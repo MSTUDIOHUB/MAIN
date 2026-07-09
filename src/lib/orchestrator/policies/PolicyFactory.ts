@@ -1,4 +1,4 @@
-import type { AppConfig } from "../../../store/useAppStore";
+import type { AppConfig } from "../../appTypes";
 import type { ExecutionPolicy } from "./ExecutionPolicy";
 import { CloudModelPolicy } from "./CloudModelPolicy";
 import { LocalModelPolicy } from "./LocalModelPolicy";

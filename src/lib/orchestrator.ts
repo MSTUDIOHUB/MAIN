@@ -82,7 +82,7 @@ import {
   type SessionAutoApproveScope,
   type ToolLifecycleState,
 } from "./runtimeTools";
-import type { AppConfig, Skill } from "../store/useAppStore";
+import type { AppConfig, Skill } from "./appTypes";
 import {
   buildPlanTaskEvidenceAudit,
   detectPlanArtifactKind,

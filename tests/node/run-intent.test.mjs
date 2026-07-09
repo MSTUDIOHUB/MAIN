@@ -668,19 +668,24 @@ test("approval phrasing does not trigger plan approval without plan artifacts", 
 });
 
 test("ordinary direct execution without plan artifacts enters execute workflow", () => {
-  const result = resolveTurnRunIntent(
+  for (const input of [
     "现在就直接实现这个功能",
-    createContext({
-      hasPlanArtifacts: false,
-      planStage: "idle",
-      isPlanApproved: false,
-    }),
-  );
+    "首先执行P0的重构，如果有任何不确定的方向请向我提问。",
+  ]) {
+    const result = resolveTurnRunIntent(
+      input,
+      createContext({
+        hasPlanArtifacts: false,
+        planStage: "idle",
+        isPlanApproved: false,
+      }),
+    );
 
-  assert.equal(result.intent, "execute");
-  assert.equal(result.commandDirective.kind, "file_modify");
-  assert.equal(result.commandDirective.requiresApproval, true);
-  assert.equal(result.needsDecision, undefined);
+    assert.equal(result.intent, "execute", input);
+    assert.equal(result.commandDirective.kind, "file_modify", input);
+    assert.equal(result.commandDirective.requiresApproval, true, input);
+    assert.equal(result.needsDecision, undefined, input);
+  }
 });
 
 test("generic continuation phrases are recognized as previous-turn continuation", () => {
@@ -717,20 +722,37 @@ test("workflow engine marks non-actionable stops as resumable turn status", () =
 
 test("store asks before executing when preflight upgrades natural chat to operations", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
+  const preflightExecutorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPreflightExecutor.ts"), "utf8");
 
-  assert.match(source, /const shouldAskForPreflightExecutionDecision =/);
-  assert.match(source, /localWasNatural[\s\S]*preflightSuggestsOperation[\s\S]*pendingRunDecision/);
-  assert.match(source, /decisionOptions: \["execute", "respond", "plan"\]/);
+  assert.match(source, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
+  assert.match(source, /await executeSubmitBlockingPreflight/);
+  assert.match(preflightExecutorSource, /const action = resolveSubmitPreflightEffectAction/);
+  assert.match(preflightExecutorSource, /action\.kind === "set_pending_decision"/);
+  assert.match(turnSubmissionSource, /const preflightDecision = resolveSubmitPreflightResultDecision/);
+  assert.match(turnSubmissionSource, /preflightDecision\.kind === "ask_execution_confirmation"/);
+  assert.match(turnSubmissionSource, /pendingRunDecision: preflightDecision\.pendingRunDecision!/);
+  assert.match(turnSubmissionSource, /const shouldAskForPreflightExecutionDecision =/);
+  assert.match(turnSubmissionSource, /localWasNatural[\s\S]*preflightSuggestsOperation[\s\S]*pendingRunDecision/);
+  assert.match(turnSubmissionSource, /decisionOptions: \["execute", "respond", "plan"\]/);
 });
 
 test("store forces auto-approved visible turns into execution semantics", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
 
-  assert.match(source, /const shouldForceExecuteForAutoApprove =/);
-  assert.match(source, /state\.autoApproveTools === true/);
-  assert.match(source, /effectiveRunIntent = currentMainModeKey === "game_studio" \? "studio_workflow" : "execute"/);
+  assert.match(source, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
+  assert.match(source, /autoApproveTools: state\.autoApproveTools/);
+  assert.match(source, /const shouldForceExecuteForAutoApprove = initialIntentDecision\.shouldForceExecuteForAutoApprove/);
+  assert.match(turnSubmissionSource, /const shouldForceExecuteForAutoApprove =/);
+  assert.match(turnSubmissionSource, /autoApproveTools === true/);
+  assert.match(turnSubmissionSource, /effectiveRunIntent = currentMainModeKey === "game_studio" \? "studio_workflow" : "execute"/);
   assert.match(source, /!shouldForceExecuteForAutoApprove && !options\?\.skipIntentResolution/);
-  assert.match(source, /shouldExecuteOnceFromReplyOption \|\|\s*state\.autoApproveTools === true/);
+  assert.match(source, /const runtimeDecision = resolveSubmitRuntimeDecision/);
+  assert.match(source, /shouldExecuteOnceFromReplyOption,\s*preservePlanState,/);
+  assert.match(source, /autoApproveTools: state\.autoApproveTools/);
+  assert.match(source, /const shouldGrantExecutionConsentForTurn = runtimeDecision\.shouldGrantExecutionConsentForTurn/);
+  assert.match(turnSubmissionSource, /params\.shouldExecuteOnceFromReplyOption \|\|\s*params\.autoApproveTools === true/);
 });
 
 test("continuation does not hijack completed or missing turns", () => {

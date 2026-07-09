@@ -22,7 +22,7 @@ import { buildExecuteNoActionPauseMessage, buildExecuteXmlTextActionRecoveryProm
 import { UNITY_FALLBACK_RECOVERY_READ_ONLY_TOOL_NAMES, annotateUnityEditToolDescriptions, extractMcpCallFailureCategory, isGameEngineLikelyServer, isUnityCommandDirective, isUnityConsoleDiagnosticsDirective, isUnityScriptWriteToolCall, normalizeGameStudioEngineKey, shouldRepromptBeforeUnityConsoleFallback, shouldTriggerUnityMcpFirstIterationFallback, shouldTriggerUnityMcpStrictRetry } from "../../orchestrator/unityDiagnostics";
 import { buildPlanAutoScaffoldPrompt, buildPlanEvidenceRecoveryBlockedPrompt, buildPlanEvidenceRecoveryClosurePrompt, buildPlanFallbackNotice, buildPlanPostConvergenceToolRedirectPrompt, buildPlanReadOnlyConvergencePause, buildPlanReadOnlyConvergencePrompt, buildPlanStreamTimeoutPauseMessage, countSuccessfulPlanReadEvidence, hasGroundedPlanClosureEvidence, hasSuccessfulTabularActivity, planRuntimePhasePresentation, resolvePlanClosureArtifactKind } from "../../orchestrator/planOrchestration";
 import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../runtimeTools";
-import type { AppConfig } from "../../../store/useAppStore";
+import type { AppConfig } from "../../appTypes";
 import { buildPlanTaskEvidenceAudit, hasBrowserValidationCapability, isPlanTaskTrustedComplete, looksLikeSubstantivePlanAssistantText, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, type PlanRuntimePhase } from "../../workflowModels";
 import { buildEffectiveTurnContract, hasExplicitUnityConsoleDiagnosticCue, type EffectiveTurnContract, type ResolvedUserIntent } from "../../runIntent";
 import { loadResolvedInstructions } from "../../instructions";

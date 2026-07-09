@@ -5,7 +5,6 @@ import { create, type StateCreator } from "zustand";
 import { persist } from "zustand/middleware";
 import { type AgentMessage, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
 import type { ExecuteRecoveryMode } from "../lib/executeRecoveryTools";
-import { WorkflowEngine, type WorkflowContext } from "../lib/orchestrator/workflowEngine";
 import type { SessionAutoApproveScope } from "../lib/runtimeTools";
 import {
   analyzeTabularDocument,
@@ -55,21 +54,15 @@ import {
   type ConversationTurn,
   type ConversationTurnStatus,
   type NormalizedStreamState,
-  type PendingOperationProposal,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressSnapshot,
   type PlanStage,
   type PlanTask,
-  type ReplyOption,
-  type ResponseLanguagePolicy,
   type RightPanelTab,
-  buildPlanTaskEvidenceAudit,
   detectPlanArtifactKind,
-  deriveRuntimePlanTasksFromArtifacts,
   extractPlanTasks,
   findDroppedPlanTasks,
-  getPendingPlanTaskCommandFocus,
   getPlanArtifactTitle,
   collectChangeEntries,
   isGenericConversationTitle,
@@ -80,7 +73,6 @@ import {
   reconcilePlanTaskCompletion,
   resolveTurnResponseLanguage,
   summarizeAssistantText,
-  summarizeUserPrompt,
   validatePlanArtifactContent,
 } from "../lib/workflowModels";
 import {
@@ -88,10 +80,8 @@ import {
   normalizeEventStreamMode,
   normalizeToolFeedbackFormat,
   withEventSchema,
-  type EventStreamMode,
   type MainThreadEvent,
   type MainThreadEventInput,
-  type ToolFeedbackFormat,
 } from "../lib/turnEvents";
 import { getDiffStats } from "../lib/diff";
 import {
@@ -111,18 +101,13 @@ import {
   extractAnthropicResponseText,
   normalizeCloudProtocol,
   resolveEffectiveCloudApiFormat,
-  type CloudToolProtocol,
-  type ReasoningDisplayMode,
 } from "../lib/cloudProtocol";
 import {
   normalizeCloudServerState,
-  type CloudProfileConfig,
-  type CloudServerConfig,
 } from "../lib/cloudServers";
 import { resolveStreamingAssistantDisplay } from "../lib/streamDisplayPolicy";
 import {
   normalizeProgressNarration,
-  type ProgressNarration,
 } from "../lib/progressNarration";
 import {
   makeTurnRuntimePhase,
@@ -130,21 +115,17 @@ import {
   deriveTurnRuntimePhaseForText,
   type TurnRuntimePhase,
 } from "../lib/turnPhase";
-import { buildPlanApprovalChoiceHint, normalizePlanApprovalChoice } from "../lib/planControl";
+import { normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   buildPlanExecutionProgressUpdate,
   normalizePlanExecutionProgressSnapshot,
 } from "../lib/planExecutionRecovery";
 import {
   type AttachedFile,
-  type AttachmentKind,
-  classifyAttachment,
-  getAttachmentDisplayName,
   normalizeAttachedFile,
 } from "../lib/attachments";
 import {
   buildSemanticMetadataContextLines,
-  buildTurnIntakeContextBlock,
   normalizeTurnInputContextSignals,
   type TurnInputContextSignals,
 } from "../lib/turnIntake";
@@ -152,7 +133,6 @@ import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import {
   buildUserContextItems,
   sanitizeUserContextItemsForPersist,
-  type UserContextItem,
 } from "../lib/userContextItems";
 import {
   LOCAL_PERSIST_SCHEMA_VERSION,
@@ -161,16 +141,14 @@ import {
   stripLegacyRuntimeFieldsFromPersistedState,
 } from "../lib/persistState";
 import {
-  buildGameStudioEnvelopeForTurn,
+  createGameStudioModeSwitchDecision,
   ensureGameStudioWorkspaceInitialized,
-  formatGameStudioCommandDocForDisplay,
-  formatGameStudioMissingCommandDoc,
-  hasBundledGameStudioLocalizedCommandMarkdown,
+  gameStudioRuntimeService,
   loadGameStudioConfig,
   removeGameStudioWorkspaceAssets,
-  resolveGameStudioHelpTarget,
+  resolveEngineFromModeSwitchChoice,
   setGameStudioEngineConfig,
-} from "../lib/gameStudioPack";
+} from "../lib/gameStudio";
 import {
   getGameStudioSlashCommandSpec,
   getDefaultStudioAgentForEngine,
@@ -182,28 +160,14 @@ import {
   type PendingSlashCommand,
   type StudioAgentKey,
   type StudioConfig,
-  type StudioEngineKey,
 } from "../lib/gameStudioCatalog";
-import {
-  detectGameDevelopmentIntent,
-  type GameDevelopmentIntentSignal,
-} from "../lib/gameDevelopmentIntent";
 import {
   createPendingDecisionCopy,
   getIntentPolicy,
   inferCommandDirective,
-  looksLikeExistingPlanExecutionRequest,
-  looksLikePlanContinuationOrApprovalInput,
-  looksLikePreviousTurnContinuationInput,
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
   resolveTurnRunIntent,
-  isResumablePreviousTurnStatus,
-  parseMainDebugShortcut,
-  parseMainIntentShortcutForMode,
-  isMainIntentShortcutAllowedInMainMode,
-  shouldContinuePreviousTurnFromInput,
-  shouldUseBlockingIntentPreflight,
   type ExecutionConsentPolicy,
   type CommandDirective,
   type MainIntentShortcut,
@@ -214,9 +178,22 @@ import {
   type RunIntentResolution,
 } from "../lib/runIntent";
 import {
-  resolvePlanStateHydrationReason,
-  shouldPromoteHydratedPlanToExecuting,
-} from "../lib/planStateHydration";
+  archiveConsumedReplyOptionsFromTaskFlow,
+  buildLocalTurnTitle,
+  buildMainDebugPrompt,
+  buildRunIntentSummary,
+  buildSubmitBlockingPreflightEffect,
+  buildSubmitPipelineDecision,
+  isResolvedUserIntentChoice,
+  normalizeIntentSummary,
+  normalizeTaskFlowPatchForConsumedReplyOptions,
+  resolveSubmitEffectiveIntentDecision,
+  resolveSubmitExecutionApprovalDecision,
+  resolveSubmitRuntimeDecision,
+  resolveSubmitSemanticMetadataDecision,
+  resolveSubmitSendGateDecision,
+  resolveSubmitTurnTitleDecision,
+} from "../lib/submit/turnSubmission";
 import { createGoalDefinition } from "../lib/goalState";
 import type { GoalDefinition, GoalProgress, GoalStatus } from "../lib/goalState";
 import type { GoalBudget } from "../lib/goalBudget";
@@ -233,13 +210,39 @@ import {
   PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
   PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
 } from "./slices/configSlice";
-import { StreamingThinkingInterceptor } from "../lib/chat/StreamingThinkingInterceptor";
-import { StreamingCadenceBuffer } from "../lib/chat/streamBuffer";
 import {
   createWorkspaceSlice,
   normalizePendingDecisionInputKey,
   normalizeStoredRightPanelTab,
 } from "./slices/workspaceSlice";
+import {
+  createSubmitSessionRuntimeFacade,
+  startSubmitElapsedTimer,
+} from "./submitRuntimeFacade";
+import { runSubmitGameStudioPreparation } from "./submitGameStudioPreparation";
+import { executeSubmitBlockingPreflight } from "./submitPreflightExecutor";
+import { startGameStudioLocalSlashSubmission } from "./gameStudioLocalSlashSubmission";
+import {
+  applySubmitSeedSessionTitle,
+  startSubmitSemanticMetadataEffect,
+} from "./submitTitleEffects";
+import { startSubmitRunLease } from "./submitRunLease";
+import { createSubmitWorkflowContext } from "./submitWorkflowContext";
+import { startSubmitStreamingUi } from "./submitStreamingUi";
+import { runSubmitWorkflowEngine } from "./submitWorkflowEngineRunner";
+import { applySubmitSessionBootstrap } from "./submitSessionBootstrap";
+import { createGameStudioLocalSlashBridge } from "./gameStudioLocalSlashBridge";
+import { applySubmitVisibleTurn } from "./submitVisibleTurn";
+import { startSubmitPlanHydrationEffect } from "./submitPlanHydration";
+import { runSubmitPlanExecutionResumeEffect } from "./submitPlanExecutionResume";
+import { applySubmitPendingReviewTransition } from "./submitPendingReviewTransition";
+import { buildSubmitAttachmentContext } from "./submitAttachmentContext";
+import { buildSubmitPromptContext } from "./submitPromptContext";
+import {
+  buildApprovedPlanExecutionPrompt,
+  ensureApprovedPlanRuntimeTasksForState,
+  normalizeApprovedPlanTaskStatuses,
+} from "./submitApprovedPlanExecution";
 import {
   buildImageGenerationParams,
   checkImageStudioEngineStatus,
@@ -255,7 +258,6 @@ import {
   runLocalImageStudioGeneration,
   startImageStudioGeneration,
   streamImageStudioGeneration,
-  type ImageGenerationBlockPayload,
   type ImageGenerationParams,
   type ImageStudioConfig,
   type ImageStudioEngineStatus,
@@ -284,28 +286,84 @@ import {
   type FeishuAdapterRuntimeStatus,
   type FeishuInteractiveCard,
   type FeishuPendingPairing,
-  type ImAdaptersConfig,
 } from "../lib/imAdapters";
 import {
   isLocalFileReadApproved,
   normalizeLocalFileReadPath,
   normalizeMcpRoutingConfig,
   normalizeToolPermissionPolicy,
-  type McpRoutingConfig,
-  type PromptLanguageStrategy,
-  type ToolPermissionPolicy,
 } from "../lib/toolCapabilities";
+import type {
+  AppConfig,
+  Lang,
+  Skill,
+  ThemeMode,
+} from "../lib/appTypes";
+import type {
+  ActiveGuidance,
+  PlanApprovalHandoff,
+  ProviderCompatibilityRuntimeLaneState,
+  QueuedUserMessage,
+  SessionModelConfig,
+} from "../lib/sessionTypes";
 import {
-  deriveThoughtDisplay,
-  normalizeThoughtSummaryForCompare,
-} from "../lib/thoughtDisplay";
+  GLOBAL_CHAT_KEY,
+  resolveGlobalChatSessionKey,
+  resolveSessionRuntimeKey,
+  resolveSessionWorkspaceKey,
+} from "../lib/sessionTypes";
+import type {
+  DiffRevertRequest,
+  DiffRevertResult,
+  GitDiffPreviewState,
+  JobItem,
+  TaskBlock,
+} from "../lib/taskTypes";
+import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 import {
-  canUpdateSeedSessionTitle,
-  isSemanticTurnMetadataCallbackCurrent,
+  compactThoughtContent,
+  compactThoughtContentForPersist,
+} from "../lib/thoughtCompaction";
+import {
   parseIntentTitleCandidate,
-  shouldRequestSemanticTurnMetadataForTurn,
-  shouldSeedSessionTitle,
 } from "../lib/intentTitlePolicy";
+
+export type {
+  AppConfig,
+  CloudConfig,
+  CloudServerConfig,
+  Lang,
+  LocalConfig,
+  Skill,
+  ThemeKey,
+  ThemeMode,
+} from "../lib/appTypes";
+export type {
+  ActiveGuidance,
+  PlanApprovalHandoff,
+  ProviderCompatibilityRuntimeLaneState,
+  QueuedUserMessage,
+  SessionModelConfig,
+} from "../lib/sessionTypes";
+export {
+  GLOBAL_CHAT_KEY,
+  resolveGlobalChatSessionKey,
+  resolveSessionRuntimeKey,
+  resolveSessionWorkspaceKey,
+} from "../lib/sessionTypes";
+export type {
+  AssistantTextVisibility,
+  DiffRevertRequest,
+  DiffRevertResult,
+  DiffRevertStatus,
+  GitDiffPreviewState,
+  JobItem,
+  ProgressTaskBlock,
+  TaskBlock,
+  TaskBlockBase,
+  ToolDiffSnapshot,
+} from "../lib/taskTypes";
+export type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 
 export function logStoreEvent(event: string, data: Record<string, unknown> = {}) {
   try {
@@ -638,9 +696,7 @@ export const translations = {
   },
 } as const;
 
-export type Lang = keyof typeof translations;
 export type TranslationKey = keyof typeof translations.en;
-export type ThemeMode = "light" | "dark" | "black";
 
 export function normalizeThemeMode(value: unknown): ThemeMode {
   return value === "light" || value === "dark" || value === "black" ? value : "dark";
@@ -658,26 +714,6 @@ export const THEMES = {
   tiffanyBlue: { accent: '#81D8D0', hover: '#5EC7BD', light: '#A8EEE8', subtle: 'rgba(129,216,208,0.16)', subtleBorder: 'rgba(129,216,208,0.34)', contrast: '#063433', name: 'Tiffany Blue' },
 } as const;
 
-export type ThemeKey = keyof typeof THEMES;
-export const GLOBAL_CHAT_KEY = "__MAIN_GLOBAL_CHAT__";
-
-export function resolveSessionWorkspaceKey(workspace: string | null | undefined): string {
-  const normalizedWorkspace = String(workspace || "").trim();
-  return normalizedWorkspace || GLOBAL_CHAT_KEY;
-}
-
-export function resolveGlobalChatSessionKey(sessionId: number | null | undefined): string | null {
-  return sessionId ? `${GLOBAL_CHAT_KEY}:${sessionId}` : null;
-}
-
-export function resolveSessionRuntimeKey(
-  workspaceOrScope: string | null | undefined,
-  sessionId: number | null | undefined,
-): string | null {
-  if (!sessionId) return null;
-  return `${resolveSessionWorkspaceKey(workspaceOrScope)}:${sessionId}`;
-}
-
 // ── Domain Types ─────────────────────────────────────────────────────
 
 export type Role = "user" | "assistant" | "system";
@@ -690,61 +726,8 @@ export interface Message {
   streaming?: boolean;
 }
 
-export interface Skill {
-  id: string;
-  name: string;
-  desc: string;
-  content: string;
-  active: boolean;
-  isBuiltIn?: boolean;
-  type?: "instruction" | "tool" | "package";       // default "instruction"
-  toolParameters?: string;            // JSON string: OpenAI-style parameters schema (for tool-type only)
-  packagePath?: string;               // Relative path to extracted folder (e.g. ".protocols/auto-optimize-1713...")
-  entryPoint?: string;                // Entry file within the package (e.g. "SKILL.md" or "program.md")
-  workspaceScope?: string | null;     // Absolute workspace root that owns this package skill
-}
-
 // ── MCP Types (re-exported from mcpClient for convenience) ──────────
 export type { MCPServer, MCPTool } from "../lib/mcpClient";
-
-export interface SessionModelConfig {
-  provider: string;
-  endpoint: string;
-  model: string;
-  activeProfile: "local" | "cloud";
-}
-
-export interface ProviderCompatibilityRuntimeLaneState {
-  forceXmlTools: boolean;
-  fallbackExpiresAt: number | null;
-  nativeSuccessStreak: number;
-  lastFallbackAt: number;
-}
-
-export interface QueuedUserMessage {
-  id: string;
-  text: string;
-  images?: string[];
-  contextMentions?: string[];
-  attachedFiles?: AttachedFile[];
-  createdAt: number;
-  status: "queued";
-}
-
-export interface ActiveGuidance {
-  id: string;
-  text: string;
-  turnId: string | null;
-  createdAt: number;
-  consumedAt?: number | null;
-}
-
-export interface PlanApprovalHandoff {
-  planTurnId: string;
-  requestedAt: number;
-  executionTurnId?: string;
-  prompt?: string;
-}
 
 export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
 
@@ -885,55 +868,7 @@ export interface WorkspaceEntry {
   lastActiveAt: number;
 }
 
-export interface LocalConfig {
-  provider: string;
-  endpoint: string;
-  model: string;
-  contextLimit: number;
-  apiKey: string;
-  toolProtocol?: CloudToolProtocol;
-}
-
-export type CloudConfig = CloudProfileConfig;
-export type { CloudServerConfig } from "../lib/cloudServers";
-
-export interface AppConfig {
-  language: Lang;
-  responseLanguagePolicy: ResponseLanguagePolicy;
-  theme: ThemeKey;
-  themeMode: ThemeMode;
-  appIconVariant: "light" | "dark";
-  workflowMode: "chat" | "edit" | "plan";  // Legacy mirror of the active turn intent.
-  promptLanguageStrategy: PromptLanguageStrategy;
-  toolPermissionPolicy: ToolPermissionPolicy;
-  mcpRouting: McpRoutingConfig;
-  instructionsEnabled: boolean;
-  hooksEnabled: boolean;
-  activeProfile: "local" | "cloud";
-  chatFontSize: number;  // px, default 13
-  sessionRecordingEnabled: boolean;
-  debugRecordFullTurnProcess: boolean;
-  reasoningDisplay: ReasoningDisplayMode;
-  eventStreamMode: EventStreamMode;
-  toolFeedbackFormat: ToolFeedbackFormat;
-  local: LocalConfig;
-  cloud: CloudConfig;
-  cloudServers: CloudServerConfig[];
-  activeCloudServerId: string;
-  cloudExperimentalLoginEnabled: boolean;
-  imAdapters: ImAdaptersConfig;
-  workspace: string;
-}
-
 export type AgentStatus = "idle" | "running" | "pending_review" | "error";
-
-export interface FeishuRemoteContext {
-  adapter: "feishu";
-  chatId: string;
-  userId: string;
-  userName: string;
-  messageId?: string;
-}
 
 export interface FeishuPendingApproval extends FeishuApprovalRecord {
   code: string;
@@ -961,51 +896,6 @@ export type FeishuApprovalProcessResult =
       approval?: FeishuPendingApproval;
     };
 
-export interface JobItem {
-  id: string;
-  subject: string;
-  status: "pending" | "in_progress" | "completed";
-}
-
-interface TaskBlockBase {
-  id: number;
-  turnId?: string;
-  turnPhase?: TurnRuntimePhase;
-}
-
-export interface ToolDiffSnapshot {
-  old: string;
-  new: string;
-  path?: string;
-  existed?: boolean;
-  fullFile?: boolean;
-  binary?: boolean;
-}
-
-export interface GitDiffPreviewState {
-  entries: GitDiffEntry[];
-  sourceLabel?: string;
-}
-
-export type DiffRevertStatus = "reverting" | "reverted" | "failed";
-
-export interface DiffRevertRequest {
-  path: string;
-  taskIds: number[];
-  oldText: string;
-  newText: string;
-  existed?: boolean;
-  fullFile?: boolean;
-}
-
-export interface DiffRevertResult {
-  path: string;
-  taskIds: number[];
-  ok: boolean;
-  message: string;
-}
-
-export type AssistantTextVisibility = "user_progress" | "hidden_process" | "substantive_plan_text";
 type CapsuleExplanationSource = "model";
 type CapsuleExplanationState = {
   turnId: string;
@@ -1013,48 +903,6 @@ type CapsuleExplanationState = {
   updatedAt: number;
   source: CapsuleExplanationSource;
 } | null;
-
-export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
-  type: "progress";
-  toolCallId?: string;
-  toolCallIds?: string[];
-  toolName?: string;
-  target?: string;
-};
-
-export type TaskBlock =
-  | (TaskBlockBase & { type: "user"; content: string; images?: string[]; contextItems?: UserContextItem[] })
-  | (TaskBlockBase & { type: "tool"; toolName: string; target: string; status: string; toolStatus: "pending" | "executed" | "rejected" | "running" | "failed"; toolCallId?: string; message?: string; diff?: ToolDiffSnapshot; shellPermissionDecision?: ShellPermissionDecision; revertStatus?: DiffRevertStatus; revertMessage?: string; intentSummary?: string; why?: string; evidence?: string; observationSummary?: string; qualityGateReason?: string; planRecoveryReason?: string })
-  | (TaskBlockBase & { type: "agent"; content: string; options?: ReplyOption[]; streaming?: boolean; hiddenProcess?: boolean; visibility?: AssistantTextVisibility; archivedAfterChoice?: boolean; archivedProposal?: boolean; selectedOption?: string; isEscalating?: boolean; escalationReason?: string; failedAttempts?: Array<{ content: string; reasoning?: string; reason: string; timestamp: number }> })
-  | (TaskBlockBase & ImageGenerationBlockPayload)
-  | ProgressTaskBlock
-  | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
-  | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
-  | (TaskBlockBase & {
-      type: "system";
-      content: string;
-      icon?: string;
-      variant?: "context_compression" | "plan_quality_gate" | "plan_execution_progress" | "plan_execution_checkpoint" | "execution_checkpoint" | "game_studio_local_markdown";
-      planExecutionProgress?: PlanExecutionProgressSnapshot;
-      contextCompression?: {
-        reason: "proactive" | "reactive" | "execute_recovery";
-        droppedCount: number;
-        tokenCountBefore: number;
-        tokenCountAfter: number;
-        tokenReduction: number;
-        compressedContext?: string;
-        displaySummary?: string;
-        memoryPacket?: string;
-        microCompactionKind?: "none" | "tool_results" | "assistant_messages" | "mixed";
-        microCompactedCount?: number;
-        droppedMessageCount?: number;
-        topTokenSource?: {
-          label: string;
-          tokens: number;
-          total?: number;
-        };
-      };
-    });
 
 // ── Store State Interface ─────────────────────────────────────────────
 
@@ -2092,248 +1940,6 @@ function normalizeSessionsByWorkspace(
   return Object.fromEntries(normalizedEntries.entries());
 }
 
-// ── Streaming Thinking Interceptor ────────────────────────────────────
-// Detects thinking XML tags (<thinking>, <thought>, <analysis>, <reasoning>)
-// as they stream in token-by-token, and routes content to a ThoughtBlock
-// instead of the agent block. Prevents thinking content from briefly
-// appearing as plain text in the chat during streaming.
-
-const MAX_VISIBLE_THOUGHT_CHARS = 36_000;
-
-function normalizeThoughtTextForCompare(text: string): string {
-  return normalizeThoughtSummaryForCompare(text);
-}
-
-function thoughtSimilarity(a: string, b: string): number {
-  const left = new Set(normalizeThoughtTextForCompare(a).split(/\s+/).filter((token) => token.length > 1));
-  const right = new Set(normalizeThoughtTextForCompare(b).split(/\s+/).filter((token) => token.length > 1));
-  if (left.size === 0 || right.size === 0) {
-    const compactLeft = normalizeThoughtTextForCompare(a).replace(/\s+/g, "");
-    const compactRight = normalizeThoughtTextForCompare(b).replace(/\s+/g, "");
-    if (compactLeft.length < 8 || compactRight.length < 8) return 0;
-    const grams = (value: string) => {
-      const set = new Set<string>();
-      for (let index = 0; index < value.length - 1; index++) set.add(value.slice(index, index + 2));
-      return set;
-    };
-    const leftGrams = grams(compactLeft);
-    const rightGrams = grams(compactRight);
-    let shared = 0;
-    for (const gram of leftGrams) {
-      if (rightGrams.has(gram)) shared++;
-    }
-    return shared / Math.max(leftGrams.size, rightGrams.size);
-  }
-  let shared = 0;
-  for (const token of left) {
-    if (right.has(token)) shared++;
-  }
-  return shared / Math.max(left.size, right.size);
-}
-
-function collapseNearDuplicateThoughtLines(text: string): string {
-  const lines = String(text || "")
-    .split(/\r?\n/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-  if (lines.length < 2) return text;
-  const kept: string[] = [];
-  for (const line of lines) {
-    const normalized = normalizeThoughtTextForCompare(line);
-    if (!normalized) continue;
-    if (kept.some((existing) => {
-      const existingNormalized = normalizeThoughtTextForCompare(existing);
-      return existingNormalized === normalized ||
-        (normalized.length > 24 && existingNormalized.length > 24 && (normalized.includes(existingNormalized) || existingNormalized.includes(normalized))) ||
-        thoughtSimilarity(line, existing) >= 0.72;
-    })) {
-      continue;
-    }
-    kept.push(line);
-  }
-  return kept.join("\n");
-}
-
-function sameThoughtParagraphSequence(paragraphs: string[], a: number, b: number, length: number): boolean {
-  for (let offset = 0; offset < length; offset++) {
-    if (normalizeThoughtTextForCompare(paragraphs[a + offset] || "") !== normalizeThoughtTextForCompare(paragraphs[b + offset] || "")) {
-      return false;
-    }
-  }
-  return true;
-}
-
-function collapseRepeatedThoughtParagraphs(text: string): string {
-  const paragraphs = String(text || "")
-    .split(/\n{2,}/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  if (paragraphs.length < 4) return text;
-
-  const collapsed: string[] = [];
-  let index = 0;
-  const maxWindow = 8;
-
-  while (index < paragraphs.length) {
-    let matched = false;
-    const remaining = paragraphs.length - index;
-    const largestWindow = Math.min(maxWindow, Math.floor(remaining / 2));
-
-    for (let windowSize = largestWindow; windowSize >= 1; windowSize--) {
-      let repeats = 1;
-      while (
-        index + (repeats + 1) * windowSize <= paragraphs.length &&
-        sameThoughtParagraphSequence(paragraphs, index, index + repeats * windowSize, windowSize)
-      ) {
-        repeats++;
-      }
-
-      if (repeats >= 2) {
-        collapsed.push(...paragraphs.slice(index, index + windowSize));
-        index += repeats * windowSize;
-        matched = true;
-        break;
-      }
-    }
-
-    if (!matched) {
-      collapsed.push(paragraphs[index]);
-      index++;
-    }
-  }
-
-  return collapsed.join("\n\n");
-}
-
-function collapseRepeatedThoughtLines(text: string): string {
-  const lines = String(text || "")
-    .split(/\r?\n/)
-    .map((part) => part.trim())
-    .filter(Boolean);
-
-  if (lines.length < 6) return text;
-
-  const collapsed: string[] = [];
-  let index = 0;
-  const maxWindow = 12;
-
-  while (index < lines.length) {
-    let matched = false;
-    const remaining = lines.length - index;
-    const largestWindow = Math.min(maxWindow, Math.floor(remaining / 2));
-
-    for (let windowSize = largestWindow; windowSize >= 1; windowSize--) {
-      let repeats = 1;
-      while (
-        index + (repeats + 1) * windowSize <= lines.length &&
-        sameThoughtParagraphSequence(lines, index, index + repeats * windowSize, windowSize)
-      ) {
-        repeats++;
-      }
-
-      if (repeats >= 2) {
-        collapsed.push(...lines.slice(index, index + windowSize));
-        index += repeats * windowSize;
-        matched = true;
-        break;
-      }
-    }
-
-    if (!matched) {
-      collapsed.push(lines[index]);
-      index++;
-    }
-  }
-
-  return collapsed.join("\n");
-}
-
-function compactThoughtNoise(text: string): string {
-  return String(text || "")
-    .replace(/(?:[，,。.\-_]\s*){32,}/g, " ... ")
-    .replace(/([，,。.!！？?;；:：])(?:\s*\1){6,}/g, "$1...")
-    .replace(/(?:\*\s*){16,}/g, "**")
-    .replace(/[^\S\r\n]{3,}/g, " ");
-}
-
-function findSuffixPrefixOverlap(existing: string, incoming: string): number {
-  const max = Math.min(existing.length, incoming.length, 4000);
-  for (let length = max; length > 20; length--) {
-    if (existing.endsWith(incoming.slice(0, length))) return length;
-  }
-  return 0;
-}
-
-function limitThoughtContent(text: string): string {
-  const content = String(text || "");
-  if (content.length <= MAX_VISIBLE_THOUGHT_CHARS) return content;
-  const head = content.slice(0, Math.floor(MAX_VISIBLE_THOUGHT_CHARS * 0.72)).trimEnd();
-  const tail = content.slice(-Math.floor(MAX_VISIBLE_THOUGHT_CHARS * 0.18)).trimStart();
-  const hidden = content.length - head.length - tail.length;
-  return `${head}\n\n[后台思考内容过长，已折叠中间 ${hidden.toLocaleString()} 个字符，避免界面卡死。]\n\n${tail}`;
-}
-
-export function compactThoughtContent(text: string): string {
-  const collapsedParagraphs = collapseRepeatedThoughtParagraphs(String(text || ""));
-  const collapsedLines = collapseRepeatedThoughtLines(collapsedParagraphs);
-  const collapsedNearDuplicates = collapseNearDuplicateThoughtLines(collapsedLines);
-  return limitThoughtContent(compactThoughtNoise(collapsedNearDuplicates));
-}
-
-export function compactThoughtContentForPersist(text: string): string {
-  const compacted = compactThoughtContent(text);
-  const summarized = deriveThoughtDisplay(compacted, {
-    maxSummaryLines: 12,
-    mode: "latest",
-    density: "adaptive",
-  }).summaryText;
-  if (summarized) return summarized;
-  return compacted.length > 2400 ? compacted.slice(0, 2400).trimEnd() : compacted;
-}
-
-function compactProcessAssistantText(text: string, language: "zh" | "en"): string {
-  const display = deriveThoughtDisplay(String(text || ""), {
-    language,
-    mode: "latest",
-    density: "adaptive",
-    maxSummaryLines: 6,
-  });
-  return display.summaryText || compactThoughtContentForPersist(String(text || ""));
-}
-
-export function pickProcessAssistantText(visibleText: string, hiddenThought: string | undefined, language: "zh" | "en"): string {
-  const visible = String(visibleText || "").trim();
-  const hidden = String(hiddenThought || "").trim();
-  const hiddenSummary = hidden ? compactProcessAssistantText(hidden, language) : "";
-  if (hiddenSummary) return hiddenSummary;
-  return compactProcessAssistantText(visible, language);
-}
-
-export function appendThoughtDelta(existing: string, incoming: string): string {
-  const current = String(existing || "");
-  const delta = String(incoming || "");
-  if (!delta) return compactThoughtContent(current);
-  if (!current) return compactThoughtContent(delta);
-
-  const normalizedCurrent = normalizeThoughtTextForCompare(current);
-  const normalizedDelta = normalizeThoughtTextForCompare(delta);
-  if (normalizedDelta && normalizedCurrent.includes(normalizedDelta)) {
-    return compactThoughtContent(current);
-  }
-
-  if (normalizedCurrent && normalizedDelta.startsWith(normalizedCurrent)) {
-    return compactThoughtContent(delta);
-  }
-
-  if (delta.startsWith(current)) {
-    return compactThoughtContent(delta);
-  }
-
-  const overlap = findSuffixPrefixOverlap(current, delta);
-  return compactThoughtContent(current + (overlap > 0 ? delta.slice(overlap) : delta));
-}
-
 // ── Task ID counter ───────────────────────────────────────────────────
 
 let taskIdCounter = 100; // Start high to avoid collision with mock data
@@ -2378,392 +1984,6 @@ async function getWorkspaceTree(workspace: string): Promise<string> {
   }
 }
 
-const RUN_INTENT_LABELS: Record<ResolvedRunIntent, { zh: string; en: string }> = {
-  respond: { zh: "回复", en: "Respond" },
-  discuss: { zh: "回复", en: "Respond" },
-  plan: { zh: "计划", en: "Plan" },
-  execute: { zh: "直接执行", en: "Execute" },
-  analyze: { zh: "分析", en: "Analyze" },
-  summarize: { zh: "总结", en: "Summarize" },
-  report: { zh: "报告", en: "Report" },
-  studio_workflow: { zh: "Game Studio 工作流", en: "Game Studio Workflow" },
-  image_studio: { zh: "生成图片", en: "Generate Image" },
-  goal: { zh: "目标", en: "Goal" },
-};
-
-const RESOLVED_USER_INTENT_KEYS = new Set<ResolvedUserIntent>([
-  "respond",
-  "discuss",
-  "plan",
-  "execute",
-  "analyze",
-  "summarize",
-  "report",
-  "studio_workflow",
-  "image_studio",
-  "goal",
-]);
-
-function isResolvedUserIntentChoice(choice: PendingRunDecisionChoice): choice is ResolvedUserIntent {
-  return RESOLVED_USER_INTENT_KEYS.has(choice as ResolvedUserIntent);
-}
-
-function isStudioEngineKey(value: string | null | undefined): value is StudioEngineKey {
-  return value === "unity" || value === "godot" || value === "unreal";
-}
-
-function resolveEngineFromModeSwitchChoice(
-  choice: PendingRunDecisionChoice | "approve_once" | "approve_thread" | "cancel",
-  pending: PendingRunDecision,
-): StudioEngineKey | null {
-  if (choice === "switch_game_studio_unity") return "unity";
-  if (choice === "switch_game_studio_godot") return "godot";
-  if (choice === "switch_game_studio_unreal") return "unreal";
-  return isStudioEngineKey(pending.target) ? pending.target : null;
-}
-
-function buildGameStudioSwitchReason(
-  signal: GameDevelopmentIntentSignal,
-  language: "zh" | "en",
-): string {
-  const evidence = [...signal.projectEvidence, ...signal.semanticEvidence].slice(0, 2).join("；");
-  if (language === "en") {
-    if (signal.engineStatus === "explicit" && signal.engine) {
-      return evidence
-        ? `Detected ${signal.engine} game-development context (${evidence}). Game Studio can route this through engine-aware workflows.`
-        : `Detected ${signal.engine} game-development context. Game Studio can route this through engine-aware workflows.`;
-    }
-    return evidence
-      ? `Detected game-development context (${evidence}), but the engine is not clear yet. Choose an engine before MAIN configures Game Studio.`
-      : "Detected game-development context, but the engine is not clear yet. Choose an engine before MAIN configures Game Studio.";
-  }
-
-  if (signal.engineStatus === "explicit" && signal.engine) {
-    return evidence
-      ? `检测到 ${signal.engine} 游戏开发上下文（${evidence}）。切换后 MAIN 会初始化 Game Studio，并同步设置该引擎。`
-      : `检测到 ${signal.engine} 游戏开发上下文。切换后 MAIN 会初始化 Game Studio，并同步设置该引擎。`;
-  }
-  return evidence
-    ? `检测到游戏开发语义（${evidence}），但还不能确定具体引擎。请先选定引擎，再让 MAIN 配置 Game Studio。`
-    : "检测到游戏开发语义，但还不能确定具体引擎。请先选定引擎，再让 MAIN 配置 Game Studio。";
-}
-
-function createGameStudioModeSwitchDecision(params: {
-  input: string;
-  images?: string[];
-  language: "zh" | "en";
-  signal: GameDevelopmentIntentSignal;
-}): PendingRunDecision {
-  const { input, images, language, signal } = params;
-  const isEnglish = language === "en";
-
-  if (signal.engineStatus === "explicit" && signal.engine) {
-    return {
-      kind: "mode_switch",
-      source: "pre_submit",
-      originalInput: input,
-      originalImages: images || [],
-      suggestedIntent: "studio_workflow",
-      reason: buildGameStudioSwitchReason(signal, language),
-      title: isEnglish ? "Switch to Game Studio?" : "切换到游戏工作室？",
-      target: signal.engine,
-      options: [
-        {
-          id: "switch_game_studio",
-          label: isEnglish ? "Switch to Game Studio" : "切换到游戏工作室",
-          value: isEnglish
-            ? "Switch to Game Studio and continue this game-development request."
-            : "切换到游戏工作室，并继续处理这个游戏开发请求。",
-        },
-        {
-          id: "stay_main",
-          label: isEnglish ? "Continue in MAIN" : "继续在 MAIN 中处理",
-          value: isEnglish
-            ? "Keep handling this request in MAIN mode."
-            : "继续在 MAIN 模式中处理这个请求。",
-        },
-      ],
-    };
-  }
-
-  return {
-    kind: "mode_switch",
-    source: "pre_submit",
-    originalInput: input,
-    originalImages: images || [],
-    suggestedIntent: "studio_workflow",
-    reason: buildGameStudioSwitchReason(signal, language),
-    title: isEnglish ? "Choose a game engine?" : "先选择游戏引擎？",
-    target: "engine",
-    options: [
-      {
-        id: "switch_game_studio_unity",
-        label: isEnglish ? "Use Unity" : "使用 Unity",
-        value: isEnglish
-          ? "Switch to Game Studio, set the engine to Unity, and continue."
-          : "切换到游戏工作室，设置引擎为 Unity，并继续处理。",
-      },
-      {
-        id: "switch_game_studio_godot",
-        label: isEnglish ? "Use Godot" : "使用 Godot",
-        value: isEnglish
-          ? "Switch to Game Studio, set the engine to Godot, and continue."
-          : "切换到游戏工作室，设置引擎为 Godot，并继续处理。",
-      },
-      {
-        id: "switch_game_studio_unreal",
-        label: isEnglish ? "Use Unreal" : "使用 Unreal",
-        value: isEnglish
-          ? "Switch to Game Studio, set the engine to Unreal, and continue."
-          : "切换到游戏工作室，设置引擎为 Unreal，并继续处理。",
-      },
-      {
-        id: "switch_game_studio_choose_engine",
-        label: isEnglish ? "Help Me Choose" : "先帮我选择",
-        value: isEnglish
-          ? "Switch to Game Studio and ask me the engine selection questions first."
-          : "切换到游戏工作室，并先向我确认游戏引擎选择。",
-      },
-      {
-        id: "stay_main",
-        label: isEnglish ? "Continue in MAIN" : "继续在 MAIN 中处理",
-        value: isEnglish
-          ? "Keep handling this request in MAIN mode."
-          : "继续在 MAIN 模式中处理这个请求。",
-      },
-    ],
-  };
-}
-
-function shouldConsiderGameStudioSuggestion(params: {
-  isHidden: boolean;
-  currentMainModeKey: MainModeKey;
-  hasPendingRunDecision: boolean;
-  hasMainDebugShortcut: boolean;
-  hasMainIntentShortcut: boolean;
-  hasLockedComposerIntent: boolean;
-  skipIntentResolution?: boolean;
-  resolvedIntent?: ResolvedRunIntent;
-  shouldContinuePlanIntent: boolean;
-  shouldContinuePreviousTurnIntent: boolean;
-  shouldReuseExistingTurnIntent: boolean;
-  suppressGameStudioSuggestion?: boolean;
-  input: string;
-  hasPlanArtifacts: boolean;
-  planStage: PlanStage;
-  isPlanApproved: boolean;
-}): boolean {
-  if (params.isHidden) return false;
-  if (params.currentMainModeKey !== "main_mode") return false;
-  if (params.hasPendingRunDecision) return false;
-  if (params.hasMainDebugShortcut || params.hasMainIntentShortcut || params.hasLockedComposerIntent) return false;
-  if (params.skipIntentResolution || params.resolvedIntent || params.suppressGameStudioSuggestion) return false;
-  if (params.shouldContinuePlanIntent || params.shouldContinuePreviousTurnIntent || params.shouldReuseExistingTurnIntent) return false;
-  if (looksLikePlanContinuationOrApprovalInput(params.input, {
-    hasPlanArtifacts: params.hasPlanArtifacts,
-    planStage: params.planStage,
-    isPlanApproved: params.isPlanApproved,
-  })) return false;
-  return true;
-}
-
-function buildGameStudioLocalHelpMessage(params: {
-  language: "zh" | "en";
-  requestedCommand?: string;
-}): string {
-  const language = params.language === "en" ? "en" : "zh";
-  const resolution = resolveGameStudioHelpTarget(params.requestedCommand);
-  if (!resolution.ok) {
-    return formatGameStudioMissingCommandDoc(resolution, language);
-  }
-
-  if (language === "zh" && !hasBundledGameStudioLocalizedCommandMarkdown(resolution.slug, language)) {
-    logStoreEvent("game_studio_help_locale_fallback", {
-      slug: resolution.slug,
-      language,
-    });
-  }
-
-  return formatGameStudioCommandDocForDisplay(resolution.slug, language)
-    ?? formatGameStudioMissingCommandDoc(
-      {
-        ok: false,
-        requested: resolution.requested || `/${resolution.slug}`,
-        suggestions: [],
-      },
-      language,
-    );
-}
-
-function buildGameStudioLocalWorkflowMessage(params: {
-  language: "zh" | "en";
-  command: PendingSlashCommand & { type: "workflow" };
-}): string | null {
-  if (params.command.slug === "help") {
-    return buildGameStudioLocalHelpMessage({
-      language: params.language,
-      requestedCommand: params.command.args,
-    });
-  }
-  return null;
-}
-
-function normalizeIntentSummary(summary: string): string {
-  return summary.replace(/\s+/g, " ").trim();
-}
-
-
-
-function isContinuationPrompt(input: string): boolean {
-  return looksLikePreviousTurnContinuationInput(input);
-}
-
-function turnHasActivity(turn: ConversationTurn | null, taskFlow: TaskBlock[]): boolean {
-  if (!turn) return false;
-  if (Array.isArray(turn.blockIds) && turn.blockIds.length > 0) return true;
-  return taskFlow.some((block) => block.turnId === turn.id);
-}
-
-function turnHasToolBlocks(turnId: string, taskFlow: TaskBlock[]): boolean {
-  return taskFlow.some((block) => block.turnId === turnId && block.type === "tool");
-}
-
-function isContinuationEchoTurn(turn: ConversationTurn | null, taskFlow: TaskBlock[]): boolean {
-  if (!turn) return false;
-  if (turn.status !== "done") return false;
-  const intent = resolveConversationTurnIntent(turn);
-  if (intent !== "respond" && intent !== "discuss") return false;
-  if (!looksLikePreviousTurnContinuationInput(turn.userPrompt || "")) return false;
-  return !turnHasToolBlocks(turn.id, taskFlow);
-}
-
-function findPreviousTurnContinuationTarget(
-  input: string,
-  currentTurn: ConversationTurn | null,
-  conversationTurns: ConversationTurn[],
-  taskFlow: TaskBlock[],
-): ConversationTurn | null {
-  const canResume = (turn: ConversationTurn | null): boolean =>
-    shouldContinuePreviousTurnFromInput(input, {
-      currentTurnIntent: resolveConversationTurnIntent(turn),
-      currentTurnStatus: turn?.status ?? null,
-      hasCurrentTurn: !!turn,
-      hasTurnActivity: turnHasActivity(turn, taskFlow),
-    });
-
-  if (currentTurn && canResume(currentTurn)) return currentTurn;
-
-  // If a previous generic "continue" was misrouted into a completed natural reply turn,
-  // allow the next continuation to recover the latest genuinely unfinished turn.
-  if (!isContinuationEchoTurn(currentTurn, taskFlow)) return null;
-
-  for (let index = conversationTurns.length - 1; index >= 0; index--) {
-    const turn = conversationTurns[index];
-    if (turn.id === currentTurn?.id) continue;
-    if (canResume(turn)) return turn;
-  }
-
-  return null;
-}
-
-const PLAN_EXECUTION_CONTEXT_RE = /执行已批准计划|计划执行|已批准计划|执行回合|计划执行恢复|剩余任务|未完成任务|可信执行证据|继续执行|resume execution|plan execution|execute approved plan|remaining tasks/i;
-
-function collectPlanResumeContextText(turn: ConversationTurn | null, taskFlow: TaskBlock[]): string {
-  if (!turn) return "";
-  const parts: string[] = [
-    turn.userPrompt || "",
-    turn.title || "",
-    turn.intentSummary || "",
-    turn.summary || "",
-  ];
-  let collectedChars = parts.reduce((count, part) => count + part.length, 0);
-
-  const appendValue = (value: unknown, depth = 0) => {
-    if (value == null || depth > 2 || collectedChars > 12_000) return;
-    if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-      const text = String(value).replace(/\s+/g, " ").trim();
-      if (text) {
-        const clipped = text.slice(0, Math.max(0, 12_000 - collectedChars));
-        if (clipped) {
-          parts.push(clipped);
-          collectedChars += clipped.length;
-        }
-      }
-      return;
-    }
-    if (Array.isArray(value)) {
-      for (const item of value.slice(0, 8)) appendValue(item, depth + 1);
-      return;
-    }
-    if (typeof value === "object") {
-      const record = value as Record<string, unknown>;
-      for (const key of [
-        "path",
-        "sourcePath",
-        "displayName",
-        "content",
-        "message",
-        "target",
-        "title",
-        "summary",
-        "intentSummary",
-        "evidence",
-        "why",
-        "next",
-        "action",
-        "contextItems",
-        "attachedFiles",
-        "images",
-      ]) {
-        appendValue(record[key], depth + 1);
-      }
-    }
-  };
-
-  for (const block of taskFlow) {
-    if (block.turnId !== turn.id) continue;
-    appendValue(block);
-  }
-
-  return parts.join("\n");
-}
-
-function turnSuggestsPlanExecutionResume(turn: ConversationTurn | null, taskFlow: TaskBlock[]): boolean {
-  if (!turn) return false;
-  const intent = resolveConversationTurnIntent(turn);
-  const contextText = collectPlanResumeContextText(turn, taskFlow);
-  if (looksLikeExistingPlanExecutionRequest(contextText)) return true;
-
-  if (intent === "plan") {
-    return isResumablePreviousTurnStatus(turn.status) && PLAN_EXECUTION_CONTEXT_RE.test(contextText);
-  }
-
-  // If the intent is not "plan", do not match plan execution resume unless the user's turn explicitly requested it,
-  // to avoid misrouting generic "continue" inputs in normal execution/chat turns.
-  return false;
-}
-
-function findPlanExecutionResumeContinuationTarget(
-  input: string,
-  currentTurn: ConversationTurn | null,
-  conversationTurns: ConversationTurn[],
-  taskFlow: TaskBlock[],
-): ConversationTurn | null {
-  if (!looksLikePreviousTurnContinuationInput(input)) return null;
-  if (currentTurn && turnSuggestsPlanExecutionResume(currentTurn, taskFlow)) return currentTurn;
-
-  let inspected = 0;
-  for (let index = conversationTurns.length - 1; index >= 0; index--) {
-    const turn = conversationTurns[index];
-    if (turn.id === currentTurn?.id) continue;
-    inspected += 1;
-    if (inspected > 4) break;
-    if (turnSuggestsPlanExecutionResume(turn, taskFlow)) return turn;
-  }
-
-  return null;
-}
-
 function getLastTurnToolSummary(turnId: string, taskFlow: TaskBlock[]): string {
   for (let index = taskFlow.length - 1; index >= 0; index--) {
     const block = taskFlow[index];
@@ -2781,201 +2001,6 @@ function getLastVisibleTurnAgentSummary(turnId: string, taskFlow: TaskBlock[]): 
     if (summary) return summary;
   }
   return "";
-}
-
-function hasOperationApprovalReplyOption(replyOptions: ReplyOption[]): boolean {
-  return replyOptions.some((option) =>
-    option.action === "approve_operation_once" ||
-    option.action === "execute_once" ||
-    option.source === "proposal_follow_up" ||
-    option.source === "operation_approval"
-  );
-}
-
-function replyOptionMatchesSelectedText(replyOptions: ReplyOption[], selectedChoiceText: string): boolean {
-  const selected = selectedChoiceText.trim();
-  if (!selected) return false;
-  return replyOptions.some((option) =>
-    String(option.value || "").trim() === selected ||
-    String(option.label || "").trim() === selected
-  );
-}
-
-function findReplyOptionMatchingSelectedText(replyOptions: ReplyOption[], selectedChoiceText: string): ReplyOption | null {
-  const selected = selectedChoiceText.trim();
-  if (!selected) return null;
-  return replyOptions.find((option) =>
-    String(option.value || "").trim() === selected ||
-    String(option.label || "").trim() === selected
-  ) || null;
-}
-
-function archiveReplyOptionBlocksForChoice(
-  taskFlow: TaskBlock[],
-  turnId: string | undefined,
-  selectedChoiceText: string,
-): {
-  taskFlow: TaskBlock[];
-  archivedCount: number;
-  exactTurnOptionBlocks: number;
-  selectedFallbackBlocks: number;
-  matchMode: "turn" | "selected_fallback" | "none";
-} {
-  const exactTurnOptionBlocks = turnId
-    ? taskFlow.filter((block) =>
-        block.turnId === turnId &&
-        block.type === "agent" &&
-        Array.isArray(block.options) &&
-        block.options.length > 0
-      ).length
-    : 0;
-  const useSelectedFallback = exactTurnOptionBlocks === 0 && selectedChoiceText.trim().length > 0;
-  let archivedCount = 0;
-  let selectedFallbackBlocks = 0;
-  const nextTaskFlow = taskFlow.map((block) => {
-    if (
-      block.type !== "agent" ||
-      !Array.isArray(block.options) ||
-      block.options.length === 0
-    ) {
-      return block;
-    }
-    const matchesTurn = !!turnId && block.turnId === turnId;
-    const matchesFallback =
-      useSelectedFallback && replyOptionMatchesSelectedText(block.options, selectedChoiceText);
-    if (!matchesTurn && !matchesFallback) return block;
-    archivedCount += 1;
-    if (matchesFallback && !matchesTurn) selectedFallbackBlocks += 1;
-    return {
-      ...block,
-      options: undefined,
-      archivedAfterChoice: true,
-      ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
-      ...(selectedChoiceText.trim() ? { selectedOption: selectedChoiceText.trim() } : {}),
-    };
-  });
-
-  return {
-    taskFlow: nextTaskFlow,
-    archivedCount,
-    exactTurnOptionBlocks,
-    selectedFallbackBlocks,
-    matchMode: archivedCount > 0
-      ? exactTurnOptionBlocks > 0
-        ? "turn"
-        : "selected_fallback"
-      : "none",
-  };
-}
-
-function archiveConsumedReplyOptionsFromTaskFlow(taskFlow: TaskBlock[]): TaskBlock[] {
-  let changed = false;
-  const selectedUsersByTurn = new Map<string, Array<Extract<TaskBlock, { type: "user" }>>>();
-  taskFlow.forEach((block) => {
-    if (block.type !== "user" || !block.turnId) return;
-    const existing = selectedUsersByTurn.get(block.turnId) || [];
-    existing.push(block);
-    selectedUsersByTurn.set(block.turnId, existing);
-  });
-  const nextTaskFlow = taskFlow.map((block, index) => {
-    if (
-      block.type !== "agent" ||
-      !Array.isArray(block.options) ||
-      block.options.length === 0
-    ) {
-      return block;
-    }
-    const turnUsers = block.turnId ? selectedUsersByTurn.get(block.turnId) || [] : [];
-    const selectedUserBlock =
-      (
-        taskFlow
-          .slice(index + 1)
-          .find((candidate) =>
-            candidate.turnId === block.turnId &&
-            candidate.type === "user" &&
-            replyOptionMatchesSelectedText(block.options!, String(candidate.content || ""))
-          ) as Extract<TaskBlock, { type: "user" }> | undefined
-      ) ||
-      turnUsers.find((candidate) =>
-        replyOptionMatchesSelectedText(block.options!, String(candidate.content || ""))
-      );
-    if (!selectedUserBlock) return block;
-    changed = true;
-    const selected = String(selectedUserBlock.content || "").trim();
-    return {
-      ...block,
-      options: undefined,
-      archivedAfterChoice: true,
-      ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
-      ...(selected ? { selectedOption: selected } : {}),
-    };
-  });
-  return changed ? nextTaskFlow : taskFlow;
-}
-
-function normalizeTaskFlowPatchForConsumedReplyOptions<T extends Record<string, unknown> | Partial<AppState>>(
-  patch: T,
-): T {
-  if (!Array.isArray((patch as any).taskFlow)) return patch;
-  const taskFlow = (patch as any).taskFlow as TaskBlock[];
-  const normalizedTaskFlow = archiveConsumedReplyOptionsFromTaskFlow(taskFlow);
-  return normalizedTaskFlow === taskFlow
-    ? patch
-    : ({ ...patch, taskFlow: normalizedTaskFlow } as T);
-}
-
-
-
-function applyOperationProposalChoice(
-  proposal: PendingOperationProposal | undefined,
-  action?: ReplyOption["action"],
-): PendingOperationProposal | undefined {
-  if (!proposal) return proposal;
-  if (action === "approve_operation_once" || action === "execute_once") {
-    return {
-      ...proposal,
-      approvalStatus: "approved",
-      approvedAt: Date.now(),
-    };
-  }
-  if (action === "adjust_plan") {
-    return {
-      ...proposal,
-      approvalStatus: "adjusting",
-    };
-  }
-  if (action === "cancel_operation") {
-    return {
-      ...proposal,
-      approvalStatus: "cancelled",
-    };
-  }
-  return proposal;
-}
-
-function buildOperationApprovalContinuationPrompt(params: {
-  language: "zh" | "en";
-  proposal?: PendingOperationProposal;
-  latestAssistantSummary?: string;
-  userChoice: string;
-}): string {
-  const summary = params.proposal?.proposalSummary || params.latestAssistantSummary || "";
-  if (params.language === "en") {
-    return [
-      "The user approved real operations for this turn.",
-      summary ? `Reuse the previous proposal summary exactly as execution context: ${summary}` : "Reuse the immediately preceding proposal in this turn as execution context.",
-      "Do not re-plan from scratch. Start the smallest necessary real tool actions now, then verify with actual tool results.",
-      "Do not claim the work is fixed or complete unless there is tool evidence, a file diff/write result, a command result, or an explicit blocker.",
-      `User approval message: ${params.userChoice}`,
-    ].join("\n");
-  }
-  return [
-    "用户已批准本轮真实操作。",
-    summary ? `请严格复用上一轮方案摘要作为执行上下文：${summary}` : "请复用本回合紧邻上一条方案作为执行上下文。",
-    "不要重新从零规划。现在开始调用最小必要的真实工具操作，然后用实际工具结果验证。",
-    "没有工具证据、文件 diff/写入结果、命令结果或明确阻塞时，不得声称已修复或已完成。",
-    `用户批准消息：${params.userChoice}`,
-  ].join("\n");
 }
 
 function buildTurnCompactionAssistantMessage(params: {
@@ -3066,96 +2091,6 @@ export function compactCompletedTurnAgentMessages(params: {
     preservedUserMessage,
     { role: "assistant", content: compactAssistantContent },
   ];
-}
-
-function buildLocalTurnTitle(
-  input: string,
-  intent: ResolvedRunIntent,
-  language: "zh" | "en",
-  contextSignals?: TurnInputContextSignals,
-): string {
-  const lowerInput = input.toLowerCase();
-  const context = normalizeTurnInputContextSignals(contextSignals);
-  if (/(?:codex|plan mode|计划模式|\.main\/plans\/plan\.md|plan\.md|proposed_plan)/i.test(input)) {
-    return language === "en" ? "Codex-style planning flow" : "重构 Codex 式计划流程";
-  }
-  if (/(?:sidebar|侧边栏|会话).*(?:标题|title)|(?:标题|title).*(?:sidebar|侧边栏|会话)/i.test(input)) {
-    return language === "en" ? "Fix semantic session titles" : "修复会话语义标题";
-  }
-  if (context.imageParts > 0) {
-    if (intent === "plan") return language === "en" ? "Plan screenshot-based fix" : "基于截图制定修复方案";
-    if (intent === "analyze") return language === "en" ? "Analyze screenshot issue" : "分析截图中的问题";
-    return language === "en" ? "Review screenshot context" : "分析截图上下文";
-  }
-  if (context.mentionedFilePaths.length > 0 || context.attachedFilePaths.length > 0) {
-    const fileName = [...context.mentionedFilePaths, ...context.attachedFilePaths][0]?.split(/[\\/]/).pop() || "";
-    if (fileName) return language === "en" ? `Analyze ${fileName}` : `分析 ${fileName}`;
-    return language === "en" ? "Analyze provided files" : "分析提供的文件";
-  }
-  const dataKeywords = /表格|excel|xlsx|csv|数据|用户画像|ltv|rfm|k-means|聚类|付费|注册|评论/i;
-  if (dataKeywords.test(lowerInput)) {
-    return language === "en" ? "Analyze user data" : "分析用户行为数据";
-  }
-  const cleanedInput = summarizeUserPrompt(input, language === "en" ? 52 : 40);
-  if (cleanedInput) return cleanedInput;
-  if (intent === "plan") return language === "en" ? "Create analysis plan" : "制定分析计划";
-  if (intent === "report") return language === "en" ? "Generate report" : "生成分析报告";
-  if (intent === "summarize") return language === "en" ? "Summarize materials" : "总结资料内容";
-  if (intent === "analyze") return language === "en" ? "Analyze materials" : "分析资料内容";
-  return language === "en" ? "New task" : "新的任务";
-}
-
-function buildTitleIntentSignature(
-  input: string,
-  intent: ResolvedRunIntent,
-  contextSignals?: TurnInputContextSignals,
-): string {
-  const context = normalizeTurnInputContextSignals(contextSignals);
-  return [
-    intent,
-    String(input || "").replace(/\s+/g, " ").trim().slice(0, 160),
-    `images:${context.imageParts}`,
-    `mentions:${context.mentionedFilePaths.slice(0, 3).join(",")}`,
-    `attachments:${context.attachedFilePaths.slice(0, 3).join(",")}`,
-  ].join("|");
-}
-
-function buildRunIntentSummary(params: {
-  input: string;
-  intent: ResolvedRunIntent;
-  language: "zh" | "en";
-  preflightSummary?: string | null;
-  reason?: string | null;
-}): string {
-  const fromPreflight = normalizeIntentSummary(params.preflightSummary || "");
-  if (fromPreflight) return fromPreflight.length <= 72 ? fromPreflight : `${fromPreflight.slice(0, 72).trim()}...`;
-
-  const label = RUN_INTENT_LABELS[params.intent]?.[params.language] || params.intent;
-  const subject = summarizeUserPrompt(params.input, params.language === "zh" ? 34 : 42);
-  if (subject && subject !== "新的任务") {
-    return params.language === "zh" ? `${label}：${subject}` : `${label}: ${subject}`;
-  }
-
-  const reason = normalizeIntentSummary(params.reason || "");
-  return reason || (params.language === "zh" ? `${label}：新的任务` : `${label}: New task`);
-}
-
-function buildMainDebugPrompt(feedback: string): string {
-  const trimmedFeedback = feedback.trim();
-  const feedbackBlock = trimmedFeedback || "未提供反馈正文。请先向用户索取完整反馈内容，再生成 bugfix 计划。";
-  return [
-    "[MDEBUG: USER FEEDBACK SELF-REPAIR]",
-    "以下是来自 MAIN Beta 用户反馈的修复请求。请在当前 MAIN 源码工作区中处理。",
-    "",
-    "工作流程：",
-    "1. 先只读定位相关源码、日志入口、复现路径和可能根因。",
-    "2. 基于反馈生成精简的 `.MAIN/plans/bugfix.md`，内容包含：现象、根因假设、影响范围、修复方案、验证方式。",
-    "3. 输出审批 Proposal，等待用户批准。",
-    "4. 批准前不要修改源码，不要生成 `.MAIN/plans/tasks.md`，不要绕过计划审批。",
-    "",
-    "用户反馈：",
-    feedbackBlock,
-  ].join("\n");
 }
 
 // region: 回合标题语义同步
@@ -3588,36 +2523,6 @@ export function sanitizeAgentMessagesForPersist(messages: AgentMessage[]): Agent
   });
 }
 
-function normalizePlanTaskStatuses(
-  tasks: PlanTask[],
-  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
-  shouldHighlightNextTask = false,
-): PlanTask[] {
-  if (!tasks.length) return tasks;
-  return reconcilePlanTaskCompletion([], tasks, evidenceLedger, {
-    preserveMissing: false,
-    highlightNext: shouldHighlightNextTask,
-  });
-}
-
-function detectRequestedRootMarkdownDeliverables(text: string): string[] {
-  const source = String(text || "");
-  const hasRootHint = /(?:根目录|项目根目录|当前项目|workspace root|project root|root directory)/i.test(source);
-  const names = Array.from(source.matchAll(/(?:^|[^\w./-])([A-Za-z][\w.-]*\.md|README\.md|Readme\.md|readme\.md)(?=$|[^\w./-])/g))
-    .map((match) => match[1])
-    .filter(Boolean)
-    .map((name) => name.replace(/^readme\.md$/i, "Readme.md"))
-    .filter((name) => !/^(?:plan|requirements|design|tasks|bugfix)\.md$/i.test(name));
-
-  if (names.length === 0 && hasRootHint && /(?:md\s*文档|markdown|说明文档|总结.*文档|Readme|README)/i.test(source)) {
-    names.push("Readme.md");
-  }
-
-  return [...new Set(names)];
-}
-
-
-
 function derivePlanStageFromArtifacts(
   artifacts: PlanArtifact[],
   tasks: PlanTask[],
@@ -3693,7 +2598,7 @@ function buildPlanArtifactRevertPatch(
         })
       : [];
   } else {
-    nextTasks = normalizePlanTaskStatuses(
+    nextTasks = normalizeApprovedPlanTaskStatuses(
       state.planTasks,
       state.planExecutionEvidenceLedger,
       state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
@@ -3710,124 +2615,6 @@ function buildPlanArtifactRevertPatch(
       state.planStage,
     ),
   };
-}
-
-function buildPlanCommandExecutionHint(
-  tasks: PlanTask[],
-  language: "zh" | "en",
-): string {
-  const focus = getPendingPlanTaskCommandFocus(tasks, 3);
-  const diagnosticHint = language === "zh"
-    ? "诊断步骤优先使用内联 `run_command`，避免在项目根目录创建临时诊断脚本；确需脚本文件时，请先把它列入当前任务清单或持久化的 tasks.md，并使用明确临时路径或清理策略。"
-    : "For diagnostics, prefer inline `run_command` and avoid creating temporary diagnostic scripts in the project root; if a script file is truly needed, list it in the current task list or persisted tasks.md first and use an explicit temporary path or cleanup strategy.";
-  if (focus.length === 0) {
-    return language === "zh"
-      ? "如果某个任务需要 shell 命令，请把精确命令写在当前任务清单里并用反引号包裹；如果本轮选择持久化 tasks.md，也同步写入对应 checkbox。执行阶段看到这些命令时，一次性命令优先用 run_command 并检查 exitCode/stdout/stderr，长驻或交互式命令用 execute_command 后再用 read_pty_since/read_pty_tail/get_pty_status 检查输出。" + diagnosticHint
-      : "If a task needs shell work, place the exact command in the current task list using backticks; if this run persists tasks.md, mirror it in the matching checkbox. During execution, prefer run_command for finite commands and inspect exitCode/stdout/stderr; use execute_command for long-running or interactive commands, then verify with read_pty_since/read_pty_tail/get_pty_status. " + diagnosticHint;
-  }
-
-  const lines = focus
-    .map(({ task, commands }) =>
-      language === "zh"
-        ? `任务：${task.text}\n命令：${commands.map((command) => `\`${command}\``).join("、")}`
-        : `Task: ${task.text}\nCommands: ${commands.map((command) => `\`${command}\``).join(", ")}`,
-    )
-    .join("\n\n");
-
-  return language === "zh"
-    ? "以下未完成任务里已经包含明确的 shell 命令，恢复执行后请优先真实运行它们：一次性命令用 run_command；长驻或交互式命令用 execute_command 后再读取 PTY 日志。不要只复述：\n\n" + lines + "\n\n" + diagnosticHint
-    : "The remaining tasks already include concrete shell commands. After resuming, run them for real: use run_command for finite commands; use execute_command and then read PTY logs for long-running or interactive commands. Do not only describe them:\n\n" + lines + "\n\n" + diagnosticHint;
-}
-
-function ensureApprovedPlanRuntimeTasksForState(
-  state: AppState,
-  language: "zh" | "en",
-): PlanTask[] {
-  const hasPersistedTasksArtifact = state.planArtifacts.some((artifact) => artifact.kind === "tasks");
-  if (state.planTasks.length > 0) {
-    const normalizedTasks = normalizePlanTaskStatuses(state.planTasks, state.planExecutionEvidenceLedger, state.isPlanApproved);
-    if (!hasPersistedTasksArtifact) {
-      const derivedRuntimeTasks = deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
-        language,
-        maxTasks: 8,
-      });
-      if (derivedRuntimeTasks.length > 0) {
-        return reconcilePlanTaskCompletion(
-          normalizedTasks,
-          derivedRuntimeTasks,
-          state.planExecutionEvidenceLedger,
-          {
-            preserveMissing: false,
-            highlightNext: state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
-          },
-        );
-      }
-    }
-    return normalizedTasks;
-  }
-  if (hasPersistedTasksArtifact) {
-    return state.planTasks;
-  }
-  return deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
-    language,
-    maxTasks: 8,
-  });
-}
-
-function formatPlanTaskListForPrompt(tasks: PlanTask[], language: "zh" | "en", limit = 12): string {
-  const visibleTasks = tasks.slice(0, limit);
-  if (visibleTasks.length === 0) {
-    return language === "zh"
-      ? "- 暂无 runtime 任务；请先从 plan.md 生成可审计任务清单。"
-      : "- No runtime tasks yet; first derive an auditable task list from plan.md.";
-  }
-  return visibleTasks.map((task, index) => {
-    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
-      (language === "zh" ? "无证据标签" : "no evidence label");
-    return `${index + 1}. ${task.text} [${evidence}]`;
-  }).join("\n");
-}
-
-function buildApprovedPlanExecutionPrompt(input: {
-  state: AppState;
-  language: "zh" | "en";
-  executionPlanTasks: PlanTask[];
-  normalizedApprovalChoice: string | null;
-}): string {
-  const hasTasksArtifact =
-    input.state.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
-    input.executionPlanTasks.length > 0;
-  const hasPersistedTasksArtifact = input.state.planArtifacts.some((artifact) => artifact.kind === "tasks");
-  const derivedRuntimeTasks =
-    input.state.planTasks.length === 0 &&
-    !hasPersistedTasksArtifact &&
-    input.executionPlanTasks.length > 0;
-  const currentPlanTurn = input.state.currentTurnId
-    ? input.state.conversationTurns.find((turn) => turn.id === input.state.currentTurnId)
-    : null;
-  const requestedDocs = detectRequestedRootMarkdownDeliverables(currentPlanTurn?.userPrompt || "");
-  const deliverableHint = requestedDocs.length > 0
-    ? input.language === "en"
-      ? ` The final tasks must include writing ${requestedDocs.map((name) => `project-root \`${name}\``).join(", ")} before completion.`
-      : ` 最终 tasks 必须包含写入${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}，完成前必须真实落盘。`
-    : "";
-  const approvalChoiceHint = buildPlanApprovalChoiceHint(input.normalizedApprovalChoice, input.language);
-  const taskListText = formatPlanTaskListForPrompt(input.executionPlanTasks, input.language);
-  const runtimeTaskNotice = derivedRuntimeTasks
-    ? input.language === "en"
-      ? "\n\nMAIN already derived a runtime task list from the approved plan, so you do not need to create `.MAIN/plans/tasks.md` before the first source write. Use this list as the execution source of truth; persist it to tasks.md only if the work becomes long, needs cross-session audit, or the user explicitly asks for an audit file:\n" + taskListText
-      : "\n\nMAIN 已经从批准后的 design 派生出 runtime 任务清单，因此第一次源码写入前不必先创建 `.MAIN/plans/tasks.md`。请把下面清单作为本轮执行事实来源；只有任务变长、需要跨会话审计或用户明确要求留档时，才持久化到 tasks.md：\n" + taskListText
-    : "";
-
-  if (input.language === "en") {
-    return hasTasksArtifact
-      ? approvalChoiceHint + "The plan is approved. Continue directly from the current task list and execute the remaining items without repeating the plan. Do not read `.MAIN/plans/tasks.md` just to check whether it exists. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, switch to writing/patching, inspect a different target, or pause with the exact blocker instead of rereading. If `.MAIN/plans/tasks.md` is already known to exist, keep it as an audit record: do not delete completed or previous task records, and only check an item off after real evidence exists for its file/command/deliverable/browser validation, or the item is explicitly pending user validation." + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(input.executionPlanTasks, "en")
-      : approvalChoiceHint + "The plan is approved. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only if the work is long, needs cross-session audit, or the user explicitly requested a durable task file. Do not read tasks.md just to check whether it exists. Then execute real work without repeating the plan. Task items should be concise and include lightweight evidence such as `evidence: file:src/app.ts` or `evidence: cmd:npm test` when there is a concrete deliverable." + deliverableHint;
-  }
-
-  return hasTasksArtifact
-    ? approvalChoiceHint + "计划已批准。请直接基于当前任务清单继续执行剩余任务，不要重复计划内容。不要为了确认 `.MAIN/plans/tasks.md` 是否存在而读取它；如果源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，请改为写入/替换、读取不同目标，或明确暂停说明阻塞，不要继续重复读取；如果它已知存在，它是审计记录：不要删除已完成或旧任务记录；只有文件/命令/交付物/浏览器验证的真实证据满足，或该项明确待用户验证后，才能勾选对应任务。" + deliverableHint + runtimeTaskNotice + "\n\n" + buildPlanCommandExecutionHint(input.executionPlanTasks, "zh")
-    : approvalChoiceHint + "计划已批准。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求持久任务文件时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。然后执行真实任务，不要重复计划内容。有明确交付物的任务请保留轻量证据标签，例如 `证据: file:src/app.ts` 或 `证据: cmd:npm test`。" + deliverableHint;
 }
 
 function buildPlanApprovalHandoffDedupLogPayload(input: {
@@ -3940,80 +2727,6 @@ export function startApprovedPlanExecutionTurnFromHandoff(input: {
   return true;
 }
 
-function buildTrustedPlanResumePrompt(input: {
-  language: "zh" | "en";
-  hasTasksArtifact: boolean;
-  tasks: PlanTask[];
-  artifacts: PlanArtifact[];
-  evidenceLedger: PlanExecutionEvidenceEntry[];
-}): string {
-  const audit = buildPlanTaskEvidenceAudit({
-    tasks: input.tasks,
-    evidenceLedger: input.evidenceLedger,
-    highlightNext: true,
-  });
-  const remaining = audit.remainingTasks.slice(0, 8);
-  const remainingText = remaining.length > 0
-    ? remaining.map((task, index) => {
-        const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
-          (input.language === "zh" ? "无证据标签" : "no evidence tags");
-        return `${index + 1}. ${task.text} [${task.evidenceStatus || "missing"}; ${evidence}]`;
-      }).join("\n")
-    : input.language === "zh"
-    ? "无剩余未满足证据的任务；请核查 runtime 任务清单是否为空或已全部满足。tasks.md 是可选审计文件，不要为了确认是否存在而读取它。"
-    : "No remaining task with unsatisfied evidence; verify whether the runtime task list is empty or fully satisfied. tasks.md is optional; do not read it just to check existence.";
-  const evidenceText = input.evidenceLedger.slice(-8).map((entry) =>
-    `- ${entry.kind}:${entry.target || entry.value} (${entry.sourceTool})`
-  ).join("\n") || (input.language === "zh" ? "- 暂无可信执行证据" : "- No trusted execution evidence yet");
-  const artifactText = input.artifacts.map((artifact) =>
-    `- ${artifact.path} (${artifact.kind}, ${artifact.content.length} chars)`
-  ).join("\n") || (input.language === "zh" ? "- 暂无计划文件摘要" : "- No plan artifact summary");
-
-  if (input.language === "zh") {
-    return [
-      "请在新的恢复上下文中继续执行计划，不要复用上一轮错误链路。",
-      input.hasTasksArtifact
-        ? "从 `.MAIN/plans/tasks.md` 中选择证据未满足且与当前改动最相关的任务继续；顺序是执行参考，不是强制线性流程。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
-        : input.artifacts.length === 0
-        ? "先读取当前 workspace 的 `.MAIN/plans/plan.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取。不要默认读取 `.MAIN/plans/tasks.md`，除非它已在计划摘要中确认存在或用户明确要求。"
-        : input.tasks.length > 0
-        ? "当前已恢复 runtime 任务清单；请选择证据未满足且与当前诊断最相关的任务直接执行，顺序是参考而不是强制。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
-        : "请先基于已批准的 plan.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。然后执行真实任务。",
-      "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
-      "",
-      "计划文件摘要：",
-      artifactText,
-      "",
-      "最近可信执行证据：",
-      evidenceText,
-      "",
-      "优先恢复任务：",
-      remainingText,
-    ].join("\n");
-  }
-
-  return [
-    "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
-    input.hasTasksArtifact
-      ? "Continue with an evidence-unsatisfied task that best matches the current change; task order is guidance, not a forced linear path. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
-      : input.artifacts.length === 0
-      ? "First read `.MAIN/plans/plan.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. Do not read `.MAIN/plans/tasks.md` by default unless it is confirmed in the plan summary or the user explicitly asks for it."
-      : input.tasks.length > 0
-      ? "A runtime task list is already available; choose the evidence-unsatisfied task that best matches the current diagnosis. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
-      : "First derive a runtime task list from the approved plan.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default. Then execute real tasks.",
-    "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
-    "",
-    "Plan artifact summary:",
-    artifactText,
-    "",
-    "Recent trusted execution evidence:",
-    evidenceText,
-    "",
-    "Priority recovery tasks:",
-    remainingText,
-  ].join("\n");
-}
-
 async function hydrateExistingPlanArtifactsForWorkspace(
   workspace: string,
   language: "zh" | "en",
@@ -4061,76 +2774,6 @@ async function hydrateExistingPlanArtifactsForWorkspace(
     { availablePaths },
   );
 }
-
-const STRUCTURED_ATTACHMENT_EXTENSIONS = new Set([
-  ".pdf",
-  ".docx",
-  ".xlsx",
-  ".xls",
-  ".csv",
-  ".tsv",
-]);
-
-const TABULAR_ATTACHMENT_EXTENSIONS = new Set([
-  ".xlsx",
-  ".xls",
-  ".csv",
-  ".tsv",
-]);
-
-function shouldUseDocumentReader(path: string): boolean {
-  const lower = path.toLowerCase();
-  for (const ext of STRUCTURED_ATTACHMENT_EXTENSIONS) {
-    if (lower.endsWith(ext)) return true;
-  }
-  return false;
-}
-
-function shouldUseTabularAnalyzer(path: string): boolean {
-  const lower = path.toLowerCase();
-  for (const ext of TABULAR_ATTACHMENT_EXTENSIONS) {
-    if (lower.endsWith(ext)) return true;
-  }
-  return false;
-}
-
-interface AttachmentReadRef {
-  path: string;
-  displayName: string;
-  kind: AttachmentKind;
-  workspace?: string;
-  sourcePath?: string;
-}
-
-async function prepareAttachedFileForRead(
-  entry: AttachedFile | string,
-  sessionKey: string,
-): Promise<AttachmentReadRef> {
-  const attachment = normalizeAttachedFile(entry);
-  const sourcePath = attachment.sourcePath || attachment.path;
-
-  if (attachment.readable && attachment.workspace) {
-    return {
-      path: attachment.path,
-      displayName: attachment.displayName || getAttachmentDisplayName(attachment.path),
-      kind: attachment.kind,
-      workspace: attachment.workspace,
-      sourcePath,
-    };
-  }
-
-  const ingested = await ingestAttachmentFile(sessionKey, sourcePath);
-  const kind = classifyAttachment(ingested.path);
-  return {
-    path: ingested.path,
-    workspace: ingested.workspace,
-    displayName: attachment.displayName || ingested.displayName || getAttachmentDisplayName(sourcePath),
-    kind: kind === "tabular" || kind === "document" ? kind : "text",
-    sourcePath: ingested.originalPath || sourcePath,
-  };
-}
-
-
 
 function blockHasVisibleAgentContent(block: TaskBlock): boolean {
   if (block.type !== "agent" || block.hiddenProcess) return false;
@@ -6475,7 +5118,7 @@ export const useAppStore = create<AppState>()(
             preserveMissing: preserveTaskHistory,
             highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
           })
-        : normalizePlanTaskStatuses(
+        : normalizeApprovedPlanTaskStatuses(
             s.planTasks,
             s.planExecutionEvidenceLedger,
             s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
@@ -7194,64 +5837,19 @@ export const useAppStore = create<AppState>()(
     selectedReplyOptionText?: string;
   }) => {
     let state = get();
-    // If agent is waiting in pending_review, and this is NOT an approval action,
-    // we abort the current run loop and start a new turn immediately.
-    const isApprovalBypass = options?.executionConsentGranted === true || (() => {
-      const currentTurn = state.currentTurnId
-        ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
-        : null;
-      if (!currentTurn) return false;
-      const replyOptions = state.taskFlow.filter((block: any) =>
-        block.turnId === currentTurn.id &&
-        block.type === "agent" &&
-        Array.isArray(block.options) &&
-        block.options.length > 0
-      );
-      const selected = text.trim();
-      const option = selected
-        ? replyOptions
-            .flatMap((block: any) => block.options || [])
-            .find((opt: any) => opt.value === selected || opt.label === selected) || null
-        : null;
-      return option?.action === "execute_once" || option?.action === "approve_operation_once";
-    })();
-
-    if (state.agentStatus === "pending_review" && !isApprovalBypass) {
-      logStoreEvent("send_pending_review_abort_and_new_turn", {
-        textChars: text?.length ?? 0,
-        pendingReviewTaskId: state.pendingReviewTaskId,
-      });
-
-      if (state.abortController) {
-        try {
-          state.abortController.abort();
-        } catch (e) {
-          console.error("Failed to abort controller during pending_review transition:", e);
-        }
-      }
-
-      if (state.pendingReviewResolve) {
-        try {
-          state.pendingReviewResolve({ action: "reject" });
-        } catch (e) {
-          console.error("Failed to resolve pendingReviewResolve during pending_review transition:", e);
-        }
-      }
-
-      set({
-        agentStatus: "idle",
-        isGenerating: false,
-        abortController: null,
-        pendingReviewResolve: null,
-        pendingReviewTaskId: null,
-        pendingToolCall: null,
-      });
-
-      if (state.currentTurnId) {
-        get().setConversationTurnStatus(state.currentTurnId, "stopped_no_action");
-      }
-
-      state = get();
+    const pendingReviewTransition = applySubmitPendingReviewTransition({
+      text,
+      executionConsentGranted: options?.executionConsentGranted,
+      state,
+      getState: get,
+      setState: set,
+      setConversationTurnStatus: (turnId, status) => {
+        get().setConversationTurnStatus(turnId, status);
+      },
+      logStoreEvent,
+    });
+    if (pendingReviewTransition.aborted) {
+      state = pendingReviewTransition.state;
     }
     const sendOriginSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
     const applyPreRunSessionPatch = (patch: Partial<AppState> | Record<string, unknown>) => {
@@ -7316,109 +5914,16 @@ export const useAppStore = create<AppState>()(
         : undefined
     );
     const hasSupplementalInput = mentionSnapshot.length > 0 || attachedFilesSnapshot.length > 0;
-    const currentTurn = state.currentTurnId
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
-      : null;
-    const currentTurnReplyOptionBlocks = currentTurn
-      ? state.taskFlow.filter((block): block is Extract<TaskBlock, { type: "agent" }> =>
-          block.turnId === currentTurn.id &&
-          block.type === "agent" &&
-          Array.isArray(block.options) &&
-          block.options.length > 0,
-        )
-      : [];
-    const currentTurnHasReplyOptions = currentTurnReplyOptionBlocks.length > 0;
-    const currentTurnIntent = resolveConversationTurnIntent(currentTurn);
     const currentMainModeKey = state.selectedMainModeKey;
-    const hasPlanArtifacts = state.planArtifacts.length > 0 || state.planStage !== "idle";
-    const hasApprovedOrExecutingPlanState =
-      hasPlanArtifacts &&
-      (state.isPlanApproved || state.planStage === "executing");
-    const planExecutionResumeContinuationTarget =
-      !isHidden && currentMainModeKey === "main_mode"
-        ? findPlanExecutionResumeContinuationTarget(text, currentTurn, state.conversationTurns, state.taskFlow)
-        : null;
-    const shouldRouteContinuationToPlanResume =
-      !isHidden &&
-      !options?.skipIntentResolution &&
-      !options?.resolvedIntent &&
-      looksLikePreviousTurnContinuationInput(text) &&
-      (
-        hasApprovedOrExecutingPlanState ||
-        !!planExecutionResumeContinuationTarget
-      );
-    const shouldContinuePlanIntent =
-      !isHidden &&
-      !shouldRouteContinuationToPlanResume &&
-      currentTurnIntent === "plan" &&
-      isContinuationPrompt(text) &&
-      (state.planStage !== "completed" || state.planArtifacts.length === 0);
-    const shouldAllowPreviousTurnContinuation =
-      !isHidden &&
-      !shouldRouteContinuationToPlanResume &&
-      !shouldContinuePlanIntent &&
-      (
-        currentMainModeKey === "main_mode" ||
-        (currentMainModeKey === "game_studio" && (currentTurnIntent === "plan" || hasPlanArtifacts))
-      );
-    const previousTurnContinuationTarget =
-      shouldAllowPreviousTurnContinuation
-        ? findPreviousTurnContinuationTarget(text, currentTurn, state.conversationTurns, state.taskFlow)
-        : null;
-    const shouldContinuePreviousTurnIntent = !!previousTurnContinuationTarget;
-    const previousTurnContinuationIntent = previousTurnContinuationTarget
-      ? resolveConversationTurnIntent(previousTurnContinuationTarget)
-      : null;
-    const selectedAwaitingChoice = text.trim();
-    const selectedAwaitingReplyOption = selectedAwaitingChoice
-      ? currentTurnReplyOptionBlocks
-          .flatMap((block) => block.options || [])
-          .find((option) => findReplyOptionMatchingSelectedText([option], selectedAwaitingChoice)) || null
-      : null;
-    const shouldAutoResumeChoiceTurn =
-      !isHidden &&
-      options?.reuseCurrentTurn !== true &&
-      !!currentTurn &&
-      currentTurnHasReplyOptions &&
-      !!selectedAwaitingReplyOption;
-    const shouldExplicitlyReuseCurrentTurn = options?.reuseCurrentTurn === true;
-    const reusableTurnId = state.currentTurnId;
-    const reuseCurrentTurn =
-      (shouldExplicitlyReuseCurrentTurn || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent) &&
-      !!reusableTurnId;
-    const isInternalTurn = isHidden && !reuseCurrentTurn && !createVisibleTurnForHiddenMessage;
-    const shouldReuseExistingTurnIntent =
-      reuseCurrentTurn &&
-      !!currentTurn &&
-      (currentTurn.status === "awaiting_input" || currentTurnHasReplyOptions);
-    const shouldExecuteOnceFromReplyOption =
-      selectedAwaitingReplyOption?.action === "execute_once" ||
-      selectedAwaitingReplyOption?.action === "approve_operation_once";
-    const operationProposalChoiceAction = selectedAwaitingReplyOption?.action;
-    const preservePlanState =
-      options?.preservePlanState === true ||
-      shouldContinuePlanIntent ||
-      shouldContinuePreviousTurnIntent ||
-      (shouldReuseExistingTurnIntent && currentTurnIntent === "plan") ||
-      (shouldAutoResumeChoiceTurn && currentTurnIntent === "plan") ||
-      looksLikePlanContinuationOrApprovalInput(text, {
-        hasPlanArtifacts,
-        planStage: state.planStage,
-        isPlanApproved: state.isPlanApproved,
-      });
-    const parsedStudioCommand = currentMainModeKey === "game_studio"
+    const preParsedStudioCommand = currentMainModeKey === "game_studio"
       ? parseGameStudioSlashCommand(text)
       : null;
-    const parsedStudioWorkflowArgs = parsedStudioCommand?.type === "workflow"
-      ? parsedStudioCommand.args
+    const preParsedStudioWorkflowArgs = preParsedStudioCommand?.type === "workflow"
+      ? preParsedStudioCommand.args
       : "";
-    const parsedSetupEngineCommand =
-      parsedStudioCommand?.type === "workflow" && parsedStudioCommand.slug === "setup-engine"
-        ? parseSetupEngineArgs(parsedStudioWorkflowArgs)
-        : null;
     const languageResolutionInput =
-      parsedStudioCommand?.type === "workflow"
-        ? (parsedStudioWorkflowArgs || text)
+      preParsedStudioCommand?.type === "workflow"
+        ? (preParsedStudioWorkflowArgs || text)
         : text;
     const preferredLanguage = isHidden
       ? state.preferredResponseLanguage
@@ -7428,122 +5933,6 @@ export const useAppStore = create<AppState>()(
           systemLanguage: state.config.language === "en" ? "en" : "zh",
           fallbackLanguage: state.config.language === "en" ? "en" : "zh",
         });
-    const hasRuntimePlanState =
-      state.planArtifacts.length > 0 ||
-      state.planTasks.length > 0 ||
-      state.planStage !== "idle";
-    const shouldAttemptAutoPlanHydration =
-      !isHidden &&
-      options?.skipAutoPlanHydration !== true &&
-      !!state.currentWorkspace.trim();
-    const autoHydrationReason = shouldAttemptAutoPlanHydration
-      ? resolvePlanStateHydrationReason({
-          text,
-          hasPlanState: hasRuntimePlanState,
-          hasContinuationState: state.isPlanApproved || state.planStage === "executing",
-          slashCommand: parsedStudioCommand,
-        })
-      : null;
-    if (autoHydrationReason) {
-      void (async () => {
-        let hydrated:
-          | Awaited<ReturnType<typeof hydrateExistingPlanArtifactsForWorkspace>>
-          | null = null;
-        try {
-          hydrated = await hydrateExistingPlanArtifactsForWorkspace(
-            state.currentWorkspace,
-            preferredLanguage === "en" ? "en" : "zh",
-          );
-        } catch {
-          hydrated = null;
-        }
-
-        const shouldPromoteToExecuting = shouldPromoteHydratedPlanToExecuting(autoHydrationReason);
-        const hasHydratedData = !!hydrated && (hydrated.artifacts.length > 0 || hydrated.tasks.length > 0);
-        if (hydrated && hasHydratedData) {
-          set((s) => {
-            const alreadyHasPlanState =
-              s.planArtifacts.length > 0 ||
-              s.planTasks.length > 0 ||
-              s.planStage !== "idle";
-            if (alreadyHasPlanState) return {};
-            const baseStage = derivePlanStageFromArtifacts(
-              hydrated.artifacts,
-              hydrated.tasks,
-              shouldPromoteToExecuting,
-              s.planStage,
-            );
-            const nextStage =
-              shouldPromoteToExecuting && (baseStage === "idle" || baseStage === "ready_to_execute")
-                ? "executing"
-                : baseStage;
-            const threadId =
-              resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) ||
-              "default";
-            const nextEvent = withEventSchema({
-              type: "plan_state_hydrated",
-              threadId,
-              turnId: s.currentTurnId || undefined,
-              timestampMs: Date.now(),
-              reason: autoHydrationReason,
-              taskCount: hydrated.tasks.length,
-              artifactPaths: hydrated.artifacts.map((artifact) => artifact.path),
-            });
-            return {
-              planArtifacts: hydrated.artifacts,
-              planTasks: hydrated.tasks,
-              planStage: nextStage,
-              isPlanApproved: shouldPromoteToExecuting || s.isPlanApproved,
-              showPlanPanel: true,
-              rightPanelTab: "plan",
-              showDiff: false,
-              runtimeEvents: appendRuntimeEvent(s.runtimeEvents, nextEvent),
-            };
-          });
-          logStoreEvent("plan_state_hydrated", {
-            workspace: state.currentWorkspace || null,
-            reason: autoHydrationReason,
-            artifacts: hydrated.artifacts.map((artifact) => artifact.path),
-            taskCount: hydrated.tasks.length,
-          });
-        }
-
-        const nextOptions = {
-          ...(options || {}),
-          skipAutoPlanHydration: true,
-          preservePlanState:
-            options?.preservePlanState === true || (hasHydratedData && shouldPromoteToExecuting),
-        };
-        if (sendOriginSessionKey && !isSessionRuntimeActive(get(), sendOriginSessionKey)) {
-          logStoreEvent("send_async_resume_skipped_inactive_session", {
-            phase: "auto_plan_hydration",
-            sessionKey: sendOriginSessionKey,
-          });
-          return;
-        }
-        get().sendMessage(text, images, nextOptions);
-      })();
-      return true;
-    }
-    const mainDebugShortcut = !isHidden && currentMainModeKey === "main_mode"
-      ? parseMainDebugShortcut(text)
-      : null;
-    if (mainDebugShortcut) {
-      text = buildMainDebugPrompt(mainDebugShortcut.rest);
-    }
-    const mainIntentShortcut = !isHidden && !mainDebugShortcut
-      ? parseMainIntentShortcutForMode(text, currentMainModeKey)
-      : null;
-    if (mainIntentShortcut) {
-      text = mainIntentShortcut.rest.trimStart();
-    }
-    const modeScopedLockedComposerIntent =
-      state.lockedComposerIntent && isMainIntentShortcutAllowedInMainMode(state.lockedComposerIntent, currentMainModeKey)
-        ? state.lockedComposerIntent
-        : null;
-    const lockedComposerIntent = !isHidden && !mainDebugShortcut
-      ? modeScopedLockedComposerIntent || mainIntentShortcut?.intent || null
-      : null;
     const cachedWorkspaceTreeForGameDetection =
       state.currentWorkspace &&
       workspaceTreeCacheKey === state.currentWorkspace &&
@@ -7553,38 +5942,98 @@ export const useAppStore = create<AppState>()(
     if (!cachedWorkspaceTreeForGameDetection && state.currentWorkspace.trim()) {
       void getWorkspaceTree(state.currentWorkspace);
     }
-    if (shouldConsiderGameStudioSuggestion({
-      isHidden,
-      currentMainModeKey,
-      hasPendingRunDecision: !!state.pendingRunDecision,
-      hasMainDebugShortcut: !!mainDebugShortcut,
-      hasMainIntentShortcut: !!mainIntentShortcut,
-      hasLockedComposerIntent: !!lockedComposerIntent,
-      skipIntentResolution: options?.skipIntentResolution,
-      resolvedIntent: options?.resolvedIntent,
-      shouldContinuePlanIntent,
-      shouldContinuePreviousTurnIntent,
-      shouldReuseExistingTurnIntent,
-      suppressGameStudioSuggestion: options?.suppressGameStudioSuggestion,
-      input: text,
+    const submitPipelineDecision = buildSubmitPipelineDecision({
+      text,
+      images,
+      options,
+      preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
+      workspaceTreeForGameDetection: cachedWorkspaceTreeForGameDetection,
+      createGameStudioModeSwitchDecision,
+      snapshot: {
+        agentStatus: state.agentStatus,
+        currentTurnId: state.currentTurnId,
+        conversationTurns: state.conversationTurns,
+        taskFlow: state.taskFlow,
+        selectedMainModeKey: currentMainModeKey,
+        currentWorkspace: state.currentWorkspace,
+        contextMentions: mentionSnapshot,
+        attachedFilesCount: attachedFilesSnapshot.length,
+        planArtifactsCount: state.planArtifacts.length,
+        planTasksCount: state.planTasks.length,
+        planStage: state.planStage,
+        isPlanApproved: state.isPlanApproved,
+        pendingRunDecision: state.pendingRunDecision,
+        lockedComposerIntent: state.lockedComposerIntent,
+      },
+    });
+    const {
+      currentTurn,
+      currentTurnHasReplyOptions,
+      currentTurnIntent,
       hasPlanArtifacts,
-      planStage: state.planStage,
-      isPlanApproved: state.isPlanApproved,
-    })) {
-      const gameDevelopmentSignal = detectGameDevelopmentIntent(text, {
-        workspaceTree: cachedWorkspaceTreeForGameDetection,
+      planExecutionResumeContinuationTarget,
+      shouldRouteContinuationToPlanResume,
+      shouldContinuePlanIntent,
+      previousTurnContinuationTarget,
+      shouldContinuePreviousTurnIntent,
+      previousTurnContinuationIntent,
+      shouldAutoResumeChoiceTurn,
+      shouldExplicitlyReuseCurrentTurn,
+      reusableTurnId,
+      reuseCurrentTurn,
+      isInternalTurn,
+      shouldReuseExistingTurnIntent,
+      shouldExecuteOnceFromReplyOption,
+      operationProposalChoiceAction,
+      preservePlanState,
+    } = submitPipelineDecision.turnReuse;
+    const parsedStudioCommand = submitPipelineDecision.parsedStudioCommand;
+    const isLocalFastStudioCommand =
+      parsedStudioCommand != null &&
+      getGameStudioSlashCommandSpec(parsedStudioCommand)?.executionMode === "local_fast";
+    const parsedStudioWorkflowArgs = parsedStudioCommand?.type === "workflow"
+      ? parsedStudioCommand.args
+      : "";
+    const parsedSetupEngineCommand =
+      parsedStudioCommand?.type === "workflow" && parsedStudioCommand.slug === "setup-engine"
+        ? parseSetupEngineArgs(parsedStudioWorkflowArgs)
+        : null;
+    const autoHydrationReason = submitPipelineDecision.planHydration.reason;
+    if (autoHydrationReason) {
+      startSubmitPlanHydrationEffect({
+        reason: autoHydrationReason,
+        text,
+        images,
+        options,
+        preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
+        workspace: state.currentWorkspace,
+        sendOriginSessionKey,
+        getState: get,
+        setState: set,
+        hydrateExistingPlanArtifactsForWorkspace,
+        derivePlanStageFromArtifacts,
+        isSessionRuntimeActive,
+        resumeSubmission: (nextText, nextImages, nextOptions) => {
+          get().sendMessage(nextText, nextImages, nextOptions);
+        },
+        logStoreEvent,
       });
-      if (gameDevelopmentSignal.shouldSuggest) {
-        applyPreRunSessionPatch({
-          pendingRunDecision: createGameStudioModeSwitchDecision({
-            input: text,
-            images,
-            language: preferredLanguage,
-            signal: gameDevelopmentSignal,
-          }),
-        });
-        return true;
-      }
+      return true;
+    }
+    const mainDebugShortcut = submitPipelineDecision.shortcuts.mainDebugShortcut;
+    if (mainDebugShortcut) {
+      text = buildMainDebugPrompt(mainDebugShortcut.rest);
+    }
+    const mainIntentShortcut = submitPipelineDecision.shortcuts.mainIntentShortcut;
+    if (mainIntentShortcut) {
+      text = submitPipelineDecision.shortcuts.textAfterIntentShortcut;
+    }
+    const lockedComposerIntent = submitPipelineDecision.shortcuts.lockedComposerIntent;
+    if (submitPipelineDecision.gameStudioModeSwitch.pendingRunDecision) {
+      applyPreRunSessionPatch({
+        pendingRunDecision: submitPipelineDecision.gameStudioModeSwitch.pendingRunDecision,
+      });
+      return true;
     }
     if (!text.trim() && !hasSupplementalInput && !images?.length) {
       return false;
@@ -7629,27 +6078,32 @@ export const useAppStore = create<AppState>()(
     });
     const isLocalStudioCommand =
       parsedStudioCommand?.type === "agent" || parsedStudioCommand?.type === "auto";
-    let effectiveRunIntent =
-      mainDebugShortcut ? "plan" :
-      options?.resolvedIntent ||
-      lockedComposerIntent ||
-      (shouldContinuePlanIntent ? "plan" : null) ||
-      (shouldContinuePreviousTurnIntent && previousTurnContinuationIntent ? previousTurnContinuationIntent : null) ||
-      (shouldReuseExistingTurnIntent
-        ? currentTurnIntent
-        : resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode));
-    let effectiveIntentSummary = normalizeIntentSummary(options?.intentSummary || "");
-    let effectiveCommandDirective: CommandDirective | null = options?.commandDirective ?? null;
-    const shouldForceExecuteForAutoApprove =
-      !isHidden &&
-      state.autoApproveTools === true &&
-      !mainDebugShortcut &&
-      !lockedComposerIntent &&
-      !shouldContinuePlanIntent &&
-      !shouldContinuePreviousTurnIntent &&
-      !shouldReuseExistingTurnIntent &&
-      !options?.skipIntentResolution &&
-      !options?.resolvedIntent;
+    const initialIntentDecision = resolveSubmitEffectiveIntentDecision({
+      text,
+      preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
+      options,
+      currentMainModeKey,
+      parsedStudioCommand,
+      isHidden,
+      autoApproveTools: state.autoApproveTools,
+      fallbackRunIntent: resolveRunIntentFromLegacyWorkflowMode(state.config.workflowMode),
+      mainDebugShortcut,
+      mainIntentShortcut,
+      lockedComposerIntent,
+      currentTurn,
+      currentTurnIntent,
+      shouldContinuePlanIntent,
+      shouldContinuePreviousTurnIntent,
+      previousTurnContinuationTarget,
+      previousTurnContinuationIntent,
+      shouldReuseExistingTurnIntent,
+      shouldExecuteOnceFromReplyOption,
+      unitySetupEngineSelected: parsedSetupEngineCommand?.engine === "unity",
+    });
+    let effectiveRunIntent = initialIntentDecision.effectiveRunIntent;
+    let effectiveIntentSummary = initialIntentDecision.effectiveIntentSummary;
+    let effectiveCommandDirective = initialIntentDecision.effectiveCommandDirective;
+    const shouldForceExecuteForAutoApprove = initialIntentDecision.shouldForceExecuteForAutoApprove;
     const applyDecisionSuppressedFallback = (
       source: "reuse_resolution" | "resolution",
       reason: string,
@@ -7669,107 +6123,6 @@ export const useAppStore = create<AppState>()(
         inputChars: text.trim().length,
       });
     };
-    if (
-      shouldExecuteOnceFromReplyOption &&
-      effectiveRunIntent !== "execute" &&
-      effectiveRunIntent !== "studio_workflow"
-    ) {
-      effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
-      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
-        source: "continuation",
-      });
-      effectiveIntentSummary = effectiveIntentSummary || buildRunIntentSummary({
-        input: text,
-        intent: effectiveRunIntent,
-        language: preferredLanguage,
-        reason: preferredLanguage === "en"
-          ? "The user selected an execution reply option, so this turn resumes with execute runtime tools."
-          : "用户选择了执行型回复选项，本轮使用执行运行能力继续。",
-      });
-    }
-
-    if (shouldForceExecuteForAutoApprove) {
-      effectiveRunIntent = currentMainModeKey === "game_studio" ? "studio_workflow" : "execute";
-      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, effectiveRunIntent, {
-        source: "natural_language",
-        parsedStudioCommand,
-      });
-      effectiveIntentSummary = effectiveIntentSummary || buildRunIntentSummary({
-        input: text,
-        intent: effectiveRunIntent,
-        language: preferredLanguage,
-        reason: preferredLanguage === "en"
-          ? "Auto-approval is enabled, so this turn uses execution semantics instead of natural chat."
-          : "自动审批已开启，本轮按执行语义处理，而不是普通聊天。",
-      });
-    }
-
-    if (!effectiveCommandDirective && parsedStudioCommand?.type === "workflow") {
-      effectiveCommandDirective = inferCommandDirective(text, "studio_workflow", {
-        source: "studio_slash",
-        parsedStudioCommand,
-      });
-    }
-
-    if (parsedSetupEngineCommand?.engine === "unity") {
-      effectiveCommandDirective = {
-        kind: "unity",
-        action: "setup-engine",
-        target: "unity",
-        source: "studio_slash",
-        requiresWorkspace: true,
-        requiresApproval: false,
-        confidence: 0.98,
-        reason: "Game Studio setup-engine explicitly selected Unity.",
-      };
-    }
-
-    if (mainDebugShortcut && !effectiveIntentSummary) {
-      effectiveIntentSummary = "MDEBUG：用户反馈自修复";
-      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, "plan", { source: "debug" });
-    }
-
-    if (shouldContinuePlanIntent && !effectiveIntentSummary) {
-      effectiveIntentSummary = buildRunIntentSummary({
-        input: currentTurn?.userPrompt || text,
-        intent: "plan",
-        language: preferredLanguage,
-        reason: preferredLanguage === "en"
-          ? "Continue the previous planning turn until the plan is produced."
-          : "继续上一轮计划目标，直到生成计划结果。",
-      });
-      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, "plan", { source: "continuation" });
-    }
-
-    if (shouldContinuePreviousTurnIntent && previousTurnContinuationTarget && !effectiveIntentSummary) {
-      effectiveIntentSummary = buildRunIntentSummary({
-        input: previousTurnContinuationTarget.userPrompt || text,
-        intent: previousTurnContinuationIntent || effectiveRunIntent,
-        language: preferredLanguage,
-        reason: preferredLanguage === "en"
-          ? "Continue the previous unfinished turn and complete the remaining work."
-          : "继续上一轮未完成内容并完成剩余操作。",
-      });
-      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(
-        previousTurnContinuationTarget.userPrompt || text,
-        previousTurnContinuationIntent || effectiveRunIntent,
-        { source: "continuation" },
-      );
-    }
-
-    if (lockedComposerIntent && !effectiveIntentSummary) {
-      effectiveIntentSummary = buildRunIntentSummary({
-        input: text,
-        intent: lockedComposerIntent,
-        language: preferredLanguage,
-        reason: preferredLanguage === "en"
-          ? "The user confirmed this composer intent before sending."
-          : "用户已在发送前确认本轮胶囊意图。",
-      });
-      effectiveCommandDirective = effectiveCommandDirective || inferCommandDirective(text, lockedComposerIntent, {
-        source: mainIntentShortcut ? "main_shortcut" : "natural_language",
-      });
-    }
 
     const shouldReevaluateReuseTurnIntent =
       !isHidden &&
@@ -7901,102 +6254,26 @@ export const useAppStore = create<AppState>()(
       }
 
       if (resolution.controlAction === "resume_plan_execution") {
-        applyPreRunSessionPatch({
-          input: "",
-          contextMentions: [],
-          attachedFiles: [],
-          lockedComposerIntent: null,
-          pendingRunDecision: null,
+        void runSubmitPlanExecutionResumeEffect({
+          text,
+          images,
+          preferredLanguage,
+          shouldRouteContinuationToPlanResume,
+          uiParentTurnId: planExecutionResumeContinuationTarget?.id || state.currentTurnId || undefined,
+          commandDirective: resolution.commandDirective || inferCommandDirective(text, "plan", {
+            source: "continuation",
+            controlAction: "resume_plan_execution",
+          }),
+          getState: get,
+          setState: set,
+          applyPreRunSessionPatch,
+          hydrateExistingPlanArtifactsForWorkspace,
+          ensureApprovedPlanRuntimeTasksForState,
+          resumeSubmission: (nextText, nextImages, nextOptions) => {
+            get().sendMessage(nextText, nextImages, nextOptions);
+          },
+          logStoreEvent,
         });
-        void (async () => {
-          const shouldHydrateExistingPlan =
-            looksLikeExistingPlanExecutionRequest(text) ||
-            shouldRouteContinuationToPlanResume;
-          let latest = get();
-          let hydratedForExecution:
-            | Awaited<ReturnType<typeof hydrateExistingPlanArtifactsForWorkspace>>
-            | null = null;
-
-          if (shouldHydrateExistingPlan) {
-            const alreadyHydrated =
-              latest.planArtifacts.length > 0 ||
-              latest.planTasks.length > 0 ||
-              latest.planStage !== "idle";
-            const hydrated = alreadyHydrated
-              ? {
-                  artifacts: latest.planArtifacts,
-                  tasks: latest.planTasks,
-                  hasTasksArtifact:
-                    latest.planArtifacts.some((artifact) => artifact.kind === "tasks") ||
-                    latest.planTasks.length > 0,
-                }
-              : await hydrateExistingPlanArtifactsForWorkspace(
-                  latest.currentWorkspace,
-                  preferredLanguage,
-                );
-            hydratedForExecution = hydrated;
-            latest = get();
-            set({
-              planArtifacts: hydrated.artifacts,
-              planTasks: hydrated.tasks,
-              isPlanApproved: true,
-              planApprovalChoice: text.trim() || null,
-              planStage: "executing",
-              planAutoResumeCount: 0,
-              planExecutionProgressSnapshot: null,
-              showPlanPanel: true,
-              rightPanelTab: "plan",
-              showDiff: false,
-            });
-            logStoreEvent("existing_plan_hydrated_for_execution", {
-              workspace: latest.currentWorkspace || null,
-              reusedExistingState: alreadyHydrated,
-              artifacts: hydrated.artifacts.map((artifact) => artifact.path),
-              taskCount: hydrated.tasks.length,
-            });
-          }
-
-          latest = get();
-          const resumePlanTasks = ensureApprovedPlanRuntimeTasksForState(latest, preferredLanguage);
-          if (resumePlanTasks.length > 0) {
-            set({ planTasks: resumePlanTasks });
-            latest = get();
-          }
-          const hasTasksArtifact =
-            (hydratedForExecution?.artifacts || latest.planArtifacts).some((artifact) => artifact.kind === "tasks") ||
-            resumePlanTasks.length > 0 ||
-            (hydratedForExecution?.tasks || latest.planTasks).length > 0;
-
-          get().sendMessage(
-            buildTrustedPlanResumePrompt({
-              language: preferredLanguage,
-              hasTasksArtifact,
-              tasks: resumePlanTasks.length > 0 ? resumePlanTasks : latest.planTasks,
-              artifacts: latest.planArtifacts,
-              evidenceLedger: latest.planExecutionEvidenceLedger,
-            }),
-            undefined,
-            {
-              hidden: true,
-              createVisibleTurnForHiddenMessage: true,
-              reuseCurrentTurn: false,
-              uiParentTurnId: planExecutionResumeContinuationTarget?.id || state.currentTurnId || undefined,
-              preservePlanState: true,
-              resolvedIntent: "plan",
-              runtimeIntentOverride: "execute",
-              commandDirective: resolution.commandDirective || inferCommandDirective(text, "plan", {
-                source: "continuation",
-                controlAction: "resume_plan_execution",
-              }),
-              executionConsentGranted: true,
-              skipIntentResolution: true,
-              turnTitle: preferredLanguage === "zh" ? "计划执行恢复" : "Plan Execution Resume",
-              intentSummary: preferredLanguage === "zh"
-                ? "从已批准计划的剩余任务继续执行。"
-                : "Resume execution from the remaining tasks in the approved plan.",
-            },
-          );
-        })();
         return true;
       }
 
@@ -8026,181 +6303,56 @@ export const useAppStore = create<AppState>()(
         }
       }
 
-      const locallyRequiresExecutionApproval =
-        resolution.requiresApproval === true ||
-        effectiveCommandDirective?.requiresApproval === true ||
-        effectiveCommandDirective?.kind === "file_modify" ||
-        effectiveCommandDirective?.kind === "shell" ||
-        effectiveCommandDirective?.kind === "git" ||
-        effectiveCommandDirective?.kind === "unity" ||
-        effectiveCommandDirective?.kind === "studio" ||
-        effectiveCommandDirective?.kind === "mcp";
-      if (
-        (resolution.intent === "execute" || resolution.intent === "studio_workflow") &&
-        locallyRequiresExecutionApproval
-      ) {
-        const pendingCopy = createPendingDecisionCopy(
-          {
-            suggestedIntent: "execute",
-            decisionOptions: ["execute", "respond"],
-            riskLevel: resolution.riskLevel,
-            reason: resolution.reason,
-          },
-          preferredLanguage,
-        );
+      const executionApprovalDecision = resolveSubmitExecutionApprovalDecision({
+        text,
+        images,
+        preferredLanguage,
+        resolution,
+        effectiveCommandDirective,
+        isLocalFastStudioCommand,
+      });
+      if (executionApprovalDecision.pendingRunDecision) {
         applyPreRunSessionPatch({
-          pendingRunDecision: {
-            kind: "intent_confirmation",
-            source: "pre_submit",
-            originalInput: text,
-            originalImages: images || [],
-            suggestedIntent: "execute",
-            reason: pendingCopy.reason,
-            title: pendingCopy.title,
-            options: pendingCopy.options,
-          },
+          pendingRunDecision: executionApprovalDecision.pendingRunDecision,
         });
         return true;
       }
 
       // 普通消息不应该因为额外的意图 preflight 而阻塞发送热路径。
       // 只有低置信度且真的可能改变流程的请求，才允许在这里等待 preflight。
-      if (shouldUseBlockingIntentPreflight(resolution, currentMainModeKey, text)) {
+      const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
+        resolution,
+        currentMainModeKey,
+        text,
+        images,
+        options,
+        preferredLanguage,
+        currentConfig: get().config,
+        sendOriginSessionKey,
+      });
+      if (blockingPreflightEffect) {
         void (async () => {
-          const preflight = await runIntentPreflight({
-            input: text,
-            language: preferredLanguage,
-            mainModeKey: currentMainModeKey,
-            config: get().config,
-          });
-
-          const latestState = get();
-          const latestInput = latestState.input.trim();
-          const hasComparableLatestInput = latestInput.length > 0;
-          const stalePreflight =
-            (hasComparableLatestInput && latestInput !== text.trim()) ||
-            latestState.selectedMainModeKey !== currentMainModeKey ||
-            !!latestState.lockedComposerIntent ||
-            !!parseMainIntentShortcutForMode(latestInput, latestState.selectedMainModeKey) ||
-            !!parseMainDebugShortcut(latestInput);
-          if (stalePreflight) {
-            logStoreEvent("intent_preflight_stale_discarded", {
-              originalChars: text.trim().length,
-              latestChars: latestInput.length,
-              selectedMainModeKey: latestState.selectedMainModeKey,
-              hasLockedComposerIntent: !!latestState.lockedComposerIntent,
-              hasExplicitShortcut:
-                !!parseMainIntentShortcutForMode(latestInput, latestState.selectedMainModeKey) ||
-                !!parseMainDebugShortcut(latestInput),
-            });
-            return;
-          }
-
-          if (preflight?.needsUserChoice) {
-            const fallbackCopy = createPendingDecisionCopy(
-              {
-                suggestedIntent: preflight.intent,
-                decisionOptions: preflight.options
-                  ?.map((option) => option.id)
-                  .filter(isResolvedUserIntentChoice),
-                riskLevel: resolution.riskLevel,
-                reason: resolution.reason,
-              },
-              preferredLanguage,
-            );
-            applyPreRunSessionPatch({
-              pendingRunDecision: {
-                kind: "intent_confirmation",
-                source: "preflight",
-                originalInput: text,
-                originalImages: images || [],
-                suggestedIntent: preflight.intent,
-                reason: resolution.reason,
-                title: preflight.question || fallbackCopy.title,
-                options: preflight.options?.length ? preflight.options : fallbackCopy.options,
-              },
-            });
-            return;
-          }
-
-          const resolvedByPreflight =
-            preflight?.intent === "studio_workflow" ? resolution.intent : preflight?.intent;
-          const resolvedIntent = resolvedByPreflight || resolution.intent;
-          const resolvedCommandDirective =
-            preflight?.commandDirective ||
-            resolution.commandDirective ||
-            inferCommandDirective(text, resolvedIntent);
-          const preflightSuggestsOperation =
-            !!preflight &&
-            (
-              resolvedIntent === "execute" ||
-              resolvedIntent === "studio_workflow" ||
-              resolvedCommandDirective.requiresApproval === true ||
-              resolvedCommandDirective.kind === "file_modify" ||
-              resolvedCommandDirective.kind === "shell" ||
-              resolvedCommandDirective.kind === "git" ||
-              resolvedCommandDirective.kind === "unity" ||
-              resolvedCommandDirective.kind === "studio" ||
-              resolvedCommandDirective.kind === "mcp"
-            );
-          const localWasNatural =
-            (resolution.intent === "respond" || resolution.intent === "discuss") &&
-            resolution.riskLevel === "low";
-          const shouldAskForPreflightExecutionDecision =
-            localWasNatural &&
-            preflightSuggestsOperation &&
-            (
-              preflight?.intent !== resolution.intent ||
-              preflight?.requiresApproval === true ||
-              (preflight?.confidence ?? 0) < 0.92
-            );
-
-          if (shouldAskForPreflightExecutionDecision) {
-            const pendingCopy = createPendingDecisionCopy(
-              {
-                suggestedIntent: "execute",
-                decisionOptions: ["execute", "respond", "plan"],
-                riskLevel: preflight?.riskLevel || "medium",
-                reason: preflight?.reason || resolution.reason,
-              },
-              preferredLanguage,
-            );
-            applyPreRunSessionPatch({
-              pendingRunDecision: {
-                kind: "intent_confirmation",
-                source: "preflight",
-                originalInput: text,
-                originalImages: images || [],
-                suggestedIntent: "execute",
-                reason: pendingCopy.reason,
-                title: pendingCopy.title,
-                options: pendingCopy.options,
-              },
-            });
-            return;
-          }
-
-          if (sendOriginSessionKey && !isSessionRuntimeActive(get(), sendOriginSessionKey)) {
-            logStoreEvent("send_async_resume_skipped_inactive_session", {
-              phase: "intent_preflight",
-              sessionKey: sendOriginSessionKey,
-            });
-            return;
-          }
-
-          get().sendMessage(text, images, {
-            ...(options || {}),
-            resolvedIntent,
-            commandDirective: resolvedCommandDirective,
-            skipIntentResolution: true,
-            turnTitle: preflight?.title,
-            intentSummary: buildRunIntentSummary({
-              input: text,
-              intent: resolvedIntent,
-              language: preferredLanguage,
-              preflightSummary: preflight?.summary,
-              reason: preflight?.reason || resolution.reason,
-            }),
+          await executeSubmitBlockingPreflight({
+            effect: blockingPreflightEffect,
+            runIntentPreflight,
+            getLatestSnapshot: (effect) => {
+              const latestState = get();
+              return {
+                input: latestState.input,
+                selectedMainModeKey: latestState.selectedMainModeKey,
+                lockedComposerIntent: latestState.lockedComposerIntent,
+                isOriginSessionActive: effect.sendOriginSessionKey
+                  ? isSessionRuntimeActive(latestState, effect.sendOriginSessionKey)
+                  : true,
+              };
+            },
+            applyPendingRunDecision: (pendingRunDecision) => {
+              applyPreRunSessionPatch({ pendingRunDecision });
+            },
+            resumeSubmission: (nextText, nextImages, nextOptions) => {
+              get().sendMessage(nextText, nextImages, nextOptions);
+            },
+            logStoreEvent,
           });
         })();
         return true;
@@ -8224,27 +6376,25 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    const effectiveIntentPolicy = getIntentPolicy(effectiveRunIntent);
-    const effectiveWorkflowMode = effectiveIntentPolicy.workflowMode;
-    const runtimeRunIntent = options?.runtimeIntentOverride ||
-      (shouldExecuteOnceFromReplyOption && effectiveRunIntent !== "plan"
-        ? currentMainModeKey === "game_studio" ? "studio_workflow" : "execute"
-        : effectiveRunIntent);
-    const effectiveDisplayIntent: ResolvedRunIntent =
-      effectiveRunIntent === "plan" && runtimeRunIntent === "execute"
-        ? "execute"
-        : effectiveRunIntent;
-    const shouldGrantExecutionConsentForTurn =
-      options?.executionConsentGranted === true ||
-      shouldExecuteOnceFromReplyOption ||
-      state.autoApproveTools === true;
-    const initialTurnStatus: ConversationTurnStatus =
-      effectiveRunIntent === "plan" && !state.isPlanApproved
-        ? "planning"
-        : "executing";
+    const runtimeDecision = resolveSubmitRuntimeDecision({
+      effectiveRunIntent,
+      runtimeIntentOverride: options?.runtimeIntentOverride,
+      currentMainModeKey,
+      isPlanApproved: state.isPlanApproved,
+      autoApproveTools: state.autoApproveTools,
+      executionConsentGranted: options?.executionConsentGranted,
+      shouldExecuteOnceFromReplyOption,
+      preservePlanState,
+      isLocalStudioCommand,
+    });
+    const effectiveWorkflowMode = runtimeDecision.effectiveWorkflowMode;
+    const runtimeRunIntent = runtimeDecision.runtimeRunIntent;
+    const effectiveDisplayIntent = runtimeDecision.effectiveDisplayIntent;
+    const shouldGrantExecutionConsentForTurn = runtimeDecision.shouldGrantExecutionConsentForTurn;
+    const initialTurnStatus = runtimeDecision.initialTurnStatus;
 
     // Reset plan approval state at the start of each new request
-    if (!preservePlanState && !isLocalStudioCommand) {
+    if (runtimeDecision.shouldResetPlanState) {
       set({
         isPlanApproved: false,
         planApprovalChoice: null,
@@ -8262,32 +6412,47 @@ export const useAppStore = create<AppState>()(
       });
     }
 
-    if (!text.trim() && (!images || images.length === 0) && !hasSupplementalInput) {
-      logStoreEvent("send_blocked", { reason: "empty_text_no_images_no_context" });
-      return false;
-    }
+    const sendGateDecision = resolveSubmitSendGateDecision({
+      text,
+      imagesLength: images?.length ?? 0,
+      hasSupplementalInput,
+      isHidden,
+      executionConsentGranted: options?.executionConsentGranted,
+      shouldExecuteOnceFromReplyOption,
+      isGenerating: state.isGenerating,
+      agentStatus: state.agentStatus,
+      hasAbortController: !!state.abortController,
+      hasCurrentTurn: !!state.currentTurnId,
+    });
 
-    const allowHiddenExecutionWhileBusy =
-      options?.hidden === true &&
-      options?.executionConsentGranted === true &&
-      state.agentStatus === "running";
-
-    if (state.isGenerating && !allowHiddenExecutionWhileBusy) {
-      get().queueUserMessage(text, images, {
-        contextMentions: mentionSnapshot,
-        attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
-      });
-      logStoreEvent("send_queued", { reason: "generation_in_progress" });
-      return false;
-    } else if (state.isGenerating && allowHiddenExecutionWhileBusy) {
+    for (const reason of sendGateDecision.allowedBusyReasons) {
       logStoreEvent("send_busy_hidden_execution_allowed", {
-        reason: "generation_in_progress",
+        reason,
         runtimeIntentOverride: options?.runtimeIntentOverride ?? null,
         turnIdOverride: options?.turnIdOverride ?? null,
       });
     }
 
-    if (state.agentStatus === "pending_review" && state.abortController && (options?.executionConsentGranted === true || shouldExecuteOnceFromReplyOption)) {
+    if (sendGateDecision.action.kind === "block_empty") {
+      logStoreEvent("send_blocked", { reason: sendGateDecision.action.reason });
+      return false;
+    }
+
+    if (sendGateDecision.action.kind === "queue") {
+      get().queueUserMessage(text, images, {
+        contextMentions: mentionSnapshot,
+        attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
+      });
+      logStoreEvent("send_queued", {
+        reason: sendGateDecision.action.reason,
+        ...(sendGateDecision.action.agentStatus
+          ? { agentStatus: sendGateDecision.action.agentStatus }
+          : {}),
+      });
+      return false;
+    }
+
+    if (sendGateDecision.action.kind === "approve_pending_review") {
       logStoreEvent("send_pending_review_approve_bypass", {
         textChars: text?.length ?? 0,
         executionConsentGranted: options?.executionConsentGranted,
@@ -8302,108 +6467,35 @@ export const useAppStore = create<AppState>()(
       return true;
     }
 
-    if (state.agentStatus === "running" || state.agentStatus === "pending_review") {
-      // ── Stuck-state recovery ──────────────────────────────────────
-      // If agentStatus is stuck at "running" but there's no abortController,
-      // the previous stream must have failed silently. Reset to idle so
-      // the user isn't permanently blocked from sending messages.
-      if (!allowHiddenExecutionWhileBusy && (state.agentStatus === "running" || state.agentStatus === "pending_review") && !state.abortController) {
-        logStoreEvent("send_stuck_state_reset", {
-          previousStatus: state.agentStatus,
-        });
-        set({ agentStatus: "idle", isGenerating: false });
-        if (state.currentTurnId) {
-          get().setConversationTurnStatus(
-            state.currentTurnId,
-            state.agentStatus === "pending_review" ? "awaiting_approval" : "stopped_no_action",
-          );
-        }
-        // Re-check after state reset
-        if (!text.trim() && (!images || images.length === 0) && !hasSupplementalInput) return false;
-      } else if (!allowHiddenExecutionWhileBusy) {
-        get().queueUserMessage(text, images, {
-          contextMentions: mentionSnapshot,
-          attachedFiles: attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
-        });
-        logStoreEvent("send_queued", {
-          reason: "agent_running_or_pending_review",
-          agentStatus: state.agentStatus,
-        });
-        return false;
-      } else {
-        logStoreEvent("send_busy_hidden_execution_allowed", {
-          reason: "agent_running",
-          runtimeIntentOverride: options?.runtimeIntentOverride ?? null,
-          turnIdOverride: options?.turnIdOverride ?? null,
-        });
+    if (sendGateDecision.action.kind === "reset_stuck_state") {
+      logStoreEvent("send_stuck_state_reset", {
+        previousStatus: sendGateDecision.action.previousStatus,
+      });
+      set({ agentStatus: "idle", isGenerating: false });
+      if (state.currentTurnId && sendGateDecision.action.turnStatus) {
+        get().setConversationTurnStatus(
+          state.currentTurnId,
+          sendGateDecision.action.turnStatus,
+        );
       }
     }
-    const sessionScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
-    let ensuredSessionId = state.currentSessionId;
-    const workspaceSessions = state.sessionsByWorkspace[sessionScopeKey] || [];
-    const hasValidCurrentSession =
-      ensuredSessionId != null &&
-      workspaceSessions.some((session) => session.id === ensuredSessionId);
-    if (!hasValidCurrentSession) {
-      const autoSessionId = Date.now();
-      const autoSessionDate = new Date(autoSessionId).toISOString();
-      const autoSessionTitle = state.currentWorkspace.trim()
-        ? (state.config.language === "en" ? "New Conversation" : "新会话")
-        : (state.config.language === "en" ? "New Chat" : "新聊天");
-      const autoSession: Session = {
-        id: autoSessionId,
-        title: autoSessionTitle,
-        titleSource: "default",
-        date: autoSessionDate,
-        updatedAt: autoSessionDate,
-        updatedAtMs: autoSessionId,
-        active: true,
-        storageStatus: "temporary",
-        recordingDisabled: !state.config.sessionRecordingEnabled,
-        messages: [],
-      };
-
-      set((s) => ({
-        sessionsByWorkspace: {
-          ...s.sessionsByWorkspace,
-          [sessionScopeKey]: [
-            autoSession,
-            ...(s.sessionsByWorkspace[sessionScopeKey] || []).map((session) => ({
-              ...session,
-              active: false,
-            })),
-          ],
-        },
-        currentSessionId: autoSessionId,
-        activeSessionByWorkspace: {
-          ...s.activeSessionByWorkspace,
-          [sessionScopeKey]: autoSessionId,
-        },
-        autoApproveTools: s.autoApproveTools,
-        autoApproveToolScopes: s.autoApproveToolScopes,
-        webSearchEnabled: s.webSearchEnabled,
-        webSearchProvider: s.webSearchProvider,
-        approvedLocalFileReadPaths: [],
-        approvedShellPermissionRules: [],
-        readOnlyAutoApproveForSession: false,
-      }));
-
-      ensuredSessionId = autoSessionId;
-    }
-
-    const runWorkspace = state.currentWorkspace;
-    const runScopeKey = sessionScopeKey;
-    const runSessionId = ensuredSessionId;
-    const runSessionKey = resolveSessionRuntimeKey(runScopeKey, runSessionId)!;
-    const commandIssuedAtMs = Date.now();
-    const commandIssuedAtIso = new Date(commandIssuedAtMs).toISOString();
-    if (runSessionId) {
-      get().updateSession(runScopeKey, runSessionId, {
-        updatedAt: commandIssuedAtIso,
-        updatedAtMs: commandIssuedAtMs,
-        active: true,
-      });
-    }
+    const sessionBootstrapDecision = applySubmitSessionBootstrap({
+      state,
+      set,
+      updateSession: (scopeKey, sessionId, patch) => {
+        get().updateSession(scopeKey, sessionId, patch);
+      },
+      autoSessionNowMs: Date.now(),
+      commandIssuedAtMs: Date.now(),
+    });
+    const {
+      sessionScopeKey,
+      ensuredSessionId,
+      runWorkspace,
+      runScopeKey,
+      runSessionId,
+      runSessionKey,
+    } = sessionBootstrapDecision;
     const backgroundRunningSessions = (Object.entries(state.runtimeBySessionKey) as [string, SessionRuntimeState][])
       .filter(([sessionKey, runtime]) =>
         sessionKey !== runSessionKey &&
@@ -8424,44 +6516,48 @@ export const useAppStore = create<AppState>()(
       backgroundRunningCount: backgroundRunningSessions.length,
       backgroundRunningSessions: backgroundRunningSessions.slice(0, 8),
     });
-    set((s) => ({
-      runtimeBySessionKey: {
-        ...s.runtimeBySessionKey,
-        [runSessionKey]: createSessionRuntimeFromState(s),
-      },
-    }));
-    const isRunSessionActive = (candidate = get()) =>
-      resolveSessionRuntimeKey(resolveSessionWorkspaceKey(candidate.currentWorkspace), candidate.currentSessionId) === runSessionKey;
-    const sessionSet = (
-      patchOrUpdater:
-        | Record<string, unknown>
-        | Partial<AppState>
-        | ((state: AppState) => Record<string, unknown> | Partial<AppState>),
-    ) => {
-      set((s) => {
-        const active = isRunSessionActive(s);
-        const existing = s.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(s);
-        const baseState = active ? s : ({ ...s, ...existing } as AppState);
-        const patch =
-          typeof patchOrUpdater === "function"
-            ? patchOrUpdater(baseState)
-            : patchOrUpdater;
-        if (!patch || typeof patch !== "object") return {};
-        const normalizedPatch = normalizeTaskFlowPatchForConsumedReplyOptions(patch);
-        const runtimePatch = pickSessionRuntimePatch(normalizedPatch);
-        const globalPatch = active ? normalizedPatch : {};
-        return {
-          ...globalPatch,
-          runtimeBySessionKey: {
-            ...s.runtimeBySessionKey,
-            [runSessionKey]: {
-              ...existing,
-              ...runtimePatch,
+    const sessionRuntimeFacade = createSubmitSessionRuntimeFacade<AppState, SessionRuntimeState>({
+      get,
+      set,
+      runSessionKey,
+      createRuntimeFromState: createSessionRuntimeFromState,
+      pickRuntimePatch: pickSessionRuntimePatch,
+      normalizePatch: (patch) =>
+        normalizeTaskFlowPatchForConsumedReplyOptions(patch as Record<string, unknown>),
+      decorateScopedState: (scoped) => ({
+        ...scoped,
+        setConversationTurnStatus: sessionSetConversationTurnStatus,
+        updateConversationTurn: sessionUpdateConversationTurn,
+        setConversationTurnSummary: sessionSetConversationTurnSummary,
+        setPlanStage: (stage: PlanStage) => sessionSet({ planStage: stage }),
+        setPlanTasks: sessionSetPlanTasks,
+        upsertPlanArtifact: sessionUpsertPlanArtifact,
+        setNormalizedStreamState: (streamState: NormalizedStreamState) => sessionSet({ normalizedStreamState: streamState }),
+        openRightPanelTab: sessionOpenRightPanelTab,
+        setRightPanelTab: sessionOpenRightPanelTab,
+        ensurePlanArtifactsHydratedForWorkspace: sessionOpenPlanWorkspacePanel,
+        openPlanWorkspacePanel: sessionOpenPlanWorkspacePanel,
+        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false }),
+        startNewTurn: (remoteFeishu) =>
+          sessionSet({
+            currentTurnState: {
+              ...createDefaultCurrentTurnState(),
+              turnId: Date.now().toString(),
+              ...(remoteFeishu ? { remoteFeishu } : {}),
             },
-          },
-        };
-      });
-    };
+          }),
+        getCurrentRunIntent: () => {
+          const current = scoped.currentTurnId
+            ? scoped.conversationTurns.find((turn) => turn.id === scoped.currentTurnId) || null
+            : null;
+          return current
+            ? resolveConversationTurnIntent(current)
+            : resolveRunIntentFromLegacyWorkflowMode(scoped.config.workflowMode);
+        },
+      }),
+    });
+    sessionRuntimeFacade.seedSessionRuntime();
+    const sessionSet = sessionRuntimeFacade.sessionSet;
     const sessionSetConversationTurnStatus = (targetTurnId: string, status: ConversationTurnStatus) =>
       sessionSet((s) => ({
         conversationTurns: s.conversationTurns.map((turn) =>
@@ -8533,7 +6629,7 @@ export const useAppStore = create<AppState>()(
               preserveMissing: preserveTaskHistory,
               highlightNext: s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
             })
-          : normalizePlanTaskStatuses(
+          : normalizeApprovedPlanTaskStatuses(
               s.planTasks,
               s.planExecutionEvidenceLedger,
               s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
@@ -8565,42 +6661,7 @@ export const useAppStore = create<AppState>()(
       const runtime = live.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(live);
       return runtime.planArtifacts.length > 0 || runtime.planTasks.length > 0 || runtime.planStage !== "idle";
     };
-    const sessionGet = (): AppState => {
-      const live = get();
-      const runtime = live.runtimeBySessionKey[runSessionKey] || createSessionRuntimeFromState(live);
-      const scoped = (isRunSessionActive(live) ? live : { ...live, ...runtime }) as AppState;
-      return {
-        ...scoped,
-        setConversationTurnStatus: sessionSetConversationTurnStatus,
-        updateConversationTurn: sessionUpdateConversationTurn,
-        setConversationTurnSummary: sessionSetConversationTurnSummary,
-        setPlanStage: (stage: PlanStage) => sessionSet({ planStage: stage }),
-        setPlanTasks: sessionSetPlanTasks,
-        upsertPlanArtifact: sessionUpsertPlanArtifact,
-        setNormalizedStreamState: (streamState: NormalizedStreamState) => sessionSet({ normalizedStreamState: streamState }),
-        openRightPanelTab: sessionOpenRightPanelTab,
-        setRightPanelTab: sessionOpenRightPanelTab,
-        ensurePlanArtifactsHydratedForWorkspace: sessionOpenPlanWorkspacePanel,
-        openPlanWorkspacePanel: sessionOpenPlanWorkspacePanel,
-        closeRightPanel: () => sessionSet({ showPlanPanel: false, showDiff: false, showTerminal: false }),
-        startNewTurn: (remoteFeishu) =>
-          sessionSet({
-            currentTurnState: {
-              ...createDefaultCurrentTurnState(),
-              turnId: Date.now().toString(),
-              ...(remoteFeishu ? { remoteFeishu } : {}),
-            },
-          }),
-        getCurrentRunIntent: () => {
-          const current = scoped.currentTurnId
-            ? scoped.conversationTurns.find((turn) => turn.id === scoped.currentTurnId) || null
-            : null;
-          return current
-            ? resolveConversationTurnIntent(current)
-            : resolveRunIntentFromLegacyWorkflowMode(scoped.config.workflowMode);
-        },
-      };
-    };
+    const sessionGet = sessionRuntimeFacade.sessionGet;
 
     const nextId = sessionGet()._nextTaskId;
     const turnId = reuseCurrentTurn
@@ -8626,569 +6687,167 @@ export const useAppStore = create<AppState>()(
     const existingTurn = reuseCurrentTurn
       ? state.conversationTurns.find((turn) => turn.id === turnId) || null
       : null;
-    const existingTitle = existingTurn?.title && !isGenericConversationTitle(existingTurn.title)
-      ? existingTurn.title
-      : "";
-    const optionTitle = options?.turnTitle && !isGenericConversationTitle(options.turnTitle)
-      ? options.turnTitle
-      : "";
-    const localTurnTitle = mainDebugShortcut
-      ? "MDEBUG：用户反馈自修复"
-      : buildLocalTurnTitle(text, effectiveRunIntent, preferredLanguage, turnInputContextSignals);
-    const turnTitle = normalizeConversationDisplayTitle(
-      existingTitle || optionTitle || localTurnTitle,
-      preferredLanguage === "en" ? 48 : 40,
-      localTurnTitle,
-    );
-    const titleIntentSignature = buildTitleIntentSignature(
-      text,
-      effectiveRunIntent,
-      turnInputContextSignals,
-    );
     const refreshedState = sessionGet();
     const activeSession = ensuredSessionId
       ? (refreshedState.sessionsByWorkspace[sessionScopeKey] || []).find((session) => session.id === ensuredSessionId)
       : null;
-    const shouldSeedSessionTitleForTurn = shouldSeedSessionTitle(activeSession);
-    const seededSessionTitleCandidate = shouldSeedSessionTitleForTurn ? turnTitle : "";
-    const autoCollapsePreviousTurnForNewTurn = (turns: ConversationTurn[]): ConversationTurn[] => {
-      // Auto-collapse only the immediate previous turn when the user starts a brand-new visible turn.
-      // This runs once per new-turn creation and never touches older turns.
-      if (isHidden || reuseCurrentTurn || turns.length === 0) return turns;
-      const previousTurnIndex = turns.length - 1;
-      const previousTurn = turns[previousTurnIndex];
-      if (!previousTurn || previousTurn.collapsed) return turns;
-      return turns.map((turn, index) =>
-        index === previousTurnIndex ? { ...turn, collapsed: true } : turn,
-      );
-    };
-    const markParentPlanTurnDoneForExecution = (turns: ConversationTurn[]): ConversationTurn[] => {
-      if (!parentPlanTurnId) return turns;
-      const summary = preferredLanguage === "en"
-        ? "Plan approved; execution was handed off to a new turn."
-        : "计划已批准，执行已交接到新的回合。";
-      return turns.map((turn) =>
-        turn.id === parentPlanTurnId
-          ? {
-              ...turn,
-              status: "done" as const,
-              summary,
-            }
-          : turn,
-      );
-    };
-    const appendLocalStudioTurn = async (
-      systemContent: string,
-      options?: { systemVariant?: Extract<TaskBlock, { type: "system" }>["variant"] },
-    ) => {
-      const userBlock = isHidden
-        ? null
-        : ({
-            id: nextId(),
-            turnId,
-            type: "user",
-            content: text,
-            ...(userContextItems.length > 0 ? { contextItems: userContextItems } : {}),
-          } as TaskBlock);
-      const systemBlock: TaskBlock = {
-        id: nextId(),
-        turnId,
-        type: "system",
-        content: systemContent,
-        ...(options?.systemVariant ? { variant: options.systemVariant } : {}),
-      };
+    const titleDecision = resolveSubmitTurnTitleDecision({
+      text,
+      effectiveRunIntent,
+      preferredLanguage,
+      isMainDebugShortcut: !!mainDebugShortcut,
+      contextSignals: turnInputContextSignals,
+      existingTurnTitle: existingTurn?.title,
+      optionTurnTitle: options?.turnTitle,
+      activeSession,
+    });
+    const {
+      turnTitle,
+      titleIntentSignature,
+      shouldSeedSessionTitleForTurn,
+      seededSessionTitleCandidate,
+    } = titleDecision;
+    const localSlashBridge = createGameStudioLocalSlashBridge({
+      sessionGet,
+      sessionSet,
+      nextTaskId: nextId,
+      text,
+      turnId,
+      userContextItems,
+      isHidden,
+      reuseCurrentTurn,
+      parentPlanTurnId,
+      preferredLanguage,
+      effectiveRunIntent,
+      effectiveDisplayIntent,
+      effectiveIntentSummary,
+      effectiveCommandDirective,
+      effectiveWorkflowMode,
+      turnTitle,
+      shouldSeedSessionTitleForTurn,
+      ensuredSessionId,
+      sessionScopeKey,
+      titleIntentSignature,
+      sanitizeTaskBlocksForPersist,
+      normalizeSessionRuntimeSnapshot,
+    });
 
-      sessionSet((s) => ({
-        taskFlow: [...s.taskFlow, ...(userBlock ? [userBlock] : []), systemBlock],
-        conversationTurns: reuseCurrentTurn
-          ? s.conversationTurns.map((turn) =>
-              turn.id === turnId
-                ? {
-                    ...turn,
-                    status: "done",
-                    displayIntent: effectiveDisplayIntent,
-                    intentSummary: turn.intentSummary || effectiveIntentSummary,
-                    commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
-                    blockIds: [...turn.blockIds, ...(userBlock ? [userBlock.id] : []), systemBlock.id].filter(
-                      (value, index, array) => array.indexOf(value) === index,
-                    ),
-                  }
-                : turn,
-            )
-          : [
-              ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns)),
-              {
-                id: turnId,
-                userPrompt: text,
-                title: turnTitle,
-                intentSummary: effectiveIntentSummary,
-                commandDirective: effectiveCommandDirective || undefined,
-                ...(parentPlanTurnId ? { parentPlanTurnId } : {}),
-                mode: effectiveWorkflowMode,
-                intent: effectiveRunIntent,
-                displayIntent: effectiveDisplayIntent,
-                status: "done",
-                summary: systemContent,
-                blockIds: [...(userBlock ? [userBlock.id] : []), systemBlock.id],
-                collapsed: false,
-                createdAt: Date.now(),
-              },
-            ],
-        currentTurnId: turnId,
-        input: isHidden ? s.input : "",
-        contextMentions: [],
-        attachedFiles: [],
-        pendingSlashCommand: null,
-        lockedComposerIntent: null,
-        pendingRunDecision: null,
-        preferredResponseLanguage: preferredLanguage,
-        isGenerating: false,
-        agentStatus: "idle",
-        elapsedTime: 0,
-      }));
-
-      if (!isHidden && shouldSeedSessionTitleForTurn && ensuredSessionId) {
-        sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
-          title: turnTitle,
-          titleSource: "local_seed",
-          titleIntentSignature,
-          active: true,
-          messages: sanitizeTaskBlocksForPersist(sessionGet().taskFlow),
-          storageStatus: sessionGet().config.sessionRecordingEnabled ? "ok" : "temporary",
-          recordingDisabled: !sessionGet().config.sessionRecordingEnabled,
-          runtimeSnapshot: normalizeSessionRuntimeSnapshot({
-            runtimeEventSchemaVersion: 1,
-            runtimeEvents: sessionGet().runtimeEvents,
-            harnessRunMarker: sessionGet().harnessRunMarker,
-            taskFlow: sessionGet().taskFlow,
-            agentMessages: sessionGet().agentMessages,
-            contextMemoryState: sessionGet().contextMemoryState,
-            contextMemoryStateByRuntimeKey: sessionGet().contextMemoryStateByRuntimeKey,
-            providerCompatibilityByRuntimeKey: sessionGet().providerCompatibilityByRuntimeKey,
-            conversationTurns: sessionGet().conversationTurns,
-            currentTurnId: sessionGet().currentTurnId,
-            selectedMainModeKey: sessionGet().selectedMainModeKey,
-            selectedNexusModeKey: sessionGet().selectedNexusModeKey,
-            imageStudio: sessionGet().imageStudio,
-            activeStudioAgentKey: sessionGet().activeStudioAgentKey,
-            gameStudioInitialized: sessionGet().gameStudioInitialized,
-            pendingSlashCommand: sessionGet().pendingSlashCommand,
-            planArtifacts: sessionGet().planArtifacts,
-            planTasks: sessionGet().planTasks,
-            planExecutionEvidenceLedger: sessionGet().planExecutionEvidenceLedger,
-            planExecutionEvidenceCount: sessionGet().planExecutionEvidenceCount,
-            planAutoResumeCount: sessionGet().planAutoResumeCount,
-            planExecutionProgressSnapshot: sessionGet().planExecutionProgressSnapshot,
-            planStage: sessionGet().planStage,
-            isPlanApproved: sessionGet().isPlanApproved,
-            showPlanPanel: sessionGet().showPlanPanel,
-            showDiff: sessionGet().showDiff,
-            showTerminal: sessionGet().showTerminal,
-            showFilePanel: sessionGet().showFilePanel,
-            rightPanelTab: sessionGet().rightPanelTab,
-            selectedDiffTaskId: sessionGet().selectedDiffTaskId,
-            autoApproveTools: sessionGet().autoApproveTools,
-            autoApproveToolScopes: sessionGet().autoApproveToolScopes,
-            webSearchEnabled: sessionGet().webSearchEnabled,
-            webSearchProvider: sessionGet().webSearchProvider,
-            queuedUserMessage: sessionGet().queuedUserMessage,
-            activeGuidance: sessionGet().activeGuidance,
-          }),
-        });
-      }
-    };
-
-    const emitLocalSlashRuntimeEvent = (event: MainThreadEventInput) => {
-      if (normalizeEventStreamMode(sessionGet().config.eventStreamMode) === "legacy") return;
-      sessionSet((s) => ({
-        runtimeEvents: appendRuntimeEvent(s.runtimeEvents, withEventSchema(event)),
-      }));
-    };
-
-    const dispatchGameStudioSlashCommand = (command: PendingSlashCommand | null): boolean => {
-      const spec = getGameStudioSlashCommandSpec(command);
-      if (!spec) return false;
-
-      const runLocalSlash = (
-        handler: () => Promise<string> | string,
-        options?: { systemVariant?: Extract<TaskBlock, { type: "system" }>["variant"] },
-      ) => {
-        emitLocalSlashRuntimeEvent({
-          type: "slash.command.started",
-          threadId: runSessionKey,
-          turnId,
-          timestampMs: Date.now(),
-          command: spec.canonicalCommand,
-          executionMode: spec.executionMode,
-        });
-
-        void (async () => {
-          try {
-            const content = await handler();
-            await appendLocalStudioTurn(content, {
-              systemVariant: options?.systemVariant,
-            });
-            emitLocalSlashRuntimeEvent({
-              type: "slash.command.completed",
-              threadId: runSessionKey,
-              turnId,
-              timestampMs: Date.now(),
-              command: spec.canonicalCommand,
-              executionMode: spec.executionMode,
-            });
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error || "Unknown slash command error");
-            await appendLocalStudioTurn(
-              preferredLanguage === "en"
-                ? `Slash command failed: ${message}`
-                : `斜杠命令执行失败：${message}`,
-            );
-            emitLocalSlashRuntimeEvent({
-              type: "slash.command.failed",
-              threadId: runSessionKey,
-              turnId,
-              timestampMs: Date.now(),
-              command: spec.canonicalCommand,
-              executionMode: spec.executionMode,
-              error: { message },
-            });
-          }
-        })();
-      };
-
-      if (command?.type === "agent") {
-        runLocalSlash(async () => {
-          await sessionGet().setActiveStudioAgentKey(command.slug, {
-            persistToWorkspace: sessionGet().gameStudioInitialized,
-          });
-          return preferredLanguage === "en"
-            ? `Game Studio specialist switched to \`${command.slug}\`. Future messages will follow this specialist until you send \`/auto\`.`
-            : `Game Studio 当前专家已切换为 \`${command.slug}\`。后续普通消息会默认按该专家视角继续；发送 \`/auto\` 可恢复自动编排。`;
-        });
-        return true;
-      }
-
-      if (command?.type === "auto") {
-        runLocalSlash(async () => {
-          await sessionGet().setActiveStudioAgentKey("studio_auto", {
-            persistToWorkspace: sessionGet().gameStudioInitialized,
-          });
-          return preferredLanguage === "en"
-            ? "Game Studio has switched back to auto-orchestration."
-            : "Game Studio 已恢复自动编排。后续消息将不再固定绑定某个专家。";
-        });
-        return true;
-      }
-
-      if (command?.type === "workflow" && spec.executionMode === "local_fast") {
-        const content = buildGameStudioLocalWorkflowMessage({
-          language: preferredLanguage === "en" ? "en" : "zh",
-          command,
-        });
-        if (!content) return false;
-        runLocalSlash(() => content, {
-          systemVariant: command.slug === "help" ? "game_studio_local_markdown" : undefined,
-        });
-        return true;
-      }
-
-      return false;
-    };
-
-    if (dispatchGameStudioSlashCommand(parsedStudioCommand)) {
+    const localSlashSubmission = startGameStudioLocalSlashSubmission({
+      command: parsedStudioCommand,
+      preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
+      runSessionKey,
+      turnId,
+      runtimeService: gameStudioRuntimeService,
+      getGameStudioInitialized: () => sessionGet().gameStudioInitialized,
+      setActiveStudioAgentKey: (agent, options) => sessionGet().setActiveStudioAgentKey(agent, options),
+      appendLocalStudioTurn: localSlashBridge.appendLocalStudioTurn,
+      emitRuntimeEvent: localSlashBridge.emitLocalSlashRuntimeEvent,
+      logStoreEvent,
+    });
+    if (localSlashSubmission.handled) {
+      void localSlashSubmission.completion;
       return true;
     }
 
-    // 1. Push user message to visible taskFlow
-    const explicitReplyOptionSourceTurnId = !isHidden ? options?.replyOptionSourceTurnId : undefined;
-    const replyOptionArchiveTurnId = explicitReplyOptionSourceTurnId ||
-      ((shouldExplicitlyReuseCurrentTurn || shouldAutoResumeChoiceTurn) && currentTurnHasReplyOptions ? turnId : undefined);
-    const shouldArchiveChoiceFeedback =
-      !isHidden &&
-      !!replyOptionArchiveTurnId;
-    const selectedChoiceText = shouldArchiveChoiceFeedback
-      ? String(options?.selectedReplyOptionText || text || "").trim()
-      : "";
-    if (shouldArchiveChoiceFeedback) {
-      const archiveProbe = archiveReplyOptionBlocksForChoice(
-        sessionGet().taskFlow,
-        replyOptionArchiveTurnId,
-        selectedChoiceText,
-      );
-      logStoreEvent("reply_options_archived", {
-        turnId,
-        sourceTurnId: replyOptionArchiveTurnId ?? null,
-        sessionKey: runSessionKey,
-        workspace: runWorkspace || null,
-        selectedChoiceChars: selectedChoiceText.length,
-        optionBlocks: archiveProbe.exactTurnOptionBlocks,
-        archivedOptionBlocks: archiveProbe.archivedCount,
-        selectedFallbackBlocks: archiveProbe.selectedFallbackBlocks,
-        matchMode: archiveProbe.matchMode,
-      });
-    }
-    const userBlock: TaskBlock | null = isHidden
-      ? null
-      : {
-          id: nextId(),
-          turnId,
-          type: "user",
-          content: text,
-          ...(userContextItems.length > 0 ? { contextItems: userContextItems } : {}),
-          ...(currentImages.length > 0 ? { images: currentImages } : {}),
-        };
-    sessionSet((s) => ({
-      ...(userBlock
-        ? (() => {
-            const archivedTaskFlow = shouldArchiveChoiceFeedback
-              ? archiveReplyOptionBlocksForChoice(
-                  s.taskFlow,
-                  replyOptionArchiveTurnId,
-                  selectedChoiceText,
-                ).taskFlow
-              : s.taskFlow;
-
-            return {
-              taskFlow: [...archivedTaskFlow, userBlock],
-              conversationTurns: reuseCurrentTurn
-                ? s.conversationTurns.map((turn) =>
-                    turn.id === turnId
-                      ? {
-                          ...turn,
-                          status: initialTurnStatus,
-                          intent: effectiveRunIntent,
-                          displayIntent: effectiveDisplayIntent,
-                          intentSummary: turn.intentSummary || effectiveIntentSummary,
-                          commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
-                          pendingOperationProposal: applyOperationProposalChoice(turn.pendingOperationProposal, operationProposalChoiceAction),
-                          mode: effectiveWorkflowMode,
-                          blockIds: turn.blockIds.includes(userBlock.id) ? turn.blockIds : [...turn.blockIds, userBlock.id],
-                        }
-                      : turn
-                  )
-                : [
-                    ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns)),
-                    {
-                      id: turnId,
-                      userPrompt: text,
-                      title: turnTitle,
-                      intentSummary: effectiveIntentSummary,
-                      commandDirective: effectiveCommandDirective || undefined,
-                      mode: effectiveWorkflowMode,
-                      intent: effectiveRunIntent,
-                      displayIntent: effectiveDisplayIntent,
-                      status: initialTurnStatus,
-                      summary: "",
-                      blockIds: [userBlock.id],
-                      collapsed: false,
-                      createdAt: Date.now(),
-                    },
-                  ],
-            };
-        })()
-        : reuseCurrentTurn
-        ? {
-            taskFlow: shouldArchiveChoiceFeedback
-              ? archiveReplyOptionBlocksForChoice(
-                  s.taskFlow,
-                  replyOptionArchiveTurnId,
-                  selectedChoiceText,
-                ).taskFlow
-              : s.taskFlow,
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId
-                ? {
-                    ...turn,
-                    status: initialTurnStatus,
-                    intent: effectiveRunIntent,
-                    displayIntent: effectiveDisplayIntent,
-                    intentSummary: turn.intentSummary || effectiveIntentSummary,
-                    commandDirective: turn.commandDirective || effectiveCommandDirective || undefined,
-                    pendingOperationProposal: applyOperationProposalChoice(turn.pendingOperationProposal, operationProposalChoiceAction),
-                    mode: effectiveWorkflowMode,
-                  }
-                : turn
-            ),
-          }
-        : {
-		            conversationTurns: [
-		              ...markParentPlanTurnDoneForExecution(autoCollapsePreviousTurnForNewTurn(s.conversationTurns).map((turn) =>
-                    uiParentTurnId && turn.id === uiParentTurnId
-                      ? { ...turn, status: initialTurnStatus, intent: turn.intent || effectiveRunIntent, displayIntent: turn.displayIntent || effectiveDisplayIntent }
-                      : turn,
-                  )),
-		              {
-		                id: turnId,
-		                userPrompt: text,
-		                title: turnTitle,
-	                intentSummary: effectiveIntentSummary,
-                commandDirective: effectiveCommandDirective || undefined,
-                uiVisibility: isInternalTurn ? "internal" : "visible",
-                ...(parentPlanTurnId ? { parentPlanTurnId } : {}),
-                mode: effectiveWorkflowMode,
-	                intent: effectiveRunIntent,
-	                displayIntent: effectiveDisplayIntent,
-	                status: initialTurnStatus,
-	                summary: "",
-	                blockIds: [],
-	                collapsed: false,
-	                createdAt: Date.now(),
-	              },
-	            ],
-	          }),
-      currentTurnId: turnId,
-      input: isHidden ? s.input : "",
-      preferredResponseLanguage: preferredLanguage,
-      ...(shouldArchiveChoiceFeedback
-        ? {
-            normalizedStreamState: {
-              ...s.normalizedStreamState,
-              replyOptions: [],
-              finishReason: null,
-            },
-          }
-        : {}),
-      pendingSlashCommand: parsedStudioCommand?.type === "workflow" ? parsedStudioCommand : null,
-      lockedComposerIntent: null,
-      pendingRunDecision: null,
-      isGenerating: true,
-      config: { ...s.config, workflowMode: effectiveWorkflowMode },
-      ...(preservePlanState ? {} : { isPlanApproved: false, planApprovalChoice: null, pendingPlanApprovalHandoff: null, planApprovalExecutionStartedForTurnId: null, clearedPlanTurnId: null }),
-      ...(preservePlanState ? {} : { planAutoResumeCount: 0, planExecutionProgressSnapshot: null }),
-      ...(shouldGrantExecutionConsentForTurn
-        ? { currentTurnExecutionConsent: { turnId, granted: true } }
-        : {}),
-      elapsedTime: 0,
-    }));
-
-    logStoreEvent("visible_turn_appended", {
+    const visibleTurnSubmission = applySubmitVisibleTurn({
+      sessionGet,
+      sessionSet,
+      nextTaskId: nextId,
+      nowMs,
+      logStoreEvent,
+      sendStartedAt,
+      runSessionKey,
+      runWorkspace,
+      text,
       turnId,
-      sessionKey: runSessionKey,
-      workspace: runWorkspace || null,
+      userContextItems,
+      currentImages,
+      isHidden,
       reuseCurrentTurn,
-      shouldArchiveChoiceFeedback,
-      selectedChoiceChars: selectedChoiceText.length,
-      userBlockId: userBlock?.id ?? null,
+      uiParentTurnId,
+      parentPlanTurnId,
+      isInternalTurn,
+      shouldExplicitlyReuseCurrentTurn,
+      shouldAutoResumeChoiceTurn,
+      currentTurnHasReplyOptions,
+      explicitReplyOptionSourceTurnId: !isHidden ? options?.replyOptionSourceTurnId : undefined,
+      selectedReplyOptionText: options?.selectedReplyOptionText,
       effectiveRunIntent,
+      effectiveDisplayIntent,
+      effectiveIntentSummary,
+      effectiveCommandDirective,
       effectiveWorkflowMode,
-      commandDirectiveKind: effectiveCommandDirective?.kind ?? null,
-      commandDirectiveAction: effectiveCommandDirective?.action ?? null,
       initialTurnStatus,
-      elapsedMs: Math.round(nowMs() - sendStartedAt),
-      taskFlowBlocks: sessionGet().taskFlow.length,
-      conversationTurns: sessionGet().conversationTurns.length,
+      operationProposalChoiceAction,
+      turnTitle,
+      parsedStudioCommand,
+      preferredLanguage,
+      preservePlanState,
+      shouldGrantExecutionConsentForTurn,
     });
+    const selectedChoiceText = visibleTurnSubmission.selectedChoiceText;
+    const markUserContextItemFailed = visibleTurnSubmission.markUserContextItemFailed;
 
-    const markUserContextItemFailed = (path: string | undefined | null) => {
-      const failedPath = String(path || "").trim();
-      if (!failedPath || userContextItems.length === 0) return;
-      sessionSet((s) => ({
-        taskFlow: s.taskFlow.map((block) => {
-          if (block.turnId !== turnId || block.type !== "user" || !Array.isArray(block.contextItems)) return block;
-          return {
-            ...block,
-            contextItems: block.contextItems.map((item) =>
-              item.path === failedPath ? { ...item, status: "failed" as const } : item
-            ),
-          };
-        }),
-      }));
-    };
-
-    if (!isHidden && shouldSeedSessionTitleForTurn && ensuredSessionId) {
-      sessionGet().updateSession(sessionScopeKey, ensuredSessionId, {
-        title: turnTitle,
-        titleSource: "local_seed",
-        titleIntentSignature,
-        active: true,
-        messages: sanitizeTaskBlocksForPersist(sessionGet().taskFlow),
-        storageStatus: sessionGet().config.sessionRecordingEnabled ? "ok" : "temporary",
-        recordingDisabled: !sessionGet().config.sessionRecordingEnabled,
-      });
-    }
+    applySubmitSeedSessionTitle({
+      isHidden,
+      shouldSeedSessionTitleForTurn,
+      ensuredSessionId,
+      sessionScopeKey,
+      turnTitle,
+      titleIntentSignature,
+      taskFlow: sessionGet().taskFlow,
+      sessionRecordingEnabled: sessionGet().config.sessionRecordingEnabled,
+      sanitizeTaskBlocksForPersist,
+      updateSession: (scopeKey, sessionId, patch) => {
+        sessionGet().updateSession(scopeKey, sessionId, patch);
+      },
+    });
 
     // 每个新 turn 都异步请求一次轻量语义标题：
     // 先用本地标题占位，不阻塞发送；模型结果回来后再覆盖 turn/sidebar 标题。
-    if (shouldRequestSemanticTurnMetadataForTurn({
-      input: text,
-      hidden: isHidden,
+    const semanticMetadataDecision = resolveSubmitSemanticMetadataDecision({
+      text,
+      isHidden,
       reuseCurrentTurn,
-      turnTitle: options?.turnTitle,
-      mainModeKey: currentMainModeKey,
-    })) {
-      const expectedTurnPrompt = text.trim();
-      const expectedSessionId = ensuredSessionId ?? null;
-      void requestSemanticTurnMetadata({
-        input: text,
-        intent: effectiveRunIntent,
-        language: preferredLanguage,
-        config: sessionGet().config,
-        contextSignals: turnInputContextSignals,
-      }).then((metadata) => {
-        if (!metadata) return;
-
+      optionTurnTitle: options?.turnTitle,
+      currentMainModeKey,
+      turnId,
+      ensuredSessionId,
+      sessionScopeKey,
+      effectiveRunIntent,
+      preferredLanguage,
+      currentConfig: sessionGet().config,
+      contextSignals: turnInputContextSignals,
+      titleIntentSignature,
+      seededSessionTitleCandidate,
+    });
+    void startSubmitSemanticMetadataEffect({
+      decision: semanticMetadataDecision,
+      requestSemanticTurnMetadata,
+      getLatestSnapshot: () => {
         const latestState = sessionGet();
-        const targetTurn = latestState.conversationTurns.find((turn) => turn.id === turnId);
-        const latestSession = expectedSessionId != null
-          ? (latestState.sessionsByWorkspace[sessionScopeKey] || [])
-            .find((session) => session.id === expectedSessionId) || null
-          : null;
-        if (!isSemanticTurnMetadataCallbackCurrent({
-          expectedTurnId: turnId,
-          expectedUserPrompt: expectedTurnPrompt,
-          expectedSessionId,
-          turn: targetTurn,
-          session: latestSession,
-        })) return;
-        if (
-          looksLikeReasoningLeakTitle(metadata.title) ||
-          looksLikeReasoningLeakTitle(metadata.summary) ||
-          isGenericConversationTitle(metadata.title)
-        ) return;
-
-        latestState.updateConversationTurn(turnId, {
-          title: metadata.title,
-          intentSummary: metadata.summary,
-        });
-
-        if (expectedSessionId != null) {
-          if (!canUpdateSeedSessionTitle({ session: latestSession, seededTitle: seededSessionTitleCandidate })) {
-            logStoreEvent("semantic_title_session_update_skipped", {
-              turnId,
-              sessionKey: runSessionKey,
-              workspace: runWorkspace || null,
-              reason: "session_title_not_auto_seed",
-              titleSource: latestSession?.titleSource || null,
-            });
-            return;
-          }
-          latestState.updateSession(sessionScopeKey, expectedSessionId, {
-            title: metadata.title,
-            titleSource: "semantic",
-            semanticTitleUpdatedAt: Date.now(),
-            titleIntentSignature,
-            active: true,
-          });
-        }
-      }).catch(() => {
-        // 标题同步失败时保持当前回退标题即可，不影响主流程继续执行。
-      });
-    }
+        return {
+          conversationTurns: latestState.conversationTurns,
+          sessionsByWorkspace: latestState.sessionsByWorkspace,
+        };
+      },
+      updateConversationTurn: (targetTurnId, patch) => {
+        sessionGet().updateConversationTurn(targetTurnId, patch);
+      },
+      updateSession: (scopeKey, sessionId, patch) => {
+        sessionGet().updateSession(scopeKey, sessionId, patch);
+      },
+      logStoreEvent,
+      runSessionKey,
+      runWorkspace,
+    });
 
     // 2. Start elapsed timer
-    const startTime = Date.now();
-    const getElapsedSeconds = () => Math.round((Date.now() - startTime) / 1000);
-    const updateElapsedTime = () => {
-      sessionSet({ elapsedTime: getElapsedSeconds() });
-    };
-    const timerInterval = setInterval(() => {
-      const state = sessionGet();
-      if (state.agentStatus === "idle" || state.agentStatus === "error") {
-        clearInterval(timerInterval);
-        return;
-      }
-      updateElapsedTime();
-    }, 1000);
+    const elapsedTimer = startSubmitElapsedTimer({
+      sessionGet,
+      sessionSet,
+    });
+    const { timerInterval, getElapsedSeconds } = elapsedTimer;
 
     // 3. Build context from @-mentions and attached files
     // Read actual file contents for attached files (from old App.tsx)
@@ -9197,431 +6856,121 @@ export const useAppStore = create<AppState>()(
       let activeStudioAgentKey = sessionGet().activeStudioAgentKey;
       let gameStudioInitialized = sessionGet().gameStudioInitialized;
       let gameStudioConfigForTurn: StudioConfig | null = null;
-      const mentions = mentionSnapshot;
-      const files = attachedFilesSnapshot;
-      const attachmentRefs: AttachmentReadRef[] = [];
-      const failedAttachmentParts: string[] = [];
-      for (const file of files) {
-        try {
-          attachmentRefs.push(await prepareAttachedFileForRead(file, runSessionKey));
-        } catch {
-          const attachment = normalizeAttachedFile(file);
-          markUserContextItemFailed(attachment.sourcePath || attachment.path);
-          failedAttachmentParts.push(`[无法读取文件：${attachment.displayName || getAttachmentDisplayName(attachment.path)}]`);
-        }
-      }
-      for (const mentionPath of mentions) {
-        const kind = classifyAttachment(mentionPath);
-        attachmentRefs.push({
-          path: mentionPath,
-          displayName: getAttachmentDisplayName(mentionPath),
-          kind: kind === "tabular" || kind === "document" ? kind : "text",
-        });
-      }
-
-      const seenAttachmentRefs = new Set<string>();
-      const allFileRefs = attachmentRefs.filter((ref) => {
-        const key = `${ref.workspace || runWorkspace || ""}::${ref.path}`;
-        if (seenAttachmentRefs.has(key)) return false;
-        seenAttachmentRefs.add(key);
-        return true;
+      const attachmentContext = await buildSubmitAttachmentContext({
+        text,
+        mentions: mentionSnapshot,
+        files: attachedFilesSnapshot,
+        runSessionKey,
+        runWorkspace,
+        preferredLanguage,
+        markUserContextItemFailed,
+        ingestAttachmentFile,
+        readFile,
+        readDocument,
+        analyzeTabularDocument,
       });
+      userContent = attachmentContext.userContent;
+      const previousTurnLastToolSummary =
+        shouldContinuePreviousTurnIntent && previousTurnContinuationTarget
+          ? getLastTurnToolSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow)
+          : "";
+      const previousTurnLastAssistantSummary =
+        shouldContinuePreviousTurnIntent && previousTurnContinuationTarget
+          ? getLastVisibleTurnAgentSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow)
+          : "";
+      const approvedProposal =
+        shouldExecuteOnceFromReplyOption
+          ? existingTurn?.pendingOperationProposal ||
+            currentTurn?.pendingOperationProposal ||
+            previousTurnContinuationTarget?.pendingOperationProposal
+          : undefined;
+      const latestAssistantSummary =
+        shouldExecuteOnceFromReplyOption
+          ? getLastVisibleTurnAgentSummary(turnId, sessionGet().taskFlow)
+          : "";
+      userContent = buildSubmitPromptContext({
+        userContent,
+        text,
+        preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
+        effectiveRunIntent,
+        effectiveWorkflowMode,
+        preservePlanState,
+        isPlanApproved: sessionGet().isPlanApproved,
+        shouldContinuePlanIntent,
+        shouldContinuePreviousTurnIntent,
+        shouldExecuteOnceFromReplyOption,
+        currentTurnUserPrompt: currentTurn?.userPrompt,
+        previousTurnContinuationTarget,
+        previousTurnLastToolSummary,
+        previousTurnLastAssistantSummary,
+        approvedProposal,
+        latestAssistantSummary,
+        selectedChoiceText,
+        turnInputContextSignals,
+      }).userContent;
 
-      if (allFileRefs.length > 0 || failedAttachmentParts.length > 0) {
-        const parts: string[] = [];
-        if (mentions.length > 0) {
-          parts.push(preferredLanguage === "en"
-            ? [
-                "[user_mentioned_files]",
-                "The user selected these files with @. Treat them as explicit context targets and use their exact paths for any follow-up read/query tools.",
-                ...mentions.map((mentionPath) => `path: ${mentionPath}`),
-              ].join("\n")
-            : [
-                "[user_mentioned_files]",
-                "用户通过 @ 选择了这些文件。请把它们视为明确上下文目标，后续读取/查询工具必须优先使用这些精确路径。",
-                ...mentions.map((mentionPath) => `path: ${mentionPath}`),
-              ].join("\n"));
-        }
-        parts.push(...failedAttachmentParts);
-        for (const ref of allFileRefs) {
-          const fp = ref.path;
-          const readWorkspace = ref.workspace ?? runWorkspace;
-          try {
-            let c: string;
-            if (shouldUseTabularAnalyzer(fp)) {
-              const summary = await analyzeTabularDocument(fp, undefined, undefined, undefined, undefined, readWorkspace);
-              const preview = await readDocument(fp, 3000, 12, 0, 40, undefined, readWorkspace);
-              const compactSummary = {
-                rowCount: summary.metadata.rowCount,
-                columnCount: summary.metadata.columnCount,
-                columns: Array.isArray(summary.metadata.columns)
-                  ? (summary.metadata.columns as unknown[]).slice(0, 40)
-                  : summary.metadata.columns,
-                numericColumns: Array.isArray(summary.metadata.numericColumns)
-                  ? (summary.metadata.numericColumns as unknown[]).slice(0, 20)
-                  : summary.metadata.numericColumns,
-                categoricalColumns: Array.isArray(summary.metadata.categoricalColumns)
-                  ? (summary.metadata.categoricalColumns as unknown[]).slice(0, 20)
-                  : summary.metadata.categoricalColumns,
-                datetimeColumns: Array.isArray(summary.metadata.datetimeColumns)
-                  ? (summary.metadata.datetimeColumns as unknown[]).slice(0, 20)
-                  : summary.metadata.datetimeColumns,
-                sampleHead: summary.sampleRows.head,
-                sampleTail: summary.sampleRows.tail,
-              };
-              c = [
-                "[attached_tabular_file]",
-                `path: ${fp}`,
-                ...(ref.sourcePath && ref.sourcePath !== fp ? [`originalPath: ${ref.sourcePath}`] : []),
-                `documentType: ${preview.documentType}`,
-                `sourceName: ${summary.sourceName}`,
-                `truncatedPreview: ${preview.truncated ? "true" : "false"}`,
-                "note: The preview below is not guaranteed to be the full file. Use analyze_tabular_document, query_tabular_document, or read_document on this exact path for full-file reasoning.",
-                "[summary]",
-                JSON.stringify(compactSummary, null, 2),
-                "[preview]",
-                preview.content || JSON.stringify(preview.metadata),
-              ].join("\n");
-            } else if (shouldUseDocumentReader(fp)) {
-              const doc = await readDocument(fp, undefined, undefined, undefined, undefined, undefined, readWorkspace);
-              const header = [
-                "[attached_document]",
-                `path: ${fp}`,
-                ...(ref.sourcePath && ref.sourcePath !== fp ? [`originalPath: ${ref.sourcePath}`] : []),
-                `documentType: ${doc.documentType}`,
-                `truncatedPreview: ${doc.truncated ? "true" : "false"}`,
-              ];
-              if (doc.title) header.push(`title: ${doc.title}`);
-              header.push("note: If this preview is truncated, use read_document on the exact path above before concluding.");
-              const body = doc.content || JSON.stringify(doc.metadata);
-              c = `${header.join("\n")}\n${body}`;
-            } else {
-              const raw = await readFile(fp, readWorkspace);
-              c = [
-                "[attached_file]",
-                `path: ${fp}`,
-                ...(ref.sourcePath && ref.sourcePath !== fp ? [`originalPath: ${ref.sourcePath}`] : []),
-                raw,
-              ].join("\n");
-            }
-            const n = ref.displayName || fp.split("/").pop() || fp;
-            parts.push("```" + n + "\n" + c + "\n```");
-          } catch {
-            const n = ref.displayName || fp.split("/").pop() || fp;
-            markUserContextItemFailed(ref.sourcePath || fp);
-            if (ref.sourcePath) markUserContextItemFailed(fp);
-            parts.push(`[无法读取文件：${n}]`);
-          }
-        }
-        userContent = parts.join("\n\n") + "\n\n" + text;
-      }
-
-      if (effectiveRunIntent === "plan" && !sessionGet().isPlanApproved && !shouldContinuePlanIntent) {
-        const planModeLead = preservePlanState
-          ? preferredLanguage === "en"
-            ? "This is still an unapproved PLAN turn. Treat the latest user message as a planning choice or clarification, not approval to edit source files."
-            : "当前仍是未批准的 PLAN 回合。请把用户最新消息视为计划选项/澄清，不要当作已批准修改源码。"
-          : preferredLanguage === "en"
-          ? "This turn is in PLAN mode."
-          : "本轮处于 PLAN 模式。";
-        userContent = preferredLanguage === "en"
-          ? [
-              `${planModeLead} If the request is a complex implementation, gather read-only evidence first, then create or update the reviewable plan at \`.MAIN/plans/plan.md\` with \`write_file\` or \`replace_in_file\`. This is the only allowed write before approval. For debug-log, screenshot, repeated-failure, or cross-module repairs, you may also keep a short staged ledger: \`requirements.md\` for user goals/acceptance and \`design.md\` for evidence-backed diagnosis. Do not write project source files or tasks.md before approval.`,
-              "Follow the opencode-style plan file workflow: if a plan file already exists, edit it incrementally; otherwise create it. Keep exploring read-only evidence until the plan is decision-complete.",
-              "The plan file must follow the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
-              "If it is only a discussion-style plan, keep the answer concise and use user options for real decisions.",
-              "",
-              userContent,
-            ].join("\n")
-          : [
-              `${planModeLead}如果这是复杂实现请求，请先收集只读证据，再用 \`write_file\` 或 \`replace_in_file\` 创建/更新可审批计划文件 \`.MAIN/plans/plan.md\`；这是批准前唯一允许的写入。遇到调试日志、截图、反复失败或跨模块修复时，可以同时保留简短 staged ledger：\`requirements.md\` 写用户目标/验收，\`design.md\` 写证据归因/取舍。等待用户批准后再改源码；批准前不要生成 tasks.md。`,
-              "严格按 opencode 风格的计划文件流程：如果 plan.md 已存在就增量编辑，否则创建完整计划；只读证据足够且计划 decision-complete 后再停在审批。",
-              "plan.md 必须对齐 Codex app 的交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
-              "如果只是讨论式方案，请保持简洁，并在真实分叉点用可点击选项让用户选择。",
-              "",
-              userContent,
-            ].join("\n");
-      }
-
-      if (shouldContinuePlanIntent) {
-        const originalPlanPrompt = currentTurn?.userPrompt?.trim();
-        userContent = preferredLanguage === "en"
-          ? [
-              "Continue the previous PLAN turn. The user is asking to keep going, not to start a new discussion.",
-              originalPlanPrompt ? `Original plan request: ${originalPlanPrompt}` : "Original plan request: use the current conversation context.",
-              "Produce real planning progress now. If key choices remain, summarize them in 2-3 bullets then use <user_options>; if all decisions are made, write plan.md directly without options. Use requirements/design only as a short staged ledger for complex evidence tracking.",
-              "Keep plan.md concise: review-summary style, no tutorial prose, no full code listings, no repeated background.",
-              text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
-            ].join("\n")
-          : [
-              "请继续上一轮 PLAN 回合。用户是在要求继续推进，不是开启新的普通讨论。",
-              originalPlanPrompt ? `上一轮计划请求：${originalPlanPrompt}` : "上一轮计划请求：请依据当前对话上下文继续。",
-              "现在必须产生实际规划进展。如有关键决策需确认，先用 2-3 条摘要归纳再给出 <user_options>；如所有决策已完成，则直接写入 plan.md 无需选项。requirements/design 只作为复杂证据追踪的简短 staged ledger。",
-              "每个 <option> 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。",
-              "plan.md 要精简成 Codex app 交接计划风格：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值；不要写教程式长文、完整代码清单或重复背景。",
-              text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
-            ].join("\n");
-      }
-
-      if (shouldContinuePreviousTurnIntent && previousTurnContinuationTarget) {
-        const originalPrompt = previousTurnContinuationTarget.userPrompt?.trim();
-        const lastTool = getLastTurnToolSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow);
-        const lastAssistant = getLastVisibleTurnAgentSummary(previousTurnContinuationTarget.id, sessionGet().taskFlow);
-        const executionHint =
-          effectiveRunIntent === "execute" || effectiveRunIntent === "studio_workflow"
-            ? preferredLanguage === "en"
-              ? "If the unfinished next step is running, testing, verifying, or executing a command, issue the real tool call now: prefer `run_command` for finite checks/tests, and use `execute_command` only for long-running or interactive validation."
-              : "如果未完成的下一步是运行、测试、验证或执行命令，现在必须发起真实工具调用：一次性检查/测试优先用 `run_command`，长驻或交互式验证才用 `execute_command`。"
-            : preferredLanguage === "en"
-            ? "If the remaining work requires workspace context, use the appropriate read-only tool immediately instead of announcing a future step."
-            : "如果剩余工作需要工作区上下文，请立即调用合适的只读工具，不要只宣布下一步。";
-        userContent = preferredLanguage === "en"
-          ? [
-              "Continue the previous unfinished turn. The user's message is a semantic continuation request, not a new discussion.",
-              originalPrompt ? `Original request: ${originalPrompt}` : "Original request: use the current conversation context.",
-              `Previous turn status: ${previousTurnContinuationTarget.status}.`,
-              lastTool ? `Last tool activity: ${lastTool}.` : "",
-              lastAssistant ? `Last visible assistant message: ${lastAssistant}` : "",
-              "Resume from the unfinished point and complete the remaining work.",
-              executionHint,
-              "Do not stop after saying what you will do next.",
-              text.trim() ? `Latest user message: ${text.trim()}` : "Latest user message: continue",
-              "",
-              userContent,
-            ].filter(Boolean).join("\n")
-          : [
-              "请继续上一轮未完成回合。用户这句是语义续跑，不是开启新的普通讨论。",
-              originalPrompt ? `上一轮原始请求：${originalPrompt}` : "上一轮原始请求：请依据当前对话上下文继续。",
-              `上一轮状态：${previousTurnContinuationTarget.status}。`,
-              lastTool ? `上一轮最后工具活动：${lastTool}。` : "",
-              lastAssistant ? `上一轮最后可见回复：${lastAssistant}` : "",
-              "请从未完成的位置恢复，并完成剩余内容。",
-              executionHint,
-              "不要只说接下来要做什么后停止。",
-              text.trim() ? `用户最新消息：${text.trim()}` : "用户最新消息：继续",
-              "",
-              userContent,
-            ].filter(Boolean).join("\n");
-      }
-
-      if (shouldExecuteOnceFromReplyOption && (effectiveRunIntent === "execute" || effectiveRunIntent === "studio_workflow")) {
-        const approvedProposal =
-          existingTurn?.pendingOperationProposal ||
-          currentTurn?.pendingOperationProposal ||
-          previousTurnContinuationTarget?.pendingOperationProposal;
-        const latestAssistantSummary = getLastVisibleTurnAgentSummary(turnId, sessionGet().taskFlow);
-        const approvalContinuationPrompt = buildOperationApprovalContinuationPrompt({
-          language: preferredLanguage === "en" ? "en" : "zh",
-          proposal: approvedProposal,
-          latestAssistantSummary,
-          userChoice: text.trim() || selectedChoiceText || "approved",
-        });
-        userContent = [
-          approvalContinuationPrompt,
-          "",
-          userContent,
-        ].join("\n");
-      }
-
-      const turnIntakeBlock = buildTurnIntakeContextBlock({
-        rawUserInput: text,
-        signals: turnInputContextSignals,
-        language: preferredLanguage === "en" ? "en" : "zh",
-        workflowMode: effectiveWorkflowMode,
+      const gameStudioPreparation = await runSubmitGameStudioPreparation({
+        turnId,
+        currentMainModeKey,
+        text,
+        userContent,
+        parsedSetupEngineCommand,
+        parsedStudioCommand,
+        activeStudioAgentKey,
+        gameStudioInitialized,
+        cachedWorkspaceTreeForGameDetection,
+        preferredLanguage,
+        runtimeService: gameStudioRuntimeService,
+        logWarning: (event, data) => appendDebugLog("warn", event, data),
+        nextTaskId: nextId,
+        sessionGet,
+        sessionSet,
+        disposeElapsedTimer: elapsedTimer.dispose,
+        invalidateWorkspaceTreeCache,
       });
-      if (turnIntakeBlock) {
-        userContent = `${turnIntakeBlock}\n\n${userContent}`;
-      }
-
-      if (currentMainModeKey === "game_studio") {
-        if (parsedSetupEngineCommand?.mode === "configure" && parsedSetupEngineCommand.engine) {
-          try {
-            const engineAgent = getDefaultStudioAgentForEngine(parsedSetupEngineCommand.engine);
-            await ensureGameStudioWorkspaceInitialized(engineAgent);
-            gameStudioConfigForTurn = await setGameStudioEngineConfig({
-              engine: parsedSetupEngineCommand.engine,
-              version: parsedSetupEngineCommand.version,
-              activeStudioAgent: engineAgent,
-            });
-            activeStudioAgentKey = normalizeStudioAgentKey(gameStudioConfigForTurn.activeStudioAgent);
-            gameStudioInitialized = true;
-            invalidateWorkspaceTreeCache();
-            sessionSet({
-              gameStudioInitialized: true,
-              activeStudioAgentKey,
-            });
-            sessionGet().bumpWorkspaceContentVersion();
-          } catch (error) {
-            appendDebugLog("warn", "game_studio_setup_engine_failed", {
-              error: error instanceof Error ? error.message : String(error),
-            });
-          }
-        } else {
-          const engineSignal = detectGameDevelopmentIntent(text, {
-            workspaceTree: cachedWorkspaceTreeForGameDetection,
-          });
-          if (engineSignal.engineStatus === "explicit" && engineSignal.engine) {
-            const currentConfig = await loadGameStudioConfig();
-            if (!currentConfig || currentConfig.engine === "unconfigured" || currentConfig.engine !== engineSignal.engine) {
-              try {
-                const engineAgent = getDefaultStudioAgentForEngine(engineSignal.engine);
-                await ensureGameStudioWorkspaceInitialized(engineAgent);
-                gameStudioConfigForTurn = await setGameStudioEngineConfig({
-                  engine: engineSignal.engine,
-                  activeStudioAgent: engineAgent,
-                });
-                activeStudioAgentKey = normalizeStudioAgentKey(gameStudioConfigForTurn.activeStudioAgent);
-                gameStudioInitialized = true;
-                invalidateWorkspaceTreeCache();
-                sessionSet({
-                  gameStudioInitialized: true,
-                  activeStudioAgentKey,
-                });
-                sessionGet().bumpWorkspaceContentVersion();
-              } catch (error) {
-                appendDebugLog("warn", "game_studio_auto_engine_config_failed", {
-                  error: error instanceof Error ? error.message : String(error),
-                });
-              }
-            } else {
-              gameStudioConfigForTurn = currentConfig;
-            }
-          }
-        }
-
-        if (!gameStudioConfigForTurn) {
-          gameStudioConfigForTurn = await loadGameStudioConfig();
-        }
-      }
-
-      const shouldUseGameStudioEnvelope =
-        currentMainModeKey === "game_studio" &&
-        (
-          parsedStudioCommand?.type === "workflow" ||
-          activeStudioAgentKey !== "studio_auto" ||
-          gameStudioInitialized
-        );
-
-      if (
-        currentMainModeKey === "game_studio" &&
-        !gameStudioInitialized &&
-        (parsedStudioCommand?.type === "workflow" || activeStudioAgentKey !== "studio_auto")
-      ) {
-        try {
-          const studioConfig = await ensureGameStudioWorkspaceInitialized(activeStudioAgentKey);
-          activeStudioAgentKey = normalizeStudioAgentKey(studioConfig.activeStudioAgent);
-          gameStudioConfigForTurn = studioConfig;
-          gameStudioInitialized = true;
-          invalidateWorkspaceTreeCache();
-          sessionSet({
-            gameStudioInitialized: true,
-            activeStudioAgentKey,
-          });
-          sessionGet().bumpWorkspaceContentVersion();
-        } catch (error) {
-          clearInterval(timerInterval);
-          const failureId = nextId();
-          sessionSet((s) => ({
-            taskFlow: [
-              ...s.taskFlow,
-              {
-                id: failureId,
-                turnId,
-                type: "system",
-                content: `Game Studio 初始化失败：${error instanceof Error ? error.message : String(error)}`,
-              } as TaskBlock,
-            ],
-            conversationTurns: s.conversationTurns.map((turn) =>
-              turn.id === turnId
-                ? {
-                    ...turn,
-                    status: "error",
-                    blockIds: turn.blockIds.includes(failureId) ? turn.blockIds : [...turn.blockIds, failureId],
-                  }
-                : turn,
-            ),
-            agentStatus: "error",
-            isGenerating: false,
-            abortController: null,
-            pendingSlashCommand: null,
-          }));
-          return;
-        }
-      }
-
-      if (shouldUseGameStudioEnvelope) {
-        userContent = buildGameStudioEnvelopeForTurn({
-          originalText: userContent,
-          nexusMode: mapMainModeToLegacyNexusMode(currentMainModeKey),
-          activeStudioAgent: activeStudioAgentKey,
-          command: parsedStudioCommand?.type === "workflow" ? parsedStudioCommand : null,
-          studioConfig: gameStudioConfigForTurn,
-          responseLanguage: preferredLanguage,
-        });
+      userContent = gameStudioPreparation.userContent;
+      activeStudioAgentKey = gameStudioPreparation.activeStudioAgentKey;
+      gameStudioInitialized = gameStudioPreparation.gameStudioInitialized;
+      gameStudioConfigForTurn = gameStudioPreparation.gameStudioConfigForTurn;
+      if (!gameStudioPreparation.ok) {
+        return;
       }
 
       // Clear mentions and attached files after reading
       sessionSet({ contextMentions: [], attachedFiles: [] });
 
-      // 4. Append to LLM conversation history
-      // Build multimodal content if images are present
-      const turnAgentMessagesStart = sessionGet().agentMessages.length;
-      let agentUserMsg: AgentMessage;
-      if (currentImages.length > 0) {
-        const parts: ContentPart[] = [];
-        // Add images first, then text
-        for (const dataUrl of currentImages) {
-          parts.push({ type: "image_url", image_url: { url: dataUrl } });
-        }
-        if (userContent.trim()) {
-          parts.push({ type: "text", text: userContent });
-        }
-        agentUserMsg = { role: "user", content: parts };
-      } else {
-        agentUserMsg = { role: "user", content: userContent };
-      }
-      sessionSet((s) => ({ agentMessages: [...s.agentMessages, agentUserMsg] }));
-
-      // 5. Create AbortController and launch the loop
-      const abortCtrl = new AbortController();
-      sessionSet({ abortController: abortCtrl });
-      
-      if (effectiveRunIntent === "goal") {
-        sessionGet().startGoal(userContent, { sessionKey: runSessionKey });
-      }
-
-      let harnessRunMarker: HarnessRunMarker = persistHarnessRunMarker({
-        schemaVersion: 1,
-        instanceId: getCurrentHarnessInstanceId(),
-        sessionKey: runSessionKey,
-        workspace: runWorkspace || null,
-        sessionId: runSessionId ?? null,
+      const runLease = startSubmitRunLease({
+        userContent,
+        currentImages,
+        runSessionKey,
+        runWorkspace,
+        runSessionId,
         turnId,
-        status: "running",
-        workflowMode: getIntentPolicy(effectiveRunIntent).workflowMode,
-        runtimeIntent: runtimeRunIntent,
-        planStage: sessionGet().planStage,
-        isPlanApproved: sessionGet().isPlanApproved,
-        iteration: 0,
-        maxIterations: 0,
-        messagesLen: sessionGet().agentMessages.length,
-        toolCount: 0,
-        latestTool: null,
-        latestToolTarget: null,
-        activeStreamId: null,
-        streamStatus: "run_started",
-        streamChunkCount: 0,
-        streamByteCount: 0,
-        streamElapsedMs: null,
-        streamLifecycleStatus: null,
-        lastStreamError: null,
-        startedAt: Date.now(),
-        updatedAt: Date.now(),
-        closedAt: null,
-        closeReason: null,
+        effectiveRunIntent,
+        runtimeRunIntent,
+        getRuntimeSnapshot: () => ({
+          agentMessagesLength: sessionGet().agentMessages.length,
+          planStage: sessionGet().planStage,
+          isPlanApproved: sessionGet().isPlanApproved,
+        }),
+        appendAgentMessage: (message) => {
+          sessionSet((s) => ({ agentMessages: [...s.agentMessages, message] }));
+        },
+        createAbortController: () => new AbortController(),
+        setAbortController: (abortController) => {
+          sessionSet({ abortController });
+        },
+        startGoal: (objective, goalOptions) => {
+          sessionGet().startGoal(objective, goalOptions);
+        },
+        getCurrentHarnessInstanceId,
+        persistHarnessRunMarker,
+        setHarnessRunMarker: (harnessRunMarker) => {
+          sessionSet({ harnessRunMarker });
+        },
       });
-
-      sessionSet({ harnessRunMarker });
+      const turnAgentMessagesStart = runLease.turnAgentMessagesStart;
+      const abortCtrl = runLease.abortController;
 
       const phaseLanguage = preferredLanguage === "en" ? "en" : "zh";
 
@@ -9635,8 +6984,7 @@ export const useAppStore = create<AppState>()(
         elapsedMs: Math.round(nowMs() - workspaceTreeStartedAt),
       });
 
-      const context: WorkflowContext = {
-        // Constants & Parameters
+      const context = createSubmitWorkflowContext({
         turnId,
         uiDisplayTurnId,
         runWorkspace,
@@ -9656,302 +7004,37 @@ export const useAppStore = create<AppState>()(
         abortCtrl,
         timerInterval,
         sendStartedAt,
-        streamBuffer: null as any, // will be assigned below
-        thinkingInterceptor: null as any, // will be assigned below
         turnAgentMessagesStart,
         getElapsedSeconds,
-
-        // Mutable stream execution state
-        agentBlockIdsCreatedThisRun: new Set<number>(),
-        firstStreamTokenAt: null,
-        streamTokenCount: 0,
-        streamTextChars: 0,
-        noFirstTokenNoticeTimer: null,
-        currentStreamingBlockId: null,
-        currentThoughtBlockId: null,
-        thoughtStartTime: null,
-        streamingAssistantDisplayBuffer: "",
-        approvedPlanHandoff: null,
-        understandingProgressBlockId: null,
-        understandingProgressClosed: false,
-
-        // Constants
         PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
         PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
         PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
-      };
-
-      const thinkingInterceptor = new StreamingThinkingInterceptor();
-      context.thinkingInterceptor = thinkingInterceptor;
-
-      const attachRuntimePhase = <T extends TaskBlock>(block: T, phase?: TurnRuntimePhase): T => {
-        const normalized = normalizeTurnRuntimePhase(block.turnPhase || phase || makeTurnRuntimePhase("scope", phaseLanguage), phaseLanguage);
-        return normalized ? { ...block, turnPhase: normalized } : block;
-      };
-
-      const appendTurnBlock = (block: TaskBlock) => {
-        const targetTurnId = block.turnId && block.turnId !== turnId ? block.turnId : uiDisplayTurnId;
-        const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: targetTurnId } as TaskBlock);
-        if (blockWithTurn.type === "agent") {
-          context.agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
-        }
-        sessionSet((s) => ({
-          taskFlow: [...s.taskFlow, blockWithTurn],
-          conversationTurns: s.conversationTurns.map((turn) =>
-            turn.id === targetTurnId && !turn.blockIds.includes(blockWithTurn.id)
-              ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
-              : turn
-          ),
-        }));
-      };
-
-      const emitProgressRuntimeEvent = (progress: any, meta: { dedupeKey?: string } = {}) => {
-        const eventId = "event-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-        sessionSet((s) => ({
-          runtimeEvents: [
-            ...s.runtimeEvents,
-            {
-              id: eventId,
-              turnId,
-              sessionKey: runSessionKey,
-              workspace: runWorkspace || null,
-              timestamp: Date.now(),
-              type: "progress",
-              dedupeKey: meta.dedupeKey || null,
-              payload: progress,
-            },
-          ],
-        }));
-      };
-
-      const buildUnderstandingProgress = (status: "running" | "done" = "running") => {
-        const hasImages = currentImages.length > 0;
-        const hasContextItems = turnInputContextSignals.mentionedFilePaths.length > 0 || turnInputContextSignals.attachedFilePaths.length > 0;
-        const contextText = hasImages
-          ? phaseLanguage === "zh"
-            ? "用户提供了 " + currentImages.length + " 张图片；先理解截图、约束和预期行为。"
-            : "The user provided " + currentImages.length + " image(s); first understand the screenshots, constraints, and expected behavior."
-          : hasContextItems
-          ? phaseLanguage === "zh"
-            ? "用户提供了上下文文件或引用；先确认这些材料与目标的关系。"
-            : "The user provided contextual files or references; first map them to the request."
-          : phaseLanguage === "zh"
-          ? "先确认用户目标、约束和安全边界。"
-          : "First confirm the user goal, constraints, and safety boundary.";
-        const next = effectiveRunIntent === "plan"
-          ? phaseLanguage === "zh"
-            ? "随后只做定向读取与证据收束，批准前只写计划文件。"
-            : "Next, use targeted reads and evidence synthesis; before approval only plan artifacts may be written."
-          : effectiveRunIntent === "execute" || effectiveRunIntent === "studio_workflow"
-          ? phaseLanguage === "zh"
-            ? "随后读取最小必要上下文，再执行真实操作或明确说明阻塞。"
-            : "Next, read the minimum necessary context, then act or state a concrete blocker."
-          : effectiveRunIntent === "respond" || effectiveRunIntent === "discuss"
-          ? phaseLanguage === "zh"
-            ? "随后基于上下文给出直接答复。"
-            : "Next, answer directly from the available context."
-          : "";
-        return normalizeProgressNarration({
-          phase: "understanding",
-          title: phaseLanguage === "zh" ? "理解需求" : "Understanding request",
-          why: effectiveIntentSummary || contextText,
-          action: contextText,
-          evidence: hasImages || hasContextItems ? contextText : "",
-          next,
-          targets: [],
-          status,
-          source: "runtime",
-          hypothesisStatus: status === "done" ? "confirmed" : "unverified",
-        });
-      };
-
-      const appendUnderstandingProgress = () => {
-        if (isHidden && !createVisibleTurnForHiddenMessage) return;
-        const progress = buildUnderstandingProgress("running");
-        const blockId = nextId();
-        context.understandingProgressBlockId = blockId;
-        appendTurnBlock({
-          id: blockId,
-          turnId,
-          turnPhase: makeTurnRuntimePhase("scope", phaseLanguage, { status: "running" }),
-          type: "progress",
-          ...progress,
-        });
-        emitProgressRuntimeEvent(progress, {
-          dedupeKey: "understanding:" + turnId,
-        });
-      };
-
-      const streamBuffer = new StreamingCadenceBuffer({
-        interceptor: thinkingInterceptor,
-        flushIntervalMs: 90,
-        onFlush: ({ agentDelta, thinkingDelta, thoughtStarted, thoughtEnded }) => {
-          const latestStateForDedupe = sessionGet();
-          const shouldDisplayReasoningBlocks = latestStateForDedupe.config.reasoningDisplay !== "hidden";
-          const nextInterceptorThought = thinkingDelta
-            ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinkingDelta)
-            : latestStateForDedupe.currentTurnState.interceptorThought;
-          const currentInterceptorThoughtContent = thinkingInterceptor.getThinkingContent() || thinkingDelta;
-          let thoughtIdToCreate: number | null = null;
-          let thoughtIdToUpdate = context.currentThoughtBlockId;
-          const thoughtDuration = context.thoughtStartTime ? Math.round((Date.now() - context.thoughtStartTime) / 1000) : undefined;
-
-          if (thoughtStarted && shouldDisplayReasoningBlocks) {
-            context.thoughtStartTime = Date.now();
-            const existingThoughtBlock = sessionGet().taskFlow
-              .filter((b) => b.turnId === turnId)
-              .reverse()
-              .find((b) => b.type === "thought");
-            if (existingThoughtBlock && !existingThoughtBlock.isStreaming) {
-              thoughtIdToCreate = null;
-              context.currentThoughtBlockId = existingThoughtBlock.id;
-              thoughtIdToUpdate = existingThoughtBlock.id;
-            } else if (existingThoughtBlock && existingThoughtBlock.isStreaming) {
-              thoughtIdToCreate = null;
-              context.currentThoughtBlockId = existingThoughtBlock.id;
-              thoughtIdToUpdate = existingThoughtBlock.id;
-            } else {
-              thoughtIdToCreate = nextId();
-              context.currentThoughtBlockId = thoughtIdToCreate;
-              thoughtIdToUpdate = thoughtIdToCreate;
-            }
-          }
-
-          let thoughtEndedId: number | null = null;
-          if (thoughtEnded && context.currentThoughtBlockId !== null && shouldDisplayReasoningBlocks) {
-            thoughtEndedId = context.currentThoughtBlockId;
-            context.currentThoughtBlockId = null;
-            context.thoughtStartTime = null;
-          } else if (thoughtEnded && !shouldDisplayReasoningBlocks) {
-            context.currentThoughtBlockId = null;
-            context.thoughtStartTime = null;
-          }
-
-          // ── Handle agent content ──
-          let agentContent = agentDelta;
-          let agentBlockIdToCreate: number | null = null;
-          let agentBlockIdToAppend: number | null = null;
-
-          if (agentContent) {
-            if (nextInterceptorThought && context.currentStreamingBlockId === null) {
-              const normThought = nextInterceptorThought.trim().toLowerCase().replace(/\s+/g, ' ');
-              const normAgent = agentContent.trim().toLowerCase().replace(/\s+/g, ' ');
-
-              if (normAgent.startsWith(normThought) || normThought.includes(normAgent)) {
-                const overlapLen = nextInterceptorThought.trim().length;
-                const possibleClean = agentContent.trim().slice(overlapLen).trim();
-                if (!possibleClean) {
-                  agentContent = "";
-                } else {
-                  agentContent = possibleClean;
-                }
-              }
-            }
-
-            if (agentContent) {
-              const displayCandidate = context.streamingAssistantDisplayBuffer + agentContent;
-              const displayDecision = resolveStreamingAssistantDisplay({
-                text: displayCandidate,
-                language: phaseLanguage,
-                workflowMode: sessionGet().config.workflowMode,
-                runIntent: effectiveRunIntent,
-                hasVisibleAgentBlock: context.currentStreamingBlockId !== null,
-              });
-              if (displayDecision.action === "show") {
-                agentContent = displayDecision.text;
-                context.streamingAssistantDisplayBuffer = "";
-              } else if (displayDecision.action === "buffer") {
-                context.streamingAssistantDisplayBuffer = displayDecision.bufferText || displayCandidate;
-                agentContent = "";
-              } else {
-                context.streamingAssistantDisplayBuffer = "";
-                agentContent = "";
-              }
-            }
-
-            if (agentContent) {
-              if (context.currentStreamingBlockId === null) {
-                agentBlockIdToCreate = nextId();
-                context.currentStreamingBlockId = agentBlockIdToCreate;
-                context.agentBlockIdsCreatedThisRun.add(agentBlockIdToCreate);
-              } else {
-                agentBlockIdToAppend = context.currentStreamingBlockId;
-              }
-            }
-          }
-
-          if (!thinkingDelta && !thoughtStarted && !thoughtEndedId && !agentContent) return;
-
-          sessionSet((s) => {
-            let taskFlow = s.taskFlow;
-            let conversationTurns = s.conversationTurns;
-
-            const appendBlock = (block: TaskBlock) => {
-              const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: block.turnId ?? turnId } as TaskBlock);
-              taskFlow = [...taskFlow, blockWithTurn];
-              conversationTurns = conversationTurns.map((turn) =>
-                turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
-                  ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
-                  : turn
-              );
-            };
-
-            if (shouldDisplayReasoningBlocks && thoughtIdToCreate !== null) {
-              appendBlock({
-                id: thoughtIdToCreate,
-                turnId,
-                type: "thought",
-                content: compactThoughtContent(currentInterceptorThoughtContent),
-                isStreaming: true,
-              });
-            } else if (shouldDisplayReasoningBlocks && thoughtIdToUpdate !== null && thinkingDelta) {
-              const tid = thoughtIdToUpdate;
-              taskFlow = taskFlow.map((t) =>
-                t.id === tid && t.type === "thought"
-                  ? { ...t, content: compactThoughtContent(currentInterceptorThoughtContent), isStreaming: true }
-                  : t
-              );
-            }
-
-            if (shouldDisplayReasoningBlocks && thoughtEndedId !== null) {
-              const tid = thoughtEndedId;
-              taskFlow = taskFlow.map((t) =>
-                t.id === tid && t.type === "thought"
-                  ? { ...t, content: compactThoughtContentForPersist((t as Extract<TaskBlock, { type: "thought" }>).content), isStreaming: false, duration: thoughtDuration }
-                  : t
-              );
-            }
-
-            if (agentBlockIdToCreate !== null && agentContent) {
-              appendBlock({ id: agentBlockIdToCreate, turnId, type: "agent", content: agentContent, streaming: true });
-            }
-
-            if (agentBlockIdToAppend !== null && agentContent) {
-              const blockId = agentBlockIdToAppend;
-              taskFlow = taskFlow.map((t) =>
-                t.id === blockId && t.type === "agent"
-                  ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + agentContent, isEscalating: false }
-                  : t
-              );
-            }
-
-            return {
-              taskFlow,
-              conversationTurns,
-              currentTurnState: {
-                ...s.currentTurnState,
-                interceptorHandled: s.currentTurnState.interceptorHandled || thoughtStarted,
-                interceptorThought: nextInterceptorThought,
-              },
-            };
-          });
-        }
       });
-      context.streamBuffer = streamBuffer;
 
-      appendUnderstandingProgress();
-      const engine = new WorkflowEngine(sessionGet, sessionSet);
-      engine.run(context);
+      startSubmitStreamingUi({
+        context,
+        sessionGet,
+        sessionSet,
+        nextTaskId: nextId,
+        currentImageCount: currentImages.length,
+        contextSignals: turnInputContextSignals,
+        effectiveIntentSummary,
+        isHidden,
+        createVisibleTurnForHiddenMessage,
+      });
+      void runSubmitWorkflowEngine({
+        get: sessionGet,
+        set: sessionSet,
+        context,
+        sanitizeTaskBlocksForPersist,
+        sanitizeAgentMessagesForPersist,
+        normalizeSessionRuntimeSnapshot,
+        normalizeProviderCompatibilityByRuntimeKey,
+        compactCompletedTurnAgentMessages,
+        normalizeQueuedUserMessage,
+        startApprovedPlanExecutionTurnFromHandoff,
+        logStoreEvent,
+      });
     })();
 
     return true;

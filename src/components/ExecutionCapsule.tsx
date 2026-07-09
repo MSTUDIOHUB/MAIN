@@ -130,6 +130,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   const [customReplyText, setCustomReplyText] = useState("");
   const [planAdjustmentText, setPlanAdjustmentText] = useState("");
   const [isApproving, setIsApproving] = useState(false);
+  const [choiceOptionsCollapsed, setChoiceOptionsCollapsed] = useState(false);
   const approvingRef = useRef(false);
 
   useEffect(() => {
@@ -198,6 +199,15 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     setTabSelections({});
     setTabWriteIns({});
   }, [replyOptions]);
+
+  const replyOptionsSignature = useMemo(
+    () => replyOptions.map((option) => `${option.action || ""}:${option.value || option.label}`).join("|"),
+    [replyOptions],
+  );
+
+  useEffect(() => {
+    setChoiceOptionsCollapsed(false);
+  }, [isAwaitingChoice, replyOptionsSignature]);
 
   const handleTabbedSubmit = () => {
     if (!tabGroups) return;
@@ -559,9 +569,32 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
 
 
 
-            {showAwaitingChoice && (
+            {showAwaitingChoice && choiceOptionsCollapsed && (
+              <button
+                type="button"
+                data-testid="execution-capsule-show-options"
+                onClick={() => setChoiceOptionsCollapsed(false)}
+                className={`mt-3 w-full px-3 py-2.5 text-center text-[12px] font-semibold ${neutralActionButtonClass}`}
+                style={choiceTextStyle}
+              >
+                {copy.showOptions}
+              </button>
+            )}
+
+            {showAwaitingChoice && !choiceOptionsCollapsed && (
               <div data-testid="execution-capsule-awaiting-choice" className={`mt-3 rounded-2xl border p-3 ${surface}`}>
-                <div className={`font-medium ${primaryText}`} style={choiceTextStyle}>{copy.chooseToContinue}</div>
+                <div className="flex min-w-0 items-start justify-between gap-3">
+                  <div className={`min-w-0 font-medium ${primaryText}`} style={choiceTextStyle}>{copy.chooseToContinue}</div>
+                  <button
+                    type="button"
+                    data-testid="execution-capsule-collapse-options"
+                    onClick={() => setChoiceOptionsCollapsed(true)}
+                    className={`shrink-0 px-2.5 py-1.5 text-[11px] font-semibold ${neutralActionButtonClass}`}
+                    style={choiceSectionStyle}
+                  >
+                    {copy.collapseOptions}
+                  </button>
+                </div>
                 <div className={`mt-1 ${secondaryText}`} style={choiceTextStyle}>
                   {hasRealChoiceOptions ? copy.choicePrompt : hasApprovalActionOptions ? copy.approvalActionsHint : copy.choiceHint}
                 </div>

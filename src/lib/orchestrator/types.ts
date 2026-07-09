@@ -3,7 +3,7 @@ import type { ContextMemoryState } from "../contextMemory";
 import { type MCPServer, type MCPTool } from "../mcpClient";
 import { type ToolDiffPreview } from "../toolDiff";
 import { type SessionAutoApproveScope, type ToolLifecycleState } from "../runtimeTools";
-import type { AppConfig, Skill } from "../../store/useAppStore";
+import type { AppConfig, Skill } from "../appTypes";
 import { type PlanArtifactRecoveryAction, type PlanExecutionEvidenceEntry, type PlanExecutionProgressUpdate, type PlanTask, type ReplyOption } from "../workflowModels";
 import type { MainModeKey } from "../mainModes";
 import { type CommandDirective, type ResolvedUserIntent } from "../runIntent";

@@ -107,6 +107,15 @@ test("ordinary composer command creates a new turn instead of consuming stale re
   await page.getByTestId("composer-textarea").fill(command);
   await page.getByTestId("composer-send-button").click();
 
+  await expect(page.getByTestId("execution-capsule-intent-option-execute")).toContainText("批准执行本轮操作");
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().selectedOptions ?? []),
+    )
+    .toEqual([]);
+
+  await page.getByTestId("execution-capsule-intent-option-execute").click();
+
   await expect
     .poll(async () =>
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().conversationTurns ?? -1),

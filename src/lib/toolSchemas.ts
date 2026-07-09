@@ -3,7 +3,7 @@
 // This is what Ollama / LM Studio / OpenAI expect in the `tools` parameter.
 // ────────────────────────────────────────────────────────────────────
 
-import type { Skill } from "../store/useAppStore";
+import type { Skill } from "./appTypes";
 import type { MCPTool } from "./mcpClient";
 
 export interface ToolDefinition {

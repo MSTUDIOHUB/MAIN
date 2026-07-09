@@ -9,7 +9,7 @@ import {
   type RunIntentRiskLevel,
 } from "./runIntent";
 import type { MainModeKey } from "./mainModes";
-import type { AppConfig } from "../store/useAppStore";
+import type { AppConfig } from "./appTypes";
 import { normalizeConversationDisplayTitle } from "./workflowModels";
 import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
 

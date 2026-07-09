@@ -1109,7 +1109,7 @@ test("plan executable reply options are ignored when the same turn has tool call
       }),
     )
     .toEqual({
-      status: "stopped_no_action",
+      status: "paused",
       currentTurnIntent: "plan",
       archivedOptionCount: 0,
       optionBlockCount: 0,

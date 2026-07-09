@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { type AppConfig } from "../store/useAppStore";
+import type { AppConfig } from "./appTypes";
 import { type ProtocolChatMessage } from "./cloudProtocol";
 import { invokeModelWithMessages, type GenerateGitCommitMessageParams } from "./gitCommitMessage";
 

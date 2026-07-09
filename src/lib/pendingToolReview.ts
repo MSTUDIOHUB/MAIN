@@ -1,4 +1,4 @@
-import type { TaskBlock } from "../store/useAppStore";
+import type { TaskBlock } from "./taskTypes";
 
 type PendingToolCallLike = {
   name?: string;

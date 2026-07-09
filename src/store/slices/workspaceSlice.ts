@@ -1,6 +1,4 @@
-import {
-  Lang,
-} from "../useAppStore";
+import type { Lang } from "../../lib/appTypes";
 import {
   MainModeKey,
   mapMainModeToLegacyNexusMode,

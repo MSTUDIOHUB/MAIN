@@ -1,41 +1,39 @@
 import { executeAgentLoop, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import { invoke } from "@tauri-apps/api/core";
-import { 
+import {
   appendThoughtDelta, 
   compactThoughtContent, 
   compactThoughtContentForPersist,
-  resolveStreamingAssistantDisplay,
-  normalizeTurnRuntimePhase,
+  pickProcessAssistantText,
+} from "../thoughtCompaction";
+import { resolveStreamingAssistantDisplay } from "../streamDisplayPolicy";
+import {
   makeTurnRuntimePhase,
-  getIntentPolicy,
-  sanitizeTaskBlocksForPersist,
-  sanitizeAgentMessagesForPersist,
-  normalizeSessionRuntimeSnapshot,
-  buildPlanExecutionProgressUpdate,
-  normalizePlanExecutionProgressSnapshot,
+  normalizeTurnRuntimePhase,
+  type TurnRuntimePhase,
+} from "../turnPhase";
+import { getIntentPolicy, type CommandDirective, type ResolvedRunIntent } from "../runIntent";
+import {
+  resolveContextMemoryStateForRuntimeLane,
+  resolveRuntimeLaneKey,
+} from "../appConfig";
+import {
   resolveSessionRuntimeKey,
   resolveSessionWorkspaceKey,
-  resolveRuntimeLaneKey,
-  resolveContextMemoryStateForRuntimeLane,
-  normalizeProviderCompatibilityByRuntimeKey,
-  compactCompletedTurnAgentMessages,
-  normalizeQueuedUserMessage,
-  pickProcessAssistantText,
-  startApprovedPlanExecutionTurnFromHandoff,
-  type AppState,
   type PlanApprovalHandoff,
-  type TaskBlock,
-  type FeishuRemoteContext,
-  type GameStudioConfig,
-  type CommandDirective,
-  type ResolvedRunIntent,
-  type AttachedFile,
-  type TurnRuntimePhase,
-  logStoreEvent
-} from "../../store/useAppStore";
+  type ProviderCompatibilityRuntimeLaneState,
+} from "../sessionTypes";
+import type { TaskBlock } from "../taskTypes";
+import type { AttachedFile } from "../attachments";
+import type { FeishuRemoteContext } from "../remoteContextTypes";
+import type { StudioConfig as GameStudioConfig } from "../gameStudioCatalog";
 import { appendDebugLog } from "../debugLog";
 import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion } from "../workflowModels";
+import {
+  buildPlanExecutionProgressUpdate,
+  normalizePlanExecutionProgressSnapshot,
+} from "../planExecutionRecovery";
 import { createPlanExecutionEvidenceEntry, appendPlanEvidenceEntry } from "../planEvidence";
 import { closeHarnessRunMarker, persistHarnessRunMarker, type HarnessRunMarker } from "../harnessCrashTelemetry";
 import { generateId } from "../utils";
@@ -46,6 +44,31 @@ import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
 
+type WorkflowStoreState = any;
+
+export interface WorkflowEngineStoreHelpers {
+  sanitizeTaskBlocksForPersist: (blocks: TaskBlock[]) => TaskBlock[];
+  sanitizeAgentMessagesForPersist: (messages: any[]) => any[];
+  normalizeSessionRuntimeSnapshot: (snapshot: Record<string, unknown>) => unknown;
+  normalizeProviderCompatibilityByRuntimeKey: (value: unknown) => Record<string, ProviderCompatibilityRuntimeLaneState>;
+  compactCompletedTurnAgentMessages: (params: {
+    agentMessages: any[];
+    turnStartIndex: number;
+    turnSummary: string;
+    turnBlocks: TaskBlock[];
+    language: "zh" | "en";
+  }) => any[];
+  normalizeQueuedUserMessage: (value: unknown) => any | null;
+  startApprovedPlanExecutionTurnFromHandoff: (input: {
+    get: () => WorkflowStoreState;
+    setActiveState: (patch: Record<string, unknown>) => void;
+    planTurnId: string;
+    handoff: PlanApprovalHandoff;
+    sessionKey: string;
+    source: "active_loop";
+  }) => void;
+  logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
+}
 
 export interface WorkflowContext {
   // Constants & Parameters
@@ -100,13 +123,24 @@ export interface WorkflowContext {
 
 export class WorkflowEngine {
   constructor(
-    private get: () => AppState,
-    private set: any
+    private get: () => WorkflowStoreState,
+    private set: any,
+    private helpers: WorkflowEngineStoreHelpers,
   ) {}
 
   public run(context: WorkflowContext): Promise<boolean> {
     const sessionGet = this.get;
     const sessionSet = this.set;
+    const {
+      sanitizeTaskBlocksForPersist,
+      sanitizeAgentMessagesForPersist,
+      normalizeSessionRuntimeSnapshot,
+      normalizeProviderCompatibilityByRuntimeKey,
+      compactCompletedTurnAgentMessages,
+      normalizeQueuedUserMessage,
+      startApprovedPlanExecutionTurnFromHandoff,
+      logStoreEvent,
+    } = this.helpers;
 
     const phaseLanguage = context.phaseLanguage;
     const turnId = context.turnId;
@@ -820,7 +854,7 @@ export class WorkflowEngine {
             if (isDuplicate && lastAgentBlock) {
               // Replace the existing block content instead of creating a new one
               const existingId = lastAgentBlock.id;
-              sessionSet((s: AppState) => ({
+              sessionSet((s: WorkflowStoreState) => ({
                 taskFlow: s.taskFlow.map((t: TaskBlock) =>
                   t.id === existingId && t.type === "agent"
                     ? { ...t, content: remainingAgent }
@@ -835,7 +869,7 @@ export class WorkflowEngine {
             }
           } else {
             const blockId = context.currentStreamingBlockId;
-            sessionSet((s: AppState) => ({
+            sessionSet((s: WorkflowStoreState) => ({
               taskFlow: s.taskFlow.map((t: TaskBlock) =>
                 t.id === blockId && t.type === "agent"
                   ? { ...t, content: (t as Extract<TaskBlock, { type: "agent" }>).content + remainingAgent }
@@ -846,7 +880,7 @@ export class WorkflowEngine {
         }
 
         const duration = context.thoughtStartTime ? Math.round((Date.now() - context.thoughtStartTime) / 1000) : undefined;
-        sessionSet((s: AppState) => {
+        sessionSet((s: WorkflowStoreState) => {
           const finalizeStreamingTaskBlocks = (taskFlow: TaskBlock[], targetTurnId: string, duration?: number): TaskBlock[] => {
             return taskFlow.map((t) => {
               if (t.turnId !== targetTurnId) return t;
@@ -897,7 +931,7 @@ export class WorkflowEngine {
           appendTurnBlock(warnBlock);
         }
 
-        sessionSet((s: AppState) => ({
+        sessionSet((s: WorkflowStoreState) => ({
           normalizedStreamState: {
             ...s.normalizedStreamState,
             finishReason: truncated ? "length" : "stop",

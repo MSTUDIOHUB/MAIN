@@ -847,10 +847,12 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
 }
 
 function TurnActivityNotice({
+  activityText,
   thoughtSummaryText,
   isThinking,
   language,
   chatFontSize,
+  progressItems,
 }: {
   activityText?: string;
   thoughtSummaryText?: string;
@@ -860,8 +862,13 @@ function TurnActivityNotice({
   progressItems?: RuntimeProgressLedgerItem[];
   text?: string;
 }) {
+  const [isProgressOpen, setIsProgressOpen] = useState(false);
   const resolvedThoughtSummaryText = String(thoughtSummaryText || "").trim();
-  if (!resolvedThoughtSummaryText) return null;
+  const resolvedActivityText = String(activityText || "").trim();
+  const resolvedProgressItems = Array.isArray(progressItems) ? progressItems.filter(Boolean) : [];
+  const progressProjection = buildRuntimeProgressProjection(resolvedProgressItems, language, 4);
+  const hasProgressLedger = resolvedProgressItems.length > 0 && !!progressProjection.summary;
+  if (!resolvedThoughtSummaryText && !resolvedActivityText && !hasProgressLedger) return null;
   const thoughtTitle = language === "zh"
     ? isThinking ? "正在整理思路" : "思考摘要"
     : isThinking ? "Thinking" : "Thinking summary";
@@ -870,17 +877,57 @@ function TurnActivityNotice({
       data-testid="turn-activity-notice"
       className="ml-9 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]"
     >
-      <div data-testid="turn-activity-thought-summary" className="max-h-[42vh] overflow-y-auto pr-1" style={{ fontSize: `${chatFontSize}px` }}>
-        <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] text-[#93c5fd]">
-          <span className={`h-1.5 w-1.5 rounded-full ${isThinking ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)] animate-pulse" : "bg-[#34d399]"}`} />
-          <span>{thoughtTitle}</span>
+      {resolvedActivityText && (
+        <div data-testid="turn-activity-text" className="mb-2 font-mono text-[11px] text-[#93c5fd]">
+          {resolvedActivityText}
         </div>
-        <MarkdownRenderer
-          content={resolvedThoughtSummaryText}
-          baseFontSize={chatFontSize}
-          sourceId="turn-activity-thought-summary"
-        />
-      </div>
+      )}
+      {hasProgressLedger && (
+        <div
+          data-testid="effective-progress-ledger"
+          className={`${resolvedThoughtSummaryText ? "mb-3 border-b border-[rgba(96,165,250,0.14)] pb-3" : ""}`}
+        >
+          <button
+            type="button"
+            data-testid="effective-progress-ledger-toggle"
+            onClick={() => setIsProgressOpen((value) => !value)}
+            className="flex w-full min-w-0 items-center justify-between gap-3 text-left"
+          >
+            <span className="min-w-0">
+              <span className="block font-mono text-[10.5px] text-[#93c5fd]">
+                {language === "zh" ? "有效进展" : "Effective Progress"}
+              </span>
+              <span className="mt-0.5 block truncate text-[12px] text-[#bfdbfe]">
+                {progressProjection.activityText || progressProjection.summary}
+              </span>
+            </span>
+            <IconChevronRight
+              className={`h-3.5 w-3.5 shrink-0 transition-transform ${isProgressOpen ? "rotate-90" : ""}`}
+            />
+          </button>
+          <div className="mt-1 truncate text-[11px] text-[#93c5fd]">
+            {progressProjection.summary}
+          </div>
+          {isProgressOpen && (
+            <div className="mt-2">
+              <EffectiveProgressLedgerDetails items={resolvedProgressItems} />
+            </div>
+          )}
+        </div>
+      )}
+      {resolvedThoughtSummaryText && (
+        <div data-testid="turn-activity-thought-summary" className="max-h-[42vh] overflow-y-auto pr-1" style={{ fontSize: `${chatFontSize}px` }}>
+          <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] text-[#93c5fd]">
+            <span className={`h-1.5 w-1.5 rounded-full ${isThinking ? "bg-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.75)] animate-pulse" : "bg-[#34d399]"}`} />
+            <span>{thoughtTitle}</span>
+          </div>
+          <MarkdownRenderer
+            content={resolvedThoughtSummaryText}
+            baseFontSize={chatFontSize}
+            sourceId="turn-activity-thought-summary"
+          />
+        </div>
+      )}
     </div>
   );
 }
@@ -3336,7 +3383,9 @@ export default function ChatArea({
       if (block.type === "agent") return block.hiddenProcess === true;
       if (block.type === "progress" || block.type === "jobList") return true;
       if (block.type === "system") {
-        return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
+        return block.variant !== "context_compression" &&
+          block.variant !== "plan_execution_checkpoint" &&
+          block.variant !== "game_studio_local_markdown";
       }
       if (block.type === "tool") {
         const status = String(block.toolStatus || block.status || "").toLowerCase();
@@ -3534,7 +3583,8 @@ export default function ChatArea({
         block.type === "jobList" ||
         (block.type === "system" &&
           block.variant !== "context_compression" &&
-          block.variant !== "plan_execution_checkpoint");
+          block.variant !== "plan_execution_checkpoint" &&
+          block.variant !== "game_studio_local_markdown");
     };
     const phaseLabels = {
       analysis: language === "zh" ? "分析与方案" : "Analysis & Proposal",

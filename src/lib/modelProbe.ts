@@ -1,4 +1,4 @@
-import type { Lang } from "../store/useAppStore";
+import type { Lang } from "./appTypes";
 
 export interface ModelCapabilities {
   instructionLanguage: "en" | "zh";

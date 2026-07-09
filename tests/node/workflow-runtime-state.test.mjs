@@ -169,27 +169,164 @@ test("agent loop blocks execute completion without execution evidence", () => {
 
 test("ordinary composer sends only reuse awaiting-choice turns on exact option match", () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const turnSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/submit/turnSubmission.ts"), "utf8");
+  const submitRuntimeFacadeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitRuntimeFacade.ts"), "utf8");
+  const submitPreflightExecutorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPreflightExecutor.ts"), "utf8");
+  const submitPlanHydrationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanHydration.ts"), "utf8");
+  const submitPlanExecutionResumeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"), "utf8");
+  const submitPendingReviewTransitionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPendingReviewTransition.ts"), "utf8");
+  const submitAttachmentContextSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitAttachmentContext.ts"), "utf8");
+  const submitPromptContextSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPromptContext.ts"), "utf8");
+  const submitApprovedPlanExecutionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitApprovedPlanExecution.ts"), "utf8");
+  const submitSessionBootstrapSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitSessionBootstrap.ts"), "utf8");
+  const submitVisibleTurnSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitVisibleTurn.ts"), "utf8");
+  const submitRunLeaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitRunLease.ts"), "utf8");
+  const submitTitleEffectsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitTitleEffects.ts"), "utf8");
+  const submitWorkflowContextSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitWorkflowContext.ts"), "utf8");
+  const submitStreamingUiSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitStreamingUi.ts"), "utf8");
+  const submitWorkflowEngineRunnerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitWorkflowEngineRunner.ts"), "utf8");
+  const gameStudioLocalSlashBridgeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/gameStudioLocalSlashBridge.ts"), "utf8");
+  const gameStudioTurnPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/gameStudioTurnPreparation.ts"), "utf8");
+  const submitGameStudioPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitGameStudioPreparation.ts"), "utf8");
+  const gameStudioLocalSlashSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/gameStudioLocalSlashSubmission.ts"), "utf8");
 
-  assert.match(storeSource, /function findReplyOptionMatchingSelectedText/);
+  assert.match(turnSubmissionSource, /export function findReplyOptionMatchingSelectedText/);
+  assert.match(turnSubmissionSource, /export function buildSubmitPipelineDecision/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitTurnReuseDecision/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitEffectiveIntentDecision/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitRuntimeDecision/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitSendGateDecision/);
+  assert.match(turnSubmissionSource, /export function buildSubmitSessionBootstrapDecision/);
+  assert.match(turnSubmissionSource, /export function buildSubmitSessionBootstrapPatch/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitTurnTitleDecision/);
+  assert.match(turnSubmissionSource, /export function buildSubmitLocalStudioTurnPatch/);
+  assert.match(turnSubmissionSource, /export function buildSubmitRunStatePatch/);
+  assert.match(turnSubmissionSource, /export function buildSubmitBlockingPreflightEffect/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitPreflightStalenessDecision/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitPreflightEffectAction/);
+  assert.match(turnSubmissionSource, /export function buildSubmitPreflightResumeOptions/);
+  assert.match(turnSubmissionSource, /export function buildSubmitVisibleTurnPatch/);
+  assert.match(turnSubmissionSource, /export function resolveSubmitSemanticMetadataDecision/);
+  assert.match(turnSubmissionSource, /export function buildSubmitHarnessRunMarkerDraft/);
+  assert.match(submitRuntimeFacadeSource, /export function createSubmitSessionRuntimeFacade/);
+  assert.match(submitRuntimeFacadeSource, /export function startSubmitElapsedTimer/);
+  assert.match(submitPreflightExecutorSource, /export async function executeSubmitBlockingPreflight/);
+  assert.match(submitPlanHydrationSource, /export async function runSubmitPlanHydrationEffect/);
+  assert.match(submitPlanHydrationSource, /export function startSubmitPlanHydrationEffect/);
+  assert.match(submitPlanHydrationSource, /shouldPromoteHydratedPlanToExecuting/);
+  assert.match(submitPlanHydrationSource, /send_async_resume_skipped_inactive_session/);
+  assert.match(submitPlanExecutionResumeSource, /export async function runSubmitPlanExecutionResumeEffect/);
+  assert.match(submitPlanExecutionResumeSource, /export function buildTrustedPlanResumePrompt/);
+  assert.match(submitPlanExecutionResumeSource, /existing_plan_hydrated_for_execution/);
+  assert.match(submitPlanExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*true/);
+  assert.match(submitPendingReviewTransitionSource, /export function applySubmitPendingReviewTransition/);
+  assert.match(submitPendingReviewTransitionSource, /resolvePendingReviewSubmissionDecision/);
+  assert.match(submitPendingReviewTransitionSource, /send_pending_review_abort_and_new_turn/);
+  assert.match(submitPendingReviewTransitionSource, /stopped_no_action/);
+  assert.match(submitAttachmentContextSource, /export async function buildSubmitAttachmentContext/);
+  assert.match(submitAttachmentContextSource, /export async function prepareAttachedFileForRead/);
+  assert.match(submitAttachmentContextSource, /\[attached_tabular_file\]/);
+  assert.match(submitAttachmentContextSource, /\[user_mentioned_files\]/);
+  assert.match(submitPromptContextSource, /export function buildSubmitPromptContext/);
+  assert.match(submitPromptContextSource, /export function buildOperationApprovalContinuationPrompt/);
+  assert.match(submitPromptContextSource, /Continue the previous PLAN turn/);
+  assert.match(submitPromptContextSource, /The user approved real operations/);
+  assert.match(submitApprovedPlanExecutionSource, /export function buildApprovedPlanExecutionPrompt/);
+  assert.match(submitApprovedPlanExecutionSource, /export function ensureApprovedPlanRuntimeTasksForState/);
+  assert.match(submitApprovedPlanExecutionSource, /export function normalizeApprovedPlanTaskStatuses/);
+  assert.match(submitApprovedPlanExecutionSource, /The plan is approved/);
+  assert.match(submitSessionBootstrapSource, /export function applySubmitSessionBootstrap/);
+  assert.match(submitSessionBootstrapSource, /buildSubmitSessionBootstrapDecision/);
+  assert.match(submitSessionBootstrapSource, /buildSubmitSessionBootstrapPatch/);
+  assert.match(submitVisibleTurnSource, /export function applySubmitVisibleTurn/);
+  assert.match(submitVisibleTurnSource, /buildSubmitVisibleTurnPatch/);
+  assert.match(submitVisibleTurnSource, /buildSubmitRunStatePatch/);
+  assert.match(submitVisibleTurnSource, /export function markSubmitUserContextItemFailed/);
+  assert.match(submitRunLeaseSource, /export function startSubmitRunLease/);
+  assert.match(submitRunLeaseSource, /buildSubmitHarnessRunMarkerDraft/);
+  assert.match(submitTitleEffectsSource, /export function applySubmitSeedSessionTitle/);
+  assert.match(submitTitleEffectsSource, /export function startSubmitSemanticMetadataEffect/);
+  assert.match(submitWorkflowContextSource, /export function createSubmitWorkflowContext/);
+  assert.match(submitWorkflowContextSource, /agentBlockIdsCreatedThisRun: new Set<number>/);
+  assert.match(submitStreamingUiSource, /export function startSubmitStreamingUi/);
+  assert.match(submitStreamingUiSource, /new StreamingCadenceBuffer/);
+  assert.match(submitStreamingUiSource, /resolveStreamingAssistantDisplay/);
+  assert.match(submitWorkflowEngineRunnerSource, /export function createSubmitWorkflowEngineHelpers/);
+  assert.match(submitWorkflowEngineRunnerSource, /export function runSubmitWorkflowEngine/);
+  assert.match(submitWorkflowEngineRunnerSource, /new WorkflowEngine/);
+  assert.match(gameStudioLocalSlashBridgeSource, /export function createGameStudioLocalSlashBridge/);
+  assert.match(gameStudioLocalSlashBridgeSource, /buildSubmitLocalStudioTurnPatch/);
+  assert.match(gameStudioLocalSlashBridgeSource, /buildLocalSlashRuntimeSnapshot/);
+  assert.match(gameStudioTurnPreparationSource, /export async function prepareGameStudioTurn/);
+  assert.match(submitGameStudioPreparationSource, /export async function runSubmitGameStudioPreparation/);
+  assert.match(submitGameStudioPreparationSource, /export function applySubmitGameStudioPreparationResult/);
+  assert.match(submitGameStudioPreparationSource, /pendingSlashCommand: null/);
+  assert.match(submitGameStudioPreparationSource, /shouldInvalidateWorkspaceTree/);
+  assert.match(gameStudioLocalSlashSubmissionSource, /export function startGameStudioLocalSlashSubmission/);
   assert.match(
-    storeSource,
-    /const selectedAwaitingReplyOption = selectedAwaitingChoice[\s\S]*?findReplyOptionMatchingSelectedText/,
+    turnSubmissionSource,
+    /const selectedAwaitingReplyOption = findReplyOptionMatchingSelectedText/,
   );
   assert.match(
-    storeSource,
+    turnSubmissionSource,
     /const shouldAutoResumeChoiceTurn =[\s\S]*?currentTurnHasReplyOptions &&[\s\S]*?!!selectedAwaitingReplyOption;/,
   );
   assert.doesNotMatch(
-    storeSource,
+    turnSubmissionSource,
     /const shouldAutoResumeChoiceTurn =[\s\S]{0,260}\(currentTurn\.status === "awaiting_input" \|\| currentTurnHasReplyOptions\)/,
   );
+  assert.match(storeSource, /const submitPipelineDecision = buildSubmitPipelineDecision/);
+  assert.match(storeSource, /const pendingReviewTransition = applySubmitPendingReviewTransition/);
+  assert.doesNotMatch(storeSource, /send_pending_review_abort_and_new_turn/);
+  assert.match(storeSource, /startSubmitPlanHydrationEffect\(\{/);
+  assert.match(storeSource, /runSubmitPlanExecutionResumeEffect\(\{/);
+  assert.doesNotMatch(storeSource, /const shouldPromoteToExecuting = shouldPromoteHydratedPlanToExecuting/);
+  assert.doesNotMatch(storeSource, /function buildTrustedPlanResumePrompt/);
+  assert.doesNotMatch(storeSource, /existing_plan_hydrated_for_execution/);
+  assert.match(storeSource, /const attachmentContext = await buildSubmitAttachmentContext/);
+  assert.doesNotMatch(storeSource, /\[attached_tabular_file\]/);
+  assert.doesNotMatch(storeSource, /prepareAttachedFileForRead/);
+  assert.match(storeSource, /userContent = buildSubmitPromptContext\(\{/);
+  assert.doesNotMatch(storeSource, /Continue the previous PLAN turn/);
+  assert.doesNotMatch(storeSource, /The user approved real operations/);
+  assert.match(storeSource, /buildApprovedPlanExecutionPrompt\(\{/);
+  assert.match(storeSource, /ensureApprovedPlanRuntimeTasksForState\(state, language\)/);
+  assert.doesNotMatch(storeSource, /The plan is approved\. Continue directly/);
+  assert.doesNotMatch(storeSource, /function buildPlanCommandExecutionHint/);
+  assert.match(storeSource, /const initialIntentDecision = resolveSubmitEffectiveIntentDecision/);
+  assert.match(storeSource, /const runtimeDecision = resolveSubmitRuntimeDecision/);
+  assert.match(storeSource, /const sendGateDecision = resolveSubmitSendGateDecision/);
+  assert.match(storeSource, /const sessionBootstrapDecision = applySubmitSessionBootstrap/);
+  assert.match(storeSource, /const titleDecision = resolveSubmitTurnTitleDecision/);
+  assert.match(storeSource, /const localSlashBridge = createGameStudioLocalSlashBridge/);
+  assert.doesNotMatch(storeSource, /buildSubmitLocalStudioTurnPatch/);
+  assert.match(storeSource, /const visibleTurnSubmission = applySubmitVisibleTurn/);
+  assert.doesNotMatch(storeSource, /buildSubmitRunStatePatch/);
+  assert.doesNotMatch(storeSource, /buildSubmitVisibleTurnPatch/);
+  assert.match(storeSource, /const blockingPreflightEffect = buildSubmitBlockingPreflightEffect/);
+  assert.match(storeSource, /await executeSubmitBlockingPreflight/);
+  assert.match(storeSource, /const semanticMetadataDecision = resolveSubmitSemanticMetadataDecision/);
+  assert.match(storeSource, /startSubmitSemanticMetadataEffect/);
+  assert.match(storeSource, /const runLease = startSubmitRunLease/);
+  assert.match(storeSource, /const context = createSubmitWorkflowContext/);
+  assert.match(storeSource, /startSubmitStreamingUi\(\{/);
+  assert.match(storeSource, /void runSubmitWorkflowEngine\(\{/);
+  assert.doesNotMatch(storeSource, /new WorkflowEngine/);
+  assert.match(storeSource, /createSubmitSessionRuntimeFacade<AppState, SessionRuntimeState>/);
+  assert.match(storeSource, /const elapsedTimer = startSubmitElapsedTimer/);
+  assert.match(storeSource, /const gameStudioPreparation = await runSubmitGameStudioPreparation/);
+  assert.doesNotMatch(storeSource, /content: gameStudioPreparation\.errorMessage/);
+  assert.doesNotMatch(storeSource, /gameStudioPreparation\.shouldInvalidateWorkspaceTree/);
+  assert.match(storeSource, /const localSlashSubmission = startGameStudioLocalSlashSubmission/);
+  assert.match(turnSubmissionSource, /params\.shouldExplicitlyReuseCurrentTurn \|\| params\.shouldAutoResumeChoiceTurn/);
+  assert.match(turnSubmissionSource, /params\.currentTurnHasReplyOptions/);
   assert.match(
-    storeSource,
-    /\(shouldExplicitlyReuseCurrentTurn \|\| shouldAutoResumeChoiceTurn\) && currentTurnHasReplyOptions \? turnId : undefined/,
+    turnSubmissionSource,
+    /shouldReuseExistingTurnIntent \? currentTurnIntent : fallbackRunIntent/,
   );
   assert.match(
     storeSource,
-    /\(shouldReuseExistingTurnIntent\s*\? currentTurnIntent\s*:\s*resolveRunIntentFromLegacyWorkflowMode/,
+    /fallbackRunIntent: resolveRunIntentFromLegacyWorkflowMode\(state\.config\.workflowMode\)/,
   );
   assert.doesNotMatch(
     storeSource,
@@ -239,9 +376,11 @@ test("global plan toolbar button is driven by live plan workspace, not historica
 
 test("approved plan execution handoff has one runtime owner and dedupe guard", () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const sessionTypesSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/sessionTypes.ts"), "utf8");
   const workflowEngineSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
-  assert.match(storeSource, /export interface PlanApprovalHandoff/);
+  assert.match(sessionTypesSource, /export interface PlanApprovalHandoff/);
+  assert.match(storeSource, /PlanApprovalHandoff/);
   assert.match(storeSource, /planApprovalExecutionStartedForTurnId/);
   assert.match(storeSource, /startApprovedPlanExecutionTurnFromHandoff/);
   assert.match(storeSource, /plan_approval_direct_execution_suppressed/);

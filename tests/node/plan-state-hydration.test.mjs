@@ -149,13 +149,16 @@ test("plan panel keeps resume action available for paused approved execution", (
 
 test("new empty workspace sessions hydrate persisted plan tasks into resumable execution state", () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const planExecutionResumeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"), "utf8");
   const appSource = fsSync.readFileSync(path.join(workspaceRoot, "src/App.tsx"), "utf8");
 
   assert.match(storeSource, /promoteTasksToExecuting\?:\s*boolean/);
   assert.match(storeSource, /options\.promoteTasksToExecuting === true[\s\S]*?hydratedPlan\.hasTasksArtifact[\s\S]*?hydratedPlan\.tasks\.length > 0/);
   assert.match(storeSource, /isPlanApproved:\s*shouldPromoteHydratedTasksToExecuting \|\| s\.isPlanApproved/);
   assert.match(storeSource, /planStage:\s*shouldPromoteHydratedTasksToExecuting \? "executing" : nextStage/);
-  assert.match(storeSource, /controlAction === "resume_plan_execution"[\s\S]*?createVisibleTurnForHiddenMessage:\s*true/);
+  assert.match(storeSource, /controlAction === "resume_plan_execution"[\s\S]*?runSubmitPlanExecutionResumeEffect\(\{/);
+  assert.match(planExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*true/);
+  assert.match(planExecutionResumeSource, /existing_plan_hydrated_for_execution/);
 
   assert.match(appSource, /hydrateWorkspacePlanForEmptySession\("new_session"\)/);
   assert.match(appSource, /promoteTasksToExecuting:\s*true/);

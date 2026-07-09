@@ -1,0 +1,241 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fsSync from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+import ts from "typescript";
+
+const workspaceRoot = process.cwd();
+const moduleCache = new Map();
+
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (moduleCache.has(normalizedPath)) return moduleCache.get(normalizedPath);
+
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
+  const localRequire = createRequire(normalizedPath);
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: normalizedPath,
+  }).outputText;
+
+  const module = { exports: {} };
+  moduleCache.set(normalizedPath, module.exports);
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ];
+      for (const candidate of candidates) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+    return localRequire(specifier);
+  };
+  const factory = new Function("exports", "module", "require", transpiled);
+  factory(module.exports, module, runtimeRequire);
+  moduleCache.set(normalizedPath, module.exports);
+  return module.exports;
+}
+
+const {
+  buildTrustedPlanResumePrompt,
+  runSubmitPlanExecutionResumeEffect,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"),
+);
+
+function planArtifact(overrides = {}) {
+  return {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: "# Plan\n\nDo the work.",
+    updatedAt: 1,
+    ...overrides,
+  };
+}
+
+function planTask(overrides = {}) {
+  return {
+    id: "task-1",
+    text: "Modify src/App.tsx",
+    completed: false,
+    source: "runtime",
+    evidence: [{ kind: "file", value: "src/App.tsx" }],
+    ...overrides,
+  };
+}
+
+function createState(overrides = {}) {
+  return {
+    currentWorkspace: "/repo",
+    currentTurnId: "turn-plan",
+    planArtifacts: [],
+    planTasks: [],
+    planStage: "idle",
+    planExecutionEvidenceLedger: [],
+    ...overrides,
+  };
+}
+
+function createHarness(state) {
+  return {
+    preRunPatches: [],
+    logs: [],
+    resumes: [],
+    setState(patch) {
+      const next = typeof patch === "function" ? patch(state) : patch;
+      if (next && typeof next === "object") Object.assign(state, next);
+    },
+    applyPreRunSessionPatch(patch) {
+      this.preRunPatches.push(patch);
+      Object.assign(state, patch);
+    },
+    logStoreEvent(event, data) {
+      this.logs.push({ event, data });
+    },
+    resumeSubmission(text, images, options) {
+      this.resumes.push({ text, images, options });
+    },
+  };
+}
+
+test("plan execution resume hydrates plan state and dispatches hidden execution turn", async () => {
+  const state = createState();
+  const harness = createHarness(state);
+  const hydratedTask = planTask();
+
+  await runSubmitPlanExecutionResumeEffect({
+    text: "继续执行计划",
+    images: ["ignored-image"],
+    preferredLanguage: "zh",
+    shouldRouteContinuationToPlanResume: true,
+    uiParentTurnId: "turn-parent",
+    commandDirective: { kind: "control", action: "resume_plan_execution" },
+    getState: () => state,
+    setState: harness.setState.bind(harness),
+    applyPreRunSessionPatch: harness.applyPreRunSessionPatch.bind(harness),
+    hydrateExistingPlanArtifactsForWorkspace: async () => ({
+      artifacts: [planArtifact()],
+      tasks: [hydratedTask],
+      hasTasksArtifact: true,
+    }),
+    ensureApprovedPlanRuntimeTasksForState: () => [hydratedTask],
+    resumeSubmission: harness.resumeSubmission.bind(harness),
+    logStoreEvent: harness.logStoreEvent.bind(harness),
+  });
+
+  assert.deepEqual(harness.preRunPatches, [
+    {
+      input: "",
+      contextMentions: [],
+      attachedFiles: [],
+      lockedComposerIntent: null,
+      pendingRunDecision: null,
+    },
+  ]);
+  assert.equal(state.isPlanApproved, true);
+  assert.equal(state.planApprovalChoice, "继续执行计划");
+  assert.equal(state.planStage, "executing");
+  assert.equal(state.showPlanPanel, true);
+  assert.equal(state.rightPanelTab, "plan");
+  assert.equal(state.showDiff, false);
+  assert.deepEqual(harness.logs, [
+    {
+      event: "existing_plan_hydrated_for_execution",
+      data: {
+        workspace: "/repo",
+        reusedExistingState: false,
+        artifacts: [".MAIN/plans/plan.md"],
+        taskCount: 1,
+      },
+    },
+  ]);
+  assert.equal(harness.resumes.length, 1);
+  assert.match(harness.resumes[0].text, /请在新的恢复上下文中继续执行计划/);
+  assert.match(harness.resumes[0].text, /Modify src\/App\.tsx/);
+  assert.equal(harness.resumes[0].images, undefined);
+  assert.deepEqual(harness.resumes[0].options, {
+    hidden: true,
+    createVisibleTurnForHiddenMessage: true,
+    reuseCurrentTurn: false,
+    uiParentTurnId: "turn-parent",
+    preservePlanState: true,
+    resolvedIntent: "plan",
+    runtimeIntentOverride: "execute",
+    commandDirective: { kind: "control", action: "resume_plan_execution" },
+    executionConsentGranted: true,
+    skipIntentResolution: true,
+    turnTitle: "计划执行恢复",
+    intentSummary: "从已批准计划的剩余任务继续执行。",
+  });
+});
+
+test("plan execution resume reuses existing plan state without rehydrating", async () => {
+  const state = createState({
+    planArtifacts: [planArtifact({ path: ".MAIN/plans/tasks.md", kind: "tasks" })],
+    planTasks: [planTask({ id: "existing-task" })],
+    planStage: "ready_to_execute",
+  });
+  const harness = createHarness(state);
+  let hydrateCalls = 0;
+
+  await runSubmitPlanExecutionResumeEffect({
+    text: "continue plan",
+    preferredLanguage: "en",
+    shouldRouteContinuationToPlanResume: true,
+    commandDirective: null,
+    getState: () => state,
+    setState: harness.setState.bind(harness),
+    applyPreRunSessionPatch: harness.applyPreRunSessionPatch.bind(harness),
+    hydrateExistingPlanArtifactsForWorkspace: async () => {
+      hydrateCalls += 1;
+      return { artifacts: [], tasks: [], hasTasksArtifact: false };
+    },
+    ensureApprovedPlanRuntimeTasksForState: () => [],
+    resumeSubmission: harness.resumeSubmission.bind(harness),
+    logStoreEvent: harness.logStoreEvent.bind(harness),
+  });
+
+  assert.equal(hydrateCalls, 0);
+  assert.equal(state.planStage, "executing");
+  assert.equal(harness.logs[0].data.reusedExistingState, true);
+  assert.equal(harness.logs[0].data.taskCount, 1);
+  assert.equal(harness.resumes.length, 1);
+  assert.match(harness.resumes[0].text, /Continue plan execution in a fresh recovery context/);
+  assert.equal(harness.resumes[0].options.turnTitle, "Plan Execution Resume");
+});
+
+test("trusted plan resume prompt summarizes evidence and remaining tasks", () => {
+  const prompt = buildTrustedPlanResumePrompt({
+    language: "en",
+    hasTasksArtifact: false,
+    tasks: [planTask()],
+    artifacts: [planArtifact()],
+    evidenceLedger: [
+      {
+        kind: "cmd",
+        value: "npm test",
+        target: "npm test",
+        sourceTool: "run_command",
+      },
+    ],
+  });
+
+  assert.match(prompt, /Plan artifact summary:/);
+  assert.match(prompt, /Recent trusted execution evidence:/);
+  assert.match(prompt, /cmd:npm test \(run_command\)/);
+  assert.match(prompt, /Priority recovery tasks:/);
+});

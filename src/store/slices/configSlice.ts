@@ -1,7 +1,5 @@
-import {
-  LocalConfig,
-  AppConfig,
-} from "../useAppStore";
+import type { AppConfig, LocalConfig } from "../../lib/appTypes";
+import { createDefaultAppConfig } from "../../lib/appConfig";
 import {
   normalizeEventStreamMode,
   normalizeToolFeedbackFormat,
@@ -11,22 +9,12 @@ import {
   normalizeCloudToolProtocol,
   resolveEffectiveCloudApiFormat,
   normalizeCloudProtocol,
-  ReasoningDisplayMode,
+  type ReasoningDisplayMode,
 } from "../../lib/cloudProtocol";
 import {
-  createDefaultCloudConfig,
-} from "../../lib/cloudServers";
-import {
-  createDefaultMcpRoutingConfig,
-  createDefaultToolPermissionPolicy,
-} from "../../lib/toolCapabilities";
-import {
   normalizeContextMemoryState,
-  ContextMemoryState,
+  type ContextMemoryState,
 } from "../../lib/contextMemory";
-import {
-  createDefaultImAdaptersConfig,
-} from "../../lib/imAdapters";
 
 export interface ConfigSlice {
   config: AppConfig;
@@ -36,33 +24,7 @@ export interface ConfigSlice {
 export const PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS = 12 * 60 * 1000;
 export const PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK = 2;
 
-export const defaultConfig: AppConfig = {
-  language: "zh",
-  responseLanguagePolicy: "follow_input_language",
-  theme: "purple",
-  themeMode: "dark",
-  appIconVariant: "dark",
-  workflowMode: "chat",
-  promptLanguageStrategy: "model_aware",
-  toolPermissionPolicy: createDefaultToolPermissionPolicy(),
-  mcpRouting: createDefaultMcpRoutingConfig(),
-  instructionsEnabled: true,
-  hooksEnabled: true,
-  activeProfile: "local",
-  chatFontSize: 13,
-  sessionRecordingEnabled: true,
-  debugRecordFullTurnProcess: false,
-  reasoningDisplay: "hidden",
-  eventStreamMode: "dual",
-  toolFeedbackFormat: "envelope_v1",
-  local: { provider: "OMLX", endpoint: "http://127.0.0.1:8080/v1", model: "", contextLimit: 16384, apiKey: "", toolProtocol: "auto" },
-  cloud: createDefaultCloudConfig(),
-  cloudServers: [],
-  activeCloudServerId: "",
-  cloudExperimentalLoginEnabled: false,
-  imAdapters: createDefaultImAdaptersConfig(),
-  workspace: "",
-};
+export const defaultConfig: AppConfig = createDefaultAppConfig();
 
 export function normalizeAppIconVariant(value: unknown): AppConfig["appIconVariant"] {
   return value === "light" ? "light" : "dark";

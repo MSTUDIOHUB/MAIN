@@ -3,8 +3,7 @@
 // Inspired by claude-code-haha QueryEngine system prompt construction.
 // ────────────────────────────────────────────────────────────────────
 
-import type { Skill } from "../store/useAppStore";
-import type { Lang } from "../store/useAppStore";
+import type { Lang, Skill } from "./appTypes";
 import type { ResolvedInstructionSet } from "./instructions";
 import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudioCatalog";
 import {
