@@ -231,6 +231,8 @@ export interface OrchestratorCallbacks {
 export interface FetchLLMStreamOptions {
   noVisibleTokenTimeoutMs?: number;
   noVisibleTokenTimeoutLabel?: string;
+  maxStreamElapsedMs?: number;
+  maxStreamElapsedLabel?: string;
   toolChoice?: OpenAiToolChoice;
   workflowMode?: string;
   runtimeIntent?: string;

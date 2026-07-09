@@ -336,11 +336,11 @@ test("post-write verification read is allowed once after repeated same-file acti
   assert.equal(result, null);
 });
 
-test("buildReadBeforeModifyValidationError blocks write_file when file exists and is >8KB", async () => {
+test("buildReadBeforeModifyValidationError blocks write_file when file exists and is large", async () => {
   globalThis.mockIpcInvoke = async (cmd, args) => {
     if (cmd === "get_file_metadata") {
       if (args.path === "src/App.tsx") {
-        return { path: "src/App.tsx", sizeBytes: 12000, modifiedMs: 123456 };
+        return { path: "src/App.tsx", sizeBytes: 60 * 1024 * 1024, modifiedMs: 123456 };
       }
       if (args.path === "src/Chart.tsx") {
         return { path: "src/Chart.tsx", sizeBytes: 1000, modifiedMs: 123456 };
@@ -417,4 +417,3 @@ test("buildReadBeforeModifyValidationError recovers read evidence from message h
   assert.ok(resultFailed);
   assert.match(resultFailed.content, /READ_BEFORE_MODIFY_BLOCKED/);
 });
-

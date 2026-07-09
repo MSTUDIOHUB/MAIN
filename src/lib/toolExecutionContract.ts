@@ -31,6 +31,10 @@ export function validateShellToolCwd(cwd: string | null): string | null {
 export function validateShellToolContract(name: string, args: Record<string, unknown>): string | null {
   if (!SHELL_EXECUTION_TOOLS.has(name)) return null;
 
+  if (!asNonEmptyString(args.description)) {
+    return `Tool '${name}' is missing required execution metadata: description. Add a short purpose summary for approval, logs, and recovery diagnostics.`;
+  }
+
   const cwdError = validateShellToolCwd(getShellToolCwd(args));
   if (cwdError) {
     const toolSpecificHint = name === "execute_command"

@@ -33,18 +33,18 @@ const {
   validateShellToolContract,
 } = await loadToolExecutionContractModule();
 
-test("shell contract rejects missing description and cwd metadata", () => {
+test("shell contract rejects missing description and validates cwd metadata", () => {
   assert.match(
     validateShellToolContract("run_command", { command: "npm test", cwd: "." }),
     /description/,
   );
-  assert.match(
+  assert.equal(
     validateShellToolContract("run_command", { command: "npm test", description: "Run tests" }),
-    /cwd/,
+    null,
   );
-  assert.match(
+  assert.equal(
     validateShellToolContract("execute_command", { command: "npm test", description: "Run tests" }),
-    /prefer `run_command`/,
+    null,
   );
   assert.equal(
     validateShellToolContract("run_command", { command: "npm test", description: "Run tests", cwd: "." }),

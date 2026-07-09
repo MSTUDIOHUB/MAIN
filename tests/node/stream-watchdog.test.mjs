@@ -57,6 +57,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  createStreamMaxElapsedTimeoutError,
   createStreamNoVisibleTokenTimeoutError,
   buildPlanExplorationBudget,
   isReasoningDominatedLengthResult,
@@ -90,6 +91,14 @@ test("classifies chunk trickle without visible progress as a plan watchdog timeo
     isStreamWatchdogTimeoutMessage("STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for 180000ms without visible output or tool calls."),
     true,
   );
+});
+
+test("classifies recovery stream max elapsed timeout as watchdog pause", () => {
+  const error = createStreamMaxElapsedTimeoutError(90_000, "approved_plan_recovery");
+
+  assert.equal(error.code, "STREAM_MAX_ELAPSED_TIMEOUT");
+  assert.match(error.message, /maximum stream duration 90000ms exceeded/);
+  assert.equal(isStreamWatchdogTimeoutMessage(error.message), true);
 });
 
 test("detects reasoning-dominated length results before max output escalation", () => {

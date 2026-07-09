@@ -48,12 +48,12 @@ test("repeat guard uses a higher threshold for read-only tools", () => {
   const history = [];
   let result = null;
 
-  for (let i = 0; i < 6; i += 1) {
+  for (let i = 0; i < 4; i += 1) {
     result = registerToolCallForRepeatGuard(history, "list_directory", { path: "src-tauri" }, true);
   }
 
   assert.equal(result.repeated, true);
-  assert.equal(result.threshold, 6);
+  assert.equal(result.threshold, 4);
 });
 
 test("repeat guard keeps write tools on the stricter threshold", () => {
@@ -76,7 +76,7 @@ test("repeat guard treats read-only shell inspection commands as recoverable rea
   let result = null;
 
   assert.equal(isReadOnlyShellInspectionToolCall("run_command", args), true);
-  for (let i = 0; i < 6; i += 1) {
+  for (let i = 0; i < 3; i += 1) {
     result = registerToolCallForRepeatGuard(
       history,
       "run_command",
@@ -86,7 +86,7 @@ test("repeat guard treats read-only shell inspection commands as recoverable rea
   }
 
   assert.equal(result.repeated, true);
-  assert.equal(result.threshold, 6);
+  assert.equal(result.threshold, 3);
 });
 
 test("read-only shell inspection includes safe find commands", () => {
@@ -116,10 +116,10 @@ test("repeat guard keeps non-inspection shell commands on the strict threshold",
 });
 
 test("repeat guard messages include the actual threshold and target", () => {
-  const recovery = formatRepeatLoopRecoveryMessage("list_directory", "src-tauri", 6);
+  const recovery = formatRepeatLoopRecoveryMessage("list_directory", "src-tauri", 4);
   const fatal = formatRepeatLoopFatalMessage("write_file", "notes.md", 3);
 
-  assert.match(recovery, /6\+ times/);
+  assert.match(recovery, /4\+ times/);
   assert.match(recovery, /src-tauri/);
   assert.match(fatal, /3\+ times/);
   assert.match(fatal, /notes\.md/);

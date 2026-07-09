@@ -273,10 +273,10 @@ export class WorkflowEngine {
       }
     };
 
-    const closeCurrentHarnessRunMarker = (status: "completed" | "paused" | "error", reason: string) => {
-      const marker = sessionGet().harnessRunMarker;
-      if (marker && marker.status === "running") {
-        const closedAt = Date.now();
+	    const closeCurrentHarnessRunMarker = (status: "completed" | "paused" | "error", reason: string) => {
+	      const marker = sessionGet().harnessRunMarker;
+	      if (marker && marker.status === "running") {
+	        const closedAt = Date.now();
         const nextMarker: HarnessRunMarker = {
           ...marker,
           status,
@@ -284,10 +284,30 @@ export class WorkflowEngine {
           closedAt,
           closeReason: reason,
         };
-        sessionSet({ harnessRunMarker: nextMarker });
-        closeHarnessRunMarker({ status, closeReason: reason });
-      }
-    };
+	        sessionSet({ harnessRunMarker: nextMarker });
+	        closeHarnessRunMarker({ status, closeReason: reason });
+	        logStoreEvent("agent_loop_stop_summary", {
+	          turnId,
+	          sessionKey: runSessionKey,
+	          workspace: runWorkspace || null,
+	          status,
+	          reason,
+	          workflowMode: marker.workflowMode,
+	          runtimeIntent: marker.runtimeIntent,
+	          planStage: marker.planStage,
+	          isPlanApproved: marker.isPlanApproved,
+	          iteration: marker.iteration,
+	          maxIterations: marker.maxIterations,
+	          latestTool: marker.latestTool || null,
+	          latestToolTarget: marker.latestToolTarget || null,
+	          activeStreamId: marker.activeStreamId || null,
+	          streamStatus: marker.streamStatus || null,
+	          streamElapsedMs: marker.streamElapsedMs || 0,
+	          streamLifecycleStatus: marker.streamLifecycleStatus || null,
+	          lastStreamError: marker.lastStreamError || null,
+	        });
+	      }
+	    };
 
     const emitProgressRuntimeEvent = (progress: any, meta: { dedupeKey?: string } = {}) => {
       const eventId = `event-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;

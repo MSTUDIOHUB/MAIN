@@ -53,6 +53,8 @@ import { buildRequiredWebResearchQuery, formatWebResearchLocalDate, shouldRequir
 import { deriveStreamSettings, resolveEffectiveToolProtocol, shouldUseXmlToolProtocol, resolveModelProtocolProfile, compactDiagnosticText, getOriginalUserPromptForPlanFallback, logAgentEvent, looksLikeRepairExecutionRequest, WEB_RESEARCH_TOOL_NAMES, KNOWLEDGE_TOOL_NAMES, filterGlobalChatToolDefinitions, getSessionTaskTargetingEvidence, runLifecycleHooks, createHookContextMessages, shouldUsePlanNoVisibleTokenWatchdog, PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS, truncateForLog, MAX_RECENT_PLAN_TOOL_ACTIVITY, EDIT_PROGRESS_TOOL_NAMES, EXECUTION_VERIFICATION_TOOL_NAMES, isReviewablePlanStage, buildPlanReviewReadyMessage, buildApprovedPlanContinuationPrompt, collectPlanClosureMaterializationInput, shouldAttemptPlanClosureGuard, isStreamWatchdogTimeoutMessage, buildApprovedPlanNoProgressStrategySwitchPrompt, PLAN_EXPLORATION_READ_ONLY_TOOLS, approvedPlanNeedsSourceEditBeforeValidation, isApprovedPlanSourceEditFirstTool, isApprovedPlanRecoveryTool, filterPlanRuntimeToolDefinitionsForPhase, hasPlanUserContextObservation, computeManagedContextLimit, computeContextForceReason, prepareMessagesForToolProtocol, summarizeMessagesForDiagnostics, summarizeToolsForDiagnostics, fetchLLMStream, shouldTreatCloudGatewayErrorAsCompatibility, buildNonActionableStopMessage, normalizeToolCallToExecute, buildAssistantHistoryMessage, shouldCompactProseCodeDump, buildProseCodeDumpNotice, summarizeReplyOptionsForLog, looksLikePlanCompletionClaim, isPreApprovalPlanDraftWrite, parseToolCallArguments, buildToolActionNarration, getToolTarget, MAX_NO_ACTION_RETRIES, buildReadOnlyPermissionHardRecoveryPrompt, formatPlanAuditRemainingTasks, resolveApprovedPlanValidationBoundary, buildApprovedPlanValidationPendingMessage, MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS, buildApprovedPlanNoToolPauseMessage, buildBrowserValidationContinuationPrompt, buildPlanCommandExecutionHint, looksLikeOperationCompletionClaim, buildExecuteCompletionEvidencePrompt, looksLikeExecutionReplanningText, buildExecuteReplanningEvidencePrompt, autoMaterializePlanArtifactFromVisibleText, buildPlanRecoveryPrompt, CONCISE_PLAN_ARTIFACT_HINT_ZH, CONCISE_PLAN_ARTIFACT_HINT_EN, isPlanArtifactPath, buildHiddenThoughtOnlyContinuationPrompt, emitToolPreflightBlocked, planUnsupportedToolFeedbackMessage, buildReadOnlyCacheSignature, readFileMetadataIfAvailable, buildPlanExplorationBudget, PLAN_REPEAT_READ_LIMIT, MAX_CONSECUTIVE_READ_ONLY_ITERATIONS, isReadFileOnlyPattern, isContentInActiveMessages, buildPlanClosurePromptFromEvidence, appendPlanRepeatReadLimitGuidance, formatCachedReadOnlyToolResult, buildGenericObservationContinuationPrompt, buildPlanGateBlockedResult, truncateToolContent, executeReadOnlyToolsConcurrently, isReadFileRepeatLimitResult, executeLocalFileReadToolWithReview, executeWriteToolWithReview, isProjectSourceWriteResult, inferLifecycleStateFromToolResult, targetProgressReasonForToolResult, isSuccessfulPlanArtifactWriteResult, shouldDeferNoProgressStopToPlanReadOnlyConvergence, buildNoProgressBatchSignature, MAX_NO_PROGRESS_LOOP_REPEATS, buildToolResultHistoryContentByFormat, summarizeReadFileRepeatLimitBatch, buildReadFileRepeatLimitBatchPauseNotice, targetProgressOutcomeForToolResult, PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO, EXECUTE_CONVERGENCE_PROMPT_RATIO, buildExecuteConvergencePrompt, isExecutionPlanArtifactWrite, isTasksPlanWrite } from "../../orchestrator";
 import { AgentMessage, ToolExecutionResult, FetchLLMStreamOptions, CachedReadOnlyToolResult, ToolCallToExecute, ToolCallInMessage, OrchestratorCallbacks, type AgentLoopOutcome } from "../types";
 
+const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
+
 export class AgentOrchestrator {
     private sawExecutionEvidence = false;
     private latestTurnContract: EffectiveTurnContract | null = null;
@@ -872,10 +874,11 @@ export class AgentOrchestrator {
         let lastNoProgressBatchSignature = "";
         let noProgressBatchRepeatCount = 0;
         let consecutiveReadFileOnlyCacheHits = 0;
-        let approvedPlanNoProgressRecoveryAttempts = 0;
-        let approvedPlanActionOnlyRecoveryActive = false;
-        let approvedPlanNoToolRecoveryFileReadActive = false;
-        let repeatedEditValidationRecoveryAttempts = 0;
+	        let approvedPlanNoProgressRecoveryAttempts = 0;
+	        let approvedPlanActionOnlyRecoveryActive = false;
+	        let approvedPlanNoToolRecoveryFileReadActive = false;
+	        let approvedPlanLongReasoningNoActionCount = 0;
+	        let repeatedEditValidationRecoveryAttempts = 0;
         let executeRecoveryMode: ExecuteRecoveryMode = workflowMode === "edit"
                   ? normalizeExecuteRecoveryMode(callbacks.getForcedExecuteRecoveryMode?.())
                   : "normal";
@@ -1059,10 +1062,11 @@ export class AgentOrchestrator {
               return "stopped";
             }
 
-            callbacks.onPlanStageChanged("executing");
-            approvedPlanActionOnlyRecoveryActive = false;
-            approvedPlanNoProgressRecoveryAttempts = 0;
-            const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
+	            callbacks.onPlanStageChanged("executing");
+	            approvedPlanActionOnlyRecoveryActive = false;
+	            approvedPlanNoProgressRecoveryAttempts = 0;
+	            approvedPlanLongReasoningNoActionCount = 0;
+	            const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
             if (callbacks.onApprovedPlanHandoff) {
               callbacks.onApprovedPlanHandoff(continuationPrompt);
               callbacks.onStatusChange("idle");
@@ -1272,24 +1276,32 @@ export class AgentOrchestrator {
                   return false;
                 }
 
-                const language = callbacks.getPreferredLanguage();
-                const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
-                const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
-                const nextStep = language === "zh"
-                  ? "恢复后直接调用真实工具执行下一项计划任务，或说明具体阻塞"
-                  : "resume by calling real tools for the next plan task, or state the concrete blocker";
-                const pauseNotice = language === "zh"
-                  ? [
-                      "执行已暂停：模型持续返回流式内容，但没有产生可见说明或工具调用。",
-                      "MAIN 已保留当前 workspace 状态，没有把这次不可见输出当作执行失败。",
-                      `最近工具目标：${repeatedTargets.length > 0 ? repeatedTargets.join("、") : "未定位到单一目标"}`,
-                      `建议恢复动作：${nextStep}。`,
-                    ].join("\n")
-                  : [
-                      "Execution paused: the model kept streaming content but produced no visible explanation or tool call.",
-                      "MAIN kept the current workspace state and did not treat this invisible-output stall as an execution failure.",
-                      `Recent targets: ${repeatedTargets.length > 0 ? repeatedTargets.join(", ") : "no single target identified"}`,
-                      `Suggested recovery: ${nextStep}.`,
+	                const language = callbacks.getPreferredLanguage();
+	                const normalizedMessage = String(message || "").toLowerCase();
+	                const recoveryReason = normalizedMessage.includes("stream_max_elapsed_timeout")
+	                  ? "stream_max_elapsed_timeout"
+	                  : "stream_no_visible_progress_timeout";
+	                const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
+	                const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
+	                const nextStep = language === "zh"
+	                  ? "恢复后直接调用真实工具执行下一项计划任务，或说明具体阻塞"
+	                  : "resume by calling real tools for the next plan task, or state the concrete blocker";
+	                const pauseNotice = language === "zh"
+	                  ? [
+	                      recoveryReason === "stream_max_elapsed_timeout"
+	                        ? "执行已暂停：恢复期流式输出超过时间边界，但没有产生可执行工具结果。"
+	                        : "执行已暂停：模型持续返回流式内容，但没有产生可见说明或工具调用。",
+	                      "MAIN 已保留当前 workspace 状态，没有把这次不可见输出当作执行失败。",
+	                      `最近工具目标：${repeatedTargets.length > 0 ? repeatedTargets.join("、") : "未定位到单一目标"}`,
+	                      `建议恢复动作：${nextStep}。`,
+	                    ].join("\n")
+	                  : [
+	                      recoveryReason === "stream_max_elapsed_timeout"
+	                        ? "Execution paused: the recovery stream exceeded its time boundary without producing an executable tool result."
+	                        : "Execution paused: the model kept streaming content but produced no visible explanation or tool call.",
+	                      "MAIN kept the current workspace state and did not treat this invisible-output stall as an execution failure.",
+	                      `Recent targets: ${repeatedTargets.length > 0 ? repeatedTargets.join(", ") : "no single target identified"}`,
+	                      `Suggested recovery: ${nextStep}.`,
                     ].join("\n");
 
                 logAgentEvent("approved_plan_stream_watchdog_paused", {
@@ -1299,26 +1311,26 @@ export class AgentOrchestrator {
                   repeatedTargets,
                   ...(logContext || {}),
                 });
-                emitTaskOrchestratorPhase("PAUSED", {
-                  reason: "stream_no_visible_progress_timeout",
-                  iteration,
-                  repeatedTargets,
-                });
+	                emitTaskOrchestratorPhase("PAUSED", {
+	                  reason: recoveryReason,
+	                  iteration,
+	                  repeatedTargets,
+	                });
                 emitPlanExecutionProgress("paused", {
-                  progressSignature,
-                  repeatedTargets,
-                  recoveryReason: "stream_no_visible_progress_timeout",
-                  nextStep,
-                });
+	                  progressSignature,
+	                  repeatedTargets,
+	                  recoveryReason,
+	                  nextStep,
+	                });
                 callbacks.onNonActionableStop(
                   pauseNotice,
                   "no_output",
                   {
-                    progressSignature,
-                    repeatedTargets,
-                    recoveryReason: "stream_no_visible_progress_timeout",
-                    nextStep,
-                  },
+	                    progressSignature,
+	                    repeatedTargets,
+	                    recoveryReason,
+	                    nextStep,
+	                  },
                 );
                 callbacks.onStatusChange("idle");
                 return true;
@@ -1517,13 +1529,32 @@ export class AgentOrchestrator {
           runtimeIntent === "execute" &&
           recentPlanToolActivity.length === 0 &&
           callbacks.getPlanExecutionEvidenceLedger().length === 0;
-        const allowApprovedPlanRecoveryFileRead =
-          approvedPlanInitialSourceReadAllowed ||
-          approvedPlanNoToolRecoveryFileReadActive ||
-          shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
-        const baseIterationAllTools =
-          approvedPlanSourceEditFirstActive
-            ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
+	        const allowApprovedPlanRecoveryFileRead =
+	          approvedPlanInitialSourceReadAllowed ||
+	          approvedPlanNoToolRecoveryFileReadActive ||
+	          shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
+	        if (executeRecoveryMode !== "normal" || approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive) {
+	          logAgentEvent("recovery_loop_summary", {
+	            iteration,
+	            workflowMode,
+	            runtimeIntent,
+	            executeRecoveryMode,
+	            executeRecoveryReason,
+	            executeRecoveryAttempts,
+	            recoveryIterationCount,
+	            maxRecoveryIterations: MAX_RECOVERY_ITERATIONS,
+	            approvedPlanActionOnlyRecoveryActive,
+	            approvedPlanNoToolRecoveryFileReadActive,
+	            approvedPlanNoProgressRecoveryAttempts,
+	            approvedPlanLongReasoningNoActionCount,
+	            allowApprovedPlanRecoveryFileRead,
+	            recentPlanToolActivity: recentPlanToolActivity.length,
+	            repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
+	          });
+	        }
+	        const baseIterationAllTools =
+	          approvedPlanSourceEditFirstActive
+	            ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
                 allowFileRead: allowApprovedPlanRecoveryFileRead,
               }))
             : approvedPlanActionOnlyRecoveryActive &&
@@ -1574,11 +1605,45 @@ export class AgentOrchestrator {
             ),
           }).status,
         });
-        const iterationAllTools = shouldClosePlanToolSurface
-          ? baseIterationAllTools.filter((tool) => isPlanDraftWriteToolName(tool.function.name))
-          : phaseScopedIterationAllTools;
-        if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && iterationAllTools.length !== baseIterationAllTools.length) {
-          logAgentEvent("plan_runtime_tool_scope_applied", {
+	        const iterationAllTools = shouldClosePlanToolSurface
+	          ? baseIterationAllTools.filter((tool) => isPlanDraftWriteToolName(tool.function.name))
+	          : phaseScopedIterationAllTools;
+	        const shouldLogToolSurfaceDecision =
+	          rawIterationAllTools.length !== iterationAllTools.length ||
+	          executeRecoveryMode !== "normal" ||
+	          approvedPlanActionOnlyRecoveryActive ||
+	          approvedPlanNoToolRecoveryFileReadActive ||
+	          (workflowMode === "plan" && callbacks.getIsPlanApproved());
+	        if (shouldLogToolSurfaceDecision) {
+	          const rawToolNames = rawIterationAllTools.map((tool) => tool.function.name);
+	          const scopedToolNames = iterationAllTools.map((tool) => tool.function.name);
+	          const scopedToolNameSet = new Set(scopedToolNames);
+	          logAgentEvent("tool_surface_decision", {
+	            iteration,
+	            workflowMode,
+	            runtimeIntent,
+	            planStage: callbacks.getPlanStage(),
+	            isPlanApproved: callbacks.getIsPlanApproved(),
+	            executeRecoveryMode,
+	            executeRecoveryReason,
+	            approvedPlanSourceEditFirstActive,
+	            approvedPlanActionOnlyRecoveryActive,
+	            approvedPlanNoToolRecoveryFileReadActive,
+	            allowFileRead: allowApprovedPlanRecoveryFileRead || effectiveExecuteRecoveryFileRead,
+	            recoveryToolSurface: approvedPlanSourceEditFirstActive
+	              ? describeApprovedPlanSourceEditFirstToolSurface(allowApprovedPlanRecoveryFileRead)
+	              : approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive
+	                ? describeApprovedPlanRecoveryToolSurface(allowApprovedPlanRecoveryFileRead)
+	                : describeExecuteRecoveryToolSurface(executeRecoveryMode, effectiveExecuteRecoveryFileRead),
+	            rawToolCount: rawToolNames.length,
+	            scopedToolCount: scopedToolNames.length,
+	            removedToolCount: Math.max(0, rawToolNames.length - scopedToolNames.length),
+	            removedTools: rawToolNames.filter((name) => !scopedToolNameSet.has(name)).slice(0, 24),
+	            scopedTools: scopedToolNames.slice(0, 24),
+	          });
+	        }
+	        if (workflowMode === "plan" && !callbacks.getIsPlanApproved() && iterationAllTools.length !== baseIterationAllTools.length) {
+	          logAgentEvent("plan_runtime_tool_scope_applied", {
             iteration,
             planRuntimePhase,
             rawTools: rawIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
@@ -1990,10 +2055,25 @@ export class AgentOrchestrator {
           if (chatFinalSynthesisPrompt) {
             usedChatFinalSynthesisPrompt = true;
           }
-          const streamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
-          const recoveryToolChoice: OpenAiToolChoice | undefined =
-            isExecuteRecoveryEligible && executeRecoveryMode !== "normal" && llmTools.length > 0 && !forceXmlTools
-              ? "required"
+	          const baseStreamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
+	          const approvedPlanRecoveryStreamHardTimeoutActive =
+	            config.activeProfile === "local" &&
+	            workflowMode === "plan" &&
+	            callbacks.getIsPlanApproved() &&
+	            runtimeIntent === "execute" &&
+	            (isExecuteRecoveryEligible || approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive);
+	          const streamWatchdogOptions: FetchLLMStreamOptions = {
+	            ...baseStreamWatchdogOptions,
+	            ...(approvedPlanRecoveryStreamHardTimeoutActive
+	              ? {
+	                  maxStreamElapsedMs: APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS,
+	                  maxStreamElapsedLabel: "approved_plan_recovery",
+	                }
+	              : {}),
+	          };
+	          const recoveryToolChoice: OpenAiToolChoice | undefined =
+	            isExecuteRecoveryEligible && executeRecoveryMode !== "normal" && llmTools.length > 0 && !forceXmlTools
+	              ? "required"
               : undefined;
           logAgentEvent("llm_request_shape", {
             iteration,
@@ -2024,11 +2104,13 @@ export class AgentOrchestrator {
             allTools: summarizeToolsForDiagnostics(iterationAllTools),
             llmTools: summarizeToolsForDiagnostics(llmTools),
             toolChoice: recoveryToolChoice ?? null,
-            watchdog: {
-              hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
-              label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,
-              noticeOnlyForLocalPlan:
-                workflowMode === "plan" &&
+	            watchdog: {
+	              hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
+	              label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,
+	              maxStreamElapsedMs: streamWatchdogOptions.maxStreamElapsedMs ?? null,
+	              maxStreamElapsedLabel: streamWatchdogOptions.maxStreamElapsedLabel ?? null,
+	              noticeOnlyForLocalPlan:
+	                workflowMode === "plan" &&
                 !callbacks.getIsPlanApproved() &&
                 config.activeProfile === "local" &&
                 forceXmlTools,
@@ -3988,13 +4070,16 @@ export class AgentOrchestrator {
           callbacks.appendMessage({ role: "system", content: diagMsg });
         }
 
-        const hiddenThoughtOnlyNoToolStop =
-          effectiveToolCalls.length === 0 &&
-          finalReplyOptions.length === 0 &&
-          !hasMeaningfulVisibleText &&
-          normalized.hiddenThought.trim().length > 0;
+	        const hiddenThoughtOnlyNoToolStop =
+	          effectiveToolCalls.length === 0 &&
+	          finalReplyOptions.length === 0 &&
+	          !hasMeaningfulVisibleText &&
+	          normalized.hiddenThought.trim().length > 0;
+	        if (effectiveToolCalls.length > 0) {
+	          approvedPlanLongReasoningNoActionCount = 0;
+	        }
 
-        logAgentEvent("normalized_turn", {
+	        logAgentEvent("normalized_turn", {
           iteration,
           visibleChars: normalized.visibleText.length,
           hiddenThoughtChars: normalized.hiddenThought.length,
@@ -4246,12 +4331,16 @@ export class AgentOrchestrator {
             availableToolNames,
           });
           const browserValidationAvailable = hasBrowserValidationCapability(availableToolNames);
-          const truncatedAfterCachedReadOnly =
-            wasTruncated &&
-            !sawExecuteOperationEvidence &&
-            recentPlanToolActivity.slice(-4).some(isCachedReadOnlyPlanActivity);
+	          const truncatedAfterCachedReadOnly =
+	            wasTruncated &&
+	            !sawExecuteOperationEvidence &&
+	            recentPlanToolActivity.slice(-4).some(isCachedReadOnlyPlanActivity);
+	          const approvedPlanLengthNoAction =
+	            wasTruncated &&
+	            normalized.toolCalls.length === 0 &&
+	            finalReplyOptions.length === 0;
 
-          if (validationBoundary === "pause_external_validation" && approvedPlanAuditForNoTool) {
+	          if (validationBoundary === "pause_external_validation" && approvedPlanAuditForNoTool) {
             logAgentEvent("plan_execution_validation_boundary", {
               iteration,
               reason: "external_validation_unavailable",
@@ -4276,10 +4365,54 @@ export class AgentOrchestrator {
               "incomplete_plan",
             );
             callbacks.onStatusChange("idle");
-            return;
-          }
+	            return;
+	          }
 
-          if (truncatedAfterCachedReadOnly) {
+	          if (approvedPlanLengthNoAction) {
+	            approvedPlanLongReasoningNoActionCount += 1;
+	            const recoveryInput = {
+	              reason: "approved_plan_reasoning_length_no_action",
+	              remainingText,
+	              logContext: {
+	                finishReason: normalized.finishReason || "unknown",
+	                hiddenThoughtChars: normalized.hiddenThought.length,
+	                visibleChars: normalized.visibleText.length,
+	                contentChars: streamText.length,
+	                streamElapsedMs: Date.now() - iterationRequestStartedAt,
+	                longReasoningNoActionCount: approvedPlanLongReasoningNoActionCount,
+	              },
+	            };
+	            logAgentEvent("long_reasoning_no_action", {
+	              iteration,
+	              workflowMode,
+	              runtimeIntent,
+	              planStage: currentPlanStageForReview,
+	              isPlanApproved: callbacks.getIsPlanApproved(),
+	              count: approvedPlanLongReasoningNoActionCount,
+	              finishReason: normalized.finishReason || "unknown",
+	              hiddenThoughtChars: normalized.hiddenThought.length,
+	              visibleChars: normalized.visibleText.length,
+	              contentChars: streamText.length,
+	              streamElapsedMs: Date.now() - iterationRequestStartedAt,
+	              approvedPlanNoProgressRecoveryAttempts,
+	              remainingTasks: approvedPlanAuditForNoTool?.remainingTasks.length ?? 0,
+	              repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
+	            });
+	            if (
+	              approvedPlanLongReasoningNoActionCount === 1 &&
+	              approvedPlanNoProgressRecoveryAttempts < MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS
+	            ) {
+	              continueApprovedPlanWithStrategySwitch(recoveryInput);
+	              continue;
+	            }
+	            pauseApprovedPlanNoProgressLoop({
+	              ...recoveryInput,
+	              repeats: Math.max(1, approvedPlanLongReasoningNoActionCount),
+	            });
+	            return;
+	          }
+
+	          if (truncatedAfterCachedReadOnly) {
             const recoveryInput = {
               reason: "no_progress_cached_read_only_length",
               remainingText,

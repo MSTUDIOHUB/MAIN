@@ -551,6 +551,20 @@ test("approved plan repeat-read guard pauses before max-iteration error", () => 
   assert.match(orchestratorSource, /pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt\({[\s\S]*?reason: "read_file_repeat_limit_batch"/);
 });
 
+test("approved plan recovery logs tool surfaces and pauses long reasoning without action", () => {
+  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
+
+  assert.match(source, /APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS\s*=\s*90_000/);
+  assert.match(source, /maxStreamElapsedMs:\s*APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS/);
+  assert.match(source, /maxStreamElapsedLabel:\s*"approved_plan_recovery"/);
+  assert.match(source, /logAgentEvent\("tool_surface_decision"/);
+  assert.match(source, /logAgentEvent\("recovery_loop_summary"/);
+  assert.match(source, /logAgentEvent\("long_reasoning_no_action"/);
+  assert.match(source, /approved_plan_reasoning_length_no_action/);
+  assert.match(source, /approvedPlanLongReasoningNoActionCount === 1/);
+  assert.match(source, /pauseApprovedPlanNoProgressLoop\(\{[\s\S]*repeats: Math\.max\(1, approvedPlanLongReasoningNoActionCount\)/);
+});
+
 test("approved plan repeated edits route to validation recovery before pausing", () => {
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
 

@@ -1050,7 +1050,7 @@ export function activeMemoryReclamation(messages: TrimMessage[]): TrimMessage[] 
 // from bloating the system role to 86k+ chars.
 
 /** Compact a group of system messages sharing the same [HookContext:XXX] prefix. */
-function compactSystemGroup(_prefix: string, messages: TrimMessage[]): TrimMessage {
+function compactSystemGroup(prefix: string, messages: TrimMessage[]): TrimMessage {
   const parts: string[] = [];
   for (const msg of messages) {
     const content = typeof msg.content === "string" ? msg.content : "";
@@ -1058,13 +1058,60 @@ function compactSystemGroup(_prefix: string, messages: TrimMessage[]): TrimMessa
     const raw = content.replace(/^\[HookContext:\S+\]\s*/, "");
     if (raw) parts.push(raw);
   }
-  const eventName = messages.length > 0
-    ? (typeof messages[0].content === "string" ? messages[0].content.replace(/^\[HookContext:(\S+?)\]\s*/, "") : "")
-    : "Unknown";
   return {
     role: "system",
-    content: `[HookContext:${eventName}] ${parts.join("\n---\n")}`,
+    content: `[HookContext:${prefix || "Unknown"}] ${parts.join("\n---\n")}`,
   };
+}
+
+function isTrimMessageLike(value: unknown): value is TrimMessage {
+  if (!value || typeof value !== "object") return false;
+  const message = value as Partial<TrimMessage>;
+  if (message.role !== "system" && message.role !== "user" && message.role !== "assistant" && message.role !== "tool") {
+    return false;
+  }
+  return typeof message.content === "string" || Array.isArray(message.content);
+}
+
+function sanitizeTrimMessages(
+  messages: TrimMessage[],
+  source: string,
+): { messages: TrimMessage[]; invalidDropped: number } {
+  const sanitized: TrimMessage[] = [];
+  let invalidDropped = 0;
+  for (const message of messages as unknown[]) {
+    if (isTrimMessageLike(message)) {
+      sanitized.push(message);
+    } else {
+      invalidDropped += 1;
+    }
+  }
+  if (invalidDropped > 0) {
+    try {
+      console.info("[agent.context_trim_invalid_message_dropped]", {
+        source,
+        invalidDropped,
+        inputCount: Array.isArray(messages) ? messages.length : 0,
+        outputCount: sanitized.length,
+      });
+    } catch {
+      // Diagnostics must never affect context management.
+    }
+  }
+  return { messages: sanitized, invalidDropped };
+}
+
+function getSystemMessageGroupKey(message: TrimMessage): string {
+  const content = typeof message.content === "string" ? message.content : "";
+  const match = content.match(/^\[HookContext:(\S+?)\]\s*/);
+  return match ? match[1] : "SupplementalSystem";
+}
+
+function systemMessageChars(messages: TrimMessage[]): number {
+  return messages.reduce((sum, message) => {
+    if (message.role !== "system") return sum;
+    return sum + (typeof message.content === "string" ? message.content.length : 0);
+  }, 0);
 }
 
 export interface SystemCompactionResult {
@@ -1072,6 +1119,8 @@ export interface SystemCompactionResult {
   systemCharsBefore: number;
   systemCharsAfter: number;
   systemDropped: number;
+  invalidDropped: number;
+  compactedSystemGroups: number;
 }
 
 /**
@@ -1087,88 +1136,101 @@ export function compactSystemMessages(
   messages: TrimMessage[],
   maxTotalSystemChars: number = 24000,
 ): SystemCompactionResult {
-  const validMessages = messages.filter(Boolean);
-  if (validMessages.length === 0) return { messages: validMessages, systemCharsBefore: 0, systemCharsAfter: 0, systemDropped: 0 };
+  const sanitized = sanitizeTrimMessages(messages, "compactSystemMessages");
+  const validMessages = sanitized.messages;
+  if (validMessages.length === 0) {
+    return {
+      messages: validMessages,
+      systemCharsBefore: 0,
+      systemCharsAfter: 0,
+      systemDropped: 0,
+      invalidDropped: sanitized.invalidDropped,
+      compactedSystemGroups: 0,
+    };
+  }
 
-  const systemCharsBefore = validMessages.reduce((sum, msg) => {
-    if (msg.role !== "system") return sum;
-    return sum + (typeof msg.content === "string" ? msg.content.length : 0);
-  }, 0);
+  const systemCharsBefore = systemMessageChars(validMessages);
 
   // Always keep the first system message (main prompt)
-  const mainSystem = validMessages[0].role === "system" ? [validMessages[0]] : [];
-  const hookSystemMessages: TrimMessage[] = [];
+  const mainSystem = validMessages[0].role === "system" ? validMessages[0] : null;
+  const systemGroups = new Map<string, TrimMessage[]>();
+  const groupOrder: string[] = [];
 
   for (let i = 1; i < validMessages.length; i += 1) {
     const msg = validMessages[i];
     if (msg.role === "system") {
-      hookSystemMessages.push(msg);
+      const key = getSystemMessageGroupKey(msg);
+      if (!systemGroups.has(key)) {
+        systemGroups.set(key, []);
+        groupOrder.push(key);
+      }
+      systemGroups.get(key)?.push(msg);
     }
   }
 
-  if (hookSystemMessages.length === 0) {
-    return { messages: validMessages, systemCharsBefore, systemCharsAfter: systemCharsBefore, systemDropped: 0 };
+  if (systemGroups.size === 0) {
+    return {
+      messages: validMessages,
+      systemCharsBefore,
+      systemCharsAfter: systemCharsBefore,
+      systemDropped: 0,
+      invalidDropped: sanitized.invalidDropped,
+      compactedSystemGroups: 0,
+    };
   }
 
-  // Group by [HookContext:XXX] prefix
-  const groups = new Map<string, TrimMessage[]>();
-  for (const msg of hookSystemMessages) {
-    const content = typeof msg.content === "string" ? msg.content : "";
-    const match = content.match(/^\[HookContext:(\S+?)\]\s*/);
-    const key = match ? match[1] : "Unknown";
-    const existing = groups.get(key) || [];
-    existing.push(msg);
-    groups.set(key, existing);
-  }
-
-  // Build compacted messages
-  const compactedSystemMessages: TrimMessage[] = [];
-  const perGroupBudget = Math.floor(maxTotalSystemChars / groups.size);
-
-  for (const [, groupMsgs] of groups) {
-    const compacted = compactSystemGroup("", groupMsgs);
+  const compactedByGroup = new Map<string, TrimMessage>();
+  const perGroupBudget = Math.max(512, Math.floor(maxTotalSystemChars / Math.max(1, systemGroups.size)));
+  for (const key of groupOrder) {
+    const groupMsgs = systemGroups.get(key) || [];
+    const compacted = compactSystemGroup(key, groupMsgs);
     // Truncate content to per-group budget
     if (typeof compacted.content === "string" && compacted.content.length > perGroupBudget) {
       compacted.content = compacted.content.slice(0, perGroupBudget) + "... [truncated]";
     }
-    compactedSystemMessages.push(compacted);
+    compactedByGroup.set(key, compacted);
   }
 
-  // If total system chars still exceed budget, drop oldest groups first
-  let totalSysChars = mainSystem.reduce((s, m) => s + (typeof m.content === "string" ? m.content.length : 0), 0)
-    + compactedSystemMessages.reduce((s, m) => s + (typeof m.content === "string" ? m.content.length : 0), 0);
-
-  if (totalSysChars > maxTotalSystemChars) {
-    const keepCount = Math.max(1, Math.floor(maxTotalSystemChars / perGroupBudget));
-    const kept = compactedSystemMessages.slice(0, keepCount);
-    const dropped = compactedSystemMessages.length - kept.length;
-    const resultMessages = [...mainSystem, ...kept, ...validMessages.filter((m) => m.role !== "system")];
-    const systemCharsAfter = resultMessages.reduce((s, m) => {
-      if (m.role !== "system") return s;
-      return s + (typeof m.content === "string" ? m.content.length : 0);
-    }, 0);
-    return { messages: resultMessages, systemCharsBefore, systemCharsAfter, systemDropped: dropped };
+  const mainSystemChars = mainSystem && typeof mainSystem.content === "string" ? mainSystem.content.length : 0;
+  let runningSystemChars = mainSystemChars;
+  const keptGroups = new Set<string>();
+  for (const key of groupOrder) {
+    const compacted = compactedByGroup.get(key);
+    if (!compacted) continue;
+    const chars = typeof compacted.content === "string" ? compacted.content.length : 0;
+    if (runningSystemChars + chars <= maxTotalSystemChars || keptGroups.size === 0 && !mainSystem) {
+      keptGroups.add(key);
+      runningSystemChars += chars;
+    }
   }
 
-  // All groups fit — rebuild message list preserving non-system messages
   const resultMessages: TrimMessage[] = [];
-  let sysIdx = 0;
+  const emittedGroups = new Set<string>();
   for (const msg of validMessages) {
-    if (msg.role === "system" && msg === mainSystem[0]) {
+    if (msg.role === "system" && msg === mainSystem) {
       resultMessages.push(msg);
     } else if (msg.role === "system") {
-      resultMessages.push(compactedSystemMessages[sysIdx++]);
+      const key = getSystemMessageGroupKey(msg);
+      if (keptGroups.has(key) && !emittedGroups.has(key)) {
+        const compacted = compactedByGroup.get(key);
+        if (compacted) resultMessages.push(compacted);
+        emittedGroups.add(key);
+      }
     } else {
       resultMessages.push(msg);
     }
   }
 
-  const systemCharsAfter = resultMessages.reduce((s, m) => {
-    if (m.role !== "system") return s;
-    return s + (typeof m.content === "string" ? m.content.length : 0);
-  }, 0);
+  const systemCharsAfter = systemMessageChars(resultMessages);
 
-  return { messages: resultMessages, systemCharsBefore, systemCharsAfter, systemDropped: 0 };
+  return {
+    messages: resultMessages,
+    systemCharsBefore,
+    systemCharsAfter,
+    systemDropped: Math.max(0, groupOrder.length - keptGroups.size),
+    invalidDropped: sanitized.invalidDropped,
+    compactedSystemGroups: keptGroups.size,
+  };
 }
 
 
@@ -1190,6 +1252,8 @@ export interface ManageContextResult {
   memoryPacket: string;
   microCompactionKind: "none" | "tool_results" | "assistant_messages" | "mixed";
   microCompactedCount: number;
+  invalidDropped: number;
+  systemCompactedGroups: number;
 }
 
 export interface ManageContextOptions {
@@ -1223,7 +1287,8 @@ export function manageContext(
   forceManage: boolean = false,
   options: ManageContextOptions & { ephemeralItemIds?: Set<string> } = {},
 ): ManageContextResult {
-  const validMessages = messages.filter(Boolean);
+  const sanitized = sanitizeTrimMessages(messages, "manageContext");
+  const validMessages = sanitized.messages;
   const reclaimedMessages = activeMemoryReclamation(validMessages);
 
   // Pre-compact excessive system messages (hook context injectors) before memory injection
@@ -1242,7 +1307,7 @@ export function manageContext(
   const shouldManage = forceManage || tokenCountBefore > budgets.proactiveTriggerBudget;
 
   if (!shouldManage) {
-    const changed = !messagesEqual(validMessages, messagesWithMemory);
+    const changed = sanitized.invalidDropped > 0 || systemCompacted.invalidDropped > 0 || !messagesEqual(validMessages, messagesWithMemory);
     return {
       messages: messagesWithMemory,
       droppedCount: 0,
@@ -1261,6 +1326,8 @@ export function manageContext(
       memoryPacket,
       microCompactionKind: "none",
       microCompactedCount: 0,
+      invalidDropped: sanitized.invalidDropped + systemCompacted.invalidDropped,
+      systemCompactedGroups: systemCompacted.compactedSystemGroups,
     };
   }
 
@@ -1312,7 +1379,7 @@ export function manageContext(
     messages: trimmed,
     droppedCount: actualDropped,
     droppedMessageCount: actualDropped,
-    changed: !messagesEqual(validMessages, trimmed),
+    changed: sanitized.invalidDropped > 0 || systemCompacted.invalidDropped > 0 || !messagesEqual(validMessages, trimmed),
     tokenCountBefore,
     tokenCountAfter,
     tokenReduction: Math.max(0, tokenCountBefore - tokenCountAfter),
@@ -1326,6 +1393,8 @@ export function manageContext(
     memoryPacket,
     microCompactionKind,
     microCompactedCount,
+    invalidDropped: sanitized.invalidDropped + systemCompacted.invalidDropped,
+    systemCompactedGroups: systemCompacted.compactedSystemGroups,
   };
 }
 
@@ -1576,5 +1645,7 @@ export function compactContextForExecuteRecovery(
     memoryPacket,
     microCompactionKind: microCompactedCount > 0 ? "tool_results" : "none",
     microCompactedCount,
+    invalidDropped: 0,
+    systemCompactedGroups: 0,
   };
 }

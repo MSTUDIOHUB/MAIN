@@ -88,6 +88,9 @@ test("workflow engine closes harness from structured agent loop outcome", () => 
   assert.match(source, /case "completed":[\s\S]*agent_loop_completed/);
   assert.match(source, /case "paused":[\s\S]*closeCurrentHarnessRunMarker\("paused"/);
   assert.match(source, /case "stopped_no_action":[\s\S]*agent_loop_no_action/);
+  assert.match(source, /agent_loop_stop_summary/);
+  assert.match(source, /streamElapsedMs:\s*marker\.streamElapsedMs/);
+  assert.match(source, /lastStreamError:\s*marker\.lastStreamError/);
   assert.doesNotMatch(source, /closeCurrentHarnessRunMarker\("completed", "agent_loop_resolved"\)/);
 });
 

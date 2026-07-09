@@ -55,6 +55,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  compactSystemMessages,
   computeContextBudgets,
   computeContextTokenBreakdown,
   compactToolResults,
@@ -62,14 +63,14 @@ const {
   activeMemoryReclamation,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
 
-test("computeContextBudgets reserves a smaller, capped output budget for long contexts", () => {
+test("computeContextBudgets reserves bounded output budget for context windows", () => {
   const budgets16k = computeContextBudgets(16384);
   const budgets128k = computeContextBudgets(131072);
 
-  assert.equal(budgets16k.outputBudget, 3276);
-  assert.equal(budgets16k.inputBudget, 13108);
-  assert.equal(budgets128k.outputBudget, 4096);
-  assert.equal(budgets128k.inputBudget, 126976);
+  assert.equal(budgets16k.outputBudget, 4096);
+  assert.equal(budgets16k.inputBudget, 12288);
+  assert.equal(budgets128k.outputBudget, 8192);
+  assert.equal(budgets128k.inputBudget, 122880);
 });
 
 test("manageContext leaves long tool output untouched while under the proactive trigger", () => {
@@ -92,6 +93,10 @@ test("manageContext can persist token savings once the proactive trigger is cros
   const messages = [
     { role: "system", content: "system prompt" },
     { role: "tool", content: "A".repeat(80000) },
+    ...Array.from({ length: 8 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `recent-${index}`,
+    })),
   ];
 
   const result = manageContext(messages, 32768, undefined, 100, 2000);
@@ -130,7 +135,13 @@ test("compactToolResults summarizes read_file windows with meaningful savings", 
     "---CONTENT END---",
   ].join("\n");
 
-  const [compacted] = compactToolResults([{ role: "tool", content: source }], 700);
+  const [compacted] = compactToolResults([
+    { role: "tool", content: source },
+    ...Array.from({ length: 8 }, (_, index) => ({
+      role: index % 2 === 0 ? "user" : "assistant",
+      content: `recent-${index}`,
+    })),
+  ], 700);
 
   assert.ok(String(compacted.content).length < source.length - 2500);
   assert.match(compacted.content, /READ_FILE_SUMMARY path: src\/store\/dashboardStore\.ts/);
@@ -148,7 +159,7 @@ test("manageContext trims down to a lower hysteresis target once the trigger is 
     })),
   ];
 
-  const result = manageContext(messages, 4096, undefined, 4000, 4000);
+  const result = manageContext(messages, 4096, 1024, 4000, 4000);
 
   assert.equal(result.changed, true);
   assert.ok(result.droppedCount > 0);
@@ -309,6 +320,45 @@ test("computeContextTokenBreakdown reports tool results as the largest source", 
   assert.ok(result.topSourceTokens > result.user);
 });
 
+test("compactSystemMessages groups hook contexts once without undefined messages", () => {
+  const messages = [
+    { role: "system", content: "main system prompt" },
+    { role: "user", content: "start" },
+    { role: "system", content: "[HookContext:PostToolUse] first hook payload" },
+    { role: "assistant", content: "working" },
+    { role: "system", content: "[HookContext:PostToolUse] second hook payload" },
+    { role: "system", content: "[HookContext:UserPromptSubmit] prompt hook payload" },
+    { role: "user", content: "continue" },
+  ];
+
+  const result = compactSystemMessages(messages, 24000);
+
+  assert.equal(result.invalidDropped, 0);
+  assert.equal(result.messages.some((message) => message == null), false);
+  assert.equal(result.messages.filter((message) =>
+    message.role === "system" &&
+    String(message.content || "").startsWith("[HookContext:PostToolUse]")
+  ).length, 1);
+  assert.equal(result.messages.filter((message) =>
+    message.role === "system" &&
+    String(message.content || "").startsWith("[HookContext:UserPromptSubmit]")
+  ).length, 1);
+  assert.equal(result.compactedSystemGroups, 2);
+});
+
+test("manageContext drops invalid runtime messages instead of crashing", () => {
+  const result = manageContext([
+    { role: "system", content: "system prompt" },
+    undefined,
+    { role: "assistant" },
+    { role: "user", content: "latest request" },
+  ], 4096, 1024, 4000, 4000, true);
+
+  assert.equal(result.invalidDropped, 2);
+  assert.equal(result.messages.some((message) => message == null), false);
+  assert.ok(result.messages.every((message) => typeof message.role === "string"));
+});
+
 test("activeMemoryReclamation prunes historical reads once a successful mutation occurs", () => {
   const readCall = {
     id: "call_read_1",
@@ -342,4 +392,3 @@ test("activeMemoryReclamation prunes historical reads once a successful mutation
   // The write tool result must remain unchanged
   assert.match(result[5].content, /written successfully/);
 });
-

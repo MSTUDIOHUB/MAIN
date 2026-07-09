@@ -1891,12 +1891,14 @@ export function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
       `Repeated/known targets: ${repeatedTargets}`,
       recent ? `Recent tool evidence: ${recent}` : "",
       `Unsatisfied task: ${input.remainingText}`,
-      input.allowFileRead
-        ? "For the next response, MAIN keeps action tools plus targeted file reads available for exact-content or patch recovery. Use one only when needed, then patch or validate."
-        : "For the next response, MAIN keeps action tools plus patch-recovery `read_file` only when a patch mismatch just happened. Use `apply_patch`/`replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
-      "Do not call read/list/search again for the same cached target. If exact current content is needed, perform one targeted read and immediately continue with patching or validation.",
-    ].filter(Boolean).join("\n");
-  }
+	      input.allowFileRead
+	        ? "For the next response, MAIN keeps action tools plus targeted file reads available for exact-content or patch recovery. Use one only when needed, then patch or validate."
+	        : "For the next response, MAIN keeps action tools plus patch-recovery `read_file` only when a patch mismatch just happened. Use `apply_patch`/`replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
+	      input.allowFileRead
+	        ? "Do not call read/list/search again for the same cached target. If exact current content is needed, perform one targeted read and immediately continue with patching or validation."
+	        : "Do not call read/list/search again for the same cached target. If exact current content is still missing, state that blocker instead of requesting an unavailable read tool.",
+	    ].filter(Boolean).join("\n");
+	  }
 
   return [
     "已批准的 Plan 仍在执行，但上一批只读工具只是复用了已知文件内容，没有产生行动证据。",
@@ -1904,11 +1906,13 @@ export function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
     `重复/已知目标：${repeatedTargets}`,
     recent ? `最近工具证据：${recent}` : "",
     `证据未满足任务：${input.remainingText}`,
-    input.allowFileRead
-      ? "下一轮 MAIN 会保留行动工具和定向文件读取，用于精确内容或 patch 恢复。只在需要时读一次，随后必须写入或验证。"
-      : "下一轮 MAIN 会保留行动工具；只有刚发生 patch 不匹配时才开放一次定向 `read_file`。请优先使用 `apply_patch` / `replace_in_file` / `write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
-    "不要再次对同一缓存目标调用 read/list/search；如果确实需要精确当前内容，只做一次定向读取，然后立即继续 patch 或验证。",
-  ].filter(Boolean).join("\n");
+	    input.allowFileRead
+	      ? "下一轮 MAIN 会保留行动工具和定向文件读取，用于精确内容或 patch 恢复。只在需要时读一次，随后必须写入或验证。"
+	      : "下一轮 MAIN 会保留行动工具；只有刚发生 patch 不匹配时才开放一次定向 `read_file`。请优先使用 `apply_patch` / `replace_in_file` / `write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
+	    input.allowFileRead
+	      ? "不要再次对同一缓存目标调用 read/list/search；如果确实需要精确当前内容，只做一次定向读取，然后立即继续 patch 或验证。"
+	      : "不要再次对同一缓存目标调用 read/list/search；如果仍缺精确当前内容，请说明这是阻塞点，不要请求当前工具面不可用的读取工具。",
+	  ].filter(Boolean).join("\n");
 }
 
 function buildApprovedPlanSourceEditFirstPrompt(language: "zh" | "en"): string {
@@ -2456,6 +2460,8 @@ export const PLAN_NO_VISIBLE_TOKEN_TIMEOUT_MS = 125_000;
 interface FetchLLMStreamOptions {
   noVisibleTokenTimeoutMs?: number;
   noVisibleTokenTimeoutLabel?: string;
+  maxStreamElapsedMs?: number;
+  maxStreamElapsedLabel?: string;
   toolChoice?: OpenAiToolChoice;
   responseFormat?: Record<string, unknown>;
   workflowMode?: string;
@@ -2466,14 +2472,16 @@ export function isStreamWatchdogTimeoutMessage(message: string): boolean {
   const normalized = String(message || "").toLowerCase();
   return (
     normalized.includes("stream_first_chunk_timeout") ||
-    normalized.includes("stream_idle_timeout") ||
-    normalized.includes("stream_no_visible_token_timeout") ||
-    normalized.includes("stream_no_visible_progress_timeout") ||
-    normalized.includes("first chunk timeout") ||
-    normalized.includes("first response timeout") ||
-    normalized.includes("没有返回首个流式 chunk") ||
-    normalized.includes("没有继续输出") ||
-    normalized.includes("首个流式 chunk") ||
+	  normalized.includes("stream_idle_timeout") ||
+	  normalized.includes("stream_no_visible_token_timeout") ||
+	  normalized.includes("stream_no_visible_progress_timeout") ||
+	  normalized.includes("stream_max_elapsed_timeout") ||
+	  normalized.includes("first chunk timeout") ||
+	  normalized.includes("first response timeout") ||
+	  normalized.includes("maximum stream duration") ||
+	  normalized.includes("没有返回首个流式 chunk") ||
+	  normalized.includes("没有继续输出") ||
+	  normalized.includes("首个流式 chunk") ||
     normalized.includes("长时间没有返回可见流式内容") ||
     normalized.includes("没有返回响应头")
   );
@@ -2483,6 +2491,13 @@ export function createStreamNoVisibleTokenTimeoutError(timeoutMs: number, label?
   const suffix = label ? ` (${label})` : "";
   const error = new Error(`STREAM_NO_VISIBLE_TOKEN_TIMEOUT: no visible model output after ${timeoutMs}ms${suffix}`);
   (error as Error & { code?: string }).code = "STREAM_NO_VISIBLE_TOKEN_TIMEOUT";
+  return error;
+}
+
+export function createStreamMaxElapsedTimeoutError(timeoutMs: number, label?: string): Error {
+  const suffix = label ? ` (${label})` : "";
+  const error = new Error(`STREAM_MAX_ELAPSED_TIMEOUT: maximum stream duration ${timeoutMs}ms exceeded${suffix}`);
+  (error as Error & { code?: string }).code = "STREAM_MAX_ELAPSED_TIMEOUT";
   return error;
 }
 
@@ -2637,19 +2652,25 @@ export async function fetchLLMStream(
   while (true) {
     fullText = "";
     let result: StreamResult;
-    try {
-      result = await new Promise<StreamResult>((resolve, reject) => {
-        let settled = false;
-        const requestAbortController = new AbortController();
-        const timeoutMs = options.noVisibleTokenTimeoutMs ?? 0;
-        let noVisibleTokenTimer: ReturnType<typeof setTimeout> | null = null;
-        const cleanup = () => {
-          if (noVisibleTokenTimer !== null) {
-            clearTimeout(noVisibleTokenTimer);
-            noVisibleTokenTimer = null;
-          }
-          signal.removeEventListener("abort", onExternalAbort);
-        };
+	    try {
+	      result = await new Promise<StreamResult>((resolve, reject) => {
+	        let settled = false;
+	        const requestAbortController = new AbortController();
+	        const timeoutMs = options.noVisibleTokenTimeoutMs ?? 0;
+	        const maxStreamElapsedMs = options.maxStreamElapsedMs ?? 0;
+	        let noVisibleTokenTimer: ReturnType<typeof setTimeout> | null = null;
+	        let maxStreamElapsedTimer: ReturnType<typeof setTimeout> | null = null;
+	        const cleanup = () => {
+	          if (noVisibleTokenTimer !== null) {
+	            clearTimeout(noVisibleTokenTimer);
+	            noVisibleTokenTimer = null;
+	          }
+	          if (maxStreamElapsedTimer !== null) {
+	            clearTimeout(maxStreamElapsedTimer);
+	            maxStreamElapsedTimer = null;
+	          }
+	          signal.removeEventListener("abort", onExternalAbort);
+	        };
         const safeResolve = (r: StreamResult) => {
           if (!settled) {
             settled = true;
@@ -2680,16 +2701,40 @@ export async function fetchLLMStream(
         }
 
         signal.addEventListener("abort", onExternalAbort, { once: true });
-        if (timeoutMs > 0) {
-          noVisibleTokenTimer = setTimeout(() => {
-            const timeoutError = createStreamNoVisibleTokenTimeoutError(
+	        if (timeoutMs > 0) {
+	          noVisibleTokenTimer = setTimeout(() => {
+	            const timeoutError = createStreamNoVisibleTokenTimeoutError(
               timeoutMs,
               options.noVisibleTokenTimeoutLabel,
             );
             safeReject(timeoutError);
-            requestAbortController.abort();
-          }, timeoutMs);
-        }
+	            requestAbortController.abort();
+	          }, timeoutMs);
+	        }
+	        if (maxStreamElapsedMs > 0) {
+	          maxStreamElapsedTimer = setTimeout(() => {
+	            logAgentEvent("stream_max_elapsed_timeout", {
+	              maxStreamElapsedMs,
+	              label: options.maxStreamElapsedLabel || null,
+	              workflowMode: options.workflowMode || null,
+	              runtimeIntent: options.runtimeIntent || null,
+	              currentMaxTokens,
+	              toolCount: allTools.length,
+	            });
+	            callbacks.onHarnessRunUpdate?.({
+	              streamStatus: "stream_max_elapsed_timeout",
+	              lastStreamError: "STREAM_MAX_ELAPSED_TIMEOUT",
+	              streamElapsedMs: maxStreamElapsedMs,
+	              streamLifecycleStatus: "timeout",
+	            });
+	            const timeoutError = createStreamMaxElapsedTimeoutError(
+	              maxStreamElapsedMs,
+	              options.maxStreamElapsedLabel,
+	            );
+	            safeReject(timeoutError);
+	            requestAbortController.abort();
+	          }, maxStreamElapsedMs);
+	        }
 
         void streamChatCompletion(
           messages,
@@ -2788,10 +2833,11 @@ export async function fetchLLMStream(
 
       if (isAbort) {
         consecutiveCancelCount++;
-        logAgentEvent("stream_cancellation_detected", {
-          consecutiveCount: consecutiveCancelCount,
-          cancelDuration: options.noVisibleTokenTimeoutMs ?? 0,
-        });
+	        logAgentEvent("stream_cancellation_detected", {
+	          consecutiveCount: consecutiveCancelCount,
+	          cancelDuration: options.noVisibleTokenTimeoutMs ?? 0,
+	          maxStreamElapsedMs: options.maxStreamElapsedMs ?? 0,
+	        });
 
         // After 2+ consecutive cancellations, aggressively compact context
         if (consecutiveCancelCount >= 2 && settings.contextLimit && messages.length > 0) {
