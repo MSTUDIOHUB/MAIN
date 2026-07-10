@@ -29,6 +29,7 @@ import type { AttachedFile } from "../attachments";
 import type { FeishuRemoteContext } from "../remoteContextTypes";
 import type { StudioConfig as GameStudioConfig } from "../gameStudio/catalog";
 import { appendDebugLog } from "../debugLog";
+import { appendRuntimeEvent, withEventSchema } from "../turnEvents";
 import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion } from "../workflowModels";
 import {
   buildPlanExecutionProgressUpdate,
@@ -490,17 +491,59 @@ export class WorkflowEngine {
         });
       },
       startNewTurn: () => sessionGet().startNewTurn(remoteFeishu),
-      onGoalProgressUpdate: (progress, _goal) => sessionGet().updateGoalProgress(progress),
+      onGoalProgressUpdate: (progress, goal) => {
+        sessionGet().updateGoalProgress(progress);
+        const currentRuntime = sessionGet().goalRuntime;
+        if (currentRuntime) {
+          sessionGet().updateGoalRuntime({
+            ...currentRuntime,
+            goal,
+            progress,
+            status: goal.status,
+            updatedAt: Date.now(),
+          });
+        }
+      },
+      onGoalRuntimeUpdate: (runtime) => sessionGet().updateGoalRuntime(runtime),
       onGoalIterationStart: (_iter) => {}, // Optionally add detailed store updates later
       onGoalIterationEnd: (_iter) => {},
-      onGoalCheckpointSaved: (_ckpt) => {},
+      onGoalCheckpointSaved: (checkpoint) => {
+        const goalId = sessionGet().goalRuntime?.goal.id || sessionGet().activeGoal?.id;
+        if (!goalId) return;
+        sessionSet((state: any) => ({
+          runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+            type: "goal.checkpoint_saved",
+            threadId: runSessionKey,
+            turnId,
+            timestampMs: Date.now(),
+            goalId,
+            checkpointId: checkpoint.id || `checkpoint_${checkpoint.iteration}`,
+            iteration: checkpoint.iteration,
+          })),
+        }));
+      },
       onGoalUserConfirmNeeded: async (_msg) => true,
       onGoalOutcome: (outcome) => {
-        if (outcome.status === "completed") {
-          sessionGet().clearGoal(); // Optionally show success
-        } else if (outcome.status === "failed") {
-          sessionGet().pauseGoal();
-        }
+        const state = sessionGet();
+        if (!state.activeGoal || !state.goalProgress) return;
+        const goal = { ...state.activeGoal, status: outcome.status, updatedAt: Date.now() };
+        const runtime = state.goalRuntime || {
+          schemaVersion: 2 as const,
+          goal,
+          progress: state.goalProgress,
+          status: outcome.status,
+          phase: null,
+          updatedAt: Date.now(),
+        };
+        sessionGet().updateGoalRuntime({
+          ...runtime,
+          goal,
+          status: outcome.status,
+          phase: outcome.status === "completed" ? "observe" : "re_plan",
+          pauseReason: outcome.status === "paused" ? outcome.reason : runtime.pauseReason,
+          lastError: outcome.status === "failed" ? outcome.reason : runtime.lastError,
+          updatedAt: Date.now(),
+        });
       },
       onApprovedPlanHandoff: (prompt: string) => {
         const pendingHandoff = sessionGet().pendingPlanApprovalHandoff;
@@ -1860,7 +1903,7 @@ export class WorkflowEngine {
 
     const executeLoopStrategy = (): Promise<AgentLoopOutcome> => {
       if (context.runtimeRunIntent === "goal") {
-        const activeGoal = sessionGet().activeGoal;
+        const activeGoal = sessionGet().goalRuntime?.goal || sessionGet().activeGoal;
         if (!activeGoal) {
           return Promise.resolve({ status: "error", reason: "no_active_goal" });
         }
@@ -1869,22 +1912,55 @@ export class WorkflowEngine {
           getPreferredLanguage: callbacks.getPreferredLanguage,
           getWorkspacePath: () => resolveSessionWorkspaceKey(sessionGet().currentWorkspace) || "",
           runAgentIteration: async (iterInput) => {
+            let iterationMessages: import("../orchestrator").AgentMessage[] = [
+              { role: "system", content: "" },
+              {
+                role: "user",
+                content: callbacks.getPreferredLanguage() === "en"
+                  ? `Execute bounded goal slice ${iterInput.iteration}/${iterInput.maxIterations}. Use the Goal Runtime contract as the source of truth, advance one verifiable milestone, and finish with evidence plus the next step.`
+                  : `执行有界目标切片 ${iterInput.iteration}/${iterInput.maxIterations}。以 Goal Runtime 合同为准，推进一个可验证里程碑，并在结束时给出证据与下一步。`,
+              },
+            ];
             const iterCallbacks = {
               ...callbacks,
-              getMessages: () => {
-                return [
-                  { role: "system", content: iterInput.goalSystemContext },
-                  ...callbacks.getMessages()
-                ] as import("../orchestrator").AgentMessage[];
-              }
+              getGoalTurnContract: () => iterInput.goalTurnContract,
+              getConfig: () => {
+                const config = callbacks.getConfig();
+                const currentAgentLoop = (config as any).agentLoop || {};
+                const currentLimits = currentAgentLoop.iterationLimits || {};
+                return {
+                  ...config,
+                  agentLoop: {
+                    ...currentAgentLoop,
+                    iterationLimits: {
+                      ...currentLimits,
+                      goalIteration: config.activeProfile === "local" ? 8 : 12,
+                    },
+                  },
+                };
+              },
+              getMessages: () => iterationMessages,
+              appendMessage: (message: import("../orchestrator").AgentMessage) => {
+                iterationMessages = [...iterationMessages, message];
+              },
+              replaceMessages: (messages: import("../orchestrator").AgentMessage[]) => {
+                iterationMessages = [...messages];
+              },
             };
             const startTaskFlowLength = sessionGet().taskFlow.length;
-            const startAgentMessagesLength = sessionGet().agentMessages.length;
             const outcome = await executeAgentLoop(iterCallbacks, abortCtrl);
             
             const newFlow = sessionGet().taskFlow.slice(startTaskFlowLength);
             let assistantText = "";
-            const toolCalls: { name: string; target?: string; arguments?: Record<string, unknown> }[] = [];
+            const toolCalls: Array<{
+              id?: string;
+              name: string;
+              target?: string;
+              arguments?: Record<string, unknown>;
+              result?: string;
+              success?: boolean;
+            }> = [];
+            const toolCallById = new Map<string, (typeof toolCalls)[number]>();
 
             for (const block of newFlow) {
                if (block.type === "agent" && block.content) {
@@ -1892,31 +1968,78 @@ export class WorkflowEngine {
                }
             }
             
-            const newMessages = sessionGet().agentMessages.slice(startAgentMessagesLength);
-            for (const msg of newMessages) {
+            for (const msg of iterationMessages) {
               if (msg.role === "assistant" && msg.tool_calls) {
                 for (const tc of msg.tool_calls) {
                   let args = {};
                   try { args = JSON.parse(tc.function.arguments); } catch (e) {}
-                  toolCalls.push({
+                  const observation = {
+                    id: tc.id,
                     name: tc.function.name,
                     arguments: args,
-                  });
+                  };
+                  toolCalls.push(observation);
+                  toolCallById.set(tc.id, observation);
                 }
               }
+              if (msg.role === "tool" && msg.tool_call_id) {
+                const observation = toolCallById.get(msg.tool_call_id);
+                if (!observation) continue;
+                const result = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "");
+                observation.result = result;
+              }
             }
+
+            for (const block of newFlow) {
+              if (block.type !== "tool") continue;
+              const callId = block.toolCallId || String(block.id);
+              let observation = block.toolCallId ? toolCallById.get(block.toolCallId) : undefined;
+              if (!observation) {
+                observation = toolCalls.find((candidate) =>
+                  candidate.name === block.toolName
+                  && (!candidate.target || candidate.target === block.target)
+                  && candidate.result === undefined
+                );
+              }
+              if (!observation) {
+                observation = {
+                  id: callId,
+                  name: block.toolName,
+                  target: block.target,
+                };
+                toolCalls.push(observation);
+                toolCallById.set(callId, observation);
+              }
+              observation.target ||= block.target;
+              observation.result ??= block.message || block.observationSummary || block.evidence || block.status;
+              observation.success = block.toolStatus === "executed";
+            }
+
+            if (!assistantText.trim()) {
+              assistantText = iterationMessages
+                .filter((message) => message.role === "assistant" && typeof message.content === "string")
+                .map((message) => String(message.content || ""))
+                .filter(Boolean)
+                .join("\n");
+            }
+
+            const estimatedTokens = Math.ceil(iterationMessages.reduce((total, message) => {
+              const content = typeof message.content === "string" ? message.content : JSON.stringify(message.content || "");
+              return total + content.length;
+            }, 0) / 4);
 
             return {
               assistantText: assistantText.trim() || (outcome.status === "error" ? outcome.reason : "Iteration completed without textual response"),
               toolCalls,
-              tokensUsed: context.streamTokenCount || 0,
+              tokensUsed: estimatedTokens,
               completed: outcome.status === "completed",
+              outcomeStatus: outcome.status,
               error: outcome.status === "error" ? outcome.reason : undefined
             };
           },
           writeFile: async (path, content) => {
-            const { writeFile } = await import("../ipc");
-            await writeFile(path, content);
+            const { writeFileAtomic } = await import("../ipc");
+            await writeFileAtomic(path, content);
           },
           readFile: async (path) => {
             try {
@@ -1928,6 +2051,7 @@ export class WorkflowEngine {
           },
           isAborted: () => abortCtrl.signal.aborted,
           onGoalProgressUpdate: (progress, goal) => callbacks.onGoalProgressUpdate?.(progress, goal),
+          onGoalRuntimeUpdate: (runtime) => callbacks.onGoalRuntimeUpdate?.(runtime),
           onGoalIterationStart: (iter) => callbacks.onGoalIterationStart?.(iter),
           onGoalIterationEnd: (iter) => callbacks.onGoalIterationEnd?.(iter),
           onGoalCheckpointSaved: (ckpt) => callbacks.onGoalCheckpointSaved?.(ckpt),
@@ -1939,9 +2063,13 @@ export class WorkflowEngine {
         return executeGoalLoop({
           goal: activeGoal,
           callbacks: goalCallbacks,
-          existingProgress: sessionGet().goalProgress,
+          existingProgress: sessionGet().goalRuntime?.progress || sessionGet().goalProgress,
         }).then(goalOutcome => ({
-          status: goalOutcome.status === "completed" ? "completed" : goalOutcome.status === "failed" ? "error" : "paused",
+          status: goalOutcome.status === "completed"
+            ? "completed"
+            : goalOutcome.status === "failed"
+              ? "error"
+              : "paused",
           reason: goalOutcome.status
         }));
       }
@@ -2017,6 +2145,11 @@ export class WorkflowEngine {
             autoApproveToolScopes: s.autoApproveToolScopes,
             queuedUserMessage: s.queuedUserMessage,
             activeGuidance: s.activeGuidance,
+            activeGoal: s.activeGoal,
+            goalProgress: s.goalProgress,
+            goalStatus: s.goalStatus,
+            goalIterationBudget: s.goalIterationBudget,
+            goalRuntime: s.goalRuntime,
           }),
         });
       }

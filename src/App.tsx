@@ -791,7 +791,6 @@ export default function App() {
   const setConfig = useAppStore((s) => s.setConfig);
 
   const t = translations[config.language] || translations.en;
-  const currentTheme = THEMES[config.theme] || THEMES.purple;
   const remoteFeishuQueueRef = useRef<FeishuInboundMessage[]>([]);
   const feishuStartingRef = useRef(false);
   const sessionSaveTimerRef = useRef<number | null>(null);
@@ -3555,8 +3554,7 @@ export default function App() {
   }, [addWorkspaceEntry, refreshSessionsForScope]);
 
   return (
-    <div className="flex h-screen w-full bg-[#000000] text-[#e4e4e7] font-sans text-sm overflow-hidden md:flex-row flex-col relative"
-      style={{ '--accent': currentTheme.accent, '--accent-hover': currentTheme.hover, '--accent-light': currentTheme.light, '--accent-subtle': currentTheme.subtle, '--accent-subtle-border': currentTheme.subtleBorder, '--accent-contrast': currentTheme.contrast } as React.CSSProperties}>
+    <div className="flex h-screen w-full bg-[#000000] text-[#e4e4e7] font-sans text-sm overflow-hidden md:flex-row flex-col relative">
       <ThemeStyles />
       <Sidebar
         config={{

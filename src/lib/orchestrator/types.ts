@@ -84,6 +84,7 @@ export interface OrchestratorCallbacks {
   // Planning & Management
   getCurrentRunIntent: () => ResolvedUserIntent;
   getRuntimeRunIntent?: () => ResolvedUserIntent;
+  getGoalTurnContract?: () => import("../goalState").GoalTurnContract | null;
   getExecutionConsentGranted?: () => boolean;
   getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
   getCommandDirective?: () => CommandDirective | null;
@@ -109,6 +110,7 @@ export interface OrchestratorCallbacks {
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("../goalState").GoalProgress, goal: import("../goalState").GoalDefinition) => void;
+  onGoalRuntimeUpdate?: (runtime: import("../goalState").GoalRuntimeSnapshot) => void;
   onGoalIterationStart?: (iteration: import("../goalState").GoalIteration) => void;
   onGoalIterationEnd?: (iteration: import("../goalState").GoalIteration) => void;
   onGoalCheckpointSaved?: (checkpoint: import("../goalState").GoalCheckpoint) => void;

@@ -8,13 +8,16 @@ import type {
   GoalCheckpoint,
   GoalDefinition,
   GoalProgress,
+  GoalRuntimeSnapshot,
 } from "./goalState";
-import { buildGoalStatusLabel, summarizeGoalIteration } from "./goalState";
+import { buildGoalStatusLabel, normalizeGoalCriteria, summarizeGoalIteration } from "./goalState";
 
 export const GOAL_DIR_NAME = "goals";
 export const GOAL_ACTIVE_FILE = "active-goal.json";
 export const GOAL_PROGRESS_FILE = "progress.md";
 export const GOAL_CHECKPOINT_DIR = "checkpoints";
+export const GOAL_STATE_FILE = "state.json";
+export const GOAL_EVIDENCE_FILE = "evidence.jsonl";
 
 // ── Path helpers ─────────────────────────────────────────────────
 
@@ -28,6 +31,22 @@ export function resolveGoalActiveFilePath(workspacePath: string): string {
 
 export function resolveGoalProgressFilePath(workspacePath: string): string {
   return `${resolveGoalDirPath(workspacePath)}/${GOAL_PROGRESS_FILE}`;
+}
+
+export function resolveGoalRuntimeDirPath(workspacePath: string, goalId: string): string {
+  return `${resolveGoalDirPath(workspacePath)}/${goalId}`;
+}
+
+export function resolveGoalRuntimeStateFilePath(workspacePath: string, goalId: string): string {
+  return `${resolveGoalRuntimeDirPath(workspacePath, goalId)}/${GOAL_STATE_FILE}`;
+}
+
+export function resolveGoalRuntimeProgressFilePath(workspacePath: string, goalId: string): string {
+  return `${resolveGoalRuntimeDirPath(workspacePath, goalId)}/${GOAL_PROGRESS_FILE}`;
+}
+
+export function resolveGoalEvidenceFilePath(workspacePath: string, goalId: string): string {
+  return `${resolveGoalRuntimeDirPath(workspacePath, goalId)}/${GOAL_EVIDENCE_FILE}`;
 }
 
 export function resolveGoalCheckpointFilePath(workspacePath: string, iteration: number): string {
@@ -93,13 +112,11 @@ export function buildGoalProgressMarkdown(input: {
   lines.push("");
 
   // Definition of Done
-  if (goal.definitionOfDone.length > 0) {
+  const criteria = normalizeGoalCriteria(goal);
+  if (criteria.length > 0) {
     lines.push(`## ${isZh ? "完成标准" : "Definition of Done"}`);
-    for (const criterion of goal.definitionOfDone) {
-      const done = progress.lastCheckpoint?.completedTasks.some((task) =>
-        task.toLowerCase().includes(criterion.toLowerCase()),
-      );
-      lines.push(`- [${done ? "x" : " "}] ${criterion}`);
+    for (const criterion of criteria) {
+      lines.push(`- [${criterion.status === "satisfied" ? "x" : " "}] ${criterion.text}`);
     }
     lines.push("");
   }
@@ -156,6 +173,24 @@ export function buildGoalProgressMarkdown(input: {
   }
 
   return lines.join("\n");
+}
+
+export function serializeGoalRuntimeSnapshot(snapshot: GoalRuntimeSnapshot): string {
+  return JSON.stringify(snapshot, null, 2);
+}
+
+export function deserializeGoalRuntimeSnapshot(json: string): GoalRuntimeSnapshot | null {
+  try {
+    const parsed = JSON.parse(json) as GoalRuntimeSnapshot;
+    if (!parsed || parsed.schemaVersion !== 2 || !parsed.goal?.id || !parsed.progress?.goalId) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function serializeGoalEvidenceJsonl(progress: GoalProgress): string {
+  return (progress.evidence || []).map((entry) => JSON.stringify(entry)).join("\n");
 }
 
 // ── Checkpoint summary for LLM context ───────────────────────────

@@ -1,6 +1,8 @@
 import { GLOBAL_CHAT_KEY, finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import { getPlanArtifactTitle } from "./workflowModels";
+import { createGoalDefinition, createGoalProgress, type GoalStatus } from "./goalState";
+import { buildGoalRuntimeSnapshot } from "./goalRuntime";
 import type { NexusModeKey } from "./gameStudio/catalog";
 import {
   isCloudSettingsScenario,
@@ -69,6 +71,7 @@ const GAME_STUDIO_TOOL_GROUP_COLLAPSE_SCENARIO = "game-studio-tool-group-collaps
 const GAME_STUDIO_AWAITING_CHOICE_SCENARIO = "game-studio-awaiting-choice";
 const CAPSULE_MODEL_EXPLANATION_SCENARIO = "capsule-model-explanation";
 const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
+const GOAL_CAPSULE_SCENARIO = "goal-capsule";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const USER_CONTEXT_PILLS_SCENARIO = "user-context-pills";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
@@ -252,6 +255,10 @@ function bindBridgeSnapshot(scenario: string) {
       agentMessageSummaries,
       selectedOptions: archivedOptionBlocks.map((block) => block.selectedOption).filter(Boolean),
       themeMode: state.config.themeMode,
+      goalStatus: state.goalStatus,
+      activeGoalId: state.activeGoal?.id ?? null,
+      activeGoalObjective: state.activeGoal?.rawText || state.activeGoal?.objective || null,
+      activeGoalRevision: state.activeGoal?.revision ?? null,
       seedCount: readSeedCount(scenario),
     };
   };
@@ -4230,6 +4237,175 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
   return cleanup;
 }
 
+function seedGoalCapsuleScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = false;
+
+  const workspace = "/tmp/e2e-goal-capsule";
+  const sessionId = 999615;
+  const now = Date.now();
+  const turnId = "e2e-goal-capsule-turn";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+  const goal = createGoalDefinition({
+    objective: "重构 Goal Runtime；完成标准：Loop 与 Capsule 通过测试；约束：兼容 dark、black、light 三大主题",
+    iterationBudget: 40,
+    maxDurationMs: 2 * 60 * 60 * 1000,
+    sessionKey: workspace,
+  });
+  const progress = createGoalProgress(goal.id, `${workspace}/.MAIN/goals/${goal.id}/progress.md`);
+  progress.currentIteration = 3;
+  progress.totalIterationsUsed = 3;
+  progress.totalTokensUsed = 4820;
+  progress.estimatedTokens = true;
+  progress.iterations = [
+    {
+      index: 3,
+      phase: "execute",
+      startedAt: now - 20_000,
+      summary: "已完成 Goal Runtime 状态投影，正在验证 Capsule 菜单。",
+      toolCallCount: 3,
+      filesModified: ["src/lib/goalRuntime.ts", "src/components/GoalPanel.tsx"],
+      testsRun: ["npm run lint"],
+      testsPassed: true,
+      unresolvedBlockers: [],
+    },
+  ];
+  progress.evidence = [
+    {
+      id: "e2e-goal-evidence-file",
+      goalId: goal.id,
+      goalRevision: goal.revision || 1,
+      iteration: 3,
+      kind: "file_change",
+      status: "passed",
+      sourceTool: "apply_patch",
+      target: "src/components/GoalPanel.tsx",
+      summary: "Goal panel updated",
+      references: ["src/components/GoalPanel.tsx"],
+      createdAt: now - 15_000,
+    },
+    {
+      id: "e2e-goal-evidence-lint",
+      goalId: goal.id,
+      goalRevision: goal.revision || 1,
+      iteration: 3,
+      kind: "build",
+      status: "passed",
+      sourceTool: "run_command",
+      target: "npm run lint",
+      summary: "TypeScript passed",
+      references: [],
+      createdAt: now - 10_000,
+    },
+  ];
+  progress.milestones = [{
+    id: "e2e-goal-milestone",
+    text: "验证 Capsule Goal 菜单与三主题",
+    status: "in_progress",
+    criterionIds: goal.criteria?.map((criterion) => criterion.id) || [],
+  }];
+  progress.currentMilestoneId = "e2e-goal-milestone";
+  progress.usage = {
+    modelIterations: 3,
+    toolCalls: 8,
+    totalTokensUsed: 4820,
+    activeDurationMs: 12 * 60 * 1000,
+    activeStartedAt: now - 20_000,
+    estimatedTokens: true,
+  };
+  const runtime = buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: { ...state.config, language: "zh", workflowMode: "edit" },
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    workspaces: [{ path: workspace, name: "E2E Goal Capsule", addedAt: now, lastActiveAt: now }],
+    activeSessionByWorkspace: { [workspace]: sessionId },
+    sessionsByWorkspace: {
+      [workspace]: [{ id: sessionId, title: "E2E Goal Capsule", date: new Date(now).toISOString(), active: true, messages: [] }],
+      [GLOBAL_CHAT_KEY]: [],
+    },
+    currentSessionId: sessionId,
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "持续完成 Goal Runtime 重构。" },
+      { id: agentBlockId, turnId, type: "agent", content: "已进入持续目标执行。", streaming: false },
+    ],
+    conversationTurns: [{
+      id: turnId,
+      userPrompt: "持续完成 Goal Runtime 重构。",
+      title: "Goal Runtime 重构",
+      mode: "edit",
+      intent: "goal",
+      displayIntent: "goal",
+      status: "done",
+      summary: "Goal Runtime 正在后台持续推进。",
+      blockIds: [userBlockId, agentBlockId],
+      collapsed: false,
+      createdAt: now,
+    }],
+    currentTurnId: turnId,
+    currentTurnState: {
+      interceptorHandled: false,
+      interceptorThought: "",
+      lastReportedThought: "",
+      lastReportedAssistantText: "",
+      capsuleExplanation: null,
+      turnId,
+    },
+    activeGoal: goal,
+    goalProgress: progress,
+    goalStatus: "active",
+    goalIterationBudget: goal.iterationBudget,
+    goalRuntime: runtime,
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+  }));
+
+  bindBridgeSnapshot(GOAL_CAPSULE_SCENARIO);
+  bridge.setGoalStatus = (status: GoalStatus) => {
+    const state = useAppStore.getState();
+    if (!state.activeGoal || !state.goalProgress) return;
+    const nextGoal = {
+      ...state.activeGoal,
+      status,
+      updatedAt: Date.now(),
+      criteria: state.activeGoal.criteria?.map((criterion) => ({
+        ...criterion,
+        status: status === "completed" ? "satisfied" as const : criterion.status,
+        evidenceIds: status === "completed" ? state.goalProgress?.evidence?.map((entry) => entry.id) || [] : criterion.evidenceIds,
+      })),
+    };
+    const nextRuntime = {
+      ...(state.goalRuntime || buildGoalRuntimeSnapshot({ goal: nextGoal, progress: state.goalProgress, phase: "observe" })),
+      goal: nextGoal,
+      status,
+      phase: status === "completed" ? "observe" as const : "re_plan" as const,
+      pauseReason: status === "paused" ? "E2E pause" : undefined,
+      updatedAt: Date.now(),
+    };
+    useAppStore.setState({ activeGoal: nextGoal, goalStatus: status, goalRuntime: nextRuntime });
+  };
+
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedGameStudioOnboardingScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -5247,6 +5423,24 @@ function seedRealOmlxPlanFlowScenario() {
       },
     );
 
+  bridge.sendGoalMessage = (text?: string) => {
+    const objective = text || "修改 src/hooks/useCsvParser.ts，将 creator 正确映射到 creatorName，并运行验证。";
+    const state = useAppStore.getState();
+    state.startGoal(objective, {
+      sessionKey: `${workspace}:${sessionId}`,
+      maxIterations: 6,
+      maxDurationMs: 20 * 60 * 1000,
+    });
+    return state.sendMessage(objective, undefined, {
+      resolvedIntent: "execute",
+      runtimeIntentOverride: "goal",
+      skipIntentResolution: true,
+      preservePlanState: true,
+      turnTitle: "OMLX Goal Runtime",
+      intentSummary: "Run a bounded Goal Runtime loop with local OMLX",
+    });
+  };
+
   bridge.approvePlan = () => {
     useAppStore.getState().approvePlan("批准执行");
   };
@@ -5275,6 +5469,21 @@ function seedRealOmlxPlanFlowScenario() {
         content: artifact.content,
       })),
       planTasks: state.planTasks,
+      goalStatus: state.goalStatus,
+      activeGoal: state.activeGoal ? {
+        id: state.activeGoal.id,
+        objective: state.activeGoal.rawText || state.activeGoal.objective,
+        revision: state.activeGoal.revision || 1,
+      } : null,
+      goalIterations: state.goalProgress?.totalIterationsUsed || 0,
+      goalPauseReason: state.goalRuntime?.pauseReason || state.goalProgress?.pauseReason || null,
+      goalLastError: state.goalRuntime?.lastError || null,
+      goalEvidence: (state.goalProgress?.evidence || []).map((entry) => ({
+        kind: entry.kind,
+        status: entry.status,
+        sourceTool: entry.sourceTool,
+        target: entry.target,
+      })),
       currentTurnStatus: currentTurn?.status ?? null,
       agentTexts,
       toolBlocks,
@@ -6837,6 +7046,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === CAPSULE_PROGRESS_ONLY_SCENARIO) {
     return seedCapsuleProcessScenario("progress");
+  }
+
+  if (scenario === GOAL_CAPSULE_SCENARIO) {
+    return seedGoalCapsuleScenario();
   }
 
   if (scenario === USER_CONTEXT_PILLS_SCENARIO) {

@@ -108,7 +108,7 @@ import {
   type ReplyOption,
 } from "./workflowModels";
 import type { MainModeKey } from "./mainModes";
-import { type CommandDirective, type ResolvedUserIntent } from "./runIntent";
+import { isMutationRuntimeIntent, type CommandDirective, type ResolvedUserIntent } from "./runIntent";
 import {
   type ResolvedInstructionSet,
 } from "./instructions";
@@ -696,7 +696,7 @@ export async function buildReadBeforeModifyValidationError(
 ): Promise<ToolExecutionResult | null> {
   if (!READ_BEFORE_MODIFY_WRITE_TOOLS.has(tc.name) && tc.name !== "read_file") return null;
   const runtimeIntent = callbacks.getRuntimeRunIntent?.() ?? callbacks.getCurrentRunIntent();
-  if (runtimeIntent !== "execute" && runtimeIntent !== "studio_workflow" && !callbacks.getIsPlanApproved()) {
+  if (!isMutationRuntimeIntent(runtimeIntent) && runtimeIntent !== "studio_workflow" && !callbacks.getIsPlanApproved()) {
     return null;
   }
 
@@ -1215,6 +1215,7 @@ export interface OrchestratorCallbacks {
   // Planning & Management
   getCurrentRunIntent: () => ResolvedUserIntent;
   getRuntimeRunIntent?: () => ResolvedUserIntent;
+  getGoalTurnContract?: () => import("./goalState").GoalTurnContract | null;
   getExecutionConsentGranted?: () => boolean;
   getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
   getCommandDirective?: () => CommandDirective | null;
@@ -1240,6 +1241,7 @@ export interface OrchestratorCallbacks {
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("./goalState").GoalProgress, goal: import("./goalState").GoalDefinition) => void;
+  onGoalRuntimeUpdate?: (runtime: import("./goalState").GoalRuntimeSnapshot) => void;
   onGoalIterationStart?: (iteration: import("./goalState").GoalIteration) => void;
   onGoalIterationEnd?: (iteration: import("./goalState").GoalIteration) => void;
   onGoalCheckpointSaved?: (checkpoint: import("./goalState").GoalCheckpoint) => void;

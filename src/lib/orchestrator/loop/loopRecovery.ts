@@ -36,7 +36,7 @@ import {
   summarizeRepeatedPlanTargetsFromToolActivity,
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import {
   formatRepeatLoopFatalMessage,
   formatRepeatLoopRecoveryMessage,
@@ -218,7 +218,7 @@ export function handleNoProgressRecovery(input: {
   };
 
   const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
-  if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && workflowMode === "edit" && (runtimeIntent === "execute" || runtimeIntent === "goal")) {
+  if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
     const language = callbacks.getPreferredLanguage();
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
     activateTrackedExecuteRecovery("mutation_first", "read_file_only_loop", {
@@ -230,7 +230,7 @@ export function handleNoProgressRecovery(input: {
   }
 
   const executeReadOnlyRecovery =
-    workflowMode === "edit" && runtimeIntent === "execute"
+    workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)
       ? resolveExecuteReadOnlyRecoveryTrigger({
           results,
           recentActivity: recentToolActivity,
@@ -413,14 +413,14 @@ export function handleNoProgressRecovery(input: {
         batches: planReadOnlyConvergenceBatches,
         tools: planReadOnlyConvergenceTools,
       });
-    } else if (workflowMode === "edit" && runtimeIntent === "execute" && pendingExecuteRecoveryPrompt) {
+    } else if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent) && pendingExecuteRecoveryPrompt) {
       logAgentEvent("execute_no_progress_deferred_to_recovery", {
         iteration,
         repeats: noProgressBatchRepeatCount,
         executeRecoveryMode: currentExecuteRecoveryMode,
         executeRecoveryReason: currentExecuteRecoveryReason,
       });
-    } else if (workflowMode === "edit" && runtimeIntent === "execute") {
+    } else if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
       const language = callbacks.getPreferredLanguage();
       const repeatedTargets = pendingExecuteNoProgressPause?.repeatedTargets.length
         ? pendingExecuteNoProgressPause.repeatedTargets
@@ -594,7 +594,7 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
   let executeRecoveryMode = input.executeRecoveryMode;
   let executeRecoveryReason = input.executeRecoveryReason;
   let consecutiveBlockedReadFileInRecoveryCount = input.consecutiveBlockedReadFileInRecoveryCount;
-  if (runtimeIntent !== "execute") {
+  if (!isMutationRuntimeIntent(runtimeIntent)) {
     return {
       executeRecoveryMode,
       executeRecoveryReason,
@@ -742,7 +742,7 @@ export function handleTargetProgressLoopRecovery(input: {
       progressCheck.threshold,
     );
     const isExecuteTargetRecoveryEligible =
-      runtimeIntent === "execute" &&
+      isMutationRuntimeIntent(runtimeIntent) &&
       progressCheck.family === "edit" &&
       (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
       (outcome === "blocked" || outcome === "failed" || outcome === "no_change");
@@ -864,7 +864,7 @@ export function handleExecuteConvergencePrompt(input: {
     recentToolActivity: recentToolActivity.length,
     executeRecoveryMode,
   });
-  if (workflowMode === "edit" && runtimeIntent === "execute") {
+  if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
     activateExecuteRecovery("mutation_first", "execute_convergence_prompt", {
       maxIterations: effectiveMaxIterations,
       recentToolActivity: recentToolActivity.length,
@@ -971,7 +971,7 @@ export function handleReadFileRepeatLimitRecovery(input: {
 
   const language = callbacks.getPreferredLanguage();
   const repeatedTargets = [readFileRepeatLimitBatch.target].filter(Boolean);
-  if (runtimeIntent === "execute" && executeRecoveryAttempts < 2) {
+  if (isMutationRuntimeIntent(runtimeIntent) && executeRecoveryAttempts < 2) {
     activateExecuteRecovery("mutation_first", "read_file_repeat_limit_batch", {
       target: readFileRepeatLimitBatch.target,
       total: readFileRepeatLimitBatch.total,
@@ -1124,7 +1124,7 @@ export function handleRepeatedEditValidationRecovery(input: {
       .filter((name) => EXECUTION_VERIFICATION_TOOL_NAMES.has(name))
       .filter((name) => name !== "send_pty_input" && name !== "clear_pty_buffer");
     const canAttemptValidationRecovery =
-      runtimeIntent === "execute" &&
+      isMutationRuntimeIntent(runtimeIntent) &&
       (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
       repeatedEditValidationRecoveryAttempts < 1 &&
       availableValidationTools.length > 0;

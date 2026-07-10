@@ -692,6 +692,10 @@ export function writeFile(path: string, content: string, workspace?: string): Pr
   return invoke<void>("write_file", { path, content, workspace });
 }
 
+export function writeFileAtomic(path: string, content: string, workspace?: string): Promise<void> {
+  return invoke<void>("write_file_atomic", { path, content, workspace });
+}
+
 export function writeChatTempFile(sessionKey: string, path: string, content: string): Promise<string> {
   return invoke<string>("write_chat_temp_file", { sessionKey, path, content });
 }

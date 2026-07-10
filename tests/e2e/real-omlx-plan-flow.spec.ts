@@ -559,4 +559,73 @@ for (const model of models) {
     expect(JSON.stringify(executionSnapshot?.debugTail || [])).not.toMatch(/no_progress_cached_read_only_batch|store\.non_actionable_stop/i);
     expect(bodyText).not.toMatch(forbiddenChatNoise);
   });
+
+  test(`real OMLX Goal Runtime completes with evidence or pauses safely with ${model}`, async ({ page }) => {
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    page.on("console", (message) => {
+      const text = message.text();
+      if (text.includes("[real-omlx-invoke] append_debug_log")) return;
+      console.log(`[goal-browser:${message.type()}] ${text}`);
+    });
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+
+    const dispatchResult = await page.evaluate(() => (window as any).__CODELY_E2E__?.sendGoalMessage?.(
+      "修改 src/hooks/useCsvParser.ts，将 CSV creator 字段映射到 Dashboard 使用的 creatorName。完成标准：源码已修改且运行测试或类型检查通过；约束：保持 creator 向后兼容。",
+    ));
+    await page.waitForTimeout(1_000);
+    const dispatchSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    console.log(`[real-omlx-goal-dispatch:${model}] ${JSON.stringify({
+      dispatchResult,
+      goalStatus: dispatchSnapshot?.goalStatus,
+      agentStatus: dispatchSnapshot?.agentStatus,
+      currentTurnStatus: dispatchSnapshot?.currentTurnStatus,
+      iterations: dispatchSnapshot?.goalIterations,
+      debug: dispatchSnapshot?.debugTail,
+    }).slice(0, 6000)}`);
+
+    await expect.poll(async () => {
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      return ["completed", "paused", "failed", "budget_exceeded"].includes(snapshot?.goalStatus || "");
+    }, { timeout: 600_000 }).toBe(true);
+
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    console.log(`[real-omlx-goal:${model}] ${JSON.stringify({
+      status: snapshot?.goalStatus,
+      pauseReason: snapshot?.goalPauseReason,
+      lastError: snapshot?.goalLastError,
+      iterations: snapshot?.goalIterations,
+      evidence: snapshot?.goalEvidence,
+      taskFlow: snapshot?.taskFlowPreview,
+      debug: snapshot?.debugTail,
+    }).slice(0, 12000)}`);
+    expect(snapshot?.activeGoal).not.toBeNull();
+    expect(snapshot?.goalIterations).toBeGreaterThan(0);
+    expect(snapshot?.goalIterations).toBeLessThanOrEqual(6);
+
+    const trigger = page.getByTestId("goal-capsule-trigger");
+    if (snapshot?.goalStatus === "completed") {
+      const parserOnDisk = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
+      expect(parserOnDisk).toMatch(/creatorName\s*:/);
+      expect(snapshot?.goalEvidence).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "file_change", status: "passed" }),
+      ]));
+      expect(snapshot?.goalEvidence.some((entry: { kind?: string; status?: string }) =>
+        (entry.kind === "test" || entry.kind === "build" || entry.kind === "browser") && entry.status === "passed"
+      )).toBe(true);
+      await expect(trigger).toHaveAttribute("data-goal-status", "completed");
+      await trigger.click();
+      await expect(page.getByTestId("goal-popover-panel")).toContainText("已完成");
+    } else {
+      expect(snapshot?.goalStatus).toBe("paused");
+      expect(`${snapshot?.goalPauseReason || ""} ${snapshot?.taskFlowPreview?.map((block: { content?: string }) => block.content).join(" ") || ""}`)
+        .toMatch(/STREAM_NO_VISIBLE_PROGRESS_TIMEOUT|stopped_no_action|execution_evidence_required|read.*repeat|agent_loop_error/i);
+      expect(snapshot?.goalEvidence.some((entry: { kind?: string; status?: string }) =>
+        entry.kind === "user_validation" && entry.status === "passed"
+      )).toBe(false);
+      await expect(trigger).toHaveAttribute("data-goal-status", "paused");
+      await trigger.click();
+      await expect(page.getByTestId("goal-popover-panel")).toContainText("已暂停");
+      await expect(page.getByTestId("goal-resume-button")).toBeVisible();
+    }
+  });
 }

@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconImageIcon, IconLogoM, IconSettings, IconStop, IconTerminal, IconZap } from "./Icons";
+import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconGoal, IconImageIcon, IconLogoM, IconSettings, IconStop, IconTerminal, IconZap } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
 import ImageGenerationCard from "./ImageGenerationCard";
@@ -2381,6 +2381,7 @@ export default function ChatArea({
     activeGoal,
     goalProgress,
     goalStatus,
+    goalRuntime,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -2423,6 +2424,7 @@ export default function ChatArea({
     activeGoal: useAppStore((s) => s.activeGoal),
     goalProgress: useAppStore((s) => s.goalProgress),
     goalStatus: useAppStore((s) => s.goalStatus),
+    goalRuntime: useAppStore((s) => s.goalRuntime),
   };
   const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
@@ -2466,9 +2468,10 @@ export default function ChatArea({
   const [persistedExplanation, setPersistedExplanation] = useState("");
   const [chatAreaHeight, setChatAreaHeight] = useState(0);
   const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
-  const [showProgressPopover, setShowProgressPopover] = useState(false);
-  const [showTasksPopover, setShowTasksPopover] = useState(false);
-  const [showGoalPopover, setShowGoalPopover] = useState(false);
+  const [capsulePopover, setCapsulePopover] = useState<"progress" | "tasks" | "goal" | null>(null);
+  const showProgressPopover = capsulePopover === "progress";
+  const showTasksPopover = capsulePopover === "tasks";
+  const showGoalPopover = capsulePopover === "goal";
   const popoverRef = useRef<HTMLDivElement>(null);
   const mButtonRef = useRef<HTMLButtonElement>(null);
   const tasksPopoverRef = useRef<HTMLDivElement>(null);
@@ -2477,66 +2480,39 @@ export default function ChatArea({
   const goalButtonRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
-    if (!showGoalPopover) return;
-    const handleDocumentClick = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
+    if (!capsulePopover) return;
+    const handleDocumentClick = (event: MouseEvent) => {
+      const popoverElement = capsulePopover === "progress"
+        ? popoverRef.current
+        : capsulePopover === "tasks"
+        ? tasksPopoverRef.current
+        : goalPopoverRef.current;
+      const triggerElement = capsulePopover === "progress"
+        ? mButtonRef.current
+        : capsulePopover === "tasks"
+        ? tasksButtonRef.current
+        : goalButtonRef.current;
+      const eventPath = event.composedPath();
       if (
-        goalPopoverRef.current &&
-        !goalPopoverRef.current.contains(target) &&
-        goalButtonRef.current &&
-        !goalButtonRef.current.contains(target)
+        (!popoverElement || !eventPath.includes(popoverElement))
+        && (!triggerElement || !eventPath.includes(triggerElement))
       ) {
-        setShowGoalPopover(false);
+        setCapsulePopover(null);
       }
     };
-    document.addEventListener("click", handleDocumentClick);
-    return () => {
-      document.removeEventListener("click", handleDocumentClick);
-    };
-  }, [showGoalPopover]);
-
-  useEffect(() => {
-    if (!showProgressPopover) return;
-    const handleDocumentClick = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (
-        popoverRef.current &&
-        !popoverRef.current.contains(target) &&
-        mButtonRef.current &&
-        !mButtonRef.current.contains(target)
-      ) {
-        setShowProgressPopover(false);
-      }
+    const handleDocumentKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setCapsulePopover(null);
     };
     document.addEventListener("click", handleDocumentClick);
+    document.addEventListener("keydown", handleDocumentKeyDown);
     return () => {
       document.removeEventListener("click", handleDocumentClick);
+      document.removeEventListener("keydown", handleDocumentKeyDown);
     };
-  }, [showProgressPopover]);
+  }, [capsulePopover]);
 
   useEffect(() => {
-    if (!showTasksPopover) return;
-    const handleDocumentClick = (e: MouseEvent) => {
-      const target = e.target as HTMLElement;
-      if (
-        tasksPopoverRef.current &&
-        !tasksPopoverRef.current.contains(target) &&
-        tasksButtonRef.current &&
-        !tasksButtonRef.current.contains(target)
-      ) {
-        setShowTasksPopover(false);
-      }
-    };
-    document.addEventListener("click", handleDocumentClick);
-    return () => {
-      document.removeEventListener("click", handleDocumentClick);
-    };
-  }, [showTasksPopover]);
-
-  useEffect(() => {
-    setShowProgressPopover(false);
-    setShowTasksPopover(false);
-    setShowGoalPopover(false);
+    setCapsulePopover(null);
   }, [isCapsuleCollapsed, activeSessionKey]);
 
   const lastTurnIdRef = useRef<string | undefined>(undefined);
@@ -3826,7 +3802,7 @@ export default function ChatArea({
   ) : null;
   const hasExecutionCapsuleControls = !!executionCapsuleControls;
   const hasCapsuleFlow = !!persistedExplanation;
-  const shouldShowMainCapsule = hasCapsuleFlow || hasExecutionCapsuleControls;
+  const shouldShowMainCapsule = hasCapsuleFlow || hasExecutionCapsuleControls || !!activeGoal;
 
   return (
     <div className="relative flex min-w-0 flex-1 flex-col bg-[#000000]">
@@ -4180,7 +4156,7 @@ export default function ChatArea({
                 </span>
                 <button
                   type="button"
-                  onClick={() => setShowProgressPopover(false)}
+                  onClick={() => setCapsulePopover(null)}
                   className={`rounded p-1 transition-colors ${
                     isLightThemeMode
                       ? "text-[#71717a] hover:bg-[#f4f4f5] hover:text-[#18181b]"
@@ -4261,7 +4237,7 @@ export default function ChatArea({
                 </span>
                 <button
                   type="button"
-                  onClick={() => setShowTasksPopover(false)}
+                  onClick={() => setCapsulePopover(null)}
                   className={`rounded p-1 transition-colors ${
                     isLightThemeMode
                       ? "text-[#71717a] hover:bg-[#f4f4f5] hover:text-[#18181b]"
@@ -4343,23 +4319,20 @@ export default function ChatArea({
             <div
               ref={goalPopoverRef}
               data-testid="goal-progress-popover"
-              className={`pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border backdrop-blur-md text-left transition-all duration-200 overflow-hidden ${
-                isLightThemeMode
-                  ? "border-[#d4d4d8] bg-white/95 shadow-[0_12px_40px_rgba(0,0,0,0.12)] text-[#18181b]"
-                  : isBlackThemeMode
-                  ? "border-[#202026] bg-[#030304]/95 shadow-[0_12px_40px_rgba(0,0,0,0.95)] text-[#e7e7ea]"
-                  : "border-[var(--accent-subtle-border)] bg-[rgba(9,9,11,0.95)] shadow-[0_12px_40px_rgba(0,0,0,0.85)] text-[#e4e4e7]"
-              }`}
+              className="pointer-events-auto mb-3 w-full max-w-xl text-left transition-all duration-200"
             >
               <GoalPanel
                 goal={activeGoal}
                 progress={goalProgress}
                 status={goalStatus}
+                runtime={goalRuntime}
                 language={language}
                 themeMode={config.themeMode}
                 onPause={() => useAppStore.getState().pauseGoal()}
                 onResume={() => useAppStore.getState().resumeGoal()}
+                onEdit={(objective) => useAppStore.getState().updateGoalText(objective)}
                 onStop={() => useAppStore.getState().clearGoal()}
+                onClose={() => setCapsulePopover(null)}
               />
             </div>
           )}
@@ -4386,8 +4359,13 @@ export default function ChatArea({
                 title={isCapsuleCollapsed ? (language === "zh" ? "点击展开" : "Click to expand") : undefined}
               >
                 {isCapsuleCollapsed ? (
-                  <div className="flex items-center justify-center w-full h-full animate-pulse">
-                    <IconLogoM className="h-5 w-5 theme-text pointer-events-none" />
+                  <div
+                    className={`flex items-center justify-center w-full h-full ${activeGoal ? `capsule-goal-icon is-${goalStatus}` : "animate-pulse"}`}
+                    data-goal-status={activeGoal ? goalStatus : undefined}
+                  >
+                    {activeGoal
+                      ? <IconGoal className="h-5 w-5 pointer-events-none" />
+                      : <IconLogoM className="h-5 w-5 theme-text pointer-events-none" />}
                   </div>
                 ) : (
                   <div className="agent-explanation-scroll-container">
@@ -4399,8 +4377,7 @@ export default function ChatArea({
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setShowProgressPopover(!showProgressPopover);
-                              setShowTasksPopover(false);
+                              setCapsulePopover(showProgressPopover ? null : "progress");
                             }}
                             className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:scale-105 active:scale-95 transition-all cursor-pointer"
                             title={language === "zh" ? "查看有效进展" : "View Effective Progress"}
@@ -4418,8 +4395,7 @@ export default function ChatArea({
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setShowTasksPopover(!showTasksPopover);
-                              setShowProgressPopover(false);
+                              setCapsulePopover(showTasksPopover ? null : "tasks");
                             }}
                             title={language === "zh" ? "任务跟踪" : "Task Tracking"}
                             className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-[#ffffff] hover:border-transparent active:scale-95 cursor-pointer"
@@ -4436,14 +4412,16 @@ export default function ChatArea({
                             type="button"
                             onClick={(e) => {
                               e.stopPropagation();
-                              setShowGoalPopover(!showGoalPopover);
-                              setShowTasksPopover(false);
-                              setShowProgressPopover(false);
+                              setCapsulePopover(showGoalPopover ? null : "goal");
                             }}
                             title={language === "zh" ? "目标进度" : "Goal Progress"}
-                            className="shrink-0 ml-3 flex items-center justify-center p-1.5 rounded-md border border-[var(--accent-subtle-border)] bg-[color-mix(in_srgb,var(--accent)_10%,transparent)] text-[var(--accent-light)] transition-all hover:bg-[var(--accent)] hover:text-[#ffffff] hover:border-transparent active:scale-95 cursor-pointer"
+                            aria-label={language === "zh" ? "目标进度" : "Goal Progress"}
+                            aria-expanded={showGoalPopover}
+                            data-testid="goal-capsule-trigger"
+                            data-goal-status={goalStatus}
+                            className={`capsule-goal-trigger is-${goalStatus} ${showGoalPopover ? "is-open" : ""}`}
                           >
-                            <IconFileText className="w-3.5 h-3.5" />
+                            <IconGoal className="w-3.5 h-3.5" />
                           </button>
                         )}
 

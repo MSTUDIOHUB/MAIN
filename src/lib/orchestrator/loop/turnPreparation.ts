@@ -263,6 +263,9 @@ export function createSystemPromptApplier(input: {
       ? formatWebResearchLocalDate()
       : "";
     const unityMcpFirstPhaseActive = getUnityMcpFirstPhaseActive();
+    const goalTurnContract = runtimeIntent === "goal"
+      ? callbacks.getGoalTurnContract?.() ?? null
+      : null;
     const systemPromptKey = [
       runtimeIntent,
       workflowMode,
@@ -275,6 +278,7 @@ export function createSystemPromptApplier(input: {
       effectiveTurnContract.approvalState,
       effectiveTurnContract.mutationExpected ? "mutation" : "no-mutation",
       effectiveTurnContract.completionEvidenceRequired,
+      goalTurnContract?.cacheKey ?? "no-goal-contract",
       mcpPriorityEngine ?? "",
       gameStudioMcpFirstEligible ? "game-studio-mcp-first" : "",
       unityMcpFirstPhaseActive ? "unity-mcp-first" : "",
@@ -340,6 +344,7 @@ export function createSystemPromptApplier(input: {
         modelProtocolNotes: modelProtocolProfile.notes,
       },
       effectiveTurnContract,
+      goalTurnContract,
     );
     const currentMessages = callbacks.getMessages();
     if (currentMessages.length === 0) {

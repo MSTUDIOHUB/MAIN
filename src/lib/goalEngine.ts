@@ -36,6 +36,9 @@ import {
   createGoalIteration,
   createGoalProgress,
   isGoalTerminal,
+  migrateGoalDefinition,
+  type GoalRuntimeSnapshot,
+  type GoalTurnContract,
 } from "./goalState";
 import type { GoalBudget } from "./goalBudget";
 import {
@@ -44,15 +47,26 @@ import {
   shouldCreateCheckpoint,
 } from "./goalBudget";
 import {
-  buildGoalIterationSystemContext,
+  buildGoalTurnContract,
   detectGoalCompletionSignal,
   extractModifiedFilesFromToolCalls,
   extractTestCommandsFromToolCalls,
 } from "./goalContextStrategy";
 import {
   buildGoalProgressMarkdown,
-  resolveGoalProgressFilePath,
+  resolveGoalEvidenceFilePath,
+  resolveGoalRuntimeProgressFilePath,
+  resolveGoalRuntimeStateFilePath,
+  serializeGoalEvidenceJsonl,
+  serializeGoalRuntimeSnapshot,
 } from "./goalPersistence";
+import {
+  buildGoalBudgetOverrides,
+  buildGoalRuntimeSnapshot,
+  createGoalEvidenceEntries,
+  evaluateGoalCompletion,
+  type GoalToolObservation,
+} from "./goalRuntime";
 
 // ── Goal Engine callbacks ────────────────────────────────────────
 
@@ -64,6 +78,7 @@ export interface GoalEngineCallbacks {
   /** Run one iteration of the agent loop with given context */
   runAgentIteration: (input: {
     goalSystemContext: string;
+    goalTurnContract: GoalTurnContract;
     iteration: number;
     maxIterations: number;
   }) => Promise<GoalAgentIterationResult>;
@@ -75,6 +90,8 @@ export interface GoalEngineCallbacks {
   isAborted: () => boolean;
   /** Notify UI of progress update */
   onGoalProgressUpdate: (progress: GoalProgress, goal: GoalDefinition) => void;
+  /** Notify clients that the authoritative runtime snapshot changed. */
+  onGoalRuntimeUpdate?: (runtime: GoalRuntimeSnapshot) => void;
   /** Notify UI of iteration start */
   onGoalIterationStart: (iteration: GoalIteration) => void;
   /** Notify UI of iteration end */
@@ -93,15 +110,15 @@ export interface GoalAgentIterationResult {
   /** Final assistant text from this iteration */
   assistantText: string;
   /** Tool calls made during this iteration */
-  toolCalls: Array<{
+  toolCalls: Array<GoalToolObservation & {
     name: string;
-    target?: string;
-    arguments?: Record<string, unknown>;
   }>;
   /** Estimated tokens used in this iteration */
   tokensUsed: number;
   /** Whether the iteration completed normally */
   completed: boolean;
+  /** Exact inner-loop outcome; non-completed outcomes must not be auto-restarted. */
+  outcomeStatus?: "completed" | "paused" | "stopped_no_action" | "stopped_no_output" | "aborted" | "error";
   /** Error message if iteration failed */
   error?: string;
 }
@@ -114,16 +131,38 @@ export async function executeGoalLoop(input: {
   budgetOverrides?: Partial<GoalBudget>;
   existingProgress?: GoalProgress | null;
 }): Promise<GoalLoopOutcome> {
-  const { goal, callbacks, budgetOverrides, existingProgress } = input;
-  const budget = resolveGoalBudget(budgetOverrides);
+  const { callbacks, budgetOverrides, existingProgress } = input;
+  const goal = migrateGoalDefinition(input.goal);
+  const budget = resolveGoalBudget({
+    ...buildGoalBudgetOverrides(goal),
+    ...budgetOverrides,
+  });
   const language = callbacks.getPreferredLanguage();
   const workspacePath = callbacks.getWorkspacePath();
-  const progressFilePath = resolveGoalProgressFilePath(workspacePath);
+  const progressFilePath = resolveGoalRuntimeProgressFilePath(workspacePath, goal.id);
 
   // Initialize or restore progress
   const progress: GoalProgress = existingProgress
-    ? { ...existingProgress }
+    ? {
+        ...existingProgress,
+        iterations: [...(existingProgress.iterations || [])],
+        evidence: [...(existingProgress.evidence || [])],
+        milestones: [...(existingProgress.milestones || [])],
+        usage: existingProgress.usage ? { ...existingProgress.usage, activeStartedAt: Date.now() } : undefined,
+      }
     : createGoalProgress(goal.id, progressFilePath);
+
+  if (!progress.usage) {
+    progress.usage = {
+      modelIterations: 0,
+      toolCalls: 0,
+      totalTokensUsed: progress.totalTokensUsed || 0,
+      activeDurationMs: 0,
+      activeStartedAt: Date.now(),
+      estimatedTokens: progress.estimatedTokens === true,
+    };
+  }
+  progress.progressFile = progressFilePath;
 
   let lastCheckpoint: GoalCheckpoint | null = progress.lastCheckpoint;
   let lastVerificationResult = null;
@@ -142,7 +181,17 @@ export async function executeGoalLoop(input: {
     // Check abort
     if (callbacks.isAborted()) {
       goal.status = "paused";
-      return buildOutcome("paused", "User aborted the goal", progress, lastCheckpoint);
+      progress.pauseReason = "User paused the goal";
+      if (progress.usage?.activeStartedAt) {
+        progress.usage.activeDurationMs += Math.max(0, Date.now() - progress.usage.activeStartedAt);
+        progress.usage.activeStartedAt = null;
+      }
+      await persistProgress(callbacks, goal, progress, language);
+      callbacks.onGoalProgressUpdate(progress, goal);
+      emitRuntimeUpdate(callbacks, goal, progress, "re_plan", progress.pauseReason);
+      const outcome = buildOutcome("paused", progress.pauseReason, progress, lastCheckpoint);
+      callbacks.onGoalOutcome(outcome);
+      return outcome;
     }
 
     // Check budget
@@ -160,16 +209,31 @@ export async function executeGoalLoop(input: {
         const shouldContinue = await callbacks.onGoalUserConfirmNeeded(budgetCheck.message);
         if (!shouldContinue) {
           goal.status = "paused";
-          return buildOutcome("paused", budgetCheck.message, progress, lastCheckpoint);
+          progress.pauseReason = budgetCheck.message;
+          await persistProgress(callbacks, goal, progress, language);
+          callbacks.onGoalProgressUpdate(progress, goal);
+          emitRuntimeUpdate(callbacks, goal, progress, "re_plan", budgetCheck.message);
+          const outcome = buildOutcome("paused", budgetCheck.message, progress, lastCheckpoint);
+          callbacks.onGoalOutcome(outcome);
+          return outcome;
         }
         // User confirmed — continue
+        progress.lastUserConfirmedIteration = progress.totalIterationsUsed;
       } else if (budgetCheck.reason === "no_progress") {
         goal.status = "paused";
-        callbacks.onGoalOutcome(buildOutcome("paused", budgetCheck.message, progress, lastCheckpoint));
-        return buildOutcome("paused", budgetCheck.message, progress, lastCheckpoint);
+        progress.pauseReason = budgetCheck.message;
+        await persistProgress(callbacks, goal, progress, language);
+        callbacks.onGoalProgressUpdate(progress, goal);
+        emitRuntimeUpdate(callbacks, goal, progress, "re_plan", budgetCheck.message);
+        const outcome = buildOutcome("paused", budgetCheck.message, progress, lastCheckpoint);
+        callbacks.onGoalOutcome(outcome);
+        return outcome;
       } else {
         goal.status = "budget_exceeded";
         const outcome = buildOutcome("budget_exceeded", budgetCheck.message, progress, lastCheckpoint);
+        await persistProgress(callbacks, goal, progress, language);
+        callbacks.onGoalProgressUpdate(progress, goal);
+        emitRuntimeUpdate(callbacks, goal, progress, null, budgetCheck.message);
         callbacks.onGoalOutcome(outcome);
         return outcome;
       }
@@ -191,7 +255,7 @@ export async function executeGoalLoop(input: {
     });
 
     // ── Build context for this iteration ──
-    const systemContext = buildGoalIterationSystemContext({
+    const goalTurnContract = buildGoalTurnContract({
       goal,
       checkpoint: lastCheckpoint,
       latestVerification: lastVerificationResult,
@@ -203,7 +267,8 @@ export async function executeGoalLoop(input: {
     let agentResult: GoalAgentIterationResult;
     try {
       agentResult = await callbacks.runAgentIteration({
-        goalSystemContext: systemContext,
+        goalSystemContext: goalTurnContract.context,
+        goalTurnContract,
         iteration: progress.currentIteration,
         maxIterations: budget.maxIterations,
       });
@@ -230,13 +295,19 @@ export async function executeGoalLoop(input: {
           progress,
           lastCheckpoint,
         );
+        await persistProgress(callbacks, goal, progress, language);
+        callbacks.onGoalProgressUpdate(progress, goal);
+        emitRuntimeUpdate(callbacks, goal, progress, "execute", outcome.reason);
         callbacks.onGoalOutcome(outcome);
         return outcome;
       }
+      await persistProgress(callbacks, goal, progress, language);
+      callbacks.onGoalProgressUpdate(progress, goal);
+      emitRuntimeUpdate(callbacks, goal, progress, "execute", errorMsg);
       continue;
     }
 
-    // ── Extract evidence from the iteration ──
+    // ── Extract observable evidence from tool results, not model claims ──
     iteration.phase = "observe";
     iteration.toolCallCount = agentResult.toolCalls.length;
     iteration.filesModified = extractModifiedFilesFromToolCalls(agentResult.toolCalls);
@@ -244,59 +315,122 @@ export async function executeGoalLoop(input: {
     iteration.summary = extractIterationSummary(agentResult.assistantText, language);
     iteration.endedAt = Date.now();
 
-    progress.totalTokensUsed += agentResult.tokensUsed;
+    const iterationEvidence = createGoalEvidenceEntries({
+      goal,
+      iteration: iteration.index,
+      observations: agentResult.toolCalls,
+    });
+    progress.evidence = [...(progress.evidence || []), ...iterationEvidence];
+    const testEvidence = iterationEvidence.filter((entry) => entry.kind === "test" || entry.kind === "build");
+    iteration.testsPassed = testEvidence.length > 0
+      ? testEvidence.every((entry) => entry.status === "passed")
+      : null;
+
+    const tokensUsed = Math.max(0, Math.floor(agentResult.tokensUsed || 0));
+    progress.totalTokensUsed += tokensUsed;
+    progress.estimatedTokens = true;
     progress.lastUpdatedAt = Date.now();
+    progress.usage = {
+      ...(progress.usage || {
+        modelIterations: 0,
+        toolCalls: 0,
+        totalTokensUsed: 0,
+        activeDurationMs: 0,
+        activeStartedAt: Date.now(),
+        estimatedTokens: true,
+      }),
+      modelIterations: (progress.usage?.modelIterations || 0) + 1,
+      toolCalls: (progress.usage?.toolCalls || 0) + agentResult.toolCalls.length,
+      totalTokensUsed: progress.totalTokensUsed,
+      estimatedTokens: true,
+    };
 
-    // Track no-progress
-    if (iteration.filesModified.length === 0 && iteration.testsRun.length === 0) {
-      consecutiveNoProgressCount += 1;
-    } else {
-      consecutiveNoProgressCount = 0;
-    }
+    if (iterationEvidence.length === 0) consecutiveNoProgressCount += 1;
+    else consecutiveNoProgressCount = 0;
 
-    // ── Check for goal completion signal ──
     const completionSignal = detectGoalCompletionSignal(agentResult.assistantText);
-    if (completionSignal.completed) {
-      goal.status = "completed";
-      lastCheckpoint = createGoalCheckpoint({
-        iteration: iteration.index,
-        completedTasks: extractCompletedTasks(progress),
-        remainingTasks: [],
-        currentPhase: "observe",
-        contextSummary: iteration.summary,
-        workspaceSnapshot: extractAllModifiedFiles(progress),
-      });
-      progress.lastCheckpoint = lastCheckpoint;
-
-      // Persist final progress
-      await persistProgress(callbacks, goal, progress, language);
-
-      const outcome = buildOutcome("completed", "Goal objective met", progress, lastCheckpoint);
-      callbacks.onGoalIterationEnd(iteration);
-      callbacks.onGoalOutcome(outcome);
-      return outcome;
-    }
-
     if (completionSignal.blocked) {
       iteration.unresolvedBlockers.push(completionSignal.blockerReason || "Unknown blocker");
     }
 
-    callbacks.onGoalIterationEnd(iteration);
-
-    // ── Create checkpoint if due ──
-    if (shouldCreateCheckpoint(iteration.index, budget)) {
-      lastCheckpoint = createGoalCheckpoint({
-        iteration: iteration.index,
-        completedTasks: extractCompletedTasks(progress),
+    // Inner-loop pauses and errors are terminal for this Goal slice. The outer
+    // runtime must not silently restart them as a new autonomous iteration.
+    if (agentResult.outcomeStatus && agentResult.outcomeStatus !== "completed") {
+      const innerReason = agentResult.error || `Agent loop ended with ${agentResult.outcomeStatus}`;
+      if (agentResult.outcomeStatus === "error") {
+        iteration.unresolvedBlockers.push(innerReason);
+      }
+      goal.status = "paused";
+      progress.pauseReason = innerReason;
+      lastCheckpoint = createCheckpointFromRuntime({
+        goal,
+        progress,
+        iteration,
         remainingTasks: extractRemainingTasks(agentResult.assistantText, language),
-        currentPhase: "re_plan",
-        contextSummary: buildCheckpointSummary(progress, language),
-        workspaceSnapshot: extractAllModifiedFiles(progress),
-        lastVerificationSummary: iteration.testsPassed !== null
-          ? (iteration.testsPassed ? "Tests passed" : "Tests failed")
-          : undefined,
+        language,
       });
       progress.lastCheckpoint = lastCheckpoint;
+      callbacks.onGoalCheckpointSaved(lastCheckpoint);
+      callbacks.onGoalIterationEnd(iteration);
+      await persistProgress(callbacks, goal, progress, language);
+      callbacks.onGoalProgressUpdate(progress, goal);
+      emitRuntimeUpdate(callbacks, goal, progress, "re_plan", innerReason);
+      const outcome = buildOutcome("paused", innerReason, progress, lastCheckpoint);
+      callbacks.onGoalOutcome(outcome);
+      return outcome;
+    }
+
+    const completionGate = evaluateGoalCompletion({
+      goal,
+      evidence: progress.evidence || [],
+      completionCandidate: completionSignal.completed,
+      unresolvedBlockers: iteration.unresolvedBlockers,
+    });
+    if (completionSignal.completed && !completionGate.passed) {
+      callbacks.onDebugEvent?.("goal_completion_rejected", {
+        iteration: iteration.index,
+        reasons: completionGate.reasons,
+        evidenceCount: progress.evidence?.length || 0,
+      });
+    }
+
+    if (completionGate.passed) {
+      goal.criteria = completionGate.criteria;
+      goal.status = "completed";
+      goal.updatedAt = Date.now();
+      lastCheckpoint = createCheckpointFromRuntime({
+        goal,
+        progress,
+        iteration,
+        remainingTasks: [],
+        language,
+      });
+      progress.lastCheckpoint = lastCheckpoint;
+      callbacks.onGoalIterationEnd(iteration);
+      callbacks.onGoalCheckpointSaved(lastCheckpoint);
+      await persistProgress(callbacks, goal, progress, language);
+      callbacks.onGoalProgressUpdate(progress, goal);
+      emitRuntimeUpdate(callbacks, goal, progress, "observe");
+      const outcome = buildOutcome("completed", "Goal completion evidence gate passed", progress, lastCheckpoint);
+      callbacks.onGoalOutcome(outcome);
+      return outcome;
+    }
+
+    callbacks.onGoalIterationEnd(iteration);
+
+    // Keep a lightweight continuation checkpoint after every bounded slice so
+    // the next fresh context never loses the most recent work. Checkpoint
+    // events remain interval-based to avoid noisy UI/runtime telemetry.
+    lastCheckpoint = createCheckpointFromRuntime({
+      goal,
+      progress,
+      iteration: { ...iteration, phase: "re_plan" },
+      remainingTasks: extractRemainingTasks(agentResult.assistantText, language),
+      language,
+    });
+    progress.lastCheckpoint = lastCheckpoint;
+
+    if (shouldCreateCheckpoint(iteration.index, budget)) {
       callbacks.onGoalCheckpointSaved(lastCheckpoint);
 
       callbacks.onDebugEvent?.("goal_checkpoint_saved", {
@@ -311,6 +445,7 @@ export async function executeGoalLoop(input: {
 
     // ── Notify UI ──
     callbacks.onGoalProgressUpdate(progress, goal);
+    emitRuntimeUpdate(callbacks, goal, progress, "re_plan");
   }
 
   // Should not normally reach here
@@ -318,6 +453,43 @@ export async function executeGoalLoop(input: {
 }
 
 // ── Helper functions ─────────────────────────────────────────────
+
+function createCheckpointFromRuntime(input: {
+  goal: GoalDefinition;
+  progress: GoalProgress;
+  iteration: GoalIteration;
+  remainingTasks: string[];
+  language: "zh" | "en";
+}): GoalCheckpoint {
+  return createGoalCheckpoint({
+    iteration: input.iteration.index,
+    completedTasks: extractCompletedTasks(input.progress),
+    remainingTasks: input.remainingTasks,
+    currentPhase: input.iteration.phase,
+    contextSummary: buildCheckpointSummary(input.progress, input.language),
+    workspaceSnapshot: extractAllModifiedFiles(input.progress),
+    lastVerificationSummary: input.iteration.testsPassed === null
+      ? undefined
+      : input.iteration.testsPassed ? "Tests passed" : "Tests failed",
+    goalRevision: input.goal.revision,
+    evidenceCursor: input.progress.evidence?.length || 0,
+  });
+}
+
+function emitRuntimeUpdate(
+  callbacks: GoalEngineCallbacks,
+  goal: GoalDefinition,
+  progress: GoalProgress,
+  phase: GoalIteration["phase"] | null,
+  pauseReason?: string,
+): void {
+  callbacks.onGoalRuntimeUpdate?.(buildGoalRuntimeSnapshot({
+    goal,
+    progress,
+    phase,
+    pauseReason,
+  }));
+}
 
 function buildOutcome(
   status: GoalLoopOutcome["status"],
@@ -340,8 +512,27 @@ async function persistProgress(
   language: "zh" | "en",
 ): Promise<void> {
   try {
+    if (goal.status !== "active" && progress.usage?.activeStartedAt) {
+      progress.usage.activeDurationMs += Math.max(0, Date.now() - progress.usage.activeStartedAt);
+      progress.usage.activeStartedAt = null;
+    }
     const markdown = buildGoalProgressMarkdown({ goal, progress, language });
     await callbacks.writeFile(progress.progressFile, markdown);
+    const runtimeSnapshot = buildGoalRuntimeSnapshot({
+      goal,
+      progress,
+      phase: progress.iterations[progress.iterations.length - 1]?.phase || null,
+      pauseReason: progress.pauseReason,
+    });
+    const workspacePath = callbacks.getWorkspacePath();
+    await callbacks.writeFile(
+      resolveGoalRuntimeStateFilePath(workspacePath, goal.id),
+      serializeGoalRuntimeSnapshot(runtimeSnapshot),
+    );
+    await callbacks.writeFile(
+      resolveGoalEvidenceFilePath(workspacePath, goal.id),
+      serializeGoalEvidenceJsonl(progress),
+    );
   } catch (err) {
     callbacks.onDebugEvent?.("goal_persist_error", {
       error: err instanceof Error ? err.message : String(err),
@@ -370,7 +561,10 @@ function extractIterationSummary(assistantText: string, _language: "zh" | "en"):
 function extractCompletedTasks(progress: GoalProgress): string[] {
   const tasks: string[] = [];
   for (const iter of progress.iterations) {
-    if (iter.summary && iter.endedAt) {
+    const hasSuccessfulEvidence = (progress.evidence || []).some(
+      (entry) => entry.iteration === iter.index && entry.status !== "failed" && entry.kind !== "blocker" && entry.kind !== "read",
+    );
+    if (iter.summary && iter.endedAt && hasSuccessfulEvidence && iter.unresolvedBlockers.length === 0) {
       tasks.push(`[Iteration ${iter.index}] ${iter.summary}`);
     }
   }

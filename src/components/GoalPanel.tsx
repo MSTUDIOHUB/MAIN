@@ -1,161 +1,332 @@
-import { IconCheck, IconPlay, IconStop, IconClose } from "./Icons";
-import type { GoalDefinition, GoalProgress } from "../lib/goalState";
+import { useEffect, useMemo, useState } from "react";
+import {
+  IconCheck,
+  IconChevronDown,
+  IconClose,
+  IconEdit,
+  IconGoal,
+  IconPause,
+  IconPlay,
+  IconTrash,
+} from "./Icons";
+import {
+  buildGoalProgressPercentage,
+  buildGoalStatusLabel,
+  normalizeGoalCriteria,
+  type GoalDefinition,
+  type GoalProgress,
+  type GoalRuntimeSnapshot,
+  type GoalStatus,
+} from "../lib/goalState";
 
 interface GoalPanelProps {
   goal: GoalDefinition;
   progress: GoalProgress | null;
-  status: string;
+  status: GoalStatus;
+  runtime?: GoalRuntimeSnapshot | null;
   language: "zh" | "en";
   themeMode: "light" | "dark" | "black";
   onPause: () => void;
   onResume: () => void;
+  onEdit: (objective: string) => boolean;
   onStop: () => void;
+  onClose?: () => void;
+}
+
+const PHASE_LABELS = {
+  plan: { zh: "规划下一步", en: "Planning" },
+  execute: { zh: "执行中", en: "Executing" },
+  observe: { zh: "收集证据", en: "Observing" },
+  re_plan: { zh: "重新规划", en: "Re-planning" },
+} as const;
+
+function formatDuration(ms: number, language: "zh" | "en"): string {
+  const totalMinutes = Math.max(0, Math.floor(ms / 60_000));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  if (language === "zh") return hours > 0 ? `${hours} 小时 ${minutes} 分钟` : `${minutes} 分钟`;
+  return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+function statusTone(status: GoalStatus): string {
+  if (status === "completed") return "goal-status-completed";
+  if (status === "failed" || status === "cancelled") return "goal-status-failed";
+  if (status === "paused" || status === "pausing" || status === "budget_exceeded" || status === "awaiting_input") {
+    return "goal-status-paused";
+  }
+  return "goal-status-active";
 }
 
 export default function GoalPanel({
   goal,
   progress,
   status,
+  runtime,
   language,
-  themeMode,
   onPause,
   onResume,
+  onEdit,
   onStop,
+  onClose,
 }: GoalPanelProps) {
-  const isLightTheme = themeMode === "light";
-  const isBlackTheme = themeMode === "black";
+  const [now, setNow] = useState(Date.now());
+  const [editing, setEditing] = useState(false);
+  const [pendingEdit, setPendingEdit] = useState(false);
+  const [draft, setDraft] = useState(goal.rawText || goal.objective);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const resolvedProgress = runtime?.progress || progress;
+  const resolvedGoal = runtime?.goal || goal;
+  const criteria = useMemo(() => normalizeGoalCriteria(resolvedGoal), [resolvedGoal]);
 
-  const iterations = progress?.iterations || [];
+  useEffect(() => {
+    setDraft(resolvedGoal.rawText || resolvedGoal.objective);
+    setEditing(false);
+    setPendingEdit(false);
+    setConfirmClear(false);
+  }, [resolvedGoal.id, resolvedGoal.revision]);
 
-  const bgColor = isLightTheme ? "bg-[#ffffff]" : isBlackTheme ? "bg-[#000000]" : "bg-[#111112]";
-  const textColor = isLightTheme ? "text-[#18181b]" : "text-[#d4d4d8]";
-  const mutedTextColor = isLightTheme ? "text-[#71717a]" : "text-[#a1a1aa]";
-  const borderColor = isLightTheme ? "border-[#e4e4e7]" : "border-[#27272a]";
-  const headerBgColor = isLightTheme ? "bg-[#f4f4f5]" : "bg-[#18181b]";
+  useEffect(() => {
+    if (!pendingEdit || status !== "paused") return;
+    setPendingEdit(false);
+    setEditing(true);
+  }, [pendingEdit, status]);
+
+  useEffect(() => {
+    if (status !== "active" && status !== "pausing") return;
+    const timer = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(timer);
+  }, [status]);
+
+  const activeDurationMs = resolvedProgress?.usage
+    ? resolvedProgress.usage.activeDurationMs + (
+        resolvedProgress.usage.activeStartedAt ? Math.max(0, now - resolvedProgress.usage.activeStartedAt) : 0
+      )
+    : Math.max(0, now - resolvedGoal.createdAt);
+  const progressPercentage = resolvedProgress
+    ? buildGoalProgressPercentage(resolvedProgress, resolvedGoal)
+    : 0;
+  const evidence = resolvedProgress?.evidence || [];
+  const latestVerification = [...evidence].reverse().find((entry) =>
+    entry.kind === "test" || entry.kind === "build" || entry.kind === "browser" || entry.kind === "user_validation"
+  );
+  const currentMilestone = resolvedProgress?.milestones?.find((item) => item.id === resolvedProgress.currentMilestoneId)
+    || resolvedProgress?.milestones?.find((item) => item.status === "in_progress")
+    || null;
+  const recentIterations = (resolvedProgress?.iterations || []).slice(-5).reverse();
+  const blockers = recentIterations.flatMap((iteration) => iteration.unresolvedBlockers).filter(Boolean).slice(0, 5);
+  const modifiedFiles = Array.from(new Set(
+    (resolvedProgress?.iterations || []).flatMap((iteration) => iteration.filesModified),
+  )).slice(0, 12);
+  const phase = runtime?.phase || recentIterations[0]?.phase || "plan";
+  const phaseLabel = PHASE_LABELS[phase][language];
+  const canResume = status === "paused" || status === "awaiting_input";
+  const canEdit = status === "active" || status === "paused" || status === "awaiting_input";
+
+  const beginEdit = () => {
+    if (status === "active") {
+      setPendingEdit(true);
+      onPause();
+      return;
+    }
+    if (status === "paused" || status === "awaiting_input") setEditing(true);
+  };
+
+  const saveEdit = () => {
+    const next = draft.trim();
+    if (!next) return;
+    if (onEdit(next)) setEditing(false);
+  };
 
   return (
-    <div className={`flex h-full flex-col ${bgColor} ${textColor}`}>
-      {/* Header */}
-      <div className={`shrink-0 border-b p-4 ${borderColor} ${headerBgColor}`}>
-        <div className="flex items-center justify-between mb-2">
-          <h2 className="text-sm font-semibold truncate" title={goal.objective}>
-            {goal.objective}
-          </h2>
-          <span className={`shrink-0 rounded-full px-2 py-0.5 text-xs font-medium border ${
-            status === "active" ? "bg-green-100 text-green-700 border-green-200" :
-            status === "paused" ? "bg-yellow-100 text-yellow-700 border-yellow-200" :
-            status === "completed" ? "bg-blue-100 text-blue-700 border-blue-200" :
-            "bg-red-100 text-red-700 border-red-200"
-          }`}>
-            {status.toUpperCase()}
+    <section
+      className="goal-popover"
+      role="dialog"
+      aria-modal="false"
+      aria-labelledby="goal-popover-title"
+      data-goal-status={status}
+      data-testid="goal-popover-panel"
+    >
+      <header className="goal-popover-header">
+        <div className="goal-popover-heading">
+          <span className={`goal-popover-icon ${statusTone(status)}`} aria-hidden="true">
+            <IconGoal className="h-4 w-4" />
           </span>
-        </div>
-
-        {/* Stats */}
-        <div className={`grid grid-cols-2 gap-4 text-xs mt-3 ${mutedTextColor}`}>
-          <div>
-            <div className="mb-1">{language === "zh" ? "迭代次数" : "Iterations"}</div>
-            <div className="font-mono text-sm font-medium">
-              {progress?.currentIteration || 0} / {goal.iterationBudget}
+          <div className="min-w-0">
+            <div id="goal-popover-title" className="goal-popover-eyebrow">
+              {language === "zh" ? "持续目标" : "Persistent Goal"}
             </div>
-          </div>
-          <div>
-            <div className="mb-1">{language === "zh" ? "Token 使用" : "Tokens Used"}</div>
-            <div className="font-mono text-sm font-medium">
-              {progress?.totalTokensUsed?.toLocaleString() || 0}
+            <div className={`goal-status-label ${statusTone(status)}`}>
+              {buildGoalStatusLabel(status, language)}
             </div>
           </div>
         </div>
-
-        {/* Controls */}
-        <div className="flex items-center gap-2 mt-4">
-          {status === "active" ? (
-            <button
-              onClick={onPause}
-              className="flex items-center justify-center gap-1.5 flex-1 py-1.5 rounded-md border border-yellow-500/50 bg-yellow-500/10 text-yellow-600 text-xs font-semibold hover:bg-yellow-500/20 transition-colors"
-            >
-              <IconStop className="mr-1.5 h-4 w-4" />
-              {language === "zh" ? "暂停" : "Pause"}
-            </button>
-          ) : (
-            <button
-              onClick={onResume}
-              disabled={status === "completed" || status === "failed"}
-              className="flex items-center justify-center gap-1.5 flex-1 py-1.5 rounded-md border border-green-500/50 bg-green-500/10 text-green-600 text-xs font-semibold hover:bg-green-500/20 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              <IconPlay className="w-3.5 h-3.5" />
-              {language === "zh" ? "继续" : "Resume"}
-            </button>
-          )}
-          <button
-            onClick={onStop}
-            className="flex items-center justify-center gap-1.5 flex-1 py-1.5 rounded-md border border-red-500/50 bg-red-500/10 text-red-600 text-xs font-semibold hover:bg-red-500/20 transition-colors"
-          >
-            <IconStop className="w-3.5 h-3.5" />
-            {language === "zh" ? "停止" : "Stop"}
+        {onClose && (
+          <button type="button" className="goal-icon-button" onClick={onClose} title={language === "zh" ? "关闭" : "Close"}>
+            <IconClose className="h-4 w-4" />
           </button>
-        </div>
-      </div>
+        )}
+      </header>
 
-      {/* Iterations Log */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        <h3 className={`text-xs font-bold uppercase tracking-wider ${mutedTextColor}`}>
-          {language === "zh" ? "执行日志" : "Execution Log"}
-        </h3>
-        
-        {iterations.length === 0 ? (
-          <div className={`text-xs text-center py-8 ${mutedTextColor}`}>
-            {language === "zh" ? "暂无迭代记录" : "No iterations yet"}
+      <div className="goal-popover-content">
+        {editing ? (
+          <div className="goal-edit-region">
+            <label htmlFor="goal-objective-editor" className="goal-section-label">
+              {language === "zh" ? "编辑目标" : "Edit goal"}
+            </label>
+            <textarea
+              id="goal-objective-editor"
+              data-testid="goal-objective-editor"
+              value={draft}
+              onChange={(event) => setDraft(event.target.value)}
+              rows={5}
+              className="goal-objective-editor"
+              autoFocus
+            />
+            <p className="goal-help-text">
+              {language === "zh"
+                ? "保存后会重新生成完成标准并使旧版本验证证据失效；目标保持暂停。"
+                : "Saving regenerates completion criteria and invalidates prior-revision verification. The goal remains paused."}
+            </p>
+            <div className="goal-inline-actions">
+              <button type="button" className="goal-action-button goal-action-primary" onClick={saveEdit} disabled={!draft.trim()}>
+                <IconCheck className="h-3.5 w-3.5" />
+                {language === "zh" ? "保存目标" : "Save goal"}
+              </button>
+              <button type="button" className="goal-action-button" onClick={() => { setDraft(resolvedGoal.rawText || resolvedGoal.objective); setEditing(false); }}>
+                {language === "zh" ? "取消" : "Cancel"}
+              </button>
+            </div>
           </div>
         ) : (
-          <div className="space-y-4">
-            {[...iterations].reverse().map((iter) => (
-              <div key={iter.index} className={`rounded-lg border p-3 ${borderColor} ${isLightTheme ? "bg-[#fafafa]" : "bg-[#18181b]"}`}>
-                <div className="flex items-center justify-between mb-2">
-                  <span className="text-xs font-bold text-blue-500">
-                    Iteration #{iter.index}
-                  </span>
-                  <span className={`text-[10px] uppercase font-bold tracking-wider px-1.5 py-0.5 rounded bg-black/10 dark:bg-white/10 ${mutedTextColor}`}>
-                    {iter.phase}
-                  </span>
-                </div>
-                
-                {iter.summary && (
-                  <p className="text-xs leading-relaxed mb-3 whitespace-pre-wrap">
-                    {iter.summary}
-                  </p>
-                )}
+          <>
+            <div className="goal-objective-row">
+              <p className="goal-objective" title={resolvedGoal.rawText || resolvedGoal.objective}>
+                {resolvedGoal.rawText || resolvedGoal.objective}
+              </p>
+              {canEdit && (
+                <button
+                  type="button"
+                  className="goal-icon-button"
+                  onClick={beginEdit}
+                  disabled={pendingEdit}
+                  title={language === "zh" ? "编辑目标" : "Edit goal"}
+                  data-testid="goal-edit-button"
+                >
+                  <IconEdit className="h-4 w-4" />
+                </button>
+              )}
+            </div>
 
-                {(iter.filesModified.length > 0 || iter.testsRun.length > 0) && (
-                  <div className={`text-[11px] mt-2 pt-2 border-t space-y-2 ${borderColor} ${mutedTextColor}`}>
-                    {iter.filesModified.length > 0 && (
-                      <div>
-                        <span className="font-medium mr-1">{language === "zh" ? "修改了:" : "Modified:"}</span>
-                        {iter.filesModified.length} {language === "zh" ? "个文件" : "files"}
-                      </div>
-                    )}
-                    {iter.testsRun.length > 0 && (
-                      <div className="flex items-start gap-1">
-                        <span className="font-medium shrink-0">{language === "zh" ? "验证:" : "Verified:"}</span>
-                        <div className="break-all font-mono">
-                          {iter.testsRun.map(cmd => (
-                            <div key={cmd} className="truncate" title={cmd}>{cmd}</div>
-                          ))}
-                        </div>
-                        {iter.testsPassed !== null && (
-                          <span className={`ml-auto shrink-0 ${iter.testsPassed ? "text-green-500" : "text-red-500"}`}>
-                            {iter.testsPassed ? <IconCheck className="w-3.5 h-3.5" /> : <IconClose className="w-3.5 h-3.5" />}
-                          </span>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )}
+            <div className="goal-summary-grid">
+              <div><span>{language === "zh" ? "当前阶段" : "Phase"}</span><strong>{phaseLabel}</strong></div>
+              <div><span>{language === "zh" ? "完成进度" : "Progress"}</span><strong>{progressPercentage}%</strong></div>
+              <div><span>{language === "zh" ? "有效运行" : "Active time"}</span><strong>{formatDuration(activeDurationMs, language)}</strong></div>
+              <div><span>{language === "zh" ? "执行切片" : "Slices"}</span><strong>{resolvedProgress?.totalIterationsUsed || 0}/{resolvedGoal.iterationBudget}</strong></div>
+            </div>
+
+            {currentMilestone && (
+              <div className="goal-current-milestone">
+                <span className="goal-section-label">{language === "zh" ? "当前里程碑" : "Current milestone"}</span>
+                <p>{currentMilestone.text}</p>
               </div>
-            ))}
-          </div>
+            )}
+
+            <div className="goal-section">
+              <div className="goal-section-title">
+                <span>{language === "zh" ? "完成标准" : "Definition of done"}</span>
+                <span>{criteria.filter((item) => item.status === "satisfied").length}/{criteria.length}</span>
+              </div>
+              <div className="goal-criteria-list">
+                {criteria.map((criterion) => (
+                  <div key={criterion.id} className="goal-criterion-row" data-status={criterion.status}>
+                    <span className="goal-criterion-marker">
+                      {criterion.status === "satisfied" ? <IconCheck className="h-3 w-3" /> : null}
+                    </span>
+                    <span>{criterion.text}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            <div className="goal-verification-row">
+              <span className="goal-section-label">{language === "zh" ? "最近验证" : "Latest verification"}</span>
+              {latestVerification ? (
+                <span className={latestVerification.status === "failed" ? "goal-verification-failed" : "goal-verification-passed"}>
+                  {latestVerification.status === "failed" ? (language === "zh" ? "失败" : "Failed") : (language === "zh" ? "通过" : "Passed")}
+                  {latestVerification.target ? ` · ${latestVerification.target}` : ""}
+                </span>
+              ) : (
+                <span className="goal-muted">{language === "zh" ? "尚无验证证据" : "No verification evidence yet"}</span>
+              )}
+            </div>
+
+            {(runtime?.pauseReason || resolvedProgress?.pauseReason) && (
+              <div className="goal-notice" data-tone={status === "failed" ? "danger" : "warning"}>
+                {runtime?.pauseReason || resolvedProgress?.pauseReason}
+              </div>
+            )}
+
+            <details className="goal-details">
+              <summary>
+                <span>{language === "zh" ? "运行详情" : "Run details"}</span>
+                <IconChevronDown className="h-4 w-4" />
+              </summary>
+              <dl className="goal-detail-list">
+                <div><dt>{language === "zh" ? "证据" : "Evidence"}</dt><dd>{evidence.length}</dd></div>
+                <div><dt>Token</dt><dd>{resolvedProgress?.totalTokensUsed?.toLocaleString() || 0}{resolvedProgress?.estimatedTokens ? " ~" : ""}</dd></div>
+                <div><dt>{language === "zh" ? "检查点" : "Checkpoint"}</dt><dd>{resolvedProgress?.lastCheckpoint?.iteration || "-"}</dd></div>
+                <div><dt>{language === "zh" ? "修改文件" : "Modified files"}</dt><dd>{modifiedFiles.length}</dd></div>
+              </dl>
+              {blockers.length > 0 && (
+                <div className="goal-detail-section">
+                  <span className="goal-section-label">{language === "zh" ? "阻塞" : "Blockers"}</span>
+                  {blockers.map((blocker, index) => <p key={`${blocker}-${index}`}>{blocker}</p>)}
+                </div>
+              )}
+              {recentIterations.length > 0 && (
+                <div className="goal-detail-section">
+                  <span className="goal-section-label">{language === "zh" ? "最近切片" : "Recent slices"}</span>
+                  {recentIterations.map((iteration) => (
+                    <p key={iteration.index}><strong>#{iteration.index}</strong> {iteration.summary || (language === "zh" ? "无摘要" : "No summary")}</p>
+                  ))}
+                </div>
+              )}
+            </details>
+          </>
         )}
       </div>
-    </div>
+
+      {!editing && (
+        <footer className="goal-popover-actions">
+          {status === "active" || status === "pausing" ? (
+            <button type="button" className="goal-action-button goal-action-primary" onClick={onPause} disabled={status === "pausing"} data-testid="goal-pause-button">
+              <IconPause className="h-3.5 w-3.5" />
+              {status === "pausing" ? (language === "zh" ? "正在暂停" : "Pausing") : (language === "zh" ? "暂停" : "Pause")}
+            </button>
+          ) : canResume ? (
+            <button type="button" className="goal-action-button goal-action-primary" onClick={onResume} data-testid="goal-resume-button">
+              <IconPlay className="h-3.5 w-3.5" />
+              {language === "zh" ? "继续" : "Resume"}
+            </button>
+          ) : null}
+
+          {confirmClear ? (
+            <div className="goal-clear-confirm" data-testid="goal-clear-confirm">
+              <p>{language === "zh" ? "只清除目标跟踪，不会回滚文件修改。" : "This clears goal tracking and does not revert file changes."}</p>
+              <button type="button" className="goal-action-button goal-action-danger" onClick={onStop}>
+                <IconTrash className="h-3.5 w-3.5" />
+                {language === "zh" ? "确认清除" : "Clear goal"}
+              </button>
+              <button type="button" className="goal-action-button" onClick={() => setConfirmClear(false)}>{language === "zh" ? "取消" : "Cancel"}</button>
+            </div>
+          ) : (
+            <button type="button" className="goal-action-button goal-action-danger-muted" onClick={() => setConfirmClear(true)} data-testid="goal-clear-button">
+              <IconTrash className="h-3.5 w-3.5" />
+              {language === "zh" ? "清除" : "Clear"}
+            </button>
+          )}
+        </footer>
+      )}
+    </section>
   );
 }

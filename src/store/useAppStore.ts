@@ -184,9 +184,16 @@ import {
   resolveSubmitRuntimeDecision,
   resolveSubmitSemanticMetadataDecision,
 } from "../lib/submit/turnSubmission";
-import { createGoalDefinition } from "../lib/goalState";
-import type { GoalDefinition, GoalProgress, GoalStatus } from "../lib/goalState";
+import {
+  createGoalDefinition,
+  createGoalProgress,
+  migrateGoalDefinition,
+  updateGoalDefinitionText,
+} from "../lib/goalState";
+import type { GoalDefinition, GoalProgress, GoalRuntimeSnapshot, GoalStatus } from "../lib/goalState";
 import type { GoalBudget } from "../lib/goalBudget";
+import { buildGoalRuntimeSnapshot, normalizeGoalRuntimeSnapshot, restoreGoalRuntimeSnapshot } from "../lib/goalRuntime";
+import { resolveGoalRuntimeProgressFilePath } from "../lib/goalPersistence";
 import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
@@ -777,6 +784,7 @@ export interface SessionRuntimeSnapshot {
   goalProgress?: GoalProgress | null;
   goalStatus?: GoalStatus;
   goalIterationBudget?: number;
+  goalRuntime?: GoalRuntimeSnapshot | null;
 }
 
 export interface SessionRuntimeState extends SessionRuntimeSnapshot {
@@ -1158,11 +1166,14 @@ export interface AppState {
   goalProgress: GoalProgress | null;
   goalStatus: GoalStatus;
   goalIterationBudget: number;
+  goalRuntime: GoalRuntimeSnapshot | null;
   startGoal: (objective: string, options?: Partial<GoalBudget> & { sessionKey?: string }) => void;
   pauseGoal: () => void;
   resumeGoal: () => void;
   clearGoal: () => void;
+  updateGoalText: (objective: string) => boolean;
   updateGoalProgress: (progress: GoalProgress) => void;
+  updateGoalRuntime: (runtime: GoalRuntimeSnapshot) => void;
 
   // Elapsed time tracking
   elapsedTime: number;
@@ -1536,6 +1547,11 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "harness.telemetry",
     "progress.updated",
     "plan.ready",
+    "goal.started",
+    "goal.state_changed",
+    "goal.checkpoint_saved",
+    "goal.completed",
+    "goal.cleared",
     "approval.requested",
     "run.paused",
     "run.completed",
@@ -1563,6 +1579,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
 
 export function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
+  options?: { restoreInterruptedGoal?: boolean },
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
@@ -1578,6 +1595,25 @@ export function normalizeSessionRuntimeSnapshot(
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
   const queuedUserMessage = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
   const activeGuidance = normalizeActiveGuidance(snapshot.activeGuidance);
+  const legacyGoal = snapshot.activeGoal ? migrateGoalDefinition(snapshot.activeGoal) : null;
+  const restoredRuntime = snapshot.goalRuntime?.schemaVersion === 2
+    ? {
+        ...snapshot.goalRuntime,
+        goal: migrateGoalDefinition(snapshot.goalRuntime.goal),
+        progress: { ...snapshot.goalRuntime.progress },
+      }
+    : legacyGoal
+      ? buildGoalRuntimeSnapshot({
+          goal: legacyGoal,
+          progress: snapshot.goalProgress || createGoalProgress(legacyGoal.id, ""),
+          phase: null,
+        })
+      : null;
+  const normalizedGoalRuntime = restoredRuntime
+    ? options?.restoreInterruptedGoal
+      ? restoreGoalRuntimeSnapshot(restoredRuntime)
+      : normalizeGoalRuntimeSnapshot(restoredRuntime)
+    : null;
   return {
     runtimeEventSchemaVersion: Math.max(1, Number(snapshot.runtimeEventSchemaVersion) || 1),
     runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
@@ -1631,10 +1667,11 @@ export function normalizeSessionRuntimeSnapshot(
       : [],
     queuedUserMessage,
     activeGuidance,
-    activeGoal: snapshot.activeGoal ?? null,
-    goalProgress: snapshot.goalProgress ?? null,
-    goalStatus: snapshot.goalStatus ?? "paused",
-    goalIterationBudget: snapshot.goalIterationBudget ?? 200,
+    activeGoal: normalizedGoalRuntime?.goal ?? legacyGoal,
+    goalProgress: normalizedGoalRuntime?.progress ?? snapshot.goalProgress ?? null,
+    goalStatus: normalizedGoalRuntime?.status ?? snapshot.goalStatus ?? "paused",
+    goalIterationBudget: normalizedGoalRuntime?.goal.iterationBudget ?? snapshot.goalIterationBudget ?? 200,
+    goalRuntime: normalizedGoalRuntime,
   };
 }
 
@@ -1748,6 +1785,7 @@ const sessionRuntimeKeys = [
   "goalProgress",
   "goalStatus",
   "goalIterationBudget",
+  "goalRuntime",
 ] as const;
 
 function pickSessionRuntimePatch(source: Partial<SessionRuntimeState> | Record<string, unknown>) {
@@ -1863,6 +1901,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     goalProgress: state.goalProgress ?? null,
     goalStatus: state.goalStatus ?? "paused",
     goalIterationBudget: state.goalIterationBudget ?? 200,
+    goalRuntime: state.goalRuntime ?? null,
   };
 }
 
@@ -1921,7 +1960,7 @@ function normalizeSessionsByWorkspace(
       ...session,
       sessionModeAffinity: resolveSessionModeAffinity(session as SessionModeAffinityLike, "main_mode"),
       messages: sanitizeTaskBlocksForPersist(session.messages || []),
-      runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot),
+      runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, { restoreInterruptedGoal: true }),
     }));
     const existing = normalizedEntries.get(scopeKey) || [];
     normalizedEntries.set(scopeKey, [...existing, ...normalizedSessions]);
@@ -5413,6 +5452,7 @@ export const useAppStore = create<AppState>()(
   goalProgress: null,
   goalStatus: "paused",
   goalIterationBudget: 200,
+  goalRuntime: null,
   startGoal: (objective, options) => {
     const newGoal = createGoalDefinition({
       objective,
@@ -5421,34 +5461,233 @@ export const useAppStore = create<AppState>()(
       maxDurationMs: options?.maxDurationMs,
       sessionKey: options?.sessionKey,
     });
-    set({
+    const workspacePath = resolveSessionWorkspaceKey(get().currentWorkspace) || "";
+    const progress = createGoalProgress(
+      newGoal.id,
+      resolveGoalRuntimeProgressFilePath(workspacePath, newGoal.id),
+    );
+    const runtime = buildGoalRuntimeSnapshot({ goal: newGoal, progress, phase: "plan" });
+    set((state) => ({
       activeGoal: newGoal,
       goalStatus: "active",
       goalIterationBudget: newGoal.iterationBudget,
-      goalProgress: null, // Reset progress for new goal
-    });
+      goalProgress: progress,
+      goalRuntime: runtime,
+      runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+        type: "goal.started",
+        threadId: String(state.currentSessionId ?? state.currentWorkspace ?? "session"),
+        ...(state.currentTurnId ? { turnId: state.currentTurnId } : {}),
+        timestampMs: Date.now(),
+        goalId: newGoal.id,
+        revision: newGoal.revision || 1,
+      })),
+    }));
   },
   pauseGoal: () => {
-    const { activeGoal } = get();
+    const { activeGoal, goalProgress, goalRuntime, isGenerating, abortController } = get();
     if (!activeGoal) return;
-    set({ goalStatus: "paused" });
+    if (activeGoal.status !== "active" && activeGoal.status !== "awaiting_input") return;
+    const nextStatus: GoalStatus = isGenerating ? "pausing" : "paused";
+    const nextGoal = { ...activeGoal, status: nextStatus, updatedAt: Date.now() };
+    const nextProgress = goalProgress || createGoalProgress(activeGoal.id, "");
+    const nextRuntime = {
+      ...(goalRuntime || buildGoalRuntimeSnapshot({ goal: nextGoal, progress: nextProgress, phase: "re_plan" })),
+      goal: nextGoal,
+      progress: { ...nextProgress, pauseReason: "User requested pause" },
+      status: nextStatus,
+      phase: "re_plan" as const,
+      pauseReason: "User requested pause",
+      updatedAt: Date.now(),
+    };
+    set((state) => ({
+      activeGoal: nextGoal,
+      goalProgress: nextRuntime.progress,
+      goalStatus: nextStatus,
+      goalRuntime: nextRuntime,
+      runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+        type: "goal.state_changed",
+        threadId: String(state.currentSessionId ?? state.currentWorkspace ?? "session"),
+        ...(state.currentTurnId ? { turnId: state.currentTurnId } : {}),
+        timestampMs: Date.now(),
+        goalId: nextGoal.id,
+        from: activeGoal.status,
+        to: nextStatus,
+        phase: "re_plan",
+        reason: "user_pause",
+      })),
+    }));
+    abortController?.abort();
   },
   resumeGoal: () => {
-    const { activeGoal, goalStatus } = get();
+    const { activeGoal, goalProgress, goalRuntime, goalStatus, isGenerating, config } = get();
     if (!activeGoal) return;
-    if (goalStatus === "paused") {
-      set({ goalStatus: "active" });
-    }
+    if (isGenerating || (goalStatus !== "paused" && goalStatus !== "awaiting_input")) return;
+    const resumedGoal = { ...activeGoal, status: "active" as const, updatedAt: Date.now() };
+    const resumedProgress = {
+      ...(goalProgress || createGoalProgress(activeGoal.id, "")),
+      pauseReason: undefined,
+      lastUserConfirmedIteration: goalProgress?.totalIterationsUsed || 0,
+      usage: {
+        ...(goalProgress?.usage || {
+          modelIterations: 0,
+          toolCalls: 0,
+          totalTokensUsed: goalProgress?.totalTokensUsed || 0,
+          activeDurationMs: 0,
+          activeStartedAt: null,
+          estimatedTokens: true,
+        }),
+        activeStartedAt: Date.now(),
+      },
+    };
+    const resumedRuntime = {
+      ...(goalRuntime || buildGoalRuntimeSnapshot({ goal: resumedGoal, progress: resumedProgress, phase: "re_plan" })),
+      goal: resumedGoal,
+      progress: resumedProgress,
+      status: "active" as const,
+      phase: "re_plan" as const,
+      pauseReason: undefined,
+      updatedAt: Date.now(),
+    };
+    set((state) => ({
+      activeGoal: resumedGoal,
+      goalProgress: resumedProgress,
+      goalStatus: "active",
+      goalRuntime: resumedRuntime,
+      runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+        type: "goal.state_changed",
+        threadId: String(state.currentSessionId ?? state.currentWorkspace ?? "session"),
+        ...(state.currentTurnId ? { turnId: state.currentTurnId } : {}),
+        timestampMs: Date.now(),
+        goalId: resumedGoal.id,
+        from: goalStatus,
+        to: "active",
+        phase: "re_plan",
+        reason: "user_resume",
+      })),
+    }));
+    setTimeout(() => {
+      const language = config.language === "en" ? "en" : "zh";
+      const sent = get().sendMessage(
+        language === "en"
+          ? `Resume the active goal ${resumedGoal.id} from its latest checkpoint.`
+          : `从最近检查点继续执行当前目标 ${resumedGoal.id}。`,
+        undefined,
+        {
+          hidden: true,
+          resolvedIntent: "execute",
+          runtimeIntentOverride: "goal",
+          skipIntentResolution: true,
+          preservePlanState: true,
+          createVisibleTurnForHiddenMessage: true,
+          turnTitle: language === "en" ? "Resume Goal" : "继续目标",
+          intentSummary: language === "en" ? "Resume the active goal" : "从检查点继续当前目标",
+        },
+      );
+      if (sent === false) {
+        const current = get();
+        if (current.activeGoal?.id !== resumedGoal.id) return;
+        const pausedGoal = { ...resumedGoal, status: "paused" as const };
+        set({
+          activeGoal: pausedGoal,
+          goalStatus: "paused",
+          goalRuntime: current.goalRuntime ? {
+            ...current.goalRuntime,
+            goal: pausedGoal,
+            status: "paused",
+            pauseReason: "Unable to acquire a resume run lease",
+            updatedAt: Date.now(),
+          } : null,
+        });
+      }
+    }, 0);
   },
   clearGoal: () => {
-    set({
+    const current = get();
+    if (current.activeGoal?.status === "active" || current.activeGoal?.status === "pausing") {
+      current.abortController?.abort();
+    }
+    set((state) => ({
       activeGoal: null,
       goalProgress: null,
       goalStatus: "paused",
-    });
+      goalRuntime: null,
+      runtimeEvents: current.activeGoal
+        ? appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+            type: "goal.cleared",
+            threadId: String(state.currentSessionId ?? state.currentWorkspace ?? "session"),
+            ...(state.currentTurnId ? { turnId: state.currentTurnId } : {}),
+            timestampMs: Date.now(),
+            goalId: current.activeGoal.id,
+            previousStatus: current.goalStatus,
+          }))
+        : state.runtimeEvents,
+    }));
+  },
+  updateGoalText: (objective) => {
+    const { activeGoal, goalProgress, goalRuntime, goalStatus } = get();
+    const text = objective.trim();
+    if (!activeGoal || !text || goalStatus !== "paused") return false;
+    const nextGoal = updateGoalDefinitionText(activeGoal, text);
+    const nextProgress: GoalProgress = {
+      ...(goalProgress || createGoalProgress(activeGoal.id, "")),
+      pauseReason: "Goal text updated; resume explicitly to continue.",
+      evidence: [...(goalProgress?.evidence || [])],
+      lastUpdatedAt: Date.now(),
+    };
+    const nextRuntime = {
+      ...(goalRuntime || buildGoalRuntimeSnapshot({ goal: nextGoal, progress: nextProgress, phase: "re_plan" })),
+      goal: nextGoal,
+      progress: nextProgress,
+      status: "paused" as const,
+      phase: "re_plan" as const,
+      pauseReason: nextProgress.pauseReason,
+      updatedAt: Date.now(),
+    };
+    set({ activeGoal: nextGoal, goalProgress: nextProgress, goalStatus: "paused", goalRuntime: nextRuntime });
+    return true;
   },
   updateGoalProgress: (progress) => {
-    set({ goalProgress: progress });
+    const state = get();
+    if (!state.activeGoal) {
+      set({ goalProgress: progress });
+      return;
+    }
+    const runtime = buildGoalRuntimeSnapshot({
+      goal: state.activeGoal,
+      progress,
+      phase: state.goalRuntime?.phase || null,
+      pauseReason: state.goalRuntime?.pauseReason,
+    });
+    set({ goalProgress: progress, goalRuntime: runtime });
+  },
+  updateGoalRuntime: (runtime) => {
+    const previous = get().goalRuntime;
+    const normalizedGoal = migrateGoalDefinition(runtime.goal);
+    const normalizedRuntime = { ...runtime, goal: normalizedGoal, status: normalizedGoal.status };
+    set((state) => ({
+      activeGoal: normalizedGoal,
+      goalProgress: normalizedRuntime.progress,
+      goalStatus: normalizedRuntime.status,
+      goalIterationBudget: normalizedGoal.iterationBudget,
+      goalRuntime: normalizedRuntime,
+      runtimeEvents: previous && previous.status !== normalizedRuntime.status
+        ? appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+            type: normalizedRuntime.status === "completed" ? "goal.completed" : "goal.state_changed",
+            threadId: String(state.currentSessionId ?? state.currentWorkspace ?? "session"),
+            ...(state.currentTurnId ? { turnId: state.currentTurnId } : {}),
+            timestampMs: Date.now(),
+            goalId: normalizedGoal.id,
+            ...(normalizedRuntime.status === "completed"
+              ? { evidenceCount: normalizedRuntime.progress.evidence?.length || 0 }
+              : {
+                  from: previous.status,
+                  to: normalizedRuntime.status,
+                  phase: normalizedRuntime.phase,
+                  reason: normalizedRuntime.pauseReason || normalizedRuntime.lastError,
+                }),
+          } as MainThreadEventInput))
+        : state.runtimeEvents,
+    }));
   },
 
   // ── Agent Orchestrator ──────────────────────────────────────────────
@@ -6593,6 +6832,26 @@ export const useAppStore = create<AppState>()(
         (normalizedSessionsByWorkspace[hydratedCurrentScopeKey] || []).some(
           (session) => session.id === persistedCurrentSessionId,
         );
+      const hydratedCurrentSession = hasHydratedCurrentSession
+        ? (normalizedSessionsByWorkspace[hydratedCurrentScopeKey] || []).find(
+            (session) => session.id === persistedCurrentSessionId,
+          ) || null
+        : null;
+      const persistedLegacyGoal = persistedState.activeGoal
+        ? migrateGoalDefinition(persistedState.activeGoal)
+        : null;
+      const persistedGoalRuntime = persistedState.goalRuntime?.schemaVersion === 2
+        ? restoreGoalRuntimeSnapshot(persistedState.goalRuntime)
+        : persistedLegacyGoal
+          ? restoreGoalRuntimeSnapshot(buildGoalRuntimeSnapshot({
+              goal: persistedLegacyGoal,
+              progress: persistedState.goalProgress || createGoalProgress(persistedLegacyGoal.id, ""),
+              phase: null,
+            }))
+          : null;
+      const hydratedGoalRuntime = hasHydratedCurrentSession
+        ? hydratedCurrentSession?.runtimeSnapshot?.goalRuntime || persistedGoalRuntime
+        : null;
       const selectedMainModeKey = mapLegacyNexusModeToMainMode(
         persistedState.selectedMainModeKey ||
           persistedState.selectedNexusModeKey ||
@@ -6701,6 +6960,11 @@ export const useAppStore = create<AppState>()(
           : null,
         planStage: hasHydratedCurrentSession ? persistedState.planStage ?? "idle" : "idle",
         isPlanApproved: hasHydratedCurrentSession ? persistedState.isPlanApproved === true : false,
+        activeGoal: hydratedGoalRuntime?.goal ?? null,
+        goalProgress: hydratedGoalRuntime?.progress ?? null,
+        goalStatus: hydratedGoalRuntime?.status ?? "paused",
+        goalIterationBudget: hydratedGoalRuntime?.goal.iterationBudget ?? 200,
+        goalRuntime: hydratedGoalRuntime,
         pendingPlanApprovalHandoff: null,
         showPlanPanel: hasHydratedCurrentSession ? persistedState.showPlanPanel === true : false,
         showDiff: hasHydratedCurrentSession ? persistedState.showDiff === true : false,

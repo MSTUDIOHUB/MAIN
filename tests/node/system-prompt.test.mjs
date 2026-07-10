@@ -751,6 +751,45 @@ test("execute prompt enforces strict immediate tool execution constraints", () =
   assert.match(prompt, /【绝对禁止只说不做】/);
 });
 
+test("goal prompt embeds the runtime-owned bounded turn contract", () => {
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "edit",
+    "zh",
+    null,
+    undefined,
+    "goal",
+    "english_core_localized_output",
+    ["read_file", "apply_patch", "run_command"],
+    null,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      goalId: "goal-test",
+      revision: 3,
+      iteration: 7,
+      maxIterations: 20,
+      status: "active",
+      phase: "execute",
+      cacheKey: "goal-test:3:7",
+      context: "GOAL_RUNTIME_CONTRACT_SENTINEL",
+    },
+  );
+
+  assert.match(prompt, /\[TURN INTENT: GOAL \(AUTONOMOUS EXECUTION\)\]/);
+  assert.match(prompt, /Goal Runtime 已经负责跨切片循环、预算、检查点、暂停恢复与最终完成判定/);
+  assert.match(prompt, /GOAL_COMPLETION_CANDIDATE/);
+  assert.match(prompt, /GOAL_RUNTIME_CONTRACT_SENTINEL/);
+  assert.doesNotMatch(prompt, /Goal Runtime contract unavailable/);
+});
+
 test("tool protocol card uses web_search XML example when read_file is not available", () => {
   const card = buildToolProtocolCard({
     activeProfile: "local",

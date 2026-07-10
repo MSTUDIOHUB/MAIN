@@ -10,7 +10,7 @@ export interface GoalBudget {
   maxIterations: number;
   /** Optional total token budget */
   maxTokens?: number;
-  /** Maximum wall-clock duration in ms (default: 4 hours) */
+  /** Maximum active execution duration in ms (default: 4 hours; pauses excluded) */
   maxDurationMs: number;
   /** Save a checkpoint every N iterations */
   checkpointInterval: number;
@@ -91,7 +91,9 @@ export function checkGoalBudget(input: {
   }
 
   // 3. Duration limit
-  const elapsed = Date.now() - goal.createdAt;
+  const elapsed = progress.usage
+    ? progress.usage.activeDurationMs + (progress.usage.activeStartedAt ? Math.max(0, Date.now() - progress.usage.activeStartedAt) : 0)
+    : Date.now() - goal.createdAt;
   if (elapsed > budget.maxDurationMs) {
     return {
       ok: false,
@@ -103,14 +105,20 @@ export function checkGoalBudget(input: {
   // 4. No-progress detection
   if (recentIterations && recentIterations.length >= budget.maxNoProgressIterations) {
     const recent = recentIterations.slice(-budget.maxNoProgressIterations);
-    const allNoProgress = recent.every(
-      (iter) => iter.filesModified.length === 0 && iter.testsRun.length === 0,
+    const evidence = progress.evidence || [];
+    const allNoProgress = recent.every((iter) =>
+      !evidence.some((entry) =>
+        entry.iteration === iter.index
+        && entry.status !== "failed"
+        && entry.kind !== "blocker"
+        && entry.kind !== "read"
+      )
     );
     if (allNoProgress) {
       return {
         ok: false,
         reason: "no_progress",
-        message: `No file changes or tests in the last ${budget.maxNoProgressIterations} iterations`,
+        message: `No meaningful execution evidence in the last ${budget.maxNoProgressIterations} iterations`,
       };
     }
   }
@@ -119,7 +127,8 @@ export function checkGoalBudget(input: {
   if (
     budget.userConfirmInterval > 0 &&
     progress.totalIterationsUsed > 0 &&
-    progress.totalIterationsUsed % budget.userConfirmInterval === 0
+    progress.totalIterationsUsed % budget.userConfirmInterval === 0 &&
+    progress.lastUserConfirmedIteration !== progress.totalIterationsUsed
   ) {
     return {
       ok: false,
@@ -150,7 +159,9 @@ export function buildGoalBudgetSummary(input: {
   language: "zh" | "en";
 }): string {
   const { progress, budget, goal, language } = input;
-  const elapsed = Date.now() - goal.createdAt;
+  const elapsed = progress.usage
+    ? progress.usage.activeDurationMs + (progress.usage.activeStartedAt ? Math.max(0, Date.now() - progress.usage.activeStartedAt) : 0)
+    : Date.now() - goal.createdAt;
   const iterLabel = `${progress.totalIterationsUsed}/${budget.maxIterations}`;
   const timeLabel = `${formatDuration(elapsed)} / ${formatDuration(budget.maxDurationMs)}`;
 

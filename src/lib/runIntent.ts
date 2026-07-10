@@ -14,6 +14,10 @@ export type ResolvedUserIntent =
   | "image_studio"
   | "goal";
 export type ResolvedRunIntent = ResolvedUserIntent;
+
+export function isMutationRuntimeIntent(intent: ResolvedUserIntent | string | null | undefined): boolean {
+  return intent === "execute" || intent === "goal";
+}
 export type RunIntentRiskLevel = "low" | "medium" | "high";
 export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
 export type RunIntentToolPolicy = "none" | "read_only" | "write" | "plan_gated" | "studio_workflow";

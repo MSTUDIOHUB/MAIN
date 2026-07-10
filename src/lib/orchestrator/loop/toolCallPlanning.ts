@@ -21,7 +21,7 @@ import {
 import { summarizeRepeatedPlanTargetsFromToolActivity, type PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import { isPlanDraftWriteToolName, shouldClosePlanToolSurfaceAfterReadOnlyConvergence } from "../../planRuntime";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
@@ -86,7 +86,7 @@ export function resolveIterationToolSurface(input: {
 
   const isExecuteRecoveryEligible =
     (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
-    runtimeIntent === "execute" &&
+    isMutationRuntimeIntent(runtimeIntent) &&
     executeRecoveryMode !== "normal";
   const allowExecuteRecoveryFileRead = shouldAllowExecuteRecoveryFileRead(recentToolActivity);
   const effectiveExecuteRecoveryFileRead =

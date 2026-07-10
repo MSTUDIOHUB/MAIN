@@ -253,6 +253,43 @@ test("agent loop runner preserves awaiting-choice pauses as a structured outcome
   }]);
 });
 
+test("agent loop runner preserves a bounded error reason for Goal Runtime diagnostics", async () => {
+  class FailingOrchestrator {
+    async execute(callbacks) {
+      callbacks.onError("STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream stalled");
+    }
+
+    getLatestTurnContract() {
+      return {
+        conversationIntent: "execute",
+        runtimeIntent: "goal",
+        approvalState: "approved",
+        mutationExpected: true,
+        completionEvidenceRequired: "execution_evidence",
+      };
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+  }
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(FailingOrchestrator, []);
+  const errors = [];
+  const outcome = await executeAgentLoop({
+    getWorkflowMode: () => "edit",
+    getIsPlanApproved: () => false,
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {},
+    onError: (error) => errors.push(error),
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "error",
+    reason: "agent_loop_error: STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream stalled",
+  });
+  assert.deepEqual(errors, ["STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream stalled"]);
+});
+
 test("agent loop runner returns aborted before completion guards read final state", async () => {
   class AbortingOrchestrator {
     async execute(_callbacks, abortController) {

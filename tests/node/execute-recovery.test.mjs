@@ -89,6 +89,10 @@ const {
   handleMaxIterationBoundary,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/maxIterationBoundary.ts"));
 
+const {
+  resolveIterationToolSurface,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"));
+
 const readOnlyTools = new Set([
   "get_project_skeleton",
   "list_directory",
@@ -276,6 +280,50 @@ test("execute recovery mutation-first surface removes broad reads and search too
     mode: "mutation_first",
     allowFileRead: true,
   }), false);
+});
+
+test("Goal Runtime receives the same mutation-first recovery surface as execute", () => {
+  const tools = ["read_file", "grep_search", "apply_patch", "run_command"].map((name) => ({
+    type: "function",
+    function: { name, description: name, parameters: { type: "object", properties: {} } },
+  }));
+  const decision = resolveIterationToolSurface({
+    callbacks: {
+      getIsPlanApproved: () => false,
+      getPlanTasks: () => [],
+      getPlanExecutionEvidenceLedger: () => [],
+      getMessages: () => [],
+      getPlanStage: () => "idle",
+    },
+    iteration: 4,
+    workflowMode: "edit",
+    runtimeIntent: "goal",
+    rawIterationAllTools: tools,
+    executeRecoveryMode: "mutation_first",
+    executeRecoveryReason: "read_file_only_loop",
+    executeRecoveryAttempts: 1,
+    recoveryIterationCount: 1,
+    maxRecoveryIterations: 6,
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    approvedPlanNoProgressRecoveryAttempts: 0,
+    approvedPlanLongReasoningNoActionCount: 0,
+    recentToolActivity: Array.from({ length: 3 }, () => ({
+      name: "read_file",
+      status: "succeeded",
+      target: "src/App.tsx",
+      detail: "FILE_UNCHANGED_STUB",
+    })),
+    recentPlanToolActivity: [],
+    planRuntimePhase: "idle",
+    planDraftingRecoveryReadCount: 0,
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: {},
+    lastAssistantTextForCheckpoint: "",
+  });
+
+  assert.equal(decision.isExecuteRecoveryEligible, true);
+  assert.deepEqual(decision.iterationAllTools.map((tool) => tool.function.name), ["apply_patch", "run_command"]);
 });
 
 test("repeat-edit validation recovery exposes only validation tools and forbids more edits", () => {

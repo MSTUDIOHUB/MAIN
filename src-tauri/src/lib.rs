@@ -3456,6 +3456,46 @@ fn write_file(
 }
 
 #[tauri::command]
+fn write_file_atomic(
+    state: State<WorkspaceState>,
+    path: String,
+    content: String,
+    workspace: Option<String>,
+) -> Result<(), String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let real_path = resolve_write_path(&path, &workspace)?;
+    if real_path.exists() && real_path.is_dir() {
+        return Err("write_file_atomic 目标是目录，无法写入".to_string());
+    }
+    let parent = real_path.parent().ok_or_else(|| "无法解析目标父目录".to_string())?;
+    fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {e}"))?;
+    let file_name = real_path.file_name().and_then(|value| value.to_str()).unwrap_or("goal-state");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", now_millis()));
+    fs::write(&temp_path, content).map_err(|e| format!("写入临时文件失败: {e}"))?;
+
+    if let Err(rename_error) = fs::rename(&temp_path, &real_path) {
+        if !real_path.exists() {
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("原子替换文件失败: {rename_error}"));
+        }
+
+        // Windows does not replace an existing destination with rename. Keep a
+        // recoverable backup while swapping the new file into place.
+        let backup_path = parent.join(format!(".{file_name}.{}.bak", now_millis()));
+        fs::rename(&real_path, &backup_path)
+            .map_err(|e| format!("创建原子写入备份失败: {e}"))?;
+        if let Err(swap_error) = fs::rename(&temp_path, &real_path) {
+            let _ = fs::rename(&backup_path, &real_path);
+            let _ = fs::remove_file(&temp_path);
+            return Err(format!("替换目标文件失败: {swap_error}"));
+        }
+        let _ = fs::remove_file(backup_path);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn write_chat_temp_file(
     session_key: String,
     path: String,
@@ -10259,6 +10299,7 @@ pub fn run() {
             get_file_metadata,
             open_file_external,
             write_file,
+            write_file_atomic,
             export_text_file,
             glob_search,
             grep_search,

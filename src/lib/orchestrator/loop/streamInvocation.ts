@@ -9,7 +9,7 @@ import {
   summarizeMessagesForDiagnostics,
   summarizeToolsForDiagnostics,
 } from "../../orchestrator";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { StreamResult } from "../../streaming";
 import type { ToolDefinition } from "../../toolSchemas";
 import { PolicyFactory } from "../policies/PolicyFactory";
@@ -192,7 +192,7 @@ export async function invokeInitialStreamForIteration(input: {
     },
   });
 
-  const isExecute = runtimeIntent === "execute";
+  const isExecute = isMutationRuntimeIntent(runtimeIntent);
   const executionPolicy = PolicyFactory.createPolicy(config);
   const responseSchema = (isExecute && config.activeProfile === "local")
     ? executionPolicy.getResponseFormatSchema?.()

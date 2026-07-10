@@ -14,7 +14,7 @@ import {
   hasPlanUserContextObservation,
   logAgentEvent,
 } from "../../orchestrator";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { StreamResult } from "../../streaming";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
@@ -204,7 +204,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
       recoveryToolSurface: "approved_plan_action_only",
       allowFileRead: false,
     });
-  } else if (workflowMode === "edit" && runtimeIntent === "execute") {
+  } else if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
     activateExecuteRecovery("mutation_first", "reasoning_dominated_recovery", {
       consecutiveReasoningDominatedCount,
       contentChars: streamResult.content.length,

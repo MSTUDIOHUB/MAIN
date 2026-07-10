@@ -5,11 +5,10 @@
 // Inspired by Codex CLI's "fresh context per iteration" approach.
 // ────────────────────────────────────────────────────────────────────
 
-import type { GoalCheckpoint, GoalDefinition } from "./goalState";
+import { normalizeGoalCriteria, type GoalCheckpoint, type GoalDefinition, type GoalTurnContract } from "./goalState";
 import type { VerificationResult } from "./goalVerification";
 import { buildCheckpointContextForLLM } from "./goalPersistence";
 import { buildVerificationSummary } from "./goalVerification";
-import { GOAL_DIR_NAME, GOAL_PROGRESS_FILE } from "./goalPersistence";
 
 export interface GoalIterationContextInput {
   /** Current goal definition */
@@ -53,13 +52,14 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
   );
 
   // ── Section 2: Definition of Done ──
-  if (goal.definitionOfDone.length > 0) {
+  const criteria = normalizeGoalCriteria(goal);
+  if (criteria.length > 0) {
     const heading = isZh ? "**完成标准**:" : "**Definition of Done**:";
-    const items = goal.definitionOfDone.map((criterion, i) => {
-      const done = checkpoint?.completedTasks.some((t) =>
-        t.toLowerCase().includes(criterion.toLowerCase()),
+    const items = criteria.map((criterion, i) => {
+      const done = criterion.status === "satisfied" || checkpoint?.completedTasks.some((t) =>
+        t.toLowerCase().includes(criterion.text.toLowerCase()),
       );
-      return `${i + 1}. [${done ? "x" : " "}] ${criterion}`;
+      return `${i + 1}. [${done ? "x" : " "}] ${criterion.text}`;
     });
     sections.push([heading, ...items, ""].join("\n"));
   }
@@ -111,7 +111,7 @@ function buildIterationInstructions(
     const lines: string[] = [
       "## 本轮迭代指令",
       "",
-      "遵循 Plan → Execute → Observe 循环：",
+      "这是 Goal Runtime 分配的一次有界执行切片。遵循 Plan → Execute → Observe 循环：",
       "",
       "1. **Plan**: 分析当前状态，从剩余任务中选择一个最小可行任务。",
       "2. **Execute**: 使用工具实现该任务（编辑文件、运行命令等）。",
@@ -127,11 +127,11 @@ function buildIterationInstructions(
 
     lines.push(
       "**约束**:",
-      "- 每轮只做一个明确的小任务，不要试图一次性完成所有工作",
+      "- 本切片只推进一个明确、可验证的里程碑；不要在模型内部自行开启无限循环",
       "- 每次修改文件后必须运行验证命令",
       "- 遇到阻塞时记录具体阻塞原因并尝试替代方案",
-      `- 完成本轮任务后，更新 \`.MAIN/${GOAL_DIR_NAME}/${GOAL_PROGRESS_FILE}\``,
-      `- 如果目标已完全达成，在回复末尾明确声明 "GOAL_COMPLETED"`,
+      "- 不要修改 `.MAIN/goals/` 中的运行时状态文件；Goal Runtime 会根据真实工具结果保存进度、检查点和证据",
+      `- 如果所有完成标准都有证据支持，在回复末尾声明 "GOAL_COMPLETION_CANDIDATE"；最终完成由运行时证据门禁决定`,
       `- 如果遇到无法解决的阻塞，声明 "GOAL_BLOCKED: <原因>"`,
       "",
     );
@@ -142,7 +142,7 @@ function buildIterationInstructions(
   const lines: string[] = [
     "## Iteration Instructions",
     "",
-    "Follow the Plan → Execute → Observe cycle:",
+    "This is one bounded execution slice assigned by Goal Runtime. Follow the Plan → Execute → Observe cycle:",
     "",
     "1. **Plan**: Analyze current state, pick one small verifiable task from remaining work.",
     "2. **Execute**: Use tools to implement it (edit files, run commands, etc.).",
@@ -158,11 +158,11 @@ function buildIterationInstructions(
 
   lines.push(
     "**Constraints**:",
-    "- Do one small, clear task per iteration. Do not try to finish everything at once.",
+    "- Advance one clear, verifiable milestone in this slice. Do not start an unbounded model-side loop.",
     "- Run verification commands after every file change.",
     "- When blocked, record the specific blocker and try an alternative approach.",
-    `- After completing this iteration's task, update \`.MAIN/${GOAL_DIR_NAME}/${GOAL_PROGRESS_FILE}\`.`,
-    '- If the goal is fully met, end your response with "GOAL_COMPLETED".',
+    "- Do not modify runtime state files under `.MAIN/goals/`; Goal Runtime persists progress, checkpoints, and evidence from real tool results.",
+    '- If every completion criterion is supported by evidence, end with "GOAL_COMPLETION_CANDIDATE". The runtime evidence gate makes the final decision.',
     '- If encountering an unresolvable blocker, state "GOAL_BLOCKED: <reason>".',
     "",
   );
@@ -172,7 +172,7 @@ function buildIterationInstructions(
 
 // ── Goal completion detection from model output ──────────────────
 
-const GOAL_COMPLETED_RE = /\bGOAL_COMPLETED\b/i;
+const GOAL_COMPLETED_RE = /\b(?:GOAL_COMPLETION_CANDIDATE|GOAL_COMPLETED)\b/i;
 const GOAL_BLOCKED_RE = /\bGOAL_BLOCKED\s*[:：]\s*(.+)/i;
 
 export function detectGoalCompletionSignal(assistantText: string): {
@@ -188,6 +188,22 @@ export function detectGoalCompletionSignal(assistantText: string): {
     return { completed: false, blocked: true, blockerReason: blockedMatch[1].trim() };
   }
   return { completed: false, blocked: false };
+}
+
+export function buildGoalTurnContract(input: GoalIterationContextInput): GoalTurnContract {
+  const goal = input.goal;
+  const context = buildGoalIterationSystemContext(input);
+  const revision = Math.max(1, Number(goal.revision) || 1);
+  return {
+    goalId: goal.id,
+    revision,
+    iteration: input.nextIteration,
+    maxIterations: goal.iterationBudget,
+    status: goal.status,
+    phase: input.checkpoint?.currentPhase || "plan",
+    context,
+    cacheKey: `${goal.id}:${revision}:${input.nextIteration}:${input.checkpoint?.iteration || 0}:${input.checkpoint?.evidenceCursor || 0}`,
+  };
 }
 
 // ── Extract modified files from tool call results ────────────────

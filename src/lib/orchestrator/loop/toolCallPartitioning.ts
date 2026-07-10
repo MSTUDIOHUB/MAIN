@@ -43,7 +43,7 @@ import {
   buildRepeatLoopSignature,
   isReadOnlyShellInspectionToolCall,
 } from "../../repetitionGuard";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../runtimeTools";
 import { shouldBlockToolCallForTargeting, type TaskTargetingProfile } from "../../taskTargeting";
 import { isLocalFileReadApproved, type ToolCapabilityRegistry, type ToolPermissionPolicy } from "../../toolCapabilities";
@@ -416,13 +416,13 @@ export async function partitionToolCallsForExecution(input: {
       const bypassApprovedPlanPatchRecoveryReadCache =
         (workflowMode === "plan" &&
           callbacks.getIsPlanApproved() &&
-          runtimeIntent === "execute" &&
+          isMutationRuntimeIntent(runtimeIntent) &&
           shouldBypassApprovedPlanReadCacheForPatchRecovery({
             toolName: tc.name,
             allowFileRead: allowApprovedPlanRecoveryFileRead,
           })) ||
         (workflowMode === "edit" &&
-          runtimeIntent === "execute" &&
+          isMutationRuntimeIntent(runtimeIntent) &&
           tc.name === "read_file" &&
           effectiveExecuteRecoveryFileRead);
       if (bypassApprovedPlanPatchRecoveryReadCache) {

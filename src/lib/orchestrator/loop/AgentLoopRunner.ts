@@ -3,6 +3,12 @@ import type { AgentLoopOutcome, OrchestratorCallbacks } from "../types";
 import { AgentOrchestrator } from "./AgentOrchestrator";
 import { resolveNonActionableStopOutcome, runAgentLoopCompletionGuards } from "./completionGuards";
 
+function buildAgentLoopErrorReason(error: unknown): string {
+  const detail = error instanceof Error ? error.message : String(error || "");
+  const normalized = detail.trim().replace(/\s+/g, " ");
+  return normalized ? `agent_loop_error: ${normalized.slice(0, 500)}` : "agent_loop_error";
+}
+
 export async function executeAgentLoop(
   callbacks: OrchestratorCallbacks,
   abortController: AbortController,
@@ -30,7 +36,7 @@ export async function executeAgentLoop(
       callbacks.onNonActionableStop(message, reason, progress);
     },
     onError: (error) => {
-      setOutcome({ status: "error", reason: "agent_loop_error" });
+      setOutcome({ status: "error", reason: buildAgentLoopErrorReason(error) });
       callbacks.onError(error);
     },
   };
@@ -38,7 +44,7 @@ export async function executeAgentLoop(
   try {
     await orchestrator.execute(wrappedCallbacks, abortController);
   } catch (error) {
-    setOutcome({ status: "error", reason: "agent_loop_error" });
+    setOutcome({ status: "error", reason: buildAgentLoopErrorReason(error) });
     throw error;
   }
 
