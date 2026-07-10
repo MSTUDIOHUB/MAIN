@@ -271,6 +271,7 @@ import {
 } from "../lib/imageStudioSessions";
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
+import { cancelSubagentRun } from "../lib/subagents";
 import {
   buildFeishuApprovalCard,
   createDefaultFeishuAdapterRuntimeStatus,
@@ -939,6 +940,7 @@ export interface AppState {
   fileViewerError: string;
   fileViewerLoading: boolean;
   selectedDiffTaskId: number | null;
+  selectedSubagentId: string | null;
   gitDiffPreview: GitDiffPreviewState | null;
   openFileTreePanel: () => void;
   openFileViewer: (path: string, workspace?: string) => Promise<void>;
@@ -951,6 +953,9 @@ export interface AppState {
   clearGitDiffPreview: () => void;
   setRightPanelTab: (tab: RightPanelTab) => void;
   openRightPanelTab: (tab: RightPanelTab) => void;
+  openSubagentsPanel: (subagentId?: string) => void;
+  selectSubagent: (subagentId: string) => void;
+  stopSubagent: (subagentId: string) => boolean;
   ensurePlanArtifactsHydratedForWorkspace: (options?: { openPanel?: boolean; reason?: string; promoteTasksToExecuting?: boolean }) => Promise<boolean>;
   openPlanWorkspacePanel: () => Promise<boolean>;
   closeRightPanel: () => void;
@@ -1552,6 +1557,9 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "goal.checkpoint_saved",
     "goal.completed",
     "goal.cleared",
+    "subagent.created",
+    "subagent.updated",
+    "subagent.closed",
     "approval.requested",
     "run.paused",
     "run.completed",
@@ -2951,6 +2959,7 @@ export const useAppStore = create<AppState>()(
   fileViewerError: "",
   fileViewerLoading: false,
   selectedDiffTaskId: null,
+  selectedSubagentId: null,
   gitDiffPreview: null,
   rightPanelTab: "plan",
   rightPanelWidth: 450,
@@ -3197,7 +3206,21 @@ export const useAppStore = create<AppState>()(
     });
   },
   openRightPanelTab: (tab) => get().setRightPanelTab(tab),
-  closeRightPanel: () => set({ showPlanPanel: false, showDiff: false, showTerminal: false }),
+  openSubagentsPanel: (subagentId) => set({
+    rightPanelTab: "subagents",
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    ...(subagentId ? { selectedSubagentId: subagentId } : {}),
+  }),
+  selectSubagent: (subagentId) => set({ selectedSubagentId: subagentId }),
+  stopSubagent: (subagentId) => cancelSubagentRun(subagentId),
+  closeRightPanel: () => set((state) => ({
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    rightPanelTab: state.rightPanelTab === "subagents" ? "plan" : state.rightPanelTab,
+  })),
   setRightPanelWidth: (w) => set({ rightPanelWidth: w }),
   sidebarWidth: 260,
   setSidebarWidth: (w) => set({ sidebarWidth: Math.max(180, Math.min(450, w)) }),

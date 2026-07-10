@@ -55,8 +55,8 @@ export function normalizePendingDecisionInputKey(input: string): string {
     .toLowerCase();
 }
 
-export function normalizeStoredRightPanelTab(value: unknown): "diff" | "terminal" | "plan" | "goal" {
-  if (value === "diff" || value === "terminal" || value === "plan" || value === "goal") {
+export function normalizeStoredRightPanelTab(value: unknown): "diff" | "terminal" | "plan" | "goal" | "subagents" {
+  if (value === "diff" || value === "terminal" || value === "plan" || value === "goal" || value === "subagents") {
     return value;
   }
   return "plan";

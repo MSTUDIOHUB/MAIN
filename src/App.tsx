@@ -968,7 +968,7 @@ export default function App() {
   const setSidebarWidth = useAppStore((s) => s.setSidebarWidth);
   const closeRightPanel = useAppStore((s) => s.closeRightPanel);
   const closeFilePanel = useAppStore((s) => s.closeFilePanel);
-  const isRightPanelVisible = showPlanPanel || showDiff || showTerminal;
+  const isRightPanelVisible = showPlanPanel || showDiff || showTerminal || rightPanelTab === "subagents";
   const isFilePanelVisible = showFilePanel;
   // isResizing is local UI state (mouse drag), not in the store
   const [isResizing, setIsResizing] = useState(false);

@@ -1055,6 +1055,7 @@ export function buildSystemPrompt(
       if (isToolNameAvailable(name, availableToolNames)) tfl.push(description);
     };
     addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。仅在没有明确路径/文件名/符号线索时作为一次浅层发现使用，建议 depth: 2；拿到结构后必须转向定向搜索或读取。");
+    addToolDescription("spawn_subagent", "- spawn_subagent: 为可独立完成的有界探索、测试分析、日志排查或摘要创建只读子智能体。只传紧凑 objective/context_hints；等待其返回摘要后再综合。不要为原子任务创建，不要让多个子智能体承担重叠工作。本地模型由 runtime 自动串行限流。");
     addToolDescription("get_file_outline", "- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
     addToolDescription("list_directory", "- list_directory: 列出特定目录内容。优先用于用户给出目录、文件附近路径，或通过搜索结果锁定目标后的定向检查。");
     addToolDescription("web_search", "- web_search: 在公共网络上搜索最新信息、外部资料或网页线索。返回标题、URL、摘要和来源；最终结论必须引用来源 URL。");

@@ -126,6 +126,7 @@ type SkillLike = {
 };
 
 const READ_ONLY_BUILT_INS = new Set([
+  "spawn_subagent",
   "list_directory",
   "read_file",
   "read_document",

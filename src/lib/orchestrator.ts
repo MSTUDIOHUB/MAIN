@@ -1209,6 +1209,7 @@ export interface OrchestratorCallbacks {
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
   getCurrentTurnId?: () => string | null;
+  getSubagentDepth?: () => number;
   getSnapshotContextLimit?: () => number;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
@@ -1238,6 +1239,10 @@ export interface OrchestratorCallbacks {
   onProviderCompatibilityFallback?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
+  runSubagent?: (
+    request: import("./subagents").SpawnSubagentRequest,
+    options?: { signal?: AbortSignal },
+  ) => Promise<import("./subagents").SpawnSubagentResult>;
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("./goalState").GoalProgress, goal: import("./goalState").GoalDefinition) => void;
@@ -1496,6 +1501,7 @@ export function prepareMessagesForToolProtocol(
 /** Derive a short display target from tool arguments. */
 export function getToolTarget(name: string, args: Record<string, unknown>): string {
   switch (name) {
+    case "spawn_subagent":  return (args.name as string) || (args.objective as string) || "subagent";
     case "list_directory":  return (args.path as string) || ".";
     case "read_file":       return (args.path as string) || "";
     case "read_document":   return (args.path as string) || "";
@@ -3630,6 +3636,7 @@ export function buildToolResultHistoryContentByFormat(
 interface ExecuteToolLifecycleOptions {
   allowExternalLocalRead?: boolean;
   shellPermissionApproval?: ShellPermissionApproval;
+  abortSignal?: AbortSignal;
   turnContext?: TurnInputContextSignals;
   recentPlanToolActivity?: PlanToolActivitySummary[];
   attemptedPlanWriteTargets?: string[];
@@ -3821,10 +3828,31 @@ async function executeToolCallWithLifecycle(
     : null;
 
   try {
-    let rawResult = await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
-      allowExternalLocalRead: options.allowExternalLocalRead === true,
-      shellPermissionApproval: options.shellPermissionApproval,
-    });
+    let rawResult = tc.name === "spawn_subagent"
+      ? await (async () => {
+          if (!callbacks.runSubagent) {
+            throw new Error("Subagent runtime is unavailable for this workflow.");
+          }
+          const result = await callbacks.runSubagent({
+            objective: String(resolvedArgs.objective || ""),
+            name: typeof resolvedArgs.name === "string" ? resolvedArgs.name : undefined,
+            role: typeof resolvedArgs.role === "string" ? resolvedArgs.role : undefined,
+            contextHints: typeof resolvedArgs.context_hints === "string"
+              ? resolvedArgs.context_hints
+              : typeof resolvedArgs.contextHints === "string" ? resolvedArgs.contextHints : undefined,
+            allowedPaths: typeof resolvedArgs.allowed_paths === "string"
+              ? resolvedArgs.allowed_paths
+              : typeof resolvedArgs.allowedPaths === "string" ? resolvedArgs.allowedPaths : undefined,
+          }, { signal: options.abortSignal });
+          if (result.status !== "completed") {
+            throw new Error(result.error || result.summary || `Subagent ${result.name} ${result.status}.`);
+          }
+          return JSON.stringify(result);
+        })()
+      : await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
+          allowExternalLocalRead: options.allowExternalLocalRead === true,
+          shellPermissionApproval: options.shellPermissionApproval,
+        });
     let resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 
     // Auto Map-Reduce for large files during read_file
@@ -4153,11 +4181,12 @@ export async function executeReadOnlyToolsConcurrently(
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
   hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>,
-  options: Pick<ExecuteToolLifecycleOptions, "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets"> = {},
+  options: Pick<ExecuteToolLifecycleOptions, "abortSignal" | "turnContext" | "recentPlanToolActivity" | "attemptedPlanWriteTargets"> = {},
 ): Promise<ToolExecutionResult[]> {
   const promises = toolCalls.map(tc =>
     executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig, {
       allowExternalLocalRead: tc.allowExternalLocalRead === true,
+      abortSignal: options.abortSignal,
       turnContext: options.turnContext,
       recentPlanToolActivity: options.recentPlanToolActivity,
       attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,

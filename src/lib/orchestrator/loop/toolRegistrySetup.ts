@@ -53,6 +53,7 @@ export async function prepareAgentLoopToolRegistry(input: {
   unityConsoleDiagnosticsRequested: boolean;
   unityScriptEditRequested: boolean;
   gameStudioScriptEditRequested: boolean;
+  subagentDepth?: number;
   webSearchEnabled: boolean;
   enabledKnowledgeBaseIds: string[];
 }): Promise<AgentLoopToolRegistryState> {
@@ -69,6 +70,7 @@ export async function prepareAgentLoopToolRegistry(input: {
     unityConsoleDiagnosticsRequested,
     unityScriptEditRequested,
     gameStudioScriptEditRequested,
+    subagentDepth = 0,
     webSearchEnabled,
     enabledKnowledgeBaseIds,
   } = input;
@@ -176,12 +178,12 @@ export async function prepareAgentLoopToolRegistry(input: {
   logAgentEvent("mcp_routing", { ...mcpRoutingResult.telemetry });
 
   const knowledgeToolsEnabled = enabledKnowledgeBaseIds.length > 0;
-  const routedToolDefinitions = buildToolDefinitions(skills, mcpTools).filter((tool) => {
+  let routedToolDefinitions = buildToolDefinitions(skills, mcpTools).filter((tool) => {
     if (!webSearchEnabled && WEB_RESEARCH_TOOL_NAMES.has(tool.function.name)) return false;
     if (!knowledgeToolsEnabled && KNOWLEDGE_TOOL_NAMES.has(tool.function.name)) return false;
     return true;
   });
-  const toolCapabilityRegistry = buildToolCapabilityRegistry({
+  let toolCapabilityRegistry = buildToolCapabilityRegistry({
     toolDefinitions: routedToolDefinitions,
     skills,
     mcpTools,
@@ -189,6 +191,21 @@ export async function prepareAgentLoopToolRegistry(input: {
     mcpToolServerMap,
     policy: config.toolPermissionPolicy,
   });
+  if (subagentDepth > 0) {
+    routedToolDefinitions = routedToolDefinitions.filter((tool) => {
+      if (tool.function.name === "spawn_subagent") return false;
+      const risk = toolCapabilityRegistry.tools[tool.function.name]?.risk;
+      return risk === "read_only" || risk === "external_read";
+    });
+    toolCapabilityRegistry = buildToolCapabilityRegistry({
+      toolDefinitions: routedToolDefinitions,
+      skills,
+      mcpTools,
+      mcpServers: connectedMcpServers,
+      mcpToolServerMap,
+      policy: config.toolPermissionPolicy,
+    });
+  }
   const preferredUnityServerUrlSet = new Set(effectivePreferredUnityUrls);
   const preferredUnityMcpToolNameSet = new Set(
     mcpTools

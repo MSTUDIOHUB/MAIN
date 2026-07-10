@@ -93,6 +93,7 @@ export class AgentOrchestrator {
           unityConsoleDiagnosticsRequested,
           unityScriptEditRequested,
           gameStudioScriptEditRequested,
+          subagentDepth: callbacks.getSubagentDepth?.() ?? 0,
           webSearchEnabled: callbacks.getWebSearchEnabled?.() === true,
           enabledKnowledgeBaseIds: callbacks.getEnabledKnowledgeBaseIds?.() || [],
         });

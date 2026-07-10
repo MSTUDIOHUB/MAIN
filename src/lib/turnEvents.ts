@@ -1,4 +1,5 @@
 import type { ToolLifecycleState } from "./runtimeTools";
+import type { SubagentActivity, SubagentRunPatch, SubagentRunSnapshot } from "./subagents";
 
 export const MAIN_THREAD_EVENT_SCHEMA_VERSION = 1 as const;
 
@@ -73,6 +74,9 @@ export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.checkpoint_saved"; threadId: string; turnId?: string; timestampMs: number; goalId: string; checkpointId: string; iteration: number }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.completed"; threadId: string; turnId?: string; timestampMs: number; goalId: string; evidenceCount: number }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.cleared"; threadId: string; turnId?: string; timestampMs: number; goalId: string; previousStatus: string }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.created"; threadId: string; turnId: string; timestampMs: number; subagent: SubagentRunSnapshot }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.updated"; threadId: string; turnId: string; timestampMs: number; subagentId: string; patch: SubagentRunPatch; activity?: SubagentActivity }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.closed"; threadId: string; turnId: string; timestampMs: number; subagentId: string; closedAt: number; reason?: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "approval.requested"; threadId: string; turnId: string; timestampMs: number; reason: string; target?: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; progress?: MainThreadProgressUpdate }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string }

@@ -93,6 +93,24 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "spawn_subagent",
+      description: "创建一个隔离的只读子智能体来处理有界、可独立完成的探索、测试分析、日志排查或摘要任务。子智能体只返回证据摘要，不直接修改工作区。仅在任务确实可拆分时使用；本地模型会自动串行限流。",
+      parameters: {
+        type: "object",
+        properties: {
+          objective: { type: "string", description: "子智能体要独立完成的明确目标" },
+          name: { type: "string", description: "可选显示名称，如 Euler；省略时由 MAIN 自动命名" },
+          role: { type: "string", description: "可选角色，如 explorer、reviewer、tester、docs" },
+          context_hints: { type: "string", description: "可选的紧凑上下文提示，不要复制整段主对话" },
+          allowed_paths: { type: "string", description: "可选的优先读取路径，使用逗号分隔" },
+        },
+        required: ["objective"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "list_directory",
       description: "扫描指定目录下的文件和子目录列表。返回工作区相对路径，目录以 / 结尾。后续 read_file、get_file_outline 等工具应优先直接复用这里返回的完整路径。",
       parameters: {

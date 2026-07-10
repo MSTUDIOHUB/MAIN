@@ -15,6 +15,8 @@ export const IconColumns = createIcon(<><rect x="3" y="3" width="18" height="18"
 export const IconClose = createIcon(<><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>);
 export const IconImageIcon = createIcon(<><rect x="3" y="3" width="18" height="18" rx="2" ry="2" /><circle cx="8.5" cy="8.5" r="1.5" /><polyline points="21 15 16 10 5 21" /></>);
 export const IconAgent = createIcon(<path d="M12 2a2 2 0 0 1 2 2c0 1.1-.9 2-2 2s-2-.9-2-2a2 2 0 0 1 2-2zm0 6c2.67 0 8 1.34 8 4v2H4v-2c0-2.66 5.33-4 8-4z" />);
+export const IconSubagent = createIcon(<><rect x="5" y="5" width="14" height="11" rx="3" /><path d="M9 16v2" /><path d="M15 16v2" /><path d="M8 21c.8-1.3 2.2-2 4-2s3.2.7 4 2" /><circle cx="9.5" cy="10.5" r=".75" fill="currentColor" stroke="none" /><circle cx="14.5" cy="10.5" r=".75" fill="currentColor" stroke="none" /><path d="M12 5V2" /></>);
+export const IconSubagentClosed = createIcon(<><rect x="5" y="4" width="14" height="11" rx="3" /><circle cx="9.5" cy="9.5" r=".75" fill="currentColor" stroke="none" /><circle cx="14.5" cy="9.5" r=".75" fill="currentColor" stroke="none" /><path d="M8 20h8" /></>);
 export const IconChat = createIcon(<><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" /></>);
 export const IconCloud = createIcon(<path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z" />);
 export const IconGlobe = createIcon(<><circle cx="12" cy="12" r="10" /><line x1="2" y1="12" x2="22" y2="12" /><path d="M12 2a15.3 15.3 0 0 1 0 20" /><path d="M12 2a15.3 15.3 0 0 0 0 20" /></>);

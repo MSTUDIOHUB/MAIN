@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React, { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconGoal, IconImageIcon, IconLogoM, IconSettings, IconStop, IconTerminal, IconZap } from "./Icons";
+import { IconAt, IconCheck, IconChevronDown, IconChevronRight, IconClose, IconCloud, IconCode, IconColumns, IconFile, IconFileText, IconFolder, IconGoal, IconImageIcon, IconLogoM, IconSettings, IconStop, IconSubagent, IconSubagentClosed, IconTerminal, IconZap } from "./Icons";
 import ActionCard from "./ActionCard";
 import Composer from "./Composer";
 import ImageGenerationCard from "./ImageGenerationCard";
@@ -89,6 +89,7 @@ import {
 } from "../lib/chat/chatToolSummary";
 import { resolveVisiblePendingToolReview } from "../lib/pendingToolReview";
 import { extractPlanDraftPreview, extractStructuredPlanProposal } from "../lib/planProposal";
+import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -887,6 +888,73 @@ function TurnActivityNotice({
           />
         </div>
       )}
+    </div>
+  );
+}
+
+function SubagentActivityNotice({
+  runs,
+  language,
+  onOpen,
+}: {
+  runs: ReturnType<typeof projectSubagentRuns>;
+  language: "zh" | "en";
+  onOpen: (id?: string) => void;
+}) {
+  if (runs.length === 0) return null;
+  const activeRuns = runs.filter((run) => isSubagentActiveStatus(run.status));
+  const closedRuns = runs.filter((run) => !!run.closedAt);
+  const latestRun = runs[runs.length - 1];
+  const rows = [
+    {
+      key: "created",
+      icon: IconSubagent,
+      text: language === "zh" ? `已创建 ${runs.length} 个智能体` : `Created ${runs.length} subagent${runs.length === 1 ? "" : "s"}`,
+      id: latestRun?.id,
+      active: false,
+    },
+    ...(closedRuns.length > 0 ? [{
+      key: "closed",
+      icon: IconSubagentClosed,
+      text: language === "zh" ? `已关闭 ${closedRuns.length} 个智能体` : `Closed ${closedRuns.length} subagent${closedRuns.length === 1 ? "" : "s"}`,
+      id: closedRuns[closedRuns.length - 1]?.id,
+      active: false,
+    }] : []),
+    ...activeRuns.slice(-3).map((run) => ({
+      key: run.id,
+      icon: IconSubagent,
+      text: `${run.name} · ${run.progress?.title || (language === "zh" ? "正在执行" : "Running")}${run.progress?.target ? `：${String(run.progress.target).split("/").pop()}` : ""}`,
+      id: run.id,
+      active: true,
+    })),
+  ];
+
+  return (
+    <div data-testid="subagent-activity-notice" className="ml-9 w-full max-w-[min(760px,calc(100%-2.25rem))] py-1">
+      <div className="space-y-0.5">
+        {rows.map((row) => {
+          const RowIcon = row.icon;
+          return (
+            <button
+              key={row.key}
+              type="button"
+              data-testid={`subagent-activity-${row.key}`}
+              onClick={() => onOpen(row.id)}
+              title={language === "zh" ? "查看子智能体执行详情" : "Inspect subagent activity"}
+              aria-label={`${row.text}，${language === "zh" ? "打开子智能体面板" : "open subagents panel"}`}
+              className="group flex min-h-8 w-full min-w-0 items-center gap-3 rounded-[6px] px-2 py-1 text-left text-[12px] text-[var(--surface-text-muted)] transition-colors hover:bg-[color-mix(in_srgb,var(--accent)_7%,transparent)] hover:text-[var(--surface-text)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)]"
+            >
+              <span className="flex h-5 w-5 shrink-0 items-center justify-center text-[var(--surface-text-muted)] group-hover:text-[var(--accent-light)]">
+                {row.active
+                  ? <span className="h-2 w-2 rounded-full bg-[#60a5fa] shadow-[0_0_7px_rgba(96,165,250,0.75)] animate-pulse" />
+                  : <RowIcon className="h-4 w-4" />}
+              </span>
+              <span className="min-w-0 flex-1 truncate">{row.text}</span>
+              <IconChevronRight className="h-3.5 w-3.5 shrink-0 opacity-0 transition-opacity group-hover:opacity-100" />
+            </button>
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -2347,6 +2415,7 @@ export default function ChatArea({
     rightPanelTab,
     runtimeEvents,
     openRightPanelTab,
+    openSubagentsPanel,
     openFileTreePanel,
     openDiffForTask,
     closeRightPanel,
@@ -2390,6 +2459,7 @@ export default function ChatArea({
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     runtimeEvents: useAppStore((s) => s.runtimeEvents),
     openRightPanelTab: useAppStore((s) => s.openRightPanelTab),
+    openSubagentsPanel: useAppStore((s) => s.openSubagentsPanel),
     openFileTreePanel: useAppStore((s) => s.openFileTreePanel),
     openDiffForTask: useAppStore((s) => s.openDiffForTask),
     closeRightPanel: useAppStore((s) => s.closeRightPanel),
@@ -2426,6 +2496,7 @@ export default function ChatArea({
     goalStatus: useAppStore((s) => s.goalStatus),
     goalRuntime: useAppStore((s) => s.goalRuntime),
   };
+  const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
   const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
   const imageStudioLocalFamilyLabel = imageStudio.config.local.serviceFamily === "ollama"
@@ -2966,11 +3037,12 @@ export default function ChatArea({
     };
   }, [taskFlow, isAutoScroll, isStreaming]);
 
-  const togglePanelTab = useCallback((tab: "plan" | "diff" | "terminal" | "file") => {
+  const togglePanelTab = useCallback((tab: "plan" | "diff" | "terminal" | "subagents" | "file") => {
     const isCurrentlyOpen =
       (tab === "plan" && showPlanPanel && rightPanelTab === "plan") ||
       (tab === "diff" && showDiff && rightPanelTab === "diff") ||
       (tab === "terminal" && showTerminal && rightPanelTab === "terminal") ||
+      (tab === "subagents" && rightPanelTab === "subagents") ||
       (tab === "file" && showFilePanel);
 
     if (isCurrentlyOpen) {
@@ -2987,8 +3059,12 @@ export default function ChatArea({
       openFileTreePanel();
       return;
     }
+    if (tab === "subagents") {
+      openSubagentsPanel();
+      return;
+    }
     openRightPanelTab(tab);
-  }, [closeFilePanel, closeRightPanel, currentWorkspace, openFileTreePanel, openRightPanelTab, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
+  }, [closeFilePanel, closeRightPanel, currentWorkspace, openFileTreePanel, openRightPanelTab, openSubagentsPanel, rightPanelTab, showDiff, showFilePanel, showPlanPanel, showTerminal]);
 
   const renderBlock = (block, index) => {
     if (block.type === "user") {
@@ -3332,6 +3408,7 @@ export default function ChatArea({
         : null;
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
+    const turnSubagentRuns = subagentRuns.filter((run) => run.parentTurnId === turn.id);
     const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
       ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
       : null;
@@ -3730,6 +3807,14 @@ export default function ChatArea({
               )}
             </React.Fragment>
           )}
+          {isTurnExpanded && turnSubagentRuns.length > 0 && (
+            <SubagentActivityNotice
+              key="subagent-activity-notice"
+              runs={turnSubagentRuns}
+              language={language}
+              onOpen={openSubagentsPanel}
+            />
+          )}
           {isTurnExpanded && shouldShowTurnActivityNotice && (
             <TurnActivityNotice
               key="turn-activity-notice"
@@ -3848,6 +3933,21 @@ export default function ChatArea({
               <IconFileText className="h-3.5 w-3.5" />
               {copy.planLabel}
               {!showPlanPanel && <span className="theme-bg theme-glow ml-0.5 h-1.5 w-1.5 rounded-full" />}
+            </button>
+          )}
+
+          {subagentRuns.length > 0 && (
+            <button
+              data-testid="top-subagents-panel-button"
+              onClick={() => togglePanelTab("subagents")}
+              className={`panel-tab-icon-button relative flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] transition-all duration-150 ${rightPanelTab === "subagents" ? "is-active" : ""}`}
+              title={language === "zh" ? "子智能体" : "Subagents"}
+              aria-label={language === "zh" ? "子智能体" : "Subagents"}
+            >
+              <IconSubagent className="h-3.5 w-3.5" />
+              {subagentRuns.some((run) => isSubagentActiveStatus(run.status)) && rightPanelTab !== "subagents" && (
+                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-[#60a5fa] shadow-[0_0_6px_rgba(96,165,250,0.8)]" />
+              )}
             </button>
           )}
 

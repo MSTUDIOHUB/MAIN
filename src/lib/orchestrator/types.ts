@@ -17,6 +17,7 @@ import { type PlanMaterializationSource } from "../planMaterialization";
 import { type ProgressNarration } from "../progressNarration";
 import type { ShellPermissionApproval, ShellPermissionDecision } from "../ipc";
 import { type TurnInputContextSignals } from "../turnIntake";
+import type { SpawnSubagentRequest, SpawnSubagentResult } from "../subagents";
 
 export interface ToolCallInMessage {
   id: string;
@@ -79,6 +80,7 @@ export interface OrchestratorCallbacks {
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
   getCurrentTurnId?: () => string | null;
+  getSubagentDepth?: () => number;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
   // Planning & Management
@@ -107,6 +109,10 @@ export interface OrchestratorCallbacks {
   onProviderCompatibilityFallback?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
+  runSubagent?: (
+    request: SpawnSubagentRequest,
+    options?: { signal?: AbortSignal },
+  ) => Promise<SpawnSubagentResult>;
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("../goalState").GoalProgress, goal: import("../goalState").GoalDefinition) => void;

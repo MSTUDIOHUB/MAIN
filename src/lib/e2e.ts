@@ -74,6 +74,7 @@ const CAPSULE_PROGRESS_ONLY_SCENARIO = "capsule-progress-only";
 const GOAL_CAPSULE_SCENARIO = "goal-capsule";
 const SIDEBAR_REMOVE_LAST_WORKSPACE_SCENARIO = "sidebar-remove-last-workspace";
 const USER_CONTEXT_PILLS_SCENARIO = "user-context-pills";
+const SUBAGENTS_PANEL_SCENARIO = "subagents-panel";
 const E2E_SEED_COUNT_PREFIX = "__CODELY_E2E_SEED_COUNT__:";
 
 function getScenarioName(): string | null {
@@ -6672,6 +6673,207 @@ function seedUserContextPillsScenario() {
   return cleanup;
 }
 
+function seedSubagentsPanelScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  bridge.events = [{ type: "boot" }];
+  bridge.savedDocuments = [];
+  bridge.completed = true;
+
+  const workspace = "/tmp/e2e-subagents-panel";
+  const sessionId = 999702;
+  const turnId = "e2e-subagents-panel-turn";
+  const now = Date.now();
+  const requestedTheme = typeof window !== "undefined"
+    ? new URLSearchParams(window.location.search).get("theme")
+    : null;
+  const themeMode = requestedTheme === "light" || requestedTheme === "black" ? requestedTheme : "dark";
+  const userBlockId = useAppStore.getState()._nextTaskId();
+  const agentBlockId = useAppStore.getState()._nextTaskId();
+  const baseSubagent = {
+    parentTurnId: turnId,
+    threadId: `${workspace}:${sessionId}`,
+    role: "explorer",
+    profile: "local" as const,
+    provider: "OMLX",
+    model: "qwen3.6-35b-a3b",
+  };
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: {
+      ...state.config,
+      language: "zh",
+      workflowMode: "chat",
+      activeProfile: "local",
+      themeMode,
+      local: {
+        ...state.config.local,
+        provider: "OMLX",
+        model: "qwen3.6-35b-a3b",
+      },
+      sessionRecordingEnabled: false,
+    },
+    currentWorkspace: workspace,
+    selectedWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [{
+        id: sessionId,
+        title: "E2E Subagents Panel",
+        date: new Date(now).toISOString(),
+        active: true,
+        storageStatus: "temporary",
+        recordingDisabled: true,
+        messages: [],
+      }],
+    },
+    currentSessionId: sessionId,
+    selectedMainModeKey: "main_mode",
+    selectedNexusModeKey: "nexus_general",
+    taskFlow: [
+      { id: userBlockId, turnId, type: "user", content: "并行检查事件协议与右侧面板。" },
+      { id: agentBlockId, turnId, type: "agent", content: "已委派两个只读子智能体并收集执行状态。", streaming: false },
+    ],
+    conversationTurns: [{
+      id: turnId,
+      userPrompt: "并行检查事件协议与右侧面板。",
+      title: "子智能体执行检查",
+      intent: "analyze",
+      mode: "chat",
+      status: "done",
+      summary: "已完成一个子智能体，另一个仍在读取代码。",
+      blockIds: [userBlockId, agentBlockId],
+      collapsed: false,
+      createdAt: now - 20_000,
+    }],
+    currentTurnId: turnId,
+    runtimeEvents: [
+      {
+        schemaVersion: 1,
+        type: "subagent.created",
+        threadId: baseSubagent.threadId,
+        turnId,
+        timestampMs: now - 18_000,
+        subagent: {
+          ...baseSubagent,
+          id: "subagent-euler",
+          name: "Euler",
+          objective: "检查 runtime event 的创建、更新与关闭投影。",
+          status: "queued",
+          createdAt: now - 18_000,
+          updatedAt: now - 18_000,
+        },
+      },
+      {
+        schemaVersion: 1,
+        type: "subagent.updated",
+        threadId: baseSubagent.threadId,
+        turnId,
+        timestampMs: now - 12_000,
+        subagentId: "subagent-euler",
+        patch: {
+          status: "completed",
+          startedAt: now - 17_000,
+          completedAt: now - 12_000,
+          updatedAt: now - 12_000,
+          summary: "事件投影保持完成状态，并单独记录 closedAt。",
+          progress: { phase: "done", title: "执行完成", completedToolCalls: 2 },
+        },
+        activity: {
+          id: "euler-activity-1",
+          timestampMs: now - 12_000,
+          status: "completed",
+          title: "返回摘要",
+          tool: "read_file",
+          target: "src/lib/turnEvents.ts",
+        },
+      },
+      {
+        schemaVersion: 1,
+        type: "subagent.closed",
+        threadId: baseSubagent.threadId,
+        turnId,
+        timestampMs: now - 11_500,
+        subagentId: "subagent-euler",
+        closedAt: now - 11_500,
+        reason: "completed",
+      },
+      {
+        schemaVersion: 1,
+        type: "subagent.created",
+        threadId: baseSubagent.threadId,
+        turnId,
+        timestampMs: now - 8_000,
+        subagent: {
+          ...baseSubagent,
+          id: "subagent-mendel",
+          name: "Mendel",
+          role: "reviewer",
+          objective: "检查 ChatArea 点击提示与 RightPanel 详情联动。",
+          status: "running",
+          createdAt: now - 8_000,
+          updatedAt: now - 2_000,
+          startedAt: now - 7_500,
+          progress: {
+            phase: "tool",
+            title: "正在执行 read_file",
+            tool: "read_file",
+            target: "src/components/ChatArea.tsx",
+            completedToolCalls: 1,
+          },
+        },
+      },
+      {
+        schemaVersion: 1,
+        type: "subagent.updated",
+        threadId: baseSubagent.threadId,
+        turnId,
+        timestampMs: now - 2_000,
+        subagentId: "subagent-mendel",
+        patch: {
+          status: "running",
+          updatedAt: now - 2_000,
+          progress: {
+            phase: "tool",
+            title: "正在执行 read_file",
+            tool: "read_file",
+            target: "src/components/ChatArea.tsx",
+            completedToolCalls: 1,
+          },
+        },
+        activity: {
+          id: "mendel-activity-1",
+          timestampMs: now - 2_000,
+          status: "running",
+          title: "开始工具调用",
+          tool: "read_file",
+          target: "src/components/ChatArea.tsx",
+        },
+      },
+    ],
+    input: "",
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planStage: "idle",
+    isPlanApproved: false,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    selectedSubagentId: null,
+    agentStatus: "idle",
+    isGenerating: false,
+  }));
+
+  bindBridgeSnapshot(SUBAGENTS_PANEL_SCENARIO);
+  const cleanup = () => { bridge.initialized = false; };
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
 function seedSidebarRemoveLastWorkspaceScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -7054,6 +7256,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === USER_CONTEXT_PILLS_SCENARIO) {
     return seedUserContextPillsScenario();
+  }
+
+  if (scenario === SUBAGENTS_PANEL_SCENARIO) {
+    return seedSubagentsPanelScenario();
   }
 
   

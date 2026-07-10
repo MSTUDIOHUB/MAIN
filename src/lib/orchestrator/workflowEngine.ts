@@ -44,6 +44,8 @@ import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLife
 import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
+import { executeControlledSubagent } from "../subagentRuntime";
+import { projectSubagentRuns } from "../subagents";
 
 type WorkflowStoreState = any;
 
@@ -1876,6 +1878,26 @@ export class WorkflowEngine {
       onContextCompress: (stats: any, reason: "proactive" | "reactive" | "execute_recovery") => {
         logStoreEvent("context_compress", { stats, reason });
       },
+    };
+
+    callbacks.runSubagent = (request, runOptions) => {
+      const parentTurnId = context.uiDisplayTurnId || turnId;
+      const existingRunCount = projectSubagentRuns(sessionGet().runtimeEvents)
+        .filter((run) => run.parentTurnId === parentTurnId)
+        .length;
+      return executeControlledSubagent({
+        request,
+        parentCallbacks: callbacks,
+        parentTurnId,
+        parentSignal: runOptions?.signal || abortCtrl.signal,
+        existingRunCount,
+        emitEvent: (event) => {
+          sessionSet((state: any) => ({
+            runtimeEvents: appendRuntimeEvent(state.runtimeEvents, event),
+          }));
+        },
+        executeAgentLoop,
+      });
     };
 
     const closeHarnessForAgentLoopOutcome = (outcome: AgentLoopOutcome) => {

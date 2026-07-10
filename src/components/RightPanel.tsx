@@ -7,6 +7,7 @@ import {
   IconColumns,
   IconFileText,
   IconRefresh,
+  IconSubagent,
   IconTerminal,
 } from "./Icons";
 import { Terminal } from "@xterm/xterm";
@@ -21,6 +22,8 @@ import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWo
 import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty, type GitDiffEntry } from "../lib/ipc";
 import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
 import { safeConfirmAsync } from "../lib/safeConfirm";
+import SubagentsPanel from "./SubagentsPanel";
+import { projectSubagentRuns, resolveSubagentCapacityPolicy } from "../lib/subagents";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -985,6 +988,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     currentSessionId,
     selectedDiffTaskId,
     gitDiffPreview,
+    runtimeEvents,
+    selectedSubagentId,
+    selectSubagent,
+    stopSubagent,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -1010,6 +1017,10 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     currentSessionId: useAppStore((s) => s.currentSessionId),
     selectedDiffTaskId: useAppStore((s) => s.selectedDiffTaskId),
     gitDiffPreview: useAppStore((s) => s.gitDiffPreview),
+    runtimeEvents: useAppStore((s) => s.runtimeEvents),
+    selectedSubagentId: useAppStore((s) => s.selectedSubagentId),
+    selectSubagent: useAppStore((s) => s.selectSubagent),
+    stopSubagent: useAppStore((s) => s.stopSubagent),
   };
 
   const selectedDiffTask = useMemo(() => {
@@ -1163,6 +1174,11 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     return true;
   };
   const hasPlanPanelContent = planArtifacts.length > 0 || fallbackPlanPreview.length > 0;
+  const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
+  const subagentCapacityPolicy = useMemo(() => resolveSubagentCapacityPolicy(config), [config]);
+  const activeSubagentCount = subagentRuns.filter((run) =>
+    run.status === "queued" || run.status === "starting" || run.status === "running" || run.status === "summarizing"
+  ).length;
   const panelMeta = useMemo(() => {
     if (rightPanelTab === "diff") {
       return {
@@ -1184,14 +1200,23 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
         description: language === "zh" ? "这里会同步显示当前线程中的终端输出。" : "Terminal output for the current thread appears here.",
       };
     }
+    if (rightPanelTab === "subagents") {
+      return {
+        icon: IconSubagent,
+        title: language === "zh" ? "子智能体" : "Subagents",
+        description: activeSubagentCount > 0
+          ? language === "zh" ? `${activeSubagentCount} 个正在执行` : `${activeSubagentCount} running`
+          : language === "zh" ? `${subagentRuns.length} 个执行记录` : `${subagentRuns.length} run${subagentRuns.length === 1 ? "" : "s"}`,
+      };
+    }
     return {
       icon: IconFileText,
       title: language === "zh" ? "计划工作区" : "Plan Workspace",
       description: latestPlanTurn?.title || (language === "zh" ? "在这里查看计划预览、审批状态和执行进度。" : "Review plan previews, approval state, and execution progress here."),
     };
-  }, [changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, viewedDiffTask?.target]);
+  }, [activeSubagentCount, changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, subagentRuns.length, viewedDiffTask?.target]);
 
-  const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal;
+  const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal || (rightPanelTab === "subagents" && subagentRuns.length > 0);
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
   const isBlackTheme = config.themeMode === "black";
 
@@ -1253,6 +1278,19 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                       : fallbackPlanPreview
                       ? language === "zh" ? "预览" : "Preview"
                       : language === "zh" ? "空闲" : "Idle"}
+                  </span>
+                )}
+                {rightPanelTab === "subagents" && (
+                  <span className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] ${
+                    activeSubagentCount > 0
+                      ? "border-[rgba(96,165,250,0.28)] bg-[rgba(96,165,250,0.1)] text-[#93c5fd]"
+                      : isLightTheme
+                      ? "border-[#b7dfc5] bg-[#edf8f1] text-[#137333]"
+                      : "border-[rgba(52,211,153,0.24)] bg-[rgba(52,211,153,0.08)] text-[#86efac]"
+                  }`}>
+                    {activeSubagentCount > 0
+                      ? language === "zh" ? "执行中" : "Running"
+                      : language === "zh" ? "已收集" : "Collected"}
                   </span>
                 )}
               </div>
@@ -1320,6 +1358,18 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                 />
               </div>
             </div>
+          )}
+
+          {rightPanelTab === "subagents" && (
+            <SubagentsPanel
+              runs={subagentRuns}
+              selectedId={selectedSubagentId}
+              capacityPolicy={subagentCapacityPolicy}
+              language={language}
+              themeMode={config.themeMode}
+              onSelect={selectSubagent}
+              onStop={(id) => { stopSubagent(id); }}
+            />
           )}
         </div>
       </div>

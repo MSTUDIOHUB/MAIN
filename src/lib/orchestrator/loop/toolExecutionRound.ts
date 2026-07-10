@@ -103,6 +103,7 @@ export async function executeToolExecutionRound(input: {
       iterationAllTools,
       hooksConfig,
       {
+        abortSignal,
         turnContext: turnInputContextSignals,
         recentPlanToolActivity,
         attemptedPlanWriteTargets,
@@ -197,6 +198,7 @@ export async function executeToolExecutionRound(input: {
       iterationAllTools,
       hooksConfig,
       {
+        abortSignal,
         turnContext: turnInputContextSignals,
         recentPlanToolActivity,
         attemptedPlanWriteTargets,

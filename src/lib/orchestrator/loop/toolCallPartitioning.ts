@@ -401,6 +401,12 @@ export async function partitionToolCallsForExecution(input: {
         writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, skipUserReview: true });
         continue;
       }
+      // A repeated delegation is still a new isolated run; never reuse the
+      // read-only result cache for subagents.
+      if (tc.name === "spawn_subagent") {
+        readOnlyCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+        continue;
+      }
       let effectiveToolArgs = toolArgs;
       let signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
       let cached = readOnlyResultCache.get(signature);
