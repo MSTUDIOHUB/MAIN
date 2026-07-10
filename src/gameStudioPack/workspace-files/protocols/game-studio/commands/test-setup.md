@@ -3,7 +3,6 @@ name: test-setup
 description: "Scaffold the test framework and CI/CD pipeline for the project's engine. Creates the tests/ directory structure, engine-specific test runner configuration, and GitHub Actions workflow. Run once during Technical Setup phase before the first sprint begins."
 argument-hint: "[force]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Bash, Write
 ---
 
 # Test Setup
@@ -24,15 +23,15 @@ A test framework installed at sprint four costs 3 sprints.
 ## Phase 1: Detect Engine and Existing State
 
 1. **Read engine config**:
-   - Read `.claude/docs/technical-preferences.md` and extract the `Engine:` value.
+   - Read `.protocols/game-studio/docs/technical-preferences.md` and extract the `Engine:` value.
    - If engine is not configured (`[TO BE CONFIGURED]`), stop:
      "Engine not configured. Run `/setup-engine` first, then re-run `/test-setup`."
 
 2. **Check for existing test infrastructure**:
-   - Glob `tests/` — does the directory exist?
-   - Glob `tests/unit/` and `tests/integration/` — do subdirectories exist?
-   - Glob `.github/workflows/` — does a CI workflow file exist?
-   - Glob `tests/gdunit4_runner.gd` (Godot) or `tests/EditMode/` (Unity) or
+   - `glob_search` `tests/` — does the directory exist?
+   - `glob_search` `tests/unit/` and `tests/integration/` — do subdirectories exist?
+   - `glob_search` `.github/workflows/` — does a CI workflow file exist?
+   - `glob_search` `tests/gdunit4_runner.gd` (Godot) or `tests/EditMode/` (Unity) or
      `Source/Tests/` (Unreal) for engine-specific artifacts.
 
 3. **Report findings**:

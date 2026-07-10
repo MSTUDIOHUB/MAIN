@@ -2,17 +2,18 @@
 
 ```text
 /
-├── CLAUDE.md                    # Master configuration
-├── .claude/                     # Agent definitions, skills, hooks, rules, docs
-├── src/                         # Game source code (core, gameplay, ai, networking, ui, tools)
-├── assets/                      # Game assets (art, audio, vfx, shaders, data)
-├── design/                      # Game design documents (gdd, narrative, levels, balance)
-├── docs/                        # Technical documentation (architecture, api, postmortems)
-│   └── engine-reference/        # Curated engine API snapshots (version-pinned)
-├── tests/                       # Test suites (unit, integration, performance, playtest)
-├── tools/                       # Build and pipeline tools (ci, build, asset-pipeline)
-├── prototypes/                  # Throwaway prototypes (isolated from src/)
-└── production/                  # Production management (sprints, milestones, releases)
-    ├── session-state/           # Ephemeral session state (active.md — gitignored)
-    └── session-logs/            # Session audit trail (gitignored)
+|-- AGENTS.md                    # Optional project guidance
+|-- .MAIN/
+|   |-- hooks.json               # MAIN lifecycle hook registration
+|   |-- game-studio/             # Studio config, manifest, and hook scripts
+|   |-- rules/game-studio/       # Path-scoped game development rules
+|   `-- templates/game-studio/   # Design and production templates
+|-- .protocols/game-studio/      # Commands, specialists, and workflow docs
+|-- src/                         # Game source code
+|-- assets/                      # Game assets and data
+|-- design/                      # Game design documents
+|-- docs/                        # Technical documentation
+|-- tests/                       # Test suites
+|-- prototypes/                  # Isolated prototypes
+`-- production/                  # Sprints, milestones, and release artifacts
 ```

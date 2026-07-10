@@ -49,8 +49,11 @@ export interface CloudServerConfig extends CloudProfileConfig {
 }
 
 export const DEFAULT_CLOUD_SERVER_ID = "cloud-server-default";
-const DEFAULT_OPENAI_ENDPOINT = "https://api.openai.com/v1";
-const DEFAULT_GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com";
+export const DEFAULT_CLOUD_ENDPOINTS: Record<CloudApiProtocol, string> = {
+  openai: "https://api.openai.com/v1",
+  anthropic: "https://api.anthropic.com",
+  gemini: "https://generativelanguage.googleapis.com",
+};
 
 function cleanString(value: unknown): string {
   return typeof value === "string" ? value : "";
@@ -60,10 +63,8 @@ function cleanNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-function defaultEndpointForProtocol(protocol: CloudApiProtocol): string {
-  if (protocol === "anthropic") return "https://api.anthropic.com";
-  if (protocol === "gemini") return DEFAULT_GEMINI_ENDPOINT;
-  return DEFAULT_OPENAI_ENDPOINT;
+export function getDefaultCloudEndpoint(protocol: CloudApiProtocol): string {
+  return DEFAULT_CLOUD_ENDPOINTS[protocol];
 }
 
 function defaultProviderForProtocol(protocol: CloudApiProtocol): string {
@@ -104,7 +105,7 @@ export function createDefaultCloudConfig(): CloudProfileConfig {
     protocol: "openai",
     apiFormat: "chat_completions",
     provider: "OpenAI",
-    endpoint: DEFAULT_OPENAI_ENDPOINT,
+    endpoint: getDefaultCloudEndpoint("openai"),
     model: "",
     apiKey: "",
     customHeaders: "",
@@ -127,7 +128,7 @@ function hasMeaningfulLegacyCloudConfig(input?: Partial<CloudProfileConfig> | nu
     protocol !== "openai" ||
     apiFormat !== "chat_completions" ||
     (provider.length > 0 && provider !== "OpenAI") ||
-    (endpoint.length > 0 && endpoint !== DEFAULT_OPENAI_ENDPOINT) ||
+    (endpoint.length > 0 && endpoint !== getDefaultCloudEndpoint("openai")) ||
     cleanString(input.model).trim().length > 0 ||
     cleanString(input.apiKey).trim().length > 0 ||
     cleanString(input.customHeaders).trim().length > 0
@@ -146,7 +147,7 @@ export function normalizeCloudConfig(input?: Partial<CloudProfileConfig> | null)
       authMode: auth.mode,
     });
   const provider = cleanString(input?.provider).trim() || defaultProviderForProtocol(protocol);
-  const endpoint = cleanString(input?.endpoint).trim() || defaultEndpointForProtocol(protocol);
+  const endpoint = cleanString(input?.endpoint).trim() || getDefaultCloudEndpoint(protocol);
 
   return {
     protocol,

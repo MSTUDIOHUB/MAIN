@@ -3,9 +3,6 @@ name: patch-notes
 description: "生成面向玩家的更新说明，强调体验变化和重点修复。"
 argument-hint: "[version] [--style brief|detailed|full]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Bash
-model: haiku
-agent: community-manager
 ---
 
 ## 阶段 1: Parse Arguments
@@ -40,7 +37,7 @@ nor a `docs/CHANGELOG.md` entry for this version exists, and git log is empty or
 
 **Tone guide detection** — before drafting notes, check for writing style guidance:
 
-1. 检查 `.claude/docs/technical-preferences.md` for any "tone", "voice", or "style"
+1. 检查 `.protocols/game-studio/docs/technical-preferences.md` for any "tone", "voice", or "style"
    fields or sections.
 2. 检查 `docs/PATCH-NOTES-STYLE.md` if it exists.
 3. 检查 `design/community/tone-guide.md` if it exists.
@@ -52,7 +49,7 @@ nor a `docs/CHANGELOG.md` entry for this version exists, and git log is empty or
 
 **Template detection** — check whether a patch notes template exists:
 
-1. Glob for `docs/patch-notes-template.md` and `.claude/docs/templates/patch-notes-template.md`.
+1. Use `glob_search` to look for a project-owned `docs/patch-notes-template.md`.
 2. If found at either location, read it and use it as the output structure for Phase 4
    instead of the built-in style templates (Brief / Detailed / Full). Fill in the
    template's sections with the categorized data.

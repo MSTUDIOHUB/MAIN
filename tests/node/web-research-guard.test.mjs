@@ -80,10 +80,14 @@ test("anchors latest Unity searches to the current local date", () => {
 });
 
 test("orchestrator gates forced research behind the web search switch", () => {
-  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
+  const phaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantDisplayActionPhase.ts"), "utf8");
+  const actionRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantActionRouting.ts"), "utf8");
+  const turnPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/turnPreparation.ts"), "utf8");
 
-  assert.match(source, /const shouldInjectRequiredWebResearchCall =\s*\n\s*webSearchEnabled &&/);
-  assert.match(source, /availableToolNames\.has\("web_search"\)/);
-  assert.match(source, /shouldRequireWebResearchForPrompt\(latestUserPromptText\)/);
-  assert.match(source, /formatWebResearchLocalDate\(\)/);
+  assert.match(phaseSource, /resolveAssistantActionRouting\(\{/);
+  assert.match(actionRoutingSource, /const shouldInjectRequiredWebResearchCall =\s*\n\s*input\.webSearchEnabled &&/);
+  assert.match(actionRoutingSource, /input\.availableToolNames\.has\("web_search"\)/);
+  assert.match(actionRoutingSource, /shouldRequireWebResearchForPrompt\(input\.latestUserPromptText\)/);
+  assert.match(actionRoutingSource, /WEB_RESEARCH_TOOL_NAMES\.has\(activity\.name \|\| ""\)/);
+  assert.match(turnPreparationSource, /formatWebResearchLocalDate\(\)/);
 });

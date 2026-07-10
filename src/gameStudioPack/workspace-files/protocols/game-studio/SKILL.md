@@ -31,11 +31,14 @@ When the user message includes a `GAME_STUDIO_CONTEXT` block:
 
 - `/agent <slug>` means the user wants that specialist lens to stay active across subsequent turns.
 - `/auto` means clear the sticky specialist and return to automatic orchestration.
-- Do not pretend to be multiple agents at once unless the command explicitly calls for cross-functional coordination.
+- A specialist profile is a domain viewpoint, not an independent model process.
+- When a command requests several specialists, apply each profile as a clearly separated review pass in the current MAIN run. Do not claim that independent agents ran unless MAIN actually exposed and executed such a tool.
 
 ## MAIN Adaptation Notes
 
-- This pack runs inside MAIN, not Claude Code.
-- Compatible assets are preserved directly: command specs, agent specs, templates, rules, docs.
+- `.MAIN/game-studio/studio.config.json` is the runtime source of truth for engine, review mode, and sticky specialist state.
+- `AGENTS.md` remains optional project guidance; Game Studio initialization does not require it.
+- Command frontmatter does not grant tools. Use only the tools currently exposed by MAIN and follow MAIN's approval model.
+- Unsupported named-tool or independent-agent instructions describe workflow intent only. Perform equivalent specialist passes with the current MAIN tool surface instead of fabricating unsupported calls.
 - Hook behavior is adapted to MAIN's four lifecycle events: `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`.
-- If a referenced upstream behavior depends on Claude Code-only features, follow the documented intent but stay inside MAIN's actual tool and approval model.
+- The installed pack owns only `.protocols/game-studio` and `.MAIN` workspace assets.

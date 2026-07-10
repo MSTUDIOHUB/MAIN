@@ -3,19 +3,18 @@ name: asset-audit
 description: "审查现有资产是否符合命名、格式、预算、风格和制作规范。"
 argument-hint: "[category|all]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
 # Read-only diagnostic skill — no specialist agent delegation needed
 ---
 
 ## 阶段 1: Read Standards
 
-Read the art bible or asset standards from the relevant design docs and the CLAUDE.md naming conventions.
+Read the art bible or asset standards from the relevant design docs and the AGENTS.md naming conventions.
 
 ---
 
 ## 阶段 2: Scan Asset Directories
 
-Scan the target asset directory using Glob:
+Scan the target asset directory using `glob_search`:
 
 - `assets/art/**/*` for art assets
 - `assets/audio/**/*` for audio assets
@@ -89,6 +88,6 @@ Scan the target asset directory using Glob:
 
 ## 阶段 5: Next Steps
 
-- Fix naming violations using the patterns defined in CLAUDE.md.
+- Fix naming violations using the patterns defined in AGENTS.md.
 - Delete confirmed orphaned assets after manual review.
 - Run `/content-audit` to cross-check asset counts against GDD-specified requirements.

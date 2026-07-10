@@ -79,6 +79,16 @@ const {
   compactContextForExecuteRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/contextTrim.ts"));
 
+const {
+  handleExecuteNoToolRecovery,
+  isExecuteRuntimeRequiringEvidence,
+  resolveExecuteNoToolCheckpointLimit,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeNoToolRecovery.ts"));
+
+const {
+  handleMaxIterationBoundary,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/maxIterationBoundary.ts"));
+
 const readOnlyTools = new Set([
   "get_project_skeleton",
   "list_directory",
@@ -95,6 +105,134 @@ const readOnlyTools = new Set([
   "read_pty_since",
   "get_pty_status",
 ]);
+
+function createExecuteNoToolHarness(language = "en") {
+  const appended = [];
+  const statuses = [];
+  const streamTokens = [];
+  const stops = [];
+  return {
+    appended,
+    statuses,
+    streamTokens,
+    stops,
+    callbacks: {
+      getPreferredLanguage: () => language,
+      appendMessage: (message) => appended.push(message),
+      onStatusChange: (status) => statuses.push(status),
+      onStreamToken: (token, id) => streamTokens.push({ token, id }),
+      onNonActionableStop: (message, reason, progress) => stops.push({ message, reason, progress }),
+    },
+  };
+}
+
+function createExecuteNoToolInput(harness, overrides = {}) {
+  return {
+    callbacks: harness.callbacks,
+    activeProfile: "cloud",
+    iteration: 2,
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    forceXmlTools: false,
+    availableToolNames: new Set(["read_file", "apply_patch", "run_command"]),
+    effectiveToolCallCount: 0,
+    finalReplyOptionsCount: 0,
+    shouldPauseForUserChoice: false,
+    sawExecuteOperationEvidence: false,
+    visibleText: "I have completed the requested changes and verified them.",
+    assistantMsgId: "assistant-1",
+    consecutiveNoToolCount: 0,
+    ...overrides,
+  };
+}
+
+test("execute no-tool recovery reprompts completion claims without evidence", () => {
+  const harness = createExecuteNoToolHarness("en");
+  const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.consecutiveNoToolCount, 1);
+  assert.deepEqual(harness.statuses, ["running"]);
+  assert.deepEqual(harness.streamTokens, [{ token: "__ESCALATION_RESET__:", id: "assistant-1" }]);
+  assert.equal(harness.appended.length, 1);
+  assert.match(harness.appended[0].content, /no real tool evidence/i);
+  assert.match(harness.appended[0].content, /Start real tool actions/i);
+  assert.equal(harness.stops.length, 0);
+});
+
+test("generic max-iteration boundary emits stop, idle, and completion in order", async () => {
+  const order = [];
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      onNonActionableStop: (_message, reason, progress) => {
+        order.push(`stop:${reason}:${progress?.recoveryReason}`);
+      },
+      onStatusChange: (status) => order.push(`status:${status}`),
+    },
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    effectiveMaxIterations: 8,
+    recentPlanToolActivity: [],
+    recentToolActivity: [],
+    lastAssistantTextForCheckpoint: "",
+    sawExecuteOperationEvidence: false,
+    executeRecoveryMode: "off",
+    emitPlanExecutionProgress: () => {},
+    emitTurnCompletedEvent: () => order.push("turn:completed"),
+  });
+
+  assert.deepEqual(order, [
+    "stop:no_action:max_iterations_boundary",
+    "status:idle",
+    "turn:completed",
+  ]);
+});
+
+test("execute no-tool recovery stops local completion loops at checkpoint", () => {
+  const harness = createExecuteNoToolHarness("zh");
+  const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
+    activeProfile: "local",
+    consecutiveNoToolCount: 4,
+    visibleText: "已经修复完成并验证通过。",
+  }));
+
+  assert.equal(resolveExecuteNoToolCheckpointLimit("local"), 5);
+  assert.equal(resolveExecuteNoToolCheckpointLimit("cloud") < resolveExecuteNoToolCheckpointLimit("local"), true);
+  assert.equal(result.status, "stopped");
+  assert.equal(result.consecutiveNoToolCount, 5);
+  assert.deepEqual(harness.statuses, ["running", "idle"]);
+  assert.equal(harness.appended.length, 0);
+  assert.equal(harness.stops.length, 1);
+  assert.equal(harness.stops[0].reason, "no_action");
+  assert.match(harness.stops[0].message, /没有产生真实工具调用或文件变更/);
+});
+
+test("execute no-tool recovery reprompts XML profiles to emit executable tool calls", () => {
+  const harness = createExecuteNoToolHarness("zh");
+  const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
+    activeProfile: "local",
+    forceXmlTools: true,
+    turnIntent: "respond",
+    runtimeIntent: "studio_workflow",
+    visibleText: "我会先修改文件，然后运行验证。",
+  }));
+
+  assert.equal(isExecuteRuntimeRequiringEvidence({
+    workflowMode: "plan",
+    turnIntent: "respond",
+    runtimeIntent: "studio_workflow",
+  }), true);
+  assert.equal(result.status, "continue");
+  assert.equal(result.consecutiveNoToolCount, 1);
+  assert.deepEqual(harness.statuses, ["running"]);
+  assert.equal(harness.appended.length, 1);
+  assert.match(harness.appended[0].content, /XML 工具协议/);
+  assert.match(harness.appended[0].content, /<tool_use>/);
+  assert.match(harness.appended[0].content, /read_file, apply_patch, run_command/);
+});
 
 test("execute recovery mutation-first surface removes broad reads and search tools", () => {
   const names = [
@@ -497,25 +635,46 @@ test("execute recovery context compaction keeps recent complete tool pairs witho
 });
 
 test("orchestrator wires execute convergence and max-iteration recovery before idle completion", () => {
-  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
+  const source = (
+    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") +
+    "\n" +
+    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8") +
+    "\n" +
+    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"), "utf8") +
+    "\n" +
+    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/finalTextOnlyToolCallHandling.ts"), "utf8") +
+    "\n" +
+    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"), "utf8") +
+    "\n" +
+    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/maxIterationBoundary.ts"), "utf8")
+  );
+  const streamInvocationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"), "utf8");
+  const toolCallPlanningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"), "utf8");
+  const contextManagementSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/contextManagement.ts"), "utf8");
+  const executeRecoveryRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"), "utf8");
+  const loopControlRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopControlRuntime.ts"), "utf8");
+  const loopRuntimeActionsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRuntimeActions.ts"), "utf8");
 
-  assert.match(source, /execute_recovery_tool_scope_applied/);
-  assert.match(source, /const effectiveExecuteRecoveryFileRead =[\s\S]*executeRecoveryMode === "patch_recovery_read" \|\| allowExecuteRecoveryFileRead/);
-  assert.match(source, /adaptiveFileReadAllowed: allowExecuteRecoveryFileRead/);
-  assert.match(source, /execute_recovery_context_compacted/);
-  assert.match(source, /isExecuteRecoveryEligible && contextForceForManagement\?\.shouldForce/);
-  assert.match(source, /execute_recovery_context_skipped/);
+  assert.match(source, /resolveIterationToolSurface\(\{/);
+  assert.match(toolCallPlanningSource, /execute_recovery_tool_scope_applied/);
+  assert.match(toolCallPlanningSource, /const effectiveExecuteRecoveryFileRead =[\s\S]*executeRecoveryMode === "patch_recovery_read" \|\| allowExecuteRecoveryFileRead/);
+  assert.match(toolCallPlanningSource, /adaptiveFileReadAllowed: allowExecuteRecoveryFileRead/);
+  assert.match(source, /prepareManagedMessagesForIteration\(\{/);
+  assert.match(contextManagementSource, /execute_recovery_context_compacted/);
+  assert.match(contextManagementSource, /isExecuteRecoveryEligible && contextForceForManagement\?\.shouldForce/);
+  assert.match(contextManagementSource, /execute_recovery_context_skipped/);
   assert.match(source, /activateExecuteRecovery\("mutation_first", "execute_convergence_prompt"/);
-  assert.match(source, /const recoveryToolChoice:[\s\S]*toolChoice: recoveryToolChoice/);
-  assert.match(source, /executeRecoveryAttempts \+= 1/);
+  assert.match(streamInvocationSource, /const recoveryToolChoice =[\s\S]*toolChoice: recoveryToolChoice/);
+  assert.match(executeRecoveryRuntimeSource, /attempts: state\.attempts \+ 1/);
+  assert.match(executeRecoveryRuntimeSource, /MAX_EXECUTE_RECOVERY_ITERATIONS = 6/);
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);
-  assert.match(source, /resolveAgentLoopMaxIterations/);
-  assert.match(source, /buildMaxStepsFinalTextPrompt/);
+  assert.match(loopControlRuntimeSource, /resolveAgentLoopMaxIterations/);
+  assert.match(streamInvocationSource, /buildMaxStepsFinalTextPrompt/);
   assert.match(source, /recoveryReason: "max_iterations_boundary"/);
   assert.match(source, /normalizeNoProgressResultContent/);
   assert.match(source, /resolveReadOnlyNoProgressTrigger/);
-  assert.match(source, /buildChatFinalSynthesisPrompt/);
-  assert.match(source, /chat_final_synthesis_activated/);
+  assert.match(streamInvocationSource, /buildChatFinalSynthesisPrompt/);
+  assert.match(loopRuntimeActionsSource, /chat_final_synthesis_activated/);
   assert.match(source, /chat_readonly_no_progress_final_synthesis/);
   assert.match(source, /chat_final_synthesis_tool_calls_ignored/);
   assert.match(source, /looksLikeRepairExecutionRequest/);
@@ -529,7 +688,7 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
 });
 
 test("orchestrator evidence reconcile logs failed tool summaries", () => {
-  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultPostProcessing.ts"), "utf8");
 
   assert.match(source, /failedEvidenceResults/);
   assert.match(source, /firstFailureReason/);

@@ -3,8 +3,6 @@ name: project-stage-detect
 description: "自动分析项目现状、识别所处阶段、发现缺口并推荐下一步；适合询问当前开发进度或做全项目审计。"
 argument-hint: "[可选： role filter like 'programmer' 或 'designer']"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Bash, Write
-model: haiku
 # Read-only diagnostic skill — no specialist agent delegation needed
 ---
 
@@ -85,7 +83,7 @@ auto-detect using these heuristics (check from most-advanced backward):
 
 ### 4. Generate Stage 报告
 
-Use template: `.claude/docs/templates/project-stage-report.md`
+Use template: `.MAIN/templates/game-studio/project-stage-report.md`
 
 **报告 structure**:
 ```markdown

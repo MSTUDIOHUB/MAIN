@@ -5,7 +5,7 @@ import type {
   PendingSlashCommand,
   ParsedSetupEngineArgs,
   StudioAgentKey,
-} from "../lib/gameStudioCatalog";
+} from "../lib/gameStudio/catalog";
 import type { MainModeKey } from "../lib/mainModes";
 import type {
   CommandDirective,

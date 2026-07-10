@@ -124,7 +124,7 @@ export function shouldClosePlanToolSurfaceAfterReadOnlyConvergence(input: {
   return hasReadyPlanEvidence(input.evidenceReadiness);
 }
 
-export function shouldRedirectPlanToolsAfterReadOnlyConvergence(input: {
+export function shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence(input: {
   workflowMode: PlanRuntimeMode;
   isPlanApproved: boolean;
   convergencePromptAlreadyUsed: boolean;

@@ -51,7 +51,7 @@ import {
   getAttachmentDisplayName,
   SUPPORTED_ATTACHMENT_EXTENSIONS,
 } from "./lib/attachments";
-import { normalizeStudioAgentKey } from "./lib/gameStudioCatalog";
+import { normalizeStudioAgentKey } from "./lib/gameStudio/catalog";
 import { normalizeContextMemoryState } from "./lib/contextMemory";
 import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
 import { createDefaultImageStudioRuntime, normalizeImageStudioRuntime } from "./lib/imageStudio";

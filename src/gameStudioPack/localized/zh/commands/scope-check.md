@@ -3,8 +3,6 @@ name: scope-check
 description: "对照原始范围检测需求膨胀，评估当前内容是否超出既定目标。"
 argument-hint: "[功能名或 sprint-N]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Bash
-model: haiku
 ---
 
 # 范围检查
@@ -14,7 +12,7 @@ model: haiku
 Compares original planned scope against current state to detect, quantify, and triage
 scope creep.
 
-**Argument:** `$ARGUMENTS[0]` — feature name, sprint number, or milestone name.
+**Argument:** `the first token after the slash command in the current user request` — feature name, sprint number, or milestone name.
 
 ---
 

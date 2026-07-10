@@ -60,6 +60,35 @@ const {
   shouldRedirectPlanToolsAfterReadOnlyConvergence,
   shouldTriggerPlanReadOnlyConvergence,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planReadOnlyConvergence.ts"));
+const {
+  handlePlanPostConvergenceToolRedirect,
+  handlePlanReadOnlyConvergence,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planConvergence.ts"));
+const {
+  handlePlanQualityRecoveryAfterToolResults,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planQualityRecovery.ts"));
+
+function createPlanConvergenceCallbacks(language = "en") {
+  const appended = [];
+  const assistantFinal = [];
+  const statuses = [];
+  const streamTokens = [];
+  return {
+    appended,
+    assistantFinal,
+    statuses,
+    streamTokens,
+    callbacks: {
+      getPreferredLanguage: () => language,
+      getMessages: () => [],
+      getIsPlanApproved: () => false,
+      appendMessage: (message) => appended.push(message),
+      onAssistantFinalText: (text, options, meta) => assistantFinal.push({ text, options, meta }),
+      onStatusChange: (status) => statuses.push(status),
+      onStreamToken: (token, id) => streamTokens.push({ token, id }),
+    },
+  };
+}
 
 test("plan evidence readiness requires observed user context and targeted reads", () => {
   assert.deepEqual(
@@ -224,6 +253,240 @@ test("plan read-only convergence tightens when user supplied screenshots or file
       { name: "grep_search", target: "App", status: "succeeded" },
     ],
   }), true);
+});
+
+test("plan convergence helper emits the first convergence prompt and updates counters", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const phases = [];
+  const result = handlePlanReadOnlyConvergence({
+    callbacks: harness.callbacks,
+    iteration: 4,
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    successfulReadOnlyExplorationResultCount: 1,
+    planReadOnlyConvergenceBatches: 2,
+    planReadOnlyConvergenceTools: 2,
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: { imageParts: 0, mentionedFilePaths: [], attachedFilePaths: [], externalAttachments: [] },
+    recentPlanToolActivity: [
+      { name: "grep_search", target: "csv|dashboard", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+    ],
+    lastAssistantTextForCheckpoint: "",
+    setPlanRuntimePhase: (phase, reason) => phases.push({ phase, reason }),
+  });
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planReadOnlyConvergenceBatches, 3);
+  assert.equal(result.planReadOnlyConvergenceTools, 3);
+  assert.equal(result.usedPlanReadOnlyConvergencePrompt, true);
+  assert.equal(harness.appended.length, 1);
+  assert.equal(harness.appended[0].role, "user");
+  assert.match(harness.appended[0].content, /PLAN_READONLY_CONVERGENCE/);
+  assert.deepEqual(phases.map((item) => item.phase), ["synthesis", "drafting"]);
+});
+
+test("plan convergence helper does not re-trigger once the convergence prompt has been used", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanReadOnlyConvergence({
+    callbacks: harness.callbacks,
+    iteration: 5,
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    successfulReadOnlyExplorationResultCount: 1,
+    planReadOnlyConvergenceBatches: 3,
+    planReadOnlyConvergenceTools: 12,
+    usedPlanReadOnlyConvergencePrompt: true,
+    turnInputContextSignals: { imageParts: 0, mentionedFilePaths: [], attachedFilePaths: [], externalAttachments: [] },
+    recentPlanToolActivity: [
+      { name: "grep_search", target: "csv|dashboard", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+    ],
+    lastAssistantTextForCheckpoint: "",
+    setPlanRuntimePhase: (phase, reason) => phases.push({ phase, reason }),
+  });
+
+  assert.equal(result.status, "none");
+  assert.equal(result.planReadOnlyConvergenceBatches, 4);
+  assert.equal(result.planReadOnlyConvergenceTools, 13);
+  assert.equal(result.usedPlanReadOnlyConvergencePrompt, true);
+  assert.equal(harness.assistantFinal.length, 0);
+  assert.equal(harness.appended.length, 0);
+  assert.deepEqual(harness.statuses, []);
+  assert.deepEqual(phases, []);
+});
+
+test("plan quality recovery routes rejected plan drafts to targeted evidence", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterToolResults({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 6,
+    results: [{
+      toolCallId: "quality-1",
+      name: "write_file",
+      target: ".MAIN/plans/plan.md",
+      content: "quality gate rejected",
+      isError: true,
+      internalFeedback: true,
+      planRecoveryAction: "targeted_evidence",
+      qualityGateReason: "missing_plan_required_sections:read_evidence",
+      missingPlanSections: ["Read Evidence"],
+    }],
+    planRuntimePhase: "drafting",
+    recentPlanToolActivity: [],
+    attemptedPlanWriteTargets: [".MAIN/plans/plan.md"],
+    latestUserPromptText: "Draft a grounded plan",
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planQualityRejectCount, 1);
+  assert.equal(result.planLastQualityGateReason, "missing_plan_required_sections:read_evidence");
+  assert.deepEqual(result.planLastMissingSections, ["Read Evidence"]);
+  assert.equal(result.pendingPlanRuntimeRecoveryPrompt, null);
+  assert.deepEqual(phases, [{
+    phase: "needs_evidence",
+    reason: "missing_plan_required_sections:read_evidence",
+    status: "running",
+  }]);
+});
+
+test("plan quality recovery closes a successful evidence recovery pass", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const recentActivity = [
+    { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "export function App" },
+  ];
+  const result = handlePlanQualityRecoveryAfterToolResults({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 7,
+    results: [{
+      toolCallId: "read-1",
+      name: "read_file",
+      target: "src/App.tsx",
+      content: "export function App() {}",
+      isError: false,
+    }],
+    planRuntimePhase: "needs_evidence",
+    recentPlanToolActivity: recentActivity,
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Draft a grounded plan",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "missing_plan_required_sections:read_evidence",
+    planLastMissingSections: ["Read Evidence"],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planEvidenceRecoveryPasses, 1);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt, /PLAN_EVIDENCE_RECOVERY_COMPLETE/);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt, /定向补证已经完成/);
+  assert.deepEqual(phases, [{
+    phase: "drafting",
+    reason: "evidence recovery complete",
+    status: "running",
+  }]);
+});
+
+function createPostConvergenceInput(overrides = {}) {
+  const harness = overrides.harness || createPlanConvergenceCallbacks("en");
+  const phases = [];
+  return {
+    harness,
+    phases,
+    input: {
+      callbacks: harness.callbacks,
+      iteration: 7,
+      workflowMode: "plan",
+      availableToolNames: new Set(["read_file", "write_file", "replace_in_file"]),
+      effectiveToolCalls: [{ id: "call_read", name: "read_file", arguments: "{}" }],
+      isAllowedUnapprovedPlanDraftMutationCall: () => false,
+      hasPlanDecisionOutput: false,
+      usedPlanReadOnlyConvergencePrompt: true,
+      turnInputContextSignals: { imageParts: 0, mentionedFilePaths: [], attachedFilePaths: [], externalAttachments: [] },
+      recentPlanToolActivity: [
+        { name: "grep_search", target: "dashboard", status: "succeeded" },
+        { name: "read_file", target: "src/App.tsx", status: "succeeded" },
+      ],
+      lastAssistantTextForCheckpoint: "",
+      visibleAssistantText: "",
+      assistantHistoryText: "",
+      providerReasoningForHistory: null,
+      assistantMsgId: "assistant-1",
+      planRuntimePhase: "drafting",
+      planPostConvergenceToolRedirectCount: 0,
+      planDraftingRecoveryReadCount: 0,
+      planReasoningOnlyRecoveryPasses: 0,
+      planEvidenceRecoveryPasses: 0,
+      planQualityRejectCount: 0,
+      planAutoScaffoldPromptIssued: false,
+      planLastQualityGateReason: "",
+      planLastMissingSections: [],
+      latestUserPromptText: "Fix the dashboard",
+      setPlanRuntimePhase: (phase, reason) => phases.push({ phase, reason }),
+      ...overrides.input,
+    },
+  };
+}
+
+test("post-convergence helper injects the single drafting recovery read", () => {
+  const { harness, phases, input } = createPostConvergenceInput({
+    input: {
+      visibleAssistantText: "I need one more file.",
+      assistantHistoryText: "I need one more file.",
+    },
+  });
+  const result = handlePlanPostConvergenceToolRedirect(input);
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planPostConvergenceToolRedirectCount, 0);
+  assert.equal(result.planDraftingRecoveryReadCount, 1);
+  assert.equal(result.planReasoningOnlyRecoveryPasses, 1);
+  assert.equal(result.planAutoScaffoldPromptIssued, false);
+  assert.equal(harness.appended.length, 2);
+  assert.equal(harness.appended[0].role, "assistant");
+  assert.equal(harness.appended[1].role, "user");
+  assert.match(harness.appended[1].content, /PLAN_DRAFTING_RECOVERY_READ/);
+  assert.deepEqual(harness.statuses, []);
+  assert.deepEqual(harness.streamTokens, []);
+  assert.deepEqual(phases, []);
+});
+
+test("post-convergence helper forces a plan write after recovery is exhausted", () => {
+  const { harness, phases, input } = createPostConvergenceInput({
+    input: {
+      effectiveToolCalls: [{ id: "call_list", name: "list_directory", arguments: "{}" }],
+      planRuntimePhase: "synthesis",
+      planPostConvergenceToolRedirectCount: 1,
+      planDraftingRecoveryReadCount: 1,
+      planReasoningOnlyRecoveryPasses: 0,
+      planEvidenceRecoveryPasses: 3,
+    },
+  });
+  const result = handlePlanPostConvergenceToolRedirect(input);
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planPostConvergenceToolRedirectCount, 2);
+  assert.equal(result.planDraftingRecoveryReadCount, 1);
+  assert.equal(result.planReasoningOnlyRecoveryPasses, 0);
+  assert.equal(result.planAutoScaffoldPromptIssued, false);
+  assert.equal(harness.appended.length, 1);
+  assert.equal(harness.appended[0].role, "user");
+  assert.match(harness.appended[0].content, /FORCED WRITE/);
+  assert.deepEqual(harness.statuses, ["running"]);
+  assert.deepEqual(harness.streamTokens, [{ token: "__ESCALATION_RESET__:", id: "assistant-1" }]);
+  assert.deepEqual(phases, [{ phase: "drafting", reason: "recovery exhausted, write with existing evidence" }]);
 });
 
 test("post-convergence plan turns redirect more read-only tools before execution", () => {

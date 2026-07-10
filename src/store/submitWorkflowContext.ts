@@ -1,6 +1,6 @@
 import type { AttachedFile } from "../lib/attachments";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
-import type { StudioConfig } from "../lib/gameStudioCatalog";
+import type { StudioConfig } from "../lib/gameStudio/catalog";
 import type { CommandDirective, ResolvedRunIntent } from "../lib/runIntent";
 import type { WorkflowContext } from "../lib/orchestrator/workflowEngine";
 

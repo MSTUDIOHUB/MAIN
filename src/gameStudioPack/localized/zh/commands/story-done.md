@@ -3,7 +3,6 @@ name: story-done
 description: "核对实现结果与验收标准，确认是否可以关闭 Story。"
 argument-hint: "[story-file-path] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Bash, Edit, AskUserQuestion, Task
 ---
 
 # Story Done
@@ -20,12 +19,12 @@ forgotten, and the story file reflects actual completion status.
 
 ## 阶段 1: Find the Story
 
-Resolve the review mode (once, store for all gate spawns this run):
+Resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern.
 
 **If a file path is provided** (e.g., `/story-done production/epics/core/story-damage-calculator.md`):
 read that file directly.
@@ -35,7 +34,7 @@ read that file directly.
 1. 检查 `production/session-state/active.md` for the currently active story.
 2. If not found there, read the most recent file in `production/sprints/` and
    look for stories marked IN PROGRESS.
-3. If multiple in-progress stories are found, use `AskUserQuestion`:
+3. If multiple in-progress stories are found, ask the user:
    - "Which story are we completing?"
    - Options: list the in-progress story file names.
 4. If no story can be found, ask the user to provide the path.
@@ -77,21 +76,21 @@ three methods:
 
 ### Automatic verification (run without asking)
 
-- **File existence check**: `Glob` for files the story said would be created.
-- **Test pass check**: if a test file path is mentioned, run it via `Bash`.
-- **No hardcoded values check**: `Grep` for numeric literals in gameplay code
+- **File existence check**: `glob_search` for files the story said would be created.
+- **Test pass check**: if a test file path is mentioned, run it via `run_command`.
+- **No hardcoded values check**: `grep_search` for numeric literals in gameplay code
   paths that should be in config files.
-- **No hardcoded strings check**: `Grep` for player-facing strings in `src/`
+- **No hardcoded strings check**: `grep_search` for player-facing strings in `src/`
   that should be in localization files.
 - **Dependency check**: if a criterion says "depends on X", check that X exists.
 
-### Manual verification with confirmation (use `AskUserQuestion`)
+### Manual verification with confirmation (ask the user)
 
 - Criteria about subjective qualities ("feels responsive", "animations play correctly")
 - Criteria about gameplay behaviour ("player takes damage when...", "enemy responds to...")
 - Performance criteria ("completes within Xms") — ask if profiled or accept as assumed
 
-Batch up to 4 manual verification questions into a single `AskUserQuestion` call:
+Ask one manual verification decision per turn with one flat `<user_options>` block:
 
 ```
 question: "Does [criterion]?"
@@ -113,9 +112,9 @@ For each acceptance criterion in the story:
 1. Ask: is there a test — unit, integration, or confirmed manual playtest — that
    directly verifies this criterion?
    - **Unit test**: check `tests/unit/` for a test file or function name that
-     matches the criterion's subject (use `Glob` and `Grep`)
+     matches the criterion's subject (use `glob_search` and `grep_search`)
    - **Integration test**: check `tests/integration/` similarly
-   - **Manual confirmation**: if the criterion was verified via `AskUserQuestion`
+   - **Manual confirmation**: if the criterion was verified in one flat `<user_options>` block
      above with a "Yes — passes" answer, count that as a manual test
 
 2. Produce a traceability table:
@@ -154,7 +153,7 @@ Based on the Story Type extracted in Phase 2, check for required evidence:
 | **Config/Data** | Smoke check pass report in `production/qa/smoke-*.md` | ADVISORY |
 
 **For Logic stories**: first read the story's **Test Evidence** section to extract the
-exact required file path. Use `Glob` to check that exact path. If the exact path is not
+exact required file path. Use `glob_search` to check that exact path. If the exact path is not
 found, also search `tests/unit/[system]/` broadly (the file may have been placed at a
 slightly different location). If no test file is found at either location:
 - Flag as **BLOCKING**: "Logic story has no unit test file. Story requires it at
@@ -162,7 +161,7 @@ slightly different location). If no test file is found at either location:
   this story 完成."
 
 **For Integration stories**: read the story's **Test Evidence** section for the exact
-required path. Use `Glob` to check that exact path first, then search
+required path. Use `glob_search` to check that exact path first, then search
 `tests/integration/[system]/` broadly, then check `production/session-logs/` for a
 playtest record referencing this story.
 If none found: flag as **BLOCKING** (same rule as Logic).
@@ -192,7 +191,7 @@ Run these checks automatically:
 1. **GDD rules check**: Using the current requirement text from `tr-registry.yaml`
    (looked up by the story's TR-ID), check that the implementation reflects what
    the GDD actually requires now — not what it required when the story was written.
-   `Grep` the implemented files for key function names, data structures, or class
+   `grep_search` the implemented files for key function names, data structures, or class
    names mentioned in the current GDD section.
 
 2. **Manifest version staleness check**: Compare the `Manifest Version:` date
@@ -206,9 +205,9 @@ Run these checks automatically:
 
 3. **ADR constraints check**: Read the referenced ADR's Decision section. 检查
    for forbidden patterns from `docs/architecture/control-manifest.md` (if it
-   exists). `Grep` for patterns explicitly forbidden in the ADR.
+   exists). `grep_search` for patterns explicitly forbidden in the ADR.
 
-4. **Hardcoded values check**: `Grep` the implemented files for numeric literals
+4. **Hardcoded values check**: `grep_search` the implemented files for numeric literals
    in gameplay logic that should be in data files.
 
 5. **Scope check**: Did the implementation touch files outside the story's stated
@@ -227,12 +226,12 @@ For each deviation found, categorize:
 
 ## 阶段 4b: QA Coverage Gate
 
-**Review mode check** — apply before spawning QL-TEST-COVERAGE:
+**Review mode check** — resolve before running QL-TEST-COVERAGE:
 - `solo` → skip. Note: "QL-TEST-COVERAGE skipped — Solo mode." Proceed to Phase 5.
 - `lean` → skip (not a PHASE-GATE). Note: "QL-TEST-COVERAGE skipped — Lean mode." Proceed to Phase 5.
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-After completing the deviation checks in Phase 4, spawn `qa-lead` via Task using gate **QL-TEST-COVERAGE** (`.claude/docs/director-gates.md`).
+After completing the deviation checks in Phase 4, apply `qa-lead` as a specialist review with gate **QL-TEST-COVERAGE** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass:
 - The story file path and story type
@@ -253,16 +252,16 @@ Skip this phase for Config/Data stories (no code tests required).
 
 ## 阶段 5: Lead Programmer Code Review Gate
 
-**Review mode check** — apply before spawning LP-CODE-REVIEW:
+**Review mode check** — resolve before running LP-CODE-REVIEW:
 - `solo` → skip. Note: "LP-CODE-REVIEW skipped — Solo mode." Proceed to Phase 6 (completion report).
 - `lean` → skip (not a PHASE-GATE). Note: "LP-CODE-REVIEW skipped — Lean mode." Proceed to Phase 6 (completion report).
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-Spawn `lead-programmer` via Task using gate **LP-CODE-REVIEW** (`.claude/docs/director-gates.md`).
+Apply `lead-programmer` as a specialist review with gate **LP-CODE-REVIEW** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: implementation file paths, story file path, relevant GDD section, governing ADR.
 
-Present the verdict to the user. If CONCERNS, surface them via `AskUserQuestion`:
+Present the verdict to the user. If CONCERNS, surface them in one flat `<user_options>` block:
 - Options: `Revise flagged issues` / `Accept and proceed` / `Discuss further`
 If REJECT, do not proceed to Phase 6 verdict until the issues are resolved.
 
@@ -416,7 +415,7 @@ If no more stories are ready but Must Have stories are still In Progress (not �
   decides if they are acceptable.
 - **BLOCKED verdict is advisory** — the user can override and mark complete
   anyway; document the risk explicitly if they do.
-- Use `AskUserQuestion` for the code review prompt and for batching manual
+- Ask the user for the code review prompt and for batching manual
   criteria confirmations.
 
 ---

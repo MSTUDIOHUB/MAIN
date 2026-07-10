@@ -5,7 +5,7 @@ import {
   normalizeStudioAgentKey,
   type PendingSlashCommand,
   type StudioAgentKey,
-} from "../lib/gameStudioCatalog";
+} from "../lib/gameStudio/catalog";
 
 export interface GameStudioLocalSlashRuntimeService {
   resolveSlashCommand(params: {

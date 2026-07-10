@@ -3,7 +3,6 @@ name: bug-report
 description: "生成结构化缺陷报告，明确现象、复现步骤、影响和上下文。"
 argument-hint: "[description] | analyze [path-to-file]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write
 ---
 
 ## 阶段 1: Parse Arguments
@@ -23,7 +22,7 @@ If no argument is provided, ask the user for a bug description before proceeding
 
 1. **Parse the description** for key information: what broke, when, how to reproduce it, and what the expected behavior is.
 
-2. **Search the codebase** for related files using Grep/Glob to add context (affected system, likely files).
+2. **Search the codebase** for related files using grep_search/glob_search to add context (affected system, likely files).
 
 3. **Draft the bug report**:
 
@@ -93,8 +92,8 @@ If no argument is provided, ask the user for a bug description before proceeding
 
 Read `production/qa/bugs/[BUG-ID].md`. Extract the reproduction steps and expected result.
 
-1. **Re-run reproduction steps** — use Grep/Glob to check whether the root cause code path still exists as described. If the fix removed or changed it, note the change.
-2. **Run the related test** — if the bug's system has a test file in `tests/`, run it via Bash and report pass/fail.
+1. **Re-run reproduction steps** — use grep_search/glob_search to check whether the root cause code path still exists as described. If the fix removed or changed it, note the change.
+2. **Run the related test** — if the bug's system has a test file in `tests/`, run it via `run_command` and report pass/fail.
 3. **检查 for regression** — grep the codebase for any new occurrence of the pattern that caused the bug.
 
 Produce a verification verdict:

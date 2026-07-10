@@ -290,7 +290,7 @@
 
 | Date | Author | Changes |
 |------|--------|---------|
-| [Date] | Claude (reverse-doc) | Initial concept doc from prototype analysis |
+| [Date] | MAIN (reverse-doc) | Initial concept doc from prototype analysis |
 | [Date] | [User] | Clarified outcomes, added playtest feedback |
 
 ---

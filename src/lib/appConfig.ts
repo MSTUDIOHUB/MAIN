@@ -3,6 +3,7 @@ import { normalizeContextMemoryState, type ContextMemoryState } from "./contextM
 import {
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
+  getDefaultLocalProviderEndpoint,
   normalizeLocalToolProtocol,
   resolveEffectiveCloudApiFormat,
 } from "./cloudProtocol";
@@ -13,9 +14,11 @@ import {
 } from "./toolCapabilities";
 import { createDefaultImAdaptersConfig } from "./imAdapters";
 
+export const CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE = false;
+
 export const DEFAULT_LOCAL_CONFIG: LocalConfig = {
   provider: "OMLX",
-  endpoint: "http://127.0.0.1:8080/v1",
+  endpoint: getDefaultLocalProviderEndpoint("OMLX"),
   model: "",
   contextLimit: 16384,
   apiKey: "",
@@ -46,7 +49,7 @@ export function createDefaultAppConfig(): AppConfig {
     cloud: createDefaultCloudConfig(),
     cloudServers: [],
     activeCloudServerId: "",
-    cloudExperimentalLoginEnabled: false,
+    cloudExperimentalLoginEnabled: CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE,
     imAdapters: createDefaultImAdaptersConfig(),
     workspace: "",
   };
@@ -84,7 +87,8 @@ export function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefi
 
   const cloudProtocolInput =
     typeof config?.cloud?.protocol === "string" ? config.cloud.protocol : "openai";
-  const cloudExperimentalLoginEnabled = false;
+  const cloudExperimentalLoginEnabled =
+    CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE && config?.cloudExperimentalLoginEnabled === true;
   const cloudAuthMode = cloudExperimentalLoginEnabled
     ? config?.cloud?.auth?.mode ?? "api_key"
     : "api_key";

@@ -1,5 +1,8 @@
 import type { AppConfig, LocalConfig } from "../../lib/appTypes";
-import { createDefaultAppConfig } from "../../lib/appConfig";
+import {
+  CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE,
+  createDefaultAppConfig,
+} from "../../lib/appConfig";
 import {
   normalizeEventStreamMode,
   normalizeToolFeedbackFormat,
@@ -96,7 +99,8 @@ export function resolveRuntimeLaneKey(config: Partial<AppConfig> | null | undefi
 
   const cloudProtocolInput =
     typeof config?.cloud?.protocol === "string" ? config.cloud.protocol : "openai";
-  const cloudExperimentalLoginEnabled = false;
+  const cloudExperimentalLoginEnabled =
+    CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE && config?.cloudExperimentalLoginEnabled === true;
   const cloudAuthMode = cloudExperimentalLoginEnabled
     ? config?.cloud?.auth?.mode ?? "api_key"
     : "api_key";

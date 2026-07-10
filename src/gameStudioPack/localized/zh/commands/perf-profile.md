@@ -3,8 +3,6 @@ name: perf-profile
 description: "识别 CPU、GPU、内存或加载瓶颈，并给出性能优化方向。"
 argument-hint: "[system-name 或 'full']"
 user-invocable: true
-agent: performance-analyst
-allowed-tools: Read, Glob, Grep, Bash
 ---
 
 ## 阶段 1: Determine Scope
@@ -18,7 +16,7 @@ Read the argument:
 
 ## 阶段 2: Load Performance Budgets
 
-检查 for existing performance targets in design docs or CLAUDE.md:
+检查 for existing performance targets in design docs or AGENTS.md:
 
 - Target FPS (e.g., 60fps = 16.67ms frame budget)
 - Memory budget (total and per-system)

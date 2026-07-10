@@ -1,4 +1,4 @@
-import type { PendingSlashCommand } from "../lib/gameStudioCatalog";
+import type { PendingSlashCommand } from "../lib/gameStudio/catalog";
 import type { MainModeKey } from "../lib/mainModes";
 import {
   inferCommandDirective,

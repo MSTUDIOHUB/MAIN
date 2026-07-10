@@ -3,7 +3,6 @@ name: smoke-check
 description: "对核心流程做快速冒烟验证，确认基本功能能跑通。"
 argument-hint: "[sprint | quick | --platform pc|console|mobile|all]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Bash, Write, AskUserQuestion
 ---
 
 # Smoke 检查
@@ -53,7 +52,7 @@ Before running anything, understand the environment:
 2. **CI check**: check whether `.github/workflows/` contains a workflow file
    referencing tests. Note in the report whether CI is configured.
 
-3. **Engine detection**: read `.claude/docs/technical-preferences.md` and
+3. **Engine detection**: read `.protocols/game-studio/docs/technical-preferences.md` and
    extract the `Engine:` value. Store this for test command selection in
    Phase 2.
 
@@ -74,7 +73,7 @@ Before running anything, understand the environment:
 
 ## 阶段 2: Run Automated Tests
 
-Attempt to run the test suite via Bash. Select the command based on the engine
+Attempt to run the test suite via `run_command`. Select the command based on the engine
 detected in Phase 1:
 
 **Godot 4:**
@@ -106,7 +105,7 @@ If no matching log found: "UE automation tests must be run via the Session
 Frontend or CI pipeline. Please confirm test status manually."
 
 **Unknown engine / not configured:**
-"Engine not configured in `.claude/docs/technical-preferences.md`. Run
+"Engine not configured in `.protocols/game-studio/docs/technical-preferences.md`. Run
 `/setup-engine` to specify the engine, then re-run `/smoke-check`."
 
 **If the test runner is not available in this environment** (engine binary not
@@ -144,7 +143,7 @@ For each story in scope:
 
 1. Extract the system slug from the story's file path
    (e.g., `production/epics/combat/story-001.md` → `combat`)
-2. Glob `tests/unit/[system]/` and `tests/integration/[system]/` for files
+2. `glob_search` `tests/unit/[system]/` and `tests/integration/[system]/` for files
    whose name contains the story slug or a closely related term
 3. 检查 the story file itself for a `Test file:` header field or a
    "Test Evidence" section
@@ -177,7 +176,7 @@ Tailor batches 2 and 3 to the actual systems identified from the sprint or QA
 plan. Replace bracketed placeholders with real mechanic names from the current
 sprint's stories.
 
-Use `AskUserQuestion` to batch-verify. Keep to at most 3 calls.
+Present at most three verification choices in one flat `<user_options>` block, then wait for the user.
 
 **Batch 1 — Core stability (always run):**
 ```
@@ -412,6 +411,6 @@ agent to begin manual verification."
   gaps for `/story-done` to follow up on.
 - **`quick` argument** skips Phase 3 (coverage scan) and Phase 4 Batch 3.
   Use it for rapid re-checks after fixing a specific failure.
-- Use `AskUserQuestion` for all manual smoke check verification.
+- Ask the user for all manual smoke check verification.
 - **Never write the report without asking** — Phase 6 requires explicit
   approval before any file is created.

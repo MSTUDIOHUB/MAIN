@@ -3,7 +3,6 @@ name: hotfix
 description: "Emergency fix workflow that bypasses normal sprint processes with a full audit trail. Creates hotfix branch, tracks approvals, and ensures the fix is backported correctly."
 argument-hint: "[bug-id or description]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash, Task
 ---
 
 > **Explicit invocation only**: This skill should only run when the user explicitly requests it with `/hotfix`. Do not auto-invoke based on context matching.
@@ -78,11 +77,11 @@ Update the hotfix record with root cause, fix details, and test results.
 
 ## Phase 5: Collect Approvals
 
-Use the Task tool to request sign-off in parallel:
+Run the listed specialist sign-off passes in the current MAIN run:
 
-- `subagent_type: lead-programmer` — Review the fix for correctness and side effects
-- `subagent_type: qa-tester` — Run targeted regression tests on the affected system
-- `subagent_type: producer` — Approve deployment timing and communication plan
+- `specialist profile: lead-programmer` — Review the fix for correctness and side effects
+- `specialist profile: qa-tester` — Run targeted regression tests on the affected system
+- `specialist profile: producer` — Approve deployment timing and communication plan
 
 All three must return APPROVE before proceeding. If any returns CONCERNS or REJECT, do not deploy — surface the issue and resolve it first.
 
@@ -90,10 +89,10 @@ All three must return APPROVE before proceeding. If any returns CONCERNS or REJE
 
 ## Phase 5b: QA Re-Entry Gate
 
-After approvals, determine the QA scope required before deploying the hotfix. Spawn `qa-lead` via Task with:
+After approvals, determine the QA scope required before deploying the hotfix. Apply `qa-lead` as a specialist review with:
 - The hotfix description and affected system
 - The regression test results from Phase 5
-- A list of all systems that touch the changed files (use Grep to find callers)
+- A list of all systems that touch the changed files (use grep_search to find callers)
 
 Ask qa-lead: **Is a full smoke check sufficient, or does this fix require a targeted team-qa pass?**
 

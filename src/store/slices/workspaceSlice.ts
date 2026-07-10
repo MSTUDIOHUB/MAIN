@@ -10,10 +10,10 @@ import {
   NexusModeKey,
   StudioAgentKey,
   PendingSlashCommand,
-} from "../../lib/gameStudioCatalog";
+} from "../../lib/gameStudio/catalog";
 import {
   setGameStudioActiveAgent,
-} from "../../lib/gameStudioPack";
+} from "../../lib/gameStudio/pack";
 import {
   normalizeAttachedFile,
   AttachedFile,

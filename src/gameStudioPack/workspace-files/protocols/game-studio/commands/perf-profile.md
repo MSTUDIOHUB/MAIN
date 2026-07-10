@@ -3,8 +3,6 @@ name: perf-profile
 description: "Structured performance profiling workflow. Identifies bottlenecks, measures against budgets, and generates optimization recommendations with priority rankings."
 argument-hint: "[system-name or 'full']"
 user-invocable: true
-agent: performance-analyst
-allowed-tools: Read, Glob, Grep, Bash
 ---
 
 ## Phase 1: Determine Scope
@@ -18,7 +16,7 @@ Read the argument:
 
 ## Phase 2: Load Performance Budgets
 
-Check for existing performance targets in design docs or CLAUDE.md:
+Check for existing performance targets in design docs or AGENTS.md:
 
 - Target FPS (e.g., 60fps = 16.67ms frame budget)
 - Memory budget (total and per-system)

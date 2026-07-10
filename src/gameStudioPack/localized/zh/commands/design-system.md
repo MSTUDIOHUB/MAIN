@@ -3,24 +3,23 @@ name: design-system
 description: "为指定系统撰写完整 GDD / 系统设计说明，明确目标、规则、反馈与边界。"
 argument-hint: "<system-name> [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Task, AskUserQuestion, TodoWrite
 ---
 
 When this skill is invoked:
 
 ## 1. Parse Arguments & Validate
 
-Resolve the review mode (once, store for all gate spawns this run):
+Resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern.
 
 A system name or retrofit path is **required**. If missing:
 
 1. 检查 if `design/gdd/systems-index.md` exists.
-2. If it exists: read it, find the highest-priority system with status "Not Started" or equivalent, and use `AskUserQuestion`:
+2. If it exists: read it, find the highest-priority system with status "Not Started" or equivalent, and ask the user:
    - Prompt: "The next system in your design order is **[system-name]** ([priority] | [layer]). Start designing it?"
    - Options: `[A] Yes — design [system-name]` / `[B] Pick a different system` / `[C] Stop here`
    - If [A]: proceed with that system name. If [B]: ask which system to design (plain text). If [C]: exit.
@@ -57,7 +56,7 @@ existing `.md` file in `design/gdd/`, enter **retrofit mode**:
    skip creating the skeleton (file already exists) and in **Phase 4** skip
    sections that are already complete. Only run the section cycle for missing/
    incomplete sections.
-7. **Never overwrite existing section content.** Use Edit tool to replace only
+7. **Never overwrite existing section content.** Use `replace_in_file` to replace only
    `[To be designed]` placeholders or empty section bodies.
 
 If NOT in retrofit mode, normalize the system name to kebab-case for the
@@ -109,7 +108,7 @@ For each dependency GDD that exists, extract and hold in context:
 - **Game pillars**: Read `design/gdd/game-pillars.md` if it exists
 - **Existing GDD**: Read `design/gdd/[system-name].md` if it exists (resume, don't
   restart from scratch)
-- **Related GDDs**: Glob `design/gdd/*.md` and read any that are thematically related
+- **Related GDDs**: `glob_search` `design/gdd/*.md` and read any that are thematically related
   (e.g., if designing a system that overlaps with another in scope, read the related GDD
   even if it's not a formal dependency)
 
@@ -160,11 +159,11 @@ Map the system's category (from systems-index.md) to an engine domain:
 | Dialogue, quests, narrative | Scripting |
 
 **Step 2 — Read engine context (if available):**
-- Read `.claude/docs/technical-preferences.md` to identify the engine and version
+- Read `.protocols/game-studio/docs/technical-preferences.md` to identify the engine and version
 - If engine is configured, read `docs/engine-reference/[engine]/VERSION.md`
 - Read `docs/engine-reference/[engine]/modules/[domain].md` if it exists
 - Read `docs/engine-reference/[engine]/breaking-changes.md` for domain-relevant entries
-- Glob `docs/architecture/adr-*.md` and read any ADRs whose domain matches
+- `glob_search` `docs/architecture/adr-*.md` and read any ADRs whose domain matches
   (check the Engine Compatibility table's "Domain" field)
 
 **Step 3 — Present the Feasibility Brief:**
@@ -197,13 +196,13 @@ If no engine reference docs exist (engine not yet configured), show a short note
 
 **Step 4 — Ask before proceeding:**
 
-Use `AskUserQuestion`:
+Ask the user:
 - "Any constraints to add before we begin, or shall we proceed with these noted?"
   - Options: "Proceed with these noted", "Add a constraint first", "I need to check the engine docs — pause here"
 
 ---
 
-Use `AskUserQuestion`:
+Ask the user:
 - "Ready to start designing [system-name]?"
   - Options: "Yes, let's go", "Show me more context first", "Design a dependency first"
 
@@ -214,7 +213,7 @@ Use `AskUserQuestion`:
 Once the user confirms, **immediately** create the GDD file with empty section
 headers. This ensures incremental writes have a target.
 
-Use the template structure from `.claude/docs/templates/game-design-document.md`:
+Use the template structure from `.MAIN/templates/game-studio/game-design-document.md`:
 
 ```markdown
 # [System Name]
@@ -282,7 +281,7 @@ Use the template structure from `.claude/docs/templates/game-design-document.md`
 Ask: "May I create the skeleton file at `design/gdd/[system-name].md`?"
 
 After writing, update `production/session-state/active.md`:
-- Use Glob to check if the file exists.
+- Use glob_search to check if the file exists.
 - If it **does not exist**: use the **Write** tool to create it. Never attempt Edit on a file that may not exist.
 - If it **already exists**: use the **Edit** tool to update the relevant fields.
 
@@ -307,12 +306,12 @@ Context  ->  Questions  ->  Options  ->  Decision  ->  Draft  ->  Approval  ->  
    decisions from dependency GDDs that constrain it.
 
 2. **Questions**: Ask clarifying questions specific to this section. Use
-   `AskUserQuestion` for constrained questions, conversational text for open-ended
+   `<user_options>` for constrained questions, conversational text for open-ended
    exploration.
 
 3. **Options**: Where the section involves design choices (not just documentation),
    present 2-4 approaches with pros/cons. Explain reasoning in conversation text,
-   then use `AskUserQuestion` to capture the decision.
+   then present one flat `<user_options>` block and wait for the decision.
 
 4. **Decision**: User picks an approach or provides custom direction.
 
@@ -320,7 +319,7 @@ Context  ->  Questions  ->  Options  ->  Decision  ->  Draft  ->  Approval  ->  
    provisional assumptions about undesigned dependencies.
 
 6. **Approval**: Immediately after the draft — in the SAME response — use
-   `AskUserQuestion`. **NEVER use plain text. NEVER skip this step.**
+   `<user_options>`. **NEVER use plain text. NEVER skip this step.**
    - Prompt: "Approve the [Section Name] section?"
    - Options: `[A] Approve — write it to file` / `[B] Make changes — describe what to fix` / `[C] Start over`
 
@@ -328,10 +327,10 @@ Context  ->  Questions  ->  Options  ->  Decision  ->  Draft  ->  Approval  ->  
    If the draft appears without the widget, the user is left at a blank prompt
    with no path forward — this is a protocol violation.**
 
-7. **Write**: Use the Edit tool to replace the placeholder with the approved content.
+7. **Write**: Use replace_in_file to replace the placeholder with the approved content.
    **CRITICAL**: Always include the section heading in the `old_string` to ensure
    uniqueness — never match `[To be designed]` alone, as multiple sections use the
-   same placeholder and the Edit tool requires a unique match. Use this pattern:
+   same placeholder and replace_in_file requires a unique match. Use this pattern:
    ```
    old_string: "## [Section Name]\n\n[To be designed]"
    new_string: "## [Section Name]\n\n[approved content]"
@@ -350,7 +349,7 @@ Context  ->  Questions  ->  Options  ->  Decision  ->  Draft  ->  Approval  ->  
      (will be handled in Phase 5).
 
 After writing each section, update `production/session-state/active.md` with the
-completed section name. Use Glob to check if the file exists — use Write to create
+completed section name. Use glob_search to check if the file exists — use Write to create
 it if absent, Edit to update it if present.
 
 ### Section-Specific Guidance
@@ -363,17 +362,17 @@ Each section has unique design considerations and may benefit from specialist ag
 
 **Goal**: One paragraph a stranger could read and understand.
 
-**Derive recommended options before building the widget**: Read the system's category and layer from the systems index (already in context from Phase 2), then determine the recommended option for each tab:
-- **Framing tab**: Foundation/Infrastructure layer → `[A]` recommended. Player-facing categories (Combat, UI, Dialogue, Character, Animation, Visual Effects, Audio) → `[C] Both` recommended.
-- **ADR ref tab**: Glob `docs/architecture/adr-*.md` and grep for the system name in the GDD Requirements section of any ADR. If a matching ADR is found → `[A] Yes — cite the ADR` recommended. If none found → `[B] No` recommended.
-- **Fantasy tab**: Foundation/Infrastructure layer → `[B] No` recommended. All other categories → `[A] Yes` recommended.
+**Derive recommended options before building the widget**: Read the system's category and layer from the systems index (already in context from Phase 2), then determine the recommended option for each decision:
+- **Framing decision**: Foundation/Infrastructure layer → `[A]` recommended. Player-facing categories (Combat, UI, Dialogue, Character, Animation, Visual Effects, Audio) → `[C] Both` recommended.
+- **ADR reference decision**: `glob_search` `docs/architecture/adr-*.md` and grep for the system name in the GDD Requirements section of any ADR. If a matching ADR is found → `[A] Yes — cite the ADR` recommended. If none found → `[B] No` recommended.
+- **Fantasy decision**: Foundation/Infrastructure layer → `[B] No` recommended. All other categories → `[A] Yes` recommended.
 
-Append `(Recommended)` to the appropriate option text in each tab.
+Append `(Recommended)` to the appropriate option text in each decision.
 
-**Framing questions (ask BEFORE drafting)**: Use `AskUserQuestion` with a multi-tab widget:
-- Tab "Framing" — "How should the overview frame this system?" Options: `[A] As a data/infrastructure layer (technical framing)` / `[B] Through its player-facing effect (design framing)` / `[C] Both — describe the data layer and its player impact`
-- Tab "ADR ref" — "Should the overview reference the existing ADR for this system?" Options: `[A] Yes — cite the ADR for implementation details` / `[B] No — keep the GDD at pure design level`
-- Tab "Fantasy" — "Does this system have a player fantasy worth stating?" Options: `[A] Yes — players feel it directly` / `[B] No — pure infrastructure, players feel what it enables`
+**Framing questions (ask BEFORE drafting)**: Ask the user with a sequence of flat `<user_options>` blocks, one decision per turn:
+- **Framing** — "How should the overview frame this system?" Options: `[A] As a data/infrastructure layer (technical framing)` / `[B] Through its player-facing effect (design framing)` / `[C] Both — describe the data layer and its player impact`
+- **ADR reference** — "Should the overview reference the existing ADR for this system?" Options: `[A] Yes — cite the ADR for implementation details` / `[B] No — keep the GDD at pure design level`
+- **Fantasy** — "Does this system have a player fantasy worth stating?" Options: `[A] Yes — players feel it directly` / `[B] No — pure infrastructure, players feel what it enables`
 
 Use the user's answers to shape the draft. Do NOT answer these questions yourself and auto-draft.
 
@@ -405,7 +404,7 @@ describes the technical approach used to achieve it.
 
 Append `(Recommended)` to the appropriate option text.
 
-**Framing question (ask BEFORE drafting)**: Use `AskUserQuestion`:
+**Framing question (ask BEFORE drafting)**: Ask the user:
 - Prompt: "Is this system something the player engages with directly, or infrastructure they experience indirectly?"
 - Options: `[A] Direct — player actively uses or feels this system` / `[B] Indirect — player experiences the effects, not the system` / `[C] Both — has a direct interaction layer and infrastructure beneath it`
 
@@ -419,8 +418,8 @@ Use the answer to frame the Player Fantasy section appropriately. Do NOT assume 
 **Cross-reference**: Must align with the game pillars. If the system serves a pillar,
 quote the relevant pillar text.
 
-**Agent delegation (MANDATORY)**: After the framing answer is given but before drafting,
-spawn `creative-director` via Task:
+**Specialist review routing (MANDATORY)**: After the framing answer is given but before drafting,
+apply `creative-director` as a specialist review:
 - Provide: system name, framing answer (direct/indirect/both), game pillars, any reference games the user mentioned, the game concept summary
 - Ask: "Shape the Player Fantasy for this system. What emotion or power fantasy should it serve? What player moment should we anchor to? What tone and language fits the game's established feeling? Be specific — give me 2-3 candidate framings."
 - Collect the creative-director's framings and present them to the user alongside the draft.
@@ -449,12 +448,12 @@ This is usually the largest section. Break it into sub-sections:
 - What are the decision points the player faces?
 - What can the player NOT do? (Constraints are as important as capabilities)
 
-**Agent delegation (MANDATORY)**: Before drafting Section C, spawn specialist agents via Task in parallel:
+**Specialist review routing (MANDATORY)**: Before drafting Section C, apply the relevant specialist profiles as separate review passes:
 - Look up the system category in the routing table (Section 6 of this skill)
-- Spawn the Primary Agent AND Supporting Agent(s) listed for this category
+- Apply the Primary Agent AND Supporting Agent(s) listed for this category
 - Provide each agent: system name, game concept summary, pillar set, dependency GDD excerpts, the specific section being worked on
 - Collect their findings before drafting
-- Surface any disagreements between agents to the user via `AskUserQuestion`
+- Surface any disagreements between agents to the user in one flat `<user_options>` block
 - Draft only after receiving specialist input
 
 **Do NOT draft Section C without first consulting the appropriate specialists.** A `systems-designer` reviewing rules and mechanics will catch design gaps the main session cannot.
@@ -494,10 +493,10 @@ table. A formula without defined variables cannot be implemented without guesswo
 - Should scaling be linear, logarithmic, or stepped?
 - What should the output ranges be at early/mid/late game?
 
-**Agent delegation (MANDATORY)**: Before proposing any formulas or balance values, spawn specialist agents via Task in parallel:
-- **Always spawn `systems-designer`**: provide Core Rules from Section C, tuning goals from user, balance context from dependency GDDs. Ask them to propose formulas with variable tables and output ranges.
-- **For economy/cost systems, also spawn `economy-designer`**: provide placement costs, upgrade cost intent, and progression goals. Ask them to validate cost curves and ratios.
-- Present the specialists' proposals to the user for review via `AskUserQuestion`
+**Specialist review routing (MANDATORY)**: Before proposing any formulas or balance values, apply the relevant specialist profiles as separate review passes:
+- **Always apply `systems-designer`**: provide Core Rules from Section C, tuning goals from user, balance context from dependency GDDs. Ask them to propose formulas with variable tables and output ranges.
+- **For economy/cost systems, also apply `economy-designer`**: provide placement costs, upgrade cost intent, and progression goals. Ask them to validate cost curves and ratios.
+- Present the specialists' proposals to the user for review in one flat `<user_options>` block
 - The user decides; the main session writes to file
 - **Do NOT invent formula values or balance numbers without specialist input.** A user without balance design expertise cannot evaluate raw numbers — they need the specialists' reasoning.
 
@@ -526,7 +525,7 @@ design question, not a specification.
 - What happens when two rules apply at the same time?
 - What happens if a player finds an unintended interaction? (Identify degenerate strategies)
 
-**Agent delegation (MANDATORY)**: Spawn `systems-designer` via Task before finalising edge cases. Provide: the completed Sections C and D, and ask them to identify edge cases from the formula and rule space that the main session may have missed. For narrative systems, also spawn `narrative-director`. Present their findings and ask the user which to include.
+**Specialist review routing (MANDATORY)**: Apply `systems-designer` as a specialist review before finalising edge cases. Provide: the completed Sections C and D, and ask them to identify edge cases from the formula and rule space that the main session may have missed. For narrative systems, also apply `narrative-director`. Present their findings and ask the user which to include.
 
 **Cross-reference**: 检查 edge cases against dependency GDDs. If a dependency
 defines a floor, cap, or resolution rule that this system could violate, flag it.
@@ -559,7 +558,7 @@ system]". Flag any one-directional dependencies for correction.
 - For each knob, what breaks if it's set too high? Too low?
 - Which knobs interact with each other? (Changing A makes B irrelevant)
 
-**Agent delegation**: If formulas are complex, delegate to `systems-designer`
+**Specialist review routing**: If formulas are complex, route through `systems-designer`
 to derive tuning knobs from the formula variables.
 
 **Cross-reference**: If a dependency GDD lists tuning knobs that affect this system,
@@ -582,7 +581,7 @@ Include at least: one criterion per core rule from Section C, and one per formul
 from Section D. Do NOT write "the system works as designed" — every criterion must
 be independently verifiable by a QA tester without reading the GDD.
 
-**Agent delegation (MANDATORY)**: Spawn `qa-lead` via Task before finalising acceptance criteria. Provide: the completed GDD sections C, D, E, and ask them to validate that the criteria are independently testable and cover all core rules and formulas. Surface any gaps or untestable criteria to the user.
+**Specialist review routing (MANDATORY)**: Apply `qa-lead` as a specialist review before finalising acceptance criteria. Provide: the completed GDD sections C, D, E, and ask them to validate that the criteria are independently testable and cover all core rules and formulas. Surface any gaps or untestable criteria to the user.
 
 **Questions to ask**:
 - What's the minimum set of tests that prove this works?
@@ -607,11 +606,11 @@ These sections are included in the template. Visual/Audio is **REQUIRED** for vi
 - Dialogue, quests, lore
 - Level/world systems
 
-For required systems: **spawn `art-director` via Task** before drafting this section. Provide: system name, game concept, game pillars, art bible sections 1–4 if they exist. Ask them to specify: (1) VFX and visual feedback requirements for this system's events, (2) any animation or visual style constraints, (3) which art bible principles most directly apply to this system. Present their output; do NOT leave this section as `[To be designed]` for visual systems.
+For required systems: **apply `art-director` as a specialist review** before drafting this section. Provide: system name, game concept, game pillars, art bible sections 1–4 if they exist. Ask them to specify: (1) VFX and visual feedback requirements for this system's events, (2) any animation or visual style constraints, (3) which art bible principles most directly apply to this system. Present their output; do NOT leave this section as `[To be designed]` for visual systems.
 
 For **all other system categories** (Foundation/Infrastructure, Economy, AI/pathfinding, Camera/input), offer the optional sections after the required sections:
 
-Use `AskUserQuestion`:
+Ask the user:
 - "The 8 required sections are complete. Do you want to also define Visual/Audio
   requirements, UI requirements, or capture open questions?"
   - Options: "Yes, all three", "Just open questions", "Skip — I'll add these later"
@@ -654,12 +653,12 @@ the source of truth). Verify:
 
 ### 5a-bis: Creative Director Pillar Review
 
-**Review mode check** — apply before spawning CD-GDD-ALIGN:
+**Review mode check** — resolve before running CD-GDD-ALIGN:
 - `solo` → skip. Note: "CD-GDD-ALIGN skipped — Solo mode." Proceed to Step 5b.
 - `lean` → skip (not a PHASE-GATE). Note: "CD-GDD-ALIGN skipped — Lean mode." Proceed to Step 5b.
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-Before finalizing the GDD, spawn `creative-director` via Task using gate **CD-GDD-ALIGN** (`.claude/docs/director-gates.md`).
+Before finalizing the GDD, apply `creative-director` as a specialist review with gate **CD-GDD-ALIGN** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: completed GDD file path, game pillars (from `design/gdd/game-concept.md` or `design/gdd/game-pillars.md`), MDA aesthetics target.
 
@@ -678,7 +677,7 @@ Scan the completed GDD for cross-system facts that should be registered:
 
 For each candidate, check if it already exists in `design/registry/entities.yaml`:
 ```
-Grep pattern="  - name: [candidate_name]" path="design/registry/entities.yaml"
+`grep_search` pattern="  - name: [candidate_name]" path="design/registry/entities.yaml"
 ```
 
 Present a summary:
@@ -707,7 +706,7 @@ Present a completion summary:
 > - Provisional assumptions: [list any assumptions about undesigned dependencies]
 > - Cross-system conflicts found: [list or "none"]
 
-> **To validate this GDD, open a fresh Claude Code session and run:**
+> **To validate this GDD, open a fresh MAIN session and run:**
 > `/design-review design/gdd/[system-name].md`
 >
 > **Never run `/design-review` in the same session as `/design-system`.** The reviewing
@@ -742,7 +741,7 @@ Update `production/session-state/active.md` with:
 
 ### 5e: Suggest Next Steps
 
-Use `AskUserQuestion`:
+Ask the user:
 - "What's next?"
   - Options:
     - "Run `/consistency-check` — verify this GDD's values don't conflict with existing GDDs (recommended before designing the next system)"
@@ -755,7 +754,7 @@ Use `AskUserQuestion`:
 
 ## 6. Specialist Agent Routing
 
-This skill delegates to specialist agents for domain expertise. The main session
+This skill works with specialist agents for domain expertise. The main session
 orchestrates the overall flow; agents provide expert content.
 
 | System Category | Primary Agent | Supporting Agent(s) |
@@ -774,11 +773,11 @@ orchestrates the overall flow; agents provide expert content.
 | Visual effects, particles, shaders | `game-designer` | `art-director` (VFX visual direction), `technical-artist` (performance budget, shader complexity), `systems-designer` (trigger/state integration) |
 | Character systems (stats, archetypes) | `game-designer` | `art-director` (character visual archetype), `narrative-director` (character arc alignment), `systems-designer` (stat formulas) |
 
-**When delegating via Task tool**:
+**When applying another specialist profile in the current MAIN run**:
 - Provide: system name, game concept summary, dependency GDD excerpts, the specific
   section being worked on, and what question needs expert input
 - The agent returns analysis/proposals to the main session
-- The main session presents the agent's output to the user via `AskUserQuestion`
+- The main session presents the agent's output to the user in one flat `<user_options>` block
 - The user decides; the main session writes to file
 - Agents do NOT write to files directly — the main session owns all file writes
 
@@ -804,7 +803,7 @@ disruption.
 This skill follows the collaborative design principle at every step:
 
 1. **Question -> Options -> Decision -> Draft -> Approval** for every section
-2. **AskUserQuestion** at every decision point (Explain -> Capture pattern):
+2. **<user_options>** at every decision point (Explain -> Capture pattern):
    - Phase 2: "Ready to start, or need more context?"
    - Phase 3: "May I create the skeleton?"
    - Phase 4 (each section): Design questions, approach options, draft approval
@@ -828,7 +827,7 @@ shows context at or above 70%. If so, append this notice to the response:
 
 > **Context is approaching the limit (≥70%).** Your progress is saved — all approved
 > sections are written to `design/gdd/[system-name].md`. When you're ready to continue,
-> open a fresh Claude Code session and run `/design-system [system-name]` — it will
+> open a fresh MAIN session and run `/design-system [system-name]` — it will
 > detect which sections are complete and resume from the next one.
 
 ---

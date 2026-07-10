@@ -3,6 +3,9 @@ function parseTokenCount(value: string): number | null {
   return Number.isFinite(parsed) && parsed >= 1024 ? parsed : null;
 }
 
+const UNKNOWN_CONTEXT_RETRY_HEADROOM_RATIO = 0.7;
+const MIN_REACTIVE_CONTEXT_LIMIT = 4096;
+
 export function extractReportedContextWindowLimit(message: string): number | null {
   const text = String(message || "");
   const patterns = [
@@ -31,5 +34,34 @@ export function clampContextLimitToReported(
       ? Math.min(configuredLimit, 4096)
       : Math.min(configuredLimit, reportedContextLimit),
     reportedContextLimit,
+  };
+}
+
+export function resolveReactiveContextLimit(
+  estimatedCurrentTokens: number,
+  errorMessage: string,
+): {
+  contextLimit: number;
+  reportedContextLimit: number | null;
+  source: "reported" | "estimated_headroom";
+} {
+  const reportedContextLimit = extractReportedContextWindowLimit(errorMessage);
+  if (reportedContextLimit != null) {
+    return {
+      contextLimit: reportedContextLimit,
+      reportedContextLimit,
+      source: "reported",
+    };
+  }
+  const safeEstimatedTokens = Number.isFinite(estimatedCurrentTokens)
+    ? Math.max(0, estimatedCurrentTokens)
+    : 0;
+  return {
+    contextLimit: Math.max(
+      MIN_REACTIVE_CONTEXT_LIMIT,
+      Math.floor(safeEstimatedTokens * UNKNOWN_CONTEXT_RETRY_HEADROOM_RATIO),
+    ),
+    reportedContextLimit: null,
+    source: "estimated_headroom",
   };
 }

@@ -3,13 +3,11 @@ name: balance-check
 description: "Analyzes game balance data files, formulas, and configuration to identify outliers, broken progressions, degenerate strategies, and economy imbalances. Use after modifying any balance-related data or design. Use when user says 'balance report', 'check game balance', 'run a balance check'."
 argument-hint: "[system-name|path-to-data-file]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
-agent: economy-designer
 ---
 
 ## Phase 1: Identify Balance Domain
 
-Determine the balance domain from `$ARGUMENTS[0]`:
+Determine the balance domain from `the first token after the slash command in the current user request`:
 
 - **Combat** → weapon/ability DPS, time-to-kill, damage type interactions
 - **Economy** → resource faucets/sinks, acquisition rates, item pricing

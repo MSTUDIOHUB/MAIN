@@ -3,17 +3,16 @@ name: milestone-review
 description: "评审里程碑完成度、风险、缺口和是否具备进入下一阶段的条件。"
 argument-hint: "[milestone-name|current] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Task, AskUserQuestion
 ---
 
 ## 阶段 0: Parse Arguments
 
-Extract the milestone name (`current` or a specific name) and resolve the review mode (once, store for all gate spawns this run):
+Extract the milestone name (`current` or a specific name) and resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern.
 
 ---
 
@@ -108,12 +107,12 @@ Read all sprint reports for sprints within this milestone from `production/sprin
 
 ## 阶段 3b: Producer Risk Assessment
 
-**Review mode check** — apply before spawning PR-MILESTONE:
+**Review mode check** — resolve before running PR-MILESTONE:
 - `solo` → skip. Note: "PR-MILESTONE skipped — Solo mode." Present the Go/No-Go section without a producer verdict.
 - `lean` → skip (not a PHASE-GATE). Note: "PR-MILESTONE skipped — Lean mode." Present the Go/No-Go section without a producer verdict.
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-Before generating the Go/No-Go recommendation, spawn `producer` via Task using gate **PR-MILESTONE** (`.claude/docs/director-gates.md`).
+Before generating the Go/No-Go recommendation, apply `producer` as a specialist review with gate **PR-MILESTONE** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: milestone name and target date, current completion percentage, blocked story count, velocity data from sprint reports (if available), list of cut candidates.
 

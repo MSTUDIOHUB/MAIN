@@ -3,8 +3,6 @@ name: create-control-manifest
 description: "After architecture is complete, produces a flat actionable rules sheet for programmers — what you must do, what you must never do, per system and per layer. Extracted from all Accepted ADRs, technical preferences, and engine reference docs. More immediately actionable than ADRs (which explain why)."
 argument-hint: "[update — regenerate from current ADRs]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Task
-agent: technical-director
 ---
 
 # Create Control Manifest
@@ -24,13 +22,13 @@ status. Re-run whenever new ADRs are accepted or existing ADRs are revised.
 ## 1. Load All Inputs
 
 ### ADRs
-- Glob `docs/architecture/adr-*.md` and read every file
+- `glob_search` `docs/architecture/adr-*.md` and read every file
 - Filter to only Accepted ADRs (Status: Accepted) — skip Proposed, Deprecated,
   Superseded
 - Note the ADR number and title for every rule sourced
 
 ### Technical Preferences
-- Read `.claude/docs/technical-preferences.md`
+- Read `.protocols/game-studio/docs/technical-preferences.md`
 - Extract: naming conventions, performance budgets, approved libraries/addons,
   forbidden patterns
 
@@ -118,12 +116,12 @@ Ask: "Does this look complete? Any rules to add or remove before I write the man
 
 ## 4b. Director Gate — Technical Review
 
-**Review mode check** — apply before spawning TD-MANIFEST:
+**Review mode check** — resolve before running TD-MANIFEST:
 - `solo` → skip. Note: "TD-MANIFEST skipped — Solo mode." Proceed to Phase 5.
 - `lean` → skip. Note: "TD-MANIFEST skipped — Lean mode." Proceed to Phase 5.
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-Spawn `technical-director` via Task using gate **TD-MANIFEST** (`.claude/docs/director-gates.md`).
+Apply `technical-director` as a specialist review with gate **TD-MANIFEST** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: the Control Manifest Preview from Phase 4 (rule counts per layer, full extracted rule list), the list of ADRs covered, engine version, and any rules sourced from technical-preferences.md or engine reference docs.
 
@@ -135,7 +133,7 @@ The technical-director reviews whether:
 
 Apply the verdict:
 - **APPROVE** → proceed to Phase 5
-- **CONCERNS** → surface via `AskUserQuestion` with options: `Revise flagged rules` / `Accept and proceed` / `Discuss further`
+- **CONCERNS** → surface in one flat `<user_options>` block with options: `Revise flagged rules` / `Accept and proceed` / `Discuss further`
 - **REJECT** → do not write the manifest; fix the flagged rules and re-present the summary
 
 ---

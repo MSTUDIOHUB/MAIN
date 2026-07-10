@@ -5,7 +5,7 @@
 
 import type { Lang, Skill } from "./appTypes";
 import type { ResolvedInstructionSet } from "./instructions";
-import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudioCatalog";
+import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudio/catalog";
 import {
   getApplicableProtocolPackagesForWorkspace,
   getProtocolPackageEntryPath,

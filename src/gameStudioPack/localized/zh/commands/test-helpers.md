@@ -3,7 +3,6 @@ name: test-helpers
 description: "生成测试辅助代码、夹具、模拟器和常用验证工具。"
 argument-hint: "[system-name | all | scaffold]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write
 ---
 
 # Test Helpers
@@ -36,7 +35,7 @@ and systems — so every developer writes less boilerplate and more assertions.
 
 ## 2. Detect Engine and Language
 
-Read `.claude/docs/technical-preferences.md` and extract:
+Read `.protocols/game-studio/docs/technical-preferences.md` and extract:
 - `Engine:` value
 - `Language:` value
 - `Framework:` from the Testing section
@@ -50,7 +49,7 @@ If engine is not configured: "Engine not configured. Run `/setup-engine` first."
 Scan the test directory for patterns already in use:
 
 ```
-Glob pattern="tests/**/*_test.*" (all test files)
+`glob_search` pattern="tests/**/*_test.*" (all test files)
 ```
 
 For a representative sample (up to 5 files), read the test files and extract:

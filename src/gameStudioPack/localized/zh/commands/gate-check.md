@@ -3,8 +3,6 @@ name: gate-check
 description: "作为阶段门检查，判断当前产物是否满足进入下一阶段的条件。"
 argument-hint: "[target-phase: systems-design | technical-setup | pre-production | production | polish | release] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Bash, Write, Task, AskUserQuestion
-model: opus
 ---
 
 # Phase Gate Validation
@@ -34,24 +32,24 @@ The project progresses through these stages:
 
 ## 1. Parse Arguments
 
-**Target phase:** `$ARGUMENTS[0]` (blank = auto-detect current stage, then validate next transition)
+**Target phase:** `the first token after the slash command in the current user request` (blank = auto-detect current stage, then validate next transition)
 
-Also resolve the review mode (once, store for all gate spawns this run):
+Also resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-Note: in `solo` mode, director spawns (CD-PHASE-GATE, TD-PHASE-GATE, PR-PHASE-GATE, AD-PHASE-GATE) are skipped — gate-check becomes artifact-existence checks only. In `lean` mode, all four directors still run (phase gates are the purpose of lean mode).
+Note: in `solo` mode, director reviews (CD-PHASE-GATE, TD-PHASE-GATE, PR-PHASE-GATE, AD-PHASE-GATE) are skipped — gate-check becomes artifact-existence checks only. In `lean` mode, all four directors still run (phase gates are the purpose of lean mode).
 
 - **With argument**: `/gate-check production` — validate readiness for that specific phase
 - **No argument**: Auto-detect current stage using the same heuristics as
   `/project-stage-detect`, then **confirm with the user before running**:
 
-  Use `AskUserQuestion`:
+  Ask the user:
   - Prompt: "Detected stage: **[current stage]**. Running gate for [Current] → [Next] transition. Is this correct?"
   - Options:
     - `[A] Yes — run this gate`
-    - `[B] No — pick a different gate` (if selected, show a second widget listing all gate options: Concept → Systems Design, Systems Design → Technical Setup, Technical Setup → Pre-Production, Pre-Production → Production, Production → Polish, Polish → Release)
+    - `[B] No — pick a different gate` (if selected, show a second `<user_options>` block listing all gate options: Concept → Systems Design, Systems Design → Technical Setup, Technical Setup → Pre-Production, Pre-Production → Production, Production → Polish, Polish → Release)
   
   Do not skip this confirmation step when no argument is provided.
 
@@ -94,8 +92,8 @@ Note: in `solo` mode, director spawns (CD-PHASE-GATE, TD-PHASE-GATE, PR-PHASE-GA
 ### Gate: Technical Setup → Pre-Production
 
 **必需 Artifacts:**
-- [ ] Engine chosen (CLAUDE.md Technology Stack is not `[CHOOSE]`)
-- [ ] Technical preferences configured (`.claude/docs/technical-preferences.md` populated)
+- [ ] Engine chosen (AGENTS.md Technology Stack is not `[CHOOSE]`)
+- [ ] Technical preferences configured (`.protocols/game-studio/docs/technical-preferences.md` populated)
 - [ ] Art bible exists at `design/art/art-bible.md` with at least Sections 1–4 (Visual Identity Foundation)
 - [ ] At least 3 Architecture Decision Records in `docs/architecture/` covering
       Foundation-layer systems (scene management, event architecture, save/load)
@@ -202,7 +200,7 @@ A depends on B). If any cycle is detected (e.g. A→B→A, or A→B→C→A):
 - [ ] Fun hypothesis from Game Concept has been explicitly validated or revised
 
 **Quality Checks:**
-- [ ] Tests are passing (run test suite via Bash)
+- [ ] Tests are passing (run test suite via `run_command`)
 - [ ] No critical/blocker bugs in any bug tracker or known issues
 - [ ] Core loop plays as designed (compare to GDD acceptance criteria)
 - [ ] Performance is within budget (check technical-preferences.md targets)
@@ -255,12 +253,12 @@ increased scrutiny on those specific checks.
 For each item in the target gate:
 
 ### Artifact Checks
-- Use `Glob` and `Read` to verify files exist and have meaningful content
+- Use `glob_search` and `read_file` to verify files exist and have meaningful content
 - Don't just check existence — verify the file has real content (not just a template header)
 - For code checks, verify directory structure and file counts
 
 **Systems Design → Technical Setup gate — cross-GDD review check**:
-Use `Glob('design/gdd/gdd-cross-review-*.md')` to find the `/review-all-gdds` report.
+Use ``glob_search`('design/gdd/gdd-cross-review-*.md')` to find the `/review-all-gdds` report.
 If no file matches, mark the "cross-GDD review report exists" artifact as **FAIL** and
 surface it prominently: "No `/review-all-gdds` report found in `design/gdd/`. Run
 `/review-all-gdds` before advancing to Technical Setup."
@@ -268,11 +266,11 @@ If a file is found, read it and check the verdict line: a FAIL verdict means the
 cross-GDD consistency check failed and must be resolved before advancing.
 
 ### Quality Checks
-- For test checks: Run the test suite via `Bash` if a test runner is configured
-- For design review checks: `Read` the GDD and check for the 8 required sections
-- For performance checks: `Read` technical-preferences.md and compare against any
+- For test checks: Run the test suite via `run_command` if a test runner is configured
+- For design review checks: `read_file` the GDD and check for the 8 required sections
+- For performance checks: `read_file` technical-preferences.md and compare against any
   profiling data in `tests/performance/` or recent `/perf-profile` output
-- For localization checks: `Grep` for hardcoded strings in `src/`
+- For localization checks: `grep_search` for hardcoded strings in `src/`
 
 ### Cross-Reference Checks
 - Compare `design/gdd/` documents against `src/` implementations
@@ -295,14 +293,14 @@ For items that can't be automatically verified, **ask the user**:
 
 ## 4b. Director Panel Assessment
 
-Before generating the final verdict, spawn all four directors as **parallel subagents** via Task using the parallel gate protocol from `.claude/docs/director-gates.md`. Issue all four Task calls simultaneously — do not wait for one before starting the next.
+Before generating the final verdict, apply all four directors as **separate specialist reviews** through the multi-review gate protocol from `.protocols/game-studio/docs/director-gates.md`. Complete all four specialist profiles as separate review passes, then synthesize their verdicts.
 
-**Spawn in parallel:**
+**Apply as separate review passes:**
 
-1. **`creative-director`** — gate **CD-PHASE-GATE** (`.claude/docs/director-gates.md`)
-2. **`technical-director`** — gate **TD-PHASE-GATE** (`.claude/docs/director-gates.md`)
-3. **`producer`** — gate **PR-PHASE-GATE** (`.claude/docs/director-gates.md`)
-4. **`art-director`** — gate **AD-PHASE-GATE** (`.claude/docs/director-gates.md`)
+1. **`creative-director`** — gate **CD-PHASE-GATE** (`.protocols/game-studio/docs/director-gates.md`)
+2. **`technical-director`** — gate **TD-PHASE-GATE** (`.protocols/game-studio/docs/director-gates.md`)
+3. **`producer`** — gate **PR-PHASE-GATE** (`.protocols/game-studio/docs/director-gates.md`)
+4. **`art-director`** — gate **AD-PHASE-GATE** (`.protocols/game-studio/docs/director-gates.md`)
 
 Pass to each: target phase name, list of artifacts present, and the context fields listed in that gate's definition.
 
@@ -422,9 +420,9 @@ echo -n "Production" > production/stage.txt
 
 ---
 
-## 7. Closing Next-Step Widget
+## 7. Closing Next-Step `<user_options>` block
 
-After the verdict is presented and any stage.txt update is complete, close with a structured next-step prompt using `AskUserQuestion`.
+After the verdict is presented and any stage.txt update is complete, close with a structured next-step prompt using `<user_options>`.
 
 **Tailor the options to the gate that just ran:**
 
@@ -458,17 +456,17 @@ Based on the verdict, suggest specific next steps:
 - **Art bible exists but no asset specs?** → `/asset-spec system:[name]` to generate per-asset visual specs and generation prompts from approved GDDs
 - **No game concept?** → `/brainstorm` to create one
 - **No systems index?** → `/map-systems` to decompose the concept into systems
-- **Missing design docs?** → `/reverse-document` or delegate to `game-designer`
+- **Missing design docs?** → `/reverse-document` or route through `game-designer`
 - **Small design change needed?** → `/quick-design` for changes under ~4 hours (bypasses full GDD pipeline)
 - **No UX specs?** → `/ux-design [screen name]` to author specs, or `/team-ui [feature]` for full pipeline
 - **UX specs not reviewed?** → `/ux-review [file]` or `/ux-review all` to validate
-- **No accessibility requirements doc?** → Use `AskUserQuestion` to offer to create it now:
+- **No accessibility requirements doc?** → Offer to create it now in `<user_options>`:
   - Prompt: "The gate requires `design/accessibility-requirements.md`. Shall I create it from the template?"
   - Options: `Create it now — I'll choose an accessibility tier`, `I'll create it myself`, `Skip for now`
-  - If "Create it now": use a second `AskUserQuestion` to ask for the tier:
+  - If "Create it now": use a second `<user_options>` block to ask for the tier:
     - Prompt: "Which accessibility tier fits this project?"
     - Options: `Basic — remapping + subtitles only (lowest effort)`, `Standard — Basic + colorblind modes + scalable UI`, `Comprehensive — Standard + motor accessibility + full settings menu`, `Exemplary — Comprehensive + external audit + full customization`
-  - Then write `design/accessibility-requirements.md` using the template at `.claude/docs/templates/accessibility-requirements.md`, filling in the chosen tier. Confirm: "May I write `design/accessibility-requirements.md`?"
+  - Then write `design/accessibility-requirements.md` using the template at `.MAIN/templates/game-studio/accessibility-requirements.md`, filling in the chosen tier. Confirm: "May I write `design/accessibility-requirements.md`?"
 - **No interaction pattern library?** → `/ux-design patterns` to initialize it
 - **GDDs not cross-reviewed?** → `/review-all-gdds` (run after all MVP GDDs are individually approved)
 - **Cross-GDD consistency issues?** → fix flagged GDDs, then re-run `/review-all-gdds`
@@ -482,7 +480,7 @@ Based on the verdict, suggest specific next steps:
 - **Missing epics?** → `/create-epics layer: foundation` then `/create-epics layer: core` (requires control manifest)
 - **Missing stories for an epic?** → `/create-stories [epic-slug]` (run after each epic is created)
 - **Stories not implementation-ready?** → `/story-readiness` to validate stories before developers pick them up
-- **Tests failing?** → delegate to `lead-programmer` or `qa-tester`
+- **Tests failing?** → route through `lead-programmer` or `qa-tester`
 - **No playtest data?** → `/playtest-report`
 - **Less than 3 playtest sessions?** → Run more playtests before advancing. Use `/playtest-report` to structure findings.
 - **No Difficulty Curve doc?** → Consider creating one at `design/difficulty-curve.md` before polish

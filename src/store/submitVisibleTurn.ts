@@ -5,7 +5,7 @@ import {
 import type { TaskBlock } from "../lib/taskTypes";
 import type { ConversationTurnStatus } from "../lib/workflowModels";
 import type { CommandDirective, LegacyWorkflowMode, ResolvedRunIntent } from "../lib/runIntent";
-import type { PendingSlashCommand } from "../lib/gameStudioCatalog";
+import type { PendingSlashCommand } from "../lib/gameStudio/catalog";
 
 type SubmitVisibleTurnSessionGet = () => any;
 type SubmitVisibleTurnSessionSet = (patch: any) => void;

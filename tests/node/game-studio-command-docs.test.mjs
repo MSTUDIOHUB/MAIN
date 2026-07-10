@@ -11,7 +11,7 @@ const workspaceRoot = process.cwd();
 const require = createRequire(import.meta.url);
 
 async function loadCommandDocsModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/gameStudioCommandDocs.ts");
+  const sourcePath = path.join(workspaceRoot, "src/lib/gameStudio/commandDocs.ts");
   const source = await fs.readFile(sourcePath, "utf8");
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {

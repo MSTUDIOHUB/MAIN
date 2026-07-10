@@ -3,9 +3,6 @@ name: architecture-review
 description: "Validates completeness and consistency of the project architecture against all GDDs. Builds a traceability matrix mapping every GDD technical requirement to ADRs, identifies coverage gaps, detects cross-ADR conflicts, verifies engine compatibility consistency across all decisions, and produces a PASS/CONCERNS/FAIL verdict. The architecture equivalent of /design-review."
 argument-hint: "[focus: full | coverage | consistency | engine | single-gdd path/to/gdd.md]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Task, AskUserQuestion
-agent: technical-director
-model: opus
 ---
 
 # Architecture Review
@@ -33,16 +30,16 @@ and Pre-Production.
 
 ### Phase 1a — L0: Summary Scan (fast, low tokens)
 
-Before reading any full document, use Grep to extract `## Summary` sections
+Before reading any full document, use grep_search to extract `## Summary` sections
 from all GDDs and ADRs:
 
 ```
-Grep pattern="## Summary" glob="design/gdd/*.md" output_mode="content" -A 4
-Grep pattern="## Summary" glob="docs/architecture/adr-*.md" output_mode="content" -A 3
+`grep_search` pattern="## Summary" glob="design/gdd/*.md" output_mode="content" -A 4
+`grep_search` pattern="## Summary" glob="docs/architecture/adr-*.md" output_mode="content" -A 3
 ```
 
 For `single-gdd [path]` mode: use the target GDD's summary to identify which
-ADRs reference the same system (Grep ADRs for the system name), then full-read
+ADRs reference the same system (`grep_search` ADRs for the system name), then full-read
 only those ADRs. Skip full-reading unrelated GDDs entirely.
 
 For `engine` mode: only full-read ADRs — GDDs are not needed for engine checks.
@@ -68,7 +65,7 @@ Read all inputs appropriate to the mode:
 - All files in `docs/engine-reference/[engine]/modules/`
 
 ### Project Standards
-- `.claude/docs/technical-preferences.md`
+- `.protocols/game-studio/docs/technical-preferences.md`
 
 Report a count: "Loaded [N] GDDs, [M] ADRs, engine: [name + version]."
 
@@ -174,7 +171,7 @@ Requirements Traceability Matrix (RTM).
 
 ### Step 3b-1 — Load stories
 
-Glob `production/epics/**/*.md` (excluding EPIC.md index files). For each
+`glob_search` `production/epics/**/*.md` (excluding EPIC.md index files). For each
 story file:
 - Extract `TR-ID` from the story's Context section
 - Extract story file path, title, Status
@@ -182,10 +179,10 @@ story file:
 
 ### Step 3b-2 — Load test files
 
-Glob `tests/unit/**/*_test.*` and `tests/integration/**/*_test.*`.
+`glob_search` `tests/unit/**/*_test.*` and `tests/integration/**/*_test.*`.
 Build an index: system → [test file paths].
 
-For each test file path from Step 3b-1, confirm via Glob whether the file
+For each test file path from Step 3b-1, confirm via `glob_search` whether the file
 actually exists. Note MISSING if the stated path does not exist.
 
 ### Step 3b-3 — Build the extended RTM
@@ -296,7 +293,7 @@ Across all ADRs, check for engine consistency:
 - Check that no two ADRs make contradictory assumptions about the same post-cutoff API
 
 ### Deprecated API Check
-- Grep all ADRs for API names listed in `deprecated-apis.md`
+- `grep_search` all ADRs for API names listed in `deprecated-apis.md`
 - Flag any ADR referencing a deprecated API
 
 ### Missing Engine Compatibility Sections
@@ -323,10 +320,10 @@ Post-Cutoff API Conflicts:
 
 ### Engine Specialist Consultation
 
-After completing the engine audit above, spawn the **primary engine specialist** via Task for a domain-expert second opinion:
-- Read `.claude/docs/technical-preferences.md` `Engine Specialists` section to get the primary specialist
+After completing the engine audit above, apply the **primary engine specialist** using its specialist profile for a domain-expert second opinion:
+- Read `.protocols/game-studio/docs/technical-preferences.md` `Engine Specialists` section to get the primary specialist
 - If no engine is configured, skip this consultation
-- Spawn `subagent_type: [primary specialist]` with: all ADRs that contain engine-specific decisions or `Post-Cutoff APIs Used` fields, the engine reference docs, and the Phase 5 audit findings. Ask them to:
+- Apply `specialist profile: [primary specialist]` with: all ADRs that contain engine-specific decisions or `Post-Cutoff APIs Used` fields, the engine reference docs, and the Phase 5 audit findings. Ask them to:
   1. Confirm or challenge each audit finding — specialists may know of engine nuances not captured in the reference docs
   2. Identify engine-specific anti-patterns in the ADRs that the audit may have missed (e.g., using the wrong Godot node type, Unity component coupling, Unreal subsystem misuse)
   3. Flag ADRs that make assumptions about engine behaviour that differ from the actual pinned version
@@ -451,7 +448,7 @@ FAIL: Critical gaps (Foundation/Core layer requirements uncovered),
 
 ## Phase 8: Write and Update Traceability Index
 
-Use `AskUserQuestion` for the write approval:
+Ask the user for the write approval:
 - "Review complete. What would you like to write?"
   - [A] Write all three files (review report + traceability index + TR registry)
   - [B] Write review report only — `docs/architecture/architecture-review-[date].md`
@@ -605,7 +602,7 @@ After completing the review and writing approved files, present:
 3. **Rerun trigger**: "Re-run `/architecture-review` after each new ADR is written
    to verify coverage improves"
 
-Then close with `AskUserQuestion`:
+Then close with `<user_options>`:
 - "Architecture review complete. What would you like to do next?"
   - [A] Write a missing ADR — open a fresh session and run `/architecture-decision [system]`
   - [B] Run `/gate-check pre-production` — if all blocking gaps are resolved
@@ -615,12 +612,12 @@ Then close with `AskUserQuestion`:
 
 ## Error Recovery Protocol
 
-If any spawned agent returns BLOCKED, errors, or fails to complete:
+If a specialist review identifies a blocker or cannot produce a verdict:
 
 1. **Surface immediately**: Report "[AgentName]: BLOCKED — [reason]" before continuing
-2. **Assess dependencies**: If the blocked agent's output is required by a later phase, do not proceed past that phase without user input
-3. **Offer options** via AskUserQuestion with three choices:
-   - Skip this agent and note the gap in the final report
+2. **Assess dependencies**: If the blocked review's output is required by a later phase, do not proceed past that phase without user input
+3. **Offer options** in one flat `<user_options>` block:
+   - Skip this review pass and note the gap in the final report
    - Retry with narrower scope (fewer GDDs, single-system focus)
    - Stop here and resolve the blocker first
 4. **Always produce a partial report** — output whatever was completed so work is not lost

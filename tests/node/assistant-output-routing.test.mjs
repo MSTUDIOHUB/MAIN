@@ -1,0 +1,182 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fsSync from "node:fs";
+import path from "node:path";
+import { createRequire } from "node:module";
+
+import ts from "typescript";
+
+const require = createRequire(import.meta.url);
+const workspaceRoot = process.cwd();
+const transpiledModuleCache = new Map();
+
+function loadTranspiledModuleSync(sourcePath) {
+  const normalizedPath = path.resolve(sourcePath);
+  if (transpiledModuleCache.has(normalizedPath)) {
+    return transpiledModuleCache.get(normalizedPath);
+  }
+
+  const source = fsSync.readFileSync(normalizedPath, "utf8");
+  const localRequire = createRequire(normalizedPath);
+  const transpiled = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.CommonJS,
+      target: ts.ScriptTarget.ES2020,
+    },
+    fileName: normalizedPath,
+  }).outputText;
+
+  const module = { exports: {} };
+  transpiledModuleCache.set(normalizedPath, module.exports);
+
+  const runtimeRequire = (specifier) => {
+    if (specifier.startsWith(".")) {
+      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
+      const candidates = [
+        basePath,
+        `${basePath}.ts`,
+        `${basePath}.tsx`,
+        path.join(basePath, "index.ts"),
+      ];
+
+      for (const candidate of candidates) {
+        if (!fsSync.existsSync(candidate)) continue;
+        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
+          return loadTranspiledModuleSync(candidate);
+        }
+      }
+    }
+
+    return localRequire(specifier);
+  };
+
+  const factory = new Function("exports", "module", "require", transpiled);
+  factory(module.exports, module, runtimeRequire);
+  transpiledModuleCache.set(normalizedPath, module.exports);
+  return module.exports;
+}
+
+const {
+  isHiddenThoughtOnlyNoToolStop,
+  resolveAssistantReplyOptionRouting,
+  resolveToolProtocolStreamClearDecision,
+  shouldAutoContinueNonBlockingPlanChoices,
+  shouldTrackAssistantCheckpoint,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantOutputRouting.ts"),
+);
+
+test("assistant output routing clears raw tool protocol unless unapproved plan text should remain", () => {
+  const clear = resolveToolProtocolStreamClearDecision({
+    toolCallCount: 1,
+    streamText: "<tool_use><tool>read_file</tool></tool_use>",
+    workflowMode: "edit",
+    isPlanApproved: false,
+    visibleAssistantText: "",
+  });
+  assert.deepEqual(clear, { shouldClear: true, preserveScopedPlanVisibleText: false });
+
+  const preservePlanText = resolveToolProtocolStreamClearDecision({
+    toolCallCount: 1,
+    streamText: "<tool_use><tool>write_file</tool></tool_use>",
+    workflowMode: "plan",
+    isPlanApproved: false,
+    visibleAssistantText: "## Plan\n- inspect evidence",
+  });
+  assert.deepEqual(preservePlanText, { shouldClear: true, preserveScopedPlanVisibleText: true });
+});
+
+test("assistant output routing leaves normal text streams alone", () => {
+  const decision = resolveToolProtocolStreamClearDecision({
+    toolCallCount: 1,
+    streamText: "I will inspect the file.",
+    workflowMode: "edit",
+    isPlanApproved: false,
+    visibleAssistantText: "I will inspect the file.",
+  });
+
+  assert.deepEqual(decision, { shouldClear: false, preserveScopedPlanVisibleText: false });
+});
+
+test("assistant output routing tracks checkpoint text only for model-authored text", () => {
+  assert.equal(
+    shouldTrackAssistantCheckpoint({
+      historyAssistantText: "I found the issue.",
+      runtimeNarrationInjected: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldTrackAssistantCheckpoint({
+      historyAssistantText: "Reading src/App.tsx",
+      runtimeNarrationInjected: true,
+    }),
+    false,
+  );
+});
+
+test("assistant output routing auto-continues only non-blocking unapproved plan choices without tools", () => {
+  assert.equal(
+    shouldAutoContinueNonBlockingPlanChoices({
+      suppressPlanContinuationReplyOptions: true,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      isPlanApproved: false,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAutoContinueNonBlockingPlanChoices({
+      suppressPlanContinuationReplyOptions: true,
+      toolCallCount: 1,
+      workflowMode: "plan",
+      isPlanApproved: false,
+    }),
+    false,
+  );
+});
+
+test("assistant output routing resolves executable plan reply options and pause decision", () => {
+  const replyOptions = [
+    { label: "批准执行本轮操作", value: "approve", action: "approve_operation_once", source: "proposal_follow_up" },
+    { label: "继续调整方案", value: "adjust", action: "adjust_plan", source: "proposal_follow_up" },
+  ];
+
+  const decision = resolveAssistantReplyOptionRouting({
+    rawFinalReplyOptions: replyOptions,
+    finalReplyOptions: [
+      { label: "继续", value: "continue", source: "explicit_user_options" },
+    ],
+    toolCallCount: 0,
+    workflowMode: "plan",
+    hasStructuredProposal: false,
+    hasReadyPlanArtifacts: false,
+    isPlanApproved: false,
+    forcePause: false,
+    finishReason: "stop",
+  });
+
+  assert.equal(decision.hasExecutablePlanProposalOptions, true);
+  assert.equal(decision.shouldPauseForUserChoice, true);
+});
+
+test("assistant output routing detects hidden-thought-only no-tool stops", () => {
+  assert.equal(
+    isHiddenThoughtOnlyNoToolStop({
+      toolCallCount: 0,
+      replyOptionCount: 0,
+      hasMeaningfulVisibleText: false,
+      hiddenThought: "internal reasoning",
+    }),
+    true,
+  );
+  assert.equal(
+    isHiddenThoughtOnlyNoToolStop({
+      toolCallCount: 0,
+      replyOptionCount: 1,
+      hasMeaningfulVisibleText: false,
+      hiddenThought: "internal reasoning",
+    }),
+    false,
+  );
+});

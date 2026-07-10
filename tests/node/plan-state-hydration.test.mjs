@@ -54,7 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const hydration = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planStateHydration.ts"));
-const catalog = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/gameStudioCatalog.ts"));
+const catalog = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/gameStudio/catalog.ts"));
 
 const { resolvePlanStateHydrationReason, shouldPromoteHydratedPlanToExecuting } = hydration;
 const { parseGameStudioSlashCommand } = catalog;

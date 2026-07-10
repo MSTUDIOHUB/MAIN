@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
 
 async function loadCatalogModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/gameStudioCatalog.ts");
+  const sourcePath = path.join(workspaceRoot, "src/lib/gameStudio/catalog.ts");
   const source = await fs.readFile(sourcePath, "utf8");
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {

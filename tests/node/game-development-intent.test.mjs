@@ -51,7 +51,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const { detectGameDevelopmentIntent } = loadTranspiledModuleSync(
-  path.join(workspaceRoot, "src/lib/gameDevelopmentIntent.ts"),
+  path.join(workspaceRoot, "src/lib/gameStudio/detection.ts"),
 );
 
 test("Unity project structure triggers an explicit Unity signal", () => {

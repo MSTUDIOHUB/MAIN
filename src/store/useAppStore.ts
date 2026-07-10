@@ -158,7 +158,7 @@ import {
   type PendingSlashCommand,
   type StudioAgentKey,
   type StudioConfig,
-} from "../lib/gameStudioCatalog";
+} from "../lib/gameStudio/catalog";
 import {
   getIntentPolicy,
   resolveConversationTurnIntent,
@@ -187,6 +187,7 @@ import {
 import { createGoalDefinition } from "../lib/goalState";
 import type { GoalDefinition, GoalProgress, GoalStatus } from "../lib/goalState";
 import type { GoalBudget } from "../lib/goalBudget";
+import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import {
@@ -6626,7 +6627,7 @@ export const useAppStore = create<AppState>()(
           cloud: cloudState.cloud,
           cloudServers: cloudState.cloudServers,
           activeCloudServerId: cloudState.activeCloudServerId,
-          cloudExperimentalLoginEnabled: false,
+          cloudExperimentalLoginEnabled: CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE,
           promptLanguageStrategy:
             (persistedConfig as any).promptLanguageStrategy === "english_core_localized_output"
               ? (persistedConfig as any).promptLanguageStrategy
@@ -6747,7 +6748,7 @@ async function requestSemanticTurnMetadata(params: {
     const model = ac.model;
     const provider = isCloud ? params.config.cloud.provider : params.config.local.provider;
     const cloudProtocol = normalizeCloudProtocol(isCloud ? params.config.cloud.protocol : "openai");
-    const cloudExperimentalLoginEnabled = false;
+    const cloudExperimentalLoginEnabled = CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE;
     const cloudAuthMode = isCloud && cloudExperimentalLoginEnabled
       ? params.config.cloud.auth?.mode ?? "api_key"
       : "api_key";

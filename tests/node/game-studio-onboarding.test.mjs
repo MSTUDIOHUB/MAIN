@@ -10,7 +10,7 @@ const require = createRequire(import.meta.url);
 const workspaceRoot = process.cwd();
 
 async function loadOnboardingModule() {
-  const sourcePath = path.join(workspaceRoot, "src/lib/gameStudioOnboarding.ts");
+  const sourcePath = path.join(workspaceRoot, "src/lib/gameStudio/onboarding.ts");
   const source = await fs.readFile(sourcePath, "utf8");
   const transpiled = ts.transpileModule(source, {
     compilerOptions: {
@@ -27,9 +27,30 @@ async function loadOnboardingModule() {
 }
 
 const {
+  getGameStudioOnboardingCopy,
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
 } = await loadOnboardingModule();
+
+test("game studio onboarding explains when to use MAIN or lifecycle workflows", () => {
+  const zh = getGameStudioOnboardingCopy("zh");
+  assert.match(zh.intro, /单次代码修改.*MAIN/);
+  assert.match(zh.intro, /生命周期工作流/);
+  assert.match(zh.intro, /阶段门/);
+  assert.equal(zh.initializeLabel, "初始化 Game Studio");
+  assert.match(zh.removeConfirmation, /隐藏文件夹/);
+  assert.match(zh.workspaceNote, /\/setup-engine/);
+  assert.match(zh.workspaceNote, /\/start/);
+
+  const en = getGameStudioOnboardingCopy("en");
+  assert.match(en.intro, /one-off coding tasks/);
+  assert.match(en.intro, /lifecycle workflows/);
+  assert.match(en.intro, /stage gates/);
+  assert.equal(en.initializeLabel, "Initialize Game Studio");
+  assert.match(en.removeConfirmation, /merged hooks/);
+  assert.match(en.workspaceDescription, /\.MAIN/);
+  assert.match(en.workspaceDescription, /\.protocols\/game-studio/);
+});
 
 test("game studio onboarding actions resolve to initialization or trailing-space drafts", () => {
   assert.deepEqual(resolveGameStudioOnboardingAction("init"), { kind: "initialize" });

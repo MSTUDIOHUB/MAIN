@@ -64,6 +64,8 @@ test("MAIN shortcut order, keyboard selection, and labels stay aligned", async (
     .evaluateAll((nodes) => nodes.map((node) => node.getAttribute("data-testid")));
   expect(shortcutIds).toEqual([
     "main-shortcut-item-plan",
+    "main-shortcut-item-image_studio",
+    "main-shortcut-item-goal",
     "main-shortcut-item-report",
     "main-shortcut-item-analyze",
     "main-shortcut-item-summarize",

@@ -120,7 +120,7 @@ import {
   type HookExecutionRecord,
   type HookEvent,
 } from "./hooks";
-import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudioCatalog";
+import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudio/catalog";
 import {
   buildRepeatLoopArgsKey,
   buildRepeatLoopSignature,
@@ -4733,6 +4733,7 @@ export function summarizeToolsForDiagnostics(tools: ToolDefinition[]): Record<st
 }
 
 export * from "./orchestrator/types";
-export { executeAgentLoop, AgentOrchestrator } from "./orchestrator/loop/AgentOrchestrator";
+export { AgentOrchestrator } from "./orchestrator/loop/AgentOrchestrator";
+export { executeAgentLoop } from "./orchestrator/loop/AgentLoopRunner";
 
 export { isReasoningModelName } from "./orchestrator/agentRecovery";

@@ -1,4 +1,4 @@
-import { detectGameDevelopmentIntent } from "../lib/gameDevelopmentIntent";
+import { detectGameDevelopmentIntent } from "../lib/gameStudio/detection";
 import { mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
 import {
   getDefaultStudioAgentForEngine,
@@ -7,7 +7,7 @@ import {
   type ParsedSetupEngineArgs,
   type StudioAgentKey,
   type StudioConfig,
-} from "../lib/gameStudioCatalog";
+} from "../lib/gameStudio/catalog";
 
 export interface GameStudioTurnRuntimeService {
   ensureInitialized(activeStudioAgent?: StudioAgentKey): Promise<StudioConfig>;

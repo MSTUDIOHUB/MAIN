@@ -1,6 +1,6 @@
 # Available Skills (Slash Commands)
 
-68 slash commands organized by phase. Type `/` in Claude Code to access any of them.
+68 slash commands organized by phase. Type `/` in MAIN to access any of them.
 
 ## Onboarding & Navigation
 

@@ -1,7 +1,11 @@
 import { GLOBAL_CHAT_KEY, finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import { getPlanArtifactTitle } from "./workflowModels";
-import type { NexusModeKey } from "./gameStudioCatalog";
+import type { NexusModeKey } from "./gameStudio/catalog";
+import {
+  isCloudSettingsScenario,
+  seedCloudSettingsScenario,
+} from "./e2e/scenarios/cloudSettings";
 
 const PLAN_FLOW_SCENARIO = "plan-flow";
 const PLAN_QUICK_REPLY_APPROVAL_SCENARIO = "plan-quick-reply-approval";
@@ -26,9 +30,6 @@ const PROCESS_DISPLAY_SCENARIO = "process-display";
 const GAME_STUDIO_ONBOARDING_SCENARIO = "game-studio-onboarding";
 const COMPOSER_MAIN_SHORTCUTS_SCENARIO = "composer-main-shortcuts";
 const GAME_STUDIO_PLAN_SHORTCUTS_SCENARIO = "game-studio-plan-shortcuts";
-const CLOUD_SETTINGS_MODEL_SELECT_SCENARIO = "cloud-settings-model-select";
-const CLOUD_SETTINGS_EMPTY_SCENARIO = "cloud-settings-empty";
-const CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO = "cloud-status-active-server-model";
 const STREAMING_TIMER_SCENARIO = "streaming-timer";
 const COMPOSER_RUNNING_GUIDANCE_SCENARIO = "composer-running-guidance";
 const STREAMING_RESPONSIVENESS_SCENARIO = "streaming-responsiveness";
@@ -4622,240 +4623,6 @@ function seedGameStudioPlanShortcutsScenario() {
   return cleanup;
 }
 
-function seedCloudSettingsModelSelectScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  incrementSeedCount(CLOUD_SETTINGS_MODEL_SELECT_SCENARIO);
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      activeProfile: "cloud",
-      activeCloudServerId: "demo-openai",
-      cloudServers: [{
-        id: "demo-openai",
-        name: "Demo Gateway",
-        protocol: "openai",
-        provider: "OpenAI",
-        apiFormat: "responses",
-        endpoint: "https://demo-gateway.example/v1",
-        apiKey: "demo-key",
-        model: "",
-        customHeaders: "",
-        temperature: 0.6,
-        topP: 0.95,
-        reasoningEffort: "none",
-        disableResponseStorage: true,
-        toolProtocol: "auto",
-        auth: { mode: "api_key", status: "disconnected" },
-      }],
-      cloud: {
-        ...state.config.cloud,
-        protocol: "openai",
-        provider: "OpenAI",
-        apiFormat: "responses",
-        endpoint: "https://demo-gateway.example/v1",
-        apiKey: "demo-key",
-        model: "",
-        reasoningEffort: "none",
-        disableResponseStorage: true,
-        toolProtocol: "auto",
-        auth: { mode: "api_key", status: "disconnected" },
-      },
-    },
-    currentWorkspace: "",
-    currentSessionId: null,
-    sessionsByWorkspace: {},
-    taskFlow: [],
-    conversationTurns: [],
-    currentTurnId: null,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    isSettingsOpen: true,
-    settingsTab: "cloud",
-    showDiff: false,
-    showPlanPanel: false,
-    showTerminal: false,
-    showFilePanel: false,
-    selectedDiffTaskId: null,
-  }));
-
-  bridge.getSnapshot = () => {
-    const state = useAppStore.getState();
-    return {
-      isSettingsOpen: state.isSettingsOpen,
-      settingsTab: state.settingsTab,
-      selectedCloudModel: state.config.cloud.model,
-      activeCloudServerId: state.config.activeCloudServerId,
-      activeCloudServerModel: state.config.cloudServers.find((server: any) => server.id === state.config.activeCloudServerId)?.model ?? null,
-      cloudServerCount: state.config.cloudServers.length,
-      cloudServers: state.config.cloudServers,
-      seedCount: readSeedCount(CLOUD_SETTINGS_MODEL_SELECT_SCENARIO),
-    };
-  };
-
-  const cleanup = () => {
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
-function seedCloudSettingsEmptyScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  incrementSeedCount(CLOUD_SETTINGS_EMPTY_SCENARIO);
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      activeProfile: "cloud",
-      activeCloudServerId: "",
-      cloudServers: [],
-      cloud: {
-        ...state.config.cloud,
-        model: "",
-        apiKey: "",
-        customHeaders: "",
-      },
-    },
-    currentWorkspace: "",
-    currentSessionId: null,
-    sessionsByWorkspace: {},
-    taskFlow: [],
-    conversationTurns: [],
-    currentTurnId: null,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    isSettingsOpen: true,
-    settingsTab: "cloud",
-    showDiff: false,
-    showPlanPanel: false,
-    showTerminal: false,
-    showFilePanel: false,
-    selectedDiffTaskId: null,
-  }));
-
-  bridge.getSnapshot = () => {
-    const state = useAppStore.getState();
-    return {
-      isSettingsOpen: state.isSettingsOpen,
-      settingsTab: state.settingsTab,
-      selectedCloudModel: state.config.cloud.model,
-      activeCloudServerId: state.config.activeCloudServerId,
-      cloudServerCount: state.config.cloudServers.length,
-      cloudServers: state.config.cloudServers,
-      seedCount: readSeedCount(CLOUD_SETTINGS_EMPTY_SCENARIO),
-    };
-  };
-
-  const cleanup = () => {
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
-function seedCloudStatusActiveServerModelScenario() {
-  const bridge = getBridge();
-  if (!bridge) return undefined;
-
-  bridge.events = [{ type: "boot" }];
-  bridge.savedDocuments = [];
-  bridge.completed = false;
-
-  incrementSeedCount(CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO);
-
-  useAppStore.setState((state) => ({
-    ...state,
-    config: {
-      ...state.config,
-      language: "zh",
-      activeProfile: "cloud",
-      activeCloudServerId: "qwen-gateway",
-      cloudServers: [{
-        id: "qwen-gateway",
-        name: "Qwen3.6",
-        protocol: "openai",
-        provider: "OpenAI",
-        apiFormat: "chat_completions",
-        endpoint: "https://qwen-gateway.example/v1",
-        apiKey: "qwen-key",
-        model: "qwen3.6-coder",
-        customHeaders: "",
-        temperature: 0.6,
-        topP: 0.95,
-        reasoningEffort: "none",
-        disableResponseStorage: true,
-        toolProtocol: "auto",
-        auth: { mode: "api_key", status: "disconnected" },
-      }],
-      cloud: {
-        ...state.config.cloud,
-        protocol: "openai",
-        provider: "OpenAI",
-        apiFormat: "chat_completions",
-        endpoint: "https://qwen-gateway.example/v1",
-        apiKey: "qwen-key",
-        model: "",
-        auth: { mode: "api_key", status: "disconnected" },
-      },
-    },
-    currentWorkspace: "",
-    currentSessionId: null,
-    sessionsByWorkspace: {},
-    taskFlow: [],
-    conversationTurns: [],
-    currentTurnId: null,
-    input: "",
-    attachedFiles: [],
-    contextMentions: [],
-    isSettingsOpen: false,
-    settingsTab: "cloud",
-    showDiff: false,
-    showPlanPanel: false,
-    showTerminal: false,
-    showFilePanel: false,
-    selectedDiffTaskId: null,
-  }));
-
-  bridge.getSnapshot = () => {
-    const state = useAppStore.getState();
-    const activeServer = state.config.cloudServers.find((server: any) => server.id === state.config.activeCloudServerId);
-    return {
-      selectedCloudModel: state.config.cloud.model,
-      activeCloudServerModel: activeServer?.model ?? null,
-      activeCloudServerName: activeServer?.name ?? null,
-      seedCount: readSeedCount(CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO),
-    };
-  };
-
-  const cleanup = () => {
-    bridge.initialized = false;
-  };
-
-  bridge.cleanup = cleanup;
-  return cleanup;
-}
-
 function seedStreamingTimerScenario() {
   const bridge = getBridge();
   if (!bridge) return undefined;
@@ -6902,16 +6669,13 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedGameStudioPlanShortcutsScenario();
   }
 
-  if (scenario === CLOUD_SETTINGS_MODEL_SELECT_SCENARIO) {
-    return seedCloudSettingsModelSelectScenario();
-  }
-
-  if (scenario === CLOUD_SETTINGS_EMPTY_SCENARIO) {
-    return seedCloudSettingsEmptyScenario();
-  }
-
-  if (scenario === CLOUD_STATUS_ACTIVE_SERVER_MODEL_SCENARIO) {
-    return seedCloudStatusActiveServerModelScenario();
+  if (isCloudSettingsScenario(scenario)) {
+    return seedCloudSettingsScenario(scenario, {
+      bridge,
+      store: useAppStore,
+      readSeedCount,
+      incrementSeedCount,
+    });
   }
 
   if (scenario === STREAMING_TIMER_SCENARIO) {

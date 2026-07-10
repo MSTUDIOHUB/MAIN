@@ -3,7 +3,6 @@ name: regression-suite
 description: "生成或整理回归测试集，确保旧功能不被新改动破坏。"
 argument-hint: "[update | audit | report]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit
 ---
 
 # Regression Suite
@@ -52,7 +51,7 @@ If it does not exist: note "No regression suite found — will create one."
 
 ### Step 2b — Load test inventory
 
-Glob all test files:
+`glob_search` all test files:
 ```
 tests/unit/**/*_test.*
 tests/integration/**/*_test.*
@@ -75,7 +74,7 @@ and story files to find stories with Status: 完成 this sprint.
 
 ### Step 2d — Load closed bugs
 
-Glob `production/qa/bugs/*.md` and filter for bugs with a `Status: Closed`
+`glob_search` `production/qa/bugs/*.md` and filter for bugs with a `Status: Closed`
 or `Status: Fixed` field. Note:
 - Which story or system the bug was in
 - Whether a regression test was mentioned in the fix description
@@ -88,7 +87,7 @@ For `audit` mode only:
 
 For each GDD acceptance criterion, determine whether a test exists:
 
-1. Grep `tests/unit/[system]/` and `tests/integration/[system]/` for file names
+1. `grep_search` `tests/unit/[system]/` and `tests/integration/[system]/` for file names
    and function names related to the criterion's key noun/verb
 2. Assign coverage:
 
@@ -109,7 +108,7 @@ For each GDD acceptance criterion, determine whether a test exists:
 For each closed bug:
 
 1. Extract the system slug from the bug's metadata
-2. Grep `tests/unit/[system]/` and `tests/integration/[system]/` for a test
+2. `grep_search` `tests/unit/[system]/` and `tests/integration/[system]/` for a test
    that references the bug ID or the specific failure scenario
 3. Assign:
    - **HAS REGRESSION TEST** — a test was found that would catch this bug
@@ -130,7 +129,7 @@ Coverage drift occurs when the game grows but the regression suite doesn't.
 - Stories completed this sprint with no corresponding test files in `tests/`
 - New systems added to `systems-index.md` since the last regression-suite update
 - GDD sections added or revised since the regression suite was last updated
-  (use Grep on GDD file modification hints if available, or ask the user)
+  (use grep_search on GDD file modification hints if available, or ask the user)
 - `tests/regression-suite.md` last-updated date vs. current date — if gap >
   2 sprints, flag as likely stale
 
@@ -220,7 +219,7 @@ Ask: "May I write/update `tests/regression-suite.md` with the current
 regression suite manifest?"
 
 For `update` mode: append new entries; never remove existing entries
-(use `Edit` with targeted insertions).
+(use `apply_patch` with targeted insertions).
 For `audit` mode: rewrite the full manifest with updated coverage data.
 For `report` mode: do not write anything.
 

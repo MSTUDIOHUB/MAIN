@@ -4,7 +4,12 @@ INPUT=$(cat)
 TOOL_NAME=$(echo "$INPUT" | grep -oE '"toolName"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 | sed 's/.*"toolName"[[:space:]]*:[[:space:]]*"//;s/"$//')
 COMMAND=$(echo "$INPUT" | grep -oE '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"command"[[:space:]]*:[[:space:]]*"//;s/"$//')
 
-if [ "$TOOL_NAME" != "execute_command" ] || [ -z "$COMMAND" ]; then
+case "$TOOL_NAME" in
+  execute_command|run_command) ;;
+  *) exit 0 ;;
+esac
+
+if [ -z "$COMMAND" ]; then
   exit 0
 fi
 

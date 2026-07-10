@@ -3,7 +3,6 @@ name: test-evidence-review
 description: "Quality review of test files and manual evidence documents. Goes beyond existence checks — evaluates assertion coverage, edge case handling, naming conventions, and evidence completeness. Produces ADEQUATE/INCOMPLETE/MISSING verdict per story. Run before QA sign-off or on demand."
 argument-hint: "[story-path | sprint | system-name]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write
 ---
 
 # Test Evidence Review
@@ -42,7 +41,7 @@ Evidence section, story slug, system name.
 **Sprint**: Read the most recently modified file in `production/sprints/`.
 Extract the list of story file paths from the sprint plan. Read each story file.
 
-**System**: Glob `production/epics/[system-name]/story-*.md`. Read each.
+**System**: `glob_search` `production/epics/[system-name]/story-*.md`. Read each.
 
 For each story, collect:
 - `Type:` field (Logic / Integration / Visual/Feel / UI / Config/Data)
@@ -57,16 +56,16 @@ For each story, collect:
 
 For each story, find the evidence:
 
-**Logic stories**: Glob `tests/unit/[system]/[story-slug]_test.*`
-  - If not found, also try: Grep in `tests/unit/[system]/` for files
+**Logic stories**: `glob_search` `tests/unit/[system]/[story-slug]_test.*`
+  - If not found, also try: `grep_search` in `tests/unit/[system]/` for files
     containing the story slug
 
-**Integration stories**: Glob `tests/integration/[system]/[story-slug]_test.*`
+**Integration stories**: `glob_search` `tests/integration/[system]/[story-slug]_test.*`
   - Also check `production/session-logs/` for playtest records mentioning the story
 
-**Visual/Feel and UI stories**: Glob `production/qa/evidence/[story-slug]-evidence.*`
+**Visual/Feel and UI stories**: `glob_search` `production/qa/evidence/[story-slug]-evidence.*`
 
-**Config/Data stories**: Glob `production/qa/smoke-*.md` (any smoke check report)
+**Config/Data stories**: `glob_search` `production/qa/smoke-*.md` (any smoke check report)
 
 Note what was found (path) or not found (gap) for each story.
 
@@ -96,7 +95,7 @@ or "when X happens" conditional: check whether a test function name or
 test body references that specific case.
 
 Heuristics:
-- Grep test file for "zero", "max", "null", "empty", "min", "invalid",
+- `grep_search` test file for "zero", "max", "null", "empty", "min", "invalid",
   "boundary", "edge" — presence of any is a positive signal
 - If the story has a Formulas section with specific bounds: check whether
   tests exercise at minimum/maximum values
@@ -141,7 +140,7 @@ closed without all required sign-offs.
 ### Screenshot / artefact completeness
 
 For Visual/Feel stories: check whether screenshot file paths are referenced
-in the evidence doc. If referenced, Glob for them to confirm they exist.
+in the evidence doc. If referenced, `glob_search` for them to confirm they exist.
 
 For UI stories: check whether a walkthrough sequence (step-by-step interaction
 log) is present.

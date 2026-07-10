@@ -84,6 +84,7 @@ const {
   mapMessagesForAnthropic,
   getModelInstructionProfile,
   resolveReasoningPolicy,
+  getDefaultLocalProviderEndpoint,
   getDefaultLocalToolProtocol,
   normalizeCloudAuthMode,
   resolveEffectiveCloudApiFormat,
@@ -428,6 +429,10 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
   assert.equal(getDefaultLocalToolProtocol("LM Studio"), "xml");
   assert.equal(getDefaultLocalToolProtocol("Ollama"), "xml");
   assert.equal(getDefaultLocalToolProtocol("OMLX"), "auto");
+  assert.equal(getDefaultLocalProviderEndpoint("LM Studio"), "http://127.0.0.1:1234/v1");
+  assert.equal(getDefaultLocalProviderEndpoint("Ollama"), "http://127.0.0.1:11434/v1");
+  assert.equal(getDefaultLocalProviderEndpoint("OMLX"), "http://127.0.0.1:8000/v1");
+  assert.equal(getDefaultLocalProviderEndpoint("custom", "https://custom.example/v1"), "https://custom.example/v1");
   assert.equal(normalizeLocalToolProtocol(undefined, "LM Studio"), "xml");
   assert.equal(normalizeLocalToolProtocol(undefined, "Ollama"), "xml");
   assert.equal(normalizeLocalToolProtocol(undefined, "OMLX"), "auto");

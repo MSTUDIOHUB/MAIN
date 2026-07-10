@@ -18,6 +18,8 @@ test("game studio onboarding inserts drafts and does not auto-send", async ({ pa
   const onboarding = page.getByTestId("game-studio-onboarding");
   await expect(onboarding).toBeVisible();
   await expect(onboarding).toContainText("MAIN GAME STUDIO");
+  await expect(onboarding).toContainText("单次代码修改或普通开发任务直接使用 MAIN");
+  await expect(onboarding).toContainText("生命周期工作流、阶段门");
 
   await page.getByTestId("game-studio-onboarding-setup-engine").click();
 

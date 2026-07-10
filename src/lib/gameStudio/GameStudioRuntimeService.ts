@@ -8,14 +8,14 @@ import type {
 import {
   looksLikePlanContinuationOrApprovalInput,
 } from "../runIntent";
-import type { GameDevelopmentIntentSignal } from "../gameDevelopmentIntent";
+import type { GameDevelopmentIntentSignal } from "./detection";
 import type {
   NexusModeKey,
   PendingSlashCommand,
   StudioAgentKey,
   StudioConfig,
   StudioEngineKey,
-} from "../gameStudioCatalog";
+} from "./catalog";
 import {
   buildGameStudioEnvelopeForTurn,
   ensureGameStudioWorkspaceInitialized,
@@ -26,7 +26,7 @@ import {
   removeGameStudioWorkspaceAssets,
   resolveGameStudioHelpTarget,
   setGameStudioEngineConfig,
-} from "../gameStudioPack";
+} from "./pack";
 
 export {
   buildGameStudioEnvelopeForTurn,

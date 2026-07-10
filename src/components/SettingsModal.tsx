@@ -33,6 +33,7 @@ import {
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
   resolveEffectiveCloudApiFormat,
+  getDefaultLocalProviderEndpoint,
   getDefaultLocalToolProtocol,
   normalizeLocalToolProtocol,
   normalizeOpenAiReasoningEffort,
@@ -51,13 +52,16 @@ import {
   upsertFeishuPairedUser,
 } from "../lib/imAdapters";
 import {
+  DEFAULT_CLOUD_ENDPOINTS,
   createDefaultCloudConfig,
   createCloudServerConfig,
   createDefaultCloudAuth,
+  getDefaultCloudEndpoint,
   normalizeCloudAuth,
   normalizeCloudServerState,
 } from "../lib/cloudServers";
 import { APP_ICON_ASSETS, applyAppIconVariant, normalizeAppIconVariant, type AppIconVariant } from "../lib/appIcon";
+import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
 
 function buildCloudConnectionFingerprint(server: any, apiFormatOverride?: unknown, modelOverride?: unknown): string {
   if (!server) return "";
@@ -91,14 +95,8 @@ const settingsControlColumnClass = "w-full lg:ml-auto lg:max-w-[620px]";
 const settingsOptionBaseClass = "border bg-[#000000] text-[#a1a1aa] transition-all duration-150 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[#09090b]";
 const settingsOptionSelectedClass = "theme-text theme-subtle-border bg-transparent ring-1 ring-inset ring-[var(--accent-light)] hover:bg-[var(--accent-subtle)]";
 
-const DEFAULT_CLOUD_ENDPOINTS = {
-  openai: "https://api.openai.com/v1",
-  anthropic: "https://api.anthropic.com",
-  gemini: "https://generativelanguage.googleapis.com",
-} as const;
-
 function defaultCloudEndpointForProtocol(protocol: "openai" | "anthropic" | "gemini"): string {
-  return DEFAULT_CLOUD_ENDPOINTS[protocol] || DEFAULT_CLOUD_ENDPOINTS.openai;
+  return getDefaultCloudEndpoint(protocol);
 }
 
 function shouldReplaceCloudEndpointForProtocol(currentEndpoint: string | undefined, nextProtocol: "openai" | "anthropic" | "gemini"): boolean {
@@ -1811,10 +1809,7 @@ export default function SettingsModal({
     if (!canChangeCurrentModel) return;
     const provider = e.target.value;
     skipNextLocalModelAutoPickRef.current = true;
-    let endpoint = config.local.endpoint;
-    if (provider === "LM Studio") endpoint = "http://127.0.0.1:1234/v1";
-    if (provider === "Ollama") endpoint = "http://127.0.0.1:11434/v1";
-    if (provider === "OMLX") endpoint = "http://127.0.0.1:8000/v1";
+    const endpoint = getDefaultLocalProviderEndpoint(provider, config.local.endpoint);
     setConfig({
       ...config,
       local: {
@@ -1946,7 +1941,7 @@ export default function SettingsModal({
   const parsedCloudCustomHeaders = parseCloudCustomHeaders(draftCloudConfig.customHeaders || "");
   const cloudAuth = normalizeCloudAuth(draftCloudConfig.auth, cloudProtocol);
   const rawCloudAuthMode = normalizeCloudAuthMode(cloudAuth.mode);
-  const cloudExperimentalLoginEnabled = false;
+  const cloudExperimentalLoginEnabled = CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE;
   const cloudAuthMode = cloudExperimentalLoginEnabled ? rawCloudAuthMode : "api_key";
   const cloudApiFormat = resolveEffectiveCloudApiFormat({
     protocol: cloudProtocol,
@@ -3010,27 +3005,27 @@ export default function SettingsModal({
               <span>{language === "zh" ? "动态文件门控" : "File Read Gate"}</span>
             </div>
             <p className="text-[11px] text-[#a1a1aa] leading-snug">
-              {language === "zh" ? "根据剩余 Token 动态分页大文件，拦截撑爆上下文的巨型读取。" : "Automatically windows large reads exceeding 70% of available budget."}
+              {language === "zh" ? "根据剩余 Token 动态分页大文件，避免单次读取耗尽上下文预算。" : "Automatically windows large reads that would consume too much of the remaining context budget."}
             </p>
           </div>
 
           <div className="rounded-lg border border-[#27272a] bg-[#121215] p-3">
             <div className="flex items-center gap-1.5 text-[12px] font-bold text-[#60a5fa] mb-1">
               <span>⚡</span>
-              <span>{language === "zh" ? "80% 渐进微压缩" : "Micro Compaction @80%"}</span>
+              <span>{language === "zh" ? "主动渐进压缩" : "Proactive Compaction"}</span>
             </div>
             <p className="text-[11px] text-[#a1a1aa] leading-snug">
-              {language === "zh" ? "输入达到 80% 预算时自动精简工具日志与重复回显。" : "Strips redundant tool logs automatically as budget reaches 80%."}
+              {language === "zh" ? "在上下文压力升高时自动精简工具日志与重复回显。" : "Strips redundant tool logs automatically as context pressure rises."}
             </p>
           </div>
 
           <div className="rounded-lg border border-[#27272a] bg-[#121215] p-3">
             <div className="flex items-center gap-1.5 text-[12px] font-bold text-[#a78bfa] mb-1">
               <span>🧠</span>
-              <span>{language === "zh" ? "90% 状态记忆快照" : "ContextState @90%"}</span>
+              <span>{language === "zh" ? "状态记忆保留" : "Context State Preservation"}</span>
             </div>
             <p className="text-[11px] text-[#a1a1aa] leading-snug">
-              {language === "zh" ? "输入达到 90% 时提取结构化计划记忆，保障对话永中断。" : "Archives structured task state so long turns never lose key context."}
+              {language === "zh" ? "压缩旧记录时保留结构化任务状态，减少长回合丢失关键上下文。" : "Preserves structured task state while older history is compacted."}
             </p>
           </div>
         </div>

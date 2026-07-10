@@ -1,7 +1,10 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { IconAt, IconFile, IconClose, IconChevronUp, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconTrash, IconGlobe, IconShield } from "./Icons";
+import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconTrash, IconGlobe, IconShield } from "./Icons";
 import ImageStudioSetupModal from "./ImageStudioSetupModal";
+import MainModeSwitcher from "./composer/MainModeSwitcher";
+import GameStudioOnboardingPanel from "./gameStudio/GameStudioOnboardingPanel";
+import GameStudioSlashMenu from "./gameStudio/GameStudioSlashMenu";
 import { getAllWorkspaceFiles, fuzzyFilterFiles } from "../utils/fsUtils";
 import { compressImage, getImageFilesFromClipboard, processImageFile } from "../utils/imageUtils";
 import { estimateTokens } from "../lib/contextTrim";
@@ -9,14 +12,15 @@ import { ingestAttachmentBytes } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import type { AgentMessage, ContentPart } from "../lib/orchestrator";
 import { createWorkspaceFileIndexController } from "../lib/workspaceFileIndex";
-import { getGameStudioSlashCatalog } from "../lib/gameStudioPack";
-import { humanizeSlug } from "../lib/gameStudioCatalog";
+import { getGameStudioSlashCatalog } from "../lib/gameStudio/pack";
+import { humanizeSlug } from "../lib/gameStudio/catalog";
 import { getIntentPolicy, getMainIntentShortcuts, getRunIntentCategoryLabel, getRunIntentLabel, parseMainDebugShortcut, parseMainIntentShortcutForMode, resolveComposerIntentSuggestion } from "../lib/runIntent";
 import { isImageModelName } from "../lib/imageStudio";
 import {
+  getGameStudioOnboardingCopy,
   resolveGameStudioOnboardingAction,
   shouldShowGameStudioOnboarding,
-} from "../lib/gameStudioOnboarding";
+} from "../lib/gameStudio/onboarding";
 import { isPlanTaskTrustedComplete } from "../lib/workflowModels";
 import {
   classifyAttachment,
@@ -182,7 +186,6 @@ export default function Composer({
   showAgentPicker,
   setShowAgentPicker,
   selectedMainModeKey,
-  setSelectedMainModeKey,
   mainModes,
   activeStudioAgentKey,
   setActiveStudioAgentKey,
@@ -212,7 +215,6 @@ export default function Composer({
   const [showSlashMenu, setShowSlashMenu] = useState(false);
   const [slashQuery, setSlashQuery] = useState("");
   const [highlightedSlashIndex, setHighlightedSlashIndex] = useState(0);
-  const [hoveredMainFocusModeKey, setHoveredMainFocusModeKey] = useState<string | null>(null);
   const [showWebSearchPanel, setShowWebSearchPanel] = useState(false);
   const [allFiles, setAllFiles] = useState<string[]>([]);
   const [isFilesLoading, setIsFilesLoading] = useState(false);
@@ -318,10 +320,6 @@ export default function Composer({
   const planKindLabel = language === "en" ? "plan" : "计划";
   const workflowKindLabel = language === "en" ? "workflow" : "工作流";
   const agentKindLabel = language === "en" ? "agent" : "专家";
-  const studioInitLabel = language === "en" ? "Initialize Game Studio" : "初始化 Game Studio";
-  const studioStartLabel = language === "en" ? "Start /start" : "开始 /start 引导";
-  const studioBrainstormLabel = language === "en" ? "Brainstorm Game" : "头脑风暴新游戏";
-  const studioSetupEngineLabel = language === "en" ? "Set Up Engine" : "设置引擎";
   const studioAutoLabel = language === "en" ? "Auto Routing" : "自动专家路由";
   const mainModeDescriptions = {
     main_mode: language === "en"
@@ -444,144 +442,6 @@ export default function Composer({
     used: Boolean(usedStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
     forceVisible: Boolean(forceVisibleStudioOnboardingByWorkspace[currentWorkspaceOnboardingKey]),
   });
-  const studioOnboardingShellClass = "border";
-  const studioOnboardingShellStyle = isLightTheme
-    ? {
-        borderColor: "var(--accent-subtle-border)",
-        background: "radial-gradient(circle at top right, var(--accent-subtle), transparent 58%), linear-gradient(135deg, rgba(255,255,255,0.98), rgba(248,250,252,0.98))",
-      }
-    : {
-        borderColor: "var(--accent-subtle-border)",
-        background: "radial-gradient(circle at top right, var(--accent-subtle), transparent 54%), linear-gradient(135deg, rgba(10,14,12,0.96), rgba(16,18,30,0.96))",
-      };
-  const studioOnboardingDividerStyle = {
-    borderColor: isLightTheme ? "rgba(15,23,42,0.08)" : "rgba(255,255,255,0.08)",
-  };
-  const studioOnboardingTitleStyle = {
-    color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)",
-  };
-  const studioOnboardingBodyStyle = {
-    color: isLightTheme ? "#52525b" : "#b1b1bb",
-  };
-  const studioOnboardingDismissClass = "border px-3 py-1 text-[11px] font-medium transition-colors hover:opacity-90";
-  const studioOnboardingDismissStyle = isLightTheme
-    ? {
-        borderColor: "var(--accent-subtle-border)",
-        backgroundColor: "rgba(255,255,255,0.88)",
-        color: "var(--accent-hover)",
-      }
-    : {
-        borderColor: "var(--accent-subtle-border)",
-        backgroundColor: "rgba(255,255,255,0.04)",
-        color: "var(--accent-light)",
-      };
-  const studioOnboardingInfoCardClass = "rounded-2xl border";
-  const studioOnboardingInfoCardStyle = isLightTheme
-    ? {
-        borderColor: "rgba(15,23,42,0.08)",
-        backgroundColor: "rgba(255,255,255,0.82)",
-      }
-    : {
-        borderColor: "rgba(255,255,255,0.08)",
-        backgroundColor: "rgba(11,13,16,0.82)",
-      };
-  const studioOnboardingActionCardClass = "rounded-2xl border transition-colors";
-  const studioOnboardingActionCardStyle = isLightTheme
-    ? {
-        borderColor: "rgba(15,23,42,0.08)",
-        backgroundColor: "rgba(255,255,255,0.82)",
-      }
-    : {
-        borderColor: "rgba(255,255,255,0.08)",
-        backgroundColor: "rgba(11,13,16,0.82)",
-      };
-  const studioOnboardingActionButtonPrimaryClass = "rounded-full border px-3.5 py-1.5 text-[11px] font-semibold transition-colors hover:opacity-90";
-  const studioOnboardingActionButtonPrimaryStyle = {
-    borderColor: "var(--accent)",
-    backgroundColor: "var(--accent)",
-    color: "#ffffff",
-  };
-  const studioOnboardingActionButtonDangerClass = "rounded-full border border-[rgba(244,114,182,0.24)] bg-[rgba(76,5,25,0.28)] px-3.5 py-1.5 text-[11px] font-semibold text-[#fda4af] transition-colors hover:bg-[rgba(127,29,29,0.34)]";
-  const studioOnboardingInfoTitleStyle = {
-    color: isLightTheme ? "#18181b" : "#f4f4f5",
-  };
-  const studioOnboardingActionTitleStyle = {
-    color: isLightTheme ? "#18181b" : "#f4f4f5",
-  };
-  const studioOnboardingActionBodyStyle = {
-    color: isLightTheme ? "#52525b" : "#b1b1bb",
-  };
-  const studioOnboardingStepLabelStyle = {
-    color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)",
-  };
-  const mainFocusMenuPanelClass = isLightTheme
-    ? "absolute bottom-full left-0 mb-2 w-72 overflow-hidden rounded-xl border bg-white z-[60]"
-    : "absolute bottom-full left-0 mb-2 w-72 overflow-hidden rounded-xl border bg-[#09090b] z-[60]";
-  const mainFocusMenuHeaderClass = isLightTheme
-    ? "border-b border-[#e4e4e7] text-[#52525b]"
-    : "border-b border-[#27272a] text-[#a1a1aa]";
-  const mainFocusItemBaseClass = "w-full text-left px-3 py-2.5 transition-colors";
-  const mainFocusItemTitleClass = isLightTheme
-    ? "text-[#18181b]"
-    : "text-[#e4e4e7]";
-  const mainFocusItemBodyClass = isLightTheme
-    ? "text-[#52525b]"
-    : "text-[#71717a]";
-  const mainFocusItemTitleStyle = {
-    color: isLightTheme ? "#18181b" : "#e4e4e7",
-  };
-  const mainFocusItemBodyStyle = {
-    color: isLightTheme ? "#52525b" : "#71717a",
-  };
-  const mainFocusSelectedTitleClass = isLightTheme
-    ? "text-[#18181b]"
-    : "text-[#f4f4f5]";
-  const mainFocusSelectedBodyClass = isLightTheme
-    ? "text-[#52525b]"
-    : "text-[#a1a1aa]";
-  const mainFocusSelectedTextStyle = {
-    color: isLightTheme ? "var(--accent-hover)" : "var(--accent-light)",
-  };
-  const mainFocusSelectedStyle = {
-    backgroundColor: "var(--accent-subtle)",
-  };
-  const mainFocusHoverStyle = {
-    backgroundColor: "var(--accent-subtle)",
-  };
-  const studioOnboardingCards = [
-    {
-      action: null,
-      title: language === "en" ? "Workspace Assets" : "工作区写入说明",
-      stepLabel: language === "en" ? "1. Prepare Workspace" : "1. 准备工作区",
-      description: language === "en"
-        ? "Initialization writes the bundled Studio pack into this workspace under `.MAIN/...` and `.protocols/game-studio/...`."
-        : "初始化会把内置 Studio 协议包写入当前工作区的 `.MAIN/...` 与 `.protocols/game-studio/...` 隐藏目录。",
-    },
-    {
-      action: "setup-engine",
-      title: studioSetupEngineLabel,
-      stepLabel: language === "en" ? "2. Continue Setup" : "2. 继续设置",
-      description: language === "en"
-        ? "Insert `/setup-engine` as a draft, then fill in engine, language, and runtime path before sending."
-        : "先把 `/setup-engine` 写成草稿，再补充引擎、语言和运行时路径后手动发送。",
-    },
-    {
-      action: "start",
-      title: studioStartLabel,
-      stepLabel: language === "en" ? "3. Start Workflow" : "3. 开始工作流",
-      description: language === "en"
-        ? "Insert `/start` as a draft so you can add project context before sending."
-        : "先把 `/start` 写成草稿，再由你补充项目背景后手动发送。",
-    },
-    {
-      action: "brainstorm",
-      title: studioBrainstormLabel,
-      stepLabel: language === "en" ? "3. Start Workflow" : "3. 开始工作流",
-      description: language === "en"
-        ? "Insert `/brainstorm` as a draft and describe the concept, pillars, and audience in the composer."
-        : "先把 `/brainstorm` 写成草稿，再在输入框里补充概念、支柱体验和目标受众。",
-    },
-  ] as const;
   const imageStudioAspectOptions = ["1:1", "4:3", "3:4", "16:9", "9:16", "3:2", "2:3", "21:9", "9:21", "9:7", "7:9"] as const;
   const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
   const isLocalImageEngine = imageStudio.config.provider === "local_image_service";
@@ -947,7 +807,6 @@ export default function Composer({
       }
       if (showAgentPicker && mainFocusPickerRef.current && !mainFocusPickerRef.current.contains(target)) {
         setShowAgentPicker(false);
-        setHoveredMainFocusModeKey(null);
       }
       if (showWebSearchPanel && webSearchPanelRef.current && !webSearchPanelRef.current.contains(target)) {
         setShowWebSearchPanel(false);
@@ -1306,10 +1165,9 @@ export default function Composer({
   };
 
   const handleRemoveGameStudioWorkspace = async () => {
+    const onboardingCopy = getGameStudioOnboardingCopy(language === "en" ? "en" : "zh");
     const confirmed = await safeConfirmAsync(
-      language === "en"
-        ? "Remove MAIN GAME STUDIO from this workspace? This will delete the Game Studio hidden folders and merged hooks for the current project."
-        : "要从当前工作区移除 MAIN GAME STUDIO 吗？这会删除该项目中的 Game Studio 隐藏文件夹和已合并的 hooks。",
+      onboardingCopy.removeConfirmation,
       { source: "Composer", action: "remove_game_studio_workspace" },
     );
 
@@ -1740,108 +1598,14 @@ export default function Composer({
         )}
 
         {showStudioOnboarding && (
-          <div
-            data-testid="game-studio-onboarding"
-            className={`mb-3 overflow-hidden rounded-[24px] ${studioOnboardingShellClass}`}
-            style={studioOnboardingShellStyle}
-          >
-            <div className="flex items-start justify-between gap-3 border-b px-5 py-4" style={studioOnboardingDividerStyle}>
-              <div>
-                <div className="text-[16px] font-semibold tracking-[0.08em]" style={studioOnboardingTitleStyle}>
-                  MAIN GAME STUDIO
-                </div>
-                <div className="mt-1 text-[12px] leading-relaxed" style={studioOnboardingBodyStyle}>
-                  {language === "en"
-                    ? "Use the action buttons to initialize or remove Studio assets for this workspace. Then follow steps 2 and 3 to draft commands, or open the full Studio command hub with `/`."
-                    : "用下方操作按钮来初始化或移除当前工作区的 Studio 资产，然后按步骤 2 和步骤 3 草拟命令；也可以随时输入 `/` 打开完整的 Studio 命令中枢。"}
-                </div>
-              </div>
-              <button
-                type="button"
-                data-testid="game-studio-onboarding-dismiss"
-                onClick={markStudioOnboardingDismissed}
-                className={`shrink-0 rounded-full ${studioOnboardingDismissClass}`}
-                style={studioOnboardingDismissStyle}
-              >
-                {language === "en" ? "Dismiss" : "关闭"}
-              </button>
-            </div>
-            <div className="grid gap-2 p-4 md:grid-cols-2">
-              {studioOnboardingCards.map((card) => {
-                if (!card.action) {
-                  return (
-                    <div
-                      key={card.title}
-                      data-testid="game-studio-onboarding-workspace"
-                      className={`${studioOnboardingInfoCardClass} px-4 py-3`}
-                      style={studioOnboardingInfoCardStyle}
-                    >
-                      <div className="text-[11px] font-semibold uppercase tracking-[0.18em]" style={studioOnboardingStepLabelStyle}>
-                        {card.stepLabel}
-                      </div>
-                      <div className="mt-1 text-[13px] font-semibold" style={studioOnboardingInfoTitleStyle}>
-                        {card.title}
-                      </div>
-                      <div className="mt-1 text-[11px] leading-snug" style={studioOnboardingActionBodyStyle}>
-                        {card.description}
-                      </div>
-                    </div>
-                  );
-                }
-
-                return (
-                  <button
-                    key={card.action}
-                    type="button"
-                    data-testid={`game-studio-onboarding-${card.action}`}
-                    onClick={() => handleStudioOnboardingAction(card.action)}
-                    className={`${studioOnboardingActionCardClass} px-4 py-3 text-left transition-colors`}
-                    style={studioOnboardingActionCardStyle}
-                  >
-                    <div className="text-[11px] font-semibold uppercase tracking-[0.18em]" style={studioOnboardingStepLabelStyle}>
-                      {card.stepLabel}
-                    </div>
-                    <div className="mt-1 text-[13px] font-semibold" style={studioOnboardingActionTitleStyle}>
-                      {card.title}
-                    </div>
-                    <div className="mt-1 text-[11px] leading-snug" style={studioOnboardingActionBodyStyle}>
-                      {card.description}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-            <div className="flex flex-wrap gap-2 px-4 pb-4">
-              <button
-                type="button"
-                data-testid="game-studio-onboarding-init"
-                onClick={() => handleStudioOnboardingAction("init")}
-                className={studioOnboardingActionButtonPrimaryClass}
-                style={studioOnboardingActionButtonPrimaryStyle}
-              >
-                {gameStudioInitialized
-                  ? (language === "en" ? "Reinitialize Game Studio" : "重新初始化 Game Studio")
-                  : studioInitLabel}
-              </button>
-              {gameStudioInitialized && (
-                <button
-                  type="button"
-                  data-testid="game-studio-onboarding-remove"
-                  onClick={handleRemoveGameStudioWorkspace}
-                  className={studioOnboardingActionButtonDangerClass}
-                >
-                  {language === "en" ? "Remove MAIN GAME STUDIO" : "移除 MAIN GAME STUDIO"}
-                </button>
-              )}
-            </div>
-            <div className="flex flex-col gap-2 border-t px-4 pb-4 pt-3 md:flex-row md:items-center md:justify-between" style={studioOnboardingDividerStyle}>
-              <div className="text-[11px] leading-relaxed md:max-w-[70%]" style={studioOnboardingBodyStyle}>
-                {language === "en"
-                  ? "Game Studio initialization is workspace-local. If you switch to another folder, that folder will need its own `.MAIN` and `.protocols/game-studio` assets before Studio workflows can run there."
-                  : "Game Studio 的初始化是按工作区独立保存的。切换到另一个文件夹后，需要在那个工作区内单独写入 `.MAIN` 与 `.protocols/game-studio` 相关资产，Studio 工作流才能在那里运行。"}
-              </div>
-            </div>
-          </div>
+          <GameStudioOnboardingPanel
+            language={language}
+            isLightTheme={isLightTheme}
+            initialized={gameStudioInitialized}
+            onDismiss={markStudioOnboardingDismissed}
+            onAction={handleStudioOnboardingAction}
+            onRemove={handleRemoveGameStudioWorkspace}
+          />
         )}
 
         {suggestedComposerIntent && suggestedComposerIntentLabel && !isImageStudioMode && !activeDiffTask && !isStreaming && (
@@ -2300,82 +2064,26 @@ export default function Composer({
             )}
 
             {showSlashMenu && isGameStudioMode && (
-              <div
-                ref={slashMenuRef}
-                className="absolute left-4 bottom-full mb-1 w-[min(36rem,calc(100%-2rem))] max-w-[36rem] bg-[#09090b] border border-[#27272a] rounded-lg overflow-hidden z-50 flex flex-col"
-              >
-                <div className="p-2 border-b border-[#27272a] flex items-center gap-2 text-[#e4e4e7] bg-[#000000]">
-                  <IconCode className="w-3.5 h-3.5 text-[#86efac]" />
-                  <span className="text-[11px] text-[#a1a1aa] truncate">{slashSearchLabel}</span>
-                  <span className="ml-auto text-[10px] text-[#52525b]">{slashCommandLabel}</span>
-                </div>
-
-                <div className="max-h-72 overflow-y-auto px-2 py-2">
-                  {filteredSlashItems.length === 0 ? (
-                    <div className="px-3 py-4 text-[11px] text-[#a1a1aa] text-center">{slashEmptyLabel}</div>
-                  ) : (
-                    (() => {
-                      let globalIndex = -1;
-                      return groupedSlashItems.map((section) => (
-                        <div key={section.heading} className="mb-2 last:mb-0">
-                          <div className="px-2 py-1 text-[10px] font-bold uppercase tracking-[0.18em] text-[#71717a]">
-                            {section.heading}
-                          </div>
-                          {section.groups.map(([groupName, items]) => (
-                            <div key={`${section.heading}-${groupName}`} className="mb-1 last:mb-0">
-                              <div className="px-2 pt-1 pb-1 text-[10px] text-[#52525b]">{groupName}</div>
-                              {items.map((item) => {
-                                globalIndex += 1;
-                                const isActive = globalIndex === highlightedSlashIndex;
-                                const itemTitle = item.kind === "workflow"
-                                  ? item.canonicalCommand
-                                  : item.kind === "main_intent"
-                                  ? item.command
-                                  : item.label;
-                                const itemKindLabel = item.kind === "workflow"
-                                  ? workflowKindLabel
-                                  : item.kind === "main_intent"
-                                  ? planKindLabel
-                                  : agentKindLabel;
-                                return (
-                                  <button
-                                    key={item.id}
-                                    onClick={() => (item.kind === "main_intent" ? handleSelectMainIntentShortcut(item) : handleSelectSlashItem(item))}
-                                    className={`w-full rounded-md px-3 py-2 text-left transition-colors ${
-                                      isActive ? "bg-[#18181b]" : "hover:bg-[#131316]"
-                                    }`}
-                                  >
-                                    <div className="flex items-center justify-between gap-3">
-                                      <div className="min-w-0">
-                                        <div className="text-[12px] font-semibold text-[#f4f4f5] truncate">
-                                          {itemTitle}
-                                        </div>
-                                        <div className="mt-0.5 text-[11px] leading-snug text-[#71717a]">
-                                          {item.description}
-                                        </div>
-                                      </div>
-                                      <div className="shrink-0 rounded-full border border-[#27272a] bg-[#050507] px-2 py-0.5 text-[10px] text-[#a1a1aa]">
-                                        {itemKindLabel}
-                                      </div>
-                                    </div>
-                                  </button>
-                                );
-                              })}
-                            </div>
-                          ))}
-                        </div>
-                      ));
-                    })()
-                  )}
-                </div>
-
-                <div className="px-3 py-1.5 border-t border-[#27272a] flex items-center gap-3 text-[10px] text-[#52525b]">
-                  <span>{mentionHintUpDown}</span>
-                  <span>{mentionHintEnter}</span>
-                  <span>{mentionHintEsc}</span>
-                  <span className="ml-auto">{slashHint}</span>
-                </div>
-              </div>
+              <GameStudioSlashMenu
+                menuRef={slashMenuRef}
+                searchLabel={slashSearchLabel}
+                commandLabel={slashCommandLabel}
+                emptyLabel={slashEmptyLabel}
+                hint={slashHint}
+                navigationHint={mentionHintUpDown}
+                selectHint={mentionHintEnter}
+                closeHint={mentionHintEsc}
+                planKindLabel={planKindLabel}
+                workflowKindLabel={workflowKindLabel}
+                agentKindLabel={agentKindLabel}
+                highlightedIndex={highlightedSlashIndex}
+                sections={groupedSlashItems}
+                onSelect={(item) => (
+                  item.kind === "main_intent"
+                    ? handleSelectMainIntentShortcut(item)
+                    : handleSelectSlashItem(item)
+                )}
+              />
             )}
           </div>
 
@@ -2461,62 +2169,18 @@ export default function Composer({
               <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
 
               {/* MAIN mode switcher */}
-              <div className="relative" ref={mainFocusPickerRef}>
-                <button
-                  data-testid="main-focus-picker-button"
-                  onClick={() => {
-                    setShowAgentPicker(!showAgentPicker);
-                    setHoveredMainFocusModeKey(null);
-                  }}
-                  className={`composer-toolbar-pill-button flex shrink-0 items-center gap-1.5 whitespace-nowrap rounded-md px-3 py-1.5 text-[11px] font-bold transition-all duration-150 ${showAgentPicker ? "is-active" : ""}`}
-                >
-                  <span className="max-w-[112px] truncate">{t[selectedMainModeKey]}</span>
-                  <IconChevronUp className="w-3.5 h-3.5" />
-                </button>
-
-                {showAgentPicker && (
-                  <div
-                    className={mainFocusMenuPanelClass}
-                    style={{ borderColor: "var(--accent-subtle-border)" }}
-                    onMouseLeave={() => setHoveredMainFocusModeKey(null)}
-                  >
-                    <div className={`px-3 py-2 text-[10px] font-bold uppercase tracking-wider ${mainFocusMenuHeaderClass}`}>{t.switchMainMode}</div>
-                    {mainModes.map((modeKey: string) => (
-                      <button
-                        key={modeKey}
-                        data-testid={`main-focus-option-${modeKey}`}
-                        onMouseMove={() => setHoveredMainFocusModeKey(modeKey)}
-                        onClick={async () => {
-                          await switchMainModeWithIsolation(modeKey);
-                          setShowAgentPicker(false);
-                          setHoveredMainFocusModeKey(null);
-                        }}
-                        style={
-                          selectedMainModeKey === modeKey
-                            ? mainFocusSelectedStyle
-                            : hoveredMainFocusModeKey === modeKey
-                            ? mainFocusHoverStyle
-                            : undefined
-                        }
-                        className={mainFocusItemBaseClass}
-                      >
-                        <div
-                          className="text-[12px] font-semibold"
-                          style={selectedMainModeKey === modeKey ? mainFocusSelectedTextStyle : mainFocusItemTitleStyle}
-                        >
-                          {t[modeKey]}
-                        </div>
-                        <div
-                          className="mt-0.5 text-[11px] leading-snug"
-                          style={selectedMainModeKey === modeKey ? mainFocusSelectedTextStyle : mainFocusItemBodyStyle}
-                        >
-                          {mainModeDescriptions[modeKey]}
-                        </div>
-                      </button>
-                    ))}
-                  </div>
-                )}
-              </div>
+              <MainModeSwitcher
+                pickerRef={mainFocusPickerRef}
+                isOpen={showAgentPicker}
+                selectedModeKey={selectedMainModeKey}
+                modeKeys={mainModes}
+                modeLabels={t}
+                modeDescriptions={mainModeDescriptions}
+                switchLabel={t.switchMainMode}
+                themeMode={themeMode}
+                onOpenChange={setShowAgentPicker}
+                onSelect={switchMainModeWithIsolation}
+              />
 
               <div className="composer-toolbar-divider h-4 w-px mx-1"></div>
 

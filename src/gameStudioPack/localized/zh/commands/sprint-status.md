@@ -3,8 +3,6 @@ name: sprint-status
 description: "快速汇总当前 Sprint 进度、阻塞项和剩余工作。"
 argument-hint: "[Sprint 编号；留空表示当前 Sprint]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
-model: haiku
 ---
 
 # Sprint 状态
@@ -21,7 +19,7 @@ files, and makes at most one concrete recommendation.
 
 ## 1. Find the Sprint
 
-**Argument:** `$ARGUMENTS[0]` (blank = use current sprint)
+**Argument:** `the first token after the slash command in the current user request` (blank = use current sprint)
 
 - If an argument is given (e.g., `/sprint-status 3`), search
   `production/sprints/` for a file matching `sprint-03.md`, `sprint-3.md`,

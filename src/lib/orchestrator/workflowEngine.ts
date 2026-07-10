@@ -27,7 +27,7 @@ import {
 import type { TaskBlock } from "../taskTypes";
 import type { AttachedFile } from "../attachments";
 import type { FeishuRemoteContext } from "../remoteContextTypes";
-import type { StudioConfig as GameStudioConfig } from "../gameStudioCatalog";
+import type { StudioConfig as GameStudioConfig } from "../gameStudio/catalog";
 import { appendDebugLog } from "../debugLog";
 import { type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion } from "../workflowModels";
 import {

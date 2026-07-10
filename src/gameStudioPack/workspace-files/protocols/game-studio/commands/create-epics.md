@@ -3,8 +3,6 @@ name: create-epics
 description: "Translate approved GDDs + architecture into epics — one epic per architectural module. Defines scope, governing ADRs, engine risk, and untraced requirements. Does NOT break into stories — run /create-stories [epic-slug] after each epic is created."
 argument-hint: "[system-name | layer: foundation|core|feature|presentation | all] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Task, AskUserQuestion
-agent: technical-director
 ---
 
 # Create Epics
@@ -27,12 +25,12 @@ will have changed.
 
 ## 1. Parse Arguments
 
-Resolve the review mode (once, store for all gate spawns this run):
+Resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern.
 
 **Modes:**
 - `/create-epics all` — process all systems in layer order
@@ -49,10 +47,10 @@ See `.claude/docs/director-gates.md` for the full check pattern.
 
 ### Step 2a — Summary scan (fast)
 
-Grep all GDDs for their `## Summary` sections before reading anything fully:
+`grep_search` all GDDs for their `## Summary` sections before reading anything fully:
 
 ```
-Grep pattern="## Summary" glob="design/gdd/*.md" output_mode="content" -A 5
+`grep_search` pattern="## Summary" glob="design/gdd/*.md" output_mode="content" -A 5
 ```
 
 For `layer:` or `[system-name]` modes: filter to only in-scope GDDs based on
@@ -122,12 +120,12 @@ Options: "Yes, create it", "Skip", "Pause — I need to write ADRs first"
 
 ## 4b. Producer Epic Structure Gate
 
-**Review mode check** — apply before spawning PR-EPIC:
+**Review mode check** — resolve before running PR-EPIC:
 - `solo` → skip. Note: "PR-EPIC skipped — Solo mode." Proceed to Step 5 (write epic files).
 - `lean` → skip (not a PHASE-GATE). Note: "PR-EPIC skipped — Lean mode." Proceed to Step 5 (write epic files).
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-After all epics for the current layer are defined (Step 4 completed for all in-scope systems), and before writing any files, spawn `producer` via Task using gate **PR-EPIC** (`.claude/docs/director-gates.md`).
+After all epics for the current layer are defined (Step 4 completed for all in-scope systems), and before writing any files, apply `producer` as a specialist review with gate **PR-EPIC** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: the full epic structure summary (all epics, their scope summaries, governing ADR counts), the layer being processed, milestone timeline and team capacity.
 

@@ -3,19 +3,18 @@ name: asset-audit
 description: "Audits game assets for compliance with naming conventions, file size budgets, format standards, and pipeline requirements. Identifies orphaned assets, missing references, and standard violations."
 argument-hint: "[category|all]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
 # Read-only diagnostic skill — no specialist agent delegation needed
 ---
 
 ## Phase 1: Read Standards
 
-Read the art bible or asset standards from the relevant design docs and the CLAUDE.md naming conventions.
+Read the art bible or asset standards from the relevant design docs and the AGENTS.md naming conventions.
 
 ---
 
 ## Phase 2: Scan Asset Directories
 
-Scan the target asset directory using Glob:
+Scan the target asset directory using `glob_search`:
 
 - `assets/art/**/*` for art assets
 - `assets/audio/**/*` for audio assets
@@ -89,6 +88,6 @@ This skill is read-only — it produces a report but does not write files.
 
 ## Phase 5: Next Steps
 
-- Fix naming violations using the patterns defined in CLAUDE.md.
+- Fix naming violations using the patterns defined in AGENTS.md.
 - Delete confirmed orphaned assets after manual review.
 - Run `/content-audit` to cross-check asset counts against GDD-specified requirements.

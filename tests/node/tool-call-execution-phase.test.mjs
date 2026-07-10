@@ -1,0 +1,51 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import fsSync from "node:fs";
+import path from "node:path";
+
+const workspaceRoot = process.cwd();
+const phaseSource = fsSync.readFileSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"),
+  "utf8",
+);
+const orchestratorSource = fsSync.readFileSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
+  "utf8",
+);
+const toolIterationPhaseSource = fsSync.readFileSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/toolIterationPhase.ts"),
+  "utf8",
+);
+
+test("tool call execution phase owns the tool handoff and execution ordering", () => {
+  assert.match(phaseSource, /export async function executeToolCallPhase/);
+  assert.match(phaseSource, /resetConsecutiveNoToolRuntimeState\(/);
+  assert.match(phaseSource, /resetPlanRecoveryPromptRuntimeState\(/);
+  assert.match(phaseSource, /resetTransientRecoveryPromptRuntimeState\(/);
+  assert.match(phaseSource, /markUnityMcpToolCallsDetected\(/);
+  assert.match(phaseSource, /logAgentEvent\("tool_calls_detected"/);
+  assert.match(phaseSource, /input\.emitTaskOrchestratorPhase\("EXECUTE_STEP"/);
+  assert.match(phaseSource, /buildAssistantHistoryMessage\([\s\S]*?\{ tool_calls: toolCallsForMsg \}/);
+  assert.match(phaseSource, /partitionToolCallsForExecution\(\{[\s\S]*?executeToolExecutionRound\(\{/);
+});
+
+test("tool call execution phase owns post-processing runtime state updates", () => {
+  assert.match(phaseSource, /handleToolResultPostProcessing\(\{/);
+  assert.match(phaseSource, /applyRecentSuccessfulProjectWriteRuntimeState\(/);
+  assert.match(phaseSource, /applyRecoveringFromEmptyAssistantReplyRuntimeState\(/);
+  assert.match(phaseSource, /applyUnityMcpToolResultState\(/);
+  assert.match(phaseSource, /applyToolResultPlanRuntimeState\(/);
+  assert.match(phaseSource, /applyApprovedPlanToolResultRecoveryState\(/);
+  assert.match(phaseSource, /unityMcpFallbackPrompt: toolResultPostProcessing\.unityMcpFallbackPrompt/);
+  assert.match(phaseSource, /isUnapprovedPlanReadOnlyBatch:\s*toolResultPostProcessing\.isUnapprovedPlanReadOnlyBatch/);
+});
+
+test("tool iteration phase delegates to the tool call execution phase", () => {
+  assert.match(toolIterationPhaseSource, /executeToolCallPhase\(input\)/);
+  assert.match(orchestratorSource, /handleToolIterationPhase\(\{/);
+  assert.doesNotMatch(orchestratorSource, /executeToolCallPhase\(\{/);
+  assert.doesNotMatch(orchestratorSource, /partitionToolCallsForExecution\(/);
+  assert.doesNotMatch(orchestratorSource, /executeToolExecutionRound\(/);
+  assert.doesNotMatch(orchestratorSource, /handleToolResultPostProcessing\(/);
+  assert.doesNotMatch(orchestratorSource, /tool_calls_detected/);
+});

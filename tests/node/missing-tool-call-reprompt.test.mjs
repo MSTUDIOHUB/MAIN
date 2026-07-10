@@ -61,6 +61,58 @@ const {
   buildMissingToolCallContinuationPrompt,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/missingToolCallReprompt.ts"));
 
+const {
+  handleMissingToolNoToolRecovery,
+  resolveMissingToolNoToolKind,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/missingToolNoToolRecovery.ts"));
+
+function createMissingToolNoToolHarness(language = "zh") {
+  const appended = [];
+  const statuses = [];
+  const streamTokens = [];
+  const stops = [];
+  return {
+    appended,
+    statuses,
+    streamTokens,
+    stops,
+    callbacks: {
+      getPreferredLanguage: () => language,
+      appendMessage: (message) => appended.push(message),
+      onStatusChange: (status) => statuses.push(status),
+      onStreamToken: (token, id) => streamTokens.push({ token, id }),
+      onNonActionableStop: (message, reason, progress) => stops.push({ message, reason, progress }),
+    },
+  };
+}
+
+function createMissingToolNoToolInput(harness, overrides = {}) {
+  return {
+    callbacks: harness.callbacks,
+    activeProfile: "cloud",
+    iteration: 3,
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    mainModeKey: "main_mode",
+    hasMeaningfulVisibleText: true,
+    compactedProseCodeDump: false,
+    wasTruncated: false,
+    normalizedFinishReason: "stop",
+    normalizedToolCallCount: 0,
+    visibleText: "我现在开始修改这个组件并修复相关 bug。",
+    visibleFallbackText: "我现在开始修改这个组件并修复相关 bug。",
+    assistantMsgId: "assistant-1",
+    hiddenThoughtOnlyNoToolStop: false,
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+    recentToolActivity: [],
+    sawExecuteOperationEvidence: false,
+    consecutiveNoToolCount: 0,
+    ...overrides,
+  };
+}
+
 test("research chat reprompts when the assistant only promises tabular analysis", () => {
   const kind = resolveMissingToolCallRepromptKind({
     workflowMode: "chat",
@@ -206,4 +258,79 @@ test("second post-write verification retry requires a single tool call with no p
   assert.match(prompt, /只输出一个 `<tool_use>` 工具调用块/);
   assert.match(prompt, /不要输出任何普通正文/);
   assert.match(prompt, /run_command/);
+});
+
+test("missing-tool no-tool recovery reprompts generic execute prose", () => {
+  const harness = createMissingToolNoToolHarness("zh");
+  const result = handleMissingToolNoToolRecovery(createMissingToolNoToolInput(harness));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.consecutiveNoToolCount, 1);
+  assert.equal(result.recoveringFromEmptyAssistantReplyAfterWrite, false);
+  assert.deepEqual(harness.statuses, ["running"]);
+  assert.equal(harness.streamTokens.length, 0);
+  assert.equal(harness.appended.length, 1);
+  assert.match(harness.appended[0].content, /立即用工具继续执行/);
+  assert.match(harness.appended[0].content, /<tool_use>/);
+  assert.equal(harness.stops.length, 0);
+});
+
+test("missing-tool no-tool recovery switches to post-write verification after project writes", () => {
+  const kind = resolveMissingToolNoToolKind({
+    workflowMode: "edit",
+    visibleText: "我将运行 python snake.py 来验证这个游戏是否正常启动。",
+    mainModeKey: "main_mode",
+    compactedProseCodeDump: false,
+    wasTruncated: false,
+    normalizedFinishReason: "stop",
+    normalizedToolCallCount: 0,
+    recentSuccessfulProjectWrite: {
+      name: "write_file",
+      target: "snake.py",
+    },
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  const harness = createMissingToolNoToolHarness("zh");
+  const result = handleMissingToolNoToolRecovery(createMissingToolNoToolInput(harness, {
+    visibleText: "我将运行 python snake.py 来验证这个游戏是否正常启动。",
+    visibleFallbackText: "我将运行 python snake.py 来验证这个游戏是否正常启动。",
+    recentSuccessfulProjectWrite: {
+      name: "write_file",
+      target: "snake.py",
+    },
+  }));
+
+  assert.equal(kind.missingToolCallRepromptKind, "post_write_verify");
+  assert.equal(kind.effectiveMissingToolKind, "post_write_verify");
+  assert.equal(result.status, "continue");
+  assert.equal(result.recoveringFromEmptyAssistantReplyAfterWrite, true);
+  assert.match(harness.appended[0].content, /立即执行真实验证/);
+  assert.match(harness.appended[0].content, /run_command/);
+});
+
+test("missing-tool no-tool recovery stops execute read-only no-action loops at checkpoint", () => {
+  const harness = createMissingToolNoToolHarness("zh");
+  const recentToolActivity = [
+    { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "READ_FILE_RESULT" },
+    { name: "grep_search", target: "submit", status: "succeeded", detail: "3 matches" },
+    { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "FILE_UNCHANGED_STUB" },
+  ];
+  const result = handleMissingToolNoToolRecovery(createMissingToolNoToolInput(harness, {
+    activeProfile: "local",
+    hasMeaningfulVisibleText: false,
+    visibleText: "",
+    visibleFallbackText: "仍在重复读取，没有执行写入或验证。",
+    consecutiveNoToolCount: 4,
+    recentToolActivity,
+  }));
+
+  assert.equal(result.status, "stopped");
+  assert.equal(result.consecutiveNoToolCount, 5);
+  assert.deepEqual(harness.statuses, ["running", "idle"]);
+  assert.deepEqual(harness.streamTokens, [{ token: "__ESCALATION_RESET__:", id: "assistant-1" }]);
+  assert.equal(harness.appended.length, 0);
+  assert.equal(harness.stops.length, 1);
+  assert.equal(harness.stops[0].reason, "no_action");
+  assert.equal(harness.stops[0].progress.recoveryReason, "execute_read_only_no_action_checkpoint");
+  assert.deepEqual(harness.stops[0].progress.repeatedTargets, ["src/app.tsx"]);
 });

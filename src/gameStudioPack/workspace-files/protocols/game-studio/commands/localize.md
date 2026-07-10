@@ -3,8 +3,6 @@ name: localize
 description: "Full localization pipeline: scan for hardcoded strings, extract and manage string tables, validate translations, generate translator briefings, run cultural/sensitivity review, manage VO localization, test RTL/platform requirements, enforce string freeze, and report coverage."
 argument-hint: "[scan|extract|validate|status|brief|cultural-review|vo-pipeline|rtl-check|freeze|qa]"
 user-invocable: true
-agent: localization-lead
-allowed-tools: Read, Glob, Grep, Write, Bash, Task, AskUserQuestion
 ---
 
 # Localization Pipeline
@@ -179,7 +177,7 @@ Ask: "May I write this translator brief to `production/localization/translator-b
 
 ## Phase 2F: Cultural Review Mode
 
-Spawn `localization-lead` via Task. Ask them to audit the following for cultural sensitivity across the target locales (read from `assets/data/strings/` and `assets/`):
+Apply `localization-lead` as a specialist review. Ask them to audit the following for cultural sensitivity across the target locales (read from `assets/data/strings/` and `assets/`):
 
 ### Content Areas to Review
 
@@ -260,14 +258,14 @@ Ask: "May I write the VO recording scripts to `production/localization/vo-script
 
 ### VO Pipeline: Validate
 
-Glob `assets/audio/vo/[locale]/` for all `.wav`/`.ogg` files. Cross-reference against the VO manifest. Report:
+`glob_search` `assets/audio/vo/[locale]/` for all `.wav`/`.ogg` files. Cross-reference against the VO manifest. Report:
 - Missing files (line in script, no audio file)
 - Extra files (audio file exists, no matching string key)
 - Naming convention violations
 
 ### VO Pipeline: Integrate
 
-Grep `src/` for VO audio references. Verify each referenced path exists in `assets/audio/vo/[locale]/`. Report broken references.
+`grep_search` `src/` for VO audio references. Verify each referenced path exists in `assets/audio/vo/[locale]/`. Report broken references.
 
 ---
 
@@ -276,7 +274,7 @@ Grep `src/` for VO audio references. Verify each referenced path exists in `asse
 Right-to-left languages (Arabic, Hebrew, Persian, Urdu) require layout mirroring beyond
 just translating text. This mode validates the implementation.
 
-Read `.claude/docs/technical-preferences.md` to determine the engine. Then check:
+Read `.protocols/game-studio/docs/technical-preferences.md` to determine the engine. Then check:
 
 **Layout mirroring**
 - Is RTL layout enabled in the engine? (Godot: `Control.layout_direction`, Unity: `RTL Support` package, Unreal: text direction flags)
@@ -296,7 +294,7 @@ Read `.claude/docs/technical-preferences.md` to determine the engine. Then check
 - Are there UI icons with directional arrows or asymmetric designs that need mirrored variants?
 - Do any text-in-image assets exist that require RTL versions?
 
-Grep patterns to check:
+`grep_search` patterns to check:
 - Engine-specific RTL flags in scene/prefab files
 - Any `HBoxContainer`, `LinearLayout`, `HorizontalBox` nodes — verify layout_direction settings
 - String concatenation with `+` near dialogue or UI code
@@ -331,7 +329,7 @@ Pre-Freeze Checklist
 [ ] Marketing strings (store description, achievements) are final
 ```
 
-Use `AskUserQuestion`:
+Ask the user:
 - Prompt: "Are all items above confirmed? Calling string freeze locks the source table."
 - Options: `[A] Yes — call string freeze now` / `[B] No — I still have strings to add`
 
@@ -366,7 +364,7 @@ Localization QA is a dedicated pass that runs after translations are delivered b
 before any locale ships. This is not the same as `/validate` (which checks completeness)
 — this is a structured playthrough-based quality check.
 
-Spawn `localization-lead` via Task with:
+Apply `localization-lead` as a specialist review with:
 - The target locale(s) to QA
 - The list of all screens/flows in the game (from `design/gdd/` or `/content-audit` output)
 - The current `/localize validate` report

@@ -38,6 +38,12 @@ const VERIFICATION_EVIDENCE_TOOLS = new Set([
   "get_pty_status",
 ]);
 
+const COMMAND_EVIDENCE_TOOLS = new Set([
+  "run_command",
+  "execute_command",
+  "send_pty_input",
+]);
+
 const WORKSPACE_FILE_REF_RE =
   /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=$|[\s`"',，。；;:)）])/g;
 const MAX_EVIDENCE_REFERENCES = 20;
@@ -61,7 +67,7 @@ export function isPlanArtifactPath(path: string): boolean {
 }
 
 export function commandResultLooksSuccessful(toolName: string, result: string): boolean {
-  if (toolName !== "run_command") return true;
+  if (!COMMAND_EVIDENCE_TOOLS.has(toolName)) return true;
   try {
     const parsed = JSON.parse(result);
     const exitCode = parsed?.exitCode ?? parsed?.code ?? parsed?.status;

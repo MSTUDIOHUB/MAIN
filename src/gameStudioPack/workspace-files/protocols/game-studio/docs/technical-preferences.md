@@ -63,7 +63,7 @@
 
 <!-- Written by /setup-engine when engine is configured. -->
 <!-- Read by /code-review, /architecture-decision, /architecture-review, and team skills -->
-<!-- to know which specialist to spawn for engine-specific validation. -->
+<!-- to know which specialist profile to apply for engine-specific validation. -->
 
 - **Primary**: [TO BE CONFIGURED — run /setup-engine]
 - **Language/Code Specialist**: [TO BE CONFIGURED]
@@ -77,7 +77,7 @@
 <!-- Skills use this table to select the right specialist per file type. -->
 <!-- If a row says [TO BE CONFIGURED], fall back to Primary for that file type. -->
 
-| File Extension / Type | Specialist to Spawn |
+| File Extension / Type | Specialist Profile |
 |-----------------------|---------------------|
 | Game code (primary language) | [TO BE CONFIGURED] |
 | Shader / material files | [TO BE CONFIGURED] |

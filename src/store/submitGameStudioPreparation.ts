@@ -1,4 +1,4 @@
-import type { StudioAgentKey, StudioConfig } from "../lib/gameStudioCatalog";
+import type { StudioAgentKey, StudioConfig } from "../lib/gameStudio/catalog";
 import {
   prepareGameStudioTurn,
   type GameStudioTurnPreparationInput,

@@ -3,7 +3,6 @@ name: day-one-patch
 description: "Prepare a day-one patch for a game launch. Scopes, prioritises, implements, and QA-gates a focused patch addressing known issues discovered after gold master but before or immediately after public launch. Treats the patch as a mini-sprint with its own QA gate and rollback plan."
 argument-hint: "[scope: known-bugs | cert-feedback | all]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash, Task, AskUserQuestion
 ---
 
 # Day-One Patch
@@ -62,7 +61,7 @@ For each open bug, evaluate:
 
 ### Step 2b — Present patch scope to user
 
-Use `AskUserQuestion`:
+Ask the user:
 - Prompt: "Based on open bugs and cert feedback, here is the proposed day-one patch scope. Does this look right?"
 - Show: table of included bugs (ID, severity, description, estimated effort)
 - Show: table of deferred bugs (ID, severity, reason deferred)
@@ -75,7 +74,7 @@ If [C]: output "No day-one patch required. Proceed to `/launch-checklist`." Stop
 Sum estimated effort. If total exceeds 1 day of work:
 > "⚠️ Patch scope is [N hours] — this exceeds a safe day-one window. Consider deferring lower-priority items to patch 1.1. A bloated day-one patch introduces more risk than it removes."
 
-Use `AskUserQuestion` to confirm proceeding or reduce scope.
+Ask the user to confirm proceeding or reduce scope.
 
 ---
 
@@ -83,7 +82,7 @@ Use `AskUserQuestion` to confirm proceeding or reduce scope.
 
 Before any code is written, define the rollback procedure. This is non-negotiable.
 
-Spawn `release-manager` via Task. Ask them to produce a rollback plan covering:
+Apply `release-manager` as a specialist review. Ask them to produce a rollback plan covering:
 - How to revert to the gold master build on each target platform
 - Platform-specific rollback constraints (some platforms cannot roll back cert builds)
 - Who is responsible for triggering the rollback
@@ -97,16 +96,16 @@ Do not proceed to Phase 4 until the rollback plan is written.
 
 ## Phase 4: Implement Fixes
 
-For each bug in the approved scope, spawn a focused implementation loop:
+For each bug in the approved scope, apply a focused implementation loop:
 
-1. Spawn `lead-programmer` via Task with:
+1. Apply `lead-programmer` as a specialist review with:
    - The bug report (exact reproduction steps and root cause if known)
    - The constraint: minimum viable fix only, no cleanup
    - The affected files (from bug report Technical Context section)
 
 2. The lead-programmer implements and runs targeted tests.
 
-3. Spawn `qa-tester` via Task to verify: does the bug reproduce after the fix?
+3. Apply `qa-tester` as a specialist review to verify: does the bug reproduce after the fix?
 
 For config/data-only fixes: make the change directly (no programmer agent needed). Confirm the value changed and re-run any relevant smoke test.
 
@@ -116,7 +115,7 @@ For config/data-only fixes: make the change directly (no programmer agent needed
 
 This is a lightweight QA pass — not a full `/team-qa`. The patch is already QA-approved from the release gate; we are only re-verifying the changed areas.
 
-Spawn `qa-lead` via Task with:
+Apply `qa-lead` as a specialist review with:
 - List of all changed files
 - List of bugs fixed (with verification status from Phase 4)
 - The smoke check scope for the affected systems

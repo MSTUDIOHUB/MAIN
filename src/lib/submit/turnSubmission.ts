@@ -16,9 +16,9 @@ import {
   shouldRequestSemanticTurnMetadataForTurn,
   type SessionTitleSeedState,
 } from "../intentTitlePolicy";
-import type { PendingSlashCommand } from "../gameStudioCatalog";
-import { parseGameStudioSlashCommand } from "../gameStudioCatalog";
-import { detectGameDevelopmentIntent, type GameDevelopmentIntentSignal } from "../gameDevelopmentIntent";
+import type { PendingSlashCommand } from "../gameStudio/catalog";
+import { parseGameStudioSlashCommand } from "../gameStudio/catalog";
+import { detectGameDevelopmentIntent, type GameDevelopmentIntentSignal } from "../gameStudio/detection";
 import type { MainModeKey } from "../mainModes";
 import {
   isMainIntentShortcutAllowedInMainMode,

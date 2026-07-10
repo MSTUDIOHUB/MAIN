@@ -3,7 +3,6 @@ name: bug-triage
 description: "对缺陷做优先级、归类、影响判断和处理建议。"
 argument-hint: "[sprint | full | trend]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit
 ---
 
 # Bug Triage
@@ -37,7 +36,7 @@ ensures no critical bug is lost between sprints.
 
 ### Step 2a — Discover bug files
 
-Glob for bug reports in priority order:
+`glob_search` for bug reports in priority order:
 1. `production/qa/bugs/*.md` — individual bug report files (preferred format)
 2. `production/qa/bugs.md` — single consolidated bug log (fallback)
 3. Any `production/qa/qa-plan-*.md` "Bugs Found" table (last resort)
@@ -60,7 +59,7 @@ If no sprint file exists: note "No sprint plan found — assigning to backlog on
 
 ### Step 2c — Load severity reference
 
-Read `.claude/docs/coding-standards.md` for severity/priority definitions if they
+Read `.protocols/game-studio/docs/coding-standards.md` for severity/priority definitions if they
 exist. If they do not exist, use the standard definitions in Step 3.
 
 ---

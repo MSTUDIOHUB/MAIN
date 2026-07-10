@@ -60,10 +60,23 @@ async function loadCloudServersModule() {
 }
 
 const {
+  DEFAULT_CLOUD_ENDPOINTS,
   DEFAULT_CLOUD_SERVER_ID,
   createDefaultCloudConfig,
+  getDefaultCloudEndpoint,
   normalizeCloudServerState,
 } = await loadCloudServersModule();
+
+test("owns protocol default endpoints in one cloud-server registry", () => {
+  assert.deepEqual(DEFAULT_CLOUD_ENDPOINTS, {
+    openai: "https://api.openai.com/v1",
+    anthropic: "https://api.anthropic.com",
+    gemini: "https://generativelanguage.googleapis.com",
+  });
+  assert.equal(getDefaultCloudEndpoint("openai"), DEFAULT_CLOUD_ENDPOINTS.openai);
+  assert.equal(getDefaultCloudEndpoint("anthropic"), DEFAULT_CLOUD_ENDPOINTS.anthropic);
+  assert.equal(getDefaultCloudEndpoint("gemini"), DEFAULT_CLOUD_ENDPOINTS.gemini);
+});
 
 test("keeps a fresh default cloud config empty until the user adds a server", () => {
   const state = normalizeCloudServerState({

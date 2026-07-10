@@ -3,11 +3,8 @@ name: changelog
 description: "从提交、迭代和文档中汇总内部变更记录。"
 argument-hint: "[version|sprint-number]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Bash, Write
-context: |
   !git log --oneline -30 2>/dev/null
   !git tag --list --sort=-v:refname 2>/dev/null | head -5
-model: haiku
 ---
 
 ## 阶段 1: Parse Arguments

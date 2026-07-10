@@ -79,7 +79,7 @@ interface ChatMessage {
 
 /** Flat connection params derived from AppConfig.local or AppConfig.cloud */
 export interface StreamSettings {
-  baseUrl: string;      // e.g. "http://127.0.0.1:8080/v1"
+  baseUrl: string;      // e.g. "http://127.0.0.1:8000/v1"
   apiKey: string;       // e.g. "ollama" / actual key
   model: string;
   apiProtocol?: CloudApiProtocol;

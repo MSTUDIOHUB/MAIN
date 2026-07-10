@@ -3,7 +3,6 @@ name: release-checklist
 description: "发布前跨团队检查代码、内容、商店、法务和流程准备情况。"
 argument-hint: "[platform: pc|console|mobile|all]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write
 ---
 
 > **Explicit invocation only**: This skill should only run when the user explicitly requests it with `/release-checklist`. Do not auto-invoke based on context matching.
@@ -16,7 +15,7 @@ Read the argument for the target platform (`pc`, `console`, `mobile`, or `all`).
 
 ## 阶段 2: Load Project Context
 
-- Read `CLAUDE.md` for project context, version information, and platform targets.
+- Read `AGENTS.md` for project context, version information, and platform targets.
 - Read the current milestone from `production/milestones/` to understand what features and content should be included in this release.
 
 ---

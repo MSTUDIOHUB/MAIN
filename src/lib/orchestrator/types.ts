@@ -9,7 +9,7 @@ import type { MainModeKey } from "../mainModes";
 import { type CommandDirective, type ResolvedUserIntent } from "../runIntent";
 import { type ResolvedInstructionSet } from "../instructions";
 import { type HookDefinition, type HookExecutionRecord, type HookEvent } from "../hooks";
-import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "../gameStudioCatalog";
+import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "../gameStudio/catalog";
 import { type PlanMaxIterationsCheckpoint, type PlanToolActivitySummary } from "../planExecutionRecovery";
 import { type ExecuteRecoveryMode } from "../executeRecoveryTools";
 import { type MainThreadEvent } from "../turnEvents";

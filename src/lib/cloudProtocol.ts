@@ -80,6 +80,21 @@ export const GEMINI_EXPERIMENTAL_MODELS = [
   "gemini-2.5-flash",
 ];
 
+export const DEFAULT_LOCAL_PROVIDER_ENDPOINTS = {
+  "LM Studio": "http://127.0.0.1:1234/v1",
+  Ollama: "http://127.0.0.1:11434/v1",
+  OMLX: "http://127.0.0.1:8000/v1",
+} as const;
+
+export function getDefaultLocalProviderEndpoint(
+  provider: string,
+  fallback = "",
+): string {
+  return DEFAULT_LOCAL_PROVIDER_ENDPOINTS[
+    provider as keyof typeof DEFAULT_LOCAL_PROVIDER_ENDPOINTS
+  ] ?? fallback;
+}
+
 interface TextContentPart {
   type: "text";
   text: string;

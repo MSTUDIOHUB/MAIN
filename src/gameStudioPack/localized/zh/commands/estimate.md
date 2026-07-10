@@ -3,14 +3,13 @@ name: estimate
 description: "对 Epic、Story 或任务做工作量估算，辅助排期和优先级决策。"
 argument-hint: "[task-description]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
 ---
 
 ## 阶段 1: Understand the Task
 
 Read the task description from the argument. If the description is too vague to estimate meaningfully, ask for clarification before proceeding.
 
-Read CLAUDE.md for project context: tech stack, coding standards, architectural patterns, and any estimation guidelines.
+Read AGENTS.md for project context: tech stack, coding standards, architectural patterns, and any estimation guidelines.
 
 Read relevant design documents from `design/gdd/` if the task relates to a documented feature or system.
 

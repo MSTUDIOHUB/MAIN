@@ -1,0 +1,295 @@
+import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
+import { logAgentEvent } from "../../orchestrator";
+import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import type { ResolvedUserIntent } from "../../runIntent";
+import type { ToolDefinition } from "../../toolSchemas";
+import type { TurnInputContextSignals } from "../../turnIntake";
+import type { PlanExecutionProgressPhase } from "../../workflowModels";
+import { generateId } from "../../utils";
+import type { AgentMessage, OrchestratorCallbacks } from "../types";
+import { prepareManagedMessagesForIteration } from "./contextManagement";
+import {
+  advanceExecuteRecoveryRuntimeIteration,
+  buildExecuteRecoveryMaxIterationsPrompt,
+  type ExecuteRecoveryRuntimeState,
+} from "./executeRecoveryRuntime";
+import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
+import type { AgentLoopRuntimeState } from "./turnPreparation";
+import type { PlanLoopRuntimeState } from "./planRuntimeState";
+import {
+  resolveFinalTextOnlyStepState,
+  type AgentLoopStreamRuntimeState,
+} from "./streamRuntimeState";
+import {
+  resolveIterationToolSurface,
+  type IterationToolSurfaceDecision,
+} from "./toolCallPlanning";
+import type { AgentLoopToolExecutionRuntimeState } from "./toolExecutionRuntimeState";
+import type { TurnIterationContext } from "./turnIterationContext";
+
+type RuntimeGuidanceCallbacks = Pick<
+  OrchestratorCallbacks,
+  "appendMessage" | "consumeActiveGuidance" | "getPreferredLanguage"
+>;
+
+export function buildRuntimeGuidanceMessage(input: {
+  language: "zh" | "en";
+  text: string;
+}): AgentMessage {
+  const guidanceText = input.text.trim();
+  return {
+    role: "user",
+    content: input.language === "en"
+      ? `Runtime guidance from the user for the current run. Treat this as high-priority direction for the next step without restarting the task:\n\n${guidanceText}`
+      : `用户在当前执行中追加的运行引导。请把它作为下一步的高优先级方向，不要重启任务：\n\n${guidanceText}`,
+  };
+}
+
+export function appendActiveRuntimeGuidance(input: {
+  callbacks: RuntimeGuidanceCallbacks;
+  managedAgentMessages: AgentMessage[];
+  iteration: number;
+}): AgentMessage[] {
+  const activeGuidance = input.callbacks.consumeActiveGuidance?.();
+  if (!activeGuidance?.text?.trim()) {
+    return input.managedAgentMessages;
+  }
+
+  const guidanceText = activeGuidance.text.trim();
+  const guidanceMessage = buildRuntimeGuidanceMessage({
+    language: input.callbacks.getPreferredLanguage(),
+    text: guidanceText,
+  });
+  input.callbacks.appendMessage(guidanceMessage);
+  logAgentEvent("runtime_guidance_injected", {
+    iteration: input.iteration,
+    guidanceId: activeGuidance.id,
+    chars: guidanceText.length,
+  });
+  return [...input.managedAgentMessages, guidanceMessage];
+}
+
+export interface IterationStreamPreparationResult {
+  runtimeIntent: ResolvedUserIntent;
+  streamRuntimeState: AgentLoopStreamRuntimeState;
+  executeRecoveryState: ExecuteRecoveryRuntimeState;
+  executeRecoveryIterationAdvance: ReturnType<typeof advanceExecuteRecoveryRuntimeIteration>;
+  finalTextOnlyStep: boolean;
+  toolSurfaceDecision: IterationToolSurfaceDecision;
+  managedAgentMessages: AgentMessage[];
+  providerCompatibilityOverride: boolean | undefined;
+  forceXmlTools: boolean;
+  llmTools: ToolDefinition[];
+  assistantMsgId: string;
+  maxOutputEscalations: number;
+  iterationRequestStartedAt: number;
+}
+
+export function prepareIterationStreamRequest(input: {
+  callbacks: OrchestratorCallbacks;
+  runtimeState: AgentLoopRuntimeState;
+  iteration: number;
+  effectiveMaxIterations: number;
+  snapshotContextLimit: number | undefined;
+  streamRuntimeState: AgentLoopStreamRuntimeState;
+  executeRecoveryState: ExecuteRecoveryRuntimeState;
+  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
+  planRuntimeState: PlanLoopRuntimeState;
+  toolExecutionRuntimeState: Pick<AgentLoopToolExecutionRuntimeState, "fileReadStates">;
+  iterationContext: Pick<TurnIterationContext, "eventTurnId" | "turnContext">;
+  turnInputContextSignals: TurnInputContextSignals;
+  recentToolActivity: PlanToolActivitySummary[];
+  recentPlanToolActivity: PlanToolActivitySummary[];
+  lastAssistantTextForCheckpoint: string;
+  mcpToolCount: number;
+  resolveRuntimeIntent: () => ResolvedUserIntent;
+  resolveAllToolsForRuntime: (runtimeIntent: ResolvedUserIntent) => ToolDefinition[];
+  applySystemPromptForRuntime: (runtimeIntent: ResolvedUserIntent, tools: ToolDefinition[]) => void;
+  clearExecuteRecovery: (
+    reason: string,
+    resetTarget?: string,
+    stateOverride?: ExecuteRecoveryRuntimeState,
+  ) => ExecuteRecoveryRuntimeState;
+  getMaxOutputEscalations: () => number;
+  emitPlanExecutionProgress: (phase: PlanExecutionProgressPhase) => void;
+}): IterationStreamPreparationResult {
+  const {
+    callbacks,
+    runtimeState,
+    iteration,
+    effectiveMaxIterations,
+    snapshotContextLimit,
+    approvedPlanRecoveryState,
+    planRuntimeState,
+    toolExecutionRuntimeState,
+    iterationContext,
+    turnInputContextSignals,
+    recentToolActivity,
+    recentPlanToolActivity,
+    lastAssistantTextForCheckpoint,
+    mcpToolCount,
+    resolveRuntimeIntent,
+    resolveAllToolsForRuntime,
+    applySystemPromptForRuntime,
+    clearExecuteRecovery,
+    getMaxOutputEscalations,
+    emitPlanExecutionProgress,
+  } = input;
+  const {
+    config,
+    isCloudProfile,
+    settings,
+    effectiveToolProtocol,
+    turnIntent,
+    workflowMode,
+  } = runtimeState;
+
+  callbacks.startNewTurn();
+  const runtimeIntent = resolveRuntimeIntent();
+  const finalTextOnlyDecision = resolveFinalTextOnlyStepState(input.streamRuntimeState, {
+    workflowMode,
+    runtimeIntent,
+    isPlanApproved: callbacks.getIsPlanApproved(),
+    iteration,
+    maxIterations: effectiveMaxIterations,
+  });
+  let streamRuntimeState = finalTextOnlyDecision.state;
+  const finalTextOnlyStep = finalTextOnlyDecision.finalTextOnlyStep;
+  if (finalTextOnlyStep) {
+    logAgentEvent("max_steps_final_text_prompt", {
+      iteration,
+      maxIterations: effectiveMaxIterations,
+      workflowMode,
+      runtimeIntent,
+      repeatedTargets: summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
+    });
+  }
+
+  const rawIterationAllTools = finalTextOnlyStep || streamRuntimeState.chatFinalSynthesisActive
+    ? []
+    : resolveAllToolsForRuntime(runtimeIntent);
+  let executeRecoveryIterationAdvance =
+    advanceExecuteRecoveryRuntimeIteration(input.executeRecoveryState);
+  let executeRecoveryState = executeRecoveryIterationAdvance.state;
+  if (executeRecoveryIterationAdvance.reachedMaxIterations) {
+    const language = callbacks.getPreferredLanguage();
+    logAgentEvent("execute_recovery_max_iterations_reached", {
+      iteration,
+      executeRecoveryMode: executeRecoveryState.mode,
+      executeRecoveryAttempts: executeRecoveryState.attempts,
+      recoveryIterationCount: executeRecoveryState.iterationCount,
+      maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
+    });
+    executeRecoveryState = clearExecuteRecovery(
+      "max_recovery_iterations_reached",
+      undefined,
+      executeRecoveryState,
+    );
+    executeRecoveryIterationAdvance = {
+      ...executeRecoveryIterationAdvance,
+      state: executeRecoveryState,
+    };
+    callbacks.appendMessage({
+      role: "system",
+      content: buildExecuteRecoveryMaxIterationsPrompt({
+        language,
+        maxIterations: executeRecoveryIterationAdvance.maxIterations,
+      }),
+    });
+  }
+
+  const toolSurfaceDecision = resolveIterationToolSurface({
+    callbacks,
+    iteration,
+    workflowMode,
+    runtimeIntent,
+    rawIterationAllTools,
+    executeRecoveryMode: executeRecoveryState.mode,
+    executeRecoveryReason: executeRecoveryState.reason,
+    executeRecoveryAttempts: executeRecoveryState.attempts,
+    recoveryIterationCount: executeRecoveryState.iterationCount,
+    maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
+    ...approvedPlanRecoveryState,
+    recentToolActivity,
+    recentPlanToolActivity,
+    ...planRuntimeState,
+    turnInputContextSignals,
+    lastAssistantTextForCheckpoint,
+  });
+  applySystemPromptForRuntime(runtimeIntent, toolSurfaceDecision.iterationAllTools);
+
+  const contextManagementResult = prepareManagedMessagesForIteration({
+    callbacks,
+    config,
+    settings,
+    isCloudProfile,
+    iteration,
+    workflowMode,
+    iterationContext,
+    iterationAllTools: toolSurfaceDecision.iterationAllTools,
+    snapshotContextLimit,
+    isExecuteRecoveryEligible: toolSurfaceDecision.isExecuteRecoveryEligible,
+    executeRecoveryMode: executeRecoveryState.mode,
+    executeRecoveryReason: executeRecoveryState.reason,
+    recentToolActivity,
+    fileReadStates: toolExecutionRuntimeState.fileReadStates,
+    allowExecuteRecoveryFileRead: toolSurfaceDecision.allowExecuteRecoveryFileRead,
+    emitPlanExecutionProgress,
+  });
+  const managedAgentMessages = appendActiveRuntimeGuidance({
+    callbacks,
+    managedAgentMessages: contextManagementResult.managedAgentMessages,
+    iteration,
+  });
+
+  const assistantMsgId = generateId();
+  const maxOutputEscalations = getMaxOutputEscalations();
+  const iterationRequestStartedAt = Date.now();
+
+  logAgentEvent("iteration_start", {
+    iteration,
+    workflowMode,
+    turnIntent,
+    runtimeIntent,
+    messagesLen: managedAgentMessages.length,
+    allTools: toolSurfaceDecision.iterationAllTools.length,
+    llmTools: contextManagementResult.llmTools.length,
+    toolProtocol: effectiveToolProtocol,
+    xmlToolsEnabled: true,
+    mcpTools: mcpToolCount,
+    currentMaxTokens: streamRuntimeState.currentMaxTokens ?? "default",
+  });
+  callbacks.onHarnessRunUpdate?.({
+    status: "running",
+    iteration,
+    maxIterations: effectiveMaxIterations,
+    workflowMode,
+    runtimeIntent,
+    planStage: callbacks.getPlanStage(),
+    isPlanApproved: callbacks.getIsPlanApproved(),
+    messagesLen: managedAgentMessages.length,
+    toolCount: toolSurfaceDecision.iterationAllTools.length,
+    activeStreamId: null,
+    streamStatus: "iteration_started",
+    streamChunkCount: 0,
+    streamByteCount: 0,
+    lastStreamError: null,
+  });
+
+  return {
+    runtimeIntent,
+    streamRuntimeState,
+    executeRecoveryState,
+    executeRecoveryIterationAdvance,
+    finalTextOnlyStep,
+    toolSurfaceDecision,
+    managedAgentMessages,
+    providerCompatibilityOverride:
+      contextManagementResult.providerCompatibilityOverride,
+    forceXmlTools: contextManagementResult.forceXmlTools,
+    llmTools: contextManagementResult.llmTools,
+    assistantMsgId,
+    maxOutputEscalations,
+    iterationRequestStartedAt,
+  };
+}

@@ -1,0 +1,55 @@
+import { logAgentEvent } from "../../orchestrator";
+import type { AgentLoopOutcome, OrchestratorCallbacks } from "../types";
+import { AgentOrchestrator } from "./AgentOrchestrator";
+import { resolveNonActionableStopOutcome, runAgentLoopCompletionGuards } from "./completionGuards";
+
+export async function executeAgentLoop(
+  callbacks: OrchestratorCallbacks,
+  abortController: AbortController,
+): Promise<AgentLoopOutcome> {
+  const orchestrator = new AgentOrchestrator();
+  let outcome: AgentLoopOutcome = { status: "completed", reason: "agent_loop_completed" };
+  const setOutcome = (next: AgentLoopOutcome) => {
+    if (outcome.status === "error") return;
+    if (outcome.status === "aborted" && next.status !== "error") return;
+    outcome = next;
+  };
+  const wrappedCallbacks: OrchestratorCallbacks = {
+    ...callbacks,
+    onAssistantFinalText: (text, replyOptions = [], meta) => {
+      if (meta?.awaitingInput === true && replyOptions.length > 0) {
+        setOutcome({ status: "paused", reason: "awaiting_user_choice" });
+        logAgentEvent("agent_loop_awaiting_user_choice", {
+          replyOptions: replyOptions.length,
+        });
+      }
+      callbacks.onAssistantFinalText(text, replyOptions, meta);
+    },
+    onNonActionableStop: (message, reason, progress) => {
+      setOutcome(resolveNonActionableStopOutcome(reason, progress));
+      callbacks.onNonActionableStop(message, reason, progress);
+    },
+    onError: (error) => {
+      setOutcome({ status: "error", reason: "agent_loop_error" });
+      callbacks.onError(error);
+    },
+  };
+
+  try {
+    await orchestrator.execute(wrappedCallbacks, abortController);
+  } catch (error) {
+    setOutcome({ status: "error", reason: "agent_loop_error" });
+    throw error;
+  }
+
+  if (abortController.signal.aborted) {
+    return { status: "aborted", reason: "agent_loop_aborted" };
+  }
+
+  return runAgentLoopCompletionGuards({
+    outcome,
+    callbacks,
+    latestTurnContract: orchestrator.getLatestTurnContract(),
+    sawExecutionEvidence: orchestrator.hasExecuteOperationEvidence(),
+  });
+}

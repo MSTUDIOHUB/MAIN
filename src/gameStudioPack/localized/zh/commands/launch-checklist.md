@@ -3,7 +3,6 @@ name: launch-checklist
 description: "上线前最后一轮发版检查，确保达到发给玩家的标准。"
 argument-hint: "[launch-date 或 'dry-run']"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write
 ---
 
 > **Explicit invocation only**: This skill should only run when the user explicitly requests it with `/launch-checklist`. Do not auto-invoke based on context matching.
@@ -16,7 +15,7 @@ Read the argument for the launch date or `dry-run` mode. Dry-run mode generates 
 
 ## 阶段 2: Gather Project Context
 
-- Read `CLAUDE.md` for tech stack, target platforms, and team structure
+- Read `AGENTS.md` for tech stack, target platforms, and team structure
 - Read the latest milestone in `production/milestones/`
 - Read any existing release checklist in `production/releases/`
 - Read the content calendar in `design/live-ops/content-calendar.md` if it exists

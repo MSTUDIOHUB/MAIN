@@ -1,9 +1,8 @@
 ---
 name: consistency-check
-description: "Scan all GDDs against the entity registry to detect cross-document inconsistencies: same entity with different stats, same item with different values, same formula with different variables. Grep-first approach — reads registry then targets only conflicting GDD sections rather than full document reads."
+description: "Scan all GDDs against the entity registry to detect cross-document inconsistencies: same entity with different stats, same item with different values, same formula with different variables. `grep_search`-first approach — reads registry then targets only conflicting GDD sections rather than full document reads."
 argument-hint: "[full | since-last-review | entity:<name> | item:<name>]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash
 ---
 
 # Consistency Check
@@ -64,7 +63,7 @@ Scope: [full | since-last-review | entity:name]
 ## Phase 2: Locate In-Scope GDDs
 
 ```
-Glob pattern="design/gdd/*.md"
+`glob_search` pattern="design/gdd/*.md"
 ```
 
 Exclude: `game-concept.md`, `systems-index.md`, `game-pillars.md` — these are
@@ -81,7 +80,7 @@ Report the in-scope GDD list before scanning.
 
 ---
 
-## Phase 3: Grep-First Conflict Scan
+## Phase 3: Search-First Conflict Scan
 
 For each registered entry, grep every in-scope GDD for the entry's name.
 Do NOT do full reads — extract only the matching lines and their immediate
@@ -96,7 +95,7 @@ each returning ~10 lines on a hit).
 For each entity in entity_map:
 
 ```
-Grep pattern="[entity_name]" glob="design/gdd/*.md" output_mode="content" -C 3
+`grep_search` pattern="[entity_name]" glob="design/gdd/*.md" output_mode="content" -C 3
 ```
 
 For each GDD hit, extract the values mentioned near the entity name:
@@ -150,7 +149,7 @@ conflicting GDD to get precise context:
 ```
 Read path="design/gdd/[conflicting_gdd].md"
 ```
-(Or use Grep with wider context if the file is large)
+(Or use grep_search with wider context if the file is large)
 
 Confirm the conflict with full context. Determine:
 1. **Which GDD is correct?** Check the `source:` field in the registry — the

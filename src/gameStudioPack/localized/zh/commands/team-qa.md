@@ -3,14 +3,12 @@ name: team-qa
 description: "编排多位专家协同推进测试、验证和缺陷收敛。"
 argument-hint: "[sprint | feature: system-name]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Task, AskUserQuestion
-agent: qa-lead
 ---
 
 When this skill is invoked, orchestrate the QA team through a structured testing cycle.
 
-**Decision Points:** At each phase transition, use `AskUserQuestion` to present
-the user with the subagent's proposals as selectable options. Write the agent's
+**Decision Points:** At each phase transition, present
+the specialist review's proposals as selectable options. Write the agent's
 full analysis in conversation, then capture the decision with concise labels.
 The user must approve before moving to the next phase.
 
@@ -19,13 +17,13 @@ The user must approve before moving to the next phase.
 - **qa-lead** — QA strategy, test plan generation, story classification, sign-off report
 - **qa-tester** — Test case writing, bug report writing, manual QA documentation
 
-## How to Delegate
+## How to Apply Specialist Profiles
 
-Use the Task tool to spawn each team member as a subagent:
-- `subagent_type: qa-lead` — Strategy, planning, classification, sign-off
-- `subagent_type: qa-tester` — Test case writing and bug report writing
+Apply each listed specialist profile as a separate review pass in the current MAIN run:
+- `specialist profile: qa-lead` — Strategy, planning, classification, sign-off
+- `specialist profile: qa-tester` — Test case writing and bug report writing
 
-Always provide full context in each agent's prompt (story file paths, QA plan path, scope constraints). Launch independent qa-tester tasks in parallel where possible (e.g., multiple stories in Phase 5 can be scaffolded simultaneously).
+Always provide full context in each agent's prompt (story file paths, QA plan path, scope constraints). Apply the qa-tester profile as a separate review pass for each story, then synthesize the results before advancing.
 
 ## Pipeline
 
@@ -45,7 +43,7 @@ Before doing anything else, gather the full scope:
 
 ### Phase 2: QA Strategy (qa-lead)
 
-Spawn `qa-lead` via Task to review all in-scope stories and produce a QA strategy.
+Apply `qa-lead` as a specialist review to review all in-scope stories and produce a QA strategy.
 
 Prompt the qa-lead to:
 - Read each story file
@@ -63,7 +61,7 @@ Prompt the qa-lead to:
 
 If the smoke check result is **FAIL**, the qa-lead must list the failures prominently. QA cannot proceed past the strategy phase with a failed smoke check.
 
-Present the qa-lead's full strategy to the user, then use `AskUserQuestion`:
+Present the qa-lead's full strategy to the user, then ask the user:
 
 ```
 question: "QA Strategy Review"
@@ -102,7 +100,7 @@ Write only after receiving approval.
 
 For each story requiring manual QA (Visual/Feel, UI, Integration without automated tests):
 
-Spawn `qa-tester` via Task for each story (run in parallel where possible), providing:
+Apply `qa-tester` as a specialist review for each story (run as a separate review pass), providing:
 - The story file path
 - The relevant section of the QA plan for that story
 - The GDD acceptance criteria for the system being tested (if available)
@@ -117,7 +115,7 @@ Each test case set should include:
 
 Present the test cases to the user for review before execution. Group by story.
 
-Use `AskUserQuestion` per story group (batched 3-4 at a time):
+Ask the user per story group (batched 3-4 at a time):
 
 ```
 question: "Test cases ready for [Story Group]. Review before manual QA begins?"
@@ -131,7 +129,7 @@ options:
 
 Walk through each story in the approved manual QA list.
 
-Batch stories into groups of 3-4 and use `AskUserQuestion` for each:
+Batch stories into groups of 3-4 and ask the user for each:
 
 ```
 question: "Manual QA — [Story Title]\n[brief description of what to test]"
@@ -142,7 +140,7 @@ options:
   - "BLOCKED — cannot test yet (reason)"
 ```
 
-After each FAIL result: use `AskUserQuestion` to collect the failure description, then spawn `qa-tester` via Task to write a formal bug report in `production/qa/bugs/`.
+After each FAIL result: ask the user to collect the failure description, then apply `qa-tester` as a specialist review to write a formal bug report in `production/qa/bugs/`.
 
 Bug report naming: `BUG-[NNN]-[short-slug].md` (increment NNN from existing bugs in the directory).
 
@@ -154,7 +152,7 @@ After collecting all results, summarize:
 
 ### Phase 7: QA Sign-Off 报告
 
-Spawn `qa-lead` via Task to produce the sign-off report using all results from Phases 4–6.
+Apply `qa-lead` as a specialist review to produce the sign-off report using all results from Phases 4–6.
 
 The sign-off report format:
 
@@ -198,15 +196,15 @@ Write only after receiving approval.
 
 ## Error Recovery Protocol
 
-If any spawned agent (via Task) returns BLOCKED, errors, or cannot complete:
+If a specialist review identifies a blocker or cannot produce a verdict:
 
-1. **Surface immediately**: 报告 "[AgentName]: BLOCKED — [reason]" to the user before continuing to dependent phases
-2. **Assess dependencies**: 检查 whether the blocked agent's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
-3. **Offer options** via AskUserQuestion with choices:
-   - Skip this agent and note the gap in the final report
+1. **Surface immediately**: 报告 "[SpecialistProfile]: BLOCKED — [reason]" to the user before continuing to dependent phases
+2. **Assess dependencies**: 检查 whether the blocked review's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
+3. **Offer options** in one flat `<user_options>` block:
+   - Skip this review pass and note the gap in the final report
    - Retry with narrower scope
    - Stop here and resolve the blocker first
-4. **Always produce a partial report** — output whatever was completed. Never discard work because one agent blocked.
+4. **Always produce a partial report** — output whatever was completed. Never discard work because one review pass identifies a blocker.
 
 Common blockers:
 - Input file missing (story not found, GDD absent) → redirect to the skill that creates it

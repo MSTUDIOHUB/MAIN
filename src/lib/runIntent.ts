@@ -1,4 +1,4 @@
-import type { PendingSlashCommand } from "./gameStudioCatalog";
+import type { PendingSlashCommand } from "./gameStudio/catalog";
 import type { MainModeKey } from "./mainModes";
 
 export type LegacyWorkflowMode = "chat" | "edit" | "plan";

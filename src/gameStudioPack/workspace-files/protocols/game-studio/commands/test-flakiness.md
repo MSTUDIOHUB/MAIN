@@ -3,7 +3,6 @@ name: test-flakiness
 description: "Detect non-deterministic (flaky) tests by reading CI run logs or test result history. Aggregates pass rates per test, identifies intermittent failures, recommends quarantine or fix, and maintains a flaky test registry. Best run during Polish phase or after multiple CI runs."
 argument-hint: "[ci-log-path | scan | registry]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash
 ---
 
 # Test Flakiness Detection
@@ -52,7 +51,7 @@ Check `test-results/` for `.xml` files.
 For Unity projects: game-ci test runner outputs NUnit XML to `test-results/`
 by default.
 
-For Unreal projects: automation logs go to `Saved/Logs/`. Grep for
+For Unreal projects: automation logs go to `Saved/Logs/`. `grep_search` for
 `Result: Success` and `Result: Fail` patterns.
 
 ### Option B — Local log files
@@ -78,12 +77,12 @@ Stop and ask the user which option to pursue.
 For each CI log or result file found, parse:
 
 **JUnit XML format** (GdUnit4 / Unity):
-- Grep for `<testcase name=` to get test names
-- Grep for `<failure` or `<error` to identify failures
+- `grep_search` for `<testcase name=` to get test names
+- `grep_search` for `<failure` or `<error` to identify failures
 - Parse `classname` and `name` attributes for full test identifiers
 
 **Plain text logs**:
-- Grep for pass/fail patterns:
+- `grep_search` for pass/fail patterns:
   - Godot: `PASSED` / `FAILED` adjacent to test names
   - Unreal: `Result: Success` / `Result: Fail`
   - Unity: `Test passed` / `Test failed`
@@ -117,7 +116,7 @@ For each flaky test, classify the likely cause:
 | **Floating point** | Fails on comparisons like `== 0.5` | Use epsilon comparison (`is_equal_approx`, `Assert.AreApproximately`) |
 | **Scene/prefab load race** | Fails when scenes are not yet ready | Await one frame after instantiation; use `await get_tree().process_frame` |
 
-Use Grep to check the test file for timing calls, randf, global state access,
+Use grep_search to check the test file for timing calls, randf, global state access,
 or equality comparisons on floats to narrow down the cause.
 
 ---
@@ -177,7 +176,7 @@ For each flaky test:
 Ask: "May I update the quarantine section of `tests/regression-suite.md`
 with the flaky tests found?"
 
-If yes: use `Edit` to append entries to the Quarantined Tests table.
+If yes: use `apply_patch` to append entries to the Quarantined Tests table.
 Never remove existing quarantine entries — only add new ones.
 
 Ask (separately): "May I write a full flakiness report to

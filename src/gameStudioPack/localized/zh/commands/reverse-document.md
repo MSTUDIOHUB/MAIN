@@ -3,7 +3,6 @@ name: reverse-document
 description: "根据现有实现反向补全文档，说明系统做了什么以及如何工作。"
 argument-hint: "<type> <path> (例如, 'design src/gameplay/combat' 或 'architecture src/core')"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash
 # Read-only diagnostic skill — no specialist agent delegation needed
 ---
 
@@ -122,9 +121,9 @@ Based on type, use appropriate template:
 
 | Type | Template | Output Path |
 |------|----------|-------------|
-| `design` | `templates/design-doc-from-implementation.md` | `design/gdd/[system-name].md` |
-| `architecture` | `templates/architecture-doc-from-code.md` | `docs/architecture/[decision-name].md` |
-| `concept` | `templates/concept-doc-from-prototype.md` | `prototypes/[name]/CONCEPT.md` or `design/concepts/[name].md` |
+| `design` | `.MAIN/templates/game-studio/design-doc-from-implementation.md` | `design/gdd/[system-name].md` |
+| `architecture` | `.MAIN/templates/game-studio/architecture-doc-from-code.md` | `docs/architecture/[decision-name].md` |
+| `concept` | `.MAIN/templates/game-studio/concept-doc-from-prototype.md` | `prototypes/[name]/CONCEPT.md` or `design/concepts/[name].md` |
 
 **Draft structure**:
 - Capture **what exists** (mechanics, patterns, implementation)

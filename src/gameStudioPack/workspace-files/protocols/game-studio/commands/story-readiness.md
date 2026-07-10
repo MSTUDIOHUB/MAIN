@@ -3,8 +3,6 @@ name: story-readiness
 description: "Validate that a story file is implementation-ready. Checks for embedded GDD requirements, ADR references, engine notes, clear acceptance criteria, and no open design questions. Produces READY / NEEDS WORK / BLOCKED verdict with specific gaps. Use when user says 'is this story ready', 'can I start on this story', 'is story X ready to implement'."
 argument-hint: "[story-file-path or 'all' or 'sprint']"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, AskUserQuestion, Task
-model: haiku
 ---
 
 # Story Readiness
@@ -23,19 +21,19 @@ gap list for each non-ready story.
 
 ## Phase 0: Resolve Review Mode
 
-Resolve the review mode once at startup (store for all gate spawns this run):
+Resolve the review mode once at startup (store for all gate reviews this run):
 
 1. If skill was called with `--review [full|lean|solo]` → use that value
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern and mode definitions.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern and mode definitions.
 
 ---
 
 ## 1. Parse Arguments
 
-**Scope:** `$ARGUMENTS[0]` (blank = ask user via AskUserQuestion)
+**Scope:** `the first token after the slash command in the current user request` (blank = ask the user)
 
 - **Specific path** (e.g., `/story-readiness production/epics/combat/story-001-basic-attack.md`):
   validate that single story file.
@@ -45,7 +43,7 @@ See `.claude/docs/director-gates.md` for the full check pattern and mode definit
   validate every story file found.
 - **No argument**: ask the user which scope to validate.
 
-If no argument is given, use `AskUserQuestion`:
+If no argument is given, ask the user:
 - "What would you like to validate?"
   - Options: "A specific story file", "All stories in the current sprint",
     "All stories in production/epics/", "Stories for a specific epic"
@@ -163,7 +161,7 @@ items pass or are explicitly marked N/A with a stated reason.
 - [ ] **Referenced assets exist**: Scan the story text for asset path patterns
   (paths containing `assets/`, or file extensions `.png`, `.jpg`, `.svg`,
   `.wav`, `.ogg`, `.mp3`, `.glb`, `.gltf`, `.tres`, `.tscn`, `.res`).
-  - For each asset path found: use Glob to check whether the file exists.
+  - For each asset path found: use glob_search to check whether the file exists.
   - If any referenced asset does not exist: **NEEDS WORK** — note the missing
     path(s). (The story references assets that have not been created yet.
     Either remove the reference, create a placeholder, or mark it as an
@@ -275,7 +273,7 @@ After reporting findings, offer:
 draft the missing sections for your approval."
 
 If the user says yes for a specific story, draft only the missing sections
-in conversation. Do not use Write or Edit tools — the user (or
+in conversation. Do not use write_file or replace_in_file tools — the user (or
 `/create-stories`) handles writing.
 
 **Redirect rules:**
@@ -319,13 +317,13 @@ If no sprint file exists or no other ready stories are found, skip this section 
 
 ## Phase 8: Director Gate — Story Readiness Review
 
-Apply the review mode resolved in Phase 0 before spawning QL-STORY-READY:
+Apply the review mode resolved in Phase 0 before applying QL-STORY-READY:
 
 - `solo` → skip. Note: "QL-STORY-READY skipped — Solo mode." Proceed to close.
 - `lean` → skip. Note: "QL-STORY-READY skipped — Lean mode." Proceed to close.
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-Spawn `qa-lead` via Task using gate **QL-STORY-READY** (`.claude/docs/director-gates.md`).
+Apply `qa-lead` as a specialist review with gate **QL-STORY-READY** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass the following context:
 - Story title
@@ -335,7 +333,7 @@ Pass the following context:
 
 Handle the verdict per standard rules in `director-gates.md`:
 - **ADEQUATE** → story is cleared. Proceed to close.
-- **GAPS [list]** → surface the specific gaps to the user via `AskUserQuestion`:
+- **GAPS [list]** → surface the specific gaps to the user in one flat `<user_options>` block:
   options: `Update story with suggested gaps` / `Accept and proceed anyway` / `Discuss further`.
 - **INADEQUATE** → surface the specific gaps; ask user whether to update the story or proceed anyway.
 

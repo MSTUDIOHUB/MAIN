@@ -14,8 +14,8 @@ all key Tier 2 leads. Any skill, team orchestrator, or workflow may invoke these
 In any skill, replace an inline director prompt with a reference:
 
 ```
-Spawn `creative-director` via Task using gate **CD-PILLARS** from
-`.claude/docs/director-gates.md`.
+Apply `creative-director` as a specialist review with gate **CD-PILLARS** from
+`.protocols/game-studio/docs/director-gates.md`.
 ```
 
 Pass the context listed under that gate's **Context to pass** field, then handle
@@ -47,10 +47,10 @@ Examples:
 | `lean` | PHASE-GATEs only (`/gate-check`) — per-skill gates skipped | **Default** — solo devs and small teams; directors review at milestones only |
 | `solo` | No director gates anywhere | Game jams, prototypes, maximum speed |
 
-**Check pattern — apply before every gate spawn:**
+**Check pattern — apply before every gate review:**
 
 ```
-Before spawning gate [GATE-ID]:
+Before applying gate [GATE-ID]:
 1. If skill was called with --review [mode], use that
 2. Else read production/review-mode.txt
 3. Else default to full
@@ -59,14 +59,14 @@ Apply the resolved mode:
 - solo → skip all gates. Note: "[GATE-ID] skipped — Solo mode"
 - lean → skip unless this is a PHASE-GATE (CD-PHASE-GATE, TD-PHASE-GATE, PR-PHASE-GATE)
          Note: "[GATE-ID] skipped — Lean mode"
-- full → spawn as normal
+- full → apply the specialist profile
 ```
 
 ---
 
 ## Invocation Pattern (copy into any skill)
 
-**MANDATORY: Resolve review mode before every gate spawn.** Never spawn a gate without checking. The resolved mode is determined once per skill run:
+**MANDATORY: Resolve review mode before every gate review.** Never apply a gate without checking. The resolved mode is determined once per skill run:
 1. If skill was called with `--review [mode]`, use that
 2. Else read `production/review-mode.txt`
 3. Else default to `lean`
@@ -74,22 +74,21 @@ Apply the resolved mode:
 Apply the resolved mode:
 - `solo` → **skip all gates**. Note in output: `[GATE-ID] skipped — Solo mode`
 - `lean` → **skip unless this is a PHASE-GATE** (CD-PHASE-GATE, TD-PHASE-GATE, PR-PHASE-GATE, AD-PHASE-GATE). Note: `[GATE-ID] skipped — Lean mode`
-- `full` → spawn as normal
+- `full` → apply the specialist profile
 
 ```
 # Apply mode check, then:
-Spawn `[agent-name]` via Task:
-- Gate: [GATE-ID] (see .claude/docs/director-gates.md)
+Apply `[agent-name]` as a specialist review:
+- Gate: [GATE-ID] (see .protocols/game-studio/docs/director-gates.md)
 - Context: [fields listed under that gate]
 - Await the verdict before proceeding.
 ```
 
-For parallel spawning (multiple directors at the same gate point):
+For multiple directors at the same gate point:
 
 ```
-# Apply mode check for each gate first, then spawn all that survive:
-Spawn all [N] agents simultaneously via Task — issue all Task calls before
-waiting for any result. Collect all verdicts before proceeding.
+# Apply the mode check for each gate first. Then apply each surviving specialist
+# profile as a separate review pass. Collect all verdicts before proceeding.
 ```
 
 ---
@@ -101,10 +100,10 @@ All gates return one of three verdicts. Skills must handle all three:
 | Verdict | Meaning | Default action |
 |---------|---------|----------------|
 | **APPROVE / READY** | No issues. Proceed. | Continue the workflow |
-| **CONCERNS [list]** | Issues present but not blocking. | Surface to user via `AskUserQuestion` — options: `Revise flagged items` / `Accept and proceed` / `Discuss further` |
+| **CONCERNS [list]** | Issues present but not blocking. | Surface to user by asking the user — options: `Revise flagged items` / `Accept and proceed` / `Discuss further` |
 | **REJECT / NOT READY [blockers]** | Blocking issues. Do not proceed. | Surface blockers to user. Do not write files or advance stage until resolved. |
 
-**Escalation rule**: When multiple directors are spawned in parallel, apply the
+**Escalation rule**: When multiple directors are applied as separate review passes, apply the
 strictest verdict — one NOT READY overrides all READY verdicts.
 
 ---
@@ -124,7 +123,7 @@ For phase gates, record in `docs/architecture/architecture.md` or
 
 ## Tier 1 — Creative Director Gates
 
-Agent: `creative-director` | Model tier: Opus | Domain: Vision, pillars, player experience
+Specialist: `creative-director` | Domain: Vision, pillars, player experience
 
 ---
 
@@ -246,7 +245,7 @@ any session that produces player feedback
 
 ### CD-PHASE-GATE — Creative Readiness at Phase Transition
 
-**Trigger**: Always at `/gate-check` — spawn in parallel with TD-PHASE-GATE and PR-PHASE-GATE
+**Trigger**: Always at `/gate-check` — run as a separate review pass alongside TD-PHASE-GATE and PR-PHASE-GATE
 
 **Context to pass**:
 - Target phase name
@@ -266,7 +265,7 @@ any session that produces player feedback
 
 ## Tier 1 — Technical Director Gates
 
-Agent: `technical-director` | Model tier: Opus | Domain: Architecture, engine risk, performance
+Specialist: `technical-director` | Domain: Architecture, engine risk, performance
 
 ---
 
@@ -391,7 +390,7 @@ or before finalizing any engine-specific implementation approach
 
 ### TD-PHASE-GATE — Technical Readiness at Phase Transition
 
-**Trigger**: Always at `/gate-check` — spawn in parallel with CD-PHASE-GATE and PR-PHASE-GATE
+**Trigger**: Always at `/gate-check` — run as a separate review pass alongside CD-PHASE-GATE and PR-PHASE-GATE
 
 **Context to pass**:
 - Target phase name
@@ -412,7 +411,7 @@ or before finalizing any engine-specific implementation approach
 
 ## Tier 1 — Producer Gates
 
-Agent: `producer` | Model tier: Opus | Domain: Scope, timeline, dependencies, production risk
+Specialist: `producer` | Domain: Scope, timeline, dependencies, production risk
 
 ---
 
@@ -517,7 +516,7 @@ is invoked
 
 ### PR-PHASE-GATE — Production Readiness at Phase Transition
 
-**Trigger**: Always at `/gate-check` — spawn in parallel with CD-PHASE-GATE and TD-PHASE-GATE
+**Trigger**: Always at `/gate-check` — run as a separate review pass alongside CD-PHASE-GATE and TD-PHASE-GATE
 
 **Context to pass**:
 - Target phase name
@@ -538,13 +537,13 @@ is invoked
 
 ## Tier 1 — Art Director Gates
 
-Agent: `art-director` | Model tier: Sonnet | Domain: Visual identity, art bible, visual production readiness
+Specialist: `art-director` | Domain: Visual identity, art bible, visual production readiness
 
 ---
 
 ### AD-CONCEPT-VISUAL — Visual Identity Anchor
 
-**Trigger**: After game pillars are locked (brainstorm Phase 4), in parallel with CD-PILLARS
+**Trigger**: After game pillars are locked (brainstorm Phase 4), as a separate review pass alongside CD-PILLARS
 
 **Context to pass**:
 - Game concept (elevator pitch, core fantasy, unique hook)
@@ -573,7 +572,7 @@ Agent: `art-director` | Model tier: Sonnet | Domain: Visual identity, art bible,
 **Context to pass**:
 - Art bible path (`design/art/art-bible.md`)
 - Game pillars and core fantasy
-- Platform and performance constraints (from `.claude/docs/technical-preferences.md` if configured)
+- Platform and performance constraints (from `.protocols/game-studio/docs/technical-preferences.md` if configured)
 - Visual identity anchor chosen during brainstorm (from `design/gdd/game-concept.md`)
 
 **Prompt**:
@@ -593,7 +592,7 @@ Agent: `art-director` | Model tier: Sonnet | Domain: Visual identity, art bible,
 
 ### AD-PHASE-GATE — Visual Readiness at Phase Transition
 
-**Trigger**: Always at `/gate-check` — spawn in parallel with CD-PHASE-GATE, TD-PHASE-GATE, and PR-PHASE-GATE
+**Trigger**: Always at `/gate-check` — run as a separate review pass alongside CD-PHASE-GATE, TD-PHASE-GATE, and PR-PHASE-GATE
 
 **Context to pass**:
 - Target phase name
@@ -619,7 +618,7 @@ Agent: `art-director` | Model tier: Sonnet | Domain: Visual identity, art bible,
 ## Tier 2 — Lead Gates
 
 These gates are invoked by orchestration skills and senior skills when a domain
-specialist's feasibility sign-off is needed. Tier 2 leads use Sonnet (default).
+specialist's feasibility sign-off is needed. Use the active MAIN model for every profile.
 
 ---
 
@@ -760,13 +759,13 @@ introduced, or when a tech art decision affects visual style
 
 ---
 
-## Parallel Gate Protocol
+## multi-review gate protocol
 
 When a workflow requires multiple directors at the same checkpoint (most common
-at `/gate-check`), spawn all agents simultaneously:
+at `/gate-check`), apply all director profiles as separate review passes:
 
 ```
-Spawn in parallel (issue all Task calls before waiting for any result):
+Apply as separate review passes:
 1. creative-director  → gate CD-PHASE-GATE
 2. technical-director → gate TD-PHASE-GATE
 3. producer           → gate PR-PHASE-GATE

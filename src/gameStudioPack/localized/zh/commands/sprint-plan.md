@@ -3,19 +3,17 @@ name: sprint-plan
 description: "规划当前迭代，安排优先级、容量、风险和交付目标。"
 argument-hint: "[new|update|status] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Task, AskUserQuestion
-context: |
   !ls production/sprints/ 2>/dev/null
 ---
 
 ## 阶段 0: Parse Arguments
 
-Extract the mode argument (`new`, `update`, or `status`) and resolve the review mode (once, store for all gate spawns this run):
+Extract the mode argument (`new`, `update`, or `status`) and resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern.
 
 ---
 
@@ -167,12 +165,12 @@ stories that haven't changed, add new stories, remove dropped ones.
 
 ## 阶段 4: Producer Feasibility Gate
 
-**Review mode check** — apply before spawning PR-SPRINT:
+**Review mode check** — resolve before running PR-SPRINT:
 - `solo` → skip. Note: "PR-SPRINT skipped — Solo mode." Proceed to Phase 5 (QA plan gate).
 - `lean` → skip (not a PHASE-GATE). Note: "PR-SPRINT skipped — Lean mode." Proceed to Phase 5 (QA plan gate).
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-Before finalising the sprint plan, spawn `producer` via Task using gate **PR-SPRINT** (`.claude/docs/director-gates.md`).
+Before finalising the sprint plan, apply `producer` as a specialist review with gate **PR-SPRINT** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: proposed story list (titles, estimates, dependencies), total team capacity in hours/days, any carryover from the previous sprint, milestone constraints and deadline.
 
@@ -190,7 +188,7 @@ After writing, add:
 
 Before closing the sprint plan, check whether a QA plan exists for this sprint.
 
-Use `Glob` to look for `production/qa/qa-plan-sprint-[N].md` or any file in `production/qa/` referencing this sprint number.
+Use `glob_search` to look for `production/qa/qa-plan-sprint-[N].md` or any file in `production/qa/` referencing this sprint number.
 
 **If a QA plan is found**: note it in the sprint plan output — "QA Plan: `[path]`" — and proceed.
 
@@ -200,7 +198,7 @@ Use `Glob` to look for `production/qa/qa-plan-sprint-[N].md` or any file in `pro
 >
 > Run `/qa-plan sprint` now, before starting any implementation. It takes one session and produces the test case requirements each story needs."
 
-Use `AskUserQuestion`:
+Ask the user:
 - Prompt: "No QA plan found for this sprint. How do you want to proceed?"
 - Options:
   - `[A] Run /qa-plan sprint now — I'll do that before starting implementation (Recommended)`

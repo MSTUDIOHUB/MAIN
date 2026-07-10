@@ -1,4 +1,4 @@
-# Agent Coordination and Delegation Map
+# Specialist Coordination Map
 
 ## Organizational Hierarchy
 
@@ -62,15 +62,15 @@ narr-dir = narrative-director perf-a = performance-analyst
 art-dir = art-director
 ```
 
-## Delegation Rules
+## Specialist Routing Rules
 
-### Who Can Delegate to Whom
+### Related Specialist Profiles
 
-| From | Can Delegate To |
+| Profile | Related Profiles |
 |------|----------------|
 | creative-director | game-designer, art-director, audio-director, narrative-director |
 | technical-director | lead-programmer, devops-engineer, performance-analyst, technical-artist (technical decisions) |
-| producer | Any agent (task assignment within their domain only) |
+| producer | Any specialist profile needed for production coordination |
 | game-designer | systems-designer, level-designer, economy-designer |
 | lead-programmer | gameplay-programmer, engine-programmer, ai-programmer, network-programmer, tools-programmer, ui-programmer |
 | art-director | technical-artist, ux-designer |
@@ -79,10 +79,10 @@ art-dir = art-director
 | qa-lead | qa-tester |
 | release-manager | devops-engineer (release builds), qa-lead (release testing) |
 | localization-lead | writer (string review), ui-programmer (text fitting) |
-| prototyper | (works independently, reports findings to producer and relevant leads) |
+| prototyper | producer and relevant leads |
 | security-engineer | network-programmer (security review), lead-programmer (secure patterns) |
 | accessibility-specialist | ux-designer (accessible patterns), ui-programmer (implementation), qa-tester (a11y testing) |
-| [engine]-specialist | engine sub-specialists (delegates subsystem-specific work) |
+| [engine]-specialist | engine sub-specialists for subsystem-specific review passes |
 | [engine] sub-specialists | (advises all programmers on engine subsystem patterns and optimization) |
 | live-ops-designer | economy-designer (live economy), community-manager (event comms), analytics-engineer (engagement metrics) |
 | community-manager | (works with producer for approval, release-manager for patch note timing) |

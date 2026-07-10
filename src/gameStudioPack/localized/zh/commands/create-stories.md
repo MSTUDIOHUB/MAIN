@@ -3,8 +3,6 @@ name: create-stories
 description: "将 Epic 拆解为可实现、可测试、可验收的 Story。"
 argument-hint: "[epic-slug | epic-path] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Task, AskUserQuestion
-agent: lead-programmer
 ---
 
 # Create Stories
@@ -28,14 +26,14 @@ then Core, and so on — matching the dependency order.
 
 Extract `--review [full|lean|solo]` if present and store as the review mode
 override for this run. If not provided, read `production/review-mode.txt`
-(default `full` if missing). This resolved mode applies to all gate spawns
-in this skill — apply the check pattern from `.claude/docs/director-gates.md`
+(default `full` if missing). This resolved mode applies to all gate reviews
+in this skill — apply the check pattern from `.protocols/game-studio/docs/director-gates.md`
 before every gate invocation.
 
 - `/create-stories [epic-slug]` — e.g. `/create-stories combat`
 - `/create-stories production/epics/combat/EPIC.md` — full path also accepted
 - No argument — ask: "Which epic would you like to break into stories?"
-  Glob `production/epics/*/EPIC.md` and list available epics with their status.
+  `glob_search` `production/epics/*/EPIC.md` and list available epics with their status.
 
 ---
 
@@ -102,12 +100,12 @@ For each story, determine:
 
 ## 4b. QA Lead Story Readiness Gate
 
-**Review mode check** — apply before spawning QL-STORY-READY:
+**Review mode check** — resolve before running QL-STORY-READY:
 - `solo` → skip. Note: "QL-STORY-READY skipped — Solo mode." Proceed to Step 5 (present stories for review).
 - `lean` → skip (not a PHASE-GATE). Note: "QL-STORY-READY skipped — Lean mode." Proceed to Step 5 (present stories for review).
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-After decomposing all stories (Step 4 complete) but before presenting them for write approval, spawn `qa-lead` via Task using gate **QL-STORY-READY** (`.claude/docs/director-gates.md`).
+After decomposing all stories (Step 4 complete) but before presenting them for write approval, apply `qa-lead` as a specialist review with gate **QL-STORY-READY** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: the full story list with acceptance criteria, story types, and TR-IDs; the epic's GDD acceptance criteria for reference.
 
@@ -157,7 +155,7 @@ Story 003: [title] — Visual/Feel — ADR-NNNN
 [N stories total: N Logic, N Integration, N Visual/Feel, N UI, N Config/Data]
 ```
 
-Use `AskUserQuestion`:
+Ask the user:
 - Prompt: "May I write these [N] stories to `production/epics/[epic-slug]/`?"
 - Options: `[A] Yes — write all [N] stories` / `[B] Not yet — I want to review or adjust first`
 
@@ -280,13 +278,13 @@ Replace the "Stories: Not yet created" line with a populated table:
 
 ## 7. After Writing
 
-Use `AskUserQuestion` to close with context-aware next steps:
+Ask the user to close with context-aware next steps:
 
 检查:
 - Are there other epics in `production/epics/` without stories yet? List them.
 - Is this the last epic? If so, include `/sprint-plan` as an option.
 
-Widget:
+`<user_options>` block:
 - Prompt: "[N] stories written to `production/epics/[epic-slug]/`. What next?"
 - Options (include all that apply):
   - `[A] Start implementing — run /story-readiness [first-story-path]` (Recommended)

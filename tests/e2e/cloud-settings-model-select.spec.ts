@@ -137,14 +137,56 @@ test.beforeEach(async ({ page }) => {
 });
 
 async function enableCloudLab(page: import("@playwright/test").Page) {
-  await page.getByTestId("cloud-lab-toggle").click();
-  await expect(page.getByTestId("cloud-lab-toggle")).toHaveAttribute("aria-checked", "true");
+  const toggle = page.getByTestId("cloud-lab-toggle");
+  test.skip(await toggle.count() === 0, "Cloud OAuth lab is disabled in this build.");
+  await toggle.click();
+  await expect(toggle).toHaveAttribute("aria-checked", "true");
 }
+
+test("cloud settings scenario keeps the stable e2e bridge contract", async ({ page }) => {
+  await page.goto("/?e2eScenario=cloud-settings-model-select");
+
+  const contract = await page.evaluate(() => {
+    const bridge = (window as any).__CODELY_E2E__;
+    return {
+      scenario: bridge?.scenario,
+      initialized: bridge?.initialized,
+      eventTypes: Array.isArray(bridge?.events) ? bridge.events.map((event: any) => event.type) : null,
+      savedDocumentsIsArray: Array.isArray(bridge?.savedDocuments),
+      completed: bridge?.completed,
+      cleanupType: typeof bridge?.cleanup,
+      getSnapshotType: typeof bridge?.getSnapshot,
+      setCloudServersType: typeof bridge?.setCloudServers,
+      setModelRuntimeLockType: typeof bridge?.setModelRuntimeLock,
+      clearModelRuntimeLockType: typeof bridge?.clearModelRuntimeLock,
+      snapshot: bridge?.getSnapshot?.(),
+    };
+  });
+
+  expect(contract).toMatchObject({
+    scenario: "cloud-settings-model-select",
+    initialized: true,
+    eventTypes: ["boot"],
+    savedDocumentsIsArray: true,
+    completed: false,
+    cleanupType: "function",
+    getSnapshotType: "function",
+    setCloudServersType: "function",
+    setModelRuntimeLockType: "function",
+    clearModelRuntimeLockType: "function",
+    snapshot: {
+      isSettingsOpen: true,
+      settingsTab: "cloud",
+      activeCloudServerId: "demo-openai",
+      cloudServerCount: 1,
+    },
+  });
+});
 
 test("cloud settings hides sampling params and keeps advanced compatibility collapsed", async ({ page }) => {
   await page.goto("/?e2eScenario=cloud-settings-model-select");
 
-  await expect(page.getByTestId("cloud-lab-toggle")).toHaveAttribute("aria-checked", "false");
+  await expect(page.getByTestId("cloud-lab-toggle")).toHaveCount(0);
   await expect(page.getByTestId("cloud-auth-mode-api_key")).toBeVisible();
   await expect(page.getByTestId("cloud-auth-mode-openai_chatgpt_oauth")).toHaveCount(0);
   await expect(page.getByTestId("cloud-auth-mode-gemini_google_oauth")).toHaveCount(0);
@@ -235,7 +277,7 @@ test("model runtime lock disables current model switching while allowing non-run
 
   await expect(page.getByTestId("model-runtime-lock-notice")).toBeVisible();
   await expect(page.getByTestId("cloud-active-profile-button")).toBeDisabled();
-  await expect(page.getByTestId("cloud-lab-toggle")).toBeDisabled();
+  await expect(page.getByTestId("cloud-lab-toggle")).toHaveCount(0);
   await expect(page.getByTestId("cloud-model-input")).toBeDisabled();
   await expect(page.getByTestId("cloud-model-refresh")).toBeDisabled();
   await expect(page.getByTestId("cloud-model-test")).toBeDisabled();

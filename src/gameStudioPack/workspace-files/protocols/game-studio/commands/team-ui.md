@@ -3,12 +3,11 @@ name: team-ui
 description: "Orchestrate the UI team through the full UX pipeline: from UX spec authoring through visual design, implementation, review, and polish. Integrates with /ux-design, /ux-review, and studio UX templates."
 argument-hint: "[UI feature description]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash, Task, AskUserQuestion, TodoWrite
 ---
 When this skill is invoked, orchestrate the UI team through a structured pipeline.
 
-**Decision Points:** At each phase transition, use `AskUserQuestion` to present
-the user with the subagent's proposals as selectable options. Write the agent's
+**Decision Points:** At each phase transition, present
+the specialist review's proposals as selectable options. Write the agent's
 full analysis in conversation, then capture the decision with concise labels.
 The user must approve before moving to the next phase.
 
@@ -16,7 +15,7 @@ The user must approve before moving to the next phase.
 - **ux-designer** — User flows, wireframes, accessibility, input handling
 - **ui-programmer** — UI framework, screens, widgets, data binding, implementation
 - **art-director** — Visual style, layout polish, consistency with art bible
-- **engine UI specialist** — Validates UI implementation patterns against engine-specific best practices (read from `.claude/docs/technical-preferences.md` Engine Specialists → UI Specialist)
+- **engine UI specialist** — Validates UI implementation patterns against engine-specific best practices (read from `.protocols/game-studio/docs/technical-preferences.md` Engine Specialists → UI Specialist)
 - **accessibility-specialist** — Audits accessibility compliance at Phase 4
 
 **Templates used by this pipeline:**
@@ -25,16 +24,16 @@ The user must approve before moving to the next phase.
 - `interaction-pattern-library.md` — Reusable interaction patterns
 - `accessibility-requirements.md` — Committed accessibility tier and requirements
 
-## How to Delegate
+## How to Apply Specialist Profiles
 
-Use the Task tool to spawn each team member as a subagent:
-- `subagent_type: ux-designer` — User flows, wireframes, accessibility, input handling
-- `subagent_type: ui-programmer` — UI framework, screens, widgets, data binding
-- `subagent_type: art-director` — Visual style, layout polish, art bible consistency
-- `subagent_type: [UI engine specialist]` — Engine-specific UI pattern validation (e.g., unity-ui-specialist, ue-umg-specialist, godot-specialist)
-- `subagent_type: accessibility-specialist` — Accessibility compliance audit
+Apply each listed specialist profile as a separate review pass in the current MAIN run:
+- `specialist profile: ux-designer` — User flows, wireframes, accessibility, input handling
+- `specialist profile: ui-programmer` — UI framework, screens, widgets, data binding
+- `specialist profile: art-director` — Visual style, layout polish, art bible consistency
+- `specialist profile: [UI engine specialist]` — Engine-specific UI pattern validation (e.g., unity-ui-specialist, ue-umg-specialist, godot-specialist)
+- `specialist profile: accessibility-specialist` — Accessibility compliance audit
 
-Always provide full context in each agent's prompt (feature requirements, existing UI patterns, platform targets). Launch independent agents in parallel where the pipeline allows it (e.g., Phase 4 review agents can run simultaneously).
+Always provide full context in each agent's prompt (feature requirements, existing UI patterns, platform targets). Apply each specialist profile as a separate review pass in the current MAIN run, then synthesize the results before advancing.
 
 ## Pipeline
 
@@ -50,7 +49,7 @@ Before designing anything, read and synthesize:
 **If `design/ux/interaction-patterns.md` does not exist**, surface the gap immediately:
 > "interaction-patterns.md does not exist — no existing patterns to reuse."
 
-Then use `AskUserQuestion` with options:
+Then ask the user with options:
 - (a) Run `/ux-design patterns` first to establish the pattern library, then continue
 - (b) Proceed without the pattern library — ui-programmer will treat all patterns created as new and add each to a new `design/ux/interaction-patterns.md` at completion
 
@@ -60,7 +59,7 @@ Summarize the context in a brief for the ux-designer: what the player is doing, 
 
 ### Phase 1b: UX Spec Authoring
 
-Invoke `/ux-design [feature name]` skill OR delegate directly to ux-designer to produce `design/ux/[feature-name].md` following the `ux-spec.md` template.
+Invoke `/ux-design [feature name]` skill OR apply the ux-designer profile to produce `design/ux/[feature-name].md` following the `ux-spec.md` template.
 
 If designing the HUD, use the `hud-design.md` template instead of `ux-spec.md`.
 
@@ -74,11 +73,11 @@ Output: `design/ux/[feature-name].md` with all required spec sections filled.
 
 After the spec is complete, invoke `/ux-review design/ux/[feature-name].md`.
 
-**Gate**: Do not proceed to Phase 2 until the verdict is APPROVED. If the verdict is NEEDS REVISION, the ux-designer must address the flagged issues and re-run the review. The user may explicitly accept a NEEDS REVISION risk and proceed, but this must be a conscious decision — present the specific concerns via `AskUserQuestion` before asking whether to proceed.
+**Gate**: Do not proceed to Phase 2 until the verdict is APPROVED. If the verdict is NEEDS REVISION, the ux-designer must address the flagged issues and re-run the review. The user may explicitly accept a NEEDS REVISION risk and proceed, but this must be a conscious decision — present the specific concerns in one flat `<user_options>` block before asking whether to proceed.
 
 ### Phase 2: Visual Design
 
-Delegate to **art-director**:
+Apply the **art-director** profile:
 - Review the full UX spec (flows, wireframes, interaction patterns, accessibility notes) — not just the wireframe images
 - Apply visual treatment from the art bible: colors, typography, spacing, animation style
 - Check that visual design preserves accessibility compliance: verify color contrast ratios, and confirm color is never the only indicator of state (shape, text, or icon must reinforce it)
@@ -88,7 +87,7 @@ Delegate to **art-director**:
 
 ### Phase 3: Implementation
 
-Before implementation begins, spawn the **engine UI specialist** (from `.claude/docs/technical-preferences.md` Engine Specialists → UI Specialist) to review the UX spec and visual design spec for engine-specific implementation guidance:
+Before implementation begins, apply the **engine UI specialist** (from `.protocols/game-studio/docs/technical-preferences.md` Engine Specialists → UI Specialist) to review the UX spec and visual design spec for engine-specific implementation guidance:
 - Which engine UI framework should be used for this screen? (e.g., UI Toolkit vs UGUI in Unity, Control nodes vs CanvasLayer in Godot, UMG vs CommonUI in Unreal)
 - Any engine-specific gotchas for the proposed layout or interaction patterns?
 - Recommended widget/node structure for the engine?
@@ -96,7 +95,7 @@ Before implementation begins, spawn the **engine UI specialist** (from `.claude/
 
 If no engine is configured, skip this step.
 
-Delegate to **ui-programmer**:
+Apply the **ui-programmer** profile:
 - Implement the UI following the UX spec and visual design spec
 - **Use patterns from `design/ux/interaction-patterns.md`** — do not reinvent patterns that are already specified. If a pattern almost fits but needs modification, note the deviation and flag it for ux-designer review.
 - **UI NEVER owns or modifies game state** — display only; emit events for all player actions
@@ -109,7 +108,7 @@ Delegate to **ui-programmer**:
 
 ### Phase 4: Review (parallel)
 
-Delegate in parallel:
+Apply these specialist profiles as separate review passes:
 - **ux-designer**: Verify implementation matches wireframes and interaction spec. Test keyboard-only and gamepad-only navigation. Check accessibility features function correctly.
 - **art-director**: Verify visual consistency with art bible. Check at minimum and maximum supported resolutions.
 - **accessibility-specialist**: Verify compliance against the committed accessibility tier documented in `design/accessibility-requirements.md`. Flag any violations as blockers.
@@ -134,15 +133,15 @@ All three review streams must report before proceeding to Phase 5.
 
 ## Error Recovery Protocol
 
-If any spawned agent (via Task) returns BLOCKED, errors, or cannot complete:
+If a specialist review identifies a blocker or cannot produce a verdict:
 
-1. **Surface immediately**: Report "[AgentName]: BLOCKED — [reason]" to the user before continuing to dependent phases
-2. **Assess dependencies**: Check whether the blocked agent's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
-3. **Offer options** via AskUserQuestion with choices:
-   - Skip this agent and note the gap in the final report
+1. **Surface immediately**: Report "[SpecialistProfile]: BLOCKED — [reason]" to the user before continuing to dependent phases
+2. **Assess dependencies**: Check whether the blocked review's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
+3. **Offer options** in one flat `<user_options>` block:
+   - Skip this review pass and note the gap in the final report
    - Retry with narrower scope
    - Stop here and resolve the blocker first
-4. **Always produce a partial report** — output whatever was completed. Never discard work because one agent blocked.
+4. **Always produce a partial report** — output whatever was completed. Never discard work because one review pass identifies a blocker.
 
 Common blockers:
 - Input file missing (story not found, GDD absent) → redirect to the skill that creates it
@@ -152,9 +151,7 @@ Common blockers:
 
 ## File Write Protocol
 
-All file writes (UX specs, interaction pattern library updates, implementation files) are
-delegated to sub-agents and sub-skills (`/ux-design`, `ui-programmer`). Each enforces the
-"May I write to [path]?" protocol. This orchestrator does not write files directly.
+The current MAIN run owns all file writes (UX specs, interaction pattern library updates, implementation files). Specialist review passes only produce analysis and verdicts. Before each write, the main run lists the target path and requests approval.
 
 ## Output
 

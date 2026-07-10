@@ -58,7 +58,7 @@ const {
   filterPlanToolNamesForRuntimePhase,
   resolvePlanNoActionRecovery,
   resolvePlanSuppressedToolRecovery,
-  shouldRedirectPlanToolsAfterReadOnlyConvergence,
+  shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence,
   shouldSuppressPlanTruncationWarning,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
 
@@ -117,7 +117,7 @@ test("plan runtime phases scope the tool surface", () => {
 });
 
 test("needs_rewrite closes the tool surface before the old convergence prompt", () => {
-  assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
+  assert.equal(shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence({
     workflowMode: "plan",
     isPlanApproved: false,
     convergencePromptAlreadyUsed: false,
@@ -136,7 +136,7 @@ test("needs_rewrite closes the tool surface before the old convergence prompt", 
 });
 
 test("needs_evidence reopens read-only tools after convergence", () => {
-  assert.equal(shouldRedirectPlanToolsAfterReadOnlyConvergence({
+  assert.equal(shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence({
     workflowMode: "plan",
     isPlanApproved: false,
     convergencePromptAlreadyUsed: true,

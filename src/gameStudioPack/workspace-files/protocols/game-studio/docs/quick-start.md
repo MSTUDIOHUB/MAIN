@@ -2,7 +2,7 @@
 
 ## What Is This?
 
-This is a complete Claude Code agent architecture for game development. It
+This is a complete MAIN agent architecture for game development. It
 organizes 48 specialized AI agents into a studio hierarchy that mirrors
 real game development teams, with defined responsibilities, delegation
 rules, and coordination protocols. It includes engine-specialist agents
@@ -17,16 +17,16 @@ Flow State, Bartle Player Types). Use whichever engine set matches your project.
 
 There are three tiers of agents:
 
-- **Tier 1 (Opus)**: Directors who make high-level decisions
+- **Leadership profiles**: Directors who make high-level decisions
   - `creative-director` -- vision and creative conflict resolution
   - `technical-director` -- architecture and technology decisions
   - `producer` -- scheduling, coordination, and risk management
 
-- **Tier 2 (Sonnet)**: Department leads who own their domain
+- **Department lead profiles**: Department leads who own their domain
   - `game-designer`, `lead-programmer`, `art-director`, `audio-director`,
     `narrative-director`, `qa-lead`, `release-manager`, `localization-lead`
 
-- **Tier 3 (Sonnet/Haiku)**: Specialists who execute within their domain
+- **Specialist profiles**: Specialists who execute within their domain
   - Designers, programmers, artists, writers, testers, engineers
 
 ### 2. Pick the Right Agent for the Job
@@ -145,7 +145,7 @@ Ask yourself: "What department would handle this in a real studio?"
 
 ### 4. Use Templates for New Documents
 
-Templates are in `.claude/docs/templates/`:
+Templates are in `.MAIN/templates/game-studio/`:
 
 - `game-design-document.md` -- for new mechanics and systems
 - `architecture-decision-record.md` -- for technical decisions
@@ -182,7 +182,7 @@ Templates are in `.claude/docs/templates/`:
 - `difficulty-curve.md` -- for difficulty axes, onboarding ramp, and cross-system interactions
 - `test-evidence.md` -- template for recording manual test evidence (screenshots, walkthrough notes)
 
-Also in `.claude/docs/templates/collaborative-protocols/` (used by agents, not typically edited directly):
+Also in `.protocols/game-studio/docs/templates/collaborative-protocols/` (used by specialist profiles, not typically edited directly):
 
 - `design-agent-protocol.md` -- question-options-draft-approval cycle for design agents
 - `implementation-agent-protocol.md` -- story pickup through /story-done cycle for programming agents
@@ -210,8 +210,8 @@ If you already know what you need, jump directly to the relevant path:
    - Generates 3 concepts, helps you pick one, defines core loop and pillars
    - Produces a game concept document and recommends an engine
 2. **Set up the engine** — Run `/setup-engine` (uses the brainstorm recommendation)
-   - Configures CLAUDE.md, detects knowledge gaps, populates reference docs
-   - Creates `.claude/docs/technical-preferences.md` with naming conventions,
+   - Configures AGENTS.md, detects knowledge gaps, populates reference docs
+   - Creates `.protocols/game-studio/docs/technical-preferences.md` with naming conventions,
      performance budgets, and engine-specific defaults
    - If the engine version is newer than the LLM's training data, it fetches
      current docs from the web so agents suggest correct APIs
@@ -230,7 +230,7 @@ If you already have a game concept and engine choice:
 
 1. **Set up the engine** — Run `/setup-engine [engine] [version]`
    (e.g., `/setup-engine godot 4.6`) — also creates technical preferences
-2. **Write the Game Pillars** — delegate to `creative-director`
+2. **Write the Game Pillars** — route through `creative-director`
 3. **Decompose into systems** — Run `/map-systems` to enumerate systems and dependencies
 4. **Design each system** — Run `/design-system [system-name]` for GDDs in dependency order
 5. **Create the initial ADR** — Run `/architecture-decision`
@@ -263,22 +263,22 @@ If you have design docs, prototypes, or code already:
 ## File Structure Reference
 
 ```
-CLAUDE.md                          -- Master config (read this first, ~60 lines)
-.claude/
-  settings.json                    -- Claude Code hooks and project settings
-  agents/                          -- 48 agent definitions (YAML frontmatter)
-  skills/                          -- 68 slash command definitions (YAML frontmatter)
-  hooks/                           -- 12 hook scripts (.sh) wired by settings.json
-  rules/                           -- 11 path-specific rule files
+.protocols/game-studio/
+  commands/                        -- 72 slash workflow command documents
+  agents/                          -- 49 specialist profile documents
   docs/
     quick-start.md                 -- This file
     technical-preferences.md       -- Project-specific standards (populated by /setup-engine)
-    coding-standards.md            -- Coding and design doc standards
     coordination-rules.md          -- Agent coordination rules
     context-management.md          -- Context budgets and compaction instructions
     directory-structure.md         -- Project directory layout
     workflow-catalog.yaml          -- 7-phase pipeline definition (read by /help)
-    setup-requirements.md          -- System prerequisites (Git Bash, jq, Python)
-    settings-local-template.md     -- Personal settings.local.json guide
-    templates/                     -- 37 document templates
+    templates/                     -- Protocol reference templates
+.MAIN/
+  hooks.json                       -- MAIN hook configuration merged by initialization
+  game-studio/
+    studio.config.json             -- Engine, review mode, and sticky specialist state
+    hooks/                          -- 5 MAIN-compatible lifecycle hook scripts
+  rules/game-studio/               -- Path-scoped game project rules
+  templates/game-studio/           -- 35 reusable production templates
 ```

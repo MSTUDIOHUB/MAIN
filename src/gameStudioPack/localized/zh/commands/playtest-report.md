@@ -3,17 +3,16 @@ name: playtest-report
 description: "记录试玩观察、反馈、问题和可行动结论。"
 argument-hint: "[new|analyze path-to-notes] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Task, AskUserQuestion
 ---
 
 ## 阶段 1: Parse Arguments
 
-Resolve the review mode (once, store for all gate spawns this run):
+Resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern.
 
 Determine the mode:
 
@@ -116,12 +115,12 @@ Present the categorized list, then route:
 
 ## 阶段 3b: Creative Director Player Experience Review
 
-**Review mode check** — apply before spawning CD-PLAYTEST:
+**Review mode check** — resolve before running CD-PLAYTEST:
 - `solo` → skip. Note: "CD-PLAYTEST skipped — Solo mode." Proceed to Phase 4 (save the report).
 - `lean` → skip (not a PHASE-GATE). Note: "CD-PLAYTEST skipped — Lean mode." Proceed to Phase 4 (save the report).
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-After categorising findings, spawn `creative-director` via Task using gate **CD-PLAYTEST** (`.claude/docs/director-gates.md`).
+After categorising findings, apply `creative-director` as a specialist review with gate **CD-PLAYTEST** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: the structured report content, game pillars and core fantasy (from `design/gdd/game-concept.md`), the specific hypothesis being tested.
 

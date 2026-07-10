@@ -1,4 +1,4 @@
-import { resolveLegacyNexusModeKey, type NexusModeKey } from "./gameStudioCatalog";
+import { resolveLegacyNexusModeKey, type NexusModeKey } from "./gameStudio/catalog";
 
 export const MAIN_MODE_KEYS = ["main_mode", "game_studio", "image_studio"] as const;
 

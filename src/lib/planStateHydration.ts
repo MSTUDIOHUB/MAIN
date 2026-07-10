@@ -1,4 +1,4 @@
-import type { PendingSlashCommand, StudioWorkflowCommandSlug } from "./gameStudioCatalog";
+import type { PendingSlashCommand, StudioWorkflowCommandSlug } from "./gameStudio/catalog";
 import { looksLikeExistingPlanExecutionRequest } from "./runIntent";
 
 export type PlanStateHydrationReason =

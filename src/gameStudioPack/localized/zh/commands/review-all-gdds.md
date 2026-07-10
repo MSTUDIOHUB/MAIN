@@ -3,8 +3,6 @@ name: review-all-gdds
 description: "对全部 GDD 做整体一致性与完整性审查，找出冲突、遗漏和优先修订项。"
 argument-hint: "[focus: full | consistency | design-theory | since-last-review]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Bash, AskUserQuestion, Task
-model: opus
 ---
 
 # Review All GDDs
@@ -29,7 +27,7 @@ completeness. This skill reviews the *relationships* between all GDDs.
 
 **Argument modes:**
 
-**Focus:** `$ARGUMENTS[0]` (blank = `full`)
+**Focus:** `the first token after the slash command in the current user request` (blank = `full`)
 
 - **No argument / `full`**: Both consistency and design theory passes
 - **`consistency`**: Cross-GDD consistency checks only (faster)
@@ -42,11 +40,11 @@ completeness. This skill reviews the *relationships* between all GDDs.
 
 ### Phase 1a — L0: Summary Scan (fast, low tokens)
 
-Before reading any full document, use Grep to extract `## Summary` sections
+Before reading any full document, use grep_search to extract `## Summary` sections
 from all GDD files:
 
 ```
-Grep pattern="## Summary" glob="design/gdd/*.md" output_mode="content" -A 5
+`grep_search` pattern="## Summary" glob="design/gdd/*.md" output_mode="content" -A 5
 ```
 
 Display a manifest to the user:
@@ -98,12 +96,9 @@ If fewer than 2 system GDDs exist, stop:
 
 ---
 
-### Parallel Execution
+### Independent Review Passes
 
-Phase 2 (Consistency) and Phase 3 (Design Theory) are independent — they read
-the same GDD inputs but produce separate reports. Spawn both as parallel Task
-agents simultaneously rather than waiting for Phase 2 to complete before
-starting Phase 3. Collect both results before writing the combined report.
+Phase 2 (Consistency) and Phase 3 (Design Theory) read the same GDD inputs but produce separate reports. Complete each as a clearly separated review pass in the current MAIN run, then combine their findings.
 
 ---
 
@@ -396,7 +391,7 @@ Scan all GDDs and identify the 3–5 most important player-facing moments where
 multiple systems activate simultaneously. Look specifically for:
 
 - **Combat + Economy overlap**: killing enemies that drop resources, spending
-  resources during combat, death/respawn interacting with economy state
+  resources during combat, death/reapply interacting with economy state
 - **Progression + Difficulty overlap**: level-up triggering mid-fight, ability
   unlocks changing combat viability, difficulty scaling at progression milestones
 - **Narrative + Gameplay overlap**: dialogue choices locking/unlocking mechanics,
@@ -544,11 +539,11 @@ FAIL: One or more blocking issues must be resolved before architecture begins.
 
 ## 阶段 6: Write 报告 and Flag GDDs
 
-Use `AskUserQuestion` for write permission:
+Ask the user for write permission:
 - Prompt: "May I write this review to `design/gdd/gdd-cross-review-[date].md`?"
 - Options: `[A] Yes — write the report` / `[B] No — skip`
 
-If any GDDs are flagged for revision, use a second `AskUserQuestion`:
+If any GDDs are flagged for revision, use a second `<user_options>` block:
 - Prompt: "Should I update the systems index to mark these GDDs as needing revision? ([list of flagged GDDs])"
 - Options: `[A] Yes — update systems index` / `[B] No — leave as-is`
 - If yes: update each flagged GDD's Status field in systems-index.md to "Needs Revision".
@@ -575,7 +570,7 @@ Confirm in conversation: "Session state updated."
 
 ## 阶段 7: Handoff
 
-After all file writes are complete, use `AskUserQuestion` for a closing widget.
+After all file writes are complete, ask the user for a closing `<user_options>` block.
 
 Before building options, check project state:
 - Are there any Warning-level items that are simple edits (flagged with "30-second edit", "brief addition", or similar)? → offer inline quick-fix option
@@ -595,18 +590,18 @@ Build the option list dynamically — only include options that apply:
 
 Assign letters A, B, C… only to included options. Mark the most pipeline-advancing option as `(recommended)`.
 
-Never end the skill with plain text. Always close with this widget.
+Never end the skill with plain text. Always close with this `<user_options>` block.
 
 ---
 
 ## Error Recovery Protocol
 
-If any spawned agent returns BLOCKED, errors, or fails to complete:
+If a specialist review identifies a blocker or cannot produce a verdict:
 
 1. **Surface immediately**: 报告 "[AgentName]: BLOCKED — [reason]" before continuing
-2. **Assess dependencies**: If the blocked agent's output is required by a later phase, do not proceed past that phase without user input
-3. **Offer options** via AskUserQuestion with three choices:
-   - Skip this agent and note the gap in the final report
+2. **Assess dependencies**: If the blocked review's output is required by a later phase, do not proceed past that phase without user input
+3. **Offer options** in one flat `<user_options>` block:
+   - Skip this review pass and note the gap in the final report
    - Retry with narrower scope (fewer GDDs, single-system focus)
    - Stop here and resolve the blocker first
 4. **Always produce a partial report** — output whatever was completed so work is not lost

@@ -3,7 +3,6 @@ name: tech-debt
 description: "盘点技术债、风险热点和需要延后治理的问题清单。"
 argument-hint: "[scan|add|prioritize|report]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write
 ---
 
 ## 阶段 1: Parse Subcommand

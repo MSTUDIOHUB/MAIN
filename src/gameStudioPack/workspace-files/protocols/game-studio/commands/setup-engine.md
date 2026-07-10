@@ -1,9 +1,8 @@
 ---
 name: setup-engine
-description: "Configure the project's game engine and version. In MAIN, the runtime source of truth is .MAIN/game-studio/studio.config.json plus Game Studio technical preferences; CLAUDE.md/.claude updates are optional compatibility notes."
+description: "Configure the project's game engine and version. In MAIN, the runtime source of truth is .MAIN/game-studio/studio.config.json plus Game Studio technical preferences; AGENTS.md updates are optional compatibility notes."
 argument-hint: "[engine] | [engine version] | refresh | upgrade [old-version] [new-version] | no args for guided selection"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, WebSearch, WebFetch, Task, AskUserQuestion
 ---
 
 When this skill is invoked:
@@ -39,7 +38,7 @@ If no engine is specified, run an interactive engine selection process:
 
 ### If the user wants to pick without a concept, ask in this order:
 
-**Question 1 — Prior experience** (ask this first, always, via `AskUserQuestion`):
+**Question 1 — Prior experience** (ask this first, always, in one flat `<user_options>` block):
 - Prompt: "Have you worked in any of these engines before?"
 - Options: `Godot` / `Unity` / `Unreal Engine 5` / `Multiple — I'll explain` / `None of them`
 - If they pick a specific engine → recommend that engine. Prior experience outweighs all other factors. Confirm with them and skip the matrix.
@@ -47,7 +46,7 @@ If no engine is specified, run an interactive engine selection process:
 
 **Questions 2-6 — Decision matrix inputs** (only if no prior engine experience):
 
-**Question 2 — Target platform** (ask this second, always, via `AskUserQuestion` — platform eliminates or heavily weights engines before any other factor):
+**Question 2 — Target platform** (ask this second, always, in one flat `<user_options>` block — platform eliminates or heavily weights engines before any other factor):
 - Prompt: "What platforms are you targeting for this game?"
 - Options: `PC (Steam / Epic)` / `Mobile (iOS / Android)` / `Console` / `Web / Browser` / `Multiple platforms`
 - Platform rules that feed directly into the recommendation:
@@ -104,11 +103,11 @@ Do NOT use a simple scoring matrix that eliminates engines. Instead, reason thro
 2. Give a primary recommendation with honest reasoning
 3. Name the best alternative and when to choose it instead
 4. Explicitly state: "This is a starting point, not a verdict — you can always migrate engines, and many developers switch between projects."
-5. Use `AskUserQuestion` to confirm: "Does this recommendation feel right, or would you like to explore a different engine?"
+5. Ask the user to confirm: "Does this recommendation feel right, or would you like to explore a different engine?"
    - Options: `[Primary engine] (Recommended)` / `[Alternative engine]` / `[Third engine]` / `Explore further` / `Type something`
 
 **If the user picks "Explore further":**
-Use `AskUserQuestion` with concept-specific deep-dive topics. Always generate these options from the user's actual concept — do not use generic options. Always include at minimum:
+Ask the user with concept-specific deep-dive topics. Always generate these options from the user's actual concept — do not use generic options. Always include at minimum:
 - The primary engine's specific limitations for this concept (e.g., "How far can Godot 3D actually go for [genre]?")
 - The alternative engine's specific tradeoffs for this concept
 - Language choice impact on this concept's technical challenges
@@ -123,13 +122,13 @@ The user can select multiple topics. Answer each selected topic in depth before 
 Once the engine is chosen:
 
 - If version was provided, use it
-- If no version provided, use WebSearch to find the latest stable release:
+- If no version provided, use `web_search` to find the latest stable release:
   - Search: `"[engine] latest stable version [current year]"`
   - Confirm with the user: "The latest stable [engine] is [version]. Use this?"
 
 ---
 
-## 4. Update CLAUDE.md Technology Stack
+## 4. Update AGENTS.md Technology Stack
 
 ### Language Selection (Godot only)
 
@@ -143,12 +142,12 @@ If Godot was chosen, ask the user which language to use **before** showing the p
 >
 > Which will this project primarily use?"
 
-Record the choice. It determines the CLAUDE.md template, naming conventions, specialist routing, and which agent is spawned for code files throughout the project.
+Record the choice. It determines the AGENTS.md template, naming conventions, specialist routing, and which agent is applied for code files throughout the project.
 
 ---
 
-Read `CLAUDE.md` and show the user the proposed Technology Stack changes.
-Ask: "May I write these engine settings to `CLAUDE.md`?"
+Read `AGENTS.md` and show the user the proposed Technology Stack changes.
+Ask: "May I write these engine settings to `AGENTS.md`?"
 
 Wait for confirmation before making any edits.
 
@@ -176,7 +175,7 @@ Update the Technology Stack section, replacing the `[CHOOSE]` placeholders with 
 
 ## 5. Populate Technical Preferences
 
-After updating CLAUDE.md, create or update `.claude/docs/technical-preferences.md` with
+After updating AGENTS.md, create or update `.protocols/game-studio/docs/technical-preferences.md` with
 engine-appropriate defaults. Read the existing template first, then fill in:
 
 ### Engine & Language Section
@@ -235,7 +234,7 @@ Example filled section:
 ```
 
 ### Remaining Sections
-- **Performance Budgets**: Use `AskUserQuestion`:
+- **Performance Budgets**: Ask the user:
   - Prompt: "Should I set default performance budgets now, or leave them for later?"
   - Options: `[A] Set defaults now (60fps, 16.6ms frame budget, engine-appropriate draw call limit)` / `[B] Leave as [TO BE CONFIGURED] — I'll set these when I know my target hardware`
   - If [A]: populate with the suggested defaults. If [B]: leave as placeholder.
@@ -263,7 +262,7 @@ Also populate the `## Engine Specialists` section in `technical-preferences.md` 
 
 ### File Extension Routing
 
-| File Extension / Type | Specialist to Spawn |
+| File Extension / Type | Specialist to Apply |
 |-----------------------|---------------------|
 | Game code (.cs files) | unity-specialist |
 | Shader / material files (.shader, .shadergraph, .mat) | unity-shader-specialist |
@@ -285,7 +284,7 @@ Also populate the `## Engine Specialists` section in `technical-preferences.md` 
 
 ### File Extension Routing
 
-| File Extension / Type | Specialist to Spawn |
+| File Extension / Type | Specialist to Apply |
 |-----------------------|---------------------|
 | Game code (.cpp, .h files) | unreal-specialist |
 | Shader / material files (.usf, .ush, Material assets) | unreal-specialist |
@@ -391,9 +390,9 @@ Wait for confirmation before writing any files.
 
 ---
 
-## 8. Update CLAUDE.md Import
+## 8. Update AGENTS.md Import
 
-Ask: "May I update the `@` import in `CLAUDE.md` to point to the new engine reference?"
+Ask: "May I update the `@` import in `AGENTS.md` to point to the new engine reference?"
 
 Wait for confirmation, then update the `@` import under "Engine Version Reference" to point to the
 correct engine:
@@ -421,7 +420,7 @@ The section should instruct the agent to:
 1. Read `docs/engine-reference/<engine>/VERSION.md`
 2. Check deprecated APIs before suggesting code
 3. Check breaking changes for relevant version transitions
-4. Use WebSearch to verify uncertain APIs
+4. Use `web_search` to verify uncertain APIs
 
 ---
 
@@ -431,7 +430,7 @@ If invoked as `/setup-engine refresh`:
 
 1. Read the existing `docs/engine-reference/<engine>/VERSION.md` to get
    the current engine and version
-2. Use WebSearch to check for:
+2. Use `web_search` to check for:
    - New engine releases since last verification
    - Updated migration guides
    - Newly deprecated APIs
@@ -454,7 +453,7 @@ file.
 
 ### Step 2 — Fetch Migration Guide
 
-Use WebSearch and WebFetch to locate the official migration guide between
+Use web research to locate the official migration guide between
 `old-version` and `new-version`:
 
 - Search: `"[engine] [old-version] to [new-version] migration guide"`
@@ -470,7 +469,7 @@ any "must migrate" items.
 Scan `src/` for code that uses APIs known to be deprecated or changed in the
 target version:
 
-- Use Grep to search for deprecated API names extracted from the migration
+- Use grep_search to search for deprecated API names extracted from the migration
   guide (e.g., old function names, removed node types, changed property names)
 - List each file that matches, with the specific API reference found
 
@@ -557,7 +556,7 @@ Engine:          [name] [version]
 Language:        [GDScript | C# | GDScript + C# | C# | C++ + Blueprint]
 Knowledge Risk:  [LOW/MEDIUM/HIGH]
 Reference Docs:  [created/skipped]
-CLAUDE.md:       [updated]
+AGENTS.md:       [updated]
 Tech Prefs:      [created/updated]
 Agent Config:    [verified]
 
@@ -576,12 +575,12 @@ Verdict: **COMPLETE** — engine configured and reference docs populated.
 
 ## Guardrails
 
-- NEVER guess an engine version — always verify via WebSearch or user confirmation
+- NEVER guess an engine version — always verify via `web_search` or user confirmation
 - NEVER overwrite existing reference docs without asking — append or update
 - If reference docs already exist for a different engine, ask before replacing
-- Always show the user what you're about to change before making CLAUDE.md edits
-- If WebSearch returns ambiguous results, show the user and let them decide
-- When the user chose **GDScript**: copy the GDScript CLAUDE.md template from Appendix A1 exactly. NEVER add "C++ via GDExtension" to the Language field. GDScript projects may use GDExtension, but it is not a primary project language. The `godot-gdextension-specialist` in the routing table is available for when native extensions are needed — it does not make C++ a project language.
+- Always show the user what you're about to change before making AGENTS.md edits
+- If `web_search` returns ambiguous results, show the user and let them decide
+- When the user chose **GDScript**: copy the GDScript AGENTS.md template from Appendix A1 exactly. NEVER add "C++ via GDExtension" to the Language field. GDScript projects may use GDExtension, but it is not a primary project language. The `godot-gdextension-specialist` in the routing table is available for when native extensions are needed — it does not make C++ a project language.
 
 ---
 
@@ -591,7 +590,7 @@ All Godot-specific variants for language-dependent configuration. Referenced fro
 
 ---
 
-### A1. CLAUDE.md Technology Stack Templates
+### A1. AGENTS.md Technology Stack Templates
 
 **GDScript:**
 ```markdown
@@ -660,7 +659,7 @@ Use GDScript conventions for `.gd` files and C# conventions for `.cs` files. Mix
 
 ### File Extension Routing
 
-| File Extension / Type | Specialist to Spawn |
+| File Extension / Type | Specialist to Apply |
 |-----------------------|---------------------|
 | Game code (.gd files) | godot-gdscript-specialist |
 | Shader / material files (.gdshader, VisualShader) | godot-shader-specialist |
@@ -682,7 +681,7 @@ Use GDScript conventions for `.gd` files and C# conventions for `.cs` files. Mix
 
 ### File Extension Routing
 
-| File Extension / Type | Specialist to Spawn |
+| File Extension / Type | Specialist to Apply |
 |-----------------------|---------------------|
 | Game code (.cs files) | godot-csharp-specialist |
 | Shader / material files (.gdshader, VisualShader) | godot-shader-specialist |
@@ -706,7 +705,7 @@ Use GDScript conventions for `.gd` files and C# conventions for `.cs` files. Mix
 
 ### File Extension Routing
 
-| File Extension / Type | Specialist to Spawn |
+| File Extension / Type | Specialist to Apply |
 |-----------------------|---------------------|
 | Game code (.gd files) | godot-gdscript-specialist |
 | Game code (.cs files) | godot-csharp-specialist |

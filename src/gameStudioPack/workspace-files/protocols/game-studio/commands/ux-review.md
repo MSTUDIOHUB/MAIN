@@ -3,8 +3,6 @@ name: ux-review
 description: "Validates a UX spec, HUD design, or interaction pattern library for completeness, accessibility compliance, GDD alignment, and implementation readiness. Produces APPROVED / NEEDS REVISION / MAJOR REVISION NEEDED verdict with specific gaps."
 argument-hint: "[file-path or 'all' or 'hud' or 'patterns']"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
-agent: ux-designer
 ---
 
 ## Overview
@@ -46,7 +44,7 @@ full detail for each.
 
 Before validating any spec, load:
 
-1. **Input & Platform config**: Read `.claude/docs/technical-preferences.md` and
+1. **Input & Platform config**: Read `.protocols/game-studio/docs/technical-preferences.md` and
    extract `## Input & Platform`. This is the authoritative source for which input
    methods the game supports — use it to drive the Input Method Coverage checks in
    Phase 3A, not the spec's own header. If unconfigured, fall back to the spec header.

@@ -3,7 +3,6 @@ name: dev-story
 description: "Read a story file and implement it. Loads the full context (story, GDD requirement, ADR guidelines, control manifest), routes to the right programmer agent for the system and engine, implements the code and test, and confirms each acceptance criterion. The core implementation skill — run after /story-readiness, before /code-review and /story-done."
 argument-hint: "[story-path]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Bash, Task, AskUserQuestion
 ---
 
 # Dev Story
@@ -33,7 +32,7 @@ drives implementation to completion — including writing the test.
 
 **If no argument**: check `production/session-state/active.md` for the active
 story. If found, confirm: "Continuing work on [story title] — is that correct?"
-If not found, ask: "Which story are we implementing?" Glob
+If not found, ask: "Which story are we implementing?" `glob_search`
 `production/epics/**/*.md` and list stories with Status: Ready.
 
 ---
@@ -48,7 +47,7 @@ If not found, ask: "Which story are we implementing?" Glob
 | Governing ADR | path from story's ADR field | **STOP** — "ADR file [path] not found. Run `/architecture-decision` to create it, or correct the filename in the story's ADR field." |
 | Control manifest | `docs/architecture/control-manifest.md` | **WARN and continue** — "Control manifest not found — layer rules cannot be checked. Run `/create-control-manifest`." |
 
-If the TR registry or governing ADR is missing, set the story status to **BLOCKED** in the session state and do not spawn any programmer agent.
+If the TR registry or governing ADR is missing, set the story status to **BLOCKED** in the session state and do not apply any programmer agent.
 
 Read all of the following simultaneously — these are independent reads. Do not start implementation until all context is loaded:
 
@@ -83,31 +82,31 @@ Read `docs/architecture/control-manifest.md`. Extract the rules for this story's
 - Performance guardrails
 
 Check: does the story's embedded Manifest Version match the current manifest header date?
-If they differ, use `AskUserQuestion` before proceeding:
+If they differ, ask the user before proceeding:
 - Prompt: "Story was written against manifest v[story-date]. Current manifest is v[current-date]. New rules may apply. How do you want to proceed?"
 - Options:
   - `[A] Update story manifest version and implement with current rules (Recommended)`
   - `[B] Implement with old rules — I accept the risk of non-compliance`
   - `[C] Stop here — I want to review the manifest diff first`
 
-If [A]: edit the story file's `Manifest Version:` field to the current manifest date before spawning the programmer. Then read the manifest carefully for new rules.
+If [A]: edit the story file's `Manifest Version:` field to the current manifest date before applying the programmer. Then read the manifest carefully for new rules.
 If [B]: read the manifest carefully for new rules anyway, and note the version mismatch in the Phase 6 summary under "Deviations".
-If [C]: stop. Do not spawn any agent. Let the user review and re-run `/dev-story`.
+If [C]: stop. Do not apply any agent. Let the user review and re-run `/dev-story`.
 
 ### Dependency validation
 
 After extracting the **Dependencies** list from the story file, validate each:
 
-1. Glob `production/epics/**/*.md` to find each dependency story file.
+1. `glob_search` `production/epics/**/*.md` to find each dependency story file.
 2. Read its `Status:` field.
 3. If any dependency has Status other than `Complete` or `Done`:
-   - Use `AskUserQuestion`:
+   - Ask the user:
      - Prompt: "Story '[current story]' depends on '[dependency title]' which is currently [status], not Complete. How do you want to proceed?"
      - Options:
        - `[A] Proceed anyway — I accept the dependency risk`
        - `[B] Stop — I'll complete the dependency first`
        - `[C] The dependency is done but status wasn't updated — mark it Complete and continue`
-   - If [B]: set story status to **BLOCKED** in session state and stop. Do not spawn any programmer agent.
+   - If [B]: set story status to **BLOCKED** in session state and stop. Do not apply any programmer agent.
    - If [C]: ask "May I update [dependency path] Status to Complete?" before continuing.
    - If [A]: note in Phase 6 summary under "Deviations": "Implemented with incomplete dependency: [dependency title] — [status]."
 
@@ -116,7 +115,7 @@ If a dependency file cannot be found: warn "Dependency story not found: [path]. 
 ---
 
 ### Engine reference
-Read `.claude/docs/technical-preferences.md`:
+Read `.protocols/game-studio/docs/technical-preferences.md`:
 - `Engine:` value — determines which programmer agents to use
 - Naming conventions (class names, file names, signal/event names)
 - Performance budgets (frame budget, memory ceiling)
@@ -127,9 +126,9 @@ Read `.claude/docs/technical-preferences.md`:
 ## Phase 3: Route to the Right Programmer
 
 Based on the story's **Layer**, **Type**, and **system name**, determine which
-specialist to spawn via Task.
+specialist to apply using its specialist profile.
 
-**Config/Data stories — skip agent spawning entirely:**
+**Config/Data stories — skip agent applying entirely:**
 If the story's Type is `Config/Data`, no programmer agent or engine specialist is needed. Jump directly to Phase 4 (Config/Data note). The implementation is a data file edit — no routing table evaluation, no engine specialist.
 
 ### Primary agent routing table
@@ -144,10 +143,10 @@ If the story's Type is `Config/Data`, no programmer agent or engine specialist i
 | Core or Feature — networking, replication | `network-programmer` |
 | Config/Data — no code | No agent needed (see Phase 4 Config note) |
 
-### Engine specialist — always spawn as secondary for code stories
+### Engine specialist — always apply as secondary for code stories
 
-Read the `Engine Specialists` section of `.claude/docs/technical-preferences.md`
-to get the configured primary specialist. Spawn them alongside the primary agent
+Read the `Engine Specialists` section of `.protocols/game-studio/docs/technical-preferences.md`
+to get the configured primary specialist. Apply them alongside the primary agent
 when the story involves engine-specific APIs, patterns, or the ADR has HIGH
 engine risk.
 
@@ -157,7 +156,7 @@ engine risk.
 | Unity | `unity-specialist`, `unity-ui-specialist`, `unity-shader-specialist` |
 | Unreal Engine | `unreal-specialist`, `ue-gas-specialist`, `ue-blueprint-specialist`, `ue-umg-specialist`, `ue-replication-specialist` |
 
-**When engine risk is HIGH** (from the ADR or VERSION.md): always spawn the engine
+**When engine risk is HIGH** (from the ADR or VERSION.md): always apply the engine
 specialist, even for non-engine-facing stories. High risk means the ADR records
 assumptions about post-cutoff engine APIs that need expert verification.
 
@@ -165,7 +164,7 @@ assumptions about post-cutoff engine APIs that need expert verification.
 
 ## Phase 4: Implement
 
-Spawn the chosen programmer agent(s) via Task with the full context package:
+Apply the chosen programmer agent(s) using its specialist profile with the full context package:
 
 Provide the agent with:
 1. The complete story file content
@@ -192,7 +191,7 @@ changed from/to.
 
 ### Visual/Feel stories
 
-Spawn `gameplay-programmer` to implement the code/animation calls. Note that
+Apply `gameplay-programmer` to implement the code/animation calls. Note that
 Visual/Feel acceptance criteria cannot be auto-verified — the "does it feel right?"
 check happens in `/story-done` via manual confirmation.
 
@@ -276,15 +275,15 @@ Create `active.md` if it does not exist. Confirm: "Session state updated."
 
 ## Error Recovery Protocol
 
-If any spawned agent (via Task) returns BLOCKED, errors, or cannot complete:
+If a specialist review identifies a blocker or cannot produce a verdict:
 
 1. **Surface immediately**: Report "[AgentName]: BLOCKED — [reason]" to the user before continuing to dependent phases
-2. **Assess dependencies**: Check whether the blocked agent's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
-3. **Offer options** via AskUserQuestion with choices:
-   - Skip this agent and note the gap in the final report
+2. **Assess dependencies**: Check whether the blocked review's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
+3. **Offer options** in one flat `<user_options>` block:
+   - Skip this review pass and note the gap in the final report
    - Retry with narrower scope
    - Stop here and resolve the blocker first
-4. **Always produce a partial report** — output whatever was completed. Never discard work because one agent blocked.
+4. **Always produce a partial report** — output whatever was completed. Never discard work because one review pass identifies a blocker.
 
 Common blockers:
 - Input file missing (story not found, GDD absent) → redirect to the skill that creates it
@@ -295,7 +294,7 @@ Common blockers:
 
 ## Collaborative Protocol
 
-- **File writes are delegated** — all source code, test files, and evidence docs are written by sub-agents spawned via Task. Each sub-agent enforces the "May I write to [path]?" protocol individually. This orchestrator does not write files directly.
+- **File-write ownership** — the current MAIN run owns source, test, and evidence writes. Specialist review passes only produce analysis and verdicts; the main run requests approval for each target path before writing.
 - **Load before implementing** — do not start coding until all context is loaded
   (story, TR-ID, ADR, manifest, engine prefs). Incomplete context produces code
   that drifts from design.

@@ -3,10 +3,7 @@ name: help
 description: "分析当前已完成内容和你的问题，判断下一步该做什么；适合“我该做什么”“卡住了”“不知道下一步”。"
 argument-hint: "[可选：你刚完成的内容，例如 'finished design-review' 或 'stuck on ADRs']"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
-context: |
   !echo "=== Live Project State ===" && echo "Stage: $(cat production/stage.txt 2>/dev/null | tr -d '[:space:]' || echo 'not set')" && echo "Latest sprint: $(ls -t production/sprints/*.md 2>/dev/null | head -1 || echo 'none')" && echo "Session state: $(head -5 production/session-state/active.md 2>/dev/null || echo 'none')"
-model: haiku
 ---
 
 # Studio 帮助 — 下一步做什么？
@@ -19,13 +16,13 @@ model: haiku
 
 ## 步骤 1：读取目录
 
-读取 `.claude/docs/workflow-catalog.yaml`。这是所有阶段的权威清单，包含每个阶段的步骤顺序、必需/可选状态，以及用于判断完成情况的产物 glob。
+读取 `.protocols/game-studio/docs/workflow-catalog.yaml`。这是所有阶段的权威清单，包含每个阶段的步骤顺序、必需/可选状态，以及用于判断完成情况的产物 glob。
 
 ---
 
 ## 步骤 1b：查找未进入目录的技能
 
-读取目录后，使用 Glob 扫描 `.claude/skills/*/SKILL.md`，取得完整的已安装技能列表。对每个文件，提取 frontmatter 中的 `name:` 字段。
+读取目录后，使用 `glob_search` 扫描 `.protocols/game-studio/commands/*.md`，取得完整的已安装技能列表。对每个文件，提取 frontmatter 中的 `name:` 字段。
 
 将这些名称与目录中的 `command:` 值对比。任何没有出现在目录命令中的技能都是**未编入目录的技能**：它仍然可以使用，但不属于阶段门控工作流。
 
@@ -84,9 +81,9 @@ model: haiku
 
 如果步骤有 `artifact.glob`：
 
-- 使用 Glob 检查是否存在匹配文件
+- 使用 `glob_search` 检查是否存在匹配文件
 - 如果指定了 `min_count`，确认匹配数量不少于该值
-- 如果指定了 `artifact.pattern`，使用 Grep 确认匹配文件中存在该模式
+- 如果指定了 `artifact.pattern`，使用 `grep_search` 确认匹配文件中存在该模式
 - **完成** = 满足产物条件
 - **未完成** = 缺少产物或未找到模式
 

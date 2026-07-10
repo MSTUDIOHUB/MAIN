@@ -3,19 +3,16 @@ name: prototype
 description: "快速制作验证性原型，用最短路径验证核心玩法或关键机制。"
 argument-hint: "[concept-description] [--review full|lean|solo]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash, Task
-agent: prototyper
-isolation: worktree
 ---
 
 ## 阶段 1: Define the Question
 
-Resolve the review mode (once, store for all gate spawns this run):
+Resolve the review mode (once, store for all gate reviews this run):
 1. If `--review [full|lean|solo]` was passed → use that
 2. Else read `production/review-mode.txt` → use that value
 3. Else → default to `lean`
 
-See `.claude/docs/director-gates.md` for the full check pattern.
+See `.protocols/game-studio/docs/director-gates.md` for the full check pattern.
 
 Read the concept description from the argument. Identify the core question this prototype must answer. If the concept is vague, state the question explicitly before proceeding — a prototype without a clear question wastes time.
 
@@ -23,7 +20,7 @@ Read the concept description from the argument. Identify the core question this 
 
 ## 阶段 2: Load Project Context
 
-Read `CLAUDE.md` for project context and the current tech stack. Understand what engine, language, and frameworks are in use so the prototype is built with compatible tooling.
+Read `AGENTS.md` for project context and the current tech stack. Understand what engine, language, and frameworks are in use so the prototype is built with compatible tooling.
 
 ---
 
@@ -116,12 +113,12 @@ If yes, write the file.
 
 ## 阶段 6: Creative Director Review
 
-**Review mode check** — apply before spawning CD-PLAYTEST:
+**Review mode check** — resolve before running CD-PLAYTEST:
 - `solo` → skip. Note: "CD-PLAYTEST skipped — Solo mode." Proceed to Phase 7 summary with the prototyper's recommendation as the final verdict.
 - `lean` → skip (not a PHASE-GATE). Note: "CD-PLAYTEST skipped — Lean mode." Proceed to Phase 7 summary with the prototyper's recommendation as the final verdict.
-- `full` → spawn as normal.
+- `full` → apply as normal.
 
-Spawn `creative-director` via Task using gate **CD-PLAYTEST** (`.claude/docs/director-gates.md`).
+Apply `creative-director` as a specialist review with gate **CD-PLAYTEST** (`.protocols/game-studio/docs/director-gates.md`).
 
 Pass: the full REPORT.md content, the original design question, game pillars and core fantasy from `design/gdd/game-concept.md` (if it exists).
 

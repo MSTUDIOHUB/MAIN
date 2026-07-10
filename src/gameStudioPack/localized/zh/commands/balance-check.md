@@ -3,13 +3,11 @@ name: balance-check
 description: "分析数值、成长、资源或战斗平衡，发现异常和失衡点。"
 argument-hint: "[system-name|path-to-data-file]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep
-agent: economy-designer
 ---
 
 ## 阶段 1: Identify Balance Domain
 
-Determine the balance domain from `$ARGUMENTS[0]`:
+Determine the balance domain from `the first token after the slash command in the current user request`:
 
 - **Combat** → weapon/ability DPS, time-to-kill, damage type interactions
 - **Economy** → resource faucets/sinks, acquisition rates, item pricing

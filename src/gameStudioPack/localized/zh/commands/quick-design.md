@@ -3,7 +3,6 @@ name: quick-design
 description: "快速产出轻量设计草案，适合把一个想法先收敛成可讨论的方案。"
 argument-hint: "[brief description of the change]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit
 ---
 
 # Quick Design

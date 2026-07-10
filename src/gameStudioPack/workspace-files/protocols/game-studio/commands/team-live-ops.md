@@ -3,16 +3,15 @@ name: team-live-ops
 description: "Orchestrate the live-ops team for post-launch content planning: coordinates live-ops-designer, economy-designer, analytics-engineer, community-manager, writer, and narrative-director to design and plan a season, event, or live content update."
 argument-hint: "[season name or event description]"
 user-invocable: true
-allowed-tools: Read, Glob, Grep, Write, Edit, Bash, Task, AskUserQuestion, TodoWrite
 ---
 **Argument check:** If no season name or event description is provided, output:
 > "Usage: `/team-live-ops [season name or event description]` — Provide the name or description of the season or live event to plan."
-Then stop immediately without spawning any subagents or reading any files.
+Then stop immediately without applying any specialist reviews or reading any files.
 
 When this skill is invoked with a valid argument, orchestrate the live-ops team through a structured planning pipeline.
 
-**Decision Points:** At each phase transition, use `AskUserQuestion` to present
-the user with the subagent's proposals as selectable options. Write the agent's
+**Decision Points:** At each phase transition, present
+the specialist review's proposals as selectable options. Write the agent's
 full analysis in conversation, then capture the decision with concise labels.
 The user must approve before moving to the next phase.
 
@@ -24,22 +23,22 @@ The user must approve before moving to the next phase.
 - **narrative-director** — Seasonal narrative theme, story arc, world event framing
 - **writer** — Event descriptions, reward item names, seasonal flavor text, announcement copy
 
-## How to Delegate
+## How to Apply Specialist Profiles
 
-Use the Task tool to spawn each team member as a subagent:
-- `subagent_type: live-ops-designer` — Season/event structure and retention mechanics
-- `subagent_type: economy-designer` — Live economy balance and reward pricing
-- `subagent_type: analytics-engineer` — Success metrics, A/B tests, event instrumentation
-- `subagent_type: community-manager` — Player-facing communication and messaging
-- `subagent_type: narrative-director` — Seasonal theme and narrative framing
-- `subagent_type: writer` — All player-facing text: event descriptions, item names, copy
+Apply each listed specialist profile as a separate review pass in the current MAIN run:
+- `specialist profile: live-ops-designer` — Season/event structure and retention mechanics
+- `specialist profile: economy-designer` — Live economy balance and reward pricing
+- `specialist profile: analytics-engineer` — Success metrics, A/B tests, event instrumentation
+- `specialist profile: community-manager` — Player-facing communication and messaging
+- `specialist profile: narrative-director` — Seasonal theme and narrative framing
+- `specialist profile: writer` — All player-facing text: event descriptions, item names, copy
 
-Always provide full context in each agent's prompt (game concept path, existing season docs, ethics policy path, current economy state). Launch independent agents in parallel where the pipeline allows it (Phases 3 and 4 can run simultaneously).
+Always provide full context in each agent's prompt (game concept path, existing season docs, ethics policy path, current economy state). Apply each specialist profile as a separate review pass in the current MAIN run, then synthesize the results before advancing.
 
 ## Pipeline
 
 ### Phase 1: Season/Event Scoping
-Delegate to **live-ops-designer**:
+Apply the **live-ops-designer** profile:
 - Define the season or event: type (seasonal, limited-time event, challenge), duration, theme direction
 - Outline the content list: what's new (modes, items, challenges, story beats)
 - Define the retention hook: what brings players back daily/weekly during this season
@@ -47,7 +46,7 @@ Delegate to **live-ops-designer**:
 - Output: season brief with scope, content list, and retention mechanic overview
 
 ### Phase 2: Narrative Theme
-Delegate to **narrative-director**:
+Apply the **narrative-director** profile:
 - Read the season brief from Phase 1
 - Design the seasonal narrative theme: how does this event connect to the game world?
 - Define the central story hook players will discover during the event
@@ -55,7 +54,7 @@ Delegate to **narrative-director**:
 - Output: narrative framing document (theme, story hook, lore connections)
 
 ### Phase 3: Economy Design (parallel with Phase 2 if theme is clear)
-Delegate to **economy-designer**:
+Apply the **economy-designer** profile:
 - Read the season brief and existing economy rules from `design/live-ops/economy-rules.md`
 - Design the reward track: free tier progression, premium tier value proposition
 - Plan the in-season economy: seasonal currency, store rotation, pricing
@@ -64,7 +63,7 @@ Delegate to **economy-designer**:
 - Output: economy design doc with reward tables, pricing, and currency flow
 
 ### Phase 4: Analytics and Success Metrics (parallel with Phase 3)
-Delegate to **analytics-engineer**:
+Apply the **analytics-engineer** profile:
 - Read the season brief
 - Define success metrics: participation rate target, retention lift target, battle pass completion rate
 - Design any A/B tests to run during the season (e.g., different reward cadences)
@@ -72,13 +71,13 @@ Delegate to **analytics-engineer**:
 - Output: analytics plan with success criteria and instrumentation requirements
 
 ### Phase 5: Content Writing (parallel)
-Delegate in parallel:
+Apply these specialist profiles as separate review passes:
 - **narrative-director** (if needed): Write any in-game narrative text (cutscene scripts, NPC dialogue, world event descriptions) for the season
 - **writer**: Write all player-facing text — event names, reward item descriptions, challenge objective text, seasonal flavor text
 - Both should read the narrative framing doc from Phase 2
 
 ### Phase 6: Player Communication Plan
-Delegate to **community-manager**:
+Apply the **community-manager** profile:
 - Read the season brief, economy design, and narrative framing
 - Draft the season launch announcement (tone, key highlights, platform-specific versions)
 - Plan the communication cadence: pre-launch teaser, launch day post, mid-season reminder, final week FOMO push
@@ -100,7 +99,7 @@ Present a summary to the user with:
 - **Analytics readiness**: are success criteria defined and instrumented?
 - **Ethics review**: check the Phase 3 economy design against `design/live-ops/ethics-policy.md`
   - If the file does not exist: flag "ETHICS REVIEW SKIPPED: `design/live-ops/ethics-policy.md` not found. Economy design was not reviewed against an ethics policy. Recommend creating one before production begins." Include this flag in the season design output document. Add to next steps: create `design/live-ops/ethics-policy.md`.
-  - If the file exists and a violation is found: flag "ETHICS FLAG: [element] in Phase 3 economy design violates [policy rule]. Approval is blocked until this is resolved." Do NOT issue a COMPLETE verdict or write output documents. Use `AskUserQuestion` with options: revise economy design / override with documented rationale / cancel. If user chooses to revise: re-spawn economy-designer to produce a corrected design, then return to Phase 7 review.
+  - If the file exists and a violation is found: flag "ETHICS FLAG: [element] in Phase 3 economy design violates [policy rule]. Approval is blocked until this is resolved." Do NOT issue a COMPLETE verdict or write output documents. Ask the user with options: revise economy design / override with documented rationale / cancel. If user chooses to revise: re-apply economy-designer to produce a corrected design, then return to Phase 7 review.
 - **Open questions**: decisions still needed before production begins
 
 Ask the user to approve the season plan before delegating to production teams. Issue the COMPLETE verdict only after the user approves and no unresolved ethics violations remain. If an ethics violation is unresolved, end with Verdict: **BLOCKED**.
@@ -114,23 +113,21 @@ All documents save to `design/live-ops/`:
 
 ## Error Recovery Protocol
 
-If any spawned agent (via Task) returns BLOCKED, errors, or cannot complete:
+If a specialist review identifies a blocker or cannot produce a verdict:
 
-1. **Surface immediately**: Report "[AgentName]: BLOCKED — [reason]" to the user before continuing to dependent phases
-2. **Assess dependencies**: Check whether the blocked agent's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
-3. **Offer options** via AskUserQuestion with choices:
-   - Skip this agent and note the gap in the final report
+1. **Surface immediately**: Report "[SpecialistProfile]: BLOCKED — [reason]" to the user before continuing to dependent phases
+2. **Assess dependencies**: Check whether the blocked review's output is required by subsequent phases. If yes, do not proceed past that dependency point without user input.
+3. **Offer options** in one flat `<user_options>` block:
+   - Skip this review pass and note the gap in the final report
    - Retry with narrower scope
    - Stop here and resolve the blocker first
-4. **Always produce a partial report** — output whatever was completed. Never discard work because one agent blocked.
+4. **Always produce a partial report** — output whatever was completed. Never discard work because one review pass identifies a blocker.
 
 If a BLOCKED state is unresolvable, end with Verdict: **BLOCKED** instead of COMPLETE.
 
 ## File Write Protocol
 
-All file writes (season design docs, analytics plans, communication calendars) are
-delegated to sub-agents spawned via Task. Each sub-agent enforces the
-"May I write to [path]?" protocol. This orchestrator does not write files directly.
+The current MAIN run owns all file writes (season design docs, analytics plans, communication calendars). Specialist review passes only produce analysis and verdicts. Before each write, the main run lists the target path and requests approval.
 
 ## Output
 
