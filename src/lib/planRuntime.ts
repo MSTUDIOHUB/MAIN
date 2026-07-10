@@ -184,7 +184,10 @@ export function resolvePlanSuppressedToolRecovery(input: {
   if (input.workflowMode !== "plan" || input.isPlanApproved) {
     return { action: "ignore", reason: "not_unapproved_plan" };
   }
-  if (input.targetedRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
+  const maxRecoveryPasses = hasReadyPlanEvidence(input.evidenceReadiness)
+    ? MAX_PLAN_REASONING_ONLY_READY_RECOVERY_PASSES
+    : MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+  if (input.targetedRecoveryPasses < maxRecoveryPasses) {
     return {
       action: "targeted_evidence",
       reason: hasReadyPlanEvidence(input.evidenceReadiness)

@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   resolveMissingToolCallRepromptKind,
   buildMissingToolCallContinuationPrompt,
+  buildTruncatedPlanContinuationPrompt,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/missingToolCallReprompt.ts"));
 
 const {
@@ -211,6 +212,16 @@ test("second missing-tool retry uses strict single-tool-call wording", () => {
   assert.match(prompt, /write_file/);
 });
 
+test("truncated plan recovery asks for concise evidence-grounded closure without another approval", () => {
+  const prompt = buildTruncatedPlanContinuationPrompt("zh");
+
+  assert.match(prompt, /PLAN_TRUNCATION_RECOVERY/);
+  assert.match(prompt, /不超过 1200 个中文字符/);
+  assert.match(prompt, /已确认证据/);
+  assert.match(prompt, /不要输出 `<user_options>`/);
+  assert.match(prompt, /独立的 Plan 审批区/);
+});
+
 test("edit mode uses post-write verification reprompt after a recent project write", () => {
   const kind = resolveMissingToolCallRepromptKind({
     workflowMode: "edit",
@@ -273,6 +284,23 @@ test("missing-tool no-tool recovery reprompts generic execute prose", () => {
   assert.match(harness.appended[0].content, /立即用工具继续执行/);
   assert.match(harness.appended[0].content, /<tool_use>/);
   assert.equal(harness.stops.length, 0);
+});
+
+test("missing-tool no-tool recovery uses plan closure prompt after truncation", () => {
+  const harness = createMissingToolNoToolHarness("zh");
+  const result = handleMissingToolNoToolRecovery(createMissingToolNoToolInput(harness, {
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    wasTruncated: true,
+    normalizedFinishReason: "length",
+    visibleText: "# 部分计划\n\n已经输出了一部分方案。",
+    visibleFallbackText: "# 部分计划\n\n已经输出了一部分方案。",
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.match(harness.appended[0].content, /PLAN_TRUNCATION_RECOVERY/);
+  assert.doesNotMatch(harness.appended[0].content, /立即输出工具调用/);
 });
 
 test("missing-tool no-tool recovery switches to post-write verification after project writes", () => {

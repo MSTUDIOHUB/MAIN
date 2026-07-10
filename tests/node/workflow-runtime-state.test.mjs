@@ -58,9 +58,16 @@ test("chat rendering keeps substantive intermediate conclusions out of process a
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
 
   assert.match(source, /hasSubstantiveIntermediateAgentText/);
-  assert.match(source, /isSubstantiveModelFeedback\(content\)/);
+  assert.match(source, /shouldRetainStageSummary\(content\)/);
   assert.match(source, /!hasSubstantiveIntermediateAgentText/);
-  assert.match(source, /阶段性\|结论\|总结\|问题\|原因\|根因\|修复\|方案\|验证/);
+  assert.doesNotMatch(source, /if \(isTransparentToolNarrationBlock\(block\)\) return false;/);
+});
+
+test("completed useful thought summaries remain visible after streaming ends", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
+
+  assert.match(source, /latestThoughtBlock\.isStreaming \|\| shouldRetainStageSummary\(summary\)/);
+  assert.match(source, /processTextsOverlap\(finalAgentSummaryText, summary\)/);
 });
 
 test("onStreamDone preserves abortController when agentStatus is pending_review", () => {
@@ -246,9 +253,13 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(assistantStreamPostProcessingPhaseSource, /applyReasoningNoToolPlanRuntimeState\(/);
   assert.match(assistantCompletionPhaseSource, /applyPlanNoToolRuntimeState\(/);
   assert.match(assistantOutputPhaseSource, /applyPlanPostConvergenceRuntimeState\(/);
+  assert.match(assistantOutputPhaseSource, /setPlanRuntimePhaseAndSync/);
+  assert.match(assistantOutputPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
   assert.match(toolCallExecutionPhaseSource, /applyToolResultPlanRuntimeState\(/);
   assert.match(toolResultRecoveryPhaseSource, /applyPlanQualityRuntimeState\(/);
   assert.match(toolResultRecoveryPhaseSource, /applyPlanReadOnlyConvergenceRuntimeState\(/);
+  assert.match(toolResultRecoveryPhaseSource, /setPlanRuntimePhaseAndSync/);
+  assert.match(toolResultRecoveryPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
   assert.match(assistantOutputPhaseSource, /markPlanModeToolActivity\(planRuntimeState\)/);
   assert.match(planReviewRuntimeSource, /markPlanClosurePromptIssued\(planRuntimeState\)/);
   assert.match(toolCallExecutionPhaseSource, /resetPlanRecoveryPromptRuntimeState\(/);

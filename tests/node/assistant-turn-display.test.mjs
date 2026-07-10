@@ -166,3 +166,32 @@ test("assistant turn display routes premature unapproved plan options into the a
   assert.equal(decision.finalReplyOptions.length, 0);
   assert.match(decision.finalVisibleText, /Implementation Plan/);
 });
+
+test("assistant turn display hides model-authored approval options once a structured plan is reviewable", () => {
+  const decision = resolveDecision({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    isPlanApproved: false,
+    planStage: "idle",
+    streamText: "<proposed_plan># Plan\n\n## Summary\nA reviewable plan backed by the inspected event flow.\n\n## Key Changes\n- Align the event names.\n- Add regression coverage.</proposed_plan>",
+    normalizedVisibleText: "# Plan\n\n## Summary\nA reviewable plan backed by the inspected event flow.\n\n## Key Changes\n- Align the event names.\n- Add regression coverage.",
+    normalizedReplyOptions: [
+      {
+        label: "Approve execution",
+        value: "approve",
+        action: "approve_operation_once",
+        source: "proposal_follow_up",
+      },
+      {
+        label: "Adjust plan",
+        value: "adjust",
+        action: "adjust_plan",
+        source: "proposal_follow_up",
+      },
+    ],
+  });
+
+  assert.equal(decision.hasStructuredProposal, true);
+  assert.equal(decision.planReplyOptionsRoutedToArtifact, true);
+  assert.equal(decision.finalReplyOptions.length, 0);
+});

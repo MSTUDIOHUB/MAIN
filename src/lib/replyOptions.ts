@@ -36,6 +36,8 @@ const OPTIONAL_PLAN_CONTEXT_OPTION_RE = /(?:提供|补充|告诉|输入|粘贴|�
 const PREMATURE_PLAN_ARTIFACT_TEXT_RE = /(?:#\s*Proposed Plan|Proposed Plan|核心问题诊断|根源分析|执行路线图|修复方案|实现方案|实施方案|重构方案|拟定方案|实施步骤|执行步骤|阶段\s*\d|影响文件|验证方式|Data Integrity|Dark Mode Refactor|Implementation Plan|Execution Plan|Root Cause|Validation)/i;
 const BLOCKING_PLAN_DECISION_TEXT_RE = /(?:真正阻塞|阻塞问题|必须(?:由)?用户(?:确认|选择|拍板)|需要用户(?:确认|选择|拍板)|缺少关键(?:业务|产品|设计|范围|验收)选择|请确认以下关键点|before (?:I|we) can (?:write|finalize|proceed)|blocking question|blocking decision|need you to choose|must choose)/i;
 const PLAN_ROUTE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|优先|同时|并行|全部|两个|两项|仅|只|先|直接|继续|开始|完整|最小|MVP|修复|修改|实现|重构|完善|执行|落地|proceed|continue|start|fix|modify|implement|refactor|execute|both|parallel|all|mvp)/i;
+const GENERIC_PROPOSAL_ADJUSTMENT_RE = /^(?:请)?(?:先|再|继续)?(?:调整|修改|完善|优化)(?:一下)?(?:上面|上述|当前|本轮)?(?:的)?(?:方案|计划)(?:，|,)?(?:(?:暂不|先不|不要)(?:开始)?(?:执行|真实操作)|不进入执行)?[。.!！]*$|^(?:keep|continue)?\s*(?:adjusting|refining|revising|improving|adjust|refine|revise|improve)\s+(?:the\s+)?(?:current\s+|above\s+|this\s+)?(?:plan|proposal)(?:\s+first|\s+without\s+executing)?[.!]*$/i;
+const GENERIC_PROPOSAL_CANCEL_RE = /^(?:请)?(?:取消|停止|结束|中止)(?:上面|上述|当前|本轮)?(?:的)?(?:执行)?(?:操作|方案|计划|执行)?(?:，|,)?(?:本轮)?(?:到此为止|结束)?[。.!！]*$|^(?:cancel|stop|end|abort)(?:\s+(?:the|this|current|above))?(?:\s+(?:operation|execution|plan|proposal|turn))?[.!]*$/i;
 
 const OPEN_ENDED_QUESTION_RE = /(?:哪个|什么|哪里|怎么|为什么|为何|怎样|如何|\b(?:what|which|where|why|how|who)\b)/i;
 
@@ -220,6 +222,46 @@ function inferReplyOptionAction(label: string, value: string): ReplyOption["acti
 
 export function inferReplyOptionActionFromText(text: string): ReplyOption["action"] | undefined {
   return inferReplyOptionAction(text, text);
+}
+
+export function isOperationProposalApprovalOption(option: ReplyOption): boolean {
+  const combined = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+  return option.action === "approve_operation_once" || OPERATION_APPROVAL_REPLY_RE.test(combined);
+}
+
+export function simplifyOperationProposalReplyOptions(replyOptions: ReplyOption[]): ReplyOption[] {
+  if (!Array.isArray(replyOptions) || replyOptions.length === 0) return [];
+  if (!replyOptions.some((option) => isOperationProposalApprovalOption(option))) return replyOptions;
+
+  return replyOptions.filter((option) => {
+    const values = [option.label, option.value]
+      .map((value) => normalizeOptionText(value || ""))
+      .filter(Boolean);
+    if (
+      (!option.action || option.action === "adjust_plan") &&
+      values.some((value) => GENERIC_PROPOSAL_ADJUSTMENT_RE.test(value))
+    ) {
+      return false;
+    }
+    if (
+      (!option.action || option.action === "cancel_operation") &&
+      values.some((value) => GENERIC_PROPOSAL_CANCEL_RE.test(value))
+    ) {
+      return false;
+    }
+    return true;
+  });
+}
+
+export function resolveCustomReplyOptionAction(
+  text: string,
+  replyOptions: ReplyOption[],
+): ReplyOption["action"] | undefined {
+  const inferredAction = inferReplyOptionActionFromText(text);
+  if (inferredAction) return inferredAction;
+  return replyOptions.some((option) => isOperationProposalApprovalOption(option))
+    ? "adjust_plan"
+    : undefined;
 }
 
 function convertAssistantClauseToUserChoice(clause: string): string {
@@ -427,22 +469,6 @@ function inferProposalFollowUpOptions(
     "approve_operation_once",
     "proposal_follow_up",
   );
-  addReplyOption(
-    replyOptions,
-    seenValues,
-    "继续调整方案",
-    "请继续调整上面的方案，暂不执行真实操作。",
-    "adjust_plan",
-    "proposal_follow_up",
-  );
-  addReplyOption(
-    replyOptions,
-    seenValues,
-    "取消操作",
-    "取消上面的执行操作，本轮到此为止。",
-    "cancel_operation",
-    "operation_approval",
-  );
 }
 
 export function hasReadOnlyPermissionReplyOptions(replyOptions: ReplyOption[]): boolean {
@@ -504,9 +530,12 @@ export function shouldRouteUnapprovedPlanReplyOptionsToArtifact(params: {
   } = params;
 
   if (workflowMode !== "plan" || isPlanApproved) return false;
-  if (hasStructuredProposal || hasReadyPlanArtifacts || hasReviewablePlanArtifacts) return false;
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
+  // Plan approval belongs to the dedicated review surface. Model-authored
+  // approve/adjust/cancel options must never create a second approval capsule,
+  // including after a structured proposal has become reviewable.
   if (hasExecutableProposalReplyOptions(replyOptions)) return true;
+  if (hasStructuredProposal || hasReadyPlanArtifacts || hasReviewablePlanArtifacts) return false;
 
   const normalizedText = normalizeOptionText(visibleText);
   if (!PREMATURE_PLAN_ARTIFACT_TEXT_RE.test(normalizedText)) return false;

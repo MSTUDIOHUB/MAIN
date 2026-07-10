@@ -64,6 +64,8 @@ const {
   hasOnlyPlanContinuationReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
   inferReplyOptionActionFromText,
+  resolveCustomReplyOptionAction,
+  simplifyOperationProposalReplyOptions,
   serializeAssistantReplyForHistory,
   shouldAutoContinueReadOnlyPermission,
   shouldPauseForReplyOptions,
@@ -518,7 +520,7 @@ test("extractReplyOptions rewrites model-self diagnostic options into user instr
   assert.equal(hasOnlyPlanContinuationReplyOptions(deferral.replyOptions), false);
 });
 
-test("extractReplyOptions synthesizes operation approval for executable proposals", () => {
+test("extractReplyOptions synthesizes one operation approval for executable proposals", () => {
   const result = extractReplyOptions(`
 ## 修复方案
 
@@ -527,12 +529,32 @@ test("extractReplyOptions synthesizes operation approval for executable proposal
 是否开始执行这个修复方案？
   `);
 
-  assert.equal(result.replyOptions.length, 3);
+  assert.equal(result.replyOptions.length, 1);
   assert.equal(result.replyOptions[0].label, "批准执行本轮操作");
   assert.equal(result.replyOptions[0].action, "approve_operation_once");
   assert.equal(result.replyOptions[0].source, "proposal_follow_up");
-  assert.equal(result.replyOptions[1].action, "adjust_plan");
-  assert.equal(result.replyOptions[2].action, "cancel_operation");
+});
+
+test("operation proposal UI options remove generic adjust and cancel controls", () => {
+  const simplified = simplifyOperationProposalReplyOptions([
+    { label: "批准执行本轮操作", value: "我批准执行。", action: "approve_operation_once", source: "proposal_follow_up" },
+    { label: "继续调整方案", value: "继续调整上面的方案，暂不执行真实操作。", action: "adjust_plan", source: "explicit_user_options" },
+    { label: "取消操作", value: "取消上面的执行操作，本轮到此为止。", action: "cancel_operation", source: "explicit_user_options" },
+    { label: "先生成正式 Plan", value: "先生成可审阅 Plan，再决定是否执行。", action: "adjust_plan", source: "explicit_user_options" },
+    { label: "继续调整方案，不进入执行", value: "继续调整方案，不进入执行", source: "explicit_user_options" },
+  ]);
+
+  assert.deepEqual(simplified.map((option) => option.label), ["批准执行本轮操作", "先生成正式 Plan"]);
+});
+
+test("operation proposal custom feedback routes to adjustment without overriding explicit approval", () => {
+  const proposalOptions = [
+    { label: "批准执行本轮操作", value: "我批准执行。", action: "approve_operation_once", source: "proposal_follow_up" },
+  ];
+
+  assert.equal(resolveCustomReplyOptionAction("请把验证步骤拆得更具体", proposalOptions), "adjust_plan");
+  assert.equal(resolveCustomReplyOptionAction("我批准执行本轮操作", proposalOptions), "approve_operation_once");
+  assert.equal(resolveCustomReplyOptionAction("补充一个想法", []), undefined);
 });
 
 test("ExecutionCapsule keeps execute_once branch labels distinct instead of flattening them", () => {
@@ -614,6 +636,27 @@ test("shouldRouteUnapprovedPlanReplyOptionsToArtifact suppresses premature imple
       hasReviewablePlanArtifacts: false,
       sawPlanModeToolActivity: false,
       visibleText,
+    }),
+    true,
+  );
+});
+
+test("shouldRouteUnapprovedPlanReplyOptionsToArtifact suppresses duplicate approval for a reviewable plan", () => {
+  const replyOptions = [
+    { label: "批准执行本轮操作", value: "批准执行", action: "approve_operation_once", source: "proposal_follow_up" },
+    { label: "继续调整方案", value: "继续调整", action: "adjust_plan", source: "proposal_follow_up" },
+    { label: "取消操作", value: "取消", action: "cancel_operation", source: "operation_approval" },
+  ];
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasStructuredProposal: true,
+      hasReadyPlanArtifacts: false,
+      hasReviewablePlanArtifacts: false,
+      visibleText: "# Proposed Plan\n\n## Summary\nReviewable plan.",
     }),
     true,
   );

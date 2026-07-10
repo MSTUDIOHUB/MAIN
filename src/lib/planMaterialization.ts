@@ -2,10 +2,12 @@ import { sanitizePlanArtifactContent, stripUserOptionsProtocol } from "./sanitiz
 import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
 import {
   analyzePlanDecisionFork,
+  classifyPlanArtifactQualityResult,
   repairActionablePlanArtifactContent,
   validateActionablePlanArtifact,
   validatePlanArtifactContent,
   type PlanDecisionForkAnalysis,
+  type PlanArtifactQualityResult,
   type PlanStage,
 } from "./workflowModels";
 import { extractPrimaryUserRequestText, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
@@ -28,7 +30,7 @@ export interface PlanMaterializationResult {
   decisionFork?: PlanDecisionForkAnalysis;
 }
 
-interface PlanMaterializationToolActivityLike {
+export interface PlanMaterializationToolActivityLike {
   name?: string;
   target?: string;
   status?: string;
@@ -892,6 +894,148 @@ function collectPathLikePlanItems(content: string, maxItems = 8): string[] {
   return uniquePlanItems(values, maxItems, 160);
 }
 
+const PLAN_GROUNDING_READ_TOOLS = new Set([
+  "read_file",
+  "read_file_window",
+  "read_document",
+  "get_file_outline",
+]);
+const PLAN_CHANGE_TARGET_FILE_RE = /(?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_@.-]+\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html|md)\b/gi;
+const PLAN_CHANGE_LINE_RE = /(?:修改|更新|改动|重构|修复|替换|移除|接入|迁移|modify|update|change|refactor|fix|replace|remove|wire|migrate)/i;
+const PLAN_NEW_FILE_LINE_RE = /(?:新增文件|新建文件|创建新文件|add\s+(?:a\s+)?new\s+file|create\s+(?:a\s+)?new\s+file)/i;
+const PLAN_CONFIRMED_EVIDENCE_HEADING_RE = /(?:^|\n)\s*#{1,6}\s*(?:已确认(?:事实|发现|证据)|已读证据|证据依据|Confirmed (?:Facts|Findings|Evidence)|Read Evidence|Evidence)\s*$/im;
+const PLAN_KEY_CHANGES_HEADING_RE = /^(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)$/i;
+
+function normalizePlanGroundingPath(value: string): string {
+  return String(value || "")
+    .replace(/\\/g, "/")
+    .replace(/^\.\//, "")
+    .replace(/^[`'"\s]+|[`'"\s.,;:：)\]}]+$/g, "")
+    .trim()
+    .toLowerCase();
+}
+
+function planGroundingPathsMatch(left: string, right: string): boolean {
+  const a = normalizePlanGroundingPath(left);
+  const b = normalizePlanGroundingPath(right);
+  if (!a || !b) return false;
+  return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+}
+
+function collectReadEvidenceTargets(input: {
+  evidence?: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): string[] {
+  const targets: string[] = [];
+  for (const record of input.evidenceRecords || []) {
+    if (
+      PLAN_GROUNDING_READ_TOOLS.has(String(record.tool || "")) &&
+      !/failed|blocked|rejected|declined/i.test(String(record.status || ""))
+    ) {
+      targets.push(record.target || "");
+    }
+  }
+  for (const activity of input.recentToolActivity || []) {
+    if (
+      PLAN_GROUNDING_READ_TOOLS.has(String(activity.name || "")) &&
+      !/failed|blocked|rejected|declined/i.test(String(activity.status || ""))
+    ) {
+      targets.push(activity.target || "");
+    }
+  }
+  for (const line of input.evidence || []) {
+    const match = String(line || "").match(/(?:read_file(?:_window)?|read_document|get_file_outline|已读取(?:文件|文件窗口|文档)|已查看文件结构|Read (?:file|file window|document)|Inspected file outline)\s*[:：;]?\s*([^;\n]{1,180})/i);
+    if (match?.[1]) targets.push(match[1]);
+  }
+  return [...new Set(targets.map(normalizePlanGroundingPath).filter(Boolean))];
+}
+
+function collectPlanChangeTargets(content: string): string[] {
+  const targets: string[] = [];
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || !PLAN_CHANGE_LINE_RE.test(line) || PLAN_NEW_FILE_LINE_RE.test(line)) continue;
+    for (const match of line.matchAll(PLAN_CHANGE_TARGET_FILE_RE)) {
+      const target = normalizePlanGroundingPath(match[0] || "");
+      if (
+        target &&
+        !/\.main\/plans\//i.test(target) &&
+        !/(?:^|\/)(?:plan|tasks|requirements|design)\.md$/i.test(target)
+      ) {
+        targets.push(target);
+      }
+    }
+  }
+  return [...new Set(targets)];
+}
+
+function extractPlanGroundingSectionBody(content: string, headingPattern: RegExp): string {
+  const body: string[] = [];
+  let inSection = false;
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const heading = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (heading) {
+      if (inSection) break;
+      inSection = headingPattern.test(heading[1] || "");
+      continue;
+    }
+    if (inSection) body.push(line);
+  }
+  return body.join("\n").trim();
+}
+
+export function validatePlanEvidenceGrounding(input: {
+  content: string;
+  evidence?: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): PlanArtifactQualityResult {
+  const readTargets = collectReadEvidenceTargets(input);
+  const changeTargets = collectPlanChangeTargets(input.content);
+  if (readTargets.length === 0) {
+    return classifyPlanArtifactQualityResult({ ok: true });
+  }
+
+  const keyChangesBody = extractPlanGroundingSectionBody(
+    input.content,
+    PLAN_KEY_CHANGES_HEADING_RE,
+  );
+  const hasSourceBackedMutationPlan =
+    readTargets.some((target) => /\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html)$/i.test(target)) &&
+    PLAN_CHANGE_LINE_RE.test(keyChangesBody);
+  if (changeTargets.length === 0) {
+    return hasSourceBackedMutationPlan
+      ? classifyPlanArtifactQualityResult({ ok: false, reason: "missing_grounded_plan_change_target" })
+      : classifyPlanArtifactQualityResult({ ok: true });
+  }
+
+  const ungroundedTargets = changeTargets.filter((target) =>
+    !readTargets.some((readTarget) => planGroundingPathsMatch(target, readTarget))
+  );
+  if (ungroundedTargets.length > 0) {
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: `ungrounded_plan_change_targets:${ungroundedTargets.slice(0, 4).join(",")}`,
+    });
+  }
+  if (!PLAN_CONFIRMED_EVIDENCE_HEADING_RE.test(String(input.content || ""))) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "missing_plan_evidence_section" });
+  }
+  return classifyPlanArtifactQualityResult({ ok: true });
+}
+
+export function validateGroundedActionablePlanArtifact(input: {
+  content: string;
+  evidence?: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): PlanArtifactQualityResult {
+  const structural = validateActionablePlanArtifact(input.content);
+  if (!structural.ok) return structural;
+  return validatePlanEvidenceGrounding(input);
+}
+
 function isSpeculativePlanLine(line: string): boolean {
   return /(?:可能|也许|大概|概率|疑似|推测|假设|probably|possibly|likely|hypothesis|assumption)/i.test(line);
 }
@@ -1312,8 +1456,12 @@ export function canonicalizePlanArtifactContent(input: {
   if (evidenceLines.length === 0 && providedContextCount === 0) return null;
 
   const summaryLines = uniquePlanItems([
-    ...goalLines.map((line) => language === "zh" ? `用户目标：${line}` : `User goal: ${line}`),
-    ...evidenceLines.slice(0, 3),
+    ...goalLines.slice(0, 1).map((line) => language === "zh" ? `用户目标：${line}` : `User goal: ${line}`),
+    evidenceLines.length > 0
+      ? language === "zh"
+        ? `已基于 ${evidenceLines.length} 项定向证据收敛范围；具体观察见“已确认证据”。`
+        : `Scope was narrowed from ${evidenceLines.length} targeted evidence item(s); see Confirmed Evidence for observations.`
+      : "",
     ...(screenshotLines.length > 0
       ? screenshotLines.slice(0, 2)
       : [buildProvidedContextObservation({ turnContext: input.turnContext, language })]),
@@ -1360,6 +1508,7 @@ export function canonicalizePlanArtifactContent(input: {
     return [
       "# Plan",
       formatCodexPlanSection("Summary", summaryLines),
+      formatCodexPlanSection("Confirmed Evidence", evidenceLines.slice(0, 6)),
       formatCodexPlanSection("Key Changes", keyChangeLines),
       formatCodexPlanSection("Public APIs / Interfaces / Types", resolvedApiLines),
       formatCodexPlanSection("Test Plan", validationLines),
@@ -1370,6 +1519,7 @@ export function canonicalizePlanArtifactContent(input: {
   return [
     "# 计划",
     formatCodexPlanSection("摘要", summaryLines),
+    formatCodexPlanSection("已确认证据", evidenceLines.slice(0, 6)),
     formatCodexPlanSection("关键改动", keyChangeLines),
     formatCodexPlanSection("公共 API / 接口 / 类型", resolvedApiLines),
     formatCodexPlanSection("测试方案", validationLines),
@@ -1593,7 +1743,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   // Final validation: if still not ok and canonicalization can help, try it
   if (
     !validation.ok &&
-    !/generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|generic_theme_token_plan|placeholder_validation_plan/i.test(validation.reason || "")
+    !/generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|generic_theme_token_plan|placeholder_validation_plan|excessive_plan_code_dump/i.test(validation.reason || "")
   ) {
     const canonical = canonicalizePlanArtifactContent({
       content,
@@ -1617,6 +1767,16 @@ export function materializePlanArtifactFromVisibleText(input: {
     }
   }
   if (!validation.ok) return { ok: false, reason: validation.reason || "quality_gate", decisionFork };
+
+  const grounding = validatePlanEvidenceGrounding({
+    content,
+    evidence: input.evidence,
+    evidenceRecords: input.evidenceRecords,
+    recentToolActivity: input.recentToolActivity,
+  });
+  if (!grounding.ok) {
+    return { ok: false, reason: grounding.reason || "evidence_grounding", decisionFork };
+  }
 
   return {
     ok: true,

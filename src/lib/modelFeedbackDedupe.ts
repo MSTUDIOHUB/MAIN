@@ -36,6 +36,28 @@ export function isSubstantiveModelFeedback(text: string): boolean {
   );
 }
 
+export function shouldRetainStageSummary(text: string): boolean {
+  const raw = String(text || "").trim();
+  if (!raw) return false;
+
+  const normalized = raw.replace(/\s+/g, "");
+  const hasCompletedFinding =
+    /(?:阶段性(?:结论|总结)|关键(?:发现|结论|证据)|审核(?:摘要|结果)|验证结果|(?:已经|已)(?:确认|发现|定位|验证|证明|排除)|(?:观察|看到|发现)(?:到|了)?|(?:结论|结果|根因|原因|取舍|决策|依据|证据)(?:是|为|在于|来自|显示|表明|：|:)|(?:测试|验证)(?:通过|失败))/.test(normalized) ||
+    /\b(?:stage summary|key (?:finding|conclusion|evidence)|review (?:summary|result)|validation result|confirmed|found|observed|verified|passed|failed)\b|\b(?:decision|rationale|evidence)\s*(?:is|was|:|shows?|indicates?)\b/i.test(raw);
+  if (isThinModelToolNarration(raw) && !hasCompletedFinding) return false;
+  if (isSubstantiveModelFeedback(raw) || hasCompletedFinding) return true;
+
+  const structuredItemCount = (raw.match(/(?:^|\n)\s*(?:\d+[.)]|[-*+])\s+\S/g) || []).length;
+  if (structuredItemCount >= 2 && normalized.length >= 40) return true;
+
+  const sentenceCount = raw
+    .split(/[。！？.!?]+|\n{2,}/)
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .length;
+  return normalized.length >= 240 && sentenceCount >= 3;
+}
+
 export function isThinModelToolNarration(text: string): boolean {
   const raw = String(text || "").trim();
   const normalized = raw.replace(/\s+/g, "");

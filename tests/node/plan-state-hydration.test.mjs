@@ -129,11 +129,13 @@ test("plan panel open path hydrates artifacts without auto-approving execution",
   assert.match(source, /setRightPanelTab:\s*\(tab\)\s*=>\s*\{\s*if \(tab === "plan"\)/);
 });
 
-test("collapsed turns keep effective progress inside the expanded view", () => {
+test("ChatArea omits the duplicated effective progress ledger", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
 
   assert.match(source, /\{isTurnExpanded && shouldShowTurnActivityNotice && \(/);
-  assert.match(source, /rounded-none bg-transparent px-1 py-1/);
+  assert.doesNotMatch(source, /data-testid="effective-progress-ledger"/);
+  assert.doesNotMatch(source, /progressItems=\{effectiveProgressLedger\}/);
+  assert.match(source, /data-testid="effective-progress-popover"/);
   assert.match(source, /archived-phase-analysis[\s\S]*archivedAfterChoice: false/);
 });
 

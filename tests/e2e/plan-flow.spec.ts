@@ -82,6 +82,28 @@ test("ExecutionCapsule plan adjustment input can be clicked, focused, and submit
     });
 });
 
+test("unified plan approval panel stays legible in light, dark, and black themes", async ({ page }, testInfo) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto("/?e2eScenario=plan-flow");
+
+  const panel = page.getByTestId("execution-capsule-awaiting-choice");
+  await expect(panel).toHaveCount(1);
+  await expect(page.getByTestId("execution-capsule-plan-approve")).toContainText("开始执行");
+  await expect(page.getByTestId("execution-capsule-plan-adjust-submit")).toContainText("提交意见");
+  await expect(page.getByTestId("execution-capsule-plan-end-turn")).toContainText("结束本轮");
+
+  for (const themeMode of ["light", "dark", "black"] as const) {
+    await page.evaluate((mode) => (window as any).__CODELY_E2E__?.setThemeMode?.(mode), themeMode);
+    await expect
+      .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().themeMode ?? null))
+      .toBe(themeMode);
+    await expect(panel).toBeVisible();
+    await expect(page.getByTestId("execution-capsule-plan-adjust-input")).toBeEditable();
+    await expect(page.getByTestId("execution-capsule-plan-end-turn")).toBeInViewport();
+    await panel.screenshot({ path: testInfo.outputPath(`unified-plan-approval-${themeMode}.png`) });
+  }
+});
+
 test("plan flow supports save then approve and finish", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-flow");
 
@@ -103,9 +125,12 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     .toBe(1);
 
   await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
-  await expect(page.getByTestId("execution-capsule-plan-reject-keep")).toContainText("拒绝并保留");
-  await expect(page.getByTestId("execution-capsule-plan-reject-delete")).toContainText("拒绝并删除");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(1);
+  await expect(page.getByTestId("execution-capsule-plan-reject-keep")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-plan-reject-delete")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-plan-end-turn")).toContainText("结束本轮");
   await expect(page.getByTestId("execution-capsule-plan-adjust-input")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-plan-adjust-input")).toHaveAttribute("placeholder", "说明需要如何调整，或提出其他要求");
   await page.getByTestId("execution-capsule-plan-adjust-input").fill("请把验证步骤写得更具体");
   await page.getByTestId("execution-capsule-plan-adjust-submit").click();
   await expect
@@ -249,6 +274,10 @@ test("plan approval quick reply approves instead of re-sending an unapproved pla
 
   await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
   await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("批准执行");
+  await expect(page.getByTestId("execution-capsule-reply-option-1")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-custom-reply-badge")).toHaveText("2.");
+  await expect(page.getByTestId("execution-capsule-custom-reply-input")).toHaveAttribute("placeholder", "说明需要如何调整，或提出其他要求");
+  await expect(page.getByRole("button", { name: "结束本轮" })).toBeVisible();
 
   await page.getByTestId("execution-capsule-reply-option-0").click();
 
@@ -288,6 +317,8 @@ for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-
 
     await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
     await expect(page.getByTestId("execution-capsule-reply-option-0")).toContainText("批准执行");
+    await expect(page.getByTestId("execution-capsule-reply-option-1")).toHaveCount(0);
+    await expect(page.getByTestId("execution-capsule-custom-reply-badge")).toHaveText("2.");
 
     await page.getByTestId("execution-capsule-reply-option-0").click();
 

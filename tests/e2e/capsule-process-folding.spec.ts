@@ -16,6 +16,13 @@ test("capsule preserves model explanation while tools are folded", async ({ page
   await expect(capsule).toContainText("保留这条模型说明");
   await expect(capsule).not.toContainText("等待您的下一步指令");
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
+  await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
+
+  await page.getByTitle("查看有效进展").click();
+  const progressPopover = page.getByTestId("effective-progress-popover");
+  await expect(progressPopover).toBeVisible();
+  await expect(progressPopover).toContainText("ChatArea.tsx");
+  await expect(progressPopover).toContainText("npm run test:workflow-assets");
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
@@ -40,6 +47,7 @@ test("capsule progress fallback never shows idle waiting copy", async ({ page })
   expect(capsuleText).not.toContain("随时准备开始新的探索或修改");
   expect(capsuleText.trim().length).toBeGreaterThan(0);
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
+  await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
 });
 
 test("turn process timeline stays inside its frame in a narrow viewport", async ({ page }) => {

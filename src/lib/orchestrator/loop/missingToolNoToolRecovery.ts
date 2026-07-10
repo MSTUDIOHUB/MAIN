@@ -2,6 +2,7 @@ import { buildExecuteNoActionPauseMessage } from "../../orchestrator/agentRecove
 import type { MainModeKey } from "../../mainModes";
 import {
   buildMissingToolCallContinuationPrompt,
+  buildTruncatedPlanContinuationPrompt,
   resolveMissingToolCallRepromptKind,
   type MissingToolCallRepromptKind,
 } from "../../missingToolCallReprompt";
@@ -221,6 +222,8 @@ export function handleMissingToolNoToolRecovery(input: {
     role: "user",
     content: hiddenThoughtOnlyNoToolStop
       ? buildHiddenThoughtOnlyContinuationPrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount)
+      : workflowMode === "plan" && effectiveMissingToolKind === "truncated_reasoning_bridge"
+      ? buildTruncatedPlanContinuationPrompt(callbacks.getPreferredLanguage())
       : buildMissingToolCallContinuationPrompt(
           effectiveMissingToolKind === "none" ? "generic" : effectiveMissingToolKind,
           callbacks.getPreferredLanguage(),

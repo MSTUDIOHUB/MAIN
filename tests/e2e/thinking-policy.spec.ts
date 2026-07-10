@@ -12,6 +12,7 @@ test.beforeEach(async ({ page }) => {
             activeProfile: "local",
             thinkingPolicy: "action_only",
             thoughtDisplayMode: "hidden",
+            reasoningDisplay: "debug_summary",
           },
         },
         version: 0,
@@ -26,8 +27,8 @@ test("process display ignores legacy hidden policy and keeps process text hierar
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
   await expect(page.getByTestId("turn-activity-notice")).toBeVisible();
-  await expect(page.getByTestId("effective-progress-ledger")).toContainText("ChatArea.tsx");
-  await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
+  await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
+  await expect(page.getByTestId("turn-activity-thought-summary")).toContainText("流式结束后继续保留");
   await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
   await expect(page.getByText("过程显示测试回复。")).toBeVisible();
   const readGroup = page.getByTestId("read-context-group").first();

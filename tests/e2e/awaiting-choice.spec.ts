@@ -146,11 +146,17 @@ test("mixed choice options keep execution choices together and split read-only p
   await expect(page.getByTestId("execution-capsule-reply-option-1")).toBeVisible();
   await expect(page.getByTestId("execution-capsule-reply-option-2")).toBeVisible();
   await expect(page.getByTestId("execution-capsule-reply-option-3")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).not.toContainText("继续调整方案");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).not.toContainText("取消操作");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice").getByText("选择下一步", { exact: true })).toHaveCount(1);
   await expect(page.getByTestId("execution-capsule-reply-option-badge-0")).toHaveText("1.");
   await expect(page.getByTestId("execution-capsule-reply-option-badge-1")).toHaveText("2.");
   await expect(page.getByTestId("execution-capsule-reply-option-badge-2")).toHaveText("3.");
   await expect(page.getByTestId("execution-capsule-reply-option-1")).toContainText("我来确认类型，然后执行修复");
   await expect(page.getByTestId("execution-capsule-custom-reply-badge")).toHaveText("4.");
+  await expect(page.getByTestId("execution-capsule-custom-reply-input")).toHaveAttribute("placeholder", "说明需要如何调整，或提出其他要求");
+  await expect(page.getByTestId("execution-capsule-custom-reply-submit")).toContainText("提交意见");
+  await expect(page.getByRole("button", { name: "结束本轮" })).toBeVisible();
 
   const approvalSection = page.getByTestId("execution-capsule-approval-actions");
   await expect(approvalSection).toBeVisible();

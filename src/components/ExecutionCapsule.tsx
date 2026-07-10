@@ -3,7 +3,11 @@ import { IconColumns, IconInfo } from "./Icons";
 import type { TurnProgressItem } from "../lib/turnProgress";
 import { buildPlanTaskEvidenceAudit, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask, type ReplyOption } from "../lib/workflowModels";
 import type { PendingRunDecision, PendingRunDecisionChoice } from "../lib/runIntent";
-import { inferReplyOptionActionFromText } from "../lib/replyOptions";
+import {
+  isOperationProposalApprovalOption,
+  resolveCustomReplyOptionAction,
+  simplifyOperationProposalReplyOptions,
+} from "../lib/replyOptions";
 
 // region: ExecutionCapsule 属性定义
 interface ExecutionCapsuleProps {
@@ -33,7 +37,6 @@ interface ExecutionCapsuleProps {
   onRequestPlanAdjustment?: (text: string) => void;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
-  onRejectAndDeletePlan?: () => void;
   onRejectDiff?: (id: number) => void;
   onApproveDiffOnce?: () => void;
   onApproveDiffSession?: () => void;
@@ -121,7 +124,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   onRequestPlanAdjustment,
   onApprovePlan,
   onRejectPlan,
-  onRejectAndDeletePlan,
   onRejectDiff,
   onApproveDiffOnce,
   onApproveDiffSession,
@@ -150,14 +152,22 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   const [activeTabIdx, setActiveTabIdx] = useState(0);
   const [tabSelections, setTabSelections] = useState<Record<string, string[]>>({});
   const [tabWriteIns, setTabWriteIns] = useState<Record<string, string>>({});
+  const simplifiedReplyOptions = useMemo(
+    () => simplifyOperationProposalReplyOptions(replyOptions),
+    [replyOptions],
+  );
+  const hasOperationProposalApproval = useMemo(
+    () => replyOptions.some((option) => isOperationProposalApprovalOption(option)),
+    [replyOptions],
+  );
 
   const tabGroups = useMemo(() => {
-    const hasTabPrefix = replyOptions.some(opt => /^\[([^\]]+)\]/.test(opt.label));
+    const hasTabPrefix = simplifiedReplyOptions.some(opt => /^\[([^\]]+)\]/.test(opt.label));
     if (!hasTabPrefix) return null;
 
     const groupsMap: Record<string, { category: string; cleanCategory: string; isMulti: boolean; options: ReplyOption[] }> = {};
     
-    replyOptions.forEach(opt => {
+    simplifiedReplyOptions.forEach(opt => {
       const match = opt.label.match(/^\[([^\]]+)\]\s*(.*)$/);
       if (match) {
         const fullCategory = match[1].trim();
@@ -192,7 +202,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     });
     
     return Object.values(groupsMap);
-  }, [replyOptions, language]);
+  }, [simplifiedReplyOptions, language]);
 
   useEffect(() => {
     setActiveTabIdx(0);
@@ -201,13 +211,13 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   }, [replyOptions]);
 
   const replyOptionsSignature = useMemo(
-    () => replyOptions.map((option) => `${option.action || ""}:${option.value || option.label}`).join("|"),
-    [replyOptions],
+    () => simplifiedReplyOptions.map((option) => `${option.action || ""}:${option.value || option.label}`).join("|"),
+    [simplifiedReplyOptions],
   );
 
   useEffect(() => {
     setChoiceOptionsCollapsed(false);
-  }, [isAwaitingChoice, replyOptionsSignature]);
+  }, [canApprovePlan, isAwaitingChoice, replyOptionsSignature]);
 
   const handleTabbedSubmit = () => {
     if (!tabGroups) return;
@@ -243,12 +253,12 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   };
 
   const realChoiceOptions = useMemo(
-    () => replyOptions.filter((option) => !isApprovalActionOption(option)),
-    [replyOptions],
+    () => simplifiedReplyOptions.filter((option) => !isApprovalActionOption(option)),
+    [simplifiedReplyOptions],
   );
   const approvalActionOptions = useMemo(
-    () => replyOptions.filter((option) => isApprovalActionOption(option)),
-    [replyOptions],
+    () => simplifiedReplyOptions.filter((option) => isApprovalActionOption(option)),
+    [simplifiedReplyOptions],
   );
   const hasRealChoiceOptions = realChoiceOptions.length > 0;
   const hasApprovalActionOptions = approvalActionOptions.length > 0;
@@ -313,13 +323,11 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     approveDiffOnce: language === "zh" ? "批准此工具请求" : "Approve This Request",
     approveDiffSession: language === "zh" ? "开启自动审查并批准" : "Turn On Auto Review",
     reject: language === "zh" ? "拒绝" : "Reject",
-    rejectAndKeepPlan: language === "zh" ? "拒绝并保留" : "Reject And Keep",
-    rejectAndDeletePlan: language === "zh" ? "拒绝并删除" : "Reject And Delete",
     approvePlan: language === "zh" ? "开始执行" : "Start Execution",
     waitingPlan: language === "zh" ? "计划待确认" : "Plan Waiting",
     adjustPlan: language === "zh" ? "调整计划" : "Adjust Plan",
-    adjustPlanPlaceholder: language === "zh" ? "输入希望调整的点" : "Describe what to change",
-    adjustPlanSubmit: language === "zh" ? "提交调整" : "Submit Adjustment",
+    adjustPlanPlaceholder: language === "zh" ? "说明需要如何调整，或提出其他要求" : "Describe changes or another request",
+    adjustPlanSubmit: language === "zh" ? "提交意见" : "Submit Feedback",
     waitingChoice: language === "zh" ? "等待选择" : "Awaiting Choice",
     pendingDecision: language === "zh" ? "待决定" : "Decision Needed",
     chooseToContinue: language === "zh" ? "选择下一步" : "Choose the next step",
@@ -331,15 +339,23 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
       ? "模型已经识别出关键分叉并暂停。请先在聊天区点击一个选项，再继续当前回合。"
       : "The model found a real branch point and paused. Pick an option in chat before this turn continues.",
     choicePrompt: language === "zh"
-      ? "直接在这里点选即可继续当前回合。"
-      : "Choose an option here to continue the current turn.",
+      ? hasOperationProposalApproval
+        ? "批准即可执行；如需调整，请在下方说明具体修改点。"
+        : "直接在这里点选即可继续当前回合。"
+      : hasOperationProposalApproval
+        ? "Approve to run, or describe the specific changes you want below."
+        : "Choose an option here to continue the current turn.",
     choicesSectionTitle: language === "zh" ? "选择下一步" : "Choose the next step",
     approvalActionsTitle: language === "zh" ? "只读授权动作" : "Read-only Permission Actions",
     approvalActionsHint: language === "zh"
       ? "这些只会允许读取、搜索和分析，不会直接执行写入修改。"
       : "These only allow reading, searching, and analysis; they do not start write changes.",
-    customChoicePlaceholder: language === "zh" ? "输入你的想法作为选项" : "Type your own choice",
-    customChoiceSubmit: language === "zh" ? "确认" : "Confirm",
+    customChoicePlaceholder: language === "zh"
+      ? hasOperationProposalApproval ? "说明需要如何调整，或提出其他要求" : "输入你的想法作为选项"
+      : hasOperationProposalApproval ? "Describe changes or another request" : "Type your own choice",
+    customChoiceSubmit: language === "zh"
+      ? hasOperationProposalApproval ? "提交意见" : "确认"
+      : hasOperationProposalApproval ? "Submit Feedback" : "Confirm",
     executionConsentTitle: language === "zh" ? "允许开始执行本轮改动？" : "Allow this turn to start making changes?",
     executionConsentHint: language === "zh"
       ? "这是本轮第一次真实写入/命令动作。确认后 MAIN 会继续；开启自动审查会在本会话自动批准非破坏性文件修改、命令、本地读取、MCP 动作和浏览器验证。"
@@ -347,7 +363,13 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     approveExecuteOnce: language === "zh" ? "直接执行本轮" : "Run This Turn",
     approveThread: language === "zh" ? "开启自动审查并执行" : "Auto Review And Run",
     dismiss: language === "zh" ? "取消/继续调整" : "Cancel / Adjust",
-    cancelTurn: language === "zh" ? "结束本轮（这会让回合停止）" : "End Round (This will stop the current turn)",
+    cancelTurn: language === "zh" ? "结束本轮" : "End Turn",
+    cancelTurnInfo: language === "zh"
+      ? "停止当前回合，不会执行上述方案。"
+      : "Stop the current turn without executing the proposal.",
+    endPlanTurnInfo: language === "zh"
+      ? "停止当前回合并保留计划文件，不会开始执行。"
+      : "Stop the current turn and keep the plan file without starting execution.",
     intentOptionInfo: language === "zh"
       ? "选择后 MAIN 会按这个意图重新处理当前输入。"
       : "Selecting this tells MAIN which intent to use for the current input.",
@@ -379,7 +401,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
       ? `共 ${progressItems.length} 个任务，已完成 ${completedCount} 个`
       : `${completedCount}/${progressItems.length} tasks completed`,
     executionStage: language === "zh" ? "执行步骤" : "Execution",
-  }), [activeProgressMode, completedCount, language, progressItems.length]);
+  }), [activeProgressMode, completedCount, hasOperationProposalApproval, language, progressItems.length]);
 
   const isBlackTheme = themeMode === "black";
   const activeRunOutline = isRunActive
@@ -396,7 +418,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   const normalizedPlanAdjustment = planAdjustmentText.replace(/\s+/g, " ").trim();
   const showChoicePromptContent = true;
   const showPendingRunDecision = !!pendingRunDecision && showChoicePromptContent;
-  const showAwaitingChoice = isAwaitingChoice && showChoicePromptContent;
+  const showAwaitingChoice = (isAwaitingChoice || canApprovePlan) && showChoicePromptContent;
   const choiceTextFontSize = Math.max(12, chatFontSize);
   const choiceTextLineHeight = Math.max(20, Math.round(choiceTextFontSize * 1.7));
   const choiceSectionFontSize = Math.max(11, choiceTextFontSize - 1);
@@ -416,11 +438,11 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   const submitCustomReply = (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!normalizedCustomReply) return;
-    const inferredAction = inferReplyOptionActionFromText(normalizedCustomReply);
+    const resolvedAction = resolveCustomReplyOptionAction(normalizedCustomReply, replyOptions);
     onSelectReplyOption?.({
       label: normalizedCustomReply,
       value: normalizedCustomReply,
-      ...(inferredAction ? { action: inferredAction } : {}),
+      ...(resolvedAction ? { action: resolvedAction } : {}),
     });
     setCustomReplyText("");
   };
@@ -451,7 +473,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                 {copy.waitingPlan}
               </span>
             )}
-            {isAwaitingChoice && (
+            {isAwaitingChoice && !canApprovePlan && (
               <span className="shrink-0 rounded-full border border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] px-2 py-0.5 text-[10px] text-[#fbbf24]">
                 {copy.waitingChoice}
               </span>
@@ -596,9 +618,76 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                   </button>
                 </div>
                 <div className={`mt-1 ${secondaryText}`} style={choiceTextStyle}>
-                  {hasRealChoiceOptions ? copy.choicePrompt : hasApprovalActionOptions ? copy.approvalActionsHint : copy.choiceHint}
+                  {canApprovePlan
+                    ? language === "zh"
+                      ? "计划已经准备就绪。开始执行，或在下方说明需要调整的内容。"
+                      : "The plan is ready. Start execution, or describe the changes you want below."
+                    : hasRealChoiceOptions
+                    ? copy.choicePrompt
+                    : hasApprovalActionOptions
+                    ? copy.approvalActionsHint
+                    : copy.choiceHint}
                 </div>
-                {hasReplyOptions && (
+                {canApprovePlan && (
+                  <div className="mt-2 flex flex-col gap-2">
+                    <div className="space-y-2">
+                      <div className="group flex min-w-0 items-center gap-2">
+                        <span className={choiceNumberClass} style={choiceTextStyle}>1.</span>
+                        <button
+                          data-testid="execution-capsule-plan-approve"
+                          onClick={handleApprovePlan}
+                          disabled={isApproving || isRunActive || planStage === "executing"}
+                          className={`${choiceOptionButtonClass} theme-plan-primary text-center font-semibold ${
+                            (isApproving || isRunActive || planStage === "executing") ? "cursor-not-allowed opacity-50" : ""
+                          }`}
+                          style={choiceTextStyle}
+                        >
+                          {copy.approvePlan}
+                        </button>
+                      </div>
+                    </div>
+
+                    <form
+                      onSubmit={submitPlanAdjustment}
+                      data-testid="execution-capsule-plan-adjust-form"
+                      className="group flex min-w-0 items-center gap-2"
+                    >
+                      <span className={choiceNumberClass} style={choiceTextStyle}>2.</span>
+                      <div className="flex min-w-0 flex-1 items-center gap-2">
+                        <input
+                          data-testid="execution-capsule-plan-adjust-input"
+                          value={planAdjustmentText}
+                          onChange={(event) => setPlanAdjustmentText(event.target.value)}
+                          placeholder={copy.adjustPlanPlaceholder}
+                          className="execution-capsule-choice-input min-w-0 flex-1 rounded-xl border px-3 py-2.5 outline-none transition-all"
+                          style={choiceTextStyle}
+                          aria-label={copy.adjustPlan}
+                        />
+                        <button
+                          type="submit"
+                          data-testid="execution-capsule-plan-adjust-submit"
+                          disabled={!normalizedPlanAdjustment || !onRequestPlanAdjustment}
+                          className={`theme-plan-primary shrink-0 rounded-xl px-3 py-2.5 text-[12px] font-semibold transition-opacity ${
+                            normalizedPlanAdjustment && onRequestPlanAdjustment ? "opacity-100" : "cursor-not-allowed opacity-40"
+                          }`}
+                        >
+                          {copy.adjustPlanSubmit}
+                        </button>
+                      </div>
+                    </form>
+
+                    <button
+                      data-testid="execution-capsule-plan-end-turn"
+                      onClick={onRejectPlan}
+                      title={copy.endPlanTurnInfo}
+                      className="w-full rounded-xl border border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.08)] px-3 py-2.5 text-center text-[#ef4444] transition-all duration-150 hover:border-[#ef4444] hover:bg-[rgba(239,68,68,0.16)] hover:text-[#f87171]"
+                      style={choiceTextStyle}
+                    >
+                      {copy.cancelTurn}
+                    </button>
+                  </div>
+                )}
+                {!canApprovePlan && hasReplyOptions && (
                   <div className="mt-3 flex flex-col gap-3">
                     {hasRealChoiceOptions && (
                       tabGroups ? (
@@ -699,6 +788,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                                   <button
                                     onClick={onCancelTurn}
                                     type="button"
+                                    title={copy.cancelTurnInfo}
                                     className="px-4 py-2 rounded-xl border border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.08)] text-[#ef4444] transition-all duration-150 hover:border-[#ef4444] hover:bg-[rgba(239,68,68,0.16)] hover:text-[#f87171] text-[12px] font-semibold"
                                   >
                                     {copy.cancelTurn}
@@ -717,10 +807,12 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                         </div>
                       ) : (
                         <div>
-                          <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
-                            {copy.choicesSectionTitle}
-                          </div>
-                          <div className="mt-2 space-y-2">
+                          {!hasOperationProposalApproval && (
+                            <div className={`font-medium uppercase tracking-[0.14em] ${secondaryText}`} style={choiceSectionStyle}>
+                              {copy.choicesSectionTitle}
+                            </div>
+                          )}
+                          <div className={`${hasOperationProposalApproval ? "" : "mt-2"} space-y-2`}>
                             {realChoiceOptions.map((option, index) => (
                               <div
                                 key={`${option.value}-${index}`}
@@ -804,6 +896,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                     {!tabGroups && (
                       <button
                         onClick={onCancelTurn}
+                        title={copy.cancelTurnInfo}
                         className="w-full px-3 py-2.5 text-center rounded-xl border border-[rgba(239,68,68,0.4)] bg-[rgba(239,68,68,0.08)] text-[#ef4444] transition-all duration-150 hover:border-[#ef4444] hover:bg-[rgba(239,68,68,0.16)] hover:text-[#f87171]"
                         style={choiceTextStyle}
                       >
@@ -815,8 +908,8 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
               </div>
             )}
 
-            {(activeReviewTask || canApprovePlan) && (
-              <div className={`mt-3 grid gap-3 ${activeReviewTask && canApprovePlan ? "md:grid-cols-2" : ""}`}>
+            {activeReviewTask && (
+              <div className="mt-3 grid gap-3">
                 {activeReviewTask && (
                   <div data-testid="execution-capsule-tool-review" className={`rounded-2xl border p-3 ${surface}`}>
                     <div className="flex min-w-0 items-start justify-between gap-3">
@@ -881,75 +974,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                   </div>
                 )}
 
-                {canApprovePlan && (
-                  <div>
-                    <div className={`rounded-2xl border p-3 ${surface}`}>
-                      <div className={`text-[12px] font-medium ${primaryText}`}>{copy.waitingPlan}</div>
-                      <div className={`mt-1 text-[12px] leading-6 ${secondaryText}`}>
-                      {language === "zh"
-                        ? "当前计划已经准备就绪。确认后会进入执行能力，写入与命令仍会逐项审查。"
-                        : "The current plan is ready. Approving it enables execution tools while keeping write and command steps review-gated."}
-                      </div>
-                    </div>
-                    <div className="mt-3 flex flex-wrap items-center justify-end gap-2 px-1">
-                      <form
-                        onSubmit={submitPlanAdjustment}
-                        data-testid="execution-capsule-plan-adjust-form"
-                        className="flex w-full min-w-0 flex-1 items-center gap-2"
-                      >
-                        <div className="min-w-0 flex-1">
-                          <input
-                            data-testid="execution-capsule-plan-adjust-input"
-                            value={planAdjustmentText}
-                            onChange={(event) => setPlanAdjustmentText(event.target.value)}
-                            placeholder={copy.adjustPlanPlaceholder}
-                            className="execution-capsule-choice-input min-w-0 w-full rounded-xl border px-3 py-2 outline-none transition-all"
-                            style={choiceTextStyle}
-                            aria-label={copy.adjustPlan}
-                          />
-                        </div>
-                        <button
-                          type="submit"
-                          data-testid="execution-capsule-plan-adjust-submit"
-                          disabled={!normalizedPlanAdjustment || !onRequestPlanAdjustment}
-                          className={`flex-1 min-w-0 text-center rounded-lg border px-3 py-2 text-[12px] font-medium transition-colors ${
-                            normalizedPlanAdjustment && onRequestPlanAdjustment
-                              ? "theme-plan-button"
-                              : "cursor-not-allowed border-[#3f3f46] bg-[#09090b] text-[#71717a]"
-                          }`}
-                        >
-                          {copy.adjustPlanSubmit}
-                        </button>
-                      </form>
-                      <button
-                        data-testid="execution-capsule-plan-reject-keep"
-                        onClick={onRejectPlan}
-                        className="flex-1 min-w-0 text-center rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
-                      >
-                        {copy.rejectAndKeepPlan}
-                      </button>
-                      {onRejectAndDeletePlan && (
-                        <button
-                          data-testid="execution-capsule-plan-reject-delete"
-                          onClick={onRejectAndDeletePlan}
-                          className="flex-1 min-w-0 text-center rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
-                        >
-                          {copy.rejectAndDeletePlan}
-                        </button>
-                      )}
-                      <button
-                        data-testid="execution-capsule-plan-approve"
-                        onClick={handleApprovePlan}
-                        disabled={isApproving || isRunActive || planStage === "executing"}
-                        className={`flex-1 min-w-0 text-center theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold ${
-                          (isApproving || isRunActive || planStage === "executing") ? "opacity-50 cursor-not-allowed" : ""
-                        }`}
-                      >
-                        {copy.approvePlan}
-                      </button>
-                    </div>
-                  </div>
-                )}
               </div>
             )}
         </div>

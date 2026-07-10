@@ -339,8 +339,18 @@ function compactReasoningNoise(text: string): string {
     .replace(/[^\S\r\n]{3,}/g, " ");
 }
 
-function compactReasoningText(text: string): string {
-  return compactReasoningNoise(collapseRepeatedLineLoops(collapseRepeatedParagraphLoops(text)));
+function compactReasoningText(text: string, maxChars = Number.POSITIVE_INFINITY): string {
+  const compacted = compactReasoningNoise(collapseRepeatedLineLoops(collapseRepeatedParagraphLoops(text)));
+  if (!Number.isFinite(maxChars) || maxChars <= 0 || compacted.length <= maxChars) {
+    return compacted;
+  }
+  const boundedMax = Math.max(160, Math.floor(maxChars));
+  const marker = "\n\n[hidden reasoning compacted]\n\n";
+  const retainedBudget = Math.max(80, boundedMax - marker.length);
+  const headChars = Math.ceil(retainedBudget * 0.7);
+  const tailChars = Math.max(0, retainedBudget - headChars);
+  return `${compacted.slice(0, headChars).trimEnd()}${marker}${compacted.slice(-tailChars).trimStart()}`
+    .slice(0, boundedMax);
 }
 
 // endregion
@@ -465,7 +475,10 @@ function mergeReplyOptions(...groups: ReplyOption[][]): ReplyOption[] {
 /**
  * 统一收敛可见正文 / 隐藏推理 / 工具调用，降低模型差异对 UI 的影响。
  */
-export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamState {
+export function normalizeAssistantTurn(
+  result: StreamResult,
+  options: { maxHiddenChars?: number } = {},
+): NormalizedStreamState {
   const initialOptions = extractReplyOptions(result.content);
   const taggedHiddenThought = extractHiddenThought(initialOptions.cleanText);
   const parsed = parseTextForTools(initialOptions.cleanText || "");
@@ -498,6 +511,7 @@ export function normalizeAssistantTurn(result: StreamResult): NormalizedStreamSt
   const visibleText = leakedTail.visibleText;
   const hiddenThought = compactReasoningText(
     [result.reasoningContent, taggedHiddenThought, leakedPrelude.leakedThought, leakedTail.leakedThought].filter(Boolean).join("\n\n").trim(),
+    options.maxHiddenChars,
   );
 
   return {

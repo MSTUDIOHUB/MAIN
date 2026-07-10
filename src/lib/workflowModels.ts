@@ -1912,7 +1912,7 @@ export function classifyPlanArtifactQualityResult(
   // Evidence gap: only when the validation reason explicitly mentions evidence problems.
   // Evidence sections are no longer part of missingRequiredSections in the unified path,
   // so we only classify as evidence gap for explicit evidence issues.
-  const hasEvidenceGap = /noisy_search_evidence|weak_path_echo_evidence|import_only_evidence/.test(reason);
+  const hasEvidenceGap = /noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|missing_plan_evidence_section|ungrounded_plan_change_targets/.test(reason);
   const hasOnlyStructuralGaps =
     missingSections.length > 0 &&
     missingSections.every((section) => PLAN_STRUCTURAL_REQUIRED_SECTIONS.has(section));
@@ -2278,6 +2278,21 @@ export function hasAnyContentUnderSection(text: string, sectionRegex: RegExp): b
   return inSection && contentChars > 5;
 }
 
+function extractPlanSectionBody(text: string, sectionRegex: RegExp): string {
+  const body: string[] = [];
+  let inSection = false;
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const heading = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    if (heading) {
+      if (inSection) break;
+      inSection = sectionRegex.test(heading[1] || "");
+      continue;
+    }
+    if (inSection) body.push(line);
+  }
+  return body.join("\n").trim();
+}
+
 export function validateActionablePlanArtifact(
   content: string,
 ): PlanArtifactQualityResult {
@@ -2285,6 +2300,38 @@ export function validateActionablePlanArtifact(
   if (!base.ok) return classifyPlanArtifactQualityResult(base);
 
   const raw = String(content || "").trim();
+  const summaryBody = extractPlanSectionBody(raw, /^(?:摘要|Summary)$/i);
+  const repeatedGoalLabels = (
+    summaryBody.match(/^\s*[-*]\s*(?:用户目标|User goal)\s*[:：]/gim) || []
+  ).length;
+  if (repeatedGoalLabels > 1) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "duplicated_user_goal_summary" });
+  }
+  if (/(?:^|\n)\s*[-*]\s*(?:已读取文件|已读取文档|Read file|Read document)\s*[:：]/i.test(summaryBody)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "raw_evidence_in_plan_summary" });
+  }
+
+  const fencedCodeBlocks = raw.match(/```[^\n]*\n[\s\S]*?```/g) || [];
+  const fencedCodeChars = fencedCodeBlocks.reduce((total, block) => total + block.length, 0);
+  if (
+    fencedCodeChars > 900 &&
+    (fencedCodeBlocks.length > 1 || fencedCodeChars > raw.length * 0.2)
+  ) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "excessive_plan_code_dump" });
+  }
+  const keyChangesBody = extractPlanSectionBody(
+    raw,
+    /^(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)$/i,
+  );
+  const keyChangeCodeFragments = keyChangesBody
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/^[-*]\s+/, ""))
+    .filter((line) =>
+      /^(?:```|\/\/|\/\*|\*\/|import\s|export\s|(?:async\s+)?function\s|(?:const|let|var)\s|class\s|interface\s|type\s+\w+\s*=|[{}]\s*$)/i.test(line)
+    );
+  if (/```/.test(keyChangesBody) || keyChangeCodeFragments.length >= 2) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "code_fragments_in_plan_key_changes" });
+  }
   if (/(?:如果确实缺少关键业务选择，用\s*提问|tsx\s*约束|imageParts\s*[0-9]|turn_intake|可见计划必须对齐|创建\s*plan\.md\s*是\s*runtime|本轮处于\s*PLAN\s*模式)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "prompt_leakage_in_plan" });
   }

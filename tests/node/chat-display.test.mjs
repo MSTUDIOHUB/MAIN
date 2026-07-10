@@ -208,6 +208,28 @@ test("chat visibility suppresses thin agent echoes of nearby tool output", () =>
   assert.equal(shouldSuppressAgentToolEcho(blocks, 1), true);
 });
 
+test("chat visibility keeps a substantive stage summary that adds meaning to tool output", () => {
+  const blocks = [
+    {
+      type: "tool",
+      toolName: "execute_command",
+      toolStatus: "executed",
+      target: "npm test",
+      observationSummary: "TypeError: canvasSize is missing from SnakeData.",
+    },
+    {
+      type: "agent",
+      content: [
+        "阶段性结论：TypeError: canvasSize is missing from SnakeData.",
+        "根因是数据模型没有声明控制器依赖的 canvasSize 字段，而不是测试环境失效。",
+        "修复方案是补齐模型字段后重新运行编译验证，并保留失败输出作为证据。",
+      ].join("\n\n"),
+    },
+  ];
+
+  assert.equal(shouldSuppressAgentToolEcho(blocks, 1), false);
+});
+
 test("chat render helpers dedupe read context entries and track cached reads", () => {
   const entries = buildReadContextEntries([
     {

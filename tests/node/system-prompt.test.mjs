@@ -547,7 +547,9 @@ test("respond prompt no longer tells the user to switch Chat or Fast or Plan", (
   assert.match(prompt, /action="approve_operation_once"/);
   assert.match(prompt, /未获批准时不要调用本轮写入或执行工具/);
   assert.match(prompt, /运行时已经把本轮升级到 execute 能力/);
-  assert.match(prompt, /如果不确定用户到底是要继续讨论\/调整方案，还是要进入真实执行/);
+  assert.match(prompt, /只提供一个 action="approve_operation_once"/);
+  assert.match(prompt, /不要再输出泛化的“继续调整方案”或“取消操作”/);
+  assert.match(prompt, /2-3 个语义明确且互不重复的方向选择/);
   assert.doesNotMatch(prompt, /不要调用 replace_in_file、write_file、execute_command 等写入或执行工具。/);
 });
 

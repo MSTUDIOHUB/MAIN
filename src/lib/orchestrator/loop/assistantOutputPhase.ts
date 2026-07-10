@@ -43,6 +43,7 @@ import {
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import {
   applyPlanPostConvergenceRuntimeState,
+  applyPlanRuntimePhase,
   markPlanModeToolActivity,
 } from "./planRuntimeState";
 import { handlePlanPostConvergenceToolRedirect } from "./planConvergence";
@@ -148,6 +149,10 @@ export function handleAssistantOutputPhase(input: {
   let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   let evidenceRuntimeState = input.evidenceRuntimeState;
   let recoveryPromptState = input.recoveryPromptState;
+  const setPlanRuntimePhaseAndSync: typeof input.setPlanRuntimePhase = (phase, reason) => {
+    input.setPlanRuntimePhase(phase, reason);
+    planRuntimeState = applyPlanRuntimePhase(planRuntimeState, { phase, reason }).state;
+  };
 
   const finishControl = (
     status: "continue" | "stopped",
@@ -620,7 +625,7 @@ export function handleAssistantOutputPhase(input: {
       assistantMsgId,
       ...planRuntimeState,
       latestUserPromptText: input.latestUserPromptText,
-      setPlanRuntimePhase: input.setPlanRuntimePhase,
+      setPlanRuntimePhase: setPlanRuntimePhaseAndSync,
     });
   planRuntimeState = applyPlanPostConvergenceRuntimeState(
     planRuntimeState,

@@ -37,6 +37,7 @@ export function processAssistantStreamResponse(input: {
   effectiveToolProtocol: string;
   forceXmlTools: boolean;
   reasoningDisplay: string;
+  maxHiddenChars?: number;
   llmToolCount: number;
   managedMessageCount: number;
   currentMaxTokens: number | undefined;
@@ -56,6 +57,7 @@ export function processAssistantStreamResponse(input: {
     effectiveToolProtocol,
     forceXmlTools,
     reasoningDisplay,
+    maxHiddenChars,
     llmToolCount,
     managedMessageCount,
     currentMaxTokens,
@@ -141,7 +143,7 @@ export function processAssistantStreamResponse(input: {
     });
   }
 
-  const normalizedBase = normalizeAssistantTurn(streamResult);
+  const normalizedBase = normalizeAssistantTurn(streamResult, { maxHiddenChars });
   const normalized = ensureVisibleConclusionWithPolicy(
     normalizedBase,
     true,

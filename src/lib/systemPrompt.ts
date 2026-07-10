@@ -937,8 +937,8 @@ export function buildSystemPrompt(
       "这一轮用于普通聊天、问答、解释、头脑风暴、澄清需求、比较方案和轻量方案交流。",
       "不要主动进入正式计划协议，不要擅自生成 requirements.md / plan.md / tasks.md，也不要输出仅供执行流使用的 Proposal 结构。",
       "默认不要修改文件、不要执行命令、不要调用写入类工具；如果本轮运行面已经是 EXECUTE、用户已通过批准选项进入执行，或工具审批卡随后批准了具体操作，则可以按批准范围使用写入、命令、浏览器等真实操作工具。",
-      "如果你判断下一步需要真实操作（写文件、改代码、运行命令、Git、部署、外部写入、生成交付文件等），先输出简短方案和 `<user_options>`：第一个选项用 action=\"approve_operation_once\" 表达“批准执行本轮操作”，第二个用 action=\"adjust_plan\" 表达“继续调整方案”，必要时第三个用 action=\"cancel_operation\" 表达取消。输出选项后立即停止。",
-      "如果不确定用户到底是要继续讨论/调整方案，还是要进入真实执行，不要自作主张；必须给出 `<user_options>` 让用户选择这轮是继续调整方案、先出正式计划，还是批准真实操作。",
+      "如果你判断下一步需要真实操作（写文件、改代码、运行命令、Git、部署、外部写入、生成交付文件等），先输出简短方案和 `<user_options>`，只提供一个 action=\"approve_operation_once\" 的“批准执行本轮操作”选项，然后立即停止。不要再输出泛化的“继续调整方案”或“取消操作”：用户可在选项区输入具体调整意见，也可用独立的“结束本轮”停止。",
+      "如果不确定用户到底是要继续讨论、先出正式计划，还是进入真实执行，不要自作主张；给出 2-3 个语义明确且互不重复的方向选择。不得用泛化的“继续调整方案”代替具体方向。",
       "不要再提及需要用户去切换 Chat / Fast / Plan 之类的界面选项。",
     ].join("\n"));
   }
@@ -1091,7 +1091,7 @@ export function buildSystemPrompt(
         tfl.push(exposedPlanWriteToolNames.length > 0
           ? `Plan turn — read-only evidence gathering first, then write \`.MAIN/plans/plan.md\` with ${planWriteToolText}. No source edits, no tasks.md before approval.`
           : "Plan turn — read-only evidence gathering first, then output a visible `<proposed_plan>` because no plan write tool is exposed. No source edits, no tasks.md before approval.");
-        tfl.push("Use \`<user_options>\` only for real branching decisions, not for generic 'continue reading' prompts.");
+        tfl.push("Use \`<user_options>\` only for real branching decisions, not for generic 'continue reading' prompts. Never emit \`approve_operation_once\`, \`adjust_plan\`, or \`cancel_operation\` as plan approval; the Plan review surface owns approval after plan.md is ready.");
         tfl.push("If plan isn't ready, give 2-4 clear options; don't force a full plan.md.");
         tfl.push(exposedPlanWriteToolNames.length > 0
           ? "When plan is mature, write plan.md; fall back to \`<proposed_plan>\` only if write tools are unavailable."
@@ -1100,14 +1100,14 @@ export function buildSystemPrompt(
           ? "Plan artifacts: plan.md is mandatory when plan write tools are exposed, design.md optional (evidence ledger), tasks.md is execution-only."
           : "Plan artifacts: plan.md is not mandatory when no plan write tool is exposed; tasks.md is execution-only.");
         tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "Keep plan.md concise: title, summary, key changes, API/interface impact, test plan, assumptions. No tutorial text, no full code dumps."
-          : "Keep the visible plan concise: title, summary, key changes, API/interface impact, test plan, assumptions. No tutorial text, no full code dumps.");
+          ? "Keep plan.md concise: title, summary, confirmed evidence, key changes, API/interface impact, test plan, assumptions. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps."
+          : "Keep the visible plan concise: title, summary, confirmed evidence, key changes, API/interface impact, test plan, assumptions. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps.");
         tfl.push(tabularWorkflowPlanInstruction);
       } else {
         tfl.push(exposedPlanWriteToolNames.length > 0
           ? `规划回合：先只读探索，证据足够后用 ${planWriteToolText} 写 \`.MAIN/plans/plan.md\`。批准前不修改源码、不生成 tasks.md。`
           : "规划回合：先只读探索，证据足够后输出可见 `<proposed_plan>`；本轮没有计划写入工具时不要伪造工具调用。批准前不修改源码、不生成 tasks.md。");
-        tfl.push("真正分叉才用 \`<user_options>\`，不给'继续读取'类泛化选项。");
+        tfl.push("真正分叉才用 \`<user_options>\`，不给'继续读取'类泛化选项。计划审批不得输出 \`approve_operation_once\`、\`adjust_plan\` 或 \`cancel_operation\`；plan.md 就绪后只由 Plan 审批区处理批准。");
         tfl.push("方案未收敛时给 2-4 个明确选择，不要强行写完整 plan.md。");
         tfl.push(exposedPlanWriteToolNames.length > 0
           ? "方案成熟时写入 plan.md；写入工具不可用才降级为 \`<proposed_plan>\`。"
@@ -1116,8 +1116,8 @@ export function buildSystemPrompt(
           ? "计划文件：有计划写入工具时 plan.md 必选，design.md 可选（证据台账），tasks.md 属执行阶段。"
           : "计划文件：没有计划写入工具时 plan.md 不强制，tasks.md 属执行阶段。");
         tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "plan.md 精简：标题、摘要、关键改动、API/接口影响、测试方案、假设。不写教程、不输出完整代码。"
-          : "可见方案保持精简：标题、摘要、关键改动、API/接口影响、测试方案、假设。不写教程、不输出完整代码。");
+          ? "plan.md 精简：标题、摘要、已确认证据、关键改动、API/接口影响、测试方案、假设。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。"
+          : "可见方案保持精简：标题、摘要、已确认证据、关键改动、API/接口影响、测试方案、假设。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。");
         tfl.push(tabularWorkflowPlanInstruction);
       }
     } else {

@@ -90,8 +90,12 @@ export function shouldSuppressAgentToolEcho(blocks: any[], agentIndex: number): 
   const agentNormalized = normalizeTranscriptDedupeText(text);
   const toolNormalized = normalizeTranscriptDedupeText(nearbyToolText);
   if (!agentNormalized || !toolNormalized) return false;
+  if (agentNormalized === toolNormalized) return true;
   if (agentNormalized.length >= 24 && toolNormalized.includes(agentNormalized)) return true;
-  if (toolNormalized.length >= 24 && agentNormalized.includes(toolNormalized)) return true;
+  if (toolNormalized.length >= 24 && agentNormalized.includes(toolNormalized)) {
+    const addedMeaningfulChars = agentNormalized.length - toolNormalized.length;
+    if (!isSubstantiveModelFeedback(text) || addedMeaningfulChars < 40) return true;
+  }
   if (!isThinToolNarration(text)) return false;
   const agentTokens = extractPathishTokens(text);
   if (agentTokens.length === 0) return false;

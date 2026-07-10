@@ -34,6 +34,7 @@ import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import {
   applyPlanQualityRuntimeState,
   applyPlanReadOnlyConvergenceRuntimeState,
+  applyPlanRuntimePhase,
 } from "./planRuntimeState";
 import type { AgentLoopGuardRuntimeState } from "./loopGuardRuntimeState";
 import {
@@ -147,6 +148,10 @@ export async function handleToolResultRecoveryPhase(input: {
   let loopGuardRuntimeState = input.loopGuardRuntimeState;
   let executeRecoveryState = input.executeRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
+  const setPlanRuntimePhaseAndSync: SetPlanRuntimePhase = (phase, reason, status) => {
+    input.setPlanRuntimePhase(phase, reason, status);
+    planRuntimeState = applyPlanRuntimePhase(planRuntimeState, { phase, reason }).state;
+  };
 
   const planQualityRecovery = handlePlanQualityRecoveryAfterToolResults({
     callbacks: input.callbacks,
@@ -157,7 +162,7 @@ export async function handleToolResultRecoveryPhase(input: {
     recentPlanToolActivity: input.recentPlanToolActivity,
     attemptedPlanWriteTargets: input.attemptedPlanWriteTargets,
     latestUserPromptText: input.latestUserPromptText,
-    setPlanRuntimePhase: input.setPlanRuntimePhase,
+    setPlanRuntimePhase: setPlanRuntimePhaseAndSync,
   });
   planRuntimeState = applyPlanQualityRuntimeState(
     planRuntimeState,
@@ -355,7 +360,7 @@ export async function handleToolResultRecoveryPhase(input: {
     recentPlanToolActivity: input.recentPlanToolActivity,
     lastAssistantTextForCheckpoint:
       input.evidenceRuntimeState.lastAssistantTextForCheckpoint,
-    setPlanRuntimePhase: input.setPlanRuntimePhase,
+    setPlanRuntimePhase: setPlanRuntimePhaseAndSync,
   });
   planRuntimeState = applyPlanReadOnlyConvergenceRuntimeState(
     planRuntimeState,

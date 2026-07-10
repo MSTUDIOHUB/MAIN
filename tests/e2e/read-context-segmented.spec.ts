@@ -9,69 +9,42 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("read/search progress stays visible when interleaved with folded command steps", async ({ page }) => {
+test("read/search progress stays accessible in the process archive without a ChatArea ledger", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-interleaved");
 
-  const ledger = page.getByTestId("turn-activity-notice").first().getByTestId("effective-progress-ledger");
-  await expect(ledger).toBeVisible();
-  await expect(ledger).toContainText("有效进展");
-  await expect(ledger).toContainText("*release*.md");
-
-  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
+  const archiveToggle = page.getByTestId("turn-process-archive-toggle");
+  await expect(archiveToggle).toBeVisible();
+  await expect(archiveToggle).toContainText("package.json");
+  await expect(archiveToggle).toContainText("git status --short --branch");
   await expect(page.getByTestId("progress-block")).toHaveCount(0);
-  await expect(page.getByTestId("read-context-group")).toHaveCount(3);
-  await expect(page.getByTestId("completed-tool-group")).toHaveCount(2);
-  await expect(page.getByTestId("read-context-group").filter({ hasText: "package.json" })).toBeVisible();
-  await expect(page.getByTestId("read-context-group").filter({ hasText: "useAppStore.ts" })).toBeVisible();
-  await expect(page.getByTestId("read-context-group").filter({ hasText: "*release*.md" })).toBeVisible();
-  await expect(page.getByTestId("completed-tool-group").filter({ hasText: "git status --short --branch" })).toBeVisible();
-  await expect(page.getByTestId("completed-tool-group").filter({ hasText: "npm run build -- --mode test" })).toBeVisible();
+  await archiveToggle.click();
+  const archiveDetails = page.getByTestId("turn-process-archive-details");
+  await expect(archiveDetails).toContainText("package.json");
+  await expect(archiveDetails).toContainText("useAppStore.ts");
+  await expect(archiveDetails).toContainText("release*.md");
+  await expect(archiveDetails).toContainText("git status --short --branch");
+  await expect(archiveDetails).toContainText("npm run build -- --mode test");
   await expect(page.getByText("读取与命令交错完成，命令步骤已折叠保留。")).toBeVisible();
 });
 
-test("visible agent output remains in transcript between folded read/search groups", async ({ page }) => {
+test("substantive stage summary remains in ChatArea while read/search evidence stays folded", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-agent-segment");
 
   await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
   await expect(page.getByTestId("progress-block")).toHaveCount(0);
-  await expect(page.getByTestId("turn-activity-notice").first().getByTestId("effective-progress-ledger")).toContainText("README.md");
+  await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
   await expect(page.getByText("第二段读取完成。")).toBeVisible();
+  const stageSummary = page.getByText("阶段性结论：第一段读取确认 ChatArea 会把读取记录按正文边界分段。");
+  await expect(stageSummary).toBeVisible();
 
-  const groups = page.getByTestId("read-context-group");
-  await expect(groups).toHaveCount(2);
-  const firstGroup = groups.nth(0);
-  const secondGroup = groups.nth(1);
-  await expect(firstGroup).toContainText("已读取 2 项上下文");
-  await expect(secondGroup).toContainText("已读取 1 项上下文");
-  await expect(page.getByText("第一段读取完成，先输出阶段结论。")).toBeVisible();
-  await expect
-    .poll(async () =>
-      page.evaluate(() => {
-        const groups = Array.from(document.querySelectorAll('[data-testid="read-context-group"]'));
-        const firstAgent = Array.from(document.querySelectorAll(".chat-agent-content"))
-          .find((node) => node.textContent?.includes("第一段读取完成"));
-        if (groups.length < 2 || !firstAgent) return false;
-        const firstGroupTop = groups[0].getBoundingClientRect().top;
-        const agentTop = firstAgent.getBoundingClientRect().top;
-        const secondGroupTop = groups[1].getBoundingClientRect().top;
-        return firstGroupTop < agentTop && agentTop < secondGroupTop;
-      }),
-    )
-    .toBe(true);
-
-  await firstGroup.click();
-  let details = page.getByTestId("read-context-group-details");
-  await expect(details).toBeVisible();
-  await expect(details).toContainText("ChatArea.tsx");
-  await expect(page.getByTestId("read-context-item")).toHaveCount(2);
-  await firstGroup.click();
-  await expect(page.getByTestId("read-context-group-details")).toHaveCount(0);
-
-  await secondGroup.click();
-  details = page.getByTestId("read-context-group-details");
-  await expect(details).toBeVisible();
-  await expect(details).toContainText("README.md");
-  await expect(page.getByTestId("read-context-item")).toHaveCount(1);
+  const processTimeline = page.getByTestId("live-turn-process-timeline");
+  await expect(processTimeline).toBeVisible();
+  await expect(processTimeline).not.toContainText("阶段性结论：第一段读取确认");
+  await page.getByTestId("live-turn-process-toggle").click();
+  const processDetails = page.getByTestId("live-turn-process-details");
+  await expect(processDetails).toContainText("ChatArea.tsx");
+  await expect(processDetails).toContainText("README.md");
 });
 
 test("thin read narration becomes transparent while the substantive model explanation stays visible", async ({ page }) => {
@@ -81,49 +54,32 @@ test("thin read narration becomes transparent while the substantive model explan
   await expect(page.getByText("核心问题映射：CSV 数据已加载")).toBeVisible();
   await expect(page.getByText("让我继续读取关键文件来确认问题根因。")).toHaveCount(0);
 
-  const groups = page.getByTestId("read-context-group");
-  await expect(groups).toHaveCount(1);
-  const group = groups.first();
-  await expect(group).toContainText("已读取 3 项上下文");
-  await expect(group).toContainText("App.tsx");
-  await expect(group).toContainText("OverviewCards.tsx");
-  await expect(group).toContainText("CourseBarChart.tsx");
-
-  await group.click();
-  const details = page.getByTestId("read-context-group-details");
-  await expect(details).toBeVisible();
-  await expect(page.getByTestId("read-context-item")).toHaveCount(3);
+  const processTimeline = page.getByTestId("live-turn-process-timeline");
+  await expect(processTimeline).toBeVisible();
+  await page.getByTestId("live-turn-process-toggle").click();
+  const details = page.getByTestId("live-turn-process-details");
+  await expect(details).toContainText("App.tsx");
+  await expect(details).toContainText("OverviewCards.tsx");
+  await expect(details).toContainText("CourseBarChart.tsx");
 });
 
-test("effective progress stays in ChatArea after plan card and follow-up messages", async ({ page }) => {
+test("effective progress stays out of ChatArea after plan card and follow-up messages", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-persistent-progress");
 
   const chat = page.getByTestId("chat-scroll-container");
-  await expect(chat.getByTestId("live-turn-process-toggle")).toHaveCount(0);
-  const progressLedger = chat.getByTestId("turn-activity-notice").first().getByTestId("effective-progress-ledger");
-  await expect(progressLedger).toBeVisible();
-  await expect(progressLedger).toContainText("有效进展");
-  await expect(progressLedger).toContainText("plan.md");
+  await expect(chat.getByTestId("effective-progress-ledger")).toHaveCount(0);
+  await expect(chat.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(chat.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
   await expect(chat.getByTestId("progress-block")).toHaveCount(0);
-  await progressLedger.getByTestId("effective-progress-ledger-toggle").click();
-  await expect(progressLedger.getByTestId("effective-progress-ledger-details")).toContainText("dashboardStore.ts");
-  await expect(progressLedger.getByTestId("effective-progress-ledger-details")).toContainText("x2 / 1 cached");
 
-  const readGroup = chat.getByTestId("read-context-group").first();
-  await expect(readGroup).toBeVisible();
-  await expect(readGroup).toContainText("已读取 2 项有效上下文（共 3 次）");
-  await expect(readGroup).toContainText("去重 1 次重复读取");
-  await expect(readGroup).toContainText("缓存复用");
-
-  await expect(chat.getByText("我已经生成了可审批计划文件 .MAIN/plans/plan.md，现在停在审批阶段。")).toBeVisible();
-  await expect(chat.getByText("后续消息已显示；上一轮有效进展应仍保留在 ChatArea 正文中。")).toBeVisible();
+  await expect(chat.getByText("计划进展保留")).toBeVisible();
+  await expect(chat.getByText("后续消息已显示；上一轮工具记录仍保留在折叠上下文分组中。")).toBeVisible();
   await expect(page.getByTestId("execution-capsule")).toHaveCount(0);
 
-  await readGroup.click();
-  const details = chat.getByTestId("read-context-group-details");
-  await expect(details).toBeVisible();
-  await expect(details).toContainText("dashboardStore.ts");
-  await expect(details).toContainText("x2 / 1 cached");
-  await expect(details).toContainText("useCsvParser.ts");
+  const processToggle = chat.getByTestId("live-turn-process-toggle");
+  await expect(processToggle).toBeVisible();
+  await processToggle.click();
+  const processDetails = chat.getByTestId("live-turn-process-details");
+  await expect(processDetails).toContainText("dashboardStore.ts");
+  await expect(processDetails).toContainText("useCsvParser.ts");
 });

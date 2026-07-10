@@ -62,6 +62,10 @@ const {
   normalizeThoughtSummaryForCompare,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/thoughtDisplay.ts"));
 
+const {
+  shouldRetainStageSummary,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/modelFeedbackDedupe.ts"));
+
 function countOccurrences(text, needle) {
   return String(text || "").split(needle).length - 1;
 }
@@ -231,4 +235,25 @@ test("thought summary comparison normalizes near-duplicate English lines", () =>
     normalizeThoughtSummaryForCompare("The file keeps returning same stub. Let try reading specific line ranges to get content need."),
     normalizeThoughtSummaryForCompare("The file keeps returning the same stub. Let me try reading specific line ranges to get the content I need."),
   );
+});
+
+test("stage summary retention keeps findings and structured conclusions but drops operation previews", () => {
+  assert.equal(
+    shouldRetainStageSummary("阶段性结论：已确认状态丢失发生在流式结束后，根因是展示条件仍要求 isStreaming。"),
+    true,
+  );
+  assert.equal(
+    shouldRetainStageSummary("阶段性结论：状态丢失发生在流式结束后。接下来我会继续检查并运行验证。"),
+    true,
+  );
+  assert.equal(
+    shouldRetainStageSummary([
+      "当前审核摘要：",
+      "1. ChatArea 中的阶段性正文应保留。",
+      "2. 与工具输出重复的短旁白应折叠。",
+    ].join("\n")),
+    true,
+  );
+  assert.equal(shouldRetainStageSummary("接下来我会继续读取相关文件并运行测试。"), false);
+  assert.equal(shouldRetainStageSummary("接下来我会继续读取文件并收集证据。"), false);
 });

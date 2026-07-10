@@ -179,6 +179,16 @@ test("ready evidence gets one model-authored plan recovery pass instead of fallb
     action: "pause_blocked",
     reason: "ready_evidence_missing_visible_plan_after_recovery",
   });
+
+  assert.deepEqual(resolvePlanSuppressedToolRecovery({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    evidenceReadiness: "ready_for_plan",
+    targetedRecoveryPasses: 1,
+  }), {
+    action: "pause_blocked",
+    reason: "suppressed_tool_ready_evidence_missing_visible_plan_after_recovery",
+  });
 });
 
 test("insufficient plan evidence allows targeted recovery passes then pauses", () => {

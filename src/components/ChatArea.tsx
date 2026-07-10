@@ -49,8 +49,6 @@ import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type T
 import {
   buildRuntimeProgressLedger,
   buildRuntimeProgressProjection,
-  summarizeRuntimeProgressLedger,
-  type RuntimeProgressLedgerItem,
 } from "../lib/runtimeProgressLedger";
 import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
 import { appendDebugLog } from "../lib/debugLog";
@@ -64,7 +62,7 @@ import {
   normalizeCapsuleProgressText,
   normalizeTranscriptDedupeText,
 } from "../lib/chat/chatContentPreview";
-import { isSubstantiveModelFeedback } from "../lib/modelFeedbackDedupe";
+import { shouldRetainStageSummary } from "../lib/modelFeedbackDedupe";
 import {
   getAgentVisibleMarkdownText,
   getLastAgentSummaryText,
@@ -852,23 +850,17 @@ function TurnActivityNotice({
   isThinking,
   language,
   chatFontSize,
-  progressItems,
 }: {
   activityText?: string;
   thoughtSummaryText?: string;
   isThinking?: boolean;
   language: "zh" | "en";
   chatFontSize: number;
-  progressItems?: RuntimeProgressLedgerItem[];
   text?: string;
 }) {
-  const [isProgressOpen, setIsProgressOpen] = useState(false);
   const resolvedThoughtSummaryText = String(thoughtSummaryText || "").trim();
   const resolvedActivityText = String(activityText || "").trim();
-  const resolvedProgressItems = Array.isArray(progressItems) ? progressItems.filter(Boolean) : [];
-  const progressProjection = buildRuntimeProgressProjection(resolvedProgressItems, language, 4);
-  const hasProgressLedger = resolvedProgressItems.length > 0 && !!progressProjection.summary;
-  if (!resolvedThoughtSummaryText && !resolvedActivityText && !hasProgressLedger) return null;
+  if (!resolvedThoughtSummaryText && !resolvedActivityText) return null;
   const thoughtTitle = language === "zh"
     ? isThinking ? "正在整理思路" : "思考摘要"
     : isThinking ? "Thinking" : "Thinking summary";
@@ -880,39 +872,6 @@ function TurnActivityNotice({
       {resolvedActivityText && (
         <div data-testid="turn-activity-text" className="mb-2 font-mono text-[11px] text-[#93c5fd]">
           {resolvedActivityText}
-        </div>
-      )}
-      {hasProgressLedger && (
-        <div
-          data-testid="effective-progress-ledger"
-          className={`${resolvedThoughtSummaryText ? "mb-3 border-b border-[rgba(96,165,250,0.14)] pb-3" : ""}`}
-        >
-          <button
-            type="button"
-            data-testid="effective-progress-ledger-toggle"
-            onClick={() => setIsProgressOpen((value) => !value)}
-            className="flex w-full min-w-0 items-center justify-between gap-3 text-left"
-          >
-            <span className="min-w-0">
-              <span className="block font-mono text-[10.5px] text-[#93c5fd]">
-                {language === "zh" ? "有效进展" : "Effective Progress"}
-              </span>
-              <span className="mt-0.5 block truncate text-[12px] text-[#bfdbfe]">
-                {progressProjection.activityText || progressProjection.summary}
-              </span>
-            </span>
-            <IconChevronRight
-              className={`h-3.5 w-3.5 shrink-0 transition-transform ${isProgressOpen ? "rotate-90" : ""}`}
-            />
-          </button>
-          <div className="mt-1 truncate text-[11px] text-[#93c5fd]">
-            {progressProjection.summary}
-          </div>
-          {isProgressOpen && (
-            <div className="mt-2">
-              <EffectiveProgressLedgerDetails items={resolvedProgressItems} />
-            </div>
-          )}
         </div>
       )}
       {resolvedThoughtSummaryText && (
@@ -928,45 +887,6 @@ function TurnActivityNotice({
           />
         </div>
       )}
-    </div>
-  );
-}
-
-function EffectiveProgressLedgerDetails({
-  items,
-}: {
-  items: RuntimeProgressLedgerItem[];
-}) {
-  const latestItems = items.filter(Boolean).slice(-4);
-  if (latestItems.length === 0) return null;
-  return (
-    <div data-testid="effective-progress-ledger-details" className="space-y-1">
-      {latestItems.map((item) => (
-        <div
-          key={item.key}
-          data-testid="effective-progress-ledger-item"
-          className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2 rounded-lg px-1.5 py-1 text-[11px]"
-        >
-          <span className={`mt-1 h-2 w-2 rounded-full ${
-            item.status === "failed" || item.status === "paused"
-              ? "bg-[#f87171]"
-              : item.status === "running"
-              ? "bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.8)]"
-              : "bg-[#10b981]"
-          }`} />
-          <span className="min-w-0">
-            <span className="block truncate font-medium text-[var(--surface-text)]">{item.title}</span>
-            {item.summary && (
-              <span className="mt-0.5 block truncate text-[var(--surface-text-subtle)]">{item.summary}</span>
-            )}
-          </span>
-          {(item.repeatCount > 1 || item.cacheHits > 0) && (
-            <span className="shrink-0 rounded-full border border-[#334155] bg-[#0f172a] px-1.5 py-0.5 text-[9px] text-[#93c5fd]">
-              x{item.repeatCount}{item.cacheHits ? ` / ${item.cacheHits} cached` : ""}
-            </span>
-          )}
-        </div>
-      ))}
     </div>
   );
 }
@@ -2447,7 +2367,6 @@ export default function ChatArea({
     approvePendingReviewOnce,
     approvePendingReviewForSession,
     rejectPlan,
-    rejectPlanAndDeleteFiles,
     agentStatus,
     normalizedStreamState,
     pendingReviewTaskId,
@@ -2490,7 +2409,6 @@ export default function ChatArea({
     approvePendingReviewOnce: useAppStore((s) => s.approvePendingReviewOnce),
     approvePendingReviewForSession: useAppStore((s) => s.approvePendingReviewForSession),
     rejectPlan: useAppStore((s) => s.rejectPlan),
-    rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     agentStatus: useAppStore((s) => s.agentStatus),
     normalizedStreamState: useAppStore((s) => s.normalizedStreamState),
     pendingReviewTaskId: useAppStore((s) => s.pendingReviewTaskId),
@@ -3360,21 +3278,15 @@ export default function ChatArea({
     const substantiveIntermediateAgentBlockIds = new Set(blocks
       .map((block, idx) => ({ block, idx }))
       .filter(({ block, idx }) => {
-      if (idx === finalVisibleAgentIndex) return false;
-      if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
-      if (Array.isArray(block.options) && block.options.length > 0) return false;
-      if (isTransparentToolNarrationBlock(block)) return false;
-      const text = getAgentVisibleMarkdownText(block);
-      const content = String(text || "").trim();
-      if (!content) return false;
-      const isSubstantiveIntermediateText =
-        content.length > 300 ||
-        isSubstantiveModelFeedback(content) ||
-        /(?:^|\n)\s*(?:\d+[.)]|[-*])\s+/.test(content) ||
-        /(?:阶段性|结论|总结|问题|原因|根因|修复|方案|验证|阻塞|risk|issue|root cause|fix|summary|conclusion)/i.test(content);
-      if (!isSubstantiveIntermediateText) return false;
-      if (shouldSuppressAgentToolEcho(blocks, idx)) return false;
-      return true;
+        if (idx === finalVisibleAgentIndex) return false;
+        if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
+        if (Array.isArray(block.options) && block.options.length > 0) return false;
+        const text = getAgentVisibleMarkdownText(block);
+        const content = String(text || "").trim();
+        if (!content) return false;
+        if (!shouldRetainStageSummary(content)) return false;
+        if (shouldSuppressAgentToolEcho(blocks, idx)) return false;
+        return true;
       })
       .map(({ block }) => block.id));
     const hasSubstantiveIntermediateAgentText = substantiveIntermediateAgentBlockIds.size > 0;
@@ -3443,16 +3355,6 @@ export default function ChatArea({
           }
         : null;
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
-    const effectiveProgressLedger = isChatIntent
-      ? []
-      : buildRuntimeProgressLedger({
-          blocks,
-          events: runtimeEvents,
-          turnId: turn.id,
-          language,
-          maxItems: 12,
-        });
-    const effectiveProgressSummary = summarizeRuntimeProgressLedger(effectiveProgressLedger, language);
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
       ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
@@ -3481,10 +3383,14 @@ export default function ChatArea({
     };
     const latestThoughtBlock = getLatestThoughtBlock(blocks);
     const bottomThoughtSummary =
-      showReasoningDebug && turn.status !== "error" && latestThoughtBlock?.isStreaming
+      showReasoningDebug && turn.status !== "error" && latestThoughtBlock
         ? (() => {
             const summary = getThoughtSummaryText(latestThoughtBlock);
-            return liveTimelineContainsProcessText(liveProcessTimeline, summary) ? "" : summary;
+            const shouldKeepSummary = latestThoughtBlock.isStreaming || shouldRetainStageSummary(summary);
+            if (!shouldKeepSummary) return "";
+            if (liveTimelineContainsProcessText(liveProcessTimeline, summary)) return "";
+            if (processTextsOverlap(finalAgentSummaryText, summary)) return "";
+            return summary;
           })()
         : "";
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
@@ -3493,7 +3399,7 @@ export default function ChatArea({
     const shouldShowTurnActivityNotice =
       turn.status !== "error" &&
       !shouldRouteActivityNoticeToCapsule &&
-      ((isChatIntent ? false : !!activeTurnActivity) || bottomThoughtSummary || effectiveProgressLedger.length > 0);
+      ((isChatIntent ? false : !!activeTurnActivity) || bottomThoughtSummary);
     const isTurnCompletedOrStopped =
       turn.status === "done" ||
       turn.status === "completed_with_changes" ||
@@ -3856,7 +3762,6 @@ export default function ChatArea({
               isThinking={isBottomThoughtStreaming}
               language={language}
               chatFontSize={resolvedChatFontSize}
-              progressItems={effectiveProgressLedger}
             />
           )}
 
@@ -3913,7 +3818,6 @@ export default function ChatArea({
       onDismissPendingRunDecision={dismissPendingRunDecision}
       onApprovePlan={approvePlan}
       onRejectPlan={rejectPlan}
-      onRejectAndDeletePlan={planArtifacts.length > 0 ? () => void rejectPlanAndDeleteFiles() : undefined}
       onRejectDiff={handleRejectInline}
       onApproveDiffOnce={() => approvePendingReviewOnce()}
       onApproveDiffSession={() => approvePendingReviewForSession()}
@@ -4469,11 +4373,13 @@ export default function ChatArea({
             return (
               <div
                 data-testid="agent-explanation-capsule"
-                className={`agent-explanation-capsule ${isCapsuleCollapsed ? "collapsed-ring cursor-pointer" : "w-full max-w-3xl flex flex-col !items-start !justify-start !rounded-2xl !p-5"}`}
+                className={`agent-explanation-capsule ${isCapsuleCollapsed ? "collapsed-ring cursor-pointer" : `w-full max-w-3xl flex flex-col !items-start !justify-start !rounded-2xl ${hasExecutionCapsuleControls ? "!p-4" : "!p-5"}`}`}
                 style={{
                   fontSize: `${Math.max(11, resolvedChatFontSize - 1)}px`,
                   lineHeight: `${Math.max(16, Math.round((resolvedChatFontSize - 1) * 1.5))}px`,
-                  maxHeight: !isCapsuleCollapsed && chatAreaHeight ? `${chatAreaHeight * 0.58}px` : undefined,
+                  maxHeight: !isCapsuleCollapsed && chatAreaHeight
+                    ? `${chatAreaHeight * (hasExecutionCapsuleControls ? 1 : 0.58)}px`
+                    : undefined,
                   overflowY: "hidden",
                 }}
                 onClick={isCapsuleCollapsed ? () => setIsCapsuleCollapsed(false) : undefined}
@@ -4555,23 +4461,19 @@ export default function ChatArea({
                         </button>
                       </div>
 
+                      {hasExecutionCapsuleControls && (
+                        <div className={`w-full border-t pt-3 ${
+                          isLightThemeMode ? "border-[#e4e4e7]" : "border-[#27272a]/60"
+                        }`}>
+                          {executionCapsuleControls}
+                        </div>
+                      )}
+
                       {hasCapsuleFlow && isRich && (
                         <div className={`w-full border-t pt-3 text-left pr-1 ${
                           isLightThemeMode ? "border-[#e4e4e7]" : "border-[#27272a]/60"
                         }`}>
                           {renderCompactMarkdownText(persistedExplanation)}
-                        </div>
-                      )}
-
-                      {hasExecutionCapsuleControls && (
-                        <div className={`w-full ${
-                          hasCapsuleFlow
-                            ? isLightThemeMode
-                              ? "border-t border-[#e4e4e7] pt-3"
-                              : "border-t border-[#27272a]/60 pt-3"
-                            : ""
-                        }`}>
-                          {executionCapsuleControls}
                         </div>
                       )}
                     </div>

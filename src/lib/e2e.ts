@@ -1060,6 +1060,8 @@ function seedAwaitingChoiceMixedOptionsScenario() {
         options: [
           { label: "先确认代码主逻辑，再决定是否改动", value: "先确认代码主逻辑，再决定是否改动" },
           { label: "我来确认类型，然后执行修复", value: "我来确认类型，然后执行修复", action: "approve_operation_once", source: "explicit_user_options" },
+          { label: "继续调整方案", value: "继续调整上面的方案，暂不执行真实操作", action: "adjust_plan", source: "explicit_user_options" },
+          { label: "取消操作", value: "取消上面的执行操作，本轮到此为止", action: "cancel_operation", source: "explicit_user_options" },
           { label: "先确认渲染层，再回头看业务逻辑", value: "先确认渲染层，再回头看业务逻辑" },
           { label: "继续当前只读读取", value: "请继续当前只读读取。", action: "continue_readonly_once" },
           { label: "当前会话只读步骤全部批准", value: "本会话只读读取、搜索和分析步骤全部允许。", action: "allow_readonly_session" },
@@ -1601,7 +1603,10 @@ function seedReadContextAgentSegmentScenario() {
       id: useAppStore.getState()._nextTaskId(),
       turnId,
       type: "agent" as const,
-      content: "第一段读取完成，先输出阶段结论。",
+      content: [
+        "阶段性结论：第一段读取确认 ChatArea 会把读取记录按正文边界分段。",
+        "这说明上下文没有丢失；后续只需要核对 README 中的展示约束。",
+      ].join("\n\n"),
       streaming: false,
     },
     {
@@ -1892,7 +1897,7 @@ function seedReadContextPersistentProgressScenario() {
       id: followupAgentBlockId,
       turnId: followupTurnId,
       type: "agent" as const,
-      content: "后续消息已显示；上一轮有效进展应仍保留在 ChatArea 正文中。",
+      content: "后续消息已显示；上一轮工具记录仍保留在折叠上下文分组中。",
       streaming: false,
     },
   ];
@@ -2174,6 +2179,7 @@ function seedProcessDisplayScenario() {
       ...state.config,
       language: "zh",
       workflowMode: "chat",
+      reasoningDisplay: "debug_summary",
     },
     currentWorkspace: "/tmp/e2e-process-display",
     sessionsByWorkspace: {
@@ -2223,8 +2229,8 @@ function seedProcessDisplayScenario() {
         turnId,
         type: "thought",
         content: [
-          "我已经完成设置项检查。",
-          "现在正在整理验证结果，并确认最终回复只保留最新步骤摘要。",
+          "阶段性结论：设置项检查已经完成。",
+          "验证结果确认，有用的思考摘要应在流式结束后继续保留。",
         ].join("\n\n"),
         isStreaming: false,
         duration: 1,

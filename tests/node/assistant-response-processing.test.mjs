@@ -117,6 +117,24 @@ test("assistant response processing preserves provider reasoning as hidden histo
   assert.equal(input.turnContextEvents.some((event) => event.type === "reasoning" && event.chars === reasoningContent.length), true);
 });
 
+test("assistant response processing enforces the configured hidden reasoning display cap", () => {
+  const reasoningContent = "Need to inspect another branch before concluding. ".repeat(100);
+  const result = processAssistantStreamResponse(baseInput({
+    maxHiddenChars: 240,
+    streamResult: {
+      content: "Visible answer",
+      reasoningContent,
+      reasoningField: "reasoning_content",
+      toolCalls: [],
+      finishReason: "stop",
+    },
+  }));
+
+  assert.equal(result.providerReasoningForHistory.reasoningContent, reasoningContent);
+  assert.ok(result.normalized.hiddenThought.length <= 240);
+  assert.match(result.normalized.hiddenThought, /hidden reasoning compacted/);
+});
+
 test("assistant response processing returns normalized tool calls without reasoning metadata", () => {
   const result = processAssistantStreamResponse(baseInput({
     streamResult: {

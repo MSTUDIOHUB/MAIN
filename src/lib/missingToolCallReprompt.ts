@@ -258,3 +258,22 @@ export function buildMissingToolCallContinuationPrompt(
         "4. If a missing key parameter would change the result, ask one short clarifying question first; otherwise execute the smallest verifiable step and state your assumption.\n" +
         "Now immediately continue using tools.";
 }
+
+export function buildTruncatedPlanContinuationPrompt(language: "zh" | "en"): string {
+  if (language === "zh") {
+    return [
+      "[PLAN_TRUNCATION_RECOVERY] 上一条规划输出达到了最大 Token 限制，只保留了部分可见计划。",
+      "不要从头重新分析，不要继续泛读文件，也不要输出执行批准选项。",
+      "请基于已经读取的证据，用不超过 1200 个中文字符的普通 Markdown 一次性重述完整可审批计划。必须包含：标题、摘要、已确认证据、关键改动、API/接口影响、测试方案、假设与默认值。",
+      "只把已读内容支持的文件、符号和根因写成已确认事实；未确认内容必须放入假设。凡计划修改的现有文件都必须已有定向读取证据。",
+      "不要输出实现代码块，不要输出 `<user_options>`，也不要要求用户再次批准；runtime 会将合格正文物化为 plan.md 并交给独立的 Plan 审批区。",
+    ].join("\n");
+  }
+  return [
+    "[PLAN_TRUNCATION_RECOVERY] The previous planning response hit the maximum token limit and only part of the visible plan survived.",
+    "Do not restart the analysis, continue broad reads, or emit execution-approval options.",
+    "Using only the evidence already read, restate one complete reviewable plan in no more than 1,600 English characters of plain Markdown. Include: title, summary, confirmed evidence, key changes, API/interface impact, test plan, and assumptions/defaults.",
+    "Treat only evidence-backed files, symbols, and root causes as confirmed; put anything unverified under assumptions. Every existing file marked for modification must already have targeted read evidence.",
+    "Do not output implementation code blocks or `<user_options>`, and do not request approval again; the runtime will materialize a valid plan.md and hand it to the separate Plan review surface.",
+  ].join("\n");
+}

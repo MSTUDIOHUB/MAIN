@@ -97,7 +97,6 @@ import {
   isPlanTaskTrustedComplete,
   analyzePlanDecisionFork,
   repairActionablePlanArtifactContent,
-  validateActionablePlanArtifact,
   validatePlanArtifactContent,
   type PlanArtifactQualityResult,
   type PlanArtifactRecoveryAction,
@@ -174,6 +173,7 @@ import {
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
+  validateGroundedActionablePlanArtifact,
   type PlanEvidenceRecord,
   type PlanMaterializationSource,
 } from "./planMaterialization";
@@ -3941,7 +3941,10 @@ async function executeToolCallWithLifecycle(
     if (kind && kind !== "tasks" && PLAN_ARTIFACT_MUTATION_TOOLS.has(tc.name)) {
       const nextContent = typeof resolvedArgs.content === "string" ? resolvedArgs.content : "";
       const validation = kind === "plan"
-        ? validateActionablePlanArtifact(nextContent)
+        ? validateGroundedActionablePlanArtifact({
+            content: nextContent,
+            recentToolActivity: options.recentPlanToolActivity,
+          })
         : validatePlanArtifactContent(nextContent, kind);
       if (!validation.ok) {
         const qualityResult = kind === "plan"
@@ -4304,7 +4307,10 @@ async function buildPlanArtifactMutationValidationError(
 
   if (kind !== "tasks") {
     let validation = kind === "plan"
-      ? validateActionablePlanArtifact(nextContent)
+      ? validateGroundedActionablePlanArtifact({
+          content: nextContent,
+          recentToolActivity: options.recentToolActivity,
+        })
       : validatePlanArtifactContent(nextContent, kind);
     if (
       kind === "plan" &&
@@ -4330,7 +4336,10 @@ async function buildPlanArtifactMutationValidationError(
         language,
       });
       if (canonicalized.ok && canonicalized.content) {
-        const canonicalValidation = validateActionablePlanArtifact(canonicalized.content);
+        const canonicalValidation = validateGroundedActionablePlanArtifact({
+          content: canonicalized.content,
+          recentToolActivity: options.recentToolActivity,
+        });
         if (canonicalValidation.ok) {
           args.content = canonicalized.content;
           tc.arguments = JSON.stringify({ ...args, content: canonicalized.content });
@@ -4359,7 +4368,10 @@ async function buildPlanArtifactMutationValidationError(
         language,
       });
       if (repaired.repairedSections.length > 0) {
-        const repairedValidation = validateActionablePlanArtifact(repaired.content);
+        const repairedValidation = validateGroundedActionablePlanArtifact({
+          content: repaired.content,
+          recentToolActivity: options.recentToolActivity,
+        });
         if (repairedValidation.ok) {
           args.content = repaired.content;
           tc.arguments = JSON.stringify({ ...args, content: repaired.content });

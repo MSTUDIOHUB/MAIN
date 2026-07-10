@@ -151,6 +151,7 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     effectiveToolProtocol,
     forceXmlTools: input.forceXmlTools,
     reasoningDisplay: reasoningPolicy.display,
+    maxHiddenChars: reasoningPolicy.maxHiddenChars,
     llmToolCount: input.llmToolCount,
     managedMessageCount: input.managedMessageCount,
     currentMaxTokens: input.currentMaxTokens,

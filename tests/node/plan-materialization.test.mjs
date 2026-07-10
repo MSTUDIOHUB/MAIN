@@ -61,6 +61,7 @@ const {
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
   summarizePlanEvidenceDetail,
+  validatePlanEvidenceGrounding,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
@@ -126,7 +127,7 @@ test("materializes valid visible plan text into plan.md artifact", () => {
     ].join("\n"),
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.equal(result.kind, "plan");
   assert.equal(result.path, ".MAIN/plans/plan.md");
   assert.match(result.content || "", /^# (?:Proposed Plan|计划)/);
@@ -164,7 +165,7 @@ test("materializes Codex-style proposed_plan blocks without requiring write tool
     userGoal: "Refactor MAIN Plan mode.",
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.equal(result.kind, "plan");
   assert.equal(result.path, ".MAIN/plans/plan.md");
   assert.doesNotMatch(result.content || "", /<\/?proposed_plan>/i);
@@ -178,6 +179,10 @@ test("canonicalizes OMLX proposed_plan with verification steps and assumptions",
       "",
       "## 摘要",
       "基于已确认的 `src/lib/planMaterialization.ts` 和 `src/lib/planRuntime.ts` 代码，以及 63 个通过的测试，Codex-style Plan flow refactor 已落地。本计划旨在通过构造真实 Plan 请求，验证 OMLX 本地模型能否正确触发 `<proposed_plan>` 解析并物化为 `.MAIN/plans/plan.md`。",
+      "",
+      "## 已确认证据",
+      "- `src/lib/planMaterialization.ts` 已支持 `<proposed_plan>` 解析与 plan.md 物化。",
+      "- `src/lib/planRuntime.ts` 已定义 Plan 阶段的收敛与恢复边界。",
       "",
       "## 关键验证步骤",
       "1. **构造模拟请求**：生成包含 `<proposed_plan>` 标签的 Markdown 内容，模拟 OMLX 模型输出。",
@@ -209,7 +214,7 @@ test("canonicalizes OMLX proposed_plan with verification steps and assumptions",
     language: "zh",
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.equal(result.path, ".MAIN/plans/plan.md");
   assert.match(result.content || "", /## 关键改动/);
   assert.match(result.content || "", /## 假设与默认值/);
@@ -513,13 +518,13 @@ test("canonicalizes Chinese formal repair plan with likely root causes", () => {
     evidence: [
       "read_file src/store/dashboardStore.ts; excerpt=dashboard store aggregates imported rows into overview metrics",
       "read_file src/hooks/useChartData.ts; excerpt=hook prepares chart data from imported records",
-      "grep_search src/App.tsx; excerpt=type ThemeType = 'light' | 'dark'",
+      "read_file src/App.tsx; excerpt=type ThemeType = 'light' | 'dark'",
     ],
     files: ["src/store/dashboardStore.ts", "src/hooks/useChartData.ts", "src/App.tsx"],
     language: "zh",
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.equal(result.path, ".MAIN/plans/plan.md");
   assert.equal(result.source, "canonicalized_visible_plan");
   assert.match(result.content || "", /^# 计划/);
@@ -1362,7 +1367,7 @@ test("canonicalization preserves long detailed lines and markdown formatting in 
     language: "zh",
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.equal(result.path, ".MAIN/plans/plan.md");
   // The content must contain the exact long step with formatting and WITHOUT truncation/ellipses!
   assert.match(result.content || "", /src\/lib\/orchestrator\.ts/);
@@ -1402,4 +1407,235 @@ test("auto-detects framework design and game dev keywords to route to design.md 
   assert.equal(result.ok, true);
   assert.equal(result.kind, "design");
   assert.equal(result.path, ".MAIN/plans/design.md");
+});
+
+test("plan evidence grounding rejects modified existing files that were never read", () => {
+  const validation = validatePlanEvidenceGrounding({
+    content: [
+      "# 计划",
+      "",
+      "## 已确认证据",
+      "- 已读取 `src/main.js` 并确认当前打开文件入口。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/main.js` 的事件处理。",
+      "- 更新 `index.html` 的脚本入口。",
+    ].join("\n"),
+    recentToolActivity: [
+      { name: "read_file", target: "src/main.js", status: "succeeded" },
+    ],
+  });
+
+  assert.equal(validation.ok, false);
+  assert.equal(validation.recoveryAction, "targeted_evidence");
+  assert.match(validation.reason || "", /ungrounded_plan_change_targets:index\.html/);
+});
+
+test("materialization rejects the logged MD Viewer plan when index.html was proposed without read evidence", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan: 修复文件打开链路",
+      "",
+      "## 摘要",
+      "- 目标：修复双击 Markdown 文件和工具栏打开按钮失效。",
+      "",
+      "## 已确认证据",
+      "- 已读取 `src-tauri/src/main.rs` 与 `src/main.js`，需要对齐后端事件和前端监听。",
+      "",
+      "## 关键改动",
+      "1. 修改 `src-tauri/src/main.rs` 的文件打开事件。",
+      "2. 修改 `src/main.js` 的事件监听和打开按钮处理。",
+      "3. 更新 `index.html` 的脚本引入方式。",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 内部事件 payload 会变化，不新增公共 API。",
+      "",
+      "## 测试方案",
+      "- 运行构建并手动验证双击与工具栏打开。",
+      "",
+      "## 假设与默认值",
+      "- 默认保持其他编辑功能不变。",
+    ].join("\n"),
+    evidenceRecords: [
+      { tool: "read_file", target: "src-tauri/src/main.rs", status: "succeeded", summary: "emits file-open" },
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "listens for open-file-event" },
+      { tool: "read_file", target: "src-tauri/tauri.conf.json", status: "succeeded", summary: "Tauri app config" },
+    ],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /ungrounded_plan_change_targets:index\.html/);
+});
+
+test("plan evidence grounding requires an explicit confirmed-evidence section", () => {
+  const validation = validatePlanEvidenceGrounding({
+    content: [
+      "# 计划",
+      "",
+      "## 摘要",
+      "- 已确认当前事件名不一致。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/main.js` 的事件处理。",
+    ].join("\n"),
+    evidence: [
+      "read_file src/main.js; excerpt=listen('open-file-event')",
+    ],
+  });
+
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, "missing_plan_evidence_section");
+});
+
+test("plan evidence grounding accepts read-backed change targets with confirmed evidence", () => {
+  const validation = validatePlanEvidenceGrounding({
+    content: [
+      "# 计划",
+      "",
+      "## 已确认证据",
+      "- `src/main.js` 当前监听 `open-file-event`。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/main.js` 的事件处理。",
+    ].join("\n"),
+    evidenceRecords: [
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "listen('open-file-event')" },
+    ],
+  });
+
+  assert.equal(validation.ok, true);
+});
+
+test("plan evidence grounding requires a concrete change target after source reads", () => {
+  const validation = validatePlanEvidenceGrounding({
+    content: [
+      "# 计划",
+      "",
+      "## 已确认证据",
+      "- `src/main.js` 当前监听 `open-file-event`。",
+      "",
+      "## 关键改动",
+      "- 修复前端事件监听并统一 payload。",
+    ].join("\n"),
+    evidenceRecords: [
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "listen('open-file-event')" },
+    ],
+  });
+
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, "missing_grounded_plan_change_target");
+  assert.equal(validation.recoveryAction, "rewrite");
+});
+
+test("rejects the logged canonicalized MD Viewer plan with polluted summary and code fragments", () => {
+  const content = [
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 用户目标：可能原因（按优先级排序）：",
+    "- 用户目标：Tauri 后端未注册 on_open_url / on_file_open 事件监听",
+    "- 用户目标：Tauri 2.x 中，系统双击文件触发的事件需要注册回调",
+    "- 已读取文件：src-tauri/src/main.rs；发现：// Prevents additional console window...",
+    "",
+    "## 已确认证据",
+    "- 已读取文件：src/main.js；发现：// MD Viewer - 主逻辑...",
+    "",
+    "## 关键改动",
+    "- ```javascript",
+    "- // 确保正确引入 dialog API",
+    "- import { open } from '@tauri-apps/plugin-dialog';",
+    "- async function handleOpenFile() {",
+    "- const selected = await open({",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- app.on_file_open()：新增 Rust 后端注册文件打开事件。",
+    "",
+    "## 测试方案",
+    "- 运行 npm run tauri build 并验证冷启动与已有实例。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持编辑功能不变。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, false);
+  assert.ok([
+    "duplicated_user_goal_summary",
+    "raw_evidence_in_plan_summary",
+    "code_fragments_in_plan_key_changes",
+  ].includes(validation.reason || ""));
+});
+
+test("actionable plan quality rejects implementation-heavy code dumps", () => {
+  const largeCode = "const value = 1;\n".repeat(80);
+  const content = [
+    "# Proposed Plan: 修复事件链路",
+    "",
+    "## 摘要",
+    "- 修复事件名不一致导致的文件打开失败。",
+    "",
+    "## 关键改动",
+    "1. 修改 `src/main.js` 的监听逻辑。",
+    "2. 修改 `src-tauri/src/main.rs` 的事件发送逻辑。",
+    "",
+    "```javascript",
+    largeCode,
+    "```",
+    "",
+    "```rust",
+    largeCode,
+    "```",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化。",
+    "",
+    "## 测试方案",
+    "- 运行构建并验证双击打开文件。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持其他行为不变。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, "excessive_plan_code_dump");
+});
+
+test("implementation-heavy plan drafts are rewritten by the model instead of semantically canonicalized", () => {
+  const largeCode = "const selected = await open({ multiple: false });\n".repeat(32);
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# 计划",
+      "",
+      "## 摘要",
+      "- 用户目标：修复双击 Markdown 文件无法打开的问题。",
+      "",
+      "## 已确认证据",
+      "- `src/main.js` 当前监听 `open-file-event`。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/main.js`，统一文件打开事件处理。",
+      "",
+      "```javascript",
+      largeCode,
+      "```",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 无公共 API、接口或类型变化。",
+      "",
+      "## 测试方案",
+      "- 运行构建并验证双击打开文件。",
+      "",
+      "## 假设与默认值",
+      "- 默认保持其他行为不变。",
+    ].join("\n"),
+    evidenceRecords: [
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "listen('open-file-event')" },
+    ],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "excessive_plan_code_dump");
 });
