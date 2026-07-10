@@ -24,6 +24,7 @@ export interface CreateSubmitWorkflowContextInput {
   abortCtrl: AbortController;
   timerInterval: unknown;
   sendStartedAt: number;
+  harnessRunId: string;
   turnAgentMessagesStart: number;
   getElapsedSeconds: () => number;
   PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: number;
@@ -54,6 +55,7 @@ export function createSubmitWorkflowContext(
     abortCtrl: input.abortCtrl,
     timerInterval: input.timerInterval,
     sendStartedAt: input.sendStartedAt,
+    harnessRunId: input.harnessRunId,
     streamBuffer: null,
     thinkingInterceptor: null,
     turnAgentMessagesStart: input.turnAgentMessagesStart,
@@ -67,7 +69,6 @@ export function createSubmitWorkflowContext(
     currentThoughtBlockId: null,
     thoughtStartTime: null,
     streamingAssistantDisplayBuffer: "",
-    approvedPlanHandoff: null,
     understandingProgressBlockId: null,
     understandingProgressClosed: false,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: input.PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,

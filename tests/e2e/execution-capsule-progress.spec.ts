@@ -171,9 +171,17 @@ test("double-clicking plan approval does not create a queued instruction", async
       const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
       const executionTurnId = snapshot?.pendingPlanApprovalHandoff?.executionTurnId ?? "";
       const consentTurnId = snapshot?.currentTurnExecutionConsent?.turnId ?? "";
-      return Boolean(executionTurnId && consentTurnId === executionTurnId);
+      return {
+        executionTurnId,
+        consentTurnId,
+        currentTurnId: snapshot?.currentTurnId ?? "",
+      };
     }))
-    .toBe(true);
+    .toEqual({
+      executionTurnId: "e2e-execution-capsule-panel-stability-turn",
+      consentTurnId: "e2e-execution-capsule-panel-stability-turn",
+      currentTurnId: "e2e-execution-capsule-panel-stability-turn",
+    });
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().pendingPlanApprovalHandoff?.planTurnId ?? null))
     .toBe("e2e-execution-capsule-panel-stability-turn");
@@ -184,6 +192,118 @@ test("double-clicking plan approval does not create a queued instruction", async
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().executionChildTurns ?? null))
     .toBe(0);
   await expect(page.getByTestId("composer-queued-message")).toHaveCount(0);
+});
+
+test("plan approval without a live loop restarts execution on the same conversation turn", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.dropPlanRunOwner?.());
+
+  await page.getByTestId("execution-capsule-plan-approve").click();
+
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+      return {
+        conversationTurns: snapshot?.conversationTurns ?? null,
+        currentTurnId: snapshot?.currentTurnId ?? null,
+        startedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? null,
+        pendingHandoff: snapshot?.pendingPlanApprovalHandoff ?? null,
+      };
+    }))
+    .toEqual({
+      conversationTurns: 1,
+      currentTurnId: "e2e-execution-capsule-panel-stability-turn",
+      startedForTurnId: "e2e-execution-capsule-panel-stability-turn",
+      pendingHandoff: null,
+  });
+});
+
+test("revoked plan approval cannot be executed by a stale store fallback", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.dropPlanRunOwner?.());
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.approveThenRejectBeforeFallback?.());
+
+  await page.waitForTimeout(100);
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+      return {
+        isPlanApproved: snapshot?.isPlanApproved ?? null,
+        currentTurnStatus: snapshot?.currentTurnStatus ?? null,
+        startedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? null,
+        pendingHandoff: snapshot?.pendingPlanApprovalHandoff ?? null,
+      };
+    }))
+    .toEqual({
+      isPlanApproved: false,
+      currentTurnStatus: "stopped_no_action",
+      startedForTurnId: null,
+      pendingHandoff: null,
+  });
+});
+
+test("busy plan resume queues the visible request without replacing the active owner", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+
+  const result = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.attemptBusyPlanResume?.()
+  );
+
+  expect(result).toEqual({
+    accepted: false,
+    ownerPreserved: true,
+    queuedText: "继续",
+    startedForTurnId: "e2e-execution-capsule-panel-stability-turn",
+  });
+});
+
+test("failed same-turn execution submission rolls back the started marker and preserves a retry checkpoint", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.dropPlanRunOwner?.());
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.failNextPlanExecutionSubmission?.());
+
+  await page.getByTestId("execution-capsule-plan-approve").click();
+
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+      return {
+        conversationTurns: snapshot?.conversationTurns ?? null,
+        currentTurnStatus: snapshot?.currentTurnStatus ?? null,
+        agentStatus: snapshot?.agentStatus ?? null,
+        startedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? null,
+        pendingPlanTurnId: snapshot?.pendingPlanApprovalHandoff?.planTurnId ?? null,
+      };
+    }))
+    .toEqual({
+      conversationTurns: 1,
+      currentTurnStatus: "paused",
+      agentStatus: "idle",
+      startedForTurnId: null,
+      pendingPlanTurnId: "e2e-execution-capsule-panel-stability-turn",
+    });
+
+  await page.getByTestId("plan-resume-button").click();
+
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+      return {
+        conversationTurns: snapshot?.conversationTurns ?? null,
+        currentTurnStatus: snapshot?.currentTurnStatus ?? null,
+        startedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? null,
+        pendingPlanTurnId: snapshot?.pendingPlanApprovalHandoff?.planTurnId ?? null,
+      };
+    }))
+    .toEqual({
+      conversationTurns: 1,
+      currentTurnStatus: "executing",
+      startedForTurnId: "e2e-execution-capsule-panel-stability-turn",
+      pendingPlanTurnId: null,
+    });
 });
 
 test("ExecutionCapsule appears for pending review but not pure running progress", async ({ page }) => {

@@ -309,6 +309,7 @@ export async function runSubmitAsyncWorkflowRun<
     abortCtrl: runLease.abortController,
     timerInterval: input.elapsedTimer.timerInterval,
     sendStartedAt: input.sendStartedAt,
+    harnessRunId: runLease.harnessRunMarker.runId,
     turnAgentMessagesStart: runLease.turnAgentMessagesStart,
     getElapsedSeconds: input.elapsedTimer.getElapsedSeconds,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: input.PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
@@ -338,7 +339,7 @@ export async function runSubmitAsyncWorkflowRun<
     normalizeProviderCompatibilityByRuntimeKey: input.normalizeProviderCompatibilityByRuntimeKey,
     compactCompletedTurnAgentMessages: input.compactCompletedTurnAgentMessages,
     normalizeQueuedUserMessage: input.normalizeQueuedUserMessage,
-    startApprovedPlanExecutionTurnFromHandoff: input.startApprovedPlanExecutionTurnFromHandoff,
+    startApprovedPlanExecutionInCurrentTurn: input.startApprovedPlanExecutionInCurrentTurn,
     logStoreEvent: input.logStoreEvent,
   } satisfies RunSubmitWorkflowEngineInput);
 }

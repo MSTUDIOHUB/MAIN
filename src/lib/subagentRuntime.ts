@@ -266,7 +266,7 @@ export async function executeControlledSubagent(input: {
     onPlanStageChanged: () => {},
     onPlanTasksUpdated: () => {},
     onPlanExecutionProgress: undefined,
-    onApprovedPlanHandoff: () => {},
+    onApprovedPlanExecutionStarted: () => {},
     onPlanMaxIterationsCheckpoint: undefined,
     onExecuteMaxIterationsCheckpoint: undefined,
     onTurnSummaryReady: (summary) => {

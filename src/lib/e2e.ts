@@ -3879,6 +3879,62 @@ function seedExecutionCapsulePanelStabilityScenario() {
     appendBridgeEvent("plan_prompt_reset");
   };
 
+  bridge.dropPlanRunOwner = () => {
+    useAppStore.setState({
+      agentStatus: "pending_review",
+      isGenerating: false,
+      abortController: null,
+    });
+    appendBridgeEvent("plan_run_owner_dropped");
+  };
+
+  bridge.failNextPlanExecutionSubmission = () => {
+    const originalSendMessage = useAppStore.getState().sendMessage;
+    const interceptSendMessage: typeof originalSendMessage = (text, images, options) => {
+      if (options?.runtimeIntentOverride === "execute" && options?.reuseCurrentTurn === true) {
+        useAppStore.setState({ sendMessage: originalSendMessage });
+        appendBridgeEvent("plan_execution_submission_rejected");
+        return false;
+      }
+      return originalSendMessage(text, images, options);
+    };
+    useAppStore.setState({ sendMessage: interceptSendMessage });
+  };
+
+  bridge.approveThenRejectBeforeFallback = () => {
+    useAppStore.getState().approvePlan("批准后立即撤销");
+    useAppStore.getState().rejectPlan();
+    appendBridgeEvent("plan_approval_revoked_before_fallback");
+  };
+
+  bridge.attemptBusyPlanResume = () => {
+    const owner = new AbortController();
+    useAppStore.setState((state) => ({
+      selectedMainModeKey: "main_mode",
+      lockedComposerIntent: null,
+      pendingRunDecision: null,
+      pendingRunDecisionResolver: null,
+      isPlanApproved: true,
+      planStage: "executing",
+      agentStatus: "running",
+      isGenerating: true,
+      abortController: owner,
+      pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: turnId,
+      conversationTurns: state.conversationTurns.map((turn) =>
+        turn.id === turnId ? { ...turn, status: "executing" } : turn
+      ),
+    }));
+    const accepted = useAppStore.getState().sendMessage("继续");
+    const latest = useAppStore.getState();
+    return {
+      accepted,
+      ownerPreserved: latest.abortController === owner,
+      queuedText: latest.queuedUserMessage?.text || null,
+      startedForTurnId: latest.planApprovalExecutionStartedForTurnId,
+    };
+  };
+
   bridge.showToolApprovalPrompt = () => {
     useAppStore.setState((state) => {
       const withReview = addReviewBlock(state);

@@ -90,6 +90,19 @@ export function applySubmitSendGateEffects<TState extends SubmitSendGateEffectsS
   }
 
   if (decision.action.kind === "queue") {
+    if (input.isHidden && input.options?.executionConsentGranted === true) {
+      input.logStoreEvent("send_busy_hidden_execution_rejected", {
+        reason: decision.action.reason,
+        runtimeIntentOverride: input.options?.runtimeIntentOverride ?? null,
+        turnIdOverride: input.options?.turnIdOverride ?? null,
+      });
+      return {
+        decision,
+        shouldContinue: false,
+        returnValue: false,
+        state: input.state,
+      };
+    }
     input.queueUserMessage(input.text, input.images, {
       contextMentions: input.mentionSnapshot,
       attachedFiles: input.attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),

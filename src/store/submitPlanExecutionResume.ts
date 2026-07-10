@@ -15,9 +15,9 @@ export interface SubmitPlanExecutionResumeState {
 
 export interface SubmitPlanExecutionResumeOptions {
   hidden: true;
-  createVisibleTurnForHiddenMessage: true;
-  reuseCurrentTurn: false;
-  uiParentTurnId?: string;
+  createVisibleTurnForHiddenMessage: boolean;
+  reuseCurrentTurn: boolean;
+  turnIdOverride?: string;
   preservePlanState: true;
   resolvedIntent: "plan";
   runtimeIntentOverride: "execute";
@@ -201,6 +201,7 @@ export async function runSubmitPlanExecutionResumeEffect<TState extends SubmitPl
     resumePlanTasks.length > 0 ||
     (hydratedForExecution?.tasks || latest.planTasks).length > 0;
 
+  const continuationTurnId = input.uiParentTurnId || latest.currentTurnId || undefined;
   input.resumeSubmission(
     buildTrustedPlanResumePrompt({
       language: input.preferredLanguage,
@@ -212,9 +213,9 @@ export async function runSubmitPlanExecutionResumeEffect<TState extends SubmitPl
     undefined,
     {
       hidden: true,
-      createVisibleTurnForHiddenMessage: true,
-      reuseCurrentTurn: false,
-      uiParentTurnId: input.uiParentTurnId,
+      createVisibleTurnForHiddenMessage: !continuationTurnId,
+      reuseCurrentTurn: !!continuationTurnId,
+      turnIdOverride: continuationTurnId,
       preservePlanState: true,
       resolvedIntent: "plan",
       runtimeIntentOverride: "execute",

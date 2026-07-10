@@ -13,7 +13,13 @@ import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { StreamSettings } from "../../streaming";
 import type { ToolDefinition } from "../../toolSchemas";
 import { type PlanExecutionProgressPhase } from "../../workflowModels";
-import { pruneEphemeralItems } from "../state/EphemeralPruner";
+import {
+  captureLatestUnconsumedToolResultBatch,
+  countToolResultChars,
+  markLatestUnconsumedToolResultBatch,
+  pruneEphemeralItems,
+  restoreLatestUnconsumedToolResultBatch,
+} from "../state/EphemeralPruner";
 import { strainReasoning } from "../state/ReasoningStrainer";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import type { TurnIterationContext } from "./turnIterationContext";
@@ -95,7 +101,19 @@ export function prepareManagedMessagesForIteration(input: {
   } = input;
   const { eventTurnId, turnContext } = iterationContext;
 
-  let managedAgentMessages = callbacks.getMessages() as AgentMessage[];
+  const sourceAgentMessages = callbacks.getMessages() as AgentMessage[];
+  const latestUnconsumedToolResultBatch = captureLatestUnconsumedToolResultBatch(sourceAgentMessages);
+  const batchMarkedSourceAgentMessages = markLatestUnconsumedToolResultBatch(
+    sourceAgentMessages,
+    latestUnconsumedToolResultBatch,
+  );
+  let managedAgentMessages = sourceAgentMessages;
+  let burnedToolResults = 0;
+  let burnedToolChars = 0;
+  let toolCharsAfterPrune = countToolResultChars(sourceAgentMessages);
+  let restoredToolResults = 0;
+  let reinsertedToolResults = 0;
+  let restoredToolChars = 0;
   const providerCompatibilityOverride = callbacks.shouldForceXmlForProviderCompatibility?.();
   const forceXmlTools = shouldUseXmlToolProtocol(
     config,
@@ -126,9 +144,9 @@ export function prepareManagedMessagesForIteration(input: {
     : null;
   let executeRecoveryContextAlreadyCompacted = false;
   if (isExecuteRecoveryEligible && contextForceForManagement?.shouldForce) {
-    const recoveryMessagesBefore = callbacks.getMessages().length;
+    const recoveryMessagesBefore = batchMarkedSourceAgentMessages.length;
     const recoveryManagedResult = compactContextForExecuteRecovery(
-      callbacks.getMessages(),
+      batchMarkedSourceAgentMessages,
       {
         previousMemoryState: callbacks.getContextMemoryState?.() || null,
         turnId: callbacks.getCurrentTurnId?.() || eventTurnId,
@@ -141,7 +159,15 @@ export function prepareManagedMessagesForIteration(input: {
       },
     );
     callbacks.onContextMemoryBuilt?.(recoveryManagedResult.memoryState, recoveryManagedResult.memoryPacket);
-    managedAgentMessages = recoveryManagedResult.messages as AgentMessage[];
+    const recoveryRestoration = restoreLatestUnconsumedToolResultBatch(
+      recoveryManagedResult.messages as AgentMessage[],
+      latestUnconsumedToolResultBatch,
+    );
+    toolCharsAfterPrune = countToolResultChars(recoveryManagedResult.messages as AgentMessage[]);
+    managedAgentMessages = recoveryRestoration.messages;
+    restoredToolResults += recoveryRestoration.restoredToolResults;
+    reinsertedToolResults += recoveryRestoration.reinsertedToolResults;
+    restoredToolChars += recoveryRestoration.restoredToolChars;
     if (recoveryManagedResult.changed) {
       try {
         callbacks.replaceMessages(managedAgentMessages);
@@ -254,7 +280,7 @@ export function prepareManagedMessagesForIteration(input: {
     const contextBudgets = contextBudgetsForManagement;
     const { inputBudget, outputBudget } = contextBudgets;
     const contextForce = contextForceForManagement;
-    const messagesForPruning = callbacks.getMessages();
+    const messagesForPruning = batchMarkedSourceAgentMessages;
 
     const strainResult = strainReasoning(messagesForPruning, {
       currentTurnReasoningThreshold: config.activeProfile === "local" ? 1200 : 2000,
@@ -277,6 +303,9 @@ export function prepareManagedMessagesForIteration(input: {
         purgeReasoningFromPriorTurns: true,
       },
     );
+    burnedToolResults = prunedResult.burnedToolResults;
+    burnedToolChars = prunedResult.burnedToolChars;
+    toolCharsAfterPrune = prunedResult.toolCharsAfter;
     const prunedMessages = prunedResult.messages;
 
     for (const _rep of turnContext.getBurnedReplacements()) {
@@ -336,7 +365,14 @@ export function prepareManagedMessagesForIteration(input: {
       files: managedResult.memoryState.files.length,
       packetChars: managedResult.memoryPacket.length,
     });
-    managedAgentMessages = managedResult.messages as AgentMessage[];
+    const managedRestoration = restoreLatestUnconsumedToolResultBatch(
+      managedResult.messages as AgentMessage[],
+      latestUnconsumedToolResultBatch,
+    );
+    managedAgentMessages = managedRestoration.messages;
+    restoredToolResults += managedRestoration.restoredToolResults;
+    reinsertedToolResults += managedRestoration.reinsertedToolResults;
+    restoredToolChars += managedRestoration.restoredToolChars;
     try {
       if (managedResult.changed) {
         callbacks.replaceMessages(managedAgentMessages);
@@ -386,6 +422,23 @@ export function prepareManagedMessagesForIteration(input: {
       managedResult,
       contextForce,
     }));
+  }
+
+  const toolCharsBefore = countToolResultChars(sourceAgentMessages);
+  if (toolCharsBefore > 0) {
+    logAgentEvent("ephemeral_prune_summary", {
+      iteration,
+      burnedToolResults,
+      burnedToolChars,
+      preservedToolResults: latestUnconsumedToolResultBatch?.toolResults.length || 0,
+      preservedToolChars: latestUnconsumedToolResultBatch?.toolChars || 0,
+      restoredToolResults,
+      reinsertedToolResults,
+      restoredToolChars,
+      toolCharsBefore,
+      toolCharsAfterPrune,
+      toolCharsAfter: countToolResultChars(managedAgentMessages),
+    });
   }
 
   return {

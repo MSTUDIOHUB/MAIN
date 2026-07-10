@@ -1230,6 +1230,7 @@ export interface OrchestratorCallbacks {
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
   getPlanAutoResumeCount?: () => number;
+  getIsApprovedPlanExecutionTransitionPending?: () => boolean;
   getStatus: () => "idle" | "running" | "pending_review" | "error";
   consumeActiveGuidance?: () => { id: string; text: string; turnId: string | null } | null;
   onGuidanceInjected?: (text: string) => void;
@@ -1288,7 +1289,7 @@ export interface OrchestratorCallbacks {
   onPlanStageChanged: (stage: "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
   onPlanTasksUpdated: (content: string) => void;
   onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
-  onApprovedPlanHandoff?: (prompt: string) => void;
+  onApprovedPlanExecutionStarted?: () => void;
   onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;

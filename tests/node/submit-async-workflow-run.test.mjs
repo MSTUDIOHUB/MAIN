@@ -185,7 +185,7 @@ function createHarness(overrides = {}) {
     normalizeProviderCompatibilityByRuntimeKey: (value) => value || {},
     compactCompletedTurnAgentMessages: (params) => params.agentMessages,
     normalizeQueuedUserMessage: (value) => value || null,
-    startApprovedPlanExecutionTurnFromHandoff: () => calls.push(["approved_plan_handoff"]),
+    startApprovedPlanExecutionInCurrentTurn: () => calls.push(["approved_plan_same_turn"]),
     logStoreEvent: (event, data) => calls.push(["log", event, data]),
     ...overrides.input,
   };

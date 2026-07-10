@@ -984,6 +984,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     agentStatus,
     config,
     isPlanApproved,
+    currentTurnId,
     currentWorkspace,
     currentSessionId,
     selectedDiffTaskId,
@@ -1013,6 +1014,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     agentStatus: useAppStore((s) => s.agentStatus),
     config: useAppStore((s) => s.config),
     isPlanApproved: useAppStore((s) => s.isPlanApproved),
+    currentTurnId: useAppStore((s) => s.currentTurnId),
     currentWorkspace: useAppStore((s) => s.currentWorkspace),
     currentSessionId: useAppStore((s) => s.currentSessionId),
     selectedDiffTaskId: useAppStore((s) => s.selectedDiffTaskId),
@@ -1124,6 +1126,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       planArtifacts.some((artifact) => artifact.kind === "tasks") ||
       planTasks.length > 0;
 
+    const resumeTurnId = latestPlanTurn?.id || currentTurnId || undefined;
     sendMessage(
       buildTrustedResumePrompt({
         language,
@@ -1135,8 +1138,9 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       undefined,
       {
         hidden: true,
-        createVisibleTurnForHiddenMessage: true,
-        reuseCurrentTurn: false,
+        createVisibleTurnForHiddenMessage: !resumeTurnId,
+        reuseCurrentTurn: !!resumeTurnId,
+        turnIdOverride: resumeTurnId,
         preservePlanState: true,
         resolvedIntent: "plan",
         runtimeIntentOverride: "execute",

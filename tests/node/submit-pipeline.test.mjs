@@ -294,6 +294,33 @@ test("submit pipeline reuses awaiting-choice turns only on exact reply option ma
   assert.equal(ordinary.turnReuse.reuseCurrentTurn, false);
 });
 
+test("hidden plan recovery can explicitly reuse its original logical turn", () => {
+  const planTurn = turn({ id: "turn-plan", mode: "plan", intent: "plan", status: "paused" });
+  const newerTurn = turn({ id: "turn-newer", status: "done" });
+  const decision = buildSubmitPipelineDecision({
+    text: "Continue approved plan execution",
+    options: {
+      hidden: true,
+      reuseCurrentTurn: true,
+      turnIdOverride: "turn-plan",
+      preservePlanState: true,
+      resolvedIntent: "plan",
+      executionConsentGranted: true,
+    },
+    snapshot: baseSnapshot({
+      currentTurnId: "turn-newer",
+      conversationTurns: [planTurn, newerTurn],
+      planArtifactsCount: 1,
+      planStage: "executing",
+      isPlanApproved: true,
+    }),
+  });
+
+  assert.equal(decision.turnReuse.reuseCurrentTurn, true);
+  assert.equal(decision.turnReuse.reusableTurnId, "turn-plan");
+  assert.equal(decision.turnReuse.isInternalTurn, false);
+});
+
 test("pending review abort is skipped for execution approval reply options", () => {
   const currentTurn = turn({ status: "awaiting_approval" });
   const taskFlow = [
@@ -551,7 +578,7 @@ test("send gate queues visible submissions while generation is active", () => {
   assert.equal(decision.allowHiddenExecutionWhileBusy, false);
 });
 
-test("send gate lets hidden execution resumes continue while running", () => {
+test("send gate never lets a hidden execution resume create a second running owner", () => {
   const decision = resolveSubmitSendGateDecision({
     text: "hidden resume",
     imagesLength: 0,
@@ -565,9 +592,10 @@ test("send gate lets hidden execution resumes continue while running", () => {
     hasCurrentTurn: true,
   });
 
-  assert.equal(decision.action.kind, "continue");
-  assert.equal(decision.allowHiddenExecutionWhileBusy, true);
-  assert.deepEqual(decision.allowedBusyReasons, ["generation_in_progress", "agent_running"]);
+  assert.equal(decision.action.kind, "queue");
+  assert.equal(decision.action.reason, "generation_in_progress");
+  assert.equal(decision.allowHiddenExecutionWhileBusy, false);
+  assert.deepEqual(decision.allowedBusyReasons, []);
 });
 
 test("send gate approves pending review reply options before queueing agent busy state", () => {
@@ -1093,8 +1121,36 @@ test("run state patch preserves hidden input and approved plan state when reques
   assert.equal(Object.hasOwn(patch, "currentTurnExecutionConsent"), false);
 });
 
+test("approved same-turn execution commit clears pending transition only when a run state is created", () => {
+  const patch = buildSubmitRunStatePatch({
+    turnId: "turn-plan",
+    isHidden: true,
+    currentInput: "",
+    preferredLanguage: "en",
+    shouldArchiveChoiceFeedback: false,
+    currentNormalizedStreamState: {
+      visibleText: "",
+      hiddenThought: "",
+      replyOptions: [],
+      hasExplicitUserChoiceRequest: false,
+      toolCalls: [],
+      finishReason: null,
+    },
+    parsedStudioCommand: null,
+    effectiveWorkflowMode: "plan",
+    preservePlanState: true,
+    shouldGrantExecutionConsentForTurn: true,
+    currentConfig: { workflowMode: "plan", language: "en" },
+  });
+
+  assert.equal(patch.pendingPlanApprovalHandoff, null);
+  assert.equal(patch.planApprovalExecutionStartedForTurnId, "turn-plan");
+  assert.deepEqual(patch.currentTurnExecutionConsent, { turnId: "turn-plan", granted: true });
+});
+
 test("harness run marker draft initializes launch telemetry without store state", () => {
   const marker = buildSubmitHarnessRunMarkerDraft({
+    runId: "run-1",
     instanceId: "instance-1",
     runSessionKey: "/tmp/game:42",
     runWorkspace: "/tmp/game",
@@ -1109,6 +1165,7 @@ test("harness run marker draft initializes launch telemetry without store state"
   });
 
   assert.equal(marker.schemaVersion, 1);
+  assert.equal(marker.runId, "run-1");
   assert.equal(marker.instanceId, "instance-1");
   assert.equal(marker.sessionKey, "/tmp/game:42");
   assert.equal(marker.workspace, "/tmp/game");
@@ -1140,6 +1197,7 @@ test("harness run marker draft initializes launch telemetry without store state"
 
 test("harness run marker draft normalizes missing workspace and session id", () => {
   const marker = buildSubmitHarnessRunMarkerDraft({
+    runId: "run-2",
     instanceId: "instance-2",
     runSessionKey: "__MAIN_GLOBAL_CHAT__:9",
     runWorkspace: "",

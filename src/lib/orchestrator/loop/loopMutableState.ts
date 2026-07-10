@@ -91,6 +91,27 @@ export function createAgentLoopMutableState(input: {
   };
 }
 
+export function resetAgentLoopMutableStateForApprovedPlanExecution(
+  state: AgentLoopMutableState,
+): void {
+  state.recentPlanToolActivity.length = 0;
+  state.recentToolActivity.length = 0;
+  state.attemptedPlanWriteTargets.length = 0;
+  state.loopGuardRuntimeState = createAgentLoopGuardRuntimeState();
+  state.noToolRuntimeState = createAgentLoopNoToolRuntimeState();
+  state.streamRuntimeState = createAgentLoopStreamRuntimeState();
+  state.recoveryPromptState = createAgentLoopRecoveryPromptRuntimeState();
+  state.planRuntimeState = createPlanLoopRuntimeState({
+    workflowMode: "plan",
+    isPlanApproved: true,
+  });
+  state.evidenceRuntimeState = createAgentLoopEvidenceRuntimeState();
+  state.approvedPlanRecoveryState = createApprovedPlanRecoveryRuntimeState();
+  state.executeRecoveryState = createExecuteRecoveryRuntimeState({
+    workflowMode: "plan",
+  });
+}
+
 export function markExecuteOperationEvidenceMutableState(
   state: AgentLoopMutableState,
 ): void {

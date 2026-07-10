@@ -119,6 +119,7 @@ import { normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   buildPlanExecutionProgressUpdate,
   normalizePlanExecutionProgressSnapshot,
+  resolveApprovedPlanSameTurnFallbackDecision,
 } from "../lib/planExecutionRecovery";
 import {
   type AttachedFile,
@@ -2674,37 +2675,78 @@ function buildPlanApprovalHandoffDedupLogPayload(input: {
   };
 }
 
-function findApprovedPlanExecutionChildTurn(state: AppState, planTurnId: string | null) {
-  if (!planTurnId) return null;
-  return state.conversationTurns.find((turn) => turn.parentPlanTurnId === planTurnId) || null;
-}
-
-export function startApprovedPlanExecutionTurnFromHandoff(input: {
+export function startApprovedPlanExecutionInCurrentTurn(input: {
   get: () => AppState;
   setActiveState: (patch: Partial<AppState>) => void;
   planTurnId: string;
   handoff: PlanApprovalHandoff;
   sessionKey: string | null;
-  source: "active_loop" | "store_fallback";
+  source: "workflow_fallback" | "store_fallback";
 }): boolean {
   const latest = input.get();
   const currentTurn = latest.conversationTurns.find((turn) => turn.id === input.planTurnId) || null;
-  const existingChildTurn = findApprovedPlanExecutionChildTurn(latest, input.planTurnId);
-  if (latest.planApprovalExecutionStartedForTurnId === input.planTurnId || existingChildTurn) {
+  if (!currentTurn) {
+    logStoreEvent("plan_approval_same_turn_execution_skipped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: "plan_turn_missing",
+      planTurnId: input.planTurnId,
+    }));
+    return false;
+  }
+  if (input.sessionKey && !isSessionRuntimeActive(latest, input.sessionKey)) {
+    logStoreEvent("plan_approval_same_turn_execution_skipped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: "session_not_active",
+      planTurnId: input.planTurnId,
+      currentTurnStatus: currentTurn.status,
+    }));
+    return false;
+  }
+  if (latest.planApprovalExecutionStartedForTurnId === input.planTurnId) {
     logStoreEvent("plan_approval_handoff_deduped", buildPlanApprovalHandoffDedupLogPayload({
       state: latest,
-      reason: latest.planApprovalExecutionStartedForTurnId === input.planTurnId
-        ? "execution_already_started"
-        : "execution_child_turn_exists",
+      reason: "same_turn_execution_already_started",
       planTurnId: input.planTurnId,
-      executionTurnId: existingChildTurn?.id ?? input.handoff.executionTurnId ?? null,
+      executionTurnId: input.planTurnId,
       currentTurnStatus: currentTurn?.status ?? null,
     }));
     return false;
   }
+  const exactPendingDecision = resolveApprovedPlanSameTurnFallbackDecision({
+    expectedSessionKey: input.sessionKey || "__active_session__",
+    currentSessionKey: input.sessionKey || "__active_session__",
+    expectedHandoff: input.handoff,
+    currentHandoff: latest.pendingPlanApprovalHandoff,
+    isPlanApproved: latest.isPlanApproved === true,
+    executionStartedForTurnId: latest.planApprovalExecutionStartedForTurnId,
+    isAgentBusy: false,
+    busyRetryAttempt: 0,
+    maxBusyRetries: 0,
+  });
+  if (exactPendingDecision !== "start") {
+    logStoreEvent("plan_approval_same_turn_execution_skipped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: "stale_or_revoked_handoff",
+      planTurnId: input.planTurnId,
+      executionTurnId: input.planTurnId,
+      currentTurnStatus: currentTurn.status,
+    }));
+    return false;
+  }
+  if (
+    latest.abortController &&
+    (latest.isGenerating || latest.agentStatus === "running" || latest.agentStatus === "pending_review")
+  ) {
+    logStoreEvent("plan_approval_same_turn_execution_skipped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: "run_owner_still_active",
+      planTurnId: input.planTurnId,
+      executionTurnId: input.planTurnId,
+      currentTurnStatus: currentTurn.status,
+    }));
+    return false;
+  }
 
-  const executionTurnId =
-    input.handoff.executionTurnId || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const language = latest.config.language === "en" ? "en" : "zh";
   const prompt = input.handoff.prompt || buildApprovedPlanExecutionPrompt({
     state: latest,
@@ -2714,16 +2756,17 @@ export function startApprovedPlanExecutionTurnFromHandoff(input: {
   });
 
   latest.updateConversationTurn(input.planTurnId, {
-    status: "done",
+    status: "executing",
     summary: language === "zh"
-      ? "计划已批准，执行已交接到新的回合。"
-      : "Plan approved; execution was handed off to a new turn.",
+      ? "计划已批准，正在当前回合继续执行。"
+      : "Plan approved; execution is continuing in the current turn.",
   });
 
   const runtimePatch = {
+    currentTurnId: input.planTurnId,
     pendingPlanApprovalHandoff: null,
     planApprovalExecutionStartedForTurnId: input.planTurnId,
-    currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
+    currentTurnExecutionConsent: { turnId: input.planTurnId, granted: true },
   };
   if (input.sessionKey) {
     latest.updateRuntimeForSession?.(input.sessionKey, runtimePatch);
@@ -2732,34 +2775,66 @@ export function startApprovedPlanExecutionTurnFromHandoff(input: {
     input.setActiveState(runtimePatch);
   }
 
-  logStoreEvent("plan_approval_execution_turn_created", {
+  let submissionStarted = false;
+  let submissionError: string | null = null;
+  try {
+    submissionStarted = latest.sendMessage(prompt, undefined, {
+      hidden: true,
+      createVisibleTurnForHiddenMessage: false,
+      reuseCurrentTurn: true,
+      turnIdOverride: input.planTurnId,
+      preservePlanState: true,
+      resolvedIntent: "plan",
+      runtimeIntentOverride: "execute",
+      executionConsentGranted: true,
+      skipIntentResolution: true,
+      intentSummary: language === "zh"
+        ? "用户已批准计划，MAIN 将在当前回合中按 plan.md 落地。"
+        : "The user approved the plan; MAIN will execute plan.md in the current turn.",
+    }) === true;
+  } catch (error) {
+    submissionError = error instanceof Error ? error.message : String(error);
+  }
+  if (!submissionStarted) {
+    const rollbackPatch = {
+      pendingPlanApprovalHandoff: input.handoff,
+      planApprovalExecutionStartedForTurnId: null,
+      agentStatus: "idle" as const,
+      isGenerating: false,
+      abortController: null,
+    };
+    if (input.sessionKey) {
+      latest.updateRuntimeForSession?.(input.sessionKey, rollbackPatch);
+    }
+    input.setActiveState(rollbackPatch);
+    latest.updateConversationTurn(input.planTurnId, {
+      status: "paused",
+      summary: language === "zh"
+        ? "计划已批准，但当前回合执行启动失败，可从计划面板重试。"
+        : "Plan approved, but execution failed to start in the current turn and can be retried from the Plan panel.",
+    });
+    logStoreEvent("plan_approval_same_turn_execution_start_failed", {
+      source: input.source,
+      planTurnId: input.planTurnId,
+      sessionKey: input.sessionKey,
+      error: submissionError,
+      pendingPreserved: true,
+      conversationTurns: input.get().conversationTurns.length,
+    });
+    return false;
+  }
+
+  logStoreEvent("plan_approval_same_turn_execution_restarted", {
     source: input.source,
     planTurnId: input.planTurnId,
-    executionTurnId,
+    executionTurnId: input.planTurnId,
     currentTurnStatus: currentTurn?.status ?? null,
-    agentStatus: latest.agentStatus,
-    isGenerating: latest.isGenerating,
-    pendingPlanApprovalHandoff: latest.pendingPlanApprovalHandoff,
-    conversationTurns: latest.conversationTurns.length,
+    agentStatus: input.get().agentStatus,
+    isGenerating: input.get().isGenerating,
+    pendingPlanApprovalHandoff: input.get().pendingPlanApprovalHandoff,
+    conversationTurns: input.get().conversationTurns.length,
     sessionKey: input.sessionKey,
     workspace: latest.currentWorkspace || null,
-  });
-
-  latest.sendMessage(prompt, undefined, {
-    hidden: true,
-    createVisibleTurnForHiddenMessage: true,
-    reuseCurrentTurn: false,
-    turnIdOverride: executionTurnId,
-    parentPlanTurnId: input.planTurnId,
-    preservePlanState: true,
-    resolvedIntent: "plan",
-    runtimeIntentOverride: "execute",
-    executionConsentGranted: true,
-    skipIntentResolution: true,
-    turnTitle: language === "zh" ? "执行已批准计划" : "Execute Approved Plan",
-    intentSummary: language === "zh"
-      ? "用户已批准计划，MAIN 将在新的执行回合中按 plan.md 落地。"
-      : "The user approved the plan; MAIN will execute plan.md in a new execution turn.",
   });
   return true;
 }
@@ -5323,7 +5398,6 @@ export const useAppStore = create<AppState>()(
       const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
       const language = state.config.language === "en" ? "en" : "zh";
       const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, language);
-      const executionTurnId = `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const currentTurn = approvedTurnId
         ? state.conversationTurns.find((turn) => turn.id === approvedTurnId)
         : null;
@@ -5331,21 +5405,15 @@ export const useAppStore = create<AppState>()(
         !!approvedTurnId && state.pendingPlanApprovalHandoff?.planTurnId === approvedTurnId;
       const hasStartedExecutionForTurn =
         !!approvedTurnId && state.planApprovalExecutionStartedForTurnId === approvedTurnId;
-      const hasExecutionChildTurn =
-        !!approvedTurnId && state.conversationTurns.some((turn) => turn.parentPlanTurnId === approvedTurnId);
-      if (hasPendingHandoffForTurn || hasStartedExecutionForTurn || hasExecutionChildTurn || state.planStage === "executing") {
+      const isAlreadyExecutingCurrentTurn =
+        !!approvedTurnId && state.planStage === "executing" && currentTurn?.status === "executing";
+      if (hasPendingHandoffForTurn || hasStartedExecutionForTurn || isAlreadyExecutingCurrentTurn) {
         logStoreEvent("plan_approval_handoff_deduped", {
           reason: hasPendingHandoffForTurn
-            ? "pending_handoff_exists"
-            : hasStartedExecutionForTurn
-            ? "execution_already_started"
-            : hasExecutionChildTurn
-            ? "execution_child_turn_exists"
-            : "plan_stage_executing",
+            ? "pending_same_turn_execution_exists"
+            : "same_turn_execution_already_started",
           planTurnId: approvedTurnId,
-          executionTurnId: hasExecutionChildTurn
-            ? state.conversationTurns.find((turn) => turn.parentPlanTurnId === approvedTurnId)?.id ?? null
-            : null,
+          executionTurnId: approvedTurnId,
           currentTurnStatus: currentTurn?.status ?? null,
           agentStatus: state.agentStatus,
           isGenerating: state.isGenerating,
@@ -5364,22 +5432,24 @@ export const useAppStore = create<AppState>()(
       });
       const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
       const pendingHandoffPatch = approvedTurnId
-        ? { planTurnId: approvedTurnId, requestedAt: Date.now(), executionTurnId, prompt: executionPrompt }
+        ? { planTurnId: approvedTurnId, requestedAt: Date.now(), executionTurnId: approvedTurnId, prompt: executionPrompt }
         : null;
-      const initialProgressSnapshot = normalizePlanExecutionProgressSnapshot({
-        turnId: executionTurnId,
-        update: buildPlanExecutionProgressUpdate({
-          language,
-          phase: "starting",
-          iterationCount: 0,
-          maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-          autoResumeCount: 0,
-          tasks: executionPlanTasks,
-          evidenceLedger: [],
-          recentToolActivity: [],
-        }),
-        now: Date.now(),
-      });
+      const initialProgressSnapshot = approvedTurnId
+        ? normalizePlanExecutionProgressSnapshot({
+            turnId: approvedTurnId,
+            update: buildPlanExecutionProgressUpdate({
+              language,
+              phase: "starting",
+              iterationCount: 0,
+              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+              autoResumeCount: 0,
+              tasks: executionPlanTasks,
+              evidenceLedger: [],
+              recentToolActivity: [],
+            }),
+            now: Date.now(),
+          })
+        : state.planExecutionProgressSnapshot;
       const activePlanLoop =
         !!approvedTurnId &&
         (state.agentStatus === "running" ||
@@ -5394,8 +5464,11 @@ export const useAppStore = create<AppState>()(
       set((s) => ({
         isPlanApproved: true,
         ...approvalChoicePatch,
-        currentTurnExecutionConsent: { turnId: executionTurnId, granted: true },
+        ...(approvedTurnId
+          ? { currentTurnExecutionConsent: { turnId: approvedTurnId, granted: true } }
+          : {}),
         pendingPlanApprovalHandoff: pendingHandoffPatch,
+        planApprovalExecutionStartedForTurnId: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
@@ -5409,20 +5482,20 @@ export const useAppStore = create<AppState>()(
               turn.id === approvedTurnId
                 ? {
                     ...turn,
-                    status: activePlanLoop ? "executing" as const : "done" as const,
+                    status: "executing" as const,
                     summary: language === "zh"
-                      ? "计划已批准，执行将交接到唯一执行回合。"
-                      : "Plan approved; execution will hand off to a single execution turn.",
+                      ? "计划已批准，正在当前回合继续执行。"
+                      : "Plan approved; execution is continuing in the current turn.",
                   }
                 : turn,
             )
           : s.conversationTurns,
       }));
 
-      logStoreEvent("plan_approval_direct_execution_suppressed", {
-        reason: activePlanLoop ? "active_plan_loop_handoff" : "handoff_single_owner",
+      logStoreEvent("plan_approval_same_turn_execution_queued", {
+        reason: activePlanLoop ? "active_plan_loop_continuation" : "same_turn_restart_required",
         planTurnId: approvedTurnId,
-        executionTurnId,
+        executionTurnId: approvedTurnId,
         currentTurnStatus: currentTurn?.status ?? null,
         agentStatus: state.agentStatus,
         isGenerating: state.isGenerating,
@@ -5432,7 +5505,7 @@ export const useAppStore = create<AppState>()(
 
       if (!activePlanLoop && approvedTurnId && pendingHandoffPatch) {
         runAfterNextPaint(() => {
-          startApprovedPlanExecutionTurnFromHandoff({
+          startApprovedPlanExecutionInCurrentTurn({
             get,
             setActiveState: (patch) => set(patch),
             planTurnId: approvedTurnId,
@@ -6219,6 +6292,46 @@ export const useAppStore = create<AppState>()(
         ? parseSetupEngineArgs(parsedStudioWorkflowArgs)
         : null;
     const autoHydrationReason = submitPipelineDecision.planHydration.reason;
+    const applyCurrentSendGate = (gateState: AppState) => applySubmitSendGateEffects({
+      text,
+      images,
+      hasSupplementalInput,
+      isHidden,
+      shouldExecuteOnceFromReplyOption,
+      state: gateState,
+      options: {
+        executionConsentGranted: options?.executionConsentGranted,
+        runtimeIntentOverride: options?.runtimeIntentOverride,
+        turnIdOverride: options?.turnIdOverride,
+      },
+      mentionSnapshot,
+      attachedFilesSnapshot,
+      queueUserMessage: (queuedText, queuedImages, queuedOptions) => {
+        get().queueUserMessage(queuedText, queuedImages, queuedOptions);
+      },
+      approvePendingReviewOnce: () => {
+        get().approvePendingReviewOnce();
+      },
+      approvePlan: (approvalChoice) => {
+        get().approvePlan(approvalChoice);
+      },
+      setState: set,
+      setConversationTurnStatus: (turnId, status) => {
+        get().setConversationTurnStatus(turnId, status);
+      },
+      logStoreEvent,
+    });
+
+    // Async Plan hydration and semantic Resume both mutate Plan state before
+    // they recursively submit a hidden execution prompt. Acquire the owner gate
+    // before either route can run.
+    if (autoHydrationReason || shouldRouteContinuationToPlanResume) {
+      const planResumeSendGateEffect = applyCurrentSendGate(state);
+      if (!planResumeSendGateEffect.shouldContinue) {
+        return planResumeSendGateEffect.returnValue ?? false;
+      }
+      state = get();
+    }
     if (autoHydrationReason) {
       startSubmitPlanHydrationEffect({
         reason: autoHydrationReason,
@@ -6388,35 +6501,7 @@ export const useAppStore = create<AppState>()(
       setState: set,
     });
 
-    const sendGateEffect = applySubmitSendGateEffects({
-      text,
-      images,
-      hasSupplementalInput,
-      isHidden,
-      shouldExecuteOnceFromReplyOption,
-      state,
-      options: {
-        executionConsentGranted: options?.executionConsentGranted,
-        runtimeIntentOverride: options?.runtimeIntentOverride,
-        turnIdOverride: options?.turnIdOverride,
-      },
-      mentionSnapshot,
-      attachedFilesSnapshot,
-      queueUserMessage: (queuedText, queuedImages, queuedOptions) => {
-        get().queueUserMessage(queuedText, queuedImages, queuedOptions);
-      },
-      approvePendingReviewOnce: () => {
-        get().approvePendingReviewOnce();
-      },
-      approvePlan: (approvalChoice) => {
-        get().approvePlan(approvalChoice);
-      },
-      setState: set,
-      setConversationTurnStatus: (turnId, status) => {
-        get().setConversationTurnStatus(turnId, status);
-      },
-      logStoreEvent,
-    });
+    const sendGateEffect = applyCurrentSendGate(state);
     if (!sendGateEffect.shouldContinue) {
       return sendGateEffect.returnValue ?? false;
     }
@@ -6707,7 +6792,7 @@ export const useAppStore = create<AppState>()(
       normalizeProviderCompatibilityByRuntimeKey,
       compactCompletedTurnAgentMessages,
       normalizeQueuedUserMessage,
-      startApprovedPlanExecutionTurnFromHandoff,
+      startApprovedPlanExecutionInCurrentTurn,
       logStoreEvent,
     });
 

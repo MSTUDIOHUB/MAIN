@@ -67,8 +67,60 @@ const {
   formatPlanExecutionProgressSnapshot,
   isCachedReadOnlyPlanActivity,
   normalizePlanExecutionProgressSnapshot,
+  resolveApprovedPlanSameTurnFallbackDecision,
   summarizeRepeatedPlanTargetsFromToolActivity,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
+
+test("approved plan same-turn fallback retries busy once only while the exact transition remains pending", () => {
+  const handoff = {
+    planTurnId: "turn-plan",
+    executionTurnId: "turn-plan",
+    requestedAt: 100,
+  };
+  const base = {
+    expectedSessionKey: "workspace:1",
+    currentSessionKey: "workspace:1",
+    expectedHandoff: handoff,
+    currentHandoff: handoff,
+    isPlanApproved: true,
+    executionStartedForTurnId: null,
+    isAgentBusy: true,
+  };
+
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    busyRetryAttempt: 0,
+  }), "retry_busy");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    busyRetryAttempt: 1,
+  }), "busy_retry_exhausted");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    currentHandoff: { ...handoff, requestedAt: 101 },
+    busyRetryAttempt: 0,
+  }), "transition_stale");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    executionStartedForTurnId: "turn-plan",
+    busyRetryAttempt: 0,
+  }), "transition_stale");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    isPlanApproved: false,
+    busyRetryAttempt: 0,
+  }), "transition_stale");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    currentHandoff: null,
+    busyRetryAttempt: 0,
+  }), "transition_stale");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    isAgentBusy: false,
+    busyRetryAttempt: 0,
+  }), "start");
+});
 
 const {
   describeApprovedPlanRecoveryToolSurface,
@@ -76,6 +128,7 @@ const {
   isApprovedPlanCachedReadOnlyNoProgressBatch,
   isApprovedPlanRecoveryToolName,
   isApprovedPlanSourceEditFirstToolName,
+  resolveApprovedPlanPatchRecoveryTarget,
   shouldAllowApprovedPlanRecoveryFileRead,
   shouldBypassApprovedPlanReadCacheForPatchRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
@@ -358,6 +411,7 @@ function createPlanNoToolInput(harness, overrides = {}) {
     planClosureEvidenceRecoveryIssued: false,
     planEvidenceRecoveryPasses: 0,
     planLastQualityGateReason: "",
+    planArtifactQualityRejected: false,
     setPlanRuntimePhase: (phase, reason, status) => harness.phases.push({ type: "runtime", phase, reason, status }),
     waitForPlanApprovalIfNeeded: async () => false,
     tryClosePlanWithEvidence: async () => "failed",
@@ -432,6 +486,28 @@ test("plan no-tool recovery prompts continuation when planning ends with no visi
   assert.match(harness.appended[0].content, /当前规划还没有进入可执行阶段/);
   assert.match(harness.appended[0].content, /\.MAIN\/plans\/plan\.md/);
   assert.equal(harness.statuses.length, 0);
+});
+
+test("rejected plan artifact cannot enter review on the next no-tool iteration", async () => {
+  const harness = createPlanNoToolHarness("en");
+  let approvalWaitCalls = 0;
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    callbacks: {
+      ...harness.callbacks,
+      getPlanStage: () => "plan",
+    },
+    hasReviewablePlanArtifacts: true,
+    planArtifactQualityRejected: true,
+    waitForPlanApprovalIfNeeded: async () => {
+      approvalWaitCalls += 1;
+      return false;
+    },
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(approvalWaitCalls, 0);
+  assert.equal(harness.statuses.includes("pending_review"), false);
+  assert.match(harness.appended.at(-1)?.content || "", /reviewable plan/i);
 });
 
 test("plan closure evidence recovery prompt keeps planning read-only and targeted", () => {
@@ -813,7 +889,7 @@ test("approved plan strategy switch continues the agent loop after recovery prom
   );
   assert.match(
     toolResultRecoveryPhaseSource,
-    /if\s*\(\s*approvedPlanNoProgressDecision\s*\)\s*{[\s\S]*?approvedPlanNoProgressDecision\.action\s*===\s*"recover"[\s\S]*?continueApprovedPlanWithStrategySwitch\(approvedPlanNoProgressDecision\);[\s\S]*?return finish\("continue"\);/,
+    /if\s*\(\s*approvedPlanNoProgressDecision\s*\)\s*{[\s\S]*?approvedPlanNoProgressDecision\.action\s*===\s*"recover"[\s\S]*?approvedPlanRecoveryState\s*=\s*input\.continueApprovedPlanWithStrategySwitch\([\s\S]*?approvedPlanNoProgressDecision[\s\S]*?return finish\("continue"\);/,
   );
   assert.match(loopRecoverySource, /isApprovedPlanCachedReadOnlyNoProgressBatch/);
   assert.match(loopRecoverySource, /no_progress_cached_read_only_batch/);
@@ -906,7 +982,7 @@ test("approved plan execution starts with the normal execute tool surface", () =
   );
   assert.match(
     loopControlRuntimeSource,
-    /const\s+result\s*=\s*continueApprovedPlanWithStrategySwitchAction\(\{[\s\S]*?setApprovedPlanRecoveryState\(\s*applyApprovedPlanStrategySwitchRecoveryState\(/,
+    /const\s+result\s*=\s*continueApprovedPlanWithStrategySwitchAction\(\{[\s\S]*?const\s+nextState\s*=\s*applyApprovedPlanStrategySwitchRecoveryState\([\s\S]*?setApprovedPlanRecoveryState\(nextState\);[\s\S]*?return nextState;/,
   );
   assert.match(
     approvedPlanRecoveryActionsSource,
@@ -997,15 +1073,41 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     false,
   );
   assert.equal(
-    shouldBypassApprovedPlanReadCacheForPatchRecovery({ toolName: "read_file", allowFileRead: true }),
+    shouldAllowApprovedPlanRecoveryFileRead([
+      { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text mismatch" },
+      { name: "write_file", target: "src/App.tsx", status: "succeeded", detail: "written" },
+    ]),
+    false,
+  );
+  const unresolvedMismatch = [
+    { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text mismatch" },
+  ];
+  assert.equal(resolveApprovedPlanPatchRecoveryTarget(unresolvedMismatch), "src/App.tsx");
+  assert.equal(
+    shouldBypassApprovedPlanReadCacheForPatchRecovery({
+      toolName: "read_file",
+      allowFileRead: true,
+      target: "src/App.tsx",
+      recentActivity: unresolvedMismatch,
+    }),
     true,
   );
   assert.equal(
-    shouldBypassApprovedPlanReadCacheForPatchRecovery({ toolName: "read_file", allowFileRead: false }),
+    shouldBypassApprovedPlanReadCacheForPatchRecovery({
+      toolName: "read_file",
+      allowFileRead: true,
+      target: "src/main.js",
+      recentActivity: unresolvedMismatch,
+    }),
     false,
   );
   assert.equal(
-    shouldBypassApprovedPlanReadCacheForPatchRecovery({ toolName: "grep_search", allowFileRead: true }),
+    shouldBypassApprovedPlanReadCacheForPatchRecovery({
+      toolName: "grep_search",
+      allowFileRead: true,
+      target: "src/App.tsx",
+      recentActivity: unresolvedMismatch,
+    }),
     false,
   );
   assert.equal(describeApprovedPlanRecoveryToolSurface(false), "action_only");
@@ -1075,6 +1177,10 @@ test("approved plan source edit first surface blocks validation before first wri
   assert.match(toolCallPlanningSource, /approvedPlanInitialSourceReadAllowed/);
   assert.match(toolCallPlanningSource, /recentPlanToolActivity\.length === 0/);
   assert.match(toolCallPlanningSource, /initialSourceReadAllowed:\s*approvedPlanInitialSourceReadAllowed/);
+  assert.match(toolCallPlanningSource, /approvedPlanSourceEditFileReadAllowed/);
+  assert.match(toolCallPlanningSource, /!approvedPlanActionOnlyRecoveryActive/);
+  assert.match(toolCallPlanningSource, /approvedPlanActionRecoveryActive[\s\S]*?isApprovedPlanRecoveryTool/);
+  assert.match(toolCallPlanningSource, /readFileExposed:\s*scopedToolNameSet\.has\("read_file"\)/);
 });
 
 test("approved plan browser validation repeats are reused or paused without agent error", () => {

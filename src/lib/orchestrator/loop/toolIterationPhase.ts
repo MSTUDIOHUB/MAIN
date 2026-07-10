@@ -83,6 +83,6 @@ export async function handleToolIterationPhase(
     recoveryPromptState: toolResultRecoveryPhase.recoveryPromptState,
     unityMcpRuntimeState: toolCallPhase.unityMcpRuntimeState,
     evidenceRuntimeState: toolCallPhase.evidenceRuntimeState,
-    approvedPlanRecoveryState: toolCallPhase.approvedPlanRecoveryState,
+    approvedPlanRecoveryState: toolResultRecoveryPhase.approvedPlanRecoveryState,
   };
 }

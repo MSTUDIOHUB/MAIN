@@ -66,6 +66,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planConvergence.ts"));
 const {
   handlePlanQualityRecoveryAfterToolResults,
+  shouldPauseForReviewablePlanArtifactAfterToolResults,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planQualityRecovery.ts"));
 
 function createPlanConvergenceCallbacks(language = "en") {
@@ -351,12 +352,151 @@ test("plan quality recovery routes rejected plan drafts to targeted evidence", (
   assert.equal(result.planQualityRejectCount, 1);
   assert.equal(result.planLastQualityGateReason, "missing_plan_required_sections:read_evidence");
   assert.deepEqual(result.planLastMissingSections, ["Read Evidence"]);
+  assert.equal(result.planArtifactQualityRejected, true);
   assert.equal(result.pendingPlanRuntimeRecoveryPrompt, null);
   assert.deepEqual(phases, [{
     phase: "needs_evidence",
     reason: "missing_plan_required_sections:read_evidence",
     status: "running",
   }]);
+});
+
+test("plan quality recovery keeps structural rewrites out of evidence recovery", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterToolResults({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 7,
+    results: [{
+      toolCallId: "quality-rewrite-1",
+      name: "write_file",
+      target: ".MAIN/plans/plan.md",
+      content: "plan saved but structurally incomplete",
+      isError: false,
+      internalFeedback: true,
+      planRecoveryAction: "rewrite",
+      qualityGateReason: "missing_plan_required_sections:key_changes",
+      missingPlanSections: ["key_changes"],
+    }],
+    planRuntimePhase: "drafting",
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.ts",
+      status: "succeeded",
+      detail: "observed implementation evidence",
+    }],
+    attemptedPlanWriteTargets: [".MAIN/plans/plan.md"],
+    latestUserPromptText: "修复计划执行流程",
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planArtifactQualityRejected, true);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
+  assert.equal(result.pendingPlanRuntimeRecoveryPrompt, null);
+  assert.deepEqual(phases, [{
+    phase: "needs_rewrite",
+    reason: "missing_plan_required_sections:key_changes",
+    status: "running",
+  }]);
+});
+
+test("quality-rejected plan writes are not eligible for post-tool review", () => {
+  const rejectedWrite = {
+    toolCallId: "quality-rewrite-review-1",
+    name: "write_file",
+    target: ".MAIN/plans/plan.md",
+    content: "saved but rejected",
+    isError: false,
+    internalFeedback: true,
+    planRecoveryAction: "rewrite",
+    qualityGateReason: "missing_plan_required_sections:key_changes",
+  };
+
+  assert.equal(shouldPauseForReviewablePlanArtifactAfterToolResults({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    results: [rejectedWrite],
+  }), false);
+
+  assert.equal(shouldPauseForReviewablePlanArtifactAfterToolResults({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    results: [{
+      ...rejectedWrite,
+      internalFeedback: false,
+      planRecoveryAction: undefined,
+      qualityGateReason: undefined,
+    }],
+  }), true);
+});
+
+test("plan artifact quality rejection persists until a later accepted write", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    planRuntimePhase: "needs_rewrite",
+    recentPlanToolActivity: [],
+    attemptedPlanWriteTargets: [".MAIN/plans/plan.md"],
+    latestUserPromptText: "Create a reviewable plan",
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: () => {},
+  };
+  const rejectedWrite = {
+    toolCallId: "quality-persist-1",
+    name: "write_file",
+    target: ".MAIN/plans/plan.md",
+    content: "saved but rejected",
+    isError: false,
+    internalFeedback: true,
+    planRecoveryAction: "rewrite",
+    qualityGateReason: "missing_plan_required_sections:key_changes",
+  };
+
+  const rejected = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 8,
+    results: [rejectedWrite],
+    planArtifactQualityRejected: false,
+  });
+  const nextNoToolIteration = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 9,
+    results: [],
+    planQualityRejectCount: rejected.planQualityRejectCount,
+    planLastQualityGateReason: rejected.planLastQualityGateReason,
+    planLastMissingSections: rejected.planLastMissingSections,
+    planArtifactQualityRejected: rejected.planArtifactQualityRejected,
+  });
+  const acceptedRewrite = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 10,
+    results: [{
+      ...rejectedWrite,
+      toolCallId: "quality-persist-2",
+      content: "accepted reviewable plan",
+      internalFeedback: false,
+      planRecoveryAction: undefined,
+      qualityGateReason: undefined,
+    }],
+    planArtifactQualityRejected: nextNoToolIteration.planArtifactQualityRejected,
+  });
+
+  assert.equal(rejected.planArtifactQualityRejected, true);
+  assert.equal(nextNoToolIteration.planArtifactQualityRejected, true);
+  assert.equal(acceptedRewrite.planArtifactQualityRejected, false);
 });
 
 test("plan quality recovery closes a successful evidence recovery pass", () => {

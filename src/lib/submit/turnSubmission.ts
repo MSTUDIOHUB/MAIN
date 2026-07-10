@@ -250,6 +250,7 @@ export function buildMainDebugPrompt(feedback: string): string {
 export interface SubmitPipelineOptions {
   hidden?: boolean;
   reuseCurrentTurn?: boolean;
+  turnIdOverride?: string;
   preservePlanState?: boolean;
   resolvedIntent?: ResolvedRunIntent;
   commandDirective?: CommandDirective | null;
@@ -575,7 +576,7 @@ export type SubmitRunStatePatch<TConfig extends object> = {
   isPlanApproved?: false;
   planApprovalChoice?: null;
   pendingPlanApprovalHandoff?: null;
-  planApprovalExecutionStartedForTurnId?: null;
+  planApprovalExecutionStartedForTurnId?: string | null;
   clearedPlanTurnId?: null;
   planAutoResumeCount?: 0;
   planExecutionProgressSnapshot?: null;
@@ -583,6 +584,7 @@ export type SubmitRunStatePatch<TConfig extends object> = {
 };
 
 export interface SubmitHarnessRunMarkerDraftInput {
+  runId: string;
   instanceId: string;
   runSessionKey: string;
   runWorkspace?: string | null;
@@ -1292,10 +1294,9 @@ export function resolveSubmitSendGateDecision(params: {
     };
   }
 
-  const allowHiddenExecutionWhileBusy =
-    params.isHidden === true &&
-    params.executionConsentGranted === true &&
-    params.agentStatus === "running";
+  // Execution consent authorizes the operation, not a second runtime owner.
+  // Hidden resumes must still wait for the active lease to finish.
+  const allowHiddenExecutionWhileBusy = false;
   const allowedBusyReasons: SubmitSendGateAllowedBusyReason[] = [];
 
   if (params.isGenerating) {
@@ -2125,6 +2126,12 @@ export function buildSubmitRunStatePatch<TConfig extends object>(
     ...(params.shouldGrantExecutionConsentForTurn
       ? { currentTurnExecutionConsent: { turnId: params.turnId, granted: true } as const }
       : {}),
+    ...(params.preservePlanState && params.shouldGrantExecutionConsentForTurn
+      ? {
+          pendingPlanApprovalHandoff: null,
+          planApprovalExecutionStartedForTurnId: params.turnId,
+        }
+      : {}),
     elapsedTime: 0,
   };
 }
@@ -2134,6 +2141,7 @@ export function buildSubmitHarnessRunMarkerDraft(
 ): HarnessRunMarker {
   return {
     schemaVersion: 1,
+    runId: params.runId,
     instanceId: params.instanceId,
     sessionKey: params.runSessionKey,
     workspace: params.runWorkspace || null,
@@ -2418,7 +2426,12 @@ export function resolveSubmitTurnReuseDecision(input: {
     currentTurnHasReplyOptions &&
     !!selectedAwaitingReplyOption;
   const shouldExplicitlyReuseCurrentTurn = input.options?.reuseCurrentTurn === true;
-  const reusableTurnId = input.currentTurnId;
+  const requestedReuseTurnId = String(input.options?.turnIdOverride || "").trim();
+  const reusableTurnId = requestedReuseTurnId
+    ? input.conversationTurns.some((turn) => turn.id === requestedReuseTurnId)
+      ? requestedReuseTurnId
+      : null
+    : input.currentTurnId;
   const reuseCurrentTurn =
     (shouldExplicitlyReuseCurrentTurn || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent) &&
     !!reusableTurnId;

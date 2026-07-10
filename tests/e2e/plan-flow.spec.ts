@@ -192,27 +192,27 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         const visibleTurns = snapshot?.visibleConversationTurns || [];
         const planTurn = visibleTurns.find((turn: { id?: string }) => turn.id === "e2e-plan-flow-turn");
-        const executionTurn = visibleTurns.find(
+        const executionChild = visibleTurns.find(
           (turn: { parentPlanTurnId?: string | null }) =>
             turn.parentPlanTurnId === "e2e-plan-flow-turn",
         );
         return {
           taskFlowUserCount: snapshot?.taskFlowUserCount,
           visibleTurnCount: visibleTurns.length,
-          planTurnStatus: planTurn?.status || null,
-          executionTurnTitle: executionTurn?.title || null,
-          executionTurnParent: executionTurn?.parentPlanTurnId || null,
+          planTurnIsExecutingOrComplete: ["executing", "completed_with_changes", "done"].includes(planTurn?.status || ""),
+          hasExecutionChild: Boolean(executionChild),
+          currentTurnId: snapshot?.currentTurnId || null,
           currentTurnParent: snapshot?.currentTurnParentPlanTurnId || null,
         };
       }),
     )
     .toEqual({
       taskFlowUserCount: userCountBeforeApproval,
-      visibleTurnCount: 2,
-      planTurnStatus: "done",
-      executionTurnTitle: "执行已批准计划",
-      executionTurnParent: "e2e-plan-flow-turn",
-      currentTurnParent: "e2e-plan-flow-turn",
+      visibleTurnCount: 1,
+      planTurnIsExecutingOrComplete: true,
+      hasExecutionChild: false,
+      currentTurnId: "e2e-plan-flow-turn",
+      currentTurnParent: null,
     });
 
   await expect(page.getByTestId("plan-stage-badge")).toContainText("已完成");

@@ -84,6 +84,8 @@ function createControl(overrides = {}) {
     getPlanExecutionEvidenceLedger: () => [],
     getMessages: () => [{ role: "user", content: "Run the approved plan" }],
     shouldForceXmlForProviderCompatibility: () => false,
+    onStatusChange: () => {},
+    appendMessage: () => {},
     ...overrides.callbacks,
   };
   const control = createAgentLoopControlRuntime({
@@ -134,7 +136,33 @@ test("loop control emits approved plan execution progress with iteration metadat
   assert.equal(progress.length, 1);
   assert.equal(progress[0].phase, "running");
   assert.equal(progress[0].iteration, 2);
-  assert.equal(progress[0].maxIterations, control.effectiveMaxIterations);
+  assert.equal(progress[0].maxIterations, control.getEffectiveMaxIterations());
+});
+
+test("loop control grants the full execution budget after same-loop plan approval", () => {
+  let approved = false;
+  let iteration = 18;
+  const progress = [];
+  const { control } = createControl({
+    callbacks: {
+      getIsPlanApproved: () => approved,
+      onPlanExecutionProgress: (update) => progress.push(update),
+    },
+    input: {
+      getIteration: () => iteration,
+      getRuntimeIntent: () => approved ? "execute" : "plan",
+    },
+  });
+
+  assert.equal(control.getEffectiveMaxIterations(), 25);
+  approved = true;
+  assert.equal(control.getEffectiveMaxIterations(), 68);
+  iteration = 19;
+  control.emitPlanExecutionProgress("running");
+  assert.equal(progress.at(-1).iteration, 1);
+  assert.equal(progress.at(-1).maxIterations, 50);
+  iteration = 40;
+  assert.equal(control.getEffectiveMaxIterations(), 68);
 });
 
 test("loop control startLoop moves unapproved plan turns into explore phase", () => {
@@ -159,4 +187,17 @@ test("loop control startLoop moves unapproved plan turns into explore phase", ()
     reason: "start",
     status: undefined,
   });
+});
+
+test("strategy switch returns and persists the folded approved-plan recovery state", () => {
+  const { control, getApprovedPlanRecoveryState } = createControl();
+
+  const nextState = control.continueApprovedPlanWithStrategySwitch({
+    reason: "no_progress_cached_read_only_batch",
+    remainingText: "Modify src/App.tsx",
+  });
+
+  assert.equal(nextState.approvedPlanNoProgressRecoveryAttempts, 1);
+  assert.equal(nextState.approvedPlanActionOnlyRecoveryActive, true);
+  assert.deepEqual(getApprovedPlanRecoveryState(), nextState);
 });

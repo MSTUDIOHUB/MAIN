@@ -46,7 +46,10 @@ import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntim
 import { applyExecuteConvergencePromptState } from "./recoveryPromptRuntimeState";
 import type { AgentLoopEvidenceRuntimeState } from "./evidenceRuntimeState";
 import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
-import { handlePlanQualityRecoveryAfterToolResults } from "./planQualityRecovery";
+import {
+  handlePlanQualityRecoveryAfterToolResults,
+  shouldPauseForReviewablePlanArtifactAfterToolResults,
+} from "./planQualityRecovery";
 import { handlePlanReadOnlyConvergence } from "./planConvergence";
 import { appendToolResultsToHistory } from "./toolResultHistory";
 import type { TurnIterationContext } from "./turnIterationContext";
@@ -81,6 +84,9 @@ type ActivateChatFinalSynthesis = (
 ) => void;
 
 type ApprovedPlanNoProgressAction = (input: ApprovedPlanNoProgressDecision) => void;
+type ApprovedPlanNoProgressRecoveryAction = (
+  input: ApprovedPlanNoProgressDecision,
+) => ApprovedPlanRecoveryRuntimeState;
 
 export type ToolResultRecoveryPhaseResult =
   | {
@@ -89,6 +95,7 @@ export type ToolResultRecoveryPhaseResult =
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
+      approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
     }
   | {
       status: "completed";
@@ -96,6 +103,7 @@ export type ToolResultRecoveryPhaseResult =
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
+      approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
     };
 
 export async function handleToolResultRecoveryPhase(input: {
@@ -139,15 +147,19 @@ export async function handleToolResultRecoveryPhase(input: {
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
   activateExecuteRecovery: ActivateExecuteRecovery;
   activateChatFinalSynthesis: ActivateChatFinalSynthesis;
-  continueApprovedPlanWithStrategySwitch: ApprovedPlanNoProgressAction;
+  continueApprovedPlanWithStrategySwitch: ApprovedPlanNoProgressRecoveryAction;
   pauseApprovedPlanNoProgressLoop: ApprovedPlanNoProgressAction;
   setPlanRuntimePhase: SetPlanRuntimePhase;
-  pauseForReviewablePlanArtifact: (trigger: string) => Promise<"not_reviewable" | "stopped" | "approved_continue">;
+  pauseForReviewablePlanArtifact: (
+    trigger: string,
+    runtimeStateOverride?: Pick<PlanLoopRuntimeState, "planArtifactQualityRejected">,
+  ) => Promise<"not_reviewable" | "stopped" | "approved_continue">;
 }): Promise<ToolResultRecoveryPhaseResult> {
   let planRuntimeState = input.planRuntimeState;
   let loopGuardRuntimeState = input.loopGuardRuntimeState;
   let executeRecoveryState = input.executeRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
+  let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   const setPlanRuntimePhaseAndSync: SetPlanRuntimePhase = (phase, reason, status) => {
     input.setPlanRuntimePhase(phase, reason, status);
     planRuntimeState = applyPlanRuntimePhase(planRuntimeState, { phase, reason }).state;
@@ -338,7 +350,9 @@ export async function handleToolResultRecoveryPhase(input: {
 
   if (approvedPlanNoProgressDecision) {
     if (approvedPlanNoProgressDecision.action === "recover") {
-      input.continueApprovedPlanWithStrategySwitch(approvedPlanNoProgressDecision);
+      approvedPlanRecoveryState = input.continueApprovedPlanWithStrategySwitch(
+        approvedPlanNoProgressDecision,
+      );
       return finish("continue");
     }
     input.pauseApprovedPlanNoProgressLoop(approvedPlanNoProgressDecision);
@@ -370,15 +384,22 @@ export async function handleToolResultRecoveryPhase(input: {
     return finish("continue");
   }
 
-  if (
-    input.workflowMode === "plan" &&
-    !input.callbacks.getIsPlanApproved() &&
-    input.results.some(isSuccessfulPlanArtifactWriteResult)
-  ) {
+  if (shouldPauseForReviewablePlanArtifactAfterToolResults({
+    workflowMode: input.workflowMode,
+    isPlanApproved: input.callbacks.getIsPlanApproved(),
+    planArtifactQualityRejected: planRuntimeState.planArtifactQualityRejected,
+    results: input.results,
+  })) {
     const currentStage = input.callbacks.getPlanStage();
     if (isReviewablePlanStage(currentStage)) {
       const reviewResult = await input.pauseForReviewablePlanArtifact(
         "post_tool_plan_artifact_write",
+        {
+          // The outer loop folds this phase only after it returns. Use the
+          // current batch's already-folded quality state so an accepted
+          // rewrite can enter review immediately instead of seeing stale true.
+          planArtifactQualityRejected: planRuntimeState.planArtifactQualityRejected,
+        },
       );
       if (reviewResult === "approved_continue") return finish("continue");
       if (reviewResult === "stopped") return finish("stopped");
@@ -497,6 +518,7 @@ export async function handleToolResultRecoveryPhase(input: {
       loopGuardRuntimeState,
       executeRecoveryState,
       recoveryPromptState,
+      approvedPlanRecoveryState,
     };
   }
 }

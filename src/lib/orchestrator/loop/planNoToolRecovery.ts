@@ -49,6 +49,7 @@ export function buildPlanClosureEvidenceRecoveryPrompt(language: "zh" | "en", re
 export function resolvePlanNoToolRecoveryDecision(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
+  planArtifactQualityRejected?: boolean;
   hasStructuredProposal: boolean;
   hasReviewablePlanArtifacts: boolean;
   currentPlanStage: string;
@@ -107,6 +108,7 @@ export function resolvePlanNoToolRecoveryDecision(input: {
     shouldEnterReview:
       input.workflowMode === "plan" &&
       !input.isPlanApproved &&
+      input.planArtifactQualityRejected !== true &&
       (input.hasStructuredProposal || input.hasReviewablePlanArtifacts),
     shouldTryPlanTextMaterialization,
     shouldMaterializeFallbackPlan,
@@ -168,6 +170,7 @@ async function handOffApprovedPlan(input: {
   callbacks: OrchestratorCallbacks;
   waitForPlanApprovalIfNeeded: () => Promise<boolean>;
   setPlanRuntimePhase: (phase: PlanRuntimePhase, reason?: string, status?: "pending" | "running" | "done" | "failed") => void;
+  recentPlanToolActivity: PlanToolActivitySummary[];
   phaseReason: string;
   assistantHistoryText: string;
   providerReasoningForHistory?: Pick<StreamResult, "reasoningContent" | "reasoningField"> | null;
@@ -176,11 +179,15 @@ async function handOffApprovedPlan(input: {
     callbacks,
     waitForPlanApprovalIfNeeded,
     setPlanRuntimePhase,
+    recentPlanToolActivity,
     phaseReason,
     assistantHistoryText,
     providerReasoningForHistory,
   } = input;
   setPlanRuntimePhase("review_ready", phaseReason, "done");
+  if (callbacks.getStatus() !== "pending_review") {
+    callbacks.onStatusChange("pending_review");
+  }
   callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
   const approved = await waitForPlanApprovalIfNeeded();
   if (!approved) {
@@ -191,13 +198,10 @@ async function handOffApprovedPlan(input: {
   }
 
   callbacks.onPlanStageChanged("executing");
+  recentPlanToolActivity.length = 0;
   const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
-  if (callbacks.onApprovedPlanHandoff) {
-    callbacks.onApprovedPlanHandoff(continuationPrompt);
-    callbacks.onStatusChange("idle");
-    return "stopped";
-  }
-
+  callbacks.onApprovedPlanExecutionStarted?.();
+  callbacks.onStatusChange("running");
   callbacks.appendMessage({
     role: "user",
     content: continuationPrompt,
@@ -237,6 +241,7 @@ export async function handlePlanNoToolRecovery(input: {
   planClosureEvidenceRecoveryIssued: boolean;
   planEvidenceRecoveryPasses: number;
   planLastQualityGateReason: string;
+  planArtifactQualityRejected?: boolean;
   setPlanRuntimePhase: (phase: PlanRuntimePhase, reason?: string, status?: "pending" | "running" | "done" | "failed") => void;
   waitForPlanApprovalIfNeeded: () => Promise<boolean>;
   tryClosePlanWithEvidence: (trigger: string, details?: {
@@ -261,6 +266,7 @@ export async function handlePlanNoToolRecovery(input: {
     providerReasoningForHistory,
     hasStructuredProposal,
     hasReviewablePlanArtifacts,
+    planArtifactQualityRejected,
     sawPlanModeToolActivity,
     wasTruncated,
     hasExecutablePlanProposalOptions,
@@ -293,6 +299,7 @@ export async function handlePlanNoToolRecovery(input: {
   const decision = resolvePlanNoToolRecoveryDecision({
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
+    planArtifactQualityRejected,
     hasStructuredProposal,
     hasReviewablePlanArtifacts,
     currentPlanStage,
@@ -343,10 +350,15 @@ export async function handlePlanNoToolRecovery(input: {
         callbacks,
         waitForPlanApprovalIfNeeded,
         setPlanRuntimePhase,
+        recentPlanToolActivity,
         phaseReason: "proposal ready",
         assistantHistoryText,
         providerReasoningForHistory,
       });
+      if (handoff === "continue") {
+        consecutiveNoToolCount = 0;
+        attemptedPlanWriteTargets.length = 0;
+      }
       return finish(handoff);
     }
   }
@@ -376,10 +388,15 @@ export async function handlePlanNoToolRecovery(input: {
         callbacks,
         waitForPlanApprovalIfNeeded,
         setPlanRuntimePhase,
+        recentPlanToolActivity,
         phaseReason: "materialized plan accepted",
         assistantHistoryText,
         providerReasoningForHistory,
       });
+      if (handoff === "continue") {
+        consecutiveNoToolCount = 0;
+        attemptedPlanWriteTargets.length = 0;
+      }
       return finish(handoff);
     }
 

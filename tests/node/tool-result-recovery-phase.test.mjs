@@ -23,6 +23,11 @@ test("tool result recovery phase owns post-tool recovery ordering", () => {
   assert.match(phaseSource, /appendToolResultsToHistory\(\{[\s\S]*?handleReadFileRepeatLimitRecovery\(\{/);
   assert.match(phaseSource, /handleCrossIterationReadFileLoopRecovery\(\{[\s\S]*?handleRepeatedEditValidationRecovery\(\{/);
   assert.match(phaseSource, /handlePlanReadOnlyConvergence\(\{[\s\S]*?pauseForReviewablePlanArtifact/);
+  assert.match(phaseSource, /shouldPauseForReviewablePlanArtifactAfterToolResults\(\{[\s\S]*?pauseForReviewablePlanArtifact/);
+  assert.match(
+    phaseSource,
+    /pauseForReviewablePlanArtifact\([\s\S]*?post_tool_plan_artifact_write[\s\S]*?planArtifactQualityRejected:\s*planRuntimeState\.planArtifactQualityRejected/,
+  );
   assert.match(phaseSource, /handleStrictRepeatGuardRecovery\(\{[\s\S]*?handleTargetProgressLoopRecovery\(\{/);
   assert.match(phaseSource, /handleExecuteConvergencePrompt\(\{[\s\S]*?logAgentEvent\("post_tool_result_continuation"/);
 });
@@ -35,6 +40,8 @@ test("tool result recovery phase owns runtime state folds", () => {
   assert.match(phaseSource, /setRepeatedEditValidationRecoveryAttempts\(/);
   assert.match(phaseSource, /applyPlanReadOnlyConvergenceRuntimeState\(/);
   assert.match(phaseSource, /applyExecuteConvergencePromptState\(/);
+  assert.match(phaseSource, /approvedPlanRecoveryState = input\.continueApprovedPlanWithStrategySwitch/);
+  assert.match(phaseSource, /approvedPlanRecoveryState,/);
 });
 
 test("tool iteration phase delegates tool-result recovery internals to the phase helper", () => {
@@ -43,6 +50,7 @@ test("tool iteration phase delegates tool-result recovery internals to the phase
   assert.match(toolIterationPhaseSource, /planRuntimeState: toolCallPhase\.planRuntimeState/);
   assert.match(toolIterationPhaseSource, /recoveryPromptState: toolCallPhase\.recoveryPromptState/);
   assert.match(toolIterationPhaseSource, /results: toolCallPhase\.allResults/);
+  assert.match(toolIterationPhaseSource, /approvedPlanRecoveryState: toolResultRecoveryPhase\.approvedPlanRecoveryState/);
   assert.doesNotMatch(orchestratorSource, /handleToolResultRecoveryPhase\(\{/);
   assert.doesNotMatch(orchestratorSource, /appendToolResultsToHistory\(/);
   assert.doesNotMatch(orchestratorSource, /handleNoProgressRecovery\(/);

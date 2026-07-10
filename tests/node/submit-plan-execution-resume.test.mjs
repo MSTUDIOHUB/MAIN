@@ -112,7 +112,7 @@ function createHarness(state) {
   };
 }
 
-test("plan execution resume hydrates plan state and dispatches hidden execution turn", async () => {
+test("plan execution resume hydrates plan state and restarts the target logical turn", async () => {
   const state = createState();
   const harness = createHarness(state);
   const hydratedTask = planTask();
@@ -169,9 +169,9 @@ test("plan execution resume hydrates plan state and dispatches hidden execution 
   assert.equal(harness.resumes[0].images, undefined);
   assert.deepEqual(harness.resumes[0].options, {
     hidden: true,
-    createVisibleTurnForHiddenMessage: true,
-    reuseCurrentTurn: false,
-    uiParentTurnId: "turn-parent",
+    createVisibleTurnForHiddenMessage: false,
+    reuseCurrentTurn: true,
+    turnIdOverride: "turn-parent",
     preservePlanState: true,
     resolvedIntent: "plan",
     runtimeIntentOverride: "execute",
@@ -216,6 +216,8 @@ test("plan execution resume reuses existing plan state without rehydrating", asy
   assert.equal(harness.resumes.length, 1);
   assert.match(harness.resumes[0].text, /Continue plan execution in a fresh recovery context/);
   assert.equal(harness.resumes[0].options.turnTitle, "Plan Execution Resume");
+  assert.equal(harness.resumes[0].options.reuseCurrentTurn, true);
+  assert.equal(harness.resumes[0].options.turnIdOverride, "turn-plan");
 });
 
 test("trusted plan resume prompt summarizes evidence and remaining tasks", () => {

@@ -40,7 +40,10 @@ export type SetPlanRuntimePhase = (
 
 export interface PlanReviewRuntimeHandlers {
   waitForPlanApprovalIfNeeded: () => Promise<boolean>;
-  pauseForReviewablePlanArtifact: (trigger: string) => Promise<PlanReviewPauseResult>;
+  pauseForReviewablePlanArtifact: (
+    trigger: string,
+    runtimeStateOverride?: Pick<PlanLoopRuntimeState, "planArtifactQualityRejected">,
+  ) => Promise<PlanReviewPauseResult>;
   tryClosePlanWithEvidence: (
     trigger: string,
     details?: {
@@ -84,7 +87,9 @@ export function createPlanReviewRuntimeHandlers(input: {
   const waitForPlanApprovalIfNeeded = async (): Promise<boolean> => {
     if (workflowMode !== "plan") return true;
     if (callbacks.getIsPlanApproved()) return true;
-    callbacks.onStatusChange("pending_review");
+    if (callbacks.getStatus() !== "pending_review") {
+      callbacks.onStatusChange("pending_review");
+    }
     return new Promise<boolean>((resolve) => {
       const checkInterval = setInterval(() => {
         if (abortController.signal.aborted) {
@@ -102,10 +107,21 @@ export function createPlanReviewRuntimeHandlers(input: {
 
   const pauseForReviewablePlanArtifact = async (
     trigger: string,
+    runtimeStateOverride?: Pick<PlanLoopRuntimeState, "planArtifactQualityRejected">,
   ): Promise<PlanReviewPauseResult> => {
     if (workflowMode !== "plan" || callbacks.getIsPlanApproved()) return "not_reviewable";
     const stage = callbacks.getPlanStage();
     if (!isReviewablePlanStage(stage)) return "not_reviewable";
+    const planArtifactQualityRejected = runtimeStateOverride?.planArtifactQualityRejected ??
+      getPlanRuntimeState().planArtifactQualityRejected;
+    if (planArtifactQualityRejected) {
+      logAgentEvent("plan_review_blocked_by_quality_rejection", {
+        trigger,
+        iteration: getIteration(),
+        planStage: stage,
+      });
+      return "not_reviewable";
+    }
     const language = callbacks.getPreferredLanguage();
     logAgentEvent("plan_review_ready_after_tool", {
       trigger,
@@ -125,6 +141,12 @@ export function createPlanReviewRuntimeHandlers(input: {
     }
 
     setPlanRuntimePhase("review_ready", "quality gate accepted", "done");
+    // Acquire the review pause before rendering the final plan. The UI finalizer
+    // may otherwise observe `running` and release the active abort controller,
+    // making approval race into a second loop.
+    if (callbacks.getStatus() !== "pending_review") {
+      callbacks.onStatusChange("pending_review");
+    }
     callbacks.onAssistantFinalText(buildPlanReviewReadyMessage(language, stage));
     const approved = await waitForPlanApprovalIfNeeded();
     if (!approved) {
@@ -138,13 +160,14 @@ export function createPlanReviewRuntimeHandlers(input: {
     setApprovedPlanRecoveryState(
       resetApprovedPlanHandoffRecoveryState(getApprovedPlanRecoveryState()),
     );
+    // Planning reads/writes are evidence for drafting, not execution history.
+    // Start the approved execution phase with a fresh activity window so its
+    // first model iteration can read the exact source it is about to edit.
+    recentPlanToolActivity.length = 0;
+    attemptedPlanWriteTargets.length = 0;
     const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
-    if (callbacks.onApprovedPlanHandoff) {
-      callbacks.onApprovedPlanHandoff(continuationPrompt);
-      callbacks.onStatusChange("idle");
-      return "stopped";
-    }
-
+    callbacks.onApprovedPlanExecutionStarted?.();
+    callbacks.onStatusChange("running");
     callbacks.appendMessage({
       role: "user",
       content: continuationPrompt,

@@ -74,6 +74,7 @@ function createFixtureState() {
     planQualityRejectCount: 2,
     planLastQualityGateReason: "missing_scope",
     planLastMissingSections: ["risks"],
+    planArtifactQualityRejected: false,
     planEvidenceRecoveryPasses: 1,
     planReasoningOnlyRecoveryPasses: 3,
     planAutoScaffoldPromptIssued: true,
@@ -95,6 +96,10 @@ test("plan loop runtime state starts in the correct phase for each workflow", ()
     workflowMode: "plan",
     isPlanApproved: false,
   }).planRuntimePhase, "explore_structure");
+  assert.equal(createPlanLoopRuntimeState({
+    workflowMode: "plan",
+    isPlanApproved: false,
+  }).planArtifactQualityRejected, false);
 
   assert.equal(createPlanLoopRuntimeState({
     workflowMode: "plan",
@@ -170,6 +175,7 @@ test("plan runtime reducers update only their owned fields", () => {
     planQualityRejectCount: 12,
     planLastQualityGateReason: "needs_evidence",
     planLastMissingSections: ["verification", "fallback"],
+    planArtifactQualityRejected: true,
     planAutoScaffoldPromptIssued: false,
     planClosureEvidenceRecoveryIssued: false,
     planEvidenceRecoveryPasses: 13,
@@ -178,6 +184,7 @@ test("plan runtime reducers update only their owned fields", () => {
     planQualityRejectCount: 12,
     planLastQualityGateReason: "needs_evidence",
     planLastMissingSections: ["verification", "fallback"],
+    planArtifactQualityRejected: true,
     planAutoScaffoldPromptIssued: false,
     planClosureEvidenceRecoveryIssued: false,
     planEvidenceRecoveryPasses: 13,

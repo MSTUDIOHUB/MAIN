@@ -204,6 +204,45 @@ test("approved plan completion guard pauses completed plan execution without aud
   assert.equal(events.statuses.at(-1), "idle");
 });
 
+test("approved plan completion is deferred until the current loop consumes the execution transition", () => {
+  const { callbacks, events } = createCallbacks({
+    getWorkflowMode: () => "plan",
+    getIsPlanApproved: () => true,
+    getIsApprovedPlanExecutionTransitionPending: () => true,
+  });
+  const result = runApprovedPlanCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    sawExecutionEvidence: false,
+  });
+
+  assert.deepEqual(result, {
+    status: "paused",
+    reason: "approved_plan_same_turn_execution_pending",
+  });
+  assert.equal(events.stops.length, 0);
+  assert.equal(events.statuses.length, 0);
+});
+
+test("approved plan recovery without a pending approval transition still runs the evidence guard", () => {
+  const { callbacks, events } = createCallbacks({
+    getWorkflowMode: () => "plan",
+    getIsPlanApproved: () => true,
+    getIsApprovedPlanExecutionTransitionPending: () => false,
+  });
+  const result = runApprovedPlanCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    sawExecutionEvidence: false,
+  });
+
+  assert.deepEqual(result, {
+    status: "stopped_no_action",
+    reason: "approved_plan_completion_guard",
+  });
+  assert.equal(events.stops.length, 1);
+});
+
 test("agent loop runner preserves awaiting-choice pauses as a structured outcome", async () => {
   const logs = [];
   const finals = [];

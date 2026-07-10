@@ -14,6 +14,7 @@ import {
   createAgentLoopMutableState,
   markChatFinalSynthesisPromptUsedMutableState,
   markExecuteOperationEvidenceMutableState,
+  resetAgentLoopMutableStateForApprovedPlanExecution,
 } from "./loopMutableState";
 import { createAgentLoopControlRuntime } from "./loopControlRuntime";
 import { prepareIterationStreamRequest } from "./iterationStreamPreparation";
@@ -119,6 +120,22 @@ export class AgentOrchestrator {
           workflowMode,
           unityMcpRuntimeState: initialUnityMcpRuntimeState,
         });
+        const notifyApprovedPlanExecutionStarted = callbacks.onApprovedPlanExecutionStarted;
+        let approvedPlanExecutionPhaseStarted = false;
+        let approvedPlanExecutionResetPendingFold = false;
+        callbacks.onApprovedPlanExecutionStarted = () => {
+          if (!approvedPlanExecutionPhaseStarted) {
+            approvedPlanExecutionPhaseStarted = true;
+            approvedPlanExecutionResetPendingFold = true;
+            resetAgentLoopMutableStateForApprovedPlanExecution(loopState);
+          }
+          notifyApprovedPlanExecutionStarted?.();
+        };
+        const reapplyApprovedPlanExecutionResetAfterPhaseFold = () => {
+          if (!approvedPlanExecutionResetPendingFold) return;
+          approvedPlanExecutionResetPendingFold = false;
+          resetAgentLoopMutableStateForApprovedPlanExecution(loopState);
+        };
         const toolSurfaceRuntime = createAgentLoopToolSurfaceRuntime({
           callbacks,
           runtimeState,
@@ -262,7 +279,7 @@ export class AgentOrchestrator {
           setPlanRuntimePhase,
         });
         const {
-          effectiveMaxIterations,
+          getEffectiveMaxIterations,
           emitPlanExecutionProgress,
           getMaxOutputEscalations,
           getPlanStreamWatchdogOptions,
@@ -280,9 +297,10 @@ export class AgentOrchestrator {
           unityMcpFallbackReason: loopState.unityMcpRuntimeState.fallbackReason,
         });
 
-        while (loopState.iteration < effectiveMaxIterations) {
+        while (loopState.iteration < getEffectiveMaxIterations()) {
         loopState.iteration++;
         const iteration = loopState.iteration;
+        const effectiveMaxIterations = getEffectiveMaxIterations();
         emitPlanExecutionProgress("running");
 
         if (abortController.signal.aborted) {
@@ -438,6 +456,7 @@ export class AgentOrchestrator {
           waitForPlanApprovalIfNeeded,
         });
         applyAssistantIterationMutableState(loopState, assistantIterationPhase);
+        reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (assistantIterationPhase.status === "stopped") {
           return;
         }
@@ -512,6 +531,7 @@ export class AgentOrchestrator {
           pauseForReviewablePlanArtifact,
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);
+        reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (toolIterationPhase.status === "aborted") {
           return;
         }
@@ -524,6 +544,7 @@ export class AgentOrchestrator {
         // Loop continues — the model sees all tool results and can respond
         }
 
+        const effectiveMaxIterations = getEffectiveMaxIterations();
         await handleMaxIterationBoundary({
           callbacks,
           workflowMode,

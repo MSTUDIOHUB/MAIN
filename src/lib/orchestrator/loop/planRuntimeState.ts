@@ -5,6 +5,7 @@ export interface PlanLoopRuntimeState {
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
+  planArtifactQualityRejected: boolean;
   planEvidenceRecoveryPasses: number;
   planReasoningOnlyRecoveryPasses: number;
   planAutoScaffoldPromptIssued: boolean;
@@ -32,6 +33,7 @@ export function createPlanLoopRuntimeState(input: {
     planQualityRejectCount: 0,
     planLastQualityGateReason: "",
     planLastMissingSections: [],
+    planArtifactQualityRejected: false,
     planEvidenceRecoveryPasses: 0,
     planReasoningOnlyRecoveryPasses: 0,
     planAutoScaffoldPromptIssued: false,
@@ -124,6 +126,7 @@ export function applyPlanQualityRuntimeState(
     | "planQualityRejectCount"
     | "planLastQualityGateReason"
     | "planLastMissingSections"
+    | "planArtifactQualityRejected"
     | "planAutoScaffoldPromptIssued"
     | "planClosureEvidenceRecoveryIssued"
     | "planEvidenceRecoveryPasses"
@@ -134,6 +137,7 @@ export function applyPlanQualityRuntimeState(
     planQualityRejectCount: input.planQualityRejectCount,
     planLastQualityGateReason: input.planLastQualityGateReason,
     planLastMissingSections: input.planLastMissingSections,
+    planArtifactQualityRejected: input.planArtifactQualityRejected,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued,
     planClosureEvidenceRecoveryIssued: input.planClosureEvidenceRecoveryIssued,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses,

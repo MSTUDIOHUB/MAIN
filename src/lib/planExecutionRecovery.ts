@@ -12,6 +12,48 @@ import {
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
 
+export type ApprovedPlanSameTurnFallbackDecision =
+  | "start"
+  | "retry_busy"
+  | "busy_retry_exhausted"
+  | "session_changed"
+  | "transition_stale";
+
+interface ApprovedPlanFallbackHandoffLike {
+  planTurnId: string;
+  requestedAt: number;
+  executionTurnId?: string;
+}
+
+export function resolveApprovedPlanSameTurnFallbackDecision(input: {
+  expectedSessionKey: string;
+  currentSessionKey: string | null;
+  expectedHandoff: ApprovedPlanFallbackHandoffLike;
+  currentHandoff: ApprovedPlanFallbackHandoffLike | null | undefined;
+  isPlanApproved: boolean;
+  executionStartedForTurnId: string | null | undefined;
+  isAgentBusy: boolean;
+  busyRetryAttempt: number;
+  maxBusyRetries?: number;
+}): ApprovedPlanSameTurnFallbackDecision {
+  if (input.currentSessionKey !== input.expectedSessionKey) return "session_changed";
+
+  const expectedExecutionTurnId = input.expectedHandoff.executionTurnId || input.expectedHandoff.planTurnId;
+  const currentExecutionTurnId = input.currentHandoff?.executionTurnId || input.currentHandoff?.planTurnId;
+  const isExactPendingTransition =
+    input.isPlanApproved &&
+    input.currentHandoff?.planTurnId === input.expectedHandoff.planTurnId &&
+    input.currentHandoff?.requestedAt === input.expectedHandoff.requestedAt &&
+    currentExecutionTurnId === expectedExecutionTurnId &&
+    input.executionStartedForTurnId !== input.expectedHandoff.planTurnId;
+  if (!isExactPendingTransition) return "transition_stale";
+
+  if (!input.isAgentBusy) return "start";
+  return input.busyRetryAttempt < Math.max(0, input.maxBusyRetries ?? 1)
+    ? "retry_busy"
+    : "busy_retry_exhausted";
+}
+
 export type PlanToolActivityStatus = "called" | "succeeded" | "failed";
 
 export interface PlanToolActivitySummary {

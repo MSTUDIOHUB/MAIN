@@ -1,7 +1,7 @@
 import type { AppConfig } from "../../appTypes";
 import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
 import {
-  resolveAgentLoopMaxIterations,
+  resolveAgentLoopIterationBudget,
   type AgentLoopIterationLimits,
 } from "../../agentLoopSafety";
 import {
@@ -49,7 +49,7 @@ type SetPlanRuntimePhase = (
 ) => void;
 
 export interface AgentLoopControlRuntime {
-  effectiveMaxIterations: number;
+  getEffectiveMaxIterations: () => number;
   emitPlanExecutionProgress: (
     phase: PlanExecutionProgressPhase,
     overrides?: Partial<PlanExecutionProgressUpdate>,
@@ -70,7 +70,7 @@ export interface AgentLoopControlRuntime {
     reason: string;
     remainingText: string;
     logContext?: Record<string, unknown>;
-  }) => void;
+  }) => ApprovedPlanRecoveryRuntimeState;
   startLoop: (input: {
     runtimeIntent: ResolvedUserIntent;
     loopStartTools: ToolDefinition[];
@@ -118,24 +118,48 @@ export function createAgentLoopControlRuntime(input: {
   const agentLoopConfig = config as AppConfig & {
     agentLoop?: { iterationLimits?: AgentLoopIterationLimits | null } | null;
   };
-  const effectiveMaxIterations = resolveAgentLoopMaxIterations({
-    workflowMode,
-    runtimeIntent: getRuntimeIntent(),
-    isPlanApproved: callbacks.getIsPlanApproved(),
-    limits: agentLoopConfig.agentLoop?.iterationLimits ?? null,
-  });
+  let planExecutionStartIteration: number | null =
+    workflowMode === "plan" && callbacks.getIsPlanApproved() ? 0 : null;
+  let didLogPlanExecutionBudget = planExecutionStartIteration === 0;
+  const resolveIterationBudget = () => {
+    const budget = resolveAgentLoopIterationBudget({
+      workflowMode,
+      runtimeIntent: getRuntimeIntent(),
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      currentIteration: getIteration(),
+      planExecutionStartIteration,
+      limits: agentLoopConfig.agentLoop?.iterationLimits ?? null,
+    });
+    if (budget.phase === "plan_execution" && planExecutionStartIteration == null) {
+      planExecutionStartIteration = budget.phaseStartIteration;
+    }
+    if (budget.phase === "plan_execution" && !didLogPlanExecutionBudget) {
+      didLogPlanExecutionBudget = true;
+      logAgentEvent("plan_execution_iteration_budget_started", {
+        planningIterationsUsed: budget.phaseStartIteration,
+        executionIterationBudget: budget.phaseMaxIterations,
+        absoluteMaxIterations: budget.absoluteMaxIterations,
+      });
+    }
+    return budget;
+  };
+  const getEffectiveMaxIterations = () => resolveIterationBudget().absoluteMaxIterations;
 
   const emitPlanExecutionProgress = (
     phase: PlanExecutionProgressPhase,
     overrides: Partial<PlanExecutionProgressUpdate> = {},
   ) => {
     if (workflowMode !== "plan" || !callbacks.getIsPlanApproved() || !callbacks.onPlanExecutionProgress) return;
+    const budget = resolveIterationBudget();
+    const displayIteration = budget.phase === "plan_execution"
+      ? Math.max(0, getIteration() - budget.phaseStartIteration)
+      : getIteration();
     callbacks.onPlanExecutionProgress({
       ...buildPlanExecutionProgressUpdate({
         language: callbacks.getPreferredLanguage(),
         phase,
-        iterationCount: getIteration(),
-        maxIterations: effectiveMaxIterations,
+        iterationCount: displayIteration,
+        maxIterations: budget.phaseMaxIterations,
         autoResumeCount: callbacks.getPlanAutoResumeCount?.() ?? 0,
         tasks: callbacks.getPlanTasks(),
         evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
@@ -213,12 +237,12 @@ export function createAgentLoopControlRuntime(input: {
       emitPlanExecutionProgress,
       ...strategyInput,
     });
-    setApprovedPlanRecoveryState(
-      applyApprovedPlanStrategySwitchRecoveryState(
-        approvedPlanRecoveryState,
-        result,
-      ),
+    const nextState = applyApprovedPlanStrategySwitchRecoveryState(
+      approvedPlanRecoveryState,
+      result,
     );
+    setApprovedPlanRecoveryState(nextState);
+    return nextState;
   };
 
   const startLoop: AgentLoopControlRuntime["startLoop"] = (startInput) => {
@@ -233,7 +257,7 @@ export function createAgentLoopControlRuntime(input: {
       builtinAndSkillTools: Math.max(0, loopStartTools.length - mcpToolCount),
       activeProfile: config.activeProfile,
       provider: settings.provider || "unknown",
-      maxIterations: effectiveMaxIterations,
+      maxIterations: getEffectiveMaxIterations(),
       iterationLimitSource: {
         chatRespond: agentLoopConfig.agentLoop?.iterationLimits?.chatRespond ?? null,
         editExecute: agentLoopConfig.agentLoop?.iterationLimits?.editExecute ?? null,
@@ -259,7 +283,7 @@ export function createAgentLoopControlRuntime(input: {
   };
 
   return {
-    effectiveMaxIterations,
+    getEffectiveMaxIterations,
     emitPlanExecutionProgress,
     getMaxOutputEscalations,
     getPlanStreamWatchdogOptions,

@@ -1,5 +1,6 @@
 export interface ApprovedPlanRecoveryActivityLike {
   name?: string;
+  target?: string;
   status?: string;
   detail?: string;
 }
@@ -71,22 +72,57 @@ export function isApprovedPlanCachedReadOnlyNoProgressBatch(input: {
 export function shouldAllowApprovedPlanRecoveryFileRead(
   recentActivity: ApprovedPlanRecoveryActivityLike[],
 ): boolean {
-  const recent = recentActivity.slice(-6);
-  let latestPatchMismatchIndex = -1;
-  let latestFileReadIndex = -1;
-  for (let index = 0; index < recent.length; index += 1) {
+  return resolveApprovedPlanPatchRecoveryTarget(recentActivity) !== null;
+}
+
+function normalizeRecoveryTarget(value: unknown): string {
+  return String(value || "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/");
+}
+
+function isSuccessfulRecoveryResolution(
+  activity: ApprovedPlanRecoveryActivityLike,
+  mismatchTarget: string,
+): boolean {
+  if (activity.status === "failed") return false;
+  if (normalizeRecoveryTarget(activity.target) !== mismatchTarget) return false;
+  return activity.name === "read_file" ||
+    (typeof activity.name === "string" && APPROVED_PLAN_SOURCE_EDIT_TOOLS.has(activity.name));
+}
+
+/**
+ * Return the newest patch-mismatch target that has not yet been satisfied by
+ * a fresh read or a successful write to that same file.
+ */
+export function resolveApprovedPlanPatchRecoveryTarget(
+  recentActivity: ApprovedPlanRecoveryActivityLike[],
+): string | null {
+  const recent = recentActivity.slice(-8);
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
     const activity = recent[index];
-    if (isPatchMismatchRecoveryActivity(activity)) latestPatchMismatchIndex = index;
-    if (activity.name === "read_file" && activity.status !== "failed") latestFileReadIndex = index;
+    if (!isPatchMismatchRecoveryActivity(activity)) continue;
+    const mismatchTarget = normalizeRecoveryTarget(activity.target);
+    if (!mismatchTarget) continue;
+    const alreadyResolved = recent
+      .slice(index + 1)
+      .some((next) => isSuccessfulRecoveryResolution(next, mismatchTarget));
+    if (!alreadyResolved) return mismatchTarget;
   }
-  return latestPatchMismatchIndex >= 0 && latestPatchMismatchIndex > latestFileReadIndex;
+  return null;
 }
 
 export function shouldBypassApprovedPlanReadCacheForPatchRecovery(input: {
   toolName: string;
   allowFileRead: boolean;
+  target: string;
+  recentActivity: ApprovedPlanRecoveryActivityLike[];
 }): boolean {
-  return input.toolName === "read_file" && input.allowFileRead;
+  if (input.toolName !== "read_file" || !input.allowFileRead) return false;
+  const recoveryTarget = resolveApprovedPlanPatchRecoveryTarget(input.recentActivity);
+  return recoveryTarget !== null && normalizeRecoveryTarget(input.target) === recoveryTarget;
 }
 
 export function isApprovedPlanRecoveryToolName(

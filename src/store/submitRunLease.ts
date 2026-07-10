@@ -37,6 +37,13 @@ export interface SubmitRunLease<TAbortController> {
   harnessRunMarker: HarnessRunMarker;
 }
 
+export function createSubmitHarnessRunId(startedAtMs: number): string {
+  const randomUuid = globalThis.crypto?.randomUUID?.();
+  return randomUuid
+    ? `run-${randomUuid}`
+    : `run-${startedAtMs}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 export function buildSubmitAgentUserMessage(params: {
   userContent: string;
   currentImages: string[];
@@ -76,6 +83,7 @@ export function startSubmitRunLease<TAbortController>(
   const runtimeAfterMessage = input.getRuntimeSnapshot();
   const startedAtMs = (input.nowMs || Date.now)();
   const harnessRunMarker = input.persistHarnessRunMarker(buildSubmitHarnessRunMarkerDraft({
+    runId: createSubmitHarnessRunId(startedAtMs),
     instanceId: input.getCurrentHarnessInstanceId(),
     runSessionKey: input.runSessionKey,
     runWorkspace: input.runWorkspace,

@@ -70,6 +70,7 @@ const {
   buildChatFinalSynthesisPrompt,
   buildEmptyModelResponsePauseNotice,
   buildMaxStepsFinalTextPrompt,
+  resolveAgentLoopIterationBudget,
   resolveAgentLoopMaxIterations,
   shouldTriggerChatFinalSynthesis,
   shouldUseMaxStepsFinalTextOnly,
@@ -326,6 +327,101 @@ test("Goal Runtime receives the same mutation-first recovery surface as execute"
   assert.deepEqual(decision.iterationAllTools.map((tool) => tool.function.name), ["apply_patch", "run_command"]);
 });
 
+function createApprovedPlanToolSurfaceInput(overrides = {}) {
+  const tools = [
+    "list_directory",
+    "grep_search",
+    "read_file",
+    "apply_patch",
+    "replace_in_file",
+    "write_file",
+    "run_command",
+    "browser_evaluate",
+  ].map((name) => ({
+    type: "function",
+    function: { name, description: name, parameters: { type: "object", properties: {} } },
+  }));
+  return {
+    callbacks: {
+      getIsPlanApproved: () => true,
+      getPlanTasks: () => [{
+        id: "edit-main",
+        text: "修改 src/main.rs 的后端逻辑",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "file", value: "src/main.rs" }],
+      }],
+      getPlanExecutionEvidenceLedger: () => [],
+      getMessages: () => [],
+      getPlanStage: () => "executing",
+    },
+    iteration: 8,
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    rawIterationAllTools: tools,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    executeRecoveryAttempts: 0,
+    recoveryIterationCount: 0,
+    maxRecoveryIterations: 6,
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    approvedPlanNoProgressRecoveryAttempts: 0,
+    approvedPlanLongReasoningNoActionCount: 0,
+    recentToolActivity: [],
+    recentPlanToolActivity: [{
+      name: "write_file",
+      status: "succeeded",
+      target: ".MAIN/plans/plan.md",
+      detail: "plan materialized",
+    }],
+    planRuntimePhase: "executing",
+    planDraftingRecoveryReadCount: 0,
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: {},
+    lastAssistantTextForCheckpoint: "",
+    ...overrides,
+  };
+}
+
+test("approved plan execution keeps targeted source reads after planning activity", () => {
+  const decision = resolveIterationToolSurface(createApprovedPlanToolSurfaceInput());
+
+  assert.equal(decision.approvedPlanSourceEditFirstActive, true);
+  assert.equal(decision.allowApprovedPlanRecoveryFileRead, true);
+  assert.deepEqual(decision.iterationAllTools.map((tool) => tool.function.name), [
+    "read_file",
+    "apply_patch",
+    "replace_in_file",
+    "write_file",
+  ]);
+});
+
+test("approved plan action-only recovery reopens read_file only for its unresolved patch target", () => {
+  const actionOnly = resolveIterationToolSurface(createApprovedPlanToolSurfaceInput({
+    approvedPlanActionOnlyRecoveryActive: true,
+  }));
+  assert.deepEqual(actionOnly.iterationAllTools.map((tool) => tool.function.name), [
+    "apply_patch",
+    "replace_in_file",
+    "write_file",
+    "run_command",
+    "browser_evaluate",
+  ]);
+
+  const patchRecovery = resolveIterationToolSurface(createApprovedPlanToolSurfaceInput({
+    approvedPlanActionOnlyRecoveryActive: true,
+    recentPlanToolActivity: [{
+      name: "replace_in_file",
+      status: "failed",
+      target: "src/main.rs",
+      detail: "search_text mismatch",
+    }],
+  }));
+  assert.equal(patchRecovery.iterationAllTools.some((tool) => tool.function.name === "read_file"), true);
+  assert.equal(patchRecovery.iterationAllTools.some((tool) => tool.function.name === "grep_search"), false);
+});
+
 test("repeat-edit validation recovery exposes only validation tools and forbids more edits", () => {
   assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
     mode: "validation_only",
@@ -577,6 +673,37 @@ test("agent loop iteration limits are mode-specific and configurable", () => {
   }), 12);
 });
 
+test("same-loop plan approval receives a full execution phase budget", () => {
+  const draft = resolveAgentLoopIterationBudget({
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    isPlanApproved: false,
+    currentIteration: 18,
+    limits: { planDraft: 25, planExecution: 50 },
+  });
+  assert.deepEqual(draft, {
+    phase: "plan_draft",
+    phaseStartIteration: 0,
+    phaseMaxIterations: 25,
+    absoluteMaxIterations: 25,
+  });
+
+  const execution = resolveAgentLoopIterationBudget({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    currentIteration: 18,
+    planExecutionStartIteration: null,
+    limits: { planDraft: 25, planExecution: 50 },
+  });
+  assert.deepEqual(execution, {
+    phase: "plan_execution",
+    phaseStartIteration: 18,
+    phaseMaxIterations: 50,
+    absoluteMaxIterations: 68,
+  });
+});
+
 test("max-steps final text prompt disables tools for chat final boundary", () => {
   assert.equal(shouldUseMaxStepsFinalTextOnly({
     workflowMode: "chat",
@@ -716,7 +843,7 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.match(executeRecoveryRuntimeSource, /attempts: state\.attempts \+ 1/);
   assert.match(executeRecoveryRuntimeSource, /MAX_EXECUTE_RECOVERY_ITERATIONS = 6/);
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);
-  assert.match(loopControlRuntimeSource, /resolveAgentLoopMaxIterations/);
+  assert.match(loopControlRuntimeSource, /resolveAgentLoopIterationBudget/);
   assert.match(streamInvocationSource, /buildMaxStepsFinalTextPrompt/);
   assert.match(source, /recoveryReason: "max_iterations_boundary"/);
   assert.match(source, /normalizeNoProgressResultContent/);

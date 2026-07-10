@@ -1519,9 +1519,15 @@ const RUNTIME_TASK_FILE_ROLE_RE =
 const RUNTIME_TASK_SECTION_RE =
   /(?:关键改动|实现改动|改动|执行|实施|任务|步骤|顺序|验证|验收|Key Changes|Implementation Changes|Changes|Execution|Implementation|Tasks|Steps|Order|Validation|Acceptance)/i;
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
-  /(?:用户目标|目标|摘要|概要|当前状态|状态发现|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|证据|已读证据|最相关证据|假设|默认值|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|User Goals?|Goals?|Summary|Overview|Current State|Findings|Background|Root Cause|Tech Stack|Architecture|Evidence|Read Evidence|Most Relevant Evidence|Assumptions|Defaults|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
+  /(?:用户目标|目标|摘要|概要|当前状态|状态发现|已确认发现|已确认事实|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|证据|已读证据|最相关证据|假设|默认值|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|User Goals?|Goals?|Summary|Overview|Current State|Confirmed Findings|Findings|Background|Root Cause|Tech Stack|Architecture|Evidence|Read Evidence|Most Relevant Evidence|Assumptions|Defaults|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
   /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
+const RUNTIME_TASK_CHANGE_HEADING_RE =
+  /^(?:改动|变更|changes?)\s*\d*\s*[：:]\s*(.+)$/i;
+const RUNTIME_TASK_CHANGE_DETAIL_RE =
+  /^(?:改动(?:内容)?|变更(?:内容)?|changes?|implementation(?: details)?)\s*[：:]\s*(.+)$/i;
+const RUNTIME_TASK_FILE_TABLE_SECTION_RE =
+  /(?:关键(?:实现)?改动|实现改动|改动\s*\d+|影响文件|涉及文件|文件变更|变更文件|key changes?|implementation changes?|affected files?|files? to change|file changes?|^files?$)/i;
 
 function stripMarkdownTaskLine(line: string): string {
   return String(line || "")
@@ -1700,14 +1706,101 @@ function extractWorkspaceFileReferencesFromText(text: string): string[] {
   return refs;
 }
 
+function collectRuntimeTaskChangeHeadingTasks(
+  content: string,
+  language: "zh" | "en",
+): PlanTask[] {
+  const descriptionsByFile = new Map<string, string[]>();
+  let pendingChange: {
+    files: string[];
+    headingSummary: string;
+    details: string[];
+  } | null = null;
+
+  const flushPendingChange = () => {
+    if (!pendingChange) return;
+    const descriptions = pendingChange.details.length > 0
+      ? pendingChange.details
+      : pendingChange.headingSummary
+        ? [pendingChange.headingSummary]
+        : [];
+    for (const filePath of pendingChange.files) {
+      const existing = descriptionsByFile.get(filePath) || [];
+      for (const description of descriptions) {
+        const clean = description.replace(/\s+/g, " ").trim();
+        if (clean && !existing.includes(clean)) existing.push(clean);
+      }
+      descriptionsByFile.set(filePath, existing);
+    }
+    pendingChange = null;
+  };
+
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const heading = line.match(/^\s*#{2,6}\s+(.+?)\s*$/);
+    if (heading) {
+      flushPendingChange();
+      const change = (heading[1] || "").replace(/\*\*/g, "").trim().match(RUNTIME_TASK_CHANGE_HEADING_RE);
+      if (!change) continue;
+
+      const headingBody = change[1] || "";
+      const headingTarget = headingBody.split(/\s+(?:—|–|-)\s+/u, 1)[0] || headingBody;
+      const files = extractWorkspaceFileReferencesFromText(headingTarget);
+      if (files.length === 0) continue;
+      let headingSummary = headingBody;
+      for (const filePath of files) {
+        headingSummary = headingSummary
+          .split(`\`${filePath}\``).join("")
+          .split(filePath).join("");
+      }
+      pendingChange = {
+        files,
+        headingSummary: headingSummary.replace(/^[\s—–\-:：]+/, "").trim(),
+        details: [],
+      };
+      continue;
+    }
+
+    if (!pendingChange) continue;
+    const normalized = line
+      .replace(/^\s*[-*]\s+/, "")
+      .replace(/\*\*/g, "")
+      .trim();
+    const detail = normalized.match(RUNTIME_TASK_CHANGE_DETAIL_RE)?.[1]?.trim();
+    if (detail) pendingChange.details.push(detail);
+  }
+  flushPendingChange();
+
+  const tasks: PlanTask[] = [];
+  for (const [filePath, descriptions] of descriptionsByFile) {
+    const evidence = makePlanTaskEvidence("file", filePath, true);
+    if (!evidence) continue;
+    const verb = language === "en" ? "Modify" : "修改";
+    const taskText = descriptions.length > 0
+      ? `${verb} ${filePath}：${descriptions.join(language === "en" ? "; " : "；")}`
+      : `${verb} ${filePath}`;
+    tasks.push(makeRuntimeTaskFromEvidenceText(taskText, evidence, language));
+  }
+  return tasks;
+}
+
 function collectRuntimeTaskTableTasks(
   content: string,
   language: "zh" | "en",
 ): PlanTask[] {
   const tasks: PlanTask[] = [];
   const seen = new Set<string>();
+  let inActionableFileTableSection = false;
 
   for (const line of String(content || "").split(/\r?\n/)) {
+    const heading = line.match(/^\s*#{1,6}\s+(.+?)\s*$/);
+    if (heading) {
+      inActionableFileTableSection = RUNTIME_TASK_FILE_TABLE_SECTION_RE.test(
+        (heading[1] || "").replace(/\*\*/g, "").trim(),
+      );
+      continue;
+    }
+    if (!inActionableFileTableSection) continue;
+
     const cells = splitMarkdownTableRow(line);
     if (!cells) continue;
 
@@ -1719,6 +1812,12 @@ function collectRuntimeTaskTableTasks(
 
     const actionCell = (cells[1] || "").replace(/\*\*/g, "").trim();
     const detail = cells.slice(2).join(" ").replace(/\*\*/g, "").trim();
+    if (
+      !RUNTIME_TASK_MUTATION_RE.test(actionCell) &&
+      (RUNTIME_TASK_READ_ONLY_RE.test(actionCell) || RUNTIME_TASK_FILE_ROLE_RE.test(actionCell))
+    ) {
+      continue;
+    }
     if (!RUNTIME_TASK_MUTATION_RE.test(`${actionCell} ${detail}`)) continue;
 
     const evidence = makePlanTaskEvidence("file", filePath, true);
@@ -1754,6 +1853,10 @@ export function deriveRuntimePlanTasksFromArtifacts(
   const combinedContent = sourceArtifacts.map((artifact) => artifact.content).join("\n\n");
   if (!combinedContent.trim()) return [];
   const runtimeRelevantContent = stripRuntimeExcludedSections(combinedContent);
+  const runtimeCommands = extractShellCommandsFromText(runtimeRelevantContent);
+  const sourceTaskLimit = runtimeCommands.length > 0
+    ? Math.max(1, maxTasks - 1)
+    : maxTasks;
 
   const tasks: PlanTask[] = [];
   const seen = new Set<string>();
@@ -1765,14 +1868,35 @@ export function deriveRuntimePlanTasksFromArtifacts(
     tasks.push(task);
   };
 
-  for (const task of collectRuntimeTaskTableTasks(runtimeRelevantContent, language)) {
+  const changeHeadingFiles = new Set<string>();
+  for (const task of collectRuntimeTaskChangeHeadingTasks(combinedContent, language)) {
     pushTask(task);
-    if (tasks.length >= maxTasks) return tasks;
+    for (const evidence of task.evidence || []) {
+      if (evidence.kind === "file") {
+        changeHeadingFiles.add(normalizePlanEvidenceValue(evidence.value));
+      }
+    }
+    if (tasks.length >= sourceTaskLimit) break;
   }
 
-  for (const line of collectRuntimeTaskCandidateLines(combinedContent)) {
-    pushTask(makeRuntimeTask(line, language));
-    if (tasks.length >= maxTasks) return tasks;
+  if (tasks.length < sourceTaskLimit) {
+    for (const task of collectRuntimeTaskTableTasks(combinedContent, language)) {
+      const fileEvidence = (task.evidence || [])
+        .filter((item) => item.kind === "file")
+        .map((item) => normalizePlanEvidenceValue(item.value));
+      if (fileEvidence.length > 0 && fileEvidence.every((value) => changeHeadingFiles.has(value))) {
+        continue;
+      }
+      pushTask(task);
+      if (tasks.length >= sourceTaskLimit) break;
+    }
+  }
+
+  if (tasks.length < sourceTaskLimit) {
+    for (const line of collectRuntimeTaskCandidateLines(combinedContent)) {
+      pushTask(makeRuntimeTask(line, language));
+      if (tasks.length >= sourceTaskLimit) break;
+    }
   }
 
   const existingCommandEvidence = new Set(
@@ -1781,7 +1905,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
       .filter((item) => item.kind === "cmd")
       .map((item) => normalizeCommandEvidenceValue(item.value)),
   );
-  for (const command of extractShellCommandsFromText(runtimeRelevantContent).slice(0, Math.max(1, maxTasks - tasks.length))) {
+  for (const command of runtimeCommands.slice(0, Math.max(1, maxTasks - tasks.length))) {
     const normalizedCommand = normalizeCommandEvidenceValue(command);
     if (existingCommandEvidence.has(normalizedCommand)) continue;
     pushTask(makeRuntimeTaskFromEvidenceText(

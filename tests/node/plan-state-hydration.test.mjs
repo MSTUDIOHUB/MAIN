@@ -146,7 +146,8 @@ test("plan panel keeps resume action available for paused approved execution", (
   assert.doesNotMatch(source, /canResumeExecution[\s\S]*?allTrustedComplete/);
   assert.match(source, /runtimeIntentOverride:\s*"execute"/);
   assert.match(source, /executionConsentGranted:\s*true/);
-  assert.match(source, /createVisibleTurnForHiddenMessage:\s*true/);
+  assert.match(source, /createVisibleTurnForHiddenMessage:\s*!resumeTurnId/);
+  assert.match(source, /reuseCurrentTurn:\s*!!resumeTurnId/);
 });
 
 test("new empty workspace sessions hydrate persisted plan tasks into resumable execution state", () => {
@@ -161,7 +162,9 @@ test("new empty workspace sessions hydrate persisted plan tasks into resumable e
   assert.match(storeSource, /planStage:\s*shouldPromoteHydratedTasksToExecuting \? "executing" : nextStage/);
   assert.match(submitIntentRoutingSource, /controlAction === "resume_plan_execution"[\s\S]*?startPlanExecutionResume\(\{/);
   assert.match(storeSource, /startPlanExecutionResume: \(resumeRequest\) =>[\s\S]*?runSubmitPlanExecutionResumeEffect\(\{/);
-  assert.match(planExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*true/);
+  assert.match(planExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*!continuationTurnId/);
+  assert.match(planExecutionResumeSource, /reuseCurrentTurn:\s*!!continuationTurnId/);
+  assert.match(planExecutionResumeSource, /turnIdOverride:\s*continuationTurnId/);
   assert.match(planExecutionResumeSource, /existing_plan_hydrated_for_execution/);
 
   assert.match(appSource, /hydrateWorkspacePlanForEmptySession\("new_session"\)/);

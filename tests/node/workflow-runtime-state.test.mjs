@@ -769,7 +769,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(streamRuntimeStateSource, /export function resolvePlanStreamWatchdogState/);
   assert.match(loopControlRuntimeSource, /export interface AgentLoopControlRuntime/);
   assert.match(loopControlRuntimeSource, /export function createAgentLoopControlRuntime/);
-  assert.match(loopControlRuntimeSource, /resolveAgentLoopMaxIterations/);
+  assert.match(loopControlRuntimeSource, /resolveAgentLoopIterationBudget/);
+  assert.match(loopControlRuntimeSource, /plan_execution_iteration_budget_started/);
   assert.match(loopControlRuntimeSource, /buildPlanExecutionProgressUpdate/);
   assert.match(loopControlRuntimeSource, /logAgentEvent\("loop_start"/);
   assert.match(recoveryPromptRuntimeStateSource, /export interface AgentLoopRecoveryPromptRuntimeState/);
@@ -1090,7 +1091,8 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitPlanExecutionResumeSource, /export async function runSubmitPlanExecutionResumeEffect/);
   assert.match(submitPlanExecutionResumeSource, /export function buildTrustedPlanResumePrompt/);
   assert.match(submitPlanExecutionResumeSource, /existing_plan_hydrated_for_execution/);
-  assert.match(submitPlanExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*true/);
+  assert.match(submitPlanExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*!continuationTurnId/);
+  assert.match(submitPlanExecutionResumeSource, /reuseCurrentTurn:\s*!!continuationTurnId/);
   assert.match(submitPendingReviewTransitionSource, /export function applySubmitPendingReviewTransition/);
   assert.match(submitPendingReviewTransitionSource, /resolvePendingReviewSubmissionDecision/);
   assert.match(submitPendingReviewTransitionSource, /send_pending_review_abort_and_new_turn/);
@@ -1100,7 +1102,7 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitPlanStateResetSource, /currentTurnExecutionConsent: \{ turnId: null, granted: false \}/);
   assert.match(submitSendGateEffectsSource, /export function applySubmitSendGateEffects/);
   assert.match(submitSendGateEffectsSource, /resolveSubmitSendGateDecision/);
-  assert.match(submitSendGateEffectsSource, /send_busy_hidden_execution_allowed/);
+  assert.match(submitSendGateEffectsSource, /send_busy_hidden_execution_rejected/);
   assert.match(submitSendGateEffectsSource, /send_stuck_state_reset/);
   assert.match(submitIntentRoutingSource, /export function resolveAndApplySubmitIntentRouting/);
   assert.match(submitIntentRoutingSource, /resolveSubmitEffectiveIntentDecision/);
@@ -1184,7 +1186,12 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
     storeSource,
     /if \(runtimeDecision\.shouldResetPlanState\)[\s\S]{0,500}planExecutionEvidenceLedger/,
   );
-  assert.match(storeSource, /const sendGateEffect = applySubmitSendGateEffects/);
+  assert.match(storeSource, /const applyCurrentSendGate = \(gateState: AppState\) => applySubmitSendGateEffects/);
+  assert.ok(
+    storeSource.indexOf("const planResumeSendGateEffect = applyCurrentSendGate(state)") <
+      storeSource.indexOf("const intentRouting = resolveAndApplySubmitIntentRouting"),
+    "Plan resume must pass the owner gate before async intent routing mutates state",
+  );
   assert.doesNotMatch(storeSource, /const sendGateDecision = resolveSubmitSendGateDecision/);
   assert.doesNotMatch(storeSource, /send_stuck_state_reset/);
   assert.match(storeSource, /startSubmitPlanHydrationEffect\(\{/);
@@ -1294,7 +1301,7 @@ test("global plan toolbar button is driven by live plan workspace, not historica
   assert.match(storeSource, /logStoreEvent\("planFilesCleared"/);
 });
 
-test("approved plan execution handoff has one runtime owner and dedupe guard", () => {
+test("approved plan execution stays in one logical turn and has one runtime owner", () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const sessionTypesSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/sessionTypes.ts"), "utf8");
   const workflowEngineSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
@@ -1306,22 +1313,23 @@ test("approved plan execution handoff has one runtime owner and dedupe guard", (
   assert.match(sessionTypesSource, /export interface PlanApprovalHandoff/);
   assert.match(storeSource, /PlanApprovalHandoff/);
   assert.match(storeSource, /planApprovalExecutionStartedForTurnId/);
-  assert.match(storeSource, /startApprovedPlanExecutionTurnFromHandoff/);
-  assert.match(storeSource, /plan_approval_direct_execution_suppressed/);
-  assert.match(storeSource, /plan_approval_execution_turn_created/);
+  assert.match(storeSource, /startApprovedPlanExecutionInCurrentTurn/);
+  assert.match(storeSource, /plan_approval_same_turn_execution_queued/);
+  assert.match(storeSource, /plan_approval_same_turn_execution_restarted/);
   assert.match(storeSource, /source:\s*"store_fallback"/);
+  assert.match(storeSource, /reuseCurrentTurn:\s*true/);
+  assert.match(storeSource, /createVisibleTurnForHiddenMessage:\s*false/);
+  assert.doesNotMatch(approvePlanMethod, /parentPlanTurnId/);
   assert.doesNotMatch(
     approvePlanMethod,
     /get\(\)\.sendMessage\(/,
-    "approvePlan must register a handoff, not directly append a hidden execution turn",
+    "approvePlan must queue a same-turn transition rather than launch in the approval reducer",
   );
 
-  assert.match(workflowEngineSource, /startApprovedPlanExecutionTurnFromHandoff/);
-  assert.match(workflowEngineSource, /source:\s*"active_loop"/);
+  assert.match(workflowEngineSource, /startApprovedPlanExecutionInCurrentTurn/);
+  assert.match(workflowEngineSource, /source:\s*"workflow_fallback"/);
+  assert.match(workflowEngineSource, /onApprovedPlanExecutionStarted/);
+  assert.match(workflowEngineSource, /plan_approval_same_turn_execution_started/);
   assert.match(workflowEngineSource, /plan_approval_handoff_deduped/);
-  assert.doesNotMatch(
-    workflowEngineSource,
-    /plan_approval_handoff_starting_execution_turn/,
-    "legacy direct-start log should be replaced by the single execution-turn-created event",
-  );
+  assert.doesNotMatch(workflowEngineSource, /approvedPlanHandoff/);
 });

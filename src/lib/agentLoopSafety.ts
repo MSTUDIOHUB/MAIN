@@ -48,6 +48,53 @@ export function resolveAgentLoopMaxIterations(input: {
   return positiveInt(limits.default, DEFAULT_AGENT_LOOP_ITERATION_LIMITS.default);
 }
 
+export interface AgentLoopIterationBudget {
+  phase: "default" | "plan_draft" | "plan_execution";
+  phaseStartIteration: number;
+  phaseMaxIterations: number;
+  absoluteMaxIterations: number;
+}
+
+/**
+ * Resolves an absolute loop ceiling while preserving a full execution budget
+ * when an unapproved Plan turns into approved execution inside the same loop.
+ */
+export function resolveAgentLoopIterationBudget(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  runtimeIntent: "respond" | "execute" | "goal" | string;
+  isPlanApproved: boolean;
+  currentIteration: number;
+  planExecutionStartIteration?: number | null;
+  limits?: AgentLoopIterationLimits | null;
+}): AgentLoopIterationBudget {
+  const currentIteration = Math.max(0, Math.floor(Number(input.currentIteration) || 0));
+  if (input.workflowMode === "plan" && input.isPlanApproved) {
+    const phaseStartIteration = input.planExecutionStartIteration == null
+      ? currentIteration
+      : Math.max(0, Math.floor(Number(input.planExecutionStartIteration) || 0));
+    const phaseMaxIterations = resolveAgentLoopMaxIterations({
+      workflowMode: "plan",
+      runtimeIntent: "execute",
+      isPlanApproved: true,
+      limits: input.limits,
+    });
+    return {
+      phase: "plan_execution",
+      phaseStartIteration,
+      phaseMaxIterations,
+      absoluteMaxIterations: phaseStartIteration + phaseMaxIterations,
+    };
+  }
+
+  const phaseMaxIterations = resolveAgentLoopMaxIterations(input);
+  return {
+    phase: input.workflowMode === "plan" ? "plan_draft" : "default",
+    phaseStartIteration: 0,
+    phaseMaxIterations,
+    absoluteMaxIterations: phaseMaxIterations,
+  };
+}
+
 export function shouldUseMaxStepsFinalTextOnly(input: {
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: "respond" | "execute" | string;

@@ -1009,6 +1009,98 @@ test("tasks artifact parsing inherits file evidence from file section headings",
   assert.equal(parsed[3].evidence?.[0]?.kind, "browser_dom");
 });
 
+test("runtime plan task derivation parses change headings and keeps validation commands", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# Markdown Viewer 修复计划",
+        "",
+        "## 已确认发现",
+        "- `src/diagnostics/read-only.rs` 只是本轮读取到的诊断证据，不需要修改。",
+        "",
+        "## 关键实现改动",
+        "### 改动 1：`src-tauri/src/main.rs` — 移除 debug 条件编译",
+        "**依据**：当前 release 构建会隐藏控制台，调试反馈不足。",
+        "**改动**：移除 `cfg_attr` 条件编译并保留现有 Tauri 初始化。",
+        "",
+        "### 改动 2：`src/main.js` — 修复 `openFile()` 使用正确 dialog API",
+        "**依据**：已读取到前端打开文件链路。",
+        "**改动**：替换旧的 `openFile` 调用并传递用户选择的路径。",
+        "",
+        "### 改动 3：`src/main.js` — 替换 `fs.readFile` 为 Tauri 命令",
+        "**改动**：改用后端命令读取文件内容。",
+        "",
+        "### 改动 4：`src-tauri/src/main.rs` — 添加 `read_file_content` 命令",
+        "**改动**：新增命令并注册到 invoke handler。",
+        "",
+        "## 影响文件清单",
+        "| 文件 | 操作 | 修改内容 |",
+        "|------|------|----------|",
+        "| `src-tauri/src/main.rs` | 修改 | 注册文件读取命令 |",
+        "| `src/main.js` | 修改 | 调用新的后端命令 |",
+        "",
+        "## 测试方案",
+        "| 场景 | 验证步骤 | 预期结果 |",
+        "|------|----------|----------|",
+        "| Debug 模式 | `npm run tauri dev` | 功能与 release 一致 |",
+      ].join("\n"),
+    },
+  ], { language: "zh", maxTasks: 8 });
+
+  const rustTask = tasks.find((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src-tauri/src/main.rs"));
+  const jsTask = tasks.find((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/main.js"));
+  const commandTask = tasks.find((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value === "npm run tauri dev"));
+
+  assert.ok(rustTask);
+  assert.ok(jsTask);
+  assert.ok(commandTask);
+  assert.match(rustTask.text, /移除.*cfg_attr.*新增命令/u);
+  assert.match(jsTask.text, /替换旧的.*改用后端命令/u);
+  assert.equal(tasks.some((task) => /依据|read-only\.rs/.test(task.text)), false);
+  assert.deepEqual(
+    tasks
+      .flatMap((task) => task.evidence || [])
+      .filter((item) => item.kind === "file")
+      .map((item) => item.value)
+      .sort(),
+    ["src-tauri/src/main.rs", "src/main.js"].sort(),
+  );
+  assert.equal(tasks.length, 3, JSON.stringify(tasks, null, 2));
+});
+
+test("runtime plan task derivation accepts affected-file tables without promoting read-only rows", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# 修复计划",
+        "",
+        "## 影响文件清单",
+        "| 文件 | 操作 | 修改内容 |",
+        "|------|------|----------|",
+        "| `src-tauri/src/main.rs` | 修改 | 添加 `read_file_content` 命令 |",
+        "| `src/main.js` | 修改 | 替换文件读取调用 |",
+        "| `src/diagnostics/read-only.rs` | 读取 | 修复前的诊断证据，不执行修改 |",
+        "",
+        "## 验证标准",
+        "- 运行 `npm run tauri dev`。",
+      ].join("\n"),
+    },
+  ], { language: "zh", maxTasks: 4 });
+
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src-tauri/src/main.rs")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/main.js")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src/diagnostics/read-only.rs")), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value === "npm run tauri dev")), true);
+});
+
 test("runtime plan task derivation accepts Codex-style key changes", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {

@@ -54,6 +54,16 @@ export function runApprovedPlanCompletionGuard(input: {
   const { outcome, callbacks, sawExecutionEvidence } = input;
   if (outcome.status !== "completed") return null;
   if (callbacks.getWorkflowMode() !== "plan" || !callbacks.getIsPlanApproved()) return null;
+  if (callbacks.getIsApprovedPlanExecutionTransitionPending?.() === true) {
+    logAgentEvent("plan_completion_guard_deferred_pending_same_turn_execution", {
+      reason: "approval_transition_not_consumed_by_current_loop",
+      sawExecutionEvidence,
+    });
+    return {
+      status: "paused",
+      reason: "approved_plan_same_turn_execution_pending",
+    };
+  }
 
   const audit = buildPlanTaskEvidenceAudit({
     tasks: callbacks.getPlanTasks(),

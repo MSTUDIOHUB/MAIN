@@ -23,7 +23,7 @@ export function createSubmitWorkflowEngineHelpers(
     normalizeProviderCompatibilityByRuntimeKey: input.normalizeProviderCompatibilityByRuntimeKey,
     compactCompletedTurnAgentMessages: input.compactCompletedTurnAgentMessages,
     normalizeQueuedUserMessage: input.normalizeQueuedUserMessage,
-    startApprovedPlanExecutionTurnFromHandoff: input.startApprovedPlanExecutionTurnFromHandoff,
+    startApprovedPlanExecutionInCurrentTurn: input.startApprovedPlanExecutionInCurrentTurn,
     logStoreEvent: input.logStoreEvent,
   };
 }

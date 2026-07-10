@@ -426,6 +426,8 @@ export async function partitionToolCallsForExecution(input: {
           shouldBypassApprovedPlanReadCacheForPatchRecovery({
             toolName: tc.name,
             allowFileRead: allowApprovedPlanRecoveryFileRead,
+            target,
+            recentActivity: recentPlanToolActivity,
           })) ||
         (workflowMode === "edit" &&
           isMutationRuntimeIntent(runtimeIntent) &&

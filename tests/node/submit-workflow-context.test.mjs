@@ -74,6 +74,7 @@ function baseInput(overrides = {}) {
     abortCtrl: { signal: { aborted: false } },
     timerInterval: "timer-1",
     sendStartedAt: 123,
+    harnessRunId: "run-124",
     turnAgentMessagesStart: 4,
     getElapsedSeconds: () => 9,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: 50,
@@ -99,6 +100,7 @@ test("submit workflow context carries immutable turn parameters and initializes 
   assert.deepEqual(context.mentionSnapshot, ["src/App.tsx"]);
   assert.equal(context.abortCtrl, input.abortCtrl);
   assert.equal(context.timerInterval, "timer-1");
+  assert.equal(context.harnessRunId, "run-124");
   assert.equal(context.getElapsedSeconds(), 9);
   assert.equal(context.streamBuffer, null);
   assert.equal(context.thinkingInterceptor, null);
@@ -108,7 +110,7 @@ test("submit workflow context carries immutable turn parameters and initializes 
   assert.equal(context.streamTokenCount, 0);
   assert.equal(context.streamTextChars, 0);
   assert.equal(context.streamingAssistantDisplayBuffer, "");
-  assert.equal(context.approvedPlanHandoff, null);
+  assert.equal("approvedPlanHandoff" in context, false);
   assert.equal(context.understandingProgressBlockId, null);
   assert.equal(context.understandingProgressClosed, false);
   assert.equal(context.PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS, 50);

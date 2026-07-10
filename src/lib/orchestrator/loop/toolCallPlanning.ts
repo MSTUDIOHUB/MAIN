@@ -128,10 +128,19 @@ export function resolveIterationToolSurface(input: {
     runtimeIntent === "execute" &&
     recentPlanToolActivity.length === 0 &&
     callbacks.getPlanExecutionEvidenceLedger().length === 0;
-  const allowApprovedPlanRecoveryFileRead =
-    approvedPlanInitialSourceReadAllowed ||
+  const approvedPlanPatchRecoveryFileReadAllowed =
     approvedPlanNoToolRecoveryFileReadActive ||
     shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
+  // Source-edit execution may span several files. Keep the narrowly scoped
+  // read_file tool available until a no-progress strategy switch explicitly
+  // moves the loop to action-only recovery; cached-read guards still prevent
+  // repeated exploration.
+  const approvedPlanSourceEditFileReadAllowed =
+    approvedPlanSourceEditFirstActive &&
+    runtimeIntent === "execute" &&
+    !approvedPlanActionOnlyRecoveryActive;
+  const allowApprovedPlanRecoveryFileRead =
+    approvedPlanSourceEditFileReadAllowed || approvedPlanPatchRecoveryFileReadAllowed;
 
   if (executeRecoveryMode !== "normal" || approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive) {
     logAgentEvent("recovery_loop_summary", {
@@ -153,15 +162,17 @@ export function resolveIterationToolSurface(input: {
     });
   }
 
+  const approvedPlanActionRecoveryActive =
+    approvedPlanActionOnlyRecoveryActive &&
+    workflowMode === "plan" &&
+    callbacks.getIsPlanApproved();
   const baseIterationAllTools =
-    approvedPlanSourceEditFirstActive
-      ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
-          allowFileRead: allowApprovedPlanRecoveryFileRead,
-        }))
-      : approvedPlanActionOnlyRecoveryActive &&
-        workflowMode === "plan" &&
-        callbacks.getIsPlanApproved()
+    approvedPlanActionRecoveryActive
       ? recoveryIterationAllTools.filter((tool) => isApprovedPlanRecoveryTool(tool, {
+          allowFileRead: approvedPlanPatchRecoveryFileReadAllowed,
+        }))
+      : approvedPlanSourceEditFirstActive
+      ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
           allowFileRead: allowApprovedPlanRecoveryFileRead,
         }))
       : recoveryIterationAllTools;
@@ -170,6 +181,7 @@ export function resolveIterationToolSurface(input: {
       iteration,
       allowFileRead: allowApprovedPlanRecoveryFileRead,
       initialSourceReadAllowed: approvedPlanInitialSourceReadAllowed,
+      sourceEditFileReadAllowed: approvedPlanSourceEditFileReadAllowed,
       recoveryToolSurface: describeApprovedPlanSourceEditFirstToolSurface(allowApprovedPlanRecoveryFileRead),
       rawTools: recoveryIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
       scopedTools: baseIterationAllTools.map((tool) => tool.function.name),
@@ -230,11 +242,16 @@ export function resolveIterationToolSurface(input: {
       approvedPlanSourceEditFirstActive,
       approvedPlanActionOnlyRecoveryActive,
       approvedPlanNoToolRecoveryFileReadActive,
-      allowFileRead: allowApprovedPlanRecoveryFileRead || effectiveExecuteRecoveryFileRead,
-      recoveryToolSurface: approvedPlanSourceEditFirstActive
+      // Report the effective surface, not an upstream eligibility hint. Those
+      // can legitimately be true while a later phase filter removes read_file.
+      allowFileRead: scopedToolNameSet.has("read_file"),
+      readFileExposed: scopedToolNameSet.has("read_file"),
+      approvedPlanPatchRecoveryFileReadAllowed,
+      approvedPlanSourceEditFileReadAllowed,
+      recoveryToolSurface: approvedPlanActionRecoveryActive || approvedPlanNoToolRecoveryFileReadActive
+        ? describeApprovedPlanRecoveryToolSurface(approvedPlanPatchRecoveryFileReadAllowed)
+        : approvedPlanSourceEditFirstActive
         ? describeApprovedPlanSourceEditFirstToolSurface(allowApprovedPlanRecoveryFileRead)
-        : approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive
-        ? describeApprovedPlanRecoveryToolSurface(allowApprovedPlanRecoveryFileRead)
         : describeExecuteRecoveryToolSurface(executeRecoveryMode, effectiveExecuteRecoveryFileRead),
       rawToolCount: rawToolNames.length,
       scopedToolCount: scopedToolNames.length,

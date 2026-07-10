@@ -8,6 +8,7 @@ import { MAX_PLAN_EVIDENCE_RECOVERY_PASSES } from "../../planRuntime";
 import {
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   collectPlanClosureMaterializationInput,
+  isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
 } from "../../orchestrator";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
@@ -22,8 +23,35 @@ export type PlanQualityRecoveryResult = {
   planAutoScaffoldPromptIssued: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
   planEvidenceRecoveryPasses: number;
+  planArtifactQualityRejected: boolean;
   pendingPlanRuntimeRecoveryPrompt: string | null;
 };
+
+function isPlanArtifactQualityRejectionResult(
+  result: ToolExecutionResult,
+): boolean {
+  return (
+    result.internalFeedback === true &&
+    !!result.planRecoveryAction &&
+    result.planRecoveryAction !== "accept"
+  );
+}
+
+export function shouldPauseForReviewablePlanArtifactAfterToolResults(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  planArtifactQualityRejected?: boolean;
+  results: ToolExecutionResult[];
+}): boolean {
+  if (input.workflowMode !== "plan" || input.isPlanApproved) return false;
+  if (
+    input.planArtifactQualityRejected === true ||
+    input.results.some(isPlanArtifactQualityRejectionResult)
+  ) {
+    return false;
+  }
+  return input.results.some(isSuccessfulPlanArtifactWriteResult);
+}
 
 export function handlePlanQualityRecoveryAfterToolResults(input: {
   callbacks: OrchestratorCallbacks;
@@ -37,6 +65,7 @@ export function handlePlanQualityRecoveryAfterToolResults(input: {
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
+  planArtifactQualityRejected?: boolean;
   planAutoScaffoldPromptIssued: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
   planEvidenceRecoveryPasses: number;
@@ -64,6 +93,7 @@ export function handlePlanQualityRecoveryAfterToolResults(input: {
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
   let planClosureEvidenceRecoveryIssued = input.planClosureEvidenceRecoveryIssued;
   let planEvidenceRecoveryPasses = input.planEvidenceRecoveryPasses;
+  let planArtifactQualityRejected = input.planArtifactQualityRejected === true;
   let pendingPlanRuntimeRecoveryPrompt: string | null = null;
   const wasPlanEvidenceRecoveryPhase = String(planRuntimePhase) === "needs_evidence";
 
@@ -74,6 +104,7 @@ export function handlePlanQualityRecoveryAfterToolResults(input: {
     planAutoScaffoldPromptIssued,
     planClosureEvidenceRecoveryIssued,
     planEvidenceRecoveryPasses,
+    planArtifactQualityRejected,
     pendingPlanRuntimeRecoveryPrompt,
   });
 
@@ -81,11 +112,11 @@ export function handlePlanQualityRecoveryAfterToolResults(input: {
     return finish();
   }
 
-  const planQualityRecoveryResults = results.filter((result) =>
-    result.internalFeedback &&
-    !!result.planRecoveryAction
+  const planQualityRecoveryResults = results.filter(
+    isPlanArtifactQualityRejectionResult,
   );
   if (planQualityRecoveryResults.length > 0) {
+    planArtifactQualityRejected = true;
     planQualityRejectCount += planQualityRecoveryResults.length;
     const latestQualityResult = planQualityRecoveryResults[planQualityRecoveryResults.length - 1];
     planLastQualityGateReason = latestQualityResult.qualityGateReason || "quality_gate";
@@ -135,14 +166,12 @@ export function handlePlanQualityRecoveryAfterToolResults(input: {
     );
     const hasStructuredQualityClosureEvidence = qualityClosureEvidence.evidenceRecords.length > 0;
     const shouldRequestTargetedEvidenceAfterQualityGate =
+      latestQualityResult.planRecoveryAction === "targeted_evidence" &&
       planQualityRejectCount >= 1 &&
       hasQualityClosureEvidence &&
+      hasStructuredQualityClosureEvidence &&
       !planClosureEvidenceRecoveryIssued &&
-      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES &&
-      (
-        latestQualityResult.planRecoveryAction !== "targeted_evidence" ||
-        hasStructuredQualityClosureEvidence
-      );
+      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
     logAgentEvent("plan_quality_gate_recovery_decision", {
       iteration,
       qualityGateReason: planLastQualityGateReason,
@@ -168,6 +197,11 @@ export function handlePlanQualityRecoveryAfterToolResults(input: {
         planLastQualityGateReason || "quality gate rejected plan draft",
       );
     }
+  } else if (results.some(isSuccessfulPlanArtifactWriteResult)) {
+    // A rejected artifact remains non-reviewable across model iterations. Only
+    // a later plan-artifact mutation that completes without quality feedback
+    // proves that the persisted artifact has passed the gate.
+    planArtifactQualityRejected = false;
   }
 
   const evidenceRecoveryBatchResults = wasPlanEvidenceRecoveryPhase

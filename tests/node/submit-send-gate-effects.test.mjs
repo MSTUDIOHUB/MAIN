@@ -157,6 +157,36 @@ test("send gate effects queue visible submissions while preserving context snaps
   assert.equal(harness.calls.logs.at(-1).data.reason, "generation_in_progress");
 });
 
+test("send gate effects reject hidden execution resumes while an owner is running without queueing internal prompts", () => {
+  const harness = createHarness({
+    isGenerating: true,
+    agentStatus: "running",
+    abortController: {},
+  });
+  const result = harness.apply({
+    text: "internal approved plan resume",
+    isHidden: true,
+    options: {
+      executionConsentGranted: true,
+      runtimeIntentOverride: "execute",
+      turnIdOverride: "turn-1",
+    },
+  });
+
+  assert.equal(result.shouldContinue, false);
+  assert.equal(result.returnValue, false);
+  assert.equal(result.decision.action.kind, "queue");
+  assert.deepEqual(harness.calls.queued, []);
+  assert.deepEqual(harness.calls.logs.at(-1), {
+    event: "send_busy_hidden_execution_rejected",
+    data: {
+      reason: "generation_in_progress",
+      runtimeIntentOverride: "execute",
+      turnIdOverride: "turn-1",
+    },
+  });
+});
+
 test("send gate effects approve pending review reply options without queueing", () => {
   const harness = createHarness({
     agentStatus: "pending_review",

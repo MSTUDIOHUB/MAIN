@@ -8,6 +8,7 @@ export type HarnessRunStatus = "running" | "completed" | "paused" | "error" | "i
 
 export interface HarnessRunMarker {
   schemaVersion: 1;
+  runId: string;
   instanceId: string;
   sessionKey: string;
   workspace: string | null;
@@ -35,6 +36,23 @@ export interface HarnessRunMarker {
   updatedAt: number;
   closedAt: number | null;
   closeReason: string | null;
+}
+
+export interface HarnessRunOwner {
+  runId: string;
+  sessionKey: string;
+  turnId: string;
+}
+
+export function isHarnessRunMarkerOwnedByRun(
+  marker: HarnessRunMarker | null | undefined,
+  owner: HarnessRunOwner,
+): boolean {
+  return !!marker &&
+    marker.status === "running" &&
+    marker.runId === owner.runId &&
+    marker.sessionKey === owner.sessionKey &&
+    marker.turnId === owner.turnId;
 }
 
 export interface HarnessUncleanRestartDiagnostic {
@@ -101,13 +119,18 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
   const record = value as Partial<HarnessRunMarker>;
   const sessionKey = typeof record.sessionKey === "string" ? record.sessionKey : "";
   if (!sessionKey) return null;
+  const startedAt = Math.max(0, Number(record.startedAt) || Date.now());
+  const turnId = typeof record.turnId === "string" ? record.turnId : null;
   return {
     schemaVersion: 1,
+    runId: typeof record.runId === "string" && record.runId.trim()
+      ? record.runId
+      : `legacy-${sessionKey}-${turnId || "no-turn"}-${startedAt}`,
     instanceId: typeof record.instanceId === "string" ? record.instanceId : "unknown",
     sessionKey,
     workspace: typeof record.workspace === "string" ? record.workspace : null,
     sessionId: typeof record.sessionId === "number" ? record.sessionId : null,
-    turnId: typeof record.turnId === "string" ? record.turnId : null,
+    turnId,
     status: record.status || "running",
     workflowMode: typeof record.workflowMode === "string" ? record.workflowMode : "unknown",
     runtimeIntent: typeof record.runtimeIntent === "string" ? record.runtimeIntent : "unknown",
@@ -126,7 +149,7 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
     streamElapsedMs: Number.isFinite(Number(record.streamElapsedMs)) ? Math.max(0, Number(record.streamElapsedMs)) : null,
     streamLifecycleStatus: typeof record.streamLifecycleStatus === "string" ? record.streamLifecycleStatus : null,
     lastStreamError: typeof record.lastStreamError === "string" ? record.lastStreamError : null,
-    startedAt: Math.max(0, Number(record.startedAt) || Date.now()),
+    startedAt,
     updatedAt: Math.max(0, Number(record.updatedAt) || Date.now()),
     closedAt: typeof record.closedAt === "number" ? record.closedAt : null,
     closeReason: typeof record.closeReason === "string" ? record.closeReason : null,
@@ -152,11 +175,28 @@ export function persistHarnessRunMarker(marker: HarnessRunMarker): HarnessRunMar
   return normalized;
 }
 
-export function closeHarnessRunMarker(
-  patch: Partial<HarnessRunMarker> & { closeReason: string; status?: HarnessRunStatus },
+export function persistHarnessRunMarkerIfOwned(
+  marker: HarnessRunMarker,
+  owner: HarnessRunOwner,
 ): HarnessRunMarker | null {
   const current = readHarnessRunMarker();
-  if (!current) return null;
+  if (!current || !isHarnessRunMarkerOwnedByRun(current, owner)) return null;
+  if (
+    marker.runId !== owner.runId ||
+    marker.sessionKey !== owner.sessionKey ||
+    marker.turnId !== owner.turnId
+  ) {
+    return null;
+  }
+  return persistHarnessRunMarker(marker);
+}
+
+export function closeHarnessRunMarker(
+  patch: Partial<HarnessRunMarker> & { closeReason: string; status?: HarnessRunStatus },
+  owner: HarnessRunOwner,
+): HarnessRunMarker | null {
+  const current = readHarnessRunMarker();
+  if (!current || !isHarnessRunMarkerOwnedByRun(current, owner)) return null;
   const next = persistHarnessRunMarker({
     ...current,
     ...patch,

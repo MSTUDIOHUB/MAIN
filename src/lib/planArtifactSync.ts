@@ -37,17 +37,17 @@ async function resolveUpdatedPlanArtifactContent(
   const path = typeof toolArgs.path === "string" ? toolArgs.path : "";
   if (!path) return null;
 
+  // write_file already gives us the exact bytes accepted by the tool. The
+  // mutation lifecycle verifies that the target changed, so reading the whole
+  // artifact back only duplicates I/O. Incremental mutations still require a
+  // read-back because their final content is not present in the arguments.
+  if (toolName === "write_file" && typeof toolArgs.content === "string") {
+    return toolArgs.content;
+  }
+
   try {
     return await options.readFile(path);
   } catch (error) {
-    if (toolName === "write_file" && typeof toolArgs.content === "string") {
-      options.warn?.(
-        `[plan-artifact-sync] Failed to read back ${path}; falling back to write_file content.`,
-        error,
-      );
-      return toolArgs.content;
-    }
-
     options.warn?.(
       `[plan-artifact-sync] Failed to read back updated plan artifact ${path}.`,
       error,
