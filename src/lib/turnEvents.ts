@@ -1,7 +1,8 @@
 import type { ToolLifecycleState } from "./runtimeTools";
 import type { SubagentActivity, SubagentRunPatch, SubagentRunSnapshot } from "./subagents";
+import type { ActionRequestKind } from "./actionRequest";
 
-export const MAIN_THREAD_EVENT_SCHEMA_VERSION = 1 as const;
+export const MAIN_THREAD_EVENT_SCHEMA_VERSION = 2 as const;
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
 
@@ -22,6 +23,12 @@ export interface MainThreadError {
 export interface MainThreadHarnessTelemetry {
   name: string;
   details: Record<string, unknown>;
+}
+
+export interface MainThreadRunIdentity {
+  runId: string;
+  parentRunId: string | null;
+  goalSliceId?: string;
 }
 
 export interface MainThreadProgressUpdate {
@@ -77,13 +84,29 @@ export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.created"; threadId: string; turnId: string; timestampMs: number; subagent: SubagentRunSnapshot }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.updated"; threadId: string; turnId: string; timestampMs: number; subagentId: string; patch: SubagentRunPatch; activity?: SubagentActivity }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.closed"; threadId: string; turnId: string; timestampMs: number; subagentId: string; closedAt: number; reason?: string }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "approval.requested"; threadId: string; turnId: string; timestampMs: number; reason: string; target?: string }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; progress?: MainThreadProgressUpdate }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string }
+  | ({
+      schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION;
+      type: "approval.requested";
+      threadId: string;
+      turnId: string;
+      timestampMs: number;
+      requestId: string;
+      actionKind: ActionRequestKind;
+      title: string;
+      reason: string;
+      target?: string;
+    } & MainThreadRunIdentity)
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.started"; threadId: string; turnId: string; timestampMs: number } & MainThreadRunIdentity)
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; progress?: MainThreadProgressUpdate } & MainThreadRunIdentity)
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string } & MainThreadRunIdentity)
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.failed"; threadId: string; turnId: string; timestampMs: number; error: MainThreadError } & MainThreadRunIdentity)
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.started"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.updated"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.completed"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "error"; threadId: string; turnId?: string; timestampMs: number; error: MainThreadError };
+
+/** Versioned event envelope used by session, turn, run, and action projections. */
+export type TurnEventV2 = MainThreadEvent;
 
 export type MainThreadEventInput = DistributiveOmit<MainThreadEvent, "schemaVersion">;
 
@@ -111,11 +134,46 @@ export function appendRuntimeEvent(
   event: MainThreadEvent,
   maxEvents = 800,
 ): MainThreadEvent[] {
-  const next = [...(events || []), event];
+  const existing = events || [];
+  if (
+    event.type === "thread.started" &&
+    existing.some((candidate) => candidate.type === "thread.started" && candidate.threadId === event.threadId)
+  ) {
+    return existing;
+  }
+  if (
+    (event.type === "run.paused" || event.type === "run.completed" || event.type === "run.failed") &&
+    existing.some((candidate) =>
+      (candidate.type === "run.paused" || candidate.type === "run.completed" || candidate.type === "run.failed") &&
+      candidate.threadId === event.threadId &&
+      candidate.turnId === event.turnId &&
+      candidate.runId === event.runId
+    )
+  ) {
+    return existing;
+  }
+  if (
+    isTerminalTurnEvent(event) &&
+    existing.some((candidate) =>
+      isTerminalTurnEvent(candidate) &&
+      candidate.threadId === event.threadId &&
+      candidate.turnId === event.turnId
+    )
+  ) {
+    return existing;
+  }
+  const next = [...existing, event];
   if (next.length <= maxEvents) return next;
-  return next.slice(next.length - maxEvents);
+  const firstThreadStarted = next.find((candidate) => candidate.type === "thread.started");
+  if (!firstThreadStarted || maxEvents <= 1) return next.slice(next.length - maxEvents);
+  const tail = next
+    .filter((candidate) => candidate !== firstThreadStarted)
+    .slice(-(maxEvents - 1));
+  return [firstThreadStarted, ...tail];
 }
 
-export function isTerminalTurnEvent(event: MainThreadEvent): boolean {
+export function isTerminalTurnEvent(
+  event: MainThreadEvent,
+): event is Extract<MainThreadEvent, { type: "turn.completed" | "turn.failed" }> {
   return event.type === "turn.completed" || event.type === "turn.failed";
 }

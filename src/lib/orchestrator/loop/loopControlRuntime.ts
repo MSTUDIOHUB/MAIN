@@ -77,6 +77,7 @@ export interface AgentLoopControlRuntime {
     mcpToolCount: number;
     unityMcpFirstPhaseActive: boolean;
     unityMcpFallbackReason: string | null;
+    allowRootSkeleton: boolean;
   }) => void;
 }
 
@@ -278,7 +279,12 @@ export function createAgentLoopControlRuntime(input: {
     });
     emitPlanExecutionProgress("starting");
     if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
-      setPlanRuntimePhase("explore_structure", "start");
+      setPlanRuntimePhase(
+        startInput.allowRootSkeleton ? "explore_structure" : "grounding",
+        startInput.allowRootSkeleton
+          ? "start with shallow project structure"
+          : "start with targeted grounding",
+      );
     }
   };
 

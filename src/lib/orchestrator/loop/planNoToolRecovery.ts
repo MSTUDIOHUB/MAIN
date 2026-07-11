@@ -1,13 +1,15 @@
 import type { StreamResult } from "../../streaming";
-import type { PlanRuntimePhase } from "../../workflowModels";
+import {
+  classifyPlanArtifactQualityResult,
+  type PlanRuntimePhase,
+} from "../../workflowModels";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { buildPlanClosureEvidenceRecoveryPrompt } from "../planOrchestration";
 import {
   autoMaterializePlanArtifactFromVisibleText,
-  buildApprovedPlanContinuationPrompt,
   buildAssistantHistoryMessage,
-  buildNonActionableStopMessage,
   buildPlanRecoveryPrompt,
   CONCISE_PLAN_ARTIFACT_HINT_EN,
   CONCISE_PLAN_ARTIFACT_HINT_ZH,
@@ -16,6 +18,7 @@ import {
 import { MAX_PLAN_EVIDENCE_RECOVERY_PASSES } from "../../planRuntime";
 import type { OrchestratorCallbacks } from "../types";
 import { resolveExecuteNoToolCheckpointLimit } from "./executeNoToolRecovery";
+import { handlePlanQualityRecoveryAfterVisibleMaterialization } from "./planQualityRecovery";
 
 export type PlanNoToolRecoveryStatus = "none" | "continue" | "stopped";
 export type PlanClosureAttemptResult = "not_attempted" | "failed" | "stopped" | "approved_continue";
@@ -25,25 +28,27 @@ export type PlanNoToolRecoveryResult = {
   consecutiveNoToolCount: number;
   usedPlanRecoveryPrompt: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
+  planQualityRejectCount: number;
+  planLastQualityGateReason: string;
+  planLastMissingSections: string[];
+  planArtifactQualityRejected: boolean;
+  planAutoScaffoldPromptIssued: boolean;
+  planEvidenceRecoveryPasses: number;
 };
 
-export function buildPlanClosureEvidenceRecoveryPrompt(language: "zh" | "en", reason: string): string {
-  if (language === "en") {
-    return [
-      "PLAN_CLOSURE_NEEDS_EVIDENCE: MAIN could not get a model-authored reviewable plan from the current clean evidence.",
-      reason ? `Failure reason: ${reason}.` : "",
-      "Do exactly one targeted read/search for the missing source or data fact. Prefer the specific file, symbol, or dataset already implicated by the user request.",
-      "After that single tool result, stop exploring and write `.MAIN/plans/plan.md`; if write tools are unavailable, produce a concise visible `<proposed_plan>`.",
-      "Do not call broad directory scans, do not edit source files, and do not create `tasks.md` before approval.",
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "PLAN_CLOSURE_NEEDS_EVIDENCE: MAIN 无法基于当前干净证据拿到模型亲自生成的可审批计划。",
-    reason ? `失败原因：${reason}。` : "",
-    "下一步只做一次定向读取/搜索，补齐缺失的源码或数据事实。优先读取用户目标已经指向的具体文件、符号或数据集。",
-    "拿到这一次工具结果后，停止探索并写入 `.MAIN/plans/plan.md`；如果写入工具不可用，输出精简可见 `<proposed_plan>`。",
-    "不要再泛扫目录；批准前不要修改源码，也不要创建 `tasks.md`。",
-  ].filter(Boolean).join("\n");
+export { buildPlanClosureEvidenceRecoveryPrompt } from "../planOrchestration";
+
+function buildPlanGenerationFailedMessage(language: "zh" | "en", reason: string): string {
+  return language === "zh"
+    ? `计划生成失败：经过有界的计划物化恢复后，仍未得到通过校验的计划产物（${reason}）。请补充约束或重试计划生成。`
+    : `Plan generation failed: bounded materialization recovery did not produce a validated plan artifact (${reason}). Add constraints or retry plan generation.`;
+}
+
+function buildPlanGenerationFailedProgress(reason: string) {
+  return {
+    recoveryReason: "plan_generation_failed",
+    nextStep: reason,
+  };
 }
 
 export function resolvePlanNoToolRecoveryDecision(input: {
@@ -64,15 +69,20 @@ export function resolvePlanNoToolRecoveryDecision(input: {
   commandDirectiveAction?: string | null;
 }): {
   shouldEnterReview: boolean;
+  shouldMaterializeStructuredProposal: boolean;
   shouldTryPlanTextMaterialization: boolean;
   shouldMaterializeFallbackPlan: boolean;
   shouldRefineLongPlanIntoChoice: boolean;
   shouldForcePlanContinuation: boolean;
 } {
-  const planningStillIncomplete =
+  const isUnapprovedPlan =
     input.workflowMode === "plan" &&
-    !input.isPlanApproved &&
-    !input.hasStructuredProposal &&
+    !input.isPlanApproved;
+  const hasAcceptedReviewArtifact =
+    input.hasReviewablePlanArtifacts && input.planArtifactQualityRejected !== true;
+  const planningStillIncomplete =
+    isUnapprovedPlan &&
+    !hasAcceptedReviewArtifact &&
     input.currentPlanStage !== "ready_to_execute";
   const hasMeaningfulSourcePlanText = input.sourceVisibleText.trim().length > 0;
   const shouldMaterializeFallbackPlan =
@@ -106,10 +116,11 @@ export function resolvePlanNoToolRecoveryDecision(input: {
 
   return {
     shouldEnterReview:
-      input.workflowMode === "plan" &&
-      !input.isPlanApproved &&
-      input.planArtifactQualityRejected !== true &&
-      (input.hasStructuredProposal || input.hasReviewablePlanArtifacts),
+      isUnapprovedPlan && hasAcceptedReviewArtifact,
+    shouldMaterializeStructuredProposal:
+      isUnapprovedPlan &&
+      input.hasStructuredProposal &&
+      (!input.hasReviewablePlanArtifacts || input.planArtifactQualityRejected === true),
     shouldTryPlanTextMaterialization,
     shouldMaterializeFallbackPlan,
     shouldRefineLongPlanIntoChoice:
@@ -177,9 +188,7 @@ async function handOffApprovedPlan(input: {
 }): Promise<"continue" | "stopped"> {
   const {
     callbacks,
-    waitForPlanApprovalIfNeeded,
     setPlanRuntimePhase,
-    recentPlanToolActivity,
     phaseReason,
     assistantHistoryText,
     providerReasoningForHistory,
@@ -189,24 +198,13 @@ async function handOffApprovedPlan(input: {
     callbacks.onStatusChange("pending_review");
   }
   callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
-  const approved = await waitForPlanApprovalIfNeeded();
-  if (!approved) {
-    if (callbacks.getStatus() !== "pending_review") {
-      callbacks.onStatusChange("idle");
-    }
-    return "stopped";
-  }
-
-  callbacks.onPlanStageChanged("executing");
-  recentPlanToolActivity.length = 0;
-  const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
-  callbacks.onApprovedPlanExecutionStarted?.();
-  callbacks.onStatusChange("running");
-  callbacks.appendMessage({
-    role: "user",
-    content: continuationPrompt,
+  logAgentEvent("plan_review_run_paused", {
+    phaseReason,
+    planStage: callbacks.getPlanStage(),
   });
-  return "continue";
+  // Review is the terminal state of this run. Approval validates the current
+  // artifact identity and starts a child execution run in the same turn.
+  return "stopped";
 }
 
 export async function handlePlanNoToolRecovery(input: {
@@ -239,9 +237,13 @@ export async function handlePlanNoToolRecovery(input: {
   consecutiveNoToolCount: number;
   usedPlanRecoveryPrompt: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
+  planRuntimePhase: PlanRuntimePhase;
   planEvidenceRecoveryPasses: number;
+  planQualityRejectCount: number;
   planLastQualityGateReason: string;
+  planLastMissingSections: string[];
   planArtifactQualityRejected?: boolean;
+  planAutoScaffoldPromptIssued: boolean;
   setPlanRuntimePhase: (phase: PlanRuntimePhase, reason?: string, status?: "pending" | "running" | "done" | "failed") => void;
   waitForPlanApprovalIfNeeded: () => Promise<boolean>;
   tryClosePlanWithEvidence: (trigger: string, details?: {
@@ -280,7 +282,9 @@ export async function handlePlanNoToolRecovery(input: {
     attemptedPlanWriteTargets,
     turnInputContextSignals,
     planEvidenceRecoveryPasses,
+    planQualityRejectCount: initialPlanQualityRejectCount,
     planLastQualityGateReason,
+    planLastMissingSections: initialPlanLastMissingSections,
     setPlanRuntimePhase,
     waitForPlanApprovalIfNeeded,
     tryClosePlanWithEvidence,
@@ -288,18 +292,30 @@ export async function handlePlanNoToolRecovery(input: {
   let consecutiveNoToolCount = input.consecutiveNoToolCount;
   let usedPlanRecoveryPrompt = input.usedPlanRecoveryPrompt;
   let planClosureEvidenceRecoveryIssued = input.planClosureEvidenceRecoveryIssued;
+  let planQualityRejectCount = initialPlanQualityRejectCount ?? 0;
+  let currentPlanLastQualityGateReason = planLastQualityGateReason;
+  let planLastMissingSections = initialPlanLastMissingSections ?? [];
+  let currentPlanArtifactQualityRejected = planArtifactQualityRejected === true;
+  let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
+  let currentPlanEvidenceRecoveryPasses = planEvidenceRecoveryPasses;
   const finish = (status: PlanNoToolRecoveryStatus): PlanNoToolRecoveryResult => ({
     status,
     consecutiveNoToolCount,
     usedPlanRecoveryPrompt,
     planClosureEvidenceRecoveryIssued,
+    planQualityRejectCount,
+    planLastQualityGateReason: currentPlanLastQualityGateReason,
+    planLastMissingSections,
+    planArtifactQualityRejected: currentPlanArtifactQualityRejected,
+    planAutoScaffoldPromptIssued,
+    planEvidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
   });
 
   const currentPlanStage = callbacks.getPlanStage();
   const decision = resolvePlanNoToolRecoveryDecision({
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
-    planArtifactQualityRejected,
+    planArtifactQualityRejected: currentPlanArtifactQualityRejected,
     hasStructuredProposal,
     hasReviewablePlanArtifacts,
     currentPlanStage,
@@ -314,53 +330,133 @@ export async function handlePlanNoToolRecovery(input: {
     commandDirectiveAction,
   });
 
-  if (decision.shouldEnterReview) {
-    let hasMaterializedStructuredProposal = hasReviewablePlanArtifacts;
-    if (hasStructuredProposal && !hasReviewablePlanArtifacts) {
-      const visibleText = sourceVisibleText || streamText;
-      const materializedProposal = await autoMaterializePlanArtifactFromVisibleText({
-        visibleText,
-        workspace,
-        callbacks,
-        userGoal: latestUserPromptText,
-        recentToolActivity: recentPlanToolActivity,
-        attemptedTargets: attemptedPlanWriteTargets,
-        turnContext: turnInputContextSignals,
+  const recoverRejectedVisibleCandidate = (
+    materialized: Awaited<ReturnType<typeof autoMaterializePlanArtifactFromVisibleText>>,
+  ): PlanNoToolRecoveryResult => {
+    const quality = materialized.quality || classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: materialized.reason || "quality_gate",
+    });
+    const recovery = handlePlanQualityRecoveryAfterVisibleMaterialization({
+      callbacks,
+      workflowMode,
+      iteration,
+      planRuntimePhase: input.planRuntimePhase,
+      recentPlanToolActivity,
+      attemptedPlanWriteTargets,
+      latestUserPromptText,
+      planQualityRejectCount,
+      planLastQualityGateReason: currentPlanLastQualityGateReason,
+      planLastMissingSections,
+      planArtifactQualityRejected: currentPlanArtifactQualityRejected,
+      planAutoScaffoldPromptIssued,
+      planClosureEvidenceRecoveryIssued,
+      planEvidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
+      setPlanRuntimePhase,
+      quality,
+    });
+    planQualityRejectCount = recovery.planQualityRejectCount;
+    currentPlanLastQualityGateReason = recovery.planLastQualityGateReason;
+    planLastMissingSections = recovery.planLastMissingSections;
+    currentPlanArtifactQualityRejected = recovery.planArtifactQualityRejected;
+    planAutoScaffoldPromptIssued = recovery.planAutoScaffoldPromptIssued;
+    planClosureEvidenceRecoveryIssued = recovery.planClosureEvidenceRecoveryIssued;
+    currentPlanEvidenceRecoveryPasses = recovery.planEvidenceRecoveryPasses;
+
+    if (recovery.pendingPlanRuntimeRecoveryPrompt) {
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: recovery.pendingPlanRuntimeRecoveryPrompt,
       });
-      logAgentEvent(
-        materializedProposal.ok
-          ? "plan_structured_proposal_materialized"
-          : "plan_structured_proposal_materialization_rejected",
-        {
-          iteration,
-          ok: materializedProposal.ok,
-          path: materializedProposal.path || "",
-          kind: materializedProposal.kind || "",
-          reason: materializedProposal.reason || "",
-          planArtifactSource: materializedProposal.source || "",
-          visibleChars: visibleText.length,
-          replyOptionsCount: (materializedProposal.replyOptions || []).length,
-        },
-      );
-      hasMaterializedStructuredProposal = materializedProposal.ok;
+      return finish("continue");
     }
 
-    if (hasMaterializedStructuredProposal) {
-      const handoff = await handOffApprovedPlan({
-        callbacks,
-        waitForPlanApprovalIfNeeded,
-        setPlanRuntimePhase,
-        recentPlanToolActivity,
-        phaseReason: "proposal ready",
-        assistantHistoryText,
-        providerReasoningForHistory,
-      });
-      if (handoff === "continue") {
-        consecutiveNoToolCount = 0;
-        attemptedPlanWriteTargets.length = 0;
-      }
-      return finish(handoff);
+    logAgentEvent("loop_stop", {
+      reason: "plan_visible_quality_recovery_exhausted",
+      iteration,
+      qualityGateReason: currentPlanLastQualityGateReason,
+      qualityRejectCount: planQualityRejectCount,
+    });
+    callbacks.onNonActionableStop(
+      buildPlanGenerationFailedMessage(
+        callbacks.getPreferredLanguage(),
+        currentPlanLastQualityGateReason || "materialization_quality_gate",
+      ),
+      "incomplete_plan",
+      buildPlanGenerationFailedProgress(currentPlanLastQualityGateReason || "materialization_quality_gate"),
+    );
+    callbacks.onStatusChange("idle");
+    return finish("stopped");
+  };
+
+  if (decision.shouldEnterReview) {
+    currentPlanLastQualityGateReason = "";
+    planLastMissingSections = [];
+    const handoff = await handOffApprovedPlan({
+      callbacks,
+      waitForPlanApprovalIfNeeded,
+      setPlanRuntimePhase,
+      recentPlanToolActivity,
+      phaseReason: "accepted artifact ready",
+      assistantHistoryText,
+      providerReasoningForHistory,
+    });
+    if (handoff === "continue") {
+      consecutiveNoToolCount = 0;
+      attemptedPlanWriteTargets.length = 0;
     }
+    return finish(handoff);
+  }
+
+  if (decision.shouldMaterializeStructuredProposal) {
+    const visibleText = sourceVisibleText || streamText;
+    const materializedProposal = await autoMaterializePlanArtifactFromVisibleText({
+      visibleText,
+      workspace,
+      callbacks,
+      userGoal: latestUserPromptText,
+      recentToolActivity: recentPlanToolActivity,
+      attemptedTargets: attemptedPlanWriteTargets,
+      turnContext: turnInputContextSignals,
+    });
+    logAgentEvent(
+      materializedProposal.ok
+        ? "plan_structured_proposal_materialized"
+        : "plan_structured_proposal_materialization_rejected",
+      {
+        iteration,
+        ok: materializedProposal.ok,
+        path: materializedProposal.path || "",
+        kind: materializedProposal.kind || "",
+        reason: materializedProposal.reason || "",
+        recoveryAction: materializedProposal.quality?.recoveryAction || "",
+        planArtifactSource: materializedProposal.source || "",
+        visibleChars: visibleText.length,
+        replyOptionsCount: (materializedProposal.replyOptions || []).length,
+      },
+    );
+    if (!materializedProposal.ok) {
+      return recoverRejectedVisibleCandidate(materializedProposal);
+    }
+
+    currentPlanArtifactQualityRejected = false;
+    currentPlanLastQualityGateReason = "";
+    planLastMissingSections = [];
+    const handoff = await handOffApprovedPlan({
+      callbacks,
+      waitForPlanApprovalIfNeeded,
+      setPlanRuntimePhase,
+      recentPlanToolActivity,
+      phaseReason: "visible candidate accepted",
+      assistantHistoryText,
+      providerReasoningForHistory,
+    });
+    if (handoff === "continue") {
+      consecutiveNoToolCount = 0;
+      attemptedPlanWriteTargets.length = 0;
+    }
+    return finish(handoff);
   }
 
   if (decision.shouldTryPlanTextMaterialization) {
@@ -403,8 +499,10 @@ export async function handlePlanNoToolRecovery(input: {
     logAgentEvent("plan_text_materialization_rejected", {
       iteration,
       reason: materializedPlan.reason || "unknown",
+      recoveryAction: materializedPlan.quality?.recoveryAction || "",
       visibleChars: sourceVisibleText.length,
     });
+    return recoverRejectedVisibleCandidate(materializedPlan);
   }
 
   if (decision.shouldMaterializeFallbackPlan) {
@@ -429,7 +527,7 @@ export async function handlePlanNoToolRecovery(input: {
           iteration,
           visibleChars: sourceVisibleText.length,
         });
-        if (!planClosureEvidenceRecoveryIssued && planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
+        if (!planClosureEvidenceRecoveryIssued && currentPlanEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
           planClosureEvidenceRecoveryIssued = true;
           setPlanRuntimePhase("needs_evidence", "plan closure failed");
           callbacks.onStatusChange("running");
@@ -437,7 +535,7 @@ export async function handlePlanNoToolRecovery(input: {
             role: "user",
             content: buildPlanClosureEvidenceRecoveryPrompt(
               callbacks.getPreferredLanguage(),
-              planLastQualityGateReason || "plan closure failed",
+              currentPlanLastQualityGateReason || "plan closure failed",
             ),
           });
           return finish("continue");
@@ -450,8 +548,9 @@ export async function handlePlanNoToolRecovery(input: {
         finishReason: normalizedFinishReason || "unknown",
       });
       callbacks.onNonActionableStop(
-        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
+        buildPlanGenerationFailedMessage(callbacks.getPreferredLanguage(), "materialization_recovery_exhausted"),
         "incomplete_plan",
+        buildPlanGenerationFailedProgress("materialization_recovery_exhausted"),
       );
       callbacks.onStatusChange("idle");
       return finish("stopped");
@@ -489,8 +588,9 @@ export async function handlePlanNoToolRecovery(input: {
       });
       callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
       callbacks.onNonActionableStop(
-        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
+        buildPlanGenerationFailedMessage(callbacks.getPreferredLanguage(), "truncated_plan_refinement_exhausted"),
         "incomplete_plan",
+        buildPlanGenerationFailedProgress("truncated_plan_refinement_exhausted"),
       );
       callbacks.onStatusChange("idle");
       return finish("stopped");
@@ -526,8 +626,9 @@ export async function handlePlanNoToolRecovery(input: {
         consecutiveNoToolCount,
       });
       callbacks.onNonActionableStop(
-        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "no_output"),
-        "no_output",
+        buildPlanGenerationFailedMessage(callbacks.getPreferredLanguage(), "plan_continuation_exhausted"),
+        "incomplete_plan",
+        buildPlanGenerationFailedProgress("plan_continuation_exhausted"),
       );
       callbacks.onStatusChange("idle");
       return finish("stopped");

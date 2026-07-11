@@ -66,6 +66,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planConvergence.ts"));
 const {
   handlePlanQualityRecoveryAfterToolResults,
+  handlePlanQualityRecoveryAfterVisibleMaterialization,
   shouldPauseForReviewablePlanArtifactAfterToolResults,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planQualityRecovery.ts"));
 
@@ -405,6 +406,92 @@ test("plan quality recovery keeps structural rewrites out of evidence recovery",
     reason: "missing_plan_required_sections:key_changes",
     status: "running",
   }]);
+});
+
+test("visible candidate rejection recovers without poisoning persisted artifact state", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 8,
+    quality: {
+      ok: false,
+      reason: "missing_plan_required_sections:key_changes",
+      missingSections: ["key_changes"],
+      recoveryAction: "rewrite",
+      canAutoRepair: true,
+    },
+    planRuntimePhase: "drafting",
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.ts",
+      status: "succeeded",
+      detail: "observed implementation evidence",
+    }],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "修复计划执行流程",
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planQualityRejectCount, 1);
+  assert.equal(result.planArtifactQualityRejected, false);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_NEEDS_REWRITE/);
+  assert.deepEqual(phases, [{
+    phase: "needs_rewrite",
+    reason: "missing_plan_required_sections:key_changes",
+    status: "running",
+  }]);
+});
+
+test("visible candidate quality recovery is bounded after rewrite and scaffold", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    quality: {
+      ok: false,
+      reason: "not_structured",
+      missingSections: [],
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    },
+    planRuntimePhase: "needs_rewrite",
+    recentPlanToolActivity: [],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Create a reviewable plan",
+    planLastQualityGateReason: "not_structured",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: () => {},
+  };
+  const scaffold = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    ...common,
+    iteration: 9,
+    planQualityRejectCount: 1,
+    planAutoScaffoldPromptIssued: false,
+  });
+  const exhausted = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    ...common,
+    iteration: 10,
+    planQualityRejectCount: scaffold.planQualityRejectCount,
+    planAutoScaffoldPromptIssued: scaffold.planAutoScaffoldPromptIssued,
+  });
+
+  assert.match(scaffold.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_AUTO_SCAFFOLD/);
+  assert.equal(scaffold.planAutoScaffoldPromptIssued, true);
+  assert.equal(exhausted.planQualityRejectCount, 3);
+  assert.equal(exhausted.pendingPlanRuntimeRecoveryPrompt, null);
+  assert.equal(exhausted.planArtifactQualityRejected, false);
 });
 
 test("quality-rejected plan writes are not eligible for post-tool review", () => {

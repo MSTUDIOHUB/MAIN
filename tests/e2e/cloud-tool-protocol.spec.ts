@@ -1016,11 +1016,14 @@ test("tool flow shows progress narration without exposing raw protocol", async (
   await expect(page.locator("body")).not.toContainText("<tool_use>");
   await expect(page.locator("body")).not.toContainText("\"toolName\"");
   await expect(page.locator("body")).not.toContainText("<analysis>");
-  const archiveToggle = page.getByTestId("turn-process-archive-toggle");
-  await expect(archiveToggle).toBeVisible();
-  await expect(archiveToggle).toHaveAttribute("aria-expanded", "false");
-  await archiveToggle.click();
-  await expect(page.getByTestId("turn-archive-step").filter({ hasText: "README.md" })).toBeVisible();
+  const processDisclosure = page.getByTestId("turn-process-disclosure");
+  await expect(processDisclosure).toBeVisible();
+  await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
+  await processDisclosure.click();
+  await expect(processDisclosure).toHaveAttribute("data-process-collapsed", "true");
+  await expect(page.getByText("已确认 README.md 包含 fallback-ok")).toBeVisible();
+  await processDisclosure.click();
+  await expect(page.getByTestId("live-turn-step").filter({ hasText: "README.md" })).toBeVisible();
   await expect(page.getByTestId("read-context-group-summary")).toHaveCount(0);
 });
 
@@ -1574,7 +1577,7 @@ test("plan closure guard prompts model to write actionable design after read-onl
             text.includes("可审批计划文件") || text.includes("停在审批阶段"),
           ),
           hasProcessSummary: (snapshot?.thoughtTexts || []).some((text: string) =>
-            text.includes("只读探索") || text.includes("design.md"),
+            text.includes("只读探索") || text.includes("关键上下文") || text.includes("design.md"),
           ),
           closurePrompted: hasLog("plan_design_closure_prompt"),
           reviewReady: hasLog("plan_design_review_ready_after_tool"),
@@ -1598,7 +1601,7 @@ test("plan closure guard prompts model to write actionable design after read-onl
     });
 });
 
-test("local plan slow first token shows notice without hard-stopping before design", async ({ page }) => {
+test("local plan slow first token logs a watchdog notice without hard-stopping before design", async ({ page }) => {
   await page.clock.install({ time: new Date("2026-05-13T09:00:00Z") });
   await page.goto("/?e2eScenario=local-plan-slow-first-token");
 
@@ -1628,8 +1631,9 @@ test("local plan slow first token shows notice without hard-stopping before desi
           hasNotice: (snapshot?.systemTexts || []).some((text: string) =>
             text.includes("模型已经较长时间没有返回可见流式内容"),
           ),
-          noticeOnlyLogged: logs.some((entry: { source?: string }) =>
-            entry.source === "store.plan_no_visible_token_notice_only",
+          noticeOnlyLogged: logs.some((entry: { source?: string; message?: string }) =>
+            String(entry.source || "").includes("plan_no_visible_token_notice_only") ||
+            String(entry.message || "").includes("plan_no_visible_token_notice_only"),
           ),
           hardStopped: hasLog("STREAM_NO_VISIBLE_TOKEN_TIMEOUT") || hasLog("plan_stage_waiting_for_design"),
           agentStatus: snapshot?.agentStatus,
@@ -1637,7 +1641,7 @@ test("local plan slow first token shows notice without hard-stopping before desi
       }),
     )
     .toEqual({
-      hasNotice: true,
+      hasNotice: false,
       noticeOnlyLogged: true,
       hardStopped: false,
       agentStatus: "running",
@@ -1885,6 +1889,54 @@ test("ordinary continue after stopped execute turn starts a new visible turn", a
       continueUserOnPreviousTurn: 0,
       hasFinalText: true,
     });
+
+  const turnSections = page.locator("section[data-turn-id]");
+  await expect(turnSections).toHaveCount(2);
+  await expect(page.getByTestId("turn-boundary-divider")).toHaveCount(1);
+  await expect(page.locator(`section[data-turn-id='${previousTurnId}']`)).toContainText("请修复 README 检查链路并验证");
+  await expect(page.locator(`section[data-turn-id='${previousTurnId}']`)).toContainText("我已经定位到 README 检查链路");
+
+  const continuedTurnId = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnId ?? "");
+  const continuedSection = page.locator(`section[data-turn-id='${continuedTurnId}']`);
+  await expect(continuedSection).toHaveAttribute("data-turn-presentation", "blocked");
+  await expect(continuedSection.getByTestId("turn-state-anchor")).toHaveCount(1);
+  await expect(continuedSection).toContainText("继续");
+  await expect(continuedSection).toContainText("已在新回合继续处理旧任务上下文");
+
+  const respondSent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudRespondMessage?.("请只解释当前上下文，不要执行操作。"),
+  );
+  expect(respondSent).toBe(true);
+  await expect.poll(async () => {
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    return {
+      turns: snapshot?.conversationTurns,
+      status: snapshot?.currentTurnStatus,
+      intent: snapshot?.currentTurnIntent,
+    };
+  }).toEqual({ turns: 3, status: "done", intent: "respond" });
+
+  await expect(turnSections).toHaveCount(3);
+  await expect(page.getByTestId("turn-boundary-divider")).toHaveCount(2);
+  const ordinaryTurnId = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnId ?? "");
+  const ordinarySection = page.locator(`section[data-turn-id='${ordinaryTurnId}']`);
+  await expect(ordinarySection).toHaveAttribute("data-turn-presentation", "ordinary");
+  await expect(ordinarySection.getByTestId("turn-state-anchor")).toHaveCount(0);
+  await expect(ordinarySection).toContainText("请只解释当前上下文，不要执行操作");
+  await expect(ordinarySection).toContainText("已在新回合继续处理旧任务上下文");
+
+  const dividerColors: string[] = [];
+  for (const mode of ["light", "dark", "black"] as const) {
+    await page.evaluate((themeMode) => (window as any).__CODELY_E2E__?.setThemeMode?.(themeMode), mode);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", mode);
+    const color = await page.getByTestId("turn-boundary-divider").first().evaluate(
+      (node) => getComputedStyle(node).backgroundColor,
+    );
+    expect(color).not.toBe("rgba(0, 0, 0, 0)");
+    expect(color).not.toBe("transparent");
+    dividerColors.push(color);
+  }
+  expect(new Set(dividerColors).size).toBeGreaterThan(1);
 });
 
 test("ordinary execute repeated read-only loops create a recovery pause instead of an error card", async ({ page }) => {

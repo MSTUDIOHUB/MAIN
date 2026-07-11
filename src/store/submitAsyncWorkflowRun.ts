@@ -18,9 +18,11 @@ import type { TaskBlock } from "../lib/taskTypes";
 import type {
   ConversationTurn,
   PendingOperationProposal,
+  PlanArtifact,
   PlanStage,
 } from "../lib/workflowModels";
 import type { TurnInputContextSignals } from "../lib/turnIntake";
+import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
 import {
   buildSubmitAttachmentContext,
   type SubmitAttachmentContextInput,
@@ -55,13 +57,16 @@ export interface SubmitAsyncWorkflowRunState extends SubmitGameStudioPreparation
   gameStudioInitialized: boolean;
   isPlanApproved: boolean;
   planStage: PlanStage;
+  planArtifacts: PlanArtifact[];
   agentMessages: AgentMessage[];
+  conversationTurns: ConversationTurn[];
+  harnessRunMarker?: HarnessRunMarker | null;
   taskFlow: TaskBlock[];
   config: {
     sessionRecordingEnabled?: boolean;
     reasoningDisplay?: string;
   };
-  startGoal: (objective: string, options: { sessionKey: string }) => void;
+  startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string }) => void;
 }
 
 export interface SubmitAsyncWorkflowElapsedTimer {
@@ -115,6 +120,8 @@ export interface StartSubmitAsyncWorkflowRunInput<
   previousTurnContinuationTarget: ConversationTurn | null;
   existingTurn: ConversationTurn | null;
   selectedChoiceText: string;
+  goalSourceContextSnapshot?: string;
+  parentRunIdOverride?: string;
   turnInputContextSignals: TurnInputContextSignals;
   remoteFeishu: FeishuRemoteContext | undefined;
   options: unknown;
@@ -249,8 +256,19 @@ export async function runSubmitAsyncWorkflowRun<
 
   input.sessionSet({ contextMentions: [], attachedFiles: [] });
 
+  const goalSourceContext = input.effectiveRunIntent === "goal"
+    ? input.goalSourceContextSnapshot || buildGoalSourceContextSnapshot({
+        objective: input.text,
+        agentMessages: input.sessionGet().agentMessages,
+        conversationTurns: input.sessionGet().conversationTurns,
+        planArtifacts: input.sessionGet().planArtifacts,
+      })
+    : undefined;
+
   const runLease = (phaseRunners.startRunLease || startSubmitRunLease)({
     userContent,
+    canonicalUserText: input.text,
+    goalSourceContext,
     currentImages: input.currentImages,
     runSessionKey: input.runSessionKey,
     runWorkspace: input.runWorkspace,
@@ -258,10 +276,12 @@ export async function runSubmitAsyncWorkflowRun<
     turnId: input.turnId,
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
+    parentRunIdOverride: input.parentRunIdOverride,
     getRuntimeSnapshot: () => ({
       agentMessagesLength: input.sessionGet().agentMessages.length,
       planStage: input.sessionGet().planStage,
       isPlanApproved: input.sessionGet().isPlanApproved,
+      harnessRunMarker: input.sessionGet().harnessRunMarker ?? null,
     }),
     appendAgentMessage: (message: AgentMessage) => {
       input.sessionSet((s: TState) => ({ agentMessages: [...s.agentMessages, message] }));
@@ -270,7 +290,7 @@ export async function runSubmitAsyncWorkflowRun<
     setAbortController: (abortController: TAbortController) => {
       input.sessionSet({ abortController });
     },
-    startGoal: (objective: string, goalOptions: { sessionKey: string }) => {
+    startGoal: (objective: string, goalOptions: { sessionKey: string; sourceContext?: string; ownerTurnId: string }) => {
       input.sessionGet().startGoal(objective, goalOptions);
     },
     getCurrentHarnessInstanceId: input.getCurrentHarnessInstanceId,

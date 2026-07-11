@@ -77,6 +77,24 @@ export function isPlanDraftWriteToolName(name: string): boolean {
   return PLAN_DRAFT_WRITE_TOOL_NAMES.has(String(name || ""));
 }
 
+export function shouldAdvancePlanFromStructureOnTargetedRead(input: {
+  workflowMode: PlanRuntimeMode;
+  isPlanApproved: boolean;
+  planRuntimePhase?: PlanRuntimePhase;
+  requestedToolNames: string[];
+}): boolean {
+  if (
+    input.workflowMode !== "plan" ||
+    input.isPlanApproved ||
+    input.planRuntimePhase !== "explore_structure"
+  ) {
+    return false;
+  }
+  return input.requestedToolNames.some((name) =>
+    name !== "get_project_skeleton" && isPlanReadOnlyToolName(name)
+  );
+}
+
 export function filterPlanToolNamesForRuntimePhase(input: {
   toolNames: string[];
   workflowMode: PlanRuntimeMode;

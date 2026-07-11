@@ -252,6 +252,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(loopRuntimeActionsSource, /applyPlanRuntimePhase\(/);
   assert.match(assistantStreamPostProcessingPhaseSource, /applyReasoningNoToolPlanRuntimeState\(/);
   assert.match(assistantCompletionPhaseSource, /applyPlanNoToolRuntimeState\(/);
+  assert.match(assistantCompletionPhaseSource, /setPlanRuntimePhaseAndSync/);
+  assert.match(assistantCompletionPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
   assert.match(assistantOutputPhaseSource, /applyPlanPostConvergenceRuntimeState\(/);
   assert.match(assistantOutputPhaseSource, /setPlanRuntimePhaseAndSync/);
   assert.match(assistantOutputPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
@@ -676,7 +678,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(missingToolNoToolRecoverySource, /missing_tool_reprompt_limit/);
   assert.match(planNoToolRecoverySource, /export async function handlePlanNoToolRecovery/);
   assert.match(planNoToolRecoverySource, /export function resolvePlanNoToolRecoveryDecision/);
-  assert.match(planNoToolRecoverySource, /export function buildPlanClosureEvidenceRecoveryPrompt/);
+  assert.match(planNoToolRecoverySource, /export \{ buildPlanClosureEvidenceRecoveryPrompt \}/);
   assert.match(planNoToolRecoverySource, /plan_structured_proposal_materialized/);
   assert.match(planNoToolRecoverySource, /plan_text_materialized/);
   assert.match(planNoToolRecoverySource, /plan_recovery_prompt_start/);
@@ -1054,6 +1056,7 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   const gameStudioTurnPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/gameStudioTurnPreparation.ts"), "utf8");
   const submitGameStudioPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitGameStudioPreparation.ts"), "utf8");
   const gameStudioLocalSlashSubmissionSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/gameStudioLocalSlashSubmission.ts"), "utf8");
+  const workflowEngineSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
   assert.match(turnSubmissionSource, /export function findReplyOptionMatchingSelectedText/);
   assert.match(turnSubmissionSource, /export function buildSubmitInputEnvelope/);
@@ -1160,12 +1163,14 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(gameStudioLocalSlashSubmissionSource, /export function startGameStudioLocalSlashSubmission/);
   assert.match(
     turnSubmissionSource,
-    /const selectedAwaitingReplyOption = findReplyOptionMatchingSelectedText/,
+    /const selectedAwaitingReplyOption = choiceIdentityMatches/,
   );
   assert.match(
     turnSubmissionSource,
-    /const shouldAutoResumeChoiceTurn =[\s\S]*?currentTurnHasReplyOptions &&[\s\S]*?!!selectedAwaitingReplyOption;/,
+    /const shouldAutoResumeChoiceTurn =[\s\S]*?currentTurnHasReplyOptions &&[\s\S]*?choiceIdentityMatches &&[\s\S]*?!!selectedAwaitingReplyOption;/,
   );
+  assert.match(turnSubmissionSource, /isMatchingUserChoiceResolution\(\{/);
+  assert.match(turnSubmissionSource, /replyOptionRequestIdentity\?: UserChoiceResolutionIdentity/);
   assert.doesNotMatch(
     turnSubmissionSource,
     /const shouldAutoResumeChoiceTurn =[\s\S]{0,260}\(currentTurn\.status === "awaiting_input" \|\| currentTurnHasReplyOptions\)/,
@@ -1182,11 +1187,21 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
     /const applyPreRunSessionPatch = \(patch:[\s\S]{0,600}runtimeBySessionKey/,
   );
   assert.match(storeSource, /applySubmitPlanStateReset\(\{/);
+  assert.ok(
+    storeSource.lastIndexOf("const sendGateEffect = applyCurrentSendGate(state)") <
+      storeSource.lastIndexOf("applySubmitPlanStateReset({"),
+    "Plan state must only reset after the send gate grants the run lease so queued Goal source context stays durable",
+  );
+  assert.match(
+    workflowEngineSource,
+    /goalSourceContextSnapshot:\s*queuedAfterRun\.goalSourceContextSnapshot/,
+    "Dequeued Goal submissions must reuse the immutable source snapshot captured while they were queued",
+  );
   assert.doesNotMatch(
     storeSource,
     /if \(runtimeDecision\.shouldResetPlanState\)[\s\S]{0,500}planExecutionEvidenceLedger/,
   );
-  assert.match(storeSource, /const applyCurrentSendGate = \(gateState: AppState\) => applySubmitSendGateEffects/);
+  assert.match(storeSource, /const applyCurrentSendGate = \([\s\S]*?\) => applySubmitSendGateEffects/);
   assert.ok(
     storeSource.indexOf("const planResumeSendGateEffect = applyCurrentSendGate(state)") <
       storeSource.indexOf("const intentRouting = resolveAndApplySubmitIntentRouting"),
@@ -1306,8 +1321,8 @@ test("approved plan execution stays in one logical turn and has one runtime owne
   const sessionTypesSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/sessionTypes.ts"), "utf8");
   const workflowEngineSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
   const approvePlanMethod = storeSource.slice(
-    storeSource.indexOf("approvePlan: (approvalChoice) =>"),
-    storeSource.indexOf("rejectPlan: () =>", storeSource.indexOf("approvePlan: (approvalChoice) =>")),
+    storeSource.indexOf("approvePlan: (approvalChoice, expectedIdentity) =>"),
+    storeSource.indexOf("rejectPlan: (expectedIdentity) =>", storeSource.indexOf("approvePlan: (approvalChoice, expectedIdentity) =>")),
   );
 
   assert.match(sessionTypesSource, /export interface PlanApprovalHandoff/);
@@ -1332,4 +1347,23 @@ test("approved plan execution stays in one logical turn and has one runtime owne
   assert.match(workflowEngineSource, /plan_approval_same_turn_execution_started/);
   assert.match(workflowEngineSource, /plan_approval_handoff_deduped/);
   assert.doesNotMatch(workflowEngineSource, /approvedPlanHandoff/);
+});
+
+test("tool-result recovery returns the activated execute-recovery state", () => {
+  const phaseSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"),
+    "utf8",
+  );
+  const actionsSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRuntimeActions.ts"),
+    "utf8",
+  );
+
+  assert.match(
+    phaseSource,
+    /executeRecoveryState = input\.activateExecuteRecovery\(mode, reason, context\)/,
+  );
+  assert.match(phaseSource, /activateExecuteRecovery: activateExecuteRecoveryAndSync/);
+  assert.doesNotMatch(phaseSource, /activateExecuteRecovery: input\.activateExecuteRecovery/);
+  assert.match(actionsSource, /return nextState;/);
 });

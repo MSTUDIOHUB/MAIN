@@ -38,7 +38,7 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("ExecutionCapsule plan adjustment input can be clicked, focused, and submitted", async ({ page }) => {
+test("PlanPanel adjustment input can be clicked, focused, and submitted", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-flow");
 
   await expect(page.locator("body")).not.toContainText("[PROPOSAL START]");
@@ -48,13 +48,14 @@ test("ExecutionCapsule plan adjustment input can be clicked, focused, and submit
   await page.getByTestId("plan-save-button").click();
   await expect(page.getByTestId("plan-save-button")).toHaveAttribute("data-save-state", "saved");
 
-  const adjustmentInput = page.getByTestId("execution-capsule-plan-adjust-input");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(0);
+  const adjustmentInput = page.getByTestId("plan-adjust-input");
   await expect(adjustmentInput).toBeVisible();
   await adjustmentInput.click();
   await expect(adjustmentInput).toBeFocused();
   await adjustmentInput.pressSequentially("请把验证步骤写得更具体");
 
-  await page.getByTestId("execution-capsule-plan-adjust-submit").click();
+  await page.getByTestId("plan-adjust-submit").click();
   await expect
     .poll(async () =>
       page.evaluate(() =>
@@ -82,15 +83,16 @@ test("ExecutionCapsule plan adjustment input can be clicked, focused, and submit
     });
 });
 
-test("unified plan approval panel stays legible in light, dark, and black themes", async ({ page }, testInfo) => {
+test("PlanPanel review actions stay legible in light, dark, and black themes", async ({ page }, testInfo) => {
   await page.setViewportSize({ width: 1280, height: 900 });
   await page.goto("/?e2eScenario=plan-flow");
 
-  const panel = page.getByTestId("execution-capsule-awaiting-choice");
+  const panel = page.getByTestId("plan-review-panel");
   await expect(panel).toHaveCount(1);
-  await expect(page.getByTestId("execution-capsule-plan-approve")).toContainText("开始执行");
-  await expect(page.getByTestId("execution-capsule-plan-adjust-submit")).toContainText("提交意见");
-  await expect(page.getByTestId("execution-capsule-plan-end-turn")).toContainText("结束本轮");
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(0);
+  await expect(page.getByTestId("plan-approve-button")).toContainText("确认方案并继续执行");
+  await expect(page.getByTestId("plan-adjust-submit")).toContainText("提交意见");
+  await expect(page.getByTestId("plan-reject-button")).toContainText("拒绝并保留");
 
   for (const themeMode of ["light", "dark", "black"] as const) {
     await page.evaluate((mode) => (window as any).__CODELY_E2E__?.setThemeMode?.(mode), themeMode);
@@ -98,11 +100,38 @@ test("unified plan approval panel stays legible in light, dark, and black themes
       .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().themeMode ?? null))
       .toBe(themeMode);
     await expect(panel).toBeVisible();
-    await expect(page.getByTestId("execution-capsule-plan-adjust-input")).toBeEditable();
-    await expect(page.getByTestId("execution-capsule-plan-end-turn")).toBeInViewport();
-    await panel.screenshot({ path: testInfo.outputPath(`unified-plan-approval-${themeMode}.png`) });
+    await expect(page.getByTestId("plan-adjust-input")).toBeEditable();
+    await expect(page.getByTestId("plan-approve-button")).toBeInViewport();
+    await panel.screenshot({ path: testInfo.outputPath(`plan-panel-review-${themeMode}.png`) });
   }
 });
+
+for (const viewportWidth of [900, 1100] as const) {
+  test(`Plan review remains operable in the responsive drawer at ${viewportWidth}px`, async ({ page }) => {
+    await page.setViewportSize({ width: viewportWidth, height: 900 });
+    await page.goto("/?e2eScenario=plan-flow");
+
+    const shell = page.getByTestId("right-panel");
+    await expect(shell).toBeVisible();
+    await expect(shell).toHaveAttribute("data-panel-tab", "plan");
+    await expect(shell).toHaveAttribute("data-turn-lifecycle", "action_required");
+    await expect(shell).toHaveAttribute("data-action-kind", "plan_review");
+    await expect(page.getByTestId("right-panel-resizer")).toBeHidden();
+    await expect(page.getByTestId("plan-review-panel")).toHaveAttribute("data-plan-presentation", "review");
+    await expect(page.getByTestId("plan-approve-button")).toBeVisible();
+    await expect(page.getByTestId("plan-approve-button")).toBeInViewport();
+    await expect
+      .poll(async () => shell.evaluate((element) => getComputedStyle(element).position))
+      .toBe("fixed");
+
+    const bounds = await shell.boundingBox();
+    expect(bounds).not.toBeNull();
+    expect(Math.round((bounds?.x || 0) + (bounds?.width || 0))).toBe(viewportWidth);
+
+    await page.getByTestId("right-panel-close").click();
+    await expect(shell).toHaveCount(0);
+  });
+}
 
 test("plan flow supports save then approve and finish", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-flow");
@@ -124,15 +153,14 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     )
     .toBe(1);
 
-  await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
-  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(1);
-  await expect(page.getByTestId("execution-capsule-plan-reject-keep")).toHaveCount(0);
-  await expect(page.getByTestId("execution-capsule-plan-reject-delete")).toHaveCount(0);
-  await expect(page.getByTestId("execution-capsule-plan-end-turn")).toContainText("结束本轮");
-  await expect(page.getByTestId("execution-capsule-plan-adjust-input")).toBeVisible();
-  await expect(page.getByTestId("execution-capsule-plan-adjust-input")).toHaveAttribute("placeholder", "说明需要如何调整，或提出其他要求");
-  await page.getByTestId("execution-capsule-plan-adjust-input").fill("请把验证步骤写得更具体");
-  await page.getByTestId("execution-capsule-plan-adjust-submit").click();
+  await expect(page.getByTestId("execution-capsule-awaiting-choice")).toHaveCount(0);
+  await expect(page.getByTestId("plan-approve-button")).toBeVisible();
+  await expect(page.getByTestId("plan-reject-button")).toBeVisible();
+  await expect(page.getByTestId("plan-reject-delete-button")).toBeVisible();
+  await expect(page.getByTestId("plan-adjust-input")).toBeVisible();
+  await expect(page.getByTestId("plan-adjust-input")).toHaveAttribute("placeholder", "说明需要如何调整，或提出其他要求");
+  await page.getByTestId("plan-adjust-input").fill("请把验证步骤写得更具体");
+  await page.getByTestId("plan-adjust-submit").click();
   await expect
     .poll(async () =>
       page.evaluate(() =>
@@ -163,8 +191,8 @@ test("plan flow supports save then approve and finish", async ({ page }) => {
     () => (window as any).__CODELY_E2E__?.getSnapshot?.().taskFlowUserCount ?? 0,
   );
 
-  await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
-  await page.getByTestId("execution-capsule-plan-approve").click();
+  await expect(page.getByTestId("plan-approve-button")).toBeVisible();
+  await page.getByTestId("plan-approve-button").click();
 
   await expect
     .poll(async () =>
@@ -269,7 +297,7 @@ test("clearing plan files from file panel removes the global plan toolbar button
     });
 });
 
-test("plan approval quick reply approves instead of re-sending an unapproved plan turn", async ({ page }) => {
+test("plan approval quick reply cannot bypass a formal PlanPanel review request", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-quick-reply-approval");
 
   await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
@@ -293,26 +321,34 @@ test("plan approval quick reply approves instead of re-sending an unapproved pla
       }),
     )
     .toEqual({
-      isPlanApproved: true,
-      planStage: "executing",
+      isPlanApproved: false,
+      planStage: "design",
       taskFlowUserCount: 1,
     });
+  await expect(page.getByTestId("plan-approve-button")).toHaveCount(0);
 
   await expect
     .poll(async () =>
       page.evaluate(() => {
         const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
-        return entries.some((entry: { source?: string; message?: string }) =>
-          entry.source === "ui.quickReply_plan_approval" &&
-          String(entry.message || "").includes("先运行诊断脚本"),
-        );
+        return {
+          classifiedAsApproval: entries.some((entry: { source?: string; message?: string }) =>
+            entry.source === "ui.quickReply_plan_approval" &&
+            String(entry.message || "").includes("先运行诊断脚本")
+          ),
+          blockedWithoutReviewRequest: entries.some((entry: { source?: string }) =>
+            entry.source === "store.plan_approval_blocked_missing_review_request"),
+        };
       }),
     )
-    .toBe(true);
+    .toEqual({
+      classifiedAsApproval: true,
+      blockedWithoutReviewRequest: true,
+    });
 });
 
 for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-materialize-qwen"] as const) {
-  test(`${scenario} materializes visible plan before approval`, async ({ page }) => {
+  test(`${scenario} materializes visible plan but still requires formal review`, async ({ page }) => {
     await page.goto(`/?e2eScenario=${scenario}`);
 
     await expect(page.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
@@ -335,11 +371,12 @@ for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-
         }),
       )
       .toEqual({
-        isPlanApproved: true,
-        planStage: "executing",
+        isPlanApproved: false,
+        planStage: "plan",
         planArtifactPaths: [".MAIN/plans/plan.md"],
         taskFlowUserCount: 1,
       });
+    await expect(page.getByTestId("plan-approve-button")).toHaveCount(0);
 
     await expect
       .poll(async () =>
@@ -354,12 +391,15 @@ for (const scenario of ["plan-quick-reply-materialize-gemma", "plan-quick-reply-
               String(entry.message || "").includes('"intent":"execute"') &&
               String(entry.message || "").includes('"planStage":"idle"'),
             ),
+            blockedWithoutReviewRequest: entries.some((entry: { source?: string }) =>
+              entry.source === "store.plan_approval_blocked_missing_review_request"),
           };
         }),
       )
       .toEqual({
         materialized: true,
         bypassedExecute: false,
+        blockedWithoutReviewRequest: true,
       });
   });
 }

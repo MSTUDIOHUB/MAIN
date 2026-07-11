@@ -329,6 +329,43 @@ test("agent loop runner preserves a bounded error reason for Goal Runtime diagno
   assert.deepEqual(errors, ["STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream stalled"]);
 });
 
+test("a run.paused boundary cannot fall through as agent_loop_completed", async () => {
+  class ReviewPausedOrchestrator {
+    async execute() {}
+
+    getLatestRunPauseReason() {
+      return "plan_review_required";
+    }
+
+    getLatestTurnContract() {
+      return {
+        conversationIntent: "plan",
+        runtimeIntent: "plan",
+        approvalState: "required",
+        mutationExpected: false,
+        completionEvidenceRequired: "none",
+      };
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+  }
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(ReviewPausedOrchestrator, []);
+  const outcome = await executeAgentLoop({
+    getWorkflowMode: () => "plan",
+    getIsPlanApproved: () => false,
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "paused",
+    reason: "plan_review_required",
+  });
+});
+
 test("agent loop runner returns aborted before completion guards read final state", async () => {
   class AbortingOrchestrator {
     async execute(_callbacks, abortController) {

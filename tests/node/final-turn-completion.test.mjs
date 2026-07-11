@@ -71,6 +71,11 @@ function createHarness(overrides = {}) {
     onStatusChange: (status) => statuses.push(status),
     onNonActionableStop: (message, reason) => stops.push({ message, reason }),
   };
+  const emitTurnEvent = (event) => events.push(event);
+  emitTurnEvent.runIdentity = {
+    runId: "run_1",
+    parentRunId: "run_parent",
+  };
   return {
     appended,
     events,
@@ -86,13 +91,13 @@ function createHarness(overrides = {}) {
         eventThreadId: "thread_1",
         eventTurnId: "turn_1",
       },
-      emitTurnEvent: (event) => events.push(event),
+      emitTurnEvent,
       emitTurnCompletedEvent: () => completed.push(true),
     },
   };
 }
 
-test("reply option pause completes the assistant turn and leaves awaiting-input state to the runner", () => {
+test("reply option pause completes the assistant item but keeps the logical turn open", () => {
   const harness = createHarness({ planStage: "plan" });
 
   const result = handleReplyOptionsPause({
@@ -114,11 +119,15 @@ test("reply option pause completes the assistant turn and leaves awaiting-input 
   assert.deepEqual(harness.appended, [{ role: "assistant", content: "Assistant answer" }]);
   assert.deepEqual(harness.statuses, ["idle"]);
   assert.deepEqual(harness.stops, []);
-  assert.equal(harness.completed.length, 1);
+  assert.equal(harness.completed.length, 0);
   assert.equal(harness.events[0].type, "item.completed");
   assert.equal(harness.events[0].threadId, "thread_1");
   assert.equal(harness.events[0].turnId, "turn_1");
   assert.equal(harness.events[0].item.details.text, "Assistant answer");
+  assert.equal(harness.events[1].type, "run.paused");
+  assert.equal(harness.events[1].reason, "awaiting_input");
+  assert.equal(harness.events[1].runId, "run_1");
+  assert.equal(harness.events[1].parentRunId, "run_parent");
 });
 
 test("unapproved plan final text pauses as incomplete when no review-ready plan exists", () => {
@@ -138,7 +147,8 @@ test("unapproved plan final text pauses as incomplete when no review-ready plan 
   assert.equal(harness.stops.length, 1);
   assert.equal(harness.stops[0].reason, "incomplete_plan");
   assert.deepEqual(harness.statuses, ["idle"]);
-  assert.equal(harness.completed.length, 1);
+  assert.equal(harness.completed.length, 0);
+  assert.equal(harness.events.at(-1).type, "run.paused");
   assert.equal(harness.events[0].item.details.type, "agent_message");
 });
 

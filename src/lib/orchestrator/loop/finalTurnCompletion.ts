@@ -22,6 +22,9 @@ type AssistantTurnCompletionInput = {
   iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId">;
   emitTurnEvent: (event: MainThreadEventInput) => void;
   emitTurnCompletedEvent: () => void;
+  completionMode?: "completed" | "paused";
+  pauseReason?: string;
+  pauseMessage?: string;
   nonActionableStop?: {
     message: string;
     reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan";
@@ -37,6 +40,9 @@ export function completeAssistantTurn(input: AssistantTurnCompletionInput): void
     iterationContext,
     emitTurnEvent,
     emitTurnCompletedEvent,
+    completionMode = "completed",
+    pauseReason,
+    pauseMessage,
     nonActionableStop,
   } = input;
   const { eventThreadId, eventTurnId } = iterationContext;
@@ -59,6 +65,31 @@ export function completeAssistantTurn(input: AssistantTurnCompletionInput): void
     callbacks.onNonActionableStop(nonActionableStop.message, nonActionableStop.reason);
   }
   callbacks.onStatusChange("idle");
+  if (completionMode === "paused") {
+    const attachedRunIdentity = (
+      emitTurnEvent as typeof emitTurnEvent & {
+        runIdentity?: {
+          runId: string;
+          parentRunId: string | null;
+          goalSliceId?: string;
+        };
+      }
+    ).runIdentity;
+    emitTurnEvent({
+      type: "run.paused",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+      runId: attachedRunIdentity?.runId || `run-untracked-${eventTurnId}`,
+      parentRunId: attachedRunIdentity?.parentRunId ?? null,
+      ...(attachedRunIdentity?.goalSliceId
+        ? { goalSliceId: attachedRunIdentity.goalSliceId }
+        : {}),
+      reason: pauseReason || nonActionableStop?.reason || "awaiting_input",
+      message: pauseMessage || nonActionableStop?.message || assistantHistoryText,
+    });
+    return;
+  }
   emitTurnCompletedEvent();
 }
 
@@ -116,6 +147,11 @@ export function handleReplyOptionsPause(input: {
   completeAssistantTurn({
     callbacks,
     ...completion,
+    completionMode: "paused",
+    pauseReason: "awaiting_input",
+    pauseMessage: callbacks.getPreferredLanguage() === "zh"
+      ? "正在等待用户在当前回合中选择或补充信息。"
+      : "Waiting for the user to choose or clarify within the current turn.",
   });
   return { status: "stopped" };
 }
@@ -151,6 +187,8 @@ export function handleFinalNoToolAssistantTurn(input: {
     completeAssistantTurn({
       callbacks,
       ...completion,
+      completionMode: "paused",
+      pauseReason: "incomplete_plan",
       nonActionableStop: {
         message: buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "incomplete_plan"),
         reason: "incomplete_plan",

@@ -8,10 +8,17 @@ import {
   resolveCustomReplyOptionAction,
   simplifyOperationProposalReplyOptions,
 } from "../lib/replyOptions";
+import type { TurnPresentationModel } from "../lib/turnPresentation";
+import type { ToolPermissionResolutionIdentity } from "../lib/actionRequest";
 
 // region: ExecutionCapsule 属性定义
 interface ExecutionCapsuleProps {
   title: string;
+  presentation?: TurnPresentationModel;
+  turnId?: string;
+  runId?: string;
+  requestId?: string;
+  permissionIdentity?: ToolPermissionResolutionIdentity;
   status: string;
   statusToneClass: string;
   language: "zh" | "en";
@@ -25,6 +32,7 @@ interface ExecutionCapsuleProps {
   progressMode?: "plan" | "execution";
   isAwaitingChoice?: boolean;
   replyOptions?: ReplyOption[];
+  allowCustomReply?: boolean;
   pendingRunDecision?: PendingRunDecision | null;
   activeDiffTask?: any;
   pendingToolReview?: any;
@@ -37,9 +45,9 @@ interface ExecutionCapsuleProps {
   onRequestPlanAdjustment?: (text: string) => void;
   onApprovePlan: () => void;
   onRejectPlan: () => void;
-  onRejectDiff?: (id: number) => void;
-  onApproveDiffOnce?: () => void;
-  onApproveDiffSession?: () => void;
+  onRejectDiff?: (identity: ToolPermissionResolutionIdentity) => void;
+  onApproveDiffOnce?: (identity: ToolPermissionResolutionIdentity) => void;
+  onApproveDiffSession?: (identity: ToolPermissionResolutionIdentity) => void;
   onOpenDiff: () => void;
 }
 // endregion
@@ -99,6 +107,12 @@ function renderFormattedLabel(text: string): ReactNode {
 }
 
 const ExecutionCapsule = memo(function ExecutionCapsule({
+  title,
+  presentation,
+  turnId,
+  runId,
+  requestId,
+  permissionIdentity,
   status,
   statusToneClass,
   language,
@@ -112,6 +126,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   progressMode,
   isAwaitingChoice = false,
   replyOptions = [],
+  allowCustomReply = false,
   pendingRunDecision = null,
   activeDiffTask,
   pendingToolReview,
@@ -134,6 +149,12 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   const [isApproving, setIsApproving] = useState(false);
   const [choiceOptionsCollapsed, setChoiceOptionsCollapsed] = useState(false);
   const approvingRef = useRef(false);
+  const resolvedTitle = presentation?.title || title;
+  const resolvedStatus = presentation?.statusLabel || status;
+  const resolvedSessionKey = permissionIdentity?.sessionKey;
+  const resolvedTurnId = permissionIdentity?.turnId || turnId || presentation?.turnId;
+  const resolvedRunId = permissionIdentity?.runId || runId || presentation?.runId;
+  const resolvedRequestId = permissionIdentity?.requestId || requestId || presentation?.requestId;
 
   useEffect(() => {
     if (planStage === "executing" || isRunActive) {
@@ -249,6 +270,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
       label: summaryLabel,
       value: finalValue,
       action: "execute_once",
+      source: "custom_reply",
     });
   };
 
@@ -266,7 +288,12 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   // region: ExecutionCapsule 展开时机
   const hasReplyOptions = hasRealChoiceOptions || hasApprovalActionOptions;
   const hasPendingRunDecision = !!pendingRunDecision;
-  const activeReviewTask = pendingToolReview || activeDiffTask;
+  const reviewTaskCandidate = pendingToolReview || activeDiffTask;
+  const activeReviewTask = permissionIdentity &&
+    reviewTaskCandidate?.id === permissionIdentity.taskId &&
+    reviewTaskCandidate?.turnId === permissionIdentity.turnId
+    ? reviewTaskCandidate
+    : null;
   const hasPendingToolReview = !!activeReviewTask;
   const hasActiveDiffPreview = !!activeReviewTask?.diff;
   const hasChoicePromptContent = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision;
@@ -442,6 +469,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     onSelectReplyOption?.({
       label: normalizedCustomReply,
       value: normalizedCustomReply,
+      source: "custom_reply",
       ...(resolvedAction ? { action: resolvedAction } : {}),
     });
     setCustomReplyText("");
@@ -458,11 +486,21 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     <div
       data-testid="execution-capsule-shell"
       data-run-active={isRunActive ? "true" : "false"}
+      data-session-key={resolvedSessionKey || undefined}
+      data-turn-id={resolvedTurnId || undefined}
+      data-run-id={resolvedRunId || undefined}
+      data-request-id={resolvedRequestId || undefined}
+      data-task-id={permissionIdentity?.taskId ?? undefined}
+      data-presentation-kind={presentation?.kind || undefined}
+      data-turn-lifecycle={presentation?.lifecycle || undefined}
       className={`execution-capsule-controls w-full min-w-0 [&_button]:pointer-events-auto [&_input]:pointer-events-auto [&_textarea]:pointer-events-auto [&_select]:pointer-events-auto ${activeRunOutline}`}
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0 flex flex-wrap items-center gap-2">
-            <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{status}</span>
+            <span data-testid="execution-capsule-title" className="min-w-0 max-w-full truncate text-[12px] font-semibold text-[var(--surface-text-strong)]" title={resolvedTitle}>
+              {resolvedTitle}
+            </span>
+            <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{resolvedStatus}</span>
             {hasTasks && (
               <span data-testid={activeProgressMode === "execution" ? "execution-capsule-execution-badge" : "execution-capsule-plan-badge"} className="theme-plan-pill shrink-0 rounded-full border px-2 py-0.5 text-[10px]">
                 {activeProgressMode === "execution" ? copy.steps : copy.tasks} {completedCount}/{progressItems.length}
@@ -866,7 +904,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       </div>
                     )}
 
-                    {!tabGroups && (
+                    {!tabGroups && allowCustomReply && (
                       <form onSubmit={submitCustomReply} data-testid="execution-capsule-custom-reply-row" className="group flex min-w-0 items-center gap-2">
                         <span data-testid="execution-capsule-custom-reply-badge" className={choiceNumberClass} style={choiceTextStyle}>{customChoiceNumber}.</span>
                         <div className="min-w-0 flex-1">
@@ -931,14 +969,14 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                         </button>
                       )}
                       <button
-                        onClick={() => onRejectDiff?.(activeReviewTask.id)}
+                        onClick={() => permissionIdentity && onRejectDiff?.(permissionIdentity)}
                         className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
                       >
                         {copy.reject}
                       </button>
                       <button
                         data-testid="execution-capsule-tool-approve-session"
-                        onClick={() => onApproveDiffSession?.()}
+                        onClick={() => permissionIdentity && onApproveDiffSession?.(permissionIdentity)}
                         className={`rounded-lg border px-4 py-2 text-[12px] font-medium transition-colors ${
                           autoApproveTools
                             ? "theme-plan-button"
@@ -953,7 +991,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       </button>
                       <button
                         data-testid="execution-capsule-tool-approve-once"
-                        onClick={() => onApproveDiffOnce?.()}
+                        onClick={() => permissionIdentity && onApproveDiffOnce?.(permissionIdentity)}
                         className="theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold"
                         title={copy.executeOnceInfo}
                       >

@@ -99,13 +99,26 @@ export function applyPlanNoToolRuntimeState(
   state: PlanLoopRuntimeState,
   input: Pick<
     PlanLoopRuntimeState,
-    "usedPlanRecoveryPrompt" | "planClosureEvidenceRecoveryIssued"
+    | "usedPlanRecoveryPrompt"
+    | "planClosureEvidenceRecoveryIssued"
+    | "planQualityRejectCount"
+    | "planLastQualityGateReason"
+    | "planLastMissingSections"
+    | "planArtifactQualityRejected"
+    | "planAutoScaffoldPromptIssued"
+    | "planEvidenceRecoveryPasses"
   >,
 ): PlanLoopRuntimeState {
   return {
     ...state,
     usedPlanRecoveryPrompt: input.usedPlanRecoveryPrompt,
     planClosureEvidenceRecoveryIssued: input.planClosureEvidenceRecoveryIssued,
+    planQualityRejectCount: input.planQualityRejectCount ?? state.planQualityRejectCount,
+    planLastQualityGateReason: input.planLastQualityGateReason ?? state.planLastQualityGateReason,
+    planLastMissingSections: input.planLastMissingSections ?? state.planLastMissingSections,
+    planArtifactQualityRejected: input.planArtifactQualityRejected ?? state.planArtifactQualityRejected,
+    planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued ?? state.planAutoScaffoldPromptIssued,
+    planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses ?? state.planEvidenceRecoveryPasses,
   };
 }
 

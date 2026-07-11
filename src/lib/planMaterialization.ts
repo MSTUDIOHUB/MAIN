@@ -16,6 +16,7 @@ export type MaterializablePlanKind = "plan" | "design";
 export type PlanMaterializationSource =
   | "visible_plan"
   | "canonicalized_visible_plan"
+  | "evidence_section_repaired_visible_plan"
   | "deterministic_evidence";
 
 export interface PlanMaterializationResult {
@@ -28,6 +29,8 @@ export interface PlanMaterializationResult {
   /** Extracted <user_options> blocks for post-validation routing. */
   replyOptions?: string[];
   decisionFork?: PlanDecisionForkAnalysis;
+  /** Typed quality outcome used by both persisted and visible-plan recovery. */
+  quality?: PlanArtifactQualityResult;
 }
 
 export interface PlanMaterializationToolActivityLike {
@@ -1036,6 +1039,69 @@ export function validateGroundedActionablePlanArtifact(input: {
   return validatePlanEvidenceGrounding(input);
 }
 
+function repairMissingPlanEvidenceSection(input: {
+  content: string;
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+  language: "zh" | "en";
+}): string | null {
+  const changeTargets = collectPlanChangeTargets(input.content);
+  if (changeTargets.length === 0) return null;
+
+  const matchesChangedTarget = (value: string): boolean => {
+    const normalized = normalizePlanGroundingPath(value);
+    return changeTargets.some((target) => planGroundingPathsMatch(target, normalized));
+  };
+  const evidenceLines = uniquePlanItems([
+    ...(input.evidenceRecords || [])
+      .filter((record) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(record.tool || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(record.status || "")) &&
+        matchesChangedTarget(record.target || "")
+      )
+      .map((record) => formatPlanEvidenceRecord(record, input.language)),
+    ...(input.recentToolActivity || [])
+      .filter((activity) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(activity.name || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(activity.status || "")) &&
+        matchesChangedTarget(activity.target || "")
+      )
+      .map((activity) => summarizeEvidenceLine(
+        summarizeToolActivityForEvidence(activity),
+        input.language,
+      )),
+  ], 6, 1200, true).filter(isConcretePlanEvidence);
+  if (evidenceLines.length === 0) return null;
+
+  const section = [
+    input.language === "zh" ? "## 已确认证据" : "## Confirmed Evidence",
+    ...evidenceLines.map((line) => `- ${line}`),
+  ];
+  const lines = input.content.trim().split(/\r?\n/);
+  const titleIndex = lines.findIndex((line) => /^#\s+\S/.test(line.trim()));
+  const nextTitleIndex = lines.findIndex((line, index) =>
+    index > titleIndex && /^#\s+\S/.test(line.trim())
+  );
+  const formalPlanEnd = nextTitleIndex >= 0 ? nextTitleIndex : lines.length;
+  const summaryIndex = lines.findIndex((line, index) =>
+    index > titleIndex &&
+    index < formalPlanEnd &&
+    /^#{1,6}\s+(?:摘要|Summary)\s*$/i.test(line.trim())
+  );
+  let insertAt = lines.findIndex((line, index) =>
+    index > Math.max(summaryIndex, titleIndex) &&
+    index <= formalPlanEnd &&
+    /^#{1,6}\s+\S/.test(line.trim())
+  );
+  if (insertAt < 0) insertAt = formalPlanEnd;
+  if (summaryIndex < 0) {
+    insertAt = titleIndex >= 0 ? titleIndex + 1 : 0;
+  }
+
+  lines.splice(insertAt, 0, "", ...section, "");
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
 function isSpeculativePlanLine(line: string): boolean {
   return /(?:可能|也许|大概|概率|疑似|推测|假设|probably|possibly|likely|hypothesis|assumption)/i.test(line);
 }
@@ -1667,6 +1733,25 @@ function normalizeDesignContent(rawText: string, language: "zh" | "en"): string 
   return `${language === "zh" ? "# 设计方案" : "# Design"}\n\n${sanitized}`;
 }
 
+function rejectPlanMaterialization(input: {
+  reason: string;
+  replyOptions?: string[];
+  decisionFork?: PlanDecisionForkAnalysis;
+  quality?: PlanArtifactQualityResult;
+}): PlanMaterializationResult {
+  const quality = input.quality || classifyPlanArtifactQualityResult({
+    ok: false,
+    reason: input.reason,
+  });
+  return {
+    ok: false,
+    reason: quality.reason || input.reason,
+    quality,
+    ...(input.replyOptions ? { replyOptions: input.replyOptions } : {}),
+    ...(input.decisionFork ? { decisionFork: input.decisionFork } : {}),
+  };
+}
+
 export function materializePlanArtifactFromVisibleText(input: {
   visibleText: string;
   planStage?: PlanStage | null;
@@ -1690,10 +1775,10 @@ export function materializePlanArtifactFromVisibleText(input: {
   const raw = extracted.replyOptions.length > 0
     ? stripPlanChoiceMarkup(extracted.content)
     : extracted.content.trim();
-  if (!raw) return { ok: false, reason: "empty", replyOptions: extracted.replyOptions };
-  if (PROTOCOL_NOISE_RE.test(raw)) return { ok: false, reason: "protocol_noise" };
-  if (TOOL_LOG_NOISE_RE.test(raw)) return { ok: false, reason: "tool_log_noise" };
-  if (raw.length < 280) return { ok: false, reason: "too_short" };
+  if (!raw) return rejectPlanMaterialization({ reason: "empty", replyOptions: extracted.replyOptions });
+  if (PROTOCOL_NOISE_RE.test(raw)) return rejectPlanMaterialization({ reason: "protocol_noise" });
+  if (TOOL_LOG_NOISE_RE.test(raw)) return rejectPlanMaterialization({ reason: "tool_log_noise" });
+  if (raw.length < 280) return rejectPlanMaterialization({ reason: "too_short" });
 
   const language = detectMaterializationLanguage({
     content: raw,
@@ -1707,9 +1792,14 @@ export function materializePlanArtifactFromVisibleText(input: {
   });
   if (kind === "design") {
     const content = normalizeDesignContent(raw, language);
-    if (countPlanShapeSignals(content) < 4) return { ok: false, reason: "not_structured" };
+    if (countPlanShapeSignals(content) < 4) return rejectPlanMaterialization({ reason: "not_structured" });
     const validation = validatePlanArtifactContent(content, "design");
-    if (!validation.ok) return { ok: false, reason: validation.reason || "quality_gate" };
+    if (!validation.ok) {
+      return rejectPlanMaterialization({
+        reason: validation.reason || "quality_gate",
+        quality: classifyPlanArtifactQualityResult(validation),
+      });
+    }
     return {
       ok: true,
       kind,
@@ -1721,7 +1811,7 @@ export function materializePlanArtifactFromVisibleText(input: {
 
   let content = normalizePlanContent(raw);
   let source: PlanMaterializationSource = input.sourceHint || "visible_plan";
-  if (countPlanShapeSignals(content) < 5) return { ok: false, reason: "not_structured" };
+  if (countPlanShapeSignals(content) < 5) return rejectPlanMaterialization({ reason: "not_structured" });
   const decisionFork = analyzePlanDecisionFork(content);
 
   let validation = validateActionablePlanArtifact(content);
@@ -1766,7 +1856,13 @@ export function materializePlanArtifactFromVisibleText(input: {
       }
     }
   }
-  if (!validation.ok) return { ok: false, reason: validation.reason || "quality_gate", decisionFork };
+  if (!validation.ok) {
+    return rejectPlanMaterialization({
+      reason: validation.reason || "quality_gate",
+      decisionFork,
+      quality: validation,
+    });
+  }
 
   const grounding = validatePlanEvidenceGrounding({
     content,
@@ -1775,7 +1871,46 @@ export function materializePlanArtifactFromVisibleText(input: {
     recentToolActivity: input.recentToolActivity,
   });
   if (!grounding.ok) {
-    return { ok: false, reason: grounding.reason || "evidence_grounding", decisionFork };
+    if (grounding.reason === "missing_plan_evidence_section") {
+      const repaired = repairMissingPlanEvidenceSection({
+        content,
+        evidenceRecords: input.evidenceRecords,
+        recentToolActivity: input.recentToolActivity,
+        language,
+      });
+      if (repaired) {
+        const repairedQuality = validateGroundedActionablePlanArtifact({
+          content: repaired,
+          evidence: input.evidence,
+          evidenceRecords: input.evidenceRecords,
+          recentToolActivity: input.recentToolActivity,
+        });
+        if (repairedQuality.ok) {
+          content = repaired;
+          source = input.sourceHint === "deterministic_evidence"
+            ? "deterministic_evidence"
+            : "evidence_section_repaired_visible_plan";
+        } else {
+          return rejectPlanMaterialization({
+            reason: repairedQuality.reason || grounding.reason || "evidence_grounding",
+            decisionFork,
+            quality: repairedQuality,
+          });
+        }
+      } else {
+        return rejectPlanMaterialization({
+          reason: grounding.reason || "evidence_grounding",
+          decisionFork,
+          quality: grounding,
+        });
+      }
+    } else {
+      return rejectPlanMaterialization({
+        reason: grounding.reason || "evidence_grounding",
+        decisionFork,
+        quality: grounding,
+      });
+    }
   }
 
   return {

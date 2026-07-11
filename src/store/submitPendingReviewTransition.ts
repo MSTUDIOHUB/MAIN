@@ -4,6 +4,7 @@ import {
   type SubmitPendingReviewDecision,
 } from "../lib/submit/turnSubmission";
 import type { ConversationTurn } from "../lib/workflowModels";
+import type { ActionRequest } from "../lib/actionRequest";
 
 type PendingReviewReject = (decision: { action: "reject" }) => void;
 
@@ -13,6 +14,7 @@ export interface SubmitPendingReviewTransitionState {
   conversationTurns: ConversationTurn[];
   taskFlow: TaskBlock[];
   pendingReviewTaskId: number | null;
+  activeActionRequest?: ActionRequest | null;
   abortController: { abort: () => void } | null;
   pendingReviewResolve: PendingReviewReject | null;
 }
@@ -89,6 +91,7 @@ export function applySubmitPendingReviewTransition<TState extends SubmitPendingR
     abortController: null,
     pendingReviewResolve: null,
     pendingReviewTaskId: null,
+    activeActionRequest: null,
     pendingToolCall: null,
   });
 

@@ -44,8 +44,15 @@ export async function executeAgentLoop(
   try {
     await orchestrator.execute(wrappedCallbacks, abortController);
   } catch (error) {
-    setOutcome({ status: "error", reason: buildAgentLoopErrorReason(error) });
+    const errorReason = buildAgentLoopErrorReason(error);
+    orchestrator.failActiveRun(errorReason);
+    setOutcome({ status: "error", reason: errorReason });
     throw error;
+  }
+
+  const runPauseReason = orchestrator.getLatestRunPauseReason?.();
+  if (runPauseReason && outcome.status === "completed") {
+    setOutcome({ status: "paused", reason: runPauseReason });
   }
 
   if (abortController.signal.aborted) {

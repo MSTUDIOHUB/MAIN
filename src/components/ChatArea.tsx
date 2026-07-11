@@ -44,7 +44,7 @@ import {
   countCompletedToolCalls,
   type ChatOperationCluster,
 } from "../lib/toolUiGrouping";
-import { deriveDynamicFirstPersonText, isConversationalFirstPersonNarration } from "../lib/capsuleStagingHelper";
+import { deriveDynamicFirstPersonText } from "../lib/capsuleStagingHelper";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
   buildRuntimeProgressLedger,
@@ -88,6 +88,14 @@ import {
   shouldGroupPlanExecutionTools,
 } from "../lib/chat/chatToolSummary";
 import { resolveVisiblePendingToolReview } from "../lib/pendingToolReview";
+import {
+  getToolPermissionResolutionIdentity,
+  shouldRenderPermissionCapsule,
+} from "../lib/actionRequest";
+import {
+  buildTurnPresentationModel,
+  shouldRenderTurnBoundary,
+} from "../lib/turnPresentation";
 import { extractPlanDraftPreview, extractStructuredPlanProposal } from "../lib/planProposal";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 
@@ -1102,6 +1110,51 @@ function TurnPhaseDivider({ label }: { label: string }) {
   );
 }
 
+function TurnProcessDisclosure({
+  collapsed,
+  count,
+  toolCount,
+  changedFileCount,
+  elapsedSeconds,
+  summary,
+  language,
+  onToggle,
+}: {
+  collapsed: boolean;
+  count: number;
+  toolCount: number;
+  changedFileCount: number;
+  elapsedSeconds: number;
+  summary?: string;
+  language: "zh" | "en";
+  onToggle: () => void;
+}) {
+  if (count <= 0) return null;
+  const details = [
+    language === "zh" ? `${toolCount} 个工具` : `${toolCount} tool${toolCount === 1 ? "" : "s"}`,
+    language === "zh" ? `${changedFileCount} 个文件` : `${changedFileCount} file${changedFileCount === 1 ? "" : "s"}`,
+    elapsedSeconds > 0 ? `${Math.round(elapsedSeconds)}s` : "",
+  ].filter(Boolean).join(" · ");
+  const action = collapsed
+    ? language === "zh" ? "展开过程" : "Show process"
+    : language === "zh" ? "收起过程" : "Hide process";
+  const label = `${action}（${count} · ${details}）`;
+  return (
+    <button
+      type="button"
+      data-testid="turn-process-disclosure"
+      data-process-collapsed={collapsed ? "true" : "false"}
+      onClick={onToggle}
+      title={summary || label}
+      className="turn-process-disclosure ml-9 inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[10.5px] font-medium transition-colors"
+      aria-expanded={!collapsed}
+    >
+      {collapsed ? <IconChevronRight className="h-3 w-3" /> : <IconChevronDown className="h-3 w-3" />}
+      <span>{label}</span>
+    </button>
+  );
+}
+
 function TurnChangesCard({
   entries,
   totalExecutedEdits,
@@ -1831,6 +1884,11 @@ function TurnArchiveStepCard({
         <span data-testid="turn-archive-step-intent" className="mt-1 block whitespace-pre-wrap break-words text-[12.5px] font-medium leading-5 text-[var(--surface-text)]">
           {renderCompactMarkdownText(primaryText)}
         </span>
+        {isLive && summaryText && summaryText !== primaryText && (
+          <span className="mt-0.5 block whitespace-pre-wrap break-words text-[11px] leading-4 text-[var(--surface-text-muted)]">
+            {renderCompactMarkdownText(summaryText)}
+          </span>
+        )}
       </span>
       {canExpandDetails && (
         <span className="inline-flex max-w-full items-center gap-1.5 px-1 py-1 text-[10px] text-[var(--surface-text-muted)] transition-colors group-hover:text-[var(--surface-text)]">
@@ -1905,7 +1963,10 @@ function LiveTurnProcessTimeline({
   const hasChangeSummary = !!model && model.steps.some((step) =>
     step.kind === "edit" && collectTurnChangeEntries(step.items).entries.length > 0
   );
-  const [expanded, setExpanded] = useState(hasChangeSummary);
+  // The turn-level disclosure is the primary process collapse control. When
+  // that disclosure is open, expose the step rows immediately instead of
+  // requiring a second nested expansion just to inspect the same process.
+  const [expanded, setExpanded] = useState(true);
   useEffect(() => {
     if (hasChangeSummary) setExpanded(true);
   }, [hasChangeSummary]);
@@ -2414,6 +2475,8 @@ export default function ChatArea({
     showFilePanel,
     rightPanelTab,
     runtimeEvents,
+    harnessRunMarker,
+    activeActionRequest,
     openRightPanelTab,
     openSubagentsPanel,
     openFileTreePanel,
@@ -2458,6 +2521,8 @@ export default function ChatArea({
     showFilePanel: useAppStore((s) => s.showFilePanel),
     rightPanelTab: useAppStore((s) => s.rightPanelTab),
     runtimeEvents: useAppStore((s) => s.runtimeEvents),
+    harnessRunMarker: useAppStore((s) => s.harnessRunMarker),
+    activeActionRequest: useAppStore((s) => s.activeActionRequest),
     openRightPanelTab: useAppStore((s) => s.openRightPanelTab),
     openSubagentsPanel: useAppStore((s) => s.openSubagentsPanel),
     openFileTreePanel: useAppStore((s) => s.openFileTreePanel),
@@ -2920,73 +2985,66 @@ export default function ChatArea({
     planStage,
     fallbackPlanPreview: activePlanFallbackPreview,
   }), [activePlanFallbackPreview, planArtifacts, planStage, planTasks]);
-  const canApprovePlan =
-    !!pinnedPlanTurn &&
-    !isPlanApproved &&
-    hasLivePlanWorkspaceContent &&
-    (
-      agentStatus === "pending_review" ||
-      pinnedPlanTurn?.status === "awaiting_approval" ||
-      planStage === "ready_to_execute"
-    );
+  const permissionActionRequest = activeActionRequest?.kind === "tool_permission" &&
+    !!activeSessionKey &&
+    activeActionRequest.sessionKey === activeSessionKey
+    ? activeActionRequest
+    : null;
+  const permissionResolutionIdentity = permissionActionRequest
+    ? getToolPermissionResolutionIdentity(permissionActionRequest)
+    : null;
+  const permissionRequestHasExactRuntimeOwner = shouldRenderPermissionCapsule({
+    request: permissionActionRequest,
+    sessionKey: activeSessionKey || "",
+    turnId: harnessRunMarker?.status === "running" && harnessRunMarker.sessionKey === activeSessionKey
+      ? harnessRunMarker.turnId
+      : null,
+    runId: harnessRunMarker?.status === "running" && harnessRunMarker.sessionKey === activeSessionKey
+      ? harnessRunMarker.runId
+      : null,
+    requestId: permissionResolutionIdentity?.requestId,
+    taskId: pendingReviewTaskId,
+  });
   const capsuleControlTurnStatusKey = capsuleControlTurnVisibleStatus || capsuleControlTurn?.status || null;
-  const capsuleControlReplyOptions = useMemo(() => {
-    if (capsuleControlTurnStatusKey !== "awaiting_input" && capsuleControlTurnStatusKey !== "awaiting_approval") {
-      return [];
-    }
-    const lastAgentBlock = [...capsuleControlTurnBlocks].reverse().find((block) => block.type === "agent");
-    if (!lastAgentBlock || !Array.isArray(lastAgentBlock.options) || lastAgentBlock.options.length === 0) {
-      return [];
-    }
-    return lastAgentBlock.options;
-  }, [capsuleControlTurnBlocks, capsuleControlTurnStatusKey]);
-  const capsuleControlHasPendingProposalCheckpoint = useMemo(() => {
-    if (!capsuleControlTurn || capsuleControlTurnStatusKey !== "awaiting_input") return false;
-    const lastAgentBlock = [...capsuleControlTurnBlocks].reverse().find((block) => block.type === "agent");
-    if (!lastAgentBlock || !Array.isArray(lastAgentBlock.options)) return false;
-    return lastAgentBlock.options.some((option: ReplyOption) =>
-      option?.action === "approve_operation_once" ||
-      option?.action === "execute_once" ||
-      option?.source === "proposal_follow_up" ||
-      option?.source === "operation_approval"
-    );
-  }, [capsuleControlTurn, capsuleControlTurnBlocks, capsuleControlTurnStatusKey]);
   const capsuleControlIsRunActive =
     agentStatus === "running" &&
     !!capsuleControlTurn &&
     capsuleControlTurnStatusKey === "executing";
-  const pendingToolReviewForExecutionCapsule = useMemo(() => resolveVisiblePendingToolReview({
-    taskFlow,
+  const pendingToolReviewForExecutionCapsule = useMemo(() => {
+    if (
+      !permissionRequestHasExactRuntimeOwner ||
+      !permissionActionRequest ||
+      permissionActionRequest.taskId !== pendingReviewTaskId
+    ) {
+      return null;
+    }
+    return resolveVisiblePendingToolReview({
+      taskFlow,
+      request: permissionActionRequest,
+      pendingReviewTaskId,
+      pendingToolCall,
+      activeDiffTask,
+    });
+  }, [
+    activeDiffTask,
     pendingReviewTaskId,
     pendingToolCall,
-    currentTurnId: capsuleControlTurn?.id || currentTurnId,
-    activeDiffTask,
-  }), [activeDiffTask, currentTurnId, pendingReviewTaskId, pendingToolCall, taskFlow, capsuleControlTurn?.id]);
-  const isAwaitingInteractiveChoice =
-    (capsuleControlTurnStatusKey === "awaiting_input" || capsuleControlTurnStatusKey === "awaiting_approval") &&
-    capsuleControlReplyOptions.length > 0;
-  const shouldShowRunStatus = isStreaming || isAwaitingInteractiveChoice;
-  const runStatusLabel = isStreaming
-    ? copy.processingLabel
-    : capsuleControlHasPendingProposalCheckpoint
-    ? language === "zh" ? "待确认方案..." : "Proposal checkpoint..."
-    : language === "zh" ? "等待选择..." : "Awaiting choice...";
+    permissionActionRequest,
+    permissionRequestHasExactRuntimeOwner,
+    taskFlow,
+  ]);
   const capsuleControlHasChoiceContext =
-    capsuleControlReplyOptions.length > 0 ||
-    !!pendingRunDecision ||
-    !!pendingToolReviewForExecutionCapsule ||
-    canApprovePlan;
+    !!pendingToolReviewForExecutionCapsule;
   const shouldShowExecutionCapsuleNormally =
     !!capsuleControlTurn &&
     capsuleControlTurnStatusKey !== "done" &&
     capsuleControlTurnStatusKey !== "completed_with_changes" &&
     capsuleControlHasChoiceContext;
   const shouldShowExecutionCapsule =
-    (!!capsuleControlTurn || !!pendingRunDecision) &&
-    (
-      capsuleControlHasChoiceContext ||
-      shouldShowExecutionCapsuleNormally
-    );
+    !!capsuleControlTurn &&
+    capsuleControlTurn.id === permissionResolutionIdentity?.turnId &&
+    !!pendingToolReviewForExecutionCapsule &&
+    (capsuleControlHasChoiceContext || shouldShowExecutionCapsuleNormally);
 
   const handleScroll = useCallback(() => {
     const el = chatContainerRef.current;
@@ -3188,6 +3246,12 @@ export default function ChatArea({
         return null;
       }
       const autoCollapse = index < taskFlow.length - 1 && taskFlow.findIndex((t, i) => i > index && t.type === "agent") !== -1;
+      const blockPermissionIdentity = permissionRequestHasExactRuntimeOwner &&
+        permissionResolutionIdentity &&
+        permissionResolutionIdentity.taskId === block.id &&
+        permissionResolutionIdentity.turnId === block.turnId
+        ? permissionResolutionIdentity
+        : null;
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-start">
           <ActionCard
@@ -3202,9 +3266,9 @@ export default function ChatArea({
             why={block.why}
             evidence={block.evidence}
             observationSummary={block.observationSummary}
-            onAllow={() => allowToolAction?.(block.id)}
-            onAllowForSession={() => approvePendingReviewForSession?.()}
-            onReject={() => rejectToolAction?.(block.id)}
+            onAllow={() => blockPermissionIdentity && allowToolAction?.(block.id, blockPermissionIdentity)}
+            onAllowForSession={() => blockPermissionIdentity && approvePendingReviewForSession?.(blockPermissionIdentity)}
+            onReject={() => blockPermissionIdentity && rejectToolAction?.(block.id, blockPermissionIdentity)}
             autoApproveTools={autoApproveTools}
             onToggleAutoApprove={onToggleAutoApprove}
             autoCollapse={autoCollapse}
@@ -3309,21 +3373,27 @@ export default function ChatArea({
       turnStatus: turn.status,
       isPlanExecutionVisible,
     });
-    const forceExpandedTurn =
-      turn.status === "awaiting_input" ||
-      turn.status === "awaiting_approval";
-    const isTurnExpanded = !turn.collapsed || forceExpandedTurn;
+    const turnPresentation = buildTurnPresentationModel({
+      turn,
+      language,
+      statusLabel: copy.turnStatusLabels[turn.status] || turn.status,
+    });
+    // Compatibility: persisted `collapsed` now projects to process-only collapse.
+    // The user request and final assistant response remain part of the continuous flow.
+    const isTurnExpanded = !turnPresentation.processCollapsed;
     const userBlock = blocks.find((block) => block.type === "user");
+    const additionalVisibleUserBlocks = userBlock
+      ? blocks
+          .map((block, blockIndex) => ({ block, blockIndex }))
+          .filter(({ block }) => block.type === "user" && block.id !== userBlock.id)
+      : [];
     const hiddenCount = blocks.filter((block) => block.type !== "user").length;
     const { entries: turnChangeEntries, totalExecutedEdits } = collectTurnChangeEntries(blocks);
     const shouldShowTurnChanges = turnChangeEntries.length > 0 || totalExecutedEdits > 0;
-    const shouldPreservePlanExecutionAgentText = isPlanTurn && isPlanExecutionVisible;
-    const finalVisibleAgentIndex = isPlanTurn && !shouldPreservePlanExecutionAgentText
-      ? -1
-      : [...blocks]
-          .map((block, idx) => ({ block, idx }))
-          .reverse()
-          .find(({ block }) => !block.hiddenProcess && hasRenderableAgentBlock(block))?.idx ?? -1;
+    const finalVisibleAgentIndex = [...blocks]
+      .map((block, idx) => ({ block, idx }))
+      .reverse()
+      .find(({ block }) => !block.hiddenProcess && hasRenderableAgentBlock(block))?.idx ?? -1;
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     const isFinishedTurn = isFinishedTurnStatus(turn.status);
     const showReasoningDebug = config.reasoningDisplay !== "hidden";
@@ -3357,13 +3427,20 @@ export default function ChatArea({
       }
       return false;
     });
-    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks && !isChatIntent;
+    // A response-style turn can still execute real tools. Process visibility is
+    // driven by those durable process blocks, not by the conversational intent
+    // label; pure chat without tool/progress blocks remains unaffected.
+    const shouldRenderLiveProcessTimeline = hasFoldableProcessBlocks;
     const shouldRenderCompletedProcessArchive = shouldRenderLiveProcessTimeline;
+    const shouldKeepContinuousProcessTimeline =
+      !turnPresentation.showStateAnchor &&
+      !hasSubstantiveIntermediateAgentText;
     const shouldArchiveCompletedProcess =
       shouldRenderCompletedProcessArchive &&
       isFinishedTurn &&
       finalVisibleAgentIndex >= 0 &&
-      !hasSubstantiveIntermediateAgentText;
+      !hasSubstantiveIntermediateAgentText &&
+      !shouldKeepContinuousProcessTimeline;
     const processArchive = shouldArchiveCompletedProcess
       ? buildTurnProcessArchiveModel({
           blocks,
@@ -3407,6 +3484,9 @@ export default function ChatArea({
           }
         : null;
     const toolExecutionSummary = buildToolExecutionSummary(blocks, language);
+    const turnToolCount = blocks.filter((block) =>
+      block.type === "tool" && ["executed", "running", "failed"].includes(String(block.toolStatus || ""))
+    ).length;
     const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const turnSubagentRuns = subagentRuns.filter((run) => run.parentTurnId === turn.id);
     const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
@@ -3466,6 +3546,12 @@ export default function ChatArea({
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
+        // A completed turn's exact final assistant answer is canonical visible
+        // context. Never let process-narration heuristics consume it merely
+        // because it mentions the tool result that immediately preceded it.
+        if (item.index === finalVisibleAgentIndex && item.block?.type === "agent") {
+          return renderBlockItem(item);
+        }
         if (isActiveRunningTurn) {
           // Active running turn routes intermediate explanations into the capsule.
           if (!(item.block?.type === "agent" && substantiveIntermediateAgentBlockIds.has(item.block.id))) {
@@ -3519,7 +3605,8 @@ export default function ChatArea({
         return item.cluster.blocks.every((block: any) => liveProcessBlockIds.has(block?.id));
       }
       if (item.kind === "readContextGroup") {
-        return false;
+        return shouldKeepContinuousProcessTimeline &&
+          item.blocks.every((block: any) => liveProcessBlockIds.has(block?.id));
       }
       if (item.kind === "completedToolGroup") {
         return item.blocks.every((block: any) => liveProcessBlockIds.has(block?.id));
@@ -3598,49 +3685,42 @@ export default function ChatArea({
     };
     const proposalCheckpointBlock = hasProposalCheckpoint ? blocks[proposalBlockIndex] : null;
     const proposalApprovalBlock = approvalBlockIndex >= 0 ? blocks[approvalBlockIndex] : null;
-    const displayTitleFallback = turn.userPrompt
-      ? normalizeConversationDisplayTitle(
-          turn.userPrompt,
-          language === "en" ? 48 : 40,
-          language === "en" ? "New task" : "新的任务",
-        )
-      : language === "en" ? "New task" : "新的任务";
-    const intentSummaryTitle = String(turn.intentSummary || "").trim();
-    const explicitTurnTitle = !isGenericConversationTitle(turn.title) ? turn.title : "";
-    const displayTurnTitle = normalizeConversationDisplayTitle(
-      intentSummaryTitle || explicitTurnTitle,
-      language === "en" ? 48 : 40,
-      displayTitleFallback,
-    );
+    const displayTurnTitle = turnPresentation.title;
     const isLightThemeMode = config.themeMode === "light";
-    const isBlackThemeMode = config.themeMode === "black";
-    const turnShellClass = isTurnExpanded
-      ? ""
-      : isLightThemeMode
-      ? "rounded-2xl border border-[#d4d4d8] bg-[#ffffff]"
-      : "rounded-2xl border border-[#1f1f23] bg-[#09090b]";
-    const turnHeaderClass = isTurnExpanded
-      ? isLightThemeMode
-        ? "rounded-xl border border-[#d4d4d8] bg-transparent hover:border-[#cbd5e1] hover:bg-[#f5f5f6]"
-        : "rounded-xl border border-[#1f1f23] bg-transparent hover:border-[#2f2f36] hover:bg-[#070709]/35"
-      : isLightThemeMode
-      ? "rounded-t-2xl border-b border-[#e4e4e7] hover:bg-[color-mix(in_srgb,var(--accent)_16%,#ffffff_84%)]"
-      : "rounded-t-2xl border-b border-[#1f1f23] hover:bg-[color-mix(in_srgb,var(--accent)_18%,transparent)]";
-    const collapsedTurnHeaderStyle = !isTurnExpanded
-      ? isLightThemeMode
-        ? {
-            borderBottomColor: "#e4e4e7",
-          }
-        : isBlackThemeMode
-        ? {
-            borderBottomColor: "#1f1f23",
-          }
-        : {
-            borderBottomColor: "#1f1f23",
-          }
+    const processItemCount = Math.max(0, collapsedProcessCount);
+    const canToggleProcess = processItemCount > 0;
+    const turnHeaderClass = "turn-state-anchor flex w-full items-center justify-between gap-4 rounded-xl border px-3 py-2 text-left transition-colors";
+    const turnTitleClass = "text-[var(--surface-text-strong)]";
+    const turnChevronClass = "text-[var(--surface-text-subtle)]";
+    const latestTurnChoiceBlock = [...blocks].reverse().find((block) =>
+      block.type === "agent" &&
+      block.archivedAfterChoice !== true &&
+      Array.isArray(block.options) &&
+      block.options.length > 0
+    );
+    const turnReplyOptions = latestTurnChoiceBlock?.type === "agent"
+      ? latestTurnChoiceBlock.options || []
+      : [];
+    const candidateChoiceRequest = latestTurnChoiceBlock?.type === "agent"
+      ? latestTurnChoiceBlock.choiceRequest
       : undefined;
-    const turnTitleClass = isLightThemeMode ? "text-[#111827]" : "text-[#f5f5f5]";
-    const turnChevronClass = isLightThemeMode ? "text-[#6b7280]" : "text-[#71717a]";
+    const turnOptionValues = turnReplyOptions.map((option) => String(option.value || option.label || "").trim()).filter(Boolean);
+    const inlineChoiceRequest = candidateChoiceRequest?.status === "pending" &&
+      candidateChoiceRequest.sessionKey === activeSessionKey &&
+      candidateChoiceRequest.turnId === turn.id &&
+      candidateChoiceRequest.optionValues.length === turnOptionValues.length &&
+      candidateChoiceRequest.optionValues.every((value) => turnOptionValues.includes(String(value).trim()))
+      ? candidateChoiceRequest
+      : null;
+    const showInlineChoiceCheckpoint =
+      (turn.status === "awaiting_input" || (turn.status === "awaiting_approval" && turnIntent !== "plan")) &&
+      turnReplyOptions.length > 0 &&
+      !!inlineChoiceRequest;
+    const inlineChoiceTitle = normalizeConversationDisplayTitle(
+      !isGenericConversationTitle(turn.title) ? turn.title : turn.intentSummary || turn.userPrompt,
+      language === "en" ? 52 : 42,
+      language === "en" ? "Turn choice" : "本轮选择",
+    );
 
     return (
       <section
@@ -3648,21 +3728,23 @@ export default function ChatArea({
         ref={(node) => {
           turnRefs.current[turn.id] = node;
         }}
+        data-turn-id={turn.id}
+        data-turn-presentation={turnPresentation.kind}
         className="py-3"
       >
-        <div className={turnShellClass}>
+        {turnPresentation.showStateAnchor && (
           <div
-            role="button"
-            tabIndex={0}
-            onClick={() => toggleConversationTurnCollapsed(turn.id)}
+            data-testid="turn-state-anchor"
+            role={canToggleProcess ? "button" : undefined}
+            tabIndex={canToggleProcess ? 0 : undefined}
+            onClick={canToggleProcess ? () => toggleConversationTurnCollapsed(turn.id) : undefined}
             onKeyDown={(event) => {
-              if (event.key === "Enter" || event.key === " ") {
+              if (canToggleProcess && (event.key === "Enter" || event.key === " ")) {
                 event.preventDefault();
                 toggleConversationTurnCollapsed(turn.id);
               }
             }}
-            className={`flex w-full items-center justify-between gap-4 px-3 py-2 text-left transition-colors ${turnHeaderClass}`}
-            style={collapsedTurnHeaderStyle}
+            className={turnHeaderClass}
           >
             <div className="min-w-0 flex flex-wrap items-center gap-2">
               {shouldShowIntentBadge && turnIntentLabel && (
@@ -3704,27 +3786,29 @@ export default function ChatArea({
                   </button>
                 )}
               </div>
-              <div className={`shrink-0 ${turnChevronClass}`}>{isTurnExpanded ? <IconChevronDown className="h-4 w-4" /> : <IconChevronRight className="h-4 w-4" />}</div>
+              {canToggleProcess && (
+                <div className={`shrink-0 ${turnChevronClass}`}>
+                  {isTurnExpanded ? <IconChevronDown className="h-4 w-4" /> : <IconChevronRight className="h-4 w-4" />}
+                </div>
+              )}
             </div>
           </div>
-          {!isTurnExpanded && (
-            <div className="px-3 pb-3 pt-2">
-              <TurnSummaryCard
-                turn={turn}
-                hiddenCount={(turn.status === "done" || turn.status === "completed_with_changes") ? collapsedProcessCount : hiddenCount}
-                fallbackSummary={planProgressSummary || finalAgentSummaryText || effectiveProgressSummary || toolExecutionSummary}
-                onOpenPlan={isPlanTurn && hasPlanContent ? () => openRightPanelTab("plan") : undefined}
-                onExpand={() => toggleConversationTurnCollapsed(turn.id)}
-                embedded
-                copy={copy}
-                chatFontSize={resolvedChatFontSize}
-              />
-            </div>
-          )}
-        </div>
+        )}
 
-        <div className={`${isTurnExpanded ? "mt-4 " : ""}space-y-4`}>
-          {isTurnExpanded && userBlock ? renderBlock(userBlock, 0) : null}
+        <div className={`${turnPresentation.showStateAnchor ? "mt-4 " : ""}space-y-4`}>
+          {userBlock ? renderBlock(userBlock, blocks.indexOf(userBlock)) : null}
+          {!turnPresentation.showStateAnchor && canToggleProcess && (
+            <TurnProcessDisclosure
+              collapsed={!isTurnExpanded}
+              count={processItemCount}
+              toolCount={turnToolCount}
+              changedFileCount={turnChangeEntries.length}
+              elapsedSeconds={Math.max(0, Number(turn.elapsedTime) || 0)}
+              summary={toolExecutionSummary}
+              language={language}
+              onToggle={() => toggleConversationTurnCollapsed(turn.id)}
+            />
+          )}
           {false && livePlanProgressBlock ? (
             <PlanExecutionSystemNotice
               key={`${turn.id}-live-plan-progress`}
@@ -3744,7 +3828,12 @@ export default function ChatArea({
           )}
 
           {!isTurnExpanded ? (
-            null
+            <React.Fragment key="collapsed-process-visible-messages">
+              {additionalVisibleUserBlocks.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
+              {finalVisibleAgentBlock
+                ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
+                : null}
+            </React.Fragment>
           ) : (
             <React.Fragment key="turn-details">
               {shouldArchiveCompletedProcess ? (
@@ -3779,16 +3868,9 @@ export default function ChatArea({
                       onOpenDiff={openDiffForTask}
                     />
                   )}
-                  {finalVisibleAgentBlock && (() => {
-                    const text = getAgentVisibleMarkdownText(finalVisibleAgentBlock);
-                    if (isTurnCompletedOrStopped && isConversationalFirstPersonNarration(text) && !isChatIntent) {
-                      const hasOptions = finalVisibleAgentBlock.options && finalVisibleAgentBlock.options.length > 0;
-                      if (!hasOptions) {
-                        return null;
-                      }
-                    }
-                    return renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex);
-                  })()}
+                  {finalVisibleAgentBlock
+                    ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
+                    : null}
                 </React.Fragment>
               ) : (
                 <React.Fragment key="live-process">
@@ -3825,37 +3907,143 @@ export default function ChatArea({
               chatFontSize={resolvedChatFontSize}
             />
           )}
+          {showInlineChoiceCheckpoint && (
+            <div
+              data-testid="turn-choice-checkpoint"
+              data-session-key={inlineChoiceRequest?.sessionKey || undefined}
+              data-turn-id={turn.id}
+              data-run-id={inlineChoiceRequest?.runId || undefined}
+              data-request-id={inlineChoiceRequest?.requestId || undefined}
+              className="rounded-xl border border-[var(--surface-border)] bg-[var(--surface-elevated)] p-3"
+            >
+              <ExecutionCapsule
+                isRunActive={false}
+                title={inlineChoiceTitle}
+                presentation={turnPresentation}
+                turnId={turn.id}
+                runId={inlineChoiceRequest?.runId}
+                requestId={inlineChoiceRequest?.requestId}
+                status={copy.turnStatusLabels[turn.status] || turn.status}
+                statusToneClass={getTurnStatusTone(turn.status)}
+                language={language}
+                themeMode={config.themeMode}
+                chatFontSize={resolvedChatFontSize}
+                planTasks={[]}
+                planStage="idle"
+                executionSteps={[]}
+                progressMode="execution"
+                isAwaitingChoice
+                replyOptions={turnReplyOptions}
+                allowCustomReply={inlineChoiceRequest.allowCustomReply}
+                pendingRunDecision={null}
+                canApprovePlan={false}
+                autoApproveTools={autoApproveTools}
+                onSelectReplyOption={(option) => onQuickReply?.(option, turn.id, inlineChoiceRequest)}
+                onRequestPlanAdjustment={(text) => onQuickReply?.({ label: text, value: text, action: "adjust_plan", source: "custom_reply" }, turn.id, inlineChoiceRequest)}
+                onCancelTurn={turn.id === currentTurnId ? onStopGeneration : undefined}
+                onApprovePlan={approvePlan}
+                onRejectPlan={rejectPlan}
+                onOpenDiff={() => openRightPanelTab("diff")}
+              />
+            </div>
+          )}
 
         </div>
-        <div
-          className="mt-4 h-px w-full rounded-full"
-          style={{ backgroundColor: "color-mix(in srgb, var(--accent) 50%, transparent)" }}
-        />
+        {shouldRenderTurnBoundary(index, groupedTurns.length) && (
+          <div
+            data-testid="turn-boundary-divider"
+            data-after-turn-id={turn.id}
+            className="turn-boundary-divider mt-4 h-px w-full"
+            aria-hidden="true"
+          />
+        )}
       </section>
     );
   };
 
-  const executionCapsuleControls = shouldShowExecutionCapsule && (capsuleControlTurn || pendingRunDecision) ? (
+  const capsuleTitle = permissionActionRequest?.title || (pendingRunDecision?.kind === "intent_confirmation"
+    ? pendingRunDecision.title || (language === "zh" ? "意图待确认" : "Intent Confirmation")
+    : normalizeConversationDisplayTitle(
+        capsuleControlTurn && !isGenericConversationTitle(capsuleControlTurn.title)
+          ? capsuleControlTurn.title
+          : capsuleControlTurn?.intentSummary || "",
+        language === "en" ? 52 : 42,
+        capsuleControlTurn?.userPrompt
+          ? normalizeConversationDisplayTitle(
+              capsuleControlTurn.userPrompt,
+              language === "en" ? 52 : 42,
+              language === "en" ? "Turn Decision" : "本轮决策",
+            )
+          : language === "en" ? "Turn Decision" : "本轮决策",
+      ));
+  const capsuleStatusLabel = copy.turnStatusLabels[capsuleControlTurnStatusKey || "awaiting_input"] ||
+    capsuleControlTurnStatusKey ||
+    (language === "zh" ? "待选择" : "Awaiting Choice");
+  const capsuleHarnessIdentity =
+    capsuleControlTurn && harnessRunMarker?.turnId === capsuleControlTurn.id
+      ? harnessRunMarker
+      : null;
+  const capsulePresentation = buildTurnPresentationModel({
+    turn: capsuleControlTurn,
+    language,
+    fallbackTitle: capsuleTitle,
+    statusOverride: capsuleControlTurnStatusKey || "awaiting_input",
+    statusLabel: capsuleStatusLabel,
+    kindOverride: !capsuleControlTurn && pendingRunDecision ? "awaiting" : undefined,
+    runId: permissionActionRequest?.runId || capsuleHarnessIdentity?.runId || undefined,
+    requestId: permissionActionRequest?.requestId || undefined,
+  });
+  const goalOwnerTurn = activeGoal
+    ? conversationTurns.find((turn) => turn.id === activeGoal.ownerTurnId) ||
+      (capsuleTurn?.intent === "goal" ? capsuleTurn : null)
+    : null;
+  const goalActionRequest = activeGoal && activeActionRequest?.kind === "goal_confirmation" &&
+    activeActionRequest.sessionKey === activeSessionKey &&
+    activeActionRequest.goalId === activeGoal.id &&
+    activeActionRequest.goalRevision === (activeGoal.revision || 1) &&
+    (!activeGoal.ownerTurnId || activeActionRequest.turnId === activeGoal.ownerTurnId) &&
+    harnessRunMarker?.status === "paused" &&
+    harnessRunMarker.sessionKey === activeActionRequest.sessionKey &&
+    harnessRunMarker.turnId === activeActionRequest.turnId &&
+    harnessRunMarker.runId === activeActionRequest.runId
+    ? activeActionRequest
+    : null;
+  const goalControlIdentity = activeGoal
+    ? {
+        goalId: activeGoal.id,
+        goalRevision: activeGoal.revision || 1,
+        ...(goalActionRequest ? { requestId: goalActionRequest.requestId } : {}),
+      }
+    : null;
+  const goalPresentation = activeGoal
+    ? buildTurnPresentationModel({
+        turn: goalOwnerTurn,
+        language,
+        fallbackTitle: activeGoal.objective,
+        statusOverride: goalStatus,
+        statusLabel: goalStatus,
+        kindOverride: "goal",
+        hasActionRequest: !!goalActionRequest,
+        turnId: activeGoal.ownerTurnId || goalOwnerTurn?.id,
+        runId: goalActionRequest?.runId || (
+          harnessRunMarker?.turnId === (activeGoal.ownerTurnId || goalOwnerTurn?.id)
+            ? harnessRunMarker.runId
+            : undefined
+        ),
+        requestId: goalActionRequest?.requestId,
+      })
+    : null;
+
+  const executionCapsuleControls = shouldShowExecutionCapsule && capsuleControlTurn ? (
     <ExecutionCapsule
       isRunActive={capsuleControlIsRunActive}
-      title={
-        pendingRunDecision?.kind === "intent_confirmation"
-          ? pendingRunDecision.title || (language === "zh" ? "意图待确认" : "Intent Confirmation")
-          : normalizeConversationDisplayTitle(
-              capsuleControlTurn && !isGenericConversationTitle(capsuleControlTurn.title)
-                ? capsuleControlTurn.title
-                : capsuleControlTurn?.intentSummary || "",
-              language === "en" ? 52 : 42,
-              capsuleControlTurn?.userPrompt
-                ? normalizeConversationDisplayTitle(
-                    capsuleControlTurn.userPrompt,
-                    language === "en" ? 52 : 42,
-                    language === "en" ? "Turn Decision" : "本轮决策",
-                  )
-                : language === "en" ? "Turn Decision" : "本轮决策",
-            )
-      }
-      status={copy.turnStatusLabels[capsuleControlTurnStatusKey || "awaiting_input"] || capsuleControlTurnStatusKey || "Awaiting Choice"}
+      title={capsuleTitle}
+      presentation={capsulePresentation}
+      turnId={permissionActionRequest?.turnId || capsuleControlTurn?.id}
+      runId={permissionActionRequest?.runId || capsuleHarnessIdentity?.runId || undefined}
+      requestId={permissionActionRequest?.requestId || undefined}
+      permissionIdentity={permissionResolutionIdentity || undefined}
+      status={capsuleStatusLabel}
       statusToneClass={getTurnStatusTone(capsuleControlTurnStatusKey || "awaiting_input")}
       language={language}
       themeMode={config.themeMode}
@@ -3865,25 +4053,54 @@ export default function ChatArea({
       planStage={pinnedPlanTurn ? planStage : "idle"}
       executionSteps={shouldShowPinnedPlanTasks ? [] : capsuleControlExecutionSteps}
       progressMode={shouldShowPinnedPlanTasks ? "plan" : "execution"}
-      isAwaitingChoice={isAwaitingInteractiveChoice}
-      replyOptions={capsuleControlReplyOptions}
-      pendingRunDecision={pendingRunDecision}
+      isAwaitingChoice={false}
+      replyOptions={[]}
+      pendingRunDecision={null}
       activeDiffTask={pendingToolReviewForExecutionCapsule}
       pendingToolReview={pendingToolReviewForExecutionCapsule}
-      canApprovePlan={canApprovePlan}
+      canApprovePlan={false}
       autoApproveTools={autoApproveTools}
-      onSelectReplyOption={(option) => capsuleControlTurn && onQuickReply?.(option, capsuleControlTurn.id)}
-      onRequestPlanAdjustment={(text) => capsuleControlTurn && onQuickReply?.({ label: text, value: text, action: "adjust_plan" }, capsuleControlTurn.id)}
       onCancelTurn={onStopGeneration}
-      onResolvePendingRunDecision={resolvePendingRunDecision}
-      onDismissPendingRunDecision={dismissPendingRunDecision}
       onApprovePlan={approvePlan}
       onRejectPlan={rejectPlan}
-      onRejectDiff={handleRejectInline}
-      onApproveDiffOnce={() => approvePendingReviewOnce()}
-      onApproveDiffSession={() => approvePendingReviewForSession()}
+      onRejectDiff={(identity) => rejectToolAction?.(identity.taskId, identity)}
+      onApproveDiffOnce={(identity) => approvePendingReviewOnce(identity)}
+      onApproveDiffSession={(identity) => approvePendingReviewForSession(identity)}
       onOpenDiff={() => openRightPanelTab("diff")}
     />
+  ) : null;
+  const intentDecisionControls = pendingRunDecision ? (
+    <div
+      data-testid="intent-decision-checkpoint"
+      className="pointer-events-auto w-full max-w-3xl rounded-2xl border border-[var(--surface-border)] bg-[var(--surface-elevated)] p-4 shadow-2xl"
+    >
+      <ExecutionCapsule
+        isRunActive={false}
+        title={pendingRunDecision.kind === "intent_confirmation"
+          ? pendingRunDecision.title || (language === "zh" ? "意图待确认" : "Intent Confirmation")
+          : language === "zh" ? "请选择下一步" : "Choose the next step"}
+        status={language === "zh" ? "待选择" : "Awaiting choice"}
+        statusToneClass={getTurnStatusTone("awaiting_input")}
+        language={language}
+        themeMode={config.themeMode}
+        chatFontSize={resolvedChatFontSize}
+        planTasks={[]}
+        planStage="idle"
+        executionSteps={[]}
+        progressMode="execution"
+        isAwaitingChoice
+        replyOptions={[]}
+        pendingRunDecision={pendingRunDecision}
+        canApprovePlan={false}
+        autoApproveTools={autoApproveTools}
+        onCancelTurn={onStopGeneration}
+        onResolvePendingRunDecision={resolvePendingRunDecision}
+        onDismissPendingRunDecision={dismissPendingRunDecision}
+        onApprovePlan={approvePlan}
+        onRejectPlan={rejectPlan}
+        onOpenDiff={() => openRightPanelTab("diff")}
+      />
+    </div>
   ) : null;
   const hasExecutionCapsuleControls = !!executionCapsuleControls;
   const hasCapsuleFlow = !!persistedExplanation;
@@ -4223,6 +4440,14 @@ export default function ChatArea({
       </div>
 
       {/* Execution capsule */}
+      {intentDecisionControls && (
+        <div
+          className="absolute left-6 right-6 z-40 flex justify-center"
+          style={{ bottom: `calc(env(safe-area-inset-bottom, 0px) + 1.5rem + ${composerHeight}px + 12px)` }}
+        >
+          {intentDecisionControls}
+        </div>
+      )}
       {shouldShowMainCapsule && (
         <div
           className="absolute left-6 right-6 z-30 pointer-events-none flex flex-col transition-all duration-300 ease-out"
@@ -4422,16 +4647,17 @@ export default function ChatArea({
               className="pointer-events-auto mb-3 w-full max-w-xl text-left transition-all duration-200"
             >
               <GoalPanel
+                presentation={goalPresentation || undefined}
                 goal={activeGoal}
                 progress={goalProgress}
                 status={goalStatus}
                 runtime={goalRuntime}
                 language={language}
                 themeMode={config.themeMode}
-                onPause={() => useAppStore.getState().pauseGoal()}
-                onResume={() => useAppStore.getState().resumeGoal()}
-                onEdit={(objective) => useAppStore.getState().updateGoalText(objective)}
-                onStop={() => useAppStore.getState().clearGoal()}
+                onPause={() => goalControlIdentity && useAppStore.getState().pauseGoal(goalControlIdentity)}
+                onResume={() => goalControlIdentity && useAppStore.getState().resumeGoal(goalControlIdentity)}
+                onEdit={(objective) => goalControlIdentity && useAppStore.getState().updateGoalText(objective, goalControlIdentity)}
+                onStop={() => goalControlIdentity && useAppStore.getState().clearGoal(goalControlIdentity)}
                 onClose={() => setCapsulePopover(null)}
               />
             </div>

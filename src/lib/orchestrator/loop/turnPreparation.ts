@@ -21,8 +21,11 @@ import type { StreamSettings } from "../../streaming";
 import { extractCompatibilityTextContent } from "../../providerCompatibility";
 import { buildSystemPrompt } from "../../systemPrompt";
 import { skillNameToToolName, type ToolDefinition } from "../../toolSchemas";
-import { withEventSchema, type MainThreadEventInput } from "../../turnEvents";
+import { withEventSchema, type MainThreadEventInput, type MainThreadProgressUpdate } from "../../turnEvents";
 import { extractPrimaryUserRequestText, extractTurnInputContextSignalsFromMessages, type TurnInputContextSignals } from "../../turnIntake";
+import { collectCanonicalTurnUserContext } from "../../turnContext";
+import { readHarnessRunMarker } from "../../harnessCrashTelemetry";
+import { markerBelongsToTurn, markerContinuesLogicalTurn, resolveRuntimeRunIdentity } from "../../runIdentity";
 import { buildTaskTargetingProfile, type TaskOrchestratorPhase, type TaskTargetingProfile } from "../../taskTargeting";
 import {
   isUnityCommandDirective,
@@ -55,9 +58,14 @@ export interface AgentLoopRuntimeState {
 export interface TurnEventEmitter {
   eventThreadId: string;
   eventTurnId: string;
+  eventRunId: string;
+  eventParentRunId: string | null;
+  eventGoalSliceId?: string;
+  eventContinuesTurn: boolean;
   emitTurnEvent: (event: MainThreadEventInput) => void;
   emitTurnCompletedEvent: () => void;
   emitTurnFailedEvent: (message: string) => void;
+  emitRunPausedEvent: (reason: string, message: string, progress?: MainThreadProgressUpdate) => boolean;
 }
 
 export interface AgentLoopTurnInputContext {
@@ -160,11 +168,37 @@ export function resolveAgentLoopTurnInputContext(
   runtimeState: AgentLoopRuntimeState,
   callbacks: OrchestratorCallbacks,
 ): AgentLoopTurnInputContext {
+  const sessionKey = callbacks.getSessionKey() || "default";
+  const turnId = callbacks.getCurrentTurnId?.() || "";
+  const marker = readHarnessRunMarker();
+  const turnStartMessageIndex = turnId && markerBelongsToTurn(marker, sessionKey, turnId)
+    ? marker?.turnStartMessageIndex ?? null
+    : null;
+  const canonicalUserContext = collectCanonicalTurnUserContext({
+    messages: runtimeState.initialMessages,
+    turnStartMessageIndex,
+  });
   const latestUserPrompt = [...runtimeState.initialMessages]
     .reverse()
     .find((message) => message.role === "user");
   const latestUserPromptFullText = latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "";
-  const latestUserPromptText = extractPrimaryUserRequestText(latestUserPromptFullText) || latestUserPromptFullText;
+  const latestUserPromptText = canonicalUserContext.texts.join("\n\n") ||
+    extractPrimaryUserRequestText(latestUserPromptFullText) ||
+    latestUserPromptFullText;
+  logAgentEvent("turn_context_sources", {
+    sessionKey,
+    turnId: turnId || null,
+    runId: marker?.runId || null,
+    parentRunId: marker?.parentRunId || null,
+    source: canonicalUserContext.source,
+    turnStartMessageIndex: canonicalUserContext.turnStartMessageIndex,
+    canonicalUserMessageCount: canonicalUserContext.texts.length,
+    canonicalUserChars: canonicalUserContext.texts.reduce((total, text) => total + text.length, 0),
+    inspectedUserMessages: canonicalUserContext.inspectedUserMessages,
+    filteredSyntheticMessages: canonicalUserContext.filteredSyntheticMessages,
+    durableMessageCount: runtimeState.initialMessages.length,
+    durableContextPreserved: true,
+  });
   const repairExecutionRequestInChat =
     runtimeState.workflowMode === "chat" && looksLikeRepairExecutionRequest(latestUserPromptText);
   const turnInputContextSignals = extractTurnInputContextSignalsFromMessages(runtimeState.initialMessages);
@@ -559,12 +593,70 @@ export function startModelProbeForTurn(settings: StreamSettings): void {
 export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEventEmitter {
   const eventThreadId = callbacks.getSessionKey() || "default";
   const eventTurnId = callbacks.getCurrentTurnId?.() || generateId();
+  const marker = readHarnessRunMarker();
+  const goalTurnContract = callbacks.getGoalTurnContract?.() as ({ goalSliceId?: string | null } | null | undefined);
+  const runIdentity = resolveRuntimeRunIdentity({
+    marker,
+    sessionKey: eventThreadId,
+    turnId: eventTurnId,
+    fallbackRunId: `run-event-${generateId()}`,
+    goalSliceId: goalTurnContract?.goalSliceId,
+  });
+  const eventContinuesTurn = markerContinuesLogicalTurn({
+    marker,
+    sessionKey: eventThreadId,
+    turnId: eventTurnId,
+    goalSliceId: goalTurnContract?.goalSliceId,
+  });
+  const initialRunEventIdentity = {
+    runId: runIdentity.runId,
+    parentRunId: runIdentity.parentRunId,
+    ...(runIdentity.goalSliceId ? { goalSliceId: runIdentity.goalSliceId } : {}),
+  };
+  const resolveRunEventIdentity = () => {
+    const current = callbacks.getCurrentRunIdentity?.();
+    if (!current?.runId) return initialRunEventIdentity;
+    return {
+      runId: current.runId,
+      parentRunId: current.parentRunId || null,
+      ...(current.goalSliceId ? { goalSliceId: current.goalSliceId } : {}),
+    };
+  };
   let turnEventTerminalEmitted = false;
+  let runTerminalEmitted = false;
   const emitTurnEvent = (event: MainThreadEventInput): void => {
+    if (
+      event.type === "run.paused" ||
+      event.type === "run.completed" ||
+      event.type === "run.failed"
+    ) {
+      runTerminalEmitted = true;
+    }
     callbacks.onTurnEvent?.(withEventSchema(event));
   };
+  Object.defineProperty(emitTurnEvent, "runIdentity", {
+    configurable: false,
+    enumerable: true,
+    get: resolveRunEventIdentity,
+  });
   const emitTurnCompletedEvent = () => {
     if (turnEventTerminalEmitted) return;
+    if (!runTerminalEmitted) {
+      const runEventIdentity = resolveRunEventIdentity();
+      runTerminalEmitted = true;
+      emitTurnEvent({
+        type: "run.completed",
+        threadId: eventThreadId,
+        turnId: eventTurnId,
+        timestampMs: Date.now(),
+        ...runEventIdentity,
+      });
+    }
+    // Goal slices are child runs of one long-lived logical turn. The outer
+    // Goal runtime alone decides whether evidence is sufficient to terminate
+    // that turn; a locally completed slice must not consume the one terminal
+    // turn event before later slices run.
+    if (resolveRunEventIdentity().goalSliceId) return;
     turnEventTerminalEmitted = true;
     emitTurnEvent({
       type: "turn.completed",
@@ -575,6 +667,22 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
   };
   const emitTurnFailedEvent = (message: string) => {
     if (turnEventTerminalEmitted) return;
+    if (!runTerminalEmitted) {
+      const runEventIdentity = resolveRunEventIdentity();
+      runTerminalEmitted = true;
+      emitTurnEvent({
+        type: "run.failed",
+        threadId: eventThreadId,
+        turnId: eventTurnId,
+        timestampMs: Date.now(),
+        error: { message },
+        ...runEventIdentity,
+      });
+    }
+    // Inner Goal failures can be recoverable and may advance to another slice.
+    // Preserve the run.failed evidence, but defer turn.failed to the outer
+    // Goal state machine.
+    if (resolveRunEventIdentity().goalSliceId) return;
     turnEventTerminalEmitted = true;
     emitTurnEvent({
       type: "turn.failed",
@@ -584,12 +692,50 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
       error: { message },
     });
   };
+  const emitRunPausedEvent = (
+    reason: string,
+    message: string,
+    progress?: MainThreadProgressUpdate,
+  ) => {
+    if (runTerminalEmitted) return false;
+    const runEventIdentity = resolveRunEventIdentity();
+    runTerminalEmitted = true;
+    emitTurnEvent({
+      type: "run.paused",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+      reason,
+      message,
+      ...(progress ? { progress } : {}),
+      ...runEventIdentity,
+    });
+    return true;
+  };
+  if (runIdentity.goalSliceId) {
+    callbacks.onHarnessRunUpdate?.({ lastGoalSliceRunId: runIdentity.runId });
+  }
+  logAgentEvent("run_identity_resolved", {
+    threadId: eventThreadId,
+    turnId: eventTurnId,
+    runId: runIdentity.runId,
+    parentRunId: runIdentity.parentRunId,
+    outerRunId: runIdentity.outerRunId,
+    goalSliceId: runIdentity.goalSliceId || null,
+    continuesTurn: eventContinuesTurn,
+    source: runIdentity.source,
+  });
   return {
     eventThreadId,
     eventTurnId,
+    eventRunId: initialRunEventIdentity.runId,
+    eventParentRunId: initialRunEventIdentity.parentRunId,
+    ...(initialRunEventIdentity.goalSliceId ? { eventGoalSliceId: initialRunEventIdentity.goalSliceId } : {}),
+    eventContinuesTurn,
     emitTurnEvent,
     emitTurnCompletedEvent,
     emitTurnFailedEvent,
+    emitRunPausedEvent,
   };
 }
 
@@ -609,18 +755,39 @@ export function emitInitialTurnPreparationEvents(input: {
     turnIntent,
     workflowMode,
   } = runtimeState;
-  const { eventThreadId, eventTurnId, emitTurnEvent } = turnEvents;
+  const {
+    eventThreadId,
+    eventTurnId,
+    eventRunId,
+    eventParentRunId,
+    eventGoalSliceId,
+    eventContinuesTurn,
+    emitTurnEvent,
+  } = turnEvents;
 
+  if (!eventContinuesTurn) {
+    if (!callbacks.hasRuntimeThreadStarted?.(eventThreadId)) {
+      emitTurnEvent({
+        type: "thread.started",
+        threadId: eventThreadId,
+        timestampMs: Date.now(),
+      });
+    }
+    emitTurnEvent({
+      type: "turn.started",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+    });
+  }
   emitTurnEvent({
-    type: "thread.started",
-    threadId: eventThreadId,
-    timestampMs: Date.now(),
-  });
-  emitTurnEvent({
-    type: "turn.started",
+    type: "run.started",
     threadId: eventThreadId,
     turnId: eventTurnId,
     timestampMs: Date.now(),
+    runId: eventRunId,
+    parentRunId: eventParentRunId,
+    ...(eventGoalSliceId ? { goalSliceId: eventGoalSliceId } : {}),
   });
   if (turnIntent !== "respond" && turnIntent !== "discuss") {
     const language = callbacks.getPreferredLanguage();

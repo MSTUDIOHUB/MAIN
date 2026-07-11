@@ -1,6 +1,6 @@
 import type { LegacyConversationThread } from "../state/Thread";
 import { type EffectiveTurnContract } from "../../runIntent";
-import { createSystemPromptApplier, createTaskTargetingRuntime, createTurnEventEmitter, emitInitialTurnPreparationEvents, loadAgentLoopHooksConfig, loadAgentLoopResolvedInstructions, prepareAgentLoopRuntimeState, resolveAgentLoopTurnInputContext, runAgentLoopStartHooks, startModelProbeForTurn } from "./turnPreparation";
+import { createSystemPromptApplier, createTaskTargetingRuntime, createTurnEventEmitter, emitInitialTurnPreparationEvents, loadAgentLoopHooksConfig, loadAgentLoopResolvedInstructions, prepareAgentLoopRuntimeState, resolveAgentLoopTurnInputContext, runAgentLoopStartHooks, startModelProbeForTurn, type TurnEventEmitter } from "./turnPreparation";
 import { invokeStreamWithRecoveryForIteration } from "./streamRecovery";
 import { prepareAgentLoopToolRegistry } from "./toolRegistrySetup";
 import { handleMaxIterationBoundary } from "./maxIterationBoundary";
@@ -29,7 +29,9 @@ const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 export class AgentOrchestrator {
     private sawExecutionEvidence = false;
     private latestTurnContract: EffectiveTurnContract | null = null;
+    private latestRunPauseReason: string | null = null;
     private loopThread: LegacyConversationThread | null = null;
+    private activeTurnEvents: TurnEventEmitter | null = null;
 
     hasExecuteOperationEvidence(): boolean {
         return this.sawExecutionEvidence;
@@ -39,9 +41,18 @@ export class AgentOrchestrator {
         return this.latestTurnContract;
     }
 
+    getLatestRunPauseReason(): string | null {
+        return this.latestRunPauseReason;
+    }
+
+    failActiveRun(message: string): void {
+        this.activeTurnEvents?.emitTurnFailedEvent(message);
+    }
+
     async execute(callbacks: OrchestratorCallbacks, abortController: AbortController) {
         this.sawExecutionEvidence = false;
         this.latestTurnContract = null;
+        this.latestRunPauseReason = null;
         const runtimeState = await prepareAgentLoopRuntimeState(callbacks);
         const {
           config,
@@ -53,13 +64,20 @@ export class AgentOrchestrator {
           workflowMode,
         } = runtimeState;
         const turnEvents = createTurnEventEmitter(callbacks);
+        this.activeTurnEvents = turnEvents;
         const {
           eventThreadId,
           eventTurnId,
           emitTurnEvent,
           emitTurnCompletedEvent,
           emitTurnFailedEvent,
+          emitRunPausedEvent: emitPreparedRunPausedEvent,
         } = turnEvents;
+        const emitRunPausedEvent: typeof emitPreparedRunPausedEvent = (reason, message, progress) => {
+          const emitted = emitPreparedRunPausedEvent(reason, message, progress);
+          if (emitted) this.latestRunPauseReason = reason;
+          return emitted;
+        };
         emitInitialTurnPreparationEvents({
           callbacks,
           runtimeState,
@@ -289,12 +307,14 @@ export class AgentOrchestrator {
         } = loopControl;
         const loopStartRuntimeIntent = resolveRuntimeIntent();
         const loopStartTools = resolveAllToolsForRuntime(loopStartRuntimeIntent);
+        const loopStartTargetingProfile = buildCurrentTaskTargetingProfile();
         loopControl.startLoop({
           runtimeIntent: loopStartRuntimeIntent,
           loopStartTools,
           mcpToolCount: mcpTools.length,
           unityMcpFirstPhaseActive: loopState.unityMcpRuntimeState.firstPhaseActive,
           unityMcpFallbackReason: loopState.unityMcpRuntimeState.fallbackReason,
+          allowRootSkeleton: loopStartTargetingProfile.allowRootSkeleton,
         });
 
         while (loopState.iteration < getEffectiveMaxIterations()) {
@@ -305,6 +325,7 @@ export class AgentOrchestrator {
 
         if (abortController.signal.aborted) {
           callbacks.onStatusChange("idle");
+          emitRunPausedEvent("aborted", "The run was aborted and can be resumed in the same turn.");
           return;
         }
 
@@ -406,9 +427,13 @@ export class AgentOrchestrator {
         });
         snapshotContextLimit = streamInvocation.snapshotContextLimit;
         if (streamInvocation.status === "stopped") {
+          emitRunPausedEvent("stream_stopped", "The model stream stopped before the run reached a terminal turn result.");
           return;
         }
         const streamResult = streamInvocation.streamResult;
+        if (streamResult.usage) {
+          callbacks.onModelUsage?.(streamResult.usage);
+        }
 
         const assistantIterationPhase = await handleAssistantIterationPhase({
           callbacks,
@@ -458,6 +483,10 @@ export class AgentOrchestrator {
         applyAssistantIterationMutableState(loopState, assistantIterationPhase);
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (assistantIterationPhase.status === "stopped") {
+          const pauseReason = workflowMode === "plan" && !callbacks.getIsPlanApproved() && callbacks.getStatus() === "pending_review"
+            ? "plan_review_required"
+            : "assistant_stopped";
+          emitRunPausedEvent(pauseReason, "The assistant run stopped in a resumable state.");
           return;
         }
         if (assistantIterationPhase.status === "continue") {
@@ -533,9 +562,11 @@ export class AgentOrchestrator {
         applyToolIterationMutableState(loopState, toolIterationPhase);
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (toolIterationPhase.status === "aborted") {
+          emitRunPausedEvent("aborted", "The tool run was aborted and can be resumed in the same turn.");
           return;
         }
         if (toolIterationPhase.status === "stopped") {
+          emitRunPausedEvent("tool_loop_stopped", "The tool loop stopped in a resumable state.");
           return;
         }
         if (toolIterationPhase.status === "continue") {
@@ -558,7 +589,7 @@ export class AgentOrchestrator {
             loopState.evidenceRuntimeState.sawExecuteOperationEvidence,
           executeRecoveryMode: loopState.executeRecoveryState.mode,
           emitPlanExecutionProgress,
-          emitTurnCompletedEvent,
+          emitRunPausedEvent,
         });
     }
 }

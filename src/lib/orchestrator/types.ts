@@ -4,7 +4,7 @@ import { type MCPServer, type MCPTool } from "../mcpClient";
 import { type ToolDiffPreview } from "../toolDiff";
 import { type SessionAutoApproveScope, type ToolLifecycleState } from "../runtimeTools";
 import type { AppConfig, Skill } from "../appTypes";
-import { type PlanArtifactRecoveryAction, type PlanExecutionEvidenceEntry, type PlanExecutionProgressUpdate, type PlanTask, type ReplyOption } from "../workflowModels";
+import { type PlanArtifact, type PlanArtifactQualityResult, type PlanArtifactRecoveryAction, type PlanExecutionEvidenceEntry, type PlanExecutionProgressUpdate, type PlanTask, type ReplyOption } from "../workflowModels";
 import type { MainModeKey } from "../mainModes";
 import { type CommandDirective, type ResolvedUserIntent } from "../runIntent";
 import { type ResolvedInstructionSet } from "../instructions";
@@ -80,6 +80,11 @@ export interface OrchestratorCallbacks {
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
   getCurrentTurnId?: () => string | null;
+  getCurrentRunIdentity?: () => {
+    runId: string;
+    parentRunId: string | null;
+    goalSliceId?: string;
+  };
   getSubagentDepth?: () => number;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
@@ -97,6 +102,7 @@ export interface OrchestratorCallbacks {
   getApprovedLocalFileReadPaths: () => string[];
   getAutoApproveToolScopes?: () => SessionAutoApproveScope[];
   getPlanStage: () => "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
+  getPlanArtifacts?: () => PlanArtifact[];
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
   getPlanAutoResumeCount?: () => number;
@@ -110,6 +116,7 @@ export interface OrchestratorCallbacks {
   onProviderCompatibilityFallback?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
+  onModelUsage?: (usage: NonNullable<import("../streaming").StreamResult["usage"]>) => void;
   runSubagent?: (
     request: SpawnSubagentRequest,
     options?: { signal?: AbortSignal },
@@ -157,6 +164,7 @@ export interface OrchestratorCallbacks {
   ) => void;
   onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => void;
   onPlanStageChanged: (stage: "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
+  onPlanApprovalInvalidated?: (reason: string) => void;
   onPlanTasksUpdated: (content: string) => void;
   onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
   onApprovedPlanExecutionStarted?: () => void;
@@ -173,6 +181,7 @@ export interface OrchestratorCallbacks {
     status?: "pending" | "running" | "done" | "failed";
   }) => void;
   onTurnEvent?: (event: MainThreadEvent) => void;
+  hasRuntimeThreadStarted?: (threadId: string) => boolean;
   onHarnessRunUpdate?: (patch: Record<string, unknown>) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
   onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
@@ -276,6 +285,7 @@ export interface PlanMaterializationResultForLoop {
   content?: string;
   reason?: string;
   source?: PlanMaterializationSource;
+  quality?: PlanArtifactQualityResult;
   toolResult?: ToolExecutionResult;
 }
 

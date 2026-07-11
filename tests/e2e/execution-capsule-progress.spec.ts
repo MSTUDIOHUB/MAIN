@@ -41,6 +41,7 @@ test("PlanPanel counts only trusted evidence, not claimed completed checkboxes",
 
 test("ExecutionCapsule keeps approval buttons visible for a long command with plan tasks", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.showPendingToolReviewPrompt?.());
 
   await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("拒绝");
@@ -52,8 +53,71 @@ test("ExecutionCapsule keeps approval buttons visible for a long command with pl
   await expect(page.getByTestId("execution-capsule-current-plan-task")).toHaveCount(0);
 });
 
+type PermissionIdentity = {
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  requestId: string;
+  taskId: number;
+};
+
+async function showExactPendingToolReview(page: Page): Promise<PermissionIdentity> {
+  await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.showPendingToolReviewPrompt?.());
+  const capsule = page.getByTestId("execution-capsule-shell");
+  await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
+  const identity = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.getPendingToolReviewIdentity?.() as PermissionIdentity | null
+  );
+  expect(identity).not.toBeNull();
+  await expect(capsule).toHaveAttribute("data-session-key", identity!.sessionKey);
+  await expect(capsule).toHaveAttribute("data-turn-id", identity!.turnId);
+  await expect(capsule).toHaveAttribute("data-run-id", identity!.runId);
+  await expect(capsule).toHaveAttribute("data-request-id", identity!.requestId);
+  await expect(capsule).toHaveAttribute("data-task-id", String(identity!.taskId));
+  return identity!;
+}
+
+for (const action of ["approve_once", "approve_session", "reject"] as const) {
+  test(`stale ${action} permission identity cannot resolve a replacement request`, async ({ page }) => {
+    const staleIdentity = await showExactPendingToolReview(page);
+    const replacementIdentity = await page.evaluate(() =>
+      (window as any).__CODELY_E2E__?.rotatePendingToolReviewIdentity?.() as PermissionIdentity
+    );
+
+    await page.evaluate(
+      ({ staleAction, identity }) =>
+        (window as any).__CODELY_E2E__?.resolvePendingToolReviewWithIdentity?.(staleAction, identity),
+      { staleAction: action, identity: staleIdentity },
+    );
+
+    await expect.poll(async () => page.evaluate(() => {
+      const bridge = (window as any).__CODELY_E2E__;
+      const snapshot = bridge?.getSnapshot?.();
+      return {
+        pendingReviewTaskId: snapshot?.pendingReviewTaskId ?? null,
+        autoApproveTools: snapshot?.autoApproveTools ?? null,
+        resolvedEvents: (bridge?.events || []).filter((event: { type?: string }) =>
+          event.type === "pending_tool_review_resolved"
+        ).length,
+        identity: bridge?.getPendingToolReviewIdentity?.() ?? null,
+      };
+    })).toEqual({
+      pendingReviewTaskId: replacementIdentity.taskId,
+      autoApproveTools: false,
+      resolvedEvents: 0,
+      identity: replacementIdentity,
+    });
+
+    const capsule = page.getByTestId("execution-capsule-shell");
+    await expect(capsule).toHaveAttribute("data-run-id", replacementIdentity.runId);
+    await expect(capsule).toHaveAttribute("data-request-id", replacementIdentity.requestId);
+  });
+}
+
 test("task tracking popover follows execution evidence order with ring-only current highlight", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.showPendingToolReviewPrompt?.());
 
   await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
   await page.getByTitle("任务跟踪").click();
@@ -103,6 +167,53 @@ test("ExecutionCapsule renders approval controls from pendingToolCall when the p
     .toBeNull();
 });
 
+async function prepareFormalPlanReview(
+  page: Page,
+  options: { runId?: string; requestId?: string; reset?: boolean } = {},
+) {
+  const runId = options.runId || "run-e2e-plan-review";
+  const requestId = options.requestId || "request-e2e-plan-review";
+  await page.evaluate(
+    ({ nextRunId, nextRequestId }) => (window as any).__CODELY_E2E__?.setExecutionCapsuleIdentity?.(
+      nextRunId,
+      nextRequestId,
+    ),
+    { nextRunId: runId, nextRequestId: requestId },
+  );
+  if (options.reset !== false) {
+    await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+  }
+
+  await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
+  await expect(page.getByTestId("plan-review-panel")).toBeVisible();
+  await expect(page.getByTestId("plan-approve-button")).toBeVisible();
+}
+
+test("Plan review stays in PlanPanel while preserving its runtime identity", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await prepareFormalPlanReview(page, {
+    runId: "run-e2e-plan-review",
+    requestId: "request-e2e-plan-review",
+    reset: false,
+  });
+
+  await expect(page.getByTestId("plan-review-panel")).toContainText("ExecutionCapsule 面板稳定回归");
+  await expect
+    .poll(async () => page.evaluate(() => {
+      const event = [...((window as any).__CODELY_E2E__?.events || [])]
+        .reverse()
+        .find((item: { type?: string }) => item.type === "execution_capsule_identity");
+      return event
+        ? { runId: event.runId, requestId: event.requestId, turnId: event.turnId }
+        : null;
+    }))
+    .toEqual({
+      runId: "run-e2e-plan-review",
+      requestId: "request-e2e-plan-review",
+      turnId: "e2e-execution-capsule-panel-stability-turn",
+    });
+});
+
 const panelModes = ["plan", "diff", "terminal", "closed"] as const;
 
 async function getPanelSnapshot(page: Page) {
@@ -116,15 +227,20 @@ async function getPanelSnapshot(page: Page) {
 }
 
 for (const mode of panelModes) {
-  test(`ExecutionCapsule plan approval preserves right panel state: ${mode}`, async ({ page }) => {
+  test(`PlanPanel approval preserves panel state after opening from: ${mode}`, async ({ page }) => {
     await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+    await prepareFormalPlanReview(page);
     await page.evaluate((nextMode) => (window as any).__CODELY_E2E__?.setPanelMode?.(nextMode), mode);
-    await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+    if (mode !== "plan") {
+      await page.getByTestId("top-plan-panel-button").click();
+    }
 
-    await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
+    await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
+    await expect(page.getByTestId("plan-review-panel")).toBeVisible();
+    await expect(page.getByTestId("plan-approve-button")).toBeVisible();
     const before = await getPanelSnapshot(page);
 
-    await page.getByTestId("execution-capsule-plan-approve").click();
+    await page.getByTestId("plan-approve-button").click();
     await expect.poll(async () => (
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().isPlanApproved ?? false)
     )).toBe(true);
@@ -149,13 +265,16 @@ for (const mode of panelModes) {
   });
 }
 
-test("double-clicking plan approval does not create a queued instruction", async ({ page }) => {
+test("double-clicking PlanPanel approval does not create a queued instruction", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+  await prepareFormalPlanReview(page);
 
-  const approve = page.getByTestId("execution-capsule-plan-approve");
+  const approve = page.getByTestId("plan-approve-button");
   await expect(approve).toBeVisible();
-  await approve.dblclick();
+  await approve.evaluate((button) => {
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
 
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().isPlanApproved ?? false))
@@ -196,10 +315,10 @@ test("double-clicking plan approval does not create a queued instruction", async
 
 test("plan approval without a live loop restarts execution on the same conversation turn", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+  await prepareFormalPlanReview(page);
   await page.evaluate(() => (window as any).__CODELY_E2E__?.dropPlanRunOwner?.());
 
-  await page.getByTestId("execution-capsule-plan-approve").click();
+  await page.getByTestId("plan-approve-button").click();
 
   await expect
     .poll(async () => page.evaluate(() => {
@@ -261,11 +380,11 @@ test("busy plan resume queues the visible request without replacing the active o
 
 test("failed same-turn execution submission rolls back the started marker and preserves a retry checkpoint", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
-  await page.evaluate(() => (window as any).__CODELY_E2E__?.resetPlanApprovalPrompt?.());
+  await prepareFormalPlanReview(page);
   await page.evaluate(() => (window as any).__CODELY_E2E__?.dropPlanRunOwner?.());
   await page.evaluate(() => (window as any).__CODELY_E2E__?.failNextPlanExecutionSubmission?.());
 
-  await page.getByTestId("execution-capsule-plan-approve").click();
+  await page.getByTestId("plan-approve-button").click();
 
   await expect
     .poll(async () => page.evaluate(() => {
@@ -327,8 +446,10 @@ test("ExecutionCapsule appears for pending review but not pure running progress"
 test("plan UI accents follow a non-purple theme across appearance modes", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
   await page.evaluate(() => (window as any).__CODELY_E2E__?.setTheme?.("green"));
+  await prepareFormalPlanReview(page);
 
-  await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
+  await expect(page.getByTestId("plan-approve-button")).toBeVisible();
   await expect(page.locator("blockquote.theme-plan-surface").first()).toBeVisible();
 
   for (const mode of ["light", "dark", "black"] as const) {
@@ -338,11 +459,10 @@ test("plan UI accents follow a non-purple theme across appearance modes", async 
     )).toBe(mode);
 
     const styles = await page.evaluate(() => {
-      const appRoot = document.querySelector<HTMLElement>("[style*='--accent']");
       const planSurface = document.querySelector<HTMLElement>(".theme-plan-surface");
       const quote = document.querySelector<HTMLElement>("blockquote.theme-plan-surface");
-      const primary = document.querySelector<HTMLElement>("[data-testid='execution-capsule-plan-approve']");
-      const rootStyle = appRoot ? getComputedStyle(appRoot) : null;
+      const primary = document.querySelector<HTMLElement>("[data-testid='plan-approve-button']");
+      const rootStyle = getComputedStyle(document.documentElement);
       return {
         accent: rootStyle?.getPropertyValue("--accent").trim() || "",
         contrast: rootStyle?.getPropertyValue("--accent-contrast").trim() || "",

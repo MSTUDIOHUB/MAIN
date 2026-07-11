@@ -36,6 +36,7 @@ import type { ProviderReasoningForHistory } from "./assistantResponseProcessing"
 import type { AgentLoopEvidenceRuntimeState } from "./evidenceRuntimeState";
 import { setLastAssistantTextForCheckpointRuntimeState } from "./evidenceRuntimeState";
 import type { AgentLoopNoToolRuntimeState } from "./noToolRuntimeState";
+import { shouldAdvancePlanFromStructureOnTargetedRead } from "../../planRuntime";
 import {
   incrementConsecutiveNoToolRuntimeState,
   resetConsecutiveNoToolRuntimeState,
@@ -331,6 +332,23 @@ export function handleAssistantOutputPhase(input: {
       preservedVisibleText: visibleAssistantText.trim().length > 0,
       planRuntimePhase: planRuntimeState.planRuntimePhase,
     });
+    if (shouldAdvancePlanFromStructureOnTargetedRead({
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      planRuntimePhase: planRuntimeState.planRuntimePhase,
+      requestedToolNames: unsupportedToolCalls.map((call) => call.name),
+    })) {
+      setPlanRuntimePhaseAndSync(
+        "grounding",
+        "targeted read requested before the structure pass",
+      );
+      logAgentEvent("plan_structure_phase_advanced_for_targeted_read", {
+        iteration,
+        requestedToolNames: unsupportedToolCalls.map((call) => call.name).slice(0, 8),
+        previousPhase: "explore_structure",
+        nextPhase: "grounding",
+      });
+    }
   }
 
   const toolProtocolStreamClear = resolveToolProtocolStreamClearDecision({

@@ -179,12 +179,36 @@ test("loop control startLoop moves unapproved plan turns into explore phase", ()
     mcpToolCount: 0,
     unityMcpFirstPhaseActive: false,
     unityMcpFallbackReason: null,
+    allowRootSkeleton: true,
   });
 
   assert.equal(progress.length, 0);
   assert.deepEqual(phases.at(-1), {
     phase: "explore_structure",
-    reason: "start",
+    reason: "start with shallow project structure",
+    status: undefined,
+  });
+});
+
+test("loop control skips root exploration when task targeting already has a scoped target", () => {
+  const { control, phases } = createControl({
+    callbacks: {
+      getIsPlanApproved: () => false,
+    },
+  });
+
+  control.startLoop({
+    runtimeIntent: "plan",
+    loopStartTools: [],
+    mcpToolCount: 0,
+    unityMcpFirstPhaseActive: false,
+    unityMcpFallbackReason: null,
+    allowRootSkeleton: false,
+  });
+
+  assert.deepEqual(phases.at(-1), {
+    phase: "grounding",
+    reason: "start with targeted grounding",
     status: undefined,
   });
 });

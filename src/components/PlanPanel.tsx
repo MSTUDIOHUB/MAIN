@@ -2,8 +2,14 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import MarkdownRenderer from "./MarkdownRenderer";
 import { IconCheck, IconSave } from "./Icons";
 import { buildPlanTaskEvidenceAudit, extractPlanTasks, isPlanConversationTurn, isPlanTaskAwaitingBrowserValidation, isPlanTaskAwaitingExternalValidation, isPlanTaskTrustedComplete, type ConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanStage, type PlanTask } from "../lib/workflowModels";
+import {
+  resolvePlanPresentationBehavior,
+  resolveTurnPresentationLifecycle,
+  type TurnPresentationModel,
+} from "../lib/turnPresentation";
 
 interface PlanPanelProps {
+  presentation?: TurnPresentationModel;
   artifacts: PlanArtifact[];
   tasks: PlanTask[];
   evidenceLedger?: PlanExecutionEvidenceEntry[];
@@ -24,6 +30,7 @@ interface PlanPanelProps {
   onDeletePlanFiles?: () => void;
   onDeleteBrowserValidationFiles?: () => void;
   onContinuePlanning?: () => void;
+  onRequestAdjustment?: (text: string) => void;
   onResumeExecution?: () => void;
   onSaveDocument?: (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => Promise<boolean> | boolean;
   onApprove: () => void;
@@ -40,6 +47,10 @@ const COPY = {
     pendingApproval: "待审批",
     awaitingChoice: "待选择",
     previewReady: "已生成预览",
+    actionRequired: "待处理",
+    paused: "已暂停",
+    stopped: "未执行",
+    failed: "失败",
     taskProgress: "任务进度",
     retained: "保留记录",
     completed: "完成",
@@ -53,6 +64,8 @@ const COPY = {
     deletePlanFiles: "删除计划文件",
     deleteBrowserValidationFiles: "清理验证截图",
     approvePlan: "确认方案并继续执行",
+    adjustPlanPlaceholder: "说明需要如何调整，或提出其他要求",
+    submitAdjustment: "提交意见",
     continuePlanning: "继续生成正式计划",
     resumeExecution: "继续执行剩余任务",
     saveDocument: "保存当前文档",
@@ -72,6 +85,9 @@ const COPY = {
     helperIdle: "切换到 Plan 模式后，Agent 会先在 .MAIN/plans 中生成规划文件（可以是工程方案，也可以是分析方案），并在这里展示审批与执行进展。",
     helperExecuting: "执行阶段会尽量保持任务列表和计划文档同步更新。",
     helperCompleted: "计划执行完成。这里会保留摘要与任务状态，聊天区也可以继续查看完整过程。",
+    helperActionRequired: "当前运行停在一个用户操作边界，但没有匹配到本计划的审批或选择请求。请返回所属回合处理该检查点。",
+    helperNoAction: "本次计划运行已经结束，但没有进入执行。可以保留或清理计划文件后继续对话。",
+    helperFailed: "计划运行失败。错误与检查点已保留，请先核对失败原因，再决定是否重新规划。",
     helperDefault: "计划文档和任务进度会优先显示在右侧，聊天区只保留结论与摘要。",
     temporaryWorkspaceHint: "当前在“聊天”里，文档已暂存到临时 .tmp 文件夹。请先保存到本地路径，再选择对应文件夹继续操作。",
     stage: {
@@ -94,6 +110,10 @@ const COPY = {
     pendingApproval: "Awaiting Approval",
     awaitingChoice: "Awaiting Choice",
     previewReady: "Preview Ready",
+    actionRequired: "Action Required",
+    paused: "Paused",
+    stopped: "No Action",
+    failed: "Failed",
     taskProgress: "Task Progress",
     retained: "Retained",
     completed: "Done",
@@ -107,6 +127,8 @@ const COPY = {
     deletePlanFiles: "Delete Plan Files",
     deleteBrowserValidationFiles: "Clear Validation Shots",
     approvePlan: "Approve Plan And Continue",
+    adjustPlanPlaceholder: "Describe changes or add another requirement",
+    submitAdjustment: "Submit Feedback",
     continuePlanning: "Continue Planning",
     resumeExecution: "Resume Execution",
     saveDocument: "Save Current Doc",
@@ -126,6 +148,9 @@ const COPY = {
     helperIdle: "In Plan mode, the agent will first generate planning files in .MAIN/plans, whether they are engineering specs or analysis-plan documents, and then show review and execution progress here.",
     helperExecuting: "During execution, the task list and plan documents will stay in sync as much as possible.",
     helperCompleted: "Plan execution is complete. This panel keeps the summary and task state while the chat still shows the full process.",
+    helperActionRequired: "The run is waiting at a user boundary, but no matching Plan review or choice request owns this panel. Handle the checkpoint in its original turn.",
+    helperNoAction: "This planning run ended without entering execution. You can keep or clear the plan files before continuing.",
+    helperFailed: "The planning run failed. Its error and checkpoint are preserved; review the cause before planning again.",
     helperDefault: "Plan documents and task progress are prioritized on the right, while chat keeps only the conclusion and summary.",
     temporaryWorkspaceHint: "These docs are currently stored in a temporary .tmp chat folder. Save them to a local path, then continue from that folder.",
     stage: {
@@ -158,6 +183,7 @@ function getStageTone(stage: PlanStage): string {
 }
 
 export default function PlanPanel({
+  presentation,
   artifacts,
   tasks,
   evidenceLedger = [],
@@ -178,6 +204,7 @@ export default function PlanPanel({
   onDeletePlanFiles,
   onDeleteBrowserValidationFiles,
   onContinuePlanning,
+  onRequestAdjustment,
   onResumeExecution,
   onSaveDocument,
   onApprove,
@@ -188,6 +215,7 @@ export default function PlanPanel({
   const [activeArtifactPath, setActiveArtifactPath] = useState<string>(artifacts[artifacts.length - 1]?.path || "");
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [isApproving, setIsApproving] = useState(false);
+  const [adjustmentText, setAdjustmentText] = useState("");
   const approvingRef = useRef(false);
 
   useEffect(() => {
@@ -233,28 +261,74 @@ export default function PlanPanel({
   const progressPct = taskAudit.totalCount > 0 ? Math.round((doneCount / taskAudit.totalCount) * 100) : 0;
   const activeTurn = [...turns].reverse().find((turn) => isPlanConversationTurn(turn)) || turns[turns.length - 1];
   const showTaskProgress = (isApproved || stage === "executing" || stage === "completed") && auditedTasks.length > 0;
-  const stageLabel = isAwaitingApproval
+  const legacyLifecycle = resolveTurnPresentationLifecycle(
+    isAwaitingApproval
+      ? "awaiting_approval"
+      : isAwaitingInput
+      ? "awaiting_input"
+      : canContinuePlanning || canResumeExecution
+      ? "paused"
+      : stage === "completed"
+      ? "done"
+      : stage === "executing"
+      ? "executing"
+      : "planning",
+  );
+  const presentationBehavior = resolvePlanPresentationBehavior({
+    lifecycle: presentation?.lifecycle || legacyLifecycle,
+    actionKind: presentation?.actionKind || (
+      !presentation && isAwaitingApproval
+        ? "plan_review"
+        : !presentation && isAwaitingInput
+        ? "user_choice"
+        : undefined
+    ),
+    canApproveExecution,
+    canContinuePlanning,
+    canResumeExecution,
+  });
+  const stageLabel = presentationBehavior.mode === "review"
     ? copy.pendingApproval
-    : isAwaitingInput
+    : presentationBehavior.mode === "choice"
     ? copy.awaitingChoice
+    : presentationBehavior.mode === "action_required"
+    ? copy.actionRequired
+    : presentationBehavior.mode === "resumable"
+    ? copy.paused
+    : presentationBehavior.mode === "success"
+    ? copy.stage.completed
+    : presentationBehavior.mode === "no_action"
+    ? copy.stopped
+    : presentationBehavior.mode === "failed"
+    ? copy.failed
     : stage === "idle" && previewMarkdown
     ? copy.previewReady
     : copy.stage[stage];
-  const stageTone = isAwaitingApproval
+  const stageTone = presentationBehavior.mode === "failed"
+    ? getStageTone("bugfix")
+    : presentationBehavior.mode === "success"
+    ? getStageTone("completed")
+    : presentationBehavior.mode === "review" ||
+      presentationBehavior.mode === "choice" ||
+      presentationBehavior.mode === "action_required" ||
+      presentationBehavior.mode === "resumable"
     ? getStageTone("ready_to_execute")
-    : isAwaitingInput
-    ? getStageTone("ready_to_execute")
-    : stage === "idle" && previewMarkdown
+    : presentationBehavior.mode === "no_action" || (stage === "idle" && previewMarkdown)
     ? getStageTone("design")
     : getStageTone(stage);
 
   const helperText = useMemo(() => {
-    if (isAwaitingApproval) {
+    if (presentationBehavior.mode === "review") {
       return copy.helperApproval;
     }
-    if (isAwaitingInput) {
+    if (presentationBehavior.mode === "choice") {
       return copy.helperChoice;
     }
+    if (presentationBehavior.mode === "action_required") return copy.helperActionRequired;
+    if (presentationBehavior.mode === "resumable") return copy.pausedExecutionHint;
+    if (presentationBehavior.mode === "success") return copy.helperCompleted;
+    if (presentationBehavior.mode === "no_action") return copy.helperNoAction;
+    if (presentationBehavior.mode === "failed") return copy.helperFailed;
     if (stage === "idle" && previewMarkdown) {
       return copy.helperIdlePreview;
     }
@@ -268,7 +342,7 @@ export default function PlanPanel({
       return copy.helperCompleted;
     }
     return copy.helperDefault;
-  }, [copy, isAwaitingApproval, isAwaitingInput, previewMarkdown, stage]);
+  }, [copy, presentationBehavior.mode, previewMarkdown, stage]);
 
   const currentDocument = activeArtifact
     ? {
@@ -317,7 +391,16 @@ export default function PlanPanel({
       : "border-[#3f3f46] bg-[#09090b] text-[#d4d4d8] hover:bg-[#18181b] hover:text-[#f5f5f5]";
 
   return (
-    <div className="flex h-full flex-col bg-[#050505]">
+    <div
+      data-testid="plan-review-panel"
+      data-turn-id={presentation?.turnId}
+      data-run-id={presentation?.runId}
+      data-request-id={presentation?.requestId}
+      data-turn-lifecycle={presentation?.lifecycle}
+      data-action-kind={presentation?.actionKind}
+      data-plan-presentation={presentationBehavior.mode}
+      className="plan-review-panel flex h-full flex-col bg-[#050505]"
+    >
       <div className="border-b border-[#27272a] px-4 py-3 bg-[#09090b]">
         <div className="flex items-start justify-between gap-3">
           <div>
@@ -488,51 +571,89 @@ export default function PlanPanel({
         </div>
       ) : (
         <div className="flex flex-1 items-center justify-center px-8 text-center text-[13px] leading-relaxed text-[#71717a]">
-          {isAwaitingApproval
+          {presentationBehavior.mode === "review"
             ? copy.waitingPlanHint
-            : isAwaitingInput
+            : presentationBehavior.mode === "choice"
             ? copy.waitingChoiceHint
             : copy.emptyHint}
         </div>
       )}
 
-      {(!hideIslandOwnedSections || canResumeExecution) && (isAwaitingApproval || isAwaitingInput || canApproveExecution || canContinuePlanning || canResumeExecution || isApproved || ((artifacts.length > 0 || previewMarkdown) && !isApproved && !canApproveExecution)) && (
-        <div className="border-t border-[#18181b] bg-[#09090b] px-4 py-3">
-          {canApproveExecution ? (
-            <div className="flex items-center justify-between gap-3">
-              <div className="text-[11px] leading-relaxed text-[#71717a]">
-                {copy.savePlanHint}
-              </div>
-              <div className="flex flex-wrap items-center justify-end gap-3">
-                <button
-                  data-testid="plan-reject-button"
-                  onClick={onReject}
-                  className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+      {(!hideIslandOwnedSections || presentationBehavior.showResumeExecution) && (
+        presentationBehavior.mode === "review" ||
+        presentationBehavior.mode === "choice" ||
+        presentationBehavior.showContinuePlanning ||
+        presentationBehavior.showResumeExecution ||
+        isApproved ||
+        ((artifacts.length > 0 || previewMarkdown) && !isApproved)
+      ) && (
+        <div className="plan-review-footer border-t border-[#18181b] bg-[#09090b] px-4 py-3">
+          {presentationBehavior.showReviewActions ? (
+            <div data-testid="plan-review-actions" className="space-y-3">
+              {onRequestAdjustment && (
+                <form
+                  data-testid="plan-adjust-form"
+                  className="flex min-w-0 items-center gap-2"
+                  onSubmit={(event) => {
+                    event.preventDefault();
+                    const text = adjustmentText.trim();
+                    if (!text) return;
+                    onRequestAdjustment(text);
+                    setAdjustmentText("");
+                  }}
                 >
-                  {copy.rejectAndKeepPlan}
-                </button>
-                {artifacts.length > 0 && onRejectAndDelete && (
+                  <input
+                    data-testid="plan-adjust-input"
+                    value={adjustmentText}
+                    onChange={(event) => setAdjustmentText(event.target.value)}
+                    placeholder={copy.adjustPlanPlaceholder}
+                    className="min-w-0 flex-1 rounded-lg border border-[#27272a] bg-[#050507] px-3 py-2 text-[12px] text-[#e4e4e7] outline-none transition-colors placeholder:text-[#71717a] focus:border-[var(--accent)]"
+                  />
                   <button
-                    data-testid="plan-reject-delete-button"
-                    onClick={onRejectAndDelete}
-                    className="rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
+                    data-testid="plan-adjust-submit"
+                    type="submit"
+                    disabled={!adjustmentText.trim()}
+                    className="theme-plan-button shrink-0 rounded-lg border px-3 py-2 text-[12px] font-semibold disabled:cursor-not-allowed disabled:opacity-40"
                   >
-                    {copy.rejectAndDeletePlan}
+                    {copy.submitAdjustment}
                   </button>
-                )}
-                <button
-                  data-testid="plan-approve-button"
-                  onClick={handleApprove}
-                  disabled={isApproving || isApproved}
-                  className={`theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold ${
-                    (isApproving || isApproved) ? "opacity-50 cursor-not-allowed" : ""
-                  }`}
-                >
-                  {copy.approvePlan}
-                </button>
+                </form>
+              )}
+              <div className="plan-review-action-row flex items-center justify-between gap-3">
+                <div className="text-[11px] leading-relaxed text-[#71717a]">
+                  {copy.savePlanHint}
+                </div>
+                <div className="plan-review-button-group flex flex-wrap items-center justify-end gap-3">
+                  <button
+                    data-testid="plan-reject-button"
+                    onClick={onReject}
+                    className="rounded-lg border border-[#3f3f46] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#a1a1aa] transition-colors hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                  >
+                    {copy.rejectAndKeepPlan}
+                  </button>
+                  {artifacts.length > 0 && onRejectAndDelete && (
+                    <button
+                      data-testid="plan-reject-delete-button"
+                      onClick={onRejectAndDelete}
+                      className="rounded-lg border border-[rgba(244,63,94,0.35)] bg-[#09090b] px-4 py-2 text-[12px] font-medium text-[#fb7185] transition-colors hover:bg-[rgba(244,63,94,0.12)] hover:text-[#fecdd3]"
+                    >
+                      {copy.rejectAndDeletePlan}
+                    </button>
+                  )}
+                  <button
+                    data-testid="plan-approve-button"
+                    onClick={handleApprove}
+                    disabled={isApproving || isApproved}
+                    className={`theme-plan-primary rounded-lg px-4 py-2 text-[12px] font-semibold ${
+                      (isApproving || isApproved) ? "opacity-50 cursor-not-allowed" : ""
+                    }`}
+                  >
+                    {copy.approvePlan}
+                  </button>
+                </div>
               </div>
             </div>
-          ) : isAwaitingInput ? (
+          ) : presentationBehavior.showChoiceCheckpoint ? (
             <div className="flex items-center justify-between gap-3">
               <div className="text-[11px] leading-relaxed text-[#71717a]">
                 {copy.waitingChoiceHint}
@@ -546,7 +667,7 @@ export default function PlanPanel({
                 </button>
               )}
             </div>
-          ) : canContinuePlanning && onContinuePlanning ? (
+          ) : presentationBehavior.showContinuePlanning && onContinuePlanning ? (
             <div className="flex flex-wrap items-center justify-end gap-3">
               {artifacts.length > 0 && onDeletePlanFiles && (
                 <button
@@ -577,7 +698,7 @@ export default function PlanPanel({
                 {copy.continuePlanning}
               </button>
             </div>
-          ) : canResumeExecution && onResumeExecution ? (
+          ) : presentationBehavior.showResumeExecution && onResumeExecution ? (
             <div className="flex items-center justify-between gap-3">
               <div className="text-[11px] leading-relaxed text-[#71717a]">
                 {copy.pausedExecutionHint}
@@ -593,7 +714,7 @@ export default function PlanPanel({
           ) : !isApproved ? (
             <div className="flex items-center justify-between gap-3">
               <div className="text-[11px] leading-relaxed text-[#71717a]">
-                {canApproveExecution ? copy.savePlanHint : copy.generatingFooter}
+                  {presentationBehavior.mode === "review" ? copy.savePlanHint : helperText}
               </div>
               {artifacts.length > 0 && onDeletePlanFiles && (
                 <button

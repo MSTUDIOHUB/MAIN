@@ -169,6 +169,52 @@ test("plan review pause rejects a persisted quality-rejected artifact", async ()
   assert.deepEqual(events, []);
 });
 
+test("plan review cannot open from a stale stage without a materialized artifact", async () => {
+  const { events, handlers } = createHandlers({
+    callbacks: {
+      getPlanStage: () => "design",
+      getPlanArtifacts: () => [],
+    },
+  });
+
+  assert.equal(
+    await handlers.pauseForReviewablePlanArtifact("stale_stage"),
+    "not_reviewable",
+  );
+  assert.deepEqual(events, []);
+});
+
+test("plan approval is rejected when the reviewed artifact changes before execution", async () => {
+  let approved = false;
+  let artifactContent = "# Plan\n\n- Change A";
+  const { handlers } = createHandlers({
+    onStatusObserved: (status) => {
+      if (status !== "pending_review") return;
+      artifactContent = "# Plan\n\n- Change B";
+      approved = true;
+    },
+    callbacks: {
+      getIsPlanApproved: () => approved,
+      getPlanStage: () => "plan",
+      getPlanArtifacts: () => [{
+        kind: "plan",
+        path: ".MAIN/plans/plan.md",
+        title: "Plan",
+        content: artifactContent,
+        revision: artifactContent.endsWith("B") ? 2 : 1,
+        updatedAt: 1,
+      }],
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+    },
+  });
+
+  assert.equal(
+    await handlers.pauseForReviewablePlanArtifact("artifact_changed"),
+    "stopped",
+  );
+});
+
 test("an accepted rewrite can enter review with the current tool-phase quality state", async () => {
   const { abortController, events, handlers } = createHandlers({
     // This deliberately models the outer loop before the tool phase has been
@@ -192,8 +238,7 @@ test("an accepted rewrite can enter review with the current tool-phase quality s
   assert.equal(events.some((event) => event.type === "phase" && event.phase === "review_ready"), true);
 });
 
-test("plan approval continues in the same loop, preserves its owner, and reopens the initial source read", async () => {
-  let approved = false;
+test("plan review pauses the current run and the approved child run reopens the initial source read", async () => {
   const trace = [];
   const lifecycle = [];
   const appendedMessages = [];
@@ -213,7 +258,7 @@ test("plan approval continues in the same loop, preserves its owner, and reopens
     recentPlanToolActivity,
     onStatusObserved: (status) => lifecycle.push(`status:${status}`),
     callbacks: {
-      getIsPlanApproved: () => approved,
+      getIsPlanApproved: () => false,
       getPlanStage: () => "design",
       getPreferredLanguage: () => "en",
       getPlanApprovalChoice: () => null,
@@ -229,21 +274,15 @@ test("plan approval continues in the same loop, preserves its owner, and reopens
     },
   });
 
-  const pause = handlers.pauseForReviewablePlanArtifact("test");
-  setTimeout(() => {
-    approved = true;
-  }, 10);
-
-  assert.equal(await pause, "approved_continue");
+  assert.equal(await handlers.pauseForReviewablePlanArtifact("test"), "stopped");
   const pendingIndex = events.findIndex((event) => event.type === "status" && event.status === "pending_review");
   assert.ok(pendingIndex >= 0);
   assert.deepEqual(lifecycle.slice(0, 2), ["status:pending_review", "final"]);
-  assert.deepEqual(trace.slice(0, 3), ["final", "stage:executing", "execution_started"]);
+  assert.deepEqual(trace, ["final"]);
   assert.equal(events.filter((event) => event.type === "status" && event.status === "pending_review").length, 1);
-  assert.equal(events.at(-1).status, "running");
-  assert.equal(recentPlanToolActivity.length, 0);
-  assert.equal(appendedMessages.length, 1);
-  assert.match(appendedMessages[0].content, /EXECUTION MODE/);
+  assert.equal(events.at(-1).status, "pending_review");
+  assert.equal(recentPlanToolActivity.length, 1);
+  assert.equal(appendedMessages.length, 0);
 
   const tools = ["read_file", "apply_patch", "replace_in_file", "write_file", "run_command"].map((name) => ({
     type: "function",

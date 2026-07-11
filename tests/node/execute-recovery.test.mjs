@@ -166,7 +166,7 @@ test("execute no-tool recovery reprompts completion claims without evidence", ()
   assert.equal(harness.stops.length, 0);
 });
 
-test("generic max-iteration boundary emits stop, idle, and completion in order", async () => {
+test("generic max-iteration boundary emits stop, idle, and a resumable run pause in order", async () => {
   const order = [];
   await handleMaxIterationBoundary({
     callbacks: {
@@ -186,13 +186,13 @@ test("generic max-iteration boundary emits stop, idle, and completion in order",
     sawExecuteOperationEvidence: false,
     executeRecoveryMode: "off",
     emitPlanExecutionProgress: () => {},
-    emitTurnCompletedEvent: () => order.push("turn:completed"),
+    emitRunPausedEvent: (reason) => order.push(`run:paused:${reason}`),
   });
 
   assert.deepEqual(order, [
     "stop:no_action:max_iterations_boundary",
     "status:idle",
-    "turn:completed",
+    "run:paused:max_iterations_boundary",
   ]);
 });
 

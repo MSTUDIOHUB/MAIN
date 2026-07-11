@@ -16,7 +16,7 @@ import "@xterm/xterm/css/xterm.css";
 import { save } from "@tauri-apps/plugin-dialog";
 import PlanPanel from "./PlanPanel";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
-import { getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
+import { getE2EQuickReplyHandler, getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
 import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
 import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty, type GitDiffEntry } from "../lib/ipc";
@@ -24,6 +24,12 @@ import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTur
 import { safeConfirmAsync } from "../lib/safeConfirm";
 import SubagentsPanel from "./SubagentsPanel";
 import { projectSubagentRuns, resolveSubagentCapacityPolicy } from "../lib/subagents";
+import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
+import {
+  buildTurnPresentationModel,
+  isPlanActionRequestPresentationEligible,
+  resolvePlanPresentationBehavior,
+} from "../lib/turnPresentation";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -990,6 +996,8 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     selectedDiffTaskId,
     gitDiffPreview,
     runtimeEvents,
+    activeActionRequest,
+    harnessRunMarker,
     selectedSubagentId,
     selectSubagent,
     stopSubagent,
@@ -1020,6 +1028,8 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     selectedDiffTaskId: useAppStore((s) => s.selectedDiffTaskId),
     gitDiffPreview: useAppStore((s) => s.gitDiffPreview),
     runtimeEvents: useAppStore((s) => s.runtimeEvents),
+    activeActionRequest: useAppStore((s) => s.activeActionRequest),
+    harnessRunMarker: useAppStore((s) => s.harnessRunMarker),
     selectedSubagentId: useAppStore((s) => s.selectedSubagentId),
     selectSubagent: useAppStore((s) => s.selectSubagent),
     stopSubagent: useAppStore((s) => s.stopSubagent),
@@ -1044,6 +1054,15 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     () => latestPlanEntry?.turn || [...conversationTurns].reverse().find((turn) => isPlanConversationTurn(turn)) || null,
     [conversationTurns, latestPlanEntry],
   );
+  const hasVisiblePlanChoice = useMemo(
+    () => !!latestPlanTurn && taskFlow.some((block) =>
+      block.turnId === latestPlanTurn.id &&
+      block.type === "agent" &&
+      Array.isArray(block.options) &&
+      block.options.length > 0
+    ),
+    [latestPlanTurn, taskFlow],
+  );
   const changeSummary = useMemo(() => {
     const scopedTaskFlow = latestPlanTurn
       ? taskFlow.filter((block) => block.turnId === latestPlanTurn.id)
@@ -1063,12 +1082,34 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
 
     return "";
   }, [latestPlanEntry]);
-  const hasReviewablePlanArtifact = planArtifacts.some((artifact) =>
-    artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "tasks"
+  const planApprovalIdentity = buildPlanApprovalIdentity(planArtifacts);
+  const activeSessionKey = resolveSessionRuntimeKey(
+    resolveSessionWorkspaceKey(currentWorkspace),
+    currentSessionId,
   );
-  const hasReviewablePlanDraft =
-    hasReviewablePlanArtifact ||
-    fallbackPlanPreview.length > 0;
+  const hasMatchingPlanActionOwner = isPlanActionRequestPresentationEligible({
+    actionKind: activeActionRequest?.kind,
+    requestStatus: activeActionRequest?.status,
+    requestSessionKey: activeActionRequest?.sessionKey,
+    requestTurnId: activeActionRequest?.turnId,
+    requestRunId: activeActionRequest?.runId,
+    markerStatus: harnessRunMarker?.status,
+    markerSessionKey: harnessRunMarker?.sessionKey,
+    markerTurnId: harnessRunMarker?.turnId,
+    markerRunId: harnessRunMarker?.runId,
+    expectedSessionKey: activeSessionKey,
+    expectedTurnId: latestPlanTurn?.id,
+  });
+  const hasMatchingPlanReviewRequest =
+    activeActionRequest?.kind === "plan_review" &&
+    harnessRunMarker?.status === "paused" &&
+    hasMatchingPlanActionOwner &&
+    !!planApprovalIdentity &&
+    activeActionRequest.planRevision === planApprovalIdentity.revision &&
+    activeActionRequest.artifactHash === planApprovalIdentity.artifactHash;
+  const hasMatchingPlanChoiceRequest =
+    activeActionRequest?.kind === "user_choice" &&
+    hasMatchingPlanActionOwner;
   const hasActivePlanContext =
     !!latestPlanTurn ||
     planArtifacts.length > 0 ||
@@ -1079,11 +1120,12 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     !isPlanApproved &&
     (
       planStage === "ready_to_execute" ||
-      (latestPlanTurn?.status === "awaiting_approval" && hasReviewablePlanDraft) ||
-      (agentStatus === "pending_review" && (hasReviewablePlanDraft || fallbackPlanPreview.length > 0))
-    );
-  const isAwaitingApproval =
-    (hasActivePlanContext && agentStatus === "pending_review" && !isPlanApproved) || canApproveExecution;
+      latestPlanTurn?.status === "awaiting_approval" ||
+      agentStatus === "pending_review"
+    ) &&
+    !!planApprovalIdentity &&
+    hasMatchingPlanReviewRequest;
+  const isAwaitingApproval = canApproveExecution;
   const isAwaitingInput =
     hasActivePlanContext &&
     !isPlanApproved &&
@@ -1101,6 +1143,51 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     isPlanApproved &&
     planStage === "executing" &&
     (agentStatus === "idle" || agentStatus === "error");
+  const planPresentationRequest = hasMatchingPlanReviewRequest || hasMatchingPlanChoiceRequest
+    ? activeActionRequest
+    : null;
+  const planReviewResolutionIdentity = planPresentationRequest?.kind === "plan_review"
+    ? planPresentationRequest
+    : null;
+  // Legacy/restored turns can predate ActionRequest persistence. Project an
+  // actual visible choice block as user_choice, but never infer Plan review.
+  const planPresentationActionKind = planPresentationRequest?.kind || (
+    isAwaitingInput && hasVisiblePlanChoice ? "user_choice" : undefined
+  );
+  const planPresentationStatus = planPresentationRequest?.kind === "plan_review"
+    ? "awaiting_approval"
+    : planPresentationRequest?.kind === "user_choice" || isAwaitingInput
+    ? "awaiting_input"
+    : planStage === "executing" && agentStatus === "running"
+    ? "executing"
+    : canResumeExecution
+    ? "paused"
+    : canContinuePlanning
+    ? "paused"
+    : planStage === "completed"
+    ? "done"
+    : latestPlanTurn?.status || "planning";
+  const planPresentation = buildTurnPresentationModel({
+    turn: latestPlanTurn,
+    language,
+    fallbackTitle: language === "zh" ? "计划工作区" : "Plan Workspace",
+    statusOverride: planPresentationStatus,
+    statusLabel: planPresentationStatus,
+    kindOverride: "plan",
+    hasActionRequest: !!planPresentationRequest,
+    actionKind: planPresentationActionKind,
+    runId: planPresentationRequest?.runId || (
+      harnessRunMarker?.turnId === latestPlanTurn?.id ? harnessRunMarker?.runId : undefined
+    ),
+    requestId: planPresentationRequest?.requestId,
+  });
+  const planPresentationBehavior = resolvePlanPresentationBehavior({
+    lifecycle: planPresentation.lifecycle,
+    actionKind: planPresentation.actionKind,
+    canApproveExecution,
+    canContinuePlanning,
+    canResumeExecution,
+  });
   const handleContinuePlanning = () => {
     const isRequirementsStage = planStage === "requirements";
     sendMessage(
@@ -1114,6 +1201,18 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       undefined,
       { hidden: true, reuseCurrentTurn: true, preservePlanState: true, resolvedIntent: "plan", skipIntentResolution: true },
     );
+  };
+  const handlePlanAdjustment = (text: string) => {
+    const planTurnId = latestPlanTurn?.id || currentTurnId || undefined;
+    const e2eQuickReplyHandler = getE2EQuickReplyHandler();
+    if (e2eQuickReplyHandler?.(text, planTurnId)) return;
+    sendMessage(text, undefined, {
+      resolvedIntent: "plan",
+      skipIntentResolution: true,
+      reuseCurrentTurn: !!planTurnId,
+      turnIdOverride: planTurnId,
+      preservePlanState: true,
+    });
   };
   const handleResumeExecution = () => {
     const e2eResumeHandler = getE2EResumeExecutionHandler();
@@ -1220,30 +1319,65 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     };
   }, [activeSubagentCount, changeSummary.entries.length, language, latestPlanTurn?.title, rightPanelTab, subagentRuns.length, viewedDiffTask?.target]);
 
-  const isVisible = (showPlanPanel && hasPlanPanelContent) || showDiff || showTerminal || (rightPanelTab === "subagents" && subagentRuns.length > 0);
   const terminalSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(currentWorkspace), currentSessionId) || undefined;
   const isBlackTheme = config.themeMode === "black";
 
   const isLightTheme = config.themeMode === "light";
+  const storePanelVisible =
+    (showPlanPanel && hasPlanPanelContent) ||
+    showDiff ||
+    showTerminal ||
+    (rightPanelTab === "subagents" && subagentRuns.length > 0);
+  const [isResponsiveDrawer, setIsResponsiveDrawer] = useState(() =>
+    typeof window !== "undefined" && window.matchMedia("(max-width: 1219px)").matches
+  );
+  const [responsiveDrawerOpen, setResponsiveDrawerOpen] = useState(storePanelVisible);
 
-  if (!isVisible) return null;
+  useEffect(() => {
+    const query = window.matchMedia("(max-width: 1219px)");
+    const sync = () => setIsResponsiveDrawer(query.matches);
+    sync();
+    query.addEventListener("change", sync);
+    return () => query.removeEventListener("change", sync);
+  }, []);
+
+  useEffect(() => {
+    if (storePanelVisible) setResponsiveDrawerOpen(true);
+  }, [storePanelVisible]);
+
+  useEffect(() => {
+    setResponsiveDrawerOpen(storePanelVisible);
+    // A task/session switch is a real presentation boundary; do not carry an
+    // overlay that belonged to the previous task into the new one.
+  }, [currentSessionId, currentWorkspace]);
+
+  const handleCloseRightPanel = () => {
+    setResponsiveDrawerOpen(false);
+    closeRightPanel();
+  };
+
+  if (!storePanelVisible && !(isResponsiveDrawer && responsiveDrawerOpen)) return null;
 
   const HeaderIcon = panelMeta.icon;
 
   return (
     <>
-      <div className={`w-1 cursor-col-resize z-20 transition-colors ${
+      <div data-testid="right-panel-resizer" className={`right-panel-resizer w-1 cursor-col-resize z-20 transition-colors ${
         isLightTheme ? "hover:bg-[#d4d4d8] active:bg-[#a1a1aa]" : "hover:bg-[#3f3f46] active:bg-[#555]"
       }`} onMouseDown={startResizing} />
       <div
-        className={`flex min-w-0 flex-col shrink-0 border-l z-10 ${
+        data-testid="right-panel"
+        data-panel-tab={rightPanelTab}
+        data-turn-lifecycle={rightPanelTab === "plan" ? planPresentation.lifecycle : undefined}
+        data-action-kind={rightPanelTab === "plan" ? planPresentation.actionKind : undefined}
+        className={`right-panel-shell flex min-w-0 flex-col shrink-0 border-l z-10 ${
           isLightTheme
             ? "border-[#e4e4e7] bg-[#ffffff] text-[#18181b]"
             : isBlackTheme
             ? "border-[#27272a] bg-[rgba(0,0,0,0.96)] text-[#d4d4d8]"
             : "border-[#27272a] bg-[#000000] text-[#d4d4d8]"
         }`}
-        style={{ width: `${rightPanelWidth}px`, display: window.innerWidth < 1220 ? "none" : "flex" }}
+        style={{ "--right-panel-width": `${rightPanelWidth}px` } as React.CSSProperties}
       >
         <div className={`min-h-[56px] shrink-0 border-b px-3 py-2 flex items-center justify-between gap-3 ${
           isLightTheme
@@ -1267,16 +1401,29 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
                 }`}>{panelMeta.title}</div>
                 {rightPanelTab === "plan" && (
                   <span className={`shrink-0 whitespace-nowrap rounded-full border px-2 py-0.5 text-[10px] ${
-                    (isAwaitingApproval || isAwaitingInput)
+                    (planPresentationBehavior.mode === "review" ||
+                      planPresentationBehavior.mode === "choice" ||
+                      planPresentationBehavior.mode === "action_required" ||
+                      planPresentationBehavior.mode === "resumable")
                       ? "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]"
                       : isLightTheme
                       ? "border-[#e4e4e7] bg-[#ffffff] text-[#71717a]"
                       : "border-[#27272a] bg-[#050505] text-[#a1a1aa]"
                   }`}>
-                    {isAwaitingApproval
+                    {planPresentationBehavior.mode === "review"
                       ? language === "zh" ? "待审批" : "Awaiting Approval"
-                      : isAwaitingInput
+                      : planPresentationBehavior.mode === "choice"
                       ? language === "zh" ? "待选择" : "Awaiting Choice"
+                      : planPresentationBehavior.mode === "action_required"
+                      ? language === "zh" ? "待处理" : "Action Required"
+                      : planPresentationBehavior.mode === "resumable"
+                      ? language === "zh" ? "已暂停" : "Paused"
+                      : planPresentationBehavior.mode === "success"
+                      ? language === "zh" ? "已完成" : "Completed"
+                      : planPresentationBehavior.mode === "failed"
+                      ? language === "zh" ? "失败" : "Failed"
+                      : planPresentationBehavior.mode === "no_action"
+                      ? language === "zh" ? "未执行" : "No Action"
                       : planArtifacts.length > 0
                       ? language === "zh" ? "已同步" : "Synced"
                       : fallbackPlanPreview
@@ -1302,7 +1449,12 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
             </div>
           </div>
 
-          <button onClick={closeRightPanel} className={`p-1 transition-colors ${
+          <button
+            type="button"
+            data-testid="right-panel-close"
+            aria-label={language === "zh" ? "关闭右侧面板" : "Close right panel"}
+            onClick={handleCloseRightPanel}
+            className={`p-1 transition-colors ${
             isLightTheme ? "text-[#71717a] hover:text-[#18181b]" : "text-[#a1a1aa] hover:text-white"
           }`}>
             <IconClose className="w-4 h-4" />
@@ -1312,6 +1464,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
         <div className="min-h-0 flex-1 overflow-hidden">
           {rightPanelTab === "plan" && hasPlanPanelContent && (
             <PlanPanel
+              presentation={planPresentation}
               artifacts={planArtifacts}
               tasks={planTasks}
               evidenceLedger={planExecutionEvidenceLedger}
@@ -1321,7 +1474,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               canApproveExecution={canApproveExecution}
               canContinuePlanning={canContinuePlanning}
               canResumeExecution={canResumeExecution}
-              hideIslandOwnedSections
               isTemporaryWorkspace={!currentWorkspace.trim()}
               isApproved={isPlanApproved}
               language={language}
@@ -1332,11 +1484,24 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               onDeletePlanFiles={deletePersistedPlanFiles}
               onDeleteBrowserValidationFiles={deleteBrowserValidationArtifacts}
               onContinuePlanning={handleContinuePlanning}
+              onRequestAdjustment={handlePlanAdjustment}
               onResumeExecution={handleResumeExecution}
               onSaveDocument={handleSavePlanDocument}
-              onApprove={approvePlan}
-              onReject={rejectPlan}
-              onRejectAndDelete={() => void rejectPlanAndDeleteFiles()}
+              onApprove={() => {
+                if (planReviewResolutionIdentity) {
+                  approvePlan(undefined, planReviewResolutionIdentity);
+                }
+              }}
+              onReject={() => {
+                if (planReviewResolutionIdentity) {
+                  rejectPlan(planReviewResolutionIdentity);
+                }
+              }}
+              onRejectAndDelete={() => {
+                if (planReviewResolutionIdentity) {
+                  void rejectPlanAndDeleteFiles(planReviewResolutionIdentity);
+                }
+              }}
             />
           )}
 

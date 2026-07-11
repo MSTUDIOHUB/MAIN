@@ -58,6 +58,7 @@ const {
   filterPlanToolNamesForRuntimePhase,
   resolvePlanNoActionRecovery,
   resolvePlanSuppressedToolRecovery,
+  shouldAdvancePlanFromStructureOnTargetedRead,
   shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence,
   shouldSuppressPlanTruncationWarning,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
@@ -114,6 +115,27 @@ test("plan runtime phases scope the tool surface", () => {
     isPlanApproved: false,
     planRuntimePhase: "review_ready",
   }), ["write_file", "replace_in_file"]);
+});
+
+test("targeted reads advance structure exploration without opening mutations", () => {
+  assert.equal(shouldAdvancePlanFromStructureOnTargetedRead({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "explore_structure",
+    requestedToolNames: ["query_tabular_document"],
+  }), true);
+  assert.equal(shouldAdvancePlanFromStructureOnTargetedRead({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "explore_structure",
+    requestedToolNames: ["write_file"],
+  }), false);
+  assert.equal(shouldAdvancePlanFromStructureOnTargetedRead({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "grounding",
+    requestedToolNames: ["query_tabular_document"],
+  }), false);
 });
 
 test("needs_rewrite closes the tool surface before the old convergence prompt", () => {

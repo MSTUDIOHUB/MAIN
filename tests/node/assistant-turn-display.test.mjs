@@ -238,6 +238,34 @@ test("assistant turn display preserves explicit blocking choices after execution
   assert.equal(decision.finalReplyOptions.length, 1);
 });
 
+test("structured Plan output preserves explicit blocking user options", () => {
+  const structuredPlan = [
+    "# Plan",
+    "",
+    "## Summary",
+    "A user-visible startup behavior choice still blocks a decision-complete plan.",
+    "",
+    "## Key Changes",
+    "- Option A keeps the existing empty editor startup.",
+    "- Option B opens a start panel before editing.",
+  ].join("\n");
+  const decision = resolveDecision({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    streamText: structuredPlan,
+    normalizedVisibleText: structuredPlan,
+    normalizedReplyOptions: [
+      { label: "Keep empty editor", value: "Keep the existing empty editor startup.", source: "explicit_user_options" },
+      { label: "Use start panel", value: "Use a start panel before editing.", source: "explicit_user_options" },
+    ],
+  });
+
+  assert.equal(decision.hasStructuredProposal, true);
+  assert.equal(decision.planReplyOptionsRoutedToArtifact, false);
+  assert.equal(decision.finalReplyOptions.length, 2);
+});
+
 test("assistant turn display keeps inferred approval for a real post-evidence decision before completion", () => {
   const decision = resolveDecision({
     normalizedVisibleText: "A newly discovered compatibility choice must be decided before continuing.",

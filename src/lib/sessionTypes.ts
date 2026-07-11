@@ -1,4 +1,5 @@
 import type { AttachedFile } from "./attachments";
+import type { ResolvedRunIntent } from "./runIntent";
 
 export const GLOBAL_CHAT_KEY = "__MAIN_GLOBAL_CHAT__";
 
@@ -39,6 +40,10 @@ export interface QueuedUserMessage {
   images?: string[];
   contextMentions?: string[];
   attachedFiles?: AttachedFile[];
+  /** Preserve the resolved workflow contract across the busy-run queue. */
+  runtimeIntentOverride?: ResolvedRunIntent;
+  /** Immutable Goal source captured before Plan state can change or reset. */
+  goalSourceContextSnapshot?: string;
   createdAt: number;
   status: "queued";
 }
@@ -56,4 +61,10 @@ export interface PlanApprovalHandoff {
   requestedAt: number;
   executionTurnId?: string;
   prompt?: string;
+  /** Identity of the exact reviewable artifact revision the user approved. */
+  planRevision?: number;
+  artifactHash?: string;
+  artifactPaths?: string[];
+  /** The planning run that produced the reviewed artifact. */
+  parentRunId?: string | null;
 }

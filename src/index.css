@@ -15,6 +15,89 @@
   --surface-text-subtle: #8c8c97;
   --surface-scrollbar: #565660;
   --surface-scrollbar-hover: #70707c;
+  --turn-boundary-color: color-mix(in srgb, var(--accent-light, #a855f7) 18%, var(--surface-border-soft) 82%);
+  --turn-state-anchor-border: color-mix(in srgb, var(--accent, #9333ea) 14%, var(--surface-border) 86%);
+  --turn-state-anchor-bg: color-mix(in srgb, var(--accent, #9333ea) 4%, transparent);
+  --turn-process-control-text: var(--surface-text-subtle);
+  --turn-process-control-border: var(--surface-border-soft);
+  --turn-process-control-bg: transparent;
+}
+
+.turn-boundary-divider {
+  background: var(--turn-boundary-color);
+}
+
+.turn-state-anchor {
+  border-color: var(--turn-state-anchor-border);
+  background: var(--turn-state-anchor-bg);
+}
+
+.turn-state-anchor[role="button"]:hover {
+  border-color: color-mix(in srgb, var(--accent-light, #a855f7) 24%, var(--surface-border) 76%);
+  background: color-mix(in srgb, var(--accent, #9333ea) 7%, transparent);
+}
+
+.turn-process-disclosure {
+  color: var(--turn-process-control-text);
+  border-color: var(--turn-process-control-border);
+  background: var(--turn-process-control-bg);
+}
+
+.turn-process-disclosure:hover {
+  color: var(--surface-text);
+  border-color: color-mix(in srgb, var(--accent-light, #a855f7) 20%, var(--surface-border) 80%);
+  background: color-mix(in srgb, var(--accent, #9333ea) 5%, transparent);
+}
+
+.right-panel-shell {
+  display: flex;
+  width: var(--right-panel-width, 450px);
+}
+
+.right-panel-resizer {
+  display: block;
+}
+
+@media (max-width: 1219px) {
+  .right-panel-resizer {
+    display: none;
+  }
+
+  .right-panel-shell {
+    position: fixed;
+    z-index: 60;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(var(--right-panel-width, 450px), calc(100vw - 1rem));
+    max-width: 32rem;
+    min-width: min(22rem, calc(100vw - 1rem));
+    box-shadow: -18px 0 48px rgba(0, 0, 0, 0.38);
+  }
+
+  html[data-theme="light"] .right-panel-shell {
+    box-shadow: -18px 0 44px rgba(15, 23, 42, 0.18);
+  }
+
+  .plan-review-action-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .plan-review-button-group {
+    justify-content: flex-start;
+  }
+}
+
+@media (max-width: 520px) {
+  .plan-review-footer [data-testid="plan-adjust-form"] {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .plan-review-footer [data-testid="plan-adjust-submit"] {
+    width: 100%;
+  }
 }
 
 /* ── 核心重置与背景 (从纯黑抬到略亮的深灰) ────────────────────── */
@@ -283,6 +366,7 @@ html[data-theme="dark"] #root {
   --surface-text-subtle: #8c8c97;
   --surface-scrollbar: #4b4b55;
   --surface-scrollbar-hover: #666670;
+  --turn-boundary-color: color-mix(in srgb, var(--accent-light, #a855f7) 16%, var(--surface-border-soft) 84%);
   background-color: var(--surface-0);
   color: var(--surface-text);
 }
@@ -330,6 +414,7 @@ html[data-theme="black"] #root {
   --surface-text-subtle: #74747e;
   --surface-scrollbar: #2f2f36;
   --surface-scrollbar-hover: #464650;
+  --turn-boundary-color: color-mix(in srgb, var(--accent-light, #a855f7) 22%, var(--surface-border-soft) 78%);
   background-color: var(--surface-0);
   color: var(--surface-text);
 }
@@ -387,6 +472,9 @@ html[data-theme="light"] #root {
   --surface-text-subtle: #71717a;
   --surface-scrollbar: #a1a1aa;
   --surface-scrollbar-hover: #71717a;
+  --turn-boundary-color: color-mix(in srgb, var(--accent-hover, #7e22ce) 16%, var(--surface-border-soft) 84%);
+  --turn-state-anchor-border: color-mix(in srgb, var(--accent-hover, #7e22ce) 16%, var(--surface-border) 84%);
+  --turn-state-anchor-bg: color-mix(in srgb, var(--accent, #9333ea) 3%, #ffffff 97%);
   background-color: var(--surface-0);
   color: var(--surface-text-strong);
 }

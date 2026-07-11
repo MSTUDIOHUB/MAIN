@@ -100,6 +100,8 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
   const harnessMarkers = [];
   const lease = startSubmitRunLease({
     userContent: "ship the goal",
+    canonicalUserText: "ship the visible goal",
+    goalSourceContext: "prior Plan conclusion",
     currentImages: [],
     runSessionKey: "workspace-a:7",
     runWorkspace: "/repo",
@@ -137,7 +139,10 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
   assert.deepEqual(lease.agentUserMessage, { role: "user", content: "ship the goal" });
   assert.equal(lease.abortController, abortController);
   assert.deepEqual(goals, [
-    { objective: "ship the goal", options: { sessionKey: "workspace-a:7" } },
+    {
+      objective: "ship the visible goal",
+      options: { sessionKey: "workspace-a:7", sourceContext: "prior Plan conclusion", ownerTurnId: "turn-1" },
+    },
   ]);
   assert.equal(persistedMarkers[0].instanceId, "instance-a");
   assert.match(persistedMarkers[0].runId, /^run-/);
@@ -145,8 +150,95 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
   assert.equal(persistedMarkers[0].planStage, "executing");
   assert.equal(persistedMarkers[0].isPlanApproved, true);
   assert.equal(persistedMarkers[0].startedAt, 456);
+  assert.equal(persistedMarkers[0].parentRunId, null);
+  assert.equal(persistedMarkers[0].turnStartMessageIndex, 1);
   assert.equal(harnessMarkers[0].persisted, true);
   assert.equal(lease.harnessRunMarker.persisted, true);
+  assert.equal(lease.runId, persistedMarkers[0].runId);
+  assert.equal(lease.parentRunId, null);
+});
+
+test("submit run lease links only exact same-turn resumes", () => {
+  const agentMessages = [
+    { role: "user", content: "initial" },
+    { role: "assistant", content: "choose" },
+  ];
+  const previousMarker = {
+    runId: "run-parent",
+    sessionKey: "workspace-a:7",
+    turnId: "turn-1",
+    turnStartMessageIndex: 0,
+  };
+  let persisted;
+  const lease = startSubmitRunLease({
+    userContent: "[turn_intake]\n[user_request]\napprove\n[/user_request]\n[/turn_intake]",
+    canonicalUserText: "approve",
+    currentImages: [],
+    runSessionKey: "workspace-a:7",
+    runWorkspace: "/repo",
+    runSessionId: 7,
+    turnId: "turn-1",
+    effectiveRunIntent: "execute",
+    runtimeRunIntent: "execute",
+    getRuntimeSnapshot: () => ({
+      agentMessagesLength: agentMessages.length,
+      planStage: "executing",
+      isPlanApproved: true,
+      harnessRunMarker: previousMarker,
+    }),
+    appendAgentMessage: (message) => agentMessages.push(message),
+    createAbortController: () => ({ signal: { aborted: false } }),
+    setAbortController: () => {},
+    startGoal: () => assert.fail("goal must not start"),
+    getCurrentHarnessInstanceId: () => "instance-a",
+    persistHarnessRunMarker: (marker) => (persisted = marker),
+    setHarnessRunMarker: () => {},
+    nowMs: () => 789,
+  });
+
+  assert.equal(lease.parentRunId, "run-parent");
+  assert.equal(persisted.parentRunId, "run-parent");
+  assert.equal(persisted.turnStartMessageIndex, 0);
+});
+
+test("action continuations preserve their exact paused parent run even when another marker is current", () => {
+  const agentMessages = [{ role: "user", content: "newer turn" }];
+  let persisted;
+  const lease = startSubmitRunLease({
+    userContent: "Use B",
+    canonicalUserText: "Use B",
+    currentImages: [],
+    runSessionKey: "workspace-a:7",
+    runWorkspace: "/repo",
+    runSessionId: 7,
+    turnId: "turn-choice",
+    effectiveRunIntent: "execute",
+    runtimeRunIntent: "execute",
+    parentRunIdOverride: "run-choice-paused",
+    getRuntimeSnapshot: () => ({
+      agentMessagesLength: agentMessages.length,
+      planStage: "idle",
+      isPlanApproved: false,
+      harnessRunMarker: {
+        runId: "run-other-current",
+        sessionKey: "workspace-a:7",
+        turnId: "turn-newer",
+        turnStartMessageIndex: 0,
+      },
+    }),
+    appendAgentMessage: (message) => agentMessages.push(message),
+    createAbortController: () => ({ signal: { aborted: false } }),
+    setAbortController: () => {},
+    startGoal: () => assert.fail("goal must not start"),
+    getCurrentHarnessInstanceId: () => "instance-a",
+    persistHarnessRunMarker: (marker) => (persisted = marker),
+    setHarnessRunMarker: () => {},
+    nowMs: () => 790,
+  });
+
+  assert.equal(lease.parentRunId, "run-choice-paused");
+  assert.equal(persisted.parentRunId, "run-choice-paused");
+  assert.equal(persisted.turnId, "turn-choice");
 });
 
 test("harness run ownership distinguishes sequential loops on the same conversation turn", () => {

@@ -9,6 +9,12 @@ export type HarnessRunStatus = "running" | "completed" | "paused" | "error" | "i
 export interface HarnessRunMarker {
   schemaVersion: 1;
   runId: string;
+  /** Previous execution run in the same logical turn. Absent on legacy markers. */
+  parentRunId?: string | null;
+  /** Earliest durable message index for this logical turn across resumed runs. */
+  turnStartMessageIndex?: number;
+  /** Last derived Goal slice run, used to preserve slice lineage across iterations. */
+  lastGoalSliceRunId?: string | null;
   instanceId: string;
   sessionKey: string;
   workspace: string | null;
@@ -126,6 +132,18 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
     runId: typeof record.runId === "string" && record.runId.trim()
       ? record.runId
       : `legacy-${sessionKey}-${turnId || "no-turn"}-${startedAt}`,
+    parentRunId: typeof record.parentRunId === "string" && record.parentRunId.trim()
+      ? record.parentRunId.trim()
+      : null,
+    turnStartMessageIndex: Math.max(
+      0,
+      Number.isInteger(Number(record.turnStartMessageIndex))
+        ? Number(record.turnStartMessageIndex)
+        : Math.max(0, (Number(record.messagesLen) || 1) - 1),
+    ),
+    lastGoalSliceRunId: typeof record.lastGoalSliceRunId === "string" && record.lastGoalSliceRunId.trim()
+      ? record.lastGoalSliceRunId.trim()
+      : null,
     instanceId: typeof record.instanceId === "string" ? record.instanceId : "unknown",
     sessionKey,
     workspace: typeof record.workspace === "string" ? record.workspace : null,

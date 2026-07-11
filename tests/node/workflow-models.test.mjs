@@ -123,6 +123,8 @@ const {
 
 const {
   buildPlanApprovalChoiceHint,
+  hasReviewablePlanArtifact,
+  hasReviewablePlanContext,
   resolvePlanApprovalQuickReplyAction,
   shouldRouteQuickReplyToPlanApproval,
 } = loadPlanControlModule();
@@ -387,6 +389,17 @@ test("plan approval quick reply resolves materialization and blocking branches",
     }),
     "not_plan_approval",
   );
+});
+
+test("reviewable plan approval requires a materialized non-empty artifact", () => {
+  assert.equal(hasReviewablePlanArtifact([]), false);
+  assert.equal(hasReviewablePlanArtifact([
+    { kind: "plan", path: ".MAIN/plans/plan.md", title: "Plan", content: "   ", updatedAt: 1 },
+  ]), false);
+  assert.equal(hasReviewablePlanArtifact([
+    { kind: "plan", path: ".MAIN/plans/plan.md", title: "Plan", content: "# Plan", updatedAt: 1 },
+  ]), true);
+  assert.equal(hasReviewablePlanContext({ planStage: "design", planArtifacts: [] }), false);
 });
 
 test("plan approval choice hint preserves the selected execution branch", () => {

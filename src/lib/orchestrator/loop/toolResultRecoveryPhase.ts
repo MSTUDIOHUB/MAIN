@@ -76,7 +76,7 @@ type ActivateExecuteRecovery = (
   mode: Exclude<ExecuteRecoveryRuntimeState["mode"], "normal">,
   reason: string,
   context?: Record<string, unknown>,
-) => void;
+) => ExecuteRecoveryRuntimeState;
 
 type ActivateChatFinalSynthesis = (
   reason: string,
@@ -160,6 +160,13 @@ export async function handleToolResultRecoveryPhase(input: {
   let executeRecoveryState = input.executeRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
   let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
+  const activateExecuteRecoveryAndSync: ActivateExecuteRecovery = (mode, reason, context) => {
+    // The callback updates the outer loop immediately. Mirror the returned
+    // state locally so this phase cannot fold an older `normal` state back over
+    // the activation when it returns.
+    executeRecoveryState = input.activateExecuteRecovery(mode, reason, context);
+    return executeRecoveryState;
+  };
   const setPlanRuntimePhaseAndSync: SetPlanRuntimePhase = (phase, reason, status) => {
     input.setPlanRuntimePhase(phase, reason, status);
     planRuntimeState = applyPlanRuntimePhase(planRuntimeState, { phase, reason }).state;
@@ -205,7 +212,7 @@ export async function handleToolResultRecoveryPhase(input: {
     approvedPlanNoProgressRecoveryAttempts:
       input.approvedPlanRecoveryState.approvedPlanNoProgressRecoveryAttempts,
     tracking: getNoProgressTrackingRuntimeState(loopGuardRuntimeState),
-    activateExecuteRecovery: input.activateExecuteRecovery,
+    activateExecuteRecovery: activateExecuteRecoveryAndSync,
     activateChatFinalSynthesis: input.activateChatFinalSynthesis,
     emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
   });
@@ -249,7 +256,7 @@ export async function handleToolResultRecoveryPhase(input: {
     recentPlanToolActivity: input.recentPlanToolActivity,
     recentToolActivity: input.recentToolActivity,
     executeRecoveryAttempts: executeRecoveryState.attempts,
-    activateExecuteRecovery: input.activateExecuteRecovery,
+    activateExecuteRecovery: activateExecuteRecoveryAndSync,
     emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
   });
   if (readFileRepeatLimitRecovery.status === "stopped") {
@@ -270,7 +277,7 @@ export async function handleToolResultRecoveryPhase(input: {
     executeRecoveryReason: executeRecoveryState.reason,
     consecutiveBlockedReadFileInRecoveryCount:
       executeRecoveryState.consecutiveBlockedReadFileCount,
-    activateExecuteRecovery: input.activateExecuteRecovery,
+    activateExecuteRecovery: activateExecuteRecoveryAndSync,
   });
   executeRecoveryState = applyCrossIterationReadFileRecoveryState(executeRecoveryState, {
     mode: crossIterationReadFileRecovery.executeRecoveryMode,
@@ -298,7 +305,7 @@ export async function handleToolResultRecoveryPhase(input: {
       loopGuardRuntimeState.successfulEditTargetsSinceVerification,
     repeatedEditValidationRecoveryAttempts:
       executeRecoveryState.repeatedEditValidationAttempts,
-    activateExecuteRecovery: input.activateExecuteRecovery,
+    activateExecuteRecovery: activateExecuteRecoveryAndSync,
     emitPlanExecutionProgress: input.emitPlanExecutionProgress,
   });
   executeRecoveryState = setRepeatedEditValidationRecoveryAttempts(
@@ -467,7 +474,7 @@ export async function handleToolResultRecoveryPhase(input: {
       loopGuardRuntimeState.targetProgressGuardRecoveredSignatures,
     recentToolActivity: input.recentToolActivity,
     executeRecoveryAttempts: executeRecoveryState.attempts,
-    activateExecuteRecovery: input.activateExecuteRecovery,
+    activateExecuteRecovery: activateExecuteRecoveryAndSync,
   });
   if (targetProgressLoopRecovery.status === "stopped") {
     return finish("stopped");
@@ -485,7 +492,7 @@ export async function handleToolResultRecoveryPhase(input: {
     usedExecuteConvergencePrompt: recoveryPromptState.usedExecuteConvergencePrompt,
     recentToolActivity: input.recentToolActivity,
     executeRecoveryMode: executeRecoveryState.mode,
-    activateExecuteRecovery: input.activateExecuteRecovery,
+    activateExecuteRecovery: activateExecuteRecoveryAndSync,
   });
   recoveryPromptState = applyExecuteConvergencePromptState(
     recoveryPromptState,

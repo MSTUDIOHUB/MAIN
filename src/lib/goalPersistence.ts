@@ -10,7 +10,8 @@ import type {
   GoalProgress,
   GoalRuntimeSnapshot,
 } from "./goalState";
-import { buildGoalStatusLabel, normalizeGoalCriteria, summarizeGoalIteration } from "./goalState";
+import { buildGoalStatusLabel, migrateGoalDefinition, normalizeGoalCriteria, summarizeGoalIteration } from "./goalState";
+import { normalizeGoalRuntimeSnapshot } from "./goalRuntime";
 
 export const GOAL_DIR_NAME = "goals";
 export const GOAL_ACTIVE_FILE = "active-goal.json";
@@ -64,7 +65,7 @@ export function deserializeGoalDefinition(json: string): GoalDefinition | null {
   try {
     const parsed = JSON.parse(json);
     if (!parsed || typeof parsed !== "object" || !parsed.id || !parsed.objective) return null;
-    return parsed as GoalDefinition;
+    return migrateGoalDefinition(parsed as GoalDefinition);
   } catch {
     return null;
   }
@@ -106,6 +107,17 @@ export function buildGoalProgressMarkdown(input: {
   lines.push(`## ${isZh ? "当前状态" : "Current Status"}`);
   lines.push(`- ${isZh ? "状态" : "Status"}: ${statusLabel}`);
   lines.push(`- ${isZh ? "迭代" : "Iteration"}: ${progress.currentIteration}/${goal.iterationBudget}`);
+  if (progress.lastStopReason) {
+    lines.push(`- ${isZh ? "最近停止原因" : "Last stop reason"}: ${progress.lastStopReason}`);
+  }
+  if (progress.usage) {
+    lines.push(`- ${isZh ? "模型轮次" : "Model iterations"}: ${progress.usage.modelIterations}`);
+    lines.push(`- ${isZh ? "工具调用" : "Tool calls"}: ${progress.usage.toolCalls}`);
+    lines.push(`- Token: ${progress.usage.totalTokensUsed}${progress.usage.estimatedTokens ? " (estimated)" : ""}`);
+  }
+  if (progress.recoveryState) {
+    lines.push(`- ${isZh ? "恢复原因" : "Recovery cause"}: ${progress.recoveryState.normalizedCause} (${progress.recoveryState.consecutiveCount}/${3})`);
+  }
   if (progress.lastCheckpoint) {
     lines.push(`- ${isZh ? "最近检查点" : "Last Checkpoint"}: ${isZh ? "迭代" : "Iteration"} ${progress.lastCheckpoint.iteration}`);
   }
@@ -182,8 +194,13 @@ export function serializeGoalRuntimeSnapshot(snapshot: GoalRuntimeSnapshot): str
 export function deserializeGoalRuntimeSnapshot(json: string): GoalRuntimeSnapshot | null {
   try {
     const parsed = JSON.parse(json) as GoalRuntimeSnapshot;
-    if (!parsed || parsed.schemaVersion !== 2 || !parsed.goal?.id || !parsed.progress?.goalId) return null;
-    return parsed;
+    if (
+      !parsed
+      || ![2, 3].includes(Number(parsed.schemaVersion))
+      || !parsed.goal?.id
+      || !parsed.progress?.goalId
+    ) return null;
+    return normalizeGoalRuntimeSnapshot(parsed);
   } catch {
     return null;
   }

@@ -5,10 +5,18 @@
 // Inspired by Codex CLI's "fresh context per iteration" approach.
 // ────────────────────────────────────────────────────────────────────
 
-import { normalizeGoalCriteria, type GoalCheckpoint, type GoalDefinition, type GoalTurnContract } from "./goalState";
+import {
+  buildGoalSliceId,
+  normalizeGoalCriteria,
+  type GoalCheckpoint,
+  type GoalDefinition,
+  type GoalEvidenceEntry,
+  type GoalTurnContract,
+} from "./goalState";
 import type { VerificationResult } from "./goalVerification";
 import { buildCheckpointContextForLLM } from "./goalPersistence";
 import { buildVerificationSummary } from "./goalVerification";
+import { classifyGoalToolCapability } from "./goalToolCapabilities";
 
 export interface GoalIterationContextInput {
   /** Current goal definition */
@@ -23,6 +31,8 @@ export interface GoalIterationContextInput {
   language: "zh" | "en";
   /** Additional user-provided guidance (optional) */
   userGuidance?: string;
+  /** Existing structured evidence from earlier slices. */
+  evidence?: GoalEvidenceEntry[];
 }
 
 /**
@@ -41,15 +51,26 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
         `## 目标模式 — 迭代 ${nextIteration}/${goal.iterationBudget}`,
         "",
         `**目标**: ${goal.objective}`,
+        `**修订**: ${goal.revision || 1}`,
         "",
       ].join("\n")
     : [
         `## Goal Mode — Iteration ${nextIteration}/${goal.iterationBudget}`,
         "",
         `**Objective**: ${goal.objective}`,
+        `**Revision**: ${goal.revision || 1}`,
         "",
       ].join("\n"),
   );
+
+  if (goal.sourceContext) {
+    sections.push([
+      isZh ? "## 有界来源上下文" : "## Bounded Source Context",
+      "",
+      goal.sourceContext,
+      "",
+    ].join("\n"));
+  }
 
   // ── Section 2: Definition of Done ──
   const criteria = normalizeGoalCriteria(goal);
@@ -62,6 +83,23 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
       return `${i + 1}. [${done ? "x" : " "}] ${criterion.text}`;
     });
     sections.push([heading, ...items, ""].join("\n"));
+  }
+
+  const existingEvidence = (input.evidence || [])
+    .filter((entry) => entry.goalId === goal.id && entry.goalRevision === (goal.revision || 1))
+    .slice(-20);
+  if (existingEvidence.length > 0) {
+    const evidenceLines = existingEvidence.map((entry) => {
+      const criteriaLabel = (entry.criterionIds || []).join(",") || "unassigned";
+      const compactSummary = String(entry.summary || "").replace(/\s+/g, " ").slice(0, 240);
+      return `- [${entry.status}] ${entry.kind} · ${entry.sourceTool}${entry.target ? ` · ${entry.target}` : ""} · criteria=${criteriaLabel}${compactSummary ? ` · ${compactSummary}` : ""}`;
+    });
+    sections.push([
+      isZh ? "## 已有结构化证据" : "## Existing Structured Evidence",
+      "",
+      ...evidenceLines,
+      "",
+    ].join("\n"));
   }
 
   // ── Section 3: Checkpoint Summary ──
@@ -194,8 +232,10 @@ export function buildGoalTurnContract(input: GoalIterationContextInput): GoalTur
   const goal = input.goal;
   const context = buildGoalIterationSystemContext(input);
   const revision = Math.max(1, Number(goal.revision) || 1);
+  const goalSliceId = buildGoalSliceId(goal.id, input.nextIteration);
   return {
     goalId: goal.id,
+    goalSliceId,
     revision,
     iteration: input.nextIteration,
     maxIterations: goal.iterationBudget,
@@ -208,25 +248,20 @@ export function buildGoalTurnContract(input: GoalIterationContextInput): GoalTur
 
 // ── Extract modified files from tool call results ────────────────
 
-const FILE_MODIFY_TOOLS = new Set([
-  "write_file",
-  "replace_in_file",
-  "create_file",
-  "apply_diff",
-  "apply_patch",
-  "insert_content",
-]);
-
 export function extractModifiedFilesFromToolCalls(
   toolCalls: Array<{ name: string; target?: string; arguments?: Record<string, unknown> }>,
 ): string[] {
   const files = new Set<string>();
   for (const call of toolCalls) {
-    if (!FILE_MODIFY_TOOLS.has(call.name)) continue;
     const target = call.target
       || (call.arguments?.path as string)
       || (call.arguments?.file_path as string)
       || (call.arguments?.target_file as string);
+    if (classifyGoalToolCapability({
+      name: call.name,
+      target,
+      arguments: call.arguments,
+    }).kind !== "file_change") continue;
     if (target && typeof target === "string") {
       files.add(target);
     }
@@ -236,16 +271,17 @@ export function extractModifiedFilesFromToolCalls(
 
 // ── Extract test commands from tool call results ─────────────────
 
-const TEST_COMMAND_RE = /\b(?:npm\s+test|npm\s+run\s+test|cargo\s+test|pytest|python\s+-m\s+pytest|go\s+test|jest|vitest|playwright\s+test)\b/i;
-
 export function extractTestCommandsFromToolCalls(
   toolCalls: Array<{ name: string; arguments?: Record<string, unknown> }>,
 ): string[] {
   const commands: string[] = [];
   for (const call of toolCalls) {
-    if (call.name !== "run_command" && call.name !== "execute_command") continue;
     const cmd = (call.arguments?.command as string) || (call.arguments?.cmd as string) || "";
-    if (TEST_COMMAND_RE.test(cmd)) {
+    if (classifyGoalToolCapability({
+      name: call.name,
+      target: cmd,
+      arguments: call.arguments,
+    }).kind === "test") {
       commands.push(cmd);
     }
   }

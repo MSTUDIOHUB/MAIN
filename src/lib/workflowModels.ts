@@ -321,6 +321,8 @@ export interface PlanArtifact {
   path: string;
   title: string;
   content: string;
+  /** Monotonic revision of this materialized artifact within the session. */
+  revision?: number;
   updatedAt: number;
 }
 
@@ -386,7 +388,7 @@ export interface ReplyOption {
   label: string;
   value: string;
   action?: "continue_readonly_once" | "allow_readonly_session" | "execute_once" | "approve_operation_once" | "adjust_plan" | "cancel_operation";
-  source?: "explicit_user_options" | "inferred_binary" | "inferred_enumerated" | "readonly_permission" | "proposal_follow_up" | "operation_approval";
+  source?: "explicit_user_options" | "inferred_binary" | "inferred_enumerated" | "readonly_permission" | "proposal_follow_up" | "operation_approval" | "custom_reply";
 }
 
 export interface PendingOperationProposal {
@@ -413,6 +415,28 @@ export type ConversationTurnStatus =
 
 export type VisibleConversationTurnStatus = ConversationTurnStatus;
 
+export interface DurableTurnExecutionSummary {
+  decisions: string[];
+  modifiedFiles: string[];
+  validations: string[];
+  failures: string[];
+  unfinished: string[];
+  artifacts: string[];
+}
+
+/**
+ * Durable user-visible context for a completed logical turn. Runtime wrappers,
+ * hidden reasoning, and raw tool output are intentionally excluded.
+ */
+export interface DurableTurnContext {
+  schemaVersion: 1;
+  turnId: string;
+  visibleUserMessages: string[];
+  finalAssistantAnswer: string;
+  execution: DurableTurnExecutionSummary;
+  committedAt: number;
+}
+
 export interface ConversationTurn {
   id: string;
   userPrompt: string;
@@ -427,7 +451,11 @@ export interface ConversationTurn {
   displayIntent?: ResolvedRunIntent;
   status: ConversationTurnStatus;
   summary: string;
+  durableContext?: DurableTurnContext;
   blockIds: number[];
+  /** Presentation-only process archive state. User/final messages stay visible. */
+  processCollapsed?: boolean;
+  /** @deprecated persisted compatibility alias for processCollapsed. */
   collapsed: boolean;
   createdAt: number;
   elapsedTime?: number;
@@ -2036,7 +2064,8 @@ export function classifyPlanArtifactQualityResult(
   // Evidence gap: only when the validation reason explicitly mentions evidence problems.
   // Evidence sections are no longer part of missingRequiredSections in the unified path,
   // so we only classify as evidence gap for explicit evidence issues.
-  const hasEvidenceGap = /noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|missing_plan_evidence_section|ungrounded_plan_change_targets/.test(reason);
+  const hasEvidenceGap = /noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|ungrounded_plan_change_targets/.test(reason);
+  const hasEvidencePresentationGap = /missing_plan_evidence_section/.test(reason);
   const hasOnlyStructuralGaps =
     missingSections.length > 0 &&
     missingSections.every((section) => PLAN_STRUCTURAL_REQUIRED_SECTIONS.has(section));
@@ -2047,6 +2076,19 @@ export function classifyPlanArtifactQualityResult(
       missingSections,
       recoveryAction: "targeted_evidence",
       canAutoRepair: false,
+    };
+  }
+
+  // A missing evidence heading is a representation/structure defect when the
+  // grounding validator has already proved that every planned change target is
+  // covered by read evidence. Reopening discovery here wastes a read pass and
+  // can broaden the plan scope instead of repairing the draft in place.
+  if (hasEvidencePresentationGap) {
+    return {
+      ...result,
+      missingSections,
+      recoveryAction: "rewrite",
+      canAutoRepair: true,
     };
   }
 

@@ -23,6 +23,8 @@ interface ApprovedPlanFallbackHandoffLike {
   planTurnId: string;
   requestedAt: number;
   executionTurnId?: string;
+  planRevision?: number;
+  artifactHash?: string;
 }
 
 export function resolveApprovedPlanSameTurnFallbackDecision(input: {
@@ -40,11 +42,21 @@ export function resolveApprovedPlanSameTurnFallbackDecision(input: {
 
   const expectedExecutionTurnId = input.expectedHandoff.executionTurnId || input.expectedHandoff.planTurnId;
   const currentExecutionTurnId = input.currentHandoff?.executionTurnId || input.currentHandoff?.planTurnId;
+  const exactArtifactIdentity =
+    !input.expectedHandoff.artifactHash ||
+    (
+      input.currentHandoff?.artifactHash === input.expectedHandoff.artifactHash &&
+      (
+        input.expectedHandoff.planRevision == null ||
+        input.currentHandoff?.planRevision === input.expectedHandoff.planRevision
+      )
+    );
   const isExactPendingTransition =
     input.isPlanApproved &&
     input.currentHandoff?.planTurnId === input.expectedHandoff.planTurnId &&
     input.currentHandoff?.requestedAt === input.expectedHandoff.requestedAt &&
     currentExecutionTurnId === expectedExecutionTurnId &&
+    exactArtifactIdentity &&
     input.executionStartedForTurnId !== input.expectedHandoff.planTurnId;
   if (!isExactPendingTransition) return "transition_stale";
 

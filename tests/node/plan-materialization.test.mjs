@@ -1466,6 +1466,8 @@ test("materialization rejects the logged MD Viewer plan when index.html was prop
 
   assert.equal(result.ok, false);
   assert.match(result.reason || "", /ungrounded_plan_change_targets:index\.html/);
+  assert.equal(result.quality?.recoveryAction, "targeted_evidence");
+  assert.equal(result.quality?.canAutoRepair, false);
 });
 
 test("plan evidence grounding requires an explicit confirmed-evidence section", () => {
@@ -1486,6 +1488,97 @@ test("plan evidence grounding requires an explicit confirmed-evidence section", 
 
   assert.equal(validation.ok, false);
   assert.equal(validation.reason, "missing_plan_evidence_section");
+  assert.equal(validation.recoveryAction, "rewrite");
+  assert.equal(validation.canAutoRepair, true);
+});
+
+test("materialization repairs only the missing evidence section without broadening plan scope", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "## 问题总结",
+      "当前文件打开链路已经完成代码读取，下面给出正式整改计划。",
+      "",
+      "# Proposed Plan: 修复 Markdown 文件打开链路",
+      "",
+      "## 摘要",
+      "- 用户目标：修复双击 Markdown 文件和工具栏打开按钮无法打开文件的问题。",
+      "",
+      "## 关键改动",
+      "1. 修改 `src-tauri/src/main.rs`，统一后端文件打开事件名称和 payload。",
+      "2. 修改 `src/main.js`，让启动参数、事件监听和工具栏按钮复用同一打开入口。",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 不新增公共 API；只统一现有内部 Tauri 事件 payload。",
+      "",
+      "## 测试方案",
+      "- 运行前端构建和 Rust 检查，并手动验证双击文件与工具栏按钮两条入口。",
+      "",
+      "## 假设与默认值",
+      "- 保持编辑器、保存和预览行为不变。",
+    ].join("\n"),
+    evidenceRecords: [
+      { tool: "read_file", target: "src-tauri/src/main.rs", status: "succeeded", summary: "后端当前发出 file-open 事件" },
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "前端当前监听 open-file-event" },
+      { tool: "read_file", target: "src-tauri/tauri.conf.json", status: "succeeded", summary: "应用配置保持现状" },
+      { tool: "read_file", target: "package.json", status: "succeeded", summary: "构建脚本保持现状" },
+    ],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.source, "evidence_section_repaired_visible_plan");
+  assert.match(result.content || "", /## 已确认证据/);
+  assert.match(result.content || "", /src-tauri\/src\/main\.rs/);
+  assert.match(result.content || "", /src\/main\.js/);
+  assert.doesNotMatch(result.content || "", /修改 `src-tauri\/tauri\.conf\.json`/);
+  assert.doesNotMatch(result.content || "", /修改 `package\.json`/);
+  assert.match(result.content || "", /统一后端文件打开事件名称和 payload/);
+  assert.match(result.content || "", /启动参数、事件监听和工具栏按钮复用同一打开入口/);
+  const repairedContent = result.content || "";
+  assert.ok(repairedContent.indexOf("# Proposed Plan") < repairedContent.indexOf("## 已确认证据"));
+  assert.ok(repairedContent.indexOf("## 摘要") < repairedContent.indexOf("## 已确认证据"));
+  assert.ok(repairedContent.indexOf("## 已确认证据") < repairedContent.indexOf("## 关键改动"));
+});
+
+test("materialization does not project metadata-only or failed reads into confirmed evidence", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Proposed Plan: 修复 Markdown 文件打开链路",
+      "",
+      "## 摘要",
+      "- 用户目标：修复前端 Markdown 文件打开入口。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/main.js`，统一启动参数和工具栏按钮的文件打开入口。",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 不新增公共 API，保持内部事件 payload 类型不变。",
+      "",
+      "## 测试方案",
+      "- 运行前端构建并手动验证双击文件与工具栏按钮。",
+      "- 同时验证启动参数为空、路径包含空格、重复打开同一文件时仍沿用现有错误处理和编辑器状态，不引入额外行为变化。",
+      "",
+      "## 假设与默认值",
+      "- 保持编辑器、保存和预览行为不变；本轮不会把读取失败或只有路径元数据的活动描述成已经确认的源码事实。",
+    ].join("\n"),
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "",
+    }],
+    recentToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "blocked",
+      detail: "读取被阻止",
+    }],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "missing_plan_evidence_section");
+  assert.equal(result.quality?.recoveryAction, "rewrite");
 });
 
 test("plan evidence grounding accepts read-backed change targets with confirmed evidence", () => {

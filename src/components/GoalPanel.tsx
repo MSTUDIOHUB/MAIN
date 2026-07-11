@@ -18,8 +18,15 @@ import {
   type GoalRuntimeSnapshot,
   type GoalStatus,
 } from "../lib/goalState";
+import {
+  resolveGoalPresentationBehavior,
+  resolveTurnPresentationLifecycle,
+  type GoalPresentationTone,
+  type TurnPresentationModel,
+} from "../lib/turnPresentation";
 
 interface GoalPanelProps {
+  presentation?: TurnPresentationModel;
   goal: GoalDefinition;
   progress: GoalProgress | null;
   status: GoalStatus;
@@ -48,16 +55,15 @@ function formatDuration(ms: number, language: "zh" | "en"): string {
   return hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
 }
 
-function statusTone(status: GoalStatus): string {
-  if (status === "completed") return "goal-status-completed";
-  if (status === "failed" || status === "cancelled") return "goal-status-failed";
-  if (status === "paused" || status === "pausing" || status === "budget_exceeded" || status === "awaiting_input") {
-    return "goal-status-paused";
-  }
+function presentationToneClass(tone: GoalPresentationTone): string {
+  if (tone === "completed") return "goal-status-completed";
+  if (tone === "failed") return "goal-status-failed";
+  if (tone === "paused") return "goal-status-paused";
   return "goal-status-active";
 }
 
 export default function GoalPanel({
+  presentation,
   goal,
   progress,
   status,
@@ -119,16 +125,21 @@ export default function GoalPanel({
   )).slice(0, 12);
   const phase = runtime?.phase || recentIterations[0]?.phase || "plan";
   const phaseLabel = PHASE_LABELS[phase][language];
-  const canResume = status === "paused" || status === "awaiting_input";
-  const canEdit = status === "active" || status === "paused" || status === "awaiting_input";
+  const resolvedLifecycle = presentation?.lifecycle || resolveTurnPresentationLifecycle(status);
+  const presentationBehavior = resolveGoalPresentationBehavior({
+    lifecycle: resolvedLifecycle,
+    status: presentation?.status || status,
+  });
+  const toneClass = presentationToneClass(presentationBehavior.tone);
 
   const beginEdit = () => {
-    if (status === "active") {
+    if (!presentationBehavior.canEdit) return;
+    if (presentationBehavior.primaryAction === "pause") {
       setPendingEdit(true);
       onPause();
       return;
     }
-    if (status === "paused" || status === "awaiting_input") setEditing(true);
+    setEditing(true);
   };
 
   const saveEdit = () => {
@@ -144,18 +155,24 @@ export default function GoalPanel({
       aria-modal="false"
       aria-labelledby="goal-popover-title"
       data-goal-status={status}
+      data-presentation-tone={presentationBehavior.tone}
+      data-turn-id={presentation?.turnId}
+      data-run-id={presentation?.runId}
+      data-request-id={presentation?.requestId}
+      data-turn-lifecycle={resolvedLifecycle}
+      data-action-kind={presentation?.actionKind}
       data-testid="goal-popover-panel"
     >
       <header className="goal-popover-header">
         <div className="goal-popover-heading">
-          <span className={`goal-popover-icon ${statusTone(status)}`} aria-hidden="true">
+          <span className={`goal-popover-icon ${toneClass}`} aria-hidden="true">
             <IconGoal className="h-4 w-4" />
           </span>
           <div className="min-w-0">
             <div id="goal-popover-title" className="goal-popover-eyebrow">
               {language === "zh" ? "持续目标" : "Persistent Goal"}
             </div>
-            <div className={`goal-status-label ${statusTone(status)}`}>
+            <div className={`goal-status-label ${toneClass}`}>
               {buildGoalStatusLabel(status, language)}
             </div>
           </div>
@@ -203,7 +220,7 @@ export default function GoalPanel({
               <p className="goal-objective" title={resolvedGoal.rawText || resolvedGoal.objective}>
                 {resolvedGoal.rawText || resolvedGoal.objective}
               </p>
-              {canEdit && (
+              {presentationBehavior.canEdit && (
                 <button
                   type="button"
                   className="goal-icon-button"
@@ -261,7 +278,7 @@ export default function GoalPanel({
             </div>
 
             {(runtime?.pauseReason || resolvedProgress?.pauseReason) && (
-              <div className="goal-notice" data-tone={status === "failed" ? "danger" : "warning"}>
+              <div className="goal-notice" data-tone={presentationBehavior.tone === "failed" ? "danger" : "warning"}>
                 {runtime?.pauseReason || resolvedProgress?.pauseReason}
               </div>
             )}
@@ -298,12 +315,12 @@ export default function GoalPanel({
 
       {!editing && (
         <footer className="goal-popover-actions">
-          {status === "active" || status === "pausing" ? (
-            <button type="button" className="goal-action-button goal-action-primary" onClick={onPause} disabled={status === "pausing"} data-testid="goal-pause-button">
+          {presentationBehavior.primaryAction === "pause" ? (
+            <button type="button" className="goal-action-button goal-action-primary" onClick={onPause} disabled={presentationBehavior.primaryActionPending} data-testid="goal-pause-button">
               <IconPause className="h-3.5 w-3.5" />
-              {status === "pausing" ? (language === "zh" ? "正在暂停" : "Pausing") : (language === "zh" ? "暂停" : "Pause")}
+              {presentationBehavior.primaryActionPending ? (language === "zh" ? "正在暂停" : "Pausing") : (language === "zh" ? "暂停" : "Pause")}
             </button>
-          ) : canResume ? (
+          ) : presentationBehavior.canResume ? (
             <button type="button" className="goal-action-button goal-action-primary" onClick={onResume} data-testid="goal-resume-button">
               <IconPlay className="h-3.5 w-3.5" />
               {language === "zh" ? "继续" : "Resume"}

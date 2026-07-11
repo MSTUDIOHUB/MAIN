@@ -55,6 +55,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const runtimeTools = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtimeTools.ts"));
 const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
+const turnPreparation = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/turnPreparation.ts"));
 const toolFeedbackEnvelope = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
 
 const {
@@ -405,6 +406,18 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
     ["turn.completed", "turn.failed"],
   );
 
+  const threadStarted = withEventSchema({
+    type: "thread.started",
+    threadId: "thread-1",
+    timestampMs: 0,
+  });
+  const preservedThread = [started, completed, failed].reduce(
+    (events, event) => appendRuntimeEvent(events, event, 2),
+    appendRuntimeEvent([], threadStarted, 2),
+  );
+  assert.deepEqual(preservedThread.map((event) => event.type), ["thread.started", "turn.failed"]);
+  assert.equal(appendRuntimeEvent(preservedThread, threadStarted, 2), preservedThread);
+
   const slash = withEventSchema({
     type: "slash.command.started",
     threadId: "thread-1",
@@ -427,6 +440,64 @@ test("thread event helpers stamp schema, detect terminal events, and keep ring b
     rule: "docs",
   });
   assert.equal(alias.type, "path_alias_hit");
+});
+
+test("runtime event reducer keeps one terminal event per run and one terminal event per turn", () => {
+  const paused = withEventSchema({
+    type: "run.paused",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    parentRunId: null,
+    timestampMs: 1,
+    reason: "awaiting_input",
+    message: "choose",
+  });
+  const completedSameRun = withEventSchema({
+    type: "run.completed",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    parentRunId: null,
+    timestampMs: 2,
+  });
+  const completedTurn = withEventSchema({
+    type: "turn.completed",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    timestampMs: 3,
+  });
+  const failedSameTurn = withEventSchema({
+    type: "turn.failed",
+    threadId: "thread-1",
+    turnId: "turn-1",
+    timestampMs: 4,
+    error: { message: "late failure" },
+  });
+  const events = [completedSameRun, completedTurn, failedSameTurn].reduce(
+    (current, event) => appendRuntimeEvent(current, event),
+    appendRuntimeEvent([], paused),
+  );
+  assert.deepEqual(events.map((event) => event.type), ["run.paused", "turn.completed"]);
+});
+
+test("Goal slice completion terminates only the child run, not the long-lived turn", () => {
+  const events = [];
+  const emitter = turnPreparation.createTurnEventEmitter({
+    getSessionKey: () => "session-goal",
+    getCurrentTurnId: () => "turn-goal",
+    getGoalTurnContract: () => ({ goalSliceId: "goal-1:slice:1" }),
+    getCurrentRunIdentity: () => ({
+      runId: "run-goal-slice-1",
+      parentRunId: "run-goal",
+      goalSliceId: "goal-1:slice:1",
+    }),
+    onTurnEvent: (event) => events.push(event),
+  });
+
+  emitter.emitTurnCompletedEvent();
+  assert.deepEqual(events.map((event) => event.type), ["run.completed"]);
+  assert.equal(events[0].goalSliceId, "goal-1:slice:1");
 });
 
 test("tool feedback envelope v1 supports parse/format roundtrip", () => {

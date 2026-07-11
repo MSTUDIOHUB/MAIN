@@ -28,6 +28,7 @@ import { executeTool } from "./toolExecutor";
 import { computeContextTokenBreakdown, estimateMessagesTokens, estimateTokens, manageContext, type TrimMessage } from "./contextTrim";
 import type { ContextMemoryState } from "./contextMemory";
 import { generateId } from "./utils";
+import { readHarnessRunMarker } from "./harnessCrashTelemetry";
 import {
   type MCPServer,
   type MCPTool,
@@ -98,6 +99,7 @@ import {
   analyzePlanDecisionFork,
   repairActionablePlanArtifactContent,
   validatePlanArtifactContent,
+  type PlanArtifact,
   type PlanArtifactQualityResult,
   type PlanArtifactRecoveryAction,
   type PlanExecutionEvidenceEntry,
@@ -1209,6 +1211,11 @@ export interface OrchestratorCallbacks {
   getAssociatedPaths: () => string[];
   getSessionKey: () => string;
   getCurrentTurnId?: () => string | null;
+  getCurrentRunIdentity?: () => {
+    runId: string;
+    parentRunId: string | null;
+    goalSliceId?: string;
+  };
   getSubagentDepth?: () => number;
   getSnapshotContextLimit?: () => number;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
@@ -1227,6 +1234,7 @@ export interface OrchestratorCallbacks {
   getApprovedLocalFileReadPaths: () => string[];
   getAutoApproveToolScopes?: () => SessionAutoApproveScope[];
   getPlanStage: () => "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
+  getPlanArtifacts?: () => PlanArtifact[];
   getPlanTasks: () => PlanTask[];
   getPlanExecutionEvidenceLedger: () => PlanExecutionEvidenceEntry[];
   getPlanAutoResumeCount?: () => number;
@@ -1240,6 +1248,7 @@ export interface OrchestratorCallbacks {
   onProviderCompatibilityFallback?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
+  onModelUsage?: (usage: NonNullable<StreamResult["usage"]>) => void;
   runSubagent?: (
     request: import("./subagents").SpawnSubagentRequest,
     options?: { signal?: AbortSignal },
@@ -1287,6 +1296,7 @@ export interface OrchestratorCallbacks {
   ) => void;
   onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => void;
   onPlanStageChanged: (stage: "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
+  onPlanApprovalInvalidated?: (reason: string) => void;
   onPlanTasksUpdated: (content: string) => void;
   onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
   onApprovedPlanExecutionStarted?: () => void;
@@ -1303,6 +1313,7 @@ export interface OrchestratorCallbacks {
     status?: "pending" | "running" | "done" | "failed";
   }) => void;
   onTurnEvent?: (event: MainThreadEvent) => void;
+  hasRuntimeThreadStarted?: (threadId: string) => boolean;
   onHarnessRunUpdate?: (patch: Record<string, unknown>) => void;
   onInstructionsResolved: (resolved: ResolvedInstructionSet) => void;
   onHooksLoaded: (hooks: HookDefinition[], loadedAt?: number | null) => void;
@@ -3118,6 +3129,7 @@ interface PlanMaterializationResultForLoop {
   content?: string;
   reason?: string;
   source?: PlanMaterializationSource;
+  quality?: PlanArtifactQualityResult;
   toolResult?: ToolExecutionResult;
   /** Extracted reply options from <user_options> blocks. */
   replyOptions?: string[];
@@ -3131,6 +3143,7 @@ async function writeMaterializedPlanArtifact(input: {
     content?: string;
     reason?: string;
     source?: PlanMaterializationSource;
+    quality?: PlanArtifactQualityResult;
   };
   workspace: string;
   callbacks: OrchestratorCallbacks;
@@ -3141,6 +3154,7 @@ async function writeMaterializedPlanArtifact(input: {
     return {
       ok: false,
       reason: materialized.reason || "quality_gate",
+      quality: materialized.quality,
     };
   }
 
@@ -4160,6 +4174,7 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
     return {
       ok: false,
       reason: materialized.reason || "quality_gate",
+      quality: materialized.quality,
       replyOptions: materialized.replyOptions,
     };
   }
@@ -4679,7 +4694,19 @@ export const CONCISE_PLAN_ARTIFACT_HINT_EN =
 
 export function logAgentEvent(event: string, data: Record<string, unknown> = {}) {
   try {
-    console.info(`[agent.${event}]`, data);
+    const marker = readHarnessRunMarker();
+    console.info(`[agent.${event}]`, {
+      sessionKey: data.sessionKey ?? data.threadId ?? marker?.sessionKey ?? null,
+      turnId: data.turnId ?? marker?.turnId ?? null,
+      runId: data.runId ?? marker?.lastGoalSliceRunId ?? marker?.runId ?? null,
+      parentRunId: data.parentRunId ?? marker?.parentRunId ?? null,
+      goalId: data.goalId ?? null,
+      goalSliceId: data.goalSliceId ?? null,
+      planRevision: data.planRevision ?? null,
+      stopClass: data.stopClass ?? null,
+      actionRequestId: data.actionRequestId ?? null,
+      ...data,
+    });
   } catch {
     // Logging must never affect the agent loop.
   }

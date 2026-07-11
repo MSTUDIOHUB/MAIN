@@ -35,7 +35,7 @@ export interface AgentLoopRuntimeActions {
     mode: Exclude<ExecuteRecoveryMode, "normal">,
     reason: string,
     context?: Record<string, unknown>,
-  ) => void;
+  ) => ExecuteRecoveryRuntimeState;
   activateChatFinalSynthesis: (
     reason: string,
     context?: Record<string, unknown>,
@@ -105,6 +105,7 @@ export function createAgentLoopRuntimeActions(input: {
       ),
       ...context,
     });
+    return nextState;
   };
 
   const activateChatFinalSynthesis: AgentLoopRuntimeActions["activateChatFinalSynthesis"] = (

@@ -1,5 +1,4 @@
 import {
-  buildApprovedPlanContinuationPrompt,
   buildPlanReviewReadyMessage,
   collectPlanClosureMaterializationInput,
   compactDiagnosticText,
@@ -9,13 +8,11 @@ import {
 } from "../../orchestrator";
 import { resolvePlanClosureArtifactKind } from "../../orchestrator/planOrchestration";
 import { composeReviewablePlanFromEvidence } from "../../planMaterialization";
+import { buildPlanApprovalIdentity } from "../../planApprovalIdentity";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { OrchestratorCallbacks } from "../types";
-import {
-  resetApprovedPlanHandoffRecoveryState,
-  type ApprovedPlanRecoveryRuntimeState,
-} from "./approvedPlanRecoveryRuntime";
+import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import {
   markPlanClosurePromptIssued,
   type PlanLoopRuntimeState,
@@ -79,8 +76,6 @@ export function createPlanReviewRuntimeHandlers(input: {
     getIteration,
     getPlanRuntimeState,
     setPlanRuntimeState,
-    getApprovedPlanRecoveryState,
-    setApprovedPlanRecoveryState,
     setPlanRuntimePhase,
   } = input;
 
@@ -122,6 +117,17 @@ export function createPlanReviewRuntimeHandlers(input: {
       });
       return "not_reviewable";
     }
+    const reviewIdentity = callbacks.getPlanArtifacts
+      ? buildPlanApprovalIdentity(callbacks.getPlanArtifacts())
+      : null;
+    if (callbacks.getPlanArtifacts && !reviewIdentity) {
+      logAgentEvent("plan_review_blocked_missing_artifact", {
+        trigger,
+        iteration: getIteration(),
+        planStage: stage,
+      });
+      return "not_reviewable";
+    }
     const language = callbacks.getPreferredLanguage();
     logAgentEvent("plan_review_ready_after_tool", {
       trigger,
@@ -129,6 +135,9 @@ export function createPlanReviewRuntimeHandlers(input: {
       planStage: stage,
       isPlanApproved: callbacks.getIsPlanApproved(),
       statusBeforeReview: callbacks.getStatus(),
+      planRevision: reviewIdentity?.revision ?? null,
+      artifactHash: reviewIdentity?.artifactHash ?? null,
+      artifactPaths: reviewIdentity?.artifactPaths ?? [],
     });
     if (stage === "design") {
       logAgentEvent("plan_design_review_ready_after_tool", {
@@ -148,31 +157,15 @@ export function createPlanReviewRuntimeHandlers(input: {
       callbacks.onStatusChange("pending_review");
     }
     callbacks.onAssistantFinalText(buildPlanReviewReadyMessage(language, stage));
-    const approved = await waitForPlanApprovalIfNeeded();
-    if (!approved) {
-      if (callbacks.getStatus() !== "pending_review") {
-        callbacks.onStatusChange("idle");
-      }
-      return "stopped";
-    }
-
-    callbacks.onPlanStageChanged("executing");
-    setApprovedPlanRecoveryState(
-      resetApprovedPlanHandoffRecoveryState(getApprovedPlanRecoveryState()),
-    );
-    // Planning reads/writes are evidence for drafting, not execution history.
-    // Start the approved execution phase with a fresh activity window so its
-    // first model iteration can read the exact source it is about to edit.
-    recentPlanToolActivity.length = 0;
-    attemptedPlanWriteTargets.length = 0;
-    const continuationPrompt = buildApprovedPlanContinuationPrompt(callbacks);
-    callbacks.onApprovedPlanExecutionStarted?.();
-    callbacks.onStatusChange("running");
-    callbacks.appendMessage({
-      role: "user",
-      content: continuationPrompt,
+    logAgentEvent("plan_review_run_paused", {
+      trigger,
+      iteration: getIteration(),
+      planRevision: reviewIdentity?.revision ?? null,
+      artifactHash: reviewIdentity?.artifactHash ?? null,
     });
-    return "approved_continue";
+    // Approval belongs to a fresh child run. The store validates the current
+    // revision/hash and starts that run with the same logical turnId.
+    return "stopped";
   };
 
   const tryClosePlanWithEvidence = async (

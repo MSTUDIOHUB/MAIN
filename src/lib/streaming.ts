@@ -124,6 +124,50 @@ export interface StreamResult {
   finishReason: "stop" | "length" | "tool_calls" | null;
   reasoningContent?: string;
   reasoningField?: "reasoning_content" | "reasoning";
+  usage?: {
+    inputTokens: number;
+    outputTokens: number;
+    totalTokens: number;
+  };
+}
+
+function extractProviderTokenUsage(payload: unknown): StreamResult["usage"] | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const record = payload as Record<string, unknown>;
+  const usage = (record.usage && typeof record.usage === "object"
+    ? record.usage
+    : record.usageMetadata && typeof record.usageMetadata === "object"
+      ? record.usageMetadata
+      : record) as Record<string, unknown>;
+  const finite = (...values: unknown[]): number => {
+    for (const value of values) {
+      const numberValue = Number(value);
+      if (Number.isFinite(numberValue) && numberValue >= 0) return Math.floor(numberValue);
+    }
+    return 0;
+  };
+  const inputTokens = finite(
+    usage.input_tokens,
+    usage.prompt_tokens,
+    usage.promptTokenCount,
+    usage.prompt_eval_count,
+    record.prompt_eval_count,
+  );
+  const outputTokens = finite(
+    usage.output_tokens,
+    usage.completion_tokens,
+    usage.candidatesTokenCount,
+    usage.eval_count,
+    record.eval_count,
+  );
+  const totalTokens = finite(
+    usage.total_tokens,
+    usage.totalTokenCount,
+    record.total_tokens,
+    inputTokens + outputTokens,
+  );
+  if (inputTokens === 0 && outputTokens === 0 && totalTokens === 0) return undefined;
+  return { inputTokens, outputTokens, totalTokens: totalTokens || inputTokens + outputTokens };
 }
 
 const REASONING_ONLY_STREAM_GUARD_CHAR_LIMIT = 12_000;
@@ -919,6 +963,7 @@ async function requestOpenAiNonStreaming(
           ? extractOpenAiChatCompletionFinishReason(payload)
           : "stop",
       ...reasoning,
+      ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
     };
 
     if (content) onToken(content);
@@ -1022,7 +1067,12 @@ async function streamViaRustProxy(
       const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
       const content = extractGeminiResponseText(payload);
       if (content) onToken(content);
-      const result: StreamResult = { content, toolCalls: [], finishReason: "stop" };
+      const result: StreamResult = {
+        content,
+        toolCalls: [],
+        finishReason: "stop",
+        ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
+      };
       onDone(result);
       return result;
     } catch (err) {
@@ -1067,6 +1117,7 @@ async function streamViaRustProxy(
   let emittedOpenAiCompatibleReasoning = "";
   let providerReasoningContent = "";
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
+  let providerTokenUsage: StreamResult["usage"] | undefined;
   let visibleContentChars = 0;
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
   const toolCallsMap = new Map<number, StreamedToolCall>();
@@ -1106,6 +1157,7 @@ async function streamViaRustProxy(
     content: fullContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
       ? {
           reasoningContent: providerReasoningContent,
@@ -1207,6 +1259,7 @@ async function streamViaRustProxy(
         if (!trimmed || !trimmed.startsWith("{")) continue;
         try {
           const json = JSON.parse(trimmed);
+          providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
           if (json.done) { finishReason = "stop"; continue; }
           const contentDelta = json.message?.content ?? "";
           if (contentDelta) {
@@ -1229,6 +1282,7 @@ async function streamViaRustProxy(
               ? trimmed.slice(5).trimStart()
               : trimmed;
           const json = JSON.parse(jsonText);
+          providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
           const extracted = extractOpenAiCompatibleDelta(json);
 
           // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)
@@ -1596,7 +1650,12 @@ export async function streamChatCompletion(
       const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
       const content = extractGeminiResponseText(payload);
       if (content) onToken(content);
-      const result: StreamResult = { content, toolCalls: [], finishReason: "stop" };
+      const result: StreamResult = {
+        content,
+        toolCalls: [],
+        finishReason: "stop",
+        ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
+      };
       onDone(result);
       return result;
     } catch (err) {
@@ -1685,6 +1744,7 @@ export async function streamChatCompletion(
   let emittedOpenAiCompatibleReasoning = "";
   let providerReasoningContent = "";
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
+  let providerTokenUsage: StreamResult["usage"] | undefined;
   let visibleContentChars = 0;
 
   // Track finish_reason from the stream
@@ -1715,6 +1775,7 @@ export async function streamChatCompletion(
     content: fullContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
       ? {
           reasoningContent: providerReasoningContent,
@@ -1748,6 +1809,7 @@ export async function streamChatCompletion(
 
           try {
             const json = JSON.parse(trimmed);
+            providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
             if (json.done) {
               finishReason = "stop";
               continue;
@@ -1779,6 +1841,7 @@ export async function streamChatCompletion(
                 ? trimmed.slice(5).trimStart()
                 : trimmed;
             const json = JSON.parse(jsonText);
+            providerTokenUsage = extractProviderTokenUsage(json) || providerTokenUsage;
             const extracted = extractOpenAiCompatibleDelta(json);
 
             // Handle reasoning_content from thinking models (Qwen3.5, DeepSeek-R1, etc.)

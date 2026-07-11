@@ -79,6 +79,7 @@ function baseSnapshot(overrides = {}) {
   return {
     agentStatus: "idle",
     currentTurnId: null,
+    currentSessionKey: "session-1",
     conversationTurns: [],
     taskFlow: [],
     selectedMainModeKey: "main_mode",
@@ -255,7 +256,7 @@ test("submit input envelope preserves hidden language and linked Feishu context"
   assert.deepEqual(envelope.remoteFeishu, linkedContext);
 });
 
-test("submit pipeline reuses awaiting-choice turns only on exact reply option match", () => {
+test("submit pipeline reuses awaiting-choice turns only with exact request identity and option", () => {
   const currentTurn = turn();
   const taskFlow = [
     {
@@ -266,18 +267,33 @@ test("submit pipeline reuses awaiting-choice turns only on exact reply option ma
       options: [
         { label: "继续分析 Main Camera", value: "继续分析 Main Camera", action: "continue_readonly_once" },
       ],
+      choiceRequest: {
+        sessionKey: "session-1",
+        turnId: "turn-1",
+        runId: "run-choice-1",
+        requestId: "request-choice-1",
+        parentRunId: null,
+        optionValues: ["继续分析 Main Camera"],
+        status: "pending",
+      },
     },
   ];
 
   const exact = buildSubmitPipelineDecision({
     text: "继续分析 Main Camera",
+    options: {
+      reuseCurrentTurn: true,
+      replyOptionSourceTurnId: "turn-1",
+      selectedReplyOptionText: "继续分析 Main Camera",
+      replyOptionRequestIdentity: taskFlow[0].choiceRequest,
+    },
     snapshot: baseSnapshot({
       currentTurnId: "turn-1",
       conversationTurns: [currentTurn],
       taskFlow,
     }),
   });
-  assert.equal(exact.turnReuse.shouldAutoResumeChoiceTurn, true);
+  assert.equal(exact.turnReuse.shouldExplicitlyReuseCurrentTurn, true);
   assert.equal(exact.turnReuse.reuseCurrentTurn, true);
   assert.equal(exact.routeKind, "agent_loop");
   assert.equal(exact.effects.launchAgentLoop, true);
@@ -292,6 +308,33 @@ test("submit pipeline reuses awaiting-choice turns only on exact reply option ma
   });
   assert.equal(ordinary.turnReuse.shouldAutoResumeChoiceTurn, false);
   assert.equal(ordinary.turnReuse.reuseCurrentTurn, false);
+
+  const sameTextWithoutIdentity = buildSubmitPipelineDecision({
+    text: "继续分析 Main Camera",
+    snapshot: baseSnapshot({
+      currentTurnId: "turn-1",
+      conversationTurns: [currentTurn],
+      taskFlow,
+    }),
+  });
+  assert.equal(sameTextWithoutIdentity.turnReuse.shouldAutoResumeChoiceTurn, false);
+  assert.equal(sameTextWithoutIdentity.turnReuse.reuseCurrentTurn, false);
+
+  const staleIdentity = buildSubmitPipelineDecision({
+    text: "继续分析 Main Camera",
+    options: {
+      reuseCurrentTurn: true,
+      replyOptionSourceTurnId: "turn-1",
+      selectedReplyOptionText: "继续分析 Main Camera",
+      replyOptionRequestIdentity: { ...taskFlow[0].choiceRequest, requestId: "stale-request" },
+    },
+    snapshot: baseSnapshot({
+      currentTurnId: "turn-1",
+      conversationTurns: [currentTurn],
+      taskFlow,
+    }),
+  });
+  assert.equal(staleIdentity.turnReuse.reuseCurrentTurn, false);
 });
 
 test("hidden plan recovery can explicitly reuse its original logical turn", () => {

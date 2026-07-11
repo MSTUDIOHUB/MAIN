@@ -1,8 +1,15 @@
 import type { TaskBlock } from "./taskTypes";
+import {
+  ACTION_REQUEST_SCHEMA_VERSION,
+  createActionRequestId,
+  type ToolPermissionActionRequest,
+} from "./actionRequest";
 
 type PendingToolCallLike = {
+  toolCallId?: string;
   name?: string;
   arguments?: unknown;
+  risk?: "local_file_read" | "browser_control";
   localFileReadPath?: string;
   shellPermissionDecision?: unknown;
 } | null | undefined;
@@ -60,6 +67,40 @@ export function derivePendingReviewTarget(toolName: string, args: Record<string,
   return toolName || "tool request";
 }
 
+export function buildToolPermissionActionRequest(input: {
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  parentRunId?: string | null;
+  title: string;
+  taskId: number;
+  toolCall: NonNullable<PendingToolCallLike>;
+  now?: number;
+}): ToolPermissionActionRequest {
+  const now = input.now ?? Date.now();
+  const toolName = String(input.toolCall.name || "tool").trim() || "tool";
+  const args = normalizeToolArguments(input.toolCall.arguments);
+  const risk: ToolPermissionActionRequest["risk"] = input.toolCall.shellPermissionDecision
+    ? "shell"
+    : input.toolCall.risk || (/^(?:apply_patch|replace_in_file|write_file|delete_file)$/i.test(toolName) ? "write" : "unknown");
+  return {
+    schemaVersion: ACTION_REQUEST_SCHEMA_VERSION,
+    requestId: createActionRequestId("tool_permission", input.runId, now),
+    kind: "tool_permission",
+    sessionKey: input.sessionKey,
+    turnId: input.turnId,
+    runId: input.runId,
+    parentRunId: input.parentRunId || null,
+    title: String(input.title || "").trim() || toolName,
+    status: "pending",
+    createdAt: now,
+    taskId: input.taskId,
+    toolName,
+    target: derivePendingReviewTarget(toolName, args, input.toolCall.localFileReadPath),
+    risk,
+  };
+}
+
 export function buildPendingReviewFallbackTask(input: {
   taskId: number | null;
   toolCall: PendingToolCallLike;
@@ -83,13 +124,24 @@ export function buildPendingReviewFallbackTask(input: {
 
 export function resolveVisiblePendingToolReview(input: {
   taskFlow: TaskBlock[];
+  request: ToolPermissionActionRequest | null | undefined;
   pendingReviewTaskId: number | null;
   pendingToolCall: PendingToolCallLike;
-  currentTurnId?: string | null;
   activeDiffTask?: unknown;
 }): ToolTaskBlock | null {
+  const request = input.request;
+  if (
+    !request ||
+    request.status !== "pending" ||
+    input.pendingReviewTaskId !== request.taskId
+  ) {
+    return null;
+  }
+
+  const isExactRequestTask = (task: ToolTaskBlock | null | undefined): task is ToolTaskBlock =>
+    !!task && task.type === "tool" && task.id === request.taskId && task.turnId === request.turnId;
   const activeTask = input.activeDiffTask as ToolTaskBlock | null | undefined;
-  if (activeTask && activeTask.type === "tool") {
+  if (isExactRequestTask(activeTask)) {
     return {
       ...activeTask,
       status: "pending_review",
@@ -97,14 +149,9 @@ export function resolveVisiblePendingToolReview(input: {
     };
   }
 
-  const byPendingId = input.pendingReviewTaskId != null
-    ? input.taskFlow.find((task): task is ToolTaskBlock => task.type === "tool" && task.id === input.pendingReviewTaskId)
-    : null;
-  const byVisibleStatus = input.taskFlow.find((task): task is ToolTaskBlock =>
-    task.type === "tool" &&
-    (task.status === "pending_review" || (input.pendingReviewTaskId != null && task.id === input.pendingReviewTaskId && task.toolStatus === "pending"))
+  const pendingTask = input.taskFlow.find((task): task is ToolTaskBlock =>
+    task.type === "tool" && task.id === request.taskId && task.turnId === request.turnId
   );
-  const pendingTask = byPendingId || byVisibleStatus;
   if (pendingTask) {
     return {
       ...pendingTask,
@@ -113,9 +160,20 @@ export function resolveVisiblePendingToolReview(input: {
     };
   }
 
+  const pendingToolCall = input.pendingToolCall;
+  if (!pendingToolCall) return null;
+  const pendingToolName = String(pendingToolCall.name || "tool").trim() || "tool";
+  const pendingToolArgs = normalizeToolArguments(pendingToolCall.arguments);
+  const pendingTarget = derivePendingReviewTarget(
+    pendingToolName,
+    pendingToolArgs,
+    pendingToolCall.localFileReadPath,
+  );
+  if (pendingToolName !== request.toolName || pendingTarget !== request.target) return null;
+
   return buildPendingReviewFallbackTask({
-    taskId: input.pendingReviewTaskId,
-    toolCall: input.pendingToolCall,
-    turnId: input.currentTurnId,
+    taskId: request.taskId,
+    toolCall: pendingToolCall,
+    turnId: request.turnId,
   });
 }

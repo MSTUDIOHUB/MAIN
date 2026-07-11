@@ -26,7 +26,7 @@ import {
 } from "./noToolRuntimeState";
 import { handlePlanNoToolRecovery } from "./planNoToolRecovery";
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
-import { applyPlanNoToolRuntimeState } from "./planRuntimeState";
+import { applyPlanNoToolRuntimeState, applyPlanRuntimePhase } from "./planRuntimeState";
 import type { TurnIterationContext } from "./turnIterationContext";
 
 type WorkflowMode = "chat" | "edit" | "plan";
@@ -213,6 +213,10 @@ export async function handleAssistantCompletionPhase(input: {
     return finish("continue");
   }
 
+  const setPlanRuntimePhaseAndSync: typeof input.setPlanRuntimePhase = (phase, reason, status) => {
+    input.setPlanRuntimePhase(phase, reason, status);
+    planRuntimeState = applyPlanRuntimePhase(planRuntimeState, { phase, reason }).state;
+  };
   const planNoToolRecovery = await handlePlanNoToolRecovery({
     callbacks: input.callbacks,
     activeProfile: input.activeProfile,
@@ -241,7 +245,7 @@ export async function handleAssistantCompletionPhase(input: {
     turnInputContextSignals: input.turnInputContextSignals,
     consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,
     ...planRuntimeState,
-    setPlanRuntimePhase: input.setPlanRuntimePhase,
+    setPlanRuntimePhase: setPlanRuntimePhaseAndSync,
     waitForPlanApprovalIfNeeded: input.waitForPlanApprovalIfNeeded,
     tryClosePlanWithEvidence: input.tryClosePlanWithEvidence,
   });

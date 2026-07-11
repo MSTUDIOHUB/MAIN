@@ -39,7 +39,7 @@ export async function handleMaxIterationBoundary(input: {
     phase: PlanExecutionProgressPhase,
     overrides?: Partial<PlanExecutionProgressUpdate>,
   ) => void;
-  emitTurnCompletedEvent: () => void;
+  emitRunPausedEvent: (reason: string, message: string) => void;
 }): Promise<MaxIterationBoundaryResult> {
   const {
     callbacks,
@@ -52,7 +52,7 @@ export async function handleMaxIterationBoundary(input: {
     sawExecuteOperationEvidence,
     executeRecoveryMode,
     emitPlanExecutionProgress,
-    emitTurnCompletedEvent,
+    emitRunPausedEvent,
   } = input;
 
   if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
@@ -80,11 +80,16 @@ export async function handleMaxIterationBoundary(input: {
         ? "点击 Resume Execution 后从检查点继续"
         : "click Resume Execution to continue from checkpoint",
     });
+    const pauseNotice = buildPlanMaxIterationsPauseNotice(
+      checkpoint,
+      callbacks.getPreferredLanguage(),
+    );
+    emitRunPausedEvent("max_iterations_boundary", pauseNotice);
     callbacks.onStatusChange("idle");
     const handled = await callbacks.onPlanMaxIterationsCheckpoint?.(checkpoint);
     if (handled) return { status: "handled" };
     callbacks.onNonActionableStop(
-      buildPlanMaxIterationsPauseNotice(checkpoint, callbacks.getPreferredLanguage()),
+      pauseNotice,
       "incomplete_plan",
       {
         phase: "paused",
@@ -121,12 +126,17 @@ export async function handleMaxIterationBoundary(input: {
       executeRecoveryMode,
     });
     const handled = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);
+    const pauseNotice = buildExecuteMaxIterationsPauseNotice(
+      checkpoint,
+      callbacks.getPreferredLanguage(),
+    );
+    emitRunPausedEvent("max_iterations_boundary", pauseNotice);
     if (handled) {
       callbacks.onStatusChange("idle");
       return { status: "handled" };
     }
     callbacks.onNonActionableStop(
-      buildExecuteMaxIterationsPauseNotice(checkpoint, callbacks.getPreferredLanguage()),
+      pauseNotice,
       "no_action",
     );
     callbacks.onStatusChange("idle");
@@ -143,10 +153,11 @@ export async function handleMaxIterationBoundary(input: {
     repeatedTargets,
     progressSignature: truncateForLog(progressSignature, 220),
   });
+  const pauseNotice = callbacks.getPreferredLanguage() === "zh"
+    ? `本轮达到 ${effectiveMaxIterations} 轮安全边界，已停止在可恢复状态。`
+    : `This turn reached the ${effectiveMaxIterations}-iteration safety boundary and stopped in a recoverable state.`;
   callbacks.onNonActionableStop(
-    callbacks.getPreferredLanguage() === "zh"
-      ? `本轮达到 ${effectiveMaxIterations} 轮安全边界，已停止在可恢复状态。`
-      : `This turn reached the ${effectiveMaxIterations}-iteration safety boundary and stopped in a recoverable state.`,
+    pauseNotice,
     "no_action",
     {
       progressSignature,
@@ -158,6 +169,6 @@ export async function handleMaxIterationBoundary(input: {
     },
   );
   callbacks.onStatusChange("idle");
-  emitTurnCompletedEvent();
+  emitRunPausedEvent("max_iterations_boundary", pauseNotice);
   return { status: "handled" };
 }

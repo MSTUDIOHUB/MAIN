@@ -7,6 +7,7 @@ import {
   type SubmitSendGateDecision,
 } from "../lib/submit/turnSubmission";
 import type { ConversationTurnStatus } from "../lib/workflowModels";
+import type { ResolvedRunIntent } from "../lib/runIntent";
 
 export interface SubmitSendGateEffectsState {
   isGenerating: boolean;
@@ -33,10 +34,19 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
   state: TState;
   mentionSnapshot: string[];
   attachedFilesSnapshot: Array<AttachedFile | string>;
+  queuedWorkflowContext?: {
+    runtimeIntentOverride?: ResolvedRunIntent;
+    goalSourceContextSnapshot?: string;
+  };
   queueUserMessage: (
     text: string,
     images?: string[],
-    options?: { contextMentions?: string[]; attachedFiles?: AttachedFile[] },
+    options?: {
+      contextMentions?: string[];
+      attachedFiles?: AttachedFile[];
+      runtimeIntentOverride?: ResolvedRunIntent;
+      goalSourceContextSnapshot?: string;
+    },
   ) => void;
   approvePendingReviewOnce: () => void;
   approvePlan: (approvalChoice?: string) => void;
@@ -106,6 +116,7 @@ export function applySubmitSendGateEffects<TState extends SubmitSendGateEffectsS
     input.queueUserMessage(input.text, input.images, {
       contextMentions: input.mentionSnapshot,
       attachedFiles: input.attachedFilesSnapshot.map((file) => normalizeAttachedFile(file)),
+      ...input.queuedWorkflowContext,
     });
     input.logStoreEvent("send_queued", {
       reason: decision.action.reason,

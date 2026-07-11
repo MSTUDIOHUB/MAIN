@@ -3,6 +3,7 @@ import type { TaskBlock } from "../lib/taskTypes";
 import type { ConversationTurn } from "../lib/workflowModels";
 import type { CommandDirective, LegacyWorkflowMode, ResolvedRunIntent } from "../lib/runIntent";
 import {
+  MAIN_THREAD_EVENT_SCHEMA_VERSION,
   appendRuntimeEvent,
   normalizeEventStreamMode,
   withEventSchema,
@@ -47,7 +48,7 @@ export interface GameStudioLocalSlashBridge {
 
 function buildLocalSlashRuntimeSnapshot(state: any): Record<string, unknown> {
   return {
-    runtimeEventSchemaVersion: 1,
+    runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents: state.runtimeEvents,
     harnessRunMarker: state.harnessRunMarker,
     taskFlow: state.taskFlow,

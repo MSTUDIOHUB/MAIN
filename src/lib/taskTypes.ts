@@ -4,6 +4,7 @@ import type { ProgressNarration } from "./progressNarration";
 import type { TurnRuntimePhase } from "./turnPhase";
 import type { UserContextItem } from "./userContextItems";
 import type { PlanExecutionProgressSnapshot, ReplyOption } from "./workflowModels";
+import type { UserChoiceResolutionIdentity } from "./actionRequest";
 
 export interface JobItem {
   id: string;
@@ -87,6 +88,7 @@ export type TaskBlock =
       type: "agent";
       content: string;
       options?: ReplyOption[];
+      choiceRequest?: UserChoiceResolutionIdentity;
       streaming?: boolean;
       hiddenProcess?: boolean;
       visibility?: AssistantTextVisibility;
@@ -99,7 +101,7 @@ export type TaskBlock =
     })
   | (TaskBlockBase & ImageGenerationBlockPayload)
   | ProgressTaskBlock
-  | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number })
+  | (TaskBlockBase & { type: "thought"; content: string; isStreaming?: boolean; duration?: number; originalChars?: number })
   | (TaskBlockBase & { type: "jobList"; jobs: JobItem[] })
   | (TaskBlockBase & {
       type: "system";

@@ -7,6 +7,11 @@ import {
 } from "../sessionTypes";
 import type { HarnessRunMarker } from "../harnessCrashTelemetry";
 import {
+  isExactUserChoiceResolutionIdentity,
+  isMatchingUserChoiceResolution,
+  type UserChoiceResolutionIdentity,
+} from "../actionRequest";
+import {
   normalizeTurnInputContextSignals,
   type TurnInputContextLike,
   type TurnInputContextSignals,
@@ -45,6 +50,7 @@ import {
   type ResolvedUserIntent,
   type RunIntentResolution,
 } from "../runIntent";
+import { shouldReuseLogicalTurnForSubmission } from "../runIdentity";
 import {
   resolvePlanStateHydrationReason,
   type PlanStateHydrationReason,
@@ -261,11 +267,17 @@ export interface SubmitPipelineOptions {
   skipAutoPlanHydration?: boolean;
   executionConsentGranted?: boolean;
   createVisibleTurnForHiddenMessage?: boolean;
+  replyOptionSourceTurnId?: string;
+  selectedReplyOptionText?: string;
+  replyOptionRequestIdentity?: UserChoiceResolutionIdentity;
+  replyOptionIsCustom?: boolean;
+  parentRunIdOverride?: string;
 }
 
 export interface SubmitPipelineSnapshot {
   agentStatus: string;
   currentTurnId: string | null;
+  currentSessionKey?: string | null;
   conversationTurns: ConversationTurn[];
   taskFlow: TaskBlock[];
   selectedMainModeKey: MainModeKey;
@@ -569,6 +581,7 @@ export type SubmitRunStatePatch<TConfig extends object> = {
   pendingSlashCommand: PendingSlashCommand | null;
   lockedComposerIntent: null;
   pendingRunDecision: null;
+  activeActionRequest: null;
   isGenerating: true;
   config: TConfig & { workflowMode: LegacyWorkflowMode };
   elapsedTime: 0;
@@ -1695,6 +1708,7 @@ export function archiveReplyOptionBlocksForChoice(
     return {
       ...block,
       options: undefined,
+      choiceRequest: undefined,
       archivedAfterChoice: true,
       ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
       ...(selectedChoiceText.trim() ? { selectedOption: selectedChoiceText.trim() } : {}),
@@ -1751,6 +1765,7 @@ export function archiveConsumedReplyOptionsFromTaskFlow(taskFlow: TaskBlock[]): 
     return {
       ...block,
       options: undefined,
+      choiceRequest: undefined,
       archivedAfterChoice: true,
       ...(hasOperationApprovalReplyOption(block.options) ? { archivedProposal: true } : {}),
       ...(selected ? { selectedOption: selected } : {}),
@@ -1847,9 +1862,9 @@ export function buildSubmitVisibleTurnPatch(
     if (params.isHidden || params.reuseCurrentTurn || turns.length === 0) return turns;
     const previousTurnIndex = turns.length - 1;
     const previousTurn = turns[previousTurnIndex];
-    if (!previousTurn || previousTurn.collapsed) return turns;
+    if (!previousTurn || (previousTurn.processCollapsed ?? previousTurn.collapsed)) return turns;
     return turns.map((turn, index) =>
-      index === previousTurnIndex ? { ...turn, collapsed: true } : turn,
+      index === previousTurnIndex ? { ...turn, processCollapsed: true, collapsed: true } : turn,
     );
   };
 
@@ -1928,6 +1943,7 @@ export function buildSubmitVisibleTurnPatch(
         status: params.initialTurnStatus,
         summary: "",
         blockIds: [userBlock.id],
+        processCollapsed: false,
         collapsed: false,
         createdAt: params.createdAtMs,
       }
@@ -1945,6 +1961,7 @@ export function buildSubmitVisibleTurnPatch(
         status: params.initialTurnStatus,
         summary: "",
         blockIds: [],
+        processCollapsed: false,
         collapsed: false,
         createdAt: params.createdAtMs,
       };
@@ -1973,9 +1990,9 @@ function autoCollapsePreviousTurnForLocalStudioTurn(params: {
   if (params.isHidden || params.reuseCurrentTurn || params.turns.length === 0) return params.turns;
   const previousTurnIndex = params.turns.length - 1;
   const previousTurn = params.turns[previousTurnIndex];
-  if (!previousTurn || previousTurn.collapsed) return params.turns;
+  if (!previousTurn || (previousTurn.processCollapsed ?? previousTurn.collapsed)) return params.turns;
   return params.turns.map((turn, index) =>
-    index === previousTurnIndex ? { ...turn, collapsed: true } : turn,
+    index === previousTurnIndex ? { ...turn, processCollapsed: true, collapsed: true } : turn,
   );
 }
 
@@ -2078,6 +2095,7 @@ export function buildSubmitLocalStudioTurnPatch(
         status: "done",
         summary: params.systemContent,
         blockIds: [...(userBlock ? [userBlock.id] : []), systemBlock.id],
+        processCollapsed: false,
         collapsed: false,
         createdAt: params.createdAtMs,
       },
@@ -2107,6 +2125,7 @@ export function buildSubmitRunStatePatch<TConfig extends object>(
       params.parsedStudioCommand?.type === "workflow" ? params.parsedStudioCommand : null,
     lockedComposerIntent: null,
     pendingRunDecision: null,
+    activeActionRequest: null,
     isGenerating: true,
     config: {
       ...params.currentConfig,
@@ -2348,6 +2367,7 @@ export function resolveSubmitTurnReuseDecision(input: {
   createVisibleTurnForHiddenMessage?: boolean;
   options?: SubmitPipelineOptions;
   currentTurnId: string | null;
+  currentSessionKey?: string | null;
   currentTurn: ConversationTurn | null;
   conversationTurns: ConversationTurn[];
   taskFlow: TaskBlock[];
@@ -2415,26 +2435,46 @@ export function resolveSubmitTurnReuseDecision(input: {
   const previousTurnContinuationIntent = previousTurnContinuationTarget
     ? resolveConversationTurnIntent(previousTurnContinuationTarget)
     : null;
-  const selectedAwaitingReplyOption = findReplyOptionMatchingSelectedText(
-    currentTurnReplyOptionBlocks.flatMap((block) => block.options || []),
-    input.text,
-  );
+  const submittedChoiceIdentity = input.options?.replyOptionRequestIdentity;
+  const identityOwnedChoiceBlock = submittedChoiceIdentity
+    ? currentTurnReplyOptionBlocks.find((block) =>
+        isExactUserChoiceResolutionIdentity(block.choiceRequest, submittedChoiceIdentity)
+      )
+    : null;
+  const choiceIdentityMatches = !!identityOwnedChoiceBlock && !!input.currentTurn &&
+    isMatchingUserChoiceResolution({
+      identity: identityOwnedChoiceBlock.choiceRequest,
+      sessionKey: input.currentSessionKey || "",
+      turnId: input.currentTurn.id,
+      optionValue: input.options?.selectedReplyOptionText || input.text,
+      isCustomReply: input.options?.replyOptionIsCustom === true,
+    });
+  const selectedAwaitingReplyOption = choiceIdentityMatches
+    ? findReplyOptionMatchingSelectedText(
+        identityOwnedChoiceBlock?.options || [],
+        input.options?.selectedReplyOptionText || input.text,
+      )
+    : null;
   const shouldAutoResumeChoiceTurn =
     !input.isHidden &&
     input.options?.reuseCurrentTurn !== true &&
     !!input.currentTurn &&
     currentTurnHasReplyOptions &&
+    choiceIdentityMatches &&
     !!selectedAwaitingReplyOption;
-  const shouldExplicitlyReuseCurrentTurn = input.options?.reuseCurrentTurn === true;
+  const isExplicitChoiceSubmission = !!input.options?.replyOptionSourceTurnId || !!submittedChoiceIdentity;
+  const shouldExplicitlyReuseCurrentTurn = input.options?.reuseCurrentTurn === true &&
+    (!isExplicitChoiceSubmission || choiceIdentityMatches);
   const requestedReuseTurnId = String(input.options?.turnIdOverride || "").trim();
   const reusableTurnId = requestedReuseTurnId
     ? input.conversationTurns.some((turn) => turn.id === requestedReuseTurnId)
       ? requestedReuseTurnId
       : null
     : input.currentTurnId;
-  const reuseCurrentTurn =
-    (shouldExplicitlyReuseCurrentTurn || shouldAutoResumeChoiceTurn || shouldContinuePlanIntent) &&
-    !!reusableTurnId;
+  const reuseCurrentTurn = shouldReuseLogicalTurnForSubmission({
+    explicitReuse: shouldExplicitlyReuseCurrentTurn,
+    exactChoiceMatch: shouldAutoResumeChoiceTurn,
+  }) && !!reusableTurnId;
   const isInternalTurn = input.isHidden && !reuseCurrentTurn && input.createVisibleTurnForHiddenMessage !== true;
   const shouldReuseExistingTurnIntent =
     reuseCurrentTurn &&
@@ -2643,6 +2683,7 @@ export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitP
     createVisibleTurnForHiddenMessage,
     options,
     currentTurnId: snapshot.currentTurnId,
+    currentSessionKey: snapshot.currentSessionKey,
     currentTurn,
     conversationTurns: snapshot.conversationTurns,
     taskFlow: snapshot.taskFlow,

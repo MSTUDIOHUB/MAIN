@@ -117,6 +117,19 @@ test("approved plan same-turn fallback retries busy once only while the exact tr
   }), "transition_stale");
   assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
     ...base,
+    expectedHandoff: { ...handoff, planRevision: 2, artifactHash: "plan-new" },
+    currentHandoff: { ...handoff, planRevision: 1, artifactHash: "plan-old" },
+    busyRetryAttempt: 0,
+  }), "transition_stale");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
+    expectedHandoff: { ...handoff, planRevision: 2, artifactHash: "plan-new" },
+    currentHandoff: { ...handoff, planRevision: 2, artifactHash: "plan-new" },
+    isAgentBusy: false,
+    busyRetryAttempt: 0,
+  }), "start");
+  assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
+    ...base,
     isAgentBusy: false,
     busyRetryAttempt: 0,
   }), "start");
@@ -151,6 +164,11 @@ const {
   handlePlanNoToolRecovery,
   resolvePlanNoToolRecoveryDecision,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planNoToolRecovery.ts"));
+const {
+  applyPlanNoToolRuntimeState,
+  applyPlanRuntimePhase,
+  createPlanLoopRuntimeState,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planRuntimeState.ts"));
 
 const {
   buildFileUnchangedReplayContent,
@@ -367,6 +385,7 @@ function createPlanNoToolHarness(language = "zh") {
     phases,
     callbacks: {
       getPreferredLanguage: () => language,
+      getMessages: () => [],
       getIsPlanApproved: () => false,
       getPlanStage: () => "requirements",
       appendMessage: (message) => appended.push(message),
@@ -409,9 +428,13 @@ function createPlanNoToolInput(harness, overrides = {}) {
     consecutiveNoToolCount: 0,
     usedPlanRecoveryPrompt: false,
     planClosureEvidenceRecoveryIssued: false,
+    planRuntimePhase: "drafting",
     planEvidenceRecoveryPasses: 0,
+    planQualityRejectCount: 0,
     planLastQualityGateReason: "",
+    planLastMissingSections: [],
     planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
     setPlanRuntimePhase: (phase, reason, status) => harness.phases.push({ type: "runtime", phase, reason, status }),
     waitForPlanApprovalIfNeeded: async () => false,
     tryClosePlanWithEvidence: async () => "failed",
@@ -474,6 +497,165 @@ test("plan no-tool decision separates materialization refine and continuation pa
   assert.equal(refine.shouldRefineLongPlanIntoChoice, true);
   assert.equal(refine.shouldMaterializeFallbackPlan, false);
   assert.equal(continuation.shouldForcePlanContinuation, true);
+});
+
+test("plan no-tool decision separates visible candidates from accepted artifacts", () => {
+  const common = {
+    workflowMode: "plan",
+    isPlanApproved: false,
+    currentPlanStage: "requirements",
+    sourceVisibleText: "# Plan\n\n## Summary\nA structured candidate",
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    wasTruncated: false,
+    hasExecutablePlanProposalOptions: false,
+    planReplyOptionsRoutedToArtifact: false,
+    finalReplyOptionsCount: 0,
+    turnIntent: "plan",
+    commandDirectiveAction: null,
+  };
+
+  const visibleCandidate = resolvePlanNoToolRecoveryDecision({
+    ...common,
+    hasStructuredProposal: true,
+    hasReviewablePlanArtifacts: false,
+    planArtifactQualityRejected: false,
+  });
+  const acceptedArtifact = resolvePlanNoToolRecoveryDecision({
+    ...common,
+    hasStructuredProposal: false,
+    hasReviewablePlanArtifacts: true,
+    planArtifactQualityRejected: false,
+  });
+  const replacementCandidate = resolvePlanNoToolRecoveryDecision({
+    ...common,
+    hasStructuredProposal: true,
+    hasReviewablePlanArtifacts: true,
+    planArtifactQualityRejected: true,
+  });
+
+  assert.equal(visibleCandidate.shouldMaterializeStructuredProposal, true);
+  assert.equal(visibleCandidate.shouldEnterReview, false);
+  assert.equal(acceptedArtifact.shouldMaterializeStructuredProposal, false);
+  assert.equal(acceptedArtifact.shouldEnterReview, true);
+  assert.equal(replacementCandidate.shouldMaterializeStructuredProposal, true);
+  assert.equal(replacementCandidate.shouldEnterReview, false);
+});
+
+test("visible plan materialization rejection enters typed recovery instead of falling through", async () => {
+  const harness = createPlanNoToolHarness("zh");
+  let approvalWaitCalls = 0;
+  const visiblePlan = [
+    "# Proposed Plan: 修复 Markdown 文件打开链路",
+    "",
+    "## 摘要",
+    "- 用户目标：修复双击 Markdown 文件无法打开的问题。",
+    "",
+    "## 已确认证据",
+    "- 已读取 `src/main.js`，确认当前前端文件打开入口。",
+    "",
+    "## 关键改动",
+    "1. 修改 `src/main.js`，统一前端文件打开入口。",
+    "2. 修改 `index.html`，调整脚本加载与启动参数传递。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API，只调整内部启动流程。",
+    "",
+    "## 测试方案",
+    "- 运行前端构建，并手动验证双击文件和工具栏按钮。",
+    "",
+    "## 假设与默认值",
+    "- 保持编辑器、保存和预览行为不变。",
+  ].join("\n");
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    hasStructuredProposal: true,
+    sourceVisibleText: visiblePlan,
+    streamText: visiblePlan,
+    hasMeaningfulVisibleText: true,
+    normalizedVisibleText: visiblePlan,
+    sawPlanModeToolActivity: true,
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "前端当前监听 open-file-event",
+    }],
+    waitForPlanApprovalIfNeeded: async () => {
+      approvalWaitCalls += 1;
+      return false;
+    },
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planQualityRejectCount, 1);
+  assert.equal(result.planArtifactQualityRejected, false);
+  assert.match(result.planLastQualityGateReason, /ungrounded_plan_change_targets:index\.html/);
+  assert.equal(approvalWaitCalls, 0);
+  assert.equal(harness.statuses.includes("pending_review"), false);
+  assert.equal(harness.stops.length, 0);
+  assert.ok(harness.phases.some((entry) => entry.phase === "needs_evidence"));
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+
+  const needsEvidencePhase = harness.phases.findLast((entry) => entry.phase === "needs_evidence");
+  let foldedState = createPlanLoopRuntimeState({ workflowMode: "plan", isPlanApproved: false });
+  foldedState = applyPlanRuntimePhase(foldedState, {
+    phase: needsEvidencePhase.phase,
+    reason: needsEvidencePhase.reason,
+  }).state;
+  foldedState = applyPlanNoToolRuntimeState(foldedState, result);
+  assert.equal(foldedState.planRuntimePhase, "needs_evidence");
+  assert.equal(foldedState.planQualityRejectCount, 1);
+  assert.equal(foldedState.planArtifactQualityRejected, false);
+
+  const nextCandidate = resolvePlanNoToolRecoveryDecision({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planArtifactQualityRejected: foldedState.planArtifactQualityRejected,
+    hasStructuredProposal: true,
+    hasReviewablePlanArtifacts: false,
+    currentPlanStage: "requirements",
+    sourceVisibleText: visiblePlan.replace("index.html", "src/main.js"),
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    wasTruncated: false,
+    hasExecutablePlanProposalOptions: false,
+    planReplyOptionsRoutedToArtifact: false,
+    finalReplyOptionsCount: 0,
+    turnIntent: "plan",
+    commandDirectiveAction: null,
+  });
+  assert.equal(nextCandidate.shouldMaterializeStructuredProposal, true);
+});
+
+test("accepted artifact pauses the review run even when the same response also looks structured", async () => {
+  const harness = createPlanNoToolHarness("en");
+  let currentStatus = "running";
+  let approvalWaitCalls = 0;
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    callbacks: {
+      ...harness.callbacks,
+      getPlanStage: () => "plan",
+      getStatus: () => currentStatus,
+      onStatusChange: (status) => {
+        currentStatus = status;
+        harness.statuses.push(status);
+      },
+    },
+    hasStructuredProposal: true,
+    hasReviewablePlanArtifacts: true,
+    sourceVisibleText: "# Plan\n\n## Summary\nThe accepted artifact remains the review source.",
+    hasMeaningfulVisibleText: true,
+    waitForPlanApprovalIfNeeded: async () => {
+      approvalWaitCalls += 1;
+      return false;
+    },
+  }));
+
+  assert.equal(result.status, "stopped");
+  assert.equal(approvalWaitCalls, 0);
+  assert.equal(currentStatus, "pending_review");
+  assert.equal(harness.statuses.filter((status) => status === "pending_review").length, 1);
+  assert.ok(harness.phases.some((entry) => entry.phase === "review_ready"));
 });
 
 test("plan no-tool recovery prompts continuation when planning ends with no visible output", async () => {
@@ -969,6 +1151,7 @@ test("approved plan execution starts with the normal execute tool surface", () =
   const approvedPlanRecoveryActionsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanRecoveryActions.ts"), "utf8");
   const approvedPlanRecoveryRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanRecoveryRuntime.ts"), "utf8");
   const planReviewRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planReviewRuntime.ts"), "utf8");
+  const appStoreSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const loopControlRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopControlRuntime.ts"), "utf8");
   const loopMutableStateSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopMutableState.ts"), "utf8");
 
@@ -976,10 +1159,12 @@ test("approved plan execution starts with the normal execute tool surface", () =
     loopMutableStateSource,
     /approvedPlanRecoveryState:\s*createApprovedPlanRecoveryRuntimeState\(\),/,
   );
+  assert.match(planReviewRuntimeSource, /Approval belongs to a fresh child run/);
   assert.match(
-    planReviewRuntimeSource,
-    /callbacks\.onPlanStageChanged\("executing"\);\s*setApprovedPlanRecoveryState\(\s*resetApprovedPlanHandoffRecoveryState\(getApprovedPlanRecoveryState\(\)\),?\s*\);/,
+    appStoreSource,
+    /planStage:\s*"executing"[\s\S]*plan_review_run_paused_for_child_execution/,
   );
+  assert.match(appStoreSource, /startApprovedPlanExecutionInCurrentTurn/);
   assert.match(
     loopControlRuntimeSource,
     /const\s+result\s*=\s*continueApprovedPlanWithStrategySwitchAction\(\{[\s\S]*?const\s+nextState\s*=\s*applyApprovedPlanStrategySwitchRecoveryState\([\s\S]*?setApprovedPlanRecoveryState\(nextState\);[\s\S]*?return nextState;/,

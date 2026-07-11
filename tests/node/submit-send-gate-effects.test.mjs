@@ -143,6 +143,10 @@ test("send gate effects queue visible submissions while preserving context snaps
     images: ["data:image/png;base64,a"],
     mentionSnapshot: ["src/App.tsx"],
     attachedFilesSnapshot: ["/tmp/report.csv"],
+    queuedWorkflowContext: {
+      runtimeIntentOverride: "goal",
+      goalSourceContextSnapshot: "[plan_artifact]\n- 修复批准生命周期",
+    },
   });
 
   assert.equal(result.shouldContinue, false);
@@ -153,6 +157,8 @@ test("send gate effects queue visible submissions while preserving context snaps
   assert.deepEqual(harness.calls.queued[0].options.contextMentions, ["src/App.tsx"]);
   assert.equal(harness.calls.queued[0].options.attachedFiles[0].path, "/tmp/report.csv");
   assert.equal(harness.calls.queued[0].options.attachedFiles[0].kind, "tabular");
+  assert.equal(harness.calls.queued[0].options.runtimeIntentOverride, "goal");
+  assert.match(harness.calls.queued[0].options.goalSourceContextSnapshot, /plan_artifact/);
   assert.equal(harness.calls.logs.at(-1).event, "send_queued");
   assert.equal(harness.calls.logs.at(-1).data.reason, "generation_in_progress");
 });

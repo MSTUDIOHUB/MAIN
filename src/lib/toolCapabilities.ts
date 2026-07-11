@@ -512,6 +512,21 @@ export function classifyBuiltInTool(name: string): ToolRiskLevel {
   return "external_write";
 }
 
+/**
+ * Classify only registered built-ins. Unlike classifyBuiltInTool(), this does
+ * not conservatively coerce an unknown name to external_write, so evidence
+ * consumers can keep unknown tools non-authoritative.
+ */
+export function classifyKnownBuiltInTool(name: string): ToolRiskLevel | null {
+  if (READ_ONLY_BUILT_INS.has(name)) return "read_only";
+  if (EXTERNAL_READ_BUILT_INS.has(name)) return "external_read";
+  if (WORKSPACE_WRITE_BUILT_INS.has(name)) return "workspace_write";
+  if (SHELL_BUILT_INS.has(name)) return "shell";
+  if (BROWSER_CONTROL_BUILT_INS.has(name)) return "browser_control";
+  if (DESTRUCTIVE_BUILT_INS.has(name)) return "destructive";
+  return null;
+}
+
 export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): ToolRiskLevel {
   const name = "function" in skillOrTool ? skillOrTool.function.name : skillOrTool.name;
   const description = "function" in skillOrTool ? skillOrTool.function.description : skillOrTool.desc;

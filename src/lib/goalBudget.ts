@@ -4,12 +4,15 @@
 // ────────────────────────────────────────────────────────────────────
 
 import type { GoalDefinition, GoalIteration, GoalProgress } from "./goalState";
+import { isGoalEvidenceMeaningfulProgress } from "./goalToolCapabilities";
 
 export interface GoalBudget {
   /** Maximum total iterations across all rounds (hard cap: 500) */
   maxIterations: number;
   /** Optional total token budget */
   maxTokens?: number;
+  /** Maximum total tool calls across all slices. */
+  maxToolCalls: number;
   /** Maximum active execution duration in ms (default: 4 hours; pauses excluded) */
   maxDurationMs: number;
   /** Save a checkpoint every N iterations */
@@ -22,6 +25,7 @@ export interface GoalBudget {
 
 export const DEFAULT_GOAL_BUDGET: GoalBudget = {
   maxIterations: 200,
+  maxToolCalls: 2_000,
   maxDurationMs: 4 * 60 * 60 * 1000,  // 4 hours
   checkpointInterval: 5,
   userConfirmInterval: 50,
@@ -31,20 +35,41 @@ export const DEFAULT_GOAL_BUDGET: GoalBudget = {
 /** Absolute hard caps that cannot be overridden */
 export const GOAL_HARD_CAPS = {
   maxIterations: 500,
+  maxToolCalls: 10_000,
   maxDurationMs: 12 * 60 * 60 * 1000,  // 12 hours
   minCheckpointInterval: 2,
 } as const;
 
 export function resolveGoalBudget(overrides?: Partial<GoalBudget> | null): GoalBudget {
   const base = { ...DEFAULT_GOAL_BUDGET, ...overrides };
+  const maxIterations = finiteNumber(base.maxIterations, DEFAULT_GOAL_BUDGET.maxIterations);
+  const maxDurationMs = finiteNumber(base.maxDurationMs, DEFAULT_GOAL_BUDGET.maxDurationMs);
+  const maxToolCalls = finiteNumber(base.maxToolCalls, DEFAULT_GOAL_BUDGET.maxToolCalls);
+  const checkpointInterval = finiteNumber(base.checkpointInterval, DEFAULT_GOAL_BUDGET.checkpointInterval);
+  const userConfirmInterval = finiteNumber(base.userConfirmInterval, DEFAULT_GOAL_BUDGET.userConfirmInterval);
+  const maxNoProgressIterations = finiteNumber(
+    base.maxNoProgressIterations,
+    DEFAULT_GOAL_BUDGET.maxNoProgressIterations,
+  );
+  const maxTokens = base.maxTokens == null
+    ? undefined
+    : Number.isFinite(Number(base.maxTokens))
+      ? Math.max(1, Math.floor(Number(base.maxTokens)))
+      : undefined;
   return {
-    maxIterations: clampInt(base.maxIterations, 1, GOAL_HARD_CAPS.maxIterations),
-    maxTokens: base.maxTokens != null ? Math.max(1, base.maxTokens) : undefined,
-    maxDurationMs: clampInt(base.maxDurationMs, 60_000, GOAL_HARD_CAPS.maxDurationMs),
-    checkpointInterval: clampInt(base.checkpointInterval, GOAL_HARD_CAPS.minCheckpointInterval, 50),
-    userConfirmInterval: Math.max(0, Math.floor(base.userConfirmInterval)),
-    maxNoProgressIterations: clampInt(base.maxNoProgressIterations, 1, 10),
+    maxIterations: clampInt(maxIterations, 1, GOAL_HARD_CAPS.maxIterations),
+    maxTokens,
+    maxToolCalls: clampInt(maxToolCalls, 1, GOAL_HARD_CAPS.maxToolCalls),
+    maxDurationMs: clampInt(maxDurationMs, 60_000, GOAL_HARD_CAPS.maxDurationMs),
+    checkpointInterval: clampInt(checkpointInterval, GOAL_HARD_CAPS.minCheckpointInterval, 50),
+    userConfirmInterval: Math.max(0, Math.floor(userConfirmInterval)),
+    maxNoProgressIterations: clampInt(maxNoProgressIterations, 1, 10),
   };
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+  const numberValue = Number(value);
+  return Number.isFinite(numberValue) ? numberValue : fallback;
 }
 
 function clampInt(value: number, min: number, max: number): number {
@@ -60,6 +85,7 @@ export type GoalBudgetCheckResult =
 export type GoalBudgetExceededReason =
   | "iteration_limit"
   | "token_limit"
+  | "tool_call_limit"
   | "duration_limit"
   | "no_progress"
   | "user_confirm_needed";
@@ -90,7 +116,17 @@ export function checkGoalBudget(input: {
     };
   }
 
-  // 3. Duration limit
+  // 3. Tool-call limit
+  const toolCallsUsed = progress.usage?.toolCalls || 0;
+  if (toolCallsUsed >= budget.maxToolCalls) {
+    return {
+      ok: false,
+      reason: "tool_call_limit",
+      message: `Goal reached tool-call limit: ${toolCallsUsed}/${budget.maxToolCalls}`,
+    };
+  }
+
+  // 4. Duration limit
   const elapsed = progress.usage
     ? progress.usage.activeDurationMs + (progress.usage.activeStartedAt ? Math.max(0, Date.now() - progress.usage.activeStartedAt) : 0)
     : Date.now() - goal.createdAt;
@@ -102,18 +138,21 @@ export function checkGoalBudget(input: {
     };
   }
 
-  // 4. No-progress detection
+  // 5. No-progress detection
   if (recentIterations && recentIterations.length >= budget.maxNoProgressIterations) {
     const recent = recentIterations.slice(-budget.maxNoProgressIterations);
     const evidence = progress.evidence || [];
-    const allNoProgress = recent.every((iter) =>
-      !evidence.some((entry) =>
-        entry.iteration === iter.index
-        && entry.status !== "failed"
-        && entry.kind !== "blocker"
-        && entry.kind !== "read"
-      )
-    );
+    const trackedNoProgress = progress.recoveryState?.normalizedCause === "no_progress"
+      && progress.recoveryState.consecutiveCount >= budget.maxNoProgressIterations;
+    const legacyAllNoProgress = !progress.recoveryState
+      && recent.every((iter) => !iter.stopReason)
+      && recent.every((iter) =>
+        !evidence.some((entry) =>
+          entry.iteration === iter.index
+          && isGoalEvidenceMeaningfulProgress(entry)
+        )
+      );
+    const allNoProgress = trackedNoProgress || legacyAllNoProgress;
     if (allNoProgress) {
       return {
         ok: false,
@@ -123,7 +162,7 @@ export function checkGoalBudget(input: {
     }
   }
 
-  // 5. User confirmation checkpoint
+  // 6. User confirmation checkpoint
   if (
     budget.userConfirmInterval > 0 &&
     progress.totalIterationsUsed > 0 &&
@@ -170,6 +209,7 @@ export function buildGoalBudgetSummary(input: {
       `迭代进度：${iterLabel}`,
       `运行时间：${timeLabel}`,
       budget.maxTokens ? `Token 用量：${progress.totalTokensUsed}/${budget.maxTokens}` : "",
+      `工具调用：${progress.usage?.toolCalls || 0}/${budget.maxToolCalls}`,
       `检查点间隔：每 ${budget.checkpointInterval} 轮`,
       budget.userConfirmInterval > 0
         ? `用户确认：每 ${budget.userConfirmInterval} 轮`
@@ -181,6 +221,7 @@ export function buildGoalBudgetSummary(input: {
     `Iterations: ${iterLabel}`,
     `Duration: ${timeLabel}`,
     budget.maxTokens ? `Tokens: ${progress.totalTokensUsed}/${budget.maxTokens}` : "",
+    `Tool calls: ${progress.usage?.toolCalls || 0}/${budget.maxToolCalls}`,
     `Checkpoint: every ${budget.checkpointInterval} iterations`,
     budget.userConfirmInterval > 0
       ? `User confirm: every ${budget.userConfirmInterval} iterations`
@@ -205,6 +246,10 @@ export function buildGoalBudgetExceededNotice(input: {
     token_limit: {
       zh: `目标已达到 Token 预算上限`,
       en: `Goal reached token budget limit`,
+    },
+    tool_call_limit: {
+      zh: "目标已达到工具调用预算上限",
+      en: "Goal reached tool-call budget limit",
     },
     duration_limit: {
       zh: `目标已达到运行时长上限`,

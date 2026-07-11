@@ -27,6 +27,8 @@ import {
   sanitizeTaskBlocksForPersist,
   syncTaskIdCounterFromBlocks,
   normalizeInterruptedConversationTurnsForRestore,
+  buildSessionRuntimeSnapshotFromStoreState,
+  buildRestoredSessionRuntimePatch,
 } from "./store/useAppStore";
 import { getE2EQuickReplyHandler, initializeE2EScenarios } from "./lib/e2e";
 import {
@@ -51,10 +53,8 @@ import {
   getAttachmentDisplayName,
   SUPPORTED_ATTACHMENT_EXTENSIONS,
 } from "./lib/attachments";
-import { normalizeStudioAgentKey } from "./lib/gameStudio/catalog";
-import { normalizeContextMemoryState } from "./lib/contextMemory";
-import { MAIN_MODE_KEYS, mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
-import { createDefaultImageStudioRuntime, normalizeImageStudioRuntime } from "./lib/imageStudio";
+import { MAIN_MODE_KEYS, mapMainModeToLegacyNexusMode } from "./lib/mainModes";
+import { createDefaultImageStudioRuntime } from "./lib/imageStudio";
 import {
   resolveSessionModeAffinity,
   type SessionModeAffinity,
@@ -70,6 +70,12 @@ import { appendDebugLog } from "./lib/debugLog";
 import { applyAppIconVariant } from "./lib/appIcon";
 import { safeConfirmAsync } from "./lib/safeConfirm";
 import { resolveVisiblePendingToolReview } from "./lib/pendingToolReview";
+import {
+  isExactUserChoiceResolutionIdentity,
+  isMatchingUserChoiceResolution,
+  type UserChoiceResolutionIdentity,
+} from "./lib/actionRequest";
+import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./lib/turnEvents";
 import {
   buildFeishuMarkdownCard,
   createFeishuPairedUserFromMessage,
@@ -127,6 +133,7 @@ function archiveReplyOptionsForTurn(taskFlow: TaskBlock[], turnId: string | unde
       ? {
           ...block,
           options: undefined,
+          choiceRequest: undefined,
           archivedAfterChoice: true,
           archivedProposal: block.options.some((option: any) =>
             option?.action === "approve_operation_once" ||
@@ -281,47 +288,6 @@ function summarizeUpdateNotes(notes: string, maxLength = 500) {
   return `${normalized.slice(0, maxLength).trimEnd()}…`;
 }
 
-function buildSessionRuntimeSnapshotFromState(state: any) {
-  const taskFlow = sanitizeTaskBlocksForPersist(state.taskFlow || []);
-  const selectedMainModeKey = mapLegacyNexusModeToMainMode(
-    state.selectedMainModeKey || state.selectedNexusModeKey,
-  );
-  return {
-    runtimeEventSchemaVersion: 1,
-    runtimeEvents: state.runtimeEvents || [],
-    harnessRunMarker: state.harnessRunMarker || null,
-    taskFlow,
-    agentMessages: sanitizeAgentMessagesForPersist(state.agentMessages || []),
-    contextMemoryState: normalizeContextMemoryState(state.contextMemoryState),
-    conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns, taskFlow),
-    currentTurnId: state.currentTurnId ?? null,
-    selectedMainModeKey,
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
-    sessionModeAffinity: resolveSessionModeAffinity(state as SessionModeAffinityLike, selectedMainModeKey),
-    imageStudio: normalizeImageStudioRuntime(state.imageStudio),
-    activeStudioAgentKey: state.activeStudioAgentKey,
-    gameStudioInitialized: state.gameStudioInitialized,
-    pendingSlashCommand: state.pendingSlashCommand ?? null,
-    planArtifacts: state.planArtifacts || [],
-    planTasks: state.planTasks || [],
-    planExecutionEvidenceLedger: state.planExecutionEvidenceLedger || [],
-    planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
-    planStage: state.planStage ?? "idle",
-    isPlanApproved: state.isPlanApproved === true,
-    planApprovalChoice: state.planApprovalChoice ?? null,
-    showPlanPanel: state.showPlanPanel === true,
-    showDiff: state.showDiff === true,
-    showTerminal: state.showTerminal === true,
-    showFilePanel: state.showFilePanel === true,
-    rightPanelTab: normalizeStoredRightPanelTab(state.rightPanelTab),
-    selectedDiffTaskId: state.selectedDiffTaskId ?? null,
-    autoApproveTools: state.autoApproveTools === true,
-    autoApproveToolScopes: state.autoApproveToolScopes || [],
-    queuedUserMessage: state.queuedUserMessage ?? null,
-    activeGuidance: state.activeGuidance ?? null,
-  };
-}
-
 function buildStoredSessionSnapshot(
   state: any,
   scopeKey: string,
@@ -335,7 +301,7 @@ function buildStoredSessionSnapshot(
   const loadedTurnCount = Array.isArray(state.conversationTurns) ? state.conversationTurns.length : 0;
   const totalTurns = Number(cachedTranscript?.totalTurns ?? session.turnCount ?? loadedTurnCount) || loadedTurnCount;
   const transcriptPartial = totalTurns > loadedTurnCount;
-  const runtimeSnapshot = buildSessionRuntimeSnapshotFromState(state);
+  const runtimeSnapshot = buildSessionRuntimeSnapshotFromStoreState(state);
   return {
     ...session,
     messages: sanitizeTaskBlocksForPersist(state.taskFlow || []),
@@ -709,53 +675,26 @@ function mergeSessionPage(
 
 function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackState: any) {
   const restoredTaskFlow = sanitizeTaskBlocksForPersist(entry.taskFlow || []);
-  const selectedMainModeKey = mapLegacyNexusModeToMainMode(
-    entry.runtimeSnapshot?.selectedMainModeKey ||
-      entry.runtimeSnapshot?.selectedNexusModeKey ||
-      entry.runtimeSnapshot?.selectedAgentKey,
-  );
-  return {
-    taskFlow: restoredTaskFlow,
-    agentMessages: sanitizeAgentMessagesForPersist(entry.runtimeSnapshot?.agentMessages || []),
-    contextMemoryState: normalizeContextMemoryState(entry.runtimeSnapshot?.contextMemoryState),
-    selectedMainModeKey,
-    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
-    sessionModeAffinity: resolveSessionModeAffinity(
-      entry.runtimeSnapshot as SessionModeAffinityLike,
-      selectedMainModeKey,
-    ),
-    imageStudio: normalizeImageStudioRuntime(entry.runtimeSnapshot?.imageStudio ?? fallbackState.imageStudio),
-    activeStudioAgentKey: normalizeStudioAgentKey(entry.runtimeSnapshot?.activeStudioAgentKey ?? fallbackState.activeStudioAgentKey),
-    gameStudioInitialized: entry.runtimeSnapshot?.gameStudioInitialized === true || fallbackState.gameStudioInitialized,
-    pendingSlashCommand: entry.runtimeSnapshot?.pendingSlashCommand ?? null,
-    conversationTurns: normalizeInterruptedConversationTurnsForRestore(entry.conversationTurns || [], restoredTaskFlow),
-    currentTurnId: entry.runtimeSnapshot?.currentTurnId ?? entry.conversationTurns[entry.conversationTurns.length - 1]?.id ?? null,
-    currentTurnState: {
-      interceptorHandled: false,
-      interceptorThought: "",
-      lastReportedThought: "",
-      lastReportedAssistantText: "",
-      capsuleExplanation: null,
-      turnId: "",
+  const restoredPatch = buildRestoredSessionRuntimePatch({
+    snapshot: {
+      ...(entry.runtimeSnapshot || {}),
+      taskFlow: restoredTaskFlow,
+      conversationTurns: entry.conversationTurns || [],
     },
-    agentStatus: "idle" as const,
-    isGenerating: false,
-    abortController: null,
-    pendingReviewResolve: null,
-    pendingReviewTaskId: null,
-    pendingToolCall: null,
-    autoApproveTools: false,
-    autoApproveToolScopes: [],
-    readOnlyAutoApproveForSession: false,
-    planArtifacts: entry.runtimeSnapshot?.planArtifacts || [],
-    planTasks: entry.runtimeSnapshot?.planTasks || [],
-    planExecutionEvidenceLedger: entry.runtimeSnapshot?.planExecutionEvidenceLedger || [],
-    planExecutionEvidenceCount: entry.runtimeSnapshot?.planExecutionEvidenceCount ?? 0,
-    planStage: entry.runtimeSnapshot?.planStage ?? "idle",
-    isPlanApproved: entry.runtimeSnapshot?.isPlanApproved ?? false,
-    planApprovalChoice: entry.runtimeSnapshot?.planApprovalChoice ?? null,
-    ...CLOSED_SESSION_PANEL_STATE,
-    elapsedTime: 0,
+    fallbackState,
+    taskFlow: restoredTaskFlow,
+    conversationTurns: entry.conversationTurns || [],
+    currentTurnId:
+      entry.runtimeSnapshot?.currentTurnId ??
+      entry.conversationTurns[entry.conversationTurns.length - 1]?.id ??
+      null,
+    resetPanels: true,
+  });
+  return {
+    ...restoredPatch,
+    taskFlow: restoredPatch.taskFlow || restoredTaskFlow,
+    conversationTurns: restoredPatch.conversationTurns ||
+      normalizeInterruptedConversationTurnsForRestore(entry.conversationTurns || [], restoredTaskFlow),
   };
 }
 
@@ -806,6 +745,8 @@ export default function App() {
   const taskFlow = useAppStore((s) => s.taskFlow);
   const runtimeEvents = useAppStore((s) => s.runtimeEvents);
   const harnessRunMarker = useAppStore((s) => s.harnessRunMarker);
+  const activeActionRequest = useAppStore((s) => s.activeActionRequest);
+  const goalRuntime = useAppStore((s) => s.goalRuntime);
   const agentMessages = useAppStore((s) => s.agentMessages);
   const contextMemoryState = useAppStore((s) => s.contextMemoryState);
   const conversationTurns = useAppStore((s) => s.conversationTurns);
@@ -1276,9 +1217,11 @@ export default function App() {
     const transcriptTotalTurns = Number(cachedTranscript?.totalTurns ?? loadedTurnCount) || loadedTurnCount;
     const transcriptPartial = transcriptTotalTurns > loadedTurnCount;
     const runtimeSnapshot = {
-      runtimeEventSchemaVersion: 1,
+      ...buildSessionRuntimeSnapshotFromStoreState(useAppStore.getState()),
+      runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
       runtimeEvents,
       harnessRunMarker,
+      activeActionRequest,
       taskFlow: messages,
       agentMessages: sanitizeAgentMessagesForPersist(agentMessages),
       contextMemoryState,
@@ -1388,6 +1331,7 @@ export default function App() {
     }
   }, [
     agentMessages,
+    activeActionRequest,
     harnessRunMarker,
     activeSessionScope,
     activeSessionKey,
@@ -1397,6 +1341,7 @@ export default function App() {
     currentSessionId,
     currentTurnId,
     gameStudioInitialized,
+    goalRuntime,
     isPlanApproved,
     pendingSlashCommand,
     planArtifacts,
@@ -1422,11 +1367,14 @@ export default function App() {
   const activeDiffTask = useMemo(() => {
     return resolveVisiblePendingToolReview({
       taskFlow,
+      request: activeActionRequest?.kind === "tool_permission" &&
+        activeActionRequest.sessionKey === activeSessionKey
+        ? activeActionRequest
+        : null,
       pendingReviewTaskId,
       pendingToolCall,
-      currentTurnId,
     });
-  }, [currentTurnId, pendingReviewTaskId, pendingToolCall, taskFlow]);
+  }, [activeActionRequest, activeSessionKey, pendingReviewTaskId, pendingToolCall, taskFlow]);
 
   const handleAttachFile = async (): Promise<AttachmentPickerResult> => {
     const result: AttachmentPickerResult = { attachments: [], imageDataUrls: [], skipped: [] };
@@ -1524,15 +1472,65 @@ export default function App() {
     return true;
   }, []);
 
-  const handleQuickReply = useCallback((choice: string | ReplyOption, sourceTurnId?: string) => {
+  const handleQuickReply = useCallback((
+    choice: string | ReplyOption,
+    sourceTurnId?: string,
+    choiceRequest?: UserChoiceResolutionIdentity | null,
+  ) => {
     const text = typeof choice === "string" ? choice : choice.value;
     const optionAction = typeof choice === "string" ? undefined : choice.action;
-    const e2eQuickReplyHandler = getE2EQuickReplyHandler();
-    if (e2eQuickReplyHandler?.(text, sourceTurnId)) {
+    const isCustomReply = typeof choice !== "string" && choice.source === "custom_reply";
+    const state = useAppStore.getState();
+    const sourceTurn = sourceTurnId
+      ? state.conversationTurns.find((turn) => turn.id === sourceTurnId) || null
+      : null;
+    const sessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(state.currentWorkspace),
+      state.currentSessionId,
+    ) || "";
+    const sourceChoiceBlock = sourceTurnId
+      ? [...state.taskFlow].reverse().find((block) =>
+          block.turnId === sourceTurnId &&
+          block.type === "agent" &&
+          block.archivedAfterChoice !== true &&
+          Array.isArray(block.options) &&
+          block.options.length > 0 &&
+          block.choiceRequest?.requestId === choiceRequest?.requestId
+        )
+      : null;
+    const liveChoiceIdentity = sourceChoiceBlock?.type === "agent"
+      ? sourceChoiceBlock.choiceRequest
+      : null;
+    const exactChoiceIdentity = isExactUserChoiceResolutionIdentity(liveChoiceIdentity, choiceRequest) &&
+      isMatchingUserChoiceResolution({
+        identity: liveChoiceIdentity,
+        sessionKey,
+        turnId: sourceTurnId || "",
+        optionValue: text,
+        isCustomReply,
+      });
+    const hasConflictingRuntimeOwner = state.isGenerating ||
+      state.agentStatus === "running" ||
+      state.agentStatus === "pending_review" ||
+      (!!state.activeActionRequest && state.activeActionRequest.requestId !== choiceRequest?.requestId);
+    if (!sourceTurn || !exactChoiceIdentity || hasConflictingRuntimeOwner) {
+      appendDebugLog("warn", "ui.quickReply_identity_rejected", {
+        sourceTurnId: sourceTurnId || null,
+        requestId: choiceRequest?.requestId || null,
+        runId: choiceRequest?.runId || null,
+        sessionKey,
+        reason: !sourceTurn
+          ? "source_turn_missing"
+          : !exactChoiceIdentity
+          ? "choice_request_mismatch"
+          : "another_runtime_owner_is_active",
+      });
       return;
     }
 
-    const state = useAppStore.getState();
+    const e2eQuickReplyHandler = getE2EQuickReplyHandler();
+    if (e2eQuickReplyHandler?.(text, sourceTurnId)) return;
+
     const reuseCurrentTurn = !!sourceTurnId && sourceTurnId === state.currentTurnId;
     const sourceTurnForLog = sourceTurnId
       ? state.conversationTurns.find((turn) => turn.id === sourceTurnId) || null
@@ -1550,11 +1548,6 @@ export default function App() {
       agentMessages: state.agentMessages.length,
       optionAction: optionAction ?? null,
     });
-    const sourceTurn = sourceTurnId
-      ? state.conversationTurns.find((turn) => turn.id === sourceTurnId) || null
-      : state.currentTurnId
-      ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
-      : null;
     const sourceIntent = resolveConversationTurnIntent(sourceTurn);
     const sourceVisiblePlanText = getLatestVisibleAgentTextForTurn(state.taskFlow, sourceTurn?.id);
     const sourcePlanMaterialization = sourceVisiblePlanText
@@ -1627,7 +1620,7 @@ export default function App() {
       return;
     }
 
-    const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn;
+    const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn && exactChoiceIdentity;
     const shouldExecuteFromQuickReply =
       optionAction === "execute_once" || optionAction === "approve_operation_once";
     const executeQuickReplyIntent = state.selectedMainModeKey === "game_studio" ? "studio_workflow" as const : "execute" as const;
@@ -1663,6 +1656,9 @@ export default function App() {
           resolvedIntent: shouldExecuteFromQuickReply ? executeQuickReplyIntent : sourceIntent,
           replyOptionSourceTurnId: sourceTurnId,
           selectedReplyOptionText: text,
+          replyOptionRequestIdentity: choiceRequest,
+          replyOptionIsCustom: isCustomReply,
+          parentRunIdOverride: choiceRequest?.runId,
           ...(shouldExecuteFromQuickReply
             ? {
                 runtimeIntentOverride: executeQuickReplyIntent,
@@ -1679,6 +1675,8 @@ export default function App() {
           skipIntentResolution: true,
           replyOptionSourceTurnId: sourceTurnId,
           selectedReplyOptionText: text,
+          replyOptionRequestIdentity: choiceRequest,
+          replyOptionIsCustom: isCustomReply,
         }
       : undefined;
 
@@ -1691,9 +1689,6 @@ export default function App() {
       input: "",
       contextMentions: [],
       attachedFiles: [],
-      ...(shouldReuseSourceTurn
-        ? { taskFlow: archiveReplyOptionsForTurn(state.taskFlow, sourceTurnId, text) }
-        : {}),
       ...(optionAction === "allow_readonly_session" ? { readOnlyAutoApproveForSession: true } : {}),
       ...(optionAction === "adjust_plan"
         ? {
@@ -1727,44 +1722,6 @@ export default function App() {
         ? { currentTurnExecutionConsent: { turnId: sourceTurnId, granted: true } }
         : {}),
     });
-
-    if (shouldReuseSourceTurn) {
-      const latest = useAppStore.getState();
-      const scopeKey = resolveSessionWorkspaceKey(latest.currentWorkspace);
-      const sessionKey = resolveSessionRuntimeKey(scopeKey, latest.currentSessionId);
-      const countOptions = (blocks: TaskBlock[] | undefined) =>
-        Array.isArray(blocks)
-          ? blocks.filter((block) =>
-              block.turnId === sourceTurnId &&
-              block.type === "agent" &&
-              Array.isArray(block.options) &&
-              block.options.length > 0
-            ).length
-          : 0;
-      const runtimeBefore = sessionKey ? latest.runtimeBySessionKey?.[sessionKey] : null;
-      appendDebugLog("info", "ui.quickReply_archive_runtime_probe", {
-        sourceTurnId,
-        sessionKey,
-        topLevelOptions: countOptions(latest.taskFlow),
-        runtimeOptions: countOptions(runtimeBefore?.taskFlow),
-        runtimeFound: !!runtimeBefore,
-      });
-      if (sessionKey && latest.runtimeBySessionKey?.[sessionKey]) {
-        useAppStore.setState((s) => {
-          const runtime = s.runtimeBySessionKey[sessionKey];
-          if (!runtime) return {};
-          return {
-            runtimeBySessionKey: {
-              ...s.runtimeBySessionKey,
-              [sessionKey]: {
-                ...runtime,
-                taskFlow: archiveReplyOptionsForTurn(runtime.taskFlow, sourceTurnId, text),
-              },
-            },
-          };
-        });
-      }
-    }
 
     runAfterNextPaint(() => {
       useAppStore.getState().sendMessage(text, undefined, sendOptions);
@@ -2031,55 +1988,23 @@ export default function App() {
       const snapshot = target.runtimeSnapshot;
       const snapshotTaskFlow = hasArrayItems(snapshot.taskFlow) ? snapshot.taskFlow : target.messages;
       const restoredTaskFlow = sanitizeTaskBlocksForPersist(snapshotTaskFlow || []);
-      const restoredMainMode = mapLegacyNexusModeToMainMode(
-        (snapshot as any).selectedMainModeKey ||
-          (snapshot as any).selectedNexusModeKey ||
-          (snapshot as any).selectedAgentKey ||
-          resolveSessionModeAffinity(target as SessionModeAffinityLike, "main_mode"),
-      );
       const restoredConversationTurns = normalizeInterruptedConversationTurnsForRestore(
         hasArrayItems(snapshot.conversationTurns) ? snapshot.conversationTurns : [],
         restoredTaskFlow,
       );
       syncTaskIdCounterFromBlocks(restoredTaskFlow);
-      useAppStore.setState({
+      useAppStore.setState(buildRestoredSessionRuntimePatch({
+        snapshot: {
+          ...snapshot,
+          taskFlow: restoredTaskFlow,
+          conversationTurns: restoredConversationTurns,
+        },
+        fallbackState: useAppStore.getState(),
         taskFlow: restoredTaskFlow,
-        agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
-        contextMemoryState: normalizeContextMemoryState(snapshot.contextMemoryState),
-        selectedMainModeKey: restoredMainMode,
-        selectedNexusModeKey: mapMainModeToLegacyNexusMode(restoredMainMode),
-        activeStudioAgentKey: normalizeStudioAgentKey(snapshot.activeStudioAgentKey ?? useAppStore.getState().activeStudioAgentKey),
-        gameStudioInitialized: snapshot.gameStudioInitialized === true || useAppStore.getState().gameStudioInitialized,
-        pendingSlashCommand: snapshot.pendingSlashCommand ?? null,
         conversationTurns: restoredConversationTurns,
         currentTurnId: snapshot.currentTurnId ?? null,
-        currentTurnState: {
-          interceptorHandled: false,
-          interceptorThought: "",
-          lastReportedThought: "",
-          lastReportedAssistantText: "",
-          capsuleExplanation: null,
-          turnId: "",
-        },
-        agentStatus: 'idle',
-        isGenerating: false,
-        abortController: null,
-        pendingReviewResolve: null,
-        pendingReviewTaskId: null,
-        pendingToolCall: null,
-        autoApproveTools: false,
-        autoApproveToolScopes: [],
-        readOnlyAutoApproveForSession: false,
-        planArtifacts: snapshot.planArtifacts || [],
-        planTasks: snapshot.planTasks || [],
-        planExecutionEvidenceLedger: snapshot.planExecutionEvidenceLedger || [],
-        planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
-        planStage: snapshot.planStage ?? 'idle',
-        isPlanApproved: snapshot.isPlanApproved ?? false,
-        planApprovalChoice: snapshot.planApprovalChoice ?? null,
-        ...CLOSED_SESSION_PANEL_STATE,
-        elapsedTime: 0,
-      });
+        resetPanels: true,
+      }));
       appendDebugLog("info", "session.restore", {
         sessionId: id,
         mode: "runtimeSnapshot",
@@ -2402,7 +2327,7 @@ export default function App() {
     const isGlobalChat = scopeKey === GLOBAL_CHAT_KEY;
     const createdAt = Date.now();
     const createdAtIso = new Date(createdAt).toISOString();
-    const emptyRuntimeSnapshot = buildSessionRuntimeSnapshotFromState({
+    const emptyRuntimeSnapshot = buildSessionRuntimeSnapshotFromStoreState({
       taskFlow: [],
       agentMessages: [],
       contextMemoryState: null,
