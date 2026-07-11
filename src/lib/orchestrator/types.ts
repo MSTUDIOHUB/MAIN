@@ -1,4 +1,4 @@
-import { type OpenAiToolChoice } from "../streaming";
+import { type OpenAiToolChoice, type StreamResult } from "../streaming";
 import type { ContextMemoryState } from "../contextMemory";
 import { type MCPServer, type MCPTool } from "../mcpClient";
 import { type ToolDiffPreview } from "../toolDiff";
@@ -137,7 +137,11 @@ export interface OrchestratorCallbacks {
     fullText: string,
     messageId: string,
     truncated: boolean,
-    meta?: { suppressTruncationWarning?: boolean; reason?: string },
+    meta?: {
+      suppressTruncationWarning?: boolean;
+      reason?: string;
+      streamDiagnostics?: StreamResult["streamDiagnostics"];
+    },
   ) => void;
   onThought: (thought: string) => void;
   onAssistantFinalText: (
@@ -179,6 +183,9 @@ export interface OrchestratorCallbacks {
     summary?: string;
     domain?: string;
     status?: "pending" | "running" | "done" | "failed";
+    reason?: string;
+    iteration?: number;
+    qualityRejectCount?: number;
   }) => void;
   onTurnEvent?: (event: MainThreadEvent) => void;
   hasRuntimeThreadStarted?: (threadId: string) => boolean;

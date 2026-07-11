@@ -740,6 +740,258 @@ test("local Rust streams store cumulative reasoning payloads as hidden metadata"
   assert.deepEqual(tokens, ["done"]);
 });
 
+test("semantic stream progress excludes hidden reasoning and tool protocol while preserving real markdown", async () => {
+  const { analyzeSemanticStreamProgress } = await loadStreamingModule(async () => undefined);
+  const hidden = analyzeSemanticStreamProgress({
+    content: [
+      `<thinking>${"内部分析。".repeat(900)}</thinking>`,
+      "<tool_use>",
+      "<tool>read_file</tool>",
+      '<parameter name="path">src/App.tsx</parameter>',
+      "</tool_use>",
+    ].join("\n"),
+    reasoningContent: "",
+  });
+  assert.equal(hidden.semanticVisibleChars, 0);
+  assert.equal(hidden.semanticContent, "");
+  assert.match(hidden.actionableContent, /<tool_use>/);
+
+  const visible = analyzeSemanticStreamProgress({
+    content: `${hidden.rawContent}\n\n## 可审批计划\n\n- 修改 src/App.tsx`,
+    reasoningContent: "",
+  });
+  assert.match(visible.semanticContent, /## 可审批计划/);
+  assert.equal(visible.semanticVisibleChars > 0, true);
+});
+
+test("semantic stream progress classifies exact and whitespace-normalized reasoning mirrors without leaking text", async () => {
+  const { analyzeSemanticStreamProgress } = await loadStreamingModule(async () => undefined);
+  const reasoning = "需要继续分析。\n".repeat(900);
+  const exact = analyzeSemanticStreamProgress({
+    content: reasoning,
+    reasoningContent: reasoning,
+  });
+  assert.equal(exact.mirrorKind, "exact");
+  assert.equal(exact.semanticContent, "");
+  assert.equal(exact.semanticVisibleChars, 0);
+  assert.equal(exact.contentHash, exact.reasoningHash);
+  assert.equal(exact.overlapRatio, 1);
+
+  const whitespaceMirror = analyzeSemanticStreamProgress({
+    content: reasoning.replaceAll("\n", "  \n"),
+    reasoningContent: reasoning,
+  });
+  assert.equal(whitespaceMirror.mirrorKind, "normalized_exact");
+  assert.equal(whitespaceMirror.semanticContent, "");
+  assert.equal(whitespaceMirror.semanticVisibleChars, 0);
+  assert.notEqual(whitespaceMirror.contentHash, whitespaceMirror.reasoningHash);
+  assert.equal(whitespaceMirror.normalizedContentHash, whitespaceMirror.normalizedReasoningHash);
+});
+
+test("semantic stream progress retains a real final suffix after a mirrored reasoning prefix", async () => {
+  const { analyzeSemanticStreamProgress } = await loadStreamingModule(async () => undefined);
+  const reasoning = "内部推演。".repeat(900);
+  const result = analyzeSemanticStreamProgress({
+    content: `${reasoning}\n\n## 最终结论\n\n- 直接修复事件参数传递。`,
+    reasoningContent: reasoning,
+  });
+  assert.equal(result.mirrorKind, "reasoning_prefix");
+  assert.doesNotMatch(result.semanticContent, /内部推演/);
+  assert.match(result.semanticContent, /## 最终结论/);
+  assert.equal(result.semanticVisibleChars > 0, true);
+});
+
+test("local Rust streams suppress OMLX-style recovered reasoning mirrors but keep diagnostics", async () => {
+  const listeners = new Map();
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const reasoning = "未闭合的后台分析。".repeat(1200);
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: reasoning } }] })}\n\n`,
+        },
+      });
+      // oMLX ThinkingParser.finish() recovery re-emits the same unclosed
+      // thinking transcript as content so generic clients do not get an
+      // empty answer. MAIN must not mistake that mirror for visible progress.
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: reasoning }, finish_reason: "length" }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: { stream_id: streamId, status: "success" },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const tokens = [];
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "继续" }],
+    {
+      baseUrl: "http://127.0.0.1:8000/v1",
+      apiKey: "not-needed",
+      model: "Qwen3.6-35B-A3B-6bit",
+      provider: "OMLX",
+      useRustProxy: true,
+    },
+    {
+      onToken: (token) => tokens.push(token),
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.deepEqual(tokens, []);
+  assert.equal(result.content, reasoning);
+  assert.equal(result.semanticContent, "");
+  assert.equal(result.reasoningContent, reasoning);
+  assert.equal(result.streamDiagnostics?.mirrorKind, "exact");
+  assert.equal(result.streamDiagnostics?.semanticVisibleChars, 0);
+  assert.equal(result.streamDiagnostics?.rawContentChars, reasoning.length);
+  assert.equal(result.streamDiagnostics?.reasoningChars, reasoning.length);
+  assert.equal(result.streamDiagnostics?.contentHash, result.streamDiagnostics?.reasoningHash);
+});
+
+test("local Rust streams keep slow genuine visible output and native tool progress", async () => {
+  const listeners = new Map();
+  const listenMock = async (eventName, handler) => {
+    listeners.set(eventName, handler);
+    return () => listeners.delete(eventName);
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    assert.equal(command, "start_chat_stream");
+    const streamId = args.streamId;
+    queueMicrotask(() => {
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "brief hidden analysis" } }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: "## 可见进展\n\n正在核对事件参数。" } }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-chunk")?.({
+        payload: {
+          stream_id: streamId,
+          chunk: `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", function: { name: "read_file", arguments: '{"path":"src/main.js"}' } }] }, finish_reason: "tool_calls" }] })}\n\n`,
+        },
+      });
+      listeners.get("chat-stream-done")?.({
+        payload: { stream_id: streamId, status: "success" },
+      });
+    });
+    return undefined;
+  }, listenMock);
+
+  const tokens = [];
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "继续" }],
+    {
+      baseUrl: "http://127.0.0.1:8000/v1",
+      apiKey: "not-needed",
+      model: "local-model",
+      provider: "OMLX",
+      useRustProxy: true,
+    },
+    {
+      onToken: (token) => tokens.push(token),
+      onDone: () => {},
+      onError: (error) => { throw error; },
+    },
+  );
+
+  assert.deepEqual(tokens, ["## 可见进展\n\n正在核对事件参数。"]);
+  assert.equal(result.semanticContent, "## 可见进展\n\n正在核对事件参数。");
+  assert.equal(result.streamDiagnostics?.semanticVisibleChars > 0, true);
+  assert.equal(result.streamDiagnostics?.firstSemanticVisibleElapsedMs != null, true);
+  assert.equal(result.streamDiagnostics?.firstToolElapsedMs != null, true);
+  assert.equal(result.toolCalls[0]?.name, "read_file");
+});
+
+test("reasoning does not exempt a semantically hidden stream from the no-visible timeout", async () => {
+  const { shouldStopNoVisibleStreamStall } = await loadStreamingModule(async () => undefined);
+  assert.equal(shouldStopNoVisibleStreamStall({
+    elapsedMs: 120_000,
+    visibleChars: 0,
+    toolCallCount: 0,
+    reasoningChars: 24_000,
+  }), true);
+  assert.equal(shouldStopNoVisibleStreamStall({
+    elapsedMs: 240_000,
+    visibleChars: 1,
+    toolCallCount: 0,
+    reasoningChars: 24_000,
+  }), false);
+  assert.equal(shouldStopNoVisibleStreamStall({
+    elapsedMs: 240_000,
+    visibleChars: 0,
+    toolCallCount: 1,
+    reasoningChars: 24_000,
+  }), false);
+});
+
+test("OMLX reasoning-off requests disable thinking without leaking provider extras to unknown endpoints", async () => {
+  const requests = [];
+  const run = async (provider, reasoningRequest) => {
+    const listeners = new Map();
+    const listenMock = async (eventName, handler) => {
+      listeners.set(eventName, handler);
+      return () => listeners.delete(eventName);
+    };
+    const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+      assert.equal(command, "start_chat_stream");
+      requests.push({ provider, body: JSON.parse(args.body) });
+      const streamId = args.streamId;
+      queueMicrotask(() => {
+        listeners.get("chat-stream-chunk")?.({
+          payload: {
+            stream_id: streamId,
+            chunk: `data: ${JSON.stringify({ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] })}\n\n`,
+          },
+        });
+        listeners.get("chat-stream-done")?.({
+          payload: { stream_id: streamId, status: "success" },
+        });
+      });
+      return undefined;
+    }, listenMock);
+    await streamChatCompletion(
+      [{ role: "user", content: "继续" }],
+      {
+        baseUrl: "http://127.0.0.1:8000/v1",
+        apiKey: "not-needed",
+        model: "local-model",
+        provider,
+        reasoningRequest,
+        useRustProxy: true,
+      },
+      { onToken: () => {}, onDone: () => {}, onError: (error) => { throw error; } },
+    );
+  };
+
+  await run("OMLX", "off");
+  await run("Custom Local", "off");
+  await run("OMLX", "auto");
+
+  assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: false });
+  assert.equal(requests[1].body.chat_template_kwargs, undefined);
+  assert.equal(requests[2].body.chat_template_kwargs, undefined);
+});
+
 test("local Rust streams stop reasoning-only runaway output", async () => {
   const listeners = new Map();
   const invokeCalls = [];

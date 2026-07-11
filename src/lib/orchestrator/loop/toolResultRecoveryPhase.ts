@@ -30,7 +30,10 @@ import {
   applyCrossIterationReadFileRecoveryState,
   setRepeatedEditValidationRecoveryAttempts,
 } from "./executeRecoveryRuntime";
-import type { PlanLoopRuntimeState } from "./planRuntimeState";
+import type {
+  PlanLoopRuntimeState,
+  PlanRuntimePhaseQualitySnapshot,
+} from "./planRuntimeState";
 import {
   applyPlanQualityRuntimeState,
   applyPlanReadOnlyConvergenceRuntimeState,
@@ -60,6 +63,7 @@ type SetPlanRuntimePhase = (
   phase: PlanRuntimePhase,
   reason?: string,
   status?: "pending" | "running" | "done" | "failed",
+  qualitySnapshot?: PlanRuntimePhaseQualitySnapshot,
 ) => void;
 
 type EmitTaskOrchestratorPhase = (
@@ -167,9 +171,22 @@ export async function handleToolResultRecoveryPhase(input: {
     executeRecoveryState = input.activateExecuteRecovery(mode, reason, context);
     return executeRecoveryState;
   };
-  const setPlanRuntimePhaseAndSync: SetPlanRuntimePhase = (phase, reason, status) => {
-    input.setPlanRuntimePhase(phase, reason, status);
-    planRuntimeState = applyPlanRuntimePhase(planRuntimeState, { phase, reason }).state;
+  const setPlanRuntimePhaseAndSync: SetPlanRuntimePhase = (
+    phase,
+    reason,
+    status,
+    qualitySnapshot,
+  ) => {
+    input.setPlanRuntimePhase(phase, reason, status, qualitySnapshot);
+    planRuntimeState = applyPlanRuntimePhase({
+      ...planRuntimeState,
+      ...(qualitySnapshot?.qualityRejectCount != null
+        ? { planQualityRejectCount: qualitySnapshot.qualityRejectCount }
+        : {}),
+      ...(qualitySnapshot?.missingSections
+        ? { planLastMissingSections: [...qualitySnapshot.missingSections] }
+        : {}),
+    }, { phase, reason }).state;
   };
 
   const planQualityRecovery = handlePlanQualityRecoveryAfterToolResults({

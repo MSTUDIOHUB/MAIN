@@ -43,7 +43,9 @@ test("assistant completion phase owns no-tool runtime state folds", () => {
   assert.match(phaseSource, /applyApprovedPlanNoToolRecoveryState\(/);
   assert.match(phaseSource, /applyPlanNoToolRuntimeState\(/);
   assert.match(phaseSource, /setPlanRuntimePhaseAndSync/);
-  assert.match(phaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
+  assert.match(phaseSource, /input\.setPlanRuntimePhase\(phase, reason, status, qualitySnapshot\)/);
+  assert.match(phaseSource, /planRuntimeState = applyPlanRuntimePhase\(\{/);
+  assert.match(phaseSource, /planLastMissingSections: \[\.\.\.qualitySnapshot\.missingSections\]/);
   assert.match(phaseSource, /applyRecoveringFromEmptyAssistantReplyRuntimeState\(/);
 });
 

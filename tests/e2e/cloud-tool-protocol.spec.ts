@@ -973,7 +973,7 @@ test.beforeEach(async ({ page }) => {
         "",
         "## 数据流与验证",
         "- 数据流：用户 Plan 请求 -> 本地模型慢首 token -> UI notice -> 模型正文 -> design.md。",
-        "- 验证：日志不出现 `STREAM_NO_VISIBLE_TOKEN_TIMEOUT` 或 `plan_stage_waiting_for_design`。",
+        "- 验证：日志不出现 `STREAM_NO_VISIBLE_TOKEN_TIMEOUT` 或 `plan_draft_stream_timeout`。",
         "",
         "## 风险与后续确认",
         "- 风险：本地模型如果永久无响应，需要用户手动停止。",
@@ -1667,7 +1667,7 @@ test("local plan slow first token logs a watchdog notice without hard-stopping b
             String(entry.source || "").includes("plan_no_visible_token_notice_only") ||
             String(entry.message || "").includes("plan_no_visible_token_notice_only"),
           ),
-          hardStopped: hasLog("STREAM_NO_VISIBLE_TOKEN_TIMEOUT") || hasLog("plan_stage_waiting_for_design"),
+          hardStopped: hasLog("STREAM_NO_VISIBLE_TOKEN_TIMEOUT") || hasLog("plan_draft_stream_timeout"),
           agentStatus: snapshot?.agentStatus,
         };
       }),
@@ -1696,7 +1696,7 @@ test("local plan slow first token logs a watchdog notice without hard-stopping b
           currentTurnStatus: snapshot?.currentTurnStatus,
           hardStopped:
             hasLog("STREAM_NO_VISIBLE_TOKEN_TIMEOUT") ||
-            hasLog("plan_stage_waiting_for_design") ||
+            hasLog("plan_draft_stream_timeout") ||
             hasLog("plan_empty_response_checkpoint"),
         };
       }),

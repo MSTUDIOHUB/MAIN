@@ -8,6 +8,7 @@ import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { buildPlanClosureEvidenceRecoveryPrompt } from "../planOrchestration";
 import {
+  autoMaterializePlanArtifactFromEvidence,
   autoMaterializePlanArtifactFromVisibleText,
   buildAssistantHistoryMessage,
   buildPlanRecoveryPrompt,
@@ -19,6 +20,7 @@ import { MAX_PLAN_EVIDENCE_RECOVERY_PASSES } from "../../planRuntime";
 import type { OrchestratorCallbacks } from "../types";
 import { resolveExecuteNoToolCheckpointLimit } from "./executeNoToolRecovery";
 import { handlePlanQualityRecoveryAfterVisibleMaterialization } from "./planQualityRecovery";
+import type { PlanRuntimePhaseQualitySnapshot } from "./planRuntimeState";
 
 export type PlanNoToolRecoveryStatus = "none" | "continue" | "stopped";
 export type PlanClosureAttemptResult = "not_attempted" | "failed" | "stopped" | "approved_continue";
@@ -49,6 +51,20 @@ function buildPlanGenerationFailedProgress(reason: string) {
     recoveryReason: "plan_generation_failed",
     nextStep: reason,
   };
+}
+
+export function shouldAttemptPlanEvidenceMaterialization(input: {
+  recoveryAction?: string | null;
+  qualityRejectCount: number;
+  qualityGateReason?: string | null;
+  finishReason?: string | null;
+}): boolean {
+  if (input.recoveryAction === "ask_user") return false;
+  return input.finishReason === "length" ||
+    input.qualityRejectCount >= 2 ||
+    /excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
+      String(input.qualityGateReason || ""),
+    );
 }
 
 export function resolvePlanNoToolRecoveryDecision(input: {
@@ -180,7 +196,13 @@ function buildForcePlanContinuationPrompt(input: {
 async function handOffApprovedPlan(input: {
   callbacks: OrchestratorCallbacks;
   waitForPlanApprovalIfNeeded: () => Promise<boolean>;
-  setPlanRuntimePhase: (phase: PlanRuntimePhase, reason?: string, status?: "pending" | "running" | "done" | "failed") => void;
+  setPlanRuntimePhase: (
+    phase: PlanRuntimePhase,
+    reason?: string,
+    status?: "pending" | "running" | "done" | "failed",
+    qualitySnapshot?: PlanRuntimePhaseQualitySnapshot,
+  ) => void;
+  qualitySnapshot?: PlanRuntimePhaseQualitySnapshot;
   recentPlanToolActivity: PlanToolActivitySummary[];
   phaseReason: string;
   assistantHistoryText: string;
@@ -192,8 +214,9 @@ async function handOffApprovedPlan(input: {
     phaseReason,
     assistantHistoryText,
     providerReasoningForHistory,
+    qualitySnapshot,
   } = input;
-  setPlanRuntimePhase("review_ready", phaseReason, "done");
+  setPlanRuntimePhase("review_ready", phaseReason, "done", qualitySnapshot);
   if (callbacks.getStatus() !== "pending_review") {
     callbacks.onStatusChange("pending_review");
   }
@@ -244,7 +267,12 @@ export async function handlePlanNoToolRecovery(input: {
   planLastMissingSections: string[];
   planArtifactQualityRejected?: boolean;
   planAutoScaffoldPromptIssued: boolean;
-  setPlanRuntimePhase: (phase: PlanRuntimePhase, reason?: string, status?: "pending" | "running" | "done" | "failed") => void;
+  setPlanRuntimePhase: (
+    phase: PlanRuntimePhase,
+    reason?: string,
+    status?: "pending" | "running" | "done" | "failed",
+    qualitySnapshot?: PlanRuntimePhaseQualitySnapshot,
+  ) => void;
   waitForPlanApprovalIfNeeded: () => Promise<boolean>;
   tryClosePlanWithEvidence: (trigger: string, details?: {
     consecutiveEmptyResponseCount?: number;
@@ -330,9 +358,11 @@ export async function handlePlanNoToolRecovery(input: {
     commandDirectiveAction,
   });
 
-  const recoverRejectedVisibleCandidate = (
+  const recoverRejectedVisibleCandidate = async (
     materialized: Awaited<ReturnType<typeof autoMaterializePlanArtifactFromVisibleText>>,
-  ): PlanNoToolRecoveryResult => {
+  ): Promise<PlanNoToolRecoveryResult> => {
+    const priorPlanAutoScaffoldPromptIssued = planAutoScaffoldPromptIssued;
+    const priorPlanClosureEvidenceRecoveryIssued = planClosureEvidenceRecoveryIssued;
     const quality = materialized.quality || classifyPlanArtifactQualityResult({
       ok: false,
       reason: materialized.reason || "quality_gate",
@@ -362,6 +392,87 @@ export async function handlePlanNoToolRecovery(input: {
     planAutoScaffoldPromptIssued = recovery.planAutoScaffoldPromptIssued;
     planClosureEvidenceRecoveryIssued = recovery.planClosureEvidenceRecoveryIssued;
     currentPlanEvidenceRecoveryPasses = recovery.planEvidenceRecoveryPasses;
+
+    const shouldAttemptEvidenceMaterialization = shouldAttemptPlanEvidenceMaterialization({
+      recoveryAction: quality.recoveryAction,
+      qualityRejectCount: recovery.planQualityRejectCount,
+      qualityGateReason: recovery.planLastQualityGateReason,
+      finishReason: normalizedFinishReason,
+    });
+    if (shouldAttemptEvidenceMaterialization) {
+      setPlanRuntimePhase("needs_rewrite", "runtime evidence materialization");
+      const evidenceMaterialized = await autoMaterializePlanArtifactFromEvidence({
+        workspace,
+        callbacks,
+        userGoal: latestUserPromptText,
+        recentToolActivity: recentPlanToolActivity,
+        attemptedTargets: attemptedPlanWriteTargets,
+        turnContext: turnInputContextSignals,
+      });
+      logAgentEvent(
+        evidenceMaterialized.ok
+          ? "plan_evidence_materialization_succeeded"
+          : "plan_evidence_materialization_failed",
+        {
+          iteration,
+          qualityGateReason: recovery.planLastQualityGateReason,
+          qualityRejectCount: recovery.planQualityRejectCount,
+          sourceFinishReason: normalizedFinishReason || "unknown",
+          path: evidenceMaterialized.path || "",
+          source: evidenceMaterialized.source || "",
+          reason: evidenceMaterialized.reason || "",
+          writeFailed: evidenceMaterialized.toolResult?.isError === true,
+        },
+      );
+      if (evidenceMaterialized.ok) {
+        currentPlanArtifactQualityRejected = false;
+        currentPlanLastQualityGateReason = "";
+        planLastMissingSections = [];
+        // The typed recovery prompt was only prepared, not appended. Preserve
+        // the prior sent-state so a successful runtime materialization cannot
+        // manufacture a prompt-history flag that never reached the model.
+        planAutoScaffoldPromptIssued = priorPlanAutoScaffoldPromptIssued;
+        planClosureEvidenceRecoveryIssued = priorPlanClosureEvidenceRecoveryIssued;
+        const language = callbacks.getPreferredLanguage();
+        return finish(await handOffApprovedPlan({
+          callbacks,
+          waitForPlanApprovalIfNeeded,
+          setPlanRuntimePhase,
+          recentPlanToolActivity,
+          phaseReason: "runtime evidence artifact accepted",
+          qualitySnapshot: {
+            qualityRejectCount: planQualityRejectCount,
+            missingSections: [],
+          },
+          assistantHistoryText: language === "zh"
+            ? "MAIN 已根据当前用户目标和已确认的只读证据生成并校验计划产物，等待审阅。"
+            : "MAIN generated and validated the Plan artifact from the current user goal and confirmed read-only evidence; it is ready for review.",
+        }));
+      }
+
+      if (
+        evidenceMaterialized.toolResult?.isError === true ||
+        recovery.planQualityRejectCount >= 2
+      ) {
+        const failureReason = evidenceMaterialized.toolResult?.isError === true
+          ? `evidence_materialization_write_failed:${evidenceMaterialized.reason || "unknown"}`
+          : `evidence_materialization_rejected:${evidenceMaterialized.reason || recovery.planLastQualityGateReason || "quality_gate"}`;
+        logAgentEvent("loop_stop", {
+          reason: "plan_evidence_materialization_exhausted",
+          iteration,
+          qualityGateReason: recovery.planLastQualityGateReason,
+          qualityRejectCount: recovery.planQualityRejectCount,
+          materializationReason: evidenceMaterialized.reason || "",
+        });
+        callbacks.onNonActionableStop(
+          buildPlanGenerationFailedMessage(callbacks.getPreferredLanguage(), failureReason),
+          "incomplete_plan",
+          buildPlanGenerationFailedProgress(failureReason),
+        );
+        callbacks.onStatusChange("idle");
+        return finish("stopped");
+      }
+    }
 
     if (recovery.pendingPlanRuntimeRecoveryPrompt) {
       callbacks.onStatusChange("running");

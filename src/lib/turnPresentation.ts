@@ -5,6 +5,7 @@ import type {
   PlanTask,
 } from "./workflowModels";
 import type { ActionRequestKind, ActionRequestStatus } from "./actionRequest";
+import type { ProgressTaskBlock } from "./taskTypes";
 
 export type TurnPresentationKind =
   | "ordinary"
@@ -254,6 +255,75 @@ export function isPlanReviewCapsulePresentationEligible(input: {
   }
   return Number(input.requestPlanRevision) === Number(input.currentPlanRevision) &&
     input.requestArtifactHash === input.currentArtifactHash;
+}
+
+export interface PlanDraftRuntimeCapsuleProjection {
+  phaseId: string;
+  title: string;
+  headline: string;
+  summary: string;
+  heartbeat: string;
+  reason: string;
+  turnId: string;
+  runId: string;
+  parentRunId: string | null;
+  iteration: number;
+  qualityRejectCount: number;
+  elapsedMs: number;
+}
+
+/**
+ * Project only the active, exactly-owned pre-approval Plan phase. The source
+ * block is runtime-authored, so model reasoning text can never become Capsule
+ * liveness content accidentally.
+ */
+export function buildPlanDraftRuntimeCapsuleProjection(input: {
+  blocks?: Array<Partial<ProgressTaskBlock> & Record<string, unknown>>;
+  expectedTurnId?: string | null;
+  expectedRunId?: string | null;
+  language?: "zh" | "en";
+}): PlanDraftRuntimeCapsuleProjection | null {
+  const expectedTurnId = String(input.expectedTurnId || "").trim();
+  const expectedRunId = String(input.expectedRunId || "").trim();
+  if (!expectedTurnId || !expectedRunId) return null;
+
+  const block = [...(input.blocks || [])].reverse().find((candidate) =>
+    candidate?.type === "progress" &&
+    candidate.turnPhase?.domain === "plan_runtime" &&
+    candidate.turnPhase?.status === "running" &&
+    String(candidate.turnId || "") === expectedTurnId &&
+    String(candidate.runId || "") === expectedRunId
+  );
+  if (!block?.turnPhase) return null;
+
+  const language = input.language === "en" ? "en" : "zh";
+  const phaseId = String(block.turnPhase.id || "plan_runtime").replace(/^plan_/, "");
+  const title = compactProgressValue(block.turnPhase.title || block.title, 120) ||
+    (language === "zh" ? "计划生成中" : "Generating plan");
+  const reason = compactProgressValue(block.phaseReason, 180);
+  const summary = compactProgressValue(block.turnPhase.summary || block.why, 240);
+  const heartbeat = compactProgressValue(block.action || block.next, 220);
+  const iteration = Math.max(0, Number(block.iteration) || 0);
+  const qualityRejectCount = Math.max(0, Number(block.qualityRejectCount) || 0);
+  const elapsedMs = Math.max(0, Number(block.elapsedMs) || 0);
+  const headline = language === "zh"
+    ? `${title}${iteration > 0 ? ` · 第 ${iteration} 次尝试` : ""}`
+    : `${title}${iteration > 0 ? ` · attempt ${iteration}` : ""}`;
+
+  return {
+    phaseId,
+    title,
+    headline,
+    summary,
+    heartbeat,
+    reason,
+    turnId: expectedTurnId,
+    runId: expectedRunId,
+    parentRunId: block.parentRunId == null ? null : String(block.parentRunId),
+    iteration,
+    qualityRejectCount,
+    elapsedMs,
+  };
 }
 
 export type PlanExecutionCapsuleTone = "active" | "waiting" | "recovery" | "failed" | "success";

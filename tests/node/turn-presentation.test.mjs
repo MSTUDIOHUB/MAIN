@@ -20,6 +20,7 @@ new Function("exports", "module", "require", transpiled)(
 );
 
 const {
+  buildPlanDraftRuntimeCapsuleProjection,
   buildPlanExecutionCapsuleProjection,
   buildTurnPresentationModel,
   isPlanActionRequestPresentationEligible,
@@ -217,6 +218,63 @@ test("Plan review Capsule requires the exact paused request and current artifact
   assert.equal(isPlanReviewCapsulePresentationEligible({ ...base, requestPlanRevision: 2 }), false);
   assert.equal(isPlanReviewCapsulePresentationEligible({ ...base, requestArtifactHash: "stale-hash" }), false);
   assert.equal(isPlanReviewCapsulePresentationEligible({ ...base, actionKind: "tool_permission" }), false);
+});
+
+test("preapproval Plan phase projection requires the exact run and never exposes reasoning text", () => {
+  const block = {
+    id: 41,
+    type: "progress",
+    turnId: "turn-plan-draft",
+    runId: "run-plan-draft",
+    parentRunId: null,
+    phase: "summarizing",
+    title: "Needs rewrite",
+    why: "草稿结构不完整，直接重写可见方案。",
+    action: "第 4 次计划生成已持续 65 秒，收到 420 个流式分块；隐藏推理正文不会展示。",
+    next: "计划通过质量门后才会进入审核。",
+    status: "running",
+    source: "runtime",
+    targets: [],
+    evidence: "",
+    phaseReason: "excessive_plan_code_dump",
+    iteration: 4,
+    qualityRejectCount: 1,
+    elapsedMs: 65_000,
+    reasoningText: "SECRET MODEL REASONING MUST NEVER RENDER",
+    turnPhase: {
+      id: "plan_needs_rewrite",
+      kind: "diagnosis",
+      title: "Needs rewrite",
+      summary: "草稿结构不完整，直接重写可见方案。",
+      domain: "plan_runtime",
+      status: "running",
+    },
+  };
+
+  const projection = buildPlanDraftRuntimeCapsuleProjection({
+    blocks: [block],
+    expectedTurnId: "turn-plan-draft",
+    expectedRunId: "run-plan-draft",
+    language: "zh",
+  });
+  assert.equal(projection.phaseId, "needs_rewrite");
+  assert.equal(projection.runId, "run-plan-draft");
+  assert.equal(projection.iteration, 4);
+  assert.equal(projection.elapsedMs, 65_000);
+  assert.match(projection.heartbeat, /65 秒/);
+  assert.match(projection.reason, /excessive_plan_code_dump/);
+  assert.doesNotMatch(JSON.stringify(projection), /SECRET MODEL REASONING/);
+
+  assert.equal(buildPlanDraftRuntimeCapsuleProjection({
+    blocks: [block],
+    expectedTurnId: "turn-plan-draft",
+    expectedRunId: "run-stale",
+  }), null);
+  assert.equal(buildPlanDraftRuntimeCapsuleProjection({
+    blocks: [{ ...block, turnPhase: { ...block.turnPhase, status: "done" } }],
+    expectedTurnId: "turn-plan-draft",
+    expectedRunId: "run-plan-draft",
+  }), null);
 });
 
 test("Plan execution Capsule headline follows runtime progress instead of the first incomplete artifact task", () => {

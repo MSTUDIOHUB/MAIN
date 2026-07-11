@@ -57,6 +57,8 @@ import {
 } from "./orchestrator/unityDiagnostics";
 import {
   buildPlanRecoveryPromptFromContext,
+  hasGroundedPlanClosureEvidence,
+  resolvePlanClosureArtifactKind,
 } from "./orchestrator/planOrchestration";
 
 export {
@@ -172,6 +174,7 @@ import {
 } from "./turnEvents";
 import { normalizeToolCallForExecution } from "./toolCallNormalization";
 import {
+  composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
@@ -1270,7 +1273,11 @@ export interface OrchestratorCallbacks {
     fullText: string,
     messageId: string,
     truncated: boolean,
-    meta?: { suppressTruncationWarning?: boolean; reason?: string },
+    meta?: {
+      suppressTruncationWarning?: boolean;
+      reason?: string;
+      streamDiagnostics?: StreamResult["streamDiagnostics"];
+    },
   ) => void;
   onThought: (thought: string) => void;
   onAssistantFinalText: (
@@ -1312,6 +1319,9 @@ export interface OrchestratorCallbacks {
     summary?: string;
     domain?: string;
     status?: "pending" | "running" | "done" | "failed";
+    reason?: string;
+    iteration?: number;
+    qualityRejectCount?: number;
   }) => void;
   onTurnEvent?: (event: MainThreadEvent) => void;
   hasRuntimeThreadStarted?: (threadId: string) => boolean;
@@ -1393,6 +1403,7 @@ export function deriveStreamSettings(config: AppConfig): StreamSettings {
       contextLimit: config.local.contextLimit,
       provider: config.local.provider,
       toolProtocol,
+      reasoningRequest: "off",
       // LM Studio / OMLX 的本地流式接口在桌面 WebView 中可能触发
       // “Load Failed”，统一交给 Tauri 后端请求，避开 WebView 限制。
       // Ollama 原生端点保留前端直连；配置成 /v1 时也走后端代理。
@@ -2986,6 +2997,7 @@ export async function fetchLLMStream(
     callbacks.onStreamDone(fullText, messageId, truncated, {
       suppressTruncationWarning: isReasoningDominated,
       reason: isReasoningDominated ? "reasoning_dominated_length" : "",
+      streamDiagnostics: result.streamDiagnostics,
     });
     return result;
 
@@ -4189,6 +4201,116 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
     workspace: input.workspace,
     callbacks: input.callbacks,
     toolCallPrefix: "plan_materialize",
+  });
+}
+
+/**
+ * Materialize a runtime-owned Plan artifact from already-sanitized, concrete
+ * evidence. This is intentionally separate from the model-visible recovery
+ * prompt: an "auto scaffold" must either produce and validate a real artifact
+ * or report a precise rejection, rather than silently launching another
+ * unbounded model rewrite.
+ */
+export async function autoMaterializePlanArtifactFromEvidence(input: {
+  workspace: string;
+  callbacks: OrchestratorCallbacks;
+  userGoal?: string;
+  recentToolActivity?: PlanToolActivitySummary[];
+  attemptedTargets?: string[];
+  turnContext?: TurnInputContextSignals;
+}): Promise<PlanMaterializationResultForLoop> {
+  const closureInput = collectPlanClosureMaterializationInput(
+    input.callbacks,
+    input.recentToolActivity || [],
+    input.attemptedTargets || [],
+    input.userGoal || "",
+  );
+  if (!hasGroundedPlanClosureEvidence(
+    closureInput,
+    input.recentToolActivity || [],
+  )) {
+    logAgentEvent("plan_evidence_materialization_rejected", {
+      reason: "insufficient_relevant_plan_evidence",
+      evidenceCount: closureInput.evidence.length,
+      structuredEvidenceCount: closureInput.evidenceRecords.length,
+      fileCount: closureInput.files.length,
+      sanitizerDropped: closureInput.sanitizer.dropped,
+      sanitizerDropReasons: closureInput.sanitizer.dropReasons,
+    });
+    return {
+      ok: false,
+      reason: "insufficient_relevant_plan_evidence",
+    };
+  }
+  const closureKind = resolvePlanClosureArtifactKind(
+    closureInput,
+    input.callbacks.getPlanStage(),
+    input.recentToolActivity || [],
+  );
+  if (closureKind !== "plan") {
+    logAgentEvent("plan_evidence_materialization_rejected", {
+      reason: "deterministic_design_materialization_not_supported",
+      closureKind,
+      planStage: input.callbacks.getPlanStage(),
+      evidenceCount: closureInput.evidence.length,
+      structuredEvidenceCount: closureInput.evidenceRecords.length,
+      fileCount: closureInput.files.length,
+    });
+    return {
+      ok: false,
+      reason: "deterministic_design_materialization_not_supported",
+    };
+  }
+  const content = composePlanArtifactFromEvidence({
+    userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
+    evidence: closureInput.evidence,
+    evidenceRecords: closureInput.evidenceRecords,
+    files: closureInput.files,
+    constraints: closureInput.constraints,
+    language: input.callbacks.getPreferredLanguage(),
+  });
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    planStage: input.callbacks.getPlanStage(),
+    preferredKind: "plan",
+    sourceHint: "deterministic_evidence",
+    userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
+    evidence: closureInput.evidence,
+    evidenceRecords: closureInput.evidenceRecords,
+    files: closureInput.files,
+    recentToolActivity: input.recentToolActivity,
+    turnContext: input.turnContext,
+    language: input.callbacks.getPreferredLanguage(),
+  });
+
+  if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
+    logAgentEvent("plan_evidence_materialization_rejected", {
+      reason: materialized.reason || "quality_gate",
+      evidenceCount: closureInput.evidence.length,
+      structuredEvidenceCount: closureInput.evidenceRecords.length,
+      fileCount: closureInput.files.length,
+      sanitizerDropped: closureInput.sanitizer.dropped,
+      sanitizerDropReasons: closureInput.sanitizer.dropReasons,
+    });
+    return {
+      ok: false,
+      reason: materialized.reason || "quality_gate",
+      quality: materialized.quality,
+    };
+  }
+
+  logAgentEvent("plan_evidence_materialization_ready", {
+    path: materialized.path,
+    source: materialized.source || "deterministic_evidence",
+    evidenceCount: closureInput.evidence.length,
+    structuredEvidenceCount: closureInput.evidenceRecords.length,
+    fileCount: closureInput.files.length,
+  });
+  return writeMaterializedPlanArtifact({
+    materialized,
+    workspace: input.workspace,
+    callbacks: input.callbacks,
+    toolCallPrefix: "plan_evidence_materialize",
   });
 }
 

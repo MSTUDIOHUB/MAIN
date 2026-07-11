@@ -65,7 +65,7 @@ export function isReasoningModelName(modelName: string | null | undefined): bool
 }
 
 export function isReasoningDominatedLengthResult(
-  result: Pick<StreamResult, "content" | "finishReason" | "reasoningContent" | "toolCalls">,
+  result: Pick<StreamResult, "content" | "actionableContent" | "semanticContent" | "finishReason" | "reasoningContent" | "toolCalls">,
   isLocal?: boolean,
   isReasoningModel?: boolean,
 ): boolean {
@@ -74,7 +74,7 @@ export function isReasoningDominatedLengthResult(
 }
 
 export function isReasoningDominatedNoActionResult(
-  result: Pick<StreamResult, "content" | "reasoningContent" | "toolCalls">,
+  result: Pick<StreamResult, "content" | "actionableContent" | "semanticContent" | "reasoningContent" | "toolCalls">,
   isLocal?: boolean,
   isReasoningModel?: boolean,
 ): boolean {
@@ -82,7 +82,12 @@ export function isReasoningDominatedNoActionResult(
   if (isReasoningModel) return false;
 
   const reasoningChars = String(result.reasoningContent || "").trim().length;
-  const visibleChars = stripReasoningBlocksForEscalation(result.content).length;
+  const semanticContent = typeof result.actionableContent === "string"
+    ? result.actionableContent
+    : typeof result.semanticContent === "string"
+    ? result.semanticContent
+    : result.content;
+  const visibleChars = stripReasoningBlocksForEscalation(semanticContent).length;
 
   // Count reasoning blocks embedded within visible content (e.g. <thought>...</thought>)
   const embeddedReasoningChars = Math.max(0, String(result.content || "").length - visibleChars);

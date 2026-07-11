@@ -16,6 +16,12 @@ import { PolicyFactory } from "../policies/PolicyFactory";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { AgentMessage, FetchLLMStreamOptions, OrchestratorCallbacks } from "../types";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
+import {
+  applyPreapprovalPlanQualityRecoveryStreamOptions,
+  capPreapprovalPlanQualityRecoveryMaxEscalations,
+  capPreapprovalPlanQualityRecoveryMaxTokens,
+  type PreapprovalPlanQualityRecoveryStreamPolicy,
+} from "./preapprovalPlanRecoveryStreamPolicy";
 
 export type PlanStreamWatchdogOptionsResolver = (
   nativeToolCount: number,
@@ -30,6 +36,7 @@ export function resolveRecoveryToolChoice(input: {
   approvedPlanNoToolRecoveryFileReadActive: boolean;
   llmToolCount: number;
   forceXmlTools: boolean;
+  preapprovalPlanQualityRecoveryToolChoice?: "required";
 }): "required" | undefined {
   if (input.llmToolCount <= 0 || input.forceXmlTools) return undefined;
   const executeRecoveryRequiresAction =
@@ -37,7 +44,9 @@ export function resolveRecoveryToolChoice(input: {
   const approvedPlanRecoveryRequiresAction =
     input.approvedPlanActionOnlyRecoveryActive ||
     input.approvedPlanNoToolRecoveryFileReadActive;
-  return executeRecoveryRequiresAction || approvedPlanRecoveryRequiresAction
+  return executeRecoveryRequiresAction ||
+    approvedPlanRecoveryRequiresAction ||
+    input.preapprovalPlanQualityRecoveryToolChoice === "required"
     ? "required"
     : undefined;
 }
@@ -77,6 +86,7 @@ export async function invokeInitialStreamForIteration(input: {
   consecutiveNoToolCount: number;
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   approvedPlanRecoveryStreamMaxElapsedMs: number;
+  preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
 }): Promise<InitialStreamInvocationResult> {
   const {
     callbacks,
@@ -109,6 +119,7 @@ export async function invokeInitialStreamForIteration(input: {
     consecutiveNoToolCount,
     getPlanStreamWatchdogOptions,
     approvedPlanRecoveryStreamMaxElapsedMs,
+    preapprovalPlanQualityRecoveryStreamPolicy,
   } = input;
   const {
     config,
@@ -164,7 +175,7 @@ export async function invokeInitialStreamForIteration(input: {
           approvedPlanRecoveryStreamMaxElapsedMs,
         )
       : approvedPlanRecoveryStreamMaxElapsedMs;
-  const streamWatchdogOptions: FetchLLMStreamOptions = {
+  const baseResolvedStreamWatchdogOptions: FetchLLMStreamOptions = {
     ...baseStreamWatchdogOptions,
     ...(approvedPlanRecoveryStreamHardTimeoutActive
       ? {
@@ -173,6 +184,12 @@ export async function invokeInitialStreamForIteration(input: {
         }
       : {}),
   };
+  const streamWatchdogOptions =
+    applyPreapprovalPlanQualityRecoveryStreamOptions(
+      preapprovalPlanQualityRecoveryStreamPolicy,
+      baseResolvedStreamWatchdogOptions,
+      llmTools.length,
+    );
   const recoveryToolChoice = resolveRecoveryToolChoice({
     isExecuteRecoveryEligible,
     executeRecoveryMode,
@@ -180,7 +197,19 @@ export async function invokeInitialStreamForIteration(input: {
     approvedPlanNoToolRecoveryFileReadActive,
     llmToolCount: llmTools.length,
     forceXmlTools,
+    preapprovalPlanQualityRecoveryToolChoice:
+      preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
   });
+  const effectiveCurrentMaxTokens =
+    capPreapprovalPlanQualityRecoveryMaxTokens(
+      preapprovalPlanQualityRecoveryStreamPolicy,
+      currentMaxTokens,
+    );
+  const effectiveMaxOutputEscalations =
+    capPreapprovalPlanQualityRecoveryMaxEscalations(
+      preapprovalPlanQualityRecoveryStreamPolicy,
+      maxOutputEscalations,
+    );
 
   logAgentEvent("llm_request_shape", {
     iteration,
@@ -195,8 +224,8 @@ export async function invokeInitialStreamForIteration(input: {
     useRustProxy: settings.useRustProxy,
     contextLimit: settings.contextLimit,
     configuredContextLimit: snapshotContextLimit ?? null,
-    currentMaxTokens: currentMaxTokens ?? "default",
-    maxOutputEscalations,
+    currentMaxTokens: effectiveCurrentMaxTokens ?? "default",
+    maxOutputEscalations: effectiveMaxOutputEscalations,
     forceXmlTools,
     toolProtocol: effectiveToolProtocol,
     nativeToolsEnabled: !forceXmlTools,
@@ -222,6 +251,19 @@ export async function invokeInitialStreamForIteration(input: {
         config.activeProfile === "local" &&
         forceXmlTools,
     },
+    preapprovalPlanQualityRecovery:
+      preapprovalPlanQualityRecoveryStreamPolicy.active
+        ? {
+            stage: preapprovalPlanQualityRecoveryStreamPolicy.stage,
+            maxOutputTokens:
+              preapprovalPlanQualityRecoveryStreamPolicy.maxOutputTokens,
+            maxStreamElapsedMs:
+              preapprovalPlanQualityRecoveryStreamPolicy.maxStreamElapsedMs,
+            toolChoice:
+              preapprovalPlanQualityRecoveryStreamPolicy.toolChoice ?? null,
+            stopClass: preapprovalPlanQualityRecoveryStreamPolicy.stopClass,
+          }
+        : null,
   });
 
   const isExecute = isMutationRuntimeIntent(runtimeIntent);
@@ -237,8 +279,8 @@ export async function invokeInitialStreamForIteration(input: {
     callbacks,
     abortSignal,
     llmTools,
-    currentMaxTokens,
-    maxOutputEscalations,
+    effectiveCurrentMaxTokens,
+    effectiveMaxOutputEscalations,
     {
       ...streamWatchdogOptions,
       toolChoice: recoveryToolChoice,

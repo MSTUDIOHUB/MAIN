@@ -20,6 +20,7 @@ import {
   type PlanRuntimePhase,
 } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
+import type { PlanRuntimePhaseQualitySnapshot } from "./planRuntimeState";
 
 export type PlanQualityRecoveryResult = {
   planQualityRejectCount: number;
@@ -60,6 +61,7 @@ type PlanQualityRecoveryInput = {
     phase: PlanRuntimePhase,
     reason?: string,
     status?: "pending" | "running" | "done" | "failed",
+    qualitySnapshot?: PlanRuntimePhaseQualitySnapshot,
   ) => void;
 };
 
@@ -114,6 +116,14 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
   let planArtifactQualityRejected = input.planArtifactQualityRejected === true;
   let pendingPlanRuntimeRecoveryPrompt: string | null = null;
   const wasPlanEvidenceRecoveryPhase = String(planRuntimePhase) === "needs_evidence";
+  const setQualityPhase = (
+    phase: PlanRuntimePhase,
+    reason?: string,
+    status?: "pending" | "running" | "done" | "failed",
+  ) => setPlanRuntimePhase(phase, reason, status, {
+    qualityRejectCount: planQualityRejectCount,
+    missingSections: planLastMissingSections,
+  });
 
   const finish = (): PlanQualityRecoveryResult => ({
     planQualityRejectCount,
@@ -149,7 +159,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     });
 
     if (latestQualityResult.recoveryAction === "targeted_evidence" && planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
-      setPlanRuntimePhase("needs_evidence", planLastQualityGateReason);
+      setQualityPhase("needs_evidence", planLastQualityGateReason);
     } else if (
       latestQualityResult.recoveryAction === "auto_scaffold" ||
       planQualityRejectCount >= 2 ||
@@ -157,7 +167,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     ) {
       if (!planAutoScaffoldPromptIssued) {
         planAutoScaffoldPromptIssued = true;
-        setPlanRuntimePhase("needs_rewrite", "auto scaffold after quality gate");
+        setQualityPhase("needs_rewrite", "auto scaffold after quality gate");
         pendingPlanRuntimeRecoveryPrompt = buildPlanAutoScaffoldPrompt({
           language: callbacks.getPreferredLanguage(),
           latestUserPromptText,
@@ -166,10 +176,10 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           missingSections: planLastMissingSections,
         });
       } else {
-        setPlanRuntimePhase("needs_rewrite", planLastQualityGateReason);
+        setQualityPhase("needs_rewrite", planLastQualityGateReason);
       }
     } else {
-      setPlanRuntimePhase("needs_rewrite", planLastQualityGateReason);
+      setQualityPhase("needs_rewrite", planLastQualityGateReason);
     }
 
     const qualityClosureEvidence = collectPlanClosureMaterializationInput(
@@ -190,6 +200,15 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       hasStructuredQualityClosureEvidence &&
       !planClosureEvidenceRecoveryIssued &&
       planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+    const deterministicEvidenceMaterializationCandidate =
+      latestQualityResult.source === "visible_candidate" &&
+      latestQualityResult.recoveryAction !== "ask_user" &&
+      (
+        planQualityRejectCount >= 2 ||
+        /excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
+          planLastQualityGateReason,
+        )
+      );
     logAgentEvent("plan_quality_gate_recovery_decision", {
       iteration,
       source: latestQualityResult.source,
@@ -198,8 +217,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       recoveryAction: latestQualityResult.recoveryAction || "",
       hasGroundedEvidence: hasQualityClosureEvidence,
       hasStructuredEvidence: hasStructuredQualityClosureEvidence,
-      deterministicClosure: false,
-      fallbackPlanMaterializationDisabled: true,
+      deterministicEvidenceMaterializationCandidate,
       targetedEvidenceRecovery: shouldRequestTargetedEvidenceAfterQualityGate,
       sanitizedEvidenceCount: qualityClosureEvidence.evidence.length,
       structuredEvidenceCount: qualityClosureEvidence.evidenceRecords.length,
@@ -210,7 +228,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     if (shouldRequestTargetedEvidenceAfterQualityGate) {
       pendingPlanRuntimeRecoveryPrompt = null;
       planClosureEvidenceRecoveryIssued = true;
-      setPlanRuntimePhase("needs_evidence", "quality gate needs model-authored plan evidence");
+      setQualityPhase("needs_evidence", "quality gate needs model-authored plan evidence");
       pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
         callbacks.getPreferredLanguage(),
         planLastQualityGateReason || "quality gate rejected plan draft",
@@ -238,7 +256,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     planEvidenceRecoveryPasses += 1;
     const hasSuccessfulEvidence = evidenceRecoveryBatchResults.some((result) => !result.isError);
     if (hasSuccessfulEvidence) {
-      setPlanRuntimePhase("drafting", "evidence recovery complete");
+      setQualityPhase("drafting", "evidence recovery complete");
       pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryClosurePrompt({
         language: callbacks.getPreferredLanguage(),
         recentToolActivity: recentPlanToolActivity,
@@ -246,7 +264,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         missingSections: planLastMissingSections,
       });
     } else {
-      setPlanRuntimePhase("blocked", "evidence recovery failed", "failed");
+      setQualityPhase("blocked", "evidence recovery failed", "failed");
       pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
         language: callbacks.getPreferredLanguage(),
         recentToolActivity: recentPlanToolActivity,

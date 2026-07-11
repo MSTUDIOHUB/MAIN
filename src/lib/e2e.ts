@@ -4234,6 +4234,108 @@ function seedExecutionCapsulePanelStabilityScenario() {
     appendBridgeEvent("panel_mode", { mode });
   };
 
+  bridge.showPlanDraftRecovery = () => {
+    const heartbeatAt = Date.now();
+    const runId = "run-e2e-plan-draft-recovery";
+    const phaseBlockId = useAppStore.getState()._nextTaskId();
+    const phaseBlock = {
+      id: phaseBlockId,
+      turnId,
+      type: "progress" as const,
+      phase: "summarizing" as const,
+      title: "Needs rewrite",
+      why: "草稿结构不完整，直接重写可见方案。",
+      action: "第 4 次计划生成已持续 65 秒，收到 420 个流式分块；隐藏推理正文不会展示。",
+      evidence: "",
+      next: "计划通过质量门后才会进入审核；当前不会请求执行批准。",
+      targets: [],
+      status: "running" as const,
+      source: "runtime" as const,
+      hypothesisStatus: "unverified" as const,
+      turnPhase: {
+        id: "plan_needs_rewrite",
+        kind: "diagnosis" as const,
+        title: "Needs rewrite",
+        summary: "草稿结构不完整，直接重写可见方案。",
+        domain: "plan_runtime",
+        status: "running" as const,
+      },
+      runId,
+      parentRunId: null,
+      dedupeKey: `plan-runtime:${runId}:plan_needs_rewrite`,
+      phaseReason: "excessive_plan_code_dump",
+      iteration: 4,
+      qualityRejectCount: 1,
+      elapsedMs: 65_000,
+      createdAt: heartbeatAt - 65_000,
+      updatedAt: heartbeatAt,
+    };
+    useAppStore.setState((state) => ({
+      taskFlow: [baseUserBlock, phaseBlock],
+      conversationTurns: state.conversationTurns.map((turn) =>
+        turn.id === turnId
+          ? {
+              ...turn,
+              status: "planning" as const,
+              summary: "",
+              blockIds: [userBlockId, phaseBlockId],
+            }
+          : turn
+      ),
+      planArtifacts: [],
+      planTasks: [],
+      planExecutionEvidenceLedger: [],
+      planExecutionEvidenceCount: 0,
+      planExecutionProgressSnapshot: null,
+      planStage: "idle",
+      isPlanApproved: false,
+      activeActionRequest: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+      showPlanPanel: false,
+      showDiff: false,
+      showTerminal: false,
+      rightPanelTab: "plan",
+      agentStatus: "running",
+      isGenerating: true,
+      abortController: new AbortController(),
+      harnessRunMarker: {
+        schemaVersion: 1,
+        runId,
+        parentRunId: null,
+        instanceId: "e2e-plan-draft-recovery-instance",
+        sessionKey: `${workspace}:${sessionId}`,
+        workspace,
+        sessionId,
+        turnId,
+        status: "running",
+        workflowMode: "plan",
+        runtimeIntent: "plan",
+        planStage: "idle",
+        isPlanApproved: false,
+        iteration: 4,
+        maxIterations: 25,
+        messagesLen: 15,
+        toolCount: 2,
+        latestTool: "read_file",
+        latestToolTarget: "src-tauri/Cargo.toml",
+        activeStreamId: "stream-e2e-plan-draft-recovery",
+        streamStatus: "chunk_progress",
+        streamChunkCount: 420,
+        streamByteCount: 88_000,
+        streamElapsedMs: 65_000,
+        streamLifecycleStatus: "streaming",
+        lastStreamError: null,
+        startedAt: heartbeatAt - 65_000,
+        updatedAt: heartbeatAt,
+        closedAt: null,
+        closeReason: null,
+      },
+    }));
+    appendBridgeEvent("plan_draft_recovery_shown", { runId, turnId });
+  };
+
   bridge.setExecutionCapsuleIdentity = (runId: string, requestId: string) => {
     const identityNow = Date.now();
     const planIdentity = buildPlanApprovalIdentity(useAppStore.getState().planArtifacts);

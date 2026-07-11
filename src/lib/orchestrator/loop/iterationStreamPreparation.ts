@@ -26,6 +26,10 @@ import {
 } from "./toolCallPlanning";
 import type { AgentLoopToolExecutionRuntimeState } from "./toolExecutionRuntimeState";
 import type { TurnIterationContext } from "./turnIterationContext";
+import {
+  resolvePreapprovalPlanQualityRecoveryStreamPolicy,
+  type PreapprovalPlanQualityRecoveryStreamPolicy,
+} from "./preapprovalPlanRecoveryStreamPolicy";
 
 type RuntimeGuidanceCallbacks = Pick<
   OrchestratorCallbacks,
@@ -83,6 +87,7 @@ export interface IterationStreamPreparationResult {
   assistantMsgId: string;
   maxOutputEscalations: number;
   iterationRequestStartedAt: number;
+  preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
 }
 
 export function prepareIterationStreamRequest(input: {
@@ -245,6 +250,19 @@ export function prepareIterationStreamRequest(input: {
   const assistantMsgId = generateId();
   const maxOutputEscalations = getMaxOutputEscalations();
   const iterationRequestStartedAt = Date.now();
+  const preapprovalPlanQualityRecoveryStreamPolicy =
+    resolvePreapprovalPlanQualityRecoveryStreamPolicy({
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      planRuntimePhase: planRuntimeState.planRuntimePhase,
+      planQualityRejectCount: planRuntimeState.planQualityRejectCount,
+      planAutoScaffoldPromptIssued:
+        planRuntimeState.planAutoScaffoldPromptIssued,
+      llmToolNames: contextManagementResult.llmTools.map(
+        (tool) => tool.function.name,
+      ),
+      forceXmlTools: contextManagementResult.forceXmlTools,
+    });
 
   logAgentEvent("iteration_start", {
     iteration,
@@ -258,6 +276,18 @@ export function prepareIterationStreamRequest(input: {
     xmlToolsEnabled: true,
     mcpTools: mcpToolCount,
     currentMaxTokens: streamRuntimeState.currentMaxTokens ?? "default",
+    preapprovalPlanQualityRecovery: preapprovalPlanQualityRecoveryStreamPolicy.active
+      ? {
+          stage: preapprovalPlanQualityRecoveryStreamPolicy.stage,
+          maxOutputTokens:
+            preapprovalPlanQualityRecoveryStreamPolicy.maxOutputTokens,
+          maxStreamElapsedMs:
+            preapprovalPlanQualityRecoveryStreamPolicy.maxStreamElapsedMs,
+          toolChoice:
+            preapprovalPlanQualityRecoveryStreamPolicy.toolChoice ?? null,
+          stopClass: preapprovalPlanQualityRecoveryStreamPolicy.stopClass,
+        }
+      : null,
   });
   callbacks.onHarnessRunUpdate?.({
     status: "running",
@@ -291,5 +321,6 @@ export function prepareIterationStreamRequest(input: {
     assistantMsgId,
     maxOutputEscalations,
     iterationRequestStartedAt,
+    preapprovalPlanQualityRecoveryStreamPolicy,
   };
 }

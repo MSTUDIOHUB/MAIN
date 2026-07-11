@@ -33,11 +33,13 @@ import {
   type OpenAiApiFormat,
   type OpenAiReasoningEffort,
   type ProtocolChatMessage,
+  type ReasoningRequestMode,
 } from "./cloudProtocol";
 import { computeContextBudgets } from "./contextTrim";
 import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
 import { isNativeToolCompatibilityErrorMessage, isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
+import { sanitizeAssistantDisplayContent } from "./sanitize";
 
 function emitStreamingConsole(
   source: "streaming" | "streamViaRustProxy",
@@ -92,6 +94,7 @@ export interface StreamSettings {
   topP?: number;
   disableResponseStorage?: boolean;
   reasoningEffort?: OpenAiReasoningEffort;
+  reasoningRequest?: ReasoningRequestMode;
   toolProtocol?: CloudToolProtocol;
   contextLimit?: number; // total context window for the model (used to calculate max_tokens)
   provider?: string;    // "Ollama" | "LM Studio" | "OMLX" | "OpenAI" — controls SSE format
@@ -120,6 +123,10 @@ export interface StreamedToolCall {
 /** Result of a completed stream — includes both text and any tool calls. */
 export interface StreamResult {
   content: string;
+  /** Mirror-stripped model content retained for tool/options normalization. */
+  actionableContent?: string;
+  /** Content after reasoning/protocol mirror removal. Raw provider text remains in `content`. */
+  semanticContent?: string;
   toolCalls: StreamedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
   reasoningContent?: string;
@@ -128,6 +135,153 @@ export interface StreamResult {
     inputTokens: number;
     outputTokens: number;
     totalTokens: number;
+  };
+  streamDiagnostics?: StreamSemanticDiagnostics;
+}
+
+export type StreamMirrorKind =
+  | "none"
+  | "exact"
+  | "normalized_exact"
+  | "reasoning_prefix"
+  | "content_prefix"
+  | "near";
+
+export interface StreamSemanticDiagnostics {
+  rawContentChars: number;
+  reasoningChars: number;
+  semanticVisibleChars: number;
+  mirrorKind: StreamMirrorKind;
+  overlapRatio: number;
+  contentHash: string | null;
+  reasoningHash: string | null;
+  normalizedContentHash: string | null;
+  normalizedReasoningHash: string | null;
+  firstSemanticVisibleElapsedMs: number | null;
+  firstToolElapsedMs: number | null;
+}
+
+export interface SemanticStreamProgress extends Omit<StreamSemanticDiagnostics, "firstSemanticVisibleElapsedMs" | "firstToolElapsedMs"> {
+  rawContent: string;
+  actionableContent: string;
+  semanticContent: string;
+}
+
+const CROSS_CHANNEL_MIRROR_MIN_CHARS = 512;
+const CROSS_CHANNEL_NEAR_MIRROR_RATIO = 0.92;
+
+function hashDiagnosticText(value: string): string | null {
+  if (!value) return null;
+  // FNV-1a is intentionally non-cryptographic. It lets diagnostics compare
+  // channels without persisting any hidden reasoning text.
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function normalizeMirrorText(value: string): string {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function commonPrefixLength(a: string, b: string): number {
+  const limit = Math.min(a.length, b.length);
+  let index = 0;
+  while (index < limit && a.charCodeAt(index) === b.charCodeAt(index)) index += 1;
+  return index;
+}
+
+function commonSuffixLength(a: string, b: string, prefixLength: number): number {
+  const limit = Math.min(a.length, b.length) - prefixLength;
+  let count = 0;
+  while (
+    count < limit &&
+    a.charCodeAt(a.length - 1 - count) === b.charCodeAt(b.length - 1 - count)
+  ) {
+    count += 1;
+  }
+  return count;
+}
+
+/**
+ * Separate provider transport text from user-visible progress.
+ *
+ * Some OpenAI-compatible servers emit reasoning in `reasoning_content` and,
+ * when a thinking block never closes, replay that same transcript as
+ * `content`. That recovery text must remain available for diagnostics but it
+ * is neither a user-visible conclusion nor forward progress.
+ */
+export function analyzeSemanticStreamProgress(input: {
+  content?: string | null;
+  reasoningContent?: string | null;
+}): SemanticStreamProgress {
+  const rawContent = String(input.content || "");
+  const reasoningContent = String(input.reasoningContent || "");
+  const normalizedContent = normalizeMirrorText(rawContent);
+  const normalizedReasoning = normalizeMirrorText(reasoningContent);
+  const shorterLength = Math.min(rawContent.length, reasoningContent.length);
+  const longerLength = Math.max(rawContent.length, reasoningContent.length);
+  const eligibleForMirror = shorterLength >= CROSS_CHANNEL_MIRROR_MIN_CHARS;
+  let mirrorKind: StreamMirrorKind = "none";
+  let semanticCandidate = rawContent;
+  let overlapRatio = 0;
+
+  if (eligibleForMirror && rawContent === reasoningContent) {
+    mirrorKind = "exact";
+    semanticCandidate = "";
+    overlapRatio = 1;
+  } else if (
+    eligibleForMirror &&
+    normalizedContent &&
+    normalizedContent === normalizedReasoning
+  ) {
+    mirrorKind = "normalized_exact";
+    semanticCandidate = "";
+    overlapRatio = 1;
+  } else if (
+    eligibleForMirror &&
+    rawContent.startsWith(reasoningContent) &&
+    reasoningContent.length / Math.max(1, rawContent.length) >= 0.8
+  ) {
+    mirrorKind = "reasoning_prefix";
+    semanticCandidate = rawContent.slice(reasoningContent.length);
+    overlapRatio = reasoningContent.length / Math.max(1, rawContent.length);
+  } else if (
+    eligibleForMirror &&
+    reasoningContent.startsWith(rawContent) &&
+    rawContent.length / Math.max(1, reasoningContent.length) >= 0.8
+  ) {
+    mirrorKind = "content_prefix";
+    semanticCandidate = "";
+    overlapRatio = rawContent.length / Math.max(1, reasoningContent.length);
+  } else if (eligibleForMirror && longerLength > 0) {
+    const prefixLength = commonPrefixLength(normalizedContent, normalizedReasoning);
+    const suffixLength = commonSuffixLength(normalizedContent, normalizedReasoning, prefixLength);
+    overlapRatio = Math.min(1, (prefixLength + suffixLength) / Math.max(1, Math.min(normalizedContent.length, normalizedReasoning.length)));
+    const lengthRatio = Math.min(normalizedContent.length, normalizedReasoning.length) /
+      Math.max(1, Math.max(normalizedContent.length, normalizedReasoning.length));
+    if (overlapRatio >= CROSS_CHANNEL_NEAR_MIRROR_RATIO && lengthRatio >= 0.85) {
+      mirrorKind = "near";
+      semanticCandidate = "";
+    }
+  }
+
+  const semanticContent = sanitizeAssistantDisplayContent(semanticCandidate).trim();
+  return {
+    rawContent,
+    actionableContent: semanticCandidate,
+    semanticContent,
+    rawContentChars: rawContent.length,
+    reasoningChars: reasoningContent.length,
+    semanticVisibleChars: semanticContent.length,
+    mirrorKind,
+    overlapRatio: Math.round(overlapRatio * 1000) / 1000,
+    contentHash: hashDiagnosticText(rawContent),
+    reasoningHash: hashDiagnosticText(reasoningContent),
+    normalizedContentHash: hashDiagnosticText(normalizedContent),
+    normalizedReasoningHash: hashDiagnosticText(normalizedReasoning),
   };
 }
 
@@ -201,9 +355,6 @@ export function shouldStopNoVisibleStreamStall(input: {
   toolCallCount: number;
   reasoningChars?: number;
 }): boolean {
-  if (input.reasoningChars && input.reasoningChars > 0) {
-    return false;
-  }
   return (
     input.elapsedMs >= STREAM_NO_VISIBLE_PROGRESS_TIMEOUT_MS &&
     input.visibleChars === 0 &&
@@ -499,6 +650,20 @@ function isGeminiProvider(settings: StreamSettings): boolean {
   return normalizeCloudProtocol(settings.apiProtocol) === "gemini";
 }
 
+function isOmlxProvider(settings: StreamSettings): boolean {
+  return String(settings.provider || "").trim().toLowerCase() === "omlx";
+}
+
+export function buildOpenAiCompatibleReasoningRequestExtras(
+  settings: StreamSettings,
+): Record<string, unknown> {
+  if (settings.reasoningRequest !== "off" || !isOmlxProvider(settings)) return {};
+  // oMLX exposes this as a documented ChatCompletionRequest capability. Do
+  // not send it to arbitrary OpenAI-compatible endpoints: many reject
+  // unknown top-level request keys.
+  return { chat_template_kwargs: { enable_thinking: false } };
+}
+
 function isOpenAiResponsesApi(settings: StreamSettings): boolean {
   return !isAnthropicProvider(settings) && !isGeminiProvider(settings) && resolveEffectiveCloudApiFormat({
     protocol: settings.apiProtocol,
@@ -775,6 +940,7 @@ async function requestOpenAiNonStreaming(
   options: StreamRequestOptions = {},
 ): Promise<StreamResult> {
   const { onToken, onDone, onError } = callbacks;
+  const streamStartedAt = Date.now();
 
   try {
     const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
@@ -934,6 +1100,7 @@ async function requestOpenAiNonStreaming(
         ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
         ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
         ...(!minimalCompatibilityMode && settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
+        ...(!minimalCompatibilityMode ? buildOpenAiCompatibleReasoningRequestExtras(settings) : {}),
       };
       applyOpenAiToolChoice(chatBody, settings, tools, options.toolChoice, minimalCompatibilityMode);
       payload = await postJsonRequest(
@@ -954,8 +1121,15 @@ async function requestOpenAiNonStreaming(
     const reasoning = !isGemini && apiFormat === "chat_completions"
       ? extractOpenAiChatCompletionReasoning(payload)
       : {};
+    const semanticProgress = analyzeSemanticStreamProgress({
+      content,
+      reasoningContent: reasoning.reasoningContent,
+    });
+    const completedAt = Date.now();
     const result: StreamResult = {
       content,
+      actionableContent: semanticProgress.actionableContent,
+      semanticContent: semanticProgress.semanticContent,
       toolCalls,
       finishReason: toolCalls.length > 0
         ? "tool_calls"
@@ -963,10 +1137,30 @@ async function requestOpenAiNonStreaming(
           ? extractOpenAiChatCompletionFinishReason(payload)
           : "stop",
       ...reasoning,
+      streamDiagnostics: {
+        rawContentChars: semanticProgress.rawContentChars,
+        reasoningChars: semanticProgress.reasoningChars,
+        semanticVisibleChars: semanticProgress.semanticVisibleChars,
+        mirrorKind: semanticProgress.mirrorKind,
+        overlapRatio: semanticProgress.overlapRatio,
+        contentHash: semanticProgress.contentHash,
+        reasoningHash: semanticProgress.reasoningHash,
+        normalizedContentHash: semanticProgress.normalizedContentHash,
+        normalizedReasoningHash: semanticProgress.normalizedReasoningHash,
+        firstSemanticVisibleElapsedMs: semanticProgress.semanticVisibleChars > 0
+          ? Math.max(0, completedAt - streamStartedAt)
+          : null,
+        firstToolElapsedMs: toolCalls.length > 0
+          ? Math.max(0, completedAt - streamStartedAt)
+          : null,
+      },
       ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
     };
 
-    if (content) onToken(content);
+    const displayContent = semanticProgress.mirrorKind === "none"
+      ? content
+      : semanticProgress.semanticContent;
+    if (displayContent) onToken(displayContent);
     onDone(result);
     return result;
   } catch (err) {
@@ -1049,6 +1243,7 @@ async function streamViaRustProxy(
           max_tokens: maxTokens,
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
+          ...buildOpenAiCompatibleReasoningRequestExtras(settings),
         };
 
   if (tools && tools.length > 0 && !isOllama && !isAnthropic && !isGemini && shouldSendNativeTools(settings)) {
@@ -1118,7 +1313,10 @@ async function streamViaRustProxy(
   let providerReasoningContent = "";
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
   let providerTokenUsage: StreamResult["usage"] | undefined;
-  let visibleContentChars = 0;
+  let semanticProgress = analyzeSemanticStreamProgress({ content: "", reasoningContent: "" });
+  let firstSemanticVisibleAt: number | null = null;
+  let firstToolAt: number | null = null;
+  let emittedMirrorSemanticContent = "";
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
@@ -1153,10 +1351,57 @@ async function streamViaRustProxy(
     reasoningActive = false;
   };
 
+  const refreshSemanticProgress = () => {
+    semanticProgress = analyzeSemanticStreamProgress({
+      content: fullContent,
+      reasoningContent: providerReasoningContent,
+    });
+    if (semanticProgress.semanticVisibleChars > 0 && firstSemanticVisibleAt === null) {
+      firstSemanticVisibleAt = Date.now();
+    }
+  };
+
+  const buildSemanticDiagnostics = (): StreamSemanticDiagnostics => ({
+    rawContentChars: semanticProgress.rawContentChars,
+    reasoningChars: semanticProgress.reasoningChars,
+    semanticVisibleChars: semanticProgress.semanticVisibleChars,
+    mirrorKind: semanticProgress.mirrorKind,
+    overlapRatio: semanticProgress.overlapRatio,
+    contentHash: semanticProgress.contentHash,
+    reasoningHash: semanticProgress.reasoningHash,
+    normalizedContentHash: semanticProgress.normalizedContentHash,
+    normalizedReasoningHash: semanticProgress.normalizedReasoningHash,
+    firstSemanticVisibleElapsedMs: firstSemanticVisibleAt === null
+      ? null
+      : Math.max(0, firstSemanticVisibleAt - streamStartedAt),
+    firstToolElapsedMs: firstToolAt === null
+      ? null
+      : Math.max(0, firstToolAt - streamStartedAt),
+  });
+
+  const emitContentForDisplay = (rawDelta: string) => {
+    if (!rawDelta) return;
+    if (semanticProgress.mirrorKind === "none") {
+      onToken(rawDelta);
+      return;
+    }
+    const nextSemantic = semanticProgress.semanticContent;
+    const semanticDelta = nextSemantic.startsWith(emittedMirrorSemanticContent)
+      ? nextSemantic.slice(emittedMirrorSemanticContent.length)
+      : emittedMirrorSemanticContent
+        ? ""
+        : nextSemantic;
+    emittedMirrorSemanticContent = nextSemantic;
+    if (semanticDelta) onToken(semanticDelta);
+  };
+
   const buildCurrentOpenAiCompatibleResult = (): StreamResult => ({
     content: fullContent,
+    actionableContent: semanticProgress.actionableContent,
+    semanticContent: semanticProgress.semanticContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    streamDiagnostics: buildSemanticDiagnostics(),
     ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
       ? {
@@ -1170,7 +1415,7 @@ async function streamViaRustProxy(
     if (resolved || anthropicProcessor) return false;
     if (!shouldStopReasoningOnlyStream({
       reasoningChars: providerReasoningContent.length,
-      visibleChars: visibleContentChars,
+      visibleChars: semanticProgress.semanticVisibleChars,
       toolCallCount: toolCallsMap.size,
       settings,
     })) {
@@ -1208,7 +1453,7 @@ async function streamViaRustProxy(
     const elapsedMs = Date.now() - streamStartedAt;
     if (!shouldStopNoVisibleStreamStall({
       elapsedMs,
-      visibleChars: visibleContentChars,
+      visibleChars: semanticProgress.semanticVisibleChars,
       toolCallCount: toolCallsMap.size,
       reasoningChars: providerReasoningContent.length,
     })) {
@@ -1219,7 +1464,7 @@ async function streamViaRustProxy(
     finishReason = "length";
     closeReasoningBlock();
     reasoningBuffer = "";
-    const message = `STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for ${elapsedMs}ms without visible output or tool calls.`;
+    const message = `STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for ${elapsedMs}ms without semantic-visible output or tool calls.`;
     emitStreamingConsole(
       "streaming",
       "warn",
@@ -1264,8 +1509,8 @@ async function streamViaRustProxy(
           const contentDelta = json.message?.content ?? "";
           if (contentDelta) {
             fullContent += contentDelta;
-            if (contentDelta.trim()) visibleContentChars += contentDelta.length;
-            onToken(contentDelta);
+            refreshSemanticProgress();
+            emitContentForDisplay(contentDelta);
           }
         } catch { /* skip */ }
       }
@@ -1294,6 +1539,7 @@ async function streamViaRustProxy(
           if (reasoningDelta && !reasoningGarbled) {
             providerReasoningContent += reasoningDelta;
             providerReasoningField = providerReasoningField ?? extracted.reasoningField;
+            refreshSemanticProgress();
             if (reasoningEmitted) {
               openReasoningBlock();
             } else {
@@ -1333,8 +1579,8 @@ async function streamViaRustProxy(
             // Close reasoning block if we were in one
             closeReasoningBlock();
             fullContent += textDelta;
-            if (textDelta.trim()) visibleContentChars += textDelta.length;
-            onToken(textDelta);
+            refreshSemanticProgress();
+            emitContentForDisplay(textDelta);
           }
 
           if (extracted.finishReason) finishReason = extracted.finishReason;
@@ -1354,6 +1600,7 @@ async function streamViaRustProxy(
                   arguments: tc.function?.arguments ?? "",
                 });
               }
+              if (firstToolAt === null) firstToolAt = Date.now();
             }
           }
           if (stopReasoningOnlyRunaway()) return;
@@ -1600,6 +1847,7 @@ export async function streamChatCompletion(
   }
 
   const { onToken, onDone, onError } = callbacks;
+  const streamStartedAt = Date.now();
   const maxTokens = maxTokensOverride ?? computeInitialMaxTokens(settings.contextLimit);
   const isGemini = isGeminiProvider(settings);
 
@@ -1631,6 +1879,7 @@ export async function streamChatCompletion(
           ...(settings.sendSamplingParameters === true && settings.temperature != null ? { temperature: settings.temperature } : {}),
           ...(settings.sendSamplingParameters === true && settings.topP != null ? { top_p: settings.topP } : {}),
           ...(options.responseFormat ? { response_format: options.responseFormat } : {}),
+          ...buildOpenAiCompatibleReasoningRequestExtras(settings),
         };
 
   // Include tools if provided (native function calling) — only for non-Ollama
@@ -1745,7 +1994,10 @@ export async function streamChatCompletion(
   let providerReasoningContent = "";
   let providerReasoningField: StreamResult["reasoningField"] | null = null;
   let providerTokenUsage: StreamResult["usage"] | undefined;
-  let visibleContentChars = 0;
+  let semanticProgress = analyzeSemanticStreamProgress({ content: "", reasoningContent: "" });
+  let firstSemanticVisibleAt: number | null = null;
+  let firstToolAt: number | null = null;
+  let emittedMirrorSemanticContent = "";
 
   // Track finish_reason from the stream
   let finishReason: "stop" | "length" | "tool_calls" | null = null;
@@ -1768,13 +2020,60 @@ export async function streamChatCompletion(
     reasoningActive = false;
   };
 
+  const refreshSemanticProgress = () => {
+    semanticProgress = analyzeSemanticStreamProgress({
+      content: fullContent,
+      reasoningContent: providerReasoningContent,
+    });
+    if (semanticProgress.semanticVisibleChars > 0 && firstSemanticVisibleAt === null) {
+      firstSemanticVisibleAt = Date.now();
+    }
+  };
+
+  const buildSemanticDiagnostics = (): StreamSemanticDiagnostics => ({
+    rawContentChars: semanticProgress.rawContentChars,
+    reasoningChars: semanticProgress.reasoningChars,
+    semanticVisibleChars: semanticProgress.semanticVisibleChars,
+    mirrorKind: semanticProgress.mirrorKind,
+    overlapRatio: semanticProgress.overlapRatio,
+    contentHash: semanticProgress.contentHash,
+    reasoningHash: semanticProgress.reasoningHash,
+    normalizedContentHash: semanticProgress.normalizedContentHash,
+    normalizedReasoningHash: semanticProgress.normalizedReasoningHash,
+    firstSemanticVisibleElapsedMs: firstSemanticVisibleAt === null
+      ? null
+      : Math.max(0, firstSemanticVisibleAt - streamStartedAt),
+    firstToolElapsedMs: firstToolAt === null
+      ? null
+      : Math.max(0, firstToolAt - streamStartedAt),
+  });
+
+  const emitContentForDisplay = (rawDelta: string) => {
+    if (!rawDelta) return;
+    if (semanticProgress.mirrorKind === "none") {
+      onToken(rawDelta);
+      return;
+    }
+    const nextSemantic = semanticProgress.semanticContent;
+    const semanticDelta = nextSemantic.startsWith(emittedMirrorSemanticContent)
+      ? nextSemantic.slice(emittedMirrorSemanticContent.length)
+      : emittedMirrorSemanticContent
+        ? ""
+        : nextSemantic;
+    emittedMirrorSemanticContent = nextSemantic;
+    if (semanticDelta) onToken(semanticDelta);
+  };
+
   // Accumulate tool calls across deltas, keyed by index
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
   const buildCurrentOpenAiCompatibleResult = (): StreamResult => ({
     content: fullContent,
+    actionableContent: semanticProgress.actionableContent,
+    semanticContent: semanticProgress.semanticContent,
     toolCalls: finalizeStreamedToolCalls(toolCallsMap),
     finishReason,
+    streamDiagnostics: buildSemanticDiagnostics(),
     ...(providerTokenUsage ? { usage: providerTokenUsage } : {}),
     ...(providerReasoningContent.trim()
       ? {
@@ -1818,8 +2117,8 @@ export async function streamChatCompletion(
             const contentDelta = json.message?.content ?? "";
             if (contentDelta) {
               fullContent += contentDelta;
-              if (contentDelta.trim()) visibleContentChars += contentDelta.length;
-              onToken(contentDelta);
+              refreshSemanticProgress();
+              emitContentForDisplay(contentDelta);
             }
           } catch {
             // malformed JSON — skip
@@ -1852,6 +2151,7 @@ export async function streamChatCompletion(
             if (reasoningDelta && !reasoningGarbled) {
               providerReasoningContent += reasoningDelta;
               providerReasoningField = providerReasoningField ?? extracted.reasoningField;
+              refreshSemanticProgress();
               if (reasoningEmitted) {
                 openReasoningBlock();
               } else {
@@ -1883,8 +2183,8 @@ export async function streamChatCompletion(
               // Close reasoning block if we were in one
               closeReasoningBlock();
               fullContent += textDelta;
-              if (textDelta.trim()) visibleContentChars += textDelta.length;
-              onToken(textDelta);
+              refreshSemanticProgress();
+              emitContentForDisplay(textDelta);
             }
 
             // Detect finish_reason for truncation awareness
@@ -1912,11 +2212,12 @@ export async function streamChatCompletion(
                     arguments: tc.function?.arguments ?? "",
                   });
                 }
+                if (firstToolAt === null) firstToolAt = Date.now();
               }
             }
             if (shouldStopReasoningOnlyStream({
               reasoningChars: providerReasoningContent.length,
-              visibleChars: visibleContentChars,
+              visibleChars: semanticProgress.semanticVisibleChars,
               toolCallCount: toolCallsMap.size,
               settings,
             })) {
@@ -1934,9 +2235,21 @@ export async function streamChatCompletion(
               onDone(result);
               return result;
             }
+            const elapsedMs = Date.now() - streamStartedAt;
+            if (shouldStopNoVisibleStreamStall({
+              elapsedMs,
+              visibleChars: semanticProgress.semanticVisibleChars,
+              toolCallCount: toolCallsMap.size,
+              reasoningChars: providerReasoningContent.length,
+            })) {
+              await reader.cancel().catch(() => {});
+              throw Object.assign(new Error(
+                `STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream produced chunks for ${elapsedMs}ms without semantic-visible output or tool calls.`,
+              ), { _semanticProgressAbort: true });
+            }
           } catch (e) {
             // Re-throw garbled-reasoning abort — must not be swallowed
-            if (e && (e as any)._garbledAbort) throw e;
+            if (e && ((e as any)._garbledAbort || (e as any)._semanticProgressAbort)) throw e;
             // malformed SSE chunk — skip
           }
         }
@@ -1956,8 +2269,8 @@ export async function streamChatCompletion(
         const json = JSON.parse(buffer.trim());
         if (json.message?.content) {
           fullContent += json.message.content;
-          if (json.message.content.trim()) visibleContentChars += json.message.content.length;
-          onToken(json.message.content);
+          refreshSemanticProgress();
+          emitContentForDisplay(json.message.content);
         }
       } catch { /* ignore */ }
     } else {
@@ -1975,14 +2288,15 @@ export async function streamChatCompletion(
           if (resolvedReasoning.delta) {
             providerReasoningContent += resolvedReasoning.delta;
             providerReasoningField = providerReasoningField ?? extracted.reasoningField;
+            refreshSemanticProgress();
           }
           const resolvedText = resolveOpenAiCompatibleTextDelta(extracted, emittedOpenAiCompatibleText);
           emittedOpenAiCompatibleText = resolvedText.emittedText;
           const contentDelta = resolvedText.delta;
           if (contentDelta) {
             fullContent += contentDelta;
-            if (contentDelta.trim()) visibleContentChars += contentDelta.length;
-            onToken(contentDelta);
+            refreshSemanticProgress();
+            emitContentForDisplay(contentDelta);
           }
         } catch { /* ignore */ }
       }

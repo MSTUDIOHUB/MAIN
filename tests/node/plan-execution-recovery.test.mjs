@@ -163,7 +163,15 @@ const {
   buildPlanClosureEvidenceRecoveryPrompt,
   handlePlanNoToolRecovery,
   resolvePlanNoToolRecoveryDecision,
+  shouldAttemptPlanEvidenceMaterialization,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planNoToolRecovery.ts"));
+const {
+  handlePlanQualityRecoveryAfterVisibleMaterialization,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planQualityRecovery.ts"));
+const {
+  hasGroundedPlanClosureEvidence,
+  resolvePlanClosureArtifactKind,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/planOrchestration.ts"));
 const {
   applyPlanNoToolRuntimeState,
   applyPlanRuntimePhase,
@@ -435,7 +443,13 @@ function createPlanNoToolInput(harness, overrides = {}) {
     planLastMissingSections: [],
     planArtifactQualityRejected: false,
     planAutoScaffoldPromptIssued: false,
-    setPlanRuntimePhase: (phase, reason, status) => harness.phases.push({ type: "runtime", phase, reason, status }),
+    setPlanRuntimePhase: (phase, reason, status, qualitySnapshot) => harness.phases.push({
+      type: "runtime",
+      phase,
+      reason,
+      status,
+      qualitySnapshot,
+    }),
     waitForPlanApprovalIfNeeded: async () => false,
     tryClosePlanWithEvidence: async () => "failed",
     ...overrides,
@@ -497,6 +511,153 @@ test("plan no-tool decision separates materialization refine and continuation pa
   assert.equal(refine.shouldRefineLongPlanIntoChoice, true);
   assert.equal(refine.shouldMaterializeFallbackPlan, false);
   assert.equal(continuation.shouldForcePlanContinuation, true);
+});
+
+test("Plan evidence materialization replaces unbounded retries for logged quality failures", () => {
+  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+    recoveryAction: "rewrite",
+    qualityRejectCount: 1,
+    qualityGateReason: "excessive_plan_code_dump",
+    finishReason: "stop",
+  }), true);
+  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+    recoveryAction: "rewrite",
+    qualityRejectCount: 1,
+    qualityGateReason: "missing_plan_required_sections:summary,key_changes",
+    finishReason: "length",
+  }), true);
+  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+    recoveryAction: "auto_scaffold",
+    qualityRejectCount: 2,
+    qualityGateReason: "quality_gate",
+    finishReason: "stop",
+  }), true);
+  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+    recoveryAction: "targeted_evidence",
+    qualityRejectCount: 1,
+    qualityGateReason: "ungrounded_plan_change_targets:index.html",
+    finishReason: "stop",
+  }), false);
+  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+    recoveryAction: "ask_user",
+    qualityRejectCount: 3,
+    qualityGateReason: "blocking_decision",
+    finishReason: "length",
+  }), false);
+});
+
+test("deterministic Plan closure rejects concrete but goal-irrelevant documentation evidence", () => {
+  const unrelated = {
+    userGoal: "修复 CSV 导入后图表不显示。",
+    evidence: ["read_file README.md; excerpt=fallback-ok"],
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "README.md",
+      status: "succeeded",
+      summary: "fallback-ok",
+    }],
+    files: ["README.md"],
+    constraints: [],
+    sanitizer: {},
+    sanitizerDropped: [],
+  };
+  assert.equal(hasGroundedPlanClosureEvidence(unrelated, [{
+    name: "read_file",
+    target: "README.md",
+    status: "succeeded",
+    detail: "fallback-ok",
+  }]), false);
+
+  const relevant = {
+    ...unrelated,
+    evidence: [
+      "read_file src/hooks/useCsvParser.ts; excerpt=解析 CSV 行并返回图表记录",
+      "read_file src/hooks/useChartData.ts; excerpt=把导入记录映射到图表序列",
+    ],
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/hooks/useCsvParser.ts",
+        status: "succeeded",
+        summary: "解析 CSV 行并返回图表记录",
+      },
+      {
+        tool: "read_file",
+        target: "src/hooks/useChartData.ts",
+        status: "succeeded",
+        summary: "把导入记录映射到图表序列",
+      },
+    ],
+    files: ["src/hooks/useCsvParser.ts", "src/hooks/useChartData.ts"],
+  };
+  assert.equal(hasGroundedPlanClosureEvidence(relevant, [{
+    name: "read_file",
+    target: "src/hooks/useCsvParser.ts",
+    status: "succeeded",
+    detail: "解析 CSV 行并返回图表记录",
+  }]), true);
+  assert.equal(resolvePlanClosureArtifactKind(relevant, "idle", [{
+    name: "analyze_tabular_document",
+    target: "orders.csv",
+    status: "succeeded",
+    detail: "creator,amount",
+  }]), "design");
+  assert.equal(resolvePlanClosureArtifactKind({
+    ...relevant,
+    userGoal: "修复设置页按钮的对齐问题。",
+    evidence: ["read_file src/components/SettingsPanel.tsx; excerpt=按钮布局"],
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/components/SettingsPanel.tsx",
+      status: "succeeded",
+      summary: "按钮布局",
+    }],
+    files: ["src/components/SettingsPanel.tsx"],
+  }, "idle", [{
+    name: "analyze_tabular_document",
+    target: "orders.csv",
+    status: "succeeded",
+    detail: "creator,amount",
+  }]), "plan");
+});
+
+test("Plan phase transition carries the same quality snapshot decided by recovery", () => {
+  const harness = createPlanNoToolHarness("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 5,
+    planRuntimePhase: "needs_rewrite",
+    recentPlanToolActivity: [],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "修复文件打开链路",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "insufficient_actionable_plan_signals",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status, qualitySnapshot) => {
+      phases.push({ phase, reason, status, qualitySnapshot });
+    },
+    quality: {
+      ok: false,
+      reason: "missing_plan_required_sections:user_goal,test_plan",
+      recoveryAction: "rewrite",
+      missingSections: ["user_goal", "test_plan"],
+    },
+  });
+
+  assert.equal(result.planQualityRejectCount, 2);
+  const transition = phases.at(-1);
+  assert.equal(transition.phase, "needs_rewrite");
+  assert.equal(transition.qualitySnapshot?.qualityRejectCount, 2);
+  assert.deepEqual(
+    transition.qualitySnapshot?.missingSections,
+    ["user_goal", "test_plan"],
+  );
 });
 
 test("plan no-tool decision separates visible candidates from accepted artifacts", () => {
@@ -597,6 +758,8 @@ test("visible plan materialization rejection enters typed recovery instead of fa
   assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
 
   const needsEvidencePhase = harness.phases.findLast((entry) => entry.phase === "needs_evidence");
+  assert.equal(needsEvidencePhase.qualitySnapshot?.qualityRejectCount, 1);
+  assert.deepEqual(needsEvidencePhase.qualitySnapshot?.missingSections, []);
   let foldedState = createPlanLoopRuntimeState({ workflowMode: "plan", isPlanApproved: false });
   foldedState = applyPlanRuntimePhase(foldedState, {
     phase: needsEvidencePhase.phase,

@@ -30,6 +30,13 @@ import {
   type PlanStreamWatchdogOptionsResolver,
 } from "./streamInvocation";
 import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
+import {
+  applyPreapprovalPlanQualityRecoveryStreamOptions,
+  capPreapprovalPlanQualityRecoveryMaxEscalations,
+  capPreapprovalPlanQualityRecoveryMaxTokens,
+  PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS,
+  type PreapprovalPlanQualityRecoveryStreamPolicy,
+} from "./preapprovalPlanRecoveryStreamPolicy";
 
 export const APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS =
   APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS;
@@ -84,6 +91,8 @@ export type StreamWithRecoveryResult =
   | {
       status: "stopped";
       snapshotContextLimit: number | undefined;
+      pauseReason?: string;
+      pauseMessage?: string;
     };
 
 function isAbortError(error: unknown): boolean {
@@ -113,7 +122,7 @@ function handlePlanDraftStreamTimeout(input: {
   }
 
   const planStage = callbacks.getPlanStage();
-  logAgentEvent("plan_stage_waiting_for_design", {
+  logAgentEvent("plan_draft_stream_timeout", {
     iteration,
     planStage,
     reason,
@@ -122,6 +131,13 @@ function handlePlanDraftStreamTimeout(input: {
   callbacks.onNonActionableStop(
     buildPlanStreamTimeoutPauseMessage(callbacks.getPreferredLanguage(), planStage),
     "incomplete_plan",
+    {
+      phase: "paused",
+      recoveryReason: reason,
+      nextStep: callbacks.getPreferredLanguage() === "zh"
+        ? "计划恢复流已达到有界时限；请从已保存的证据和恢复点继续，不要重新进行宽泛读取。"
+        : "The bounded plan recovery stream reached its limit; resume from the saved evidence and checkpoint without broad rereading.",
+    },
   );
   callbacks.onStatusChange("idle");
   return true;
@@ -234,6 +250,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   consecutiveNoToolCount: number;
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   approvedPlanRecoveryStreamMaxElapsedMs: number;
+  preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
   pauseApprovedPlanStreamWatchdog: (message: string, logContext?: Record<string, unknown>) => boolean;
   emitPlanExecutionProgress: (
     phase: PlanExecutionProgressPhase,
@@ -270,6 +287,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     consecutiveNoToolCount,
     getPlanStreamWatchdogOptions,
     approvedPlanRecoveryStreamMaxElapsedMs,
+    preapprovalPlanQualityRecoveryStreamPolicy,
     pauseApprovedPlanStreamWatchdog,
     emitPlanExecutionProgress,
   } = input;
@@ -280,6 +298,24 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     workflowMode,
   } = runtimeState;
   let snapshotContextLimit = input.snapshotContextLimit;
+  const capRecoveryMaxTokens = (maxTokens: number | undefined) =>
+    capPreapprovalPlanQualityRecoveryMaxTokens(
+      preapprovalPlanQualityRecoveryStreamPolicy,
+      maxTokens,
+    );
+  const capRecoveryMaxEscalations = (maxEscalations: number) =>
+    capPreapprovalPlanQualityRecoveryMaxEscalations(
+      preapprovalPlanQualityRecoveryStreamPolicy,
+      maxEscalations,
+    );
+  const applyRecoveryStreamOptions = (
+    options: Parameters<typeof applyPreapprovalPlanQualityRecoveryStreamOptions>[1],
+    nativeToolCount: number,
+  ) => applyPreapprovalPlanQualityRecoveryStreamOptions(
+    preapprovalPlanQualityRecoveryStreamPolicy,
+    options,
+    nativeToolCount,
+  );
 
   try {
     const initialStreamInvocation = await invokeInitialStreamForIteration({
@@ -313,6 +349,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       consecutiveNoToolCount,
       getPlanStreamWatchdogOptions,
       approvedPlanRecoveryStreamMaxElapsedMs,
+      preapprovalPlanQualityRecoveryStreamPolicy,
     });
     if (initialStreamInvocation.status === "stopped") {
       return { status: "stopped", snapshotContextLimit };
@@ -385,16 +422,16 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           callbacks,
           abortSignal,
           llmTools,
-          retryMaxTokens,
-          0,
-          {
+          capRecoveryMaxTokens(retryMaxTokens),
+          capRecoveryMaxEscalations(0),
+          applyRecoveryStreamOptions({
             ...getPlanStreamWatchdogOptions(llmTools.length),
             maxStreamElapsedMs: retryMaxElapsedMs,
             maxStreamElapsedLabel: "approved_plan_action_retry",
             toolChoice: "required",
             workflowMode,
             runtimeIntent,
-          },
+          }, llmTools.length),
         );
         callbacks.onProviderNativeToolSuccess?.();
         logAgentEvent("approved_plan_stream_watchdog_recovered", {
@@ -424,16 +461,25 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     if (pauseApprovedPlanStreamWatchdog(errMsg, { stage: "initial_stream" })) {
       return { status: "stopped", snapshotContextLimit };
     }
+    const planDraftStreamTimeoutReason =
+      preapprovalPlanQualityRecoveryStreamPolicy.active
+        ? PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS
+        : "stream_first_chunk_timeout";
     if (
       handlePlanDraftStreamTimeout({
         callbacks,
         runtimeState,
         iteration,
-        reason: "stream_first_chunk_timeout",
+        reason: planDraftStreamTimeoutReason,
         message: errMsg,
       })
     ) {
-      return { status: "stopped", snapshotContextLimit };
+      return {
+        status: "stopped",
+        snapshotContextLimit,
+        pauseReason: planDraftStreamTimeoutReason,
+        pauseMessage: errMsg,
+      };
     }
 
     const nativeToolsWereAttempted = llmTools.length > 0;
@@ -523,13 +569,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           callbacks,
           abortSignal,
           llmTools,
-          aggressiveOutputBudget,
-          1,
-          {
+          capRecoveryMaxTokens(aggressiveOutputBudget),
+          capRecoveryMaxEscalations(1),
+          applyRecoveryStreamOptions({
             ...getPlanStreamWatchdogOptions(llmTools.length),
             workflowMode,
             runtimeIntent,
-          },
+          }, llmTools.length),
         );
         if (llmTools.length > 0) {
           callbacks.onProviderNativeToolSuccess?.();
@@ -607,13 +653,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             callbacks,
             abortSignal,
             llmTools,
-            emergencyOutputBudget,
-            0,
-            {
+            capRecoveryMaxTokens(emergencyOutputBudget),
+            capRecoveryMaxEscalations(0),
+            applyRecoveryStreamOptions({
               ...getPlanStreamWatchdogOptions(llmTools.length),
               workflowMode,
               runtimeIntent,
-            },
+            }, llmTools.length),
           );
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
@@ -722,13 +768,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           callbacks,
           abortSignal,
           llmTools,
-          cloudReactiveOutputBudget,
-          1,
-          {
+          capRecoveryMaxTokens(cloudReactiveOutputBudget),
+          capRecoveryMaxEscalations(1),
+          applyRecoveryStreamOptions({
             ...getPlanStreamWatchdogOptions(llmTools.length),
             workflowMode,
             runtimeIntent,
-          },
+          }, llmTools.length),
         );
         if (llmTools.length > 0) {
           callbacks.onProviderNativeToolSuccess?.();
@@ -797,13 +843,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           callbacks,
           abortSignal,
           [],
-          currentMaxTokens,
-          maxOutputEscalations,
-          {
+          capRecoveryMaxTokens(currentMaxTokens),
+          capRecoveryMaxEscalations(maxOutputEscalations),
+          applyRecoveryStreamOptions({
             ...getPlanStreamWatchdogOptions(0),
             workflowMode,
             runtimeIntent,
-          },
+          }, 0),
         );
         return { status: "streamed", streamResult, snapshotContextLimit };
       } catch (retryErr) {
@@ -855,13 +901,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             callbacks,
             abortSignal,
             [],
-            currentMaxTokens,
-            maxOutputEscalations,
-            {
+            capRecoveryMaxTokens(currentMaxTokens),
+            capRecoveryMaxEscalations(maxOutputEscalations),
+            applyRecoveryStreamOptions({
               ...getPlanStreamWatchdogOptions(0),
               workflowMode,
               runtimeIntent,
-            },
+            }, 0),
           );
           return { status: "streamed", streamResult, snapshotContextLimit };
         } catch (finalErr) {
@@ -902,13 +948,13 @@ export async function invokeStreamWithRecoveryForIteration(input: {
               callbacks,
               abortSignal,
               [],
-              currentMaxTokens,
-              maxOutputEscalations,
-              {
+              capRecoveryMaxTokens(currentMaxTokens),
+              capRecoveryMaxEscalations(maxOutputEscalations),
+              applyRecoveryStreamOptions({
                 ...getPlanStreamWatchdogOptions(0),
                 workflowMode,
                 runtimeIntent,
-              },
+              }, 0),
             );
             return { status: "streamed", streamResult, snapshotContextLimit };
           } catch (lastErr) {

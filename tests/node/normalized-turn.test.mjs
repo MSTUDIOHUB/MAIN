@@ -446,3 +446,45 @@ test("normalization preserves native reasoningContent in hiddenThought", () => {
   assert.equal(normalized.visibleText, "我来做些工作。");
   assert.equal(normalized.hiddenThought, "让我仔细想想接下来该干嘛...");
 });
+
+test("normalization does not promote a recovered reasoning mirror into visible text or tools", () => {
+  const mirroredReasoning = [
+    "需要继续分析。".repeat(200),
+    "<tool_use>",
+    "<tool>write_file</tool>",
+    '<parameter name="path">src/App.tsx</parameter>',
+    '<parameter name="content">hallucinated</parameter>',
+    "</tool_use>",
+  ].join("\n");
+  const normalized = normalizeAssistantTurn({
+    content: mirroredReasoning,
+    semanticContent: "",
+    toolCalls: [],
+    finishReason: "length",
+    reasoningContent: mirroredReasoning,
+  });
+
+  assert.equal(normalized.visibleText, "");
+  assert.equal(normalized.toolCalls.length, 0);
+  assert.match(normalized.hiddenThought, /需要继续分析/);
+});
+
+test("normalization preserves mirror-stripped XML tool protocol as actionable content", () => {
+  const protocol = [
+    "<tool_use>",
+    "<tool>read_file</tool>",
+    '<parameter name="path">src/App.tsx</parameter>',
+    "</tool_use>",
+  ].join("\n");
+  const normalized = normalizeAssistantTurn({
+    content: protocol,
+    actionableContent: protocol,
+    semanticContent: "",
+    toolCalls: [],
+    finishReason: "stop",
+  });
+
+  assert.equal(normalized.visibleText, "");
+  assert.equal(normalized.toolCalls.length, 1);
+  assert.equal(normalized.toolCalls[0]?.name, "read_file");
+});

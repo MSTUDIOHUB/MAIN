@@ -23,6 +23,7 @@ import {
 import {
   applyPlanRuntimePhase,
   type PlanLoopRuntimeState,
+  type PlanRuntimePhaseQualitySnapshot,
 } from "./planRuntimeState";
 import {
   activateChatFinalSynthesisState,
@@ -49,6 +50,7 @@ export interface AgentLoopRuntimeActions {
     phase: PlanRuntimePhase,
     reason?: string,
     status?: "pending" | "running" | "done" | "failed",
+    qualitySnapshot?: PlanRuntimePhaseQualitySnapshot,
   ) => void;
 }
 
@@ -158,10 +160,26 @@ export function createAgentLoopRuntimeActions(input: {
     phase,
     reason,
     status = "running",
+    qualitySnapshot,
   ) => {
     if (workflowMode !== "plan" || callbacks.getIsPlanApproved()) return;
+    const currentState = getPlanRuntimeState();
+    const qualityState: PlanLoopRuntimeState = {
+      ...currentState,
+      ...(qualitySnapshot?.qualityRejectCount != null
+        ? {
+            planQualityRejectCount: Math.max(
+              0,
+              Number(qualitySnapshot.qualityRejectCount) || 0,
+            ),
+          }
+        : {}),
+      ...(qualitySnapshot?.missingSections
+        ? { planLastMissingSections: [...qualitySnapshot.missingSections] }
+        : {}),
+    };
     const phaseUpdate = applyPlanRuntimePhase(
-      getPlanRuntimeState(),
+      qualityState,
       { phase, reason },
     );
     if (!phaseUpdate.changed) return;
@@ -178,6 +196,9 @@ export function createAgentLoopRuntimeActions(input: {
       summary: presentation.summary,
       domain: "plan_runtime",
       status,
+      reason: reason || "",
+      iteration: getIteration(),
+      qualityRejectCount: phaseUpdate.state.planQualityRejectCount,
     });
     logAgentEvent("plan_runtime_phase_changed", {
       phase,

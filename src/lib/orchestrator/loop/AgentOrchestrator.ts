@@ -379,6 +379,7 @@ export class AgentOrchestrator {
           assistantMsgId,
           maxOutputEscalations,
           iterationRequestStartedAt,
+          preapprovalPlanQualityRecoveryStreamPolicy,
         } = iterationStreamPreparation;
         const {
           isExecuteRecoveryEligible,
@@ -422,12 +423,17 @@ export class AgentOrchestrator {
           consecutiveNoToolCount: loopState.noToolRuntimeState.consecutiveNoToolCount,
           getPlanStreamWatchdogOptions,
           approvedPlanRecoveryStreamMaxElapsedMs: APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS,
+          preapprovalPlanQualityRecoveryStreamPolicy,
           pauseApprovedPlanStreamWatchdog,
           emitPlanExecutionProgress,
         });
         snapshotContextLimit = streamInvocation.snapshotContextLimit;
         if (streamInvocation.status === "stopped") {
-          emitRunPausedEvent("stream_stopped", "The model stream stopped before the run reached a terminal turn result.");
+          emitRunPausedEvent(
+            streamInvocation.pauseReason || "stream_stopped",
+            streamInvocation.pauseMessage ||
+              "The model stream stopped before the run reached a terminal turn result.",
+          );
           return;
         }
         const streamResult = streamInvocation.streamResult;

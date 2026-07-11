@@ -21,6 +21,12 @@ export interface PlanLoopRuntimeState {
   planPostConvergenceToolRedirectCount: number;
 }
 
+/** Quality fields committed atomically with a Plan phase transition. */
+export interface PlanRuntimePhaseQualitySnapshot {
+  qualityRejectCount?: number;
+  missingSections?: string[];
+}
+
 export function createPlanLoopRuntimeState(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;

@@ -131,6 +131,10 @@ export interface WorkflowContext {
   firstStreamTokenAt: number | null;
   streamTokenCount: number;
   streamTextChars: number;
+  iterationStreamTokenCount: number;
+  iterationStreamTextChars: number;
+  runStreamTokenCount: number;
+  runStreamTextChars: number;
   noFirstTokenNoticeTimer: any;
   currentStreamingBlockId: number | null;
   currentThoughtBlockId: number | null;
@@ -535,6 +539,194 @@ export class WorkflowEngine {
           },
         ],
       }));
+    };
+
+    let activePlanRuntimePhaseBlockId: number | null = null;
+
+    const isUnapprovedPlanRuntime = () =>
+      getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode === "plan" &&
+      sessionGet().isPlanApproved !== true;
+
+    const progressPhaseForTurnRuntimePhase = (kind: string): "understanding" | "investigating" | "editing" | "verifying" | "summarizing" =>
+      kind === "scope" ? "understanding" :
+      kind === "context" ? "investigating" :
+      kind === "implementation" ? "editing" :
+      kind === "validation" ? "verifying" :
+      "summarizing";
+
+    const planRuntimeHeartbeatText = (marker: any, iteration: number) => {
+      const elapsedMs = Math.max(0, Number(marker.streamElapsedMs) || 0);
+      const elapsedSeconds = Math.max(0, Math.round(elapsedMs / 1000));
+      const chunkCount = Math.max(0, Number(marker.streamChunkCount) || 0);
+      if (marker.streamStatus === "stream_done") {
+        return phaseLanguage === "zh"
+          ? `第 ${Math.max(1, iteration)} 次计划生成已返回，MAIN 正在校验计划结构与可执行性。`
+          : `Plan attempt ${Math.max(1, iteration)} returned; MAIN is validating its structure and executability.`;
+      }
+      return phaseLanguage === "zh"
+        ? `第 ${Math.max(1, iteration)} 次计划生成已持续 ${elapsedSeconds} 秒，收到 ${chunkCount} 个流式分块；隐藏推理正文不会展示。`
+        : `Plan attempt ${Math.max(1, iteration)} has streamed for ${elapsedSeconds}s across ${chunkCount} chunks; hidden reasoning text is not displayed.`;
+    };
+
+    const emitPlanRuntimePhaseEvent = (block: any) => {
+      appendWorkflowRuntimeEvent({
+        type: "progress.updated",
+        threadId: runSessionKey,
+        turnId,
+        timestampMs: Date.now(),
+        progress: {
+          phase: block.phase,
+          title: block.title,
+          status: block.status,
+          summary: [block.why, block.action].filter(Boolean).join(" · "),
+          next: block.next,
+          dedupeKey: block.dedupeKey,
+          iteration: block.iteration,
+        },
+      });
+    };
+
+    const projectTurnRuntimePhase = (phase: {
+      id: string;
+      kind: "scope" | "context" | "diagnosis" | "implementation" | "validation";
+      title: string;
+      summary?: string;
+      domain?: string;
+      status?: "pending" | "running" | "done" | "failed";
+      reason?: string;
+      iteration?: number;
+      qualityRejectCount?: number;
+    }) => {
+      if (!isUnapprovedPlanRuntime() || phase.domain !== "plan_runtime") return;
+      const normalizedPhase = normalizeTurnRuntimePhase(phase, phaseLanguage);
+      if (!normalizedPhase) return;
+      const now = Date.now();
+      const blockStatus: "running" | "done" | "failed" = phase.status === "failed"
+        ? "failed"
+        : phase.status === "done"
+        ? "done"
+        : "running";
+      const iteration = Math.max(0, Number(phase.iteration) || 0);
+      const owner = activeRuntimeRunIdentity;
+
+      if (activePlanRuntimePhaseBlockId !== null) {
+        const previousId = activePlanRuntimePhaseBlockId;
+        sessionSet((state: any) => ({
+          taskFlow: state.taskFlow.map((block: any) =>
+            block.id === previousId && block.type === "progress"
+              ? {
+                  ...block,
+                  status: "done",
+                  updatedAt: now,
+                  turnPhase: block.turnPhase
+                    ? { ...block.turnPhase, status: "done" }
+                    : block.turnPhase,
+                }
+              : block
+          ),
+        }));
+      }
+
+      const blockId = sessionGet()._nextTaskId();
+      const block = {
+        id: blockId,
+        turnId,
+        type: "progress" as const,
+        phase: progressPhaseForTurnRuntimePhase(phase.kind),
+        title: phase.title,
+        why: phase.summary || "",
+        action: "",
+        evidence: "",
+        next: phaseLanguage === "zh"
+          ? "计划通过质量门后才会进入审核；当前不会请求执行批准。"
+          : "The plan enters review only after passing the quality gate; execution approval is not requested yet.",
+        targets: [],
+        status: blockStatus,
+        source: "runtime" as const,
+        hypothesisStatus: phase.status === "failed" ? "blocked" as const : "unverified" as const,
+        turnPhase: normalizedPhase,
+        runId: owner.runId,
+        parentRunId: owner.parentRunId,
+        dedupeKey: `plan-runtime:${owner.runId}:${phase.id}`,
+        phaseReason: String(phase.reason || ""),
+        iteration,
+        qualityRejectCount: Math.max(0, Number(phase.qualityRejectCount) || 0),
+        elapsedMs: 0,
+        createdAt: now,
+        updatedAt: now,
+      };
+      activePlanRuntimePhaseBlockId = blockStatus === "running" ? blockId : null;
+      appendTurnBlock(block);
+      emitPlanRuntimePhaseEvent(block);
+      if (blockStatus === "running") {
+        sessionSet((state: any) => ({
+          conversationTurns: state.conversationTurns.map((candidate: any) =>
+            candidate.id === turnId &&
+            candidate.status !== "awaiting_input" &&
+            candidate.status !== "awaiting_approval"
+              ? { ...candidate, status: "planning" }
+              : candidate
+          ),
+        }));
+      }
+    };
+
+    const emitPlanRuntimeStreamHeartbeat = (marker: any) => {
+      if (!isUnapprovedPlanRuntime() || activePlanRuntimePhaseBlockId === null) return;
+      if (!["stream_started", "first_chunk", "chunk_progress", "stream_done", "no_chunk_progress_warning"].includes(String(marker.streamStatus || ""))) {
+        return;
+      }
+      const blockId = activePlanRuntimePhaseBlockId;
+      const state = sessionGet();
+      const activeBlock = state.taskFlow.find((block: any) =>
+        block.id === blockId &&
+        block.type === "progress" &&
+        block.runId === activeRuntimeRunIdentity.runId &&
+        block.turnPhase?.domain === "plan_runtime"
+      );
+      if (!activeBlock) return;
+      const iteration = Math.max(0, Number(marker.iteration ?? activeBlock.iteration) || 0);
+      const elapsedMs = Math.max(0, Number(marker.streamElapsedMs) || 0);
+      const action = planRuntimeHeartbeatText(marker, iteration);
+      const updatedAt = Date.now();
+      const updatedBlock = {
+        ...activeBlock,
+        action,
+        iteration,
+        elapsedMs,
+        updatedAt,
+      };
+      sessionSet((current: any) => ({
+        taskFlow: current.taskFlow.map((block: any) =>
+          block.id === blockId ? updatedBlock : block
+        ),
+      }));
+      emitPlanRuntimePhaseEvent(updatedBlock);
+    };
+
+    const settlePlanRuntimePhase = (status: "done" | "failed", detail = "") => {
+      if (activePlanRuntimePhaseBlockId === null) return;
+      const blockId = activePlanRuntimePhaseBlockId;
+      activePlanRuntimePhaseBlockId = null;
+      const state = sessionGet();
+      const activeBlock = state.taskFlow.find((block: any) => block.id === blockId && block.type === "progress");
+      if (!activeBlock || activeBlock.runId !== activeRuntimeRunIdentity.runId) return;
+      const updatedBlock = {
+        ...activeBlock,
+        status,
+        action: detail || activeBlock.action,
+        hypothesisStatus: status === "failed" ? "blocked" : activeBlock.hypothesisStatus,
+        updatedAt: Date.now(),
+        turnPhase: activeBlock.turnPhase
+          ? { ...activeBlock.turnPhase, status }
+          : activeBlock.turnPhase,
+      };
+      sessionSet((current: any) => ({
+        taskFlow: current.taskFlow.map((block: any) =>
+          block.id === blockId ? updatedBlock : block
+        ),
+      }));
+      emitPlanRuntimePhaseEvent(updatedBlock);
     };
 
     const emitLocalPlanExecutionProgress = (phase: "starting" | "running" | "completed" | "paused" | "error", update: any) => {
@@ -962,6 +1154,7 @@ export class WorkflowEngine {
         const markerPatch = patch as Partial<HarnessRunMarker> & Record<string, unknown>;
         updateHarnessRunMarker(markerPatch);
         emitPlanStreamHeartbeat(markerPatch);
+        emitPlanRuntimeStreamHeartbeat(markerPatch);
       },
       onDebugEvent: (event: any, data: any = {}) => {
         try {
@@ -1007,6 +1200,8 @@ export class WorkflowEngine {
             context.firstStreamTokenAt = null;
             context.streamTokenCount = 0;
             context.streamTextChars = 0;
+            context.iterationStreamTokenCount = 0;
+            context.iterationStreamTextChars = 0;
             if (thinkingInterceptor) {
               thinkingInterceptor.reset();
             }
@@ -1021,6 +1216,8 @@ export class WorkflowEngine {
           context.firstStreamTokenAt = null;
           context.streamTokenCount = 0;
           context.streamTextChars = 0;
+          context.iterationStreamTokenCount = 0;
+          context.iterationStreamTextChars = 0;
           context.streamingAssistantDisplayBuffer = "";
 
           const currentTaskFlow = sessionGet().taskFlow;
@@ -1098,6 +1295,10 @@ export class WorkflowEngine {
         }
         context.streamTokenCount++;
         context.streamTextChars += token.length;
+        context.iterationStreamTokenCount++;
+        context.iterationStreamTextChars += token.length;
+        context.runStreamTokenCount++;
+        context.runStreamTextChars += token.length;
         streamBuffer.append(token);
       },
 
@@ -1217,11 +1418,30 @@ export class WorkflowEngine {
           suppressTruncationWarning,
           truncationReason: meta?.reason || null,
           firstTokenElapsedMs: context.firstStreamTokenAt == null ? null : Math.round(context.firstStreamTokenAt - sendStartedAt),
-          streamTokenCount: context.streamTokenCount,
-          streamTextChars: context.streamTextChars,
+          streamTokenCount: context.iterationStreamTokenCount,
+          streamTextChars: context.iterationStreamTextChars,
+          metricScope: "iteration",
+          iterationStreamTokenCount: context.iterationStreamTokenCount,
+          iterationStreamTextChars: context.iterationStreamTextChars,
+          runStreamTokenCount: context.runStreamTokenCount,
+          runStreamTextChars: context.runStreamTextChars,
+          rawContentChars: meta?.streamDiagnostics?.rawContentChars ?? _fullText.length,
+          reasoningChars: meta?.streamDiagnostics?.reasoningChars ?? 0,
+          semanticVisibleChars: meta?.streamDiagnostics?.semanticVisibleChars ?? _fullText.length,
+          mirrorKind: meta?.streamDiagnostics?.mirrorKind ?? "none",
+          overlapRatio: meta?.streamDiagnostics?.overlapRatio ?? 0,
+          contentHash: meta?.streamDiagnostics?.contentHash ?? null,
+          reasoningHash: meta?.streamDiagnostics?.reasoningHash ?? null,
+          normalizedContentHash: meta?.streamDiagnostics?.normalizedContentHash ?? null,
+          normalizedReasoningHash: meta?.streamDiagnostics?.normalizedReasoningHash ?? null,
+          firstSemanticVisibleElapsedMs: meta?.streamDiagnostics?.firstSemanticVisibleElapsedMs ?? null,
+          firstToolElapsedMs: meta?.streamDiagnostics?.firstToolElapsedMs ?? null,
           taskFlowBlocks: sessionGet().taskFlow.length,
           agentBlocksCreatedThisRun: context.agentBlockIdsCreatedThisRun.size,
         });
+        context.iterationStreamTokenCount = 0;
+        context.iterationStreamTextChars = 0;
+        context.firstStreamTokenAt = null;
 
         // Show truncation warning if the model hit max_tokens
         if (truncated && !suppressTruncationWarning) {
@@ -1362,6 +1582,15 @@ export class WorkflowEngine {
       onAssistantFinalText: (text: any, replyOptions: any[] = [], meta: any) => {
         const hasToolCalls = meta?.hasToolCalls === true;
         const awaitingInput = meta?.awaitingInput === true && replyOptions.length > 0;
+        // A pre-approval Plan response is only a quality candidate. The Plan
+        // runtime decides after this callback whether it becomes a materialized
+        // artifact, needs another bounded rewrite, or pauses. Do not publish a
+        // terminal turn/assistant answer before that decision exists.
+        const provisionalPlanCandidate =
+          isUnapprovedPlanRuntime() &&
+          !hasToolCalls &&
+          !awaitingInput &&
+          sessionGet().agentStatus !== "pending_review";
         const language = sessionGet().config.language === "en" ? "en" : "zh";
         const fallbackText = replyOptions.length > 0
           ? language === "en"
@@ -1417,7 +1646,7 @@ export class WorkflowEngine {
 
         // Resolve Feishu adaptive card sending. Text emitted before a tool call is
         // progress, not completion, so remote replies wait for the final answer.
-        if (remoteFeishu && !hasToolCalls) {
+        if (remoteFeishu && !hasToolCalls && !provisionalPlanCandidate) {
           const cardTitle = sessionGet().config.language === "en" ? "Task Complete" : "任务处理完成";
           const displaySummary = pickProcessAssistantText(
             text,
@@ -1444,7 +1673,7 @@ export class WorkflowEngine {
         }
 
         // Complete understanding progress
-        if (!awaitingInput && !context.understandingProgressClosed && context.understandingProgressBlockId != null) {
+        if (!awaitingInput && !provisionalPlanCandidate && !context.understandingProgressClosed && context.understandingProgressBlockId != null) {
           context.understandingProgressClosed = true;
           const progress = {
             phase: "understanding" as const,
@@ -1478,6 +1707,14 @@ export class WorkflowEngine {
           let taskFlow = s.taskFlow;
           let conversationTurns = s.conversationTurns;
           let nextStreamingBlockId = context.currentStreamingBlockId;
+          const assistantPresentationPatch = provisionalPlanCandidate
+            ? { hiddenProcess: true, visibility: "hidden_process" as const }
+            : meta?.visibility
+            ? {
+                hiddenProcess: meta.visibility === "hidden_process",
+                visibility: meta.visibility,
+              }
+            : {};
 
           // Merge answer/progress block. When this text precedes tool calls, close
           // the visible block but keep the overall run active for tool execution
@@ -1495,6 +1732,7 @@ export class WorkflowEngine {
                 streaming: false,
                 options: replyOptions,
                 choiceRequest: choiceRequestIdentity,
+                ...assistantPresentationPatch,
               } as TaskBlock);
               taskFlow = [...taskFlow, replacementBlock];
               conversationTurns = conversationTurns.map((turn: any) =>
@@ -1505,7 +1743,7 @@ export class WorkflowEngine {
             } else {
               taskFlow = taskFlow.map((t: any) =>
                 t.id === blockId && t.type === "agent"
-                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity }
+                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity, ...assistantPresentationPatch }
                   : t
               );
             }
@@ -1525,7 +1763,7 @@ export class WorkflowEngine {
               const blockId = existingAgentBlock.id;
               taskFlow = taskFlow.map((t: any) =>
                 t.id === blockId && t.type === "agent"
-                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity }
+                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity, ...assistantPresentationPatch }
                   : t
               );
             } else {
@@ -1538,6 +1776,7 @@ export class WorkflowEngine {
                 streaming: false,
                 options: replyOptions,
                 choiceRequest: choiceRequestIdentity,
+                ...assistantPresentationPatch,
               } as TaskBlock);
 
               taskFlow = [...taskFlow, blockWithTurn];
@@ -1572,6 +1811,11 @@ export class WorkflowEngine {
                     status: "awaiting_input",
                     summary: normalizedFinal || turn.summary,
                   }
+                : provisionalPlanCandidate
+                ? {
+                    ...turn,
+                    status: turn.status === "awaiting_approval" ? turn.status : "planning",
+                  }
                 : hasToolCalls
                 ? {
                     ...turn,
@@ -1593,6 +1837,15 @@ export class WorkflowEngine {
               agentStatus: "idle",
               isGenerating: false,
               abortController: null,
+            };
+          }
+
+          if (provisionalPlanCandidate) {
+            return {
+              taskFlow,
+              conversationTurns,
+              agentStatus: "running",
+              isGenerating: true,
             };
           }
 
@@ -2062,7 +2315,24 @@ export class WorkflowEngine {
         });
       },
 
+      onTurnRuntimePhaseChanged: (phase) => {
+        projectTurnRuntimePhase(phase);
+      },
+
       onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => {
+        if (status === "pending_review") {
+          settlePlanRuntimePhase(
+            "done",
+            phaseLanguage === "zh"
+              ? "计划已通过质量门，正在等待审核。"
+              : "The plan passed the quality gate and is awaiting review.",
+          );
+        } else if (status === "error") {
+          settlePlanRuntimePhase(
+            "failed",
+            phaseLanguage === "zh" ? "计划运行失败。" : "Plan runtime failed.",
+          );
+        }
         const latest = sessionGet();
         const planApprovalIdentity = status === "pending_review"
           ? buildPlanApprovalIdentity(latest.planArtifacts)
@@ -2109,6 +2379,17 @@ export class WorkflowEngine {
           agentStatus: status,
           isGenerating: status === "running",
           ...(status === "idle" || status === "error" ? { abortController: null } : {}),
+          ...(status === "running" && isUnapprovedPlanRuntime()
+            ? {
+                conversationTurns: s.conversationTurns.map((turn: any) =>
+                  turn.id === turnId &&
+                  turn.status !== "awaiting_input" &&
+                  turn.status !== "awaiting_approval"
+                    ? { ...turn, status: "planning" }
+                    : turn
+                ),
+              }
+            : {}),
           ...(shouldMarkPlanAwaitingApproval
             ? {
                 conversationTurns: s.conversationTurns.map((turn: any) =>
@@ -2120,6 +2401,10 @@ export class WorkflowEngine {
       },
 
       onError: (error: string) => {
+        settlePlanRuntimePhase(
+          "failed",
+          phaseLanguage === "zh" ? "计划运行失败。" : "Plan runtime failed.",
+        );
         sessionSet({ agentStatus: "error", isGenerating: false, abortController: null });
         appendTurnBlock({
           id: sessionGet()._nextTaskId(),
@@ -2130,6 +2415,9 @@ export class WorkflowEngine {
       },
 
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", progress?: Partial<PlanExecutionProgressUpdate>) => {
+        if (reason === "incomplete_plan") {
+          settlePlanRuntimePhase("failed", message);
+        }
         logStoreEvent("non_actionable_stop", {
           reason,
           recoveryReason: progress?.recoveryReason || null,
@@ -2293,6 +2581,7 @@ export class WorkflowEngine {
       },
 
       onTurnSummaryReady: (summary: string) => {
+        if (isUnapprovedPlanRuntime()) return;
         sessionSet((s: any) => ({
           conversationTurns: s.conversationTurns.map((turn: any) =>
             turn.id === turnId ? { ...turn, summary } : turn

@@ -133,7 +133,16 @@ test("completion guard maps non-actionable stops to structured loop outcomes", (
     }),
     {
       status: "stopped_no_action",
-      reason: "incomplete_plan",
+      reason: "approved_plan_completion_guard_no_evidence",
+    },
+  );
+  assert.deepEqual(
+    resolveNonActionableStopOutcome("incomplete_plan", {
+      recoveryReason: "preapproval_plan_quality_recovery_stream_timeout",
+    }),
+    {
+      status: "paused",
+      reason: "preapproval_plan_quality_recovery_stream_timeout",
     },
   );
 });

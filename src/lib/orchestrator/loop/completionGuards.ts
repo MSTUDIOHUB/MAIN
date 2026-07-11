@@ -21,7 +21,7 @@ export function resolveNonActionableStopOutcome(
     progress?.recoveryReason === "approved_plan_completion_guard_no_evidence" ? "stopped_no_action" :
     reason === "incomplete_plan" ? "paused" :
     "stopped_no_action";
-  return { status, reason };
+  return { status, reason: progress?.recoveryReason || reason };
 }
 
 export function resolveFinalTurnContractForCompletion(input: {

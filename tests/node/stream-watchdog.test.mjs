@@ -128,6 +128,26 @@ test("approved plan action recovery requires a native tool call even while execu
   }), undefined);
 });
 
+test("preapproval plan quality recovery requires a native plan artifact call", () => {
+  const common = {
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolCount: 2,
+    forceXmlTools: false,
+  };
+  assert.equal(resolveRecoveryToolChoice({
+    ...common,
+    preapprovalPlanQualityRecoveryToolChoice: "required",
+  }), "required");
+  assert.equal(resolveRecoveryToolChoice({
+    ...common,
+    forceXmlTools: true,
+    preapprovalPlanQualityRecoveryToolChoice: "required",
+  }), undefined);
+});
+
 test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {
   const message = createStreamMaxElapsedTimeoutError(45_000, "approved_plan_recovery").message;
   const base = {
@@ -160,6 +180,38 @@ test("detects reasoning-dominated length results before max output escalation", 
     isReasoningDominatedLengthResult({
       content: `<thinking>${"需要继续分析。".repeat(500)}</thinking>`,
       reasoningContent: "需要继续分析。".repeat(500),
+      finishReason: "length",
+      toolCalls: [],
+    }),
+    true,
+  );
+
+  const longXmlToolCall = [
+    "<tool_use>",
+    "<tool>write_file</tool>",
+    '<parameter name="path">src/App.tsx</parameter>',
+    `<parameter name="content">${"export const value = 1;\n".repeat(500)}</parameter>`,
+    "</tool_use>",
+  ].join("\n");
+  assert.equal(
+    isReasoningDominatedLengthResult({
+      content: longXmlToolCall,
+      actionableContent: longXmlToolCall,
+      semanticContent: "",
+      reasoningContent: "",
+      finishReason: "length",
+      toolCalls: [],
+    }),
+    false,
+  );
+
+  const mirroredReasoning = "未闭合后台分析。".repeat(1200);
+  assert.equal(
+    isReasoningDominatedLengthResult({
+      content: mirroredReasoning,
+      actionableContent: "",
+      semanticContent: "",
+      reasoningContent: mirroredReasoning,
       finishReason: "length",
       toolCalls: [],
     }),

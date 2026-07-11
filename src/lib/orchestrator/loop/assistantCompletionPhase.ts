@@ -213,9 +213,22 @@ export async function handleAssistantCompletionPhase(input: {
     return finish("continue");
   }
 
-  const setPlanRuntimePhaseAndSync: typeof input.setPlanRuntimePhase = (phase, reason, status) => {
-    input.setPlanRuntimePhase(phase, reason, status);
-    planRuntimeState = applyPlanRuntimePhase(planRuntimeState, { phase, reason }).state;
+  const setPlanRuntimePhaseAndSync: typeof input.setPlanRuntimePhase = (
+    phase,
+    reason,
+    status,
+    qualitySnapshot,
+  ) => {
+    input.setPlanRuntimePhase(phase, reason, status, qualitySnapshot);
+    planRuntimeState = applyPlanRuntimePhase({
+      ...planRuntimeState,
+      ...(qualitySnapshot?.qualityRejectCount != null
+        ? { planQualityRejectCount: qualitySnapshot.qualityRejectCount }
+        : {}),
+      ...(qualitySnapshot?.missingSections
+        ? { planLastMissingSections: [...qualitySnapshot.missingSections] }
+        : {}),
+    }, { phase, reason }).state;
   };
   const planNoToolRecovery = await handlePlanNoToolRecovery({
     callbacks: input.callbacks,

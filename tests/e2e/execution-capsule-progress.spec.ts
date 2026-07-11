@@ -32,6 +32,28 @@ test("pure plan execution projects the runtime checkpoint into the main Capsule"
   await expect(page.getByTestId("plan-task-progress")).toContainText("T9: 更新");
 });
 
+test("preapproval Plan recovery projects the exact run phase and hidden-reasoning heartbeat", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.showPlanDraftRecovery?.());
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toBeVisible();
+  await expect(capsule).toHaveAttribute("data-turn-id", "e2e-execution-capsule-panel-stability-turn");
+  await expect(capsule).toHaveAttribute("data-run-id", "run-e2e-plan-draft-recovery");
+  await expect(capsule).toHaveAttribute("data-plan-runtime-phase", "needs_rewrite");
+
+  const progress = page.getByTestId("plan-draft-runtime-progress");
+  await expect(progress).toHaveAttribute("data-phase", "needs_rewrite");
+  await expect(progress).toHaveAttribute("data-iteration", "4");
+  await expect(progress).toHaveAttribute("data-elapsed-ms", "65000");
+  await expect(page.getByTestId("plan-draft-runtime-reason")).toContainText("草稿结构不完整");
+  await expect(page.getByTestId("plan-draft-runtime-heartbeat")).toContainText("65 秒");
+  await expect(page.getByTestId("plan-draft-runtime-heartbeat")).toContainText("隐藏推理正文不会展示");
+  await expect(page.getByTestId("plan-review-capsule")).toHaveCount(0);
+  await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
+  await expect(page.locator("body")).not.toContainText("SECRET MODEL REASONING");
+});
+
 test("PlanPanel counts only trusted evidence, not claimed completed checkboxes", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-strict-evidence-progress");
 

@@ -25,6 +25,28 @@ test("assistant progress before tool calls keeps the run active", () => {
   );
 });
 
+test("preapproval Plan quality candidates stay non-terminal and publish run-owned phase heartbeat", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const assistantCallback = source.slice(
+    source.indexOf("onAssistantFinalText: (text"),
+    source.indexOf("onToolExecuting:", source.indexOf("onAssistantFinalText: (text")),
+  );
+  const heartbeat = source.slice(
+    source.indexOf("const emitPlanRuntimeStreamHeartbeat"),
+    source.indexOf("const settlePlanRuntimePhase", source.indexOf("const emitPlanRuntimeStreamHeartbeat")),
+  );
+
+  assert.match(source, /onTurnRuntimePhaseChanged:\s*\(phase\)\s*=>\s*\{\s*projectTurnRuntimePhase\(phase\)/s);
+  assert.match(source, /dedupeKey:\s*`plan-runtime:\$\{owner\.runId\}:\$\{phase\.id\}`/);
+  assert.match(source, /emitPlanRuntimeStreamHeartbeat\(markerPatch\)/);
+  assert.match(assistantCallback, /const provisionalPlanCandidate\s*=/);
+  assert.match(assistantCallback, /provisionalPlanCandidate[\s\S]{0,240}status:\s*turn\.status === "awaiting_approval" \? turn\.status : "planning"/);
+  assert.match(assistantCallback, /if \(provisionalPlanCandidate\) \{\s*return \{\s*taskFlow,\s*conversationTurns,\s*agentStatus: "running",\s*isGenerating: true/s);
+  assert.doesNotMatch(heartbeat, /hiddenThought|reasoningText|providerReasoning|block\.content/);
+  assert.match(heartbeat, /streamElapsedMs/);
+  assert.match(source, /const chunkCount = Math\.max\(0, Number\(marker\.streamChunkCount\)/);
+});
+
 test("tool execution reasserts running state for stop button and timer", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
@@ -253,7 +275,9 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(assistantStreamPostProcessingPhaseSource, /applyReasoningNoToolPlanRuntimeState\(/);
   assert.match(assistantCompletionPhaseSource, /applyPlanNoToolRuntimeState\(/);
   assert.match(assistantCompletionPhaseSource, /setPlanRuntimePhaseAndSync/);
-  assert.match(assistantCompletionPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
+  assert.match(assistantCompletionPhaseSource, /input\.setPlanRuntimePhase\(phase, reason, status, qualitySnapshot\)/);
+  assert.match(assistantCompletionPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(\{/);
+  assert.match(assistantCompletionPhaseSource, /planQualityRejectCount: qualitySnapshot\.qualityRejectCount/);
   assert.match(assistantOutputPhaseSource, /applyPlanPostConvergenceRuntimeState\(/);
   assert.match(assistantOutputPhaseSource, /setPlanRuntimePhaseAndSync/);
   assert.match(assistantOutputPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
@@ -261,7 +285,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolResultRecoveryPhaseSource, /applyPlanQualityRuntimeState\(/);
   assert.match(toolResultRecoveryPhaseSource, /applyPlanReadOnlyConvergenceRuntimeState\(/);
   assert.match(toolResultRecoveryPhaseSource, /setPlanRuntimePhaseAndSync/);
-  assert.match(toolResultRecoveryPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(planRuntimeState/);
+  assert.match(toolResultRecoveryPhaseSource, /input\.setPlanRuntimePhase\(phase, reason, status, qualitySnapshot\)/);
+  assert.match(toolResultRecoveryPhaseSource, /planRuntimeState = applyPlanRuntimePhase\(\{/);
   assert.match(assistantOutputPhaseSource, /markPlanModeToolActivity\(planRuntimeState\)/);
   assert.match(planReviewRuntimeSource, /markPlanClosurePromptIssued\(planRuntimeState\)/);
   assert.match(toolCallExecutionPhaseSource, /resetPlanRecoveryPromptRuntimeState\(/);

@@ -37,6 +37,7 @@ function deriveStreamSettings(config: PreflightConfig): StreamSettings {
       contextLimit: config.local.contextLimit,
       provider: config.local.provider,
       toolProtocol: normalizeLocalToolProtocol(config.local.toolProtocol, config.local.provider),
+      reasoningRequest: "off",
       // LM Studio / OMLX 的本地请求也走 Tauri 后端，避免 WebView 的
       // “Load Failed” 网络错误；Ollama /v1 也走后端代理。
       useRustProxy: shouldUseRustProxyForLocalProvider(config.local.provider, config.local.endpoint),

@@ -109,6 +109,10 @@ test("submit workflow context carries immutable turn parameters and initializes 
   assert.equal(context.firstStreamTokenAt, null);
   assert.equal(context.streamTokenCount, 0);
   assert.equal(context.streamTextChars, 0);
+  assert.equal(context.iterationStreamTokenCount, 0);
+  assert.equal(context.iterationStreamTextChars, 0);
+  assert.equal(context.runStreamTokenCount, 0);
+  assert.equal(context.runStreamTextChars, 0);
   assert.equal(context.streamingAssistantDisplayBuffer, "");
   assert.equal("approvedPlanHandoff" in context, false);
   assert.equal(context.understandingProgressBlockId, null);

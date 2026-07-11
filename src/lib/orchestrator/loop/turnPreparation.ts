@@ -144,6 +144,7 @@ export async function prepareAgentLoopRuntimeState(
     reasoningDisplay: config.reasoningDisplay,
     reasoningEffort: settings.reasoningEffort,
   });
+  settings.reasoningRequest = reasoningPolicy.request;
 
   return {
     config,

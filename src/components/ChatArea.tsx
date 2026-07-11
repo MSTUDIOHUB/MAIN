@@ -93,6 +93,7 @@ import {
   shouldRenderPermissionCapsule,
 } from "../lib/actionRequest";
 import {
+  buildPlanDraftRuntimeCapsuleProjection,
   buildPlanExecutionCapsuleProjection,
   buildTurnPresentationModel,
   isPlanReviewCapsulePresentationEligible,
@@ -2886,6 +2887,21 @@ export default function ChatArea({
   const capsuleTurnBlocks = capsuleTurn
     ? blocksByTurnId.byTurnId.get(capsuleTurn.id) || EMPTY_CHAT_BLOCKS
     : EMPTY_CHAT_BLOCKS;
+  const capsulePlanDraftRuntimeProjection = useMemo(
+    () => buildPlanDraftRuntimeCapsuleProjection({
+      blocks: capsuleTurnBlocks,
+      expectedTurnId: capsuleTurn?.id,
+      expectedRunId:
+        !isPlanApproved &&
+        harnessRunMarker?.status === "running" &&
+        harnessRunMarker.sessionKey === activeSessionKey &&
+        harnessRunMarker.turnId === capsuleTurn?.id
+          ? harnessRunMarker.runId
+          : null,
+      language,
+    }),
+    [activeSessionKey, capsuleTurn?.id, capsuleTurnBlocks, harnessRunMarker, isPlanApproved, language],
+  );
   const capsuleIsRunActive =
     !!capsuleTurn &&
     (
@@ -2981,6 +2997,9 @@ export default function ChatArea({
     if (planExecutionCapsuleProjection?.headline) {
       return normalizeCapsuleProgressText(planExecutionCapsuleProjection.headline);
     }
+    if (capsulePlanDraftRuntimeProjection?.headline) {
+      return normalizeCapsuleProgressText(capsulePlanDraftRuntimeProjection.headline);
+    }
     if (!capsuleIsRunActive || !capsuleTurn) return "";
     if (cachedCapsuleExplanation) return cachedCapsuleExplanation;
     if (activeTurnExplanation.text) return activeTurnExplanation.text;
@@ -2988,7 +3007,7 @@ export default function ChatArea({
     const progressText = normalizeCapsuleProgressText(capsuleProgressProjection.activityText);
     if (progressText) return progressText;
     return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought));
-  }, [planExecutionCapsuleProjection?.headline, capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
+  }, [planExecutionCapsuleProjection?.headline, capsulePlanDraftRuntimeProjection?.headline, capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
@@ -4153,6 +4172,7 @@ export default function ChatArea({
     hasCapsuleFlow ||
     hasExecutionCapsuleControls ||
     !!planReviewCapsuleControls ||
+    !!capsulePlanDraftRuntimeProjection ||
     !!planExecutionCapsuleProjection ||
     !!activeGoal;
 
@@ -4718,6 +4738,8 @@ export default function ChatArea({
               ? planReviewActionRequest.title
               : planExecutionCapsuleProjection?.headline
               ? planExecutionCapsuleProjection.headline
+              : capsulePlanDraftRuntimeProjection?.headline
+              ? capsulePlanDraftRuntimeProjection.headline
               : hasCapsuleFlow
               ? isRich
                 ? (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")
@@ -4729,9 +4751,10 @@ export default function ChatArea({
                 data-testid="agent-explanation-capsule"
                 data-action-kind={planReviewActionRequest?.kind || permissionActionRequest?.kind || undefined}
                 data-session-key={planReviewActionRequest?.sessionKey || permissionActionRequest?.sessionKey || undefined}
-                data-turn-id={planReviewActionRequest?.turnId || permissionActionRequest?.turnId || undefined}
-                data-run-id={planReviewActionRequest?.runId || permissionActionRequest?.runId || undefined}
+                data-turn-id={planReviewActionRequest?.turnId || permissionActionRequest?.turnId || capsulePlanDraftRuntimeProjection?.turnId || undefined}
+                data-run-id={planReviewActionRequest?.runId || permissionActionRequest?.runId || capsulePlanDraftRuntimeProjection?.runId || undefined}
                 data-request-id={planReviewActionRequest?.requestId || permissionActionRequest?.requestId || undefined}
+                data-plan-runtime-phase={capsulePlanDraftRuntimeProjection?.phaseId || undefined}
                 data-plan-revision={planReviewActionRequest ? String(planReviewActionRequest.planRevision) : undefined}
                 data-artifact-hash={planReviewActionRequest?.artifactHash || undefined}
                 className={`agent-explanation-capsule ${isCapsuleCollapsed ? "collapsed-ring cursor-pointer" : `w-full max-w-3xl flex flex-col !items-start !justify-start !rounded-2xl ${hasTypedCapsuleControls ? "!p-4" : "!p-5"}`}`}
@@ -4875,6 +4898,49 @@ export default function ChatArea({
                               {[planExecutionCapsuleProjection.recoveryReason, ...planExecutionCapsuleProjection.repeatedTargets]
                                 .filter(Boolean)
                                 .join(" · ")}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      {capsulePlanDraftRuntimeProjection && !planReviewActionRequest && !planExecutionCapsuleProjection && (
+                        <div
+                          data-testid="plan-draft-runtime-progress"
+                          data-phase={capsulePlanDraftRuntimeProjection.phaseId}
+                          data-turn-id={capsulePlanDraftRuntimeProjection.turnId}
+                          data-run-id={capsulePlanDraftRuntimeProjection.runId}
+                          data-iteration={String(capsulePlanDraftRuntimeProjection.iteration)}
+                          data-elapsed-ms={String(capsulePlanDraftRuntimeProjection.elapsedMs)}
+                          className={`w-full rounded-xl border px-3 py-2.5 text-[11px] leading-5 ${
+                            isLightThemeMode
+                              ? "border-[rgba(15,23,42,0.1)] bg-[rgba(248,250,252,0.82)] text-[#475569]"
+                              : isBlackThemeMode
+                              ? "border-[#202026] bg-[#030304] text-[#a1a1aa]"
+                              : "border-[#27272a] bg-[#09090b] text-[#a1a1aa]"
+                          }`}
+                        >
+                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                            <span className="theme-plan-pill rounded-full border px-2 py-0.5 text-[10px] font-semibold">
+                              {language === "zh"
+                                ? `计划阶段：${capsulePlanDraftRuntimeProjection.title}`
+                                : `Plan phase: ${capsulePlanDraftRuntimeProjection.title}`}
+                            </span>
+                            {capsulePlanDraftRuntimeProjection.qualityRejectCount > 0 && (
+                              <span data-testid="plan-draft-runtime-reject-count">
+                                {language === "zh"
+                                  ? `已恢复 ${capsulePlanDraftRuntimeProjection.qualityRejectCount} 次`
+                                  : `${capsulePlanDraftRuntimeProjection.qualityRejectCount} recovery attempt(s)`}
+                              </span>
+                            )}
+                          </div>
+                          {(capsulePlanDraftRuntimeProjection.summary || capsulePlanDraftRuntimeProjection.reason) && (
+                            <div data-testid="plan-draft-runtime-reason" className="mt-1 break-words text-[#fbbf24]">
+                              {capsulePlanDraftRuntimeProjection.summary || capsulePlanDraftRuntimeProjection.reason}
+                            </div>
+                          )}
+                          {capsulePlanDraftRuntimeProjection.heartbeat && (
+                            <div data-testid="plan-draft-runtime-heartbeat" className="mt-1 break-words">
+                              {capsulePlanDraftRuntimeProjection.heartbeat}
                             </div>
                           )}
                         </div>

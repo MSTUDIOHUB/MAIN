@@ -2389,6 +2389,17 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
             : {}),
           ...(b.toolName ? { toolName: String(b.toolName) } : {}),
           ...(b.target ? { target: String(b.target) } : {}),
+          ...(b.runId ? { runId: String(b.runId) } : {}),
+          ...(b.parentRunId != null ? { parentRunId: String(b.parentRunId) } : {}),
+          ...(b.dedupeKey ? { dedupeKey: String(b.dedupeKey).slice(0, 220) } : {}),
+          ...(b.phaseReason ? { phaseReason: String(b.phaseReason).slice(0, 240) } : {}),
+          ...(b.iteration != null ? { iteration: Math.max(0, Number(b.iteration) || 0) } : {}),
+          ...(b.qualityRejectCount != null
+            ? { qualityRejectCount: Math.max(0, Number(b.qualityRejectCount) || 0) }
+            : {}),
+          ...(b.elapsedMs != null ? { elapsedMs: Math.max(0, Number(b.elapsedMs) || 0) } : {}),
+          ...(b.createdAt != null ? { createdAt: Math.max(0, Number(b.createdAt) || 0) } : {}),
+          ...(b.updatedAt != null ? { updatedAt: Math.max(0, Number(b.updatedAt) || 0) } : {}),
         };
       }
       case "thought":

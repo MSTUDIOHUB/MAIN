@@ -479,8 +479,13 @@ export function normalizeAssistantTurn(
   result: StreamResult,
   options: { maxHiddenChars?: number } = {},
 ): NormalizedStreamState {
-  const initialOptions = extractReplyOptions(result.content);
-  const taggedHiddenThought = extractHiddenThought(initialOptions.cleanText);
+  const semanticContent = typeof result.actionableContent === "string"
+    ? result.actionableContent
+    : typeof result.semanticContent === "string"
+    ? result.semanticContent
+    : result.content;
+  const initialOptions = extractReplyOptions(semanticContent);
+  const taggedHiddenThought = extractHiddenThought(result.content);
   const parsed = parseTextForTools(initialOptions.cleanText || "");
   const nativeToolCalls = normalizeNativeToolCalls(result);
   const parsedTextToolCalls = normalizeParsedTextToolCalls(parsed);

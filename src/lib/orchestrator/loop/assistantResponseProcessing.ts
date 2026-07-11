@@ -77,12 +77,30 @@ export function processAssistantStreamResponse(input: {
 
   logAgentEvent("stream_done", {
     iteration,
+    metricScope: "iteration",
     finishReason: streamResult.finishReason || "unknown",
     contentChars: streamText.length,
     providerReasoningChars: providerReasoningForHistory?.reasoningContent.length ?? 0,
+    actionableChars: streamResult.actionableContent?.length ?? streamText.length,
+    semanticVisibleChars: streamResult.streamDiagnostics?.semanticVisibleChars ?? streamResult.semanticContent?.length ?? streamText.length,
+    mirrorKind: streamResult.streamDiagnostics?.mirrorKind ?? "none",
+    overlapRatio: streamResult.streamDiagnostics?.overlapRatio ?? 0,
+    contentHash: streamResult.streamDiagnostics?.contentHash ?? null,
+    reasoningHash: streamResult.streamDiagnostics?.reasoningHash ?? null,
+    normalizedContentHash: streamResult.streamDiagnostics?.normalizedContentHash ?? null,
+    normalizedReasoningHash: streamResult.streamDiagnostics?.normalizedReasoningHash ?? null,
+    firstSemanticVisibleElapsedMs: streamResult.streamDiagnostics?.firstSemanticVisibleElapsedMs ?? null,
+    firstToolElapsedMs: streamResult.streamDiagnostics?.firstToolElapsedMs ?? null,
     toolCalls: streamResult.toolCalls.length,
+    nativeToolCalls: streamResult.toolCalls.length,
     elapsedMs: Date.now() - iterationRequestStartedAt,
     emptyResult: streamText.length === 0 && streamResult.toolCalls.length === 0,
+    semanticEmptyResult:
+      (streamResult.semanticContent?.trim().length ?? streamText.trim().length) === 0 &&
+      streamResult.toolCalls.length === 0,
+    actionableEmptyResult:
+      (streamResult.actionableContent?.trim().length ?? streamText.trim().length) === 0 &&
+      streamResult.toolCalls.length === 0,
   });
 
   if (contentShort && toolCallsFew) {

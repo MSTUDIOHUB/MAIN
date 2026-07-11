@@ -477,7 +477,10 @@ export function resolvePlanClosureArtifactKind(
   ) {
     return "design";
   }
-  if (hasSuccessfulTabularActivity(recentActivity) && /(?:\.csv|\.tsv|\.xlsx|表格|数据|tabular|spreadsheet)/i.test(text)) {
+  if (
+    hasSuccessfulTabularActivity(recentActivity) &&
+    /(?:\b(?:csv|tsv|xlsx)\b|表格|数据|tabular|spreadsheet)/i.test(text)
+  ) {
     return "design";
   }
   return "plan";

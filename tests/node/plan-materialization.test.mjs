@@ -1470,6 +1470,54 @@ test("materialization rejects the logged MD Viewer plan when index.html was prop
   assert.equal(result.quality?.canAutoRepair, false);
 });
 
+test("deterministic evidence closure repairs the logged MD Viewer rejection without inventing targets", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "修复 macOS 上双击 Markdown 文件和工具栏打开按钮没有反应的问题，并保持现有编辑与保存行为不变。",
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "应用入口接收系统文件打开请求并向主窗口发送内部事件",
+      },
+      {
+        tool: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        summary: "前端 openFile 函数和工具栏按钮负责读取并展示 Markdown 内容",
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/tauri.conf.json",
+        status: "succeeded",
+        summary: "Tauri 主窗口和应用打包配置位于此文件",
+      },
+      {
+        tool: "read_file",
+        target: "src-tauri/Cargo.toml",
+        status: "succeeded",
+        summary: "后端依赖和 Tauri 版本由此清单约束",
+      },
+    ],
+    files: [
+      "src-tauri/src/main.rs",
+      "src/main.js",
+      "src-tauri/tauri.conf.json",
+      "src-tauri/Cargo.toml",
+    ],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+  assert.match(content, /src-tauri\/src\/main\.rs/);
+  assert.match(content, /src\/main\.js/);
+  assert.match(content, /双击|工具栏|文件打开/);
+  assert.doesNotMatch(content, /index\.html/);
+  assert.doesNotMatch(content, /function\s+openFile|invoke\(|listen\(/);
+});
+
 test("plan evidence grounding requires an explicit confirmed-evidence section", () => {
   const validation = validatePlanEvidenceGrounding({
     content: [

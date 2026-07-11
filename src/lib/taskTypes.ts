@@ -61,6 +61,16 @@ export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
   toolCallIds?: string[];
   toolName?: string;
   target?: string;
+  /** Runtime owner for durable phase/liveness projection. */
+  runId?: string;
+  parentRunId?: string | null;
+  dedupeKey?: string;
+  phaseReason?: string;
+  iteration?: number;
+  qualityRejectCount?: number;
+  elapsedMs?: number;
+  createdAt?: number;
+  updatedAt?: number;
 };
 
 export type TaskBlock =
