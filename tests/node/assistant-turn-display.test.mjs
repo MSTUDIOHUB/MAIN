@@ -201,6 +201,42 @@ test("assistant turn display hides model-authored approval options once a struct
   assert.equal(decision.finalReplyOptions.length, 0);
 });
 
+test("assistant turn display does not expose model-self investigation and execution branches after Plan drafting", () => {
+  const modelReply = [
+    "# MD Viewer 文件打开修复计划",
+    "",
+    "## 摘要",
+    "已读取 Rust 文件打开入口、前端事件监听与 dialog 调用。",
+    "",
+    "## 关键改动",
+    "- 连接后端 `open-file` 事件与前端加载入口。",
+    "- 等待 dialog Promise 后再传递文件路径。",
+    "",
+    "<user_options>",
+    "<option>我需要先查看 main.js 中是否有 open-file 事件监听器，再决定方案</option>",
+    "<option>先修复 main.rs 中的 handle_open_url，再处理前端部分</option>",
+    "<option>我需要了解 Tauri 2 dialog 插件的正确导入方式后再执行</option>",
+    "</user_options>",
+  ].join("\n");
+  const extracted = extractReplyOptions(modelReply);
+
+  const decision = resolveDecision({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planStage: "plan",
+    streamText: modelReply,
+    normalizedVisibleText: extracted.cleanText,
+    normalizedReplyOptions: extracted.replyOptions,
+    sawPlanModeToolActivity: true,
+  });
+
+  assert.equal(decision.hasStructuredProposal, true);
+  assert.equal(decision.rawFinalReplyOptions.length, 3);
+  assert.equal(decision.planReplyOptionsRoutedToArtifact, true);
+  assert.deepEqual(decision.finalReplyOptions, []);
+});
+
 test("assistant turn display completes evidenced execution instead of reopening inferred approval", () => {
   const completionSummary = [
     "## 修复方案已完成",

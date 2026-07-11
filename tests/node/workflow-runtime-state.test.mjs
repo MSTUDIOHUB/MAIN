@@ -25,26 +25,22 @@ test("assistant progress before tool calls keeps the run active", () => {
   );
 });
 
-test("preapproval Plan quality candidates stay non-terminal and publish run-owned phase heartbeat", () => {
+test("preapproval Plan quality candidates stay non-terminal without publishing internal phase UI", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const runtimeActionsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRuntimeActions.ts"), "utf8");
   const assistantCallback = source.slice(
     source.indexOf("onAssistantFinalText: (text"),
     source.indexOf("onToolExecuting:", source.indexOf("onAssistantFinalText: (text")),
   );
-  const heartbeat = source.slice(
-    source.indexOf("const emitPlanRuntimeStreamHeartbeat"),
-    source.indexOf("const settlePlanRuntimePhase", source.indexOf("const emitPlanRuntimeStreamHeartbeat")),
-  );
 
-  assert.match(source, /onTurnRuntimePhaseChanged:\s*\(phase\)\s*=>\s*\{\s*projectTurnRuntimePhase\(phase\)/s);
-  assert.match(source, /dedupeKey:\s*`plan-runtime:\$\{owner\.runId\}:\$\{phase\.id\}`/);
-  assert.match(source, /emitPlanRuntimeStreamHeartbeat\(markerPatch\)/);
   assert.match(assistantCallback, /const provisionalPlanCandidate\s*=/);
   assert.match(assistantCallback, /provisionalPlanCandidate[\s\S]{0,240}status:\s*turn\.status === "awaiting_approval" \? turn\.status : "planning"/);
   assert.match(assistantCallback, /if \(provisionalPlanCandidate\) \{\s*return \{\s*taskFlow,\s*conversationTurns,\s*agentStatus: "running",\s*isGenerating: true/s);
-  assert.doesNotMatch(heartbeat, /hiddenThought|reasoningText|providerReasoning|block\.content/);
-  assert.match(heartbeat, /streamElapsedMs/);
-  assert.match(source, /const chunkCount = Math\.max\(0, Number\(marker\.streamChunkCount\)/);
+  assert.doesNotMatch(source, /onTurnRuntimePhaseChanged:/);
+  assert.doesNotMatch(source, /projectTurnRuntimePhase/);
+  assert.doesNotMatch(source, /emitPlanRuntimeStreamHeartbeat/);
+  assert.doesNotMatch(source, /plan-runtime:\$\{owner\.runId\}/);
+  assert.match(runtimeActionsSource, /logAgentEvent\("plan_runtime_phase_changed"/);
 });
 
 test("tool execution reasserts running state for stop button and timer", () => {
@@ -103,10 +99,22 @@ test("onStreamDone preserves abortController when agentStatus is pending_review"
 
 test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const onToolDoneStart = source.indexOf("onToolDone: (");
+  const internalFeedbackGuard = source.indexOf("if (meta?.internalFeedback === true)", onToolDoneStart);
+  const evidenceCreation = source.indexOf("createPlanExecutionEvidenceEntry", onToolDoneStart);
 
   assert.match(source, /createPlanExecutionEvidenceEntry/);
   assert.match(source, /appendPlanEvidenceEntry/);
   assert.match(source, /reconcilePlanTaskCompletion/);
+  assert.ok(internalFeedbackGuard > onToolDoneStart);
+  assert.ok(
+    evidenceCreation > internalFeedbackGuard,
+    "internal quality feedback must return before user progress/evidence is created",
+  );
+  assert.match(
+    source.slice(internalFeedbackGuard, evidenceCreation),
+    /tool_result_internal_feedback[\s\S]*taskFlow:\s*s\.taskFlow\.filter[\s\S]*return;/,
+  );
 });
 
 test("workflow engine closes harness from structured agent loop outcome", () => {

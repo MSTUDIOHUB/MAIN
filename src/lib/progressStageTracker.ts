@@ -1,5 +1,6 @@
 import type { MainThreadEvent, MainThreadProgressUpdate } from "./turnEvents";
 import type { ProgressNarrationPhase } from "./progressNarration";
+import { isInternalRuntimeProgressUpdate } from "./runtimeProgressVisibility";
 
 /**
  * 阶段步骤项 — 用于在 ExecutionCapsule 中展示按阶段编号的跟踪进度。
@@ -130,7 +131,11 @@ interface IndexedProgressUpdate extends MainThreadProgressUpdate {
 function buildIndexedProgressEvents(events: MainThreadEvent[]): IndexedProgressUpdate[] {
   const results: IndexedProgressUpdate[] = [];
   for (const event of events) {
-    if (event.type === "progress.updated" && event.progress) {
+    if (
+      event.type === "progress.updated" &&
+      event.progress &&
+      !isInternalRuntimeProgressUpdate(event.progress)
+    ) {
       results.push({
         ...event.progress,
         timestampMs: event.timestampMs,

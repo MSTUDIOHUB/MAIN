@@ -1,6 +1,5 @@
 import { StreamingThinkingInterceptor } from "../lib/chat/StreamingThinkingInterceptor";
 import { StreamingCadenceBuffer } from "../lib/chat/streamBuffer";
-import { normalizeProgressNarration } from "../lib/progressNarration";
 import { resolveStreamingAssistantDisplay } from "../lib/streamDisplayPolicy";
 import type { TaskBlock } from "../lib/taskTypes";
 import {
@@ -48,11 +47,6 @@ export function startSubmitStreamingUi(
     sessionGet,
     sessionSet,
     nextTaskId,
-    currentImageCount,
-    contextSignals,
-    effectiveIntentSummary,
-    isHidden,
-    createVisibleTurnForHiddenMessage,
   } = input;
   const turnId = context.turnId;
   const phaseLanguage = context.phaseLanguage;
@@ -63,99 +57,6 @@ export function startSubmitStreamingUi(
   const attachRuntimePhase = <T extends TaskBlock>(block: T, phase?: TurnRuntimePhase): T => {
     const normalized = normalizeTurnRuntimePhase(block.turnPhase || phase || makeTurnRuntimePhase("scope", phaseLanguage), phaseLanguage);
     return normalized ? { ...block, turnPhase: normalized } : block;
-  };
-
-  const appendTurnBlock = (block: TaskBlock) => {
-    const targetTurnId = block.turnId && block.turnId !== turnId ? block.turnId : context.uiDisplayTurnId;
-    const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: targetTurnId } as TaskBlock);
-    if (blockWithTurn.type === "agent") {
-      context.agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
-    }
-    sessionSet((s: any) => ({
-      taskFlow: [...s.taskFlow, blockWithTurn],
-      conversationTurns: s.conversationTurns.map((turn: any) =>
-        turn.id === targetTurnId && !turn.blockIds.includes(blockWithTurn.id)
-          ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
-          : turn
-      ),
-    }));
-  };
-
-  const emitProgressRuntimeEvent = (progress: any, meta: { dedupeKey?: string } = {}) => {
-    const eventId = "event-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-    sessionSet((s: any) => ({
-      runtimeEvents: [
-        ...s.runtimeEvents,
-        {
-          id: eventId,
-          turnId,
-          sessionKey: context.runSessionKey,
-          workspace: context.runWorkspace || null,
-          timestamp: Date.now(),
-          type: "progress",
-          dedupeKey: meta.dedupeKey || null,
-          payload: progress,
-        },
-      ],
-    }));
-  };
-
-  const buildUnderstandingProgress = (status: "running" | "done" = "running") => {
-    const hasImages = currentImageCount > 0;
-    const hasContextItems = contextSignals.mentionedFilePaths.length > 0 || contextSignals.attachedFilePaths.length > 0;
-    const contextText = hasImages
-      ? phaseLanguage === "zh"
-        ? "用户提供了 " + currentImageCount + " 张图片；先理解截图、约束和预期行为。"
-        : "The user provided " + currentImageCount + " image(s); first understand the screenshots, constraints, and expected behavior."
-      : hasContextItems
-      ? phaseLanguage === "zh"
-        ? "用户提供了上下文文件或引用；先确认这些材料与目标的关系。"
-        : "The user provided contextual files or references; first map them to the request."
-      : phaseLanguage === "zh"
-      ? "先确认用户目标、约束和安全边界。"
-      : "First confirm the user goal, constraints, and safety boundary.";
-    const next = effectiveRunIntent === "plan"
-      ? phaseLanguage === "zh"
-        ? "随后只做定向读取与证据收束，批准前只写计划文件。"
-        : "Next, use targeted reads and evidence synthesis; before approval only plan artifacts may be written."
-      : effectiveRunIntent === "execute" || effectiveRunIntent === "studio_workflow"
-      ? phaseLanguage === "zh"
-        ? "随后读取最小必要上下文，再执行真实操作或明确说明阻塞。"
-        : "Next, read the minimum necessary context, then act or state a concrete blocker."
-      : effectiveRunIntent === "respond" || effectiveRunIntent === "discuss"
-      ? phaseLanguage === "zh"
-        ? "随后基于上下文给出直接答复。"
-        : "Next, answer directly from the available context."
-      : "";
-    return normalizeProgressNarration({
-      phase: "understanding",
-      title: phaseLanguage === "zh" ? "理解需求" : "Understanding request",
-      why: effectiveIntentSummary || contextText,
-      action: contextText,
-      evidence: hasImages || hasContextItems ? contextText : "",
-      next,
-      targets: [],
-      status,
-      source: "runtime",
-      hypothesisStatus: status === "done" ? "confirmed" : "unverified",
-    });
-  };
-
-  const appendUnderstandingProgress = () => {
-    if (isHidden && !createVisibleTurnForHiddenMessage) return;
-    const progress = buildUnderstandingProgress("running");
-    const blockId = nextTaskId();
-    context.understandingProgressBlockId = blockId;
-    appendTurnBlock({
-      id: blockId,
-      turnId,
-      turnPhase: makeTurnRuntimePhase("scope", phaseLanguage, { status: "running" }),
-      type: "progress",
-      ...progress,
-    });
-    emitProgressRuntimeEvent(progress, {
-      dedupeKey: "understanding:" + turnId,
-    });
   };
 
   const streamBuffer = new StreamingCadenceBuffer({
@@ -324,7 +225,6 @@ export function startSubmitStreamingUi(
   });
 
   context.streamBuffer = streamBuffer;
-  appendUnderstandingProgress();
 
   return {
     thinkingInterceptor,

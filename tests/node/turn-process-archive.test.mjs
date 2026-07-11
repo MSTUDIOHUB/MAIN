@@ -531,10 +531,11 @@ test("codex activity groups keep edits commands browser and failures separate", 
   assert.equal(groups[3].status, "failed");
 });
 
-test("codex activity groups use fixed plan runtime labels and quality recovery reasons", () => {
-  const groups = buildCodexActivityGroups([
+test("internal Plan runtime phases stay out of activity groups and archives while real tools remain", () => {
+  const blocks = [
     {
       id: 1,
+      turnId: "turn-plan",
       type: "progress",
       phase: "investigating",
       title: "Needs evidence",
@@ -556,6 +557,7 @@ test("codex activity groups use fixed plan runtime labels and quality recovery r
     },
     {
       id: 2,
+      turnId: "turn-plan",
       type: "tool",
       toolName: "read_file",
       target: "src/lib/orchestrator.ts",
@@ -574,6 +576,7 @@ test("codex activity groups use fixed plan runtime labels and quality recovery r
     },
     {
       id: 3,
+      turnId: "turn-plan",
       type: "progress",
       phase: "summarizing",
       title: "Drafting",
@@ -593,14 +596,50 @@ test("codex activity groups use fixed plan runtime labels and quality recovery r
         status: "running",
       },
     },
-  ], "zh");
+  ];
+  const groups = buildCodexActivityGroups(blocks, "zh");
+  const live = buildLiveTurnProcessTimelineModel({ blocks, language: "zh" });
+  const archive = buildTurnProcessArchiveModel({
+    blocks: [
+      { id: 0, turnId: "turn-plan", type: "user", content: "生成计划" },
+      ...blocks,
+      { id: 4, turnId: "turn-plan", type: "agent", content: "计划已生成。" },
+    ],
+    finalVisibleAgentIndex: 4,
+    language: "zh",
+  });
+  const projectVisibleActivity = (activity) => {
+    const { items: _items, ...visibleActivity } = activity;
+    return visibleActivity;
+  };
+  const projectVisibleTimeline = (model) => model.steps.map((step) => {
+    const { items: _items, activity, ...visibleStep } = step;
+    return {
+      ...visibleStep,
+      activity: activity ? projectVisibleActivity(activity) : undefined,
+    };
+  });
 
-  assert.equal(groups.length, 2);
-  assert.equal(groups[0].label, "Needs evidence");
-  assert.match(groups[0].title, /Needs evidence/);
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].items.length, 1);
+  assert.equal(groups[0].items[0].type, "tool");
   assert.match(groups[0].title, /读取 orchestrator\.ts/);
-  assert.match(groups[0].summary, /PLAN_NOT_READY|orchestrator/);
-  assert.match(groups[0].recoveryHint, /草稿需补证据/);
-  assert.match(groups[0].recoveryHint, /read_evidence/);
-  assert.equal(groups[1].label, "Drafting");
+  assert.doesNotMatch(
+    JSON.stringify(groups.map(projectVisibleActivity)),
+    /Needs evidence|Drafting|草稿缺少真实证据|read_evidence/,
+  );
+
+  assert.equal(live.totalCount, 1);
+  assert.equal(live.blocks[0].type, "tool");
+  assert.doesNotMatch(
+    JSON.stringify(projectVisibleTimeline(live)),
+    /Needs evidence|Drafting|草稿缺少真实证据|read_evidence/,
+  );
+
+  assert.equal(archive.totalCount, 1);
+  assert.equal(archive.blocks[0].type, "tool");
+  assert.doesNotMatch(
+    JSON.stringify(projectVisibleTimeline(archive)),
+    /Needs evidence|Drafting|草稿缺少真实证据|read_evidence/,
+  );
 });

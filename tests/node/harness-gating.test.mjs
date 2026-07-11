@@ -66,6 +66,10 @@ const {
   buildNoProgressBatchSignature,
   buildLoopDetectionValidationError,
   buildReadBeforeModifyValidationError,
+  buildPlanArtifactMutationValidationError,
+  isPreApprovalPlanDraftWrite,
+  isPlanArtifactPath,
+  getProtectedPlanArtifactMutationViolation,
   summarizeReadFileRepeatLimitBatch,
   buildReadFileRepeatLimitBatchPauseNotice,
   getOriginalUserPromptForPlanFallback,
@@ -168,8 +172,179 @@ test("plan artifact quality gate only validates mutation tools", () => {
 
   assert.match(
     source,
-    /if \(kind && kind !== "tasks" && PLAN_ARTIFACT_MUTATION_TOOLS\.has\(tc\.name\)\)/,
+    /if \(kind && kind !== "summary" && PLAN_ARTIFACT_MUTATION_TOOLS\.has\(tc\.name\)\)/,
   );
+});
+
+test("invalid tasks.md is rejected before disk mutation and cannot update runtime tasks", async () => {
+  const lifecycle = [];
+  const result = await buildPlanArtifactMutationValidationError(
+    {
+      id: "call-invalid-tasks",
+      name: "write_file",
+      arguments: JSON.stringify({
+        path: ".MAIN/plans/tasks.md",
+        content: "# Tasks\n- [ ] 修复逻辑",
+      }),
+    },
+    {
+      path: ".MAIN/plans/tasks.md",
+      content: "# Tasks\n- [ ] 修复逻辑",
+    },
+    "/tmp/workspace",
+    createMockCallbacks({
+      onToolExecuting: () => lifecycle.push("executing"),
+      onToolDone: (_name, _target, _message, meta) => lifecycle.push(meta?.internalFeedback ? "internal_done" : "done"),
+      onToolError: () => lifecycle.push("error"),
+      getPlanTasks: () => [{ id: "task-old", text: "修复逻辑", status: "pending" }],
+    }),
+  );
+
+  assert.equal(result?.internalFeedback, true);
+  assert.equal(result?.qualityGateReason, "missing_task_evidence");
+  assert.equal(result?.planRecoveryAction, "rewrite");
+  assert.match(result?.content || "", /(?:未|没有)写入磁盘|not written/i);
+  assert.deepEqual(lifecycle, ["executing", "internal_done"]);
+});
+
+test("apply_patch cannot bypass the atomic Plan artifact quality gate", async () => {
+  const planPatch = [
+    "*** Begin Patch",
+    "*** Update File: .MAIN/plans/plan.md",
+    "@@",
+    "-old",
+    "+new",
+    "*** End Patch",
+  ].join("\n");
+  const lifecycle = [];
+  const result = await buildPlanArtifactMutationValidationError(
+    { id: "call-plan-patch", name: "apply_patch", arguments: JSON.stringify({ patch: planPatch }) },
+    { patch: planPatch },
+    "/tmp/workspace",
+    createMockCallbacks({
+      onToolExecuting: () => lifecycle.push("executing"),
+      onToolDone: (_name, _target, _message, meta) => lifecycle.push(meta?.internalFeedback ? "internal_done" : "done"),
+      onToolError: () => lifecycle.push("error"),
+    }),
+  );
+
+  assert.equal(result?.internalFeedback, true);
+  assert.equal(result?.qualityGateReason, "plan_artifact_patch_requires_single_file_mutation");
+  assert.equal(result?.planRecoveryAction, "rewrite");
+  assert.match(result?.content || "", /write_file|replace_in_file/);
+  assert.deepEqual(lifecycle, ["executing", "internal_done"]);
+  assert.equal(isPreApprovalPlanDraftWrite("apply_patch", { patch: planPatch }), true);
+
+  const mixedPatch = planPatch.replace(
+    "*** End Patch",
+    [
+      "*** Update File: src/main.ts",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\n"),
+  );
+  const mixedResult = await buildPlanArtifactMutationValidationError(
+    { id: "call-mixed-patch", name: "apply_patch", arguments: JSON.stringify({ patch: mixedPatch }) },
+    { patch: mixedPatch },
+    "/tmp/workspace",
+    createMockCallbacks(),
+  );
+  assert.equal(mixedResult?.qualityGateReason, "plan_artifact_patch_requires_single_file_mutation");
+  assert.equal(isPreApprovalPlanDraftWrite("apply_patch", { patch: mixedPatch }), false);
+
+  const sourcePatch = mixedPatch.replace(".MAIN/plans/plan.md", "src/plan.ts");
+  assert.equal(
+    await buildPlanArtifactMutationValidationError(
+      { id: "call-source-patch", name: "apply_patch", arguments: JSON.stringify({ patch: sourcePatch }) },
+      { patch: sourcePatch },
+      "/tmp/workspace",
+      createMockCallbacks(),
+    ),
+    null,
+  );
+});
+
+test("Plan mutation classification accepts only the canonical session-owned artifact path", () => {
+  assert.equal(isPlanArtifactPath(".MAIN/plans/plan.md"), true);
+  assert.equal(isPlanArtifactPath("./.MAIN\\plans\\plan.md"), true);
+  assert.equal(isPlanArtifactPath("nested/.MAIN/plans/plan.md"), false);
+  assert.equal(isPlanArtifactPath("/tmp/other/.MAIN/plans/plan.md"), false);
+  assert.equal(
+    isPreApprovalPlanDraftWrite("write_file", { path: "nested/.MAIN/plans/plan.md", content: "# Plan" }),
+    false,
+  );
+  assert.equal(
+    isPreApprovalPlanDraftWrite("write_file", { path: "/tmp/other/.MAIN/plans/plan.md", content: "# Plan" }),
+    false,
+  );
+});
+
+test("shell and delete tools cannot bypass protected Plan artifact mutations", async () => {
+  const shellViolation = getProtectedPlanArtifactMutationViolation(
+    "run_command",
+    { command: "python -c \"open('.MAIN/plans/tasks.md','w').write('bad')\"" },
+    "en",
+  );
+  assert.equal(shellViolation?.reason, "plan_artifact_shell_access_blocked");
+  assert.match(shellViolation?.message || "", /write_file|replace_in_file/);
+
+  const deleteViolation = getProtectedPlanArtifactMutationViolation(
+    "delete_workspace_path",
+    { path: "./.MAIN/plans/plan.md" },
+    "en",
+  );
+  assert.equal(deleteViolation?.reason, "plan_artifact_delete_blocked");
+  assert.equal(deleteViolation?.target, ".MAIN/plans/plan.md");
+  assert.equal(
+    getProtectedPlanArtifactMutationViolation(
+      "delete_workspace_path",
+      { path: "nested/.MAIN/plans/plan.md" },
+      "en",
+    ),
+    null,
+  );
+
+  const result = await buildPlanArtifactMutationValidationError(
+    { id: "call-shell-plan-write", name: "execute_command", arguments: JSON.stringify({ command: "rm .MAIN/plans/plan.md" }) },
+    { command: "rm .MAIN/plans/plan.md" },
+    "/tmp/workspace",
+    createMockCallbacks(),
+  );
+  assert.equal(result?.internalFeedback, true);
+  assert.equal(result?.qualityGateReason, "plan_artifact_shell_access_blocked");
+});
+
+test("validated Plan replace is promoted to one exact full-content write", async () => {
+  const original = "# Tasks\n- [ ] Repair src/old.ts\n";
+  globalThis.mockIpcInvoke = async (cmd) => cmd === "read_file" ? original : {};
+  const args = {
+    path: ".MAIN/plans/tasks.md",
+    search_text: "src/old.ts",
+    replace_text: "src/new.ts",
+  };
+  const tc = {
+    id: "call-plan-replace",
+    name: "replace_in_file",
+    arguments: JSON.stringify(args),
+  };
+  const result = await buildPlanArtifactMutationValidationError(
+    tc,
+    args,
+    "/tmp/workspace",
+    createMockCallbacks({ getPlanTasks: () => [] }),
+  );
+
+  assert.equal(result, null);
+  assert.equal(tc.name, "write_file");
+  assert.equal(args.search_text, undefined);
+  assert.equal(args.replace_text, undefined);
+  assert.equal(args.content, "# Tasks\n- [ ] Repair src/new.ts\n");
+  assert.deepEqual(JSON.parse(tc.arguments), {
+    path: ".MAIN/plans/tasks.md",
+    content: "# Tasks\n- [ ] Repair src/new.ts\n",
+  });
 });
 
 test("buildLoopDetectionValidationError blocks repetitive writes on the same file path", () => {

@@ -32,6 +32,7 @@ import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
 import {
   consumePendingUncleanRestartDiagnostic,
+  getHarnessActionRunId,
   getCurrentHarnessInstanceId,
   normalizeHarnessRunMarker,
   persistHarnessRunMarker,
@@ -61,6 +62,7 @@ import {
   type PlanStage,
   type PlanTask,
   type RightPanelTab,
+  canonicalizePlanArtifactPath,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -75,6 +77,7 @@ import {
   summarizeAssistantText,
   validatePlanArtifactContent,
 } from "../lib/workflowModels";
+import { sanitizeRestoredPlanArtifacts } from "../lib/planArtifactRestore";
 import {
   MAIN_THREAD_EVENT_SCHEMA_VERSION,
   appendRuntimeEvent,
@@ -146,13 +149,18 @@ import {
   isCurrentGoalControlResolution,
   isExactToolPermissionResolutionIdentity,
   isToolPermissionActionRequest,
+  normalizeActionRequest,
   type ActionRequest,
   type ToolPermissionResolutionIdentity,
   type UserChoiceResolutionIdentity,
   type PlanReviewResolutionIdentity,
   type GoalControlIdentity,
 } from "../lib/actionRequest";
-import { restorePendingActionRequest } from "../lib/actionRequestRestore";
+import {
+  isInternalUnapprovedPlanChoiceRestore,
+  restorePendingActionRequest,
+  stripRestoredUserChoiceControlText,
+} from "../lib/actionRequestRestore";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import {
   sanitizeUserContextItemsForPersist,
@@ -1673,7 +1681,7 @@ export function normalizeSessionRuntimeSnapshot(
     snapshot.autoApproveTools === true,
     snapshot.autoApproveToolScopes,
   );
-  const taskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
+  const rawTaskFlow = sanitizeTaskBlocksForPersist(snapshot.taskFlow || []);
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
   const queuedUserMessage = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
   const activeGuidance = normalizeActiveGuidance(snapshot.activeGuidance);
@@ -1696,8 +1704,39 @@ export function normalizeSessionRuntimeSnapshot(
       ? restoreGoalRuntimeSnapshot(restoredRuntime)
       : normalizeGoalRuntimeSnapshot(restoredRuntime)
     : null;
+  const unapprovedPlanTurnIds = (snapshot.conversationTurns || [])
+    .filter((turn) => isPlanConversationTurn(turn))
+    .map((turn) => turn.id);
+  const restoredPlanArtifacts = sanitizeRestoredPlanArtifacts({
+    artifacts: snapshot.planArtifacts || [],
+    isPlanApproved: snapshot.isPlanApproved === true,
+  });
+  const persistedPlanIdentity = buildPlanApprovalIdentity(snapshot.planArtifacts || []);
+  const restoredPlanIdentity = buildPlanApprovalIdentity(restoredPlanArtifacts.artifacts);
+  const rejectedReviewablePlanArtifact = restoredPlanArtifacts.rejected.some((artifact) =>
+    artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix"
+  );
+  const restoredIsPlanApproved =
+    snapshot.isPlanApproved === true &&
+    !rejectedReviewablePlanArtifact &&
+    !!persistedPlanIdentity &&
+    !!restoredPlanIdentity &&
+    persistedPlanIdentity.revision === restoredPlanIdentity.revision &&
+    persistedPlanIdentity.artifactHash === restoredPlanIdentity.artifactHash;
+  const hasTasksArtifact = restoredPlanArtifacts.artifacts.some((artifact) =>
+    artifact.kind === "tasks" || artifact.kind === "bugfix"
+  );
+  const restoredPlanTasks = restoredIsPlanApproved || hasTasksArtifact
+    ? snapshot.planTasks || []
+    : [];
+  const restoredPlanStage = derivePlanStageFromArtifacts(
+    restoredPlanArtifacts.artifacts,
+    restoredPlanTasks,
+    restoredIsPlanApproved,
+    snapshot.planStage ?? "idle",
+  );
   const normalizedHarnessRunMarker = normalizeHarnessRunMarker(snapshot.harnessRunMarker);
-  const restoredHarnessRunMarker = normalizedHarnessRunMarker?.status === "running"
+  const interruptedHarnessRunMarker = normalizedHarnessRunMarker?.status === "running"
     ? {
         ...normalizedHarnessRunMarker,
         status: "paused" as const,
@@ -1705,27 +1744,378 @@ export function normalizeSessionRuntimeSnapshot(
         closeReason: normalizedHarnessRunMarker.closeReason || "application_restarted",
       }
     : normalizedHarnessRunMarker;
-  const restoredPlanIdentity = buildPlanApprovalIdentity(snapshot.planArtifacts || []);
+  const restoredHarnessRunMarker = interruptedHarnessRunMarker
+    ? {
+        ...interruptedHarnessRunMarker,
+        planStage: restoredPlanStage,
+        isPlanApproved: restoredIsPlanApproved,
+      }
+    : null;
   const restoredActionRequest = restorePendingActionRequest({
     request: snapshot.activeActionRequest,
     runOwner: restoredHarnessRunMarker,
     planIdentity: restoredPlanIdentity,
-    taskFlow,
+    taskFlow: rawTaskFlow,
     goalRuntime: normalizedGoalRuntime,
+    unapprovedPlanTurnIds: restoredIsPlanApproved ? [] : unapprovedPlanTurnIds,
   });
+  const originalActionRequest = normalizeActionRequest(snapshot.activeActionRequest);
+  const rejectedProceduralChoice =
+    isInternalUnapprovedPlanChoiceRestore({
+      request: originalActionRequest,
+      planIdentity: restoredPlanIdentity,
+      taskFlow: rawTaskFlow,
+      unapprovedPlanTurnIds: restoredIsPlanApproved ? [] : unapprovedPlanTurnIds,
+    });
+  const invalidatedActionRequest = originalActionRequest && restoredActionRequest == null
+    ? originalActionRequest
+    : null;
+  const invalidatedChoiceRequest = invalidatedActionRequest?.kind === "user_choice"
+    ? invalidatedActionRequest
+    : null;
+  const invalidatedPlanReview = invalidatedActionRequest?.kind === "plan_review";
+  const invalidatedRequestSharesMarkerTurn =
+    !!invalidatedActionRequest &&
+    !!restoredHarnessRunMarker &&
+    restoredHarnessRunMarker.sessionKey === invalidatedActionRequest.sessionKey &&
+    restoredHarnessRunMarker.turnId === invalidatedActionRequest.turnId;
+  const invalidatedRequestOwnsProjectedMarkerRun =
+    invalidatedRequestSharesMarkerTurn &&
+    getHarnessActionRunId(restoredHarnessRunMarker) === invalidatedActionRequest?.runId;
+  const invalidatedActionReason = rejectedProceduralChoice
+    ? "invalid_plan_user_choice_cleared"
+    : invalidatedActionRequest?.kind === "tool_permission"
+    ? "non_resumable_tool_permission_cleared"
+    : invalidatedActionRequest?.kind === "plan_review"
+    ? "stale_plan_review_cleared"
+    : invalidatedActionRequest?.kind === "goal_confirmation"
+    ? "stale_goal_confirmation_cleared"
+    : "stale_user_choice_cleared";
+  let invalidatedChoiceText = "";
+  const taskFlow = rawTaskFlow.map((block) => {
+    if (
+      invalidatedActionRequest?.kind === "tool_permission" &&
+      block.type === "tool" &&
+      block.id === invalidatedActionRequest.taskId
+    ) {
+      return {
+        ...block,
+        status: "paused",
+        toolStatus: "failed" as const,
+        message: "Tool permission expired during session restore; resume to request it again.",
+      };
+    }
+    const isOrphanedPendingChoice =
+      block.type === "agent" &&
+      block.choiceRequest?.status === "pending" &&
+      !(
+        restoredActionRequest?.kind === "user_choice" &&
+        restoredActionRequest.requestId === block.choiceRequest.requestId
+      );
+    const matchesInvalidatedChoice =
+      !!invalidatedChoiceRequest &&
+      block.type === "agent" &&
+      block.choiceRequest?.requestId === invalidatedChoiceRequest.requestId;
+    if (
+      block.type !== "agent" ||
+      (!isOrphanedPendingChoice && !matchesInvalidatedChoice)
+    ) {
+      return block;
+    }
+    const optionValues = matchesInvalidatedChoice && invalidatedChoiceRequest
+      ? invalidatedChoiceRequest.optionValues
+      : (block.options || []).map((option) => String(option.value || option.label || "")).filter(Boolean);
+    const cleanedChoiceText = stripRestoredUserChoiceControlText(
+      String(block.content || ""),
+      optionValues,
+    );
+    if (invalidatedChoiceRequest?.requestId === block.choiceRequest?.requestId) {
+      invalidatedChoiceText = cleanedChoiceText;
+    }
+    return {
+      ...block,
+      content: cleanedChoiceText,
+      options: [],
+      choiceRequest: undefined,
+    };
+  });
+  const invalidatedTurnPrompt = String(
+    (snapshot.conversationTurns || []).find((turn) => turn.id === invalidatedActionRequest?.turnId)?.userPrompt || "",
+  );
+  const invalidatedActionUsesChinese = /[^\x00-\x7F]/.test(
+    `${invalidatedChoiceText}\n${invalidatedTurnPrompt}`,
+  );
+  const invalidatedActionMessage = rejectedProceduralChoice
+    ? invalidatedActionUsesChinese
+      ? "已清理模型生成的内部计划步骤选项；保留诊断上下文，本轮可安全继续生成计划。"
+      : "Model-authored internal Plan steps were cleared; diagnostic context is preserved and the Plan can safely resume."
+    : invalidatedActionRequest?.kind === "tool_permission"
+    ? invalidatedActionUsesChinese
+      ? "应用重启后旧工具权限无法安全恢复；失效的批准请求已清理，继续时会按新运行身份重新请求。"
+      : "A tool permission lease cannot survive restart; the stale request was cleared and will be requested again under a new run identity."
+    : invalidatedActionRequest?.kind === "plan_review"
+    ? invalidatedActionUsesChinese
+      ? "恢复会话时计划审批身份已失效；上下文已保留，可重新生成或调整计划。"
+      : "The restored Plan review identity is stale; context is preserved so the Plan can be regenerated or adjusted."
+    : invalidatedActionRequest?.kind === "goal_confirmation"
+    ? invalidatedActionUsesChinese
+      ? "Goal 确认点与当前运行身份不一致；已移除失效控件并保留检查点。"
+      : "The Goal confirmation no longer matches the active run; stale controls were removed and the checkpoint was preserved."
+    : invalidatedActionUsesChinese
+    ? "待选择项与当前运行身份不一致；已移除失效按钮并保留上下文。"
+    : "The pending choice no longer matches the active run; stale controls were removed and context was preserved.";
+  const restoredMarkerTerminalStatus = restoredHarnessRunMarker?.status === "completed" || restoredHarnessRunMarker?.status === "error"
+    ? restoredHarnessRunMarker.status
+    : null;
+  const conversationTurns = normalizeInterruptedConversationTurnsForRestore(
+    snapshot.conversationTurns,
+    taskFlow,
+  ).map((turn) => {
+    if (turn.status !== "awaiting_input" && turn.status !== "awaiting_approval") return turn;
+    if (restoredActionRequest?.turnId === turn.id) return turn;
+    const ownsInvalidatedRequest = invalidatedActionRequest?.turnId === turn.id;
+    const useChinese = /[^\x00-\x7F]/.test(String(turn.userPrompt || ""));
+    const ownsTerminalMarker = restoredMarkerTerminalStatus && restoredHarnessRunMarker?.turnId === turn.id;
+    return {
+      ...turn,
+      status: ownsTerminalMarker
+        ? restoredMarkerTerminalStatus === "completed" ? "done" as const : "error" as const
+        : "paused" as const,
+      summary: ownsTerminalMarker
+        ? restoredMarkerTerminalStatus === "completed"
+          ? useChinese ? "运行已完成；恢复时清理了不一致的待处理控件。" : "The run completed; inconsistent pending controls were cleared during restore."
+          : useChinese ? "运行已失败；恢复时清理了不一致的待处理控件。" : "The run failed; inconsistent pending controls were cleared during restore."
+        : ownsInvalidatedRequest
+        ? summarizeAssistantText(invalidatedChoiceText) || invalidatedActionMessage
+        : useChinese
+        ? "恢复时未找到可解析的操作请求；已移除失效控件并保留上下文。"
+        : "No resolvable action request was found during restore; stale controls were removed and context was preserved.",
+    };
+  });
+  const sanitizedHarnessRunMarker = invalidatedRequestOwnsProjectedMarkerRun && restoredHarnessRunMarker?.status === "paused"
+    ? {
+        ...restoredHarnessRunMarker,
+        closeReason: invalidatedActionReason,
+      }
+    : restoredHarnessRunMarker;
+  const invalidatedOwnerRequest = invalidatedActionRequest;
+  const replacementPauseReason = invalidatedActionReason;
+  const replacementPauseMessage = invalidatedActionMessage;
+  let replacedOwnerPause = false;
+  let runtimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents)
+    .filter((event) =>
+      !invalidatedOwnerRequest || (
+        !(event.type === "approval.requested" && event.requestId === invalidatedOwnerRequest.requestId) &&
+        !(
+          restoredMarkerTerminalStatus &&
+          invalidatedRequestOwnsProjectedMarkerRun &&
+          event.type === "run.paused" &&
+          event.threadId === invalidatedOwnerRequest.sessionKey &&
+          event.turnId === invalidatedOwnerRequest.turnId &&
+          event.runId === invalidatedOwnerRequest.runId
+        )
+      )
+    )
+    .map((event) => {
+      if (
+        !invalidatedOwnerRequest ||
+        event.type !== "run.paused" ||
+        event.threadId !== invalidatedOwnerRequest.sessionKey ||
+        event.turnId !== invalidatedOwnerRequest.turnId ||
+        event.runId !== invalidatedOwnerRequest.runId
+      ) {
+        return event;
+      }
+      replacedOwnerPause = true;
+      return withEventSchema({
+        type: "run.paused",
+        threadId: event.threadId,
+        turnId: event.turnId,
+        timestampMs: event.timestampMs,
+        runId: event.runId,
+        parentRunId: event.parentRunId,
+        ...(event.goalSliceId ? { goalSliceId: event.goalSliceId } : {}),
+        reason: replacementPauseReason,
+        message: replacementPauseMessage,
+      });
+    });
+  const ownerHasHardTerminal = !!invalidatedOwnerRequest && runtimeEvents.some((event) =>
+    (event.type === "run.completed" || event.type === "run.failed") &&
+    event.threadId === invalidatedOwnerRequest.sessionKey &&
+    event.turnId === invalidatedOwnerRequest.turnId &&
+    event.runId === invalidatedOwnerRequest.runId
+  );
+  if (invalidatedOwnerRequest && !replacedOwnerPause && !ownerHasHardTerminal) {
+    const timestampMs = sanitizedHarnessRunMarker?.closedAt || Date.now();
+    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema(
+      restoredMarkerTerminalStatus && invalidatedRequestOwnsProjectedMarkerRun
+        ? restoredMarkerTerminalStatus === "completed"
+          ? {
+              type: "run.completed",
+              threadId: invalidatedOwnerRequest.sessionKey,
+              turnId: invalidatedOwnerRequest.turnId,
+              timestampMs,
+              runId: invalidatedOwnerRequest.runId,
+              parentRunId: invalidatedOwnerRequest.parentRunId || null,
+              summary: "Restored completed run; stale pending action controls were removed.",
+            }
+          : {
+              type: "run.failed",
+              threadId: invalidatedOwnerRequest.sessionKey,
+              turnId: invalidatedOwnerRequest.turnId,
+              timestampMs,
+              runId: invalidatedOwnerRequest.runId,
+              parentRunId: invalidatedOwnerRequest.parentRunId || null,
+              error: { message: sanitizedHarnessRunMarker?.lastStreamError || sanitizedHarnessRunMarker?.closeReason || "Restored failed run." },
+            }
+        : {
+            type: "run.paused",
+            threadId: invalidatedOwnerRequest.sessionKey,
+            turnId: invalidatedOwnerRequest.turnId,
+            timestampMs,
+            runId: invalidatedOwnerRequest.runId,
+            parentRunId: invalidatedOwnerRequest.parentRunId || null,
+            reason: replacementPauseReason,
+            message: replacementPauseMessage,
+          }
+    ));
+  }
+  const interruptedActionRunId = getHarnessActionRunId(sanitizedHarnessRunMarker);
+  const interruptedTurnId = sanitizedHarnessRunMarker?.turnId || null;
+  const interruptedRunHasTerminal = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
+    (event.type === "run.paused" || event.type === "run.completed" || event.type === "run.failed") &&
+    event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
+    event.turnId === interruptedTurnId &&
+    event.runId === interruptedActionRunId
+  );
+  if (
+    sanitizedHarnessRunMarker?.status === "paused" &&
+    interruptedActionRunId &&
+    interruptedTurnId &&
+    !interruptedRunHasTerminal
+  ) {
+    const interruptedTurn = conversationTurns.find((turn) => turn.id === interruptedTurnId);
+    const useChinese = /[^\x00-\x7F]/.test(String(interruptedTurn?.userPrompt || ""));
+    const wasInterruptedByRestart = normalizedHarnessRunMarker?.status === "running";
+    const projectedRunLostItsAction = !!invalidatedActionRequest &&
+      invalidatedRequestSharesMarkerTurn &&
+      !invalidatedRequestOwnsProjectedMarkerRun;
+    const pauseReason = wasInterruptedByRestart
+      ? "application_restarted"
+      : projectedRunLostItsAction
+      ? "restored_inconsistent_checkpoint"
+      : sanitizedHarnessRunMarker.closeReason || "restored_paused_checkpoint";
+    const pauseMessage = wasInterruptedByRestart
+      ? useChinese
+        ? "应用重启中断了本次运行；上下文和检查点已保留，可以安全恢复。"
+        : "The application restart interrupted this run; context and checkpoints were preserved for safe resume."
+      : projectedRunLostItsAction
+      ? useChinese
+        ? "恢复时发现当前运行与待处理请求身份不一致；失效控件已清理，运行保留为可恢复暂停。"
+        : "Restore found that the projected run and pending request identities disagreed; stale controls were cleared and the run remains safely resumable."
+      : useChinese
+      ? "已恢复暂停的运行检查点；上下文已保留，可以安全继续。"
+      : "The paused run checkpoint was restored with its context and can safely resume.";
+    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+      type: "run.paused",
+      threadId: sanitizedHarnessRunMarker.sessionKey,
+      turnId: interruptedTurnId,
+      timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
+      runId: interruptedActionRunId,
+      parentRunId: sanitizedHarnessRunMarker.activeParentRunId || sanitizedHarnessRunMarker.parentRunId || null,
+      reason: pauseReason,
+      message: pauseMessage,
+    }));
+  }
+  const projectedRunHasHardTerminal = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
+    (event.type === "run.completed" || event.type === "run.failed") &&
+    event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
+    event.turnId === interruptedTurnId &&
+    event.runId === interruptedActionRunId
+  );
+  if (
+    sanitizedHarnessRunMarker &&
+    interruptedActionRunId &&
+    interruptedTurnId &&
+    !projectedRunHasHardTerminal &&
+    (sanitizedHarnessRunMarker.status === "completed" || sanitizedHarnessRunMarker.status === "error")
+  ) {
+    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema(
+      sanitizedHarnessRunMarker.status === "completed"
+        ? {
+            type: "run.completed",
+            threadId: sanitizedHarnessRunMarker.sessionKey,
+            turnId: interruptedTurnId,
+            timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
+            runId: interruptedActionRunId,
+            parentRunId: sanitizedHarnessRunMarker.activeParentRunId || sanitizedHarnessRunMarker.parentRunId || null,
+            summary: "Restored completed run checkpoint.",
+          }
+        : {
+            type: "run.failed",
+            threadId: sanitizedHarnessRunMarker.sessionKey,
+            turnId: interruptedTurnId,
+            timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
+            runId: interruptedActionRunId,
+            parentRunId: sanitizedHarnessRunMarker.activeParentRunId || sanitizedHarnessRunMarker.parentRunId || null,
+            error: { message: sanitizedHarnessRunMarker.lastStreamError || sanitizedHarnessRunMarker.closeReason || "Restored failed run." },
+          }
+    ));
+  }
+  const persistedAgentMessages = sanitizeAgentMessagesForPersist(snapshot.agentMessages || []);
+  let rejectedChoiceMessageIndex = -1;
+  if (invalidatedChoiceRequest) {
+    for (let index = persistedAgentMessages.length - 1; index >= 0; index -= 1) {
+      const message = persistedAgentMessages[index];
+      const messageText = typeof message.content === "string" ? message.content : "";
+      if (
+        message.role === "assistant" &&
+        invalidatedChoiceRequest.optionValues.every((value) => messageText.includes(value))
+      ) {
+        rejectedChoiceMessageIndex = index;
+        break;
+      }
+    }
+  }
+  const agentMessages = persistedAgentMessages.map((message, index) =>
+    index === rejectedChoiceMessageIndex &&
+    typeof message.content === "string" &&
+    invalidatedChoiceRequest
+      ? {
+          ...message,
+          content: stripRestoredUserChoiceControlText(
+            message.content,
+            invalidatedChoiceRequest.optionValues,
+          ),
+        }
+      : message
+  );
+  if (restoredPlanArtifacts.rejected.length > 0 || invalidatedActionRequest) {
+    logStoreEvent("session_plan_restore_sanitized", {
+      rejectedArtifacts: restoredPlanArtifacts.rejected,
+      rejectedProceduralChoice,
+      invalidatedPlanReview,
+      rejectedRequestId: invalidatedActionRequest?.requestId || null,
+      rejectedActionKind: invalidatedActionRequest?.kind || null,
+      rejectedActionReason: invalidatedActionRequest ? invalidatedActionReason : null,
+      restoredArtifactPaths: restoredPlanArtifacts.artifacts.map((artifact) => artifact.path),
+      restoredPlanStage,
+      restoredIsPlanApproved,
+    });
+  }
   return {
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
-    runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
-    harnessRunMarker: restoredHarnessRunMarker,
+    runtimeEvents,
+    harnessRunMarker: sanitizedHarnessRunMarker,
     activeActionRequest: restoredActionRequest,
     taskFlow,
-    agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
+    agentMessages,
     contextMemoryState: normalizedContextMemoryState,
     contextMemoryStateByRuntimeKey: normalizeContextMemoryStateByRuntimeKey(snapshot.contextMemoryStateByRuntimeKey),
     providerCompatibilityByRuntimeKey: normalizeProviderCompatibilityByRuntimeKey(
       snapshot.providerCompatibilityByRuntimeKey,
     ),
-    conversationTurns: normalizeInterruptedConversationTurnsForRestore(snapshot.conversationTurns, taskFlow),
+    conversationTurns,
     currentTurnId: snapshot.currentTurnId ?? null,
     selectedMainModeKey,
     selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
@@ -1734,22 +2124,24 @@ export function normalizeSessionRuntimeSnapshot(
     activeStudioAgentKey: normalizeStudioAgentKey(snapshot.activeStudioAgentKey),
     gameStudioInitialized: snapshot.gameStudioInitialized === true,
     pendingSlashCommand: normalizePendingSlashCommand(snapshot.pendingSlashCommand),
-    planArtifacts: snapshot.planArtifacts || [],
-    planTasks: snapshot.planTasks || [],
-    planExecutionEvidenceLedger: snapshot.planExecutionEvidenceLedger || [],
-    planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
-    planAutoResumeCount: Math.max(0, Number(snapshot.planAutoResumeCount) || 0),
-    planExecutionProgressSnapshot: normalizeStoredPlanExecutionProgressSnapshot(snapshot.planExecutionProgressSnapshot),
-    planStage: snapshot.planStage ?? "idle",
-    isPlanApproved: snapshot.isPlanApproved ?? false,
-    planApprovalChoice: normalizePlanApprovalChoice(snapshot.planApprovalChoice),
+    planArtifacts: restoredPlanArtifacts.artifacts,
+    planTasks: restoredPlanTasks,
+    planExecutionEvidenceLedger: restoredIsPlanApproved ? snapshot.planExecutionEvidenceLedger || [] : [],
+    planExecutionEvidenceCount: restoredIsPlanApproved ? snapshot.planExecutionEvidenceCount ?? 0 : 0,
+    planAutoResumeCount: restoredIsPlanApproved ? Math.max(0, Number(snapshot.planAutoResumeCount) || 0) : 0,
+    planExecutionProgressSnapshot: restoredIsPlanApproved
+      ? normalizeStoredPlanExecutionProgressSnapshot(snapshot.planExecutionProgressSnapshot)
+      : null,
+    planStage: restoredPlanStage,
+    isPlanApproved: restoredIsPlanApproved,
+    planApprovalChoice: restoredIsPlanApproved ? normalizePlanApprovalChoice(snapshot.planApprovalChoice) : "",
     pendingPlanApprovalHandoff: null,
     planApprovalExecutionStartedForTurnId:
-      typeof snapshot.planApprovalExecutionStartedForTurnId === "string"
+      restoredIsPlanApproved && typeof snapshot.planApprovalExecutionStartedForTurnId === "string"
         ? snapshot.planApprovalExecutionStartedForTurnId
         : null,
     clearedPlanTurnId: typeof snapshot.clearedPlanTurnId === "string" ? snapshot.clearedPlanTurnId : null,
-    showPlanPanel: snapshot.showPlanPanel ?? false,
+    showPlanPanel: restoredPlanArtifacts.artifacts.length > 0 && (snapshot.showPlanPanel ?? false),
     showDiff: snapshot.showDiff ?? false,
     showTerminal: snapshot.showTerminal ?? false,
     showFilePanel: snapshot.showFilePanel ?? false,
@@ -2057,21 +2449,26 @@ export function buildRestoredSessionRuntimePatch(input: {
   currentTurnId?: string | null;
   resetPanels?: boolean;
 }): Partial<AppState> {
-  const normalized = normalizeSessionRuntimeSnapshot(input.snapshot, {
+  const mergedSnapshot = input.snapshot
+    ? {
+        ...input.snapshot,
+        ...(input.taskFlow ? { taskFlow: input.taskFlow } : {}),
+        ...(input.conversationTurns ? { conversationTurns: input.conversationTurns } : {}),
+        ...(input.currentTurnId !== undefined ? { currentTurnId: input.currentTurnId } : {}),
+      }
+    : input.snapshot;
+  const normalized = normalizeSessionRuntimeSnapshot(mergedSnapshot, {
     restoreInterruptedGoal: true,
   });
   if (!normalized) return {};
-  const taskFlow = sanitizeTaskBlocksForPersist(input.taskFlow || normalized.taskFlow || []);
-  const conversationTurns = normalizeInterruptedConversationTurnsForRestore(
-    input.conversationTurns || normalized.conversationTurns || [],
-    taskFlow,
-  );
+  const taskFlow = normalized.taskFlow || [];
+  const conversationTurns = normalized.conversationTurns || [];
   const runtime = createSessionRuntimeFromState({
     ...input.fallbackState,
     ...normalized,
     taskFlow,
     conversationTurns,
-    currentTurnId: input.currentTurnId ?? normalized.currentTurnId ?? null,
+    currentTurnId: normalized.currentTurnId ?? null,
     currentTurnState: createDefaultCurrentTurnState(),
     agentStatus: "idle",
     isGenerating: false,
@@ -2282,9 +2679,17 @@ function trimPersistedContextCompression(value: unknown): string | undefined {
     : `${text.slice(0, MAX_PERSISTED_CONTEXT_COMPRESSION_CHARS).trim()}…`;
 }
 
-function persistedTurnPhase(block: TaskBlock): { turnPhase?: TurnRuntimePhase } {
+function persistedTurnPhase(block: TaskBlock): {
+  turnPhase?: TurnRuntimePhase;
+  audience?: "user" | "internal";
+} {
   const turnPhase = normalizeTurnRuntimePhase(block.turnPhase);
-  return turnPhase ? { turnPhase } : {};
+  return {
+    ...(turnPhase ? { turnPhase } : {}),
+    ...(block.audience === "internal" || block.audience === "user"
+      ? { audience: block.audience }
+      : {}),
+  };
 }
 
 /** JSON.stringify wrapper that never throws — returns fallback on failure. */
@@ -5417,7 +5822,17 @@ export const useAppStore = create<AppState>()(
   setPlanStage: (stage) => set({ planStage: stage }),
   upsertPlanArtifact: (artifact) =>
     set((s) => {
+      const canonicalPath = canonicalizePlanArtifactPath(artifact.path);
       const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
+      if (!canonicalPath || detectPlanArtifactKind(canonicalPath) !== artifact.kind) {
+        logStoreEvent("plan_artifact_rejected_by_identity_gate", {
+          path: artifact.path,
+          canonicalPath,
+          kind: artifact.kind,
+        });
+        return {};
+      }
+      const normalizedArtifact = { ...artifact, path: canonicalPath };
       const validation = validatePlanArtifactContent(sanitizedContent, artifact.kind);
       if (!validation.ok) {
         logStoreEvent("plan_artifact_rejected_by_quality_gate", {
@@ -5434,12 +5849,14 @@ export const useAppStore = create<AppState>()(
         (max, candidate) => Math.max(max, Number(candidate.revision) || 0),
         0,
       );
-      const existingIndex = nextArtifacts.findIndex((item) => item.path === artifact.path);
+      const existingIndex = nextArtifacts.findIndex(
+        (item) => canonicalizePlanArtifactPath(item.path) === canonicalPath,
+      );
       if (existingIndex >= 0) {
         const existingArtifact = nextArtifacts[existingIndex];
         const contentChanged = existingArtifact.content !== sanitizedContent || existingArtifact.kind !== artifact.kind;
         nextArtifacts[existingIndex] = {
-          ...artifact,
+          ...normalizedArtifact,
           content: sanitizedContent,
           revision: contentChanged
             ? Math.max(1, currentMaxPlanRevision + 1)
@@ -5447,7 +5864,7 @@ export const useAppStore = create<AppState>()(
         };
       } else {
         nextArtifacts.push({
-          ...artifact,
+          ...normalizedArtifact,
           content: sanitizedContent,
           revision: Math.max(1, currentMaxPlanRevision + 1),
         });
@@ -5510,7 +5927,7 @@ export const useAppStore = create<AppState>()(
           })
         : s.activeActionRequest;
       logStoreEvent("plan_artifact_stage_transition", {
-        path: artifact.path,
+        path: canonicalPath,
         kind: artifact.kind,
         previousStage: s.planStage,
         nextStage,
@@ -5690,11 +6107,11 @@ export const useAppStore = create<AppState>()(
         resolveSessionWorkspaceKey(state.currentWorkspace),
         state.currentSessionId,
       );
-      const reviewRunMatches = !!state.harnessRunMarker?.runId &&
-        state.harnessRunMarker.status === "paused" &&
-        state.harnessRunMarker.runId === reviewRequest?.runId &&
-        state.harnessRunMarker.turnId === approvedTurnId &&
-        state.harnessRunMarker.sessionKey === reviewSessionKey;
+      const reviewRunMatches = !!getHarnessActionRunId(state.harnessRunMarker) &&
+        state.harnessRunMarker?.status === "paused" &&
+        getHarnessActionRunId(state.harnessRunMarker) === reviewRequest?.runId &&
+        state.harnessRunMarker?.turnId === approvedTurnId &&
+        state.harnessRunMarker?.sessionKey === reviewSessionKey;
       if (
         reviewRequest?.kind !== "plan_review" ||
         reviewRequest.status !== "pending" ||
@@ -5850,7 +6267,7 @@ export const useAppStore = create<AppState>()(
             planRevision: approvalIdentity.revision,
             artifactHash: approvalIdentity.artifactHash,
             artifactPaths: approvalIdentity.artifactPaths,
-            parentRunId: state.harnessRunMarker?.runId || null,
+            parentRunId: getHarnessActionRunId(state.harnessRunMarker),
           }
         : null;
       const initialProgressSnapshot = approvedTurnId
@@ -5952,7 +6369,7 @@ export const useAppStore = create<AppState>()(
         state.harnessRunMarker?.status === "paused" &&
         state.harnessRunMarker.sessionKey === request.sessionKey &&
         state.harnessRunMarker.turnId === request.turnId &&
-        state.harnessRunMarker.runId === request.runId &&
+        getHarnessActionRunId(state.harnessRunMarker) === request.runId &&
         request.requestId === expectedIdentity.requestId &&
         request.sessionKey === expectedIdentity.sessionKey &&
         request.turnId === expectedIdentity.turnId &&

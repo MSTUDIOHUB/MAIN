@@ -32,26 +32,35 @@ test("pure plan execution projects the runtime checkpoint into the main Capsule"
   await expect(page.getByTestId("plan-task-progress")).toContainText("T9: 更新");
 });
 
-test("preapproval Plan recovery projects the exact run phase and hidden-reasoning heartbeat", async ({ page }) => {
+test("preapproval Plan recovery keeps internal phases and heartbeats out of user UI", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
   await page.evaluate(() => (window as any).__CODELY_E2E__?.showPlanDraftRecovery?.());
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  await expect(capsule).toHaveAttribute("data-turn-id", "e2e-execution-capsule-panel-stability-turn");
-  await expect(capsule).toHaveAttribute("data-run-id", "run-e2e-plan-draft-recovery");
-  await expect(capsule).toHaveAttribute("data-plan-runtime-phase", "needs_rewrite");
-
-  const progress = page.getByTestId("plan-draft-runtime-progress");
-  await expect(progress).toHaveAttribute("data-phase", "needs_rewrite");
-  await expect(progress).toHaveAttribute("data-iteration", "4");
-  await expect(progress).toHaveAttribute("data-elapsed-ms", "65000");
-  await expect(page.getByTestId("plan-draft-runtime-reason")).toContainText("草稿结构不完整");
-  await expect(page.getByTestId("plan-draft-runtime-heartbeat")).toContainText("65 秒");
-  await expect(page.getByTestId("plan-draft-runtime-heartbeat")).toContainText("隐藏推理正文不会展示");
+  await expect(capsule).not.toHaveAttribute("data-plan-runtime-phase", /.+/);
+  await expect(page.getByTestId("plan-draft-runtime-progress")).toHaveCount(0);
+  await expect(page.locator("[data-plan-runtime-phase]")).toHaveCount(0);
   await expect(page.getByTestId("plan-review-capsule")).toHaveCount(0);
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
-  await expect(page.locator("body")).not.toContainText("SECRET MODEL REASONING");
+  await page.getByTitle("查看有效进展").click();
+  await expect(page.getByTestId("effective-progress-popover")).toContainText("暂无有效进展");
+  await expect(page.locator("body")).not.toContainText(/Needs rewrite|Drafting|草稿结构不完整|65 秒|隐藏推理正文不会展示|SECRET MODEL REASONING/);
+});
+
+test("pending user choice renders only in the global Capsule with its exact action identity", async ({ page }) => {
+  await page.goto("/?e2eScenario=awaiting-choice");
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toBeVisible();
+  await expect(capsule).toHaveAttribute("data-action-kind", "user_choice");
+  await expect(capsule).toHaveAttribute("data-session-key", "/tmp/e2e-awaiting-choice:999006");
+  await expect(capsule).toHaveAttribute("data-turn-id", "e2e-awaiting-choice-turn");
+  await expect(capsule).toHaveAttribute("data-run-id", "run-e2e-awaiting-choice");
+  await expect(capsule).toHaveAttribute("data-request-id", "request-e2e-awaiting-choice");
+  await expect(capsule.getByTestId("execution-capsule-awaiting-choice")).toBeVisible();
+  await expect(capsule.getByTestId("execution-capsule-reply-option-0")).toContainText("先修暂停等待选择");
+  await expect(page.getByTestId("turn-choice-checkpoint")).toHaveCount(0);
 });
 
 test("PlanPanel counts only trusted evidence, not claimed completed checkboxes", async ({ page }) => {
@@ -195,6 +204,17 @@ test("ExecutionCapsule renders approval controls from pendingToolCall when the p
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().pendingReviewTaskId ?? null))
     .toBeNull();
+});
+
+test("a second permission request owned by a child run stays in the global Capsule", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.showChildRunToolApprovalPrompt?.());
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toHaveAttribute("data-action-kind", "tool_permission");
+  await expect(capsule).toHaveAttribute("data-run-id", /-child$/);
+  await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
+  await expect(page.getByTestId("execution-capsule-tool-approve-once")).toBeVisible();
 });
 
 async function prepareFormalPlanReview(

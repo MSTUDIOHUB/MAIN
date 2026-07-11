@@ -679,14 +679,48 @@ export function deriveVisibleConversationTurnStatus(params: {
 /**
  * 通过计划文件路径判断产物类型。
  */
+const CANONICAL_PLAN_ARTIFACT_FILENAMES = new Set([
+  "plan.md",
+  "requirements.md",
+  "design.md",
+  "tasks.md",
+  "bugfix.md",
+]);
+
+/**
+ * Collapse syntactic aliases for the session-owned Plan workspace. Tool calls
+ * may report `./.MAIN/...`, Windows separators, or an absolute workspace path;
+ * those identities must all address the same artifact and approval lease.
+ */
+export function canonicalizePlanArtifactPath(path: string | null | undefined): string {
+  const normalized = String(path || "")
+    .trim()
+    .replace(/\\/g, "/")
+    .replace(/^\.\/+/, "")
+    .replace(/\/{2,}/g, "/");
+  if (!normalized) return "";
+
+  const lower = normalized.toLowerCase();
+  // Workspace path normalization happens before this boundary. Without an
+  // explicit workspace root, an absolute path must stay absolute; collapsing
+  // `/other/workspace/.MAIN/...` would alias another project's approval into
+  // the current session.
+  if (normalized.startsWith("/") || /^[a-z]:\//i.test(normalized)) return normalized;
+  const marker = ".main/plans/";
+  if (!lower.startsWith(marker)) return normalized;
+  const filename = lower.slice(marker.length);
+  if (!CANONICAL_PLAN_ARTIFACT_FILENAMES.has(filename)) return normalized;
+  return `.MAIN/plans/${filename}`;
+}
+
 export function detectPlanArtifactKind(path: string): PlanArtifactKind | null {
-  const normalized = path.replace(/\\/g, "/").toLowerCase();
-  if (!normalized.includes(".main/plans/")) return null;
-  if (normalized.endsWith("plan.md")) return "plan";
-  if (normalized.endsWith("requirements.md")) return "requirements";
-  if (normalized.endsWith("design.md")) return "design";
-  if (normalized.endsWith("tasks.md")) return "tasks";
-  if (normalized.endsWith("bugfix.md")) return "bugfix";
+  const normalized = canonicalizePlanArtifactPath(path).toLowerCase();
+  if (!normalized.startsWith(".main/plans/")) return null;
+  if (normalized === ".main/plans/plan.md") return "plan";
+  if (normalized === ".main/plans/requirements.md") return "requirements";
+  if (normalized === ".main/plans/design.md") return "design";
+  if (normalized === ".main/plans/tasks.md") return "tasks";
+  if (normalized === ".main/plans/bugfix.md") return "bugfix";
   return null;
 }
 
@@ -2436,11 +2470,18 @@ export function validatePlanArtifactContent(
     if (!hasCheckboxTasks || tasks.length === 0) {
       return { ok: false, reason: "missing_checkbox_tasks" };
     }
-    const hasAnyTaskEvidence = tasks.some((task) => task.evidence && task.evidence.length > 0);
-    if (!hasAnyTaskEvidence) {
+    const everyTaskHasEvidence = tasks.every((task) => task.evidence && task.evidence.length > 0);
+    if (!everyTaskHasEvidence) {
       return { ok: false, reason: "missing_task_evidence" };
     }
     return { ok: true };
+  }
+
+  if (kind === "bugfix" && /^\s*[-*]\s+\[[ xX]\]\s+.+$/m.test(raw)) {
+    const tasks = extractPlanTasks(raw);
+    if (tasks.length === 0 || tasks.some((task) => !task.evidence || task.evidence.length === 0)) {
+      return { ok: false, reason: "missing_task_evidence" };
+    }
   }
 
   // Strip markdown code blocks before validating noise patterns so code snippets inside markdown don't trigger raw_source_code

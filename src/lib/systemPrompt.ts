@@ -1096,7 +1096,7 @@ export function buildSystemPrompt(
           ? `Plan turn — read-only evidence gathering first, then write \`.MAIN/plans/plan.md\` with ${planWriteToolText}. No source edits, no tasks.md before approval.`
           : "Plan turn — read-only evidence gathering first, then output a visible `<proposed_plan>` because no plan write tool is exposed. No source edits, no tasks.md before approval.");
         tfl.push("Use \`<user_options>\` only for real branching decisions, not for generic 'continue reading' prompts. Never emit \`approve_operation_once\`, \`adjust_plan\`, or \`cancel_operation\` as plan approval; the Plan review surface owns approval after plan.md is ready.");
-        tfl.push("If plan isn't ready, give 2-4 clear options; don't force a full plan.md.");
+        tfl.push("If the Plan is not ready only because evidence or analysis is incomplete, continue autonomously with the exposed safe tools; do not turn your own read/check/fix ordering into user options. Give 2-4 options only when a user-owned product, scope, technology, or priority decision genuinely blocks the artifact.");
         tfl.push(exposedPlanWriteToolNames.length > 0
           ? "When plan is mature, write plan.md; fall back to \`<proposed_plan>\` only if write tools are unavailable."
           : "When plan is mature, output `<proposed_plan>` Markdown and stop; do not claim a file write.");
@@ -1112,7 +1112,7 @@ export function buildSystemPrompt(
           ? `规划回合：先只读探索，证据足够后用 ${planWriteToolText} 写 \`.MAIN/plans/plan.md\`。批准前不修改源码、不生成 tasks.md。`
           : "规划回合：先只读探索，证据足够后输出可见 `<proposed_plan>`；本轮没有计划写入工具时不要伪造工具调用。批准前不修改源码、不生成 tasks.md。");
         tfl.push("真正分叉才用 \`<user_options>\`，不给'继续读取'类泛化选项。计划审批不得输出 \`approve_operation_once\`、\`adjust_plan\` 或 \`cancel_operation\`；plan.md 就绪后只由 Plan 审批区处理批准。");
-        tfl.push("方案未收敛时给 2-4 个明确选择，不要强行写完整 plan.md。");
+        tfl.push("如果方案尚未收敛只是因为证据或分析不足，应使用当前开放的安全工具自主继续；不要把你自己的读取、检查或修复顺序包装成用户选项。只有用户拥有的产品、范围、技术选型或优先级决策真正阻塞计划文件时，才给出 2-4 个选项。");
         tfl.push(exposedPlanWriteToolNames.length > 0
           ? "方案成熟时写入 plan.md；写入工具不可用才降级为 \`<proposed_plan>\`。"
           : "方案成熟时输出 `<proposed_plan>` Markdown 并停止；不要声称已经写入计划文件。");

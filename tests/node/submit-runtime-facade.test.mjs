@@ -153,6 +153,28 @@ function createControllerState(overrides = {}) {
   };
 }
 
+function buildAcceptedControllerPlan(label) {
+  return [
+    "# Plan runtime identity refresh",
+    "",
+    "## User goal",
+    `- ${label}: keep the reviewed Plan bound to the exact materialized bytes.`,
+    "",
+    "## Key changes",
+    "- Update the same plan artifact path while preserving a monotonic revision.",
+    "- Refresh the pending review request so a control rendered for older bytes is stale.",
+    "",
+    "## Execution steps",
+    "1. Materialize the accepted Plan artifact.",
+    "2. Recompute the review identity from the stored artifact set.",
+    "3. Require the refreshed identity before execution can be approved.",
+    "",
+    "## Validation",
+    "- Assert the revision, artifact hash, artifact paths, and request id all describe the latest write.",
+    "",
+  ].join("\n");
+}
+
 function applySet(stateRef, patchOrUpdater) {
   const patch = typeof patchOrUpdater === "function"
     ? patchOrUpdater(stateRef.current)
@@ -432,6 +454,93 @@ test("submit session runtime controller writes decorated callbacks to background
   assert.equal(runRuntime.conversationTurns[0].status, "awaiting_approval");
   assert.equal(runRuntime.conversationTurns[0].collapsed, false);
   assert.equal(runRuntime.conversationTurns[0].elapsedTime, 5);
+});
+
+test("submit session runtime controller advances Plan revision and refreshes pending review identity", () => {
+  const staleReviewRequest = {
+    schemaVersion: 1,
+    requestId: "action-plan-review-run-plan-0-stale",
+    kind: "plan_review",
+    sessionKey: "/tmp/app:42",
+    turnId: "turn-1",
+    runId: "run-plan",
+    parentRunId: null,
+    title: "Review Plan",
+    status: "pending",
+    createdAt: 0,
+    planRevision: 99,
+    artifactHash: "plan-stale",
+    artifactPaths: [".MAIN/plans/plan.md"],
+  };
+  const stateRef = {
+    current: createControllerState({ activeActionRequest: staleReviewRequest }),
+  };
+
+  const controller = createSubmitSessionRuntimeController({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/app:42",
+    createRuntimeFromState: createControllerRuntimeFromState,
+    pickRuntimePatch: pickControllerRuntimePatch,
+    derivePlanStageFromArtifacts: () => "review",
+    createDefaultCurrentTurnState: () => ({ interceptorHandled: false }),
+    logStoreEvent: () => {},
+  });
+
+  const artifactPath = ".MAIN/plans/plan.md";
+  controller.sessionGet().upsertPlanArtifact({
+    kind: "plan",
+    path: artifactPath,
+    title: "Plan",
+    content: buildAcceptedControllerPlan("First revision"),
+    revision: 41,
+    updatedAt: 100,
+  });
+
+  const firstArtifact = stateRef.current.planArtifacts[0];
+  const firstReviewRequest = stateRef.current.activeActionRequest;
+  assert.equal(firstArtifact.revision, 1);
+  assert.equal(firstReviewRequest.kind, "plan_review");
+  assert.equal(firstReviewRequest.planRevision, 1);
+  assert.deepEqual(firstReviewRequest.artifactPaths, [artifactPath]);
+  assert.notEqual(firstReviewRequest.artifactHash, staleReviewRequest.artifactHash);
+  assert.notEqual(firstReviewRequest.requestId, staleReviewRequest.requestId);
+
+  controller.sessionGet().upsertPlanArtifact({
+    kind: "plan",
+    path: artifactPath,
+    title: "Plan",
+    content: buildAcceptedControllerPlan("Second revision"),
+    revision: 41,
+    updatedAt: 200,
+  });
+
+  const secondArtifact = stateRef.current.planArtifacts[0];
+  const secondReviewRequest = stateRef.current.activeActionRequest;
+  assert.equal(stateRef.current.planArtifacts.length, 1);
+  assert.equal(secondArtifact.path, artifactPath);
+  assert.equal(secondArtifact.revision, 2);
+  assert.equal(secondReviewRequest.kind, "plan_review");
+  assert.equal(secondReviewRequest.planRevision, 2);
+  assert.deepEqual(secondReviewRequest.artifactPaths, [artifactPath]);
+  assert.notEqual(secondReviewRequest.artifactHash, firstReviewRequest.artifactHash);
+  assert.notEqual(secondReviewRequest.requestId, firstReviewRequest.requestId);
+
+  // A Plan approval control is an exact identity lease. Once the artifact is
+  // rewritten, every identity field captured by the old control is stale.
+  assert.notDeepEqual(
+    {
+      requestId: secondReviewRequest.requestId,
+      planRevision: secondReviewRequest.planRevision,
+      artifactHash: secondReviewRequest.artifactHash,
+    },
+    {
+      requestId: firstReviewRequest.requestId,
+      planRevision: firstReviewRequest.planRevision,
+      artifactHash: firstReviewRequest.artifactHash,
+    },
+  );
+  assert.equal(stateRef.current.isPlanApproved, false);
 });
 
 test("submit elapsed timer updates active elapsed time and clears itself when run ends", () => {

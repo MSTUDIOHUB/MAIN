@@ -16,6 +16,8 @@ export interface TaskBlockBase {
   id: number;
   turnId?: string;
   turnPhase?: TurnRuntimePhase;
+  /** Internal runtime diagnostics are persisted for recovery but never rendered. */
+  audience?: "user" | "internal";
 }
 
 export interface ToolDiffSnapshot {

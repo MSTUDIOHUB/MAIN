@@ -22,6 +22,7 @@ import {
   buildReadOnlyCacheSignature,
   emitToolPreflightBlocked,
   getSessionTaskTargetingEvidence,
+  getProtectedPlanArtifactMutationViolation,
   getToolTarget,
   isContentInActiveMessages,
   isExecutionPlanArtifactWrite,
@@ -184,6 +185,41 @@ export async function partitionToolCallsForExecution(input: {
     });
     const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
     toolFailureSignatures.set(tc.id, failureSignature);
+
+    const protectedPlanMutation = getProtectedPlanArtifactMutationViolation(
+      tc.name,
+      toolArgs,
+      callbacks.getPreferredLanguage(),
+    );
+    if (protectedPlanMutation) {
+      callbacks.onToolExecuting(tc.name, protectedPlanMutation.target, undefined, { toolCallId: tc.id });
+      callbacks.onToolDone(tc.name, protectedPlanMutation.target, protectedPlanMutation.message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: protectedPlanMutation.reason,
+      });
+      logAgentEvent("plan_artifact_protected_mutation_blocked", {
+        iteration,
+        tool: tc.name,
+        target: protectedPlanMutation.target,
+        reason: protectedPlanMutation.reason,
+        diskWritten: false,
+        storePublished: false,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target: protectedPlanMutation.target,
+        content: protectedPlanMutation.message,
+        displayContent: protectedPlanMutation.message,
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: protectedPlanMutation.reason,
+        planRecoveryAction: "rewrite",
+      });
+      continue;
+    }
 
     if ((failedToolCallCounts.get(failureSignature) ?? 0) >= 2) {
       const failureCount = failedToolCallCounts.get(failureSignature) ?? 0;

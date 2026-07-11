@@ -8,7 +8,11 @@ export type HarnessRunStatus = "running" | "completed" | "paused" | "error" | "i
 
 export interface HarnessRunMarker {
   schemaVersion: 1;
+  /** Outer process lease used for crash-safe persistence ownership. */
   runId: string;
+  /** Current child run that owns any actionable request shown in the UI. */
+  activeRunId?: string | null;
+  activeParentRunId?: string | null;
   /** Previous execution run in the same logical turn. Absent on legacy markers. */
   parentRunId?: string | null;
   /** Earliest durable message index for this logical turn across resumed runs. */
@@ -59,6 +63,20 @@ export function isHarnessRunMarkerOwnedByRun(
     marker.runId === owner.runId &&
     marker.sessionKey === owner.sessionKey &&
     marker.turnId === owner.turnId;
+}
+
+/** The outer harness lease and the currently actionable child run are
+ * intentionally separate. UI/request identity must use this projection while
+ * persistence ownership continues to use `marker.runId`. */
+export function getHarnessActionRunId(
+  marker: HarnessRunMarker | null | undefined,
+): string | null {
+  const activeRunId = typeof marker?.activeRunId === "string"
+    ? marker.activeRunId.trim()
+    : "";
+  if (activeRunId) return activeRunId;
+  const outerRunId = typeof marker?.runId === "string" ? marker.runId.trim() : "";
+  return outerRunId || null;
 }
 
 export interface HarnessUncleanRestartDiagnostic {
@@ -127,11 +145,18 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
   if (!sessionKey) return null;
   const startedAt = Math.max(0, Number(record.startedAt) || Date.now());
   const turnId = typeof record.turnId === "string" ? record.turnId : null;
+  const runId = typeof record.runId === "string" && record.runId.trim()
+    ? record.runId
+    : `legacy-${sessionKey}-${turnId || "no-turn"}-${startedAt}`;
   return {
     schemaVersion: 1,
-    runId: typeof record.runId === "string" && record.runId.trim()
-      ? record.runId
-      : `legacy-${sessionKey}-${turnId || "no-turn"}-${startedAt}`,
+    runId,
+    activeRunId: typeof record.activeRunId === "string" && record.activeRunId.trim()
+      ? record.activeRunId.trim()
+      : runId,
+    activeParentRunId: typeof record.activeParentRunId === "string" && record.activeParentRunId.trim()
+      ? record.activeParentRunId.trim()
+      : null,
     parentRunId: typeof record.parentRunId === "string" && record.parentRunId.trim()
       ? record.parentRunId.trim()
       : null,

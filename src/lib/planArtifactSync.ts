@@ -1,6 +1,16 @@
-import { detectPlanArtifactKind, type PlanArtifactKind } from "./workflowModels";
+import {
+  canonicalizePlanArtifactPath,
+  detectPlanArtifactKind,
+  type PlanArtifactKind,
+} from "./workflowModels";
 
 type SyncedPlanArtifactKind = Exclude<PlanArtifactKind, "summary">;
+
+export interface ResolvedPlanArtifactUpdate {
+  kind: SyncedPlanArtifactKind;
+  path: string;
+  content: string;
+}
 
 const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file"]);
 
@@ -26,7 +36,7 @@ function getPlanArtifactTarget(
   const kind = detectPlanArtifactKind(path);
   if (!kind || kind === "summary") return null;
 
-  return { kind, path };
+  return { kind, path: canonicalizePlanArtifactPath(path) };
 }
 
 async function resolveUpdatedPlanArtifactContent(
@@ -56,20 +66,36 @@ async function resolveUpdatedPlanArtifactContent(
   }
 }
 
+export async function resolvePlanArtifactAfterToolSuccess(
+  toolName: string,
+  toolArgs: Record<string, unknown>,
+  options: PlanArtifactSyncOptions,
+): Promise<ResolvedPlanArtifactUpdate | null> {
+  const target = getPlanArtifactTarget(toolName, toolArgs);
+  if (!target) return null;
+
+  const content = await resolveUpdatedPlanArtifactContent(toolName, toolArgs, options);
+  if (content == null) return null;
+  return { ...target, content };
+}
+
+export function commitResolvedPlanArtifactUpdate(
+  update: ResolvedPlanArtifactUpdate,
+  callbacks: PlanArtifactSyncCallbacks,
+): void {
+  callbacks.onPlanArtifactUpdated(update.path, update.content, update.kind);
+  if (update.kind === "tasks" || update.kind === "bugfix") {
+    callbacks.onPlanTasksUpdated(update.content);
+  }
+}
+
 export async function syncPlanArtifactAfterToolSuccess(
   toolName: string,
   toolArgs: Record<string, unknown>,
   callbacks: PlanArtifactSyncCallbacks,
   options: PlanArtifactSyncOptions,
 ): Promise<void> {
-  const target = getPlanArtifactTarget(toolName, toolArgs);
-  if (!target) return;
-
-  const content = await resolveUpdatedPlanArtifactContent(toolName, toolArgs, options);
-  if (content == null) return;
-
-  callbacks.onPlanArtifactUpdated(target.path, content, target.kind);
-  if (target.kind === "tasks" || target.kind === "bugfix") {
-    callbacks.onPlanTasksUpdated(content);
-  }
+  const update = await resolvePlanArtifactAfterToolSuccess(toolName, toolArgs, options);
+  if (!update) return;
+  commitResolvedPlanArtifactUpdate(update, callbacks);
 }

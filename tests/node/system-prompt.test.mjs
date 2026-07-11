@@ -730,6 +730,44 @@ test("system prompt prioritizes turn intake screenshots and attached context bef
   assert.match(prompt, /先读取并利用用户已给上下文/);
 });
 
+test("Plan prompt never turns model-internal work ordering into user choices", () => {
+  const zhPrompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "zh",
+    null,
+    undefined,
+    "plan",
+    "english_core_localized_output",
+    ["read_file", "grep_search", "write_file"],
+  );
+  const enPrompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "en",
+    null,
+    undefined,
+    "plan",
+    "english_core_localized_output",
+    ["read_file", "grep_search", "write_file"],
+  );
+
+  assert.match(zhPrompt, /不要把你自己的读取、检查或修复顺序包装成用户选项/);
+  assert.match(enPrompt, /do not turn your own read\/check\/fix ordering into user options/i);
+  assert.doesNotMatch(zhPrompt, /方案未收敛时给 2-4 个明确选择/);
+  assert.doesNotMatch(enPrompt, /If plan isn't ready, give 2-4 clear options/i);
+});
+
 test("execute prompt enforces strict immediate tool execution constraints", () => {
   const prompt = buildSystemPrompt(
     [],

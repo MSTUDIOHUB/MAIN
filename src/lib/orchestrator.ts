@@ -36,8 +36,12 @@ import {
 import { getFileMetadata, shellPermissionPreflight } from "./ipc";
 import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
-import { summarizeApplyPatchTarget } from "./applyPatchTool";
-import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
+import { parseApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import {
+  commitResolvedPlanArtifactUpdate,
+  resolvePlanArtifactAfterToolSuccess,
+  syncPlanArtifactAfterToolSuccess,
+} from "./planArtifactSync";
 import {
   buildReadFileWindowContinuationGuidance,
 } from "./readFileWindow";
@@ -88,6 +92,7 @@ import {
 import type { AppConfig, Skill } from "./appTypes";
 import {
   buildPlanTaskEvidenceAudit,
+  canonicalizePlanArtifactPath,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -468,28 +473,62 @@ export function getSessionTaskTargetingEvidence(sessionKey: string): Set<string>
  * These are auto-executed in Plan Mode, but the allowed file set depends
  * on the current plan stage.
  */
-function getPlanArtifactMutationTarget(name: string, args: Record<string, unknown>): { path: string; fileName: string } | null {
-  if (!PLAN_ARTIFACT_MUTATION_TOOLS.has(name)) return null;
-  const path = (args.path as string) || "";
-  const normalized = path.replace(/\\/g, "/");
-  if (!normalized.toLowerCase().includes(".main/plans/")) return null;
-  const fileName = normalized.split("/").pop() || "";
-  return fileName ? { path, fileName } : null;
+function getPlanArtifactMutationTargets(name: string, args: Record<string, unknown>): Array<{ path: string; fileName: string }> {
+  if (!PLAN_ARTIFACT_MUTATION_TOOLS.has(name)) return [];
+  const rawPaths = name === "apply_patch"
+    ? (() => {
+        const parsed = parseApplyPatch(typeof args.patch === "string" ? args.patch : "");
+        if (!parsed.ok) return [];
+        return parsed.operations.flatMap((operation) =>
+          operation.newPath ? [operation.path, operation.newPath] : [operation.path]
+        );
+      })()
+    : [typeof args.path === "string" ? args.path : ""];
+  const targets: Array<{ path: string; fileName: string }> = [];
+  for (const path of rawPaths) {
+    const kind = detectPlanArtifactKind(path);
+    if (!kind || kind === "summary") continue;
+    const canonicalPath = canonicalizePlanArtifactPath(path);
+    const fileName = canonicalPath.split("/").pop() || "";
+    if (fileName && !targets.some((target) => target.path === canonicalPath)) {
+      targets.push({ path: canonicalPath, fileName: fileName.toLowerCase() });
+    }
+  }
+  return targets;
+}
+
+function mutationTargetsOnlyPlanArtifacts(
+  name: string,
+  args: Record<string, unknown>,
+  targets: Array<{ path: string; fileName: string }>,
+): boolean {
+  if (targets.length === 0) return false;
+  if (name !== "apply_patch") return true;
+  const parsed = parseApplyPatch(typeof args.patch === "string" ? args.patch : "");
+  if (!parsed.ok) return false;
+  const changedPathCount = parsed.operations.reduce(
+    (count, operation) => count + (operation.newPath ? 2 : 1),
+    0,
+  );
+  return changedPathCount === targets.length;
 }
 
 export function isPreApprovalPlanDraftWrite(name: string, args: Record<string, unknown>): boolean {
-  const target = getPlanArtifactMutationTarget(name, args);
-  return !!target && PRE_APPROVAL_PLAN_FILE_NAMES.has(target.fileName);
+  const targets = getPlanArtifactMutationTargets(name, args);
+  return mutationTargetsOnlyPlanArtifacts(name, args, targets) &&
+    targets.every((target) => PRE_APPROVAL_PLAN_FILE_NAMES.has(target.fileName));
 }
 
 export function isExecutionPlanArtifactWrite(name: string, args: Record<string, unknown>): boolean {
-  const target = getPlanArtifactMutationTarget(name, args);
-  return !!target && EXECUTION_PLAN_FILE_NAMES.has(target.fileName);
+  const targets = getPlanArtifactMutationTargets(name, args);
+  return mutationTargetsOnlyPlanArtifacts(name, args, targets) &&
+    targets.every((target) => EXECUTION_PLAN_FILE_NAMES.has(target.fileName));
 }
 
 export function isTasksPlanWrite(name: string, args: Record<string, unknown>): boolean {
-  const target = getPlanArtifactMutationTarget(name, args);
-  return !!target && target.fileName === "tasks.md";
+  const targets = getPlanArtifactMutationTargets(name, args);
+  return mutationTargetsOnlyPlanArtifacts(name, args, targets) &&
+    targets.every((target) => target.fileName === "tasks.md");
 }
 
 function isEphemeralPlanArtifactMutation(name: string, args: Record<string, unknown>): boolean {
@@ -498,7 +537,32 @@ function isEphemeralPlanArtifactMutation(name: string, args: Record<string, unkn
 }
 
 export function isPlanArtifactPath(path: string): boolean {
-  return path.replace(/\\/g, "/").toLowerCase().includes(".main/plans/");
+  const kind = detectPlanArtifactKind(path);
+  return !!kind && kind !== "summary";
+}
+
+export function getProtectedPlanArtifactMutationViolation(
+  name: string,
+  args: Record<string, unknown>,
+  language: "zh" | "en",
+): { reason: string; target: string; message: string } | null {
+  const path = typeof args.path === "string" ? args.path : "";
+  const command = typeof args.command === "string" ? args.command : "";
+  const isProtectedDelete = name === "delete_workspace_path" && isPlanArtifactPath(path);
+  const normalizedCommand = command.replace(/\\/g, "/").toLowerCase();
+  const isProtectedShellAccess =
+    (name === "run_command" || name === "execute_command") &&
+    normalizedCommand.includes(".main/plans/");
+  if (!isProtectedDelete && !isProtectedShellAccess) return null;
+
+  const target = isProtectedDelete ? canonicalizePlanArtifactPath(path) : truncateForLog(command, 240);
+  const reason = isProtectedDelete
+    ? "plan_artifact_delete_blocked"
+    : "plan_artifact_shell_access_blocked";
+  const message = language === "zh"
+    ? `${reason.toUpperCase()}: 计划产物不能通过 ${name} 修改、删除或读取（目标：${target}）。请使用 write_file 或 replace_in_file 单文件更新，使 MAIN 能在磁盘、Store、revision 和批准状态变化前校验最终内容；不再需要的计划应通过 Plan 工作流重新生成或显式清理会话。`
+    : `${reason.toUpperCase()}: Plan artifacts cannot be modified, deleted, or read through ${name} (target: ${target}). Use a single-file write_file or replace_in_file call so MAIN can validate the final content before disk, Store, revision, and approval state change; regenerate or explicitly clear obsolete plans through the Plan workflow.`;
+  return { reason, target, message };
 }
 
 export function emitToolPreflightBlocked(
@@ -1303,6 +1367,11 @@ export interface OrchestratorCallbacks {
     progress?: Partial<PlanExecutionProgressUpdate>,
   ) => void;
   onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => void;
+  onPlanArtifactRejected?: (
+    path: string,
+    kind: "plan" | "requirements" | "design" | "tasks" | "bugfix",
+    reason: string,
+  ) => void;
   onPlanStageChanged: (stage: "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
   onPlanApprovalInvalidated?: (reason: string) => void;
   onPlanTasksUpdated: (content: string) => void;
@@ -1368,7 +1437,12 @@ export interface OrchestratorCallbacks {
     toolName: string,
     target: string,
     result: string,
-    meta?: { toolCallId?: string; diff?: ToolDiffPreview },
+    meta?: {
+      toolCallId?: string;
+      diff?: ToolDiffPreview;
+      internalFeedback?: boolean;
+      qualityGateReason?: string | null;
+    },
   ) => void;
   onToolError: (
     toolName: string,
@@ -1615,7 +1689,7 @@ function normalizeNoProgressResultContent(result: ToolExecutionResult): string {
 }
 
 export function buildNoProgressBatchSignature(results: ToolExecutionResult[]): string {
-  const usable = results.filter((result) => !result.isError);
+  const usable = results.filter((result) => !result.isError && !result.internalFeedback);
   if (usable.length === 0) return "";
   if (usable.every((result) => NO_PROGRESS_EXCLUDED_TOOLS.has(result.name))) return "";
   const fragments = usable
@@ -1777,6 +1851,7 @@ export function buildPlanReviewReadyMessage(
 export function isSuccessfulPlanArtifactWriteResult(result: ToolExecutionResult): boolean {
   return (
     !result.isError &&
+    !result.internalFeedback &&
     PLAN_ARTIFACT_MUTATION_TOOLS.has(result.name) &&
     !!result.target &&
     isPlanArtifactPath(result.target)
@@ -3950,26 +4025,29 @@ async function executeToolCallWithLifecycle(
     const modelContent = truncateToolContent(resultStr, budgets.modelChars);
     const displayContent = truncateToolContent(resultStr, budgets.displayChars);
 
-    // 计划文件会在 Plan 面板中单独展示，不再依赖聊天区自己拼装。
-    await syncPlanArtifactAfterToolSuccess(
+    const planArtifactSyncCallbacks = {
+      onPlanArtifactUpdated: callbacks.onPlanArtifactUpdated,
+      onPlanTasksUpdated: callbacks.onPlanTasksUpdated,
+    };
+    const planArtifactSyncOptions = {
+      readFile: async (path: string) => {
+        const content = await executeTool("read_file", { path, __raw: true }, workspace, sessionKey, {
+          allowExternalLocalRead: options.allowExternalLocalRead === true,
+        });
+        return String(content ?? "");
+      },
+      warn: (message: string, error?: unknown) => logAgentEvent("plan_artifact_sync_warn", {
+        message,
+        error: error instanceof Error ? error.message : String(error || ""),
+      }),
+    };
+    // Resolve the exact bytes written first, but do not publish them to the
+    // Plan store until the quality gate below accepts the candidate. A disk
+    // write is not proof that a reviewable artifact exists.
+    const resolvedPlanArtifactUpdate = await resolvePlanArtifactAfterToolSuccess(
       tc.name,
       resolvedArgs,
-      {
-        onPlanArtifactUpdated: callbacks.onPlanArtifactUpdated,
-        onPlanTasksUpdated: callbacks.onPlanTasksUpdated,
-      },
-      {
-        readFile: async (path) => {
-          const content = await executeTool("read_file", { path, __raw: true }, workspace, sessionKey, {
-            allowExternalLocalRead: options.allowExternalLocalRead === true,
-          });
-          return String(content ?? "");
-        },
-        warn: (message, error) => logAgentEvent("plan_artifact_sync_warn", {
-          message,
-          error: error instanceof Error ? error.message : String(error || ""),
-        }),
-      },
+      planArtifactSyncOptions,
     );
     rememberReadBeforeModifyEvidence(sessionKey, tc.name, resolvedArgs, {
       toolCallId: tc.id,
@@ -3997,11 +4075,13 @@ async function executeToolCallWithLifecycle(
     let finalPlanRecoveryAction: PlanArtifactRecoveryAction | undefined;
     let finalMissingPlanSections: string[] | undefined;
     let isInternalFeedback = false;
+    let planArtifactAccepted = true;
 
-    const path = typeof resolvedArgs.path === "string" ? resolvedArgs.path : "";
-    const kind = path ? detectPlanArtifactKind(path) : null;
-    if (kind && kind !== "tasks" && PLAN_ARTIFACT_MUTATION_TOOLS.has(tc.name)) {
-      const nextContent = typeof resolvedArgs.content === "string" ? resolvedArgs.content : "";
+    const path = resolvedPlanArtifactUpdate?.path || (typeof resolvedArgs.path === "string" ? resolvedArgs.path : "");
+    const kind = resolvedPlanArtifactUpdate?.kind || (path ? detectPlanArtifactKind(path) : null);
+    if (kind && kind !== "summary" && PLAN_ARTIFACT_MUTATION_TOOLS.has(tc.name)) {
+      const nextContent = resolvedPlanArtifactUpdate?.content ||
+        (typeof resolvedArgs.content === "string" ? resolvedArgs.content : "");
       const validation = kind === "plan"
         ? validateGroundedActionablePlanArtifact({
             content: nextContent,
@@ -4009,6 +4089,7 @@ async function executeToolCallWithLifecycle(
           })
         : validatePlanArtifactContent(nextContent, kind);
       if (!validation.ok) {
+        planArtifactAccepted = false;
         const qualityResult = kind === "plan"
           ? validation as PlanArtifactQualityResult
           : null;
@@ -4033,8 +4114,14 @@ async function executeToolCallWithLifecycle(
           recoveryAction,
           missingSections,
           canAutoRepair: qualityResult?.canAutoRepair ?? false,
+          storePublished: false,
           ...(decisionFork ? { decisionFork } : {}),
         });
+        callbacks.onPlanArtifactRejected?.(
+          path,
+          kind,
+          validation.reason || "quality_gate",
+        );
 
         const shouldUseInternalFeedback =
           kind === "plan" &&
@@ -4068,8 +4155,18 @@ async function executeToolCallWithLifecycle(
         finalQualityGateReason = validation.reason || "quality_gate";
         finalPlanRecoveryAction = recoveryAction;
         finalMissingPlanSections = missingSections;
-        isInternalFeedback = shouldUseInternalFeedback;
+        // A rejected artifact write is runtime control feedback in every
+        // workflow state. It may be visible to the model for recovery, but it
+        // must never count as user progress or successful execution evidence.
+        isInternalFeedback = true;
       }
+    }
+
+    if (resolvedPlanArtifactUpdate && planArtifactAccepted) {
+      commitResolvedPlanArtifactUpdate(
+        resolvedPlanArtifactUpdate,
+        planArtifactSyncCallbacks,
+      );
     }
 
     const completedDiffPreview =
@@ -4079,7 +4176,12 @@ async function executeToolCallWithLifecycle(
         before: mutationBeforeDiffSnapshot,
         after: mutationAfterDiffSnapshot,
       }) || diffPreview;
-    callbacks.onToolDone(tc.name, target, finalDisplayContent, { toolCallId: tc.id, diff: completedDiffPreview });
+    callbacks.onToolDone(tc.name, target, finalDisplayContent, {
+      toolCallId: tc.id,
+      diff: completedDiffPreview,
+      ...(isInternalFeedback ? { internalFeedback: true } : {}),
+      ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
+    });
     return {
       toolCallId: tc.id,
       name: tc.name,
@@ -4439,7 +4541,64 @@ export function buildPlanGateBlockedResult(
   };
 }
 
-async function buildPlanArtifactMutationValidationError(
+function buildPlanArtifactQualityPreflightRejection(input: {
+  tc: ToolCallToExecute;
+  target: string;
+  path: string;
+  kind: "plan" | "requirements" | "design" | "tasks" | "bugfix";
+  callbacks: OrchestratorCallbacks;
+  validation: {
+    ok: boolean;
+    reason?: string;
+    recoveryAction?: PlanArtifactRecoveryAction;
+    missingSections?: string[];
+  };
+}): ToolExecutionResult {
+  const { tc, target, path, kind, callbacks, validation } = input;
+  const language = callbacks.getPreferredLanguage();
+  const reason = validation.reason || "quality_gate";
+  const recoveryAction = validation.recoveryAction || "rewrite";
+  const missingSections = validation.missingSections || [];
+  const missingHint = missingSections.length > 0
+    ? ` missingSections=${missingSections.join(",")};`
+    : "";
+  const message = language === "zh"
+    ? `PLAN_ARTIFACT_QUALITY_REJECTED_BEFORE_WRITE: ${path} 未通过质量门（原因：${reason}；recovery=${recoveryAction};${missingHint}）。候选内容没有写入磁盘，原有文件、任务状态和审批身份保持不变。请根据反馈修正候选后重试；只有真实产品/范围/技术决策阻塞时才询问用户。`
+    : `PLAN_ARTIFACT_QUALITY_REJECTED_BEFORE_WRITE: ${path} failed the quality gate (${reason}; recovery=${recoveryAction};${missingHint}). The candidate was not written, so the existing file, task state, and approval identity remain unchanged. Correct the candidate and retry; ask the user only for a genuinely blocking product, scope, or technology decision.`;
+
+  callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+  callbacks.onToolDone(tc.name, target, message, {
+    toolCallId: tc.id,
+    internalFeedback: true,
+    qualityGateReason: reason,
+  });
+  logAgentEvent("plan_artifact_quality_rejected", {
+    path,
+    kind,
+    tool: tc.name,
+    reason,
+    recoveryAction,
+    missingSections,
+    canAutoRepair: false,
+    diskWritten: false,
+    storePublished: false,
+  });
+  return {
+    toolCallId: tc.id,
+    name: tc.name,
+    target,
+    content: message,
+    displayContent: message,
+    isError: false,
+    lifecycleState: "completed",
+    internalFeedback: true,
+    qualityGateReason: reason,
+    planRecoveryAction: recoveryAction,
+    ...(missingSections.length > 0 ? { missingPlanSections: missingSections } : {}),
+  };
+}
+
+export async function buildPlanArtifactMutationValidationError(
   tc: ToolCallToExecute,
   args: Record<string, unknown>,
   workspace: string,
@@ -4450,11 +4609,83 @@ async function buildPlanArtifactMutationValidationError(
     attemptedTargets?: string[];
   } = {},
 ): Promise<ToolExecutionResult | null> {
+  const protectedMutation = getProtectedPlanArtifactMutationViolation(
+    tc.name,
+    args,
+    callbacks.getPreferredLanguage(),
+  );
+  if (protectedMutation) {
+    callbacks.onToolExecuting(tc.name, protectedMutation.target, undefined, { toolCallId: tc.id });
+    callbacks.onToolDone(tc.name, protectedMutation.target, protectedMutation.message, {
+      toolCallId: tc.id,
+      internalFeedback: true,
+      qualityGateReason: protectedMutation.reason,
+    });
+    logAgentEvent("plan_artifact_protected_mutation_blocked", {
+      tool: tc.name,
+      target: protectedMutation.target,
+      reason: protectedMutation.reason,
+      diskWritten: false,
+      storePublished: false,
+    });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target: protectedMutation.target,
+      content: protectedMutation.message,
+      displayContent: protectedMutation.message,
+      isError: false,
+      lifecycleState: "completed",
+      internalFeedback: true,
+      qualityGateReason: protectedMutation.reason,
+      planRecoveryAction: "rewrite",
+    };
+  }
+  if (tc.name === "apply_patch") {
+    const parsed = parseApplyPatch(typeof args.patch === "string" ? args.patch : "");
+    if (!parsed.ok) return null;
+    const planTargets = parsed.operations.flatMap((operation) =>
+      [operation.path, operation.newPath || ""].filter((path) => {
+        const kind = path ? detectPlanArtifactKind(path) : null;
+        return !!kind && kind !== "summary";
+      })
+    );
+    if (planTargets.length === 0) return null;
+
+    const target = planTargets.join(", ");
+    const message = callbacks.getPreferredLanguage() === "zh"
+      ? `PLAN_ARTIFACT_PATCH_REQUIRES_SINGLE_FILE_MUTATION: apply_patch 不能修改 ${target}。计划产物必须使用 write_file 或 replace_in_file 单文件更新，以便 MAIN 在任何磁盘、Store、revision 或批准状态变化前计算并校验最终内容。本次补丁未执行；若补丁还包含源码修改，请拆分后重试。`
+      : `PLAN_ARTIFACT_PATCH_REQUIRES_SINGLE_FILE_MUTATION: apply_patch cannot modify ${target}. Plan artifacts must be updated with a single-file write_file or replace_in_file call so MAIN can compute and validate the final content before any disk, Store, revision, or approval-state mutation. This patch was not executed; split out any source changes and retry.`;
+    callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    callbacks.onToolDone(tc.name, target, message, {
+      toolCallId: tc.id,
+      internalFeedback: true,
+      qualityGateReason: "plan_artifact_patch_requires_single_file_mutation",
+    });
+    logAgentEvent("plan_artifact_patch_preflight_blocked", {
+      tool: tc.name,
+      paths: planTargets,
+      diskWritten: false,
+      storePublished: false,
+    });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: message,
+      displayContent: message,
+      isError: false,
+      lifecycleState: "completed",
+      internalFeedback: true,
+      qualityGateReason: "plan_artifact_patch_requires_single_file_mutation",
+      planRecoveryAction: "rewrite",
+    };
+  }
   if (tc.name !== "write_file" && tc.name !== "replace_in_file") return null;
 
   const path = typeof args.path === "string" ? args.path : "";
   const kind = path ? detectPlanArtifactKind(path) : null;
-  if (!kind) return null;
+  if (!kind || kind === "summary") return null;
 
   let nextContent: string | null = null;
   if (tc.name === "write_file") {
@@ -4474,13 +4705,27 @@ async function buildPlanArtifactMutationValidationError(
     }
   }
 
-  if (nextContent == null) return null;
+  if (nextContent == null) {
+    const target = getToolTarget(tc.name, args);
+    const message = callbacks.getPreferredLanguage() === "zh"
+      ? `PLAN_ARTIFACT_PREFLIGHT_UNAVAILABLE: 无法在写入前计算 ${path} 的最终内容，本次修改未执行。请重新读取精确文件内容后再提交局部替换。`
+      : `PLAN_ARTIFACT_PREFLIGHT_UNAVAILABLE: MAIN could not compute the final ${path} content before writing, so the mutation was not executed. Read the exact current content and retry the targeted replacement.`;
+    callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
+  }
 
   const language = callbacks.getPreferredLanguage();
   const target = getToolTarget(tc.name, args);
 
-  if (kind !== "tasks") {
-    let validation = kind === "plan"
+  let validation = kind === "plan"
       ? validateGroundedActionablePlanArtifact({
           content: nextContent,
           recentToolActivity: options.recentToolActivity,
@@ -4560,9 +4805,15 @@ async function buildPlanArtifactMutationValidationError(
         }
       }
     }
-    if (!validation.ok) {
-      return null;
-    }
+  if (!validation.ok) {
+    return buildPlanArtifactQualityPreflightRejection({
+      tc,
+      target,
+      path,
+      kind,
+      callbacks,
+      validation,
+    });
   }
 
   if (kind === "tasks") {
@@ -4613,6 +4864,23 @@ async function buildPlanArtifactMutationValidationError(
         };
       }
     }
+  }
+
+  if (tc.name === "replace_in_file") {
+    const originalToolName = tc.name;
+    tc.name = "write_file";
+    delete args.search_text;
+    delete args.replace_text;
+    args.path = path;
+    args.content = nextContent;
+    tc.arguments = JSON.stringify(args);
+    logAgentEvent("plan_artifact_replace_promoted_to_validated_write", {
+      path,
+      kind,
+      originalTool: originalToolName,
+      effectiveTool: tc.name,
+      contentChars: nextContent.length,
+    });
   }
 
   return null;

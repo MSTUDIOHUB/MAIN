@@ -110,7 +110,7 @@ function createSessionHarness() {
   };
 }
 
-test("submit streaming ui initializes stream handles and appends understanding progress", () => {
+test("submit streaming ui initializes stream handles without projecting synthetic understanding progress", () => {
   const context = baseContext();
   const harness = createSessionHarness();
   let nextId = 100;
@@ -132,14 +132,10 @@ test("submit streaming ui initializes stream handles and appends understanding p
 
   assert.equal(lease.thinkingInterceptor, context.thinkingInterceptor);
   assert.equal(lease.streamBuffer, context.streamBuffer);
-  assert.equal(context.understandingProgressBlockId, 100);
-  assert.equal(harness.state.taskFlow.length, 1);
-  assert.equal(harness.state.taskFlow[0].type, "progress");
-  assert.equal(harness.state.taskFlow[0].turnId, "turn-ui");
-  assert.equal(harness.state.taskFlow[0].why, "Fix the screenshot layout");
-  assert.deepEqual(harness.state.conversationTurns[0].blockIds, [100]);
-  assert.equal(harness.state.runtimeEvents.length, 1);
-  assert.equal(harness.state.runtimeEvents[0].dedupeKey, "understanding:turn-1");
+  assert.equal(context.understandingProgressBlockId, null);
+  assert.equal(harness.state.taskFlow.length, 0);
+  assert.deepEqual(harness.state.conversationTurns[0].blockIds, []);
+  assert.equal(harness.state.runtimeEvents.length, 0);
 });
 
 test("submit streaming ui keeps hidden resume invisible while initializing streams", () => {

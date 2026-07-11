@@ -1929,6 +1929,32 @@ test("validatePlanArtifactContent requires inferable task evidence", () => {
   assert.equal(validatePlanArtifactContent("- [ ] 调整 src/App.tsx 空状态", "tasks").ok, true);
   assert.equal(validatePlanArtifactContent("- [ ] 运行检查 — 证据: cmd:npx tsc --noEmit", "tasks").ok, true);
   assert.equal(validatePlanArtifactContent("- [ ] 修复组件状态 — 证据: file:src/App.tsx", "tasks").ok, true);
+  assert.equal(
+    validatePlanArtifactContent([
+      "- [ ] 修复组件状态 — 证据: file:src/App.tsx",
+      "- [ ] 更新其余未指定目标的逻辑",
+    ].join("\n"), "tasks").ok,
+    false,
+  );
+
+  const bugfixWithoutEvidence = [
+    "# Bugfix plan",
+    "",
+    "## Root cause",
+    "The runtime can publish a task checklist before its evidence contract is validated, which can split artifact and execution state.",
+    "",
+    "## Tasks",
+    "- [ ] Repair the runtime state transition",
+    "",
+    "## Validation",
+    "Run the focused state-machine regression tests after the mutation is accepted.",
+  ].join("\n");
+  const bugfixWithEvidence = bugfixWithoutEvidence.replace(
+    "- [ ] Repair the runtime state transition",
+    "- [ ] Repair the runtime state transition — Evidence: file:src/store/useAppStore.ts",
+  );
+  assert.equal(validatePlanArtifactContent(bugfixWithoutEvidence, "bugfix").ok, false);
+  assert.equal(validatePlanArtifactContent(bugfixWithEvidence, "bugfix").ok, true);
 });
 
 test("approved plan execution no-tool recovery bypasses generic missing-tool stop", () => {

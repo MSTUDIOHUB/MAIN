@@ -30,7 +30,7 @@ import type { FeishuRemoteContext } from "../remoteContextTypes";
 import type { StudioConfig as GameStudioConfig } from "../gameStudio/catalog";
 import { appendDebugLog } from "../debugLog";
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION, appendRuntimeEvent, withEventSchema } from "../turnEvents";
-import { type DurableTurnContext, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion } from "../workflowModels";
+import { type DurableTurnContext, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, canonicalizePlanArtifactPath, detectPlanArtifactKind } from "../workflowModels";
 import {
   buildPlanExecutionProgressUpdate,
   normalizePlanExecutionProgressSnapshot,
@@ -330,6 +330,10 @@ export class WorkflowEngine {
         ...(previous.goalSliceId ? { goalSliceId: previous.goalSliceId } : {}),
         source: previous.source,
       };
+      updateHarnessRunMarker({
+        activeRunId: nextRunId,
+        activeParentRunId: request.runId,
+      });
       appendWorkflowRuntimeEvent({
         type: "run.started",
         threadId: runSessionKey,
@@ -541,193 +545,9 @@ export class WorkflowEngine {
       }));
     };
 
-    let activePlanRuntimePhaseBlockId: number | null = null;
-
     const isUnapprovedPlanRuntime = () =>
       getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode === "plan" &&
       sessionGet().isPlanApproved !== true;
-
-    const progressPhaseForTurnRuntimePhase = (kind: string): "understanding" | "investigating" | "editing" | "verifying" | "summarizing" =>
-      kind === "scope" ? "understanding" :
-      kind === "context" ? "investigating" :
-      kind === "implementation" ? "editing" :
-      kind === "validation" ? "verifying" :
-      "summarizing";
-
-    const planRuntimeHeartbeatText = (marker: any, iteration: number) => {
-      const elapsedMs = Math.max(0, Number(marker.streamElapsedMs) || 0);
-      const elapsedSeconds = Math.max(0, Math.round(elapsedMs / 1000));
-      const chunkCount = Math.max(0, Number(marker.streamChunkCount) || 0);
-      if (marker.streamStatus === "stream_done") {
-        return phaseLanguage === "zh"
-          ? `第 ${Math.max(1, iteration)} 次计划生成已返回，MAIN 正在校验计划结构与可执行性。`
-          : `Plan attempt ${Math.max(1, iteration)} returned; MAIN is validating its structure and executability.`;
-      }
-      return phaseLanguage === "zh"
-        ? `第 ${Math.max(1, iteration)} 次计划生成已持续 ${elapsedSeconds} 秒，收到 ${chunkCount} 个流式分块；隐藏推理正文不会展示。`
-        : `Plan attempt ${Math.max(1, iteration)} has streamed for ${elapsedSeconds}s across ${chunkCount} chunks; hidden reasoning text is not displayed.`;
-    };
-
-    const emitPlanRuntimePhaseEvent = (block: any) => {
-      appendWorkflowRuntimeEvent({
-        type: "progress.updated",
-        threadId: runSessionKey,
-        turnId,
-        timestampMs: Date.now(),
-        progress: {
-          phase: block.phase,
-          title: block.title,
-          status: block.status,
-          summary: [block.why, block.action].filter(Boolean).join(" · "),
-          next: block.next,
-          dedupeKey: block.dedupeKey,
-          iteration: block.iteration,
-        },
-      });
-    };
-
-    const projectTurnRuntimePhase = (phase: {
-      id: string;
-      kind: "scope" | "context" | "diagnosis" | "implementation" | "validation";
-      title: string;
-      summary?: string;
-      domain?: string;
-      status?: "pending" | "running" | "done" | "failed";
-      reason?: string;
-      iteration?: number;
-      qualityRejectCount?: number;
-    }) => {
-      if (!isUnapprovedPlanRuntime() || phase.domain !== "plan_runtime") return;
-      const normalizedPhase = normalizeTurnRuntimePhase(phase, phaseLanguage);
-      if (!normalizedPhase) return;
-      const now = Date.now();
-      const blockStatus: "running" | "done" | "failed" = phase.status === "failed"
-        ? "failed"
-        : phase.status === "done"
-        ? "done"
-        : "running";
-      const iteration = Math.max(0, Number(phase.iteration) || 0);
-      const owner = activeRuntimeRunIdentity;
-
-      if (activePlanRuntimePhaseBlockId !== null) {
-        const previousId = activePlanRuntimePhaseBlockId;
-        sessionSet((state: any) => ({
-          taskFlow: state.taskFlow.map((block: any) =>
-            block.id === previousId && block.type === "progress"
-              ? {
-                  ...block,
-                  status: "done",
-                  updatedAt: now,
-                  turnPhase: block.turnPhase
-                    ? { ...block.turnPhase, status: "done" }
-                    : block.turnPhase,
-                }
-              : block
-          ),
-        }));
-      }
-
-      const blockId = sessionGet()._nextTaskId();
-      const block = {
-        id: blockId,
-        turnId,
-        type: "progress" as const,
-        phase: progressPhaseForTurnRuntimePhase(phase.kind),
-        title: phase.title,
-        why: phase.summary || "",
-        action: "",
-        evidence: "",
-        next: phaseLanguage === "zh"
-          ? "计划通过质量门后才会进入审核；当前不会请求执行批准。"
-          : "The plan enters review only after passing the quality gate; execution approval is not requested yet.",
-        targets: [],
-        status: blockStatus,
-        source: "runtime" as const,
-        hypothesisStatus: phase.status === "failed" ? "blocked" as const : "unverified" as const,
-        turnPhase: normalizedPhase,
-        runId: owner.runId,
-        parentRunId: owner.parentRunId,
-        dedupeKey: `plan-runtime:${owner.runId}:${phase.id}`,
-        phaseReason: String(phase.reason || ""),
-        iteration,
-        qualityRejectCount: Math.max(0, Number(phase.qualityRejectCount) || 0),
-        elapsedMs: 0,
-        createdAt: now,
-        updatedAt: now,
-      };
-      activePlanRuntimePhaseBlockId = blockStatus === "running" ? blockId : null;
-      appendTurnBlock(block);
-      emitPlanRuntimePhaseEvent(block);
-      if (blockStatus === "running") {
-        sessionSet((state: any) => ({
-          conversationTurns: state.conversationTurns.map((candidate: any) =>
-            candidate.id === turnId &&
-            candidate.status !== "awaiting_input" &&
-            candidate.status !== "awaiting_approval"
-              ? { ...candidate, status: "planning" }
-              : candidate
-          ),
-        }));
-      }
-    };
-
-    const emitPlanRuntimeStreamHeartbeat = (marker: any) => {
-      if (!isUnapprovedPlanRuntime() || activePlanRuntimePhaseBlockId === null) return;
-      if (!["stream_started", "first_chunk", "chunk_progress", "stream_done", "no_chunk_progress_warning"].includes(String(marker.streamStatus || ""))) {
-        return;
-      }
-      const blockId = activePlanRuntimePhaseBlockId;
-      const state = sessionGet();
-      const activeBlock = state.taskFlow.find((block: any) =>
-        block.id === blockId &&
-        block.type === "progress" &&
-        block.runId === activeRuntimeRunIdentity.runId &&
-        block.turnPhase?.domain === "plan_runtime"
-      );
-      if (!activeBlock) return;
-      const iteration = Math.max(0, Number(marker.iteration ?? activeBlock.iteration) || 0);
-      const elapsedMs = Math.max(0, Number(marker.streamElapsedMs) || 0);
-      const action = planRuntimeHeartbeatText(marker, iteration);
-      const updatedAt = Date.now();
-      const updatedBlock = {
-        ...activeBlock,
-        action,
-        iteration,
-        elapsedMs,
-        updatedAt,
-      };
-      sessionSet((current: any) => ({
-        taskFlow: current.taskFlow.map((block: any) =>
-          block.id === blockId ? updatedBlock : block
-        ),
-      }));
-      emitPlanRuntimePhaseEvent(updatedBlock);
-    };
-
-    const settlePlanRuntimePhase = (status: "done" | "failed", detail = "") => {
-      if (activePlanRuntimePhaseBlockId === null) return;
-      const blockId = activePlanRuntimePhaseBlockId;
-      activePlanRuntimePhaseBlockId = null;
-      const state = sessionGet();
-      const activeBlock = state.taskFlow.find((block: any) => block.id === blockId && block.type === "progress");
-      if (!activeBlock || activeBlock.runId !== activeRuntimeRunIdentity.runId) return;
-      const updatedBlock = {
-        ...activeBlock,
-        status,
-        action: detail || activeBlock.action,
-        hypothesisStatus: status === "failed" ? "blocked" : activeBlock.hypothesisStatus,
-        updatedAt: Date.now(),
-        turnPhase: activeBlock.turnPhase
-          ? { ...activeBlock.turnPhase, status }
-          : activeBlock.turnPhase,
-      };
-      sessionSet((current: any) => ({
-        taskFlow: current.taskFlow.map((block: any) =>
-          block.id === blockId ? updatedBlock : block
-        ),
-      }));
-      emitPlanRuntimePhaseEvent(updatedBlock);
-    };
 
     const emitLocalPlanExecutionProgress = (phase: "starting" | "running" | "completed" | "paused" | "error", update: any) => {
       const progressSnapshot = normalizePlanExecutionProgressSnapshot({
@@ -1154,7 +974,6 @@ export class WorkflowEngine {
         const markerPatch = patch as Partial<HarnessRunMarker> & Record<string, unknown>;
         updateHarnessRunMarker(markerPatch);
         emitPlanStreamHeartbeat(markerPatch);
-        emitPlanRuntimeStreamHeartbeat(markerPatch);
       },
       onDebugEvent: (event: any, data: any = {}) => {
         try {
@@ -1871,6 +1690,10 @@ export class WorkflowEngine {
       onToolExecuting: (toolName: string, target: string, diffPreview?: any, meta?: { toolCallId?: string }) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
         const executionId = lifecycleMeta.toolCallId || undefined;
+        const isInternalPlanArtifactMutation =
+          isUnapprovedPlanRuntime() &&
+          (toolName === "write_file" || toolName === "replace_in_file") &&
+          detectPlanArtifactKind(target) !== null;
         logStoreEvent("tool_start", {
           turnId,
           sessionKey: runSessionKey,
@@ -1934,7 +1757,10 @@ export class WorkflowEngine {
           status: "running",
           toolStatus: "running",
         });
-        emitProgressRuntimeEvent(progress, { dedupeKey: `tool:${executionId || `${toolName}:${target}`}:running` });
+        emitProgressRuntimeEvent({
+          ...progress,
+          ...(isInternalPlanArtifactMutation ? { audience: "internal" as const } : {}),
+        }, { dedupeKey: `tool:${executionId || `${toolName}:${target}`}:running` });
         sessionSet((s: any) => {
           const existingIndex = findCurrentToolLifecycleBlockIndex(
             s.taskFlow,
@@ -1945,6 +1771,7 @@ export class WorkflowEngine {
           );
           const updateToolBlock = (block: any) => attachRuntimePhase({
             ...block,
+            ...(isInternalPlanArtifactMutation ? { audience: "internal" } : {}),
             turnId: block.turnId || toolDisplayTurnId,
             type: "tool",
             toolName,
@@ -1988,10 +1815,52 @@ export class WorkflowEngine {
         });
       },
 
-      onToolDone: (toolName: string, target: string, result: string, meta?: { toolCallId?: string; diff?: any }) => {
+      onToolDone: (
+        toolName: string,
+        target: string,
+        result: string,
+        meta?: {
+          toolCallId?: string;
+          diff?: any;
+          internalFeedback?: boolean;
+          qualityGateReason?: string | null;
+        },
+      ) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
         const executionId = lifecycleMeta.toolCallId || undefined;
         const resultText = String(result || "");
+        if (meta?.internalFeedback === true) {
+          logStoreEvent("tool_result_internal_feedback", {
+            turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+            toolName,
+            target,
+            executionId,
+            qualityGateReason: meta.qualityGateReason || null,
+            resultChars: resultText.length,
+          });
+          sessionSet((s: any) => {
+            const existingIndex = findCurrentToolLifecycleBlockIndex(
+              s.taskFlow,
+              toolName,
+              target,
+              ["pending", "running", "executed"],
+              lifecycleMeta,
+            );
+            if (existingIndex < 0) return {};
+            const blockId = s.taskFlow[existingIndex]?.id;
+            return {
+              taskFlow: s.taskFlow.filter((_: any, index: number) => index !== existingIndex),
+              conversationTurns: s.conversationTurns.map((turn: any) =>
+                blockId != null && turn.blockIds.includes(blockId)
+                  ? { ...turn, blockIds: turn.blockIds.filter((id: number) => id !== blockId) }
+                  : turn
+              ),
+            };
+          });
+          return;
+        }
         const completedDiff = shouldAttachToolDiffPreview(toolName, target, meta?.diff) ? meta?.diff : undefined;
         const noOp = isNoOpToolResult(resultText);
         const entry = createPlanExecutionEvidenceEntry({
@@ -2315,24 +2184,7 @@ export class WorkflowEngine {
         });
       },
 
-      onTurnRuntimePhaseChanged: (phase) => {
-        projectTurnRuntimePhase(phase);
-      },
-
       onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => {
-        if (status === "pending_review") {
-          settlePlanRuntimePhase(
-            "done",
-            phaseLanguage === "zh"
-              ? "计划已通过质量门，正在等待审核。"
-              : "The plan passed the quality gate and is awaiting review.",
-          );
-        } else if (status === "error") {
-          settlePlanRuntimePhase(
-            "failed",
-            phaseLanguage === "zh" ? "计划运行失败。" : "Plan runtime failed.",
-          );
-        }
         const latest = sessionGet();
         const planApprovalIdentity = status === "pending_review"
           ? buildPlanApprovalIdentity(latest.planArtifacts)
@@ -2401,10 +2253,6 @@ export class WorkflowEngine {
       },
 
       onError: (error: string) => {
-        settlePlanRuntimePhase(
-          "failed",
-          phaseLanguage === "zh" ? "计划运行失败。" : "Plan runtime failed.",
-        );
         sessionSet({ agentStatus: "error", isGenerating: false, abortController: null });
         appendTurnBlock({
           id: sessionGet()._nextTaskId(),
@@ -2415,9 +2263,6 @@ export class WorkflowEngine {
       },
 
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", progress?: Partial<PlanExecutionProgressUpdate>) => {
-        if (reason === "incomplete_plan") {
-          settlePlanRuntimePhase("failed", message);
-        }
         logStoreEvent("non_actionable_stop", {
           reason,
           recoveryReason: progress?.recoveryReason || null,
@@ -2518,6 +2363,100 @@ export class WorkflowEngine {
           previousIdentity.artifactHash !== nextIdentity.artifactHash
         ) {
           callbacks.onPlanApprovalInvalidated?.("approved_plan_artifact_revision_changed");
+        }
+      },
+
+      onPlanArtifactRejected: (path, kind, reason) => {
+        const canonicalPath = canonicalizePlanArtifactPath(path);
+        const liveBeforeRejection = sessionGet();
+        const rejectedApprovedArtifact = liveBeforeRejection.planArtifacts.find(
+          (artifact: any) => canonicalizePlanArtifactPath(artifact.path) === canonicalPath,
+        );
+        const pendingApprovedReviewOwnsPath =
+          liveBeforeRejection.activeActionRequest?.kind === "plan_review" &&
+          liveBeforeRejection.activeActionRequest.artifactPaths.some(
+            (artifactPath: string) => canonicalizePlanArtifactPath(artifactPath) === canonicalPath,
+          );
+        const invalidatesApprovedExecution =
+          liveBeforeRejection.isPlanApproved === true &&
+          (kind === "plan" || kind === "design" || kind === "bugfix") &&
+          (!!rejectedApprovedArtifact || pendingApprovedReviewOwnsPath);
+
+        sessionSet((state: any) => {
+          const rejectedArtifact = state.planArtifacts.find(
+            (artifact: any) => canonicalizePlanArtifactPath(artifact.path) === canonicalPath,
+          );
+          const pendingReviewOwnsPath =
+            state.activeActionRequest?.kind === "plan_review" &&
+            state.activeActionRequest.artifactPaths.some(
+              (artifactPath: string) => canonicalizePlanArtifactPath(artifactPath) === canonicalPath,
+            );
+          if (!rejectedArtifact && !pendingReviewOwnsPath) return {};
+
+          const nextArtifacts = state.planArtifacts.filter(
+            (artifact: any) => canonicalizePlanArtifactPath(artifact.path) !== canonicalPath,
+          );
+          const artifactKinds = new Set(nextArtifacts.map((artifact: any) => artifact.kind));
+          const preserveApprovedTasksExecutionStage =
+            kind === "tasks" &&
+            state.isPlanApproved === true &&
+            (state.planStage === "ready_to_execute" ||
+              state.planStage === "executing" ||
+              state.planStage === "completed");
+          const nextStage = preserveApprovedTasksExecutionStage
+            ? state.planStage
+            : artifactKinds.has("tasks")
+            ? (state.planTasks.length > 0 ? "ready_to_execute" : "tasks")
+            : artifactKinds.has("bugfix")
+            ? "bugfix"
+            : artifactKinds.has("plan")
+            ? "plan"
+            : artifactKinds.has("design")
+            ? "design"
+            : artifactKinds.has("requirements")
+            ? "requirements"
+            : "idle";
+          const invalidatesApproval =
+            state.isPlanApproved === true &&
+            (kind === "plan" || kind === "design" || kind === "bugfix");
+          logStoreEvent("plan_artifact_rejection_invalidated_state", {
+            path: canonicalPath,
+            reportedPath: path,
+            kind,
+            reason,
+            removedExistingArtifact: !!rejectedArtifact,
+            clearedPlanReviewRequest: pendingReviewOwnsPath,
+            invalidatedApproval: invalidatesApproval,
+            preservedApprovedTasksExecutionStage: preserveApprovedTasksExecutionStage,
+            nextStage,
+          });
+          return {
+            planArtifacts: nextArtifacts,
+            planStage: nextStage,
+            showPlanPanel: nextArtifacts.length > 0 && state.showPlanPanel,
+            ...(pendingReviewOwnsPath ? { activeActionRequest: null } : {}),
+            ...(invalidatesApproval
+              ? {
+                  isPlanApproved: false,
+                  planApprovalChoice: null,
+                  pendingPlanApprovalHandoff: null,
+                  planApprovalExecutionStartedForTurnId: null,
+                  planTasks: [],
+                  planExecutionEvidenceLedger: [],
+                  planExecutionEvidenceCount: 0,
+                  planExecutionProgressSnapshot: null,
+                }
+              : {}),
+          };
+        });
+
+        // A rejected rewrite of an already-approved artifact invalidates the
+        // active execution lease. Reuse the central invalidation boundary so
+        // the run is paused, the old approval is cleared, and any surviving
+        // reviewable revision receives a fresh identity before execution can
+        // continue in a child run.
+        if (invalidatesApprovedExecution) {
+          callbacks.onPlanApprovalInvalidated?.("approved_plan_artifact_quality_rejected");
         }
       },
 
@@ -2782,6 +2721,10 @@ export class WorkflowEngine {
               turnId,
               fallbackRunId: context.harnessRunId,
               goalSliceId: iterInput.goalSliceId,
+            });
+            updateHarnessRunMarker({
+              activeRunId: activeRuntimeRunIdentity.runId,
+              activeParentRunId: activeRuntimeRunIdentity.parentRunId,
             });
             let iterationMessages: import("../orchestrator").AgentMessage[] = [
               { role: "system", content: "" },

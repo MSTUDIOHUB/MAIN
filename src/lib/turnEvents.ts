@@ -44,6 +44,8 @@ export interface MainThreadProgressUpdate {
   dedupeKey?: string;
   repeatCount?: number;
   iteration?: number;
+  /** Internal diagnostics are persisted/logged but never projected as user work. */
+  audience?: "user" | "internal";
 }
 
 export interface MainThreadItem {

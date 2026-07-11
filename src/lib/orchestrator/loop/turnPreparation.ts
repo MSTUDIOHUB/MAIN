@@ -806,6 +806,7 @@ export function emitInitialTurnPreparationEvents(input: {
         phase: "understanding",
         title: language === "zh" ? "理解需求" : "Understanding request",
         status: "running",
+        audience: "internal",
         summary: hasImages
           ? language === "zh"
             ? "正在理解用户目标、截图内容和执行约束，随后再定向读取必要证据。"

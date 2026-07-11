@@ -1,5 +1,7 @@
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
 import {
+  canonicalizePlanArtifactPath,
+  detectPlanArtifactKind,
   extractPlanTasks,
   reconcilePlanTaskCompletion,
   validatePlanArtifactContent,
@@ -18,6 +20,8 @@ import {
   type LegacyWorkflowMode,
 } from "../lib/runIntent";
 import { normalizeApprovedPlanTaskStatuses } from "./submitApprovedPlanExecution";
+import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
+import { buildPlanReviewActionRequest, type ActionRequest } from "../lib/actionRequest";
 import {
   createSubmitSessionRuntimeFacade,
   type SubmitSessionPatch,
@@ -36,6 +40,7 @@ export interface SubmitSessionRuntimeControllerState<TRuntime extends object>
   planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
   planStage: PlanStage;
   isPlanApproved: boolean;
+  activeActionRequest?: ActionRequest | null;
   showPlanPanel: boolean;
   showDiff: boolean;
   showTerminal: boolean;
@@ -133,7 +138,17 @@ export function createSubmitSessionRuntimeController<
 
   const sessionUpsertPlanArtifact = (artifact: PlanArtifact) =>
     sessionSet((s) => {
+      const canonicalPath = canonicalizePlanArtifactPath(artifact.path);
       const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
+      if (!canonicalPath || detectPlanArtifactKind(canonicalPath) !== artifact.kind) {
+        input.logStoreEvent("plan_artifact_rejected_by_identity_gate", {
+          path: artifact.path,
+          canonicalPath,
+          kind: artifact.kind,
+        });
+        return {} as Partial<TState>;
+      }
+      const normalizedArtifact = { ...artifact, path: canonicalPath };
       const validation = validatePlanArtifactContent(sanitizedContent, artifact.kind);
       if (!validation.ok) {
         input.logStoreEvent("plan_artifact_rejected_by_quality_gate", {
@@ -146,11 +161,29 @@ export function createSubmitSessionRuntimeController<
       }
 
       const nextArtifacts = [...s.planArtifacts];
-      const existingIndex = nextArtifacts.findIndex((item) => item.path === artifact.path);
+      const currentMaxPlanRevision = s.planArtifacts.reduce(
+        (max, candidate) => Math.max(max, Number(candidate.revision) || 0),
+        0,
+      );
+      const existingIndex = nextArtifacts.findIndex(
+        (item) => canonicalizePlanArtifactPath(item.path) === canonicalPath,
+      );
       if (existingIndex >= 0) {
-        nextArtifacts[existingIndex] = { ...artifact, content: sanitizedContent };
+        const existingArtifact = nextArtifacts[existingIndex];
+        const contentChanged = existingArtifact.content !== sanitizedContent || existingArtifact.kind !== artifact.kind;
+        nextArtifacts[existingIndex] = {
+          ...normalizedArtifact,
+          content: sanitizedContent,
+          revision: contentChanged
+            ? Math.max(1, currentMaxPlanRevision + 1)
+            : Math.max(1, Number(existingArtifact.revision) || Number(artifact.revision) || 1),
+        };
       } else {
-        nextArtifacts.push({ ...artifact, content: sanitizedContent });
+        nextArtifacts.push({
+          ...normalizedArtifact,
+          content: sanitizedContent,
+          revision: Math.max(1, currentMaxPlanRevision + 1),
+        });
       }
 
       const parsedTasks = artifact.kind === "tasks" || artifact.kind === "bugfix"
@@ -171,6 +204,28 @@ export function createSubmitSessionRuntimeController<
             s.planExecutionEvidenceLedger,
             s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
           );
+      const nextApprovalIdentity = buildPlanApprovalIdentity(nextArtifacts);
+      const shouldRefreshPlanReviewRequest =
+        s.activeActionRequest?.kind === "plan_review" &&
+        !!nextApprovalIdentity &&
+        (
+          s.activeActionRequest.planRevision !== nextApprovalIdentity.revision ||
+          s.activeActionRequest.artifactHash !== nextApprovalIdentity.artifactHash
+        );
+      const nextPlanReviewRequest = shouldRefreshPlanReviewRequest &&
+        s.activeActionRequest?.kind === "plan_review" &&
+        nextApprovalIdentity
+        ? buildPlanReviewActionRequest({
+            sessionKey: s.activeActionRequest.sessionKey,
+            turnId: s.activeActionRequest.turnId,
+            runId: s.activeActionRequest.runId,
+            parentRunId: s.activeActionRequest.parentRunId,
+            title: s.activeActionRequest.title,
+            planRevision: nextApprovalIdentity.revision,
+            artifactHash: nextApprovalIdentity.artifactHash,
+            artifactPaths: nextApprovalIdentity.artifactPaths,
+          })
+        : s.activeActionRequest;
       return {
         planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
         planStage: input.derivePlanStageFromArtifacts(
@@ -180,6 +235,7 @@ export function createSubmitSessionRuntimeController<
           s.planStage,
         ),
         planTasks: normalizedTasks,
+        ...(shouldRefreshPlanReviewRequest ? { activeActionRequest: nextPlanReviewRequest } : {}),
         clearedPlanTurnId: null,
         showPlanPanel: true,
         rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" : "plan",

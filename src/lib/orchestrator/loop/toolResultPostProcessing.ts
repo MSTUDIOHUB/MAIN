@@ -116,6 +116,9 @@ export function handleToolResultPostProcessing(input: {
   let approvedPlanActionOnlyRecoveryActive = input.approvedPlanActionOnlyRecoveryActive;
   let approvedPlanNoToolRecoveryFileReadActive = input.approvedPlanNoToolRecoveryFileReadActive;
   let approvedPlanNoProgressRecoveryAttempts = input.approvedPlanNoProgressRecoveryAttempts;
+  // Internal quality-gate feedback is model/runtime control flow. It must not
+  // become user progress, execution evidence, task targeting or success usage.
+  const externalResults = results.filter((result) => !result.internalFeedback);
 
   const resultCountsAsExecutionEvidence = (result: ToolExecutionResult): boolean => {
     const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
@@ -123,7 +126,7 @@ export function handleToolResultPostProcessing(input: {
       isVerificationEvidenceResult(result);
   };
 
-  for (const result of results) {
+  for (const result of externalResults) {
     if (result.isError) continue;
     const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
     const countsAsExecutionEvidence = resultCountsAsExecutionEvidence(result);
@@ -162,7 +165,7 @@ export function handleToolResultPostProcessing(input: {
   }
 
   const unityConsoleResult = resolveUnityMcpForcedConsoleResult({
-    results,
+    results: externalResults,
     unityMcpForceConsoleFirstPending,
     unityConsoleMissingFirstToolRepromptIssued,
     language: callbacks.getPreferredLanguage(),
@@ -174,26 +177,25 @@ export function handleToolResultPostProcessing(input: {
   unityConsoleMissingFirstToolRepromptIssued = unityConsoleResult.unityConsoleMissingFirstToolRepromptIssued;
   const unityMcpFallbackPrompt = unityConsoleResult.prompt;
 
-  results.forEach((result) => rememberToolActivity(recentToolActivity, result));
+  externalResults.forEach((result) => rememberToolActivity(recentToolActivity, result));
   const remainingTaskText =
     callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task))?.text ?? null;
-  const externalResultsForDigest = results.filter((result) => !result.internalFeedback);
-  if (callbacks.onExecutionDigestUpdate && externalResultsForDigest.length > 0) {
+  if (callbacks.onExecutionDigestUpdate && externalResults.length > 0) {
     const digest = buildExecutionDigest({
       language: callbacks.getPreferredLanguage(),
       turnIntent,
-      toolResults: externalResultsForDigest,
+      toolResults: externalResults,
       remainingTask: remainingTaskText || undefined,
     });
     if (digest) callbacks.onExecutionDigestUpdate(digest);
   }
 
   if (workflowMode === "plan") {
-    results.forEach((result) => rememberToolActivity(recentPlanToolActivity, result));
+    externalResults.forEach((result) => rememberToolActivity(recentPlanToolActivity, result));
     if (
       !callbacks.getIsPlanApproved() &&
       planRuntimePhase === "drafting" &&
-      results.some((r) => r.name === "read_file" || r.name === "read_document" || r.name === "get_file_outline")
+      externalResults.some((r) => r.name === "read_file" || r.name === "read_document" || r.name === "get_file_outline")
     ) {
       planDraftingRecoveryReadCount += 1;
     }
@@ -202,11 +204,10 @@ export function handleToolResultPostProcessing(input: {
     workflowMode === "plan" &&
     !callbacks.getIsPlanApproved() &&
     planRuntimePhase === "explore_structure" &&
-    results.some((result) => result.name === "get_project_skeleton" && !result.internalFeedback)
+    externalResults.some((result) => result.name === "get_project_skeleton")
   ) {
-    const structureSucceeded = results.some((result) =>
+    const structureSucceeded = externalResults.some((result) =>
       result.name === "get_project_skeleton" &&
-      !result.internalFeedback &&
       !result.isError
     );
     if (structureSucceeded) {
@@ -217,15 +218,15 @@ export function handleToolResultPostProcessing(input: {
     }
   }
 
-  const failedEvidenceResults = results.filter((result) => !result.internalFeedback && result.isError);
+  const failedEvidenceResults = externalResults.filter((result) => result.isError);
   const firstFailedEvidenceResult = failedEvidenceResults[0];
   const firstFailedEvidenceLifecycleState = firstFailedEvidenceResult
     ? inferLifecycleStateFromToolResult(firstFailedEvidenceResult)
     : null;
-  const successfulResultCount = results.filter((result) => !result.isError).length;
+  const successfulResultCount = externalResults.filter((result) => !result.isError).length;
   emitTaskOrchestratorPhase("EVIDENCE_RECONCILE", {
     iteration,
-    results: results.length,
+    results: externalResults.length,
     successfulResults: successfulResultCount,
     failedResults: failedEvidenceResults.length,
     firstFailureReason: firstFailedEvidenceResult
@@ -242,19 +243,20 @@ export function handleToolResultPostProcessing(input: {
   logAgentEvent("post_tool_result_continuation", {
     stage: "after_evidence_reconcile",
     iteration,
-    results: results.length,
+    results: externalResults.length,
     successfulResults: successfulResultCount,
-    editResults: results.filter((result) => !result.isError && EDIT_PROGRESS_TOOL_NAMES.has(result.name)).length,
-    verificationResults: results.filter(isVerificationEvidenceResult).length,
+    internalFeedbackResults: results.length - externalResults.length,
+    editResults: externalResults.filter((result) => !result.isError && EDIT_PROGRESS_TOOL_NAMES.has(result.name)).length,
+    verificationResults: externalResults.filter(isVerificationEvidenceResult).length,
     runtimeIntent,
     workflowMode,
     planApproved: callbacks.getIsPlanApproved(),
   });
 
-  const successfulReadOnlyExplorationResultCount = results.filter((result) =>
+  const successfulReadOnlyExplorationResultCount = externalResults.filter((result) =>
     !result.isError && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
   ).length;
-  const nonReadOnlySuccessfulResultCount = results.filter((result) =>
+  const nonReadOnlySuccessfulResultCount = externalResults.filter((result) =>
     resultCountsAsExecutionEvidence(result) &&
     !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
   ).length;
@@ -262,7 +264,7 @@ export function handleToolResultPostProcessing(input: {
     workflowMode === "plan" &&
     callbacks.getIsPlanApproved() &&
     approvedPlanNoToolRecoveryFileReadActive &&
-    results.some((result) => result.name === "read_file")
+    externalResults.some((result) => result.name === "read_file")
   ) {
     approvedPlanNoToolRecoveryFileReadActive = false;
   }
@@ -272,7 +274,7 @@ export function handleToolResultPostProcessing(input: {
     approvedPlanNoProgressRecoveryAttempts = 0;
   }
   if (workflowMode === "edit" && nonReadOnlySuccessfulResultCount > 0) {
-    const firstSuccessTarget = results.find(
+    const firstSuccessTarget = externalResults.find(
       (result) => resultCountsAsExecutionEvidence(result) &&
         !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
     )?.target;
@@ -298,7 +300,7 @@ export function handleToolResultPostProcessing(input: {
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
       hasPlanDecisionOutput,
-      resultCount: results.length,
+      resultCount: externalResults.length,
       successfulReadOnlyResultCount: successfulReadOnlyExplorationResultCount,
       nonReadOnlySuccessfulResultCount,
     }),

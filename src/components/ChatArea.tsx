@@ -93,7 +93,6 @@ import {
   shouldRenderPermissionCapsule,
 } from "../lib/actionRequest";
 import {
-  buildPlanDraftRuntimeCapsuleProjection,
   buildPlanExecutionCapsuleProjection,
   buildTurnPresentationModel,
   isPlanReviewCapsulePresentationEligible,
@@ -102,6 +101,7 @@ import {
 import { extractPlanDraftPreview, extractStructuredPlanProposal } from "../lib/planProposal";
 import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
+import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -2673,6 +2673,7 @@ export default function ChatArea({
     const next = new Map<string, any[]>();
     const legacyBlocks: any[] = [];
     for (const block of taskFlow) {
+      if (block?.audience === "internal") continue;
       const turnId = block?.turnId;
       if (!turnId) {
         legacyBlocks.push(block);
@@ -2778,6 +2779,7 @@ export default function ChatArea({
     () => buildPlanApprovalIdentity(planArtifacts),
     [planArtifacts],
   );
+  const harnessActionRunId = getHarnessActionRunId(harnessRunMarker);
   const planReviewOwnerTurn = activeActionRequest?.kind === "plan_review"
     ? conversationTurns.find((turn) => turn.id === activeActionRequest.turnId) || null
     : null;
@@ -2795,7 +2797,7 @@ export default function ChatArea({
       markerStatus: harnessRunMarker?.status,
       markerSessionKey: harnessRunMarker?.sessionKey,
       markerTurnId: harnessRunMarker?.turnId,
-      markerRunId: harnessRunMarker?.runId,
+      markerRunId: harnessActionRunId,
       expectedSessionKey: activeSessionKey,
       expectedTurnId: currentTurnId,
       currentPlanRevision: currentPlanApprovalIdentity?.revision,
@@ -2803,11 +2805,50 @@ export default function ChatArea({
     })
       ? activeActionRequest
       : null;
+  const userChoiceActionRequest =
+    activeActionRequest?.kind === "user_choice" &&
+    activeActionRequest.status === "pending" &&
+    !!activeSessionKey &&
+    activeActionRequest.sessionKey === activeSessionKey &&
+    activeActionRequest.turnId === currentTurnId &&
+    harnessRunMarker?.status === "paused" &&
+    harnessRunMarker.sessionKey === activeActionRequest.sessionKey &&
+    harnessRunMarker.turnId === activeActionRequest.turnId &&
+    harnessActionRunId === activeActionRequest.runId
+      ? activeActionRequest
+      : null;
+  const userChoiceOwnerTurn = userChoiceActionRequest
+    ? conversationTurns.find((turn) => turn.id === userChoiceActionRequest.turnId) || null
+    : null;
+  const userChoiceOwnerBlocks = userChoiceActionRequest
+    ? blocksByTurnId.byTurnId.get(userChoiceActionRequest.turnId) || EMPTY_CHAT_BLOCKS
+    : EMPTY_CHAT_BLOCKS;
+  const userChoiceAgentBlock = userChoiceActionRequest
+    ? [...userChoiceOwnerBlocks].reverse().find((block) =>
+        block.type === "agent" &&
+        block.choiceRequest?.requestId === userChoiceActionRequest.requestId &&
+        Array.isArray(block.options)
+      ) || null
+    : null;
+  const userChoiceReplyOptions = userChoiceActionRequest
+    ? (() => {
+        const blockOptions = Array.isArray(userChoiceAgentBlock?.options)
+          ? userChoiceAgentBlock.options
+          : [];
+        const expectedValues = new Set(userChoiceActionRequest.optionValues.map((value) => String(value).trim()));
+        const exactOptions = blockOptions.filter((option) =>
+          expectedValues.has(String(option?.value || option?.label || "").trim())
+        );
+        return exactOptions.length === userChoiceActionRequest.optionValues.length
+          ? exactOptions
+          : userChoiceActionRequest.optionValues.map((value) => ({ label: value, value }));
+      })()
+    : [];
   useEffect(() => {
-    if (!planReviewActionRequest) return;
+    if (!planReviewActionRequest && !userChoiceActionRequest) return;
     setIsCapsuleCollapsed(false);
     setCapsulePopover(null);
-  }, [planReviewActionRequest?.requestId]);
+  }, [planReviewActionRequest?.requestId, userChoiceActionRequest?.requestId]);
   const capsuleControlTurnVisibleStatus = useMemo(() => {
     if (!capsuleControlTurn) return null;
 
@@ -2887,21 +2928,6 @@ export default function ChatArea({
   const capsuleTurnBlocks = capsuleTurn
     ? blocksByTurnId.byTurnId.get(capsuleTurn.id) || EMPTY_CHAT_BLOCKS
     : EMPTY_CHAT_BLOCKS;
-  const capsulePlanDraftRuntimeProjection = useMemo(
-    () => buildPlanDraftRuntimeCapsuleProjection({
-      blocks: capsuleTurnBlocks,
-      expectedTurnId: capsuleTurn?.id,
-      expectedRunId:
-        !isPlanApproved &&
-        harnessRunMarker?.status === "running" &&
-        harnessRunMarker.sessionKey === activeSessionKey &&
-        harnessRunMarker.turnId === capsuleTurn?.id
-          ? harnessRunMarker.runId
-          : null,
-      language,
-    }),
-    [activeSessionKey, capsuleTurn?.id, capsuleTurnBlocks, harnessRunMarker, isPlanApproved, language],
-  );
   const capsuleIsRunActive =
     !!capsuleTurn &&
     (
@@ -2997,9 +3023,6 @@ export default function ChatArea({
     if (planExecutionCapsuleProjection?.headline) {
       return normalizeCapsuleProgressText(planExecutionCapsuleProjection.headline);
     }
-    if (capsulePlanDraftRuntimeProjection?.headline) {
-      return normalizeCapsuleProgressText(capsulePlanDraftRuntimeProjection.headline);
-    }
     if (!capsuleIsRunActive || !capsuleTurn) return "";
     if (cachedCapsuleExplanation) return cachedCapsuleExplanation;
     if (activeTurnExplanation.text) return activeTurnExplanation.text;
@@ -3007,7 +3030,7 @@ export default function ChatArea({
     const progressText = normalizeCapsuleProgressText(capsuleProgressProjection.activityText);
     if (progressText) return progressText;
     return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought));
-  }, [planExecutionCapsuleProjection?.headline, capsulePlanDraftRuntimeProjection?.headline, capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
+  }, [planExecutionCapsuleProjection?.headline, capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
@@ -3050,7 +3073,7 @@ export default function ChatArea({
       ? harnessRunMarker.turnId
       : null,
     runId: harnessRunMarker?.status === "running" && harnessRunMarker.sessionKey === activeSessionKey
-      ? harnessRunMarker.runId
+      ? harnessActionRunId
       : null,
     requestId: permissionResolutionIdentity?.requestId,
     taskId: pendingReviewTaskId,
@@ -3755,7 +3778,14 @@ export default function ChatArea({
       ? latestTurnChoiceBlock.choiceRequest
       : undefined;
     const turnOptionValues = turnReplyOptions.map((option) => String(option.value || option.label || "").trim()).filter(Boolean);
+    // The global Capsule is owned by the one currently active ActionRequest.
+    // An older logical turn can still retain its own durable pending choice
+    // after an ordinary command starts a newer turn. That checkpoint is
+    // intentionally block-owned: the click path revalidates the complete
+    // serialized identity and refuses it while another runtime owner is busy.
     const inlineChoiceRequest = candidateChoiceRequest?.status === "pending" &&
+      !!candidateChoiceRequest.requestId &&
+      !!candidateChoiceRequest.runId &&
       candidateChoiceRequest.sessionKey === activeSessionKey &&
       candidateChoiceRequest.turnId === turn.id &&
       candidateChoiceRequest.optionValues.length === turnOptionValues.length &&
@@ -3765,7 +3795,8 @@ export default function ChatArea({
     const showInlineChoiceCheckpoint =
       (turn.status === "awaiting_input" || (turn.status === "awaiting_approval" && turnIntent !== "plan")) &&
       turnReplyOptions.length > 0 &&
-      !!inlineChoiceRequest;
+      !!inlineChoiceRequest &&
+      inlineChoiceRequest.requestId !== userChoiceActionRequest?.requestId;
     const inlineChoiceTitle = normalizeConversationDisplayTitle(
       !isGenericConversationTitle(turn.title) ? turn.title : turn.intentSummary || turn.userPrompt,
       language === "en" ? 52 : 42,
@@ -4052,7 +4083,7 @@ export default function ChatArea({
     harnessRunMarker?.status === "paused" &&
     harnessRunMarker.sessionKey === activeActionRequest.sessionKey &&
     harnessRunMarker.turnId === activeActionRequest.turnId &&
-    harnessRunMarker.runId === activeActionRequest.runId
+    harnessActionRunId === activeActionRequest.runId
     ? activeActionRequest
     : null;
   const goalActionRequest = goalBlockingActionRequest?.kind === "goal_confirmation" &&
@@ -4081,7 +4112,7 @@ export default function ChatArea({
         turnId: activeGoal.ownerTurnId || goalOwnerTurn?.id,
         runId: goalBlockingActionRequest?.runId || (
           harnessRunMarker?.turnId === (activeGoal.ownerTurnId || goalOwnerTurn?.id)
-            ? harnessRunMarker.runId
+            ? harnessActionRunId || undefined
             : undefined
         ),
         requestId: goalBlockingActionRequest?.requestId,
@@ -4095,6 +4126,53 @@ export default function ChatArea({
       themeMode={config.themeMode}
       onOpenPlan={() => openRightPanelTab("plan")}
       onApprove={() => approvePlan(undefined, planReviewActionRequest)}
+    />
+  ) : null;
+
+  const userChoiceCapsuleControls = userChoiceActionRequest && userChoiceOwnerTurn ? (
+    <ExecutionCapsule
+      isRunActive={false}
+      title={userChoiceActionRequest.title}
+      presentation={buildTurnPresentationModel({
+        turn: userChoiceOwnerTurn,
+        language,
+        statusOverride: "awaiting_input",
+        statusLabel: copy.turnStatusLabels.awaiting_input || (language === "zh" ? "待选择" : "Awaiting choice"),
+        kindOverride: "awaiting",
+        hasActionRequest: true,
+        actionKind: "user_choice",
+        turnId: userChoiceActionRequest.turnId,
+        runId: userChoiceActionRequest.runId,
+        requestId: userChoiceActionRequest.requestId,
+      })}
+      turnId={userChoiceActionRequest.turnId}
+      runId={userChoiceActionRequest.runId}
+      requestId={userChoiceActionRequest.requestId}
+      status={copy.turnStatusLabels.awaiting_input || (language === "zh" ? "待选择" : "Awaiting choice")}
+      statusToneClass={getTurnStatusTone("awaiting_input")}
+      language={language}
+      themeMode={config.themeMode}
+      chatFontSize={resolvedChatFontSize}
+      planTasks={[]}
+      planStage="idle"
+      executionSteps={[]}
+      progressMode="execution"
+      isAwaitingChoice
+      replyOptions={userChoiceReplyOptions}
+      allowCustomReply={userChoiceActionRequest.allowCustomReply}
+      pendingRunDecision={null}
+      canApprovePlan={false}
+      autoApproveTools={autoApproveTools}
+      onSelectReplyOption={(option) => onQuickReply?.(option, userChoiceActionRequest.turnId, userChoiceActionRequest)}
+      onRequestPlanAdjustment={(text) => onQuickReply?.(
+        { label: text, value: text, action: "adjust_plan", source: "custom_reply" },
+        userChoiceActionRequest.turnId,
+        userChoiceActionRequest,
+      )}
+      onCancelTurn={userChoiceActionRequest.turnId === currentTurnId ? onStopGeneration : undefined}
+      onApprovePlan={approvePlan}
+      onRejectPlan={rejectPlan}
+      onOpenDiff={() => openRightPanelTab("diff")}
     />
   ) : null;
 
@@ -4172,7 +4250,7 @@ export default function ChatArea({
     hasCapsuleFlow ||
     hasExecutionCapsuleControls ||
     !!planReviewCapsuleControls ||
-    !!capsulePlanDraftRuntimeProjection ||
+    !!userChoiceCapsuleControls ||
     !!planExecutionCapsuleProjection ||
     !!activeGoal;
 
@@ -4736,25 +4814,24 @@ export default function ChatArea({
             const isRich = hasCapsuleFlow && (persistedExplanation.includes("#") || persistedExplanation.includes("\n"));
             const headerLabel = planReviewActionRequest
               ? planReviewActionRequest.title
+              : userChoiceActionRequest
+              ? userChoiceActionRequest.title
               : planExecutionCapsuleProjection?.headline
               ? planExecutionCapsuleProjection.headline
-              : capsulePlanDraftRuntimeProjection?.headline
-              ? capsulePlanDraftRuntimeProjection.headline
               : hasCapsuleFlow
               ? isRich
                 ? (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")
                 : renderCompactMarkdownText(persistedExplanation)
               : "MAIN";
-            const hasTypedCapsuleControls = hasExecutionCapsuleControls || !!planReviewCapsuleControls;
+            const hasTypedCapsuleControls = hasExecutionCapsuleControls || !!planReviewCapsuleControls || !!userChoiceCapsuleControls;
             return (
               <div
                 data-testid="agent-explanation-capsule"
-                data-action-kind={planReviewActionRequest?.kind || permissionActionRequest?.kind || undefined}
-                data-session-key={planReviewActionRequest?.sessionKey || permissionActionRequest?.sessionKey || undefined}
-                data-turn-id={planReviewActionRequest?.turnId || permissionActionRequest?.turnId || capsulePlanDraftRuntimeProjection?.turnId || undefined}
-                data-run-id={planReviewActionRequest?.runId || permissionActionRequest?.runId || capsulePlanDraftRuntimeProjection?.runId || undefined}
-                data-request-id={planReviewActionRequest?.requestId || permissionActionRequest?.requestId || undefined}
-                data-plan-runtime-phase={capsulePlanDraftRuntimeProjection?.phaseId || undefined}
+                data-action-kind={planReviewActionRequest?.kind || userChoiceActionRequest?.kind || permissionActionRequest?.kind || undefined}
+                data-session-key={planReviewActionRequest?.sessionKey || userChoiceActionRequest?.sessionKey || permissionActionRequest?.sessionKey || undefined}
+                data-turn-id={planReviewActionRequest?.turnId || userChoiceActionRequest?.turnId || permissionActionRequest?.turnId || undefined}
+                data-run-id={planReviewActionRequest?.runId || userChoiceActionRequest?.runId || permissionActionRequest?.runId || undefined}
+                data-request-id={planReviewActionRequest?.requestId || userChoiceActionRequest?.requestId || permissionActionRequest?.requestId || undefined}
                 data-plan-revision={planReviewActionRequest ? String(planReviewActionRequest.planRevision) : undefined}
                 data-artifact-hash={planReviewActionRequest?.artifactHash || undefined}
                 className={`agent-explanation-capsule ${isCapsuleCollapsed ? "collapsed-ring cursor-pointer" : `w-full max-w-3xl flex flex-col !items-start !justify-start !rounded-2xl ${hasTypedCapsuleControls ? "!p-4" : "!p-5"}`}`}
@@ -4840,7 +4917,7 @@ export default function ChatArea({
                           </button>
                         )}
 
-                        {!planReviewActionRequest && (
+                        {!planReviewActionRequest && !userChoiceActionRequest && (
                           <button
                             onClick={(e) => {
                               e.stopPropagation();
@@ -4864,7 +4941,15 @@ export default function ChatArea({
                         </div>
                       )}
 
-                      {planExecutionCapsuleProjection && !planReviewActionRequest && (
+                      {userChoiceCapsuleControls && (
+                        <div className={`w-full border-t pt-3 ${
+                          isLightThemeMode ? "border-[#e4e4e7]" : "border-[#27272a]/60"
+                        }`}>
+                          {userChoiceCapsuleControls}
+                        </div>
+                      )}
+
+                      {planExecutionCapsuleProjection && !planReviewActionRequest && !userChoiceActionRequest && (
                         <div
                           data-testid="plan-execution-runtime-progress"
                           data-phase={planExecutionCapsuleProjection.phase}
@@ -4898,49 +4983,6 @@ export default function ChatArea({
                               {[planExecutionCapsuleProjection.recoveryReason, ...planExecutionCapsuleProjection.repeatedTargets]
                                 .filter(Boolean)
                                 .join(" · ")}
-                            </div>
-                          )}
-                        </div>
-                      )}
-
-                      {capsulePlanDraftRuntimeProjection && !planReviewActionRequest && !planExecutionCapsuleProjection && (
-                        <div
-                          data-testid="plan-draft-runtime-progress"
-                          data-phase={capsulePlanDraftRuntimeProjection.phaseId}
-                          data-turn-id={capsulePlanDraftRuntimeProjection.turnId}
-                          data-run-id={capsulePlanDraftRuntimeProjection.runId}
-                          data-iteration={String(capsulePlanDraftRuntimeProjection.iteration)}
-                          data-elapsed-ms={String(capsulePlanDraftRuntimeProjection.elapsedMs)}
-                          className={`w-full rounded-xl border px-3 py-2.5 text-[11px] leading-5 ${
-                            isLightThemeMode
-                              ? "border-[rgba(15,23,42,0.1)] bg-[rgba(248,250,252,0.82)] text-[#475569]"
-                              : isBlackThemeMode
-                              ? "border-[#202026] bg-[#030304] text-[#a1a1aa]"
-                              : "border-[#27272a] bg-[#09090b] text-[#a1a1aa]"
-                          }`}
-                        >
-                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                            <span className="theme-plan-pill rounded-full border px-2 py-0.5 text-[10px] font-semibold">
-                              {language === "zh"
-                                ? `计划阶段：${capsulePlanDraftRuntimeProjection.title}`
-                                : `Plan phase: ${capsulePlanDraftRuntimeProjection.title}`}
-                            </span>
-                            {capsulePlanDraftRuntimeProjection.qualityRejectCount > 0 && (
-                              <span data-testid="plan-draft-runtime-reject-count">
-                                {language === "zh"
-                                  ? `已恢复 ${capsulePlanDraftRuntimeProjection.qualityRejectCount} 次`
-                                  : `${capsulePlanDraftRuntimeProjection.qualityRejectCount} recovery attempt(s)`}
-                              </span>
-                            )}
-                          </div>
-                          {(capsulePlanDraftRuntimeProjection.summary || capsulePlanDraftRuntimeProjection.reason) && (
-                            <div data-testid="plan-draft-runtime-reason" className="mt-1 break-words text-[#fbbf24]">
-                              {capsulePlanDraftRuntimeProjection.summary || capsulePlanDraftRuntimeProjection.reason}
-                            </div>
-                          )}
-                          {capsulePlanDraftRuntimeProjection.heartbeat && (
-                            <div data-testid="plan-draft-runtime-heartbeat" className="mt-1 break-words">
-                              {capsulePlanDraftRuntimeProjection.heartbeat}
                             </div>
                           )}
                         </div>

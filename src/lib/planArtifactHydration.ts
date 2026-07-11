@@ -3,6 +3,7 @@ import {
   detectPlanArtifactKind,
   extractPlanTasks,
   getPlanArtifactTitle,
+  validateActionablePlanArtifact,
   validatePlanArtifactContent,
   type PlanArtifact,
   type PlanArtifactKind,
@@ -68,7 +69,9 @@ export async function hydratePlanArtifactsFromReader(
     const content = sanitizePlanArtifactContent(raw);
     if (!content.trim()) continue;
 
-    const validation = validatePlanArtifactContent(content, kind);
+    const validation = kind === "plan"
+      ? validateActionablePlanArtifact(content)
+      : validatePlanArtifactContent(content, kind);
     if (!validation.ok) continue;
 
     artifacts.push({

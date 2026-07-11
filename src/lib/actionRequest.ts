@@ -101,6 +101,7 @@ export function isCurrentGoalControlResolution(input: {
     sessionKey?: string | null;
     turnId?: string | null;
     runId?: string | null;
+    activeRunId?: string | null;
   } | null;
 }): boolean {
   const identity = input.identity;
@@ -123,7 +124,7 @@ export function isCurrentGoalControlResolution(input: {
     input.runOwner?.status === "paused" &&
     input.runOwner.sessionKey === confirmation.sessionKey &&
     input.runOwner.turnId === confirmation.turnId &&
-    input.runOwner.runId === confirmation.runId;
+    (input.runOwner.activeRunId || input.runOwner.runId) === confirmation.runId;
 }
 
 /** Pause and clear are administrative Goal controls rather than resolutions of

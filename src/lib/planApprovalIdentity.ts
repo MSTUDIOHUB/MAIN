@@ -1,4 +1,7 @@
-import type { PlanArtifact } from "./workflowModels";
+import {
+  canonicalizePlanArtifactPath,
+  type PlanArtifact,
+} from "./workflowModels";
 
 // tasks.md is an execution/checkpoint artifact created after approval. Binding
 // it into the reviewed design hash would invalidate a valid approval whenever
@@ -24,6 +27,10 @@ function stableHash(input: string): string {
 export function getReviewablePlanArtifacts(artifacts: PlanArtifact[]): PlanArtifact[] {
   return (artifacts || [])
     .filter((artifact) => REVIEWABLE_KINDS.has(artifact.kind) && String(artifact.content || "").trim())
+    .map((artifact) => ({
+      ...artifact,
+      path: canonicalizePlanArtifactPath(artifact.path),
+    }))
     .slice()
     .sort((left, right) => left.path.localeCompare(right.path));
 }

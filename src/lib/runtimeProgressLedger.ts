@@ -1,4 +1,8 @@
 import type { MainThreadEvent, MainThreadProgressUpdate } from "./turnEvents";
+import {
+  isInternalRuntimeProgressBlock,
+  isInternalRuntimeProgressUpdate,
+} from "./runtimeProgressVisibility";
 
 export type RuntimeProgressLanguage = "zh" | "en";
 export type RuntimeProgressStatus = "running" | "done" | "failed" | "paused" | "completed";
@@ -23,6 +27,23 @@ export interface RuntimeProgressProjection {
   summary: string;
   activityText: string;
 }
+
+type RuntimeProgressAggregation = "snapshot" | "occurrence";
+
+type RuntimeProgressLedgerCandidate = Omit<
+  RuntimeProgressLedgerItem,
+  "repeatCount" | "cacheHits"
+> & {
+  repeatCount?: number;
+  cacheHits?: number;
+  aggregation?: RuntimeProgressAggregation;
+};
+
+type RuntimeProgressLedgerAccumulator = RuntimeProgressLedgerItem & {
+  occurrenceCount: number;
+  explicitRepeatCount: number;
+  aggregation: RuntimeProgressAggregation;
+};
 
 function compactLine(value: unknown, maxChars = 220): string {
   const text = String(value ?? "").replace(/\s+/g, " ").trim();
@@ -131,18 +152,26 @@ function keyForProgress(input: {
 }
 
 function addItem(
-  map: Map<string, RuntimeProgressLedgerItem>,
-  item: Omit<RuntimeProgressLedgerItem, "repeatCount" | "cacheHits"> & {
-    repeatCount?: number;
-    cacheHits?: number;
-  },
+  map: Map<string, RuntimeProgressLedgerAccumulator>,
+  item: RuntimeProgressLedgerCandidate,
 ): void {
+  const aggregation = item.aggregation === "occurrence" ? "occurrence" : "snapshot";
+  const explicitRepeatCount = Number.isFinite(Number(item.repeatCount))
+    ? Math.max(0, Number(item.repeatCount) || 0)
+    : 0;
+  const occurrenceIncrement = aggregation === "occurrence"
+    ? Math.max(1, explicitRepeatCount || 1)
+    : 0;
   const existing = map.get(item.key);
   if (!existing) {
+    const occurrenceCount = occurrenceIncrement;
     map.set(item.key, {
       ...item,
-      repeatCount: Math.max(1, item.repeatCount || 1),
+      aggregation,
+      repeatCount: Math.max(1, occurrenceCount, explicitRepeatCount),
       cacheHits: Math.max(0, item.cacheHits || 0),
+      occurrenceCount,
+      explicitRepeatCount,
     });
     return;
   }
@@ -161,8 +190,12 @@ function addItem(
     existing.tool = existing.tool || item.tool;
     existing.phase = existing.phase || item.phase;
   }
-  existing.repeatCount += Math.max(1, item.repeatCount || 1);
-  existing.cacheHits += Math.max(0, item.cacheHits || 0);
+  existing.occurrenceCount += occurrenceIncrement;
+  existing.explicitRepeatCount = Math.max(existing.explicitRepeatCount, explicitRepeatCount);
+  existing.repeatCount = Math.max(1, existing.occurrenceCount, existing.explicitRepeatCount);
+  existing.cacheHits = aggregation === "occurrence"
+    ? existing.cacheHits + Math.max(0, item.cacheHits || 0)
+    : Math.max(existing.cacheHits, Math.max(0, item.cacheHits || 0));
   existing.lastSeenAt = Math.max(existing.lastSeenAt, item.lastSeenAt);
 }
 
@@ -170,7 +203,8 @@ function itemFromProgressEvent(
   progress: MainThreadProgressUpdate,
   timestampMs: number,
   language: RuntimeProgressLanguage,
-): Omit<RuntimeProgressLedgerItem, "repeatCount" | "cacheHits"> & { repeatCount?: number; cacheHits?: number } | null {
+): RuntimeProgressLedgerCandidate | null {
+  if (isInternalRuntimeProgressUpdate(progress)) return null;
   const target = normalizeTarget(progress.target || "");
   const tool = String(progress.tool || "").trim();
   const status = normalizeStatus(progress.status);
@@ -190,15 +224,18 @@ function itemFromProgressEvent(
     tool,
     firstSeenAt: timestampMs,
     lastSeenAt: timestampMs,
-    repeatCount: Math.max(1, Number(progress.repeatCount) || 1),
+    ...(Number.isFinite(Number(progress.repeatCount)) && Number(progress.repeatCount) > 0
+      ? { repeatCount: Number(progress.repeatCount) }
+      : {}),
     cacheHits: isCachedText(summary) ? 1 : 0,
+    aggregation: "snapshot",
   };
 }
 
 function itemFromHarnessTelemetry(
   event: MainThreadEvent,
   language: RuntimeProgressLanguage,
-): Omit<RuntimeProgressLedgerItem, "repeatCount" | "cacheHits"> & { repeatCount?: number; cacheHits?: number } | null {
+): RuntimeProgressLedgerCandidate | null {
   if (event.type !== "harness.telemetry") return null;
   const name = String(event.telemetry?.name || "");
   if (name !== "no_chunk_progress_warning" && name !== "stream_error" && name !== "stream_cancelled") {
@@ -245,6 +282,7 @@ function itemFromHarnessTelemetry(
     tool: "",
     firstSeenAt: event.timestampMs,
     lastSeenAt: event.timestampMs,
+    aggregation: "snapshot",
   };
 }
 
@@ -252,7 +290,8 @@ function itemFromBlock(
   block: any,
   index: number,
   language: RuntimeProgressLanguage,
-): Omit<RuntimeProgressLedgerItem, "repeatCount" | "cacheHits"> & { repeatCount?: number; cacheHits?: number } | null {
+): RuntimeProgressLedgerCandidate | null {
+  if (isInternalRuntimeProgressBlock(block)) return null;
   const timestamp = Number(block?.createdAt || block?.updatedAt || index + 1);
   if (block?.type === "progress") {
     const target = normalizeTarget(block.target || block.targets?.[0] || "");
@@ -270,6 +309,7 @@ function itemFromBlock(
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
       cacheHits: isCachedText(summary) ? 1 : 0,
+      aggregation: "snapshot",
     };
   }
   if (block?.type === "tool") {
@@ -288,6 +328,7 @@ function itemFromBlock(
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
       cacheHits: isCachedText(text) ? 1 : 0,
+      aggregation: "occurrence",
     };
   }
   if (block?.type === "system" && /暂停|paused|missing_tool_loop|no progress|重复/i.test(String(block.content || ""))) {
@@ -302,6 +343,7 @@ function itemFromBlock(
       tool: "",
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
+      aggregation: "snapshot",
     };
   }
   return null;
@@ -315,7 +357,7 @@ export function buildRuntimeProgressLedger(input: {
   maxItems?: number;
 }): RuntimeProgressLedgerItem[] {
   const language = normalizeLanguage(input.language);
-  const byKey = new Map<string, RuntimeProgressLedgerItem>();
+  const byKey = new Map<string, RuntimeProgressLedgerAccumulator>();
   const turnId = String(input.turnId || "");
   (input.blocks || []).forEach((block, index) => {
     if (turnId && String(block?.turnId || "") && String(block.turnId) !== turnId) return;
@@ -352,7 +394,13 @@ export function buildRuntimeProgressLedger(input: {
     }
   }
   const items = [...byKey.values()]
-    .sort((a, b) => a.firstSeenAt - b.firstSeenAt);
+    .sort((a, b) => a.firstSeenAt - b.firstSeenAt)
+    .map(({
+      occurrenceCount: _occurrenceCount,
+      explicitRepeatCount: _explicitRepeatCount,
+      aggregation: _aggregation,
+      ...item
+    }) => item);
   const maxItems = Math.max(1, Number(input.maxItems) || 12);
   return items.length <= maxItems ? items : items.slice(items.length - maxItems);
 }

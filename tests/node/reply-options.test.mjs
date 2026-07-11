@@ -662,6 +662,42 @@ test("shouldRouteUnapprovedPlanReplyOptionsToArtifact suppresses duplicate appro
   );
 });
 
+test("shouldRouteUnapprovedPlanReplyOptionsToArtifact folds the latest model-self Plan branches back into the artifact", () => {
+  const extracted = extractReplyOptions([
+    "问题根因确认（8 条要点）：",
+    "修复范围明确：只需修改 3 个文件。",
+    "请选择下一步：",
+    "",
+    "<user_options>",
+    "<option>我需要先查看 main.js 中是否有 open-file 事件监听器，再决定方案</option>",
+    "<option>先修复 main.rs 中的 handle_open_url，再处理前端部分</option>",
+    "<option>我需要了解 Tauri 2 dialog 插件的正确导入方式后再执行</option>",
+    "</user_options>",
+  ].join("\n"));
+
+  assert.deepEqual(
+    extracted.replyOptions.map((option) => option.label),
+    [
+      "我需要先查看 main.js 中是否有 open-file 事件监听器，再决定方案",
+      "先修复 main.rs 中的 handle_open_url，再处理前端部分",
+      "我需要了解 Tauri 2 dialog 插件的正确导入方式后再执行",
+    ],
+  );
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions: extracted.replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasStructuredProposal: true,
+      hasReadyPlanArtifacts: false,
+      hasReviewablePlanArtifacts: true,
+      sawPlanModeToolActivity: true,
+      visibleText: extracted.cleanText,
+    }),
+    true,
+  );
+});
+
 test("shouldRouteUnapprovedPlanReplyOptionsToArtifact treats combined priority choices as plan content", () => {
   const visibleText = [
     "我已读取关键数据流和主题入口，下面给出实施方案预览。",
@@ -713,6 +749,22 @@ test("shouldRouteUnapprovedPlanReplyOptionsToArtifact keeps genuine blocking pla
 
   assert.equal(
     shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions: [
+        { label: "启动时默认显示空白页，由用户手动选择文件", value: "启动时默认显示空白页，由用户手动选择文件", source: "explicit_user_options" },
+        { label: "启动时自动恢复上次打开的 Markdown 文件", value: "启动时自动恢复上次打开的 Markdown 文件", source: "explicit_user_options" },
+      ],
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasStructuredProposal: true,
+      hasReviewablePlanArtifacts: true,
+      sawPlanModeToolActivity: true,
+      visibleText: "# Plan\n\n请选择启动时的默认用户体验：显示空白页，还是恢复上次文件？",
+    }),
+    false,
+  );
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
       replyOptions,
       workflowMode: "plan",
       isPlanApproved: false,
@@ -721,6 +773,48 @@ test("shouldRouteUnapprovedPlanReplyOptionsToArtifact keeps genuine blocking pla
     }),
     false,
   );
+
+  assert.equal(
+    shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+      replyOptions,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasStructuredProposal: true,
+      hasReadyPlanArtifacts: false,
+      hasReviewablePlanArtifacts: true,
+      sawPlanModeToolActivity: true,
+      visibleText: [
+        "# Plan",
+        "",
+        "Blocking decision: the startup UX choice still blocks a decision-complete plan.",
+        "The product direction changes user-visible behavior, so I need you to choose before I can finalize the plan.",
+      ].join("\n"),
+    }),
+    false,
+  );
+
+  for (const decision of [
+    {
+      visibleText: "# Plan\n\n请选择默认启动行为：",
+      options: ["开启", "关闭"],
+    },
+    {
+      visibleText: "# Plan\n\n请选择技术栈：React 还是 Vue？",
+      options: ["React", "Vue"],
+    },
+  ]) {
+    assert.equal(
+      shouldRouteUnapprovedPlanReplyOptionsToArtifact({
+        replyOptions: decision.options.map((value) => ({ label: value, value, source: "explicit_user_options" })),
+        workflowMode: "plan",
+        isPlanApproved: false,
+        hasStructuredProposal: true,
+        hasReviewablePlanArtifacts: true,
+        visibleText: decision.visibleText,
+      }),
+      false,
+    );
+  }
 });
 
 test("shouldPauseForReplyOptions lets unapproved plan tool calls run before proposal approval", () => {

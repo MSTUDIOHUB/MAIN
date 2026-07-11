@@ -3,7 +3,7 @@ import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import { getPlanArtifactTitle } from "./workflowModels";
 import { createGoalDefinition, createGoalProgress, type GoalStatus } from "./goalState";
 import { buildGoalRuntimeSnapshot } from "./goalRuntime";
-import { buildPlanReviewActionRequest } from "./actionRequest";
+import { buildPlanReviewActionRequest, buildUserChoiceActionRequest } from "./actionRequest";
 import { buildToolPermissionActionRequest } from "./pendingToolReview";
 import { buildPlanApprovalIdentity } from "./planApprovalIdentity";
 import type { HarnessRunMarker } from "./harnessCrashTelemetry";
@@ -156,6 +156,56 @@ function buildE2ERunningToolPermissionOwner(input: {
     updatedAt: now,
     closedAt: null,
     closeReason: null,
+  };
+}
+
+function buildE2EPausedActionOwner(input: {
+  workspace: string;
+  sessionId: number;
+  turnId: string;
+  runId: string;
+  workflowMode: string;
+  runtimeIntent: string;
+  planStage: string;
+  isPlanApproved: boolean;
+  closeReason: string;
+  parentRunId?: string | null;
+  now?: number;
+}): HarnessRunMarker {
+  const now = input.now ?? Date.now();
+  return {
+    schemaVersion: 1,
+    runId: input.runId,
+    activeRunId: input.runId,
+    activeParentRunId: input.parentRunId || null,
+    parentRunId: input.parentRunId || null,
+    instanceId: `e2e-paused-action-${input.sessionId}`,
+    sessionKey: `${input.workspace}:${input.sessionId}`,
+    workspace: input.workspace,
+    sessionId: input.sessionId,
+    turnId: input.turnId,
+    status: "paused",
+    workflowMode: input.workflowMode,
+    runtimeIntent: input.runtimeIntent,
+    planStage: input.planStage,
+    isPlanApproved: input.isPlanApproved,
+    iteration: 1,
+    maxIterations: 12,
+    messagesLen: 2,
+    toolCount: 0,
+    latestTool: null,
+    latestToolTarget: null,
+    activeStreamId: null,
+    streamStatus: "closed",
+    streamChunkCount: 0,
+    streamByteCount: 0,
+    streamElapsedMs: 0,
+    streamLifecycleStatus: "completed",
+    lastStreamError: null,
+    startedAt: now - 1_000,
+    updatedAt: now,
+    closedAt: now,
+    closeReason: input.closeReason,
   };
 }
 
@@ -646,6 +696,23 @@ function seedPlanQuickReplyApprovalScenario() {
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
+  const runId = "run-e2e-plan-quick-reply-approval";
+  const optionValues = [
+    "批准执行：先运行诊断脚本，再根据结果修复字体加载",
+    "继续调整方案，不进入执行",
+  ];
+  const choiceRequest = {
+    ...buildUserChoiceActionRequest({
+      sessionKey: `${workspace}:${sessionId}`,
+      turnId,
+      runId,
+      title: "计划 Quick Reply 审批",
+      optionValues,
+      allowCustomReply: true,
+      now,
+    }),
+    requestId: "request-e2e-plan-quick-reply-approval",
+  };
 
   useAppStore.setState((state) => ({
     ...state,
@@ -665,6 +732,19 @@ function seedPlanQuickReplyApprovalScenario() {
       }],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: buildE2EPausedActionOwner({
+      workspace,
+      sessionId,
+      turnId,
+      runId,
+      workflowMode: "plan",
+      runtimeIntent: "plan",
+      planStage: "design",
+      isPlanApproved: false,
+      closeReason: "awaiting_user_choice",
+      now,
+    }),
+    activeActionRequest: choiceRequest,
     taskFlow: [
       { id: userBlockId, turnId, type: "user", content: "请先规划字体修复流程，我确认后再执行。" },
       {
@@ -682,19 +762,7 @@ function seedPlanQuickReplyApprovalScenario() {
             value: "继续调整方案，不进入执行",
           },
         ],
-        choiceRequest: {
-          sessionKey: `${workspace}:${sessionId}`,
-          turnId,
-          runId: "run-e2e-plan-quick-reply-approval",
-          requestId: "request-e2e-plan-quick-reply-approval",
-          parentRunId: null,
-          optionValues: [
-            "批准执行：先运行诊断脚本，再根据结果修复字体加载",
-            "继续调整方案，不进入执行",
-          ],
-          allowCustomReply: true,
-          status: "pending",
-        },
+        choiceRequest,
         streaming: false,
       },
     ],
@@ -766,6 +834,23 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
+  const runId = `run-e2e-plan-quick-reply-materialize-${modelStyle}`;
+  const optionValues = [
+    "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
+    "继续调整上面的方案，暂不执行真实操作",
+  ];
+  const choiceRequest = {
+    ...buildUserChoiceActionRequest({
+      sessionKey: `${workspace}:${sessionId}`,
+      turnId,
+      runId,
+      title: `${modelStyle} 计划物化 Quick Reply`,
+      optionValues,
+      allowCustomReply: true,
+      now,
+    }),
+    requestId: `request-e2e-plan-quick-reply-materialize-${modelStyle}`,
+  };
   const agentContent = modelStyle === "gemma"
     ? [
         "## 修复方案",
@@ -836,6 +921,19 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
       }],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: buildE2EPausedActionOwner({
+      workspace,
+      sessionId,
+      turnId,
+      runId,
+      workflowMode: "plan",
+      runtimeIntent: "plan",
+      planStage: "idle",
+      isPlanApproved: false,
+      closeReason: "awaiting_user_choice",
+      now,
+    }),
+    activeActionRequest: choiceRequest,
     taskFlow: [
       { id: userBlockId, turnId, type: "user", content: `请用 ${modelStyle} 风格先规划，批准后再执行。` },
       {
@@ -857,19 +955,7 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
             source: "proposal_follow_up" as const,
           },
         ],
-        choiceRequest: {
-          sessionKey: `${workspace}:${sessionId}`,
-          turnId,
-          runId: `run-e2e-plan-quick-reply-materialize-${modelStyle}`,
-          requestId: `request-e2e-plan-quick-reply-materialize-${modelStyle}`,
-          parentRunId: null,
-          optionValues: [
-            "我批准按上面的方案开始真实操作，请复用上一轮方案，不要重新规划，直接执行并验证",
-            "继续调整上面的方案，暂不执行真实操作",
-          ],
-          allowCustomReply: true,
-          status: "pending",
-        },
+        choiceRequest,
         streaming: false,
       },
     ],
@@ -1093,6 +1179,20 @@ function seedAwaitingChoiceScenario() {
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
+  const workspace = "/tmp/e2e-awaiting-choice";
+  const runId = "run-e2e-awaiting-choice";
+  const request = {
+    ...buildUserChoiceActionRequest({
+      sessionKey: `${workspace}:${sessionId}`,
+      turnId,
+      runId,
+      title: "等待用户选择回归流",
+      optionValues: ["先修暂停等待选择，再补 UI 状态", "先补 UI 状态，再回头修暂停逻辑"],
+      allowCustomReply: true,
+      now,
+    }),
+    requestId: "request-e2e-awaiting-choice",
+  };
 
   useAppStore.setState((state) => ({
     ...state,
@@ -1101,7 +1201,7 @@ function seedAwaitingChoiceScenario() {
       language: "zh",
       workflowMode: "plan",
     },
-    currentWorkspace: "/tmp/e2e-awaiting-choice",
+    currentWorkspace: workspace,
     sessionsByWorkspace: {
       "/tmp/e2e-awaiting-choice": [
         {
@@ -1114,6 +1214,39 @@ function seedAwaitingChoiceScenario() {
       ],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: {
+      schemaVersion: 1,
+      runId,
+      parentRunId: null,
+      instanceId: "e2e-awaiting-choice-instance",
+      sessionKey: `${workspace}:${sessionId}`,
+      workspace,
+      sessionId,
+      turnId,
+      status: "paused",
+      workflowMode: "plan",
+      runtimeIntent: "plan",
+      planStage: "design",
+      isPlanApproved: false,
+      iteration: 2,
+      maxIterations: 12,
+      messagesLen: 3,
+      toolCount: 0,
+      latestTool: null,
+      latestToolTarget: null,
+      activeStreamId: null,
+      streamStatus: "closed",
+      streamChunkCount: 0,
+      streamByteCount: 0,
+      streamElapsedMs: 0,
+      streamLifecycleStatus: "completed",
+      lastStreamError: null,
+      startedAt: now - 1_000,
+      updatedAt: now,
+      closedAt: now,
+      closeReason: "awaiting_user_choice",
+    },
+    activeActionRequest: request,
     taskFlow: [
       { id: userBlockId, turnId, type: "user", content: "请继续做计划和工程实现。" },
       {
@@ -1126,16 +1259,7 @@ function seedAwaitingChoiceScenario() {
           { label: "先修暂停等待选择，再补 UI 状态", value: "先修暂停等待选择，再补 UI 状态" },
           { label: "先补 UI 状态，再回头修暂停逻辑", value: "先补 UI 状态，再回头修暂停逻辑" },
         ],
-        choiceRequest: {
-          sessionKey: `/tmp/e2e-awaiting-choice:${sessionId}`,
-          turnId,
-          runId: "run-e2e-awaiting-choice",
-          requestId: "request-e2e-awaiting-choice",
-          parentRunId: null,
-          optionValues: ["先修暂停等待选择，再补 UI 状态", "先补 UI 状态，再回头修暂停逻辑"],
-          allowCustomReply: true,
-          status: "pending",
-        },
+        choiceRequest: request,
       },
     ],
     conversationTurns: [
@@ -1213,6 +1337,29 @@ function seedAwaitingChoiceMixedOptionsScenario() {
   const now = Date.now();
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
+  const workspace = "/tmp/e2e-awaiting-choice-mixed-options";
+  const runId = "run-e2e-awaiting-choice-mixed";
+  const optionValues = [
+    "先确认代码主逻辑，再决定是否改动",
+    "我来确认类型，然后执行修复",
+    "继续调整上面的方案，暂不执行真实操作",
+    "取消上面的执行操作，本轮到此为止",
+    "先确认渲染层，再回头看业务逻辑",
+    "请继续当前只读读取。",
+    "本会话只读读取、搜索和分析步骤全部允许。",
+  ];
+  const choiceRequest = {
+    ...buildUserChoiceActionRequest({
+      sessionKey: `${workspace}:${sessionId}`,
+      turnId,
+      runId,
+      title: "混合选项分区",
+      optionValues,
+      allowCustomReply: true,
+      now,
+    }),
+    requestId: "request-e2e-awaiting-choice-mixed",
+  };
 
   useAppStore.setState((state) => ({
     ...state,
@@ -1221,9 +1368,9 @@ function seedAwaitingChoiceMixedOptionsScenario() {
       language: "zh",
       workflowMode: "plan",
     },
-    currentWorkspace: "/tmp/e2e-awaiting-choice-mixed-options",
+    currentWorkspace: workspace,
     sessionsByWorkspace: {
-      "/tmp/e2e-awaiting-choice-mixed-options": [
+      [workspace]: [
         {
           id: sessionId,
           title: "E2E Awaiting Choice Mixed",
@@ -1234,6 +1381,19 @@ function seedAwaitingChoiceMixedOptionsScenario() {
       ],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: buildE2EPausedActionOwner({
+      workspace,
+      sessionId,
+      turnId,
+      runId,
+      workflowMode: "plan",
+      runtimeIntent: "plan",
+      planStage: "design",
+      isPlanApproved: false,
+      closeReason: "awaiting_user_choice",
+      now,
+    }),
+    activeActionRequest: choiceRequest,
     taskFlow: [
       { id: userBlockId, turnId, type: "user", content: "请告诉我下一步该怎么处理。" },
       {
@@ -1251,24 +1411,7 @@ function seedAwaitingChoiceMixedOptionsScenario() {
           { label: "继续当前只读读取", value: "请继续当前只读读取。", action: "continue_readonly_once" },
           { label: "当前会话只读步骤全部批准", value: "本会话只读读取、搜索和分析步骤全部允许。", action: "allow_readonly_session" },
         ],
-        choiceRequest: {
-          sessionKey: `/tmp/e2e-awaiting-choice-mixed-options:${sessionId}`,
-          turnId,
-          runId: "run-e2e-awaiting-choice-mixed",
-          requestId: "request-e2e-awaiting-choice-mixed",
-          parentRunId: null,
-          optionValues: [
-            "先确认代码主逻辑，再决定是否改动",
-            "我来确认类型，然后执行修复",
-            "继续调整上面的方案，暂不执行真实操作",
-            "取消上面的执行操作，本轮到此为止",
-            "先确认渲染层，再回头看业务逻辑",
-            "请继续当前只读读取。",
-            "本会话只读读取、搜索和分析步骤全部允许。",
-          ],
-          allowCustomReply: true,
-          status: "pending",
-        },
+        choiceRequest,
       },
     ],
     conversationTurns: [
@@ -4544,6 +4687,35 @@ function seedExecutionCapsulePanelStabilityScenario() {
       };
     });
     appendBridgeEvent("tool_prompt_shown");
+  };
+
+  bridge.showChildRunToolApprovalPrompt = () => {
+    bridge.showToolApprovalPrompt?.();
+    useAppStore.setState((state) => {
+      const outerRunId = state.harnessRunMarker?.runId || "run-e2e-panel-tool-review";
+      const childRunId = `${outerRunId}-child`;
+      const request = state.activeActionRequest?.kind === "tool_permission"
+        ? state.activeActionRequest
+        : null;
+      return {
+        harnessRunMarker: state.harnessRunMarker
+          ? {
+              ...state.harnessRunMarker,
+              activeRunId: childRunId,
+              activeParentRunId: outerRunId,
+            }
+          : state.harnessRunMarker,
+        activeActionRequest: request
+          ? {
+              ...request,
+              runId: childRunId,
+              parentRunId: outerRunId,
+              requestId: `${request.requestId}-child`,
+            }
+          : null,
+      };
+    });
+    appendBridgeEvent("child_run_tool_prompt_shown");
   };
 
   bridge.setRunState = (stateName: "running" | "pending_review" | "idle") => {

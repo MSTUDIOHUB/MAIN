@@ -34,7 +34,10 @@ const PLAN_CONTINUATION_TECH_TARGET_RE = /(?:是否|能否|能不能|有没有|�
 const PLAN_CONTINUATION_DECISION_RE = /(?:方案|设计|需求|范围|风格|体验|取舍|批准|执行|修复|修改|实现|生成|创建|采用|选择|保留|跳过|提交|部署|开始执行|product|design|requirement|scope|tradeoff|approve|execute|implement|fix|modify|create|choose|adopt|deploy)/i;
 const OPTIONAL_PLAN_CONTEXT_OPTION_RE = /(?:提供|补充|告诉|输入|粘贴|发(?:给)?我|provide|share|tell|paste).{0,40}(?:关键)?(?:文件路径|路径|文件|组件名|组件|函数名|模块名|类名|symbol|path|file|component|function|module|class)/i;
 const PREMATURE_PLAN_ARTIFACT_TEXT_RE = /(?:#\s*Proposed Plan|Proposed Plan|核心问题诊断|根源分析|执行路线图|修复方案|实现方案|实施方案|重构方案|拟定方案|实施步骤|执行步骤|阶段\s*\d|影响文件|验证方式|Data Integrity|Dark Mode Refactor|Implementation Plan|Execution Plan|Root Cause|Validation)/i;
-const BLOCKING_PLAN_DECISION_TEXT_RE = /(?:真正阻塞|阻塞问题|必须(?:由)?用户(?:确认|选择|拍板)|需要用户(?:确认|选择|拍板)|缺少关键(?:业务|产品|设计|范围|验收)选择|请确认以下关键点|before (?:I|we) can (?:write|finalize|proceed)|blocking question|blocking decision|need you to choose|must choose)/i;
+const BLOCKING_PLAN_DECISION_TEXT_RE = /(?:真正阻塞|阻塞问题|必须(?:由)?用户(?:确认|选择|拍板)|需要用户(?:确认|选择|拍板)|缺少关键(?:业务|产品|设计|范围|验收)选择|请确认以下关键点|before (?:I|we) can (?:write|finalize|proceed)|blocking question|blocking decision|need you to choose|must choose|user[- ]visible.{0,80}(?:choice|decision).{0,80}(?:blocks?|required)|(?:choice|decision).{0,80}blocks?.{0,80}(?:plan|proposal|implementation))/i;
+const USER_OWNED_PLAN_DECISION_RE = /(?:用户(?:可见|体验)|启动(?:时|行为)|默认(?:行为|页面|策略|打开|显示)|产品(?:行为|方向)?|业务(?:规则|口径)|范围|功能边界|是否支持|平台选择|兼容(?:范围|策略)|隐私|权限策略|数据(?:保留|恢复|同步|存储)|自动恢复|手动选择|技术栈|框架选型|数据库选型|部署目标|优先级|优先推进|MVP|最小可运行|完整框架|主题风格|交互方式|default (?:behavior|page|experience|startup)|user experience|product behavior|business rule|scope|feature boundary|whether to support|platform choice|compatibility|privacy|data (?:retention|restore|sync|storage)|technology stack|framework choice|database choice|deployment target|priority|minimum viable product)/i;
+const INTERACTIVE_PLAN_DECISION_CUE_RE = /(?:请选择|请确认|请决定|请选|需要您选择|由您决定|还是|二选一|三选一|which|choose|select|pick|confirm|would you prefer|do you prefer)/i;
+const INTERNAL_PLAN_WORK_ORDER_OPTION_RE = /(?:我需要|让我|需要先|先|再|然后|随后|后再|了解|查看|检查|读取|搜索|定位|修复|修改|处理|执行|实现|验证|investigate|inspect|read|search|locate|fix|modify|handle|execute|implement|validate).{0,100}(?:源码|代码|文件|函数|事件|监听器|插件|前端|后端|模块|逻辑|接口|Tauri|dialog|src[\\/]|[A-Za-z0-9_.\-/\\]+\.[A-Za-z0-9]{1,12}|source|code|file|function|event|listener|plugin|frontend|backend|module|logic|interface)/i;
 const PLAN_ROUTE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|优先|同时|并行|全部|两个|两项|仅|只|先|直接|继续|开始|完整|最小|MVP|修复|修改|实现|重构|完善|执行|落地|proceed|continue|start|fix|modify|implement|refactor|execute|both|parallel|all|mvp)/i;
 const GENERIC_PROPOSAL_ADJUSTMENT_RE = /^(?:请)?(?:先|再|继续)?(?:调整|修改|完善|优化)(?:一下)?(?:上面|上述|当前|本轮)?(?:的)?(?:方案|计划)(?:，|,)?(?:(?:暂不|先不|不要)(?:开始)?(?:执行|真实操作)|不进入执行)?[。.!！]*$|^(?:keep|continue)?\s*(?:adjusting|refining|revising|improving|adjust|refine|revise|improve)\s+(?:the\s+)?(?:current\s+|above\s+|this\s+)?(?:plan|proposal)(?:\s+first|\s+without\s+executing)?[.!]*$/i;
 const GENERIC_PROPOSAL_CANCEL_RE = /^(?:请)?(?:取消|停止|结束|中止)(?:上面|上述|当前|本轮)?(?:的)?(?:执行)?(?:操作|方案|计划|执行)?(?:，|,)?(?:本轮)?(?:到此为止|结束)?[。.!！]*$|^(?:cancel|stop|end|abort)(?:\s+(?:the|this|current|above))?(?:\s+(?:operation|execution|plan|proposal|turn))?[.!]*$/i;
@@ -535,11 +538,46 @@ export function shouldRouteUnapprovedPlanReplyOptionsToArtifact(params: {
   // approve/adjust/cancel options must never create a second approval capsule,
   // including after a structured proposal has become reviewable.
   if (hasExecutableProposalReplyOptions(replyOptions)) return true;
-  if (hasStructuredProposal || hasReadyPlanArtifacts || hasReviewablePlanArtifacts) return false;
 
   const normalizedText = normalizeOptionText(visibleText);
-  if (!PREMATURE_PLAN_ARTIFACT_TEXT_RE.test(normalizedText)) return false;
+  // A real blocking product/design decision remains a user boundary. All
+  // other branches attached to a structured or persisted Plan are model work
+  // (read more, implement one part first, inspect a dependency) and must be
+  // folded back into the artifact instead of becoming a user_choice request.
   if (BLOCKING_PLAN_DECISION_TEXT_RE.test(normalizedText)) return false;
+  const userOwnedDecisionOptionCount = replyOptions.filter((option) => {
+    const optionText = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+    return USER_OWNED_PLAN_DECISION_RE.test(optionText);
+  }).length;
+  // Product/UX/scope words in the surrounding narrative are not sufficient:
+  // a sentence such as "修复范围明确" describes the plan, while the options
+  // may still be model-internal read/fix ordering. Require the alternatives
+  // themselves to encode the user-owned decision axis. An explicit blocking
+  // question remains covered by BLOCKING_PLAN_DECISION_TEXT_RE above.
+  if (
+    replyOptions.length >= 2 &&
+    userOwnedDecisionOptionCount >= Math.min(2, replyOptions.length)
+  ) {
+    return false;
+  }
+  const hasExplicitVisibleDecisionAxis =
+    USER_OWNED_PLAN_DECISION_RE.test(normalizedText) &&
+    INTERACTIVE_PLAN_DECISION_CUE_RE.test(normalizedText);
+  const optionsAreUserValuesRatherThanWorkOrder = replyOptions.every((option) => {
+    const optionText = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+    return !looksLikePlanContinuationReplyOption(option) &&
+      !INTERNAL_PLAN_WORK_ORDER_OPTION_RE.test(optionText);
+  });
+  if (
+    replyOptions.length >= 2 &&
+    replyOptions.length <= 4 &&
+    hasExplicitVisibleDecisionAxis &&
+    optionsAreUserValuesRatherThanWorkOrder
+  ) {
+    return false;
+  }
+  if (hasStructuredProposal || hasReadyPlanArtifacts || hasReviewablePlanArtifacts) return true;
+  if (!PREMATURE_PLAN_ARTIFACT_TEXT_RE.test(normalizedText)) return false;
 
   const actionableOptions = replyOptions.filter((option) => option.source !== "readonly_permission");
   if (actionableOptions.length === 0) return false;

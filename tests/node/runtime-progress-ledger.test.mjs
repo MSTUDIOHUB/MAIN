@@ -101,7 +101,7 @@ test("runtime progress ledger dedupes repeated read blocks and exposes cache reu
   assert.match(summarizeRuntimeProgressLedger(items, "zh"), /缓存复用/);
 });
 
-test("runtime progress ledger merges structured progress events with legacy blocks", () => {
+test("runtime progress ledger merges a progress snapshot with a tool occurrence without double-counting", () => {
   const event = withEventSchema({
     type: "progress.updated",
     threadId: "thread-a",
@@ -137,7 +137,7 @@ test("runtime progress ledger merges structured progress events with legacy bloc
   });
 
   assert.equal(items.length, 1);
-  assert.equal(items[0].repeatCount, 2);
+  assert.equal(items[0].repeatCount, 1);
   assert.equal(items[0].status, "running");
   assert.match(items[0].summary, /定位 CSV|找到导入入口/);
 });
@@ -179,9 +179,74 @@ test("runtime progress ledger exposes model stream idle warnings without duplica
   const items = buildRuntimeProgressLedger({ events, turnId: "turn-a", language: "zh" });
 
   assert.equal(items.length, 1);
-  assert.equal(items[0].repeatCount, 2);
+  assert.equal(items[0].repeatCount, 1);
   assert.match(items[0].title, /等待模型继续输出/);
   assert.match(items[0].summary, /90 秒/);
+});
+
+test("runtime progress ledger excludes internal Plan heartbeats and synthetic understanding snapshots", () => {
+  const planEvents = Array.from({ length: 25 }, (_, index) => withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    timestampMs: 10 + index,
+    progress: {
+      phase: "investigating",
+      title: "Exploring",
+      status: "running",
+      summary: `第 ${index + 1} 次内部计划心跳。`,
+      dedupeKey: "plan-runtime:run-plan:plan_context",
+    },
+  }));
+  const understandingEvent = withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    timestampMs: 40,
+    progress: {
+      phase: "understanding",
+      title: "理解需求",
+      status: "running",
+      summary: "仅供运行时诊断。",
+      audience: "internal",
+    },
+  });
+  const blocks = [
+    {
+      id: 1,
+      turnId: "turn-a",
+      type: "progress",
+      phase: "investigating",
+      title: "Exploring",
+      status: "running",
+      turnPhase: {
+        id: "plan_context",
+        kind: "context",
+        title: "Exploring",
+        domain: "plan_runtime",
+        status: "running",
+      },
+    },
+    {
+      id: 2,
+      turnId: "turn-a",
+      type: "progress",
+      phase: "understanding",
+      title: "理解需求",
+      status: "running",
+      audience: "internal",
+    },
+  ];
+
+  const items = buildRuntimeProgressLedger({
+    blocks,
+    events: [...planEvents, understandingEvent],
+    turnId: "turn-a",
+    language: "zh",
+  });
+
+  assert.deepEqual(items, []);
+  assert.equal(summarizeRuntimeProgressLedger(items, "zh"), "");
 });
 
 test("runtime progress projection keeps latest status and only recent four details", () => {
@@ -204,6 +269,8 @@ test("runtime progress projection keeps latest status and only recent four detai
   const items = buildRuntimeProgressLedger({ events, turnId: "turn-a", language: "zh", maxItems: 12 });
   const projection = buildRuntimeProgressProjection(items, "zh", 4);
 
+  assert.equal(items.length, 5);
+  assert.ok(items.every((item) => item.phase !== "understanding"));
   assert.equal(projection.latest.title, "读取目标 5");
   assert.equal(projection.latest.status, "running");
   assert.equal(projection.recent.length, 4);

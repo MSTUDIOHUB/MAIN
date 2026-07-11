@@ -167,6 +167,11 @@ export interface OrchestratorCallbacks {
     progress?: Partial<PlanExecutionProgressUpdate>,
   ) => void;
   onPlanArtifactUpdated: (path: string, content: string, kind: "plan" | "requirements" | "design" | "tasks" | "bugfix") => void;
+  onPlanArtifactRejected?: (
+    path: string,
+    kind: "plan" | "requirements" | "design" | "tasks" | "bugfix",
+    reason: string,
+  ) => void;
   onPlanStageChanged: (stage: "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => void;
   onPlanApprovalInvalidated?: (reason: string) => void;
   onPlanTasksUpdated: (content: string) => void;
@@ -232,7 +237,12 @@ export interface OrchestratorCallbacks {
     toolName: string,
     target: string,
     result: string,
-    meta?: { toolCallId?: string; diff?: ToolDiffPreview },
+    meta?: {
+      toolCallId?: string;
+      diff?: ToolDiffPreview;
+      internalFeedback?: boolean;
+      qualityGateReason?: string | null;
+    },
   ) => void;
   onToolError: (
     toolName: string,

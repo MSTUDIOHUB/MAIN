@@ -6,6 +6,7 @@ import {
   type ToolPresentationLanguage,
 } from "./toolPresentation";
 import type { ProgressNarrationPhase } from "./progressNarration";
+import { isInternalRuntimeProgressBlock } from "./runtimeProgressVisibility";
 import { normalizeTurnRuntimePhase, type TurnRuntimePhase } from "./turnPhase";
 import { deriveThoughtDisplay } from "./thoughtDisplay";
 
@@ -589,6 +590,20 @@ function getFirstPlanRuntimeArchivePhase(items: any[]): PlanRuntimeArchivePhase 
   return "";
 }
 
+function stripInternalPlanRuntimePresentation(block: any): any {
+  if (!block || block.type === "progress" || block.turnPhase?.domain !== "plan_runtime") {
+    return block;
+  }
+  const {
+    turnPhase: _turnPhase,
+    qualityGateReason: _qualityGateReason,
+    planRecoveryReason: _planRecoveryReason,
+    phaseReason: _phaseReason,
+    ...visibleBlock
+  } = block;
+  return visibleBlock;
+}
+
 function planRuntimeArchiveGroupLabel(phase: PlanRuntimeArchivePhase, language: ToolPresentationLanguage): string {
   if (language === "en") {
     if (phase === "needs_evidence") return "Needs evidence";
@@ -1044,8 +1059,9 @@ export function buildCodexActivityGroups(
   language: ToolPresentationLanguage = "zh",
 ): ActivityCell[] {
   const groups: ActivityCell[] = [];
-  for (const block of blocks) {
-    if (!block || block.type === "user") continue;
+  for (const rawBlock of blocks) {
+    if (!rawBlock || rawBlock.type === "user" || isInternalRuntimeProgressBlock(rawBlock)) continue;
+    const block = stripInternalPlanRuntimePresentation(rawBlock);
     const activity = buildActivityCellFromItems([block], normalizeLanguage(language));
     const current = groups[groups.length - 1] || null;
     if (canMergeActivityCells(current, activity)) {
@@ -1624,7 +1640,8 @@ function makeStep(input: {
   index: number;
   language: ToolPresentationLanguage;
 }): TurnArchiveStep {
-  const { block, index, language } = input;
+  const { index, language } = input;
+  const block = stripInternalPlanRuntimePresentation(input.block);
   const phase = normalizeTurnRuntimePhase(block?.turnPhase, language);
   if (block.type === "thought") {
     return {
@@ -1915,6 +1932,7 @@ export function buildTurnProcessArchiveModel(input: {
   const archiveEntries = input.blocks
     .map((block, index) => ({ block, index }))
     .filter(({ block, index }) => {
+    if (isInternalRuntimeProgressBlock(block)) return false;
     if (!isProcessArchiveCandidate(block, input.finalVisibleAgentIndex, index)) return false;
     if (block.type === "thought" && !includeThoughts) return false;
     if (block.type === "thought" && block.id !== latestThoughtId) return false;
@@ -1948,6 +1966,7 @@ export function buildLiveTurnProcessTimelineModel(input: {
   const steps: TurnArchiveStep[] = [];
   input.blocks.forEach((block, index) => {
     if (!block || block.type === "user") return;
+    if (isInternalRuntimeProgressBlock(block)) return;
     if (block.type === "thought") {
       return;
     }

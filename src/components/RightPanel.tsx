@@ -30,6 +30,7 @@ import {
   isPlanActionRequestPresentationEligible,
   resolvePlanPresentationBehavior,
 } from "../lib/turnPresentation";
+import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -1096,7 +1097,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     markerStatus: harnessRunMarker?.status,
     markerSessionKey: harnessRunMarker?.sessionKey,
     markerTurnId: harnessRunMarker?.turnId,
-    markerRunId: harnessRunMarker?.runId,
+    markerRunId: getHarnessActionRunId(harnessRunMarker),
     expectedSessionKey: activeSessionKey,
     expectedTurnId: latestPlanTurn?.id,
   });
@@ -1177,7 +1178,9 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     hasActionRequest: !!planPresentationRequest,
     actionKind: planPresentationActionKind,
     runId: planPresentationRequest?.runId || (
-      harnessRunMarker?.turnId === latestPlanTurn?.id ? harnessRunMarker?.runId : undefined
+      harnessRunMarker?.turnId === latestPlanTurn?.id
+        ? getHarnessActionRunId(harnessRunMarker) || undefined
+        : undefined
     ),
     requestId: planPresentationRequest?.requestId,
   });
