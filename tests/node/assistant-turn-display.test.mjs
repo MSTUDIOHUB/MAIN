@@ -61,11 +61,15 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantTurnDisplay.ts"),
 );
+const { extractReplyOptions } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/replyOptions.ts"),
+);
 
 function resolveDecision(overrides = {}) {
   return resolveAssistantTurnDisplayDecision({
     workflowMode: "edit",
     turnIntent: "execute",
+    runtimeIntent: "execute",
     streamText: "I will continue.",
     normalizedVisibleText: "I will continue.",
     normalizedBaseVisibleText: "",
@@ -75,6 +79,7 @@ function resolveDecision(overrides = {}) {
     isPlanApproved: false,
     planStage: "idle",
     sawPlanModeToolActivity: false,
+    sawExecuteOperationEvidence: false,
     readOnlyAutoApproveForSession: false,
     language: "en",
     ...overrides,
@@ -194,4 +199,83 @@ test("assistant turn display hides model-authored approval options once a struct
   assert.equal(decision.hasStructuredProposal, true);
   assert.equal(decision.planReplyOptionsRoutedToArtifact, true);
   assert.equal(decision.finalReplyOptions.length, 0);
+});
+
+test("assistant turn display completes evidenced execution instead of reopening inferred approval", () => {
+  const completionSummary = [
+    "## 修复方案已完成",
+    "",
+    "- 已修改运行时的回复选项路由。",
+    "- 已运行构建并通过验证。",
+    "- 后续可以继续完善相关测试。",
+  ].join("\n");
+  const inferred = extractReplyOptions(completionSummary);
+  assert.equal(inferred.replyOptions[0]?.source, "proposal_follow_up");
+  const decision = resolveDecision({
+    streamText: completionSummary,
+    normalizedVisibleText: completionSummary,
+    normalizedReplyOptions: inferred.replyOptions,
+    sawExecuteOperationEvidence: true,
+  });
+
+  assert.equal(decision.hasStructuredProposal, false);
+  assert.equal(decision.suppressInferredOperationApprovalAfterExecution, true);
+  assert.equal(decision.finalReplyOptions.length, 0);
+});
+
+test("assistant turn display preserves explicit blocking choices after execution evidence", () => {
+  const decision = resolveDecision({
+    normalizedVisibleText: "发现两条会改变用户可见行为的实现路径，请选择。",
+    normalizedReplyOptions: [{
+      label: "保留旧行为",
+      value: "保留旧行为",
+      source: "explicit_user_options",
+    }],
+    sawExecuteOperationEvidence: true,
+  });
+
+  assert.equal(decision.suppressInferredOperationApprovalAfterExecution, false);
+  assert.equal(decision.finalReplyOptions.length, 1);
+});
+
+test("assistant turn display keeps inferred approval for a real post-evidence decision before completion", () => {
+  const decision = resolveDecision({
+    normalizedVisibleText: "A newly discovered compatibility choice must be decided before continuing.",
+    normalizedReplyOptions: [{
+      label: "Approve the compatibility change",
+      value: "Approve the compatibility change",
+      action: "approve_operation_once",
+      source: "proposal_follow_up",
+    }],
+    sawExecuteOperationEvidence: true,
+  });
+
+  assert.equal(decision.suppressInferredOperationApprovalAfterExecution, false);
+  assert.equal(decision.finalReplyOptions.length, 1);
+});
+
+test("plain structured markdown remains a tier-3 proposal only inside Plan workflow", () => {
+  const plaintextPlan = [
+    "# Implementation Plan",
+    "",
+    "## Changes",
+    "- Update the runtime boundary.",
+    "- Add regression tests.",
+    "- Preserve explicit blocking choices while preventing completed execution from reopening approval.",
+  ].join("\n");
+
+  const editDecision = resolveDecision({
+    streamText: plaintextPlan,
+    normalizedVisibleText: plaintextPlan,
+  });
+  const planDecision = resolveDecision({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    streamText: plaintextPlan,
+    normalizedVisibleText: plaintextPlan,
+  });
+
+  assert.equal(editDecision.hasStructuredProposal, false);
+  assert.equal(planDecision.hasStructuredProposal, true);
 });

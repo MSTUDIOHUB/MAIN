@@ -1,4 +1,4 @@
-import { hasTieredPlanProposal } from "../../planProposal";
+import { hasExplicitPlanProposal, hasTieredPlanProposal } from "../../planProposal";
 import {
   hasExecutableProposalReplyOptions,
   hasOnlyNonBlockingPlanReplyOptions,
@@ -8,10 +8,11 @@ import {
   shouldSuppressApprovedPlanExecutionReplyOptions,
   stripReadOnlyPermissionPrompt,
 } from "../../replyOptions";
-import type { LegacyWorkflowMode, ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type LegacyWorkflowMode, type ResolvedUserIntent } from "../../runIntent";
 import {
   buildProseCodeDumpNotice,
   isReviewablePlanStage,
+  looksLikeOperationCompletionClaim,
   shouldCompactProseCodeDump,
 } from "../../orchestrator";
 import { buildPlanFallbackNotice } from "../../orchestrator/planOrchestration";
@@ -27,6 +28,7 @@ export interface AssistantTurnDisplayDecision {
   suppressPlanContinuationReplyOptions: boolean;
   suppressExecutableProposalOptionsForToolCalls: boolean;
   suppressApprovedPlanExecutionReplyOptions: boolean;
+  suppressInferredOperationApprovalAfterExecution: boolean;
   suppressNonDecisionReplyOptions: boolean;
   currentPlanStageForReview: PlanStage;
   isApprovedPlanExecutionTurn: boolean;
@@ -44,6 +46,7 @@ export interface AssistantTurnDisplayDecision {
 export function resolveAssistantTurnDisplayDecision(input: {
   workflowMode: LegacyWorkflowMode;
   turnIntent: ResolvedUserIntent;
+  runtimeIntent: ResolvedUserIntent;
   streamText: string;
   normalizedVisibleText: string;
   normalizedBaseVisibleText: string;
@@ -53,9 +56,31 @@ export function resolveAssistantTurnDisplayDecision(input: {
   isPlanApproved: boolean;
   planStage: PlanStage;
   sawPlanModeToolActivity: boolean;
+  sawExecuteOperationEvidence: boolean;
   readOnlyAutoApproveForSession: boolean;
   language: "zh" | "en";
 }): AssistantTurnDisplayDecision {
+  const isExecutionRuntime =
+    input.workflowMode === "edit" ||
+    isMutationRuntimeIntent(input.runtimeIntent) ||
+    input.runtimeIntent === "studio_workflow";
+  const executionConclusionCandidate =
+    isExecutionRuntime &&
+    input.sawExecuteOperationEvidence &&
+    input.effectiveToolCallCount === 0 &&
+    input.normalizedFinishReason === "stop" &&
+    looksLikeOperationCompletionClaim(
+      input.normalizedBaseVisibleText || input.normalizedVisibleText,
+    );
+  // proposal_follow_up is synthesized from prose for compatibility with
+  // models that omit <user_options>. Once this execution has real evidence,
+  // inferred future-work suggestions must not reopen approval. Explicit model
+  // choices remain untouched and can still pause at a genuine decision fork.
+  const normalizedReplyOptions = executionConclusionCandidate
+    ? input.normalizedReplyOptions.filter((option) => option.source !== "proposal_follow_up")
+    : input.normalizedReplyOptions;
+  const suppressInferredOperationApprovalAfterExecution =
+    normalizedReplyOptions.length !== input.normalizedReplyOptions.length;
   const compactedProseCodeDump = shouldCompactProseCodeDump({
     workflowMode: input.workflowMode,
     turnIntent: input.turnIntent,
@@ -75,18 +100,18 @@ export function resolveAssistantTurnDisplayDecision(input: {
     input.effectiveToolCallCount === 0 &&
     !compactedProseCodeDump &&
     shouldAutoContinueReadOnlyPermission({
-      replyOptions: input.normalizedReplyOptions,
+      replyOptions: normalizedReplyOptions,
       readOnlyAutoApproveForSession: input.readOnlyAutoApproveForSession,
     });
   const suppressReadOnlyPermissionOptionsForToolCalls =
     input.effectiveToolCallCount > 0 &&
-    hasOnlyReadOnlyPermissionReplyOptions(input.normalizedReplyOptions);
+    hasOnlyReadOnlyPermissionReplyOptions(normalizedReplyOptions);
   const suppressTruncatedReadOnlyPermissionOptions =
     input.effectiveToolCallCount === 0 &&
     input.workflowMode === "plan" &&
     !input.isPlanApproved &&
     input.normalizedFinishReason === "length" &&
-    hasOnlyReadOnlyPermissionReplyOptions(input.normalizedReplyOptions);
+    hasOnlyReadOnlyPermissionReplyOptions(normalizedReplyOptions);
   const suppressReadOnlyPermissionOptions =
     autoContinueReadOnlyPermission ||
     suppressReadOnlyPermissionOptionsForToolCalls ||
@@ -95,19 +120,19 @@ export function resolveAssistantTurnDisplayDecision(input: {
     input.effectiveToolCallCount === 0 &&
     input.workflowMode === "plan" &&
     !input.isPlanApproved &&
-    hasOnlyNonBlockingPlanReplyOptions(input.normalizedReplyOptions);
+    hasOnlyNonBlockingPlanReplyOptions(normalizedReplyOptions);
   const suppressExecutableProposalOptionsForToolCalls =
     input.effectiveToolCallCount > 0 &&
     input.workflowMode === "plan" &&
     !input.isPlanApproved &&
-    hasExecutableProposalReplyOptions(input.normalizedReplyOptions);
+    hasExecutableProposalReplyOptions(normalizedReplyOptions);
   const currentPlanStageForReview = input.planStage;
   const isApprovedPlanExecutionTurn =
     input.isPlanApproved &&
     currentPlanStageForReview === "executing";
   const suppressApprovedPlanExecutionReplyOptions =
     shouldSuppressApprovedPlanExecutionReplyOptions({
-      replyOptions: input.normalizedReplyOptions,
+      replyOptions: normalizedReplyOptions,
       workflowMode: input.workflowMode,
       isPlanApproved: input.isPlanApproved,
       planStage: currentPlanStageForReview,
@@ -117,12 +142,14 @@ export function resolveAssistantTurnDisplayDecision(input: {
     suppressPlanContinuationReplyOptions ||
     suppressExecutableProposalOptionsForToolCalls ||
     suppressApprovedPlanExecutionReplyOptions;
-  const hasStructuredProposal = hasTieredPlanProposal(input.streamText);
+  const hasStructuredProposal = input.workflowMode === "plan"
+    ? hasTieredPlanProposal(input.streamText)
+    : hasExplicitPlanProposal(input.streamText);
   const hasReadyPlanArtifacts = currentPlanStageForReview === "ready_to_execute";
   const hasReviewablePlanArtifacts = isReviewablePlanStage(currentPlanStageForReview);
   const rawFinalReplyOptions = compactedProseCodeDump || suppressNonDecisionReplyOptions
     ? []
-    : input.normalizedReplyOptions;
+    : normalizedReplyOptions;
   const planReplyOptionsRoutedToArtifact = shouldRouteUnapprovedPlanReplyOptionsToArtifact({
     replyOptions: rawFinalReplyOptions,
     workflowMode: input.workflowMode,
@@ -153,6 +180,7 @@ export function resolveAssistantTurnDisplayDecision(input: {
     suppressPlanContinuationReplyOptions,
     suppressExecutableProposalOptionsForToolCalls,
     suppressApprovedPlanExecutionReplyOptions,
+    suppressInferredOperationApprovalAfterExecution,
     suppressNonDecisionReplyOptions,
     currentPlanStageForReview,
     isApprovedPlanExecutionTurn,

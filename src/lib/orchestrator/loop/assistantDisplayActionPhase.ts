@@ -59,6 +59,7 @@ export function handleAssistantDisplayActionPhase(input: {
   latestUserPromptText: string;
   recentToolActivity: PlanToolActivitySummary[];
   sawPlanModeToolActivity: boolean;
+  sawExecuteOperationEvidence: boolean;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   chatFinalSynthesisActive: boolean;
   consecutiveNoToolCount: number;
@@ -86,6 +87,7 @@ export function handleAssistantDisplayActionPhase(input: {
   const assistantTurnDisplay = resolveAssistantTurnDisplayDecision({
     workflowMode,
     turnIntent,
+    runtimeIntent,
     streamText: input.streamText,
     normalizedVisibleText: normalized.visibleText,
     normalizedBaseVisibleText: input.normalizedBaseVisibleText,
@@ -95,6 +97,7 @@ export function handleAssistantDisplayActionPhase(input: {
     isPlanApproved: callbacks.getIsPlanApproved(),
     planStage: callbacks.getPlanStage(),
     sawPlanModeToolActivity: input.sawPlanModeToolActivity,
+    sawExecuteOperationEvidence: input.sawExecuteOperationEvidence,
     readOnlyAutoApproveForSession:
       workflowMode === "edit" || callbacks.getReadOnlyAutoApproveForSession(),
     language: callbacks.getPreferredLanguage(),
@@ -108,6 +111,7 @@ export function handleAssistantDisplayActionPhase(input: {
     suppressPlanContinuationReplyOptions,
     suppressExecutableProposalOptionsForToolCalls,
     suppressApprovedPlanExecutionReplyOptions,
+    suppressInferredOperationApprovalAfterExecution,
     sourceVisibleText,
     currentPlanStageForReview,
     isApprovedPlanExecutionTurn,
@@ -233,6 +237,19 @@ export function handleAssistantDisplayActionPhase(input: {
       turnIntent,
       runtimeIntent,
       planStage: currentPlanStageForReview,
+    });
+  }
+  if (suppressInferredOperationApprovalAfterExecution) {
+    logAgentEvent("inferred_operation_approval_suppressed_after_execution", {
+      iteration,
+      workflowMode,
+      turnIntent,
+      runtimeIntent,
+      finishReason: normalized.finishReason || "unknown",
+      executionEvidenceObserved: input.sawExecuteOperationEvidence,
+      suppressedOptions:
+        normalized.replyOptions.length - rawFinalReplyOptions.length,
+      optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
     });
   }
   if (planReplyOptionsRoutedToArtifact) {

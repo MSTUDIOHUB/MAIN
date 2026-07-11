@@ -204,6 +204,8 @@ export async function handleAssistantIterationPhase(input: {
     latestUserPromptText: input.latestUserPromptText,
     recentToolActivity: input.recentToolActivity,
     sawPlanModeToolActivity: planRuntimeState.sawPlanModeToolActivity,
+    sawExecuteOperationEvidence:
+      evidenceRuntimeState.sawExecuteOperationEvidence,
     recoveryPromptState,
     chatFinalSynthesisActive: input.streamRuntimeState.chatFinalSynthesisActive,
     consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,

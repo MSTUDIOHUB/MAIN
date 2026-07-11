@@ -1813,7 +1813,7 @@ export function looksLikeOperationCompletionClaim(text: string): boolean {
   if (!hasCompletionClaim) return false;
   const looksLikeProposalOnly =
     /(?:方案|建议|计划|将会|可以|应该|准备|下一步|如果|待|需要用户|是否|proposal|plan|suggest|would|will|should|can|could|next step|ready to|once)/i.test(normalized) &&
-    !/(?:已|已经|成功|done|fixed|implemented|patched|updated|completed|verified|passed)\b/i.test(normalized);
+    !/(?:已|已经|成功)|\b(?:done|fixed|implemented|patched|updated|completed|verified|passed)\b/i.test(normalized);
   return !looksLikeProposalOnly;
 }
 

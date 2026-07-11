@@ -250,6 +250,18 @@ export function hasTieredPlanProposal(text: string): boolean {
   return extractTieredPlanProposal(text) !== null;
 }
 
+/**
+ * Returns true only when the model used an explicit proposal protocol.
+ *
+ * Plain structured Markdown is intentionally excluded here. It is a useful
+ * compatibility fallback while the runtime is already in Plan mode, but the
+ * same shape is also used by completion summaries, reviews, and reports.
+ */
+export function hasExplicitPlanProposal(text: string): boolean {
+  const proposal = extractTieredPlanProposal(text);
+  return proposal !== null && (!("kind" in proposal) || proposal.kind === "tier2_proposed_plan");
+}
+
 // Normalize any tier to a unified format that the runtime can consume
 export function normalizePlanProposal(proposal: TieredPlanResult): StructuredPlanProposal {
   if ("jobs" in proposal) {
