@@ -9,10 +9,11 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("running turn header appears while streaming", async ({ page }) => {
+test("ordinary running turn stays in the continuous flow while streaming", async ({ page }) => {
   await page.goto("/?e2eScenario=streaming-timer");
 
-  await expect(page.getByRole("button", { name: /执行中 .*计时器回归流/ })).toBeVisible();
+  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(0);
+  await expect(page.getByText("请检查计时器是否正常增长。")).toBeVisible();
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 });
 
@@ -58,7 +59,8 @@ test("chat history remains scrollable during rapid streaming updates", async ({ 
   await page.goto("/?e2eScenario=streaming-responsiveness");
 
   const scroller = page.getByTestId("chat-scroll-container");
-  await expect(page.getByRole("button", { name: /执行中 .*流式滚动回归/ })).toBeVisible();
+  await expect(page.getByTestId("turn-state-anchor")).toHaveCount(0);
+  await expect(page.getByText("请持续输出，同时保持历史滚动流畅。")).toBeAttached();
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 
   await scroller.evaluate((el) => {

@@ -199,6 +199,7 @@ import {
   normalizeTurnInputContextSignals,
   type TurnInputContextSignals,
 } from "./turnIntake";
+import { canonicalizeVisibleUserText } from "./turnContext";
 
 // ── Spec file auto-approval helpers ────────────────────────────────
 
@@ -2177,8 +2178,12 @@ export function getOriginalUserPromptForPlanFallback(callbacks: OrchestratorCall
     .filter((message) => message.role === "user")
     .map((message) => {
       const raw = extractCompatibilityTextContent(message.content);
-      const primary = extractPrimaryUserRequestText(raw);
-      return stripControlPromptForPlanFallback(primary || raw);
+      // Runtime context packets and hidden resume prompts share the user role
+      // for provider compatibility, but they are not canonical user input.
+      // Reuse the same boundary as durable turn context instead of selecting
+      // the first arbitrary user-role packet.
+      const canonical = canonicalizeVisibleUserText(raw);
+      return canonical ? stripControlPromptForPlanFallback(canonical) : "";
     })
     .filter(Boolean);
   return userMessages.find((text) => !isPlanControlUserPrompt(text)) || userMessages[0] || "";
@@ -4541,15 +4546,16 @@ export async function executeWriteToolWithReview(
     readFile: async (path) => String(await executeTool("read_file", { path, __raw: true }, workspace, callbacks.getSessionKey()) ?? ""),
   });
   if (!mutationPreflight.ok) {
+    const recoveryTarget = String(mutationPreflight.path || "").trim() || target;
     logAgentEvent("workspace_mutation_preflight_blocked", {
       tool: tc.name,
-      target,
+      target: recoveryTarget,
       reason: mutationPreflight.reason,
     });
     return {
       toolCallId: tc.id,
       name: tc.name,
-      target,
+      target: recoveryTarget,
       content: `Error: ${mutationPreflight.message || "MUTATION_PREFLIGHT_BLOCKED"}`,
       isError: true,
       lifecycleState: "blocked",

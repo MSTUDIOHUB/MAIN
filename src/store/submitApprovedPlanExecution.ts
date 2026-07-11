@@ -1,13 +1,236 @@
 import { buildPlanApprovalChoiceHint } from "../lib/planControl";
+import { getReviewablePlanArtifacts } from "../lib/planApprovalIdentity";
 import {
   deriveRuntimePlanTasksFromArtifacts,
   getPendingPlanTaskCommandFocus,
   reconcilePlanTaskCompletion,
+  validateActionablePlanArtifact,
+  validatePlanArtifactContent,
   type ConversationTurn,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
   type PlanTask,
 } from "../lib/workflowModels";
+
+export type ApprovedPlanExecutionReadinessReason =
+  | "missing_reviewable_plan_artifact"
+  | "plan_artifact_quality_rejected"
+  | "runtime_task_set_empty"
+  | "runtime_task_set_not_executable"
+  | "mutation_task_missing"
+  | "executable_validation_task_missing";
+
+export interface ApprovedPlanExecutionReadiness {
+  ok: boolean;
+  stopClass: "plan_execution_materialization_failed" | null;
+  reason: ApprovedPlanExecutionReadinessReason | null;
+  qualityReason: string | null;
+  mutationOriented: boolean;
+  requiresExecutableValidation: boolean;
+  concreteMutationTaskCount: number;
+  executableValidationTaskCount: number;
+  taskCount: number;
+}
+
+const PLAN_MUTATION_SECTION_RE =
+  /^(?:关键改动|关键实现改动|实现改动|实施步骤|执行步骤|修复步骤|落地步骤|影响文件(?:清单)?|涉及文件(?:清单)?|文件变更|变更文件|Key Changes|Implementation Changes|Implementation Steps|Execution Steps|Plan of Work|Affected Files(?: List)?|Files? to Change|File Changes)(?:\s*(?:[（(].*[）)]|[:：—-].*))?$/i;
+const PLAN_VALIDATION_SECTION_RE =
+  /^(?:测试方案|测试计划|测试场景|验证方案|验证标准|验证方式|验收标准|验收|Test Plan|Testing|Tests?|Validation|Acceptance(?: Criteria)?)(?:\s*(?:[（(].*[）)]|[:：—-]|与).*)?$/i;
+const LEADING_READ_OR_VALIDATION_INTENT_RE =
+  /^(?:(?:需要|需|先|请|继续|首先|下一步|再)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解|验证|测试|验收|运行测试|执行测试)|^(?:(?:need(?:s)?\s+to|first|please|next|then)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand|verify|validate|test)\b/i;
+const EXPLICIT_MUTATION_ACTION_RE =
+  /(?:将.{1,140}(?:改为|替换为)|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现|implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+const MUTATION_AFTER_READ_RE =
+  /(?:然后|随后|之后|再|并(?:且)?).{0,120}(?:将.{1,80}(?:改为|替换为)|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现)|(?:then|after(?:wards)?|and then).{0,120}(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+const EXPLICIT_NO_MUTATION_RE =
+  /^(?:不(?:修改|改动|新增|改变|写入)|无需(?:修改|改动|新增|改变|写入)|保持.{0,80}不变|do not (?:modify|change|write)\b|no (?:source |code )?changes?\b|keep.{0,80}unchanged\b)/i;
+const VALIDATION_TASK_TEXT_RE =
+  /(?:验证|测试|验收|检查|确认|构建|编译|lint|类型检查|回归|verify|validate|test|acceptance|check|build|compile|typecheck|type-check|regression)/i;
+const VALIDATION_COMMAND_RE =
+  /(?:\b(?:test|tests|testing|lint|typecheck|type-check|check|build|compile|clippy|pytest|vitest|jest|playwright|cypress)\b|tsc(?:\s|$)|cargo\s+(?:test|check|build|clippy)\b|go\s+test\b|swift\s+test\b|dotnet\s+test\b|mvn\s+test\b|gradle\w*\s+\S+)/i;
+
+function stripPlanListSyntax(line: string): string {
+  return String(line || "")
+    .replace(/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/, "")
+    .replace(/^\s*\|/, "")
+    .replace(/\|\s*$/, "")
+    .replace(/\*\*/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function collectSectionLines(content: string, headingPattern: RegExp): string[] {
+  const lines: string[] = [];
+  let inSection = false;
+  let sectionLevel = 0;
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    const heading = rawLine.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const level = heading[1]?.length || 0;
+      if (inSection && level <= sectionLevel) inSection = false;
+      const headingText = (heading[2] || "")
+        .replace(/\*\*/g, "")
+        .replace(/^\d+[.)、]\s*/, "")
+        .trim();
+      if (!inSection && headingPattern.test(headingText)) {
+        inSection = true;
+        sectionLevel = level;
+      }
+      continue;
+    }
+    if (inSection) {
+      const normalized = stripPlanListSyntax(rawLine);
+      if (normalized) lines.push(normalized);
+    }
+  }
+  return lines;
+}
+
+function hasExplicitMutationIntent(text: string): boolean {
+  const normalized = stripPlanListSyntax(text);
+  if (!normalized || EXPLICIT_NO_MUTATION_RE.test(normalized)) return false;
+  if (LEADING_READ_OR_VALIDATION_INTENT_RE.test(normalized) && !MUTATION_AFTER_READ_RE.test(normalized)) {
+    return false;
+  }
+  return EXPLICIT_MUTATION_ACTION_RE.test(normalized);
+}
+
+function isConcreteMutationOrDeliverableTask(task: PlanTask): boolean {
+  const evidence = task.evidence || [];
+  if (evidence.some((item) => item.kind === "deliverable" && String(item.value || "").trim())) {
+    return true;
+  }
+  return evidence.some((item) => item.kind === "file" && String(item.value || "").trim()) &&
+    hasExplicitMutationIntent(task.text);
+}
+
+function isExecutableValidationTask(task: PlanTask): boolean {
+  const evidence = task.evidence || [];
+  if (evidence.some((item) =>
+    item.kind === "browser_dom" ||
+    item.kind === "browser_screenshot" ||
+    item.kind === "dev_server_url" ||
+    item.kind === "tauri_required" ||
+    item.kind === "manual_user_validation"
+  )) {
+    return true;
+  }
+  const commands = [
+    ...(task.commands || []),
+    ...evidence.filter((item) => item.kind === "cmd").map((item) => item.value),
+  ].filter((value) => String(value || "").trim());
+  return commands.length > 0 && (
+    VALIDATION_TASK_TEXT_RE.test(task.text) ||
+    commands.some((command) => VALIDATION_COMMAND_RE.test(command))
+  );
+}
+
+function failedPlanExecutionReadiness(input: Omit<ApprovedPlanExecutionReadiness, "ok" | "stopClass">): ApprovedPlanExecutionReadiness {
+  return {
+    ok: false,
+    stopClass: "plan_execution_materialization_failed",
+    ...input,
+  };
+}
+
+/**
+ * Defense-in-depth check at the approval boundary. The plan artifact may have
+ * been persisted or restored since materialization, so approval must re-run
+ * semantic validation and prove that the derived task projection is capable
+ * of executing the reviewed plan before a child run is created.
+ */
+export function evaluateApprovedPlanExecutionReadiness(input: {
+  planArtifacts: PlanArtifact[];
+  executionPlanTasks: PlanTask[];
+}): ApprovedPlanExecutionReadiness {
+  const reviewableArtifacts = getReviewablePlanArtifacts(input.planArtifacts);
+  const taskCount = input.executionPlanTasks.length;
+  if (reviewableArtifacts.length === 0) {
+    return failedPlanExecutionReadiness({
+      reason: "missing_reviewable_plan_artifact",
+      qualityReason: null,
+      mutationOriented: false,
+      requiresExecutableValidation: false,
+      concreteMutationTaskCount: 0,
+      executableValidationTaskCount: 0,
+      taskCount,
+    });
+  }
+
+  for (const artifact of reviewableArtifacts) {
+    // plan.md follows the full executable Plan contract. Design/bugfix
+    // artifacts have their own persisted schemas and must not be rejected for
+    // lacking plan-only headings, but still pass their native noise/structure
+    // validation before their task projection is trusted.
+    const quality = artifact.kind === "plan"
+      ? validateActionablePlanArtifact(artifact.content)
+      : validatePlanArtifactContent(artifact.content, artifact.kind);
+    if (!quality.ok) {
+      return failedPlanExecutionReadiness({
+        reason: "plan_artifact_quality_rejected",
+        qualityReason: quality.reason || "unknown_plan_quality_failure",
+        mutationOriented: false,
+        requiresExecutableValidation: false,
+        concreteMutationTaskCount: 0,
+        executableValidationTaskCount: 0,
+        taskCount,
+      });
+    }
+  }
+
+  const mutationOriented = reviewableArtifacts.some((artifact) =>
+    collectSectionLines(artifact.content, PLAN_MUTATION_SECTION_RE).some(hasExplicitMutationIntent)
+  );
+  const requiresExecutableValidation = reviewableArtifacts.some((artifact) =>
+    collectSectionLines(artifact.content, PLAN_VALIDATION_SECTION_RE).length > 0
+  );
+  const concreteMutationTaskCount = input.executionPlanTasks.filter(isConcreteMutationOrDeliverableTask).length;
+  const executableValidationTaskCount = input.executionPlanTasks.filter(isExecutableValidationTask).length;
+  const counts = {
+    mutationOriented,
+    requiresExecutableValidation,
+    concreteMutationTaskCount,
+    executableValidationTaskCount,
+    taskCount,
+  };
+
+  if (taskCount === 0) {
+    return failedPlanExecutionReadiness({
+      reason: "runtime_task_set_empty",
+      qualityReason: null,
+      ...counts,
+    });
+  }
+  if (concreteMutationTaskCount === 0 && executableValidationTaskCount === 0) {
+    return failedPlanExecutionReadiness({
+      reason: "runtime_task_set_not_executable",
+      qualityReason: null,
+      ...counts,
+    });
+  }
+  if (mutationOriented && concreteMutationTaskCount === 0) {
+    return failedPlanExecutionReadiness({
+      reason: "mutation_task_missing",
+      qualityReason: null,
+      ...counts,
+    });
+  }
+  if (requiresExecutableValidation && executableValidationTaskCount === 0) {
+    return failedPlanExecutionReadiness({
+      reason: "executable_validation_task_missing",
+      qualityReason: null,
+      ...counts,
+    });
+  }
+
+  return {
+    ok: true,
+    stopClass: null,
+    reason: null,
+    qualityReason: null,
+    ...counts,
+  };
+}
 
 export interface ApprovedPlanExecutionState {
   planArtifacts: PlanArtifact[];

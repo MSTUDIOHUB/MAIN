@@ -32,6 +32,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const actionRequests = loadTranspiledModuleSync(path.join(process.cwd(), "src/lib/actionRequest.ts"));
+const actionRequestRestore = loadTranspiledModuleSync(path.join(process.cwd(), "src/lib/actionRequestRestore.ts"));
 const planIdentity = loadTranspiledModuleSync(path.join(process.cwd(), "src/lib/planApprovalIdentity.ts"));
 const pendingToolReview = loadTranspiledModuleSync(path.join(process.cwd(), "src/lib/pendingToolReview.ts"));
 const runTransitions = loadTranspiledModuleSync(path.join(process.cwd(), "src/lib/runTransitionReducer.ts"));
@@ -208,6 +209,184 @@ test("Goal controls cannot cross a confirmation request or run boundary", () => 
     goalRevision: 3,
     runOwner,
   }), false, "a control must not consume another Goal's confirmation request");
+
+  const toolPermission = {
+    schemaVersion: 1,
+    requestId: "permission-1",
+    kind: "tool_permission",
+    sessionKey: "session-1",
+    turnId: "turn-goal",
+    runId: "run-goal-2",
+    title: "Read a protected file",
+    status: "pending",
+    createdAt: 12,
+    taskId: 9,
+    toolName: "read_file",
+    target: "src/main.ts",
+  };
+  assert.equal(actionRequests.isCurrentGoalControlResolution({
+    request: toolPermission,
+    identity: { goalId: "goal-1", goalRevision: 3 },
+    goalId: "goal-1",
+    goalRevision: 3,
+    runOwner,
+  }), false, "a Goal resume control cannot consume an exact pending tool permission");
+  const userChoice = actionRequests.buildUserChoiceActionRequest({
+    sessionKey: "session-1",
+    turnId: "turn-goal",
+    runId: "run-goal-2",
+    title: "Choose recovery",
+    optionValues: ["Retry", "Stop"],
+    now: 13,
+  });
+  assert.equal(actionRequests.isCurrentGoalControlResolution({
+    request: userChoice,
+    identity: { goalId: "goal-1", goalRevision: 3 },
+    goalId: "goal-1",
+    goalRevision: 3,
+    runOwner,
+  }), false, "a Goal resume control cannot bypass a pending user choice");
+
+  assert.equal(actionRequests.isCurrentGoalAdministrativeControl({
+    request: toolPermission,
+    identity: { goalId: "goal-1", goalRevision: 3 },
+    goalId: "goal-1",
+    goalRevision: 3,
+  }), true, "pause and clear remain available without consuming another request");
+  assert.equal(actionRequests.isCurrentGoalAdministrativeControl({
+    request,
+    identity: { goalId: "goal-1", goalRevision: 3 },
+    goalId: "goal-1",
+    goalRevision: 3,
+  }), false, "an administrative control rendered before confirmation cannot clear a newer checkpoint");
+  assert.equal(actionRequests.isCurrentGoalAdministrativeControl({
+    request,
+    identity: { goalId: "goal-1", goalRevision: 3, requestId: request.requestId },
+    goalId: "goal-1",
+    goalRevision: 3,
+  }), true);
+  assert.equal(
+    actionRequests.clearGoalConfirmationActionRequest(toolPermission, "goal-1", 3),
+    toolPermission,
+  );
+  assert.equal(
+    actionRequests.clearGoalConfirmationActionRequest({ ...request, goalId: "goal-2" }, "goal-1", 3)?.goalId,
+    "goal-2",
+  );
+  assert.equal(actionRequests.clearGoalConfirmationActionRequest(request, "goal-1", 3), null);
+});
+
+test("runtime restore revives only exact resumable action checkpoints", () => {
+  const owner = {
+    status: "paused",
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+  };
+  const choice = actionRequests.buildUserChoiceActionRequest({
+    sessionKey: owner.sessionKey,
+    turnId: owner.turnId,
+    runId: owner.runId,
+    title: "Choose",
+    optionValues: ["A", "B"],
+    allowCustomReply: true,
+    now: 20,
+  });
+  const choiceBlock = {
+    id: 1,
+    turnId: owner.turnId,
+    type: "agent",
+    content: "Choose",
+    options: [{ label: "A", value: "A" }, { label: "B", value: "B" }],
+    choiceRequest: actionRequests.toUserChoiceResolutionIdentity(choice),
+  };
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: choice,
+    runOwner: owner,
+    taskFlow: [choiceBlock],
+  })?.requestId, choice.requestId);
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: choice,
+    runOwner: { ...owner, runId: "stale-run" },
+    taskFlow: [choiceBlock],
+  }), null);
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: choice,
+    runOwner: owner,
+    taskFlow: [{ ...choiceBlock, options: [{ label: "A", value: "A" }] }],
+  }), null);
+
+  const planReview = actionRequests.buildPlanReviewActionRequest({
+    sessionKey: owner.sessionKey,
+    turnId: owner.turnId,
+    runId: owner.runId,
+    title: "Review",
+    planRevision: 2,
+    artifactHash: "hash-2",
+    artifactPaths: [".MAIN/plans/plan.md"],
+    now: 21,
+  });
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: planReview,
+    runOwner: owner,
+    planIdentity: { revision: 2, artifactHash: "hash-2", artifactPaths: [], artifactCount: 1 },
+  })?.requestId, planReview.requestId);
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: planReview,
+    runOwner: owner,
+    planIdentity: { revision: 3, artifactHash: "hash-3", artifactPaths: [], artifactCount: 1 },
+  }), null);
+
+  const confirmation = actionRequests.buildGoalConfirmationActionRequest({
+    sessionKey: owner.sessionKey,
+    turnId: owner.turnId,
+    runId: owner.runId,
+    title: "Confirm",
+    goalId: "goal-1",
+    goalRevision: 4,
+    reason: "checkpoint",
+    now: 22,
+  });
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: confirmation,
+    runOwner: owner,
+    goalRuntime: {
+      status: "awaiting_input",
+      goal: { id: "goal-1", revision: 4, sessionKey: "session-1", ownerTurnId: "turn-1" },
+    },
+  })?.requestId, confirmation.requestId);
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: confirmation,
+    runOwner: owner,
+    goalRuntime: {
+      status: "paused",
+      goal: { id: "goal-1", revision: 4, sessionKey: "session-1", ownerTurnId: "turn-1" },
+    },
+  }), null);
+
+  const permission = {
+    schemaVersion: 1,
+    requestId: "permission-restore",
+    kind: "tool_permission",
+    sessionKey: owner.sessionKey,
+    turnId: owner.turnId,
+    runId: owner.runId,
+    title: "Write",
+    status: "pending",
+    createdAt: 23,
+    taskId: 3,
+    toolName: "write_file",
+    target: "src/main.ts",
+  };
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: permission,
+    runOwner: owner,
+  }), null, "tool permission resolvers are process-local and cannot be revived after reload");
+  assert.equal(actionRequestRestore.restorePendingActionRequest({
+    request: { ...choice, status: "resolved" },
+    runOwner: owner,
+    taskFlow: [choiceBlock],
+  }), null);
 });
 
 test("malformed persisted action requests are cleared instead of revived", () => {

@@ -55,6 +55,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildFallbackGitCommitMessage,
   generateGitCommitMessage,
+  resolveGitCommitModelRequestConcurrency,
   sanitizeGitCommitSubject,
   sanitizeGitCommitMessage,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/gitCommitMessage.ts"));
@@ -64,6 +65,30 @@ const baseStatus = {
   insertions: 10,
   deletions: 2,
 };
+
+function buildLargeModifiedEntry(lineCount = 18_000) {
+  return {
+    path: "src/lib/gitCommitMessage.ts",
+    status: "M",
+    old: "",
+    new: Array.from({ length: lineCount }, (_, index) => `const chunkMarker${index} = ${index}; // ${"x".repeat(18)}`).join("\n"),
+    existed: true,
+    fullFile: true,
+  };
+}
+
+function commitModelResponse(content) {
+  return { choices: [{ message: { content } }] };
+}
+
+const detailedCommitResponse = [
+  "<commit_message>",
+  "fix(git): bound commit summary model concurrency",
+  "",
+  "- Bound commit message generation requests by provider capacity",
+  "- Preserve ordered Git summaries while covering large change sets",
+  "</commit_message>",
+].join("\n");
 
 test("sanitizeGitCommitSubject extracts one clean subject and enforces length", () => {
   assert.equal(sanitizeGitCommitSubject("Commit message: Update sidebar git menu\n\nDetails"), "Update sidebar git menu");
@@ -295,4 +320,111 @@ test("generateGitCommitMessage prefers detailed model output and rejects thin ou
   assert.match(fallback.message, /提交信息生成/);
   assert.match(fallback.message, /Git 菜单/);
   assert.doesNotMatch(fallback.message, /覆盖 \d+ 个文件|src\/|`|新增\/调整|移除\/替换/);
+});
+
+test("commit summary concurrency is provider-aware and supports bounded overrides", () => {
+  assert.equal(resolveGitCommitModelRequestConcurrency({
+    activeProfile: "local",
+    local: { provider: "OMLX" },
+  }), 2);
+  assert.equal(resolveGitCommitModelRequestConcurrency({
+    activeProfile: "local",
+    local: { provider: "LM Studio" },
+  }), 2);
+  assert.equal(resolveGitCommitModelRequestConcurrency({
+    activeProfile: "local",
+    local: { provider: "Ollama" },
+  }), 1);
+  assert.equal(resolveGitCommitModelRequestConcurrency({
+    activeProfile: "local",
+    local: { provider: "OMLX", maxActiveRequests: 4 },
+  }), 4);
+  assert.equal(resolveGitCommitModelRequestConcurrency({
+    activeProfile: "cloud",
+    cloud: {},
+  }), 3);
+  assert.equal(resolveGitCommitModelRequestConcurrency({
+    activeProfile: "cloud",
+    cloud: { maxActiveRequests: 99 },
+  }), 6);
+});
+
+test("large local diffs cap model requests and preserve representative summary order", async () => {
+  const config = {
+    activeProfile: "local",
+    local: {
+      provider: "OMLX",
+      endpoint: "http://127.0.0.1:8000/v1",
+      model: "Qwen3.6-35B-A3B-6bit",
+      apiKey: "test",
+    },
+  };
+  let chunkSequence = 0;
+  let requestCount = 0;
+  let finalCombinedSummary = "";
+  const generated = await generateGitCommitMessage({
+    config,
+    language: "en",
+    workspace: "/tmp/repo",
+    status: { changedFiles: 1, insertions: 18_000, deletions: 0 },
+    entries: [buildLargeModifiedEntry()],
+    requestJson: async (request) => {
+      requestCount += 1;
+      const messages = request.body.messages || [];
+      const system = String(messages[0]?.content || "");
+      if (/Summarize the changes in the provided git diff chunk/i.test(system)) {
+        const sequence = chunkSequence++;
+        await new Promise((resolve) => setTimeout(resolve, (4 - sequence) * 3));
+        return commitModelResponse(`ordered-summary-${sequence}`);
+      }
+      finalCombinedSummary = String(messages.at(-1)?.content || "");
+      return commitModelResponse(detailedCommitResponse);
+    },
+  });
+
+  assert.equal(generated.source, "model");
+  assert.ok(requestCount <= 5, `expected at most four chunk summaries plus one final call, got ${requestCount}`);
+  assert.equal(chunkSequence, 4);
+  assert.ok(finalCombinedSummary.indexOf("ordered-summary-0") < finalCombinedSummary.indexOf("ordered-summary-1"));
+  assert.ok(finalCombinedSummary.indexOf("ordered-summary-1") < finalCombinedSummary.indexOf("ordered-summary-2"));
+  assert.match(finalCombinedSummary, /additional diff chunks were not sent as individual model requests/);
+});
+
+test("concurrent local commit generations share one provider capacity pool", async () => {
+  const config = {
+    activeProfile: "local",
+    local: {
+      provider: "OMLX",
+      endpoint: "http://127.0.0.1:8000/v1",
+      model: "Qwen3.6-35B-A3B-6bit",
+      apiKey: "test",
+    },
+  };
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const requestJson = async (request) => {
+    inFlight += 1;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((resolve) => setTimeout(resolve, 8));
+    inFlight -= 1;
+    const messages = request.body.messages || [];
+    const system = String(messages[0]?.content || "");
+    return /Summarize the changes in the provided git diff chunk/i.test(system)
+      ? commitModelResponse("bounded local summary")
+      : commitModelResponse(detailedCommitResponse);
+  };
+  const params = {
+    config,
+    language: "en",
+    workspace: "/tmp/repo",
+    status: { changedFiles: 1, insertions: 18_000, deletions: 0 },
+    entries: [buildLargeModifiedEntry()],
+    requestJson,
+  };
+
+  await Promise.all([
+    generateGitCommitMessage(params),
+    generateGitCommitMessage(params),
+  ]);
+  assert.equal(maxInFlight, 2);
 });

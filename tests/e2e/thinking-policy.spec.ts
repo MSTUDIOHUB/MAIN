@@ -31,11 +31,11 @@ test("process display ignores legacy hidden policy and keeps process text hierar
   await expect(page.getByTestId("turn-activity-thought-summary")).toContainText("流式结束后继续保留");
   await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
   await expect(page.getByText("过程显示测试回复。")).toBeVisible();
-  const readGroup = page.getByTestId("read-context-group").first();
-  await expect(readGroup).toBeVisible();
-  await expect(readGroup).toContainText("ChatArea.tsx");
+  const processTimeline = page.getByTestId("live-turn-process-timeline");
+  await expect(processTimeline).toBeVisible();
+  await expect(processTimeline).toContainText("ChatArea.tsx");
 
-  const initialReadGroupFontSize = await readGroup.evaluate((element) =>
+  const initialProcessFontSize = await processTimeline.evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
   const initialAgentFontSize = await page.locator(".chat-agent-content").first().evaluate((element) =>
@@ -44,8 +44,7 @@ test("process display ignores legacy hidden policy and keeps process text hierar
   const initialComposerFontSize = await page.getByTestId("composer-textarea").evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
-  expect(initialReadGroupFontSize).toBeGreaterThanOrEqual(initialComposerFontSize);
-  expect(initialReadGroupFontSize - initialComposerFontSize).toBeLessThanOrEqual(1);
+  expect(initialProcessFontSize).toBeLessThan(initialComposerFontSize);
   expect(initialAgentFontSize).toBe(initialComposerFontSize);
 
   await page.getByTestId("model-settings-button").click();
@@ -66,7 +65,7 @@ test("process display ignores legacy hidden policy and keeps process text hierar
     ),
   ).toBeGreaterThan(initialAgentFontSize + 4);
 
-  const readGroupFontSize = await readGroup.evaluate((element) =>
+  const processFontSize = await processTimeline.evaluate((element) =>
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
   const agentFontSize = await page.locator(".chat-agent-content").first().evaluate((element) =>
@@ -76,15 +75,15 @@ test("process display ignores legacy hidden policy and keeps process text hierar
     Number.parseFloat(window.getComputedStyle(element).fontSize),
   );
 
-  expect(Math.abs(readGroupFontSize - initialReadGroupFontSize)).toBeLessThanOrEqual(0.5);
+  expect(processFontSize).toBeGreaterThan(initialProcessFontSize + 4);
   expect(agentFontSize).toBeGreaterThan(initialAgentFontSize + 4);
   expect(composerFontSize).toBeGreaterThan(initialComposerFontSize + 2);
   expect(agentFontSize).toBe(composerFontSize);
-  expect(readGroupFontSize).toBeLessThan(composerFontSize);
+  expect(processFontSize).toBeLessThan(composerFontSize);
 
   await page.reload();
   await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
-  await expect(page.getByTestId("read-context-group")).toContainText("ChatArea.tsx");
+  await expect(page.getByTestId("live-turn-process-timeline")).toContainText("ChatArea.tsx");
   await expect(page.getByText("过程显示测试回复。")).toBeVisible();
   await expect(page.getByTestId("thinking-policy-action_only")).toHaveCount(0);
 });

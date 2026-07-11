@@ -119,8 +119,8 @@ test("materializes valid visible plan text into plan.md artifact", () => {
       "- 只允许 design 自动物化，避免越权写源码。",
       "",
       "## 验证方式",
-      "- 增加 Node 单测覆盖解析、清洗、提示词和计划物化。",
-      "- 通过 E2E 复现空响应与伪工具链路。",
+      "- 增加并运行 Node 单测，覆盖解析、清洗、提示词和计划物化。",
+      "- 运行 E2E，复现空响应与伪工具链路并检查恢复状态。",
       "",
       "## 开放问题",
       "- 是否需要为更多本地模型格式继续扩展兼容。",
@@ -264,13 +264,13 @@ test("materializes Gemma-style markdown fix plan without structured proposal tag
     "- 保留普通聊天的一次性操作审批，不影响轻量任务。",
     "",
     "### 验证方式",
-    "- 增加 Node 单测覆盖 Gemma4 普通方案和 quick reply 路由。",
-    "- 验证批准后仍可使用 Browser/Playwright 证据工具。",
+    "- 运行 Node 单测，覆盖 Gemma4 普通方案和 quick reply 路由。",
+    "- 使用 Browser/Playwright 打开审批流程并验证批准后的证据工具仍可调用。",
   ].join("\n");
 
   const result = materializePlanArtifactFromVisibleText({ visibleText });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.equal(result.path, ".MAIN/plans/plan.md");
   assert.equal(isMaterializablePlanLikeText(visibleText), true);
 });
@@ -379,7 +379,7 @@ test("materializes Gemma4 proposal plan with tables without leaking protocol mar
     ].join("\n"),
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.ok(["visible_plan", "canonicalized_visible_plan"].includes(result.source || ""));
   assert.match(result.content || "", /\| 文件 \| 改动 \|/);
   assert.match(result.content || "", /\| src\/App\.tsx \| 增加数据映射并接入上传流程 \|/);
@@ -650,8 +650,8 @@ test("materializes MVP defaults without requiring open questions", () => {
       "- ask 命令不进入静默 allow，降低联网和项目改写风险。",
       "",
       "## 验证方式",
-      "- Node 单测覆盖计划门禁。",
-      "- Rust 单测覆盖 builtin_default、ask 和 deny。",
+      "- 运行 `node --test tests/node/runtime-tools.test.mjs`，检查计划门禁用例全部通过。",
+      "- 运行 `cargo test permissions`，检查 builtin_default、ask 和 deny 用例全部通过。",
       "",
       "## 默认假设与后续增强",
       "- 自动保存历史版本：MVP 不做。",
@@ -659,7 +659,7 @@ test("materializes MVP defaults without requiring open questions", () => {
     ].join("\n"),
   });
 
-  assert.equal(result.ok, true);
+  assert.equal(result.ok, true, result.reason);
   assert.equal(result.path, ".MAIN/plans/plan.md");
   assert.match(result.content || "", /## 假设与默认值/);
   assert.match(result.content || "", /自动保存历史版本：MVP 不做/);
@@ -1658,6 +1658,132 @@ test("rejects the logged canonicalized MD Viewer plan with polluted summary and 
     "raw_evidence_in_plan_summary",
     "code_fragments_in_plan_key_changes",
   ].includes(validation.reason || ""));
+});
+
+test("rejects a structurally complete MD Viewer plan whose test plan is only diagnosis and assurances", () => {
+  const content = [
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复双击 Markdown 文件后无法打开的问题。",
+    "",
+    "## 已确认证据",
+    "- 已读取文件：src-tauri/src/main.rs。",
+    "- 已读取文件：src/main.js。",
+    "",
+    "## 关键改动",
+    "- 将 `app.on(\"open\", ...)` 改为 `app_handle.on_open_url(...)`。",
+    "- 确保 `SingleInstance` 的回调正确处理文件路径。",
+    "- 确保 `open_files` 命令正确触发前端事件。",
+    "- 确认 `dialog.open()` 的 Tauri v2 正确调用方式。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化。",
+    "",
+    "## 测试方案",
+    "- `main.rs` 中 `on_open_files` 事件监听器使用了错误的 API 名称。",
+    "- `src/main.js` 中 `dialog.open()` 的调用方式与 Tauri v2 不兼容。",
+    "- 需要读取 `src/main.js` 中 `openFile` 函数的完整实现以确认 dialog 调用细节。",
+    "- 确保 `SingleInstance` 正确传递文件路径给已运行的实例。",
+    "- 确保前端能接收并处理 `file-open` 事件。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持编辑器其他行为不变。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, "non_executable_test_plan");
+
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    userGoal: "修复双击 Markdown 文件无法打开的问题。",
+    evidenceRecords: [
+      { tool: "read_file", target: "src-tauri/src/main.rs", status: "succeeded", summary: "builder" },
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "openFile" },
+    ],
+    language: "zh",
+  });
+  assert.equal(materialized.ok, false);
+  assert.equal(materialized.reason, "non_executable_test_plan");
+});
+
+test("structural Plan repair preserves the canonical goal and executable MD Viewer test scenarios", () => {
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# MD Viewer 文件打开功能修复计划",
+      "",
+      "## 摘要",
+      "- 修复双击 Markdown 文件后打开空白，以及软件内‘打开’按钮不弹出文件选择窗口两个问题。",
+      "",
+      "## 已确认发现",
+      "- `src-tauri/src/main.rs` 当前包含文件打开事件与单实例处理。",
+      "- `src/main.js` 已导入 Tauri dialog 插件并包含 `openFile` 函数。",
+      "",
+      "## 未验证假设",
+      "- 未验证：`main.rs` 中事件监听 API 名称可能错误。",
+      "- 未验证：需要读取 `src/main.js` 中 `openFile` 的完整实现以确认细节。",
+      "",
+      "## 影响文件",
+      "- `src-tauri/src/main.rs`",
+      "- `src/main.js`",
+      "",
+      "## 实施步骤",
+      "### 步骤 1：修正后端文件打开事件",
+      "- 修改 `src-tauri/src/main.rs`，统一系统文件打开与单实例传递路径。",
+      "### 步骤 2：修正前端打开链路",
+      "- 修改 `src/main.js`，统一 dialog 返回值和 `file-open` 事件处理。",
+      "### 步骤 3：验证单实例逻辑",
+      "- 验证已运行实例接收新文件路径。",
+      "- 验证前端接收 `file-open` 事件。",
+      "",
+      "## 测试方案",
+      "1. 双击 `.md` 文件，验证软件打开并加载内容。",
+      "2. 软件已运行时双击另一个 `.md`，验证窗口切换到新文件。",
+      "3. 点击工具栏‘打开’，验证弹出文件选择窗口。",
+      "4. 选择文件后，验证编辑器加载内容并显示预览。",
+      "",
+      "## 假设与默认值",
+      "- 未验证假设只能指导定向检查，不能作为已确认根因。",
+    ].join("\n"),
+    userGoal: "修复双击 Markdown 文件后打开空白，以及软件内打开按钮失效的问题。",
+    evidenceRecords: [
+      { tool: "read_file", target: "src-tauri/src/main.rs", status: "succeeded", summary: "event setup" },
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "openFile" },
+    ],
+    language: "zh",
+  });
+
+  assert.equal(materialized.ok, true, materialized.reason);
+  assert.match(materialized.content || "", /双击 Markdown 文件后打开空白/);
+  assert.match(materialized.content || "", /## 关键改动[\s\S]*修改 `src-tauri\/src\/main\.rs`/);
+  const testPlan = (materialized.content || "").match(/## 测试方案\s*\n([\s\S]*?)(?=\n## |$)/)?.[1] || "";
+  assert.match(testPlan, /双击 `\.md` 文件/);
+  assert.match(testPlan, /点击工具栏‘打开’/);
+  assert.match(testPlan, /选择文件后/);
+  assert.doesNotMatch(testPlan, /需要读取|API 名称可能错误|未验证/);
+});
+
+test("grounding ignores test-plan file mentions as change targets", () => {
+  const validation = validatePlanEvidenceGrounding({
+    content: [
+      "# 计划",
+      "",
+      "## 已确认证据",
+      "- 已读取 `src/main.js`。",
+      "",
+      "## 关键改动",
+      "- 将文件打开事件改为统一 payload。",
+      "",
+      "## 测试方案",
+      "- 需要读取 `src/main.js` 中 `openFile` 的完整实现以确认细节。",
+    ].join("\n"),
+    evidenceRecords: [
+      { tool: "read_file", target: "src/main.js", status: "succeeded", summary: "openFile" },
+    ],
+  });
+  assert.equal(validation.ok, false);
+  assert.equal(validation.reason, "missing_grounded_plan_change_target");
 });
 
 test("actionable plan quality rejects implementation-heavy code dumps", () => {

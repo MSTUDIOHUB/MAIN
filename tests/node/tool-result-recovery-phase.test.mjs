@@ -33,6 +33,16 @@ test("tool result recovery phase owns post-tool recovery ordering", () => {
 });
 
 test("tool result recovery phase owns runtime state folds", () => {
+  assert.match(
+    phaseSource,
+    /const activateExecuteRecoveryAndSync[\s\S]*?executeRecoveryState = input\.activateExecuteRecovery\(mode, reason, context\)/,
+    "a recovery activation must update the phase-local state before the reducer returns",
+  );
+  assert.match(
+    phaseSource,
+    /handleNoProgressRecovery\(\{[\s\S]*?activateExecuteRecovery: activateExecuteRecoveryAndSync/,
+    "direct mutation mismatch recovery must use the synchronized activation path",
+  );
   assert.match(phaseSource, /applyPlanQualityRuntimeState\(/);
   assert.match(phaseSource, /applyNoProgressTrackingRuntimeState\(/);
   assert.match(phaseSource, /applyToolFailureSignatureRuntimeState\(/);

@@ -12,7 +12,7 @@ test.beforeEach(async ({ page }) => {
 test("plan runtime survives reload and can resume execution", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-reload-resume");
 
-  await expect(page.getByTestId("plan-stage-badge")).toContainText("执行中");
+  await expect(page.getByTestId("plan-stage-badge")).toContainText("已暂停");
   await expect(page.getByTestId("plan-resume-button")).toBeVisible();
   await expect(page.getByText("这个方案已经批准了，请继续把剩余任务做完。")).toBeVisible();
 
@@ -34,7 +34,7 @@ test("plan runtime survives reload and can resume execution", async ({ page }) =
 
   await page.reload();
 
-  await expect(page.getByTestId("plan-stage-badge")).toContainText("执行中");
+  await expect(page.getByTestId("plan-stage-badge")).toContainText("已暂停");
   await expect(page.getByTestId("plan-resume-button")).toBeVisible();
   await expect(page.getByText("这个方案已经批准了，请继续把剩余任务做完。")).toBeVisible();
 

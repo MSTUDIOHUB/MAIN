@@ -28,6 +28,7 @@ interface CommitMessageConfig {
     endpoint?: string;
     model?: string;
     apiKey?: string;
+    maxActiveRequests?: number;
   };
   cloud?: {
     protocol?: unknown;
@@ -42,6 +43,7 @@ interface CommitMessageConfig {
       mode?: unknown;
       tokenRef?: string;
     };
+    maxActiveRequests?: number;
   };
 }
 
@@ -68,10 +70,107 @@ export interface GeneratedGitCommitMessage {
 }
 
 const MAX_DIFF_FILES = 30;
+const DEFAULT_LOCAL_CHUNK_SUMMARY_CONCURRENCY = 1;
+const DEFAULT_BATCHED_LOCAL_CHUNK_SUMMARY_CONCURRENCY = 2;
+const DEFAULT_CLOUD_CHUNK_SUMMARY_CONCURRENCY = 3;
+const MAX_LOCAL_CHUNK_SUMMARIES = 4;
+const MAX_CLOUD_CHUNK_SUMMARIES = 12;
 
 const MAX_FALLBACK_FILES = 8;
 const MAX_FALLBACK_GROUPS = 4;
 const COMMIT_SUBJECT_MAX_LENGTH = 72;
+
+interface ModelRequestCapacityPool {
+  active: number;
+  limit: number;
+  waiters: Array<() => void>;
+}
+
+const modelRequestCapacityPools = new Map<string, ModelRequestCapacityPool>();
+
+function clampRequestConcurrency(value: unknown, fallback: number, max: number): number {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
+  return Math.max(1, Math.min(max, Math.floor(numeric)));
+}
+
+export function resolveGitCommitModelRequestConcurrency(config: CommitMessageConfig): number {
+  if (config.activeProfile === "cloud") {
+    return clampRequestConcurrency(
+      config.cloud?.maxActiveRequests,
+      DEFAULT_CLOUD_CHUNK_SUMMARY_CONCURRENCY,
+      6,
+    );
+  }
+
+  const provider = String(config.local?.provider || "").trim().toLowerCase();
+  const providerDefault = /(?:^|\b)ollama(?:\b|$)/i.test(provider)
+    ? DEFAULT_LOCAL_CHUNK_SUMMARY_CONCURRENCY
+    : /omlx|lm\s*studio|lmstudio/i.test(provider)
+      ? DEFAULT_BATCHED_LOCAL_CHUNK_SUMMARY_CONCURRENCY
+      : DEFAULT_LOCAL_CHUNK_SUMMARY_CONCURRENCY;
+  return clampRequestConcurrency(config.local?.maxActiveRequests, providerDefault, 4);
+}
+
+function getModelRequestCapacityKey(config: CommitMessageConfig): string {
+  const isCloud = config.activeProfile === "cloud";
+  const active = isCloud ? config.cloud : config.local;
+  return [
+    isCloud ? "cloud" : "local",
+    String(active?.provider || "").trim().toLowerCase(),
+    String(active?.endpoint || "").trim().replace(/\/$/, "").toLowerCase(),
+    String(active?.model || "").trim().toLowerCase(),
+  ].join("\u001f");
+}
+
+function drainModelRequestCapacityPool(pool: ModelRequestCapacityPool): void {
+  while (pool.active < pool.limit && pool.waiters.length > 0) {
+    const resume = pool.waiters.shift();
+    if (!resume) break;
+    pool.active += 1;
+    resume();
+  }
+}
+
+async function acquireModelRequestCapacity(config: CommitMessageConfig): Promise<() => void> {
+  const key = getModelRequestCapacityKey(config);
+  const limit = resolveGitCommitModelRequestConcurrency(config);
+  const pool = modelRequestCapacityPools.get(key) || { active: 0, limit, waiters: [] };
+  pool.limit = limit;
+  modelRequestCapacityPools.set(key, pool);
+
+  if (pool.active < pool.limit) {
+    pool.active += 1;
+  } else {
+    await new Promise<void>((resolve) => {
+      pool.waiters.push(resolve);
+      drainModelRequestCapacityPool(pool);
+    });
+  }
+
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    pool.active = Math.max(0, pool.active - 1);
+    drainModelRequestCapacityPool(pool);
+    if (pool.active === 0 && pool.waiters.length === 0) {
+      modelRequestCapacityPools.delete(key);
+    }
+  };
+}
+
+async function withModelRequestCapacity<T>(
+  config: CommitMessageConfig,
+  task: () => Promise<T>,
+): Promise<T> {
+  const release = await acquireModelRequestCapacity(config);
+  try {
+    return await task();
+  } finally {
+    release();
+  }
+}
 
 function trimToLength(value: string, maxLength: number) {
   const trimmed = value.trim();
@@ -696,8 +795,16 @@ export async function invokeModelWithMessages(params: GenerateGitCommitMessagePa
     timerId = globalThis.setTimeout(() => reject(new Error("Commit message generation timed out")), 60_000);
   });
   try {
+    // Capacity is global per profile/provider/endpoint/model, so two UI
+    // actions cannot each create their own unbounded local-model fan-out. If
+    // the UI timeout wins, this promise continues holding its slot until the
+    // underlying Rust/fetch request actually settles; a non-cancellable curl
+    // fallback must not be mistaken for released model capacity.
+    const requestPromise = withModelRequestCapacity(params.config, () =>
+      requestJson({ url, method: "POST", headers, body, isCloud, authMode: cloudAuthMode, tokenRef: cloudTokenRef })
+    );
     const payload = await Promise.race([
-      requestJson({ url, method: "POST", headers, body, isCloud, authMode: cloudAuthMode, tokenRef: cloudTokenRef }),
+      requestPromise,
       timeout,
     ]);
 
@@ -852,24 +959,125 @@ async function requestModelFinalCommitMessage(params: GenerateGitCommitMessagePa
   return sanitizeGitCommitMessage(raw);
 }
 
+async function mapWithBoundedConcurrency<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  worker: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (items.length === 0) return [];
+
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+  const workerCount = Math.min(items.length, Math.max(1, Math.floor(concurrency)));
+
+  const runWorker = async () => {
+    while (true) {
+      const index = nextIndex;
+      if (index >= items.length) return;
+      nextIndex += 1;
+      results[index] = await worker(items[index], index);
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  return results;
+}
+
+function resolveChunkSummaryConcurrency(config: CommitMessageConfig): number {
+  return resolveGitCommitModelRequestConcurrency(config);
+}
+
+function selectRepresentativeDiffChunks(
+  chunks: string[],
+  config: CommitMessageConfig,
+): { chunks: string[]; omittedCount: number } {
+  const maxChunks = config.activeProfile === "cloud"
+    ? MAX_CLOUD_CHUNK_SUMMARIES
+    : MAX_LOCAL_CHUNK_SUMMARIES;
+  if (chunks.length <= maxChunks) return { chunks, omittedCount: 0 };
+
+  const selectedIndexes = new Set<number>();
+  for (let index = 0; index < maxChunks; index += 1) {
+    selectedIndexes.add(Math.round(index * (chunks.length - 1) / Math.max(1, maxChunks - 1)));
+  }
+  const selected = [...selectedIndexes]
+    .sort((left, right) => left - right)
+    .map((index) => chunks[index])
+    .filter(Boolean);
+  return {
+    chunks: selected,
+    omittedCount: Math.max(0, chunks.length - selected.length),
+  };
+}
+
 
 export async function generateGitCommitMessage(params: GenerateGitCommitMessageParams): Promise<GeneratedGitCommitMessage> {
   try {
     const chunks = buildDiffChunks(params.entries, params.status);
     let finalModelMessage: string | null = null;
-    
+    const concurrency = resolveChunkSummaryConcurrency(params.config);
+
     if (chunks.length === 1) {
+      console.info("[gitCommitMessage] generation_scheduled", {
+        workspace: params.workspace,
+        profile: params.config.activeProfile === "cloud" ? "cloud" : "local",
+        provider: params.config.activeProfile === "cloud"
+          ? params.config.cloud?.provider
+          : params.config.local?.provider,
+        model: params.config.activeProfile === "cloud"
+          ? params.config.cloud?.model
+          : params.config.local?.model,
+        diffChunkCount: 1,
+        selectedChunkCount: 1,
+        omittedChunkCount: 0,
+        requestConcurrency: concurrency,
+        maxModelRequestCount: 1,
+      });
       finalModelMessage = await requestModelCommitMessage(params, chunks[0]);
     } else {
-      const chunkPromises = chunks.map(chunk => requestModelChunkSummary(params, chunk));
-      const chunkSummaries = await Promise.all(chunkPromises);
+      const selectedChunks = selectRepresentativeDiffChunks(chunks, params.config);
+      console.info("[gitCommitMessage] generation_scheduled", {
+        workspace: params.workspace,
+        profile: params.config.activeProfile === "cloud" ? "cloud" : "local",
+        provider: params.config.activeProfile === "cloud"
+          ? params.config.cloud?.provider
+          : params.config.local?.provider,
+        model: params.config.activeProfile === "cloud"
+          ? params.config.cloud?.model
+          : params.config.local?.model,
+        diffChunkCount: chunks.length,
+        selectedChunkCount: selectedChunks.chunks.length,
+        omittedChunkCount: selectedChunks.omittedCount,
+        requestConcurrency: concurrency,
+        maxModelRequestCount: selectedChunks.chunks.length + 1,
+      });
+      const chunkSummaries = await mapWithBoundedConcurrency(
+        selectedChunks.chunks,
+        concurrency,
+        (chunk) => requestModelChunkSummary(params, chunk),
+      );
       const validSummaries = chunkSummaries.filter(Boolean);
       if (validSummaries.length > 0) {
-        finalModelMessage = await requestModelFinalCommitMessage(params, validSummaries.join("\n\n"));
+        const deterministicCoverage = selectedChunks.omittedCount > 0
+          ? [
+              params.language === "zh"
+                ? `本地聚合覆盖：另有 ${selectedChunks.omittedCount} 个 diff 分块未逐块调用模型。`
+                : `Local aggregation coverage: ${selectedChunks.omittedCount} additional diff chunks were not sent as individual model requests.`,
+              buildFallbackGitCommitMessage(params.entries, params.language, params.status),
+            ].join("\n")
+          : "";
+        finalModelMessage = await requestModelFinalCommitMessage(
+          params,
+          [...validSummaries, deterministicCoverage].filter(Boolean).join("\n\n"),
+        );
       }
     }
 
     if (finalModelMessage && isDetailedEnoughGitCommitMessage(finalModelMessage, params.entries, params.status)) {
+      console.info("[gitCommitMessage] generation_completed", {
+        workspace: params.workspace,
+        source: "model",
+      });
       return { message: finalModelMessage, source: "model" };
     }
   } catch (e) {
@@ -877,6 +1085,10 @@ export async function generateGitCommitMessage(params: GenerateGitCommitMessageP
     // Fall through to deterministic local generation.
   }
 
+  console.info("[gitCommitMessage] generation_completed", {
+    workspace: params.workspace,
+    source: "fallback",
+  });
   return {
     message: buildFallbackGitCommitMessage(params.entries, params.language, params.status),
     source: "fallback",

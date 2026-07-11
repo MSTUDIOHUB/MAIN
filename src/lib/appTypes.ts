@@ -44,6 +44,8 @@ export interface LocalConfig {
   contextLimit: number;
   apiKey: string;
   toolProtocol?: CloudToolProtocol;
+  /** Optional provider capacity override used by bounded auxiliary model jobs. */
+  maxActiveRequests?: number;
 }
 
 export type CloudConfig = CloudProfileConfig;

@@ -109,7 +109,7 @@ test("game studio help renders local command markdown instead of system pill", a
     .toEqual({ conversationTurns: 1, currentTurnStatus: "done" });
 });
 
-test("game studio continuation keeps previous plan turn identity", async ({ page }) => {
+test("game studio continuation creates a new logical turn while preserving plan context", async ({ page }) => {
   await page.goto("/?e2eScenario=game-studio-plan-shortcuts");
 
   await page.evaluate(() =>
@@ -127,11 +127,15 @@ test("game studio continuation keeps previous plan turn identity", async ({ page
         return {
           currentTurnIntent: snapshot?.currentTurnIntent ?? null,
           conversationTurns: snapshot?.conversationTurns ?? null,
+          currentTurnId: snapshot?.currentTurnId ?? null,
+          turnIds: snapshot?.turnIds ?? [],
         };
       }),
     )
     .toEqual({
       currentTurnIntent: "plan",
-      conversationTurns: 1,
+      conversationTurns: 2,
+      currentTurnId: expect.not.stringMatching(/^e2e-game-studio-plan-continuation-turn$/),
+      turnIds: expect.arrayContaining(["e2e-game-studio-plan-continuation-turn"]),
     });
 });

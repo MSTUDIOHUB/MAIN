@@ -1,4 +1,4 @@
-import { previewApplyPatch } from "./applyPatchTool";
+import { previewApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 
 export type WorkspaceMutationPreflightReason =
   | "not_applicable"
@@ -13,6 +13,8 @@ export interface WorkspaceMutationPreflightResult {
   ok: boolean;
   reason?: WorkspaceMutationPreflightReason;
   message?: string;
+  /** Best available workspace target for recovery and progress correlation. */
+  path?: string;
 }
 
 export interface WorkspaceMutationPreflightInput {
@@ -77,6 +79,7 @@ function blocked(input: {
     ok: false,
     reason: input.reason,
     message: buildMessage(input),
+    path: input.path,
   };
 }
 
@@ -96,12 +99,15 @@ export async function preflightWorkspaceMutation(
     if (typeof patch !== "string" || !patch.trim()) {
       return blocked({ reason: "missing_content", toolName, path: "patch", language });
     }
+    const patchTarget = summarizeApplyPatchTarget(patch) ||
+      patch.match(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/m)?.[1]?.trim() ||
+      "patch";
     const preview = await previewApplyPatch(patch, input.readFile);
     if (!preview.ok) {
       return blocked({
         reason: "invalid_patch",
         toolName,
-        path: preview.changes[0]?.path || "patch",
+        path: preview.changes[0]?.path || patchTarget,
         language,
         detail: preview.error,
       });

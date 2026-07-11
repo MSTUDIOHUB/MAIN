@@ -107,11 +107,10 @@ export function isCurrentGoalControlResolution(input: {
   if (!identity || !input.goalId) return false;
   if (identity.goalId !== input.goalId || identity.goalRevision !== input.goalRevision) return false;
 
-  const pendingGoalConfirmation = input.request?.kind === "goal_confirmation" &&
-    input.request.status === "pending"
-      ? input.request
-      : null;
-  if (!pendingGoalConfirmation) return !identity.requestId;
+  const pendingRequest = input.request?.status === "pending" ? input.request : null;
+  if (!pendingRequest) return !identity.requestId;
+  if (pendingRequest.kind !== "goal_confirmation") return false;
+  const pendingGoalConfirmation = pendingRequest;
   if (
     pendingGoalConfirmation.goalId !== input.goalId ||
     pendingGoalConfirmation.goalRevision !== input.goalRevision
@@ -125,6 +124,40 @@ export function isCurrentGoalControlResolution(input: {
     input.runOwner.sessionKey === confirmation.sessionKey &&
     input.runOwner.turnId === confirmation.turnId &&
     input.runOwner.runId === confirmation.runId;
+}
+
+/** Pause and clear are administrative Goal controls rather than resolutions of
+ * a pending permission/choice. They still bind the exact Goal revision, and a
+ * request id (when captured) must match the current Goal confirmation. */
+export function isCurrentGoalAdministrativeControl(input: {
+  request: ActionRequest | null | undefined;
+  identity: GoalControlIdentity | null | undefined;
+  goalId: string | null | undefined;
+  goalRevision: number;
+}): boolean {
+  const identity = input.identity;
+  if (!identity || !input.goalId) return false;
+  if (identity.goalId !== input.goalId || identity.goalRevision !== input.goalRevision) return false;
+  const confirmation = input.request?.kind === "goal_confirmation" &&
+    input.request.status === "pending" &&
+    input.request.goalId === input.goalId &&
+    input.request.goalRevision === input.goalRevision
+      ? input.request
+      : null;
+  if (!confirmation) return !identity.requestId;
+  return confirmation.requestId === identity.requestId;
+}
+
+export function clearGoalConfirmationActionRequest(
+  request: ActionRequest | null | undefined,
+  goalId: string,
+  goalRevision: number,
+): ActionRequest | null {
+  return request?.kind === "goal_confirmation" &&
+    request.goalId === goalId &&
+    request.goalRevision === goalRevision
+    ? null
+    : request || null;
 }
 
 export function toUserChoiceResolutionIdentity(

@@ -68,6 +68,7 @@ const {
   buildReadBeforeModifyValidationError,
   summarizeReadFileRepeatLimitBatch,
   buildReadFileRepeatLimitBatchPauseNotice,
+  getOriginalUserPromptForPlanFallback,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
 // Mock callbacks for the orchestrator
@@ -86,6 +87,30 @@ function createMockCallbacks(options = {}) {
     ...options,
   };
 }
+
+test("Plan fallback selects canonical turn input instead of ContextState or hidden approval prompts", () => {
+  const callbacks = createMockCallbacks({
+    messages: [
+      {
+        role: "user",
+        content: "[System: ContextState]\nconstraints: do not persist [turn_intake] wrappers\nLatest user request: stale packet",
+      },
+      {
+        role: "user",
+        content: "[turn_intake]\n[user_request]\n修复双击 Markdown 文件后空白和打开按钮失效的问题。\n[/user_request]\n[/turn_intake]",
+      },
+      {
+        role: "user",
+        content: "[turn_intake]\n[user_request]\n计划已批准。请继续执行已批准计划。\n[/user_request]\n[/turn_intake]",
+      },
+    ],
+  });
+
+  assert.equal(
+    getOriginalUserPromptForPlanFallback(callbacks),
+    "修复双击 Markdown 文件后空白和打开按钮失效的问题。",
+  );
+});
 
 test("buildShellReadValidationError blocks command starting with cat/head/tail/sed", () => {
   const tcRun = { id: "call_run", name: "run_command" };

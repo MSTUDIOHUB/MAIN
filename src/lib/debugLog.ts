@@ -290,7 +290,7 @@ function classifyConsoleLog(args: unknown[]): {
     };
   }
 
-  const bracketMatch = first.match(/^\[(orchestrator|streaming|streamViaRustProxy|sendMessage|contextTrim)\]\s*(.*)$/);
+  const bracketMatch = first.match(/^\[(orchestrator|streaming|streamViaRustProxy|sendMessage|contextTrim|gitCommitMessage)\]\s*(.*)$/);
   if (bracketMatch) {
     const source = bracketMatch[1] === "sendMessage" ? "store.sendMessage" : bracketMatch[1];
     const tail = bracketMatch[2]?.trim();

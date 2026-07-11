@@ -70,6 +70,14 @@ const {
 const {
   shouldSuppressPlanTruncationWarning,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
+const {
+  resolveRecoveryToolChoice,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"));
+const {
+  APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
+  buildApprovedPlanStreamWatchdogRecoveryPrompt,
+  shouldAttemptApprovedPlanStreamWatchdogRecovery,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"));
 
 test("classifies no-visible-token stream timeout as a plan watchdog timeout", () => {
   const error = createStreamNoVisibleTokenTimeoutError(125_000, "plan:preapproval_xml_tools");
@@ -99,6 +107,52 @@ test("classifies recovery stream max elapsed timeout as watchdog pause", () => {
   assert.equal(error.code, "STREAM_MAX_ELAPSED_TIMEOUT");
   assert.match(error.message, /maximum stream duration 90000ms exceeded/);
   assert.equal(isStreamWatchdogTimeoutMessage(error.message), true);
+});
+
+test("approved plan action recovery requires a native tool call even while execute recovery is normal", () => {
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    approvedPlanActionOnlyRecoveryActive: true,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolCount: 7,
+    forceXmlTools: false,
+  }), "required");
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolCount: 7,
+    forceXmlTools: false,
+  }), undefined);
+});
+
+test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {
+  const message = createStreamMaxElapsedTimeoutError(45_000, "approved_plan_recovery").message;
+  const base = {
+    message,
+    activeProfile: "local",
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    isExecuteRecoveryEligible: false,
+    approvedPlanActionOnlyRecoveryActive: true,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolCount: 7,
+    forceXmlTools: false,
+  };
+  assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery(base), true);
+  assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery({
+    ...base,
+    approvedPlanActionOnlyRecoveryActive: false,
+  }), false);
+  assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery({
+    ...base,
+    forceXmlTools: true,
+  }), false);
+  assert.equal(APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS, 45_000);
+  assert.match(buildApprovedPlanStreamWatchdogRecoveryPrompt("zh"), /直接调用一个可用工具/);
 });
 
 test("detects reasoning-dominated length results before max output escalation", () => {

@@ -12,8 +12,8 @@ test.beforeEach(async ({ page }) => {
 test("plan panel refreshes when tasks.md is updated through replace_in_file", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-replace-refresh");
 
-  await expect(page.getByTestId("plan-stage-badge")).toContainText("执行中");
-  await expect(page.getByText("任务 1/3")).toBeVisible();
+  await expect(page.getByTestId("plan-stage-badge")).toContainText("已暂停");
+  await expect(page.getByText("1/3", { exact: true })).toBeVisible();
   await expect(page.getByTestId("markdown-table").locator("table")).toBeVisible();
   await expect(page.getByRole("columnheader", { name: "验证项" })).toBeVisible();
   await expect(page.getByRole("cell", { name: "PlanPanel 表格" })).toBeVisible();
@@ -49,7 +49,7 @@ test("plan panel refreshes when tasks.md is updated through replace_in_file", as
       artifactIncludesCompletedLine: true,
     });
 
-  await expect(page.getByText("任务 2/3")).toBeVisible();
+  await expect(page.getByText("2/3", { exact: true })).toBeVisible();
   await expect(page.getByText("保存方案供用户留档（已完成）").first()).toBeVisible();
 });
 

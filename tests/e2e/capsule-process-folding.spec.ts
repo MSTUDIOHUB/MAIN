@@ -26,13 +26,22 @@ test("capsule preserves model explanation while tools are folded", async ({ page
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
-  await expect(page.getByTestId("live-turn-process-toggle")).toHaveAttribute("aria-expanded", "false");
+  const processDisclosure = page.getByTestId("turn-process-disclosure");
+  await expect(processDisclosure).toHaveAttribute("aria-expanded", "true");
+  await expect(processDisclosure).toContainText("3 个工具");
+  await processDisclosure.click();
+  await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
+  await expect(timeline).toHaveCount(0);
+  await expect(capsule).toContainText("保留这条模型说明");
+
+  await processDisclosure.click();
+  await expect(timeline).toBeVisible();
+  await expect(page.getByTestId("live-turn-process-toggle")).toHaveAttribute("aria-expanded", "true");
   await expect(page.getByTestId("tool-status-label")).toHaveCount(0);
   await expect(page.getByTestId("tool-collapsed-summary")).toHaveCount(0);
   await expect(page.getByTestId("chat-operation-summary")).toHaveCount(0);
   await expect(page.getByTestId("completed-tool-group-summary")).toHaveCount(0);
 
-  await page.getByTestId("live-turn-process-toggle").click();
   await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
   await expect(page.getByTestId("live-turn-process-details")).toContainText("运行回归测试确认折叠状态");
 });
@@ -56,7 +65,6 @@ test("turn process timeline stays inside its frame in a narrow viewport", async 
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();
-  await page.getByTestId("live-turn-process-toggle").click();
   await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
 
   const overflowing = await page.evaluate(() => {

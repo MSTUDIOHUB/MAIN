@@ -1593,6 +1593,13 @@ function isRuntimeTaskActionableText(text: string): boolean {
     return true;
   }
 
+  // A read/inspect sentence can contain mutation nouns such as “the complete
+  // implementation”. Treat the leading intent as authoritative unless the
+  // same sentence explicitly pivots from inspection to a write action.
+  const hasLeadingReadOnlyIntent = /^(?:(?:需要|需|先|请|继续|首先|下一步)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解)|^(?:(?:need(?:s)?\s+to|first|please|next)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand)\b/i.test(normalized.trim());
+  const hasMutationAfterRead = /(?:然后|随后|之后|再|并(?:且)?).{0,100}(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出)|(?:then|after(?:wards)?|and then).{0,100}(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i.test(normalized);
+  if (hasLeadingReadOnlyIntent && !hasMutationAfterRead) return false;
+
   if (RUNTIME_TASK_MUTATION_RE.test(normalized)) return true;
   if (RUNTIME_TASK_VERIFICATION_RE.test(normalized)) return true;
   if (RUNTIME_TASK_READ_ONLY_RE.test(normalized) || RUNTIME_TASK_FILE_ROLE_RE.test(normalized)) return false;
@@ -2149,6 +2156,26 @@ function insertPlanSectionAfterTitle(content: string, section: string): string {
   return `${before}\n\n${section.trim()}${after ? `\n\n${after}` : ""}`.trim();
 }
 
+function extractReusablePlanImplementationBody(content: string): string {
+  const body: string[] = [];
+  let inSection = false;
+  let sectionLevel = 0;
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const heading = line.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const level = heading[1]?.length || 0;
+      if (inSection && level <= sectionLevel) break;
+      if (!inSection && /^(?:实施步骤|执行步骤|修复步骤|拟定方案|落地方案|Implementation Steps|Execution Steps|Plan of Work|Implementation Plan|Approach)$/i.test(heading[2] || "")) {
+        inSection = true;
+        sectionLevel = level;
+        continue;
+      }
+    }
+    if (inSection) body.push(line);
+  }
+  return body.join("\n").trim();
+}
+
 export function repairActionablePlanArtifactContent(input: {
   content: string;
   userGoal?: string;
@@ -2182,9 +2209,20 @@ export function repairActionablePlanArtifactContent(input: {
   const repairedSections: string[] = [];
 
   if (missingSections.includes("key_changes")) {
+    const reusableImplementation = extractReusablePlanImplementationBody(repaired);
+    const verificationOnly =
+      !reusableImplementation &&
+      /(?:关键验证步骤|仅验证现有逻辑|旨在.{0,80}验证|verification[- ]only|verify the existing)/i.test(repaired);
+    const keyChangesBody = reusableImplementation || (verificationOnly
+      ? language === "en"
+        ? "- Do not modify application source; execute the named verification steps and test plan, and record their results."
+        : "- 不修改业务源码；执行计划中列出的验证步骤和测试方案，并记录结果。"
+      : language === "en"
+        ? "- Implement the smallest targeted change described by the affected files and execution steps, preserving existing behavior outside that scope."
+        : "- 按影响文件和执行步骤实施最小必要改动，保持范围外现有行为不变。");
     const section = language === "en"
-      ? "## Key Changes\n- Implement the smallest targeted change described by the affected files and execution steps, preserving existing behavior outside that scope."
-      : "## 关键改动\n- 按影响文件和执行步骤实施最小必要改动，保持范围外现有行为不变。";
+      ? `## Key Changes\n${keyChangesBody}`
+      : `## 关键改动\n${keyChangesBody}`;
     repaired = insertPlanSectionAfterTitle(repaired, section);
     repairedSections.push("key_changes");
   }
@@ -2580,6 +2618,21 @@ export function validateActionablePlanArtifact(
     /(?:公共\s*API|接口|类型|Public APIs?|Interfaces?|Types?).{0,120}(?:新增|修改|变化|保持|不变|added|modified|changed|unchanged|preserved)/i.test(raw) ||
     hasAnyContentUnderSection(raw, /(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i);
   const hasTestPlan = /(?:^|\n)\s*#{1,6}\s*(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)/i.test(raw);
+  const testPlanBody = extractPlanSectionBody(
+    raw,
+    /^(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)$/i,
+  );
+  const hasConcreteTestCommand = /`\s*(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[\w:-]+|npx\s+\S+|node\s+--test\b|cargo\s+(?:test|check|build|clippy)\b|pytest\b|python\d*\s+-m\s+\S+|go\s+test\b|swift\s+test\b|dotnet\s+test\b|mvn\s+test\b|gradle\w*\s+\S+)/i.test(testPlanBody);
+  const hasConcreteManualOrToolScenario =
+    /(?:运行|执行).{0,100}(?:单元测试|集成测试|端到端测试|E2E|Playwright|测试套件|测试|构建|编译|lint|类型检查)/i.test(testPlanBody) ||
+    /(?:运行|执行|启动|构建|编译|手动|浏览器|桌面|Playwright|E2E|双击|拖放|打开|点击|导入|保存|刷新).{0,140}(?:验证|确认|检查|断言|比较|预期|应当|成功|失败|通过|结果)/i.test(testPlanBody) ||
+    /(?:验证|确认|检查|断言|比较).{0,140}(?:打开|点击|双击|拖放|导入|保存|渲染|事件|窗口|状态|输出|结果|错误|回退|流程|链路)/i.test(testPlanBody) ||
+    /(?:run|execute).{0,100}(?:unit tests?|integration tests?|end-to-end tests?|E2E|Playwright|test suites?|tests?|build|compile|lint|typecheck)/i.test(testPlanBody) ||
+    /(?:run|execute|start|build|compile|manually|browser|desktop|Playwright|E2E|double[- ]click|drag|drop|open|click|import|save|reload).{0,140}(?:verify|assert|check|compare|expect|should|success|failure|pass|result)/i.test(testPlanBody) ||
+    /(?:verify|assert|check|compare).{0,140}(?:open|click|double[- ]click|drag|drop|import|save|render|event|window|state|output|result|error|fallback|flow)/i.test(testPlanBody);
+  if (hasTestPlan && !hasConcreteTestCommand && !hasConcreteManualOrToolScenario) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "non_executable_test_plan" });
+  }
   const hasConcreteChangeSignal =
     /(?:修改|更新|新增|修复|补齐|调整|接入|生成|实现|重构|保持|不改变|不新增|验证|运行|modify|update|add|fix|adjust|wire|generate|implement|refactor|preserve|unchanged|run|verify)/i.test(raw) &&
     hasTargetOrData;

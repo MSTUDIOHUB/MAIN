@@ -868,6 +868,31 @@ test("runtime plan task derivation skips approved-plan diagnostic read loops", (
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src/store/dashboardStore.ts")), false);
 });
 
+test("runtime plan task derivation does not treat '完整实现' in a read sentence as a mutation task", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# 计划",
+        "",
+        "## 关键改动",
+        "- 修改 `src-tauri/src/main.rs`，接入文件打开事件。",
+        "",
+        "## 测试方案",
+        "- 需要读取 `src/main.js` 中 `openFile` 函数的完整实现以确认 dialog 调用细节。",
+        "- 运行 `cargo check` 验证 Rust 编译。",
+      ].join("\n"),
+    },
+  ], { language: "zh" });
+
+  assert.equal(tasks.some((task) => /需要读取|完整实现/.test(task.text)), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.value === "src-tauri/src/main.rs")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value === "cargo check")), true);
+});
+
 test("runtime plan task derivation does not turn code identifiers into shell command tasks", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {

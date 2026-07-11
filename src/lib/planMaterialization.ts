@@ -904,7 +904,7 @@ const PLAN_GROUNDING_READ_TOOLS = new Set([
   "get_file_outline",
 ]);
 const PLAN_CHANGE_TARGET_FILE_RE = /(?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_@.-]+\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html|md)\b/gi;
-const PLAN_CHANGE_LINE_RE = /(?:修改|更新|改动|重构|修复|替换|移除|接入|迁移|modify|update|change|refactor|fix|replace|remove|wire|migrate)/i;
+const PLAN_EXPLICIT_MUTATION_RE = /(?:修改|更新|改动|改为|新增|添加|实现|生成|创建|删除|重构|修复|替换|移除|接入|迁移|modify|update|change|add|implement|generate|create|delete|refactor|fix|replace|remove|wire|migrate)/i;
 const PLAN_NEW_FILE_LINE_RE = /(?:新增文件|新建文件|创建新文件|add\s+(?:a\s+)?new\s+file|create\s+(?:a\s+)?new\s+file)/i;
 const PLAN_CONFIRMED_EVIDENCE_HEADING_RE = /(?:^|\n)\s*#{1,6}\s*(?:已确认(?:事实|发现|证据)|已读证据|证据依据|Confirmed (?:Facts|Findings|Evidence)|Read Evidence|Evidence)\s*$/im;
 const PLAN_KEY_CHANGES_HEADING_RE = /^(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)$/i;
@@ -923,6 +923,27 @@ function planGroundingPathsMatch(left: string, right: string): boolean {
   const b = normalizePlanGroundingPath(right);
   if (!a || !b) return false;
   return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+}
+
+function isPlanMutationLine(value: string): boolean {
+  const line = String(value || "")
+    .replace(/^\s*(?:[-*]|\d+[.)、])\s+/, "")
+    .trim();
+  if (!line) return false;
+
+  // Validation and investigation prose often mentions mutation nouns (for
+  // example, “检查结果是否包含关键实现改动”). The leading intent owns the
+  // sentence unless it explicitly pivots to a write action.
+  const hasLeadingReadOrValidationIntent = /^(?:(?:需要|需|先|请|继续|首先|最后|下一步)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解|验证|测试|运行|执行)|^(?:(?:need(?:s)?\s+to|first|please|finally|next)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand|verify|test|run|execute)\b/i.test(line);
+  const hasMutationAfterIntent = /(?:然后|随后|之后|再|并(?:且)?).{0,120}(?:修改|更新|改为|重构|修复|替换|移除|接入|迁移)|(?:then|after(?:wards)?|and then).{0,120}(?:modify|update|change|refactor|fix|replace|remove|wire|migrate)/i.test(line);
+  if (hasLeadingReadOrValidationIntent && !hasMutationAfterIntent) return false;
+
+  // A verification-only plan may explicitly state that source code remains
+  // unchanged. That is a scope constraint, not a mutation target.
+  if (/^(?:不(?:会|需|需要|计划)?修改|无需修改|不改变|保持.+不变|no\s+(?:source\s+)?changes?|do\s+not\s+modify|keep.+unchanged)/i.test(line)) {
+    return false;
+  }
+  return PLAN_EXPLICIT_MUTATION_RE.test(line);
 }
 
 function collectReadEvidenceTargets(input: {
@@ -956,9 +977,13 @@ function collectReadEvidenceTargets(input: {
 
 function collectPlanChangeTargets(content: string): string[] {
   const targets: string[] = [];
-  for (const rawLine of String(content || "").split(/\r?\n/)) {
+  const keyChangesBody = extractPlanGroundingSectionBody(
+    content,
+    PLAN_KEY_CHANGES_HEADING_RE,
+  );
+  for (const rawLine of keyChangesBody.split(/\r?\n/)) {
     const line = rawLine.trim();
-    if (!line || !PLAN_CHANGE_LINE_RE.test(line) || PLAN_NEW_FILE_LINE_RE.test(line)) continue;
+    if (!line || !isPlanMutationLine(line) || PLAN_NEW_FILE_LINE_RE.test(line)) continue;
     for (const match of line.matchAll(PLAN_CHANGE_TARGET_FILE_RE)) {
       const target = normalizePlanGroundingPath(match[0] || "");
       if (
@@ -1006,7 +1031,7 @@ export function validatePlanEvidenceGrounding(input: {
   );
   const hasSourceBackedMutationPlan =
     readTargets.some((target) => /\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html)$/i.test(target)) &&
-    PLAN_CHANGE_LINE_RE.test(keyChangesBody);
+    keyChangesBody.split(/\r?\n/).some(isPlanMutationLine);
   if (changeTargets.length === 0) {
     return hasSourceBackedMutationPlan
       ? classifyPlanArtifactQualityResult({ ok: false, reason: "missing_grounded_plan_change_target" })
@@ -1506,8 +1531,11 @@ export function canonicalizePlanArtifactContent(input: {
     ], 5, 2000, true),
   ], 5, 2000, true);
   const validationLines = collectLinesFromSections(sections, [
-    /(?:验证|测试|构建|验收|Validation|Testing|Acceptance|Build|Checks)/i,
-  ], 5, 4000, true);
+    // Match validation sections by role, not by a loose substring. In the
+    // logged MD Viewer incident, “未验证假设” and “步骤 3：验证…” consumed the
+    // five-line limit before the real 测试方案 section was reached.
+    /^(?:验证(?:方式|标准|方案|步骤)?|测试(?:方案|计划|场景|步骤)?|构建(?:检查)?|验收(?:标准|方案)?|Validation(?: Plan| Steps| Standards?)?|Testing|Test Plan|Acceptance(?: Criteria| Plan)?|Build(?: Checks?)?|Checks?)$/i,
+  ], 8, 4000, true);
 
   const hasRequiredSignals = [
     goalLines.length > 0,
@@ -1833,7 +1861,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   // Final validation: if still not ok and canonicalization can help, try it
   if (
     !validation.ok &&
-    !/generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|generic_theme_token_plan|placeholder_validation_plan|excessive_plan_code_dump/i.test(validation.reason || "")
+    !/generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|generic_theme_token_plan|placeholder_validation_plan|non_executable_test_plan|excessive_plan_code_dump/i.test(validation.reason || "")
   ) {
     const canonical = canonicalizePlanArtifactContent({
       content,

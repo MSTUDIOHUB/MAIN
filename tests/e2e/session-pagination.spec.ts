@@ -12,6 +12,21 @@ test.beforeEach(async ({ page }) => {
       { id: 2001, title: "Short Session", date: now, active: true, storageStatus: "temporary", recordingDisabled: true },
       { id: 2002, title: "Paged Session", date: now, active: false, storageStatus: "ok", recordingDisabled: false },
     ];
+    const shortTurns = [{
+      id: "short-turn",
+      userPrompt: "Short Session",
+      title: "Short Session",
+      mode: "chat",
+      status: "done",
+      summary: "Short content",
+      blockIds: [1, 2],
+      collapsed: false,
+      createdAt: 1,
+    }];
+    const shortMessages = [
+      { id: 1, turnId: "short-turn", type: "user", content: "Short Session" },
+      { id: 2, turnId: "short-turn", type: "agent", content: "Short content", streaming: false },
+    ];
     const turns = Array.from({ length: 320 }, (_, index) => {
       const turnNumber = index + 1;
       return {
@@ -97,12 +112,15 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return sessions;
       if (cmd === "save_project_session") return new Promise((resolve) => setTimeout(() => resolve(args?.session ?? {}), 700));
       if (cmd === "load_project_session_meta") {
+        const requestedId = Number(args?.sessionId ?? 2002);
+        const isPagedSession = requestedId === 2002;
         return {
-          id: Number(args?.sessionId ?? 2002),
-          title: "Paged Session",
+          id: requestedId,
+          title: isPagedSession ? "Paged Session" : "Short Session",
           date: now,
-          active: false,
-          storageStatus: "ok",
+          active: requestedId === 2001,
+          storageStatus: isPagedSession ? "ok" : "temporary",
+          recordingDisabled: !isPagedSession,
           runtimeSnapshot: {
             agentMessages: [],
             selectedMainModeKey: "main_mode",
@@ -114,24 +132,27 @@ test.beforeEach(async ({ page }) => {
             planStage: "idle",
             isPlanApproved: false,
           },
-          turnCount: turns.length,
-          messageCount: messages.length,
+          turnCount: isPagedSession ? turns.length : shortTurns.length,
+          messageCount: isPagedSession ? messages.length : shortMessages.length,
         };
       }
       if (cmd === "load_project_session_page") {
-        const before = Number(args?.beforeTurnIndex ?? turns.length);
+        const requestedId = Number(args?.sessionId ?? 2002);
+        const sourceTurns = requestedId === 2002 ? turns : shortTurns;
+        const sourceMessages = requestedId === 2002 ? messages : shortMessages;
+        const before = Number(args?.beforeTurnIndex ?? sourceTurns.length);
         const limit = Number(args?.limit ?? 30);
-        const end = Math.min(before, turns.length);
+        const end = Math.min(before, sourceTurns.length);
         const start = Math.max(0, end - limit);
-        const pageTurns = turns.slice(start, end);
+        const pageTurns = sourceTurns.slice(start, end);
         const ids = new Set(pageTurns.flatMap((turn) => turn.blockIds));
         return {
-          sessionId: String(args?.sessionId ?? 2002),
+          sessionId: String(requestedId),
           turns: pageTurns,
-          messages: messages.filter((message) => ids.has(message.id)),
+          messages: sourceMessages.filter((message) => ids.has(message.id)),
           startTurnIndex: start,
           endTurnIndex: end,
-          totalTurns: turns.length,
+          totalTurns: sourceTurns.length,
           hasMore: start > 0,
           nextBeforeTurnIndex: start > 0 ? start : null,
         };
@@ -147,12 +168,12 @@ test("switching to a 300+ turn session shows the recent page quickly and loads o
 
   const startedAt = Date.now();
   await page.getByText("Paged Session").click();
-  await expect(page.getByText("Paged turn 320")).toBeVisible({ timeout: 300 });
+  await expect(page.getByText("User 320")).toBeVisible({ timeout: 300 });
   expect(Date.now() - startedAt).toBeLessThan(700);
-  await expect(page.getByText("Paged turn 1")).toHaveCount(0);
+  await expect(page.getByText("User 1", { exact: true })).toHaveCount(0);
 
   await page.getByRole("button", { name: "加载更早历史" }).click();
-  await expect(page.getByText("Paged turn 290")).toBeVisible();
+  await expect(page.getByText("User 290")).toBeVisible();
 });
 
 test("empty live runtime cache does not block restoring persisted transcript pages", async ({ page }) => {
@@ -230,7 +251,7 @@ test("empty live runtime cache does not block restoring persisted transcript pag
 
   await page.goto("/");
 
-  await expect(page.getByText("Paged turn 320")).toBeVisible();
+  await expect(page.getByText("User 320")).toBeVisible();
   await expect(page.getByText("Agent 320")).toBeVisible();
 });
 

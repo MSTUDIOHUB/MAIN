@@ -14,8 +14,9 @@ test("game studio live steps show concise progress without nested action cards",
 
   await expect(page.getByTestId("thought-block")).toHaveCount(0);
   await expect(page.getByTestId("live-turn-process-timeline")).toBeVisible();
+  await expect(page.getByTestId("turn-process-disclosure")).toContainText("4 个工具");
   const liveToggle = page.getByTestId("live-turn-process-toggle");
-  await expect(liveToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(liveToggle).toHaveAttribute("aria-expanded", "true");
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toContainText("manage_camera");
   await expect(capsule).toContainText("重复 2 次");
@@ -42,7 +43,6 @@ test("game studio live steps show concise progress without nested action cards",
   expect(capsuleStyleAfter.border).toBe(capsuleStyleBefore.border);
   expect(capsuleStyleAfter.boxShadow).toBe(capsuleStyleBefore.boxShadow);
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
-  await liveToggle.click();
 
   const steps = page.getByTestId("live-turn-step");
   await expect(steps).toHaveCount(4);
@@ -64,9 +64,11 @@ test("game studio live steps show concise progress without nested action cards",
 test("game studio awaiting_input state does not keep showing running tool activity", async ({ page }) => {
   await page.goto("/?e2eScenario=game-studio-awaiting-choice");
 
+  await expect(page.getByTestId("turn-state-anchor")).toContainText("待选择");
   await expect(page.getByTestId("live-turn-process-timeline")).toBeVisible();
   await expect(page.getByTestId("turn-activity-thought-summary")).toHaveCount(0);
-  await expect(page.getByTestId("turn-activity-notice")).toBeVisible();
-  await expect(page.getByTestId("turn-activity-notice")).toContainText("已调用 execute_code");
+  await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
+  await expect(page.locator('[data-testid="live-turn-step"][data-status="running"]')).toHaveCount(0);
+  await expect(page.getByText("请选择下一步。")).toBeVisible();
   await expect(page.getByText("正在调用工具")).toHaveCount(0);
 });

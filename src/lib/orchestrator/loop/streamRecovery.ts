@@ -24,8 +24,56 @@ import {
 } from "../../orchestrator";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
-import { invokeInitialStreamForIteration, type PlanStreamWatchdogOptionsResolver } from "./streamInvocation";
+import {
+  APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS,
+  invokeInitialStreamForIteration,
+  type PlanStreamWatchdogOptionsResolver,
+} from "./streamInvocation";
 import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
+
+export const APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS =
+  APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS;
+export const APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS = 2_048;
+
+export function shouldAttemptApprovedPlanStreamWatchdogRecovery(input: {
+  message: string;
+  activeProfile: string;
+  workflowMode: "chat" | "edit" | "plan";
+  runtimeIntent: ResolvedUserIntent;
+  isPlanApproved: boolean;
+  isExecuteRecoveryEligible: boolean;
+  approvedPlanActionOnlyRecoveryActive: boolean;
+  approvedPlanNoToolRecoveryFileReadActive: boolean;
+  llmToolCount: number;
+  forceXmlTools: boolean;
+}): boolean {
+  return input.activeProfile === "local" &&
+    input.workflowMode === "plan" &&
+    input.runtimeIntent === "execute" &&
+    input.isPlanApproved &&
+    isStreamWatchdogTimeoutMessage(input.message) &&
+    input.llmToolCount > 0 &&
+    !input.forceXmlTools &&
+    (
+      input.isExecuteRecoveryEligible ||
+      input.approvedPlanActionOnlyRecoveryActive ||
+      input.approvedPlanNoToolRecoveryFileReadActive
+    );
+}
+
+export function buildApprovedPlanStreamWatchdogRecoveryPrompt(language: "zh" | "en"): string {
+  return language === "en"
+    ? [
+        "APPROVED_PLAN_STREAM_RECOVERY: The previous recovery stream timed out without producing a tool result.",
+        "Call exactly one available tool now. Do not emit analysis, a plan, or a progress paragraph before the tool call.",
+        "If the previous edit had a patch mismatch, use one targeted read_file for the exact target; otherwise patch, run validation, or use browser validation now.",
+      ].join("\n")
+    : [
+        "APPROVED_PLAN_STREAM_RECOVERY: 上一次恢复流超时，且没有产生工具结果。",
+        "现在必须直接调用一个可用工具；工具调用前不要输出分析、计划或进度段落。",
+        "如果上一笔编辑是 patch mismatch，只对精确目标调用一次 read_file；否则现在直接修改、运行验证或执行浏览器验证。",
+      ].join("\n");
+}
 
 export type StreamWithRecoveryResult =
   | {
@@ -275,12 +323,104 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       snapshotContextLimit,
     };
   } catch (err) {
-    if (isAbortError(err)) {
+    let activeError: unknown = err;
+    if (isAbortError(activeError)) {
       callbacks.onStatusChange("idle");
       return { status: "stopped", snapshotContextLimit };
     }
 
-    const errMsg = (err as Error).message || "";
+    let errMsg = (activeError as Error).message || "";
+    if (shouldAttemptApprovedPlanStreamWatchdogRecovery({
+      message: errMsg,
+      activeProfile: config.activeProfile,
+      workflowMode,
+      runtimeIntent,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      isExecuteRecoveryEligible,
+      approvedPlanActionOnlyRecoveryActive,
+      approvedPlanNoToolRecoveryFileReadActive,
+      llmToolCount: llmTools.length,
+      forceXmlTools,
+    })) {
+      const retryMaxElapsedMs = Math.min(
+        APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
+        approvedPlanRecoveryStreamMaxElapsedMs,
+      );
+      const retryMaxTokens = Math.min(
+        currentMaxTokens ?? APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS,
+        APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_OUTPUT_TOKENS,
+      );
+      const retryPrompt = buildApprovedPlanStreamWatchdogRecoveryPrompt(
+        callbacks.getPreferredLanguage(),
+      );
+      logAgentEvent("approved_plan_stream_watchdog_recovery_started", {
+        iteration,
+        previousError: errMsg.slice(0, 240),
+        retryMaxElapsedMs,
+        retryMaxTokens,
+        toolCount: llmTools.length,
+        toolChoice: "required",
+      });
+      callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      emitPlanExecutionProgress("running", {
+        recoveryReason: "stream_watchdog_bounded_retry",
+        nextStep: callbacks.getPreferredLanguage() === "zh"
+          ? "正在进行一次有界工具调用恢复"
+          : "running one bounded tool-call recovery",
+      });
+      try {
+        const retryMessages = prepareMessagesForToolProtocol(
+          [
+            ...managedAgentMessages,
+            { role: "user" as const, content: retryPrompt },
+          ],
+          config,
+          settings,
+          providerCompatibilityOverride,
+        );
+        const streamResult = await fetchLLMStream(
+          retryMessages,
+          settings,
+          assistantMsgId,
+          callbacks,
+          abortSignal,
+          llmTools,
+          retryMaxTokens,
+          0,
+          {
+            ...getPlanStreamWatchdogOptions(llmTools.length),
+            maxStreamElapsedMs: retryMaxElapsedMs,
+            maxStreamElapsedLabel: "approved_plan_action_retry",
+            toolChoice: "required",
+            workflowMode,
+            runtimeIntent,
+          },
+        );
+        callbacks.onProviderNativeToolSuccess?.();
+        logAgentEvent("approved_plan_stream_watchdog_recovered", {
+          iteration,
+          toolCalls: streamResult.toolCalls?.length || 0,
+          finishReason: streamResult.finishReason || null,
+        });
+        return { status: "streamed", streamResult, snapshotContextLimit };
+      } catch (retryError) {
+        if (isAbortError(retryError)) {
+          callbacks.onStatusChange("idle");
+          return { status: "stopped", snapshotContextLimit };
+        }
+        activeError = retryError;
+        errMsg = (retryError as Error).message || "";
+        logAgentEvent("approved_plan_stream_watchdog_recovery_failed", {
+          iteration,
+          error: errMsg.slice(0, 240),
+          retryMaxElapsedMs,
+          toolCount: llmTools.length,
+        });
+        if (pauseApprovedPlanStreamWatchdog(errMsg, { stage: "bounded_action_retry" })) {
+          return { status: "stopped", snapshotContextLimit };
+        }
+      }
+    }
     if (pauseApprovedPlanStreamWatchdog(errMsg, { stage: "initial_stream" })) {
       return { status: "stopped", snapshotContextLimit };
     }
@@ -298,7 +438,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
 
     const nativeToolsWereAttempted = llmTools.length > 0;
     const isContextError =
-      (err as Error & { isContextError?: boolean }).isContextError === true ||
+      (activeError as Error & { isContextError?: boolean }).isContextError === true ||
       errMsg.includes("CONTEXT_LENGTH_EXCEEDED") ||
       errMsg.includes("context_length_exceeded") ||
       errMsg.includes("context window") ||
@@ -806,7 +946,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     }
 
     callbacks.onError(getErrorMessage(
-      err,
+      activeError,
       callbacks.getPreferredLanguage() === "zh" ? "模型流式请求失败" : "LLM stream failed",
     ));
     callbacks.onStatusChange("error");

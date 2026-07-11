@@ -53,11 +53,13 @@ test.beforeEach(async ({ page }) => {
           rootNodes.push({ name, path, is_dir: false });
           sortNodes(rootNodes);
         }
+        (window as any).__CODELY_E2E__?.notifyWorkspaceContentChanged?.();
         return path;
       },
       removePath(path: string) {
         delete files[path];
         removeNode(path);
+        (window as any).__CODELY_E2E__?.notifyWorkspaceContentChanged?.();
       },
       pathFor(name: string) {
         return `${workspace}/${name}`;

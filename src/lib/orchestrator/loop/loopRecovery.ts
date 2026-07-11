@@ -24,6 +24,7 @@ import {
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
   buildExecuteValidationRecoveryPrompt,
+  isExecutePatchMismatchRecoveryActivity,
   resolveExecuteReadOnlyRecoveryTrigger,
   resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
@@ -92,6 +93,59 @@ export interface ApprovedPlanNoProgressDecision {
   remainingText: string;
   repeats: number;
   logContext: Record<string, unknown>;
+}
+
+export interface DirectMutationPreflightRecoveryDecision {
+  mode: "patch_recovery_read";
+  reason: "mutation_preflight_invalid_patch" | "mutation_preflight_search_text_mismatch";
+  target: string;
+}
+
+export function resolveDirectMutationPreflightRecovery(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  runtimeIntent: ResolvedUserIntent;
+  isPlanApproved: boolean;
+  executeRecoveryMode: ExecuteRecoveryMode;
+  executeRecoveryAttempts: number;
+  results: ToolExecutionResult[];
+}): DirectMutationPreflightRecoveryDecision | null {
+  const eligibleWorkflow =
+    input.workflowMode === "edit" ||
+    (input.workflowMode === "plan" && input.isPlanApproved);
+  if (
+    !eligibleWorkflow ||
+    !isMutationRuntimeIntent(input.runtimeIntent) ||
+    input.executeRecoveryMode !== "normal" ||
+    input.executeRecoveryAttempts >= 2
+  ) {
+    return null;
+  }
+
+  for (const result of input.results) {
+    const diagnostic = [
+      result.content,
+      result.displayContent,
+      result.qualityGateReason,
+      result.lifecycleState,
+    ].filter(Boolean).join("\n");
+    if (!isExecutePatchMismatchRecoveryActivity({
+      name: result.name,
+      status: result.isError ? "failed" : "succeeded",
+      target: result.target,
+      detail: diagnostic,
+    })) {
+      continue;
+    }
+    const reason = /invalid_patch|invalid patch|无效|无法应用/i.test(diagnostic)
+      ? "mutation_preflight_invalid_patch"
+      : "mutation_preflight_search_text_mismatch";
+    return {
+      mode: "patch_recovery_read",
+      reason,
+      target: String(result.target || "").trim(),
+    };
+  }
+  return null;
 }
 
 export type NoProgressRecoveryResult =
@@ -216,6 +270,36 @@ export function handleNoProgressRecovery(input: {
     currentExecuteRecoveryAttempts += 1;
     activateExecuteRecovery(mode, reason, context);
   };
+
+  const directMutationPreflightRecovery = resolveDirectMutationPreflightRecovery({
+    workflowMode,
+    runtimeIntent,
+    isPlanApproved: callbacks.getIsPlanApproved(),
+    executeRecoveryMode: currentExecuteRecoveryMode,
+    executeRecoveryAttempts: currentExecuteRecoveryAttempts,
+    results,
+  });
+  if (directMutationPreflightRecovery) {
+    const repeatedTargets = directMutationPreflightRecovery.target
+      ? [directMutationPreflightRecovery.target]
+      : summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+    activateTrackedExecuteRecovery(
+      directMutationPreflightRecovery.mode,
+      directMutationPreflightRecovery.reason,
+      {
+        target: directMutationPreflightRecovery.target || null,
+        repeatedTargets,
+      },
+    );
+    pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
+      language: callbacks.getPreferredLanguage(),
+      reason: directMutationPreflightRecovery.reason,
+      mode: directMutationPreflightRecovery.mode,
+      repeatedTargets,
+      recentActivity: recentToolActivity,
+      allowFileRead: true,
+    });
+  }
 
   const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
   if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {

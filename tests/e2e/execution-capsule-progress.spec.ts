@@ -17,11 +17,15 @@ test("ExecutionCapsule does not invent execution step progress from plain tool a
   await expect(page.getByTestId("execution-capsule-execution-progress")).toHaveCount(0);
 });
 
-test("pure plan execution progress stays in the PlanPanel instead of the chat capsule", async ({ page }) => {
+test("pure plan execution projects the runtime checkpoint into the main Capsule", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-plan-task-progress");
 
   await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
   await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
+  await expect(page.getByTestId("agent-explanation-capsule")).toBeVisible();
+  await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveAttribute("data-phase", "tool_start");
+  await expect(page.getByTestId("plan-execution-runtime-tool")).toContainText("apply_patch · src/task-9.ts");
+  await expect(page.getByTestId("plan-execution-runtime-task")).toContainText("T9: 更新 src/task-9.ts");
   await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T1: 更新");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T8: 更新");
@@ -115,7 +119,7 @@ for (const action of ["approve_once", "approve_session", "reject"] as const) {
   });
 }
 
-test("task tracking popover follows execution evidence order with ring-only current highlight", async ({ page }) => {
+test("task tracking popover preserves authored checklist order with runtime-only current highlight", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-pending-tool-review");
   await page.evaluate(() => (window as any).__CODELY_E2E__?.showPendingToolReviewPrompt?.());
 
@@ -127,9 +131,9 @@ test("task tracking popover follows execution evidence order with ring-only curr
     rows.map((row) => row.getAttribute("data-task-id"))
   );
   expect(taskIds.slice(0, 4)).toEqual([
-    "review-plan-task-3",
     "review-plan-task-1",
     "review-plan-task-2",
+    "review-plan-task-3",
     "review-plan-task-4",
   ]);
 
@@ -148,6 +152,10 @@ test("task tracking popover follows execution evidence order with ring-only curr
   expect(styles.className).toContain("ring-[color-mix(in_srgb,var(--accent)_72%,transparent)]");
   expect(styles.className).not.toContain("shadow-[inset_3px_0_0");
   expect(styles.borderLeftColor).not.toBe("rgb(5, 150, 105)");
+
+  await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveAttribute("data-phase", "waiting_review");
+  await expect(page.getByTestId("plan-execution-runtime-tool")).toContainText("run_command");
+  await expect(page.getByTestId("plan-execution-runtime-recovery")).toContainText("tool_permission_required");
 });
 
 test("ExecutionCapsule renders approval controls from pendingToolCall when the pending tool card is missing", async ({ page }) => {
@@ -185,11 +193,13 @@ async function prepareFormalPlanReview(
   }
 
   await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-tool-review")).toHaveCount(0);
+  await expect(page.getByTestId("plan-review-capsule")).toBeVisible();
   await expect(page.getByTestId("plan-review-panel")).toBeVisible();
   await expect(page.getByTestId("plan-approve-button")).toBeVisible();
 }
 
-test("Plan review stays in PlanPanel while preserving its runtime identity", async ({ page }) => {
+test("typed Plan review Capsule preserves the exact request and artifact identity", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
   await prepareFormalPlanReview(page, {
     runId: "run-e2e-plan-review",
@@ -198,6 +208,15 @@ test("Plan review stays in PlanPanel while preserving its runtime identity", asy
   });
 
   await expect(page.getByTestId("plan-review-panel")).toContainText("ExecutionCapsule 面板稳定回归");
+  const capsule = page.getByTestId("plan-review-capsule");
+  await expect(capsule).toHaveAttribute("data-action-kind", "plan_review");
+  await expect(capsule).toHaveAttribute("data-turn-id", "e2e-execution-capsule-panel-stability-turn");
+  await expect(capsule).toHaveAttribute("data-run-id", "run-e2e-plan-review");
+  await expect(capsule).toHaveAttribute("data-request-id", "request-e2e-plan-review");
+  await expect(capsule).toHaveAttribute("data-plan-revision", "1");
+  await expect(capsule).toHaveAttribute("data-artifact-hash", /.+/);
+  await expect(page.getByTestId("plan-review-capsule-open")).toContainText("审阅计划");
+  await expect(page.getByTestId("plan-review-capsule-approve")).toContainText("批准执行");
   await expect
     .poll(async () => page.evaluate(() => {
       const event = [...((window as any).__CODELY_E2E__?.events || [])]
@@ -227,12 +246,15 @@ async function getPanelSnapshot(page: Page) {
 }
 
 for (const mode of panelModes) {
-  test(`PlanPanel approval preserves panel state after opening from: ${mode}`, async ({ page }) => {
+  test(`Plan review Capsule remains visible and opens PlanPanel from: ${mode}`, async ({ page }) => {
     await page.goto("/?e2eScenario=execution-capsule-panel-stability");
     await prepareFormalPlanReview(page);
     await page.evaluate((nextMode) => (window as any).__CODELY_E2E__?.setPanelMode?.(nextMode), mode);
+
+    await expect(page.getByTestId("plan-review-capsule")).toBeVisible();
+    await expect(page.getByTestId("plan-review-capsule")).toHaveAttribute("data-action-kind", "plan_review");
     if (mode !== "plan") {
-      await page.getByTestId("top-plan-panel-button").click();
+      await page.getByTestId("plan-review-capsule-open").click();
     }
 
     await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
@@ -265,6 +287,29 @@ for (const mode of panelModes) {
   });
 }
 
+test("Plan review Capsule approves the exact request while the right panel is closed", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-panel-stability");
+  await prepareFormalPlanReview(page, {
+    runId: "run-e2e-plan-review-capsule",
+    requestId: "request-e2e-plan-review-capsule",
+    reset: false,
+  });
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setPanelMode?.("closed"));
+
+  await expect(page.getByTestId("right-panel")).toHaveCount(0);
+  await expect(page.getByTestId("plan-review-capsule")).toHaveAttribute(
+    "data-request-id",
+    "request-e2e-plan-review-capsule",
+  );
+  await page.getByTestId("plan-review-capsule-approve").click();
+
+  await expect.poll(async () => (
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().isPlanApproved ?? false)
+  )).toBe(true);
+  await expect(page.getByTestId("plan-review-capsule")).toHaveCount(0);
+  await expect(page.getByTestId("execution-capsule-tool-review")).toHaveCount(0);
+});
+
 test("double-clicking PlanPanel approval does not create a queued instruction", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
   await prepareFormalPlanReview(page);
@@ -288,25 +333,35 @@ test("double-clicking PlanPanel approval does not create a queued instruction", 
   await expect
     .poll(async () => page.evaluate(() => {
       const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
-      const executionTurnId = snapshot?.pendingPlanApprovalHandoff?.executionTurnId ?? "";
       const consentTurnId = snapshot?.currentTurnExecutionConsent?.turnId ?? "";
       return {
-        executionTurnId,
         consentTurnId,
         currentTurnId: snapshot?.currentTurnId ?? "",
+        executionStartedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? "",
       };
     }))
     .toEqual({
-      executionTurnId: "e2e-execution-capsule-panel-stability-turn",
       consentTurnId: "e2e-execution-capsule-panel-stability-turn",
       currentTurnId: "e2e-execution-capsule-panel-stability-turn",
+      executionStartedForTurnId: "e2e-execution-capsule-panel-stability-turn",
     });
   await expect
-    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().pendingPlanApprovalHandoff?.planTurnId ?? null))
-    .toBe("e2e-execution-capsule-panel-stability-turn");
-  await expect
-    .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planApprovalExecutionStartedForTurnId ?? null))
-    .toBeNull();
+    .poll(async () => page.evaluate(() => {
+      const entries = JSON.parse(window.localStorage.getItem("main.debugLog.v1") || "[]");
+      const queued = entries
+        .filter((entry: { source?: string }) => entry.source === "store.plan_approval_same_turn_execution_queued")
+        .map((entry: { message?: string }) => JSON.parse(String(entry.message || "{}")));
+      return {
+        count: queued.length,
+        planTurnId: queued[0]?.planTurnId ?? null,
+        executionTurnId: queued[0]?.executionTurnId ?? null,
+      };
+    }))
+    .toEqual({
+      count: 1,
+      planTurnId: "e2e-execution-capsule-panel-stability-turn",
+      executionTurnId: "e2e-execution-capsule-panel-stability-turn",
+    });
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().executionChildTurns ?? null))
     .toBe(0);
@@ -449,6 +504,7 @@ test("plan UI accents follow a non-purple theme across appearance modes", async 
   await prepareFormalPlanReview(page);
 
   await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
+  await expect(page.getByTestId("plan-review-capsule")).toBeVisible();
   await expect(page.getByTestId("plan-approve-button")).toBeVisible();
   await expect(page.locator("blockquote.theme-plan-surface").first()).toBeVisible();
 

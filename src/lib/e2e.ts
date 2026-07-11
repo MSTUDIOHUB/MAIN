@@ -407,7 +407,23 @@ function seedPlanFlowScenario() {
       path: ".MAIN/plans/plan.md",
       title: "Design",
       updatedAt: now - 1_000,
-      content: "# Design\n\n- 目标：支持生成计划、保存方案、批准执行与最终收尾。\n- 右侧 Plan Workspace 负责展示方案与审批入口。\n- 保存成功后应明确反馈已保存。\n- 验证：批准后生成 tasks.md 并进入执行进度。\n",
+      content: [
+        "# Design",
+        "",
+        "## 目标",
+        "- 支持生成计划、保存方案、批准执行与最终收尾。",
+        "",
+        "## 关键改动",
+        "- 修改 `src/lib/planControl.ts`，让正式 Plan 审批进入同一回合的执行 handoff。",
+        "- 修改 `src/components/RightPanel.tsx`，保持 Plan Workspace 的保存与审批入口可见。",
+        "",
+        "## 数据流",
+        "- Plan artifact -> exact review request -> approved child run -> evidence-backed completion。",
+        "",
+        "## 验证方式",
+        "- 运行 `node --test tests/node/workflow-models.test.mjs`，验证审批和执行状态转换。",
+        "- 使用 E2E 点击批准，验证同一逻辑回合进入执行并最终完成。",
+      ].join("\n"),
     },
   ];
   const approvalIdentity = buildPlanApprovalIdentity(artifacts);
@@ -775,7 +791,7 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
         "- 普通聊天的一次性执行审批继续保留。",
         "",
         "### 验证方式",
-        "- 点击批准后应看到 plan.md、`isPlanApproved:true` 和 `planStage:executing`。",
+        "- 使用 E2E 点击批准，验证已生成 plan.md，且状态进入 `isPlanApproved:true` 和 `planStage:executing`。",
       ].join("\n")
     : [
         "### 目标",
@@ -799,7 +815,7 @@ function seedPlanQuickReplyMaterializeScenario(modelStyle: "gemma" | "qwen") {
         "- 物化失败时阻断执行。",
         "",
         "### 验证方式",
-        "- E2E 点击批准后必须生成 plan.md 并进入执行状态。",
+        "- 使用 E2E 点击批准，验证已生成 plan.md 并进入执行状态。",
       ].join("\n");
 
   useAppStore.setState((state) => ({
@@ -2665,8 +2681,12 @@ function seedDiffReloadSummaryScenario() {
   }
 
   bindBridgeSnapshot(DIFF_RELOAD_SUMMARY_SCENARIO);
+  bridge.notifyWorkspaceContentChanged = () => {
+    useAppStore.getState().bumpWorkspaceContentVersion();
+  };
 
   const cleanup = () => {
+    delete bridge.notifyWorkspaceContentChanged;
     bridge.initialized = false;
   };
 
@@ -3375,6 +3395,19 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
     planTasks,
     planExecutionEvidenceLedger: evidenceLedger,
     planExecutionEvidenceCount: evidenceLedger.length,
+    planExecutionProgressSnapshot: {
+      turnId,
+      phase: "tool_start",
+      currentTask: planTasks[8].text,
+      currentTool: "apply_patch · src/task-9.ts",
+      latestEvidence: "已完成前 8 项文件修改",
+      nextStep: "完成 src/task-9.ts 后运行验证",
+      repeatedTargets: [],
+      iteration: 9,
+      maxIterations: 50,
+      autoResumeCount: 0,
+      updatedAt: now,
+    },
     planStage: "executing",
     isPlanApproved: true,
     showPlanPanel: true,
@@ -3678,6 +3711,20 @@ function seedExecutionCapsulePendingToolReviewScenario() {
     planTasks,
     planExecutionEvidenceLedger: evidenceLedger,
     planExecutionEvidenceCount: evidenceLedger.length,
+    planExecutionProgressSnapshot: {
+      turnId,
+      phase: "waiting_review",
+      currentTask: planTasks[8].text,
+      currentTool: `run_command · ${longCommand}`,
+      latestEvidence: "已完成 8/12 项可信验证",
+      nextStep: "批准命令后继续执行第 9 项验证",
+      repeatedTargets: [],
+      recoveryReason: "tool_permission_required",
+      iteration: 9,
+      maxIterations: 50,
+      autoResumeCount: 0,
+      updatedAt: now,
+    },
     planStage: "executing",
     isPlanApproved: true,
     showPlanPanel: false,
@@ -4126,7 +4173,23 @@ function seedExecutionCapsulePanelStabilityScenario() {
         kind: "design",
         path: ".MAIN/plans/plan.md",
         title: "Design",
-        content: "# ExecutionCapsule 面板稳定设计\n\n> 计划高亮应跟随当前主题色。\n\n审批只更新 ExecutionCapsule 状态，不改动右侧面板。",
+        content: [
+          "# ExecutionCapsule 面板稳定设计",
+          "",
+          "## 影响文件",
+          "- 修改 `src/components/ExecutionCapsule.tsx`，让审批状态跟随当前主题色并保持右侧面板稳定。",
+          "- 更新 `tests/e2e/execution-capsule-execution-progress.spec.ts`，覆盖审批后的面板状态。",
+          "",
+          "## 执行顺序",
+          "1. 修改 ExecutionCapsule 的审批状态投影，不改变右侧面板选择。",
+          "2. 运行可执行的 Playwright 回归测试验证批准与执行衔接。",
+          "",
+          "## 关键数据流",
+          "Plan review request 绑定当前 revision/hash；批准后创建执行 run，面板展示状态保持独立。",
+          "",
+          "## 验证方式",
+          "- 运行 `npx playwright test tests/e2e/execution-capsule-execution-progress.spec.ts`。",
+        ].join("\n"),
         updatedAt: now,
       },
       {
@@ -5218,6 +5281,8 @@ function seedGameStudioPlanShortcutsScenario() {
       input: state.input,
       selectedMainModeKey: state.selectedMainModeKey,
       lockedComposerIntent: state.lockedComposerIntent,
+      currentTurnId: state.currentTurnId,
+      turnIds: state.conversationTurns.map((turn) => turn.id),
       currentTurnIntent: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.intent ?? null
         : null,
@@ -6610,8 +6675,54 @@ function seedPlanApprovalExecuteToolsScenario() {
   const workspace = "/tmp/e2e-plan-approval-execute-tools";
   const sessionId = 999503;
   const turnId = "e2e-plan-approval-execute-tools-turn";
+  const reviewRunId = "run-e2e-plan-approval-execute-tools-review";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
+  const planArtifacts = [
+    {
+      kind: "plan" as const,
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      revision: 1,
+      updatedAt: now - 1_000,
+      content: [
+        "# 审批后执行工具回归计划",
+        "",
+        "## 摘要",
+        "- 用户目标：验证 Plan 审批后以新的执行 run 修改源码并运行验证。",
+        "",
+        "## 已确认证据",
+        "- `src/main.js` 是当前 E2E 工作区的可写源码入口。",
+        "- 执行 run 需要同时获得 workspace write 与 shell 工具能力。",
+        "",
+        "## 关键改动",
+        "- 修改 `src/main.js`，加入批准执行路径的回归标记。",
+        "",
+        "## 公共 API / 接口 / 类型",
+        "- 不修改公共 API；仅增加内部回归标记。",
+        "",
+        "## 测试方案",
+        "- 运行 `npm run test:workflow-assets` 验证批准后的执行链路。",
+        "",
+        "## 假设与默认值",
+        "- 保持现有启动流程不变。",
+      ].join("\n"),
+    },
+    {
+      kind: "tasks" as const,
+      path: ".MAIN/plans/tasks.md",
+      title: "Tasks",
+      revision: 1,
+      updatedAt: now,
+      content: [
+        "# Tasks",
+        "",
+        "- [ ] 修改 `src/main.js` 加入批准执行回归标记 — 证据: file:src/main.js",
+        "- [ ] 运行 `npm run test:workflow-assets` — 证据: cmd:npm run test:workflow-assets",
+      ].join("\n"),
+    },
+  ];
+  const approvalIdentity = buildPlanApprovalIdentity(planArtifacts);
   const server = {
     id: "e2e-plan-approval-execute-tools-server",
     name: "E2E Cloud",
@@ -6661,6 +6772,49 @@ function seedPlanApprovalExecuteToolsScenario() {
       ],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: {
+      schemaVersion: 1,
+      runId: reviewRunId,
+      instanceId: "e2e-plan-approval-execute-tools-instance",
+      sessionKey: `${workspace}:${sessionId}`,
+      workspace,
+      sessionId,
+      turnId,
+      status: "paused",
+      workflowMode: "plan",
+      runtimeIntent: "plan",
+      planStage: "ready_to_execute",
+      isPlanApproved: false,
+      iteration: 1,
+      maxIterations: 12,
+      messagesLen: 2,
+      toolCount: 0,
+      latestTool: null,
+      latestToolTarget: null,
+      activeStreamId: null,
+      streamStatus: "closed",
+      streamChunkCount: 0,
+      streamByteCount: 0,
+      streamElapsedMs: 0,
+      streamLifecycleStatus: "completed",
+      lastStreamError: null,
+      startedAt: now - 1_000,
+      updatedAt: now,
+      closedAt: now,
+      closeReason: "plan_review_required",
+    },
+    activeActionRequest: approvalIdentity
+      ? buildPlanReviewActionRequest({
+          sessionKey: `${workspace}:${sessionId}`,
+          turnId,
+          runId: reviewRunId,
+          title: "审批后执行工具回归",
+          planRevision: approvalIdentity.revision,
+          artifactHash: approvalIdentity.artifactHash,
+          artifactPaths: approvalIdentity.artifactPaths,
+          now,
+        })
+      : null,
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
@@ -6692,24 +6846,32 @@ function seedPlanApprovalExecuteToolsScenario() {
     input: "",
     attachedFiles: [],
     contextMentions: [],
-    planArtifacts: [
+    planArtifacts,
+    planTasks: [
       {
-        kind: "design" as const,
-        path: ".MAIN/plans/plan.md",
-        title: "Design",
-        updatedAt: now - 1_000,
-        content: "# Design\n\n- 目标：批准后应允许执行工具出现在运行时工具列表中。\n- 方案：Plan 回合保持 plan 身份，但批准后的 runtime intent 使用 execute。\n- 验证：下一轮请求包含 run_command 和写入工具能力。\n",
+        id: "plan-approval-task-mutation",
+        text: "修改 `src/main.js` 加入批准执行回归标记",
+        status: "pending",
+        evidence: [{ kind: "file", value: "src/main.js" }],
+      },
+      {
+        id: "plan-approval-task-validation",
+        text: "运行 `npm run test:workflow-assets` 验证批准后的执行链路",
+        status: "pending",
+        commands: ["npm run test:workflow-assets"],
+        evidence: [{ kind: "cmd", value: "npm run test:workflow-assets" }],
       },
     ],
-    planTasks: [],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
-    planStage: "design",
+    planStage: "ready_to_execute",
     isPlanApproved: false,
     planApprovalChoice: null,
     currentTurnExecutionConsent: { turnId: null, granted: false },
-    autoApproveTools: false,
-    autoApproveToolScopes: [],
+    // This scenario exercises scoped execution progression, not permission UI.
+    // Opt in explicitly so mutation can advance to the validation-focused run.
+    autoApproveTools: true,
+    autoApproveToolScopes: ["workspace_write", "shell"],
     readOnlyAutoApproveForSession: false,
     showPlanPanel: true,
     showDiff: false,
@@ -6717,7 +6879,7 @@ function seedPlanApprovalExecuteToolsScenario() {
     showFilePanel: false,
     rightPanelTab: "plan",
     selectedDiffTaskId: null,
-    agentStatus: "idle",
+    agentStatus: "pending_review",
     isGenerating: false,
     abortController: null,
     pendingReviewResolve: null,

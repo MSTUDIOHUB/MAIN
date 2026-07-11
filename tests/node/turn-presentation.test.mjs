@@ -20,8 +20,10 @@ new Function("exports", "module", "require", transpiled)(
 );
 
 const {
+  buildPlanExecutionCapsuleProjection,
   buildTurnPresentationModel,
   isPlanActionRequestPresentationEligible,
+  isPlanReviewCapsulePresentationEligible,
   resolveGoalPresentationBehavior,
   resolvePlanPresentationBehavior,
   resolveTurnPresentationLifecycle,
@@ -191,6 +193,133 @@ test("Plan requests are presentable only for the exact paused owner run", () => 
   );
 });
 
+test("Plan review Capsule requires the exact paused request and current artifact identity", () => {
+  const base = {
+    actionKind: "plan_review",
+    requestStatus: "pending",
+    requestSessionKey: "workspace:7",
+    requestTurnId: "turn-7",
+    requestRunId: "run-7",
+    requestPlanRevision: 3,
+    requestArtifactHash: "plan-hash-3",
+    markerStatus: "paused",
+    markerSessionKey: "workspace:7",
+    markerTurnId: "turn-7",
+    markerRunId: "run-7",
+    expectedSessionKey: "workspace:7",
+    expectedTurnId: "turn-7",
+    currentPlanRevision: 3,
+    currentArtifactHash: "plan-hash-3",
+  };
+
+  assert.equal(isPlanReviewCapsulePresentationEligible(base), true);
+  assert.equal(isPlanReviewCapsulePresentationEligible({ ...base, markerStatus: "running" }), false);
+  assert.equal(isPlanReviewCapsulePresentationEligible({ ...base, requestPlanRevision: 2 }), false);
+  assert.equal(isPlanReviewCapsulePresentationEligible({ ...base, requestArtifactHash: "stale-hash" }), false);
+  assert.equal(isPlanReviewCapsulePresentationEligible({ ...base, actionKind: "tool_permission" }), false);
+});
+
+test("Plan execution Capsule headline follows runtime progress instead of the first incomplete artifact task", () => {
+  const tasks = [
+    {
+      id: "task-read-placeholder",
+      text: "需要读取 src/main.js 中 openFile 函数的完整实现以确认 dialog 调用细节",
+      status: "in_progress",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    },
+    {
+      id: "task-patch-runtime",
+      text: "修改 src/runtime.ts 的恢复状态投影",
+      status: "pending",
+      evidence: [{ kind: "file", value: "src/runtime.ts" }],
+    },
+  ];
+  const baseSnapshot = {
+    turnId: "turn-plan",
+    phase: "running",
+    currentTask: tasks[0].text,
+    currentTool: "暂无工具调用",
+    latestEvidence: "",
+    nextStep: "执行真实修改",
+    iteration: 1,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    updatedAt: 1,
+  };
+
+  const placeholder = buildPlanExecutionCapsuleProjection({
+    snapshot: baseSnapshot,
+    tasks,
+    language: "zh",
+  });
+  assert.equal(placeholder.headline, "正在推进计划任务");
+  assert.equal(placeholder.currentTask, "");
+  assert.equal(placeholder.currentTaskId, null);
+
+  const activeReadTool = buildPlanExecutionCapsuleProjection({
+    snapshot: {
+      ...baseSnapshot,
+      phase: "tool_start",
+      currentTool: "read_file · src/main.js",
+    },
+    tasks,
+    language: "zh",
+  });
+  assert.match(activeReadTool.headline, /正在执行.*read_file.*src\/main\.js/);
+  assert.equal(activeReadTool.currentTool, "read_file · src/main.js");
+  assert.equal(activeReadTool.currentTask, "");
+  assert.equal(activeReadTool.currentTaskId, null);
+
+  const authoredReadThenPatchTask = {
+    id: "task-read-then-patch",
+    text: "先读取 src/runtime.ts，然后修改恢复状态投影",
+    status: "pending",
+    evidence: [{ kind: "file", value: "src/runtime.ts" }],
+  };
+  const authoredReadThenPatch = buildPlanExecutionCapsuleProjection({
+    snapshot: {
+      ...baseSnapshot,
+      phase: "tool_start",
+      currentTask: authoredReadThenPatchTask.text,
+      currentTool: "read_file · src/runtime.ts",
+    },
+    tasks: [authoredReadThenPatchTask],
+    language: "zh",
+  });
+  assert.equal(authoredReadThenPatch.currentTask, authoredReadThenPatchTask.text);
+  assert.equal(authoredReadThenPatch.currentTaskId, authoredReadThenPatchTask.id);
+
+  const activeTool = buildPlanExecutionCapsuleProjection({
+    snapshot: {
+      ...baseSnapshot,
+      phase: "tool_start",
+      currentTask: tasks[1].text,
+      currentTool: "apply_patch · src/runtime.ts",
+    },
+    tasks,
+    language: "zh",
+  });
+  assert.match(activeTool.headline, /正在执行.*apply_patch.*src\/runtime\.ts/);
+  assert.equal(activeTool.currentTaskId, "task-patch-runtime");
+
+  const failed = buildPlanExecutionCapsuleProjection({
+    snapshot: {
+      ...baseSnapshot,
+      phase: "tool_error",
+      currentTask: tasks[1].text,
+      currentTool: "apply_patch · src/runtime.ts",
+      recoveryReason: "invalid_patch",
+      repeatedTargets: ["src/runtime.ts"],
+    },
+    tasks,
+    language: "en",
+  });
+  assert.equal(failed.tone, "failed");
+  assert.match(failed.headline, /Tool execution failed.*apply_patch/);
+  assert.equal(failed.recoveryReason, "invalid_patch");
+  assert.deepEqual(failed.repeatedTargets, ["src/runtime.ts"]);
+});
+
 test("Goal behavior projects tone and primary controls from lifecycle", () => {
   assert.deepEqual(
     resolveGoalPresentationBehavior({ lifecycle: "active", status: "active" }),
@@ -205,9 +334,15 @@ test("Goal behavior projects tone and primary controls from lifecycle", () => {
     { tone: "paused", primaryAction: "pause", primaryActionPending: true, canEdit: false, canResume: false },
   );
   assert.deepEqual(
-    resolveGoalPresentationBehavior({ lifecycle: "action_required", status: "awaiting_input" }),
+    resolveGoalPresentationBehavior({ lifecycle: "action_required", status: "awaiting_input", actionKind: "goal_confirmation" }),
     { tone: "paused", primaryAction: "resume", primaryActionPending: false, canEdit: true, canResume: true },
   );
+  for (const actionKind of ["tool_permission", "user_choice"]) {
+    assert.deepEqual(
+      resolveGoalPresentationBehavior({ lifecycle: "action_required", status: "awaiting_input", actionKind }),
+      { tone: "paused", primaryAction: "pause", primaryActionPending: false, canEdit: false, canResume: false },
+    );
+  }
   assert.deepEqual(
     resolveGoalPresentationBehavior({ lifecycle: "success", status: "completed" }),
     { tone: "completed", primaryAction: null, primaryActionPending: false, canEdit: false, canResume: false },

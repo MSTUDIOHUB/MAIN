@@ -21,6 +21,27 @@ export type PlanStreamWatchdogOptionsResolver = (
   nativeToolCount: number,
 ) => FetchLLMStreamOptions | undefined;
 
+export const APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS = 45_000;
+
+export function resolveRecoveryToolChoice(input: {
+  isExecuteRecoveryEligible: boolean;
+  executeRecoveryMode: ExecuteRecoveryMode;
+  approvedPlanActionOnlyRecoveryActive: boolean;
+  approvedPlanNoToolRecoveryFileReadActive: boolean;
+  llmToolCount: number;
+  forceXmlTools: boolean;
+}): "required" | undefined {
+  if (input.llmToolCount <= 0 || input.forceXmlTools) return undefined;
+  const executeRecoveryRequiresAction =
+    input.isExecuteRecoveryEligible && input.executeRecoveryMode !== "normal";
+  const approvedPlanRecoveryRequiresAction =
+    input.approvedPlanActionOnlyRecoveryActive ||
+    input.approvedPlanNoToolRecoveryFileReadActive;
+  return executeRecoveryRequiresAction || approvedPlanRecoveryRequiresAction
+    ? "required"
+    : undefined;
+}
+
 export type InitialStreamInvocationResult =
   | { status: "streamed"; streamResult: StreamResult }
   | { status: "stopped"; reason: "reasoning_dominated" };
@@ -136,19 +157,30 @@ export async function invokeInitialStreamForIteration(input: {
     callbacks.getIsPlanApproved() &&
     runtimeIntent === "execute" &&
     (isExecuteRecoveryEligible || approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive);
+  const recoveryStreamMaxElapsedMs =
+    approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive
+      ? Math.min(
+          APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS,
+          approvedPlanRecoveryStreamMaxElapsedMs,
+        )
+      : approvedPlanRecoveryStreamMaxElapsedMs;
   const streamWatchdogOptions: FetchLLMStreamOptions = {
     ...baseStreamWatchdogOptions,
     ...(approvedPlanRecoveryStreamHardTimeoutActive
       ? {
-          maxStreamElapsedMs: approvedPlanRecoveryStreamMaxElapsedMs,
+          maxStreamElapsedMs: recoveryStreamMaxElapsedMs,
           maxStreamElapsedLabel: "approved_plan_recovery",
         }
       : {}),
   };
-  const recoveryToolChoice =
-    isExecuteRecoveryEligible && executeRecoveryMode !== "normal" && llmTools.length > 0 && !forceXmlTools
-      ? "required"
-      : undefined;
+  const recoveryToolChoice = resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible,
+    executeRecoveryMode,
+    approvedPlanActionOnlyRecoveryActive,
+    approvedPlanNoToolRecoveryFileReadActive,
+    llmToolCount: llmTools.length,
+    forceXmlTools,
+  });
 
   logAgentEvent("llm_request_shape", {
     iteration,

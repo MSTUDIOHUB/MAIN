@@ -199,3 +199,26 @@ test("submit intent routing starts blocking preflight for ambiguous chat executi
   assert.equal(harness.calls.preflights[0].sendOriginSessionKey, "workspace::7");
   assert.deepEqual(harness.calls.preRunPatches, []);
 });
+
+test("hidden skip-intent control prompts do not infer shell directives from embedded commands", () => {
+  const harness = createHarness({
+    text: "计划已批准。请执行源码修改，然后运行 `npm test`。",
+    isHidden: true,
+    options: {
+      resolvedIntent: "plan",
+      runtimeIntentOverride: "execute",
+      skipIntentResolution: true,
+      preservePlanState: true,
+    },
+    currentTurnIntent: "plan",
+    hasPlanArtifacts: true,
+    isPlanApproved: true,
+    planStage: "executing",
+  });
+  const result = harness.resolve();
+
+  assert.equal(result.handled, false);
+  assert.equal(result.effectiveRunIntent, "plan");
+  assert.equal(result.effectiveCommandDirective, null);
+  assert.deepEqual(harness.calls.preflights, []);
+});

@@ -145,6 +145,7 @@ test("apply_patch preflight blocks invalid, no-op, and mismatched patches before
 
   assert.equal(invalid.ok, false);
   assert.equal(invalid.reason, "invalid_patch");
+  assert.equal(invalid.path, "src/App.tsx");
   assert.match(invalid.message || "", /Do not ask for approval/);
 
   const valid = await preflightWorkspaceMutation({

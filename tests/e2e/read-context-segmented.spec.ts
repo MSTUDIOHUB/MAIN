@@ -9,22 +9,20 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("read/search progress stays accessible in the process archive without a ChatArea ledger", async ({ page }) => {
+test("read/search progress stays accessible in the continuous process timeline without a ChatArea ledger", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-interleaved");
 
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
-  const archiveToggle = page.getByTestId("turn-process-archive-toggle");
-  await expect(archiveToggle).toBeVisible();
-  await expect(archiveToggle).toContainText("package.json");
-  await expect(archiveToggle).toContainText("git status --short --branch");
+  await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
+  const processDisclosure = page.getByTestId("turn-process-disclosure");
+  await expect(processDisclosure).toContainText("5 个工具");
   await expect(page.getByTestId("progress-block")).toHaveCount(0);
-  await archiveToggle.click();
-  const archiveDetails = page.getByTestId("turn-process-archive-details");
-  await expect(archiveDetails).toContainText("package.json");
-  await expect(archiveDetails).toContainText("useAppStore.ts");
-  await expect(archiveDetails).toContainText("release*.md");
-  await expect(archiveDetails).toContainText("git status --short --branch");
-  await expect(archiveDetails).toContainText("npm run build -- --mode test");
+  const processDetails = page.getByTestId("live-turn-process-details");
+  await expect(processDetails).toContainText("package.json");
+  await expect(processDetails).toContainText("useAppStore.ts");
+  await expect(processDetails).toContainText("release*.md");
+  await expect(processDetails).toContainText("git status --short --branch");
+  await expect(processDetails).toContainText("npm run build -- --mode test");
   await expect(page.getByText("读取与命令交错完成，命令步骤已折叠保留。")).toBeVisible();
 });
 
@@ -41,7 +39,6 @@ test("substantive stage summary remains in ChatArea while read/search evidence s
   const processTimeline = page.getByTestId("live-turn-process-timeline");
   await expect(processTimeline).toBeVisible();
   await expect(processTimeline).not.toContainText("阶段性结论：第一段读取确认");
-  await page.getByTestId("live-turn-process-toggle").click();
   const processDetails = page.getByTestId("live-turn-process-details");
   await expect(processDetails).toContainText("ChatArea.tsx");
   await expect(processDetails).toContainText("README.md");
@@ -56,7 +53,6 @@ test("thin read narration becomes transparent while the substantive model explan
 
   const processTimeline = page.getByTestId("live-turn-process-timeline");
   await expect(processTimeline).toBeVisible();
-  await page.getByTestId("live-turn-process-toggle").click();
   const details = page.getByTestId("live-turn-process-details");
   await expect(details).toContainText("App.tsx");
   await expect(details).toContainText("OverviewCards.tsx");
@@ -78,7 +74,7 @@ test("effective progress stays out of ChatArea after plan card and follow-up mes
 
   const processToggle = chat.getByTestId("live-turn-process-toggle");
   await expect(processToggle).toBeVisible();
-  await processToggle.click();
+  await expect(processToggle).toHaveAttribute("aria-expanded", "true");
   const processDetails = chat.getByTestId("live-turn-process-details");
   await expect(processDetails).toContainText("dashboardStore.ts");
   await expect(processDetails).toContainText("useCsvParser.ts");

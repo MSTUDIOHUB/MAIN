@@ -392,7 +392,11 @@ export function resolveAndApplySubmitIntentRouting<
     effectiveRunIntent = resolution.intent;
   }
 
-  if (!effectiveCommandDirective) {
+  const shouldInferCommandDirective = !(
+    input.isHidden &&
+    input.options?.skipIntentResolution === true
+  );
+  if (!effectiveCommandDirective && shouldInferCommandDirective) {
     effectiveCommandDirective = inferCommandDirective(input.text, effectiveRunIntent, {
       source: input.mainIntentShortcut
         ? "main_shortcut"

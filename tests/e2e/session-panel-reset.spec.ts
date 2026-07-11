@@ -57,6 +57,10 @@ test.beforeEach(async ({ page }) => {
     };
     const firstRuntime = makeRuntime(1001, "First Session");
     const secondRuntime = makeRuntime(1002, "Second Session");
+    const sessions = [
+      { id: 1001, title: "First Session", date: now, active: true, storageStatus: "ok", recordingDisabled: false, turnCount: 1, messageCount: 2 },
+      { id: 1002, title: "Second Session", date: now, active: false, storageStatus: "ok", recordingDisabled: false, turnCount: 1, messageCount: 2 },
+    ];
 
     window.localStorage.setItem("local-agent-ide", JSON.stringify({
       state: {
@@ -84,10 +88,7 @@ test.beforeEach(async ({ page }) => {
         workspaces: [{ path: workspace, name: "Panel Reset Workspace", addedAt: Date.now(), lastActiveAt: Date.now() }],
         activeSessionByWorkspace: { [workspace]: 1001 },
         sessionsByWorkspace: {
-          [workspace]: [
-            { id: 1001, title: "First Session", date: now, active: true, storageStatus: "temporary", recordingDisabled: true, messages: firstRuntime.taskFlow, runtimeSnapshot: firstRuntime },
-            { id: 1002, title: "Second Session", date: now, active: false, storageStatus: "temporary", recordingDisabled: true, messages: secondRuntime.taskFlow, runtimeSnapshot: secondRuntime },
-          ],
+          [workspace]: sessions,
           __MAIN_GLOBAL_CHAT__: [],
         },
         taskFlow: firstRuntime.taskFlow,
@@ -128,8 +129,30 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
       if (cmd === "get_workspace_root") return workspace;
       if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path ?? workspace);
-      if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return [];
+      if (cmd === "list_project_sessions" || cmd === "rebuild_project_sessions_index") return sessions;
       if (cmd === "save_project_session") return args?.session ?? {};
+      if (cmd === "load_project_session_meta") {
+        const requestedId = Number(args?.sessionId ?? 1001);
+        const session = sessions.find((candidate) => candidate.id === requestedId) || sessions[0];
+        return {
+          ...session,
+          runtimeSnapshot: requestedId === 1002 ? secondRuntime : firstRuntime,
+        };
+      }
+      if (cmd === "load_project_session_page") {
+        const requestedId = Number(args?.sessionId ?? 1001);
+        const runtime = requestedId === 1002 ? secondRuntime : firstRuntime;
+        return {
+          sessionId: String(requestedId),
+          turns: runtime.conversationTurns,
+          messages: runtime.taskFlow,
+          startTurnIndex: 0,
+          endTurnIndex: 1,
+          totalTurns: 1,
+          hasMore: false,
+          nextBeforeTurnIndex: null,
+        };
+      }
       if (cmd === "list_directory") {
         return [{ name: "src", path: `${workspace}/src`, is_dir: true }];
       }
@@ -157,9 +180,14 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("switching sessions closes restored right and file panels", async ({ page }) => {
+test("switching sessions closes the currently open right and file panels", async ({ page }) => {
   await page.goto("/");
 
+  await expect(page.getByTestId("session-item-1001")).toContainText("First Session");
+  await expect(page.getByTestId("diff-panel")).toHaveCount(0);
+  await expect(page.getByTestId("file-panel")).toHaveCount(0);
+  await page.locator('button[aria-label="变更比对"]').click();
+  await page.locator('button[aria-label="文件"]').click();
   await expect(page.getByTestId("diff-panel")).toBeVisible();
   await expect(page.getByTestId("file-panel")).toBeVisible();
 

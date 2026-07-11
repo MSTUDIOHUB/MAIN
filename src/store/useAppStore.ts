@@ -133,6 +133,7 @@ import {
 } from "../lib/turnIntake";
 import {
   buildCanonicalCompletedTurnMessages,
+  compactPlanReviewTurnMessages,
   findCanonicalTurnStartMessageIndex,
 } from "../lib/turnContext";
 import { serializeDurableTurnContextForModel } from "../lib/durableTurnContext";
@@ -140,18 +141,18 @@ import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
 import { resolveGoalEventOwnerIdentity } from "../lib/goalEventIdentity";
 import {
   buildPlanReviewActionRequest,
-  clearActionRequestOfKind,
+  clearGoalConfirmationActionRequest,
+  isCurrentGoalAdministrativeControl,
   isCurrentGoalControlResolution,
-  isExactUserChoiceResolutionIdentity,
   isExactToolPermissionResolutionIdentity,
   isToolPermissionActionRequest,
-  normalizeActionRequest,
   type ActionRequest,
   type ToolPermissionResolutionIdentity,
   type UserChoiceResolutionIdentity,
   type PlanReviewResolutionIdentity,
   type GoalControlIdentity,
 } from "../lib/actionRequest";
+import { restorePendingActionRequest } from "../lib/actionRequestRestore";
 import { getFilePreviewStrategy } from "../lib/filePreviewStrategy";
 import {
   sanitizeUserContextItemsForPersist,
@@ -261,6 +262,7 @@ import { startSubmitAsyncWorkflowRun } from "./submitAsyncWorkflowRun";
 import {
   buildApprovedPlanExecutionPrompt,
   ensureApprovedPlanRuntimeTasksForState,
+  evaluateApprovedPlanExecutionReadiness,
   normalizeApprovedPlanTaskStatuses,
 } from "./submitApprovedPlanExecution";
 import {
@@ -1703,57 +1705,14 @@ export function normalizeSessionRuntimeSnapshot(
         closeReason: normalizedHarnessRunMarker.closeReason || "application_restarted",
       }
     : normalizedHarnessRunMarker;
-  const normalizedActionRequest = normalizeActionRequest(snapshot.activeActionRequest);
   const restoredPlanIdentity = buildPlanApprovalIdentity(snapshot.planArtifacts || []);
-  const restoredPlanReviewRequest =
-    normalizedActionRequest?.kind === "plan_review" &&
-    normalizedActionRequest.status === "pending" &&
-    !!restoredHarnessRunMarker &&
-    restoredHarnessRunMarker.status === "paused" &&
-    restoredHarnessRunMarker.runId === normalizedActionRequest.runId &&
-    restoredHarnessRunMarker.turnId === normalizedActionRequest.turnId &&
-    restoredHarnessRunMarker.sessionKey === normalizedActionRequest.sessionKey &&
-    !!restoredPlanIdentity &&
-    restoredPlanIdentity.revision === normalizedActionRequest.planRevision &&
-    restoredPlanIdentity.artifactHash === normalizedActionRequest.artifactHash
-      ? normalizedActionRequest
-      : null;
-  const restoredUserChoiceRequest =
-    normalizedActionRequest?.kind === "user_choice" &&
-    normalizedActionRequest.status === "pending" &&
-    restoredHarnessRunMarker?.status === "paused" &&
-    restoredHarnessRunMarker.runId === normalizedActionRequest.runId &&
-    restoredHarnessRunMarker.turnId === normalizedActionRequest.turnId &&
-    restoredHarnessRunMarker.sessionKey === normalizedActionRequest.sessionKey &&
-    taskFlow.some((block) =>
-      block.type === "agent" &&
-      block.turnId === normalizedActionRequest.turnId &&
-      isExactUserChoiceResolutionIdentity(block.choiceRequest, normalizedActionRequest) &&
-      Array.isArray(block.options) &&
-      block.options.length === normalizedActionRequest.optionValues.length &&
-      block.options.every((option, index) =>
-        String(option.value || option.label || "").trim() === normalizedActionRequest.optionValues[index]
-      )
-    )
-      ? normalizedActionRequest
-      : null;
-  const restoredGoalConfirmationRequest =
-    normalizedActionRequest?.kind === "goal_confirmation" &&
-    normalizedActionRequest.status === "pending" &&
-    restoredHarnessRunMarker?.status === "paused" &&
-    restoredHarnessRunMarker.runId === normalizedActionRequest.runId &&
-    restoredHarnessRunMarker.turnId === normalizedActionRequest.turnId &&
-    restoredHarnessRunMarker.sessionKey === normalizedActionRequest.sessionKey &&
-    normalizedGoalRuntime?.status === "awaiting_input" &&
-    normalizedGoalRuntime.goal.id === normalizedActionRequest.goalId &&
-    (!normalizedGoalRuntime.goal.sessionKey || normalizedGoalRuntime.goal.sessionKey === normalizedActionRequest.sessionKey) &&
-    (normalizedGoalRuntime.goal.revision || 1) === normalizedActionRequest.goalRevision &&
-    normalizedGoalRuntime.goal.ownerTurnId === normalizedActionRequest.turnId
-      ? normalizedActionRequest
-      : null;
-  const restoredActionRequest = restoredPlanReviewRequest ||
-    restoredUserChoiceRequest ||
-    restoredGoalConfirmationRequest;
+  const restoredActionRequest = restorePendingActionRequest({
+    request: snapshot.activeActionRequest,
+    runOwner: restoredHarnessRunMarker,
+    planIdentity: restoredPlanIdentity,
+    taskFlow,
+    goalRuntime: normalizedGoalRuntime,
+  });
   return {
     runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
     runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
@@ -2954,17 +2913,62 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
       : "Plan approved; execution is continuing in the current turn.",
   });
 
+  const reviewRunMarker = latest.harnessRunMarker;
+  const reviewedPlanContent = latest.planArtifacts
+    .filter((artifact) => ["plan", "design", "bugfix"].includes(artifact.kind))
+    .slice()
+    .sort((left, right) => left.path.localeCompare(right.path))
+    .map((artifact) => [
+      `<!-- ${artifact.path} revision ${Number(artifact.revision) || 1} -->`,
+      String(artifact.content || "").trim(),
+    ].join("\n"))
+    .filter(Boolean)
+    .join("\n\n");
+  const canCompactReviewRun =
+    reviewRunMarker?.status === "paused" &&
+    reviewRunMarker.turnId === input.planTurnId &&
+    Number.isInteger(reviewRunMarker.turnStartMessageIndex) &&
+    Number(reviewRunMarker.turnStartMessageIndex) >= 0;
+  const reviewTurnBlocks = latest.taskFlow.filter((block) => block.turnId === input.planTurnId);
+  const canonicalReviewUserMessageCount = buildCanonicalCompletedTurnMessages({
+    turnBlocks: reviewTurnBlocks,
+    fallbackAssistantText: reviewedPlanContent,
+  }).filter((message) => message.role === "user").length;
+  const childAgentMessages = canCompactReviewRun
+    ? compactPlanReviewTurnMessages({
+        messages: latest.agentMessages,
+        turnStartMessageIndex: Number(reviewRunMarker.turnStartMessageIndex),
+        turnBlocks: reviewTurnBlocks,
+        reviewedPlanContent,
+      }) as AgentMessage[]
+    : latest.agentMessages;
+
   const runtimePatch = {
     currentTurnId: input.planTurnId,
     pendingPlanApprovalHandoff: null,
     planApprovalExecutionStartedForTurnId: input.planTurnId,
     currentTurnExecutionConsent: { turnId: input.planTurnId, granted: true },
+    ...(childAgentMessages !== latest.agentMessages
+      ? { agentMessages: childAgentMessages }
+      : {}),
   };
   if (input.sessionKey) {
     latest.updateRuntimeForSession?.(input.sessionKey, runtimePatch);
   }
   if (!input.sessionKey || isSessionRuntimeActive(latest, input.sessionKey)) {
     input.setActiveState(runtimePatch);
+  }
+  if (childAgentMessages !== latest.agentMessages) {
+    logStoreEvent("plan_approval_child_context_compacted", {
+      sessionKey: input.sessionKey,
+      turnId: input.planTurnId,
+      parentRunId: reviewRunMarker?.runId || null,
+      messagesBefore: latest.agentMessages.length,
+      messagesAfter: childAgentMessages.length,
+      canonicalUserMessageCount: canonicalReviewUserMessageCount,
+      omittedRuntimeMessages: Math.max(0, latest.agentMessages.length - childAgentMessages.length),
+      reviewedPlanChars: reviewedPlanContent.length,
+    });
   }
 
   let submissionStarted = false;
@@ -5737,6 +5741,62 @@ export const useAppStore = create<AppState>()(
       const normalizedApprovalChoice = normalizePlanApprovalChoice(approvalChoice);
       const language = state.config.language === "en" ? "en" : "zh";
       const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, language);
+      const executionReadiness = evaluateApprovedPlanExecutionReadiness({
+        planArtifacts: state.planArtifacts,
+        executionPlanTasks,
+      });
+      if (!executionReadiness.ok) {
+        const qualityDetail = executionReadiness.qualityReason
+          ? `${executionReadiness.reason}:${executionReadiness.qualityReason}`
+          : executionReadiness.reason || "unknown_plan_execution_readiness_failure";
+        state.abortController?.abort();
+        set((s) => ({
+          isPlanApproved: false,
+          planApprovalChoice: null,
+          pendingPlanApprovalHandoff: null,
+          planApprovalExecutionStartedForTurnId: null,
+          currentTurnExecutionConsent: { turnId: null, granted: false },
+          activeActionRequest: null,
+          planTasks: [],
+          planExecutionEvidenceLedger: [],
+          planExecutionEvidenceCount: 0,
+          planAutoResumeCount: 0,
+          planExecutionProgressSnapshot: null,
+          planStage: "plan",
+          agentStatus: "idle",
+          isGenerating: false,
+          abortController: null,
+          conversationTurns: s.conversationTurns.map((turn) =>
+            turn.id === approvedTurnId
+              ? {
+                  ...turn,
+                  status: "paused" as const,
+                  summary: language === "zh"
+                    ? `计划执行物化失败（plan_execution_materialization_failed）：${qualityDetail}。请修订或重新生成计划。`
+                    : `Plan execution materialization failed (plan_execution_materialization_failed): ${qualityDetail}. Revise or regenerate the plan before approval.`,
+                }
+              : turn,
+          ),
+        }));
+        logStoreEvent("plan_approval_blocked_execution_materialization", {
+          stopClass: executionReadiness.stopClass,
+          reason: executionReadiness.reason,
+          qualityReason: executionReadiness.qualityReason,
+          planTurnId: approvedTurnId,
+          sessionKey: reviewSessionKey,
+          runId: reviewRequest.runId,
+          parentRunId: reviewRequest.parentRunId || null,
+          actionRequestId: reviewRequest.requestId,
+          planRevision: reviewRequest.planRevision,
+          artifactHash: reviewRequest.artifactHash,
+          taskCount: executionReadiness.taskCount,
+          mutationOriented: executionReadiness.mutationOriented,
+          requiresExecutableValidation: executionReadiness.requiresExecutableValidation,
+          concreteMutationTaskCount: executionReadiness.concreteMutationTaskCount,
+          executableValidationTaskCount: executionReadiness.executableValidationTaskCount,
+        });
+        return;
+      }
       const currentTurn = approvedTurnId
         ? state.conversationTurns.find((turn) => turn.id === approvedTurnId)
         : null;
@@ -5967,22 +6027,21 @@ export const useAppStore = create<AppState>()(
     }));
   },
   pauseGoal: (expectedIdentity) => {
-    const { activeGoal, goalProgress, goalRuntime, isGenerating, abortController, activeActionRequest, harnessRunMarker } = get();
+    const { activeGoal, goalProgress, goalRuntime, isGenerating, abortController, activeActionRequest } = get();
     if (!activeGoal) return;
     const expectedRevision = activeGoal.revision || 1;
-    if (expectedIdentity && !isCurrentGoalControlResolution({
+    if (expectedIdentity && !isCurrentGoalAdministrativeControl({
       request: activeActionRequest,
       identity: expectedIdentity,
       goalId: activeGoal.id,
       goalRevision: expectedRevision,
-      runOwner: harnessRunMarker,
     })) {
       logStoreEvent("goal_pause_identity_mismatch", {
-        expectedGoalId: expectedIdentity.goalId,
+        expectedGoalId: expectedIdentity?.goalId || null,
         activeGoalId: activeGoal.id,
-        expectedRevision: expectedIdentity.goalRevision,
+        expectedRevision: expectedIdentity?.goalRevision || null,
         activeRevision: expectedRevision,
-        expectedRequestId: expectedIdentity.requestId || null,
+        expectedRequestId: expectedIdentity?.requestId || null,
         activeRequestId: activeActionRequest?.requestId || null,
       });
       return;
@@ -6005,7 +6064,11 @@ export const useAppStore = create<AppState>()(
       goalProgress: nextRuntime.progress,
       goalStatus: nextStatus,
       goalRuntime: nextRuntime,
-      activeActionRequest: clearActionRequestOfKind(state.activeActionRequest, "goal_confirmation"),
+      activeActionRequest: clearGoalConfirmationActionRequest(
+        state.activeActionRequest,
+        activeGoal.id,
+        expectedRevision,
+      ),
       runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
         type: "goal.state_changed",
         ...resolveGoalEventOwnerIdentity({
@@ -6028,19 +6091,22 @@ export const useAppStore = create<AppState>()(
     const { activeGoal, goalProgress, goalRuntime, goalStatus, isGenerating, config, runtimeEvents, currentTurnId, activeActionRequest, harnessRunMarker } = get();
     if (!activeGoal) return;
     const expectedRevision = activeGoal.revision || 1;
-    if (expectedIdentity && !isCurrentGoalControlResolution({
+    const exactControlResolution = expectedIdentity ? isCurrentGoalControlResolution({
       request: activeActionRequest,
       identity: expectedIdentity,
       goalId: activeGoal.id,
       goalRevision: expectedRevision,
       runOwner: harnessRunMarker,
-    })) {
+    }) : false;
+    const hasPendingActionRequest = activeActionRequest?.status === "pending";
+    if ((expectedIdentity && !exactControlResolution) ||
+      (goalStatus === "awaiting_input" && hasPendingActionRequest && !exactControlResolution)) {
       logStoreEvent("goal_resume_identity_mismatch", {
-        expectedGoalId: expectedIdentity.goalId,
+        expectedGoalId: expectedIdentity?.goalId || null,
         activeGoalId: activeGoal.id,
-        expectedRevision: expectedIdentity.goalRevision,
+        expectedRevision: expectedIdentity?.goalRevision || null,
         activeRevision: expectedRevision,
-        expectedRequestId: expectedIdentity.requestId || null,
+        expectedRequestId: expectedIdentity?.requestId || null,
         activeRequestId: activeActionRequest?.requestId || null,
       });
       return;
@@ -6096,7 +6162,11 @@ export const useAppStore = create<AppState>()(
       goalProgress: resumedProgress,
       goalStatus: "active",
       goalRuntime: resumedRuntime,
-      activeActionRequest: clearActionRequestOfKind(state.activeActionRequest, "goal_confirmation"),
+      activeActionRequest: clearGoalConfirmationActionRequest(
+        state.activeActionRequest,
+        activeGoal.id,
+        expectedRevision,
+      ),
       runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
         type: "goal.state_changed",
         ...resolveGoalEventOwnerIdentity({
@@ -6151,12 +6221,11 @@ export const useAppStore = create<AppState>()(
   },
   clearGoal: (expectedIdentity) => {
     const current = get();
-    if (expectedIdentity && !isCurrentGoalControlResolution({
+    if (expectedIdentity && !isCurrentGoalAdministrativeControl({
       request: current.activeActionRequest,
       identity: expectedIdentity,
       goalId: current.activeGoal?.id,
       goalRevision: current.activeGoal?.revision || 1,
-      runOwner: current.harnessRunMarker,
     })) {
       logStoreEvent("goal_clear_identity_mismatch", {
         expectedGoalId: expectedIdentity.goalId,
@@ -6176,7 +6245,13 @@ export const useAppStore = create<AppState>()(
       goalProgress: null,
       goalStatus: "paused",
       goalRuntime: null,
-      activeActionRequest: clearActionRequestOfKind(state.activeActionRequest, "goal_confirmation"),
+      activeActionRequest: current.activeGoal
+        ? clearGoalConfirmationActionRequest(
+            state.activeActionRequest,
+            current.activeGoal.id,
+            current.activeGoal.revision || 1,
+          )
+        : state.activeActionRequest,
       runtimeEvents: current.activeGoal
           ? appendRuntimeEvent(state.runtimeEvents, withEventSchema({
             type: "goal.cleared",
@@ -6198,19 +6273,22 @@ export const useAppStore = create<AppState>()(
     const text = objective.trim();
     if (!activeGoal || !text || (goalStatus !== "paused" && goalStatus !== "blocked" && goalStatus !== "awaiting_input")) return false;
     const expectedRevision = activeGoal.revision || 1;
-    if (expectedIdentity && !isCurrentGoalControlResolution({
+    const exactControlResolution = expectedIdentity ? isCurrentGoalControlResolution({
       request: activeActionRequest,
       identity: expectedIdentity,
       goalId: activeGoal.id,
       goalRevision: expectedRevision,
       runOwner: harnessRunMarker,
-    })) {
+    }) : false;
+    const hasPendingActionRequest = activeActionRequest?.status === "pending";
+    if ((expectedIdentity && !exactControlResolution) ||
+      (goalStatus === "awaiting_input" && hasPendingActionRequest && !exactControlResolution)) {
       logStoreEvent("goal_update_identity_mismatch", {
-        expectedGoalId: expectedIdentity.goalId,
+        expectedGoalId: expectedIdentity?.goalId || null,
         activeGoalId: activeGoal.id,
-        expectedRevision: expectedIdentity.goalRevision,
+        expectedRevision: expectedIdentity?.goalRevision || null,
         activeRevision: expectedRevision,
-        expectedRequestId: expectedIdentity.requestId || null,
+        expectedRequestId: expectedIdentity?.requestId || null,
         activeRequestId: activeActionRequest?.requestId || null,
       });
       return false;
@@ -6240,7 +6318,11 @@ export const useAppStore = create<AppState>()(
       goalProgress: nextProgress,
       goalStatus: "paused",
       goalRuntime: nextRuntime,
-      activeActionRequest: clearActionRequestOfKind(activeActionRequest, "goal_confirmation"),
+      activeActionRequest: clearGoalConfirmationActionRequest(
+        activeActionRequest,
+        activeGoal.id,
+        expectedRevision,
+      ),
     });
     return true;
   },
@@ -7515,21 +7597,15 @@ export const useAppStore = create<AppState>()(
             (session) => session.id === persistedCurrentSessionId,
           ) || null
         : null;
-      const persistedLegacyGoal = persistedState.activeGoal
-        ? migrateGoalDefinition(persistedState.activeGoal)
-        : null;
-      const persistedGoalRuntime = persistedState.goalRuntime && [2, 3].includes(Number(persistedState.goalRuntime.schemaVersion))
-        ? restoreGoalRuntimeSnapshot(persistedState.goalRuntime)
-        : persistedLegacyGoal
-          ? restoreGoalRuntimeSnapshot(buildGoalRuntimeSnapshot({
-              goal: persistedLegacyGoal,
-              progress: persistedState.goalProgress || createGoalProgress(persistedLegacyGoal.id, ""),
-              phase: null,
-            }))
-          : null;
-      const hydratedGoalRuntime = hasHydratedCurrentSession
-        ? hydratedCurrentSession?.runtimeSnapshot?.goalRuntime || persistedGoalRuntime
-        : null;
+      const normalizedHydratedRuntime = hasHydratedCurrentSession
+        ? normalizeSessionRuntimeSnapshot({
+            ...persistedState,
+            goalRuntime: hydratedCurrentSession?.runtimeSnapshot?.goalRuntime || persistedState.goalRuntime,
+            activeGoal: hydratedCurrentSession?.runtimeSnapshot?.activeGoal || persistedState.activeGoal,
+            goalProgress: hydratedCurrentSession?.runtimeSnapshot?.goalProgress || persistedState.goalProgress,
+          }, { restoreInterruptedGoal: true })
+        : undefined;
+      const hydratedGoalRuntime = normalizedHydratedRuntime?.goalRuntime || null;
       const selectedMainModeKey = mapLegacyNexusModeToMainMode(
         persistedState.selectedMainModeKey ||
           persistedState.selectedNexusModeKey ||
@@ -7550,28 +7626,7 @@ export const useAppStore = create<AppState>()(
         (persistedConfig as any).local,
         current.config.local,
       );
-      const hydratedTaskFlow = hasHydratedCurrentSession
-        ? sanitizeTaskBlocksForPersist(persistedState.taskFlow || [])
-        : [];
-      const persistedHarnessMarker = normalizeHarnessRunMarker(persistedState.harnessRunMarker);
-      const persistedPlanIdentity = buildPlanApprovalIdentity(
-        hasHydratedCurrentSession ? persistedState.planArtifacts || [] : [],
-      );
-      const persistedActionRequest = normalizeActionRequest(
-        hasHydratedCurrentSession ? persistedState.activeActionRequest : null,
-      );
-      const restoredPlanReviewRequest =
-        persistedActionRequest?.kind === "plan_review" &&
-        persistedActionRequest.status === "pending" &&
-        persistedHarnessMarker?.status === "paused" &&
-        persistedHarnessMarker?.runId === persistedActionRequest.runId &&
-        persistedHarnessMarker?.turnId === persistedActionRequest.turnId &&
-        persistedHarnessMarker?.sessionKey === persistedActionRequest.sessionKey &&
-        !!persistedPlanIdentity &&
-        persistedPlanIdentity.revision === persistedActionRequest.planRevision &&
-        persistedPlanIdentity.artifactHash === persistedActionRequest.artifactHash
-          ? persistedActionRequest
-          : null;
+      const hydratedTaskFlow = normalizedHydratedRuntime?.taskFlow || [];
       return {
         ...current,
         ...persistedStateWithoutTaskCenter,
@@ -7620,43 +7675,29 @@ export const useAppStore = create<AppState>()(
         ),
         activeSessionByWorkspace: persistedState.activeSessionByWorkspace || {},
         taskFlow: hydratedTaskFlow,
-        runtimeEvents: hasHydratedCurrentSession
-          ? normalizeRuntimeEvents(persistedState.runtimeEvents)
-          : [],
-        agentMessages: hasHydratedCurrentSession
-          ? sanitizeAgentMessagesForPersist(persistedState.agentMessages || [])
-          : [],
-        conversationTurns: hasHydratedCurrentSession
-          ? normalizeInterruptedConversationTurnsForRestore(
-              persistedState.conversationTurns,
-              hydratedTaskFlow,
-            )
-          : [],
+        runtimeEvents: normalizedHydratedRuntime?.runtimeEvents || [],
+        harnessRunMarker: normalizedHydratedRuntime?.harnessRunMarker || null,
+        agentMessages: normalizedHydratedRuntime?.agentMessages || [],
+        conversationTurns: normalizedHydratedRuntime?.conversationTurns || [],
         selectedWorkspace: persistedState.selectedWorkspace || persistedState.currentWorkspace || current.selectedWorkspace,
         selectedMainModeKey,
         selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
         imageStudio: normalizeImageStudioRuntime(persistedState.imageStudio),
         activeStudioAgentKey: normalizeStudioAgentKey(persistedState.activeStudioAgentKey),
         gameStudioInitialized: persistedState.gameStudioInitialized === true,
-        pendingSlashCommand: hasHydratedCurrentSession
-          ? normalizePendingSlashCommand(persistedState.pendingSlashCommand)
-          : null,
+        pendingSlashCommand: normalizedHydratedRuntime?.pendingSlashCommand || null,
         rightPanelTab,
         currentSessionId: hasHydratedCurrentSession ? persistedCurrentSessionId : null,
-        currentTurnId: hasHydratedCurrentSession
-          ? (typeof persistedState.currentTurnId === "string" ? persistedState.currentTurnId : null)
-          : null,
+        currentTurnId: normalizedHydratedRuntime?.currentTurnId || null,
         currentTurnState: createDefaultCurrentTurnState(),
-        planArtifacts: hasHydratedCurrentSession ? persistedState.planArtifacts || [] : [],
-        planTasks: hasHydratedCurrentSession ? persistedState.planTasks || [] : [],
-        planExecutionEvidenceLedger: hasHydratedCurrentSession ? persistedState.planExecutionEvidenceLedger || [] : [],
-        planExecutionEvidenceCount: hasHydratedCurrentSession ? persistedState.planExecutionEvidenceCount ?? 0 : 0,
-        planAutoResumeCount: hasHydratedCurrentSession ? persistedState.planAutoResumeCount ?? 0 : 0,
-        planExecutionProgressSnapshot: hasHydratedCurrentSession
-          ? normalizeStoredPlanExecutionProgressSnapshot(persistedState.planExecutionProgressSnapshot)
-          : null,
-        planStage: hasHydratedCurrentSession ? persistedState.planStage ?? "idle" : "idle",
-        isPlanApproved: hasHydratedCurrentSession ? persistedState.isPlanApproved === true : false,
+        planArtifacts: normalizedHydratedRuntime?.planArtifacts || [],
+        planTasks: normalizedHydratedRuntime?.planTasks || [],
+        planExecutionEvidenceLedger: normalizedHydratedRuntime?.planExecutionEvidenceLedger || [],
+        planExecutionEvidenceCount: normalizedHydratedRuntime?.planExecutionEvidenceCount || 0,
+        planAutoResumeCount: normalizedHydratedRuntime?.planAutoResumeCount || 0,
+        planExecutionProgressSnapshot: normalizedHydratedRuntime?.planExecutionProgressSnapshot || null,
+        planStage: normalizedHydratedRuntime?.planStage || "idle",
+        isPlanApproved: normalizedHydratedRuntime?.isPlanApproved === true,
         activeGoal: hydratedGoalRuntime?.goal ?? null,
         goalProgress: hydratedGoalRuntime?.progress ?? null,
         goalStatus: hydratedGoalRuntime?.status ?? "paused",
@@ -7673,7 +7714,7 @@ export const useAppStore = create<AppState>()(
         abortController: null,
         pendingReviewResolve: null,
         pendingReviewTaskId: null,
-        activeActionRequest: restoredPlanReviewRequest,
+        activeActionRequest: normalizedHydratedRuntime?.activeActionRequest || null,
         pendingToolCall: null,
         autoApproveTools: false,
         autoApproveToolScopes: [],

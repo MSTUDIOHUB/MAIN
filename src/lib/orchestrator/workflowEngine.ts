@@ -61,6 +61,7 @@ import { buildPlanApprovalIdentity } from "../planApprovalIdentity";
 import { resolveRuntimeRunIdentity, type RuntimeRunIdentity } from "../runIdentity";
 import { buildDurableTurnContext, shouldCanonicalizeTerminalTurnContext } from "../durableTurnContext";
 import { reduceRunTransition } from "../runTransitionReducer";
+import { findLatestRunOwnedAgentBlock } from "./runOwnedAgentBlocks";
 
 type WorkflowStoreState = any;
 
@@ -233,6 +234,9 @@ export class WorkflowEngine {
     const appendTurnBlock = (block: TaskBlock) => {
       const targetTurnId = block.turnId && block.turnId !== turnId ? block.turnId : context.uiDisplayTurnId;
       const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: targetTurnId } as TaskBlock);
+      if (blockWithTurn.type === "agent") {
+        context.agentBlockIdsCreatedThisRun.add(blockWithTurn.id);
+      }
       sessionSet((s: any) => {
         const taskFlow = [...s.taskFlow, blockWithTurn];
         const conversationTurns = s.conversationTurns.map((turn: any) =>
@@ -459,18 +463,22 @@ export class WorkflowEngine {
     };
 
 	    const closeCurrentHarnessRunMarker = (status: "completed" | "paused" | "error", reason: string) => {
-	      const marker = sessionGet().harnessRunMarker;
+	      const runtimeAtClose = sessionGet();
+	      const marker = runtimeAtClose.harnessRunMarker;
 	      if (isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner)) {
 	        const closedAt = Date.now();
         const nextMarker: HarnessRunMarker = {
           ...marker,
           status,
+          planStage: runtimeAtClose.planStage,
+          isPlanApproved: runtimeAtClose.isPlanApproved,
           updatedAt: closedAt,
           closedAt,
           closeReason: reason,
         };
 	        sessionSet({ harnessRunMarker: nextMarker });
 	        closeHarnessRunMarker({ status, closeReason: reason }, harnessRunOwner);
+	        const latestRuntime = sessionGet();
 	        logStoreEvent("agent_loop_stop_summary", {
 	          turnId,
 	          sessionKey: runSessionKey,
@@ -479,8 +487,12 @@ export class WorkflowEngine {
 	          reason,
 	          workflowMode: marker.workflowMode,
 	          runtimeIntent: marker.runtimeIntent,
-	          planStage: marker.planStage,
-	          isPlanApproved: marker.isPlanApproved,
+	          // Plan review and approval can change while the same run marker is
+	          // alive. Report reducer-owned current state, not the immutable
+	          // start snapshot (the latest log incorrectly said planStage=idle
+	          // immediately after plan.md revision 1 reached review).
+	          planStage: latestRuntime.planStage,
+	          isPlanApproved: latestRuntime.isPlanApproved,
 	          iteration: marker.iteration,
 	          maxIterations: marker.maxIterations,
 	          latestTool: marker.latestTool || null,
@@ -1049,11 +1061,14 @@ export class WorkflowEngine {
             }));
           } else {
             sessionSet((s: any) => {
-              const latestAgent = [...s.taskFlow]
-                .reverse()
-                .find((block) => block.turnId === turnId && block.type === "agent");
+              const latestAgent = findLatestRunOwnedAgentBlock(
+                s.taskFlow,
+                context.uiDisplayTurnId,
+                context.agentBlockIdsCreatedThisRun,
+              );
               if (latestAgent) {
                 const targetId = latestAgent.id;
+                context.agentBlockIdsCreatedThisRun.delete(targetId);
                 return {
                   taskFlow: s.taskFlow.filter((block: any) => block.id !== targetId),
                   conversationTurns: s.conversationTurns.map((turn: any) =>
@@ -1125,9 +1140,12 @@ export class WorkflowEngine {
             // iterations (e.g., repeated "I need to read file X" preambles),
             // replace the last agent block instead of appending a duplicate.
             const currentTaskFlow = sessionGet().taskFlow;
-            const lastAgentBlock = [...currentTaskFlow]
-              .reverse()
-              .find((t: any) => t.turnId === turnId && t.type === "agent" && !t.streaming) as any;
+            const lastAgentBlock = findLatestRunOwnedAgentBlock(
+              currentTaskFlow,
+              context.uiDisplayTurnId,
+              context.agentBlockIdsCreatedThisRun,
+              { requireSettled: true },
+            );
             const trimmedNew = remainingAgent.trim();
             const trimmedLast = lastAgentBlock ? String(lastAgentBlock.content || "").trim() : "";
             const isDuplicate = trimmedLast.length > 0 && trimmedNew.length > 0 && (

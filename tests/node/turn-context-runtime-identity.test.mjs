@@ -158,6 +158,67 @@ test("canonical turn context keeps visible requests and choices but filters hidd
   assert.equal(messages.length, 5, "canonical extraction must not truncate durable context");
 });
 
+test("canonical turn context never promotes ContextState or wrapped hidden approval prompts", () => {
+  const contextState = [
+    "[System: ContextState",
+    "ContextMemoryState v1 id=ctx-control updatedAt=1",
+    "Latest user request: 修复双击 Markdown 文件无法打开的问题。",
+    "Hard constraints:",
+    "- 如果用户消息包含 [turn_intake]，优先读取其中的 user_request。",
+    "Use this as compact historical state only; prioritize the latest messages and current workspace evidence.]",
+  ].join("\n");
+  const hiddenApproval = [
+    "[turn_intake]",
+    "[user_request]",
+    "计划已批准。请直接执行剩余任务，并运行 `npm test`。",
+    "[/user_request]",
+    "[/turn_intake]",
+  ].join("\n");
+  const result = turnContext.collectCanonicalTurnUserContext({
+    messages: [
+      { role: "user", content: "[turn_intake]\n[user_request]\n修复双击 Markdown 文件无法打开的问题。\n[/user_request]\n[/turn_intake]" },
+      { role: "user", content: contextState },
+      { role: "user", content: "PLAN_READONLY_CONVERGENCE: stop broad exploration and write plan.md." },
+      { role: "user", content: hiddenApproval },
+    ],
+    turnStartMessageIndex: 0,
+  });
+
+  assert.deepEqual(result.texts, ["修复双击 Markdown 文件无法打开的问题。"]);
+  assert.equal(result.inspectedUserMessages, 4);
+  assert.equal(result.filteredSyntheticMessages, 3);
+});
+
+test("approved Plan child context keeps prior turns, canonical input, and the exact reviewed artifact only", () => {
+  const reviewedPlan = "# 计划\n\n## 摘要\n- 修复文件打开链路。\n\n## 测试方案\n- 双击文件并验证内容加载。";
+  const compacted = turnContext.compactPlanReviewTurnMessages({
+    messages: [
+      { role: "user", content: "上一轮问题" },
+      { role: "assistant", content: "上一轮精确回答" },
+      { role: "user", content: "[turn_intake]\n[user_request]\n修复双击文件空白和打开按钮失效。\n[/user_request]\n[/turn_intake]" },
+      { role: "user", content: "[System: ContextState]\nContextMemoryState v1\nconstraints mention [turn_intake]" },
+      { role: "assistant", content: "隐藏探索过程" },
+      { role: "tool", content: "大段 read_file 原始输出" },
+      { role: "user", content: "[turn_intake]\n[user_request]\n计划已批准。请执行 npm test。\n[/user_request]\n[/turn_intake]" },
+    ],
+    turnStartMessageIndex: 2,
+    turnBlocks: [
+      { type: "user", content: "修复双击文件空白和打开按钮失效。" },
+      { type: "thought", content: "隐藏推理", hiddenProcess: true },
+      { type: "agent", content: "计划已生成，请审核。" },
+    ],
+    reviewedPlanContent: reviewedPlan,
+  });
+
+  assert.deepEqual(compacted, [
+    { role: "user", content: "上一轮问题" },
+    { role: "assistant", content: "上一轮精确回答" },
+    { role: "user", content: "修复双击文件空白和打开按钮失效。" },
+    { role: "assistant", content: reviewedPlan },
+  ]);
+  assert.doesNotMatch(JSON.stringify(compacted), /ContextState|大段 read_file|计划已批准|隐藏探索/);
+});
+
 test("completed turn compaction preserves every visible clarification and the exact final answer", () => {
   const compacted = turnContext.buildCanonicalCompletedTurnMessages({
     turnBlocks: [

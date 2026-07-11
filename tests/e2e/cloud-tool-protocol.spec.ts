@@ -177,7 +177,10 @@ test.beforeEach(async ({ page }) => {
         const path = String(args?.path ?? "");
         const scenario = new URL(window.location.href).searchParams.get("e2eScenario");
         const memoryFile = getMemoryFile(path);
-        if (scenario === "approved-plan-execution-replay" && memoryFile) {
+        if (
+          (scenario === "approved-plan-execution-replay" || scenario === "plan-approval-execute-tools") &&
+          memoryFile
+        ) {
           readFileCalls.push(path);
           const lines = memoryFile.content.split("\n");
           const startLine = Math.max(1, Number(args?.startLine ?? 1) || 1);
@@ -755,13 +758,42 @@ test.beforeEach(async ({ page }) => {
         }
 
         if (scenario === "plan-approval-execute-tools") {
+          if (!readFileCalls.includes("src/main.js")) {
+            return JSON.stringify({
+              output_text: [
+                "我会先读取 `src/main.js`，确认现有启动流程后再修改。",
+                "<tool_use>",
+                "<tool>read_file</tool>",
+                "<parameter name=\"path\">src/main.js</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          if (writeFileCalls.includes("src/main.js") && !runCommandCalls.includes("npm run test:workflow-assets")) {
+            return JSON.stringify({
+              output_text: [
+                "源码改动已完成；现在运行批准计划中的验证命令。",
+                "<tool_use>",
+                "<tool>run_command</tool>",
+                "<parameter name=\"command\">npm run test:workflow-assets</parameter>",
+                "<parameter name=\"cwd\">.</parameter>",
+                "<parameter name=\"description\">验证批准后的执行链路</parameter>",
+                "</tool_use>",
+              ].join("\n"),
+            });
+          }
+          if (runCommandCalls.includes("npm run test:workflow-assets")) {
+            return JSON.stringify({
+              output_text: "已修改 `src/main.js` 并完成 `npm run test:workflow-assets` 验证。",
+            });
+          }
           return JSON.stringify({
             output_text: [
-              "我会先写入执行任务清单。",
+              "我会写入批准执行回归标记。",
               "<tool_use>",
               "<tool>write_file</tool>",
-              "<parameter name=\"path\">.MAIN/plans/tasks.md</parameter>",
-              "<parameter name=\"content\"># Tasks\n\n- [ ] 验证批准后执行工具可用</parameter>",
+              "<parameter name=\"path\">src/main.js</parameter>",
+              "<parameter name=\"content\">import { initEditor } from './components/editor.js';\n\n// Approved Plan execution regression marker.\nconst root = document.getElementById('app');\n\nexport function boot() {\n  root.innerHTML = '&lt;div class=\"editor-shell\"&gt;&lt;/div&gt;';\n  initEditor(root.querySelector('.editor-shell'));\n}\n\nboot();\n</parameter>",
               "</tool_use>",
             ].join("\n"),
           });
@@ -1817,7 +1849,9 @@ test("approved plan execution replay pauses repeated source reads instead of com
       isPlanApproved: true,
       firstHasReadFile: true,
       firstHasPatch: true,
-      readMainCount: 3,
+      // One fresh read is intentionally allowed after the failed patch so the
+      // recovery run can rebuild exact edit context before repeat-read guard stops it.
+      readMainCount: 4,
       sawPatchAttempt: true,
       hasRepeatReadPause: true,
       hasAgentLoopError: false,
@@ -1975,25 +2009,31 @@ test("ordinary execute repeated read-only loops create a recovery pause instead 
 test("approved plan resumes with execute runtime tools while preserving plan turn identity", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-approval-execute-tools");
 
-  await expect(page.getByTestId("execution-capsule-plan-approve")).toBeVisible();
-  await page.getByTestId("execution-capsule-plan-approve").click();
+  const planReviewCapsule = page.getByTestId("plan-review-capsule");
+  await expect(planReviewCapsule).toBeVisible();
+  await expect(planReviewCapsule).toHaveAttribute("data-action-kind", "plan_review");
+  await page.getByTestId("plan-review-capsule-approve").click();
 
   await expect
     .poll(async () =>
       page.evaluate(() => {
         const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
         const requests = probe?.requests || [];
-        const latestWithTools = [...requests].reverse().find((request: any) => request.hasTools);
-        if (!latestWithTools) return null;
-        const parsed = JSON.parse(latestWithTools.body || "{}");
-        const names = (parsed.tools || []).map((tool: any) => tool?.name || tool?.function?.name).filter(Boolean);
+        const toolNameSets = requests
+          .filter((request: any) => request.hasTools)
+          .map((request: any) => (JSON.parse(request.body || "{}").tools || [])
+            .map((tool: any) => tool?.name || tool?.function?.name)
+            .filter(Boolean));
+        if (toolNameSets.length === 0) return null;
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         return {
-          hasWrite: names.includes("write_file") && names.includes("replace_in_file"),
-          hasShell: names.includes("run_command") && names.includes("execute_command"),
+          hasWrite: toolNameSets.some((names: string[]) => names.includes("write_file") && names.includes("replace_in_file")),
+          hasShell: toolNameSets.some((names: string[]) => names.includes("run_command") && names.includes("execute_command")),
           currentTurnIntent: snapshot?.currentTurnIntent,
           currentTurnDisplayIntent: snapshot?.currentTurnDisplayIntent,
           isPlanApproved: snapshot?.isPlanApproved,
+          wroteSource: (probe?.writeFileCalls || []).includes("src/main.js"),
+          ranValidation: (probe?.runCommandCalls || []).includes("npm run test:workflow-assets"),
         };
       }),
     )
@@ -2003,6 +2043,8 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
       currentTurnIntent: "plan",
       currentTurnDisplayIntent: "execute",
       isPlanApproved: true,
+      wroteSource: true,
+      ranValidation: true,
     });
 
   await expect
@@ -2011,12 +2053,16 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         return {
           hasWriteToolBlock: (snapshot?.toolNames || []).includes("write_file"),
-          hasExecutionAgentText: (snapshot?.agentTexts || []).includes("我会先写入执行任务清单。"),
+          hasValidationToolBlock: (snapshot?.toolNames || []).includes("run_command"),
+          hasExecutionAgentText: (snapshot?.agentTexts || []).some((text: string) =>
+            text.includes("源码改动已完成；现在运行批准计划中的验证命令。"),
+          ),
         };
       }),
     )
     .toEqual({
       hasWriteToolBlock: true,
+      hasValidationToolBlock: true,
       hasExecutionAgentText: true,
     });
 });

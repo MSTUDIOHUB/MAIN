@@ -128,9 +128,27 @@ test("manual project session starts as a top temporary row and never becomes Mis
         return { ...(args?.session as object), storageStatus: "ok", recordingDisabled: false };
       }
       if (cmd === "load_project_session_meta") {
-        (window as any).__MANUAL_CREATE_SESSION_LOADS__.push(Number(args?.sessionId));
+        const requestedId = Number(args?.sessionId);
+        const existing = oldSessions.find((session) => session.id === requestedId);
+        if (existing) {
+          return {
+            ...existing,
+            runtimeSnapshot: {
+              agentMessages: [],
+              selectedMainModeKey: "main_mode",
+              selectedNexusModeKey: "nexus_general",
+              planArtifacts: [],
+              planTasks: [],
+              planExecutionEvidenceLedger: [],
+              planExecutionEvidenceCount: 0,
+              planStage: "idle",
+              isPlanApproved: false,
+            },
+          };
+        }
+        (window as any).__MANUAL_CREATE_SESSION_LOADS__.push(requestedId);
         return {
-          id: Number(args?.sessionId),
+          id: requestedId,
           title: "Missing Session",
           date: "",
           active: false,
@@ -140,13 +158,31 @@ test("manual project session starts as a top temporary row and never becomes Mis
         };
       }
       if (cmd === "load_project_session_page") {
+        const requestedId = Number(args?.sessionId);
+        const isKnownSession = oldSessions.some((session) => session.id === requestedId);
+        const turnId = requestedId === 6101 ? "old-turn" : "oldest-turn";
+        const title = requestedId === 6101 ? "Older Project Session" : "Oldest Project Session";
+        const summary = requestedId === 6101 ? "Older content" : "Oldest content";
         return {
           sessionId: String(args?.sessionId),
-          turns: [],
-          messages: [],
+          turns: isKnownSession ? [{
+            id: turnId,
+            userPrompt: title,
+            title,
+            mode: "chat",
+            status: "done",
+            summary,
+            blockIds: [requestedId * 10 + 1, requestedId * 10 + 2],
+            collapsed: false,
+            createdAt: requestedId,
+          }] : [],
+          messages: isKnownSession ? [
+            { id: requestedId * 10 + 1, turnId, type: "user", content: title },
+            { id: requestedId * 10 + 2, turnId, type: "agent", content: summary, streaming: false },
+          ] : [],
           startTurnIndex: 0,
-          endTurnIndex: 0,
-          totalTurns: 0,
+          endTurnIndex: isKnownSession ? 1 : 0,
+          totalTurns: isKnownSession ? 1 : 0,
           hasMore: false,
           nextBeforeTurnIndex: null,
         };

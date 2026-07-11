@@ -54,6 +54,7 @@ const {
   buildPlanCommandExecutionHint,
   detectRequestedRootMarkdownDeliverables,
   ensureApprovedPlanRuntimeTasksForState,
+  evaluateApprovedPlanExecutionReadiness,
   formatPlanTaskListForPrompt,
   normalizeApprovedPlanTaskStatuses,
 } = loadTranspiledModuleSync(
@@ -86,6 +87,77 @@ function baseState(overrides = {}) {
     ],
     ...overrides,
   };
+}
+
+function reviewablePlanArtifact(content, overrides = {}) {
+  return {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    revision: 1,
+    updatedAt: 1,
+    content,
+    ...overrides,
+  };
+}
+
+function executableMutationPlan() {
+  return [
+    "# 文件打开链路修复计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复 Markdown 文件打开事件与前端入口不一致的问题。",
+    "",
+    "## 已确认证据",
+    "- 已读取 `src/main.js` 并确认 `openFile` 是前端入口。",
+    "- 已读取 `src-tauri/src/main.rs` 并确认后端事件名称不一致。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/main.js`，统一 `openFile` 接收的文件路径 payload。",
+    "- 修改 `src-tauri/src/main.rs`，统一单实例与系统文件打开事件名称。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不新增公共 API；内部文件打开事件 payload 保持字符串路径。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm test` 验证前端文件打开事件回归测试。",
+    "- 运行 `cargo check` 验证 Tauri 后端编译。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持编辑器和预览渲染行为不变。",
+  ].join("\n");
+}
+
+function loggedNonExecutableMdViewerPlan() {
+  return [
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复双击 Markdown 文件后无法打开的问题。",
+    "",
+    "## 已确认证据",
+    "- 已读取文件：src-tauri/src/main.rs。",
+    "- 已读取文件：src/main.js。",
+    "",
+    "## 关键改动",
+    "- 将 `app.on(\"open\", ...)` 改为 `app_handle.on_open_url(...)`。",
+    "- 确保 `SingleInstance` 的回调正确处理文件路径。",
+    "- 确保 `open_files` 命令正确触发前端事件。",
+    "- 确认 `dialog.open()` 的 Tauri v2 正确调用方式。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化。",
+    "",
+    "## 测试方案",
+    "- `main.rs` 中 `on_open_files` 事件监听器使用了错误的 API 名称。",
+    "- `src/main.js` 中 `dialog.open()` 的调用方式与 Tauri v2 不兼容。",
+    "- 需要读取 `src/main.js` 中 `openFile` 函数的完整实现以确认 dialog 调用细节。",
+    "- 确保 `SingleInstance` 正确传递文件路径给已运行的实例。",
+    "- 确保前端能接收并处理 `file-open` 事件。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持编辑器其他行为不变。",
+  ].join("\n");
 }
 
 test("approved plan execution detects requested root markdown deliverables", () => {
@@ -146,4 +218,140 @@ test("approved plan execution normalizes existing runtime tasks without requirin
   assert.equal(normalized.length, 1);
   assert.equal(normalized[0].text, "运行 `npm test`");
   assert.equal(statuses.length, 1);
+});
+
+test("approval readiness rejects the logged MD Viewer plan before deriving a child execution run", () => {
+  const artifact = reviewablePlanArtifact(loggedNonExecutableMdViewerPlan());
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.stopClass, "plan_execution_materialization_failed");
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.equal(readiness.qualityReason, "non_executable_test_plan");
+});
+
+test("approval readiness rejects a bogus read-only runtime task for a mutation plan", () => {
+  const artifact = reviewablePlanArtifact(executableMutationPlan());
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks: [{
+      id: "task-read-open-file",
+      text: "需要读取 `src/main.js` 中 `openFile` 函数的完整实现以确认 dialog 调用细节",
+      status: "pending",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    }],
+  });
+
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.reason, "runtime_task_set_not_executable");
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.concreteMutationTaskCount, 0);
+  assert.equal(readiness.executableValidationTaskCount, 0);
+});
+
+test("approval readiness accepts a semantically valid mutation plan with concrete mutation and validation tasks", () => {
+  const artifact = reviewablePlanArtifact(executableMutationPlan());
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.stopClass, null);
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.requiresExecutableValidation, true);
+  assert.ok(readiness.concreteMutationTaskCount >= 1);
+  assert.ok(readiness.executableValidationTaskCount >= 1);
+});
+
+test("approval readiness recognizes a mutation verb after a concrete file target", () => {
+  const artifact = reviewablePlanArtifact(executableMutationPlan());
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks: [
+      {
+        id: "task-file-mutation",
+        text: "在 `src/main.js` 中修改 `openFile` 的 payload 处理",
+        status: "pending",
+        evidence: [{ kind: "file", value: "src/main.js" }],
+      },
+      {
+        id: "task-validation",
+        text: "运行 `npm test` 验证文件打开回归",
+        status: "pending",
+        commands: ["npm test"],
+        evidence: [{ kind: "cmd", value: "npm test" }],
+      },
+    ],
+  });
+
+  assert.equal(readiness.ok, true, readiness.reason);
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+});
+
+test("approval readiness preserves the native contract for a design-only review artifact", () => {
+  const artifact = reviewablePlanArtifact([
+    "# 文件打开链路设计",
+    "",
+    "## 影响文件",
+    "- `src/main.js`：前端文件打开入口。",
+    "- `src-tauri/src/main.rs`：系统文件打开事件入口。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/main.js`，统一前端事件 payload 解析。",
+    "- 修改 `src-tauri/src/main.rs`，统一单实例文件路径转发。",
+    "",
+    "## 数据流",
+    "- 系统文件路径由 Tauri 转为字符串 payload，再由前端入口读取并渲染 Markdown。",
+    "",
+    "## 验证方式",
+    "- 运行 `npm test` 验证前端事件处理。",
+    "- 运行 `cargo check` 验证后端编译。",
+  ].join("\n"), {
+    kind: "design",
+    path: ".MAIN/plans/design.md",
+    title: "Design",
+  });
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true);
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.requiresExecutableValidation, true);
+  assert.ok(readiness.concreteMutationTaskCount >= 1);
+  assert.ok(readiness.executableValidationTaskCount >= 1);
+});
+
+test("approvePlan applies readiness failure before queuing a same-turn child run", () => {
+  const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const approveStart = storeSource.indexOf("approvePlan: (approvalChoice, expectedIdentity) =>");
+  const approveEnd = storeSource.indexOf("rejectPlan: (expectedIdentity) =>", approveStart);
+  const approvePlanMethod = storeSource.slice(approveStart, approveEnd);
+  const readinessIndex = approvePlanMethod.indexOf("evaluateApprovedPlanExecutionReadiness");
+  const handoffIndex = approvePlanMethod.indexOf("pendingHandoffPatch");
+
+  assert.ok(readinessIndex >= 0);
+  assert.ok(handoffIndex > readinessIndex);
+  assert.match(approvePlanMethod, /if \(!executionReadiness\.ok\) \{[\s\S]*activeActionRequest: null/);
+  assert.match(approvePlanMethod, /isPlanApproved: false/);
+  assert.match(approvePlanMethod, /status: "paused" as const/);
+  assert.match(approvePlanMethod, /plan_execution_materialization_failed/);
+  assert.match(approvePlanMethod, /plan_approval_blocked_execution_materialization/);
 });

@@ -94,6 +94,10 @@ const {
   resolveIterationToolSurface,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"));
 
+const {
+  resolveDirectMutationPreflightRecovery,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
+
 const readOnlyTools = new Set([
   "get_project_skeleton",
   "list_directory",
@@ -497,6 +501,62 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
   });
   assert.match(prompt, /上下文与当前文件不匹配/);
   assert.match(prompt, /不要继续重试基于旧上下文的 `apply_patch`/);
+});
+
+test("first mutation preflight mismatch immediately enters targeted patch recovery", () => {
+  const replaceDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    executeRecoveryMode: "normal",
+    executeRecoveryAttempts: 0,
+    results: [{
+      name: "replace_in_file",
+      target: "src-tauri/src/main.rs",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED: search_text 在 src-tauri/src/main.rs 中不存在。",
+      isError: true,
+      lifecycleState: "blocked",
+    }],
+  });
+  assert.deepEqual(replaceDecision, {
+    mode: "patch_recovery_read",
+    reason: "mutation_preflight_search_text_mismatch",
+    target: "src-tauri/src/main.rs",
+  });
+
+  const patchDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    executeRecoveryMode: "normal",
+    executeRecoveryAttempts: 0,
+    results: [{
+      name: "apply_patch",
+      target: "src-tauri/src/main.rs",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（Update File has no changes）。",
+      isError: true,
+      lifecycleState: "blocked",
+    }],
+  });
+  assert.deepEqual(patchDecision, {
+    mode: "patch_recovery_read",
+    reason: "mutation_preflight_invalid_patch",
+    target: "src-tauri/src/main.rs",
+  });
+
+  assert.equal(resolveDirectMutationPreflightRecovery({
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    executeRecoveryMode: "patch_recovery_read",
+    executeRecoveryAttempts: 1,
+    results: [{
+      name: "apply_patch",
+      target: "src-tauri/src/main.rs",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED: invalid_patch",
+      isError: true,
+    }],
+  }), null, "an active recovery lease must not be reinitialized by the same failure");
 });
 
 test("read-only budget triggers execute recovery before max iterations", () => {

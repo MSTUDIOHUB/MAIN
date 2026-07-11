@@ -1,4 +1,9 @@
-import type { ConversationTurn, ConversationTurnStatus } from "./workflowModels";
+import type {
+  ConversationTurn,
+  ConversationTurnStatus,
+  PlanExecutionProgressSnapshot,
+  PlanTask,
+} from "./workflowModels";
 import type { ActionRequestKind, ActionRequestStatus } from "./actionRequest";
 
 export type TurnPresentationKind =
@@ -149,6 +154,7 @@ export interface GoalPresentationBehavior {
 export function resolveGoalPresentationBehavior(input: {
   lifecycle: TurnPresentationLifecycle;
   status?: string;
+  actionKind?: ActionRequestKind;
 }): GoalPresentationBehavior {
   const status = String(input.status || "").trim().toLowerCase();
   const primaryActionPending = status === "pausing";
@@ -159,9 +165,14 @@ export function resolveGoalPresentationBehavior(input: {
     : input.lifecycle === "active"
     ? "active"
     : "paused";
+  const isNonGoalConfirmationAction = input.lifecycle === "action_required" &&
+    !!input.actionKind &&
+    input.actionKind !== "goal_confirmation";
   const primaryAction: GoalPresentationPrimaryAction = input.lifecycle === "active" || primaryActionPending
     ? "pause"
-    : input.lifecycle === "resumable" || input.lifecycle === "action_required"
+    : isNonGoalConfirmationAction && status === "awaiting_input"
+    ? "pause"
+    : input.lifecycle === "resumable" || (input.lifecycle === "action_required" && !isNonGoalConfirmationAction)
     ? "resume"
     : null;
   const canResume = primaryAction === "resume";
@@ -173,7 +184,7 @@ export function resolveGoalPresentationBehavior(input: {
     canEdit: !primaryActionPending && (
       input.lifecycle === "active" ||
       input.lifecycle === "resumable" ||
-      input.lifecycle === "action_required"
+      (input.lifecycle === "action_required" && !isNonGoalConfirmationAction)
     ),
     canResume,
   };
@@ -206,6 +217,254 @@ export function isPlanActionRequestPresentationEligible(input: {
     input.markerTurnId === input.expectedTurnId &&
     !!input.requestRunId &&
     input.requestRunId === input.markerRunId;
+}
+
+/**
+ * The compact Plan-review entry is a projection of the same durable
+ * `plan_review` request used by PlanPanel. It is never inferred from a turn
+ * status alone: the current artifact revision/hash and paused run lease must
+ * all still match.
+ */
+export function isPlanReviewCapsulePresentationEligible(input: {
+  actionKind?: ActionRequestKind | null;
+  requestStatus?: ActionRequestStatus | null;
+  requestSessionKey?: string | null;
+  requestTurnId?: string | null;
+  requestRunId?: string | null;
+  requestPlanRevision?: number | null;
+  requestArtifactHash?: string | null;
+  markerStatus?: string | null;
+  markerSessionKey?: string | null;
+  markerTurnId?: string | null;
+  markerRunId?: string | null;
+  expectedSessionKey?: string | null;
+  expectedTurnId?: string | null;
+  currentPlanRevision?: number | null;
+  currentArtifactHash?: string | null;
+}): boolean {
+  if (input.actionKind !== "plan_review") return false;
+  if (!isPlanActionRequestPresentationEligible(input)) return false;
+  if (
+    !Number.isFinite(Number(input.requestPlanRevision)) ||
+    !Number.isFinite(Number(input.currentPlanRevision)) ||
+    !input.requestArtifactHash ||
+    !input.currentArtifactHash
+  ) {
+    return false;
+  }
+  return Number(input.requestPlanRevision) === Number(input.currentPlanRevision) &&
+    input.requestArtifactHash === input.currentArtifactHash;
+}
+
+export type PlanExecutionCapsuleTone = "active" | "waiting" | "recovery" | "failed" | "success";
+
+export interface PlanExecutionCapsuleProjection {
+  phase: PlanExecutionProgressSnapshot["phase"];
+  tone: PlanExecutionCapsuleTone;
+  headline: string;
+  currentTask: string;
+  currentTool: string;
+  recoveryReason: string;
+  nextStep: string;
+  repeatedTargets: string[];
+  currentTaskId: string | null;
+}
+
+function compactProgressValue(value: unknown, maxLength = 180): string {
+  const normalized = String(value || "").replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(1, maxLength - 1)).trimEnd()}…`;
+}
+
+function normalizeProgressMatchText(value: unknown): string {
+  return String(value || "")
+    .replace(/(?:—|-)?\s*(?:证据|evidence)\s*[:：].*$/i, "")
+    .replace(/[`*_#>\[\](){}]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function isPlaceholderProgressTool(value: string): boolean {
+  return !value || /^(?:暂无工具调用|no tool call yet|none|n\/a)$/i.test(value);
+}
+
+function isReadOnlyPlanningPlaceholder(value: string): boolean {
+  return /^(?:(?:需要|需|先|请|继续|首先|下一步)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解)|^(?:(?:need(?:s)?\s+to|first|please|next)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand)\b/i.test(value);
+}
+
+function isAuthoredExecutablePlanTask(task: PlanTask): boolean {
+  const text = String(task.text || "").trim();
+  const evidence = task.evidence || [];
+  const mutationActionPattern = /(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现|implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+  const mutationAfterReadPattern = /(?:然后|随后|之后|再|并(?:且)?).{0,120}(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现)|(?:then|after(?:wards)?|and then).{0,120}(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+  const hasMutationAction = mutationActionPattern.test(text) &&
+    (!isReadOnlyPlanningPlaceholder(text) || mutationAfterReadPattern.test(text));
+  const hasValidationAction = /(?:验证|测试|验收|构建|编译|lint|类型检查|回归|verify|validate|test|acceptance|build|compile|typecheck|type-check|regression)/i.test(text);
+  const hasMutationTarget = evidence.some((item) =>
+    item.kind === "deliverable" || item.kind === "file"
+  );
+  const hasExecutableValidation = evidence.some((item) =>
+    item.kind === "cmd" ||
+    item.kind === "browser_dom" ||
+    item.kind === "browser_screenshot" ||
+    item.kind === "dev_server_url" ||
+    item.kind === "tauri_required" ||
+    item.kind === "manual_user_validation"
+  ) || (task.commands || []).some((command) => String(command || "").trim().length > 0);
+  return (hasMutationAction && hasMutationTarget) || (hasValidationAction && hasExecutableValidation);
+}
+
+function resolvePlanExecutionCurrentTaskTextMatch(
+  tasks: PlanTask[],
+  snapshot: PlanExecutionProgressSnapshot,
+): PlanTask | null {
+  const currentTask = normalizeProgressMatchText(snapshot.currentTask);
+  if (currentTask.length < 8) return null;
+  return tasks.find((task) => {
+    const taskText = normalizeProgressMatchText(task.text);
+    return taskText.length >= 8 && currentTask === taskText;
+  }) || null;
+}
+
+/**
+ * Match a runtime checkpoint to the authored checklist without selecting the
+ * first incomplete artifact task by default. A task is highlighted only when
+ * the current checkpoint explicitly references its text or evidence target.
+ */
+export function resolvePlanExecutionCurrentTaskId(
+  tasks: PlanTask[],
+  snapshot: PlanExecutionProgressSnapshot | null | undefined,
+): string | null {
+  if (!snapshot || tasks.length === 0) return null;
+  const currentTask = normalizeProgressMatchText(snapshot.currentTask);
+  const currentTool = normalizeProgressMatchText(snapshot.currentTool);
+
+  for (const task of tasks) {
+    const taskText = normalizeProgressMatchText(task.text);
+    if (
+      taskText.length >= 8 &&
+      currentTask.length >= 8 &&
+      (currentTask.includes(taskText) || taskText.includes(currentTask))
+    ) {
+      return task.id;
+    }
+  }
+
+  if (currentTool) {
+    for (const task of tasks) {
+      if ((task.evidence || []).some((item) => {
+        const value = normalizeProgressMatchText(item.value);
+        return value.length >= 3 && currentTool.includes(value);
+      })) {
+        return task.id;
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * Runtime progress owns the live Capsule headline. Artifact tasks remain a
+ * stable checklist and are never promoted to the headline merely because they
+ * are the first item without evidence.
+ */
+export function buildPlanExecutionCapsuleProjection(input: {
+  snapshot: PlanExecutionProgressSnapshot | null | undefined;
+  tasks?: PlanTask[];
+  language?: "zh" | "en";
+}): PlanExecutionCapsuleProjection | null {
+  const snapshot = input.snapshot;
+  if (!snapshot) return null;
+  const language = input.language === "en" ? "en" : "zh";
+  const rawCurrentTask = compactProgressValue(snapshot.currentTask);
+  const rawCurrentTool = compactProgressValue(snapshot.currentTool);
+  const currentTool = isPlaceholderProgressTool(rawCurrentTool) ? "" : rawCurrentTool;
+  const textMatchedAuthoredTask = resolvePlanExecutionCurrentTaskTextMatch(
+    input.tasks || [],
+    snapshot,
+  );
+  const suppressReadOnlyPlaceholder =
+    isReadOnlyPlanningPlaceholder(rawCurrentTask) &&
+    (!textMatchedAuthoredTask || !isAuthoredExecutablePlanTask(textMatchedAuthoredTask));
+  const currentTask = suppressReadOnlyPlaceholder ? "" : rawCurrentTask;
+  const recoveryReason = compactProgressValue(snapshot.recoveryReason, 160);
+  const nextStep = compactProgressValue(snapshot.nextStep);
+  const repeatedTargets = (snapshot.repeatedTargets || [])
+    .map((target) => compactProgressValue(target, 100))
+    .filter(Boolean)
+    .slice(0, 4);
+  const primary = currentTool || currentTask;
+
+  let tone: PlanExecutionCapsuleTone = "active";
+  let headline: string;
+  switch (snapshot.phase) {
+    case "tool_error":
+      tone = "failed";
+      headline = language === "zh"
+        ? `工具执行失败${primary ? `：${primary}` : ""}`
+        : `Tool execution failed${primary ? `: ${primary}` : ""}`;
+      break;
+    case "paused":
+      tone = recoveryReason ? "recovery" : "waiting";
+      headline = language === "zh"
+        ? `计划执行已暂停${recoveryReason ? `：${recoveryReason}` : primary ? `：${primary}` : ""}`
+        : `Plan execution paused${recoveryReason ? `: ${recoveryReason}` : primary ? `: ${primary}` : ""}`;
+      break;
+    case "waiting_review":
+      tone = "waiting";
+      headline = language === "zh"
+        ? `等待工具批准${primary ? `：${primary}` : ""}`
+        : `Waiting for tool approval${primary ? `: ${primary}` : ""}`;
+      break;
+    case "auto_resume":
+    case "checkpoint":
+    case "context_compression":
+      tone = "recovery";
+      headline = language === "zh"
+        ? `正在恢复计划执行${recoveryReason ? `：${recoveryReason}` : primary ? `：${primary}` : ""}`
+        : `Recovering plan execution${recoveryReason ? `: ${recoveryReason}` : primary ? `: ${primary}` : ""}`;
+      break;
+    case "completed":
+      tone = "success";
+      headline = language === "zh" ? "计划执行已完成" : "Plan execution completed";
+      break;
+    case "tool_start":
+      headline = language === "zh"
+        ? `正在执行${primary ? `：${primary}` : "工具"}`
+        : `Running${primary ? `: ${primary}` : " tool"}`;
+      break;
+    case "tool_done":
+      headline = language === "zh"
+        ? `工具结果已记录${primary ? `：${primary}` : ""}`
+        : `Tool result recorded${primary ? `: ${primary}` : ""}`;
+      break;
+    case "starting":
+      headline = language === "zh" ? "正在启动计划执行" : "Starting plan execution";
+      break;
+    default:
+      if (recoveryReason) tone = "recovery";
+      headline = recoveryReason
+        ? language === "zh" ? `正在恢复：${recoveryReason}` : `Recovering: ${recoveryReason}`
+        : language === "zh"
+        ? `正在推进${primary ? `：${primary}` : "计划任务"}`
+        : `Working${primary ? `: ${primary}` : " through the plan"}`;
+      break;
+  }
+
+  return {
+    phase: snapshot.phase,
+    tone,
+    headline: compactProgressValue(headline, 220),
+    currentTask,
+    currentTool,
+    recoveryReason,
+    nextStep,
+    repeatedTargets,
+    currentTaskId: suppressReadOnlyPlaceholder
+      ? null
+      : resolvePlanExecutionCurrentTaskId(input.tasks || [], snapshot),
+  };
 }
 
 const GENERIC_TURN_TITLES = new Set([

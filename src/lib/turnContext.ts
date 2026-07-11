@@ -1,3 +1,4 @@
+import { isContextMemoryText } from "./contextMemory";
 import { extractPrimaryUserRequestText } from "./turnIntake";
 
 export interface TurnContextMessageLike {
@@ -33,8 +34,8 @@ export function extractTurnContextTextContent(content: unknown): string {
 export function isSyntheticRecoveryUserText(text: string): boolean {
   const value = String(text || "").trim();
   if (!value) return true;
-  if (/\[turn_intake\]|\[user_request\]/i.test(value)) return false;
   return (
+    isContextMemoryText(value) ||
     /^\[(?:System|FORCED WRITE|PLAN_[A-Z_]+|EXECUTE_[A-Z_]+|TOOL_[A-Z_]+|APPROVED_PLAN_[A-Z_]+)\b/i.test(value) ||
     /^(?:PLAN_[A-Z_]+|EXECUTE_[A-Z_]+|TOOL_[A-Z_]+|APPROVED_PLAN_[A-Z_]+)\s*:/i.test(value) ||
     /^(?:计划已批准(?:[，。]|$)|The plan is approved(?:[,.]|$))/i.test(value) ||
@@ -50,12 +51,21 @@ export function isSyntheticRecoveryUserText(text: string): boolean {
 export function canonicalizeVisibleUserText(text: string): string {
   const raw = String(text || "").trim();
   if (!raw) return "";
-  const approvalChoice = raw.match(
+  // ContextState is a user-role transport packet. It can quote system
+  // constraints containing the literal token `turn_intake`, so classify the
+  // packet before looking for a nested intake block.
+  if (isContextMemoryText(raw)) return "";
+  const primary = (extractPrimaryUserRequestText(raw) || raw).trim();
+  const approvalChoice = primary.match(
     /^(?:用户批准并选择：|The user approved and selected:\s*)([^\r\n]+)\r?\n(?:计划已批准|The plan is approved)/i,
   );
   if (approvalChoice?.[1]?.trim()) return approvalChoice[1].trim();
-  if (isSyntheticRecoveryUserText(raw)) return "";
-  return (extractPrimaryUserRequestText(raw) || raw).trim();
+  // Submitted messages wrap their source in turn_intake. Classify the
+  // extracted source so hidden approval/recovery prompts cannot become a
+  // canonical user request merely because they were submitted through the
+  // ordinary message pipeline.
+  if (isSyntheticRecoveryUserText(primary)) return "";
+  return primary;
 }
 
 function clampTurnStartIndex(value: number | null | undefined, length: number): number | null {
@@ -165,4 +175,42 @@ export function findCanonicalTurnStartMessageIndex(input: {
   return targetIndex < 0 && earliestMatch >= 0
     ? earliestMatch
     : input.fallbackStartIndex;
+}
+
+export function compactPlanReviewTurnMessages(input: {
+  messages: TurnContextMessageLike[];
+  turnStartMessageIndex: number;
+  turnBlocks: TurnContextBlockLike[];
+  reviewedPlanContent: string;
+}): Array<{ role?: string; content?: unknown }> {
+  const reviewedPlanContent = String(input.reviewedPlanContent || "").trim();
+  if (!reviewedPlanContent) return input.messages;
+  if (!Array.isArray(input.messages) || input.messages.length === 0) return input.messages;
+  if (
+    input.turnStartMessageIndex < 0 ||
+    input.turnStartMessageIndex >= input.messages.length
+  ) {
+    return input.messages;
+  }
+
+  const canonical = buildCanonicalCompletedTurnMessages({
+    turnBlocks: input.turnBlocks,
+    fallbackAssistantText: reviewedPlanContent,
+  });
+  const canonicalUsers = canonical.filter((message) => message.role === "user");
+  if (canonicalUsers.length === 0) return input.messages;
+  const effectiveTurnStartIndex = findCanonicalTurnStartMessageIndex({
+    messages: input.messages,
+    canonicalUserTexts: canonicalUsers.map((message) => message.content),
+    fallbackStartIndex: input.turnStartMessageIndex,
+  });
+
+  return [
+    ...input.messages.slice(0, effectiveTurnStartIndex),
+    ...canonicalUsers,
+    // The reviewed artifact is the assistant handoff for the fresh child run.
+    // Exploration prompts, hidden reasoning, and raw tool results remain owned
+    // by the paused parent run rather than leaking into canonical history.
+    { role: "assistant", content: reviewedPlanContent },
+  ];
 }

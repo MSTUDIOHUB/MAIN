@@ -129,6 +129,7 @@ export default function GoalPanel({
   const presentationBehavior = resolveGoalPresentationBehavior({
     lifecycle: resolvedLifecycle,
     status: presentation?.status || status,
+    actionKind: presentation?.actionKind,
   });
   const toneClass = presentationToneClass(presentationBehavior.tone);
 
