@@ -510,9 +510,9 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
         type: "object",
         properties: {
           url: { type: "string", description: "要打开的本地 URL，例如 http://localhost:5173 或工作区内 file:// 页面" },
-          actions: { type: "string", description: "可选，逐行 Playwright 动作 DSL：click: selector；fill: selector => text；press: selector => Enter；select_file: selector => relative/file.csv；wait_for_selector: selector；wait_for_text: text" },
+          actions: { type: "string", description: "可选，逐行 Playwright 动作 DSL：click: selector；fill: selector => text；press: selector => Enter；select_file: selector => relative/file.csv；wait_for_selector: selector；wait_for_text: text（只检查 document.body 正文，不检查页面 title）" },
           checks: { type: "string", description: "可选，逐行断言 DSL：text: 文本；not_text: 文本；selector: CSS；not_selector: CSS；title: 文本；console: 文本；not_console: 文本；no_console_errors" },
-          wait_for_text: { type: "string", description: "可选，打开页面后等待正文中出现的文本" },
+          wait_for_text: { type: "string", description: "可选，打开页面后等待 document.body 正文中出现的文本；不能用页面标题，标题请使用 checks: title: 文本" },
           wait_for_selector: { type: "string", description: "可选，打开页面后等待出现的 CSS selector" },
           screenshot: { type: "boolean", description: "可选，是否保存全页截图到 .MAIN/browser-validation/ 作为验证证据" },
           fail_on_console_error: { type: "boolean", description: "可选，console error/pageerror 是否让验证失败，默认 true" },

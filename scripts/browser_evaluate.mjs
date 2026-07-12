@@ -112,6 +112,37 @@ async function bodyText(page) {
   }
 }
 
+async function capturePageDiagnostics(page, result) {
+  result.finalUrl = page.url();
+  try {
+    result.title = await page.title();
+  } catch {
+    // A navigation failure is reported by the main validation path below.
+  }
+  try {
+    result.textPreview = (await bodyText(page)).slice(0, MAX_PREVIEW_CHARS);
+  } catch {
+    // Keep the navigation result even when body extraction itself fails.
+  }
+}
+
+function describeWaitForTextFailure(error, expectedText, title) {
+  const message = error?.message || String(error);
+  const expected = String(expectedText || "").trim();
+  const pageTitle = String(title || "").trim();
+  if (
+    expected &&
+    pageTitle.includes(expected) &&
+    /timeout/i.test(message)
+  ) {
+    return [
+      message,
+      `wait_for_text only searches document.body text; "${expected}" matches the current page title "${pageTitle}" instead. Use a title check (title: ${expected}) or wait_for_selector for a DOM element.`,
+    ].join("\n");
+  }
+  return message;
+}
+
 function pushBounded(list, item, max) {
   list.push(item);
   if (list.length > max) list.splice(0, list.length - max);
@@ -141,11 +172,15 @@ async function runActions(page, input, result, timeoutMs, workspace) {
     } else if (kind === "wait_for_selector" || kind === "wait_selector") {
       await page.locator(value).first().waitFor({ state: "visible", timeout: timeoutMs });
     } else if (kind === "wait_for_text" || kind === "wait_text") {
-      await page.waitForFunction(
-        (needle) => document.body?.innerText?.includes(needle),
-        value,
-        { timeout: timeoutMs },
-      );
+      try {
+        await page.waitForFunction(
+          (needle) => document.body?.innerText?.includes(needle),
+          value,
+          { timeout: timeoutMs },
+        );
+      } catch (error) {
+        throw new Error(describeWaitForTextFailure(error, value, result.title));
+      }
     } else if (kind === "wait") {
       await page.waitForTimeout(clampNumber(value, 500, 0, Math.min(timeoutMs, 10_000)));
     } else {
@@ -257,7 +292,7 @@ async function main() {
 
     const response = await page.goto(normalizedUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     result.status = response?.status() ?? null;
-    result.finalUrl = page.url();
+    await capturePageDiagnostics(page, result);
 
     try {
       await page.waitForLoadState("networkidle", { timeout: Math.min(timeoutMs, 3000) });
@@ -273,17 +308,21 @@ async function main() {
     }
     if (input.waitForText || input.wait_for_text) {
       const expectedText = String(input.waitForText || input.wait_for_text);
-      await page.waitForFunction(
-        (needle) => document.body?.innerText?.includes(needle),
-        expectedText,
-        { timeout: timeoutMs },
-      );
+      try {
+        await page.waitForFunction(
+          (needle) => document.body?.innerText?.includes(needle),
+          expectedText,
+          { timeout: timeoutMs },
+        );
+      } catch (error) {
+        throw new Error(describeWaitForTextFailure(error, expectedText, result.title));
+      }
     }
 
     await runActions(page, input, result, timeoutMs, workspace);
     await runChecks(page, input, result);
 
-    result.title = await page.title();
+    await capturePageDiagnostics(page, result);
 
     if (input.screenshot === true || input.screenshot === "true") {
       const screenshotDir = path.resolve(workspace, ".MAIN", "browser-validation");

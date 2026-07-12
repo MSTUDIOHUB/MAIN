@@ -1645,7 +1645,7 @@ test("approved plan source edit first surface blocks validation before first wri
   assert.match(toolCallPlanningSource, /readFileExposed:\s*scopedToolNameSet\.has\("read_file"\)/);
 });
 
-test("approved plan browser validation repeats are reused or paused without agent error", () => {
+test("browser validation repeats are reused or paused without agent error", () => {
   const orchestratorSource = (
     fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") +
     "\n" +
@@ -1657,8 +1657,8 @@ test("approved plan browser validation repeats are reused or paused without agen
   );
   const toolCallPartitioningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"), "utf8");
 
-  assert.match(orchestratorSource, /approvedPlanBrowserValidationCache/);
-  assert.match(toolCallPartitioningSource, /approved_plan_browser_validation_reused/);
+  assert.match(orchestratorSource, /browserValidationCache/);
+  assert.match(toolCallPartitioningSource, /browser_validation_reused_without_state_change/);
   assert.match(orchestratorSource, /approved_plan_repeated_browser_validation/);
   assert.doesNotMatch(
     toolCallPartitioningSource,

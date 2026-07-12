@@ -9,7 +9,7 @@ import type {
 
 export interface AgentLoopToolExecutionRuntimeState {
   readOnlyResultCache: Map<string, CachedReadOnlyToolResult>;
-  approvedPlanBrowserValidationCache: Map<string, ToolExecutionResult>;
+  browserValidationCache: Map<string, ToolExecutionResult>;
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
 }
@@ -19,7 +19,7 @@ export function createAgentLoopToolExecutionRuntimeState(
 ): AgentLoopToolExecutionRuntimeState {
   return {
     readOnlyResultCache: new Map(),
-    approvedPlanBrowserValidationCache: new Map(),
+    browserValidationCache: new Map(),
     readOnlyDuplicateSkipCounts: new Map(),
     fileReadStates: getSessionFileReadStates(sessionKey),
   };

@@ -62,7 +62,7 @@ test("tool execution runtime state initializes per-loop caches", () => {
   const state = createAgentLoopToolExecutionRuntimeState("tool-runtime-state-test-a");
 
   assert.equal(state.readOnlyResultCache.size, 0);
-  assert.equal(state.approvedPlanBrowserValidationCache.size, 0);
+  assert.equal(state.browserValidationCache.size, 0);
   assert.equal(state.readOnlyDuplicateSkipCounts.size, 0);
   assert.equal(state.fileReadStates.size, 0);
 });
@@ -74,7 +74,7 @@ test("tool execution runtime state keeps file-read states session scoped", () =>
   const other = createAgentLoopToolExecutionRuntimeState(`${sessionKey}-other`);
 
   assert.notEqual(first.readOnlyResultCache, second.readOnlyResultCache);
-  assert.notEqual(first.approvedPlanBrowserValidationCache, second.approvedPlanBrowserValidationCache);
+  assert.notEqual(first.browserValidationCache, second.browserValidationCache);
   assert.notEqual(first.readOnlyDuplicateSkipCounts, second.readOnlyDuplicateSkipCounts);
   assert.equal(first.fileReadStates, second.fileReadStates);
   assert.notEqual(first.fileReadStates, other.fileReadStates);

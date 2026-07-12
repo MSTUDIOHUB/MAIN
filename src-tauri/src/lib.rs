@@ -47,6 +47,11 @@ const PTY_BUFFER_LIMIT_BYTES: usize = 512 * 1024;
 const GREP_MATCH_LIMIT: usize = 2000;
 const GREP_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 const COMMAND_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
+// The Playwright script enforces the user-facing validation budget itself.
+// Keep the native supervisor alive briefly after that budget so the script can
+// serialize its structured failure and close Chromium instead of being killed
+// at the same instant as the inner timeout.
+const BROWSER_EVALUATE_CLEANUP_GRACE_MS: u64 = 5_000;
 #[cfg(not(target_os = "windows"))]
 const LOGIN_SHELL_ENV_TIMEOUT_MS: u64 = 4_000;
 #[cfg(not(target_os = "windows"))]
@@ -4908,7 +4913,9 @@ fn browser_evaluate(
             .to_string()
     })?;
 
-    let timeout = Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(1_000, 180_000));
+    let validation_timeout =
+        Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(1_000, 180_000));
+    let supervisor_timeout = browser_evaluate_supervisor_timeout(validation_timeout);
     let payload = json!({
         "url": url,
         "actions": actions.unwrap_or_default(),
@@ -4917,7 +4924,7 @@ fn browser_evaluate(
         "waitForSelector": wait_for_selector,
         "screenshot": screenshot.unwrap_or(false),
         "failOnConsoleError": fail_on_console_error.unwrap_or(true),
-        "timeoutMs": timeout.as_millis() as u64,
+        "timeoutMs": validation_timeout.as_millis() as u64,
     });
 
     let mut command = ProcessCommand::new(&node_path);
@@ -4957,7 +4964,7 @@ fn browser_evaluate(
         match child.try_wait() {
             Ok(Some(status)) => break status,
             Ok(None) => {
-                if started_at.elapsed() >= timeout {
+                if started_at.elapsed() >= supervisor_timeout {
                     timed_out = true;
                     break terminate_timed_out_child(&mut child)?;
                 }
@@ -4974,8 +4981,10 @@ fn browser_evaluate(
 
     if timed_out {
         return Err(format!(
-            "browser_evaluate timed out after {}ms{}",
-            timeout.as_millis(),
+            "browser_evaluate timed out after {}ms (validation budget {}ms + cleanup grace {}ms){}",
+            supervisor_timeout.as_millis(),
+            validation_timeout.as_millis(),
+            BROWSER_EVALUATE_CLEANUP_GRACE_MS,
             if stderr_text.is_empty() {
                 String::new()
             } else {
@@ -5006,6 +5015,10 @@ fn browser_evaluate(
 
     serde_json::from_str::<Value>(stdout_text)
         .map_err(|e| format!("browser_evaluate returned invalid JSON: {e}; stdout: {stdout_text}"))
+}
+
+fn browser_evaluate_supervisor_timeout(validation_timeout: Duration) -> Duration {
+    validation_timeout.saturating_add(Duration::from_millis(BROWSER_EVALUATE_CLEANUP_GRACE_MS))
 }
 
 #[tauri::command]
@@ -10406,10 +10419,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        compare_file_nodes, delete_plan_files_in_dir, is_supported_attachment_path,
-        is_valid_git_branch_name, looks_long_running_shell_command, merge_json_rows_by_id,
-        parse_git_branch_line, parse_git_numstat, parse_git_porcelain_entries,
-        parse_git_porcelain_status, read_session_transcript_with_fallback, resolve_existing_path,
+        browser_evaluate_supervisor_timeout, compare_file_nodes, delete_plan_files_in_dir,
+        is_supported_attachment_path, is_valid_git_branch_name, looks_long_running_shell_command,
+        merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
+        parse_git_porcelain_entries, parse_git_porcelain_status,
+        read_session_transcript_with_fallback, resolve_existing_path,
         resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
         should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
         write_json_atomic, write_jsonl_atomic, FileNode, SessionTranscript,
@@ -10417,7 +10431,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn make_temp_workspace(name: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -10490,6 +10504,18 @@ mod tests {
         assert!(!looks_long_running_shell_command("vite build"));
         assert!(!looks_long_running_shell_command("next build"));
         assert!(!looks_long_running_shell_command("storybook build"));
+    }
+
+    #[test]
+    fn browser_evaluate_supervisor_timeout_leaves_cleanup_grace() {
+        assert_eq!(
+            browser_evaluate_supervisor_timeout(Duration::from_millis(10_000)),
+            Duration::from_millis(15_000),
+        );
+        assert_eq!(
+            browser_evaluate_supervisor_timeout(Duration::from_millis(180_000)),
+            Duration::from_millis(185_000),
+        );
     }
 
     #[test]

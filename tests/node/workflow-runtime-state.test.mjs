@@ -487,7 +487,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.doesNotMatch(source, /const targetProgressGuardRecoveredSignatures = new Set/);
   assert.doesNotMatch(source, /const failedToolCallCounts = new Map/);
   assert.doesNotMatch(source, /const readOnlyResultCache = new Map/);
-  assert.doesNotMatch(source, /const approvedPlanBrowserValidationCache = new Map/);
+  assert.doesNotMatch(source, /const browserValidationCache = new Map/);
   assert.doesNotMatch(source, /const readOnlyDuplicateSkipCounts = new Map/);
   assert.doesNotMatch(source, /const fileReadStates = getSessionFileReadStates/);
   assert.doesNotMatch(source, /let recentSuccessfulProjectWrite/);
@@ -583,14 +583,14 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolCallPartitioningSource, /shouldBlockToolCallForTargeting/);
   assert.match(toolCallPartitioningSource, /buildReadOnlyCacheSignature/);
   assert.match(toolCallPartitioningSource, /logAgentEvent\("file_read_cache_hit"/);
-  assert.match(toolCallPartitioningSource, /logAgentEvent\("approved_plan_browser_validation_reused"/);
+  assert.match(toolCallPartitioningSource, /logAgentEvent\("browser_validation_reused_without_state_change"/);
   assert.match(toolCallPartitioningSource, /emitToolPreflightBlocked/);
   assert.match(toolExecutionRoundSource, /export async function executeToolExecutionRound/);
   assert.match(toolExecutionRoundSource, /executeReadOnlyToolsConcurrently/);
   assert.match(toolExecutionRoundSource, /executeLocalFileReadToolWithReview/);
   assert.match(toolExecutionRoundSource, /executeWriteToolWithReview/);
   assert.match(toolExecutionRoundSource, /logAgentEvent\("file_read_cache_stored"/);
-  assert.match(toolExecutionRoundSource, /approvedPlanBrowserValidationCache\.set/);
+  assert.match(toolExecutionRoundSource, /browserValidationCache\.set/);
   assert.match(toolResultHistorySource, /export function appendToolResultsToHistory/);
   assert.match(toolResultHistorySource, /iterationContext: Pick<TurnIterationContext, "eventThreadId" \| "eventTurnId" \| "turnContext">;/);
   assert.match(toolResultHistorySource, /const \{ eventThreadId, eventTurnId, turnContext \} = iterationContext;/);

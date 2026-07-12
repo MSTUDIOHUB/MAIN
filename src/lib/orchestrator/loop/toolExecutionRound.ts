@@ -69,7 +69,7 @@ export async function executeToolExecutionRound(input: {
   readOnlyResultCache: Map<string, CachedReadOnlyToolResult>;
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
-  approvedPlanBrowserValidationCache: Map<string, ToolExecutionResult>;
+  browserValidationCache: Map<string, ToolExecutionResult>;
 }): Promise<ToolExecutionRoundResult> {
   const {
     readOnlyCalls,
@@ -90,7 +90,7 @@ export async function executeToolExecutionRound(input: {
     readOnlyResultCache,
     readOnlyDuplicateSkipCounts,
     fileReadStates,
-    approvedPlanBrowserValidationCache,
+    browserValidationCache,
   } = input;
 
   const allResults: ToolExecutionResult[] = [];
@@ -222,10 +222,18 @@ export async function executeToolExecutionRound(input: {
       },
     );
     allResults.push(result);
-    if (tc.name === "browser_evaluate" && !result.isError) {
+    if (tc.name !== "browser_evaluate" && browserValidationCache.size > 0) {
+      browserValidationCache.clear();
+      logAgentEvent("browser_validation_cache_invalidated", {
+        iteration,
+        tool: tc.name,
+        reason: "non_browser_tool_executed",
+      });
+    }
+    if (tc.name === "browser_evaluate") {
       const toolArgs = parseToolCallArguments(tc, workspace);
       const signature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
-      approvedPlanBrowserValidationCache.set(signature, result);
+      browserValidationCache.set(signature, result);
     }
 
     if (abortSignal.aborted) {

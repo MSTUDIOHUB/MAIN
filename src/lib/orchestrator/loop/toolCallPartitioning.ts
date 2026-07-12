@@ -14,6 +14,7 @@ import {
   countSuccessfulPlanReadEvidence,
   hasSuccessfulTabularActivity,
 } from "../../orchestrator/planOrchestration";
+import { browserResultLooksSuccessful } from "../../planEvidence";
 import {
   appendPlanRepeatReadLimitGuidance,
   buildGenericObservationContinuationPrompt,
@@ -105,7 +106,7 @@ export async function partitionToolCallsForExecution(input: {
   readOnlyResultCache: Map<string, CachedReadOnlyToolResult>;
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
-  approvedPlanBrowserValidationCache: Map<string, ToolExecutionResult>;
+  browserValidationCache: Map<string, ToolExecutionResult>;
   iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId">;
   emitTurnEvent: (event: MainThreadEventInput) => void;
 }): Promise<ToolCallPartitioningResult> {
@@ -133,7 +134,7 @@ export async function partitionToolCallsForExecution(input: {
     readOnlyResultCache,
     readOnlyDuplicateSkipCounts,
     fileReadStates,
-    approvedPlanBrowserValidationCache,
+    browserValidationCache,
     iterationContext,
     emitTurnEvent,
   } = input;
@@ -941,32 +942,33 @@ export async function partitionToolCallsForExecution(input: {
       });
     } else {
       const reviewSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
-      const cachedBrowserValidation =
-        workflowMode === "plan" &&
-        callbacks.getIsPlanApproved() &&
-        runtimeIntent === "execute" &&
-        tc.name === "browser_evaluate"
-          ? approvedPlanBrowserValidationCache.get(reviewSignature)
-          : undefined;
+      const cachedBrowserValidation = tc.name === "browser_evaluate"
+        ? browserValidationCache.get(reviewSignature)
+        : undefined;
       if (cachedBrowserValidation) {
-        logAgentEvent("approved_plan_browser_validation_reused", {
+        const cachedContent = cachedBrowserValidation.content || cachedBrowserValidation.displayContent || "";
+        const cachedBrowserFailed = cachedBrowserValidation.isError || !browserResultLooksSuccessful(cachedContent);
+        logAgentEvent("browser_validation_reused_without_state_change", {
           iteration,
           target,
           signature: truncateForLog(reviewSignature, 180),
+          previousResult: cachedBrowserFailed ? "failed" : "succeeded",
         });
         preExecutionResults.push({
           toolCallId: tc.id,
           name: tc.name,
           target,
           content: [
-            `REUSED_BROWSER_VALIDATION: identical browser_evaluate for ${target || "the same target"} already succeeded in this execution turn.`,
-            "Reuse the previous browser/DOM result and continue with the next unverified task or final summary.",
+            `REUSED_BROWSER_VALIDATION: identical browser_evaluate for ${target || "the same target"} already ran without a subsequent command or source mutation.`,
+            cachedBrowserFailed
+              ? "The previous validation failed. Do not rerun it unchanged; use the captured diagnostic to repair the page or change the validation target/arguments."
+              : "Reuse the previous browser/DOM result and continue with the next unverified task or final summary.",
             "",
-            truncateToolContent(cachedBrowserValidation.content || cachedBrowserValidation.displayContent || "", 4000),
+            truncateToolContent(cachedContent, 4000),
           ].filter(Boolean).join("\n"),
-          displayContent: `REUSED_BROWSER_VALIDATION: ${target || cachedBrowserValidation.target || "browser_evaluate"}`,
-          isError: false,
-          lifecycleState: "completed",
+          displayContent: `${cachedBrowserFailed ? "REUSED_BROWSER_VALIDATION_FAILED" : "REUSED_BROWSER_VALIDATION"}: ${target || cachedBrowserValidation.target || "browser_evaluate"}`,
+          isError: cachedBrowserFailed,
+          lifecycleState: cachedBrowserFailed ? "failed" : "completed",
         });
         continue;
       }
