@@ -22,6 +22,7 @@ new Function("exports", "module", "require", transpiled)(
 const {
   buildPlanExecutionCapsuleProjection,
   buildTurnPresentationModel,
+  canOfferPlanContinuation,
   isPlanActionRequestPresentationEligible,
   isPlanReviewCapsulePresentationEligible,
   resolveGoalPresentationBehavior,
@@ -159,6 +160,25 @@ test("Plan behavior requires both the lifecycle action kind and business approva
   });
   assert.equal(resumeExecution.showContinuePlanning, false);
   assert.equal(resumeExecution.showResumeExecution, true);
+});
+
+test("a rejected visible candidate cannot render formal Plan continuation controls", () => {
+  const base = {
+    hasActivePlanContext: true,
+    isPlanApproved: false,
+    isAwaitingInput: false,
+    canApproveExecution: false,
+    agentStatus: "idle",
+  };
+
+  assert.equal(canOfferPlanContinuation({
+    ...base,
+    materializedArtifactCount: 0,
+  }), false);
+  assert.equal(canOfferPlanContinuation({
+    ...base,
+    materializedArtifactCount: 1,
+  }), true);
 });
 
 test("Plan requests are presentable only for the exact paused owner run", () => {

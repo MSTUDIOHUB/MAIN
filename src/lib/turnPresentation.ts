@@ -109,6 +109,23 @@ export interface PlanPresentationBehavior {
   showResumeExecution: boolean;
 }
 
+export function canOfferPlanContinuation(input: {
+  hasActivePlanContext: boolean;
+  isPlanApproved: boolean;
+  isAwaitingInput: boolean;
+  canApproveExecution: boolean;
+  materializedArtifactCount: number;
+  agentStatus: string;
+}): boolean {
+  return input.hasActivePlanContext &&
+    !input.isPlanApproved &&
+    !input.isAwaitingInput &&
+    !input.canApproveExecution &&
+    input.materializedArtifactCount > 0 &&
+    input.agentStatus !== "running" &&
+    input.agentStatus !== "pending_review";
+}
+
 /**
  * Projects the shared turn lifecycle into Plan-specific UI behavior. Business
  * readiness stays an additional gate: a plan_review request alone cannot make

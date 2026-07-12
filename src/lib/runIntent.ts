@@ -748,14 +748,21 @@ export function buildEffectiveTurnContract(input: {
     mutationExpected ||
     directiveKind === "unity" ||
     directiveKind === "mcp";
+  const isUnapprovedPlanDraft =
+    conversationIntent === "plan" &&
+    runtimeIntent === "plan" &&
+    input.planApproved !== true;
   const needsApproval =
+    !isUnapprovedPlanDraft &&
     input.executionConsentGranted !== true &&
     (input.commandDirective?.requiresApproval === true || mutationExpected || operationDirective) &&
     !(conversationIntent === "plan" && input.planApproved === true) &&
     directiveKind !== "plan_approval" &&
     directiveKind !== "plan_resume";
   const operationApprovalState: OperationApprovalState =
-    input.executionConsentGranted === true || (mutationExpected && input.planApproved === true)
+    isUnapprovedPlanDraft
+      ? "not_required"
+      : input.executionConsentGranted === true || (mutationExpected && input.planApproved === true)
       ? "approved"
       : needsApproval
       ? "needs_approval"

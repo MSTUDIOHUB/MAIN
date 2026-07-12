@@ -67,6 +67,7 @@ const allPlanTools = [
   "get_project_skeleton",
   "grep_search",
   "read_file",
+  "spawn_subagent",
   "write_file",
   "replace_in_file",
   "run_command",
@@ -78,21 +79,21 @@ test("plan runtime phases scope the tool surface", () => {
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "explore_structure",
-  }), ["get_project_skeleton", "read_file"]);
+  }), ["get_project_skeleton", "read_file", "spawn_subagent"]);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "grounding",
-  }), ["get_project_skeleton", "grep_search", "read_file"]);
+  }), ["get_project_skeleton", "grep_search", "read_file", "spawn_subagent"]);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "needs_evidence",
-  }), ["read_file"]);
+  }), ["read_file", "spawn_subagent"]);
 
   assert.deepEqual(filterPlanToolNamesForRuntimePhase({
     toolNames: allPlanTools,

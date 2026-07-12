@@ -684,6 +684,7 @@ function isPlanArtifactPath(path: string): boolean {
 }
 
 const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
+  "spawn_subagent",
   "get_project_skeleton",
   "list_directory",
   "glob_search",

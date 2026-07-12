@@ -221,6 +221,7 @@ const PLAN_ARTIFACT_MUTATION_TOOLS = new Set(["write_file", "replace_in_file", "
 export const PLAN_REPEAT_READ_LIMIT = 3;
 export const EXECUTION_REPEAT_READ_LIMIT = 8;
 export const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
+  "spawn_subagent",
   "get_project_skeleton",
   "list_directory",
   "glob_search",
@@ -358,8 +359,8 @@ export function planUnsupportedToolFeedbackMessage(input: {
     }
     if (phase === "drafting" || phase === "synthesis" || phase === "needs_rewrite" || phase === "review_ready" || phase === "blocked") {
       return input.language === "zh"
-        ? `PLAN_DRAFTING_TOOL_BLOCKED: 当前处于 ${phase} 阶段，只允许创建或更新 .MAIN/plans/plan.md。不要继续调用 ${input.toolName}；请基于已有证据用 write_file 或 replace_in_file 写入可审批计划文件。`
-        : `PLAN_DRAFTING_TOOL_BLOCKED: The current phase is ${phase}, so only creating or updating .MAIN/plans/plan.md is allowed. Do not call ${input.toolName}; use write_file or replace_in_file to write the reviewable plan from existing evidence.`;
+        ? `PLAN_DRAFTING_TOOL_BLOCKED: 当前处于 ${phase} 阶段，工具面已关闭。不要继续调用 ${input.toolName}；请基于冻结的证据包直接输出可审阅 Markdown，MAIN runtime 会负责校验并原子物化 .MAIN/plans/plan.md。`
+        : `PLAN_DRAFTING_TOOL_BLOCKED: The ${phase} phase has a closed tool surface. Do not call ${input.toolName}; return reviewable Markdown from the frozen evidence bundle and MAIN runtime will validate and atomically materialize .MAIN/plans/plan.md.`;
     }
     if ((phase === "grounding" || phase === "needs_evidence" || phase === "explore_structure") && !readOnly) {
       return input.language === "zh"

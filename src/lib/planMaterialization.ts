@@ -21,6 +21,7 @@ import {
 export type MaterializablePlanKind = "plan" | "design";
 export type PlanMaterializationSource =
   | "visible_plan"
+  | "deterministically_compacted_visible_plan"
   | "canonicalized_visible_plan"
   | "evidence_section_repaired_visible_plan"
   | "deterministic_evidence";
@@ -1798,6 +1799,17 @@ function normalizeDesignContent(rawText: string, language: "zh" | "en"): string 
   return `${language === "zh" ? "# 设计方案" : "# Design"}\n\n${sanitized}`;
 }
 
+function compactImplementationCodeBlocks(content: string): string {
+  // The surrounding change bullets are the plan contract. Embedded
+  // implementations are redundant and can accidentally become ungrounded
+  // candidate changes, so remove the fenced bodies instead of asking for a
+  // second lossy rewrite.
+  return content
+    .replace(/```[^\n]*\n[\s\S]*?```/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
 function rejectPlanMaterialization(input: {
   reason: string;
   replyOptions?: string[];
@@ -1888,6 +1900,15 @@ export function materializePlanArtifactFromVisibleText(input: {
   const decisionFork = analyzePlanDecisionFork(content);
 
   let validation = validateActionablePlanArtifact(content);
+  if (!validation.ok && validation.reason === "excessive_plan_code_dump") {
+    const compacted = compactImplementationCodeBlocks(content);
+    const compactedValidation = validateActionablePlanArtifact(compacted);
+    if (compactedValidation.ok) {
+      content = compacted;
+      validation = compactedValidation;
+      source = "deterministically_compacted_visible_plan";
+    }
+  }
   if (!validation.ok && validation.canAutoRepair) {
     const repaired = repairActionablePlanArtifactContent({
       content,

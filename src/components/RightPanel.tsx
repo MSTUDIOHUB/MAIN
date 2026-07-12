@@ -27,6 +27,7 @@ import { projectSubagentRuns, resolveSubagentCapacityPolicy } from "../lib/subag
 import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import {
   buildTurnPresentationModel,
+  canOfferPlanContinuation,
   isPlanActionRequestPresentationEligible,
   resolvePlanPresentationBehavior,
 } from "../lib/turnPresentation";
@@ -1131,14 +1132,17 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     hasActivePlanContext &&
     !isPlanApproved &&
     latestPlanTurn?.status === "awaiting_input";
-  const canContinuePlanning =
-    hasActivePlanContext &&
-    !isPlanApproved &&
-    !isAwaitingInput &&
-    !canApproveExecution &&
-    (planArtifacts.length > 0 || fallbackPlanPreview.length > 0) &&
-    agentStatus !== "running" &&
-    agentStatus !== "pending_review";
+  // A visible assistant draft is only a diagnostic preview until the runtime
+  // has materialized and verified a plan artifact. Never offer formal-plan
+  // continuation/rejection controls for a candidate that failed the gate.
+  const canContinuePlanning = canOfferPlanContinuation({
+    hasActivePlanContext,
+    isPlanApproved,
+    isAwaitingInput,
+    canApproveExecution,
+    materializedArtifactCount: planArtifacts.length,
+    agentStatus,
+  });
   const canResumeExecution =
     hasActivePlanContext &&
     isPlanApproved &&

@@ -549,7 +549,10 @@ for (const model of models) {
         if (artifactCount > 0) return "artifact_ready";
         if (
           snapshot?.isGenerating === false &&
-          (snapshot?.taskFlowTypes || []).includes("user")
+          (
+            (snapshot?.taskFlowTypes || []).includes("user") ||
+            ["error", "idle"].includes(String(snapshot?.agentStatus || ""))
+          )
         ) {
           const debugTail = JSON.stringify(snapshot?.debugTail || []).slice(-2_000);
           return `terminal_without_artifact:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}:${debugTail}`;

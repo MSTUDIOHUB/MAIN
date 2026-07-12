@@ -2070,7 +2070,7 @@ test("actionable plan quality rejects implementation-heavy code dumps", () => {
   assert.equal(validation.reason, "excessive_plan_code_dump");
 });
 
-test("implementation-heavy plan drafts are rewritten by the model instead of semantically canonicalized", () => {
+test("implementation-heavy plan drafts are deterministically compacted without another model pass", () => {
   const largeCode = "const selected = await open({ multiple: false });\n".repeat(32);
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [
@@ -2104,6 +2104,93 @@ test("implementation-heavy plan drafts are rewritten by the model instead of sem
     language: "zh",
   });
 
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, "excessive_plan_code_dump");
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.source, "deterministically_compacted_visible_plan");
+  assert.doesNotMatch(result.content || "", /const selected = await open/);
+  assert.match(result.content || "", /修改 `src\/main\.js`/);
+});
+
+test("MD Viewer trace derives grounded targets from semantic source reads and materializes the first candidate", () => {
+  const evidenceRecords = [
+    {
+      tool: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      summary: "The Tauri builder registers open_files and stores FILES and FILE_CONTENTS, while the setup chain contains the application event wiring.",
+    },
+    {
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "window.addEventListener('file-open', handleFileOpen) is the frontend entry point for an externally opened Markdown file.",
+    },
+    {
+      tool: "read_file",
+      target: "src/components/toolbar.js",
+      status: "succeeded",
+      summary: "openFiles invokes the Tauri open_files command and then forwards selected file data to the editor loading flow.",
+    },
+  ];
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-md-viewer-trace",
+    objective: "修复双击 Markdown 文件后显示空白，以及工具栏打开按钮无法弹出文件选择器的问题。",
+    evidenceRecords,
+    files: evidenceRecords.map((record) => record.target),
+  });
+
+  assert.deepEqual(bundle.changeTargets, [
+    "src-tauri/src/main.rs",
+    "src/main.js",
+    "src/components/toolbar.js",
+  ]);
+
+  const largeCode = "const selected = await open({ multiple: false });\n".repeat(34);
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# 修复 Markdown 文件打开链路",
+      "",
+      "## 摘要",
+      "- 打通系统双击、Tauri 后端事件与前端编辑器加载链路，并修复工具栏文件选择流程。",
+      "",
+      "## 已确认证据",
+      "- `src-tauri/src/main.rs` 包含后端打开命令与应用事件接线。",
+      "- `src/main.js` 包含前端 `file-open` 监听入口。",
+      "- `src/components/toolbar.js` 包含工具栏打开命令调用。",
+      "",
+      "## 关键改动",
+      "- 修改 `src-tauri/src/main.rs`，统一系统文件打开事件的 payload，并把文件内容返回给前端。",
+      "- 修改 `src/main.js`，让外部打开事件进入现有编辑器加载流程。",
+      "- 修改 `src/components/toolbar.js`，正确等待文件选择结果并调用统一加载入口。",
+      "",
+      "```javascript",
+      largeCode,
+      "```",
+      "",
+      "```rust",
+      "fn open_files() {}\n".repeat(80),
+      "```",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 统一后端命令与前端事件的文件 payload；不新增公共 API。",
+      "",
+      "## 测试方案",
+      "- 运行构建，分别验证系统双击 Markdown 与工具栏选择文件后内容正确显示。",
+      "",
+      "## 假设与默认值",
+      "- 保留现有编辑器渲染与文件关联配置。",
+    ].join("\n"),
+    userGoal: bundle.objective,
+    evidenceRecords,
+    files: evidenceRecords.map((record) => record.target),
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.evidenceBundleHash, bundle.hash);
+  assert.equal(result.source, "deterministically_compacted_visible_plan");
+  assert.equal(result.candidate?.changes.length, 3);
+  assert.ok(result.candidate?.changes.every((change) => change.targetRef && change.evidenceRefs.length > 0));
+  assert.doesNotMatch(result.content || "", /const selected|fn open_files/);
 });

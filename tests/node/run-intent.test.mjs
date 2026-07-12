@@ -180,6 +180,27 @@ test("approved plan conversation becomes execute runtime for completion evidence
   assert.equal(contract.completionEvidenceRequired, "execution_evidence");
 });
 
+test("a new unapproved Plan turn never inherits operation consent from another run", () => {
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: "plan",
+    runtimeIntent: "plan",
+    commandDirective: {
+      kind: "none",
+      source: "natural_language",
+      requiresApproval: false,
+    },
+    planApproved: false,
+    planReviewReady: false,
+    executionConsentGranted: true,
+  });
+
+  assert.equal(contract.operationApprovalState, "not_required");
+  assert.equal(contract.approvalState, "not_required");
+  assert.equal(contract.planReviewState, "not_ready");
+  assert.equal(contract.mutationExpected, false);
+  assert.equal(contract.completionEvidenceRequired, "plan_artifact");
+});
+
 test("Chinese feature addition requests enter execute workflow", () => {
   for (const input of [
     "目前已经有了“打开”和“保存”功能了，请增加一个新建功能，点击新建后可以创建新的文档。",

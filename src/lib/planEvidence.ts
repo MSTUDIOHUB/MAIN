@@ -119,6 +119,10 @@ function summaryExposesTargetDefect(summary: string): boolean {
   return /(?:\b(?:missing|incorrect|wrong|broken|unimplemented|stubbed?|fails?|failure|no-op|empty handler|does not|doesn't|without|never\s+(?:assigns?|maps?|registers?|listens?|returns?|sets?|handles?|calls?|emits?))\b|\bonly\s+(?:returns?|sets?|writes?|handles?|calls?|emits?)\b|缺少|缺失|错误|不正确|失效|失败|未实现|未注册|未监听|未等待|从未(?:映射|注册|监听|返回|设置|处理|调用)|没有(?:映射|注册|监听|返回|设置|处理)|为空|空实现|只(?:返回|设置|写入|处理|调用)|仅(?:返回|设置|写入|处理|调用))/i.test(summary);
 }
 
+function summaryExposesImplementationStructure(summary: string): boolean {
+  return /(?:\b(?:function|handler|listener|event|command|invoke|emit|payload|callback|builder|setup|registers?|listens?|returns?|forwards?|loads?|stores?)\b|(?:window|app|tauri|dialog)\s*[.:]|[_-](?:event|handler)\b|函数|处理器|监听|事件|命令|调用|回调|注册|返回|转发|加载|存储|配置)/i.test(summary);
+}
+
 function isActionableChangeTarget(fact: PlanEvidenceFact, objective: string): boolean {
   if (!SOURCE_TARGET_RE.test(fact.target) || LOW_SIGNAL_TARGET_RE.test(fact.target)) return false;
   if (!objectiveMentionsTarget(objective, fact.target) && !summaryExposesTargetDefect(fact.summary)) return false;
@@ -158,14 +162,29 @@ export function buildPlanEvidenceBundle(input: {
         hash,
       };
     });
-  const factTargets = facts
+  const strictFactTargets = facts
     .filter((fact) => isActionableChangeTarget(fact, objective))
     .map((fact) => fact.target);
+  // Symptom-only requests usually do not name implementation paths. When the
+  // targeted reads already expose concrete source structure, retain those
+  // paths as the evidence-backed scope instead of reporting zero targets and
+  // forcing the model into another broad read loop. This fallback is used only
+  // when no stricter defect/path match exists, so related-consumer reads do not
+  // widen an already grounded plan.
+  const factTargets = strictFactTargets.length > 0
+    ? strictFactTargets
+    : facts
+      .filter((fact) =>
+        SOURCE_TARGET_RE.test(fact.target) &&
+        !LOW_SIGNAL_TARGET_RE.test(fact.target) &&
+        summaryExposesImplementationStructure(fact.summary)
+      )
+      .map((fact) => fact.target);
   const fileTargets = (input.files || []).filter((target) =>
     SOURCE_TARGET_RE.test(target) &&
     !PLAN_PATH_RE.test(target) &&
     !LOW_SIGNAL_TARGET_RE.test(target) &&
-    facts.some((fact) => isActionableChangeTarget(fact, objective) && (fact.target.replace(/\\/g, "/").endsWith(target.replace(/\\/g, "/")) || target.replace(/\\/g, "/").endsWith(fact.target.replace(/\\/g, "/"))))
+    facts.some((fact) => factTargets.includes(fact.target) && (fact.target.replace(/\\/g, "/").endsWith(target.replace(/\\/g, "/")) || target.replace(/\\/g, "/").endsWith(fact.target.replace(/\\/g, "/"))))
   );
   const changeTargets = unique([...factTargets, ...fileTargets], 12);
   const verificationTargets = inferVerificationTargets(constraints, facts);
