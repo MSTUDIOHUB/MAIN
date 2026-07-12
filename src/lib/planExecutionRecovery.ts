@@ -115,12 +115,15 @@ function compactLine(value: string | undefined | null, maxChars = MAX_LINE_CHARS
 }
 
 function summarizeTask(task: PlanTask): string {
-  const status = isPlanTaskAwaitingExternalValidation(task)
-    ? "待用户验证"
+  // The task tracker owns detailed evidence state. Repeating internal values
+  // such as `[missing]` in the Capsule headline is both noisy and misleading:
+  // it describes the audit record, not the user's next action.
+  const suffix = isPlanTaskAwaitingExternalValidation(task)
+    ? "（待用户验证）"
     : isPlanTaskAwaitingBrowserValidation(task)
-    ? "需要浏览器验证"
-    : task.evidenceStatus || task.status || "missing";
-  return compactLine(`${task.text} [${status}]`);
+    ? "（需要浏览器验证）"
+    : "";
+  return compactLine(`${task.text}${suffix}`);
 }
 
 function summarizeEvidence(entry: PlanExecutionEvidenceEntry): string {

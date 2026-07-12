@@ -29,6 +29,7 @@ async function loadWorkspacePathsModule() {
 const {
   relativizeToWorkspacePath,
   formatDirectoryNodesForTool,
+  workspacePathsReferToSameFile,
 } = await loadWorkspacePathsModule();
 
 test("relativizeToWorkspacePath keeps nested directories relative to the workspace root", () => {
@@ -67,4 +68,18 @@ test("relativizeToWorkspacePath normalizes Windows separators", () => {
   );
 
   assert.equal(result, "Assets/Scripts/BattleEntity.cs");
+});
+
+test("workspace path identity rejects an overlapping relative suffix but accepts an absolute tool target", () => {
+  assert.equal(
+    workspacePathsReferToSameFile("src-tauri/src/main.rs", "src/main.rs"),
+    false,
+  );
+  assert.equal(
+    workspacePathsReferToSameFile(
+      "/Users/example/MD Viewer/src-tauri/src/main.rs",
+      "src-tauri/src/main.rs",
+    ),
+    true,
+  );
 });

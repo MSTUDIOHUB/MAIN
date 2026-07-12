@@ -22,10 +22,11 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
 
   await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
   await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
-  await expect(page.getByTestId("agent-explanation-capsule")).toBeVisible();
-  await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveAttribute("data-phase", "tool_start");
-  await expect(page.getByTestId("plan-execution-runtime-tool")).toContainText("apply_patch · src/task-9.ts");
-  await expect(page.getByTestId("plan-execution-runtime-task")).toHaveCount(0);
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toBeVisible();
+  await expect(capsule).toContainText("正在执行：apply_patch · src/task-9.ts");
+  await expect(capsule).not.toContainText("阶段：tool_start");
+  await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
   await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T1: 更新");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T8: 更新");
@@ -199,9 +200,9 @@ test("task tracking popover preserves authored checklist order with runtime-only
   expect(styles.className).not.toContain("shadow-[inset_3px_0_0");
   expect(styles.borderLeftColor).not.toBe("rgb(5, 150, 105)");
 
-  await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveAttribute("data-phase", "waiting_review");
-  await expect(page.getByTestId("plan-execution-runtime-tool")).toContainText("run_command");
-  await expect(page.getByTestId("plan-execution-runtime-recovery")).toContainText("tool_permission_required");
+  await expect(page.getByTestId("agent-explanation-capsule")).toContainText("等待工具批准：run_command");
+  await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("阶段：waiting_review");
+  await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
 });
 
 test("ExecutionCapsule renders approval controls from pendingToolCall when the pending tool card is missing", async ({ page }) => {

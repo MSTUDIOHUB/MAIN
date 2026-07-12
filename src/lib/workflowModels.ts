@@ -3,6 +3,7 @@ import {
   resolveConversationTurnIntent,
   resolveRunIntentFromLegacyWorkflowMode,
 } from "./runIntent";
+import { workspacePathsReferToSameFile } from "./workspacePaths";
 
 // lib/workflowModels.ts
 // 计划面板、回合视图、流式归一化共享模型。
@@ -779,6 +780,7 @@ const SHELL_COMMAND_REQUIRED_OPERAND_RE = /^(?:tauri|vite|node|deno|composer|php
 function pushShellCommand(target: string[], candidate: string) {
   const normalized = candidate
     .replace(/^[`'"]+|[`'"]+$/g, "")
+    .replace(/[）】〕〉》]+$/g, "")
     .replace(/\s+/g, " ")
     .trim();
   if (!normalized || !SHELL_COMMAND_START_RE.test(normalized)) return;
@@ -947,6 +949,24 @@ function commandLooksLikePlaywrightOrBrowserTest(value: string): boolean {
 
 const FOCUSED_VALIDATION_COMMAND = "focused validation command";
 
+// `execute_command` writes into the shared PTY and only reports the first
+// chunk of output.  A successful dispatch is not enough to prove that a
+// server or desktop runtime actually came up: the next PTY observation is
+// where compiler/runtime failures usually appear.  Keep this command-shape
+// rule in the durable Plan evidence layer so every provider gets the same
+// completion boundary, rather than relying on a model to remember it.
+const LONG_RUNNING_PLAN_COMMAND_RE =
+  /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:tauri\s+dev|dev|start|serve|watch|preview|storybook)\b|\b(?:cargo\s+)?tauri\s+dev\b|\b(?:vite|next|nuxt|nuxi|astro|webpack-dev-server|storybook)\s+(?:dev|start|serve|preview)\b/i;
+const PTY_OBSERVATION_TOOL_NAMES = new Set([
+  "read_pty_since",
+  "read_pty_tail",
+  "get_pty_status",
+]);
+
+export function requiresPtyObservationForPlanCommand(value: string): boolean {
+  return LONG_RUNNING_PLAN_COMMAND_RE.test(String(value || ""));
+}
+
 function commandLooksLikeFiniteValidation(value: string): boolean {
   return /(?:\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)\b|\bnpx\s+(?:tsc|playwright|vitest|jest)\b|\b(?:cargo\s+(?:test|check|clippy)|pytest|python\s+-m\s+(?:pytest|unittest)|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b)/i.test(
     String(value || ""),
@@ -979,6 +999,39 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
     segment === expected ||
     segment.startsWith(`${expected} `)
   );
+}
+
+function commandEvidenceSatisfiedByLedger(
+  evidence: PlanTaskEvidence,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): boolean {
+  const matchingCommands = evidenceLedger.filter((record) =>
+    evidenceMatchesRecord(evidence, record)
+  );
+  if (matchingCommands.length === 0) return false;
+  if (!requiresPtyObservationForPlanCommand(evidence.value)) return true;
+
+  // A long-running command is considered observed only after the command was
+  // dispatched through the PTY and a later PTY read/status call examined the
+  // output. `run_command` does not satisfy this evidence; checking the source
+  // here also keeps restored/legacy tool records from completing a startup
+  // task incorrectly.
+  return matchingCommands.some((commandRecord) =>
+    commandRecord.sourceTool === "execute_command" &&
+    evidenceLedger.some((record) =>
+      PTY_OBSERVATION_TOOL_NAMES.has(record.sourceTool) &&
+      Number(record.createdAt || 0) >= Number(commandRecord.createdAt || 0)
+    )
+  );
+}
+
+function commandEvidenceIsAwaitingPtyObservation(
+  evidence: PlanTaskEvidence,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): boolean {
+  if (evidence.kind !== "cmd" || !requiresPtyObservationForPlanCommand(evidence.value)) return false;
+  return evidenceLedger.some((record) => evidenceMatchesRecord(evidence, record)) &&
+    !commandEvidenceSatisfiedByLedger(evidence, evidenceLedger);
 }
 
 const VALIDATION_ACTION_RE =
@@ -1104,7 +1157,7 @@ function evidencePathMatches(candidateRaw: string, expectedRaw: string): boolean
   const candidate = normalizePlanEvidenceValue(candidateRaw);
   if (!expected || !candidate) return false;
   if (isInternalPlanEvidenceValue(expected) || isInternalPlanEvidenceValue(candidate)) return false;
-  if (candidate === expected || candidate.endsWith(`/${expected}`) || expected.endsWith(`/${candidate}`)) return true;
+  if (workspacePathsReferToSameFile(candidate, expected)) return true;
 
   const escaped = expected.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   return new RegExp(`(?:^|[\\s"'(:=])${escaped}(?:$|[\\s"',):;])`, "i").test(candidate);
@@ -1349,7 +1402,9 @@ function resolvePlanTaskEvidenceStatus(
   }
 
   const matched = evidence.filter((item) =>
-    evidenceLedger.some((record) => evidenceMatchesRecord(item, record))
+    item.kind === "cmd"
+      ? commandEvidenceSatisfiedByLedger(item, evidenceLedger)
+      : evidenceLedger.some((record) => evidenceMatchesRecord(item, record))
   ).length;
 
   if (matched === evidence.length) {
@@ -1367,11 +1422,17 @@ function resolvePlanTaskEvidenceStatus(
     };
   }
 
+  const awaitingPtyObservation = evidence.some((item) =>
+    commandEvidenceIsAwaitingPtyObservation(item, evidenceLedger)
+  );
+
   return {
     status: matched > 0 ? "partial" : "missing",
     matched,
     total: evidence.length,
-    blockedReason: matched > 0
+    blockedReason: awaitingPtyObservation
+      ? "长驻启动命令已发送，但尚未通过 PTY 的 read_pty_since、read_pty_tail 或 get_pty_status 检查启动输出"
+      : matched > 0
       ? `仅满足 ${matched}/${evidence.length} 条证据`
       : "缺少真实执行证据，暂不能标记完成",
   };

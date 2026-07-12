@@ -54,6 +54,19 @@ test("tool result recovery phase owns runtime state folds", () => {
   assert.match(phaseSource, /approvedPlanRecoveryState,/);
 });
 
+test("approved plan scope blocks become a revision checkpoint before completion can be audited", () => {
+  const scopeCheckpointIndex = phaseSource.indexOf("const approvedPlanScopeBlockedTargets");
+  const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({");
+
+  assert.notEqual(scopeCheckpointIndex, -1);
+  assert.notEqual(completionAuditIndex, -1);
+  assert.ok(scopeCheckpointIndex < completionAuditIndex);
+  assert.match(phaseSource, /getApprovedPlanScopeBlockedTargets\(input\.results\)/);
+  assert.match(phaseSource, /logAgentEvent\("approved_plan_scope_revision_required"/);
+  assert.match(phaseSource, /emitPlanExecutionProgress\("paused",[\s\S]*?approved_plan_scope_revision_required/);
+  assert.match(phaseSource, /onNonActionableStop\(message, "incomplete_plan",[\s\S]*?approved_plan_scope_revision_required/);
+});
+
 test("tool iteration phase delegates tool-result recovery internals to the phase helper", () => {
   assert.match(orchestratorSource, /handleToolIterationPhase\(\{/);
   assert.match(toolIterationPhaseSource, /handleToolResultRecoveryPhase\(\{/);

@@ -1217,6 +1217,28 @@ test("plan execution progress snapshot is structured and ignores internal plan e
   assert.doesNotMatch(text, /Next:/);
 });
 
+test("plan execution progress keeps missing audit state out of the user-facing task headline", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "running",
+    iterationCount: 1,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    tasks: [{
+      id: "startup",
+      text: "启动桌面应用并检查启动输出",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "cmd", value: "npm run tauri dev" }],
+    }],
+    evidenceLedger: [],
+    recentToolActivity: [],
+  });
+
+  assert.match(update.currentTask, /启动桌面应用/);
+  assert.doesNotMatch(update.currentTask, /\[missing\]/);
+});
+
 test("plan execution checkpoints map to canonical runtime progress states", () => {
   const baseSnapshot = {
     turnId: "turn-1",

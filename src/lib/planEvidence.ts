@@ -1,4 +1,5 @@
 import { extractPrimaryUserRequestText } from "./turnIntake";
+import { workspacePathsReferToSameFile } from "./workspacePaths";
 import {
   normalizePlanEvidenceValue,
   type PlanExecutionEvidenceEntry,
@@ -184,7 +185,9 @@ export function buildPlanEvidenceBundle(input: {
     SOURCE_TARGET_RE.test(target) &&
     !PLAN_PATH_RE.test(target) &&
     !LOW_SIGNAL_TARGET_RE.test(target) &&
-    facts.some((fact) => factTargets.includes(fact.target) && (fact.target.replace(/\\/g, "/").endsWith(target.replace(/\\/g, "/")) || target.replace(/\\/g, "/").endsWith(fact.target.replace(/\\/g, "/"))))
+    facts.some((fact) =>
+      factTargets.includes(fact.target) && workspacePathsReferToSameFile(fact.target, target)
+    )
   );
   const changeTargets = unique([...factTargets, ...fileTargets], 12);
   const verificationTargets = inferVerificationTargets(constraints, facts);
@@ -279,15 +282,27 @@ function sectionLines(content: string, heading: RegExp): string[] {
 }
 
 function findTargetRef(text: string, bundle: PlanEvidenceBundle): string {
+  const explicitPaths = [...text.matchAll(PATH_LIKE_RE)]
+    .map((match) => match[1] || "")
+    .filter(Boolean);
+  for (const path of explicitPaths) {
+    const exact = bundle.changeTargets.find((target) =>
+      workspacePathsReferToSameFile(target, path)
+    );
+    if (exact) return exact;
+  }
+  // An explicit file reference is a hard claim. Preserve it when it is not
+  // grounded so validation can reject a false relative suffix instead of
+  // silently assigning it to a different file with the same basename.
+  if (explicitPaths[0]) return explicitPaths[0];
+
   const normalized = text.replace(/\\/g, "/").toLowerCase();
-  const exact = bundle.changeTargets.find((target) => {
+  const basenameMatches = bundle.changeTargets.filter((target) => {
     const path = target.replace(/\\/g, "/").toLowerCase();
     const base = path.split("/").pop() || path;
-    return normalized.includes(path) || normalized.includes(base);
+    return !!base && normalized.includes(base);
   });
-  if (exact) return exact;
-  const path = [...text.matchAll(PATH_LIKE_RE)][0]?.[1] || "";
-  if (path) return path;
+  if (basenameMatches.length === 1) return basenameMatches[0];
   return bundle.changeTargets.length === 1 ? bundle.changeTargets[0] : "";
 }
 
@@ -301,7 +316,7 @@ export function buildPlanCandidate(input: {
   const changes = changeLines.map((text) => {
     const targetRef = findTargetRef(text, input.bundle);
     const evidenceRefs = input.bundle.facts
-      .filter((fact) => !targetRef || fact.target.replace(/\\/g, "/").endsWith(targetRef.replace(/\\/g, "/")) || targetRef.replace(/\\/g, "/").endsWith(fact.target.replace(/\\/g, "/")))
+      .filter((fact) => !targetRef || workspacePathsReferToSameFile(fact.target, targetRef))
       .map((fact) => fact.id);
     return { text, targetRef, evidenceRefs };
   });

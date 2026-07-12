@@ -17,6 +17,7 @@ import {
   type PlanCandidate,
   type PlanEvidenceBundle,
 } from "./planEvidence";
+import { workspacePathsReferToSameFile } from "./workspacePaths";
 
 export type MaterializablePlanKind = "plan" | "design";
 export type PlanMaterializationSource =
@@ -113,7 +114,11 @@ const SEMANTIC_EVIDENCE_TOOLS = new Set([
   "glob_search",
   "index_workspace_documents",
 ]);
-const PATH_LIKE_RE = /\b(?:src|app|lib|components|tests|pages|hooks|store|styles|assets|public|server|client|packages|apps|docs|scripts|config|\.?MAIN)\/[A-Za-z0-9_./@-]+\b/g;
+// Preserve the entire workspace-relative path. The previous root-only matcher
+// could restart after the hyphen in a nested workspace directory and extract
+// a different relative file.
+const PATH_LIKE_RE =
+  /(?:^|[\s\x60"'(（:=])((?:(?:\.{1,2}\/|[A-Za-z0-9_.@-]+\/)+)[A-Za-z0-9_.@-]+\.[A-Za-z0-9]{1,10})(?=$|[\s\x60"',，。；;:)）\]}])/g;
 const ACTIONABLE_PLAN_FILE_RE =
   /^(?:\.?\/)?[A-Za-z0-9_@./-]+\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|md|css|scss|html|toml|yaml|yml)$/i;
 const PLAN_EVIDENCE_REFERENCE_RE =
@@ -558,8 +563,9 @@ function normalizePathLikeCandidate(value: unknown): string {
     return direct.replace(/^\.\//, "");
   }
 
-  const pathMatch = raw.match(PATH_LIKE_RE);
-  const candidate = pathMatch?.find((item) => !isPlanArtifactPath(item) && !isInternalPlanEvidenceText(item)) || "";
+  const candidate = [...raw.matchAll(PATH_LIKE_RE)]
+    .map((match) => match[1] || "")
+    .find((item) => !isPlanArtifactPath(item) && !isInternalPlanEvidenceText(item)) || "";
   return candidate.replace(/^\.\//, "");
 }
 
@@ -928,10 +934,10 @@ function normalizePlanGroundingPath(value: string): string {
 }
 
 function planGroundingPathsMatch(left: string, right: string): boolean {
-  const a = normalizePlanGroundingPath(left);
-  const b = normalizePlanGroundingPath(right);
-  if (!a || !b) return false;
-  return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+  return workspacePathsReferToSameFile(
+    normalizePlanGroundingPath(left),
+    normalizePlanGroundingPath(right),
+  );
 }
 
 function isPlanMutationLine(value: string): boolean {
@@ -1253,6 +1259,79 @@ function extractInlineCommands(values: string[], maxItems = 4): string[] {
   return commands;
 }
 
+// The user commonly describes a broken startup command in ordinary prose
+// (for example, "npm run tauri dev 无法启动") rather than in a Markdown code
+// span.  Deterministic plan recovery used to look only at backticks in tool
+// evidence/constraints, silently replacing that acceptance criterion with a
+// generic `cargo check`.  Preserve explicit interactive startup commands as
+// first-class validation work even when the model's plan draft is too short.
+const EXPLICIT_INTERACTIVE_STARTUP_COMMAND_RE =
+  /\b((?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:tauri\s+dev|dev|start|serve|preview|storybook)|(?:cargo\s+)?tauri\s+dev|(?:vite|next|nuxt|nuxi|astro)\s+(?:dev|start|serve|preview)|webpack-dev-server)\b/gi;
+const INTERACTIVE_STARTUP_COMMAND_RE =
+  /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:tauri\s+dev|dev|start|serve|preview|storybook)\b|\b(?:cargo\s+)?tauri\s+dev\b|\b(?:vite|next|nuxt|nuxi|astro)\s+(?:dev|start|serve|preview)\b|\bwebpack-dev-server\b/i;
+
+function extractExplicitInteractiveStartupCommands(value: string, maxItems = 3): string[] {
+  const seen = new Set<string>();
+  const commands: string[] = [];
+  for (const match of String(value || "").matchAll(EXPLICIT_INTERACTIVE_STARTUP_COMMAND_RE)) {
+    const command = String(match[1] || "").replace(/\s+/g, " ").trim();
+    const key = command.toLowerCase();
+    if (!command || seen.has(key)) continue;
+    seen.add(key);
+    commands.push(command);
+    if (commands.length >= maxItems) break;
+  }
+  return commands;
+}
+
+function uniqueValidationCommands(values: string[], maxItems = 4): string[] {
+  const seen = new Set<string>();
+  const commands: string[] = [];
+  for (const raw of values) {
+    const command = String(raw || "").replace(/\s+/g, " ").trim();
+    const key = command.toLowerCase();
+    if (!command || seen.has(key)) continue;
+    seen.add(key);
+    commands.push(command);
+    if (commands.length >= maxItems) break;
+  }
+  return commands;
+}
+
+function isInteractiveStartupCommand(command: string): boolean {
+  return INTERACTIVE_STARTUP_COMMAND_RE.test(String(command || ""));
+}
+
+function isTauriDesktopStartupCommand(command: string): boolean {
+  return /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?tauri\s+dev\b|\b(?:cargo\s+)?tauri\s+dev\b/i.test(
+    String(command || ""),
+  );
+}
+
+function buildDeterministicValidationPlanLines(input: {
+  commands: string[];
+  language: "zh" | "en";
+}): string[] {
+  const lines = input.commands.map((command) => {
+    if (!isInteractiveStartupCommand(command)) {
+      return input.language === "zh"
+        ? `运行 \`${command}\` 并检查退出码与输出。`
+        : `Run \`${command}\` and inspect exit status/output.`;
+    }
+    return input.language === "zh"
+      ? `使用 \`execute_command\` 启动 \`${command}\`，随后使用 \`read_pty_since\`、\`read_pty_tail\` 或 \`get_pty_status\` 检查新增启动输出和错误；在 PTY 观察完成前不得将该启动验证标记通过。 （证据：cmd:${command}）`
+      : `Use \`execute_command\` to start \`${command}\`, then use \`read_pty_since\`, \`read_pty_tail\`, or \`get_pty_status\` to inspect new startup output/errors; do not mark startup validation passed before that PTY observation. (evidence: cmd:${command})`;
+  });
+
+  if (input.commands.some(isTauriDesktopStartupCommand)) {
+    lines.push(input.language === "zh"
+      ? "在实际启动的 Tauri 桌面窗口中验证用户报告的启动、双击打开和文件选择行为；此项保留待 Tauri 运行时/用户确认，不能用 cargo check、构建或 curl 代替。 （证据：tauri_required:desktop runtime interaction）"
+      : "In the actually launched Tauri desktop window, verify the user-reported startup, double-click-open, and file-picker behavior; keep this pending Tauri runtime/user confirmation and do not substitute cargo check, a build, or curl. (evidence: tauri_required: desktop runtime interaction)");
+  }
+
+  return lines;
+}
+
 function buildInsufficientEvidencePlan(input: { goal: string; language: "zh" | "en" }): string {
   if (input.language === "en") {
     const summary = input.goal
@@ -1355,7 +1434,13 @@ function buildCodexStylePlanArtifact(input: {
   );
   const files = (filesWithConcreteEvidence.length > 0 ? filesWithConcreteEvidence : rawFiles).slice(0, 8);
   const constraints = uniqueCompactLines(input.constraints, 5, 200);
-  const commands = extractInlineCommands([...evidence, ...constraints]);
+  const commands = uniqueValidationCommands([
+    // Explicit user-reported startup failures are acceptance criteria, not
+    // incidental prose. Put them first so a generic compiler fallback cannot
+    // displace the requested launch check.
+    ...extractExplicitInteractiveStartupCommands(goal),
+    ...extractInlineCommands([...evidence, ...constraints]),
+  ]);
   const deterministicValidationCommand = commands[0] || (() => {
     if (files.some((file) => /\.rs$/i.test(file))) return "cargo check";
     if (files.some((file) => /\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(file))) return "npm run build";
@@ -1396,7 +1481,7 @@ function buildCodexStylePlanArtifact(input: {
         "No public API, interface, or type change is planned by default; if implementation proves one is required, pause before widening scope.",
       ]),
       formatCodexPlanSection("Test Plan", commands.length > 0
-        ? commands.map((command) => `Run \`${command}\` and inspect exit status/output.`)
+        ? buildDeterministicValidationPlanLines({ commands, language: "en" })
         : deterministicValidationCommand
         ? [`Run \`${deterministicValidationCommand}\` and inspect exit status/output.`]
         : [
@@ -1432,7 +1517,7 @@ function buildCodexStylePlanArtifact(input: {
       "默认不新增或修改公共 API、接口或类型；如果执行中证明必须扩大接口范围，先暂停确认。",
     ]),
     formatCodexPlanSection("测试方案", commands.length > 0
-      ? commands.map((command) => `运行 \`${command}\` 并检查退出码与输出。`)
+      ? buildDeterministicValidationPlanLines({ commands, language: "zh" })
       : deterministicValidationCommand
       ? [`运行 \`${deterministicValidationCommand}\` 并检查退出码与输出。`]
       : [

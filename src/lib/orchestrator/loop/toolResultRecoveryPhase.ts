@@ -93,6 +93,41 @@ type ApprovedPlanNoProgressRecoveryAction = (
   input: ApprovedPlanNoProgressDecision,
 ) => ApprovedPlanRecoveryRuntimeState;
 
+const APPROVED_PLAN_SCOPE_BLOCKED_RE = /\bAPPROVED_PLAN_SCOPE_BLOCKED\b/;
+
+function getApprovedPlanScopeBlockedTargets(results: ToolExecutionResult[]): string[] {
+  return Array.from(new Set(
+    results
+      .filter((result) =>
+        result.isError &&
+        APPROVED_PLAN_SCOPE_BLOCKED_RE.test(String(result.content || ""))
+      )
+      .map((result) => String(result.target || "").trim())
+      .filter(Boolean),
+  ));
+}
+
+function buildApprovedPlanScopeRevisionPauseMessage(input: {
+  language: "zh" | "en";
+  targets: string[];
+  plannedTargets: string[];
+}): string {
+  const targets = input.targets.join(", ") || (input.language === "zh" ? "新的相关文件" : "a newly relevant file");
+  const planned = input.plannedTargets.join(", ") || (input.language === "zh" ? "当前计划任务" : "the current Plan tasks");
+  if (input.language === "en") {
+    return [
+      "Execution is paused before modifying " + targets + ".",
+      "The file is outside the approved Plan scope (" + planned + "). Read-only inspection remains allowed, but MAIN will not write an unreviewed target.",
+      "Create a focused Plan revision that adds the evidence-backed target, then review and approve that revision before resuming execution.",
+    ].join("\n");
+  }
+  return [
+    "执行已在修改 " + targets + " 前暂停。",
+    "该文件不在已批准 Plan 的修改范围内（当前范围：" + planned + "）。仍可继续做只读定向检查，但 MAIN 不会写入未经审核的目标。",
+    "请生成一份只补充该已确认目标的 Plan 修订，审核并批准该修订后再继续执行。",
+  ].join("\n");
+}
+
 export type ToolResultRecoveryPhaseResult =
   | {
       status: "continue" | "stopped" | "plan_completed";
@@ -209,6 +244,67 @@ export async function handleToolResultRecoveryPhase(input: {
     planQualityRecovery,
   );
   const pendingPlanRuntimeRecoveryPrompt = planQualityRecovery.pendingPlanRuntimeRecoveryPrompt;
+  const approvedPlanScopeBlockedTargets = getApprovedPlanScopeBlockedTargets(input.results);
+
+  // A scope block is not an ordinary failed patch. The current revision has
+  // proved insufficient, so keep the write boundary intact and stop before a
+  // local model can reinterpret the error as permission to retry or complete
+  // the remaining tasks. Read-only tools remain available on the next
+  // revision-drafting turn.
+  if (
+    input.workflowMode === "plan" &&
+    input.callbacks.getIsPlanApproved() &&
+    approvedPlanScopeBlockedTargets.length > 0
+  ) {
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: input.results,
+      toolArgsByCallId: input.toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    const plannedTargets = Array.from(new Set(
+      input.callbacks.getPlanTasks().flatMap((task) =>
+        (task.evidence || [])
+          .filter((evidence) => evidence.kind === "file" || evidence.kind === "deliverable")
+          .map((evidence) => String(evidence.value || "").trim())
+          .filter(Boolean),
+      ),
+    ));
+    const language = input.callbacks.getPreferredLanguage();
+    const message = buildApprovedPlanScopeRevisionPauseMessage({
+      language,
+      targets: approvedPlanScopeBlockedTargets,
+      plannedTargets,
+    });
+    logAgentEvent("approved_plan_scope_revision_required", {
+      iteration: input.iteration,
+      targets: approvedPlanScopeBlockedTargets,
+      plannedTargets,
+      resultCount: input.results.length,
+    });
+    input.emitPlanExecutionProgress("paused", {
+      currentTask: language === "zh" ? "需要扩展已批准计划" : "approved Plan revision required",
+      currentTool: "",
+      latestEvidence: approvedPlanScopeBlockedTargets.join(", "),
+      recoveryReason: "approved_plan_scope_revision_required",
+      repeatedTargets: approvedPlanScopeBlockedTargets,
+      nextStep: language === "zh"
+        ? "补充已确认文件的计划修订并重新审核"
+        : "add the confirmed file in a Plan revision and review it",
+    });
+    input.callbacks.onNonActionableStop(message, "incomplete_plan", {
+      phase: "paused",
+      recoveryReason: "approved_plan_scope_revision_required",
+      repeatedTargets: approvedPlanScopeBlockedTargets,
+      nextStep: language === "zh"
+        ? "补充已确认文件的计划修订并重新审核"
+        : "add the confirmed file in a Plan revision and review it",
+    });
+    input.callbacks.onStatusChange("idle");
+    return finish("stopped");
+  }
 
   // Codex-style Plan execution is runtime-owned: once every task in the
   // approved revision has fresh trusted evidence, do not spend another model

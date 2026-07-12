@@ -1,6 +1,7 @@
 import type { PlanRuntimePhase } from "./workflowModels";
 import { buildPlanEvidenceBundle, isPlanEvidenceBundleReady } from "./planEvidence";
 import { hasTurnProvidedContext, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
+import { workspacePathsReferToSameFile } from "./workspacePaths";
 
 export const PLAN_READONLY_CONVERGENCE_BATCH_LIMIT = 3;
 export const PLAN_READONLY_CONVERGENCE_TOOL_LIMIT = 12;
@@ -116,7 +117,7 @@ function targetMatchesProvidedPath(target: string, providedPaths: string[]): boo
   return providedPaths.some((rawPath) => {
     const normalizedPath = normalizeEvidencePath(rawPath);
     if (!normalizedPath) return false;
-    return normalizedTarget === normalizedPath || normalizedTarget.endsWith(`/${normalizedPath}`) || normalizedPath.endsWith(`/${normalizedTarget}`);
+    return workspacePathsReferToSameFile(normalizedTarget, normalizedPath);
   });
 }
 

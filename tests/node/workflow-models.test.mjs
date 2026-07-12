@@ -1380,6 +1380,42 @@ test("approved Plan blocks workspace mutations outside the reviewed task targets
   assert.deepEqual(blocked.unexpectedTargets, ["src/app.tsx"]);
 });
 
+test("approved Plan scope never treats a nested source path as its shorter relative suffix", () => {
+  const tasks = extractPlanTasks(
+    "- [ ] 修改 src-tauri/src/main.rs 的 macOS 文件打开事件。",
+  );
+  const truncated = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "replace_in_file",
+    args: { path: "src/main.rs" },
+    target: "src/main.rs",
+    tasks,
+  });
+  const absoluteExact = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "replace_in_file",
+    args: { path: "/Users/example/MD Viewer/src-tauri/src/main.rs" },
+    target: "/Users/example/MD Viewer/src-tauri/src/main.rs",
+    tasks,
+  });
+  const exploratoryRead = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "read_file",
+    args: { path: "src/main.js" },
+    target: "src/main.js",
+    tasks,
+  });
+
+  assert.equal(truncated.allowed, false);
+  assert.deepEqual(truncated.unexpectedTargets, ["src/main.rs"]);
+  assert.equal(absoluteExact.allowed, true);
+  assert.equal(exploratoryRead.applies, false);
+  assert.equal(exploratoryRead.allowed, true);
+});
+
 test("read-only shell commands do not satisfy file evidence", () => {
   const parsed = extractPlanTasks("- [x] 在 Rust 后端新增 GitFileEntry 结构体 — 证据: file:src-tauri/src/lib.rs");
   const readOnlyCommand = createPlanExecutionEvidenceEntry({
@@ -1527,6 +1563,84 @@ test("Tauri runtime validation pauses as user/external validation instead of cur
   assert.equal(audit.pendingExternalValidation, true);
   assert.equal(audit.remainingTasks.length, 0);
   assert.equal(audit.pendingUserValidationTasks.length, 1);
+});
+
+test("long-running desktop startup requires execute_command plus a later PTY observation before completion", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([
+    {
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: "Plan",
+      updatedAt: 1,
+      content: [
+        "# 计划",
+        "",
+        "## 关键改动",
+        "- 修改 `src-tauri/src/main.rs` 的启动初始化。",
+        "",
+        "## 测试方案",
+        "- 使用 `execute_command` 启动 `npm run tauri dev`，随后读取 PTY 启动输出。 （证据：cmd:npm run tauri dev）",
+        "- 在实际 Tauri 桌面窗口中验证打开文件行为。 （证据：tauri_required:desktop runtime interaction）",
+      ].join("\n"),
+    },
+  ], { language: "zh", maxTasks: 8 });
+  const startupTask = tasks.find((task) => task.evidence?.some((item) =>
+    item.kind === "cmd" && item.value === "npm run tauri dev"
+  ));
+  const externalTask = tasks.find((task) => task.evidence?.some((item) =>
+    item.kind === "tauri_required"
+  ));
+
+  assert.ok(startupTask, JSON.stringify(tasks, null, 2));
+  assert.ok(externalTask, JSON.stringify(tasks, null, 2));
+
+  const dispatched = createPlanExecutionEvidenceEntry({
+    toolName: "execute_command",
+    target: "npm run tauri dev",
+    result: JSON.stringify({
+      command: "npm run tauri dev",
+      output: "Compiling md-viewer...",
+      startOffset: 12,
+      endOffset: 48,
+    }),
+  });
+  const beforeObservation = reconcilePlanTaskCompletion([], tasks, dispatched ? [dispatched] : []);
+  const pendingStartup = beforeObservation.find((task) => task.id === startupTask.id);
+  assert.equal(isPlanTaskTrustedComplete(pendingStartup), false);
+  assert.match(pendingStartup?.blockedReason || "", /PTY/);
+
+  const observed = createPlanExecutionEvidenceEntry({
+    toolName: "read_pty_since",
+    target: "terminal @ 48",
+    result: JSON.stringify({ text: "Finished dev startup", startOffset: 48, endOffset: 72 }),
+  });
+  const wrongDispatch = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm run tauri dev",
+    result: JSON.stringify({ exitCode: 0, stdout: "unexpected one-shot result" }),
+  });
+  const afterWrongTool = reconcilePlanTaskCompletion(
+    [],
+    tasks,
+    [wrongDispatch, observed].filter(Boolean),
+  );
+  assert.equal(
+    isPlanTaskTrustedComplete(afterWrongTool.find((task) => task.id === startupTask.id)),
+    false,
+  );
+  const afterObservation = reconcilePlanTaskCompletion(
+    [],
+    tasks,
+    [dispatched, observed].filter(Boolean),
+  );
+  const completedStartup = afterObservation.find((task) => task.id === startupTask.id);
+  const pendingDesktopValidation = afterObservation.find((task) => task.id === externalTask.id);
+  const audit = buildPlanTaskEvidenceAudit({ tasks: afterObservation });
+
+  assert.equal(isPlanTaskTrustedComplete(completedStartup), true);
+  assert.equal(pendingDesktopValidation?.evidenceStatus, "requires_tauri_validation");
+  assert.equal(audit.pendingExternalValidation, true);
+  assert.equal(audit.allTrustedComplete, false);
 });
 
 test("focused test or build alternatives accept fresh command evidence without becoming Tauri-only", () => {

@@ -4977,45 +4977,6 @@ export default function ChatArea({
                         </div>
                       )}
 
-                      {planExecutionCapsuleProjection && !planReviewActionRequest && !userChoiceActionRequest && (
-                        <div
-                          data-testid="plan-execution-runtime-progress"
-                          data-phase={planExecutionCapsuleProjection.phase}
-                          data-tone={planExecutionCapsuleProjection.tone}
-                          className={`w-full rounded-xl border px-3 py-2.5 text-[11px] leading-5 ${
-                            isLightThemeMode
-                              ? "border-[rgba(15,23,42,0.1)] bg-[rgba(248,250,252,0.82)] text-[#475569]"
-                              : isBlackThemeMode
-                              ? "border-[#202026] bg-[#030304] text-[#a1a1aa]"
-                              : "border-[#27272a] bg-[#09090b] text-[#a1a1aa]"
-                          }`}
-                        >
-                          <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
-                            <span className="theme-plan-pill rounded-full border px-2 py-0.5 text-[10px] font-semibold">
-                              {language === "zh" ? `阶段：${planExecutionCapsuleProjection.phase}` : `Phase: ${planExecutionCapsuleProjection.phase}`}
-                            </span>
-                            {planExecutionCapsuleProjection.currentTool && (
-                              <span data-testid="plan-execution-runtime-tool" className="min-w-0 truncate">
-                                {language === "zh" ? "工具" : "Tool"}：{planExecutionCapsuleProjection.currentTool}
-                              </span>
-                            )}
-                          </div>
-                          {planExecutionCapsuleProjection.currentTask && !capsuleHasTasks && (
-                            <div data-testid="plan-execution-runtime-task" className="mt-1 break-words">
-                              {language === "zh" ? "当前任务" : "Current task"}：{planExecutionCapsuleProjection.currentTask}
-                            </div>
-                          )}
-                          {(planExecutionCapsuleProjection.recoveryReason || planExecutionCapsuleProjection.repeatedTargets.length > 0) && (
-                            <div data-testid="plan-execution-runtime-recovery" className="mt-1 break-words text-[#fbbf24]">
-                              {language === "zh" ? "恢复" : "Recovery"}：
-                              {[planExecutionCapsuleProjection.recoveryReason, ...planExecutionCapsuleProjection.repeatedTargets]
-                                .filter(Boolean)
-                                .join(" · ")}
-                            </div>
-                          )}
-                        </div>
-                      )}
-
                       {hasExecutionCapsuleControls && (
                         <div className={`w-full border-t pt-3 ${
                           isLightThemeMode ? "border-[#e4e4e7]" : "border-[#27272a]/60"

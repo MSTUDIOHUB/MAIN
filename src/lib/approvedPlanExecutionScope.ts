@@ -1,4 +1,5 @@
 import type { PlanTask } from "./workflowModels";
+import { workspacePathsReferToSameFile } from "./workspacePaths";
 
 const BUILTIN_WORKSPACE_MUTATION_TOOLS = new Set([
   "write_file",
@@ -19,7 +20,7 @@ function pathsMatch(left: string, right: string): boolean {
   const a = normalizePath(left);
   const b = normalizePath(right);
   if (!a || !b) return false;
-  return a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+  return workspacePathsReferToSameFile(a, b);
 }
 
 function extractApplyPatchTargets(patch: string): string[] {

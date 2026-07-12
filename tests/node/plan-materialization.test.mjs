@@ -66,6 +66,7 @@ const {
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
 const {
+  buildPlanCandidate,
   buildPlanEvidenceBundle,
   formatPlanEvidenceBundleForModel,
   hasDeterministicPlanMaterializationEvidence,
@@ -73,6 +74,7 @@ const {
   validatePlanCandidate,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
 const {
+  deriveRuntimePlanTasksFromArtifacts,
   validateActionablePlanArtifact,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
 
@@ -918,6 +920,40 @@ test("composes deterministic reviewable plan artifact after repeated quality rej
   assert.doesNotMatch(content, /MAIN TOOL FEEDBACK|ContextMemoryState|RecoveryDetails/);
 });
 
+test("deterministic plan preserves a user-reported Tauri startup failure as PTY-checked validation", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "修复 Markdown Viewer 的打开问题；目前 npm run tauri dev都无法正常启动软件。",
+    evidence: [
+      "read_file src-tauri/src/main.rs; excerpt=Builder::default() 注册 Tauri 启动与命令处理",
+      "read_file src/main.js; excerpt=openFile 会调用前端文件打开处理",
+    ],
+    files: ["src-tauri/src/main.rs", "src/main.js"],
+    constraints: ["批准前不修改源码。"],
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.match(content, /`npm run tauri dev`/);
+  assert.match(content, /execute_command/);
+  assert.match(content, /read_pty_since/);
+  assert.match(content, /证据：cmd:npm run tauri dev/);
+  assert.match(content, /证据：tauri_required:desktop runtime interaction/);
+
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content,
+    updatedAt: 1,
+  }], { language: "zh" });
+  assert.equal(tasks.filter((task) => task.evidence?.some((item) =>
+    item.kind === "cmd" && item.value === "npm run tauri dev"
+  )).length, 1);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) =>
+    item.kind === "tauri_required"
+  )), true);
+});
+
 test("deterministic closure drops runtime plan instructions from assumptions", () => {
   const userGoal = [
     "修复一些问题：",
@@ -1655,6 +1691,82 @@ test("plan evidence grounding rejects modified existing files that were never re
   assert.equal(validation.ok, false);
   assert.equal(validation.recoveryAction, "targeted_evidence");
   assert.match(validation.reason || "", /ungrounded_plan_change_targets:index\.html/);
+});
+
+test("plan evidence grounding rejects a truncated relative suffix instead of aliasing a nested source file", () => {
+  const validation = validatePlanEvidenceGrounding({
+    content: [
+      "# 计划",
+      "",
+      "## 已确认证据",
+      "- 已读取 src-tauri/src/main.rs 并确认系统文件打开入口。",
+      "",
+      "## 关键改动",
+      "- 修改 src/main.rs 的文件打开事件。",
+    ].join("\n"),
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "handle_open_url receives the macOS file-open event",
+      },
+    ],
+  });
+
+  assert.equal(validation.ok, false);
+  assert.match(validation.reason || "", /ungrounded_plan_change_targets:src\/main\.rs/);
+});
+
+test("plan evidence sanitizer retains src-tauri paths without inventing their inner relative suffix", () => {
+  const sanitized = sanitizePlanEvidenceInput({
+    evidence: [
+      "read_file src-tauri/src/main.rs; handle_open_url stores incoming file paths for later forwarding",
+    ],
+    files: ["src-tauri/src/main.rs"],
+    language: "zh",
+  });
+  const bundle = buildPlanEvidenceBundle({
+    objective: "修复 macOS 文件打开入口。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      summary: "handle_open_url stores incoming file paths for later forwarding",
+    }],
+    files: sanitized.files,
+  });
+
+  assert.equal(sanitized.files.includes("src-tauri/src/main.rs"), true);
+  assert.equal(sanitized.files.includes("src/main.rs"), false);
+  assert.deepEqual(bundle.changeTargets, ["src-tauri/src/main.rs"]);
+
+  const candidate = buildPlanCandidate({
+    content: [
+      "# Plan",
+      "",
+      "## Summary",
+      "- Repair the file-open path.",
+      "",
+      "## Confirmed Evidence",
+      "- src-tauri/src/main.rs receives the file-open event.",
+      "",
+      "## Key Changes",
+      "- Update src/main.rs to forward the event.",
+      "",
+      "## Public APIs / Interfaces / Types",
+      "- No public API change.",
+      "",
+      "## Test Plan",
+      "- Run cargo check.",
+      "",
+      "## Assumptions / Defaults",
+      "- Preserve existing behavior.",
+    ].join("\n"),
+    bundle,
+  });
+  assert.equal(candidate.changes[0]?.targetRef, "src/main.rs");
+  assert.deepEqual(validatePlanCandidate(candidate, bundle.hash), ["ungrounded_changes"]);
 });
 
 test("materialization rejects the logged MD Viewer plan when index.html was proposed without read evidence", () => {
