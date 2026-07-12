@@ -64,6 +64,31 @@ const {
   path.join(workspaceRoot, "src/lib/orchestrator.ts"),
 );
 const {
+  shouldExposeGameEngineMcpServer,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/unityDiagnostics.ts"),
+);
+
+test("game engine MCP servers stay out of unrelated workspaces", () => {
+  const unityServer = { name: "unityMCP", url: "http://localhost:8080/mcp" };
+  const genericServer = { name: "docs", url: "http://localhost:9000/mcp" };
+  assert.equal(shouldExposeGameEngineMcpServer({
+    server: unityServer,
+    gameStudioEngineContext: false,
+    unityCommandRequested: false,
+  }), false);
+  assert.equal(shouldExposeGameEngineMcpServer({
+    server: unityServer,
+    gameStudioEngineContext: true,
+    unityCommandRequested: false,
+  }), true);
+  assert.equal(shouldExposeGameEngineMcpServer({
+    server: genericServer,
+    gameStudioEngineContext: false,
+    unityCommandRequested: false,
+  }), true);
+});
+const {
   activateUnityMcpFallbackState,
   applyUnityMcpNoToolRecoveryState,
   applyUnityMcpToolResultState,

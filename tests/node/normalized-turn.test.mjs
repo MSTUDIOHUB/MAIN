@@ -57,9 +57,16 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { ensureVisibleConclusion, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } = loadTranspiledModuleSync(
+const { classifyAssistantCompletion, ensureVisibleConclusion, isAssistantTurnEmpty, isSyntheticVisibleConclusion, normalizeAssistantTurn } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/normalizedTurn.ts"),
 );
+
+test("completion classification keeps protocol-only and true-empty distinct from context errors", () => {
+  assert.equal(classifyAssistantCompletion({ content: "", toolCalls: [], finishReason: "stop" }), "true_empty");
+  assert.equal(classifyAssistantCompletion({ content: "<tool_use></tool_use>", toolCalls: [], finishReason: "stop" }), "protocol_only");
+  assert.equal(classifyAssistantCompletion({ content: "", reasoningContent: "still reasoning", toolCalls: [], finishReason: "stop" }), "reasoning_only");
+  assert.equal(classifyAssistantCompletion({ content: "done", toolCalls: [], finishReason: "stop" }), "content");
+});
 
 test("assistant turn empty guard matches truly empty responses", () => {
   assert.equal(

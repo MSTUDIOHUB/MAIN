@@ -7,7 +7,6 @@ import {
 import {
   logAgentEvent,
 } from "../../orchestrator";
-import { planRuntimePhasePresentation } from "../../orchestrator/planOrchestration";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { OrchestratorCallbacks } from "../types";
@@ -184,28 +183,14 @@ export function createAgentLoopRuntimeActions(input: {
     );
     if (!phaseUpdate.changed) return;
     setPlanRuntimeState(phaseUpdate.state);
-    const presentation = planRuntimePhasePresentation(
-      phase,
-      callbacks.getPreferredLanguage(),
-      reason,
-    );
-    callbacks.onTurnRuntimePhaseChanged?.({
-      id: `plan_${phase}`,
-      kind: presentation.kind,
-      title: presentation.title,
-      summary: presentation.summary,
-      domain: "plan_runtime",
-      status,
-      reason: reason || "",
-      iteration: getIteration(),
-      qualityRejectCount: phaseUpdate.state.planQualityRejectCount,
-    });
     logAgentEvent("plan_runtime_phase_changed", {
       phase,
       reason: reason || "",
       iteration: getIteration(),
       qualityRejectCount: phaseUpdate.state.planQualityRejectCount,
       missingSections: phaseUpdate.state.planLastMissingSections,
+      userVisible: false,
+      status,
     });
   };
 

@@ -11,6 +11,12 @@ import {
   type PlanStage,
 } from "./workflowModels";
 import { extractPrimaryUserRequestText, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
+import {
+  buildPlanCandidate,
+  validatePlanCandidate,
+  type PlanCandidate,
+  type PlanEvidenceBundle,
+} from "./planEvidence";
 
 export type MaterializablePlanKind = "plan" | "design";
 export type PlanMaterializationSource =
@@ -31,6 +37,8 @@ export interface PlanMaterializationResult {
   decisionFork?: PlanDecisionForkAnalysis;
   /** Typed quality outcome used by both persisted and visible-plan recovery. */
   quality?: PlanArtifactQualityResult;
+  evidenceBundleHash?: string;
+  candidate?: PlanCandidate;
 }
 
 export interface PlanMaterializationToolActivityLike {
@@ -1018,8 +1026,12 @@ export function validatePlanEvidenceGrounding(input: {
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
+  evidenceBundle?: PlanEvidenceBundle;
 }): PlanArtifactQualityResult {
-  const readTargets = collectReadEvidenceTargets(input);
+  const readTargets = [
+    ...collectReadEvidenceTargets(input),
+    ...(input.evidenceBundle?.facts.map((fact) => fact.target) || []),
+  ];
   const changeTargets = collectPlanChangeTargets(input.content);
   if (readTargets.length === 0) {
     return classifyPlanArtifactQualityResult({ ok: true });
@@ -1033,9 +1045,15 @@ export function validatePlanEvidenceGrounding(input: {
     readTargets.some((target) => /\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html)$/i.test(target)) &&
     keyChangesBody.split(/\r?\n/).some(isPlanMutationLine);
   if (changeTargets.length === 0) {
-    return hasSourceBackedMutationPlan
-      ? classifyPlanArtifactQualityResult({ ok: false, reason: "missing_grounded_plan_change_target" })
-      : classifyPlanArtifactQualityResult({ ok: true });
+    if (!hasSourceBackedMutationPlan) return classifyPlanArtifactQualityResult({ ok: true });
+    if (input.evidenceBundle) {
+      const candidate = buildPlanCandidate({ content: input.content, bundle: input.evidenceBundle });
+      const groundedCandidateChanges = candidate.changes.length > 0 && candidate.changes.every((change) =>
+        !!change.targetRef && change.evidenceRefs.length > 0
+      );
+      if (groundedCandidateChanges) return classifyPlanArtifactQualityResult({ ok: true });
+    }
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "missing_grounded_plan_change_target" });
   }
 
   const ungroundedTargets = changeTargets.filter((target) =>
@@ -1058,6 +1076,7 @@ export function validateGroundedActionablePlanArtifact(input: {
   evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
+  evidenceBundle?: PlanEvidenceBundle;
 }): PlanArtifactQualityResult {
   const structural = validateActionablePlanArtifact(input.content);
   if (!structural.ok) return structural;
@@ -1279,6 +1298,9 @@ function buildDeterministicChangeLine(input: {
   );
   if (input.language === "en") {
     if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usecsvparser/.test(lowerFile)) {
+      if (/creator\s*(?:field)?[\s\S]{0,80}creatorName|creatorName[\s\S]{0,80}creator/i.test(input.goal)) {
+        return `Update \`${file}\` so the CSV \`creator\` (and existing localized fallback) is assigned to \`creatorName\` while preserving the legacy \`creator\` value. Grounding evidence: ${evidence}.`;
+      }
       return `Fix CSV column-to-order-field mapping in \`${file}\` so Dashboard-required fields such as creator/course/date/status/amount are not dropped. Grounding evidence: ${evidence}.`;
     }
     if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /dashboardstore/.test(lowerFile)) {
@@ -1294,6 +1316,9 @@ function buildDeterministicChangeLine(input: {
   }
 
   if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usecsvparser/.test(lowerFile)) {
+    if (/creator\s*(?:字段)?[\s\S]{0,80}creatorName|creatorName[\s\S]{0,80}creator/i.test(input.goal)) {
+      return `修改 \`${file}\`，把 CSV 的 \`creator\`（及现有中文列名回退值）明确赋给 \`creatorName\`，同时保留旧 \`creator\` 字段以维持兼容。依据证据：${evidence}。`;
+    }
     return `修复 \`${file}\` 的 CSV 列名到订单字段映射，确保 creator、course、date、status、amount 等 Dashboard 所需字段不会在导入时丢失。依据证据：${evidence}。`;
   }
   if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /dashboardstore/.test(lowerFile)) {
@@ -1330,6 +1355,14 @@ function buildCodexStylePlanArtifact(input: {
   const files = (filesWithConcreteEvidence.length > 0 ? filesWithConcreteEvidence : rawFiles).slice(0, 8);
   const constraints = uniqueCompactLines(input.constraints, 5, 200);
   const commands = extractInlineCommands([...evidence, ...constraints]);
+  const deterministicValidationCommand = commands[0] || (() => {
+    if (files.some((file) => /\.rs$/i.test(file))) return "cargo check";
+    if (files.some((file) => /\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(file))) return "npm run build";
+    if (files.some((file) => /\.py$/i.test(file))) return "python -m pytest";
+    if (files.some((file) => /\.go$/i.test(file))) return "go test ./...";
+    if (files.some((file) => /\.cs$/i.test(file))) return "dotnet test";
+    return "";
+  })();
   const hasGroundedEvidence = Boolean(goal) &&
     evidence.length > 0 &&
     meaningfulConcreteEvidence.length > 0 &&
@@ -1355,14 +1388,16 @@ function buildCodexStylePlanArtifact(input: {
       formatCodexPlanSection("Summary", [
         `User goal: ${goal}`,
         `Grounding evidence covers ${scope}.`,
-        evidence[0] ? `Most relevant evidence: ${evidence[0]}.` : "No additional evidence summary is trusted.",
       ]),
+      formatCodexPlanSection("Confirmed Evidence", evidence),
       formatCodexPlanSection("Key Changes", changes),
       formatCodexPlanSection("Public APIs / Interfaces / Types", [
         "No public API, interface, or type change is planned by default; if implementation proves one is required, pause before widening scope.",
       ]),
       formatCodexPlanSection("Test Plan", commands.length > 0
         ? commands.map((command) => `Run \`${command}\` and inspect exit status/output.`)
+        : deterministicValidationCommand
+        ? [`Run \`${deterministicValidationCommand}\` and inspect exit status/output.`]
         : [
             "Run the focused test, build, or browser/desktop validation for the touched subsystem and record the result.",
           ]),
@@ -1389,14 +1424,16 @@ function buildCodexStylePlanArtifact(input: {
     formatCodexPlanSection("摘要", [
       `用户目标：${goal}`,
       `定向证据已覆盖：${scope}。`,
-      evidence[0] ? `最相关证据：${evidence[0]}。` : "暂无可额外信任的证据摘要。",
     ]),
+    formatCodexPlanSection("已确认证据", evidence),
     formatCodexPlanSection("关键改动", changes),
     formatCodexPlanSection("公共 API / 接口 / 类型", [
       "默认不新增或修改公共 API、接口或类型；如果执行中证明必须扩大接口范围，先暂停确认。",
     ]),
     formatCodexPlanSection("测试方案", commands.length > 0
       ? commands.map((command) => `运行 \`${command}\` 并检查退出码与输出。`)
+      : deterministicValidationCommand
+      ? [`运行 \`${deterministicValidationCommand}\` 并检查退出码与输出。`]
       : [
           "运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。",
         ]),
@@ -1792,7 +1829,15 @@ export function materializePlanArtifactFromVisibleText(input: {
   recentToolActivity?: PlanMaterializationToolActivityLike[];
   turnContext?: TurnInputContextLike | null;
   language?: "zh" | "en";
+  evidenceBundle?: PlanEvidenceBundle;
+  expectedEvidenceBundleHash?: string;
 }): PlanMaterializationResult {
+  if (
+    input.expectedEvidenceBundleHash &&
+    input.evidenceBundle?.hash !== input.expectedEvidenceBundleHash
+  ) {
+    return rejectPlanMaterialization({ reason: "evidence_bundle_hash_mismatch" });
+  }
   // Extract reply options BEFORE stripping them, so validation sees clean plan content
   // but we preserve the options for post-validation routing.
   // We use extracted.content directly since extractReplyOptionsFromContent already
@@ -1897,6 +1942,7 @@ export function materializePlanArtifactFromVisibleText(input: {
     evidence: input.evidence,
     evidenceRecords: input.evidenceRecords,
     recentToolActivity: input.recentToolActivity,
+    evidenceBundle: input.evidenceBundle,
   });
   if (!grounding.ok) {
     if (grounding.reason === "missing_plan_evidence_section") {
@@ -1912,6 +1958,7 @@ export function materializePlanArtifactFromVisibleText(input: {
           evidence: input.evidence,
           evidenceRecords: input.evidenceRecords,
           recentToolActivity: input.recentToolActivity,
+          evidenceBundle: input.evidenceBundle,
         });
         if (repairedQuality.ok) {
           content = repaired;
@@ -1941,6 +1988,15 @@ export function materializePlanArtifactFromVisibleText(input: {
     }
   }
 
+  const candidate = input.evidenceBundle
+    ? buildPlanCandidate({ content, bundle: input.evidenceBundle })
+    : undefined;
+  if (candidate) {
+    const candidateFailures = validatePlanCandidate(candidate, input.evidenceBundle!.hash);
+    if (candidateFailures.length > 0) {
+      return rejectPlanMaterialization({ reason: `plan_candidate_invalid:${candidateFailures.join(",")}` });
+    }
+  }
   return {
     ok: true,
     kind,
@@ -1949,6 +2005,8 @@ export function materializePlanArtifactFromVisibleText(input: {
     source,
     replyOptions: extracted.replyOptions,
     decisionFork,
+    ...(input.evidenceBundle ? { evidenceBundleHash: input.evidenceBundle.hash } : {}),
+    ...(candidate ? { candidate } : {}),
   };
 }
 
@@ -2035,6 +2093,7 @@ export function composePlanArtifactFromEvidence(input: {
   files?: string[];
   constraints?: string[];
   language?: "zh" | "en";
+  evidenceBundle?: PlanEvidenceBundle;
 }): string {
   const language = input.language === "en" ? "en" : "zh";
   const sanitized = sanitizePlanEvidenceInput({
@@ -2047,9 +2106,15 @@ export function composePlanArtifactFromEvidence(input: {
   });
   return buildCodexStylePlanArtifact({
     userGoal: sanitized.userGoal || input.userGoal,
-    evidence: sanitized.evidence.map((item) => summarizeEvidenceLine(item, language)),
-    files: sanitized.files,
-    constraints: sanitized.constraints,
+    evidence: input.evidenceBundle
+      ? input.evidenceBundle.facts.map((fact) => `${fact.tool} ${fact.target}: ${fact.summary}`)
+      : sanitized.evidence.map((item) => summarizeEvidenceLine(item, language)),
+    files: input.evidenceBundle?.changeTargets.length
+      ? input.evidenceBundle.changeTargets
+      : sanitized.files,
+    constraints: input.evidenceBundle
+      ? input.evidenceBundle.constraints
+      : sanitized.constraints,
     language,
   });
 }

@@ -66,10 +66,29 @@ const {
   buildPlanMaxIterationsResumePrompt,
   formatPlanExecutionProgressSnapshot,
   isCachedReadOnlyPlanActivity,
+  isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanSameTurnFallbackDecision,
   summarizeRepeatedPlanTargetsFromToolActivity,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
+
+test("plan review awaiting approval is not an active execution lease", () => {
+  assert.equal(isPlanReviewExecutionLeaseActive({
+    agentStatus: "pending_review",
+    isGenerating: false,
+    hasAbortController: true,
+  }), false);
+  assert.equal(isPlanReviewExecutionLeaseActive({
+    agentStatus: "running",
+    isGenerating: true,
+    hasAbortController: true,
+  }), true);
+  assert.equal(isPlanReviewExecutionLeaseActive({
+    agentStatus: "running",
+    isGenerating: false,
+    hasAbortController: true,
+  }), false);
+});
 
 test("approved plan same-turn fallback retries busy once only while the exact transition remains pending", () => {
   const handoff = {
@@ -601,6 +620,15 @@ test("deterministic Plan closure rejects concrete but goal-irrelevant documentat
     target: "orders.csv",
     status: "succeeded",
     detail: "creator,amount",
+  }]), "plan");
+  assert.equal(resolvePlanClosureArtifactKind({
+    ...relevant,
+    userGoal: "为 CSV 分析流程制定架构设计文档。",
+  }, "idle", [{
+    name: "analyze_tabular_document",
+    target: "orders.csv",
+    status: "succeeded",
+    detail: "creator,amount",
   }]), "design");
   assert.equal(resolvePlanClosureArtifactKind({
     ...relevant,
@@ -829,7 +857,8 @@ test("plan no-tool recovery prompts continuation when planning ends with no visi
   assert.equal(result.consecutiveNoToolCount, 1);
   assert.equal(harness.appended.length, 1);
   assert.match(harness.appended[0].content, /当前规划还没有进入可执行阶段/);
-  assert.match(harness.appended[0].content, /\.MAIN\/plans\/plan\.md/);
+  assert.match(harness.appended[0].content, /<proposed_plan>/);
+  assert.match(harness.appended[0].content, /runtime.*物化/);
   assert.equal(harness.statuses.length, 0);
 });
 
@@ -852,7 +881,8 @@ test("rejected plan artifact cannot enter review on the next no-tool iteration",
   assert.equal(result.status, "continue");
   assert.equal(approvalWaitCalls, 0);
   assert.equal(harness.statuses.includes("pending_review"), false);
-  assert.match(harness.appended.at(-1)?.content || "", /reviewable plan/i);
+  assert.match(harness.appended.at(-1)?.content || "", /visible `<proposed_plan>`/i);
+  assert.match(harness.appended.at(-1)?.content || "", /runtime validates and materializes/i);
 });
 
 test("plan closure evidence recovery prompt keeps planning read-only and targeted", () => {

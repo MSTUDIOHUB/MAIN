@@ -6,6 +6,25 @@ function parseTokenCount(value: string): number | null {
 const UNKNOWN_CONTEXT_RETRY_HEADROOM_RATIO = 0.7;
 const MIN_REACTIVE_CONTEXT_LIMIT = 4096;
 
+const EXPLICIT_CONTEXT_ERROR_PATTERNS = [
+  /CONTEXT_LENGTH_EXCEEDED/i,
+  /context_length_exceeded/i,
+  /maximum context length/i,
+  /max(?:imum)? context window/i,
+  /prompt too long/i,
+  /context too (?:large|long)/i,
+  /prefill memory guard/i,
+  /token limit(?: exceeded)?/i,
+  /number of tokens to keep.*context length/i,
+];
+
+export function isExplicitContextWindowError(message: string): boolean {
+  const text = String(message || "");
+  if (!text.trim()) return false;
+  if (/empty completion/i.test(text)) return false;
+  return EXPLICIT_CONTEXT_ERROR_PATTERNS.some((pattern) => pattern.test(text));
+}
+
 export function extractReportedContextWindowLimit(message: string): number | null {
   const text = String(message || "");
   const patterns = [
@@ -31,7 +50,7 @@ export function clampContextLimitToReported(
   const reportedContextLimit = extractReportedContextWindowLimit(errorMessage);
   return {
     contextLimit: reportedContextLimit == null
-      ? Math.min(configuredLimit, 4096)
+      ? configuredLimit
       : Math.min(configuredLimit, reportedContextLimit),
     reportedContextLimit,
   };

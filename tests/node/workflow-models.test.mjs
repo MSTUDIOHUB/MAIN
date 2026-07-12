@@ -18,6 +18,10 @@ function loadPlanEvidenceModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
 }
 
+function loadApprovedPlanExecutionScopeModule() {
+  return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanExecutionScope.ts"));
+}
+
 function loadPlanControlModule() {
   return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planControl.ts"));
 }
@@ -120,6 +124,8 @@ const {
   isPlanEvidenceLedgerTool,
   isPlanExecutionEvidenceTool,
 } = loadPlanEvidenceModule();
+
+const { resolveApprovedPlanMutationScope } = loadApprovedPlanExecutionScopeModule();
 
 const {
   buildPlanApprovalChoiceHint,
@@ -1304,6 +1310,76 @@ test("generic workspace_write and project_change evidence do not complete unrela
   assert.equal(buildPlanTaskEvidenceAudit({ tasks: reconciled }).acceptedCompletion, false);
 });
 
+test("approved mutation task requires the planned identifier in the fresh diff", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 修改 `src/hooks/useCsvParser.ts`，将 `creator` 映射为 `creatorName`，同时保留 legacy `creator` fallback。",
+  );
+  assert.equal(parsed.length, 1);
+  assert.deepEqual(parsed[0].evidence?.[0]?.requiredTerms, ["creatorName"]);
+
+  const unrelatedWrite = createPlanExecutionEvidenceEntry({
+    toolName: "write_file",
+    target: "src/hooks/useCsvParser.ts",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: "return { creator: row.creator };",
+      new: "return { creator: row.creator, status: row.status };",
+      path: "src/hooks/useCsvParser.ts",
+      fullFile: true,
+    },
+  });
+  const plannedWrite = createPlanExecutionEvidenceEntry({
+    toolName: "write_file",
+    target: "src/hooks/useCsvParser.ts",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: "return { creator: row.creator };",
+      new: "return { creatorName: row.creatorName ?? row.creator, creator: row.creator };",
+      path: "src/hooks/useCsvParser.ts",
+      fullFile: true,
+    },
+  });
+
+  const unrelatedAudit = buildPlanTaskEvidenceAudit({
+    tasks: parsed,
+    evidenceLedger: unrelatedWrite ? [unrelatedWrite] : [],
+  });
+  const plannedAudit = buildPlanTaskEvidenceAudit({
+    tasks: parsed,
+    evidenceLedger: plannedWrite ? [plannedWrite] : [],
+  });
+
+  assert.equal(unrelatedAudit.allTrustedComplete, false);
+  assert.equal(plannedAudit.allTrustedComplete, true);
+  assert.equal(plannedWrite?.changedIdentifiers?.includes("creatorName"), true);
+});
+
+test("approved Plan blocks workspace mutations outside the reviewed task targets", () => {
+  const tasks = extractPlanTasks(
+    "- [ ] 修改 `src/hooks/useCsvParser.ts`，将 `creator` 映射为 `creatorName`。",
+  );
+  const allowed = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "write_file",
+    args: { path: "src/hooks/useCsvParser.ts" },
+    target: "src/hooks/useCsvParser.ts",
+    tasks,
+  });
+  const blocked = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "apply_patch",
+    args: { patch: "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-old\n+new\n*** End Patch" },
+    target: "src/App.tsx",
+    tasks,
+  });
+
+  assert.equal(allowed.allowed, true);
+  assert.equal(blocked.allowed, false);
+  assert.deepEqual(blocked.unexpectedTargets, ["src/app.tsx"]);
+});
+
 test("read-only shell commands do not satisfy file evidence", () => {
   const parsed = extractPlanTasks("- [x] 在 Rust 后端新增 GitFileEntry 结构体 — 证据: file:src-tauri/src/lib.rs");
   const readOnlyCommand = createPlanExecutionEvidenceEntry({
@@ -1451,6 +1527,54 @@ test("Tauri runtime validation pauses as user/external validation instead of cur
   assert.equal(audit.pendingExternalValidation, true);
   assert.equal(audit.remainingTasks.length, 0);
   assert.equal(audit.pendingUserValidationTasks.length, 1);
+});
+
+test("focused test or build alternatives accept fresh command evidence without becoming Tauri-only", () => {
+  const parsed = extractPlanTasks("- [x] 运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。");
+  const commandEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm test -- --passWithNoTests",
+    result: JSON.stringify({ exitCode: 0, stdout: "tests passed" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, commandEvidence ? [commandEvidence] : []);
+
+  assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
+  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+  assert.equal(isPlanTaskAwaitingExternalValidation(reconciled[0]), false);
+});
+
+test("test build or manual alternatives stay automatable when command validation is available", () => {
+  const parsed = extractPlanTasks("- [x] 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。");
+  const commandEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npx tsc --noEmit",
+    result: JSON.stringify({ exitCode: 0, stdout: "typecheck passed" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, commandEvidence ? [commandEvidence] : []);
+
+  assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
+  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+});
+
+test("runtime task evidence does not classify dotted code properties as files", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: [
+      "# Plan",
+      "## Key Changes",
+      "- Fix `src/hooks/useCsvParser.ts` so `row.creator` is assigned to creatorName.",
+      "## Test Plan",
+      "- Run `npm test`.",
+    ].join("\n"),
+    updatedAt: Date.now(),
+  }], { language: "en" });
+
+  const fileEvidence = tasks.flatMap((task) => task.evidence || []).filter((entry) => entry.kind === "file");
+  assert.deepEqual(fileEvidence.map((entry) => entry.value), ["src/hooks/useCsvParser.ts"]);
 });
 
 test("browser validation capability detection is tool-name based and provider neutral", () => {
@@ -1752,7 +1876,7 @@ test("validateActionablePlanArtifact rejects user-visible decision forks even wi
   assert.equal(result.reason, "user_visible_decision_fork_without_options");
 });
 
-test("validateActionablePlanArtifact rejects startup UX forks even when plan recommends one option", () => {
+test("validateActionablePlanArtifact accepts a startup UX default when no user decision is explicitly required", () => {
   const plan = [
     "# 计划：修复双击 .md 文件打开时出现空白窗口的问题",
     "",
@@ -1796,11 +1920,10 @@ test("validateActionablePlanArtifact rejects startup UX forks even when plan rec
   const fork = analyzePlanDecisionFork(plan);
   const result = validateActionablePlanArtifact(plan);
 
-  assert.equal(fork.classification, "blocking");
-  assert.equal(fork.requiresUserOptions, true);
-  assert.equal(fork.userVisibleDecision, true);
-  assert.equal(result.ok, false);
-  assert.equal(result.reason, "user_visible_decision_fork_without_options");
+  assert.equal(fork.classification, "defaultable");
+  assert.equal(fork.requiresUserOptions, false);
+  assert.equal(fork.userVisibleDecision, false);
+  assert.equal(result.ok, true);
 });
 
 test("validateActionablePlanArtifact allows defaulted internal implementation forks", () => {

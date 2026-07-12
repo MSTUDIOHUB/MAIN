@@ -211,8 +211,8 @@ export async function handleEmptyResponseRecovery(input: {
     callbacks.appendMessage({
       role: "user",
       content: callbacks.getPreferredLanguage() === "zh"
-        ? "上一条 Plan 回复是空的。请立即继续生成可审批的正式计划：复杂实现和修复类请求默认用 write_file 或 replace_in_file 创建/更新 `.MAIN/plans/plan.md`；如果信息不足，只能用 `<user_options>` 给出关键选择。不要只返回空消息、隐藏 thinking/analysis，或伪工具占位。"
-        : "The previous Plan reply was empty. Continue now with a reviewable plan: complex implementation and fix plans should use write_file or replace_in_file to create/update `.MAIN/plans/plan.md`; if information is insufficient, offer key choices with `<user_options>`. Do not return an empty message, hidden thinking/analysis only, or pseudo-tool placeholders.",
+        ? "上一条 Plan 回复为空或只有协议内容。请在相同上下文和证据包上重试一次，直接输出可审批 `<proposed_plan>`；计划文件由 MAIN runtime 物化。如果只有真实阻塞选择才使用 `<user_options>`。不要返回隐藏 thinking/analysis 或伪工具占位。"
+        : "The previous Plan reply was empty or protocol-only. Retry once with the same context and evidence bundle, and output a reviewable `<proposed_plan>`; MAIN runtime owns materialization. Use `<user_options>` only for a real blocking choice. Do not return hidden reasoning or pseudo-tool placeholders.",
     });
     return finish("continue");
   }

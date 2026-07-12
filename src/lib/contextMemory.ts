@@ -1,5 +1,6 @@
 import { looksLikeSyntheticContinuationText } from "./syntheticContinuation";
 import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
+import { extractPrimaryUserRequestText } from "./turnIntake";
 
 export type ContextMemoryRole = "system" | "user" | "assistant" | "tool";
 
@@ -131,6 +132,9 @@ function isSyntheticDurableEntryText(text: string): boolean {
   if (isBareContextMemorySection(compacted)) return true;
   const stripped = stripContextMemoryLabel(compacted);
   if (!stripped) return true;
+  if (/\[\/?turn_intake\]|^workflowMode\s*:|^imageParts\s*:|^mentionedFiles\s*:|^attachedFiles\s*:|^priority\s*:/i.test(stripped)) {
+    return true;
+  }
   return looksLikeSyntheticContinuationText(stripped || compacted);
 }
 
@@ -606,13 +610,16 @@ export function buildContextMemoryState(
 
     const source = sourceFor(message, index, options.turnId ? { turnId: options.turnId } : {});
     if (message.role === "user") {
-      if (looksLikeSyntheticContinuationText(text)) continue;
-      const request = entry(text, source, updatedAt);
+      const canonicalUserText = /\[turn_intake\]/i.test(text)
+        ? extractPrimaryUserRequestText(text)
+        : text;
+      if (looksLikeSyntheticContinuationText(canonicalUserText)) continue;
+      const request = entry(canonicalUserText, source, updatedAt);
       if (request) {
         collected.latestUserRequest = request;
         pushEntry(collected.goals, request);
       }
-      for (const sentence of splitSentences(text)) {
+      for (const sentence of splitSentences(canonicalUserText)) {
         if (matchesConstraint(sentence)) pushEntry(collected.constraints, entry(sentence, source, updatedAt));
         if (matchesDecision(sentence)) pushEntry(collected.decisions, entry(sentence, source, updatedAt));
         if (matchesNextStep(sentence)) pushEntry(collected.nextSteps, entry(sentence, source, updatedAt));

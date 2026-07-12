@@ -290,6 +290,75 @@ test("tool result post-processing tracks plan read-only batches for convergence"
   assert.deepEqual([...harness.taskTargetingEvidence], ["path:src/App.tsx"]);
 });
 
+test("tool result post-processing freezes a semantic evidence bundle before repeat guards", () => {
+  const harness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "explore_structure",
+    results: [result({
+      toolCallId: "impact_1",
+      name: "repo_map_impact",
+      target: "src/hooks/useCsvParser.ts",
+      content: "normalizeCsvOrder never assigns creatorName although Dashboard consumes that field",
+    })],
+    toolArgsByCallId: new Map([["impact_1", { path: "src/hooks/useCsvParser.ts" }]]),
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  harness.input.callbacks = {
+    ...harness.input.callbacks,
+    getMessages: () => [{
+      role: "user",
+      content: "Fix creatorName mapping in src/hooks/useCsvParser.ts and prepare a plan.",
+    }],
+    getCurrentTurnId: () => "turn-plan-1",
+    getContextMemoryState: () => null,
+  };
+
+  const post = handleToolResultPostProcessing(harness.input);
+
+  assert.equal(post.planRuntimePhase, "drafting");
+  assert.deepEqual(harness.planRuntimePhases, [{
+    phase: "drafting",
+    reason: "semantic evidence bundle ready",
+    status: "running",
+  }]);
+});
+
+test("a targeted read leaves structure exploration even before semantic evidence is ready", () => {
+  const harness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "explore_structure",
+    results: [result({
+      toolCallId: "read_weak",
+      name: "read_file",
+      target: "src/App.tsx",
+      content: "READ_FILE_RESULT path: src/App.tsx",
+    })],
+    toolArgsByCallId: new Map([["read_weak", { path: "src/App.tsx" }]]),
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  harness.input.callbacks = {
+    ...harness.input.callbacks,
+    getMessages: () => [{ role: "user", content: "Prepare a focused plan." }],
+    getCurrentTurnId: () => "turn-plan-weak",
+    getContextMemoryState: () => null,
+  };
+
+  const post = handleToolResultPostProcessing(harness.input);
+
+  assert.equal(post.planRuntimePhase, "grounding");
+  assert.deepEqual(harness.planRuntimePhases, [{
+    phase: "grounding",
+    reason: "targeted evidence read completed",
+    status: "running",
+  }]);
+});
+
 test("failed command validation does not become execution evidence or clear recovery", () => {
   const harness = createPostProcessingInput({
     results: [result({

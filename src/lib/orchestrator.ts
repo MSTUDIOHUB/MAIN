@@ -33,7 +33,7 @@ import {
   type MCPServer,
   type MCPTool,
 } from "./mcpClient";
-import { getFileMetadata, shellPermissionPreflight } from "./ipc";
+import { getFileMetadata, shellPermissionPreflight, writeFileAtomic } from "./ipc";
 import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import { parseApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
@@ -61,7 +61,6 @@ import {
 } from "./orchestrator/unityDiagnostics";
 import {
   buildPlanRecoveryPromptFromContext,
-  hasGroundedPlanClosureEvidence,
   resolvePlanClosureArtifactKind,
 } from "./orchestrator/planOrchestration";
 
@@ -187,6 +186,11 @@ import {
   type PlanEvidenceRecord,
   type PlanMaterializationSource,
 } from "./planMaterialization";
+import {
+  buildPlanEvidenceBundle,
+  isPlanEvidenceBundleReady,
+  type PlanEvidenceBundle,
+} from "./planEvidence";
 import { formatToolPresentation } from "./toolPresentation";
 import {
   buildPlanReadOnlyProgressNarration,
@@ -1963,7 +1967,7 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
       "The user already allowed read-only inspection for this session, but the previous turn still did not make useful tool progress.",
       "Do not ask for permission again and do not narrate a future read.",
       workflowMode === "plan"
-        ? "If the evidence is sufficient, create or update `.MAIN/plans/plan.md` with write_file or replace_in_file; if one fact is still missing, call exactly one targeted read/search tool now. If the target was already cached, reuse the existing content instead of rereading it."
+        ? "If the evidence is sufficient, output visible `<proposed_plan>` for MAIN runtime to materialize; if one fact is still missing, call exactly one targeted read/search tool now. Reuse cached content instead of rereading it."
         : "If you need evidence, call one targeted read/search tool now. If the target was already cached, reuse the existing content and move to the next real action: patch/write, run a finite command, browser validation, or state the exact blocker.",
     ].join("\n");
   }
@@ -1971,7 +1975,7 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
     "用户已经允许本会话的只读检查，但上一轮仍没有产生有效工具进展。",
     "不要再次询问许可，也不要只描述接下来要读取什么。",
     workflowMode === "plan"
-      ? "如果证据已经足够，直接用 write_file 或 replace_in_file 创建/更新 `.MAIN/plans/plan.md`；如果只缺一个事实，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，不要重复读取。"
+      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交由 MAIN runtime 物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，不要重复读取。"
       : "如果还需要证据，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，并进入下一个真实动作：写入/替换、运行有限命令、浏览器验证，或说明精确阻塞。",
   ].join("\n");
 }
@@ -2362,6 +2366,7 @@ export function collectPlanClosureMaterializationInput(
   constraints: string[];
   sanitizer: ReturnType<typeof sanitizePlanEvidenceInput>["stats"];
   sanitizerDropped: ReturnType<typeof sanitizePlanEvidenceInput>["dropped"];
+  evidenceBundle: PlanEvidenceBundle;
 } {
   const memory = callbacks.getContextMemoryState?.() || null;
   const userGoal =
@@ -2416,6 +2421,13 @@ export function collectPlanClosureMaterializationInput(
     maxFiles: 14,
     maxConstraints: 8,
   });
+  const evidenceBundle = buildPlanEvidenceBundle({
+    turnId: callbacks.getCurrentTurnId?.() || null,
+    objective: sanitized.userGoal,
+    constraints: sanitized.constraints,
+    evidenceRecords,
+    files: sanitized.files,
+  });
 
   return {
     userGoal: sanitized.userGoal,
@@ -2425,6 +2437,7 @@ export function collectPlanClosureMaterializationInput(
     constraints: sanitized.constraints,
     sanitizer: sanitized.stats,
     sanitizerDropped: sanitized.dropped,
+    evidenceBundle,
   };
 }
 
@@ -3255,8 +3268,38 @@ async function writeMaterializedPlanArtifact(input: {
   input.callbacks.onToolExecuting("write_file", materialized.path, undefined, { toolCallId });
 
   try {
-    const rawResult = await executeTool("write_file", args, input.workspace, input.callbacks.getSessionKey());
-    const resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+    let resultStr = "Plan artifact written atomically and verified.";
+    try {
+      await writeFileAtomic(materialized.path, materialized.content, input.workspace);
+      const readBack = await executeTool(
+        "read_file",
+        { path: materialized.path, __raw: true },
+        input.workspace,
+        input.callbacks.getSessionKey(),
+      );
+      if (String(readBack ?? "") !== materialized.content) {
+        throw new Error("Atomic plan artifact read-back did not match the validated candidate.");
+      }
+    } catch (atomicError) {
+      // Browser E2E adapters and older desktop bridges may not expose the
+      // atomic IPC yet. Preserve compatibility, but still require exact
+      // read-back before publishing the artifact or review request.
+      logAgentEvent("plan_artifact_atomic_write_fallback", {
+        path: materialized.path,
+        reason: getErrorMessage(atomicError, "atomic bridge unavailable"),
+      });
+      const rawResult = await executeTool("write_file", args, input.workspace, input.callbacks.getSessionKey());
+      resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+      const fallbackReadBack = await executeTool(
+        "read_file",
+        { path: materialized.path, __raw: true },
+        input.workspace,
+        input.callbacks.getSessionKey(),
+      );
+      if (String(fallbackReadBack ?? "") !== materialized.content) {
+        throw new Error("Plan artifact fallback write read-back did not match the validated candidate.");
+      }
+    }
     await syncPlanArtifactAfterToolSuccess(
       "write_file",
       args,
@@ -3383,11 +3426,11 @@ export function buildToolActionNarration(input: {
       phase: "summarizing",
       title: input.language === "zh" ? "整理可审批方案" : "Draft reviewable plan",
       why: input.language === "zh"
-        ? "计划审批前只持久化方案，不提前修改源码。"
-        : "Before approval, persist the plan without editing source files.",
+        ? "计划审批前只校验候选方案，不提前修改源码。"
+        : "Before approval, validate the plan candidate without editing source files.",
       action: input.language === "zh"
-        ? "正在写入或更新 `.MAIN/plans/plan.md` 草案。"
-        : "Writing or updating the `.MAIN/plans/plan.md` draft.",
+        ? "正在把候选方案交给 runtime 校验和物化。"
+        : "Passing the plan candidate to runtime validation and materialization.",
       evidence: "",
       next: "",
       targets: presentations.map((item) => item.presentation.target).filter(Boolean),
@@ -3490,11 +3533,11 @@ export function appendPlanRepeatReadLimitGuidance(
 ): string {
   const guidance = language === "zh"
     ? stage === "requirements"
-      ? "PLAN_REPEAT_READ_LIMIT: 你正在计划阶段重复读取已经缓存且未变化的上下文。请停止重复读取，直接基于 requirements.md 和已有文件上下文写入 `.MAIN/plans/plan.md`；如果设计方向不明确，用 `<user_options>` 提供用户可点击选择并立刻停止。"
-      : "PLAN_REPEAT_READ_LIMIT: 你正在重复读取已经缓存且未变化的上下文。请停止重复读取，转向创建/更新 `.MAIN/plans/plan.md`，或用 `<user_options>` 询问关键分叉。"
+      ? "PLAN_REPEAT_READ_LIMIT: 你正在计划阶段重复读取已经缓存且未变化的上下文。请停止重复读取，直接基于 requirements.md 和已有文件上下文输出可见 `<proposed_plan>`；如果存在真正由用户决定的阻塞分叉，再用 `<user_options>` 提问并立刻停止。"
+      : "PLAN_REPEAT_READ_LIMIT: 你正在重复读取已经缓存且未变化的上下文。请停止重复读取，输出可见 `<proposed_plan>`；只有真正阻塞的用户决策才能使用 `<user_options>`。"
     : stage === "requirements"
-    ? "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads during planning. Stop rereading files and write `.MAIN/plans/plan.md` from requirements.md and existing context; if the plan direction is unclear, offer `<user_options>` and stop."
-    : "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads. Stop rereading and create/update `.MAIN/plans/plan.md`, or offer `<user_options>` for the key decision.";
+    ? "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads during planning. Stop rereading files and output visible `<proposed_plan>` from requirements.md and existing context; use `<user_options>` only for a genuinely blocking user-owned decision."
+    : "PLAN_REPEAT_READ_LIMIT: You are repeating cached unchanged reads. Stop rereading and output visible `<proposed_plan>`; use `<user_options>` only for a genuinely blocking user-owned decision.";
   return `${content}\n\n${guidance}`;
 }
 
@@ -4129,25 +4172,25 @@ async function executeToolCallWithLifecycle(
 
         const language = callbacks.getPreferredLanguage();
         const recoveryHintZh = recoveryAction === "targeted_evidence"
-          ? "这属于证据缺口；runtime 会重新开放一次受限只读补证。下一步只读取一个最相关证据，随后必须回到 plan.md。"
+          ? "这属于证据缺口；runtime 会重新开放一次受限只读补证。下一步只读取一个最相关证据，随后必须输出新的可见计划候选。"
           : recoveryAction === "auto_scaffold"
-          ? "这属于低质量草稿；runtime 会给出最小计划脚手架，请按脚手架重写 plan.md。"
-          : "这属于结构重写问题；不要继续读文件，直接补齐缺失章节并重写 plan.md。";
+          ? "这属于低质量草稿；runtime 会给出最小计划脚手架，请按脚手架输出新的可见计划候选。"
+          : "这属于结构重写问题；不要继续读文件，直接补齐缺失章节并输出新的可见计划候选。";
         const recoveryHintEn = recoveryAction === "targeted_evidence"
-          ? "This is an evidence gap; runtime will reopen one limited read-only recovery pass. Read exactly one relevant evidence target, then return to plan.md."
+          ? "This is an evidence gap; runtime will reopen one limited read-only recovery pass. Read exactly one relevant evidence target, then output a new visible plan candidate."
           : recoveryAction === "auto_scaffold"
-          ? "This is a low-quality draft; runtime will provide a minimal plan scaffold. Rewrite plan.md from that scaffold."
-          : "This is a structural rewrite issue; do not read more files, add the missing sections and rewrite plan.md.";
+          ? "This is a low-quality draft; runtime will provide a minimal plan scaffold. Output a new visible plan candidate from that scaffold."
+          : "This is a structural rewrite issue; do not read more files, add the missing sections and output a new visible plan candidate.";
         const missingHint = missingSections.length > 0
           ? ` missingSections=${missingSections.join(",")};`
           : "";
 
         const feedbackMessage = language === "zh"
           ? shouldUseInternalFeedback
-            ? `[WARNING] ${path} 已成功写入并保存到磁盘。但是，当前内容未达到 Codex App 式可审批 plan.md 的完美质量要求（原因：${validation.reason || "质量不足"}；recovery=${recoveryAction};${missingHint}）。不要把猜测或调试日志建议写成计划；请在下一步中增量编辑 plan.md 补齐缺失章节，并确保每个改动有具体依据。${recoveryHintZh}`
+            ? `[WARNING] 检测到模型直接写入的计划候选 ${path}，但当前内容未达到可审批质量（原因：${validation.reason || "质量不足"}；recovery=${recoveryAction};${missingHint}）。不要继续直接写计划文件；请输出可见 \`<proposed_plan>\` 补齐缺失章节，并确保每个改动有具体依据。${recoveryHintZh}`
             : `[WARNING] ${path} 已成功写入并保存到磁盘。但是，其内容不像可审批的正式计划（原因：${validation.reason || "质量不足"}）。`
           : shouldUseInternalFeedback
-          ? `[WARNING] ${path} has been successfully written and saved to disk. However, the content does not yet meet the Codex app-style reviewable plan.md requirements (${validation.reason || "quality gate"}; recovery=${recoveryAction};${missingHint}). Do not turn guesses or debug-log advice into the plan; please incrementally edit plan.md in the next step to add the missing sections and ground each change in concrete evidence. ${recoveryHintEn}`
+          ? `[WARNING] A model-authored plan file candidate was detected at ${path}, but it does not meet reviewable quality (${validation.reason || "quality gate"}; recovery=${recoveryAction};${missingHint}). Do not keep writing the plan file directly; output a visible \`<proposed_plan>\` with the missing sections and concrete evidence. ${recoveryHintEn}`
           : `[WARNING] ${path} has been successfully written and saved to disk. However, the content does not look like a reviewable plan artifact (${validation.reason || "quality gate"}).`;
 
         finalContent = `${modelContent}\n\n${feedbackMessage}`;
@@ -4282,6 +4325,8 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
     recentToolActivity: input.recentToolActivity,
     turnContext: input.turnContext,
     language: input.callbacks.getPreferredLanguage(),
+    evidenceBundle: closureInput.evidenceBundle,
+    expectedEvidenceBundleHash: closureInput.evidenceBundle.hash,
   });
 
   if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
@@ -4289,6 +4334,10 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
       reason: materialized.reason || "quality_gate",
       replyOptions: materialized.replyOptions?.length || 0,
       decisionFork: materialized.decisionFork || null,
+      evidenceBundleId: closureInput.evidenceBundle.bundleId,
+      evidenceBundleHash: closureInput.evidenceBundle.hash,
+      semanticFacts: closureInput.evidenceBundle.facts.length,
+      changeTargets: closureInput.evidenceBundle.changeTargets.length,
     });
     return {
       ok: false,
@@ -4327,10 +4376,7 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     input.attemptedTargets || [],
     input.userGoal || "",
   );
-  if (!hasGroundedPlanClosureEvidence(
-    closureInput,
-    input.recentToolActivity || [],
-  )) {
+  if (!isPlanEvidenceBundleReady(closureInput.evidenceBundle)) {
     logAgentEvent("plan_evidence_materialization_rejected", {
       reason: "insufficient_relevant_plan_evidence",
       evidenceCount: closureInput.evidence.length,
@@ -4338,6 +4384,10 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
       fileCount: closureInput.files.length,
       sanitizerDropped: closureInput.sanitizer.dropped,
       sanitizerDropReasons: closureInput.sanitizer.dropReasons,
+      evidenceBundleId: closureInput.evidenceBundle.bundleId,
+      evidenceBundleHash: closureInput.evidenceBundle.hash,
+      semanticFacts: closureInput.evidenceBundle.facts.length,
+      changeTargets: closureInput.evidenceBundle.changeTargets.length,
     });
     return {
       ok: false,
@@ -4349,20 +4399,6 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     input.callbacks.getPlanStage(),
     input.recentToolActivity || [],
   );
-  if (closureKind !== "plan") {
-    logAgentEvent("plan_evidence_materialization_rejected", {
-      reason: "deterministic_design_materialization_not_supported",
-      closureKind,
-      planStage: input.callbacks.getPlanStage(),
-      evidenceCount: closureInput.evidence.length,
-      structuredEvidenceCount: closureInput.evidenceRecords.length,
-      fileCount: closureInput.files.length,
-    });
-    return {
-      ok: false,
-      reason: "deterministic_design_materialization_not_supported",
-    };
-  }
   const content = composePlanArtifactFromEvidence({
     userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
     evidence: closureInput.evidence,
@@ -4370,11 +4406,12 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     files: closureInput.files,
     constraints: closureInput.constraints,
     language: input.callbacks.getPreferredLanguage(),
+    evidenceBundle: closureInput.evidenceBundle,
   });
   const materialized = materializePlanArtifactFromVisibleText({
     visibleText: content,
     planStage: input.callbacks.getPlanStage(),
-    preferredKind: "plan",
+    preferredKind: closureKind,
     sourceHint: "deterministic_evidence",
     userGoal: closureInput.userGoal || getOriginalUserPromptForPlanFallback(input.callbacks),
     evidence: closureInput.evidence,
@@ -4383,6 +4420,8 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     recentToolActivity: input.recentToolActivity,
     turnContext: input.turnContext,
     language: input.callbacks.getPreferredLanguage(),
+    evidenceBundle: closureInput.evidenceBundle,
+    expectedEvidenceBundleHash: closureInput.evidenceBundle.hash,
   });
 
   if (!materialized.ok || !materialized.path || !materialized.content || !materialized.kind) {
@@ -4393,6 +4432,10 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
       fileCount: closureInput.files.length,
       sanitizerDropped: closureInput.sanitizer.dropped,
       sanitizerDropReasons: closureInput.sanitizer.dropReasons,
+      evidenceBundleId: closureInput.evidenceBundle.bundleId,
+      evidenceBundleHash: closureInput.evidenceBundle.hash,
+      semanticFacts: closureInput.evidenceBundle.facts.length,
+      changeTargets: closureInput.evidenceBundle.changeTargets.length,
     });
     return {
       ok: false,
@@ -4403,10 +4446,13 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
 
   logAgentEvent("plan_evidence_materialization_ready", {
     path: materialized.path,
+    kind: materialized.kind,
     source: materialized.source || "deterministic_evidence",
     evidenceCount: closureInput.evidence.length,
     structuredEvidenceCount: closureInput.evidenceRecords.length,
     fileCount: closureInput.files.length,
+    evidenceBundleId: closureInput.evidenceBundle.bundleId,
+    evidenceBundleHash: closureInput.evidenceBundle.hash,
   });
   return writeMaterializedPlanArtifact({
     materialized,
@@ -4519,15 +4565,15 @@ export function buildPlanGateBlockedResult(
   const language = callbacks.getPreferredLanguage();
   const message = language === "zh"
     ? reason === "pre_approval_tasks"
-      ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先完成 plan.md 草稿并等待用户批准。"
+      ? "PLAN 阶段尚未批准，不能提前生成 `.MAIN/plans/tasks.md`。请先输出可见 `<proposed_plan>`，由 runtime 物化 plan.md 并等待用户批准。"
       : reason === "missing_tasks_before_source"
       ? "计划已批准，但还没有可执行的任务清单。请先从 plan.md 派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再按任务修改源码或交付文档。"
-      : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请先用 write_file 或 replace_in_file 写入可审批的 `.MAIN/plans/plan.md`；必要时可用 `.MAIN/plans/design.md` 记录证据归因。"
+      : "PLAN 阶段尚未批准，不能修改源码或项目交付文件。请输出可见 `<proposed_plan>`，由 MAIN runtime 校验并物化 `.MAIN/plans/plan.md`。"
     : reason === "pre_approval_tasks"
-    ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Create a plan.md draft and wait for approval first."
+    ? "PLAN mode is not approved yet, so `.MAIN/plans/tasks.md` must not be generated. Output visible `<proposed_plan>` for runtime materialization and wait for approval."
     : reason === "missing_tasks_before_source"
     ? "The plan is approved, but there is no executable task list yet. First derive a runtime task list from plan.md; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs before editing source or final deliverables."
-    : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. First use write_file or replace_in_file to write a reviewable `.MAIN/plans/plan.md`; use `.MAIN/plans/design.md` only when evidence tradeoffs need a short ledger.";
+    : "PLAN mode is not approved yet, so source or deliverable files cannot be modified. Output visible `<proposed_plan>` for MAIN runtime to validate and materialize as `.MAIN/plans/plan.md`.";
 
   callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
   callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });

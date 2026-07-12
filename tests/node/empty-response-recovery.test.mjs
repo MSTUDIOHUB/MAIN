@@ -143,7 +143,8 @@ test("first unapproved plan empty response appends placeholder and plan continua
   assert.equal(result.consecutiveEmptyResponseCount, 1);
   assert.equal(events.filter((event) => event.type === "append").length, 2);
   assert.equal(events[0].message.content, "...");
-  assert.match(events[1].message.content, /reviewable plan/);
+  assert.match(events[1].message.content, /reviewable `<proposed_plan>`/);
+  assert.match(events[1].message.content, /runtime owns materialization/);
 });
 
 test("second unapproved plan empty response attempts closure guard before stopping", async () => {

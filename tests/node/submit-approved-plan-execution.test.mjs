@@ -60,6 +60,11 @@ const {
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitApprovedPlanExecution.ts"),
 );
+const {
+  collectRuntimeTaskCandidateLines,
+  inferPlanTaskEvidence,
+  isRuntimeTaskActionableText,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
 
 function task(overrides = {}) {
   return {
@@ -267,7 +272,7 @@ test("approval readiness accepts a semantically valid mutation plan with concret
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true);
+  assert.equal(readiness.ok, true, JSON.stringify(readiness));
   assert.equal(readiness.stopClass, null);
   assert.equal(readiness.mutationOriented, true);
   assert.equal(readiness.requiresExecutableValidation, true);
@@ -298,6 +303,93 @@ test("approval readiness recognizes a mutation verb after a concrete file target
 
   assert.equal(readiness.ok, true, readiness.reason);
   assert.equal(readiness.concreteMutationTaskCount, 1);
+});
+
+test("approval task projection preserves long grounded PlanCandidate changes", () => {
+  const longChange = [
+    "修复 `src/hooks/useCsvParser.ts`，在 normalizeCsvOrder 中保留现有 creator 映射并同步赋值 creatorName，",
+    "使 Dashboard、图表聚合和 Order 接口读取同一规范字段；继续兼容中文创建者列，避免旧 CSV 导入行为回退，",
+    "并以已经读取的 useCsvParser、Order 类型与 dashboardStore 证据作为实现边界。",
+    "同时不改动图表组件、状态仓库或公开数据模型，只在解析边界完成字段规范化，并确保空值与旧字段 fallback 顺序保持稳定。",
+  ].join("");
+  assert.ok(longChange.length > 220);
+  const artifact = reviewablePlanArtifact([
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复 CSV creator 到 creatorName 的映射。",
+    "",
+    "## 已确认证据",
+    "- `src/hooks/useCsvParser.ts` 当前只赋值 creator。",
+    "",
+    "## 关键改动",
+    `- ${longChange}`,
+    "",
+    "## 公共 API 与类型",
+    "- 不改变公共接口。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm test` 验证映射。",
+    "",
+    "## 假设与默认值",
+    "- 保持 creator 向后兼容。",
+  ].join("\n"));
+  const state = baseState({ planArtifacts: [artifact], isPlanApproved: false });
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts")
+  ));
+  assert.equal(readiness.ok, true, JSON.stringify(readiness));
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+});
+
+test("approval task projection keeps the real OMLX deterministic evidence change", () => {
+  const artifact = reviewablePlanArtifact([
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 用户目标：请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。",
+    "- 定向证据已覆盖：`src/hooks/useCsvParser.ts`。",
+    "",
+    "## 已确认证据",
+    "- read file src/hooks/useCsvParser.ts: L1: export interface CsvOrder L2: creator?: string; L6: export function normalizeCsvOrder(row: Record<string, string ): CsvOrder L7: return L8: creator: row.creator || row '创建者' || ''...",
+    "- read file src/types/order.ts: L1: export interface Order creatorName: string; amount: number; status?: string;",
+    "- read file src/store/dashboardStore.ts: L1: export const creatorField = 'creatorName';",
+    "",
+    "## 关键改动",
+    "- 修复 `src/hooks/useCsvParser.ts` 的 CSV 列名到订单字段映射，确保 creator、course、date、status、amount 等 Dashboard 所需字段不会在导入时丢失。依据证据：read file src/hooks/useCsvParser.ts: L1: export interface CsvOrder L2: creator?: string; L6: export function normalizeCsvOrder(row: Record<string, string ): CsvOrder L7: return L8: creator: row.creator || row '创建者' || ''...。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 默认不新增或修改公共 API、接口或类型；如果执行中证明必须扩大接口范围，先暂停确认。",
+    "",
+    "## 测试方案",
+    "- 运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。",
+    "",
+    "## 假设与默认值",
+    "- 默认实施满足已批准目标的最小变更。",
+  ].join("\n"));
+  const state = baseState({ planArtifacts: [artifact], isPlanApproved: false });
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({
+    readiness,
+    executionPlanTasks,
+    candidates: collectRuntimeTaskCandidateLines(artifact.content),
+    directEvidence: inferPlanTaskEvidence("修复 `src/hooks/useCsvParser.ts` 的 CSV 列名到订单字段映射，确保 creatorName 正确赋值。"),
+    actionable: isRuntimeTaskActionableText("修复 `src/hooks/useCsvParser.ts` 的 CSV 列名到订单字段映射，确保 creator、course、date、status、amount 等 Dashboard 所需字段不会在导入时丢失。依据证据：read file src/hooks/useCsvParser.ts: L1: export interface CsvOrder L2: creator?: string; L6: export function normalizeCsvOrder(row: Record<string, string ): CsvOrder L7: return L8: creator: row.creator || row '创建者' || ''...。"),
+  }));
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts")
+  ));
 });
 
 test("approval readiness preserves the native contract for a design-only review artifact", () => {

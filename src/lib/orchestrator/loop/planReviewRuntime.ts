@@ -183,7 +183,7 @@ export function createPlanReviewRuntimeHandlers(input: {
       attemptedPlanWriteTargets,
       latestUserPromptText,
     );
-    const evidenceCount = closureInput.evidence.length;
+    const evidenceCount = closureInput.evidenceBundle.facts.length;
     const currentStage = callbacks.getPlanStage();
     const hasReviewablePlanArtifacts = isReviewablePlanStage(currentStage);
     const closureKind = resolvePlanClosureArtifactKind(
@@ -218,6 +218,9 @@ export function createPlanReviewRuntimeHandlers(input: {
       iteration: getIteration(),
       evidenceCount,
       structuredEvidenceCount: closureInput.evidenceRecords.length,
+      evidenceBundleId: closureInput.evidenceBundle.bundleId,
+      evidenceBundleHash: closureInput.evidenceBundle.hash,
+      changeTargets: closureInput.evidenceBundle.changeTargets.length,
       fileCount: closureInput.files.length,
       constraintCount: closureInput.constraints.length,
       targetPath,
@@ -238,6 +241,8 @@ export function createPlanReviewRuntimeHandlers(input: {
         iteration: getIteration(),
         evidenceCount,
         structuredEvidenceCount: closureInput.evidenceRecords.length,
+        evidenceBundleId: closureInput.evidenceBundle.bundleId,
+        evidenceBundleHash: closureInput.evidenceBundle.hash,
         fileCount: closureInput.files.length,
         targetPath,
       });

@@ -148,6 +148,8 @@ test("Chinese find-and-fix requests build an execution evidence contract", () =>
 
   assert.equal(contract.runtimeIntent, "execute");
   assert.equal(contract.approvalState, "needs_approval");
+  assert.equal(contract.operationApprovalState, "needs_approval");
+  assert.equal(contract.planReviewState, "not_ready");
   assert.equal(contract.allowedToolRisks, "write");
   assert.equal(contract.mutationExpected, true);
   assert.equal(contract.validationExpected, true);
@@ -170,6 +172,8 @@ test("approved plan conversation becomes execute runtime for completion evidence
   assert.equal(contract.conversationIntent, "plan");
   assert.equal(contract.runtimeIntent, "execute");
   assert.equal(contract.approvalState, "approved");
+  assert.equal(contract.operationApprovalState, "approved");
+  assert.equal(contract.planReviewState, "approved");
   assert.equal(contract.allowedToolRisks, "write");
   assert.equal(contract.mutationExpected, true);
   assert.equal(contract.validationExpected, true);

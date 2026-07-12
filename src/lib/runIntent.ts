@@ -22,6 +22,8 @@ export type RunIntentRiskLevel = "low" | "medium" | "high";
 export type RunIntentUiCategory = "workflow_mode" | "output_style" | "discussion" | "studio_workflow";
 export type RunIntentToolPolicy = "none" | "read_only" | "write" | "plan_gated" | "studio_workflow";
 export type EffectiveTurnApprovalState = "not_required" | "needs_approval" | "approved";
+export type PlanReviewState = "not_ready" | "awaiting_review" | "approved";
+export type OperationApprovalState = EffectiveTurnApprovalState;
 export type EffectiveTurnCompletionEvidence =
   | "none"
   | "answer"
@@ -159,7 +161,10 @@ export interface RunIntentPolicy {
 export interface EffectiveTurnContract {
   conversationIntent: ResolvedUserIntent;
   runtimeIntent: ResolvedUserIntent;
+  /** @deprecated Read operationApprovalState. Kept for persisted prompt/test compatibility. */
   approvalState: EffectiveTurnApprovalState;
+  planReviewState: PlanReviewState;
+  operationApprovalState: OperationApprovalState;
   allowedToolRisks: RunIntentToolPolicy;
   mutationExpected: boolean;
   validationExpected: boolean;
@@ -713,6 +718,7 @@ export function buildEffectiveTurnContract(input: {
   runtimeIntent?: ResolvedUserIntent | null;
   commandDirective?: CommandDirective | null;
   planApproved?: boolean;
+  planReviewReady?: boolean;
   executionConsentGranted?: boolean;
 }): EffectiveTurnContract {
   const conversationIntent = input.conversationIntent;
@@ -748,12 +754,19 @@ export function buildEffectiveTurnContract(input: {
     !(conversationIntent === "plan" && input.planApproved === true) &&
     directiveKind !== "plan_approval" &&
     directiveKind !== "plan_resume";
-  const approvalState: EffectiveTurnApprovalState =
-    input.executionConsentGranted === true || input.planApproved === true
+  const operationApprovalState: OperationApprovalState =
+    input.executionConsentGranted === true || (mutationExpected && input.planApproved === true)
       ? "approved"
       : needsApproval
       ? "needs_approval"
       : "not_required";
+  const planReviewState: PlanReviewState = conversationIntent !== "plan"
+    ? "not_ready"
+    : input.planApproved === true
+    ? "approved"
+    : input.planReviewReady === true
+    ? "awaiting_review"
+    : "not_ready";
   const completionEvidenceRequired: EffectiveTurnCompletionEvidence =
     mutationExpected
       ? "execution_evidence"
@@ -765,7 +778,9 @@ export function buildEffectiveTurnContract(input: {
   return {
     conversationIntent,
     runtimeIntent,
-    approvalState,
+    approvalState: operationApprovalState,
+    planReviewState,
+    operationApprovalState,
     allowedToolRisks: runtimePolicy.toolPolicy,
     mutationExpected,
     validationExpected,

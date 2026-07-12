@@ -1,6 +1,6 @@
 import { buildChatFinalSynthesisPrompt, buildMaxStepsFinalTextPrompt } from "../../agentLoopSafety";
 import { describeExecuteRecoveryToolSurface, summarizeRepeatedExecuteTargets, type ExecuteRecoveryMode } from "../../executeRecoveryTools";
-import { isAssistantTurnEmpty, normalizeAssistantTurn } from "../../normalizedTurn";
+import { classifyAssistantCompletion } from "../../normalizedTurn";
 import {
   fetchLLMStream,
   logAgentEvent,
@@ -308,17 +308,16 @@ export async function invokeInitialStreamForIteration(input: {
   if (llmTools.length > 0) {
     callbacks.onProviderNativeToolSuccess?.();
   }
-  if (
-    config.activeProfile === "local" &&
-    snapshotContextLimit != null &&
-    isAssistantTurnEmpty(normalizeAssistantTurn(streamResult))
-  ) {
-    const contextErr = new Error(
-      "Local model returned an empty completion. Treating as context window limit exceeded to trigger reactive compaction.",
-    );
-    (contextErr as any).isContextError = true;
-    throw contextErr;
-  }
+  const completionClass = classifyAssistantCompletion(streamResult);
+  logAgentEvent("assistant_completion_classified", {
+    iteration,
+    completionClass,
+    finishReason: streamResult.finishReason || null,
+    contentChars: streamResult.content.length,
+    reasoningChars: (streamResult.reasoningContent || "").length,
+    toolCalls: streamResult.toolCalls?.length || 0,
+    contextLimitUnchanged: snapshotContextLimit ?? null,
+  });
 
   return { status: "streamed", streamResult };
 }

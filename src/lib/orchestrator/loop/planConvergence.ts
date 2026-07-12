@@ -125,6 +125,8 @@ export function handlePlanReadOnlyConvergence(input: {
     evidenceReadinessReason: planEvidenceReadinessForConvergence.reason,
     successfulTargetedReads: planEvidenceReadinessForConvergence.successfulTargetedReads,
     successfulSearches: planEvidenceReadinessForConvergence.successfulSearches,
+    semanticFacts: planEvidenceReadinessForConvergence.semanticFacts,
+    changeTargets: planEvidenceReadinessForConvergence.changeTargets,
   });
 
   if (!usedPlanReadOnlyConvergencePrompt) {
@@ -264,6 +266,8 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     preservedVisibleText: hasMeaningfulVisibleText,
     evidenceReadiness: planEvidenceReadinessForRedirect.status,
     evidenceReadinessReason: planEvidenceReadinessForRedirect.reason,
+    semanticFacts: planEvidenceReadinessForRedirect.semanticFacts,
+    changeTargets: planEvidenceReadinessForRedirect.changeTargets,
     planRuntimePhase,
   });
   logAgentEvent("plan_unsupported_tool_call_suppressed", {
@@ -274,6 +278,8 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     preservedVisibleText: hasMeaningfulVisibleText,
     evidenceReadiness: planEvidenceReadinessForRedirect.status,
     evidenceReadinessReason: planEvidenceReadinessForRedirect.reason,
+    semanticFacts: planEvidenceReadinessForRedirect.semanticFacts,
+    changeTargets: planEvidenceReadinessForRedirect.changeTargets,
     planRuntimePhase,
     qualityGateReason: planLastQualityGateReason,
     missingSections: planLastMissingSections,
@@ -289,13 +295,9 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     planDraftingRecoveryReadCount += 1;
     planReasoningOnlyRecoveryPasses += 1;
     const readToolsAvailable = ["read_file", "read_document", "get_file_outline"].some((name) => availableToolNames.has(name));
-    const urgencyHint = readToolsAvailable
-      ? (language === "zh"
-        ? `PLAN_DRAFTING_RECOVERY_READ: 这是唯一一次 drafting 补读机会。请只读取刚才缺失的最具体文件，然后立即用 write_file 或 replace_in_file 写入 .MAIN/plans/plan.md。不要继续探索。尝试的读工具：${suppressedToolNames.join(", ")}。`
-        : `PLAN_DRAFTING_RECOVERY_READ: This is the only drafting recovery read. Read only the most specific missing file, then immediately write .MAIN/plans/plan.md with write_file or replace_in_file. Do not continue exploring. Attempted read tools: ${suppressedToolNames.join(", ")}.`)
-      : (language === "zh"
-        ? `PLAN_DRAFTING_WRITE_NOW: 当前 drafting 工具面没有读取工具。不要再尝试读取；请基于已有证据立即用 write_file 或 replace_in_file 写入 .MAIN/plans/plan.md。若确有阻塞性取舍，请输出 <user_options> 后停止。`
-        : `PLAN_DRAFTING_WRITE_NOW: No read tools are available in the current drafting tool surface. Do not attempt more reads; write .MAIN/plans/plan.md now with write_file or replace_in_file from existing evidence. If a blocking decision remains, output <user_options> and stop.`);
+    const urgencyHint = language === "zh"
+      ? `PLAN_DRAFTING_OUTPUT_NOW: drafting 工具面已经关闭。不要再尝试读取；请基于已注入的证据包输出可见 <proposed_plan>，由 MAIN runtime 物化。若确有阻塞性取舍，请输出 <user_options> 后停止。刚才被拦截的工具：${suppressedToolNames.join(", ")}。`
+      : `PLAN_DRAFTING_OUTPUT_NOW: The drafting tool surface is closed. Do not attempt more reads; output visible <proposed_plan> from the injected evidence bundle for MAIN runtime to materialize. If a blocking decision remains, output <user_options> and stop. Suppressed tools: ${suppressedToolNames.join(", ")}.`;
     callbacks.appendMessage({
       role: "user",
       content: urgencyHint,
@@ -338,16 +340,16 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     return finish("continue");
   }
   if (suppressedRecoveryDecision.action === "pause_blocked") {
-    // Keep recovery live by forcing a plan write with existing evidence instead of
+    // Keep recovery live by forcing visible convergence with existing evidence instead of
     // turning a suppressed read into a terminal no-action pause.
     planPostConvergenceToolRedirectCount += 1;
-    setPlanRuntimePhase("drafting", "recovery exhausted, write with existing evidence");
+    setPlanRuntimePhase("drafting", "recovery exhausted, draft with frozen evidence");
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
       role: "user",
       content: language === "zh"
-        ? `【强制写入提示】定向补证和恢复读取已全部使用完毕，证据已充分。请立即停止尝试任何只读工具，直接使用 write_file 或 replace_in_file 创建或更新 .MAIN/plans/plan.md。如果你认为还需要某个具体文件的信息，在计划中将该缺失信息标记为"用户待提供"并写入计划；否则现在就写。`
-        : `[FORCED WRITE] All targeted evidence recovery passes and controlled recovery reads are exhausted — you have sufficient evidence. Immediately stop attempting read tools and use write_file or replace_in_file to create or update .MAIN/plans/plan.md. If you believe a specific file is missing, mark it as "pending user input" within the plan itself; otherwise write the plan now.`,
+        ? `【强制收敛提示】定向补证已经用完，证据包已冻结。立即停止尝试工具并输出可见 <proposed_plan>，由 MAIN runtime 校验和物化；若确有一个阻塞事实，把它作为明确阻塞选择。`
+        : `[FORCED CONVERGENCE] Targeted evidence recovery is exhausted and the evidence bundle is frozen. Stop attempting tools and output visible <proposed_plan> for MAIN runtime to validate and materialize; expose only a genuine blocking choice.`,
     });
     logAgentEvent("plan_suppressed_tool_forced_write_injected", {
       iteration,

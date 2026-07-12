@@ -122,6 +122,7 @@ import {
 } from "../lib/planApprovalIdentity";
 import {
   buildPlanExecutionProgressUpdate,
+  isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanSameTurnFallbackDecision,
 } from "../lib/planExecutionRecovery";
@@ -6286,15 +6287,11 @@ export const useAppStore = create<AppState>()(
             now: Date.now(),
           })
         : state.planExecutionProgressSnapshot;
-      const activePlanLoop =
-        !!approvedTurnId &&
-        (state.agentStatus === "running" ||
-          state.agentStatus === "pending_review" ||
-          state.isGenerating === true ||
-          currentTurn?.status === "planning" ||
-          currentTurn?.status === "awaiting_approval" ||
-          currentTurn?.status === "awaiting_input") &&
-        state.abortController !== null;
+      const activePlanLoop = !!approvedTurnId && isPlanReviewExecutionLeaseActive({
+        agentStatus: state.agentStatus,
+        isGenerating: state.isGenerating,
+        hasAbortController: state.abortController !== null,
+      });
       const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
 
       set((s) => ({
@@ -6313,6 +6310,7 @@ export const useAppStore = create<AppState>()(
         ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
         agentStatus: activePlanLoop ? s.agentStatus : "idle",
         isGenerating: activePlanLoop ? s.isGenerating : false,
+        abortController: activePlanLoop ? s.abortController : null,
         planStage: "executing",
         conversationTurns: approvedTurnId
           ? s.conversationTurns.map((turn) =>

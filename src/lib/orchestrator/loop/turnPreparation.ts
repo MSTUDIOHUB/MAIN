@@ -286,9 +286,10 @@ export function createSystemPromptApplier(input: {
       runtimeIntent,
       commandDirective: callbacks.getCommandDirective?.() ?? null,
       planApproved: callbacks.getIsPlanApproved(),
-      executionConsentGranted:
-        callbacks.getExecutionConsentGranted?.() === true ||
-        callbacks.getIsPlanApproved(),
+      planReviewReady:
+        !callbacks.getIsPlanApproved() &&
+        (callbacks.getPlanArtifacts?.() || []).some((artifact) => artifact.kind === "plan"),
+      executionConsentGranted: callbacks.getExecutionConsentGranted?.() === true,
     });
     setLatestTurnContract(effectiveTurnContract);
     const webResearchPromptDate = (
@@ -311,6 +312,8 @@ export function createSystemPromptApplier(input: {
       callbacks.getCommandDirective?.()?.kind ?? "none",
       callbacks.getCommandDirective?.()?.action ?? "",
       effectiveTurnContract.approvalState,
+      effectiveTurnContract.planReviewState,
+      effectiveTurnContract.operationApprovalState,
       effectiveTurnContract.mutationExpected ? "mutation" : "no-mutation",
       effectiveTurnContract.completionEvidenceRequired,
       goalTurnContract?.cacheKey ?? "no-goal-contract",

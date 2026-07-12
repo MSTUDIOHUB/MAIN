@@ -4,6 +4,10 @@ import os from "node:os";
 import path from "node:path";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
+const omlxEndpoint = String(
+  process.env.OMLX_ENDPOINT || process.env.OMLX_BASE_URL || "http://127.0.0.1:8000/v1",
+).replace(/\/+$/, "");
+const omlxApiKey = String(process.env.OMLX_API_KEY || "mmnn");
 const models = (process.env.OMLX_MODELS || "gemma-4-26b-a4b-it-8bit,Qwen3.6-35B-A3B-6bit")
   .split(",")
   .map((item) => item.trim())
@@ -123,6 +127,22 @@ test.beforeEach(async ({ page }) => {
       };
     });
   });
+  await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
+    const command = String(rawCommand || "").trim();
+    const parser = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
+    const hasCreatorNameAssignment = /creatorName\s*:\s*[^,}\n]+/.test(parser);
+    const isFiniteVerification = /(?:test|typecheck|tsc|check|verify|lint|build|compile)/i.test(command);
+    const exitCode = hasCreatorNameAssignment && isFiniteVerification ? 0 : 1;
+    return JSON.stringify({
+      command,
+      cwd: workspace,
+      exitCode,
+      stdout: exitCode === 0
+        ? "Fresh fixture verification passed: creatorName assignment is present."
+        : "Fresh fixture verification failed: expected a finite verification command and creatorName assignment.",
+      stderr: "",
+    });
+  });
 
   await page.exposeFunction("__MAIN_E2E_PROXY_REQUEST", async (args: Record<string, unknown>) => {
     const url = String(args.url || "");
@@ -186,7 +206,7 @@ test.beforeEach(async ({ page }) => {
     return text;
   });
 
-  await page.addInitScript(({ workspace }) => {
+  await page.addInitScript(({ workspace, endpoint, apiKey }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
     let streamCancelled = false;
     const readText = async (path: string) => {
@@ -196,6 +216,7 @@ test.beforeEach(async ({ page }) => {
       await (window as any).__MAIN_E2E_DISK_WRITE(path, content);
     };
     (window as any).__REAL_OMLX_WORKSPACE__ = workspace;
+    (window as any).__REAL_OMLX_CONFIG__ = { endpoint, apiKey };
 
     (window as any).__TAURI_EVENT_PLUGIN_INTERNALS__ ??= { unregisterListener: () => {} };
     const callbacks = new Map<number, unknown>();
@@ -464,10 +485,27 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "shell_permission_preflight") {
         return { decision: "allow", requiresApproval: false, source: "e2e" };
       }
-      if (cmd === "run_command") return "ok";
+      if (cmd === "browser_evaluate") {
+        return {
+          ok: true,
+          url: String(args?.url || ""),
+          finalUrl: String(args?.url || ""),
+          status: 200,
+          title: "Real OMLX fixture",
+          assertions: [{ passed: true, description: "creatorName mapping fixture is ready" }],
+          consoleErrors: [],
+          pageErrors: [],
+          failedRequests: [],
+          textPreview: "creatorName",
+          durationMs: 1,
+        };
+      }
+      if (cmd === "run_command") {
+        return await (window as any).__MAIN_E2E_RUN_VERIFICATION(String(args?.command || args?.cmd || ""));
+      }
       return null;
     };
-  }, { workspace });
+  }, { workspace, endpoint: omlxEndpoint, apiKey: omlxApiKey });
 });
 
 for (const model of models) {
@@ -483,19 +521,42 @@ for (const model of models) {
     });
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
 
-    await page.evaluate((text) => (window as any).__CODELY_E2E__?.sendCloudMessage?.(text), realOmlxRequest);
+    await page.evaluate((text) => {
+      const bridge = (window as any).__CODELY_E2E__;
+      Promise.resolve(bridge?.sendCloudMessage?.(text)).catch((error) => {
+        bridge.dispatchError = error instanceof Error ? error.message : String(error);
+      });
+    }, realOmlxRequest);
 
+    let lastPlanPollSignature = "";
     await expect
       .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-        return {
-          status: snapshot?.agentStatus,
-          approved: snapshot?.isPlanApproved,
-          artifactCount: snapshot?.planArtifacts?.length ?? 0,
+        const planPollDiagnostic = {
+          agentStatus: snapshot?.agentStatus,
+          isGenerating: snapshot?.isGenerating,
+          currentTurnStatus: snapshot?.currentTurnStatus,
           planStage: snapshot?.planStage,
+          artifactCount: snapshot?.planArtifacts?.length ?? 0,
         };
+        const planPollSignature = JSON.stringify(planPollDiagnostic);
+        if (planPollSignature !== lastPlanPollSignature) {
+          console.log(`[real-omlx-plan-poll:${model}] ${planPollSignature.slice(0, 1_000)}`);
+          lastPlanPollSignature = planPollSignature;
+        }
+        if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+        const artifactCount = snapshot?.planArtifacts?.length ?? 0;
+        if (artifactCount > 0) return "artifact_ready";
+        if (
+          snapshot?.isGenerating === false &&
+          (snapshot?.taskFlowTypes || []).includes("user")
+        ) {
+          const debugTail = JSON.stringify(snapshot?.debugTail || []).slice(-2_000);
+          return `terminal_without_artifact:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}:${debugTail}`;
+        }
+        return "running";
       }, { timeout: 600_000 })
-      .toMatchObject({ artifactCount: 1 });
+      .toBe("artifact_ready");
 
     const plan = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planArtifacts?.[0]?.content || "");
     expect(plan).toMatch(/用户目标|Summary|摘要/);
@@ -513,11 +574,28 @@ for (const model of models) {
       expect((planSnapshot?.agentTexts || []).join("\n")).toMatch(/问题|分析|修复|Dashboard|CSV|深色|creator/i);
     }
 
-    await page.evaluate(() => (window as any).__CODELY_E2E__?.approvePlan?.());
+    const approvalDispatch = await page.evaluate(() => {
+      const bridge = (window as any).__CODELY_E2E__;
+      const result = bridge?.approvePlan?.();
+      Promise.resolve(result).catch((error) => {
+        bridge.dispatchError = error instanceof Error ? error.message : String(error);
+      });
+      return result;
+    });
+    console.log(`[real-omlx-approval-dispatch:${model}] ${JSON.stringify(approvalDispatch).slice(0, 2_000)}`);
+
+    await expect.poll(async () => {
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+      return snapshot?.isPlanApproved === true && snapshot?.planApprovalExecutionStartedForTurnId
+        ? "execution_started"
+        : `waiting:${snapshot?.agentStatus}:${snapshot?.isGenerating}:${Boolean(snapshot?.pendingPlanApprovalHandoff)}`;
+    }, { timeout: 30_000 }).toBe("execution_started");
 
     await expect
       .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+        if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
         const parser = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
         return {
           status: snapshot?.agentStatus,
@@ -550,11 +628,36 @@ for (const model of models) {
       "",
     ].join("\n"));
 
+    await expect
+      .poll(async () => {
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+        if (snapshot?.activeActionRequest?.kind === "tool_permission") {
+          await expect(page.getByTestId("execution-capsule-tool-approve-once")).toBeVisible();
+          await page.getByTestId("execution-capsule-tool-approve-once").click();
+          return "running";
+        }
+        if (
+          snapshot?.isGenerating === false &&
+          snapshot?.planStage === "completed" &&
+          ["done", "completed_with_changes"].includes(String(snapshot?.currentTurnStatus || ""))
+        ) return "completed";
+        if (snapshot?.isGenerating === false) {
+          const debugTail = JSON.stringify(snapshot?.debugTail || []).slice(-2_000);
+          return `terminal_without_completion:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}:${debugTail}`;
+        }
+        return "running";
+      }, { timeout: 300_000 })
+      .toBe("completed");
+
     const bodyText = await page.locator("body").innerText();
     const executionSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
     const executionChatText = JSON.stringify(executionSnapshot?.taskFlowPreview || []);
     console.log(`[real-omlx-chat-execute:${model}] ${executionChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
     expect(executionChatText).toMatch(/apply_patch|write_file|replace_in_file|run_command|已完成|creatorName|useCsvParser/i);
+    expect(executionSnapshot?.planExecutionEvidence || []).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: "file", target: "src/hooks/useCsvParser.ts" }),
+      expect.objectContaining({ kind: "cmd" }),
+    ]));
     expect(executionChatText).not.toMatch(forbiddenChatNoise);
     expect(JSON.stringify(executionSnapshot?.debugTail || [])).not.toMatch(/no_progress_cached_read_only_batch|store\.non_actionable_stop/i);
     expect(bodyText).not.toMatch(forbiddenChatNoise);

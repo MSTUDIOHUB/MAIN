@@ -6,6 +6,7 @@ export function normalizeSyntheticContinuationText(input: unknown): string {
 
 const SYNTHETIC_PREFIX_PATTERNS: RegExp[] = [
   /^\[System:/i,
+  /^\[turn_intake\]/i,
   /^EXECUTE_RECOVERY:/i,
   /^PLAN_[A-Z_]+:/i,
   /^Recovery(?:Details)?:/i,

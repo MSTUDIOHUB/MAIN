@@ -25,7 +25,7 @@ export default defineConfig({
     : {
         command: "npm run dev -- --host 127.0.0.1 --port 4173",
         url: baseURL,
-        reuseExistingServer: true,
+        reuseExistingServer: process.env.PLAYWRIGHT_REUSE_EXISTING_SERVER !== "0",
         timeout: 120_000,
       },
 });

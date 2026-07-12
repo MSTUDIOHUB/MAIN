@@ -1,4 +1,5 @@
 import { shouldBypassApprovedPlanReadCacheForPatchRecovery } from "../../approvedPlanRecoveryTools";
+import { resolveApprovedPlanMutationScope } from "../../approvedPlanExecutionScope";
 import {
   FILE_UNCHANGED_STUB,
   buildFileReadSignature,
@@ -338,6 +339,40 @@ export async function partitionToolCallsForExecution(input: {
         symbols: targetingProfile.symbols.slice(0, 8),
         imageParts: targetingProfile.imageParts,
         hasUserProvidedContext: targetingProfile.hasUserProvidedContext,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: `Error: ${message}`,
+        isError: true,
+        lifecycleState: "blocked",
+      });
+      continue;
+    }
+
+    const approvedPlanMutationScope = resolveApprovedPlanMutationScope({
+      workflowMode,
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      toolName: tc.name,
+      args: toolArgs,
+      target,
+      tasks: callbacks.getPlanTasks(),
+    });
+    if (approvedPlanMutationScope.applies && !approvedPlanMutationScope.allowed) {
+      const unexpected = approvedPlanMutationScope.unexpectedTargets.join(", ") || target || tc.name;
+      const planned = approvedPlanMutationScope.plannedTargets.join(", ") || "none";
+      const message = callbacks.getPreferredLanguage() === "zh"
+        ? `APPROVED_PLAN_SCOPE_BLOCKED: ${unexpected} 不在已批准 Plan 的修改目标中。当前允许的修改目标：${planned}。请继续执行现有计划任务；如确需扩大范围，必须先停止并生成新 revision 供用户重新审批。`
+        : `APPROVED_PLAN_SCOPE_BLOCKED: ${unexpected} is outside the approved Plan mutation targets. Allowed targets: ${planned}. Continue the reviewed tasks; if scope expansion is necessary, stop and create a new revision for review.`;
+      callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+      logAgentEvent("approved_plan_mutation_scope_blocked", {
+        iteration,
+        tool: tc.name,
+        target,
+        requestedTargets: approvedPlanMutationScope.requestedTargets,
+        unexpectedTargets: approvedPlanMutationScope.unexpectedTargets,
+        plannedTargets: approvedPlanMutationScope.plannedTargets,
       });
       preExecutionResults.push({
         toolCallId: tc.id,

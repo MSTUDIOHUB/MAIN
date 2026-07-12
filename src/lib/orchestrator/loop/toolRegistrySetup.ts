@@ -10,6 +10,7 @@ import {
 import {
   annotateUnityEditToolDescriptions,
   isGameEngineLikelyServer,
+  shouldExposeGameEngineMcpServer,
   type GameStudioEngineKey,
 } from "../../orchestrator/unityDiagnostics";
 import {
@@ -119,6 +120,29 @@ export async function prepareAgentLoopToolRegistry(input: {
       .map((status) => status.url),
   );
   const connectedMcpServers = enabledMcpServers.filter((server) => connectedMcpServerUrls.has(server.url));
+  const hiddenGameEngineMcpServerUrls = new Set(
+    connectedMcpServers
+      .filter((server) => !shouldExposeGameEngineMcpServer({
+        server,
+        gameStudioEngineContext,
+        unityCommandRequested,
+      }))
+      .map((server) => server.url),
+  );
+  const hiddenGameEngineMcpTools = mcpTools.filter((tool) =>
+    hiddenGameEngineMcpServerUrls.has(mcpToolServerMap[tool.name] || "")
+  );
+  if (hiddenGameEngineMcpTools.length > 0) {
+    mcpTools = mcpTools.filter((tool) =>
+      !hiddenGameEngineMcpServerUrls.has(mcpToolServerMap[tool.name] || "")
+    );
+    logAgentEvent("mcp_game_engine_tools_scoped", {
+      gameStudioEngineContext,
+      unityCommandRequested,
+      hiddenToolCount: hiddenGameEngineMcpTools.length,
+      hiddenToolNames: hiddenGameEngineMcpTools.map((tool) => tool.name).slice(0, 24),
+    });
+  }
   const mcpPriorityEngine = gameStudioEngine ?? (unityCommandRequested ? "unity" : null);
   const preferredGameStudioMcpServerUrls = mcpPriorityEngine
     ? connectedMcpServers

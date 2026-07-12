@@ -83,6 +83,23 @@ test("synthetic continuation prompts are excluded from durable goal/constraint/d
   assert.equal(decisions.includes("tool_use"), false);
 });
 
+test("turn intake wrapper contributes only canonical visible user text", () => {
+  const wrapped = [
+    "[turn_intake]",
+    "workflowMode: plan",
+    "imageParts: 0",
+    "priority: internal runtime guidance must never become durable context.",
+    "[user_request]",
+    "请修复双击 Markdown 文件后只打开空白窗口的问题。",
+    "[/user_request]",
+    "[/turn_intake]",
+  ].join("\n");
+  const state = buildContextMemoryState([{ role: "user", content: wrapped }], { now: 50 });
+  assert.equal(state.latestUserRequest?.text, "请修复双击 Markdown 文件后只打开空白窗口的问题。");
+  const durable = [...state.goals, ...state.constraints, ...state.decisions].map((item) => item.text).join("\n");
+  assert.doesNotMatch(durable, /turn_intake|workflowMode|internal runtime guidance/i);
+});
+
 test("execute recovery prompts do not replace the original latest user request", () => {
   const recoveryPrompt = [
     "EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算，但还没有产生写入、命令或浏览器验证证据。",

@@ -66,6 +66,12 @@ const {
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
 const {
+  buildPlanEvidenceBundle,
+  formatPlanEvidenceBundleForModel,
+  isPlanEvidenceBundleReady,
+  validatePlanCandidate,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
+const {
   validateActionablePlanArtifact,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
 
@@ -133,6 +139,182 @@ test("materializes valid visible plan text into plan.md artifact", () => {
   assert.match(result.content || "", /^# (?:Proposed Plan|计划)/);
   assert.match(result.content || "", /## (?:关键改动|Key Changes|拟定方案)/);
   assert.doesNotMatch(result.content || "", /用户目标：用户目标与约束|用户目标：开放问题/);
+});
+
+test("real MD Viewer trace keeps one semantic evidence bundle through deterministic materialization", () => {
+  const records = [
+    {
+      tool: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      summary: "handle_open_url currently discards the incoming file path, while setup registers app.on_url without forwarding the event to the webview",
+      hash: "main-rs-hash",
+    },
+    {
+      tool: "read_file",
+      target: "src/components/toolbar.js",
+      status: "succeeded",
+      summary: "handleOpenFile calls dialog.open without awaiting the Promise, so selected is a Promise instead of the chosen file path",
+      hash: "toolbar-hash",
+    },
+    {
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "the frontend bootstrap does not install an open-file event listener that forwards desktop file-open events into editor.loadFile",
+      hash: "main-js-hash",
+    },
+    {
+      tool: "read_file",
+      target: "package.json",
+      status: "succeeded",
+      summary: "package.json contains only general package metadata and does not explain either open-file failure",
+      hash: "package-hash",
+    },
+  ];
+  const objective = "修复 MD Viewer 双击 Markdown 文件只打开空白窗口，以及应用内打开按钮无法弹出文件选择器的问题，并制定可审批计划。";
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-md-viewer-trace",
+    objective,
+    evidenceRecords: records,
+    files: records.map((record) => record.target),
+    constraints: ["批准前不得修改源码。", "运行 `npm run build` 并进行桌面打开流程验证。"],
+  });
+
+  assert.equal(isPlanEvidenceBundleReady(bundle), true);
+  assert.equal(bundle.facts.length, 4);
+  assert.deepEqual(bundle.changeTargets, [
+    "src-tauri/src/main.rs",
+    "src/components/toolbar.js",
+    "src/main.js",
+  ]);
+  const packet = formatPlanEvidenceBundleForModel(bundle, "zh");
+  assert.match(packet, new RegExp(bundle.hash));
+  assert.doesNotMatch(packet, /turn_intake|workflowMode/);
+
+  const content = composePlanArtifactFromEvidence({
+    userGoal: objective,
+    evidence: records.map((record) => `${record.tool}; ${record.target}; ${record.summary}`),
+    evidenceRecords: records,
+    files: records.map((record) => record.target),
+    constraints: ["批准前不得修改源码。", "运行 `npm run build` 并进行桌面打开流程验证。"],
+    language: "zh",
+    evidenceBundle: bundle,
+  });
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    userGoal: objective,
+    evidence: records.map((record) => `${record.tool}; ${record.target}; ${record.summary}`),
+    evidenceRecords: records,
+    files: records.map((record) => record.target),
+    language: "zh",
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+  });
+
+  assert.equal(materialized.ok, true, materialized.reason);
+  assert.equal(materialized.evidenceBundleHash, bundle.hash);
+  assert.ok(materialized.candidate);
+  assert.deepEqual(validatePlanCandidate(materialized.candidate, bundle.hash), []);
+  assert.doesNotMatch(materialized.content || "", /最相关证据|noisy_search_evidence|ContextMemoryState/);
+  assert.match(materialized.content || "", /src-tauri\/src\/main\.rs/);
+  assert.match(materialized.content || "", /src\/components\/toolbar\.js/);
+
+  const mismatched = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: "stale-bundle",
+  });
+  assert.equal(mismatched.ok, false);
+  assert.equal(mismatched.reason, "evidence_bundle_hash_mismatch");
+});
+
+test("plan evidence keeps related CSV consumers as facts without turning them into change targets", () => {
+  const objective = "修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。";
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-csv-fix",
+    objective,
+    files: [
+      "src/hooks/useCsvParser.ts",
+      "src/types/order.ts",
+      "src/store/dashboardStore.ts",
+      "src/hooks/useChartData.ts",
+    ],
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src/hooks/useCsvParser.ts",
+        status: "succeeded",
+        summary: "normalizeCsvOrder 只返回 creator，没有映射到 Dashboard 需要的 creatorName",
+      },
+      {
+        tool: "read_file",
+        target: "src/types/order.ts",
+        status: "succeeded",
+        summary: "Order 接口要求 creatorName 字段为字符串",
+      },
+      {
+        tool: "read_file",
+        target: "src/store/dashboardStore.ts",
+        status: "succeeded",
+        summary: "Dashboard store 使用 creatorName 作为创建者字段",
+      },
+      {
+        tool: "read_file",
+        target: "src/hooks/useChartData.ts",
+        status: "succeeded",
+        summary: "图表读取 creatorName 并保留 creator 作为向后兼容回退",
+      },
+    ],
+  });
+
+  assert.equal(bundle.facts.length, 4);
+  assert.deepEqual(bundle.changeTargets, ["src/hooks/useCsvParser.ts"]);
+});
+
+test("deterministic bundle materialization excludes legacy import-only cache noise", () => {
+  const objective = "修复 src/hooks/useCsvParser.ts 的 creatorName 映射。";
+  const evidenceRecords = [
+    {
+      tool: "read_file",
+      target: "src/hooks/useCsvParser.ts",
+      status: "succeeded",
+      summary: "normalizeCsvOrder 只返回 creator，没有映射到 creatorName",
+    },
+    {
+      tool: "read_file",
+      target: "src/App.tsx",
+      status: "succeeded",
+      summary: "L1: import React from 'react'",
+    },
+  ];
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-import-noise",
+    objective,
+    evidenceRecords,
+    files: evidenceRecords.map((item) => item.target),
+  });
+  const content = composePlanArtifactFromEvidence({
+    userGoal: objective,
+    evidenceRecords,
+    evidence: [
+      "read_file src/hooks/useCsvParser.ts; normalizeCsvOrder 只返回 creator，没有映射到 creatorName",
+      "read_file src/App.tsx; L1: import React from 'react'",
+    ],
+    files: evidenceRecords.map((item) => item.target),
+    language: "zh",
+    evidenceBundle: bundle,
+  });
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    userGoal: objective,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+  });
+
+  assert.equal(materialized.ok, true, materialized.reason);
+  assert.doesNotMatch(content, /import React/);
+  assert.match(content, /src\/hooks\/useCsvParser\.ts/);
 });
 
 test("materializes Codex-style proposed_plan blocks without requiring write tools", () => {
@@ -817,6 +999,25 @@ test("deterministic plan uses concrete read evidence instead of broad search gro
   assert.match(content, /深色模式表面|主题 token/);
   assert.doesNotMatch(content, /直接相关的最小改动|写入前先用证据确认/);
   assert.doesNotMatch(content, /依据证据：已搜索文件|依据证据：已查看目录/);
+});
+
+test("deterministic plan preserves the exact creator to creatorName repair contract", () => {
+  const content = composePlanArtifactFromEvidence({
+    userGoal: "修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName，并保持 creator 向后兼容。",
+    evidence: [
+      "read_file src/hooks/useCsvParser.ts; excerpt=normalizeCsvOrder 目前只返回 creator，没有给 creatorName 赋值",
+      "read_file src/types/order.ts; excerpt=Order 要求 creatorName 字段",
+    ],
+    files: ["src/hooks/useCsvParser.ts"],
+    constraints: ["保持 creator 向后兼容"],
+    language: "zh",
+  });
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
+  assert.match(content, /赋给 `creatorName`/);
+  assert.match(content, /保留旧 `creator` 字段/);
+  assert.match(content, /运行 `npm run build`/);
+  assert.doesNotMatch(content, /course、date、status、amount/);
 });
 
 test("read_file_window evidence is concrete enough for real UI plan materialization", () => {

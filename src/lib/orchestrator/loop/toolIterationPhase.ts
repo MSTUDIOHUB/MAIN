@@ -27,7 +27,7 @@ type ToolIterationPhaseInput = ToolCallPhaseInput &
   >;
 
 export type ToolIterationPhaseResult = {
-  status: "aborted" | "stopped" | "continue" | "completed";
+  status: "aborted" | "stopped" | "continue" | "completed" | "plan_completed";
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
   loopGuardRuntimeState: AgentLoopGuardRuntimeState;
@@ -36,6 +36,7 @@ export type ToolIterationPhaseResult = {
   unityMcpRuntimeState: UnityMcpRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
+  completionAudit?: { completedCount: number; totalCount: number };
 };
 
 export async function handleToolIterationPhase(
@@ -84,5 +85,8 @@ export async function handleToolIterationPhase(
     unityMcpRuntimeState: toolCallPhase.unityMcpRuntimeState,
     evidenceRuntimeState: toolCallPhase.evidenceRuntimeState,
     approvedPlanRecoveryState: toolResultRecoveryPhase.approvedPlanRecoveryState,
+    ...(toolResultRecoveryPhase.completionAudit
+      ? { completionAudit: toolResultRecoveryPhase.completionAudit }
+      : {}),
   };
 }

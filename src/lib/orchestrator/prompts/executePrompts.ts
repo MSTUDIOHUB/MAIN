@@ -103,7 +103,7 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
       "The user already allowed read-only inspection for this session, but the previous turn still did not make useful tool progress.",
       "Do not ask for permission again and do not narrate a future read.",
       workflowMode === "plan"
-        ? "If the evidence is sufficient, create or update `.MAIN/plans/plan.md` with write_file or replace_in_file; if one fact is still missing, call exactly one targeted read/search tool now. If the target was already cached, reuse the existing content instead of rereading it."
+        ? "If the evidence is sufficient, output a visible `<proposed_plan>` for runtime validation and materialization; if one fact is still missing, call exactly one targeted read/search tool now. If the target was already cached, reuse the existing content instead of rereading it."
         : "If you need evidence, call one targeted read/search tool now. If the target was already cached, reuse the existing content and move to the next real action: patch/write, run a finite command, browser validation, or state the exact blocker.",
     ].join("\n");
   }
@@ -111,7 +111,7 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
     "用户已经允许本会话的只读检查，但上一轮仍没有产生有效工具进展。",
     "不要再次询问许可，也不要只描述接下来要读取什么。",
     workflowMode === "plan"
-      ? "如果证据已经足够，直接用 write_file 或 replace_in_file 创建/更新 `.MAIN/plans/plan.md`；如果只缺一个事实，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，不要重复读取。"
+      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交给 runtime 校验和物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，不要重复读取。"
       : "如果还需要证据，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，并进入下一个真实动作：写入/替换、运行有限命令、浏览器验证，或说明精确阻塞。",
   ].join("\n");
 }

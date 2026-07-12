@@ -158,14 +158,14 @@ function buildForcePlanContinuationPrompt(input: {
   const missingStepHint =
     language === "zh"
       ? currentPlanStage === "requirements"
-        ? "你已经有旧流程的 requirements.md，下一步必须创建/更新 `.MAIN/plans/plan.md` 作为可审批方案；如果设计方向仍不明确，只能用 `<user_options>` 给出面向用户的选择并停止。不要重复读取已读文件。"
+        ? "你已经有旧流程的 requirements.md，下一步必须输出可见 `<proposed_plan>` 交由 runtime 物化；如果设计方向仍不明确，只能用 `<user_options>` 给出真实阻塞选择并停止。不要重复读取已读文件。"
         : currentPlanStage === "design"
         ? "你已经有 plan.md，下一步应输出正式 Proposal 或给用户关键选择；不要在批准前提前生成 tasks.md。"
         : sawPlanModeToolActivity
         ? "你已经开始做项目探索了，但还没有给出可让用户决策的规划结果。下一步应先收束分歧并询问用户。"
         : "请先给出可让用户决策的规划问题。"
       : currentPlanStage === "requirements"
-      ? "A legacy requirements.md exists. Next create/update `.MAIN/plans/plan.md` as the reviewable plan; if the plan direction is still unclear, offer `<user_options>` and stop. Do not repeat reads of files already in context."
+      ? "A legacy requirements.md exists. Next output visible `<proposed_plan>` for runtime materialization; if the plan direction is still unclear, offer a real blocking `<user_options>` choice and stop. Do not repeat reads of files already in context."
       : currentPlanStage === "design"
       ? "plan.md exists. Next submit the formal Proposal or offer the key choices; do not generate tasks.md before approval."
       : sawPlanModeToolActivity
@@ -176,19 +176,19 @@ function buildForcePlanContinuationPrompt(input: {
     ? `当前规划还没有进入可执行阶段。${missingStepHint}\n` +
         `${CONCISE_PLAN_ARTIFACT_HINT_ZH}\n` +
         "请继续规划，并在本轮结束前完成以下其一：\n" +
-        "1. 用普通 Markdown 输出 3-8 条关键判断，然后用面向用户的口吻给出 2-4 个 `<user_options>` 让用户选择；每个选项必须是用户可直接点击发送的完整选择，不要写成“是否……”问题句。\n" +
-        "2. 如果信息已经足够，用 write_file 或 replace_in_file 创建/更新 `.MAIN/plans/plan.md`，提交正式可审批方案。\n" +
-        "3. 如果这是复杂实现计划，必须落盘可审批 plan.md；requirements.md 只是可选需求台账，在用户批准之前不要生成 `tasks.md` 或修改源码。\n" +
-        `${currentPlanStage === "requirements" ? "当前已经有旧流程 requirements.md，本轮不要重复读文件；请直接写入 plan.md，或用 user_options 询问设计分叉。\n" : ""}` +
+        "1. 如果信息足够，直接输出一个包含标准章节的可见 `<proposed_plan>`；MAIN runtime 会校验并物化 plan.md。\n" +
+        "2. 只有真正阻塞执行的用户决策才输出 2-4 个 `<user_options>`；不要把继续读取、检查或先后顺序包装成选项。\n" +
+        "3. requirements.md 只是可选需求台账，在用户批准之前不要生成 `tasks.md` 或修改源码。\n" +
+        `${currentPlanStage === "requirements" ? "当前已经有旧流程 requirements.md，本轮不要重复读文件；请直接输出 proposed_plan，或询问真实设计分叉。\n" : ""}` +
         `${wasTruncated ? "你上一条回复已经发生截断，请从中断处继续，不要重头重复。\n" : ""}` +
         "不要只输出一句总结、结束语，或空结束符。"
     : `The current plan has not reached an executable stage. ${missingStepHint}\n` +
         `${CONCISE_PLAN_ARTIFACT_HINT_EN}\n` +
         "Continue planning and complete one of these before ending this turn:\n" +
-        "1. Output 3-8 key judgments in Markdown, then offer 2-4 `<user_options>` for the user to choose from.\n" +
-        "2. If there is enough information, use write_file or replace_in_file to create/update `.MAIN/plans/plan.md` as the formal reviewable plan.\n" +
-        "3. For complex implementation planning, the reviewable plan must be persisted to plan.md; requirements.md is only an optional requirement ledger. Do not generate `tasks.md` or edit source files before approval.\n" +
-        `${currentPlanStage === "requirements" ? "A legacy requirements.md already exists. Do not repeat file reads in this turn; write plan.md directly, or ask for design choices with user_options.\n" : ""}` +
+        "1. If information is sufficient, output one visible `<proposed_plan>` with the standard sections; MAIN runtime validates and materializes plan.md.\n" +
+        "2. Offer 2-4 `<user_options>` only for a genuinely blocking user-owned decision; never turn reading/checking order into choices.\n" +
+        "3. requirements.md is only an optional requirement ledger. Do not generate `tasks.md` or edit source files before approval.\n" +
+        `${currentPlanStage === "requirements" ? "A legacy requirements.md already exists. Do not repeat reads; output proposed_plan directly, or ask for a real design fork.\n" : ""}` +
         `${wasTruncated ? "Your previous reply was truncated; continue from the interruption point without restarting.\n" : ""}` +
         "Do not output only a summary, sign-off, or empty stop.";
 }

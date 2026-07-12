@@ -668,7 +668,7 @@ export class WorkflowEngine {
       getRuntimeRunIntent: () => runtimeRunIntent,
       getExecutionConsentGranted: () => {
         const consent = sessionGet().currentTurnExecutionConsent;
-        return consent?.granted === true && (!consent.turnId || consent.turnId === turnId);
+        return consent?.granted === true && !!consent.turnId && consent.turnId === turnId;
       },
       getForcedExecuteRecoveryMode: () => options?.forceExecuteRecoveryMode ?? null,
       getCommandDirective: () => effectiveCommandDirective,
@@ -1638,7 +1638,11 @@ export class WorkflowEngine {
                 : hasToolCalls
                 ? {
                     ...turn,
-                    status: turn.status === "awaiting_approval" ? turn.status : "executing",
+                    status: turn.status === "awaiting_approval"
+                      ? turn.status
+                      : isUnapprovedPlanRuntime()
+                      ? "planning"
+                      : "executing",
                     summary: normalizedFinal || turn.summary,
                   }
                 : {
@@ -1868,6 +1872,7 @@ export class WorkflowEngine {
           target,
           result: resultText,
           noOp,
+          diff: completedDiff,
         });
         const observationSummary = summarizeToolObservation({
           toolName,

@@ -1,4 +1,8 @@
 import { GLOBAL_CHAT_KEY, finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
+import {
+  ensureApprovedPlanRuntimeTasksForState,
+  evaluateApprovedPlanExecutionReadiness,
+} from "../store/submitApprovedPlanExecution";
 import { syncPlanArtifactAfterToolSuccess } from "./planArtifactSync";
 import { getPlanArtifactTitle } from "./workflowModels";
 import { createGoalDefinition, createGoalProgress, type GoalStatus } from "./goalState";
@@ -6167,11 +6171,13 @@ function seedRealOmlxPlanFlowScenario() {
   bridge.events = [{ type: "boot" }];
   bridge.savedDocuments = [];
   bridge.completed = false;
+  bridge.dispatchError = null;
 
   incrementSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO);
 
   const params = new URLSearchParams(window.location.search);
   const model = params.get("model") || "gemma-4-26b-a4b-it-8bit";
+  const realOmlxConfig = (window as any).__REAL_OMLX_CONFIG__ || {};
   const workspace = `/tmp/e2e-real-omlx-${model.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}`;
   const sessionId = model.includes("Qwen") ? 999522 : 999521;
   const now = Date.now();
@@ -6186,9 +6192,9 @@ function seedRealOmlxPlanFlowScenario() {
       local: {
         ...state.config.local,
         provider: "OMLX",
-        endpoint: "http://127.0.0.1:8000/v1",
+        endpoint: String(realOmlxConfig.endpoint || "http://127.0.0.1:8000/v1"),
         model,
-        apiKey: "mmnn",
+        apiKey: String(realOmlxConfig.apiKey || "mmnn"),
         contextLimit: 32768,
         toolProtocol: "auto",
       },
@@ -6270,7 +6276,41 @@ function seedRealOmlxPlanFlowScenario() {
   };
 
   bridge.approvePlan = () => {
-    useAppStore.getState().approvePlan("批准执行");
+    const before = useAppStore.getState();
+    const executionTasks = ensureApprovedPlanRuntimeTasksForState(
+      before,
+      before.config.language === "en" ? "en" : "zh",
+    );
+    const readiness = evaluateApprovedPlanExecutionReadiness({
+      planArtifacts: before.planArtifacts,
+      executionPlanTasks: executionTasks,
+    });
+    before.approvePlan("批准执行");
+    const after = useAppStore.getState();
+    return {
+      before: {
+        turnId: before.currentTurnId,
+        runId: before.harnessRunMarker?.runId || null,
+        agentStatus: before.agentStatus,
+        isGenerating: before.isGenerating,
+        actionRequestId: before.activeActionRequest?.requestId || null,
+        readiness,
+        executionTasks,
+        planContent: before.planArtifacts[0]?.content || "",
+      },
+      after: {
+        turnId: after.currentTurnId,
+        runId: after.harnessRunMarker?.runId || null,
+        agentStatus: after.agentStatus,
+        isGenerating: after.isGenerating,
+        approved: after.isPlanApproved,
+        pendingHandoff: after.pendingPlanApprovalHandoff,
+        executionStartedForTurnId: after.planApprovalExecutionStartedForTurnId,
+      },
+    };
+  };
+  bridge.approvePendingTool = () => {
+    useAppStore.getState().approvePendingReviewOnce();
   };
 
   bridge.getSnapshot = () => {
@@ -6297,6 +6337,12 @@ function seedRealOmlxPlanFlowScenario() {
         content: artifact.content,
       })),
       planTasks: state.planTasks,
+      planExecutionEvidence: state.planExecutionEvidenceLedger.map((entry) => ({
+        kind: entry.kind,
+        value: entry.value,
+        target: entry.target,
+        sourceTool: entry.sourceTool,
+      })),
       goalStatus: state.goalStatus,
       activeGoal: state.activeGoal ? {
         id: state.activeGoal.id,
@@ -6313,6 +6359,16 @@ function seedRealOmlxPlanFlowScenario() {
         target: entry.target,
       })),
       currentTurnStatus: currentTurn?.status ?? null,
+      currentRunId: state.harnessRunMarker?.runId || null,
+      parentRunId: state.harnessRunMarker?.parentRunId || null,
+      pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
+      planApprovalExecutionStartedForTurnId: state.planApprovalExecutionStartedForTurnId,
+      activeActionRequest: state.activeActionRequest ? {
+        kind: state.activeActionRequest.kind,
+        requestId: state.activeActionRequest.requestId,
+        turnId: state.activeActionRequest.turnId,
+        runId: state.activeActionRequest.runId,
+      } : null,
       agentTexts,
       toolBlocks,
       taskFlowTypes: state.taskFlow.map((block) => block.type),
@@ -6325,6 +6381,7 @@ function seedRealOmlxPlanFlowScenario() {
         status: block.status || "",
       })),
       debugTail: ((window as any).__REAL_OMLX_DEBUG_LOGS__ || []).slice(-80),
+      dispatchError: bridge.dispatchError || null,
       seedCount: readSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO),
     };
   };

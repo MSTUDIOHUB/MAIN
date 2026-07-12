@@ -101,6 +101,21 @@ export function isGameEngineLikelyServer(
   return /\b(unreal|ue4|ue5|ue)\b/i.test(text);
 }
 
+export function isGameEngineMcpServer(server: Pick<MCPServer, "name" | "url">): boolean {
+  return ["unity", "godot", "unreal"].some((engine) =>
+    isGameEngineLikelyServer(server, engine)
+  );
+}
+
+export function shouldExposeGameEngineMcpServer(input: {
+  server: Pick<MCPServer, "name" | "url">;
+  gameStudioEngineContext: boolean;
+  unityCommandRequested: boolean;
+}): boolean {
+  if (!isGameEngineMcpServer(input.server)) return true;
+  return input.gameStudioEngineContext || input.unityCommandRequested;
+}
+
 export function extractMcpCallFailureCategory(content: string): string | null {
   const match = content.match(/MCP_CALL_FAILURE\[([^[\]]+)\]/i);
   return match ? match[1].toLowerCase() : null;

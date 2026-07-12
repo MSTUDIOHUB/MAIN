@@ -25,6 +25,17 @@ export type ApprovedPlanFinalizationResult = {
   consecutiveNoToolCount: number;
 };
 
+export function buildApprovedPlanEvidenceCompletionMessage(input: {
+  language: "zh" | "en";
+  completedCount: number;
+  totalCount: number;
+}): string {
+  if (input.language === "en") {
+    return `Completed the approved Plan (${input.completedCount}/${input.totalCount}). MAIN verified the planned mutations and validation evidence for every task; no additional model-authored completion claim was required.`;
+  }
+  return `已按批准的 Plan 完成全部任务（${input.completedCount}/${input.totalCount}）。MAIN 已逐项核验计划要求的修改和验证证据，无需再依赖模型额外声明完成。`;
+}
+
 function buildApprovedPlanContinuationForRemainingTasks(input: {
   callbacks: OrchestratorCallbacks;
   audit: PlanTaskEvidenceAudit | null;

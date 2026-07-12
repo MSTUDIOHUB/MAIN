@@ -282,6 +282,14 @@ export interface PlanTaskEvidence {
   kind: PlanTaskEvidenceKind;
   value: string;
   inferred?: boolean;
+  /**
+   * Explicit code/config identifiers that must occur in the fresh changed
+   * lines for a file mutation to satisfy this evidence.  This prevents a
+   * write to the right path but unrelated content from completing a Plan
+   * task.  It is intentionally optional because prose-only changes cannot be
+   * reduced to identifiers safely.
+   */
+  requiredTerms?: string[];
 }
 
 export interface PlanExecutionEvidenceEntry {
@@ -291,6 +299,8 @@ export interface PlanExecutionEvidenceEntry {
   sourceTool: string;
   target?: string;
   references?: string[];
+  /** Identifiers observed in fresh added/changed lines of this mutation. */
+  changedIdentifiers?: string[];
   createdAt: number;
 }
 
@@ -838,6 +848,12 @@ function isLikelyWorkspaceFileReference(value: string): boolean {
   if (/^\d+(?:\.\d+)+$/.test(normalized)) return false;
   const ext = normalized.split(".").pop() || "";
   if (/^\d+$/.test(ext) && !normalized.includes("/")) return false;
+  if (
+    !normalized.includes("/") &&
+    !/\.(?:tsx?|jsx?|mjs|cjs|json|jsonc|ya?ml|toml|rs|py|go|java|kt|kts|cs|cpp|cc|cxx|c|h|hpp|swift|vue|svelte|css|scss|sass|less|html?|md|mdx|txt|csv|tsv|xml|sql|sh|bash|zsh|fish|ps1|env|lock)$/i.test(normalized)
+  ) {
+    return false;
+  }
   return true;
 }
 
@@ -921,6 +937,14 @@ function commandLooksLikePlaywrightOrBrowserTest(value: string): boolean {
   return /\b(?:playwright|cypress|puppeteer|browser\s+test|e2e)\b/i.test(String(value || ""));
 }
 
+const FOCUSED_VALIDATION_COMMAND = "focused validation command";
+
+function commandLooksLikeFiniteValidation(value: string): boolean {
+  return /(?:\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)\b|\bnpx\s+(?:tsc|playwright|vitest|jest)\b|\b(?:cargo\s+(?:test|check|clippy)|pytest|python\s+-m\s+(?:pytest|unittest)|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b)/i.test(
+    String(value || ""),
+  );
+}
+
 function commandLooksLikeDevServerOrHttpProbe(value: string): boolean {
   return /\b(?:npm|pnpm|yarn|bun|npx)\s+(?:run\s+)?(?:dev|preview|vite)\b/i.test(String(value || "")) ||
     /\b(?:vite|webpack-dev-server|next\s+dev)\b/i.test(String(value || "")) ||
@@ -939,6 +963,7 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
   const expected = normalizeCommandEvidenceValue(expectedRaw);
   const actual = normalizeCommandEvidenceValue(actualRaw);
   if (!expected || !actual) return false;
+  if (expected === FOCUSED_VALIDATION_COMMAND) return commandLooksLikeFiniteValidation(actual);
   if (expected === actual) return true;
 
   const actualSegments = splitCommandEvidenceSegments(actual);
@@ -970,6 +995,13 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
   if (!VALIDATION_ACTION_RE.test(normalized)) return [];
   if (commands.some(commandLooksLikePlaywrightOrBrowserTest)) {
     return [];
+  }
+
+  const hasAutomatableValidationAlternative =
+    /(?:聚焦测试|构建检查|类型检查|单元测试|(?:测试|检查).{0,30}(?:构建|编译)|(?:构建|编译).{0,30}(?:测试|检查)|focused tests?|build checks?|typechecks?|unit tests?|(?:tests?|checks?).{0,40}(?:build|compile)|(?:build|compile).{0,40}(?:tests?|checks?))/i.test(normalized);
+  if (hasAutomatableValidationAlternative) {
+    const parsed = makePlanTaskEvidence("cmd", FOCUSED_VALIDATION_COMMAND, true);
+    return parsed ? [parsed] : [];
   }
 
   if (TAURI_VALIDATION_RE.test(normalized)) {
@@ -1074,10 +1106,41 @@ function makePlanTaskEvidence(
   kind: PlanTaskEvidenceKind,
   value: string,
   inferred = false,
+  requiredTerms: string[] = [],
 ): PlanTaskEvidence | null {
   const clean = String(value || "").replace(/^['"`]+|['"`]+$/g, "").trim();
   if (!clean) return null;
-  return { kind, value: clean, ...(inferred ? { inferred: true } : {}) };
+  const normalizedRequiredTerms = Array.from(new Set(requiredTerms
+    .map((term) => String(term || "").trim())
+    .filter((term) => /^[A-Za-z_$][\w$-]*$/.test(term))))
+    .slice(0, 6);
+  return {
+    kind,
+    value: clean,
+    ...(inferred ? { inferred: true } : {}),
+    ...(normalizedRequiredTerms.length > 0 ? { requiredTerms: normalizedRequiredTerms } : {}),
+  };
+}
+
+function inferMutationRequiredTerms(text: string): string[] {
+  const normalized = String(text || "");
+  const directionalPatterns = [
+    /`([A-Za-z_$][\w$-]*)`\s*(?:映射|重命名|替换|改名|转换)\s*(?:为|成|到)\s*`([A-Za-z_$][\w$-]*)`/i,
+    /(?:rename|map|replace|convert)\s+`?([A-Za-z_$][\w$-]*)`?\s+(?:to|as|with)\s+`?([A-Za-z_$][\w$-]*)`?/i,
+    /`([A-Za-z_$][\w$-]*)`\s*(?:→|->|=>)\s*`([A-Za-z_$][\w$-]*)`/,
+  ];
+  for (const pattern of directionalPatterns) {
+    const match = normalized.match(pattern);
+    if (match?.[2]) return [match[2]];
+  }
+
+  const terms: string[] = [];
+  for (const match of normalized.matchAll(/`([A-Za-z_$][\w$-]*)`/g)) {
+    const term = String(match[1] || "");
+    if (!term || /^(?:src|test|tests|file|true|false|null|undefined)$/i.test(term)) continue;
+    terms.push(term);
+  }
+  return Array.from(new Set(terms)).slice(0, 4);
 }
 
 function inferSourcePathFromCodeIdentifier(identifier: string): string | null {
@@ -1110,7 +1173,7 @@ function dedupePlanTaskEvidence(evidence: PlanTaskEvidence[]): PlanTaskEvidence[
   const seen = new Set<string>();
   const deduped: PlanTaskEvidence[] = [];
   for (const item of evidence) {
-    const key = `${item.kind}:${normalizePlanEvidenceValue(item.value)}`;
+    const key = `${item.kind}:${normalizePlanEvidenceValue(item.value)}:${(item.requiredTerms || []).join(",")}`;
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(item);
@@ -1145,9 +1208,17 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
   }
 
   const fileEvidence: PlanTaskEvidence[] = [];
+  const mutationRequiredTerms = isLikelySourceMutationTask(text)
+    ? inferMutationRequiredTerms(text)
+    : [];
   for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
     if (!isLikelyWorkspaceFileReference(matched[1] || "")) continue;
-    const parsed = makePlanTaskEvidence("file", matched[1] || "", true);
+    const parsed = makePlanTaskEvidence(
+      "file",
+      matched[1] || "",
+      true,
+      mutationRequiredTerms,
+    );
     if (parsed) fileEvidence.push(parsed);
   }
 
@@ -1213,7 +1284,13 @@ function evidenceMatchesRecord(
 
   if (evidence.kind === "file" || evidence.kind === "deliverable") {
     if (record.kind === "file" || record.kind === "deliverable") {
-      return evidencePathMatches(record.value || record.target || "", evidence.value);
+      if (!evidencePathMatches(record.value || record.target || "", evidence.value)) return false;
+      const requiredTerms = evidence.requiredTerms || [];
+      if (requiredTerms.length === 0) return true;
+      const changedIdentifiers = new Set(
+        (record.changedIdentifiers || []).map((term) => term.toLocaleLowerCase()),
+      );
+      return requiredTerms.every((term) => changedIdentifiers.has(term.toLocaleLowerCase()));
     }
     if (
       record.kind === "cmd" &&
@@ -1402,7 +1479,9 @@ export function reconcilePlanTaskCompletion(
 
 function formatAuditEvidence(task: PlanTask): string {
   const evidence = task.evidence && task.evidence.length > 0
-    ? task.evidence.map((item) => `${item.kind}:${item.value}`).join(", ")
+    ? task.evidence.map((item) =>
+        `${item.kind}:${item.value}${item.requiredTerms?.length ? ` requires-change:${item.requiredTerms.join("|")}` : ""}`
+      ).join(", ")
     : "";
   return evidence || "missing evidence label";
 }
@@ -1583,7 +1662,7 @@ const RUNTIME_TASK_SECTION_RE =
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
   /(?:用户目标|目标|摘要|概要|当前状态|状态发现|已确认发现|已确认事实|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|证据|已读证据|最相关证据|假设|默认值|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|User Goals?|Goals?|Summary|Overview|Current State|Confirmed Findings|Findings|Background|Root Cause|Tech Stack|Architecture|Evidence|Read Evidence|Most Relevant Evidence|Assumptions|Defaults|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
-  /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO|\.\.\.)/i;
+  /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO)/i;
 const RUNTIME_TASK_CHANGE_HEADING_RE =
   /^(?:改动|变更|changes?)\s*\d*\s*[：:]\s*(.+)$/i;
 const RUNTIME_TASK_CHANGE_DETAIL_RE =
@@ -1606,7 +1685,7 @@ function isMarkdownTableSyntaxLine(line: string): boolean {
   return text.slice(1, -1).includes("|");
 }
 
-function isRuntimeTaskActionableText(text: string): boolean {
+export function isRuntimeTaskActionableText(text: string): boolean {
   const normalized = String(text || "");
   if (!normalized.trim()) return false;
   if (isMarkdownTableSyntaxLine(normalized)) return false;
@@ -1640,7 +1719,7 @@ function isRuntimeTaskActionableText(text: string): boolean {
   return RUNTIME_TASK_ACTION_RE.test(normalized);
 }
 
-function collectRuntimeTaskCandidateLines(content: string): string[] {
+export function collectRuntimeTaskCandidateLines(content: string): string[] {
   const lines = String(content || "").split(/\r?\n/);
   const candidates: string[] = [];
   let inUsefulSection = false;
@@ -1661,9 +1740,15 @@ function collectRuntimeTaskCandidateLines(content: string): string[] {
     if (!/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) continue;
     if (isMarkdownTableSyntaxLine(line)) continue;
     const text = stripMarkdownTaskLine(line);
-    if (text.length < 8 || text.length > 220) continue;
+    // PlanCandidate change lines intentionally preserve concrete rationale and
+    // evidence references, so a valid mutation bullet can be substantially
+    // longer than a chat-sized task label. Rejecting it here made approval see
+    // the reviewed artifact as mutation-oriented while deriving only its short
+    // validation bullet. Keep the complete contract through task projection;
+    // UI presentation can compact it separately.
+    if (text.length < 8 || text.length > 800) continue;
     if (isMarkdownTableSyntaxLine(text)) continue;
-    if (RUNTIME_TASK_PLACEHOLDER_RE.test(text)) continue;
+    if (RUNTIME_TASK_PLACEHOLDER_RE.test(text) || /^(?:\.{3}|…+)$/.test(text)) continue;
     const evidence = inferPlanTaskEvidence(text, extractShellCommandsFromText(text));
     if (/[:：]\s*$/.test(text) && (evidence.length === 0 || !RUNTIME_TASK_MUTATION_RE.test(text))) continue;
     if (!isRuntimeTaskActionableText(text)) continue;
@@ -2392,9 +2477,10 @@ export function analyzePlanDecisionFork(content: string): PlanDecisionForkAnalys
   const forkContext = extractPlanDecisionForkContext(raw);
   const hasUserVisibleDecision = hasUserVisibleDecisionCue(`${options.join("\n")}\n${forkContext}`);
   const hasBlockingCue =
-    /(?:需要|需|请|等待|必须).{0,32}(?:选择|确认|决定|取舍|拍板)/i.test(raw) ||
-    /(?:选择|确认|决定).{0,24}(?:方案|选项|路径|优先级|[A-CＡ-Ｃ1-3一二三])/i.test(raw) ||
-    /二选一|三选一|取舍|优先级|which option|choose|decision required|trade[- ]off|needs? confirmation/i.test(raw);
+    /(?:需要|需|请|等待|必须)(?:由)?用户.{0,32}(?:选择|确认|决定|取舍|拍板)/i.test(forkContext) ||
+    /(?:用户)(?:必须|需要|需).{0,32}(?:选择|确认|决定|取舍|拍板)/i.test(forkContext) ||
+    /(?:选择|确认|决定)(?:方案|选项|路径)\s*[A-CＡ-Ｃ1-3一二三].{0,20}(?:或|还是|vs\.?|versus).{0,20}[A-CＡ-Ｃ1-3一二三]/i.test(forkContext) ||
+    /二选一|三选一|decision required|user must choose|needs? user confirmation/i.test(forkContext);
 
   if (hasExplicitUserOptions) {
     return {
@@ -2408,7 +2494,7 @@ export function analyzePlanDecisionFork(content: string): PlanDecisionForkAnalys
     };
   }
 
-  if (hasUserVisibleDecision) {
+  if (hasUserVisibleDecision && hasBlockingCue) {
     return {
       hasFork: true,
       classification: "blocking",

@@ -343,7 +343,9 @@ export function formatPlanTaskListForPrompt(tasks: PlanTask[], language: "zh" | 
       : "- No runtime tasks yet; first derive an auditable task list from plan.md.";
   }
   return visibleTasks.map((task, index) => {
-    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
+    const evidence = task.evidence?.map((item) =>
+      `${item.kind}:${item.value}${item.requiredTerms?.length ? ` requires-change:${item.requiredTerms.join("|")}` : ""}`
+    ).join(", ") ||
       (language === "zh" ? "无证据标签" : "no evidence label");
     return `${index + 1}. ${task.text} [${evidence}]`;
   }).join("\n");

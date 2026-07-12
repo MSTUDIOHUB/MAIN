@@ -1,5 +1,6 @@
 import { buildExecutionDigest } from "../../executionDigest";
 import {
+  collectPlanClosureMaterializationInput,
   EDIT_PROGRESS_TOOL_NAMES,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   compactDiagnosticText,
@@ -38,6 +39,7 @@ type EmitTaskOrchestratorPhase = (
 type RecentSuccessfulProjectWrite = { name: string; target: string } | null;
 
 export type ToolResultPostProcessingResult = {
+  planRuntimePhase: PlanRuntimePhase;
   recentSuccessfulProjectWrite: RecentSuccessfulProjectWrite;
   recoveringFromEmptyAssistantReplyAfterWrite: boolean;
   unityConsoleFinalVerificationRequired: boolean;
@@ -101,7 +103,7 @@ export function handleToolResultPostProcessing(input: {
     unityConsoleDiagnosticsRequested,
     markExecuteOperationEvidence,
     activateUnityMcpFallback,
-    setPlanRuntimePhase,
+    setPlanRuntimePhase: commitPlanRuntimePhase,
     emitTaskOrchestratorPhase,
     clearExecuteRecovery,
   } = input;
@@ -116,6 +118,11 @@ export function handleToolResultPostProcessing(input: {
   let approvedPlanActionOnlyRecoveryActive = input.approvedPlanActionOnlyRecoveryActive;
   let approvedPlanNoToolRecoveryFileReadActive = input.approvedPlanNoToolRecoveryFileReadActive;
   let approvedPlanNoProgressRecoveryAttempts = input.approvedPlanNoProgressRecoveryAttempts;
+  let effectivePlanRuntimePhase = planRuntimePhase;
+  const setPlanRuntimePhase: SetPlanRuntimePhase = (phase, reason, status) => {
+    effectivePlanRuntimePhase = phase;
+    commitPlanRuntimePhase(phase, reason, status);
+  };
   // Internal quality-gate feedback is model/runtime control flow. It must not
   // become user progress, execution evidence, task targeting or success usage.
   const externalResults = results.filter((result) => !result.internalFeedback);
@@ -203,6 +210,60 @@ export function handleToolResultPostProcessing(input: {
   if (
     workflowMode === "plan" &&
     !callbacks.getIsPlanApproved() &&
+    !hasPlanDecisionOutput &&
+    ["explore_structure", "grounding", "needs_evidence", "synthesis"].includes(String(planRuntimePhase))
+  ) {
+    // Evidence convergence is a runtime decision, not a model/iteration-count
+    // decision. Build the exact bundle that drafting and validation will use
+    // after every successful read batch. Once it has semantic facts and a
+    // grounded change target, freeze the read surface immediately. This keeps
+    // a local model from rereading the same impact target until the generic
+    // repetition guard terminates the whole turn.
+    const closureInput = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      [],
+      "",
+    );
+    const bundle = closureInput.evidenceBundle;
+    if (bundle.facts.length > 0 && bundle.changeTargets.length > 0) {
+      setPlanRuntimePhase("drafting", "semantic evidence bundle ready");
+      logAgentEvent("plan_evidence_bundle_frozen", {
+        iteration,
+        evidenceBundleId: bundle.bundleId,
+        evidenceBundleHash: bundle.hash,
+        semanticFacts: bundle.facts.length,
+        changeTargets: bundle.changeTargets.length,
+        verificationTargets: bundle.verificationTargets.length,
+        previousPhase: planRuntimePhase,
+      });
+    } else if (
+      planRuntimePhase === "explore_structure" &&
+      externalResults.some((result) =>
+        !result.isError &&
+        result.name !== "get_project_skeleton" &&
+        PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
+      )
+    ) {
+      // read_file is intentionally available during structure exploration.
+      // A successful targeted read therefore has to advance the phase here;
+      // waiting for the old "unsupported tool" redirect leaves the runtime in
+      // explore_structure forever and prevents bundle injection/drafting.
+      setPlanRuntimePhase("grounding", "targeted evidence read completed");
+      logAgentEvent("plan_structure_phase_advanced_for_targeted_result", {
+        iteration,
+        previousPhase: planRuntimePhase,
+        nextPhase: "grounding",
+        toolNames: externalResults
+          .filter((result) => !result.isError)
+          .map((result) => result.name)
+          .slice(0, 8),
+      });
+    }
+  }
+  if (
+    workflowMode === "plan" &&
+    !callbacks.getIsPlanApproved() &&
     planRuntimePhase === "explore_structure" &&
     externalResults.some((result) => result.name === "get_project_skeleton")
   ) {
@@ -282,6 +343,7 @@ export function handleToolResultPostProcessing(input: {
   }
 
   return {
+    planRuntimePhase: effectivePlanRuntimePhase,
     recentSuccessfulProjectWrite,
     recoveringFromEmptyAssistantReplyAfterWrite,
     unityConsoleFinalVerificationRequired,

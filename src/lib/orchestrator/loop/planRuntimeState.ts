@@ -130,10 +130,12 @@ export function applyPlanNoToolRuntimeState(
 
 export function applyToolResultPlanRuntimeState(
   state: PlanLoopRuntimeState,
-  input: Pick<PlanLoopRuntimeState, "planDraftingRecoveryReadCount">,
+  input: Pick<PlanLoopRuntimeState, "planDraftingRecoveryReadCount"> &
+    Partial<Pick<PlanLoopRuntimeState, "planRuntimePhase">>,
 ): PlanLoopRuntimeState {
   return {
     ...state,
+    planRuntimePhase: input.planRuntimePhase ?? state.planRuntimePhase,
     planDraftingRecoveryReadCount: input.planDraftingRecoveryReadCount,
   };
 }

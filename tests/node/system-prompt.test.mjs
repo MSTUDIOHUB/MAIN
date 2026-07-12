@@ -357,8 +357,8 @@ test("workflow prompt with no tools does not show executable XML templates", () 
 
   assert.match(prompt, /availableTools: none/);
   assert.match(prompt, /本轮没有暴露可调用工具/);
-  assert.match(prompt, /没有计划写入工具时 plan\.md 不强制/);
-  assert.match(prompt, /不要声称已经写入计划文件/);
+  assert.match(prompt, /进入审核前必须由 runtime 物化 plan\.md/);
+  assert.match(prompt, /计划文件写入由 runtime 而不是模型负责/);
   assert.doesNotMatch(prompt, /<tool_use>/);
   assert.doesNotMatch(prompt, /<tool>read_file<\/tool>/);
   assert.doesNotMatch(prompt, /plan\.md 必选/);
@@ -485,7 +485,7 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   assert.doesNotMatch(prompt, /必须生成精简的 `\.MAIN\/plans\/requirements\.md`/);
 });
 
-test("plan prompt prefers pre-approval plan.md writes for complex planning", () => {
+test("plan prompt keeps plan.md materialization runtime-owned even when write tools are listed", () => {
   const prompt = buildSystemPrompt(
     [],
     "/tmp/workspace",
@@ -502,10 +502,10 @@ test("plan prompt prefers pre-approval plan.md writes for complex planning", () 
     ["read_file", "write_file", "replace_in_file"],
   );
 
-  assert.match(prompt, /正式审批首选写入 `\.MAIN\/plans\/plan\.md`/);
-  assert.match(prompt, /证据足够后用 `write_file`、`replace_in_file` 写 `\.MAIN\/plans\/plan\.md`|收集只读证据后，用本轮可用计划写入工具/);
+  assert.match(prompt, /MAIN runtime 校验并物化 `\.MAIN\/plans\/plan\.md`/);
+  assert.match(prompt, /输出可见 `<proposed_plan>` Markdown/);
   assert.doesNotMatch(prompt, /\.\.MAIN\/plans\/plan\.md|\.\\\.MAIN\/plans\/plan\.md/);
-  assert.doesNotMatch(prompt, /MAIN runtime 会物化为 `\.MAIN\/plans\/plan\.md`/);
+  assert.doesNotMatch(prompt, /用本轮可用计划写入工具|证据足够后用 `write_file`/);
 });
 
 test("system prompt tells the model to stop after emitting user options", () => {

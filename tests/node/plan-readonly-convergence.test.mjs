@@ -106,6 +106,8 @@ test("plan evidence readiness requires observed user context and targeted reads"
       reason: "provided_context_not_observed",
       successfulTargetedReads: 0,
       successfulSearches: 1,
+      semanticFacts: 0,
+      changeTargets: 0,
     },
   );
 
@@ -123,7 +125,7 @@ test("plan evidence readiness requires observed user context and targeted reads"
     assessPlanEvidenceReadiness({
       hasObservedUserContext: true,
       recentToolActivity: [
-        { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+        { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
       ],
     }).status,
     "needs_targeted_read",
@@ -134,7 +136,7 @@ test("plan evidence readiness requires observed user context and targeted reads"
       hasObservedUserContext: true,
       recentToolActivity: [
         { name: "grep_search", target: "csv/import/loadData", status: "succeeded" },
-        { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+        { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
       ],
     }).status,
     "ready_for_plan",
@@ -158,7 +160,7 @@ test("plan read-only convergence stops broad discovery before targeted evidence 
     batchCount: 3,
     toolCount: 3,
     recentToolActivity: [
-      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
   }), false);
 
@@ -169,7 +171,7 @@ test("plan read-only convergence stops broad discovery before targeted evidence 
     toolCount: 3,
     recentToolActivity: [
       { name: "grep_search", target: "csv/import/loadData", status: "succeeded" },
-      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
   }), true);
 
@@ -179,8 +181,8 @@ test("plan read-only convergence stops broad discovery before targeted evidence 
     batchCount: 2,
     toolCount: 12,
     recentToolActivity: [
-      { name: "get_file_outline", target: "src/store/dashboardStore.ts", status: "succeeded" },
-      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+      { name: "get_file_outline", target: "src/store/dashboardStore.ts", status: "succeeded", detail: "dashboardStore consumes creatorName for grouping" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
   }), true);
 });
@@ -203,7 +205,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     userContext: { imageParts: 2 },
     hasObservedUserContext: false,
     recentToolActivity: [
-      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
   }), false);
 
@@ -215,7 +217,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     userContext: { imageParts: 2 },
     hasObservedUserContext: true,
     recentToolActivity: [
-      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
   }), false);
 
@@ -228,7 +230,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     hasObservedUserContext: true,
     recentToolActivity: [
       { name: "grep_search", target: "csv|dashboard", status: "succeeded" },
-      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
   }), true);
 
@@ -240,9 +242,9 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     userContext: { attachedFilePaths: ["logs/main-debug.log"] },
     hasObservedUserContext: true,
     recentToolActivity: [
-      { name: "read_file", target: "logs/main-debug.log", status: "succeeded" },
+      { name: "read_file", target: "logs/main-debug.log", status: "succeeded", detail: "log records the exact plan_generation_failed stop after evidence materialization rejection" },
     ],
-  }), true);
+  }), false);
 
   assert.equal(shouldTriggerPlanReadOnlyConvergence({
     isUnapprovedPlanReadOnlyBatch: true,
@@ -272,7 +274,7 @@ test("plan convergence helper emits the first convergence prompt and updates cou
     turnInputContextSignals: { imageParts: 0, mentionedFilePaths: [], attachedFilePaths: [], externalAttachments: [] },
     recentPlanToolActivity: [
       { name: "grep_search", target: "csv|dashboard", status: "succeeded" },
-      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded" },
+      { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
     lastAssistantTextForCheckpoint: "",
     setPlanRuntimePhase: (phase, reason) => phases.push({ phase, reason }),
@@ -667,7 +669,7 @@ function createPostConvergenceInput(overrides = {}) {
   };
 }
 
-test("post-convergence helper injects the single drafting recovery read", () => {
+test("post-convergence helper closes drafting tools and requests visible plan output", () => {
   const { harness, phases, input } = createPostConvergenceInput({
     input: {
       visibleAssistantText: "I need one more file.",
@@ -684,13 +686,13 @@ test("post-convergence helper injects the single drafting recovery read", () => 
   assert.equal(harness.appended.length, 2);
   assert.equal(harness.appended[0].role, "assistant");
   assert.equal(harness.appended[1].role, "user");
-  assert.match(harness.appended[1].content, /PLAN_DRAFTING_RECOVERY_READ/);
+  assert.match(harness.appended[1].content, /PLAN_DRAFTING_OUTPUT_NOW/);
   assert.deepEqual(harness.statuses, []);
   assert.deepEqual(harness.streamTokens, []);
   assert.deepEqual(phases, []);
 });
 
-test("post-convergence helper forces a plan write after recovery is exhausted", () => {
+test("post-convergence helper forces visible plan convergence after recovery is exhausted", () => {
   const { harness, phases, input } = createPostConvergenceInput({
     input: {
       effectiveToolCalls: [{ id: "call_list", name: "list_directory", arguments: "{}" }],
@@ -710,10 +712,10 @@ test("post-convergence helper forces a plan write after recovery is exhausted", 
   assert.equal(result.planAutoScaffoldPromptIssued, false);
   assert.equal(harness.appended.length, 1);
   assert.equal(harness.appended[0].role, "user");
-  assert.match(harness.appended[0].content, /FORCED WRITE/);
+  assert.match(harness.appended[0].content, /FORCED CONVERGENCE/);
   assert.deepEqual(harness.statuses, ["running"]);
   assert.deepEqual(harness.streamTokens, [{ token: "__ESCALATION_RESET__:", id: "assistant-1" }]);
-  assert.deepEqual(phases, [{ phase: "drafting", reason: "recovery exhausted, write with existing evidence" }]);
+  assert.deepEqual(phases, [{ phase: "drafting", reason: "recovery exhausted, draft with frozen evidence" }]);
 });
 
 test("post-convergence plan turns redirect more read-only tools before execution", () => {

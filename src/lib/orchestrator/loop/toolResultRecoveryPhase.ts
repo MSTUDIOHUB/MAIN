@@ -14,6 +14,7 @@ import type {
   PlanExecutionProgressUpdate,
   PlanRuntimePhase,
 } from "../../workflowModels";
+import { buildPlanTaskEvidenceAudit } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
 import type { ApprovedPlanNoProgressDecision } from "./loopRecovery";
 import {
@@ -94,12 +95,13 @@ type ApprovedPlanNoProgressRecoveryAction = (
 
 export type ToolResultRecoveryPhaseResult =
   | {
-      status: "continue" | "stopped";
+      status: "continue" | "stopped" | "plan_completed";
       planRuntimeState: PlanLoopRuntimeState;
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
       approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
+      completionAudit?: { completedCount: number; totalCount: number };
     }
   | {
       status: "completed";
@@ -108,6 +110,7 @@ export type ToolResultRecoveryPhaseResult =
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
       approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
+      completionAudit?: { completedCount: number; totalCount: number };
     };
 
 export async function handleToolResultRecoveryPhase(input: {
@@ -164,6 +167,7 @@ export async function handleToolResultRecoveryPhase(input: {
   let executeRecoveryState = input.executeRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
   let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
+  let completionAudit: { completedCount: number; totalCount: number } | undefined;
   const activateExecuteRecoveryAndSync: ActivateExecuteRecovery = (mode, reason, context) => {
     // The callback updates the outer loop immediately. Mirror the returned
     // state locally so this phase cannot fold an older `normal` state back over
@@ -205,6 +209,56 @@ export async function handleToolResultRecoveryPhase(input: {
     planQualityRecovery,
   );
   const pendingPlanRuntimeRecoveryPrompt = planQualityRecovery.pendingPlanRuntimeRecoveryPrompt;
+
+  // Codex-style Plan execution is runtime-owned: once every task in the
+  // approved revision has fresh trusted evidence, do not spend another model
+  // turn asking it to narrate or declare completion.  Persist the current tool
+  // results first, then close the execution lease deterministically.
+  if (input.workflowMode === "plan" && input.callbacks.getIsPlanApproved()) {
+    const audit = buildPlanTaskEvidenceAudit({
+      tasks: input.callbacks.getPlanTasks(),
+      evidenceLedger: input.callbacks.getPlanExecutionEvidenceLedger(),
+      highlightNext: true,
+    });
+    if (
+      audit.totalCount > 0 &&
+      audit.allTrustedComplete &&
+      !audit.pendingExternalValidation
+    ) {
+      appendToolResultsToHistory({
+        callbacks: input.callbacks,
+        toolFeedbackFormat: input.toolFeedbackFormat,
+        results: input.results,
+        toolArgsByCallId: input.toolArgsByCallId,
+        iterationContext: input.iterationContext,
+        emitTurnEvent: input.emitTurnEvent,
+      });
+      input.emitTaskOrchestratorPhase("DONE", {
+        reason: "plan_evidence_complete_after_tool",
+        iteration: input.iteration,
+        completed: audit.completedCount,
+        total: audit.totalCount,
+      });
+      input.emitPlanExecutionProgress("completed", {
+        currentTask: "",
+        currentTool: "",
+        nextStep: "",
+      });
+      input.callbacks.onPlanStageChanged("completed");
+      logAgentEvent("plan_execution_completed_from_runtime_evidence", {
+        iteration: input.iteration,
+        completed: audit.completedCount,
+        total: audit.totalCount,
+        evidenceCount: input.callbacks.getPlanExecutionEvidenceLedger().length,
+        modelCompletionClaimRequired: false,
+      });
+      completionAudit = {
+        completedCount: audit.completedCount,
+        totalCount: audit.totalCount,
+      };
+      return finish("plan_completed");
+    }
+  }
 
   const noProgressRecovery = handleNoProgressRecovery({
     callbacks: input.callbacks,
@@ -543,6 +597,7 @@ export async function handleToolResultRecoveryPhase(input: {
       executeRecoveryState,
       recoveryPromptState,
       approvedPlanRecoveryState,
+      ...(completionAudit ? { completionAudit } : {}),
     };
   }
 }

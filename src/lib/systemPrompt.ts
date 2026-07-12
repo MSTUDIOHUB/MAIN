@@ -543,10 +543,6 @@ export function buildSystemPrompt(
     "replace_in_file",
     "write_file",
   ].filter((name) => isToolNameAvailable(name, availableToolNames));
-  const exposedPlanWriteToolNames = [
-    "write_file",
-    "replace_in_file",
-  ].filter((name) => isToolNameAvailable(name, availableToolNames));
   const readToolText = formatAvailableToolNamesOrFallback(
     exposedReadToolNames,
     "当前没有暴露读取/搜索工具",
@@ -554,10 +550,6 @@ export function buildSystemPrompt(
   const writeToolText = formatAvailableToolNamesOrFallback(
     exposedWriteToolNames,
     "当前没有暴露写入工具",
-  );
-  const planWriteToolText = formatAvailableToolNamesOrFallback(
-    exposedPlanWriteToolNames,
-    "当前没有暴露计划写入工具",
   );
   const filePagingWarning = shellToolsAvailable
     ? "不要用 `run_command`、`cat`、`sed`、`head`、`tail` 作为常规分页读文件手段。"
@@ -588,7 +580,7 @@ export function buildSystemPrompt(
     "================================",
     "[CORE TOOL PROTOCOL]",
     `Prompt language strategy: ${promptLanguageStrategy}.`,
-    `Effective turn contract: conversationIntent=${turnContract.conversationIntent}; runtimeIntent=${turnContract.runtimeIntent}; approvalState=${turnContract.approvalState}; mutationExpected=${turnContract.mutationExpected ? "true" : "false"}; validationExpected=${turnContract.validationExpected ? "true" : "false"}; completionEvidenceRequired=${turnContract.completionEvidenceRequired}.`,
+    `Effective turn contract: conversationIntent=${turnContract.conversationIntent}; runtimeIntent=${turnContract.runtimeIntent}; planReviewState=${turnContract.planReviewState}; operationApprovalState=${turnContract.operationApprovalState}; mutationExpected=${turnContract.mutationExpected ? "true" : "false"}; validationExpected=${turnContract.validationExpected ? "true" : "false"}; completionEvidenceRequired=${turnContract.completionEvidenceRequired}.`,
     "Tool availability is intent-scoped. Only call tools that are actually exposed in this turn's tool list.",
     "MAIN may attach second-level command metadata for this turn; use it to choose the concrete tool family, but keep the top-level intent boundary intact.",
     "Native tool calls may be emitted directly; the UI will display tool progress, approvals, diffs, terminal output, and failures.",
@@ -612,7 +604,7 @@ export function buildSystemPrompt(
     "[SAFETY AND PERMISSION BOUNDARY]",
     "Read-only and external-read tools may be used without asking for step-by-step consent.",
     "Workspace writes, shell execution, browser control, external writes, and destructive operations are approval-gated by the runtime.",
-    "Plan turns follow the opencode-style file workflow: before approval, the only allowed write is `.MAIN/plans/plan.md` or an optional evidence ledger under `.MAIN/plans/`. Source edits and final deliverables wait for plan approval.",
+    "Plan turns use a runtime-owned artifact workflow: the model gathers read-only evidence and emits a visible `<proposed_plan>` candidate; MAIN validates and materializes `.MAIN/plans/plan.md`. The model must not write plan artifacts, source files, tasks.md, or final deliverables before approval.",
     "If a needed write, command, Git, deployment, browser-control, external-write, or deliverable-generation tool is absent because of the current intent, continue with available safe tools or explain the blocker and ask for operation approval with `<user_options>`.",
     "",
     "[LOCALIZED USER OUTPUT]",
@@ -816,12 +808,8 @@ export function buildSystemPrompt(
       "================================",
       "[TURN INTENT: PLAN]",
       planLang === "en"
-        ? (exposedPlanWriteToolNames.length > 0
-            ? `You are in PLAN mode this turn. Goal: collect read-only evidence, then write a reviewable plan to \`.MAIN/plans/plan.md\` with the exposed plan write tools (${planWriteToolText}). Approval-gated: no source edits, no tasks.md, no deliverables before user approval.`
-            : "You are in PLAN mode this turn. Goal: collect read-only evidence and produce a visible reviewable plan. No plan write tool is exposed, so do not emit fake tool calls; use `<proposed_plan>` Markdown and wait for approval.")
-        : (exposedPlanWriteToolNames.length > 0
-            ? `本轮处于 PLAN 模式。目标：收集只读证据后，用本轮可用计划写入工具（${planWriteToolText}）写入可审批计划 \`.MAIN/plans/plan.md\`。批准前禁止修改源码、生成 tasks.md 或输出交付物。`
-            : "本轮处于 PLAN 模式。目标：收集只读证据并输出可审批方案；本轮没有暴露计划写入工具，不要伪造工具调用，改用 `<proposed_plan>` Markdown 并等待批准。"),
+        ? "You are in PLAN mode this turn. Collect read-only evidence, then output visible `<proposed_plan>` Markdown. MAIN runtime validates and materializes `.MAIN/plans/plan.md`; do not emit file-write tool calls."
+        : "本轮处于 PLAN 模式。收集只读证据后输出可见 `<proposed_plan>` Markdown；`.MAIN/plans/plan.md` 由 MAIN runtime 校验并物化，不要发出文件写入工具调用。",
       "",
       "## Core Rules",
       planLang === "en"
@@ -830,34 +818,22 @@ export function buildSystemPrompt(
             ? `1. Explore first with the exposed read/search tools (${readToolText}). Use \`get_project_skeleton\` only when it is exposed and no narrower clue exists; do not re-scan directories.`
             : "1. No read/search tool is exposed. Do not fake exploration; base the plan on provided user evidence and state any missing evidence explicitly.",
           "2. Grounding: use screenshots, attachments, and @ files as primary evidence. State what you observe.",
-          exposedPlanWriteToolNames.length > 0
-            ? `3. Convergence: once evidence is sufficient, write \`.MAIN/plans/plan.md\` with ${planWriteToolText} — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.`
-            : "3. Convergence: once evidence is sufficient, output `<proposed_plan>` Markdown — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.",
+          "3. Convergence: once evidence is sufficient, output `<proposed_plan>` Markdown — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.",
           "4. Ask only at real decision forks: use \`<user_options>\` only when 2+ equally reasonable implementation paths, tech stack choices, or scope/priority trade-offs require user input. Never fake a question when nothing blocks progress.",
-          exposedPlanWriteToolNames.length > 0
-            ? "5. Write plan.md as your final action; do not continue exploring after the plan is complete."
-            : "5. Output the visible proposed plan as your final action; do not claim a plan file was written.",
-          exposedPlanWriteToolNames.length > 0
-            ? "6. Plan artifacts rule: plan.md is mandatory when plan write tools are exposed; design.md is optional (evidence ledger); tasks.md belongs to execution only."
-            : "6. Plan artifacts rule: plan.md is not mandatory when no plan write tool is exposed; tasks.md still belongs to execution only.",
-          "7. If plan write tools are unavailable, output a visible \`<proposed_plan>\` in plain Markdown.",
+          "5. Output the visible proposed plan as your final action; runtime, not the model, owns the plan file write.",
+          "6. Plan artifacts rule: a runtime-materialized plan.md is mandatory before review; tasks.md belongs to execution only.",
+          "7. Output a visible \`<proposed_plan>\` in plain Markdown; never imitate a write tool call.",
         ].join("\n")
         : [
           exposedReadToolNames.length > 0
             ? `1. 先探索：使用本轮可用读取/搜索工具（${readToolText}）定向定位；只有 \`get_project_skeleton\` 已暴露且无线索时才使用，不要重复扫目录。`
             : "1. 本轮没有读取/搜索工具。不要伪造探索；基于用户已提供证据制定方案，并明确缺失证据。",
           "2. 证据优先：截图、附件、@ 文件是首要证据；先说明观察到的现象。",
-          exposedPlanWriteToolNames.length > 0
-            ? `3. 收敛写计划：证据足够后，用 ${planWriteToolText} 写入 \`.MAIN/plans/plan.md\` — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。`
-            : "3. 收敛出方案：证据足够后，输出 `<proposed_plan>` Markdown — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。",
+          "3. 收敛出方案：证据足够后，输出 `<proposed_plan>` Markdown — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。",
           "4. 只在真正需要用户决策的分叉点才用 \`<user_options>\`：当存在 2 个以上同等合理的实现路径、技术方案选型、或范围/优先级取舍时，必须给出选项让用户选择。不要在不阻塞时假装提问。",
-          exposedPlanWriteToolNames.length > 0
-            ? "5. 计划写完即停止：写入 plan.md 是本轮最后一件事，不要继续探索。"
-            : "5. 输出可见 proposed plan 后即停止；不要声称已经写入计划文件。",
-          exposedPlanWriteToolNames.length > 0
-            ? "6. 计划文件规则：有计划写入工具时 plan.md 必选；design.md 可选（证据台账）；tasks.md 属于执行阶段。"
-            : "6. 计划文件规则：没有计划写入工具时 plan.md 不强制；tasks.md 仍属于执行阶段。",
-          "7. 写入工具不可用时，输出可见的 \`<proposed_plan>\` 纯文本方案。",
+          "5. 输出可见 proposed plan 后即停止；计划文件写入由 runtime 而不是模型负责。",
+          "6. 计划文件规则：进入审核前必须由 runtime 物化 plan.md；tasks.md 仍属于执行阶段。",
+          "7. 输出可见的 \`<proposed_plan>\` 纯文本方案，不要模仿写入工具调用。",
         ].join("\n"),
       "",
       `All user-visible content (plan.md, responses, options) must use ${resolvedLanguageName}. System instructions above use ${instructionLanguageName} for model comprehension.`,
@@ -1037,13 +1013,9 @@ export function buildSystemPrompt(
     }
     if (turnIntent === "plan") {
       if (instructionLanguage === "en") {
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "Plan turn: gather read-only evidence, then write `.MAIN/plans/plan.md`. Only write plan.md/design.md before approval; no source edits or tasks.md."
-          : "Plan turn: gather evidence from the provided context and output a visible `<proposed_plan>`. No plan write tool is exposed, so do not claim plan.md/design.md was written.");
+        tfl.push("Plan turn: gather evidence from the provided context and output a visible `<proposed_plan>`. MAIN runtime validates and materializes `.MAIN/plans/plan.md`; do not emit plan or source write calls before approval.");
       } else {
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "规划回合：先收集只读证据，再写 `.MAIN/plans/plan.md`。批准前只允许写 plan.md/可选证据台账，不修改源码或生成 tasks.md。"
-          : "规划回合：基于已提供上下文收集证据并输出可见 `<proposed_plan>`。本轮没有计划写入工具，不要声称已经写入 plan.md/design.md。");
+        tfl.push("规划回合：基于已提供上下文收集证据并输出可见 `<proposed_plan>`，由 MAIN runtime 校验并物化 `.MAIN/plans/plan.md`；批准前不要发出计划或源码写入调用。");
       }
       tfl.push("如果用户最终目标是实现、修复、生成文件或修改项目，本回合仍只产出可审批计划；源码写入、命令执行和最终交付物必须等计划批准后的执行 runtime。不要声称环境没有写入能力，也不要在批准前修改源码。");
       tfl.push("实现/生成类任务禁止在聊天区输出完整项目代码或大段 Markdown 代码清单；计划只描述要改什么、为何改、如何验证。批准后再通过当前执行工具面落地真实文件。");
@@ -1092,36 +1064,20 @@ export function buildSystemPrompt(
     if (turnIntent === "plan") {
       const tflLang = instructionLanguage === "en" ? "en" : "zh";
       if (tflLang === "en") {
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? `Plan turn — read-only evidence gathering first, then write \`.MAIN/plans/plan.md\` with ${planWriteToolText}. No source edits, no tasks.md before approval.`
-          : "Plan turn — read-only evidence gathering first, then output a visible `<proposed_plan>` because no plan write tool is exposed. No source edits, no tasks.md before approval.");
+        tfl.push("Plan turn — gather read-only evidence, then output visible `<proposed_plan>` for MAIN runtime to materialize as plan.md. No plan writes, source edits, or tasks.md before approval.");
         tfl.push("Use \`<user_options>\` only for real branching decisions, not for generic 'continue reading' prompts. Never emit \`approve_operation_once\`, \`adjust_plan\`, or \`cancel_operation\` as plan approval; the Plan review surface owns approval after plan.md is ready.");
         tfl.push("If the Plan is not ready only because evidence or analysis is incomplete, continue autonomously with the exposed safe tools; do not turn your own read/check/fix ordering into user options. Give 2-4 options only when a user-owned product, scope, technology, or priority decision genuinely blocks the artifact.");
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "When plan is mature, write plan.md; fall back to \`<proposed_plan>\` only if write tools are unavailable."
-          : "When plan is mature, output `<proposed_plan>` Markdown and stop; do not claim a file write.");
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "Plan artifacts: plan.md is mandatory when plan write tools are exposed, design.md optional (evidence ledger), tasks.md is execution-only."
-          : "Plan artifacts: plan.md is not mandatory when no plan write tool is exposed; tasks.md is execution-only.");
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "Keep plan.md concise: title, summary, confirmed evidence, key changes, API/interface impact, test plan, assumptions. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps."
-          : "Keep the visible plan concise: title, summary, confirmed evidence, key changes, API/interface impact, test plan, assumptions. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps.");
+        tfl.push("When plan is mature, output `<proposed_plan>` Markdown and stop; runtime owns the file write.");
+        tfl.push("Plan artifacts: runtime-materialized plan.md is mandatory before review; tasks.md is execution-only.");
+        tfl.push("Keep the visible plan concise: title, summary, confirmed evidence, key changes, API/interface impact, test plan, assumptions. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps.");
         tfl.push(tabularWorkflowPlanInstruction);
       } else {
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? `规划回合：先只读探索，证据足够后用 ${planWriteToolText} 写 \`.MAIN/plans/plan.md\`。批准前不修改源码、不生成 tasks.md。`
-          : "规划回合：先只读探索，证据足够后输出可见 `<proposed_plan>`；本轮没有计划写入工具时不要伪造工具调用。批准前不修改源码、不生成 tasks.md。");
+        tfl.push("规划回合：先只读探索，证据足够后输出可见 `<proposed_plan>`，由 MAIN runtime 物化为 plan.md；不要伪造工具调用。批准前不写计划文件、不修改源码、不生成 tasks.md。");
         tfl.push("真正分叉才用 \`<user_options>\`，不给'继续读取'类泛化选项。计划审批不得输出 \`approve_operation_once\`、\`adjust_plan\` 或 \`cancel_operation\`；plan.md 就绪后只由 Plan 审批区处理批准。");
         tfl.push("如果方案尚未收敛只是因为证据或分析不足，应使用当前开放的安全工具自主继续；不要把你自己的读取、检查或修复顺序包装成用户选项。只有用户拥有的产品、范围、技术选型或优先级决策真正阻塞计划文件时，才给出 2-4 个选项。");
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "方案成熟时写入 plan.md；写入工具不可用才降级为 \`<proposed_plan>\`。"
-          : "方案成熟时输出 `<proposed_plan>` Markdown 并停止；不要声称已经写入计划文件。");
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "计划文件：有计划写入工具时 plan.md 必选，design.md 可选（证据台账），tasks.md 属执行阶段。"
-          : "计划文件：没有计划写入工具时 plan.md 不强制，tasks.md 属执行阶段。");
-        tfl.push(exposedPlanWriteToolNames.length > 0
-          ? "plan.md 精简：标题、摘要、已确认证据、关键改动、API/接口影响、测试方案、假设。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。"
-          : "可见方案保持精简：标题、摘要、已确认证据、关键改动、API/接口影响、测试方案、假设。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。");
+        tfl.push("方案成熟时输出 `<proposed_plan>` Markdown 并停止；计划文件写入由 runtime 负责。");
+        tfl.push("计划文件：进入审核前必须由 runtime 物化 plan.md，tasks.md 属执行阶段。");
+        tfl.push("可见方案保持精简：标题、摘要、已确认证据、关键改动、API/接口影响、测试方案、假设。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。");
         tfl.push(tabularWorkflowPlanInstruction);
       }
     } else {
@@ -1163,7 +1119,7 @@ export function buildSystemPrompt(
     tfl.push("2. 输出一行 `[PROPOSAL START]`。");
     tfl.push("3. 紧接着以 `# Proposed Plan` 作为第一个 Markdown 标题。");
     tfl.push("4. 方案正文必须是根级别 Markdown，且结构化清晰；保持一页审阅摘要风格，不要复制完整规格全文。");
-    tfl.push("5. PLAN 正式审批首选写入 `.MAIN/plans/plan.md`；如果只能使用旧 Proposal 协议，则在方案正文最后附加合法 `<plan>` JSON。提交后立即停止，不要再追加寒暄或日志。");
+    tfl.push("5. 输出可见 `<proposed_plan>` 或兼容的合法 `<plan>` 结构后立即停止；MAIN runtime 会校验并物化 `.MAIN/plans/plan.md`。不要自行写计划文件，也不要追加寒暄或日志。");
 
     parts.push(tfl.join("\n"));
   }

@@ -19,6 +19,18 @@ export type ApprovedPlanSameTurnFallbackDecision =
   | "session_changed"
   | "transition_stale";
 
+export function isPlanReviewExecutionLeaseActive(input: {
+  agentStatus: string;
+  isGenerating: boolean;
+  hasAbortController: boolean;
+}): boolean {
+  // pending_review/awaiting_approval is a paused review run, not a live
+  // execution lease. Treating its retained AbortController as active leaves
+  // the approved child run queued forever because the review promise has
+  // already settled and can no longer perform the workflow fallback.
+  return input.agentStatus === "running" && input.isGenerating && input.hasAbortController;
+}
+
 interface ApprovedPlanFallbackHandoffLike {
   planTurnId: string;
   requestedAt: number;

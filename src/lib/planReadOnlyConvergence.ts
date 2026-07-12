@@ -1,4 +1,5 @@
 import type { PlanRuntimePhase } from "./workflowModels";
+import { buildPlanEvidenceBundle, isPlanEvidenceBundleReady } from "./planEvidence";
 import { hasTurnProvidedContext, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 
 export const PLAN_READONLY_CONVERGENCE_BATCH_LIMIT = 3;
@@ -16,6 +17,8 @@ export interface PlanEvidenceReadinessResult {
   reason: string;
   successfulTargetedReads: number;
   successfulSearches: number;
+  semanticFacts: number;
+  changeTargets: number;
 }
 
 export interface PlanToolActivityLike {
@@ -137,13 +140,26 @@ export function assessPlanEvidenceReadiness(input: {
     PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(String(item.name || "")) &&
     targetMatchesProvidedPath(String(item.target || ""), providedPaths)
   );
+  const semanticBundle = buildPlanEvidenceBundle({
+    turnId: "readiness",
+    objective: "plan evidence readiness",
+    evidenceRecords: successful.map((item) => ({
+      tool: String(item.name || ""),
+      target: String(item.target || ""),
+      status: "succeeded",
+      summary: String(item.detail || ""),
+    })),
+    files: successful.map((item) => String(item.target || "")),
+  });
+  const semanticFacts = semanticBundle.facts.length;
+  const changeTargets = semanticBundle.changeTargets.length;
+  const counts = { successfulTargetedReads, successfulSearches, semanticFacts, changeTargets };
 
   if (input.hasBlockingUserChoice) {
     return {
       status: "blocked_user_choice",
       reason: "blocking_user_choice",
-      successfulTargetedReads,
-      successfulSearches,
+      ...counts,
     };
   }
 
@@ -151,8 +167,7 @@ export function assessPlanEvidenceReadiness(input: {
     return {
       status: "needs_observation",
       reason: "provided_context_not_observed",
-      successfulTargetedReads,
-      successfulSearches,
+      ...counts,
     };
   }
 
@@ -160,8 +175,15 @@ export function assessPlanEvidenceReadiness(input: {
     return {
       status: "needs_targeted_read",
       reason: successfulSearches > 0 ? "search_without_targeted_read" : "no_targeted_evidence_read",
-      successfulTargetedReads,
-      successfulSearches,
+      ...counts,
+    };
+  }
+
+  if (!isPlanEvidenceBundleReady(semanticBundle)) {
+    return {
+      status: "needs_targeted_read",
+      reason: semanticFacts <= 0 ? "targeted_reads_without_semantic_facts" : "semantic_facts_without_change_target",
+      ...counts,
     };
   }
 
@@ -169,16 +191,14 @@ export function assessPlanEvidenceReadiness(input: {
     return {
       status: "needs_targeted_read",
       reason: "insufficient_targeted_evidence",
-      successfulTargetedReads,
-      successfulSearches,
+      ...counts,
     };
   }
 
   return {
     status: "ready_for_plan",
     reason: "targeted_evidence_available",
-    successfulTargetedReads,
-    successfulSearches,
+    ...counts,
   };
 }
 

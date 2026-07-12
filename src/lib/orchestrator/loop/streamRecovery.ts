@@ -1,5 +1,5 @@
 import { isCloudGatewayTimeoutMessage, isRetryableCloudErrorMessage } from "../../cloudRetry";
-import { clampContextLimitToReported, resolveReactiveContextLimit } from "../../contextWindow";
+import { isExplicitContextWindowError, resolveReactiveContextLimit } from "../../contextWindow";
 import { estimateMessagesTokens, manageContext } from "../../contextTrim";
 import { getErrorMessage } from "../../errorUtils";
 import { buildPlanStreamTimeoutPauseMessage } from "../../orchestrator/planOrchestration";
@@ -483,15 +483,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     }
 
     const nativeToolsWereAttempted = llmTools.length > 0;
-    const isContextError =
-      (activeError as Error & { isContextError?: boolean }).isContextError === true ||
-      errMsg.includes("CONTEXT_LENGTH_EXCEEDED") ||
-      errMsg.includes("context_length_exceeded") ||
-      errMsg.includes("context window") ||
-      errMsg.includes("maximum context length") ||
-      errMsg.includes("token limit") ||
-      errMsg.includes("prefill memory guard") ||
-      errMsg.includes("context too large");
+    const isContextError = isExplicitContextWindowError(errMsg);
     const isCompatibilityError =
       isProviderCompatibilityErrorMessage(errMsg) ||
       shouldTreatCloudGatewayErrorAsCompatibility(
@@ -510,14 +502,21 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       });
 
       const configuredContextLimit = snapshotContextLimit;
-      const { contextLimit: reactiveContextLimit, reportedContextLimit } =
-        clampContextLimitToReported(configuredContextLimit, errMsg);
+      const estimatedCurrentTokens = estimateMessagesTokens(managedAgentMessages);
+      const {
+        contextLimit: requestedReactiveContextLimit,
+        reportedContextLimit,
+        source: reactiveLimitSource,
+      } = resolveReactiveContextLimit(estimatedCurrentTokens, errMsg);
+      const reactiveContextLimit = Math.min(configuredContextLimit, requestedReactiveContextLimit);
       if (reportedContextLimit != null && reactiveContextLimit < configuredContextLimit) {
         logAgentEvent("context_limit_clamped", {
           iteration,
           reportedContextLimit,
           configuredContextLimit,
           reactiveContextLimit,
+          estimatedCurrentTokens,
+          reactiveLimitSource,
         });
       }
       snapshotContextLimit = reactiveContextLimit;

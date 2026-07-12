@@ -1,5 +1,6 @@
 import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
-import { logAgentEvent } from "../../orchestrator";
+import { collectPlanClosureMaterializationInput, logAgentEvent } from "../../orchestrator";
+import { formatPlanEvidenceBundleForModel, isPlanEvidenceBundleReady } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { ToolDefinition } from "../../toolSchemas";
@@ -241,11 +242,43 @@ export function prepareIterationStreamRequest(input: {
     allowExecuteRecoveryFileRead: toolSurfaceDecision.allowExecuteRecoveryFileRead,
     emitPlanExecutionProgress,
   });
-  const managedAgentMessages = appendActiveRuntimeGuidance({
+  let managedAgentMessages = appendActiveRuntimeGuidance({
     callbacks,
     managedAgentMessages: contextManagementResult.managedAgentMessages,
     iteration,
   });
+  const shouldInjectPlanEvidenceBundle =
+    workflowMode === "plan" &&
+    !callbacks.getIsPlanApproved() &&
+    ["synthesis", "drafting", "needs_rewrite", "review_ready"].includes(planRuntimeState.planRuntimePhase);
+  if (shouldInjectPlanEvidenceBundle) {
+    const closureInput = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      [],
+      "",
+    );
+    const bundle = closureInput.evidenceBundle;
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      {
+        role: "system",
+        content: formatPlanEvidenceBundleForModel(bundle, callbacks.getPreferredLanguage()),
+      },
+    ];
+    logAgentEvent("plan_evidence_bundle_injected", {
+      iteration,
+      planRuntimePhase: planRuntimeState.planRuntimePhase,
+      evidenceBundleId: bundle.bundleId,
+      evidenceBundleHash: bundle.hash,
+      objectiveChars: bundle.objective.length,
+      semanticFacts: bundle.facts.length,
+      changeTargets: bundle.changeTargets.length,
+      verificationTargets: bundle.verificationTargets.length,
+      ready: isPlanEvidenceBundleReady(bundle),
+      transcriptToolMessages: managedAgentMessages.filter((message) => message.role === "tool").length,
+    });
+  }
 
   const assistantMsgId = generateId();
   const maxOutputEscalations = getMaxOutputEscalations();

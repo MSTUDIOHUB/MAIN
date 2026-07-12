@@ -20,7 +20,7 @@ import {
 } from "../../orchestrator";
 import { summarizeRepeatedPlanTargetsFromToolActivity, type PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
-import { isPlanDraftWriteToolName, shouldClosePlanToolSurfaceAfterReadOnlyConvergence } from "../../planRuntime";
+import { shouldClosePlanToolSurfaceAfterReadOnlyConvergence } from "../../planRuntime";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
@@ -218,7 +218,7 @@ export function resolveIterationToolSurface(input: {
     }).status,
   });
   const iterationAllTools = shouldClosePlanToolSurface
-    ? baseIterationAllTools.filter((tool) => isPlanDraftWriteToolName(tool.function.name))
+    ? []
     : phaseScopedIterationAllTools;
 
   const shouldLogToolSurfaceDecision =

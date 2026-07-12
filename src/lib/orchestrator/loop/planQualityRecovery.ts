@@ -4,8 +4,8 @@ import {
   buildPlanEvidenceRecoveryBlockedPrompt,
   buildPlanEvidenceRecoveryClosurePrompt,
   buildPlanPostConvergenceToolRedirectPrompt,
-  hasGroundedPlanClosureEvidence,
 } from "../../orchestrator/planOrchestration";
+import { isPlanEvidenceBundleReady } from "../../planEvidence";
 import { MAX_PLAN_EVIDENCE_RECOVERY_PASSES } from "../../planRuntime";
 import {
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
@@ -188,9 +188,8 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       attemptedPlanWriteTargets,
       latestUserPromptText,
     );
-    const hasQualityClosureEvidence = hasGroundedPlanClosureEvidence(
-      qualityClosureEvidence,
-      recentPlanToolActivity,
+    const hasQualityClosureEvidence = isPlanEvidenceBundleReady(
+      qualityClosureEvidence.evidenceBundle,
     );
     const hasStructuredQualityClosureEvidence = qualityClosureEvidence.evidenceRecords.length > 0;
     const shouldRequestTargetedEvidenceAfterQualityGate =
@@ -224,6 +223,10 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       sanitizedFileCount: qualityClosureEvidence.files.length,
       sanitizerDropped: qualityClosureEvidence.sanitizer.dropped,
       sanitizerDropReasons: qualityClosureEvidence.sanitizer.dropReasons,
+      evidenceBundleId: qualityClosureEvidence.evidenceBundle.bundleId,
+      evidenceBundleHash: qualityClosureEvidence.evidenceBundle.hash,
+      semanticFacts: qualityClosureEvidence.evidenceBundle.facts.length,
+      changeTargets: qualityClosureEvidence.evidenceBundle.changeTargets.length,
     });
     if (shouldRequestTargetedEvidenceAfterQualityGate) {
       pendingPlanRuntimeRecoveryPrompt = null;

@@ -23,6 +23,8 @@ import { handleAssistantIterationPhase } from "./assistantIterationPhase";
 import { createAgentLoopToolSurfaceRuntime } from "./toolSurfaceRuntime";
 import { createAgentLoopRuntimeActions } from "./loopRuntimeActions";
 import type { OrchestratorCallbacks } from "../types";
+import { completeAssistantTurn } from "./finalTurnCompletion";
+import { buildApprovedPlanEvidenceCompletionMessage } from "./approvedPlanFinalization";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -567,6 +569,35 @@ export class AgentOrchestrator {
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
+        if (toolIterationPhase.status === "plan_completed") {
+          const audit = toolIterationPhase.completionAudit || {
+            completedCount: callbacks.getPlanTasks().length,
+            totalCount: callbacks.getPlanTasks().length,
+          };
+          const finalText = buildApprovedPlanEvidenceCompletionMessage({
+            language: callbacks.getPreferredLanguage(),
+            completedCount: audit.completedCount,
+            totalCount: audit.totalCount,
+          });
+          callbacks.onTurnSummaryReady(finalText);
+          callbacks.onAssistantFinalText(finalText, [], {
+            hasToolCalls: false,
+            visibility: "user_progress",
+            preserveAssistantText: true,
+            capsuleCandidate: true,
+            modelAuthored: false,
+          });
+          completeAssistantTurn({
+            callbacks,
+            assistantHistoryText: finalText,
+            providerReasoningForHistory: null,
+            assistantMsgId: `runtime-plan-complete-${eventTurnId}-${iteration}`,
+            iterationContext: turnIterationContext,
+            emitTurnEvent,
+            emitTurnCompletedEvent,
+          });
+          return;
+        }
         if (toolIterationPhase.status === "aborted") {
           emitRunPausedEvent("aborted", "The tool run was aborted and can be resumed in the same turn.");
           return;

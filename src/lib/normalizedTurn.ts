@@ -560,4 +560,25 @@ export function isAssistantTurnEmpty(normalized: Pick<NormalizedStreamState, "vi
   );
 }
 
+export type AssistantCompletionClass =
+  | "content"
+  | "tool_calls"
+  | "reasoning_only"
+  | "protocol_only"
+  | "true_empty";
+
+/**
+ * Classify a provider completion without guessing its cause. In particular,
+ * an empty or protocol-only local completion is not evidence that the model's
+ * context window was exceeded.
+ */
+export function classifyAssistantCompletion(result: StreamResult): AssistantCompletionClass {
+  const normalized = normalizeAssistantTurn(result);
+  if (normalized.toolCalls.length > 0) return "tool_calls";
+  if (normalized.visibleText.trim() || normalized.replyOptions.length > 0) return "content";
+  if (normalized.hiddenThought.trim()) return "reasoning_only";
+  if (String(result.content || "").trim()) return "protocol_only";
+  return "true_empty";
+}
+
 // endregion
