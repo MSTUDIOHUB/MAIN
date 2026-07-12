@@ -1,6 +1,10 @@
 import type { AppConfig } from "./appTypes";
 import { resolveRuntimeLaneKey } from "./appConfig";
 import type { MainThreadEvent } from "./turnEvents";
+import {
+  normalizeWorkspacePathIdentity,
+  relativizeToWorkspacePath,
+} from "./workspacePaths";
 
 export type SubagentStatus =
   | "queued"
@@ -9,6 +13,7 @@ export type SubagentStatus =
   | "summarizing"
   | "completed"
   | "blocked"
+  | "degraded"
   | "failed"
   | "canceled";
 
@@ -25,7 +30,7 @@ export interface SubagentActivity {
 }
 
 export interface SubagentProgress {
-  phase: "queued" | "starting" | "thinking" | "tool" | "summarizing" | "done";
+  phase: "queued" | "starting" | "waiting" | "thinking" | "tool" | "summarizing" | "done";
   title: string;
   tool?: string;
   target?: string;
@@ -39,6 +44,10 @@ export interface SubagentRunSnapshot {
   name: string;
   role: string;
   objective: string;
+  scopeKey?: string;
+  scope?: string;
+  allowedPaths?: string[];
+  expectedOutput?: string;
   status: SubagentStatus;
   profile: "local" | "cloud";
   provider: string;
@@ -73,16 +82,62 @@ export interface SpawnSubagentRequest {
   name?: string;
   role?: string;
   objective: string;
+  scopeKey?: string;
+  scope?: string;
   contextHints?: string;
   allowedPaths?: string;
+  expectedOutput?: string;
 }
 
 export interface SpawnSubagentResult {
   subagentId: string;
   name: string;
+  status: "queued" | "running";
+  scopeKey: string;
+}
+
+export interface SubagentEvidenceItem {
+  tool: string;
+  target: string;
+  detail: string;
+}
+
+export interface SubagentResultEnvelope {
+  subagentId: string;
+  name: string;
+  scopeKey: string;
   status: SubagentStatus;
   summary: string;
+  evidence: SubagentEvidenceItem[];
+  blocker?: string;
+  remainingWork?: string;
   error?: string;
+}
+
+export interface WaitSubagentsRequest {
+  subagentIds?: string[];
+}
+
+export interface WaitSubagentsResult {
+  results: SubagentResultEnvelope[];
+  pendingIds: string[];
+}
+
+export interface SubagentExecutionScope {
+  subagentId: string;
+  parentSessionKey: string;
+  scopeKey: string;
+  workspace: string;
+  allowedPaths: string[];
+}
+
+export interface RuntimeTraceContext {
+  threadId: string;
+  turnId: string;
+  runId: string;
+  parentRunId: string | null;
+  agentKind: "parent" | "subagent";
+  subagentId?: string;
 }
 
 export interface SubagentCapacityPolicy {
@@ -98,6 +153,7 @@ export interface SubagentCapacityPolicy {
 const TERMINAL_SUBAGENT_STATUSES = new Set<SubagentStatus>([
   "completed",
   "blocked",
+  "degraded",
   "failed",
   "canceled",
 ]);
@@ -132,6 +188,8 @@ export function resolveSubagentCapacityPolicy(config: AppConfig): SubagentCapaci
     profile,
     provider: configured.provider,
     model: configured.model,
+    // This is the number of child workflows. Model-request concurrency is
+    // coordinated separately and reserves capacity for the parent thread.
     maxActiveRequests: profile === "local" ? 1 : 3,
     maxCreatedPerTurn: profile === "local" ? 3 : 6,
     childMaxIterations: profile === "local" ? 6 : 8,
@@ -209,6 +267,123 @@ interface CapacityLaneState {
 const capacityLanes = new Map<string, CapacityLaneState>();
 const degradedUntilByLane = new Map<string, number>();
 const childAbortControllers = new Map<string, AbortController>();
+
+export interface CoordinatedSubagentRun {
+  threadId: string;
+  parentTurnId: string;
+  subagentId: string;
+  name: string;
+  scopeKey: string;
+  completion: Promise<SubagentResultEnvelope>;
+  result?: SubagentResultEnvelope;
+}
+
+export interface SubagentScopeLease {
+  threadId: string;
+  parentTurnId: string;
+  subagentId: string;
+  scopeKey: string;
+  workspace: string;
+  allowedPaths: string[];
+  createdAt: number;
+}
+
+const coordinatedRuns = new Map<string, CoordinatedSubagentRun>();
+const scopeLeases = new Map<string, SubagentScopeLease>();
+
+function coordinationKey(threadId: string, parentTurnId: string, subagentId: string): string {
+  return `${threadId}::${parentTurnId}::${subagentId}`;
+}
+
+export function parseSubagentAllowedPaths(value: unknown, workspace = ""): string[] {
+  const paths = String(value || "")
+    .split(/[\n,;]+/)
+    .map((entry) => entry.trim())
+    .filter(Boolean)
+    .map((entry) => relativizeToWorkspacePath(entry, workspace))
+    .map(normalizeWorkspacePathIdentity)
+    .filter(Boolean);
+  return [...new Set(paths)];
+}
+
+function pathContains(scopePath: string, targetPath: string): boolean {
+  const scope = normalizeWorkspacePathIdentity(scopePath);
+  const target = normalizeWorkspacePathIdentity(targetPath);
+  if (!scope || !target) return false;
+  if (scope === ".") return true;
+  return target === scope || target.startsWith(`${scope}/`);
+}
+
+export function acquireSubagentScopeLease(input: SubagentScopeLease): void {
+  scopeLeases.set(input.subagentId, {
+    ...input,
+    allowedPaths: input.allowedPaths.map(normalizeWorkspacePathIdentity).filter(Boolean),
+  });
+}
+
+export function releaseSubagentScopeLease(subagentId: string): void {
+  scopeLeases.delete(subagentId);
+}
+
+export function findSubagentScopeConflict(input: {
+  threadId: string;
+  targetPath: string;
+  currentSubagentId?: string | null;
+}): SubagentScopeLease | null {
+  for (const lease of scopeLeases.values()) {
+    if (lease.threadId !== input.threadId) continue;
+    if (lease.subagentId === input.currentSubagentId) continue;
+    const target = normalizeWorkspacePathIdentity(
+      relativizeToWorkspacePath(input.targetPath, lease.workspace),
+    );
+    if (!target) continue;
+    if (lease.allowedPaths.some((allowed) =>
+      pathContains(allowed, target) || pathContains(target, allowed)
+    )) return lease;
+  }
+  return null;
+}
+
+export function validateSubagentScopeTarget(
+  scope: SubagentExecutionScope,
+  targetPath: string,
+): boolean {
+  const target = normalizeWorkspacePathIdentity(
+    relativizeToWorkspacePath(targetPath, scope.workspace),
+  );
+  return !!target && scope.allowedPaths.some((allowed) => pathContains(allowed, target));
+}
+
+export function registerCoordinatedSubagentRun(input: CoordinatedSubagentRun): void {
+  const key = coordinationKey(input.threadId, input.parentTurnId, input.subagentId);
+  coordinatedRuns.set(key, input);
+  void input.completion.then((result) => {
+    const current = coordinatedRuns.get(key);
+    if (current) current.result = result;
+  });
+}
+
+export async function waitForCoordinatedSubagents(input: {
+  threadId: string;
+  parentTurnId: string;
+  subagentIds?: string[];
+}): Promise<WaitSubagentsResult> {
+  const requestedIds = new Set((input.subagentIds || []).filter(Boolean));
+  const runs = [...coordinatedRuns.values()].filter((run) =>
+    run.threadId === input.threadId &&
+    run.parentTurnId === input.parentTurnId &&
+    (requestedIds.size === 0 || requestedIds.has(run.subagentId))
+  );
+  if (runs.length === 0) return { results: [], pendingIds: [...requestedIds] };
+  const results = await Promise.all(runs.map((run) => run.completion));
+  return { results, pendingIds: [] };
+}
+
+export function getCoordinatedSubagentRunCount(threadId: string, parentTurnId: string): number {
+  return [...coordinatedRuns.values()].filter((run) =>
+    run.threadId === threadId && run.parentTurnId === parentTurnId
+  ).length;
+}
 
 function makeAbortError(): Error {
   const error = new Error("Subagent execution was canceled.");
@@ -301,7 +476,7 @@ export function reportSubagentCapacityFailure(
   error: unknown,
 ): boolean {
   const message = error instanceof Error ? error.message : String(error || "");
-  const shouldDegrade = /\b(?:oom|out of memory|memory allocation|429|524)\b|connection reset|socket hang up|gateway timeout|no visible progress/i.test(message);
+  const shouldDegrade = /SUBAGENT_MEMORY_PRESSURE_DEGRADED|\b(?:oom|out of memory|memory allocation|429|524)\b|connection reset|socket hang up|gateway timeout|no visible progress|stream.*timeout/i.test(message);
   if (!shouldDegrade) return false;
   degradedUntilByLane.set(policy.laneKey, Date.now() + 5 * 60_000);
   const lane = capacityLanes.get(policy.laneKey);
@@ -328,4 +503,6 @@ export function resetSubagentRuntimeForTests(): void {
   capacityLanes.clear();
   degradedUntilByLane.clear();
   childAbortControllers.clear();
+  coordinatedRuns.clear();
+  scopeLeases.clear();
 }

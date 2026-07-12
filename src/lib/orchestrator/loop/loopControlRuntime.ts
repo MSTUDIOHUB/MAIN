@@ -130,6 +130,7 @@ export function createAgentLoopControlRuntime(input: {
       currentIteration: getIteration(),
       planExecutionStartIteration,
       limits: agentLoopConfig.agentLoop?.iterationLimits ?? null,
+      subagentDepth: callbacks.getSubagentDepth?.() ?? 0,
     });
     if (budget.phase === "plan_execution" && planExecutionStartIteration == null) {
       planExecutionStartIteration = budget.phaseStartIteration;
@@ -260,6 +261,7 @@ export function createAgentLoopControlRuntime(input: {
       provider: settings.provider || "unknown",
       maxIterations: getEffectiveMaxIterations(),
       iterationLimitSource: {
+        subagent: agentLoopConfig.agentLoop?.iterationLimits?.subagent ?? null,
         chatRespond: agentLoopConfig.agentLoop?.iterationLimits?.chatRespond ?? null,
         editExecute: agentLoopConfig.agentLoop?.iterationLimits?.editExecute ?? null,
         planDraft: agentLoopConfig.agentLoop?.iterationLimits?.planDraft ?? null,

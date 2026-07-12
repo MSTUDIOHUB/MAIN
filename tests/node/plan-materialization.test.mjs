@@ -62,9 +62,52 @@ const {
   sanitizePlanEvidenceInput,
   summarizePlanEvidenceDetail,
   validatePlanEvidenceGrounding,
+  validateNumberedUserGoalFacetCoverage,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
+
+test("numbered user-goal facets require evidence, change, and validation coverage", () => {
+  const userGoal = [
+    "1、双击 Markdown 文件后只显示空白界面。",
+    "2、工具栏打开功能无法弹出窗口选择文件。",
+    "3、npm run tauri dev 无法正常启动应用。",
+  ].join("\n");
+  const incomplete = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: [
+      "# 修复方案",
+      "## 已确认证据",
+      "- main.rs 的双击 Markdown 文件事件没有传递内容，导致空白界面。",
+      "## 关键改动",
+      "- 修改 main.rs 的双击文件事件和空白界面处理。",
+      "## 测试方案",
+      "- 双击 Markdown 文件，验证不再显示空白界面。",
+    ].join("\n"),
+  });
+  assert.equal(incomplete.ok, false);
+  assert.match(incomplete.reason || "", /uncovered_user_goal_facets:2,3/);
+
+  const complete = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: [
+      "# 修复方案",
+      "## 已确认证据",
+      "- main.rs 的双击 Markdown 文件事件没有传递内容，导致空白界面。",
+      "- toolbar 的打开功能未使用文件选择窗口。",
+      "- tauri.conf 与 vite 端口不一致导致 npm run tauri dev 无法启动。",
+      "## 关键改动",
+      "- 修复双击 Markdown 文件后的空白界面处理。",
+      "- 修复工具栏打开功能并接入文件选择窗口。",
+      "- 对齐 tauri dev 配置，使 npm run tauri dev 正常启动。",
+      "## 测试方案",
+      "- 双击 Markdown 文件，验证不再显示空白界面。",
+      "- 点击工具栏打开功能，验证文件选择窗口弹出。",
+      "- 运行 npm run tauri dev，验证应用正常启动。",
+    ].join("\n"),
+  });
+  assert.equal(complete.ok, true, complete.reason);
+});
 const {
   buildPlanCandidate,
   buildPlanEvidenceBundle,

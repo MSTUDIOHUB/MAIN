@@ -871,6 +871,78 @@ function parsePlanSections(content: string): ParsedPlanSection[] {
   return sections;
 }
 
+const PLAN_FACET_STOP_TERMS = new Set([
+  "现在", "软件", "问题", "功能", "需要", "进行", "以及", "这个", "一个", "无法", "已经",
+  "the", "and", "with", "that", "this", "from", "issue", "problem", "should", "must",
+]);
+
+function extractNumberedUserGoalFacets(userGoal: string): Array<{ index: number; text: string }> {
+  return String(userGoal || "")
+    .split(/\r?\n/)
+    .map((line) => line.match(/^\s*(\d{1,2})\s*[、.)．]\s*(.+?)\s*$/))
+    .filter((match): match is RegExpMatchArray => !!match)
+    .map((match) => ({ index: Number(match[1]), text: match[2].trim() }))
+    .filter((facet) => facet.text.length >= 4);
+}
+
+function semanticFacetTerms(value: string): Set<string> {
+  const terms = new Set<string>();
+  const normalized = String(value || "").toLowerCase();
+  for (const token of normalized.match(/[a-z0-9_./-]{3,}/g) || []) {
+    if (!PLAN_FACET_STOP_TERMS.has(token)) terms.add(token);
+  }
+  for (const chunk of normalized.match(/[\u4e00-\u9fff]{2,}/g) || []) {
+    if (!PLAN_FACET_STOP_TERMS.has(chunk) && chunk.length <= 8) terms.add(chunk);
+    for (let index = 0; index <= chunk.length - 2; index++) {
+      const pair = chunk.slice(index, index + 2);
+      if (!PLAN_FACET_STOP_TERMS.has(pair)) terms.add(pair);
+    }
+  }
+  return terms;
+}
+
+function facetSectionCovered(facetTerms: Set<string>, sectionBody: string): boolean {
+  const sectionTerms = semanticFacetTerms(sectionBody);
+  let matches = 0;
+  for (const term of facetTerms) {
+    if (sectionTerms.has(term)) matches += term.length >= 4 ? 2 : 1;
+  }
+  return matches >= 2;
+}
+
+export function validateNumberedUserGoalFacetCoverage(input: {
+  userGoal?: string;
+  content: string;
+}): PlanArtifactQualityResult {
+  const facets = extractNumberedUserGoalFacets(input.userGoal || "");
+  if (facets.length < 2) return classifyPlanArtifactQualityResult({ ok: true });
+  const sections = parsePlanSections(input.content);
+  const evidenceBody = sections
+    .filter((section) => /证据|发现|根因|evidence|finding|root cause/i.test(section.title))
+    .map((section) => section.body)
+    .join("\n");
+  const changesBody = sections
+    .filter((section) => /关键改动|实现改动|修复方案|实施方案|key changes|implementation|fix plan/i.test(section.title))
+    .map((section) => section.body)
+    .join("\n");
+  const validationBody = sections
+    .filter((section) => /测试|验证|test|validation/i.test(section.title))
+    .map((section) => section.body)
+    .join("\n");
+  const uncovered = facets.filter((facet) => {
+    const terms = semanticFacetTerms(facet.text);
+    return !facetSectionCovered(terms, evidenceBody) ||
+      !facetSectionCovered(terms, changesBody) ||
+      !facetSectionCovered(terms, validationBody);
+  });
+  return uncovered.length === 0
+    ? classifyPlanArtifactQualityResult({ ok: true })
+    : classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: `uncovered_user_goal_facets:${uncovered.map((facet) => facet.index).join(",")}`,
+      });
+}
+
 function collectSectionTitles(
   sections: ParsedPlanSection[],
   patterns: RegExp[],
@@ -2092,6 +2164,18 @@ export function materializePlanArtifactFromVisibleText(input: {
         quality: grounding,
       });
     }
+  }
+
+  const facetCoverage = validateNumberedUserGoalFacetCoverage({
+    userGoal: input.userGoal,
+    content,
+  });
+  if (!facetCoverage.ok) {
+    return rejectPlanMaterialization({
+      reason: facetCoverage.reason || "uncovered_user_goal_facets",
+      decisionFork,
+      quality: facetCoverage,
+    });
   }
 
   const candidate = input.evidenceBundle

@@ -1,20 +1,26 @@
 import { expect, test } from "@playwright/test";
 
 test.describe("subagent activity and right panel", () => {
-  test("opens the selected subagent from ChatArea and shows execution details", async ({ page }) => {
+  test.beforeEach(async ({ page }) => {
+    await page.addInitScript(() => {
+      window.localStorage.clear();
+    });
+  });
+
+  test("opens selected subagents and keeps degraded evidence readable", async ({ page }) => {
     await page.goto("/?e2eScenario=subagents-panel");
 
     const notice = page.getByTestId("subagent-activity-notice");
     await expect(notice).toBeVisible();
-    await expect(notice).toContainText("已创建 2 个智能体");
-    await expect(notice).toContainText("已关闭 1 个智能体");
+    await expect(notice).toContainText("已创建 3 个智能体");
+    await expect(notice).toContainText("已关闭 2 个智能体");
     await expect(notice).toContainText("Mendel");
     await expect(notice).toContainText("ChatArea.tsx");
 
     await page.getByTestId("subagent-activity-subagent-mendel").click();
     const panel = page.getByTestId("subagents-panel");
     await expect(panel).toBeVisible();
-    await expect(panel).toContainText("本地单通道");
+    await expect(panel).toContainText("本地主体 + 1 子流");
     await expect(panel).toContainText("qwen3.6-35b-a3b");
     await expect(page.getByTestId("subagent-detail")).toContainText("Mendel");
     await expect(page.getByTestId("subagent-detail")).toContainText("src/components/ChatArea.tsx");
@@ -24,6 +30,12 @@ test.describe("subagent activity and right panel", () => {
     await expect(page.getByTestId("subagent-detail")).toContainText("Euler");
     await expect(page.getByTestId("subagent-detail")).toContainText("事件投影保持完成状态");
     await expect(page.getByTestId("stop-subagent-button")).toHaveCount(0);
+
+    await page.getByTestId("subagent-list-item-subagent-herschel").click();
+    await expect(page.getByTestId("subagent-detail")).toContainText("已降级由主体接管");
+    await expect(page.getByTestId("subagent-detail")).toContainText("已定位共享模型通道与内存采样入口");
+    await expect(page.getByTestId("subagent-detail")).toContainText("接管原因");
+    await expect(page.getByTestId("subagent-detail")).toContainText("可用内存低于预留线");
   });
 
   for (const theme of ["light", "dark", "black"] as const) {

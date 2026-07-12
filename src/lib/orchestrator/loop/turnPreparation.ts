@@ -19,7 +19,7 @@ import {
 import { buildEffectiveTurnContract, hasExplicitUnityConsoleDiagnosticCue, type CommandDirective, type EffectiveTurnContract, type ResolvedUserIntent } from "../../runIntent";
 import type { StreamSettings } from "../../streaming";
 import { extractCompatibilityTextContent } from "../../providerCompatibility";
-import { buildSystemPrompt } from "../../systemPrompt";
+import { buildSubagentSystemPrompt, buildSystemPrompt } from "../../systemPrompt";
 import { skillNameToToolName, type ToolDefinition } from "../../toolSchemas";
 import { withEventSchema, type MainThreadEventInput, type MainThreadProgressUpdate } from "../../turnEvents";
 import { extractPrimaryUserRequestText, extractTurnInputContextSignalsFromMessages, type TurnInputContextSignals } from "../../turnIntake";
@@ -333,7 +333,16 @@ export function createSystemPromptApplier(input: {
 
     const mcpToolNames = availableToolNameList.filter((name) => mcpToolNameSet.has(name));
     const customToolNames = availableToolNameList.filter((name) => skillToolNameSet.has(name));
-    const systemPrompt = buildSystemPrompt(
+    const subagentScope = callbacks.getSubagentScope?.() ?? null;
+    const systemPrompt = subagentScope
+      ? buildSubagentSystemPrompt({
+          workspace,
+          language: callbacks.getPreferredLanguage(),
+          availableToolNames: availableToolNameList,
+          scopeKey: subagentScope.scopeKey,
+          allowedPaths: subagentScope.allowedPaths,
+        })
+      : buildSystemPrompt(
       skills,
       workspace,
       mainModeKey,

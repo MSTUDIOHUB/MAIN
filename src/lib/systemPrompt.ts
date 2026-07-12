@@ -388,6 +388,8 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
 const WORKSPACE_IGNORE_DIRS = new Set(["node_modules", ".git", ".svn", ".hg", ".idea", ".vscode", ".vs", "dist", "build", "out", "bin", "obj", "target", "vendor", "__pycache__", ".next", ".nuxt", ".cache", ".turbo", "coverage", ".gradle", ".dart_tool", ".fvm", ".DS_Store"]);
 
 const READ_ONLY_BUILT_IN_TOOL_NAMES = [
+  "spawn_subagent",
+  "wait_subagents",
   "get_project_skeleton",
   "get_file_outline",
   "list_directory",
@@ -424,6 +426,37 @@ const WORKFLOW_BUILT_IN_TOOL_NAMES = [
   "execute_command",
   "send_pty_input",
 ];
+
+export function buildSubagentSystemPrompt(input: {
+  workspace: string;
+  language: Lang;
+  availableToolNames: string[];
+  scopeKey: string;
+  allowedPaths: string[];
+}): string {
+  const zh = input.language !== "en";
+  const paths = input.allowedPaths.map((path) => `- ${path}`).join("\n");
+  const tools = input.availableToolNames.map((name) => `\`${name}\``).join(", ");
+  return zh
+    ? [
+        "你是 MAIN 的有界只读子智能体，只负责父任务分配的独立证据收集。",
+        `工作区：${input.workspace}`,
+        `范围标识：${input.scopeKey}`,
+        `允许路径：\n${paths || "- 无"}`,
+        `可用工具：${tools || "无"}`,
+        "严格限制在允许路径内，只读取和搜索。不得写文件、运行命令、请求审批、创建子智能体或向用户提供回复选项。",
+        "优先引用文件路径和具体证据。完成后只返回简洁摘要、不确定项与剩余工作；不要重述父任务，也不要直接面向最终用户。",
+      ].join("\n\n")
+    : [
+        "You are a bounded read-only MAIN subagent responsible only for an independently delegated evidence task.",
+        `Workspace: ${input.workspace}`,
+        `Scope key: ${input.scopeKey}`,
+        `Allowed paths:\n${paths || "- none"}`,
+        `Available tools: ${tools || "none"}`,
+        "Stay within the allowed paths and only read or search. Do not write files, run commands, request approval, spawn agents, or offer reply choices.",
+        "Cite concrete paths and evidence. Finish with only a concise summary, uncertainty, and remaining work; do not address the end user.",
+      ].join("\n\n");
+}
 
 function filterAvailableToolNames(names: string[], availableToolNames?: string[]): string[] {
   if (!availableToolNames) return names;
@@ -970,6 +1003,8 @@ export function buildSystemPrompt(
       toolProtocolProfile?.nativeToolsEnabled !== true &&
       turnIntent === "plan";
     const compactWorkflowToolDescriptions = new Set([
+      "spawn_subagent",
+      "wait_subagents",
       "get_project_skeleton",
       "read_file",
       "read_document",
@@ -1027,7 +1062,8 @@ export function buildSystemPrompt(
       if (isToolNameAvailable(name, availableToolNames)) tfl.push(description);
     };
     addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。仅在没有明确路径/文件名/符号线索时作为一次浅层发现使用，建议 depth: 2；拿到结构后必须转向定向搜索或读取。");
-    addToolDescription("spawn_subagent", "- spawn_subagent: 为可独立完成的有界探索、测试分析、日志排查或摘要创建只读子智能体。只传紧凑 objective/context_hints；等待其返回摘要后再综合。不要为原子任务创建，不要让多个子智能体承担重叠工作。本地模型由 runtime 自动串行限流。");
+    addToolDescription("spawn_subagent", "- spawn_subagent: 异步创建有界只读子智能体。必须给出 scope_key、scope、allowed_paths 和 expected_output；返回句柄后继续处理不重叠工作，不要等待或重复读取其租约路径。");
+    addToolDescription("wait_subagents", "- wait_subagents: 在主体完成自己的非重叠工作后，等待并汇合一个或全部子智能体的摘要、证据、阻塞原因和剩余工作。最终结论前必须汇合仍在运行的子智能体。");
     addToolDescription("get_file_outline", "- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
     addToolDescription("list_directory", "- list_directory: 列出特定目录内容。优先用于用户给出目录、文件附近路径，或通过搜索结果锁定目标后的定向检查。");
     addToolDescription("web_search", "- web_search: 在公共网络上搜索最新信息、外部资料或网页线索。返回标题、URL、摘要和来源；最终结论必须引用来源 URL。");

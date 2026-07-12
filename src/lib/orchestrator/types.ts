@@ -17,7 +17,14 @@ import { type PlanMaterializationSource } from "../planMaterialization";
 import { type ProgressNarration } from "../progressNarration";
 import type { ShellPermissionApproval, ShellPermissionDecision } from "../ipc";
 import { type TurnInputContextSignals } from "../turnIntake";
-import type { SpawnSubagentRequest, SpawnSubagentResult } from "../subagents";
+import type {
+  RuntimeTraceContext,
+  SpawnSubagentRequest,
+  SpawnSubagentResult,
+  SubagentExecutionScope,
+  WaitSubagentsRequest,
+  WaitSubagentsResult,
+} from "../subagents";
 
 export interface ToolCallInMessage {
   id: string;
@@ -86,6 +93,8 @@ export interface OrchestratorCallbacks {
     goalSliceId?: string;
   };
   getSubagentDepth?: () => number;
+  getSubagentScope?: () => SubagentExecutionScope | null;
+  getRuntimeTraceContext?: () => RuntimeTraceContext;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
   // Planning & Management
@@ -121,6 +130,10 @@ export interface OrchestratorCallbacks {
     request: SpawnSubagentRequest,
     options?: { signal?: AbortSignal },
   ) => Promise<SpawnSubagentResult>;
+  waitSubagents?: (
+    request: WaitSubagentsRequest,
+    options?: { signal?: AbortSignal },
+  ) => Promise<WaitSubagentsResult>;
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("../goalState").GoalProgress, goal: import("../goalState").GoalDefinition) => void;

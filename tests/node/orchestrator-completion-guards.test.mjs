@@ -301,6 +301,47 @@ test("agent loop runner preserves awaiting-choice pauses as a structured outcome
   }]);
 });
 
+test("subagent runner strips reply options and preserves the evidence summary", async () => {
+  const finals = [];
+  class SubagentChoiceOrchestrator {
+    async execute(callbacks) {
+      callbacks.onAssistantFinalText(
+        "Useful evidence summary",
+        [{ id: "approve", label: "Approve", value: "approve" }],
+        { awaitingInput: true },
+      );
+    }
+
+    getLatestTurnContract() {
+      return {
+        conversationIntent: "respond",
+        runtimeIntent: "analyze",
+        approvalState: "not_required",
+        mutationExpected: false,
+        completionEvidenceRequired: "none",
+      };
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+  }
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(SubagentChoiceOrchestrator, []);
+  const outcome = await executeAgentLoop({
+    getSubagentDepth: () => 1,
+    getWorkflowMode: () => "chat",
+    getIsPlanApproved: () => false,
+    onAssistantFinalText: (...args) => finals.push(args),
+    onNonActionableStop: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assert.deepEqual(outcome, { status: "completed", reason: "agent_loop_completed" });
+  assert.equal(finals[0][0], "Useful evidence summary");
+  assert.deepEqual(finals[0][1], []);
+  assert.equal(finals[0][2].awaitingInput, false);
+});
+
 test("agent loop runner preserves a bounded error reason for Goal Runtime diagnostics", async () => {
   class FailingOrchestrator {
     async execute(callbacks) {

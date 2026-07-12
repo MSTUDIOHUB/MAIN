@@ -720,6 +720,21 @@ test("agent loop iteration limits are mode-specific and configurable", () => {
     runtimeIntent: "respond",
     isPlanApproved: false,
   }), 25);
+
+  assert.equal(resolveAgentLoopMaxIterations({
+    workflowMode: "chat",
+    runtimeIntent: "analyze",
+    isPlanApproved: false,
+    subagentDepth: 1,
+    limits: { subagent: 6, default: 25 },
+  }), 6);
+  assert.equal(resolveAgentLoopMaxIterations({
+    workflowMode: "chat",
+    runtimeIntent: "analyze",
+    isPlanApproved: false,
+    subagentDepth: 1,
+    limits: { subagent: 8, default: 25 },
+  }), 8);
   assert.equal(resolveAgentLoopMaxIterations({
     workflowMode: "plan",
     runtimeIntent: "execute",

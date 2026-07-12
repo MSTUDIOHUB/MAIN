@@ -1748,7 +1748,8 @@ test("approved plan recovery logs tool surfaces and pauses long reasoning withou
 
   assert.match(source, /APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS\s*=\s*90_000/);
   assert.match(source, /approvedPlanRecoveryStreamMaxElapsedMs:\s*APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS/);
-  assert.match(streamInvocationSource, /maxStreamElapsedMs:\s*recoveryStreamMaxElapsedMs/);
+  assert.match(streamInvocationSource, /maxStreamElapsedMs:\s*minPositive\([\s\S]*?recoveryStreamMaxElapsedMs/);
+  assert.match(streamInvocationSource, /boundedMaxElapsedMs[\s\S]*?120_000/);
   assert.match(streamInvocationSource, /APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS\s*=\s*45_000/);
   assert.match(streamInvocationSource, /approvedPlanActionOnlyRecoveryActive[\s\S]*?resolveRecoveryToolChoice/);
   assert.match(streamInvocationSource, /maxStreamElapsedLabel:\s*"approved_plan_recovery"/);

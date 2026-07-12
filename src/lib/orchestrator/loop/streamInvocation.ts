@@ -175,11 +175,45 @@ export async function invokeInitialStreamForIteration(input: {
           approvedPlanRecoveryStreamMaxElapsedMs,
         )
       : approvedPlanRecoveryStreamMaxElapsedMs;
+  const childStreamBounded = (callbacks.getSubagentDepth?.() ?? 0) > 0;
+  const normalApprovedLocalExecutionBounded =
+    config.activeProfile === "local" &&
+    workflowMode === "plan" &&
+    callbacks.getIsPlanApproved() &&
+    runtimeIntent === "execute";
+  const boundedNoVisibleMs = childStreamBounded || normalApprovedLocalExecutionBounded ? 45_000 : 0;
+  const boundedMaxElapsedMs = childStreamBounded || normalApprovedLocalExecutionBounded ? 120_000 : 0;
+  const minPositive = (current: number | undefined, next: number): number | undefined => {
+    if (next <= 0) return current;
+    if (!current || current <= 0) return next;
+    return Math.min(current, next);
+  };
   const baseResolvedStreamWatchdogOptions: FetchLLMStreamOptions = {
     ...baseStreamWatchdogOptions,
+    ...(boundedNoVisibleMs > 0
+      ? {
+          noVisibleTokenTimeoutMs: minPositive(
+            baseStreamWatchdogOptions.noVisibleTokenTimeoutMs,
+            boundedNoVisibleMs,
+          ),
+          noVisibleTokenTimeoutLabel: childStreamBounded
+            ? "subagent_no_visible_progress"
+            : "approved_plan_no_visible_progress",
+          maxStreamElapsedMs: minPositive(
+            baseStreamWatchdogOptions.maxStreamElapsedMs,
+            boundedMaxElapsedMs,
+          ),
+          maxStreamElapsedLabel: childStreamBounded
+            ? "subagent_stream_boundary"
+            : "approved_plan_stream_boundary",
+        }
+      : {}),
     ...(approvedPlanRecoveryStreamHardTimeoutActive
       ? {
-          maxStreamElapsedMs: recoveryStreamMaxElapsedMs,
+          maxStreamElapsedMs: minPositive(
+            boundedMaxElapsedMs > 0 ? boundedMaxElapsedMs : baseStreamWatchdogOptions.maxStreamElapsedMs,
+            recoveryStreamMaxElapsedMs,
+          ),
           maxStreamElapsedLabel: "approved_plan_recovery",
         }
       : {}),
@@ -200,11 +234,14 @@ export async function invokeInitialStreamForIteration(input: {
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
   });
-  const effectiveCurrentMaxTokens =
+  const policyCurrentMaxTokens =
     capPreapprovalPlanQualityRecoveryMaxTokens(
       preapprovalPlanQualityRecoveryStreamPolicy,
       currentMaxTokens,
     );
+  const effectiveCurrentMaxTokens = childStreamBounded && finalTextOnlyStep
+    ? Math.min(policyCurrentMaxTokens || 2_048, 2_048)
+    : policyCurrentMaxTokens;
   const effectiveMaxOutputEscalations =
     capPreapprovalPlanQualityRecoveryMaxEscalations(
       preapprovalPlanQualityRecoveryStreamPolicy,

@@ -38,6 +38,7 @@ function hasReadyPlanEvidence(status?: PlanEvidenceReadiness): boolean {
 
 const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "spawn_subagent",
+  "wait_subagents",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -55,6 +56,7 @@ const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
 const PLAN_STRUCTURE_EXPLORATION_TOOL_NAMES = new Set([
   "get_project_skeleton",
   "spawn_subagent",
+  "wait_subagents",
   // Allow read_file during structure exploration so the model can read
   // specific files discovered by get_project_skeleton. This prevents
   // the model from getting stuck trying unsupported tools.
@@ -104,7 +106,7 @@ export function filterPlanToolNamesForRuntimePhase(input: {
     return input.toolNames.filter((name) => PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(name));
   }
   if (isPlanRuntimeReadOnlyPhase(input.planRuntimePhase)) {
-    return input.toolNames.filter((name) => name === "spawn_subagent" || isPlanReadOnlyToolName(name));
+    return input.toolNames.filter((name) => name === "spawn_subagent" || name === "wait_subagents" || isPlanReadOnlyToolName(name));
   }
   if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
     // Runtime owns plan.md materialization. The model drafts visible Markdown

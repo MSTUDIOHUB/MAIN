@@ -1,4 +1,4 @@
-import { executeAgentLoop, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
+import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import { mergeGoalToolObservations, type GoalToolObservation } from "../goalRuntime";
 import { invoke } from "@tauri-apps/api/core";
@@ -51,8 +51,8 @@ import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLife
 import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
-import { executeControlledSubagent } from "../subagentRuntime";
-import { projectSubagentRuns } from "../subagents";
+import { scheduleControlledSubagent } from "../subagentRuntime";
+import { getCoordinatedSubagentRunCount, parseSubagentAllowedPaths, waitForCoordinatedSubagents } from "../subagents";
 import {
   buildGoalConfirmationActionRequest,
   buildPlanReviewActionRequest,
@@ -697,6 +697,13 @@ export class WorkflowEngine {
           ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
           : {}),
       }),
+      getRuntimeTraceContext: () => ({
+        threadId: runSessionKey,
+        turnId,
+        runId: activeRuntimeRunIdentity.runId,
+        parentRunId: activeRuntimeRunIdentity.parentRunId,
+        agentKind: "parent",
+      }),
       hasRuntimeThreadStarted: (threadId: string) => sessionGet().runtimeEvents.some((event: any) =>
         event.type === "thread.started" && event.threadId === threadId
       ),
@@ -1041,6 +1048,26 @@ export class WorkflowEngine {
       },
       onDebugEvent: (event: any, data: any = {}) => {
         try {
+          if (
+            event === "memory_pressure_sample" &&
+            data.runtimeEventOwner === true &&
+            typeof data.laneKey === "string" &&
+            typeof data.availableBytes === "number" &&
+            typeof data.reserveBytes === "number"
+          ) {
+            sessionSet((state: any) => ({
+              runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+                type: "model_lane.pressure",
+                threadId: String(data.threadId || runSessionKey),
+                turnId: String(data.turnId || turnId),
+                timestampMs: Date.now(),
+                laneKey: data.laneKey,
+                availableBytes: data.availableBytes,
+                reserveBytes: data.reserveBytes,
+                action: data.action === "degrade" ? "degrade" : data.action === "hold" ? "hold" : "sample",
+              })),
+            }));
+          }
           const latest = sessionGet();
           const goal = latest.goalRuntime?.goal || latest.activeGoal || null;
           const planIdentity = buildPlanApprovalIdentity(latest.planArtifacts || []);
@@ -1049,8 +1076,8 @@ export class WorkflowEngine {
             sessionKey: runSessionKey,
             workspace: runWorkspace || null,
             ...data,
-            runId: activeRuntimeRunIdentity.runId,
-            parentRunId: activeRuntimeRunIdentity.parentRunId,
+            runId: data.runId ?? activeRuntimeRunIdentity.runId,
+            parentRunId: data.parentRunId ?? activeRuntimeRunIdentity.parentRunId,
             goalId: goal?.id || null,
             goalSliceId: activeRuntimeRunIdentity.goalSliceId || null,
             planRevision: planIdentity?.revision || null,
@@ -2646,10 +2673,27 @@ export class WorkflowEngine {
 
     callbacks.runSubagent = (request, runOptions) => {
       const parentTurnId = context.uiDisplayTurnId || turnId;
-      const existingRunCount = projectSubagentRuns(sessionGet().runtimeEvents)
-        .filter((run) => run.parentTurnId === parentTurnId)
-        .length;
-      return executeControlledSubagent({
+      const existingRunCount = getCoordinatedSubagentRunCount(runSessionKey, parentTurnId);
+      const allowedPaths = parseSubagentAllowedPaths(request.allowedPaths, runWorkspace);
+      const parentEvidencePaths = [...getSessionTaskTargetingEvidence(runSessionKey)]
+        .filter((entry) => entry.startsWith("file:"))
+        .map((entry) => entry.slice("file:".length));
+      const duplicateCount = allowedPaths.filter((allowed) => parentEvidencePaths.some((path) =>
+        path === allowed || path.startsWith(`${allowed}/`) || allowed.startsWith(`${path}/`)
+      )).length;
+      const independentReviewer = /reviewer|independent[_ -]?review/i.test(request.role || "");
+      if (!independentReviewer && allowedPaths.length > 0 && duplicateCount / allowedPaths.length > 0.5) {
+        callbacks.onDebugEvent?.("delegation_scope_decision", {
+          decision: "rejected",
+          reason: "duplicate_parent_scope",
+          allowedPaths,
+          duplicateCount,
+        });
+        return Promise.reject(new Error(
+          `SUBAGENT_DUPLICATE_SCOPE: ${duplicateCount}/${allowedPaths.length} allowed paths were already explored by the parent. Delegate an independent scope or use role=reviewer for an explicit independent review.`,
+        ));
+      }
+      return Promise.resolve(scheduleControlledSubagent({
         request,
         parentCallbacks: callbacks,
         parentTurnId,
@@ -2661,7 +2705,25 @@ export class WorkflowEngine {
           }));
         },
         executeAgentLoop,
+      }));
+    };
+    callbacks.waitSubagents = async (request) => {
+      const parentTurnId = context.uiDisplayTurnId || turnId;
+      callbacks.onDebugEvent?.("parent_wait", {
+        subagentIds: request.subagentIds || [],
+        parentTurnId,
       });
+      const result = await waitForCoordinatedSubagents({
+        threadId: runSessionKey,
+        parentTurnId,
+        subagentIds: request.subagentIds,
+      });
+      callbacks.onDebugEvent?.("parent_resume", {
+        subagentIds: result.results.map((entry) => entry.subagentId),
+        statuses: result.results.map((entry) => entry.status),
+        parentTurnId,
+      });
+      return result;
     };
 
     const closeHarnessForAgentLoopOutcome = (outcome: AgentLoopOutcome) => {

@@ -32,6 +32,7 @@ function statusLabel(status: SubagentStatus, language: "zh" | "en"): string {
     summarizing: { zh: "整理中", en: "Summarizing" },
     completed: { zh: "已完成", en: "Completed" },
     blocked: { zh: "已受阻", en: "Blocked" },
+    degraded: { zh: "已降级由主体接管", en: "Handed back to main" },
     failed: { zh: "失败", en: "Failed" },
     canceled: { zh: "已取消", en: "Canceled" },
   };
@@ -48,6 +49,11 @@ function statusTone(status: SubagentStatus, light: boolean): string {
     return light
       ? "border-[#f3c5c5] bg-[#fff1f1] text-[#b3261e]"
       : "border-[rgba(248,113,113,0.28)] bg-[rgba(248,113,113,0.08)] text-[#fca5a5]";
+  }
+  if (status === "degraded") {
+    return light
+      ? "border-[#e2c56f] bg-[#fff8df] text-[#765700]"
+      : "border-[rgba(250,204,21,0.3)] bg-[rgba(250,204,21,0.08)] text-[#fde047]";
   }
   if (status === "canceled") {
     return light
@@ -83,6 +89,7 @@ function ActivityIcon({ run, className }: { run: SubagentRunRecord; className?: 
     return <span className={`h-2.5 w-2.5 rounded-full bg-[#60a5fa] shadow-[0_0_8px_rgba(96,165,250,0.7)] animate-pulse ${className || ""}`} />;
   }
   if (run.status === "completed") return <IconCheck className={`text-[#34d399] ${className || ""}`} />;
+  if (run.status === "degraded") return <IconSubagentClosed className={`text-[#fde047] ${className || ""}`} />;
   if (run.status === "canceled") return <IconSubagentClosed className={`text-[#a1a1aa] ${className || ""}`} />;
   return <IconClose className={`text-[#f87171] ${className || ""}`} />;
 }
@@ -123,7 +130,7 @@ export default function SubagentsPanel({
         </div>
         <div className={`mt-2 truncate text-[10px] ${isLight ? "text-[#80868b]" : "text-[#71717a]"}`} title={`${capacityPolicy.provider} · ${capacityPolicy.model}`}>
           {capacityPolicy.profile === "local"
-            ? language === "zh" ? "本地单通道" : "Single local lane"
+            ? language === "zh" ? "本地主体 + 1 子流" : "Local main + 1 child stream"
             : language === "zh" ? "云端受控并行" : "Controlled cloud parallelism"}
           {` · ${capacityPolicy.provider} · ${capacityPolicy.model}`}
         </div>
@@ -247,17 +254,26 @@ export default function SubagentsPanel({
             </section>
           )}
 
-          {(selected.summary || selected.error) && (
+          {selected.summary && (
             <section className={`mt-4 border-t pt-3 ${isLight ? "border-[#e4e4e7]" : "border-[#27272a]"}`}>
-              <div className={`text-[10px] font-medium uppercase ${selected.error ? "text-[#f87171]" : isLight ? "text-[#5f6368]" : "text-[#8f8f98]"}`}>
-                {selected.error ? language === "zh" ? "错误" : "Error" : language === "zh" ? "返回摘要" : "Returned summary"}
+              <div className={`text-[10px] font-medium uppercase ${isLight ? "text-[#5f6368]" : "text-[#8f8f98]"}`}>
+                {language === "zh" ? "返回摘要" : "Returned summary"}
               </div>
-              <div className={`mt-2 whitespace-pre-wrap break-words rounded-[6px] border px-3 py-2 text-[11px] leading-5 ${
-                selected.error
-                  ? isLight ? "border-[#f3c5c5] bg-[#fff7f7] text-[#b3261e]" : "border-[rgba(248,113,113,0.24)] bg-[rgba(248,113,113,0.06)] text-[#fca5a5]"
-                  : isLight ? "border-[#e4e4e7] bg-[#f8f9fa] text-[#3c4043]" : "border-[#27272a] bg-[#09090b] text-[#d4d4d8]"
-              }`}>
-                {selected.error || selected.summary}
+              <div className={`mt-2 whitespace-pre-wrap break-words rounded-[6px] border px-3 py-2 text-[11px] leading-5 ${isLight ? "border-[#e4e4e7] bg-[#f8f9fa] text-[#3c4043]" : "border-[#27272a] bg-[#09090b] text-[#d4d4d8]"}`}>
+                {selected.summary}
+              </div>
+            </section>
+          )}
+
+          {selected.error && selected.status !== "completed" && (
+            <section className={`mt-4 border-t pt-3 ${isLight ? "border-[#e4e4e7]" : "border-[#27272a]"}`}>
+              <div className="text-[10px] font-medium uppercase text-[#f87171]">
+                {selected.status === "degraded"
+                  ? language === "zh" ? "接管原因" : "Handoff reason"
+                  : language === "zh" ? "阻塞原因" : "Blocker"}
+              </div>
+              <div className={`mt-2 whitespace-pre-wrap break-words rounded-[6px] border px-3 py-2 text-[11px] leading-5 ${isLight ? "border-[#f3c5c5] bg-[#fff7f7] text-[#b3261e]" : "border-[rgba(248,113,113,0.24)] bg-[rgba(248,113,113,0.06)] text-[#fca5a5]"}`}>
+                {selected.error}
               </div>
             </section>
           )}

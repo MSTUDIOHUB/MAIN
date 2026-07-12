@@ -91,7 +91,7 @@ export async function prepareAgentLoopToolRegistry(input: {
       : "Server status is unknown until discovery runs.",
   }));
 
-  if (mcpServers.length > 0) {
+  if (mcpServers.length > 0 && subagentDepth === 0) {
     logAgentEvent("mcp_discovery_start", {
       enabledServers: enabledMcpServers.length,
       totalServers: mcpServers.length,
@@ -216,11 +216,11 @@ export async function prepareAgentLoopToolRegistry(input: {
     policy: config.toolPermissionPolicy,
   });
   if (subagentDepth > 0) {
+    const childToolNames = new Set(["read_file", "grep_search", "get_file_outline"]);
     routedToolDefinitions = routedToolDefinitions.filter((tool) => {
-      if (tool.function.name === "spawn_subagent") return false;
-      const risk = toolCapabilityRegistry.tools[tool.function.name]?.risk;
-      return risk === "read_only" || risk === "external_read";
+      return childToolNames.has(tool.function.name);
     });
+    mcpTools = [];
     toolCapabilityRegistry = buildToolCapabilityRegistry({
       toolDefinitions: routedToolDefinitions,
       skills,

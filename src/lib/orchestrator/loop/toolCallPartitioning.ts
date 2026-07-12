@@ -52,6 +52,9 @@ import { isLocalFileReadApproved, type ToolCapabilityRegistry, type ToolPermissi
 import type { MainThreadEventInput, MainThreadItem } from "../../turnEvents";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { findSubagentScopeConflict, validateSubagentScopeTarget } from "../../subagents";
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
+import { parseApplyPatch } from "../../applyPatchTool";
 import type {
   AgentMessage,
   CachedReadOnlyToolResult,
@@ -187,6 +190,54 @@ export async function partitionToolCallsForExecution(input: {
     const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
     toolFailureSignatures.set(tc.id, failureSignature);
 
+    const directScopeTarget = typeof toolArgs.path === "string" ? toolArgs.path.trim() : "";
+    const scopeTargets = tc.name === "apply_patch"
+      ? parseApplyPatch(String(toolArgs.patch || "")).operations.flatMap((operation) =>
+          [operation.path, operation.newPath].filter((path): path is string => !!path)
+        )
+      : tc.name === "grep_search"
+        ? [directScopeTarget || "."]
+        : new Set(["read_file", "get_file_outline", "write_file", "replace_in_file"] as string[]).has(tc.name)
+          ? [directScopeTarget]
+          : [];
+    if (scopeTargets.length > 0) {
+      const subagentScope = callbacks.getSubagentScope?.() ?? null;
+      const scopeConflict = subagentScope ? null : scopeTargets
+        .map((scopeTarget) => findSubagentScopeConflict({
+          threadId: callbacks.getSessionKey(),
+          targetPath: scopeTarget,
+        }))
+        .find(Boolean) || null;
+      const scopeBlocked = subagentScope
+        ? scopeTargets.some((scopeTarget) =>
+            !scopeTarget || !validateSubagentScopeTarget(subagentScope, scopeTarget)
+          )
+        : !!scopeConflict;
+      callbacks.onDebugEvent?.("delegation_scope_decision", {
+        tool: tc.name,
+        targets: scopeTargets,
+        decision: scopeBlocked ? "blocked" : "allowed",
+        agentKind: subagentScope ? "subagent" : "parent",
+        subagentId: subagentScope?.subagentId || scopeConflict?.subagentId || null,
+        scopeKey: subagentScope?.scopeKey || scopeConflict?.scopeKey || null,
+      });
+      if (scopeBlocked) {
+        const message = subagentScope
+          ? `SUBAGENT_SCOPE_BLOCKED: ${tc.name} targets '${scopeTargets.join(", ") || "<missing path>"}' are outside allowed_paths for scope '${subagentScope.scopeKey}'.`
+          : `PARENT_SCOPE_OWNED_BY_SUBAGENT: '${scopeTargets.join(", ")}' overlaps the lease held by ${scopeConflict?.subagentId} (${scopeConflict?.scopeKey}). Continue non-overlapping work and call wait_subagents before accessing it.`;
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+        preExecutionResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: `Error: ${message}`,
+          isError: true,
+          lifecycleState: "blocked",
+        });
+        continue;
+      }
+    }
+
     const protectedPlanMutation = getProtectedPlanArtifactMutationViolation(
       tc.name,
       toolArgs,
@@ -220,6 +271,50 @@ export async function partitionToolCallsForExecution(input: {
         planRecoveryAction: "rewrite",
       });
       continue;
+    }
+
+    if (tc.name === "write_file" && target) {
+      const failedPatchCount = [...recentPlanToolActivity, ...recentToolActivity]
+        .filter((activity) =>
+          activity.name === "apply_patch" &&
+          activity.status === "failed" &&
+          workspacePathsReferToSameFile(activity.target, target)
+        ).length;
+      if (failedPatchCount >= 2) {
+        const latestRead = [...fileReadStates.values()]
+          .filter((state) => workspacePathsReferToSameFile(state.path, target))
+          .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+        const currentMeta = await readFileMetadataIfAvailable(target, workspace);
+        const sourceBody = String(latestRead?.modelContent || "")
+          .replace(/^[\s\S]*?---CONTENT START---\s*/i, "")
+          .replace(/\s*---CONTENT END---[\s\S]*$/i, "");
+        const sourceLineCount = sourceBody ? sourceBody.split(/\r?\n/).length : Number.POSITIVE_INFINITY;
+        const snapshotStillCurrent = !!latestRead && !!currentMeta &&
+          latestRead.sizeBytes === currentMeta.sizeBytes &&
+          latestRead.modifiedMs === currentMeta.modifiedMs;
+        const fullWriteAllowed = sourceLineCount <= 400 && snapshotStillCurrent;
+        callbacks.onDebugEvent?.("patch_recovery_full_write_decision", {
+          target,
+          failedPatchCount,
+          sourceLineCount: Number.isFinite(sourceLineCount) ? sourceLineCount : null,
+          snapshotStillCurrent,
+          decision: fullWriteAllowed ? "allowed" : "blocked",
+          latestReadHash: latestRead?.contentHash || null,
+        });
+        if (!fullWriteAllowed) {
+          const message = `WRITE_FILE_AFTER_PATCH_FAILURE_BLOCKED: ${failedPatchCount} precise patches failed for '${target}'. Full-file replacement requires a current complete read of at most 400 lines whose size and modified-time still match the latest read snapshot.`;
+          callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+          preExecutionResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            target,
+            content: `Error: ${message}`,
+            isError: true,
+            lifecycleState: "blocked",
+          });
+          continue;
+        }
+      }
     }
 
     if ((failedToolCallCounts.get(failureSignature) ?? 0) >= 2) {
@@ -474,7 +569,7 @@ export async function partitionToolCallsForExecution(input: {
       }
       // A repeated delegation is still a new isolated run; never reuse the
       // read-only result cache for subagents.
-      if (tc.name === "spawn_subagent") {
+      if (tc.name === "spawn_subagent" || tc.name === "wait_subagents") {
         readOnlyCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
         continue;
       }

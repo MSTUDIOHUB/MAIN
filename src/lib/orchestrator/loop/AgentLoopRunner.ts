@@ -23,13 +23,18 @@ export async function executeAgentLoop(
   const wrappedCallbacks: OrchestratorCallbacks = {
     ...callbacks,
     onAssistantFinalText: (text, replyOptions = [], meta) => {
-      if (meta?.awaitingInput === true && replyOptions.length > 0) {
+      const isSubagent = (callbacks.getSubagentDepth?.() ?? 0) > 0;
+      if (!isSubagent && meta?.awaitingInput === true && replyOptions.length > 0) {
         setOutcome({ status: "paused", reason: "awaiting_user_choice" });
         logAgentEvent("agent_loop_awaiting_user_choice", {
           replyOptions: replyOptions.length,
         });
       }
-      callbacks.onAssistantFinalText(text, replyOptions, meta);
+      callbacks.onAssistantFinalText(
+        text,
+        isSubagent ? [] : replyOptions,
+        isSubagent ? { ...meta, awaitingInput: false } : meta,
+      );
     },
     onNonActionableStop: (message, reason, progress) => {
       setOutcome(resolveNonActionableStopOutcome(reason, progress));

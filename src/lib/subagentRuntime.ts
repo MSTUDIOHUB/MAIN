@@ -1,8 +1,12 @@
 import type { AppConfig } from "./appTypes";
 import type { AgentLoopOutcome, AgentMessage, OrchestratorCallbacks } from "./orchestrator/types";
 import {
+  acquireSubagentScopeLease,
   registerSubagentAbortController,
+  registerCoordinatedSubagentRun,
   reportSubagentCapacityFailure,
+  parseSubagentAllowedPaths,
+  releaseSubagentScopeLease,
   resolveSubagentCapacityPolicy,
   unregisterSubagentAbortController,
   withSubagentCapacity,
@@ -11,6 +15,7 @@ import {
   type SubagentActivity,
   type SubagentProgress,
   type SubagentRunPatch,
+  type SubagentResultEnvelope,
   type SubagentRunSnapshot,
   type SubagentStatus,
 } from "./subagents";
@@ -39,27 +44,33 @@ function compactText(value: unknown, maxChars: number): string {
 }
 
 function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"): string {
-  const hints = compactText(request.contextHints, 4_000);
+  const hints = compactText(request.contextHints, 1_600);
   const allowedPaths = compactText(request.allowedPaths, 2_000);
+  const scope = compactText(request.scope, 500);
+  const expectedOutput = compactText(request.expectedOutput, 500);
   if (language === "en") {
     return [
       "You are a bounded read-only subagent working for a parent task.",
       `Role: ${request.role || "explorer"}`,
       `Objective: ${request.objective}`,
+      scope ? `Owned scope: ${scope}` : "",
       hints ? `Context hints: ${hints}` : "",
-      allowedPaths ? `Preferred paths: ${allowedPaths}` : "",
+      allowedPaths ? `Allowed paths: ${allowedPaths}` : "",
+      expectedOutput ? `Expected output: ${expectedOutput}` : "",
       "Use only the read/search tools exposed to you. Do not modify files, run shell commands, request approval, or spawn another agent.",
-      "Return a concise evidence-based summary with relevant file paths, findings, and any uncertainty. Do not address the end user directly.",
+      "Stay inside the allowed paths. Return a concise evidence summary with file paths, findings, uncertainty, and remaining work. Never offer approval choices or address the end user directly.",
     ].filter(Boolean).join("\n\n");
   }
   return [
     "你是主任务派生出的有界只读子智能体。",
     `角色：${request.role || "explorer"}`,
     `目标：${request.objective}`,
+    scope ? `负责范围：${scope}` : "",
     hints ? `上下文提示：${hints}` : "",
-    allowedPaths ? `优先路径：${allowedPaths}` : "",
+    allowedPaths ? `允许路径：${allowedPaths}` : "",
+    expectedOutput ? `预期产出：${expectedOutput}` : "",
     "只使用当前暴露的读取与搜索工具。不得修改文件、运行 Shell 命令、请求用户批准或继续创建子智能体。",
-    "返回简洁、基于证据的摘要，包含相关文件路径、结论与不确定项；不要直接面向最终用户说话。",
+    "严格限制在允许路径内。返回简洁的证据摘要，包含文件路径、结论、不确定项与剩余工作；不要提供批准选项，也不要直接面向最终用户说话。",
   ].filter(Boolean).join("\n\n");
 }
 
@@ -76,6 +87,8 @@ function resolveChildConfig(config: AppConfig, maxIterations: number): AppConfig
       iterationLimits: {
         ...currentLimits,
         chatRespond: maxIterations,
+        default: maxIterations,
+        subagent: maxIterations,
       },
     },
   } as AppConfig;
@@ -88,7 +101,16 @@ function resolveOutcomeStatus(outcome: AgentLoopOutcome, aborted: boolean): Suba
   return "failed";
 }
 
-export async function executeControlledSubagent(input: {
+interface PreparedSubagentRun {
+  subagentId: string;
+  name: string;
+  role: string;
+  objective: string;
+  scopeKey: string;
+  allowedPaths: string[];
+}
+
+export function scheduleControlledSubagent(input: {
   request: SpawnSubagentRequest;
   parentCallbacks: OrchestratorCallbacks;
   parentTurnId: string;
@@ -96,7 +118,7 @@ export async function executeControlledSubagent(input: {
   existingRunCount: number;
   emitEvent: (event: MainThreadEvent) => void;
   executeAgentLoop: ExecuteAgentLoop;
-}): Promise<SpawnSubagentResult> {
+}): SpawnSubagentResult {
   const parentConfig = input.parentCallbacks.getConfig();
   const language = input.parentCallbacks.getPreferredLanguage();
   const policy = resolveSubagentCapacityPolicy(parentConfig);
@@ -111,8 +133,66 @@ export async function executeControlledSubagent(input: {
   const subagentId = `subagent-${generateId()}`;
   const name = sanitizeName(input.request.name, input.existingRunCount);
   const role = compactText(input.request.role || "explorer", 48) || "explorer";
-  const objective = compactText(input.request.objective, 4_000);
+  const rawObjective = String(input.request.objective || "").trim();
+  if (rawObjective.length > 800) {
+    throw new Error("SUBAGENT_SCOPE_TOO_BROAD: objective must be 800 characters or fewer.");
+  }
+  const objective = compactText(rawObjective, 800);
   if (!objective) throw new Error("Subagent objective is required.");
+  const allowedPaths = parseSubagentAllowedPaths(input.request.allowedPaths, parentConfig.workspace);
+  if (allowedPaths.length === 0) {
+    throw new Error("SUBAGENT_SCOPE_REQUIRED: workspace subagents require allowed_paths.");
+  }
+  if (policy.profile === "local" && allowedPaths.length > 6) {
+    throw new Error("SUBAGENT_SCOPE_TOO_BROAD: local subagents may own at most 6 paths.");
+  }
+  const scopeKey = compactText(input.request.scopeKey || input.request.scope || objective, 96);
+  const prepared: PreparedSubagentRun = {
+    subagentId,
+    name,
+    role,
+    objective,
+    scopeKey,
+    allowedPaths,
+  };
+  const completion = executeControlledSubagent({ ...input, prepared });
+  registerCoordinatedSubagentRun({
+    threadId: input.parentCallbacks.getSessionKey(),
+    parentTurnId: input.parentTurnId,
+    subagentId,
+    name,
+    scopeKey,
+    completion,
+  });
+  return { subagentId, name, status: "queued", scopeKey };
+}
+
+export async function executeControlledSubagent(input: {
+  request: SpawnSubagentRequest;
+  parentCallbacks: OrchestratorCallbacks;
+  parentTurnId: string;
+  parentSignal?: AbortSignal;
+  existingRunCount: number;
+  emitEvent: (event: MainThreadEvent) => void;
+  executeAgentLoop: ExecuteAgentLoop;
+  prepared?: PreparedSubagentRun;
+}): Promise<SubagentResultEnvelope> {
+  const parentConfig = input.parentCallbacks.getConfig();
+  const language = input.parentCallbacks.getPreferredLanguage();
+  const policy = resolveSubagentCapacityPolicy(parentConfig);
+  const prepared = input.prepared || (() => {
+    const objective = compactText(input.request.objective, 800);
+    return {
+      subagentId: `subagent-${generateId()}`,
+      name: sanitizeName(input.request.name, input.existingRunCount),
+      role: compactText(input.request.role || "explorer", 48) || "explorer",
+      objective,
+      scopeKey: compactText(input.request.scopeKey || input.request.scope || objective, 96),
+      allowedPaths: parseSubagentAllowedPaths(input.request.allowedPaths, parentConfig.workspace),
+    };
+  })();
+  const { subagentId, name, role, objective, scopeKey, allowedPaths } = prepared;
+  const childRunId = `run-${subagentId}`;
 
   const now = Date.now();
   const snapshot: SubagentRunSnapshot = {
@@ -122,6 +202,10 @@ export async function executeControlledSubagent(input: {
     name,
     role,
     objective,
+    scopeKey,
+    scope: compactText(input.request.scope, 500),
+    allowedPaths,
+    expectedOutput: compactText(input.request.expectedOutput, 500),
     status: "queued",
     profile: policy.profile,
     provider: policy.provider,
@@ -141,6 +225,15 @@ export async function executeControlledSubagent(input: {
     timestampMs: now,
     subagent: snapshot,
   }));
+  acquireSubagentScopeLease({
+    threadId: snapshot.threadId,
+    parentTurnId: input.parentTurnId,
+    subagentId,
+    scopeKey,
+    workspace: parentConfig.workspace,
+    allowedPaths,
+    createdAt: now,
+  });
 
   const childAbortController = new AbortController();
   registerSubagentAbortController(subagentId, childAbortController);
@@ -161,6 +254,7 @@ export async function executeControlledSubagent(input: {
   let turnSummary = "";
   let lastError = "";
   let completedToolCalls = 0;
+  const evidence: SubagentResultEnvelope["evidence"] = [];
   let activitySequence = 0;
   let lastProgressEmitAt = 0;
 
@@ -223,7 +317,45 @@ export async function executeControlledSubagent(input: {
     startNewTurn: () => {},
     getContextMemoryState: () => null,
     getSubagentDepth: () => 1,
+    getCurrentRunIdentity: () => ({
+      runId: childRunId,
+      parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
+    }),
+    getSubagentScope: () => ({
+      subagentId,
+      parentSessionKey: snapshot.threadId,
+      scopeKey,
+      workspace: parentConfig.workspace,
+      allowedPaths,
+    }),
+    getRuntimeTraceContext: () => ({
+      threadId: `${snapshot.threadId}:${subagentId}`,
+      turnId: subagentId,
+      runId: childRunId,
+      parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
+      agentKind: "subagent",
+      subagentId,
+    }),
+    onDebugEvent: (event, data = {}) => {
+      if (event === "memory_pressure_sample" && data.action === "hold") {
+        emitProgress({
+          phase: "waiting",
+          title: language === "zh" ? "等待本地模型内存余量" : "Waiting for local model memory",
+          completedToolCalls,
+        });
+      }
+      input.parentCallbacks.onDebugEvent?.(event, {
+        ...data,
+        threadId: `${snapshot.threadId}:${subagentId}`,
+        turnId: subagentId,
+        runId: childRunId,
+        parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
+        agentKind: "subagent",
+        subagentId,
+      });
+    },
     runSubagent: undefined,
+    waitSubagents: undefined,
     onGoalProgressUpdate: undefined,
     onGoalRuntimeUpdate: undefined,
     onGoalIterationStart: undefined,
@@ -309,6 +441,11 @@ export async function executeControlledSubagent(input: {
     },
     onToolDone: (tool, target, result) => {
       completedToolCalls += 1;
+      evidence.push({
+        tool,
+        target,
+        detail: compactText(result, 1_000),
+      });
       emitUpdate({
         status: "running",
         progress: {
@@ -337,6 +474,7 @@ export async function executeControlledSubagent(input: {
 
   let finalStatus: SubagentStatus = "failed";
   let finalSummary = "";
+  let wallClockTimedOut = false;
   try {
     return await withSubagentCapacity({
       policy,
@@ -363,8 +501,15 @@ export async function executeControlledSubagent(input: {
           },
         }, makeActivity("running", language === "zh" ? "开始执行" : "Execution started"));
 
-        const outcome = await input.executeAgentLoop(childCallbacks, childAbortController);
+        const wallClockTimer = setTimeout(() => {
+          wallClockTimedOut = true;
+          lastError = "SUBAGENT_WALL_CLOCK_TIMEOUT: execution exceeded 240 seconds.";
+          childAbortController.abort();
+        }, 240_000);
+        const outcome = await input.executeAgentLoop(childCallbacks, childAbortController)
+          .finally(() => clearTimeout(wallClockTimer));
         finalStatus = resolveOutcomeStatus(outcome, childAbortController.signal.aborted);
+        if (wallClockTimedOut) finalStatus = "blocked";
         finalSummary = compactText(
           finalText || turnSummary || streamText || childMessages
             .filter((message) => message.role === "assistant" && typeof message.content === "string")
@@ -380,7 +525,8 @@ export async function executeControlledSubagent(input: {
         }
         const completedAt = Date.now();
         if (finalStatus === "failed") {
-          reportSubagentCapacityFailure(policy, lastError || outcome.reason);
+          const degraded = reportSubagentCapacityFailure(policy, lastError || outcome.reason);
+          if (degraded) finalStatus = "degraded";
         }
         emitUpdate({
           status: finalStatus,
@@ -402,24 +548,51 @@ export async function executeControlledSubagent(input: {
             ? language === "zh" ? "返回摘要" : "Summary returned"
             : language === "zh" ? "执行结束" : "Execution ended",
         ));
+        if (finalStatus === "degraded") {
+          input.emitEvent(withEventSchema({
+            type: "subagent.handed_back",
+            threadId: snapshot.threadId,
+            turnId: input.parentTurnId,
+            timestampMs: completedAt,
+            subagentId,
+            reason: lastError || outcome.reason,
+            evidenceCount: evidence.length,
+            remainingWork: objective,
+          }));
+          input.parentCallbacks.onDebugEvent?.("subagent_handed_back", {
+            subagentId,
+            scopeKey,
+            reason: lastError || outcome.reason,
+            evidenceCount: evidence.length,
+            remainingWork: objective,
+          });
+        }
         return {
           subagentId,
           name,
+          scopeKey,
           status: finalStatus,
           summary: finalSummary,
+          evidence: evidence.slice(-24),
+          ...(finalStatus === "completed" ? {} : { blocker: lastError || outcome.reason }),
+          ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
         };
       },
     });
   } catch (error) {
-    finalStatus = childAbortController.signal.aborted ? "canceled" : "failed";
+    finalStatus = wallClockTimedOut
+      ? "blocked"
+      : childAbortController.signal.aborted ? "canceled" : "failed";
     finalSummary = compactText(finalText || turnSummary || streamText, 16_000);
     lastError = finalStatus === "canceled"
       ? language === "zh"
         ? "SUBAGENT_CANCELED_BY_USER：子智能体已停止；除非用户明确要求，否则不要重新创建相同任务。"
         : "SUBAGENT_CANCELED_BY_USER: the subagent was stopped; do not respawn the same task unless the user explicitly asks."
       : error instanceof Error ? error.message : String(error || "");
-    reportSubagentCapacityFailure(policy, error);
+    if (finalStatus === "failed" && reportSubagentCapacityFailure(policy, error)) {
+      finalStatus = "degraded";
+    }
     emitUpdate({
       status: finalStatus,
       completedAt: Date.now(),
@@ -444,8 +617,12 @@ export async function executeControlledSubagent(input: {
     return {
       subagentId,
       name,
+      scopeKey,
       status: finalStatus,
       summary: finalSummary,
+      evidence: evidence.slice(-24),
+      blocker: lastError,
+      ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
       error: lastError,
     };
   } finally {
@@ -461,5 +638,6 @@ export async function executeControlledSubagent(input: {
     }));
     input.parentSignal?.removeEventListener("abort", abortFromParent);
     unregisterSubagentAbortController(subagentId);
+    releaseSubagentScopeLease(subagentId);
   }
 }

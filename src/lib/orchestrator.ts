@@ -34,6 +34,7 @@ import {
   type MCPTool,
 } from "./mcpClient";
 import { getFileMetadata, shellPermissionPreflight, writeFileAtomic } from "./ipc";
+import { acquireModelLane } from "./modelLaneCoordinator";
 import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import { parseApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
@@ -223,6 +224,7 @@ export const PLAN_REPEAT_READ_LIMIT = 3;
 export const EXECUTION_REPEAT_READ_LIMIT = 8;
 export const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "spawn_subagent",
+  "wait_subagents",
   "get_project_skeleton",
   "list_directory",
   "glob_search",
@@ -1289,6 +1291,8 @@ export interface OrchestratorCallbacks {
     goalSliceId?: string;
   };
   getSubagentDepth?: () => number;
+  getSubagentScope?: () => import("./subagents").SubagentExecutionScope | null;
+  getRuntimeTraceContext?: () => import("./subagents").RuntimeTraceContext;
   getSnapshotContextLimit?: () => number;
   hasSessionHookInitialized: (sessionKey: string) => boolean;
   markSessionHookInitialized: (sessionKey: string) => void;
@@ -1325,6 +1329,10 @@ export interface OrchestratorCallbacks {
     request: import("./subagents").SpawnSubagentRequest,
     options?: { signal?: AbortSignal },
   ) => Promise<import("./subagents").SpawnSubagentResult>;
+  waitSubagents?: (
+    request: import("./subagents").WaitSubagentsRequest,
+    options?: { signal?: AbortSignal },
+  ) => Promise<import("./subagents").WaitSubagentsResult>;
 
   // Goal Mode Support
   onGoalProgressUpdate?: (progress: import("./goalState").GoalProgress, goal: import("./goalState").GoalDefinition) => void;
@@ -1606,6 +1614,7 @@ export function prepareMessagesForToolProtocol(
 export function getToolTarget(name: string, args: Record<string, unknown>): string {
   switch (name) {
     case "spawn_subagent":  return (args.name as string) || (args.objective as string) || "subagent";
+    case "wait_subagents": return (args.subagent_ids as string) || "all subagents";
     case "list_directory":  return (args.path as string) || ".";
     case "read_file":       return (args.path as string) || "";
     case "read_document":   return (args.path as string) || "";
@@ -2775,7 +2784,23 @@ export async function fetchLLMStream(
 
   // Track consecutive stream cancellations for aggressive context compaction
   let consecutiveCancelCount = 0;
+  let capacityHandoffRetryCount = 0;
 
+  const traceContext = callbacks.getRuntimeTraceContext?.();
+  const isSubagentRequest = (callbacks.getSubagentDepth?.() || 0) > 0;
+  const modelLane = await acquireModelLane({
+    config: callbacks.getConfig(),
+    contextLimit: settings.contextLimit,
+    agentKind: isSubagentRequest ? "subagent" : "parent",
+    subagentId: traceContext?.subagentId,
+    signal,
+    onDebugEvent: (event, data) => callbacks.onDebugEvent?.(event, {
+      ...data,
+      ...(traceContext || {}),
+    }),
+  });
+
+  try {
   while (true) {
     fullText = "";
     let result: StreamResult;
@@ -2787,7 +2812,7 @@ export async function fetchLLMStream(
 	        const maxStreamElapsedMs = options.maxStreamElapsedMs ?? 0;
 	        let noVisibleTokenTimer: ReturnType<typeof setTimeout> | null = null;
 	        let maxStreamElapsedTimer: ReturnType<typeof setTimeout> | null = null;
-	        const cleanup = () => {
+        const cleanup = () => {
 	          if (noVisibleTokenTimer !== null) {
 	            clearTimeout(noVisibleTokenTimer);
 	            noVisibleTokenTimer = null;
@@ -2797,6 +2822,7 @@ export async function fetchLLMStream(
 	            maxStreamElapsedTimer = null;
 	          }
 	          signal.removeEventListener("abort", onExternalAbort);
+	          modelLane.setPressureHandler(undefined);
 	        };
         const safeResolve = (r: StreamResult) => {
           if (!settled) {
@@ -2828,6 +2854,10 @@ export async function fetchLLMStream(
         }
 
         signal.addEventListener("abort", onExternalAbort, { once: true });
+	        modelLane.setPressureHandler((pressureFailure) => {
+	          safeReject(pressureFailure);
+	          requestAbortController.abort();
+	        });
 	        if (timeoutMs > 0) {
 	          noVisibleTokenTimer = setTimeout(() => {
 	            const timeoutError = createStreamNoVisibleTokenTimeoutError(
@@ -2868,6 +2898,7 @@ export async function fetchLLMStream(
           settings,
           {
             onToken: (token) => {
+	          if (token.length > 0) modelLane.markFirstToken();
               if (noVisibleTokenTimer !== null && token.length > 0) {
                 clearTimeout(noVisibleTokenTimer);
                 noVisibleTokenTimer = null;
@@ -2910,6 +2941,9 @@ export async function fetchLLMStream(
       });
     } catch (err) {
       const retryMessage = getErrorMessage(err, "LLM stream failed");
+	  const childHandedBackForFailure = modelLane.reportFailure(err);
+	  if (retryMessage.includes("SUBAGENT_MEMORY_PRESSURE_DEGRADED")) throw err;
+	  if (isSubagentRequest && childHandedBackForFailure) throw err;
       
       const isOomError = isLocal && (
         retryMessage.toLowerCase().includes("oom") ||
@@ -2920,6 +2954,8 @@ export async function fetchLLMStream(
       );
 
       if (isOomError && settings.contextLimit && settings.contextLimit > 4096) {
+	    if (childHandedBackForFailure && capacityHandoffRetryCount >= 1) throw err;
+	    if (childHandedBackForFailure) capacityHandoffRetryCount += 1;
         const newLimit = Math.max(4096, Math.floor(settings.contextLimit / 2));
         logAgentEvent("local_oom_fallback", {
           originalLimit: settings.contextLimit,
@@ -3092,6 +3128,9 @@ export async function fetchLLMStream(
     });
     return result;
 
+  }
+  } finally {
+    modelLane.release();
   }
 }
 
@@ -3990,18 +4029,40 @@ async function executeToolCallWithLifecycle(
             objective: String(resolvedArgs.objective || ""),
             name: typeof resolvedArgs.name === "string" ? resolvedArgs.name : undefined,
             role: typeof resolvedArgs.role === "string" ? resolvedArgs.role : undefined,
+            scopeKey: typeof resolvedArgs.scope_key === "string" ? resolvedArgs.scope_key : undefined,
+            scope: typeof resolvedArgs.scope === "string" ? resolvedArgs.scope : undefined,
             contextHints: typeof resolvedArgs.context_hints === "string"
               ? resolvedArgs.context_hints
               : typeof resolvedArgs.contextHints === "string" ? resolvedArgs.contextHints : undefined,
             allowedPaths: typeof resolvedArgs.allowed_paths === "string"
               ? resolvedArgs.allowed_paths
               : typeof resolvedArgs.allowedPaths === "string" ? resolvedArgs.allowedPaths : undefined,
+            expectedOutput: typeof resolvedArgs.expected_output === "string"
+              ? resolvedArgs.expected_output
+              : typeof resolvedArgs.expectedOutput === "string" ? resolvedArgs.expectedOutput : undefined,
           }, { signal: options.abortSignal });
-          if (result.status !== "completed") {
-            throw new Error(result.error || result.summary || `Subagent ${result.name} ${result.status}.`);
-          }
           return JSON.stringify(result);
         })()
+      : tc.name === "wait_subagents"
+        ? await (async () => {
+            if (!callbacks.waitSubagents) {
+              throw new Error("Subagent wait runtime is unavailable for this workflow.");
+            }
+            const subagentIds = String(resolvedArgs.subagent_ids || "")
+              .split(/[\n,;]+/)
+              .map((value) => value.trim())
+              .filter(Boolean);
+            const joined = await callbacks.waitSubagents({ subagentIds }, { signal: options.abortSignal });
+            const unusableFailure = joined.results.find((entry) =>
+              entry.status === "failed" &&
+              entry.evidence.length === 0 &&
+              (!entry.summary.trim() || entry.summary.trim() === String(entry.blocker || entry.error || "").trim())
+            );
+            if (unusableFailure) {
+              throw new Error(unusableFailure.blocker || unusableFailure.error || `Subagent ${unusableFailure.name} failed without usable evidence.`);
+            }
+            return JSON.stringify(joined);
+          })()
       : await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
           allowExternalLocalRead: options.allowExternalLocalRead === true,
           shellPermissionApproval: options.shellPermissionApproval,

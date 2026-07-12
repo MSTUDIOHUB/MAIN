@@ -31,6 +31,7 @@ export interface PlanToolActivityLike {
 
 const PLAN_READ_ONLY_TOOL_NAMES = new Set([
   "spawn_subagent",
+  "wait_subagents",
   "get_project_skeleton",
   "list_directory",
   "glob_search",
@@ -53,6 +54,7 @@ const PLAN_READ_ONLY_TOOL_NAMES = new Set([
 ]);
 const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "spawn_subagent",
+  "wait_subagents",
   "read_file",
   "read_document",
   "analyze_tabular_document",

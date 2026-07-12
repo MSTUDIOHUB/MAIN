@@ -94,17 +94,34 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "spawn_subagent",
-      description: "创建一个隔离的只读子智能体来处理有界、可独立完成的探索、测试分析、日志排查或摘要任务。子智能体只返回证据摘要，不直接修改工作区。仅在任务确实可拆分时使用；本地模型会自动串行限流。",
+      description: "异步创建一个隔离的只读子智能体来处理有界、可独立完成的探索或分析任务。立即返回运行句柄；主体应继续处理不重叠工作，之后用 wait_subagents 汇合。",
       parameters: {
         type: "object",
         properties: {
           objective: { type: "string", description: "子智能体要独立完成的明确目标" },
           name: { type: "string", description: "可选显示名称，如 Euler；省略时由 MAIN 自动命名" },
           role: { type: "string", description: "可选角色，如 explorer、reviewer、tester、docs" },
+          scope_key: { type: "string", description: "稳定、简短且唯一的职责范围标识" },
+          scope: { type: "string", description: "该子智能体独占的职责边界，不得与主体当前探索重复" },
           context_hints: { type: "string", description: "可选的紧凑上下文提示，不要复制整段主对话" },
-          allowed_paths: { type: "string", description: "可选的优先读取路径，使用逗号分隔" },
+          allowed_paths: { type: "string", description: "允许读取和搜索的工作区路径，使用逗号分隔；本地任务最多 6 个" },
+          expected_output: { type: "string", description: "汇合时需要返回的证据结构或判断" },
         },
-        required: ["objective"],
+        required: ["objective", "scope_key", "scope", "allowed_paths", "expected_output"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "wait_subagents",
+      description: "等待并汇合当前父回合创建的一个或全部子智能体。省略 subagent_ids 时等待本回合全部子智能体；返回摘要、证据、阻塞原因和剩余工作。",
+      parameters: {
+        type: "object",
+        properties: {
+          subagent_ids: { type: "string", description: "可选，逗号分隔的子智能体 ID；省略则等待全部" },
+        },
+        required: [],
       },
     },
   },

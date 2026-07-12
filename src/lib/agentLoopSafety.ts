@@ -1,4 +1,5 @@
 export interface AgentLoopIterationLimits {
+  subagent?: number;
   chatRespond?: number;
   editExecute?: number;
   planDraft?: number;
@@ -14,6 +15,7 @@ export const DEFAULT_AGENT_LOOP_ITERATION_LIMITS = {
   planExecution: 50,
   goalIteration: 150,
   default: 25,
+  subagent: 6,
 } as const;
 
 function positiveInt(value: unknown, fallback: number): number {
@@ -28,8 +30,12 @@ export function resolveAgentLoopMaxIterations(input: {
   runtimeIntent: "respond" | "execute" | "goal" | string;
   isPlanApproved: boolean;
   limits?: AgentLoopIterationLimits | null;
+  subagentDepth?: number;
 }): number {
   const limits = input.limits || {};
+  if ((input.subagentDepth || 0) > 0) {
+    return positiveInt(limits.subagent, DEFAULT_AGENT_LOOP_ITERATION_LIMITS.subagent);
+  }
   if (input.runtimeIntent === "goal") {
     return positiveInt(limits.goalIteration, DEFAULT_AGENT_LOOP_ITERATION_LIMITS.goalIteration);
   }
@@ -66,6 +72,7 @@ export function resolveAgentLoopIterationBudget(input: {
   currentIteration: number;
   planExecutionStartIteration?: number | null;
   limits?: AgentLoopIterationLimits | null;
+  subagentDepth?: number;
 }): AgentLoopIterationBudget {
   const currentIteration = Math.max(0, Math.floor(Number(input.currentIteration) || 0));
   if (input.workflowMode === "plan" && input.isPlanApproved) {
@@ -106,7 +113,9 @@ export function shouldUseMaxStepsFinalTextOnly(input: {
   if (input.alreadyPrompted) return false;
   if (input.iteration < input.maxIterations) return false;
   if (input.workflowMode === "plan" && input.isPlanApproved) return false;
-  return input.workflowMode === "chat" && input.runtimeIntent === "respond";
+  return input.workflowMode === "chat" && (
+    input.runtimeIntent === "respond" || input.runtimeIntent === "analyze"
+  );
 }
 
 export function buildMaxStepsFinalTextPrompt(input: {

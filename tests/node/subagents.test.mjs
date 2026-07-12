@@ -59,6 +59,7 @@ function makeConfig(profile, overrides = {}) {
     },
     cloudServers: [],
     activeCloudServerId: "",
+    workspace: "/workspace",
     ...overrides,
   };
 }
@@ -163,18 +164,25 @@ test("controlled child runtime isolates messages and returns its summary through
   subagents.resetSubagentRuntimeForTests();
   const events = [];
   const parentMessages = [{ role: "user", content: "private parent transcript" }];
+  const traceEvents = [];
   const result = await subagentRuntime.executeControlledSubagent({
     request: {
       name: "Euler",
       role: "explorer",
       objective: "Inspect the event boundary",
       contextHints: "Start with src/lib/turnEvents.ts",
+      scopeKey: "turn-events",
+      scope: "Inspect only the turn event contract",
+      allowedPaths: "src/lib/turnEvents.ts",
+      expectedOutput: "Evidence summary",
     },
     parentCallbacks: {
       getConfig: () => makeConfig("local"),
       getPreferredLanguage: () => "en",
       getSessionKey: () => "thread-1",
       getMessages: () => parentMessages,
+      getCurrentRunIdentity: () => ({ runId: "run-parent", parentRunId: null }),
+      onDebugEvent: (event, data) => traceEvents.push({ event, data }),
     },
     parentTurnId: "turn-1",
     existingRunCount: 0,
@@ -185,6 +193,9 @@ test("controlled child runtime isolates messages and returns its summary through
       assert.equal(childCallbacks.getMessages().length, 1);
       assert.notEqual(childCallbacks.getMessages(), parentMessages);
       assert.match(childCallbacks.getMessages()[0].content, /bounded read-only subagent/);
+      assert.notEqual(childCallbacks.getCurrentRunIdentity().runId, "run-parent");
+      assert.equal(childCallbacks.getCurrentRunIdentity().parentRunId, "run-parent");
+      childCallbacks.onDebugEvent("child_trace_probe", {});
       childCallbacks.onToolExecuting("read_file", "src/lib/turnEvents.ts");
       childCallbacks.onToolDone("read_file", "src/lib/turnEvents.ts", "event schema");
       childCallbacks.onAssistantFinalText("The event boundary is versioned and durable.");
@@ -202,6 +213,123 @@ test("controlled child runtime isolates messages and returns its summary through
   const [record] = subagents.projectSubagentRuns(events);
   assert.equal(record.status, "completed");
   assert.equal(record.activities.filter((activity) => activity.status === "completed").length, 2);
+  assert.equal(traceEvents[0].data.agentKind, "subagent");
+  assert.equal(traceEvents[0].data.parentRunId, "run-parent");
+  assert.match(traceEvents[0].data.runId, /^run-subagent-/);
+});
+
+test("async spawn returns a handle before completion and wait preserves structured results", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const events = [];
+  let releaseChild;
+  const childGate = new Promise((resolve) => { releaseChild = resolve; });
+  const parentCallbacks = {
+    getConfig: () => makeConfig("local"),
+    getPreferredLanguage: () => "en",
+    getSessionKey: () => "thread-async",
+    getMessages: () => [{ role: "user", content: "parent" }],
+  };
+  const handle = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      name: "Euler",
+      role: "explorer",
+      objective: "Inspect turn event persistence",
+      scopeKey: "turn-events",
+      scope: "Turn event persistence only",
+      allowedPaths: "src/lib/turnEvents.ts",
+      expectedOutput: "Path-backed summary",
+    },
+    parentCallbacks,
+    parentTurnId: "turn-async",
+    existingRunCount: 0,
+    emitEvent: (event) => events.push(event),
+    executeAgentLoop: async (childCallbacks) => {
+      await childGate;
+      childCallbacks.onToolDone("read_file", "src/lib/turnEvents.ts", "versioned events");
+      childCallbacks.onAssistantFinalText("Turn events are versioned and persisted.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+  assert.equal(handle.status, "queued");
+  assert.equal(handle.scopeKey, "turn-events");
+  assert.equal(events.some((event) => event.type === "subagent.closed"), false);
+
+  const waiting = subagents.waitForCoordinatedSubagents({
+    threadId: "thread-async",
+    parentTurnId: "turn-async",
+    subagentIds: [handle.subagentId],
+  });
+  releaseChild();
+  const joined = await waiting;
+  assert.equal(joined.results[0].status, "completed");
+  assert.match(joined.results[0].summary, /versioned and persisted/);
+  assert.equal(joined.results[0].evidence[0].target, "src/lib/turnEvents.ts");
+});
+
+test("blocked child results preserve their useful summary instead of becoming tool errors", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect a bounded blocker",
+      scopeKey: "blocker",
+      scope: "One file",
+      allowedPaths: "src/lib/subagents.ts",
+      expectedOutput: "Partial evidence",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-blocked",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-blocked",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      childCallbacks.onToolDone("read_file", "src/lib/subagents.ts", "lease registry located");
+      childCallbacks.onAssistantFinalText("The lease registry is usable evidence.", [
+        { label: "Approve", value: "approve" },
+      ], { awaitingInput: true });
+      return { status: "paused", reason: "awaiting_user_choice" };
+    },
+  });
+  assert.equal(result.status, "blocked");
+  assert.match(result.summary, /usable evidence/);
+  assert.equal(result.evidence.length, 1);
+});
+
+test("scope leases reject child escape and parent overlap", () => {
+  subagents.resetSubagentRuntimeForTests();
+  subagents.acquireSubagentScopeLease({
+    threadId: "thread-scope",
+    parentTurnId: "turn-scope",
+    subagentId: "subagent-scope",
+    scopeKey: "runtime",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib/subagents.ts"],
+    createdAt: Date.now(),
+  });
+  const scope = {
+    subagentId: "subagent-scope",
+    parentSessionKey: "thread-scope",
+    scopeKey: "runtime",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib/subagents.ts"],
+  };
+  assert.equal(subagents.validateSubagentScopeTarget(scope, "/workspace/src/lib/subagents.ts"), true);
+  assert.equal(subagents.validateSubagentScopeTarget(scope, "src/lib/orchestrator.ts"), false);
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-scope",
+    targetPath: "/workspace/src/lib/subagents.ts",
+  })?.subagentId, "subagent-scope");
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-scope",
+    targetPath: "src",
+  })?.subagentId, "subagent-scope");
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-scope",
+    targetPath: ".",
+  })?.subagentId, "subagent-scope");
 });
 
 test("subagent source contracts keep children read-only and UI activity clickable", () => {
@@ -212,12 +340,13 @@ test("subagent source contracts keep children read-only and UI activity clickabl
   const schemaSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/toolSchemas.ts"), "utf8");
 
   assert.match(registrySource, /subagentDepth > 0/);
-  assert.match(registrySource, /risk === "read_only" \|\| risk === "external_read"/);
-  assert.match(registrySource, /tool\.function\.name === "spawn_subagent"/);
+  assert.match(registrySource, /childToolNames = new Set\(\["read_file", "grep_search", "get_file_outline"\]\)/);
+  assert.match(registrySource, /mcpServers\.length > 0 && subagentDepth === 0/);
   assert.match(partitionSource, /never reuse the[\s\S]*read-only result cache for subagents/);
   assert.match(chatSource, /data-testid="subagent-activity-notice"/);
   assert.match(chatSource, /openSubagentsPanel/);
   assert.match(panelSource, /rightPanelTab === "subagents"/);
   assert.match(panelSource, /<SubagentsPanel/);
   assert.match(schemaSource, /name: "spawn_subagent"/);
+  assert.match(schemaSource, /name: "wait_subagents"/);
 });

@@ -1641,6 +1641,8 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "subagent.created",
     "subagent.updated",
     "subagent.closed",
+    "subagent.handed_back",
+    "model_lane.pressure",
     "approval.requested",
     "run.started",
     "run.paused",
