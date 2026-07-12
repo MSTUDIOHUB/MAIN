@@ -2936,6 +2936,18 @@ export default function ChatArea({
       agentStatus === "pending_review" ||
       capsuleTurn.status === "executing"
     );
+  const capsuleHarnessRunId =
+    capsuleTurn &&
+    harnessRunMarker?.status === "running" &&
+    harnessRunMarker.sessionKey === activeSessionKey &&
+    harnessRunMarker.turnId === capsuleTurn.id
+      ? harnessActionRunId
+      : null;
+  // A child execution checkpoint remains authoritative while a run is paused
+  // for recovery or failure, when the harness marker is no longer `running`.
+  // The approved child snapshot is installed before the old review lease has
+  // fully closed, so it wins over a briefly still-running parent marker.
+  const capsuleActiveRunId = capsulePlanExecutionSnapshot?.runId || capsuleHarnessRunId || null;
   const capsuleProgressLedger = useMemo(() => {
     if (!capsuleTurn) return [];
     return buildRuntimeProgressLedger({
@@ -2944,8 +2956,17 @@ export default function ChatArea({
       turnId: capsuleTurn.id,
       language,
       maxItems: 12,
+      activeRunId: capsuleActiveRunId,
+      planExecutionSnapshot: capsulePlanExecutionSnapshot,
     });
-  }, [capsuleTurn, capsuleTurnBlocks, language, runtimeEvents]);
+  }, [
+    capsuleActiveRunId,
+    capsulePlanExecutionSnapshot,
+    capsuleTurn,
+    capsuleTurnBlocks,
+    language,
+    runtimeEvents,
+  ]);
   const capsuleProgressProjection = useMemo(
     () => buildRuntimeProgressProjection(capsuleProgressLedger, language, 4),
     [capsuleProgressLedger, language],
@@ -2977,10 +2998,14 @@ export default function ChatArea({
     return { text: "", blockId: null };
   }, [capsuleIsRunActive, capsuleTurnBlocks]);
 
-  const cachedCapsuleExplanation = useMemo(() => {
-    if (!capsuleIsRunActive || !capsuleTurn) return "";
-    if (capsuleExplanationState?.turnId !== capsuleTurn.id) return "";
-    return normalizeCapsuleExplanationText(capsuleExplanationState.text);
+  const capsuleExplanationBySource = useMemo(() => {
+    if (!capsuleIsRunActive || !capsuleTurn) return { runtime: "", model: "" };
+    if (capsuleExplanationState?.turnId !== capsuleTurn.id) return { runtime: "", model: "" };
+    const text = normalizeCapsuleExplanationText(capsuleExplanationState.text);
+    if (!text) return { runtime: "", model: "" };
+    return capsuleExplanationState.source === "runtime"
+      ? { runtime: text, model: "" }
+      : { runtime: "", model: text };
   }, [capsuleExplanationState, capsuleIsRunActive, capsuleTurn]);
 
   useEffect(() => {
@@ -3024,13 +3049,16 @@ export default function ChatArea({
       return normalizeCapsuleProgressText(planExecutionCapsuleProjection.headline);
     }
     if (!capsuleIsRunActive || !capsuleTurn) return "";
-    if (cachedCapsuleExplanation) return cachedCapsuleExplanation;
+    // A plan-runtime narration is authoritative during drafting. A compliant
+    // model explanation may still be shown, but cannot replace runtime state.
+    if (capsuleExplanationBySource.runtime) return capsuleExplanationBySource.runtime;
+    if (capsuleExplanationBySource.model) return capsuleExplanationBySource.model;
     if (activeTurnExplanation.text) return activeTurnExplanation.text;
     if (explanationInfo.text) return explanationInfo.text;
     const progressText = normalizeCapsuleProgressText(capsuleProgressProjection.activityText);
     if (progressText) return progressText;
     return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought));
-  }, [planExecutionCapsuleProjection?.headline, capsuleIsRunActive, capsuleTurn, cachedCapsuleExplanation, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
+  }, [planExecutionCapsuleProjection?.headline, capsuleIsRunActive, capsuleTurn, capsuleExplanationBySource, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;

@@ -148,6 +148,36 @@ test("assistant turn display suppresses executable options during approved plan 
   assert.equal(decision.finalReplyOptions.length, 0);
 });
 
+test("assistant turn display hides inferred diagnostic choices while the approved plan has tool calls", () => {
+  const decision = resolveDecision({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    isPlanApproved: true,
+    planStage: "executing",
+    effectiveToolCallCount: 2,
+    normalizedVisibleText: "正在继续执行已批准计划。",
+    normalizedReplyOptions: [
+      {
+        label: "引用了 save_file_content 命令但未在 Rust 端实现",
+        value: "引用了 save_file_content 命令但未在 Rust 端实现",
+        action: "execute_once",
+        source: "inferred_enumerated",
+      },
+      {
+        label: "我来确认是否在 tauri.conf.json 中配置",
+        value: "我来确认是否在 tauri.conf.json 中配置",
+        source: "inferred_enumerated",
+      },
+    ],
+  });
+
+  assert.equal(decision.suppressInferredReplyOptionsForToolCalls, true);
+  assert.equal(decision.suppressApprovedPlanExecutionReplyOptions, true);
+  assert.deepEqual(decision.rawFinalReplyOptions, []);
+  assert.deepEqual(decision.finalReplyOptions, []);
+});
+
 test("assistant turn display routes premature unapproved plan options into the artifact", () => {
   const decision = resolveDecision({
     workflowMode: "plan",

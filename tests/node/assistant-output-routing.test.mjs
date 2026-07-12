@@ -216,6 +216,38 @@ test("assistant output routing resolves executable plan reply options and pause 
   assert.equal(decision.shouldPauseForUserChoice, true);
 });
 
+test("assistant output routing keeps inferred diagnostic options from pausing tool execution", () => {
+  const inferredDiagnostics = [
+    {
+      label: "引用了 save_file_content 命令但未在 Rust 端实现",
+      value: "引用了 save_file_content 命令但未在 Rust 端实现",
+      action: "execute_once",
+      source: "inferred_enumerated",
+    },
+    {
+      label: "我来确认是否在 tauri.conf.json 中配置",
+      value: "我来确认是否在 tauri.conf.json 中配置",
+      source: "inferred_enumerated",
+    },
+  ];
+
+  const decision = resolveAssistantReplyOptionRouting({
+    rawFinalReplyOptions: inferredDiagnostics,
+    finalReplyOptions: inferredDiagnostics,
+    toolCallCount: 2,
+    workflowMode: "plan",
+    hasStructuredProposal: false,
+    hasReadyPlanArtifacts: false,
+    isPlanApproved: true,
+    forcePause: true,
+    finishReason: "tool_calls",
+  });
+
+  // Completion only drops calls from the reply-options pause path; this false
+  // decision therefore leaves the two calls on the normal execution path.
+  assert.equal(decision.shouldPauseForUserChoice, false);
+});
+
 test("assistant output routing detects hidden-thought-only no-tool stops", () => {
   assert.equal(
     isHiddenThoughtOnlyNoToolStop({

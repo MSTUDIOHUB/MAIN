@@ -60,6 +60,7 @@ const {
   buildReadOnlyPermissionContinuationPrompt,
   extractReplyOptions,
   hasExecutableProposalReplyOptions,
+  hasOnlyInferredReplyOptions,
   hasOnlyNonBlockingPlanReplyOptions,
   hasOnlyPlanContinuationReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
@@ -146,6 +147,139 @@ test("shouldPauseForReplyOptions does not hold chat runs for inferred numbered a
       toolCallCount: 0,
       workflowMode: "chat",
       finishReason: "stop",
+    }),
+    true,
+  );
+});
+
+test("screenshot-like diagnostic and self-directed numbered text never becomes a user choice", () => {
+  const extracted = extractReplyOptions([
+    "请选择下一步：",
+    "1. 引用了 `save_file_content` 命令但未在 Rust 端实现",
+    "2. 我来确认是否在 tauri.conf.json 中配置",
+  ].join("\n"));
+
+  assert.equal(extracted.hasExplicitUserOptionsTag, false);
+  assert.deepEqual(extracted.replyOptions, []);
+
+  // Protect resumed/older turns as well: if a previous inference path already
+  // produced these two entries, their coexistence with tool calls must not
+  // create a pause that discards the calls.
+  const legacyInferredDiagnostics = [
+    {
+      label: "引用了 save_file_content 命令但未在 Rust 端实现",
+      value: "引用了 save_file_content 命令但未在 Rust 端实现",
+      action: "execute_once",
+      source: "inferred_enumerated",
+    },
+    {
+      label: "我来确认是否在 tauri.conf.json 中配置",
+      value: "我来确认是否在 tauri.conf.json 中配置",
+      source: "inferred_enumerated",
+    },
+  ];
+
+  assert.equal(hasOnlyInferredReplyOptions(legacyInferredDiagnostics), true);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: legacyInferredDiagnostics,
+      toolCallCount: 2,
+      workflowMode: "plan",
+      isPlanApproved: true,
+      forcePause: true,
+      finishReason: "tool_calls",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSuppressApprovedPlanExecutionReplyOptions({
+      replyOptions: legacyInferredDiagnostics,
+      toolCallCount: 2,
+      workflowMode: "plan",
+      isPlanApproved: true,
+      planStage: "executing",
+    }),
+    true,
+  );
+});
+
+test("explicit blocking choices remain available without tool calls, including ordinary chat XML", () => {
+  const explicitBlocking = extractReplyOptions([
+    "需要你决定默认打开行为：",
+    "<user_options>",
+    "<option>启动时显示空白页</option>",
+    "<option>启动时自动恢复上次文件</option>",
+    "</user_options>",
+  ].join("\n"));
+
+  assert.deepEqual(
+    explicitBlocking.replyOptions.map((option) => option.source),
+    ["explicit_user_options", "explicit_user_options"],
+  );
+  assert.equal(
+    shouldSuppressApprovedPlanExecutionReplyOptions({
+      replyOptions: explicitBlocking.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      isPlanApproved: true,
+      planStage: "executing",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: explicitBlocking.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      isPlanApproved: true,
+      finishReason: "stop",
+    }),
+    true,
+  );
+
+  const ordinaryChatXml = extractReplyOptions([
+    "<user_options>",
+    "<option>继续执行现有修复</option>",
+    "<option>先停止并汇报当前结果</option>",
+    "</user_options>",
+  ].join("\n"));
+  assert.equal(ordinaryChatXml.hasExplicitUserOptionsTag, true);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: ordinaryChatXml.replyOptions,
+      toolCallCount: 2,
+      workflowMode: "chat",
+      finishReason: "tool_calls",
+    }),
+    true,
+  );
+});
+
+test("approved plan execution ignores explicit but non-blocking workflow choices", () => {
+  const nonBlocking = extractReplyOptions([
+    "<user_options>",
+    "<option>继续按默认实现</option>",
+    "<option>先汇报当前状态</option>",
+    "</user_options>",
+  ].join("\n"));
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: nonBlocking.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      isPlanApproved: true,
+      finishReason: "stop",
+    }),
+    false,
+  );
+  assert.equal(
+    shouldSuppressApprovedPlanExecutionReplyOptions({
+      replyOptions: nonBlocking.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      isPlanApproved: true,
+      planStage: "executing",
     }),
     true,
   );
@@ -280,6 +414,23 @@ test("extractReplyOptions ignores plan summary bullets after proposal headings",
 2. 游戏循环：\`setInterval\` 每150ms更新
 3. 渲染：网格背景、绿色渐变蛇身、红色圆形食物
 4. 碰撞检测：墙壁边界 + 自身重叠 + 食物重合
+  `);
+
+  assert.equal(result.replyOptions.length, 0);
+});
+
+test("extractReplyOptions does not turn plan execution order or risk notes into choices", () => {
+  const result = extractReplyOptions(`
+# Design
+
+## 执行顺序
+1. 固化数据字段和指标口径。
+2. 设计查询和聚合步骤。
+3. 明确报表输出结构和人工复核点。
+
+## 风险与后续确认
+- 风险：列名变化会导致查询条件失效，需要执行阶段增加列名兼容检查。
+- 后续确认：执行前由用户选择输出格式；默认先生成 Markdown 报告草稿。
   `);
 
   assert.equal(result.replyOptions.length, 0);

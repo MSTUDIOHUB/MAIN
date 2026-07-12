@@ -636,7 +636,16 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     ) {
       runTerminalEmitted = true;
     }
-    callbacks.onTurnEvent?.(withEventSchema(event));
+    // Progress is a run-scoped observation, not merely turn-scoped history.
+    // Stamp newly emitted progress with the active run identity while keeping
+    // the event field optional for persisted legacy sessions.
+    const eventWithRunIdentity = event.type === "progress.updated" && !event.runId
+      ? {
+          ...event,
+          ...resolveRunEventIdentity(),
+        }
+      : event;
+    callbacks.onTurnEvent?.(withEventSchema(eventWithRunIdentity));
   };
   Object.defineProperty(emitTurnEvent, "runIdentity", {
     configurable: false,

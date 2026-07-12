@@ -241,6 +241,48 @@ test("action continuations preserve their exact paused parent run even when anot
   assert.equal(persisted.turnId, "turn-choice");
 });
 
+test("approved handoffs preserve a preallocated child run id through the submission lease", () => {
+  const agentMessages = [{ role: "user", content: "reviewed plan" }];
+  let persisted;
+  const lease = startSubmitRunLease({
+    userContent: "execute approved plan",
+    canonicalUserText: "execute approved plan",
+    currentImages: [],
+    runSessionKey: "workspace-a:7",
+    runWorkspace: "/repo",
+    runSessionId: 7,
+    turnId: "turn-plan",
+    effectiveRunIntent: "plan",
+    runtimeRunIntent: "execute",
+    parentRunIdOverride: "run-review",
+    runIdOverride: "run-approved-child",
+    getRuntimeSnapshot: () => ({
+      agentMessagesLength: agentMessages.length,
+      planStage: "executing",
+      isPlanApproved: true,
+      harnessRunMarker: {
+        runId: "run-review",
+        sessionKey: "workspace-a:7",
+        turnId: "turn-plan",
+        turnStartMessageIndex: 0,
+      },
+    }),
+    appendAgentMessage: (message) => agentMessages.push(message),
+    createAbortController: () => ({ signal: { aborted: false } }),
+    setAbortController: () => {},
+    startGoal: () => assert.fail("goal must not start"),
+    getCurrentHarnessInstanceId: () => "instance-a",
+    persistHarnessRunMarker: (marker) => (persisted = marker),
+    setHarnessRunMarker: () => {},
+    nowMs: () => 791,
+  });
+
+  assert.equal(lease.runId, "run-approved-child");
+  assert.equal(lease.parentRunId, "run-review");
+  assert.equal(persisted.runId, "run-approved-child");
+  assert.equal(persisted.parentRunId, "run-review");
+});
+
 test("harness run ownership distinguishes sequential loops on the same conversation turn", () => {
   const marker = {
     status: "running",

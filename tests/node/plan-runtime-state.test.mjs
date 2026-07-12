@@ -63,6 +63,27 @@ const {
   shouldSuppressPlanTruncationWarning,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
 
+const {
+  buildPlanRuntimeCapsuleNarration,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/planOrchestration.ts"));
+
+test("plan runtime capsule narration exposes only fixed user-safe drafting states", () => {
+  assert.equal(
+    buildPlanRuntimeCapsuleNarration("grounding", "zh"),
+    "正在收集生成计划所需信息",
+  );
+  assert.equal(
+    buildPlanRuntimeCapsuleNarration("needs_rewrite", "zh"),
+    "正在整理已确认信息，生成可审批计划",
+  );
+  assert.equal(
+    buildPlanRuntimeCapsuleNarration("needs_evidence", "zh"),
+    "正在补充一项关键证据以完善计划",
+  );
+  assert.equal(buildPlanRuntimeCapsuleNarration("review_ready", "zh"), "");
+  assert.equal(buildPlanRuntimeCapsuleNarration("blocked", "en"), "");
+});
+
 const allPlanTools = [
   "get_project_skeleton",
   "grep_search",

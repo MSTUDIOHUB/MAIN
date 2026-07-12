@@ -448,3 +448,16 @@ test("approvePlan applies readiness failure before queuing a same-turn child run
   assert.match(approvePlanMethod, /plan_execution_materialization_failed/);
   assert.match(approvePlanMethod, /plan_approval_blocked_execution_materialization/);
 });
+
+test("approvePlan reserves a child run before publishing the initial execution progress", () => {
+  const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const approveStart = storeSource.indexOf("approvePlan: (approvalChoice, expectedIdentity) =>");
+  const approveEnd = storeSource.indexOf("rejectPlan: (expectedIdentity) =>", approveStart);
+  const approvePlanMethod = storeSource.slice(approveStart, approveEnd);
+
+  assert.match(approvePlanMethod, /const executionRunId = approvedTurnId/);
+  assert.match(approvePlanMethod, /executionRunId: executionRunId \|\| undefined/);
+  assert.match(approvePlanMethod, /runId: executionRunId/);
+  assert.match(approvePlanMethod, /toPlanExecutionRuntimeProgressUpdate\(/);
+  assert.match(approvePlanMethod, /plan-execution-progress:\$\{executionRunId\}/);
+});

@@ -1,4 +1,6 @@
 import type { MainThreadEvent, MainThreadProgressUpdate } from "./turnEvents";
+import { toPlanExecutionRuntimeProgressUpdate } from "./planExecutionRecovery";
+import type { PlanExecutionProgressSnapshot } from "./workflowModels";
 import {
   isInternalRuntimeProgressBlock,
   isInternalRuntimeProgressUpdate,
@@ -355,17 +357,48 @@ export function buildRuntimeProgressLedger(input: {
   turnId?: string;
   language?: RuntimeProgressLanguage;
   maxItems?: number;
+  /** Restrict current effective progress to the active run when known. */
+  activeRunId?: string | null;
+  /** A live plan checkpoint bridges the approval-to-child-run handoff. */
+  planExecutionSnapshot?: PlanExecutionProgressSnapshot | null;
 }): RuntimeProgressLedgerItem[] {
   const language = normalizeLanguage(input.language);
   const byKey = new Map<string, RuntimeProgressLedgerAccumulator>();
   const turnId = String(input.turnId || "");
+  const snapshotRunId = String(input.planExecutionSnapshot?.runId || "").trim();
+  // During the approval handoff a paused parent marker is expected. The child
+  // checkpoint is then the only current-run identity available to the UI.
+  const activeRunId = String(input.activeRunId || snapshotRunId || "").trim();
+  const hasLivePlanExecution = !!input.planExecutionSnapshot &&
+    (!turnId || input.planExecutionSnapshot.turnId === turnId) &&
+    (!activeRunId || !snapshotRunId || snapshotRunId === activeRunId);
   (input.blocks || []).forEach((block, index) => {
     if (turnId && String(block?.turnId || "") && String(block.turnId) !== turnId) return;
+    // Live progress has a canonical run-owned event. Older transcript blocks
+    // remain useful history but must not impersonate the currently executing
+    // child run, especially across plan-review handoffs.
+    if (activeRunId && String(block?.runId || "") !== activeRunId) return;
+    // The review-run pause belongs to audit history, never to an already
+    // approved execution checkpoint rendered as current progress.
+    if (
+      hasLivePlanExecution &&
+      block?.type === "system" &&
+      /暂停|paused|waiting.*review|等待审核/i.test(String(block.content || ""))
+    ) {
+      return;
+    }
     const item = itemFromBlock(block, index, language);
     if (item) addItem(byKey, item);
   });
   for (const event of input.events || []) {
     if (turnId && String((event as any).turnId || "") && String((event as any).turnId) !== turnId) continue;
+    const eventRunId = String((event as any).runId || "").trim();
+    const isRunOwnedEvent = event.type === "progress.updated" ||
+      event.type === "run.paused" ||
+      event.type === "run.completed" ||
+      event.type === "run.failed";
+    if (activeRunId && isRunOwnedEvent && eventRunId !== activeRunId) continue;
+    if (hasLivePlanExecution && event.type === "run.paused" && event.reason === "plan_review") continue;
     if (event.type === "progress.updated") {
       const item = itemFromProgressEvent(event.progress, event.timestampMs, language);
       if (item) addItem(byKey, item);
@@ -388,10 +421,35 @@ export function buildRuntimeProgressLedger(input: {
           lastSeenAt: event.timestampMs,
         });
       }
+    } else if (event.type === "run.failed") {
+      addItem(byKey, {
+        key: `run-failed:${eventRunId || event.turnId}`,
+        phase: "blocked",
+        title: language === "zh" ? "运行失败" : "Run failed",
+        status: "failed",
+        summary: compactLine(event.error?.message || "", 260),
+        target: "",
+        tool: "",
+        firstSeenAt: event.timestampMs,
+        lastSeenAt: event.timestampMs,
+      });
     } else if (event.type === "harness.telemetry") {
       const item = itemFromHarnessTelemetry(event, language);
       if (item) addItem(byKey, item);
     }
+  }
+  if (hasLivePlanExecution && input.planExecutionSnapshot) {
+    const snapshot = input.planExecutionSnapshot;
+    const item = itemFromProgressEvent(
+      toPlanExecutionRuntimeProgressUpdate({
+        snapshot,
+        language,
+        dedupeKey: `plan-execution-progress:${snapshot.runId || activeRunId || snapshot.turnId}`,
+      }),
+      Math.max(0, Number(snapshot.updatedAt) || 0),
+      language,
+    );
+    if (item) addItem(byKey, item);
   }
   const items = [...byKey.values()]
     .sort((a, b) => a.firstSeenAt - b.firstSeenAt)

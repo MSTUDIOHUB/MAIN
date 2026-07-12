@@ -128,6 +128,9 @@ export function handleReplyOptionsPause(input: {
 
   logAgentEvent("reply_options_pause", {
     iteration,
+    reason: effectiveToolCallCount > 0
+      ? "legacy_explicit_choice_precedes_tool_execution"
+      : "awaiting_explicit_user_choice",
     replyOptions: replyOptions.length,
     optionPreview: summarizeReplyOptionsForLog(replyOptions),
     droppedToolCalls: effectiveToolCallCount,

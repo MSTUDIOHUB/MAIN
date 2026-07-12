@@ -1381,6 +1381,8 @@ export interface OrchestratorCallbacks {
   onPlanTasksUpdated: (content: string) => void;
   onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
   onApprovedPlanExecutionStarted?: () => void;
+  /** A fixed, user-safe plan drafting narration. Raw phases stay in the loop. */
+  onPlanRuntimeNarration?: (narration: string | null) => void;
   onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
   onTurnSummaryReady: (summary: string) => void;

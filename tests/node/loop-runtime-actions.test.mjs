@@ -24,6 +24,9 @@ test("loop runtime actions own mutable recovery and phase reducers", () => {
   assert.match(actionsSource, /clearExecuteRecoveryRuntimeState\(stateOverride\)/);
   assert.match(actionsSource, /clearCrossIterationReadTrackingForTarget\(/);
   assert.match(actionsSource, /applyPlanRuntimePhase\(/);
+  assert.match(actionsSource, /buildPlanRuntimeCapsuleNarration\(/);
+  assert.match(actionsSource, /onPlanRuntimeNarration\?\./);
+  assert.doesNotMatch(actionsSource, /onTurnRuntimePhaseChanged\?\./);
 });
 
 test("loop runtime actions keep recovery telemetry next to the state mutation", () => {

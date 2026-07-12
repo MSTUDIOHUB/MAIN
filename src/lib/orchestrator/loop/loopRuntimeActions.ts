@@ -7,6 +7,7 @@ import {
 import {
   logAgentEvent,
 } from "../../orchestrator";
+import { buildPlanRuntimeCapsuleNarration } from "../../orchestrator/planOrchestration";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { OrchestratorCallbacks } from "../types";
@@ -84,6 +85,17 @@ export function createAgentLoopRuntimeActions(input: {
   const {
     workflowMode,
   } = runtimeState;
+  const publishPlanRuntimeNarration = (phase: PlanRuntimePhase) => {
+    callbacks.onPlanRuntimeNarration?.(
+      buildPlanRuntimeCapsuleNarration(phase, callbacks.getPreferredLanguage()) || null,
+    );
+  };
+
+  // The initial exploration phase has no transition yet, but it still needs a
+  // user-safe capsule description before the first tool or model token.
+  if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
+    publishPlanRuntimeNarration(getPlanRuntimeState().planRuntimePhase);
+  }
 
   const activateExecuteRecovery: AgentLoopRuntimeActions["activateExecuteRecovery"] = (
     mode,
@@ -183,6 +195,7 @@ export function createAgentLoopRuntimeActions(input: {
     );
     if (!phaseUpdate.changed) return;
     setPlanRuntimeState(phaseUpdate.state);
+    publishPlanRuntimeNarration(phase);
     logAgentEvent("plan_runtime_phase_changed", {
       phase,
       reason: reason || "",

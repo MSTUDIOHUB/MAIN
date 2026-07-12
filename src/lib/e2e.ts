@@ -3467,6 +3467,8 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
   const sessionId = 999602;
   const now = Date.now();
   const turnId = "e2e-execution-capsule-plan-task-progress-turn";
+  const reviewRunId = "run-e2e-execution-capsule-plan-review";
+  const childRunId = "run-e2e-execution-capsule-plan-child";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const planTasks = Array.from({ length: 9 }, (_, index) => {
     const taskNumber = index + 1;
@@ -3544,6 +3546,8 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
     planExecutionEvidenceCount: evidenceLedger.length,
     planExecutionProgressSnapshot: {
       turnId,
+      runId: childRunId,
+      parentRunId: reviewRunId,
       phase: "tool_start",
       currentTask: planTasks[8].text,
       currentTool: "apply_patch · src/task-9.ts",
@@ -3565,6 +3569,82 @@ function seedExecutionCapsulePlanTaskProgressScenario() {
     agentStatus: "running",
     isGenerating: true,
     abortController: new AbortController(),
+    harnessRunMarker: {
+      schemaVersion: 1,
+      runId: childRunId,
+      parentRunId: reviewRunId,
+      instanceId: "e2e-execution-capsule-plan-child-instance",
+      sessionKey: `${workspace}:${sessionId}`,
+      workspace,
+      sessionId,
+      turnId,
+      status: "running",
+      workflowMode: "plan",
+      runtimeIntent: "execute",
+      planStage: "executing",
+      isPlanApproved: true,
+      iteration: 9,
+      maxIterations: 50,
+      messagesLen: 12,
+      toolCount: 9,
+      latestTool: "apply_patch",
+      latestToolTarget: "src/task-9.ts",
+      activeStreamId: "stream-e2e-execution-capsule-plan-child",
+      streamStatus: "tool_running",
+      streamChunkCount: 0,
+      streamByteCount: 0,
+      streamElapsedMs: 0,
+      streamLifecycleStatus: "streaming",
+      lastStreamError: null,
+      startedAt: now - 2_000,
+      updatedAt: now,
+      closedAt: null,
+      closeReason: null,
+    },
+    runtimeEvents: [
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "run.paused" as const,
+        threadId: `${workspace}:${sessionId}`,
+        turnId,
+        timestampMs: now - 1_000,
+        runId: reviewRunId,
+        parentRunId: null,
+        reason: "plan_review",
+        message: "计划产物已物化并通过校验，等待审核。",
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "progress.updated" as const,
+        threadId: `${workspace}:${sessionId}`,
+        turnId,
+        timestampMs: now - 900,
+        runId: reviewRunId,
+        parentRunId: null,
+        progress: {
+          phase: "plan_review",
+          title: "旧审核进度",
+          status: "paused",
+          summary: "计划产物已物化并通过校验，等待审核。",
+        },
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "progress.updated" as const,
+        threadId: `${workspace}:${sessionId}`,
+        turnId,
+        timestampMs: now,
+        runId: childRunId,
+        parentRunId: reviewRunId,
+        progress: {
+          phase: "plan_execution:tool_start",
+          title: "正在执行已批准计划",
+          status: "running",
+          summary: "apply_patch · src/task-9.ts",
+          dedupeKey: `plan-execution-progress:${childRunId}`,
+        },
+      },
+    ],
     pendingReviewResolve: null,
     pendingReviewTaskId: null,
     pendingToolCall: null,
@@ -4384,7 +4464,17 @@ function seedExecutionCapsulePanelStabilityScenario() {
   bridge.showPlanDraftRecovery = () => {
     const heartbeatAt = Date.now();
     const runId = "run-e2e-plan-draft-recovery";
+    const staleReadBlockId = useAppStore.getState()._nextTaskId();
     const phaseBlockId = useAppStore.getState()._nextTaskId();
+    const staleReadBlock = {
+      id: staleReadBlockId,
+      turnId,
+      type: "agent" as const,
+      content: "我已读取 tauri.conf.json，接下来会继续整理计划。",
+      streaming: false,
+      createdAt: heartbeatAt - 66_000,
+      updatedAt: heartbeatAt - 66_000,
+    };
     const phaseBlock = {
       id: phaseBlockId,
       turnId,
@@ -4418,17 +4508,26 @@ function seedExecutionCapsulePanelStabilityScenario() {
       updatedAt: heartbeatAt,
     };
     useAppStore.setState((state) => ({
-      taskFlow: [baseUserBlock, phaseBlock],
+      taskFlow: [baseUserBlock, staleReadBlock, phaseBlock],
       conversationTurns: state.conversationTurns.map((turn) =>
         turn.id === turnId
           ? {
               ...turn,
               status: "planning" as const,
               summary: "",
-              blockIds: [userBlockId, phaseBlockId],
+              blockIds: [userBlockId, staleReadBlockId, phaseBlockId],
             }
           : turn
       ),
+      currentTurnState: {
+        ...state.currentTurnState,
+        capsuleExplanation: {
+          turnId,
+          text: "正在整理已确认信息，生成可审批计划",
+          updatedAt: heartbeatAt,
+          source: "runtime" as const,
+        },
+      },
       planArtifacts: [],
       planTasks: [],
       planExecutionEvidenceLedger: [],
@@ -7995,9 +8094,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return bridge?.cleanup;
   }
 
-  bridge.initialized = true;
-  bridge.scenario = scenario;
-  bindCloudServerBridgeControls();
+  try {
+    bridge.initialized = true;
+    bridge.scenario = scenario;
+    bindCloudServerBridgeControls();
 
   if (scenario === PLAN_FLOW_SCENARIO) {
     return seedPlanFlowScenario();
@@ -8271,6 +8371,13 @@ export function initializeE2EScenarios(): (() => void) | undefined {
     return seedSidebarRemoveLastWorkspaceScenario();
   }
 
-bridge.initialized = false;
-  return undefined;
+    bridge.initialized = false;
+    return undefined;
+  } catch (error) {
+    // A synchronous seed failure must not leave a bridge that claims to be
+    // initialized while its scenario controls were never installed.
+    bridge.initialized = false;
+    bridge.initializationError = error instanceof Error ? error.message : String(error);
+    throw error;
+  }
 }

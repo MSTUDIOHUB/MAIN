@@ -22,6 +22,10 @@ const INTERNAL_PROCESS_OPTION_RE = /(?:切换(?:到)?(?:执行|讨论|计划)模
 const PLAN_SUMMARY_HEADING_RE = /(?:方案总结|需求规格|设计方案|关键设计决策|设计决策|方案正文|计划摘要|方案摘要|requirements?|design|proposal|plan summary|design decisions?)/i;
 const PLAN_SUMMARY_ITEM_RE = /^(?:\*\*)?(?:技术栈|核心玩法|交互控制|交付物|架构|游戏循环|渲染|碰撞检测|执行顺序|关键设计决策|需求规格|设计方案|文件|模块|验证方式|测试方案|范围|目标|验收标准)(?:\*\*)?\s*[:：]/i;
 const DIAGNOSTIC_STATEMENT_OPTION_RE = /(?:问题可能|可能(?:是|在|出在)|看起来|似乎|应该是|原因(?:可能)?|被(?:自动)?(?:引入|加载|调用|覆盖)|已经(?:存在|完成|失败)|没有(?:被|正确)|is likely|likely due to|probably|seems? like|appears? to|was automatically|has been|is already)/i;
+const TOOL_IMPLEMENTATION_DIAGNOSTIC_OPTION_RE = /^(?:引用|调用|使用).{0,160}(?:命令|工具|command|tool).{0,120}(?:未|没有|尚未|not).{0,80}(?:实现|注册|提供|implemented|available)/i;
+const ASSISTANT_SELF_DIRECTED_INVESTIGATION_RE = /^(?:我来|让我|我会|我将|I(?:'ll| will))\s*(?:检查|读取|查看|分析|验证|定位|排查|核对|搜索|调查|check|read|view|inspect|analy[sz]e|verify|locate|debug|search|investigate)/i;
+const ASSISTANT_SELF_DIRECTED_CONFIRM_RE = /^(?:我来|让我|我会|我将|I(?:'ll| will))\s*(?:确认|confirm)/i;
+const ASSISTANT_SELF_DIRECTED_CONFIRM_CONDITION_RE = /(?:是否|能否|有没有|正确|配置|路径|文件|代码|源码|接口|函数|组件|Rust|Tauri|config|file|code|source|implementation|registered|available)/i;
 const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|先|直接|继续|开始|执行|运行|批准|确认|选择|使用|改用|采用|切换|修复|修改|实现|重构|完善|生成|创建|删除|保留|跳过|我来|我要|请|proceed|continue|start|run|execute|approve|confirm|choose|use|switch|fix|modify|implement|refactor|create|delete|skip)/i;
 const DECISION_VALUE_OPTION_RE = /(?:[？?]$|是否|应该|需要基于|基于|字段|金额|状态为|差值|计算|\bfield\b|\bvalue\b|\bamount\b|\bcalculate\b)/i;
 const LABELED_REPORT_STATEMENT_RE = /^(?:\*\*)?(.{2,80}?)(?:\*\*)?\s*[:：]\s*(.+)$/;
@@ -193,12 +197,62 @@ function looksLikeLabeledReportStatementOption(text: string): boolean {
   );
 }
 
+function isInferredModelActionOrDiagnostic(text: string): boolean {
+  const normalized = normalizeOptionText(text).replace(/^请\s*/, "");
+  return TOOL_IMPLEMENTATION_DIAGNOSTIC_OPTION_RE.test(normalized) ||
+    ASSISTANT_SELF_DIRECTED_INVESTIGATION_RE.test(normalized) ||
+    (
+      ASSISTANT_SELF_DIRECTED_CONFIRM_RE.test(normalized) &&
+      ASSISTANT_SELF_DIRECTED_CONFIRM_CONDITION_RE.test(normalized)
+    );
+}
+
+export function hasOnlyInferredReplyOptions(replyOptions: ReplyOption[]): boolean {
+  if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
+  return replyOptions.every((option) =>
+    option.source === "inferred_enumerated" ||
+    option.source === "inferred_binary" ||
+    option.source === "readonly_permission" ||
+    option.source === "proposal_follow_up" ||
+    option.source === "operation_approval"
+  );
+}
+
+/**
+ * Approved-plan execution accepts a user-choice boundary only through the
+ * explicit protocol and a user-owned, genuinely blocking decision axis.
+ * Numbered prose, compatibility inference and model work orders are all
+ * runtime work, not a new user decision.
+ */
+function hasExplicitApprovedPlanDecisionOptions(replyOptions: ReplyOption[]): boolean {
+  if (!Array.isArray(replyOptions) || replyOptions.length < 2) return false;
+  const explicitOptions = replyOptions.every((option) => {
+    const text = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+    return option.source === "explicit_user_options" &&
+      !option.action &&
+      !isInferredModelActionOrDiagnostic(text) &&
+      !looksLikeInternalPlanArtifactStep(text) &&
+      !INTERNAL_PLAN_WORK_ORDER_OPTION_RE.test(text);
+  });
+  if (!explicitOptions) return false;
+
+  // The execution runtime only yields when the user actually owns the
+  // product/business choice. Generic "continue", "report first", or model
+  // workflow ordering is not a blocker even if it appears in <user_options>.
+  const userOwnedDecisionOptionCount = replyOptions.filter((option) => {
+    const text = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+    return USER_OWNED_PLAN_DECISION_RE.test(text);
+  }).length;
+  return userOwnedDecisionOptionCount >= Math.min(2, replyOptions.length);
+}
+
 function looksLikeActionableReplyOption(text: string, source?: ReplyOption["source"]): boolean {
   const normalized = normalizeOptionText(text);
   if (!normalized) return false;
   if (source === "readonly_permission") return true;
   if (source === "inferred_enumerated" || source === "inferred_binary") {
     if (OPEN_ENDED_QUESTION_RE.test(normalized)) return false;
+    if (isInferredModelActionOrDiagnostic(normalized)) return false;
     if (looksLikeInternalPlanArtifactStep(normalized) || looksLikePlanSummaryItem(normalized)) {
       return false;
     }
@@ -503,13 +557,20 @@ export function shouldSuppressApprovedPlanExecutionReplyOptions(params: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved?: boolean;
   planStage?: string | null;
+  toolCallCount?: number;
 }): boolean {
-  return (
-    params.workflowMode === "plan" &&
-    params.isPlanApproved === true &&
-    params.planStage === "executing" &&
-    hasExecutableProposalReplyOptions(params.replyOptions)
-  );
+  if (
+    params.workflowMode !== "plan" ||
+    params.isPlanApproved !== true ||
+    params.planStage !== "executing"
+  ) {
+    return false;
+  }
+  // A response must never both execute an approved plan and ask the user to
+  // decide its own next internal action. Tool/permission decisions have their
+  // dedicated action-request paths instead.
+  if ((params.toolCallCount || 0) > 0) return true;
+  return !hasExplicitApprovedPlanDecisionOptions(params.replyOptions);
 }
 
 export function shouldRouteUnapprovedPlanReplyOptionsToArtifact(params: {
@@ -756,6 +817,7 @@ export function shouldPauseForReplyOptions(params: {
   } = params;
 
   if (!Array.isArray(replyOptions) || replyOptions.length === 0) return false;
+  const inferredOptionsOnly = hasOnlyInferredReplyOptions(replyOptions);
   const hasLengthSafeOption = replyOptions.some((option) =>
     option.source === "explicit_user_options"
   );
@@ -767,6 +829,16 @@ export function shouldPauseForReplyOptions(params: {
     !!option.action
   );
   if (finishReason === "length" && !hasLengthSafeOption) return false;
+  // Inference is compatibility glue for models that omit structured options;
+  // it must never discard real work emitted in the same response.
+  if (toolCallCount > 0 && inferredOptionsOnly) return false;
+  // Once the user has approved a plan, the runtime owns execution. Even an
+  // explicit model option cannot coexist with tool calls in that same turn;
+  // without calls only an explicit, non-runtime user decision may pause it.
+  if (workflowMode === "plan" && isPlanApproved) {
+    if (toolCallCount > 0) return false;
+    return hasExplicitApprovedPlanDecisionOptions(replyOptions);
+  }
   if (
     workflowMode === "plan" &&
     !isPlanApproved &&

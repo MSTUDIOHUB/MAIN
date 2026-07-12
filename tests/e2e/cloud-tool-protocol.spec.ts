@@ -55,6 +55,13 @@ test.beforeEach(async ({ page }) => {
       "}",
       "",
     ].join("\n"));
+    setMemoryFile("src-tauri/tauri.conf.json", [
+      "{",
+      "  \"productName\": \"E2E MAIN\",",
+      "  \"app\": { \"windows\": [] }",
+      "}",
+      "",
+    ].join("\n"));
 
     (window as any).__CLOUD_TOOL_PROTOCOL_TEST__ = {
       requests,
@@ -99,6 +106,13 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "get_system_memory") return { total_gb: 32, available_gb: 24 };
       if (cmd === "set_workspace_root") return String(args?.path ?? "");
       if (cmd === "get_workspace_root") return "/tmp/e2e-cloud-tool-protocol";
+      if (cmd === "write_file_atomic") {
+        // Runtime-owned Plan materialization uses the atomic bridge and then
+        // verifies the exact read-back. Keep the E2E filesystem coherent with
+        // that production contract instead of silently accepting a no-op IPC.
+        setMemoryFile(String(args?.path ?? ""), String(args?.content ?? ""));
+        return null;
+      }
       if (cmd === "shell_permission_preflight") {
         const command = String(args?.command ?? "");
         return {
@@ -322,7 +336,14 @@ test.beforeEach(async ({ page }) => {
           return planFiles[path];
         }
         const memoryFile = getMemoryFile(path);
-        if (scenario === "approved-plan-execution-replay" && memoryFile) {
+        if (
+          memoryFile &&
+          (
+            scenario === "approved-plan-execution-replay" ||
+            scenario === "plan-approval-execute-tools" ||
+            path.startsWith(".MAIN/plans/")
+          )
+        ) {
           readFileCalls.push(path);
           return memoryFile.content;
         }
@@ -758,15 +779,32 @@ test.beforeEach(async ({ page }) => {
         }
 
         if (scenario === "plan-approval-execute-tools") {
-          if (!readFileCalls.includes("src/main.js")) {
+          const missingInitialReads = [
+            !readFileCalls.includes("src/main.js")
+              ? [
+                  "<tool_use>",
+                  "<tool>read_file</tool>",
+                  "<parameter name=\"path\">src/main.js</parameter>",
+                  "</tool_use>",
+                ].join("\n")
+              : "",
+            !readFileCalls.includes("src-tauri/tauri.conf.json")
+              ? [
+                  "<tool_use>",
+                  "<tool>read_file</tool>",
+                  "<parameter name=\"path\">src-tauri/tauri.conf.json</parameter>",
+                  "</tool_use>",
+                ].join("\n")
+              : "",
+          ].filter(Boolean);
+          if (missingInitialReads.length > 0) {
             return JSON.stringify({
               output_text: [
-                "我会先读取 `src/main.js`，确认现有启动流程后再修改。",
-                "<tool_use>",
-                "<tool>read_file</tool>",
-                "<parameter name=\"path\">src/main.js</parameter>",
-                "</tool_use>",
-              ].join("\n"),
+                readFileCalls.length === 0
+                  ? "请选择下一步：\n1. 引用了 `save_file_content` 命令但未在 Rust 端实现\n2. 我来确认是否在 tauri.conf.json 中配置"
+                  : "继续补齐执行所需的源码读取。",
+                ...missingInitialReads,
+              ].filter(Boolean).join("\n"),
             });
           }
           if (writeFileCalls.includes("src/main.js") && !runCommandCalls.includes("npm run test:workflow-assets")) {
@@ -1492,6 +1530,15 @@ test("global chat without explicit files does not expose workspace tools", async
 test("global chat with an attachment only exposes attachment read tools", async ({ page }) => {
   await page.goto("/?e2eScenario=global-chat-attachment-read");
 
+  // E2E scenario controls are installed from the app mount effect. Wait for
+  // the bridge rather than treating a just-completed navigation as proof that
+  // React has committed the scenario, which made this direct call flaky.
+  await expect
+    .poll(async () =>
+      page.evaluate(() => typeof (window as any).__CODELY_E2E__?.sendCloudMessage),
+    )
+    .toBe("function");
+
   const sent = await page.evaluate(() =>
     (window as any).__CODELY_E2E__?.sendCloudMessage?.("请读取附件并确认标记。"),
   );
@@ -2018,6 +2065,25 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
     .poll(async () =>
       page.evaluate(() => {
         const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
+        return {
+          readMain: (probe?.readFileCalls || []).includes("src/main.js"),
+          readTauriConfig: (probe?.readFileCalls || []).includes("src-tauri/tauri.conf.json"),
+          awaitingChoice: document.querySelectorAll('[data-testid="execution-capsule-awaiting-choice"]').length,
+          replyOptions: document.querySelectorAll('[data-testid^="execution-capsule-reply-option-"]').length,
+        };
+      }),
+    )
+    .toEqual({
+      readMain: true,
+      readTauriConfig: true,
+      awaitingChoice: 0,
+      replyOptions: 0,
+    });
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => {
+        const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
         const requests = probe?.requests || [];
         const toolNameSets = requests
           .filter((request: any) => request.hasTools)
@@ -2054,8 +2120,9 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
         return {
           hasWriteToolBlock: (snapshot?.toolNames || []).includes("write_file"),
           hasValidationToolBlock: (snapshot?.toolNames || []).includes("run_command"),
-          hasExecutionAgentText: (snapshot?.agentTexts || []).some((text: string) =>
-            text.includes("源码改动已完成；现在运行批准计划中的验证命令。"),
+          hasExecutionResult: (snapshot?.agentTexts || []).some((text: string) =>
+            text.includes("源码改动已完成；现在运行批准计划中的验证命令。") ||
+            text.includes("已按批准的 Plan 完成全部任务"),
           ),
         };
       }),
@@ -2063,7 +2130,7 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
     .toEqual({
       hasWriteToolBlock: true,
       hasValidationToolBlock: true,
-      hasExecutionAgentText: true,
+      hasExecutionResult: true,
     });
 });
 

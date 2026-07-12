@@ -122,6 +122,7 @@ export interface StartSubmitAsyncWorkflowRunInput<
   selectedChoiceText: string;
   goalSourceContextSnapshot?: string;
   parentRunIdOverride?: string;
+  runIdOverride?: string;
   turnInputContextSignals: TurnInputContextSignals;
   remoteFeishu: FeishuRemoteContext | undefined;
   options: unknown;
@@ -277,6 +278,7 @@ export async function runSubmitAsyncWorkflowRun<
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
     parentRunIdOverride: input.parentRunIdOverride,
+    runIdOverride: input.runIdOverride,
     getRuntimeSnapshot: () => ({
       agentMessagesLength: input.sessionGet().agentMessages.length,
       planStage: input.sessionGet().planStage,

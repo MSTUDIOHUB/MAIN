@@ -60,6 +60,8 @@ export interface PlanApprovalHandoff {
   planTurnId: string;
   requestedAt: number;
   executionTurnId?: string;
+  /** Preallocated child owner so approval progress is never unowned. */
+  executionRunId?: string;
   prompt?: string;
   /** Identity of the exact reviewable artifact revision the user approved. */
   planRevision?: number;

@@ -306,6 +306,9 @@ export interface PlanExecutionEvidenceEntry {
 
 export interface PlanExecutionProgressSnapshot {
   turnId: string;
+  /** Runtime ownership is optional so persisted checkpoints remain compatible. */
+  runId?: string;
+  parentRunId?: string | null;
   phase: PlanExecutionProgressPhase;
   currentTask: string;
   currentTool: string;
@@ -321,8 +324,13 @@ export interface PlanExecutionProgressSnapshot {
   updatedAt: number;
 }
 
-export type PlanExecutionProgressUpdate = Omit<PlanExecutionProgressSnapshot, "turnId" | "updatedAt"> & {
+export type PlanExecutionProgressUpdate = Omit<
+  PlanExecutionProgressSnapshot,
+  "turnId" | "runId" | "parentRunId" | "updatedAt"
+> & {
   turnId?: string;
+  runId?: string;
+  parentRunId?: string | null;
   updatedAt?: number;
 };
 

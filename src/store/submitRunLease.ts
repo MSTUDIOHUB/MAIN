@@ -27,6 +27,8 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   runtimeRunIntent: ResolvedRunIntent;
   /** Exact paused run that an action continuation resumes. */
   parentRunIdOverride?: string;
+  /** Preallocated child owner for approval handoffs. */
+  runIdOverride?: string;
   getRuntimeSnapshot: () => SubmitRunLeaseRuntimeSnapshot;
   appendAgentMessage: (message: AgentMessage) => void;
   createAbortController: () => TAbortController;
@@ -96,11 +98,12 @@ export function startSubmitRunLease<TAbortController>(
 
   const runtimeAfterMessage = input.getRuntimeSnapshot();
   const startedAtMs = (input.nowMs || Date.now)();
+  const runId = String(input.runIdOverride || "").trim() || createSubmitHarnessRunId(startedAtMs);
   const lineage = resolveSubmitRunLineage({
     previousMarker: runtimeBeforeMessage.harnessRunMarker,
     sessionKey: input.runSessionKey,
     turnId: input.turnId,
-    runId: createSubmitHarnessRunId(startedAtMs),
+    runId,
     currentMessageStartIndex: turnAgentMessagesStart,
   });
   const parentRunId = String(input.parentRunIdOverride || "").trim() || lineage.parentRunId;

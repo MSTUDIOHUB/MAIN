@@ -9,6 +9,7 @@ import {
   type PlanExecutionProgressUpdate,
   type PlanTask,
 } from "./workflowModels";
+import type { MainThreadProgressUpdate } from "./turnEvents";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
 
@@ -473,6 +474,10 @@ export function normalizePlanExecutionProgressSnapshot(input: {
   const previous = input.previous;
   return {
     turnId: input.update.turnId || previous?.turnId || input.turnId,
+    runId: input.update.runId || previous?.runId || undefined,
+    parentRunId: input.update.parentRunId !== undefined
+      ? input.update.parentRunId
+      : previous?.parentRunId,
     phase: input.update.phase || previous?.phase || "running",
     currentTask: compactLine(input.update.currentTask || previous?.currentTask || ""),
     currentTool: compactLine(input.update.currentTool || previous?.currentTool || ""),
@@ -489,6 +494,63 @@ export function normalizePlanExecutionProgressSnapshot(input: {
     maxIterations: Math.max(0, Number(input.update.maxIterations ?? previous?.maxIterations) || 0),
     autoResumeCount: Math.max(0, Number(input.update.autoResumeCount ?? previous?.autoResumeCount) || 0),
     updatedAt: Math.max(0, Number(input.update.updatedAt) || Number(input.now) || Date.now()),
+  };
+}
+
+/**
+ * Convert the plan-specific checkpoint into the canonical runtime event shape.
+ * The checkpoint intentionally retains richer plan fields for the task UI;
+ * consumers of runtimeEvents must not receive that incompatible object.
+ */
+export function toPlanExecutionRuntimeProgressUpdate(input: {
+  snapshot: PlanExecutionProgressSnapshot;
+  language: "zh" | "en";
+  dedupeKey?: string;
+}): MainThreadProgressUpdate {
+  const { snapshot, language } = input;
+  const failed = snapshot.phase === "tool_error";
+  const paused = snapshot.phase === "paused" || snapshot.phase === "waiting_review";
+  const completed = snapshot.phase === "completed";
+  const status = failed
+    ? "failed"
+    : paused
+    ? "paused"
+    : completed
+    ? "completed"
+    : snapshot.phase === "tool_done"
+    ? "done"
+    : "running";
+  const title = language === "zh"
+    ? failed
+      ? "计划执行工具失败"
+      : paused
+      ? "计划执行已暂停"
+      : completed
+      ? "计划执行已完成"
+      : "正在执行已批准计划"
+    : failed
+    ? "Plan execution tool failed"
+    : paused
+    ? "Plan execution paused"
+    : completed
+    ? "Plan execution completed"
+    : "Executing approved plan";
+  const summary = [
+    snapshot.currentTask,
+    snapshot.currentTool,
+    snapshot.latestEvidence,
+    snapshot.nextStep,
+  ]
+    .map((value) => compactLine(value, 180))
+    .filter(Boolean)
+    .join(" · ");
+
+  return {
+    phase: `plan_execution:${snapshot.phase}`,
+    title,
+    status,
+    summary,
+    ...(input.dedupeKey ? { dedupeKey: input.dedupeKey } : {}),
   };
 }
 

@@ -1,6 +1,7 @@
 import { hasExplicitPlanProposal, hasTieredPlanProposal } from "../../planProposal";
 import {
   hasExecutableProposalReplyOptions,
+  hasOnlyInferredReplyOptions,
   hasOnlyNonBlockingPlanReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
   shouldAutoContinueReadOnlyPermission,
@@ -27,6 +28,7 @@ export interface AssistantTurnDisplayDecision {
   suppressReadOnlyPermissionOptions: boolean;
   suppressPlanContinuationReplyOptions: boolean;
   suppressExecutableProposalOptionsForToolCalls: boolean;
+  suppressInferredReplyOptionsForToolCalls: boolean;
   suppressApprovedPlanExecutionReplyOptions: boolean;
   suppressInferredOperationApprovalAfterExecution: boolean;
   suppressNonDecisionReplyOptions: boolean;
@@ -126,6 +128,9 @@ export function resolveAssistantTurnDisplayDecision(input: {
     input.workflowMode === "plan" &&
     !input.isPlanApproved &&
     hasExecutableProposalReplyOptions(normalizedReplyOptions);
+  const suppressInferredReplyOptionsForToolCalls =
+    input.effectiveToolCallCount > 0 &&
+    hasOnlyInferredReplyOptions(normalizedReplyOptions);
   const currentPlanStageForReview = input.planStage;
   const isApprovedPlanExecutionTurn =
     input.isPlanApproved &&
@@ -136,11 +141,13 @@ export function resolveAssistantTurnDisplayDecision(input: {
       workflowMode: input.workflowMode,
       isPlanApproved: input.isPlanApproved,
       planStage: currentPlanStageForReview,
+      toolCallCount: input.effectiveToolCallCount,
     });
   const suppressNonDecisionReplyOptions =
     suppressReadOnlyPermissionOptions ||
     suppressPlanContinuationReplyOptions ||
     suppressExecutableProposalOptionsForToolCalls ||
+    suppressInferredReplyOptionsForToolCalls ||
     suppressApprovedPlanExecutionReplyOptions;
   const hasStructuredProposal = input.workflowMode === "plan"
     ? hasTieredPlanProposal(input.streamText)
@@ -179,6 +186,7 @@ export function resolveAssistantTurnDisplayDecision(input: {
     suppressReadOnlyPermissionOptions,
     suppressPlanContinuationReplyOptions,
     suppressExecutableProposalOptionsForToolCalls,
+    suppressInferredReplyOptionsForToolCalls,
     suppressApprovedPlanExecutionReplyOptions,
     suppressInferredOperationApprovalAfterExecution,
     suppressNonDecisionReplyOptions,

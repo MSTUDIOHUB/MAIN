@@ -57,6 +57,95 @@ const {
   withEventSchema,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 
+test("runtime progress ledger keeps an approved child run separate from its parent plan-review pause", () => {
+  const parentRunId = "run-plan-review";
+  const childRunId = "run-plan-execution";
+  const planExecutionSnapshot = {
+    turnId: "turn-plan",
+    runId: childRunId,
+    parentRunId,
+    phase: "tool_start",
+    currentTask: "按计划修复 Rust 保存命令",
+    currentTool: "replace_in_file · src-tauri/src/main.rs",
+    latestEvidence: "已定位缺失的 save_file_content 命令",
+    nextStep: "写入 Rust 命令并运行检查",
+    iteration: 1,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    updatedAt: 30,
+  };
+  const events = [
+    withEventSchema({
+      type: "run.paused",
+      threadId: "thread-a",
+      turnId: "turn-plan",
+      runId: parentRunId,
+      parentRunId: null,
+      timestampMs: 10,
+      reason: "plan_review",
+      message: "计划产物已物化并通过校验，等待审核。",
+      progress: {
+        phase: "plan_review",
+        title: "计划已生成，等待审核",
+        status: "paused",
+        summary: "等待用户批准计划。",
+      },
+    }),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-a",
+      turnId: "turn-plan",
+      runId: parentRunId,
+      parentRunId: null,
+      timestampMs: 11,
+      progress: {
+        phase: "plan_review",
+        title: "计划已生成，等待审核",
+        status: "paused",
+        summary: "等待用户批准计划。",
+        dedupeKey: `plan-review:${parentRunId}`,
+      },
+    }),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-a",
+      turnId: "turn-plan",
+      runId: childRunId,
+      parentRunId,
+      timestampMs: 20,
+      progress: {
+        phase: "plan_execution:tool_start",
+        title: "正在执行已批准计划",
+        status: "running",
+        summary: "按计划修复 Rust 保存命令 · replace_in_file · src-tauri/src/main.rs",
+        dedupeKey: `plan-execution-progress:${childRunId}`,
+      },
+    }),
+  ];
+
+  const items = buildRuntimeProgressLedger({
+    blocks: [
+      {
+        id: 1,
+        turnId: "turn-plan",
+        type: "system",
+        content: "计划产物已物化并通过校验，等待审核。",
+      },
+    ],
+    events,
+    turnId: "turn-plan",
+    activeRunId: childRunId,
+    planExecutionSnapshot,
+    language: "zh",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].status, "running");
+  assert.equal(items[0].title, "正在执行已批准计划");
+  assert.match(items[0].summary, /按计划修复 Rust 保存命令/);
+  assert.doesNotMatch(items.map((item) => `${item.title} ${item.summary}`).join("\n"), /等待审核|等待用户批准/);
+});
+
 test("runtime progress ledger dedupes repeated read blocks and exposes cache reuse", () => {
   const blocks = [
     {

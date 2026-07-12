@@ -70,6 +70,7 @@ const {
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanSameTurnFallbackDecision,
   summarizeRepeatedPlanTargetsFromToolActivity,
+  toPlanExecutionRuntimeProgressUpdate,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
 
 test("plan review awaiting approval is not an active execution lease", () => {
@@ -1214,6 +1215,48 @@ test("plan execution progress snapshot is structured and ignores internal plan e
   assert.doesNotMatch(text, /Latest evidence:/);
   assert.doesNotMatch(text, /Current tool:/);
   assert.doesNotMatch(text, /Next:/);
+});
+
+test("plan execution checkpoints map to canonical runtime progress states", () => {
+  const baseSnapshot = {
+    turnId: "turn-1",
+    currentTask: "修复保存命令",
+    currentTool: "replace_in_file · src-tauri/src/main.rs",
+    latestEvidence: "已确认前端引用 save_file_content",
+    nextStep: "运行定向检查",
+    iteration: 2,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    updatedAt: 123,
+  };
+  const running = toPlanExecutionRuntimeProgressUpdate({
+    snapshot: { ...baseSnapshot, phase: "tool_start" },
+    language: "zh",
+    dedupeKey: "plan-execution-progress:run-child",
+  });
+  const paused = toPlanExecutionRuntimeProgressUpdate({
+    snapshot: { ...baseSnapshot, phase: "paused" },
+    language: "zh",
+  });
+  const failed = toPlanExecutionRuntimeProgressUpdate({
+    snapshot: { ...baseSnapshot, phase: "tool_error" },
+    language: "zh",
+  });
+
+  assert.deepEqual(
+    { phase: running.phase, title: running.title, status: running.status, dedupeKey: running.dedupeKey },
+    {
+      phase: "plan_execution:tool_start",
+      title: "正在执行已批准计划",
+      status: "running",
+      dedupeKey: "plan-execution-progress:run-child",
+    },
+  );
+  assert.match(running.summary, /修复保存命令/);
+  assert.equal(paused.status, "paused");
+  assert.equal(paused.title, "计划执行已暂停");
+  assert.equal(failed.status, "failed");
+  assert.equal(failed.title, "计划执行工具失败");
 });
 
 test("plan execution progress preserves an explicit runtime task from the orchestrator", () => {

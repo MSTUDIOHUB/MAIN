@@ -125,6 +125,7 @@ import {
   isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanSameTurnFallbackDecision,
+  toPlanExecutionRuntimeProgressUpdate,
 } from "../lib/planExecutionRecovery";
 import {
   type AttachedFile,
@@ -268,6 +269,7 @@ import { applySubmitPlanStateReset } from "./submitPlanStateReset";
 import { applySubmitSendGateEffects } from "./submitSendGateEffects";
 import { resolveAndApplySubmitIntentRouting } from "./submitIntentRouting";
 import { startSubmitAsyncWorkflowRun } from "./submitAsyncWorkflowRun";
+import { createSubmitHarnessRunId } from "./submitRunLease";
 import {
   buildApprovedPlanExecutionPrompt,
   ensureApprovedPlanRuntimeTasksForState,
@@ -929,7 +931,7 @@ export type FeishuApprovalProcessResult =
       approval?: FeishuPendingApproval;
     };
 
-type CapsuleExplanationSource = "model";
+type CapsuleExplanationSource = "model" | "runtime";
 type CapsuleExplanationState = {
   turnId: string;
   text: string;
@@ -1305,6 +1307,9 @@ export interface AppState {
       goalSourceContextSnapshot?: string;
       remoteFeishu?: FeishuRemoteContext;
       skipAutoPlanHydration?: boolean;
+      parentRunIdOverride?: string;
+      /** Reserved child run identity for an approved Plan handoff. */
+      runIdOverride?: string;
     },
   ) => boolean;
   // Resume loop after human review
@@ -1587,6 +1592,12 @@ function normalizeStoredPlanExecutionProgressSnapshot(value: unknown): PlanExecu
   return normalizePlanExecutionProgressSnapshot({
     turnId,
     update: {
+      runId: typeof snapshot.runId === "string" ? snapshot.runId : undefined,
+      parentRunId: typeof snapshot.parentRunId === "string"
+        ? snapshot.parentRunId
+        : snapshot.parentRunId === null
+        ? null
+        : undefined,
       phase: snapshot.phase || "running",
       currentTask: String(snapshot.currentTask || ""),
       currentTool: String(snapshot.currentTool || ""),
@@ -3400,6 +3411,8 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
       resolvedIntent: "plan",
       runtimeIntentOverride: "execute",
       executionConsentGranted: true,
+      parentRunIdOverride: input.handoff.parentRunId || undefined,
+      runIdOverride: input.handoff.executionRunId,
       skipIntentResolution: true,
       intentSummary: language === "zh"
         ? "用户已批准计划，MAIN 将在当前回合中按 plan.md 落地。"
@@ -6259,16 +6272,26 @@ export const useAppStore = create<AppState>()(
         normalizedApprovalChoice,
       });
       const approvalChoicePatch = { planApprovalChoice: normalizedApprovalChoice || null };
+      // Reserve the child owner before stopping the review run. This closes
+      // the slow-first-token gap where an approved plan was executing but its
+      // only visible checkpoint still belonged to no run at all.
+      const executionRunId = approvedTurnId
+        ? createSubmitHarnessRunId(Date.now())
+        : null;
+      const executionParentRunId = executionRunId
+        ? reviewRequest?.runId || getHarnessActionRunId(state.harnessRunMarker) || null
+        : null;
       const pendingHandoffPatch = approvedTurnId
         ? {
             planTurnId: approvedTurnId,
             requestedAt: Date.now(),
             executionTurnId: approvedTurnId,
+            executionRunId: executionRunId || undefined,
             prompt: executionPrompt,
             planRevision: approvalIdentity.revision,
             artifactHash: approvalIdentity.artifactHash,
             artifactPaths: approvalIdentity.artifactPaths,
-            parentRunId: getHarnessActionRunId(state.harnessRunMarker),
+            parentRunId: executionParentRunId,
           }
         : null;
       const initialProgressSnapshot = approvedTurnId
@@ -6284,6 +6307,12 @@ export const useAppStore = create<AppState>()(
               evidenceLedger: [],
               recentToolActivity: [],
             }),
+            ...(executionRunId
+              ? {
+                  runId: executionRunId,
+                  parentRunId: executionParentRunId,
+                }
+              : {}),
             now: Date.now(),
           })
         : state.planExecutionProgressSnapshot;
@@ -6293,6 +6322,21 @@ export const useAppStore = create<AppState>()(
         hasAbortController: state.abortController !== null,
       });
       const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
+      const initialProgressEvent = approvedTurnId && executionRunId && initialProgressSnapshot
+        ? withEventSchema({
+            type: "progress.updated",
+            threadId: reviewSessionKey,
+            turnId: approvedTurnId,
+            timestampMs: initialProgressSnapshot.updatedAt,
+            runId: executionRunId,
+            parentRunId: executionParentRunId,
+            progress: toPlanExecutionRuntimeProgressUpdate({
+              snapshot: initialProgressSnapshot,
+              language,
+              dedupeKey: `plan-execution-progress:${executionRunId}`,
+            }),
+          })
+        : null;
 
       set((s) => ({
         isPlanApproved: true,
@@ -6307,6 +6351,9 @@ export const useAppStore = create<AppState>()(
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
         planExecutionProgressSnapshot: initialProgressSnapshot,
+        ...(initialProgressEvent
+          ? { runtimeEvents: appendRuntimeEvent(s.runtimeEvents, initialProgressEvent) }
+          : {}),
         ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
         agentStatus: activePlanLoop ? s.agentStatus : "idle",
         isGenerating: activePlanLoop ? s.isGenerating : false,
@@ -7193,6 +7240,7 @@ export const useAppStore = create<AppState>()(
     replyOptionRequestIdentity?: UserChoiceResolutionIdentity;
     replyOptionIsCustom?: boolean;
     parentRunIdOverride?: string;
+    runIdOverride?: string;
   }) => {
     let state = get();
     const pendingReviewTransition = applySubmitPendingReviewTransition({
@@ -7819,6 +7867,7 @@ export const useAppStore = create<AppState>()(
       selectedChoiceText,
       goalSourceContextSnapshot,
       parentRunIdOverride: options?.parentRunIdOverride,
+      runIdOverride: options?.runIdOverride,
       turnInputContextSignals,
       remoteFeishu,
       options,

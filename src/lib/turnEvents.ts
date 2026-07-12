@@ -76,7 +76,9 @@ export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "path_alias_hit"; threadId: string; turnId: string; timestampMs: number; tool: string; field: string; from: string; to: string; rule: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "plan_state_hydrated"; threadId: string; turnId?: string; timestampMs: number; reason: string; taskCount: number; artifactPaths: string[] }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "harness.telemetry"; threadId: string; turnId?: string; timestampMs: number; telemetry: MainThreadHarnessTelemetry }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "progress.updated"; threadId: string; turnId: string; timestampMs: number; progress: MainThreadProgressUpdate }
+  // Progress belongs to a concrete run whenever the emitter can identify one.
+  // Keep the identity optional so persisted pre-v2 events remain readable.
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "progress.updated"; threadId: string; turnId: string; timestampMs: number; progress: MainThreadProgressUpdate } & Partial<MainThreadRunIdentity>)
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "plan.ready"; threadId: string; turnId: string; timestampMs: number; path?: string; summary?: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.started"; threadId: string; turnId?: string; timestampMs: number; goalId: string; revision: number }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "goal.state_changed"; threadId: string; turnId?: string; timestampMs: number; goalId: string; from: string; to: string; phase?: string | null; reason?: string }

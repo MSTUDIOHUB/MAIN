@@ -30,6 +30,7 @@ export type AssistantDisplayActionPhaseResult =
       compactedProseCodeDump: boolean;
       autoContinueReadOnlyPermission: boolean;
       suppressPlanContinuationReplyOptions: boolean;
+      suppressInferredReplyOptionsForToolCalls: boolean;
       sourceVisibleText: string;
       finalVisibleText: string;
       currentPlanStageForReview: ReturnType<OrchestratorCallbacks["getPlanStage"]>;
@@ -110,6 +111,7 @@ export function handleAssistantDisplayActionPhase(input: {
     suppressTruncatedReadOnlyPermissionOptions,
     suppressPlanContinuationReplyOptions,
     suppressExecutableProposalOptionsForToolCalls,
+    suppressInferredReplyOptionsForToolCalls,
     suppressApprovedPlanExecutionReplyOptions,
     suppressInferredOperationApprovalAfterExecution,
     sourceVisibleText,
@@ -227,12 +229,35 @@ export function handleAssistantDisplayActionPhase(input: {
       turnIntent,
     });
   }
+  if (suppressInferredReplyOptionsForToolCalls) {
+    logAgentEvent("inferred_reply_options_ignored_for_tool_call", {
+      iteration,
+      toolCalls: effectiveToolCalls.length,
+      replyOptions: normalized.replyOptions.length,
+      optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
+      workflowMode,
+      turnIntent,
+      runtimeIntent,
+    });
+  }
   if (suppressApprovedPlanExecutionReplyOptions) {
     logAgentEvent("approved_plan_execution_reply_options_ignored", {
       iteration,
       replyOptions: normalized.replyOptions.length,
       optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
       visibleChars: normalized.visibleText.length,
+      workflowMode,
+      turnIntent,
+      runtimeIntent,
+      planStage: currentPlanStageForReview,
+    });
+    logAgentEvent("approved_plan_execution_nonblocking_options_ignored", {
+      iteration,
+      reason: effectiveToolCalls.length > 0
+        ? "tool_calls_present"
+        : "not_explicit_blocking_user_decision",
+      replyOptions: normalized.replyOptions.length,
+      toolCalls: effectiveToolCalls.length,
       workflowMode,
       turnIntent,
       runtimeIntent,
@@ -326,6 +351,7 @@ export function handleAssistantDisplayActionPhase(input: {
     compactedProseCodeDump,
     autoContinueReadOnlyPermission,
     suppressPlanContinuationReplyOptions,
+    suppressInferredReplyOptionsForToolCalls,
     sourceVisibleText,
     finalVisibleText,
     currentPlanStageForReview,

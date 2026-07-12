@@ -32,12 +32,27 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   await expect(page.getByTestId("plan-task-progress")).toContainText("T9: 更新");
 });
 
+test("approved child-run progress replaces its parent review pause in Effective Progress", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-plan-task-progress");
+
+  await page.getByTitle("查看有效进展").click();
+  const progressPopover = page.getByTestId("effective-progress-popover");
+  await expect(progressPopover).toBeVisible();
+  await expect(progressPopover).toContainText("正在执行已批准计划");
+  await expect(progressPopover).toContainText("apply_patch · src/task-9.ts");
+  await expect(progressPopover).not.toContainText("等待审核");
+  await expect(progressPopover).not.toContainText("计划产物已物化");
+  await expect(progressPopover).not.toContainText("旧审核进度");
+});
+
 test("preapproval Plan recovery keeps internal phases and heartbeats out of user UI", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-panel-stability");
   await page.evaluate(() => (window as any).__CODELY_E2E__?.showPlanDraftRecovery?.());
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
+  await expect(capsule).toContainText("正在整理已确认信息，生成可审批计划");
+  await expect(capsule).not.toContainText("我已读取 tauri.conf.json");
   await expect(capsule).not.toHaveAttribute("data-plan-runtime-phase", /.+/);
   await expect(page.getByTestId("plan-draft-runtime-progress")).toHaveCount(0);
   await expect(page.locator("[data-plan-runtime-phase]")).toHaveCount(0);

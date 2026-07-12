@@ -246,6 +246,46 @@ export function planRuntimePhasePresentation(
   }
 }
 
+/**
+ * A compact, user-facing status for the live capsule. This deliberately does
+ * not include phase reasons, quality-gate details, or model-authored draft
+ * text: those remain runtime diagnostics rather than user work.
+ */
+export function buildPlanRuntimeCapsuleNarration(
+  phase: PlanRuntimePhase,
+  language: Language,
+): string {
+  if (language === "en") {
+    switch (phase) {
+      case "explore_structure":
+      case "grounding":
+        return "Gathering the key information needed to prepare the plan";
+      case "synthesis":
+      case "drafting":
+      case "needs_rewrite":
+        return "Organizing confirmed findings into a reviewable plan";
+      case "needs_evidence":
+        return "Collecting one key piece of evidence to complete the plan";
+      default:
+        return "";
+    }
+  }
+
+  switch (phase) {
+    case "explore_structure":
+    case "grounding":
+      return "正在收集生成计划所需信息";
+    case "synthesis":
+    case "drafting":
+    case "needs_rewrite":
+      return "正在整理已确认信息，生成可审批计划";
+    case "needs_evidence":
+      return "正在补充一项关键证据以完善计划";
+    default:
+      return "";
+  }
+}
+
 export function buildPlanAutoScaffoldPrompt(input: {
   language: Language;
   latestUserPromptText: string;

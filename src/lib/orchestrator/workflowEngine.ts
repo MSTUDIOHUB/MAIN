@@ -29,15 +29,21 @@ import type { AttachedFile } from "../attachments";
 import type { FeishuRemoteContext } from "../remoteContextTypes";
 import type { StudioConfig as GameStudioConfig } from "../gameStudio/catalog";
 import { appendDebugLog } from "../debugLog";
-import { MAIN_THREAD_EVENT_SCHEMA_VERSION, appendRuntimeEvent, withEventSchema } from "../turnEvents";
+import {
+  MAIN_THREAD_EVENT_SCHEMA_VERSION,
+  appendRuntimeEvent,
+  withEventSchema,
+  type MainThreadProgressUpdate,
+} from "../turnEvents";
 import { type DurableTurnContext, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, canonicalizePlanArtifactPath, detectPlanArtifactKind } from "../workflowModels";
 import {
   buildPlanExecutionProgressUpdate,
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanSameTurnFallbackDecision,
+  toPlanExecutionRuntimeProgressUpdate,
 } from "../planExecutionRecovery";
 import { createPlanExecutionEvidenceEntry, appendPlanEvidenceEntry } from "../planEvidence";
-import { closeHarnessRunMarker, isHarnessRunMarkerOwnedByRun, persistHarnessRunMarkerIfOwned, type HarnessRunMarker } from "../harnessCrashTelemetry";
+import { closeHarnessRunMarker, getHarnessActionRunId, isHarnessRunMarkerOwnedByRun, persistHarnessRunMarkerIfOwned, type HarnessRunMarker } from "../harnessCrashTelemetry";
 import { generateId } from "../utils";
 import { runAfterNextPaint } from "../uiScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
@@ -526,22 +532,28 @@ export class WorkflowEngine {
 	      }
 	    };
 
-    const emitProgressRuntimeEvent = (progress: any, meta: { dedupeKey?: string } = {}) => {
-      const eventId = `event-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      sessionSet((s: any) => ({
-        runtimeEvents: [
-          ...s.runtimeEvents,
-          {
-            id: eventId,
-            turnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-            timestamp: Date.now(),
-            type: "progress",
-            dedupeKey: meta.dedupeKey || null,
-            payload: progress,
-          },
-        ],
+    const emitProgressRuntimeEvent = (
+      progress: MainThreadProgressUpdate,
+      meta: { dedupeKey?: string } = {},
+    ) => {
+      const runtimeEvent = withEventSchema({
+        type: "progress.updated",
+        threadId: runSessionKey,
+        turnId,
+        timestampMs: Date.now(),
+        runId: activeRuntimeRunIdentity.runId,
+        parentRunId: activeRuntimeRunIdentity.parentRunId || null,
+        ...(activeRuntimeRunIdentity.goalSliceId
+          ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
+          : {}),
+        progress: {
+          ...progress,
+          ...(meta.dedupeKey ? { dedupeKey: meta.dedupeKey } : {}),
+        },
+      });
+      sessionSet((state: any) => reduceRunTransition(state, {
+        type: "runtime_event",
+        event: runtimeEvent,
       }));
     };
 
@@ -550,31 +562,60 @@ export class WorkflowEngine {
       sessionGet().isPlanApproved !== true;
 
     const emitLocalPlanExecutionProgress = (phase: PlanExecutionProgressPhase, update: Partial<PlanExecutionProgressUpdate>) => {
+      const marker = sessionGet().harnessRunMarker;
+      const markerRunId = getHarnessActionRunId(marker);
+      if (
+        marker?.status === "running" &&
+        marker?.turnId === turnId &&
+        markerRunId &&
+        markerRunId !== activeRuntimeRunIdentity.runId
+      ) {
+        logStoreEvent("plan_execution_progress_ignored_stale_run", {
+          turnId,
+          expectedRunId: markerRunId,
+          receivedRunId: activeRuntimeRunIdentity.runId,
+          phase,
+        });
+        return;
+      }
+      const previousSnapshot = sessionGet().planExecutionProgressSnapshot;
       const progressSnapshot = normalizePlanExecutionProgressSnapshot({
         turnId,
-        update: buildPlanExecutionProgressUpdate({
-          language: phaseLanguage,
-          phase,
-          iterationCount: update.iteration ?? 0,
-          maxIterations: update.maxIterations ?? PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-          autoResumeCount: sessionGet().planAutoResumeCount,
-          tasks: sessionGet().planTasks,
-          evidenceLedger: sessionGet().planExecutionEvidenceLedger,
-          recentToolActivity: [],
-          currentTask: update.currentTask,
-          currentTool: update.currentTool,
-          latestEvidence: update.latestEvidence,
-          nextStep: update.nextStep,
-          progressSignature: update.progressSignature,
-          lastEffectiveEvidenceAt: update.lastEffectiveEvidenceAt,
-          recoveryReason: update.recoveryReason,
-          repeatedTargets: update.repeatedTargets,
-        }),
-        previous: sessionGet().planExecutionProgressSnapshot,
+        update: {
+          ...buildPlanExecutionProgressUpdate({
+            language: phaseLanguage,
+            phase,
+            iterationCount: update.iteration ?? 0,
+            maxIterations: update.maxIterations ?? PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+            autoResumeCount: sessionGet().planAutoResumeCount,
+            tasks: sessionGet().planTasks,
+            evidenceLedger: sessionGet().planExecutionEvidenceLedger,
+            recentToolActivity: [],
+            currentTask: update.currentTask,
+            currentTool: update.currentTool,
+            latestEvidence: update.latestEvidence,
+            nextStep: update.nextStep,
+            progressSignature: update.progressSignature,
+            lastEffectiveEvidenceAt: update.lastEffectiveEvidenceAt,
+            recoveryReason: update.recoveryReason,
+            repeatedTargets: update.repeatedTargets,
+          }),
+          runId: activeRuntimeRunIdentity.runId,
+          parentRunId: activeRuntimeRunIdentity.parentRunId || null,
+        },
+        previous: previousSnapshot?.runId && previousSnapshot.runId !== activeRuntimeRunIdentity.runId
+          ? null
+          : previousSnapshot,
         now: Date.now(),
       });
       sessionSet({ planExecutionProgressSnapshot: progressSnapshot });
-      emitProgressRuntimeEvent(progressSnapshot, { dedupeKey: `plan-execution-progress:${turnId}` });
+      emitProgressRuntimeEvent(
+        toPlanExecutionRuntimeProgressUpdate({
+          snapshot: progressSnapshot,
+          language: phaseLanguage,
+          dedupeKey: `plan-execution-progress:${activeRuntimeRunIdentity.runId}`,
+        }),
+      );
     };
 
     const emitPlanStreamHeartbeat = (marker: any) => {
@@ -836,22 +877,29 @@ export class WorkflowEngine {
           return;
         }
         const language = sessionGet().config.language === "en" ? "en" : "zh";
+        const previousSnapshot = sessionGet().planExecutionProgressSnapshot;
         const progressSnapshot = normalizePlanExecutionProgressSnapshot({
           turnId,
-          update: buildPlanExecutionProgressUpdate({
-            language,
-            phase: "starting",
-            iterationCount: 0,
-            maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-            autoResumeCount: 0,
-            tasks: sessionGet().planTasks,
-            evidenceLedger: [],
-            recentToolActivity: [],
-            nextStep: language === "zh"
-              ? "在当前回合按已批准 plan.md 继续执行"
-              : "continue in the current turn and follow the approved plan.md",
-          }),
-          previous: sessionGet().planExecutionProgressSnapshot,
+          update: {
+            ...buildPlanExecutionProgressUpdate({
+              language,
+              phase: "starting",
+              iterationCount: 0,
+              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+              autoResumeCount: 0,
+              tasks: sessionGet().planTasks,
+              evidenceLedger: [],
+              recentToolActivity: [],
+              nextStep: language === "zh"
+                ? "在当前回合按已批准 plan.md 继续执行"
+                : "continue in the current turn and follow the approved plan.md",
+            }),
+            runId: activeRuntimeRunIdentity.runId,
+            parentRunId: activeRuntimeRunIdentity.parentRunId || null,
+          },
+          previous: previousSnapshot?.runId && previousSnapshot.runId !== activeRuntimeRunIdentity.runId
+            ? null
+            : previousSnapshot,
           now: Date.now(),
         });
         sessionSet((s: any) => ({
@@ -859,6 +907,10 @@ export class WorkflowEngine {
           pendingPlanApprovalHandoff: null,
           planApprovalExecutionStartedForTurnId: turnId,
           planExecutionProgressSnapshot: progressSnapshot,
+          currentTurnState: {
+            ...s.currentTurnState,
+            capsuleExplanation: null,
+          },
           planStage: "executing",
           agentStatus: "running",
           isGenerating: true,
@@ -881,6 +933,13 @@ export class WorkflowEngine {
           isPlanApproved: true,
           status: "running",
         });
+        emitProgressRuntimeEvent(
+          toPlanExecutionRuntimeProgressUpdate({
+            snapshot: progressSnapshot,
+            language,
+            dedupeKey: `plan-execution-progress:${activeRuntimeRunIdentity.runId}`,
+          }),
+        );
         logStoreEvent("plan_approval_same_turn_execution_started", {
           planTurnId: turnId,
           executionTurnId: turnId,
@@ -1769,7 +1828,7 @@ export class WorkflowEngine {
         emitProgressRuntimeEvent({
           ...progress,
           ...(isInternalPlanArtifactMutation ? { audience: "internal" as const } : {}),
-        }, { dedupeKey: `tool:${executionId || `${toolName}:${target}`}:running` });
+        }, { dedupeKey: `tool:${executionId || `${toolName}:${target}`}` });
         sessionSet((s: any) => {
           const existingIndex = findCurrentToolLifecycleBlockIndex(
             s.taskFlow,
@@ -1969,6 +2028,26 @@ export class WorkflowEngine {
             }),
           };
         });
+        emitProgressRuntimeEvent(
+          progress,
+          { dedupeKey: `tool:${executionId || `${toolName}:${target}`}` },
+        );
+      },
+
+      onPlanRuntimeNarration: (narration) => {
+        sessionSet((state: any) => ({
+          currentTurnState: {
+            ...state.currentTurnState,
+            capsuleExplanation: narration
+              ? {
+                  turnId: toolDisplayTurnId,
+                  text: narration,
+                  updatedAt: Date.now(),
+                  source: "runtime" as const,
+                }
+              : null,
+          },
+        }));
       },
 
       onToolError: (toolName: string, target: string, error: string, meta?: { toolCallId?: string }) => {
@@ -2047,6 +2126,10 @@ export class WorkflowEngine {
             }),
           };
         });
+        emitProgressRuntimeEvent(
+          progress,
+          { dedupeKey: `tool:${executionId || `${toolName}:${target}`}` },
+        );
       },
 
       requestReview: (toolCall: any) => {
