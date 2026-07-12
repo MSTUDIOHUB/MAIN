@@ -1004,6 +1004,40 @@ export function handleReadFileRepeatLimitRecovery(input: {
       .filter((target, index, all) => target && all.indexOf(target) === index)
       .slice(0, 4);
     const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
+    if (executeRecoveryAttempts < MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS) {
+      const recoveryReason = "approved_plan_read_file_repeat_limit";
+      activateExecuteRecovery("mutation_first", recoveryReason, {
+        repeatedTargets,
+        repeatResults: repeatResults.length,
+      });
+      logAgentEvent("approved_plan_read_file_repeat_limit_recovery", {
+        iteration,
+        repeatedTargets,
+        progressSignature: truncateForLog(progressSignature, 220),
+        repeatResults: repeatResults.length,
+        executeRecoveryAttempts,
+        recoveryToolSurface: "action_only",
+      });
+      emitTaskOrchestratorPhase("EXECUTE_RECOVERY", {
+        reason: recoveryReason,
+        iteration,
+        repeatedTargets,
+        remainingTask: language === "zh"
+          ? "禁止再次读取缓存目标；改为源码修改、命令/浏览器验证或明确阻塞。"
+          : "do not reread cached targets; switch to source edits, command/browser validation, or a concrete blocker",
+      });
+      return {
+        status: "pending_prompt",
+        prompt: buildExecuteRecoveryPrompt({
+          language,
+          reason: recoveryReason,
+          mode: "mutation_first",
+          repeatedTargets,
+          recentActivity: recentPlanToolActivity,
+          allowFileRead: false,
+        }),
+      };
+    }
     const notice = language === "zh"
       ? [
           "计划执行已暂停：模型再次请求了已被重复读取保护拦截的 read_file。",

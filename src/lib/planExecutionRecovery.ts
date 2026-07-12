@@ -411,6 +411,7 @@ export function buildPlanExecutionProgressUpdate(input: {
   tasks: PlanTask[];
   evidenceLedger: PlanExecutionEvidenceEntry[];
   recentToolActivity: PlanToolActivitySummary[];
+  currentTask?: string;
   currentTool?: string;
   latestEvidence?: string;
   nextStep?: string;
@@ -436,13 +437,14 @@ export function buildPlanExecutionProgressUpdate(input: {
     currentTool: input.currentTool,
     latestEvidence: input.latestEvidence || recentEvidence,
   });
-  const currentTask = activeTask
+  const derivedCurrentTask = activeTask
     ? summarizeTask(activeTask)
     : remainingTask && !(recentTool && isBroadPlanTask(remainingTask))
     ? summarizeTask(remainingTask)
     : recentTool
     ? compactLine(input.language === "zh" ? `当前动作：${recentTool}` : `Current action: ${recentTool}`)
     : input.language === "zh" ? "核查最终证据" : "verify final evidence";
+  const currentTask = compactLine(input.currentTask || derivedCurrentTask);
 
   return {
     phase: input.phase,

@@ -68,6 +68,7 @@ const {
 const {
   buildPlanEvidenceBundle,
   formatPlanEvidenceBundleForModel,
+  hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
   validatePlanCandidate,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
@@ -227,6 +228,30 @@ test("real MD Viewer trace keeps one semantic evidence bundle through determinis
   });
   assert.equal(mismatched.ok, false);
   assert.equal(mismatched.reason, "evidence_bundle_hash_mismatch");
+});
+
+test("line excerpts without a confirmed defect cannot auto-materialize a symptom-only plan", () => {
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-md-viewer-excerpt-only",
+    objective: "修复双击 Markdown 打开空白窗口和工具栏打开按钮失效的问题。",
+    evidenceRecords: [
+      {
+        tool: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        summary: "L21: Store file paths for later processing; L23: FILES.get_or_init(...)",
+      },
+      {
+        tool: "read_file",
+        target: "src/components/toolbar.js",
+        status: "succeeded",
+        summary: "工具栏组件导入 invoke，并定义 handleOpenFile。",
+      },
+    ],
+  });
+
+  assert.equal(isPlanEvidenceBundleReady(bundle), true);
+  assert.equal(hasDeterministicPlanMaterializationEvidence(bundle), false);
 });
 
 test("plan evidence keeps related CSV consumers as facts without turning them into change targets", () => {

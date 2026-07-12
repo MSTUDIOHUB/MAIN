@@ -207,6 +207,7 @@ test("approved plan execution prompt preserves runtime task and requested delive
   });
 
   assert.match(prompt, /计划已批准/);
+  assert.match(prompt, /按当前任务清单顺序执行/);
   assert.match(prompt, /项目根目录 `Report\.md`/);
   assert.match(prompt, /MAIN 已经从批准后的 design 派生出 runtime 任务清单/);
   assert.match(prompt, /实现 Report\.md 输出/);

@@ -4972,7 +4972,7 @@ export default function ChatArea({
                               </span>
                             )}
                           </div>
-                          {planExecutionCapsuleProjection.currentTask && (
+                          {planExecutionCapsuleProjection.currentTask && !capsuleHasTasks && (
                             <div data-testid="plan-execution-runtime-task" className="mt-1 break-words">
                               {language === "zh" ? "当前任务" : "Current task"}：{planExecutionCapsuleProjection.currentTask}
                             </div>

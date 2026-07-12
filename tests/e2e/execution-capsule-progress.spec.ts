@@ -17,7 +17,7 @@ test("ExecutionCapsule does not invent execution step progress from plain tool a
   await expect(page.getByTestId("execution-capsule-execution-progress")).toHaveCount(0);
 });
 
-test("pure plan execution projects the runtime checkpoint into the main Capsule", async ({ page }) => {
+test("pure plan execution keeps the runtime checkpoint in the main Capsule without duplicating its task tracker", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-plan-task-progress");
 
   await expect(page.getByTestId("execution-capsule-shell")).toHaveCount(0);
@@ -25,7 +25,7 @@ test("pure plan execution projects the runtime checkpoint into the main Capsule"
   await expect(page.getByTestId("agent-explanation-capsule")).toBeVisible();
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveAttribute("data-phase", "tool_start");
   await expect(page.getByTestId("plan-execution-runtime-tool")).toContainText("apply_patch · src/task-9.ts");
-  await expect(page.getByTestId("plan-execution-runtime-task")).toContainText("T9: 更新 src/task-9.ts");
+  await expect(page.getByTestId("plan-execution-runtime-task")).toHaveCount(0);
   await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T1: 更新");
   await expect(page.getByTestId("plan-task-progress")).toContainText("T8: 更新");

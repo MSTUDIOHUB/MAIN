@@ -175,6 +175,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"));
 
 const {
+  handleReadFileRepeatLimitRecovery,
   handleStrictRepeatGuardRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
 
@@ -1215,6 +1216,24 @@ test("plan execution progress snapshot is structured and ignores internal plan e
   assert.doesNotMatch(text, /Next:/);
 });
 
+test("plan execution progress preserves an explicit runtime task from the orchestrator", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "tool_start",
+    iterationCount: 8,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    tasks,
+    evidenceLedger,
+    recentToolActivity: [],
+    currentTask: "按顺序修复 src/components/toolbar.js 的文件选择对话框",
+    currentTool: "replace_in_file · src/components/toolbar.js",
+  });
+
+  assert.equal(update.currentTask, "按顺序修复 src/components/toolbar.js 的文件选择对话框");
+  assert.match(update.currentTool, /toolbar\.js/);
+});
+
 test("no-progress loop notice names repeated target evidence gap and recovery action", () => {
   const recentToolActivity = [
     { name: "read_file", target: "src/store/dashboardStore.ts", status: "succeeded", detail: "FILE_UNCHANGED_STUB: src/store/dashboardStore.ts" },
@@ -1582,7 +1601,7 @@ test("approved plan browser validation repeats are reused or paused without agen
   );
 });
 
-test("approved plan repeat-read guard pauses before max-iteration error", () => {
+test("approved plan repeat-read guard switches to an action-only recovery before it pauses", () => {
   const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
   const toolIterationPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolIterationPhase.ts"), "utf8");
   const toolResultRecoveryPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"), "utf8");
@@ -1595,6 +1614,7 @@ test("approved plan repeat-read guard pauses before max-iteration error", () => 
   assert.match(toolResultRecoveryPhaseSource, /handleStrictRepeatGuardRecovery\(\{/);
   assert.match(loopRecoverySource, /approvedPlanReadFileRepeatLimit/);
   assert.match(loopRecoverySource, /approved_plan_read_file_repeat_limit/);
+  assert.match(loopRecoverySource, /approved_plan_read_file_repeat_limit_recovery/);
   assert.match(toolCallPartitioningSource, /shouldPushApprovedPlanReadLimit/);
   assert.match(toolCallPartitioningSource, /READ_FILE_REPEAT_LIMIT: \$\{target \|\| fileReadState\.path\}/);
   assert.match(loopRecoverySource, /approved_plan_repeated_read_file/);
@@ -1609,6 +1629,50 @@ test("approved plan repeat-read guard pauses before max-iteration error", () => 
   assert.match(loopRecoverySource, /activateExecuteRecovery\("mutation_first",\s*"read_file_repeat_limit_batch"/);
   assert.match(loopRecoverySource, /read_file_repeat_limit_recovery/);
   assert.match(loopRecoverySource, /prompt: buildExecuteRecoveryPrompt\({[\s\S]*?reason: "read_file_repeat_limit_batch"/);
+});
+
+test("approved plan repeat-read limit preserves the run and requests an action-only pivot", () => {
+  const prompts = [];
+  const phases = [];
+  const stops = [];
+  const recoveries = [];
+  const result = handleReadFileRepeatLimitRecovery({
+    callbacks: {
+      getIsPlanApproved: () => true,
+      getPreferredLanguage: () => "zh",
+      getPlanTasks: () => [{ id: "task-1", text: "修复 toolbar", status: "in_progress" }],
+      appendMessage: (message) => prompts.push(message),
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    iteration: 31,
+    results: [{
+      name: "read_file",
+      target: "src/components/toolbar.js",
+      content: "READ_FILE_REPEAT_LIMIT: src/components/toolbar.js",
+      isError: false,
+    }],
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/components/toolbar.js",
+      status: "succeeded",
+      detail: "READ_FILE_REPEAT_LIMIT: src/components/toolbar.js",
+    }],
+    recentToolActivity: [],
+    executeRecoveryAttempts: 0,
+    activateExecuteRecovery: (mode, reason, context) => recoveries.push({ mode, reason, context }),
+    emitTaskOrchestratorPhase: (phase, details) => phases.push({ phase, details }),
+  });
+
+  assert.equal(result.status, "pending_prompt");
+  assert.match(result.prompt, /mutation_first|修改|验证/);
+  assert.deepEqual(recoveries.map((entry) => entry.mode), ["mutation_first"]);
+  assert.equal(recoveries[0].reason, "approved_plan_read_file_repeat_limit");
+  assert.equal(phases[0].phase, "EXECUTE_RECOVERY");
+  assert.equal(stops.length, 0);
+  assert.equal(prompts.length, 0);
 });
 
 test("approved plan recovery logs tool surfaces and pauses long reasoning without action", () => {
@@ -1794,4 +1858,17 @@ test("approved-plan stream heartbeats update visible plan progress", () => {
   assert.match(storeSource, /emitLocalPlanExecutionProgress\("running"/);
   assert.match(storeSource, /ChatArea 会持续显示流式进度/);
   assert.match(storeSource, /emitPlanStreamHeartbeat\(markerPatch\)/);
+});
+
+test("workflow engine forwards the complete approved-plan progress snapshot", () => {
+  const workflowEngineSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+
+  assert.match(workflowEngineSource, /currentTask:\s*progress\.currentTask/);
+  assert.match(workflowEngineSource, /latestEvidence:\s*progress\.latestEvidence/);
+  assert.match(workflowEngineSource, /progressSignature:\s*progress\.progressSignature/);
+  assert.match(workflowEngineSource, /lastEffectiveEvidenceAt:\s*progress\.lastEffectiveEvidenceAt/);
+  assert.doesNotMatch(workflowEngineSource, /recentToolActivity:\s*update\.currentTool\s*\?\s*\[update\.currentTool\]/);
 });

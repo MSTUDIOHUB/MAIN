@@ -188,6 +188,7 @@ import {
 } from "./planMaterialization";
 import {
   buildPlanEvidenceBundle,
+  hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
   type PlanEvidenceBundle,
 } from "./planEvidence";
@@ -4377,9 +4378,15 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     input.attemptedTargets || [],
     input.userGoal || "",
   );
-  if (!isPlanEvidenceBundleReady(closureInput.evidenceBundle)) {
+  const hasBundleEvidence = isPlanEvidenceBundleReady(closureInput.evidenceBundle);
+  const hasDeterministicEvidence = hasDeterministicPlanMaterializationEvidence(
+    closureInput.evidenceBundle,
+  );
+  if (!hasBundleEvidence || !hasDeterministicEvidence) {
     logAgentEvent("plan_evidence_materialization_rejected", {
-      reason: "insufficient_relevant_plan_evidence",
+      reason: hasBundleEvidence
+        ? "insufficient_diagnostic_plan_evidence"
+        : "insufficient_relevant_plan_evidence",
       evidenceCount: closureInput.evidence.length,
       structuredEvidenceCount: closureInput.evidenceRecords.length,
       fileCount: closureInput.files.length,
@@ -4392,7 +4399,9 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     });
     return {
       ok: false,
-      reason: "insufficient_relevant_plan_evidence",
+      reason: hasBundleEvidence
+        ? "insufficient_diagnostic_plan_evidence"
+        : "insufficient_relevant_plan_evidence",
     };
   }
   const closureKind = resolvePlanClosureArtifactKind(

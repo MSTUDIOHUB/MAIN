@@ -88,11 +88,11 @@ export function buildTrustedPlanResumePrompt(input: {
     return [
       "请在新的恢复上下文中继续执行计划，不要复用上一轮错误链路。",
       input.hasTasksArtifact
-        ? "从 `.MAIN/plans/tasks.md` 中选择证据未满足且与当前改动最相关的任务继续；顺序是执行参考，不是强制线性流程。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
+        ? "按 `.MAIN/plans/tasks.md` 的顺序继续证据未满足的任务；每项完成最小必要读取、写入和声明验证后再进入下一项。只有已确认依赖要求时才调整顺序，并在工具结果中记录原因。只有真实写入/命令成功/验证证据满足后，才可以把任务视为完成。"
         : input.artifacts.length === 0
         ? "先读取当前 workspace 的 `.MAIN/plans/plan.md`；如果旧会话已存在 bugfix.md 或 requirements.md，可作为辅助上下文读取。不要默认读取 `.MAIN/plans/tasks.md`，除非它已在计划摘要中确认存在或用户明确要求。"
         : input.tasks.length > 0
-        ? "当前已恢复 runtime 任务清单；请选择证据未满足且与当前诊断最相关的任务直接执行，顺序是参考而不是强制。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
+        ? "当前已恢复 runtime 任务清单；请按顺序直接执行第一个证据未满足的任务，完成最小必要读取、写入和声明验证后再进入下一项。只有已确认依赖要求时才调整顺序，并在工具结果中记录原因。只有当任务较长、需要跨会话审计或用户要求留档时，才先把清单持久化到 `.MAIN/plans/tasks.md`；不要为了确认它是否存在而读取它。"
         : "请先基于已批准的 plan.md 派生 runtime 任务清单；只有长任务、跨会话恢复或需要审计留档时，才生成 `.MAIN/plans/tasks.md`；不要默认读取缺失的 tasks.md。然后执行真实任务。",
       "不要重写已经满足证据的任务；如果存在 tasks.md，不要只修改 checkbox；不要重复计划说明。",
       "",
@@ -110,11 +110,11 @@ export function buildTrustedPlanResumePrompt(input: {
   return [
     "Continue plan execution in a fresh recovery context; do not reuse the previous errored loop.",
     input.hasTasksArtifact
-      ? "Continue with an evidence-unsatisfied task that best matches the current change; task order is guidance, not a forced linear path. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
+      ? "Continue with the first evidence-unsatisfied task in checklist order. Complete its minimum necessary read, mutation, and declared validation before advancing; reorder only for a proven dependency and record the reason in the tool result. Treat a task as complete only after real file-write, successful command, Browser/Playwright DOM/screenshot evidence, or explicit pending user validation exists."
       : input.artifacts.length === 0
       ? "First read `.MAIN/plans/plan.md` from the current workspace; if a legacy bugfix.md or requirements.md exists, use it only as supporting context. Do not read `.MAIN/plans/tasks.md` by default unless it is confirmed in the plan summary or the user explicitly asks for it."
       : input.tasks.length > 0
-      ? "A runtime task list is already available; choose the evidence-unsatisfied task that best matches the current diagnosis. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
+      ? "A runtime task list is already available; execute the first evidence-unsatisfied task in order, then advance only after its minimum necessary read, mutation, and declared validation. Reorder only for a proven dependency and record the reason in the tool result. Persist it to `.MAIN/plans/tasks.md` only when the task is long, cross-session, or explicitly needs an audit file; do not read it just to check existence."
       : "First derive a runtime task list from the approved plan.md. Generate `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or audit-file needs; do not read missing tasks.md by default. Then execute real tasks.",
     "Do not redo tasks whose evidence is already satisfied. If tasks.md exists, do not only edit checkboxes. Do not restate the plan.",
     "",

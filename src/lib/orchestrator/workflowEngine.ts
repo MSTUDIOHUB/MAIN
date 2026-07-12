@@ -549,19 +549,24 @@ export class WorkflowEngine {
       getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode === "plan" &&
       sessionGet().isPlanApproved !== true;
 
-    const emitLocalPlanExecutionProgress = (phase: "starting" | "running" | "completed" | "paused" | "error", update: any) => {
+    const emitLocalPlanExecutionProgress = (phase: PlanExecutionProgressPhase, update: Partial<PlanExecutionProgressUpdate>) => {
       const progressSnapshot = normalizePlanExecutionProgressSnapshot({
         turnId,
         update: buildPlanExecutionProgressUpdate({
           language: phaseLanguage,
-          phase: phase as PlanExecutionProgressPhase,
-          iterationCount: update.iteration,
-          maxIterations: update.maxIterations,
+          phase,
+          iterationCount: update.iteration ?? 0,
+          maxIterations: update.maxIterations ?? PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
           autoResumeCount: sessionGet().planAutoResumeCount,
           tasks: sessionGet().planTasks,
           evidenceLedger: sessionGet().planExecutionEvidenceLedger,
-          recentToolActivity: update.currentTool ? [update.currentTool] : [],
+          recentToolActivity: [],
+          currentTask: update.currentTask,
+          currentTool: update.currentTool,
+          latestEvidence: update.latestEvidence,
           nextStep: update.nextStep,
+          progressSignature: update.progressSignature,
+          lastEffectiveEvidenceAt: update.lastEffectiveEvidenceAt,
           recoveryReason: update.recoveryReason,
           repeatedTargets: update.repeatedTargets,
         }),
@@ -2177,12 +2182,22 @@ export class WorkflowEngine {
           phase: progress.phase,
           iteration: progress.iteration,
           autoResume: progress.autoResumeCount,
+          currentTask: progress.currentTask,
+          currentTool: progress.currentTool,
+          latestEvidence: progress.latestEvidence,
+          progressSignature: progress.progressSignature || null,
+          recoveryReason: progress.recoveryReason || null,
+          repeatedTargets: progress.repeatedTargets || [],
         });
 
-        emitLocalPlanExecutionProgress(progress.phase as any, {
+        emitLocalPlanExecutionProgress(progress.phase, {
           iteration: progress.iteration,
           maxIterations: progress.maxIterations,
+          currentTask: progress.currentTask,
           currentTool: progress.currentTool,
+          latestEvidence: progress.latestEvidence,
+          progressSignature: progress.progressSignature,
+          lastEffectiveEvidenceAt: progress.lastEffectiveEvidenceAt,
           recoveryReason: progress.recoveryReason,
           repeatedTargets: progress.repeatedTargets,
           nextStep: progress.nextStep,

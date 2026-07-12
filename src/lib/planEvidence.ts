@@ -207,6 +207,27 @@ export function isPlanEvidenceBundleReady(bundle: PlanEvidenceBundle): boolean {
   return !!bundle.objective && bundle.facts.length > 0 && bundle.changeTargets.length > 0;
 }
 
+/**
+ * A runtime-generated fallback plan must be held to a higher bar than a
+ * model-authored draft.  Structural excerpts can guide further investigation,
+ * but they do not establish that a particular file is the cause of a
+ * symptom-only request.  Auto-materializing from those excerpts produces a
+ * formally shaped but operationally empty checklist.
+ */
+export function hasDeterministicPlanMaterializationEvidence(bundle: PlanEvidenceBundle): boolean {
+  if (!isPlanEvidenceBundleReady(bundle)) return false;
+  const normalizedTargets = new Set(bundle.changeTargets.map((target) =>
+    target.replace(/\\/g, "/").toLowerCase(),
+  ));
+  return bundle.facts.some((fact) => {
+    const target = fact.target.replace(/\\/g, "/").toLowerCase();
+    return normalizedTargets.has(target) && (
+      objectiveMentionsTarget(bundle.objective, fact.target) ||
+      summaryExposesTargetDefect(fact.summary)
+    );
+  });
+}
+
 export function formatPlanEvidenceBundleForModel(
   bundle: PlanEvidenceBundle,
   language: "zh" | "en",
