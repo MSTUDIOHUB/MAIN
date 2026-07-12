@@ -369,6 +369,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(assistantOutputRoutingSource, /hasExecutableProposalReplyOptions/);
   assert.match(assistantOutputRoutingSource, /shouldPauseForReplyOptions/);
   assert.match(assistantOutputRoutingSource, /shouldAutoContinueNonBlockingPlanChoices/);
+  assert.match(assistantOutputRoutingSource, /resolveClosedPlanReadOnlyContinuation/);
+  assert.match(assistantOutputPhaseSource, /plan_closed_tool_surface_read_recovery/);
   assert.match(finalTextOnlyToolCallHandlingSource, /buildMaxStepsToolCallIgnoredNotice/);
   assert.match(finalTextOnlyToolCallHandlingSource, /buildExecuteNoProgressLoopPauseNotice/);
   assert.match(finalTextOnlyToolCallHandlingSource, /completeAssistantTurn\(\{/);
@@ -740,7 +742,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(planConvergenceSource, /plan_readonly_convergence_threshold/);
   assert.match(planConvergenceSource, /shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence/);
   assert.match(planConvergenceSource, /plan_post_convergence_tool_redirect/);
-  assert.match(planConvergenceSource, /plan_drafting_recovery_read_injected/);
+  assert.match(planConvergenceSource, /planEvidenceRecoveryPasses/);
   assert.match(planConvergenceSource, /plan_suppressed_tool_recovery_decision/);
   assert.match(planConvergenceSource, /plan_suppressed_tool_forced_write_injected/);
   assert.match(planQualityRecoverySource, /export function handlePlanQualityRecoveryAfterToolResults/);

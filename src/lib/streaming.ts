@@ -40,6 +40,10 @@ import { isRetryableCloudErrorMessage } from "./cloudRetry";
 import { toError } from "./errorUtils";
 import { isNativeToolCompatibilityErrorMessage, isProviderCompatibilityErrorMessage, PROVIDER_COMPATIBILITY_TAG } from "./providerCompatibility";
 import { sanitizeAssistantDisplayContent } from "./sanitize";
+import {
+  detectVisibleTextRepetition,
+  type VisibleTextRepetitionMatch,
+} from "./visibleTextRepetition";
 
 function emitStreamingConsole(
   source: "streaming" | "streamViaRustProxy",
@@ -54,6 +58,15 @@ function emitStreamingConsole(
   } else {
     writer(`[${source}] ${message}`, data);
   }
+}
+
+function createVisibleTextRepetitionError(match: VisibleTextRepetitionMatch): Error {
+  const error = new Error(
+    `STREAM_VISIBLE_TEXT_REPETITION: model repeated a ${match.cycleChars}-character visible cycle ` +
+    `${match.repetitions} times without a tool call.`,
+  );
+  (error as Error & { code?: string }).code = "STREAM_VISIBLE_TEXT_REPETITION";
+  return error;
 }
 
 /** Multimodal content parts (OpenAI-compatible). */
@@ -1488,6 +1501,38 @@ async function streamViaRustProxy(
     return true;
   };
 
+  const stopVisibleTextRepetition = () => {
+    if (resolved || anthropicProcessor || toolCallsMap.size > 0) return false;
+    const match = detectVisibleTextRepetition(semanticProgress.semanticContent);
+    if (!match) return false;
+
+    resolved = true;
+    finishReason = "length";
+    closeReasoningBlock();
+    const error = createVisibleTextRepetitionError(match);
+    emitStreamingConsole(
+      "streaming",
+      "warn",
+      "Visible stream repetition detected; cancelling before further duplicate output.",
+      match,
+    );
+    callbacks.onLifecycle?.({
+      phase: "stream_error",
+      streamId,
+      elapsedMs: Date.now() - streamStartedAt,
+      chunkCount: rustProxyChunkCount,
+      byteCount: rustProxyByteCount,
+      status: "visible_text_repetition",
+      error: error.message,
+    });
+    invoke("cancel_chat_stream", { streamId }).catch(() => {});
+    onToken("__ESCALATION_RESET__:");
+    onError(error);
+    rejectResult?.(error);
+    cleanup();
+    return true;
+  };
+
   const processSseChunk = (rawChunk: string) => {
     if (anthropicProcessor) {
       anthropicProcessor.processChunk(rawChunk);
@@ -1510,6 +1555,7 @@ async function streamViaRustProxy(
           if (contentDelta) {
             fullContent += contentDelta;
             refreshSemanticProgress();
+            if (stopVisibleTextRepetition()) return;
             emitContentForDisplay(contentDelta);
           }
         } catch { /* skip */ }
@@ -1580,6 +1626,7 @@ async function streamViaRustProxy(
             closeReasoningBlock();
             fullContent += textDelta;
             refreshSemanticProgress();
+            if (stopVisibleTextRepetition()) return;
             emitContentForDisplay(textDelta);
           }
 
@@ -2083,6 +2130,22 @@ export async function streamChatCompletion(
       : {}),
   });
 
+  const throwIfVisibleTextRepetition = () => {
+    if (toolCallsMap.size > 0) return;
+    const match = detectVisibleTextRepetition(semanticProgress.semanticContent);
+    if (!match) return;
+    const error = createVisibleTextRepetitionError(match);
+    emitStreamingConsole(
+      "streaming",
+      "warn",
+      "Visible stream repetition detected; cancelling before further duplicate output.",
+      match,
+    );
+    onToken("__ESCALATION_RESET__:");
+    reader.cancel().catch(() => {});
+    throw Object.assign(error, { _visibleTextRepetitionAbort: true });
+  };
+
   try {
     while (true) {
       const { done, value } = await reader.read();
@@ -2118,9 +2181,11 @@ export async function streamChatCompletion(
             if (contentDelta) {
               fullContent += contentDelta;
               refreshSemanticProgress();
+              throwIfVisibleTextRepetition();
               emitContentForDisplay(contentDelta);
             }
-          } catch {
+          } catch (error) {
+            if (error && (error as any)._visibleTextRepetitionAbort) throw error;
             // malformed JSON — skip
           }
         }
@@ -2184,6 +2249,7 @@ export async function streamChatCompletion(
               closeReasoningBlock();
               fullContent += textDelta;
               refreshSemanticProgress();
+              throwIfVisibleTextRepetition();
               emitContentForDisplay(textDelta);
             }
 
@@ -2249,7 +2315,7 @@ export async function streamChatCompletion(
             }
           } catch (e) {
             // Re-throw garbled-reasoning abort — must not be swallowed
-            if (e && ((e as any)._garbledAbort || (e as any)._semanticProgressAbort)) throw e;
+            if (e && ((e as any)._garbledAbort || (e as any)._semanticProgressAbort || (e as any)._visibleTextRepetitionAbort)) throw e;
             // malformed SSE chunk — skip
           }
         }

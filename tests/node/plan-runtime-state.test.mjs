@@ -106,14 +106,6 @@ test("plan runtime phases scope the tool surface", () => {
     toolNames: allPlanTools,
     workflowMode: "plan",
     isPlanApproved: false,
-    planRuntimePhase: "drafting",
-    allowDraftingRecoveryRead: true,
-  }), []);
-
-  assert.deepEqual(filterPlanToolNamesForRuntimePhase({
-    toolNames: allPlanTools,
-    workflowMode: "plan",
-    isPlanApproved: false,
     planRuntimePhase: "review_ready",
   }), []);
 });

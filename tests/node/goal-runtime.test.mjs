@@ -173,6 +173,25 @@ test("mutation goals require both a file change and a recognized verification re
   assert.ok(completed.criteria.every((criterion) => criterion.status === "satisfied"));
 });
 
+test("a test-or-typecheck completion criterion accepts either verified branch", () => {
+  const goal = goalState.createGoalDefinition({
+    objective: "修改 CSV 解析器。完成标准：源码已修改且运行测试或类型检查通过；约束：保持兼容",
+  });
+  const evidence = goalRuntime.createGoalEvidenceEntries({
+    goal,
+    iteration: 1,
+    observations: [
+      { name: "replace_in_file", target: "src/hooks/useCsvParser.ts", result: "Done" },
+      { name: "run_command", arguments: { command: "npx tsc --noEmit" }, result: "0 errors" },
+    ],
+  });
+
+  const result = goalRuntime.evaluateGoalCompletion({ goal, evidence, completionCandidate: true });
+  assert.equal(result.passed, true);
+  assert.equal(result.criteria[0].status, "satisfied");
+  assert.equal(result.criteria[0].evidenceIds.length, 2);
+});
+
 test("editing a goal invalidates evidence from the previous revision", () => {
   const original = goalState.createGoalDefinition({ objective: "Fix the capsule and run tests" });
   const oldEvidence = goalRuntime.createGoalEvidenceEntries({
@@ -426,6 +445,35 @@ test("Goal Engine completes only after a tool-backed mutation and verification s
   assert.equal(harness.outcomes.at(-1).status, "completed");
   assert.ok(harness.writes.some((write) => write.filePath.endsWith(`/.MAIN/goals/${goal.id}/state.json`)));
   assert.ok(harness.writes.some((write) => write.filePath.endsWith(`/.MAIN/goals/${goal.id}/evidence.jsonl`)));
+});
+
+test("Goal Engine completes from verified evidence after a non-terminal provider stop without a model marker", async () => {
+  const goal = goalState.createGoalDefinition({
+    objective: "Update the parser. Definition of done: modify source and run typecheck",
+    iterationBudget: 6,
+  });
+  const debugEvents = [];
+  const harness = createEngineCallbacks(async () => ({
+    assistantText: "The parser was updated and typecheck passed.",
+    toolCalls: [
+      { name: "apply_patch", target: "src/hooks/useCsvParser.ts", result: "Done" },
+      { name: "run_command", arguments: { command: "npx tsc --noEmit" }, result: "0 errors" },
+    ],
+    tokensUsed: 120,
+    completed: false,
+    outcomeStatus: "stopped_no_output",
+    stopReason: "no_output",
+    sliceBoundaryReached: false,
+  }));
+  harness.callbacks.onDebugEvent = (event, data) => debugEvents.push({ event, data });
+
+  const outcome = await goalEngine.executeGoalLoop({ goal, callbacks: harness.callbacks });
+  assert.equal(outcome.status, "completed");
+  assert.equal(outcome.iterationsUsed, 1);
+  assert.ok(debugEvents.some(({ event }) => event === "goal_runtime_evidence_completion_candidate"));
+  assert.ok(debugEvents.some(({ event, data }) =>
+    event === "goal_completion_accepted" && data?.candidateSource === "runtime_evidence"
+  ));
 });
 
 test("Goal Engine retries a normalized recoverable error and blocks on the third occurrence", async () => {

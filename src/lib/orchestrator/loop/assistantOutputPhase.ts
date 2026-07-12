@@ -26,6 +26,7 @@ import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRun
 import { resetApprovedPlanLongReasoningNoActionCount } from "./approvedPlanRecoveryRuntime";
 import {
   isHiddenThoughtOnlyNoToolStop,
+  resolveClosedPlanReadOnlyContinuation,
   resolveAssistantReplyOptionRouting,
   resolveToolProtocolStreamClearDecision,
   shouldAutoContinueNonBlockingPlanChoices,
@@ -36,13 +37,17 @@ import type { ProviderReasoningForHistory } from "./assistantResponseProcessing"
 import type { AgentLoopEvidenceRuntimeState } from "./evidenceRuntimeState";
 import { setLastAssistantTextForCheckpointRuntimeState } from "./evidenceRuntimeState";
 import type { AgentLoopNoToolRuntimeState } from "./noToolRuntimeState";
-import { shouldAdvancePlanFromStructureOnTargetedRead } from "../../planRuntime";
+import {
+  buildPlanTargetedEvidenceRecoveryPrompt,
+  shouldAdvancePlanFromStructureOnTargetedRead,
+} from "../../planRuntime";
 import {
   incrementConsecutiveNoToolRuntimeState,
   resetConsecutiveNoToolRuntimeState,
 } from "./noToolRuntimeState";
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import {
+  applyPlanEvidenceRecoveryRuntimeState,
   applyPlanPostConvergenceRuntimeState,
   applyPlanRuntimePhase,
   markPlanModeToolActivity,
@@ -394,7 +399,72 @@ export function handleAssistantOutputPhase(input: {
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
     });
-  if (autoContinueNonBlockingPlanChoices) {
+  const closedPlanReadOnlyContinuation = resolveClosedPlanReadOnlyContinuation({
+    suppressPlanContinuationReplyOptions:
+      input.suppressPlanContinuationReplyOptions,
+    replyOptions: normalized.replyOptions,
+    toolCallCount: effectiveToolCalls.length,
+    workflowMode,
+    isPlanApproved: callbacks.getIsPlanApproved(),
+    availableToolCount: input.availableToolNames.size,
+    planRuntimePhase: planRuntimeState.planRuntimePhase,
+    targetedRecoveryPasses: Math.max(
+      planRuntimeState.planEvidenceRecoveryPasses,
+      planRuntimeState.planReasoningOnlyRecoveryPasses,
+    ),
+  });
+  if (closedPlanReadOnlyContinuation.action === "targeted_evidence") {
+    logAgentEvent("plan_closed_tool_surface_read_recovery", {
+      iteration,
+      previousPhase: planRuntimeState.planRuntimePhase,
+      availableToolCount: input.availableToolNames.size,
+      replyOptions: normalized.replyOptions.length,
+      recoveryReason: closedPlanReadOnlyContinuation.reason || null,
+      targetedRecoveryPasses: Math.max(
+        planRuntimeState.planEvidenceRecoveryPasses,
+        planRuntimeState.planReasoningOnlyRecoveryPasses,
+      ),
+    });
+    const nonBlockingHistoryText = serializeAssistantReplyForHistory(
+      historyAssistantText,
+      [],
+    );
+    if (nonBlockingHistoryText.trim()) {
+      callbacks.appendMessage(
+        buildAssistantHistoryMessage(
+          nonBlockingHistoryText,
+          input.providerReasoningForHistory,
+        ),
+      );
+    }
+    planRuntimeState = applyPlanEvidenceRecoveryRuntimeState(planRuntimeState, {
+      planEvidenceRecoveryPasses: planRuntimeState.planEvidenceRecoveryPasses + 1,
+    });
+    setPlanRuntimePhaseAndSync(
+      "needs_evidence",
+      closedPlanReadOnlyContinuation.reason || "closed plan tool surface requires scoped evidence",
+    );
+    callbacks.onStatusChange("running");
+    callbacks.appendMessage({
+      role: "user",
+      content: buildPlanTargetedEvidenceRecoveryPrompt({
+        language: callbacks.getPreferredLanguage(),
+        reason: closedPlanReadOnlyContinuation.reason,
+        trigger: "closed_read_request",
+      }),
+    });
+    return finishControl("continue");
+  }
+  if (closedPlanReadOnlyContinuation.action === "defer") {
+    logAgentEvent("plan_closed_tool_surface_read_recovery_exhausted", {
+      iteration,
+      previousPhase: planRuntimeState.planRuntimePhase,
+      availableToolCount: input.availableToolNames.size,
+      replyOptions: normalized.replyOptions.length,
+      recoveryReason: closedPlanReadOnlyContinuation.reason || null,
+    });
+  }
+  if (autoContinueNonBlockingPlanChoices && closedPlanReadOnlyContinuation.action !== "defer") {
     logAgentEvent("plan_non_blocking_choice_auto_continue", {
       iteration,
       replyOptions: normalized.replyOptions.length,

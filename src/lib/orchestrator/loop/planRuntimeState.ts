@@ -82,6 +82,16 @@ export function applyReasoningNoToolPlanRuntimeState(
   };
 }
 
+export function applyPlanEvidenceRecoveryRuntimeState(
+  state: PlanLoopRuntimeState,
+  input: Pick<PlanLoopRuntimeState, "planEvidenceRecoveryPasses">,
+): PlanLoopRuntimeState {
+  return {
+    ...state,
+    planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses,
+  };
+}
+
 export function applyPlanPostConvergenceRuntimeState(
   state: PlanLoopRuntimeState,
   input: Pick<
@@ -90,12 +100,14 @@ export function applyPlanPostConvergenceRuntimeState(
     | "planDraftingRecoveryReadCount"
     | "planReasoningOnlyRecoveryPasses"
     | "planAutoScaffoldPromptIssued"
-  >,
+  > & Partial<Pick<PlanLoopRuntimeState, "planEvidenceRecoveryPasses">>,
 ): PlanLoopRuntimeState {
   return {
     ...state,
     planPostConvergenceToolRedirectCount: input.planPostConvergenceToolRedirectCount,
     planDraftingRecoveryReadCount: input.planDraftingRecoveryReadCount,
+    planEvidenceRecoveryPasses:
+      input.planEvidenceRecoveryPasses ?? state.planEvidenceRecoveryPasses,
     planReasoningOnlyRecoveryPasses: input.planReasoningOnlyRecoveryPasses,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued,
   };

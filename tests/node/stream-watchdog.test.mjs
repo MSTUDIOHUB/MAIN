@@ -101,6 +101,13 @@ test("classifies chunk trickle without visible progress as a plan watchdog timeo
   );
 });
 
+test("classifies a visible-text repetition guard as a stream watchdog stop", () => {
+  assert.equal(
+    isStreamWatchdogTimeoutMessage("STREAM_VISIBLE_TEXT_REPETITION: model repeated a visible cycle"),
+    true,
+  );
+});
+
 test("classifies recovery stream max elapsed timeout as watchdog pause", () => {
   const error = createStreamMaxElapsedTimeoutError(90_000, "approved_plan_recovery");
 

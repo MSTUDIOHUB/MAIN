@@ -35,6 +35,7 @@ export type PlanPostConvergenceToolRedirectResult = {
   status: "none" | "continue";
   planPostConvergenceToolRedirectCount: number;
   planDraftingRecoveryReadCount: number;
+  planEvidenceRecoveryPasses: number;
   planReasoningOnlyRecoveryPasses: number;
   planAutoScaffoldPromptIssued: boolean;
 };
@@ -205,7 +206,6 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     providerReasoningForHistory,
     assistantMsgId,
     planRuntimePhase,
-    planEvidenceRecoveryPasses,
     planQualityRejectCount,
     planLastQualityGateReason,
     planLastMissingSections,
@@ -215,6 +215,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
 
   let planPostConvergenceToolRedirectCount = input.planPostConvergenceToolRedirectCount;
   let planDraftingRecoveryReadCount = input.planDraftingRecoveryReadCount;
+  let planEvidenceRecoveryPasses = input.planEvidenceRecoveryPasses;
   let planReasoningOnlyRecoveryPasses = input.planReasoningOnlyRecoveryPasses;
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
 
@@ -222,6 +223,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     status,
     planPostConvergenceToolRedirectCount,
     planDraftingRecoveryReadCount,
+    planEvidenceRecoveryPasses,
     planReasoningOnlyRecoveryPasses,
     planAutoScaffoldPromptIssued,
   });
@@ -285,33 +287,6 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     missingSections: planLastMissingSections,
   });
 
-  const suppressedToolNames = effectiveToolCalls.map((call) => call.name);
-  const isDraftingReadAttempt =
-    planRuntimePhase === "drafting" &&
-    suppressedToolNames.some((toolName) =>
-      toolName === "read_file" || toolName === "read_document" || toolName === "get_file_outline"
-    );
-  if (isDraftingReadAttempt && planDraftingRecoveryReadCount < 1) {
-    planDraftingRecoveryReadCount += 1;
-    planReasoningOnlyRecoveryPasses += 1;
-    const readToolsAvailable = ["read_file", "read_document", "get_file_outline"].some((name) => availableToolNames.has(name));
-    const urgencyHint = language === "zh"
-      ? `PLAN_DRAFTING_OUTPUT_NOW: drafting 工具面已经关闭。不要再尝试读取；请基于已注入的证据包输出可见 <proposed_plan>，由 MAIN runtime 物化。若确有阻塞性取舍，请输出 <user_options> 后停止。刚才被拦截的工具：${suppressedToolNames.join(", ")}。`
-      : `PLAN_DRAFTING_OUTPUT_NOW: The drafting tool surface is closed. Do not attempt more reads; output visible <proposed_plan> from the injected evidence bundle for MAIN runtime to materialize. If a blocking decision remains, output <user_options> and stop. Suppressed tools: ${suppressedToolNames.join(", ")}.`;
-    callbacks.appendMessage({
-      role: "user",
-      content: urgencyHint,
-    });
-    logAgentEvent("plan_drafting_recovery_read_injected", {
-      iteration,
-      attemptedTools: suppressedToolNames,
-      planDraftingRecoveryReadCount,
-      readToolsAvailable,
-      maxRecoveryReads: 1,
-    });
-    return finish("continue");
-  }
-
   const suppressedRecoveryDecision = resolvePlanSuppressedToolRecovery({
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
@@ -327,7 +302,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     targetedRecoveryPasses: Math.max(planEvidenceRecoveryPasses, planReasoningOnlyRecoveryPasses),
   });
   if (suppressedRecoveryDecision.action === "targeted_evidence") {
-    planReasoningOnlyRecoveryPasses += 1;
+    planEvidenceRecoveryPasses += 1;
     setPlanRuntimePhase("needs_evidence", planEvidenceReadinessForRedirect.reason);
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
@@ -335,6 +310,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
       content: buildPlanTargetedEvidenceRecoveryPrompt({
         language,
         reason: planEvidenceReadinessForRedirect.reason,
+        trigger: "closed_read_request",
       }),
     });
     return finish("continue");

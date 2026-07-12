@@ -669,7 +669,7 @@ function createPostConvergenceInput(overrides = {}) {
   };
 }
 
-test("post-convergence helper closes drafting tools and requests visible plan output", () => {
+test("post-convergence helper reopens bounded targeted evidence when a drafting read is suppressed", () => {
   const { harness, phases, input } = createPostConvergenceInput({
     input: {
       visibleAssistantText: "I need one more file.",
@@ -680,16 +680,17 @@ test("post-convergence helper closes drafting tools and requests visible plan ou
 
   assert.equal(result.status, "continue");
   assert.equal(result.planPostConvergenceToolRedirectCount, 0);
-  assert.equal(result.planDraftingRecoveryReadCount, 1);
-  assert.equal(result.planReasoningOnlyRecoveryPasses, 1);
+  assert.equal(result.planDraftingRecoveryReadCount, 0);
+  assert.equal(result.planEvidenceRecoveryPasses, 1);
+  assert.equal(result.planReasoningOnlyRecoveryPasses, 0);
   assert.equal(result.planAutoScaffoldPromptIssued, false);
   assert.equal(harness.appended.length, 2);
   assert.equal(harness.appended[0].role, "assistant");
   assert.equal(harness.appended[1].role, "user");
-  assert.match(harness.appended[1].content, /PLAN_DRAFTING_OUTPUT_NOW/);
-  assert.deepEqual(harness.statuses, []);
+  assert.match(harness.appended[1].content, /PLAN_TARGETED_EVIDENCE_RECOVERY/);
+  assert.deepEqual(harness.statuses, ["running"]);
   assert.deepEqual(harness.streamTokens, []);
-  assert.deepEqual(phases, []);
+  assert.deepEqual(phases, [{ phase: "needs_evidence", reason: "targeted_reads_without_semantic_facts" }]);
 });
 
 test("post-convergence helper forces visible plan convergence after recovery is exhausted", () => {

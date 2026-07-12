@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   isHiddenThoughtOnlyNoToolStop,
   resolveAssistantReplyOptionRouting,
+  resolveClosedPlanReadOnlyContinuation,
   resolveToolProtocolStreamClearDecision,
   shouldAutoContinueNonBlockingPlanChoices,
   shouldTrackAssistantCheckpoint,
@@ -134,6 +135,61 @@ test("assistant output routing auto-continues only non-blocking unapproved plan 
     }),
     false,
   );
+});
+
+test("closed drafting surface reopens bounded targeted evidence for a read-only continuation request", () => {
+  const first = resolveClosedPlanReadOnlyContinuation({
+    suppressPlanContinuationReplyOptions: true,
+    replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
+    toolCallCount: 0,
+    workflowMode: "plan",
+    isPlanApproved: false,
+    availableToolCount: 0,
+    planRuntimePhase: "drafting",
+    targetedRecoveryPasses: 0,
+  });
+  assert.deepEqual(first, {
+    action: "targeted_evidence",
+    reason: "suppressed_tool_ready_evidence_missing_visible_plan",
+  });
+
+  const exhausted = resolveClosedPlanReadOnlyContinuation({
+    suppressPlanContinuationReplyOptions: true,
+    replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
+    toolCallCount: 0,
+    workflowMode: "plan",
+    isPlanApproved: false,
+    availableToolCount: 0,
+    planRuntimePhase: "drafting",
+    targetedRecoveryPasses: 1,
+  });
+  assert.deepEqual(exhausted, {
+    action: "defer",
+    reason: "suppressed_tool_ready_evidence_missing_visible_plan_after_recovery",
+  });
+});
+
+test("closed plan continuation does not reopen tools for arbitrary options or an open evidence surface", () => {
+  assert.deepEqual(resolveClosedPlanReadOnlyContinuation({
+    suppressPlanContinuationReplyOptions: true,
+    replyOptions: [{ label: "改变范围", value: "改变范围" }],
+    toolCallCount: 0,
+    workflowMode: "plan",
+    isPlanApproved: false,
+    availableToolCount: 0,
+    planRuntimePhase: "drafting",
+    targetedRecoveryPasses: 0,
+  }), { action: "none" });
+  assert.deepEqual(resolveClosedPlanReadOnlyContinuation({
+    suppressPlanContinuationReplyOptions: true,
+    replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
+    toolCallCount: 0,
+    workflowMode: "plan",
+    isPlanApproved: false,
+    availableToolCount: 1,
+    planRuntimePhase: "needs_evidence",
+    targetedRecoveryPasses: 0,
+  }), { action: "none" });
 });
 
 test("assistant output routing resolves executable plan reply options and pause decision", () => {

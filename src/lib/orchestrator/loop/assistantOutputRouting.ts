@@ -1,7 +1,15 @@
 import { containsToolUseBlock } from "../../orchestrator/agentRecovery";
-import { hasExecutableProposalReplyOptions, shouldPauseForReplyOptions } from "../../replyOptions";
+import {
+  hasExecutableProposalReplyOptions,
+  hasOnlyReadOnlyPermissionReplyOptions,
+  shouldPauseForReplyOptions,
+} from "../../replyOptions";
+import {
+  isPlanRuntimeFinalizationPhase,
+  resolvePlanSuppressedToolRecovery,
+} from "../../planRuntime";
 import type { LegacyWorkflowMode } from "../../runIntent";
-import type { ReplyOption } from "../../workflowModels";
+import type { PlanRuntimePhase, ReplyOption } from "../../workflowModels";
 
 export interface ToolProtocolStreamClearDecision {
   shouldClear: boolean;
@@ -45,6 +53,50 @@ export function shouldAutoContinueNonBlockingPlanChoices(input: {
     input.toolCallCount === 0 &&
     input.workflowMode === "plan" &&
     !input.isPlanApproved;
+}
+
+/**
+ * A plan can enter its text-only drafting phase with a sufficient evidence
+ * bundle, then discover that the model still needs one concrete fact.  Do not
+ * continue by merely telling the model to call a tool: that would be
+ * impossible while the tool surface is intentionally empty.  Instead, return
+ * the bounded runtime transition that reopens the targeted-evidence phase.
+ */
+export function resolveClosedPlanReadOnlyContinuation(input: {
+  suppressPlanContinuationReplyOptions: boolean;
+  replyOptions: ReplyOption[];
+  toolCallCount: number;
+  workflowMode: LegacyWorkflowMode;
+  isPlanApproved: boolean;
+  availableToolCount: number;
+  planRuntimePhase: PlanRuntimePhase;
+  targetedRecoveryPasses: number;
+}): {
+  action: "none" | "targeted_evidence" | "defer";
+  reason?: string;
+} {
+  if (!shouldAutoContinueNonBlockingPlanChoices(input)) {
+    return { action: "none" };
+  }
+  if (
+    input.availableToolCount > 0 ||
+    !isPlanRuntimeFinalizationPhase(input.planRuntimePhase) ||
+    !hasOnlyReadOnlyPermissionReplyOptions(input.replyOptions)
+  ) {
+    return { action: "none" };
+  }
+  const recovery = resolvePlanSuppressedToolRecovery({
+    workflowMode: input.workflowMode,
+    isPlanApproved: input.isPlanApproved,
+    // The runtime intentionally closed this finalization phase only after it
+    // had frozen a usable evidence bundle.  A model request here gets one
+    // bounded re-open, not the broader insufficient-evidence retry budget.
+    evidenceReadiness: "ready_for_plan",
+    targetedRecoveryPasses: input.targetedRecoveryPasses,
+  });
+  return recovery.action === "targeted_evidence"
+    ? { action: "targeted_evidence", reason: recovery.reason }
+    : { action: "defer", reason: recovery.reason };
 }
 
 export function resolveAssistantReplyOptionRouting(input: {

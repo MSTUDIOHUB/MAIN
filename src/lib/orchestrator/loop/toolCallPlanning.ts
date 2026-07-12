@@ -55,7 +55,6 @@ export function resolveIterationToolSurface(input: {
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
   planRuntimePhase: PlanRuntimePhase;
-  planDraftingRecoveryReadCount: number;
   usedPlanReadOnlyConvergencePrompt: boolean;
   turnInputContextSignals: TurnInputContextSignals;
   lastAssistantTextForCheckpoint: string;
@@ -78,7 +77,6 @@ export function resolveIterationToolSurface(input: {
     recentToolActivity,
     recentPlanToolActivity,
     planRuntimePhase,
-    planDraftingRecoveryReadCount,
     usedPlanReadOnlyConvergencePrompt,
     turnInputContextSignals,
     lastAssistantTextForCheckpoint,
@@ -191,17 +189,11 @@ export function resolveIterationToolSurface(input: {
     });
   }
 
-  const allowDraftingRecoveryRead =
-    workflowMode === "plan" &&
-    !callbacks.getIsPlanApproved() &&
-    planRuntimePhase === "drafting" &&
-    planDraftingRecoveryReadCount < 1;
   const phaseScopedIterationAllTools = filterPlanRuntimeToolDefinitionsForPhase({
     tools: baseIterationAllTools,
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
     planRuntimePhase,
-    allowDraftingRecoveryRead,
   });
   const shouldClosePlanToolSurface = shouldClosePlanToolSurfaceAfterReadOnlyConvergence({
     workflowMode,

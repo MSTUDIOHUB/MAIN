@@ -579,19 +579,72 @@ export async function executeGoalLoop(input: {
       });
     }
 
-    const completionGate = evaluateGoalCompletion({
+    // A model marker is useful, but it cannot be the sole way to terminate a
+    // Goal. The runtime owns terminal state from the evidence ledger and exact
+    // criteria, so a local provider's missing final marker cannot force more
+    // work after the task is already proven complete.
+    let completionCandidate = resolveGoalCompletionCandidate({
+      completionSignal,
+      agentResult,
+      innerDecision,
+    });
+    let completionGate = evaluateGoalCompletion({
       goal,
       evidence: progress.evidence || [],
-      completionCandidate: completionSignal.completed && innerDecision.action === "continue",
+      completionCandidate: completionCandidate.accepted,
       unresolvedBlockers: iteration.unresolvedBlockers,
     });
+    // Some providers report an otherwise recoverable no-action/no-output stop
+    // after successful tools. If all hard completion criteria are already
+    // satisfied, the evidence gate is sufficient to settle that cleanly. This
+    // cannot override user input, pause, abort, or provider-error states.
+    if (!completionCandidate.accepted && canSettleGoalFromRuntimeEvidence({
+      completionSignal,
+      agentResult,
+    })) {
+      const evidenceOnlyGate = evaluateGoalCompletion({
+        goal,
+        evidence: progress.evidence || [],
+        completionCandidate: true,
+        unresolvedBlockers: iteration.unresolvedBlockers,
+      });
+      if (evidenceOnlyGate.passed) {
+        completionCandidate = { accepted: true, source: "runtime_evidence" };
+        completionGate = evidenceOnlyGate;
+      } else {
+        callbacks.onDebugEvent?.("goal_runtime_evidence_completion_rejected", {
+          iteration: iteration.index,
+          goalSliceId: goalTurnContract.goalSliceId,
+          outcomeStatus: agentResult.outcomeStatus || (agentResult.completed ? "completed" : "unknown"),
+          reasons: evidenceOnlyGate.reasons,
+          evidenceCount: progress.evidence?.length || 0,
+        });
+      }
+    }
     goal.criteria = completionGate.criteria;
-    if (completionSignal.completed && !completionGate.passed) {
-      iteration.stopClass = "evidence_missing";
-      progress.stopClass = "evidence_missing";
+    if (completionCandidate.source === "runtime_evidence") {
+      callbacks.onDebugEvent?.("goal_runtime_evidence_completion_candidate", {
+        iteration: iteration.index,
+        goalSliceId: goalTurnContract.goalSliceId,
+        outcomeStatus: agentResult.outcomeStatus || (agentResult.completed ? "completed" : "unknown"),
+        stopReason: effectiveStopReason,
+        sliceBoundaryReached: autoNextSlice,
+        evidenceCount: progress.evidence?.length || 0,
+      });
+    }
+    if (completionCandidate.accepted && !completionGate.passed) {
+      // Preserve the ordinary slice-boundary status when completion was
+      // runtime-nominated. A missing marker must not turn a normal bounded
+      // continuation into a misleading evidence pause. Explicit model claims
+      // still receive the more precise evidence_missing stop class.
+      if (completionCandidate.source === "model_marker") {
+        iteration.stopClass = "evidence_missing";
+        progress.stopClass = "evidence_missing";
+      }
       callbacks.onDebugEvent?.("goal_completion_rejected", {
         iteration: iteration.index,
         goalSliceId: goalTurnContract.goalSliceId,
+        candidateSource: completionCandidate.source,
         reasons: completionGate.reasons,
         evidenceCount: progress.evidence?.length || 0,
       });
@@ -616,6 +669,12 @@ export async function executeGoalLoop(input: {
       await persistProgress(callbacks, goal, progress, language);
       callbacks.onGoalProgressUpdate(progress, goal);
       emitRuntimeUpdate(callbacks, goal, progress, "observe");
+      callbacks.onDebugEvent?.("goal_completion_accepted", {
+        iteration: iteration.index,
+        goalSliceId: goalTurnContract.goalSliceId,
+        candidateSource: completionCandidate.source,
+        supportingEvidenceIds: completionGate.supportingEvidenceIds,
+      });
       const outcome = buildOutcome("completed", "Goal completion evidence gate passed", progress, lastCheckpoint);
       callbacks.onGoalOutcome(outcome);
       return outcome;
@@ -769,6 +828,47 @@ function buildOutcome(
     lastStopReason: progress.lastStopReason,
     stopClass: progress.stopClass,
   };
+}
+
+function resolveGoalCompletionCandidate(input: {
+  completionSignal: ReturnType<typeof detectGoalCompletionSignal>;
+  agentResult: GoalAgentIterationResult;
+  innerDecision: ReturnType<typeof resolveGoalInnerOutcomeDecision>;
+}): { accepted: boolean; source: "model_marker" | "runtime_evidence" | "none" } {
+  if (input.completionSignal.completed && input.innerDecision.action === "continue") {
+    return { accepted: true, source: "model_marker" };
+  }
+
+  // A normal inner completion and the expected bounded slice boundary are
+  // clean terminal points. A stopped_no_action result can also be a normal
+  // provider-side handoff after real tool work (especially with local models
+  // that omit the final marker); let the evidence gate decide that narrow
+  // case. Pauses, input requests, stream failures, blocked states, and other
+  // recovery errors keep their explicit paths above.
+  const reachedCleanBoundary = input.innerDecision.action === "continue" && (
+    input.agentResult.completed === true
+    || input.agentResult.outcomeStatus === "completed"
+    || input.agentResult.sliceBoundaryReached === true
+  );
+  const toolBackedNoAction = input.agentResult.outcomeStatus === "stopped_no_action"
+    && input.agentResult.toolCalls.length > 0;
+  return reachedCleanBoundary || toolBackedNoAction
+    ? { accepted: true, source: "runtime_evidence" }
+    : { accepted: false, source: "none" };
+}
+
+function canSettleGoalFromRuntimeEvidence(input: {
+  completionSignal: ReturnType<typeof detectGoalCompletionSignal>;
+  agentResult: GoalAgentIterationResult;
+}): boolean {
+  if (input.completionSignal.blocked) return false;
+  // Explicit user-control and provider-error outcomes have already been
+  // handled above or need their own recovery path. A stopped_no_action or
+  // stopped_no_output result is allowed here only when the evidence gate can
+  // independently prove every required criterion.
+  return input.agentResult.outcomeStatus !== "paused"
+    && input.agentResult.outcomeStatus !== "aborted"
+    && input.agentResult.outcomeStatus !== "error";
 }
 
 function goalStopClassForBudgetReason(

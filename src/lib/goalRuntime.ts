@@ -192,9 +192,10 @@ function evidenceIsFresh(goal: GoalDefinition, entry: GoalEvidenceEntry): boolea
 
 const CRITERION_MUTATION_RE = /(?:implement|fix|repair|refactor|migrate|update|modify|change|create|write|remove|delete|实现|修复|重构|迁移|更新|修改|创建|编写|删除)/i;
 const CRITERION_TEST_RE = /(?:\btests?\b|pytest|jest|vitest|playwright\s+test|测试|用例)/i;
-const CRITERION_BUILD_RE = /(?:\bbuild\b|\blint\b|typecheck|tsc|cargo\s+check|构建|编译|静态检查)/i;
+const CRITERION_BUILD_RE = /(?:\bbuild\b|\blint\b|type\s*check|typecheck|tsc|cargo\s+check|构建|编译|静态检查|类型检查)/i;
 const CRITERION_BROWSER_RE = /(?:browser|screenshot|render|visual|dom|浏览器|截图|渲染|视觉)/i;
 const CRITERION_VERIFICATION_RE = /(?:verify|verification|validate|validation|pass|regression|compatible|compatibility|验证|校验|通过|回归|兼容)/i;
+const CRITERION_TEST_BUILD_ALTERNATIVE_RE = /(?:\b(?:tests?|pytest|jest|vitest|playwright\s+test)\b|测试|用例).{0,80}?(?:\bor\b|或者|或|\/).{0,80}?(?:\b(?:build|lint|type\s*check|typecheck|tsc)\b|构建|编译|静态检查|类型检查)|(?:\b(?:build|lint|type\s*check|typecheck|tsc)\b|构建|编译|静态检查|类型检查).{0,80}?(?:\bor\b|或者|或|\/).{0,80}?(?:\b(?:tests?|pytest|jest|vitest|playwright\s+test)\b|测试|用例)/i;
 const CRITERION_IGNORED_TOKENS = new Set([
   "this", "that", "with", "from", "into", "then", "goal", "runtime",
   "implement", "implemented", "update", "updated", "modify", "modified", "change", "changed", "fix", "fixed",
@@ -243,8 +244,18 @@ function selectEvidenceForCriterion(
   const requirements: Array<(entry: GoalEvidenceEntry) => boolean> = [];
 
   if (requiresMutation) requirements.push((entry) => entry.kind === "file_change");
-  if (requiresTest) requirements.push((entry) => entry.kind === "test");
-  if (requiresBuild) requirements.push((entry) => entry.kind === "build");
+  // Preserve an explicit "test OR build/typecheck" definition of done as an
+  // alternative, rather than treating keyword detection as two conjunctive
+  // requirements. This keeps completion tied to the user's stated contract.
+  const allowsTestOrBuild = requiresTest
+    && requiresBuild
+    && CRITERION_TEST_BUILD_ALTERNATIVE_RE.test(text);
+  if (allowsTestOrBuild) {
+    requirements.push((entry) => entry.kind === "test" || entry.kind === "build");
+  } else {
+    if (requiresTest) requirements.push((entry) => entry.kind === "test");
+    if (requiresBuild) requirements.push((entry) => entry.kind === "build");
+  }
   if (requiresBrowser) requirements.push((entry) => entry.kind === "browser");
   if (requiresGenericVerification) {
     requirements.push((entry) =>

@@ -18,7 +18,7 @@ function isPlanRuntimeReadOnlyPhase(phase?: PlanRuntimePhase): boolean {
   return phase === "explore_structure" || phase === "grounding" || phase === "needs_evidence";
 }
 
-function isPlanRuntimeFinalizationPhase(phase?: PlanRuntimePhase): boolean {
+export function isPlanRuntimeFinalizationPhase(phase?: PlanRuntimePhase): boolean {
   return (
     phase === "synthesis" ||
     phase === "drafting" ||
@@ -93,7 +93,6 @@ export function filterPlanToolNamesForRuntimePhase(input: {
   workflowMode: PlanRuntimeMode;
   isPlanApproved: boolean;
   planRuntimePhase?: PlanRuntimePhase;
-  allowDraftingRecoveryRead?: boolean;
 }): string[] {
   if (input.workflowMode !== "plan" || input.isPlanApproved || !input.planRuntimePhase) {
     return input.toolNames;
@@ -225,10 +224,14 @@ export function shouldSuppressPlanTruncationWarning(input: {
 export function buildPlanTargetedEvidenceRecoveryPrompt(input: {
   language: "zh" | "en";
   reason?: string;
+  trigger?: "reasoning_only" | "closed_read_request";
 }): string {
+  const closedReadRequest = input.trigger === "closed_read_request";
   if (input.language === "en") {
     return [
-      "PLAN_TARGETED_EVIDENCE_RECOVERY: The previous planning turn ended in hidden reasoning without a reviewable plan.",
+      closedReadRequest
+        ? "PLAN_TARGETED_EVIDENCE_RECOVERY: The plan requested more read-only evidence after the drafting tool surface had closed."
+        : "PLAN_TARGETED_EVIDENCE_RECOVERY: The previous planning turn ended in hidden reasoning without a reviewable plan.",
       input.reason ? `Evidence readiness: ${input.reason}.` : "",
       "Do tightly scoped read-only evidence pass(es) now. Prefer the most specific file/path/symbol from the user request or the latest evidence.",
       "After the read/search result, stop exploring and output a concise visible `<proposed_plan>`. MAIN runtime owns `.MAIN/plans/plan.md` materialization.",
@@ -236,7 +239,9 @@ export function buildPlanTargetedEvidenceRecoveryPrompt(input: {
     ].filter(Boolean).join("\n");
   }
   return [
-    "PLAN_TARGETED_EVIDENCE_RECOVERY: 上一条计划回复只有隐藏推理，没有形成可审批计划。",
+    closedReadRequest
+      ? "PLAN_TARGETED_EVIDENCE_RECOVERY: 计划在 drafting 工具面关闭后仍请求补充只读证据。"
+      : "PLAN_TARGETED_EVIDENCE_RECOVERY: 上一条计划回复只有隐藏推理，没有形成可审批计划。",
     input.reason ? `证据状态：${input.reason}。` : "",
     "现在只做精确定向的只读补证。优先读取用户请求或已有证据里最具体的文件、路径或符号。",
     "拿到读取/搜索结果后，停止探索并输出精简的可见 `<proposed_plan>`；`.MAIN/plans/plan.md` 由 MAIN runtime 负责物化。",

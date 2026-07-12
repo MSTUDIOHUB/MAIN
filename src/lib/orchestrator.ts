@@ -310,14 +310,12 @@ export function filterPlanRuntimeToolDefinitionsForPhase(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
   planRuntimePhase?: PlanRuntimePhase;
-  allowDraftingRecoveryRead?: boolean;
 }): ToolDefinition[] {
   const names = new Set(filterPlanToolNamesForRuntimePhase({
     toolNames: input.tools.map((tool) => tool.function.name),
     workflowMode: input.workflowMode,
     isPlanApproved: input.isPlanApproved,
     planRuntimePhase: input.planRuntimePhase,
-    allowDraftingRecoveryRead: input.allowDraftingRecoveryRead,
   }));
   if (names.size === input.tools.length) return input.tools;
   return input.tools.filter((tool) => names.has(tool.function.name));
@@ -2601,6 +2599,7 @@ export function isStreamWatchdogTimeoutMessage(message: string): boolean {
 	  normalized.includes("stream_idle_timeout") ||
 	  normalized.includes("stream_no_visible_token_timeout") ||
 	  normalized.includes("stream_no_visible_progress_timeout") ||
+	  normalized.includes("stream_visible_text_repetition") ||
 	  normalized.includes("stream_max_elapsed_timeout") ||
 	  normalized.includes("first chunk timeout") ||
 	  normalized.includes("first response timeout") ||
