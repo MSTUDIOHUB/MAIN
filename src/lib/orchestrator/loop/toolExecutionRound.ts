@@ -5,9 +5,10 @@ import {
   pruneFileReadStates,
 } from "../../orchestrator/fileReadCache";
 import {
-  buildRepeatLoopArgsKey,
-  buildRepeatLoopSignature,
-} from "../../repetitionGuard";
+  buildBrowserValidationCacheSignature,
+  isBrowserValidationResultCacheable,
+} from "../../browserValidation";
+import { buildRepeatLoopArgsKey } from "../../repetitionGuard";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
@@ -222,7 +223,12 @@ export async function executeToolExecutionRound(input: {
       },
     );
     allResults.push(result);
-    if (tc.name !== "browser_evaluate" && browserValidationCache.size > 0) {
+    if (
+      tc.name !== "browser_evaluate" &&
+      browserValidationCache.size > 0 &&
+      result.lifecycleState !== "blocked" &&
+      result.lifecycleState !== "declined"
+    ) {
       browserValidationCache.clear();
       logAgentEvent("browser_validation_cache_invalidated", {
         iteration,
@@ -232,8 +238,16 @@ export async function executeToolExecutionRound(input: {
     }
     if (tc.name === "browser_evaluate") {
       const toolArgs = parseToolCallArguments(tc, workspace);
-      const signature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
-      browserValidationCache.set(signature, result);
+      const signature = buildBrowserValidationCacheSignature(toolArgs);
+      const cacheable = isBrowserValidationResultCacheable(result.content || result.displayContent || "");
+      if (cacheable) browserValidationCache.set(signature, result);
+      logAgentEvent(cacheable ? "browser_validation_cache_stored" : "browser_validation_cache_skipped", {
+        iteration,
+        signature: truncateForLog(signature, 180),
+        status: result.isError ? "failed" : "succeeded",
+        lifecycleState: result.lifecycleState || null,
+        reason: cacheable ? "stable_browser_state" : "transient_or_unstructured_result",
+      });
     }
 
     if (abortSignal.aborted) {

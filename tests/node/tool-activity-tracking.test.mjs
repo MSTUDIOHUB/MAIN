@@ -67,6 +67,12 @@ const {
 const {
   formatToolFeedbackEnvelope,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"));
+const {
+  buildBrowserValidationCacheSignature,
+  buildBrowserValidationFailureContent,
+  isBrowserValidationResultCacheable,
+  parseBrowserValidationOutcome,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/browserValidation.ts"));
 
 function result(overrides) {
   return {
@@ -203,6 +209,57 @@ test("tool activity tracking counts only successful commands browser checks and 
     target: "src/App.tsx",
     content: "updated source file",
   }), {}), true);
+});
+
+test("browser validation cache ignores timeout-only retries while preserving meaningful checks", () => {
+  const first = buildBrowserValidationCacheSignature({
+    url: "http://localhost:1420",
+    wait_for_text: "Ready",
+    timeout_ms: 60_000,
+  });
+  const timeoutRetry = buildBrowserValidationCacheSignature({
+    url: "http://localhost:1420/",
+    waitForText: "Ready",
+    timeoutMs: 10_000,
+    screenshot: true,
+    failOnConsoleError: true,
+  });
+  const differentCheck = buildBrowserValidationCacheSignature({
+    url: "http://localhost:1420",
+    wait_for_text: "Ready",
+    checks: "selector: #app",
+  });
+
+  assert.equal(first, timeoutRetry);
+  assert.notEqual(first, differentCheck);
+});
+
+test("browser validation outcome keeps concise diagnostics for failed tool feedback", () => {
+  const raw = JSON.stringify({
+    ok: false,
+    failureSummary: "page_error: Cannot set properties of null",
+    failureReasons: ["page_error", "blank_page"],
+    blankPage: true,
+    screenshotPath: ".MAIN/browser-validation/browser-1.png",
+    pageErrors: ["Cannot set properties of null"],
+    consoleErrors: [],
+    assertions: [{ passed: false }],
+    durationMs: 812,
+    error: null,
+  });
+  const outcome = parseBrowserValidationOutcome(raw);
+
+  assert.equal(outcome.ok, false);
+  assert.equal(outcome.blankPage, true);
+  assert.equal(outcome.failedAssertionCount, 1);
+  assert.equal(outcome.screenshotPath, ".MAIN/browser-validation/browser-1.png");
+  assert.match(buildBrowserValidationFailureContent(raw), /^BROWSER_VALIDATION_FAILED: page_error/);
+  assert.equal(isBrowserValidationResultCacheable(buildBrowserValidationFailureContent(raw)), true);
+  assert.equal(isBrowserValidationResultCacheable(JSON.stringify({
+    ok: false,
+    failureReasons: ["runtime_error"],
+    failureSummary: "runtime_error: net::ERR_CONNECTION_REFUSED",
+  })), false);
 });
 
 test("tool activity tracking records bounded recent activity and helper classifications", () => {

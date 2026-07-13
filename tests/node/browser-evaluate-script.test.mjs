@@ -1,11 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { access, mkdtemp, rm } from "node:fs/promises";
+import fsSync from "node:fs";
 
 const workspaceRoot = process.cwd();
 const browserEvaluateScript = path.join(workspaceRoot, "scripts/browser_evaluate.mjs");
+const tauriLibSource = fsSync.readFileSync(path.join(workspaceRoot, "src-tauri/src/lib.rs"), "utf8");
 
 async function startServer(html) {
   const server = http.createServer((_request, response) => {
@@ -24,9 +28,9 @@ async function startServer(html) {
   };
 }
 
-async function runBrowserEvaluate(input) {
+async function runBrowserEvaluate(input, cwd = workspaceRoot) {
   const child = spawn(process.execPath, [browserEvaluateScript], {
-    cwd: workspaceRoot,
+    cwd,
     stdio: ["pipe", "pipe", "pipe"],
   });
   let stdout = "";
@@ -52,6 +56,7 @@ test("browser evaluator keeps page diagnostics when a body-text wait times out o
     url: server.url,
     waitForText: "MD Viewer",
     timeoutMs: 1000,
+    screenshot: false,
   });
 
   assert.equal(result.status, 200);
@@ -70,10 +75,64 @@ test("browser evaluator completes a DOM validation without a title/body mismatch
     waitForText: "Ready",
     checks: "selector: #app;;title: Ready",
     timeoutMs: 2500,
+    screenshot: false,
   });
 
   assert.equal(result.ok, true);
   assert.equal(result.status, 200);
   assert.equal(result.title, "Ready");
   assert.equal(result.assertions.length, 2);
+});
+
+test("browser evaluator captures a screenshot by default and rejects a blank app shell", async (t) => {
+  const server = await startServer("<!doctype html><title>Blank</title><main id=app></main>");
+  const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), "main-browser-evaluate-"));
+  t.after(server.close);
+  t.after(() => rm(tempWorkspace, { recursive: true, force: true }));
+
+  const result = await runBrowserEvaluate({
+    url: server.url,
+    timeoutMs: 2500,
+  }, tempWorkspace);
+
+  assert.equal(result.ok, false);
+  assert.equal(result.blankPage, true);
+  assert.ok(result.failureReasons.includes("blank_page"));
+  assert.match(result.failureSummary, /blank_page/);
+  assert.match(result.screenshotPath, /^\.MAIN\/browser-validation\/browser-\d+-\d+\.png$/);
+  await access(path.join(tempWorkspace, result.screenshotPath));
+});
+
+test("browser evaluator short-circuits body waits after a page runtime error and preserves evidence", async (t) => {
+  const server = await startServer([
+    "<!doctype html><title>Broken</title><main id=app></main>",
+    "<script>document.querySelector('#missing').onclick = () => {};</script>",
+  ].join(""));
+  const tempWorkspace = await mkdtemp(path.join(os.tmpdir(), "main-browser-error-"));
+  t.after(server.close);
+  t.after(() => rm(tempWorkspace, { recursive: true, force: true }));
+
+  const result = await runBrowserEvaluate({
+    url: server.url,
+    waitForText: "never appears",
+    timeoutMs: 10_000,
+  }, tempWorkspace);
+
+  assert.equal(result.ok, false);
+  assert.ok(result.failureReasons.includes("page_error"));
+  assert.match(result.failureSummary, /Cannot set properties of null|Cannot set property/);
+  assert.ok(result.durationMs < 5000, `runtime error should stop the wait early, got ${result.durationMs}ms`);
+  assert.match(result.screenshotPath, /^\.MAIN\/browser-validation\/browser-\d+-\d+\.png$/);
+  await access(path.join(tempWorkspace, result.screenshotPath));
+});
+
+test("blocking browser and finite command processes stay off the Tauri UI thread", () => {
+  assert.match(
+    tauriLibSource,
+    /async fn browser_evaluate\([\s\S]{0,1200}?tauri::async_runtime::spawn_blocking/,
+  );
+  assert.match(
+    tauriLibSource,
+    /async fn run_command\([\s\S]{0,900}?tauri::async_runtime::spawn_blocking/,
+  );
 });

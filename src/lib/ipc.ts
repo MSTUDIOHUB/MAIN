@@ -70,6 +70,9 @@ export interface BrowserEvaluateInput {
 
 export interface BrowserEvaluateResult {
   ok: boolean;
+  failureSummary?: string;
+  failureReasons?: string[];
+  blankPage?: boolean;
   url?: string;
   finalUrl?: string;
   status?: number | null;
@@ -81,6 +84,8 @@ export interface BrowserEvaluateResult {
   pageErrors?: string[];
   failedRequests?: string[];
   screenshotPath?: string | null;
+  screenshotError?: string | null;
+  renderDiagnostics?: Record<string, unknown> | null;
   textPreview?: string;
   durationMs?: number;
   error?: string | null;

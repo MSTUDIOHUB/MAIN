@@ -100,6 +100,8 @@ test("browser validation schema exposes local Playwright checks", () => {
   assert.ok(browserEvaluate.function.parameters.properties.checks);
   assert.ok(browserEvaluate.function.parameters.properties.wait_for_text);
   assert.ok(browserEvaluate.function.parameters.properties.screenshot);
+  assert.match(browserEvaluate.function.parameters.properties.screenshot.description, /默认 true/);
+  assert.match(browserEvaluate.function.parameters.properties.timeout_ms.description, /默认 15000/);
 });
 
 test("repo_map and apply_patch schemas are exposed for built-in code intelligence and edits", () => {

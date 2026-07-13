@@ -15,6 +15,7 @@ import {
   hasSuccessfulTabularActivity,
 } from "../../orchestrator/planOrchestration";
 import { browserResultLooksSuccessful } from "../../planEvidence";
+import { buildBrowserValidationCacheSignature } from "../../browserValidation";
 import {
   appendPlanRepeatReadLimitGuidance,
   buildGenericObservationContinuationPrompt,
@@ -995,7 +996,9 @@ export async function partitionToolCallsForExecution(input: {
         lifecycleState: "blocked",
       });
     } else {
-      const reviewSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
+      const reviewSignature = tc.name === "browser_evaluate"
+        ? buildBrowserValidationCacheSignature(toolArgs)
+        : buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
       const cachedBrowserValidation = tc.name === "browser_evaluate"
         ? browserValidationCache.get(reviewSignature)
         : undefined;

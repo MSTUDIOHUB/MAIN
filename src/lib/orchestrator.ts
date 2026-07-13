@@ -191,10 +191,15 @@ import {
 } from "./planMaterialization";
 import {
   assessPlanClosureEvidence,
+  browserResultLooksSuccessful,
   buildPlanEvidenceBundle,
   isPlanEvidenceBundleReady,
   type PlanEvidenceBundle,
 } from "./planEvidence";
+import {
+  buildBrowserValidationFailureContent,
+  parseBrowserValidationOutcome,
+} from "./browserValidation";
 import { formatToolPresentation } from "./toolPresentation";
 import {
   buildPlanReadOnlyProgressNarration,
@@ -4072,6 +4077,54 @@ async function executeToolCallWithLifecycle(
           shellPermissionApproval: options.shellPermissionApproval,
         });
     let resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
+
+    if (tc.name === "browser_evaluate") {
+      const browserOutcome = parseBrowserValidationOutcome(resultStr);
+      const browserSucceeded = browserResultLooksSuccessful(resultStr);
+      logAgentEvent("browser_validation_result", {
+        target,
+        ok: browserOutcome?.ok ?? browserSucceeded,
+        blankPage: browserOutcome?.blankPage ?? false,
+        screenshotPath: browserOutcome?.screenshotPath ?? null,
+        failureReasons: browserOutcome?.failureReasons.slice(0, 8) ?? [],
+        failureSummary: browserOutcome?.failureSummary.slice(0, 600) ?? "",
+        pageErrorCount: browserOutcome?.pageErrors.length ?? 0,
+        consoleErrorCount: browserOutcome?.consoleErrors.length ?? 0,
+        failedAssertionCount: browserOutcome?.failedAssertionCount ?? 0,
+        durationMs: browserOutcome?.durationMs ?? null,
+      });
+      if (!browserSucceeded) {
+        const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
+        const budgets = getToolResultBudgets(tc.name, cloudProfile);
+        const failureContent = buildBrowserValidationFailureContent(resultStr);
+        const modelFailureContent = truncateToolContent(failureContent, budgets.modelChars);
+        const displayFailureContent = truncateToolContent(failureContent, budgets.displayChars);
+        callbacks.onToolError(tc.name, target, displayFailureContent, { toolCallId: tc.id });
+        const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
+          toolName: tc.name,
+          toolArgs: resolvedArgs,
+          toolResult: resultStr,
+          isError: true,
+          workspace,
+          workflowMode: callbacks.getWorkflowMode(),
+          language: callbacks.getPreferredLanguage(),
+          associatedPaths: callbacks.getAssociatedPaths(),
+        });
+        return {
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: modelFailureContent,
+          displayContent: displayFailureContent,
+          isError: true,
+          lifecycleState: "failed",
+          additionalContexts: [
+            ...preHookResult.additionalContexts,
+            ...postHookResult.additionalContexts,
+          ],
+        };
+      }
+    }
 
     // Auto Map-Reduce for large files during read_file
     if (tc.name === "read_file" && resultStr.includes("truncated: true") && !resolvedArgs.start_line) {

@@ -587,7 +587,10 @@ export async function executeTool(
         checks: parseOptionalString(args.checks),
         waitForText: parseOptionalString(args.wait_for_text) ?? parseOptionalString(args.waitForText),
         waitForSelector: parseOptionalString(args.wait_for_selector) ?? parseOptionalString(args.waitForSelector),
-        screenshot: args.screenshot === true || args.screenshot === "true",
+        screenshot:
+          args.screenshot === undefined || args.screenshot === null
+            ? undefined
+            : args.screenshot === true || args.screenshot === "true",
         failOnConsoleError:
           args.fail_on_console_error === false || args.fail_on_console_error === "false" ||
           args.failOnConsoleError === false || args.failOnConsoleError === "false"

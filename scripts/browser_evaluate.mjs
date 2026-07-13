@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { mkdir } from "node:fs/promises";
+import { mkdir, readdir, unlink } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -7,6 +7,9 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 const MAX_PREVIEW_CHARS = 4000;
 const MAX_CONSOLE_ITEMS = 80;
 const MAX_FAILED_REQUESTS = 40;
+const MAX_SAVED_SCREENSHOTS = 20;
+const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_FAILURE_SUMMARY_CHARS = 1200;
 
 function clampNumber(value, fallback, min, max) {
   const parsed = Number(value);
@@ -112,6 +115,96 @@ async function bodyText(page) {
   }
 }
 
+async function inspectRenderedPage(page) {
+  return await page.evaluate(() => {
+    const body = document.body;
+    if (!body) {
+      return {
+        bodyTextChars: 0,
+        bodyElementCount: 0,
+        visibleMeaningfulElementCount: 0,
+        visibleInteractiveElementCount: 0,
+        visibleMediaElementCount: 0,
+        visibleBackgroundImageCount: 0,
+        visiblePseudoContentCount: 0,
+        blankPage: true,
+      };
+    }
+
+    const isVisible = (element) => {
+      const style = window.getComputedStyle(element);
+      if (
+        style.display === "none" ||
+        style.visibility === "hidden" ||
+        Number.parseFloat(style.opacity || "1") <= 0
+      ) {
+        return false;
+      }
+      const rect = element.getBoundingClientRect();
+      return rect.width >= 1 && rect.height >= 1 &&
+        rect.bottom >= 0 && rect.right >= 0 &&
+        rect.top <= window.innerHeight && rect.left <= window.innerWidth;
+    };
+
+    const allElements = Array.from(body.querySelectorAll("*"));
+    const visibleElements = allElements.filter(isVisible);
+    const interactiveSelector = [
+      "a[href]",
+      "button",
+      "input",
+      "textarea",
+      "select",
+      "summary",
+      "[contenteditable='true']",
+      "[role='button']",
+      "[role='link']",
+      "[role='textbox']",
+      "[role='checkbox']",
+      "[role='radio']",
+      "[role='tab']",
+    ].join(",");
+    const mediaSelector = "img[src],picture,video,canvas,svg,iframe,object,embed";
+    const semanticSelector = [
+      interactiveSelector,
+      mediaSelector,
+      "table",
+      "pre",
+      "code",
+      "[aria-label]",
+      "[aria-labelledby]",
+    ].join(",");
+    const visibleInteractiveElementCount = visibleElements.filter((element) => element.matches(interactiveSelector)).length;
+    const visibleMediaElementCount = visibleElements.filter((element) => element.matches(mediaSelector)).length;
+    const visibleMeaningfulElementCount = visibleElements.filter((element) => element.matches(semanticSelector)).length;
+    const visibleBackgroundImageCount = visibleElements.filter((element) => {
+      const backgroundImage = window.getComputedStyle(element).backgroundImage;
+      return backgroundImage && backgroundImage !== "none";
+    }).length;
+    const visiblePseudoContentCount = visibleElements.filter((element) => {
+      const before = window.getComputedStyle(element, "::before").content;
+      const after = window.getComputedStyle(element, "::after").content;
+      return [before, after].some((content) => content && content !== "none" && content !== "normal" && content !== "\"\"");
+    }).length;
+    const visibleText = typeof body.innerText === "string" ? body.innerText : body.textContent || "";
+    const normalizedText = String(visibleText).replace(/\s+/g, "").trim();
+    const blankPage = normalizedText.length === 0 &&
+      visibleMeaningfulElementCount === 0 &&
+      visibleBackgroundImageCount === 0 &&
+      visiblePseudoContentCount === 0;
+
+    return {
+      bodyTextChars: normalizedText.length,
+      bodyElementCount: allElements.length,
+      visibleMeaningfulElementCount,
+      visibleInteractiveElementCount,
+      visibleMediaElementCount,
+      visibleBackgroundImageCount,
+      visiblePseudoContentCount,
+      blankPage,
+    };
+  });
+}
+
 async function capturePageDiagnostics(page, result) {
   result.finalUrl = page.url();
   try {
@@ -124,6 +217,72 @@ async function capturePageDiagnostics(page, result) {
   } catch {
     // Keep the navigation result even when body extraction itself fails.
   }
+  try {
+    result.renderDiagnostics = await inspectRenderedPage(page);
+    result.blankPage = result.renderDiagnostics.blankPage === true;
+  } catch {
+    // A page can disappear during failed navigation; retain the other diagnostics.
+  }
+}
+
+async function captureScreenshot(page, result, workspace) {
+  const screenshotDir = path.resolve(workspace, ".MAIN", "browser-validation");
+  await mkdir(screenshotDir, { recursive: true });
+  const screenshotPath = path.join(screenshotDir, `browser-${Date.now()}-${process.pid}.png`);
+  await page.screenshot({ path: screenshotPath, fullPage: true });
+  result.screenshotPath = path.relative(workspace, screenshotPath).replace(/\\/g, "/");
+  try {
+    const staleScreenshots = (await readdir(screenshotDir))
+      .filter((name) => /^browser-\d+(?:-\d+)?\.png$/.test(name))
+      .sort()
+      .slice(0, -MAX_SAVED_SCREENSHOTS);
+    await Promise.all(staleScreenshots.map((name) => unlink(path.join(screenshotDir, name))));
+  } catch {
+    // Retention cleanup is best-effort and must not hide the validation result.
+  }
+}
+
+function finalizeValidationOutcome(result, failOnConsoleError) {
+  const reasons = [];
+  const summaries = [];
+  const addFailure = (reason, summary) => {
+    if (!reasons.includes(reason)) reasons.push(reason);
+    const normalized = String(summary || "")
+      .replace(/\u001b\[[0-?]*[ -/]*[@-~]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+    if (normalized) summaries.push(`${reason}: ${normalized}`);
+  };
+
+  if (result.error) addFailure("runtime_error", result.error);
+  if (typeof result.status === "number" && (result.status < 200 || result.status >= 400)) {
+    addFailure("http_status", `navigation returned HTTP ${result.status}`);
+  }
+  if (failOnConsoleError && result.pageErrors.length > 0) {
+    addFailure("page_error", result.pageErrors[0]);
+  }
+  if (failOnConsoleError && result.consoleErrors.length > 0) {
+    addFailure("console_error", result.consoleErrors[0]);
+  }
+  const failedAssertion = result.assertions.find((item) => item.passed === false);
+  if (failedAssertion) {
+    addFailure("assertion_failed", `${failedAssertion.kind}: ${failedAssertion.value} (${failedAssertion.detail || "failed"})`);
+  }
+  const failedAction = result.actions.find((item) => item.ok === false);
+  if (failedAction) addFailure("action_failed", `${failedAction.kind}: ${failedAction.value}`);
+  const pageWasReached = typeof result.status === "number" || (result.finalUrl && result.finalUrl !== "about:blank");
+  if (result.blankPage && pageWasReached) {
+    const diagnostics = result.renderDiagnostics || {};
+    addFailure(
+      "blank_page",
+      `no visible text or meaningful rendered content after load (bodyElements=${diagnostics.bodyElementCount ?? 0})`,
+    );
+  }
+  if (result.screenshotError) addFailure("screenshot_failed", result.screenshotError);
+
+  result.failureReasons = reasons;
+  result.failureSummary = summaries.join(" | ").slice(0, MAX_FAILURE_SUMMARY_CHARS);
+  result.ok = reasons.length === 0;
 }
 
 function describeWaitForTextFailure(error, expectedText, title) {
@@ -239,12 +398,16 @@ async function main() {
   const startedAt = Date.now();
   const input = JSON.parse((await readStdin()) || "{}");
   const workspace = process.cwd();
-  const timeoutMs = clampNumber(input.timeoutMs ?? input.timeout_ms, 60_000, 1_000, 180_000);
+  const timeoutMs = clampNumber(input.timeoutMs ?? input.timeout_ms, DEFAULT_TIMEOUT_MS, 1_000, 180_000);
   const failOnConsoleError = input.failOnConsoleError ?? input.fail_on_console_error ?? true;
+  const shouldCaptureScreenshot = input.screenshot !== false && input.screenshot !== "false";
   const normalizedUrl = normalizeUrlForBrowser(input.url, workspace);
 
   const result = {
     ok: false,
+    failureSummary: "",
+    failureReasons: [],
+    blankPage: false,
     url: normalizedUrl,
     finalUrl: "",
     status: null,
@@ -256,12 +419,15 @@ async function main() {
     pageErrors: [],
     failedRequests: [],
     screenshotPath: null,
+    screenshotError: null,
+    renderDiagnostics: null,
     textPreview: "",
     durationMs: 0,
     error: null,
   };
 
   let browser;
+  let page;
   try {
     const chromium = await loadChromium();
     browser = await chromium.launch({ headless: true });
@@ -272,7 +438,7 @@ async function main() {
         height: clampNumber(input.viewportHeight ?? input.viewport_height, 900, 240, 2160),
       },
     });
-    const page = await context.newPage();
+    page = await context.newPage();
 
     page.on("console", (message) => {
       const item = { type: message.type(), text: message.text() };
@@ -300,6 +466,10 @@ async function main() {
       // Network idleness is best-effort; SPAs often keep dev connections open.
     }
 
+    if (failOnConsoleError && result.pageErrors.length > 0) {
+      throw new Error(`PAGE_RUNTIME_ERROR: ${result.pageErrors[0]}`);
+    }
+
     if (input.waitForSelector || input.wait_for_selector) {
       await page.locator(String(input.waitForSelector || input.wait_for_selector)).first().waitFor({
         state: "visible",
@@ -323,23 +493,24 @@ async function main() {
     await runChecks(page, input, result);
 
     await capturePageDiagnostics(page, result);
-
-    if (input.screenshot === true || input.screenshot === "true") {
-      const screenshotDir = path.resolve(workspace, ".MAIN", "browser-validation");
-      await mkdir(screenshotDir, { recursive: true });
-      const screenshotPath = path.join(screenshotDir, `browser-${Date.now()}.png`);
-      await page.screenshot({ path: screenshotPath, fullPage: true });
-      result.screenshotPath = path.relative(workspace, screenshotPath).replace(/\\/g, "/");
-    }
-
-    const assertionsPassed = result.assertions.every((item) => item.passed !== false);
-    const actionsPassed = result.actions.every((item) => item.ok !== false);
-    const consolePassed = failOnConsoleError ? result.consoleErrors.length === 0 && result.pageErrors.length === 0 : true;
-    result.ok = actionsPassed && assertionsPassed && consolePassed;
   } catch (error) {
     result.error = error?.message || String(error);
-    result.ok = false;
   } finally {
+    if (page) {
+      try {
+        await capturePageDiagnostics(page, result);
+      } catch {
+        // Preserve the original navigation or action failure.
+      }
+      if (shouldCaptureScreenshot) {
+        try {
+          await captureScreenshot(page, result, workspace);
+        } catch (error) {
+          result.screenshotError = error?.message || String(error);
+        }
+      }
+    }
+    finalizeValidationOutcome(result, failOnConsoleError);
     result.durationMs = Date.now() - startedAt;
     if (browser) {
       try {

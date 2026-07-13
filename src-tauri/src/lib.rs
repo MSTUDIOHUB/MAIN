@@ -4924,23 +4924,29 @@ fn get_pty_status(
 }
 
 #[tauri::command]
-fn run_command(
-    state: State<WorkspaceState>,
+async fn run_command(
+    state: State<'_, WorkspaceState>,
     command: String,
     input: Option<String>,
     timeout_ms: Option<u64>,
     workspace: Option<String>,
     permission_approval: Option<harness::permissions::ShellPermissionApproval>,
 ) -> Result<TerminalCommandOutput, String> {
-    let _lock = get_workspace_write_lock().lock().unwrap();
     let workspace = resolve_workspace_root(&state, workspace)?;
     let timeout = Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(100, 600_000));
-    run_workspace_shell_command(&workspace, command, input, timeout, permission_approval)
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lock = get_workspace_write_lock().lock().map_err(|_| {
+            "RUN_COMMAND_LOCK_POISONED: workspace command lock is unavailable".to_string()
+        })?;
+        run_workspace_shell_command(&workspace, command, input, timeout, permission_approval)
+    })
+    .await
+    .map_err(|error| format!("RUN_COMMAND_TASK_FAILED: {error}"))?
 }
 
 #[tauri::command]
-fn browser_evaluate(
-    state: State<WorkspaceState>,
+async fn browser_evaluate(
+    state: State<'_, WorkspaceState>,
     url: String,
     actions: Option<String>,
     checks: Option<String>,
@@ -4952,6 +4958,34 @@ fn browser_evaluate(
     workspace: Option<String>,
 ) -> Result<Value, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_browser_evaluate_process(
+            workspace,
+            url,
+            actions,
+            checks,
+            wait_for_text,
+            wait_for_selector,
+            screenshot,
+            fail_on_console_error,
+            timeout_ms,
+        )
+    })
+    .await
+    .map_err(|error| format!("BROWSER_EVALUATE_TASK_FAILED: {error}"))?
+}
+
+fn run_browser_evaluate_process(
+    workspace: PathBuf,
+    url: String,
+    actions: Option<String>,
+    checks: Option<String>,
+    wait_for_text: Option<String>,
+    wait_for_selector: Option<String>,
+    screenshot: Option<bool>,
+    fail_on_console_error: Option<bool>,
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
     let script_path = browser_validation_script_path();
     if !script_path.exists() {
         return Err(format!(
@@ -4965,7 +4999,7 @@ fn browser_evaluate(
     })?;
 
     let validation_timeout =
-        Duration::from_millis(timeout_ms.unwrap_or(60_000).clamp(1_000, 180_000));
+        Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(1_000, 180_000));
     let supervisor_timeout = browser_evaluate_supervisor_timeout(validation_timeout);
     let payload = json!({
         "url": url,
@@ -4973,7 +5007,7 @@ fn browser_evaluate(
         "checks": checks.unwrap_or_default(),
         "waitForText": wait_for_text,
         "waitForSelector": wait_for_selector,
-        "screenshot": screenshot.unwrap_or(false),
+        "screenshot": screenshot.unwrap_or(true),
         "failOnConsoleError": fail_on_console_error.unwrap_or(true),
         "timeoutMs": validation_timeout.as_millis() as u64,
     });
