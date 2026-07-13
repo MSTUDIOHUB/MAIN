@@ -10,6 +10,26 @@ export interface TurnInputContextLike {
   attachedFilePaths?: string[];
 }
 
+export type SubagentDelegationPreference =
+  | "unspecified"
+  | "forbidden"
+  | "allowed"
+  | "preferred";
+
+const SUBAGENT_REFERENCE_RE = /(?:sub[\s_-]?agents?|子智能体|子代理|多智能体|multi[\s_-]?agents?|multiple\s+agents?)/i;
+const SUBAGENT_FORBIDDEN_RE = /(?:(?:不要|禁止|无需|不需要|别|不可|不能).{0,24}(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:sub[\s_-]?agents?|子智能体|子代理|多智能体).{0,24}(?:不要|禁止|无需|不需要|不可|不能)|(?:do\s+not|don't|without|no)\s+(?:use\s+)?(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?))/i;
+const SUBAGENT_PARALLEL_RE = /(?:(?:多个|两个|多开|并行|协同|分工).{0,32}(?:sub[\s_-]?agents?|子智能体|子代理|智能体)|(?:sub[\s_-]?agents?|子智能体|子代理|智能体).{0,32}(?:多个|两个|多开|并行|协同|分工)|(?:parallel|multiple|two|several|collaborat(?:e|ion)|divide\s+the\s+work).{0,32}(?:sub[\s_-]?agents?|agents?))/i;
+const SUBAGENT_ALLOWED_RE = /(?:(?:可以|可用|允许|同意|可开启|可使用).{0,28}(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:may|can|allowed\s+to|feel\s+free\s+to).{0,28}(?:use\s+|spawn\s+)?(?:sub[\s_-]?agents?|agents?))/i;
+
+export function resolveSubagentDelegationPreference(input: string): SubagentDelegationPreference {
+  const text = String(input || "").replace(/\s+/g, " ").trim();
+  if (!text || !SUBAGENT_REFERENCE_RE.test(text)) return "unspecified";
+  if (SUBAGENT_FORBIDDEN_RE.test(text)) return "forbidden";
+  if (SUBAGENT_PARALLEL_RE.test(text)) return "preferred";
+  if (SUBAGENT_ALLOWED_RE.test(text)) return "allowed";
+  return "allowed";
+}
+
 type MessageLike = {
   role?: string;
   content?: unknown;
@@ -56,12 +76,24 @@ export function buildTurnIntakeContextBlock(input: {
   if (!hasContext && !String(input.rawUserInput || "").trim()) return "";
 
   const rawUserInput = String(input.rawUserInput || "").trim();
+  const subagentPreference = resolveSubagentDelegationPreference(rawUserInput);
   const lines: string[] = ["[turn_intake]"];
   lines.push(`workflowMode: ${input.workflowMode || "chat"}`);
+  lines.push(`subagentPreference: ${subagentPreference}`);
   lines.push(`imageParts: ${signals.imageParts}`);
   lines.push(`mentionedFiles: ${signals.mentionedFilePaths.length}`);
   for (const path of signals.mentionedFilePaths.slice(0, 12)) {
     lines.push(`@file: ${path}`);
+  }
+
+  if (subagentPreference === "preferred") {
+    lines.push(input.language === "en"
+      ? "delegation: The user prefers parallel subagent collaboration. Before broad exploration, identify useful read-only scopes with disjoint paths; if at least two exist, spawn up to two early while the parent continues non-overlapping work. Do not create filler or duplicate scopes."
+      : "delegation: 用户明确偏好多子智能体并行协作。大范围探索前先识别路径不重叠且有实质价值的只读范围；若至少存在两个，应尽早创建最多两个子智能体，同时主体继续非重叠工作。不要为了凑数制造琐碎或重复范围。");
+  } else if (subagentPreference === "forbidden") {
+    lines.push(input.language === "en"
+      ? "delegation: The user explicitly disabled subagents for this turn."
+      : "delegation: 用户明确要求本轮不使用子智能体。");
   }
   lines.push(`attachedFiles: ${signals.attachedFilePaths.length}`);
   for (const path of signals.attachedFilePaths.slice(0, 12)) {

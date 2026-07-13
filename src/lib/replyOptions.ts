@@ -229,7 +229,7 @@ export function hasOnlyInferredReplyOptions(replyOptions: ReplyOption[]): boolea
  * Numbered prose, compatibility inference and model work orders are all
  * runtime work, not a new user decision.
  */
-function hasExplicitApprovedPlanDecisionOptions(replyOptions: ReplyOption[]): boolean {
+export function hasExplicitUserOwnedMutationDecisionOptions(replyOptions: ReplyOption[]): boolean {
   if (!Array.isArray(replyOptions) || replyOptions.length < 2) return false;
   const explicitOptions = replyOptions.every((option) => {
     const text = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
@@ -249,6 +249,42 @@ function hasExplicitApprovedPlanDecisionOptions(replyOptions: ReplyOption[]): bo
     return USER_OWNED_PLAN_DECISION_RE.test(text);
   }).length;
   return userOwnedDecisionOptionCount >= Math.min(2, replyOptions.length);
+}
+
+/**
+ * Mutation-capable runtimes already own implementation sequencing and tool
+ * approval. They may yield only for a decision whose alternatives are
+ * genuinely owned by the user.
+ */
+export function shouldSuppressMutationRuntimeReplyOptions(params: {
+  replyOptions: ReplyOption[];
+  runtimeIntent?: string | null;
+  toolCallCount?: number;
+  visibleText?: string;
+}): boolean {
+  if (!Array.isArray(params.replyOptions) || params.replyOptions.length === 0) return false;
+  if (!["execute", "goal", "studio_workflow"].includes(String(params.runtimeIntent || ""))) {
+    return false;
+  }
+  if ((params.toolCallCount || 0) > 0) return true;
+  if (hasExplicitUserOwnedMutationDecisionOptions(params.replyOptions)) return false;
+
+  const visibleText = normalizeOptionText(params.visibleText || "");
+  const explicitDecisionOptions = params.replyOptions.length >= 2 &&
+    params.replyOptions.length <= 4 &&
+    params.replyOptions.every((option) => {
+      const text = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+      return option.source === "explicit_user_options" &&
+        !option.action &&
+        !isInferredModelActionOrDiagnostic(text) &&
+        !looksLikeInternalPlanArtifactStep(text) &&
+        !INTERNAL_PLAN_WORK_ORDER_OPTION_RE.test(text);
+    });
+  const visibleDecisionBoundary =
+    BLOCKING_PLAN_DECISION_TEXT_RE.test(visibleText) ||
+    INTERACTIVE_PLAN_DECISION_CUE_RE.test(visibleText);
+
+  return !(explicitDecisionOptions && visibleDecisionBoundary);
 }
 
 function hasExplicitUnapprovedPlanDecisionOptions(replyOptions: ReplyOption[]): boolean {
@@ -594,7 +630,7 @@ export function shouldSuppressApprovedPlanExecutionReplyOptions(params: {
   // decide its own next internal action. Tool/permission decisions have their
   // dedicated action-request paths instead.
   if ((params.toolCallCount || 0) > 0) return true;
-  return !hasExplicitApprovedPlanDecisionOptions(params.replyOptions);
+  return !hasExplicitUserOwnedMutationDecisionOptions(params.replyOptions);
 }
 
 export function shouldRouteUnapprovedPlanReplyOptionsToArtifact(params: {
@@ -868,7 +904,7 @@ export function shouldPauseForReplyOptions(params: {
   // without calls only an explicit, non-runtime user decision may pause it.
   if (workflowMode === "plan" && isPlanApproved) {
     if (toolCallCount > 0) return false;
-    return hasExplicitApprovedPlanDecisionOptions(replyOptions);
+    return hasExplicitUserOwnedMutationDecisionOptions(replyOptions);
   }
   if (
     workflowMode === "plan" &&

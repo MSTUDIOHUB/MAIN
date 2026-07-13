@@ -102,9 +102,19 @@ export function createAgentLoopRuntimeActions(input: {
     reason,
     context = {},
   ) => {
+    const repeatedTargets = Array.isArray(context.repeatedTargets)
+      ? context.repeatedTargets.filter((target): target is string => typeof target === "string" && !!target.trim())
+      : [];
+    const expectedTarget = typeof context.expectedTarget === "string"
+      ? context.expectedTarget
+      : typeof context.target === "string"
+        ? context.target
+        : repeatedTargets.length === 1
+          ? repeatedTargets[0]
+          : null;
     const nextState = activateExecuteRecoveryRuntimeState(
       getExecuteRecoveryState(),
-      { mode, reason },
+      { mode, reason, expectedTarget },
     );
     setExecuteRecoveryState(nextState);
     logAgentEvent("execute_recovery_activated", {
@@ -114,7 +124,7 @@ export function createAgentLoopRuntimeActions(input: {
       reason,
       recoveryToolSurface: describeExecuteRecoveryToolSurface(
         nextState.mode,
-        shouldAllowExecuteRecoveryFileRead(recentToolActivity),
+        shouldAllowExecuteRecoveryFileRead(recentToolActivity, nextState.mode),
       ),
       ...context,
     });

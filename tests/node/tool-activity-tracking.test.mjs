@@ -313,6 +313,19 @@ test("tool activity tracking records bounded recent activity and helper classifi
     content: JSON.stringify({ ok: false, error: "assertion failed" }),
   })), false);
   assert.equal(isVerificationEvidenceResult(result({ name: "run_command", isError: true })), false);
+  assert.equal(isVerificationEvidenceResult(result({
+    name: "run_command",
+    isError: false,
+    content: formatToolFeedbackEnvelope({
+      status: "failed",
+      toolCallId: "run_structured_failed",
+      tool: "run_command",
+      target: "npm test",
+      content: JSON.stringify({ exitCode: 0, stdout: "passed" }),
+    }),
+  })), false, "structured failure status must override success-looking command output");
+  assert.equal(isVerificationEvidenceResult(result({ name: "git_diff", isError: false })), false);
+  assert.equal(isVerificationEvidenceResult(result({ name: "clear_pty_buffer", isError: false })), false);
 });
 
 test("Plan evidence activity outlives the short loop-detection window and merges rereads", () => {
@@ -432,7 +445,7 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
   assert.match(executionHarness.digests[0], /read_file src\/lib\/modelLaneCoordinator\.ts/);
 });
 
-test("tool result post-processing records source-write evidence digest and recovery reset", () => {
+test("tool result post-processing records source-write evidence without clearing recovery before validation", () => {
   const harness = createPostProcessingInput();
 
   const post = handleToolResultPostProcessing(harness.input);
@@ -440,10 +453,7 @@ test("tool result post-processing records source-write evidence digest and recov
   assert.equal(post.recentSuccessfulProjectWrite?.target, "src/App.tsx");
   assert.equal(post.recoveringFromEmptyAssistantReplyAfterWrite, false);
   assert.ok(harness.executeEvidenceMarks.length >= 1);
-  assert.deepEqual(harness.clearRecoveryCalls, [{
-    reason: "action_evidence_observed",
-    resetTarget: "src/App.tsx",
-  }]);
+  assert.deepEqual(harness.clearRecoveryCalls, []);
   assert.equal(post.remainingTaskText, "Run validation");
   assert.equal(post.nonReadOnlySuccessfulResultCount, 1);
   assert.equal(post.successfulReadOnlyExplorationResultCount, 0);

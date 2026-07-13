@@ -197,6 +197,7 @@ import {
   isPlanEvidenceBundleReady,
   type PlanEvidenceBundle,
 } from "./planEvidence";
+import { VERIFICATION_TOOL_NAMES } from "./verificationEvidence";
 import {
   buildBrowserValidationFailureContent,
   parseBrowserValidationOutcome,
@@ -273,16 +274,7 @@ const GLOBAL_CHAT_ALWAYS_ALLOWED_TOOL_NAMES = new Set([
   ...WEB_RESEARCH_TOOL_NAMES,
   ...KNOWLEDGE_TOOL_NAMES,
 ]);
-export const EXECUTION_VERIFICATION_TOOL_NAMES = new Set([
-  "run_command",
-  "browser_evaluate",
-  "execute_command",
-  "send_pty_input",
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
-]);
+export const EXECUTION_VERIFICATION_TOOL_NAMES = VERIFICATION_TOOL_NAMES;
 
 const MCP_EDIT_TOOL_NAMES = new Set(["script_apply_edits", "apply_text_edits", "manage_script", "create_script", "delete_script"]);
 export const EDIT_PROGRESS_TOOL_NAMES = new Set([
@@ -1314,6 +1306,11 @@ export interface OrchestratorCallbacks {
   getGoalTurnContract?: () => import("./goalState").GoalTurnContract | null;
   getExecutionConsentGranted?: () => boolean;
   getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
+  getForcedExecuteRecoveryState?: () => {
+    mode: ExecuteRecoveryMode;
+    reason?: string | null;
+    expectedTarget?: string | null;
+  } | null;
   getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";
   getIsPlanApproved: () => boolean;
@@ -1337,6 +1334,11 @@ export interface OrchestratorCallbacks {
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
   onModelUsage?: (usage: NonNullable<StreamResult["usage"]>) => void;
+  onExecuteRecoveryStateChange?: (state: {
+    mode: ExecuteRecoveryMode;
+    reason: string;
+    expectedTarget: string | null;
+  }) => void;
   getPendingSubagentIds?: () => string[];
   runSubagent?: (
     request: import("./subagents").SpawnSubagentRequest,

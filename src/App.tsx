@@ -62,6 +62,7 @@ import {
 } from "./lib/imageStudioSessions";
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
+import { shouldContinueGoalFromUserChoice } from "./lib/goalChoiceContinuation";
 import { materializePlanArtifactFromVisibleText } from "./lib/planMaterialization";
 import { runAfterNextPaint } from "./lib/uiScheduling";
 import { checkForMainUpdate, installMainUpdate, type MainUpdateInfo, type MainUpdateProgress } from "./lib/updater";
@@ -1623,7 +1624,24 @@ export default function App() {
     const shouldReuseSourceTurn = !!sourceTurnId && !!sourceTurn && exactChoiceIdentity;
     const shouldExecuteFromQuickReply =
       optionAction === "execute_once" || optionAction === "approve_operation_once";
+    const shouldContinueExistingGoal = shouldContinueGoalFromUserChoice({
+      sourceIntent,
+      sourceTurnId,
+      activeGoal: state.activeGoal,
+      goalStatus: state.goalStatus,
+      activeActionRequest: state.activeActionRequest,
+      choiceRequest,
+    });
     const executeQuickReplyIntent = state.selectedMainModeKey === "game_studio" ? "studio_workflow" as const : "execute" as const;
+
+    if (shouldContinueExistingGoal) {
+      appendDebugLog("info", "ui.quickReply_goal_continuation", {
+        sourceTurnId,
+        goalId: state.activeGoal?.id || null,
+        requestId: choiceRequest?.requestId || null,
+        guidanceChars: text.length,
+      });
+    }
 
     if (optionAction === "cancel_operation") {
       useAppStore.setState((s) => ({
@@ -1653,13 +1671,22 @@ export default function App() {
       ? {
           reuseCurrentTurn: true,
           preservePlanState: sourceIntent === "plan",
-          resolvedIntent: shouldExecuteFromQuickReply ? executeQuickReplyIntent : sourceIntent,
+          resolvedIntent: shouldContinueExistingGoal
+            ? "goal" as const
+            : shouldExecuteFromQuickReply ? executeQuickReplyIntent : sourceIntent,
           replyOptionSourceTurnId: sourceTurnId,
           selectedReplyOptionText: text,
           replyOptionRequestIdentity: choiceRequest,
           replyOptionIsCustom: isCustomReply,
           parentRunIdOverride: choiceRequest?.runId,
-          ...(shouldExecuteFromQuickReply
+          ...(shouldContinueExistingGoal
+            ? {
+                runtimeIntentOverride: "goal" as const,
+                executionConsentGranted: true,
+                continueExistingGoal: true,
+                goalContinuationGuidance: text,
+              }
+            : shouldExecuteFromQuickReply
             ? {
                 runtimeIntentOverride: executeQuickReplyIntent,
                 executionConsentGranted: true,

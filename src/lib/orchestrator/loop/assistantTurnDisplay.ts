@@ -6,6 +6,7 @@ import {
   hasOnlyReadOnlyPermissionReplyOptions,
   shouldAutoContinueReadOnlyPermission,
   shouldRouteUnapprovedPlanReplyOptionsToArtifact,
+  shouldSuppressMutationRuntimeReplyOptions,
   shouldSuppressApprovedPlanExecutionReplyOptions,
   stripReadOnlyPermissionPrompt,
 } from "../../replyOptions";
@@ -30,6 +31,7 @@ export interface AssistantTurnDisplayDecision {
   suppressExecutableProposalOptionsForToolCalls: boolean;
   suppressInferredReplyOptionsForToolCalls: boolean;
   suppressApprovedPlanExecutionReplyOptions: boolean;
+  suppressMutationRuntimeReplyOptions: boolean;
   suppressInferredOperationApprovalAfterExecution: boolean;
   suppressNonDecisionReplyOptions: boolean;
   currentPlanStageForReview: PlanStage;
@@ -143,12 +145,22 @@ export function resolveAssistantTurnDisplayDecision(input: {
       planStage: currentPlanStageForReview,
       toolCallCount: input.effectiveToolCallCount,
     });
+  const suppressMutationRuntimeReplyOptions =
+    !suppressApprovedPlanExecutionReplyOptions &&
+    !(input.workflowMode === "plan" && !input.isPlanApproved) &&
+    shouldSuppressMutationRuntimeReplyOptions({
+      replyOptions: normalizedReplyOptions,
+      runtimeIntent: input.runtimeIntent,
+      toolCallCount: input.effectiveToolCallCount,
+      visibleText: input.normalizedVisibleText,
+    });
   const suppressNonDecisionReplyOptions =
     suppressReadOnlyPermissionOptions ||
     suppressPlanContinuationReplyOptions ||
     suppressExecutableProposalOptionsForToolCalls ||
     suppressInferredReplyOptionsForToolCalls ||
-    suppressApprovedPlanExecutionReplyOptions;
+    suppressApprovedPlanExecutionReplyOptions ||
+    suppressMutationRuntimeReplyOptions;
   const hasStructuredProposal = input.workflowMode === "plan"
     ? hasTieredPlanProposal(input.streamText)
     : hasExplicitPlanProposal(input.streamText);
@@ -188,6 +200,7 @@ export function resolveAssistantTurnDisplayDecision(input: {
     suppressExecutableProposalOptionsForToolCalls,
     suppressInferredReplyOptionsForToolCalls,
     suppressApprovedPlanExecutionReplyOptions,
+    suppressMutationRuntimeReplyOptions,
     suppressInferredOperationApprovalAfterExecution,
     suppressNonDecisionReplyOptions,
     currentPlanStageForReview,

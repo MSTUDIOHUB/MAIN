@@ -39,6 +39,7 @@ const {
   extractPrimaryUserRequestText,
   extractTurnInputContextSignalsFromMessages,
   hasTurnProvidedContext,
+  resolveSubagentDelegationPreference,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnIntake.ts"));
 
 test("turn intake block makes screenshots and files first-class context", () => {
@@ -121,4 +122,36 @@ test("primary request extraction keeps original plan target for continue turns",
     extractPrimaryUserRequestText(block),
     "修复 MAIN 的计划审批按钮无响应问题\n继续",
   );
+});
+
+test("turn intake distinguishes preferred, allowed, and forbidden subagent delegation", () => {
+  assert.equal(
+    resolveSubagentDelegationPreference("可以开启多个subagent协同工作"),
+    "preferred",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference("可以使用一个 subagent 帮忙检查"),
+    "allowed",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference("这次不要使用子智能体"),
+    "forbidden",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference("修复启动白屏"),
+    "unspecified",
+  );
+});
+
+test("preferred subagent collaboration becomes an explicit runtime intake contract", () => {
+  const block = buildTurnIntakeContextBlock({
+    rawUserInput: "修复启动白屏，可以开启多个subagent协同工作",
+    signals: {},
+    language: "zh",
+    workflowMode: "edit",
+  });
+
+  assert.match(block, /subagentPreference: preferred/);
+  assert.match(block, /路径不重叠/);
+  assert.match(block, /尽早创建最多两个子智能体/);
 });

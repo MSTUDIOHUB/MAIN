@@ -283,6 +283,42 @@ test("approved handoffs preserve a preallocated child run id through the submiss
   assert.equal(persisted.parentRunId, "run-review");
 });
 
+test("Goal choice continuations append guidance without creating a replacement Goal", () => {
+  const agentMessages = [{ role: "assistant", content: "Choose startup behavior" }];
+  let persisted;
+  const lease = startSubmitRunLease({
+    userContent: "显示欢迎页",
+    canonicalUserText: "显示欢迎页",
+    currentImages: [],
+    runSessionKey: "workspace-a:7",
+    runWorkspace: "/repo",
+    runSessionId: 7,
+    turnId: "turn-goal",
+    effectiveRunIntent: "goal",
+    runtimeRunIntent: "goal",
+    continueExistingGoal: true,
+    parentRunIdOverride: "run-goal:slice:1",
+    getRuntimeSnapshot: () => ({
+      agentMessagesLength: agentMessages.length,
+      planStage: "idle",
+      isPlanApproved: false,
+    }),
+    appendAgentMessage: (message) => agentMessages.push(message),
+    createAbortController: () => ({ signal: { aborted: false } }),
+    setAbortController: () => {},
+    startGoal: () => assert.fail("a Goal continuation must retain the existing Goal"),
+    getCurrentHarnessInstanceId: () => "instance-a",
+    persistHarnessRunMarker: (marker) => (persisted = marker),
+    setHarnessRunMarker: () => {},
+    nowMs: () => 792,
+  });
+
+  assert.deepEqual(agentMessages.at(-1), { role: "user", content: "显示欢迎页" });
+  assert.equal(lease.parentRunId, "run-goal:slice:1");
+  assert.equal(persisted.workflowMode, "edit");
+  assert.equal(persisted.runtimeIntent, "goal");
+});
+
 test("harness run ownership distinguishes sequential loops on the same conversation turn", () => {
   const marker = {
     status: "running",

@@ -291,17 +291,25 @@ test("assistant turn display completes evidenced execution instead of reopening 
 
 test("assistant turn display preserves explicit blocking choices after execution evidence", () => {
   const decision = resolveDecision({
-    normalizedVisibleText: "发现两条会改变用户可见行为的实现路径，请选择。",
-    normalizedReplyOptions: [{
-      label: "保留旧行为",
-      value: "保留旧行为",
-      source: "explicit_user_options",
-    }],
+    normalizedVisibleText: "启动行为存在两个都可实现的产品方向，请选择。",
+    normalizedReplyOptions: [
+      {
+        label: "保留旧行为",
+        value: "保留旧行为",
+        source: "explicit_user_options",
+      },
+      {
+        label: "显示欢迎页",
+        value: "显示欢迎页",
+        source: "explicit_user_options",
+      },
+    ],
     sawExecuteOperationEvidence: true,
   });
 
   assert.equal(decision.suppressInferredOperationApprovalAfterExecution, false);
-  assert.equal(decision.finalReplyOptions.length, 1);
+  assert.equal(decision.suppressMutationRuntimeReplyOptions, false);
+  assert.equal(decision.finalReplyOptions.length, 2);
 });
 
 test("structured Plan output preserves explicit blocking user options", () => {
@@ -332,7 +340,7 @@ test("structured Plan output preserves explicit blocking user options", () => {
   assert.equal(decision.finalReplyOptions.length, 2);
 });
 
-test("assistant turn display keeps inferred approval for a real post-evidence decision before completion", () => {
+test("assistant turn display suppresses inferred reapproval during mutation execution", () => {
   const decision = resolveDecision({
     normalizedVisibleText: "A newly discovered compatibility choice must be decided before continuing.",
     normalizedReplyOptions: [{
@@ -345,7 +353,31 @@ test("assistant turn display keeps inferred approval for a real post-evidence de
   });
 
   assert.equal(decision.suppressInferredOperationApprovalAfterExecution, false);
-  assert.equal(decision.finalReplyOptions.length, 1);
+  assert.equal(decision.suppressMutationRuntimeReplyOptions, true);
+  assert.equal(decision.finalReplyOptions.length, 0);
+});
+
+test("Goal suppresses model-owned analysis and approval branches from the Qwen regression", () => {
+  const decision = resolveDecision({
+    turnIntent: "goal",
+    runtimeIntent: "goal",
+    normalizedVisibleText: "根因已经定位，下一步准备继续处理。",
+    normalizedReplyOptions: [
+      {
+        label: "我来确认修复方案，开始执行",
+        value: "我来确认修复方案，开始执行",
+        source: "explicit_user_options",
+      },
+      {
+        label: "先查看完整的 git diff 了解当前变更状态",
+        value: "先查看完整的 git diff 了解当前变更状态",
+        source: "explicit_user_options",
+      },
+    ],
+  });
+
+  assert.equal(decision.suppressMutationRuntimeReplyOptions, true);
+  assert.equal(decision.finalReplyOptions.length, 0);
 });
 
 test("plain structured markdown remains a tier-3 proposal only inside Plan workflow", () => {

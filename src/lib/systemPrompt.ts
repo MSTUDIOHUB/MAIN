@@ -901,6 +901,8 @@ export function buildSystemPrompt(
       "2. 遵守当前工具与审批边界。需要许可、用户决策或外部验证时明确给出 blocker，由运行时进入等待输入状态。",
       "3. 结束前简要总结新增进展、验证证据、未解决阻塞和下一步；不要重复已经保留在上下文中的分析。",
       "4. 只有当全部完成标准都有工具证据支持时才输出 GOAL_COMPLETION_CANDIDATE；该标记只是候选，运行时证据门禁拥有最终决定权。",
+      "5. Goal 已经拥有本目标的执行授权。禁止输出 approve_operation_once、再次批准执行或把读取、修改、验证顺序包装成用户选项；这些都是 Goal Runtime 自己应继续完成的工作。",
+      "6. 只有真正由用户拥有的产品行为、业务规则、范围边界、技术选型或优先级分叉才能使用 `<user_options>`，并给出 2-4 个互斥选项。",
       goalTurnContract?.context || "[Goal Runtime contract unavailable: do not claim completion; report the missing contract as a blocker.]",
     ].join("\n"));
   } else if (turnIntent === "execute" || turnIntent === "studio_workflow") {

@@ -48,6 +48,7 @@ import {
   registerToolCallForRepeatGuard,
 } from "../../repetitionGuard";
 import { isPlanTaskTrustedComplete } from "../../workflowModels";
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import {
   isToolAutoExecutableForCall,
   type ToolCapabilityRegistry,
@@ -303,18 +304,24 @@ export function handleNoProgressRecovery(input: {
 
   const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
   if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
-    const language = callbacks.getPreferredLanguage();
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    activateTrackedExecuteRecovery("mutation_first", "read_file_only_loop", {
+    activateTrackedExecuteRecovery("patch_recovery_read", "read_file_only_loop", {
       repeatedTargets,
     });
-    pendingExecuteRecoveryPrompt = language === "zh"
-      ? `## 警告：只读循环检测器触发\n你当前已连续 ${consecutiveReadFileOnlyCacheHits} 轮重复读取同一批文件（命中缓存）。\n**下一条回复必须满足以下要求：**\n1. 立即停止重复调用 \`read_file\`。\n2. 必须执行具有修改性质的动作：调用 \`apply_patch\` / \`write_file\` 修改代码，或使用 \`run_command\` 重新运行打包/编译命令来获取最新反馈。\n3. 如果遇到阻碍，请直接向用户说明具体阻塞原因。`
-      : `## WARNING: Read-Only Loop Detector Triggered\nYou have consecutively read the same cached files for ${consecutiveReadFileOnlyCacheHits} iterations without taking action.\n**Your next reply MUST fulfill the following requirements:**\n1. Stop calling \`read_file\` repeatedly.\n2. You MUST perform a mutation or verification: call \`apply_patch\` / \`write_file\` to edit code, or use \`run_command\` to run build/compile commands to get fresh output.\n3. If blocked, state the concrete reason directly to the user.`;
+    pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
+      language: callbacks.getPreferredLanguage(),
+      reason: "read_file_only_loop",
+      mode: "patch_recovery_read",
+      repeatedTargets,
+      recentActivity: recentToolActivity,
+      allowFileRead: true,
+    });
   }
 
   const executeReadOnlyRecovery =
-    workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)
+    workflowMode === "edit" &&
+    isMutationRuntimeIntent(runtimeIntent) &&
+    currentExecuteRecoveryMode === "normal"
       ? resolveExecuteReadOnlyRecoveryTrigger({
           results,
           recentActivity: recentToolActivity,
@@ -334,11 +341,10 @@ export function handleNoProgressRecovery(input: {
   if (executeReadOnlyRecovery.shouldRecover) {
     const language = callbacks.getPreferredLanguage();
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    const allowFileRead = shouldAllowExecuteRecoveryFileRead(recentToolActivity);
     if (currentExecuteRecoveryAttempts < 2) {
-      const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = allowFileRead
-        ? "patch_recovery_read"
-        : "mutation_first";
+      // Give every provider one causal context step. The partition executes a
+      // single read and defers any same-response edit until that result exists.
+      const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = "patch_recovery_read";
       activateTrackedExecuteRecovery(nextMode, executeReadOnlyRecovery.reason, {
         readOnlyActivityCount: executeReadOnlyRecovery.readOnlyActivityCount,
         batchToolChars: executeReadOnlyRecovery.batchToolChars,
@@ -350,7 +356,7 @@ export function handleNoProgressRecovery(input: {
         mode: nextMode,
         repeatedTargets,
         recentActivity: recentToolActivity,
-        allowFileRead,
+        allowFileRead: shouldAllowExecuteRecoveryFileRead(recentToolActivity, nextMode),
       });
     } else {
       const remainingText = callbacks.getPreferredLanguage() === "zh"
@@ -688,15 +694,19 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
 
   let blockedReadFileDetected = false;
   for (const result of results) {
+    if (result.internalFeedback) continue;
     if (result.name !== "read_file") continue;
     const target = result.target;
     if (!target) continue;
+    const trackedTarget = [...crossIterationFileReads.keys()].find((candidate) =>
+      workspacePathsReferToSameFile(candidate, target)
+    ) || target;
 
     if (!result.isError) {
-      crossIterationFileReads.set(target, (crossIterationFileReads.get(target) || 0) + 1);
-      const count = crossIterationFileReads.get(target)!;
+      crossIterationFileReads.set(trackedTarget, (crossIterationFileReads.get(trackedTarget) || 0) + 1);
+      const count = crossIterationFileReads.get(trackedTarget)!;
       const crossReadThreshold = resolveCrossIterationReadThreshold(snapshotContextLimit);
-      if (count >= crossReadThreshold) {
+      if (count >= crossReadThreshold && executeRecoveryMode === "normal") {
         const language = callbacks.getPreferredLanguage();
         const reason = "cross_iteration_file_read_loop";
         executeRecoveryMode = "mutation_first";
@@ -720,7 +730,7 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
       continue;
     }
 
-    if (executeRecoveryMode !== "normal" || (crossIterationFileReads.get(target) ?? 0) >= 2) {
+    if (executeRecoveryMode !== "normal" || (crossIterationFileReads.get(trackedTarget) ?? 0) >= 2) {
       blockedReadFileDetected = true;
     }
   }

@@ -1,3 +1,5 @@
+import { workspacePathsReferToSameFile } from "./workspacePaths";
+
 export interface ApprovedPlanRecoveryActivityLike {
   name?: string;
   target?: string;
@@ -106,7 +108,7 @@ function isSuccessfulRecoveryResolution(
   mismatchTarget: string,
 ): boolean {
   if (activity.status === "failed") return false;
-  if (normalizeRecoveryTarget(activity.target) !== mismatchTarget) return false;
+  if (!workspacePathsReferToSameFile(String(activity.target || ""), mismatchTarget)) return false;
   return activity.name === "read_file" ||
     (typeof activity.name === "string" && APPROVED_PLAN_SOURCE_EDIT_TOOLS.has(activity.name));
 }
@@ -118,7 +120,7 @@ function isSuccessfulRecoveryResolution(
 export function resolveApprovedPlanPatchRecoveryTarget(
   recentActivity: ApprovedPlanRecoveryActivityLike[],
 ): string | null {
-  const recent = recentActivity.slice(-8);
+  const recent = recentActivity.slice(-12);
   for (let index = recent.length - 1; index >= 0; index -= 1) {
     const activity = recent[index];
     if (!isPatchMismatchRecoveryActivity(activity)) continue;
@@ -140,7 +142,7 @@ export function shouldBypassApprovedPlanReadCacheForPatchRecovery(input: {
 }): boolean {
   if (input.toolName !== "read_file" || !input.allowFileRead) return false;
   const recoveryTarget = resolveApprovedPlanPatchRecoveryTarget(input.recentActivity);
-  return recoveryTarget !== null && normalizeRecoveryTarget(input.target) === recoveryTarget;
+  return recoveryTarget !== null && workspacePathsReferToSameFile(input.target, recoveryTarget);
 }
 
 export function isApprovedPlanRecoveryToolName(

@@ -3,6 +3,8 @@
 // Tracks goal definition, iteration progress, and checkpoints.
 // ────────────────────────────────────────────────────────────────────
 
+import type { ExecuteRecoveryMode } from "./executeRecoveryTools";
+
 export type GoalStatus =
   | "active"           // Currently executing
   | "pausing"          // Abort/checkpoint requested; waiting for a safe boundary
@@ -147,6 +149,12 @@ export interface GoalContinuationState {
   messageCountBefore: number;
   compacted: boolean;
   operationCount: number;
+  /** Exact provider-neutral recovery transaction captured at the slice boundary. */
+  executeRecoveryState?: {
+    mode: ExecuteRecoveryMode;
+    reason: string;
+    expectedTarget: string | null;
+  };
 }
 
 export interface GoalOperationSummary {

@@ -88,7 +88,6 @@ export function handleToolResultPostProcessing(input: {
   activateUnityMcpFallback: (reason: string) => void;
   setPlanRuntimePhase: SetPlanRuntimePhase;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
-  clearExecuteRecovery: (reason: string, resetTarget?: string) => void;
 }): ToolResultPostProcessingResult {
   const {
     callbacks,
@@ -108,7 +107,6 @@ export function handleToolResultPostProcessing(input: {
     activateUnityMcpFallback,
     setPlanRuntimePhase: commitPlanRuntimePhase,
     emitTaskOrchestratorPhase,
-    clearExecuteRecovery,
   } = input;
 
   let recentSuccessfulProjectWrite = input.recentSuccessfulProjectWrite;
@@ -417,14 +415,6 @@ export function handleToolResultPostProcessing(input: {
     approvedPlanNoToolRecoveryFileReadActive = false;
     approvedPlanNoProgressRecoveryAttempts = 0;
   }
-  if (workflowMode === "edit" && nonReadOnlySuccessfulResultCount > 0) {
-    const firstSuccessTarget = externalResults.find(
-      (result) => resultCountsAsExecutionEvidence(result) &&
-        !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
-    )?.target;
-    clearExecuteRecovery("action_evidence_observed", firstSuccessTarget || undefined);
-  }
-
   return {
     planRuntimePhase: effectivePlanRuntimePhase,
     recentSuccessfulProjectWrite,

@@ -1317,6 +1317,8 @@ export interface AppState {
       remoteFeishu?: FeishuRemoteContext;
       skipAutoPlanHydration?: boolean;
       parentRunIdOverride?: string;
+      continueExistingGoal?: boolean;
+      goalContinuationGuidance?: string;
       /** Reserved child run identity for an approved Plan handoff. */
       runIdOverride?: string;
     },
@@ -7375,6 +7377,8 @@ export const useAppStore = create<AppState>()(
     replyOptionIsCustom?: boolean;
     parentRunIdOverride?: string;
     runIdOverride?: string;
+    continueExistingGoal?: boolean;
+    goalContinuationGuidance?: string;
   }) => {
     let state = get();
     const pendingReviewTransition = applySubmitPendingReviewTransition({

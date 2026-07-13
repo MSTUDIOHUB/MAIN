@@ -272,6 +272,10 @@ export interface SubmitPipelineOptions {
   replyOptionRequestIdentity?: UserChoiceResolutionIdentity;
   replyOptionIsCustom?: boolean;
   parentRunIdOverride?: string;
+  /** Identity-validated quick reply that continues the current Goal in-place. */
+  continueExistingGoal?: boolean;
+  /** One-shot user choice injected into the next Goal continuation contract. */
+  goalContinuationGuidance?: string;
 }
 
 export interface SubmitPipelineSnapshot {
@@ -843,6 +847,7 @@ export function resolveSubmitEffectiveIntentDecision(
 
   if (
     shouldExecuteOnceFromReplyOption &&
+    options?.continueExistingGoal !== true &&
     effectiveRunIntent !== "execute" &&
     effectiveRunIntent !== "studio_workflow"
   ) {

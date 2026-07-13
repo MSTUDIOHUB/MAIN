@@ -25,6 +25,8 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   turnId: string;
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
+  /** Continue the identity-validated active Goal instead of creating a new one. */
+  continueExistingGoal?: boolean;
   /** Exact paused run that an action continuation resumes. */
   parentRunIdOverride?: string;
   /** Preallocated child owner for approval handoffs. */
@@ -88,7 +90,7 @@ export function startSubmitRunLease<TAbortController>(
   const abortController = input.createAbortController();
   input.setAbortController(abortController);
 
-  if (input.effectiveRunIntent === "goal") {
+  if (input.effectiveRunIntent === "goal" && input.continueExistingGoal !== true) {
     const canonicalObjective = String(input.canonicalUserText || "").trim() || input.userContent.trim();
     input.startGoal(
       canonicalObjective,

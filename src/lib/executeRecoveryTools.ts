@@ -1,3 +1,5 @@
+import { workspacePathsReferToSameFile } from "./workspacePaths";
+
 export type ExecuteRecoveryMode =
   | "normal"
   | "mutation_first"
@@ -20,6 +22,20 @@ export interface ExecuteRecoveryResultLike {
   displayContent?: string;
   isError?: boolean;
   internalFeedback?: boolean;
+}
+
+export interface ExecuteRecoveryBatchCallLike {
+  id: string;
+  name: string;
+  target?: string;
+}
+
+export interface ExecuteRecoveryBatchDecision {
+  active: boolean;
+  phase: "normal" | "need_context" | "need_mutation" | "need_validation" | "legacy_action";
+  selectedCallId: string | null;
+  selectedToolName: string | null;
+  deferredCallIds: string[];
 }
 
 export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
@@ -81,35 +97,137 @@ export function isExecutePatchMismatchRecoveryActivity(activity: ExecuteRecovery
 }
 
 export function shouldAllowExecuteRecoveryFileRead(
-  recentActivity: ExecuteRecoveryActivityLike[],
+  _recentActivity: ExecuteRecoveryActivityLike[],
+  mode: ExecuteRecoveryMode = "normal",
 ): boolean {
-  const recent = recentActivity.slice(-16);
-  let latestPatchMismatchIndex = -1;
-  let latestFileReadIndex = -1;
-  const targetReadCounts = new Map<string, number>();
+  // Tool definitions are chosen before the next call arguments are known.
+  // Availability must therefore come from the recovery transaction phase,
+  // never from a history-wide read count that can hide a required new target.
+  return normalizeExecuteRecoveryMode(mode) === "patch_recovery_read";
+}
 
-  for (let index = 0; index < recent.length; index += 1) {
+function normalizeExecuteRecoveryTarget(value: unknown): string {
+  return String(value || "")
+    .trim()
+    .replace(/^['"]|['"]$/g, "")
+    .replace(/\\/g, "/")
+    .replace(/\/+/g, "/");
+}
+
+function isSuccessfulExecutePatchRecoveryResolution(
+  activity: ExecuteRecoveryActivityLike,
+  mismatchTarget: string,
+): boolean {
+  if (activity.status !== "succeeded") return false;
+  if (!workspacePathsReferToSameFile(String(activity.target || ""), mismatchTarget)) return false;
+  return activity.name === "read_file" || EXECUTE_RECOVERY_MUTATION_TOOLS.has(String(activity.name || ""));
+}
+
+/**
+ * Return the newest patch-mismatch target that has not yet received a fresh
+ * read or a successful mutation. This is a target-scoped, one-shot cache lease.
+ */
+export function resolveExecutePatchRecoveryTarget(
+  recentActivity: ExecuteRecoveryActivityLike[],
+): string | null {
+  // recentToolActivity is already bounded by the runtime. Inspect the whole
+  // retained window so unrelated tool calls cannot prematurely expire an
+  // unresolved patch mismatch.
+  const recent = recentActivity.slice(-12);
+  for (let index = recent.length - 1; index >= 0; index -= 1) {
     const activity = recent[index];
-    if (isExecutePatchMismatchRecoveryActivity(activity)) latestPatchMismatchIndex = index;
-    if (activity.name === "read_file") {
-      latestFileReadIndex = index;
-      const target = activity.target || "";
-      if (target) {
-        targetReadCounts.set(target, (targetReadCounts.get(target) || 0) + 1);
-      }
-    }
+    if (!isExecutePatchMismatchRecoveryActivity(activity)) continue;
+    const mismatchTarget = normalizeExecuteRecoveryTarget(activity.target);
+    if (!mismatchTarget) continue;
+    const alreadyResolved = recent
+      .slice(index + 1)
+      .some((next) => isSuccessfulExecutePatchRecoveryResolution(next, mismatchTarget));
+    if (!alreadyResolved) return mismatchTarget;
+  }
+  return null;
+}
+
+export function shouldBypassExecuteReadCacheForPatchRecovery(input: {
+  toolName: string;
+  allowFileRead: boolean;
+  target: string;
+  recentActivity: ExecuteRecoveryActivityLike[];
+}): boolean {
+  if (input.toolName !== "read_file" || !input.allowFileRead) return false;
+  const recoveryTarget = resolveExecutePatchRecoveryTarget(input.recentActivity);
+  return recoveryTarget !== null && workspacePathsReferToSameFile(input.target, recoveryTarget);
+}
+
+export function shouldUseExecutePatchRecoveryReadLease(input: {
+  toolName: string;
+  allowFileRead: boolean;
+  target: string;
+  recentActivity: ExecuteRecoveryActivityLike[];
+  leaseClaimed: boolean;
+}): boolean {
+  return !input.leaseClaimed && shouldBypassExecuteReadCacheForPatchRecovery(input);
+}
+
+/**
+ * Normalize native, XML, and compatibility-model multi-call responses into a
+ * single recovery transaction step. A read and an edit generated in the same
+ * response cannot be causally related because the edit has not seen the read
+ * result yet, so every non-selected call is closed as deferred feedback.
+ */
+export function resolveExecuteRecoveryBatchDecision(input: {
+  mode: ExecuteRecoveryMode;
+  calls: ExecuteRecoveryBatchCallLike[];
+  recentActivity?: ExecuteRecoveryActivityLike[];
+  expectedTarget?: string | null;
+}): ExecuteRecoveryBatchDecision {
+  const mode = normalizeExecuteRecoveryMode(input.mode);
+  const calls = Array.isArray(input.calls) ? input.calls : [];
+  if (mode === "normal") {
+    return {
+      active: false,
+      phase: "normal",
+      selectedCallId: null,
+      selectedToolName: null,
+      deferredCallIds: [],
+    };
   }
 
-  if (latestPatchMismatchIndex >= 0 && latestFileReadIndex > latestPatchMismatchIndex) {
-    return false;
-  }
-
-  for (const count of targetReadCounts.values()) {
-    if (count >= 3) {
-      return false;
-    }
-  }
-  return true;
+  const phase = mode === "patch_recovery_read"
+    ? "need_context" as const
+    : mode === "mutation_first"
+      ? "need_mutation" as const
+      : mode === "validation_only"
+        ? "need_validation" as const
+        : "legacy_action" as const;
+  const eligible = calls.filter((call) => isExecuteRecoveryToolName(
+    call.name,
+    new Set(EXECUTE_RECOVERY_PATCH_READ_TOOLS),
+    { mode, allowFileRead: mode === "patch_recovery_read" },
+  ));
+  const transactionTarget = String(input.expectedTarget || "").trim() || (
+    mode === "patch_recovery_read"
+      ? resolveExecutePatchRecoveryTarget(input.recentActivity || [])
+      : null
+  );
+  const requiresTargetMatch = Boolean(transactionTarget) && (
+    mode === "patch_recovery_read" ||
+    mode === "mutation_first" ||
+    mode === "action_only"
+  );
+  const selected = requiresTargetMatch
+    ? eligible.find((call) =>
+        workspacePathsReferToSameFile(call.target || "", transactionTarget || "")
+      )
+    : eligible[0];
+  return {
+    active: true,
+    phase,
+    selectedCallId: selected?.id || null,
+    selectedToolName: selected?.name || null,
+    deferredCallIds: calls
+      .filter((call) => call.id !== selected?.id)
+      .map((call) => call.id),
+  };
 }
 
 export function isExecuteRecoveryToolName(
@@ -124,17 +242,16 @@ export function isExecuteRecoveryToolName(
   if (mode === "normal") return true;
   if (mode === "validation_only") return EXECUTE_RECOVERY_VALIDATION_TOOLS.has(name);
   if (mode === "mutation_first") {
-    return EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS.has(name) ||
-      Boolean(options.allowFileRead && EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name));
+    return EXECUTE_RECOVERY_MUTATION_TOOLS.has(name);
   }
   if (mode === "patch_recovery_read") {
-    return EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS.has(name) ||
-      EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name);
+    return Boolean(options.allowFileRead && EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name));
   }
-  if (!readOnlyTools.has(name)) return true;
-  if (mode === "action_only") return false;
-  if (mode === "action_plus_targeting" && EXECUTE_RECOVERY_TARGETING_TOOLS.has(name)) return true;
-  return Boolean(options.allowFileRead && EXECUTE_RECOVERY_PATCH_READ_TOOLS.has(name));
+  if (mode === "action_only") return EXECUTE_RECOVERY_MUTATION_TOOLS.has(name);
+  if (mode === "action_plus_targeting") {
+    return EXECUTE_RECOVERY_MUTATION_TOOLS.has(name) || EXECUTE_RECOVERY_TARGETING_TOOLS.has(name);
+  }
+  return !readOnlyTools.has(name);
 }
 
 export function describeExecuteRecoveryToolSurface(
@@ -146,9 +263,10 @@ export function describeExecuteRecoveryToolSurface(
   if (normalized === "validation_only") return "validation_only";
   if (normalized === "action_only") return "action_only";
   if (normalized === "mutation_first") {
-    return allowFileRead ? "mutation_first_plus_patch_file_read" : "mutation_first";
+    return "mutation_only";
   }
-  if (normalized === "patch_recovery_read" || allowFileRead) return "action_plus_patch_file_read";
+  if (normalized === "patch_recovery_read") return "context_read_only";
+  if (allowFileRead) return "action_plus_targeted_file_read";
   return "action_plus_targeting";
 }
 
@@ -178,6 +296,15 @@ export function countRecentCachedReadOnlyActivities(
     .length;
 }
 
+function resolveEquivalentRecoveryTargetKey(
+  counts: Map<string, number>,
+  target: string,
+): string {
+  return [...counts.keys()].find((candidate) =>
+    workspacePathsReferToSameFile(candidate, target)
+  ) || target;
+}
+
 export function getMaxRepeatedReadOnlyTargetScore(
   recentActivity: ExecuteRecoveryActivityLike[],
   readOnlyTools: Set<string>,
@@ -188,8 +315,9 @@ export function getMaxRepeatedReadOnlyTargetScore(
     if (!readOnlyTools.has(String(activity.name || ""))) continue;
     const target = String(activity.target || "").trim();
     if (!target) continue;
+    const targetKey = resolveEquivalentRecoveryTargetKey(counts, target);
     const cachedWeight = isReadOnlyNoProgressDetail(activity.detail) ? 2 : 1;
-    counts.set(target, (counts.get(target) || 0) + cachedWeight);
+    counts.set(targetKey, (counts.get(targetKey) || 0) + cachedWeight);
   }
   return Math.max(0, ...counts.values());
 }
@@ -202,8 +330,9 @@ export function summarizeRepeatedExecuteTargets(
   for (const activity of recentActivity) {
     const target = String(activity.target || "").trim();
     if (!target) continue;
+    const targetKey = resolveEquivalentRecoveryTargetKey(counts, target);
     const cachedWeight = isReadOnlyNoProgressDetail(activity.detail) ? 2 : 1;
-    counts.set(target, (counts.get(target) || 0) + cachedWeight);
+    counts.set(targetKey, (counts.get(targetKey) || 0) + cachedWeight);
   }
   return [...counts.entries()]
     .filter(([, count]) => count >= 2)
@@ -281,7 +410,7 @@ export function resolveReadOnlyNoProgressTrigger(input: {
   const cachedReadLimit = input.minCachedReadOnlyActivities ?? 0;
   if (
     allSuccessfulReadsAreCached &&
-    readOnlyActivityCount >= cachedReadLimit
+    cachedReadOnlyActivityCount >= cachedReadLimit
   ) {
     return { shouldRecover: true, reason: "repeated_cached_read", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
@@ -306,7 +435,6 @@ export function buildExecuteRecoveryPrompt(input: {
 }): string {
   const surface = describeExecuteRecoveryToolSurface(input.mode, input.allowFileRead);
   const isPatchMismatchRecovery =
-    input.mode === "patch_recovery_read" ||
     /patch|mismatch|target_progress_patch_mismatch|search_text|not\s+found/i.test(input.reason || "");
   const repeatedTargets = input.repeatedTargets?.length
     ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
@@ -330,6 +458,9 @@ export function buildExecuteRecoveryPrompt(input: {
         : input.allowFileRead
         ? "A targeted `read_file` is available to repair exact-content or patch mismatch problems; after that, patch, run a finite command, use browser validation, or state the exact blocker."
         : "No `read_file` is available in this recovery step. Reuse cached context and take the next concrete action: `apply_patch`/`replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker. If grep_search already returned a line containing the failing code, treat that line as enough context for a minimal exact replacement.",
+      input.allowFileRead
+        ? "Uniform action protocol (use the first applicable branch and call one tool): 1) if the intended edit target's exact current text is missing, call one targeted `read_file` for that target; 2) otherwise call one mutation tool; 3) after a successful mutation, call one finite validation tool. Never batch multiple speculative reads."
+        : "Uniform action protocol (use the first applicable branch and call one tool): 1) mutate from the retained exact context; 2) after a successful mutation, call one finite validation tool; 3) if neither is possible, report the exact blocker without claiming completion.",
       "For edits, call exactly one small Codex-style patch transaction: prefer `apply_patch`, touch only the minimal file(s), and keep the patch to 1-3 focused hunks. Do not paste source code or full files into chat Markdown.",
       "Do not start a new broad scan, do not reread the same files, do not use cat/sed/head/tail shell file reads as a workaround, and do not output another plan instead of action.",
     ].filter(Boolean).join("\n");
@@ -348,6 +479,9 @@ export function buildExecuteRecoveryPrompt(input: {
       : input.allowFileRead
       ? "现在可使用定向 `read_file` 来修复精确内容或 patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
       : "这个恢复步骤不再开放 `read_file`。请复用已缓存上下文，执行下一个具体动作：`apply_patch` / `replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。如果 grep_search 已经返回包含失败代码的行，把该行视为最小精确替换的足够上下文。",
+    input.allowFileRead
+      ? "统一行动协议（按顺序选择第一个适用分支，并且只调用一个工具）：1）缺少待编辑目标的当前精确文本时，只对该目标调用一次定向 `read_file`；2）已有精确文本时，调用一个修改工具；3）修改成功后，调用一个有限验证工具。不要在同一批次发起多个猜测性读取。"
+      : "统一行动协议（按顺序选择第一个适用分支，并且只调用一个工具）：1）基于保留的精确上下文执行修改；2）修改成功后调用一个有限验证工具；3）两者都无法执行时，只报告精确阻塞，不能声称完成。",
     "编辑时必须调用一次小型 Codex-style patch 事务：优先 `apply_patch`，只触碰最小必要文件，patch 控制在 1-3 个聚焦 hunk 内。不要把源码或完整文件粘贴到聊天 Markdown。",
     "不要开启新一轮泛读，不要重复读取同一批文件，不要用 cat/sed/head/tail shell 读文件绕行，也不要用新的方案文档替代执行动作。",
   ].filter(Boolean).join("\n");

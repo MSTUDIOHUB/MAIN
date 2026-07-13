@@ -1645,7 +1645,16 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     shouldBypassApprovedPlanReadCacheForPatchRecovery({
       toolName: "read_file",
       allowFileRead: true,
-      target: "src/App.tsx",
+      target: "./src/App.tsx",
+      recentActivity: unresolvedMismatch,
+    }),
+    true,
+  );
+  assert.equal(
+    shouldBypassApprovedPlanReadCacheForPatchRecovery({
+      toolName: "read_file",
+      allowFileRead: true,
+      target: "/tmp/workspace/src/App.tsx",
       recentActivity: unresolvedMismatch,
     }),
     true,
@@ -1659,6 +1668,15 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     }),
     false,
   );
+  assert.equal(resolveApprovedPlanPatchRecoveryTarget([
+    ...unresolvedMismatch,
+    ...Array.from({ length: 8 }, (_, index) => ({
+      name: "grep_search",
+      target: `symbol-${index}`,
+      status: "succeeded",
+      detail: "one match",
+    })),
+  ]), "src/App.tsx");
   assert.equal(
     shouldBypassApprovedPlanReadCacheForPatchRecovery({
       toolName: "grep_search",

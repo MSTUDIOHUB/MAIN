@@ -60,9 +60,13 @@ const {
   describeExecuteRecoveryToolSurface,
   isExecutePatchMismatchRecoveryActivity,
   isExecuteRecoveryToolName,
+  resolveExecuteRecoveryBatchDecision,
   resolveExecuteReadOnlyRecoveryTrigger,
+  resolveExecutePatchRecoveryTarget,
   resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
+  shouldBypassExecuteReadCacheForPatchRecovery,
+  shouldUseExecutePatchRecoveryReadLease,
   summarizeRepeatedExecuteTargets,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
 
@@ -310,25 +314,21 @@ test("execute recovery mutation-first surface removes broad reads and search too
     "apply_patch",
     "replace_in_file",
     "write_file",
-    "execute_command",
-    "run_command",
-    "browser_evaluate",
-    "send_pty_input",
-    "get_pty_status",
   ]);
-  assert.equal(describeExecuteRecoveryToolSurface("mutation_first"), "mutation_first");
-  assert.equal(describeExecuteRecoveryToolSurface("mutation_first", true), "mutation_first_plus_patch_file_read");
+  assert.equal(describeExecuteRecoveryToolSurface("mutation_first"), "mutation_only");
+  assert.equal(describeExecuteRecoveryToolSurface("mutation_first", true), "mutation_only");
+  assert.equal(describeExecuteRecoveryToolSurface("action_plus_targeting", true), "action_plus_targeted_file_read");
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
-  }), true);
+  }), false);
   assert.equal(isExecuteRecoveryToolName("grep_search", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
   }), false);
 });
 
-test("Goal Runtime receives the same mutation-first recovery surface as execute", () => {
+test("Goal Runtime opens one context-read phase before mutation recovery", () => {
   const tools = ["read_file", "grep_search", "apply_patch", "run_command"].map((name) => ({
     type: "function",
     function: { name, description: name, parameters: { type: "object", properties: {} } },
@@ -345,7 +345,7 @@ test("Goal Runtime receives the same mutation-first recovery surface as execute"
     workflowMode: "edit",
     runtimeIntent: "goal",
     rawIterationAllTools: tools,
-    executeRecoveryMode: "mutation_first",
+    executeRecoveryMode: "patch_recovery_read",
     executeRecoveryReason: "read_file_only_loop",
     executeRecoveryAttempts: 1,
     recoveryIterationCount: 1,
@@ -369,7 +369,7 @@ test("Goal Runtime receives the same mutation-first recovery surface as execute"
   });
 
   assert.equal(decision.isExecuteRecoveryEligible, true);
-  assert.deepEqual(decision.iterationAllTools.map((tool) => tool.function.name), ["apply_patch", "run_command"]);
+  assert.deepEqual(decision.iterationAllTools.map((tool) => tool.function.name), ["read_file"]);
 });
 
 function createApprovedPlanToolSurfaceInput(overrides = {}) {
@@ -626,11 +626,11 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
     }),
     true,
   );
-  assert.equal(shouldAllowExecuteRecoveryFileRead(recent), true);
+  assert.equal(shouldAllowExecuteRecoveryFileRead(recent, "patch_recovery_read"), true);
   assert.equal(
     shouldAllowExecuteRecoveryFileRead([
       { name: "apply_patch", status: "failed", target: "src/App.tsx", detail: "Patch context was not found" },
-    ]),
+    ], "patch_recovery_read"),
     true,
   );
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
@@ -646,9 +646,59 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
     shouldAllowExecuteRecoveryFileRead([
       ...recent,
       { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
-    ]),
-    false,
+    ], "patch_recovery_read"),
+    true,
   );
+  assert.equal(resolveExecutePatchRecoveryTarget(recent), "src/App.tsx");
+  assert.equal(shouldBypassExecuteReadCacheForPatchRecovery({
+    toolName: "read_file",
+    allowFileRead: true,
+    target: "./src/App.tsx",
+    recentActivity: recent,
+  }), true, "relative aliases should resolve to the patch target");
+  assert.equal(shouldBypassExecuteReadCacheForPatchRecovery({
+    toolName: "read_file",
+    allowFileRead: true,
+    target: "/tmp/workspace/src/App.tsx",
+    recentActivity: recent,
+  }), true, "absolute workspace aliases should resolve to the patch target");
+  assert.equal(shouldBypassExecuteReadCacheForPatchRecovery({
+    toolName: "read_file",
+    allowFileRead: true,
+    target: "src/index.html",
+    recentActivity: recent,
+  }), false, "a patch mismatch may bypass cache only for its own target");
+  assert.equal(resolveExecutePatchRecoveryTarget([
+    ...recent,
+    { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
+  ]), null, "the cache-bypass lease is consumed by one successful targeted read");
+  assert.equal(resolveExecutePatchRecoveryTarget([
+    ...recent,
+    { name: "read_file", status: "failed", target: "src/App.tsx", detail: "temporary read error" },
+  ]), "src/App.tsx", "a failed targeted read must not consume the patch recovery lease");
+  assert.equal(resolveExecutePatchRecoveryTarget([
+    ...recent,
+    ...Array.from({ length: 8 }, (_, index) => ({
+      name: "grep_search",
+      status: "succeeded",
+      target: `symbol-${index}`,
+      detail: "one match",
+    })),
+  ]), "src/App.tsx", "unrelated activity must not expire an unresolved patch mismatch");
+  assert.equal(shouldUseExecutePatchRecoveryReadLease({
+    toolName: "read_file",
+    allowFileRead: true,
+    target: "src/App.tsx",
+    recentActivity: recent,
+    leaseClaimed: false,
+  }), true);
+  assert.equal(shouldUseExecutePatchRecoveryReadLease({
+    toolName: "read_file",
+    allowFileRead: true,
+    target: "src/App.tsx",
+    recentActivity: recent,
+    leaseClaimed: true,
+  }), false, "only one same-batch call may claim the targeted cache-bypass lease");
 
   const prompt = buildExecuteRecoveryPrompt({
     language: "zh",
@@ -717,6 +767,97 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
   }), null, "an active recovery lease must not be reinitialized by the same failure");
 });
 
+test("recovery batch selection serializes different model call shapes by phase", () => {
+  const calls = [
+    { id: "validate-first", name: "run_command", target: "npm test" },
+    { id: "wrong-read", name: "read_file", target: "src/other.ts" },
+    { id: "edit", name: "apply_patch", target: "src/App.tsx" },
+    { id: "target-read", name: "read_file", target: "/tmp/workspace/src/App.tsx" },
+  ];
+  const recentActivity = [
+    { name: "apply_patch", status: "failed", target: "./src/App.tsx", detail: "patch context mismatch" },
+  ];
+
+  const context = resolveExecuteRecoveryBatchDecision({
+    mode: "patch_recovery_read",
+    calls,
+    recentActivity,
+  });
+  assert.equal(context.phase, "need_context");
+  assert.equal(context.selectedCallId, "target-read", "path aliases must select the actual mismatch target");
+  assert.deepEqual(context.deferredCallIds.sort(), ["edit", "validate-first", "wrong-read"]);
+
+  const wrongTargetOnly = resolveExecuteRecoveryBatchDecision({
+    mode: "patch_recovery_read",
+    calls: [{ id: "wrong-read", name: "read_file", target: "src/other.ts" }],
+    recentActivity,
+  });
+  assert.equal(
+    wrongTargetOnly.selectedCallId,
+    null,
+    "a known patch target must not fall back to an unrelated read",
+  );
+  assert.deepEqual(wrongTargetOnly.deferredCallIds, ["wrong-read"]);
+
+  const mutation = resolveExecuteRecoveryBatchDecision({ mode: "mutation_first", calls });
+  assert.equal(mutation.phase, "need_mutation");
+  assert.equal(mutation.selectedCallId, "edit", "validation order in model output cannot skip mutation");
+  assert.equal(mutation.deferredCallIds.includes("validate-first"), true);
+
+  const wrongMutationOnly = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [{ id: "wrong-edit", name: "replace_in_file", target: "src/other.ts" }],
+    expectedTarget: "src/App.tsx",
+  });
+  assert.equal(
+    wrongMutationOnly.selectedCallId,
+    null,
+    "an unrelated mutation must be deferred before it can write",
+  );
+  assert.deepEqual(wrongMutationOnly.deferredCallIds, ["wrong-edit"]);
+
+  const matchingMutation = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [
+      { id: "wrong-edit", name: "write_file", target: "src/other.ts" },
+      { id: "target-edit", name: "apply_patch", target: "/tmp/workspace/src/App.tsx" },
+    ],
+    expectedTarget: "./src/App.tsx",
+  });
+  assert.equal(matchingMutation.selectedCallId, "target-edit");
+  assert.deepEqual(matchingMutation.deferredCallIds, ["wrong-edit"]);
+
+  const actionOnlyWrongMutation = resolveExecuteRecoveryBatchDecision({
+    mode: "action_only",
+    calls: [{ id: "wrong-edit", name: "write_file", target: "src/other.ts" }],
+    expectedTarget: "src/App.tsx",
+  });
+  assert.equal(actionOnlyWrongMutation.selectedCallId, null);
+  assert.deepEqual(actionOnlyWrongMutation.deferredCallIds, ["wrong-edit"]);
+
+  const validation = resolveExecuteRecoveryBatchDecision({
+    mode: "validation_only",
+    calls,
+    expectedTarget: "src/App.tsx",
+  });
+  assert.equal(validation.phase, "need_validation");
+  assert.equal(validation.selectedCallId, "validate-first");
+  assert.equal(validation.deferredCallIds.includes("edit"), true);
+
+  const toolCallPartitioningSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
+    "utf8",
+  );
+  assert.match(toolCallPartitioningSource, /expectedTarget:\s*executeRecoveryState\.expectedTarget/);
+  assert.match(toolCallPartitioningSource, /下一步必须读取该目标/);
+  assert.match(toolCallPartitioningSource, /下一步必须修改该目标/);
+  const toolCallExecutionPhaseSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"),
+    "utf8",
+  );
+  assert.match(toolCallExecutionPhaseSource, /partitionToolCallsForExecution\(\{[\s\S]*?executeRecoveryState,/);
+});
+
 test("read-only budget triggers execute recovery before max iterations", () => {
   const recent = Array.from({ length: 8 }, (_value, index) => ({
     name: "read_file",
@@ -739,11 +880,14 @@ test("read-only budget triggers execute recovery before max iterations", () => {
   const prompt = buildExecuteRecoveryPrompt({
     language: "zh",
     reason: decision.reason,
-    mode: "mutation_first",
+    mode: "patch_recovery_read",
     repeatedTargets: summarizeRepeatedExecuteTargets(recent),
     recentActivity: recent,
+    allowFileRead: shouldAllowExecuteRecoveryFileRead(recent, "patch_recovery_read"),
   });
-  assert.match(prompt, /不再开放 `read_file`/);
+  assert.match(prompt, /可使用定向 `read_file`/);
+  assert.match(prompt, /统一行动协议/);
+  assert.match(prompt, /不要在同一批次发起多个猜测性读取/);
   assert.match(prompt, /apply_patch|write_file|replace_in_file/);
   assert.match(prompt, /小型 Codex-style patch 事务/);
   assert.match(prompt, /不要把源码或完整文件粘贴到聊天 Markdown/);
@@ -777,6 +921,8 @@ test("chat read-only no-progress is eligible for final synthesis before max iter
     { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
     { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
     { name: "grep_search", status: "succeeded", target: "onFileLoaded", detail: "5 matches" },
+    { name: "read_file", status: "succeeded", target: "src/lib/router.ts", detail: "CACHED_FILE_REPLAY: src/lib/router.ts" },
+    { name: "grep_search", status: "succeeded", target: "routeConfig", detail: "READ_ONLY_REPEAT_LIMIT: duplicate search" },
   ];
   const decision = resolveReadOnlyNoProgressTrigger({
     results: [{ name: "read_file", target: "src/App.tsx", content: "FILE_UNCHANGED_STUB", isError: false }],
@@ -1121,6 +1267,29 @@ test("execute recovery does not trigger on a single cached read when minCachedRe
   assert.equal(decision.shouldRecover, false);
 });
 
+test("execute recovery does not count fresh file windows toward the cached-read threshold", () => {
+  const recent = [
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "READ_FILE_RESULT lines 1-120" },
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "READ_FILE_RESULT lines 121-240" },
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "READ_FILE_RESULT lines 241-360" },
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "FILE_UNCHANGED_STUB: lines 241-360 already cached" },
+  ];
+  const decision = resolveExecuteReadOnlyRecoveryTrigger({
+    results: [{ name: "read_file", target: "src/main.js", content: "FILE_UNCHANGED_STUB", isError: false }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 0,
+    minReadOnlyActivities: 99,
+    minCachedReadOnlyActivities: 3,
+    minRepeatedReadOnlyTargetScore: 99,
+  });
+
+  assert.equal(decision.readOnlyActivityCount, 4);
+  assert.equal(decision.cachedReadOnlyActivityCount, 1);
+  assert.equal(decision.shouldRecover, false);
+});
+
 test("execute recovery detects cached reads across changing batch signatures", () => {
   const recent = [
     { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
@@ -1170,5 +1339,30 @@ test("targeting search recovery opens read_file path to see context", () => {
   const recent = [
     { name: "grep_search", status: "succeeded", target: "Order", detail: "Order" },
   ];
-  assert.equal(shouldAllowExecuteRecoveryFileRead(recent), true);
+  assert.equal(shouldAllowExecuteRecoveryFileRead(recent, "normal"), false);
+  assert.equal(shouldAllowExecuteRecoveryFileRead(recent, "patch_recovery_read"), true);
+});
+
+test("segmented reads of one file never hide read_file from a new recovery target", () => {
+  const recent = [
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "READ_FILE_RESULT lines 1-120" },
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "READ_FILE_RESULT lines 121-240" },
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "READ_FILE_RESULT lines 241-360" },
+    { name: "read_file", status: "succeeded", target: "src/main.js", detail: "FILE_UNCHANGED_STUB: requested range already cached" },
+  ];
+
+  assert.equal(shouldAllowExecuteRecoveryFileRead(recent, "normal"), false);
+  assert.equal(shouldAllowExecuteRecoveryFileRead(recent, "patch_recovery_read"), true);
+
+  const toolCallPartitioningSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
+    "utf8",
+  );
+  assert.match(toolCallPartitioningSource, /shouldUseExecutePatchRecoveryReadLease/);
+  assert.match(toolCallPartitioningSource, /executePatchRecoveryReadLeaseClaimed/);
+  assert.doesNotMatch(
+    toolCallPartitioningSource,
+    /tc\.name === "read_file" &&\s*effectiveExecuteRecoveryFileRead\)/,
+    "ordinary recovery reads must not bypass path + argument cache signatures",
+  );
 });

@@ -826,6 +826,9 @@ test("goal prompt embeds the runtime-owned bounded turn contract", () => {
   assert.match(prompt, /\[TURN INTENT: GOAL \(AUTONOMOUS EXECUTION\)\]/);
   assert.match(prompt, /Goal Runtime 负责同一逻辑任务的连续执行、资源预算、检查点、暂停恢复与最终完成判定/);
   assert.match(prompt, /内部安全边界不会创建新目标/);
+  assert.match(prompt, /Goal 已经拥有本目标的执行授权/);
+  assert.match(prompt, /禁止输出 approve_operation_once/);
+  assert.match(prompt, /只有真正由用户拥有的产品行为、业务规则、范围边界、技术选型或优先级分叉/);
   assert.match(prompt, /GOAL_COMPLETION_CANDIDATE/);
   assert.match(prompt, /GOAL_RUNTIME_CONTRACT_SENTINEL/);
   assert.doesNotMatch(prompt, /Goal Runtime contract unavailable/);

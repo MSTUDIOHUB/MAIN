@@ -83,6 +83,7 @@ export function createAgentLoopMutableState(input: {
     executeRecoveryState: createExecuteRecoveryRuntimeState({
       workflowMode: input.workflowMode,
       forcedMode: input.callbacks.getForcedExecuteRecoveryMode?.(),
+      forcedState: input.callbacks.getForcedExecuteRecoveryState?.(),
     }),
     toolExecutionRuntimeState: createAgentLoopToolExecutionRuntimeState(
       input.callbacks.getSessionKey(),

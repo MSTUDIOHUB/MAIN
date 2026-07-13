@@ -116,6 +116,24 @@ test("each Goal slice contract includes revision and bounded prior evidence mapp
   assert.match(context, /criteria=criterion_1/);
 });
 
+test("Goal context promotes an explicit multi-subagent preference without making delegation a quota", () => {
+  const goal = goalState.createGoalDefinition({
+    objective: "修复启动白屏，可以开启多个subagent协同工作",
+  });
+  const context = goalContext.buildGoalIterationSystemContext({
+    goal,
+    checkpoint: null,
+    latestVerification: null,
+    nextIteration: 1,
+    language: "zh",
+  });
+
+  assert.match(context, /子智能体协作偏好/);
+  assert.match(context, /路径不重叠/);
+  assert.match(context, /最多两个子智能体/);
+  assert.match(context, /不要为凑数/);
+});
+
 test("tool result parsing accepts zero failures and rejects explicit failures", () => {
   assert.equal(goalRuntime.isGoalToolResultSuccessful("12 passed, 0 failed"), true);
   assert.equal(goalRuntime.isGoalToolResultSuccessful("0 errors"), true);
@@ -428,6 +446,107 @@ function createEngineCallbacks(runAgentIteration) {
   };
 }
 
+test("a paused Goal resumes in place with retained evidence and one-shot user guidance", async () => {
+  const goal = goalState.createGoalDefinition({
+    objective: "修复 src/main.js 并运行 npm run build",
+    iterationBudget: 6,
+  });
+  goal.status = "awaiting_input";
+  const progress = goalState.createGoalProgress(goal.id, ".MAIN/goals/progress.md");
+  progress.currentIteration = 1;
+  progress.totalIterationsUsed = 1;
+  progress.stopClass = "awaiting_input";
+  progress.pauseReason = "awaiting_explicit_user_choice";
+  progress.lastStopReason = "awaiting_explicit_user_choice";
+  progress.continuation = goalContinuity.createGoalContinuationState({
+    sourceIteration: 1,
+    messages: [
+      {
+        role: "assistant",
+        content: "Root cause confirmed: startup code dereferences a missing DOM element.",
+        tool_calls: [{
+          id: "read-main",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"src/main.js"}' },
+        }],
+      },
+      {
+        role: "tool",
+        tool_call_id: "read-main",
+        content: "const editor = document.getElementById('editor');",
+      },
+    ],
+  });
+
+  let observedInput;
+  const debugEvents = [];
+  const harness = createEngineCallbacks(async (input) => {
+    observedInput = input;
+    return {
+      assistantText: "Applied the selected startup behavior and verified it. GOAL_COMPLETION_CANDIDATE",
+      toolCalls: [
+        { name: "apply_patch", target: "src/main.js", result: "Done" },
+        { name: "run_command", arguments: { command: "npm run build" }, result: "0 errors" },
+      ],
+      tokensUsed: 80,
+      completed: true,
+      outcomeStatus: "completed",
+    };
+  });
+  harness.callbacks.onDebugEvent = (event, data) => debugEvents.push({ event, data });
+
+  const outcome = await goalEngine.executeGoalLoop({
+    goal,
+    callbacks: harness.callbacks,
+    existingProgress: progress,
+    userGuidance: "采用欢迎页启动行为",
+  });
+
+  assert.equal(outcome.status, "completed");
+  assert.equal(observedInput.goalTurnContract.goalId, goal.id);
+  assert.match(observedInput.goalSystemContext, /修复 src\/main\.js 并运行 npm run build/);
+  assert.match(observedInput.goalSystemContext, /采用欢迎页启动行为/);
+  assert.equal(
+    observedInput.continuation.messages.some((message) =>
+      message.content.includes("Root cause confirmed")
+    ),
+    true,
+  );
+  assert.ok(debugEvents.some(({ event, data }) =>
+    event === "goal_continuation_guidance_applied"
+    && data?.previousStatus === "awaiting_input"
+    && data?.retainedOperations === 1
+  ));
+});
+
+test("preferred subagent work logs a skipped delegation decision when the model never spawns", async () => {
+  const goal = goalState.createGoalDefinition({
+    objective: "修复跨模块问题，可以开启多个subagent协同工作",
+    iterationBudget: 4,
+  });
+  const debugEvents = [];
+  const harness = createEngineCallbacks(async () => ({
+    assistantText: "Implemented and verified. GOAL_COMPLETION_CANDIDATE",
+    toolCalls: [
+      { name: "apply_patch", target: "src/runtime.ts", result: "Done" },
+      { name: "run_command", arguments: { command: "npm run lint" }, result: "0 errors" },
+    ],
+    tokensUsed: 50,
+    completed: true,
+    outcomeStatus: "completed",
+  }));
+  harness.callbacks.onDebugEvent = (event, data) => debugEvents.push({ event, data });
+
+  const outcome = await goalEngine.executeGoalLoop({ goal, callbacks: harness.callbacks });
+
+  assert.equal(outcome.status, "completed");
+  assert.ok(debugEvents.some(({ event, data }) =>
+    event === "delegation_scope_decision"
+    && data?.decision === "skipped"
+    && data?.reason === "preferred_parallelism_not_used_in_first_goal_continuation"
+  ));
+});
+
 test("Goal Engine completes only after a tool-backed mutation and verification slice", async () => {
   const goal = goalState.createGoalDefinition({ objective: "Refactor Goal Runtime and run lint", iterationBudget: 10 });
   const harness = createEngineCallbacks(async () => ({
@@ -634,6 +753,450 @@ test("Goal continuation transport preserves complete tool pairs and strips runti
   assert.match(state.memoryPacket, /src\/main\.ts/);
 });
 
+test("Goal continuation drops expired recovery tool errors without losing real tool evidence", () => {
+  const state = goalContinuity.createGoalContinuationState({
+    sourceIteration: 4,
+    messages: [
+      {
+        role: "assistant",
+        content: "I need both the source and the page shell before editing.",
+        tool_calls: [
+          {
+            id: "read-source",
+            type: "function",
+            function: { name: "read_file", arguments: '{"path":"src/main.js"}' },
+          },
+          {
+            id: "read-page",
+            type: "function",
+            function: { name: "read_file", arguments: '{"path":"index.html"}' },
+          },
+          {
+            id: "deferred-edit",
+            type: "function",
+            function: { name: "apply_patch", arguments: '{"patch":"*** Begin Patch"}' },
+          },
+        ],
+      },
+      { role: "tool", tool_call_id: "read-source", content: "const app = document.querySelector('#app');" },
+      {
+        role: "tool",
+        tool_call_id: "read-page",
+        content: [
+          '[MAIN_TOOL_FEEDBACK_V1]{"version":1,"status":"blocked","tool_call_id":"read-page","tool":"read_file","target":"index.html"}',
+          "Error: READ_FILE_NOT_AVAILABLE_IN_RECOVERY: read_file is not exposed in the current goal recovery step.",
+        ].join("\n"),
+      },
+      {
+        role: "tool",
+        tool_call_id: "deferred-edit",
+        content: "EXECUTE_RECOVERY_BATCH_DEFERRED: consume the selected read before editing.",
+      },
+      {
+        role: "assistant",
+        content: "A missing file is durable workspace evidence.",
+        tool_calls: [{
+          id: "read-missing",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"missing.html"}' },
+        }],
+      },
+      { role: "tool", tool_call_id: "read-missing", content: "ENOENT: missing.html" },
+    ],
+  });
+
+  const restored = goalContinuity.restoreGoalContinuationMessages(state);
+  const callIds = restored.flatMap((message) => (message.tool_calls || []).map((call) => call.id));
+  const resultIds = restored.flatMap((message) => message.tool_call_id ? [message.tool_call_id] : []);
+
+  assert.deepEqual(callIds.sort(), ["read-missing", "read-source"]);
+  assert.deepEqual(resultIds.sort(), ["read-missing", "read-source"]);
+  assert.equal(restored.some((message) => message.content.includes("READ_FILE_NOT_AVAILABLE_IN_RECOVERY")), false);
+  assert.equal(restored.some((message) => message.content.includes("EXECUTE_RECOVERY_BATCH_DEFERRED")), false);
+  assert.equal(restored.some((message) => message.content.includes("querySelector")), true);
+  assert.equal(restored.some((message) => message.content.includes("ENOENT")), true);
+  assert.doesNotMatch(state.memoryPacket || "", /READ_FILE_NOT_AVAILABLE_IN_RECOVERY/);
+});
+
+test("Goal continuation prompt makes the current tool surface authoritative", () => {
+  const english = goalContinuity.buildGoalContinuationPrompt({
+    language: "en",
+    goalId: "goal-tools",
+    continuationIndex: 2,
+  });
+  const chinese = goalContinuity.buildGoalContinuationPrompt({
+    language: "zh",
+    goalId: "goal-tools",
+    continuationIndex: 2,
+  });
+
+  assert.match(english, /tools exposed for this continuation are authoritative/i);
+  assert.match(english, /temporary tool-unavailable recovery result has expired/i);
+  assert.match(english, /one fixed action order/i);
+  assert.match(chinese, /以本次实际开放的工具为准/);
+  assert.match(chinese, /已经失效/);
+  assert.match(chinese, /遵循固定行动顺序/);
+});
+
+test("Goal continuation restores the unfinished recovery phase across slices", () => {
+  const stateFor = (toolCalls, results) => goalContinuity.createGoalContinuationState({
+    sourceIteration: 2,
+    messages: [
+      {
+        role: "assistant",
+        content: "Continue the file-change goal.",
+        tool_calls: toolCalls.map((call, index) => ({
+          id: `call-${index}`,
+          type: "function",
+          function: { name: call.name, arguments: JSON.stringify(call.arguments || {}) },
+        })),
+      },
+      ...results.map((content, index) => ({
+        role: "tool",
+        tool_call_id: `call-${index}`,
+        content,
+      })),
+    ],
+  });
+
+  const afterRead = stateFor(
+    [{ name: "read_file", arguments: { path: "src/App.tsx" } }],
+    ["---CONTENT START---\nexport const app = true;\n---CONTENT END---"],
+  );
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    afterRead,
+    { mutationRequired: true },
+  ), null, "a legacy plain read must not invent recovery at a slice boundary");
+
+  const persistedAfterRead = goalContinuity.createGoalContinuationState({
+    sourceIteration: 2,
+    messages: afterRead.messages,
+    executeRecoveryState: {
+      mode: "mutation_first",
+      reason: "recovery_context_observed",
+      expectedTarget: "src/App.tsx",
+    },
+  });
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    persistedAfterRead,
+    { mutationRequired: true },
+  ), "mutation_first");
+
+  const afterMutation = stateFor(
+    [{ name: "apply_patch", arguments: { patch: "update src/App.tsx" } }],
+    ['{"path":"src/App.tsx","changed":true}'],
+  );
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    afterMutation,
+    { mutationRequired: true },
+  ), "validation_only");
+
+  const afterValidation = stateFor(
+    [
+      { name: "apply_patch", arguments: { patch: "update src/App.tsx" } },
+      { name: "run_command", arguments: { command: "npm test" } },
+    ],
+    ['{"path":"src/App.tsx","changed":true}', '{"exitCode":0,"stdout":"passed"}'],
+  );
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    afterValidation,
+    { mutationRequired: true },
+  ), null);
+
+  const afterMismatch = stateFor(
+    [{ name: "replace_in_file", arguments: { path: "src/App.tsx" } }],
+    ["Error: search_text mismatch; no match found"],
+  );
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    afterMismatch,
+    { mutationRequired: true },
+  ), "patch_recovery_read");
+
+  for (const noEffectResult of [
+    '{"noOp":true}',
+    "empty_change",
+    "identical_content",
+    "no changes",
+  ]) {
+    const legacyNoEffect = stateFor(
+      [
+        { name: "replace_in_file", arguments: { path: "src/App.tsx" } },
+        { name: "read_file", arguments: { path: "src/App.tsx" } },
+        { name: "replace_in_file", arguments: { path: "src/App.tsx" } },
+      ],
+      [
+        "Error: search_text mismatch; no match found",
+        "current target context",
+        noEffectResult,
+      ],
+    );
+    assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+      legacyNoEffect,
+      { mutationRequired: true },
+    ), "mutation_first", `${noEffectResult} must not become successful legacy mutation evidence`);
+  }
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    persistedAfterRead,
+    { mutationRequired: false },
+  ), null, "non-mutation goals must not inherit a file-edit phase");
+
+  assert.deepEqual(goalContinuity.resolveGoalContinuationExecuteRecoveryState(
+    persistedAfterRead,
+    { mutationRequired: true },
+  ), {
+    mode: "mutation_first",
+    reason: "recovery_context_observed",
+    expectedTarget: "src/App.tsx",
+  });
+});
+
+test("Goal continuation treats structured feedback status as authoritative", () => {
+  const envelope = ({ status, id, tool, target, body }) => [
+    `[MAIN_TOOL_FEEDBACK_V1]${JSON.stringify({
+      version: 1,
+      status,
+      tool_call_id: id,
+      tool,
+      target,
+    })}`,
+    body,
+  ].join("\n");
+  const stateFor = (status, tool = "read_file", body = "current file content") =>
+    goalContinuity.createGoalContinuationState({
+      sourceIteration: 2,
+      messages: [
+        {
+          role: "assistant",
+          content: "Continue.",
+          tool_calls: [{
+            id: "call-1",
+            type: "function",
+            function: { name: tool, arguments: '{"path":"src/App.tsx"}' },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: "call-1",
+          content: envelope({ status, id: "call-1", tool, target: "src/App.tsx", body }),
+        },
+      ],
+    });
+
+  for (const status of ["failed", "blocked", "declined", "cached", "no_effect_mutation", "no_op"]) {
+    assert.equal(
+      goalContinuity.resolveGoalContinuationExecuteRecoveryState(
+        stateFor(status),
+        { mutationRequired: true },
+      ),
+      null,
+      `${status} must not be replayed as a fresh read`,
+    );
+  }
+
+  const misleadingFailure = stateFor("failed", "read_file", "export const app = true;");
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    misleadingFailure,
+    { mutationRequired: true },
+  ), null, "a success-looking body cannot override a failed envelope status");
+
+  const misleadingSuccess = stateFor("completed", "read_file", "Error: stale legacy text");
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    misleadingSuccess,
+    { mutationRequired: true },
+  ), null, "a completed plain read is valid evidence but must not invent recovery without a runtime snapshot");
+});
+
+test("Goal continuation restores one target-scoped recovery transaction", () => {
+  const envelope = ({ status = "completed", id, tool, target, body }) => [
+    `[MAIN_TOOL_FEEDBACK_V1]${JSON.stringify({
+      version: 1,
+      status,
+      tool_call_id: id,
+      tool,
+      target,
+    })}`,
+    body,
+  ].join("\n");
+  const createState = (operations) => goalContinuity.createGoalContinuationState({
+    sourceIteration: 3,
+    messages: operations.flatMap((operation, index) => {
+      const id = `call-${index}`;
+      return [
+        {
+          role: "assistant",
+          content: operation.assistant || "Continue the same transaction.",
+          tool_calls: [{
+            id,
+            type: "function",
+            function: {
+              name: operation.tool,
+              arguments: JSON.stringify(operation.arguments || {}),
+            },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: id,
+          content: envelope({
+            status: operation.status || "completed",
+            id,
+            tool: operation.tool,
+            target: operation.target || "",
+            body: operation.body || "",
+          }),
+        },
+      ];
+    }),
+  });
+
+  const afterTargetedRead = createState([
+    {
+      tool: "replace_in_file",
+      arguments: { path: "/workspace/src/App.tsx" },
+      target: "/workspace/src/App.tsx",
+      status: "failed",
+      body: "search_text mismatch; no match found",
+    },
+    {
+      tool: "read_file",
+      arguments: { path: "src/Other.tsx" },
+      target: "src/Other.tsx",
+      body: "unrelated context",
+    },
+    {
+      tool: "read_file",
+      arguments: { path: "src/App.tsx" },
+      target: "src/App.tsx",
+      body: "Error: stale legacy text inside a completed structured result",
+    },
+  ]);
+  assert.deepEqual(goalContinuity.resolveGoalContinuationExecuteRecoveryState(
+    afterTargetedRead,
+    { mutationRequired: true },
+  ), {
+    mode: "mutation_first",
+    reason: "goal_continuation_context_observed",
+    expectedTarget: "/workspace/src/App.tsx",
+  });
+
+  const noEffectMutation = createState([
+    {
+      tool: "replace_in_file",
+      arguments: { path: "src/App.tsx" },
+      target: "src/App.tsx",
+      status: "failed",
+      body: "search_text mismatch; no match found",
+    },
+    {
+      tool: "read_file",
+      arguments: { path: "src/App.tsx" },
+      target: "src/App.tsx",
+      body: "current target context",
+    },
+    {
+      tool: "replace_in_file",
+      arguments: { path: "src/App.tsx" },
+      target: "src/App.tsx",
+      status: "no_effect_mutation",
+      body: "Done",
+    },
+  ]);
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    noEffectMutation,
+    { mutationRequired: true },
+  ), "mutation_first");
+});
+
+test("Goal continuation uses live verification semantics and does not reopen after validation", () => {
+  const envelope = ({ status = "completed", id, tool, target = "", body = "" }) => [
+    `[MAIN_TOOL_FEEDBACK_V1]${JSON.stringify({
+      version: 1,
+      status,
+      tool_call_id: id,
+      tool,
+      target,
+    })}`,
+    body,
+  ].join("\n");
+  const stateFor = (operations) => goalContinuity.createGoalContinuationState({
+    sourceIteration: 4,
+    messages: operations.flatMap((operation, index) => {
+      const id = `verify-${index}`;
+      return [
+        {
+          role: "assistant",
+          content: "Continue.",
+          tool_calls: [{
+            id,
+            type: "function",
+            function: { name: operation.tool, arguments: JSON.stringify(operation.arguments || {}) },
+          }],
+        },
+        {
+          role: "tool",
+          tool_call_id: id,
+          content: envelope({ ...operation, id }),
+        },
+      ];
+    }),
+  });
+  const mutation = {
+    tool: "replace_in_file",
+    arguments: { path: "src/App.tsx" },
+    target: "src/App.tsx",
+    body: "updated",
+  };
+
+  for (const nonVerification of [
+    { tool: "execute_command", body: '{"running":true}' },
+    { tool: "send_pty_input", body: "npm test" },
+    { tool: "read_pty_tail", body: '{"running":true,"output":"starting"}' },
+    { tool: "git_diff", body: "diff --git a/src/App.tsx b/src/App.tsx" },
+    { tool: "clear_pty_buffer", body: "cleared" },
+  ]) {
+    assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+      stateFor([mutation, nonVerification]),
+      { mutationRequired: true },
+    ), "validation_only", `${nonVerification.tool} must not close validation`);
+  }
+
+  const readyPty = stateFor([
+    mutation,
+    {
+      tool: "read_pty_tail",
+      body: '{"running":true,"output":"Local: http://localhost:1420/ ready in 200 ms"}',
+    },
+  ]);
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    readyPty,
+    { mutationRequired: true },
+  ), null, "a ready PTY observation closes validation");
+
+  const failedCommand = stateFor([
+    mutation,
+    { tool: "run_command", status: "failed", body: '{"exitCode":0,"stdout":"passed"}' },
+  ]);
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
+    failedCommand,
+    { mutationRequired: true },
+  ), "validation_only", "failed envelope status wins over success-looking command output");
+
+  const readAfterVerifiedMutation = stateFor([
+    mutation,
+    { tool: "run_command", body: '{"exitCode":0,"stdout":"passed"}' },
+    {
+      tool: "read_file",
+      arguments: { path: "src/App.tsx" },
+      target: "src/App.tsx",
+      body: "post-validation inspection",
+    },
+  ]);
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryState(
+    readAfterVerifiedMutation,
+    { mutationRequired: true },
+  ), null, "ordinary post-validation reads must not reopen a completed transaction");
+});
+
 test("Goal runtime normalization preserves durable continuation memory idempotently", () => {
   const goal = goalState.createGoalDefinition({ objective: "Continue one persistent task" });
   const progress = goalState.createGoalProgress(goal.id, ".MAIN/goals/progress.md");
@@ -644,6 +1207,11 @@ test("Goal runtime normalization preserves durable continuation memory idempoten
     ],
   });
   progress.continuation.memoryPacket = "durable older operation memory";
+  progress.continuation.executeRecoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src/lib/goalRuntime.ts",
+  };
   const snapshot = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
 
   const once = goalRuntime.normalizeGoalRuntimeSnapshot(snapshot);
@@ -652,6 +1220,48 @@ test("Goal runtime normalization preserves durable continuation memory idempoten
   assert.equal(once.progress.continuation.memoryPacket, "durable older operation memory");
   assert.equal(twice.progress.continuation.memoryPacket, once.progress.continuation.memoryPacket);
   assert.deepEqual(twice.progress.continuation.messages, once.progress.continuation.messages);
+  assert.deepEqual(twice.progress.continuation.executeRecoveryState, {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src/lib/goalRuntime.ts",
+  });
+});
+
+test("Goal runtime normalization removes stale recovery restrictions from persisted memory", () => {
+  const goal = goalState.createGoalDefinition({ objective: "Resume a goal with migrated memory" });
+  const progress = goalState.createGoalProgress(goal.id, ".MAIN/goals/progress.md");
+  progress.continuation = goalContinuity.createGoalContinuationState({
+    sourceIteration: 3,
+    messages: [
+      { role: "assistant", content: "The next durable action is editing `src/main.ts`." },
+    ],
+  });
+  progress.continuation.memoryPacket = [
+    "Historical compacted context",
+    "READ_FILE_NOT_AVAILABLE_IN_RECOVERY: read_file was hidden in a prior loop.",
+  ].join("\n");
+  progress.continuation.compacted = true;
+  const snapshot = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
+
+  const normalized = goalRuntime.normalizeGoalRuntimeSnapshot(snapshot);
+  assert.doesNotMatch(normalized.progress.continuation.memoryPacket || "", /READ_FILE_NOT_AVAILABLE_IN_RECOVERY/);
+  assert.match(normalized.progress.continuation.memoryPacket || "", /src\/main\.ts/);
+  assert.equal(normalized.progress.continuation.compacted, true);
+
+  const continued = goalContinuity.createGoalContinuationState({
+    sourceIteration: 4,
+    previous: progress.continuation,
+    messages: [{ role: "assistant", content: "Keep the new durable conclusion." }],
+  });
+  assert.doesNotMatch(continued.memoryPacket || "", /READ_FILE_NOT_AVAILABLE_IN_RECOVERY/);
+  assert.match(continued.memoryPacket || "", /new durable conclusion/i);
+  assert.equal(
+    goalContinuity.sanitizeGoalContinuationMemoryPacket(
+      'Evidence:\n- const marker = "READ_FILE_NOT_AVAILABLE_IN_RECOVERY:";',
+    ),
+    'Evidence:\n- const marker = "READ_FILE_NOT_AVAILABLE_IN_RECOVERY:";',
+    "source code mentioning the legacy marker is not transient runtime control",
+  );
 });
 
 test("Goal continuation compaction keeps bounded complete tool protocol groups", () => {

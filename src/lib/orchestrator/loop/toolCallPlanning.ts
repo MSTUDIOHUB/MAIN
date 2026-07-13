@@ -88,7 +88,10 @@ export function resolveIterationToolSurface(input: {
     (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
     isMutationRuntimeIntent(runtimeIntent) &&
     executeRecoveryMode !== "normal";
-  const allowExecuteRecoveryFileRead = shouldAllowExecuteRecoveryFileRead(recentToolActivity);
+  const allowExecuteRecoveryFileRead = shouldAllowExecuteRecoveryFileRead(
+    recentToolActivity,
+    executeRecoveryMode,
+  );
   const effectiveExecuteRecoveryFileRead =
     executeRecoveryMode === "patch_recovery_read" || allowExecuteRecoveryFileRead;
   const recoveryIterationAllTools = isExecuteRecoveryEligible

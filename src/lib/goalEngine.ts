@@ -85,6 +85,7 @@ import {
   compactGoalAssistantContext,
   extractGoalAssistantSummary,
 } from "./goalContinuity";
+import { resolveSubagentDelegationPreference } from "./turnIntake";
 
 // ── Goal Engine callbacks ────────────────────────────────────────
 
@@ -159,6 +160,8 @@ export async function executeGoalLoop(input: {
   callbacks: GoalEngineCallbacks;
   budgetOverrides?: Partial<GoalBudget>;
   existingProgress?: GoalProgress | null;
+  /** One-shot guidance supplied while resuming the same logical Goal. */
+  userGuidance?: string;
 }): Promise<GoalLoopOutcome> {
   const { callbacks, budgetOverrides, existingProgress } = input;
   const goal = migrateGoalDefinition(input.goal);
@@ -168,6 +171,7 @@ export async function executeGoalLoop(input: {
   });
   const language = callbacks.getPreferredLanguage();
   const workspacePath = callbacks.getWorkspacePath();
+  const subagentPreference = resolveSubagentDelegationPreference(goal.objective);
   const progressFilePath = resolveGoalRuntimeProgressFilePath(workspacePath, goal.id);
 
   // Initialize or restore progress
@@ -198,6 +202,7 @@ export async function executeGoalLoop(input: {
     };
   }
   progress.progressFile = progressFilePath;
+  let pendingUserGuidance = String(input.userGuidance || "").trim();
 
   let lastCheckpoint: GoalCheckpoint | null = progress.lastCheckpoint;
   let lastVerificationResult = null;
@@ -242,6 +247,28 @@ export async function executeGoalLoop(input: {
     return outcome;
   }
 
+  if (
+    existingProgress &&
+    pendingUserGuidance &&
+    (goal.status === "awaiting_input" || goal.status === "paused")
+  ) {
+    const previousStatus = goal.status;
+    goal.status = "active";
+    progress.pauseReason = undefined;
+    if (progress.stopClass === "awaiting_input" || progress.stopClass === "user_paused") {
+      progress.stopClass = undefined;
+      progress.lastStopReason = undefined;
+    }
+    callbacks.onDebugEvent?.("goal_continuation_guidance_applied", {
+      goalId: goal.id,
+      previousStatus,
+      guidanceChars: pendingUserGuidance.length,
+      retainedMessages: progress.continuation?.messages.length || 0,
+      retainedOperations: progress.continuation?.operationCount || 0,
+      retainedEvidence: progress.evidence?.length || 0,
+    });
+  }
+
   callbacks.onDebugEvent?.("goal_loop_start", {
     goalId: goal.id,
     continuationId: `${goal.id}:slice:${progress.totalIterationsUsed + 1}`,
@@ -257,6 +284,7 @@ export async function executeGoalLoop(input: {
     retainedMessages: progress.continuation?.messages.length || 0,
     retainedOperations: progress.continuation?.operationCount || 0,
     memoryChars: progress.continuation?.memoryPacket?.length || 0,
+    subagentPreference,
   });
 
   // ── Main Loop ──────────────────────────────────────────────────
@@ -363,6 +391,7 @@ export async function executeGoalLoop(input: {
     });
 
     // ── Build the updated contract without discarding retained messages ──
+    const continuationGuidance = pendingUserGuidance || undefined;
     const goalTurnContract = buildGoalTurnContract({
       goal,
       checkpoint: lastCheckpoint,
@@ -375,7 +404,9 @@ export async function executeGoalLoop(input: {
       continuationMemory: progress.continuation?.compacted
         ? progress.continuation.memoryPacket
         : undefined,
+      userGuidance: continuationGuidance,
     });
+    pendingUserGuidance = "";
 
     // ── Execute one agent iteration ──
     let agentResult: GoalAgentIterationResult;
@@ -512,6 +543,20 @@ export async function executeGoalLoop(input: {
       iteration: iteration.index,
       observations: agentResult.toolCalls,
     });
+    if (
+      iteration.index === 1 &&
+      subagentPreference === "preferred" &&
+      !agentResult.toolCalls.some((call) => call.name === "spawn_subagent")
+    ) {
+      callbacks.onDebugEvent?.("delegation_scope_decision", {
+        decision: "skipped",
+        reason: "preferred_parallelism_not_used_in_first_goal_continuation",
+        preference: subagentPreference,
+        continuationId: goalTurnContract.goalSliceId,
+        observedToolCalls: agentResult.toolCalls.length,
+        observedToolNames: [...new Set(agentResult.toolCalls.map((call) => call.name))].slice(0, 12),
+      });
+    }
     iteration.summary = extractIterationSummary(agentResult.assistantText, language, iterationEvidence);
     if (agentResult.continuation) {
       progress.continuation = agentResult.continuation;

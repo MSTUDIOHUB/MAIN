@@ -1,9 +1,14 @@
 import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
-import { mergeGoalToolObservations, type GoalToolObservation } from "../goalRuntime";
+import {
+  goalRequiresMutation,
+  mergeGoalToolObservations,
+  type GoalToolObservation,
+} from "../goalRuntime";
 import {
   buildGoalContinuationPrompt,
   createGoalContinuationState,
+  resolveGoalContinuationExecuteRecoveryState,
   restoreGoalContinuationMessages,
 } from "../goalContinuity";
 import { invoke } from "@tauri-apps/api/core";
@@ -3528,9 +3533,36 @@ export class WorkflowEngine {
             const deferredNonActionableStops: Array<
               Parameters<OrchestratorCallbacks["onNonActionableStop"]>
             > = [];
+            const continuationRecoveryState = resolveGoalContinuationExecuteRecoveryState(
+              iterInput.continuation,
+              { mutationRequired: goalRequiresMutation(activeGoal) },
+            );
+            if (continuationRecoveryState) {
+              callbacks.onDebugEvent?.("goal_continuation_recovery_mode_restored", {
+                continuationId: iterInput.goalSliceId,
+                continuation: iterInput.iteration,
+                executeRecoveryMode: continuationRecoveryState.mode,
+                executeRecoveryReason: continuationRecoveryState.reason,
+                expectedTarget: continuationRecoveryState.expectedTarget,
+              });
+            }
+            let latestExecuteRecoveryState = continuationRecoveryState ||
+              iterInput.continuation?.executeRecoveryState || {
+                mode: "normal" as const,
+                reason: "",
+                expectedTarget: null,
+              };
             const iterCallbacks = {
               ...callbacks,
               getGoalTurnContract: () => iterInput.goalTurnContract,
+              getForcedExecuteRecoveryState: () =>
+                continuationRecoveryState || callbacks.getForcedExecuteRecoveryState?.() || null,
+              getForcedExecuteRecoveryMode: () =>
+                continuationRecoveryState?.mode || callbacks.getForcedExecuteRecoveryMode?.() || null,
+              onExecuteRecoveryStateChange: (state: typeof latestExecuteRecoveryState) => {
+                latestExecuteRecoveryState = { ...state };
+                callbacks.onExecuteRecoveryStateChange?.(state);
+              },
               getConfig: () => {
                 const config = callbacks.getConfig();
                 const currentAgentLoop = (config as any).agentLoop || {};
@@ -3606,6 +3638,7 @@ export class WorkflowEngine {
                 messages: [...retainedContinuationMessages, ...currentContinuationMessages],
                 sourceIteration: iterInput.iteration,
                 previous: iterInput.continuation,
+                executeRecoveryState: latestExecuteRecoveryState,
               });
               const goalError = enrichedError as Error & {
                 goalIterationUsage?: typeof failureUsage;
@@ -3706,6 +3739,7 @@ export class WorkflowEngine {
               messages: [...retainedContinuationMessages, ...currentContinuationMessages],
               sourceIteration: iterInput.iteration,
               previous: iterInput.continuation,
+              executeRecoveryState: latestExecuteRecoveryState,
             });
 
             callbacks.onDebugEvent?.("goal_inner_continuation_outcome", {
@@ -3775,6 +3809,10 @@ export class WorkflowEngine {
           goal: activeGoal,
           callbacks: goalCallbacks,
           existingProgress: sessionGet().goalRuntime?.progress || sessionGet().goalProgress,
+          userGuidance: String(
+            (context.options as { goalContinuationGuidance?: string } | null | undefined)
+              ?.goalContinuationGuidance || "",
+          ).trim() || undefined,
         }).then((goalOutcome) => {
           if (goalOutcome.status === "completed") {
             appendWorkflowRuntimeEvent({

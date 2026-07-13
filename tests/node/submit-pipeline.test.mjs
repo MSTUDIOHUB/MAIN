@@ -463,6 +463,23 @@ test("effective intent decision upgrades auto-approve Game Studio turns to studi
   assert.match(decision.effectiveIntentSummary, /Game Studio 工作流|自动审批/);
 });
 
+test("effective intent decision keeps an identity-validated choice inside Goal runtime", () => {
+  const decision = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
+    text: "显示欢迎页",
+    options: {
+      resolvedIntent: "goal",
+      continueExistingGoal: true,
+      executionConsentGranted: true,
+    },
+    currentTurnIntent: "goal",
+    shouldReuseExistingTurnIntent: true,
+    shouldExecuteOnceFromReplyOption: true,
+  }));
+
+  assert.equal(decision.effectiveRunIntent, "goal");
+  assert.equal(decision.shouldForceExecuteForAutoApprove, false);
+});
+
 test("effective intent decision preserves explicit Unity setup-engine directive", () => {
   const decision = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
     text: "/setup-engine unity",

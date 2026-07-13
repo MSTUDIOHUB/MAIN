@@ -1,3 +1,5 @@
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
+
 export type RecentLoopGuardToolCall = {
   name: string;
   argsKey: string;
@@ -76,8 +78,12 @@ export function clearCrossIterationReadTrackingForTarget(
   state: AgentLoopGuardRuntimeState,
   target?: string | null,
 ): AgentLoopGuardRuntimeState {
-  if (!target || !state.crossIterationFileReads.has(target)) return state;
-  state.crossIterationFileReads.delete(target);
+  if (!target) return state;
+  const trackedTarget = [...state.crossIterationFileReads.keys()].find((candidate) =>
+    workspacePathsReferToSameFile(candidate, target)
+  );
+  if (!trackedTarget) return state;
+  state.crossIterationFileReads.delete(trackedTarget);
   return state;
 }
 

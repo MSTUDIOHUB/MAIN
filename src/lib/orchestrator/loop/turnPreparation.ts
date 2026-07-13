@@ -22,7 +22,12 @@ import { extractCompatibilityTextContent } from "../../providerCompatibility";
 import { buildSubagentSystemPrompt, buildSystemPrompt } from "../../systemPrompt";
 import { skillNameToToolName, type ToolDefinition } from "../../toolSchemas";
 import { withEventSchema, type MainThreadEventInput, type MainThreadProgressUpdate } from "../../turnEvents";
-import { extractPrimaryUserRequestText, extractTurnInputContextSignalsFromMessages, type TurnInputContextSignals } from "../../turnIntake";
+import {
+  extractPrimaryUserRequestText,
+  extractTurnInputContextSignalsFromMessages,
+  resolveSubagentDelegationPreference,
+  type TurnInputContextSignals,
+} from "../../turnIntake";
 import { collectCanonicalTurnUserContext } from "../../turnContext";
 import { readHarnessRunMarker } from "../../harnessCrashTelemetry";
 import { markerBelongsToTurn, markerContinuesLogicalTurn, resolveRuntimeRunIdentity } from "../../runIdentity";
@@ -564,6 +569,7 @@ export function createTaskTargetingRuntime(input: {
   });
 
   const initialTaskTargetingProfile = buildCurrentTaskTargetingProfile();
+  const subagentPreference = resolveSubagentDelegationPreference(latestUserPromptText);
   emitTaskOrchestratorPhase("INTAKE_PARSE", {
     facets: initialTaskTargetingProfile.facets,
     explicitPaths: initialTaskTargetingProfile.explicitPaths.slice(0, 8),
@@ -576,7 +582,16 @@ export function createTaskTargetingRuntime(input: {
     hasUserProvidedContext: initialTaskTargetingProfile.hasUserProvidedContext,
     requiresDesignProtocol: initialTaskTargetingProfile.requiresDesignProtocol,
     designProtocolSatisfied: initialTaskTargetingProfile.designProtocolSatisfied,
+    subagentPreference,
   });
+  if (subagentPreference !== "unspecified") {
+    logAgentEvent("delegation_preference_detected", {
+      preference: subagentPreference,
+      workflowMode,
+      turnIntent,
+      source: "turn_intake",
+    });
+  }
 
   return {
     taskTargetingEvidence,

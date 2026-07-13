@@ -280,6 +280,8 @@ export async function runSubmitAsyncWorkflowRun<
     turnId: input.turnId,
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
+    continueExistingGoal:
+      (input.options as { continueExistingGoal?: boolean } | null | undefined)?.continueExistingGoal === true,
     parentRunIdOverride: input.parentRunIdOverride,
     runIdOverride: input.runIdOverride,
     getRuntimeSnapshot: () => ({

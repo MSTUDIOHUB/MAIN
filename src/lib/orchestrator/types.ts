@@ -110,6 +110,11 @@ export interface OrchestratorCallbacks {
   getGoalTurnContract?: () => import("../goalState").GoalTurnContract | null;
   getExecutionConsentGranted?: () => boolean;
   getForcedExecuteRecoveryMode?: () => ExecuteRecoveryMode | null;
+  getForcedExecuteRecoveryState?: () => {
+    mode: ExecuteRecoveryMode;
+    reason?: string | null;
+    expectedTarget?: string | null;
+  } | null;
   getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";
   getIsPlanApproved: () => boolean;
@@ -133,6 +138,11 @@ export interface OrchestratorCallbacks {
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
   onModelUsage?: (usage: NonNullable<import("../streaming").StreamResult["usage"]>) => void;
+  onExecuteRecoveryStateChange?: (state: {
+    mode: ExecuteRecoveryMode;
+    reason: string;
+    expectedTarget: string | null;
+  }) => void;
   getPendingSubagentIds?: () => string[];
   runSubagent?: (
     request: SpawnSubagentRequest,

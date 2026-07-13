@@ -142,6 +142,14 @@ export class AgentOrchestrator {
           workflowMode,
           unityMcpRuntimeState: initialUnityMcpRuntimeState,
         });
+        const publishExecuteRecoveryState = () => {
+          callbacks.onExecuteRecoveryStateChange?.({
+            mode: loopState.executeRecoveryState.mode,
+            reason: loopState.executeRecoveryState.reason,
+            expectedTarget: loopState.executeRecoveryState.expectedTarget,
+          });
+        };
+        publishExecuteRecoveryState();
         const notifyApprovedPlanExecutionStarted = callbacks.onApprovedPlanExecutionStarted;
         let approvedPlanExecutionPhaseStarted = false;
         let approvedPlanExecutionResetPendingFold = false;
@@ -150,6 +158,7 @@ export class AgentOrchestrator {
             approvedPlanExecutionPhaseStarted = true;
             approvedPlanExecutionResetPendingFold = true;
             resetAgentLoopMutableStateForApprovedPlanExecution(loopState);
+            publishExecuteRecoveryState();
           }
           notifyApprovedPlanExecutionStarted?.();
         };
@@ -157,6 +166,7 @@ export class AgentOrchestrator {
           if (!approvedPlanExecutionResetPendingFold) return;
           approvedPlanExecutionResetPendingFold = false;
           resetAgentLoopMutableStateForApprovedPlanExecution(loopState);
+          publishExecuteRecoveryState();
         };
         const toolSurfaceRuntime = createAgentLoopToolSurfaceRuntime({
           callbacks,
@@ -239,6 +249,7 @@ export class AgentOrchestrator {
           getExecuteRecoveryState: () => loopState.executeRecoveryState,
           setExecuteRecoveryState: (state) => {
             loopState.executeRecoveryState = state;
+            publishExecuteRecoveryState();
           },
           getStreamRuntimeState: () => loopState.streamRuntimeState,
           setStreamRuntimeState: (state) => {
@@ -388,6 +399,7 @@ export class AgentOrchestrator {
           loopState,
           iterationStreamPreparation,
         );
+        publishExecuteRecoveryState();
         const {
           runtimeIntent,
           finalTextOnlyStep,
@@ -586,6 +598,7 @@ export class AgentOrchestrator {
           pauseForReviewablePlanArtifact,
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);
+        publishExecuteRecoveryState();
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (toolIterationPhase.status === "plan_completed") {
           const audit = toolIterationPhase.completionAudit || {

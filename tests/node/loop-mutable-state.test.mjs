@@ -120,6 +120,27 @@ test("approved Plan phase reset removes planning counters while preserving the t
   assert.equal(state.evidenceRuntimeState.sawExecuteOperationEvidence, false);
 });
 
+test("loop mutable state restores a target-scoped forced recovery transaction", () => {
+  const state = createAgentLoopMutableState({
+    callbacks: {
+      getIsPlanApproved: () => false,
+      getForcedExecuteRecoveryMode: () => "mutation_first",
+      getForcedExecuteRecoveryState: () => ({
+        mode: "validation_only",
+        reason: "goal_continuation_mutation_observed",
+        expectedTarget: "src/App.tsx",
+      }),
+      getSessionKey: () => "session-1",
+    },
+    workflowMode: "edit",
+    unityMcpRuntimeState: { firstPhaseActive: false },
+  });
+
+  assert.equal(state.executeRecoveryState.mode, "validation_only");
+  assert.equal(state.executeRecoveryState.reason, "goal_continuation_mutation_observed");
+  assert.equal(state.executeRecoveryState.expectedTarget, "src/App.tsx");
+});
+
 test("agent orchestrator delegates mutable runtime state creation and folds", () => {
   assert.match(orchestratorSource, /createAgentLoopMutableState\(\{/);
   assert.match(orchestratorSource, /applyIterationStreamPreparationMutableState\(/);
@@ -128,6 +149,8 @@ test("agent orchestrator delegates mutable runtime state creation and folds", ()
   assert.match(orchestratorSource, /markExecuteOperationEvidenceMutableState\(loopState\)/);
   assert.match(orchestratorSource, /markChatFinalSynthesisPromptUsedMutableState\(loopState\)/);
   assert.match(orchestratorSource, /resetAgentLoopMutableStateForApprovedPlanExecution\(loopState\)/);
+  assert.match(orchestratorSource, /publishExecuteRecoveryState/);
+  assert.match(orchestratorSource, /onExecuteRecoveryStateChange/);
   assert.doesNotMatch(orchestratorSource, /createAgentLoopGuardRuntimeState\(\)/);
   assert.doesNotMatch(orchestratorSource, /createAgentLoopStreamRuntimeState\(\)/);
   assert.doesNotMatch(orchestratorSource, /markExecuteOperationEvidenceRuntimeState\(/);

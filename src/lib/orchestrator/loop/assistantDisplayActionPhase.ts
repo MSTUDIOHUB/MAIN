@@ -113,6 +113,7 @@ export function handleAssistantDisplayActionPhase(input: {
     suppressExecutableProposalOptionsForToolCalls,
     suppressInferredReplyOptionsForToolCalls,
     suppressApprovedPlanExecutionReplyOptions,
+    suppressMutationRuntimeReplyOptions,
     suppressInferredOperationApprovalAfterExecution,
     sourceVisibleText,
     currentPlanStageForReview,
@@ -262,6 +263,20 @@ export function handleAssistantDisplayActionPhase(input: {
       turnIntent,
       runtimeIntent,
       planStage: currentPlanStageForReview,
+    });
+  }
+  if (suppressMutationRuntimeReplyOptions) {
+    logAgentEvent("mutation_runtime_reply_options_suppressed", {
+      iteration,
+      reason: effectiveToolCalls.length > 0
+        ? "tool_calls_present"
+        : "model_owned_work_or_reapproval",
+      replyOptions: normalized.replyOptions.length,
+      optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
+      toolCalls: effectiveToolCalls.length,
+      workflowMode,
+      turnIntent,
+      runtimeIntent,
     });
   }
   if (suppressInferredOperationApprovalAfterExecution) {

@@ -17,6 +17,7 @@ import type { VerificationResult } from "./goalVerification";
 import { buildCheckpointContextForLLM } from "./goalPersistence";
 import { buildVerificationSummary } from "./goalVerification";
 import { classifyGoalToolCapability } from "./goalToolCapabilities";
+import { resolveSubagentDelegationPreference } from "./turnIntake";
 
 export interface GoalIterationContextInput {
   /** Current goal definition */
@@ -71,6 +72,22 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
       goal.sourceContext,
       "",
     ].join("\n"));
+  }
+
+  const subagentPreference = resolveSubagentDelegationPreference(goal.objective);
+  if (subagentPreference === "preferred") {
+    sections.push([
+      isZh ? "## 子智能体协作偏好" : "## Subagent Collaboration Preference",
+      "",
+      isZh
+        ? "用户明确偏好多子智能体并行协作。先识别路径不重叠、可独立交付证据的只读范围；若至少存在两个实质范围，应尽早创建最多两个子智能体，主体同时推进非重叠工作。不要重复读取子智能体租约路径，也不要为凑数拆分琐碎任务。"
+        : "The user explicitly prefers parallel subagent collaboration. Identify read-only scopes with disjoint paths and independently useful evidence; when at least two substantial scopes exist, spawn up to two early while the parent advances non-overlapping work. Do not duplicate leased paths or manufacture filler tasks.",
+      "",
+    ].join("\n"));
+  } else if (subagentPreference === "forbidden") {
+    sections.push(isZh
+      ? "用户明确要求本目标不使用子智能体。"
+      : "The user explicitly disabled subagents for this goal.");
   }
 
   if (input.continuationMemory) {

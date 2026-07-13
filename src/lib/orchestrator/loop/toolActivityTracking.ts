@@ -11,14 +11,7 @@ import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { summarizePlanEvidenceDetail } from "../../planMaterialization";
 import { parseToolFeedbackEnvelope } from "../../toolFeedbackEnvelope";
 import type { ToolExecutionResult } from "../types";
-import { analyzePtyObservationResult } from "../../devServerRuntime";
-
-const PTY_OBSERVATION_TOOL_NAMES = new Set([
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
-]);
+import { isSuccessfulVerificationToolObservation } from "../../verificationEvidence";
 
 const SUBAGENT_EVIDENCE_TOOLS = new Set([
   "read_file",
@@ -181,27 +174,6 @@ export function isEditProgressResult(result: ToolExecutionResult): boolean {
 }
 
 export function isVerificationEvidenceResult(result: ToolExecutionResult): boolean {
-  if (
-    result.isError ||
-    result.internalFeedback ||
-    !EXECUTION_VERIFICATION_TOOL_NAMES.has(result.name)
-  ) {
-    return false;
-  }
-  if (result.name === "browser_evaluate") {
-    return browserResultLooksSuccessful(result.content || "");
-  }
-  // Dispatching a PTY command or typing into it is execution progress, not
-  // verification. A later PTY observation owns the long-lived process state.
-  if (result.name === "execute_command" || result.name === "send_pty_input") {
-    return false;
-  }
-  if (PTY_OBSERVATION_TOOL_NAMES.has(result.name)) {
-    const observation = analyzePtyObservationResult(result.content || "");
-    return observation.status === "ready";
-  }
-  if (result.name === "run_command") {
-    return commandResultLooksSuccessful(result.name, result.content || "");
-  }
-  return true;
+  return EXECUTION_VERIFICATION_TOOL_NAMES.has(result.name) &&
+    isSuccessfulVerificationToolObservation(result);
 }

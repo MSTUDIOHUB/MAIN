@@ -1,4 +1,9 @@
 import { shouldBypassApprovedPlanReadCacheForPatchRecovery } from "../../approvedPlanRecoveryTools";
+import {
+  resolveExecuteRecoveryBatchDecision,
+  shouldUseExecutePatchRecoveryReadLease,
+  type ExecuteRecoveryMode,
+} from "../../executeRecoveryTools";
 import { resolveApprovedPlanMutationScope } from "../../approvedPlanExecutionScope";
 import {
   FILE_UNCHANGED_STUB,
@@ -73,6 +78,7 @@ import type {
   ReadOnlyToolCallForRound,
   WriteToolCallForRound,
 } from "./toolExecutionRound";
+import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import type { TurnIterationContext } from "./turnIterationContext";
 
 export interface ToolCallPartitioningResult {
@@ -107,6 +113,7 @@ export async function partitionToolCallsForExecution(input: {
   buildCurrentTaskTargetingProfile: () => TaskTargetingProfile;
   approvedPlanActionOnlyRecoveryActive: boolean;
   allowApprovedPlanRecoveryFileRead: boolean;
+  executeRecoveryState: ExecuteRecoveryRuntimeState;
   effectiveExecuteRecoveryFileRead: boolean;
   readOnlyResultCache: Map<string, CachedReadOnlyToolResult>;
   readOnlyDuplicateSkipCounts: Map<string, number>;
@@ -135,6 +142,7 @@ export async function partitionToolCallsForExecution(input: {
     buildCurrentTaskTargetingProfile,
     approvedPlanActionOnlyRecoveryActive,
     allowApprovedPlanRecoveryFileRead,
+    executeRecoveryState,
     effectiveExecuteRecoveryFileRead,
     readOnlyResultCache,
     readOnlyDuplicateSkipCounts,
@@ -144,6 +152,7 @@ export async function partitionToolCallsForExecution(input: {
     emitTurnEvent,
   } = input;
   const { eventThreadId, eventTurnId } = iterationContext;
+  const executeRecoveryMode: ExecuteRecoveryMode = executeRecoveryState.mode;
 
   const readOnlyCalls: ReadOnlyToolCallForRound[] = [];
   const localFileReadCalls: LocalFileReadToolCallForRound[] = [];
@@ -155,6 +164,21 @@ export async function partitionToolCallsForExecution(input: {
   const queuedReadOnlySignatures = new Set<string>();
   const toolFailureSignatures = new Map<string, string>();
   const preExecutionResults: ToolExecutionResult[] = [];
+  let approvedPlanPatchRecoveryReadLeaseClaimed = false;
+  let executePatchRecoveryReadLeaseClaimed = false;
+  const executeRecoveryBatchDecision = resolveExecuteRecoveryBatchDecision({
+    mode: executeRecoveryMode,
+    calls: toolCalls.map((call) => {
+      const args = parseToolCallArguments(call, workspace);
+      return {
+        id: call.id,
+        name: call.name,
+        target: getToolTarget(call.name, args),
+      };
+    }),
+    recentActivity: recentToolActivity,
+    expectedTarget: executeRecoveryState.expectedTarget,
+  });
 
   for (const tc of toolCalls) {
     let toolArgs = parseToolCallArguments(tc, workspace);
@@ -195,6 +219,63 @@ export async function partitionToolCallsForExecution(input: {
     });
     const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
     toolFailureSignatures.set(tc.id, failureSignature);
+
+    if (
+      executeRecoveryBatchDecision.active &&
+      executeRecoveryBatchDecision.selectedCallId !== tc.id
+    ) {
+      const language = callbacks.getPreferredLanguage();
+      const selectedTool = executeRecoveryBatchDecision.selectedToolName || (
+        executeRecoveryBatchDecision.phase === "need_context"
+          ? "read_file"
+          : executeRecoveryBatchDecision.phase === "need_mutation"
+            ? "apply_patch/replace_in_file/write_file"
+            : "run_command/browser_evaluate"
+      );
+      const expectedTargetHint = executeRecoveryState.expectedTarget
+        ? language === "zh"
+          ? executeRecoveryBatchDecision.phase === "need_context"
+            ? ` 当前事务目标是 ${executeRecoveryState.expectedTarget}；下一步必须读取该目标。`
+            : executeRecoveryBatchDecision.phase === "need_mutation" || executeRecoveryBatchDecision.phase === "legacy_action"
+              ? ` 当前事务目标是 ${executeRecoveryState.expectedTarget}；下一步必须修改该目标。`
+              : ` 当前事务目标必须保持为 ${executeRecoveryState.expectedTarget}。`
+          : executeRecoveryBatchDecision.phase === "need_context"
+            ? ` The transaction target is ${executeRecoveryState.expectedTarget}; the next call must read that target.`
+            : executeRecoveryBatchDecision.phase === "need_mutation" || executeRecoveryBatchDecision.phase === "legacy_action"
+              ? ` The transaction target is ${executeRecoveryState.expectedTarget}; the next call must mutate that target.`
+              : ` The transaction target must remain ${executeRecoveryState.expectedTarget}.`
+        : "";
+      const message = language === "zh"
+        ? `EXECUTE_RECOVERY_BATCH_DEFERRED: 当前恢复事务处于 ${executeRecoveryBatchDecision.phase}，本批只执行一个 ${selectedTool}。${tc.name} 已推迟；请先消费本批工具结果，再在下一条回复中调用下一阶段的一个工具。${expectedTargetHint}`
+        : `EXECUTE_RECOVERY_BATCH_DEFERRED: The recovery transaction is in ${executeRecoveryBatchDecision.phase}; this batch executes only one ${selectedTool}. ${tc.name} was deferred. Consume this tool result, then call one tool for the next phase in the next response.${expectedTargetHint}`;
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "execute_recovery_batch_deferred",
+      });
+      logAgentEvent("execute_recovery_batch_call_deferred", {
+        iteration,
+        phase: executeRecoveryBatchDecision.phase,
+        selectedCallId: executeRecoveryBatchDecision.selectedCallId,
+        selectedTool: executeRecoveryBatchDecision.selectedToolName,
+        deferredCallId: tc.id,
+        deferredTool: tc.name,
+        target,
+        expectedTarget: executeRecoveryState.expectedTarget,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: "",
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "execute_recovery_batch_deferred",
+      });
+      continue;
+    }
 
     const directScopeTarget = typeof toolArgs.path === "string" ? toolArgs.path.trim() : "";
     const scopeTargets = tc.name === "apply_patch"
@@ -639,34 +720,51 @@ export async function partitionToolCallsForExecution(input: {
           : "";
       let fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
       const bypassApprovedPlanPatchRecoveryReadCache =
-        (workflowMode === "plan" &&
-          callbacks.getIsPlanApproved() &&
-          isMutationRuntimeIntent(runtimeIntent) &&
-          shouldBypassApprovedPlanReadCacheForPatchRecovery({
-            toolName: tc.name,
-            allowFileRead: allowApprovedPlanRecoveryFileRead,
-            target,
-            recentActivity: recentPlanToolActivity,
-          })) ||
-        (workflowMode === "edit" &&
-          isMutationRuntimeIntent(runtimeIntent) &&
-          tc.name === "read_file" &&
-          effectiveExecuteRecoveryFileRead);
-      if (bypassApprovedPlanPatchRecoveryReadCache) {
-        logAgentEvent("approved_plan_patch_recovery_read_cache_bypass", {
-          iteration,
+        !approvedPlanPatchRecoveryReadLeaseClaimed &&
+        workflowMode === "plan" &&
+        callbacks.getIsPlanApproved() &&
+        isMutationRuntimeIntent(runtimeIntent) &&
+        shouldBypassApprovedPlanReadCacheForPatchRecovery({
+          toolName: tc.name,
+          allowFileRead: allowApprovedPlanRecoveryFileRead,
           target,
-          recentActivity: (workflowMode === "plan" ? recentPlanToolActivity : recentToolActivity)
-            .slice(-4)
-            .map((activity) => ({
-              name: activity.name,
-              target: activity.target,
-              status: activity.status,
-            })),
+          recentActivity: recentPlanToolActivity,
         });
+      const bypassExecutePatchRecoveryReadCache =
+        workflowMode === "edit" &&
+        isMutationRuntimeIntent(runtimeIntent) &&
+        shouldUseExecutePatchRecoveryReadLease({
+          toolName: tc.name,
+          allowFileRead: effectiveExecuteRecoveryFileRead,
+          target,
+          recentActivity: recentToolActivity,
+          leaseClaimed: executePatchRecoveryReadLeaseClaimed,
+        });
+      if (bypassApprovedPlanPatchRecoveryReadCache) approvedPlanPatchRecoveryReadLeaseClaimed = true;
+      if (bypassExecutePatchRecoveryReadCache) executePatchRecoveryReadLeaseClaimed = true;
+      const bypassPatchRecoveryReadCache =
+        bypassApprovedPlanPatchRecoveryReadCache || bypassExecutePatchRecoveryReadCache;
+      if (bypassPatchRecoveryReadCache) {
+        logAgentEvent(
+          bypassApprovedPlanPatchRecoveryReadCache
+            ? "approved_plan_patch_recovery_read_cache_bypass"
+            : "execute_patch_recovery_read_cache_bypass",
+          {
+            iteration,
+            target,
+            leaseScope: "one_targeted_read_per_batch",
+            recentActivity: (workflowMode === "plan" ? recentPlanToolActivity : recentToolActivity)
+              .slice(-4)
+              .map((activity) => ({
+                name: activity.name,
+                target: activity.target,
+                status: activity.status,
+              })),
+          },
+        );
       }
 
-      if (fileReadState && !bypassApprovedPlanPatchRecoveryReadCache && isContentInActiveMessages(fileReadState.modelContent, managedAgentMessages)) {
+      if (fileReadState && !bypassPatchRecoveryReadCache && isContentInActiveMessages(fileReadState.modelContent, managedAgentMessages)) {
         const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
         const unchanged =
           metadata != null &&
@@ -792,7 +890,7 @@ export async function partitionToolCallsForExecution(input: {
         tc.name === "read_file" &&
         typeof toolArgs.path === "string" &&
         fileReadMetadata &&
-        !bypassApprovedPlanPatchRecoveryReadCache
+        !bypassPatchRecoveryReadCache
       ) {
         const coverage = getReadFileCoverageForPath({
           states: fileReadStates,
@@ -902,7 +1000,7 @@ export async function partitionToolCallsForExecution(input: {
 
       if (
         cacheableReadOnlyTool &&
-        !bypassApprovedPlanPatchRecoveryReadCache &&
+        !bypassPatchRecoveryReadCache &&
         (cached || queuedReadOnlySignatures.has(signature))
       ) {
         const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;

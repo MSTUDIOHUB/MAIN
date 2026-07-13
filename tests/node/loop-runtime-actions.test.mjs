@@ -20,6 +20,8 @@ test("loop runtime actions own mutable recovery and phase reducers", () => {
 
   assert.match(actionsSource, /export function createAgentLoopRuntimeActions/);
   assert.match(actionsSource, /activateExecuteRecoveryRuntimeState\(/);
+  assert.match(actionsSource, /expectedTarget/);
+  assert.match(actionsSource, /repeatedTargets\.length === 1/);
   assert.match(actionsSource, /activateChatFinalSynthesisState\(/);
   assert.match(actionsSource, /clearExecuteRecoveryRuntimeState\(stateOverride\)/);
   assert.match(actionsSource, /clearCrossIterationReadTrackingForTarget\(/);

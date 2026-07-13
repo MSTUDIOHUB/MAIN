@@ -1,6 +1,11 @@
 import type { HooksConfig } from "../../hooks";
 import {
+  isReadOnlyNoProgressDetail,
+  resolveExecutePatchRecoveryTarget,
+} from "../../executeRecoveryTools";
+import {
   buildAssistantHistoryMessage,
+  isProjectSourceWriteResult,
   isReviewablePlanStage,
   isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
@@ -27,7 +32,10 @@ import {
   applyRecentSuccessfulProjectWriteRuntimeState,
   markExecuteOperationEvidenceRuntimeState,
 } from "./evidenceRuntimeState";
-import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import {
+  transitionExecuteRecoveryRuntimeState,
+  type ExecuteRecoveryRuntimeState,
+} from "./executeRecoveryRuntime";
 import type { AgentLoopGuardRuntimeState } from "./loopGuardRuntimeState";
 import { clearCrossIterationReadTrackingForTarget } from "./loopGuardRuntimeState";
 import type { AgentLoopNoToolRuntimeState } from "./noToolRuntimeState";
@@ -45,6 +53,7 @@ import { resetTransientRecoveryPromptRuntimeState } from "./recoveryPromptRuntim
 import type { AgentLoopToolExecutionRuntimeState } from "./toolExecutionRuntimeState";
 import { partitionToolCallsForExecution } from "./toolCallPartitioning";
 import { executeToolExecutionRound } from "./toolExecutionRound";
+import { isVerificationEvidenceResult } from "./toolActivityTracking";
 import { handleToolResultPostProcessing } from "./toolResultPostProcessing";
 import { appendToolResultsToHistory } from "./toolResultHistory";
 import type { TurnIterationContext } from "./turnIterationContext";
@@ -242,6 +251,7 @@ export async function executeToolCallPhase(input: {
     buildCurrentTaskTargetingProfile: input.buildCurrentTaskTargetingProfile,
     ...approvedPlanRecoveryState,
     allowApprovedPlanRecoveryFileRead: input.allowApprovedPlanRecoveryFileRead,
+    executeRecoveryState,
     effectiveExecuteRecoveryFileRead: input.effectiveExecuteRecoveryFileRead,
     ...input.toolExecutionRuntimeState,
     iterationContext: input.iterationContext,
@@ -282,6 +292,52 @@ export async function executeToolCallPhase(input: {
   allResults.push(...toolExecutionRound.results);
   const wasAborted = toolExecutionRound.status === "aborted";
 
+  const freshReadResult = allResults.find((result) =>
+    result.name === "read_file" &&
+    !result.isError &&
+    !result.internalFeedback &&
+    !isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
+  );
+  const mutationResult = allResults.find((result) =>
+    !result.internalFeedback && isProjectSourceWriteResult(result)
+  );
+  const validationResult = allResults.find(isVerificationEvidenceResult);
+  const expectedRecoveryTarget = executeRecoveryState.expectedTarget || (
+    executeRecoveryState.mode === "patch_recovery_read"
+      ? resolveExecutePatchRecoveryTarget(input.recentToolActivity)
+      : null
+  );
+  const recoveryTransition = transitionExecuteRecoveryRuntimeState(
+    executeRecoveryState,
+    {
+      expectedTarget: expectedRecoveryTarget,
+      freshReadTarget: freshReadResult?.target,
+      mutationTarget: mutationResult?.target,
+      validationTarget: validationResult?.target || validationResult?.name,
+    },
+  );
+  if (recoveryTransition.transition === "validation_to_normal") {
+    executeRecoveryState = clearExecuteRecoveryAndSync(
+      "recovery_validation_observed",
+      recoveryTransition.target || undefined,
+    );
+  } else if (recoveryTransition.transition !== "none") {
+    const previousMode = executeRecoveryState.mode;
+    executeRecoveryState = recoveryTransition.state;
+    logAgentEvent("execute_recovery_phase_transition", {
+      iteration: input.iteration,
+      transition: recoveryTransition.transition,
+      previousMode,
+      nextMode: executeRecoveryState.mode,
+      target: recoveryTransition.target,
+      executeRecoveryAttempts: executeRecoveryState.attempts,
+    });
+  } else if (recoveryTransition.state !== executeRecoveryState) {
+    // A known patch target remains part of the transaction even if the model
+    // attempted an unrelated read or mutation that cannot advance the phase.
+    executeRecoveryState = recoveryTransition.state;
+  }
+
   const hasPlanDecisionOutput =
     input.hasStructuredProposal ||
     input.finalReplyOptionCount > 0 ||
@@ -318,7 +374,6 @@ export async function executeToolCallPhase(input: {
     activateUnityMcpFallback: input.activateUnityMcpFallback,
     setPlanRuntimePhase: input.setPlanRuntimePhase,
     emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
-    clearExecuteRecovery: clearExecuteRecoveryAndSync,
   });
   evidenceRuntimeState = applyRecentSuccessfulProjectWriteRuntimeState(
     evidenceRuntimeState,
