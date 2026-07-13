@@ -40,6 +40,38 @@ test("tool call execution phase owns post-processing runtime state updates", () 
   assert.match(phaseSource, /isUnapprovedPlanReadOnlyBatch:\s*toolResultPostProcessing\.isUnapprovedPlanReadOnlyBatch/);
 });
 
+test("tool call execution phase preserves callback-owned state through the phase fold", () => {
+  assert.match(
+    phaseSource,
+    /const markExecuteOperationEvidenceAndSync[\s\S]*?evidenceRuntimeState = markExecuteOperationEvidenceRuntimeState/,
+  );
+  assert.match(
+    phaseSource,
+    /const clearExecuteRecoveryAndSync[\s\S]*?executeRecoveryState = input\.clearExecuteRecovery\([\s\S]*?executeRecoveryState[\s\S]*?loopGuardRuntimeState = clearCrossIterationReadTrackingForTarget/,
+  );
+  assert.match(
+    phaseSource,
+    /markExecuteOperationEvidence: markExecuteOperationEvidenceAndSync/,
+  );
+  assert.match(phaseSource, /clearExecuteRecovery: clearExecuteRecoveryAndSync/);
+  assert.match(phaseSource, /executeRecoveryState,[\s\S]*?loopGuardRuntimeState,/);
+});
+
+test("partial abort reconciles observed tool results before returning and closes protocol calls", () => {
+  const postProcessIndex = phaseSource.indexOf("handleToolResultPostProcessing({");
+  const abortedReturnIndex = phaseSource.indexOf('status: "aborted"', postProcessIndex);
+
+  assert.notEqual(postProcessIndex, -1);
+  assert.notEqual(abortedReturnIndex, -1);
+  assert.ok(postProcessIndex < abortedReturnIndex);
+  assert.match(phaseSource, /const wasAborted = toolExecutionRound\.status === "aborted"/);
+  assert.match(phaseSource, /if \(wasAborted\) \{[\s\S]*?appendToolResultsToHistory\(\{/);
+  assert.match(phaseSource, /observedToolCallIds/);
+  assert.match(phaseSource, /TOOL_CALL_ABORTED/);
+  assert.match(phaseSource, /lifecycleState: "blocked"/);
+  assert.match(phaseSource, /internalFeedback: true/);
+});
+
 test("tool iteration phase delegates to the tool call execution phase", () => {
   assert.match(toolIterationPhaseSource, /executeToolCallPhase\(input\)/);
   assert.match(orchestratorSource, /handleToolIterationPhase\(\{/);

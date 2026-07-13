@@ -767,6 +767,11 @@ test.beforeEach(async ({ page }) => {
         }
 
         if (scenario === "execute-max-iterations-checkpoint") {
+          if (body.includes("QUEUE_PRIORITY_CHECK")) {
+            return JSON.stringify({
+              output_text: "QUEUE_PRIORITY_CHECK 已优先处理完成。",
+            });
+          }
           return JSON.stringify({
             output_text: [
               "继续读取下一份检查材料。",
@@ -2039,7 +2044,9 @@ test("ordinary execute repeated read-only loops create a recovery pause instead 
           hasReadOnlyRecoveryGuidance: systemTexts.some((text: string) =>
             /重复只读|复用已读上下文|read-only|reuse read context/i.test(text),
           ),
+          planAutoResumeCount: snapshot?.planAutoResumeCount,
           currentTurnStatus: snapshot?.currentTurnStatus,
+          conversationTurns: snapshot?.conversationTurns,
           hasErrorTool: (snapshot?.toolNames || []).includes("Error"),
         };
       }),
@@ -2048,8 +2055,125 @@ test("ordinary execute repeated read-only loops create a recovery pause instead 
     .toEqual({
       hasRecoverablePause: true,
       hasReadOnlyRecoveryGuidance: true,
+      planAutoResumeCount: 1,
       currentTurnStatus: "stopped_no_action",
+      conversationTurns: 1,
       hasErrorTool: false,
+    });
+
+  const lineage = await page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    return {
+      currentTurnId: snapshot?.currentTurnId ?? null,
+      turnStartedEvents: snapshot?.turnStartedEvents || [],
+      runStartedEvents: snapshot?.runStartedEvents || [],
+    };
+  });
+  expect(lineage.currentTurnId).not.toBeNull();
+  expect(lineage.turnStartedEvents).toEqual([{ turnId: lineage.currentTurnId }]);
+  expect(lineage.runStartedEvents).toHaveLength(2);
+  const [initialRun, resumedRun] = lineage.runStartedEvents;
+  expect(initialRun).toMatchObject({
+    turnId: lineage.currentTurnId,
+    parentRunId: null,
+  });
+  expect(resumedRun).toMatchObject({
+    turnId: lineage.currentTurnId,
+    parentRunId: initialRun.runId,
+  });
+  expect(resumedRun.runId).not.toBe(initialRun.runId);
+});
+
+test("a queued user message wins over max-iteration auto-resume without starting two owners", async ({ page }) => {
+  test.setTimeout(35_000);
+  await page.goto("/?e2eScenario=execute-max-iterations-checkpoint");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请直接执行一个需要多轮检查的长任务。"),
+  );
+  expect(sent).toBe(true);
+  const queued = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.queueCloudRespondMessage?.("QUEUE_PRIORITY_CHECK"),
+  );
+  expect(queued).toBe(true);
+
+  await expect.poll(async () =>
+    page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+      return {
+        planAutoResumeCount: snapshot?.planAutoResumeCount,
+        conversationTurns: snapshot?.conversationTurns,
+        currentTurnStatus: snapshot?.currentTurnStatus,
+        handledQueuedMessage: (snapshot?.agentTexts || []).some((text: string) =>
+          text.includes("QUEUE_PRIORITY_CHECK 已优先处理完成"),
+        ),
+        turnStartedEvents: snapshot?.turnStartedEvents || [],
+        runStartedEvents: snapshot?.runStartedEvents || [],
+        runPausedEvents: snapshot?.runPausedEvents || [],
+      };
+    }), { timeout: 25_000 }).toMatchObject({
+      planAutoResumeCount: 0,
+      conversationTurns: 2,
+      currentTurnStatus: "done",
+      handledQueuedMessage: true,
+      turnStartedEvents: [{ turnId: expect.any(String) }, { turnId: expect.any(String) }],
+      runStartedEvents: [
+        { runId: expect.any(String), turnId: expect.any(String), parentRunId: null },
+        { runId: expect.any(String), turnId: expect.any(String), parentRunId: null },
+      ],
+      runPausedEvents: [
+        {
+          runId: expect.any(String),
+          turnId: expect.any(String),
+          reason: "max_iterations_auto_resume_canceled",
+          message: expect.stringMatching(/优先|priority/i),
+        },
+      ],
+    });
+});
+
+test("a rejected max-iteration auto-resume rolls back and leaves a visible checkpoint", async ({ page }) => {
+  test.setTimeout(35_000);
+  await page.goto("/?e2eScenario=execute-max-iterations-checkpoint");
+
+  const sent = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.sendCloudMessage?.("请直接执行一个需要多轮检查的长任务。"),
+  );
+  expect(sent).toBe(true);
+  const armed = await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.rejectNextAutoResume?.(),
+  );
+  expect(armed).toBe(true);
+
+  await expect.poll(async () =>
+    page.evaluate(() => {
+      const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+      return {
+        planAutoResumeCount: snapshot?.planAutoResumeCount,
+        conversationTurns: snapshot?.conversationTurns,
+        currentTurnStatus: snapshot?.currentTurnStatus,
+        hasVisiblePause: (snapshot?.systemTexts || []).some((text: string) =>
+          /执行已暂停|Execution paused/.test(text),
+        ),
+        runStartedEvents: snapshot?.runStartedEvents || [],
+        runPausedEvents: snapshot?.runPausedEvents || [],
+      };
+    }), { timeout: 25_000 }).toMatchObject({
+      planAutoResumeCount: 0,
+      conversationTurns: 1,
+      currentTurnStatus: "stopped_no_action",
+      hasVisiblePause: true,
+      runStartedEvents: [
+        { runId: expect.any(String), turnId: expect.any(String), parentRunId: null },
+      ],
+      runPausedEvents: [
+        {
+          runId: expect.any(String),
+          turnId: expect.any(String),
+          reason: "max_iterations_auto_resume_canceled",
+          message: expect.stringMatching(/暂停|paused/i),
+        },
+      ],
     });
 });
 

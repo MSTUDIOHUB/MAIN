@@ -42,10 +42,18 @@ import {
 } from "../turnEvents";
 import { type DurableTurnContext, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, canonicalizePlanArtifactPath, detectPlanArtifactKind } from "../workflowModels";
 import {
+  PLAN_MAX_AUTO_RESUME_LIMIT,
+  buildExecuteMaxIterationsAutoResumeNotice,
+  buildExecuteMaxIterationsPauseNotice,
+  buildExecuteMaxIterationsResumePrompt,
+  buildPlanMaxIterationsAutoResumeNotice,
+  buildPlanMaxIterationsPauseNotice,
+  buildPlanMaxIterationsResumePrompt,
   buildPlanExecutionProgressUpdate,
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanSameTurnFallbackDecision,
   toPlanExecutionRuntimeProgressUpdate,
+  type PlanMaxIterationsCheckpoint,
 } from "../planExecutionRecovery";
 import { createPlanExecutionEvidenceEntry, appendPlanEvidenceEntry } from "../planEvidence";
 import { closeHarnessRunMarker, getHarnessActionRunId, isHarnessRunMarkerOwnedByRun, persistHarnessRunMarkerIfOwned, type HarnessRunMarker } from "../harnessCrashTelemetry";
@@ -229,6 +237,11 @@ export class WorkflowEngine {
       phase: string | null;
       nextStep: string | null;
       repeatedTargets: string[];
+    } | null = null;
+    let pendingMaxIterationsAutoResume: {
+      kind: "plan" | "execute";
+      start: () => void;
+      cancel: (reason: string, options?: { visible?: boolean }) => void;
     } | null = null;
     const logStoreEvent = (event: string, data: Record<string, unknown> = {}) => {
       const state = sessionGet();
@@ -2437,6 +2450,447 @@ export class WorkflowEngine {
         });
       },
 
+      onPlanMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
+        const currentCount = Math.max(
+          0,
+          Number(sessionGet().planAutoResumeCount) || 0,
+        );
+        const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
+        const effectiveCheckpoint = {
+          ...checkpoint,
+          autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
+        };
+        const notice = shouldAutoResume
+          ? buildPlanMaxIterationsAutoResumeNotice(effectiveCheckpoint, phaseLanguage)
+          : buildPlanMaxIterationsPauseNotice(effectiveCheckpoint, phaseLanguage);
+
+        appendDebugLog(
+          shouldAutoResume ? "info" : "warn",
+          shouldAutoResume
+            ? "plan.max_iterations_auto_resume_pending"
+            : "plan.max_iterations_paused",
+          {
+            turnId,
+            uiDisplayTurnId: context.uiDisplayTurnId,
+            checkpoint: effectiveCheckpoint,
+            notice,
+          },
+        );
+        sessionSet((state: any) => ({
+          planAutoResumeCount: currentCount,
+          planStage: state.planStage === "completed" ? "completed" : "executing",
+          conversationTurns: state.conversationTurns.map((turn: any) =>
+            turn.id === turnId || turn.id === context.uiDisplayTurnId
+              ? {
+                  ...turn,
+                  status: "stopped_no_action",
+                  collapsed: false,
+                }
+              : turn
+          ),
+        }));
+        if (!shouldAutoResume) {
+          emitLocalPlanExecutionProgress("paused", {
+            iteration: effectiveCheckpoint.iterationCount,
+            maxIterations: effectiveCheckpoint.maxIterations,
+            currentTask: effectiveCheckpoint.currentTask,
+            latestEvidence: effectiveCheckpoint.completedEvidence[0],
+            recoveryReason: "plan_max_iterations_checkpoint",
+            nextStep: phaseLanguage === "zh"
+              ? "点击 Resume Execution 后从检查点继续"
+              : "click Resume Execution to continue from checkpoint",
+          });
+          const visibleNotice = phaseLanguage === "zh"
+            ? "计划执行已暂停：已达到安全轮次边界。MAIN 已保留当前 workspace 状态；可使用 Resume Execution 从这里继续。"
+            : "Plan execution paused after reaching the safety boundary. MAIN kept the current workspace state; use Resume Execution to continue from here.";
+          appendTurnBlock({
+            id: sessionGet()._nextTaskId(),
+            turnId: context.uiDisplayTurnId,
+            type: "system",
+            content: notice,
+            variant: "plan_execution_checkpoint",
+          });
+          sessionGet().setConversationTurnSummary(
+            context.uiDisplayTurnId,
+            visibleNotice,
+          );
+          logStoreEvent("plan_max_iterations_paused", {
+            autoResumeCount: currentCount,
+            maxIterations: checkpoint.maxIterations,
+          });
+          return true;
+        }
+
+        logStoreEvent("plan_max_iterations_auto_resume_pending", {
+          autoResumeCount: effectiveCheckpoint.autoResumeCount,
+          maxIterations: checkpoint.maxIterations,
+        });
+        const cancelAutoResume = (reason: string, options?: { visible?: boolean }) => {
+          const latest = sessionGet();
+          const latestSessionKey = resolveSessionRuntimeKey(
+            resolveSessionWorkspaceKey(latest.currentWorkspace),
+            latest.currentSessionId,
+          );
+          if (latestSessionKey !== runSessionKey) return;
+          const pauseCheckpoint = {
+            ...effectiveCheckpoint,
+            autoResumeCount: currentCount,
+          };
+          const pauseNotice = buildPlanMaxIterationsPauseNotice(
+            pauseCheckpoint,
+            phaseLanguage,
+          );
+          const cancellationNotice = options?.visible
+            ? pauseNotice
+            : phaseLanguage === "zh"
+              ? "自动续跑已取消：新的用户消息或运行时交接优先。"
+              : "Auto-resume was canceled because a newer user message or runtime handoff took priority.";
+          sessionSet((state: any) => ({
+            planAutoResumeCount: currentCount,
+            conversationTurns: state.conversationTurns.map((turn: any) =>
+              turn.id === turnId || turn.id === context.uiDisplayTurnId
+                ? { ...turn, status: "stopped_no_action", collapsed: false }
+                : turn
+            ),
+            runtimeEvents: state.runtimeEvents.map((event: any) =>
+              event.type === "run.paused" &&
+              event.runId === activeRuntimeRunIdentity.runId &&
+              event.reason === "max_iterations_auto_resume"
+                ? {
+                    ...event,
+                    reason: "max_iterations_auto_resume_canceled",
+                    message: cancellationNotice,
+                  }
+                : event
+            ),
+          }));
+          logStoreEvent("plan_max_iterations_auto_resume_canceled", {
+            reason,
+            autoResumeCount: currentCount,
+            maxIterations: checkpoint.maxIterations,
+          });
+          emitLocalPlanExecutionProgress("paused", {
+            iteration: effectiveCheckpoint.iterationCount,
+            maxIterations: effectiveCheckpoint.maxIterations,
+            currentTask: effectiveCheckpoint.currentTask,
+            latestEvidence: effectiveCheckpoint.completedEvidence[0],
+            recoveryReason: reason,
+            nextStep: options?.visible
+              ? phaseLanguage === "zh"
+                ? "点击 Resume Execution 后从检查点继续"
+                : "click Resume Execution to continue from checkpoint"
+              : phaseLanguage === "zh"
+                ? "新的用户消息或运行时交接已优先接管"
+                : "a newer user message or runtime handoff took priority",
+          });
+          if (options?.visible) {
+            appendTurnBlock({
+              id: sessionGet()._nextTaskId(),
+              turnId: context.uiDisplayTurnId,
+              type: "system",
+              content: pauseNotice,
+              variant: "plan_execution_checkpoint",
+            });
+            sessionGet().setConversationTurnSummary(
+              context.uiDisplayTurnId,
+              phaseLanguage === "zh"
+                ? "计划自动续跑未能启动，已安全暂停；可使用 Resume Execution 重试。"
+                : "Plan auto-resume could not start and paused safely; use Resume Execution to retry.",
+            );
+          }
+        };
+        pendingMaxIterationsAutoResume = {
+          kind: "plan",
+          cancel: cancelAutoResume,
+          start: () => {
+            const latest = sessionGet();
+            const latestSessionKey = resolveSessionRuntimeKey(
+              resolveSessionWorkspaceKey(latest.currentWorkspace),
+              latest.currentSessionId,
+            );
+            if (latestSessionKey !== runSessionKey) return;
+            if (
+              latest.isGenerating ||
+              latest.agentStatus === "running" ||
+              latest.agentStatus === "pending_review"
+            ) {
+              logStoreEvent("plan_max_iterations_auto_resume_skipped", {
+                reason: "newer_run_active",
+                agentStatus: latest.agentStatus,
+                isGenerating: latest.isGenerating,
+              });
+              return;
+            }
+            if (!latest.isPlanApproved || latest.planStage !== "executing") {
+              cancelAutoResume("approved_plan_no_longer_executable", { visible: true });
+              return;
+            }
+
+            sessionSet((state: any) => ({
+              planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
+              conversationTurns: state.conversationTurns.map((turn: any) =>
+                turn.id === turnId || turn.id === context.uiDisplayTurnId
+                  ? { ...turn, status: "executing" }
+                  : turn
+              ),
+            }));
+            let started = false;
+            try {
+              started = latest.sendMessage(
+                buildPlanMaxIterationsResumePrompt({
+                  language: phaseLanguage,
+                  checkpoint: effectiveCheckpoint,
+                  hasTasksArtifact:
+                    latest.planArtifacts.some((artifact: any) => artifact.kind === "tasks") ||
+                    latest.planTasks.length > 0,
+                  tasks: latest.planTasks,
+                  artifacts: latest.planArtifacts,
+                  evidenceLedger: latest.planExecutionEvidenceLedger,
+                }),
+                undefined,
+                {
+                  hidden: true,
+                  reuseCurrentTurn: true,
+                  turnIdOverride: context.uiDisplayTurnId || turnId,
+                  preservePlanState: true,
+                  resolvedIntent: "plan",
+                  runtimeIntentOverride: "execute",
+                  executionConsentGranted: true,
+                  parentRunIdOverride: activeRuntimeRunIdentity.runId,
+                  skipIntentResolution: true,
+                  turnTitle: phaseLanguage === "zh"
+                    ? "计划执行自动恢复"
+                    : "Plan Execution Auto-Resume",
+                  intentSummary: phaseLanguage === "zh"
+                    ? "计划执行达到安全轮次边界后自动恢复一次。"
+                    : "Auto-resume once after the plan execution safety boundary.",
+                },
+              ) === true;
+            } catch (error) {
+              logStoreEvent("plan_max_iterations_auto_resume_submission_failed", {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            if (started) {
+              logStoreEvent("plan_max_iterations_auto_resume_dispatched", {
+                autoResumeCount: effectiveCheckpoint.autoResumeCount,
+                parentRunId: activeRuntimeRunIdentity.runId,
+              });
+            } else {
+              cancelAutoResume("resume_submission_rejected", { visible: true });
+            }
+          },
+        };
+        return {
+          status: "auto_resume_scheduled" as const,
+          checkpoint: effectiveCheckpoint,
+        };
+      },
+
+      onExecuteMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
+        const currentCount = Math.max(
+          0,
+          Number(sessionGet().planAutoResumeCount) || 0,
+        );
+        const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
+        const effectiveCheckpoint = {
+          ...checkpoint,
+          autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
+        };
+        const notice = shouldAutoResume
+          ? buildExecuteMaxIterationsAutoResumeNotice(effectiveCheckpoint, phaseLanguage)
+          : buildExecuteMaxIterationsPauseNotice(effectiveCheckpoint, phaseLanguage);
+
+        appendDebugLog(
+          shouldAutoResume ? "info" : "warn",
+          shouldAutoResume
+            ? "execute.max_iterations_auto_resume_pending"
+            : "execute.max_iterations_paused",
+          {
+            turnId,
+            uiDisplayTurnId: context.uiDisplayTurnId,
+            checkpoint: effectiveCheckpoint,
+            notice,
+          },
+        );
+        sessionSet((state: any) => ({
+          planAutoResumeCount: currentCount,
+          conversationTurns: state.conversationTurns.map((turn: any) =>
+            turn.id === turnId || turn.id === context.uiDisplayTurnId
+              ? {
+                  ...turn,
+                  status: "stopped_no_action",
+                  collapsed: false,
+                }
+              : turn
+          ),
+        }));
+
+        if (!shouldAutoResume) {
+          const visibleNotice = phaseLanguage === "zh"
+            ? "执行已暂停：本轮达到安全边界。MAIN 已保留当前 workspace 状态；可继续执行以从这里恢复。"
+            : "Execution paused after reaching the safety boundary. MAIN kept the current workspace state; continue execution to resume from here.";
+          appendTurnBlock({
+            id: sessionGet()._nextTaskId(),
+            turnId: context.uiDisplayTurnId,
+            type: "system",
+            content: notice,
+            variant: "execution_checkpoint",
+          });
+          sessionGet().setConversationTurnSummary(
+            context.uiDisplayTurnId,
+            visibleNotice,
+          );
+          logStoreEvent("execute_max_iterations_paused", {
+            autoResumeCount: currentCount,
+            maxIterations: checkpoint.maxIterations,
+          });
+          return true;
+        }
+
+        logStoreEvent("execute_max_iterations_auto_resume_pending", {
+          autoResumeCount: effectiveCheckpoint.autoResumeCount,
+          maxIterations: checkpoint.maxIterations,
+        });
+        const cancelAutoResume = (reason: string, options?: { visible?: boolean }) => {
+          const latest = sessionGet();
+          const latestSessionKey = resolveSessionRuntimeKey(
+            resolveSessionWorkspaceKey(latest.currentWorkspace),
+            latest.currentSessionId,
+          );
+          if (latestSessionKey !== runSessionKey) return;
+          const pauseCheckpoint = {
+            ...effectiveCheckpoint,
+            autoResumeCount: currentCount,
+          };
+          const pauseNotice = buildExecuteMaxIterationsPauseNotice(
+            pauseCheckpoint,
+            phaseLanguage,
+          );
+          const cancellationNotice = options?.visible
+            ? pauseNotice
+            : phaseLanguage === "zh"
+              ? "自动续跑已取消：新的用户消息或运行时交接优先。"
+              : "Auto-resume was canceled because a newer user message or runtime handoff took priority.";
+          sessionSet((state: any) => ({
+            planAutoResumeCount: currentCount,
+            conversationTurns: state.conversationTurns.map((turn: any) =>
+              turn.id === turnId || turn.id === context.uiDisplayTurnId
+                ? { ...turn, status: "stopped_no_action", collapsed: false }
+                : turn
+            ),
+            runtimeEvents: state.runtimeEvents.map((event: any) =>
+              event.type === "run.paused" &&
+              event.runId === activeRuntimeRunIdentity.runId &&
+              event.reason === "max_iterations_auto_resume"
+                ? {
+                    ...event,
+                    reason: "max_iterations_auto_resume_canceled",
+                    message: cancellationNotice,
+                  }
+                : event
+            ),
+          }));
+          logStoreEvent("execute_max_iterations_auto_resume_canceled", {
+            reason,
+            autoResumeCount: currentCount,
+            maxIterations: checkpoint.maxIterations,
+          });
+          if (options?.visible) {
+            appendTurnBlock({
+              id: sessionGet()._nextTaskId(),
+              turnId: context.uiDisplayTurnId,
+              type: "system",
+              content: pauseNotice,
+              variant: "execution_checkpoint",
+            });
+            sessionGet().setConversationTurnSummary(
+              context.uiDisplayTurnId,
+              phaseLanguage === "zh"
+                ? "自动续跑未能启动，已安全暂停；可继续执行以重试。"
+                : "Auto-resume could not start and paused safely; continue execution to retry.",
+            );
+          }
+        };
+        pendingMaxIterationsAutoResume = {
+          kind: "execute",
+          cancel: cancelAutoResume,
+          start: () => {
+            const latest = sessionGet();
+            const latestSessionKey = resolveSessionRuntimeKey(
+              resolveSessionWorkspaceKey(latest.currentWorkspace),
+              latest.currentSessionId,
+            );
+            if (latestSessionKey !== runSessionKey) return;
+            if (
+              latest.isGenerating ||
+              latest.agentStatus === "running" ||
+              latest.agentStatus === "pending_review"
+            ) {
+              logStoreEvent("execute_max_iterations_auto_resume_skipped", {
+                reason: "newer_run_active",
+                agentStatus: latest.agentStatus,
+                isGenerating: latest.isGenerating,
+              });
+              return;
+            }
+
+            sessionSet((state: any) => ({
+              planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
+              conversationTurns: state.conversationTurns.map((turn: any) =>
+                turn.id === turnId || turn.id === context.uiDisplayTurnId
+                  ? { ...turn, status: "executing" }
+                  : turn
+              ),
+            }));
+            let started = false;
+            try {
+              started = latest.sendMessage(
+                buildExecuteMaxIterationsResumePrompt({
+                  language: phaseLanguage,
+                  checkpoint: effectiveCheckpoint,
+                }),
+                undefined,
+                {
+                  hidden: true,
+                  reuseCurrentTurn: true,
+                  turnIdOverride: context.uiDisplayTurnId || turnId,
+                  preservePlanState: true,
+                  resolvedIntent: "execute",
+                  runtimeIntentOverride: "execute",
+                  forceExecuteRecoveryMode: "action_plus_targeting",
+                  executionConsentGranted: true,
+                  parentRunIdOverride: activeRuntimeRunIdentity.runId,
+                  skipIntentResolution: true,
+                  turnTitle: phaseLanguage === "zh"
+                    ? "执行自动恢复"
+                    : "Execution Auto-Resume",
+                  intentSummary: phaseLanguage === "zh"
+                    ? "执行达到安全轮次边界后自动恢复一次。"
+                    : "Auto-resume once after the execution safety boundary.",
+                },
+              ) === true;
+            } catch (error) {
+              logStoreEvent("execute_max_iterations_auto_resume_submission_failed", {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            if (started) {
+              logStoreEvent("execute_max_iterations_auto_resume_dispatched", {
+                autoResumeCount: effectiveCheckpoint.autoResumeCount,
+                parentRunId: activeRuntimeRunIdentity.runId,
+              });
+            } else {
+              cancelAutoResume("resume_submission_rejected", { visible: true });
+            }
+          },
+        };
+        return {
+          status: "auto_resume_scheduled" as const,
+          checkpoint: effectiveCheckpoint,
+        };
+      },
+
       onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => {
         const latest = sessionGet();
         const planApprovalIdentity = status === "pending_review"
@@ -3424,6 +3878,13 @@ export class WorkflowEngine {
         latestState.planApprovalExecutionStartedForTurnId !== turnId
           ? latestState.pendingPlanApprovalHandoff
           : null;
+      if (pendingMaxIterationsAutoResume && (pendingSameTurnExecution || queuedAfterRun)) {
+        pendingMaxIterationsAutoResume.cancel(
+          pendingSameTurnExecution ? "plan_approval_handoff" : "queued_user_message",
+        );
+        pendingMaxIterationsAutoResume = null;
+        latestState = sessionGet();
+      }
       if (pendingSameTurnExecution) {
         sessionSet({ agentStatus: "idle", isGenerating: false, abortController: null });
         latestState = sessionGet();
@@ -3520,7 +3981,7 @@ export class WorkflowEngine {
         }
 
         runAfterNextPaint(() => {
-          let latest = sessionGet();
+          const latest = sessionGet();
           const latestSessionKey = resolveSessionRuntimeKey(
             resolveSessionWorkspaceKey(latest.currentWorkspace),
             latest.currentSessionId,
@@ -3541,13 +4002,12 @@ export class WorkflowEngine {
             return;
           }
           if (latest.isGenerating || latest.agentStatus === "running") {
-            logStoreEvent("queued_user_message_force_idle", {
-              reason: "stale_running_or_generating",
+            logStoreEvent("queued_user_message_deferred", {
+              reason: "newer_run_active",
               agentStatus: latest.agentStatus,
               isGenerating: latest.isGenerating,
             });
-            sessionSet({ agentStatus: "idle", isGenerating: false });
-            latest = sessionGet();
+            return;
           }
           logStoreEvent("queued_user_message_sending", {
             chars: queuedAfterRun.text.length,
@@ -3555,22 +4015,40 @@ export class WorkflowEngine {
             contextMentions: queuedAfterRun.contextMentions?.length || 0,
             attachedFiles: queuedAfterRun.attachedFiles?.length || 0,
           });
+          let started = false;
+          try {
+            started = latest.sendMessage(queuedAfterRun.text, queuedAfterRun.images, {
+              contextMentionsSnapshot: queuedAfterRun.contextMentions || [],
+              attachedFilesSnapshot: queuedAfterRun.attachedFiles || [],
+              runtimeIntentOverride: queuedAfterRun.runtimeIntentOverride,
+              goalSourceContextSnapshot: queuedAfterRun.goalSourceContextSnapshot,
+            }) === true;
+          } catch (error) {
+            logStoreEvent("queued_user_message_submission_failed", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          if (!started) {
+            logStoreEvent("queued_user_message_submission_rejected", {
+              chars: queuedAfterRun.text.length,
+            });
+            return;
+          }
 
-          // Only clear queuedUserMessage when actually sending the message
+          // Keep the payload durable until the new run has synchronously
+          // acquired its lease. A rejected submission remains visible/retryable.
           sessionSet({
             queuedUserMessage: null,
             input: "",
             contextMentions: [],
             attachedFiles: [],
           });
-
-          latest.sendMessage(queuedAfterRun.text, queuedAfterRun.images, {
-            contextMentionsSnapshot: queuedAfterRun.contextMentions || [],
-            attachedFilesSnapshot: queuedAfterRun.attachedFiles || [],
-            runtimeIntentOverride: queuedAfterRun.runtimeIntentOverride,
-            goalSourceContextSnapshot: queuedAfterRun.goalSourceContextSnapshot,
-          });
         });
+      } else if (pendingMaxIterationsAutoResume) {
+        const pending = pendingMaxIterationsAutoResume;
+        pendingMaxIterationsAutoResume = null;
+        logStoreEvent(`${pending.kind}_max_iterations_auto_resume_scheduled`, {});
+        runAfterNextPaint(() => pending.start());
       }
 
       return true;

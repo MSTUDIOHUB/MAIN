@@ -27,6 +27,8 @@ test("tool iteration phase owns the execution-to-recovery handoff", () => {
   assert.match(phaseSource, /hasPlanDecisionOutput: toolCallPhase\.hasPlanDecisionOutput/);
   assert.match(phaseSource, /unityMcpFallbackPrompt: toolCallPhase\.unityMcpFallbackPrompt/);
   assert.match(phaseSource, /isUnapprovedPlanReadOnlyBatch:\s*toolCallPhase\.isUnapprovedPlanReadOnlyBatch/);
+  assert.match(phaseSource, /executeRecoveryState: toolCallPhase\.executeRecoveryState/);
+  assert.match(phaseSource, /loopGuardRuntimeState: toolCallPhase\.loopGuardRuntimeState/);
 });
 
 test("tool iteration phase returns one folded runtime-state result to the orchestrator", () => {

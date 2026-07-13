@@ -67,6 +67,13 @@ export interface AgentLoopOutcome {
   reason: string;
 }
 
+export type MaxIterationsCheckpointHandling =
+  | boolean
+  | {
+      status: "auto_resume_scheduled";
+      checkpoint: PlanMaxIterationsCheckpoint;
+    };
+
 export interface OrchestratorCallbacks {
   // State accessors
   getMessages: () => AgentMessage[];
@@ -193,8 +200,12 @@ export interface OrchestratorCallbacks {
   onApprovedPlanExecutionStarted?: () => void;
   /** A fixed, user-safe plan drafting narration. Raw phases stay in the loop. */
   onPlanRuntimeNarration?: (narration: string | null) => void;
-  onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
-  onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
+  onPlanMaxIterationsCheckpoint?: (
+    checkpoint: PlanMaxIterationsCheckpoint,
+  ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
+  onExecuteMaxIterationsCheckpoint?: (
+    checkpoint: PlanMaxIterationsCheckpoint,
+  ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
   onTurnSummaryReady: (summary: string) => void;
   onExecutionDigestUpdate?: (summary: string) => void;
   onTurnRuntimePhaseChanged?: (phase: {

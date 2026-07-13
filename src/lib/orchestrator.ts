@@ -55,6 +55,7 @@ import {
 import {
   isReasoningDominatedLengthResult,
 } from "./orchestrator/agentRecovery";
+import type { MaxIterationsCheckpointHandling } from "./orchestrator/types";
 import {
   buildUnityApplyTextPolicyBlockedMessage,
   isUnityExecutionContext,
@@ -1403,8 +1404,12 @@ export interface OrchestratorCallbacks {
   onApprovedPlanExecutionStarted?: () => void;
   /** A fixed, user-safe plan drafting narration. Raw phases stay in the loop. */
   onPlanRuntimeNarration?: (narration: string | null) => void;
-  onPlanMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
-  onExecuteMaxIterationsCheckpoint?: (checkpoint: PlanMaxIterationsCheckpoint) => boolean | Promise<boolean>;
+  onPlanMaxIterationsCheckpoint?: (
+    checkpoint: PlanMaxIterationsCheckpoint,
+  ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
+  onExecuteMaxIterationsCheckpoint?: (
+    checkpoint: PlanMaxIterationsCheckpoint,
+  ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
   onTurnSummaryReady: (summary: string) => void;
   onExecutionDigestUpdate?: (summary: string) => void;
   onTurnRuntimePhaseChanged?: (phase: {

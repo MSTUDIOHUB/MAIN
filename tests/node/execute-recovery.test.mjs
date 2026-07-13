@@ -204,6 +204,43 @@ test("generic max-iteration boundary emits stop, idle, and a resumable run pause
   ]);
 });
 
+test("execute max-iteration callback can schedule auto-resume without consuming the counter", async () => {
+  let autoResumeCount = 0;
+  const stops = [];
+  const statuses = [];
+  const pausedRuns = [];
+
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => autoResumeCount,
+      onExecuteMaxIterationsCheckpoint: (checkpoint) => ({
+        status: "auto_resume_scheduled",
+        checkpoint: { ...checkpoint, autoResumeCount: 1 },
+      }),
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: (status) => statuses.push(status),
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: [],
+    recentToolActivity: [],
+    lastAssistantTextForCheckpoint: "still working",
+    sawExecuteOperationEvidence: true,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: (reason, message) => pausedRuns.push({ reason, message }),
+  });
+
+  assert.equal(autoResumeCount, 0);
+  assert.deepEqual(stops, []);
+  assert.deepEqual(statuses, ["idle"]);
+  assert.equal(pausedRuns[0].reason, "max_iterations_auto_resume");
+  assert.match(pausedRuns[0].message, /auto-resume once in a fresh context/);
+});
+
 test("execute no-tool recovery stops local completion loops at checkpoint", () => {
   const harness = createExecuteNoToolHarness("zh");
   const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
@@ -1052,7 +1089,7 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.match(source, /chat_repair_readonly_no_progress_paused/);
   assert.match(source, /unresolvedRepairRequest/);
 
-  const callbackIndex = source.indexOf("const handled = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);");
+  const callbackIndex = source.indexOf("const handling = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);");
   const idleIndex = source.indexOf("callbacks.onStatusChange(\"idle\");", callbackIndex);
   assert.equal(callbackIndex > 0, true);
   assert.equal(idleIndex > callbackIndex, true);

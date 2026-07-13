@@ -10,7 +10,7 @@ import type { ResolvedUserIntent } from "../../runIntent";
 import type { TaskOrchestratorPhase, TaskTargetingProfile } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
 import type { ToolDefinition } from "../../toolSchemas";
-import type { MainThreadEventInput } from "../../turnEvents";
+import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type {
@@ -23,7 +23,13 @@ import type {
 import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import { applyApprovedPlanToolResultRecoveryState } from "./approvedPlanRecoveryRuntime";
 import type { AgentLoopEvidenceRuntimeState } from "./evidenceRuntimeState";
-import { applyRecentSuccessfulProjectWriteRuntimeState } from "./evidenceRuntimeState";
+import {
+  applyRecentSuccessfulProjectWriteRuntimeState,
+  markExecuteOperationEvidenceRuntimeState,
+} from "./evidenceRuntimeState";
+import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import type { AgentLoopGuardRuntimeState } from "./loopGuardRuntimeState";
+import { clearCrossIterationReadTrackingForTarget } from "./loopGuardRuntimeState";
 import type { AgentLoopNoToolRuntimeState } from "./noToolRuntimeState";
 import {
   applyRecoveringFromEmptyAssistantReplyRuntimeState,
@@ -40,6 +46,7 @@ import type { AgentLoopToolExecutionRuntimeState } from "./toolExecutionRuntimeS
 import { partitionToolCallsForExecution } from "./toolCallPartitioning";
 import { executeToolExecutionRound } from "./toolExecutionRound";
 import { handleToolResultPostProcessing } from "./toolResultPostProcessing";
+import { appendToolResultsToHistory } from "./toolResultHistory";
 import type { TurnIterationContext } from "./turnIterationContext";
 import type { UnityMcpRuntimeState } from "./unityMcpRuntime";
 import {
@@ -69,6 +76,8 @@ export type ToolCallExecutionPhaseResult =
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
       unityMcpRuntimeState: UnityMcpRuntimeState;
       evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
+      executeRecoveryState: ExecuteRecoveryRuntimeState;
+      loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
       allResults: ToolExecutionResult[];
       toolArgsByCallId: Map<string, Record<string, unknown>>;
@@ -81,6 +90,8 @@ export type ToolCallExecutionPhaseResult =
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
       unityMcpRuntimeState: UnityMcpRuntimeState;
       evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
+      executeRecoveryState: ExecuteRecoveryRuntimeState;
+      loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
       allResults: ToolExecutionResult[];
       toolArgsByCallId: Map<string, Record<string, unknown>>;
@@ -125,17 +136,24 @@ export async function executeToolCallPhase(input: {
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   unityMcpRuntimeState: UnityMcpRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
+  executeRecoveryState: ExecuteRecoveryRuntimeState;
+  loopGuardRuntimeState: AgentLoopGuardRuntimeState;
   approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   toolExecutionRuntimeState: AgentLoopToolExecutionRuntimeState;
+  toolFeedbackFormat: ToolFeedbackFormat;
   failedToolCallCounts: Map<string, number>;
   buildCurrentTaskTargetingProfile: () => TaskTargetingProfile;
-  iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId">;
+  iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId" | "turnContext">;
   emitTurnEvent: (event: MainThreadEventInput) => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   markExecuteOperationEvidence: () => void;
   activateUnityMcpFallback: (reason: string) => void;
   setPlanRuntimePhase: SetPlanRuntimePhase;
-  clearExecuteRecovery: (reason: string, resetTarget?: string) => void;
+  clearExecuteRecovery: (
+    reason: string,
+    resetTarget?: string,
+    stateOverride?: ExecuteRecoveryRuntimeState,
+  ) => ExecuteRecoveryRuntimeState;
 }): Promise<ToolCallExecutionPhaseResult> {
   let noToolRuntimeState = resetConsecutiveNoToolRuntimeState(
     input.noToolRuntimeState,
@@ -150,7 +168,33 @@ export async function executeToolCallPhase(input: {
     input.unityMcpRuntimeState,
   );
   let evidenceRuntimeState = input.evidenceRuntimeState;
+  let executeRecoveryState = input.executeRecoveryState;
+  let loopGuardRuntimeState = input.loopGuardRuntimeState;
   let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
+  const markExecuteOperationEvidenceAndSync = () => {
+    input.markExecuteOperationEvidence();
+    evidenceRuntimeState = markExecuteOperationEvidenceRuntimeState(
+      evidenceRuntimeState,
+    );
+  };
+  const clearExecuteRecoveryAndSync = (
+    reason: string,
+    resetTarget?: string,
+  ) => {
+    const recoveryWasActive = executeRecoveryState.mode !== "normal";
+    executeRecoveryState = input.clearExecuteRecovery(
+      reason,
+      resetTarget,
+      executeRecoveryState,
+    );
+    if (recoveryWasActive) {
+      loopGuardRuntimeState = clearCrossIterationReadTrackingForTarget(
+        loopGuardRuntimeState,
+        resetTarget,
+      );
+    }
+    return executeRecoveryState;
+  };
 
   logAgentEvent("tool_calls_detected", {
     iteration: input.iteration,
@@ -236,20 +280,7 @@ export async function executeToolCallPhase(input: {
     ...input.toolExecutionRuntimeState,
   });
   allResults.push(...toolExecutionRound.results);
-  if (toolExecutionRound.status === "aborted") {
-    return {
-      status: "aborted",
-      noToolRuntimeState,
-      planRuntimeState,
-      recoveryPromptState,
-      unityMcpRuntimeState,
-      evidenceRuntimeState,
-      approvedPlanRecoveryState,
-      allResults,
-      toolArgsByCallId,
-      toolFailureSignatures,
-    };
-  }
+  const wasAborted = toolExecutionRound.status === "aborted";
 
   const hasPlanDecisionOutput =
     input.hasStructuredProposal ||
@@ -283,11 +314,11 @@ export async function executeToolCallPhase(input: {
     recoveringFromEmptyAssistantReplyAfterWrite:
       noToolRuntimeState.recoveringFromEmptyAssistantReplyAfterWrite,
     ...approvedPlanRecoveryState,
-    markExecuteOperationEvidence: input.markExecuteOperationEvidence,
+    markExecuteOperationEvidence: markExecuteOperationEvidenceAndSync,
     activateUnityMcpFallback: input.activateUnityMcpFallback,
     setPlanRuntimePhase: input.setPlanRuntimePhase,
     emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
-    clearExecuteRecovery: input.clearExecuteRecovery,
+    clearExecuteRecovery: clearExecuteRecoveryAndSync,
   });
   evidenceRuntimeState = applyRecentSuccessfulProjectWriteRuntimeState(
     evidenceRuntimeState,
@@ -310,6 +341,57 @@ export async function executeToolCallPhase(input: {
     toolResultPostProcessing,
   );
 
+  if (wasAborted) {
+    // The assistant tool_calls message is already in history. Close every call
+    // before pausing so native providers never receive dangling tool calls on
+    // resume. Only observed results participate in evidence/recovery folding;
+    // unstarted calls are protocol-only internal feedback.
+    const observedToolCallIds = new Set(allResults.map((result) => result.toolCallId));
+    const protocolResults = [
+      ...allResults,
+      ...input.effectiveToolCalls
+        .filter((call) => !observedToolCallIds.has(call.id))
+        .map((call): ToolExecutionResult => {
+          const args = toolArgsByCallId.get(call.id) || {};
+          const target = String(
+            args.path || args.command || args.url || args.query || call.name,
+          ).trim();
+          return {
+            toolCallId: call.id,
+            name: call.name,
+            target,
+            content:
+              "TOOL_CALL_ABORTED: The run was stopped before this tool call started. Resume in the same turn if it is still needed.",
+            isError: true,
+            lifecycleState: "blocked",
+            internalFeedback: true,
+          };
+        }),
+    ];
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: protocolResults,
+      toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    return {
+      status: "aborted",
+      noToolRuntimeState,
+      planRuntimeState,
+      recoveryPromptState,
+      unityMcpRuntimeState,
+      evidenceRuntimeState,
+      executeRecoveryState,
+      loopGuardRuntimeState,
+      approvedPlanRecoveryState,
+      allResults: protocolResults,
+      toolArgsByCallId,
+      toolFailureSignatures,
+    };
+  }
+
   return {
     status: "completed",
     noToolRuntimeState,
@@ -317,6 +399,8 @@ export async function executeToolCallPhase(input: {
     recoveryPromptState,
     unityMcpRuntimeState,
     evidenceRuntimeState,
+    executeRecoveryState,
+    loopGuardRuntimeState,
     approvedPlanRecoveryState,
     allResults,
     toolArgsByCallId,

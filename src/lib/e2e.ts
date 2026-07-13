@@ -6898,6 +6898,28 @@ function seedCloudToolProtocolScenario(scenario: string) {
     },
   );
 
+  bridge.queueCloudRespondMessage = (text?: string) => {
+    useAppStore.getState().queueUserMessage(
+      text || "请优先处理这条排队消息。",
+      undefined,
+      { runtimeIntentOverride: "respond" },
+    );
+    return true;
+  };
+
+  bridge.rejectNextAutoResume = () => {
+    const originalSendMessage = useAppStore.getState().sendMessage;
+    const guardedSendMessage: typeof originalSendMessage = (text, images, options) => {
+      if (options?.hidden && options?.parentRunIdOverride) {
+        useAppStore.setState({ sendMessage: originalSendMessage });
+        return false;
+      }
+      return originalSendMessage(text, images, options);
+    };
+    useAppStore.setState({ sendMessage: guardedSendMessage });
+    return true;
+  };
+
   bridge.sendCloudMessage = (text?: string) => {
     if (scenario === GLOBAL_CHAT_ATTACHMENT_READ_SCENARIO) {
       return useAppStore.getState().sendMessage(
@@ -7066,6 +7088,24 @@ function seedCloudToolProtocolScenario(scenario: string) {
       currentTurnStatus: currentTurn?.status ?? null,
       currentTurnIntent: currentTurn?.intent ?? null,
       currentTurnDisplayIntent: currentTurn?.displayIntent ?? currentTurn?.intent ?? null,
+      turnStartedEvents: state.runtimeEvents
+        .filter((event) => event.type === "turn.started")
+        .map((event) => ({ turnId: event.turnId })),
+      runStartedEvents: state.runtimeEvents
+        .filter((event) => event.type === "run.started")
+        .map((event) => ({
+          turnId: event.turnId,
+          runId: event.runId,
+          parentRunId: event.parentRunId || null,
+        })),
+      runPausedEvents: state.runtimeEvents
+        .filter((event) => event.type === "run.paused")
+        .map((event) => ({
+          turnId: event.turnId,
+          runId: event.runId,
+          reason: event.reason,
+          message: event.message,
+        })),
       pendingRunDecision: state.pendingRunDecision
         ? {
             kind: state.pendingRunDecision.kind,

@@ -1045,7 +1045,11 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(source, /markExecuteOperationEvidence/);
   assert.match(toolIterationPhaseSource, /executeToolCallPhase\(input\)/);
   assert.match(toolCallExecutionPhaseSource, /handleToolResultPostProcessing\(\{/);
-  assert.match(toolCallExecutionPhaseSource, /markExecuteOperationEvidence: input\.markExecuteOperationEvidence/);
+  assert.match(toolCallExecutionPhaseSource, /markExecuteOperationEvidence: markExecuteOperationEvidenceAndSync/);
+  assert.match(
+    toolCallExecutionPhaseSource,
+    /evidenceRuntimeState = markExecuteOperationEvidenceRuntimeState\(/,
+  );
   assert.match(toolResultPostProcessingSource, /toolResultCountsAsExecutionEvidence/);
   assert.match(toolResultPostProcessingSource, /markExecuteOperationEvidence/);
   assert.match(toolActivityTrackingSource, /parseToolFeedbackEnvelope/);
@@ -1061,6 +1065,64 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(orchestrator, /"noOp"\\s\*:\\s\*true\|NO_EFFECT_MUTATION/);
   assert.match(workflowEngine, /getExecutionConsentGranted/);
   assert.match(workflowEngine, /currentTurnExecutionConsent/);
+});
+
+test("workflow engine owns one hidden auto-resume at max-iteration checkpoints", () => {
+  const source = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const planStart = source.indexOf("onPlanMaxIterationsCheckpoint:");
+  const executeStart = source.indexOf("onExecuteMaxIterationsCheckpoint:", planStart);
+  const handlersEnd = source.indexOf("onStatusChange:", executeStart);
+  const planHandler = source.slice(planStart, executeStart);
+  const executeHandler = source.slice(executeStart, handlersEnd);
+  const terminalStart = source.indexOf("const queuedAfterRun =", handlersEnd);
+  const terminalEnd = source.indexOf("return true;", terminalStart);
+  const terminalContinuation = source.slice(terminalStart, terminalEnd);
+
+  assert.notEqual(planStart, -1);
+  assert.notEqual(executeStart, -1);
+  assert.notEqual(handlersEnd, -1);
+  for (const handler of [planHandler, executeHandler]) {
+    assert.match(handler, /currentCount < PLAN_MAX_AUTO_RESUME_LIMIT/);
+    assert.match(handler, /planAutoResumeCount: effectiveCheckpoint\.autoResumeCount/);
+    assert.match(handler, /turn\.id === turnId \|\| turn\.id === context\.uiDisplayTurnId/);
+    assert.match(handler, /pendingMaxIterationsAutoResume = \{/);
+    assert.match(handler, /status: "auto_resume_scheduled" as const/);
+    assert.match(handler, /hidden: true/);
+    assert.match(handler, /reuseCurrentTurn: true/);
+    assert.match(handler, /turnIdOverride: context\.uiDisplayTurnId \|\| turnId/);
+    assert.match(handler, /parentRunIdOverride: activeRuntimeRunIdentity\.runId/);
+    assert.match(handler, /preservePlanState: true/);
+    assert.match(handler, /cancelAutoResume\("resume_submission_rejected", \{ visible: true \}\)/);
+    assert.match(handler, /type: "system",\s*content: pauseNotice,/);
+  }
+  assert.match(planHandler, /buildPlanMaxIterationsResumePrompt/);
+  assert.match(planHandler, /resolvedIntent: "plan"/);
+  assert.match(planHandler, /runtimeIntentOverride: "execute"/);
+  assert.match(planHandler, /executionConsentGranted: true/);
+  assert.match(executeHandler, /buildExecuteMaxIterationsResumePrompt/);
+  assert.match(executeHandler, /runtimeIntentOverride: "execute"/);
+  assert.match(executeHandler, /forceExecuteRecoveryMode: "action_plus_targeting"/);
+  assert.match(executeHandler, /executionConsentGranted: true/);
+  assert.notEqual(terminalStart, -1);
+  assert.notEqual(terminalEnd, -1);
+  assert.match(
+    terminalContinuation,
+    /pendingMaxIterationsAutoResume && \(pendingSameTurnExecution \|\| queuedAfterRun\)/,
+  );
+  assert.match(terminalContinuation, /queued_user_message_deferred/);
+  assert.doesNotMatch(terminalContinuation, /queued_user_message_force_idle/);
+  assert.match(terminalContinuation, /queued_user_message_submission_rejected/);
+  assert.ok(
+    terminalContinuation.indexOf("started = latest.sendMessage(") <
+      terminalContinuation.indexOf("queuedUserMessage: null"),
+  );
+  assert.match(
+    terminalContinuation,
+    /else if \(pendingMaxIterationsAutoResume\)[\s\S]*?runAfterNextPaint\(\(\) => pending\.start\(\)\)/,
+  );
 });
 
 test("ordinary composer sends only reuse awaiting-choice turns on exact option match", () => {

@@ -792,7 +792,7 @@ export function buildExecuteMaxIterationsResumePrompt(input: {
 
   if (input.language === "zh") {
     return [
-      "请在新的恢复上下文中继续上一轮执行任务。这是 MAIN 在普通 Execute 25 轮安全边界后的自动恢复，只允许继续真实未完成工作。",
+      `请在新的恢复上下文中继续上一轮执行任务。这是 MAIN 在普通 Execute ${input.checkpoint.maxIterations} 轮安全边界后的自动恢复，只允许继续真实未完成工作。`,
       "复用下面的检查点、最近工具结果和压缩记忆；如果任务已经完成，直接输出最终总结并停止，不要再调用工具。",
       "如果仍需工具，只选择一个最小必要的下一步动作：写入/替换、运行有限命令、浏览器验证，或说明精确阻塞。不要重复读取最近已有结果的同一批文件。",
       "MAIN 会临时收窄宽泛读取工具；只有 patch mismatch 需要精确当前内容时才做一次定向读取。",
@@ -807,7 +807,7 @@ export function buildExecuteMaxIterationsResumePrompt(input: {
   }
 
   return [
-    "Continue the previous execute task in a fresh recovery context. This is MAIN's automatic recovery after the normal Execute 25-iteration safety boundary; only continue real unfinished work.",
+    `Continue the previous execute task in a fresh recovery context. This is MAIN's automatic recovery after the normal Execute ${input.checkpoint.maxIterations}-iteration safety boundary; only continue real unfinished work.`,
     "Reuse the checkpoint, recent tool results, and compact memory below. If the task is complete, output the final summary and stop without more tools.",
     "If another tool is still needed, choose exactly one smallest necessary action: patch/write, run a finite command, use browser validation, or state the exact blocker. Do not repeat the same reads that already have results.",
     "MAIN will temporarily narrow broad read tools; do a targeted file read only when a patch mismatch requires exact current content.",

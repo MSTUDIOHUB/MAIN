@@ -1189,14 +1189,14 @@ test("pause notice is structured and points to manual resume after one auto-resu
 
 test("execute max-iteration notices describe a recoverable boundary instead of failure", () => {
   const checkpoint = buildPlanMaxIterationsCheckpoint({
-    iterationCount: 25,
-    maxIterations: 25,
+    iterationCount: 50,
+    maxIterations: 50,
     autoResumeCount: PLAN_MAX_AUTO_RESUME_LIMIT,
     tasks: [],
     evidenceLedger: [],
     recentToolActivity: [{ name: "run_command", target: "npm test", status: "succeeded", detail: "exitCode 0" }],
     lastAssistantText: "继续验证剩余步骤。",
-    unresolvedBlockers: ["Agent loop reached maximum iterations (25)."],
+    unresolvedBlockers: ["Agent loop reached maximum iterations (50)."],
   });
 
   const autoNotice = buildExecuteMaxIterationsAutoResumeNotice({ ...checkpoint, autoResumeCount: 1 }, "zh");
@@ -1209,6 +1209,7 @@ test("execute max-iteration notices describe a recoverable boundary instead of f
   assert.match(pauseNotice, /复用已读上下文/);
   assert.match(pauseNotice, /重复只读/);
   assert.match(prompt, /如果任务已经完成，直接输出最终总结/);
+  assert.match(prompt, /普通 Execute 50 轮安全边界/);
 });
 
 test("resume prompt requires fresh workspace reads and treats .MAIN plans as internal state", () => {

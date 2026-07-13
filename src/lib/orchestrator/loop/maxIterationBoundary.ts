@@ -1,5 +1,7 @@
 import {
+  buildExecuteMaxIterationsAutoResumeNotice,
   buildExecuteMaxIterationsPauseNotice,
+  buildPlanMaxIterationsAutoResumeNotice,
   buildPlanMaxIterationsCheckpoint,
   buildPlanMaxIterationsPauseNotice,
   buildPlanProgressSignatureFromToolActivity,
@@ -75,21 +77,47 @@ export async function handleMaxIterationBoundary(input: {
       remainingTasks: checkpoint.remainingTasks.length,
       recentToolActivity: checkpoint.recentToolActivity.length,
     });
-    emitPlanExecutionProgress("paused", {
-      nextStep: callbacks.getPreferredLanguage() === "zh"
-        ? "点击 Resume Execution 后从检查点继续"
-        : "click Resume Execution to continue from checkpoint",
-    });
-    const pauseNotice = buildPlanMaxIterationsPauseNotice(
-      checkpoint,
-      callbacks.getPreferredLanguage(),
+    const handling = await callbacks.onPlanMaxIterationsCheckpoint?.(checkpoint);
+    const explicitAutoResume = typeof handling === "object" &&
+      handling?.status === "auto_resume_scheduled";
+    const handled = handling === true || explicitAutoResume;
+    const effectiveAutoResumeCount = explicitAutoResume
+      ? Math.max(checkpoint.autoResumeCount, handling.checkpoint.autoResumeCount)
+      : Math.max(
+          checkpoint.autoResumeCount,
+          callbacks.getPlanAutoResumeCount?.() ?? checkpoint.autoResumeCount,
+        );
+    const autoResumeScheduled = explicitAutoResume || (
+      handling === true && effectiveAutoResumeCount > checkpoint.autoResumeCount
     );
-    emitRunPausedEvent("max_iterations_boundary", pauseNotice);
+    const boundaryCheckpoint = {
+      ...checkpoint,
+      autoResumeCount: effectiveAutoResumeCount,
+    };
+    const boundaryNotice = autoResumeScheduled
+      ? buildPlanMaxIterationsAutoResumeNotice(
+          boundaryCheckpoint,
+          callbacks.getPreferredLanguage(),
+        )
+      : buildPlanMaxIterationsPauseNotice(
+          boundaryCheckpoint,
+          callbacks.getPreferredLanguage(),
+        );
+    if (!handled) {
+      emitPlanExecutionProgress("paused", {
+        nextStep: callbacks.getPreferredLanguage() === "zh"
+          ? "点击 Resume Execution 后从检查点继续"
+          : "click Resume Execution to continue from checkpoint",
+      });
+    }
+    emitRunPausedEvent(
+      autoResumeScheduled ? "max_iterations_auto_resume" : "max_iterations_boundary",
+      boundaryNotice,
+    );
     callbacks.onStatusChange("idle");
-    const handled = await callbacks.onPlanMaxIterationsCheckpoint?.(checkpoint);
     if (handled) return { status: "handled" };
     callbacks.onNonActionableStop(
-      pauseNotice,
+      boundaryNotice,
       "incomplete_plan",
       {
         phase: "paused",
@@ -125,18 +153,42 @@ export async function handleMaxIterationBoundary(input: {
       sawExecuteOperationEvidence,
       executeRecoveryMode,
     });
-    const handled = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);
-    const pauseNotice = buildExecuteMaxIterationsPauseNotice(
-      checkpoint,
-      callbacks.getPreferredLanguage(),
+    const handling = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);
+    const explicitAutoResume = typeof handling === "object" &&
+      handling?.status === "auto_resume_scheduled";
+    const handled = handling === true || explicitAutoResume;
+    const effectiveAutoResumeCount = explicitAutoResume
+      ? Math.max(checkpoint.autoResumeCount, handling.checkpoint.autoResumeCount)
+      : Math.max(
+          checkpoint.autoResumeCount,
+          callbacks.getPlanAutoResumeCount?.() ?? checkpoint.autoResumeCount,
+        );
+    const autoResumeScheduled = explicitAutoResume || (
+      handling === true && effectiveAutoResumeCount > checkpoint.autoResumeCount
     );
-    emitRunPausedEvent("max_iterations_boundary", pauseNotice);
+    const boundaryCheckpoint = {
+      ...checkpoint,
+      autoResumeCount: effectiveAutoResumeCount,
+    };
+    const boundaryNotice = autoResumeScheduled
+      ? buildExecuteMaxIterationsAutoResumeNotice(
+          boundaryCheckpoint,
+          callbacks.getPreferredLanguage(),
+        )
+      : buildExecuteMaxIterationsPauseNotice(
+          boundaryCheckpoint,
+          callbacks.getPreferredLanguage(),
+        );
+    emitRunPausedEvent(
+      autoResumeScheduled ? "max_iterations_auto_resume" : "max_iterations_boundary",
+      boundaryNotice,
+    );
     if (handled) {
       callbacks.onStatusChange("idle");
       return { status: "handled" };
     }
     callbacks.onNonActionableStop(
-      pauseNotice,
+      boundaryNotice,
       "no_action",
     );
     callbacks.onStatusChange("idle");

@@ -95,6 +95,12 @@ export async function executeToolExecutionRound(input: {
   } = input;
 
   const allResults: ToolExecutionResult[] = [];
+  const finishAborted = (): ToolExecutionRoundResult => {
+    callbacks.onStatusChange("idle");
+    return { status: "aborted", results: allResults };
+  };
+
+  if (abortSignal.aborted) return finishAborted();
 
   if (readOnlyCalls.length > 0) {
     const readResults = await executeReadOnlyToolsConcurrently(
@@ -170,9 +176,11 @@ export async function executeToolExecutionRound(input: {
       normalizedReadResults.push(resultForModel);
     }
     allResults.push(...normalizedReadResults);
+    if (abortSignal.aborted) return finishAborted();
   }
 
   for (const tc of localFileReadCalls) {
+    if (abortSignal.aborted) return finishAborted();
     const toolArgs = parseToolCallArguments(tc, workspace);
     const result = await executeLocalFileReadToolWithReview(
       tc,
@@ -185,12 +193,10 @@ export async function executeToolExecutionRound(input: {
     );
     allResults.push(result);
 
-    if (abortSignal.aborted) {
-      callbacks.onStatusChange("idle");
-      return { status: "aborted", results: allResults };
-    }
+    if (abortSignal.aborted) return finishAborted();
   }
 
+  if (abortSignal.aborted) return finishAborted();
   if (specFileCalls.length > 0) {
     const specResults = await executeReadOnlyToolsConcurrently(
       specFileCalls,
@@ -206,9 +212,11 @@ export async function executeToolExecutionRound(input: {
       },
     );
     allResults.push(...specResults);
+    if (abortSignal.aborted) return finishAborted();
   }
 
   for (const tc of writeCalls) {
+    if (abortSignal.aborted) return finishAborted();
     const result = await executeWriteToolWithReview(
       tc,
       workspace,
@@ -250,10 +258,7 @@ export async function executeToolExecutionRound(input: {
       });
     }
 
-    if (abortSignal.aborted) {
-      callbacks.onStatusChange("idle");
-      return { status: "aborted", results: allResults };
-    }
+    if (abortSignal.aborted) return finishAborted();
   }
 
   return { status: "completed", results: allResults };
