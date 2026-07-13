@@ -86,13 +86,74 @@ test("local parent and two child model requests overlap after cold-start admissi
   await Promise.resolve();
   assert.equal(admittedChildren, 0);
   parent.markFirstToken();
-  const [firstChild, secondChild] = await Promise.all([firstChildPromise, secondChildPromise]);
+  const firstChild = await firstChildPromise;
+  firstChild.markFirstToken();
+  const secondChild = await secondChildPromise;
   assert.equal(admittedChildren, 2);
   assert.ok(events.some((entry) =>
     entry.event === "model_lane_admission" &&
     entry.data.activeRequests === 3 &&
-    entry.data.limit === 3
+    entry.data.limit === 4
   ));
+  assert.ok(events.some((entry) =>
+    entry.event === "model_lane_admission" &&
+    entry.data.decision === "queued" &&
+    entry.data.queueReason === "cold_start_first_token" &&
+    entry.data.liveRequests?.some((request) => request.agentKind === "parent")
+  ));
+  secondChild.release();
+  firstChild.release();
+  parent.release();
+});
+
+test("healthy local overlap exposes an elastic fourth model lane for parent plus three children", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const events = [];
+  lanes.setModelLaneMemoryReaderForTests(async () => ({
+    total_gb: 64,
+    available_gb: 24,
+    total_bytes: 64 * 1024 ** 3,
+    available_bytes: 24 * 1024 ** 3,
+  }));
+  const parent = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "parent",
+  });
+  parent.markFirstToken();
+  const firstChild = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "subagent",
+    subagentId: "subagent-burst-1",
+  });
+  firstChild.markFirstToken();
+  const secondChild = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "subagent",
+    subagentId: "subagent-burst-2",
+  });
+  secondChild.markFirstToken();
+  await lanes.sampleModelLaneMemoryForTests(parent.laneKey, 10_000);
+  await lanes.sampleModelLaneMemoryForTests(parent.laneKey, 10_000);
+  assert.equal(lanes.getModelLaneBurstAdmission(parent.laneKey).allowed, true);
+
+  const thirdChild = await lanes.acquireModelLane({
+    config: localConfig(),
+    requestTokenBudget: 10_000,
+    agentKind: "subagent",
+    subagentId: "subagent-burst-3",
+    onDebugEvent: (event, data) => events.push({ event, data }),
+  });
+  assert.ok(events.some((entry) =>
+    entry.event === "model_lane_admission" &&
+    entry.data.decision === "admitted" &&
+    entry.data.activeRequests === 4 &&
+    entry.data.limit === 4
+  ));
+
+  thirdChild.release();
   secondChild.release();
   firstChild.release();
   parent.release();
@@ -187,6 +248,7 @@ for (const failureMessage of ["OOM", "connection reset", "429 rate limited", "52
       agentKind: "subagent",
       subagentId: "subagent-failure-first",
     });
+    firstChild.markFirstToken();
     const secondChild = await lanes.acquireModelLane({
       config: localConfig(),
       contextLimit: 32768,

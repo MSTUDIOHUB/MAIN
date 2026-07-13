@@ -184,7 +184,17 @@ test.beforeEach(async ({ page }) => {
     };
   });
 
-  await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_REQUEST", async (args: Record<string, unknown>) => {
+  const chatStreams = new Map<string, {
+    reader: ReadableStreamDefaultReader<Uint8Array>;
+    decoder: TextDecoder;
+    controller: AbortController;
+    url: string;
+    model: string;
+    chars: number;
+    preview: string;
+  }>();
+  await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_OPEN", async (args: Record<string, unknown>) => {
+    const streamId = String(args.streamId || args.stream_id || "");
     const url = String(args.url || "");
     const bodyText = String(args.body || "");
     let model = "";
@@ -193,22 +203,53 @@ test.beforeEach(async ({ page }) => {
     } catch {
       // Keep logging best-effort; invalid JSON will fail at the endpoint.
     }
+    const controller = new AbortController();
     const response = await fetch(url, {
       method: "POST",
       headers: args.headers as Record<string, string>,
       body: bodyText,
+      signal: controller.signal,
     });
-    const text = await response.text();
-    console.log(`[real-omlx-stream] ${response.status} ${url} model=${model} chars=${text.length} ${text.slice(0, 180).replace(/\s+/g, " ")}`);
     if (!response.ok) {
+      const text = await response.text();
       throw new Error(`HTTP ${response.status}: ${text.slice(0, 500)}`);
     }
-    return text;
+    if (!response.body) throw new Error(`HTTP ${response.status}: response body is not streamable`);
+    chatStreams.set(streamId, {
+      reader: response.body.getReader(),
+      decoder: new TextDecoder(),
+      controller,
+      url,
+      model,
+      chars: 0,
+      preview: "",
+    });
+    return { status: response.status };
+  });
+  await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_READ", async (streamId: string) => {
+    const stream = chatStreams.get(String(streamId));
+    if (!stream) return { done: true, chunk: "" };
+    const { done, value } = await stream.reader.read();
+    const chunk = stream.decoder.decode(value || new Uint8Array(), { stream: !done });
+    stream.chars += chunk.length;
+    if (stream.preview.length < 180) stream.preview = `${stream.preview}${chunk}`.slice(0, 180);
+    if (done) {
+      chatStreams.delete(String(streamId));
+      console.log(`[real-omlx-stream] 200 ${stream.url} model=${stream.model} chars=${stream.chars} ${stream.preview.replace(/\s+/g, " ")}`);
+    }
+    return { done, chunk };
+  });
+  await page.exposeFunction("__MAIN_E2E_CHAT_STREAM_CANCEL", async (streamId: string) => {
+    const stream = chatStreams.get(String(streamId));
+    if (!stream) return false;
+    stream.controller.abort();
+    chatStreams.delete(String(streamId));
+    return true;
   });
 
   await page.addInitScript(({ workspace, endpoint, apiKey }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
-    let streamCancelled = false;
+    const canceledStreamIds = new Set<string>();
     const readText = async (path: string) => {
       return await (window as any).__MAIN_E2E_DISK_READ(path);
     };
@@ -247,11 +288,8 @@ test.beforeEach(async ({ page }) => {
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "append_debug_log") {
         debugEntries.push(args || {});
-        if (debugEntries.length > 800) debugEntries.splice(0, debugEntries.length - 800);
+        if (debugEntries.length > 1_200) debugEntries.splice(0, debugEntries.length - 1_200);
         return null;
-      }
-      if (cmd !== "plugin:event|listen" && cmd !== "plugin:event|unlisten") {
-        console.log(`[real-omlx-invoke] ${cmd}`);
       }
       if (cmd === "plugin:event|listen") {
         const handlerId = Number(args?.handler ?? callbackId++);
@@ -265,29 +303,41 @@ test.beforeEach(async ({ page }) => {
         eventListeners.delete(Number(args?.eventId ?? args?.handler));
         return null;
       }
-      if (cmd === "get_system_memory") return { total_gb: 64, available_gb: 48 };
+      if (cmd === "get_system_memory") return {
+        total_gb: 64,
+        available_gb: 48,
+        total_bytes: 64 * 1024 ** 3,
+        available_bytes: 48 * 1024 ** 3,
+      };
+      if (cmd === "list_project_sessions") return [];
       if (cmd === "get_workspace_root") return workspace;
       if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path || workspace);
       if (cmd === "cancel_proxy_request") return null;
       if (cmd === "cancel_chat_stream") {
-        streamCancelled = true;
+        const streamId = String(args?.streamId || args?.stream_id || "");
+        canceledStreamIds.add(streamId);
+        await (window as any).__MAIN_E2E_CHAT_STREAM_CANCEL(streamId);
         return null;
       }
       if (cmd === "proxy_request") return await (window as any).__MAIN_E2E_PROXY_REQUEST(args || {});
       if (cmd === "proxy_request_detailed") return await (window as any).__MAIN_E2E_PROXY_REQUEST_DETAILED(args || {});
       if (cmd === "start_chat_stream") {
         const streamId = String(args?.streamId || args?.stream_id || "");
-        streamCancelled = false;
+        canceledStreamIds.delete(streamId);
         try {
-          const chunk = await (window as any).__MAIN_E2E_CHAT_STREAM_REQUEST(args || {});
-          if (streamCancelled) {
-            emitTauriEvent("chat-stream-done", { stream_id: streamId, status: "cancelled", error: null });
-            return null;
+          await (window as any).__MAIN_E2E_CHAT_STREAM_OPEN(args || {});
+          while (!canceledStreamIds.has(streamId)) {
+            const next = await (window as any).__MAIN_E2E_CHAT_STREAM_READ(streamId);
+            if (next?.chunk) {
+              emitTauriEvent("chat-stream-chunk", { stream_id: streamId, chunk: next.chunk });
+            }
+            if (next?.done) break;
           }
-          if (chunk) {
-            emitTauriEvent("chat-stream-chunk", { stream_id: streamId, chunk });
-          }
-          emitTauriEvent("chat-stream-done", { stream_id: streamId, status: "ok", error: null });
+          emitTauriEvent("chat-stream-done", {
+            stream_id: streamId,
+            status: canceledStreamIds.has(streamId) ? "cancelled" : "ok",
+            error: null,
+          });
         } catch (error) {
           emitTauriEvent("chat-stream-done", {
             stream_id: streamId,
@@ -382,6 +432,68 @@ test.beforeEach(async ({ page }) => {
           .filter(([, content]) => !query || String(content).includes(query))
           .map(([path, content]) => `${path}:1:${String(content).split("\n")[0]}`)
           .join("\n");
+      }
+      if (cmd === "code_ast_query") {
+        const filePath = String(args?.path || "");
+        const content = await readText(filePath);
+        const symbols = String(content).split(/\r?\n/).flatMap((line, index) => {
+          const match = line.match(/\b(?:export\s+)?(?:async\s+)?(interface|type|class|function|const|let)\s+([A-Za-z_$][A-Za-z0-9_$]*)/);
+          if (!match) return [];
+          return [{
+            name: match[2],
+            kind: match[1],
+            syntaxKind: match[1] === "interface" ? "interface_declaration" : `${match[1]}_declaration`,
+            startLine: index + 1,
+            startColumn: 1,
+            endLine: index + 1,
+            signature: line.trim(),
+          }];
+        });
+        return {
+          path: filePath,
+          language: filePath.endsWith(".tsx") ? "tsx" : "typescript",
+          rootKind: "program",
+          hasErrors: false,
+          errorCount: 0,
+          symbols,
+          truncated: false,
+          note: "E2E structured AST fixture",
+        };
+      }
+      if (cmd === "find_symbol_references") {
+        const symbol = String(args?.symbol || "");
+        const requestedPath = String(args?.path || "");
+        const allPaths = await (window as any).__MAIN_E2E_DISK_GLOB();
+        const filePaths = requestedPath
+          ? allPaths.filter((filePath: string) => filePath.startsWith(requestedPath))
+          : allPaths;
+        const occurrences: Array<Record<string, unknown>> = [];
+        for (const filePath of filePaths) {
+          const content = await readText(filePath);
+          String(content).split(/\r?\n/).forEach((line, index) => {
+            const column = line.indexOf(symbol);
+            if (column < 0) return;
+            occurrences.push({
+              path: filePath,
+              language: filePath.endsWith(".tsx") ? "tsx" : "typescript",
+              role: /\b(?:interface|type|class|function|const|let)\s+/.test(line) ? "definition" : "reference",
+              syntaxKind: "identifier",
+              line: index + 1,
+              column: column + 1,
+              context: line.trim(),
+            });
+          });
+        }
+        return {
+          symbol,
+          scope: requestedPath || workspace,
+          scannedFiles: filePaths.length,
+          skippedFiles: 0,
+          parseFailures: 0,
+          occurrences,
+          truncated: false,
+          note: "E2E structured reference fixture",
+        };
       }
       if (cmd === "build_repository_index") {
         const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
@@ -735,3 +847,130 @@ for (const model of models) {
     }
   });
 }
+
+const subagentModel = process.env.OMLX_SUBAGENT_MODEL ||
+  models.find((model) => /qwen3\.6-35b-a3b/i.test(model)) ||
+  models[0];
+
+test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async ({ page }) => {
+  page.on("console", (message) => {
+    const text = message.text();
+    if (text.includes("[real-omlx-invoke] append_debug_log")) return;
+    console.log(`[subagent-browser:${message.type()}] ${text}`);
+  });
+  page.on("pageerror", (error) => {
+    console.log(`[subagent-browser:pageerror] ${error.message}`);
+  });
+  await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(subagentModel)}`);
+
+  const prompt = [
+    "请为 CSV creatorName 数据链路生成一个可审批的整改计划。",
+    "这个任务有三个实质性且路径互不重叠的分析范围。必须先连续调用 spawn_subagent 三次；前两个按默认并发启动，第三个交给 runtime 在安全采样后弹性放行。不要在委派前读取这些文件：",
+    "1. Euler：scope_key=csv-parser，scope=只分析 CSV 字段归一化，allowed_paths=src/hooks/useCsvParser.ts，expected_output=指出字段映射缺口并给出文件证据。",
+    "2. Mendel：scope_key=chart-consumer，scope=只分析图表消费 creatorName 的逻辑，allowed_paths=src/hooks/useChartData.ts,src/store/dashboardStore.ts，expected_output=说明消费端契约并给出文件证据。",
+    "3. Herschel：scope_key=type-contract，scope=只分析订单类型中的 creatorName 契约，allowed_paths=src/types/order.ts，expected_output=说明类型约束并给出文件证据。",
+    "主体只负责读取 cn_tutorial_orders_by_creator_20260512.csv、整合三个结果和形成计划；不要重读子智能体租约路径。",
+    "在输出计划前必须调用 wait_subagents 汇合三个结果。此轮只做计划，不修改文件。",
+  ].join("\n");
+  await page.evaluate((text) => {
+    const bridge = (window as any).__CODELY_E2E__;
+    Promise.resolve(bridge?.sendCloudMessage?.(text)).catch((error) => {
+      bridge.dispatchError = error instanceof Error ? error.message : String(error);
+    });
+  }, prompt);
+
+  let maxActiveChildren = 0;
+  let maxRunningChildren = 0;
+  await expect.poll(async () => {
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+    const runs = snapshot?.subagentRuns || [];
+    maxActiveChildren = Math.max(
+      maxActiveChildren,
+      runs.filter((run: { status?: string }) => ["queued", "starting", "running", "summarizing"].includes(String(run.status))).length,
+    );
+    maxRunningChildren = Math.max(
+      maxRunningChildren,
+      runs.filter((run: { status?: string }) => ["starting", "running", "summarizing"].includes(String(run.status))).length,
+    );
+    if (
+      runs.length >= 3 &&
+      snapshot?.planArtifacts?.length > 0 &&
+      snapshot?.isGenerating === false &&
+      runs.every((run: { status?: string }) => !["queued", "starting", "running", "summarizing"].includes(String(run.status)))
+    ) {
+      return "joined_plan_ready";
+    }
+    if (snapshot?.isGenerating === false && runs.length < 3) {
+      return `terminal_without_three_subagents:${runs.length}:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+    }
+    if (snapshot?.isGenerating === false && !snapshot?.planArtifacts?.length) {
+      return `terminal_without_plan:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+    }
+    return `running:${runs.length}:${maxActiveChildren}`;
+  }, { timeout: 600_000 }).toBe("joined_plan_ready");
+
+  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  const runs = snapshot.subagentRuns as Array<{
+    id: string;
+    scopeKey: string;
+    status: string;
+    startedAt: number | null;
+    completedAt: number | null;
+    summary: string;
+    evidenceCount: number;
+  }>;
+  const selectedRuns = runs.slice(0, 3);
+  const debugEntries = (snapshot.debugTail || []) as Array<{ source?: string; message?: string }>;
+  const parsedDebugEntries = debugEntries.map((entry) => {
+    try {
+      return { source: entry.source, ...JSON.parse(entry.message || "{}") };
+    } catch {
+      return { source: entry.source, message: entry.message };
+    }
+  });
+  const diagnosticDebug = parsedDebugEntries.filter((entry) =>
+    /subagent|model_lane|parent_(?:wait|resume|join)/.test(String(entry.source || "")),
+  );
+  const debugText = JSON.stringify(debugEntries);
+  console.log(`[real-omlx-subagents:${subagentModel}] ${JSON.stringify({
+    maxActiveChildren,
+    maxRunningChildren,
+    runs: selectedRuns,
+    plan: snapshot.planArtifacts?.[0]?.content,
+    debug: diagnosticDebug,
+  }).slice(0, 20_000)}`);
+
+  expect(new Set(selectedRuns.map((run) => run.scopeKey)).size).toBe(3);
+  expect(selectedRuns.every((run) => ["completed", "blocked", "degraded"].includes(run.status))).toBe(true);
+  expect(selectedRuns.every((run) => run.startedAt && run.completedAt && run.summary.trim().length > 0)).toBe(true);
+  expect(maxActiveChildren).toBeGreaterThanOrEqual(3);
+  expect(maxRunningChildren).toBeGreaterThanOrEqual(3);
+  expect(Math.max(...selectedRuns.map((run) => run.startedAt || 0)))
+    .toBeLessThan(Math.min(...selectedRuns.map((run) => run.completedAt || Number.MAX_SAFE_INTEGER)));
+  expect(parsedDebugEntries.some((entry) =>
+    entry.source === "parent_join_required" ||
+    (entry.source === "store.agent_loop_stop_summary" && entry.latestTool === "wait_subagents")
+  )).toBe(true);
+  expect(debugText).toMatch(/parent_wait/);
+  expect(debugText).toMatch(/parent_resume/);
+  expect(parsedDebugEntries.some((entry) => (
+    entry.source === "model_lane_admission" && entry.activeRequests === 3 && entry.limit === 4
+  ))).toBe(true);
+  expect(parsedDebugEntries.some((entry) => (
+    entry.source === "subagent_started" &&
+    entry.elasticAdmissionGranted === true &&
+    Number(entry.burstAdmission?.safeOverlapSamples || 0) >= 2
+  ))).toBe(true);
+  expect(parsedDebugEntries.some((entry) => (
+    entry.source === "model_lane_admission"
+    && ["cold_start_first_token", "lane_full"].includes(String(entry.queueReason || ""))
+  ))).toBe(true);
+  expect(debugText).not.toMatch(/"decision":"degraded"|SUBAGENT_MEMORY_PRESSURE_DEGRADED|out of memory|\bOOM\b/i);
+  for (const run of selectedRuns) {
+    expect(debugText).toContain(run.id.replace(/^subagent-/, "run-subagent-"));
+  }
+  expect(snapshot.planArtifacts[0].content).toMatch(/useCsvParser|creatorName/);
+  expect(snapshot.planArtifacts[0].content).toMatch(/useChartData|dashboardStore/);
+  expect(snapshot.planArtifacts[0].content).toMatch(/src\/types\/order\.ts/);
+});

@@ -1,6 +1,7 @@
 import type { AppConfig } from "./appTypes";
 import { resolveRuntimeLaneKey } from "./appConfig";
-import type { MainThreadEvent } from "./turnEvents";
+import { getModelLaneBurstAdmission } from "./modelLaneCoordinator";
+import { appendRuntimeEvent, withEventSchema, type MainThreadEvent } from "./turnEvents";
 import {
   normalizeWorkspacePathIdentity,
   relativizeToWorkspacePath,
@@ -146,6 +147,7 @@ export interface SubagentCapacityPolicy {
   provider: string;
   model: string;
   maxActiveRequests: number;
+  maxBurstActiveRequests: number;
   maxCreatedPerTurn: number;
   childMaxIterations: number;
 }
@@ -191,6 +193,7 @@ export function resolveSubagentCapacityPolicy(config: AppConfig): SubagentCapaci
     // This is the number of child workflows. Model-request concurrency is
     // coordinated separately and reserves capacity for the parent thread.
     maxActiveRequests: profile === "local" ? 2 : 3,
+    maxBurstActiveRequests: 3,
     maxCreatedPerTurn: profile === "local" ? 3 : 6,
     childMaxIterations: profile === "local" ? 6 : 8,
   };
@@ -233,11 +236,25 @@ export function projectSubagentRuns(events: readonly MainThreadEvent[]): Subagen
     if (event.type === "subagent.closed") {
       const current = records.get(event.subagentId);
       if (!current) continue;
+      const terminalStatus = isSubagentTerminalStatus(event.reason as SubagentStatus)
+        ? event.reason as SubagentStatus
+        : event.reason === "orphaned_after_restart" || event.reason === "runtime_controller_missing"
+          ? "canceled"
+          : current.status;
       records.set(event.subagentId, {
         ...current,
+        status: terminalStatus,
         closedAt: event.closedAt,
+        ...(isSubagentTerminalStatus(terminalStatus) && !current.completedAt
+          ? { completedAt: event.closedAt }
+          : {}),
         updatedAt: Math.max(current.updatedAt, event.closedAt),
       });
+      continue;
+    }
+
+    if (event.type === "subagent.dismissed") {
+      records.delete(event.subagentId);
     }
   }
 
@@ -262,6 +279,8 @@ interface CapacityLaneState {
   active: number;
   limit: number;
   queue: CapacityWaiter[];
+  policy: SubagentCapacityPolicy;
+  reevaluationTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const capacityLanes = new Map<string, CapacityLaneState>();
@@ -276,6 +295,9 @@ export interface CoordinatedSubagentRun {
   scopeKey: string;
   completion: Promise<SubagentResultEnvelope>;
   result?: SubagentResultEnvelope;
+  createdAt?: number;
+  completedAt?: number;
+  cleanupTimer?: ReturnType<typeof setTimeout>;
 }
 
 export interface SubagentScopeLease {
@@ -290,9 +312,23 @@ export interface SubagentScopeLease {
 
 const coordinatedRuns = new Map<string, CoordinatedSubagentRun>();
 const scopeLeases = new Map<string, SubagentScopeLease>();
+const createdRunCounts = new Map<string, number>();
+const COORDINATED_RESULT_TTL_MS = 10 * 60_000;
 
 function coordinationKey(threadId: string, parentTurnId: string, subagentId: string): string {
   return `${threadId}::${parentTurnId}::${subagentId}`;
+}
+
+function parentCoordinationKey(threadId: string, parentTurnId: string): string {
+  return `${threadId}::${parentTurnId}`;
+}
+
+function releaseCoordinatedRun(key: string): boolean {
+  const run = coordinatedRuns.get(key);
+  if (!run) return false;
+  if (run.cleanupTimer) clearTimeout(run.cleanupTimer);
+  coordinatedRuns.delete(key);
+  return true;
 }
 
 export function parseSubagentAllowedPaths(value: unknown, workspace = ""): string[] {
@@ -344,6 +380,23 @@ export function findSubagentScopeConflict(input: {
   return null;
 }
 
+export function findSubagentLeaseOverlap(input: {
+  threadId: string;
+  workspace: string;
+  allowedPaths: string[];
+}): SubagentScopeLease | null {
+  const candidates = input.allowedPaths
+    .map((path) => normalizeWorkspacePathIdentity(relativizeToWorkspacePath(path, input.workspace)))
+    .filter(Boolean);
+  for (const lease of scopeLeases.values()) {
+    if (lease.threadId !== input.threadId) continue;
+    if (candidates.some((candidate) => lease.allowedPaths.some((allowed) =>
+      pathContains(allowed, candidate) || pathContains(candidate, allowed)
+    ))) return lease;
+  }
+  return null;
+}
+
 export function validateSubagentScopeTarget(
   scope: SubagentExecutionScope,
   targetPath: string,
@@ -356,11 +409,33 @@ export function validateSubagentScopeTarget(
 
 export function registerCoordinatedSubagentRun(input: CoordinatedSubagentRun): void {
   const key = coordinationKey(input.threadId, input.parentTurnId, input.subagentId);
-  coordinatedRuns.set(key, input);
+  const parentKey = parentCoordinationKey(input.threadId, input.parentTurnId);
+  if (!coordinatedRuns.has(key)) {
+    createdRunCounts.set(parentKey, (createdRunCounts.get(parentKey) || 0) + 1);
+  }
+  const run: CoordinatedSubagentRun = {
+    ...input,
+    createdAt: input.createdAt || Date.now(),
+  };
+  coordinatedRuns.set(key, run);
   void input.completion.then((result) => {
     const current = coordinatedRuns.get(key);
-    if (current) current.result = result;
+    if (!current) return;
+    current.result = result;
+    current.completedAt = Date.now();
+    current.cleanupTimer = setTimeout(() => {
+      releaseCoordinatedRun(key);
+    }, COORDINATED_RESULT_TTL_MS);
   });
+}
+
+export function getPendingCoordinatedSubagentIds(threadId: string, parentTurnId: string): string[] {
+  return [...coordinatedRuns.values()]
+    .filter((run) =>
+      run.threadId === threadId &&
+      run.parentTurnId === parentTurnId
+    )
+    .map((run) => run.subagentId);
 }
 
 export async function waitForCoordinatedSubagents(input: {
@@ -376,13 +451,72 @@ export async function waitForCoordinatedSubagents(input: {
   );
   if (runs.length === 0) return { results: [], pendingIds: [...requestedIds] };
   const results = await Promise.all(runs.map((run) => run.completion));
+  for (const run of runs) {
+    releaseCoordinatedRun(coordinationKey(run.threadId, run.parentTurnId, run.subagentId));
+  }
   return { results, pendingIds: [] };
 }
 
 export function getCoordinatedSubagentRunCount(threadId: string, parentTurnId: string): number {
-  return [...coordinatedRuns.values()].filter((run) =>
-    run.threadId === threadId && run.parentTurnId === parentTurnId
-  ).length;
+  return createdRunCounts.get(parentCoordinationKey(threadId, parentTurnId)) || 0;
+}
+
+export interface ParentSubagentFinalizationResult {
+  requestedIds: string[];
+  canceledIds: string[];
+  controllerMissingIds: string[];
+  settledIds: string[];
+  timedOutIds: string[];
+  releasedCount: number;
+}
+
+export async function finalizeCoordinatedSubagentsForParent(input: {
+  threadId: string;
+  parentTurnId: string;
+  graceMs?: number;
+}): Promise<ParentSubagentFinalizationResult> {
+  const runs = [...coordinatedRuns.values()].filter((run) =>
+    run.threadId === input.threadId && run.parentTurnId === input.parentTurnId
+  );
+  const requestedIds = runs.filter((run) => !run.result).map((run) => run.subagentId);
+  const canceledIds: string[] = [];
+  const controllerMissingIds: string[] = [];
+  for (const id of requestedIds) {
+    if (cancelSubagentRun(id)) canceledIds.push(id);
+    else controllerMissingIds.push(id);
+  }
+
+  const graceMs = Math.max(0, input.graceMs ?? 2_000);
+  const completions = runs.map(async (run) => {
+    await run.completion.catch(() => undefined);
+    return run.subagentId;
+  });
+  const settledIds = new Set<string>();
+  if (completions.length > 0 && graceMs > 0) {
+    await Promise.race([
+      Promise.all(completions.map(async (completion) => {
+        const id = await completion;
+        settledIds.add(id);
+      })),
+      new Promise<void>((resolve) => setTimeout(resolve, graceMs)),
+    ]);
+  }
+
+  let releasedCount = 0;
+  for (const run of runs) {
+    if (releaseCoordinatedRun(coordinationKey(run.threadId, run.parentTurnId, run.subagentId))) {
+      releasedCount += 1;
+    }
+  }
+  createdRunCounts.delete(parentCoordinationKey(input.threadId, input.parentTurnId));
+  return {
+    requestedIds,
+    canceledIds,
+    controllerMissingIds,
+    settledIds: [...settledIds],
+    timedOutIds: requestedIds.filter((id) => !settledIds.has(id)),
+    releasedCount,
+  };
 }
 
 function makeAbortError(): Error {
@@ -395,10 +529,41 @@ function effectiveLaneLimit(policy: SubagentCapacityPolicy): number {
   const degradedUntil = degradedUntilByLane.get(policy.laneKey) || 0;
   if (degradedUntil > Date.now()) return 1;
   if (degradedUntil > 0) degradedUntilByLane.delete(policy.laneKey);
+  if (
+    policy.profile === "local" &&
+    policy.maxBurstActiveRequests > policy.maxActiveRequests &&
+    getModelLaneBurstAdmission(policy.laneKey).allowed
+  ) {
+    return policy.maxBurstActiveRequests;
+  }
   return policy.maxActiveRequests;
 }
 
+export function getSubagentBurstAdmission(policy: SubagentCapacityPolicy) {
+  const degradedUntil = degradedUntilByLane.get(policy.laneKey) || 0;
+  if (degradedUntil > Date.now()) {
+    return {
+      allowed: false,
+      reason: "capacity_degraded",
+      safeOverlapSamples: 0,
+      lastSafeOverlapAt: null,
+      activeRequests: 0,
+    };
+  }
+  return getModelLaneBurstAdmission(policy.laneKey);
+}
+
+function scheduleCapacityReevaluation(state: CapacityLaneState): void {
+  if (state.reevaluationTimer || state.queue.length === 0) return;
+  state.reevaluationTimer = setTimeout(() => {
+    state.reevaluationTimer = null;
+    state.limit = effectiveLaneLimit(state.policy);
+    drainCapacityLane(state);
+  }, 1_000);
+}
+
 function drainCapacityLane(state: CapacityLaneState): void {
+  state.limit = effectiveLaneLimit(state.policy);
   while (state.active < state.limit && state.queue.length > 0) {
     const waiter = state.queue.shift()!;
     if (waiter.signal?.aborted) {
@@ -409,6 +574,11 @@ function drainCapacityLane(state: CapacityLaneState): void {
     state.active += 1;
     waiter.resolve();
   }
+  if (state.queue.length > 0) scheduleCapacityReevaluation(state);
+  else if (state.reevaluationTimer) {
+    clearTimeout(state.reevaluationTimer);
+    state.reevaluationTimer = null;
+  }
 }
 
 async function acquireSubagentCapacity(
@@ -417,7 +587,14 @@ async function acquireSubagentCapacity(
 ): Promise<{ queued: boolean; release: () => void }> {
   if (signal?.aborted) throw makeAbortError();
   const limit = effectiveLaneLimit(policy);
-  const state = capacityLanes.get(policy.laneKey) || { active: 0, limit, queue: [] };
+  const state = capacityLanes.get(policy.laneKey) || {
+    active: 0,
+    limit,
+    queue: [],
+    policy,
+    reevaluationTimer: null,
+  };
+  state.policy = policy;
   state.limit = limit;
   capacityLanes.set(policy.laneKey, state);
 
@@ -437,6 +614,7 @@ async function acquireSubagentCapacity(
         signal.addEventListener("abort", waiter.onAbort, { once: true });
       }
       state.queue.push(waiter);
+      scheduleCapacityReevaluation(state);
     });
   }
 
@@ -480,7 +658,10 @@ export function reportSubagentCapacityFailure(
   if (!shouldDegrade) return false;
   degradedUntilByLane.set(policy.laneKey, Date.now() + 5 * 60_000);
   const lane = capacityLanes.get(policy.laneKey);
-  if (lane) lane.limit = 1;
+  if (lane) {
+    lane.limit = 1;
+    drainCapacityLane(lane);
+  }
   return true;
 }
 
@@ -499,10 +680,64 @@ export function cancelSubagentRun(id: string): boolean {
   return true;
 }
 
+export function hasLiveSubagentController(id: string): boolean {
+  return childAbortControllers.has(id);
+}
+
+export function reconcileOrphanedSubagentEvents(
+  events: readonly MainThreadEvent[],
+  now = Date.now(),
+): MainThreadEvent[] {
+  let reconciled = [...events];
+  for (const run of projectSubagentRuns(events)) {
+    if (!isSubagentActiveStatus(run.status) || hasLiveSubagentController(run.id)) continue;
+    const error = "SUBAGENT_ORPHANED_AFTER_RESTART: the persisted run has no live runtime controller and was closed during session restore.";
+    reconciled = appendRuntimeEvent(reconciled, withEventSchema({
+      type: "subagent.updated",
+      threadId: run.threadId,
+      turnId: run.parentTurnId,
+      timestampMs: now,
+      subagentId: run.id,
+      patch: {
+        status: "canceled",
+        updatedAt: now,
+        completedAt: now,
+        error,
+        progress: {
+          phase: "done",
+          title: "Runtime record reconciled after restart",
+          completedToolCalls: run.progress?.completedToolCalls || 0,
+        },
+      },
+      activity: {
+        id: `${run.id}-orphan-${now}`,
+        timestampMs: now,
+        status: "canceled",
+        title: "Orphaned runtime record closed during restore",
+        detail: error,
+      },
+    }));
+    reconciled = appendRuntimeEvent(reconciled, withEventSchema({
+      type: "subagent.closed",
+      threadId: run.threadId,
+      turnId: run.parentTurnId,
+      timestampMs: now,
+      subagentId: run.id,
+      closedAt: now,
+      reason: "orphaned_after_restart",
+    }));
+  }
+  return reconciled;
+}
+
 export function resetSubagentRuntimeForTests(): void {
+  for (const lane of capacityLanes.values()) {
+    if (lane.reevaluationTimer) clearTimeout(lane.reevaluationTimer);
+  }
   capacityLanes.clear();
   degradedUntilByLane.clear();
   childAbortControllers.clear();
   coordinatedRuns.clear();
+  createdRunCounts.clear();
   scopeLeases.clear();
 }

@@ -89,6 +89,10 @@ export async function handleEmptyResponseRecovery(input: {
   let usedMalformedToolUseRecoveryPrompt = input.usedMalformedToolUseRecoveryPrompt;
   let recoveringFromEmptyAssistantReplyAfterWrite =
     input.recoveringFromEmptyAssistantReplyAfterWrite;
+  const emitDebug = (event: string, data: Record<string, unknown>) => {
+    if (callbacks.onDebugEvent) callbacks.onDebugEvent(`agent.${event}`, data);
+    else logAgentEvent(event, data);
+  };
 
   const finish = (status: EmptyResponseRecoveryResult["status"]): EmptyResponseRecoveryResult => ({
     status,
@@ -107,7 +111,7 @@ export async function handleEmptyResponseRecovery(input: {
     !callbacks.getIsPlanApproved() &&
     isReviewablePlanStage(callbacks.getPlanStage())
   ) {
-    logAgentEvent("plan_review_ready_after_empty_response", {
+    emitDebug("plan_review_ready_after_empty_response", {
       iteration,
       planStage: callbacks.getPlanStage(),
       consecutiveEmptyResponseCount,
@@ -124,7 +128,7 @@ export async function handleEmptyResponseRecovery(input: {
     normalizedBaseToolCallCount === 0;
   if (malformedToolUseBlock && !usedMalformedToolUseRecoveryPrompt) {
     usedMalformedToolUseRecoveryPrompt = true;
-    logAgentEvent("tool_protocol_parse_failed", {
+    emitDebug("tool_protocol_parse_failed", {
       iteration,
       workflowMode,
       turnIntent,
@@ -143,12 +147,39 @@ export async function handleEmptyResponseRecovery(input: {
   emptyResponseCountThisTurn += 1;
 
   if (
+    (callbacks.getSubagentDepth?.() || 0) > 0 &&
+    activeProfile === "local" &&
+    consecutiveEmptyResponseCount === 1 &&
+    !input.normalized.toolCalls.length &&
+    !callbacks.shouldForceXmlForProviderCompatibility?.()
+  ) {
+    callbacks.onProviderCompatibilityFallback?.("subagent_empty_native_completion");
+    emitDebug("subagent_empty_response_fallback", {
+      iteration,
+      action: "switch_to_xml_tools",
+      workflowMode,
+      runtimeIntent,
+    });
+    callbacks.appendMessage({
+      role: "assistant",
+      content: buildEmptyAssistantPlaceholder(normalized.hiddenThought),
+    });
+    callbacks.appendMessage({
+      role: "user",
+      content: callbacks.getPreferredLanguage() === "zh"
+        ? "上一条子任务响应为空。运行时已切换为 XML 工具协议；现在直接调用一个允许的读取/搜索工具，不要输出批准选项或空白回复。"
+        : "The previous subagent response was empty. The runtime switched to the XML tool protocol; call one allowed read/search tool now without approval choices or another empty reply.",
+    });
+    return finish("continue");
+  }
+
+  if (
     workflowMode === "chat" &&
     runtimeIntent === "respond" &&
     emptyResponseCountThisTurn >= 2
   ) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    logAgentEvent("loop_stop", {
+    emitDebug("loop_stop", {
       reason: "empty_model_response",
       iteration,
       consecutiveEmptyResponseCount,
@@ -185,12 +216,12 @@ export async function handleEmptyResponseRecovery(input: {
       if (closureResult === "approved_continue") return finish("continue");
       if (closureResult === "stopped") return finish("stopped");
       if (closureResult === "failed") {
-        logAgentEvent("plan_empty_after_closure_failed", {
+        emitDebug("plan_empty_after_closure_failed", {
           iteration,
           consecutiveEmptyResponseCount,
         });
       }
-      logAgentEvent("loop_stop", {
+      emitDebug("loop_stop", {
         reason: "plan_empty_response_checkpoint",
         iteration,
         consecutiveEmptyResponseCount,
@@ -219,7 +250,7 @@ export async function handleEmptyResponseRecovery(input: {
 
   if (consecutiveEmptyResponseCount >= 3) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    logAgentEvent("loop_stop", {
+    emitDebug("loop_stop", {
       reason: "empty_model_response",
       iteration,
       consecutiveEmptyResponseCount,

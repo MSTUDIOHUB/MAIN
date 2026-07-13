@@ -34,7 +34,9 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
+const modelLanes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
 const subagentRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagentRuntime.ts"));
+const subagentJoinRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/subagentJoinRuntime.ts"));
 const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 
 function makeConfig(profile, overrides = {}) {
@@ -68,6 +70,7 @@ test("capacity policy permits two local children and bounded cloud parallelism",
   const local = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
   assert.equal(local.profile, "local");
   assert.equal(local.maxActiveRequests, 2);
+  assert.equal(local.maxBurstActiveRequests, 3);
   assert.equal(local.maxCreatedPerTurn, 3);
   assert.equal(local.model, "qwen3.6-35b-a3b");
 
@@ -77,6 +80,7 @@ test("capacity policy permits two local children and bounded cloud parallelism",
   }));
   assert.equal(cloud.profile, "cloud");
   assert.equal(cloud.maxActiveRequests, 3);
+  assert.equal(cloud.maxBurstActiveRequests, 3);
   assert.equal(cloud.maxCreatedPerTurn, 6);
   assert.equal(cloud.model, "gpt-cloud");
 });
@@ -116,6 +120,49 @@ test("runtime event projection preserves completion while recording thread closu
   assert.equal(record.summary, "Found the event boundary.");
   assert.equal(record.activities.length, 1);
   assert.deepEqual(subagents.getSubagentRunsForTurn(events, "turn-1").map((run) => run.id), ["subagent-1"]);
+
+  const dismissed = [
+    ...events,
+    turnEvents.withEventSchema({
+      type: "subagent.dismissed",
+      threadId: "thread-1",
+      turnId: "turn-1",
+      timestampMs: 22,
+      subagentId: "subagent-1",
+    }),
+  ];
+  assert.deepEqual(subagents.projectSubagentRuns(dismissed), []);
+});
+
+test("session restore reconciles active records that have no live controller", () => {
+  subagents.resetSubagentRuntimeForTests();
+  const events = [turnEvents.withEventSchema({
+    type: "subagent.created",
+    threadId: "thread-restore",
+    turnId: "turn-old",
+    timestampMs: 10,
+    subagent: {
+      id: "subagent-orphan",
+      parentTurnId: "turn-old",
+      threadId: "thread-restore",
+      name: "Euler",
+      role: "explorer",
+      objective: "Inspect stale state",
+      status: "running",
+      profile: "local",
+      provider: "OMLX",
+      model: "qwen",
+      createdAt: 10,
+      updatedAt: 10,
+    },
+  })];
+
+  const reconciled = subagents.reconcileOrphanedSubagentEvents(events, 50);
+  const [run] = subagents.projectSubagentRuns(reconciled);
+  assert.equal(run.status, "canceled");
+  assert.equal(run.completedAt, 50);
+  assert.equal(run.closedAt, 50);
+  assert.match(run.error, /SUBAGENT_ORPHANED_AFTER_RESTART/);
 });
 
 test("local capacity scheduler runs at most two child workflows at once", async () => {
@@ -141,6 +188,62 @@ test("local capacity scheduler runs at most two child workflows at once", async 
   assert.deepEqual(executionOrder.slice(0, 2), ["start:0", "start:1"]);
   assert.equal(executionOrder.filter((entry) => entry.startsWith("start:")).length, 3);
   assert.equal(executionOrder.filter((entry) => entry.startsWith("end:")).length, 3);
+});
+
+test("a queued third local child starts only after two safe model-overlap samples", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  modelLanes.resetModelLaneCoordinatorForTests();
+  modelLanes.setModelLaneMemoryReaderForTests(async () => ({
+    total_gb: 64,
+    available_gb: 24,
+    total_bytes: 64 * 1024 ** 3,
+    available_bytes: 24 * 1024 ** 3,
+  }));
+  const policy = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
+  let active = 0;
+  let maxActive = 0;
+  let releaseTasks;
+  const taskGate = new Promise((resolve) => { releaseTasks = resolve; });
+  let resolveThirdStarted;
+  const thirdStarted = new Promise((resolve) => { resolveThirdStarted = resolve; });
+  const tasks = Promise.all([0, 1, 2].map(() => subagents.withSubagentCapacity({
+    policy,
+    task: async () => {
+      active += 1;
+      maxActive = Math.max(maxActive, active);
+      if (active === 3) resolveThirdStarted();
+      await taskGate;
+      active -= 1;
+    },
+  })));
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(active, 2);
+
+  const firstModel = await modelLanes.acquireModelLane({
+    config: makeConfig("local"),
+    agentKind: "subagent",
+    subagentId: "subagent-health-1",
+  });
+  firstModel.markFirstToken();
+  const secondModel = await modelLanes.acquireModelLane({
+    config: makeConfig("local"),
+    agentKind: "subagent",
+    subagentId: "subagent-health-2",
+  });
+  secondModel.markFirstToken();
+  await modelLanes.sampleModelLaneMemoryForTests(policy.laneKey);
+  await modelLanes.sampleModelLaneMemoryForTests(policy.laneKey);
+  assert.equal(subagents.getSubagentBurstAdmission(policy).allowed, true);
+  await Promise.race([
+    thirdStarted,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("elastic child was not admitted")), 2_000)),
+  ]);
+  assert.equal(maxActive, 3);
+
+  releaseTasks();
+  await tasks;
+  secondModel.release();
+  firstModel.release();
 });
 
 test("cloud capacity scheduler caps concurrent child calls at three", async () => {
@@ -272,6 +375,113 @@ test("async spawn returns a handle before completion and wait preserves structur
   assert.equal(joined.results[0].status, "completed");
   assert.match(joined.results[0].summary, /versioned and persisted/);
   assert.equal(joined.results[0].evidence[0].target, "src/lib/turnEvents.ts");
+  assert.deepEqual(subagents.getPendingCoordinatedSubagentIds("thread-async", "turn-async"), []);
+  assert.equal(subagents.getCoordinatedSubagentRunCount("thread-async", "turn-async"), 1);
+});
+
+test("parent finalization cancels live children and releases coordinator state", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const controller = new AbortController();
+  let resolveCompletion;
+  const completion = new Promise((resolve) => { resolveCompletion = resolve; });
+  controller.signal.addEventListener("abort", () => resolveCompletion({
+    subagentId: "subagent-finalize",
+    name: "Euler",
+    scopeKey: "runtime",
+    status: "canceled",
+    summary: "Partial evidence retained.",
+    evidence: [],
+  }), { once: true });
+  subagents.registerSubagentAbortController("subagent-finalize", controller);
+  subagents.registerCoordinatedSubagentRun({
+    threadId: "thread-finalize",
+    parentTurnId: "turn-finalize",
+    subagentId: "subagent-finalize",
+    name: "Euler",
+    scopeKey: "runtime",
+    completion,
+  });
+
+  const result = await subagents.finalizeCoordinatedSubagentsForParent({
+    threadId: "thread-finalize",
+    parentTurnId: "turn-finalize",
+    graceMs: 100,
+  });
+  subagents.unregisterSubagentAbortController("subagent-finalize");
+  assert.deepEqual(result.requestedIds, ["subagent-finalize"]);
+  assert.deepEqual(result.canceledIds, ["subagent-finalize"]);
+  assert.deepEqual(result.settledIds, ["subagent-finalize"]);
+  assert.deepEqual(result.timedOutIds, []);
+  assert.equal(result.releasedCount, 1);
+  assert.equal(subagents.getCoordinatedSubagentRunCount("thread-finalize", "turn-finalize"), 0);
+});
+
+test("completed child remains joinable until the parent consumes its result", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const completion = Promise.resolve({
+    subagentId: "subagent-ready",
+    name: "Mendel",
+    scopeKey: "ready-result",
+    status: "completed",
+    summary: "Ready before the parent reached its join boundary.",
+    evidence: [],
+  });
+  subagents.registerCoordinatedSubagentRun({
+    threadId: "thread-ready",
+    parentTurnId: "turn-ready",
+    subagentId: "subagent-ready",
+    name: "Mendel",
+    scopeKey: "ready-result",
+    completion,
+  });
+  await completion;
+  await Promise.resolve();
+
+  assert.deepEqual(
+    subagents.getPendingCoordinatedSubagentIds("thread-ready", "turn-ready"),
+    ["subagent-ready"],
+  );
+  const joined = await subagents.waitForCoordinatedSubagents({
+    threadId: "thread-ready",
+    parentTurnId: "turn-ready",
+  });
+  assert.equal(joined.results[0].status, "completed");
+  assert.deepEqual(subagents.getPendingCoordinatedSubagentIds("thread-ready", "turn-ready"), []);
+});
+
+test("runtime parent join injects structured child evidence before finalization", async () => {
+  const messages = [];
+  const events = [];
+  const recent = [];
+  const recentPlan = [];
+  const joined = await subagentJoinRuntime.joinPendingSubagentsForParent({
+    callbacks: {
+      getPendingSubagentIds: () => ["subagent-euler", "subagent-mendel"],
+      waitSubagents: async () => ({
+        pendingIds: [],
+        results: [{
+          subagentId: "subagent-euler",
+          name: "Euler",
+          scopeKey: "events",
+          status: "completed",
+          summary: "Found the event boundary.",
+          evidence: [{ tool: "read_file", target: "src/lib/turnEvents.ts", detail: "Versioned events." }],
+        }],
+      }),
+      getPreferredLanguage: () => "en",
+      appendMessage: (message) => messages.push(message),
+      onDebugEvent: (event, data) => events.push({ event, data }),
+    },
+    recentToolActivity: recent,
+    recentPlanToolActivity: recentPlan,
+    reason: "parent_final_response",
+  });
+
+  assert.equal(joined, true);
+  assert.match(messages[0].content, /SUBAGENT_JOIN_RESULT/);
+  assert.deepEqual(recent.map((entry) => [entry.name, entry.target]), [["read_file", "src/lib/turnEvents.ts"]]);
+  assert.deepEqual(recentPlan, recent);
+  assert.deepEqual(events.map((entry) => entry.event), ["parent_join_required", "parent_join_injected"]);
 });
 
 test("blocked child results preserve their useful summary instead of becoming tool errors", async () => {
@@ -306,6 +516,43 @@ test("blocked child results preserve their useful summary instead of becoming to
   assert.equal(result.evidence.length, 1);
 });
 
+test("iteration boundary with evidence is a blocked partial result, not a failure", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const traceEvents = [];
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect a bounded file",
+      scopeKey: "bounded-file",
+      scope: "One file",
+      allowedPaths: "src/lib/subagents.ts",
+      expectedOutput: "Partial evidence",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-boundary",
+      getMessages: () => [],
+      onDebugEvent: (event, data) => traceEvents.push({ event, data }),
+    },
+    parentTurnId: "turn-boundary",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      childCallbacks.onToolDone("read_file", "src/lib/subagents.ts", "Coordinator evidence");
+      childCallbacks.onAssistantFinalText("The coordinator retains a bounded partial result.");
+      childCallbacks.onNonActionableStop("Iteration boundary reached.", "no_action", {
+        recoveryReason: "max_iterations_boundary",
+      });
+      return { status: "stopped_no_action", reason: "max_iterations_boundary" };
+    },
+  });
+
+  assert.equal(result.status, "blocked");
+  assert.match(result.summary, /bounded partial result/);
+  assert.equal(result.evidence.length, 1);
+  assert.ok(traceEvents.some((entry) => entry.event === "subagent_partial_result_preserved"));
+});
+
 test("scope leases reject child escape and parent overlap", () => {
   subagents.resetSubagentRuntimeForTests();
   subagents.acquireSubagentScopeLease({
@@ -338,6 +585,16 @@ test("scope leases reject child escape and parent overlap", () => {
     threadId: "thread-scope",
     targetPath: ".",
   })?.subagentId, "subagent-scope");
+  assert.equal(subagents.findSubagentLeaseOverlap({
+    threadId: "thread-scope",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib"],
+  })?.subagentId, "subagent-scope");
+  assert.equal(subagents.findSubagentLeaseOverlap({
+    threadId: "thread-scope",
+    workspace: "/workspace",
+    allowedPaths: ["src/components"],
+  }), null);
 });
 
 test("subagent source contracts keep children read-only and UI activity clickable", () => {
@@ -346,6 +603,7 @@ test("subagent source contracts keep children read-only and UI activity clickabl
   const chatSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
   const panelSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/RightPanel.tsx"), "utf8");
   const schemaSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/toolSchemas.ts"), "utf8");
+  const workflowSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
   assert.match(registrySource, /subagentDepth > 0/);
   assert.match(registrySource, /childToolNames = new Set\(\[/);
@@ -368,4 +626,11 @@ test("subagent source contracts keep children read-only and UI activity clickabl
   assert.match(panelSource, /<SubagentsPanel/);
   assert.match(schemaSource, /name: "spawn_subagent"/);
   assert.match(schemaSource, /name: "wait_subagents"/);
+  assert.match(workflowSource, /run\.parentTurnId !== currentParentTurnId/);
+  assert.match(workflowSource, /return prepareSubagentsForNewTurn\(\)\.then\(executeLoopStrategy\)/);
+  assert.match(workflowSource, /subagent_new_turn_preflight/);
+  const debugLogSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/debugLog.ts"), "utf8");
+  assert.match(debugLogSource, /source === "agent\.iteration_start"/);
+  assert.match(debugLogSource, /source === "agent\.context_pack_built"/);
+  assert.match(debugLogSource, /source === "agent\.stream_low_content_diagnostic"/);
 });

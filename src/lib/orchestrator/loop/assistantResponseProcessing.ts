@@ -42,6 +42,7 @@ export function processAssistantStreamResponse(input: {
   managedMessageCount: number;
   currentMaxTokens: number | undefined;
   turnContext: ResponseTurnContext;
+  onDebugEvent?: (event: string, data: Record<string, unknown>) => void;
 }): AssistantResponseProcessingResult {
   const {
     streamResult,
@@ -74,8 +75,12 @@ export function processAssistantStreamResponse(input: {
       : null;
   const contentShort = streamText.length < 10;
   const toolCallsFew = streamResult.toolCalls.length < 2;
+  const emitDebug = (event: string, data: Record<string, unknown>) => {
+    if (input.onDebugEvent) input.onDebugEvent(`agent.${event}`, data);
+    else logAgentEvent(event, data);
+  };
 
-  logAgentEvent("stream_done", {
+  emitDebug("stream_done", {
     iteration,
     metricScope: "iteration",
     finishReason: streamResult.finishReason || "unknown",
@@ -104,7 +109,7 @@ export function processAssistantStreamResponse(input: {
   });
 
   if (contentShort && toolCallsFew) {
-    logAgentEvent("stream_low_content_diagnostic", {
+    emitDebug("stream_low_content_diagnostic", {
       iteration,
       contentChars: streamText.length,
       contentPreview: streamText.slice(0, 200),
@@ -121,7 +126,7 @@ export function processAssistantStreamResponse(input: {
   }
 
   if (providerReasoningForHistory) {
-    logAgentEvent("reasoning_suppressed", {
+    emitDebug("reasoning_suppressed", {
       iteration,
       chars: providerReasoningForHistory.reasoningContent.length,
       field: providerReasoningForHistory.reasoningField || "reasoning_content",
@@ -138,7 +143,7 @@ export function processAssistantStreamResponse(input: {
   }
 
   if (streamText.length === 0 && streamResult.toolCalls.length === 0) {
-    logAgentEvent("llm_empty_response_diagnostic", {
+    emitDebug("llm_empty_response_diagnostic", {
       iteration,
       elapsedMs: Date.now() - iterationRequestStartedAt,
       workflowMode,

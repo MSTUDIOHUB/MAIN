@@ -1076,7 +1076,7 @@ export function buildSystemPrompt(
       if (isToolNameAvailable(name, availableToolNames)) tfl.push(description);
     };
     addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。仅在没有明确路径/文件名/符号线索时作为一次浅层发现使用，建议 depth: 2；拿到结构后必须转向定向搜索或读取。");
-    addToolDescription("spawn_subagent", "- spawn_subagent: 异步创建有界只读子智能体。必须给出 scope_key、scope、allowed_paths 和 expected_output；返回句柄后继续处理不重叠工作，不要等待或重复读取其租约路径。");
+    addToolDescription("spawn_subagent", "- spawn_subagent: 异步创建有界只读子智能体。必须给出 scope_key、scope、allowed_paths 和 expected_output；返回句柄后继续处理不重叠工作，不要等待或重复读取其租约路径。常规并行上限为 2，不是必须填满的配额：简单任务使用 0 或 1 个，可明确拆分时才使用 2 个。只有任务仍存在第三个实质性、可独立完成且路径不重叠的工作范围时才创建第 3 个，runtime 会根据已运行子流的首 token、连续内存采样和故障状态决定弹性放行。不要为填满额度拆分琐碎或重复任务。第四个及更多本地子智能体不可用。");
     addToolDescription("wait_subagents", "- wait_subagents: 在主体完成自己的非重叠工作后，等待并汇合一个或全部子智能体的摘要、证据、阻塞原因和剩余工作。最终结论前必须汇合仍在运行的子智能体。");
     addToolDescription("get_file_outline", "- get_file_outline: (path: string) 轻量启发式文件轮廓。适合 Tree-sitter 暂不支持的语言；受支持源码优先用 code_ast_query 获取真实语法树结果。");
     addToolDescription("code_ast_query", "- code_ast_query: 对 TS/TSX、JS/JSX、Rust、Python、C#、Go 文件执行真实 Tree-sitter 语法树查询，返回声明、语法节点类型、签名和精确行号。源码探索先用它缩小范围，再用小窗口 read_file 查看实现；不要用整文件读取或 grep_search 模拟 AST。");

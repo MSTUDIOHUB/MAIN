@@ -156,6 +156,7 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     managedMessageCount: input.managedMessageCount,
     currentMaxTokens: input.currentMaxTokens,
     turnContext: input.turnContext,
+    onDebugEvent: callbacks.onDebugEvent,
   });
   const {
     streamText,

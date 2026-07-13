@@ -307,7 +307,13 @@ import {
 } from "../lib/imageStudioSessions";
 import { runIntentPreflight } from "../lib/intentPreflight";
 import { runAfterNextPaint } from "../lib/uiScheduling";
-import { cancelSubagentRun } from "../lib/subagents";
+import {
+  cancelSubagentRun,
+  isSubagentActiveStatus,
+  isSubagentTerminalStatus,
+  projectSubagentRuns,
+  reconcileOrphanedSubagentEvents,
+} from "../lib/subagents";
 import {
   buildFeishuApprovalCard,
   createDefaultFeishuAdapterRuntimeStatus,
@@ -992,6 +998,8 @@ export interface AppState {
   openSubagentsPanel: (subagentId?: string) => void;
   selectSubagent: (subagentId: string) => void;
   stopSubagent: (subagentId: string) => boolean;
+  stopAllSubagents: () => number;
+  dismissEndedSubagents: () => number;
   ensurePlanArtifactsHydratedForWorkspace: (options?: { openPanel?: boolean; reason?: string; promoteTasksToExecuting?: boolean }) => Promise<boolean>;
   openPlanWorkspacePanel: () => Promise<boolean>;
   closeRightPanel: () => void;
@@ -1641,6 +1649,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "subagent.created",
     "subagent.updated",
     "subagent.closed",
+    "subagent.dismissed",
     "subagent.handed_back",
     "model_lane.pressure",
     "approval.requested",
@@ -2075,6 +2084,18 @@ export function normalizeSessionRuntimeSnapshot(
             error: { message: sanitizedHarnessRunMarker.lastStreamError || sanitizedHarnessRunMarker.closeReason || "Restored failed run." },
           }
     ));
+  }
+  if (options?.restoreInterruptedGoal) {
+    const beforeReconcileCount = runtimeEvents.length;
+    runtimeEvents = reconcileOrphanedSubagentEvents(runtimeEvents);
+    if (runtimeEvents.length > beforeReconcileCount) {
+      logStoreEvent("subagent_orphan_reconciled", {
+        appendedEvents: runtimeEvents.length - beforeReconcileCount,
+        activeAfterRestore: projectSubagentRuns(runtimeEvents).filter((run) =>
+          isSubagentActiveStatus(run.status)
+        ).length,
+      });
+    }
   }
   const persistedAgentMessages = sanitizeAgentMessagesForPersist(snapshot.agentMessages || []);
   let rejectedChoiceMessageIndex = -1;
@@ -3919,7 +3940,80 @@ export const useAppStore = create<AppState>()(
     ...(subagentId ? { selectedSubagentId: subagentId } : {}),
   }),
   selectSubagent: (subagentId) => set({ selectedSubagentId: subagentId }),
-  stopSubagent: (subagentId) => cancelSubagentRun(subagentId),
+  stopSubagent: (subagentId) => {
+    const canceled = cancelSubagentRun(subagentId);
+    logStoreEvent("subagent_cancel_requested", { subagentId, controllerFound: canceled });
+    if (canceled) return true;
+    const run = projectSubagentRuns(get().runtimeEvents).find((candidate) => candidate.id === subagentId);
+    if (!run || !isSubagentActiveStatus(run.status)) return false;
+    const timestampMs = Date.now();
+    const error = "SUBAGENT_RUNTIME_CONTROLLER_MISSING: the live controller no longer exists; the stale record was closed.";
+    set((state) => ({
+      runtimeEvents: appendRuntimeEvent(
+        appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+          type: "subagent.updated",
+          threadId: run.threadId,
+          turnId: run.parentTurnId,
+          timestampMs,
+          subagentId,
+          patch: {
+            status: "canceled",
+            updatedAt: timestampMs,
+            completedAt: timestampMs,
+            error,
+            progress: {
+              phase: "done",
+              title: "Stale runtime record closed",
+              completedToolCalls: run.progress?.completedToolCalls || 0,
+            },
+          },
+        })),
+        withEventSchema({
+          type: "subagent.closed",
+          threadId: run.threadId,
+          turnId: run.parentTurnId,
+          timestampMs,
+          subagentId,
+          closedAt: timestampMs,
+          reason: "runtime_controller_missing",
+        }),
+      ),
+    }));
+    logStoreEvent("subagent_cancel_result", {
+      subagentId,
+      result: "stale_record_reconciled",
+    });
+    return false;
+  },
+  stopAllSubagents: () => {
+    const activeRuns = projectSubagentRuns(get().runtimeEvents).filter((run) =>
+      isSubagentActiveStatus(run.status)
+    );
+    activeRuns.forEach((run) => get().stopSubagent(run.id));
+    logStoreEvent("subagent_cancel_all_requested", { count: activeRuns.length });
+    return activeRuns.length;
+  },
+  dismissEndedSubagents: () => {
+    const endedRuns = projectSubagentRuns(get().runtimeEvents).filter((run) =>
+      isSubagentTerminalStatus(run.status)
+    );
+    if (endedRuns.length === 0) return 0;
+    const timestampMs = Date.now();
+    set((state) => ({
+      runtimeEvents: endedRuns.reduce((events, run) => appendRuntimeEvent(events, withEventSchema({
+        type: "subagent.dismissed",
+        threadId: run.threadId,
+        turnId: run.parentTurnId,
+        timestampMs,
+        subagentId: run.id,
+      })), state.runtimeEvents),
+      selectedSubagentId: endedRuns.some((run) => run.id === state.selectedSubagentId)
+        ? null
+        : state.selectedSubagentId,
+    }));
+    logStoreEvent("subagent_history_dismissed", { count: endedRuns.length });
+    return endedRuns.length;
+  },
   closeRightPanel: () => set((state) => ({
     showPlanPanel: false,
     showDiff: false,

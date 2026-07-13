@@ -1003,6 +1003,8 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     selectedSubagentId,
     selectSubagent,
     stopSubagent,
+    stopAllSubagents,
+    dismissEndedSubagents,
   } = {
     showDiff: useAppStore((s) => s.showDiff),
     showPlanPanel: useAppStore((s) => s.showPlanPanel),
@@ -1035,6 +1037,8 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     selectedSubagentId: useAppStore((s) => s.selectedSubagentId),
     selectSubagent: useAppStore((s) => s.selectSubagent),
     stopSubagent: useAppStore((s) => s.stopSubagent),
+    stopAllSubagents: useAppStore((s) => s.stopAllSubagents),
+    dismissEndedSubagents: useAppStore((s) => s.dismissEndedSubagents),
   };
 
   const selectedDiffTask = useMemo(() => {
@@ -1545,6 +1549,8 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
               themeMode={config.themeMode}
               onSelect={selectSubagent}
               onStop={(id) => { stopSubagent(id); }}
+              onStopAll={() => { stopAllSubagents(); }}
+              onClearEnded={() => { dismissEndedSubagents(); }}
             />
           )}
         </div>

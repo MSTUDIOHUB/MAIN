@@ -2,6 +2,8 @@ import type { AppConfig } from "./appTypes";
 import type { AgentLoopOutcome, AgentMessage, OrchestratorCallbacks } from "./orchestrator/types";
 import {
   acquireSubagentScopeLease,
+  findSubagentLeaseOverlap,
+  getSubagentBurstAdmission,
   registerSubagentAbortController,
   registerCoordinatedSubagentRun,
   reportSubagentCapacityFailure,
@@ -168,6 +170,23 @@ export function scheduleControlledSubagent(input: {
   if (policy.profile === "local" && allowedPaths.length > 6) {
     throw new Error("SUBAGENT_SCOPE_TOO_BROAD: local subagents may own at most 6 paths.");
   }
+  const leaseOverlap = findSubagentLeaseOverlap({
+    threadId: input.parentCallbacks.getSessionKey(),
+    workspace: parentConfig.workspace,
+    allowedPaths,
+  });
+  if (leaseOverlap) {
+    input.parentCallbacks.onDebugEvent?.("delegation_scope_decision", {
+      decision: "rejected",
+      reason: "duplicate_subagent_scope",
+      conflictingSubagentId: leaseOverlap.subagentId,
+      conflictingScopeKey: leaseOverlap.scopeKey,
+      allowedPaths,
+    });
+    throw new Error(
+      `SUBAGENT_DUPLICATE_SCOPE: allowed_paths overlap ${leaseOverlap.subagentId} (${leaseOverlap.scopeKey}). Delegate a distinct scope.`,
+    );
+  }
   const scopeKey = compactText(input.request.scopeKey || input.request.scope || objective, 96);
   const prepared: PreparedSubagentRun = {
     subagentId,
@@ -184,6 +203,8 @@ export function scheduleControlledSubagent(input: {
     scopeKey,
     profile: policy.profile,
     childCapacity: policy.maxActiveRequests,
+    burstChildCapacity: policy.maxBurstActiveRequests,
+    elasticCandidate: policy.profile === "local" && input.existingRunCount >= policy.maxActiveRequests,
     allowedPathCount: allowedPaths.length,
   });
   const completion = executeControlledSubagent({ ...input, prepared });
@@ -272,6 +293,8 @@ export async function executeControlledSubagent(input: {
     scopeKey,
     profile: policy.profile,
     childCapacity: policy.maxActiveRequests,
+    burstChildCapacity: policy.maxBurstActiveRequests,
+    elasticCandidate: policy.profile === "local" && input.existingRunCount >= policy.maxActiveRequests,
     allowedPathCount: allowedPaths.length,
   });
   acquireSubagentScopeLease({
@@ -306,6 +329,7 @@ export async function executeControlledSubagent(input: {
   const evidence: SubagentResultEnvelope["evidence"] = [];
   let activitySequence = 0;
   let lastProgressEmitAt = 0;
+  let childForceXmlTools = false;
 
   const emitUpdate = (patch: SubagentRunPatch, activity?: SubagentActivity) => {
     input.emitEvent(withEventSchema({
@@ -385,6 +409,16 @@ export async function executeControlledSubagent(input: {
       agentKind: "subagent",
       subagentId,
     }),
+    shouldForceXmlForProviderCompatibility: () => childForceXmlTools,
+    onProviderCompatibilityFallback: (reason) => {
+      childForceXmlTools = true;
+      emitChildDebug("subagent_protocol_fallback", {
+        reason,
+        from: "native_tools",
+        to: "xml_tools",
+      });
+    },
+    onProviderNativeToolSuccess: () => {},
     onDebugEvent: (event, data = {}) => {
       if (event === "memory_pressure_sample" && data.action === "hold") {
         emitProgress({
@@ -432,8 +466,10 @@ export async function executeControlledSubagent(input: {
       childStatus = "error";
       lastError = String(error || "");
     },
-    onNonActionableStop: (message) => {
-      lastError = String(message || "");
+    onNonActionableStop: (message, _reason, progress) => {
+      lastError = progress?.recoveryReason === "empty_model_response"
+        ? `SUBAGENT_EMPTY_MODEL_RESPONSE: the provider returned no semantic text or tool calls after the bounded ${childForceXmlTools ? "native-to-XML fallback" : "native tool"} attempts.`
+        : String(message || "");
     },
     onPlanArtifactUpdated: () => {},
     onPlanStageChanged: () => {},
@@ -524,10 +560,22 @@ export async function executeControlledSubagent(input: {
       signal: childAbortController.signal,
       onQueued: () => {
         capacityQueuedAt = Date.now();
+        const burstAdmission = getSubagentBurstAdmission(policy);
+        const elasticCandidate = policy.profile === "local" &&
+          input.existingRunCount >= policy.maxActiveRequests;
         emitChildDebug("subagent_capacity_queued", {
           profile: policy.profile,
           childCapacity: policy.maxActiveRequests,
+          burstChildCapacity: policy.maxBurstActiveRequests,
+          elasticCandidate,
+          burstAdmission,
         });
+        if (elasticCandidate) {
+          emitChildDebug("subagent_elastic_admission", {
+            decision: "queued",
+            burstAdmission,
+          });
+        }
         emitUpdate({
           status: "queued",
           progress: {
@@ -541,10 +589,23 @@ export async function executeControlledSubagent(input: {
       },
       task: async () => {
         const startedAt = Date.now();
+        const burstAdmission = getSubagentBurstAdmission(policy);
+        const elasticCandidate = policy.profile === "local" &&
+          input.existingRunCount >= policy.maxActiveRequests;
+        if (elasticCandidate) {
+          emitChildDebug("subagent_elastic_admission", {
+            decision: burstAdmission.allowed ? "admitted" : "started_after_base_slot_released",
+            waitMs: capacityQueuedAt == null ? 0 : startedAt - capacityQueuedAt,
+            burstAdmission,
+          });
+        }
         emitChildDebug("subagent_started", {
           profile: policy.profile,
           capacityWaitMs: capacityQueuedAt == null ? 0 : startedAt - capacityQueuedAt,
           childCapacity: policy.maxActiveRequests,
+          burstChildCapacity: policy.maxBurstActiveRequests,
+          elasticAdmissionGranted: elasticCandidate && burstAdmission.allowed,
+          burstAdmission,
         });
         emitUpdate({
           status: "starting",
@@ -565,7 +626,7 @@ export async function executeControlledSubagent(input: {
           .finally(() => clearTimeout(wallClockTimer));
         finalStatus = resolveOutcomeStatus(outcome, childAbortController.signal.aborted);
         if (wallClockTimedOut) finalStatus = "blocked";
-        finalSummary = compactText(
+        const candidateSummary = compactText(
           finalText || turnSummary || streamText || childMessages
             .filter((message) => message.role === "assistant" && typeof message.content === "string")
             .map((message) => String(message.content))
@@ -573,6 +634,20 @@ export async function executeControlledSubagent(input: {
             .join("\n"),
           16_000,
         );
+        finalSummary = candidateSummary;
+        if (
+          finalStatus === "failed" &&
+          (outcome.status === "stopped_no_action" || outcome.status === "stopped_no_output") &&
+          (candidateSummary.length > 0 || evidence.length > 0)
+        ) {
+          finalStatus = "blocked";
+          emitChildDebug("subagent_partial_result_preserved", {
+            outcomeStatus: outcome.status,
+            outcomeReason: outcome.reason,
+            summaryChars: candidateSummary.length,
+            evidenceCount: evidence.length,
+          });
+        }
         if (!finalSummary) {
           finalSummary = finalStatus === "completed"
             ? language === "zh" ? "子智能体已完成，但没有返回可见摘要。" : "The subagent completed without a visible summary."
@@ -592,15 +667,21 @@ export async function executeControlledSubagent(input: {
             phase: "done",
             title: finalStatus === "completed"
               ? language === "zh" ? "执行完成" : "Completed"
+              : finalStatus === "blocked" || finalStatus === "degraded"
+              ? language === "zh" ? "已返回可用的部分结果" : "Usable partial result returned"
               : finalStatus === "canceled"
               ? language === "zh" ? "已取消" : "Canceled"
               : language === "zh" ? "执行未完成" : "Execution did not complete",
             completedToolCalls,
           },
         }, makeActivity(
-          finalStatus === "completed" ? "completed" : finalStatus === "canceled" ? "canceled" : "failed",
+          finalStatus === "completed" || finalStatus === "blocked" || finalStatus === "degraded"
+            ? "completed"
+            : finalStatus === "canceled" ? "canceled" : "failed",
           finalStatus === "completed"
             ? language === "zh" ? "返回摘要" : "Summary returned"
+            : finalStatus === "blocked" || finalStatus === "degraded"
+            ? language === "zh" ? "返回部分摘要" : "Partial summary returned"
             : language === "zh" ? "执行结束" : "Execution ended",
         ));
         if (finalStatus === "degraded") {

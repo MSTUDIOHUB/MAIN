@@ -346,7 +346,16 @@ export async function invokeInitialStreamForIteration(input: {
     callbacks.onProviderNativeToolSuccess?.();
   }
   const completionClass = classifyAssistantCompletion(streamResult);
-  logAgentEvent("assistant_completion_classified", {
+  if (callbacks.onDebugEvent) callbacks.onDebugEvent("agent.assistant_completion_classified", {
+    iteration,
+    completionClass,
+    finishReason: streamResult.finishReason || null,
+    contentChars: streamResult.content.length,
+    reasoningChars: (streamResult.reasoningContent || "").length,
+    toolCalls: streamResult.toolCalls?.length || 0,
+    contextLimitUnchanged: snapshotContextLimit ?? null,
+  });
+  else logAgentEvent("assistant_completion_classified", {
     iteration,
     completionClass,
     finishReason: streamResult.finishReason || null,

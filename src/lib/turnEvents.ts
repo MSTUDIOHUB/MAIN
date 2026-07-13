@@ -88,6 +88,7 @@ export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.created"; threadId: string; turnId: string; timestampMs: number; subagent: SubagentRunSnapshot }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.updated"; threadId: string; turnId: string; timestampMs: number; subagentId: string; patch: SubagentRunPatch; activity?: SubagentActivity }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.closed"; threadId: string; turnId: string; timestampMs: number; subagentId: string; closedAt: number; reason?: string }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.dismissed"; threadId: string; turnId: string; timestampMs: number; subagentId: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "subagent.handed_back"; threadId: string; turnId: string; timestampMs: number; subagentId: string; reason: string; evidenceCount: number; remainingWork?: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "model_lane.pressure"; threadId: string; turnId: string; timestampMs: number; laneKey: string; availableBytes: number; reserveBytes: number; action: "sample" | "hold" | "degrade" }
   | ({

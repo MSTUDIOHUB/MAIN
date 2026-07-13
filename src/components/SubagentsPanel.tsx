@@ -5,6 +5,7 @@ import {
   IconStop,
   IconSubagent,
   IconSubagentClosed,
+  IconTrash,
 } from "./Icons";
 import {
   isSubagentActiveStatus,
@@ -22,6 +23,8 @@ interface SubagentsPanelProps {
   themeMode: ThemeMode;
   onSelect: (id: string) => void;
   onStop: (id: string) => void;
+  onStopAll: () => void;
+  onClearEnded: () => void;
 }
 
 function statusLabel(status: SubagentStatus, language: "zh" | "en"): string {
@@ -102,6 +105,8 @@ export default function SubagentsPanel({
   themeMode,
   onSelect,
   onStop,
+  onStopAll,
+  onClearEnded,
 }: SubagentsPanelProps) {
   const isLight = themeMode === "light";
   const selected = useMemo(
@@ -110,11 +115,13 @@ export default function SubagentsPanel({
   );
   const activeCount = runs.filter((run) => isSubagentActiveStatus(run.status)).length;
   const completedCount = runs.filter((run) => run.status === "completed").length;
+  const endedCount = runs.length - activeCount;
 
   return (
     <div data-testid="subagents-panel" className={`flex h-full min-h-0 flex-col ${isLight ? "bg-[#ffffff] text-[#202124]" : "bg-[#050505] text-[#e4e4e7]"}`}>
       <div className={`shrink-0 border-b px-4 py-3 ${isLight ? "border-[#e4e4e7] bg-[#fafafa]" : "border-[#18181b] bg-[#09090b]"}`}>
-        <div className="grid grid-cols-3 gap-3 text-[11px]">
+        <div className="flex items-start gap-3">
+          <div className="grid min-w-0 flex-1 grid-cols-3 gap-3 text-[11px]">
           <div>
             <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "活跃" : "Active"}</div>
             <div className="mt-0.5 text-[14px] font-semibold">{activeCount} / {capacityPolicy.maxActiveRequests}</div>
@@ -126,6 +133,35 @@ export default function SubagentsPanel({
           <div>
             <div className={isLight ? "text-[#5f6368]" : "text-[#71717a]"}>{language === "zh" ? "本轮上限" : "Turn cap"}</div>
             <div className="mt-0.5 text-[14px] font-semibold">{capacityPolicy.maxCreatedPerTurn}</div>
+          </div>
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <button
+              type="button"
+              data-testid="stop-all-subagents-button"
+              onClick={onStopAll}
+              disabled={activeCount === 0}
+              title={language === "zh" ? "停止全部子智能体" : "Stop all subagents"}
+              aria-label={language === "zh" ? "停止全部子智能体" : "Stop all subagents"}
+              className={`flex h-7 w-7 items-center justify-center rounded-[6px] border transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${
+                isLight ? "border-[#dadce0] text-[#5f6368] hover:bg-[#fce8e6] hover:text-[#c5221f]" : "border-[#27272a] text-[#a1a1aa] hover:bg-[rgba(248,113,113,0.1)] hover:text-[#f87171]"
+              }`}
+            >
+              <IconStop className="h-3 w-3" />
+            </button>
+            <button
+              type="button"
+              data-testid="clear-ended-subagents-button"
+              onClick={onClearEnded}
+              disabled={endedCount === 0}
+              title={language === "zh" ? "清理已结束记录" : "Clear ended records"}
+              aria-label={language === "zh" ? "清理已结束记录" : "Clear ended records"}
+              className={`flex h-7 w-7 items-center justify-center rounded-[6px] border transition-colors disabled:cursor-not-allowed disabled:opacity-35 ${
+                isLight ? "border-[#dadce0] text-[#5f6368] hover:bg-[#f1f3f4] hover:text-[#202124]" : "border-[#27272a] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#e4e4e7]"
+              }`}
+            >
+              <IconTrash className="h-3 w-3" />
+            </button>
           </div>
         </div>
         <div className={`mt-2 truncate text-[10px] ${isLight ? "text-[#80868b]" : "text-[#71717a]"}`} title={`${capacityPolicy.provider} · ${capacityPolicy.model}`}>

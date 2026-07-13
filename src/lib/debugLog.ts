@@ -388,6 +388,40 @@ function isRoutineDebugEntry(entry: DebugLogEntry): boolean {
     return true;
   }
 
+  // `agent.llm_request_shape` already carries the iteration, intent, model,
+  // message and tool counts. Keeping the adjacent iteration marker doubles
+  // every model step without adding a diagnostic field.
+  if (source === "agent.iteration_start") return true;
+
+  if (
+    source === "agent.context_pack_built" &&
+    /"forceManaged":false/i.test(message) &&
+    /"droppedMessageCount":0/i.test(message) &&
+    /"microCompactionKind":"none"/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (
+    source === "agent.ephemeral_prune_summary" &&
+    /"burnedToolResults":0/i.test(message) &&
+    /"restoredToolResults":0/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (
+    source === "agent.stream_low_content_diagnostic" &&
+    /"toolCallCount":0/i.test(message) &&
+    /"contentChars":[01](?:,|})/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (source === "streaming" && /routing through Rust proxy/i.test(message)) {
+    return true;
+  }
+
   if (source === "delegation_scope_decision" && /"decision":"allowed"/i.test(message)) {
     return true;
   }

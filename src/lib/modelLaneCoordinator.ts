@@ -5,6 +5,7 @@ import { getSystemMemory, type SystemMemoryInfo } from "./ipc";
 const GIB = 1024 ** 3;
 const PRESSURE_SAMPLE_MS = 2_000;
 const DEGRADE_DURATION_MS = 5 * 60_000;
+const BURST_HEALTH_TTL_MS = 30_000;
 
 export type ModelLaneAgentKind = "parent" | "subagent";
 
@@ -23,6 +24,7 @@ interface LaneWaiter {
   requestTokenBudget: number;
   queuedAt: number;
   queueLogged: boolean;
+  queueReason?: ModelLaneState["lastQueueReason"];
   signal?: AbortSignal;
   resolve: () => void;
   reject: (error: Error) => void;
@@ -45,6 +47,17 @@ interface ModelLaneState {
   maxObservedOverlapDropBytes: number;
   draining: boolean;
   drainRequested: boolean;
+  safeSubagentOverlapSamples: number;
+  lastSafeSubagentOverlapAt: number;
+  lastQueueReason: "lane_full" | "cold_start_first_token" | "memory_reserve" | "memory_probe_unavailable" | null;
+}
+
+export interface ModelLaneBurstAdmission {
+  allowed: boolean;
+  reason: "ready" | "no_lane_activity" | "not_local" | "degraded" | "memory_probe_unavailable" | "insufficient_safe_overlap" | "safe_overlap_stale";
+  safeOverlapSamples: number;
+  lastSafeOverlapAt: number | null;
+  activeRequests: number;
 }
 
 export interface ModelLaneLease {
@@ -94,7 +107,10 @@ function laneLimit(state: ModelLaneState): number {
   if (state.degradedUntil > Date.now()) return 1;
   if (!state.local) return 4;
   if (state.memoryUnavailable) return 1;
-  return 3;
+  // Local lanes normally host the parent plus two children. A fourth model
+  // request is reachable only after the child scheduler grants its elastic
+  // third-child slot from observed healthy overlap.
+  return 4;
 }
 
 function newestSubagent(state: ModelLaneState): LaneEntry | null {
@@ -105,6 +121,8 @@ function newestSubagent(state: ModelLaneState): LaneEntry | null {
 
 function degradeLane(state: ModelLaneState, reason: string): boolean {
   state.degradedUntil = Date.now() + DEGRADE_DURATION_MS;
+  state.safeSubagentOverlapSamples = 0;
+  state.lastSafeSubagentOverlapAt = 0;
   const child = newestSubagent(state);
   child?.onDebugEvent?.("model_lane_admission", {
     laneKey: state.laneKey,
@@ -142,10 +160,21 @@ async function sampleLaneMemory(
     const action = memory.available_bytes < critical || state.lowMemorySamples >= 2
       ? "degrade"
       : belowReserve ? "hold" : "sample";
+    const activeSubagents = state.active.filter((entry) => entry.agentKind === "subagent");
+    const stableSubagentOverlap = activeSubagents.length >= 2 &&
+      activeSubagents.every((entry) => entry.firstTokenSeen);
+    if (action === "sample" && stableSubagentOverlap) {
+      state.safeSubagentOverlapSamples += 1;
+      state.lastSafeSubagentOverlapAt = Date.now();
+    } else if (action !== "sample") {
+      state.safeSubagentOverlapSamples = 0;
+      state.lastSafeSubagentOverlapAt = 0;
+    }
     const shouldLog = phase === "admission" || action !== "sample" ||
       state.overlapSampleCount === 1 || state.overlapSampleCount % 15 === 0;
-    if (shouldLog) state.active.forEach((entry, index) => {
-      entry.onDebugEvent?.("memory_pressure_sample", {
+    if (shouldLog) {
+      const owner = state.active[0];
+      owner?.onDebugEvent?.("memory_pressure_sample", {
         laneKey: state.laneKey,
         phase,
         availableBytes: memory.available_bytes,
@@ -159,10 +188,17 @@ async function sampleLaneMemory(
         maxObservedOverlapDropBytes: state.maxObservedOverlapDropBytes,
         overlapSampleCount: state.overlapSampleCount,
         lowMemorySamples: state.lowMemorySamples,
+        safeSubagentOverlapSamples: state.safeSubagentOverlapSamples,
+        stableSubagentOverlap,
         action,
-        runtimeEventOwner: index === 0,
+        activeRequests: state.active.map((entry) => ({
+          requestId: entry.id,
+          agentKind: entry.agentKind,
+          subagentId: entry.subagentId || null,
+          firstTokenSeen: entry.firstTokenSeen,
+        })),
       });
-    });
+    }
     if (action === "degrade") {
       degradeLane(state, memory.available_bytes < critical ? "critical memory threshold" : "sustained low memory");
       return false;
@@ -170,6 +206,8 @@ async function sampleLaneMemory(
     return !belowReserve;
   } catch (error) {
     state.memoryUnavailable = true;
+    state.safeSubagentOverlapSamples = 0;
+    state.lastSafeSubagentOverlapAt = 0;
     for (const entry of state.active) {
       entry.onDebugEvent?.("memory_pressure_sample", {
         laneKey: state.laneKey,
@@ -210,13 +248,25 @@ function startMonitor(state: ModelLaneState, requestTokenBudget: number): void {
 }
 
 async function canAdmit(state: ModelLaneState, waiter: LaneWaiter): Promise<boolean> {
-  if (state.active.length >= laneLimit(state)) return false;
-  if (!state.local || state.active.length === 0) return true;
-  if (!state.active[0]?.firstTokenSeen) return false;
+  if (state.active.length >= laneLimit(state)) {
+    state.lastQueueReason = "lane_full";
+    return false;
+  }
+  if (!state.local || state.active.length === 0) {
+    state.lastQueueReason = null;
+    return true;
+  }
+  if (!state.active.every((entry) => entry.firstTokenSeen)) {
+    state.lastQueueReason = "cold_start_first_token";
+    return false;
+  }
   const memoryAvailable = await sampleLaneMemory(state, waiter.requestTokenBudget, "admission");
   if (!memoryAvailable && state.degradedUntil > Date.now() && waiter.entry.agentKind === "subagent") {
     throw pressureError("model lane admission degraded after memory pressure");
   }
+  state.lastQueueReason = memoryAvailable
+    ? null
+    : state.memoryUnavailable ? "memory_probe_unavailable" : "memory_reserve";
   return memoryAvailable;
 }
 
@@ -253,14 +303,22 @@ async function drainLane(state: ModelLaneState): Promise<void> {
         if (!allowed) {
           if (!waiter.queueLogged) {
             waiter.queueLogged = true;
+            waiter.queueReason = state.lastQueueReason;
             waiter.entry.onDebugEvent?.("model_lane_admission", {
               laneKey: state.laneKey,
               decision: "queued",
+              queueReason: state.lastQueueReason || "admission_pending",
               activeRequests: state.active.length,
               limit: laneLimit(state),
               requestTokenBudget: waiter.requestTokenBudget,
               agentKind: waiter.entry.agentKind,
               subagentId: waiter.entry.subagentId || null,
+              liveRequests: state.active.map((entry) => ({
+                requestId: entry.id,
+                agentKind: entry.agentKind,
+                subagentId: entry.subagentId || null,
+                firstTokenSeen: entry.firstTokenSeen,
+              })),
             });
           }
           if (state.active[0]?.firstTokenSeen) scheduleAdmissionRetry(state);
@@ -311,6 +369,9 @@ export async function acquireModelLane(input: {
     maxObservedOverlapDropBytes: 0,
     draining: false,
     drainRequested: false,
+    safeSubagentOverlapSamples: 0,
+    lastSafeSubagentOverlapAt: 0,
+    lastQueueReason: null,
   };
   lanes.set(laneKey, state);
   const entry: LaneEntry = {
@@ -357,8 +418,15 @@ export async function acquireModelLane(input: {
       waitMs: Date.now() - waiter.queuedAt,
       requestTokenBudget,
       overlapping: state.active.length > 1,
+      queueReason: waiter.queueLogged ? waiter.queueReason || "admission_pending" : null,
       agentKind: input.agentKind,
       subagentId: input.subagentId || null,
+      liveRequests: state.active.map((activeEntry) => ({
+        requestId: activeEntry.id,
+        agentKind: activeEntry.agentKind,
+        subagentId: activeEntry.subagentId || null,
+        firstTokenSeen: activeEntry.firstTokenSeen,
+      })),
     });
   }
 
@@ -386,8 +454,39 @@ export async function acquireModelLane(input: {
   };
 }
 
+export function getModelLaneBurstAdmission(laneKey: string): ModelLaneBurstAdmission {
+  const state = lanes.get(laneKey);
+  const base = {
+    safeOverlapSamples: state?.safeSubagentOverlapSamples || 0,
+    lastSafeOverlapAt: state?.lastSafeSubagentOverlapAt || null,
+    activeRequests: state?.active.length || 0,
+  };
+  if (!state) return { allowed: false, reason: "no_lane_activity", ...base };
+  if (!state.local) return { allowed: false, reason: "not_local", ...base };
+  if (state.degradedUntil > Date.now()) return { allowed: false, reason: "degraded", ...base };
+  if (state.memoryUnavailable) {
+    return { allowed: false, reason: "memory_probe_unavailable", ...base };
+  }
+  if (state.safeSubagentOverlapSamples < 2 || state.lastSafeSubagentOverlapAt <= 0) {
+    return { allowed: false, reason: "insufficient_safe_overlap", ...base };
+  }
+  if (Date.now() - state.lastSafeSubagentOverlapAt > BURST_HEALTH_TTL_MS) {
+    return { allowed: false, reason: "safe_overlap_stale", ...base };
+  }
+  return { allowed: true, reason: "ready", ...base };
+}
+
 export function setModelLaneMemoryReaderForTests(reader?: () => Promise<SystemMemoryInfo>): void {
   memoryReader = reader || getSystemMemory;
+}
+
+export async function sampleModelLaneMemoryForTests(
+  laneKey: string,
+  requestTokenBudget = 8_192,
+): Promise<boolean> {
+  const state = lanes.get(laneKey);
+  if (!state) return false;
+  return sampleLaneMemory(state, requestTokenBudget, "overlap");
 }
 
 export function resetModelLaneCoordinatorForTests(): void {

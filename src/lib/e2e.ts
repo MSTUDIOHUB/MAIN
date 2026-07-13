@@ -12,6 +12,7 @@ import { buildToolPermissionActionRequest } from "./pendingToolReview";
 import { buildPlanApprovalIdentity } from "./planApprovalIdentity";
 import type { HarnessRunMarker } from "./harnessCrashTelemetry";
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./turnEvents";
+import { projectSubagentRuns } from "./subagents";
 import type { NexusModeKey } from "./gameStudio/catalog";
 import {
   isCloudSettingsScenario,
@@ -1578,6 +1579,7 @@ function seedFeishuRemoteAnalysisScenario() {
       ],
     },
     currentSessionId: sessionId,
+    mcpServers: [],
     selectedMainModeKey: "main_mode",
     selectedNexusModeKey: "nexus_general",
     taskFlow: [
@@ -6425,6 +6427,23 @@ function seedRealOmlxPlanFlowScenario() {
       status: block.status,
       error: block.error,
     }));
+    const subagentRuns = projectSubagentRuns(state.runtimeEvents).map((run) => ({
+      id: run.id,
+      parentTurnId: run.parentTurnId,
+      name: run.name,
+      role: run.role,
+      objective: run.objective,
+      scopeKey: run.scopeKey || "",
+      allowedPaths: run.allowedPaths || [],
+      status: run.status,
+      createdAt: run.createdAt,
+      startedAt: run.startedAt || null,
+      completedAt: run.completedAt || null,
+      closedAt: run.closedAt || null,
+      summary: run.summary || "",
+      error: run.error || "",
+      evidenceCount: run.activities.filter((activity) => activity.status === "completed").length,
+    }));
     return {
       model,
       agentStatus: state.agentStatus,
@@ -6471,6 +6490,7 @@ function seedRealOmlxPlanFlowScenario() {
       } : null,
       agentTexts,
       toolBlocks,
+      subagentRuns,
       taskFlowTypes: state.taskFlow.map((block) => block.type),
       taskFlowPreview: state.taskFlow.map((block: any) => ({
         type: block.type,
@@ -6480,7 +6500,7 @@ function seedRealOmlxPlanFlowScenario() {
         target: block.target || "",
         status: block.status || "",
       })),
-      debugTail: ((window as any).__REAL_OMLX_DEBUG_LOGS__ || []).slice(-80),
+      debugTail: ((window as any).__REAL_OMLX_DEBUG_LOGS__ || []).slice(-1_200),
       dispatchError: bridge.dispatchError || null,
       seedCount: readSeedCount(REAL_OMLX_PLAN_FLOW_SCENARIO),
     };

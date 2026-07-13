@@ -28,6 +28,7 @@ import { handlePlanNoToolRecovery } from "./planNoToolRecovery";
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import { applyPlanNoToolRuntimeState, applyPlanRuntimePhase } from "./planRuntimeState";
 import type { TurnIterationContext } from "./turnIterationContext";
+import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -122,6 +123,19 @@ export async function handleAssistantCompletionPhase(input: {
     emitTurnEvent: input.emitTurnEvent,
     emitTurnCompletedEvent: input.emitTurnCompletedEvent,
   };
+
+  if (
+    effectiveToolCallCount === 0 &&
+    await joinPendingSubagentsForParent({
+      callbacks: input.callbacks,
+      recentToolActivity: input.recentToolActivity,
+      recentPlanToolActivity: input.recentPlanToolActivity,
+      reason: "parent_final_response",
+    })
+  ) {
+    input.callbacks.onStatusChange("running");
+    return finish("continue");
+  }
 
   const replyOptionsPause = handleReplyOptionsPause({
     callbacks: input.callbacks,

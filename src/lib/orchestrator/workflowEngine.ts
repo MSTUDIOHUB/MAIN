@@ -52,7 +52,16 @@ import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
 import { scheduleControlledSubagent } from "../subagentRuntime";
-import { getCoordinatedSubagentRunCount, parseSubagentAllowedPaths, waitForCoordinatedSubagents } from "../subagents";
+import {
+  cancelSubagentRun,
+  finalizeCoordinatedSubagentsForParent,
+  getCoordinatedSubagentRunCount,
+  getPendingCoordinatedSubagentIds,
+  isSubagentActiveStatus,
+  parseSubagentAllowedPaths,
+  projectSubagentRuns,
+  waitForCoordinatedSubagents,
+} from "../subagents";
 import {
   buildGoalConfirmationActionRequest,
   buildPlanReviewActionRequest,
@@ -279,6 +288,105 @@ export class WorkflowEngine {
       sessionSet((state: any) => ({
         runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema(event as any)),
       }));
+    };
+
+    const closeProjectedSubagentRuns = (input: {
+      ids: Iterable<string>;
+      error: string;
+      title: string;
+      reason: string;
+    }): string[] => {
+      const ids = new Set(input.ids);
+      if (ids.size === 0) return [];
+      const activeRuns = projectSubagentRuns(sessionGet().runtimeEvents).filter((run) =>
+        ids.has(run.id) && isSubagentActiveStatus(run.status)
+      );
+      if (activeRuns.length === 0) return [];
+      const timestampMs = Date.now();
+      sessionSet((state: any) => ({
+        runtimeEvents: activeRuns.reduce((events, run) => {
+          const updated = appendRuntimeEvent(events, withEventSchema({
+            type: "subagent.updated",
+            threadId: run.threadId,
+            turnId: run.parentTurnId,
+            timestampMs,
+            subagentId: run.id,
+            patch: {
+              status: "canceled",
+              updatedAt: timestampMs,
+              completedAt: timestampMs,
+              error: input.error,
+              progress: {
+                phase: "done",
+                title: input.title,
+                completedToolCalls: run.progress?.completedToolCalls || 0,
+              },
+            },
+          }));
+          return appendRuntimeEvent(updated, withEventSchema({
+            type: "subagent.closed",
+            threadId: run.threadId,
+            turnId: run.parentTurnId,
+            timestampMs,
+            subagentId: run.id,
+            closedAt: timestampMs,
+            reason: input.reason,
+          }));
+        }, state.runtimeEvents),
+      }));
+      return activeRuns.map((run) => run.id);
+    };
+
+    const prepareSubagentsForNewTurn = async (): Promise<void> => {
+      const currentParentTurnId = context.uiDisplayTurnId || turnId;
+      const priorRuns = projectSubagentRuns(sessionGet().runtimeEvents).filter((run) =>
+        run.threadId === runSessionKey &&
+        run.parentTurnId !== currentParentTurnId &&
+        isSubagentActiveStatus(run.status)
+      );
+      if (priorRuns.length === 0) return;
+
+      const priorParentTurnIds = [...new Set(priorRuns.map((run) => run.parentTurnId))];
+      const requestedIds = new Set<string>();
+      const canceledIds = new Set<string>();
+      const controllerMissingIds = new Set<string>();
+      const timedOutIds = new Set<string>();
+      let releasedCount = 0;
+
+      for (const run of priorRuns) {
+        if (cancelSubagentRun(run.id)) canceledIds.add(run.id);
+        else controllerMissingIds.add(run.id);
+      }
+      for (const parentTurnId of priorParentTurnIds) {
+        const result = await finalizeCoordinatedSubagentsForParent({
+          threadId: runSessionKey,
+          parentTurnId,
+          graceMs: 2_000,
+        });
+        result.requestedIds.forEach((id) => requestedIds.add(id));
+        result.canceledIds.forEach((id) => canceledIds.add(id));
+        result.controllerMissingIds.forEach((id) => controllerMissingIds.add(id));
+        result.timedOutIds.forEach((id) => timedOutIds.add(id));
+        releasedCount += result.releasedCount;
+      }
+
+      const reconciledIds = closeProjectedSubagentRuns({
+        ids: priorRuns.map((run) => run.id),
+        error: "SUBAGENT_SUPERSEDED_BY_NEW_TURN: a new user turn started before this child runtime settled.",
+        title: "Closed before the new turn",
+        reason: "superseded_by_new_turn",
+      });
+      logStoreEvent("subagent_new_turn_preflight", {
+        currentParentTurnId,
+        priorParentTurnIds,
+        detectedIds: priorRuns.map((run) => run.id),
+        requestedCount: requestedIds.size,
+        canceledCount: canceledIds.size,
+        controllerMissingCount: controllerMissingIds.size,
+        timedOutCount: timedOutIds.size,
+        reconciledCount: reconciledIds.length,
+        releasedCount,
+      });
     };
 
     const publishActionRequest = (
@@ -2722,6 +2830,10 @@ export class WorkflowEngine {
         executeAgentLoop,
       }));
     };
+    callbacks.getPendingSubagentIds = () => getPendingCoordinatedSubagentIds(
+      runSessionKey,
+      context.uiDisplayTurnId || turnId,
+    );
     callbacks.waitSubagents = async (request) => {
       const parentTurnId = context.uiDisplayTurnId || turnId;
       callbacks.onDebugEvent?.("parent_wait", {
@@ -2737,6 +2849,11 @@ export class WorkflowEngine {
         subagentIds: result.results.map((entry) => entry.subagentId),
         statuses: result.results.map((entry) => entry.status),
         parentTurnId,
+      });
+      callbacks.onDebugEvent?.("coordinated_run_released", {
+        parentTurnId,
+        releasedIds: result.results.map((entry) => entry.subagentId),
+        releasedCount: result.results.length,
       });
       return result;
     };
@@ -3196,7 +3313,29 @@ export class WorkflowEngine {
       return executeAgentLoop(callbacks, abortCtrl);
     };
 
-    return executeLoopStrategy().then((loopOutcome) => {
+    return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) => {
+      const parentTurnId = context.uiDisplayTurnId || turnId;
+      const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
+        threadId: runSessionKey,
+        parentTurnId,
+      });
+      if (subagentFinalization.requestedIds.length > 0 || subagentFinalization.releasedCount > 0) {
+        callbacks.onDebugEvent?.("parent_subagents_finalized", {
+          parentTurnId,
+          outcomeStatus: loopOutcome.status,
+          ...subagentFinalization,
+        });
+      }
+      const unresolvedIds = new Set([
+        ...subagentFinalization.controllerMissingIds,
+        ...subagentFinalization.timedOutIds,
+      ]);
+      closeProjectedSubagentRuns({
+        ids: unresolvedIds,
+        error: "SUBAGENT_PARENT_TERMINATED: the parent run ended before the child runtime settled.",
+        title: "Closed with parent run",
+        reason: "canceled",
+      });
       closeHarnessForAgentLoopOutcome(loopOutcome);
       clearInterval(timerInterval);
       commitFinalElapsedTime();
@@ -3396,8 +3535,29 @@ export class WorkflowEngine {
       }
 
       return true;
-    }).catch((err: any) => {
+    }).catch(async (err: any) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      const parentTurnId = context.uiDisplayTurnId || turnId;
+      const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
+        threadId: runSessionKey,
+        parentTurnId,
+      }).catch(() => null);
+      if (subagentFinalization) {
+        callbacks.onDebugEvent?.("parent_subagents_finalized", {
+          parentTurnId,
+          outcomeStatus: "error",
+          ...subagentFinalization,
+        });
+        closeProjectedSubagentRuns({
+          ids: [
+            ...subagentFinalization.controllerMissingIds,
+            ...subagentFinalization.timedOutIds,
+          ],
+          error: "SUBAGENT_PARENT_CRASHED: the parent run crashed before the child runtime settled.",
+          title: "Closed after parent failure",
+          reason: "canceled",
+        });
+      }
       closeCurrentHarnessRunMarker("error", "agent_loop_crashed");
       clearInterval(timerInterval);
       commitFinalElapsedTime();

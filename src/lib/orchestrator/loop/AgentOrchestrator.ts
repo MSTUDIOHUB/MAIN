@@ -25,6 +25,8 @@ import { createAgentLoopRuntimeActions } from "./loopRuntimeActions";
 import type { OrchestratorCallbacks } from "../types";
 import { completeAssistantTurn } from "./finalTurnCompletion";
 import { buildApprovedPlanEvidenceCompletionMessage } from "./approvedPlanFinalization";
+import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
+import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -329,6 +331,22 @@ export class AgentOrchestrator {
           callbacks.onStatusChange("idle");
           emitRunPausedEvent("aborted", "The run was aborted and can be resumed in the same turn.");
           return;
+        }
+
+        if (
+          workflowMode === "plan" &&
+          !callbacks.getIsPlanApproved() &&
+          isPlanRuntimeFinalizationPhase(loopState.planRuntimeState.planRuntimePhase)
+        ) {
+          const joined = await joinPendingSubagentsForParent({
+            callbacks,
+            recentToolActivity: loopState.recentToolActivity,
+            recentPlanToolActivity: loopState.recentPlanToolActivity,
+            reason: "plan_finalization",
+          });
+          if (joined) {
+            setPlanRuntimePhase("drafting", "subagent results joined before plan drafting");
+          }
         }
 
         const turnIterationContext = startTurnIteration({

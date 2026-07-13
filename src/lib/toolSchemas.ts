@@ -94,7 +94,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "spawn_subagent",
-      description: "异步创建一个隔离的只读子智能体来处理有界、可独立完成的探索或分析任务。立即返回运行句柄；主体应继续处理不重叠工作，之后用 wait_subagents 汇合。",
+      description: "异步创建一个隔离的只读子智能体来处理有界、可独立完成的探索或分析任务。常规并行上限为 2，不是必须填满的配额；简单任务使用 0 或 1 个。只有仍有第三个实质性独立范围时才创建第 3 个，runtime 会在首 token、内存与故障状态安全后弹性放行。立即返回运行句柄；主体应继续处理不重叠工作，之后用 wait_subagents 汇合。",
       parameters: {
         type: "object",
         properties: {

@@ -126,6 +126,7 @@ export interface OrchestratorCallbacks {
   onProviderNativeToolSuccess?: () => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
   onModelUsage?: (usage: NonNullable<import("../streaming").StreamResult["usage"]>) => void;
+  getPendingSubagentIds?: () => string[];
   runSubagent?: (
     request: SpawnSubagentRequest,
     options?: { signal?: AbortSignal },
