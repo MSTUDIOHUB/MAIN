@@ -7,6 +7,7 @@ export function normalizeSyntheticContinuationText(input: unknown): string {
 const SYNTHETIC_PREFIX_PATTERNS: RegExp[] = [
   /^\[System:/i,
   /^\[turn_intake\]/i,
+  /^\[goal_continuation\b/i,
   /^EXECUTE_RECOVERY:/i,
   /^PLAN_[A-Z_]+:/i,
   /^Recovery(?:Details)?:/i,
@@ -14,6 +15,7 @@ const SYNTHETIC_PREFIX_PATTERNS: RegExp[] = [
 ];
 
 const SYNTHETIC_STRONG_PATTERNS: RegExp[] = [
+  /^\[goal_continuation\b/i,
   /^EXECUTE_RECOVERY:/i,
   /用户已经批准本轮执行，但上一条回复/i,
   /The user already approved this execution turn, but the previous response/i,

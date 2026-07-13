@@ -219,6 +219,7 @@ import {
   resolveSubmitSemanticMetadataDecision,
 } from "../lib/submit/turnSubmission";
 import {
+  DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
   createGoalDefinition,
   createGoalProgress,
   migrateGoalDefinition,
@@ -2197,7 +2198,9 @@ export function normalizeSessionRuntimeSnapshot(
     activeGoal: normalizedGoalRuntime?.goal ?? legacyGoal,
     goalProgress: normalizedGoalRuntime?.progress ?? snapshot.goalProgress ?? null,
     goalStatus: normalizedGoalRuntime?.status ?? snapshot.goalStatus ?? "paused",
-    goalIterationBudget: normalizedGoalRuntime?.goal.iterationBudget ?? snapshot.goalIterationBudget ?? 200,
+    goalIterationBudget: normalizedGoalRuntime?.goal.iterationBudget
+      ?? snapshot.goalIterationBudget
+      ?? DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
     goalRuntime: normalizedGoalRuntime,
   };
 }
@@ -2442,7 +2445,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     activeGoal: state.activeGoal ?? null,
     goalProgress: state.goalProgress ?? null,
     goalStatus: state.goalStatus ?? "paused",
-    goalIterationBudget: state.goalIterationBudget ?? 200,
+    goalIterationBudget: state.goalIterationBudget ?? DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
     goalRuntime: state.goalRuntime ?? null,
   };
 }
@@ -2995,7 +2998,7 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
     activeGoal: state.activeGoal ?? null,
     goalProgress: state.goalProgress ?? null,
     goalStatus: state.goalStatus ?? "paused",
-    goalIterationBudget: state.goalIterationBudget ?? 200,
+    goalIterationBudget: state.goalIterationBudget ?? DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
     goalRuntime: state.goalRuntime ?? null,
   };
 }
@@ -6591,13 +6594,13 @@ export const useAppStore = create<AppState>()(
   activeGoal: null,
   goalProgress: null,
   goalStatus: "paused",
-  goalIterationBudget: 200,
+  goalIterationBudget: DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
   goalRuntime: null,
   startGoal: (objective, options) => {
     const newGoal = createGoalDefinition({
       objective,
       sourceContext: options?.sourceContext,
-      iterationBudget: options?.maxIterations ?? 200,
+      iterationBudget: options?.maxIterations,
       tokenBudget: options?.maxTokens,
       toolCallBudget: options?.maxToolCalls,
       maxDurationMs: options?.maxDurationMs,
@@ -8320,7 +8323,8 @@ export const useAppStore = create<AppState>()(
         activeGoal: hydratedGoalRuntime?.goal ?? null,
         goalProgress: hydratedGoalRuntime?.progress ?? null,
         goalStatus: hydratedGoalRuntime?.status ?? "paused",
-        goalIterationBudget: hydratedGoalRuntime?.goal.iterationBudget ?? 200,
+        goalIterationBudget: hydratedGoalRuntime?.goal.iterationBudget
+          ?? DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
         goalRuntime: hydratedGoalRuntime,
         pendingPlanApprovalHandoff: null,
         showPlanPanel: hasHydratedCurrentSession ? persistedState.showPlanPanel === true : false,

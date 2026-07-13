@@ -22,7 +22,7 @@ export type GoalIterationPhase =
 
 export type GoalCriterionStatus = "pending" | "satisfied" | "failed" | "invalidated";
 
-/** Machine-readable reason for the latest Goal slice or outer-loop boundary. */
+/** Machine-readable reason for the latest internal continuation or outer boundary. */
 export type GoalStopClass =
   | "completed"
   | "evidence_missing"
@@ -42,6 +42,11 @@ export type GoalStopClass =
 
 export const GOAL_SCHEMA_VERSION = 3 as const;
 export const GOAL_SOURCE_CONTEXT_MAX_CHARS = 6_000;
+/**
+ * Compatibility-only emergency guard for internal continuation boundaries.
+ * It is not a task estimate and must not be presented as user progress.
+ */
+export const DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT = 200;
 
 export interface GoalCriterion {
   id: string;
@@ -112,6 +117,46 @@ export interface GoalRecoveryState {
   updatedAt: number;
 }
 
+export interface GoalContinuationToolCall {
+  id: string;
+  type: "function";
+  function: {
+    name: string;
+    arguments: string;
+  };
+}
+
+/**
+ * A persisted, provider-neutral message from the active Goal conversation.
+ * Reasoning fields are deliberately excluded; visible conclusions and complete
+ * tool call/result pairs are enough to continue the work safely.
+ */
+export interface GoalContinuationMessage {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  tool_calls?: GoalContinuationToolCall[];
+  tool_call_id?: string;
+}
+
+export interface GoalContinuationState {
+  sourceIteration: number;
+  updatedAt: number;
+  messages: GoalContinuationMessage[];
+  /** Durable compact memory used when older exact messages leave the context window. */
+  memoryPacket?: string;
+  messageCountBefore: number;
+  compacted: boolean;
+  operationCount: number;
+}
+
+export interface GoalOperationSummary {
+  iteration: number;
+  tool: string;
+  target: string;
+  status: GoalEvidenceStatus;
+  summary: string;
+}
+
 export interface GoalDefinition {
   /** Persistence schema version. Missing means legacy v1. */
   schemaVersion?: 1 | 2 | 3;
@@ -139,7 +184,10 @@ export interface GoalDefinition {
   createdAt: number;
   /** Current goal status */
   status: GoalStatus;
-  /** Total iteration budget for this goal */
+  /**
+   * Legacy/internal emergency continuation limit. This is not an estimate of
+   * work size and must not be rendered as n/total progress.
+   */
   iterationBudget: number;
   /** Optional total token budget */
   tokenBudget?: number;
@@ -149,7 +197,7 @@ export interface GoalDefinition {
   maxDurationMs?: number;
   /** Session key associated with this goal */
   sessionKey?: string;
-  /** Logical conversation turn that owns every resume and bounded slice. */
+  /** Logical conversation turn that owns every resume and internal continuation. */
   ownerTurnId?: string;
 }
 
@@ -158,9 +206,9 @@ export interface GoalIteration {
   index: number;
   /** Current phase within this iteration */
   phase: GoalIterationPhase;
-  /** Stable identity for the fresh inner agent run that owns this slice. */
+  /** Stable identity for the child run that continues the same logical Goal task. */
   goalSliceId?: string;
-  /** Goal definition revision that produced this slice. */
+  /** Goal definition revision that produced this continuation. */
   goalRevision?: number;
   /** When the iteration started */
   startedAt: number;
@@ -178,7 +226,7 @@ export interface GoalIteration {
   testsPassed: boolean | null;
   /** Unresolved blockers encountered */
   unresolvedBlockers: string[];
-  /** Exact inner-loop outcome and stop reason for this bounded slice. */
+  /** Exact inner-loop outcome and stop reason for this internal continuation. */
   innerOutcomeStatus?: "completed" | "paused" | "stopped_no_action" | "stopped_no_output" | "aborted" | "error";
   stopReason?: string;
   stopClass?: GoalStopClass;
@@ -205,6 +253,10 @@ export interface GoalCheckpoint {
   workspaceSnapshot: string[];
   /** Recent verification result summary */
   lastVerificationSummary?: string;
+  /** Most recent visible model conclusions, compacted without hidden reasoning. */
+  lastAssistantContext?: string;
+  /** Recent structured tool operations, retained independently of prose quality. */
+  recentOperations?: GoalOperationSummary[];
 }
 
 export interface GoalProgress {
@@ -233,9 +285,11 @@ export interface GoalProgress {
   lastUserConfirmedIteration?: number;
   pauseReason?: string;
   lastStopReason?: string;
-  /** Exact normalized class for the latest slice or outer-loop stop. */
+  /** Exact normalized class for the latest continuation or outer-loop stop. */
   stopClass?: GoalStopClass;
   recoveryState?: GoalRecoveryState;
+  /** Exact recent conversation plus durable compact memory for the next continuation. */
+  continuation?: GoalContinuationState;
   /** Earlier iterations remain history but do not count toward a resumed blocked audit. */
   recoveryAuditStartIteration?: number;
   usage?: GoalUsage;
@@ -276,7 +330,7 @@ export interface GoalLoopOutcome {
   finalCheckpoint: GoalCheckpoint | null;
   /** Aggregate real loop counters plus explicitly marked token estimates. */
   usage?: GoalUsage;
-  /** Exact stop reason reported by the last inner slice. */
+  /** Exact stop reason reported by the last inner continuation. */
   lastStopReason?: string;
   stopClass?: GoalStopClass;
 }
@@ -334,7 +388,11 @@ export function createGoalDefinition(input: {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     status: criteriaReviewRequired ? "awaiting_input" : "active",
-    iterationBudget: Math.min(finitePositiveInt(input.iterationBudget, 200) || 200, 500),
+    iterationBudget: Math.min(
+      finitePositiveInt(input.iterationBudget, DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT)
+        || DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
+      500,
+    ),
     tokenBudget: finitePositiveInt(input.tokenBudget),
     toolCallBudget: finitePositiveInt(input.toolCallBudget),
     maxDurationMs: finitePositiveInt(input.maxDurationMs),
@@ -447,6 +505,8 @@ export function createGoalCheckpoint(input: {
   lastVerificationSummary?: string;
   goalRevision?: number;
   evidenceCursor?: number;
+  lastAssistantContext?: string;
+  recentOperations?: GoalOperationSummary[];
 }): GoalCheckpoint {
   return {
     id: `checkpoint_${input.iteration}_${Date.now()}`,
@@ -460,6 +520,8 @@ export function createGoalCheckpoint(input: {
     contextSummary: input.contextSummary,
     workspaceSnapshot: input.workspaceSnapshot,
     lastVerificationSummary: input.lastVerificationSummary,
+    lastAssistantContext: input.lastAssistantContext,
+    recentOperations: input.recentOperations,
   };
 }
 
@@ -694,7 +756,11 @@ export function migrateGoalDefinition(goal: GoalDefinition): GoalDefinition {
     verificationHints: pollutedLegacyDefinition || !Array.isArray(goal.verificationHints)
       ? extractGoalVerificationHints(rawText)
       : goal.verificationHints,
-    iterationBudget: Math.min(finitePositiveInt(goal.iterationBudget, 200) || 200, 500),
+    iterationBudget: Math.min(
+      finitePositiveInt(goal.iterationBudget, DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT)
+        || DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
+      500,
+    ),
     tokenBudget: finitePositiveInt(goal.tokenBudget),
     toolCallBudget: finitePositiveInt(goal.toolCallBudget),
     maxDurationMs: finitePositiveInt(goal.maxDurationMs),

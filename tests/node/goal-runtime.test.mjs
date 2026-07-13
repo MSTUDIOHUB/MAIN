@@ -39,6 +39,7 @@ const goalRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/g
 const goalBudget = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalBudget.ts"));
 const goalContext = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalContextStrategy.ts"));
 const goalEngine = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalEngine.ts"));
+const goalContinuity = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalContinuity.ts"));
 const goalSourceContext = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalSourceContext.ts"));
 const goalEventIdentity = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalEventIdentity.ts"));
 
@@ -349,7 +350,7 @@ test("read-only shell inspection does not count as Goal execution progress", () 
   }).passed, false);
 });
 
-test("GoalTurnContract is revisioned, bounded, and asks for runtime-gated completion", () => {
+test("GoalTurnContract is revisioned, continuous, and asks for runtime-gated completion", () => {
   const goal = goalState.createGoalDefinition({ objective: "实现持久目标并运行测试", iterationBudget: 25 });
   const contract = goalContext.buildGoalTurnContract({
     goal,
@@ -363,7 +364,8 @@ test("GoalTurnContract is revisioned, bounded, and asks for runtime-gated comple
   assert.equal(contract.goalSliceId, `${goal.id}:slice:4`);
   assert.equal(contract.maxIterations, 25);
   assert.match(contract.cacheKey, new RegExp(`^${goal.id}:1:4:`));
-  assert.match(contract.context, /有界执行切片/);
+  assert.match(contract.context, /同一个持续目标/);
+  assert.doesNotMatch(contract.context, /连续执行 4\/25|迭代 4\/25/);
   assert.match(contract.context, /GOAL_COMPLETION_CANDIDATE/);
   assert.match(contract.context, /不要在模型内部自行开启无限循环/);
   assert.match(contract.context, /不要修改 `.MAIN\/goals\/` 中的运行时状态文件/);
@@ -471,8 +473,14 @@ test("Goal Engine completes from verified evidence after a non-terminal provider
   assert.equal(outcome.status, "completed");
   assert.equal(outcome.iterationsUsed, 1);
   assert.ok(debugEvents.some(({ event }) => event === "goal_runtime_evidence_completion_candidate"));
+  assert.equal(
+    debugEvents.find(({ event }) => event === "goal_continuation_start")?.data?.continuationId,
+    `${goal.id}:slice:1`,
+  );
   assert.ok(debugEvents.some(({ event, data }) =>
-    event === "goal_completion_accepted" && data?.candidateSource === "runtime_evidence"
+    event === "goal_completion_accepted"
+    && data?.candidateSource === "runtime_evidence"
+    && data?.continuationId === `${goal.id}:slice:1`
   ));
 });
 
@@ -500,7 +508,45 @@ test("Goal Engine retries a normalized recoverable error and blocks on the third
   assert.equal(harness.runtimeUpdates.at(-1).progress.recoveryState.consecutiveCount, 3);
 });
 
-test("Goal Engine carries a continuation checkpoint into every fresh slice", async () => {
+test("Goal Engine resumes from retained conclusions after a recoverable stream failure", async () => {
+  const goal = goalState.createGoalDefinition({ objective: "Update Goal Runtime and run lint", iterationBudget: 10 });
+  let runs = 0;
+  const harness = createEngineCallbacks(async (input) => {
+    runs += 1;
+    if (runs === 1) {
+      const error = new Error("provider stream failed");
+      error.goalContinuationState = goalContinuity.createGoalContinuationState({
+        sourceIteration: 1,
+        messages: [
+          { role: "assistant", content: "Root cause confirmed in `src/lib/goalRuntime.ts`; the next action is the patch." },
+        ],
+      });
+      error.goalIterationUsage = { modelIterations: 1, toolCalls: 0, tokensUsed: 30, estimatedTokens: true };
+      throw error;
+    }
+
+    assert.equal(input.continuation.messages[0].content.includes("Root cause confirmed"), true);
+    return {
+      assistantText: "Patched and linted. GOAL_COMPLETION_CANDIDATE",
+      toolCalls: [
+        { name: "apply_patch", target: "src/lib/goalRuntime.ts", result: "Done" },
+        { name: "run_command", arguments: { command: "npm run lint" }, result: "0 errors" },
+      ],
+      tokensUsed: 60,
+      completed: true,
+      outcomeStatus: "completed",
+    };
+  });
+
+  const outcome = await goalEngine.executeGoalLoop({ goal, callbacks: harness.callbacks });
+  assert.equal(outcome.status, "completed");
+  assert.equal(runs, 2);
+  assert.equal(harness.runtimeUpdates.some((runtime) =>
+    runtime.progress.continuation?.messages[0]?.content.includes("Root cause confirmed")
+  ), true);
+});
+
+test("Goal Engine carries conclusions and operation context across internal continuations", async () => {
   const goal = goalState.createGoalDefinition({ objective: "Refactor Goal Runtime and run lint", iterationBudget: 10 });
   const seenContracts = [];
   let runs = 0;
@@ -508,14 +554,34 @@ test("Goal Engine carries a continuation checkpoint into every fresh slice", asy
     runs += 1;
     seenContracts.push(input.goalTurnContract);
     if (runs === 1) {
+      const continuation = goalContinuity.createGoalContinuationState({
+        sourceIteration: 1,
+        messages: [
+          { role: "assistant", content: "Concrete finding: `src/lib/goalRuntime.ts` still needs lint verification." },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [{
+              id: "call-patch",
+              type: "function",
+              function: { name: "apply_patch", arguments: JSON.stringify({ patch: "*** Update File: src/lib/goalRuntime.ts" }) },
+            }],
+          },
+          { role: "tool", tool_call_id: "call-patch", content: "Done" },
+        ],
+      });
       return {
-        assistantText: "Patched the runtime.\n## Next\n- Run lint",
+        assistantText: "I have finished reading the relevant files.\n\nConcrete finding: `src/lib/goalRuntime.ts` was patched and still needs lint verification.\n\n## Next\n- Run lint",
         toolCalls: [{ name: "apply_patch", target: "src/lib/goalRuntime.ts", result: "Done" }],
         tokensUsed: 80,
         completed: true,
         outcomeStatus: "completed",
+        continuation,
       };
     }
+    assert.equal(input.continuation.messages[0].content.includes("Concrete finding"), true);
+    assert.equal(input.continuation.messages[1].tool_calls[0].function.name, "apply_patch");
+    assert.equal(input.continuation.messages[2].content, "Done");
     return {
       assistantText: "Lint passed. GOAL_COMPLETION_CANDIDATE",
       toolCalls: [{ name: "run_command", arguments: { command: "npm run lint" }, result: "0 errors" }],
@@ -529,9 +595,104 @@ test("Goal Engine carries a continuation checkpoint into every fresh slice", asy
   assert.equal(outcome.status, "completed");
   assert.equal(runs, 2);
   assert.equal(seenContracts[1].iteration, 2);
-  assert.match(seenContracts[1].context, /Iteration 1/);
+  assert.match(seenContracts[1].context, /Continuation 1/);
+  assert.match(seenContracts[1].context, /Concrete finding/);
   assert.match(seenContracts[1].context, /src\/lib\/goalRuntime\.ts/);
   assert.match(seenContracts[1].context, /Run lint/);
+});
+
+test("Goal continuation transport preserves complete tool pairs and strips runtime control messages", () => {
+  const state = goalContinuity.createGoalContinuationState({
+    sourceIteration: 3,
+    messages: [
+      { role: "system", content: "large regenerated system prompt" },
+      { role: "user", content: '[goal_continuation goal_id="g" index="3"]\ncontinue\n[/goal_continuation]' },
+      { role: "user", content: "EXECUTE_RECOVERY: Now immediately continue using tools." },
+      { role: "assistant", content: "The root cause is in `src/main.ts:L120`: `editor.getValue()` is invalid for a textarea." },
+      {
+        role: "assistant",
+        content: "",
+        tool_calls: [{
+          id: "read-1",
+          type: "function",
+          function: { name: "read_file", arguments: '{"path":"src/main.ts","start_line":110}' },
+        }],
+        reasoning_content: "private reasoning must not persist",
+      },
+      { role: "tool", tool_call_id: "read-1", content: "const editor = document.querySelector('textarea')" },
+      { role: "tool", tool_call_id: "orphan", content: "orphan result" },
+    ],
+  });
+
+  assert.equal(state.messages.some((message) => message.role === "system"), false);
+  assert.equal(state.messages.some((message) => message.content.includes("goal_continuation")), false);
+  assert.equal(state.messages.some((message) => message.content.includes("EXECUTE_RECOVERY")), false);
+  assert.equal(state.messages.some((message) => message.content.includes("private reasoning")), false);
+  assert.equal(state.messages.some((message) => message.tool_call_id === "orphan"), false);
+  assert.equal(state.messages.find((message) => message.tool_calls)?.tool_calls[0].function.arguments.includes("src/main.ts"), true);
+  assert.equal(state.messages.find((message) => message.role === "tool")?.content.includes("textarea"), true);
+  assert.match(state.memoryPacket, /src\/main\.ts/);
+});
+
+test("Goal runtime normalization preserves durable continuation memory idempotently", () => {
+  const goal = goalState.createGoalDefinition({ objective: "Continue one persistent task" });
+  const progress = goalState.createGoalProgress(goal.id, ".MAIN/goals/progress.md");
+  progress.continuation = goalContinuity.createGoalContinuationState({
+    sourceIteration: 2,
+    messages: [
+      { role: "assistant", content: "Keep this exact conclusion about `src/lib/goalRuntime.ts`." },
+    ],
+  });
+  progress.continuation.memoryPacket = "durable older operation memory";
+  const snapshot = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
+
+  const once = goalRuntime.normalizeGoalRuntimeSnapshot(snapshot);
+  const twice = goalRuntime.normalizeGoalRuntimeSnapshot(once);
+
+  assert.equal(once.progress.continuation.memoryPacket, "durable older operation memory");
+  assert.equal(twice.progress.continuation.memoryPacket, once.progress.continuation.memoryPacket);
+  assert.deepEqual(twice.progress.continuation.messages, once.progress.continuation.messages);
+});
+
+test("Goal continuation compaction keeps bounded complete tool protocol groups", () => {
+  const messages = [];
+  for (let index = 0; index < 80; index += 1) {
+    messages.push({
+      role: "assistant",
+      content: "",
+      tool_calls: [{
+        id: `call-${index}`,
+        type: "function",
+        function: { name: "read_file", arguments: JSON.stringify({ path: `src/file-${index}.ts` }) },
+      }],
+    });
+    messages.push({ role: "tool", tool_call_id: `call-${index}`, content: `content-${index}` });
+  }
+  messages.push({ role: "assistant", content: "Latest concrete conclusion must survive compaction." });
+
+  const state = goalContinuity.createGoalContinuationState({ sourceIteration: 4, messages });
+  const callIds = new Set(state.messages.flatMap((message) =>
+    (message.tool_calls || []).map((call) => call.id)
+  ));
+  const resultIds = new Set(state.messages.flatMap((message) =>
+    message.tool_call_id ? [message.tool_call_id] : []
+  ));
+
+  assert.equal(state.compacted, true);
+  assert.equal(state.messages.length <= 72, true);
+  assert.deepEqual([...callIds].sort(), [...resultIds].sort());
+  assert.equal(state.messages.at(-1).content.includes("Latest concrete conclusion"), true);
+
+  const next = goalContinuity.createGoalContinuationState({
+    sourceIteration: 5,
+    previous: { ...state, messages: state.messages.slice(-1) },
+    messages: [
+      state.messages.at(-1),
+      { role: "assistant", content: "One more conclusion." },
+    ],
+  });
+  assert.equal(next.compacted, true);
+  assert.match(next.memoryPacket, /Latest concrete conclusion|One more conclusion/);
 });
 
 test("periodic user confirmation pause is persisted before Goal Engine returns", async () => {

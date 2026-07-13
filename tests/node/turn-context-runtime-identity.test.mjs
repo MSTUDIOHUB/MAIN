@@ -145,7 +145,7 @@ test("canonical turn context keeps visible requests and choices but filters hidd
     },
     {
       role: "user",
-      content: "Execute bounded goal slice 2/10. Use the Goal Runtime contract as the source of truth.",
+      content: '[goal_continuation goal_id="goal-1" index="2"]\nContinue the same persistent goal.\n[/goal_continuation]',
     },
   ];
   const result = turnContext.collectCanonicalTurnUserContext({

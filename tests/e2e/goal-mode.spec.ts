@@ -23,6 +23,9 @@ test("Goal capsule exposes one themed popover with persistent lifecycle controls
   await expect(panel).toContainText("持续目标");
   await expect(panel).toContainText("验证 Capsule Goal 菜单与三主题");
   await expect(panel).toContainText("npm run lint");
+  await expect(panel).toContainText("模型轮次");
+  await expect(panel).not.toContainText("3/40");
+  await expect(panel).not.toContainText("执行切片");
   await expect(page.getByTestId("effective-progress-popover")).toHaveCount(0);
   await expect(page.getByTestId("tasks-progress-popover")).toHaveCount(0);
 

@@ -379,13 +379,13 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
               value={name}
               onChange={(event) => setName(event.target.value)}
               placeholder={copy.namePlaceholder}
-              className="w-full rounded-md border border-[#27272a] bg-black px-3 py-2 text-xs text-white outline-none theme-ring"
+              className="w-full rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-xs text-white outline-none theme-ring"
             />
             <input
               value={description}
               onChange={(event) => setDescription(event.target.value)}
               placeholder={copy.descPlaceholder}
-              className="w-full rounded-md border border-[#27272a] bg-black px-3 py-2 text-xs text-white outline-none theme-ring"
+              className="w-full rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-xs text-white outline-none theme-ring"
             />
             <button
               onClick={createBase}
@@ -408,7 +408,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                     className={`w-full rounded-lg border p-3 text-left transition-colors ${
                       selectedBase?.id === base.id
                         ? "theme-subtle-bg theme-border"
-                        : "border-[#27272a] bg-black hover:border-[#3f3f46]"
+                        : "border-[#27272a] bg-[#000000] hover:border-[#3f3f46]"
                     }`}
                   >
                     <div className="flex items-center gap-2">
@@ -441,7 +441,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                   <p className="mt-1 text-xs text-[#a1a1aa]">{selectedBase.description || selectedBase.embeddingProfile}</p>
                 </div>
                 <div className="flex shrink-0 items-center gap-2">
-                  <button onClick={() => toggleBase(selectedBase)} disabled={!!busy} className="flex items-center gap-2 rounded-md border border-[#27272a] bg-black px-3 py-2 text-xs text-[#e4e4e7] hover:bg-[#18181b] disabled:opacity-50">
+                  <button onClick={() => toggleBase(selectedBase)} disabled={!!busy} className="flex items-center gap-2 rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-xs text-[#e4e4e7] hover:bg-[#18181b] disabled:opacity-50">
                     {selectedBase.enabled && <IconCheck className="h-3.5 w-3.5 text-[#86d9a3]" />}
                     {selectedBase.enabled ? copy.enabled : copy.disabled}
                   </button>
@@ -501,7 +501,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                       value={webUrl}
                       onChange={(e) => setWebUrl(e.target.value)}
                       placeholder="输入网页链接 (例如 https://docs.python.org/3/library/os.html)"
-                      className="w-full rounded-md border border-[#27272a] bg-black px-3 py-2 text-xs text-white outline-none theme-ring"
+                      className="w-full rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-xs text-white outline-none theme-ring"
                     />
                     <div className="flex flex-wrap items-center gap-4 text-xs text-[#a1a1aa] pt-1">
                       <label className="flex items-center gap-2 cursor-pointer hover:text-white transition-colors">
@@ -509,7 +509,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                           type="checkbox"
                           checked={recursive}
                           onChange={(e) => setRecursive(e.target.checked)}
-                          className="rounded border-[#27272a] bg-black text-[#3b82f6] focus:ring-0 cursor-pointer"
+                          className="rounded border-[#27272a] bg-[#000000] text-[#3b82f6] focus:ring-0 cursor-pointer"
                         />
                         递归导入子链接
                       </label>
@@ -520,7 +520,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                             <select
                               value={maxDepth}
                               onChange={(e) => setMaxDepth(Number(e.target.value))}
-                              className="rounded border border-[#27272a] bg-black px-2 py-1 text-xs text-white outline-none"
+                              className="rounded border border-[#27272a] bg-[#000000] px-2 py-1 text-xs text-white outline-none"
                             >
                               <option value={1}>1 层 (仅直接子链接)</option>
                               <option value={2}>2 层 (推荐)</option>
@@ -532,7 +532,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                             <select
                               value={maxPages}
                               onChange={(e) => setMaxPages(Number(e.target.value))}
-                              className="rounded border border-[#27272a] bg-black px-2 py-1 text-xs text-white outline-none"
+                              className="rounded border border-[#27272a] bg-[#000000] px-2 py-1 text-xs text-white outline-none"
                             >
                               <option value={10}>10 页</option>
                               <option value={20}>20 页</option>
@@ -566,7 +566,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                     </span>
                     <button
                       onClick={cancelWebImport}
-                      className="rounded border border-red-950 bg-black px-2.5 py-1 text-[10px] text-red-300 hover:bg-red-950/40"
+                      className="rounded border border-red-950 bg-[#000000] px-2.5 py-1 text-[10px] text-red-300 hover:bg-red-950/40"
                     >
                       终止抓取
                     </button>
@@ -581,7 +581,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                         {progress.current} / {progress.total} 页
                       </span>
                     </div>
-                    <div className="h-1.5 w-full bg-black rounded-full overflow-hidden">
+                    <div className="h-1.5 w-full bg-[#000000] rounded-full overflow-hidden">
                       <div
                         className="h-full bg-[#3b82f6] transition-all duration-300"
                         style={{
@@ -594,11 +594,11 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
               )}
 
               <div className="mb-5 flex items-center gap-2">
-                <button onClick={rebuildBase} disabled={!!busy || sources.length === 0} className="flex items-center gap-2 rounded-md border border-[#27272a] bg-black px-3 py-2 text-xs text-[#a1a1aa] hover:bg-[#18181b] hover:text-white disabled:opacity-50">
+                <button onClick={rebuildBase} disabled={!!busy || sources.length === 0} className="flex items-center gap-2 rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-xs text-[#a1a1aa] hover:bg-[#18181b] hover:text-white disabled:opacity-50">
                   <IconRefresh className="h-3.5 w-3.5" />
                   {copy.rebuild}
                 </button>
-                <button onClick={deleteBase} disabled={!!busy} className="flex items-center gap-2 rounded-md border border-red-950 bg-black px-3 py-2 text-xs text-red-300 hover:bg-red-950/40 disabled:opacity-50">
+                <button onClick={deleteBase} disabled={!!busy} className="flex items-center gap-2 rounded-md border border-red-950 bg-[#000000] px-3 py-2 text-xs text-red-300 hover:bg-red-950/40 disabled:opacity-50">
                   <IconTrash className="h-3.5 w-3.5" />
                   {copy.delete}
                 </button>
@@ -607,11 +607,11 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
               <div className="mb-5">
                 <div className="mb-2 text-xs font-bold uppercase tracking-wide text-[#71717a]">{copy.sources}</div>
                 {sources.length === 0 ? (
-                  <div className="rounded-lg border border-[#27272a] bg-black p-5 text-center text-xs text-[#71717a]">{copy.noSources}</div>
+                  <div className="rounded-lg border border-[#27272a] bg-[#000000] p-5 text-center text-xs text-[#71717a]">{copy.noSources}</div>
                 ) : (
                   <div className="space-y-2">
                     {sources.map((source) => (
-                      <div key={source.id} className="rounded-lg border border-[#27272a] bg-black p-3">
+                      <div key={source.id} className="rounded-lg border border-[#27272a] bg-[#000000] p-3">
                         <div className="flex items-center gap-2">
                           <IconFile className="h-4 w-4 text-[#a1a1aa]" />
                           <span className="min-w-0 flex-1 truncate text-xs font-bold text-[#e4e4e7]">{source.title}</span>
@@ -638,7 +638,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                       if (event.key === "Enter") void runSearch();
                     }}
                     placeholder={copy.searchPlaceholder}
-                    className="min-w-0 flex-1 rounded-md border border-[#27272a] bg-black px-3 py-2 text-xs text-white outline-none theme-ring"
+                    className="min-w-0 flex-1 rounded-md border border-[#27272a] bg-[#000000] px-3 py-2 text-xs text-white outline-none theme-ring"
                   />
                   <button onClick={runSearch} disabled={!searchQuery.trim() || !!busy} className="flex items-center gap-2 rounded-md border border-[#27272a] bg-[#18181b] px-3 py-2 text-xs font-bold text-[#e4e4e7] hover:bg-[#27272a] disabled:opacity-50">
                     <IconSearch className="h-3.5 w-3.5" />
@@ -648,7 +648,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
                 {hits.length > 0 && (
                   <div className="mt-3 space-y-2">
                     {hits.map((hit) => (
-                      <div key={hit.citation.chunkId} className="rounded-lg border border-[#27272a] bg-black p-3">
+                      <div key={hit.citation.chunkId} className="rounded-lg border border-[#27272a] bg-[#000000] p-3">
                         <div className="mb-1 text-[10px] font-bold text-[#86d9a3]">
                           {hit.citation.sourceTitle}
                           {hit.citation.page ? ` · p.${hit.citation.page}` : ""}
@@ -666,7 +666,7 @@ export default function KnowledgeModal({ isOpen, onClose, currentWorkspace }: {
             <div className="flex flex-1 items-center justify-center text-xs text-[#71717a]">{copy.noBases}</div>
           )}
 
-          <div className="flex justify-end border-t border-[#27272a] bg-black px-5 py-4">
+          <div className="flex justify-end border-t border-[#27272a] bg-[#000000] px-5 py-4">
             <button onClick={onClose} className="rounded-md theme-bg px-6 py-1.5 text-xs font-bold theme-bg-hover">
               {copy.close}
             </button>

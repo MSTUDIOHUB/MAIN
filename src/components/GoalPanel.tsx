@@ -239,7 +239,7 @@ export default function GoalPanel({
               <div><span>{language === "zh" ? "当前阶段" : "Phase"}</span><strong>{phaseLabel}</strong></div>
               <div><span>{language === "zh" ? "完成进度" : "Progress"}</span><strong>{progressPercentage}%</strong></div>
               <div><span>{language === "zh" ? "有效运行" : "Active time"}</span><strong>{formatDuration(activeDurationMs, language)}</strong></div>
-              <div><span>{language === "zh" ? "执行切片" : "Slices"}</span><strong>{resolvedProgress?.totalIterationsUsed || 0}/{resolvedGoal.iterationBudget}</strong></div>
+              <div><span>{language === "zh" ? "模型轮次" : "Model rounds"}</span><strong>{resolvedProgress?.usage?.modelIterations || 0}</strong></div>
             </div>
 
             {currentMilestone && (
@@ -292,7 +292,7 @@ export default function GoalPanel({
               <dl className="goal-detail-list">
                 <div><dt>{language === "zh" ? "证据" : "Evidence"}</dt><dd>{evidence.length}</dd></div>
                 <div><dt>Token</dt><dd>{resolvedProgress?.totalTokensUsed?.toLocaleString() || 0}{resolvedProgress?.estimatedTokens ? " ~" : ""}</dd></div>
-                <div><dt>{language === "zh" ? "检查点" : "Checkpoint"}</dt><dd>{resolvedProgress?.lastCheckpoint?.iteration || "-"}</dd></div>
+                <div><dt>{language === "zh" ? "内部续跑" : "Continuations"}</dt><dd>{resolvedProgress?.totalIterationsUsed || 0}</dd></div>
                 <div><dt>{language === "zh" ? "修改文件" : "Modified files"}</dt><dd>{modifiedFiles.length}</dd></div>
               </dl>
               {blockers.length > 0 && (
@@ -303,7 +303,7 @@ export default function GoalPanel({
               )}
               {recentIterations.length > 0 && (
                 <div className="goal-detail-section">
-                  <span className="goal-section-label">{language === "zh" ? "最近切片" : "Recent slices"}</span>
+                  <span className="goal-section-label">{language === "zh" ? "最近进展" : "Recent progress"}</span>
                   {recentIterations.map((iteration) => (
                     <p key={iteration.index}><strong>#{iteration.index}</strong> {iteration.summary || (language === "zh" ? "无摘要" : "No summary")}</p>
                   ))}

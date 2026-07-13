@@ -1,10 +1,10 @@
 // lib/goalEngine.ts
-// Core Goal Engine — implements the Ralph Loop for MAIN's Goal Mode.
+// Core Goal Engine for MAIN's persistent Goal Mode.
 //
 // Architecture:
 //   The Goal Engine is a HIGHER-LEVEL loop that wraps the existing
-//   AgentOrchestrator. Each "goal iteration" triggers one run of the
-//   orchestrator with a compressed context window.
+//   AgentOrchestrator. Internal continuations share one logical turn and retain
+//   recent messages; checkpoints and evidence provide durable recovery.
 //
 //   ┌─────────────────────────────────────────┐
 //   │              Goal Engine                │
@@ -32,6 +32,8 @@ import type {
   GoalProgress,
   GoalIterationUsage,
   GoalStopClass,
+  GoalContinuationState,
+  GoalEvidenceEntry,
 } from "./goalState";
 import {
   createGoalCheckpoint,
@@ -39,6 +41,7 @@ import {
   createGoalProgress,
   isGoalTerminal,
   migrateGoalDefinition,
+  normalizeGoalCriteria,
   type GoalRuntimeSnapshot,
   type GoalTurnContract,
 } from "./goalState";
@@ -78,6 +81,10 @@ import {
   normalizeGoalRecoveryCause,
   resolveGoalInnerOutcomeDecision,
 } from "./goalOutcomePolicy";
+import {
+  compactGoalAssistantContext,
+  extractGoalAssistantSummary,
+} from "./goalContinuity";
 
 // ── Goal Engine callbacks ────────────────────────────────────────
 
@@ -93,6 +100,8 @@ export interface GoalEngineCallbacks {
     goalSliceId: string;
     iteration: number;
     maxIterations: number;
+    /** Retained exact recent messages plus durable memory from the same Goal task. */
+    continuation: GoalContinuationState | null;
   }) => Promise<GoalAgentIterationResult>;
   /** Write a file to the workspace */
   writeFile: (path: string, content: string) => Promise<void>;
@@ -139,6 +148,8 @@ export interface GoalAgentIterationResult {
   sliceBoundaryReached?: boolean;
   /** Actual inner model/tool counters; token estimates remain explicitly marked. */
   usage?: GoalIterationUsage;
+  /** Updated retained conversation for the next internal continuation or resume. */
+  continuation?: GoalContinuationState;
 }
 
 // ── Main entry point ─────────────────────────────────────────────
@@ -166,6 +177,12 @@ export async function executeGoalLoop(input: {
         iterations: [...(existingProgress.iterations || [])],
         evidence: [...(existingProgress.evidence || [])],
         milestones: [...(existingProgress.milestones || [])],
+        continuation: existingProgress.continuation
+          ? {
+              ...existingProgress.continuation,
+              messages: [...(existingProgress.continuation.messages || [])],
+            }
+          : undefined,
         usage: existingProgress.usage ? { ...existingProgress.usage, activeStartedAt: Date.now() } : undefined,
       }
     : createGoalProgress(goal.id, progressFilePath);
@@ -227,11 +244,19 @@ export async function executeGoalLoop(input: {
 
   callbacks.onDebugEvent?.("goal_loop_start", {
     goalId: goal.id,
-    goalSliceId: `${goal.id}:slice:${progress.totalIterationsUsed + 1}`,
+    continuationId: `${goal.id}:slice:${progress.totalIterationsUsed + 1}`,
     objective: goal.objective.slice(0, 200),
-    budget: { maxIterations: budget.maxIterations, maxDurationMs: budget.maxDurationMs },
+    budget: {
+      emergencyContinuationLimit: budget.maxIterations,
+      maxDurationMs: budget.maxDurationMs,
+      maxToolCalls: budget.maxToolCalls,
+      maxTokens: budget.maxTokens,
+    },
     resuming: !!existingProgress,
-    startIteration: progress.totalIterationsUsed,
+    retainedContinuations: progress.totalIterationsUsed,
+    retainedMessages: progress.continuation?.messages.length || 0,
+    retainedOperations: progress.continuation?.operationCount || 0,
+    memoryChars: progress.continuation?.memoryPacket?.length || 0,
   });
 
   // ── Main Loop ──────────────────────────────────────────────────
@@ -319,7 +344,7 @@ export async function executeGoalLoop(input: {
       }
     }
 
-    // ── Start new iteration ──
+    // ── Start an internal continuation boundary ──
     progress.totalIterationsUsed += 1;
     progress.currentIteration = progress.totalIterationsUsed;
 
@@ -327,15 +352,17 @@ export async function executeGoalLoop(input: {
     progress.iterations.push(iteration);
 
     callbacks.onGoalIterationStart(iteration);
-    callbacks.onDebugEvent?.("goal_iteration_start", {
-      iteration: iteration.index,
-      goalSliceId: iteration.goalSliceId,
+    callbacks.onDebugEvent?.("goal_continuation_start", {
+      continuation: iteration.index,
+      continuationId: iteration.goalSliceId,
       phase: iteration.phase,
-      totalUsed: progress.totalIterationsUsed,
-      budget: budget.maxIterations,
+      emergencyContinuationLimit: budget.maxIterations,
+      retainedMessages: progress.continuation?.messages.length || 0,
+      retainedOperations: progress.continuation?.operationCount || 0,
+      memoryChars: progress.continuation?.memoryPacket?.length || 0,
     });
 
-    // ── Build context for this iteration ──
+    // ── Build the updated contract without discarding retained messages ──
     const goalTurnContract = buildGoalTurnContract({
       goal,
       checkpoint: lastCheckpoint,
@@ -343,6 +370,11 @@ export async function executeGoalLoop(input: {
       nextIteration: progress.currentIteration,
       language,
       evidence: progress.evidence || [],
+      // Exact recent messages are already replayed. Add compact memory only
+      // after older transcript content has actually left that exact window.
+      continuationMemory: progress.continuation?.compacted
+        ? progress.continuation.memoryPacket
+        : undefined,
     });
 
     // ── Execute one agent iteration ──
@@ -354,12 +386,20 @@ export async function executeGoalLoop(input: {
         goalSliceId: goalTurnContract.goalSliceId,
         iteration: progress.currentIteration,
         maxIterations: budget.maxIterations,
+        continuation: progress.continuation || null,
       });
     } catch (err) {
       const errorMsg = err instanceof Error ? err.message : String(err);
-      const reportedFailureUsage = (err as { goalIterationUsage?: Partial<GoalIterationUsage> } | null)?.goalIterationUsage;
+      const reportedFailure = err as {
+        goalIterationUsage?: Partial<GoalIterationUsage>;
+        goalContinuationState?: GoalContinuationState;
+      } | null;
+      const reportedFailureUsage = reportedFailure?.goalIterationUsage;
+      if (reportedFailure?.goalContinuationState) {
+        progress.continuation = reportedFailure.goalContinuationState;
+      }
       const failureUsage: GoalIterationUsage = {
-        // The bounded slice was invoked, so a thrown request must never vanish
+        // The continuation was invoked, so a thrown request must never vanish
         // from accounting even when its provider did not return token usage.
         modelIterations: Math.max(1, Math.floor(Number(reportedFailureUsage?.modelIterations) || 0)),
         toolCalls: Math.max(0, Math.floor(Number(reportedFailureUsage?.toolCalls) || 0)),
@@ -420,13 +460,18 @@ export async function executeGoalLoop(input: {
         iteration.stopClass = progress.stopClass;
         iteration.unresolvedBlockers.push(`Agent iteration error: ${errorMsg}`);
       }
-      const remainingTasks = lastCheckpoint?.remainingTasks || [];
+      const remainingTasks = resolveRemainingTasks({
+        goal,
+        assistantText: iteration.summary,
+        previous: lastCheckpoint?.remainingTasks || [],
+      });
       lastCheckpoint = createCheckpointFromRuntime({
         goal,
         progress,
         iteration: { ...iteration, phase: "re_plan" },
         remainingTasks,
         language,
+        assistantText: iteration.summary,
       });
       progress.lastCheckpoint = lastCheckpoint;
       if (stopStatus || shouldCreateCheckpoint(iteration.index, budget)) {
@@ -434,9 +479,9 @@ export async function executeGoalLoop(input: {
       }
 
       callbacks.onGoalIterationEnd(iteration);
-      callbacks.onDebugEvent?.("goal_iteration_error", {
-        iteration: iteration.index,
-        goalSliceId: iteration.goalSliceId,
+      callbacks.onDebugEvent?.("goal_continuation_error", {
+        continuation: iteration.index,
+        continuationId: iteration.goalSliceId,
         error: errorMsg.slice(0, 500),
         action: decision.action,
         normalizedCause: decision.normalizedCause || null,
@@ -459,7 +504,7 @@ export async function executeGoalLoop(input: {
     iteration.toolCallCount = agentResult.toolCalls.length;
     iteration.filesModified = extractModifiedFilesFromToolCalls(agentResult.toolCalls);
     iteration.testsRun = extractTestCommandsFromToolCalls(agentResult.toolCalls);
-    iteration.summary = extractIterationSummary(agentResult.assistantText, language);
+    iteration.summary = "";
     iteration.endedAt = Date.now();
 
     const iterationEvidence = createGoalEvidenceEntries({
@@ -467,6 +512,10 @@ export async function executeGoalLoop(input: {
       iteration: iteration.index,
       observations: agentResult.toolCalls,
     });
+    iteration.summary = extractIterationSummary(agentResult.assistantText, language, iterationEvidence);
+    if (agentResult.continuation) {
+      progress.continuation = agentResult.continuation;
+    }
     progress.evidence = assignGoalEvidenceCriterionIds(
       goal,
       [...(progress.evidence || []), ...iterationEvidence],
@@ -510,18 +559,21 @@ export async function executeGoalLoop(input: {
 
     const hasMeaningfulEvidence = iterationEvidence.some(isGoalEvidenceMeaningfulProgress);
 
-    callbacks.onDebugEvent?.("goal_slice_outcome", {
-      goalSliceId: goalTurnContract.goalSliceId,
-      iteration: iteration.index,
+    callbacks.onDebugEvent?.("goal_continuation_outcome", {
+      continuationId: goalTurnContract.goalSliceId,
+      continuation: iteration.index,
       outcomeStatus: agentResult.outcomeStatus || (agentResult.completed ? "completed" : "unknown"),
       stopReason: iteration.stopReason || null,
       sliceBoundaryReached: agentResult.sliceBoundaryReached === true,
       usage: normalizedUsage,
       evidenceCount: iterationEvidence.length,
+      retainedMessages: progress.continuation?.messages.length || 0,
+      retainedOperations: progress.continuation?.operationCount || 0,
+      memoryChars: progress.continuation?.memoryPacket?.length || 0,
     });
 
     const completionSignal = detectGoalCompletionSignal(agentResult.assistantText);
-    const autoNextSlice = agentResult.sliceBoundaryReached === true
+    const autoContinue = agentResult.sliceBoundaryReached === true
       || iteration.stopReason === "max_iterations_boundary";
     const effectiveStopReason = completionSignal.blocked
       ? completionSignal.blockerReason || "goal_blocked_without_reason"
@@ -529,7 +581,7 @@ export async function executeGoalLoop(input: {
     const innerDecision = resolveGoalInnerOutcomeDecision({
       status: completionSignal.blocked ? "stopped_no_action" : agentResult.outcomeStatus,
       stopReason: effectiveStopReason,
-      sliceBoundaryReached: autoNextSlice,
+      sliceBoundaryReached: autoContinue,
       isAborted: callbacks.isAborted(),
     });
     const immediateStopStatus = goalStatusForOutcomeAction(innerDecision.action);
@@ -548,8 +600,13 @@ export async function executeGoalLoop(input: {
         goal,
         progress,
         iteration,
-        remainingTasks: extractRemainingTasks(agentResult.assistantText, language),
+        remainingTasks: resolveRemainingTasks({
+          goal,
+          assistantText: agentResult.assistantText,
+          previous: lastCheckpoint?.remainingTasks || [],
+        }),
         language,
+        assistantText: agentResult.assistantText,
       });
       progress.lastCheckpoint = lastCheckpoint;
       callbacks.onGoalCheckpointSaved(lastCheckpoint);
@@ -568,14 +625,17 @@ export async function executeGoalLoop(input: {
       return outcome;
     }
 
-    if (autoNextSlice) {
+    if (autoContinue) {
       iteration.stopClass = "slice_budget_exhausted";
       progress.stopClass = "slice_budget_exhausted";
-      callbacks.onDebugEvent?.("goal_slice_auto_next", {
-        goalSliceId: goalTurnContract.goalSliceId,
-        iteration: iteration.index,
+      callbacks.onDebugEvent?.("goal_continuation_auto_resume", {
+        continuationId: goalTurnContract.goalSliceId,
+        continuation: iteration.index,
         stopReason: iteration.stopReason,
-        nextGoalSliceId: `${goal.id}:slice:${iteration.index + 1}`,
+        nextContinuationId: `${goal.id}:slice:${iteration.index + 1}`,
+        retainedMessages: progress.continuation?.messages.length || 0,
+        retainedOperations: progress.continuation?.operationCount || 0,
+        memoryChars: progress.continuation?.memoryPacket?.length || 0,
       });
     }
 
@@ -614,7 +674,7 @@ export async function executeGoalLoop(input: {
       } else {
         callbacks.onDebugEvent?.("goal_runtime_evidence_completion_rejected", {
           iteration: iteration.index,
-          goalSliceId: goalTurnContract.goalSliceId,
+          continuationId: goalTurnContract.goalSliceId,
           outcomeStatus: agentResult.outcomeStatus || (agentResult.completed ? "completed" : "unknown"),
           reasons: evidenceOnlyGate.reasons,
           evidenceCount: progress.evidence?.length || 0,
@@ -625,15 +685,15 @@ export async function executeGoalLoop(input: {
     if (completionCandidate.source === "runtime_evidence") {
       callbacks.onDebugEvent?.("goal_runtime_evidence_completion_candidate", {
         iteration: iteration.index,
-        goalSliceId: goalTurnContract.goalSliceId,
+        continuationId: goalTurnContract.goalSliceId,
         outcomeStatus: agentResult.outcomeStatus || (agentResult.completed ? "completed" : "unknown"),
         stopReason: effectiveStopReason,
-        sliceBoundaryReached: autoNextSlice,
+        sliceBoundaryReached: autoContinue,
         evidenceCount: progress.evidence?.length || 0,
       });
     }
     if (completionCandidate.accepted && !completionGate.passed) {
-      // Preserve the ordinary slice-boundary status when completion was
+      // Preserve the ordinary continuation-boundary status when completion was
       // runtime-nominated. A missing marker must not turn a normal bounded
       // continuation into a misleading evidence pause. Explicit model claims
       // still receive the more precise evidence_missing stop class.
@@ -643,7 +703,7 @@ export async function executeGoalLoop(input: {
       }
       callbacks.onDebugEvent?.("goal_completion_rejected", {
         iteration: iteration.index,
-        goalSliceId: goalTurnContract.goalSliceId,
+        continuationId: goalTurnContract.goalSliceId,
         candidateSource: completionCandidate.source,
         reasons: completionGate.reasons,
         evidenceCount: progress.evidence?.length || 0,
@@ -662,6 +722,7 @@ export async function executeGoalLoop(input: {
         iteration,
         remainingTasks: [],
         language,
+        assistantText: agentResult.assistantText,
       });
       progress.lastCheckpoint = lastCheckpoint;
       callbacks.onGoalIterationEnd(iteration);
@@ -671,7 +732,7 @@ export async function executeGoalLoop(input: {
       emitRuntimeUpdate(callbacks, goal, progress, "observe");
       callbacks.onDebugEvent?.("goal_completion_accepted", {
         iteration: iteration.index,
-        goalSliceId: goalTurnContract.goalSliceId,
+        continuationId: goalTurnContract.goalSliceId,
         candidateSource: completionCandidate.source,
         supportingEvidenceIds: completionGate.supportingEvidenceIds,
       });
@@ -698,12 +759,12 @@ export async function executeGoalLoop(input: {
       const recoveryStopClass: GoalStopClass = recoveryCause === "no_progress"
         ? "no_progress"
         : "recoverable_error";
-      if (!autoNextSlice) {
+      if (!autoContinue) {
         iteration.stopClass = recoveryStopClass;
         progress.stopClass = recoveryStopClass;
       }
       callbacks.onDebugEvent?.("goal_recovery_state_updated", {
-        goalSliceId: goalTurnContract.goalSliceId,
+        continuationId: goalTurnContract.goalSliceId,
         normalizedCause: recoveryCause,
         consecutiveCount: progress.recoveryState.consecutiveCount,
         stopReason: recoveryReason,
@@ -720,8 +781,13 @@ export async function executeGoalLoop(input: {
           goal,
           progress,
           iteration,
-          remainingTasks: extractRemainingTasks(agentResult.assistantText, language),
+          remainingTasks: resolveRemainingTasks({
+            goal,
+            assistantText: agentResult.assistantText,
+            previous: lastCheckpoint?.remainingTasks || [],
+          }),
           language,
+          assistantText: agentResult.assistantText,
         });
         progress.lastCheckpoint = lastCheckpoint;
         callbacks.onGoalCheckpointSaved(lastCheckpoint);
@@ -739,15 +805,20 @@ export async function executeGoalLoop(input: {
 
     callbacks.onGoalIterationEnd(iteration);
 
-    // Keep a lightweight continuation checkpoint after every bounded slice so
-    // the next fresh context never loses the most recent work. Checkpoint
-    // events remain interval-based to avoid noisy UI/runtime telemetry.
+    // Keep a continuation checkpoint after every internal boundary. Exact
+    // recent messages stay in progress.continuation; this checkpoint remains a
+    // self-contained fallback for pause, restart, or later context compaction.
     lastCheckpoint = createCheckpointFromRuntime({
       goal,
       progress,
       iteration: { ...iteration, phase: "re_plan" },
-      remainingTasks: extractRemainingTasks(agentResult.assistantText, language),
+      remainingTasks: resolveRemainingTasks({
+        goal,
+        assistantText: agentResult.assistantText,
+        previous: lastCheckpoint?.remainingTasks || [],
+      }),
       language,
+      assistantText: agentResult.assistantText,
     });
     progress.lastCheckpoint = lastCheckpoint;
 
@@ -756,7 +827,7 @@ export async function executeGoalLoop(input: {
 
       callbacks.onDebugEvent?.("goal_checkpoint_saved", {
         iteration: iteration.index,
-        goalSliceId: goalTurnContract.goalSliceId,
+        continuationId: goalTurnContract.goalSliceId,
         completedTasks: lastCheckpoint.completedTasks.length,
         remainingTasks: lastCheckpoint.remainingTasks.length,
       });
@@ -782,6 +853,7 @@ function createCheckpointFromRuntime(input: {
   iteration: GoalIteration;
   remainingTasks: string[];
   language: "zh" | "en";
+  assistantText?: string;
 }): GoalCheckpoint {
   return createGoalCheckpoint({
     iteration: input.iteration.index,
@@ -795,6 +867,14 @@ function createCheckpointFromRuntime(input: {
       : input.iteration.testsPassed ? "Tests passed" : "Tests failed",
     goalRevision: input.goal.revision,
     evidenceCursor: input.progress.evidence?.length || 0,
+    lastAssistantContext: compactGoalAssistantContext(input.assistantText),
+    recentOperations: (input.progress.evidence || []).slice(-16).map((entry) => ({
+      iteration: entry.iteration,
+      tool: entry.sourceTool,
+      target: entry.target,
+      status: entry.status,
+      summary: entry.summary,
+    })),
   });
 }
 
@@ -839,7 +919,7 @@ function resolveGoalCompletionCandidate(input: {
     return { accepted: true, source: "model_marker" };
   }
 
-  // A normal inner completion and the expected bounded slice boundary are
+  // A normal inner completion and the expected continuation boundary are
   // clean terminal points. A stopped_no_action result can also be a normal
   // provider-side handoff after real tool work (especially with local models
   // that omit the final marker); let the evidence gate decide that narrow
@@ -915,22 +995,56 @@ async function persistProgress(
   }
 }
 
-function extractIterationSummary(assistantText: string, _language: "zh" | "en"): string {
-  // Extract the first meaningful paragraph as a summary
-  const lines = assistantText.split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length === 0) return "(no summary)";
+function buildIterationEvidenceSummary(
+  evidence: GoalEvidenceEntry[],
+  language: "zh" | "en",
+): string {
+  if (evidence.length === 0) return "";
+  const failed = evidence.filter((entry) => entry.status === "failed");
+  const changes = evidence.filter((entry) => entry.kind === "file_change");
+  const validations = evidence.filter((entry) =>
+    entry.kind === "test" || entry.kind === "build" || entry.kind === "browser"
+  );
+  const reads = evidence.filter((entry) => entry.kind === "read");
+  const targets = (entries: GoalEvidenceEntry[], limit: number) => [...new Set(
+    entries.map((entry) => entry.target || entry.sourceTool).filter(Boolean),
+  )].slice(0, limit).join(", ");
 
-  // Skip lines that are just headers or tool markers
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed.startsWith("#")) continue;
-    if (trimmed.startsWith("```")) continue;
-    if (/^(?:GOAL_COMPLETED|GOAL_BLOCKED)/i.test(trimmed)) continue;
-    // Return first substantive line, truncated
-    return trimmed.length > 200 ? trimmed.slice(0, 200) + "..." : trimmed;
+  if (failed.length > 0) {
+    return language === "zh"
+      ? `失败操作：${targets(failed, 3)}`
+      : `Failed operations: ${targets(failed, 3)}`;
   }
+  const parts: string[] = [];
+  if (changes.length > 0) {
+    parts.push(language === "zh"
+      ? `已修改 ${targets(changes, 4)}`
+      : `Modified ${targets(changes, 4)}`);
+  }
+  if (validations.length > 0) {
+    parts.push(language === "zh"
+      ? `已验证 ${targets(validations, 3)}`
+      : `Verified ${targets(validations, 3)}`);
+  }
+  if (parts.length === 0 && reads.length > 0) {
+    parts.push(language === "zh"
+      ? `已检查 ${targets(reads, 4)}`
+      : `Inspected ${targets(reads, 4)}`);
+  }
+  return parts.join(language === "zh" ? "；" : "; ");
+}
 
-  return lines[0].trim().slice(0, 200);
+function extractIterationSummary(
+  assistantText: string,
+  language: "zh" | "en",
+  evidence: GoalEvidenceEntry[],
+): string {
+  const conclusion = extractGoalAssistantSummary(assistantText, 480);
+  const evidenceSummary = buildIterationEvidenceSummary(evidence, language);
+  if (!conclusion) return evidenceSummary || (language === "zh" ? "本次连续执行没有可用摘要" : "No usable continuation summary");
+  if (!evidenceSummary || conclusion.toLowerCase().includes(evidenceSummary.toLowerCase())) return conclusion;
+  const combined = `${conclusion} | ${evidenceSummary}`;
+  return combined.length <= 640 ? combined : `${combined.slice(0, 637)}...`;
 }
 
 function extractCompletedTasks(progress: GoalProgress): string[] {
@@ -940,14 +1054,13 @@ function extractCompletedTasks(progress: GoalProgress): string[] {
       (entry) => entry.iteration === iter.index && isGoalEvidenceMeaningfulProgress(entry),
     );
     if (iter.summary && iter.endedAt && hasSuccessfulEvidence && iter.unresolvedBlockers.length === 0) {
-      tasks.push(`[Iteration ${iter.index}] ${iter.summary}`);
+      tasks.push(`[Continuation ${iter.index}] ${iter.summary}`);
     }
   }
   return tasks.slice(-20); // Keep last 20
 }
 
-function extractRemainingTasks(assistantText: string, _language: "zh" | "en"): string[] {
-  // Try to extract remaining tasks from the assistant's output
+function extractExplicitRemainingTasks(assistantText: string): string[] {
   const tasks: string[] = [];
   const lines = assistantText.split("\n");
   let inRemainingSection = false;
@@ -969,6 +1082,42 @@ function extractRemainingTasks(assistantText: string, _language: "zh" | "en"): s
   return tasks.slice(0, 20);
 }
 
+function normalizeTaskKey(value: string): string {
+  return String(value || "").toLowerCase().replace(/[\s`*_#.,，。:：;；-]+/g, "").trim();
+}
+
+function resolveRemainingTasks(input: {
+  goal: GoalDefinition;
+  assistantText: string;
+  previous: string[];
+}): string[] {
+  const explicit = extractExplicitRemainingTasks(input.assistantText);
+  const criteria = normalizeGoalCriteria(input.goal);
+  const satisfiedKeys = criteria
+    .filter((criterion) => criterion.status === "satisfied")
+    .map((criterion) => normalizeTaskKey(criterion.text));
+  const pending = criteria
+    .filter((criterion) => criterion.required && criterion.status !== "satisfied")
+    .map((criterion) => criterion.text);
+  const fallback = explicit.length > 0 ? explicit : input.previous;
+  const candidates = [...fallback, ...pending].filter((task) => {
+    const key = normalizeTaskKey(task);
+    if (!key) return false;
+    return !satisfiedKeys.some((satisfied) =>
+      satisfied && (key === satisfied || key.includes(satisfied) || satisfied.includes(key))
+    );
+  });
+  const seen = new Set<string>();
+  const remaining: string[] = [];
+  for (const task of candidates) {
+    const key = normalizeTaskKey(task);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    remaining.push(task.trim());
+  }
+  return remaining.slice(0, 20);
+}
+
 function buildCheckpointSummary(progress: GoalProgress, language: "zh" | "en"): string {
   const recentIterations = progress.iterations.slice(-3);
   const isZh = language === "zh";
@@ -977,7 +1126,7 @@ function buildCheckpointSummary(progress: GoalProgress, language: "zh" | "en"): 
     const files = iter.filesModified.length > 0
       ? ` (${isZh ? "修改" : "modified"}: ${iter.filesModified.join(", ")})`
       : "";
-    return `${isZh ? "迭代" : "Iter"} ${iter.index}: ${iter.summary}${files}`;
+    return `${isZh ? "连续执行" : "Continuation"} ${iter.index}: ${iter.summary}${files}`;
   });
 
   return summaries.join("\n");

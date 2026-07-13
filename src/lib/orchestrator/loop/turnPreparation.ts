@@ -675,10 +675,10 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
         ...runEventIdentity,
       });
     }
-    // Goal slices are child runs of one long-lived logical turn. The outer
-    // Goal runtime alone decides whether evidence is sufficient to terminate
-    // that turn; a locally completed slice must not consume the one terminal
-    // turn event before later slices run.
+    // Goal continuations are child runs of one long-lived logical turn. The
+    // outer Goal runtime alone decides whether evidence is sufficient to
+    // terminate that turn; an internal boundary must not consume its terminal
+    // event before the continuation completes.
     if (resolveRunEventIdentity().goalSliceId) return;
     turnEventTerminalEmitted = true;
     emitTurnEvent({

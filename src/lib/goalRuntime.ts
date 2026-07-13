@@ -14,6 +14,7 @@ import {
   classifyGoalToolCapability,
   isGoalEvidenceCompletionEligible,
 } from "./goalToolCapabilities";
+import { createGoalContinuationState } from "./goalContinuity";
 
 export interface GoalToolObservation {
   id?: string;
@@ -540,6 +541,14 @@ export function normalizeGoalRuntimeSnapshot(snapshot: GoalRuntimeSnapshot): Goa
       ? "awaiting_input" as const
       : snapshot.status || goal.status;
   const evidence = assignGoalEvidenceCriterionIds(goal, [...(snapshot.progress.evidence || [])]);
+  const persistedContinuation = snapshot.progress.continuation;
+  const normalizedContinuation = persistedContinuation
+    ? createGoalContinuationState({
+        messages: persistedContinuation.messages || [],
+        sourceIteration: persistedContinuation.sourceIteration,
+        now: persistedContinuation.updatedAt || snapshot.updatedAt || Date.now(),
+      })
+    : undefined;
   return {
     ...snapshot,
     schemaVersion: GOAL_SCHEMA_VERSION,
@@ -556,6 +565,19 @@ export function normalizeGoalRuntimeSnapshot(snapshot: GoalRuntimeSnapshot): Goa
       usage: snapshot.progress.usage ? { ...snapshot.progress.usage } : undefined,
       pauseReason: migrationPauseReason || snapshot.progress.pauseReason,
       recoveryState: snapshot.progress.recoveryState ? { ...snapshot.progress.recoveryState } : undefined,
+      continuation: normalizedContinuation
+        ? {
+            ...normalizedContinuation,
+            // Normalization is idempotent: keep durable memory produced at the
+            // execution boundary instead of summarizing that packet into itself.
+            memoryPacket: persistedContinuation?.memoryPacket || normalizedContinuation.memoryPacket,
+            compacted: persistedContinuation?.compacted === true || normalizedContinuation.compacted,
+            messageCountBefore: Math.max(
+              persistedContinuation?.messageCountBefore || 0,
+              normalizedContinuation.messageCountBefore,
+            ),
+          }
+        : undefined,
     },
     status,
     pauseReason: migrationPauseReason || snapshot.pauseReason,

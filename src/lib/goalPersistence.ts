@@ -106,7 +106,7 @@ export function buildGoalProgressMarkdown(input: {
   const statusLabel = buildGoalStatusLabel(goal.status, language);
   lines.push(`## ${isZh ? "当前状态" : "Current Status"}`);
   lines.push(`- ${isZh ? "状态" : "Status"}: ${statusLabel}`);
-  lines.push(`- ${isZh ? "迭代" : "Iteration"}: ${progress.currentIteration}/${goal.iterationBudget}`);
+  lines.push(`- ${isZh ? "内部连续执行" : "Internal continuations"}: ${progress.currentIteration}`);
   if (progress.lastStopReason) {
     lines.push(`- ${isZh ? "最近停止原因" : "Last stop reason"}: ${progress.lastStopReason}`);
   }
@@ -119,7 +119,7 @@ export function buildGoalProgressMarkdown(input: {
     lines.push(`- ${isZh ? "恢复原因" : "Recovery cause"}: ${progress.recoveryState.normalizedCause} (${progress.recoveryState.consecutiveCount}/${3})`);
   }
   if (progress.lastCheckpoint) {
-    lines.push(`- ${isZh ? "最近检查点" : "Last Checkpoint"}: ${isZh ? "迭代" : "Iteration"} ${progress.lastCheckpoint.iteration}`);
+    lines.push(`- ${isZh ? "最近检查点" : "Last Checkpoint"}: ${isZh ? "连续执行" : "Continuation"} ${progress.lastCheckpoint.iteration}`);
   }
   lines.push("");
 
@@ -133,13 +133,13 @@ export function buildGoalProgressMarkdown(input: {
     lines.push("");
   }
 
-  // Completed Steps
+  // Progress history
   const completedIterations = progress.iterations.filter((iter) => iter.endedAt != null);
   if (completedIterations.length > 0) {
-    lines.push(`## ${isZh ? "已完成步骤" : "Completed Steps"}`);
+    lines.push(`## ${isZh ? "进展记录" : "Progress History"}`);
     for (const iter of completedIterations.slice(-20)) {
       const summary = summarizeGoalIteration(iter, language);
-      lines.push(`${iter.index}. [${isZh ? "迭代" : "Iteration"} ${iter.index}] ${summary}`);
+      lines.push(`${iter.index}. [${isZh ? "连续执行" : "Continuation"} ${iter.index}] ${summary}`);
     }
     if (completedIterations.length > 20) {
       lines.push(`... ${isZh ? "更早的" : "earlier"} ${completedIterations.length - 20} ${isZh ? "步已省略" : "steps omitted"}`);
@@ -224,7 +224,7 @@ export function buildCheckpointContextForLLM(input: {
   lines.push(isZh ? "## 目标检查点摘要" : "## Goal Checkpoint Summary");
   lines.push("");
   lines.push(`**${isZh ? "目标" : "Objective"}**: ${goal.objective}`);
-  lines.push(`**${isZh ? "迭代" : "Iteration"}**: ${checkpoint.iteration}/${goal.iterationBudget}`);
+  lines.push(`**${isZh ? "连续执行" : "Continuation"}**: ${checkpoint.iteration}`);
   lines.push("");
 
   if (checkpoint.completedTasks.length > 0) {
@@ -249,6 +249,21 @@ export function buildCheckpointContextForLLM(input: {
     lines.push("");
   }
 
+  if (checkpoint.lastAssistantContext) {
+    lines.push(isZh ? "**最近模型结论**:" : "**Latest Model Conclusions**:");
+    lines.push(checkpoint.lastAssistantContext);
+    lines.push("");
+  }
+
+  if (checkpoint.recentOperations?.length) {
+    lines.push(isZh ? "**最近工具操作**:" : "**Recent Tool Operations**:");
+    for (const operation of checkpoint.recentOperations.slice(-12)) {
+      const target = operation.target ? ` · ${operation.target}` : "";
+      lines.push(`- [${operation.status}] ${operation.tool}${target} · ${operation.summary}`);
+    }
+    lines.push("");
+  }
+
   if (checkpoint.contextSummary) {
     lines.push(isZh ? "**上下文摘要**:" : "**Context Summary**:");
     lines.push(checkpoint.contextSummary);
@@ -268,7 +283,7 @@ export function buildCheckpointContextForLLM(input: {
 
 // ── Parse existing progress from file ────────────────────────────
 
-const ITERATION_LINE_RE = /^\d+\.\s*\[(?:迭代|Iteration)\s+(\d+)\]\s*(.+)$/;
+const ITERATION_LINE_RE = /^\d+\.\s*\[(?:迭代|Iteration|连续执行|Continuation)\s+(\d+)\]\s*(.+)$/;
 
 export function parseGoalProgressFromMarkdown(markdown: string): {
   objective: string | null;
@@ -293,7 +308,7 @@ export function parseGoalProgressFromMarkdown(markdown: string): {
 
     // Detect section headers
     if (trimmed.startsWith("## ")) {
-      if (/已完成|Completed Steps/i.test(trimmed)) section = "completed";
+      if (/已完成|Completed Steps|进展记录|Progress History/i.test(trimmed)) section = "completed";
       else if (/剩余|Remaining/i.test(trimmed)) section = "remaining";
       else section = "";
       continue;

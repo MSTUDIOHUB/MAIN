@@ -27,7 +27,7 @@ function compactSourceItem(value: string, maxChars = 1_600): string {
 }
 
 function isRuntimeOnlyUserMessage(text: string): boolean {
-  return /^(?:\[System:\s*ContextState|\[GoalTurnContract|\[goal_runtime|Execute bounded goal slice|执行有界目标切片)/i.test(
+  return /^(?:\[System:\s*ContextState|\[GoalTurnContract|\[goal_runtime|\[goal_continuation\b|Execute bounded goal slice|执行有界目标切片)/i.test(
     text.trim(),
   );
 }

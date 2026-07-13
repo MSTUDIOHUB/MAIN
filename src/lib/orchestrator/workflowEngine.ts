@@ -1,6 +1,11 @@
 import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import { mergeGoalToolObservations, type GoalToolObservation } from "../goalRuntime";
+import {
+  buildGoalContinuationPrompt,
+  createGoalContinuationState,
+  restoreGoalContinuationMessages,
+} from "../goalContinuity";
 import { invoke } from "@tauri-apps/api/core";
 import {
   appendThoughtDelta, 
@@ -3043,15 +3048,23 @@ export class WorkflowEngine {
               activeRunId: activeRuntimeRunIdentity.runId,
               activeParentRunId: activeRuntimeRunIdentity.parentRunId,
             });
+            const retainedContinuationMessages = restoreGoalContinuationMessages(iterInput.continuation);
             let iterationMessages: import("../orchestrator").AgentMessage[] = [
               { role: "system", content: "" },
+              ...retainedContinuationMessages,
               {
                 role: "user",
-                content: callbacks.getPreferredLanguage() === "en"
-                  ? `Execute bounded goal slice ${iterInput.iteration}/${iterInput.maxIterations} (${iterInput.goalSliceId}). Use the Goal Runtime contract as the source of truth, advance one verifiable milestone, and finish with evidence plus the next step.`
-                  : `执行有界目标切片 ${iterInput.iteration}/${iterInput.maxIterations}（${iterInput.goalSliceId}）。以 Goal Runtime 合同为准，推进一个可验证里程碑，并在结束时给出证据与下一步。`,
+                content: buildGoalContinuationPrompt({
+                  language: callbacks.getPreferredLanguage(),
+                  goalId: iterInput.goalTurnContract.goalId,
+                  continuationIndex: iterInput.iteration,
+                }),
               },
             ];
+            // Keep a separate append-only ledger for this continuation. The
+            // active context can be replaced by compaction, so an array index
+            // into iterationMessages is not a stable work boundary.
+            let currentContinuationMessages: import("../orchestrator").AgentMessage[] = [];
             const goalInnerIterationLimit = callbacks.getConfig().activeProfile === "local" ? 8 : 12;
             let maxObservedModelIteration = 0;
             let providerUsageReports = 0;
@@ -3082,6 +3095,7 @@ export class WorkflowEngine {
               getMessages: () => iterationMessages,
               appendMessage: (message: import("../orchestrator").AgentMessage) => {
                 iterationMessages = [...iterationMessages, message];
+                currentContinuationMessages = [...currentContinuationMessages, message];
               },
               replaceMessages: (messages: import("../orchestrator").AgentMessage[]) => {
                 iterationMessages = [...messages];
@@ -3110,10 +3124,10 @@ export class WorkflowEngine {
             try {
               outcome = await executeAgentLoop(iterCallbacks, abortCtrl);
             } catch (error) {
-              const assistantResponseCount = iterationMessages.filter((message) => message.role === "assistant").length;
+              const assistantResponseCount = currentContinuationMessages.filter((message) => message.role === "assistant").length;
               const modelIterationsUsed = Math.max(1, maxObservedModelIteration, assistantResponseCount);
               const observedToolIds = new Set<string>();
-              for (const message of iterationMessages) {
+              for (const message of currentContinuationMessages) {
                 if (message.role !== "assistant" || !message.tool_calls) continue;
                 for (const toolCall of message.tool_calls) observedToolIds.add(toolCall.id);
               }
@@ -3134,16 +3148,29 @@ export class WorkflowEngine {
                 estimatedTokens: !hasCompleteProviderUsage,
               };
               const enrichedError = error instanceof Error ? error : new Error(String(error));
-              (enrichedError as Error & { goalIterationUsage?: typeof failureUsage }).goalIterationUsage = failureUsage;
-              callbacks.onDebugEvent?.("goal_inner_slice_threw", {
-                goalSliceId: iterInput.goalSliceId,
-                iteration: iterInput.iteration,
+              const failureContinuation = createGoalContinuationState({
+                messages: [...retainedContinuationMessages, ...currentContinuationMessages],
+                sourceIteration: iterInput.iteration,
+                previous: iterInput.continuation,
+              });
+              const goalError = enrichedError as Error & {
+                goalIterationUsage?: typeof failureUsage;
+                goalContinuationState?: typeof failureContinuation;
+              };
+              goalError.goalIterationUsage = failureUsage;
+              goalError.goalContinuationState = failureContinuation;
+              callbacks.onDebugEvent?.("goal_inner_continuation_threw", {
+                continuationId: iterInput.goalSliceId,
+                continuation: iterInput.iteration,
                 error: enrichedError.message,
                 usage: failureUsage,
+                retainedMessages: failureContinuation.messages.length,
+                retainedOperations: failureContinuation.operationCount,
+                memoryChars: failureContinuation.memoryPacket?.length || 0,
               });
               throw enrichedError;
             }
-            const assistantResponseCount = iterationMessages.filter((message) => message.role === "assistant").length;
+            const assistantResponseCount = currentContinuationMessages.filter((message) => message.role === "assistant").length;
             const modelIterationsUsed = Math.max(maxObservedModelIteration, assistantResponseCount);
             const deferredNonActionableStop = deferredNonActionableStops[0];
             const deferredRecoveryReason = deferredNonActionableStop?.[2]?.recoveryReason;
@@ -3171,7 +3198,7 @@ export class WorkflowEngine {
                }
             }
             
-            for (const msg of iterationMessages) {
+            for (const msg of currentContinuationMessages) {
               if (msg.role === "assistant" && msg.tool_calls) {
                 for (const tc of msg.tool_calls) {
                   let args = {};
@@ -3205,7 +3232,7 @@ export class WorkflowEngine {
             const toolCalls = mergeGoalToolObservations(transcriptToolCalls, runtimeToolCalls);
 
             if (!assistantText.trim()) {
-              assistantText = iterationMessages
+              assistantText = currentContinuationMessages
                 .filter((message) => message.role === "assistant" && typeof message.content === "string")
                 .map((message) => String(message.content || ""))
                 .filter(Boolean)
@@ -3221,10 +3248,15 @@ export class WorkflowEngine {
               ? providerTotalTokens
               : Math.max(providerTotalTokens, estimatedTokens);
             const estimatedTokenUsage = !hasCompleteProviderUsage;
+            const continuation = createGoalContinuationState({
+              messages: [...retainedContinuationMessages, ...currentContinuationMessages],
+              sourceIteration: iterInput.iteration,
+              previous: iterInput.continuation,
+            });
 
-            callbacks.onDebugEvent?.("goal_inner_slice_outcome", {
-              goalSliceId: iterInput.goalSliceId,
-              iteration: iterInput.iteration,
+            callbacks.onDebugEvent?.("goal_inner_continuation_outcome", {
+              continuationId: iterInput.goalSliceId,
+              continuation: iterInput.iteration,
               outcomeStatus: outcome.status,
               stopReason,
               sliceBoundaryReached,
@@ -3237,6 +3269,10 @@ export class WorkflowEngine {
                 providerInputTokens,
                 providerOutputTokens,
               },
+              retainedMessages: continuation.messages.length,
+              retainedOperations: continuation.operationCount,
+              continuationCompacted: continuation.compacted,
+              memoryChars: continuation.memoryPacket?.length || 0,
             });
 
             return {
@@ -3254,6 +3290,7 @@ export class WorkflowEngine {
                 tokensUsed,
                 estimatedTokens: estimatedTokenUsage,
               },
+              continuation,
             };
           },
           writeFile: async (path, content) => {

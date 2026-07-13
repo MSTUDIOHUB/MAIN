@@ -43,6 +43,7 @@ export function isSyntheticRecoveryUserText(text: string): boolean {
     /^(?:在新的恢复上下文中继续计划执行|Continue plan execution in a fresh recovery context)/i.test(value) ||
     /^(?:Resume execution from the remaining tasks in the approved plan|从已批准计划的剩余任务继续执行)/i.test(value) ||
     /^(?:Resume the active goal\s+[^\s]+\s+from its latest checkpoint|从最近检查点继续执行当前目标\s+[^\s]+)[。.]?$/i.test(value) ||
+    /^\[goal_continuation\b/i.test(value) ||
     /^(?:执行有界目标切片\s*\d+\/\d+|Execute bounded goal slice\s*\d+\/\d+)/i.test(value) ||
     /^(?:这是 Goal Runtime 分配的一次有界执行切片|This is one bounded execution slice assigned by Goal Runtime)/i.test(value)
   );

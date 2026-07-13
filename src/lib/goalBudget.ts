@@ -1,17 +1,19 @@
 // lib/goalBudget.ts
 // Budget management and safety controls for Goal Mode.
-// Enforces iteration limits, duration caps, and no-progress detection.
+// Enforces resource limits, an internal emergency continuation guard, and
+// no-progress detection. Continuation count is never a task-size estimate.
 // ────────────────────────────────────────────────────────────────────
 
 import type { GoalDefinition, GoalIteration, GoalProgress } from "./goalState";
+import { DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT } from "./goalState";
 import { isGoalEvidenceMeaningfulProgress } from "./goalToolCapabilities";
 
 export interface GoalBudget {
-  /** Maximum total iterations across all rounds (hard cap: 500) */
+  /** Internal emergency continuation limit (hard cap: 500; not task progress). */
   maxIterations: number;
   /** Optional total token budget */
   maxTokens?: number;
-  /** Maximum total tool calls across all slices. */
+  /** Maximum total tool calls across all internal continuations. */
   maxToolCalls: number;
   /** Maximum active execution duration in ms (default: 4 hours; pauses excluded) */
   maxDurationMs: number;
@@ -24,11 +26,11 @@ export interface GoalBudget {
 }
 
 export const DEFAULT_GOAL_BUDGET: GoalBudget = {
-  maxIterations: 200,
+  maxIterations: DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
   maxToolCalls: 2_000,
   maxDurationMs: 4 * 60 * 60 * 1000,  // 4 hours
   checkpointInterval: 5,
-  userConfirmInterval: 50,
+  userConfirmInterval: 0,
   maxNoProgressIterations: 3,
 };
 
@@ -103,7 +105,7 @@ export function checkGoalBudget(input: {
     return {
       ok: false,
       reason: "iteration_limit",
-      message: `Goal reached iteration limit: ${progress.totalIterationsUsed}/${budget.maxIterations}`,
+      message: `Goal reached internal continuation safety limit: ${progress.totalIterationsUsed}/${budget.maxIterations}`,
     };
   }
 
@@ -172,7 +174,7 @@ export function checkGoalBudget(input: {
     return {
       ok: false,
       reason: "user_confirm_needed",
-      message: `Periodic user confirmation checkpoint at iteration ${progress.totalIterationsUsed}`,
+      message: `Periodic user confirmation checkpoint after ${progress.totalIterationsUsed} internal continuations`,
     };
   }
 
@@ -201,12 +203,11 @@ export function buildGoalBudgetSummary(input: {
   const elapsed = progress.usage
     ? progress.usage.activeDurationMs + (progress.usage.activeStartedAt ? Math.max(0, Date.now() - progress.usage.activeStartedAt) : 0)
     : Date.now() - goal.createdAt;
-  const iterLabel = `${progress.totalIterationsUsed}/${budget.maxIterations}`;
   const timeLabel = `${formatDuration(elapsed)} / ${formatDuration(budget.maxDurationMs)}`;
 
   if (language === "zh") {
     return [
-      `迭代进度：${iterLabel}`,
+      `内部连续执行：${progress.totalIterationsUsed}`,
       `运行时间：${timeLabel}`,
       budget.maxTokens ? `Token 用量：${progress.totalTokensUsed}/${budget.maxTokens}` : "",
       `工具调用：${progress.usage?.toolCalls || 0}/${budget.maxToolCalls}`,
@@ -218,7 +219,7 @@ export function buildGoalBudgetSummary(input: {
   }
 
   return [
-    `Iterations: ${iterLabel}`,
+    `Internal continuations: ${progress.totalIterationsUsed}`,
     `Duration: ${timeLabel}`,
     budget.maxTokens ? `Tokens: ${progress.totalTokensUsed}/${budget.maxTokens}` : "",
     `Tool calls: ${progress.usage?.toolCalls || 0}/${budget.maxToolCalls}`,
@@ -240,8 +241,8 @@ export function buildGoalBudgetExceededNotice(input: {
 
   const reasonLabels: Record<GoalBudgetExceededReason, { zh: string; en: string }> = {
     iteration_limit: {
-      zh: `目标已达到迭代上限（${progress.totalIterationsUsed}/${budget.maxIterations}）`,
-      en: `Goal reached iteration limit (${progress.totalIterationsUsed}/${budget.maxIterations})`,
+      zh: `目标已达到内部连续执行安全上限（${progress.totalIterationsUsed}）`,
+      en: `Goal reached its internal continuation safety limit (${progress.totalIterationsUsed})`,
     },
     token_limit: {
       zh: `目标已达到 Token 预算上限`,

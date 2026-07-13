@@ -1,8 +1,8 @@
 // lib/goalContextStrategy.ts
 // Context management strategy for Goal Mode.
-// Between iterations, compresses the context window aggressively
-// while preserving goal definition and recent evidence.
-// Inspired by Codex CLI's "fresh context per iteration" approach.
+// Keeps one logical Goal conversation across internal continuation boundaries.
+// Older context is compacted only when needed, while exact recent messages,
+// checkpoints, and structured tool evidence remain available.
 // ────────────────────────────────────────────────────────────────────
 
 import {
@@ -31,14 +31,15 @@ export interface GoalIterationContextInput {
   language: "zh" | "en";
   /** Additional user-provided guidance (optional) */
   userGuidance?: string;
-  /** Existing structured evidence from earlier slices. */
+  /** Existing structured evidence from earlier internal continuations. */
   evidence?: GoalEvidenceEntry[];
+  /** Durable memory produced from the retained Goal conversation. */
+  continuationMemory?: string;
 }
 
 /**
- * Build the initial system-level context for a new goal iteration.
- * This replaces the full message history with a compressed summary,
- * following the Ralph Loop pattern of "fresh context per iteration".
+ * Build the system-level contract for the next internal continuation.
+ * The actual recent conversation is retained separately by Goal Runtime.
  */
 export function buildGoalIterationSystemContext(input: GoalIterationContextInput): string {
   const { goal, checkpoint, latestVerification, nextIteration, language, userGuidance } = input;
@@ -48,14 +49,14 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
   // ── Section 1: Goal & Phase Identity ──
   sections.push(isZh
     ? [
-        `## 目标模式 — 迭代 ${nextIteration}/${goal.iterationBudget}`,
+        `## 持续目标 — 连续执行 ${nextIteration}`,
         "",
         `**目标**: ${goal.objective}`,
         `**修订**: ${goal.revision || 1}`,
         "",
       ].join("\n")
     : [
-        `## Goal Mode — Iteration ${nextIteration}/${goal.iterationBudget}`,
+        `## Persistent Goal — Continuation ${nextIteration}`,
         "",
         `**Objective**: ${goal.objective}`,
         `**Revision**: ${goal.revision || 1}`,
@@ -68,6 +69,15 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
       isZh ? "## 有界来源上下文" : "## Bounded Source Context",
       "",
       goal.sourceContext,
+      "",
+    ].join("\n"));
+  }
+
+  if (input.continuationMemory) {
+    sections.push([
+      isZh ? "## 连续执行记忆" : "## Continuation Memory",
+      "",
+      input.continuationMemory,
       "",
     ].join("\n"));
   }
@@ -147,9 +157,9 @@ function buildIterationInstructions(
 
   if (isZh) {
     const lines: string[] = [
-      "## 本轮迭代指令",
+      "## 当前连续执行指令",
       "",
-      "这是 Goal Runtime 分配的一次有界执行切片。遵循 Plan → Execute → Observe 循环：",
+      "这是同一个持续目标在内部安全边界后的连续执行。沿用已有上下文，遵循 Plan → Execute → Observe 循环：",
       "",
       "1. **Plan**: 分析当前状态，从剩余任务中选择一个最小可行任务。",
       "2. **Execute**: 使用工具实现该任务（编辑文件、运行命令等）。",
@@ -165,7 +175,8 @@ function buildIterationInstructions(
 
     lines.push(
       "**约束**:",
-      "- 本切片只推进一个明确、可验证的里程碑；不要在模型内部自行开启无限循环",
+      "- 继续推进一个明确、可验证的里程碑；不要重新开始任务，也不要在模型内部自行开启无限循环",
+      "- 复用已有读取、工具结果和文件状态；只有工作区证据变化或确有缺口时才重复操作",
       "- 每次修改文件后必须运行验证命令",
       "- 遇到阻塞时记录具体阻塞原因并尝试替代方案",
       "- 不要修改 `.MAIN/goals/` 中的运行时状态文件；Goal Runtime 会根据真实工具结果保存进度、检查点和证据",
@@ -178,9 +189,9 @@ function buildIterationInstructions(
   }
 
   const lines: string[] = [
-    "## Iteration Instructions",
+    "## Current Continuation Instructions",
     "",
-    "This is one bounded execution slice assigned by Goal Runtime. Follow the Plan → Execute → Observe cycle:",
+    "This continues the same persistent goal after an internal safety boundary. Reuse the retained context and follow the Plan → Execute → Observe cycle:",
     "",
     "1. **Plan**: Analyze current state, pick one small verifiable task from remaining work.",
     "2. **Execute**: Use tools to implement it (edit files, run commands, etc.).",
@@ -196,7 +207,8 @@ function buildIterationInstructions(
 
   lines.push(
     "**Constraints**:",
-    "- Advance one clear, verifiable milestone in this slice. Do not start an unbounded model-side loop.",
+    "- Continue one clear, verifiable milestone. Do not restart the task or start an unbounded model-side loop.",
+    "- Reuse existing reads, tool results, and file state. Repeat an operation only when workspace evidence changed or a real gap remains.",
     "- Run verification commands after every file change.",
     "- When blocked, record the specific blocker and try an alternative approach.",
     "- Do not modify runtime state files under `.MAIN/goals/`; Goal Runtime persists progress, checkpoints, and evidence from real tool results.",
