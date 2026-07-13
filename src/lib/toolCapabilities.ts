@@ -151,7 +151,6 @@ const READ_ONLY_BUILT_INS = new Set([
   "read_pty_tail",
   "read_pty_since",
   "get_pty_status",
-  "clear_pty_buffer",
   "get_project_skeleton",
   "get_file_outline",
 ]);

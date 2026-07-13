@@ -24,7 +24,6 @@ import {
   readPtySince,
   browserEvaluate,
   codeAstQuery,
-  clearPtyBuffer,
   getPtyStatus,
   findSymbolReferences,
   runCommand,
@@ -54,6 +53,10 @@ import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } fro
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 import { sanitizePtyOutput } from "./ptyOutputSanitizer";
+import {
+  buildUnconfirmedPtyCommandError,
+  resolvePtyCommandAdmission,
+} from "./ptyCommandRuntime";
 import { runGitDiffTool, runGitStatusTool } from "./gitTools";
 
 function sleep(ms: number): Promise<void> {
@@ -136,8 +139,24 @@ const WORKSPACE_REQUIRED_TOOL_NAMES = new Set([
   "read_pty_tail",
   "read_pty_since",
   "get_pty_status",
-  "clear_pty_buffer",
 ]);
+
+function isMissingPtySessionError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error || "");
+  return /PTY.*(?:尚未启动|not started|not active)/i.test(message);
+}
+
+async function ensurePtySession(
+  sessionKey: string | undefined,
+  workspace: string,
+) {
+  let status = await getPtyStatus(sessionKey).catch(() => null);
+  if (!status?.active || !status.running) {
+    await spawnPty(140, 40, sessionKey, workspace);
+    status = await getPtyStatus(sessionKey);
+  }
+  return status;
+}
 
 function isAbsoluteLocalPath(value: string): boolean {
   return value.startsWith("/") || /^[A-Za-z]:[\\/]/.test(value);
@@ -475,13 +494,17 @@ export async function executeTool(
       if (!command) throw new Error("Missing required parameter 'command'.");
       const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 4000, 0), 30_000);
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
-      let beforeOffset = 0;
+      let initialStatus = await ensurePtySession(sessionKey, workspace);
+      const admission = resolvePtyCommandAdmission(initialStatus);
+      if (!admission.allowed) throw new Error(admission.reason);
+      let beforeOffset = initialStatus.bufferEndOffset;
       try {
-        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
         await writePty(command + "\n", sessionKey, options.shellPermissionApproval);
-      } catch {
+      } catch (error) {
+        if (!isMissingPtySessionError(error)) throw error;
         await spawnPty(140, 40, sessionKey, workspace);
-        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
+        initialStatus = await getPtyStatus(sessionKey);
+        beforeOffset = initialStatus.bufferEndOffset;
         await writePty(command + "\n", sessionKey, options.shellPermissionApproval);
       }
       await sleep(waitMs);
@@ -492,8 +515,8 @@ export async function executeTool(
       const maxExtends = 2;
       const extendMs = 2000;
       let extendCount = 0;
+      let statusAfter = await getPtyStatus(sessionKey);
       while (extendCount < maxExtends) {
-        const statusAfter = await getPtyStatus(sessionKey);
         if (statusAfter.bufferEndOffset <= output.endOffset) break;
         await sleep(extendMs);
         const extendedOutput = await readPtySince(output.endOffset, maxChars, sessionKey);
@@ -507,14 +530,22 @@ export async function executeTool(
           bufferEndOffset: extendedOutput.bufferEndOffset,
         };
         extendCount++;
+        statusAfter = await getPtyStatus(sessionKey);
       }
+
+      const sanitizedOutput = sanitizePtyOutput(output.text);
+      const unconfirmedError = buildUnconfirmedPtyCommandError(command, sanitizedOutput);
+      if (unconfirmedError) throw new Error(unconfirmedError);
 
       return JSON.stringify({
         command,
-        output: sanitizePtyOutput(output.text),
+        output: sanitizedOutput,
         startOffset: output.startOffset,
         endOffset: output.endOffset,
         truncated: output.truncated,
+        foregroundPid: statusAfter.foregroundPid ?? null,
+        shellAvailable: statusAfter.shellAvailable ?? null,
+        commandAccepted: true,
         note: "If the process is still running or output is incomplete, call read_pty_since with endOffset or read_pty_tail.",
       });
     }
@@ -537,9 +568,6 @@ export async function executeTool(
       await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));
       return await getPtyStatus(sessionKey);
 
-    case "clear_pty_buffer":
-      return await clearPtyBuffer(sessionKey);
-
     case "send_pty_input": {
       const input = (args.input as string) || "";
       if (!input) throw new Error("Missing required parameter 'input'.");
@@ -548,12 +576,25 @@ export async function executeTool(
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
       let beforeOffset = 0;
       try {
-        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
-        await writePty(input + (appendNewline ? "\n" : ""), sessionKey, options.shellPermissionApproval);
-      } catch {
+        beforeOffset = (await ensurePtySession(sessionKey, workspace)).bufferEndOffset;
+        await writePty(
+          input + (appendNewline ? "\n" : ""),
+          sessionKey,
+          options.shellPermissionApproval,
+          false,
+          true,
+        );
+      } catch (error) {
+        if (!isMissingPtySessionError(error)) throw error;
         await spawnPty(140, 40, sessionKey, workspace);
         beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
-        await writePty(input + (appendNewline ? "\n" : ""), sessionKey, options.shellPermissionApproval);
+        await writePty(
+          input + (appendNewline ? "\n" : ""),
+          sessionKey,
+          options.shellPermissionApproval,
+          false,
+          true,
+        );
       }
       await sleep(waitMs);
       const output = await readPtySince(beforeOffset, maxChars, sessionKey);

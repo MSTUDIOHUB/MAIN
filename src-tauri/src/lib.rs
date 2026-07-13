@@ -301,6 +301,8 @@ struct PtyStatus {
     active: bool,
     running: bool,
     pid: Option<u32>,
+    foreground_pid: Option<u32>,
+    shell_available: bool,
     exit_code: Option<i32>,
     buffer_start_offset: u64,
     buffer_end_offset: u64,
@@ -1748,6 +1750,28 @@ fn apply_login_shell_args(cmd: &mut CommandBuilder, shell: &str) {
 
 #[cfg(target_os = "windows")]
 fn apply_login_shell_args(_cmd: &mut CommandBuilder, _shell: &str) {}
+
+#[cfg(unix)]
+fn pty_foreground_process_id(master: &(dyn portable_pty::MasterPty + Send)) -> Option<u32> {
+    master
+        .process_group_leader()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+#[cfg(not(unix))]
+fn pty_foreground_process_id(_master: &(dyn portable_pty::MasterPty + Send)) -> Option<u32> {
+    None
+}
+
+fn pty_shell_available(running: bool, shell_pid: Option<u32>, foreground_pid: Option<u32>) -> bool {
+    if !running {
+        return false;
+    }
+    match (shell_pid, foreground_pid) {
+        (Some(shell_pid), Some(foreground_pid)) => shell_pid == foreground_pid,
+        _ => true,
+    }
+}
 
 #[cfg(not(target_os = "windows"))]
 fn configure_login_env_probe(command: &mut ProcessCommand, shell: &str) {
@@ -4744,6 +4768,7 @@ fn write_pty(
     session_key: Option<String>,
     permission_approval: Option<harness::permissions::ShellPermissionApproval>,
     user_terminal: Option<bool>,
+    allow_foreground_input: Option<bool>,
 ) -> Result<(), String> {
     let mut guard = state
         .sessions
@@ -4753,6 +4778,22 @@ fn write_pty(
     let session = guard
         .get_mut(&key)
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
+    let shell_pid = session.child.process_id();
+    let foreground_pid = pty_foreground_process_id(session.master.as_ref());
+    if user_terminal != Some(true)
+        && allow_foreground_input != Some(true)
+        && !pty_shell_available(true, shell_pid, foreground_pid)
+    {
+        return Err(format!(
+            "PTY_BUSY: integrated terminal shell pid={} is occupied by foreground process group pid={}. Do not resend a shell command; inspect the existing process or use send_pty_input for intentional foreground input.",
+            shell_pid
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            foreground_pid
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+        ));
+    }
     if user_terminal != Some(true) {
         validate_pty_input(
             &session.workspace,
@@ -4890,6 +4931,8 @@ fn get_pty_status(
             active: false,
             running: false,
             pid: None,
+            foreground_pid: None,
+            shell_available: false,
             exit_code: None,
             buffer_start_offset: 0,
             buffer_end_offset: 0,
@@ -4905,6 +4948,8 @@ fn get_pty_status(
     let running = status.is_none();
     let exit_code = status.map(|s| s.exit_code() as i32);
     let pid = session.child.process_id();
+    let foreground_pid = pty_foreground_process_id(session.master.as_ref());
+    let shell_available = pty_shell_available(running, pid, foreground_pid);
     let buffer = session
         .buffer
         .lock()
@@ -4915,6 +4960,8 @@ fn get_pty_status(
         active: true,
         running,
         pid,
+        foreground_pid,
+        shell_available,
         exit_code,
         buffer_start_offset: buffer.start_offset,
         buffer_end_offset: buffer.end_offset(),
@@ -10509,7 +10556,7 @@ mod tests {
         browser_evaluate_supervisor_timeout, compare_file_nodes, delete_plan_files_in_dir,
         is_supported_attachment_path, is_valid_git_branch_name, looks_long_running_shell_command,
         merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
-        parse_git_porcelain_entries, parse_git_porcelain_status,
+        parse_git_porcelain_entries, parse_git_porcelain_status, pty_shell_available,
         read_session_transcript_with_fallback, resolve_existing_path,
         resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
         should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
@@ -10576,6 +10623,14 @@ mod tests {
 
         validate_pty_input(&workspace, &mut pending, "\r", None).unwrap();
         assert_eq!(pending, "");
+    }
+
+    #[test]
+    fn pty_shell_availability_tracks_foreground_process_group_ownership() {
+        assert!(pty_shell_available(true, Some(100), Some(100)));
+        assert!(!pty_shell_available(true, Some(100), Some(200)));
+        assert!(!pty_shell_available(false, Some(100), Some(100)));
+        assert!(pty_shell_available(true, Some(100), None));
     }
 
     #[test]

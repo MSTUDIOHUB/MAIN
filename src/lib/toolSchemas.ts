@@ -515,7 +515,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "execute_command",
-      description: "在集成 PTY 终端发送一条命令并短暂等待输出。适合启动开发服务器、交互式进程或需要保留终端上下文的命令；执行后应继续用 read_pty_since / read_pty_tail / get_pty_status 检查日志。",
+      description: "在集成 PTY shell 空闲时发送一条命令并短暂等待输出。适合启动开发服务器、交互式进程或需要保留终端上下文的命令；前台进程仍运行时会返回 PTY_BUSY，此时不得重发 shell 命令，应读取现有日志或用 send_pty_input 进行有意的交互。",
       parameters: {
         type: "object",
         properties: {
@@ -636,24 +636,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "get_pty_status",
-      description: "可选等待后检查集成 PTY 是否已启动、shell 是否仍在运行、当前捕获缓冲区 offset/字节数，以及最近少量输出。",
+      description: "可选等待后检查集成 PTY 是否已启动、shell 是否可接受新命令、当前前台进程组、捕获缓冲区 offset/字节数，以及最近少量输出。shellAvailable=false 表示已有长驻或交互进程占用终端。",
       parameters: {
         type: "object",
         properties: {
           wait_ms: { type: "number", description: "检查前等待多少毫秒，默认 0，最大 30000" },
         },
-        required: [],
-      },
-    },
-  },
-  {
-    type: "function",
-    function: {
-      name: "clear_pty_buffer",
-      description: "清空 AI 侧捕获的 PTY 输出缓冲区并重置读取起点。适合在启动长日志任务前标记干净起点；不会关闭终端进程。",
-      parameters: {
-        type: "object",
-        properties: {},
         required: [],
       },
     },

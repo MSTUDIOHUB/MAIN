@@ -508,6 +508,8 @@ export interface PtyStatus {
   active: boolean;
   running: boolean;
   pid?: number | null;
+  foregroundPid?: number | null;
+  shellAvailable?: boolean;
   exitCode?: number | null;
   bufferStartOffset: number;
   bufferEndOffset: number;
@@ -1227,8 +1229,15 @@ export function writePty(
   sessionKey?: string,
   permissionApproval?: ShellPermissionApproval,
   userTerminal?: boolean,
+  allowForegroundInput?: boolean,
 ): Promise<void> {
-  return invoke<void>("write_pty", { input, sessionKey, permissionApproval, userTerminal });
+  return invoke<void>("write_pty", {
+    input,
+    sessionKey,
+    permissionApproval,
+    userTerminal,
+    allowForegroundInput,
+  });
 }
 
 export function readPtyBuffer(maxChars?: number, sessionKey?: string): Promise<string> {

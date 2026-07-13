@@ -214,7 +214,6 @@ const TOOL_REQUIRED_ARGUMENTS: Record<string, string> = {
   read_pty_tail: "max_chars?, wait_ms?",
   read_pty_since: "offset, max_chars?, wait_ms?",
   get_pty_status: "wait_ms?",
-  clear_pty_buffer: "",
 };
 
 function compactToolSignature(name: string): string {
@@ -421,7 +420,6 @@ const READ_ONLY_BUILT_IN_TOOL_NAMES = [
   "read_pty_tail",
   "read_pty_since",
   "get_pty_status",
-  "clear_pty_buffer",
 ];
 
 const WORKFLOW_BUILT_IN_TOOL_NAMES = [
@@ -1106,7 +1104,6 @@ export function buildSystemPrompt(
     addToolDescription("read_pty_tail", "- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。命令还在跑且需要观察时，传 `wait_ms` 先等一小段时间再读。");
     addToolDescription("read_pty_since", "- read_pty_since: 按 offset 读取新增终端输出，适合检查某次命令之后发生了什么。命令还在跑且输出未完整时，传 `wait_ms` 等待后再观察，不要用 shell sleep 来等待。");
     addToolDescription("get_pty_status", "- get_pty_status: 检查 PTY 是否运行、当前 buffer offset、最近输出；可传 `wait_ms` 在检查前等待。");
-    addToolDescription("clear_pty_buffer", "- clear_pty_buffer: 清空 AI 侧 PTY 捕获缓冲，适合在启动长日志任务前建立干净读取起点。");
     if (shellToolsAvailable) {
       tfl.push("Shell 恢复规则：权限错误会说明来自内置默认策略还是项目策略；不要尝试读取不存在的 `.MAIN/permissions.yaml`。脚手架命令如果报 `not a terminal` / `non-interactive`，不要循环重试，改用非交互参数或按计划用文件工具手动创建结构。");
     }

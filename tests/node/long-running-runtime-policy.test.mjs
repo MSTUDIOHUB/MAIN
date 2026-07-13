@@ -36,6 +36,7 @@ function loadTs(sourcePath) {
 const devServerRuntime = loadTs(path.join(workspaceRoot, "src/lib/devServerRuntime.ts"));
 const cachePolicy = loadTs(path.join(workspaceRoot, "src/lib/readOnlyToolCachePolicy.ts"));
 const sanitizer = loadTs(path.join(workspaceRoot, "src/lib/ptyOutputSanitizer.ts"));
+const ptyCommandRuntime = loadTs(path.join(workspaceRoot, "src/lib/ptyCommandRuntime.ts"));
 const recoveryTools = loadTs(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
 const planEvidence = loadTs(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
 
@@ -155,6 +156,52 @@ test("PTY sanitizer preserves warnings cleared by carriage-return and strips ter
   assert.match(clean, /Error: timeout/);
   assert.doesNotMatch(clean, /\u001b|\u0007/);
   assert.doesNotMatch(clean, /\n{4,}/);
+});
+
+test("PTY command admission rejects shell commands while a foreground process owns the terminal", () => {
+  const busy = ptyCommandRuntime.resolvePtyCommandAdmission({
+    active: true,
+    running: true,
+    pid: 100,
+    foregroundPid: 200,
+    shellAvailable: false,
+  });
+  assert.equal(busy.allowed, false);
+  assert.match(busy.reason, /PTY_BUSY/);
+  assert.match(busy.reason, /foreground process group pid=200/);
+
+  const idle = ptyCommandRuntime.resolvePtyCommandAdmission({
+    active: true,
+    running: true,
+    pid: 100,
+    foregroundPid: 100,
+    shellAvailable: true,
+  });
+  assert.deepEqual(idle, { allowed: true });
+});
+
+test("PTY command output does not treat terminal echo as successful shell execution", () => {
+  assert.match(
+    ptyCommandRuntime.buildUnconfirmedPtyCommandError("npm run dev", "npm run dev\nnpm run dev"),
+    /PTY_COMMAND_ECHO_ONLY/,
+  );
+  assert.match(
+    ptyCommandRuntime.buildUnconfirmedPtyCommandError("npm run dev", ""),
+    /PTY_COMMAND_UNCONFIRMED/,
+  );
+  assert.equal(
+    ptyCommandRuntime.buildUnconfirmedPtyCommandError(
+      "npm run dev",
+      "npm run dev\nVITE v5.4.21 ready in 812 ms\nLocal: http://localhost:1420/",
+    ),
+    null,
+  );
+});
+
+test("agent tool surface no longer exposes destructive PTY buffer clearing", () => {
+  const toolSchemas = loadTs(path.join(workspaceRoot, "src/lib/toolSchemas.ts"));
+  const names = toolSchemas.TOOL_DEFINITIONS.map((tool) => tool.function.name);
+  assert.equal(names.includes("clear_pty_buffer"), false);
 });
 
 test("process evidence entries retain ordering instead of deduplicating retries", () => {

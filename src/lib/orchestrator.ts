@@ -4368,6 +4368,18 @@ async function executeToolCallWithLifecycle(
     // Instead of throwing, we return the error as a tool result.
     // The AI sees the error and can self-correct (e.g., try a different path).
     const errorMsg = (err as Error).message || String(err);
+    if (
+      (tc.name === "execute_command" || tc.name === "send_pty_input") &&
+      /^PTY_[A-Z_]+:/.test(errorMsg)
+    ) {
+      logAgentEvent("pty_command_runtime_error", {
+        tool: tc.name,
+        target,
+        code: errorMsg.split(":", 1)[0],
+        message: errorMsg.slice(0, 1_000),
+        sessionKey,
+      });
+    }
     if (isOptionalTasksMdRead(tc.name, target) && isMissingOptionalTasksMdReadError(errorMsg)) {
       const optionalMessage = buildOptionalTasksMdMissingResult(callbacks.getPreferredLanguage(), target);
       callbacks.onToolDone(tc.name, target, optionalMessage, { toolCallId: tc.id });
