@@ -3,6 +3,7 @@ import {
   describeApprovedPlanSourceEditFirstToolSurface,
   shouldAllowApprovedPlanRecoveryFileRead,
 } from "../../approvedPlanRecoveryTools";
+import { resolveDevServerRuntimeObservation } from "../../devServerRuntime";
 import {
   describeExecuteRecoveryToolSurface,
   isExecuteRecoveryToolName,
@@ -140,6 +141,12 @@ export function resolveIterationToolSurface(input: {
     !approvedPlanActionOnlyRecoveryActive;
   const allowApprovedPlanRecoveryFileRead =
     approvedPlanSourceEditFileReadAllowed || approvedPlanPatchRecoveryFileReadAllowed;
+  const devServerRuntimeObservation = resolveDevServerRuntimeObservation(
+    callbacks.getPlanExecutionEvidenceLedger(),
+  );
+  const preservePtyLifecycle =
+    devServerRuntimeObservation.status === "pending" ||
+    devServerRuntimeObservation.status === "running";
 
   if (executeRecoveryMode !== "normal" || approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive) {
     logAgentEvent("recovery_loop_summary", {
@@ -173,15 +180,21 @@ export function resolveIterationToolSurface(input: {
       : approvedPlanSourceEditFirstActive
       ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
           allowFileRead: allowApprovedPlanRecoveryFileRead,
+          preservePtyLifecycle,
         }))
       : recoveryIterationAllTools;
   if (approvedPlanSourceEditFirstActive && baseIterationAllTools.length !== recoveryIterationAllTools.length) {
     logAgentEvent("approved_plan_source_edit_first_tool_scope_applied", {
       iteration,
       allowFileRead: allowApprovedPlanRecoveryFileRead,
+      preservePtyLifecycle,
+      devServerRuntimeStatus: devServerRuntimeObservation.status,
       initialSourceReadAllowed: approvedPlanInitialSourceReadAllowed,
       sourceEditFileReadAllowed: approvedPlanSourceEditFileReadAllowed,
-      recoveryToolSurface: describeApprovedPlanSourceEditFirstToolSurface(allowApprovedPlanRecoveryFileRead),
+      recoveryToolSurface: describeApprovedPlanSourceEditFirstToolSurface(
+        allowApprovedPlanRecoveryFileRead,
+        preservePtyLifecycle,
+      ),
       rawTools: recoveryIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
       scopedTools: baseIterationAllTools.map((tool) => tool.function.name),
       removedToolCount: Math.max(0, recoveryIterationAllTools.length - baseIterationAllTools.length),
@@ -245,7 +258,10 @@ export function resolveIterationToolSurface(input: {
       recoveryToolSurface: approvedPlanActionRecoveryActive || approvedPlanNoToolRecoveryFileReadActive
         ? describeApprovedPlanRecoveryToolSurface(approvedPlanPatchRecoveryFileReadAllowed)
         : approvedPlanSourceEditFirstActive
-        ? describeApprovedPlanSourceEditFirstToolSurface(allowApprovedPlanRecoveryFileRead)
+        ? describeApprovedPlanSourceEditFirstToolSurface(
+            allowApprovedPlanRecoveryFileRead,
+            preservePtyLifecycle,
+          )
         : describeExecuteRecoveryToolSurface(executeRecoveryMode, effectiveExecuteRecoveryFileRead),
       rawToolCount: rawToolNames.length,
       scopedToolCount: scopedToolNames.length,

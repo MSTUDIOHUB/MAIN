@@ -32,6 +32,15 @@ export const APPROVED_PLAN_SOURCE_EDIT_TOOLS = new Set([
   "write_file",
 ]);
 
+export const APPROVED_PLAN_PTY_LIFECYCLE_TOOLS = new Set([
+  "send_pty_input",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+]);
+
 export const APPROVED_PLAN_ACTION_RECOVERY_TOOLS = new Set([
   ...APPROVED_PLAN_SOURCE_EDIT_TOOLS,
   "run_command",
@@ -146,9 +155,10 @@ export function isApprovedPlanRecoveryToolName(
 
 export function isApprovedPlanSourceEditFirstToolName(
   name: string,
-  options: { allowFileRead?: boolean } = {},
+  options: { allowFileRead?: boolean; preservePtyLifecycle?: boolean } = {},
 ): boolean {
   if (APPROVED_PLAN_SOURCE_EDIT_TOOLS.has(name)) return true;
+  if (options.preservePtyLifecycle && APPROVED_PLAN_PTY_LIFECYCLE_TOOLS.has(name)) return true;
   return Boolean(options.allowFileRead && APPROVED_PLAN_PATCH_RECOVERY_READ_TOOLS.has(name));
 }
 
@@ -156,6 +166,10 @@ export function describeApprovedPlanRecoveryToolSurface(allowFileRead: boolean):
   return allowFileRead ? "action_plus_patch_file_read" : "action_only";
 }
 
-export function describeApprovedPlanSourceEditFirstToolSurface(allowFileRead: boolean): string {
-  return allowFileRead ? "source_edit_plus_patch_file_read" : "source_edit_only";
+export function describeApprovedPlanSourceEditFirstToolSurface(
+  allowFileRead: boolean,
+  preservePtyLifecycle = false,
+): string {
+  const base = allowFileRead ? "source_edit_plus_patch_file_read" : "source_edit_only";
+  return preservePtyLifecycle ? `${base}_plus_pty_lifecycle` : base;
 }

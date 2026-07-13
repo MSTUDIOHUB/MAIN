@@ -1719,14 +1719,22 @@ test("approved plan source edit first surface blocks validation before first wri
   assert.equal(isApprovedPlanSourceEditFirstToolName("write_file"), true);
   assert.equal(isApprovedPlanSourceEditFirstToolName("run_command"), false);
   assert.equal(isApprovedPlanSourceEditFirstToolName("browser_evaluate"), false);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("get_pty_status"), false);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("get_pty_status", { preservePtyLifecycle: true }), true);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("read_pty_since", { preservePtyLifecycle: true }), true);
   assert.equal(isApprovedPlanSourceEditFirstToolName("read_file"), false);
   assert.equal(isApprovedPlanSourceEditFirstToolName("read_file", { allowFileRead: true }), true);
   assert.equal(describeApprovedPlanSourceEditFirstToolSurface(false), "source_edit_only");
   assert.equal(describeApprovedPlanSourceEditFirstToolSurface(true), "source_edit_plus_patch_file_read");
+  assert.equal(
+    describeApprovedPlanSourceEditFirstToolSurface(true, true),
+    "source_edit_plus_patch_file_read_plus_pty_lifecycle",
+  );
 
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
   const iterationStreamPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"), "utf8");
   const toolCallPlanningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"), "utf8");
+  const toolCallPartitioningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"), "utf8");
   assert.match(orchestratorSource, /prepareIterationStreamRequest\(\{/);
   assert.match(iterationStreamPreparationSource, /resolveIterationToolSurface\(\{/);
   assert.match(toolCallPlanningSource, /approvedPlanNeedsSourceEditBeforeValidation/);
@@ -1735,9 +1743,14 @@ test("approved plan source edit first surface blocks validation before first wri
   assert.match(toolCallPlanningSource, /recentPlanToolActivity\.length === 0/);
   assert.match(toolCallPlanningSource, /initialSourceReadAllowed:\s*approvedPlanInitialSourceReadAllowed/);
   assert.match(toolCallPlanningSource, /approvedPlanSourceEditFileReadAllowed/);
+  assert.match(toolCallPlanningSource, /preservePtyLifecycle/);
   assert.match(toolCallPlanningSource, /!approvedPlanActionOnlyRecoveryActive/);
   assert.match(toolCallPlanningSource, /approvedPlanActionRecoveryActive[\s\S]*?isApprovedPlanRecoveryTool/);
   assert.match(toolCallPlanningSource, /readFileExposed:\s*scopedToolNameSet\.has\("read_file"\)/);
+
+  const unavailableCheckIndex = toolCallPartitioningSource.indexOf("!availableToolNames.has(tc.name)");
+  const browserPreflightIndex = toolCallPartitioningSource.indexOf("resolveBrowserValidationPreflight({");
+  assert.ok(unavailableCheckIndex >= 0 && browserPreflightIndex > unavailableCheckIndex);
 });
 
 test("browser validation repeats are reused or paused without agent error", () => {

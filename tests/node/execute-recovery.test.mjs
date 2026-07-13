@@ -411,6 +411,65 @@ test("approved plan execution keeps targeted source reads after planning activit
   ]);
 });
 
+test("source edits under hyphenated or nested src roots release the edit-first gate", () => {
+  const input = createApprovedPlanToolSurfaceInput();
+  input.callbacks = {
+    ...input.callbacks,
+    getPlanTasks: () => [{
+      id: "edit-tauri-main",
+      text: "修改 src-tauri/src/main.rs 的后端逻辑",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "file", value: "src-tauri/src/main.rs" }],
+    }],
+    getPlanExecutionEvidenceLedger: () => [{
+      id: "source-write",
+      kind: "file",
+      value: "src-tauri/src/main.rs",
+      target: "src-tauri/src/main.rs",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }],
+  };
+
+  const decision = resolveIterationToolSurface(input);
+
+  assert.equal(decision.approvedPlanSourceEditFirstActive, false);
+  assert.equal(decision.availableToolNames.has("run_command"), true);
+  assert.equal(decision.availableToolNames.has("browser_evaluate"), true);
+  assert.equal(decision.availableToolNames.has("get_pty_status"), true);
+});
+
+test("a pending long-running command keeps PTY lifecycle tools available behind the edit-first gate", () => {
+  const input = createApprovedPlanToolSurfaceInput();
+  input.callbacks = {
+    ...input.callbacks,
+    getPlanExecutionEvidenceLedger: () => [{
+      id: "dev-server-dispatch",
+      kind: "cmd",
+      value: "npm run dev",
+      target: "npm run dev",
+      sourceTool: "execute_command",
+      observationStatus: "pending",
+      createdAt: 1,
+    }],
+  };
+
+  const decision = resolveIterationToolSurface(input);
+
+  assert.equal(decision.approvedPlanSourceEditFirstActive, true);
+  for (const toolName of [
+    "send_pty_input",
+    "read_pty_buffer",
+    "read_pty_tail",
+    "read_pty_since",
+    "get_pty_status",
+  ]) {
+    assert.equal(decision.availableToolNames.has(toolName), true, toolName);
+  }
+  assert.equal(decision.availableToolNames.has("browser_evaluate"), false);
+});
+
 test("approved plan action-only recovery reopens read_file only for its unresolved patch target", () => {
   const actionOnly = resolveIterationToolSurface(createApprovedPlanToolSurfaceInput({
     approvedPlanActionOnlyRecoveryActive: true,

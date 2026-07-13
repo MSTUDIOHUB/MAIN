@@ -184,47 +184,8 @@ export async function partitionToolCallsForExecution(input: {
       });
     }
 
-    if (tc.name === "browser_evaluate" && typeof toolArgs.url === "string") {
-      const browserPreflight = resolveBrowserValidationPreflight({
-        requestedUrl: toolArgs.url,
-        ledger: callbacks.getPlanExecutionEvidenceLedger(),
-      });
-      if (browserPreflight.action === "block") {
-        const requestedUrl = toolArgs.url;
-        const failed = browserPreflight.runtimeStatus === "failed" || browserPreflight.runtimeStatus === "stopped";
-        const message = failed
-          ? `DEV_SERVER_START_FAILED: the latest PTY observation shows that the dev server failed. Repair or restart it, then inspect PTY readiness before browser validation at ${requestedUrl}.`
-          : `DEV_SERVER_NOT_READY: the latest long-running command is still ${browserPreflight.runtimeStatus}. Call read_pty_since/read_pty_tail/get_pty_status and wait for a ready URL before browser validation at ${requestedUrl}.`;
-        callbacks.onToolError(tc.name, requestedUrl, message, { toolCallId: tc.id });
-        logAgentEvent("browser_validation_blocked_until_dev_server_ready", {
-          iteration,
-          requestedUrl,
-          runtimeStatus: browserPreflight.runtimeStatus,
-        });
-        preExecutionResults.push({
-          toolCallId: tc.id,
-          name: tc.name,
-          target: requestedUrl,
-          content: `Error: ${message}`,
-          isError: true,
-          lifecycleState: "blocked",
-        });
-        continue;
-      }
-      if (browserPreflight.action === "correct") {
-        const requestedUrl = toolArgs.url;
-        toolArgs = { ...toolArgs, url: browserPreflight.url };
-        tc.arguments = JSON.stringify(toolArgs);
-        logAgentEvent("browser_validation_url_corrected_from_runtime_evidence", {
-          iteration,
-          requestedUrl,
-          resolvedUrl: browserPreflight.url,
-        });
-      }
-    }
-
     toolArgsByCallId.set(tc.id, toolArgs);
-    const target = getToolTarget(tc.name, toolArgs);
+    let target = getToolTarget(tc.name, toolArgs);
     callbacks.onHarnessRunUpdate?.({
       latestTool: tc.name,
       latestToolTarget: target || null,
@@ -444,6 +405,49 @@ export async function partitionToolCallsForExecution(input: {
         ...(isUnapprovedPlanContext ? { internalFeedback: true, displayContent: "" } : {}),
       });
       continue;
+    }
+
+    if (tc.name === "browser_evaluate" && typeof toolArgs.url === "string") {
+      const browserPreflight = resolveBrowserValidationPreflight({
+        requestedUrl: toolArgs.url,
+        ledger: callbacks.getPlanExecutionEvidenceLedger(),
+      });
+      if (browserPreflight.action === "block") {
+        const requestedUrl = toolArgs.url;
+        const failed = browserPreflight.runtimeStatus === "failed" || browserPreflight.runtimeStatus === "stopped";
+        const message = failed
+          ? `DEV_SERVER_START_FAILED: the latest PTY observation shows that the dev server failed. Repair or restart it, then inspect PTY readiness before browser validation at ${requestedUrl}.`
+          : `DEV_SERVER_NOT_READY: the latest long-running command is still ${browserPreflight.runtimeStatus}. Call read_pty_since/read_pty_tail/get_pty_status and wait for a ready URL before browser validation at ${requestedUrl}.`;
+        callbacks.onToolError(tc.name, requestedUrl, message, { toolCallId: tc.id });
+        logAgentEvent("browser_validation_blocked_until_dev_server_ready", {
+          iteration,
+          requestedUrl,
+          runtimeStatus: browserPreflight.runtimeStatus,
+          ptyObservationToolsAvailable: ["read_pty_since", "read_pty_tail", "get_pty_status"]
+            .filter((name) => availableToolNames.has(name)),
+        });
+        preExecutionResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target: requestedUrl,
+          content: `Error: ${message}`,
+          isError: true,
+          lifecycleState: "blocked",
+        });
+        continue;
+      }
+      if (browserPreflight.action === "correct") {
+        const requestedUrl = toolArgs.url;
+        toolArgs = { ...toolArgs, url: browserPreflight.url };
+        tc.arguments = JSON.stringify(toolArgs);
+        toolArgsByCallId.set(tc.id, toolArgs);
+        target = getToolTarget(tc.name, toolArgs);
+        logAgentEvent("browser_validation_url_corrected_from_runtime_evidence", {
+          iteration,
+          requestedUrl,
+          resolvedUrl: browserPreflight.url,
+        });
+      }
     }
 
     const targetingGate = isPlanStructureExploreTool

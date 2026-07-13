@@ -1736,14 +1736,14 @@ export function isApprovedPlanRecoveryTool(
 
 export function isApprovedPlanSourceEditFirstTool(
   tool: ToolDefinition,
-  options: { allowFileRead?: boolean } = {},
+  options: { allowFileRead?: boolean; preservePtyLifecycle?: boolean } = {},
 ): boolean {
   return isApprovedPlanSourceEditFirstToolName(tool.function.name, options);
 }
 
 function isSourceFileEvidencePath(value: string): boolean {
   const normalized = String(value || "").replace(/\\/g, "/").trim();
-  return /^(?:src|app|lib|components|hooks|store|styles|utils|pages|server|client|packages|apps)\//i.test(normalized) &&
+  return /(?:^|\/)(?:src(?:-[^/]+)?|app|lib|components|hooks|store|styles|utils|pages|server|client|packages|apps)\//i.test(normalized) &&
     /\.(?:tsx?|jsx?|css|scss|json|py|rs|go|swift|vue|svelte)$/i.test(normalized) &&
     !/\.MAIN\/plans\//i.test(normalized);
 }
