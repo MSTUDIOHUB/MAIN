@@ -115,6 +115,29 @@ test("repo_map and apply_patch schemas are exposed for built-in code intelligenc
   assert.match(applyPatch.function.description, /Codex/);
 });
 
+test("Tree-sitter AST and native Git inspection schemas are exposed as bounded read-only tools", () => {
+  const tools = buildToolDefinitions([]);
+  const byName = new Map(tools.map((tool) => [tool.function.name, tool]));
+  const ast = byName.get("code_ast_query");
+  const references = byName.get("find_symbol_references");
+  const gitStatus = byName.get("git_status");
+  const gitDiff = byName.get("git_diff");
+
+  assert.ok(ast);
+  assert.ok(references);
+  assert.ok(gitStatus);
+  assert.ok(gitDiff);
+  assert.deepEqual(ast.function.parameters.required, ["path"]);
+  assert.deepEqual(references.function.parameters.required, ["symbol"]);
+  assert.ok(ast.function.parameters.properties.max_results);
+  assert.ok(references.function.parameters.properties.max_results);
+  assert.ok(gitDiff.function.parameters.properties.max_chars);
+  assert.match(ast.function.description, /Tree-sitter/);
+  assert.match(references.function.description, /语法级/);
+  assert.match(gitStatus.function.description, /原生 Git/);
+  assert.match(gitDiff.function.description, /HEAD/);
+});
+
 test("web search schemas expose free external read tools", () => {
   const tools = buildToolDefinitions([]);
   const webSearch = tools.find((tool) => tool.function.name === "web_search");

@@ -28,6 +28,7 @@ use std::os::raw::c_int;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+pub mod code_ast;
 pub mod critic;
 pub mod eval;
 pub mod executor;
@@ -2373,6 +2374,56 @@ async fn build_repository_index(
         .build_and_store()
         .await?;
     Ok(index)
+}
+
+#[tauri::command]
+fn code_ast_query(
+    state: State<'_, WorkspaceState>,
+    path: String,
+    query: Option<String>,
+    kinds: Option<String>,
+    max_results: Option<usize>,
+    workspace: Option<String>,
+) -> Result<code_ast::AstQueryResult, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let real_path = resolve_existing_path(&path, &workspace)?;
+    if !real_path.is_file() {
+        return Err(format!(
+            "AST_FILE_REQUIRED: {} is not a file.",
+            real_path.display()
+        ));
+    }
+    code_ast::query_file(
+        &workspace,
+        &real_path,
+        query.as_deref(),
+        kinds.as_deref(),
+        max_results,
+    )
+}
+
+#[tauri::command]
+async fn find_symbol_references(
+    state: State<'_, WorkspaceState>,
+    symbol: String,
+    path: Option<String>,
+    max_results: Option<usize>,
+    workspace: Option<String>,
+) -> Result<code_ast::SymbolReferencesResult, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let scope = match path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(path) => resolve_existing_path(path, &workspace)?,
+        None => workspace.clone(),
+    };
+    tauri::async_runtime::spawn_blocking(move || {
+        code_ast::find_references(&workspace, &scope, &symbol, max_results)
+    })
+    .await
+    .map_err(|error| format!("AST_REFERENCE_TASK_FAILED: {error}"))?
 }
 
 #[tauri::command]
@@ -10330,6 +10381,8 @@ pub fn run() {
             browser_evaluate,
             shell_permission_preflight,
             build_repository_index,
+            code_ast_query,
+            find_symbol_references,
             load_session_memory,
             record_session_failure,
             run_eval_harness,

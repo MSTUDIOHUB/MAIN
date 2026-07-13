@@ -31,6 +31,10 @@ function nextCallId(): string {
 const BARE_TOOL_NAMES = new Set([
   "get_project_skeleton",
   "get_file_outline",
+  "code_ast_query",
+  "find_symbol_references",
+  "git_status",
+  "git_diff",
   "list_directory",
   "read_file",
   "read_document",
@@ -75,6 +79,9 @@ const TOOL_BODY_ARG_NAMES: Partial<Record<string, string>> = {
 
 const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
   get_file_outline: "path",
+  code_ast_query: "path",
+  find_symbol_references: "symbol",
+  git_diff: "path",
   list_directory: "path",
   read_file: "path",
   read_document: "path",

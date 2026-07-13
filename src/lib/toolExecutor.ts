@@ -23,8 +23,10 @@ import {
   readPtyTail,
   readPtySince,
   browserEvaluate,
+  codeAstQuery,
   clearPtyBuffer,
   getPtyStatus,
+  findSymbolReferences,
   runCommand,
   getFileOutline,
   ingestAttachmentFile,
@@ -52,6 +54,7 @@ import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } fro
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 import { sanitizePtyOutput } from "./ptyOutputSanitizer";
+import { runGitDiffTool, runGitStatusTool } from "./gitTools";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -114,12 +117,16 @@ const WORKSPACE_REQUIRED_TOOL_NAMES = new Set([
   "repo_map_context",
   "repo_map_files",
   "repo_map_impact",
+  "code_ast_query",
+  "find_symbol_references",
   "get_project_skeleton",
   "get_file_outline",
   "index_workspace_documents",
   "replace_in_file",
   "write_file",
   "apply_patch",
+  "git_status",
+  "git_diff",
   "delete_workspace_path",
   "run_command",
   "browser_evaluate",
@@ -432,6 +439,36 @@ export async function executeTool(
 
     case "repo_map_impact":
       return await repoMapImpact(args, workspace);
+
+    case "code_ast_query": {
+      const path = parseOptionalString(args.path);
+      if (!path) throw new Error("Missing required parameter 'path'.");
+      return JSON.stringify(await codeAstQuery({
+        path,
+        query: parseOptionalString(args.query),
+        kinds: parseOptionalString(args.kinds),
+        maxResults: parseOptionalNumber(args.max_results ?? args.maxResults),
+      }, workspace));
+    }
+
+    case "find_symbol_references": {
+      const symbol = parseOptionalString(args.symbol);
+      if (!symbol) throw new Error("Missing required parameter 'symbol'.");
+      return JSON.stringify(await findSymbolReferences({
+        symbol,
+        path: parseOptionalString(args.path),
+        maxResults: parseOptionalNumber(args.max_results ?? args.maxResults),
+      }, workspace));
+    }
+
+    case "git_status":
+      return await runGitStatusTool(
+        workspace,
+        !(args.include_stats === false || args.include_stats === "false"),
+      );
+
+    case "git_diff":
+      return await runGitDiffTool(args, workspace);
 
     case "execute_command": {
       const command = applyShellCwd((args.command as string) || "", args);

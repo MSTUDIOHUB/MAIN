@@ -166,6 +166,48 @@ export interface EmbeddingRecord {
   vector: number[];
 }
 
+export interface AstSymbol {
+  name: string;
+  kind: string;
+  syntaxKind: string;
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  signature: string;
+}
+
+export interface AstQueryResult {
+  path: string;
+  language: string;
+  rootKind: string;
+  hasErrors: boolean;
+  errorCount: number;
+  symbols: AstSymbol[];
+  truncated: boolean;
+  note: string;
+}
+
+export interface SymbolOccurrence {
+  path: string;
+  language: string;
+  role: "definition" | "import" | "call" | "reference" | string;
+  syntaxKind: string;
+  line: number;
+  column: number;
+  context: string;
+}
+
+export interface SymbolReferencesResult {
+  symbol: string;
+  scope: string;
+  scannedFiles: number;
+  skippedFiles: number;
+  parseFailures: number;
+  occurrences: SymbolOccurrence[];
+  truncated: boolean;
+  note: string;
+}
+
 export interface KnowledgeBase {
   id: string;
   name: string;
@@ -1058,6 +1100,34 @@ export function shellPermissionPreflight(
 
 export function buildRepositoryIndex(workspace?: string): Promise<RepositoryIndex> {
   return invoke<RepositoryIndex>("build_repository_index", { workspace });
+}
+
+export function codeAstQuery(input: {
+  path: string;
+  query?: string;
+  kinds?: string;
+  maxResults?: number;
+}, workspace?: string): Promise<AstQueryResult> {
+  return invoke<AstQueryResult>("code_ast_query", {
+    path: input.path,
+    query: input.query,
+    kinds: input.kinds,
+    maxResults: input.maxResults,
+    workspace,
+  });
+}
+
+export function findSymbolReferences(input: {
+  symbol: string;
+  path?: string;
+  maxResults?: number;
+}, workspace?: string): Promise<SymbolReferencesResult> {
+  return invoke<SymbolReferencesResult>("find_symbol_references", {
+    symbol: input.symbol,
+    path: input.path,
+    maxResults: input.maxResults,
+    workspace,
+  });
 }
 
 export function loadSessionMemory(workspace?: string): Promise<SessionMemory> {

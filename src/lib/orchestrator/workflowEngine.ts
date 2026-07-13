@@ -2832,6 +2832,24 @@ export class WorkflowEngine {
       return latestState;
     };
 
+    const commitFinalElapsedTime = () => {
+      const elapsedTime = Math.max(0, getElapsedSeconds());
+      const elapsedTurnIds = new Set([turnId, context.uiDisplayTurnId].filter(Boolean));
+      sessionSet((state: any) => ({
+        pendingSlashCommand: null,
+        elapsedTime,
+        conversationTurns: state.conversationTurns.map((candidate: any) =>
+          elapsedTurnIds.has(candidate.id)
+            ? {
+                ...candidate,
+                elapsedTime: Math.max(0, Number(candidate.elapsedTime) || 0, elapsedTime),
+              }
+            : candidate
+        ),
+      }));
+      return elapsedTime;
+    };
+
     const persistCurrentSessionRuntime = (state = sessionGet()) => {
       if (!runSessionId) return;
       const messages = sanitizeTaskBlocksForPersist(state.taskFlow);
@@ -3181,7 +3199,7 @@ export class WorkflowEngine {
     return executeLoopStrategy().then((loopOutcome) => {
       closeHarnessForAgentLoopOutcome(loopOutcome);
       clearInterval(timerInterval);
-      sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
+      commitFinalElapsedTime();
 
       const pausedActionRequest = sessionGet().activeActionRequest as ActionRequest | null;
       if (loopOutcome.status !== "completed" && loopOutcome.status !== "error" && pausedActionRequest) {
@@ -3382,7 +3400,7 @@ export class WorkflowEngine {
       const errorMessage = err instanceof Error ? err.message : String(err);
       closeCurrentHarnessRunMarker("error", "agent_loop_crashed");
       clearInterval(timerInterval);
-      sessionSet({ pendingSlashCommand: null, elapsedTime: getElapsedSeconds() });
+      commitFinalElapsedTime();
       appendWorkflowRuntimeEvent({
         type: "run.failed",
         threadId: runSessionKey,

@@ -13,7 +13,9 @@ export interface SubmitGameStudioPreparationState {
     id: string;
     status?: string;
     blockIds: number[];
+    elapsedTime?: number;
   }>;
+  elapsedTime?: number;
   bumpWorkspaceContentVersion?: () => void;
   agentStatus?: string;
   isGenerating?: boolean;
@@ -81,6 +83,11 @@ export function applySubmitGameStudioPreparationResult<TState extends SubmitGame
               ...turn,
               status: "error",
               blockIds: turn.blockIds.includes(failureId) ? turn.blockIds : [...turn.blockIds, failureId],
+              elapsedTime: Math.max(
+                0,
+                Number(turn.elapsedTime) || 0,
+                Number(state.elapsedTime) || 0,
+              ),
             }
           : turn,
       ),

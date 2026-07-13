@@ -247,7 +247,10 @@ export async function runSubmitAsyncWorkflowRun<
     nextTaskId: input.nextTaskId,
     sessionGet: input.sessionGet,
     sessionSet: input.sessionSet,
-    disposeElapsedTimer: input.elapsedTimer.dispose,
+    disposeElapsedTimer: () => {
+      input.elapsedTimer.dispose();
+      input.sessionSet({ elapsedTime: input.elapsedTimer.getElapsedSeconds() });
+    },
     invalidateWorkspaceTreeCache: input.invalidateWorkspaceTreeCache,
   });
   if (!gameStudioPreparation.ok) {

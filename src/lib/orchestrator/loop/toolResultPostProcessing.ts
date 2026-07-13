@@ -235,7 +235,14 @@ export function handleToolResultPostProcessing(input: {
     if (
       !callbacks.getIsPlanApproved() &&
       planRuntimePhase === "drafting" &&
-      externalResults.some((r) => r.name === "read_file" || r.name === "read_document" || r.name === "get_file_outline")
+      externalResults.some((r) =>
+        r.name === "read_file" ||
+        r.name === "read_document" ||
+        r.name === "get_file_outline" ||
+        r.name === "code_ast_query" ||
+        r.name === "find_symbol_references" ||
+        r.name === "git_diff"
+      )
     ) {
       planDraftingRecoveryReadCount += 1;
     }

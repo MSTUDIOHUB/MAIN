@@ -482,7 +482,7 @@ function summarizeToolResult(message: TrimMessage, lookup: Map<string, ToolCallS
   const contentHash = stableHash(content).slice(0, 8);
   const baseTarget = target ? ` ${compactTextLine(target, 120)}` : "";
 
-  if (/read_file|get_file_outline|grep_search|glob_search|list_directory|repo_map_/i.test(name)) {
+  if (/read_file|get_file_outline|code_ast_query|find_symbol_references|git_status|git_diff|grep_search|glob_search|list_directory|repo_map_/i.test(name)) {
     return `${name}${baseTarget} (${content.length.toLocaleString()} chars, hash ${contentHash})`;
   }
 

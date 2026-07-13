@@ -162,6 +162,7 @@ export interface SubmitElapsedTimerInput<
 > {
   sessionGet: () => TState;
   sessionSet: (patch: { elapsedTime: number }) => void;
+  initialElapsedSeconds?: number;
   nowMs?: () => number;
   setTimer?: (callback: () => void, ms: number) => TTimerHandle;
   clearTimer?: (timer: TTimerHandle) => void;
@@ -184,7 +185,8 @@ export function startSubmitElapsedTimer<
   const setTimer = params.setTimer || ((callback, ms) => setInterval(callback, ms) as TTimerHandle);
   const clearTimer = params.clearTimer || ((timer) => clearInterval(timer as ReturnType<typeof setInterval>));
   const startTime = nowMs();
-  const getElapsedSeconds = () => Math.round((nowMs() - startTime) / 1000);
+  const initialElapsedSeconds = Math.max(0, Math.round(Number(params.initialElapsedSeconds) || 0));
+  const getElapsedSeconds = () => initialElapsedSeconds + Math.round((nowMs() - startTime) / 1000);
   const updateElapsedTime = () => {
     params.sessionSet({ elapsedTime: getElapsedSeconds() });
   };

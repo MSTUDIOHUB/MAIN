@@ -12,6 +12,7 @@ test.beforeEach(async ({ page }) => {
 test("Goal capsule exposes one themed popover with persistent lifecycle controls", async ({ page }) => {
   await page.goto("/?e2eScenario=goal-capsule");
 
+  await expect(page.getByTestId("turn-elapsed-time")).toHaveText("1m23s");
   const trigger = page.getByTestId("goal-capsule-trigger");
   await expect(trigger).toBeVisible();
   await expect(trigger).toHaveAttribute("data-goal-status", "active");

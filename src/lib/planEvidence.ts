@@ -349,7 +349,8 @@ export function validatePlanCandidate(candidate: PlanCandidate, expectedBundleHa
 
 const NON_EXECUTION_EVIDENCE_TOOLS = new Set([
   "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search",
-  "repo_map_context", "repo_map_files", "repo_map_impact", "read_file", "read_document",
+  "repo_map_context", "repo_map_files", "repo_map_impact", "code_ast_query",
+  "find_symbol_references", "git_status", "git_diff", "read_file", "read_document",
   "knowledge_search", "knowledge_get_excerpt", "analyze_tabular_document", "query_tabular_document",
   "index_workspace_documents", "read_pty_buffer", "read_pty_tail", "read_pty_since",
   "get_pty_status", "clear_pty_buffer",
@@ -357,6 +358,7 @@ const NON_EXECUTION_EVIDENCE_TOOLS = new Set([
 
 const VERIFICATION_EVIDENCE_TOOLS = new Set([
   "read_file", "read_document", "knowledge_search", "knowledge_get_excerpt", "grep_search",
+  "code_ast_query", "find_symbol_references", "git_status", "git_diff",
   "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status",
 ]);
 

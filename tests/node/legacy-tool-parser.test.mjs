@@ -68,6 +68,40 @@ test("parses local-model single positional argument safely for whitelisted tools
   assert.equal(parsed.cleanText, "");
 });
 
+test("parses AST and Git tools emitted by local models", () => {
+  const ast = parseTextForTools('code_ast_query(path="src/lib/orchestrator.ts", query="getToolTarget", max_results=20)');
+  assert.equal(ast.toolCalls.length, 1);
+  assert.equal(ast.toolCalls[0].name, "code_ast_query");
+  assert.deepEqual(ast.toolCalls[0].arguments, {
+    path: "src/lib/orchestrator.ts",
+    query: "getToolTarget",
+    max_results: 20,
+  });
+
+  const references = parseTextForTools('find_symbol_references("getToolTarget")');
+  assert.equal(references.toolCalls.length, 1);
+  assert.equal(references.toolCalls[0].name, "find_symbol_references");
+  assert.deepEqual(references.toolCalls[0].arguments, { symbol: "getToolTarget" });
+
+  const gitStatus = parseTextForTools("git_status()");
+  assert.equal(gitStatus.toolCalls.length, 1);
+  assert.equal(gitStatus.toolCalls[0].name, "git_status");
+
+  const gitDiff = parseTextForTools([
+    "<tool_use>",
+    "<tool>git_diff</tool>",
+    "<parameter name=\"path\">src/lib/orchestrator.ts</parameter>",
+    "<parameter name=\"context_lines\">4</parameter>",
+    "</tool_use>",
+  ].join("\n"));
+  assert.equal(gitDiff.toolCalls.length, 1);
+  assert.equal(gitDiff.toolCalls[0].name, "git_diff");
+  assert.deepEqual(gitDiff.toolCalls[0].arguments, {
+    path: "src/lib/orchestrator.ts",
+    context_lines: "4",
+  });
+});
+
 test("parses local-model knowledge search calls", () => {
   const parsed = parseTextForTools('knowledge_search("Unity Rigidbody AddForce")');
   assert.equal(parsed.toolCalls.length, 1);

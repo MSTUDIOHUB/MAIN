@@ -239,9 +239,9 @@ export async function partitionToolCallsForExecution(input: {
       ? parseApplyPatch(String(toolArgs.patch || "")).operations.flatMap((operation) =>
           [operation.path, operation.newPath].filter((path): path is string => !!path)
         )
-      : tc.name === "grep_search"
+      : tc.name === "grep_search" || tc.name === "find_symbol_references" || tc.name === "git_diff"
         ? [directScopeTarget || "."]
-        : new Set(["read_file", "get_file_outline", "write_file", "replace_in_file"] as string[]).has(tc.name)
+        : new Set(["read_file", "get_file_outline", "code_ast_query", "write_file", "replace_in_file"] as string[]).has(tc.name)
           ? [directScopeTarget]
           : [];
     if (scopeTargets.length > 0) {

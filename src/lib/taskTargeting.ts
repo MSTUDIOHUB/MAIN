@@ -295,9 +295,9 @@ export function buildTaskTargetingProfile(input: BuildTaskTargetingProfileInput 
   const preferredReadTools = facets.has("tabular_data")
     ? ["analyze_tabular_document", "query_tabular_document", "read_document"]
     : hasScopedTarget
-    ? ["repo_map_search", "repo_map_context", "grep_search", "glob_search", "list_directory", "get_file_outline", "read_file"]
+    ? ["repo_map_search", "code_ast_query", "find_symbol_references", "repo_map_context", "grep_search", "glob_search", "list_directory", "get_file_outline", "read_file"]
     : hasProvidedContext
-    ? ["repo_map_context", "repo_map_search", "grep_search", "glob_search", "list_directory", "read_file", "get_file_outline"]
+    ? ["repo_map_context", "repo_map_search", "code_ast_query", "find_symbol_references", "grep_search", "glob_search", "list_directory", "read_file", "get_file_outline"]
     : ["repo_map_files", "repo_map_search", "get_project_skeleton", "list_directory", "grep_search"];
 
   const reasons: string[] = [];
@@ -341,7 +341,21 @@ export function getTaskTargetingEvidenceKey(
 ): string | null {
   if (toolName === "get_project_skeleton") return "tool:get_project_skeleton";
   if (toolName.startsWith("repo_map_")) return `tool:${toolName}`;
-  if (toolName === "read_file" || toolName === "read_document" || toolName === "get_file_outline") {
+  if (toolName === "find_symbol_references") {
+    const symbol = String(args.symbol || target || "").trim();
+    const scope = String(args.path || ".").trim();
+    return symbol ? `symbol:${symbol}:${normalizeSlashPath(scope) || "."}` : null;
+  }
+  if (toolName === "git_diff") {
+    const scope = String(args.path || args.filter || ".").trim();
+    return `git-diff:${normalizeSlashPath(scope) || "."}`;
+  }
+  if (
+    toolName === "read_file" ||
+    toolName === "read_document" ||
+    toolName === "get_file_outline" ||
+    toolName === "code_ast_query"
+  ) {
     const path = String(args.path || args.file_path || target || "").trim();
     return path ? `path:${normalizeSlashPath(path)}` : null;
   }

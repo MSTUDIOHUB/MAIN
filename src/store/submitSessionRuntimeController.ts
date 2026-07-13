@@ -103,7 +103,11 @@ export function createSubmitSessionRuntimeController<
                 status === "awaiting_approval" || status === "awaiting_input" || status === "error"
                   ? false
                   : turn.collapsed,
-              elapsedTime: turn.elapsedTime || s.elapsedTime || 0,
+              elapsedTime: Math.max(
+                0,
+                Number(turn.elapsedTime) || 0,
+                Number(s.elapsedTime) || 0,
+              ),
             }
           : turn,
       ),

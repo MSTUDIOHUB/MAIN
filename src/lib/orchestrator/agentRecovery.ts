@@ -442,6 +442,7 @@ export function choosePseudoToolRecovery(input: {
     "read_document",
     "analyze_tabular_document",
     "get_file_outline",
+    "code_ast_query",
     "list_directory",
     "index_workspace_documents",
   ]);

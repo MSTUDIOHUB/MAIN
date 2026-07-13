@@ -25,6 +25,8 @@ export interface ExecuteRecoveryResultLike {
 export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
   "grep_search",
   "get_file_outline",
+  "code_ast_query",
+  "find_symbol_references",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -39,6 +41,8 @@ export const EXECUTE_RECOVERY_VALIDATION_TOOLS = new Set([
   "run_command",
   "execute_command",
   "browser_evaluate",
+  "git_status",
+  "git_diff",
   "send_pty_input",
   "read_pty_buffer",
   "read_pty_tail",

@@ -91,6 +91,10 @@ test("built-in tool risks separate read, write, shell, and destructive operation
   assert.equal(classifyBuiltInTool("write_file"), "workspace_write");
   assert.equal(classifyBuiltInTool("apply_patch"), "workspace_write");
   assert.equal(classifyBuiltInTool("repo_map_search"), "read_only");
+  assert.equal(classifyBuiltInTool("code_ast_query"), "read_only");
+  assert.equal(classifyBuiltInTool("find_symbol_references"), "read_only");
+  assert.equal(classifyBuiltInTool("git_status"), "read_only");
+  assert.equal(classifyBuiltInTool("git_diff"), "read_only");
   assert.equal(classifyBuiltInTool("web_search"), "external_read");
   assert.equal(classifyBuiltInTool("web_fetch"), "external_read");
   assert.equal(classifyBuiltInTool("run_command"), "shell");

@@ -2371,15 +2371,17 @@ const TurnTimer = memo(function TurnTimer({
 }) {
   const storeElapsedTime = useAppStore((s) => s.elapsedTime);
   const isActive = turnId === currentTurnId && (isStreaming || status === "executing" || status === "planning");
-  const timeToShow = isActive ? storeElapsedTime : (savedElapsedTime || 0);
-  if (timeToShow <= 0 && !isActive) return null;
+  const persistedElapsedTime = Math.max(0, Number(savedElapsedTime) || 0);
+  const timeToShow = Math.floor(isActive
+    ? Math.max(persistedElapsedTime, Number(storeElapsedTime) || 0)
+    : persistedElapsedTime);
 
   const minutes = Math.floor(timeToShow / 60);
   const seconds = timeToShow % 60;
   const timeString = minutes > 0 ? `${minutes}m${seconds}s` : `${seconds}s`;
 
   return (
-    <span className={`rounded-full border px-2 py-0.5 text-[10px] flex items-center gap-1.5 ${
+    <span data-testid="turn-elapsed-time" className={`rounded-full border px-2 py-0.5 text-[10px] flex items-center gap-1.5 ${
       isActive 
         ? "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]" 
         : isLightThemeMode

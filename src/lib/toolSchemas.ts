@@ -279,6 +279,39 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
   {
     type: "function",
     function: {
+      name: "code_ast_query",
+      description: "使用 Tree-sitter 解析单个源码文件的真实语法树，返回有界的声明节点、符号名、语法节点类型、位置、签名和语法错误统计。支持 TS/TSX/JS/JSX/Rust/Python/C#/Go；需要理解结构时优先于整文件读取。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "要解析的源码文件路径" },
+          query: { type: "string", description: "可选，按符号名、签名或语法节点类型过滤" },
+          kinds: { type: "string", description: "可选，逗号分隔的标准类型或语法节点类型，如 function,class,interface" },
+          max_results: { type: "number", description: "最多返回多少个声明，默认 80，最大 200" },
+        },
+        required: ["path"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "find_symbol_references",
+      description: "使用 Tree-sitter 在指定文件或目录中查找符号的语法级定义、导入、调用和引用，忽略注释与字符串。适合修改前定位影响点；同名标识符可能属于不同语义符号，存在歧义时需结合 AST 上下文或编译器验证。",
+      parameters: {
+        type: "object",
+        properties: {
+          symbol: { type: "string", description: "要精确匹配的标识符名称" },
+          path: { type: "string", description: "可选，限制到某个源码文件或目录；默认整个工作区" },
+          max_results: { type: "number", description: "最多返回多少个位置，默认 80，最大 200" },
+        },
+        required: ["symbol"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
       name: "read_file",
       description: "读取源码、Markdown、JSON、日志、纯文本等文件的内容窗口。工作区外的本机绝对路径会先请求用户授权，授权后通过临时附件副本读取。大文件不会伪装成完整内容，会返回 truncated、totalLines、totalChars、returnedLines、nextStartLine 等元数据；需要后续内容时继续用 start_line/end_line/max_lines 读取指定行区间。遇到 TypeScript/测试报错行号时，优先读取报错行附近窗口，不要全量读取大文件，也不要用 run_command 分段分页读文件。",
       parameters: {
@@ -443,6 +476,38 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           patch: { type: "string", description: "补丁文本，优先使用 *** Begin Patch / *** End Patch；也可使用 --- a/file +++ b/file 的 unified diff" },
         },
         required: ["patch"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_status",
+      description: "从 MAIN 原生 Git 后端读取结构化工作区状态，包括分支、上游、ahead/behind、staged/unstaged/untracked/conflicted 数量和增删行统计。只读且无需 Shell；检查改动状态时优先使用。",
+      parameters: {
+        type: "object",
+        properties: {
+          include_stats: { type: "boolean", description: "是否计算增删行统计，默认 true" },
+        },
+        required: [],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "git_diff",
+      description: "从 MAIN 原生 Git 后端读取 HEAD 到当前工作区的结构化差异，覆盖 staged、unstaged 和 untracked 文件，返回有界 unified hunks 与增删行统计。大仓库应传 path 或 filter 缩小范围；只读且无需 Shell。",
+      parameters: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "可选，只返回指定工作区相对文件" },
+          filter: { type: "string", description: "可选状态组：changed、added、deleted、untracked" },
+          context_lines: { type: "number", description: "每个变更块保留的上下文行数，默认 3，最大 12" },
+          max_files: { type: "number", description: "最多返回多少个文件，默认 20，最大 60" },
+          max_chars: { type: "number", description: "所有 diff hunk 的总字符预算，默认 24000，最大 80000" },
+        },
+        required: [],
       },
     },
   },

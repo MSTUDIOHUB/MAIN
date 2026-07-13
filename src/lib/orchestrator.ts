@@ -236,6 +236,10 @@ export const PLAN_EXPLORATION_READ_ONLY_TOOLS = new Set([
   "repo_map_context",
   "repo_map_files",
   "repo_map_impact",
+  "code_ast_query",
+  "find_symbol_references",
+  "git_status",
+  "git_diff",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -1632,6 +1636,10 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     case "repo_map_files": return (args.filter as string) || "repo map files";
     case "repo_map_impact": return (args.target as string) || "";
     case "repo_map_status": return "repo map";
+    case "code_ast_query": return (args.path as string) || "";
+    case "find_symbol_references": return (args.symbol as string) || "";
+    case "git_status": return "git status";
+    case "git_diff": return (args.path as string) || (args.filter as string) || "workspace diff";
     case "execute_command": return (args.command as string) || "";
     case "send_pty_input":  return (args.input as string) || "terminal input";
     case "run_command":     return (args.command as string) || "";

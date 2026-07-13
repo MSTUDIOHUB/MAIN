@@ -216,7 +216,15 @@ export async function prepareAgentLoopToolRegistry(input: {
     policy: config.toolPermissionPolicy,
   });
   if (subagentDepth > 0) {
-    const childToolNames = new Set(["read_file", "grep_search", "get_file_outline"]);
+    const childToolNames = new Set([
+      "read_file",
+      "grep_search",
+      "get_file_outline",
+      "code_ast_query",
+      "find_symbol_references",
+      "git_status",
+      "git_diff",
+    ]);
     routedToolDefinitions = routedToolDefinitions.filter((tool) => {
       return childToolNames.has(tool.function.name);
     });

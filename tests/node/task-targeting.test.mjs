@@ -56,8 +56,24 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildTaskTargetingProfile,
+  getTaskTargetingEvidenceKey,
   shouldBlockToolCallForTargeting,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/taskTargeting.ts"));
+
+test("AST and Git targeting evidence uses semantic scopes instead of fake file paths", () => {
+  assert.equal(
+    getTaskTargetingEvidenceKey("code_ast_query", { path: "src/lib/orchestrator.ts" }),
+    "path:src/lib/orchestrator.ts",
+  );
+  assert.equal(
+    getTaskTargetingEvidenceKey("find_symbol_references", { symbol: "getToolTarget", path: "src/lib" }),
+    "symbol:getToolTarget:src/lib",
+  );
+  assert.equal(
+    getTaskTargetingEvidenceKey("git_diff", { filter: "changed" }, "workspace diff"),
+    "git-diff:changed",
+  );
+});
 
 const designSkill = {
   active: true,

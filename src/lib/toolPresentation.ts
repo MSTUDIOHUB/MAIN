@@ -5,6 +5,10 @@ const TOOL_VERB_LABELS: Record<string, { zh: string; en: string }> = {
   list_directory: { zh: "扫描目录", en: "Scan directory" },
   get_project_skeleton: { zh: "查看项目结构", en: "Inspect project structure" },
   get_file_outline: { zh: "读取文件结构", en: "Read file outline" },
+  code_ast_query: { zh: "解析语法树", en: "Parse syntax tree" },
+  find_symbol_references: { zh: "查找符号引用", en: "Find symbol references" },
+  git_status: { zh: "检查 Git 状态", en: "Check Git status" },
+  git_diff: { zh: "检查 Git 差异", en: "Inspect Git diff" },
   glob_search: { zh: "搜索文件", en: "Search files" },
   grep_search: { zh: "搜索内容", en: "Search content" },
   web_search: { zh: "搜索网络", en: "Search web" },
@@ -50,6 +54,7 @@ const DISCOVERY_TOOLS = new Set([
   "repo_map_context",
   "repo_map_files",
   "repo_map_impact",
+  "find_symbol_references",
   "index_workspace_documents",
   "knowledge_search",
   "find_gameobjects",
@@ -57,6 +62,9 @@ const DISCOVERY_TOOLS = new Set([
 
 const INSPECTION_TOOLS = new Set([
   "get_file_outline",
+  "code_ast_query",
+  "git_status",
+  "git_diff",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -289,7 +297,7 @@ export function deriveToolIntentSummary(input: {
     if (phase === "verify") return "Run a verification command to check whether the change holds.";
     if (phase === "command") return "Run the command and use its output to decide the next step.";
     if (phase === "discover") {
-      if (toolName === "grep_search" || toolName === "glob_search") {
+      if (toolName === "grep_search" || toolName === "glob_search" || toolName === "find_symbol_references") {
         return "Locate relevant files or symbols before reading more context.";
       }
       return "Inspect the workspace shape and narrow the useful context.";
@@ -299,6 +307,8 @@ export function deriveToolIntentSummary(input: {
         return "Analyze the table data and confirm the relevant facts.";
       }
       if (toolName === "get_file_outline") return "Read the file structure before touching implementation details.";
+      if (toolName === "code_ast_query") return "Parse the syntax tree and narrow the implementation range.";
+      if (toolName === "git_status" || toolName === "git_diff") return "Inspect the current Git changes before deciding the next action.";
       return "Read the target content and confirm the implementation details.";
     }
     return "Keep the process message for traceability.";
@@ -309,7 +319,7 @@ export function deriveToolIntentSummary(input: {
   if (phase === "verify") return "运行验证命令，确认改动是否成立。";
   if (phase === "command") return "执行命令并根据输出决定下一步。";
   if (phase === "discover") {
-    if (toolName === "grep_search" || toolName === "glob_search") {
+    if (toolName === "grep_search" || toolName === "glob_search" || toolName === "find_symbol_references") {
       return "定位相关文件或符号，再收敛后续读取范围。";
     }
     return "查看工作区结构，缩小有效上下文范围。";
@@ -319,6 +329,8 @@ export function deriveToolIntentSummary(input: {
       return "分析表格数据，确认相关事实。";
     }
     if (toolName === "get_file_outline") return "先查看文件结构，再进入实现细节。";
+    if (toolName === "code_ast_query") return "解析语法树，收敛需要读取的实现范围。";
+    if (toolName === "git_status" || toolName === "git_diff") return "检查当前 Git 改动，再决定下一步。";
     return "读取目标内容，确认实现细节。";
   }
   return trimIntentSummary("记录过程消息，保留可追溯上下文。");

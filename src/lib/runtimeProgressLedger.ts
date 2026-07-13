@@ -82,10 +82,10 @@ function compactTarget(value: unknown): string {
 }
 
 function toolFamily(tool: string): string {
-  if (/^(?:read_file|read_document|get_file_outline|analyze_tabular_document|query_tabular_document|knowledge_get_excerpt)$/i.test(tool)) {
+  if (/^(?:read_file|read_document|get_file_outline|code_ast_query|git_status|git_diff|analyze_tabular_document|query_tabular_document|knowledge_get_excerpt)$/i.test(tool)) {
     return "read";
   }
-  if (/^(?:list_directory|get_project_skeleton|glob_search|grep_search|repo_map_status|repo_map_search|repo_map_context|repo_map_files|repo_map_impact|index_workspace_documents|knowledge_search)$/i.test(tool)) {
+  if (/^(?:list_directory|get_project_skeleton|glob_search|grep_search|find_symbol_references|repo_map_status|repo_map_search|repo_map_context|repo_map_files|repo_map_impact|index_workspace_documents|knowledge_search)$/i.test(tool)) {
     return "search";
   }
   if (/^(?:write_file|replace_in_file|apply_patch|delete_workspace_path)$/i.test(tool)) return "edit";

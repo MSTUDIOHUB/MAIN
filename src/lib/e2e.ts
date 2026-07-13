@@ -5279,6 +5279,7 @@ function seedGoalCapsuleScenario() {
       blockIds: [userBlockId, agentBlockId],
       collapsed: false,
       createdAt: now,
+      elapsedTime: 83,
     }],
     currentTurnId: turnId,
     currentTurnState: {

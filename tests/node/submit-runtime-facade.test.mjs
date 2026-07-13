@@ -572,3 +572,26 @@ test("submit elapsed timer updates active elapsed time and clears itself when ru
   assert.deepEqual(cleared, ["timer-1"]);
   assert.equal(timer.getElapsedSeconds(), 2);
 });
+
+test("submit elapsed timer resumes from a persisted turn total", () => {
+  let now = 10_000;
+  const patches = [];
+  const callbacks = [];
+
+  const timer = startSubmitElapsedTimer({
+    sessionGet: () => ({ agentStatus: "running" }),
+    sessionSet: (patch) => patches.push(patch),
+    initialElapsedSeconds: 8,
+    nowMs: () => now,
+    setTimer: (callback) => {
+      callbacks.push(callback);
+      return "timer-resumed";
+    },
+    clearTimer: () => {},
+  });
+
+  now = 12_600;
+  callbacks[0]();
+  assert.deepEqual(patches, [{ elapsedTime: 11 }]);
+  assert.equal(timer.getElapsedSeconds(), 11);
+});

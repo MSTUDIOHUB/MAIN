@@ -137,6 +137,9 @@ interface BuildChatRenderSegmentsInput {
 
 const READ_OPERATION_TOOL_NAMES = new Set([
   "get_file_outline",
+  "code_ast_query",
+  "git_status",
+  "git_diff",
   "read_file",
   "read_document",
   "web_fetch",
@@ -151,6 +154,7 @@ const SEARCH_OPERATION_TOOL_NAMES = new Set([
   "grep_search",
   "web_search",
   "repo_map_search",
+  "find_symbol_references",
   "knowledge_search",
 ]);
 

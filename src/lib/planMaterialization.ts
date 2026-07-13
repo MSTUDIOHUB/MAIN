@@ -110,6 +110,9 @@ const SEMANTIC_EVIDENCE_TOOLS = new Set([
   "read_file_window",
   "read_document",
   "get_file_outline",
+  "code_ast_query",
+  "find_symbol_references",
+  "git_diff",
   "grep_search",
   "glob_search",
   "index_workspace_documents",
@@ -133,6 +136,9 @@ const TOOL_LABELS_ZH: Record<string, string> = {
   read_file_window: "已读取文件窗口",
   read_document: "已读取文档",
   get_file_outline: "已查看文件结构",
+  code_ast_query: "已解析语法树",
+  find_symbol_references: "已查找符号引用",
+  git_diff: "已检查 Git 差异",
   grep_search: "已搜索文本",
   glob_search: "已搜索文件",
   index_workspace_documents: "已索引工作区文档",
@@ -147,6 +153,9 @@ const TOOL_LABELS_EN: Record<string, string> = {
   read_file_window: "Read file window",
   read_document: "Read document",
   get_file_outline: "Inspected file outline",
+  code_ast_query: "Parsed syntax tree",
+  find_symbol_references: "Found symbol references",
+  git_diff: "Inspected Git diff",
   grep_search: "Searched text",
   glob_search: "Searched files",
   index_workspace_documents: "Indexed workspace documents",
@@ -155,7 +164,7 @@ const TOOL_LABELS_EN: Record<string, string> = {
 const BROAD_DISCOVERY_EVIDENCE_RE =
   /^(?:(?:glob_search|list_directory|get_project_skeleton|index_workspace_documents)\b|(?:已搜索文件|已查看目录|已查看项目结构|已索引工作区文档)(?:[:：\s]|$)|(?:Searched files|Listed directory|Inspected project structure|Indexed workspace documents)\b)/i;
 const CONCRETE_PLAN_EVIDENCE_RE =
-  /^(?:(?:read_file|read_file_window|read_document|get_file_outline|grep_search|analyze_tabular_document|query_tabular_document)\b|(?:已读取文件|已读取文件窗口|已读取文档|已查看文件结构|已搜索文本|已分析表格数据|已查询表格数据)(?:[:：\s]|$)|(?:Read file|Read file window|Read document|Inspected file outline|Searched text|Analyzed tabular data|Queried tabular data)\b)/i;
+  /^(?:(?:read_file|read_file_window|read_document|get_file_outline|code_ast_query|find_symbol_references|git_diff|grep_search|analyze_tabular_document|query_tabular_document)\b|(?:已读取文件|已读取文件窗口|已读取文档|已查看文件结构|已解析语法树|已查找符号引用|已检查 Git 差异|已搜索文本|已分析表格数据|已查询表格数据)(?:[:：\s]|$)|(?:Read file|Read file window|Read document|Inspected file outline|Parsed syntax tree|Found symbol references|Inspected Git diff|Searched text|Analyzed tabular data|Queried tabular data)\b)/i;
 const CSV_DASHBOARD_GOAL_RE =
   /(?:CSV|导入|creator|course|课程|销售|排行|趋势|环比|订单|状态|Dashboard|面板|图表|指标|数据|field|column|chart|metric|order|status)/i;
 const DARK_THEME_GOAL_RE =

@@ -187,6 +187,10 @@ const TOOL_REQUIRED_ARGUMENTS: Record<string, string> = {
   list_directory: "path",
   read_file: "path, start_line?, max_lines?",
   get_file_outline: "path",
+  code_ast_query: "path, query?, kinds?, max_results?",
+  find_symbol_references: "symbol, path?, max_results?",
+  git_status: "include_stats?",
+  git_diff: "path?, filter?, context_lines?, max_files?, max_chars?",
   read_document: "path, row_offset?, max_rows?",
   analyze_tabular_document: "path",
   query_tabular_document: "path, query",
@@ -392,6 +396,10 @@ const READ_ONLY_BUILT_IN_TOOL_NAMES = [
   "wait_subagents",
   "get_project_skeleton",
   "get_file_outline",
+  "code_ast_query",
+  "find_symbol_references",
+  "git_status",
+  "git_diff",
   "list_directory",
   "read_file",
   "read_document",
@@ -445,6 +453,7 @@ export function buildSubagentSystemPrompt(input: {
         `允许路径：\n${paths || "- 无"}`,
         `可用工具：${tools || "无"}`,
         "严格限制在允许路径内，只读取和搜索。不得写文件、运行命令、请求审批、创建子智能体或向用户提供回复选项。",
+        "源码任务优先用 code_ast_query/find_symbol_references 获取结构和引用，再用小窗口 read_file 核实实现；需要确认当前改动时用 git_status/git_diff，不要用文本搜索模拟语法树或通过 shell 读取 Git 差异。",
         "优先引用文件路径和具体证据。完成后只返回简洁摘要、不确定项与剩余工作；不要重述父任务，也不要直接面向最终用户。",
       ].join("\n\n")
     : [
@@ -454,6 +463,7 @@ export function buildSubagentSystemPrompt(input: {
         `Allowed paths:\n${paths || "- none"}`,
         `Available tools: ${tools || "none"}`,
         "Stay within the allowed paths and only read or search. Do not write files, run commands, request approval, spawn agents, or offer reply choices.",
+        "For source tasks, prefer code_ast_query/find_symbol_references for structure and references, then confirm implementation with a small read_file window. Use git_status/git_diff for current changes instead of imitating syntax analysis with text search or reading Git diffs through the shell.",
         "Cite concrete paths and evidence. Finish with only a concise summary, uncertainty, and remaining work; do not address the end user.",
       ].join("\n\n");
 }
@@ -751,7 +761,7 @@ export function buildSystemPrompt(
     "`get_project_skeleton` 只返回项目/资料目录结构，不包含任何文件内容。仅凭目录结构做出的分析毫无价值。",
     "在给出代码分析或架构总结之前，你必须：",
     "1. 先读取并利用用户已给上下文：图片要先总结可见 UI/文本/状态/异常，附件和 @ 文件要优先使用精确路径。源码/Unity 项目再根据用户问题里的路径、文件名、符号、截图文字或报错关键词做定向搜索/读取；只有缺少这些线索时，才用一次浅层 `get_project_skeleton(depth: 2)` 定位核心目录。表格/文档/资料分析任务先用用户提供的 `path:` 或最小范围 `list_directory` 找到文件，再直接使用文档/表格工具；",
-    "2. 再用 `get_file_outline`、`read_file`、`read_document`、`analyze_tabular_document` 或 `query_tabular_document` 实际读取关键文件的内容；源码/纯文本优先用 `read_file` 的行窗口参数读取关键范围，PDF/DOCX 优先用 `read_document`，大型 CSV/TSV/XLSX 优先先用 `analyze_tabular_document` 看全表，再用 `query_tabular_document` 做筛选/聚合，最后才按需用 `read_document` 分段读取原始行窗口；",
+    "2. 源码任务优先用 `code_ast_query` 查看真实语法树声明、用 `find_symbol_references` 查找语法级引用，再用 `read_file` 的小行窗口核实目标实现；不支持的语言再退回 `get_file_outline`/`grep_search`。PDF/DOCX 优先用 `read_document`，大型 CSV/TSV/XLSX 优先先用 `analyze_tabular_document` 看全表，再用 `query_tabular_document` 做筛选/聚合，最后才按需用 `read_document` 分段读取原始行窗口；",
     "3. 基于代码内容（而非目录名称）给出有价值的分析。",
     "4. 如果用户消息里包含附件预览，并出现 `truncatedPreview: true`、`attached_tabular_file` 或明确的 `path:` 字段，你必须把它视为“只给了预览，不是全量内容”，不能直接据此下完整结论，应继续对该路径调用工具。",
   ].join("\n"));
@@ -1014,6 +1024,10 @@ export function buildSystemPrompt(
       "web_fetch",
       "repo_map_search",
       "repo_map_context",
+      "code_ast_query",
+      "find_symbol_references",
+      "git_status",
+      "git_diff",
       "write_file",
       "apply_patch",
       "browser_evaluate",
@@ -1064,7 +1078,11 @@ export function buildSystemPrompt(
     addToolDescription("get_project_skeleton", "- get_project_skeleton: (depth?: number) 极速获取项目宏观骨架。仅在没有明确路径/文件名/符号线索时作为一次浅层发现使用，建议 depth: 2；拿到结构后必须转向定向搜索或读取。");
     addToolDescription("spawn_subagent", "- spawn_subagent: 异步创建有界只读子智能体。必须给出 scope_key、scope、allowed_paths 和 expected_output；返回句柄后继续处理不重叠工作，不要等待或重复读取其租约路径。");
     addToolDescription("wait_subagents", "- wait_subagents: 在主体完成自己的非重叠工作后，等待并汇合一个或全部子智能体的摘要、证据、阻塞原因和剩余工作。最终结论前必须汇合仍在运行的子智能体。");
-    addToolDescription("get_file_outline", "- get_file_outline: (path: string) 提取 C# 文件的类型定义和 public/protected 成员签名，剔除函数体。用于理解类的接口和耦合关系，无需读取完整源码。");
+    addToolDescription("get_file_outline", "- get_file_outline: (path: string) 轻量启发式文件轮廓。适合 Tree-sitter 暂不支持的语言；受支持源码优先用 code_ast_query 获取真实语法树结果。");
+    addToolDescription("code_ast_query", "- code_ast_query: 对 TS/TSX、JS/JSX、Rust、Python、C#、Go 文件执行真实 Tree-sitter 语法树查询，返回声明、语法节点类型、签名和精确行号。源码探索先用它缩小范围，再用小窗口 read_file 查看实现；不要用整文件读取或 grep_search 模拟 AST。");
+    addToolDescription("find_symbol_references", "- find_symbol_references: 在允许范围内解析语法树并查找符号的定义、导入、调用和引用。它是语法级而非编译器类型解析，同名符号可能需要结合路径与 read_file 判别；跨文件改动前优先用它评估引用面。");
+    addToolDescription("git_status", "- git_status: 通过 MAIN 原生 Git 后端获取结构化工作区状态和可选统计，只读且无需 shell。修改前后用它确认实际变更集合。");
+    addToolDescription("git_diff", "- git_diff: 通过 MAIN 原生 Git 后端返回有界的 HEAD-to-worktree 结构化差异，包含 staged、unstaged 和 untracked；优先传 path/filter 控制范围。编辑后、验证前用它检查实际补丁，不要通过 run_command 执行 git diff。");
     addToolDescription("list_directory", "- list_directory: 列出特定目录内容。优先用于用户给出目录、文件附近路径，或通过搜索结果锁定目标后的定向检查。");
     addToolDescription("web_search", "- web_search: 在公共网络上搜索最新信息、外部资料或网页线索。返回标题、URL、摘要和来源；最终结论必须引用来源 URL。");
     addToolDescription("web_fetch", "- web_fetch: 读取指定 HTTP/HTTPS URL 的正文；GitHub repo/blob/tree/raw 链接会优先解析公开仓库结构或 raw 内容。用于用户给出链接、GitHub 地址、外部文档时定向取证。");
@@ -1081,7 +1099,7 @@ export function buildSystemPrompt(
     addToolDescription("apply_patch", "- apply_patch: 用补丁真实修改工作区文件。优先使用 Codex 风格 `*** Begin Patch` / `*** End Patch` 与 `*** Update File:`、`*** Add File:`、`*** Delete File:`；也兼容常见 `--- a/file` / `+++ b/file` unified diff。上下文必须来自当前文件内容。");
     addToolDescription("replace_in_file", "- replace_in_file: 精确替换单个文件中的旧文本。只有 search_text 与当前文件完全一致时才会写入；不匹配时只允许定向读取一次当前内容再重试。");
     addToolDescription("write_file", "- write_file: 完整创建或覆盖文件。适合新文件或全文件重写；已有文件同内容写入会被视为无效进展。");
-    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 状态检查/提交/推送等有限命令时优先使用它，并基于返回结果总结成功/失败；不要把它当作常规文件分页读取工具。");
+    addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 提交/推送等有限命令时使用，并基于返回结果总结成功/失败；Git 状态与差异优先用 git_status/git_diff，不要把 shell 当作常规文件分页读取工具。");
     addToolDescription("browser_evaluate", "- browser_evaluate: 打开本地 dev server 或工作区内 file:// 页面进行真实浏览器验证。必须传 `url`；可传 `actions`（逐行：click/fill/press/select_file/wait_for_selector/wait_for_text）和 `checks`（逐行：text/not_text/selector/not_selector/title/console/not_console/no_console_errors）。用于 UI/DOM/console 渲染验证；不要用 curl/grep/cat 替代它。");
     addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），不要在 command 里用 `cd ... &&` 代替 cwd。可传 `wait_ms` 等待输出，默认 4000，最多 30000。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
     addToolDescription("send_pty_input", "- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）。可传 `wait_ms` 等待交互程序回显。");

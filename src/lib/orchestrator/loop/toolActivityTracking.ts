@@ -25,6 +25,9 @@ const SUBAGENT_EVIDENCE_TOOLS = new Set([
   "read_document",
   "get_file_outline",
   "grep_search",
+  "code_ast_query",
+  "find_symbol_references",
+  "git_diff",
 ]);
 
 function appendBoundedToolActivity(

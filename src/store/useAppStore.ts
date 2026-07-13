@@ -3602,7 +3602,17 @@ export const useAppStore = create<AppState>()(
         ),
         conversationTurns: currentTurnId
           ? s.conversationTurns.map((turn) =>
-              turn.id === currentTurnId ? { ...turn, status: "stopped_no_action" as const } : turn
+              turn.id === currentTurnId
+                ? {
+                    ...turn,
+                    status: "stopped_no_action" as const,
+                    elapsedTime: Math.max(
+                      0,
+                      Number(turn.elapsedTime) || 0,
+                      Number(s.elapsedTime) || 0,
+                    ),
+                  }
+                : turn
             )
           : s.conversationTurns,
       }));
@@ -4698,7 +4708,18 @@ export const useAppStore = create<AppState>()(
           ...(isWebFallback ? { cooldownUntil: Date.now() + 15000 } : {}),
         },
         conversationTurns: s.conversationTurns.map((turn) =>
-          turn.id === turnId ? { ...turn, status, summary, elapsedTime: turn.elapsedTime || s.elapsedTime || 0 } : turn
+          turn.id === turnId
+            ? {
+                ...turn,
+                status,
+                summary,
+                elapsedTime: Math.max(
+                  0,
+                  Number(turn.elapsedTime) || 0,
+                  Number(s.elapsedTime) || 0,
+                ),
+              }
+            : turn
         ),
       }));
       persistSession();
@@ -4980,7 +5001,11 @@ export const useAppStore = create<AppState>()(
                 status === "awaiting_approval" || status === "awaiting_input" || status === "error"
                   ? false
                   : (turn.processCollapsed ?? turn.collapsed),
-              elapsedTime: turn.elapsedTime || s.elapsedTime || 0,
+              elapsedTime: Math.max(
+                0,
+                Number(turn.elapsedTime) || 0,
+                Number(s.elapsedTime) || 0,
+              ),
             }
           : turn
       ),
@@ -6105,6 +6130,11 @@ export const useAppStore = create<AppState>()(
                       summary: language === "zh"
                         ? "计划产物尚未成功生成或已失效，无法批准执行。"
                         : "No valid materialized plan artifact is available for approval.",
+                      elapsedTime: Math.max(
+                        0,
+                        Number(turn.elapsedTime) || 0,
+                        Number(s.elapsedTime) || 0,
+                      ),
                     }
                   : turn,
               )
@@ -6218,6 +6248,11 @@ export const useAppStore = create<AppState>()(
                   summary: language === "zh"
                     ? `计划执行物化失败（plan_execution_materialization_failed）：${qualityDetail}。请修订或重新生成计划。`
                     : `Plan execution materialization failed (plan_execution_materialization_failed): ${qualityDetail}. Revise or regenerate the plan before approval.`,
+                  elapsedTime: Math.max(
+                    0,
+                    Number(turn.elapsedTime) || 0,
+                    Number(s.elapsedTime) || 0,
+                  ),
                 }
               : turn,
           ),
@@ -7833,9 +7868,17 @@ export const useAppStore = create<AppState>()(
     });
 
     // 2. Start elapsed timer
+    const elapsedOwnerTurnIds = new Set([turnId, uiDisplayTurnId].filter(Boolean));
+    const initialElapsedSeconds = sessionGet().conversationTurns.reduce(
+      (maxElapsed, turn) => elapsedOwnerTurnIds.has(turn.id)
+        ? Math.max(maxElapsed, Number(turn.elapsedTime) || 0)
+        : maxElapsed,
+      0,
+    );
     const elapsedTimer = startSubmitElapsedTimer({
       sessionGet,
       sessionSet,
+      initialElapsedSeconds,
     });
 
     void startSubmitAsyncWorkflowRun({
@@ -7996,6 +8039,11 @@ export const useAppStore = create<AppState>()(
                         ...turn,
                         status: "paused",
                         summary: turn.summary || "Application restarted; resume from the last checkpoint.",
+                        elapsedTime: Math.max(
+                          0,
+                          Number(turn.elapsedTime) || 0,
+                          Number(s.elapsedTime) || 0,
+                        ),
                       }
                     : turn
                 ),

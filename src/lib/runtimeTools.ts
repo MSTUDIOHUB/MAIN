@@ -151,7 +151,7 @@ function parseToolCallArguments(call: RuntimeToolCall, workspace?: string | null
 }
 
 function isPlanFileReadBeforeTasks(name: string, args: Record<string, unknown>, target: string): boolean {
-  if (!["read_file", "read_document", "get_file_outline", "list_directory"].includes(name)) return false;
+  if (!["read_file", "read_document", "get_file_outline", "code_ast_query", "find_symbol_references", "git_status", "git_diff", "list_directory"].includes(name)) return false;
   const rawPath = String(args.path || args.file_path || target || "")
     .replace(/\\/g, "/")
     .toLowerCase();

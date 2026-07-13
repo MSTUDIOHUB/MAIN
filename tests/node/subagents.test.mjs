@@ -348,7 +348,18 @@ test("subagent source contracts keep children read-only and UI activity clickabl
   const schemaSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/toolSchemas.ts"), "utf8");
 
   assert.match(registrySource, /subagentDepth > 0/);
-  assert.match(registrySource, /childToolNames = new Set\(\["read_file", "grep_search", "get_file_outline"\]\)/);
+  assert.match(registrySource, /childToolNames = new Set\(\[/);
+  for (const toolName of [
+    "read_file",
+    "grep_search",
+    "get_file_outline",
+    "code_ast_query",
+    "find_symbol_references",
+    "git_status",
+    "git_diff",
+  ]) {
+    assert.match(registrySource, new RegExp(`"${toolName}"`));
+  }
   assert.match(registrySource, /mcpServers\.length > 0 && subagentDepth === 0/);
   assert.match(partitionSource, /never reuse the[\s\S]*read-only result cache for subagents/);
   assert.match(chatSource, /data-testid="subagent-activity-notice"/);

@@ -41,6 +41,7 @@ test.beforeEach(async ({ page }) => {
 test("PlanPanel adjustment input can be clicked, focused, and submitted", async ({ page }) => {
   await page.goto("/?e2eScenario=plan-flow");
 
+  await expect(page.getByTestId("turn-elapsed-time")).toHaveText("0s");
   await expect(page.locator("body")).not.toContainText("[PROPOSAL START]");
   await expect(page.locator("body")).not.toContainText("<user_options>");
   await expect(page.locator("body")).not.toContainText("<tool_use>");
