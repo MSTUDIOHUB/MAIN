@@ -64,10 +64,10 @@ function makeConfig(profile, overrides = {}) {
   };
 }
 
-test("capacity policy serializes local models and permits bounded cloud parallelism", () => {
+test("capacity policy permits two local children and bounded cloud parallelism", () => {
   const local = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
   assert.equal(local.profile, "local");
-  assert.equal(local.maxActiveRequests, 1);
+  assert.equal(local.maxActiveRequests, 2);
   assert.equal(local.maxCreatedPerTurn, 3);
   assert.equal(local.model, "qwen3.6-35b-a3b");
 
@@ -118,7 +118,7 @@ test("runtime event projection preserves completion while recording thread closu
   assert.deepEqual(subagents.getSubagentRunsForTurn(events, "turn-1").map((run) => run.id), ["subagent-1"]);
 });
 
-test("local capacity scheduler never runs two child model calls at once", async () => {
+test("local capacity scheduler runs at most two child workflows at once", async () => {
   subagents.resetSubagentRuntimeForTests();
   const policy = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
   let active = 0;
@@ -137,8 +137,10 @@ test("local capacity scheduler never runs two child model calls at once", async 
     },
   })));
 
-  assert.equal(maxActive, 1);
-  assert.deepEqual(executionOrder, ["start:0", "end:0", "start:1", "end:1", "start:2", "end:2"]);
+  assert.equal(maxActive, 2);
+  assert.deepEqual(executionOrder.slice(0, 2), ["start:0", "start:1"]);
+  assert.equal(executionOrder.filter((entry) => entry.startsWith("start:")).length, 3);
+  assert.equal(executionOrder.filter((entry) => entry.startsWith("end:")).length, 3);
 });
 
 test("cloud capacity scheduler caps concurrent child calls at three", async () => {
@@ -216,6 +218,12 @@ test("controlled child runtime isolates messages and returns its summary through
   assert.equal(traceEvents[0].data.agentKind, "subagent");
   assert.equal(traceEvents[0].data.parentRunId, "run-parent");
   assert.match(traceEvents[0].data.runId, /^run-subagent-/);
+  assert.ok(traceEvents.some((entry) => entry.event === "subagent_queued"));
+  assert.ok(traceEvents.some((entry) => entry.event === "subagent_started"));
+  assert.ok(traceEvents.some((entry) => entry.event === "subagent_finished"));
+  assert.ok(traceEvents.every((entry) =>
+    entry.data.runId === result.subagentId.replace(/^subagent-/, "run-subagent-")
+  ));
 });
 
 test("async spawn returns a handle before completion and wait preserves structured results", async () => {

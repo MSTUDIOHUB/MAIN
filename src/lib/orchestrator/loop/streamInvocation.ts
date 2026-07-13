@@ -248,7 +248,7 @@ export async function invokeInitialStreamForIteration(input: {
       maxOutputEscalations,
     );
 
-  logAgentEvent("llm_request_shape", {
+  callbacks.onDebugEvent?.("agent.llm_request_shape", {
     iteration,
     workflowMode,
     turnIntent,

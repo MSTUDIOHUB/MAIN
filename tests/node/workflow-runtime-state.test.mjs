@@ -303,7 +303,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(iterationStreamPreparationSource, /resolveFinalTextOnlyStepState\(input\.streamRuntimeState/);
   assert.match(iterationStreamPreparationSource, /appendActiveRuntimeGuidance\(\{/);
   assert.match(iterationStreamPreparationSource, /runtime_guidance_injected/);
-  assert.match(iterationStreamPreparationSource, /logAgentEvent\("iteration_start"/);
+  assert.match(iterationStreamPreparationSource, /callbacks\.onDebugEvent\?\.\("agent\.iteration_start"/);
   assert.match(iterationStreamPreparationSource, /buildExecuteRecoveryMaxIterationsPrompt/);
   assert.match(loopRuntimeActionsSource, /activateChatFinalSynthesisState\(/);
   assert.match(source, /markChatFinalSynthesisPromptUsedMutableState\(loopState\)/);
@@ -809,7 +809,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(loopControlRuntimeSource, /resolveAgentLoopIterationBudget/);
   assert.match(loopControlRuntimeSource, /plan_execution_iteration_budget_started/);
   assert.match(loopControlRuntimeSource, /buildPlanExecutionProgressUpdate/);
-  assert.match(loopControlRuntimeSource, /logAgentEvent\("loop_start"/);
+  assert.match(loopControlRuntimeSource, /callbacks\.onDebugEvent\?\.\("agent\.loop_start"/);
   assert.match(recoveryPromptRuntimeStateSource, /export interface AgentLoopRecoveryPromptRuntimeState/);
   assert.match(recoveryPromptRuntimeStateSource, /export function createAgentLoopRecoveryPromptRuntimeState/);
   assert.match(recoveryPromptRuntimeStateSource, /export function resetTransientRecoveryPromptRuntimeState/);
@@ -1328,6 +1328,11 @@ test("debug log compacts repeated prompt and tool payloads instead of storing ra
   assert.match(source, /<chars:\$\{normalized\.length\};hash:/);
   assert.match(source, /const compacted = compactDebugValue\(input\)/);
   assert.match(source, /redacted\.length > 8_000/);
+  assert.match(source, /function isSecretDebugKey/);
+  assert.match(source, /SECRET_DEBUG_KEYS/);
+  assert.doesNotMatch(source, /if \(\/authorization\|api\[-_\]\?key\|x-api-key\|token\|password\|secret\/i\.test\(key\)\)/);
+  assert.match(source, /source === "agent\.plan_runtime_tool_scope_applied"/);
+  assert.match(source, /source === "delegation_scope_decision"/);
 });
 
 test("global plan toolbar button is driven by live plan workspace, not historical plan turns", () => {

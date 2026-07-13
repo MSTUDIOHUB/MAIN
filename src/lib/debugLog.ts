@@ -51,6 +51,29 @@ function toIsoTimestamp() {
   return new Date().toISOString();
 }
 
+const SECRET_DEBUG_KEYS = new Set([
+  "authorization",
+  "apikey",
+  "xapikey",
+  "token",
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "password",
+  "secret",
+  "clientsecret",
+]);
+
+function isSecretDebugKey(key: string): boolean {
+  const normalized = String(key || "").replace(/[^a-z0-9]/gi, "").toLowerCase();
+  return SECRET_DEBUG_KEYS.has(normalized) ||
+    normalized.startsWith("authorization") ||
+    normalized.includes("apikey") ||
+    normalized.endsWith("token") ||
+    normalized.endsWith("password") ||
+    normalized.endsWith("secret");
+}
+
 function redactSecrets(text: string): string {
   return text
     .replace(/Bearer\s+[\w.+/=-]+/gi, "Bearer [REDACTED]")
@@ -158,7 +181,7 @@ function stringifyArg(arg: unknown): string {
   try {
     const seen = new WeakSet<object>();
     return JSON.stringify(arg, (key, value) => {
-      if (/authorization|api[-_]?key|x-api-key|token|password|secret/i.test(key)) {
+      if (isSecretDebugKey(key)) {
         return "[REDACTED]";
       }
       if (value && typeof value === "object") {
@@ -211,7 +234,7 @@ function compactDebugValue(value: unknown, depth = 0): unknown {
 
   const compacted: Record<string, unknown> = {};
   for (const [key, nested] of Object.entries(valueRecord)) {
-    if (/authorization|api[-_]?key|x-api-key|token|password|secret/i.test(key)) {
+    if (isSecretDebugKey(key)) {
       compacted[key] = "[REDACTED]";
       continue;
     }
@@ -358,7 +381,21 @@ function isRoutineDebugEntry(entry: DebugLogEntry): boolean {
     source === "store.reasoning_suppressed" ||
     source === "store.stream_reset" ||
     source === "agent.synthetic_visible_conclusion_suppressed" ||
-    source === "agent.tool_action_narration_injected"
+    source === "agent.tool_action_narration_injected" ||
+    source === "agent.plan_runtime_tool_scope_applied" ||
+    source === "agent.post_tool_result_continuation"
+  ) {
+    return true;
+  }
+
+  if (source === "delegation_scope_decision" && /"decision":"allowed"/i.test(message)) {
+    return true;
+  }
+
+  if (
+    source === "agent.tool_permission_plan" &&
+    /"risk":"read_only"/i.test(message) &&
+    /"policy":"auto_execute"/i.test(message)
   ) {
     return true;
   }

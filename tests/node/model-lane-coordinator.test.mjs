@@ -45,36 +45,99 @@ function localConfig() {
   };
 }
 
-test("local parent and one child model request overlap after cold-start admission", async () => {
+test("local parent and two child model requests overlap after cold-start admission", async () => {
   lanes.resetModelLaneCoordinatorForTests();
+  const events = [];
   lanes.setModelLaneMemoryReaderForTests(async () => ({
     total_gb: 64,
-    available_gb: 30,
+    available_gb: 20,
     total_bytes: 64 * 1024 ** 3,
-    available_bytes: 30 * 1024 ** 3,
+    available_bytes: 20 * 1024 ** 3,
   }));
   const parent = await lanes.acquireModelLane({
     config: localConfig(),
-    contextLimit: 32768,
+    contextLimit: 131072,
+    requestTokenBudget: 10_000,
     agentKind: "parent",
   });
-  let childAdmitted = false;
-  const childPromise = lanes.acquireModelLane({
+  let admittedChildren = 0;
+  const firstChildPromise = lanes.acquireModelLane({
     config: localConfig(),
-    contextLimit: 32768,
+    contextLimit: 131072,
+    requestTokenBudget: 10_000,
     agentKind: "subagent",
-    subagentId: "subagent-overlap",
+    subagentId: "subagent-overlap-1",
+    onDebugEvent: (event, data) => events.push({ event, data }),
   }).then((lease) => {
-    childAdmitted = true;
+    admittedChildren += 1;
+    return lease;
+  });
+  const secondChildPromise = lanes.acquireModelLane({
+    config: localConfig(),
+    contextLimit: 131072,
+    requestTokenBudget: 10_000,
+    agentKind: "subagent",
+    subagentId: "subagent-overlap-2",
+    onDebugEvent: (event, data) => events.push({ event, data }),
+  }).then((lease) => {
+    admittedChildren += 1;
     return lease;
   });
   await Promise.resolve();
-  assert.equal(childAdmitted, false);
+  assert.equal(admittedChildren, 0);
   parent.markFirstToken();
-  const child = await childPromise;
-  assert.equal(childAdmitted, true);
-  child.release();
+  const [firstChild, secondChild] = await Promise.all([firstChildPromise, secondChildPromise]);
+  assert.equal(admittedChildren, 2);
+  assert.ok(events.some((entry) =>
+    entry.event === "model_lane_admission" &&
+    entry.data.activeRequests === 3 &&
+    entry.data.limit === 3
+  ));
+  secondChild.release();
+  firstChild.release();
   parent.release();
+});
+
+test("two local subagent streams overlap using measured request demand instead of full context", async () => {
+  lanes.resetModelLaneCoordinatorForTests();
+  const events = [];
+  lanes.setModelLaneMemoryReaderForTests(async () => ({
+    total_gb: 64,
+    available_gb: 20,
+    total_bytes: 64 * 1024 ** 3,
+    available_bytes: 20 * 1024 ** 3,
+  }));
+  const first = await lanes.acquireModelLane({
+    config: localConfig(),
+    contextLimit: 131072,
+    requestTokenBudget: 12_000,
+    agentKind: "subagent",
+    subagentId: "subagent-first",
+    onDebugEvent: (event, data) => events.push({ event, data }),
+  });
+  const secondPromise = lanes.acquireModelLane({
+    config: localConfig(),
+    contextLimit: 131072,
+    requestTokenBudget: 12_000,
+    agentKind: "subagent",
+    subagentId: "subagent-second",
+    onDebugEvent: (event, data) => events.push({ event, data }),
+  });
+  first.markFirstToken();
+  const second = await secondPromise;
+
+  const admissionSample = events.find((entry) =>
+    entry.event === "memory_pressure_sample" && entry.data.phase === "admission"
+  );
+  assert.ok(admissionSample);
+  assert.equal(admissionSample.data.action, "sample");
+  assert.ok(admissionSample.data.reserveBytes < 20 * 1024 ** 3);
+  assert.ok(events.some((entry) =>
+    entry.event === "model_lane_admission" && entry.data.overlapping === true
+  ));
+
+  second.release();
+  first.release();
 });
 
 test("critical admission pressure rejects the child while preserving the parent", async () => {
@@ -118,18 +181,28 @@ for (const failureMessage of ["OOM", "connection reset", "429 rate limited", "52
       agentKind: "parent",
     });
     parent.markFirstToken();
-    const child = await lanes.acquireModelLane({
+    const firstChild = await lanes.acquireModelLane({
       config: localConfig(),
       contextLimit: 32768,
       agentKind: "subagent",
-      subagentId: "subagent-failure",
+      subagentId: "subagent-failure-first",
     });
-    let childFailure = null;
-    child.setPressureHandler((error) => { childFailure = error; });
+    const secondChild = await lanes.acquireModelLane({
+      config: localConfig(),
+      contextLimit: 32768,
+      agentKind: "subagent",
+      subagentId: "subagent-failure-second",
+    });
+    let firstChildFailure = null;
+    let secondChildFailure = null;
+    firstChild.setPressureHandler((error) => { firstChildFailure = error; });
+    secondChild.setPressureHandler((error) => { secondChildFailure = error; });
     assert.equal(parent.reportFailure(new Error(failureMessage)), true);
-    assert.match(childFailure?.message || "", /SUBAGENT_MEMORY_PRESSURE_DEGRADED/);
+    assert.equal(firstChildFailure, null);
+    assert.match(secondChildFailure?.message || "", /SUBAGENT_MEMORY_PRESSURE_DEGRADED/);
     parent.markFirstToken();
-    child.release();
+    secondChild.release();
+    firstChild.release();
     parent.release();
   });
 }

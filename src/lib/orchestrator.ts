@@ -2788,9 +2788,14 @@ export async function fetchLLMStream(
 
   const traceContext = callbacks.getRuntimeTraceContext?.();
   const isSubagentRequest = (callbacks.getSubagentDepth?.() || 0) > 0;
+  const requestTokenBudget = Math.min(
+    settings.contextLimit || 32_768,
+    Math.max(2_048, estimateMessagesTokens(messages as TrimMessage[]) + currentMaxTokens),
+  );
   const modelLane = await acquireModelLane({
     config: callbacks.getConfig(),
     contextLimit: settings.contextLimit,
+    requestTokenBudget,
     agentKind: isSubagentRequest ? "subagent" : "parent",
     subagentId: traceContext?.subagentId,
     signal,

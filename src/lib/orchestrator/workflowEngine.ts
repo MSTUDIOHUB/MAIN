@@ -209,6 +209,13 @@ export class WorkflowEngine {
       outerRunId: context.harnessRunId,
       source: "harness_marker",
     };
+    let lastNonActionableStopDiagnostic: {
+      reason: string;
+      recoveryReason: string | null;
+      phase: string | null;
+      nextStep: string | null;
+      repeatedTargets: string[];
+    } | null = null;
     const logStoreEvent = (event: string, data: Record<string, unknown> = {}) => {
       const state = sessionGet();
       const goal = state.goalRuntime?.goal || state.activeGoal || null;
@@ -516,6 +523,7 @@ export class WorkflowEngine {
 	          streamElapsedMs: marker.streamElapsedMs || 0,
 	          streamLifecycleStatus: marker.streamLifecycleStatus || null,
 	          lastStreamError: marker.lastStreamError || null,
+	          stopDiagnostic: lastNonActionableStopDiagnostic,
 	        });
 	      }
 	      else if (marker?.status === "running") {
@@ -2393,6 +2401,13 @@ export class WorkflowEngine {
       },
 
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", progress?: Partial<PlanExecutionProgressUpdate>) => {
+        lastNonActionableStopDiagnostic = {
+          reason,
+          recoveryReason: progress?.recoveryReason || null,
+          phase: progress?.phase || null,
+          nextStep: progress?.nextStep || null,
+          repeatedTargets: progress?.repeatedTargets || [],
+        };
         logStoreEvent("non_actionable_stop", {
           reason,
           recoveryReason: progress?.recoveryReason || null,

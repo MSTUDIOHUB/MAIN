@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  extractDelegatedSubagentActivities,
   isEditProgressResult,
   isVerificationEvidenceResult,
   rememberToolActivity,
@@ -255,6 +256,93 @@ test("tool activity tracking records bounded recent activity and helper classifi
     content: JSON.stringify({ ok: false, error: "assertion failed" }),
   })), false);
   assert.equal(isVerificationEvidenceResult(result({ name: "run_command", isError: true })), false);
+});
+
+test("wait_subagents promotes child file evidence instead of recording orchestration noise", () => {
+  const waitResult = result({
+    toolCallId: "wait_1",
+    name: "wait_subagents",
+    target: "subagent-a,subagent-b",
+    content: formatToolFeedbackEnvelope({
+      status: "completed",
+      toolCallId: "wait_1",
+      tool: "wait_subagents",
+      target: "subagent-a,subagent-b",
+      content: JSON.stringify({
+        results: [{
+          subagentId: "subagent-a",
+          status: "completed",
+          evidence: [{
+            tool: "read_file",
+            target: "src/lib/subagents.ts",
+            detail: "The resolveSubagentCapacityPolicy function incorrectly limits local child workflows before model-lane admission.",
+          }],
+        }, {
+          subagentId: "subagent-b",
+          status: "completed",
+          evidence: [{
+            tool: "read_file",
+            target: "src/lib/modelLaneCoordinator.ts",
+            detail: "The acquireModelLane function enforces the shared parent and child model-stream limit.",
+          }],
+        }],
+        pendingIds: [],
+      }),
+    }),
+  });
+
+  const promoted = extractDelegatedSubagentActivities(waitResult);
+  assert.deepEqual(promoted.map((item) => item.target), [
+    "src/lib/subagents.ts",
+    "src/lib/modelLaneCoordinator.ts",
+  ]);
+  assert.ok(promoted.every((item) => item.status === "succeeded"));
+
+  const debugEvents = [];
+  const harness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "grounding",
+    results: [waitResult],
+    toolArgsByCallId: new Map([["wait_1", { subagent_ids: "subagent-a,subagent-b" }]]),
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  harness.input.callbacks = {
+    ...harness.input.callbacks,
+    getMessages: () => [{
+      role: "user",
+      content: "Prepare a plan for local subagent capacity and shared model-lane admission.",
+    }],
+    getCurrentTurnId: () => "turn-subagent-plan",
+    getContextMemoryState: () => null,
+    onDebugEvent: (event, data) => debugEvents.push({ event, data }),
+  };
+
+  const post = handleToolResultPostProcessing(harness.input);
+  assert.equal(post.planRuntimePhase, "drafting");
+  assert.deepEqual(harness.recentPlanToolActivity.map((item) => item.name), ["read_file", "read_file"]);
+  assert.ok([...harness.taskTargetingEvidence].includes("path:src/lib/subagents.ts"));
+  assert.ok(debugEvents.some((entry) =>
+    entry.event === "subagent_evidence_promoted" && entry.data.evidenceCount === 2
+  ));
+
+  const executionHarness = createPostProcessingInput({
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    planRuntimePhase: "idle",
+    results: [waitResult],
+    toolArgsByCallId: new Map([["wait_1", { subagent_ids: "subagent-a,subagent-b" }]]),
+  });
+  handleToolResultPostProcessing(executionHarness.input);
+  assert.deepEqual(executionHarness.recentToolActivity.map((item) => item.target), [
+    "src/lib/subagents.ts",
+    "src/lib/modelLaneCoordinator.ts",
+  ]);
+  assert.equal(executionHarness.executeEvidenceMarks.length, 0);
+  assert.match(executionHarness.digests[0], /read_file src\/lib\/modelLaneCoordinator\.ts/);
 });
 
 test("tool result post-processing records source-write evidence digest and recovery reset", () => {

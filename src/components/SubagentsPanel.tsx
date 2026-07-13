@@ -130,7 +130,7 @@ export default function SubagentsPanel({
         </div>
         <div className={`mt-2 truncate text-[10px] ${isLight ? "text-[#80868b]" : "text-[#71717a]"}`} title={`${capacityPolicy.provider} · ${capacityPolicy.model}`}>
           {capacityPolicy.profile === "local"
-            ? language === "zh" ? "本地主体 + 1 子流" : "Local main + 1 child stream"
+            ? language === "zh" ? "本地主体 + 最多 2 个子流" : "Local parent + up to 2 child streams"
             : language === "zh" ? "云端受控并行" : "Controlled cloud parallelism"}
           {` · ${capacityPolicy.provider} · ${capacityPolicy.model}`}
         </div>

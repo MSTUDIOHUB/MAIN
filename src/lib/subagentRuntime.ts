@@ -43,6 +43,28 @@ function compactText(value: unknown, maxChars: number): string {
   return text.length > maxChars ? `${text.slice(0, maxChars).trimEnd()}...` : text;
 }
 
+function compactEvidence(
+  evidence: SubagentResultEnvelope["evidence"],
+): SubagentResultEnvelope["evidence"] {
+  const seen = new Set<string>();
+  const compacted: SubagentResultEnvelope["evidence"] = [];
+  for (const item of evidence) {
+    const tool = compactText(item.tool, 80);
+    const target = compactText(item.target, 300);
+    if (!tool || !target) continue;
+    const key = `${tool}:${target}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    compacted.push({
+      tool,
+      target,
+      detail: compactText(item.detail, 400),
+    });
+    if (compacted.length >= 10) break;
+  }
+  return compacted;
+}
+
 function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"): string {
   const hints = compactText(request.contextHints, 1_600);
   const allowedPaths = compactText(request.allowedPaths, 2_000);
@@ -155,6 +177,15 @@ export function scheduleControlledSubagent(input: {
     scopeKey,
     allowedPaths,
   };
+  input.parentCallbacks.onDebugEvent?.("subagent_scheduled", {
+    subagentId,
+    name,
+    role,
+    scopeKey,
+    profile: policy.profile,
+    childCapacity: policy.maxActiveRequests,
+    allowedPathCount: allowedPaths.length,
+  });
   const completion = executeControlledSubagent({ ...input, prepared });
   registerCoordinatedSubagentRun({
     threadId: input.parentCallbacks.getSessionKey(),
@@ -193,6 +224,18 @@ export async function executeControlledSubagent(input: {
   })();
   const { subagentId, name, role, objective, scopeKey, allowedPaths } = prepared;
   const childRunId = `run-${subagentId}`;
+  const parentRunId = input.parentCallbacks.getCurrentRunIdentity?.().runId || null;
+  const emitChildDebug = (event: string, data: Record<string, unknown> = {}) => {
+    input.parentCallbacks.onDebugEvent?.(event, {
+      ...data,
+      threadId: `${input.parentCallbacks.getSessionKey()}:${subagentId}`,
+      turnId: subagentId,
+      runId: childRunId,
+      parentRunId,
+      agentKind: "subagent",
+      subagentId,
+    });
+  };
 
   const now = Date.now();
   const snapshot: SubagentRunSnapshot = {
@@ -225,6 +268,12 @@ export async function executeControlledSubagent(input: {
     timestampMs: now,
     subagent: snapshot,
   }));
+  emitChildDebug("subagent_queued", {
+    scopeKey,
+    profile: policy.profile,
+    childCapacity: policy.maxActiveRequests,
+    allowedPathCount: allowedPaths.length,
+  });
   acquireSubagentScopeLease({
     threadId: snapshot.threadId,
     parentTurnId: input.parentTurnId,
@@ -319,7 +368,7 @@ export async function executeControlledSubagent(input: {
     getSubagentDepth: () => 1,
     getCurrentRunIdentity: () => ({
       runId: childRunId,
-      parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
+      parentRunId,
     }),
     getSubagentScope: () => ({
       subagentId,
@@ -332,7 +381,7 @@ export async function executeControlledSubagent(input: {
       threadId: `${snapshot.threadId}:${subagentId}`,
       turnId: subagentId,
       runId: childRunId,
-      parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
+      parentRunId,
       agentKind: "subagent",
       subagentId,
     }),
@@ -344,15 +393,7 @@ export async function executeControlledSubagent(input: {
           completedToolCalls,
         });
       }
-      input.parentCallbacks.onDebugEvent?.(event, {
-        ...data,
-        threadId: `${snapshot.threadId}:${subagentId}`,
-        turnId: subagentId,
-        runId: childRunId,
-        parentRunId: input.parentCallbacks.getCurrentRunIdentity?.().runId || null,
-        agentKind: "subagent",
-        subagentId,
-      });
+      emitChildDebug(event, data);
     },
     runSubagent: undefined,
     waitSubagents: undefined,
@@ -475,22 +516,36 @@ export async function executeControlledSubagent(input: {
   let finalStatus: SubagentStatus = "failed";
   let finalSummary = "";
   let wallClockTimedOut = false;
+  const lifecycleStartedAt = Date.now();
+  let capacityQueuedAt: number | null = null;
   try {
     return await withSubagentCapacity({
       policy,
       signal: childAbortController.signal,
-      onQueued: () => emitUpdate({
-        status: "queued",
-        progress: {
-          phase: "queued",
-          title: policy.profile === "local"
-            ? language === "zh" ? "本地模型单通道排队中" : "Queued on the single local model lane"
-            : language === "zh" ? "等待云端并发配额" : "Waiting for cloud concurrency capacity",
-          completedToolCalls,
-        },
-      }),
+      onQueued: () => {
+        capacityQueuedAt = Date.now();
+        emitChildDebug("subagent_capacity_queued", {
+          profile: policy.profile,
+          childCapacity: policy.maxActiveRequests,
+        });
+        emitUpdate({
+          status: "queued",
+          progress: {
+            phase: "queued",
+            title: policy.profile === "local"
+              ? language === "zh" ? "等待本地子智能体并发配额" : "Waiting for local subagent capacity"
+              : language === "zh" ? "等待云端并发配额" : "Waiting for cloud concurrency capacity",
+            completedToolCalls,
+          },
+        });
+      },
       task: async () => {
         const startedAt = Date.now();
+        emitChildDebug("subagent_started", {
+          profile: policy.profile,
+          capacityWaitMs: capacityQueuedAt == null ? 0 : startedAt - capacityQueuedAt,
+          childCapacity: policy.maxActiveRequests,
+        });
         emitUpdate({
           status: "starting",
           startedAt,
@@ -559,7 +614,7 @@ export async function executeControlledSubagent(input: {
             evidenceCount: evidence.length,
             remainingWork: objective,
           }));
-          input.parentCallbacks.onDebugEvent?.("subagent_handed_back", {
+          emitChildDebug("subagent_handed_back", {
             subagentId,
             scopeKey,
             reason: lastError || outcome.reason,
@@ -573,7 +628,7 @@ export async function executeControlledSubagent(input: {
           scopeKey,
           status: finalStatus,
           summary: finalSummary,
-          evidence: evidence.slice(-24),
+          evidence: compactEvidence(evidence),
           ...(finalStatus === "completed" ? {} : { blocker: lastError || outcome.reason }),
           ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
@@ -620,13 +675,20 @@ export async function executeControlledSubagent(input: {
       scopeKey,
       status: finalStatus,
       summary: finalSummary,
-      evidence: evidence.slice(-24),
+      evidence: compactEvidence(evidence),
       blocker: lastError,
       ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
       error: lastError,
     };
   } finally {
     const closedAt = Date.now();
+    emitChildDebug("subagent_finished", {
+      status: finalStatus,
+      durationMs: closedAt - lifecycleStartedAt,
+      completedToolCalls,
+      evidenceCount: compactEvidence(evidence).length,
+      blocker: compactText(lastError, 300) || null,
+    });
     input.emitEvent(withEventSchema({
       type: "subagent.closed",
       threadId: snapshot.threadId,

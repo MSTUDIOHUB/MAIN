@@ -20,7 +20,7 @@ test.describe("subagent activity and right panel", () => {
     await page.getByTestId("subagent-activity-subagent-mendel").click();
     const panel = page.getByTestId("subagents-panel");
     await expect(panel).toBeVisible();
-    await expect(panel).toContainText("本地主体 + 1 子流");
+    await expect(panel).toContainText("本地主体 + 最多 2 个子流");
     await expect(panel).toContainText("qwen3.6-35b-a3b");
     await expect(page.getByTestId("subagent-detail")).toContainText("Mendel");
     await expect(page.getByTestId("subagent-detail")).toContainText("src/components/ChatArea.tsx");

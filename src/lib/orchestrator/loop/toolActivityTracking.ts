@@ -19,6 +19,73 @@ const PTY_OBSERVATION_TOOL_NAMES = new Set([
   "get_pty_status",
 ]);
 
+const SUBAGENT_EVIDENCE_TOOLS = new Set([
+  "read_file",
+  "read_file_window",
+  "read_document",
+  "get_file_outline",
+  "grep_search",
+]);
+
+function appendBoundedToolActivity(
+  targetList: PlanToolActivitySummary[],
+  activity: PlanToolActivitySummary,
+): void {
+  targetList.push(activity);
+  if (targetList.length > MAX_RECENT_PLAN_TOOL_ACTIVITY) {
+    targetList.splice(0, targetList.length - MAX_RECENT_PLAN_TOOL_ACTIVITY);
+  }
+}
+
+export function extractDelegatedSubagentActivities(
+  result: ToolExecutionResult,
+): PlanToolActivitySummary[] {
+  if (result.name !== "wait_subagents" || result.isError) return [];
+  const parsedFeedback = parseToolFeedbackEnvelope(result.content || "");
+  const body = parsedFeedback?.body || result.content || "";
+  let payload: unknown;
+  try {
+    payload = JSON.parse(body);
+  } catch {
+    return [];
+  }
+  const results = Array.isArray((payload as { results?: unknown[] })?.results)
+    ? (payload as { results: unknown[] }).results
+    : [];
+  const activities: PlanToolActivitySummary[] = [];
+  const seen = new Set<string>();
+  for (const envelope of results) {
+    const record = envelope && typeof envelope === "object"
+      ? envelope as Record<string, unknown>
+      : {};
+    const status = String(record.status || "");
+    if (!/^(?:completed|blocked|degraded)$/.test(status) || !Array.isArray(record.evidence)) continue;
+    for (const item of record.evidence) {
+      const evidence = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const name = String(evidence.tool || "").trim();
+      const target = String(evidence.target || "").trim();
+      if (!SUBAGENT_EVIDENCE_TOOLS.has(name) || !target) continue;
+      const key = `${name}:${target}`.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const detail = summarizePlanEvidenceDetail({
+        tool: name,
+        target,
+        content: String(evidence.detail || ""),
+        maxChars: 220,
+      });
+      activities.push({
+        name,
+        target,
+        status: "succeeded",
+        ...(detail ? { detail } : {}),
+      });
+      if (activities.length >= MAX_RECENT_PLAN_TOOL_ACTIVITY) return activities;
+    }
+  }
+  return activities;
+}
+
 export function toolResultCountsAsExecutionEvidence(
   result: ToolExecutionResult,
   args: Record<string, unknown>,
@@ -60,15 +127,19 @@ export function rememberToolActivity(
     maxChars: 220,
   });
   const detail = planEvidenceDetail || (/\bREAD_FILE_RESULT\b/i.test(rawDetail) ? "" : truncateForLog(rawDetail, 120));
-  targetList.push({
+  appendBoundedToolActivity(targetList, {
     name: result.name,
     target: result.target,
     status: result.isError ? "failed" : "succeeded",
     ...(detail ? { detail } : {}),
   });
-  if (targetList.length > MAX_RECENT_PLAN_TOOL_ACTIVITY) {
-    targetList.splice(0, targetList.length - MAX_RECENT_PLAN_TOOL_ACTIVITY);
-  }
+}
+
+export function rememberDelegatedSubagentActivities(
+  targetList: PlanToolActivitySummary[],
+  activities: PlanToolActivitySummary[],
+): void {
+  activities.forEach((activity) => appendBoundedToolActivity(targetList, activity));
 }
 
 export function isEditProgressResult(result: ToolExecutionResult): boolean {

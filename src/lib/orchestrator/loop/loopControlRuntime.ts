@@ -249,7 +249,7 @@ export function createAgentLoopControlRuntime(input: {
 
   const startLoop: AgentLoopControlRuntime["startLoop"] = (startInput) => {
     const { runtimeIntent, loopStartTools, mcpToolCount } = startInput;
-    logAgentEvent("loop_start", {
+    callbacks.onDebugEvent?.("agent.loop_start", {
       workflowMode,
       turnIntent,
       runtimeIntent,

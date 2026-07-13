@@ -17,7 +17,9 @@ import { getTaskTargetingEvidenceKey, type TaskOrchestratorPhase } from "../../t
 import { isPlanTaskTrustedComplete, type PlanRuntimePhase } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
 import {
+  extractDelegatedSubagentActivities,
   isVerificationEvidenceResult,
+  rememberDelegatedSubagentActivities,
   rememberToolActivity,
   toolResultCountsAsExecutionEvidence,
 } from "./toolActivityTracking";
@@ -126,6 +128,10 @@ export function handleToolResultPostProcessing(input: {
   // Internal quality-gate feedback is model/runtime control flow. It must not
   // become user progress, execution evidence, task targeting or success usage.
   const externalResults = results.filter((result) => !result.internalFeedback);
+  const delegatedActivities = externalResults.flatMap(extractDelegatedSubagentActivities);
+  const directlyTrackedResults = externalResults.filter((result) =>
+    result.name !== "spawn_subagent" && result.name !== "wait_subagents"
+  );
 
   const resultCountsAsExecutionEvidence = (result: ToolExecutionResult): boolean => {
     const resultArgs = toolArgsByCallId.get(result.toolCallId) ?? {};
@@ -170,6 +176,21 @@ export function handleToolResultPostProcessing(input: {
       recoveringFromEmptyAssistantReplyAfterWrite = false;
     }
   }
+  for (const activity of delegatedActivities) {
+    const targetingEvidenceKey = getTaskTargetingEvidenceKey(
+      activity.name,
+      { path: activity.target },
+      activity.target,
+    );
+    if (targetingEvidenceKey) taskTargetingEvidence.add(targetingEvidenceKey);
+  }
+  if (delegatedActivities.length > 0) {
+    callbacks.onDebugEvent?.("subagent_evidence_promoted", {
+      iteration,
+      evidenceCount: delegatedActivities.length,
+      targets: delegatedActivities.map((activity) => activity.target).slice(0, 12),
+    });
+  }
 
   const unityConsoleResult = resolveUnityMcpForcedConsoleResult({
     results: externalResults,
@@ -184,21 +205,33 @@ export function handleToolResultPostProcessing(input: {
   unityConsoleMissingFirstToolRepromptIssued = unityConsoleResult.unityConsoleMissingFirstToolRepromptIssued;
   const unityMcpFallbackPrompt = unityConsoleResult.prompt;
 
-  externalResults.forEach((result) => rememberToolActivity(recentToolActivity, result));
+  directlyTrackedResults.forEach((result) => rememberToolActivity(recentToolActivity, result));
+  rememberDelegatedSubagentActivities(recentToolActivity, delegatedActivities);
   const remainingTaskText =
     callbacks.getPlanTasks().find((task) => !isPlanTaskTrustedComplete(task))?.text ?? null;
-  if (callbacks.onExecutionDigestUpdate && externalResults.length > 0) {
+  const digestResults = [
+    ...directlyTrackedResults,
+    ...delegatedActivities.map((activity, index) => ({
+      toolCallId: `delegated-evidence-${index}`,
+      name: activity.name,
+      target: activity.target,
+      content: activity.detail || "delegated subagent evidence",
+      isError: false,
+    })),
+  ];
+  if (callbacks.onExecutionDigestUpdate && digestResults.length > 0) {
     const digest = buildExecutionDigest({
       language: callbacks.getPreferredLanguage(),
       turnIntent,
-      toolResults: externalResults,
+      toolResults: digestResults,
       remainingTask: remainingTaskText || undefined,
     });
     if (digest) callbacks.onExecutionDigestUpdate(digest);
   }
 
   if (workflowMode === "plan") {
-    externalResults.forEach((result) => rememberToolActivity(recentPlanToolActivity, result));
+    directlyTrackedResults.forEach((result) => rememberToolActivity(recentPlanToolActivity, result));
+    rememberDelegatedSubagentActivities(recentPlanToolActivity, delegatedActivities);
     if (
       !callbacks.getIsPlanApproved() &&
       planRuntimePhase === "drafting" &&

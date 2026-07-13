@@ -186,11 +186,12 @@ export function resolveAgentLoopTurnInputContext(
   const latestUserPromptText = canonicalUserContext.texts.join("\n\n") ||
     extractPrimaryUserRequestText(latestUserPromptFullText) ||
     latestUserPromptFullText;
-  logAgentEvent("turn_context_sources", {
+  const traceContext = callbacks.getRuntimeTraceContext?.();
+  callbacks.onDebugEvent?.("agent.turn_context_sources", {
     sessionKey,
     turnId: turnId || null,
-    runId: marker?.runId || null,
-    parentRunId: marker?.parentRunId || null,
+    runId: traceContext?.runId || callbacks.getCurrentRunIdentity?.().runId || marker?.runId || null,
+    parentRunId: traceContext?.parentRunId ?? callbacks.getCurrentRunIdentity?.().parentRunId ?? marker?.parentRunId ?? null,
     source: canonicalUserContext.source,
     turnStartMessageIndex: canonicalUserContext.turnStartMessageIndex,
     canonicalUserMessageCount: canonicalUserContext.texts.length,
@@ -737,13 +738,14 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
   if (runIdentity.goalSliceId) {
     callbacks.onHarnessRunUpdate?.({ lastGoalSliceRunId: runIdentity.runId });
   }
-  logAgentEvent("run_identity_resolved", {
+  const currentRunIdentity = resolveRunEventIdentity();
+  callbacks.onDebugEvent?.("agent.run_identity_resolved", {
     threadId: eventThreadId,
     turnId: eventTurnId,
-    runId: runIdentity.runId,
-    parentRunId: runIdentity.parentRunId,
+    runId: currentRunIdentity.runId,
+    parentRunId: currentRunIdentity.parentRunId,
     outerRunId: runIdentity.outerRunId,
-    goalSliceId: runIdentity.goalSliceId || null,
+    goalSliceId: currentRunIdentity.goalSliceId || null,
     continuesTurn: eventContinuesTurn,
     source: runIdentity.source,
   });

@@ -297,7 +297,7 @@ export function prepareIterationStreamRequest(input: {
       forceXmlTools: contextManagementResult.forceXmlTools,
     });
 
-  logAgentEvent("iteration_start", {
+  callbacks.onDebugEvent?.("agent.iteration_start", {
     iteration,
     workflowMode,
     turnIntent,

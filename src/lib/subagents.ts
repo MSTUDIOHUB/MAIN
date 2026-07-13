@@ -190,7 +190,7 @@ export function resolveSubagentCapacityPolicy(config: AppConfig): SubagentCapaci
     model: configured.model,
     // This is the number of child workflows. Model-request concurrency is
     // coordinated separately and reserves capacity for the parent thread.
-    maxActiveRequests: profile === "local" ? 1 : 3,
+    maxActiveRequests: profile === "local" ? 2 : 3,
     maxCreatedPerTurn: profile === "local" ? 3 : 6,
     childMaxIterations: profile === "local" ? 6 : 8,
   };
