@@ -1234,7 +1234,10 @@ export function handleRepeatedEditValidationRecovery(input: {
 
     const count = (successfulEditTargetsSinceVerification.get(targetKey) || 0) + 1;
     successfulEditTargetsSinceVerification.set(targetKey, count);
-    if (count < 5) continue;
+    // Three successful writes to the same target without validation is enough
+    // to detect a stale-edit loop. Waiting for five allowed local models to
+    // repeatedly damage syntax before the runtime forced a compile/test step.
+    if (count < 3) continue;
 
     const displayTarget = String(result.target || targetKey).replace(/^shell-write:/, "");
     const language = callbacks.getPreferredLanguage();

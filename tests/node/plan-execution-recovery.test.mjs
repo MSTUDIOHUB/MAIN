@@ -1504,9 +1504,12 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     "write_file",
     "run_command",
     "execute_command",
+    "send_pty_input",
     "browser_evaluate",
+    "get_pty_status",
   ]);
-  assert.equal(cachedReadRecoveryTools.includes("send_pty_input"), false);
+  assert.equal(cachedReadRecoveryTools.includes("send_pty_input"), true);
+  assert.equal(cachedReadRecoveryTools.includes("get_pty_status"), true);
   assert.equal(patchRecoveryTools.includes("read_file"), true);
   assert.equal(patchRecoveryTools.includes("list_directory"), false);
   assert.equal(

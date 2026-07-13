@@ -51,6 +51,7 @@ import { formatDirectoryNodesForTool } from "./workspacePaths";
 import { formatReadFileWindowForModel, formatReadFileWindowPayloadForModel } from "./readFileWindow";
 import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
+import { sanitizePtyOutput } from "./ptyOutputSanitizer";
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -60,23 +61,6 @@ function sleep(ms: number): Promise<void> {
  * Sanitizes raw PTY output by stripping ANSI escape sequences and
  * resolving carriage returns (\r) to avoid progress bar string inflation.
  */
-function sanitizePtyOutput(rawText: string): string {
-  if (!rawText) return rawText;
-  
-  // 1. Strip ANSI escape sequences
-  const noAnsi = rawText.replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, "");
-
-  // 2. Collapse carriage returns (\r)
-  const lines = noAnsi.split('\n');
-  const collapsedLines = lines.map(line => {
-    if (!line.includes('\r')) return line;
-    const parts = line.split('\r');
-    return parts[parts.length - 1];
-  });
-  
-  return collapsedLines.join('\n');
-}
-
 function sanitizePtyResult<T extends { text?: string }>(result: T): T {
   if (result && typeof result.text === "string") {
     return { ...result, text: sanitizePtyOutput(result.text) };

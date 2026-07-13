@@ -230,6 +230,21 @@ test("tool activity tracking records bounded recent activity and helper classifi
   assert.equal(isEditProgressResult(result({ name: "run_command", target: "shell-write:npm test" })), true);
   assert.equal(isVerificationEvidenceResult(result({ name: "run_command", isError: false })), true);
   assert.equal(isVerificationEvidenceResult(result({
+    name: "execute_command",
+    isError: false,
+    content: JSON.stringify({ command: "npm run dev", output: "starting" }),
+  })), false);
+  assert.equal(isVerificationEvidenceResult(result({
+    name: "read_pty_tail",
+    isError: false,
+    content: JSON.stringify({ running: true, text: "Waiting for your frontend dev server to start" }),
+  })), false);
+  assert.equal(isVerificationEvidenceResult(result({
+    name: "read_pty_since",
+    isError: false,
+    content: JSON.stringify({ running: true, text: "VITE ready in 812 ms\nLocal: http://localhost:1420/" }),
+  })), true);
+  assert.equal(isVerificationEvidenceResult(result({
     name: "run_command",
     isError: false,
     content: JSON.stringify({ exitCode: 1, stderr: "failed" }),

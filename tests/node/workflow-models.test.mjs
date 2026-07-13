@@ -95,6 +95,7 @@ const {
   detectResponseLanguageMismatch,
   deriveRuntimePlanTasksFromArtifacts,
   deriveVisibleConversationTurnStatus,
+  extractShellCommandsFromText,
   extractPlanTasks,
   findDroppedPlanTasks,
   hasLivePlanWorkspace,
@@ -1609,10 +1610,35 @@ test("long-running desktop startup requires execute_command plus a later PTY obs
   assert.equal(isPlanTaskTrustedComplete(pendingStartup), false);
   assert.match(pendingStartup?.blockedReason || "", /PTY/);
 
-  const observed = createPlanExecutionEvidenceEntry({
+  const stillStarting = createPlanExecutionEvidenceEntry({
     toolName: "read_pty_since",
     target: "terminal @ 48",
-    result: JSON.stringify({ text: "Finished dev startup", startOffset: 48, endOffset: 72 }),
+    result: JSON.stringify({
+      text: "Waiting for your frontend dev server to start on http://localhost:1420/",
+      startOffset: 48,
+      endOffset: 72,
+      running: true,
+    }),
+  });
+  const whileStarting = reconcilePlanTaskCompletion(
+    [],
+    tasks,
+    [dispatched, stillStarting].filter(Boolean),
+  );
+  assert.equal(
+    isPlanTaskTrustedComplete(whileStarting.find((task) => task.id === startupTask.id)),
+    false,
+  );
+
+  const observed = createPlanExecutionEvidenceEntry({
+    toolName: "read_pty_since",
+    target: "terminal @ 72",
+    result: JSON.stringify({
+      text: "VITE v7.0.4 ready in 812 ms\nLocal: http://localhost:1420/",
+      startOffset: 72,
+      endOffset: 108,
+      running: true,
+    }),
   });
   const wrongDispatch = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
@@ -1641,6 +1667,57 @@ test("long-running desktop startup requires execute_command plus a later PTY obs
   assert.equal(pendingDesktopValidation?.evidenceStatus, "requires_tauri_validation");
   assert.equal(audit.pendingExternalValidation, true);
   assert.equal(audit.allTrustedComplete, false);
+
+  const restarted = {
+    ...dispatched,
+    id: "restart",
+    createdAt: Number(observed?.createdAt || 0) + 1,
+    observationStatus: "pending",
+  };
+  const afterRestart = reconcilePlanTaskCompletion(
+    [],
+    tasks,
+    [dispatched, observed, restarted].filter(Boolean),
+  );
+  assert.equal(
+    isPlanTaskTrustedComplete(afterRestart.find((task) => task.id === startupTask.id)),
+    false,
+    "a later restart must invalidate readiness from an older process",
+  );
+
+  const failed = {
+    ...stillStarting,
+    id: "failed-observation",
+    createdAt: restarted.createdAt + 1,
+    observationStatus: "failed",
+  };
+  const afterFailure = reconcilePlanTaskCompletion(
+    [],
+    tasks,
+    [dispatched, observed, restarted, failed].filter(Boolean),
+  );
+  const failedStartup = afterFailure.find((task) => task.id === startupTask.id);
+  assert.equal(failedStartup?.evidenceStatus, "blocked");
+  assert.match(failedStartup?.blockedReason || "", /启动失败/);
+});
+
+test("negated validation alternatives are not materialized as shell commands", () => {
+  const text = "此项保留待 Tauri 运行时确认，不能用 cargo check、构建或 curl 代替。";
+  assert.deepEqual(extractShellCommandsFromText(text), []);
+
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# 计划",
+      "## 验证",
+      `- ${text} （证据：tauri_required:desktop runtime interaction）`,
+    ].join("\n"),
+  }], { language: "zh" });
+  assert.equal(tasks.some((task) => task.commands?.some((command) => /cargo check/.test(command))), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "tauri_required")), true);
 });
 
 test("focused test or build alternatives accept fresh command evidence without becoming Tauri-only", () => {

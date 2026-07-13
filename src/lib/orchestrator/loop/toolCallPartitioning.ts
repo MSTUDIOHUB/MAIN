@@ -56,6 +56,10 @@ import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { findSubagentScopeConflict, validateSubagentScopeTarget } from "../../subagents";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import { parseApplyPatch } from "../../applyPatchTool";
+import { shouldCacheReadOnlyToolResult } from "../../readOnlyToolCachePolicy";
+import {
+  resolveBrowserValidationPreflight,
+} from "../../devServerRuntime";
 import type {
   AgentMessage,
   CachedReadOnlyToolResult,
@@ -178,6 +182,45 @@ export async function partitionToolCallsForExecution(input: {
         imageParts: targetingProfile.imageParts,
         hasUserProvidedContext: targetingProfile.hasUserProvidedContext,
       });
+    }
+
+    if (tc.name === "browser_evaluate" && typeof toolArgs.url === "string") {
+      const browserPreflight = resolveBrowserValidationPreflight({
+        requestedUrl: toolArgs.url,
+        ledger: callbacks.getPlanExecutionEvidenceLedger(),
+      });
+      if (browserPreflight.action === "block") {
+        const requestedUrl = toolArgs.url;
+        const failed = browserPreflight.runtimeStatus === "failed" || browserPreflight.runtimeStatus === "stopped";
+        const message = failed
+          ? `DEV_SERVER_START_FAILED: the latest PTY observation shows that the dev server failed. Repair or restart it, then inspect PTY readiness before browser validation at ${requestedUrl}.`
+          : `DEV_SERVER_NOT_READY: the latest long-running command is still ${browserPreflight.runtimeStatus}. Call read_pty_since/read_pty_tail/get_pty_status and wait for a ready URL before browser validation at ${requestedUrl}.`;
+        callbacks.onToolError(tc.name, requestedUrl, message, { toolCallId: tc.id });
+        logAgentEvent("browser_validation_blocked_until_dev_server_ready", {
+          iteration,
+          requestedUrl,
+          runtimeStatus: browserPreflight.runtimeStatus,
+        });
+        preExecutionResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target: requestedUrl,
+          content: `Error: ${message}`,
+          isError: true,
+          lifecycleState: "blocked",
+        });
+        continue;
+      }
+      if (browserPreflight.action === "correct") {
+        const requestedUrl = toolArgs.url;
+        toolArgs = { ...toolArgs, url: browserPreflight.url };
+        tc.arguments = JSON.stringify(toolArgs);
+        logAgentEvent("browser_validation_url_corrected_from_runtime_evidence", {
+          iteration,
+          requestedUrl,
+          resolvedUrl: browserPreflight.url,
+        });
+      }
     }
 
     toolArgsByCallId.set(tc.id, toolArgs);
@@ -575,8 +618,9 @@ export async function partitionToolCallsForExecution(input: {
         continue;
       }
       let effectiveToolArgs = toolArgs;
+      const cacheableReadOnlyTool = shouldCacheReadOnlyToolResult(tc.name);
       let signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
-      let cached = readOnlyResultCache.get(signature);
+      let cached = cacheableReadOnlyTool ? readOnlyResultCache.get(signature) : undefined;
       const fileReadMetadata =
         tc.name === "read_file" && typeof toolArgs.path === "string"
           ? await readFileMetadataIfAvailable(toolArgs.path, workspace)
@@ -848,7 +892,11 @@ export async function partitionToolCallsForExecution(input: {
         }
       }
 
-      if (!bypassApprovedPlanPatchRecoveryReadCache && (cached || queuedReadOnlySignatures.has(signature))) {
+      if (
+        cacheableReadOnlyTool &&
+        !bypassApprovedPlanPatchRecoveryReadCache &&
+        (cached || queuedReadOnlySignatures.has(signature))
+      ) {
         const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;
         readOnlyDuplicateSkipCounts.set(signature, duplicateCount);
         const shouldPushReadOnlyRepeatLimit =
@@ -910,8 +958,10 @@ export async function partitionToolCallsForExecution(input: {
         continue;
       }
 
-      queuedReadOnlySignatures.add(signature);
-      readOnlyCallSignatures.set(tc.id, signature);
+      if (cacheableReadOnlyTool) {
+        queuedReadOnlySignatures.add(signature);
+        readOnlyCallSignatures.set(tc.id, signature);
+      }
       if (fileReadSignature) readOnlyCallSignatures.set(`${tc.id}:file_read`, fileReadSignature);
       readOnlyCalls.push({
         id: tc.id,

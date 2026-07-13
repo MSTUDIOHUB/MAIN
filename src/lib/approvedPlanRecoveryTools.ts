@@ -36,6 +36,15 @@ export const APPROVED_PLAN_ACTION_RECOVERY_TOOLS = new Set([
   ...APPROVED_PLAN_SOURCE_EDIT_TOOLS,
   "run_command",
   "execute_command",
+  // Long-lived commands are not complete at dispatch time. Keep their
+  // observation/input surface available even after action-only recovery is
+  // activated, otherwise the runtime creates an impossible completion gate.
+  "send_pty_input",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
   "browser_evaluate",
 ]);
 

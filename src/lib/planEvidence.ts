@@ -1,7 +1,9 @@
 import { extractPrimaryUserRequestText } from "./turnIntake";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import { analyzePtyObservationResult } from "./devServerRuntime";
 import {
   normalizePlanEvidenceValue,
+  requiresPtyObservationForPlanCommand,
   type PlanExecutionEvidenceEntry,
 } from "./workflowModels";
 import type { ToolDiffPreview } from "./toolDiff";
@@ -359,6 +361,12 @@ const VERIFICATION_EVIDENCE_TOOLS = new Set([
 ]);
 
 const COMMAND_EVIDENCE_TOOLS = new Set(["run_command", "execute_command", "send_pty_input"]);
+const PTY_OBSERVATION_EVIDENCE_TOOLS = new Set([
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+]);
 const WORKSPACE_FILE_REF_RE =
   /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?=$|[\s`"',，。；;:)）])/g;
 const MAX_EVIDENCE_REFERENCES = 20;
@@ -475,7 +483,23 @@ export function createPlanExecutionEvidenceEntry(input: {
     };
   }
   if (COMMAND_EVIDENCE_TOOLS.has(input.toolName)) {
-    return commandResultLooksSuccessful(input.toolName, input.result) ? { ...base, kind: "cmd" } : null;
+    if (!commandResultLooksSuccessful(input.toolName, input.result)) return null;
+    return {
+      ...base,
+      kind: "cmd",
+      ...(input.toolName === "execute_command" && requiresPtyObservationForPlanCommand(target)
+        ? { observationStatus: "pending" as const }
+        : {}),
+    };
+  }
+  if (PTY_OBSERVATION_EVIDENCE_TOOLS.has(input.toolName)) {
+    const observation = analyzePtyObservationResult(input.result);
+    return {
+      ...base,
+      kind: observation.status === "ready" && observation.url ? "dev_server_url" : "tool",
+      value: observation.status === "ready" && observation.url ? observation.url : target,
+      observationStatus: observation.status,
+    };
   }
   if (sourceToolLooksLikeBrowserAutomation(input.toolName)) {
     if (!browserResultLooksSuccessful(input.result)) return null;
@@ -494,6 +518,16 @@ export function appendPlanEvidenceEntry(
   entry: PlanExecutionEvidenceEntry | null,
 ): PlanExecutionEvidenceEntry[] {
   if (!entry) return ledger;
+  // Process dispatch and terminal observations are ordered events, not stable
+  // facts. Keeping only the first identical value lets an old ready state
+  // satisfy a later restart, so always retain their latest bounded sequence.
+  if (
+    entry.sourceTool === "execute_command" ||
+    entry.sourceTool === "send_pty_input" ||
+    PTY_OBSERVATION_EVIDENCE_TOOLS.has(entry.sourceTool)
+  ) {
+    return [...ledger, entry].slice(-200);
+  }
   const entryKey = `${entry.kind}:${normalizePlanEvidenceValue(entry.value)}:${entry.sourceTool}`;
   if (ledger.some((item) => `${item.kind}:${normalizePlanEvidenceValue(item.value)}:${item.sourceTool}` === entryKey)) {
     return ledger;

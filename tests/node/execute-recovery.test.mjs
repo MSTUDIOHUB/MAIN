@@ -95,6 +95,10 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"));
 
 const {
+  handleRepeatedEditValidationRecovery,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
+
+const {
   resolveDirectMutationPreflightRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
 
@@ -340,6 +344,12 @@ function createApprovedPlanToolSurfaceInput(overrides = {}) {
     "replace_in_file",
     "write_file",
     "run_command",
+    "execute_command",
+    "send_pty_input",
+    "read_pty_buffer",
+    "read_pty_tail",
+    "read_pty_since",
+    "get_pty_status",
     "browser_evaluate",
   ].map((name) => ({
     type: "function",
@@ -410,6 +420,12 @@ test("approved plan action-only recovery reopens read_file only for its unresolv
     "replace_in_file",
     "write_file",
     "run_command",
+    "execute_command",
+    "send_pty_input",
+    "read_pty_buffer",
+    "read_pty_tail",
+    "read_pty_since",
+    "get_pty_status",
     "browser_evaluate",
   ]);
 
@@ -451,6 +467,52 @@ test("repeat-edit validation recovery exposes only validation tools and forbids 
   assert.match(prompt, /连续修改同一目标/);
   assert.match(prompt, /必须只调用一个验证工具/);
   assert.match(prompt, /不要继续编辑文件/);
+});
+
+test("third consecutive edit to one target forces validation before another write", () => {
+  const editCounts = new Map();
+  const activations = [];
+  const statuses = [];
+  let recoveryAttempts = 0;
+  const makeInput = () => ({
+    callbacks: {
+      getPreferredLanguage: () => "zh",
+      getIsPlanApproved: () => true,
+      onStatusChange: (status) => statuses.push(status),
+      onNonActionableStop: () => assert.fail("third edit should recover before pausing"),
+    },
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    iteration: 3,
+    results: [{
+      toolCallId: `edit-${editCounts.get("src/main.rs") || 0}`,
+      name: "apply_patch",
+      target: "src/main.rs",
+      content: "patch applied",
+      isError: false,
+    }],
+    availableToolNames: new Set(["run_command", "browser_evaluate"]),
+    recentToolActivity: [],
+    successfulEditTargetsSinceVerification: editCounts,
+    repeatedEditValidationRecoveryAttempts: recoveryAttempts,
+    activateExecuteRecovery: (mode, reason, context) => activations.push({ mode, reason, context }),
+    emitPlanExecutionProgress: () => {},
+  });
+
+  const first = handleRepeatedEditValidationRecovery(makeInput());
+  recoveryAttempts = first.repeatedEditValidationRecoveryAttempts;
+  assert.equal(first.status, "none");
+  const second = handleRepeatedEditValidationRecovery(makeInput());
+  recoveryAttempts = second.repeatedEditValidationRecoveryAttempts;
+  assert.equal(second.status, "none");
+  const third = handleRepeatedEditValidationRecovery(makeInput());
+
+  assert.equal(third.status, "pending_prompt");
+  assert.equal(activations.length, 1);
+  assert.equal(activations[0].mode, "validation_only");
+  assert.equal(activations[0].reason, "repeat_edit_target_without_validation");
+  assert.equal(activations[0].context.editCount, 3);
+  assert.deepEqual(statuses, ["running"]);
 });
 
 test("patch mismatch recovery opens one targeted read_file path", () => {

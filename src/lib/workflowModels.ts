@@ -302,6 +302,8 @@ export interface PlanExecutionEvidenceEntry {
   references?: string[];
   /** Identifiers observed in fresh added/changed lines of this mutation. */
   changedIdentifiers?: string[];
+  /** Runtime-owned state for long-lived PTY commands and their observations. */
+  observationStatus?: "pending" | "unknown" | "running" | "ready" | "failed" | "stopped";
   createdAt: number;
 }
 
@@ -794,6 +796,13 @@ function pushShellCommand(target: string[], candidate: string) {
   }
 }
 
+function isNegatedShellCommandOccurrence(text: string, index: number): boolean {
+  const prefix = String(text || "").slice(Math.max(0, index - 80), index);
+  return /(?:不能|不可|不要|不得|无需|不应|禁止|避免)(?:再|直接|继续)?(?:用|使用|运行|执行|调用|拿)?\s*$/i.test(prefix) ||
+    /(?:do\s+not|don't|must\s+not|should\s+not|cannot|can't|avoid|without)(?:\s+(?:use|using|run|running|execute|executing|call|calling|substitute))?\s*$/i.test(prefix) ||
+    /(?:instead\s+of|rather\s+than)\s*$/i.test(prefix);
+}
+
 export function extractShellCommandsFromText(text: string): string[] {
   if (!text.trim()) return [];
 
@@ -807,10 +816,12 @@ export function extractShellCommandsFromText(text: string): string[] {
   }
 
   for (const matched of text.matchAll(/`([^`\n]+)`/g)) {
+    if (isNegatedShellCommandOccurrence(text, matched.index ?? 0)) continue;
     pushShellCommand(commands, matched[1] ?? "");
   }
 
   for (const matched of text.matchAll(SHELL_COMMAND_FRAGMENT_RE)) {
+    if (isNegatedShellCommandOccurrence(text, matched.index ?? 0)) continue;
     pushShellCommand(commands, matched[0] ?? "");
   }
 
@@ -958,6 +969,7 @@ const FOCUSED_VALIDATION_COMMAND = "focused validation command";
 const LONG_RUNNING_PLAN_COMMAND_RE =
   /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:tauri\s+dev|dev|start|serve|watch|preview|storybook)\b|\b(?:cargo\s+)?tauri\s+dev\b|\b(?:vite|next|nuxt|nuxi|astro|webpack-dev-server|storybook)\s+(?:dev|start|serve|preview)\b/i;
 const PTY_OBSERVATION_TOOL_NAMES = new Set([
+  "read_pty_buffer",
   "read_pty_since",
   "read_pty_tail",
   "get_pty_status",
@@ -1005,24 +1017,48 @@ function commandEvidenceSatisfiedByLedger(
   evidence: PlanTaskEvidence,
   evidenceLedger: PlanExecutionEvidenceEntry[],
 ): boolean {
-  const matchingCommands = evidenceLedger.filter((record) =>
-    evidenceMatchesRecord(evidence, record)
-  );
+  const matchingCommands = evidenceLedger.filter((record) => evidenceMatchesRecord(evidence, record));
   if (matchingCommands.length === 0) return false;
   if (!requiresPtyObservationForPlanCommand(evidence.value)) return true;
 
-  // A long-running command is considered observed only after the command was
-  // dispatched through the PTY and a later PTY read/status call examined the
-  // output. `run_command` does not satisfy this evidence; checking the source
-  // here also keeps restored/legacy tool records from completing a startup
-  // task incorrectly.
-  return matchingCommands.some((commandRecord) =>
-    commandRecord.sourceTool === "execute_command" &&
-    evidenceLedger.some((record) =>
+  // Only the newest dispatch owns readiness. An older successful launch must
+  // not complete a later restart that is still waiting or has already failed.
+  const sortedCommands = [...matchingCommands]
+    .filter((record) => record.sourceTool === "execute_command")
+    .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+  const latestCommand = sortedCommands[sortedCommands.length - 1];
+  if (!latestCommand) return false;
+  const observations = evidenceLedger
+    .filter((record) =>
       PTY_OBSERVATION_TOOL_NAMES.has(record.sourceTool) &&
-      Number(record.createdAt || 0) >= Number(commandRecord.createdAt || 0)
-    )
-  );
+      Number(record.createdAt || 0) >= Number(latestCommand.createdAt || 0)
+    );
+  const latestObservation = observations[observations.length - 1];
+  if (!latestObservation) return false;
+
+  const isWatchOnlyCommand = /\bwatch\b/i.test(evidence.value) &&
+    !/\b(?:dev|start|serve|preview|tauri|vite|storybook)\b/i.test(evidence.value);
+  return latestObservation.observationStatus === "ready" ||
+    (isWatchOnlyCommand && latestObservation.observationStatus === "running");
+}
+
+function latestFailedPtyObservationForCommand(
+  evidence: PlanTaskEvidence,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): PlanExecutionEvidenceEntry | null {
+  const commands = evidenceLedger
+    .filter((record) => evidenceMatchesRecord(evidence, record) && record.sourceTool === "execute_command");
+  const latestCommand = commands[commands.length - 1];
+  if (!latestCommand) return null;
+  const observations = evidenceLedger
+    .filter((record) =>
+      PTY_OBSERVATION_TOOL_NAMES.has(record.sourceTool) &&
+      Number(record.createdAt || 0) >= Number(latestCommand.createdAt || 0)
+    );
+  const observation = observations[observations.length - 1];
+  return observation?.observationStatus === "failed" || observation?.observationStatus === "stopped"
+    ? observation
+    : null;
 }
 
 function commandEvidenceIsAwaitingPtyObservation(
@@ -1425,12 +1461,17 @@ function resolvePlanTaskEvidenceStatus(
   const awaitingPtyObservation = evidence.some((item) =>
     commandEvidenceIsAwaitingPtyObservation(item, evidenceLedger)
   );
+  const failedPtyObservation = evidence.find((item) =>
+    item.kind === "cmd" && latestFailedPtyObservationForCommand(item, evidenceLedger)
+  );
 
   return {
-    status: matched > 0 ? "partial" : "missing",
+    status: failedPtyObservation ? "blocked" : matched > 0 ? "partial" : "missing",
     matched,
     total: evidence.length,
-    blockedReason: awaitingPtyObservation
+    blockedReason: failedPtyObservation
+      ? "长驻启动命令的最新 PTY 观察显示启动失败或已经停止；必须修复或重新启动后再验证"
+      : awaitingPtyObservation
       ? "长驻启动命令已发送，但尚未通过 PTY 的 read_pty_since、read_pty_tail 或 get_pty_status 检查启动输出"
       : matched > 0
       ? `仅满足 ${matched}/${evidence.length} 条证据`
