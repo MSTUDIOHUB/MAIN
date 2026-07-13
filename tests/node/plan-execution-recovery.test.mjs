@@ -1753,6 +1753,22 @@ test("approved plan source edit first surface blocks validation before first wri
   assert.ok(unavailableCheckIndex >= 0 && browserPreflightIndex > unavailableCheckIndex);
 });
 
+test("browser readiness preflight stays visible without counting as a browser execution failure", () => {
+  const toolCallPartitioningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"), "utf8");
+  const browserPreflightIndex = toolCallPartitioningSource.indexOf("resolveBrowserValidationPreflight({");
+  const browserPreflightBlockEnd = toolCallPartitioningSource.indexOf(
+    'if (browserPreflight.action === "correct")',
+    browserPreflightIndex,
+  );
+  assert.ok(browserPreflightIndex >= 0 && browserPreflightBlockEnd > browserPreflightIndex);
+  const browserPreflightBlock = toolCallPartitioningSource.slice(
+    browserPreflightIndex,
+    browserPreflightBlockEnd,
+  );
+  assert.match(browserPreflightBlock, /toolFailureSignatures\.delete\(tc\.id\)/);
+  assert.doesNotMatch(browserPreflightBlock, /internalFeedback/);
+});
+
 test("browser validation repeats are reused or paused without agent error", () => {
   const orchestratorSource = (
     fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") +

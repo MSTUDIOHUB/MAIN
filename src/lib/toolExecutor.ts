@@ -67,11 +67,13 @@ function sleep(ms: number): Promise<void> {
  * Sanitizes raw PTY output by stripping ANSI escape sequences and
  * resolving carriage returns (\r) to avoid progress bar string inflation.
  */
-function sanitizePtyResult<T extends { text?: string }>(result: T): T {
-  if (result && typeof result.text === "string") {
-    return { ...result, text: sanitizePtyOutput(result.text) };
-  }
-  return result;
+function sanitizePtyResult<T extends { text?: string; tail?: string }>(result: T): T {
+  if (!result) return result;
+  return {
+    ...result,
+    ...(typeof result.text === "string" ? { text: sanitizePtyOutput(result.text) } : {}),
+    ...(typeof result.tail === "string" ? { tail: sanitizePtyOutput(result.tail) } : {}),
+  };
 }
 
 function parseOptionalNumber(value: unknown): number | undefined {
@@ -566,7 +568,7 @@ export async function executeTool(
 
     case "get_pty_status":
       await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));
-      return await getPtyStatus(sessionKey);
+      return sanitizePtyResult(await getPtyStatus(sessionKey));
 
     case "send_pty_input": {
       const input = (args.input as string) || "";

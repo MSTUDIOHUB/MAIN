@@ -36,6 +36,8 @@ function loadTs(sourcePath) {
 const devServerRuntime = loadTs(path.join(workspaceRoot, "src/lib/devServerRuntime.ts"));
 const cachePolicy = loadTs(path.join(workspaceRoot, "src/lib/readOnlyToolCachePolicy.ts"));
 const sanitizer = loadTs(path.join(workspaceRoot, "src/lib/ptyOutputSanitizer.ts"));
+const ipc = loadTs(path.join(workspaceRoot, "src/lib/ipc.ts"));
+const toolExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
 const ptyCommandRuntime = loadTs(path.join(workspaceRoot, "src/lib/ptyCommandRuntime.ts"));
 const recoveryTools = loadTs(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
 const planEvidence = loadTs(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
@@ -156,6 +158,36 @@ test("PTY sanitizer preserves warnings cleared by carriage-return and strips ter
   assert.match(clean, /Error: timeout/);
   assert.doesNotMatch(clean, /\u001b|\u0007/);
   assert.doesNotMatch(clean, /\n{4,}/);
+});
+
+test("get_pty_status sanitation lets a newer ANSI-decorated VITE launch supersede an old port error", async () => {
+  const rawTail = [
+    "\u001b[31mError:\u001b[0m Port 1420 is already in use",
+    "VITE v7.0.4 \u001b[32mready\u001b[0m in 155 ms",
+    "\u001b[32m➜\u001b[0m  \u001b[1mLocal:\u001b[0m   http://localhost:\u001b[1m1420\u001b[0m/",
+  ].join("\n");
+  const rawStatus = {
+    active: true,
+    running: true,
+    bufferStartOffset: 0,
+    bufferEndOffset: rawTail.length,
+    bufferBytes: rawTail.length,
+    tail: rawTail,
+  };
+  const originalGetPtyStatus = ipc.getPtyStatus;
+  ipc.getPtyStatus = async () => rawStatus;
+  let status;
+  try {
+    status = await toolExecutor.executeTool("get_pty_status", { wait_ms: 0 }, workspaceRoot);
+  } finally {
+    ipc.getPtyStatus = originalGetPtyStatus;
+  }
+  const observation = devServerRuntime.analyzePtyObservationResult(JSON.stringify(status));
+
+  assert.doesNotMatch(status.tail, /\u001b/);
+  assert.match(status.tail, /Error: Port 1420 is already in use/);
+  assert.equal(observation.status, "ready");
+  assert.equal(observation.url, "http://localhost:1420/");
 });
 
 test("PTY command admission rejects shell commands while a foreground process owns the terminal", () => {

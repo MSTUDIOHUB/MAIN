@@ -419,6 +419,9 @@ export async function partitionToolCallsForExecution(input: {
         const message = failed
           ? `DEV_SERVER_START_FAILED: the latest PTY observation shows that the dev server failed. Repair or restart it, then inspect PTY readiness before browser validation at ${requestedUrl}.`
           : `DEV_SERVER_NOT_READY: the latest long-running command is still ${browserPreflight.runtimeStatus}. Call read_pty_since/read_pty_tail/get_pty_status and wait for a ready URL before browser validation at ${requestedUrl}.`;
+        // The browser tool did not execute, so this transient readiness gate must not
+        // poison the repeated-failure history for a later, ready browser validation.
+        toolFailureSignatures.delete(tc.id);
         callbacks.onToolError(tc.name, requestedUrl, message, { toolCallId: tc.id });
         logAgentEvent("browser_validation_blocked_until_dev_server_ready", {
           iteration,

@@ -143,3 +143,29 @@ test("tool failure signature reducer increments errors and clears on success", (
   assert.equal(state.failedToolCallCounts.has("read_file:src/app.ts"), false);
   assert.equal(state.failedToolCallCounts.get("run_command:npm-test"), 1);
 });
+
+test("browser readiness preflight blocks do not poison real browser failure counts", () => {
+  const state = createAgentLoopGuardRuntimeState();
+  const browserSignature = "browser_evaluate:http://localhost:1420/";
+
+  applyToolFailureSignatureRuntimeState(state, {
+    toolFailureSignatures: new Map(),
+    results: [
+      { toolCallId: "preflight_pending", isError: true },
+      { toolCallId: "preflight_failed", isError: true },
+    ],
+  });
+  assert.equal(state.failedToolCallCounts.has(browserSignature), false);
+
+  applyToolFailureSignatureRuntimeState(state, {
+    toolFailureSignatures: new Map([
+      ["browser_failure_1", browserSignature],
+      ["browser_failure_2", browserSignature],
+    ]),
+    results: [
+      { toolCallId: "browser_failure_1", isError: true },
+      { toolCallId: "browser_failure_2", isError: true },
+    ],
+  });
+  assert.equal(state.failedToolCallCounts.get(browserSignature), 2);
+});
