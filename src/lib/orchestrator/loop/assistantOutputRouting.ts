@@ -1,6 +1,7 @@
 import { containsToolUseBlock } from "../../orchestrator/agentRecovery";
 import {
   hasExecutableProposalReplyOptions,
+  hasOnlyNonBlockingPlanReplyOptions,
   hasOnlyReadOnlyPermissionReplyOptions,
   shouldPauseForReplyOptions,
 } from "../../replyOptions";
@@ -48,11 +49,13 @@ export function shouldAutoContinueNonBlockingPlanChoices(input: {
   toolCallCount: number;
   workflowMode: LegacyWorkflowMode;
   isPlanApproved: boolean;
+  hasSubstantivePlanAssistantText?: boolean;
 }): boolean {
   return input.suppressPlanContinuationReplyOptions &&
     input.toolCallCount === 0 &&
     input.workflowMode === "plan" &&
-    !input.isPlanApproved;
+    !input.isPlanApproved &&
+    !input.hasSubstantivePlanAssistantText;
 }
 
 /**
@@ -81,7 +84,8 @@ export function resolveClosedPlanReadOnlyContinuation(input: {
   if (
     input.availableToolCount > 0 ||
     !isPlanRuntimeFinalizationPhase(input.planRuntimePhase) ||
-    !hasOnlyReadOnlyPermissionReplyOptions(input.replyOptions)
+    !hasOnlyReadOnlyPermissionReplyOptions(input.replyOptions) &&
+    !hasOnlyNonBlockingPlanReplyOptions(input.replyOptions)
   ) {
     return { action: "none" };
   }

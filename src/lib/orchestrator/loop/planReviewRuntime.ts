@@ -45,7 +45,7 @@ export interface PlanReviewRuntimeHandlers {
     trigger: string,
     details?: {
       consecutiveEmptyResponseCount?: number;
-      rejectedVisibleChars?: number;
+      rejectedVisibleCandidate?: boolean;
       toolCallCount?: number;
       replyOptionCount?: number;
     },
@@ -172,7 +172,7 @@ export function createPlanReviewRuntimeHandlers(input: {
     trigger: string,
     details: {
       consecutiveEmptyResponseCount?: number;
-      rejectedVisibleChars?: number;
+      rejectedVisibleCandidate?: boolean;
       toolCallCount?: number;
       replyOptionCount?: number;
     } = {},

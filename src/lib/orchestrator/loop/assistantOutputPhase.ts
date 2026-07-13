@@ -398,7 +398,22 @@ export function handleAssistantOutputPhase(input: {
       toolCallCount: effectiveToolCalls.length,
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
+      hasSubstantivePlanAssistantText,
     });
+  if (
+    input.suppressPlanContinuationReplyOptions &&
+    hasSubstantivePlanAssistantText &&
+    effectiveToolCalls.length === 0 &&
+    workflowMode === "plan" &&
+    !callbacks.getIsPlanApproved()
+  ) {
+    logAgentEvent("plan_non_blocking_options_stripped_candidate_preserved", {
+      iteration,
+      replyOptions: normalized.replyOptions.length,
+      visibleChars: input.sourceVisibleText.length,
+      planRuntimePhase: planRuntimeState.planRuntimePhase,
+    });
+  }
   const closedPlanReadOnlyContinuation = resolveClosedPlanReadOnlyContinuation({
     suppressPlanContinuationReplyOptions:
       input.suppressPlanContinuationReplyOptions,
@@ -721,6 +736,9 @@ export function handleAssistantOutputPhase(input: {
   );
   if (planPostConvergenceToolRedirect.status === "continue") {
     return finishControl("continue");
+  }
+  if (planPostConvergenceToolRedirect.status === "stopped") {
+    return finishControl("stopped");
   }
 
   return {

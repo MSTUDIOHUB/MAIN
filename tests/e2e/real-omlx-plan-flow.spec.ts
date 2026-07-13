@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { validateActionablePlanArtifact } from "../../src/lib/workflowModels";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const omlxEndpoint = String(
@@ -15,8 +16,41 @@ const models = (process.env.OMLX_MODELS || "gemma-4-26b-a4b-it-8bit,Qwen3.6-35B-
 const realOmlxRequest =
   process.env.REAL_OMLX_REQUEST ||
   "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。";
+const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
+const realOmlxPlanExpectation = new RegExp(
+  process.env.REAL_OMLX_PLAN_EXPECT || "useCsvParser\\.ts|CSV|creator",
+  "i",
+);
+const realOmlxPlanExpectAll = String(process.env.REAL_OMLX_PLAN_EXPECT_ALL || "")
+  .split(";;")
+  .map((pattern) => pattern.trim())
+  .filter(Boolean)
+  .map((pattern) => new RegExp(pattern, "i"));
+const realOmlxPlanTimeoutMs = Math.max(
+  30_000,
+  Number(process.env.REAL_OMLX_PLAN_TIMEOUT_MS || 600_000),
+);
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
+
+function summarizePlanDebugTail(entries: unknown[]): string[] {
+  return (Array.isArray(entries) ? entries : [])
+    .map((entry) => {
+      if (!entry || typeof entry !== "object") return String(entry || "");
+      const record = entry as Record<string, unknown>;
+      const source = String(record.source || record.target || "");
+      if (!/(?:^agent\.plan_|^agent\.loop_stop$|^store\.(?:non_actionable_stop|agent_loop_stop_summary)$|^app\.instance\.closed$|stream_(?:error|timeout|watchdog))/i.test(source)) {
+        return "";
+      }
+      return [record.level, source, record.message]
+        .filter((value) => value != null && String(value).trim())
+        .map(String)
+        .join(" ");
+    })
+    .filter(Boolean)
+    .slice(-12)
+    .map((line) => line.slice(0, 1_200));
+}
 
 test.describe.configure({ timeout: 1_200_000 });
 test.skip(!runRealOmlx, "Set MAIN_REAL_OMLX_E2E=1 to run real local OMLX plan-flow validation.");
@@ -61,17 +95,10 @@ test.beforeEach(async ({ page }) => {
     "src/components/FileUploader/DragUpload.tsx": "export function DragUpload() { return <input type=\"file\" />; }\n",
     "cn_tutorial_orders_by_creator_20260512.csv": "creator,amount\nalice,12\n",
   };
-  for (const [relative, content] of Object.entries(seedFiles)) {
-    const absolute = path.join(workspace, relative);
-    await fs.mkdir(path.dirname(absolute), { recursive: true });
-    let fileExists = false;
-    try {
-      await fs.access(absolute);
-      fileExists = true;
-    } catch {
-      fileExists = false;
-    }
-    if (!fileExists) {
+  if (!customWorkspace) {
+    for (const [relative, content] of Object.entries(seedFiles)) {
+      const absolute = path.join(workspace, relative);
+      await fs.mkdir(path.dirname(absolute), { recursive: true });
       await fs.writeFile(absolute, content, "utf8");
     }
   }
@@ -348,27 +375,16 @@ test.beforeEach(async ({ page }) => {
         return null;
       }
       if (cmd === "get_project_skeleton") {
-        return [
-          ".",
-          "├── src",
-          "│   ├── components",
-          "│   │   ├── Dashboard",
-          "│   │   │   ├── CourseBarChart.tsx",
-          "│   │   │   ├── StatusPieChart.tsx",
-          "│   │   │   └── TrendLineChart.tsx",
-          "│   │   └── FileUploader",
-          "│   │       └── DragUpload.tsx",
-          "│   ├── hooks",
-          "│   │   ├── useChartData.ts",
-          "│   │   └── useCsvParser.ts",
-          "│   └── store",
-          "│       └── dashboardStore.ts",
-          "│   ├── App.tsx",
-          "│   ├── index.css",
-          "│   └── types",
-          "│       └── order.ts",
-          "└── cn_tutorial_orders_by_creator_20260512.csv",
-        ].join("\n");
+        const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
+        const visiblePaths = filePaths
+          .filter((filePath: string) =>
+            !/(?:^|\/)(?:node_modules|target|dist|build|\.git|\.MAIN)(?:\/|$)/.test(filePath) &&
+            !/(?:^|\/)\.[^/]+(?:\/|$)/.test(filePath) &&
+            !/^src-tauri\/(?:gen|icons)\//.test(filePath) &&
+            !/(?:^|\/)package-lock\.json$/.test(filePath)
+          )
+          .slice(0, 120);
+        return [".", ...visiblePaths.map((filePath: string) => `- ${filePath}`)].join("\n");
       }
       if (cmd === "list_directory") {
         const path = String(args?.path || ".");
@@ -423,7 +439,52 @@ test.beforeEach(async ({ page }) => {
         }
         return [];
       }
-      if (cmd === "glob_search") return (await (window as any).__MAIN_E2E_DISK_GLOB()).filter((path: string) => /\.(?:ts|tsx|css|csv)$/.test(path));
+      if (cmd === "glob_search") {
+        const requestedGlob = String(args?.glob || args?.pattern || args?.query || args?.path || "**/*")
+          .replace(/\\/g, "/")
+          .replace(/^\.\//, "");
+        const escapeRegexChar = (char: string) => /[\\^$.[\]()+|]/.test(char) ? `\\${char}` : char;
+        const globToRegex = (pattern: string) => {
+          let source = "^";
+          for (let index = 0; index < pattern.length; index += 1) {
+            const char = pattern[index];
+            const next = pattern[index + 1];
+            if (char === "*" && next === "*") {
+              if (pattern[index + 2] === "/") {
+                source += "(?:.*/)?";
+                index += 2;
+              } else {
+                source += ".*";
+                index += 1;
+              }
+            } else if (char === "*") {
+              source += "[^/]*";
+            } else if (char === "?") {
+              source += "[^/]";
+            } else if (char === "{") {
+              const close = pattern.indexOf("}", index + 1);
+              if (close > index) {
+                source += `(?:${pattern.slice(index + 1, close).split(",").map((part) =>
+                  part.split("").map(escapeRegexChar).join("")
+                ).join("|")})`;
+                index = close;
+              } else {
+                source += "\\{";
+              }
+            } else {
+              source += escapeRegexChar(char);
+            }
+          }
+          return new RegExp(`${source}$`, "i");
+        };
+        const matcher = globToRegex(requestedGlob || "**/*");
+        return (await (window as any).__MAIN_E2E_DISK_GLOB())
+          .filter((filePath: string) =>
+            !/(?:^|\/)(?:node_modules|target|dist|build|\.git|\.MAIN)(?:\/|$)/.test(filePath) &&
+            !/(?:^|\/)\.[^/]+(?:\/|$)/.test(filePath)
+          )
+          .filter((filePath: string) => matcher.test(filePath));
+      }
       if (cmd === "grep_search") {
         const query = String(args?.query || args?.pattern || "");
         const filePaths = await (window as any).__MAIN_E2E_DISK_GLOB();
@@ -590,7 +651,7 @@ test.beforeEach(async ({ page }) => {
         const path = String(args?.path || "");
         return await (window as any).__MAIN_E2E_DISK_METADATA(path);
       }
-      if (cmd === "write_file") {
+      if (cmd === "write_file" || cmd === "write_file_atomic") {
         await writeText(String(args?.path || ""), String(args?.content || ""));
         return null;
       }
@@ -641,8 +702,11 @@ for (const model of models) {
     }, realOmlxRequest);
 
     let lastPlanPollSignature = "";
-    await expect
-      .poll(async () => {
+    let lastPlanTerminalSignature = "";
+    let lastPlanDebugSignature = "";
+    try {
+      await expect
+        .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
         const planPollDiagnostic = {
           agentStatus: snapshot?.agentStatus,
@@ -656,6 +720,12 @@ for (const model of models) {
           console.log(`[real-omlx-plan-poll:${model}] ${planPollSignature.slice(0, 1_000)}`);
           lastPlanPollSignature = planPollSignature;
         }
+        const debugDigest = summarizePlanDebugTail(snapshot?.debugTail || []);
+        const debugSignature = JSON.stringify(debugDigest);
+        if (debugSignature && debugSignature !== "[]" && debugSignature !== lastPlanDebugSignature) {
+          console.log(`[real-omlx-plan-runtime:${model}] ${debugSignature.slice(-6_000)}`);
+          lastPlanDebugSignature = debugSignature;
+        }
         if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
         const artifactCount = snapshot?.planArtifacts?.length ?? 0;
         if (artifactCount > 0) return "artifact_ready";
@@ -666,16 +736,33 @@ for (const model of models) {
             ["error", "idle"].includes(String(snapshot?.agentStatus || ""))
           )
         ) {
-          const debugTail = JSON.stringify(snapshot?.debugTail || []).slice(-2_000);
-          return `terminal_without_artifact:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}:${debugTail}`;
+          const terminal = `terminal_without_artifact:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+          if (terminal !== lastPlanTerminalSignature) {
+            console.log(`[real-omlx-plan-terminal:${model}] ${terminal}`);
+            console.log(`[real-omlx-plan-debug:${model}] ${JSON.stringify(summarizePlanDebugTail(snapshot?.debugTail || []))}`);
+            console.log(`[real-omlx-plan-flow:${model}] ${JSON.stringify(snapshot?.taskFlowPreview || [])}`);
+            lastPlanTerminalSignature = terminal;
+          }
+          if (realOmlxPlanOnly) throw new Error(terminal);
+          return terminal;
         }
         return "running";
-      }, { timeout: 600_000 })
+      }, { timeout: realOmlxPlanTimeoutMs })
       .toBe("artifact_ready");
+    } catch (error) {
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      console.log(`[real-omlx-plan-timeout-debug:${model}] ${JSON.stringify(summarizePlanDebugTail(snapshot?.debugTail || [])).slice(-12_000)}`);
+      console.log(`[real-omlx-plan-timeout-flow:${model}] ${JSON.stringify(snapshot?.taskFlowPreview || []).slice(-12_000)}`);
+      throw error;
+    }
 
     const plan = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planArtifacts?.[0]?.content || "");
-    expect(plan).toMatch(/用户目标|Summary|摘要/);
-    expect(plan).toMatch(/useCsvParser\.ts|CSV|creator/);
+    const planQuality = validateActionablePlanArtifact(plan);
+    expect(planQuality.ok, planQuality.reason || "semantic plan validation failed").toBe(true);
+    expect(plan).toMatch(realOmlxPlanExpectation);
+    for (const expectation of realOmlxPlanExpectAll) {
+      expect(plan).toMatch(expectation);
+    }
     expect(plan).not.toMatch(/用户目标：\s*(?:\n|$)/);
     expect(plan).not.toMatch(/以落实已批准目标|落实已批准方案中涉及|Apply the approved plan change/i);
     expect(plan).not.toMatch(/直接相关的最小改动|写入前先用证据确认|依据证据：已搜索文件|依据证据：已查看目录/i);
@@ -683,10 +770,31 @@ for (const model of models) {
     const planSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
     const planChatText = JSON.stringify(planSnapshot?.taskFlowPreview || []);
     console.log(`[real-omlx-chat-plan:${model}] ${planChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
-    expect(planChatText).toMatch(/read_file|list_directory|读取|计划|CSV|useCsvParser|creator/i);
+    expect(planChatText).toMatch(realOmlxPlanOnly
+      ? /read_file|grep_search|code_ast_query|读取|搜索|计划|根因|修复/i
+      : /read_file|list_directory|读取|计划|CSV|useCsvParser|creator/i);
     expect(planChatText).not.toMatch(forbiddenChatNoise);
     if (expectAgentExplanation) {
       expect((planSnapshot?.agentTexts || []).join("\n")).toMatch(/问题|分析|修复|Dashboard|CSV|深色|creator/i);
+    }
+
+    if (realOmlxPlanOnly) {
+      await expect.poll(async () => {
+        const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+        if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+        if (snapshot?.isGenerating === false && snapshot?.agentStatus === "pending_review") {
+          return "pending_review";
+        }
+        if (snapshot?.isGenerating === false) {
+          return `terminal_without_review:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+        }
+        return "running";
+      }, { timeout: 120_000 }).toBe("pending_review");
+      const finalPlanSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      expect(JSON.stringify(finalPlanSnapshot?.debugTail || [])).not.toMatch(
+        /plan_generation_failed|plan_evidence_materialization_exhausted/i,
+      );
+      return;
     }
 
     const approvalDispatch = await page.evaluate(() => {

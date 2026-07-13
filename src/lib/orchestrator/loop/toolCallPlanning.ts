@@ -13,6 +13,7 @@ import {
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   approvedPlanNeedsSourceEditBeforeValidation,
   filterPlanRuntimeToolDefinitionsForPhase,
+  getOriginalUserPromptForPlanFallback,
   hasPlanUserContextObservation,
   isApprovedPlanRecoveryTool,
   isApprovedPlanSourceEditFirstTool,
@@ -201,6 +202,7 @@ export function resolveIterationToolSurface(input: {
     convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
     planRuntimePhase,
     evidenceReadiness: assessPlanEvidenceReadiness({
+      userGoal: getOriginalUserPromptForPlanFallback(callbacks),
       userContext: turnInputContextSignals,
       recentToolActivity: recentPlanToolActivity,
       hasObservedUserContext: hasPlanUserContextObservation(

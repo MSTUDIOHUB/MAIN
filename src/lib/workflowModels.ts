@@ -2255,10 +2255,17 @@ const PLAN_ARTIFACT_NOISE_PATTERNS: Array<{ pattern: RegExp; reason: string }> =
 ];
 
 function hasMeaningfulPlanSections(content: string, _kind: PlanArtifactKind): boolean {
-  const normalized = content.replace(/\s+/g, " ").trim();
-  if (normalized.length < 120) return false;
-  // Model-driven semantic structure check: Ensure the markdown document has at least one heading section (# or ## or ###) with structured prose
-  return /^\s{0,3}#{1,4}\s+.+/m.test(content);
+  const lines = String(content || "").split(/\r?\n/);
+  const hasHeading = lines.some((line) => /^\s{0,3}#{1,4}\s+\S/.test(line));
+  const hasBody = lines.some((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || /^#{1,6}\s+/.test(trimmed)) return false;
+    return !/^(?:TBD|TODO|To be determined|待定|待补充|稍后补充)[。.!！]?$/i.test(trimmed);
+  });
+  // Artifact validity is semantic, not proportional to output length. Compact
+  // models may express a complete plan in a few lines; the plan-specific gate
+  // below still checks goal, work path, validation, grounding, and noise.
+  return hasHeading && hasBody;
 }
 
 const PLAN_STRUCTURAL_REQUIRED_SECTIONS = new Set([
@@ -2300,7 +2307,7 @@ export function classifyPlanArtifactQualityResult(
   // Evidence gap: only when the validation reason explicitly mentions evidence problems.
   // Evidence sections are no longer part of missingRequiredSections in the unified path,
   // so we only classify as evidence gap for explicit evidence issues.
-  const hasEvidenceGap = /noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|ungrounded_plan_change_targets/.test(reason);
+  const hasEvidenceGap = /insufficient_grounded_evidence|noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|ungrounded_plan_change_targets|uncovered_user_goal_facets|unverified_plan_contract_counterpart/.test(reason);
   const hasEvidencePresentationGap = /missing_plan_evidence_section/.test(reason);
   const hasOnlyStructuralGaps =
     missingSections.length > 0 &&
@@ -2506,10 +2513,15 @@ function hasGoalLikePlanTitle(content: string): boolean {
     .map((line) => line.trim())
     .find((line) => /^#{1,2}\s+\S/.test(line));
   if (!firstHeading) return false;
-  return (
-    /(?:计划|方案|修复|排查|诊断|改造|Plan|Fix|Repair|Diagnosis|Remediation)/i.test(firstHeading) &&
-    /(?:CSV|Dashboard|面板|数据|导入|显示|图表|指标|修复|排查|诊断|用户|bug|issue|problem|data|chart|metric)/i.test(firstHeading)
-  );
+  if (!/(?:计划|方案|设计|实施|修复|排查|诊断|改造|Plan|Proposal|Design|Implementation|Fix|Repair|Diagnosis|Remediation)/i.test(firstHeading)) {
+    return false;
+  }
+  const qualifier = firstHeading
+    .replace(/^#{1,2}\s+/, "")
+    .replace(/(?:正式|建议|可审批|计划|方案|设计|实施|修复|排查|诊断|改造|Proposed|Proposal|Plan|Design|Implementation|Fix|Repair|Diagnosis|Remediation)/gi, " ")
+    .replace(/[^A-Za-z0-9_\u4e00-\u9fff]+/g, "")
+    .trim();
+  return qualifier.length >= 3;
 }
 
 export function looksLikeSubstantivePlanAssistantText(text: string): boolean {
@@ -2762,7 +2774,7 @@ export function validateActionablePlanArtifact(
   }
   const keyChangesBody = extractPlanSectionBody(
     raw,
-    /^(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)$/i,
+    /^(?:关键改动|关键实现改动|实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|落地方案|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Plan of Work)$/i,
   );
   const keyChangeCodeFragments = keyChangesBody
     .split(/\r?\n/)
@@ -2785,6 +2797,9 @@ export function validateActionablePlanArtifact(
   if (/(?:最小可用闭环|smallest useful workflow|Use the inspected context as the source of truth|基于当前可用的只读证据|available read-only evidence|基于已确认的证据先收窄实现目标|实施满足用户目标的最小源码变更|Use the confirmed evidence to narrow the implementation target|Apply the smallest source changes that satisfy the user goal)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
   }
+  if (/(?:当前定向证据不足|Insufficient targeted evidence exists|阻塞：需要先补充具体源码、数据、命令或接口证据|Blocked: collect concrete source, data, command, or interface evidence)/i.test(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "insufficient_grounded_evidence" });
+  }
   if (/(?:直接相关的最小改动；写入前先用证据确认具体字段、状态或接口|smallest verified change .*confirm the exact edit from evidence before writing)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_fallback_plan" });
   }
@@ -2803,15 +2818,11 @@ export function validateActionablePlanArtifact(
   if (importOnlyEvidenceCount >= 1) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "import_only_evidence" });
   }
-  const genericThemeTokenChangeCount = (raw.match(/(?:更新|调整|改造|优化|modify|update|adjust)[^。\n]*(?:深色模式表面|主题\s*token|theme\s*tokens?|dark\s+mode\s+surface|图表\/容器对比度|chart\/container contrast)/gi) || []).length;
-  if (genericThemeTokenChangeCount >= 2) {
-    return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_theme_token_plan" });
-  }
   const hasPlaceholderValidationPlan =
     /(?:运行受影响子系统的聚焦测试、构建检查或浏览器\/桌面验证|Run the focused test, build, or browser\/desktop validation for the touched subsystem)/i.test(raw);
   if (
     hasPlaceholderValidationPlan &&
-    (importOnlyEvidenceCount >= 1 || weakPathEchoGroundingCount >= 2 || genericThemeTokenChangeCount >= 2)
+    (importOnlyEvidenceCount >= 1 || weakPathEchoGroundingCount >= 2)
   ) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "placeholder_validation_plan" });
   }
@@ -2839,7 +2850,7 @@ export function validateActionablePlanArtifact(
     /(?:\.tsx?|\.jsx?|\.swift|\.py|\.rs|\.go|\.json|\.csv|\.tsv|\.xlsx|\.md|\/[A-Za-z0-9_.-]+|\\[A-Za-z0-9_.-]+)/i.test(raw) ||
     /(?:CSV|TSV|XLSX|字段|列|指标|数据|表格|截图|附件|column|metric|dataset|table|screenshot|attachment)/i.test(raw);
   const hasObservedEvidence = /(?:截图观察|附件观察|已确认事实|已读证据|证据引用|真实发现|Observed|Evidence|Confirmed|Findings)/i.test(raw);
-  const hasExecutionOrder = /(?:执行步骤|实施步骤|修复步骤|落地步骤|关键改动|关键实现改动|Key Changes|Implementation Changes|Execution Steps|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
+  const hasExecutionOrder = /(?:执行步骤|实施步骤|修复步骤|落地步骤|关键改动|关键实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|组件设计|数据流|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Component Design|Data Flow|Execution Steps|Implementation Steps|Plan of Work|\b1\.\s+)/i.test(raw);
   const hasValidation = /(?:验证标准|验证方式|验收|测试|构建|Validation|Acceptance|Test|Build|测试方案|Test Plan)/i.test(raw);
   const hasConcreteUserGoal =
     (
@@ -2847,7 +2858,7 @@ export function validateActionablePlanArtifact(
       hasGoalLikePlanTitle(raw)
     ) &&
     !/(?:最小可用闭环|smallest useful workflow).{0,80}(?:默认|first version)/i.test(raw);
-  const hasKeyChanges = /(?:^|\n)\s*#{1,6}\s*(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)/i.test(raw);
+  const hasKeyChanges = /(?:^|\n)\s*#{1,6}\s*(?:关键改动|关键实现改动|实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|落地方案|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Plan of Work)/i.test(raw);
   const hasPublicInterfacesSection =
     /(?:^|\n)\s*#{1,6}\s*(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i.test(raw);
   const hasExplicitPublicInterfaceDisposition =
@@ -2871,7 +2882,7 @@ export function validateActionablePlanArtifact(
     return classifyPlanArtifactQualityResult({ ok: false, reason: "non_executable_test_plan" });
   }
   const hasConcreteChangeSignal =
-    /(?:修改|更新|新增|修复|补齐|调整|接入|生成|实现|重构|保持|不改变|不新增|验证|运行|modify|update|add|fix|adjust|wire|generate|implement|refactor|preserve|unchanged|run|verify)/i.test(raw) &&
+    /(?:修改|更新|新增|修复|补齐|调整|接入|生成|实现|重构|写入|持久化|归一化|统一|配置|扩展|支持|引入|拆分|合并|保持|不改变|不新增|验证|运行|modify|update|add|fix|adjust|wire|generate|implement|refactor|write|persist|normalize|configure|extend|support|introduce|split|merge|preserve|unchanged|run|verify)/i.test(raw) &&
     hasTargetOrData;
 
   // Unified validation path: single check list for all plans.
@@ -2897,23 +2908,19 @@ export function validateActionablePlanArtifact(
     return classifyPlanArtifactQualityResult({ ok: false, reason: "insufficient_actionable_plan_signals" });
   }
 
-  // Unified path: always required sections + Codex Plan Contract sections (only when headers present).
-  // Evidence sections (screenshot, read evidence, confirmed findings, affected files) are NOT required.
-  const hasSummary = /(?:^|\n)\s*#{1,6}\s*(?:摘要|Summary)/i.test(raw);
-  const hasAssumptions =
-    /(?:^|\n)\s*#{1,6}\s*(?:假设与默认值|默认假设|假设|默认值|Assumptions(?:\s*\/\s*Defaults)?|Defaults)/i.test(raw);
-
-  const codexContractSections = [
-    [hasSummary, "summary"],
-    [hasKeyChanges && hasConcreteChangeSignal, "key_changes"],
-    [hasPublicInterfacesSection && hasExplicitPublicInterfaceDisposition, "public_interfaces"],
-    [hasTestPlan && hasValidation, "test_plan"],
-    [hasAssumptions, "assumptions"],
+  // Plans may describe a bug fix, a new feature, a design decision, or a
+  // verification-only task. Require the semantic contract, not one fixed
+  // document template. Optional canonical sections are checked only when the
+  // author chose to include them.
+  const optionalSectionIntegrity = [
+    [!hasKeyChanges || hasConcreteChangeSignal, "key_changes"],
+    [!hasPublicInterfacesSection || hasExplicitPublicInterfaceDisposition, "public_interfaces"],
+    [!hasTestPlan || hasValidation, "test_plan"],
   ];
 
   const missingRequiredSections: string[] = [
     ...alwaysRequiredSections,
-    ...codexContractSections,
+    ...optionalSectionIntegrity,
   ]
     .filter(([ok]) => !ok)
     .map(([, name]) => name) as string[];

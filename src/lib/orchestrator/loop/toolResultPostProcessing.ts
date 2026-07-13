@@ -11,6 +11,7 @@ import {
   targetProgressReasonForToolResult,
 } from "../../orchestrator";
 import { isUnityScriptWriteToolCall } from "../../orchestrator/unityDiagnostics";
+import { assessPlanClosureEvidence } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
 import { getTaskTargetingEvidenceKey, type TaskOrchestratorPhase } from "../../taskTargeting";
@@ -230,8 +231,16 @@ export function handleToolResultPostProcessing(input: {
   }
 
   if (workflowMode === "plan") {
-    directlyTrackedResults.forEach((result) => rememberToolActivity(recentPlanToolActivity, result));
-    rememberDelegatedSubagentActivities(recentPlanToolActivity, delegatedActivities);
+    directlyTrackedResults.forEach((result) => rememberToolActivity(
+      recentPlanToolActivity,
+      result,
+      { evidenceLedger: true },
+    ));
+    rememberDelegatedSubagentActivities(
+      recentPlanToolActivity,
+      delegatedActivities,
+      { evidenceLedger: true },
+    );
     if (
       !callbacks.getIsPlanApproved() &&
       planRuntimePhase === "drafting" &&
@@ -255,10 +264,10 @@ export function handleToolResultPostProcessing(input: {
   ) {
     // Evidence convergence is a runtime decision, not a model/iteration-count
     // decision. Build the exact bundle that drafting and validation will use
-    // after every successful read batch. Once it has semantic facts and a
-    // grounded change target, freeze the read surface immediately. This keeps
-    // a local model from rereading the same impact target until the generic
-    // repetition guard terminates the whole turn.
+    // after every successful read batch. The read surface can close only when
+    // that bundle also satisfies the deterministic closure gate; otherwise the
+    // runtime would declare structural excerpts sufficient here and reject the
+    // same bundle as diagnostically insufficient during materialization.
     const closureInput = collectPlanClosureMaterializationInput(
       callbacks,
       recentPlanToolActivity,
@@ -266,17 +275,51 @@ export function handleToolResultPostProcessing(input: {
       "",
     );
     const bundle = closureInput.evidenceBundle;
-    if (bundle.facts.length > 0 && bundle.changeTargets.length > 0) {
-      setPlanRuntimePhase("drafting", "semantic evidence bundle ready");
-      logAgentEvent("plan_evidence_bundle_frozen", {
+    const closureAssessment = assessPlanClosureEvidence(bundle);
+    if (closureAssessment.ready) {
+      setPlanRuntimePhase("drafting", "plan closure evidence ready");
+      logAgentEvent("plan_evidence_bundle_ready", {
         iteration,
         evidenceBundleId: bundle.bundleId,
         evidenceBundleHash: bundle.hash,
+        evidenceLedgerEntries: recentPlanToolActivity.length,
+        bundleReady: true,
+        closureReady: true,
+        closureReason: closureAssessment.reason,
+        objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
+        defectSignalMatches: closureAssessment.defectSignalMatches,
+        contractMismatchMatches: closureAssessment.contractMismatchMatches,
+        contractMismatchKinds: closureAssessment.contractMismatchKinds,
+        unresolvedContractKinds: closureAssessment.unresolvedContractKinds,
         semanticFacts: bundle.facts.length,
         changeTargets: bundle.changeTargets.length,
+        changeTargetPaths: bundle.changeTargets,
         verificationTargets: bundle.verificationTargets.length,
         previousPhase: planRuntimePhase,
       });
+    } else if (bundle.facts.length > 0 && bundle.changeTargets.length > 0) {
+      logAgentEvent("plan_evidence_bundle_open", {
+        iteration,
+        evidenceBundleId: bundle.bundleId,
+        evidenceBundleHash: bundle.hash,
+        evidenceLedgerEntries: recentPlanToolActivity.length,
+        bundleReady: true,
+        closureReady: false,
+        closureReason: closureAssessment.reason,
+        objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
+        defectSignalMatches: closureAssessment.defectSignalMatches,
+        contractMismatchMatches: closureAssessment.contractMismatchMatches,
+        contractMismatchKinds: closureAssessment.contractMismatchKinds,
+        unresolvedContractKinds: closureAssessment.unresolvedContractKinds,
+        semanticFacts: bundle.facts.length,
+        changeTargets: bundle.changeTargets.length,
+        changeTargetPaths: bundle.changeTargets,
+        verificationTargets: bundle.verificationTargets.length,
+        previousPhase: planRuntimePhase,
+      });
+      if (planRuntimePhase === "explore_structure") {
+        setPlanRuntimePhase("grounding", closureAssessment.reason);
+      }
     } else if (
       planRuntimePhase === "explore_structure" &&
       externalResults.some((result) =>

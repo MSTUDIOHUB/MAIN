@@ -141,7 +141,7 @@ test("missing read evidence does not cause targeted_evidence in unified path", (
   assert.ok(!result.missingSections?.includes("screenshot_attachment_observations"));
 });
 
-test("nonstandard proposed plan canonicalizes before quality recovery loops", () => {
+test("nonstandard but complete proposed plan does not enter quality recovery", () => {
   const draft = [
     "# Proposed Plan",
     "",
@@ -167,8 +167,7 @@ test("nonstandard proposed plan canonicalizes before quality recovery loops", ()
   ].join("\n");
 
   const initial = validateActionablePlanArtifact(draft);
-  assert.equal(initial.ok, false);
-  assert.match(initial.reason || "", /missing_plan_required_sections|insufficient_actionable_plan_signals|too_short|generic_fallback_plan/);
+  assert.equal(initial.ok, true, initial.reason);
 
   const materialized = materializePlanArtifactFromVisibleText({
     visibleText: draft,
@@ -186,15 +185,10 @@ test("nonstandard proposed plan canonicalizes before quality recovery loops", ()
     language: "zh",
   });
 
-  // In unified path: canonicalization may still succeed if it can produce
-  // a plan with the required sections (user_goal, execution_steps, validation)
-  assert.ok(materialized.ok === true || materialized.ok === false);
-  if (materialized.ok && materialized.content) {
-    const validated = validateActionablePlanArtifact(materialized.content);
-    assert.equal(validated.ok, true);
-    // The canonicalized/repaired content has execution steps and validation
-    assert.match(materialized.content, /## (?:执行步骤|关键改动|测试方案)|Approach|Validation/);
-  }
+  assert.equal(materialized.ok, true, materialized.reason);
+  assert.equal(validateActionablePlanArtifact(materialized.content || "").ok, true);
+  assert.match(materialized.content || "", /## Approach/);
+  assert.match(materialized.content || "", /## Validation/);
   assert.doesNotMatch(materialized.content || "", /excerpt=/);
 });
 
@@ -231,7 +225,7 @@ test("generic fallback plan escalates to auto scaffold", () => {
   assert.equal(result.recoveryAction, "auto_scaffold");
 });
 
-test("missing public_interfaces and test_plan sections can be auto-repaired", () => {
+test("a flexible plan only repairs the missing semantic validation contract", () => {
   const plan = [
     "# CSV Dashboard 修复计划",
     "",
@@ -257,8 +251,7 @@ test("missing public_interfaces and test_plan sections can be auto-repaired", ()
   assert.equal(initial.ok, false);
   assert.equal(initial.recoveryAction, "rewrite");
   assert.ok(initial.canAutoRepair === true);
-  assert.ok(initial.missingSections.includes("public_interfaces"));
-  assert.ok(initial.missingSections.includes("test_plan"));
+  assert.deepEqual(initial.missingSections, ["validation"]);
 
   const repaired = repairActionablePlanArtifactContent({
     content: plan,
@@ -267,14 +260,13 @@ test("missing public_interfaces and test_plan sections can be auto-repaired", ()
     language: "zh",
   });
 
-  assert.ok(repaired.repairedSections.includes("public_interfaces"));
-  assert.ok(repaired.repairedSections.includes("test_plan"));
+  assert.deepEqual(repaired.repairedSections, ["validation"]);
   assert.equal(validateActionablePlanArtifact(repaired.content).ok, true);
-  assert.match(repaired.content, /## 公共 API \/ 接口 \/ 类型/);
-  assert.match(repaired.content, /## 测试方案/);
+  assert.match(repaired.content, /## 验证标准/);
+  assert.doesNotMatch(repaired.content, /## 公共 API \/ 接口 \/ 类型/);
 });
 
-test("missing key_changes section can be auto-repaired when the plan has concrete targets", () => {
+test("execution steps do not require a duplicate key_changes section", () => {
   const plan = [
     "# CSV Dashboard 修复计划",
     "",
@@ -310,19 +302,26 @@ test("missing key_changes section can be auto-repaired when the plan has concret
   ].join("\n");
 
   const initial = validateActionablePlanArtifact(plan);
-  assert.equal(initial.ok, false);
-  assert.equal(initial.recoveryAction, "rewrite");
-  assert.equal(initial.canAutoRepair, true);
-  assert.ok(initial.missingSections.includes("key_changes"));
+  assert.equal(initial.ok, true, initial.reason);
+});
 
-  const repaired = repairActionablePlanArtifactContent({
-    content: plan,
-    userGoal: "修复 CSV 导入后 Dashboard 指标没有正确更新的问题",
-    quality: initial,
-    language: "zh",
-  });
+test("feature plans may use architecture and acceptance headings without bug-root-cause sections", () => {
+  const plan = [
+    "# 离线草稿同步功能",
+    "",
+    "## 目标",
+    "- 新增离线草稿同步，并保持现有在线保存行为。",
+    "",
+    "## 当前实现",
+    "- `src/store/drafts.ts` 只保存内存状态，`src/services/sync.ts` 负责在线提交。",
+    "",
+    "## 架构改动",
+    "- 在 `src/store/drafts.ts` 增加待同步队列，并由 `src/services/sync.ts` 在恢复连接后按顺序提交。",
+    "",
+    "## 验收标准",
+    "- 断网新增两份草稿后恢复网络，验证两份草稿按顺序同步且不会重复提交。",
+  ].join("\n");
 
-  assert.ok(repaired.repairedSections.includes("key_changes"));
-  assert.equal(validateActionablePlanArtifact(repaired.content).ok, true);
-  assert.match(repaired.content, /## 关键改动/);
+  const result = validateActionablePlanArtifact(plan);
+  assert.equal(result.ok, true, result.reason);
 });

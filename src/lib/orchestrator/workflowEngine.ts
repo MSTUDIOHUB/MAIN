@@ -1309,7 +1309,9 @@ export class WorkflowEngine {
 
         if (context.thoughtStartTime === null) context.thoughtStartTime = Date.now();
         if (context.firstStreamTokenAt === null) {
-          context.firstStreamTokenAt = Date.now();
+          context.firstStreamTokenAt = typeof performance !== "undefined"
+            ? performance.now()
+            : Date.now();
           clearNoFirstTokenNoticeTimer();
           logStoreEvent("stream_first_token", {
             turnId,

@@ -291,7 +291,8 @@ test("English system prompt uses domain-neutral tabular guidance", () => {
 
   assert.match(prompt, /If the task is closer to reporting, summarization, or research analysis/);
   assert.match(prompt, /confirm table structure, key fields, data types, temporal\/numeric\/categorical dimensions, missing values, and aggregation semantics/);
-  assert.match(prompt, /Continue analyzing the tabular parsing path/);
+  assert.match(prompt, /prefix each label with `\[Topic\]`/);
+  assert.match(prompt, /never imply execution approval/);
   assert.doesNotMatch(prompt, /amount|course|orders\.csv|written to Store|CSV parsing/i);
 });
 
@@ -523,8 +524,9 @@ test("system prompt tells the model to stop after emitting user options", () => 
 
   assert.match(prompt, /一旦你输出了 `<user_options>`，本轮就应立即停止并等待用户点击/);
   assert.match(prompt, /不要假装提问后又自己继续往下执行/);
-  assert.match(prompt, /如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻/);
-  assert.match(prompt, /不要写成模型自述的“我来确认\/我来检查\/我来分析”/);
+  assert.match(prompt, /`<option>` 是用户点击后发回给你的完整指令/);
+  assert.match(prompt, /`\[Topic \(多选\)\]`/);
+  assert.match(prompt, /不代表批准执行/);
 });
 
 test("respond prompt no longer tells the user to switch Chat or Fast or Plan", () => {

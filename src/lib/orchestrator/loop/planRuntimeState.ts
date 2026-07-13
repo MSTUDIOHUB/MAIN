@@ -5,8 +5,10 @@ export interface PlanLoopRuntimeState {
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
+  planFacetMappingSource: string;
   planArtifactQualityRejected: boolean;
   planEvidenceRecoveryPasses: number;
+  planEvidenceNoProgressPasses: number;
   planReasoningOnlyRecoveryPasses: number;
   planAutoScaffoldPromptIssued: boolean;
   planDraftingRecoveryReadCount: number;
@@ -39,8 +41,10 @@ export function createPlanLoopRuntimeState(input: {
     planQualityRejectCount: 0,
     planLastQualityGateReason: "",
     planLastMissingSections: [],
+    planFacetMappingSource: "",
     planArtifactQualityRejected: false,
     planEvidenceRecoveryPasses: 0,
+    planEvidenceNoProgressPasses: 0,
     planReasoningOnlyRecoveryPasses: 0,
     planAutoScaffoldPromptIssued: false,
     planDraftingRecoveryReadCount: 0,
@@ -122,6 +126,7 @@ export function applyPlanNoToolRuntimeState(
     | "planQualityRejectCount"
     | "planLastQualityGateReason"
     | "planLastMissingSections"
+    | "planFacetMappingSource"
     | "planArtifactQualityRejected"
     | "planAutoScaffoldPromptIssued"
     | "planEvidenceRecoveryPasses"
@@ -134,6 +139,7 @@ export function applyPlanNoToolRuntimeState(
     planQualityRejectCount: input.planQualityRejectCount ?? state.planQualityRejectCount,
     planLastQualityGateReason: input.planLastQualityGateReason ?? state.planLastQualityGateReason,
     planLastMissingSections: input.planLastMissingSections ?? state.planLastMissingSections,
+    planFacetMappingSource: input.planFacetMappingSource ?? state.planFacetMappingSource,
     planArtifactQualityRejected: input.planArtifactQualityRejected ?? state.planArtifactQualityRejected,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued ?? state.planAutoScaffoldPromptIssued,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses ?? state.planEvidenceRecoveryPasses,
@@ -163,6 +169,7 @@ export function applyPlanQualityRuntimeState(
     | "planAutoScaffoldPromptIssued"
     | "planClosureEvidenceRecoveryIssued"
     | "planEvidenceRecoveryPasses"
+    | "planEvidenceNoProgressPasses"
   >,
 ): PlanLoopRuntimeState {
   return {
@@ -174,6 +181,7 @@ export function applyPlanQualityRuntimeState(
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued,
     planClosureEvidenceRecoveryIssued: input.planClosureEvidenceRecoveryIssued,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: input.planEvidenceNoProgressPasses,
   };
 }
 

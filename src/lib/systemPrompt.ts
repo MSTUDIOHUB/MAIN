@@ -547,8 +547,8 @@ export function buildSystemPrompt(
     commandDirective,
   });
   const userOptionInstruction = resolvedResponseLanguage === "en"
-    ? "4. `<option>` is sent back as the user's next message: if the option asks you to continue investigating, confirming, reading, analyzing, or executing, write it as a user instruction (for example, \"Please confirm whether the imported result reached the target state\" or \"Continue analyzing the tabular parsing path\"), not as model self-talk such as \"I will check\" or \"I will analyze\". Use \"I will...\" only when the option truly means the user will do something later."
-    : "4. `<option>` 是用户点击后发回给你的消息：如果选项是让你继续调查、确认、读取、分析或执行，必须写成用户指令口吻（如“请确认导入结果是否写入目标状态”“继续分析表格解析逻辑”），不要写成模型自述的“我来确认/我来检查/我来分析”。只有当确实表示用户自己稍后去确认时，才可以使用“我来……”。";
+    ? "4. `<option>` is sent back as the user's next message: write it as a complete user instruction, not model self-talk. When several independent decision axes must be answered together, prefix each label with `[Topic]`; use `[Topic (multiple)]` only when choices in that group can be combined. These answers resolve planning uncertainty and never imply execution approval."
+    : "4. `<option>` 是用户点击后发回给你的完整指令，不要写成模型自述。多个彼此独立的决策轴需要一次回答时，用 `[Topic]` 作为每个选项标签前缀；只有同组选项可组合时才使用 `[Topic (多选)]`。这些回答用于解除规划不确定性，不代表批准执行。";
   const tabularChatGroundingInstruction = resolvedResponseLanguage === "en"
     ? "For CSV/TSV/XLSX, imported data, time series, charts, or aggregate reporting, first confirm table structure, key fields, data types, temporal/numeric/categorical dimensions, missing values, and aggregation semantics before giving conclusions or reading source code."
     : "涉及 CSV/TSV/XLSX、导入数据、时间序列、图表或聚合统计时，先确认表结构、关键字段、数据类型、时间/数值/分类维度、缺失值和聚合口径，再给结论或读取源码实现。";
@@ -814,14 +814,14 @@ export function buildSystemPrompt(
         return (
           "PLAN CAPABILITY NOTE (low-tier model): Use simple Markdown with clear headings. " +
           "You may wrap your plan in <proposed_plan> tags. " +
-          "Include: (1) affected files, (2) step-by-step actions, (3) validation. " +
+          "Include: (1) the goal, (2) a concrete implementation, design, or analysis approach, and (3) validation. Name affected files only when source changes are actually planned. " +
           "Keep it short — 10-15 lines is enough. Avoid JSON <plan> blocks; they are error-prone for small models."
         );
       }
       return (
         "PLAN 能力提示（小模型）：使用简洁 Markdown 带清晰标题即可。 " +
         "可将计划包裹在 <proposed_plan> 标签中。 " +
-        "必须包含：(1) 影响文件，(2) 逐步操作，(3) 验证方式。 " +
+        "必须表达：(1) 目标，(2) 具体实施、设计或分析路径，(3) 验证方式。只有确实计划修改源码时才需要写影响文件。 " +
         "保持简短 — 10-15 行即可。避免 JSON <plan> 块，小模型容易出错。"
       );
     }
@@ -831,13 +831,13 @@ export function buildSystemPrompt(
         return (
           "PLAN CAPABILITY NOTE (standard model): You may produce structured Markdown plans with " +
           "headings and bullet lists. Both [PROPOSAL START]...<plan>{...}</plan>...[PROPOSAL END] " +
-          "and <proposed_plan> wrapped Markdown are accepted. Include all standard sections."
+          "and <proposed_plan> wrapped Markdown are accepted. Adapt sections to the task while preserving the goal, approach, relevant boundaries, and validation."
         );
       }
       return (
         "PLAN 能力提示（标准模型）：可以产出带标题和列表的结构化 Markdown 计划。 " +
         "支持 [PROPOSAL START]...<plan>{...}</plan>...[PROPOSAL END] 和 <proposed_plan> 包裹格式。 " +
-        "请包含所有标准章节。"
+        "章节随任务调整，但必须保留目标、实施/设计/分析路径、相关边界和验证。"
       );
     }
     // Level 3 = strong: no hints needed, full instructions already in Core Rules
@@ -861,8 +861,8 @@ export function buildSystemPrompt(
             ? `1. Explore first with the exposed read/search tools (${readToolText}). Use \`get_project_skeleton\` only when it is exposed and no narrower clue exists; do not re-scan directories.`
             : "1. No read/search tool is exposed. Do not fake exploration; base the plan on provided user evidence and state any missing evidence explicitly.",
           "2. Grounding: use screenshots, attachments, and @ files as primary evidence. State what you observe.",
-          "3. Convergence: once evidence is sufficient, output `<proposed_plan>` Markdown — include affected files, implementation steps, and validation. Short, decision-complete, directly actionable.",
-          "4. Ask only at real decision forks: use \`<user_options>\` only when 2+ equally reasonable implementation paths, tech stack choices, or scope/priority trade-offs require user input. Never fake a question when nothing blocks progress.",
+          "3. Convergence: once evidence is sufficient, output concise, decision-complete `<proposed_plan>` Markdown. Adapt headings to the task: implementation plans name affected boundaries, while feature, design, research, or verification plans may use architecture, components, decisions, constraints, or analysis methods. Always include executable acceptance or validation.",
+          "4. Ask only at real decision forks: use \`<user_options>\` only when 2+ equally reasonable implementation paths, tech stack choices, or scope/priority trade-offs require user input. Ask, then stop without emitting \`<proposed_plan>\`; resume planning after the answer. Never fake a question when nothing blocks progress.",
           "5. Output the visible proposed plan as your final action; runtime, not the model, owns the plan file write.",
           "6. Plan artifacts rule: a runtime-materialized plan.md is mandatory before review; tasks.md belongs to execution only.",
           "7. Output a visible \`<proposed_plan>\` in plain Markdown; never imitate a write tool call.",
@@ -872,8 +872,8 @@ export function buildSystemPrompt(
             ? `1. 先探索：使用本轮可用读取/搜索工具（${readToolText}）定向定位；只有 \`get_project_skeleton\` 已暴露且无线索时才使用，不要重复扫目录。`
             : "1. 本轮没有读取/搜索工具。不要伪造探索；基于用户已提供证据制定方案，并明确缺失证据。",
           "2. 证据优先：截图、附件、@ 文件是首要证据；先说明观察到的现象。",
-          "3. 收敛出方案：证据足够后，输出 `<proposed_plan>` Markdown — 必须包含影响文件、实施步骤、验证方式；短小、可决策、可直接执行。",
-          "4. 只在真正需要用户决策的分叉点才用 \`<user_options>\`：当存在 2 个以上同等合理的实现路径、技术方案选型、或范围/优先级取舍时，必须给出选项让用户选择。不要在不阻塞时假装提问。",
+          "3. 收敛出方案：证据足够后输出精简、决策完整的 `<proposed_plan>` Markdown。章节随任务调整：实施类说明影响边界，新功能、设计、调研或验证类可使用架构、组件、决策、约束或分析方法；始终给出可执行验收或验证。",
+          "4. 只在真正需要用户决策的分叉点才用 \`<user_options>\`：当存在 2 个以上同等合理的实现路径、技术方案选型、或范围/优先级取舍时，必须给出选项。提问后立即停止，不要同时输出 `<proposed_plan>`；用户回答后再继续规划。不要在不阻塞时假装提问。",
           "5. 输出可见 proposed plan 后即停止；计划文件写入由 runtime 而不是模型负责。",
           "6. 计划文件规则：进入审核前必须由 runtime 物化 plan.md；tasks.md 仍属于执行阶段。",
           "7. 输出可见的 \`<proposed_plan>\` 纯文本方案，不要模仿写入工具调用。",
@@ -1123,7 +1123,7 @@ export function buildSystemPrompt(
         tfl.push("If the Plan is not ready only because evidence or analysis is incomplete, continue autonomously with the exposed safe tools; do not turn your own read/check/fix ordering into user options. Give 2-4 options only when a user-owned product, scope, technology, or priority decision genuinely blocks the artifact.");
         tfl.push("When plan is mature, output `<proposed_plan>` Markdown and stop; runtime owns the file write.");
         tfl.push("Plan artifacts: runtime-materialized plan.md is mandatory before review; tasks.md is execution-only.");
-        tfl.push("Keep the visible plan concise: title, summary, confirmed evidence, key changes, API/interface impact, test plan, assumptions. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps.");
+        tfl.push("Keep the visible plan concise and adapt its headings to the task. It must express the goal, grounded current state or constraints, implementation/design/analysis path, affected boundary when relevant, and executable validation. Mention APIs, types, assumptions, or source files only when they affect the work. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps.");
         tfl.push(tabularWorkflowPlanInstruction);
       } else {
         tfl.push("规划回合：先只读探索，证据足够后输出可见 `<proposed_plan>`，由 MAIN runtime 物化为 plan.md；不要伪造工具调用。批准前不写计划文件、不修改源码、不生成 tasks.md。");
@@ -1131,7 +1131,7 @@ export function buildSystemPrompt(
         tfl.push("如果方案尚未收敛只是因为证据或分析不足，应使用当前开放的安全工具自主继续；不要把你自己的读取、检查或修复顺序包装成用户选项。只有用户拥有的产品、范围、技术选型或优先级决策真正阻塞计划文件时，才给出 2-4 个选项。");
         tfl.push("方案成熟时输出 `<proposed_plan>` Markdown 并停止；计划文件写入由 runtime 负责。");
         tfl.push("计划文件：进入审核前必须由 runtime 物化 plan.md，tasks.md 属执行阶段。");
-        tfl.push("可见方案保持精简：标题、摘要、已确认证据、关键改动、API/接口影响、测试方案、假设。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。");
+        tfl.push("可见方案保持精简，章节随任务调整；必须表达目标、有根据的现状或约束、实施/设计/分析路径、相关时的影响边界和可执行验证。API、类型、假设或源码文件只在影响工作时才写。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。");
         tfl.push(tabularWorkflowPlanInstruction);
       }
     } else {

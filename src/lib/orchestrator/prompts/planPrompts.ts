@@ -271,7 +271,12 @@ export function stripControlPromptForPlanFallback(text: string): string {
     .replace(/<tool_use>[\s\S]*?<\/tool_use>/gi, " ")
     .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
     .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
-    .replace(/\s+/g, " ")
+    // Keep paragraph and list boundaries because Plan quality gates use them
+    // to preserve independent user-goal facets. Only collapse horizontal
+    // whitespace and excessive blank lines.
+    .replace(/[^\S\r\n]+/g, " ")
+    .replace(/[ \t]*\r?\n[ \t]*/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 
@@ -303,4 +308,3 @@ export function detectRequestedRootMarkdownDeliverables(text: string): string[] 
 
   return [...new Set(normalized)];
 }
-

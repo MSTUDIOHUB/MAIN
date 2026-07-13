@@ -75,11 +75,13 @@ function createPlanConvergenceCallbacks(language = "en") {
   const assistantFinal = [];
   const statuses = [];
   const streamTokens = [];
+  const stops = [];
   return {
     appended,
     assistantFinal,
     statuses,
     streamTokens,
+    stops,
     callbacks: {
       getPreferredLanguage: () => language,
       getMessages: () => [],
@@ -88,6 +90,7 @@ function createPlanConvergenceCallbacks(language = "en") {
       onAssistantFinalText: (text, options, meta) => assistantFinal.push({ text, options, meta }),
       onStatusChange: (status) => statuses.push(status),
       onStreamToken: (token, id) => streamTokens.push({ token, id }),
+      onNonActionableStop: (message, reason, progress) => stops.push({ message, reason, progress }),
     },
   };
 }
@@ -143,6 +146,59 @@ test("plan evidence readiness requires observed user context and targeted reads"
   );
 });
 
+test("MD Viewer structural reads do not close diagnostic Plan before a root-cause fact", () => {
+  const userGoal = [
+    "在 macOS 双击 Markdown 文件时只打开空白界面。",
+    "软件内的打开功能无法开启文件选择窗口。",
+    "找到原因并制定严谨整改方案。",
+  ].join(" ");
+  const structuralReads = [
+    {
+      name: "read_file",
+      target: "src-tauri/src/main.rs",
+      status: "succeeded",
+      detail: "fn main registers Tauri plugins, commands, and emits file-open events to the frontend",
+    },
+    {
+      name: "read_file",
+      target: "src-tauri/tauri.conf.json",
+      status: "succeeded",
+      detail: "Tauri application configuration defines the window and Markdown file associations",
+    },
+    {
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "window.addEventListener handles file-open and openFile invokes the dialog and backend command",
+    },
+  ];
+
+  const structural = assessPlanEvidenceReadiness({
+    userGoal,
+    hasObservedUserContext: true,
+    recentToolActivity: structuralReads,
+  });
+  assert.equal(structural.status, "needs_targeted_read");
+  assert.equal(structural.reason, "change_targets_lack_confirmed_rationale");
+  assert.equal(structural.semanticFacts, 3);
+  assert.equal(structural.changeTargets, 2);
+
+  const diagnosed = assessPlanEvidenceReadiness({
+    userGoal,
+    hasObservedUserContext: true,
+    recentToolActivity: [
+      ...structuralReads,
+      {
+        name: "grep_search",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        detail: "src/main.js invokes read_file_content but src-tauri/src/main.rs never registers that command",
+      },
+    ],
+  });
+  assert.equal(diagnosed.status, "ready_for_plan");
+});
+
 test("plan read-only convergence stops broad discovery before targeted evidence loops", () => {
   assert.equal(shouldTriggerPlanReadOnlyConvergence({
     isUnapprovedPlanReadOnlyBatch: true,
@@ -163,6 +219,28 @@ test("plan read-only convergence stops broad discovery before targeted evidence 
       { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
   }), false);
+
+  assert.equal(shouldTriggerPlanReadOnlyConvergence({
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    batchCount: 3,
+    toolCount: 6,
+    userGoal: "制定桌面应用文档打开流程的修改计划。",
+    recentToolActivity: [
+      {
+        name: "read_file",
+        target: "src/main.ts",
+        status: "succeeded",
+        detail: "command_invoke_contract(load_document) import open from '@tauri-apps/plugin-dialog'",
+      },
+      {
+        name: "read_file",
+        target: "src-tauri/src/lib.rs",
+        status: "succeeded",
+        detail: "handler_contract(save_document) .plugin(tauri_plugin_dialog::init())",
+      },
+    ],
+  }), true);
 
   assert.equal(shouldTriggerPlanReadOnlyConvergence({
     isUnapprovedPlanReadOnlyBatch: true,
@@ -288,6 +366,50 @@ test("plan convergence helper emits the first convergence prompt and updates cou
   assert.equal(harness.appended[0].role, "user");
   assert.match(harness.appended[0].content, /PLAN_READONLY_CONVERGENCE/);
   assert.deepEqual(phases.map((item) => item.phase), ["synthesis", "drafting"]);
+});
+
+test("plan convergence names an unresolved contract instead of allowing more broad reads", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanReadOnlyConvergence({
+    callbacks: {
+      ...harness.callbacks,
+      getMessages: () => [{
+        role: "user",
+        content: "制定桌面应用文档打开流程的修改计划。",
+      }],
+    },
+    iteration: 3,
+    isUnapprovedPlanReadOnlyBatch: true,
+    hasPlanDecisionOutput: false,
+    successfulReadOnlyExplorationResultCount: 2,
+    planReadOnlyConvergenceBatches: 2,
+    planReadOnlyConvergenceTools: 4,
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: { imageParts: 0, mentionedFilePaths: [], attachedFilePaths: [], externalAttachments: [] },
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/main.ts",
+        status: "succeeded",
+        detail: "command_invoke_contract(load_document) import open from '@tauri-apps/plugin-dialog'",
+      },
+      {
+        name: "read_file",
+        target: "src-tauri/src/lib.rs",
+        status: "succeeded",
+        detail: "handler_contract(save_document) .plugin(tauri_plugin_dialog::init())",
+      },
+    ],
+    lastAssistantTextForCheckpoint: "",
+    setPlanRuntimePhase: (phase, reason) => phases.push({ phase, reason }),
+  });
+
+  assert.equal(result.status, "continue");
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+  assert.match(harness.appended.at(-1)?.content || "", /permission_contract:dialog/);
+  assert.match(harness.appended.at(-1)?.content || "", /不要仅为解决当前缺口而重读/);
+  assert.equal(phases.at(-1)?.phase, "needs_evidence");
 });
 
 test("plan convergence helper does not re-trigger once the convergence prompt has been used", () => {
@@ -453,6 +575,108 @@ test("visible candidate rejection recovers without poisoning persisted artifact 
   }]);
 });
 
+test("second short diagnostic draft requests evidence instead of forcing an invalid scaffold", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 5,
+    quality: {
+      ok: false,
+      reason: "too_short",
+      missingSections: [],
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    },
+    planRuntimePhase: "drafting",
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src-tauri/src/main.rs",
+        status: "succeeded",
+        detail: "fn main registers Tauri commands and emits file-open events",
+      },
+      {
+        name: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        detail: "window.addEventListener handles file-open and openFile invokes the backend",
+      },
+    ],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "找到双击 Markdown 文件只显示空白以及打开按钮失效的原因并制定整改方案。",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "too_short",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planQualityRejectCount, 2);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+  assert.equal(phases.at(-1)?.phase, "needs_evidence");
+  assert.equal(phases.at(-1)?.reason, "change_targets_lack_confirmed_rationale");
+});
+
+test("a first rejected draft prioritizes an unresolved contract counterpart over text rewrite", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 6,
+    quality: {
+      ok: false,
+      reason: "unsupported_hypothesis_as_plan",
+      missingSections: [],
+      recoveryAction: "rewrite",
+      canAutoRepair: false,
+    },
+    planRuntimePhase: "drafting",
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/main.ts",
+        status: "succeeded",
+        detail: "command_invoke_contract(load_document) import open from '@tauri-apps/plugin-dialog'",
+      },
+      {
+        name: "read_file",
+        target: "src-tauri/src/lib.rs",
+        status: "succeeded",
+        detail: "handler_contract(save_document) .plugin(tauri_plugin_dialog::init())",
+      },
+    ],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "修复桌面应用的文档打开流程并制定计划。",
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planQualityRejectCount, 1);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.equal(result.planAutoScaffoldPromptIssued, false);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /permission_contract:dialog/);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /运行时权限、capability、manifest 或配置拥有者/);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /src-tauri\/src\/lib\.rs/);
+  assert.deepEqual(phases, [{
+    phase: "needs_evidence",
+    reason: "contract_counterpart_unverified",
+    status: "running",
+  }]);
+});
+
 test("visible candidate quality recovery is bounded after rewrite and scaffold", () => {
   const harness = createPlanConvergenceCallbacks("en");
   const common = {
@@ -588,7 +812,7 @@ test("plan artifact quality rejection persists until a later accepted write", ()
   assert.equal(acceptedRewrite.planArtifactQualityRejected, false);
 });
 
-test("plan quality recovery closes a successful evidence recovery pass", () => {
+test("plan quality recovery keeps tools open when a successful read still lacks closure evidence", () => {
   const harness = createPlanConvergenceCallbacks("zh");
   const phases = [];
   const recentActivity = [
@@ -619,13 +843,178 @@ test("plan quality recovery closes a successful evidence recovery pass", () => {
   });
 
   assert.equal(result.planEvidenceRecoveryPasses, 1);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt, /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+  assert.deepEqual(phases, [{
+    phase: "needs_evidence",
+    reason: "change_targets_lack_confirmed_rationale",
+    status: "running",
+  }]);
+});
+
+test("plan quality recovery closes once a successful read exposes a target defect", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const recentActivity = [{
+    name: "read_file",
+    target: "src/App.tsx",
+    status: "succeeded",
+    detail: "App is missing the file-open listener required by the user workflow",
+  }];
+  const result = handlePlanQualityRecoveryAfterToolResults({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 8,
+    results: [{
+      toolCallId: "read-defect-1",
+      name: "read_file",
+      target: "src/App.tsx",
+      content: "export function App() {}",
+      isError: false,
+    }],
+    planRuntimePhase: "needs_evidence",
+    recentPlanToolActivity: recentActivity,
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Fix the broken file-open workflow",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "missing_plan_required_sections:read_evidence",
+    planLastMissingSections: ["Read Evidence"],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryPasses: 1,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planEvidenceRecoveryPasses, 2);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
   assert.match(result.pendingPlanRuntimeRecoveryPrompt, /PLAN_EVIDENCE_RECOVERY_COMPLETE/);
-  assert.match(result.pendingPlanRuntimeRecoveryPrompt, /定向补证已经完成/);
   assert.deepEqual(phases, [{
     phase: "drafting",
     reason: "evidence recovery complete",
     status: "running",
   }]);
+});
+
+test("an outstanding evidence request is consumed after reconciliation advances to drafting", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const recentActivity = [{
+    name: "read_file",
+    target: "src/App.tsx",
+    status: "succeeded",
+    detail: "App is missing the file-open listener required by the user workflow",
+  }];
+  const result = handlePlanQualityRecoveryAfterToolResults({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 9,
+    results: [{
+      toolCallId: "read-reconciled-1",
+      name: "read_file",
+      target: "src/App.tsx",
+      content: "export function App() {}",
+      isError: false,
+    }],
+    planRuntimePhase: "drafting",
+    recentPlanToolActivity: recentActivity,
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Fix the broken file-open workflow",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "uncovered_user_goal_facets:1",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planEvidenceRecoveryPasses, 1);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt, /PLAN_EVIDENCE_RECOVERY_COMPLETE/);
+  assert.deepEqual(phases, [{
+    phase: "drafting",
+    reason: "evidence recovery complete",
+    status: "running",
+  }]);
+});
+
+test("cached evidence recovery retries a different owner once, then pauses without consuming evidence budget", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const recentActivity = [
+    {
+      name: "read_file",
+      target: "src/main.ts",
+      status: "succeeded",
+      detail: "command_invoke_contract(load_document) imports open from '@tauri-apps/plugin-dialog'",
+    },
+    {
+      name: "read_file",
+      target: "src-tauri/src/lib.rs",
+      status: "succeeded",
+      detail: "handler_contract(load_document) initializes tauri_plugin_dialog",
+    },
+  ];
+  const phases = [];
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    recentPlanToolActivity: recentActivity,
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Plan a reliable document-open workflow.",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "contract_counterpart_unverified",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planArtifactQualityRejected: false,
+    planRuntimePhase: "needs_evidence",
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryPasses: 1,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  };
+  const repeatedRead = {
+    toolCallId: "read-cached-owner",
+    name: "read_file",
+    target: "src/main.ts",
+    content: "Repeated read-only tool call skipped because the file is unchanged.",
+    isError: false,
+  };
+
+  const retry = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 10,
+    planEvidenceNoProgressPasses: 0,
+    results: [repeatedRead],
+  });
+
+  assert.equal(retry.planEvidenceRecoveryPasses, 1);
+  assert.equal(retry.planEvidenceNoProgressPasses, 1);
+  assert.equal(retry.planClosureEvidenceRecoveryIssued, true);
+  assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+  assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /src\/main\.ts/);
+  assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /choose a different owner/);
+  assert.deepEqual(phases.at(-1), {
+    phase: "needs_evidence",
+    reason: "contract_counterpart_unverified",
+    status: "running",
+  });
+
+  const blocked = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 11,
+    planEvidenceNoProgressPasses: retry.planEvidenceNoProgressPasses,
+    results: [repeatedRead],
+  });
+
+  assert.equal(blocked.planEvidenceRecoveryPasses, 1);
+  assert.equal(blocked.planEvidenceNoProgressPasses, 2);
+  assert.equal(blocked.planClosureEvidenceRecoveryIssued, false);
+  assert.match(blocked.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_BLOCKED/);
+  assert.match(blocked.pendingPlanRuntimeRecoveryPrompt || "", /do not draft a plan that assumes the unresolved evidence/i);
+  assert.deepEqual(phases.at(-1), {
+    phase: "blocked",
+    reason: "evidence recovery repeated without progress",
+    status: "failed",
+  });
 });
 
 function createPostConvergenceInput(overrides = {}) {
@@ -679,7 +1068,7 @@ test("post-convergence helper reopens bounded targeted evidence when a drafting 
   const result = handlePlanPostConvergenceToolRedirect(input);
 
   assert.equal(result.status, "continue");
-  assert.equal(result.planPostConvergenceToolRedirectCount, 0);
+  assert.equal(result.planPostConvergenceToolRedirectCount, 1);
   assert.equal(result.planDraftingRecoveryReadCount, 0);
   assert.equal(result.planEvidenceRecoveryPasses, 1);
   assert.equal(result.planReasoningOnlyRecoveryPasses, 0);
@@ -717,6 +1106,34 @@ test("post-convergence helper forces visible plan convergence after recovery is 
   assert.deepEqual(harness.statuses, ["running"]);
   assert.deepEqual(harness.streamTokens, [{ token: "__ESCALATION_RESET__:", id: "assistant-1" }]);
   assert.deepEqual(phases, [{ phase: "drafting", reason: "recovery exhausted, draft with frozen evidence" }]);
+});
+
+test("post-convergence tool redirects stop after a bounded recovery budget", () => {
+  const { harness, phases, input } = createPostConvergenceInput({
+    input: {
+      effectiveToolCalls: [{ id: "call_read", name: "read_file", arguments: "{}" }],
+      planRuntimePhase: "drafting",
+      planPostConvergenceToolRedirectCount: 3,
+      planEvidenceRecoveryPasses: 3,
+      planQualityRejectCount: 2,
+      planLastQualityGateReason: "missing_plan_required_sections:test_plan",
+    },
+  });
+  const result = handlePlanPostConvergenceToolRedirect(input);
+
+  assert.equal(result.status, "stopped");
+  assert.equal(result.planPostConvergenceToolRedirectCount, 3);
+  assert.equal(harness.stops.length, 1);
+  assert.equal(harness.stops[0].reason, "incomplete_plan");
+  assert.equal(
+    harness.stops[0].progress?.nextStep,
+    "post_convergence_tool_redirect_budget_exhausted",
+  );
+  assert.deepEqual(harness.statuses, ["idle"]);
+  assert.deepEqual(phases, [{
+    phase: "blocked",
+    reason: "post_convergence_tool_redirect_budget_exhausted",
+  }]);
 });
 
 test("post-convergence plan turns redirect more read-only tools before execution", () => {
@@ -829,7 +1246,7 @@ test("post-convergence plan tool surface narrows to targeted evidence or final d
       "write_file",
       "get_project_skeleton",
     ],
-  }), ["read_file", "repo_map_context"]);
+  }), ["grep_search", "read_file", "repo_map_context"]);
 
   assert.deepEqual(filterPlanToolNamesAfterReadOnlyConvergence({
     workflowMode: "plan",

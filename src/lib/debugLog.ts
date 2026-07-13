@@ -388,10 +388,78 @@ function isRoutineDebugEntry(entry: DebugLogEntry): boolean {
     return true;
   }
 
+  // These are immediately followed by richer lifecycle summaries. Keeping
+  // both versions makes a single model iteration look like several distinct
+  // events and obscures the actual stop or recovery decision.
+  if (
+    source === "agent.assistant_completion_classified" ||
+    source === "agent.plan_quality_recovery_action" ||
+    source === "agent.plan_text_materialization_rejected" ||
+    source === "agent.plan_structured_proposal_materialization_rejected"
+  ) {
+    return true;
+  }
+
+  if (
+    source === "store.stream_done" &&
+    /"truncated":false/i.test(message) &&
+    /"truncationReason":null/i.test(message) &&
+    /"mirrorKind":"none"/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (
+    source === "agent.normalized_turn" &&
+    /"replyOptions":0/i.test(message) &&
+    /"hasStructuredProposal":false/i.test(message)
+  ) {
+    return true;
+  }
+
   // `agent.llm_request_shape` already carries the iteration, intent, model,
   // message and tool counts. Keeping the adjacent iteration marker doubles
   // every model step without adding a diagnostic field.
   if (source === "agent.iteration_start") return true;
+
+  if (
+    source === "agent.mcp_discovery_start" &&
+    /"enabledServers":0/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (
+    source === "agent.mcp_discovery_done" &&
+    /"discoveryRelevantToTurn":false/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (
+    source === "agent.mcp_server_status" &&
+    /"discoveryRelevantToTurn":false/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (
+    source === "agent.mcp_server_status" &&
+    /"requestedUnityRouting":false/i.test(message) &&
+    /"requestedGameStudioMcpRouting":false/i.test(message) &&
+    /"unityConsoleDiagnosticsRequested":false/i.test(message) &&
+    /"state":"disabled"/i.test(message)
+  ) {
+    return true;
+  }
+
+  if (
+    source === "agent.mcp_routing" &&
+    /"selectedToolCount":0/i.test(message) &&
+    /"routingRan":false/i.test(message)
+  ) {
+    return true;
+  }
 
   if (
     source === "agent.context_pack_built" &&
@@ -429,7 +497,7 @@ function isRoutineDebugEntry(entry: DebugLogEntry): boolean {
   if (
     source === "agent.tool_permission_plan" &&
     /"risk":"read_only"/i.test(message) &&
-    /"policy":"auto_execute"/i.test(message)
+    /"(?:policy|plannedAction)":"auto_execute"/i.test(message)
   ) {
     return true;
   }

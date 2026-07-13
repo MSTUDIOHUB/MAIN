@@ -5,8 +5,14 @@ import {
   buildPlanEvidenceRecoveryClosurePrompt,
   buildPlanPostConvergenceToolRedirectPrompt,
 } from "../../orchestrator/planOrchestration";
-import { isPlanEvidenceBundleReady } from "../../planEvidence";
-import { MAX_PLAN_EVIDENCE_RECOVERY_PASSES } from "../../planRuntime";
+import {
+  assessPlanClosureEvidence,
+  isPlanEvidenceBundleReady,
+} from "../../planEvidence";
+import {
+  MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
+  MAX_PLAN_EVIDENCE_RECOVERY_PASSES,
+} from "../../planRuntime";
 import {
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   collectPlanClosureMaterializationInput,
@@ -29,6 +35,7 @@ export type PlanQualityRecoveryResult = {
   planAutoScaffoldPromptIssued: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
   planEvidenceRecoveryPasses: number;
+  planEvidenceNoProgressPasses: number;
   planArtifactQualityRejected: boolean;
   pendingPlanRuntimeRecoveryPrompt: string | null;
 };
@@ -57,6 +64,7 @@ type PlanQualityRecoveryInput = {
   planAutoScaffoldPromptIssued: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
   planEvidenceRecoveryPasses: number;
+  planEvidenceNoProgressPasses?: number;
   setPlanRuntimePhase: (
     phase: PlanRuntimePhase,
     reason?: string,
@@ -72,6 +80,16 @@ function isPlanArtifactQualityRejectionResult(
     result.internalFeedback === true &&
     !!result.planRecoveryAction &&
     result.planRecoveryAction !== "accept"
+  );
+}
+
+const PLAN_EVIDENCE_NO_PROGRESS_RESULT_RE =
+  /Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|FILE_UNCHANGED_STUB|already called with identical arguments/i;
+
+function evidenceRecoveryResultProvidesNewEvidence(result: ToolExecutionResult): boolean {
+  if (result.isError) return false;
+  return !PLAN_EVIDENCE_NO_PROGRESS_RESULT_RE.test(
+    `${result.displayContent || ""}\n${result.content || ""}`,
   );
 }
 
@@ -113,9 +131,20 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
   let planClosureEvidenceRecoveryIssued = input.planClosureEvidenceRecoveryIssued;
   let planEvidenceRecoveryPasses = input.planEvidenceRecoveryPasses;
+  let planEvidenceNoProgressPasses = input.planEvidenceNoProgressPasses ?? 0;
   let planArtifactQualityRejected = input.planArtifactQualityRejected === true;
   let pendingPlanRuntimeRecoveryPrompt: string | null = null;
-  const wasPlanEvidenceRecoveryPhase = String(planRuntimePhase) === "needs_evidence";
+  const hasOutstandingEvidenceRecoveryRead =
+    planClosureEvidenceRecoveryIssued &&
+    input.evidenceRecoveryResults.some((result) =>
+      !result.internalFeedback && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
+    );
+  // Tool-result reconciliation may advance needs_evidence -> drafting as soon
+  // as a new bundle becomes closure-ready. The outstanding recovery request
+  // still belongs to that read batch and must be consumed here; otherwise the
+  // next uncovered facet is incorrectly suppressed as a duplicate request.
+  const wasPlanEvidenceRecoveryPhase =
+    String(planRuntimePhase) === "needs_evidence" || hasOutstandingEvidenceRecoveryRead;
   const setQualityPhase = (
     phase: PlanRuntimePhase,
     reason?: string,
@@ -132,6 +161,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     planAutoScaffoldPromptIssued,
     planClosureEvidenceRecoveryIssued,
     planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses,
     planArtifactQualityRejected,
     pendingPlanRuntimeRecoveryPrompt,
   });
@@ -158,12 +188,110 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       evidenceRecoveryPasses: planEvidenceRecoveryPasses,
     });
 
-    if (latestQualityResult.recoveryAction === "targeted_evidence" && planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
+    const qualityClosureEvidence = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      attemptedPlanWriteTargets,
+      latestUserPromptText,
+    );
+    const hasQualityClosureEvidence = isPlanEvidenceBundleReady(
+      qualityClosureEvidence.evidenceBundle,
+    );
+    const closureEvidenceAssessment = assessPlanClosureEvidence(
+      qualityClosureEvidence.evidenceBundle,
+    );
+    const hasStructuredQualityClosureEvidence = qualityClosureEvidence.evidenceRecords.length > 0;
+    const closureGapNeedsTargetedEvidence =
+      latestQualityResult.recoveryAction !== "ask_user" &&
+      hasQualityClosureEvidence &&
+      hasStructuredQualityClosureEvidence &&
+      !closureEvidenceAssessment.ready;
+    const shouldRequestTargetedEvidenceAfterQualityGate =
+      (
+        latestQualityResult.recoveryAction === "targeted_evidence" ||
+        closureGapNeedsTargetedEvidence
+      ) &&
+      planQualityRejectCount >= 1 &&
+      hasQualityClosureEvidence &&
+      hasStructuredQualityClosureEvidence &&
+      !planClosureEvidenceRecoveryIssued &&
+      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+    const effectiveRecoveryAction = shouldRequestTargetedEvidenceAfterQualityGate
+      ? "targeted_evidence"
+      : latestQualityResult.recoveryAction;
+    const deterministicEvidenceMaterializationCandidate =
+      latestQualityResult.source === "visible_candidate" &&
+      latestQualityResult.recoveryAction !== "ask_user" &&
+      closureEvidenceAssessment.ready &&
+      (
+        planQualityRejectCount >= 2 ||
+        /excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
+          planLastQualityGateReason,
+        )
+      );
+    logAgentEvent("plan_quality_gate_recovery_decision", {
+      iteration,
+      source: latestQualityResult.source,
+      qualityGateReason: planLastQualityGateReason,
+      qualityRejectCount: planQualityRejectCount,
+      requestedRecoveryAction: latestQualityResult.recoveryAction || "",
+      effectiveRecoveryAction,
+      hasGroundedEvidence: hasQualityClosureEvidence,
+      hasStructuredEvidence: hasStructuredQualityClosureEvidence,
+      closureEvidenceReady: closureEvidenceAssessment.ready,
+      closureEvidenceReason: closureEvidenceAssessment.reason,
+      objectiveTargetMatches: closureEvidenceAssessment.objectiveTargetMatches,
+      defectSignalMatches: closureEvidenceAssessment.defectSignalMatches,
+      contractMismatchMatches: closureEvidenceAssessment.contractMismatchMatches,
+      contractMismatchKinds: closureEvidenceAssessment.contractMismatchKinds,
+      unresolvedContractKinds: closureEvidenceAssessment.unresolvedContractKinds,
+      deterministicEvidenceMaterializationCandidate,
+      targetedEvidenceRecovery: shouldRequestTargetedEvidenceAfterQualityGate,
+      sanitizedEvidenceCount: qualityClosureEvidence.evidence.length,
+      structuredEvidenceCount: qualityClosureEvidence.evidenceRecords.length,
+      sanitizedFileCount: qualityClosureEvidence.files.length,
+      sanitizerDropped: qualityClosureEvidence.sanitizer.dropped,
+      sanitizerDropReasons: qualityClosureEvidence.sanitizer.dropReasons,
+      evidenceBundleId: qualityClosureEvidence.evidenceBundle.bundleId,
+      evidenceBundleHash: qualityClosureEvidence.evidenceBundle.hash,
+      semanticFacts: qualityClosureEvidence.evidenceBundle.facts.length,
+      changeTargets: qualityClosureEvidence.evidenceBundle.changeTargets.length,
+    });
+    if (shouldRequestTargetedEvidenceAfterQualityGate) {
+      planClosureEvidenceRecoveryIssued = true;
+      setQualityPhase(
+        "needs_evidence",
+        closureEvidenceAssessment.ready
+          ? "quality gate needs model-authored plan evidence"
+          : closureEvidenceAssessment.reason,
+      );
+      pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
+        callbacks.getPreferredLanguage(),
+        planLastQualityGateReason || "quality gate rejected plan draft",
+        latestUserPromptText,
+        {
+          unresolvedContractKinds: closureEvidenceAssessment.unresolvedContractKinds,
+          confirmedChangeTargets: qualityClosureEvidence.evidenceBundle.changeTargets,
+        },
+      );
+    } else if (
+      planClosureEvidenceRecoveryIssued &&
+      !closureEvidenceAssessment.ready &&
+      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES
+    ) {
+      setQualityPhase("needs_evidence", closureEvidenceAssessment.reason);
+    } else if (
+      latestQualityResult.recoveryAction === "targeted_evidence" &&
+      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES
+    ) {
       setQualityPhase("needs_evidence", planLastQualityGateReason);
     } else if (
       latestQualityResult.recoveryAction === "auto_scaffold" ||
       planQualityRejectCount >= 2 ||
-      (latestQualityResult.recoveryAction === "targeted_evidence" && planEvidenceRecoveryPasses >= MAX_PLAN_EVIDENCE_RECOVERY_PASSES)
+      (
+        latestQualityResult.recoveryAction === "targeted_evidence" &&
+        planEvidenceRecoveryPasses >= MAX_PLAN_EVIDENCE_RECOVERY_PASSES
+      )
     ) {
       if (!planAutoScaffoldPromptIssued) {
         planAutoScaffoldPromptIssued = true;
@@ -180,62 +308,6 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       }
     } else {
       setQualityPhase("needs_rewrite", planLastQualityGateReason);
-    }
-
-    const qualityClosureEvidence = collectPlanClosureMaterializationInput(
-      callbacks,
-      recentPlanToolActivity,
-      attemptedPlanWriteTargets,
-      latestUserPromptText,
-    );
-    const hasQualityClosureEvidence = isPlanEvidenceBundleReady(
-      qualityClosureEvidence.evidenceBundle,
-    );
-    const hasStructuredQualityClosureEvidence = qualityClosureEvidence.evidenceRecords.length > 0;
-    const shouldRequestTargetedEvidenceAfterQualityGate =
-      latestQualityResult.recoveryAction === "targeted_evidence" &&
-      planQualityRejectCount >= 1 &&
-      hasQualityClosureEvidence &&
-      hasStructuredQualityClosureEvidence &&
-      !planClosureEvidenceRecoveryIssued &&
-      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
-    const deterministicEvidenceMaterializationCandidate =
-      latestQualityResult.source === "visible_candidate" &&
-      latestQualityResult.recoveryAction !== "ask_user" &&
-      (
-        planQualityRejectCount >= 2 ||
-        /excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
-          planLastQualityGateReason,
-        )
-      );
-    logAgentEvent("plan_quality_gate_recovery_decision", {
-      iteration,
-      source: latestQualityResult.source,
-      qualityGateReason: planLastQualityGateReason,
-      qualityRejectCount: planQualityRejectCount,
-      recoveryAction: latestQualityResult.recoveryAction || "",
-      hasGroundedEvidence: hasQualityClosureEvidence,
-      hasStructuredEvidence: hasStructuredQualityClosureEvidence,
-      deterministicEvidenceMaterializationCandidate,
-      targetedEvidenceRecovery: shouldRequestTargetedEvidenceAfterQualityGate,
-      sanitizedEvidenceCount: qualityClosureEvidence.evidence.length,
-      structuredEvidenceCount: qualityClosureEvidence.evidenceRecords.length,
-      sanitizedFileCount: qualityClosureEvidence.files.length,
-      sanitizerDropped: qualityClosureEvidence.sanitizer.dropped,
-      sanitizerDropReasons: qualityClosureEvidence.sanitizer.dropReasons,
-      evidenceBundleId: qualityClosureEvidence.evidenceBundle.bundleId,
-      evidenceBundleHash: qualityClosureEvidence.evidenceBundle.hash,
-      semanticFacts: qualityClosureEvidence.evidenceBundle.facts.length,
-      changeTargets: qualityClosureEvidence.evidenceBundle.changeTargets.length,
-    });
-    if (shouldRequestTargetedEvidenceAfterQualityGate) {
-      pendingPlanRuntimeRecoveryPrompt = null;
-      planClosureEvidenceRecoveryIssued = true;
-      setQualityPhase("needs_evidence", "quality gate needs model-authored plan evidence");
-      pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
-        callbacks.getPreferredLanguage(),
-        planLastQualityGateReason || "quality gate rejected plan draft",
-      );
     }
   } else if (input.acceptedPersistedArtifact) {
     // A rejected artifact remains non-reviewable across model iterations. Only
@@ -256,16 +328,126 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     evidenceRecoveryBatchResults.length > 0 &&
     pendingPlanRuntimeRecoveryPrompt == null
   ) {
-    planEvidenceRecoveryPasses += 1;
-    const hasSuccessfulEvidence = evidenceRecoveryBatchResults.some((result) => !result.isError);
+    // A completed read consumes the outstanding recovery request. A later,
+    // still-uncovered facet may use the next bounded pass; without a read,
+    // the flag remains set and duplicate prompts stay suppressed.
+    planClosureEvidenceRecoveryIssued = false;
+    const successfulEvidenceResults = evidenceRecoveryBatchResults.filter(
+      evidenceRecoveryResultProvidesNewEvidence,
+    );
+    const hasSuccessfulEvidence = successfulEvidenceResults.length > 0;
     if (hasSuccessfulEvidence) {
-      setQualityPhase("drafting", "evidence recovery complete");
-      pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryClosurePrompt({
-        language: callbacks.getPreferredLanguage(),
-        recentToolActivity: recentPlanToolActivity,
-        qualityGateReason: planLastQualityGateReason,
-        missingSections: planLastMissingSections,
+      planEvidenceRecoveryPasses += 1;
+      planEvidenceNoProgressPasses = 0;
+      const recoveredClosureInput = collectPlanClosureMaterializationInput(
+        callbacks,
+        recentPlanToolActivity,
+        attemptedPlanWriteTargets,
+        latestUserPromptText,
+      );
+      const recoveredClosureAssessment = assessPlanClosureEvidence(
+        recoveredClosureInput.evidenceBundle,
+      );
+      const recoveryBudgetRemaining =
+        planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+      logAgentEvent("plan_evidence_recovery_assessed", {
+        iteration,
+        recoveryPass: planEvidenceRecoveryPasses,
+        maxRecoveryPasses: MAX_PLAN_EVIDENCE_RECOVERY_PASSES,
+        closureReady: recoveredClosureAssessment.ready,
+        closureReason: recoveredClosureAssessment.reason,
+        objectiveTargetMatches: recoveredClosureAssessment.objectiveTargetMatches,
+        defectSignalMatches: recoveredClosureAssessment.defectSignalMatches,
+        contractMismatchMatches: recoveredClosureAssessment.contractMismatchMatches,
+        contractMismatchKinds: recoveredClosureAssessment.contractMismatchKinds,
+        unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+        recoveryBudgetRemaining,
+        semanticFacts: recoveredClosureInput.evidenceBundle.facts.length,
+        changeTargets: recoveredClosureInput.evidenceBundle.changeTargets.length,
       });
+      if (!recoveredClosureAssessment.ready && recoveryBudgetRemaining) {
+        planClosureEvidenceRecoveryIssued = true;
+        setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
+        pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
+          callbacks.getPreferredLanguage(),
+          recoveredClosureAssessment.reason,
+          latestUserPromptText,
+          {
+            unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+            confirmedChangeTargets: recoveredClosureInput.evidenceBundle.changeTargets,
+          },
+        );
+      } else if (recoveredClosureAssessment.ready) {
+        setQualityPhase(
+          "drafting",
+          "evidence recovery complete",
+        );
+        pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryClosurePrompt({
+          language: callbacks.getPreferredLanguage(),
+          recentToolActivity: recentPlanToolActivity,
+          qualityGateReason: planLastQualityGateReason,
+          missingSections: planLastMissingSections,
+        });
+      } else {
+        setQualityPhase("blocked", "evidence recovery budget exhausted", "failed");
+        pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
+          language: callbacks.getPreferredLanguage(),
+          recentToolActivity: recentPlanToolActivity,
+          qualityGateReason: recoveredClosureAssessment.reason,
+          missingSections: planLastMissingSections,
+          requireResolvedEvidence: true,
+        });
+      }
+    } else if (evidenceRecoveryBatchResults.some((result) => !result.isError)) {
+      planEvidenceNoProgressPasses += 1;
+      const recoveredClosureInput = collectPlanClosureMaterializationInput(
+        callbacks,
+        recentPlanToolActivity,
+        attemptedPlanWriteTargets,
+        latestUserPromptText,
+      );
+      const recoveredClosureAssessment = assessPlanClosureEvidence(
+        recoveredClosureInput.evidenceBundle,
+      );
+      const avoidTargets = [...new Set(
+        evidenceRecoveryBatchResults.map((result) => String(result.target || "").trim()).filter(Boolean),
+      )];
+      const canRetryWithoutProgress =
+        planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES &&
+        planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+      logAgentEvent("plan_evidence_recovery_no_progress", {
+        iteration,
+        noProgressPass: planEvidenceNoProgressPasses,
+        maxNoProgressPasses: MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
+        evidenceRecoveryPasses: planEvidenceRecoveryPasses,
+        closureReason: recoveredClosureAssessment.reason,
+        unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+        repeatedTargets: avoidTargets,
+        canRetry: canRetryWithoutProgress,
+      });
+      if (canRetryWithoutProgress) {
+        planClosureEvidenceRecoveryIssued = true;
+        setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
+        pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
+          callbacks.getPreferredLanguage(),
+          recoveredClosureAssessment.reason,
+          latestUserPromptText,
+          {
+            unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+            confirmedChangeTargets: recoveredClosureInput.evidenceBundle.changeTargets,
+            avoidTargets,
+          },
+        );
+      } else {
+        setQualityPhase("blocked", "evidence recovery repeated without progress", "failed");
+        pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
+          language: callbacks.getPreferredLanguage(),
+          recentToolActivity: recentPlanToolActivity,
+          qualityGateReason: recoveredClosureAssessment.reason,
+          missingSections: planLastMissingSections,
+          requireResolvedEvidence: true,
+        });
+      }
     } else {
       setQualityPhase("blocked", "evidence recovery failed", "failed");
       pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
@@ -333,6 +515,7 @@ export function handlePlanQualityRecoveryAfterVisibleMaterialization(
       result.pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
         input.callbacks.getPreferredLanguage(),
         result.planLastQualityGateReason,
+        input.latestUserPromptText,
       );
     } else if (recoveryAction === "ask_user") {
       result.pendingPlanRuntimeRecoveryPrompt = input.callbacks.getPreferredLanguage() === "zh"

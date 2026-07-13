@@ -124,6 +124,25 @@ test("shouldPauseForReplyOptions respects forcePause while keeping legacy edit/r
   );
 });
 
+test("shouldPauseForReplyOptions preserves explicit blocking choices beside a structured Plan", () => {
+  const replyOptions = [
+    { label: "Use local-only storage", value: "Use local-only storage", source: "explicit_user_options" },
+    { label: "Enable cloud synchronization", value: "Enable cloud synchronization", source: "explicit_user_options" },
+  ];
+
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: true,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+    }),
+    true,
+  );
+});
+
 test("shouldPauseForReplyOptions does not hold chat runs for inferred numbered answers", () => {
   assert.equal(
     shouldPauseForReplyOptions({
@@ -201,6 +220,17 @@ test("screenshot-like diagnostic and self-directed numbered text never becomes a
     }),
     true,
   );
+});
+
+test("labeled technical findings stay plan evidence instead of inferred choices", () => {
+  const extracted = extractReplyOptions([
+    "请确认以下两个技术结论：",
+    "1. **后端缺少 `load_document` 命令实现**：现有处理器列表没有注册对应命令。",
+    "2. **前端事件处理器未正确调用后端命令**：当前事件链调用了不存在的接口。",
+  ].join("\n"));
+
+  assert.equal(extracted.hasExplicitUserOptionsTag, false);
+  assert.deepEqual(extracted.replyOptions, []);
 });
 
 test("explicit blocking choices remain available without tool calls, including ordinary chat XML", () => {
@@ -431,6 +461,27 @@ test("extractReplyOptions does not turn plan execution order or risk notes into 
 ## 风险与后续确认
 - 风险：列名变化会导致查询条件失效，需要执行阶段增加列名兼容检查。
 - 后续确认：执行前由用户选择输出格式；默认先生成 Markdown 报告草稿。
+  `);
+
+  assert.equal(result.replyOptions.length, 0);
+});
+
+test("decision-like prose cannot capture validation bullets across Plan headings", () => {
+  const result = extractReplyOptions(`
+为了确认契约影响，我需要检查 Dashboard 如何消费这些数据。
+
+# Proposed Plan: 修复字段契约
+
+## 目标
+统一解析结果与 Dashboard 使用的字段。
+
+## 实施路径
+1. 修改 \`src/hooks/useCsvParser.ts\`，补齐 \`creatorName\` 映射。
+2. 保持现有 \`creator\` 兼容行为。
+
+## 验证方式
+- **静态检查**：确保 TypeScript 类型检查通过。
+- **逻辑验证**：确认数据流字段路径闭环。
   `);
 
   assert.equal(result.replyOptions.length, 0);
@@ -713,6 +764,11 @@ test("ExecutionCapsule keeps execute_once branch labels distinct instead of flat
   assert.match(source, /option\.action === "approve_operation_once"/);
   assert.match(source, /option\.action === "execute_once"/);
   assert.match(source, /return option\.label \|\| option\.value \|\|/);
+  const multiSubmitStart = source.indexOf("const handleTabbedSubmit");
+  const multiSubmitEnd = source.indexOf("\n  };", multiSubmitStart);
+  const multiSubmitBody = source.slice(multiSubmitStart, multiSubmitEnd);
+  assert.match(multiSubmitBody, /source:\s*"custom_reply"/);
+  assert.doesNotMatch(multiSubmitBody, /action:\s*"execute_once"/);
 });
 
 test("shouldPauseForReplyOptions pauses for proposal follow-up even on length-safe paths", () => {
@@ -1080,6 +1136,31 @@ test("non-blocking plan exploration choices do not pause Plan mode", () => {
 <user_options>
 <option>直接开始探索（我会先从搜索 CSV 导入逻辑开始）</option>
 <option>提供一些关键文件路径/组件名（如果您已知的话）</option>
+</user_options>
+  `);
+
+  assert.equal(hasOnlyNonBlockingPlanReplyOptions(result.replyOptions), true);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: result.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+      forcePause: true,
+      finishReason: "stop",
+    }),
+    false,
+  );
+});
+
+test("model-owned draft-now versus inspect-more options auto-continue Plan grounding", () => {
+  const result = extractReplyOptions(`
+为了制定精确计划，我需要确认相关组件如何使用该字段。
+<user_options>
+<option>直接基于当前发现生成计划（假设需要将 creator 映射到 creatorName）</option>
+<option>我来确认具体的字段使用情况</option>
 </user_options>
   `);
 

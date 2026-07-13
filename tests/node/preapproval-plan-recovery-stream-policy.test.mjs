@@ -92,7 +92,7 @@ test("preapproval plan rewrite gets one provider-neutral bounded stream lease", 
     policy.maxStreamElapsedMs,
     PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS,
   );
-  assert.equal(policy.maxStreamElapsedMs, 60_000);
+  assert.equal(policy.maxStreamElapsedMs, 120_000);
   assert.equal(policy.maxOutputTokens, 2_048);
   assert.equal(policy.toolChoice, "required");
   assert.equal(
@@ -127,7 +127,7 @@ test("XML fallback remains bounded without requesting unavailable native tools",
   assert.equal(policy.active, true);
   assert.equal(policy.toolChoice, undefined);
   assert.equal(options.toolChoice, undefined);
-  assert.equal(options.maxStreamElapsedMs, 60_000);
+  assert.equal(options.maxStreamElapsedMs, 120_000);
 });
 
 test("non-rewrite plan phases and approved execution are not capped", () => {

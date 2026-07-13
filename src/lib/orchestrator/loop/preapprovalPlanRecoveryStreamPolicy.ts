@@ -3,7 +3,7 @@ import type { PlanRuntimePhase } from "../../workflowModels";
 import type { FetchLLMStreamOptions } from "../types";
 
 export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS = 2_048;
-export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS = 60_000;
+export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS = 120_000;
 export const PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS =
   "preapproval_plan_quality_recovery_stream_timeout";
 

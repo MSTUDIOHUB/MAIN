@@ -39,6 +39,8 @@ function hasReadyPlanEvidence(status?: PlanEvidenceReadiness): boolean {
 const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "spawn_subagent",
   "wait_subagents",
+  "glob_search",
+  "grep_search",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -153,6 +155,7 @@ export function shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence(input: {
 }
 
 export const MAX_PLAN_EVIDENCE_RECOVERY_PASSES = 3;
+export const MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES = 2;
 export const MAX_PLAN_REASONING_ONLY_READY_RECOVERY_PASSES = 1;
 
 export function resolvePlanNoActionRecovery(input: {

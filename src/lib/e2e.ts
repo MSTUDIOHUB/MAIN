@@ -6280,7 +6280,10 @@ function seedRealOmlxPlanFlowScenario() {
   const params = new URLSearchParams(window.location.search);
   const model = params.get("model") || "gemma-4-26b-a4b-it-8bit";
   const realOmlxConfig = (window as any).__REAL_OMLX_CONFIG__ || {};
-  const workspace = `/tmp/e2e-real-omlx-${model.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}`;
+  const workspace = String(
+    (window as any).__REAL_OMLX_WORKSPACE__ ||
+    `/tmp/e2e-real-omlx-${model.replace(/[^a-z0-9_-]+/gi, "-").toLowerCase()}`,
+  );
   const sessionId = model.includes("Qwen") ? 999522 : 999521;
   const now = Date.now();
 

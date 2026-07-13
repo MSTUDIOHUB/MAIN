@@ -72,6 +72,7 @@ const {
   getProtectedPlanArtifactMutationViolation,
   summarizeReadFileRepeatLimitBatch,
   buildReadFileRepeatLimitBatchPauseNotice,
+  collectPlanClosureMaterializationInput,
   getOriginalUserPromptForPlanFallback,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
@@ -114,6 +115,30 @@ test("Plan fallback selects canonical turn input instead of ContextState or hidd
     getOriginalUserPromptForPlanFallback(callbacks),
     "修复双击 Markdown 文件后空白和打开按钮失效的问题。",
   );
+});
+
+test("Plan closure preserves multiline numbered user-goal facets", () => {
+  const userGoal = [
+    "请制定可审批计划：",
+    "1、保存后详情页仍显示旧标题。",
+    "2、删除后列表计数没有更新。",
+    "每个问题都需要证据、改动和验证。",
+  ].join("\n");
+  const callbacks = createMockCallbacks({
+    getCurrentTurnId: () => "turn-numbered-goal",
+    getContextMemoryState: () => null,
+  });
+
+  const closure = collectPlanClosureMaterializationInput(
+    callbacks,
+    [],
+    [],
+    `[turn_intake]\n[user_request]\n${userGoal}\n[/user_request]\n[/turn_intake]`,
+  );
+
+  assert.equal(closure.userGoal, userGoal);
+  assert.match(closure.userGoal, /^1、/m);
+  assert.match(closure.userGoal, /^2、/m);
 });
 
 test("buildShellReadValidationError blocks command starting with cat/head/tail/sed", () => {

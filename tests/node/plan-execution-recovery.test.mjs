@@ -462,6 +462,7 @@ function createPlanNoToolInput(harness, overrides = {}) {
     planQualityRejectCount: 0,
     planLastQualityGateReason: "",
     planLastMissingSections: [],
+    planFacetMappingSource: "",
     planArtifactQualityRejected: false,
     planAutoScaffoldPromptIssued: false,
     setPlanRuntimePhase: (phase, reason, status, qualitySnapshot) => harness.phases.push({
@@ -535,6 +536,12 @@ test("plan no-tool decision separates materialization refine and continuation pa
 });
 
 test("Plan evidence materialization replaces unbounded retries for logged quality failures", () => {
+  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+    recoveryAction: "rewrite",
+    qualityRejectCount: 1,
+    qualityGateReason: "too_short",
+    finishReason: "stop",
+  }), true);
   assert.equal(shouldAttemptPlanEvidenceMaterialization({
     recoveryAction: "rewrite",
     qualityRejectCount: 1,
@@ -781,6 +788,7 @@ test("visible plan materialization rejection enters typed recovery instead of fa
   assert.equal(result.planQualityRejectCount, 1);
   assert.equal(result.planArtifactQualityRejected, false);
   assert.match(result.planLastQualityGateReason, /ungrounded_plan_change_targets:index\.html/);
+  assert.equal(result.planFacetMappingSource, visiblePlan);
   assert.equal(approvalWaitCalls, 0);
   assert.equal(harness.statuses.includes("pending_review"), false);
   assert.equal(harness.stops.length, 0);
@@ -799,6 +807,7 @@ test("visible plan materialization rejection enters typed recovery instead of fa
   assert.equal(foldedState.planRuntimePhase, "needs_evidence");
   assert.equal(foldedState.planQualityRejectCount, 1);
   assert.equal(foldedState.planArtifactQualityRejected, false);
+  assert.equal(foldedState.planFacetMappingSource, visiblePlan);
 
   const nextCandidate = resolvePlanNoToolRecoveryDecision({
     workflowMode: "plan",
@@ -818,6 +827,81 @@ test("visible plan materialization rejection enters typed recovery instead of fa
     commandDirectiveAction: null,
   });
   assert.equal(nextCandidate.shouldMaterializeStructuredProposal, true);
+});
+
+test("pending closure-evidence recovery wins over deterministic materialization", async () => {
+  const harness = createPlanNoToolHarness("zh");
+  const sourceVisibleText = "我还需要继续分析当前状态同步实现。";
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    iteration: 5,
+    latestUserPromptText: "找到保存后详情未刷新和删除后列表计数未更新的原因并制定整改方案。",
+    sourceVisibleText,
+    streamText: sourceVisibleText,
+    normalizedVisibleText: sourceVisibleText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "too_short",
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/store/detailStore.ts",
+        status: "succeeded",
+        detail: "function saveDetail writes the record and updates the detail cache",
+      },
+      {
+        name: "read_file",
+        target: "src/store/listStore.ts",
+        status: "succeeded",
+        detail: "function deleteRecord removes an item and exposes a derived count",
+      },
+    ],
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.planQualityRejectCount, 2);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.equal(harness.stops.length, 0);
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
+  assert.equal(harness.phases.at(-1)?.phase, "needs_evidence");
+
+  const repeatedHarness = createPlanNoToolHarness("zh");
+  const repeated = await handlePlanNoToolRecovery(createPlanNoToolInput(repeatedHarness, {
+    iteration: 6,
+    latestUserPromptText: "找到保存后详情未刷新和删除后列表计数未更新的原因并制定整改方案。",
+    sourceVisibleText,
+    streamText: sourceVisibleText,
+    normalizedVisibleText: sourceVisibleText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    planQualityRejectCount: result.planQualityRejectCount,
+    planLastQualityGateReason: result.planLastQualityGateReason,
+    planClosureEvidenceRecoveryIssued: result.planClosureEvidenceRecoveryIssued,
+    planEvidenceRecoveryPasses: result.planEvidenceRecoveryPasses,
+    planAutoScaffoldPromptIssued: result.planAutoScaffoldPromptIssued,
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/store/detailStore.ts",
+        status: "succeeded",
+        detail: "function saveDetail writes the record and updates the detail cache",
+      },
+      {
+        name: "read_file",
+        target: "src/store/listStore.ts",
+        status: "succeeded",
+        detail: "function deleteRecord removes an item and exposes a derived count",
+      },
+    ],
+  }));
+
+  assert.equal(repeated.status, "stopped");
+  assert.equal(repeatedHarness.stops.length, 1);
+  assert.match(repeatedHarness.stops[0].message, /有界的计划物化恢复/);
+  assert.equal(
+    repeatedHarness.appended.some((message) => /PLAN_CLOSURE_NEEDS_EVIDENCE/.test(message.content || "")),
+    false,
+  );
 });
 
 test("accepted artifact pauses the review run even when the same response also looks structured", async () => {
@@ -888,12 +972,20 @@ test("rejected plan artifact cannot enter review on the next no-tool iteration",
 });
 
 test("plan closure evidence recovery prompt keeps planning read-only and targeted", () => {
-  const zh = buildPlanClosureEvidenceRecoveryPrompt("zh", "缺少源码证据");
-  const en = buildPlanClosureEvidenceRecoveryPrompt("en", "missing source evidence");
+  const goal = [
+    "1、保存后详情页仍显示旧标题。",
+    "2、删除后列表计数没有更新。",
+  ].join("\n");
+  const zh = buildPlanClosureEvidenceRecoveryPrompt("zh", "uncovered_user_goal_facets:2", goal);
+  const en = buildPlanClosureEvidenceRecoveryPrompt("en", "uncovered_user_goal_facets:2", goal);
 
   assert.match(zh, /PLAN_CLOSURE_NEEDS_EVIDENCE/);
-  assert.match(zh, /只做一次定向读取\/搜索/);
+  assert.match(zh, /2\. 删除后列表计数没有更新/);
+  assert.doesNotMatch(zh, /保存后详情页仍显示旧标题/);
+  assert.match(zh, /只做一次能够把它绑定到具体源码/);
+  assert.match(zh, /每个用户编号分面都必须映射到已确认证据、具体改动和可执行验证/);
   assert.match(zh, /批准前不要修改源码/);
+  assert.match(en, /2\. 删除后列表计数没有更新/);
   assert.match(en, /exactly one targeted read\/search/);
   assert.match(en, /Do not call broad directory scans/);
 });

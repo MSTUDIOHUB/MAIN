@@ -1,6 +1,10 @@
 import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
 import { collectPlanClosureMaterializationInput, logAgentEvent } from "../../orchestrator";
-import { formatPlanEvidenceBundleForModel, isPlanEvidenceBundleReady } from "../../planEvidence";
+import {
+  assessPlanClosureEvidence,
+  formatPlanEvidenceBundleForModel,
+  isPlanEvidenceBundleReady,
+} from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { ToolDefinition } from "../../toolSchemas";
@@ -259,6 +263,7 @@ export function prepareIterationStreamRequest(input: {
       "",
     );
     const bundle = closureInput.evidenceBundle;
+    const closureAssessment = assessPlanClosureEvidence(bundle);
     managedAgentMessages = [
       ...managedAgentMessages,
       {
@@ -275,7 +280,15 @@ export function prepareIterationStreamRequest(input: {
       semanticFacts: bundle.facts.length,
       changeTargets: bundle.changeTargets.length,
       verificationTargets: bundle.verificationTargets.length,
-      ready: isPlanEvidenceBundleReady(bundle),
+      bundleReady: isPlanEvidenceBundleReady(bundle),
+      closureReady: closureAssessment.ready,
+      ready: closureAssessment.ready,
+      closureReason: closureAssessment.reason,
+      objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
+      defectSignalMatches: closureAssessment.defectSignalMatches,
+      contractMismatchMatches: closureAssessment.contractMismatchMatches,
+      contractMismatchKinds: closureAssessment.contractMismatchKinds,
+      unresolvedContractKinds: closureAssessment.unresolvedContractKinds,
       transcriptToolMessages: managedAgentMessages.filter((message) => message.role === "tool").length,
     });
   }

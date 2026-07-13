@@ -11,6 +11,7 @@ import {
   isReasoningDominatedNoActionResult,
 } from "../../orchestrator/agentRecovery";
 import {
+  getOriginalUserPromptForPlanFallback,
   hasPlanUserContextObservation,
   logAgentEvent,
 } from "../../orchestrator";
@@ -103,6 +104,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
 
   if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
     const readiness = assessPlanEvidenceReadiness({
+      userGoal: getOriginalUserPromptForPlanFallback(callbacks),
       userContext: turnInputContextSignals,
       recentToolActivity: recentPlanToolActivity,
       hasObservedUserContext: hasPlanUserContextObservation(

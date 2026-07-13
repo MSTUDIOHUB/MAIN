@@ -1,5 +1,9 @@
 import type { PlanRuntimePhase } from "./workflowModels";
-import { buildPlanEvidenceBundle, isPlanEvidenceBundleReady } from "./planEvidence";
+import {
+  assessPlanClosureEvidence,
+  buildPlanEvidenceBundle,
+  isPlanEvidenceBundleReady,
+} from "./planEvidence";
 import { hasTurnProvidedContext, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
 
@@ -59,6 +63,8 @@ const PLAN_READ_ONLY_TOOL_NAMES = new Set([
 const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "spawn_subagent",
   "wait_subagents",
+  "glob_search",
+  "grep_search",
   "read_file",
   "read_document",
   "analyze_tabular_document",
@@ -75,6 +81,14 @@ const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "read_pty_buffer",
   "get_pty_status",
 ]);
+
+function isPlanEvidenceSearchTool(name: string): boolean {
+  return name === "grep_search" || name === "glob_search";
+}
+
+function isPlanTargetedEvidenceRead(name: string): boolean {
+  return PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(name) && !isPlanEvidenceSearchTool(name);
+}
 const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set([
   "write_file",
   "replace_in_file",
@@ -131,6 +145,7 @@ function targetMatchesProvidedPath(target: string, providedPaths: string[]): boo
 }
 
 export function assessPlanEvidenceReadiness(input: {
+  userGoal?: string;
   userContext?: TurnInputContextLike;
   recentToolActivity?: PlanToolActivityLike[];
   hasObservedUserContext?: boolean;
@@ -141,20 +156,20 @@ export function assessPlanEvidenceReadiness(input: {
   const activity = Array.isArray(input.recentToolActivity) ? input.recentToolActivity : [];
   const successful = activity.filter(isSuccessfulActivity);
   const successfulTargetedReads = successful.filter((item) =>
-    PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(String(item.name || "")) && hasConcreteTarget(item)
+    isPlanTargetedEvidenceRead(String(item.name || "")) && hasConcreteTarget(item)
   ).length;
   const successfulSearches = successful.filter((item) =>
-    (String(item.name || "") === "grep_search" || String(item.name || "") === "glob_search") &&
+    isPlanEvidenceSearchTool(String(item.name || "")) &&
     hasConcreteTarget(item)
   ).length;
   const providedPaths = [...userContext.mentionedFilePaths, ...userContext.attachedFilePaths];
   const readProvidedPath = providedPaths.length > 0 && successful.some((item) =>
-    PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(String(item.name || "")) &&
+    isPlanTargetedEvidenceRead(String(item.name || "")) &&
     targetMatchesProvidedPath(String(item.target || ""), providedPaths)
   );
   const semanticBundle = buildPlanEvidenceBundle({
     turnId: "readiness",
-    objective: "plan evidence readiness",
+    objective: String(input.userGoal || "plan evidence readiness"),
     evidenceRecords: successful.map((item) => ({
       tool: String(item.name || ""),
       target: String(item.target || ""),
@@ -195,6 +210,15 @@ export function assessPlanEvidenceReadiness(input: {
     return {
       status: "needs_targeted_read",
       reason: semanticFacts <= 0 ? "targeted_reads_without_semantic_facts" : "semantic_facts_without_change_target",
+      ...counts,
+    };
+  }
+
+  const closureAssessment = assessPlanClosureEvidence(semanticBundle);
+  if (!closureAssessment.ready) {
+    return {
+      status: "needs_targeted_read",
+      reason: closureAssessment.reason,
       ...counts,
     };
   }
@@ -270,6 +294,7 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
   hasPlanDecisionOutput: boolean;
   batchCount: number;
   toolCount: number;
+  userGoal?: string;
   userContext?: TurnInputContextLike;
   recentToolActivity?: PlanToolActivityLike[];
   hasObservedUserContext?: boolean;
@@ -285,14 +310,20 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
     ? PLAN_CONTEXT_READONLY_CONVERGENCE_TOOL_LIMIT
     : PLAN_READONLY_CONVERGENCE_TOOL_LIMIT;
   const readiness = assessPlanEvidenceReadiness({
+    userGoal: input.userGoal,
     userContext,
     recentToolActivity: input.recentToolActivity,
     hasObservedUserContext: input.hasObservedUserContext,
   });
   if (
     readiness.status === "needs_targeted_read" &&
-    readiness.successfulSearches > 0 &&
-    input.batchCount >= 1
+    (
+      (readiness.successfulSearches > 0 && input.batchCount >= 1) ||
+      (
+        readiness.successfulTargetedReads >= 2 &&
+        (input.batchCount >= batchLimit || input.toolCount >= toolLimit)
+      )
+    )
   ) {
     return true;
   }

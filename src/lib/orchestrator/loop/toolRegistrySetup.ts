@@ -77,6 +77,14 @@ export async function prepareAgentLoopToolRegistry(input: {
   } = input;
 
   const enabledMcpServers = mcpServers.filter((server) => server.enabled !== false);
+  const normalizedPrompt = latestUserPromptText.toLowerCase();
+  const mcpDiscoveryRelevantToTurn =
+    unityCommandRequested ||
+    gameStudioEngineContext ||
+    /\bmcp\b/i.test(latestUserPromptText) ||
+    enabledMcpServers.some((server) =>
+      !!server.name.trim() && normalizedPrompt.includes(server.name.trim().toLowerCase())
+    );
   let mcpTools = initialMcpTools;
   let mcpToolServerMap = getMcpToolServerMap();
   let mcpServerStatuses: MCPServerStatusSnapshot[] = mcpServers.map((server) => ({
@@ -92,25 +100,48 @@ export async function prepareAgentLoopToolRegistry(input: {
   }));
 
   if (mcpServers.length > 0 && subagentDepth === 0) {
-    logAgentEvent("mcp_discovery_start", {
-      enabledServers: enabledMcpServers.length,
-      totalServers: mcpServers.length,
-    });
-    const { tools: discovered, toolServerMap, serverStatuses } = await discoverAllMcpTools(mcpServers);
+    const discoveryStartedAt = Date.now();
+    if (mcpDiscoveryRelevantToTurn) {
+      logAgentEvent("mcp_discovery_start", {
+        enabledServers: enabledMcpServers.length,
+        totalServers: mcpServers.length,
+        requestedServerNames: enabledMcpServers
+          .filter((server) => {
+            const normalizedName = server.name.trim().toLowerCase();
+            return !!normalizedName && normalizedPrompt.includes(normalizedName);
+          })
+          .map((server) => server.name),
+      });
+    }
+    const { tools: discovered, toolServerMap, serverStatuses } = await discoverAllMcpTools(
+      mcpServers,
+      { logFailures: mcpDiscoveryRelevantToTurn },
+    );
     mcpServerStatuses = serverStatuses;
     mcpToolServerMap = toolServerMap;
     setMcpToolServerMap(toolServerMap);
     if (discovered.length > 0) {
+      mcpTools = discovered;
+    } else {
+      mcpTools = [];
+    }
+    if (mcpDiscoveryRelevantToTurn) {
       logAgentEvent("mcp_discovery_done", {
         discoveredTools: discovered.length,
         toolNames: discovered.map((tool) => tool.name).slice(0, 24),
+        elapsedMs: Date.now() - discoveryStartedAt,
+        connectedServers: serverStatuses
+          .filter((status) => status.status === "connected")
+          .map((status) => status.serverName),
+        failedServers: serverStatuses
+          .filter((status) => status.status === "failed")
+          .map((status) => ({
+            server: status.serverName,
+            category: status.category,
+            httpStatus: status.httpStatus,
+            cached: status.cached === true,
+          })),
       });
-      mcpTools = discovered;
-    } else {
-      logAgentEvent("mcp_discovery_done", {
-        discoveredTools: 0,
-      });
-      mcpTools = [];
     }
   }
 
@@ -163,6 +194,7 @@ export async function prepareAgentLoopToolRegistry(input: {
     : [];
 
   logAgentEvent("mcp_server_status", {
+    discoveryRelevantToTurn: mcpDiscoveryRelevantToTurn,
     requestedUnityRouting: unityCommandRequested,
     gameStudioUnityContext,
     gameStudioEngine,

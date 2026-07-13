@@ -1,5 +1,8 @@
 import type { PlanToolActivitySummary } from "../planExecutionRecovery";
-import type { PlanEvidenceRecord } from "../planMaterialization";
+import {
+  extractNumberedUserGoalFacets,
+  type PlanEvidenceRecord,
+} from "../planMaterialization";
 import type { PlanEvidenceBundle } from "../planEvidence";
 import {
   hasTurnProvidedContext,
@@ -7,6 +10,7 @@ import {
   type TurnInputContextSignals,
 } from "../turnIntake";
 import type { PlanRuntimePhase, ReplyOption } from "../workflowModels";
+import { stripControlPromptForPlanFallback } from "./prompts/planPrompts";
 
 type Language = "zh" | "en";
 type PlanStage = "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed";
@@ -22,21 +26,90 @@ export interface PlanClosureMaterializationInput {
   evidenceBundle?: PlanEvidenceBundle;
 }
 
-export function buildPlanClosureEvidenceRecoveryPrompt(language: Language, reason: string): string {
+export interface PlanClosureEvidenceRecoveryContext {
+  unresolvedContractKinds?: string[];
+  confirmedChangeTargets?: string[];
+  avoidTargets?: string[];
+}
+
+export function buildPlanClosureEvidenceRecoveryPrompt(
+  language: Language,
+  reason: string,
+  userGoal = "",
+  context: PlanClosureEvidenceRecoveryContext = {},
+): string {
+  const uncoveredFacets = reason.match(/uncovered_user_goal_facets:([0-9,]+)/i)?.[1] || "";
+  const uncoveredFacetIndexes = new Set(
+    uncoveredFacets
+      .split(",")
+      .map((value) => Number(value))
+      .filter(Number.isFinite),
+  );
+  const uncoveredFacetDetails = extractNumberedUserGoalFacets(userGoal)
+    .filter((facet) => uncoveredFacetIndexes.has(facet.index))
+    .map((facet) => `${facet.index}. ${facet.text}`);
+  const unresolvedContractKinds = [...new Set(
+    (context.unresolvedContractKinds || []).map((value) => String(value || "").trim()).filter(Boolean),
+  )].slice(0, 8);
+  const confirmedChangeTargets = [...new Set(
+    (context.confirmedChangeTargets || []).map((value) => String(value || "").trim()).filter(Boolean),
+  )].slice(0, 12);
+  const avoidTargets = [...new Set(
+    (context.avoidTargets || []).map((value) => String(value || "").trim()).filter(Boolean),
+  )].slice(0, 8);
+  const hasPermissionContractGap = unresolvedContractKinds.some((kind) =>
+    kind.startsWith("permission_contract:")
+  );
   if (language === "en") {
     return [
       "PLAN_CLOSURE_NEEDS_EVIDENCE: MAIN could not get a model-authored reviewable plan from the current clean evidence.",
       reason ? `Failure reason: ${reason}.` : "",
-      "Do exactly one targeted read/search for the missing source or data fact. Prefer the specific file, symbol, or dataset already implicated by the user request.",
-      "After that single tool result, stop exploring and produce a concise visible `<proposed_plan>`. MAIN runtime owns `.MAIN/plans/plan.md` materialization.",
+      uncoveredFacets
+        ? `The uncovered numbered user-goal item(s) are ${uncoveredFacets}.`
+        : "",
+      uncoveredFacetDetails.length > 0
+        ? `Exact uncovered facets:\n${uncoveredFacetDetails.map((facet) => `- ${facet}`).join("\n")}`
+        : "",
+      unresolvedContractKinds.length > 0
+        ? `Unverified contract counterparts:\n${unresolvedContractKinds.map((kind) => `- ${kind}`).join("\n")}`
+        : "",
+      confirmedChangeTargets.length > 0
+        ? `Already-covered change owners; do not reread them merely to resolve this gap:\n${confirmedChangeTargets.map((target) => `- ${target}`).join("\n")}`
+        : "",
+      avoidTargets.length > 0
+        ? `The previous recovery read did not advance the evidence; choose a different owner than:\n${avoidTargets.map((target) => `- ${target}`).join("\n")}`
+        : "",
+      hasPermissionContractGap
+        ? "Inspect the runtime permission/capability/manifest/configuration owner for the named plugin contract. A package or dependency declaration does not prove that runtime permission is granted. If its path is unknown, use one narrow search to locate that owner and then read it."
+        : "",
+      "Select one unresolved facet or contract and do exactly one targeted read/search that binds it to a concrete source, configuration, permission, interface, or data contract. Do not reread evidence for covered facets.",
+      "After that single tool result, stop exploring and produce a concise visible `<proposed_plan>`. Map every numbered user-goal facet to confirmed evidence, a concrete change, and an executable validation. MAIN runtime owns `.MAIN/plans/plan.md` materialization.",
       "Do not call broad directory scans, do not edit source files, and do not create `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_CLOSURE_NEEDS_EVIDENCE: MAIN 无法基于当前干净证据拿到模型亲自生成的可审批计划。",
     reason ? `失败原因：${reason}。` : "",
-    "下一步只做一次定向读取/搜索，补齐缺失的源码或数据事实。优先读取用户目标已经指向的具体文件、符号或数据集。",
-    "拿到这一次工具结果后，停止探索并输出精简可见 `<proposed_plan>`；`.MAIN/plans/plan.md` 由 MAIN runtime 负责物化。",
+    uncoveredFacets
+      ? `尚未覆盖的用户编号分面是 ${uncoveredFacets}。`
+      : "",
+    uncoveredFacetDetails.length > 0
+      ? `尚未覆盖分面的原文：\n${uncoveredFacetDetails.map((facet) => `- ${facet}`).join("\n")}`
+      : "",
+    unresolvedContractKinds.length > 0
+      ? `尚未核实的契约对应项：\n${unresolvedContractKinds.map((kind) => `- ${kind}`).join("\n")}`
+      : "",
+    confirmedChangeTargets.length > 0
+      ? `这些改动拥有者已经有证据，不要仅为解决当前缺口而重读：\n${confirmedChangeTargets.map((target) => `- ${target}`).join("\n")}`
+      : "",
+    avoidTargets.length > 0
+      ? `上一次补证没有增加有效证据，请改查不同的契约拥有者，不要再读：\n${avoidTargets.map((target) => `- ${target}`).join("\n")}`
+      : "",
+    hasPermissionContractGap
+      ? "请检查对应插件的运行时权限、capability、manifest 或配置拥有者；包清单或依赖声明不能证明运行时权限已经授予。若不知道路径，先做一次窄范围搜索定位拥有者，再读取该文件。"
+      : "",
+    "从尚未解决的分面或契约中选择一个，下一步只做一次能够把它绑定到具体源码、配置、权限、接口或数据契约的精确定向取证。不要重读已覆盖分面的证据。",
+    "拿到这一次工具结果后，停止探索并输出精简可见 `<proposed_plan>`；每个用户编号分面都必须映射到已确认证据、具体改动和可执行验证。`.MAIN/plans/plan.md` 由 MAIN runtime 负责物化。",
     "不要再泛扫目录；批准前不要修改源码，也不要创建 `tasks.md`。",
   ].filter(Boolean).join("\n");
 }
@@ -63,8 +136,8 @@ export function buildPlanReadOnlyConvergencePrompt(
         ? "Before any broad discovery, use the exact @ file or attachment paths as primary evidence and name what those files already show."
         : "",
       "Stop broad rereading now. If targeted source/data evidence is still missing, call exactly one specific read/search tool for the missing file, symbol, or dataset, then stop. If the evidence is decision-complete, output one visible `<proposed_plan>`; MAIN runtime will materialize the artifact.",
-      "The plan file must include: confirmed findings, unverified hypotheses, evidence already read, tradeoffs, affected files, implementation steps, and validation.",
-      "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
+      "The plan must express the goal, grounded current state or constraints, an implementation/design/analysis path, relevant affected boundaries, and executable validation. Adapt headings to the task; do not force bug-root-cause or source-file sections onto feature, design, research, or verification work.",
+      "Only use `<user_options>` if there is a real product/design decision the user must make before a plan can be written. Ask and stop without also emitting `<proposed_plan>`; do not offer options that merely ask to continue reading, checking, analyzing, or verifying.",
       "If a blocker remains, name the blocker and the single missing fact needed; do not continue broad file exploration.",
       "Do not edit source files or `tasks.md` before approval.",
     ].filter(Boolean).join("\n");
@@ -82,8 +155,8 @@ export function buildPlanReadOnlyConvergencePrompt(
       ? "在继续大范围发现前，必须优先使用 @ 文件或附件的精确路径作为主要证据，并说明这些文件已经证明了什么。"
       : "",
     "下一步不要继续泛读文件。如果还缺源码/数据定向证据，只能围绕缺失的文件、符号或数据集调用一次具体读取/搜索工具，然后停止；如果证据已经足够，请输出一个可见 `<proposed_plan>`，计划文件由 MAIN runtime 物化。",
-    "计划文件必须包含：已确认发现、未验证假设、已读证据、方案取舍、影响文件、实施步骤和验证方式。",
-    "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；不要给出只是继续读取、检查、分析或验证的选项。",
+    "计划必须表达目标、有根据的现状或约束、实施/设计/分析路径、相关影响边界和可执行验证。章节应随任务调整，不要给新功能、设计、调研或验证任务强套 Bug 根因或源码文件章节。",
+    "只有存在真实产品/设计分叉、必须由用户决定后才能写计划时，才允许使用 `<user_options>`；提问后停止，不要同时输出 `<proposed_plan>`，也不要给出只是继续读取、检查、分析或验证的选项。",
     "如果仍有阻塞，只说明阻塞点和唯一缺失事实；不要继续大范围探索。",
     "批准前不要修改源码或生成 `tasks.md`。",
   ].filter(Boolean).join("\n");
@@ -386,6 +459,7 @@ export function buildPlanEvidenceRecoveryBlockedPrompt(input: {
   recentToolActivity: PlanToolActivitySummary[];
   qualityGateReason?: string;
   missingSections?: string[];
+  requireResolvedEvidence?: boolean;
 }): string {
   const reason = formatPlanQualityReason({
     reason: input.qualityGateReason,
@@ -397,14 +471,18 @@ export function buildPlanEvidenceRecoveryBlockedPrompt(input: {
     return [
       "PLAN_EVIDENCE_RECOVERY_BLOCKED: The one targeted evidence pass did not produce usable evidence.",
       reason,
-      "Do not keep calling read-only tools. Either output `<proposed_plan>` using only confirmed evidence below, or state the single real blocker as a user-visible question.",
+      input.requireResolvedEvidence
+        ? "Do not keep calling read-only tools and do not draft a plan that assumes the unresolved evidence. State the exact unresolved evidence gap as the blocker and pause safely. Ask the user only when resolving it requires a genuine user-owned decision."
+        : "Do not keep calling read-only tools. Either output `<proposed_plan>` using only confirmed evidence below, or state the single real blocker as a user-visible question.",
       evidence,
     ].filter(Boolean).join("\n");
   }
   return [
     "PLAN_EVIDENCE_RECOVERY_BLOCKED: 这一次定向补证没有得到可用证据。",
     reason,
-    "不要继续调用只读工具。要么只基于下面已确认的证据输出 `<proposed_plan>`，要么把唯一真实阻塞点作为可见问题告诉用户。",
+    input.requireResolvedEvidence
+      ? "不要继续调用只读工具，也不要用未闭合的证据假定起草计划。请明确说明尚缺的证据并安全暂停；只有解决它确实需要用户决策时，才向用户提供选择。"
+      : "不要继续调用只读工具。要么只基于下面已确认的证据输出 `<proposed_plan>`，要么把唯一真实阻塞点作为可见问题告诉用户。",
     evidence,
   ].filter(Boolean).join("\n");
 }
@@ -568,9 +646,9 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "Rules:",
       "- Do not copy tool logs, duplicate-call warnings, hidden thinking, raw source code, or truncation messages into plan files.",
       "- Output one visible `<proposed_plan>`; MAIN runtime validates and materializes `.MAIN/plans/plan.md` after the response.",
-      "- `plan.md` must use the Codex app handoff shape: title, Summary, Key Changes / Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults.",
+      "- Keep `plan.md` decision-complete, but adapt its headings to the task. Bug fixes may use root cause, features may use architecture/components/data flow, and research or verification plans may use decisions/constraints without inventing source edits.",
       "- Screenshot/attachment observations, read evidence, and confirmed facts belong in the concise Summary only when real; do not inflate them into empty audit sections.",
-      "- Every implementation change must point to concrete files, interfaces, data flow, commands, validation, or an explicit default. If public APIs/interfaces/types do not change, say that explicitly.",
+      "- Every implementation or design decision must point to concrete files, interfaces, components, data flow, commands, validation, or an explicit default. Mention public API/interface/type disposition only when it affects execution.",
       "- Do not include console.log/debug-log suggestions, generalized CSS/store guesses, or probability claims as execution steps unless a cited evidence line supports them; otherwise place them under unverified hypotheses.",
       "- If the user asks for analysis, explanation, or advice without explicitly requesting a file, respond directly in the ChatArea with Markdown text. Do NOT write any files to disk to prevent workspace pollution.",
       "- If the user explicitly requests saving a document/report, write the Markdown document directly to `docs/<filename>.md` with `write_file`.",
@@ -589,9 +667,9 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "规则：",
     "- 不要把工具日志、重复调用提示、后台思考、原始源码或截断提示写进计划文件。",
     "- 输出一个可见 `<proposed_plan>`；MAIN runtime 会在响应后校验并物化 `.MAIN/plans/plan.md`。",
-    "- `plan.md` 必须使用 Codex app 交接计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。",
+    "- `plan.md` 必须做到决策完整，但章节应随任务类型调整：修复类可写根因，新增功能可写架构/组件/数据流，调研或验证类可写决策/约束，不要虚构源码改动。",
     "- 截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞审计章节。",
-    "- 每个关键实现改动必须指向具体文件、接口、数据流、命令、验证方式或明确默认假设；如果公共 API/接口/类型不变，必须显式写明。",
+    "- 每个实现或设计决策必须指向具体文件、接口、组件、数据流、命令、验证方式或明确默认值；公共 API/接口/类型只有在影响执行时才需要说明。",
     "- 没有证据支撑时，不要把 console.log/调试日志建议、泛化 CSS/Store 猜测或概率判断写成执行步骤；只能放入未验证假设。",
     "- 若用户未明确要求生成磁盘文件，默认仅在 ChatArea 中回答 Markdown 分析，切勿擅自写磁盘文件污染用户 Git 工作区。",
     "- 若用户明确要求保存报告文件，直接用 `write_file` 保存至工作区 `docs/<文件名>.md`。",
@@ -673,18 +751,6 @@ function extractExplicitGoalPaths(goal: string): string[] {
   return Array.from(String(goal || "").matchAll(/\b[A-Za-z0-9_@./-]+\.(?:tsx?|jsx?|swift|py|rs|go|json|csv|tsv|xlsx|mdx?|css|scss|html|toml|ya?ml|log)\b/g))
     .map((match) => normalizePlanEvidencePath(match[0]))
     .filter(Boolean);
-}
-
-function stripControlPromptForPlanFallback(text: string): string {
-  return String(text || "")
-    .replace(/^本轮处于 PLAN 模式。[\s\S]*?\n\n/i, "")
-    .replace(/^This turn is in PLAN mode\.[\s\S]*?\n\n/i, "")
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/<tool_use>[\s\S]*?<\/tool_use>/gi, " ")
-    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
-    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
 }
 
 function collectFallbackPlanBullets(sourceText: string, fallbackPrompt: string, maxBullets = 8): string[] {

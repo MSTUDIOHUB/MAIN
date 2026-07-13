@@ -2,6 +2,7 @@ import { isExecutionPlanArtifactWrite, isSuccessfulPlanArtifactWriteResult, isTa
 import {
   EDIT_PROGRESS_TOOL_NAMES,
   EXECUTION_VERIFICATION_TOOL_NAMES,
+  MAX_PLAN_EVIDENCE_TOOL_ACTIVITY,
   MAX_RECENT_PLAN_TOOL_ACTIVITY,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
 } from "../../orchestrator";
@@ -33,11 +34,34 @@ const SUBAGENT_EVIDENCE_TOOLS = new Set([
 function appendBoundedToolActivity(
   targetList: PlanToolActivitySummary[],
   activity: PlanToolActivitySummary,
+  maxItems = MAX_RECENT_PLAN_TOOL_ACTIVITY,
+  mergeByTarget = false,
 ): void {
-  targetList.push(activity);
-  if (targetList.length > MAX_RECENT_PLAN_TOOL_ACTIVITY) {
-    targetList.splice(0, targetList.length - MAX_RECENT_PLAN_TOOL_ACTIVITY);
+  if (mergeByTarget) {
+    const normalizedTarget = String(activity.target || "").replace(/\\/g, "/").toLowerCase();
+    const existing = targetList.find((item) =>
+      item.name === activity.name &&
+      String(item.target || "").replace(/\\/g, "/").toLowerCase() === normalizedTarget
+    );
+    if (existing) {
+      const details = [existing.detail, activity.detail]
+        .map((detail) => String(detail || "").trim())
+        .filter((detail, index, all) => detail && all.indexOf(detail) === index);
+      existing.status = existing.status === "succeeded" || activity.status === "succeeded"
+        ? "succeeded"
+        : activity.status;
+      if (details.length > 0) existing.detail = details.join(" | ").slice(0, 440);
+      return;
+    }
   }
+  targetList.push(activity);
+  if (targetList.length > maxItems) {
+    targetList.splice(0, targetList.length - maxItems);
+  }
+}
+
+export interface ToolActivityRetentionOptions {
+  evidenceLedger?: boolean;
 }
 
 export function extractDelegatedSubagentActivities(
@@ -120,6 +144,7 @@ export function toolResultCountsAsExecutionEvidence(
 export function rememberToolActivity(
   targetList: PlanToolActivitySummary[],
   result: ToolExecutionResult,
+  options: ToolActivityRetentionOptions = {},
 ): void {
   if (result.internalFeedback) return;
   const rawDetail = result.displayContent || result.content || "";
@@ -135,14 +160,20 @@ export function rememberToolActivity(
     target: result.target,
     status: result.isError ? "failed" : "succeeded",
     ...(detail ? { detail } : {}),
-  });
+  }, options.evidenceLedger ? MAX_PLAN_EVIDENCE_TOOL_ACTIVITY : MAX_RECENT_PLAN_TOOL_ACTIVITY, options.evidenceLedger);
 }
 
 export function rememberDelegatedSubagentActivities(
   targetList: PlanToolActivitySummary[],
   activities: PlanToolActivitySummary[],
+  options: ToolActivityRetentionOptions = {},
 ): void {
-  activities.forEach((activity) => appendBoundedToolActivity(targetList, activity));
+  activities.forEach((activity) => appendBoundedToolActivity(
+    targetList,
+    activity,
+    options.evidenceLedger ? MAX_PLAN_EVIDENCE_TOOL_ACTIVITY : MAX_RECENT_PLAN_TOOL_ACTIVITY,
+    options.evidenceLedger,
+  ));
 }
 
 export function isEditProgressResult(result: ToolExecutionResult): boolean {

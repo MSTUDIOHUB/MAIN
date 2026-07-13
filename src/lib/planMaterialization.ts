@@ -12,18 +12,28 @@ import {
 } from "./workflowModels";
 import { extractPrimaryUserRequestText, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 import {
+  assessPlanConfigurationContracts,
+  assessPlanClosureEvidence,
   buildPlanCandidate,
   validatePlanCandidate,
   type PlanCandidate,
+  type PlanConfigurationContractAssessment,
   type PlanEvidenceBundle,
 } from "./planEvidence";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import {
+  extractNumberedUserGoalFacets,
+  preserveNumberedUserGoalLines,
+} from "./numberedGoalFacets";
+
+export { extractNumberedUserGoalFacets } from "./numberedGoalFacets";
 
 export type MaterializablePlanKind = "plan" | "design";
 export type PlanMaterializationSource =
   | "visible_plan"
   | "deterministically_compacted_visible_plan"
   | "canonicalized_visible_plan"
+  | "grounding_repaired_visible_plan"
   | "evidence_section_repaired_visible_plan"
   | "deterministic_evidence";
 
@@ -165,16 +175,12 @@ const BROAD_DISCOVERY_EVIDENCE_RE =
   /^(?:(?:glob_search|list_directory|get_project_skeleton|index_workspace_documents)\b|(?:已搜索文件|已查看目录|已查看项目结构|已索引工作区文档)(?:[:：\s]|$)|(?:Searched files|Listed directory|Inspected project structure|Indexed workspace documents)\b)/i;
 const CONCRETE_PLAN_EVIDENCE_RE =
   /^(?:(?:read_file|read_file_window|read_document|get_file_outline|code_ast_query|find_symbol_references|git_diff|grep_search|analyze_tabular_document|query_tabular_document)\b|(?:已读取文件|已读取文件窗口|已读取文档|已查看文件结构|已解析语法树|已查找符号引用|已检查 Git 差异|已搜索文本|已分析表格数据|已查询表格数据)(?:[:：\s]|$)|(?:Read file|Read file window|Read document|Inspected file outline|Parsed syntax tree|Found symbol references|Inspected Git diff|Searched text|Analyzed tabular data|Queried tabular data)\b)/i;
-const CSV_DASHBOARD_GOAL_RE =
-  /(?:CSV|导入|creator|course|课程|销售|排行|趋势|环比|订单|状态|Dashboard|面板|图表|指标|数据|field|column|chart|metric|order|status)/i;
-const DARK_THEME_GOAL_RE =
-  /(?:深色|暗色|dark\s*mode|theme|主题|白色底|background|contrast|palette)/i;
 const BROAD_OR_NOISY_SEARCH_TARGET_RE =
   /^(?:\.|\.\/|\/|\*+|\*\*\/\*\.[A-Za-z0-9_*{}.,-]+|\*\.[A-Za-z0-9_*{}.,-]+|get_project_skeleton|[\s.*{}()[\]|,+-]+)$/i;
 const TOOL_DETAIL_NON_EVIDENCE_RE =
   /(?:package-lock\.json|package\.json|node_modules|dist\/|build\/|<title\b|index\.html:\d+:\s*<title)/i;
 const TOOL_DETAIL_HAS_SOURCE_SIGNAL_RE =
-  /\b(?:src|app|lib|components|hooks|store|styles|utils|tests|pages|server|client|packages|apps)\/[A-Za-z0-9_./@-]+|\b(?:function|const|let|class|interface|type|export|import|use[A-Z][A-Za-z0-9_]*|loadOrders|parse|map|chart|dashboard|theme|dark|CSV|字段|列|指标|订单|图表|状态|趋势|环比)\b/i;
+  /\b(?:src|app|lib|components|hooks|store|styles|utils|tests|pages|server|client|packages|apps)\/[A-Za-z0-9_./@-]+|\b(?:async|await|function|fn|const|let|class|struct|enum|interface|type|export|import|return|throw|match|impl|use[A-Z][A-Za-z0-9_]*|[A-Za-z_$][A-Za-z0-9_$]{2,}\s*(?:\(|=|:))|(?:字段|配置|接口|状态|事件|命令|权限|插件|数据流|样式)/i;
 const PATH_ECHO_EVIDENCE_RE =
   /(?:已读取文件|Read file)\s*[:：]\s*([A-Za-z0-9_@./-]+\.[A-Za-z0-9]+)(?:\s*[;；]\s*(?:发现|found)\s*[:：]\s*\1)?\s*$/i;
 const READ_FILE_RESULT_RE = /\bREAD_FILE_RESULT\b/i;
@@ -183,7 +189,9 @@ const READ_FILE_CONTENT_END = "---CONTENT END---";
 const READ_FILE_METADATA_LINE_RE =
   /^(?:\[MAIN_TOOL_FEEDBACK_V1\].*|READ_FILE_RESULT|path\s*:.*|truncated\s*:.*|totalLines\s*:.*|totalChars\s*:.*|returnedLines\s*:.*|returnedChars\s*:.*|nextStartLine\s*:.*|nextRead\s*:.*|note\s*:.*|---CONTENT (?:START|END)---|\.\.\.\[compact:.*)$/i;
 const PLAN_EVIDENCE_SOURCE_SIGNAL_RE =
-  /\b(?:import|export|function|const|let|class|interface|type|return|if|else|for|while|switch|case|try|catch|useEffect|useMemo|useState|props|state|set[A-Z][A-Za-z0-9_]*|load[A-Z]?[A-Za-z0-9_]*|parse[A-Z]?[A-Za-z0-9_]*|map|filter|reduce|render|csv|order|course|creator|amount|status|trend|metric|dashboard|chart|theme|dark|background|token|localStorage)\b|(?:字段|列名|订单|课程|销售|金额|状态|图表|趋势|环比|主题|深色|暗色|背景|指标)/i;
+  /\b(?:import|export|async|await|function|fn|const|let|class|struct|enum|interface|type|return|if|else|for|while|switch|case|match|try|catch|throw|impl|props|state|set[A-Z][A-Za-z0-9_]*|load[A-Z]?[A-Za-z0-9_]*|parse[A-Z]?[A-Za-z0-9_]*|map|filter|reduce|render|localStorage|permissions?|capabilit(?:y|ies)|dependencies|plugins?|[A-Za-z_$][A-Za-z0-9_$]{2,}\s*(?:\(|=|:))\b|(?:字段|配置|接口|状态|事件|命令|权限|插件|数据流|样式)/i;
+const PLAN_EVIDENCE_SOURCE_CONTRACT_RE =
+  /(?:\b(?:invoke|emit|listen|addEventListener|removeEventListener|generate_handler|invoke_handler|register|plugin|permissions?|capabilit(?:y|ies)|fileAssociations?|dialog)[A-Za-z0-9_:.!-]*\s*(?:[(![.:]|$)|@[A-Za-z0-9_./-]+\/plugin-[A-Za-z0-9_-]+)/i;
 
 function countPlanShapeSignals(content: string): number {
   const headingCount = (content.match(/^#{1,3}\s+\S+/gm) || []).length;
@@ -460,18 +468,118 @@ function compactPlanEvidenceSourceLine(line: string, index: number): string {
   return `L${index + 1}: ${compacted}`;
 }
 
+function planEvidenceSourceSignalScore(line: string): number {
+  let score = 0;
+  if (PLAN_EVIDENCE_SOURCE_SIGNAL_RE.test(line)) score += 1;
+  if (PLAN_EVIDENCE_SOURCE_CONTRACT_RE.test(line)) score += 12;
+  if (/\b(?:invoke|emit|listen|addEventListener|invoke_handler)\s*\(/i.test(line)) score += 8;
+  if (/\b(?:open|read|write|save|load|handle)[A-Za-z0-9_]*\s*\(/i.test(line)) score += 3;
+  if (/DOMContentLoaded|beforeunload|load\s*["']/i.test(line)) score -= 4;
+  if (/(?:generate_handler!\s*\[|["']permissions["']\s*:\s*\[)/i.test(line)) score += 8;
+  if (/\b(?:devUrl|dev[_-]?server|beforeDevCommand|port)\b\s*["']?\s*[:=]|--port(?:=|\s+)|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*\d{2,5}/i.test(line)) score += 10;
+  if (/\b(?:throw|panic|error|failed|missing|invalid|unsupported)\b|失败|缺少|错误|无效/i.test(line)) score += 6;
+  if (/\b(?:export\s+)?(?:async\s+)?(?:function|fn|class|interface|type)\b/i.test(line)) score += 4;
+  if (/\b(?:import|use)\b/i.test(line)) score += 2;
+  if (/^\s*(?:\/\/|#)/.test(line)) score -= 2;
+  return score;
+}
+
+function compactPlanEvidenceSourceCandidate(
+  lines: string[],
+  index: number,
+): { text: string; endIndex: number } {
+  const line = lines[index] || "";
+  const multilineContract = /(?:generate_handler!\s*\[|["']permissions["']\s*:\s*\[)/i.test(line);
+  let endIndex = index;
+  if (multilineContract) {
+    const closingPattern = /(?:\]\)|\]\s*[,;]?)\s*$/;
+    while (endIndex + 1 < lines.length && endIndex - index < 12) {
+      endIndex += 1;
+      if (closingPattern.test((lines[endIndex] || "").trim())) break;
+    }
+  }
+  const joined = lines.slice(index, endIndex + 1).join(" ");
+  if (/generate_handler!\s*\[/i.test(joined)) {
+    const body = joined.match(/generate_handler!\s*\[([\s\S]*?)\]/i)?.[1] || "";
+    const handlers = [...new Set(body.match(/[A-Za-z_][A-Za-z0-9_]*/g) || [])].slice(0, 12);
+    if (handlers.length > 0) {
+      return {
+        text: `L${index + 1}: handler_contract(${handlers.join(",")})`,
+        endIndex,
+      };
+    }
+  }
+  if (/["']permissions["']\s*:\s*\[/i.test(joined)) {
+    const body = joined.match(/["']permissions["']\s*:\s*\[([\s\S]*?)\]/i)?.[1] || "";
+    const permissions = [...body.matchAll(/["']([^"']+)["']/g)]
+      .map((match) => match[1] || "")
+      .filter(Boolean)
+      .slice(0, 16);
+    if (permissions.length > 0) {
+      return {
+        text: `L${index + 1}: permission_contract(${permissions.join(",")})`,
+        endIndex,
+      };
+    }
+  }
+  const emittedEvent = joined.match(/\.emit\s*\(\s*[`'"]?([A-Za-z0-9_.:-]+)[`'"]?/i)?.[1] || "";
+  if (emittedEvent) {
+    return {
+      text: `L${index + 1}: event_emit_contract(${emittedEvent})`,
+      endIndex,
+    };
+  }
+  const domListenedEvent = joined.match(/addEventListener\s*\(\s*[`'"]?([A-Za-z0-9_.:-]+)[`'"]?/i)?.[1] || "";
+  if (domListenedEvent) {
+    return {
+      text: `L${index + 1}: event_dom_listener_contract(${domListenedEvent})`,
+      endIndex,
+    };
+  }
+  const tauriListenedEvent = joined.match(/(?:^|[^A-Za-z0-9_])listen\s*\(\s*[`'"]?([A-Za-z0-9_.:-]+)[`'"]?/i)?.[1] || "";
+  if (tauriListenedEvent) {
+    return {
+      text: `L${index + 1}: event_tauri_listener_contract(${tauriListenedEvent})`,
+      endIndex,
+    };
+  }
+  const invokedCommand = joined.match(/\binvoke\s*\(\s*[`'"]?([A-Za-z0-9_.:-]+)[`'"]?/i)?.[1] || "";
+  if (invokedCommand) {
+    return {
+      text: `L${index + 1}: command_invoke_contract(${invokedCommand})`,
+      endIndex,
+    };
+  }
+  return {
+    text: compactPlanEvidenceSourceLine(joined, index),
+    endIndex,
+  };
+}
+
 function collectPlanEvidenceSourceSignals(body: string, maxChars: number): string {
   const lines = String(body || "").split(/\r?\n/);
-  const picked: string[] = [];
-  let chars = 0;
+  const candidates: Array<{ text: string; score: number; index: number }> = [];
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index] || "";
-    if (!PLAN_EVIDENCE_SOURCE_SIGNAL_RE.test(line)) continue;
-    const compacted = compactPlanEvidenceSourceLine(line, index);
-    if (!compacted || picked.includes(compacted)) continue;
+    const score = planEvidenceSourceSignalScore(line);
+    if (score <= 0) continue;
+    const candidate = compactPlanEvidenceSourceCandidate(lines, index);
+    if (candidate.text) candidates.push({ text: candidate.text, score, index });
+    index = candidate.endIndex;
+  }
+  candidates.sort((left, right) => right.score - left.score || left.index - right.index);
+
+  const picked: string[] = [];
+  const pickedContracts = new Set<string>();
+  let chars = 0;
+  for (const candidate of candidates) {
+    const compacted = candidate.text;
+    const contractKey = compacted.replace(/^L\d+:\s*/i, "").toLowerCase();
+    if (!compacted || pickedContracts.has(contractKey)) continue;
     const nextChars = chars + compacted.length + 1;
     if (nextChars > maxChars && picked.length > 0) break;
     picked.push(compacted);
+    pickedContracts.add(contractKey);
     chars = nextChars;
     if (picked.length >= 6) break;
   }
@@ -810,7 +918,8 @@ export function sanitizePlanEvidenceInput(input: {
   }
 
   const primaryUserGoal = extractPrimaryUserRequestText(String(input.userGoal || ""));
-  const cleanUserGoal = compactPlanLine(primaryUserGoal || input.userGoal || "", 600);
+  const rawUserGoal = sanitizePlanArtifactContent(String(primaryUserGoal || input.userGoal || "")).trim();
+  const cleanUserGoal = preserveNumberedUserGoalLines(rawUserGoal, 600) || compactPlanLine(rawUserGoal, 600);
   const cleanEvidence = unique(evidence, Math.max(1, Number(input.maxEvidence) || 12), 220);
   const cleanFiles = unique(files, Math.max(1, Number(input.maxFiles) || 12), 180);
   const cleanConstraints = unique(constraints, Math.max(1, Number(input.maxConstraints) || 6), 220);
@@ -839,6 +948,8 @@ export function sanitizePlanEvidenceInput(input: {
 interface ParsedPlanSection {
   title: string;
   body: string;
+  level: number;
+  ancestors: string[];
 }
 
 function matchPlanOutlineHeading(line: string): string {
@@ -861,38 +972,67 @@ function parsePlanSections(content: string): ParsedPlanSection[] {
   const sections: ParsedPlanSection[] = [];
   let title = "";
   let body: string[] = [];
+  let level = 0;
+  let ancestors: string[] = [];
+  const headingStack: Array<{ level: number; title: string }> = [];
+  const flush = () => {
+    if (title || body.join("\n").trim()) {
+      sections.push({ title, body: body.join("\n"), level, ancestors });
+    }
+  };
   for (const line of String(content || "").split(/\r?\n/)) {
-    const heading = line.match(/^\s*#{1,6}\s+(.+?)\s*$/);
+    const heading = line.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
     const outlineHeading = heading ? "" : matchPlanOutlineHeading(line);
     if (heading || outlineHeading) {
-      if (title || body.join("\n").trim()) {
-        sections.push({ title, body: body.join("\n") });
+      flush();
+      const nextLevel = heading ? (heading[1] || "#").length : 2;
+      while (
+        headingStack.length > 0 &&
+        (headingStack[headingStack.length - 1]?.level || 0) >= nextLevel
+      ) {
+        headingStack.pop();
       }
-      title = heading?.[1] || outlineHeading;
+      ancestors = headingStack.map((entry) => entry.title);
+      title = heading?.[2] || outlineHeading;
+      level = nextLevel;
       body = [];
+      headingStack.push({ level: nextLevel, title });
     } else {
       body.push(line);
     }
   }
-  if (title || body.join("\n").trim()) {
-    sections.push({ title, body: body.join("\n") });
-  }
+  flush();
   return sections;
 }
 
-const PLAN_FACET_STOP_TERMS = new Set([
-  "现在", "软件", "问题", "功能", "需要", "进行", "以及", "这个", "一个", "无法", "已经",
-  "the", "and", "with", "that", "this", "from", "issue", "problem", "should", "must",
-]);
-
-function extractNumberedUserGoalFacets(userGoal: string): Array<{ index: number; text: string }> {
-  return String(userGoal || "")
-    .split(/\r?\n/)
-    .map((line) => line.match(/^\s*(\d{1,2})\s*[、.)．]\s*(.+?)\s*$/))
-    .filter((match): match is RegExpMatchArray => !!match)
-    .map((match) => ({ index: Number(match[1]), text: match[2].trim() }))
-    .filter((facet) => facet.text.length >= 4);
+function planSectionMatchesRole(
+  section: ParsedPlanSection,
+  patterns: RegExp[],
+): boolean {
+  return [section.title, ...section.ancestors]
+    .map(normalizePlanSectionRoleTitle)
+    .some((title) => patterns.some((pattern) => pattern.test(title)));
 }
+
+function normalizePlanSectionRoleTitle(title: string): string {
+  return String(title || "")
+    .trim()
+    .replace(/^(?:(?:第\s*)?[一二三四五六七八九十百]+|\d{1,3})\s*[、.．):：-]\s*/, "")
+    .trim();
+}
+
+function formatPlanSectionContext(section: ParsedPlanSection): string {
+  const titles = [...section.ancestors, section.title]
+    .map(normalizePlanSectionRoleTitle)
+    .filter((title) => title && !/^(?:Proposed Plan|Plan|计划|整改计划|修复计划)$/i.test(title));
+  return uniquePlanItems(titles, 3, 180, true).slice(-2).join(" / ");
+}
+
+const PLAN_FACET_STOP_TERMS = new Set([
+  "现在", "当前", "软件", "用户", "目标", "问题", "功能", "需要", "要求", "进行", "以及", "这个", "一个", "无法", "已经",
+  "修复", "实现", "改动", "验证", "确认", "执行", "操作", "检查", "结果", "通过", "相关", "对应", "原始", "涉及", "不一", "一致",
+  "the", "and", "with", "that", "this", "from", "issue", "problem", "should", "must", "user", "goal", "current", "implement", "change", "validate", "verify", "confirm", "execute", "result",
+]);
 
 function semanticFacetTerms(value: string): Set<string> {
   const terms = new Set<string>();
@@ -919,6 +1059,90 @@ function facetSectionCovered(facetTerms: Set<string>, sectionBody: string): bool
   return matches >= 2;
 }
 
+function facetLineStronglyCovered(facetTerms: Set<string>, line: string): boolean {
+  const lineTerms = semanticFacetTerms(line);
+  let distinctMatches = 0;
+  for (const term of facetTerms) {
+    if (lineTerms.has(term)) distinctMatches += 1;
+  }
+  return distinctMatches >= 2;
+}
+
+function distinctSemanticFacetTerms(
+  facetText: string,
+  allFacetTexts: string[],
+): Set<string> {
+  const ownTerms = semanticFacetTerms(facetText);
+  const sharedTerms = new Set<string>();
+  for (const other of allFacetTexts) {
+    if (other === facetText) continue;
+    for (const term of semanticFacetTerms(other)) sharedTerms.add(term);
+  }
+  return new Set([...ownTerms].filter((term) => !sharedTerms.has(term)));
+}
+
+type PlanFacetReferencePrefix = "E" | "C" | "D" | "V";
+
+interface PlanFacetTraceabilityRow {
+  index: number;
+  body: string;
+  evidenceRefs: string[];
+  changeRefs: string[];
+  decisionRefs: string[];
+  validationRefs: string[];
+}
+
+function collectPlanReferenceIds(value: string, prefix: PlanFacetReferencePrefix): string[] {
+  const ids = new Set<string>();
+  const pattern = new RegExp(`\\b${prefix}(\\d{1,3})\\b`, "gi");
+  for (const match of String(value || "").matchAll(pattern)) {
+    ids.add(`${prefix}${Number(match[1])}`);
+  }
+  return [...ids];
+}
+
+function parsePlanFacetTraceabilityRows(sections: ParsedPlanSection[]): PlanFacetTraceabilityRow[] {
+  const rows: PlanFacetTraceabilityRow[] = [];
+  for (const section of sections) {
+    if (!/^(?:(?:需求|目标|用户目标|问题)?分面(?:追踪|映射|覆盖)|(?:Requirement|Goal|Issue) Facet (?:Traceability|Mapping|Coverage))$/i.test(
+      normalizePlanSectionRoleTitle(section.title),
+    )) continue;
+    for (const rawLine of section.body.split(/\r?\n/)) {
+      const body = stripPlanListMarker(rawLine);
+      const match = body.match(/^(?:分面|需求|目标|问题|Facet|Requirement|Goal|Issue)\s*#?\s*(\d{1,2})\b/i);
+      if (!match) continue;
+      rows.push({
+        index: Number(match[1]),
+        body,
+        evidenceRefs: collectPlanReferenceIds(body, "E"),
+        changeRefs: collectPlanReferenceIds(body, "C"),
+        decisionRefs: collectPlanReferenceIds(body, "D"),
+        validationRefs: collectPlanReferenceIds(body, "V"),
+      });
+    }
+  }
+  return rows;
+}
+
+function planFacetTraceabilityRowIsGrounded(input: {
+  row?: PlanFacetTraceabilityRow;
+  facetTerms: Set<string>;
+  evidenceBody: string;
+  changesBody: string;
+  decisionsBody: string;
+  validationBody: string;
+}): boolean {
+  const row = input.row;
+  if (!row || !facetSectionCovered(input.facetTerms, row.body)) return false;
+  const referencesExist = (refs: string[], body: string) =>
+    refs.length > 0 && refs.every((ref) => new RegExp(`\\[${ref}\\]`, "i").test(body));
+  const groundedAction = referencesExist(row.changeRefs, input.changesBody) ||
+    referencesExist(row.decisionRefs, input.decisionsBody);
+  return referencesExist(row.evidenceRefs, input.evidenceBody) &&
+    groundedAction &&
+    referencesExist(row.validationRefs, input.validationBody);
+}
+
 export function validateNumberedUserGoalFacetCoverage(input: {
   userGoal?: string;
   content: string;
@@ -926,23 +1150,35 @@ export function validateNumberedUserGoalFacetCoverage(input: {
   const facets = extractNumberedUserGoalFacets(input.userGoal || "");
   if (facets.length < 2) return classifyPlanArtifactQualityResult({ ok: true });
   const sections = parsePlanSections(input.content);
-  const evidenceBody = sections
-    .filter((section) => /证据|发现|根因|evidence|finding|root cause/i.test(section.title))
-    .map((section) => section.body)
+  const collectRoleText = (patterns: RegExp[]) => sections
+    .filter((section) => planSectionMatchesRole(section, patterns))
+    .map((section) => `${section.ancestors.join("\n")}\n${section.title}\n${section.body}`)
     .join("\n");
-  const changesBody = sections
-    .filter((section) => /关键改动|实现改动|修复方案|实施方案|key changes|implementation|fix plan/i.test(section.title))
-    .map((section) => section.body)
-    .join("\n");
-  const validationBody = sections
-    .filter((section) => /测试|验证|test|validation/i.test(section.title))
-    .map((section) => section.body)
-    .join("\n");
+  const evidenceBody = collectRoleText([
+    /证据|发现|根因|现状|当前状态|当前实现|现有架构|背景|上下文|约束|依赖|边界|基线|需求依据|evidence|finding|root cause|current state|current implementation|existing architecture|background|context|constraint|dependenc|boundary|baseline/i,
+  ]);
+  const changesBody = collectRoleText([
+    /关键改动|实现改动|具体改动|改动|变更|修复方案|实现方案|实施方案|执行方案|架构|设计|组件|数据流|落地方案|key changes|changes?|implementation|fix plan|approach|architecture|design|components?|data flow|plan of work/i,
+  ]);
+  const decisionsBody = collectRoleText([
+    /决策|结论|取舍|约束|保持不变|无需改动|不修改|decision|conclusion|trade-?off|constraint|no changes?|unchanged/i,
+  ]);
+  const validationBody = collectRoleText([/测试|验证|验收|成功标准|完成标准|test|validation|acceptance|success criteria|definition of done/i]);
+  const traceabilityRows = parsePlanFacetTraceabilityRows(sections);
   const uncovered = facets.filter((facet) => {
     const terms = semanticFacetTerms(facet.text);
-    return !facetSectionCovered(terms, evidenceBody) ||
-      !facetSectionCovered(terms, changesBody) ||
-      !facetSectionCovered(terms, validationBody);
+    const semanticCoverage = facetSectionCovered(terms, evidenceBody) &&
+      (facetSectionCovered(terms, changesBody) || facetSectionCovered(terms, decisionsBody)) &&
+      facetSectionCovered(terms, validationBody);
+    const referenceCoverage = planFacetTraceabilityRowIsGrounded({
+      row: traceabilityRows.find((row) => row.index === facet.index),
+      facetTerms: terms,
+      evidenceBody,
+      changesBody,
+      decisionsBody,
+      validationBody,
+    });
+    return !semanticCoverage && !referenceCoverage;
   });
   return uncovered.length === 0
     ? classifyPlanArtifactQualityResult({ ok: true })
@@ -959,8 +1195,10 @@ function collectSectionTitles(
 ): string[] {
   return uniquePlanItems(
     sections
-      .map((section) => section.title)
-      .filter((title) => patterns.some((pattern) => pattern.test(title))),
+      .filter((section) => patterns.some((pattern) =>
+        pattern.test(normalizePlanSectionRoleTitle(section.title))
+      ))
+      .map((section) => section.title),
     maxItems,
     1000,
     true,
@@ -973,10 +1211,17 @@ function collectLinesFromSections(
   maxItems: number,
   maxChars = 220,
   preserveFormatting = false,
+  includeDescendants = false,
+  includeSectionContext = false,
 ): string[] {
   const values: string[] = [];
   for (const section of sections) {
-    if (!patterns.some((pattern) => pattern.test(section.title))) continue;
+    const matches = includeDescendants
+      ? planSectionMatchesRole(section, patterns)
+      : patterns.some((pattern) => pattern.test(normalizePlanSectionRoleTitle(section.title)));
+    if (!matches) continue;
+    const context = includeSectionContext ? formatPlanSectionContext(section) : "";
+    if (context) values.push(context);
     values.push(...section.body.split(/\r?\n/));
   }
   return uniquePlanItems(values, maxItems, maxChars, preserveFormatting);
@@ -1000,10 +1245,10 @@ const PLAN_GROUNDING_READ_TOOLS = new Set([
   "get_file_outline",
 ]);
 const PLAN_CHANGE_TARGET_FILE_RE = /(?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_@.-]+\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html|md)\b/gi;
-const PLAN_EXPLICIT_MUTATION_RE = /(?:修改|更新|改动|改为|新增|添加|实现|生成|创建|删除|重构|修复|替换|移除|接入|迁移|modify|update|change|add|implement|generate|create|delete|refactor|fix|replace|remove|wire|migrate)/i;
+const PLAN_EXPLICIT_MUTATION_RE = /(?:修改|更新|改动|改为|新增|添加|实现|生成|创建|删除|重构|修复|替换|移除|接入|迁移|写入|持久化|归一化|统一|配置|扩展|支持|引入|拆分|合并|modify|update|change|add|implement|generate|create|delete|refactor|fix|replace|remove|wire|migrate|write|persist|normalize|configure|extend|support|introduce|split|merge)/i;
 const PLAN_NEW_FILE_LINE_RE = /(?:新增文件|新建文件|创建新文件|add\s+(?:a\s+)?new\s+file|create\s+(?:a\s+)?new\s+file)/i;
-const PLAN_CONFIRMED_EVIDENCE_HEADING_RE = /(?:^|\n)\s*#{1,6}\s*(?:已确认(?:事实|发现|证据)|已读证据|证据依据|Confirmed (?:Facts|Findings|Evidence)|Read Evidence|Evidence)\s*$/im;
-const PLAN_KEY_CHANGES_HEADING_RE = /^(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)$/i;
+const PLAN_CONFIRMED_EVIDENCE_HEADING_RE = /(?:^|\n)\s*#{1,6}\s*(?:已确认(?:事实|发现|证据)|已读证据|证据依据|当前状态|当前实现|现有架构|项目背景|实现约束|Confirmed (?:Facts|Findings|Evidence)|Read Evidence|Evidence|Current State|Current Implementation|Existing Architecture|Project Context|Implementation Constraints)\s*$/im;
+const PLAN_KEY_CHANGES_HEADING_RE = /^(?:关键改动|关键实现改动|实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|落地方案|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Plan of Work)$/i;
 
 function normalizePlanGroundingPath(value: string): string {
   return String(value || "")
@@ -1173,6 +1418,7 @@ export function validateGroundedActionablePlanArtifact(input: {
 
 function repairMissingPlanEvidenceSection(input: {
   content: string;
+  evidence?: string[];
   evidenceRecords?: PlanEvidenceRecord[];
   recentToolActivity?: PlanMaterializationToolActivityLike[];
   language: "zh" | "en";
@@ -1185,6 +1431,9 @@ function repairMissingPlanEvidenceSection(input: {
     return changeTargets.some((target) => planGroundingPathsMatch(target, normalized));
   };
   const evidenceLines = uniquePlanItems([
+    ...(input.evidence || [])
+      .map((item) => summarizeEvidenceLine(item, input.language))
+      .filter((item) => changeTargets.some((target) => evidenceMentionsFile(item, target))),
     ...(input.evidenceRecords || [])
       .filter((record) =>
         PLAN_GROUNDING_READ_TOOLS.has(String(record.tool || "")) &&
@@ -1232,6 +1481,96 @@ function repairMissingPlanEvidenceSection(input: {
 
   lines.splice(insertAt, 0, "", ...section, "");
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function appendItemsToPlanRoleSection(input: {
+  content: string;
+  heading: RegExp;
+  items: string[];
+}): string | null {
+  const items = uniquePlanItems(input.items, 6, 4000, true);
+  if (items.length === 0) return null;
+  const lines = String(input.content || "").trim().split(/\r?\n/);
+  const headingIndex = lines.findIndex((line) => {
+    const match = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    return Boolean(match && input.heading.test(normalizePlanSectionRoleTitle(match[1] || "")));
+  });
+  if (headingIndex < 0) return null;
+
+  let sectionEnd = lines.findIndex((line, index) =>
+    index > headingIndex && /^#{1,6}\s+\S/.test(line.trim())
+  );
+  if (sectionEnd < 0) sectionEnd = lines.length;
+  while (sectionEnd > headingIndex + 1 && !lines[sectionEnd - 1]?.trim()) {
+    sectionEnd -= 1;
+  }
+  lines.splice(sectionEnd, 0, ...items.map((item) => `- ${item}`));
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+function repairMissingGroundedPlanChangeTargets(input: {
+  content: string;
+  userGoal?: string;
+  evidence?: string[];
+  evidenceRecords?: PlanEvidenceRecord[];
+  files?: string[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+  language: "zh" | "en";
+}): string | null {
+  const readTargets = collectReadEvidenceTargets(input);
+  if (readTargets.length === 0) return null;
+
+  const evidenceLines = uniquePlanItems([
+    ...(input.evidence || []).map((item) => summarizeEvidenceLine(item, input.language)),
+    ...(input.evidenceRecords || [])
+      .filter((record) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(record.tool || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(record.status || ""))
+      )
+      .map((record) => formatPlanEvidenceRecord(record, input.language)),
+    ...(input.recentToolActivity || [])
+      .filter((activity) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(activity.name || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(activity.status || ""))
+      )
+      .map((activity) => summarizeEvidenceLine(
+        summarizeToolActivityForEvidence(activity),
+        input.language,
+      )),
+  ], 12, 1600, true).filter(isMeaningfulConcretePlanEvidence);
+  if (evidenceLines.length === 0) return null;
+
+  const sections = parsePlanSections(input.content);
+  const inferredGoal = compactPlanLine(
+    input.userGoal || collectLinesFromSections(sections, [
+      /^(?:用户目标|目标|需求|Goal|Objective|User Request)$/i,
+    ], 1, 420, true)[0] || "",
+    420,
+    true,
+  );
+  const files = uniquePlanItems([
+    ...(input.files || []),
+    ...collectPathLikePlanItems(input.content, 12),
+  ], 12, 180).filter(isActionablePlanFile);
+  const repairLines = files.flatMap((file) => {
+    const isRead = readTargets.some((target) => planGroundingPathsMatch(file, target));
+    if (!isRead) return [];
+    const grounding = evidenceLines.find((item) => evidenceMentionsFile(item, file));
+    if (!grounding) return [];
+    return [buildDeterministicChangeLine({
+      file,
+      goal: inferredGoal,
+      evidence: grounding,
+      language: input.language,
+    })];
+  });
+  if (repairLines.length === 0) return null;
+
+  return appendItemsToPlanRoleSection({
+    content: input.content,
+    heading: PLAN_KEY_CHANGES_HEADING_RE,
+    items: repairLines,
+  });
 }
 
 function isSpeculativePlanLine(line: string): boolean {
@@ -1392,6 +1731,7 @@ function isTauriDesktopStartupCommand(command: string): boolean {
 function buildDeterministicValidationPlanLines(input: {
   commands: string[];
   language: "zh" | "en";
+  desktopRuntimeRequired?: boolean;
 }): string[] {
   const lines = input.commands.map((command) => {
     if (!isInteractiveStartupCommand(command)) {
@@ -1404,13 +1744,173 @@ function buildDeterministicValidationPlanLines(input: {
       : `Use \`execute_command\` to start \`${command}\`, then use \`read_pty_since\`, \`read_pty_tail\`, or \`get_pty_status\` to inspect new startup output/errors; do not mark startup validation passed before that PTY observation. (evidence: cmd:${command})`;
   });
 
-  if (input.commands.some(isTauriDesktopStartupCommand)) {
+  if (input.desktopRuntimeRequired || input.commands.some(isTauriDesktopStartupCommand)) {
     lines.push(input.language === "zh"
-      ? "在实际启动的 Tauri 桌面窗口中验证用户报告的启动、双击打开和文件选择行为；此项保留待 Tauri 运行时/用户确认，不能用 cargo check、构建或 curl 代替。 （证据：tauri_required:desktop runtime interaction）"
-      : "In the actually launched Tauri desktop window, verify the user-reported startup, double-click-open, and file-picker behavior; keep this pending Tauri runtime/user confirmation and do not substitute cargo check, a build, or curl. (evidence: tauri_required: desktop runtime interaction)");
+      ? "在实际启动的桌面窗口中逐项验证用户目标涉及的交互场景；此项保留待桌面运行时/用户确认，不能用静态检查、构建或 HTTP 探测代替。 （证据：tauri_required:desktop runtime interaction）"
+      : "In the actually launched desktop window, verify each interactive scenario in the user goal; keep this pending desktop-runtime/user confirmation and do not substitute a static check, build, or HTTP probe. (evidence: tauri_required:desktop runtime interaction)");
   }
 
   return lines;
+}
+
+function labelPlanReferenceLines(
+  lines: string[],
+  prefix: PlanFacetReferencePrefix,
+  enabled: boolean,
+): string[] {
+  if (!enabled) return lines;
+  return lines.map((line, index) => `[${prefix}${index + 1}] ${line}`);
+}
+
+function selectFacetReferenceIds(input: {
+  facetText: string;
+  facetTerms?: Set<string>;
+  lines: string[];
+  prefix: PlanFacetReferencePrefix;
+  mappingContext?: string;
+}): string[] {
+  const facetTerms = input.facetTerms || semanticFacetTerms(input.facetText);
+  const context = String(input.mappingContext || "");
+  const contextPaths = [...context.matchAll(PLAN_CHANGE_TARGET_FILE_RE)]
+    .map((match) => normalizePlanGroundingPath(match[0] || ""))
+    .filter(Boolean);
+  const contextAnchors = new Set<string>();
+  for (const match of context.matchAll(/`([^`\n]{3,120})`/g)) {
+    const anchor = String(match[1] || "").trim().toLowerCase();
+    if (/^[A-Za-z0-9_@./:-]+$/.test(anchor)) contextAnchors.add(anchor);
+  }
+  for (const match of context.matchAll(/\b[A-Za-z][A-Za-z0-9_./:-]{3,}\b/g)) {
+    const anchor = String(match[0] || "").toLowerCase();
+    if (!/^(?:this|that|with|from|into|plan|issue|problem|change|changes|evidence|validation|source|target|file|read_file|function|const|return)$/.test(anchor)) {
+      contextAnchors.add(anchor);
+    }
+  }
+  const matchingIndexes = input.lines
+    .map((line, index) => ({ line, index }))
+    .filter(({ line }) => {
+      const comparableLine = input.prefix === "C"
+        ? line.split(/(?:依据证据|Grounding evidence)\s*[:：]/i)[0]
+        : line;
+      const normalizedLine = comparableLine.toLowerCase().replace(/\\/g, "/");
+      const hasMappedPath = contextPaths.some((path) =>
+        planGroundingPathsMatch(path, comparableLine) || normalizedLine.includes(path)
+      );
+      // A model-authored facet section with concrete paths is a stronger
+      // relation than a shared framework or subsystem token. Requiring that
+      // path prevents, for example, every Tauri change from being assigned to
+      // an unrelated Tauri startup facet.
+      if (contextPaths.length > 0) return hasMappedPath;
+      if (facetLineStronglyCovered(facetTerms, line)) return true;
+      if (!context) return false;
+      return [...contextAnchors].some((anchor) =>
+        anchor.length >= 4 && normalizedLine.includes(anchor)
+      );
+    })
+    .map(({ index }) => index);
+  return matchingIndexes.map((index) => `${input.prefix}${index + 1}`);
+}
+
+function buildFacetMappingContext(input: {
+  facetIndex: number;
+  facetText: string;
+  facetTerms: Set<string>;
+  source?: string;
+}): string {
+  const source = String(input.source || "").trim();
+  if (!source) return "";
+  const ordinalPattern = new RegExp(
+    `^(?:(?:分面|需求|目标|问题|Facet|Requirement|Goal|Issue)\\s*#?\\s*)?${input.facetIndex}\\s*(?:[\u3001.\uff0e):：-]|的)`,
+    "i",
+  );
+  const sections = parsePlanSections(source);
+  const sectionContexts = sections
+    .filter((section) =>
+      ordinalPattern.test(section.title.trim()) ||
+      facetSectionCovered(
+        input.facetTerms,
+        `${section.ancestors.join("\n")}\n${section.title}\n${section.body}`,
+      )
+    )
+    .map((section) => `${section.ancestors.join("\n")}\n${section.title}\n${section.body}`);
+  if (sectionContexts.length > 0) return sectionContexts.join("\n");
+
+  const lines = source.split(/\r?\n/);
+  const windows: string[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    if (
+      !ordinalPattern.test((lines[index] || "").trim()) &&
+      !facetSectionCovered(input.facetTerms, lines[index] || "")
+    ) continue;
+    windows.push(lines.slice(index, Math.min(lines.length, index + 10)).join("\n"));
+  }
+  return windows.join("\n");
+}
+
+function buildFacetValidationPlanLines(input: {
+  facets: Array<{ index: number; text: string }>;
+  language: "zh" | "en";
+}): string[] {
+  if (input.facets.length < 2) return [];
+  return input.facets.map((facet) => input.language === "zh"
+    ? `按分面 ${facet.index} 的原始约束“${facet.text}”执行其涉及的输入、操作或检查，记录实际结果，并确认该分面单独通过；不得用其他分面的结果或仅用构建成功代替。`
+    : `Exercise the inputs, actions, or checks in facet ${facet.index} ("${facet.text}"), record the observed result, and confirm this facet passes independently; do not substitute another facet or a successful build.`);
+}
+
+function buildFacetTraceabilityPlanLines(input: {
+  facets: Array<{ index: number; text: string }>;
+  evidenceLines: string[];
+  changeLines: string[];
+  decisionLines?: string[];
+  language: "zh" | "en";
+  mappingSource?: string;
+}): string[] {
+  if (
+    input.facets.length < 2 ||
+    input.evidenceLines.length === 0 ||
+    (input.changeLines.length === 0 && (input.decisionLines?.length || 0) === 0)
+  ) return [];
+  const allFacetTexts = input.facets.map((facet) => facet.text);
+  return input.facets.flatMap((facet, position) => {
+    const facetTerms = distinctSemanticFacetTerms(facet.text, allFacetTexts);
+    const mappingContext = buildFacetMappingContext({
+      facetIndex: facet.index,
+      facetText: facet.text,
+      facetTerms,
+      source: input.mappingSource,
+    });
+    const evidenceRefs = selectFacetReferenceIds({
+      facetText: facet.text,
+      facetTerms,
+      lines: input.evidenceLines,
+      prefix: "E",
+      mappingContext,
+    });
+    const changeRefs = selectFacetReferenceIds({
+      facetText: facet.text,
+      facetTerms,
+      lines: input.changeLines,
+      prefix: "C",
+      mappingContext,
+    });
+    const decisionRefs = selectFacetReferenceIds({
+      facetText: facet.text,
+      facetTerms,
+      lines: input.decisionLines || [],
+      prefix: "D",
+      mappingContext,
+    });
+    if (evidenceRefs.length === 0 || (changeRefs.length === 0 && decisionRefs.length === 0)) return [];
+    const evidence = evidenceRefs.join(input.language === "zh" ? "、" : ", ");
+    const actionRefs = changeRefs.length > 0 ? changeRefs : decisionRefs;
+    const actions = actionRefs.join(input.language === "zh" ? "、" : ", ");
+    const actionLabel = changeRefs.length > 0
+      ? input.language === "zh" ? "改动目标" : "change targets"
+      : input.language === "zh" ? "已确认决策" : "confirmed decisions";
+    const validation = `V${position + 1}`;
+    return [input.language === "zh"
+      ? `分面 ${facet.index}（${facet.text}）：由已确认事实 ${evidence} 共同约束，对应${actionLabel} ${actions}，并由 ${validation} 独立验收。`
+      : `Facet ${facet.index} (${facet.text}): jointly grounded by confirmed evidence ${evidence}, mapped to ${actionLabel} ${actions}, and independently accepted by ${validation}.`];
+  });
 }
 
 function buildInsufficientEvidencePlan(input: { goal: string; language: "zh" | "en" }): string {
@@ -1445,53 +1945,191 @@ function summarizeGoalForPlanChange(goal: string, language: "zh" | "en"): string
   return compact.replace(/[。.!?？；;:：]\s*$/, "");
 }
 
+function buildDeterministicContractFindings(
+  contractMismatchKinds: string[] = [],
+  language: "zh" | "en",
+): string[] {
+  const findings: string[] = [];
+  for (const kind of contractMismatchKinds) {
+    if (kind.startsWith("unregistered_command:")) {
+      const command = kind.slice("unregistered_command:".length);
+      findings.push(language === "zh"
+        ? `已确认调用方使用命令 \`${command}\`，但后端 \`generate_handler!\` 注册表中没有对应处理器。`
+        : `The caller invokes command \`${command}\`, but the backend \`generate_handler!\` registry has no matching handler.`);
+    } else if (kind.startsWith("event_listener_api:")) {
+      const eventName = kind.slice("event_listener_api:".length);
+      findings.push(language === "zh"
+        ? `已确认生产方通过 Tauri event transport 发出 \`${eventName}\`，消费方却使用 DOM \`addEventListener\`，两端事件 API 契约不一致。`
+        : `The producer emits \`${eventName}\` through the Tauri event transport while the consumer uses DOM \`addEventListener\`; the event API contracts do not match.`);
+    } else if (kind.startsWith("missing_permission:")) {
+      const plugin = kind.slice("missing_permission:".length);
+      findings.push(language === "zh"
+        ? `已确认应用配置了 \`${plugin}\` 插件，但 capability 证据中没有对应的 \`${plugin}:*\` 权限。`
+        : `The app configures the \`${plugin}\` plugin, but the capability evidence contains no matching \`${plugin}:*\` permission.`);
+    } else if (kind.startsWith("config_value_mismatch:")) {
+      const key = kind.slice("config_value_mismatch:".length);
+      findings.push(language === "zh"
+        ? `已确认同一启动链路的多个配置对 \`${key}\` 给出了不同值。`
+        : `Multiple configurations in the same startup path define conflicting values for \`${key}\`.`);
+    }
+  }
+  return findings;
+}
+
+function buildDeterministicConfigurationDecisionLines(
+  contracts: PlanConfigurationContractAssessment[] = [],
+  language: "zh" | "en",
+): string[] {
+  return contracts
+    .filter((contract) => contract.status === "consistent")
+    .map((contract) => {
+      const targets = contract.targets.map((target) => `\`${target}\``).join(language === "zh" ? "、" : ", ");
+      const values = contract.values.map((value) => `\`${value}\``).join(language === "zh" ? "、" : ", ");
+      return language === "zh"
+        ? `保持 ${targets} 中已确认一致的 \`${contract.key}\` 值 ${values}，不把该配置列为修复改动；通过实际启动输出验证结论，若失败原因指向其他边界，再生成最小计划修订。`
+        : `Keep the confirmed matching \`${contract.key}\` value ${values} in ${targets} unchanged rather than inventing a configuration fix; validate the conclusion from actual startup output and create a minimal plan revision only if it identifies another boundary.`;
+    });
+}
+
+function escapePlanRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function evidenceSupportsContractMismatch(evidence: string, kind: string): boolean {
+  const value = String(evidence || "");
+  if (kind.startsWith("unregistered_command:")) {
+    const command = kind.slice("unregistered_command:".length);
+    return new RegExp(`(?:command_invoke_contract\\s*\\(${escapePlanRegExp(command)}\\)|handler_contract\\s*\\()`, "i")
+      .test(value);
+  }
+  if (kind.startsWith("event_listener_api:")) {
+    const eventName = kind.slice("event_listener_api:".length);
+    return new RegExp(
+      `event_(?:emit|dom_listener|tauri_listener)_contract\\s*\\(${escapePlanRegExp(eventName)}\\)`,
+      "i",
+    ).test(value);
+  }
+  if (kind.startsWith("missing_permission:")) {
+    const plugin = kind.slice("missing_permission:".length);
+    const pluginPattern = escapePlanRegExp(plugin).replace(/\\-/g, "[-_]");
+    return (
+      /(?:^|[\\/])capabilit(?:y|ies)[\\/]/i.test(value) &&
+        /permission_contract\s*\(/i.test(value)
+    ) ||
+      new RegExp(`(?:@tauri-apps/plugin-|tauri_plugin_)${pluginPattern}`, "i").test(value);
+  }
+  if (kind.startsWith("config_value_mismatch:")) {
+    return /\b(?:devUrl|dev[_-]?server|development server|port)\b\s*["']?\s*[:=]|--port(?:=|\s+)|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*\d{2,5}/i
+      .test(value);
+  }
+  return false;
+}
+
+function prioritizeContractEvidence(
+  evidence: string[],
+  contractMismatchKinds: string[] = [],
+): string[] {
+  if (contractMismatchKinds.length === 0) return evidence;
+  const contractEvidence = evidence.filter((item) =>
+    contractMismatchKinds.some((kind) => evidenceSupportsContractMismatch(item, kind))
+  );
+  return uniquePlanItems([...contractEvidence, ...evidence], evidence.length, 320, true);
+}
+
 function buildDeterministicChangeLine(input: {
   file: string;
   goal: string;
   evidence: string;
   language: "zh" | "en";
+  contractMismatchKinds?: string[];
 }): string {
   const file = input.file;
   const lowerFile = file.toLowerCase();
-  const goalAndFile = `${input.goal}\n${file}`;
   const evidence = input.evidence || (
     input.language === "zh" ? "已读项目证据确认该文件在影响范围内" : "read project evidence confirms this file is in scope"
   );
+  const localContractMismatchKinds = (input.contractMismatchKinds || []).filter((kind) => {
+    if (kind.startsWith("unregistered_command:")) {
+      return /\.rs$/i.test(lowerFile) && /handler_contract\s*\(/i.test(evidence);
+    }
+    if (kind.startsWith("event_listener_api:")) {
+      const eventName = kind.slice("event_listener_api:".length);
+      return evidence.includes(`event_dom_listener_contract(${eventName})`);
+    }
+    if (kind.startsWith("missing_permission:")) {
+      return /(?:^|\/)capabilit(?:y|ies)\//i.test(lowerFile) && /permission_contract\s*\(/i.test(evidence);
+    }
+    if (kind.startsWith("config_value_mismatch:")) {
+      return /\b(?:devUrl|dev[_-]?server|development server|port)\b\s*["']?\s*[:=]|--port(?:=|\s+)|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*\d{2,5}/i.test(evidence);
+    }
+    return false;
+  });
+  const missingCommands = localContractMismatchKinds
+    .filter((kind) => kind.startsWith("unregistered_command:"))
+    .map((kind) => kind.slice("unregistered_command:".length))
+    .filter(Boolean);
+  const mismatchedEvents = localContractMismatchKinds
+    .filter((kind) => kind.startsWith("event_listener_api:"))
+    .map((kind) => kind.slice("event_listener_api:".length))
+    .filter(Boolean);
+  const missingPluginPermissions = localContractMismatchKinds
+    .filter((kind) => kind.startsWith("missing_permission:"))
+    .map((kind) => kind.slice("missing_permission:".length))
+    .filter(Boolean);
+  const mismatchedConfigurationKeys = localContractMismatchKinds
+    .filter((kind) => kind.startsWith("config_value_mismatch:"))
+    .map((kind) => kind.slice("config_value_mismatch:".length))
+    .filter(Boolean);
+  const pluginPermissionList = missingPluginPermissions
+    .map((plugin) => `\`${plugin}:default\``)
+    .join(", ");
+  const commandList = missingCommands.map((command) => `\`${command}\``).join(", ");
+  const eventList = mismatchedEvents.map((eventName) => `\`${eventName}\``).join(", ");
   if (input.language === "en") {
-    if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usecsvparser/.test(lowerFile)) {
-      if (/creator\s*(?:field)?[\s\S]{0,80}creatorName|creatorName[\s\S]{0,80}creator/i.test(input.goal)) {
-        return `Update \`${file}\` so the CSV \`creator\` (and existing localized fallback) is assigned to \`creatorName\` while preserving the legacy \`creator\` value. Grounding evidence: ${evidence}.`;
-      }
-      return `Fix CSV column-to-order-field mapping in \`${file}\` so Dashboard-required fields such as creator/course/date/status/amount are not dropped. Grounding evidence: ${evidence}.`;
+    if (/\.rs$/i.test(lowerFile) && missingCommands.length > 0) {
+      return `Implement the missing Tauri command${missingCommands.length > 1 ? "s" : ""} ${commandList} in \`${file}\` and add ${missingCommands.length > 1 ? "them" : "it"} to the existing \`generate_handler!\` registration with an argument, return, and error contract that matches the caller. Grounding evidence: ${evidence}.`;
     }
-    if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /dashboardstore/.test(lowerFile)) {
-      return `Fix the imported-data path in \`${file}\` so Dashboard metrics and charts consume the uploaded CSV data instead of stale/default state. Grounding evidence: ${evidence}.`;
+    if (/\.(?:[cm]?js|jsx|tsx?)$/i.test(lowerFile) && (missingCommands.length > 0 || mismatchedEvents.length > 0)) {
+      const actions = [
+        missingCommands.length > 0
+          ? `keep the ${commandList} invocation aligned with the registered Rust argument and return contract`
+          : "",
+        mismatchedEvents.length > 0
+          ? `replace the DOM listener for ${eventList} with the Tauri event API, consume its payload, and dispose the listener during teardown`
+          : "",
+      ].filter(Boolean).join("; ");
+      return `Update \`${file}\` to ${actions}. Grounding evidence: ${evidence}.`;
     }
-    if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usechartdata|dashboard|chart/.test(lowerFile)) {
-      return `Align chart data derivation in \`${file}\` with the imported order records for rankings, trends, month-over-month metrics, and order status. Grounding evidence: ${evidence}.`;
+    if (/capabilit(?:y|ies).+\.json$/i.test(lowerFile) && missingPluginPermissions.length > 0) {
+      return `Add the minimum permissions required by the configured Tauri plugins to \`${file}\` (${pluginPermissionList}), without widening unrelated capabilities. Grounding evidence: ${evidence}.`;
     }
-    if (DARK_THEME_GOAL_RE.test(goalAndFile) && /app\.tsx|index\.css|theme|style|dashboard|component/.test(lowerFile)) {
-      return `Update \`${file}\` to use coherent dark-theme surfaces, tokens, and chart/container contrast instead of light backgrounds with isolated dark boxes. Grounding evidence: ${evidence}.`;
+    if (mismatchedConfigurationKeys.length > 0) {
+      return `Align \`${mismatchedConfigurationKeys.join("`, `")}\` in \`${file}\` with the other read-backed configuration owner in the same startup path, changing only the side that differs from the canonical development command. Grounding evidence: ${evidence}.`;
     }
-    return `Update \`${file}\` at the confirmed implementation boundary for the user goal, then verify the affected behavior with the focused check. Grounding evidence: ${evidence}.`;
+    return `Update \`${file}\` at the implementation boundary confirmed by the evidence, preserve unrelated behavior, and verify the affected user-goal path. Grounding evidence: ${evidence}.`;
   }
 
-  if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usecsvparser/.test(lowerFile)) {
-    if (/creator\s*(?:字段)?[\s\S]{0,80}creatorName|creatorName[\s\S]{0,80}creator/i.test(input.goal)) {
-      return `修改 \`${file}\`，把 CSV 的 \`creator\`（及现有中文列名回退值）明确赋给 \`creatorName\`，同时保留旧 \`creator\` 字段以维持兼容。依据证据：${evidence}。`;
-    }
-    return `修复 \`${file}\` 的 CSV 列名到订单字段映射，确保 creator、course、date、status、amount 等 Dashboard 所需字段不会在导入时丢失。依据证据：${evidence}。`;
+  if (/\.rs$/i.test(lowerFile) && missingCommands.length > 0) {
+    return `在 \`${file}\` 中实现缺失的 Tauri 命令 ${commandList}，并加入现有 \`generate_handler!\` 注册；命令参数、返回值和错误传播必须与调用方契约一致。依据证据：${evidence}。`;
   }
-  if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /dashboardstore/.test(lowerFile)) {
-    return `修复 \`${file}\` 中导入数据进入 Dashboard 状态与统计源的链路，确保课程排行、销售趋势、月度环比和订单状态读取上传后的真实数据。依据证据：${evidence}。`;
+  if (/\.(?:[cm]?js|jsx|tsx?)$/i.test(lowerFile) && (missingCommands.length > 0 || mismatchedEvents.length > 0)) {
+    const actions = [
+      missingCommands.length > 0
+        ? `让 ${commandList} 调用的参数与 Rust 命令注册契约一致`
+        : "",
+      mismatchedEvents.length > 0
+        ? `把 ${eventList} 的 DOM 监听改为 Tauri event API，读取其 payload，并在卸载时释放监听器`
+        : "",
+    ].filter(Boolean).join("；");
+    return `修改 \`${file}\`：${actions}。依据证据：${evidence}。`;
   }
-  if (CSV_DASHBOARD_GOAL_RE.test(goalAndFile) && /usechartdata|dashboard|chart/.test(lowerFile)) {
-    return `调整 \`${file}\` 的图表数据派生，让排行、趋势、环比和状态图表与导入后的订单记录保持一致。依据证据：${evidence}。`;
+  if (/capabilit(?:y|ies).+\.json$/i.test(lowerFile) && missingPluginPermissions.length > 0) {
+    return `在 \`${file}\` 中加入已配置 Tauri 插件所需的最小权限（${pluginPermissionList}），并保持其他 capability 不变。依据证据：${evidence}。`;
   }
-  if (DARK_THEME_GOAL_RE.test(goalAndFile) && /app\.tsx|index\.css|theme|style|dashboard|component/.test(lowerFile)) {
-    return `更新 \`${file}\` 的深色模式表面、主题 token、图表/容器对比度，避免白底页面上局部套深色框的割裂显示。依据证据：${evidence}。`;
+  if (mismatchedConfigurationKeys.length > 0) {
+    return `将 \`${file}\` 中的 \`${mismatchedConfigurationKeys.join("`、`")}\` 与同一启动链路的另一已读配置所有者对齐，只修改偏离规范开发命令的一侧。依据证据：${evidence}。`;
   }
-  return `更新 \`${file}\` 中已确认影响用户目标的字段、状态或界面处理，并用聚焦验证确认行为变化。依据证据：${evidence}。`;
+  return `在 \`${file}\` 的证据已确认实现边界实施必要改动，保持无关行为不变，并验证对应用户目标链路。依据证据：${evidence}。`;
 }
 
 function buildCodexStylePlanArtifact(input: {
@@ -1500,36 +2138,67 @@ function buildCodexStylePlanArtifact(input: {
   files: string[];
   constraints: string[];
   language: "zh" | "en";
+  contractMismatchKinds?: string[];
+  configurationContracts?: PlanConfigurationContractAssessment[];
+  facetMappingSource?: string;
 }): string {
+  const facets = extractNumberedUserGoalFacets(input.userGoal);
+  const facetTraceabilityEnabled = facets.length >= 2;
   const goal = compactPlanLine(input.userGoal, 420);
-  const rawEvidence = uniqueCompactLines(input.evidence, 10, 220);
+  const rawEvidence = prioritizeContractEvidence(
+    uniqueCompactLines(input.evidence, 24, 320, true),
+    input.contractMismatchKinds,
+  );
   const concreteEvidence = rawEvidence.filter(isConcretePlanEvidence);
   const meaningfulConcreteEvidence = concreteEvidence.filter(isMeaningfulConcretePlanEvidence);
-  const evidence = (meaningfulConcreteEvidence.length > 0
+  const evidenceCandidates = meaningfulConcreteEvidence.length > 0
     ? meaningfulConcreteEvidence
     : rawEvidence.filter((item) => !isBroadDiscoveryEvidence(item))
-  ).slice(0, 8);
+  ;
+  const evidence = prioritizeContractEvidence(
+    evidenceCandidates,
+    input.contractMismatchKinds,
+  ).slice(0, 12);
   const rawFiles = uniqueCompactLines(input.files, 10, 160).filter(isActionablePlanFile);
   const filesWithConcreteEvidence = rawFiles.filter((file) =>
     evidence.some((item) => evidenceMentionsFile(item, file))
   );
   const files = (filesWithConcreteEvidence.length > 0 ? filesWithConcreteEvidence : rawFiles).slice(0, 8);
   const constraints = uniqueCompactLines(input.constraints, 5, 200);
-  const commands = uniqueValidationCommands([
+  const explicitCommands = uniqueValidationCommands([
     // Explicit user-reported startup failures are acceptance criteria, not
     // incidental prose. Put them first so a generic compiler fallback cannot
     // displace the requested launch check.
     ...extractExplicitInteractiveStartupCommands(goal),
     ...extractInlineCommands([...evidence, ...constraints]),
   ]);
-  const deterministicValidationCommand = commands[0] || (() => {
-    if (files.some((file) => /\.rs$/i.test(file))) return "cargo check";
-    if (files.some((file) => /\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(file))) return "npm run build";
-    if (files.some((file) => /\.py$/i.test(file))) return "python -m pytest";
-    if (files.some((file) => /\.go$/i.test(file))) return "go test ./...";
-    if (files.some((file) => /\.cs$/i.test(file))) return "dotnet test";
-    return "";
-  })();
+  const inferredCommands = [
+    files.some((file) => /^src-tauri\/.*\.rs$/i.test(file))
+      ? "cargo check --manifest-path src-tauri/Cargo.toml"
+      : files.some((file) => /\.rs$/i.test(file)) ? "cargo check" : "",
+    files.some((file) => /\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(file)) ? "npm run build" : "",
+    files.some((file) => /\.py$/i.test(file)) ? "python -m pytest" : "",
+    files.some((file) => /\.go$/i.test(file)) ? "go test ./..." : "",
+    files.some((file) => /\.cs$/i.test(file)) ? "dotnet test" : "",
+  ].filter(Boolean);
+  const commands = uniqueValidationCommands([...explicitCommands, ...inferredCommands]);
+  const desktopRuntimeRequired =
+    /(?:mac(?:os)?|windows|linux|desktop|桌面|窗口|原生|native|dialog|button|click|select|drag|drop|keyboard|shortcut|鼠标|按钮|操作|交互|行为|功能|显示|无反应|失效|无法|启动|点击|选择|拖拽|键盘|快捷键)/i.test(goal) &&
+    /(?:tauri|src-tauri|electron|wails|desktop)/i.test(evidence.join("\n"));
+  const contractFindings = buildDeterministicContractFindings(
+    input.contractMismatchKinds,
+    input.language,
+  );
+  const configurationDecisions = buildDeterministicConfigurationDecisionLines(
+    input.configurationContracts,
+    input.language,
+  );
+  const confirmedEvidence = uniqueCompactLines(
+    [...contractFindings, ...evidence],
+    16,
+    320,
+    true,
+  );
   const hasGroundedEvidence = Boolean(goal) &&
     evidence.length > 0 &&
     meaningfulConcreteEvidence.length > 0 &&
@@ -1548,26 +2217,45 @@ function buildCodexStylePlanArtifact(input: {
           goal,
           evidence: pickEvidenceForFile(evidence, file),
           language: "en",
+          contractMismatchKinds: input.contractMismatchKinds,
         }))
       : [`Implement the confirmed data/reporting change for ${goalSummary} using the inspected evidence: ${evidence[0]}.`];
+    const validation = [
+      ...buildFacetValidationPlanLines({ facets, language: "en" }),
+      ...(commands.length > 0
+        ? buildDeterministicValidationPlanLines({ commands, language: "en", desktopRuntimeRequired })
+        : ["Run the focused test, build, or browser/desktop validation for the touched subsystem and record the result."]),
+    ];
+    const traceability = buildFacetTraceabilityPlanLines({
+      facets,
+      evidenceLines: confirmedEvidence,
+      changeLines: changes,
+      decisionLines: configurationDecisions,
+      language: "en",
+      mappingSource: input.facetMappingSource,
+    });
     return [
       "# Plan",
       formatCodexPlanSection("Summary", [
         `User goal: ${goal}`,
         `Grounding evidence covers ${scope}.`,
       ]),
-      formatCodexPlanSection("Confirmed Evidence", evidence),
-      formatCodexPlanSection("Key Changes", changes),
-      formatCodexPlanSection("Public APIs / Interfaces / Types", [
-        "No public API, interface, or type change is planned by default; if implementation proves one is required, pause before widening scope.",
-      ]),
-      formatCodexPlanSection("Test Plan", commands.length > 0
-        ? buildDeterministicValidationPlanLines({ commands, language: "en" })
-        : deterministicValidationCommand
-        ? [`Run \`${deterministicValidationCommand}\` and inspect exit status/output.`]
+      formatCodexPlanSection("Confirmed Evidence", labelPlanReferenceLines(confirmedEvidence, "E", facetTraceabilityEnabled)),
+      formatCodexPlanSection("Key Changes", labelPlanReferenceLines(changes, "C", facetTraceabilityEnabled)),
+      ...(configurationDecisions.length > 0
+        ? [formatCodexPlanSection("Decisions / Constraints", labelPlanReferenceLines(configurationDecisions, "D", facetTraceabilityEnabled))]
+        : []),
+      formatCodexPlanSection("Public APIs / Interfaces / Types", input.contractMismatchKinds?.length
+        ? [
+            "Keep the repair inside the app's internal command, event-payload, and capability contracts; do not expose a new external API.",
+          ]
         : [
-            "Run the focused test, build, or browser/desktop validation for the touched subsystem and record the result.",
+            "No public API, interface, or type change is planned by default; if implementation proves one is required, pause before widening scope.",
           ]),
+      formatCodexPlanSection("Test Plan", labelPlanReferenceLines(validation, "V", facetTraceabilityEnabled)),
+      ...(traceability.length > 0
+        ? [formatCodexPlanSection("Requirement Facet Traceability", traceability)]
+        : []),
       formatCodexPlanSection("Assumptions / Defaults", constraints.length > 0
       ? constraints
       : [
@@ -1584,26 +2272,41 @@ function buildCodexStylePlanArtifact(input: {
         goal,
         evidence: pickEvidenceForFile(evidence, file),
         language: "zh",
+        contractMismatchKinds: input.contractMismatchKinds,
       }))
     : [`基于已确认的证据实施与“${goalSummary}”相关的数据/报表改动：${evidence[0]}。`];
+  const validation = [
+    ...buildFacetValidationPlanLines({ facets, language: "zh" }),
+    ...(commands.length > 0
+      ? buildDeterministicValidationPlanLines({ commands, language: "zh", desktopRuntimeRequired })
+      : ["运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。"]),
+  ];
+  const traceability = buildFacetTraceabilityPlanLines({
+    facets,
+    evidenceLines: confirmedEvidence,
+    changeLines: changes,
+    decisionLines: configurationDecisions,
+    language: "zh",
+    mappingSource: input.facetMappingSource,
+  });
   return [
     "# 计划",
     formatCodexPlanSection("摘要", [
       `用户目标：${goal}`,
       `定向证据已覆盖：${scope}。`,
     ]),
-    formatCodexPlanSection("已确认证据", evidence),
-    formatCodexPlanSection("关键改动", changes),
-    formatCodexPlanSection("公共 API / 接口 / 类型", [
-      "默认不新增或修改公共 API、接口或类型；如果执行中证明必须扩大接口范围，先暂停确认。",
-    ]),
-    formatCodexPlanSection("测试方案", commands.length > 0
-      ? buildDeterministicValidationPlanLines({ commands, language: "zh" })
-      : deterministicValidationCommand
-      ? [`运行 \`${deterministicValidationCommand}\` 并检查退出码与输出。`]
-      : [
-          "运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。",
-        ]),
+    formatCodexPlanSection("已确认证据", labelPlanReferenceLines(confirmedEvidence, "E", facetTraceabilityEnabled)),
+    formatCodexPlanSection("关键改动", labelPlanReferenceLines(changes, "C", facetTraceabilityEnabled)),
+    ...(configurationDecisions.length > 0
+      ? [formatCodexPlanSection("决策与约束", labelPlanReferenceLines(configurationDecisions, "D", facetTraceabilityEnabled))]
+      : []),
+    formatCodexPlanSection("公共 API / 接口 / 类型", input.contractMismatchKinds?.length
+      ? ["修复限定在应用内部的命令、事件 payload 与 capability 契约内，不新增对外 API。"]
+      : ["默认不新增或修改公共 API、接口或类型；如果执行中证明必须扩大接口范围，先暂停确认。"]),
+    formatCodexPlanSection("测试方案", labelPlanReferenceLines(validation, "V", facetTraceabilityEnabled)),
+    ...(traceability.length > 0
+      ? [formatCodexPlanSection("需求分面追踪", traceability)]
+      : []),
     formatCodexPlanSection("假设与默认值", constraints.length > 0
       ? constraints
       : [
@@ -1655,7 +2358,7 @@ export function canonicalizePlanArtifactContent(input: {
   ], 4, 2000, true);
   const visibleEvidenceLines = collectLinesFromSections(sections, [
     /(?:已读证据|证据引用|证据|读取|调查|Evidence|References|Read Evidence|Context Read)/i,
-  ], 6, 2000, true);
+  ], 6, 2000, true, false, true);
   const inlineEvidenceLines = uniquePlanItems(raw.split(/\r?\n/).filter((line) => {
     const cleaned = cleanPlanItem(line, 2000, true);
     return isConcretePlanEvidence(cleaned) || isBroadDiscoveryEvidence(cleaned);
@@ -1682,10 +2385,11 @@ export function canonicalizePlanArtifactContent(input: {
     true
   );
   const evidenceLines = uniquePlanItems([
-    ...structuredEvidence,
+    ...structuredEvidence.slice(0, 6),
+    ...visibleEvidenceLines.slice(0, 4),
+    ...structuredEvidence.slice(6),
     ...externalEvidence,
     ...activityEvidence,
-    ...visibleEvidenceLines,
     ...inlineEvidenceLines,
     providedContextCount > 0
       ? buildProvidedContextObservation({ turnContext: input.turnContext, language })
@@ -1724,8 +2428,11 @@ export function canonicalizePlanArtifactContent(input: {
   }
   const stepLines = uniquePlanItems([
     ...collectLinesFromSections(sections, [
-      /(?:执行|实施|方案|计划|步骤|修复|落地|Approach|Implementation|Plan of Work|Plan|Steps|Fix)/i,
-    ], 8, 4000, true),
+      /(?:执行|实施|方案|计划|步骤|修复|改动|变更|落地|Approach|Implementation|Changes?|Plan of Work|Plan|Steps|Fix)/i,
+    ], 8, 4000, true, false, true),
+    ...collectLinesFromSections(sections, [
+      /(?:整改|执行|实施|步骤|修复|改动|变更|落地|Approach|Implementation|Changes?|Plan of Work|Steps|Fix)/i,
+    ], 8, 4000, true, true, true),
   ], 8, 4000, true).filter((line) =>
     !/(?:与用户目标直接相关的最小改动|smallest user-goal-specific change|落实已批准目标|approved goal)/i.test(line)
   );
@@ -1735,11 +2442,10 @@ export function canonicalizePlanArtifactContent(input: {
     ], 5, 2000, true),
   ], 5, 2000, true);
   const validationLines = collectLinesFromSections(sections, [
-    // Match validation sections by role, not by a loose substring. In the
-    // logged MD Viewer incident, “未验证假设” and “步骤 3：验证…” consumed the
-    // five-line limit before the real 测试方案 section was reached.
+    // Match the validation role instead of loose substrings such as
+    // unverified assumptions. Descendants of a validation heading are kept.
     /^(?:验证(?:方式|标准|方案|步骤)?|测试(?:方案|计划|场景|步骤)?|构建(?:检查)?|验收(?:标准|方案)?|Validation(?: Plan| Steps| Standards?)?|Testing|Test Plan|Acceptance(?: Criteria| Plan)?|Build(?: Checks?)?|Checks?)$/i,
-  ], 8, 4000, true);
+  ], 8, 4000, true, true, true);
 
   const hasRequiredSignals = [
     goalLines.length > 0,
@@ -1769,7 +2475,7 @@ export function canonicalizePlanArtifactContent(input: {
     ? concreteEvidenceLines
     : evidenceLines.filter((line) => !isBroadDiscoveryEvidence(line));
   const fileDerivedChangeLines = fileLines.slice(0, 4).flatMap((file) => {
-    const grounding = pickEvidenceForFile(fileChangeEvidence, file);
+    const grounding = fileChangeEvidence.find((item) => evidenceMentionsFile(item, file)) || "";
     if (!grounding) return [];
     return [buildDeterministicChangeLine({
       file,
@@ -1806,7 +2512,7 @@ export function canonicalizePlanArtifactContent(input: {
     return [
       "# Plan",
       formatCodexPlanSection("Summary", summaryLines),
-      formatCodexPlanSection("Confirmed Evidence", evidenceLines.slice(0, 6)),
+      formatCodexPlanSection("Confirmed Evidence", evidenceLines.slice(0, 10)),
       formatCodexPlanSection("Key Changes", keyChangeLines),
       formatCodexPlanSection("Public APIs / Interfaces / Types", resolvedApiLines),
       formatCodexPlanSection("Test Plan", validationLines),
@@ -1817,7 +2523,7 @@ export function canonicalizePlanArtifactContent(input: {
   return [
     "# 计划",
     formatCodexPlanSection("摘要", summaryLines),
-    formatCodexPlanSection("已确认证据", evidenceLines.slice(0, 6)),
+    formatCodexPlanSection("已确认证据", evidenceLines.slice(0, 10)),
     formatCodexPlanSection("关键改动", keyChangeLines),
     formatCodexPlanSection("公共 API / 接口 / 类型", resolvedApiLines),
     formatCodexPlanSection("测试方案", validationLines),
@@ -2029,7 +2735,6 @@ export function materializePlanArtifactFromVisibleText(input: {
   if (!raw) return rejectPlanMaterialization({ reason: "empty", replyOptions: extracted.replyOptions });
   if (PROTOCOL_NOISE_RE.test(raw)) return rejectPlanMaterialization({ reason: "protocol_noise" });
   if (TOOL_LOG_NOISE_RE.test(raw)) return rejectPlanMaterialization({ reason: "tool_log_noise" });
-  if (raw.length < 280) return rejectPlanMaterialization({ reason: "too_short" });
 
   const language = detectMaterializationLanguage({
     content: raw,
@@ -2069,7 +2774,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   if (!validation.ok && validation.reason === "excessive_plan_code_dump") {
     const compacted = compactImplementationCodeBlocks(content);
     const compactedValidation = validateActionablePlanArtifact(compacted);
-    if (compactedValidation.ok) {
+    if (compacted !== content) {
       content = compacted;
       validation = compactedValidation;
       source = "deterministically_compacted_visible_plan";
@@ -2093,7 +2798,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   // Final validation: if still not ok and canonicalization can help, try it
   if (
     !validation.ok &&
-    !/generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|generic_theme_token_plan|placeholder_validation_plan|non_executable_test_plan|excessive_plan_code_dump/i.test(validation.reason || "")
+    !/insufficient_grounded_evidence|generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|placeholder_validation_plan|non_executable_test_plan|excessive_plan_code_dump/i.test(validation.reason || "")
   ) {
     const canonical = canonicalizePlanArtifactContent({
       content,
@@ -2124,17 +2829,47 @@ export function materializePlanArtifactFromVisibleText(input: {
     });
   }
 
-  const grounding = validatePlanEvidenceGrounding({
+  let grounding = validatePlanEvidenceGrounding({
     content,
     evidence: input.evidence,
     evidenceRecords: input.evidenceRecords,
     recentToolActivity: input.recentToolActivity,
     evidenceBundle: input.evidenceBundle,
   });
+  let changeGroundingRepaired = false;
+  if (!grounding.ok && grounding.reason === "missing_grounded_plan_change_target") {
+    const repaired = repairMissingGroundedPlanChangeTargets({
+      content,
+      userGoal: input.userGoal,
+      evidence: input.evidence,
+      evidenceRecords: input.evidenceRecords,
+      files: input.files,
+      recentToolActivity: input.recentToolActivity,
+      language,
+    });
+    if (repaired) {
+      const repairedStructural = validateActionablePlanArtifact(repaired);
+      if (repairedStructural.ok) {
+        content = repaired;
+        changeGroundingRepaired = true;
+        source = input.sourceHint === "deterministic_evidence"
+          ? "deterministic_evidence"
+          : "grounding_repaired_visible_plan";
+        grounding = validatePlanEvidenceGrounding({
+          content,
+          evidence: input.evidence,
+          evidenceRecords: input.evidenceRecords,
+          recentToolActivity: input.recentToolActivity,
+          evidenceBundle: input.evidenceBundle,
+        });
+      }
+    }
+  }
   if (!grounding.ok) {
     if (grounding.reason === "missing_plan_evidence_section") {
       const repaired = repairMissingPlanEvidenceSection({
         content,
+        evidence: input.evidence,
         evidenceRecords: input.evidenceRecords,
         recentToolActivity: input.recentToolActivity,
         language,
@@ -2151,7 +2886,9 @@ export function materializePlanArtifactFromVisibleText(input: {
           content = repaired;
           source = input.sourceHint === "deterministic_evidence"
             ? "deterministic_evidence"
-            : "evidence_section_repaired_visible_plan";
+            : changeGroundingRepaired
+              ? "grounding_repaired_visible_plan"
+              : "evidence_section_repaired_visible_plan";
         } else {
           return rejectPlanMaterialization({
             reason: repairedQuality.reason || grounding.reason || "evidence_grounding",
@@ -2258,7 +2995,7 @@ export function composeReviewablePlanFromEvidence(input: {
       files.length ? `Relevant paths:\n${formatBullets(files, "No path summary available.")}` : "",
       constraints.length ? `Constraints:\n${formatBullets(constraints, "No extra constraints.")}` : "",
       "",
-      `${targetPath} must use the Codex app plan shape: title, Summary, Key Changes or Implementation Changes, Public APIs / Interfaces / Types, Test Plan, and Assumptions / Defaults. Mention screenshot/attachment observations, read evidence, and confirmed facts inside the concise summary only when they are real. If a critical choice blocks execution, ask with \`<user_options>\` before approval instead of burying it as an open question.`,
+      `${targetPath} must make the objective, grounded implementation or design decisions, affected boundaries, and executable acceptance checks clear. Adapt headings to the work: bug fixes may include root cause, features may use architecture/components/data flow, and research or verification plans may use decisions/constraints instead of source edits. Include API/type changes and assumptions only when relevant. If a critical choice blocks execution, ask with \`<user_options>\` before approval instead of burying it as an open question.`,
     ].filter(Boolean).join("\n");
   }
 
@@ -2281,7 +3018,7 @@ export function composeReviewablePlanFromEvidence(input: {
     files.length ? `相关路径：\n${formatBullets(files, "暂无路径摘要。")}` : "",
     constraints.length ? `约束：\n${formatBullets(constraints, "暂无额外约束。")}` : "",
     "",
-    `${targetPath} 必须使用 Codex app 计划结构：标题、摘要、关键实现改动、公共 API/接口/类型、测试方案、假设与默认值。截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞章节。真正阻塞执行的选择必须在批准前用 \`<user_options>\` 提问，不要伪装成计划尾部的开放问题。`,
+    `${targetPath} 必须清楚表达目标、已有依据、实现或设计决策、受影响边界与可执行验收，但标题和章节应随任务类型调整：修复类可写根因，新增功能可写架构/组件/数据流，调研或验证类可写决策/约束而不强行虚构源码改动。公共 API/类型变化和假设只在相关时写入。真正阻塞执行的选择必须在批准前用 \`<user_options>\` 提问，不要伪装成计划尾部的开放问题。`,
   ].filter(Boolean).join("\n");
 }
 
@@ -2293,6 +3030,7 @@ export function composePlanArtifactFromEvidence(input: {
   constraints?: string[];
   language?: "zh" | "en";
   evidenceBundle?: PlanEvidenceBundle;
+  facetMappingSource?: string;
 }): string {
   const language = input.language === "en" ? "en" : "zh";
   const sanitized = sanitizePlanEvidenceInput({
@@ -2315,5 +3053,12 @@ export function composePlanArtifactFromEvidence(input: {
       ? input.evidenceBundle.constraints
       : sanitized.constraints,
     language,
+    contractMismatchKinds: input.evidenceBundle
+      ? assessPlanClosureEvidence(input.evidenceBundle).contractMismatchKinds
+      : [],
+    configurationContracts: input.evidenceBundle
+      ? assessPlanConfigurationContracts(input.evidenceBundle)
+      : [],
+    facetMappingSource: input.facetMappingSource,
   });
 }

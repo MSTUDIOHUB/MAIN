@@ -33,7 +33,7 @@ type TryClosePlanWithEvidence = (
   trigger: string,
   details?: {
     consecutiveEmptyResponseCount?: number;
-    rejectedVisibleChars?: number;
+    rejectedVisibleCandidate?: boolean;
     toolCallCount?: number;
     replyOptionCount?: number;
   },

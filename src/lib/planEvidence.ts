@@ -7,6 +7,7 @@ import {
   type PlanExecutionEvidenceEntry,
 } from "./workflowModels";
 import type { ToolDiffPreview } from "./toolDiff";
+import { preserveNumberedUserGoalLines } from "./numberedGoalFacets";
 
 export interface PlanEvidenceFactInput {
   tool: string;
@@ -35,6 +36,27 @@ export interface PlanEvidenceBundle {
   verificationTargets: string[];
 }
 
+export interface PlanClosureEvidenceAssessment {
+  ready: boolean;
+  reason:
+    | "bundle_not_ready"
+    | "confirmed_change_rationale_available"
+    | "contract_counterpart_unverified"
+    | "change_targets_lack_confirmed_rationale";
+  objectiveTargetMatches: number;
+  defectSignalMatches: number;
+  contractMismatchMatches: number;
+  contractMismatchKinds: string[];
+  unresolvedContractKinds: string[];
+}
+
+export interface PlanConfigurationContractAssessment {
+  key: string;
+  status: "consistent" | "mismatch";
+  values: string[];
+  targets: string[];
+}
+
 export interface PlanCandidateChange {
   text: string;
   targetRef: string;
@@ -56,6 +78,7 @@ const SOURCE_TARGET_RE = /\.(?:tsx?|jsx?|mjs|cjs|rs|py|go|swift|java|kt|cs|cpp|c
 const PLAN_PATH_RE = /(?:^|[\\/])\.MAIN[\\/]plans[\\/]/i;
 const LOW_SIGNAL_TARGET_RE = /(?:^|[\\/])(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i;
 const PATH_LIKE_RE = /(?:^|[\s`'"(])([A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z0-9]+)(?=$|[\s`'"),:;])/g;
+const MAX_PLAN_EVIDENCE_FACTS = 24;
 
 function stableHash(value: string): string {
   let hash = 2166136261;
@@ -119,11 +142,252 @@ function objectiveMentionsTarget(objective: string, target: string): boolean {
 }
 
 function summaryExposesTargetDefect(summary: string): boolean {
-  return /(?:\b(?:missing|incorrect|wrong|broken|unimplemented|stubbed?|fails?|failure|no-op|empty handler|does not|doesn't|without|never\s+(?:assigns?|maps?|registers?|listens?|returns?|sets?|handles?|calls?|emits?))\b|\bonly\s+(?:returns?|sets?|writes?|handles?|calls?|emits?)\b|缺少|缺失|错误|不正确|失效|失败|未实现|未注册|未监听|未等待|从未(?:映射|注册|监听|返回|设置|处理|调用)|没有(?:映射|注册|监听|返回|设置|处理)|为空|空实现|只(?:返回|设置|写入|处理|调用)|仅(?:返回|设置|写入|处理|调用))/i.test(summary);
+  const withoutDiagnosticMessages = String(summary || "")
+    .replace(/console\.(?:error|warn|log)\s*\([^)]*\)/gi, " ");
+  return /(?:\b(?:missing|incorrect(?:ly)?|wrong(?:ly)?|broken|unimplemented|stubbed?|fails?|failure|no-op|empty handler|does not|doesn't|without|never\s+(?:assigns?|maps?|registers?|listens?|returns?|sets?|handles?|calls?|emits?))\b|\bonly\s+(?:returns?|sets?|writes?|handles?|calls?|emits?)\b|缺少|缺失|错误|不正确|失效|失败|未实现|未注册|未监听|未等待|从未(?:映射|注册|监听|返回|设置|处理|调用)|没有(?:映射|注册|监听|返回|设置|处理)|为空|空实现|只(?:返回|设置|写入|处理|调用)|仅(?:返回|设置|写入|处理|调用))/i.test(withoutDiagnosticMessages);
 }
 
 function summaryExposesImplementationStructure(summary: string): boolean {
-  return /(?:\b(?:function|handler|listener|event|command|invoke|emit|payload|callback|builder|setup|registers?|listens?|returns?|forwards?|loads?|stores?)\b|(?:window|app|tauri|dialog)\s*[.:]|[_-](?:event|handler)\b|函数|处理器|监听|事件|命令|调用|回调|注册|返回|转发|加载|存储|配置)/i.test(summary);
+  return /(?:\b(?:function|handler|listener|event|command|invoke|emit|payload|callback|builder|setup|registers?|listens?|returns?|forwards?|loads?|stores?|permissions?|capabilit(?:y|ies)|plugins?)\b|\b(?:handler|permission|event_(?:emit|dom_listener|tauri_listener))_contract\b|(?:window|app|tauri|dialog)\s*[.:]|[_-](?:event|handler)\b|函数|处理器|监听|事件|命令|调用|回调|注册|返回|转发|加载|存储|配置|权限|能力|插件)/i.test(summary);
+}
+
+interface ComparableConfigurationObservation {
+  key: "development_server_port";
+  value: string;
+}
+
+function extractComparableConfigurationObservations(
+  fact: Pick<PlanEvidenceFact, "target" | "summary">,
+): ComparableConfigurationObservation[] {
+  const target = String(fact.target || "");
+  const summary = String(fact.summary || "");
+  const looksLikeDevelopmentConfig =
+    /(?:^|[\\/])(?:[^\\/]*(?:config|conf)[^\\/]*)\.[A-Za-z0-9]+$/i.test(target) ||
+    /\b(?:devUrl|dev[_-]?server|development server|beforeDevCommand|localhost|127\.0\.0\.1)\b/i.test(summary);
+  if (!looksLikeDevelopmentConfig) return [];
+
+  const values = new Set<string>();
+  for (const match of summary.matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])\s*:\s*(\d{2,5})/gi)) {
+    if (match[1]) values.add(match[1]);
+  }
+  for (const match of summary.matchAll(/(?:\bdevUrl\b|\bdev[_-]?server(?:\s+port)?\b|\bdevelopment server(?:\s+port)?\b|\bport\b)\s*["']?\s*[:=]\s*["']?(\d{2,5})\b/gi)) {
+    if (match[1]) values.add(match[1]);
+  }
+  for (const match of summary.matchAll(/--port(?:=|\s+)(\d{2,5})\b/gi)) {
+    if (match[1]) values.add(match[1]);
+  }
+  return [...values].map((value) => ({ key: "development_server_port", value }));
+}
+
+function objectiveRequestsComparableConfiguration(objective: string): boolean {
+  return /\b(?:dev(?:elopment)?(?:\s+server)?|startup|launch|serve|port)\b|开发(?:服务器|服务)?|启动|端口/i.test(
+    String(objective || ""),
+  );
+}
+
+function collectConfigurationContractAssessments(
+  facts: PlanEvidenceFact[],
+  objective: string,
+): PlanConfigurationContractAssessment[] {
+  if (!objectiveRequestsComparableConfiguration(objective)) return [];
+  const grouped = new Map<string, { values: Set<string>; targets: Set<string> }>();
+  for (const fact of facts) {
+    for (const observation of extractComparableConfigurationObservations(fact)) {
+      const entry = grouped.get(observation.key) || {
+        values: new Set<string>(),
+        targets: new Set<string>(),
+      };
+      entry.values.add(observation.value);
+      entry.targets.add(fact.target);
+      grouped.set(observation.key, entry);
+    }
+  }
+  return [...grouped.entries()]
+    .filter(([, entry]) => entry.targets.size > 1)
+    .map(([key, entry]) => ({
+      key,
+      status: entry.values.size > 1 ? "mismatch" as const : "consistent" as const,
+      values: [...entry.values],
+      targets: [...entry.targets],
+    }));
+}
+
+export function assessPlanConfigurationContracts(
+  bundle: PlanEvidenceBundle,
+): PlanConfigurationContractAssessment[] {
+  return collectConfigurationContractAssessments(bundle.facts, bundle.objective);
+}
+
+function planEvidenceFactPriority(fact: PlanEvidenceFact, objective: string, index: number): number {
+  let score = Math.min(index, 10) / 100;
+  if (objectiveMentionsTarget(objective, fact.target)) score += 20;
+  if (summaryExposesTargetDefect(fact.summary)) score += 10;
+  if (/(?:command_invoke|handler|event_(?:emit|dom_listener|tauri_listener)|permission)_contract\s*\(|@tauri-apps\/plugin-|tauri_plugin_/i.test(fact.summary)) {
+    score += 12;
+  }
+  if (extractComparableConfigurationObservations(fact).length > 0) score += 10;
+  if (summaryExposesImplementationStructure(fact.summary)) score += 2;
+  if (/^(?:read_file|read_file_window|read_document|code_ast_query|find_symbol_references|git_diff)$/i.test(fact.tool)) score += 1;
+  return score;
+}
+
+function collectContractMismatchKinds(facts: PlanEvidenceFact[], objective = ""): string[] {
+  const invokedCommands = new Set<string>();
+  const registeredCommands = new Set<string>();
+  const emittedEvents = new Set<string>();
+  const tauriListenedEvents = new Set<string>();
+  const domListenedEvents = new Set<string>();
+  const configuredPlugins = new Set<string>();
+  const capabilityEvidence: string[] = [];
+  let hasCompleteHandlerList = false;
+
+  for (const fact of facts) {
+    const summary = String(fact.summary || "");
+    for (const match of summary.matchAll(/(?:\binvoke\s*\(\s*[`'"]([A-Za-z0-9_.:-]+)[`'"]|command_invoke_contract\s*\(([^)]+)\))/gi)) {
+      const command = match[1] || match[2] || "";
+      if (command) invokedCommands.add(command);
+    }
+    for (const match of summary.matchAll(/(?:generate_handler!\s*\[([\s\S]*?)\]|handler_contract\s*\(([^)]*)\))/gi)) {
+      hasCompleteHandlerList = true;
+      for (const identifier of (match[1] || match[2] || "").match(/[A-Za-z_][A-Za-z0-9_]*/g) || []) {
+        registeredCommands.add(identifier);
+      }
+    }
+    for (const match of summary.matchAll(/(?:\.emit\s*\(\s*[`'"]([A-Za-z0-9_.:-]+)[`'"]|event_emit_contract\s*\(([^)]+)\))/gi)) {
+      const eventName = match[1] || match[2] || "";
+      if (eventName) emittedEvents.add(eventName);
+    }
+    for (const match of summary.matchAll(/(?:(?:^|[^A-Za-z0-9_])listen\s*\(\s*[`'"]([A-Za-z0-9_.:-]+)[`'"]|event_tauri_listener_contract\s*\(([^)]+)\))/gi)) {
+      const eventName = match[1] || match[2] || "";
+      if (eventName) tauriListenedEvents.add(eventName);
+    }
+    for (const match of summary.matchAll(/(?:addEventListener\s*\(\s*[`'"]([A-Za-z0-9_.:-]+)[`'"]|event_dom_listener_contract\s*\(([^)]+)\))/gi)) {
+      const eventName = match[1] || match[2] || "";
+      if (eventName) domListenedEvents.add(eventName);
+    }
+    for (const match of summary.matchAll(/(?:@tauri-apps\/plugin-([a-z0-9_-]+)|tauri_plugin_([a-z0-9_]+))/gi)) {
+      const plugin = String(match[1] || match[2] || "").replace(/_/g, "-").toLowerCase();
+      if (plugin) configuredPlugins.add(plugin);
+    }
+    if (
+      /(?:^|\/)capabilities\//i.test(fact.target) &&
+      /(?:permissions|permission_contract)/i.test(summary) &&
+      (/(?:permission_contract\s*\([^)]*\)|permissions[\s\S]*\])/i.test(summary))
+    ) {
+      capabilityEvidence.push(summary);
+    }
+  }
+
+  const mismatches: string[] = [];
+  if (hasCompleteHandlerList) {
+    for (const command of invokedCommands) {
+      if (!registeredCommands.has(command)) mismatches.push(`unregistered_command:${command}`);
+    }
+  }
+  for (const eventName of emittedEvents) {
+    if (domListenedEvents.has(eventName) && !tauriListenedEvents.has(eventName)) {
+      mismatches.push(`event_listener_api:${eventName}`);
+    }
+  }
+  const capabilityPermissions = capabilityEvidence.join("\n");
+  if (capabilityPermissions) {
+    for (const plugin of configuredPlugins) {
+      const permissionPrefix = new RegExp(`(?:^|[^A-Za-z0-9_-])${escapeRegExp(plugin)}:[A-Za-z0-9_*-]+`, "i");
+      if (!permissionPrefix.test(capabilityPermissions)) {
+        mismatches.push(`missing_permission:${plugin}`);
+      }
+    }
+  }
+  for (const contract of collectConfigurationContractAssessments(facts, objective)) {
+    if (contract.status === "mismatch") {
+      mismatches.push(`config_value_mismatch:${contract.key}`);
+    }
+  }
+  return [...new Set(mismatches)].slice(0, 8);
+}
+
+function collectUnresolvedContractKinds(
+  facts: PlanEvidenceFact[],
+  changeTargets: string[],
+): string[] {
+  const frontendPlugins = new Map<string, Set<string>>();
+  const backendPlugins = new Map<string, Set<string>>();
+  let hasCapabilityPermissionEvidence = false;
+  for (const fact of facts) {
+    const summary = String(fact.summary || "");
+    if (
+      /(?:^|\/)capabilities\//i.test(fact.target.replace(/\\/g, "/")) &&
+      /permission_contract\s*\(/i.test(summary)
+    ) {
+      hasCapabilityPermissionEvidence = true;
+    }
+    for (const match of summary.matchAll(/@tauri-apps\/plugin-([a-z0-9_-]+)/gi)) {
+      const plugin = String(match[1] || "").replace(/_/g, "-").toLowerCase();
+      if (!plugin) continue;
+      const targets = frontendPlugins.get(plugin) || new Set<string>();
+      targets.add(fact.target);
+      frontendPlugins.set(plugin, targets);
+    }
+    for (const match of summary.matchAll(/tauri_plugin_([a-z0-9_]+)/gi)) {
+      const plugin = String(match[1] || "").replace(/_/g, "-").toLowerCase();
+      if (!plugin) continue;
+      const targets = backendPlugins.get(plugin) || new Set<string>();
+      targets.add(fact.target);
+      backendPlugins.set(plugin, targets);
+    }
+  }
+  if (hasCapabilityPermissionEvidence) return [];
+
+  const normalizedChangeTargets = new Set(
+    changeTargets.map((target) => target.replace(/\\/g, "/").toLowerCase()),
+  );
+  return [...frontendPlugins.keys()]
+    .filter((plugin) => backendPlugins.has(plugin))
+    .filter((plugin) => {
+      const owners = [
+        ...(frontendPlugins.get(plugin) || []),
+        ...(backendPlugins.get(plugin) || []),
+      ];
+      return owners.some((target) =>
+        normalizedChangeTargets.has(target.replace(/\\/g, "/").toLowerCase())
+      );
+    })
+    .map((plugin) => `permission_contract:${plugin}`)
+    .slice(0, 8);
+}
+
+function factIsChangeTargetForContractMismatch(
+  fact: PlanEvidenceFact,
+  mismatchKinds: string[],
+): boolean {
+  const summary = String(fact.summary || "");
+  const normalizedTarget = fact.target.replace(/\\/g, "/").toLowerCase();
+  for (const kind of mismatchKinds) {
+    if (kind.startsWith("unregistered_command:") && /(?:generate_handler!\s*\[|handler_contract\s*\()/i.test(summary)) {
+      return true;
+    }
+    if (kind.startsWith("event_listener_api:")) {
+      const eventName = kind.slice("event_listener_api:".length);
+      const escapedEventName = escapeRegExp(eventName);
+      if (new RegExp(`(?:addEventListener\\s*\\(\\s*[\u0060'"]${escapedEventName}[\u0060'"]|event_dom_listener_contract\\s*\\(${escapedEventName}\\))`, "i").test(summary)) {
+        return true;
+      }
+    }
+    if (
+      kind.startsWith("missing_permission:") &&
+      /(?:^|\/)capabilities\//i.test(normalizedTarget) &&
+      /(?:permissions|permission_contract)/i.test(summary)
+    ) {
+      return true;
+    }
+    if (kind.startsWith("config_value_mismatch:")) {
+      const key = kind.slice("config_value_mismatch:".length);
+      if (extractComparableConfigurationObservations(fact).some((observation) => observation.key === key)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 function isActionableChangeTarget(fact: PlanEvidenceFact, objective: string): boolean {
@@ -148,11 +412,11 @@ export function buildPlanEvidenceBundle(input: {
   evidenceRecords?: PlanEvidenceFactInput[];
   files?: string[];
 }): PlanEvidenceBundle {
-  const objective = compact(extractPrimaryUserRequestText(input.objective) || input.objective, 600);
+  const rawObjective = extractPrimaryUserRequestText(input.objective) || input.objective;
+  const objective = preserveNumberedUserGoalLines(rawObjective, 600) || compact(rawObjective, 600);
   const constraints = unique(input.constraints || [], 8);
-  const facts = (input.evidenceRecords || [])
+  const semanticFacts = (input.evidenceRecords || [])
     .filter((record) => record.status === "succeeded" && isSemanticFact(record))
-    .slice(-16)
     .map((record, index) => {
       const summary = compact(record.summary, 320);
       const target = compact(record.target, 220);
@@ -165,17 +429,35 @@ export function buildPlanEvidenceBundle(input: {
         hash,
       };
     });
+  const selectedFactIndexes = new Set(
+    semanticFacts
+      .map((fact, index) => ({
+        score: planEvidenceFactPriority(fact, objective, index),
+        index,
+      }))
+      .sort((left, right) => right.score - left.score || right.index - left.index)
+      .slice(0, MAX_PLAN_EVIDENCE_FACTS)
+      .map((entry) => entry.index),
+  );
+  const facts = semanticFacts
+    .filter((_fact, index) => selectedFactIndexes.has(index))
+    .map((fact, index) => ({ ...fact, id: `fact-${index + 1}-${fact.hash}` }));
   const strictFactTargets = facts
     .filter((fact) => isActionableChangeTarget(fact, objective))
     .map((fact) => fact.target);
+  const contractMismatchKinds = collectContractMismatchKinds(facts, objective);
+  const contractFactTargets = facts
+    .filter((fact) => factIsChangeTargetForContractMismatch(fact, contractMismatchKinds))
+    .map((fact) => fact.target);
+  const groundedFactTargets = unique([...strictFactTargets, ...contractFactTargets], 12);
   // Symptom-only requests usually do not name implementation paths. When the
   // targeted reads already expose concrete source structure, retain those
   // paths as the evidence-backed scope instead of reporting zero targets and
   // forcing the model into another broad read loop. This fallback is used only
   // when no stricter defect/path match exists, so related-consumer reads do not
   // widen an already grounded plan.
-  const factTargets = strictFactTargets.length > 0
-    ? strictFactTargets
+  const factTargets = groundedFactTargets.length > 0
+    ? groundedFactTargets
     : facts
       .filter((fact) =>
         SOURCE_TARGET_RE.test(fact.target) &&
@@ -219,18 +501,63 @@ export function isPlanEvidenceBundleReady(bundle: PlanEvidenceBundle): boolean {
  * symptom-only request.  Auto-materializing from those excerpts produces a
  * formally shaped but operationally empty checklist.
  */
-export function hasDeterministicPlanMaterializationEvidence(bundle: PlanEvidenceBundle): boolean {
-  if (!isPlanEvidenceBundleReady(bundle)) return false;
+export function assessPlanClosureEvidence(
+  bundle: PlanEvidenceBundle,
+): PlanClosureEvidenceAssessment {
+  if (!isPlanEvidenceBundleReady(bundle)) {
+    return {
+      ready: false,
+      reason: "bundle_not_ready",
+      objectiveTargetMatches: 0,
+      defectSignalMatches: 0,
+      contractMismatchMatches: 0,
+      contractMismatchKinds: [],
+      unresolvedContractKinds: [],
+    };
+  }
   const normalizedTargets = new Set(bundle.changeTargets.map((target) =>
     target.replace(/\\/g, "/").toLowerCase(),
   ));
-  return bundle.facts.some((fact) => {
+  let objectiveTargetMatches = 0;
+  let defectSignalMatches = 0;
+  for (const fact of bundle.facts) {
     const target = fact.target.replace(/\\/g, "/").toLowerCase();
-    return normalizedTargets.has(target) && (
-      objectiveMentionsTarget(bundle.objective, fact.target) ||
-      summaryExposesTargetDefect(fact.summary)
-    );
-  });
+    if (!normalizedTargets.has(target)) continue;
+    if (objectiveMentionsTarget(bundle.objective, fact.target)) {
+      objectiveTargetMatches += 1;
+    }
+    if (summaryExposesTargetDefect(fact.summary)) {
+      defectSignalMatches += 1;
+    }
+  }
+  const contractMismatchKinds = collectContractMismatchKinds(bundle.facts, bundle.objective);
+  const contractMismatchMatches = contractMismatchKinds.length;
+  const unresolvedContractKinds = collectUnresolvedContractKinds(
+    bundle.facts,
+    bundle.changeTargets,
+  );
+  const hasConfirmedRationale =
+    objectiveTargetMatches > 0 ||
+    defectSignalMatches > 0 ||
+    contractMismatchMatches > 0;
+  const ready = hasConfirmedRationale && unresolvedContractKinds.length === 0;
+  return {
+    ready,
+    reason: unresolvedContractKinds.length > 0
+      ? "contract_counterpart_unverified"
+      : ready
+        ? "confirmed_change_rationale_available"
+        : "change_targets_lack_confirmed_rationale",
+    objectiveTargetMatches,
+    defectSignalMatches,
+    contractMismatchMatches,
+    contractMismatchKinds,
+    unresolvedContractKinds,
+  };
+}
+
+export function hasDeterministicPlanMaterializationEvidence(bundle: PlanEvidenceBundle): boolean {
+  return assessPlanClosureEvidence(bundle).ready;
 }
 
 export function formatPlanEvidenceBundleForModel(
@@ -312,9 +639,9 @@ export function buildPlanCandidate(input: {
   content: string;
   bundle: PlanEvidenceBundle;
 }): PlanCandidate {
-  const summary = sectionLines(input.content, /^(?:摘要|Summary)$/i);
-  const findings = sectionLines(input.content, /^(?:已确认证据|已读证据|证据引用|已确认事实|真实发现|发现|Confirmed Evidence|Read Evidence|Evidence References?|Confirmed Facts|Findings)$/i);
-  const changeLines = sectionLines(input.content, /^(?:关键改动|关键实现改动|实现改动|Key Changes|Implementation Changes)$/i);
+  const summary = sectionLines(input.content, /^(?:摘要|目标|用户目标|概述|背景|Summary|Goal|User Goal|Overview|Objective|Background)$/i);
+  const findings = sectionLines(input.content, /^(?:已确认证据|已读证据|证据引用|已确认事实|真实发现|发现|当前状态|当前实现|现有架构|项目背景|实现约束|Confirmed Evidence|Read Evidence|Evidence References?|Confirmed Facts|Findings|Current State|Current Implementation|Existing Architecture|Project Context|Implementation Constraints)$/i);
+  const changeLines = sectionLines(input.content, /^(?:关键改动|关键实现改动|实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|落地方案|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Plan of Work)$/i);
   const changes = changeLines.map((text) => {
     const targetRef = findTargetRef(text, input.bundle);
     const evidenceRefs = input.bundle.facts
@@ -328,7 +655,7 @@ export function buildPlanCandidate(input: {
     findings,
     changes,
     interfaces: sectionLines(input.content, /^(?:公共\s*API.*|接口|类型|Public APIs?.*|Interfaces?|Types?)$/i),
-    tests: sectionLines(input.content, /^(?:测试方案|测试计划|验证方案|Test Plan|Testing|Tests?)$/i),
+    tests: sectionLines(input.content, /^(?:测试方案|测试计划|验证方案|验收标准|成功标准|完成标准|Test Plan|Testing|Tests?|Validation|Acceptance Criteria|Success Criteria|Definition of Done)$/i),
     assumptions: sectionLines(input.content, /^(?:假设与默认值|默认假设|假设|默认值|Assumptions.*|Defaults)$/i),
     blockingChoices: sectionLines(input.content, /^(?:阻塞选择|待用户选择|Blocking Choices?|User Choices?)$/i),
   };
@@ -337,13 +664,12 @@ export function buildPlanCandidate(input: {
 export function validatePlanCandidate(candidate: PlanCandidate, expectedBundleHash: string): string[] {
   const failures: string[] = [];
   if (!expectedBundleHash || candidate.bundleHash !== expectedBundleHash) failures.push("evidence_bundle_hash_mismatch");
-  if (candidate.summary.length === 0) failures.push("missing_summary");
-  if (candidate.findings.length === 0) failures.push("missing_findings");
-  if (candidate.changes.length === 0) failures.push("missing_changes");
+  // PlanCandidate is a best-effort projection used to bind recognized change
+  // lines to the frozen evidence bundle. The preceding artifact quality gate
+  // already validates a task-appropriate goal, work path, and verification;
+  // requiring canonical headings again here would reject valid feature,
+  // design, research, and verification plans solely because of their titles.
   if (candidate.changes.some((change) => !change.targetRef || change.evidenceRefs.length === 0)) failures.push("ungrounded_changes");
-  if (candidate.interfaces.length === 0) failures.push("missing_interfaces");
-  if (candidate.tests.length === 0) failures.push("missing_tests");
-  if (candidate.assumptions.length === 0) failures.push("missing_assumptions");
   return [...new Set(failures)];
 }
 

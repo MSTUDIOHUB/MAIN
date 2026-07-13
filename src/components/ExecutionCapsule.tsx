@@ -269,7 +269,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     onSelectReplyOption?.({
       label: summaryLabel,
       value: finalValue,
-      action: "execute_once",
       source: "custom_reply",
     });
   };

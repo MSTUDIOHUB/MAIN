@@ -33,6 +33,7 @@ export type PlanNoToolRecoveryResult = {
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
+  planFacetMappingSource: string;
   planArtifactQualityRejected: boolean;
   planAutoScaffoldPromptIssued: boolean;
   planEvidenceRecoveryPasses: number;
@@ -62,7 +63,7 @@ export function shouldAttemptPlanEvidenceMaterialization(input: {
   if (input.recoveryAction === "ask_user") return false;
   return input.finishReason === "length" ||
     input.qualityRejectCount >= 2 ||
-    /excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
+    /too_short|excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
       String(input.qualityGateReason || ""),
     );
 }
@@ -265,6 +266,7 @@ export async function handlePlanNoToolRecovery(input: {
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
+  planFacetMappingSource: string;
   planArtifactQualityRejected?: boolean;
   planAutoScaffoldPromptIssued: boolean;
   setPlanRuntimePhase: (
@@ -276,7 +278,7 @@ export async function handlePlanNoToolRecovery(input: {
   waitForPlanApprovalIfNeeded: () => Promise<boolean>;
   tryClosePlanWithEvidence: (trigger: string, details?: {
     consecutiveEmptyResponseCount?: number;
-    rejectedVisibleChars?: number;
+    rejectedVisibleCandidate?: boolean;
     toolCallCount?: number;
     replyOptionCount?: number;
   }) => Promise<PlanClosureAttemptResult>;
@@ -313,6 +315,7 @@ export async function handlePlanNoToolRecovery(input: {
     planQualityRejectCount: initialPlanQualityRejectCount,
     planLastQualityGateReason,
     planLastMissingSections: initialPlanLastMissingSections,
+    planFacetMappingSource: initialPlanFacetMappingSource,
     setPlanRuntimePhase,
     waitForPlanApprovalIfNeeded,
     tryClosePlanWithEvidence,
@@ -323,6 +326,7 @@ export async function handlePlanNoToolRecovery(input: {
   let planQualityRejectCount = initialPlanQualityRejectCount ?? 0;
   let currentPlanLastQualityGateReason = planLastQualityGateReason;
   let planLastMissingSections = initialPlanLastMissingSections ?? [];
+  let currentPlanFacetMappingSource = initialPlanFacetMappingSource || "";
   let currentPlanArtifactQualityRejected = planArtifactQualityRejected === true;
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
   let currentPlanEvidenceRecoveryPasses = planEvidenceRecoveryPasses;
@@ -334,6 +338,7 @@ export async function handlePlanNoToolRecovery(input: {
     planQualityRejectCount,
     planLastQualityGateReason: currentPlanLastQualityGateReason,
     planLastMissingSections,
+    planFacetMappingSource: currentPlanFacetMappingSource,
     planArtifactQualityRejected: currentPlanArtifactQualityRejected,
     planAutoScaffoldPromptIssued,
     planEvidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
@@ -367,6 +372,18 @@ export async function handlePlanNoToolRecovery(input: {
       ok: false,
       reason: materialized.reason || "quality_gate",
     });
+    const candidateMappingSource = sourceVisibleText.trim();
+    if (
+      quality.recoveryAction === "targeted_evidence" &&
+      candidateMappingSource.length >= 120
+    ) {
+      currentPlanFacetMappingSource = candidateMappingSource.slice(0, 24_000);
+      logAgentEvent("plan_facet_mapping_source_retained", {
+        iteration,
+        qualityGateReason: quality.reason || materialized.reason || "quality_gate",
+        sourceChars: currentPlanFacetMappingSource.length,
+      });
+    }
     const recovery = handlePlanQualityRecoveryAfterVisibleMaterialization({
       callbacks,
       workflowMode,
@@ -393,6 +410,26 @@ export async function handlePlanNoToolRecovery(input: {
     planClosureEvidenceRecoveryIssued = recovery.planClosureEvidenceRecoveryIssued;
     currentPlanEvidenceRecoveryPasses = recovery.planEvidenceRecoveryPasses;
 
+    const newlyIssuedClosureEvidenceRecovery =
+      !!recovery.pendingPlanRuntimeRecoveryPrompt &&
+      recovery.planClosureEvidenceRecoveryIssued &&
+      !priorPlanClosureEvidenceRecoveryIssued;
+    if (newlyIssuedClosureEvidenceRecovery) {
+      logAgentEvent("plan_evidence_materialization_deferred", {
+        iteration,
+        reason: "targeted_closure_evidence_pending",
+        qualityGateReason: recovery.planLastQualityGateReason,
+        qualityRejectCount: recovery.planQualityRejectCount,
+        evidenceRecoveryPasses: recovery.planEvidenceRecoveryPasses,
+      });
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: recovery.pendingPlanRuntimeRecoveryPrompt || "",
+      });
+      return finish("continue");
+    }
+
     const shouldAttemptEvidenceMaterialization = shouldAttemptPlanEvidenceMaterialization({
       recoveryAction: quality.recoveryAction,
       qualityRejectCount: recovery.planQualityRejectCount,
@@ -408,6 +445,7 @@ export async function handlePlanNoToolRecovery(input: {
         recentToolActivity: recentPlanToolActivity,
         attemptedTargets: attemptedPlanWriteTargets,
         turnContext: turnInputContextSignals,
+        facetMappingSource: currentPlanFacetMappingSource || sourceVisibleText,
       });
       logAgentEvent(
         evidenceMaterialized.ok
@@ -448,6 +486,46 @@ export async function handlePlanNoToolRecovery(input: {
             ? "MAIN 已根据当前用户目标和已确认的只读证据生成并校验计划产物，等待审阅。"
             : "MAIN generated and validated the Plan artifact from the current user goal and confirmed read-only evidence; it is ready for review.",
         }));
+      }
+
+      if (
+        evidenceMaterialized.quality?.recoveryAction === "targeted_evidence" &&
+        !planClosureEvidenceRecoveryIssued &&
+        currentPlanEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES
+      ) {
+        const materializationReason = evidenceMaterialized.reason || "deterministic_plan_needs_targeted_evidence";
+        currentPlanArtifactQualityRejected = true;
+        currentPlanLastQualityGateReason = materializationReason;
+        planClosureEvidenceRecoveryIssued = true;
+        setPlanRuntimePhase("needs_evidence", materializationReason);
+        const targetedPrompt = buildPlanClosureEvidenceRecoveryPrompt(
+          callbacks.getPreferredLanguage(),
+          materializationReason,
+          latestUserPromptText,
+        );
+        logAgentEvent("plan_evidence_materialization_targeted_recovery", {
+          iteration,
+          qualityGateReason: recovery.planLastQualityGateReason,
+          materializationReason,
+          qualityRejectCount: recovery.planQualityRejectCount,
+          evidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
+        });
+        callbacks.onStatusChange("running");
+        callbacks.appendMessage({ role: "user", content: targetedPrompt });
+        return finish("continue");
+      }
+
+      if (
+        evidenceMaterialized.quality?.recoveryAction === "targeted_evidence" &&
+        planClosureEvidenceRecoveryIssued
+      ) {
+        logAgentEvent("plan_evidence_materialization_targeted_recovery_suppressed", {
+          iteration,
+          reason: "closure_evidence_recovery_already_issued",
+          materializationReason: evidenceMaterialized.reason || "",
+          qualityRejectCount: recovery.planQualityRejectCount,
+          evidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
+        });
       }
 
       if (
@@ -627,7 +705,7 @@ export async function handlePlanNoToolRecovery(input: {
 
     if (usedPlanRecoveryPrompt) {
       const closureResult = await tryClosePlanWithEvidence("plan_recovery_prompt_limit", {
-        rejectedVisibleChars: sourceVisibleText.length,
+        rejectedVisibleCandidate: sourceVisibleText.trim().length > 0,
         toolCallCount: effectiveToolCallCount,
         replyOptionCount: finalReplyOptionsCount,
       });
@@ -647,6 +725,7 @@ export async function handlePlanNoToolRecovery(input: {
             content: buildPlanClosureEvidenceRecoveryPrompt(
               callbacks.getPreferredLanguage(),
               currentPlanLastQualityGateReason || "plan closure failed",
+              latestUserPromptText,
             ),
           });
           return finish("continue");
@@ -719,7 +798,7 @@ export async function handlePlanNoToolRecovery(input: {
     consecutiveNoToolCount += 1;
     if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
       const closureResult = await tryClosePlanWithEvidence("force_plan_continuation_limit", {
-        rejectedVisibleChars: sourceVisibleText.length,
+        rejectedVisibleCandidate: sourceVisibleText.trim().length > 0,
         toolCallCount: effectiveToolCallCount,
         replyOptionCount: finalReplyOptionsCount,
       });

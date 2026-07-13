@@ -409,6 +409,19 @@ test("plan closure guard runs before empty checkpoint when read-only evidence ex
     }),
     false,
   );
+
+  assert.equal(
+    shouldAttemptPlanClosureGuard({
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasReviewablePlanArtifacts: false,
+      evidenceCount: 2,
+      rejectedVisibleCandidate: true,
+      toolCallCount: 0,
+      replyOptionCount: 0,
+    }),
+    true,
+  );
 });
 
 test("plan read-only batches defer no-progress pause to convergence guard", () => {

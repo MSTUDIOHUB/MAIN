@@ -95,6 +95,7 @@ export interface DiscoverAllMcpToolsOptions {
   useFailureBackoff?: boolean;
   failureBackoffMs?: number;
   nowMs?: number;
+  logFailures?: boolean;
 }
 
 class MCPRequestError extends Error {
@@ -632,14 +633,16 @@ export async function discoverAllMcpTools(
         };
         statusSnapshots.push(failureSnapshot);
         rememberMcpDiscoveryFailure(server, failureSnapshot, options);
-        console.warn(`[MCP] Failed to discover tools from ${server.name} (${server.url}): ${diagnostic.message}`);
-        console.warn("[MCP] Discovery diagnostics", {
-          server: server.name,
-          url: server.url,
-          category: diagnostic.category,
-          status: diagnostic.status,
-          responseSnippet: diagnostic.responseSnippet,
-        });
+        if (options.logFailures !== false) {
+          console.warn(`[MCP] Failed to discover tools from ${server.name} (${server.url}): ${diagnostic.message}`);
+          console.warn("[MCP] Discovery diagnostics", {
+            server: server.name,
+            url: server.url,
+            category: diagnostic.category,
+            status: diagnostic.status,
+            responseSnippet: diagnostic.responseSnippet,
+          });
+        }
       }
     }),
   );

@@ -135,6 +135,17 @@ test("assistant output routing auto-continues only non-blocking unapproved plan 
     }),
     false,
   );
+  assert.equal(
+    shouldAutoContinueNonBlockingPlanChoices({
+      suppressPlanContinuationReplyOptions: true,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      isPlanApproved: false,
+      hasSubstantivePlanAssistantText: true,
+    }),
+    false,
+    "strip the non-blocking options but preserve a substantive plan candidate for materialization",
+  );
 });
 
 test("closed drafting surface reopens bounded targeted evidence for a read-only continuation request", () => {
@@ -166,6 +177,32 @@ test("closed drafting surface reopens bounded targeted evidence for a read-only 
   assert.deepEqual(exhausted, {
     action: "defer",
     reason: "suppressed_tool_ready_evidence_missing_visible_plan_after_recovery",
+  });
+
+  const modelOwnedGroundingChoice = resolveClosedPlanReadOnlyContinuation({
+    suppressPlanContinuationReplyOptions: true,
+    replyOptions: [
+      {
+        label: "直接基于当前发现生成计划",
+        value: "直接基于当前发现生成计划（假设采用当前映射）",
+        source: "explicit_user_options",
+      },
+      {
+        label: "我来确认具体的字段使用情况",
+        value: "我来确认具体的字段使用情况",
+        source: "explicit_user_options",
+      },
+    ],
+    toolCallCount: 0,
+    workflowMode: "plan",
+    isPlanApproved: false,
+    availableToolCount: 0,
+    planRuntimePhase: "drafting",
+    targetedRecoveryPasses: 0,
+  });
+  assert.deepEqual(modelOwnedGroundingChoice, {
+    action: "targeted_evidence",
+    reason: "suppressed_tool_ready_evidence_missing_visible_plan",
   });
 });
 

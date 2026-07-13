@@ -64,6 +64,7 @@ import {
   buildPlanRecoveryPromptFromContext,
   resolvePlanClosureArtifactKind,
 } from "./orchestrator/planOrchestration";
+import { stripControlPromptForPlanFallback } from "./orchestrator/prompts/planPrompts";
 
 export {
   buildExecuteXmlTextActionRecoveryPrompt,
@@ -93,6 +94,7 @@ import type { AppConfig, Skill } from "./appTypes";
 import {
   buildPlanTaskEvidenceAudit,
   canonicalizePlanArtifactPath,
+  classifyPlanArtifactQualityResult,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -188,8 +190,8 @@ import {
   type PlanMaterializationSource,
 } from "./planMaterialization";
 import {
+  assessPlanClosureEvidence,
   buildPlanEvidenceBundle,
-  hasDeterministicPlanMaterializationEvidence,
   isPlanEvidenceBundleReady,
   type PlanEvidenceBundle,
 } from "./planEvidence";
@@ -2259,18 +2261,6 @@ export function resolveApprovedPlanValidationBoundary(input: {
   return "none";
 }
 
-function stripControlPromptForPlanFallback(text: string): string {
-  return String(text || "")
-    .replace(/^本轮处于 PLAN 模式。[\s\S]*?\n\n/i, "")
-    .replace(/^This turn is in PLAN mode\.[\s\S]*?\n\n/i, "")
-    .replace(/```[\s\S]*?```/g, " ")
-    .replace(/<tool_use>[\s\S]*?<\/tool_use>/gi, " ")
-    .replace(/<(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>[\s\S]*?<\/(?:analysis|thought|thinking|reasoning)>/gi, " ")
-    .replace(/<\/?(?:analysis|thought|thinking|reasoning)(?:\s[^>]*)?>/gi, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
 function isPlanRuntimeInstructionMemory(text: string): boolean {
   return /(?:本轮处于\s*PLAN\s*模式|This turn is in PLAN mode|上一条\s*Plan\s*回复|previous Plan reply|PLAN_REPEAT_READ_LIMIT|PLAN_QUALITY_GATE|如果确实缺少关键业务选择|critical business choice|真正阻塞执行的选择|plan direction is unclear|用\s*`?\s*<?user_options>?\s*`?\s*提问|ask with\s*`?\s*<?user_options>?|可见计划必须|visible\s+`?<proposed_plan>`|创建\s*plan\.md\s*是\s*runtime|MAIN\s+runtime\s+会物化|物化为\s*`?\.MAIN\/plans\/plan\.md|Codex app\s*计划结构|Codex app plan shape|tsx\s*约束|imageParts\s*[0-9]|turn_intake|不要重复扫描目录|Do not repeat directory scans|不要为了完成规划而调用|Do not call\s+`?(?:write_file|replace_in_file)`?\s+just to finish planning)/i.test(
     String(text || "").replace(/\\/g, "/"),
@@ -2670,7 +2660,7 @@ export function shouldAttemptPlanClosureGuard(input: {
   evidenceCount: number;
   consecutiveEmptyResponseCount?: number;
   usedPlanRecoveryPrompt?: boolean;
-  rejectedVisibleChars?: number;
+  rejectedVisibleCandidate?: boolean;
   toolCallCount?: number;
   replyOptionCount?: number;
 }): boolean {
@@ -2679,7 +2669,7 @@ export function shouldAttemptPlanClosureGuard(input: {
   if ((input.toolCallCount ?? 0) > 0 || (input.replyOptionCount ?? 0) > 0) return false;
   if ((input.consecutiveEmptyResponseCount ?? 0) >= 2) return true;
   if (input.usedPlanRecoveryPrompt) return true;
-  return typeof input.rejectedVisibleChars === "number" && input.rejectedVisibleChars > 0 && input.rejectedVisibleChars < 280;
+  return input.rejectedVisibleCandidate === true;
 }
 
 export function shouldDeferNoProgressStopToPlanReadOnlyConvergence(input: {
@@ -4447,6 +4437,7 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
   recentToolActivity?: PlanToolActivitySummary[];
   attemptedTargets?: string[];
   turnContext?: TurnInputContextSignals;
+  facetMappingSource?: string;
 }): Promise<PlanMaterializationResultForLoop> {
   const closureInput = collectPlanClosureMaterializationInput(
     input.callbacks,
@@ -4455,14 +4446,16 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     input.userGoal || "",
   );
   const hasBundleEvidence = isPlanEvidenceBundleReady(closureInput.evidenceBundle);
-  const hasDeterministicEvidence = hasDeterministicPlanMaterializationEvidence(
-    closureInput.evidenceBundle,
-  );
+  const closureAssessment = assessPlanClosureEvidence(closureInput.evidenceBundle);
+  const hasDeterministicEvidence = closureAssessment.ready;
   if (!hasBundleEvidence || !hasDeterministicEvidence) {
+    const rejectionReason = !hasBundleEvidence
+      ? "insufficient_relevant_plan_evidence"
+      : closureAssessment.unresolvedContractKinds.length > 0
+        ? `unverified_plan_contract_counterpart:${closureAssessment.unresolvedContractKinds.join(",")}`
+        : "insufficient_diagnostic_plan_evidence";
     logAgentEvent("plan_evidence_materialization_rejected", {
-      reason: hasBundleEvidence
-        ? "insufficient_diagnostic_plan_evidence"
-        : "insufficient_relevant_plan_evidence",
+      reason: rejectionReason,
       evidenceCount: closureInput.evidence.length,
       structuredEvidenceCount: closureInput.evidenceRecords.length,
       fileCount: closureInput.files.length,
@@ -4470,14 +4463,24 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
       sanitizerDropReasons: closureInput.sanitizer.dropReasons,
       evidenceBundleId: closureInput.evidenceBundle.bundleId,
       evidenceBundleHash: closureInput.evidenceBundle.hash,
+      bundleReady: hasBundleEvidence,
+      closureReady: closureAssessment.ready,
+      closureReason: closureAssessment.reason,
+      objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
+      defectSignalMatches: closureAssessment.defectSignalMatches,
+      contractMismatchMatches: closureAssessment.contractMismatchMatches,
+      contractMismatchKinds: closureAssessment.contractMismatchKinds,
+      unresolvedContractKinds: closureAssessment.unresolvedContractKinds,
       semanticFacts: closureInput.evidenceBundle.facts.length,
       changeTargets: closureInput.evidenceBundle.changeTargets.length,
     });
     return {
       ok: false,
-      reason: hasBundleEvidence
-        ? "insufficient_diagnostic_plan_evidence"
-        : "insufficient_relevant_plan_evidence",
+      reason: rejectionReason,
+      quality: classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: rejectionReason,
+      }),
     };
   }
   const closureKind = resolvePlanClosureArtifactKind(
@@ -4493,6 +4496,7 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     constraints: closureInput.constraints,
     language: input.callbacks.getPreferredLanguage(),
     evidenceBundle: closureInput.evidenceBundle,
+    facetMappingSource: input.facetMappingSource,
   });
   const materialized = materializePlanArtifactFromVisibleText({
     visibleText: content,
@@ -5215,6 +5219,7 @@ export async function executeWriteToolWithReview(
 // ── The Loop ──────────────────────────────────────────────────────
 
 export const MAX_RECENT_PLAN_TOOL_ACTIVITY = 12;
+export const MAX_PLAN_EVIDENCE_TOOL_ACTIVITY = 32;
 export const CONCISE_PLAN_ARTIFACT_HINT_ZH =
   "计划文档必须精简：plan.md 60-120 行；可选 design.md 40-80 行；如确需持久化 tasks.md，保持 8-20 个 checkbox。不要写教程式长文、完整代码清单或重复背景。Proposal 只做一页审阅摘要。";
 export const CONCISE_PLAN_ARTIFACT_HINT_EN =

@@ -258,6 +258,36 @@ test("tool activity tracking records bounded recent activity and helper classifi
   assert.equal(isVerificationEvidenceResult(result({ name: "run_command", isError: true })), false);
 });
 
+test("Plan evidence activity outlives the short loop-detection window and merges rereads", () => {
+  const recent = [];
+  const ledger = [];
+  for (let index = 0; index < 15; index += 1) {
+    const readResult = result({
+      toolCallId: `read_${index}`,
+      name: "read_file",
+      target: `src/module-${index}.ts`,
+      content: `export function module${index}() { return ${index}; }`,
+    });
+    rememberToolActivity(recent, readResult);
+    rememberToolActivity(ledger, readResult, { evidenceLedger: true });
+  }
+
+  assert.equal(recent.length, 12);
+  assert.equal(recent.some((item) => item.target === "src/module-0.ts"), false);
+  assert.equal(ledger.length, 15);
+  assert.equal(ledger[0].target, "src/module-0.ts");
+
+  rememberToolActivity(ledger, result({
+    toolCallId: "read_0_window",
+    name: "read_file",
+    target: "src/module-0.ts",
+    content: "export const additionalBoundary = true;",
+  }), { evidenceLedger: true });
+  assert.equal(ledger.length, 15);
+  assert.match(ledger[0].detail || "", /module0/);
+  assert.match(ledger[0].detail || "", /additionalBoundary/);
+});
+
 test("wait_subagents promotes child file evidence instead of recording orchestration noise", () => {
   const waitResult = result({
     toolCallId: "wait_1",
@@ -424,7 +454,43 @@ test("tool result post-processing freezes a semantic evidence bundle before repe
   assert.equal(post.planRuntimePhase, "drafting");
   assert.deepEqual(harness.planRuntimePhases, [{
     phase: "drafting",
-    reason: "semantic evidence bundle ready",
+    reason: "plan closure evidence ready",
+    status: "running",
+  }]);
+});
+
+test("tool result post-processing keeps structural-only evidence open for diagnosis", () => {
+  const harness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "explore_structure",
+    results: [result({
+      toolCallId: "impact_structural",
+      name: "repo_map_impact",
+      target: "src-tauri/src/main.rs",
+      content: "main registers Tauri builder handlers and emits file-open events to the frontend",
+    })],
+    toolArgsByCallId: new Map([["impact_structural", { path: "src-tauri/src/main.rs" }]]),
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  harness.input.callbacks = {
+    ...harness.input.callbacks,
+    getMessages: () => [{
+      role: "user",
+      content: "Find why opening a Markdown file shows a blank window and prepare a repair plan.",
+    }],
+    getCurrentTurnId: () => "turn-plan-structural",
+    getContextMemoryState: () => null,
+  };
+
+  const post = handleToolResultPostProcessing(harness.input);
+
+  assert.equal(post.planRuntimePhase, "grounding");
+  assert.deepEqual(harness.planRuntimePhases, [{
+    phase: "grounding",
+    reason: "change_targets_lack_confirmed_rationale",
     status: "running",
   }]);
 });
