@@ -417,8 +417,7 @@ export function handleAssistantOutputPhase(input: {
     });
   }
   const closedPlanReadOnlyContinuation = resolveClosedPlanReadOnlyContinuation({
-    suppressPlanContinuationReplyOptions:
-      input.suppressPlanContinuationReplyOptions,
+    autoContinueNonBlockingPlanChoices,
     replyOptions: normalized.replyOptions,
     toolCallCount: effectiveToolCalls.length,
     workflowMode,

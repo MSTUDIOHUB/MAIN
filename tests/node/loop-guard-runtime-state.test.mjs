@@ -79,37 +79,52 @@ test("loop guard runtime state initializes mutable guard collections", () => {
 
 test("no-progress tracking snapshot and reducer preserve guard collection ownership", () => {
   const state = createAgentLoopGuardRuntimeState();
-  state.crossIterationFileReads.set("src/app.ts", 2);
+  state.crossIterationFileReads.set("window-app", {
+    path: "src/app.ts",
+    versionToken: "1:1",
+    count: 2,
+  });
 
   assert.deepEqual(getNoProgressTrackingRuntimeState(state), {
     lastNoProgressBatchSignature: "",
     noProgressBatchRepeatCount: 0,
     consecutiveReadFileOnlyCacheHits: 0,
+    lastReadFileOnlyObservationSignature: "",
   });
 
   const next = applyNoProgressTrackingRuntimeState(state, {
     lastNoProgressBatchSignature: "read_file:src/app.ts",
     noProgressBatchRepeatCount: 3,
     consecutiveReadFileOnlyCacheHits: 2,
+    lastReadFileOnlyObservationSignature: "window-app",
   });
   assert.equal(next.crossIterationFileReads, state.crossIterationFileReads);
-  assert.equal(next.crossIterationFileReads.get("src/app.ts"), 2);
+  assert.equal(next.crossIterationFileReads.get("window-app")?.count, 2);
   assert.deepEqual(getNoProgressTrackingRuntimeState(next), {
     lastNoProgressBatchSignature: "read_file:src/app.ts",
     noProgressBatchRepeatCount: 3,
     consecutiveReadFileOnlyCacheHits: 2,
+    lastReadFileOnlyObservationSignature: "window-app",
   });
 });
 
 test("cross-iteration read tracking can be cleared for the affected recovery target", () => {
   const state = createAgentLoopGuardRuntimeState();
-  state.crossIterationFileReads.set("src/a.ts", 4);
-  state.crossIterationFileReads.set("src/b.ts", 2);
+  state.crossIterationFileReads.set("window-a", {
+    path: "src/a.ts",
+    versionToken: "1:1",
+    count: 4,
+  });
+  state.crossIterationFileReads.set("window-b", {
+    path: "src/b.ts",
+    versionToken: "1:1",
+    count: 2,
+  });
 
   const next = clearCrossIterationReadTrackingForTarget(state, "src/a.ts");
   assert.equal(next, state);
-  assert.equal(state.crossIterationFileReads.has("src/a.ts"), false);
-  assert.equal(state.crossIterationFileReads.get("src/b.ts"), 2);
+  assert.equal(state.crossIterationFileReads.has("window-a"), false);
+  assert.equal(state.crossIterationFileReads.get("window-b")?.count, 2);
 
   assert.equal(clearCrossIterationReadTrackingForTarget(state, "missing.ts"), state);
   assert.equal(clearCrossIterationReadTrackingForTarget(state, null), state);

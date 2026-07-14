@@ -2146,8 +2146,6 @@ export class WorkflowEngine {
             ["pending", "running", "executed"],
             lifecycleMeta,
           );
-          if (existingIndex < 0) return {};
-
           const nextLedger = appendPlanEvidenceEntry(s.planExecutionEvidenceLedger || [], entry);
           const nextTasks = reconcilePlanTaskCompletion(
             s.planTasks || [],
@@ -2159,10 +2157,20 @@ export class WorkflowEngine {
             }
           );
 
-          return {
+          // Durable execution evidence belongs to the tool result, not to its
+          // presentation block. A lifecycle card may be absent after restore,
+          // compaction, or a UI timing race; dropping a successful result here
+          // leaves approved tasks pending and can make the model rerun an
+          // already-successful command until the repetition guard fires.
+          const evidencePatch = {
             planExecutionEvidenceLedger: nextLedger,
             planExecutionEvidenceCount: nextLedger.length,
             planTasks: nextTasks,
+          };
+          if (existingIndex < 0) return evidencePatch;
+
+          return {
+            ...evidencePatch,
             taskFlow: s.taskFlow.map((block: any, index: number) => {
               if (index !== existingIndex) return block;
               const completedPhase = withTurnRuntimePhaseStatus(
@@ -2461,7 +2469,9 @@ export class WorkflowEngine {
           0,
           Number(sessionGet().planAutoResumeCount) || 0,
         );
-        const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
+        const shouldAutoResume =
+          checkpoint.autoResumeEligible &&
+          currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
         const effectiveCheckpoint = {
           ...checkpoint,
           autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
@@ -2523,6 +2533,9 @@ export class WorkflowEngine {
           logStoreEvent("plan_max_iterations_paused", {
             autoResumeCount: currentCount,
             maxIterations: checkpoint.maxIterations,
+            reason: checkpoint.autoResumeEligible
+              ? "auto_resume_limit_reached"
+              : "no_durable_execution_progress",
           });
           return true;
         }
@@ -2698,7 +2711,9 @@ export class WorkflowEngine {
           0,
           Number(sessionGet().planAutoResumeCount) || 0,
         );
-        const shouldAutoResume = currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
+        const shouldAutoResume =
+          checkpoint.autoResumeEligible &&
+          currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
         const effectiveCheckpoint = {
           ...checkpoint,
           autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
@@ -2750,6 +2765,9 @@ export class WorkflowEngine {
           logStoreEvent("execute_max_iterations_paused", {
             autoResumeCount: currentCount,
             maxIterations: checkpoint.maxIterations,
+            reason: checkpoint.autoResumeEligible
+              ? "auto_resume_limit_reached"
+              : "no_durable_execution_progress",
           });
           return true;
         }

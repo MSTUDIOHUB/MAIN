@@ -11,12 +11,19 @@ export type RecentTargetProgressToolCall = {
   family: "edit" | "verify" | "other";
 };
 
+export interface CrossIterationFileReadObservation {
+  path: string;
+  versionToken: string;
+  count: number;
+}
+
 export interface AgentLoopGuardRuntimeState {
-  crossIterationFileReads: Map<string, number>;
+  crossIterationFileReads: Map<string, CrossIterationFileReadObservation>;
   successfulEditTargetsSinceVerification: Map<string, number>;
   lastNoProgressBatchSignature: string;
   noProgressBatchRepeatCount: number;
   consecutiveReadFileOnlyCacheHits: number;
+  lastReadFileOnlyObservationSignature: string;
   recentToolCalls: RecentLoopGuardToolCall[];
   recentTargetToolCalls: RecentTargetProgressToolCall[];
   repeatGuardRecoveredSignatures: Set<string>;
@@ -29,6 +36,7 @@ export type NoProgressLoopTrackingState = Pick<
   | "lastNoProgressBatchSignature"
   | "noProgressBatchRepeatCount"
   | "consecutiveReadFileOnlyCacheHits"
+  | "lastReadFileOnlyObservationSignature"
 >;
 
 export type ToolFailureSignatureResult = {
@@ -44,6 +52,7 @@ export function createAgentLoopGuardRuntimeState(): AgentLoopGuardRuntimeState {
     lastNoProgressBatchSignature: "",
     noProgressBatchRepeatCount: 0,
     consecutiveReadFileOnlyCacheHits: 0,
+    lastReadFileOnlyObservationSignature: "",
     recentToolCalls: [],
     recentTargetToolCalls: [],
     repeatGuardRecoveredSignatures: new Set(),
@@ -59,6 +68,7 @@ export function getNoProgressTrackingRuntimeState(
     lastNoProgressBatchSignature: state.lastNoProgressBatchSignature,
     noProgressBatchRepeatCount: state.noProgressBatchRepeatCount,
     consecutiveReadFileOnlyCacheHits: state.consecutiveReadFileOnlyCacheHits,
+    lastReadFileOnlyObservationSignature: state.lastReadFileOnlyObservationSignature,
   };
 }
 
@@ -71,6 +81,7 @@ export function applyNoProgressTrackingRuntimeState(
     lastNoProgressBatchSignature: input.lastNoProgressBatchSignature,
     noProgressBatchRepeatCount: input.noProgressBatchRepeatCount,
     consecutiveReadFileOnlyCacheHits: input.consecutiveReadFileOnlyCacheHits,
+    lastReadFileOnlyObservationSignature: input.lastReadFileOnlyObservationSignature,
   };
 }
 
@@ -79,11 +90,11 @@ export function clearCrossIterationReadTrackingForTarget(
   target?: string | null,
 ): AgentLoopGuardRuntimeState {
   if (!target) return state;
-  const trackedTarget = [...state.crossIterationFileReads.keys()].find((candidate) =>
-    workspacePathsReferToSameFile(candidate, target)
-  );
-  if (!trackedTarget) return state;
-  state.crossIterationFileReads.delete(trackedTarget);
+  for (const [key, observation] of state.crossIterationFileReads) {
+    if (workspacePathsReferToSameFile(observation.path, target)) {
+      state.crossIterationFileReads.delete(key);
+    }
+  }
   return state;
 }
 

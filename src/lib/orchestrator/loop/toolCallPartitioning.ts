@@ -7,6 +7,7 @@ import {
 import { resolveApprovedPlanMutationScope } from "../../approvedPlanExecutionScope";
 import {
   FILE_UNCHANGED_STUB,
+  buildFileReadObservationIdentity,
   buildFileReadSignature,
   buildFileUnchangedReplayContent,
   buildFileUnchangedStub,
@@ -62,7 +63,10 @@ import type { PlanRuntimePhase } from "../../workflowModels";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { findSubagentScopeConflict, validateSubagentScopeTarget } from "../../subagents";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
-import { parseApplyPatch } from "../../applyPatchTool";
+import {
+  isWorkspaceMutationToolCall,
+  resolveWorkspaceMutationTargets,
+} from "../../workspaceMutationTools";
 import { shouldCacheReadOnlyToolResult } from "../../readOnlyToolCachePolicy";
 import {
   resolveBrowserValidationPreflight,
@@ -284,10 +288,7 @@ export async function partitionToolCallsForExecution(input: {
     }
 
     const isOrderSensitiveWorkspaceAction =
-      tc.name === "apply_patch" ||
-      tc.name === "replace_in_file" ||
-      tc.name === "write_file" ||
-      tc.name === "delete_workspace_path" ||
+      isWorkspaceMutationToolCall(tc.name, toolArgs) ||
       tc.name === "run_command" ||
       tc.name === "execute_command" ||
       tc.name === "send_pty_input";
@@ -394,13 +395,12 @@ export async function partitionToolCallsForExecution(input: {
     }
 
     const directScopeTarget = typeof toolArgs.path === "string" ? toolArgs.path.trim() : "";
-    const scopeTargets = tc.name === "apply_patch"
-      ? parseApplyPatch(String(toolArgs.patch || "")).operations.flatMap((operation) =>
-          [operation.path, operation.newPath].filter((path): path is string => !!path)
-        )
+    const mutationScopeTargets = resolveWorkspaceMutationTargets(tc.name, toolArgs, target);
+    const scopeTargets = mutationScopeTargets.length > 0
+      ? mutationScopeTargets
       : tc.name === "grep_search" || tc.name === "find_symbol_references" || tc.name === "git_diff"
         ? [directScopeTarget || "."]
-        : new Set(["read_file", "get_file_outline", "code_ast_query", "write_file", "replace_in_file"] as string[]).has(tc.name)
+        : new Set(["read_file", "get_file_outline", "code_ast_query"] as string[]).has(tc.name)
           ? [directScopeTarget]
           : [];
     if (scopeTargets.length > 0) {
@@ -882,13 +882,28 @@ export async function partitionToolCallsForExecution(input: {
           name: tc.name,
           target,
           content,
-          displayContent: `${FILE_UNCHANGED_STUB}: ${target}`,
-          isError: false,
-        });
+            displayContent: `${FILE_UNCHANGED_STUB}: ${target}`,
+            isError: false,
+            ...(fileReadMetadata
+              ? {
+                  readFileObservation: buildFileReadObservationIdentity({
+                    requestSignature: fileReadSignature,
+                    path: fileReadMetadata.path,
+                    sizeBytes: fileReadMetadata.sizeBytes,
+                    modifiedMs: fileReadMetadata.modifiedMs,
+                    source: "stub",
+                  }),
+                }
+              : {}),
+          });
         continue;
       }
 
-      if (fileReadState && !bypassPatchRecoveryReadCache && isContentInActiveMessages(fileReadState.modelContent, managedAgentMessages)) {
+      if (fileReadState && !bypassPatchRecoveryReadCache) {
+        const contentStillActive = isContentInActiveMessages(
+          fileReadState.modelContent,
+          managedAgentMessages,
+        );
         const metadata = fileReadMetadata ?? await readFileMetadataIfAvailable(fileReadState.path, workspace);
         const unchanged =
           metadata != null &&
@@ -917,6 +932,41 @@ export async function partitionToolCallsForExecution(input: {
         } else {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
+          if (!contentStillActive) {
+            // Context compaction may evict the tool message while the runtime
+            // still owns the exact versioned window. Replay the retained
+            // source so the model can use it, but mark it as an observation
+            // replay rather than fresh execution progress. A successful
+            // mutation invalidates this state before a post-edit read.
+            const content = buildFileUnchangedReplayContent(fileReadState, duplicateCount);
+            logAgentEvent("file_read_cache_hit", {
+              iteration,
+              target: target || fileReadState.path,
+              decision: "context_evicted_replay",
+              signature: truncateForLog(fileReadSignature, 180),
+              duplicateCount,
+              sizeBytes: fileReadState.sizeBytes,
+              modifiedMs: fileReadState.modifiedMs,
+              contentHash: fileReadState.contentHash,
+            });
+            preExecutionResults.push({
+              toolCallId: tc.id,
+              name: tc.name,
+              target,
+              content,
+              displayContent: `CACHED_FILE_REPLAY: ${target || fileReadState.path}`,
+              isError: false,
+              readFileObservation: buildFileReadObservationIdentity({
+                requestSignature: fileReadSignature,
+                path: fileReadState.path,
+                sizeBytes: fileReadState.sizeBytes,
+                modifiedMs: fileReadState.modifiedMs,
+                contentHash: fileReadState.contentHash,
+                source: "replay",
+              }),
+            });
+            continue;
+          }
           const planBudget = buildPlanExplorationBudget({
             workflowMode,
             isPlanApproved: callbacks.getIsPlanApproved(),
@@ -1005,6 +1055,14 @@ export async function partitionToolCallsForExecution(input: {
               ? `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path}`
               : `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
             isError: false,
+            readFileObservation: buildFileReadObservationIdentity({
+              requestSignature: fileReadSignature,
+              path: fileReadState.path,
+              sizeBytes: fileReadState.sizeBytes,
+              modifiedMs: fileReadState.modifiedMs,
+              contentHash: fileReadState.contentHash,
+              source: replayApprovedExecutionRead ? "replay" : "stub",
+            }),
           });
           continue;
         }
@@ -1043,6 +1101,16 @@ export async function partitionToolCallsForExecution(input: {
             content,
             displayContent: `${FILE_UNCHANGED_STUB}: ${target || coverage.fullFileState.path}`,
             isError: false,
+            readFileObservation: buildFileReadObservationIdentity({
+              // Identity belongs to the requested subrange, not the cached
+              // full-file source that happened to cover it.
+              requestSignature: fileReadSignature,
+              path: fileReadMetadata.path,
+              sizeBytes: coverage.fullFileState.sizeBytes,
+              modifiedMs: coverage.fullFileState.modifiedMs,
+              contentHash: coverage.fullFileState.contentHash,
+              source: "stub",
+            }),
           });
           continue;
         }
@@ -1077,6 +1145,13 @@ export async function partitionToolCallsForExecution(input: {
               content,
               displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadMetadata.path}`,
               isError: false,
+              readFileObservation: buildFileReadObservationIdentity({
+                requestSignature: fileReadSignature,
+                path: fileReadMetadata.path,
+                sizeBytes: fileReadMetadata.sizeBytes,
+                modifiedMs: fileReadMetadata.modifiedMs,
+                source: "stub",
+              }),
             });
             continue;
           }
@@ -1115,6 +1190,14 @@ export async function partitionToolCallsForExecution(input: {
                 content,
                 displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
                 isError: false,
+                readFileObservation: buildFileReadObservationIdentity({
+                  requestSignature: fileReadSignature,
+                  path: fileReadState.path,
+                  sizeBytes: fileReadState.sizeBytes,
+                  modifiedMs: fileReadState.modifiedMs,
+                  contentHash: fileReadState.contentHash,
+                  source: "stub",
+                }),
               });
               continue;
             }

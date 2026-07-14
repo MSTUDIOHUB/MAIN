@@ -78,7 +78,7 @@ export function resolveNonBlockingPlanChoiceLoop(input: {
  * the bounded runtime transition that reopens the targeted-evidence phase.
  */
 export function resolveClosedPlanReadOnlyContinuation(input: {
-  suppressPlanContinuationReplyOptions: boolean;
+  autoContinueNonBlockingPlanChoices: boolean;
   replyOptions: ReplyOption[];
   toolCallCount: number;
   workflowMode: LegacyWorkflowMode;
@@ -90,7 +90,10 @@ export function resolveClosedPlanReadOnlyContinuation(input: {
   action: "none" | "targeted_evidence" | "defer";
   reason?: string;
 } {
-  if (!shouldAutoContinueNonBlockingPlanChoices(input)) {
+  // Consume the decision already made with the complete output context.
+  // Recomputing it here previously lost the substantive-plan signal and
+  // converted a valid candidate into a fake evidence request.
+  if (!input.autoContinueNonBlockingPlanChoices) {
     return { action: "none" };
   }
   if (

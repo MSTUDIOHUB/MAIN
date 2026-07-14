@@ -579,6 +579,7 @@ export async function handleToolResultRecoveryPhase(input: {
 
   const crossIterationReadFileRecovery = handleCrossIterationReadFileLoopRecovery({
     callbacks: input.callbacks,
+    workflowMode: input.workflowMode,
     runtimeIntent: input.runtimeIntent,
     iteration: input.iteration,
     results: input.results,

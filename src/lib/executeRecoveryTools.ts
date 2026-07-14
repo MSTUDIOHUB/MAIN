@@ -1,4 +1,5 @@
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import { WORKSPACE_MUTATION_TOOL_NAMES } from "./workspaceMutationTools";
 import {
   isFinitePlanValidationCommand,
   isFlexiblePlanValidationCommandEvidence,
@@ -82,11 +83,7 @@ export const EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS = new Set([
   "run_command",
 ]);
 
-export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set([
-  "apply_patch",
-  "replace_in_file",
-  "write_file",
-]);
+export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set(WORKSPACE_MUTATION_TOOL_NAMES);
 
 export const EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS = new Set([
   ...EXECUTE_RECOVERY_MUTATION_TOOLS,

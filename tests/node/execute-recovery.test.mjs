@@ -132,7 +132,9 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/fileReadCache.ts"));
 
 const {
+  approvedPlanNeedsSourceEditBeforeValidation,
   buildReadOnlyCacheSignature,
+  getToolTarget,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
 const readOnlyTools = new Set([
@@ -364,7 +366,12 @@ test("execute max-iteration callback can schedule auto-resume without consuming 
     runtimeIntent: "execute",
     effectiveMaxIterations: 50,
     recentPlanToolActivity: [],
-    recentToolActivity: [],
+    recentToolActivity: [{
+      name: "apply_patch",
+      target: "src/App.tsx",
+      status: "succeeded",
+      detail: "changed App component",
+    }],
     lastAssistantTextForCheckpoint: "still working",
     sawExecuteOperationEvidence: true,
     executeRecoveryMode: "normal",
@@ -377,6 +384,263 @@ test("execute max-iteration callback can schedule auto-resume without consuming 
   assert.deepEqual(statuses, ["idle"]);
   assert.equal(pausedRuns[0].reason, "max_iterations_auto_resume");
   assert.match(pausedRuns[0].message, /auto-resume once in a fresh context/);
+});
+
+test("successful MCP source edits count as durable max-iteration progress", async () => {
+  let checkpoint;
+  const stops = [];
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => 0,
+      getPlanExecutionEvidenceLedger: () => [],
+      onExecuteMaxIterationsCheckpoint: (value) => {
+        checkpoint = value;
+        return {
+          status: "auto_resume_scheduled",
+          checkpoint: { ...value, autoResumeCount: 1 },
+        };
+      },
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: [],
+    recentToolActivity: [{
+      name: "script_apply_edits",
+      target: "Assets/Scripts/PlayerController.cs",
+      status: "succeeded",
+      detail: "applied one source edit",
+    }],
+    lastAssistantTextForCheckpoint: "still working",
+    sawExecuteOperationEvidence: true,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: () => {},
+  });
+
+  assert.equal(checkpoint?.autoResumeEligible, true);
+  assert.equal(stops.length, 0);
+});
+
+test("an unrelated successful shell inspection is not durable max-iteration progress", async () => {
+  let checkpoint;
+  const stops = [];
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => 0,
+      getPlanExecutionEvidenceLedger: () => [],
+      onExecuteMaxIterationsCheckpoint: (value) => {
+        checkpoint = value;
+        return {
+          status: "auto_resume_scheduled",
+          checkpoint: { ...value, autoResumeCount: 1 },
+        };
+      },
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: [],
+    recentToolActivity: [{
+      name: "run_command",
+      target: "pwd",
+      status: "succeeded",
+      detail: "exitCode=0",
+    }],
+    lastAssistantTextForCheckpoint: "checking directory",
+    sawExecuteOperationEvidence: true,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: () => {},
+  });
+
+  assert.equal(checkpoint?.autoResumeEligible, false);
+  assert.equal(stops.length, 1);
+});
+
+test("a content-level browser readiness failure is not durable max-iteration progress", async () => {
+  let checkpoint;
+  const stops = [];
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => 0,
+      getPlanExecutionEvidenceLedger: () => [],
+      onExecuteMaxIterationsCheckpoint: (value) => {
+        checkpoint = value;
+        return {
+          status: "auto_resume_scheduled",
+          checkpoint: { ...value, autoResumeCount: 1 },
+        };
+      },
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: [],
+    recentToolActivity: [{
+      name: "browser_evaluate",
+      target: "http://localhost:1420",
+      status: "succeeded",
+      detail: "DEV_SERVER_NOT_READY: navigation timed out",
+    }],
+    lastAssistantTextForCheckpoint: "browser is not ready",
+    sawExecuteOperationEvidence: true,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: () => {},
+  });
+
+  assert.equal(checkpoint?.autoResumeEligible, false);
+  assert.equal(stops.length, 1);
+});
+
+test("approved plan max-iteration boundary refuses auto-resume after read-only thrashing", async () => {
+  const stops = [];
+  const pausedRuns = [];
+  let observedCheckpoint;
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => true,
+      getPlanAutoResumeCount: () => 0,
+      getPlanTasks: () => [{
+        id: "edit-main",
+        text: "Modify src/main.js initialization error handling",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "file", value: "src/main.js" }],
+      }],
+      getPlanExecutionEvidenceLedger: () => [],
+      onPlanMaxIterationsCheckpoint: (checkpoint) => {
+        observedCheckpoint = checkpoint;
+        return {
+          status: "auto_resume_scheduled",
+          checkpoint: { ...checkpoint, autoResumeCount: 1 },
+        };
+      },
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: Array.from({ length: 8 }, () => ({
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "CACHED_FILE_REPLAY: src/main.js",
+    })),
+    recentToolActivity: [],
+    lastAssistantTextForCheckpoint: "reading another window",
+    sawExecuteOperationEvidence: false,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: (reason, message) => pausedRuns.push({ reason, message }),
+  });
+
+  assert.equal(observedCheckpoint?.autoResumeEligible, false);
+  assert.equal(pausedRuns[0]?.reason, "max_iterations_boundary");
+  assert.equal(stops.length, 1);
+  assert.match(pausedRuns[0]?.message || "", /no trusted write, command, or validation progress/i);
+});
+
+test("pending PTY polling cannot make a max-iteration checkpoint auto-resumable", async () => {
+  const stops = [];
+  let checkpoint;
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => 0,
+      onExecuteMaxIterationsCheckpoint: (value) => {
+        checkpoint = value;
+        return {
+          status: "auto_resume_scheduled",
+          checkpoint: { ...value, autoResumeCount: 1 },
+        };
+      },
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: [],
+    recentToolActivity: [{
+      name: "get_pty_status",
+      target: "terminal status",
+      status: "succeeded",
+      detail: "status=pending output empty",
+    }],
+    lastAssistantTextForCheckpoint: "waiting for terminal",
+    sawExecuteOperationEvidence: true,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: () => {},
+  });
+
+  assert.equal(checkpoint?.autoResumeEligible, false);
+  assert.equal(stops.length, 1);
+});
+
+test("a recent ready PTY observation is durable max-iteration progress", async () => {
+  let checkpoint;
+  const stops = [];
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => 0,
+      getPlanExecutionEvidenceLedger: () => [{
+        id: "ready-observation",
+        kind: "dev_server_url",
+        value: "http://127.0.0.1:1420",
+        target: "terminal status",
+        sourceTool: "get_pty_status",
+        observationStatus: "ready",
+        createdAt: 2,
+      }],
+      onExecuteMaxIterationsCheckpoint: (value) => {
+        checkpoint = value;
+        return {
+          status: "auto_resume_scheduled",
+          checkpoint: { ...value, autoResumeCount: 1 },
+        };
+      },
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: [],
+    recentToolActivity: [{
+      name: "get_pty_status",
+      target: "terminal status",
+      status: "succeeded",
+      detail: "status=ready url=http://127.0.0.1:1420",
+    }],
+    lastAssistantTextForCheckpoint: "server is ready",
+    sawExecuteOperationEvidence: true,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: () => {},
+  });
+
+  assert.equal(checkpoint?.autoResumeEligible, true);
+  assert.equal(stops.length, 0);
 });
 
 test("execute no-tool recovery stops local completion loops at checkpoint", () => {
@@ -434,6 +698,9 @@ test("execute recovery mutation-first surface removes broad reads and search too
     "apply_patch",
     "replace_in_file",
     "write_file",
+    "delete_workspace_path",
+    "script_apply_edits",
+    "apply_text_edits",
     "execute_command",
     "run_command",
     "browser_evaluate",
@@ -448,7 +715,24 @@ test("execute recovery mutation-first surface removes broad reads and search too
     "apply_patch",
     "replace_in_file",
     "write_file",
+    "delete_workspace_path",
+    "script_apply_edits",
+    "apply_text_edits",
   ]);
+  assert.equal(
+    getToolTarget("script_apply_edits", { path: "Assets/Scripts", name: "Foo" }),
+    "Assets/Scripts/Foo.cs",
+  );
+  const mcpDecision = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [{
+      id: "mcp-edit",
+      name: "script_apply_edits",
+      target: getToolTarget("script_apply_edits", { path: "Assets/Scripts", name: "Foo" }),
+    }],
+    expectedTarget: "Assets/Scripts/Foo.cs",
+  });
+  assert.equal(mcpDecision.selectedCallId, "mcp-edit");
   assert.equal(describeExecuteRecoveryToolSurface("mutation_first"), "mutation_only");
   assert.equal(describeExecuteRecoveryToolSurface("mutation_first", true), "mutation_only");
   assert.equal(describeExecuteRecoveryToolSurface("action_plus_targeting", true), "action_plus_targeted_file_read");
@@ -460,6 +744,39 @@ test("execute recovery mutation-first surface removes broad reads and search too
     mode: "mutation_first",
     allowFileRead: true,
   }), false);
+});
+
+test("approved Plan source-edit gate is task-targeted and accepts matching MCP evidence", () => {
+  const tasks = [{
+    id: "unity-edit",
+    text: "Modify Assets/Scripts/Foo.cs, then run focused tests",
+    status: "pending",
+    executionKind: "mutation",
+    evidence: [
+      { kind: "file", value: "Assets/Scripts/Foo.cs" },
+      { kind: "cmd", value: "focused validation command" },
+    ],
+  }];
+  const unrelatedWrite = [{
+    id: "other-write",
+    kind: "file",
+    value: "Assets/Scripts/Other.cs",
+    target: "Assets/Scripts/Other.cs",
+    sourceTool: "write_file",
+    createdAt: 1,
+  }];
+  const matchingMcpWrite = [{
+    id: "foo-write",
+    kind: "file",
+    value: "Assets/Scripts/Foo.cs",
+    target: "Assets/Scripts/Foo.cs",
+    sourceTool: "script_apply_edits",
+    createdAt: 2,
+  }];
+
+  assert.equal(approvedPlanNeedsSourceEditBeforeValidation(tasks, []), true);
+  assert.equal(approvedPlanNeedsSourceEditBeforeValidation(tasks, unrelatedWrite), true);
+  assert.equal(approvedPlanNeedsSourceEditBeforeValidation(tasks, matchingMcpWrite), false);
 });
 
 test("a repeated read-only loop enters mutation-first instead of patch-context reread", () => {
@@ -510,6 +827,64 @@ test("a repeated read-only loop enters mutation-first instead of patch-context r
   assert.equal(activations[0].reason, "read_file_only_loop");
   assert.match(result.pendingExecuteRecoveryPrompt, /mutation_only/);
   assert.doesNotMatch(result.pendingExecuteRecoveryPrompt, /可使用定向 `read_file`/);
+});
+
+test("different cached file windows do not trip the global read-only streak", () => {
+  const activations = [];
+  let tracking = {
+    lastNoProgressBatchSignature: "",
+    noProgressBatchRepeatCount: 0,
+    consecutiveReadFileOnlyCacheHits: 0,
+    lastReadFileOnlyObservationSignature: "",
+  };
+
+  for (const key of ["range-a", "range-b", "range-c"]) {
+    const result = handleNoProgressRecovery({
+      callbacks: {
+        getIsPlanApproved: () => false,
+        getPreferredLanguage: () => "zh",
+      },
+      activeProfile: "local",
+      workflowMode: "edit",
+      runtimeIntent: "goal",
+      iteration: 3,
+      results: [{
+        toolCallId: key,
+        name: "read_file",
+        target: "src/App.tsx",
+        content: `CACHED_FILE_REPLAY: ${key}`,
+        isError: false,
+        readFileObservation: {
+          key,
+          path: "src/App.tsx",
+          requestSignature: `read_file::src/App.tsx::${key}`,
+          versionToken: "v1",
+          source: "replay",
+        },
+      }],
+      recentToolActivity: [],
+      recentPlanToolActivity: [],
+      sawExecuteOperationEvidence: false,
+      executeRecoveryMode: "normal",
+      executeRecoveryReason: "",
+      executeRecoveryAttempts: 0,
+      repairExecutionRequestInChat: false,
+      latestUserPromptText: "修复白屏",
+      isUnapprovedPlanReadOnlyBatch: false,
+      planReadOnlyConvergenceBatches: 0,
+      planReadOnlyConvergenceTools: 0,
+      approvedPlanNoProgressRecoveryAttempts: 0,
+      tracking,
+      activateExecuteRecovery: (mode, reason, context) => activations.push({ mode, reason, context }),
+      activateChatFinalSynthesis: () => {},
+      emitTaskOrchestratorPhase: () => {},
+    });
+    tracking = result.tracking;
+  }
+
+  assert.equal(activations.length, 0);
+  assert.equal(tracking.consecutiveReadFileOnlyCacheHits, 1);
+  assert.equal(tracking.lastReadFileOnlyObservationSignature, "range-c");
 });
 
 test("an unavailable stale read is blocked before execute-recovery batch deferral", async () => {
@@ -626,14 +1001,22 @@ test("read_file cache is range-and-version aware and never falls back to stale g
   assert.equal(active.readOnlyCalls.length, 0);
   assert.equal(active.preExecutionResults.length, 1);
   assert.match(active.preExecutionResults[0].content, /FILE_UNCHANGED_STUB/);
+  assert.equal(active.preExecutionResults[0].readFileObservation?.source, "stub");
 
   const compacted = await partitionToolCallsForExecution(createReadFilePartitionInput({
     managedAgentMessages: [],
     fileReadStates: new Map([[fileSignature, currentState]]),
   }));
 
-  assert.equal(compacted.preExecutionResults.length, 0);
-  assert.equal(compacted.readOnlyCalls.length, 1);
+  assert.equal(compacted.preExecutionResults.length, 1);
+  assert.equal(compacted.readOnlyCalls.length, 0);
+  assert.match(compacted.preExecutionResults[0].content, /CACHED_FILE_REPLAY/);
+  assert.match(compacted.preExecutionResults[0].content, /export function App/);
+  assert.equal(compacted.preExecutionResults[0].readFileObservation?.source, "replay");
+  assert.equal(
+    compacted.preExecutionResults[0].readFileObservation?.key,
+    active.preExecutionResults[0].readFileObservation?.key,
+  );
 });
 
 test("stale windows are removed before coverage narrowing can reuse them", async () => {
@@ -738,6 +1121,47 @@ test("a large-file semantic summary never claims exact line coverage", () => {
   assert.deepEqual(coverage.ranges, []);
 });
 
+test("full-file cache coverage preserves the identity of each requested window", async () => {
+  const fullContent = "export function App() {\n  return null;\n}\n";
+  const fullSignature = buildFileReadSignature("src/App.tsx", { path: "src/App.tsx" });
+  const fullState = {
+    signature: fullSignature,
+    path: "src/App.tsx",
+    argsKey: "full",
+    contentHash: "full-hash",
+    contentLength: fullContent.length,
+    sizeBytes: 120,
+    modifiedMs: 2,
+    modelContent: fullContent,
+    updatedAt: 1,
+  };
+  globalThis.mockIpcInvoke = async (cmd) => cmd === "get_file_metadata"
+    ? { path: "src/App.tsx", sizeBytes: 120, modifiedMs: 2 }
+    : {};
+
+  const runWindow = async (id, startLine) => partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id,
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/App.tsx", start_line: startLine, max_lines: 20 }),
+    }],
+    managedAgentMessages: [{ role: "tool", content: fullContent }],
+    fileReadStates: new Map([[fullSignature, fullState]]),
+  }));
+
+  const first = await runWindow("window-a", 1);
+  const second = await runWindow("window-b", 21);
+  const firstObservation = first.preExecutionResults[0]?.readFileObservation;
+  const secondObservation = second.preExecutionResults[0]?.readFileObservation;
+
+  assert.ok(firstObservation);
+  assert.ok(secondObservation);
+  assert.notEqual(firstObservation.key, secondObservation.key);
+  assert.equal(firstObservation.versionToken, secondObservation.versionToken);
+  assert.match(firstObservation.requestSignature, /start_line.*1/);
+  assert.match(secondObservation.requestSignature, /start_line.*21/);
+});
+
 test("a successful mutation invalidates file windows and args-only observations", () => {
   const signature = buildFileReadSignature("src/App.tsx", {
     path: "src/App.tsx",
@@ -801,6 +1225,26 @@ test("a successful mutation invalidates file windows and args-only observations"
   assert.equal(commandInvalidation.invalidatedFileReadSignatures.length, 2);
   assert.equal(commandStates.size, 0);
   assert.equal(commandCache.size, 0);
+
+  const unityState = commandState("unity", "Assets/Scripts/Foo.cs");
+  const unityStates = new Map([["unity", unityState]]);
+  const unityInvalidation = invalidateWorkspaceReadCachesAfterMutation({
+    toolName: "script_apply_edits",
+    args: { path: "Assets/Scripts", name: "Foo" },
+    target: "Assets/Scripts/Foo.cs",
+    fileReadStates: unityStates,
+  });
+  assert.deepEqual(unityInvalidation.invalidatedFileReadSignatures, ["unity"]);
+
+  const inspectStates = new Map([["unity", unityState]]);
+  const inspectInvalidation = invalidateWorkspaceReadCachesAfterMutation({
+    toolName: "manage_script",
+    args: { action: "inspect", path: "Assets/Scripts", name: "Foo" },
+    target: "manage_script",
+    fileReadStates: inspectStates,
+  });
+  assert.equal(inspectInvalidation.invalidatedFileReadSignatures.length, 0);
+  assert.equal(inspectStates.size, 1);
 });
 
 test("only real mutations and opaque workspace actions advance the observation epoch", () => {
@@ -820,6 +1264,18 @@ test("only real mutations and opaque workspace actions advance the observation e
     content: JSON.stringify({ success: true }),
     isError: false,
   }), true);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("script_apply_edits", {
+    content: "updated method",
+    isError: false,
+  }, { path: "Assets/Scripts", name: "Foo" }), true);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("manage_script", {
+    content: "inspected script",
+    isError: false,
+  }, { action: "inspect", path: "Assets/Scripts", name: "Foo" }), false);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("manage_script", {
+    content: "created script",
+    isError: false,
+  }, { action: "create", path: "Assets/Scripts", name: "Foo" }), true);
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("run_command", {
     content: JSON.stringify({ exitCode: 0, stdout: "no-op appears in test output" }),
     isError: false,
@@ -900,6 +1356,50 @@ test("a read after a same-batch mutation is deferred instead of executing agains
   assert.equal(ordered.readOnlyCalls.length, 1);
   assert.equal(ordered.writeCalls.length, 1);
   assert.equal(ordered.preExecutionResults.length, 0);
+});
+
+test("a read after a same-batch MCP script edit is also deferred", async () => {
+  const registry = {
+    tools: {
+      ...partitionToolCapabilityRegistry.tools,
+      script_apply_edits: {
+        key: "script_apply_edits",
+        name: "script_apply_edits",
+        source: "mcp",
+        category: "file",
+        risk: "external_write",
+        enabled: true,
+        autoExecutable: false,
+      },
+    },
+    policy: partitionPermissionPolicy,
+  };
+  const input = createReadFilePartitionInput({
+    toolCalls: [
+      {
+        id: "mcp-edit-first",
+        name: "script_apply_edits",
+        arguments: JSON.stringify({ path: "Assets/Scripts", name: "Foo", edits: [] }),
+      },
+      {
+        id: "read-after-mcp-edit",
+        name: "read_file",
+        arguments: JSON.stringify({ path: "Assets/Scripts/Foo.cs", start_line: 1, max_lines: 100 }),
+      },
+    ],
+    availableToolNames: new Set(["script_apply_edits", "read_file"]),
+    toolCapabilityRegistry: registry,
+  });
+  input.callbacks = {
+    ...input.callbacks,
+    getAutoApproveToolScopes: () => ["external_write"],
+  };
+
+  const result = await partitionToolCallsForExecution(input);
+  assert.equal(result.writeCalls.length, 1);
+  assert.equal(result.readOnlyCalls.length, 0);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.match(result.preExecutionResults[0].content, /ORDERED_BATCH_CALL_DEFERRED/);
 });
 
 test("all workspace observations after a same-batch action are deferred", async () => {

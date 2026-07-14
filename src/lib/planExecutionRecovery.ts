@@ -11,6 +11,7 @@ import {
 } from "./workflowModels";
 import type { MainThreadProgressUpdate } from "./turnEvents";
 import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
+import { isPlanReadOnlyToolName } from "./planReadOnlyConvergence";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
 
@@ -94,6 +95,8 @@ export interface PlanMaxIterationsCheckpoint {
   iterationCount: number;
   maxIterations: number;
   autoResumeCount: number;
+  /** Auto-resume is safe only when this run produced durable execution delta. */
+  autoResumeEligible: boolean;
   currentTask: string;
   remainingTasks: string[];
   completedEvidence: string[];
@@ -312,6 +315,27 @@ export function summarizePlanExecutionEvidence(
 ): string[] {
   return evidenceLedger
     .filter((entry) => !isInternalPlanPath(entry.target || entry.value))
+    .slice(-limit)
+    .map(summarizeEvidence)
+    .filter(Boolean);
+}
+
+export function summarizeCompletedPlanExecutionEvidence(
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+  limit = 8,
+): string[] {
+  return evidenceLedger
+    .filter((entry) => !isInternalPlanPath(entry.target || entry.value))
+    .filter((entry) =>
+      !isPlanReadOnlyToolName(String(entry.sourceTool || "")) ||
+      entry.observationStatus === "ready"
+    )
+    .filter((entry) =>
+      entry.observationStatus !== "pending" &&
+      entry.observationStatus !== "unknown" &&
+      entry.observationStatus !== "failed" &&
+      entry.observationStatus !== "stopped"
+    )
     .slice(-limit)
     .map(summarizeEvidence)
     .filter(Boolean);
@@ -591,6 +615,7 @@ export function buildPlanMaxIterationsCheckpoint(input: {
   iterationCount: number;
   maxIterations: number;
   autoResumeCount: number;
+  autoResumeEligible: boolean;
   tasks: PlanTask[];
   evidenceLedger: PlanExecutionEvidenceEntry[];
   recentToolActivity: PlanToolActivitySummary[];
@@ -603,7 +628,7 @@ export function buildPlanMaxIterationsCheckpoint(input: {
     highlightNext: true,
   });
   const remaining = audit.remainingTasks;
-  const completedEvidence = summarizePlanExecutionEvidence(input.evidenceLedger);
+  const completedEvidence = summarizeCompletedPlanExecutionEvidence(input.evidenceLedger);
   const currentTask = remaining[0]
     ? summarizeTask(remaining[0])
     : "No task with unsatisfied evidence was found; verify the runtime task list and current workspace state. tasks.md is optional; do not read it just to check existence.";
@@ -613,6 +638,7 @@ export function buildPlanMaxIterationsCheckpoint(input: {
     iterationCount: input.iterationCount,
     maxIterations: input.maxIterations,
     autoResumeCount: Math.max(0, input.autoResumeCount),
+    autoResumeEligible: input.autoResumeEligible,
     currentTask,
     remainingTasks: topLines(
       remaining.map(summarizeTask),
@@ -686,11 +712,14 @@ export function buildPlanMaxIterationsPauseNotice(
   if (language === "zh") {
     return [
       `计划执行已暂停：连续第 ${checkpoint.iterationCount}/${checkpoint.maxIterations} 轮后仍未闭环。`,
-      "MAIN 已经自动恢复过一次，为避免无限循环，这次停在可恢复状态。",
+      checkpoint.autoResumeEligible
+        ? "MAIN 已经自动恢复过一次，为避免无限循环，这次停在可恢复状态。"
+        : "本轮没有检测到可信写入、命令或验收进展，MAIN 不会自动开启另一个循环。",
       "",
       "RecoveryDetails:",
       `- reason: ${checkpoint.reason}`,
       `- autoResumeCount: ${checkpoint.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
+      `- autoResumeEligible: ${checkpoint.autoResumeEligible}`,
       `- currentTask: ${checkpoint.currentTask}`,
       "- recentToolActivity:",
       ...(toolLines.length ? toolLines : ["- 无"]),
@@ -707,11 +736,14 @@ export function buildPlanMaxIterationsPauseNotice(
 
   return [
     `Plan execution paused after ${checkpoint.iterationCount}/${checkpoint.maxIterations} iterations without closure.`,
-    "MAIN has already auto-resumed once, so it is stopping here to avoid an infinite loop.",
+    checkpoint.autoResumeEligible
+      ? "MAIN has already auto-resumed once, so it is stopping here to avoid an infinite loop."
+      : "This run produced no trusted write, command, or validation progress, so MAIN will not start another automatic loop.",
     "",
     "RecoveryDetails:",
     `- reason: ${checkpoint.reason}`,
     `- autoResumeCount: ${checkpoint.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
+    `- autoResumeEligible: ${checkpoint.autoResumeEligible}`,
     `- currentTask: ${checkpoint.currentTask}`,
     "- recentToolActivity:",
     ...(toolLines.length ? toolLines : ["- none"]),

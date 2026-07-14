@@ -100,15 +100,19 @@ const {
   findDroppedPlanTasks,
   hasLivePlanWorkspace,
   hasBrowserValidationCapability,
+  inferPlanTaskEvidence,
   isPlanTaskAwaitingBrowserValidation,
   isPlanTaskAwaitingExternalValidation,
   isEphemeralPlanArtifactPath,
   isFinitePlanValidationCommand,
+  isPlanTaskSourceMutationObligation,
   isPlanTaskTrustedComplete,
+  isRuntimeTaskActionableText,
   looksLikeReasoningLeakTitle,
   mergePlanTasks,
   normalizeConversationDisplayTitle,
   normalizeResponseLanguagePolicy,
+  planTaskHasUnsatisfiedSourceMutationEvidence,
   reconcilePlanTaskCompletion,
   resolveTurnResponseLanguage,
   resolveActiveConversationTurn,
@@ -756,6 +760,33 @@ test("plan evidence ignores plan-file writes and identical write_file no-ops", (
   assert.equal(reconciled[0].evidenceStatus, "missing");
 });
 
+test("plan evidence trusts verified MCP edits but not non-mutating manage_script calls", () => {
+  const task = extractPlanTasks(
+    "- [ ] 修改 `Assets/Scripts/Foo.cs` 添加启动保护。",
+  )[0];
+  const mcpEdit = createPlanExecutionEvidenceEntry({
+    toolName: "script_apply_edits",
+    target: "Assets/Scripts/Foo.cs",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: "void Start() {}",
+      new: "void Start() { GuardStartup(); }",
+      path: "Assets/Scripts/Foo.cs",
+    },
+  });
+  const inspectOnly = createPlanExecutionEvidenceEntry({
+    toolName: "manage_script",
+    target: "manage_script",
+    result: JSON.stringify({ success: true, action: "inspect" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], [task], mcpEdit ? [mcpEdit] : []);
+
+  assert.equal(mcpEdit?.kind, "file");
+  assert.equal(mcpEdit?.target, "Assets/Scripts/Foo.cs");
+  assert.equal(inspectOnly, null);
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+});
+
 test("plan evidence records ordered finite command outcomes", () => {
   const failedCommand = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
@@ -1259,6 +1290,213 @@ test("runtime task derivation keeps diagnosis and impact facts out of the approv
   assert.equal(audit.allTrustedComplete, true, JSON.stringify(audit));
 });
 
+test("runtime task derivation inherits nested mutation headings and excludes themed diagnosis descendants", () => {
+  const plan = [
+    "# 修复白屏问题计划",
+    "",
+    "## 白屏问题诊断",
+    "",
+    "### 观察到的现象",
+    "1. `src/main.js` 第 24 行：`document.addEventListener('DOMContentLoaded', () => {` — 这是唯一入口点",
+    "2. `src/main.js` 的 `init()` 内部没有 try-catch。",
+    "",
+    "### 根因分析",
+    "- 任意初始化错误都会导致白屏。",
+    "",
+    "## 改动方案",
+    "",
+    "### 1. 修改 `src/main.js` — 添加错误处理",
+    "- 在 DOMContentLoaded 回调内部包裹 try-catch。",
+    "- 在初始化失败时显示清晰错误信息。",
+    "",
+    "### 2. 验证步骤",
+    "1. 运行 `npm run dev` 启动开发服务器。",
+    "2. 访问 `http://localhost:1420` 检查页面是否正常渲染。",
+  ].join("\n");
+
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: plan,
+  }], { language: "zh" });
+
+  const mutationTasks = tasks.filter(isPlanTaskSourceMutationObligation);
+  assert.equal(mutationTasks.length, 1, JSON.stringify(tasks));
+  assert.equal(mutationTasks[0].evidence?.[0]?.value, "src/main.js");
+  assert.match(mutationTasks[0].text, /修改 src\/main\.js/);
+  assert.equal(tasks.some((task) => /唯一入口点|观察到的现象/.test(task.text)), false);
+  assert.equal(
+    isRuntimeTaskActionableText("`document.addEventListener('DOMContentLoaded', handler)` 是唯一入口点"),
+    false,
+  );
+  assert.equal(
+    isRuntimeTaskActionableText("`updateState` is the current state handler"),
+    false,
+  );
+});
+
+test("combined diagnosis and fix headings retain mutation descendants without leaking diagnostic tables", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# 修复计划",
+      "",
+      "## 问题诊断与修复方案",
+      "### 诊断证据",
+      "| 文件 | 操作 | 说明 |",
+      "| --- | --- | --- |",
+      "| `src/diagnostic.js` | 修改 | 添加 listener 是当前行为，不是待执行任务 |",
+      "",
+      "### 修改 `src/main.js`",
+      "- 添加初始化错误处理。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm test`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  assert.equal(tasks.some((task) =>
+    task.executionKind === "mutation" &&
+    task.evidence?.some((entry) => entry.kind === "file" && entry.value === "src/main.js")
+  ), true, JSON.stringify(tasks));
+  assert.equal(tasks.some((task) =>
+    task.evidence?.some((entry) => entry.value === "src/diagnostic.js")
+  ), false, JSON.stringify(tasks));
+  assert.equal(tasks.some((task) =>
+    task.executionKind === "validation" &&
+    task.evidence?.some((entry) => entry.kind === "cmd" && entry.value === "npm test")
+  ), true, JSON.stringify(tasks));
+});
+
+test("validation provenance cannot activate source-edit-first from mutation words in check text", () => {
+  assert.equal(isPlanTaskSourceMutationObligation({
+    id: "validate-fix",
+    text: "运行 npm test 验证 src/main.js 修复",
+    status: "pending",
+    commands: ["npm test"],
+    evidence: [
+      { kind: "cmd", value: "npm test" },
+      { kind: "file", value: "src/main.js" },
+    ],
+  }), false);
+  assert.equal(isPlanTaskSourceMutationObligation({
+    id: "typed-validation",
+    text: "检查 src/main.js 修复结果",
+    status: "pending",
+    executionKind: "validation",
+    evidence: [{ kind: "file", value: "src/main.js" }],
+  }), false);
+});
+
+test("a composite source edit and validation step keeps its mutation obligation", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Fix plan",
+      "",
+      "## Key Changes",
+      "- Modify `src/main.js` to catch initialization failures, then run `npm test`.",
+    ].join("\n"),
+  }], { language: "en" });
+
+  const mutationTask = tasks.find(isPlanTaskSourceMutationObligation);
+  const validationTask = tasks.find((task) => task.executionKind === "validation");
+  assert.ok(mutationTask, JSON.stringify(tasks));
+  assert.ok(validationTask, JSON.stringify(tasks));
+  assert.ok(mutationTask.evidence?.some((entry) =>
+    entry.kind === "file" && entry.value === "src/main.js"
+  ), JSON.stringify(tasks));
+  assert.ok(validationTask.evidence?.some((entry) =>
+    entry.kind === "cmd" && entry.value === "npm test"
+  ), JSON.stringify(tasks));
+
+  assert.equal(isPlanTaskSourceMutationObligation({
+    id: "legacy-composite",
+    text: "Modify src/main.js, then run npm test",
+    status: "pending",
+    commands: ["npm test"],
+    evidence: [
+      { kind: "file", value: "src/main.js" },
+      { kind: "cmd", value: "npm test" },
+    ],
+  }), true);
+
+  const compositeTask = {
+    id: "composite-progress",
+    text: "Modify src/main.js, then run npm test",
+    status: "in_progress",
+    executionKind: "mutation",
+    commands: ["npm test"],
+    evidence: [
+      { kind: "file", value: "src/main.js" },
+      { kind: "cmd", value: "npm test" },
+    ],
+  };
+  assert.equal(planTaskHasUnsatisfiedSourceMutationEvidence(compositeTask, []), true);
+  assert.equal(planTaskHasUnsatisfiedSourceMutationEvidence(compositeTask, [{
+    id: "source-write",
+    kind: "file",
+    value: "src/main.js",
+    target: "src/main.js",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  }]), false);
+});
+
+test("descriptive data-flow sections do not become phantom mutation tasks", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# State review",
+      "",
+      "## Data Flow",
+      "- `src/store/dashboardStore.ts` updates state after import and the component reads the new snapshot.",
+      "",
+      "## Validation",
+      "- Run `npm test`.",
+    ].join("\n"),
+  }], { language: "en" });
+
+  assert.equal(tasks.some((task) =>
+    task.evidence?.some((entry) => entry.value === "src/store/dashboardStore.ts")
+  ), false, JSON.stringify(tasks));
+  assert.equal(tasks.some(isPlanTaskSourceMutationObligation), false, JSON.stringify(tasks));
+});
+
+test("runtime plan task derivation recognizes actionable architecture-change sections", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Offline draft sync",
+      "",
+      "## Architecture Changes",
+      "- Update `src/store/drafts.ts` to queue offline drafts for ordered replay.",
+      "",
+      "## Acceptance",
+      "- Verify two offline drafts sync once after reconnecting.",
+    ].join("\n"),
+  }], { language: "en" });
+
+  assert.equal(tasks.some((task) =>
+    task.executionKind === "mutation" &&
+    task.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/store/drafts.ts")
+  ), true);
+});
+
 test("English Diagnosis sections remain evidence context instead of mutation tasks", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([{
     kind: "plan",
@@ -1430,6 +1668,98 @@ test("runtime plan task derivation parses change headings and keeps validation c
     ["src-tauri/src/main.rs", "src/main.js"].sort(),
   );
   assert.equal(tasks.length, 3, JSON.stringify(tasks, null, 2));
+});
+
+test("explicit build commands outrank browser keyword heuristics", () => {
+  const explicit = inferPlanTaskEvidence(
+    "运行 `npm run build` 并检查退出码与输出。",
+    ["npm run build"],
+  );
+  const inferred = inferPlanTaskEvidence("检查 build 输出是否成功。", []);
+
+  assert.deepEqual(explicit, [{ kind: "cmd", value: "npm run build", inferred: true }]);
+  assert.equal(inferred.some((evidence) => evidence.kind === "browser_dom"), false);
+  assert.equal(inferred.some((evidence) => evidence.kind === "cmd"), true);
+});
+
+test("runtime plan projection does not duplicate an explicit build validation as browser work", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# CSV creator mapping",
+      "",
+      "## 目标",
+      "- 修复 `src/hooks/useCsvParser.ts`，让 creator 正确映射为 creatorName。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/hooks/useCsvParser.ts`，补齐 creatorName 映射。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm run build` 并检查退出码与输出。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  assert.equal(tasks.length, 2);
+  assert.equal(tasks.filter((task) => task.executionKind === "mutation").length, 1);
+  assert.equal(tasks.filter((task) => task.executionKind === "validation").length, 1);
+  assert.equal(tasks.some((task) => task.evidence?.some((evidence) => evidence.kind === "browser_dom")), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((evidence) =>
+    evidence.kind === "cmd" && evidence.value === "npm run build"
+  )), true);
+});
+
+test("build-output follow-up bullets reuse finite command evidence instead of requiring a browser", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# CSV creator mapping",
+      "",
+      "## 关键改动",
+      "- 修改 `src/hooks/useCsvParser.ts`，补齐 creatorName 映射。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm run build`。",
+      "- 确认构建输出显示成功。",
+    ].join("\n"),
+  }], { language: "zh" });
+  const ledger = [
+    {
+      id: "source-edit",
+      kind: "file",
+      value: "src/hooks/useCsvParser.ts",
+      target: "src/hooks/useCsvParser.ts",
+      sourceTool: "replace_in_file",
+      createdAt: 1,
+      diff: "@@ -1 +1 @@\n-old\n+creatorName: creator",
+      changedIdentifiers: ["creatorName"],
+    },
+    {
+      id: "build-success",
+      kind: "cmd",
+      value: "npm run build",
+      target: "npm run build",
+      sourceTool: "run_command",
+      createdAt: 2,
+      outcome: "succeeded",
+    },
+  ];
+  const audit = buildPlanTaskEvidenceAudit({ tasks, evidenceLedger: ledger });
+
+  assert.equal(tasks.some((task) => task.evidence?.some((evidence) => evidence.kind === "browser_dom")), false);
+  assert.equal(audit.allTrustedComplete, true);
+});
+
+test("shell command extraction covers common validation runners", () => {
+  assert.deepEqual(
+    extractShellCommandsFromText("运行 `pytest -q`、`mvn test`、`swift test`、`./gradlew test` 和 `corepack pnpm test`。"),
+    ["pytest -q", "mvn test", "swift test", "./gradlew test", "corepack pnpm test"],
+  );
 });
 
 test("runtime plan task derivation accepts affected-file tables without promoting read-only rows", () => {
@@ -1719,6 +2049,49 @@ test("approved Plan blocks workspace mutations outside the reviewed task targets
   assert.equal(allowed.allowed, true);
   assert.equal(blocked.allowed, false);
   assert.deepEqual(blocked.unexpectedTargets, ["src/app.tsx"]);
+});
+
+test("approved Plan applies the same target scope to MCP edits and deletes", () => {
+  const tasks = extractPlanTasks(
+    "- [ ] 修改 `Assets/Scripts/Foo.cs` 添加启动保护。",
+  );
+  const allowedMcp = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "script_apply_edits",
+    args: { path: "Assets/Scripts", name: "Foo" },
+    target: "Assets/Scripts/Foo.cs",
+    tasks,
+  });
+  const blockedMcp = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "script_apply_edits",
+    args: { path: "Assets/Scripts", name: "Other" },
+    target: "Assets/Scripts/Other.cs",
+    tasks,
+  });
+  const blockedDelete = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "delete_workspace_path",
+    args: { path: "Assets/Scripts/Other.cs" },
+    target: "Assets/Scripts/Other.cs",
+    tasks,
+  });
+  const inspectOnly = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "manage_script",
+    args: { action: "inspect", path: "Assets/Scripts", name: "Foo" },
+    target: "manage_script",
+    tasks,
+  });
+
+  assert.equal(allowedMcp.allowed, true);
+  assert.equal(blockedMcp.allowed, false);
+  assert.equal(blockedDelete.allowed, false);
+  assert.equal(inspectOnly.applies, false);
 });
 
 test("approved Plan scope never treats a nested source path as its shorter relative suffix", () => {
@@ -2552,6 +2925,53 @@ test("validateActionablePlanArtifact allows defaulted internal implementation fo
   assert.equal(fork.classification, "defaultable");
   assert.equal(fork.requiresUserOptions, false);
   assert.equal(result.ok, true);
+});
+
+test("validateActionablePlanArtifact does not treat a mutation-looking H1 as an execution section", () => {
+  const plan = [
+    "# Fix initialization error handling",
+    "",
+    "## Summary",
+    "- User goal: Add startup error handling in `src/main.js`.",
+    "",
+    "## Evidence",
+    "- Confirmed `src/main.js` registers the startup listener without an error boundary.",
+    "",
+    "## Test Plan",
+    "- Run `npm test` and verify startup errors are reported.",
+    "",
+    "## Validation",
+    "- Startup failures produce a visible error instead of a blank screen.",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(plan);
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /missing_plan_required_sections:.*execution_steps/);
+});
+
+test("validateActionablePlanArtifact does not treat Data Flow as a mutation section", () => {
+  const plan = [
+    "# Startup reliability plan",
+    "",
+    "## Summary",
+    "- User goal: Add an initialization error listener in `src/main.js`.",
+    "",
+    "## Evidence",
+    "- Confirmed `src/main.js` owns startup event registration.",
+    "",
+    "## Data Flow",
+    "1. The startup event reaches the existing application bootstrap.",
+    "",
+    "## Test Plan",
+    "- Run `npm test` and verify initialization failures are surfaced.",
+    "",
+    "## Validation",
+    "- The application reports an initialization error without hanging.",
+  ].join("\n");
+
+  const result = validateActionablePlanArtifact(plan);
+  assert.equal(result.ok, false);
+  assert.match(result.reason || "", /missing_plan_required_sections:.*execution_steps/);
 });
 
 test("validateActionablePlanArtifact rejects empty goals and approved-goal filler", () => {

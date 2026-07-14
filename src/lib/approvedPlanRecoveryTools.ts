@@ -1,5 +1,6 @@
 import { workspacePathsReferToSameFile } from "./workspacePaths";
 import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
+import { WORKSPACE_MUTATION_TOOL_NAMES } from "./workspaceMutationTools";
 
 export interface ApprovedPlanRecoveryActivityLike {
   name?: string;
@@ -29,11 +30,7 @@ export const APPROVED_PLAN_PATCH_RECOVERY_READ_TOOLS = new Set([
   "read_file",
 ]);
 
-export const APPROVED_PLAN_SOURCE_EDIT_TOOLS = new Set([
-  "apply_patch",
-  "replace_in_file",
-  "write_file",
-]);
+export const APPROVED_PLAN_SOURCE_EDIT_TOOLS = new Set(WORKSPACE_MUTATION_TOOL_NAMES);
 
 export const APPROVED_PLAN_PTY_LIFECYCLE_TOOLS = new Set([
   "send_pty_input",

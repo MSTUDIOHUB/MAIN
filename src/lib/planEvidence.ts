@@ -9,6 +9,11 @@ import {
 import type { ToolDiffPreview } from "./toolDiff";
 import { preserveNumberedUserGoalLines } from "./numberedGoalFacets";
 import { classifyFailedFiniteValidationOutcome } from "./commandValidationOutcome";
+import {
+  EXTERNAL_WORKSPACE_MUTATION_TOOL_NAMES,
+  hasResolvedWorkspaceMutationTarget,
+  isWorkspaceMutationToolName,
+} from "./workspaceMutationTools";
 
 export interface PlanEvidenceFactInput {
   tool: string;
@@ -747,7 +752,7 @@ export function browserResultLooksSuccessful(result: string): boolean {
   } catch {
     // Plain-text adapters are accepted unless they carry a clear failure marker.
   }
-  return !/(?:"ok"\s*:\s*false|"success"\s*:\s*false|browser validation failed|assertion failed|error:)/i.test(result);
+  return !/(?:"ok"\s*:\s*false|"success"\s*:\s*false|browser validation failed|assertion failed|DEV_SERVER_NOT_READY|REPEATED_FAILURE_BLOCKED|navigation timeout|timed?\s*out|page (?:runtime )?error|error:)/i.test(result);
 }
 
 export function isPlanExecutionEvidenceTool(toolName: string, target: string): boolean {
@@ -796,7 +801,16 @@ export function createPlanExecutionEvidenceEntry(input: {
     sourceTool: input.toolName,
     createdAt: timestamp,
   };
-  if (["write_file", "replace_in_file", "apply_patch", "delete_workspace_path"].includes(input.toolName)) {
+  if (isWorkspaceMutationToolName(input.toolName)) {
+    if (
+      EXTERNAL_WORKSPACE_MUTATION_TOOL_NAMES.has(input.toolName) &&
+      (!input.diff?.path || !hasResolvedWorkspaceMutationTarget(input.toolName, target))
+    ) {
+      // Dynamic editor tools may also expose read/inspect actions (notably
+      // manage_script). Only a verified changed path/diff is trusted as Plan
+      // mutation evidence.
+      return null;
+    }
     const beforeLines = new Set(String(input.diff?.old || "").split(/\r?\n/));
     const changedText = String(input.diff?.new || "")
       .split(/\r?\n/)

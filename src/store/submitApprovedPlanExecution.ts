@@ -3,6 +3,10 @@ import { getReviewablePlanArtifacts } from "../lib/planApprovalIdentity";
 import {
   deriveRuntimePlanTasksFromArtifacts,
   getPendingPlanTaskCommandFocus,
+  isLikelySourceMutationTask,
+  isRuntimeTaskMutationSectionHeading,
+  isPlanTaskSourceMutationObligation,
+  normalizeRuntimePlanSectionHeadings,
   reconcilePlanTaskCompletion,
   validateActionablePlanArtifact,
   validatePlanArtifactContent,
@@ -32,14 +36,12 @@ export interface ApprovedPlanExecutionReadiness {
   taskCount: number;
 }
 
-const PLAN_MUTATION_SECTION_RE =
-  /^(?:改动|变更|关键改动|关键实现改动|实现改动|实施步骤|执行步骤|修复步骤|落地步骤|影响文件(?:清单)?|涉及文件(?:清单)?|文件变更|变更文件|Changes?|Key Changes|Implementation Changes|Implementation Steps|Execution Steps|Plan of Work|Affected Files(?: List)?|Files? to Change|File Changes)(?:\s*(?:[（(].*[）)]|[:：—-].*))?$/i;
 const PLAN_VALIDATION_SECTION_RE =
-  /^(?:测试方案|测试计划|测试场景|验证方案|验证标准|验证方式|验收标准|验收|Test Plan|Testing|Tests?|Validation|Acceptance(?: Criteria)?)(?:\s*(?:[（(].*[）)]|[:：—-]|与).*)?$/i;
+  /^(?:(?:目标\s*与\s*)?(?:测试方案|测试计划|测试场景|验证方案|验证标准|验证方式|验收标准|验收)|(?:Goals?\s+and\s+)?(?:Test Plan|Testing|Tests?|Validation|Acceptance(?: Criteria)?))(?:\s*(?:[（(].*[）)]|[:：—-]|与).*)?$/i;
 const LEADING_READ_OR_VALIDATION_INTENT_RE =
   /^(?:(?:需要|需|先|请|继续|首先|下一步|再)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解|验证|测试|验收|运行测试|执行测试)|^(?:(?:need(?:s)?\s+to|first|please|next|then)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand|verify|validate|test)\b/i;
 const EXPLICIT_MUTATION_ACTION_RE =
-  /(?:将.{1,140}(?:改为|替换为)|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现|implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+  /(?:将.{1,140}(?:改为|替换为)|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现)|\b(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
 const MUTATION_AFTER_READ_RE =
   /(?:然后|随后|之后|再|并(?:且)?).{0,120}(?:将.{1,80}(?:改为|替换为)|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现)|(?:then|after(?:wards)?|and then).{0,120}(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
 const EXPLICIT_NO_MUTATION_RE =
@@ -59,20 +61,35 @@ function stripPlanListSyntax(line: string): string {
     .trim();
 }
 
-function collectSectionLines(content: string, headingPattern: RegExp): string[] {
+function collectSectionLines(
+  content: string,
+  headingMatcher: RegExp | ((heading: string) => boolean),
+): string[] {
   const lines: string[] = [];
   let inSection = false;
   let sectionLevel = 0;
-  for (const rawLine of String(content || "").split(/\r?\n/)) {
+  for (const rawLine of normalizeRuntimePlanSectionHeadings(content).split(/\r?\n/)) {
     const heading = rawLine.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
     if (heading) {
       const level = heading[1]?.length || 0;
-      if (inSection && level <= sectionLevel) inSection = false;
       const headingText = (heading[2] || "")
         .replace(/\*\*/g, "")
         .replace(/^\d+[.)、]\s*/, "")
         .trim();
-      if (!inSection && headingPattern.test(headingText)) {
+      if (inSection && level > sectionLevel) {
+        // Nested headings carry reviewed intent too. Plans commonly put the
+        // concrete mutation in a child heading such as
+        // "### 1. Modify src/main.js" and only supporting detail below it.
+        lines.push(headingText);
+        continue;
+      }
+      if (inSection && level <= sectionLevel) inSection = false;
+      const headingMatches = typeof headingMatcher === "function"
+        ? headingMatcher(headingText)
+        : headingMatcher.test(headingText);
+      // H1 is the document title, even when it starts with "Fix". Approval
+      // requires a real child execution/validation section.
+      if (!inSection && level > 1 && headingMatches) {
         inSection = true;
         sectionLevel = level;
       }
@@ -92,7 +109,8 @@ function hasExplicitMutationIntent(text: string): boolean {
   if (LEADING_READ_OR_VALIDATION_INTENT_RE.test(normalized) && !MUTATION_AFTER_READ_RE.test(normalized)) {
     return false;
   }
-  return EXPLICIT_MUTATION_ACTION_RE.test(normalized);
+  return EXPLICIT_MUTATION_ACTION_RE.test(normalized) &&
+    isLikelySourceMutationTask(normalized);
 }
 
 function isConcreteMutationOrDeliverableTask(task: PlanTask): boolean {
@@ -100,8 +118,7 @@ function isConcreteMutationOrDeliverableTask(task: PlanTask): boolean {
   if (evidence.some((item) => item.kind === "deliverable" && String(item.value || "").trim())) {
     return true;
   }
-  return evidence.some((item) => item.kind === "file" && String(item.value || "").trim()) &&
-    hasExplicitMutationIntent(task.text);
+  return isPlanTaskSourceMutationObligation(task) && hasExplicitMutationIntent(task.text);
 }
 
 function isExecutableValidationTask(task: PlanTask): boolean {
@@ -179,7 +196,7 @@ export function evaluateApprovedPlanExecutionReadiness(input: {
   }
 
   const mutationOriented = reviewableArtifacts.some((artifact) =>
-    collectSectionLines(artifact.content, PLAN_MUTATION_SECTION_RE).some(hasExplicitMutationIntent)
+    collectSectionLines(artifact.content, isRuntimeTaskMutationSectionHeading).some(hasExplicitMutationIntent)
   );
   const requiresExecutableValidation = reviewableArtifacts.some((artifact) =>
     collectSectionLines(artifact.content, PLAN_VALIDATION_SECTION_RE).length > 0

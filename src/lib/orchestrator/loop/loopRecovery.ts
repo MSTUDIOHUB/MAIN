@@ -49,7 +49,11 @@ import {
   registerTargetProgressEventForLoopGuard,
   registerToolCallForRepeatGuard,
 } from "../../repetitionGuard";
-import { isPlanTaskTrustedComplete } from "../../workflowModels";
+import {
+  buildPlanTaskEvidenceAudit,
+  isPlanTaskTrustedComplete,
+  planTaskHasUnsatisfiedSourceMutationEvidence,
+} from "../../workflowModels";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import {
   isToolAutoExecutableForCall,
@@ -61,6 +65,7 @@ import {
   isEditProgressResult,
   isVerificationEvidenceResult,
 } from "./toolActivityTracking";
+import type { CrossIterationFileReadObservation } from "./loopGuardRuntimeState";
 
 const DEFAULT_CROSS_ITERATION_READ_CONTEXT_LIMIT = 128000;
 const SMALL_CONTEXT_READ_LOOP_THRESHOLD = 16384;
@@ -69,6 +74,33 @@ const SMALL_CONTEXT_MAX_CROSS_READS = 3;
 const MEDIUM_CONTEXT_MAX_CROSS_READS = 4;
 const LARGE_CONTEXT_MAX_CROSS_READS = 5;
 const BLOCKED_READS_BEFORE_RECOVERY_RESET = 2;
+
+function hasPendingApprovedPlanSourceMutation(callbacks: OrchestratorCallbacks): boolean {
+  if (!callbacks.getIsPlanApproved()) return false;
+  const tasks = callbacks.getPlanTasks();
+  if (!Array.isArray(tasks) || tasks.length === 0) return false;
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks,
+    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+    preserveMissing: true,
+    highlightNext: true,
+  });
+  const evidenceLedger = callbacks.getPlanExecutionEvidenceLedger();
+  return audit.remainingTasks.some((task) =>
+    planTaskHasUnsatisfiedSourceMutationEvidence(task, evidenceLedger)
+  );
+}
+
+function isExecuteMutationRecoveryEligible(input: {
+  callbacks: OrchestratorCallbacks;
+  workflowMode: "chat" | "edit" | "plan";
+  runtimeIntent: ResolvedUserIntent;
+}): boolean {
+  if (!isMutationRuntimeIntent(input.runtimeIntent)) return false;
+  if (input.workflowMode === "edit") return true;
+  return input.workflowMode === "plan" &&
+    hasPendingApprovedPlanSourceMutation(input.callbacks);
+}
 
 function resolveCrossIterationReadThreshold(contextLimit?: number): number {
   const effectiveContextLimit = contextLimit ?? DEFAULT_CROSS_ITERATION_READ_CONTEXT_LIMIT;
@@ -81,6 +113,16 @@ export interface NoProgressTrackingState {
   lastNoProgressBatchSignature: string;
   noProgressBatchRepeatCount: number;
   consecutiveReadFileOnlyCacheHits: number;
+  lastReadFileOnlyObservationSignature: string;
+}
+
+function buildReadFileOnlyObservationBatchSignature(results: ToolExecutionResult[]): string {
+  if (!isReadFileOnlyPattern(results)) return "";
+  return results
+    .map((result) => result.readFileObservation?.key || buildNoProgressBatchSignature([result]))
+    .filter(Boolean)
+    .sort()
+    .join("||");
 }
 
 export interface PendingExecuteNoProgressPause {
@@ -232,7 +274,12 @@ export function handleNoProgressRecovery(input: {
   } = input;
 
   const noProgressBatchSignature = buildNoProgressBatchSignature(results);
-  let { lastNoProgressBatchSignature, noProgressBatchRepeatCount, consecutiveReadFileOnlyCacheHits } = input.tracking;
+  let {
+    lastNoProgressBatchSignature,
+    noProgressBatchRepeatCount,
+    consecutiveReadFileOnlyCacheHits,
+    lastReadFileOnlyObservationSignature,
+  } = input.tracking;
   if (noProgressBatchSignature) {
     if (noProgressBatchSignature === lastNoProgressBatchSignature) {
       noProgressBatchRepeatCount += 1;
@@ -245,16 +292,28 @@ export function handleNoProgressRecovery(input: {
     noProgressBatchRepeatCount = 0;
   }
 
-  if (isReadFileOnlyPattern(results)) {
-    consecutiveReadFileOnlyCacheHits += 1;
+  const readFileOnlyObservationSignature = buildReadFileOnlyObservationBatchSignature(results);
+  if (readFileOnlyObservationSignature) {
+    const previousReadFileOnlyObservationSignature =
+      lastReadFileOnlyObservationSignature ||
+      (consecutiveReadFileOnlyCacheHits > 0 ? readFileOnlyObservationSignature : "");
+    if (readFileOnlyObservationSignature === previousReadFileOnlyObservationSignature) {
+      consecutiveReadFileOnlyCacheHits += 1;
+      lastReadFileOnlyObservationSignature = readFileOnlyObservationSignature;
+    } else {
+      lastReadFileOnlyObservationSignature = readFileOnlyObservationSignature;
+      consecutiveReadFileOnlyCacheHits = 1;
+    }
   } else {
     consecutiveReadFileOnlyCacheHits = 0;
+    lastReadFileOnlyObservationSignature = "";
   }
 
   const tracking = {
     lastNoProgressBatchSignature,
     noProgressBatchRepeatCount,
     consecutiveReadFileOnlyCacheHits,
+    lastReadFileOnlyObservationSignature,
   };
 
   let pendingExecuteRecoveryPrompt: string | null = null;
@@ -263,6 +322,11 @@ export function handleNoProgressRecovery(input: {
   let currentExecuteRecoveryMode = executeRecoveryMode;
   let currentExecuteRecoveryReason = executeRecoveryReason;
   let currentExecuteRecoveryAttempts = executeRecoveryAttempts;
+  const executeMutationRecoveryEligible = isExecuteMutationRecoveryEligible({
+    callbacks,
+    workflowMode,
+    runtimeIntent,
+  });
   const activateTrackedExecuteRecovery = (
     mode: Exclude<ExecuteRecoveryMode, "normal">,
     reason: string,
@@ -305,7 +369,7 @@ export function handleNoProgressRecovery(input: {
   }
 
   const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
-  if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
+  if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && executeMutationRecoveryEligible) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
     activateTrackedExecuteRecovery("mutation_first", "read_file_only_loop", {
       repeatedTargets,
@@ -321,8 +385,7 @@ export function handleNoProgressRecovery(input: {
   }
 
   const executeReadOnlyRecovery =
-    workflowMode === "edit" &&
-    isMutationRuntimeIntent(runtimeIntent) &&
+    executeMutationRecoveryEligible &&
     currentExecuteRecoveryMode === "normal"
       ? resolveExecuteReadOnlyRecoveryTrigger({
           results,
@@ -505,14 +568,14 @@ export function handleNoProgressRecovery(input: {
         batches: planReadOnlyConvergenceBatches,
         tools: planReadOnlyConvergenceTools,
       });
-    } else if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent) && pendingExecuteRecoveryPrompt) {
+    } else if (executeMutationRecoveryEligible && pendingExecuteRecoveryPrompt) {
       logAgentEvent("execute_no_progress_deferred_to_recovery", {
         iteration,
         repeats: noProgressBatchRepeatCount,
         executeRecoveryMode: currentExecuteRecoveryMode,
         executeRecoveryReason: currentExecuteRecoveryReason,
       });
-    } else if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
+    } else if (executeMutationRecoveryEligible) {
       const language = callbacks.getPreferredLanguage();
       const repeatedTargets = pendingExecuteNoProgressPause?.repeatedTargets.length
         ? pendingExecuteNoProgressPause.repeatedTargets
@@ -659,11 +722,12 @@ export interface CrossIterationReadFileLoopRecoveryResult {
 
 export function handleCrossIterationReadFileLoopRecovery(input: {
   callbacks: OrchestratorCallbacks;
+  workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
   iteration: number;
   results: ToolExecutionResult[];
   snapshotContextLimit?: number;
-  crossIterationFileReads: Map<string, number>;
+  crossIterationFileReads: Map<string, CrossIterationFileReadObservation>;
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
   consecutiveBlockedReadFileInRecoveryCount: number;
@@ -686,7 +750,11 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
   let executeRecoveryMode = input.executeRecoveryMode;
   let executeRecoveryReason = input.executeRecoveryReason;
   let consecutiveBlockedReadFileInRecoveryCount = input.consecutiveBlockedReadFileInRecoveryCount;
-  if (!isMutationRuntimeIntent(runtimeIntent)) {
+  if (!isExecuteMutationRecoveryEligible({
+    callbacks,
+    workflowMode: input.workflowMode,
+    runtimeIntent,
+  })) {
     return {
       executeRecoveryMode,
       executeRecoveryReason,
@@ -694,28 +762,64 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
     };
   }
 
+  let matchingMutationProgressObserved = false;
+  for (const result of results) {
+    if (!isEditProgressResult(result) || !result.target) continue;
+    for (const [key, observation] of [...crossIterationFileReads.entries()]) {
+      if (!workspacePathsReferToSameFile(observation.path, result.target)) continue;
+      crossIterationFileReads.delete(key);
+      matchingMutationProgressObserved = true;
+    }
+  }
+  // A successful command or an edit to another file does not change the
+  // cached version/range of this read target. Keeping its streak prevents
+  // read A -> pwd/edit B -> read A from evading loop recovery indefinitely.
+  if (matchingMutationProgressObserved) consecutiveBlockedReadFileInRecoveryCount = 0;
+
   let blockedReadFileDetected = false;
   for (const result of results) {
     if (result.internalFeedback) continue;
     if (result.name !== "read_file") continue;
     const target = result.target;
     if (!target) continue;
-    const trackedTarget = [...crossIterationFileReads.keys()].find((candidate) =>
-      workspacePathsReferToSameFile(candidate, target)
-    ) || target;
+    const readObservation = result.readFileObservation;
 
     if (!result.isError) {
       const noProgressRead = isReadOnlyNoProgressDetail(
         String(result.displayContent || result.content || ""),
       );
       if (!noProgressRead) {
-        // A new range or a new file version is progress. Clear the target's
-        // unchanged-window streak instead of treating path reuse as a loop.
-        crossIterationFileReads.delete(trackedTarget);
+        // A fresh read of a new range is legal and must not erase another
+        // range's streak. A conservative command-cache invalidation can also
+        // re-execute the same unchanged range; keeping that exact identity
+        // prevents `read A -> pwd -> read A` from evading loop recovery.
+        // Only a genuinely new file version retires older version streaks.
+        if (readObservation) {
+          for (const [key, observation] of [...crossIterationFileReads.entries()]) {
+            if (!workspacePathsReferToSameFile(observation.path, readObservation.path)) continue;
+            if (observation.versionToken !== readObservation.versionToken) {
+              crossIterationFileReads.delete(key);
+            }
+          }
+        }
         continue;
       }
-      crossIterationFileReads.set(trackedTarget, (crossIterationFileReads.get(trackedTarget) || 0) + 1);
-      const count = crossIterationFileReads.get(trackedTarget)!;
+      // Count only observations the cache has proved were already seen for
+      // this file version/range. This detects loops without imposing a raw
+      // limit on how often a large or newly changed file may be read.
+      const observationKey = readObservation?.key || buildNoProgressBatchSignature([result]);
+      if (!observationKey) continue;
+      const previousObservation = crossIterationFileReads.get(observationKey);
+      const count = (previousObservation?.count || 0) + 1;
+      crossIterationFileReads.set(observationKey, {
+        path: readObservation?.path || target,
+        versionToken: readObservation?.versionToken || "legacy",
+        count,
+      });
+      if (crossIterationFileReads.size > 240) {
+        const oldestKey = crossIterationFileReads.keys().next().value;
+        if (oldestKey) crossIterationFileReads.delete(oldestKey);
+      }
       const crossReadThreshold = resolveCrossIterationReadThreshold(snapshotContextLimit);
       if (count >= crossReadThreshold && executeRecoveryMode === "normal") {
         const reason = "cross_iteration_file_read_loop";
@@ -727,18 +831,22 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
         });
         callbacks.appendMessage({
           role: "system",
-          content: `[System: Cross-iteration unchanged-window read_file loop detected for ${target} (${count} no-progress reads). The requested content is already in context — request a missing range, use a changed version, act with write/verify/run/browser tools, or state the real blocker. Do not output long prose.]`,
+          content: `[System: Cross-iteration observation-only read_file loop detected for ${target} (${count} reads without task progress; latest=${noProgressRead ? "cached/replayed" : "fresh observation"}). The reads remain valid evidence, but the pending mutation task has not advanced. Act now with a scoped write, validation, or an exact blocker. Do not output long prose.]`,
         });
         logAgentEvent("cross_iteration_file_read_loop", {
           iteration,
           target,
           crossIterationReads: count,
+          latestReadKind: "cached_or_replayed",
         });
       }
       continue;
     }
 
-    if (executeRecoveryMode !== "normal" || (crossIterationFileReads.get(trackedTarget) ?? 0) >= 2) {
+    const repeatedTargetReadCount = [...crossIterationFileReads.values()]
+      .filter((observation) => workspacePathsReferToSameFile(observation.path, target))
+      .reduce((max, observation) => Math.max(max, observation.count), 0);
+    if (executeRecoveryMode !== "normal" || repeatedTargetReadCount >= 2) {
       blockedReadFileDetected = true;
     }
   }
@@ -963,7 +1071,7 @@ export function handleExecuteConvergencePrompt(input: {
     recentToolActivity: recentToolActivity.length,
     executeRecoveryMode,
   });
-  if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
+  if (isExecuteMutationRecoveryEligible({ callbacks, workflowMode, runtimeIntent })) {
     activateExecuteRecovery("mutation_first", "execute_convergence_prompt", {
       maxIterations: effectiveMaxIterations,
       recentToolActivity: recentToolActivity.length,

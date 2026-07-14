@@ -336,6 +336,8 @@ export interface ToolExecutionResult {
   qualityGateReason?: string;
   planRecoveryAction?: PlanArtifactRecoveryAction;
   missingPlanSections?: string[];
+  /** Internal identity for one versioned read_file request window. */
+  readFileObservation?: import("./fileReadCache").FileReadObservationIdentity;
 }
 
 export interface PlanMaterializationResultForLoop {

@@ -6,6 +6,11 @@ import {
   MAX_RECENT_PLAN_TOOL_ACTIVITY,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
 } from "../../orchestrator";
+import {
+  hasResolvedWorkspaceMutationTarget,
+  isWorkspaceMutationToolCall,
+  isWorkspaceMutationToolName,
+} from "../../workspaceMutationTools";
 import { browserResultLooksSuccessful, commandResultLooksSuccessful } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { summarizePlanEvidenceDetail } from "../../planMaterialization";
@@ -116,10 +121,8 @@ export function toolResultCountsAsExecutionEvidence(
   if (feedbackStatus === "no_op" || feedbackStatus === "no_effect_mutation" || feedbackStatus === "cached") {
     return false;
   }
-  const isWorkspaceMutation =
-    result.name === "apply_patch" ||
-    result.name === "replace_in_file" ||
-    result.name === "write_file";
+  const isWorkspaceMutation = isWorkspaceMutationToolCall(result.name, args);
+  if (isWorkspaceMutationToolName(result.name) && !isWorkspaceMutation) return false;
   if (
     isWorkspaceMutation &&
     /"noOp"\s*:\s*true|NO_EFFECT_MUTATION|no-op|nothing to (?:change|patch|write)|already matched requested content/i.test(result.content || "")
@@ -177,7 +180,18 @@ export function rememberDelegatedSubagentActivities(
 }
 
 export function isEditProgressResult(result: ToolExecutionResult): boolean {
-  return EDIT_PROGRESS_TOOL_NAMES.has(result.name) || String(result.target || "").startsWith("shell-write:");
+  if (result.isError || result.internalFeedback) return false;
+  if (
+    /"noOp"\s*:\s*true|NO_EFFECT_MUTATION|"status"\s*:\s*"(?:no_op|no_effect_mutation)"|no-op|nothing to (?:change|patch|write)|already matched requested content/i.test(
+      String(result.content || result.displayContent || ""),
+    )
+  ) {
+    return false;
+  }
+  if (EDIT_PROGRESS_TOOL_NAMES.has(result.name)) {
+    return hasResolvedWorkspaceMutationTarget(result.name, result.target || "");
+  }
+  return String(result.target || "").startsWith("shell-write:");
 }
 
 export function isVerificationEvidenceResult(result: ToolExecutionResult): boolean {

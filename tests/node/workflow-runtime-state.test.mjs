@@ -106,6 +106,9 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
   assert.match(source, /createPlanExecutionEvidenceEntry/);
   assert.match(source, /appendPlanEvidenceEntry/);
   assert.match(source, /reconcilePlanTaskCompletion/);
+  const lifecycleMissReturn = source.indexOf("if (existingIndex < 0) return evidencePatch", evidenceCreation);
+  const evidenceAppend = source.indexOf("appendPlanEvidenceEntry", evidenceCreation);
+  assert.ok(evidenceAppend > evidenceCreation && evidenceAppend < lifecycleMissReturn);
   assert.ok(internalFeedbackGuard > onToolDoneStart);
   assert.ok(
     evidenceCreation > internalFeedbackGuard,

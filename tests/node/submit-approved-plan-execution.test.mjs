@@ -165,6 +165,72 @@ function loggedNonExecutableMdViewerPlan() {
   ].join("\n");
 }
 
+function themedDiagnosisNestedMutationPlan() {
+  return [
+    "# 白屏修复计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复 MD Viewer 启动白屏，并在初始化失败时显示错误。",
+    "",
+    "## 已确认证据",
+    "- 已读取 `src/main.js`，确认 DOMContentLoaded 调用 init。",
+    "",
+    "## 白屏问题诊断",
+    "### 观察到的现象",
+    "1. `src/main.js` 第 24 行：`document.addEventListener('DOMContentLoaded', handler)` 是唯一入口点。",
+    "2. `init()` 中没有错误处理。",
+    "",
+    "## 改动方案",
+    "### 1. 修改 `src/main.js` — 添加错误处理",
+    "- 在 DOMContentLoaded 回调中捕获 init 异常并显示错误层。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不改变公共 API。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm run dev` 启动开发服务器。",
+    "- 使用浏览器验证页面能正常渲染。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有编辑与预览行为不变。",
+  ].join("\n");
+}
+
+function realQwenCsvRecoveryPlan() {
+  return [
+    "# Proposed Plan",
+    "",
+    "## 1. 目标与验收标准",
+    "- **目标**：修复 `src/hooks/useCsvParser.ts` 中的 `normalizeCsvOrder`，将 CSV creator 映射为 `creatorName`。",
+    "- **验收标准**：",
+    "  1. 返回对象必须包含 `creatorName`。",
+    "  2. Dashboard 能正确显示 creator 信息。",
+    "",
+    "## 2. 现状分析（基于只读证据）",
+    "- `normalizeCsvOrder` 当前只返回 `creator`，下游读取 `creatorName`。",
+    "",
+    "## 3. 实施步骤",
+    "1. **修改 `src/hooks/useCsvParser.ts`**：",
+    "   - 更新 `normalizeCsvOrder` 返回对象，添加 `creatorName: row.creator || row['创建者'] || ''`。",
+    "",
+    "## 4. 影响范围",
+    "- `src/types/order.ts` 无需修改。",
+    "",
+    "## 5. 风险与回滚",
+    "- 若验证失败，恢复原始字段映射。",
+    "",
+    "## 6. 测试方案",
+    "- **手动验证**：",
+    "  - 使用 `cn_tutorial_orders_by_creator_20260512.csv` 进行测试。",
+    "  - 观察 Dashboard 是否正确显示 creator 信息。",
+    "- **代码审查**：",
+    "  - 确认 `normalizeCsvOrder` 的返回值与 `Order` 接口兼容。",
+    "",
+    "## 7. 假设与默认值",
+    "- 保留现有 `creator` 字段以兼容既有调用。",
+  ].join("\n");
+}
+
 test("approved plan execution detects requested root markdown deliverables", () => {
   assert.deepEqual(
     detectRequestedRootMarkdownDeliverables("Write project root CHANGELOG.md and README.md, ignore plan.md"),
@@ -243,6 +309,38 @@ test("approval readiness rejects the logged MD Viewer plan before deriving a chi
   assert.equal(readiness.qualityReason, "non_executable_test_plan");
 });
 
+test("approval readiness rejects a mutation title with evidence and tests but no mutation section", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Fix initialization error handling",
+    "",
+    "## Summary",
+    "- User goal: Add startup error handling in `src/main.js`.",
+    "",
+    "## Evidence",
+    "- Confirmed `src/main.js` owns startup listener registration.",
+    "",
+    "## Test Plan",
+    "- Run `npm test` and verify startup errors are surfaced.",
+    "",
+    "## Validation",
+    "- Startup failures report an error without a blank screen.",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "en");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, false);
+  assert.equal(readiness.reason, "plan_artifact_quality_rejected");
+  assert.match(readiness.qualityReason || "", /execution_steps/);
+  assert.equal(readiness.concreteMutationTaskCount, 0);
+});
+
 test("approval readiness rejects a bogus read-only runtime task for a mutation plan", () => {
   const artifact = reviewablePlanArtifact(executableMutationPlan());
   const readiness = evaluateApprovedPlanExecutionReadiness({
@@ -260,6 +358,206 @@ test("approval readiness rejects a bogus read-only runtime task for a mutation p
   assert.equal(readiness.mutationOriented, true);
   assert.equal(readiness.concreteMutationTaskCount, 0);
   assert.equal(readiness.executableValidationTaskCount, 0);
+});
+
+test("approval readiness preserves a nested mutation under a themed diagnosis plan", () => {
+  const artifact = reviewablePlanArtifact(themedDiagnosisNestedMutationPlan());
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.equal(
+    executionPlanTasks.some((task) => /唯一入口点/.test(task.text)),
+    false,
+  );
+  assert.equal(
+    executionPlanTasks.filter((task) =>
+      task.evidence?.some((entry) => entry.kind === "file" && entry.value === "src/main.js")
+    ).length,
+    1,
+  );
+});
+
+test("approval readiness projects the recovered Qwen plan into mutation and executable validation roles", () => {
+  const artifact = reviewablePlanArtifact(realQwenCsvRecoveryPlan());
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.ok(readiness.executableValidationTaskCount >= 1);
+  assert.ok(executionPlanTasks.some((task) =>
+    task.executionKind === "mutation" &&
+    task.evidence?.some((entry) => entry.kind === "file" && entry.value === "src/hooks/useCsvParser.ts")
+  ), JSON.stringify(executionPlanTasks));
+  assert.ok(executionPlanTasks.some((task) =>
+    task.executionKind === "validation" &&
+    task.evidence?.some((entry) => entry.kind === "browser_dom" || entry.kind === "cmd")
+  ), JSON.stringify(executionPlanTasks));
+  assert.equal(executionPlanTasks.some((task) =>
+    task.executionKind === "observation" &&
+    task.evidence?.some((entry) => entry.value === "cn_tutorial_orders_by_creator_20260512.csv")
+  ), false, JSON.stringify(executionPlanTasks));
+});
+
+test("approval readiness keeps mutation intent from a combined diagnosis and fix heading", () => {
+  const artifact = reviewablePlanArtifact([
+    "# 白屏修复计划",
+    "",
+    "## 摘要",
+    "- 用户目标：修复初始化白屏，并在启动失败时显示明确错误。",
+    "",
+    "## 已确认证据",
+    "- 已读取 `src/main.js`，确认初始化入口与错误处理缺口。",
+    "",
+    "## 问题诊断与修复方案",
+    "### 诊断证据",
+    "- `src/main.js` 当前只有一个初始化入口。",
+    "### 修改 `src/main.js`",
+    "- 在入口回调中添加初始化错误处理，并保留现有成功路径。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 不改变公共 API、接口或类型。",
+    "",
+    "## 测试方案",
+    "- 运行 `npm test`。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 UI 行为不变。",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.equal(executionPlanTasks.some((task) => /当前只有一个初始化入口/.test(task.text)), false);
+});
+
+test("approval readiness recognizes an English diagnosis and fix plan with a file-only child heading", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Startup error handling plan",
+    "",
+    "## Summary",
+    "- User goal: add visible initialization error handling without changing the success path.",
+    "",
+    "## Confirmed Evidence",
+    "- Read `src/main.js` and confirmed it owns the initialization entry point.",
+    "",
+    "## Diagnosis and Fix Plan",
+    "### `src/main.js`",
+    "- Add initialization error handling while preserving the existing success path.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API, interface, or type changes.",
+    "",
+    "## Test Plan",
+    "- Run `npm test` and verify the focused regression passes.",
+    "",
+    "## Assumptions",
+    "- Preserve the current UI behavior on successful startup.",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "en");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.ok(readiness.executableValidationTaskCount >= 1);
+});
+
+test("approval readiness projects local-model plans with bare section and file labels", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Startup error handling plan",
+    "",
+    "Summary",
+    "- User goal: add visible initialization error handling without changing the success path.",
+    "",
+    "Confirmed Evidence",
+    "- Read `src/main.js` and confirmed it owns initialization.",
+    "",
+    "Fix Plan",
+    "src/main.js",
+    "- Add initialization error handling while preserving successful startup.",
+    "",
+    "Test Plan",
+    "- Run `npm test` and verify the focused regression passes.",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "en");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.ok(readiness.executableValidationTaskCount >= 1);
+});
+
+test("one composite plan step preserves both source mutation and validation obligations", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Initialization fix plan",
+    "",
+    "## Summary",
+    "- User goal: add initialization error handling and verify it with the focused test.",
+    "",
+    "## Confirmed Evidence",
+    "- Read `src/main.js` and confirmed it owns initialization.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.js` to catch initialization failures, then run `npm test` to verify the regression.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API, interface, or type changes.",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "en");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.equal(readiness.executableValidationTaskCount, 1);
 });
 
 test("approval readiness accepts a semantically valid mutation plan with concrete mutation and validation tasks", () => {

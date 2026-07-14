@@ -177,6 +177,7 @@ const {
 
 const {
   handleCrossIterationReadFileLoopRecovery,
+  handleExecuteConvergencePrompt,
   handleReadFileRepeatLimitRecovery,
   handleStrictRepeatGuardRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
@@ -1253,8 +1254,16 @@ test("max-iteration checkpoint keeps internal plan files out of project-source e
     iterationCount: 50,
     maxIterations: 50,
     autoResumeCount: 0,
+    autoResumeEligible: true,
     tasks,
-    evidenceLedger,
+    evidenceLedger: [...evidenceLedger, {
+      id: "document-observation",
+      kind: "tool",
+      value: "docs/runtime-notes.md",
+      target: "docs/runtime-notes.md",
+      sourceTool: "read_document",
+      createdAt: 3,
+    }],
     recentToolActivity: [{ name: "replace_in_file", target: "src/lib/orchestrator.ts", status: "succeeded" }],
     lastAssistantText: "Continuing with tests.",
   });
@@ -1263,6 +1272,7 @@ test("max-iteration checkpoint keeps internal plan files out of project-source e
   assert.equal(checkpoint.currentTask.includes("Add resume guard tests"), true);
   assert.equal(checkpoint.completedEvidence.some((line) => line.includes("src/lib/orchestrator.ts")), true);
   assert.equal(checkpoint.completedEvidence.some((line) => line.includes(".MAIN/plans")), false);
+  assert.equal(checkpoint.completedEvidence.some((line) => line.includes("runtime-notes")), false);
 });
 
 test("pause notice is structured and points to manual resume after one auto-resume", () => {
@@ -1270,6 +1280,7 @@ test("pause notice is structured and points to manual resume after one auto-resu
     iterationCount: 50,
     maxIterations: 50,
     autoResumeCount: PLAN_MAX_AUTO_RESUME_LIMIT,
+    autoResumeEligible: false,
     tasks,
     evidenceLedger,
     recentToolActivity: [{ name: "run_command", target: "npm test", status: "failed", detail: "exitCode 1" }],
@@ -1288,6 +1299,7 @@ test("execute max-iteration notices describe a recoverable boundary instead of f
     iterationCount: 50,
     maxIterations: 50,
     autoResumeCount: PLAN_MAX_AUTO_RESUME_LIMIT,
+    autoResumeEligible: false,
     tasks: [],
     evidenceLedger: [],
     recentToolActivity: [{ name: "run_command", target: "npm test", status: "succeeded", detail: "exitCode 0" }],
@@ -1313,6 +1325,7 @@ test("resume prompt requires fresh workspace reads and treats .MAIN plans as int
     iterationCount: 50,
     maxIterations: 50,
     autoResumeCount: 1,
+    autoResumeEligible: true,
     tasks,
     evidenceLedger,
     recentToolActivity: [{ name: "replace_in_file", target: "src/store/useAppStore.ts", status: "succeeded" }],
@@ -1337,6 +1350,7 @@ test("resume prompt does not tell the model to read missing optional tasks.md", 
     iterationCount: 50,
     maxIterations: 50,
     autoResumeCount: 1,
+    autoResumeEligible: false,
     tasks,
     evidenceLedger: [],
     recentToolActivity: [{ name: "read_file", target: "src/App.tsx", status: "succeeded" }],
@@ -1360,6 +1374,7 @@ test("empty checkpoint fallback treats tasks.md as optional", () => {
     iterationCount: 50,
     maxIterations: 50,
     autoResumeCount: 1,
+    autoResumeEligible: false,
     tasks: [],
     evidenceLedger: [],
     recentToolActivity: [{ name: "read_file", target: "src/App.tsx", status: "succeeded" }],
@@ -1608,20 +1623,23 @@ test("approved execution repeated cached reads replay prior content after the fi
   assert.match(replay, /L1: import React/);
   assert.match(
     toolCallPartitioningSource,
-    /replayApprovedExecutionRead[\s\S]*duplicateCount\s*>=\s*2[\s\S]*buildFileUnchangedReplayContent/,
+    /contextStillActive|contentStillActive/,
   );
+  assert.match(toolCallPartitioningSource, /context_evicted_replay/);
+  assert.match(toolCallPartitioningSource, /buildFileUnchangedReplayContent/);
 });
 
-test("cross-iteration read recovery counts unchanged windows, not fresh ranges or versions", () => {
+test("cross-iteration read recovery keeps fresh ranges legal but requires mutation-task progress", () => {
   const appended = [];
   const activations = [];
   const callbacks = {
     appendMessage: (message) => appended.push(message),
     getPreferredLanguage: () => "en",
   };
-  const crossIterationFileReads = new Map([["src/main.js", 2]]);
+  const crossIterationFileReads = new Map();
   const fresh = handleCrossIterationReadFileLoopRecovery({
     callbacks,
+    workflowMode: "edit",
     runtimeIntent: "execute",
     iteration: 4,
     results: [{
@@ -1643,17 +1661,18 @@ test("cross-iteration read recovery counts unchanged windows, not fresh ranges o
   assert.equal(crossIterationFileReads.has("src/main.js"), false);
   assert.equal(activations.length, 0);
 
-  const cached = handleCrossIterationReadFileLoopRecovery({
+  const secondFresh = handleCrossIterationReadFileLoopRecovery({
     callbacks,
+    workflowMode: "edit",
     runtimeIntent: "execute",
     iteration: 5,
-    results: Array.from({ length: 3 }, (_value, index) => ({
-      toolCallId: `cached-window-${index}`,
+    results: [{
+      toolCallId: "fresh-window-2",
       name: "read_file",
       target: "src/main.js",
-      content: "FILE_UNCHANGED_STUB: requested range already cached",
+      content: "READ_FILE_RESULT lines 401-500",
       isError: false,
-    })),
+    }],
     snapshotContextLimit: 16_000,
     crossIterationFileReads,
     executeRecoveryMode: "normal",
@@ -1662,10 +1681,410 @@ test("cross-iteration read recovery counts unchanged windows, not fresh ranges o
     activateExecuteRecovery: (...args) => activations.push(args),
   });
 
-  assert.equal(cached.executeRecoveryMode, "mutation_first");
-  assert.equal(crossIterationFileReads.get("src/main.js"), 3);
+  assert.equal(secondFresh.executeRecoveryMode, "normal");
+  assert.equal(crossIterationFileReads.has("src/main.js"), false);
+  assert.equal(activations.length, 0);
+
+  let cached;
+  for (let replay = 1; replay <= 3; replay += 1) {
+    cached = handleCrossIterationReadFileLoopRecovery({
+      callbacks,
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      iteration: 5 + replay,
+      results: [{
+        toolCallId: `cached-window-${replay}`,
+        name: "read_file",
+        target: "src/main.js",
+        content: "CACHED_FILE_REPLAY: requested range restored after compaction",
+        isError: false,
+      }],
+      snapshotContextLimit: 16_000,
+      crossIterationFileReads,
+      executeRecoveryMode: "normal",
+      executeRecoveryReason: "",
+      consecutiveBlockedReadFileInRecoveryCount: 0,
+      activateExecuteRecovery: (...args) => activations.push(args),
+    });
+  }
+
+  assert.equal(cached?.executeRecoveryMode, "mutation_first");
+  assert.equal(Math.max(...[...crossIterationFileReads.values()].map((entry) => entry.count)), 3);
   assert.equal(activations.length, 1);
-  assert.match(appended.at(-1)?.content || "", /unchanged-window/);
+  assert.match(appended.at(-1)?.content || "", /observation-only/);
+});
+
+test("fresh file windows have no raw read-count cap and no-op writes do not reset repeated replay state", () => {
+  const activations = [];
+  const callbacks = {
+    appendMessage: () => {},
+    getPreferredLanguage: () => "en",
+  };
+  const crossIterationFileReads = new Map();
+
+  for (let index = 0; index < 20; index += 1) {
+    const result = handleCrossIterationReadFileLoopRecovery({
+      callbacks,
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      iteration: index + 1,
+      results: [{
+        toolCallId: `fresh-${index}`,
+        name: "read_file",
+        target: "src/large-file.ts",
+        content: `READ_FILE_RESULT lines ${index * 100 + 1}-${(index + 1) * 100}`,
+        isError: false,
+      }],
+      snapshotContextLimit: 16_000,
+      crossIterationFileReads,
+      executeRecoveryMode: "normal",
+      executeRecoveryReason: "",
+      consecutiveBlockedReadFileInRecoveryCount: 0,
+      activateExecuteRecovery: (...args) => activations.push(args),
+    });
+    assert.equal(result.executeRecoveryMode, "normal");
+  }
+  assert.equal(crossIterationFileReads.size, 0);
+  assert.equal(activations.length, 0);
+
+  crossIterationFileReads.set("window-large", {
+    path: "src/large-file.ts",
+    versionToken: "1000:1",
+    count: 2,
+  });
+  handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 21,
+    results: [{
+      toolCallId: "no-op-write",
+      name: "write_file",
+      target: "src/large-file.ts",
+      content: "NO_EFFECT_MUTATION: content already matched requested content",
+      isError: false,
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(crossIterationFileReads.get("window-large")?.count, 2);
+
+  handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 22,
+    results: [{
+      toolCallId: "unrelated-write",
+      name: "write_file",
+      target: "src/other-file.ts",
+      content: "WRITE_FILE_RESULT: changed src/other-file.ts",
+      isError: false,
+    }, {
+      toolCallId: "unrelated-command",
+      name: "run_command",
+      target: "pwd",
+      content: "exitCode=0",
+      isError: false,
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(crossIterationFileReads.get("window-large")?.count, 2);
+
+  handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 23,
+    results: [{
+      toolCallId: "third-replay",
+      name: "read_file",
+      target: "src/large-file.ts",
+      content: "CACHED_FILE_REPLAY: unchanged range",
+      isError: false,
+      readFileObservation: {
+        key: "window-large",
+        path: "src/large-file.ts",
+        requestSignature: "read_file::src/large-file.ts::range-a",
+        versionToken: "1000:1",
+        source: "replay",
+      },
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(crossIterationFileReads.get("window-large")?.count, 3);
+  assert.equal(activations.at(-1)?.[0], "mutation_first");
+});
+
+test("cross-iteration read recovery isolates range signatures and file versions", () => {
+  const activations = [];
+  const callbacks = {
+    appendMessage: () => {},
+    getPreferredLanguage: () => "en",
+  };
+  const makeObservation = (key, versionToken, source = "replay") => ({
+    key,
+    path: "src/large-file.ts",
+    requestSignature: `read_file::src/large-file.ts::${key}`,
+    versionToken,
+    source,
+  });
+  const crossIterationFileReads = new Map();
+
+  for (const key of ["range-a", "range-b", "range-c"]) {
+    const result = handleCrossIterationReadFileLoopRecovery({
+      callbacks,
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      iteration: crossIterationFileReads.size + 1,
+      results: [{
+        toolCallId: key,
+        name: "read_file",
+        target: "src/large-file.ts",
+        content: `CACHED_FILE_REPLAY: ${key}`,
+        isError: false,
+        readFileObservation: makeObservation(key, "v1"),
+      }],
+      snapshotContextLimit: 16_000,
+      crossIterationFileReads,
+      executeRecoveryMode: "normal",
+      executeRecoveryReason: "",
+      consecutiveBlockedReadFileInRecoveryCount: 0,
+      activateExecuteRecovery: (...args) => activations.push(args),
+    });
+    assert.equal(result.executeRecoveryMode, "normal");
+  }
+  assert.deepEqual(
+    [...crossIterationFileReads.values()].map((entry) => entry.count),
+    [1, 1, 1],
+  );
+  assert.equal(activations.length, 0);
+
+  crossIterationFileReads.set("range-a", {
+    path: "src/large-file.ts",
+    versionToken: "v1",
+    count: 2,
+  });
+  handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 4,
+    results: [{
+      toolCallId: "fresh-b",
+      name: "read_file",
+      target: "src/large-file.ts",
+      content: "READ_FILE_RESULT range-b",
+      isError: false,
+      readFileObservation: makeObservation("range-b", "v1", "fresh"),
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(crossIterationFileReads.get("range-a")?.count, 2);
+
+  const repeatedA = handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 5,
+    results: [{
+      toolCallId: "replay-a-3",
+      name: "read_file",
+      target: "src/large-file.ts",
+      content: "CACHED_FILE_REPLAY: range-a",
+      isError: false,
+      readFileObservation: makeObservation("range-a", "v1"),
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(repeatedA.executeRecoveryMode, "mutation_first");
+
+  const nextVersionReads = new Map([["range-a-v1", {
+    path: "src/large-file.ts",
+    versionToken: "v1",
+    count: 2,
+  }]]);
+  handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 6,
+    results: [{
+      toolCallId: "fresh-v2",
+      name: "read_file",
+      target: "src/large-file.ts",
+      content: "READ_FILE_RESULT range-a v2",
+      isError: false,
+      readFileObservation: makeObservation("range-a-v2", "v2", "fresh"),
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads: nextVersionReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(nextVersionReads.has("range-a-v1"), false);
+
+  const commandInvalidatedReads = new Map([["range-a", {
+    path: "src/large-file.ts",
+    versionToken: "v1",
+    count: 2,
+  }]]);
+  handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 7,
+    results: [{
+      toolCallId: "fresh-a-after-pwd",
+      name: "read_file",
+      target: "src/large-file.ts",
+      content: "READ_FILE_RESULT range-a after command cache invalidation",
+      isError: false,
+      readFileObservation: makeObservation("range-a", "v1", "fresh"),
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads: commandInvalidatedReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(commandInvalidatedReads.get("range-a")?.count, 2);
+  const afterCommandReplay = handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    iteration: 8,
+    results: [{
+      toolCallId: "replay-a-after-pwd",
+      name: "read_file",
+      target: "src/large-file.ts",
+      content: "CACHED_FILE_REPLAY: range-a after command cache invalidation",
+      isError: false,
+      readFileObservation: makeObservation("range-a", "v1"),
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads: commandInvalidatedReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+  assert.equal(afterCommandReplay.executeRecoveryMode, "mutation_first");
+});
+
+test("approved plan convergence activates mutation recovery for an unfinished source task", () => {
+  const appended = [];
+  const activations = [];
+  const callbacks = {
+    appendMessage: (message) => appended.push(message),
+    getIsPlanApproved: () => true,
+    getPlanTasks: () => [{
+      id: "edit-main",
+      text: "修改 src/main.js 添加初始化错误处理",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    }],
+    getPlanExecutionEvidenceLedger: () => [],
+  };
+
+  const result = handleExecuteConvergencePrompt({
+    callbacks,
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    iteration: 12,
+    effectiveMaxIterations: 50,
+    usedExecuteConvergencePrompt: false,
+    recentToolActivity: Array.from({ length: 12 }, () => ({
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+    })),
+    executeRecoveryMode: "normal",
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+
+  assert.equal(result.usedExecuteConvergencePrompt, true);
+  assert.equal(activations.length, 1);
+  assert.equal(activations[0][0], "mutation_first");
+  assert.equal(activations[0][1], "execute_convergence_prompt");
+  assert.equal(appended.length, 1);
+});
+
+test("approved plan convergence moves to validation after composite task source evidence is satisfied", () => {
+  const appended = [];
+  const activations = [];
+  const callbacks = {
+    appendMessage: (message) => appended.push(message),
+    getIsPlanApproved: () => true,
+    getPlanTasks: () => [{
+      id: "edit-and-test",
+      text: "Modify src/main.js, then run npm test",
+      status: "in_progress",
+      executionKind: "mutation",
+      commands: ["npm test"],
+      evidenceStatus: "partial",
+      evidence: [
+        { kind: "file", value: "src/main.js" },
+        { kind: "cmd", value: "npm test" },
+      ],
+    }],
+    getPlanExecutionEvidenceLedger: () => [{
+      id: "main-write",
+      kind: "file",
+      value: "src/main.js",
+      target: "src/main.js",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }],
+  };
+
+  const result = handleExecuteConvergencePrompt({
+    callbacks,
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    iteration: 12,
+    effectiveMaxIterations: 50,
+    usedExecuteConvergencePrompt: false,
+    recentToolActivity: Array.from({ length: 12 }, () => ({
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+    })),
+    executeRecoveryMode: "normal",
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+
+  assert.equal(result.usedExecuteConvergencePrompt, true);
+  assert.equal(activations.length, 0);
+  assert.equal(appended.length, 1);
 });
 
 test("approved plan execution starts with the normal execute tool surface", () => {
@@ -1888,6 +2307,9 @@ test("approved plan source edit first surface blocks validation before first wri
   assert.equal(isApprovedPlanSourceEditFirstToolName("apply_patch"), true);
   assert.equal(isApprovedPlanSourceEditFirstToolName("replace_in_file"), true);
   assert.equal(isApprovedPlanSourceEditFirstToolName("write_file"), true);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("delete_workspace_path"), true);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("script_apply_edits"), true);
+  assert.equal(isApprovedPlanSourceEditFirstToolName("apply_text_edits"), true);
   assert.equal(isApprovedPlanSourceEditFirstToolName("run_command"), false);
   assert.equal(isApprovedPlanSourceEditFirstToolName("browser_evaluate"), false);
   assert.equal(isApprovedPlanSourceEditFirstToolName("get_pty_status"), false);

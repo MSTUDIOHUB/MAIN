@@ -1,6 +1,7 @@
 import type { HooksConfig } from "../../hooks";
 import type { FileReadState } from "../../orchestrator/fileReadCache";
 import {
+  buildFileReadObservationIdentity,
   hashString,
   invalidateWorkspaceReadCachesAfterMutation,
   pruneFileReadStates,
@@ -13,6 +14,7 @@ import { buildRepeatLoopArgsKey } from "../../repetitionGuard";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
+import { isWorkspaceMutationToolCall } from "../../workspaceMutationTools";
 import {
   executeLocalFileReadToolWithReview,
   executeReadOnlyToolsConcurrently,
@@ -45,12 +47,9 @@ export type WriteToolCallForRound = ToolCallToExecute & {
 export function shouldAdvanceWorkspaceObservationEpoch(
   toolName: string,
   result: Pick<ToolExecutionResult, "content" | "displayContent" | "isError" | "lifecycleState">,
+  toolArgs: Record<string, unknown> = {},
 ): boolean {
-  const isExplicitWorkspaceMutation =
-    toolName === "apply_patch" ||
-    toolName === "replace_in_file" ||
-    toolName === "write_file" ||
-    toolName === "delete_workspace_path";
+  const isExplicitWorkspaceMutation = isWorkspaceMutationToolCall(toolName, toolArgs);
   const isOpaqueWorkspaceAction =
     toolName === "run_command" ||
     toolName === "execute_command" ||
@@ -158,7 +157,7 @@ export async function executeToolExecutionRound(input: {
       }
       const readFileRepeatLimitResult = isReadFileRepeatLimitResult(result);
       const narrowedNote = readFileWindowNarrowedNotes.get(result.toolCallId);
-      const resultForModel = narrowedNote && !result.isError
+      let resultForModel = narrowedNote && !result.isError
         ? {
             ...result,
             content: `${narrowedNote}\n\n${result.content}`,
@@ -181,6 +180,19 @@ export async function executeToolExecutionRound(input: {
         const path = typeof args.path === "string" ? args.path : result.target;
         const metadata = await readFileMetadataIfAvailable(path, workspace);
         const contentHash = hashString(result.content);
+        if (metadata) {
+          resultForModel = {
+            ...resultForModel,
+            readFileObservation: buildFileReadObservationIdentity({
+              requestSignature: fileReadSignature,
+              path: metadata.path,
+              sizeBytes: metadata.sizeBytes,
+              modifiedMs: metadata.modifiedMs,
+              contentHash,
+              source: "fresh",
+            }),
+          };
+        }
         const previous = fileReadStates.get(fileReadSignature);
         if (metadata && (!previous || previous.contentHash !== contentHash || previous.modifiedMs !== metadata.modifiedMs || previous.sizeBytes !== metadata.sizeBytes)) {
           fileReadStates.set(fileReadSignature, {
@@ -287,8 +299,8 @@ export async function executeToolExecutionRound(input: {
       },
     );
     allResults.push(result);
-    if (shouldAdvanceWorkspaceObservationEpoch(tc.name, result)) {
-      const toolArgs = parseToolCallArguments(tc, workspace);
+    const toolArgs = parseToolCallArguments(tc, workspace);
+    if (shouldAdvanceWorkspaceObservationEpoch(tc.name, result, toolArgs)) {
       const invalidation = invalidateWorkspaceReadCachesAfterMutation({
         toolName: tc.name,
         args: toolArgs,

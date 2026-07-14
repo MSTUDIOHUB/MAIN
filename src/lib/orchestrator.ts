@@ -40,6 +40,10 @@ import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } f
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import {
+  WORKSPACE_MUTATION_TOOL_NAMES,
+  resolveWorkspaceMutationTargets,
+} from "./workspaceMutationTools";
 import { parseApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import {
   commitResolvedPlanArtifactUpdate,
@@ -63,7 +67,6 @@ import type { MaxIterationsCheckpointHandling } from "./orchestrator/types";
 import {
   buildUnityApplyTextPolicyBlockedMessage,
   isUnityExecutionContext,
-  resolveUnityScriptPathFromArgs,
 } from "./orchestrator/unityDiagnostics";
 import {
   buildPlanRecoveryPromptFromContext,
@@ -109,6 +112,7 @@ import {
   isPlanTaskAwaitingBrowserValidation,
   isPlanTaskAwaitingExternalValidation,
   isEphemeralPlanArtifactPath,
+  planTaskHasUnsatisfiedSourceMutationEvidence,
   isPlanTaskTrustedComplete,
   analyzePlanDecisionFork,
   repairActionablePlanArtifactContent,
@@ -281,13 +285,7 @@ const GLOBAL_CHAT_ALWAYS_ALLOWED_TOOL_NAMES = new Set([
 ]);
 export const EXECUTION_VERIFICATION_TOOL_NAMES = VERIFICATION_TOOL_NAMES;
 
-const MCP_EDIT_TOOL_NAMES = new Set(["script_apply_edits", "apply_text_edits", "manage_script", "create_script", "delete_script"]);
-export const EDIT_PROGRESS_TOOL_NAMES = new Set([
-  "write_file",
-  "replace_in_file",
-  "apply_patch",
-  ...MCP_EDIT_TOOL_NAMES,
-]);
+export const EDIT_PROGRESS_TOOL_NAMES = WORKSPACE_MUTATION_TOOL_NAMES;
 const FORCE_CONTEXT_TEXT_CHARS = 60_000;
 const FORCE_CONTEXT_TOOL_RESULT_CHARS = 35_000;
 const FORCE_CONTEXT_TOOL_MESSAGE_COUNT = 12;
@@ -1649,6 +1647,8 @@ export function prepareMessagesForToolProtocol(
 
 /** Derive a short display target from tool arguments. */
 export function getToolTarget(name: string, args: Record<string, unknown>): string {
+  const mutationTargets = resolveWorkspaceMutationTargets(name, args);
+  if (mutationTargets.length > 0) return mutationTargets.join(", ");
   switch (name) {
     case "spawn_subagent":  return (args.name as string) || (args.objective as string) || "subagent";
     case "wait_subagents": return (args.subagent_ids as string) || "all subagents";
@@ -1705,7 +1705,11 @@ export function isReadFileOnlyPattern(results: ToolExecutionResult[]): boolean {
   return results.every(res => 
     res.name === "read_file" && 
     !res.isError && 
-    (res.content.includes("FILE_UNCHANGED_STUB") || res.content.includes("READ_FILE_REPEAT_LIMIT"))
+    (
+      res.content.includes("FILE_UNCHANGED_STUB") ||
+      res.content.includes("CACHED_FILE_REPLAY") ||
+      res.content.includes("READ_FILE_REPEAT_LIMIT")
+    )
   );
 }
 
@@ -1739,6 +1743,7 @@ function normalizeNoProgressResultContent(result: ToolExecutionResult): string {
   if (!PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)) return raw;
   return raw
     .replace(/Duplicate skip count in this run:\s*\d+\./gi, "Duplicate skip count in this run: [n].")
+    .replace(/\(duplicate\s+\d+\)/gi, "(duplicate [n])")
     .replace(/duplicateCount\s*[:=]\s*\d+/gi, "duplicateCount=[n]")
     .replace(/Previous read:\s*[\d,]+\s+chars/gi, "Previous read: [n] chars")
     .replace(/Previous read window:\s*lines\s+\d+-\d+\s+of\s+\d+,\s*[\d,]+\s+result chars/gi, "Previous read window: lines [range] of [n], [n] result chars");
@@ -1771,40 +1776,20 @@ export function isApprovedPlanSourceEditFirstTool(
   return isApprovedPlanSourceEditFirstToolName(tool.function.name, options);
 }
 
-function isSourceFileEvidencePath(value: string): boolean {
-  const normalized = String(value || "").replace(/\\/g, "/").trim();
-  return /(?:^|\/)(?:src(?:-[^/]+)?|app|lib|components|hooks|store|styles|utils|pages|server|client|packages|apps)\//i.test(normalized) &&
-    /\.(?:tsx?|jsx?|css|scss|json|py|rs|go|swift|vue|svelte)$/i.test(normalized) &&
-    !/\.MAIN\/plans\//i.test(normalized);
-}
-
 export function approvedPlanNeedsSourceEditBeforeValidation(
   tasks: PlanTask[],
   evidenceLedger: PlanExecutionEvidenceEntry[],
 ): boolean {
   if (!Array.isArray(tasks) || tasks.length === 0) return false;
-  const hasSourceWriteEvidence = (evidenceLedger || []).some((entry) =>
-    entry.kind === "file" &&
-    /^(?:apply_patch|replace_in_file|write_file)$/.test(entry.sourceTool || "") &&
-    isSourceFileEvidencePath(entry.value || entry.target || "")
-  );
-  if (hasSourceWriteEvidence) return false;
-
   const audit = buildPlanTaskEvidenceAudit({
     tasks,
     evidenceLedger,
     preserveMissing: true,
     highlightNext: true,
   });
-  return audit.remainingTasks.some((task) => {
-    const evidencePaths = (task.evidence || [])
-      .filter((item) => item.kind === "file")
-      .map((item) => item.value);
-    const text = task.text || "";
-    return evidencePaths.some(isSourceFileEvidencePath) ||
-      /(?:修改|更新|新增|修复|重写|实现|调整|接入|补齐|edit|modify|update|add|fix|rewrite|implement|patch)\b/i.test(text) &&
-        /(?:src|app|lib|components|hooks|store|styles|utils|pages|server|client|packages|apps)\//i.test(text);
-  });
+  return audit.remainingTasks.some((task) =>
+    planTaskHasUnsatisfiedSourceMutationEvidence(task, evidenceLedger)
+  );
 }
 
 function looksLikeProseCodeDump(text: string): boolean {
@@ -3189,6 +3174,7 @@ interface ToolExecutionResult {
   qualityGateReason?: string;
   planRecoveryAction?: PlanArtifactRecoveryAction;
   missingPlanSections?: string[];
+  readFileObservation?: import("./orchestrator/fileReadCache").FileReadObservationIdentity;
 }
 
 function getToolResultDiagnosticText(result?: ToolExecutionResult): string {
@@ -3640,37 +3626,8 @@ function normalizePathLike(value: string): string {
 }
 
 function resolveMutationVerificationPath(name: string, args: Record<string, unknown>): string | null {
-  const pathArg = typeof args.path === "string" ? normalizePathLike(args.path) : "";
-
-  switch (name) {
-    case "write_file":
-    case "replace_in_file":
-    case "create_script":
-    case "delete_script":
-      return pathArg || null;
-    case "script_apply_edits":
-      return resolveUnityScriptPathFromArgs(args);
-    case "manage_script": {
-      const action = typeof args.action === "string" ? args.action.trim().toLowerCase() : "";
-      if (action !== "create" && action !== "delete") return null;
-      return resolveUnityScriptPathFromArgs(args);
-    }
-    case "apply_text_edits": {
-      const uri = typeof args.uri === "string" ? String(args.uri).trim() : "";
-      if (!uri) return null;
-      if (uri.startsWith("Assets/")) return normalizePathLike(uri);
-      if (uri.startsWith("file://")) {
-        try {
-          return normalizePathLike(decodeURIComponent(uri.replace(/^file:\/\//, "")));
-        } catch {
-          return normalizePathLike(uri.replace(/^file:\/\//, ""));
-        }
-      }
-      return null;
-    }
-    default:
-      return null;
-  }
+  const targets = resolveWorkspaceMutationTargets(name, args);
+  return targets.length === 1 ? normalizePathLike(targets[0]) : null;
 }
 
 function isSameFileMetadata(
@@ -4383,14 +4340,15 @@ async function executeToolCallWithLifecycle(
       );
     }
 
+    const completedTarget = mutationVerificationPath || target;
     const completedDiffPreview =
       buildMutationDiffPreviewFromSnapshots({
         toolName: tc.name,
-        target,
+        target: completedTarget,
         before: mutationBeforeDiffSnapshot,
         after: mutationAfterDiffSnapshot,
       }) || diffPreview;
-    callbacks.onToolDone(tc.name, target, finalDisplayContent, {
+    callbacks.onToolDone(tc.name, completedTarget, finalDisplayContent, {
       toolCallId: tc.id,
       diff: completedDiffPreview,
       ...(isInternalFeedback ? { internalFeedback: true } : {}),
@@ -4399,7 +4357,7 @@ async function executeToolCallWithLifecycle(
     return {
       toolCallId: tc.id,
       name: tc.name,
-      target,
+      target: completedTarget,
       content: finalContent,
       displayContent: finalDisplayContent,
       isError: false,

@@ -168,7 +168,7 @@ test("non-blocking plan choice auto-continuation forces finalization at its retr
 
 test("closed drafting surface reopens targeted evidence without a raw read-count cap", () => {
   const first = resolveClosedPlanReadOnlyContinuation({
-    suppressPlanContinuationReplyOptions: true,
+    autoContinueNonBlockingPlanChoices: true,
     replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
     toolCallCount: 0,
     workflowMode: "plan",
@@ -183,7 +183,7 @@ test("closed drafting surface reopens targeted evidence without a raw read-count
   });
 
   const laterDistinctRead = resolveClosedPlanReadOnlyContinuation({
-    suppressPlanContinuationReplyOptions: true,
+    autoContinueNonBlockingPlanChoices: true,
     replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
     toolCallCount: 0,
     workflowMode: "plan",
@@ -198,7 +198,7 @@ test("closed drafting surface reopens targeted evidence without a raw read-count
   });
 
   const modelOwnedGroundingChoice = resolveClosedPlanReadOnlyContinuation({
-    suppressPlanContinuationReplyOptions: true,
+    autoContinueNonBlockingPlanChoices: true,
     replyOptions: [
       {
         label: "直接基于当前发现生成计划",
@@ -226,7 +226,21 @@ test("closed drafting surface reopens targeted evidence without a raw read-count
 
 test("closed plan continuation does not reopen tools for arbitrary options or an open evidence surface", () => {
   assert.deepEqual(resolveClosedPlanReadOnlyContinuation({
-    suppressPlanContinuationReplyOptions: true,
+    autoContinueNonBlockingPlanChoices: false,
+    replyOptions: [{
+      label: "确认 normalizeCsvOrder 的返回值类型兼容",
+      value: "请确认 normalizeCsvOrder 的返回值类型兼容",
+      source: "inferred_enumerated",
+    }],
+    toolCallCount: 0,
+    workflowMode: "plan",
+    isPlanApproved: false,
+    availableToolCount: 0,
+    planRuntimePhase: "drafting",
+    targetedRecoveryPasses: 0,
+  }), { action: "none" });
+  assert.deepEqual(resolveClosedPlanReadOnlyContinuation({
+    autoContinueNonBlockingPlanChoices: true,
     replyOptions: [{ label: "改变范围", value: "改变范围" }],
     toolCallCount: 0,
     workflowMode: "plan",
@@ -236,7 +250,7 @@ test("closed plan continuation does not reopen tools for arbitrary options or an
     targetedRecoveryPasses: 0,
   }), { action: "none" });
   assert.deepEqual(resolveClosedPlanReadOnlyContinuation({
-    suppressPlanContinuationReplyOptions: true,
+    autoContinueNonBlockingPlanChoices: true,
     replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
     toolCallCount: 0,
     workflowMode: "plan",

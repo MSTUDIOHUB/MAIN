@@ -4,6 +4,11 @@ import {
   type planReadFileWindowCoverage,
 } from "../readFileWindow";
 import { workspacePathsReferToSameFile } from "../workspacePaths";
+import {
+  isWorkspaceMutationToolCall,
+  isWorkspaceMutationToolName,
+  resolveWorkspaceMutationTargets,
+} from "../workspaceMutationTools";
 
 export interface FileReadState {
   signature: string;
@@ -15,6 +20,17 @@ export interface FileReadState {
   modifiedMs: number;
   modelContent: string;
   updatedAt: number;
+}
+
+export type FileReadObservationSource = "fresh" | "stub" | "replay";
+
+export interface FileReadObservationIdentity {
+  key: string;
+  path: string;
+  requestSignature: string;
+  versionToken: string;
+  contentHash?: string;
+  source: FileReadObservationSource;
 }
 
 export const FILE_UNCHANGED_STUB = "FILE_UNCHANGED_STUB";
@@ -48,19 +64,7 @@ function collectMutationTargets(
   args: Record<string, unknown>,
   fallbackTarget: string,
 ): string[] {
-  if (toolName !== "apply_patch") {
-    return [String(args.path || fallbackTarget || "").trim()].filter(Boolean);
-  }
-
-  const patch = String(args.patch || "");
-  const targets: string[] = [];
-  for (const match of patch.matchAll(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/gmi)) {
-    if (match[1]) targets.push(match[1].trim());
-  }
-  for (const match of patch.matchAll(/^\+\+\+\s+(?:b\/)?([^\s]+)$/gmi)) {
-    if (match[1] && match[1] !== "/dev/null") targets.push(match[1].trim());
-  }
-  return [...new Set(targets.length > 0 ? targets : [fallbackTarget].filter(Boolean))];
+  return resolveWorkspaceMutationTargets(toolName, args, fallbackTarget);
 }
 
 /**
@@ -79,6 +83,9 @@ export function invalidateWorkspaceReadCachesAfterMutation(input: {
   readOnlyResultCache?: Map<string, unknown>;
   readOnlyDuplicateSkipCounts?: Map<string, number>;
 }): { invalidatedFileReadSignatures: string[]; invalidatedReadOnlyEntries: number } {
+  if (isWorkspaceMutationToolName(input.toolName) && !isWorkspaceMutationToolCall(input.toolName, input.args)) {
+    return { invalidatedFileReadSignatures: [], invalidatedReadOnlyEntries: 0 };
+  }
   const targets = collectMutationTargets(
     input.toolName,
     input.args,
@@ -163,6 +170,26 @@ export function buildFileReadSignature(path: string, args: Record<string, unknow
     ),
   );
   return `read_file::${path}::${argsKey}`;
+}
+
+export function buildFileReadObservationIdentity(input: {
+  requestSignature: string;
+  path: string;
+  sizeBytes: number;
+  modifiedMs: number;
+  contentHash?: string;
+  source: FileReadObservationSource;
+}): FileReadObservationIdentity {
+  const versionToken = `${input.sizeBytes}:${input.modifiedMs}`;
+  const contentToken = String(input.contentHash || "unknown");
+  return {
+    key: `${input.requestSignature}::version=${versionToken}::content=${contentToken}`,
+    path: input.path,
+    requestSignature: input.requestSignature,
+    versionToken,
+    ...(input.contentHash ? { contentHash: input.contentHash } : {}),
+    source: input.source,
+  };
 }
 
 export function buildFileUnchangedStub(state: FileReadState): string {
