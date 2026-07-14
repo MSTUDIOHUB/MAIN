@@ -147,7 +147,7 @@ test("first unapproved plan empty response appends placeholder and plan continua
   assert.match(events[1].message.content, /runtime owns materialization/);
 });
 
-test("second unapproved plan empty response attempts closure guard before stopping", async () => {
+test("second unapproved plan empty response attempts closure then continues with a stricter recovery", async () => {
   const { callbacks, events } = makeCallbacks({ language: "en", approved: false });
   const closureCalls = [];
   const result = await handleEmptyResponseRecovery(baseInput({
@@ -162,7 +162,7 @@ test("second unapproved plan empty response attempts closure guard before stoppi
     },
   }));
 
-  assert.equal(result.status, "stopped");
+  assert.equal(result.status, "continue");
   assert.equal(result.consecutiveEmptyResponseCount, 2);
   assert.deepEqual(closureCalls[0], {
     trigger: "empty_response_checkpoint",
@@ -172,6 +172,25 @@ test("second unapproved plan empty response attempts closure guard before stoppi
       replyOptionCount: 0,
     },
   });
+  assert.equal(events.some((event) => event.type === "stop"), false);
+  assert.equal(events.filter((event) => event.type === "append").length, 2);
+  assert.match(events.at(-1)?.message.content || "", /task must continue/i);
+  assert.match(events.at(-1)?.message.content || "", /exactly one targeted read-only tool/i);
+});
+
+test("third unapproved plan empty response stops only after bounded recovery is exhausted", async () => {
+  const { callbacks, events } = makeCallbacks({ language: "en", approved: false });
+  const result = await handleEmptyResponseRecovery(baseInput({
+    callbacks,
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    consecutiveEmptyResponseCount: 2,
+    tryClosePlanWithEvidence: async () => "failed",
+  }));
+
+  assert.equal(result.status, "stopped");
+  assert.equal(result.consecutiveEmptyResponseCount, 3);
   assert.equal(events.some((event) => event.type === "stop" && event.reason === "incomplete_plan"), true);
 });
 

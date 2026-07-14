@@ -174,5 +174,5 @@ test("unapproved plan reasoning-only result asks for targeted evidence first", (
     status: undefined,
   });
   assert.equal(events.some((event) => event.type === "status" && event.status === "running"), true);
-  assert.equal(events.some((event) => event.type === "append" && /证据|读取/.test(event.message.content)), true);
+  assert.equal(events.some((event) => event.type === "append" && /evidence|read/i.test(event.message.content)), true);
 });

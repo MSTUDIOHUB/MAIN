@@ -11,7 +11,13 @@ import { WEB_RESEARCH_TOOL_NAMES } from "../../orchestrator";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { LegacyWorkflowMode, ResolvedUserIntent } from "../../runIntent";
 import { buildRequiredWebResearchQuery, shouldRequireWebResearchForPrompt } from "../../webResearchGuard";
-import type { ReplyOption } from "../../workflowModels";
+import {
+  buildPlanTaskEvidenceAudit,
+  isFinitePlanValidationCommand,
+  type PlanExecutionEvidenceEntry,
+  type PlanTask,
+  type ReplyOption,
+} from "../../workflowModels";
 import { generateId } from "../../utils";
 import type { AgentMessage, ToolCallToExecute } from "../types";
 
@@ -26,6 +32,67 @@ export interface AssistantActionRoutingDecision {
   userVisibleText: string;
   webResearchQuery: string | null;
   webResearchProvider: string | null;
+}
+
+function normalizeCommand(value: unknown): string {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+export function resolveApprovedPlanFiniteCommandInjection(input: {
+  isApprovedPlanExecutionTurn: boolean;
+  toolCallCount: number;
+  replyOptionCount: number;
+  availableToolNames: Set<string>;
+  tasks: PlanTask[];
+  evidenceLedger: PlanExecutionEvidenceEntry[];
+  recentToolActivity: PlanToolActivitySummary[];
+  buildToolCallId?: () => string;
+}): { call: ToolCallToExecute; task: PlanTask; command: string } | null {
+  if (
+    !input.isApprovedPlanExecutionTurn ||
+    input.toolCallCount > 0 ||
+    input.replyOptionCount > 0 ||
+    !input.availableToolNames.has("run_command")
+  ) {
+    return null;
+  }
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    preserveMissing: true,
+    highlightNext: true,
+  });
+  if (audit.remainingTasks.length !== 1) return null;
+  const task = audit.remainingTasks[0];
+  const commands = (task.commands || [])
+    .map(normalizeCommand)
+    .filter((command) =>
+      command &&
+      command !== "focused validation command" &&
+      isFinitePlanValidationCommand(command)
+    );
+  if (commands.length !== 1) return null;
+  const command = commands[0];
+  const normalizedCommand = normalizeCommand(command).toLowerCase();
+  const recentlyFailed = input.recentToolActivity.some((activity) =>
+    activity.status === "failed" &&
+    activity.name === "run_command" &&
+    normalizeCommand(activity.target).toLowerCase() === normalizedCommand
+  );
+  if (recentlyFailed) return null;
+  return {
+    task,
+    command,
+    call: {
+      id: input.buildToolCallId?.() || `call_${generateId()}`,
+      name: "run_command",
+      arguments: JSON.stringify({
+        command,
+        cwd: ".",
+        description: normalizeCommand(task.text).slice(0, 240) || "Run approved Plan validation",
+      }),
+    },
+  };
 }
 
 export function resolveAssistantActionRouting(input: {

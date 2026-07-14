@@ -1,4 +1,5 @@
 import { buildExecutionDigest } from "../../executionDigest";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
   collectPlanClosureMaterializationInput,
   EDIT_PROGRESS_TOOL_NAMES,
@@ -11,7 +12,10 @@ import {
   targetProgressReasonForToolResult,
 } from "../../orchestrator";
 import { isUnityScriptWriteToolCall } from "../../orchestrator/unityDiagnostics";
-import { assessPlanClosureEvidence } from "../../planEvidence";
+import {
+  assessPlanClosureEvidence,
+  isPlanEvidenceBundleReady,
+} from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
 import { getTaskTargetingEvidenceKey, type TaskOrchestratorPhase } from "../../taskTargeting";
@@ -195,7 +199,7 @@ export function handleToolResultPostProcessing(input: {
     results: externalResults,
     unityMcpForceConsoleFirstPending,
     unityConsoleMissingFirstToolRepromptIssued,
-    language: callbacks.getPreferredLanguage(),
+    language: MODEL_CONTROL_LANGUAGE,
   });
   if (unityConsoleResult.fallbackReason) {
     activateUnityMcpFallback(unityConsoleResult.fallbackReason);
@@ -262,10 +266,11 @@ export function handleToolResultPostProcessing(input: {
   ) {
     // Evidence convergence is a runtime decision, not a model/iteration-count
     // decision. Build the exact bundle that drafting and validation will use
-    // after every successful read batch. The read surface can close only when
-    // that bundle also satisfies the deterministic closure gate; otherwise the
-    // runtime would declare structural excerpts sufficient here and reject the
-    // same bundle as diagnostically insufficient during materialization.
+    // after every successful read batch. A model-authored draft can synthesize
+    // relationships across grounded source excerpts, so its read surface closes
+    // once the bundle has semantic facts and change owners. The stricter closure
+    // assessment is reserved for deterministic runtime materialization, which
+    // cannot safely infer a diagnosis that the evidence does not state.
     const closureInput = collectPlanClosureMaterializationInput(
       callbacks,
       recentPlanToolActivity,
@@ -274,15 +279,26 @@ export function handleToolResultPostProcessing(input: {
     );
     const bundle = closureInput.evidenceBundle;
     const closureAssessment = assessPlanClosureEvidence(bundle);
-    if (closureAssessment.ready) {
-      setPlanRuntimePhase("drafting", "plan closure evidence ready");
+    const modelAuthoredDraftReady = isPlanEvidenceBundleReady(bundle);
+    const shouldAdvanceToDrafting = closureAssessment.ready || (
+      modelAuthoredDraftReady && String(planRuntimePhase) !== "needs_evidence"
+    );
+    if (shouldAdvanceToDrafting) {
+      setPlanRuntimePhase(
+        "drafting",
+        closureAssessment.ready
+          ? "plan closure evidence ready"
+          : "model-authored plan evidence ready",
+      );
       logAgentEvent("plan_evidence_bundle_ready", {
         iteration,
         evidenceBundleId: bundle.bundleId,
         evidenceBundleHash: bundle.hash,
         evidenceLedgerEntries: recentPlanToolActivity.length,
         bundleReady: true,
-        closureReady: true,
+        closureReady: closureAssessment.ready,
+        modelAuthoredDraftReady,
+        deterministicMaterializationReady: closureAssessment.ready,
         closureReason: closureAssessment.reason,
         objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
         defectSignalMatches: closureAssessment.defectSignalMatches,
@@ -295,7 +311,7 @@ export function handleToolResultPostProcessing(input: {
         verificationTargets: bundle.verificationTargets.length,
         previousPhase: planRuntimePhase,
       });
-    } else if (bundle.facts.length > 0 && bundle.changeTargets.length > 0) {
+    } else if (modelAuthoredDraftReady) {
       logAgentEvent("plan_evidence_bundle_open", {
         iteration,
         evidenceBundleId: bundle.bundleId,
@@ -303,6 +319,8 @@ export function handleToolResultPostProcessing(input: {
         evidenceLedgerEntries: recentPlanToolActivity.length,
         bundleReady: true,
         closureReady: false,
+        modelAuthoredDraftReady,
+        deterministicMaterializationReady: false,
         closureReason: closureAssessment.reason,
         objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
         defectSignalMatches: closureAssessment.defectSignalMatches,

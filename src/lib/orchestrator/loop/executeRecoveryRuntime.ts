@@ -160,7 +160,10 @@ export function transitionExecuteRecoveryRuntimeState(
     };
   }
 
-  if (state.mode === "validation_only" && observation.validationTarget) {
+  if (
+    (state.mode === "validation_only" || state.mode === "finite_validation_only") &&
+    observation.validationTarget
+  ) {
     return {
       state: clearExecuteRecoveryRuntimeState(transactionState),
       transition: "validation_to_normal",

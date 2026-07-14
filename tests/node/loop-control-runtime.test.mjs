@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   createAgentLoopControlRuntime,
+  resolvePlanDraftQualityRecoveryReserve,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/loopControlRuntime.ts"),
 );
@@ -74,6 +75,11 @@ function createControl(overrides = {}) {
     approvedPlanActionOnlyRecoveryActive: false,
     approvedPlanNoToolRecoveryFileReadActive: false,
     approvedPlanLongReasoningNoActionCount: 0,
+  };
+  let planRuntimeState = {
+    planRuntimePhase: "grounding",
+    planQualityRejectCount: 0,
+    planArtifactQualityRejected: false,
   };
   const callbacks = {
     getIsPlanApproved: () => true,
@@ -115,6 +121,7 @@ function createControl(overrides = {}) {
     setApprovedPlanRecoveryState: (state) => {
       approvedPlanRecoveryState = state;
     },
+    getPlanRuntimeState: () => planRuntimeState,
     emitTaskOrchestratorPhase: (phase, extra) => phases.push({ phase, extra }),
     setPlanRuntimePhase: (phase, reason, status) =>
       phases.push({ phase, reason, status }),
@@ -125,8 +132,60 @@ function createControl(overrides = {}) {
     progress,
     phases,
     getApprovedPlanRecoveryState: () => approvedPlanRecoveryState,
+    setPlanRuntimeState: (state) => {
+      planRuntimeState = state;
+    },
   };
 }
+
+test("Plan quality recovery receives a bounded finalization reserve", () => {
+  assert.equal(resolvePlanDraftQualityRecoveryReserve({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "needs_evidence",
+    planQualityRejectCount: 1,
+    planArtifactQualityRejected: false,
+  }), 4);
+  assert.equal(resolvePlanDraftQualityRecoveryReserve({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "grounding",
+    planQualityRejectCount: 1,
+    planArtifactQualityRejected: false,
+  }), 0);
+  assert.equal(resolvePlanDraftQualityRecoveryReserve({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    planRuntimePhase: "needs_evidence",
+    planQualityRejectCount: 1,
+    planArtifactQualityRejected: true,
+  }), 0);
+});
+
+test("loop control extends only an active rejected Plan draft", () => {
+  let planRuntimeState = {
+    planRuntimePhase: "grounding",
+    planQualityRejectCount: 0,
+    planArtifactQualityRejected: false,
+  };
+  const { control } = createControl({
+    callbacks: {
+      getIsPlanApproved: () => false,
+    },
+    input: {
+      getRuntimeIntent: () => "plan",
+      getPlanRuntimeState: () => planRuntimeState,
+    },
+  });
+
+  assert.equal(control.getEffectiveMaxIterations(), 25);
+  planRuntimeState = {
+    planRuntimePhase: "needs_rewrite",
+    planQualityRejectCount: 1,
+    planArtifactQualityRejected: false,
+  };
+  assert.equal(control.getEffectiveMaxIterations(), 29);
+});
 
 test("loop control emits approved plan execution progress with iteration metadata", () => {
   const { control, progress } = createControl();

@@ -57,7 +57,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { buildSystemPrompt, buildToolProtocolCard } = loadTranspiledModuleSync(
+const { buildSystemPrompt, buildToolProtocolCard, detectInstructionLanguage } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/systemPrompt.ts"),
 );
 
@@ -133,7 +133,7 @@ test("data analyst chat prompt tells the model to auto-fallback on read-only fai
   assert.match(prompt, /不要为了这种只读降级向用户申请批准/);
   assert.match(prompt, /不要停下来征求用户是否允许降级/);
   assert.match(prompt, /推荐回退顺序：`analyze_tabular_document` 全表概览 → `query_tabular_document` 结构化筛选\/聚合 → `read_document` 原始行窗口\/分页读取/);
-  assert.match(prompt, /确认表结构、关键字段、数据类型、时间\/数值\/分类维度、缺失值和聚合口径/);
+  assert.match(prompt, /confirm table structure, key fields, data types, temporal\/numeric\/categorical dimensions, missing values, and aggregation semantics/i);
   assert.doesNotMatch(prompt, /金额、课程字段|课程字段/);
   assert.match(prompt, /避免输出“我将再次执行”“请稍候确认是否同意降级”这类过程化台词/);
   assert.match(prompt, /不要先输出“下一步行动计划”“请稍候，我将开始分析”之类的过渡台词后停住/);
@@ -173,11 +173,10 @@ test("system prompt only adds web-search guidance when web tools are available",
   );
 
   assert.doesNotMatch(withoutWeb, /网络搜索已开启/);
-  assert.doesNotMatch(withoutWeb, /网络搜索日期锚点/);
+  assert.doesNotMatch(withoutWeb, /Current local date for web research/);
   assert.match(withWeb, /网络搜索已开启/);
-  assert.match(withWeb, /网络搜索日期锚点/);
-  assert.match(withWeb, /当前本地日期为 \d{4}-\d{2}-\d{2}/);
-  assert.match(withWeb, /不要按模型训练截止日期或旧年份理解/);
+  assert.match(withWeb, /Current local date for web research: \d{4}-\d{2}-\d{2}/);
+  assert.match(withWeb, /not the model training cutoff/);
   assert.match(withWeb, /来源 URL/);
 });
 
@@ -203,6 +202,45 @@ test("system prompt uses English core tool protocol with localized output strate
   assert.doesNotMatch(prompt, /[⚠🚫]/);
   assert.doesNotMatch(prompt, /在执行文件读取、搜索、修改、构建、测试等操作前，必须先用普通 Markdown 输出一句/);
   assert.doesNotMatch(prompt, /调用工具前，先用普通 Markdown 写一句用户可见的操作说明/);
+});
+
+test("English core strategy is provider-neutral while user-visible output stays localized", () => {
+  for (const model of ["gemma-4", "qwen3.6", "unknown-local-model"]) {
+    assert.equal(
+      detectInstructionLanguage(model, "zh", "english_core_localized_output", "OMLX"),
+      "en",
+    );
+  }
+
+  const prompt = buildSystemPrompt(
+    [],
+    "/tmp/workspace",
+    "main_mode",
+    "",
+    [],
+    [],
+    "plan",
+    "zh",
+    null,
+    undefined,
+    undefined,
+    "english_core_localized_output",
+    ["read_file", "write_file"],
+    null,
+    undefined,
+    {
+      displayLanguage: "zh",
+      resolvedResponseLanguage: "zh",
+    },
+  );
+
+  assert.match(prompt, /You are in PLAN mode this turn/);
+  assert.match(prompt, /When you need a tool, the next content must contain exactly one complete XML tool block/);
+  assert.match(prompt, /MUST use 简体中文/);
+  assert.match(
+    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/appConfig.ts"), "utf8"),
+    /promptLanguageStrategy:\s*"english_core_localized_output"/,
+  );
 });
 
 test("system prompt separates display language from resolved response language", () => {
@@ -358,8 +396,8 @@ test("workflow prompt with no tools does not show executable XML templates", () 
 
   assert.match(prompt, /availableTools: none/);
   assert.match(prompt, /本轮没有暴露可调用工具/);
-  assert.match(prompt, /进入审核前必须由 runtime 物化 plan\.md/);
-  assert.match(prompt, /计划文件写入由 runtime 而不是模型负责/);
+  assert.match(prompt, /runtime-materialized plan\.md is mandatory before review/);
+  assert.match(prompt, /runtime, not the model, owns the plan file write/);
   assert.doesNotMatch(prompt, /<tool_use>/);
   assert.doesNotMatch(prompt, /<tool>read_file<\/tool>/);
   assert.doesNotMatch(prompt, /plan\.md 必选/);
@@ -482,7 +520,7 @@ test("data analyst plan prompt uses interactive planning and analysis semantics"
   );
 
   assert.match(prompt, /\[TURN INTENT: PLAN\]/);
-  assert.match(prompt, /规划产物应表达分析目标、数据范围/);
+  assert.match(prompt, /planning artifact should describe the analysis goal, data scope/);
   assert.doesNotMatch(prompt, /必须生成精简的 `\.MAIN\/plans\/requirements\.md`/);
 });
 
@@ -503,8 +541,8 @@ test("plan prompt keeps plan.md materialization runtime-owned even when write to
     ["read_file", "write_file", "replace_in_file"],
   );
 
-  assert.match(prompt, /MAIN runtime 校验并物化 `\.MAIN\/plans\/plan\.md`/);
-  assert.match(prompt, /输出可见 `<proposed_plan>` Markdown/);
+  assert.match(prompt, /MAIN runtime validates and materializes `\.MAIN\/plans\/plan\.md`/);
+  assert.match(prompt, /output visible `<proposed_plan>` Markdown/i);
   assert.doesNotMatch(prompt, /\.\.MAIN\/plans\/plan\.md|\.\\\.MAIN\/plans\/plan\.md/);
   assert.doesNotMatch(prompt, /用本轮可用计划写入工具|证据足够后用 `write_file`/);
 });
@@ -524,9 +562,9 @@ test("system prompt tells the model to stop after emitting user options", () => 
 
   assert.match(prompt, /一旦你输出了 `<user_options>`，本轮就应立即停止并等待用户点击/);
   assert.match(prompt, /不要假装提问后又自己继续往下执行/);
-  assert.match(prompt, /`<option>` 是用户点击后发回给你的完整指令/);
-  assert.match(prompt, /`\[Topic \(多选\)\]`/);
-  assert.match(prompt, /不代表批准执行/);
+  assert.match(prompt, /`<option>` is sent back as the user's next message/);
+  assert.match(prompt, /`\[Topic \(multiple\)\]`/);
+  assert.match(prompt, /never imply execution approval/);
 });
 
 test("respond prompt no longer tells the user to switch Chat or Fast or Plan", () => {
@@ -764,7 +802,7 @@ test("Plan prompt never turns model-internal work ordering into user choices", (
     ["read_file", "grep_search", "write_file"],
   );
 
-  assert.match(zhPrompt, /不要把你自己的读取、检查或修复顺序包装成用户选项/);
+  assert.match(zhPrompt, /do not turn your own read\/check\/fix ordering into user options/i);
   assert.match(enPrompt, /do not turn your own read\/check\/fix ordering into user options/i);
   assert.doesNotMatch(zhPrompt, /方案未收敛时给 2-4 个明确选择/);
   assert.doesNotMatch(enPrompt, /If plan isn't ready, give 2-4 clear options/i);

@@ -6,10 +6,13 @@
 //   2. <tool_call> with JSON inside
 //   3. <function_call> with JSON inside
 //   4. <tool_code> wrappers containing a single function-style call
+//   5. Gemma/OMLX <|tool_call>call:name{...} text tokens
 //
 // Reasoning tags extracted as thoughts:
 //   <analysis>, <thought>, <thinking>, <reasoning>
 // ────────────────────────────────────────────────────────────────────
+
+import { TOOL_DEFINITIONS } from "./toolSchemas.ts";
 
 export interface ParsedToolCall {
   id: string;
@@ -29,40 +32,8 @@ function nextCallId(): string {
 }
 
 const BARE_TOOL_NAMES = new Set([
-  "get_project_skeleton",
-  "get_file_outline",
-  "code_ast_query",
-  "find_symbol_references",
-  "git_status",
-  "git_diff",
-  "list_directory",
-  "read_file",
-  "read_document",
-  "analyze_tabular_document",
-  "query_tabular_document",
-  "index_workspace_documents",
-  "knowledge_search",
-  "knowledge_get_excerpt",
-  "glob_search",
-  "grep_search",
-  "web_search",
-  "web_fetch",
-  "repo_map_status",
-  "repo_map_search",
-  "repo_map_context",
-  "repo_map_files",
-  "repo_map_impact",
-  "replace_in_file",
-  "write_file",
-  "apply_patch",
-  "execute_command",
-  "send_pty_input",
-  "run_command",
-  "browser_evaluate",
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
+  ...TOOL_DEFINITIONS.map((tool) => tool.function.name),
+  // Legacy parser support; this internal action is not exposed to models.
   "clear_pty_buffer",
 ]);
 
@@ -385,6 +356,27 @@ function parseToolCodeBlock(inner: string): ParsedToolCall[] {
   return parsed ? [parsed] : [];
 }
 
+function parseGemmaToolCallBlocks(text: string): ParsedToolCall[] {
+  const calls: ParsedToolCall[] = [];
+  const blockRe = /<\|tool_call>\s*call:([a-z_][a-z0-9_]*)\s*\{([\s\S]*?)\}(?:\s*<\|\/tool_call>)?/gi;
+  let match: RegExpExecArray | null;
+
+  while ((match = blockRe.exec(text)) !== null) {
+    const toolName = String(match[1] || "").trim();
+    if (!BARE_TOOL_NAMES.has(toolName)) continue;
+    const namedArgumentBody = String(match[2] || "")
+      .replace(/(^|,)\s*([a-z_][a-z0-9_]*)\s*:\s*/gi, "$1 $2=")
+      .trim();
+    calls.push({
+      id: nextCallId(),
+      name: toolName,
+      arguments: parseNamedArguments(namedArgumentBody),
+    });
+  }
+
+  return calls;
+}
+
 function parseInlineToolInvocation(text: string): ParsedToolCall | null {
   const trimmed = text.trim();
   if (!trimmed) return null;
@@ -616,6 +608,9 @@ export function parseTextForTools(text: string): ParsedTextResult {
     toolCalls.push(...parseToolCodeBlock(block));
   }
 
+  // Format 5: Gemma/OMLX native-looking calls surfaced in text content.
+  toolCalls.push(...parseGemmaToolCallBlocks(text));
+
   // 3. Build clean text by removing all known XML blocks
   const xmlStrippedText = text
     .replace(
@@ -628,6 +623,7 @@ export function parseTextForTools(text: string): ParsedTextResult {
       "",
     )
     .replace(/<tool_code(?:\s[^>]*)?>[\s\S]*?<\/tool_code>/g, "")
+    .replace(/<\|tool_call>\s*call:[a-z_][a-z0-9_]*\s*\{[\s\S]*?\}(?:\s*<\|\/tool_call>)?/gi, "")
     .replace(
       /<\/?(?:analysis|thought|thinking|reasoning|tool_use|tool_call|function_call|tool_code|tool|parameter|tool_response)(?:\s[^>]*)?>/g,
       "",

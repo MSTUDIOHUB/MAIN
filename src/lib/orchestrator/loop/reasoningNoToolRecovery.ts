@@ -1,4 +1,5 @@
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import {
   buildPlanEvidenceBlockedPauseMessage,
@@ -145,7 +146,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
       callbacks.appendMessage({
         role: "user",
         content: buildPlanTargetedEvidenceRecoveryPrompt({
-          language: callbacks.getPreferredLanguage(),
+          language: MODEL_CONTROL_LANGUAGE,
           reason: readiness.reason,
         }),
       });
@@ -217,7 +218,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   callbacks.onStatusChange("running");
   callbacks.appendMessage({
     role: "user",
-    content: buildReasoningDominatedRecoveryPrompt(callbacks.getPreferredLanguage(), workflowMode),
+    content: buildReasoningDominatedRecoveryPrompt(MODEL_CONTROL_LANGUAGE, workflowMode),
   });
   return finish("continue");
 }

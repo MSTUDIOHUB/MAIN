@@ -337,9 +337,20 @@ export function parseSubagentAllowedPaths(value: unknown, workspace = ""): strin
     .map((entry) => entry.trim())
     .filter(Boolean)
     .map((entry) => relativizeToWorkspacePath(entry, workspace))
-    .map(normalizeWorkspacePathIdentity)
+    .map((entry) => String(entry || "")
+      .replace(/\\/g, "/")
+      .replace(/^[`'\"]+|[`'\"]+$/g, "")
+      .replace(/^\.\//, "")
+      .replace(/\/+$/, "")
+      .trim())
     .filter(Boolean);
-  return [...new Set(paths)];
+  const seen = new Set<string>();
+  return paths.filter((path) => {
+    const identity = normalizeWorkspacePathIdentity(path);
+    if (!identity || seen.has(identity)) return false;
+    seen.add(identity);
+    return true;
+  });
 }
 
 function pathContains(scopePath: string, targetPath: string): boolean {

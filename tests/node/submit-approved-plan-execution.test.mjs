@@ -281,6 +281,85 @@ test("approval readiness accepts a semantically valid mutation plan with concret
   assert.ok(readiness.executableValidationTaskCount >= 1);
 });
 
+test("approval readiness materializes semantic validation outcomes without requiring a model-authored command", () => {
+  const artifact = reviewablePlanArtifact([
+    "# 修复 CSV 字段映射",
+    "",
+    "## 已确认证据",
+    "- `src/hooks/useCsvParser.ts` 当前只填充 creator。",
+    "",
+    "## 关键实现改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，将 creator 同步映射到 creatorName。",
+    "",
+    "## 验证方式",
+    "1. 检查 normalizeCsvOrder 的返回对象是否同时包含正确的 creator 和 creatorName。",
+    "2. 上传包含 creator 列的 CSV，确认 Dashboard 界面显示正常。",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) =>
+      evidence.kind === "cmd" && evidence.value === "focused validation command"
+    )
+  ));
+  assert.ok(readiness.executableValidationTaskCount >= 1);
+});
+
+test("approval readiness preserves semantic validation flattened into a canonical key-changes section", () => {
+  const artifact = reviewablePlanArtifact([
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 修复 CSV creator 到 creatorName 的字段映射。",
+    "",
+    "## 已确认证据",
+    "- 已读取文件：src/hooks/useCsvParser.ts；当前 normalizeCsvOrder 只填充 creator。",
+    "",
+    "## 关键改动",
+    "- 关键实现改动",
+    "- **修改 `normalizeCsvOrder` 函数**：在返回对象中增加 `creatorName` 的映射逻辑。",
+    "- **映射规则**：从 CSV 行读取 `creator` 或 `创建者` 并赋给 `creatorName`。",
+    "- 验证方案",
+    "- **静态检查**：确保 `CsvOrder` 接口的类型定义与映射逻辑一致。",
+    "- **逻辑验证**（待执行阶段）：通过模拟包含 `creator` 或 `创建者` 列的 CSV 行数据，验证生成的 `CsvOrder` 对象是否同时包含正确的 `creatorName`。",
+    "- 在 `src/hooks/useCsvParser.ts` 的证据已确认实现边界实施必要改动，保持无关行为不变，并验证对应用户目标链路。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API、接口或类型变化；如果执行中证明必须改变，先暂停确认。",
+    "",
+    "## 测试方案",
+    "- 验证方案",
+    "- **静态检查**：确保 `CsvOrder` 接口的类型定义与映射逻辑一致。",
+    "- **逻辑验证**（待执行阶段）：通过模拟包含 `creator` 或 `创建者` 列的 CSV 行数据，验证生成的 `CsvOrder` 对象是否同时包含正确的 `creatorName`。",
+    "",
+    "## 假设与默认值",
+    "- 默认保持未点名的公共 API、接口和类型不变。",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) =>
+      evidence.kind === "cmd" && evidence.value === "focused validation command"
+    )
+  ), JSON.stringify(executionPlanTasks));
+});
+
 test("approval readiness recognizes a mutation verb after a concrete file target", () => {
   const artifact = reviewablePlanArtifact(executableMutationPlan());
   const readiness = evaluateApprovedPlanExecutionReadiness({
@@ -346,7 +425,7 @@ test("approval task projection preserves long grounded PlanCandidate changes", (
     entry.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts")
   ));
   assert.equal(readiness.ok, true, JSON.stringify(readiness));
-  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.equal(readiness.concreteMutationTaskCount, 1, JSON.stringify(executionPlanTasks));
 });
 
 test("approval task projection keeps the real OMLX deterministic evidence change", () => {
@@ -391,6 +470,33 @@ test("approval task projection keeps the real OMLX deterministic evidence change
   assert.ok(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts")
   ));
+});
+
+test("approval readiness treats a plain prose change section as mutation-oriented", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Proposed Plan: 修复 CSV creator 字段映射",
+    "",
+    "## 问题",
+    "`src/hooks/useCsvParser.ts` 缺少 creatorName 映射。",
+    "",
+    "## 改动",
+    "**文件**: `src/hooks/useCsvParser.ts`",
+    "",
+    "修改 `normalizeCsvOrder` 函数，将 CSV 的 creator 字段映射到 creatorName。",
+    "",
+    "## 验证",
+    "1. 运行与受影响范围匹配的聚焦测试。",
+  ].join("\n"));
+  const state = baseState({ planArtifacts: [artifact], isPlanApproved: false });
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.mutationOriented, true);
+  assert.equal(readiness.concreteMutationTaskCount, 1, JSON.stringify(executionPlanTasks));
+  assert.equal(readiness.ok, true, JSON.stringify(readiness));
 });
 
 test("approval readiness preserves the native contract for a design-only review artifact", () => {

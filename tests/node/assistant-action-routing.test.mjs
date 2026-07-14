@@ -57,10 +57,32 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  resolveApprovedPlanFiniteCommandInjection,
   resolveAssistantActionRouting,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantActionRouting.ts"),
 );
+
+function finiteCommandInjection(overrides = {}) {
+  return resolveApprovedPlanFiniteCommandInjection({
+    isApprovedPlanExecutionTurn: true,
+    toolCallCount: 0,
+    replyOptionCount: 0,
+    availableToolNames: new Set(["run_command"]),
+    tasks: [{
+      id: "validate-build",
+      text: "Run the approved finite build validation",
+      status: "pending",
+      commands: ["npm run build"],
+      evidence: [{ kind: "cmd", value: "npm run build", inferred: true }],
+      evidenceStatus: "missing",
+    }],
+    evidenceLedger: [],
+    recentToolActivity: [],
+    buildToolCallId: () => "call_validation",
+    ...overrides,
+  });
+}
 
 function route(overrides = {}) {
   return resolveAssistantActionRouting({
@@ -159,4 +181,47 @@ test("assistant action routing does not inject duplicate web research after a we
 
   assert.equal(decision.injectedRequiredWebResearchCall, false);
   assert.equal(decision.effectiveToolCalls.length, 0);
+});
+
+test("approved Plan execution injects its sole remaining finite validation command", () => {
+  const injection = finiteCommandInjection();
+
+  assert.ok(injection);
+  assert.equal(injection.task.id, "validate-build");
+  assert.equal(injection.command, "npm run build");
+  assert.equal(injection.call.id, "call_validation");
+  assert.equal(injection.call.name, "run_command");
+  assert.deepEqual(JSON.parse(injection.call.arguments), {
+    command: "npm run build",
+    cwd: ".",
+    description: "Run the approved finite build validation",
+  });
+});
+
+test("approved Plan finite validation injection stays inside narrow runtime boundaries", () => {
+  assert.equal(finiteCommandInjection({ isApprovedPlanExecutionTurn: false }), null);
+  assert.equal(finiteCommandInjection({ toolCallCount: 1 }), null);
+  assert.equal(finiteCommandInjection({ replyOptionCount: 1 }), null);
+  assert.equal(finiteCommandInjection({ availableToolNames: new Set(["read_file"]) }), null);
+  assert.equal(finiteCommandInjection({
+    tasks: [{
+      id: "open-ended",
+      text: "Keep watching the server",
+      status: "pending",
+      commands: ["npm run dev"],
+      evidence: [{ kind: "cmd", value: "npm run dev" }],
+    }],
+  }), null);
+});
+
+test("approved Plan finite validation injection does not repeat a failed command", () => {
+  const injection = finiteCommandInjection({
+    recentToolActivity: [{
+      name: "run_command",
+      status: "failed",
+      target: "npm run build",
+    }],
+  });
+
+  assert.equal(injection, null);
 });

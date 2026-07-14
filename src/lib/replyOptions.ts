@@ -26,6 +26,7 @@ const TOOL_IMPLEMENTATION_DIAGNOSTIC_OPTION_RE = /^(?:引用|调用|使用).{0,1
 const ASSISTANT_SELF_DIRECTED_INVESTIGATION_RE = /^(?:我来|让我|我会|我将|I(?:'ll| will))\s*(?:检查|读取|查看|分析|验证|定位|排查|核对|搜索|调查|check|read|view|inspect|analy[sz]e|verify|locate|debug|search|investigate)/i;
 const ASSISTANT_SELF_DIRECTED_CONFIRM_RE = /^(?:我来|让我|我会|我将|I(?:'ll| will))\s*(?:确认|confirm)/i;
 const ASSISTANT_SELF_DIRECTED_CONFIRM_CONDITION_RE = /(?:是否|能否|有没有|正确|配置|路径|文件|代码|源码|接口|函数|组件|Rust|Tauri|config|file|code|source|implementation|registered|available)/i;
+const ASSISTANT_OPTIONAL_PLAN_CONTEXT_CONDITION_RE = /(?:字段|映射|类型|契约|field|mapping|type|contract)/i;
 const ACTIONABLE_OPTION_RE = /(?:^方案\s*[A-Z0-9一二三四五六七八九十]|^option\s*[A-Z0-9]|先|直接|继续|开始|执行|运行|批准|确认|选择|使用|改用|采用|切换|修复|修改|实现|重构|完善|生成|创建|删除|保留|跳过|我来|我要|请|proceed|continue|start|run|execute|approve|confirm|choose|use|switch|fix|modify|implement|refactor|create|delete|skip)/i;
 const DECISION_VALUE_OPTION_RE = /(?:[？?]$|是否|应该|需要基于|基于|字段|金额|状态为|差值|计算|\bfield\b|\bvalue\b|\bamount\b|\bcalculate\b)/i;
 const LABELED_REPORT_STATEMENT_RE = /^(?:\*\*)?(.{2,80}?)(?:\*\*)?\s*[:：]\s*(.+)$/;
@@ -39,6 +40,7 @@ const PLAN_CONTINUATION_ACTION_RE = /^(?:请)?(?:先|继续|直接|再|尝试|�
 const PLAN_CONTINUATION_TECH_TARGET_RE = /(?:是否|能否|能不能|有没有|是否能|是否可以|成功|正确|读取|存入|计算|渲染|解析|冲突|代码|源码|文件|接口|组件|函数|字段|契约|状态|数据|日志|表格|当前(?:发现|证据)|Store|store|CSV|csv|src[\/\\]|[A-Za-z0-9_.\-\/\\]+\.[A-Za-z0-9]{1,12}|\bstate\b|\bdata\b|\bfield\b|\bcontract\b|\bevidence\b|\bfile\b|\bcomponent\b|\bfunction\b|\binterface\b|\blog\b|\bparse\b|\brender\b|\bload\b|\bstore\b)/i;
 const PLAN_CONTINUATION_DECISION_RE = /(?:方案|设计|需求|范围|风格|体验|取舍|批准|执行|修复|修改|实现|生成|创建|采用|选择|保留|跳过|提交|部署|开始执行|product|design|requirement|scope|tradeoff|approve|execute|implement|fix|modify|create|choose|adopt|deploy)/i;
 const OPTIONAL_PLAN_CONTEXT_OPTION_RE = /(?:提供|补充|告诉|输入|粘贴|发(?:给)?我|provide|share|tell|paste).{0,40}(?:关键)?(?:文件路径|路径|文件|组件名|组件|函数名|模块名|类名|symbol|path|file|component|function|module|class)/i;
+const OPTIONAL_PLAN_CLARIFICATION_OPTION_RE = /^(?:我来|由我|让我|用户来|I(?:'ll| will)?|let me|user(?: can)?)\s*(?:先)?\s*(?:确认|补充|澄清|说明|confirm|clarify|provide|add)(?:一下)?\s*(?:需求|要求|细节|信息|上下文|背景|requirements?|details?|information|context)?[。.!！]*$/i;
 const PREMATURE_PLAN_ARTIFACT_TEXT_RE = /(?:#\s*Proposed Plan|Proposed Plan|核心问题诊断|根源分析|执行路线图|修复方案|实现方案|实施方案|重构方案|拟定方案|实施步骤|执行步骤|阶段\s*\d|影响文件|验证方式|Data Integrity|Dark Mode Refactor|Implementation Plan|Execution Plan|Root Cause|Validation)/i;
 const BLOCKING_PLAN_DECISION_TEXT_RE = /(?:真正阻塞|阻塞问题|必须(?:由)?用户(?:确认|选择|拍板)|需要用户(?:确认|选择|拍板)|缺少关键(?:业务|产品|设计|范围|验收)选择|请确认以下关键点|before (?:I|we) can (?:write|finalize|proceed)|blocking question|blocking decision|need you to choose|must choose|user[- ]visible.{0,80}(?:choice|decision).{0,80}(?:blocks?|required)|(?:choice|decision).{0,80}blocks?.{0,80}(?:plan|proposal|implementation))/i;
 const USER_OWNED_PLAN_DECISION_RE = /(?:用户(?:可见|体验)|启动(?:时|行为)|默认(?:行为|页面|策略|打开|显示)|产品(?:行为|方向)?|业务(?:规则|口径)|范围|功能边界|是否支持|平台选择|兼容(?:范围|策略)|隐私|权限策略|数据(?:保留|恢复|同步|存储)|自动恢复|手动选择|技术栈|框架选型|数据库选型|部署目标|优先级|优先推进|MVP|最小可运行|完整框架|主题风格|交互方式|default (?:behavior|page|experience|startup)|user experience|product behavior|business rule|scope|feature boundary|whether to support|platform choice|compatibility|privacy|data (?:retention|restore|sync|storage)|technology stack|framework choice|database choice|deployment target|priority|minimum viable product)/i;
@@ -720,18 +722,40 @@ function looksLikePlanContinuationReplyOption(option: ReplyOption): boolean {
 }
 
 function looksLikeOptionalPlanContextReplyOption(option: ReplyOption): boolean {
-  const combined = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
+  const values = [option.label, option.value]
+    .map((value) => normalizeOptionText(value || ""))
+    .filter(Boolean);
+  const combined = values.join(" ");
   if (!combined) return false;
-  if (!OPTIONAL_PLAN_CONTEXT_OPTION_RE.test(combined)) return false;
+  const hasOptionalClarification = values.some((value) =>
+    OPTIONAL_PLAN_CLARIFICATION_OPTION_RE.test(value)
+  ) || values.some((value) =>
+    ASSISTANT_SELF_DIRECTED_CONFIRM_RE.test(value) &&
+    (
+      ASSISTANT_SELF_DIRECTED_CONFIRM_CONDITION_RE.test(value) ||
+      ASSISTANT_OPTIONAL_PLAN_CONTEXT_CONDITION_RE.test(value)
+    ) &&
+    !USER_OWNED_PLAN_DECISION_RE.test(value)
+  );
+  if (
+    !values.some((value) => OPTIONAL_PLAN_CONTEXT_OPTION_RE.test(value)) &&
+    !hasOptionalClarification
+  ) return false;
   if (BLOCKING_PLAN_DECISION_TEXT_RE.test(combined)) return false;
+  if (USER_OWNED_PLAN_DECISION_RE.test(combined)) return false;
   if (OPERATION_CUE_RE.test(combined) && !READONLY_ACTION_RE.test(combined)) return false;
   return true;
 }
 
 function looksLikeModelOwnedPlanDraftingOption(option: ReplyOption): boolean {
-  const combined = normalizeOptionText(`${option.label || ""} ${option.value || ""}`);
-  if (!combined) return false;
-  return /(?:基于|按照?).{0,24}(?:当前|现有).{0,20}(?:发现|证据|信息|分析).{0,36}(?:生成|起草|输出|完成).{0,16}(?:计划|方案)|(?:generate|draft|produce|finish).{0,20}(?:the\s+)?(?:plan|proposal).{0,36}(?:current|existing).{0,16}(?:evidence|findings?|information)/i.test(combined);
+  const values = [option.label, option.value]
+    .map((value) => normalizeOptionText(value || ""))
+    .filter(Boolean);
+  return values.some((value) =>
+    /(?:基于|按照?).{0,24}(?:当前|现有).{0,20}(?:发现|证据|信息|分析).{0,36}(?:生成|起草|输出|完成).{0,16}(?:计划|方案)|(?:generate|draft|produce|finish).{0,20}(?:the\s+)?(?:plan|proposal).{0,36}(?:current|existing).{0,16}(?:evidence|findings?|information)/i.test(value) ||
+    /^(?:直接|现在|继续)?(?:生成|起草|输出|完成)(?:一份|该|这个|当前|修复|实施|实现|可审批的|\s)*(?:计划|方案)(?:[（(](?:假设|默认|assuming|assume).{0,160}[）)])?$/i.test(value) ||
+    /^(?:generate|draft|produce|finish)(?:\s+the)?(?:\s+(?:repair|implementation|reviewable))?\s+(?:plan|proposal)$/i.test(value)
+  );
 }
 
 export function hasOnlyPlanContinuationReplyOptions(replyOptions: ReplyOption[]): boolean {
@@ -751,7 +775,10 @@ export function hasOnlyNonBlockingPlanReplyOptions(replyOptions: ReplyOption[]):
       looksLikeOptionalPlanContextReplyOption(option) ||
       looksLikeModelOwnedPlanDraftingOption(option)
     ) &&
-    replyOptions.some((option) => looksLikePlanContinuationReplyOption(option))
+    replyOptions.some((option) =>
+      looksLikePlanContinuationReplyOption(option) ||
+      looksLikeModelOwnedPlanDraftingOption(option)
+    )
   );
 }
 

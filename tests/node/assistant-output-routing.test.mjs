@@ -60,6 +60,7 @@ const {
   isHiddenThoughtOnlyNoToolStop,
   resolveAssistantReplyOptionRouting,
   resolveClosedPlanReadOnlyContinuation,
+  resolveNonBlockingPlanChoiceLoop,
   resolveToolProtocolStreamClearDecision,
   shouldAutoContinueNonBlockingPlanChoices,
   shouldTrackAssistantCheckpoint,
@@ -146,6 +147,23 @@ test("assistant output routing auto-continues only non-blocking unapproved plan 
     false,
     "strip the non-blocking options but preserve a substantive plan candidate for materialization",
   );
+});
+
+test("non-blocking plan choice auto-continuation forces finalization at its retry boundary", () => {
+  assert.deepEqual(resolveNonBlockingPlanChoiceLoop({
+    consecutiveNoToolCount: 0,
+    maxAutoContinues: 2,
+  }), {
+    action: "continue",
+    nextConsecutiveNoToolCount: 1,
+  });
+  assert.deepEqual(resolveNonBlockingPlanChoiceLoop({
+    consecutiveNoToolCount: 1,
+    maxAutoContinues: 2,
+  }), {
+    action: "force_finalize",
+    nextConsecutiveNoToolCount: 2,
+  });
 });
 
 test("closed drafting surface reopens bounded targeted evidence for a read-only continuation request", () => {

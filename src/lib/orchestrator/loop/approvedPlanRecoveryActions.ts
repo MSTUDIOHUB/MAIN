@@ -8,6 +8,7 @@ import {
   describeApprovedPlanRecoveryToolSurface,
   shouldAllowApprovedPlanRecoveryFileRead,
 } from "../../approvedPlanRecoveryTools";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import type {
   PlanExecutionProgressPhase,
   PlanExecutionProgressUpdate,
@@ -236,7 +237,7 @@ export function continueApprovedPlanWithStrategySwitch(input: {
   callbacks.appendMessage({
     role: "user",
     content: buildApprovedPlanNoProgressStrategySwitchPrompt({
-      language,
+      language: MODEL_CONTROL_LANGUAGE,
       remainingText: input.remainingText,
       repeatedTargets,
       recentToolActivity: recentPlanToolActivity,

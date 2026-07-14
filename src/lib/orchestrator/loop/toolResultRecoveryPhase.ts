@@ -1,9 +1,14 @@
 import {
+  buildFailedFiniteValidationRecoveryPrompt,
+} from "../../executeRecoveryTools";
+import {
   isReviewablePlanStage,
   isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
 } from "../../orchestrator";
+import { commandResultLooksSuccessful } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
@@ -107,7 +112,7 @@ function getApprovedPlanScopeBlockedTargets(results: ToolExecutionResult[]): str
   ));
 }
 
-function buildApprovedPlanScopeRevisionPauseMessage(input: {
+function buildApprovedPlanScopeRecoveryPrompt(input: {
   language: "zh" | "en";
   targets: string[];
   plannedTargets: string[];
@@ -116,15 +121,15 @@ function buildApprovedPlanScopeRevisionPauseMessage(input: {
   const planned = input.plannedTargets.join(", ") || (input.language === "zh" ? "当前计划任务" : "the current Plan tasks");
   if (input.language === "en") {
     return [
-      "Execution is paused before modifying " + targets + ".",
-      "The file is outside the approved Plan scope (" + planned + "). Read-only inspection remains allowed, but MAIN will not write an unreviewed target.",
-      "Create a focused Plan revision that adds the evidence-backed target, then review and approve that revision before resuming execution.",
+      "The attempted write to " + targets + " was blocked because it is outside the approved Plan scope (" + planned + ").",
+      "Do not pause merely to add a temporary verification helper. Continue the approved work using existing tests, an inline command, a temporary location outside the workspace, or read-only inspection.",
+      "Only if the source change genuinely requires this additional workspace target, output a focused Plan revision for review; otherwise continue execution and validation now.",
     ].join("\n");
   }
   return [
-    "执行已在修改 " + targets + " 前暂停。",
-    "该文件不在已批准 Plan 的修改范围内（当前范围：" + planned + "）。仍可继续做只读定向检查，但 MAIN 不会写入未经审核的目标。",
-    "请生成一份只补充该已确认目标的 Plan 修订，审核并批准该修订后再继续执行。",
+    "对 " + targets + " 的写入已被拦截，因为它不在已批准 Plan 的修改范围内（当前范围：" + planned + "）。",
+    "不要仅为添加临时验证脚本而暂停；请改用现有测试、内联命令、工作区外临时位置或只读检查，继续完成已批准任务。",
+    "只有当源码修复确实必须修改这个额外目标时，才输出聚焦的 Plan revision 供审核；否则现在继续执行和验证。",
   ].join("\n");
 }
 
@@ -246,11 +251,11 @@ export async function handleToolResultRecoveryPhase(input: {
   const pendingPlanRuntimeRecoveryPrompt = planQualityRecovery.pendingPlanRuntimeRecoveryPrompt;
   const approvedPlanScopeBlockedTargets = getApprovedPlanScopeBlockedTargets(input.results);
 
-  // A scope block is not an ordinary failed patch. The current revision has
-  // proved insufficient, so keep the write boundary intact and stop before a
-  // local model can reinterpret the error as permission to retry or complete
-  // the remaining tasks. Read-only tools remain available on the next
-  // revision-drafting turn.
+  // Keep the reviewed mutation boundary intact without turning every omitted
+  // implementation detail into a user checkpoint. A blocked helper/test-file
+  // write can usually recover through existing tests, an inline command, or a
+  // temporary path; only a genuinely necessary source expansion needs a new
+  // reviewed revision.
   if (
     input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved() &&
@@ -273,37 +278,33 @@ export async function handleToolResultRecoveryPhase(input: {
       ),
     ));
     const language = input.callbacks.getPreferredLanguage();
-    const message = buildApprovedPlanScopeRevisionPauseMessage({
-      language,
+    const recoveryPrompt = buildApprovedPlanScopeRecoveryPrompt({
+      language: MODEL_CONTROL_LANGUAGE,
       targets: approvedPlanScopeBlockedTargets,
       plannedTargets,
     });
-    logAgentEvent("approved_plan_scope_revision_required", {
+    logAgentEvent("approved_plan_scope_block_recovering", {
       iteration: input.iteration,
       targets: approvedPlanScopeBlockedTargets,
       plannedTargets,
       resultCount: input.results.length,
     });
-    input.emitPlanExecutionProgress("paused", {
-      currentTask: language === "zh" ? "需要扩展已批准计划" : "approved Plan revision required",
+    input.emitPlanExecutionProgress("running", {
+      currentTask: language === "zh" ? "在已批准范围内继续" : "continuing within approved Plan scope",
       currentTool: "",
       latestEvidence: approvedPlanScopeBlockedTargets.join(", "),
-      recoveryReason: "approved_plan_scope_revision_required",
+      recoveryReason: "approved_plan_scope_block_recovering",
       repeatedTargets: approvedPlanScopeBlockedTargets,
       nextStep: language === "zh"
-        ? "补充已确认文件的计划修订并重新审核"
-        : "add the confirmed file in a Plan revision and review it",
+        ? "改用计划内验证方式并继续执行"
+        : "use an in-scope validation method and continue execution",
     });
-    input.callbacks.onNonActionableStop(message, "incomplete_plan", {
-      phase: "paused",
-      recoveryReason: "approved_plan_scope_revision_required",
-      repeatedTargets: approvedPlanScopeBlockedTargets,
-      nextStep: language === "zh"
-        ? "补充已确认文件的计划修订并重新审核"
-        : "add the confirmed file in a Plan revision and review it",
+    input.callbacks.onStatusChange("running");
+    input.callbacks.appendMessage({
+      role: "user",
+      content: recoveryPrompt,
     });
-    input.callbacks.onStatusChange("idle");
-    return finish("stopped");
+    return finish("continue");
   }
 
   // Codex-style Plan execution is runtime-owned: once every task in the
@@ -413,6 +414,47 @@ export async function handleToolResultRecoveryPhase(input: {
     iterationContext: input.iterationContext,
     emitTurnEvent: input.emitTurnEvent,
   });
+
+  const failedFiniteValidation = input.results.find((result) =>
+    result.name === "run_command" &&
+    !result.internalFeedback &&
+    (result.isError || !commandResultLooksSuccessful(result.name, result.content || ""))
+  );
+  if (
+    failedFiniteValidation &&
+    input.workflowMode === "plan" &&
+    input.callbacks.getIsPlanApproved()
+  ) {
+    const args = input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {};
+    const command = String(
+      args.command || args.cmd || failedFiniteValidation.target || "",
+    ).trim();
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "finite_validation_only",
+      "failed_finite_validation_command",
+      { command, target: failedFiniteValidation.target || "run_command" },
+    );
+    const recoveryPrompt = buildFailedFiniteValidationRecoveryPrompt({
+      command,
+      result: failedFiniteValidation.content || failedFiniteValidation.displayContent || "",
+    });
+    logAgentEvent("approved_plan_finite_validation_recovery", {
+      iteration: input.iteration,
+      command,
+      target: failedFiniteValidation.target || "",
+      executeRecoveryAttempts: executeRecoveryState.attempts,
+    });
+    input.emitPlanExecutionProgress("running", {
+      currentTool: "run_command",
+      recoveryReason: "failed_finite_validation_command",
+      nextStep: input.callbacks.getPreferredLanguage() === "zh"
+        ? "改用与项目运行时匹配的一次性验证命令"
+        : "run a different finite validation command compatible with the project runtime",
+    });
+    input.callbacks.onStatusChange("running");
+    input.callbacks.appendMessage({ role: "user", content: recoveryPrompt });
+    return finish("continue");
+  }
 
   const goalCheckpoint = input.callbacks.evaluateGoalToolResultCheckpoint?.(
     input.results,

@@ -6,6 +6,7 @@ export type ExecuteRecoveryMode =
   | "action_plus_targeting"
   | "patch_recovery_read"
   | "validation_only"
+  | "finite_validation_only"
   | "action_only";
 
 export interface ExecuteRecoveryActivityLike {
@@ -67,6 +68,10 @@ export const EXECUTE_RECOVERY_VALIDATION_TOOLS = new Set([
   "clear_pty_buffer",
 ]);
 
+export const EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS = new Set([
+  "run_command",
+]);
+
 export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set([
   "apply_patch",
   "replace_in_file",
@@ -85,6 +90,7 @@ export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMod
     value === "action_plus_targeting" ||
     value === "patch_recovery_read" ||
     value === "validation_only" ||
+    value === "finite_validation_only" ||
     value === "action_only" ||
     value === "normal"
     ? value
@@ -196,7 +202,7 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     ? "need_context" as const
     : mode === "mutation_first"
       ? "need_mutation" as const
-      : mode === "validation_only"
+      : mode === "validation_only" || mode === "finite_validation_only"
         ? "need_validation" as const
         : "legacy_action" as const;
   const eligible = calls.filter((call) => isExecuteRecoveryToolName(
@@ -241,6 +247,9 @@ export function isExecuteRecoveryToolName(
   const mode = normalizeExecuteRecoveryMode(options.mode);
   if (mode === "normal") return true;
   if (mode === "validation_only") return EXECUTE_RECOVERY_VALIDATION_TOOLS.has(name);
+  if (mode === "finite_validation_only") {
+    return EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS.has(name);
+  }
   if (mode === "mutation_first") {
     return EXECUTE_RECOVERY_MUTATION_TOOLS.has(name);
   }
@@ -261,6 +270,7 @@ export function describeExecuteRecoveryToolSurface(
   const normalized = normalizeExecuteRecoveryMode(mode);
   if (normalized === "normal") return "normal";
   if (normalized === "validation_only") return "validation_only";
+  if (normalized === "finite_validation_only") return "finite_validation_only";
   if (normalized === "action_only") return "action_only";
   if (normalized === "mutation_first") {
     return "mutation_only";
@@ -525,6 +535,25 @@ export function buildExecuteValidationRecoveryPrompt(input: {
     "下一条回复必须只调用一个验证工具；有限的构建/测试/lint 优先用 `run_command`，页面 DOM/截图验证用 `browser_evaluate`。",
     "不要继续编辑文件，不要重新读取文件，也不要在验证工具返回前总结完成。如果无法自动验证，请说明精确阻塞，不能声称任务完成。",
   ].filter(Boolean).join("\n");
+}
+
+export function buildFailedFiniteValidationRecoveryPrompt(input: {
+  command: string;
+  result: string;
+}): string {
+  const command = String(input.command || "").trim() || "the failed finite command";
+  const result = String(input.result || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1_200);
+  return [
+    "FINITE_VALIDATION_RECOVERY: The last `run_command` failed and cannot satisfy the approved Plan's command evidence.",
+    `Failed command: ${command}`,
+    result ? `Observed result: ${result}` : "Observed result: no usable command output was returned.",
+    "The next tool surface is intentionally limited to `run_command`. Call one different finite validation command that matches the actual project runtime and source format (for example an existing test, build, typecheck, lint, or compile command).",
+    "Do not switch this finite check to `execute_command` or PTY tools, do not reread an already-modified source file, and do not infer that a successful file edit was reverted merely because the validation command itself was invalid.",
+    "Use stdout, stderr, and exitCode to distinguish a real source/test failure from a wrong command. If the diagnostic names a real source defect, repair it in a later normal execution transaction; otherwise choose a compatible finite command now. Do not repeat the failed command unchanged and do not claim completion before exitCode 0.",
+  ].join("\n");
 }
 
 export function buildExecuteNoProgressLoopPauseNotice(input: {

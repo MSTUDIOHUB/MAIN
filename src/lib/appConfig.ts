@@ -33,7 +33,7 @@ export function createDefaultAppConfig(): AppConfig {
     themeMode: "dark",
     appIconVariant: "dark",
     workflowMode: "chat",
-    promptLanguageStrategy: "model_aware",
+    promptLanguageStrategy: "english_core_localized_output",
     toolPermissionPolicy: createDefaultToolPermissionPolicy(),
     mcpRouting: createDefaultMcpRoutingConfig(),
     instructionsEnabled: true,

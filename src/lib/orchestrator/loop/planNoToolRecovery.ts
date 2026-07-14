@@ -4,6 +4,7 @@ import {
   type PlanRuntimePhase,
 } from "../../workflowModels";
 import type { ResolvedUserIntent } from "../../runIntent";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { buildPlanClosureEvidenceRecoveryPrompt } from "../planOrchestration";
@@ -366,6 +367,19 @@ export async function handlePlanNoToolRecovery(input: {
   const recoverRejectedVisibleCandidate = async (
     materialized: Awaited<ReturnType<typeof autoMaterializePlanArtifactFromVisibleText>>,
   ): Promise<PlanNoToolRecoveryResult> => {
+    let rejectedCandidateContextPreserved = false;
+    const preserveRejectedCandidateForRecovery = () => {
+      if (rejectedCandidateContextPreserved) return;
+      const candidate = sourceVisibleText.trim();
+      if (!candidate) return;
+      callbacks.appendMessage(buildAssistantHistoryMessage(candidate));
+      rejectedCandidateContextPreserved = true;
+      logAgentEvent("plan_rejected_candidate_context_preserved", {
+        iteration,
+        qualityGateReason: currentPlanLastQualityGateReason || materialized.reason || "quality_gate",
+        candidateChars: candidate.length,
+      });
+    };
     const priorPlanAutoScaffoldPromptIssued = planAutoScaffoldPromptIssued;
     const priorPlanClosureEvidenceRecoveryIssued = planClosureEvidenceRecoveryIssued;
     const quality = materialized.quality || classifyPlanArtifactQualityResult({
@@ -423,6 +437,7 @@ export async function handlePlanNoToolRecovery(input: {
         evidenceRecoveryPasses: recovery.planEvidenceRecoveryPasses,
       });
       callbacks.onStatusChange("running");
+      preserveRejectedCandidateForRecovery();
       callbacks.appendMessage({
         role: "user",
         content: recovery.pendingPlanRuntimeRecoveryPrompt || "",
@@ -499,7 +514,7 @@ export async function handlePlanNoToolRecovery(input: {
         planClosureEvidenceRecoveryIssued = true;
         setPlanRuntimePhase("needs_evidence", materializationReason);
         const targetedPrompt = buildPlanClosureEvidenceRecoveryPrompt(
-          callbacks.getPreferredLanguage(),
+          MODEL_CONTROL_LANGUAGE,
           materializationReason,
           latestUserPromptText,
         );
@@ -511,6 +526,7 @@ export async function handlePlanNoToolRecovery(input: {
           evidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
         });
         callbacks.onStatusChange("running");
+        preserveRejectedCandidateForRecovery();
         callbacks.appendMessage({ role: "user", content: targetedPrompt });
         return finish("continue");
       }
@@ -528,13 +544,48 @@ export async function handlePlanNoToolRecovery(input: {
         });
       }
 
-      if (
-        evidenceMaterialized.toolResult?.isError === true ||
-        recovery.planQualityRejectCount >= 2
-      ) {
-        const failureReason = evidenceMaterialized.toolResult?.isError === true
-          ? `evidence_materialization_write_failed:${evidenceMaterialized.reason || "unknown"}`
-          : `evidence_materialization_rejected:${evidenceMaterialized.reason || recovery.planLastQualityGateReason || "quality_gate"}`;
+      if (evidenceMaterialized.toolResult?.isError === true) {
+        const failureReason = `evidence_materialization_write_failed:${evidenceMaterialized.reason || "unknown"}`;
+        logAgentEvent("loop_stop", {
+          reason: "plan_evidence_materialization_exhausted",
+          iteration,
+          qualityGateReason: recovery.planLastQualityGateReason,
+          qualityRejectCount: recovery.planQualityRejectCount,
+          materializationReason: evidenceMaterialized.reason || "",
+        });
+        callbacks.onNonActionableStop(
+          buildPlanGenerationFailedMessage(callbacks.getPreferredLanguage(), failureReason),
+          "incomplete_plan",
+          buildPlanGenerationFailedProgress(failureReason),
+        );
+        callbacks.onStatusChange("idle");
+        return finish("stopped");
+      }
+
+      // A prepared auto-scaffold prompt is a model recovery path, not proof
+      // that the prompt reached the model. If deterministic materialization
+      // cannot meet its intentionally higher evidence bar, preserve the
+      // rejected conversational draft and let the model perform the bounded
+      // rewrite before declaring plan generation exhausted.
+      if (recovery.pendingPlanRuntimeRecoveryPrompt) {
+        callbacks.onStatusChange("running");
+        preserveRejectedCandidateForRecovery();
+        callbacks.appendMessage({
+          role: "user",
+          content: recovery.pendingPlanRuntimeRecoveryPrompt,
+        });
+        logAgentEvent("plan_evidence_materialization_fell_back_to_model_rewrite", {
+          iteration,
+          qualityGateReason: recovery.planLastQualityGateReason,
+          qualityRejectCount: recovery.planQualityRejectCount,
+          materializationReason: evidenceMaterialized.reason || "",
+          candidateContextPreserved: rejectedCandidateContextPreserved,
+        });
+        return finish("continue");
+      }
+
+      if (recovery.planQualityRejectCount >= 2) {
+        const failureReason = `evidence_materialization_rejected:${evidenceMaterialized.reason || recovery.planLastQualityGateReason || "quality_gate"}`;
         logAgentEvent("loop_stop", {
           reason: "plan_evidence_materialization_exhausted",
           iteration,
@@ -554,6 +605,7 @@ export async function handlePlanNoToolRecovery(input: {
 
     if (recovery.pendingPlanRuntimeRecoveryPrompt) {
       callbacks.onStatusChange("running");
+      preserveRejectedCandidateForRecovery();
       callbacks.appendMessage({
         role: "user",
         content: recovery.pendingPlanRuntimeRecoveryPrompt,
@@ -723,7 +775,7 @@ export async function handlePlanNoToolRecovery(input: {
           callbacks.appendMessage({
             role: "user",
             content: buildPlanClosureEvidenceRecoveryPrompt(
-              callbacks.getPreferredLanguage(),
+              MODEL_CONTROL_LANGUAGE,
               currentPlanLastQualityGateReason || "plan closure failed",
               latestUserPromptText,
             ),
@@ -787,9 +839,7 @@ export async function handlePlanNoToolRecovery(input: {
     }
     callbacks.appendMessage({
       role: "user",
-      content: callbacks.getPreferredLanguage() === "zh"
-        ? "上一条规划内容过长并发生截断。不要继续输出长篇计划，也不要写入 `.MAIN/plans/`。请把刚才内容收束成不超过 8 条要点，然后用面向用户的口吻提出 2-4 个可点击选项。每个 `<option>` 必须是用户点击后会发送的完整选择，不要写成“是否……”问题句。使用 `<user_options>` 后立刻停止等待。"
-        : "The previous planning reply was too long and was truncated. Do not continue with a long plan and do not write `.MAIN/plans/` files. Condense it into no more than 8 bullets, then offer 2-4 decision options with `<user_options>` and stop immediately.",
+      content: "The previous planning reply was too long and was truncated. Do not continue with a long plan and do not write `.MAIN/plans/` files. Condense it into no more than 8 bullets, then offer 2-4 decision options with `<user_options>` in MAIN's configured response language and stop immediately.",
     });
     return finish("continue");
   }
@@ -826,7 +876,7 @@ export async function handlePlanNoToolRecovery(input: {
     callbacks.appendMessage({
       role: "user",
       content: buildForcePlanContinuationPrompt({
-        language: callbacks.getPreferredLanguage(),
+        language: MODEL_CONTROL_LANGUAGE,
         currentPlanStage,
         sawPlanModeToolActivity,
         wasTruncated,

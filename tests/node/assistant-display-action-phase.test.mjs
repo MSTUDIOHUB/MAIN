@@ -34,6 +34,7 @@ test("assistant display action phase owns display and action telemetry", () => {
   assert.match(phaseSource, /pseudo_tool_recovered/);
   assert.match(phaseSource, /pseudo_tool_recovery_unavailable/);
   assert.match(phaseSource, /web_research_required_tool_injected/);
+  assert.match(phaseSource, /approved_plan_finite_command_injected/);
   assert.match(phaseSource, /readonly_permission_options_ignored_for_tool_call/);
   assert.match(phaseSource, /plan_reply_options_routed_to_artifact/);
   assert.match(phaseSource, /reply_options_detected/);

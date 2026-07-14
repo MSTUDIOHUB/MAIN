@@ -1,4 +1,5 @@
 import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { collectPlanClosureMaterializationInput, logAgentEvent } from "../../orchestrator";
 import {
   assessPlanClosureEvidence,
@@ -182,7 +183,6 @@ export function prepareIterationStreamRequest(input: {
     advanceExecuteRecoveryRuntimeIteration(input.executeRecoveryState);
   let executeRecoveryState = executeRecoveryIterationAdvance.state;
   if (executeRecoveryIterationAdvance.reachedMaxIterations) {
-    const language = callbacks.getPreferredLanguage();
     logAgentEvent("execute_recovery_max_iterations_reached", {
       iteration,
       executeRecoveryMode: executeRecoveryState.mode,
@@ -202,7 +202,7 @@ export function prepareIterationStreamRequest(input: {
     callbacks.appendMessage({
       role: "system",
       content: buildExecuteRecoveryMaxIterationsPrompt({
-        language,
+        language: MODEL_CONTROL_LANGUAGE,
         maxIterations: executeRecoveryIterationAdvance.maxIterations,
       }),
     });
@@ -268,7 +268,7 @@ export function prepareIterationStreamRequest(input: {
       ...managedAgentMessages,
       {
         role: "system",
-        content: formatPlanEvidenceBundleForModel(bundle, callbacks.getPreferredLanguage()),
+        content: formatPlanEvidenceBundleForModel(bundle, MODEL_CONTROL_LANGUAGE),
       },
     ];
     logAgentEvent("plan_evidence_bundle_injected", {

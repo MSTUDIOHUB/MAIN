@@ -20,6 +20,7 @@ import {
   truncateForLog,
 } from "../../orchestrator";
 import { isApprovedPlanCachedReadOnlyNoProgressBatch } from "../../approvedPlanRecoveryTools";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
@@ -293,7 +294,7 @@ export function handleNoProgressRecovery(input: {
       },
     );
     pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
-      language: callbacks.getPreferredLanguage(),
+      language: MODEL_CONTROL_LANGUAGE,
       reason: directMutationPreflightRecovery.reason,
       mode: directMutationPreflightRecovery.mode,
       repeatedTargets,
@@ -309,7 +310,7 @@ export function handleNoProgressRecovery(input: {
       repeatedTargets,
     });
     pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
-      language: callbacks.getPreferredLanguage(),
+      language: MODEL_CONTROL_LANGUAGE,
       reason: "read_file_only_loop",
       mode: "mutation_first",
       repeatedTargets,
@@ -351,7 +352,7 @@ export function handleNoProgressRecovery(input: {
         repeatedTargets,
       });
       pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
-        language,
+        language: MODEL_CONTROL_LANGUAGE,
         reason: executeReadOnlyRecovery.reason,
         mode: nextMode,
         repeatedTargets,
@@ -707,7 +708,6 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
       const count = crossIterationFileReads.get(trackedTarget)!;
       const crossReadThreshold = resolveCrossIterationReadThreshold(snapshotContextLimit);
       if (count >= crossReadThreshold && executeRecoveryMode === "normal") {
-        const language = callbacks.getPreferredLanguage();
         const reason = "cross_iteration_file_read_loop";
         executeRecoveryMode = "mutation_first";
         executeRecoveryReason = reason;
@@ -717,9 +717,7 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
         });
         callbacks.appendMessage({
           role: "system",
-          content: language === "zh"
-            ? `[System: 检测到跨迭代重复读取同一文件（${target}，已连续读取${count}次）。文件内容已在上下文中，请勿再次读取。请基于已有上下文直接执行写入、验证命令、浏览器操作，或说明真实阻塞。不要输出长段落回复。]`
-            : `[System: Cross-iteration read_file loop detected for ${target} (read ${count} times across iterations). File content is already in context — do not re-read. Act directly with write/verify/run commands, browser actions, or state the real blocker. Do not output long prose.]`,
+          content: `[System: Cross-iteration read_file loop detected for ${target} (read ${count} times across iterations). File content is already in context — do not re-read. Act directly with write/verify/run commands, browser actions, or state the real blocker. Do not output long prose.]`,
         });
         logAgentEvent("cross_iteration_file_read_loop", {
           iteration,
@@ -757,11 +755,8 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
       };
     }
 
-    const language = callbacks.getPreferredLanguage();
     const usedTools = results.map((result) => result.name).filter(Boolean).join(", ");
-    const recoveryPrompt = language === "zh"
-      ? "[System: read_file 在当前恢复模式不可用。你已尝试多次读取，工具已显示此操作被阻止。请立即使用可用工具执行实际动作：replace_in_file、write_file、apply_patch 修改代码，或 execute_command 运行验证。不要再次尝试 read_file。]"
-      : "[System: read_file is not available in the current recovery mode. You have attempted to read multiple times and the tool has blocked this action. Immediately act with available tools: use replace_in_file, write_file, apply_patch to edit code, or execute_command to run validation. Do not attempt read_file again.]";
+    const recoveryPrompt = "[System: read_file is not available in the current recovery mode. You have attempted to read multiple times and the tool has blocked this action. Immediately act with available tools: use replace_in_file, write_file, apply_patch to edit code, or execute_command to run validation. Do not attempt read_file again.]";
     callbacks.appendMessage({ role: "user", content: recoveryPrompt });
     logAgentEvent("blocked_read_file_recovery_prompt_injected", {
       iteration,
@@ -853,7 +848,7 @@ export function handleTargetProgressLoopRecovery(input: {
       callbacks.appendMessage({
         role: "user",
         content: buildExecuteRecoveryPrompt({
-          language: callbacks.getPreferredLanguage(),
+          language: MODEL_CONTROL_LANGUAGE,
           reason: recoveryReason,
           mode,
           repeatedTargets: displayTarget ? [displayTarget] : summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
@@ -966,7 +961,7 @@ export function handleExecuteConvergencePrompt(input: {
   }
   callbacks.appendMessage({
     role: "user",
-    content: buildExecuteConvergencePrompt(callbacks.getPreferredLanguage(), iteration, effectiveMaxIterations),
+    content: buildExecuteConvergencePrompt(MODEL_CONTROL_LANGUAGE, iteration, effectiveMaxIterations),
   });
 
   return { usedExecuteConvergencePrompt: true };
@@ -1039,7 +1034,7 @@ export function handleReadFileRepeatLimitRecovery(input: {
       return {
         status: "pending_prompt",
         prompt: buildExecuteRecoveryPrompt({
-          language,
+          language: MODEL_CONTROL_LANGUAGE,
           reason: recoveryReason,
           mode: "mutation_first",
           repeatedTargets,
@@ -1124,7 +1119,7 @@ export function handleReadFileRepeatLimitRecovery(input: {
     return {
       status: "pending_prompt",
       prompt: buildExecuteRecoveryPrompt({
-        language,
+        language: MODEL_CONTROL_LANGUAGE,
         reason: "read_file_repeat_limit_batch",
         mode: "mutation_first",
         repeatedTargets,
@@ -1285,7 +1280,7 @@ export function handleRepeatedEditValidationRecovery(input: {
         status: "pending_prompt",
         repeatedEditValidationRecoveryAttempts,
         prompt: buildExecuteValidationRecoveryPrompt({
-          language,
+          language: MODEL_CONTROL_LANGUAGE,
           reason: "repeat_edit_target_without_validation",
           target: displayTarget,
           editCount: count,

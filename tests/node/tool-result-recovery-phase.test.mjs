@@ -68,7 +68,7 @@ test("tool result recovery phase owns runtime state folds", () => {
   assert.match(phaseSource, /approvedPlanRecoveryState,/);
 });
 
-test("approved plan scope blocks become a revision checkpoint before completion can be audited", () => {
+test("approved plan scope blocks recover within the reviewed scope before completion can be audited", () => {
   const scopeCheckpointIndex = phaseSource.indexOf("const approvedPlanScopeBlockedTargets");
   const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({");
 
@@ -76,9 +76,27 @@ test("approved plan scope blocks become a revision checkpoint before completion 
   assert.notEqual(completionAuditIndex, -1);
   assert.ok(scopeCheckpointIndex < completionAuditIndex);
   assert.match(phaseSource, /getApprovedPlanScopeBlockedTargets\(input\.results\)/);
-  assert.match(phaseSource, /logAgentEvent\("approved_plan_scope_revision_required"/);
-  assert.match(phaseSource, /emitPlanExecutionProgress\("paused",[\s\S]*?approved_plan_scope_revision_required/);
-  assert.match(phaseSource, /onNonActionableStop\(message, "incomplete_plan",[\s\S]*?approved_plan_scope_revision_required/);
+  assert.match(phaseSource, /logAgentEvent\("approved_plan_scope_block_recovering"/);
+  assert.match(phaseSource, /emitPlanExecutionProgress\("running",[\s\S]*?approved_plan_scope_block_recovering/);
+  assert.match(phaseSource, /appendMessage\(\{[\s\S]*?content: recoveryPrompt/);
+  assert.doesNotMatch(phaseSource, /approved_plan_scope_revision_required/);
+});
+
+test("approved Plan finite command failures enter command-only recovery", () => {
+  const appendIndex = phaseSource.indexOf(
+    "appendToolResultsToHistory({",
+    phaseSource.indexOf("handleNoProgressRecovery({"),
+  );
+  const recoveryIndex = phaseSource.indexOf("approved_plan_finite_validation_recovery");
+  const goalCheckpointIndex = phaseSource.indexOf("evaluateGoalToolResultCheckpoint?.(");
+
+  assert.notEqual(appendIndex, -1);
+  assert.notEqual(recoveryIndex, -1);
+  assert.notEqual(goalCheckpointIndex, -1);
+  assert.ok(appendIndex < recoveryIndex);
+  assert.ok(recoveryIndex < goalCheckpointIndex);
+  assert.match(phaseSource, /"finite_validation_only",\s*"failed_finite_validation_command"/);
+  assert.match(phaseSource, /buildFailedFiniteValidationRecoveryPrompt\(\{/);
 });
 
 test("tool iteration phase delegates tool-result recovery internals to the phase helper", () => {

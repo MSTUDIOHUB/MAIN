@@ -103,6 +103,7 @@ const {
   isPlanTaskAwaitingBrowserValidation,
   isPlanTaskAwaitingExternalValidation,
   isEphemeralPlanArtifactPath,
+  isFinitePlanValidationCommand,
   isPlanTaskTrustedComplete,
   looksLikeReasoningLeakTitle,
   mergePlanTasks,
@@ -823,6 +824,170 @@ test("runtime plan task derivation creates executable tasks without tasks.md", (
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("runtime-tools-events-envelope"))), true);
 });
 
+test("runtime plan task derivation binds prose change sections with a labeled file", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan: 修复 CSV creator 字段映射",
+      "",
+      "## 改动",
+      "**文件**: `src/hooks/useCsvParser.ts`",
+      "",
+      "修改 `normalizeCsvOrder` 函数，将 CSV 的 creator 字段映射到 creatorName。",
+      "",
+      "```typescript",
+      "return { creatorName: row.creator || '' };",
+      "```",
+      "",
+      "## 验证",
+      "1. 运行聚焦测试，确认 creatorName 已赋值。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const sourceTask = tasks.find((task) =>
+    task.evidence?.some((evidence) =>
+      evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts"
+    )
+  );
+  assert.ok(sourceTask, JSON.stringify(tasks));
+  assert.match(sourceTask.text, /修改.*useCsvParser\.ts.*normalizeCsvOrder/);
+});
+
+test("runtime plan task derivation inherits implementation context for nested file headings", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 实现改动",
+      "### 文件: `src/hooks/useCsvParser.ts`",
+      "**当前代码:** 返回对象只有 `creator`。",
+      "**修改后:** 添加 `creatorName` 并保留现有 CSV 取值逻辑。",
+      "",
+      "## 验证方式",
+      "1. 修改后返回对象包含 `creatorName`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  assert.equal(
+    tasks.some((task) => task.evidence?.some((evidence) =>
+      evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts"
+    )),
+    true,
+    JSON.stringify(tasks),
+  );
+  assert.equal(
+    tasks.some((task) => task.evidence?.some((evidence) => evidence.kind === "cmd")),
+    true,
+    JSON.stringify(tasks),
+  );
+});
+
+test("runtime plan task derivation does not promote integration validation references to source mutations", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 实现方案",
+      "修改 `src/hooks/useCsvParser.ts`：",
+      "1. 更新 `CsvOrder` 接口，将 `creator` 字段重命名为 `creatorName`。",
+      "2. 更新 `normalizeCsvOrder`，将返回值中的 `creator` 改为 `creatorName`。",
+      "",
+      "## 验证方案",
+      "1. **静态检查**：确认返回对象包含 `creatorName` 字段。",
+      "2. **逻辑验证**：确认 `creatorName` 来源于 CSV 的 `creator` 列。",
+      "3. **集成验证**：确保 `src/store/dashboardStore.ts` 通过 `creatorField` 访问时能获取 creator 名称。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  assert.equal(
+    tasks.some((task) => task.evidence?.some((evidence) =>
+      evidence.kind === "file" && evidence.value === "src/store/dashboardStore.ts"
+    )),
+    false,
+    JSON.stringify(tasks),
+  );
+  assert.equal(
+    tasks.some((task) => task.evidence?.some((evidence) =>
+      evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts"
+    )),
+    true,
+    JSON.stringify(tasks),
+  );
+  assert.equal(
+    tasks.some((task) => /集成验证/.test(task.text) && task.evidence?.some((evidence) => evidence.kind === "cmd")),
+    true,
+  );
+});
+
+test("runtime plan task derivation turns outcome bullets under validation headings into executable checks", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 具体实现",
+      "- 修改 `src/hooks/useCsvParser.ts`，增加 `creatorName` 映射。",
+      "",
+      "## 验证方式",
+      "1. 修改后 `normalizeCsvOrder` 返回的对象同时包含 `creator` 和 `creatorName`。",
+      "2. `creatorName` 的值与 CSV `creator` 列保持一致。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  assert.equal(
+    tasks.some((task) => task.evidence?.some((evidence) =>
+      evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts"
+    )),
+    true,
+    JSON.stringify(tasks),
+  );
+  assert.equal(
+    tasks.some((task) => /验证：修改后/.test(task.text) && task.evidence?.some((evidence) => evidence.kind === "cmd")),
+    true,
+    JSON.stringify(tasks),
+  );
+});
+
+test("runtime plan task derivation excludes files explicitly marked as unchanged", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 关键实现改动",
+      "- 修改 `src/hooks/useCsvParser.ts`，添加 `creatorName` 映射。",
+      "- `src/types/order.ts`：无需修改，接口已包含 `creatorName`。",
+      "- `src/store/dashboardStore.ts`: no changes are required.",
+      "- Do not modify `src/components/Dashboard/CourseBarChart.tsx`; leave it unchanged.",
+      "",
+      "## 验证方式",
+      "- 验证返回对象包含 `creatorName`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationFiles = tasks.flatMap((task) => task.evidence || [])
+    .filter((evidence) => evidence.kind === "file")
+    .map((evidence) => evidence.value);
+  assert.deepEqual(mutationFiles, ["src/hooks/useCsvParser.ts"], JSON.stringify(tasks));
+});
+
 test("runtime plan task derivation ignores status findings and tech-stack bullets", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
@@ -1355,6 +1520,31 @@ test("approved mutation task requires the planned identifier in the fresh diff",
   assert.equal(plannedWrite?.changedIdentifiers?.includes("creatorName"), true);
 });
 
+test("mutation location identifiers are not required in fresh changed lines", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 仅修改 `src/hooks/useCsvParser.ts` 中的 `normalizeCsvOrder` 函数。",
+  );
+  assert.equal(parsed.length, 1);
+  assert.deepEqual(parsed[0].evidence?.[0]?.requiredTerms || [], []);
+
+  const writeEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "replace_in_file",
+    target: "src/hooks/useCsvParser.ts",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: "    creator: row.creator || '',",
+      new: "    creator: row.creator || '',\n    creatorName: row.creator || '',",
+      path: "src/hooks/useCsvParser.ts",
+    },
+  });
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: parsed,
+    evidenceLedger: writeEvidence ? [writeEvidence] : [],
+  });
+
+  assert.equal(audit.allTrustedComplete, true);
+});
+
 test("approved Plan blocks workspace mutations outside the reviewed task targets", () => {
   const tasks = extractPlanTasks(
     "- [ ] 修改 `src/hooks/useCsvParser.ts`，将 `creator` 映射为 `creatorName`。",
@@ -1735,6 +1925,34 @@ test("focused test or build alternatives accept fresh command evidence without b
   assert.equal(isPlanTaskAwaitingExternalValidation(reconciled[0]), false);
 });
 
+test("bounded inline runtime assertions count as finite Plan validation", () => {
+  assert.equal(isFinitePlanValidationCommand(
+    "node -e \"const value = 1; if (value !== 1) process.exit(1)\"",
+  ), true);
+  assert.equal(isFinitePlanValidationCommand(
+    "python3 -c \"assert 1 == 1\"",
+  ), true);
+  assert.equal(isFinitePlanValidationCommand(
+    "npx ts-node --eval \"console.log('ok')\"",
+  ), true);
+  assert.equal(isFinitePlanValidationCommand("npm run dev"), false);
+  assert.equal(isFinitePlanValidationCommand("node src/server.js"), false);
+
+  const parsed = extractPlanTasks(
+    "- [ ] 逻辑验证：确认 normalizeCsvOrder 返回正确的 creatorName。",
+  );
+  const command = "node -e \"if (!'creatorName') process.exit(1)\"";
+  const commandEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: command,
+    result: JSON.stringify({ exitCode: 0, stdout: "inline assertion passed" }),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], parsed, commandEvidence ? [commandEvidence] : []);
+
+  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+});
+
 test("test build or manual alternatives stay automatable when command validation is available", () => {
   const parsed = extractPlanTasks("- [x] 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。");
   const commandEvidence = createPlanExecutionEvidenceEntry({
@@ -1747,6 +1965,29 @@ test("test build or manual alternatives stay automatable when command validation
   assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
   assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
   assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+});
+
+test("a semantic confirmation step stays automatable unless it explicitly requires a human", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 代码审查：确认 normalizeCsvOrder 返回对象包含正确的 creatorName。",
+  );
+
+  assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
+  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
+  assert.equal(isPlanTaskAwaitingExternalValidation(parsed[0]), false);
+
+  const technicallyAutomatableManualLabel = extractPlanTasks(
+    "- [ ] 手动验证：`normalizeCsvOrder({ creator: 'alice' })` 返回 `{ creatorName: 'alice' }`。",
+  );
+  assert.equal(technicallyAutomatableManualLabel[0].evidence?.[0]?.kind, "cmd");
+  assert.equal(technicallyAutomatableManualLabel[0].evidence?.[0]?.value, "focused validation command");
+  assert.equal(isPlanTaskAwaitingExternalValidation(technicallyAutomatableManualLabel[0]), false);
+
+  const manual = extractPlanTasks(
+    "- [ ] 用户手动确认结果正确。",
+  );
+  assert.equal(manual[0].evidence?.[0]?.kind, "manual_user_validation");
+  assert.equal(isPlanTaskAwaitingExternalValidation(manual[0]), true);
 });
 
 test("runtime task evidence does not classify dotted code properties as files", () => {

@@ -33,7 +33,7 @@ export interface ApprovedPlanExecutionReadiness {
 }
 
 const PLAN_MUTATION_SECTION_RE =
-  /^(?:关键改动|关键实现改动|实现改动|实施步骤|执行步骤|修复步骤|落地步骤|影响文件(?:清单)?|涉及文件(?:清单)?|文件变更|变更文件|Key Changes|Implementation Changes|Implementation Steps|Execution Steps|Plan of Work|Affected Files(?: List)?|Files? to Change|File Changes)(?:\s*(?:[（(].*[）)]|[:：—-].*))?$/i;
+  /^(?:改动|变更|关键改动|关键实现改动|实现改动|实施步骤|执行步骤|修复步骤|落地步骤|影响文件(?:清单)?|涉及文件(?:清单)?|文件变更|变更文件|Changes?|Key Changes|Implementation Changes|Implementation Steps|Execution Steps|Plan of Work|Affected Files(?: List)?|Files? to Change|File Changes)(?:\s*(?:[（(].*[）)]|[:：—-].*))?$/i;
 const PLAN_VALIDATION_SECTION_RE =
   /^(?:测试方案|测试计划|测试场景|验证方案|验证标准|验证方式|验收标准|验收|Test Plan|Testing|Tests?|Validation|Acceptance(?: Criteria)?)(?:\s*(?:[（(].*[）)]|[:：—-]|与).*)?$/i;
 const LEADING_READ_OR_VALIDATION_INTENT_RE =

@@ -979,10 +979,21 @@ export function requiresPtyObservationForPlanCommand(value: string): boolean {
   return LONG_RUNNING_PLAN_COMMAND_RE.test(String(value || ""));
 }
 
-function commandLooksLikeFiniteValidation(value: string): boolean {
-  return /(?:\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)\b|\bnpx\s+(?:tsc|playwright|vitest|jest)\b|\b(?:cargo\s+(?:test|check|clippy)|pytest|python\s+-m\s+(?:pytest|unittest)|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b)/i.test(
-    String(value || ""),
-  );
+export function isFinitePlanValidationCommand(value: string): boolean {
+  const command = String(value || "").trim();
+  if (!command || requiresPtyObservationForPlanCommand(command)) return false;
+  if (/(?:\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)\b|\bnpx\s+(?:tsc|playwright|vitest|jest)\b|\b(?:node\s+--test|cargo\s+(?:test|check|clippy)|pytest|python\s+-m\s+(?:pytest|unittest)|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b)/i.test(command)) {
+    return true;
+  }
+
+  // Small repositories and one-file fixes do not always expose a package
+  // script. A bounded inline assertion is still a legitimate finite check;
+  // classifying it as non-validation made successful `node -e` / `python -c`
+  // evidence invisible and sent compatible models back into recovery loops.
+  return /(?:^|\s*(?:&&|\|\||;)\s*)(?:node|bun|deno)\b[^\n;&|]{0,500}\s(?:-e|--eval)(?:\s|=)/i.test(command) ||
+    /(?:^|\s*(?:&&|\|\||;)\s*)python3?\b[^\n;&|]{0,200}\s-c(?:\s|$)/i.test(command) ||
+    /(?:^|\s*(?:&&|\|\||;)\s*)(?:ruby\b[^\n;&|]{0,200}\s-e|php\b[^\n;&|]{0,200}\s-r)(?:\s|$)/i.test(command) ||
+    /(?:^|\s*(?:&&|\|\||;)\s*)npx\s+(?:tsx|ts-node)\b[^\n;&|]{0,500}\s(?:-e|--eval)(?:\s|=)/i.test(command);
 }
 
 function commandLooksLikeDevServerOrHttpProbe(value: string): boolean {
@@ -1003,7 +1014,7 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
   const expected = normalizeCommandEvidenceValue(expectedRaw);
   const actual = normalizeCommandEvidenceValue(actualRaw);
   if (!expected || !actual) return false;
-  if (expected === FOCUSED_VALIDATION_COMMAND) return commandLooksLikeFiniteValidation(actual);
+  if (expected === FOCUSED_VALIDATION_COMMAND) return isFinitePlanValidationCommand(actual);
   if (expected === actual) return true;
 
   const actualSegments = splitCommandEvidenceSegments(actual);
@@ -1072,6 +1083,8 @@ function commandEvidenceIsAwaitingPtyObservation(
 
 const VALIDATION_ACTION_RE =
   /(?:验证|测试|检查|验收|确认|打开|预览|渲染|显示|截图|启动|verify|test|check|validate|render|preview|open|screenshot|start|serve)/i;
+const CONCRETE_VALIDATION_OUTCOME_RE =
+  /(?:是否|确保|应(?:当|该)?|能够|可以|正确|正常|成功|失败|不再|保持|返回|包含|产生|显示|可见|一致|兼容|生效|完成|expected|should|must|can\b|correct|success|fail|no longer|remain|return|contain|include|produce|render|display|visible|match|consistent|compatible|work(?:s|ing)?\b)/i;
 const BROWSER_VALIDATION_RE =
   /(?:浏览器|页面|前端|UI|DOM|截图|可视|可见|视觉|渲染|预览|图表|显示|颜色|深色|浅色|主题切换|localhost|127\.0\.0\.1|Playwright|Cypress|Puppeteer|browser|page|frontend|screenshot|render|preview|DOM)/i;
 const MARKDOWN_VIEWER_VALIDATION_RE =
@@ -1079,11 +1092,13 @@ const MARKDOWN_VIEWER_VALIDATION_RE =
 const TAURI_VALIDATION_RE =
   /(?:Tauri|invoke\(['"`](?:open_file|save_file|save_file_as)|open_file|save_file|文件选择|文件对话框|系统浏览器|桌面|窗口|原生|desktop|file\s+dialog|native|system integration)/i;
 const MANUAL_VALIDATION_RE =
-  /(?:手动|人工|用户(?:自己)?|你自己|自行|肉眼|确认|manual|human|user confirmation|user validation|visually inspect)/i;
+  /(?:人工|用户(?:自己)?|你自己|自行|肉眼|需(?:要)?\s*手动(?:确认|检查|验收)|由用户手动|human|user confirmation|user validation|manually confirmed by (?:the )?user|visually inspect)/i;
 const SOURCE_MUTATION_TASK_RE =
-  /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|防御性编程|implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+  /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|防御性编程|implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
 const PRIMARY_VALIDATION_TASK_RE =
-  /(?:^\s*(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图)(?:\s|[:：]|$)|^\s*(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
+  /(?:^\s*(?:(?:静态|逻辑|行为|功能|单元|集成|端到端|回归|构建|类型|编译|运行时|自动化)?(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图))(?:\s|[（(]|[:：]|$)|^\s*(?:(?:static|logical?|behavioral|functional|unit|integration|end-to-end|e2e|regression|build|type|compile|runtime|automated)\s+)?(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
+const NEGATED_SOURCE_MUTATION_SPAN_RE =
+  /(?:无需|不(?:需要|必|要)|不会)\s*(?:进行|做|作)?\s*(?:任何|额外)?\s*(?:修改|改动|变更|更新|调整)|保持(?:现有|当前)?[^，。；;]{0,40}不变|(?:no|without)\s+(?:code\s+)?changes?\s+(?:are\s+)?(?:needed|required)|does\s+not\s+require[^.;]{0,50}(?:changes?|updates?|modifications?)|(?:leave|keep|remain)\s+[^.;]{0,50}\s+unchanged|without\s+(?:modifying|changing|updating)|do\s+not\s+(?:modify|change|update)/gi;
 const CODE_IDENTIFIER_REF_RE =
   /`([A-Za-z_$][\w$]*)`|(?:^|[\s（(【\[{:：，,])((?:use[A-Z][A-Za-z0-9_]*|[a-z][A-Za-z0-9_]*Store))(?=$|[\s）)】\]}，,。.;；:：])/g;
 
@@ -1118,6 +1133,16 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
 
   if (/(?:localhost|127\.0\.0\.1|\bdev server\b|开发服务器|服务器|服务|端口|\bport\b)/i.test(normalized)) {
     const parsed = makePlanTaskEvidence("dev_server_url", "dev server reachable", true);
+    return parsed ? [parsed] : [];
+  }
+
+  // A reviewed plan can describe a concrete assertion without knowing the
+  // repository's exact test command yet (for example, "check that the return
+  // object contains creatorName"). Preserve that assertion as an executable
+  // runtime obligation. The execution loop must still run a finite validation
+  // command and record trusted evidence before the task can complete.
+  if (CONCRETE_VALIDATION_OUTCOME_RE.test(normalized)) {
+    const parsed = makePlanTaskEvidence("cmd", FOCUSED_VALIDATION_COMMAND, true);
     return parsed ? [parsed] : [];
   }
 
@@ -1231,13 +1256,21 @@ function inferMutationRequiredTerms(text: string): string[] {
     if (match?.[2]) return [match[2]];
   }
 
-  const terms: string[] = [];
-  for (const match of normalized.matchAll(/`([A-Za-z_$][\w$-]*)`/g)) {
-    const term = String(match[1] || "");
-    if (!term || /^(?:src|test|tests|file|true|false|null|undefined)$/i.test(term)) continue;
-    terms.push(term);
+  const explicitTargetPatterns = [
+    /(?:增加|新增|添加|补齐|写入|设置|赋值给)\s*(?:字段|属性)?\s*`([A-Za-z_$][\w$-]*)`/i,
+    /`([A-Za-z_$][\w$-]*)`\s*(?:字段|属性)\s*(?:增加|新增|添加|补齐|写入|设置|赋值)/i,
+    /(?:add|introduce|write|set|assign|populate)\s+(?:the\s+)?`([A-Za-z_$][\w$-]*)`/i,
+  ];
+  for (const pattern of explicitTargetPatterns) {
+    const match = normalized.match(pattern);
+    if (match?.[1]) return [match[1]];
   }
-  return Array.from(new Set(terms)).slice(0, 4);
+
+  // Identifiers that only locate the edit (for example “modify the
+  // `normalizeCsvOrder` function”) need not occur in the added diff lines.
+  // Treating every backticked identifier as an expected new symbol prevented
+  // otherwise-correct one-line edits from ever satisfying their Plan task.
+  return [];
 }
 
 function inferSourcePathFromCodeIdentifier(identifier: string): string | null {
@@ -1262,7 +1295,8 @@ function inferSourceEvidenceFromCodeIdentifiers(text: string): PlanTaskEvidence[
 
 function isLikelySourceMutationTask(text: string): boolean {
   const normalized = String(text || "");
-  if (!SOURCE_MUTATION_TASK_RE.test(normalized)) return false;
+  const affirmativeText = normalized.replace(NEGATED_SOURCE_MUTATION_SPAN_RE, " ");
+  if (!SOURCE_MUTATION_TASK_RE.test(affirmativeText)) return false;
   return !PRIMARY_VALIDATION_TASK_RE.test(normalized);
 }
 
@@ -1760,7 +1794,7 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 const RUNTIME_TASK_ACTION_RE =
   /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate)/i;
 const RUNTIME_TASK_MUTATION_RE =
-  /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
+  /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
 const RUNTIME_TASK_VERIFICATION_RE =
   /(?:执行|运行|验证|测试|验收|run|verify|test|validate|acceptance)/i;
 const RUNTIME_TASK_READ_ONLY_RE =
@@ -1768,7 +1802,9 @@ const RUNTIME_TASK_READ_ONLY_RE =
 const RUNTIME_TASK_FILE_ROLE_RE =
   /(?:负责|用于|包含|当前|现有|可能|根因|原因|问题|错误|不匹配|responsible|handles|contains|current|existing|possible|root cause|finding|issue|mismatch)/i;
 const RUNTIME_TASK_SECTION_RE =
-  /(?:关键改动|实现改动|改动|执行|实施|任务|步骤|顺序|验证|验收|Key Changes|Implementation Changes|Changes|Execution|Implementation|Tasks|Steps|Order|Validation|Acceptance)/i;
+  /(?:关键改动|实现改动|实现方案|实施方案|改动|执行|实施|任务|步骤|顺序|验证|验收|Key Changes|Implementation Changes|Implementation Plan|Proposed Changes|Changes|Execution|Implementation|Approach|Tasks|Steps|Order|Validation|Acceptance)/i;
+const RUNTIME_TASK_VALIDATION_SECTION_RE =
+  /^(?:\d+\s*[.)、:：-]?\s*)?(?:验证(?:方式|方案|标准|步骤|结果)?|测试(?:方式|方案|标准|步骤|结果)?|验收(?:方式|方案|标准|步骤|结果)?|Validation(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Verification(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Testing(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Acceptance(?:\s+(?:Criteria|Tests?|Steps|Results))?)\s*$/i;
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
   /(?:用户目标|目标|摘要|概要|当前状态|状态发现|已确认发现|已确认事实|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|证据|已读证据|最相关证据|假设|默认值|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|User Goals?|Goals?|Summary|Overview|Current State|Confirmed Findings|Findings|Background|Root Cause|Tech Stack|Architecture|Evidence|Read Evidence|Most Relevant Evidence|Assumptions|Defaults|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
@@ -1818,13 +1854,22 @@ export function isRuntimeTaskActionableText(text: string): boolean {
 
   // A read/inspect sentence can contain mutation nouns such as “the complete
   // implementation”. Treat the leading intent as authoritative unless the
-  // same sentence explicitly pivots from inspection to a write action.
+  // same sentence explicitly pivots from inspection to a write action or
+  // defines a concrete validation outcome that the runtime can prove.
   const hasLeadingReadOnlyIntent = /^(?:(?:需要|需|先|请|继续|首先|下一步)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解)|^(?:(?:need(?:s)?\s+to|first|please|next)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand)\b/i.test(normalized.trim());
   const hasMutationAfterRead = /(?:然后|随后|之后|再|并(?:且)?).{0,100}(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出)|(?:then|after(?:wards)?|and then).{0,100}(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i.test(normalized);
-  if (hasLeadingReadOnlyIntent && !hasMutationAfterRead) return false;
+  const hasConcreteValidationOutcome =
+    PRIMARY_VALIDATION_TASK_RE.test(normalized) &&
+    CONCRETE_VALIDATION_OUTCOME_RE.test(normalized);
+  if (hasLeadingReadOnlyIntent && !hasMutationAfterRead && !hasConcreteValidationOutcome) return false;
 
-  if (RUNTIME_TASK_MUTATION_RE.test(normalized)) return true;
+  if (hasConcreteValidationOutcome) return true;
+
+  if (isLikelySourceMutationTask(normalized)) return true;
   if (RUNTIME_TASK_VERIFICATION_RE.test(normalized)) return true;
+  // A sentence can mention mutation vocabulary only to say that a file stays
+  // unchanged. Do not fall through to the broad action matcher in that case.
+  if (RUNTIME_TASK_MUTATION_RE.test(normalized)) return false;
   if (RUNTIME_TASK_READ_ONLY_RE.test(normalized) || RUNTIME_TASK_FILE_ROLE_RE.test(normalized)) return false;
   return RUNTIME_TASK_ACTION_RE.test(normalized);
 }
@@ -1834,12 +1879,16 @@ export function collectRuntimeTaskCandidateLines(content: string): string[] {
   const candidates: string[] = [];
   let inUsefulSection = false;
   let inExcludedSection = false;
+  let inValidationSection = false;
 
   for (const line of lines) {
     const heading = line.match(/^\s*#{1,4}\s+(.+)$/);
     if (heading) {
       const headingText = heading[1] || "";
       inExcludedSection = RUNTIME_TASK_EXCLUDED_SECTION_RE.test(headingText);
+      inValidationSection =
+        !inExcludedSection &&
+        RUNTIME_TASK_VALIDATION_SECTION_RE.test(headingText.replace(/\*\*/g, "").trim());
       inUsefulSection =
         RUNTIME_TASK_SECTION_RE.test(headingText) &&
         !inExcludedSection;
@@ -1849,7 +1898,13 @@ export function collectRuntimeTaskCandidateLines(content: string): string[] {
     if (inExcludedSection) continue;
     if (!/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) continue;
     if (isMarkdownTableSyntaxLine(line)) continue;
-    const text = stripMarkdownTaskLine(line);
+    const rawText = stripMarkdownTaskLine(line);
+    const text =
+      inValidationSection &&
+      !PRIMARY_VALIDATION_TASK_RE.test(rawText) &&
+      CONCRETE_VALIDATION_OUTCOME_RE.test(rawText)
+        ? `${/[\u3400-\u9fff]/.test(rawText) ? "验证：" : "Verify: "}${rawText}`
+        : rawText;
     // PlanCandidate change lines intentionally preserve concrete rationale and
     // evidence references, so a valid mutation bullet can be substantially
     // longer than a chat-sized task label. Rejecting it here made approval see
@@ -2047,6 +2102,100 @@ function collectRuntimeTaskChangeHeadingTasks(
   return tasks;
 }
 
+function collectRuntimeTaskProseSectionTasks(
+  content: string,
+  language: "zh" | "en",
+): PlanTask[] {
+  const descriptionsByFile = new Map<string, string[]>();
+  let inActionableSection = false;
+  let inValidationSection = false;
+  let actionableSectionLevel = 0;
+  let inCodeFence = false;
+  let pendingFiles: string[] = [];
+
+  const remember = (files: string[], description: string) => {
+    const clean = stripMarkdownTaskLine(description).replace(/^[\s:：—–-]+/, "").trim();
+    // Validation labels such as “集成验证” / “integration validation” contain
+    // the mutation word “集成”, but they describe an assertion against a
+    // referenced file rather than a request to edit that file. Reuse the
+    // shared mutation classifier so validation bullets cannot become phantom
+    // source tasks that no later write can satisfy.
+    if (!clean || !isLikelySourceMutationTask(clean)) return;
+    if (!isRuntimeTaskActionableText(clean)) return;
+    for (const filePath of files) {
+      const existing = descriptionsByFile.get(filePath) || [];
+      if (!existing.includes(clean)) existing.push(clean);
+      descriptionsByFile.set(filePath, existing);
+    }
+  };
+
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    if (/^\s*```/.test(rawLine)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) continue;
+
+    const heading = rawLine.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const headingLevel = (heading[1] || "").length;
+      const headingText = (heading[2] || "").replace(/\*\*/g, "").trim();
+      const nestedHeadingFiles = extractWorkspaceFileReferencesFromText(headingText);
+      const isNestedFileHeading =
+        inActionableSection &&
+        !inValidationSection &&
+        actionableSectionLevel > 0 &&
+        headingLevel > actionableSectionLevel &&
+        /^(?:文件|目标文件|修改文件|file|target file|file to change)\s*[:：]/i.test(headingText) &&
+        nestedHeadingFiles.length > 0;
+      if (isNestedFileHeading) {
+        pendingFiles = nestedHeadingFiles;
+        continue;
+      }
+      inActionableSection =
+        RUNTIME_TASK_SECTION_RE.test(headingText) &&
+        !RUNTIME_TASK_EXCLUDED_SECTION_RE.test(headingText);
+      inValidationSection =
+        inActionableSection &&
+        RUNTIME_TASK_VALIDATION_SECTION_RE.test(headingText);
+      actionableSectionLevel = inActionableSection ? headingLevel : 0;
+      pendingFiles = [];
+      continue;
+    }
+    if (!inActionableSection || isMarkdownTableSyntaxLine(rawLine)) continue;
+
+    const normalized = rawLine.replace(/\*\*/g, "").trim();
+    if (!normalized) continue;
+    const directFiles = extractWorkspaceFileReferencesFromText(normalized);
+    const isFileLabel = /^(?:文件|目标文件|修改文件|file|target file|file to change)\s*[:：]/i.test(normalized);
+    if (isFileLabel && directFiles.length > 0) {
+      pendingFiles = directFiles;
+      continue;
+    }
+
+    if (!inValidationSection && directFiles.length > 0 && isLikelySourceMutationTask(normalized)) {
+      remember(directFiles, normalized);
+      pendingFiles = directFiles;
+      continue;
+    }
+    if (!inValidationSection && pendingFiles.length > 0 && isLikelySourceMutationTask(normalized)) {
+      remember(pendingFiles, normalized);
+    }
+  }
+
+  const tasks: PlanTask[] = [];
+  for (const [filePath, descriptions] of descriptionsByFile) {
+    const evidence = makePlanTaskEvidence("file", filePath, true);
+    if (!evidence) continue;
+    const verb = language === "en" ? "Modify" : "修改";
+    const taskText = descriptions.length > 0
+      ? `${verb} ${filePath}：${descriptions.join(language === "en" ? "; " : "；")}`
+      : `${verb} ${filePath}`;
+    tasks.push(makeRuntimeTaskFromEvidenceText(taskText, evidence, language));
+  }
+  return tasks;
+}
+
 function collectRuntimeTaskTableTasks(
   content: string,
   language: "zh" | "en",
@@ -2082,7 +2231,7 @@ function collectRuntimeTaskTableTasks(
     ) {
       continue;
     }
-    if (!RUNTIME_TASK_MUTATION_RE.test(`${actionCell} ${detail}`)) continue;
+    if (!isLikelySourceMutationTask(`${actionCell} ${detail}`)) continue;
 
     const evidence = makePlanTaskEvidence("file", filePath, true);
     if (!evidence) continue;
@@ -2132,15 +2281,29 @@ export function deriveRuntimePlanTasksFromArtifacts(
     tasks.push(task);
   };
 
-  const changeHeadingFiles = new Set<string>();
+  const structuredMutationFiles = new Set<string>();
   for (const task of collectRuntimeTaskChangeHeadingTasks(combinedContent, language)) {
     pushTask(task);
     for (const evidence of task.evidence || []) {
       if (evidence.kind === "file") {
-        changeHeadingFiles.add(normalizePlanEvidenceValue(evidence.value));
+        structuredMutationFiles.add(normalizePlanEvidenceValue(evidence.value));
       }
     }
     if (tasks.length >= sourceTaskLimit) break;
+  }
+
+  if (tasks.length < sourceTaskLimit) {
+    for (const task of collectRuntimeTaskProseSectionTasks(combinedContent, language)) {
+      const fileEvidence = (task.evidence || [])
+        .filter((item) => item.kind === "file")
+        .map((item) => normalizePlanEvidenceValue(item.value));
+      if (fileEvidence.some((value) => structuredMutationFiles.has(value))) {
+        continue;
+      }
+      pushTask(task);
+      fileEvidence.forEach((value) => structuredMutationFiles.add(value));
+      if (tasks.length >= sourceTaskLimit) break;
+    }
   }
 
   if (tasks.length < sourceTaskLimit) {
@@ -2148,17 +2311,26 @@ export function deriveRuntimePlanTasksFromArtifacts(
       const fileEvidence = (task.evidence || [])
         .filter((item) => item.kind === "file")
         .map((item) => normalizePlanEvidenceValue(item.value));
-      if (fileEvidence.length > 0 && fileEvidence.every((value) => changeHeadingFiles.has(value))) {
+      if (fileEvidence.length > 0 && fileEvidence.every((value) => structuredMutationFiles.has(value))) {
         continue;
       }
       pushTask(task);
+      fileEvidence.forEach((value) => structuredMutationFiles.add(value));
       if (tasks.length >= sourceTaskLimit) break;
     }
   }
 
   if (tasks.length < sourceTaskLimit) {
     for (const line of collectRuntimeTaskCandidateLines(combinedContent)) {
-      pushTask(makeRuntimeTask(line, language));
+      const task = makeRuntimeTask(line, language);
+      const fileEvidence = (task?.evidence || [])
+        .filter((item) => item.kind === "file")
+        .map((item) => normalizePlanEvidenceValue(item.value));
+      if (fileEvidence.some((value) => structuredMutationFiles.has(value))) {
+        continue;
+      }
+      pushTask(task);
+      fileEvidence.forEach((value) => structuredMutationFiles.add(value));
       if (tasks.length >= sourceTaskLimit) break;
     }
   }

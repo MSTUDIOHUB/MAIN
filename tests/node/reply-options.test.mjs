@@ -1180,6 +1180,103 @@ test("model-owned draft-now versus inspect-more options auto-continue Plan groun
   );
 });
 
+test("draft-now versus optional generic clarification does not pause an explicit Plan request", () => {
+  const result = extractReplyOptions(`
+I have enough evidence to draft the repair plan.
+<user_options>
+<option>直接生成修复计划</option>
+<option>我来确认需求</option>
+</user_options>
+  `);
+
+  assert.equal(hasOnlyNonBlockingPlanReplyOptions(result.replyOptions), true);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: result.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+      forcePause: true,
+      finishReason: "stop",
+    }),
+    false,
+  );
+});
+
+test("draft-now with an explicit default assumption remains model-owned Plan work", () => {
+  const result = extractReplyOptions(`
+<user_options>
+<option>直接生成修复计划（假设将 creator 映射到 creatorName）</option>
+<option>我来确认字段定义</option>
+</user_options>
+  `);
+
+  assert.equal(hasOnlyNonBlockingPlanReplyOptions(result.replyOptions), true);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: result.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+      forcePause: true,
+      finishReason: "stop",
+    }),
+    false,
+  );
+});
+
+test("draft-now default plus assistant-owned field clarification does not pause Plan", () => {
+  const result = extractReplyOptions(`
+<user_options>
+<option>直接生成修复计划（假设将 creator 映射到 creatorName）</option>
+<option>我来确认字段需求</option>
+</user_options>
+  `);
+
+  assert.equal(hasOnlyNonBlockingPlanReplyOptions(result.replyOptions), true);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: result.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+      forcePause: true,
+      finishReason: "stop",
+    }),
+    false,
+  );
+});
+
+test("draft-now does not auto-resolve a genuine user-owned scope decision", () => {
+  const result = extractReplyOptions(`
+<user_options>
+<option>直接生成最小范围计划</option>
+<option>我来确认产品范围需求</option>
+</user_options>
+  `);
+
+  assert.equal(hasOnlyNonBlockingPlanReplyOptions(result.replyOptions), false);
+  assert.equal(
+    shouldPauseForReplyOptions({
+      replyOptions: result.replyOptions,
+      toolCallCount: 0,
+      workflowMode: "plan",
+      hasStructuredProposal: false,
+      hasReadyPlanArtifacts: false,
+      isPlanApproved: false,
+      forcePause: true,
+      finishReason: "stop",
+    }),
+    true,
+  );
+});
+
 test("read-only auto approval strips repeated permission prompts and builds continuation", () => {
   const result = extractReplyOptions("请问是否同意我下一步分析 `CombatUnit.cs` 的内容？");
 

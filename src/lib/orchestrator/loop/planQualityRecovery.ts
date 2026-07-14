@@ -9,6 +9,7 @@ import {
   assessPlanClosureEvidence,
   isPlanEvidenceBundleReady,
 } from "../../planEvidence";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
   MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
   MAX_PLAN_EVIDENCE_RECOVERY_PASSES,
@@ -266,7 +267,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           : closureEvidenceAssessment.reason,
       );
       pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
-        callbacks.getPreferredLanguage(),
+        MODEL_CONTROL_LANGUAGE,
         planLastQualityGateReason || "quality gate rejected plan draft",
         latestUserPromptText,
         {
@@ -297,7 +298,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         planAutoScaffoldPromptIssued = true;
         setQualityPhase("needs_rewrite", "auto scaffold after quality gate");
         pendingPlanRuntimeRecoveryPrompt = buildPlanAutoScaffoldPrompt({
-          language: callbacks.getPreferredLanguage(),
+          language: MODEL_CONTROL_LANGUAGE,
           latestUserPromptText,
           recentToolActivity: recentPlanToolActivity,
           qualityGateReason: planLastQualityGateReason,
@@ -369,7 +370,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         planClosureEvidenceRecoveryIssued = true;
         setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
         pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
-          callbacks.getPreferredLanguage(),
+          MODEL_CONTROL_LANGUAGE,
           recoveredClosureAssessment.reason,
           latestUserPromptText,
           {
@@ -383,7 +384,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           "evidence recovery complete",
         );
         pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryClosurePrompt({
-          language: callbacks.getPreferredLanguage(),
+          language: MODEL_CONTROL_LANGUAGE,
           recentToolActivity: recentPlanToolActivity,
           qualityGateReason: planLastQualityGateReason,
           missingSections: planLastMissingSections,
@@ -391,7 +392,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       } else {
         setQualityPhase("blocked", "evidence recovery budget exhausted", "failed");
         pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
-          language: callbacks.getPreferredLanguage(),
+          language: MODEL_CONTROL_LANGUAGE,
           recentToolActivity: recentPlanToolActivity,
           qualityGateReason: recoveredClosureAssessment.reason,
           missingSections: planLastMissingSections,
@@ -429,7 +430,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         planClosureEvidenceRecoveryIssued = true;
         setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
         pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
-          callbacks.getPreferredLanguage(),
+          MODEL_CONTROL_LANGUAGE,
           recoveredClosureAssessment.reason,
           latestUserPromptText,
           {
@@ -441,7 +442,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       } else {
         setQualityPhase("blocked", "evidence recovery repeated without progress", "failed");
         pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
-          language: callbacks.getPreferredLanguage(),
+          language: MODEL_CONTROL_LANGUAGE,
           recentToolActivity: recentPlanToolActivity,
           qualityGateReason: recoveredClosureAssessment.reason,
           missingSections: planLastMissingSections,
@@ -451,7 +452,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     } else {
       setQualityPhase("blocked", "evidence recovery failed", "failed");
       pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
-        language: callbacks.getPreferredLanguage(),
+        language: MODEL_CONTROL_LANGUAGE,
         recentToolActivity: recentPlanToolActivity,
         qualityGateReason: planLastQualityGateReason,
         missingSections: planLastMissingSections,
@@ -513,17 +514,15 @@ export function handlePlanQualityRecoveryAfterVisibleMaterialization(
     ) {
       result.planClosureEvidenceRecoveryIssued = true;
       result.pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
-        input.callbacks.getPreferredLanguage(),
+        MODEL_CONTROL_LANGUAGE,
         result.planLastQualityGateReason,
         input.latestUserPromptText,
       );
     } else if (recoveryAction === "ask_user") {
-      result.pendingPlanRuntimeRecoveryPrompt = input.callbacks.getPreferredLanguage() === "zh"
-        ? "PLAN_NEEDS_USER_DECISION: 当前草稿包含一个真实阻塞选择。不要继续读文件或猜测默认值；请用 `<user_options>` 向用户给出 2-4 个互斥选项，然后停止等待。"
-        : "PLAN_NEEDS_USER_DECISION: The draft contains a real blocking choice. Do not read more files or guess a default; present 2-4 mutually exclusive `<user_options>` and stop for the user.";
+      result.pendingPlanRuntimeRecoveryPrompt = "PLAN_NEEDS_USER_DECISION: The draft contains a real blocking choice. Do not read more files or guess a default; present 2-4 mutually exclusive `<user_options>` and stop for the user. Keep the option labels in MAIN's configured response language.";
     } else {
       result.pendingPlanRuntimeRecoveryPrompt = buildPlanPostConvergenceToolRedirectPrompt({
-        language: input.callbacks.getPreferredLanguage(),
+        language: MODEL_CONTROL_LANGUAGE,
         toolNames: [],
         phase: "needs_rewrite",
         qualityGateReason: result.planLastQualityGateReason,

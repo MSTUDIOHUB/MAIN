@@ -15,6 +15,7 @@ import {
   type PlanRuntimeMode,
 } from "../../planRuntime";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import type { StreamResult } from "../../streaming";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
@@ -115,7 +116,7 @@ export function handlePlanReadOnlyConvergence(input: {
     };
   }
 
-  const language = callbacks.getPreferredLanguage();
+  const language = MODEL_CONTROL_LANGUAGE;
   const convergencePhase = planEvidenceReadinessForConvergence.status === "needs_targeted_read"
     ? "needs_evidence"
     : "synthesis";
@@ -311,7 +312,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
   }
   planPostConvergenceToolRedirectCount = nextRedirectCount;
 
-  const language = callbacks.getPreferredLanguage();
+  const language = MODEL_CONTROL_LANGUAGE;
   const hasMeaningfulVisibleText = visibleAssistantText.trim().length > 0;
   if (hasMeaningfulVisibleText) {
     callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
@@ -383,9 +384,7 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
       role: "user",
-      content: language === "zh"
-        ? `【强制收敛提示】定向补证已经用完，证据包已冻结。立即停止尝试工具并输出可见 <proposed_plan>，由 MAIN runtime 校验和物化；若确有一个阻塞事实，把它作为明确阻塞选择。`
-        : `[FORCED CONVERGENCE] Targeted evidence recovery is exhausted and the evidence bundle is frozen. Stop attempting tools and output visible <proposed_plan> for MAIN runtime to validate and materialize; expose only a genuine blocking choice.`,
+      content: `[FORCED CONVERGENCE] Targeted evidence recovery is exhausted and the evidence bundle is frozen. Stop attempting tools and output visible <proposed_plan> for MAIN runtime to validate and materialize; expose only a genuine blocking choice. Keep user-visible content in MAIN's configured response language.`,
     });
     logAgentEvent("plan_suppressed_tool_forced_write_injected", {
       iteration,

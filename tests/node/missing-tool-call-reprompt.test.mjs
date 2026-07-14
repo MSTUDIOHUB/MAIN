@@ -281,7 +281,7 @@ test("missing-tool no-tool recovery reprompts generic execute prose", () => {
   assert.deepEqual(harness.statuses, ["running"]);
   assert.equal(harness.streamTokens.length, 0);
   assert.equal(harness.appended.length, 1);
-  assert.match(harness.appended[0].content, /立即用工具继续执行/);
+  assert.match(harness.appended[0].content, /immediately continue using tools/i);
   assert.match(harness.appended[0].content, /<tool_use>/);
   assert.equal(harness.stops.length, 0);
 });
@@ -332,7 +332,7 @@ test("missing-tool no-tool recovery switches to post-write verification after pr
   assert.equal(kind.effectiveMissingToolKind, "post_write_verify");
   assert.equal(result.status, "continue");
   assert.equal(result.recoveringFromEmptyAssistantReplyAfterWrite, true);
-  assert.match(harness.appended[0].content, /立即执行真实验证/);
+  assert.match(harness.appended[0].content, /run the real verification now/i);
   assert.match(harness.appended[0].content, /run_command/);
 });
 

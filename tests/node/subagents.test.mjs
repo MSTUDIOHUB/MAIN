@@ -66,6 +66,16 @@ function makeConfig(profile, overrides = {}) {
   };
 }
 
+test("subagent allowed paths preserve execution casing while deduplicating identities", () => {
+  assert.deepEqual(subagents.parseSubagentAllowedPaths(
+    "src/hooks/useCsvParser.ts,./src/hooks/usecsvparser.ts,src/store/DashboardStore.ts",
+    "/workspace",
+  ), [
+    "src/hooks/useCsvParser.ts",
+    "src/store/DashboardStore.ts",
+  ]);
+});
+
 test("capacity policy permits two local children and bounded cloud parallelism", () => {
   const local = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
   assert.equal(local.profile, "local");

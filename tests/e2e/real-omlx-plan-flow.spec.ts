@@ -2,7 +2,10 @@ import { expect, test } from "@playwright/test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { validateActionablePlanArtifact } from "../../src/lib/workflowModels";
+import {
+  isFinitePlanValidationCommand,
+  validateActionablePlanArtifact,
+} from "../../src/lib/workflowModels";
 
 const runRealOmlx = process.env.MAIN_REAL_OMLX_E2E === "1";
 const omlxEndpoint = String(
@@ -158,7 +161,7 @@ test.beforeEach(async ({ page }) => {
     const command = String(rawCommand || "").trim();
     const parser = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
     const hasCreatorNameAssignment = /creatorName\s*:\s*[^,}\n]+/.test(parser);
-    const isFiniteVerification = /(?:test|typecheck|tsc|check|verify|lint|build|compile)/i.test(command);
+    const isFiniteVerification = isFinitePlanValidationCommand(command);
     const exitCode = hasCreatorNameAssignment && isFiniteVerification ? 0 : 1;
     return JSON.stringify({
       command,
@@ -882,7 +885,22 @@ for (const model of models) {
       expect.objectContaining({ kind: "cmd" }),
     ]));
     expect(executionChatText).not.toMatch(forbiddenChatNoise);
-    expect(JSON.stringify(executionSnapshot?.debugTail || [])).not.toMatch(/no_progress_cached_read_only_batch|store\.non_actionable_stop/i);
+    const terminalExecutionSummary = [...(executionSnapshot?.debugTail || [])]
+      .reverse()
+      .map((entry: { source?: string; message?: string }) => {
+        if (entry.source !== "store.agent_loop_stop_summary") return null;
+        try {
+          return JSON.parse(String(entry.message || "{}"));
+        } catch {
+          return null;
+        }
+      })
+      .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "execute");
+    expect(terminalExecutionSummary).toMatchObject({
+      status: "completed",
+      reason: "agent_loop_completed",
+      planStage: "completed",
+    });
     expect(bodyText).not.toMatch(forbiddenChatNoise);
   });
 

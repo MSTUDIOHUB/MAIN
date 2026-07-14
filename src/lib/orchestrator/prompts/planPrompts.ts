@@ -25,10 +25,13 @@ export function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
 
   if (input.language === "en") {
     return [
-      "The approved Plan is still executing, but the last read-only batch reused already-known file content and did not create action evidence.",
+      "The approved Plan is still executing, but recent steps did not satisfy the remaining trusted evidence.",
       "Continue now. Do not stop and do not re-plan.",
       `Repeated/known targets: ${repeatedTargets}`,
       recent ? `Recent tool evidence: ${recent}` : "",
+      recent && /(?:failed|failure|error)/i.test(recent)
+        ? "Inspect the latest failed tool result and switch to a compatible validation or mutation action. Do not repeat the failed command or substitute a completion summary."
+        : "",
       `Unsatisfied task: ${input.remainingText}`,
       input.allowFileRead
         ? "For the next response, MAIN keeps action tools plus targeted file reads available for exact-content or patch recovery. Use one only when needed, then patch or validate."
@@ -38,10 +41,13 @@ export function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
   }
 
   return [
-    "已批准的 Plan 仍在执行，但上一批只读工具只是复用了已知文件内容，没有产生行动证据。",
+    "已批准的 Plan 仍在执行，但最近步骤尚未满足剩余的可信证据。",
     "现在继续执行，不要停止，也不要重新规划。",
     `重复/已知目标：${repeatedTargets}`,
     recent ? `最近工具证据：${recent}` : "",
+    recent && /(?:failed|failure|error|失败|错误)/i.test(recent)
+      ? "请读取最近失败工具的结果并切换到兼容的验证或修改动作；不要重复失败命令，也不要用完成总结替代证据。"
+      : "",
     `证据未满足任务：${input.remainingText}`,
     input.allowFileRead
       ? "下一轮 MAIN 会保留行动工具和定向文件读取，用于精确内容或 patch 恢复。只在需要时读一次，随后必须写入或验证。"

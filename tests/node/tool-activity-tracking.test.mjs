@@ -526,7 +526,7 @@ test("tool result post-processing freezes a semantic evidence bundle before repe
   }]);
 });
 
-test("tool result post-processing keeps structural-only evidence open for diagnosis", () => {
+test("structural evidence can enter model-authored drafting without enabling deterministic materialization", () => {
   const harness = createPostProcessingInput({
     workflowMode: "plan",
     turnIntent: "plan",
@@ -554,12 +554,44 @@ test("tool result post-processing keeps structural-only evidence open for diagno
 
   const post = handleToolResultPostProcessing(harness.input);
 
-  assert.equal(post.planRuntimePhase, "grounding");
+  assert.equal(post.planRuntimePhase, "drafting");
   assert.deepEqual(harness.planRuntimePhases, [{
-    phase: "grounding",
-    reason: "change_targets_lack_confirmed_rationale",
+    phase: "drafting",
+    reason: "model-authored plan evidence ready",
     status: "running",
   }]);
+});
+
+test("targeted evidence recovery still waits for confirmed closure rationale", () => {
+  const harness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "needs_evidence",
+    results: [result({
+      toolCallId: "impact_recovery_structural",
+      name: "repo_map_impact",
+      target: "src-tauri/src/main.rs",
+      content: "main registers Tauri builder handlers and emits file-open events to the frontend",
+    })],
+    toolArgsByCallId: new Map([["impact_recovery_structural", { path: "src-tauri/src/main.rs" }]]),
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  harness.input.callbacks = {
+    ...harness.input.callbacks,
+    getMessages: () => [{
+      role: "user",
+      content: "Find why opening a Markdown file shows a blank window and prepare a repair plan.",
+    }],
+    getCurrentTurnId: () => "turn-plan-targeted-recovery",
+    getContextMemoryState: () => null,
+  };
+
+  const post = handleToolResultPostProcessing(harness.input);
+
+  assert.equal(post.planRuntimePhase, "needs_evidence");
+  assert.deepEqual(harness.planRuntimePhases, []);
 });
 
 test("a targeted read leaves structure exploration even before semantic evidence is ready", () => {

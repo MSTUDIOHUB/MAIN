@@ -47,3 +47,18 @@ test("does not classify a normal plan with distinct repeated headings as a loop"
   ].join("\n"));
   assert.equal(result, null);
 });
+
+test("detects a long low-entropy punctuation stream before it can run indefinitely", () => {
+  const result = detectVisibleTextRepetition(`Starting analysis.${"!".repeat(240)}`);
+  assert.equal(result?.repetitions, 3);
+  assert.equal(result?.unitCount, 1);
+  assert.ok((result?.cycleChars || 0) >= 80);
+});
+
+test("does not classify punctuation-rich but meaningful output as low entropy", () => {
+  const result = detectVisibleTextRepetition(Array.from(
+    { length: 20 },
+    (_, index) => `Step ${index + 1}: inspect file-${index}.ts, compare field_${index}, then verify result!`,
+  ).join("\n"));
+  assert.equal(result, null);
+});

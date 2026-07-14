@@ -3,6 +3,7 @@ import {
   shouldRecoverExecuteXmlTextWithoutAction,
 } from "../../orchestrator/agentRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
   buildExecuteCompletionEvidencePrompt,
   buildExecuteReplanningEvidencePrompt,
@@ -117,7 +118,7 @@ export function handleExecuteNoToolRecovery(input: {
 
     callbacks.appendMessage({
       role: "user",
-      content: buildExecuteCompletionEvidencePrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount),
+      content: buildExecuteCompletionEvidencePrompt(MODEL_CONTROL_LANGUAGE, consecutiveNoToolCount),
     });
     return finish("continue");
   }
@@ -156,7 +157,7 @@ export function handleExecuteNoToolRecovery(input: {
 
     callbacks.appendMessage({
       role: "user",
-      content: buildExecuteReplanningEvidencePrompt(callbacks.getPreferredLanguage(), consecutiveNoToolCount),
+      content: buildExecuteReplanningEvidencePrompt(MODEL_CONTROL_LANGUAGE, consecutiveNoToolCount),
     });
     return finish("continue");
   }
@@ -204,7 +205,7 @@ export function handleExecuteNoToolRecovery(input: {
     callbacks.appendMessage({
       role: "user",
       content: buildExecuteXmlTextActionRecoveryPrompt({
-        language: callbacks.getPreferredLanguage(),
+        language: MODEL_CONTROL_LANGUAGE,
         retryCount: consecutiveNoToolCount,
         availableTools: Array.from(availableToolNames),
       }),

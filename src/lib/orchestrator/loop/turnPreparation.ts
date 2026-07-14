@@ -41,6 +41,7 @@ import { generateId } from "../../utils";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import { formatWebResearchLocalDate } from "../../webResearchGuard";
 import { createProbeRunner, runModelProbe } from "../../modelProbe";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 
 export interface AgentLoopRuntimeState {
   config: ReturnType<OrchestratorCallbacks["getConfig"]>;
@@ -349,7 +350,7 @@ export function createSystemPromptApplier(input: {
     const systemPrompt = subagentScope
       ? buildSubagentSystemPrompt({
           workspace,
-          language: callbacks.getPreferredLanguage(),
+          language: MODEL_CONTROL_LANGUAGE,
           availableToolNames: availableToolNameList,
           scopeKey: subagentScope.scopeKey,
           allowedPaths: subagentScope.allowedPaths,

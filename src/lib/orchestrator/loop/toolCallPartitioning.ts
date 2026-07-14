@@ -606,8 +606,8 @@ export async function partitionToolCallsForExecution(input: {
       const unexpected = approvedPlanMutationScope.unexpectedTargets.join(", ") || target || tc.name;
       const planned = approvedPlanMutationScope.plannedTargets.join(", ") || "none";
       const message = callbacks.getPreferredLanguage() === "zh"
-        ? `APPROVED_PLAN_SCOPE_BLOCKED: ${unexpected} 不在已批准 Plan 的修改目标中。当前允许的修改目标：${planned}。请继续执行现有计划任务；如确需扩大范围，必须先停止并生成新 revision 供用户重新审批。`
-        : `APPROVED_PLAN_SCOPE_BLOCKED: ${unexpected} is outside the approved Plan mutation targets. Allowed targets: ${planned}. Continue the reviewed tasks; if scope expansion is necessary, stop and create a new revision for review.`;
+        ? `APPROVED_PLAN_SCOPE_BLOCKED: ${unexpected} 不在已批准 Plan 的修改目标中，因此本次写入未执行。当前允许的修改目标：${planned}。请先用现有测试、内联命令或只读检查完成计划内验证并继续任务；只有该目标确属必要源码改动时，才生成聚焦的新 revision 供审核。`
+        : `APPROVED_PLAN_SCOPE_BLOCKED: ${unexpected} is outside the approved Plan mutation targets, so this write was not executed. Allowed targets: ${planned}. Continue with in-scope validation using existing tests, inline commands, or read-only inspection; create a focused revision only if this target is genuinely required for the source change.`;
       callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
       logAgentEvent("approved_plan_mutation_scope_blocked", {
         iteration,

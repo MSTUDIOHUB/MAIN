@@ -55,6 +55,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   buildExecuteNoProgressLoopPauseNotice,
+  buildFailedFiniteValidationRecoveryPrompt,
   buildExecuteRecoveryPrompt,
   buildExecuteValidationRecoveryPrompt,
   describeExecuteRecoveryToolSurface,
@@ -285,7 +286,7 @@ test("execute no-tool recovery reprompts XML profiles to emit executable tool ca
   assert.equal(result.consecutiveNoToolCount, 1);
   assert.deepEqual(harness.statuses, ["running"]);
   assert.equal(harness.appended.length, 1);
-  assert.match(harness.appended[0].content, /XML 工具协议/);
+  assert.match(harness.appended[0].content, /uses XML tool calls/i);
   assert.match(harness.appended[0].content, /<tool_use>/);
   assert.match(harness.appended[0].content, /read_file, apply_patch, run_command/);
 });
@@ -670,6 +671,34 @@ test("repeat-edit validation recovery exposes only validation tools and forbids 
   assert.match(prompt, /连续修改同一目标/);
   assert.match(prompt, /必须只调用一个验证工具/);
   assert.match(prompt, /不要继续编辑文件/);
+});
+
+test("failed finite validation recovery exposes only run_command", () => {
+  assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
+    mode: "finite_validation_only",
+  }), true);
+  for (const blocked of [
+    "execute_command",
+    "read_pty_since",
+    "read_file",
+    "replace_in_file",
+    "browser_evaluate",
+  ]) {
+    assert.equal(isExecuteRecoveryToolName(blocked, readOnlyTools, {
+      mode: "finite_validation_only",
+    }), false, blocked);
+  }
+  assert.equal(
+    describeExecuteRecoveryToolSurface("finite_validation_only"),
+    "finite_validation_only",
+  );
+  const prompt = buildFailedFiniteValidationRecoveryPrompt({
+    command: "node -e require('./src/example.js')",
+    result: '{"exitCode":1,"stderr":"module not found"}',
+  });
+  assert.match(prompt, /intentionally limited to `run_command`/);
+  assert.match(prompt, /do not reread an already-modified source file/i);
+  assert.match(prompt, /exitCode 0/);
 });
 
 test("third consecutive edit to one target forces validation before another write", () => {

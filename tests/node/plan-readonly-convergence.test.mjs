@@ -408,7 +408,7 @@ test("plan convergence names an unresolved contract instead of allowing more bro
   assert.equal(result.status, "continue");
   assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.match(harness.appended.at(-1)?.content || "", /permission_contract:dialog/);
-  assert.match(harness.appended.at(-1)?.content || "", /不要仅为解决当前缺口而重读/);
+  assert.match(harness.appended.at(-1)?.content || "", /do not reread them merely to resolve this gap/i);
   assert.equal(phases.at(-1)?.phase, "needs_evidence");
 });
 
@@ -668,7 +668,7 @@ test("a first rejected draft prioritizes an unresolved contract counterpart over
   assert.equal(result.planClosureEvidenceRecoveryIssued, true);
   assert.equal(result.planAutoScaffoldPromptIssued, false);
   assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /permission_contract:dialog/);
-  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /运行时权限、capability、manifest 或配置拥有者/);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /runtime permission\/capability\/manifest\/configuration owner/i);
   assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /src-tauri\/src\/lib\.rs/);
   assert.deepEqual(phases, [{
     phase: "needs_evidence",

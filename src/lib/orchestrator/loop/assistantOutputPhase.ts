@@ -2,6 +2,7 @@ import {
   buildReadOnlyPermissionContinuationPrompt,
   serializeAssistantReplyForHistory,
 } from "../../replyOptions";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { progressNarrationToText } from "../../progressNarration";
 import {
   buildAssistantHistoryMessage,
@@ -27,6 +28,7 @@ import { resetApprovedPlanLongReasoningNoActionCount } from "./approvedPlanRecov
 import {
   isHiddenThoughtOnlyNoToolStop,
   resolveClosedPlanReadOnlyContinuation,
+  resolveNonBlockingPlanChoiceLoop,
   resolveAssistantReplyOptionRouting,
   resolveToolProtocolStreamClearDecision,
   shouldAutoContinueNonBlockingPlanChoices,
@@ -463,7 +465,7 @@ export function handleAssistantOutputPhase(input: {
     callbacks.appendMessage({
       role: "user",
       content: buildPlanTargetedEvidenceRecoveryPrompt({
-        language: callbacks.getPreferredLanguage(),
+        language: MODEL_CONTROL_LANGUAGE,
         reason: closedPlanReadOnlyContinuation.reason,
         trigger: "closed_read_request",
       }),
@@ -480,8 +482,32 @@ export function handleAssistantOutputPhase(input: {
     });
   }
   if (autoContinueNonBlockingPlanChoices && closedPlanReadOnlyContinuation.action !== "defer") {
+    const loopDecision = resolveNonBlockingPlanChoiceLoop({
+      consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,
+      maxAutoContinues: MAX_NO_ACTION_RETRIES,
+    });
+    noToolRuntimeState =
+      incrementConsecutiveNoToolRuntimeState(noToolRuntimeState);
+    if (loopDecision.action === "force_finalize") {
+      logAgentEvent("plan_non_blocking_choice_auto_continue_limit", {
+        iteration,
+        consecutiveNoToolCount: loopDecision.nextConsecutiveNoToolCount,
+        maxAutoContinues: MAX_NO_ACTION_RETRIES,
+        optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
+        workflowMode,
+        turnIntent,
+        action: "force_plan_finalization",
+      });
+      noToolRuntimeState =
+        resetConsecutiveNoToolRuntimeState(noToolRuntimeState);
+      setPlanRuntimePhaseAndSync(
+        "drafting",
+        "non-blocking choice loop forced plan finalization",
+      );
+    }
     logAgentEvent("plan_non_blocking_choice_auto_continue", {
       iteration,
+      consecutiveNoToolCount: loopDecision.nextConsecutiveNoToolCount,
       replyOptions: normalized.replyOptions.length,
       optionPreview: summarizeReplyOptionsForLog(normalized.replyOptions),
       visibleChars: normalized.visibleText.length,
@@ -504,9 +530,9 @@ export function handleAssistantOutputPhase(input: {
     callbacks.appendMessage({
       role: "user",
       content:
-        callbacks.getPreferredLanguage() === "zh"
-          ? "MAIN 已将刚才的非阻塞计划选项视为继续规划许可：不要再询问是否开始探索或是否提供路径；请立即调用一个最具体的只读工具读取/搜索缺失证据。如果证据已经足够，直接创建/更新 `.MAIN/plans/plan.md`。"
-          : "MAIN treated the previous non-blocking plan options as permission to continue planning: do not ask whether to start exploration or provide paths again; immediately call one specific read/search tool for the missing evidence. If evidence is sufficient, create/update `.MAIN/plans/plan.md`.",
+        loopDecision.action === "force_finalize"
+          ? "The runtime resolved the repeated non-blocking options automatically. Complete planning now: call exactly one targeted read-only tool only if evidence is missing; otherwise output the complete reviewable `<proposed_plan>`. Do not emit more options or ask whether to continue; MAIN runtime owns the plan artifact."
+          : "MAIN treated the previous non-blocking plan options as permission to continue planning: do not ask whether to start exploration or provide paths again; immediately call one specific read/search tool for the missing evidence. If evidence is sufficient, output the complete reviewable `<proposed_plan>`; MAIN runtime owns the plan artifact.",
     });
     return finishControl("continue");
   }
@@ -610,7 +636,7 @@ export function handleAssistantOutputPhase(input: {
         callbacks.appendMessage({
           role: "user",
           content: buildReadOnlyPermissionHardRecoveryPrompt(
-            callbacks.getPreferredLanguage(),
+            MODEL_CONTROL_LANGUAGE,
             workflowMode,
           ),
         });
@@ -638,7 +664,7 @@ export function handleAssistantOutputPhase(input: {
     callbacks.appendMessage({
       role: "user",
       content: buildReadOnlyPermissionContinuationPrompt(
-        callbacks.getPreferredLanguage(),
+        MODEL_CONTROL_LANGUAGE,
         {
           allowFileRead: input.availableToolNames.has("read_file"),
         },

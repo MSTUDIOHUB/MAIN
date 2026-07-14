@@ -35,6 +35,7 @@ import {
 } from "./mcpClient";
 import { getFileMetadata, shellPermissionPreflight, writeFileAtomic } from "./ipc";
 import { acquireModelLane } from "./modelLaneCoordinator";
+import { MODEL_CONTROL_LANGUAGE } from "./modelControlLanguage";
 import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import { parseApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
@@ -2492,7 +2493,7 @@ export function buildPlanRecoveryPrompt(callbacks: OrchestratorCallbacks, source
     .filter((item) => !/Repeated read-only tool call skipped|Duplicate skip count|already called with identical arguments/i.test(item))
     .slice(0, 6);
   return buildPlanRecoveryPromptFromContext({
-    language: callbacks.getPreferredLanguage(),
+    language: MODEL_CONTROL_LANGUAGE,
     userPrompt: getOriginalUserPromptForPlanFallback(callbacks),
     sourceText,
     toolHighlights,

@@ -71,12 +71,18 @@ const {
   shouldSuppressPlanTruncationWarning,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
 const {
+  resolveApprovedPlanRecoveryPreferredToolNames,
   resolveRecoveryToolChoice,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"));
 const {
   APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
+  PREAPPROVAL_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
   buildApprovedPlanStreamWatchdogRecoveryPrompt,
+  buildPreapprovalPlanStreamWatchdogRecoveryPrompt,
+  resolvePreapprovalPlanStreamWatchdogReadFallback,
+  resolvePreapprovalPlanStreamWatchdogRecoveryTools,
   shouldAttemptApprovedPlanStreamWatchdogRecovery,
+  shouldAttemptPreapprovalPlanStreamWatchdogRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"));
 
 test("classifies no-visible-token stream timeout as a plan watchdog timeout", () => {
@@ -106,6 +112,102 @@ test("classifies a visible-text repetition guard as a stream watchdog stop", () 
     isStreamWatchdogTimeoutMessage("STREAM_VISIBLE_TEXT_REPETITION: model repeated a visible cycle"),
     true,
   );
+});
+
+test("preapproval Plan watchdog failures get one provider-neutral bounded recovery", () => {
+  assert.equal(PREAPPROVAL_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS, 120_000);
+  assert.equal(shouldAttemptPreapprovalPlanStreamWatchdogRecovery({
+    message: "STREAM_VISIBLE_TEXT_REPETITION: model repeated a visible cycle",
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    isPlanApproved: false,
+    qualityRecoveryActive: false,
+  }), true);
+  assert.equal(shouldAttemptPreapprovalPlanStreamWatchdogRecovery({
+    message: "STREAM_VISIBLE_TEXT_REPETITION: model repeated a visible cycle",
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    isPlanApproved: false,
+    qualityRecoveryActive: true,
+  }), false);
+  assert.equal(shouldAttemptPreapprovalPlanStreamWatchdogRecovery({
+    message: "STREAM_VISIBLE_TEXT_REPETITION: model repeated a visible cycle",
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    isPlanApproved: true,
+    qualityRecoveryActive: false,
+  }), false);
+  assert.match(buildPreapprovalPlanStreamWatchdogRecoveryPrompt("en", true), /exactly one targeted read-only tool/i);
+  assert.match(buildPreapprovalPlanStreamWatchdogRecoveryPrompt("zh", false), /完整可审批/);
+});
+
+test("preapproval Plan watchdog recovery narrows to core read-only evidence tools", () => {
+  const tool = (name) => ({
+    type: "function",
+    function: {
+      name,
+      description: name,
+      parameters: { type: "object", properties: {}, required: [] },
+    },
+  });
+  const recovered = resolvePreapprovalPlanStreamWatchdogRecoveryTools([
+    tool("apply_patch"),
+    tool("read_file"),
+    tool("run_command"),
+    tool("grep_search"),
+    tool("browser_evaluate"),
+    tool("list_directory"),
+    tool("get_file_outline"),
+  ]);
+
+  assert.deepEqual(recovered.map((entry) => entry.function.name), [
+    "read_file",
+    "grep_search",
+    "list_directory",
+    "get_file_outline",
+  ]);
+});
+
+test("preapproval Plan watchdog injects one safe read for a unique explicit unread target", () => {
+  const readTool = {
+    type: "function",
+    function: {
+      name: "read_file",
+      description: "read",
+      parameters: { type: "object", properties: {}, required: ["path"] },
+    },
+  };
+  const common = {
+    messages: [{
+      role: "user",
+      content: "Please fix src/hooks/useCsvParser.ts after preparing a Plan.",
+    }],
+    tools: [readTool],
+    recentToolActivity: [],
+    buildToolCallId: () => "call_read_target",
+  };
+  const call = resolvePreapprovalPlanStreamWatchdogReadFallback(common);
+
+  assert.equal(call?.id, "call_read_target");
+  assert.equal(call?.name, "read_file");
+  assert.deepEqual(JSON.parse(call?.arguments || "{}"), {
+    path: "src/hooks/useCsvParser.ts",
+  });
+  assert.equal(resolvePreapprovalPlanStreamWatchdogReadFallback({
+    ...common,
+    recentToolActivity: [{
+      name: "read_file",
+      status: "succeeded",
+      target: "./src/hooks/useCsvParser.ts",
+    }],
+  }), null);
+  assert.equal(resolvePreapprovalPlanStreamWatchdogReadFallback({
+    ...common,
+    messages: [{
+      role: "user",
+      content: "Compare src/a.ts and src/b.ts before planning.",
+    }],
+  }), null);
 });
 
 test("classifies recovery stream max elapsed timeout as watchdog pause", () => {
@@ -175,6 +277,51 @@ test("local execute recovery binds the request to the current transaction tool",
     forceXmlTools: false,
     preferExplicitFunction: true,
   }), { type: "function", function: { name: "read_file" } });
+});
+
+test("approved plan recovery binds native tool choice to the remaining evidence kind", () => {
+  const validationTasks = [{
+    id: "validate",
+    text: "Run a focused validation",
+    status: "pending",
+    evidence: [{ kind: "cmd", value: "focused validation command" }],
+    evidenceStatus: "missing",
+  }];
+  const validationPreferred = resolveApprovedPlanRecoveryPreferredToolNames({
+    tasks: validationTasks,
+    evidenceLedger: [],
+  });
+  assert.deepEqual(validationPreferred.slice(0, 2), ["run_command", "execute_command"]);
+  assert.deepEqual(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    approvedPlanActionOnlyRecoveryActive: true,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["apply_patch", "run_command", "browser_evaluate"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+    approvedPlanRecoveryPreferredToolNames: validationPreferred,
+  }), { type: "function", function: { name: "run_command" } });
+
+  const browserPreferred = resolveApprovedPlanRecoveryPreferredToolNames({
+    tasks: [{
+      ...validationTasks[0],
+      id: "browser",
+      text: "Check rendered DOM",
+      evidence: [{ kind: "browser_dom", value: "main dashboard" }],
+    }],
+    evidenceLedger: [],
+  });
+  assert.deepEqual(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: false,
+    executeRecoveryMode: "normal",
+    approvedPlanActionOnlyRecoveryActive: true,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["apply_patch", "run_command", "browser_evaluate"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+    approvedPlanRecoveryPreferredToolNames: browserPreferred,
+  }), { type: "function", function: { name: "browser_evaluate" } });
 });
 
 test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {

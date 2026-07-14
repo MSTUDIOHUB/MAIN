@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import { parseTextForTools } from "../../src/lib/textToolParser.ts";
 import { sanitizeAIOutput } from "../../src/lib/sanitize.ts";
+import { TOOL_DEFINITIONS } from "../../src/lib/toolSchemas.ts";
 
 test("parses legacy execute_command wrapper into a real read-only tool call", () => {
   const parsed = parseTextForTools([
@@ -100,6 +101,67 @@ test("parses AST and Git tools emitted by local models", () => {
     path: "src/lib/orchestrator.ts",
     context_lines: "4",
   });
+});
+
+test("parses every registered built-in tool from XML without registry drift", () => {
+  for (const tool of TOOL_DEFINITIONS) {
+    const name = tool.function.name;
+    const parsed = parseTextForTools(`<tool_use><tool>${name}</tool></tool_use>`);
+    assert.equal(parsed.toolCalls.length, 1, `expected ${name} to be parsed`);
+    assert.equal(parsed.toolCalls[0].name, name);
+  }
+});
+
+test("parses parallel subagent spawn calls and a join from local-model XML", () => {
+  const parsed = parseTextForTools([
+    "<tool_use>",
+    "<tool>spawn_subagent</tool>",
+    '<parameter name="objective">Inspect frontend initialization</parameter>',
+    '<parameter name="scope_key">frontend</parameter>',
+    '<parameter name="scope">Frontend only</parameter>',
+    '<parameter name="allowed_paths">src/main.js,src/components</parameter>',
+    '<parameter name="expected_output">Evidence-backed findings</parameter>',
+    "</tool_use>",
+    "<tool_use>",
+    "<tool>spawn_subagent</tool>",
+    '<parameter name="objective">Inspect Tauri configuration</parameter>',
+    '<parameter name="scope_key">tauri</parameter>',
+    '<parameter name="scope">Tauri only</parameter>',
+    '<parameter name="allowed_paths">src-tauri/tauri.conf.json,src-tauri/src/main.rs</parameter>',
+    '<parameter name="expected_output">Evidence-backed findings</parameter>',
+    "</tool_use>",
+    "<tool_use>",
+    "<tool>wait_subagents</tool>",
+    "</tool_use>",
+  ].join("\n"));
+
+  assert.deepEqual(parsed.toolCalls.map((call) => call.name), [
+    "spawn_subagent",
+    "spawn_subagent",
+    "wait_subagents",
+  ]);
+  assert.equal(parsed.toolCalls[0].arguments.scope_key, "frontend");
+  assert.equal(parsed.toolCalls[1].arguments.scope_key, "tauri");
+});
+
+test("parses Gemma OMLX text tool tokens as executable calls", () => {
+  const parsed = parseTextForTools([
+    "<|tool_call>call:get_file_outline{path: 'src/hooks/useCsvParser.ts'}",
+    '<|tool_call>call:code_ast_query{path: "src/hooks/useChartData.ts", query: "creatorName"}',
+  ].join("\n"));
+
+  assert.deepEqual(parsed.toolCalls.map((call) => call.name), [
+    "get_file_outline",
+    "code_ast_query",
+  ]);
+  assert.deepEqual(parsed.toolCalls[0].arguments, {
+    path: "src/hooks/useCsvParser.ts",
+  });
+  assert.deepEqual(parsed.toolCalls[1].arguments, {
+    path: "src/hooks/useChartData.ts",
+    query: "creatorName",
+  });
+  assert.equal(parsed.cleanText, "");
 });
 
 test("parses local-model knowledge search calls", () => {

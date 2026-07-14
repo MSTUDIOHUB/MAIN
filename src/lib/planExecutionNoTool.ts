@@ -32,10 +32,12 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
   missingTasksArtifact: boolean;
   remainingText: string;
   commandHint?: string;
+  recentActivitySummary?: string;
   rejectedCompletionClaim?: boolean;
 }): string {
   const remainingText = String(input.remainingText || "").trim();
   const commandHint = String(input.commandHint || "").trim();
+  const recentActivitySummary = String(input.recentActivitySummary || "").trim();
   if (input.language === "zh") {
     return [
       input.missingTasksArtifact
@@ -49,6 +51,10 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
         : "允许的下一步只有：`read_file` 一次性读取缺失的精确源码窗口、`apply_patch`/`replace_in_file`/`write_file` 写入源码、`run_command`/`execute_command` 做真实命令验证、或 `browser_evaluate` 做 UI/DOM/截图验证。不要再读取 `.MAIN/plans/plan.md`，不要用 `cat`/`head`/`grep`/`rg` 通过 shell 翻源码。若读取了源码，下一轮必须写入或验证；完成任务前必须先产生真实工具证据。",
       "当前缺失证据：",
       remainingText,
+      recentActivitySummary ? `最近工具结果：${recentActivitySummary}` : "",
+      recentActivitySummary && /(?:failed|failure|error|失败|错误)/i.test(recentActivitySummary)
+        ? "上一次工具失败不能作为完成证据。读取其 exitCode/stdout/stderr，改用与真实文件扩展名、项目运行时和当前任务相兼容的验证方式；不要重复失败命令，也不要只输出完成说明。"
+        : "",
       commandHint,
     ].filter(Boolean).join("\n");
   }
@@ -65,6 +71,10 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
       : "The only allowed next steps are: one targeted `read_file` for the exact missing source window, `apply_patch`/`replace_in_file`/`write_file` for source edits, `run_command`/`execute_command` for real command validation, or `browser_evaluate` for UI/DOM/screenshot validation. Do not reread `.MAIN/plans/plan.md`, and do not use shell `cat`/`head`/`grep`/`rg` to page source. If you read source, the following turn must write or validate; completion requires real tool evidence.",
     "Missing evidence:",
     remainingText,
+    recentActivitySummary ? `Recent tool result: ${recentActivitySummary}` : "",
+    recentActivitySummary && /(?:failed|failure|error|失败|错误)/i.test(recentActivitySummary)
+      ? "A failed tool result is not completion evidence. Inspect its exitCode/stdout/stderr and use a different validation method compatible with the real file extension, project runtime, and current task. Do not repeat the failed command or only state completion."
+      : "",
     commandHint,
   ].filter(Boolean).join("\n");
 }

@@ -1,5 +1,6 @@
 import { buildEmptyModelResponsePauseNotice } from "../../agentLoopSafety";
 import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { buildMissingToolCallContinuationPrompt } from "../../missingToolCallReprompt";
 import { isAssistantTurnEmpty } from "../../normalizedTurn";
 import {
@@ -138,7 +139,7 @@ export async function handleEmptyResponseRecovery(input: {
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
       role: "user",
-      content: buildMalformedToolUseRecoveryPrompt(callbacks.getPreferredLanguage()),
+      content: buildMalformedToolUseRecoveryPrompt(MODEL_CONTROL_LANGUAGE),
     });
     return finish("continue");
   }
@@ -166,9 +167,7 @@ export async function handleEmptyResponseRecovery(input: {
     });
     callbacks.appendMessage({
       role: "user",
-      content: callbacks.getPreferredLanguage() === "zh"
-        ? "上一条子任务响应为空。运行时已切换为 XML 工具协议；现在直接调用一个允许的读取/搜索工具，不要输出批准选项或空白回复。"
-        : "The previous subagent response was empty. The runtime switched to the XML tool protocol; call one allowed read/search tool now without approval choices or another empty reply.",
+      content: "The previous subagent response was empty. The runtime switched to the XML tool protocol; call one allowed read/search tool now without approval choices or another empty reply.",
     });
     return finish("continue");
   }
@@ -221,6 +220,9 @@ export async function handleEmptyResponseRecovery(input: {
           consecutiveEmptyResponseCount,
         });
       }
+    }
+
+    if (consecutiveEmptyResponseCount >= 3) {
       emitDebug("loop_stop", {
         reason: "plan_empty_response_checkpoint",
         iteration,
@@ -241,9 +243,9 @@ export async function handleEmptyResponseRecovery(input: {
 
     callbacks.appendMessage({
       role: "user",
-      content: callbacks.getPreferredLanguage() === "zh"
-        ? "上一条 Plan 回复为空或只有协议内容。请在相同上下文和证据包上重试一次，直接输出可审批 `<proposed_plan>`；计划文件由 MAIN runtime 物化。如果只有真实阻塞选择才使用 `<user_options>`。不要返回隐藏 thinking/analysis 或伪工具占位。"
-        : "The previous Plan reply was empty or protocol-only. Retry once with the same context and evidence bundle, and output a reviewable `<proposed_plan>`; MAIN runtime owns materialization. Use `<user_options>` only for a real blocking choice. Do not return hidden reasoning or pseudo-tool placeholders.",
+      content: consecutiveEmptyResponseCount === 1
+        ? "The previous Plan reply was empty or protocol-only. Retry once with the same context and evidence bundle, and output a reviewable `<proposed_plan>`; MAIN runtime owns materialization. Use `<user_options>` only for a real blocking choice. Do not return hidden reasoning or pseudo-tool placeholders."
+        : "Two consecutive Plan replies produced no usable content, but the task must continue. Reuse the current context: if evidence is missing, call exactly one targeted read-only tool now; otherwise output the complete `<proposed_plan>`. Do not ask whether to continue, emit `<user_options>`, or return another blank/protocol placeholder.",
     });
     return finish("continue");
   }
@@ -292,12 +294,12 @@ export async function handleEmptyResponseRecovery(input: {
       shouldForcePostWriteVerification
         ? buildMissingToolCallContinuationPrompt(
             "post_write_verify",
-            callbacks.getPreferredLanguage(),
+            MODEL_CONTROL_LANGUAGE,
             consecutiveEmptyResponseCount,
           )
         : workflowMode === "chat"
-        ? "上一条回复是空的。请直接输出对用户可见的 Markdown 正文来回答用户；如果确实需要工具，请使用正式工具调用。不要只返回空消息，也不要只输出不可见的 thinking/analysis 标签。现在继续。"
-        : "上一条回复是空的。请继续执行，并确保这次返回可见正文或正式工具调用；不要只返回空消息，也不要只输出不可见的 thinking/analysis 标签。现在继续。",
+        ? "The previous reply was empty. Answer the user with visible Markdown, or use a formal tool call when a tool is genuinely needed. Do not return another empty message or hidden reasoning only. Continue now and keep the final user-visible response in MAIN's configured response language."
+        : "The previous reply was empty. Continue execution and return either a visible response or a formal tool call; do not return another empty message or hidden reasoning only. Keep user-visible text in MAIN's configured response language.",
   });
   if (shouldForcePostWriteVerification) {
     recoveringFromEmptyAssistantReplyAfterWrite = true;

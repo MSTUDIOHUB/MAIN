@@ -9,6 +9,7 @@ import {
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
 } from "../../orchestrator";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import type { LegacyWorkflowMode, ResolvedUserIntent } from "../../runIntent";
 import type { OrchestratorCallbacks } from "../types";
 import {
@@ -120,7 +121,7 @@ export function handleAssistantNoToolRecovery(input: {
     input.callbacks.appendMessage({
       role: "user",
       content: buildToolUnavailableRecoveryPrompt(
-        input.callbacks.getPreferredLanguage(),
+        MODEL_CONTROL_LANGUAGE,
         input.workflowMode,
       ),
     });
@@ -147,7 +148,7 @@ export function handleAssistantNoToolRecovery(input: {
     input.callbacks.appendMessage({
       role: "user",
       content: buildPseudoToolCallRecoveryPrompt(
-        input.callbacks.getPreferredLanguage(),
+        MODEL_CONTROL_LANGUAGE,
         input.workflowMode,
       ),
     });

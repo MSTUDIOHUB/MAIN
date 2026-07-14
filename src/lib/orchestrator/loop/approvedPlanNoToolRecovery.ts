@@ -9,8 +9,8 @@ import {
 import {
   describeApprovedPlanRecoveryToolSurface,
 } from "../../approvedPlanRecoveryTools";
+import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
-  buildApprovedPlanNoToolPauseMessage,
   buildApprovedPlanValidationPendingMessage,
   buildBrowserValidationContinuationPrompt,
   buildPlanCommandExecutionHint,
@@ -162,6 +162,10 @@ export function handleApprovedPlanNoToolRecovery(input: {
     wasTruncated &&
     normalized.toolCalls.length === 0 &&
     finalReplyOptionsCount === 0;
+  const recentActivitySummary = recentPlanToolActivity
+    .slice(-4)
+    .map((item) => [item.status, item.name, item.target, item.detail].filter(Boolean).join(" "))
+    .join(language === "zh" ? "；" : "; ");
 
   if (validationBoundary === "pause_external_validation" && approvedPlanAuditForNoTool) {
     logAgentEvent("plan_execution_validation_boundary", {
@@ -299,50 +303,46 @@ export function handleApprovedPlanNoToolRecovery(input: {
   });
 
   if (consecutiveNoToolCount >= resolveApprovedPlanNoToolCheckpointLimit(activeProfile)) {
-    logAgentEvent("loop_stop", {
-      reason: "plan_execution_no_tool_checkpoint",
+    logAgentEvent("plan_execution_no_tool_checkpoint_recovery", {
       iteration,
       consecutiveNoToolCount,
       completionClaimRejected: rejectedCompletionClaim,
       auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
       auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
+      approvedPlanNoProgressRecoveryAttempts,
     });
-    emitPlanExecutionProgress("paused", {
-      nextStep: language === "zh"
-        ? "恢复后先核查当前 workspace 状态，再基于 runtime 任务清单继续；只有已知存在时才读取 tasks.md"
-        : "on resume, inspect current workspace state and continue from the runtime task list; read tasks.md only if it is already known to exist",
-    });
-    callbacks.onNonActionableStop(
-      buildApprovedPlanNoToolPauseMessage(
-        language,
-        remainingText,
-        consecutiveNoToolCount,
-        approvedPlanAuditForNoTool || undefined,
-        rejectedCompletionClaim,
-        Array.from(availableToolNames),
-      ),
-      "no_action",
-      {
-        phase: "paused",
-        recoveryReason: "plan_execution_no_tool_checkpoint",
-        nextStep: language === "zh"
-          ? "复用已读计划和任务上下文，转向写入、命令验证、浏览器验证或明确阻塞"
-          : "reuse the approved plan/task context and pivot to write, command validation, browser validation, or a concrete blocker",
+    const result = continueApprovedPlanWithStrategySwitch({
+      callbacks,
+      iteration,
+      recentPlanToolActivity,
+      approvedPlanNoProgressRecoveryAttempts,
+      emitTaskOrchestratorPhase,
+      emitPlanExecutionProgress,
+      reason: "plan_execution_no_tool_checkpoint_recovery",
+      remainingText,
+      logContext: {
+        completionClaimRejected: rejectedCompletionClaim,
+        auditCompleted: approvedPlanAuditForNoTool?.completedCount ?? 0,
+        auditTotal: approvedPlanAuditForNoTool?.totalCount ?? 0,
+        recentActivitySummary,
       },
-    );
-    callbacks.onStatusChange("idle");
-    return finish("stopped");
+    });
+    consecutiveNoToolCount = 0;
+    approvedPlanNoProgressRecoveryAttempts = result.approvedPlanNoProgressRecoveryAttempts;
+    approvedPlanActionOnlyRecoveryActive = result.approvedPlanActionOnlyRecoveryActive;
+    return finish("continue");
   }
 
   callbacks.appendMessage({
     role: "user",
     content: validationBoundary === "browser_prompt"
-      ? buildBrowserValidationContinuationPrompt({ language, remainingText })
+      ? buildBrowserValidationContinuationPrompt({ language: MODEL_CONTROL_LANGUAGE, remainingText })
       : buildPlanExecutionNoToolRecoveryPrompt({
-          language,
+          language: MODEL_CONTROL_LANGUAGE,
           missingTasksArtifact: approvedPlanMissingTasks,
           remainingText,
-          commandHint: buildPlanCommandExecutionHint(approvedPlanTasks, language),
+          commandHint: buildPlanCommandExecutionHint(approvedPlanTasks, MODEL_CONTROL_LANGUAGE),
+          recentActivitySummary,
           rejectedCompletionClaim,
         }),
   });

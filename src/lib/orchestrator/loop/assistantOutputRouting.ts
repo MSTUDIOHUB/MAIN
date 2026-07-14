@@ -58,6 +58,21 @@ export function shouldAutoContinueNonBlockingPlanChoices(input: {
     !input.hasSubstantivePlanAssistantText;
 }
 
+export function resolveNonBlockingPlanChoiceLoop(input: {
+  consecutiveNoToolCount: number;
+  maxAutoContinues: number;
+}): {
+  action: "continue" | "force_finalize";
+  nextConsecutiveNoToolCount: number;
+} {
+  const nextConsecutiveNoToolCount = Math.max(0, input.consecutiveNoToolCount) + 1;
+  const maxAutoContinues = Math.max(1, input.maxAutoContinues);
+  return {
+    action: nextConsecutiveNoToolCount >= maxAutoContinues ? "force_finalize" : "continue",
+    nextConsecutiveNoToolCount,
+  };
+}
+
 /**
  * A plan can enter its text-only drafting phase with a sufficient evidence
  * bundle, then discover that the model still needs one concrete fact.  Do not

@@ -793,6 +793,8 @@ test("visible plan materialization rejection enters typed recovery instead of fa
   assert.equal(harness.statuses.includes("pending_review"), false);
   assert.equal(harness.stops.length, 0);
   assert.ok(harness.phases.some((entry) => entry.phase === "needs_evidence"));
+  assert.equal(harness.appended.at(-2)?.role, "assistant");
+  assert.equal(harness.appended.at(-2)?.content, visiblePlan);
   assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
 
   const needsEvidencePhase = harness.phases.findLast((entry) => entry.phase === "needs_evidence");
@@ -827,6 +829,61 @@ test("visible plan materialization rejection enters typed recovery instead of fa
     commandDirectiveAction: null,
   });
   assert.equal(nextCandidate.shouldMaterializeStructuredProposal, true);
+});
+
+test("failed deterministic fallback sends the prepared model scaffold before exhausting Plan recovery", async () => {
+  const sourceVisibleText = "我会继续分析白屏问题并稍后给出方案。";
+  const activity = [{
+    name: "read_file",
+    target: "src/main.js",
+    status: "succeeded",
+    detail: "function initEditor reads the editor element and registers its input listener",
+  }];
+  const harness = createPlanNoToolHarness("zh");
+  const recovered = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    iteration: 8,
+    latestUserPromptText: "启动软件测试白屏，无任何 UI 显示，找到原因并修复。",
+    sourceVisibleText,
+    streamText: sourceVisibleText,
+    normalizedVisibleText: sourceVisibleText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "unsupported_hypothesis_as_plan",
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryPasses: 3,
+    recentPlanToolActivity: activity,
+  }));
+
+  assert.equal(recovered.status, "continue");
+  assert.equal(recovered.planQualityRejectCount, 2);
+  assert.equal(recovered.planAutoScaffoldPromptIssued, true);
+  assert.equal(harness.stops.length, 0);
+  assert.equal(harness.appended.at(-2)?.role, "assistant");
+  assert.equal(harness.appended.at(-2)?.content, sourceVisibleText);
+  assert.equal(harness.appended.at(-1)?.role, "user");
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_AUTO_SCAFFOLD/);
+
+  const exhaustedHarness = createPlanNoToolHarness("zh");
+  const exhausted = await handlePlanNoToolRecovery(createPlanNoToolInput(exhaustedHarness, {
+    iteration: 9,
+    latestUserPromptText: "启动软件测试白屏，无任何 UI 显示，找到原因并修复。",
+    sourceVisibleText,
+    streamText: sourceVisibleText,
+    normalizedVisibleText: sourceVisibleText,
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    planQualityRejectCount: recovered.planQualityRejectCount,
+    planLastQualityGateReason: recovered.planLastQualityGateReason,
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryPasses: recovered.planEvidenceRecoveryPasses,
+    planAutoScaffoldPromptIssued: recovered.planAutoScaffoldPromptIssued,
+    recentPlanToolActivity: activity,
+  }));
+
+  assert.equal(exhausted.status, "stopped");
+  assert.equal(exhaustedHarness.stops.length, 1);
+  assert.equal(exhaustedHarness.appended.length, 0);
 });
 
 test("pending closure-evidence recovery wins over deterministic materialization", async () => {
@@ -942,9 +999,9 @@ test("plan no-tool recovery prompts continuation when planning ends with no visi
   assert.equal(result.status, "continue");
   assert.equal(result.consecutiveNoToolCount, 1);
   assert.equal(harness.appended.length, 1);
-  assert.match(harness.appended[0].content, /当前规划还没有进入可执行阶段/);
+  assert.match(harness.appended[0].content, /current plan has not reached an executable stage/i);
   assert.match(harness.appended[0].content, /<proposed_plan>/);
-  assert.match(harness.appended[0].content, /runtime.*物化/);
+  assert.match(harness.appended[0].content, /runtime.*materializes?/i);
   assert.equal(harness.statuses.length, 0);
 });
 
@@ -1465,7 +1522,7 @@ test("approved plan no-tool helper appends recovery prompt and opens action reco
   assert.equal(resolveApprovedPlanNoToolCheckpointLimit("local"), 5);
 });
 
-test("approved plan no-tool helper pauses at the local checkpoint boundary", () => {
+test("approved plan no-tool helper switches strategy at the local checkpoint boundary", () => {
   const { harness, input } = createApprovedPlanNoToolInput({
     input: {
       activeProfile: "local",
@@ -1482,16 +1539,16 @@ test("approved plan no-tool helper pauses at the local checkpoint boundary", () 
   });
   const result = handleApprovedPlanNoToolRecovery(input);
 
-  assert.equal(result.status, "stopped");
-  assert.equal(result.consecutiveNoToolCount, 5);
+  assert.equal(result.status, "continue");
+  assert.equal(result.consecutiveNoToolCount, 0);
   assert.equal(result.approvedPlanActionOnlyRecoveryActive, true);
   assert.equal(result.approvedPlanNoToolRecoveryFileReadActive, true);
-  assert.deepEqual(harness.statuses, ["running", "idle"]);
-  assert.equal(harness.appended.length, 0);
-  assert.equal(harness.stops.length, 1);
-  assert.equal(harness.stops[0].reason, "no_action");
-  assert.match(harness.stops[0].message, /Completion claim not accepted|执行已暂停|execution protocol|执行协议/);
-  assert.deepEqual(harness.progress.map((entry) => entry.phase), ["paused"]);
+  assert.equal(result.approvedPlanNoProgressRecoveryAttempts, 1);
+  assert.deepEqual(harness.statuses, ["running", "running"]);
+  assert.equal(harness.appended.length, 1);
+  assert.match(harness.appended[0].content, /继续执行|Continue now/);
+  assert.equal(harness.stops.length, 0);
+  assert.deepEqual(harness.progress.map((entry) => entry.phase), ["running"]);
 });
 
 test("approved execution repeated cached reads replay prior content after the first stub", () => {
@@ -1875,7 +1932,7 @@ test("approved plan repeat-read limit preserves the run and requests an action-o
   });
 
   assert.equal(result.status, "pending_prompt");
-  assert.match(result.prompt, /mutation_first|修改|验证/);
+  assert.match(result.prompt, /mutation_(?:first|only)|validation/i);
   assert.deepEqual(recoveries.map((entry) => entry.mode), ["mutation_first"]);
   assert.equal(recoveries[0].reason, "approved_plan_read_file_repeat_limit");
   assert.equal(phases[0].phase, "EXECUTE_RECOVERY");

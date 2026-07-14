@@ -12,6 +12,11 @@ import {
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { OpenAiToolChoice, StreamResult } from "../../streaming";
 import type { ToolDefinition } from "../../toolSchemas";
+import {
+  buildPlanTaskEvidenceAudit,
+  type PlanExecutionEvidenceEntry,
+  type PlanTask,
+} from "../../workflowModels";
 import { PolicyFactory } from "../policies/PolicyFactory";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { AgentMessage, FetchLLMStreamOptions, OrchestratorCallbacks } from "../types";
@@ -29,6 +34,42 @@ export type PlanStreamWatchdogOptionsResolver = (
 
 export const APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS = 45_000;
 
+export function resolveApprovedPlanRecoveryPreferredToolNames(input: {
+  tasks: PlanTask[];
+  evidenceLedger: PlanExecutionEvidenceEntry[];
+}): string[] {
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    preserveMissing: true,
+    highlightNext: true,
+  });
+  const evidenceKinds = new Set(
+    audit.remainingTasks.flatMap((task) => (task.evidence || []).map((item) => item.kind)),
+  );
+  const namedTools = audit.remainingTasks
+    .flatMap((task) => task.evidence || [])
+    .filter((item) => item.kind === "tool")
+    .map((item) => item.value)
+    .filter(Boolean);
+
+  const preferred: string[] = [...namedTools];
+  if (evidenceKinds.has("browser_dom") || evidenceKinds.has("browser_screenshot")) {
+    preferred.push("browser_evaluate");
+  }
+  if (evidenceKinds.has("cmd")) {
+    preferred.push("run_command", "execute_command");
+  }
+  if (evidenceKinds.has("dev_server_url")) {
+    preferred.push("execute_command", "browser_evaluate");
+  }
+  if (evidenceKinds.has("file") || evidenceKinds.has("deliverable") || evidenceKinds.has("text")) {
+    preferred.push("apply_patch", "replace_in_file", "write_file");
+  }
+
+  return [...new Set(preferred)];
+}
+
 export function resolveRecoveryToolChoice(input: {
   isExecuteRecoveryEligible: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
@@ -38,6 +79,7 @@ export function resolveRecoveryToolChoice(input: {
   forceXmlTools: boolean;
   preferExplicitFunction?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
+  approvedPlanRecoveryPreferredToolNames?: string[];
 }): OpenAiToolChoice | undefined {
   const availableToolNames = new Set(input.llmToolNames);
   if (availableToolNames.size <= 0 || input.forceXmlTools) return undefined;
@@ -63,6 +105,8 @@ export function resolveRecoveryToolChoice(input: {
         input.executeRecoveryMode === "action_only"
       ) {
         selectedTool = firstAvailable(["apply_patch", "replace_in_file", "write_file"]);
+      } else if (input.executeRecoveryMode === "finite_validation_only") {
+        selectedTool = firstAvailable(["run_command"]);
       } else if (input.executeRecoveryMode === "validation_only") {
         selectedTool = firstAvailable([
           "run_command",
@@ -74,7 +118,11 @@ export function resolveRecoveryToolChoice(input: {
       }
     }
     if (!selectedTool && input.approvedPlanActionOnlyRecoveryActive) {
-      selectedTool = firstAvailable(["apply_patch", "replace_in_file", "write_file"]);
+      selectedTool = firstAvailable(
+        input.approvedPlanRecoveryPreferredToolNames?.length
+          ? input.approvedPlanRecoveryPreferredToolNames
+          : ["apply_patch", "replace_in_file", "write_file", "run_command", "execute_command", "browser_evaluate"],
+      );
     }
     if (!selectedTool && input.approvedPlanNoToolRecoveryFileReadActive) {
       selectedTool = firstAvailable(["read_file"]);
@@ -260,6 +308,12 @@ export async function invokeInitialStreamForIteration(input: {
       baseResolvedStreamWatchdogOptions,
       llmTools.length,
     );
+  const approvedPlanRecoveryPreferredToolNames = approvedPlanActionOnlyRecoveryActive
+    ? resolveApprovedPlanRecoveryPreferredToolNames({
+        tasks: callbacks.getPlanTasks(),
+        evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+      })
+    : [];
   const recoveryToolChoice = resolveRecoveryToolChoice({
     isExecuteRecoveryEligible,
     executeRecoveryMode,
@@ -270,6 +324,7 @@ export async function invokeInitialStreamForIteration(input: {
     preferExplicitFunction: config.activeProfile === "local",
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
+    approvedPlanRecoveryPreferredToolNames,
   });
   const policyCurrentMaxTokens =
     capPreapprovalPlanQualityRecoveryMaxTokens(
@@ -314,6 +369,7 @@ export async function invokeInitialStreamForIteration(input: {
     allTools: summarizeToolsForDiagnostics(iterationAllTools),
     llmTools: summarizeToolsForDiagnostics(llmTools),
     toolChoice: recoveryToolChoice ?? null,
+    approvedPlanRecoveryPreferredToolNames,
     watchdog: {
       hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
       label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,

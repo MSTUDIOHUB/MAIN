@@ -81,6 +81,26 @@ export interface AgentLoopControlRuntime {
   }) => void;
 }
 
+export const PLAN_DRAFT_QUALITY_RECOVERY_RESERVE = 4;
+
+export function resolvePlanDraftQualityRecoveryReserve(input: {
+  workflowMode: "chat" | "edit" | "plan";
+  isPlanApproved: boolean;
+  planRuntimePhase: PlanRuntimePhase;
+  planQualityRejectCount: number;
+  planArtifactQualityRejected: boolean;
+}): number {
+  if (input.workflowMode !== "plan" || input.isPlanApproved) return 0;
+  const qualityRecoveryActive =
+    input.planQualityRejectCount > 0 || input.planArtifactQualityRejected;
+  if (!qualityRecoveryActive) return 0;
+  return ["needs_evidence", "needs_rewrite", "drafting", "blocked"].includes(
+    input.planRuntimePhase,
+  )
+    ? PLAN_DRAFT_QUALITY_RECOVERY_RESERVE
+    : 0;
+}
+
 export function createAgentLoopControlRuntime(input: {
   callbacks: OrchestratorCallbacks;
   runtimeState: AgentLoopRuntimeState;
@@ -92,6 +112,11 @@ export function createAgentLoopControlRuntime(input: {
   setStreamRuntimeState: (state: AgentLoopStreamRuntimeState) => void;
   getApprovedPlanRecoveryState: () => ApprovedPlanRecoveryRuntimeState;
   setApprovedPlanRecoveryState: (state: ApprovedPlanRecoveryRuntimeState) => void;
+  getPlanRuntimeState: () => {
+    planRuntimePhase: PlanRuntimePhase;
+    planQualityRejectCount: number;
+    planArtifactQualityRejected: boolean;
+  };
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   setPlanRuntimePhase: SetPlanRuntimePhase;
 }): AgentLoopControlRuntime {
@@ -106,6 +131,7 @@ export function createAgentLoopControlRuntime(input: {
     setStreamRuntimeState,
     getApprovedPlanRecoveryState,
     setApprovedPlanRecoveryState,
+    getPlanRuntimeState,
     emitTaskOrchestratorPhase,
     setPlanRuntimePhase,
   } = input;
@@ -122,6 +148,7 @@ export function createAgentLoopControlRuntime(input: {
   let planExecutionStartIteration: number | null =
     workflowMode === "plan" && callbacks.getIsPlanApproved() ? 0 : null;
   let didLogPlanExecutionBudget = planExecutionStartIteration === 0;
+  let didLogPlanDraftQualityRecoveryReserve = false;
   const resolveIterationBudget = () => {
     const budget = resolveAgentLoopIterationBudget({
       workflowMode,
@@ -142,6 +169,34 @@ export function createAgentLoopControlRuntime(input: {
         executionIterationBudget: budget.phaseMaxIterations,
         absoluteMaxIterations: budget.absoluteMaxIterations,
       });
+    }
+    if (budget.phase === "plan_draft") {
+      const planRuntimeState = getPlanRuntimeState();
+      const reserve = resolvePlanDraftQualityRecoveryReserve({
+        workflowMode,
+        isPlanApproved: callbacks.getIsPlanApproved(),
+        planRuntimePhase: planRuntimeState.planRuntimePhase,
+        planQualityRejectCount: planRuntimeState.planQualityRejectCount,
+        planArtifactQualityRejected: planRuntimeState.planArtifactQualityRejected,
+      });
+      if (reserve > 0) {
+        if (!didLogPlanDraftQualityRecoveryReserve) {
+          didLogPlanDraftQualityRecoveryReserve = true;
+          logAgentEvent("plan_draft_quality_recovery_reserve_activated", {
+            iteration: getIteration(),
+            baseMaxIterations: budget.absoluteMaxIterations,
+            reserveIterations: reserve,
+            planRuntimePhase: planRuntimeState.planRuntimePhase,
+            qualityRejectCount: planRuntimeState.planQualityRejectCount,
+            artifactQualityRejected: planRuntimeState.planArtifactQualityRejected,
+          });
+        }
+        return {
+          ...budget,
+          phaseMaxIterations: budget.phaseMaxIterations + reserve,
+          absoluteMaxIterations: budget.absoluteMaxIterations + reserve,
+        };
+      }
     }
     return budget;
   };

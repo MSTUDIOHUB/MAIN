@@ -8,7 +8,10 @@ import type { ResolvedUserIntent } from "../../runIntent";
 import { generateId } from "../../utils";
 import type { NormalizedStreamState, ReplyOption } from "../../workflowModels";
 import type { AgentMessage, OrchestratorCallbacks, ToolCallToExecute } from "../types";
-import { resolveAssistantActionRouting } from "./assistantActionRouting";
+import {
+  resolveApprovedPlanFiniteCommandInjection,
+  resolveAssistantActionRouting,
+} from "./assistantActionRouting";
 import { handleAssistantNoToolRecovery } from "./assistantRecoveryHandling";
 import { resolveAssistantTurnDisplayDecision } from "./assistantTurnDisplay";
 import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntimeState";
@@ -154,8 +157,34 @@ export function handleAssistantDisplayActionPhase(input: {
     pseudoRecovery,
     pseudoToolCallPlaceholder,
     syntheticVisibleConclusion,
-    userVisibleText,
+    userVisibleText: routedUserVisibleText,
   } = assistantActionRouting;
+
+  const approvedPlanFiniteCommandInjection = resolveApprovedPlanFiniteCommandInjection({
+    isApprovedPlanExecutionTurn,
+    toolCallCount: effectiveToolCalls.length,
+    replyOptionCount: finalReplyOptions.length,
+    availableToolNames: input.availableToolNames,
+    tasks: callbacks.getPlanTasks(),
+    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+    recentToolActivity: input.recentToolActivity,
+    buildToolCallId: () => `call_${generateId()}`,
+  });
+  if (approvedPlanFiniteCommandInjection) {
+    effectiveToolCalls = [approvedPlanFiniteCommandInjection.call];
+    callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+    logAgentEvent("approved_plan_finite_command_injected", {
+      iteration,
+      command: approvedPlanFiniteCommandInjection.command,
+      taskId: approvedPlanFiniteCommandInjection.task.id,
+      reason: "single_remaining_approved_finite_command",
+      workflowMode,
+      runtimeIntent,
+    });
+  }
+  const userVisibleText = approvedPlanFiniteCommandInjection
+    ? ""
+    : routedUserVisibleText;
 
   if (pseudoRecovery?.call) {
     callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);

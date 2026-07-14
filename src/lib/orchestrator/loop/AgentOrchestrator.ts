@@ -308,6 +308,7 @@ export class AgentOrchestrator {
           setApprovedPlanRecoveryState: (state) => {
             loopState.approvedPlanRecoveryState = state;
           },
+          getPlanRuntimeState: () => loopState.planRuntimeState,
           emitTaskOrchestratorPhase,
           setPlanRuntimePhase,
         });
