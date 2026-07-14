@@ -342,7 +342,7 @@ test("approved plan watchdog timeout gets exactly one bounded native-tool recove
   assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery({
     ...base,
     approvedPlanActionOnlyRecoveryActive: false,
-  }), false);
+  }), true, "normal approved execution also gets one bounded watchdog retry");
   assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery({
     ...base,
     forceXmlTools: true,

@@ -130,12 +130,7 @@ export function shouldAttemptApprovedPlanStreamWatchdogRecovery(input: {
     input.isPlanApproved &&
     isStreamWatchdogTimeoutMessage(input.message) &&
     input.llmToolCount > 0 &&
-    !input.forceXmlTools &&
-    (
-      input.isExecuteRecoveryEligible ||
-      input.approvedPlanActionOnlyRecoveryActive ||
-      input.approvedPlanNoToolRecoveryFileReadActive
-    );
+    !input.forceXmlTools;
 }
 
 export function buildApprovedPlanStreamWatchdogRecoveryPrompt(language: "zh" | "en"): string {

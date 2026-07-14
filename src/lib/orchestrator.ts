@@ -966,6 +966,16 @@ function sedSegmentHasFileOperand(args: string[]): boolean {
   return false;
 }
 
+function sedSegmentMutatesInPlace(args: string[]): boolean {
+  return args.some((arg) =>
+    arg === "-i" ||
+    /^-i.+/.test(arg) ||
+    /^-[A-Za-z]*i[A-Za-z]*$/.test(arg) ||
+    arg === "--in-place" ||
+    arg.startsWith("--in-place=")
+  );
+}
+
 function isShellFileReadSegment(segment: string): boolean {
   const normalized = normalizeShellReadSegment(segment);
   if (!normalized || isDirectoryOnlyShellSegment(normalized)) return false;
@@ -974,6 +984,7 @@ function isShellFileReadSegment(segment: string): boolean {
     return catHeadTailSegmentHasFileOperand(command, args);
   }
   if (/^sed$/i.test(command)) {
+    if (sedSegmentMutatesInPlace(args)) return false;
     return sedSegmentHasFileOperand(args);
   }
   return false;

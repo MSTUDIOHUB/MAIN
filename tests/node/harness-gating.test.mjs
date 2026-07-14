@@ -141,7 +141,7 @@ test("Plan closure preserves multiline numbered user-goal facets", () => {
   assert.match(closure.userGoal, /^2、/m);
 });
 
-test("buildShellReadValidationError blocks command starting with cat/head/tail/sed", () => {
+test("buildShellReadValidationError blocks shell file reads but permits in-place sed writes", () => {
   const tcRun = { id: "call_run", name: "run_command" };
   const tcExec = { id: "call_exec", name: "execute_command" };
 
@@ -149,7 +149,7 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
 
   const errCat = buildShellReadValidationError(tcRun, { command: "cat src/App.tsx" }, callbacks);
   const errHead = buildShellReadValidationError(tcRun, { command: "head -n 20 src/App.tsx" }, callbacks);
-  const errSed = buildShellReadValidationError(tcRun, { command: "sed -i 's/a/b/g' src/App.tsx" }, callbacks);
+  const okSedWrite = buildShellReadValidationError(tcRun, { command: "sed -i '' 's/a/b/g' src/App.tsx" }, callbacks);
   const errCdSed = buildShellReadValidationError(tcExec, { command: "cd /tmp/project && sed -n '270,310p' src/App.tsx" }, callbacks);
   const errCdCatPipe = buildShellReadValidationError(tcExec, { command: "cd /tmp/project && cat -n src/App.tsx | grep -A 15 rawOrders" }, callbacks);
   const okLs = buildShellReadValidationError(tcRun, { command: "ls -la" }, callbacks);
@@ -162,7 +162,7 @@ test("buildShellReadValidationError blocks command starting with cat/head/tail/s
   assert.match(errCat.content, /SHELL_READ_FORBIDDEN/);
 
   assert.ok(errHead);
-  assert.ok(errSed);
+  assert.equal(okSedWrite, null);
   assert.ok(errCdSed);
   assert.ok(errCdCatPipe);
   assert.equal(okLs, null);
@@ -178,6 +178,9 @@ test("isShellFileReadCommand detects read commands after directory changes", () 
   assert.equal(isShellFileReadCommand("curl -s http://localhost:1421 | head -30"), false);
   assert.equal(isShellFileReadCommand("printf '%s\\n' ok | sed -n '1p'"), false);
   assert.equal(isShellFileReadCommand("printf '%s\\n' ok | cat"), false);
+  assert.equal(isShellFileReadCommand("sed -i '' 's/a/b/g' src/App.tsx"), false);
+  assert.equal(isShellFileReadCommand("sed --in-place=.bak 's/a/b/g' src/App.tsx"), false);
+  assert.equal(isShellFileReadCommand("sed -Ei 's/a/b/g' src/App.tsx"), false);
   assert.equal(isShellFileReadCommand("cd /tmp/project && npm run build"), false);
   assert.equal(isShellFileReadCommand("grep -n \"loadOrders\" src/App.tsx"), false);
 });

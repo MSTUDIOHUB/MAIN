@@ -220,10 +220,21 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     mode === "mutation_first" ||
     mode === "action_only"
   );
-  const selected = requiresTargetMatch
+  const matchingTargetCall = requiresTargetMatch
     ? eligible.find((call) =>
         workspacePathsReferToSameFile(call.target || "", transactionTarget || "")
       )
+    : undefined;
+  // A malformed or partially streamed apply_patch may not expose a target yet.
+  // If it is the only eligible mutation, let normal patch parsing and mutation
+  // preflight return the precise error instead of silently deferring the call.
+  const soleUnresolvedPatch =
+    requiresTargetMatch &&
+    eligible.length === 1 &&
+    eligible[0]?.name === "apply_patch" &&
+    /^(?:workspace patch)?$/i.test(String(eligible[0]?.target || "").trim());
+  const selected = requiresTargetMatch
+    ? matchingTargetCall || (soleUnresolvedPatch ? eligible[0] : undefined)
     : eligible[0];
   return {
     active: true,

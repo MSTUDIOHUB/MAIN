@@ -1339,6 +1339,87 @@ function collectPlanChangeTargets(content: string): string[] {
   return [...new Set(targets)];
 }
 
+interface ExplicitPlanCodeChange {
+  target: string;
+  before: string;
+  after: string;
+}
+
+function normalizeExplicitPlanCode(value: string): string {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .join("\n")
+    .trim();
+}
+
+function extractLabeledPlanCode(block: string, label: "before" | "after"): string {
+  const pattern = label === "before"
+    ? /(?:\*\*)?(?:修改前|变更前|当前代码|Before|Current)(?:\*\*)?\s*[:：]?\s*\n\s*```[^\n]*\n([\s\S]*?)```/i
+    : /(?:\*\*)?(?:修改后|变更后|目标代码|After|Proposed)(?:\*\*)?\s*[:：]?\s*\n\s*```[^\n]*\n([\s\S]*?)```/i;
+  return normalizeExplicitPlanCode(block.match(pattern)?.[1] || "");
+}
+
+function collectExplicitPlanCodeChanges(content: string): ExplicitPlanCodeChange[] {
+  const raw = String(content || "");
+  const fileLabel = /(?:\*\*)?(?:文件|File)(?:\*\*)?\s*[:：]\s*`?([A-Za-z0-9_@./\\-]+\.[A-Za-z0-9]+)`?/gi;
+  const matches = [...raw.matchAll(fileLabel)];
+  const changes: ExplicitPlanCodeChange[] = [];
+  for (let index = 0; index < matches.length; index += 1) {
+    const match = matches[index];
+    const start = match.index ?? 0;
+    const end = matches[index + 1]?.index ?? raw.length;
+    const block = raw.slice(start, end);
+    const before = extractLabeledPlanCode(block, "before");
+    const after = extractLabeledPlanCode(block, "after");
+    if (!before || !after) continue;
+    changes.push({
+      target: normalizePlanGroundingPath(match[1] || ""),
+      before,
+      after,
+    });
+  }
+  return changes;
+}
+
+/**
+ * Explicit before/after snippets are an executable contract, not illustrative
+ * prose. Validate that the contract changes something and, when the target was
+ * read, that its claimed before-state actually came from that read result.
+ */
+export function validateExplicitPlanCodeChangeGrounding(input: {
+  content: string;
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): PlanArtifactQualityResult {
+  const changes = collectExplicitPlanCodeChanges(input.content);
+  for (const change of changes) {
+    if (change.before === change.after) {
+      return classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: `plan_change_noop:${change.target || "unknown"}`,
+      });
+    }
+
+    const matchingReads = (input.recentToolActivity || []).filter((activity) =>
+      /^(?:read_file|read_file_window|read_document)$/i.test(String(activity.name || "")) &&
+      !/failed|blocked|rejected|declined/i.test(String(activity.status || "")) &&
+      planGroundingPathsMatch(change.target, String(activity.target || ""))
+    );
+    if (matchingReads.length === 0) continue;
+    const beforeWasObserved = matchingReads.some((activity) =>
+      normalizeExplicitPlanCode(String(activity.detail || "")).includes(change.before)
+    );
+    if (!beforeWasObserved) {
+      return classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: `plan_before_state_not_observed:${change.target || "unknown"}`,
+      });
+    }
+  }
+  return classifyPlanArtifactQualityResult({ ok: true });
+}
+
 function extractPlanGroundingSectionBody(content: string, headingPattern: RegExp): string {
   const body: string[] = [];
   let inSection = false;
@@ -2769,6 +2850,18 @@ export function materializePlanArtifactFromVisibleText(input: {
   let source: PlanMaterializationSource = input.sourceHint || "visible_plan";
   if (countPlanShapeSignals(content) < 5) return rejectPlanMaterialization({ reason: "not_structured" });
   const decisionFork = analyzePlanDecisionFork(content);
+
+  const explicitCodeGrounding = validateExplicitPlanCodeChangeGrounding({
+    content,
+    recentToolActivity: input.recentToolActivity,
+  });
+  if (!explicitCodeGrounding.ok) {
+    return rejectPlanMaterialization({
+      reason: explicitCodeGrounding.reason || "explicit_plan_code_grounding",
+      decisionFork,
+      quality: explicitCodeGrounding,
+    });
+  }
 
   let validation = validateActionablePlanArtifact(content);
   if (!validation.ok && validation.reason === "excessive_plan_code_dump") {

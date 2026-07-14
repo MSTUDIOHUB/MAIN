@@ -61,11 +61,53 @@ const {
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
   summarizePlanEvidenceDetail,
+  validateExplicitPlanCodeChangeGrounding,
   validatePlanEvidenceGrounding,
   validateNumberedUserGoalFacetCoverage,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/planMaterialization.ts"),
 );
+
+test("explicit plan code changes must be non-noop and match observed source state", () => {
+  const planChange = (before, after) => [
+    "### 改动 1",
+    "**文件**: `src/main.js`",
+    "**修改前**:",
+    "```javascript",
+    before,
+    "```",
+    "**修改后**:",
+    "```javascript",
+    after,
+    "```",
+  ].join("\n");
+
+  const noOp = validateExplicitPlanCodeChangeGrounding({
+    content: planChange("import { invoke } from '@tauri-apps/api/core';", "import { invoke } from '@tauri-apps/api/core';"),
+  });
+  assert.equal(noOp.ok, false);
+  assert.match(noOp.reason, /plan_change_noop:src\/main\.js/);
+
+  const activity = [{
+    name: "read_file",
+    target: "src/main.js",
+    status: "succeeded",
+    detail: "import { invoke } from '@tauri-apps/api/core';\nconst ready = true;",
+  }];
+  const inventedBefore = validateExplicitPlanCodeChangeGrounding({
+    content: planChange("import invoke from '@tauri-apps/api/core';", "import { invoke } from '@tauri-apps/api/core';"),
+    recentToolActivity: activity,
+  });
+  assert.equal(inventedBefore.ok, false);
+  assert.match(inventedBefore.reason, /plan_before_state_not_observed:src\/main\.js/);
+  assert.equal(inventedBefore.recoveryAction, "targeted_evidence");
+
+  const observedBefore = validateExplicitPlanCodeChangeGrounding({
+    content: planChange("const ready = true;", "const ready = false;"),
+    recentToolActivity: activity,
+  });
+  assert.equal(observedBefore.ok, true);
+});
 
 test("numbered user-goal facets require evidence, change, and validation coverage", () => {
   const userGoal = [

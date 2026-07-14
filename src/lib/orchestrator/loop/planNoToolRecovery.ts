@@ -72,6 +72,7 @@ export function shouldAttemptPlanEvidenceMaterialization(input: {
 export function resolvePlanNoToolRecoveryDecision(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
+  planRuntimePhase?: PlanRuntimePhase;
   planArtifactQualityRejected?: boolean;
   hasStructuredProposal: boolean;
   hasReviewablePlanArtifacts: boolean;
@@ -98,8 +99,11 @@ export function resolvePlanNoToolRecoveryDecision(input: {
     !input.isPlanApproved;
   const hasAcceptedReviewArtifact =
     input.hasReviewablePlanArtifacts && input.planArtifactQualityRejected !== true;
+  const planningEvidenceBlocked =
+    input.planRuntimePhase === "blocked" && !hasAcceptedReviewArtifact;
   const planningStillIncomplete =
     isUnapprovedPlan &&
+    !planningEvidenceBlocked &&
     !hasAcceptedReviewArtifact &&
     input.currentPlanStage !== "ready_to_execute";
   const hasMeaningfulSourcePlanText = input.sourceVisibleText.trim().length > 0;
@@ -137,6 +141,7 @@ export function resolvePlanNoToolRecoveryDecision(input: {
       isUnapprovedPlan && hasAcceptedReviewArtifact,
     shouldMaterializeStructuredProposal:
       isUnapprovedPlan &&
+      !planningEvidenceBlocked &&
       input.hasStructuredProposal &&
       (!input.hasReviewablePlanArtifacts || input.planArtifactQualityRejected === true),
     shouldTryPlanTextMaterialization,
@@ -349,6 +354,7 @@ export async function handlePlanNoToolRecovery(input: {
   const decision = resolvePlanNoToolRecoveryDecision({
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
+    planRuntimePhase: input.planRuntimePhase,
     planArtifactQualityRejected: currentPlanArtifactQualityRejected,
     hasStructuredProposal,
     hasReviewablePlanArtifacts,
@@ -648,6 +654,28 @@ export async function handlePlanNoToolRecovery(input: {
       attemptedPlanWriteTargets.length = 0;
     }
     return finish(handoff);
+  }
+
+  if (
+    workflowMode === "plan" &&
+    !callbacks.getIsPlanApproved() &&
+    input.planRuntimePhase === "blocked" &&
+    !hasReviewablePlanArtifacts
+  ) {
+    const failureReason = currentPlanLastQualityGateReason || "plan_evidence_recovery_exhausted";
+    logAgentEvent("plan_blocked_candidate_rejected", {
+      iteration,
+      reason: failureReason,
+      hasStructuredProposal,
+      evidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
+    });
+    callbacks.onNonActionableStop(
+      buildPlanGenerationFailedMessage(callbacks.getPreferredLanguage(), failureReason),
+      "incomplete_plan",
+      buildPlanGenerationFailedProgress(failureReason),
+    );
+    callbacks.onStatusChange("idle");
+    return finish("stopped");
   }
 
   if (decision.shouldMaterializeStructuredProposal) {

@@ -952,6 +952,17 @@ test("recovery batch selection serializes different model call shapes by phase",
   );
   assert.deepEqual(wrongMutationOnly.deferredCallIds, ["wrong-edit"]);
 
+  const unresolvedPatch = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [{ id: "unresolved-patch", name: "apply_patch", target: "workspace patch" }],
+    expectedTarget: "src/App.tsx",
+  });
+  assert.equal(
+    unresolvedPatch.selectedCallId,
+    "unresolved-patch",
+    "the patch parser should report an unresolved target instead of recovery silently deferring it",
+  );
+
   const matchingMutation = resolveExecuteRecoveryBatchDecision({
     mode: "mutation_first",
     calls: [

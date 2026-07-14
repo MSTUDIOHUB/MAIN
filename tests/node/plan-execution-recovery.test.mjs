@@ -535,6 +535,43 @@ test("plan no-tool decision separates materialization refine and continuation pa
   assert.equal(continuation.shouldForcePlanContinuation, true);
 });
 
+test("blocked Plan evidence recovery cannot materialize a later contradictory proposal", async () => {
+  const harness = createPlanNoToolHarness("zh");
+  const blockedDecision = resolvePlanNoToolRecoveryDecision({
+    workflowMode: "plan",
+    isPlanApproved: false,
+    planRuntimePhase: "blocked",
+    hasStructuredProposal: true,
+    hasReviewablePlanArtifacts: false,
+    currentPlanStage: "requirements",
+    sourceVisibleText: "# Proposed Plan\n## 关键改动\n- 修改 `src/main.js`。",
+    hasMeaningfulVisibleText: true,
+    sawPlanModeToolActivity: true,
+    wasTruncated: false,
+    hasExecutablePlanProposalOptions: false,
+    planReplyOptionsRoutedToArtifact: false,
+    finalReplyOptionsCount: 0,
+    turnIntent: "plan",
+    commandDirectiveAction: null,
+  });
+  assert.equal(blockedDecision.shouldMaterializeStructuredProposal, false);
+  assert.equal(blockedDecision.shouldTryPlanTextMaterialization, false);
+
+  const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
+    planRuntimePhase: "blocked",
+    planEvidenceRecoveryPasses: 3,
+    planLastQualityGateReason: "change_targets_lack_confirmed_rationale",
+    planArtifactQualityRejected: true,
+    hasStructuredProposal: true,
+    sourceVisibleText: "# Proposed Plan\n## 关键改动\n- 修改 `src/main.js`。",
+    hasMeaningfulVisibleText: true,
+  }));
+  assert.equal(result.status, "stopped");
+  assert.equal(harness.stops.length, 1);
+  assert.equal(harness.stops[0].reason, "incomplete_plan");
+  assert.match(harness.stops[0].message, /change_targets_lack_confirmed_rationale/);
+});
+
 test("Plan evidence materialization replaces unbounded retries for logged quality failures", () => {
   assert.equal(shouldAttemptPlanEvidenceMaterialization({
     recoveryAction: "rewrite",
