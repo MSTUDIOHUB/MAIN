@@ -1,5 +1,17 @@
 import type { PlanRuntimePhase } from "../../workflowModels";
 
+/**
+ * `needs_evidence` serves two different runtime transactions. A model-authored
+ * draft may use structural facts and infer the remaining relationships, while
+ * deterministic runtime materialization must not infer a diagnosis. Keep the
+ * recovery objective explicit so phase transitions cannot silently swap those
+ * two evidence thresholds.
+ */
+export type PlanEvidenceRecoveryObjective =
+  | "none"
+  | "model_draft"
+  | "deterministic_closure";
+
 export interface PlanLoopRuntimeState {
   planRuntimePhase: PlanRuntimePhase;
   planQualityRejectCount: number;
@@ -7,6 +19,7 @@ export interface PlanLoopRuntimeState {
   planLastMissingSections: string[];
   planFacetMappingSource: string;
   planArtifactQualityRejected: boolean;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses: number;
   planReasoningOnlyRecoveryPasses: number;
@@ -43,6 +56,7 @@ export function createPlanLoopRuntimeState(input: {
     planLastMissingSections: [],
     planFacetMappingSource: "",
     planArtifactQualityRejected: false,
+    planEvidenceRecoveryObjective: "none",
     planEvidenceRecoveryPasses: 0,
     planEvidenceNoProgressPasses: 0,
     planReasoningOnlyRecoveryPasses: 0,
@@ -78,21 +92,31 @@ export function applyPlanRuntimePhase(
 
 export function applyReasoningNoToolPlanRuntimeState(
   state: PlanLoopRuntimeState,
-  input: Pick<PlanLoopRuntimeState, "planReasoningOnlyRecoveryPasses">,
+  input: Pick<
+    PlanLoopRuntimeState,
+    "planReasoningOnlyRecoveryPasses" | "planEvidenceRecoveryObjective"
+  >,
 ): PlanLoopRuntimeState {
   return {
     ...state,
     planReasoningOnlyRecoveryPasses: input.planReasoningOnlyRecoveryPasses,
+    planEvidenceRecoveryObjective:
+      input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
   };
 }
 
 export function applyPlanEvidenceRecoveryRuntimeState(
   state: PlanLoopRuntimeState,
-  input: Pick<PlanLoopRuntimeState, "planEvidenceRecoveryPasses">,
+  input: Pick<
+    PlanLoopRuntimeState,
+    "planEvidenceRecoveryPasses" | "planEvidenceRecoveryObjective"
+  >,
 ): PlanLoopRuntimeState {
   return {
     ...state,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses,
+    planEvidenceRecoveryObjective:
+      input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
   };
 }
 
@@ -103,6 +127,7 @@ export function applyPlanPostConvergenceRuntimeState(
     | "planPostConvergenceToolRedirectCount"
     | "planDraftingRecoveryReadCount"
     | "planReasoningOnlyRecoveryPasses"
+    | "planEvidenceRecoveryObjective"
     | "planAutoScaffoldPromptIssued"
   > & Partial<Pick<PlanLoopRuntimeState, "planEvidenceRecoveryPasses">>,
 ): PlanLoopRuntimeState {
@@ -113,6 +138,8 @@ export function applyPlanPostConvergenceRuntimeState(
     planEvidenceRecoveryPasses:
       input.planEvidenceRecoveryPasses ?? state.planEvidenceRecoveryPasses,
     planReasoningOnlyRecoveryPasses: input.planReasoningOnlyRecoveryPasses,
+    planEvidenceRecoveryObjective:
+      input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued,
   };
 }
@@ -128,6 +155,7 @@ export function applyPlanNoToolRuntimeState(
     | "planLastMissingSections"
     | "planFacetMappingSource"
     | "planArtifactQualityRejected"
+    | "planEvidenceRecoveryObjective"
     | "planAutoScaffoldPromptIssued"
     | "planEvidenceRecoveryPasses"
   >,
@@ -141,6 +169,8 @@ export function applyPlanNoToolRuntimeState(
     planLastMissingSections: input.planLastMissingSections ?? state.planLastMissingSections,
     planFacetMappingSource: input.planFacetMappingSource ?? state.planFacetMappingSource,
     planArtifactQualityRejected: input.planArtifactQualityRejected ?? state.planArtifactQualityRejected,
+    planEvidenceRecoveryObjective:
+      input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued ?? state.planAutoScaffoldPromptIssued,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses ?? state.planEvidenceRecoveryPasses,
   };
@@ -148,13 +178,18 @@ export function applyPlanNoToolRuntimeState(
 
 export function applyToolResultPlanRuntimeState(
   state: PlanLoopRuntimeState,
-  input: Pick<PlanLoopRuntimeState, "planDraftingRecoveryReadCount"> &
+  input: Pick<
+    PlanLoopRuntimeState,
+    "planDraftingRecoveryReadCount" | "planEvidenceRecoveryObjective"
+  > &
     Partial<Pick<PlanLoopRuntimeState, "planRuntimePhase">>,
 ): PlanLoopRuntimeState {
   return {
     ...state,
     planRuntimePhase: input.planRuntimePhase ?? state.planRuntimePhase,
     planDraftingRecoveryReadCount: input.planDraftingRecoveryReadCount,
+    planEvidenceRecoveryObjective:
+      input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
   };
 }
 
@@ -168,6 +203,7 @@ export function applyPlanQualityRuntimeState(
     | "planArtifactQualityRejected"
     | "planAutoScaffoldPromptIssued"
     | "planClosureEvidenceRecoveryIssued"
+    | "planEvidenceRecoveryObjective"
     | "planEvidenceRecoveryPasses"
     | "planEvidenceNoProgressPasses"
   >,
@@ -180,6 +216,8 @@ export function applyPlanQualityRuntimeState(
     planArtifactQualityRejected: input.planArtifactQualityRejected,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued,
     planClosureEvidenceRecoveryIssued: input.planClosureEvidenceRecoveryIssued,
+    planEvidenceRecoveryObjective:
+      input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses,
     planEvidenceNoProgressPasses: input.planEvidenceNoProgressPasses,
   };
@@ -192,6 +230,7 @@ export function applyPlanReadOnlyConvergenceRuntimeState(
     | "planReadOnlyConvergenceBatches"
     | "planReadOnlyConvergenceTools"
     | "usedPlanReadOnlyConvergencePrompt"
+    | "planEvidenceRecoveryObjective"
   >,
 ): PlanLoopRuntimeState {
   return {
@@ -199,6 +238,8 @@ export function applyPlanReadOnlyConvergenceRuntimeState(
     planReadOnlyConvergenceBatches: input.planReadOnlyConvergenceBatches,
     planReadOnlyConvergenceTools: input.planReadOnlyConvergenceTools,
     usedPlanReadOnlyConvergencePrompt: input.usedPlanReadOnlyConvergencePrompt,
+    planEvidenceRecoveryObjective:
+      input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
   };
 }
 

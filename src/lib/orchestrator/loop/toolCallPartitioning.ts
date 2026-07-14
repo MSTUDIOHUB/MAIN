@@ -13,6 +13,7 @@ import {
   formatReadFileWindowCoverageStub,
   formatReadFileWindowNarrowedNote,
   getReadFileCoverageForPath,
+  invalidateStaleFileReadStatesForPath,
   type FileReadState,
 } from "../../orchestrator/fileReadCache";
 import {
@@ -162,10 +163,13 @@ export async function partitionToolCallsForExecution(input: {
   const readOnlyCallSignatures = new Map<string, string>();
   const readFileWindowNarrowedNotes = new Map<string, string>();
   const queuedReadOnlySignatures = new Set<string>();
+  const queuedFileReadSignatures = new Set<string>();
   const toolFailureSignatures = new Map<string, string>();
   const preExecutionResults: ToolExecutionResult[] = [];
   let approvedPlanPatchRecoveryReadLeaseClaimed = false;
   let executePatchRecoveryReadLeaseClaimed = false;
+  let sawOrderSensitiveWorkspaceAction = false;
+  let deferRemainingCallsForBatchOrder = false;
   const executeRecoveryBatchDecision = resolveExecuteRecoveryBatchDecision({
     mode: executeRecoveryMode,
     calls: toolCalls.map((call) => {
@@ -279,6 +283,59 @@ export async function partitionToolCallsForExecution(input: {
       continue;
     }
 
+    const isOrderSensitiveWorkspaceAction =
+      tc.name === "apply_patch" ||
+      tc.name === "replace_in_file" ||
+      tc.name === "write_file" ||
+      tc.name === "delete_workspace_path" ||
+      tc.name === "run_command" ||
+      tc.name === "execute_command" ||
+      tc.name === "send_pty_input";
+    // Execution rounds intentionally group auto-executable observations ahead
+    // of reviewed/ mutating calls. Preserve the model's within-batch happens-
+    // before relation by deferring any workspace observation that follows an
+    // action; otherwise grep/outline/git/PTY results could describe the state
+    // before the earlier write or command. The capability risk keeps this
+    // boundary aligned with the registry instead of maintaining another list
+    // of individual read tool names here.
+    const isOrderSensitiveWorkspaceObservation =
+      toolCapabilityRegistry.tools[tc.name]?.risk === "read_only";
+    const observationWouldRunBeforeEarlierAction =
+      sawOrderSensitiveWorkspaceAction && isOrderSensitiveWorkspaceObservation;
+    if (observationWouldRunBeforeEarlierAction) {
+      deferRemainingCallsForBatchOrder = true;
+    }
+    if (deferRemainingCallsForBatchOrder) {
+      const language = callbacks.getPreferredLanguage();
+      const message = language === "zh"
+        ? `ORDERED_BATCH_CALL_DEFERRED: ${tc.name} 位于同批写入/命令之后。MAIN 不会把它提前到修改前执行；请先消费本批操作结果，再在下一条回复中读取修改后的文件或继续后续动作。`
+        : `ORDERED_BATCH_CALL_DEFERRED: ${tc.name} appeared after a write/command in the same batch. MAIN will not move it ahead of that action; consume this batch result, then read the post-action file or continue later actions in the next response.`;
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "ordered_batch_call_deferred",
+      });
+      logAgentEvent("ordered_batch_call_deferred", {
+        iteration,
+        tool: tc.name,
+        target,
+        reason: observationWouldRunBeforeEarlierAction
+          ? "workspace_observation_after_action"
+          : "depends_on_deferred_observation",
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: "",
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "ordered_batch_call_deferred",
+      });
+      continue;
+    }
     if (
       executeRecoveryBatchDecision.active &&
       executeRecoveryBatchDecision.selectedCallId !== tc.id
@@ -713,6 +770,7 @@ export async function partitionToolCallsForExecution(input: {
     } else if (planned.action === "auto_execute") {
       if (planned.sessionAutoApproved && planned.risk !== "local_file_read") {
         writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, skipUserReview: true });
+        if (isOrderSensitiveWorkspaceAction) sawOrderSensitiveWorkspaceAction = true;
         continue;
       }
       // A repeated delegation is still a new isolated run; never reuse the
@@ -722,7 +780,11 @@ export async function partitionToolCallsForExecution(input: {
         continue;
       }
       let effectiveToolArgs = toolArgs;
-      const cacheableReadOnlyTool = shouldCacheReadOnlyToolResult(tc.name);
+      // read_file has a dedicated cache keyed by path + range/options and
+      // guarded by size/mtime. The generic cache is args-only and can replay a
+      // pre-mutation result, so it must never own persistent file reads.
+      const cacheableReadOnlyTool =
+        tc.name !== "read_file" && shouldCacheReadOnlyToolResult(tc.name);
       let signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
       let cached = cacheableReadOnlyTool ? readOnlyResultCache.get(signature) : undefined;
       const fileReadMetadata =
@@ -734,6 +796,28 @@ export async function partitionToolCallsForExecution(input: {
           ? buildFileReadSignature(fileReadMetadata?.path ?? toolArgs.path, effectiveToolArgs)
           : "";
       let fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
+      if (fileReadMetadata) {
+        const invalidatedSignatures = invalidateStaleFileReadStatesForPath({
+          states: fileReadStates,
+          path: fileReadMetadata.path,
+          sizeBytes: fileReadMetadata.sizeBytes,
+          modifiedMs: fileReadMetadata.modifiedMs,
+        });
+        invalidatedSignatures.forEach((key) => readOnlyDuplicateSkipCounts.delete(key));
+        if (invalidatedSignatures.length > 0) {
+          logAgentEvent("file_read_cache_invalidated", {
+            iteration,
+            target,
+            reason: "path_metadata_epoch_changed",
+            invalidatedCount: invalidatedSignatures.length,
+            current: {
+              sizeBytes: fileReadMetadata.sizeBytes,
+              modifiedMs: fileReadMetadata.modifiedMs,
+            },
+          });
+        }
+        fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
+      }
       const bypassApprovedPlanPatchRecoveryReadCache =
         !approvedPlanPatchRecoveryReadLeaseClaimed &&
         workflowMode === "plan" &&
@@ -777,6 +861,31 @@ export async function partitionToolCallsForExecution(input: {
               })),
           },
         );
+      }
+
+      if (
+        fileReadSignature &&
+        queuedFileReadSignatures.has(fileReadSignature) &&
+        !bypassPatchRecoveryReadCache
+      ) {
+        const content = [
+          `${FILE_UNCHANGED_STUB}: an identical read_file path/range is already queued in this tool batch.`,
+          "Reuse the other result from this batch; request a different start_line/end_line/max_lines window only if more source is needed.",
+        ].join("\n");
+        logAgentEvent("file_read_same_batch_duplicate", {
+          iteration,
+          target,
+          signature: truncateForLog(fileReadSignature, 180),
+        });
+        preExecutionResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content,
+          displayContent: `${FILE_UNCHANGED_STUB}: ${target}`,
+          isError: false,
+        });
+        continue;
       }
 
       if (fileReadState && !bypassPatchRecoveryReadCache && isContentInActiveMessages(fileReadState.modelContent, managedAgentMessages)) {
@@ -1083,7 +1192,10 @@ export async function partitionToolCallsForExecution(input: {
         queuedReadOnlySignatures.add(signature);
         readOnlyCallSignatures.set(tc.id, signature);
       }
-      if (fileReadSignature) readOnlyCallSignatures.set(`${tc.id}:file_read`, fileReadSignature);
+      if (fileReadSignature) {
+        queuedFileReadSignatures.add(fileReadSignature);
+        readOnlyCallSignatures.set(`${tc.id}:file_read`, fileReadSignature);
+      }
       readOnlyCalls.push({
         id: tc.id,
         name: tc.name,
@@ -1095,6 +1207,7 @@ export async function partitionToolCallsForExecution(input: {
       });
     } else if (planned.action === "spec_file_auto_approved") {
       specFileCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+      if (isOrderSensitiveWorkspaceAction) sawOrderSensitiveWorkspaceAction = true;
     } else if (planned.action === "blocked_plan_gate") {
       if (planned.target) attemptedPlanWriteTargets.push(planned.target);
       preExecutionResults.push(buildPlanGateBlockedResult(tc, toolArgs, callbacks, planned.reason || "pre_approval_source_write"));
@@ -1146,6 +1259,7 @@ export async function partitionToolCallsForExecution(input: {
         continue;
       }
       writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
+      if (isOrderSensitiveWorkspaceAction) sawOrderSensitiveWorkspaceAction = true;
     }
   }
 

@@ -26,6 +26,7 @@ import {
   buildExecuteRecoveryPrompt,
   buildExecuteValidationRecoveryPrompt,
   isExecutePatchMismatchRecoveryActivity,
+  isReadOnlyNoProgressDetail,
   resolveExecuteReadOnlyRecoveryTrigger,
   resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
@@ -579,7 +580,7 @@ export function handleNoProgressRecovery(input: {
         for (const activity of recentPlanToolActivity.slice(-8)) {
           const target = String(activity.target || "").trim();
           if (!target) continue;
-          const cachedWeight = /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT/i.test(activity.detail || "") ? 2 : 1;
+          const cachedWeight = isReadOnlyNoProgressDetail(activity.detail) ? 2 : 1;
           counts.set(target, (counts.get(target) || 0) + cachedWeight);
         }
         return [...counts.entries()]
@@ -704,6 +705,15 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
     ) || target;
 
     if (!result.isError) {
+      const noProgressRead = isReadOnlyNoProgressDetail(
+        String(result.displayContent || result.content || ""),
+      );
+      if (!noProgressRead) {
+        // A new range or a new file version is progress. Clear the target's
+        // unchanged-window streak instead of treating path reuse as a loop.
+        crossIterationFileReads.delete(trackedTarget);
+        continue;
+      }
       crossIterationFileReads.set(trackedTarget, (crossIterationFileReads.get(trackedTarget) || 0) + 1);
       const count = crossIterationFileReads.get(trackedTarget)!;
       const crossReadThreshold = resolveCrossIterationReadThreshold(snapshotContextLimit);
@@ -717,7 +727,7 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
         });
         callbacks.appendMessage({
           role: "system",
-          content: `[System: Cross-iteration read_file loop detected for ${target} (read ${count} times across iterations). File content is already in context — do not re-read. Act directly with write/verify/run commands, browser actions, or state the real blocker. Do not output long prose.]`,
+          content: `[System: Cross-iteration unchanged-window read_file loop detected for ${target} (${count} no-progress reads). The requested content is already in context — request a missing range, use a changed version, act with write/verify/run/browser tools, or state the real blocker. Do not output long prose.]`,
         });
         logAgentEvent("cross_iteration_file_read_loop", {
           iteration,

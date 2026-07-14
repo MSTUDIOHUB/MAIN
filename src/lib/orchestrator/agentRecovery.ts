@@ -45,7 +45,7 @@ export function buildExecuteNoActionPauseMessage(input: {
       repeatedTargets.length > 0 ? `重复目标：${repeatedTargets.join("、")}` : "",
       recent.length > 0 ? `最近有效进展：\n${recent.map((line) => `- ${line}`).join("\n")}` : "",
       visible ? `模型最后可见输出：${visible}` : "",
-      "恢复时不要继续重复读取相同文件；请基于已读内容直接写入/替换、运行验证命令，或说明阻塞在什么具体证据/权限/业务选择上。",
+      "恢复时不要在文件未变化且结果仍在上下文时重复同一读取范围；文件修改后、结果已淘汰或需要不同范围时可以重读。否则请基于已读内容直接写入/替换、运行验证命令，或说明阻塞在什么具体证据/权限/业务选择上。",
     ].filter(Boolean).join("\n");
   }
 
@@ -54,7 +54,7 @@ export function buildExecuteNoActionPauseMessage(input: {
     repeatedTargets.length > 0 ? `Repeated targets: ${repeatedTargets.join(", ")}` : "",
     recent.length > 0 ? `Recent effective progress:\n${recent.map((line) => `- ${line}`).join("\n")}` : "",
     visible ? `Last visible model output: ${visible}` : "",
-    "On resume, do not reread the same files. Use the cached context to patch/write, run validation, or state the concrete evidence/permission/business-choice blocker.",
+    "On resume, do not reread the same range while the file is unchanged and that result remains active; reread after mutation, eviction, or for a different required range. Otherwise use cached context to patch/write, validate, or state the concrete evidence/permission/business-choice blocker.",
   ].filter(Boolean).join("\n");
 }
 

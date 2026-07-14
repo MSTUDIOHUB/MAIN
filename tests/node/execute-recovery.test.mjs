@@ -27,7 +27,13 @@ function loadTranspiledModuleSync(sourcePath) {
   const module = { exports: {} };
   transpiledModuleCache.set(normalizedPath, module.exports);
   const localRequire = createRequire(normalizedPath);
+  globalThis.mockIpcInvoke = globalThis.mockIpcInvoke || (async () => ({}));
   const runtimeRequire = (specifier) => {
+    if (specifier === "@tauri-apps/api/core") {
+      return {
+        invoke: async (cmd, args) => globalThis.mockIpcInvoke(cmd, args),
+      };
+    }
     if (specifier.startsWith(".")) {
       const basePath = path.resolve(path.dirname(normalizedPath), specifier);
       const candidates = [
@@ -56,17 +62,24 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildExecuteNoProgressLoopPauseNotice,
   buildFailedFiniteValidationRecoveryPrompt,
+  classifyFailedFiniteValidationOutcome,
+  compactStructuredCommandResult,
   buildExecuteRecoveryPrompt,
   buildExecuteValidationRecoveryPrompt,
   describeExecuteRecoveryToolSurface,
+  failedFiniteValidationMatchesPendingPlanEvidence,
+  hasPendingPlanCommandEvidence,
   isExecutePatchMismatchRecoveryActivity,
   isExecuteRecoveryToolName,
+  isReadOnlyNoProgressDetail,
   resolveExecuteRecoveryBatchDecision,
   resolveExecuteReadOnlyRecoveryTrigger,
   resolveExecutePatchRecoveryTarget,
+  resolveFailedFiniteValidationRecoveryPolicy,
   resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
   shouldBypassExecuteReadCacheForPatchRecovery,
+  shouldEnterFailedFiniteValidationRecovery,
   shouldUseExecutePatchRecoveryReadLease,
   summarizeRepeatedExecuteTargets,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
@@ -108,6 +121,19 @@ const {
 const {
   partitionToolCallsForExecution,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"));
+const {
+  shouldAdvanceWorkspaceObservationEpoch,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolExecutionRound.ts"));
+
+const {
+  buildFileReadSignature,
+  getReadFileCoverageForPath,
+  invalidateWorkspaceReadCachesAfterMutation,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/fileReadCache.ts"));
+
+const {
+  buildReadOnlyCacheSignature,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
 const readOnlyTools = new Set([
   "get_project_skeleton",
@@ -125,6 +151,111 @@ const readOnlyTools = new Set([
   "read_pty_since",
   "get_pty_status",
 ]);
+
+const partitionPermissionPolicy = {
+  autoExecuteRiskLevels: ["read_only"],
+  approvalRequiredRiskLevels: ["workspace_write", "shell", "local_file_read", "external_read", "external_write", "browser_control", "destructive"],
+  disabledRiskLevels: [],
+};
+
+const partitionToolCapabilityRegistry = {
+  tools: {
+    read_file: {
+      key: "read_file",
+      name: "read_file",
+      source: "built_in",
+      category: "file",
+      risk: "read_only",
+      enabled: true,
+      autoExecutable: true,
+    },
+  },
+  policy: partitionPermissionPolicy,
+};
+
+function createPermissiveTargetingProfile() {
+  return {
+    facets: [],
+    explicitPaths: ["src/App.tsx"],
+    symbols: [],
+    tabularPaths: [],
+    mentionedFilePaths: [],
+    attachedFilePaths: [],
+    imageParts: 0,
+    hasUserProvidedContext: false,
+    hasOnlyVisualContext: false,
+    rootDirectoryAlreadyListed: false,
+    designProtocolPaths: [],
+    requiresDesignProtocol: false,
+    designProtocolSatisfied: true,
+    userStyleConfirmed: true,
+    tabularAnalysisSatisfied: true,
+    rootSkeletonAlreadyRead: false,
+    allowRootSkeleton: true,
+    preferredReadTools: ["read_file"],
+    reasons: [],
+  };
+}
+
+function createReadFilePartitionInput(overrides = {}) {
+  return {
+    toolCalls: [{
+      id: "read-window",
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/App.tsx", start_line: 1, max_lines: 100 }),
+    }],
+    workspace: workspaceRoot,
+    callbacks: {
+      getApprovedLocalFileReadPaths: () => [],
+      getAutoApproveToolScopes: () => [],
+      getIsPlanApproved: () => false,
+      getPlanExecutionEvidenceLedger: () => [],
+      getPlanStage: () => "requirements",
+      getPlanTasks: () => [],
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "read-cache-test",
+      getSubagentScope: () => null,
+      onDebugEvent: () => {},
+      onHarnessRunUpdate: () => {},
+      onToolDone: () => {},
+      onToolError: () => {},
+      onToolExecuting: () => {},
+    },
+    iteration: 2,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    planRuntimePhase: "idle",
+    availableToolNames: new Set(["read_file"]),
+    toolCapabilityRegistry: partitionToolCapabilityRegistry,
+    toolPermissionPolicy: partitionPermissionPolicy,
+    recentPlanToolActivity: [],
+    recentToolActivity: [],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Inspect src/App.tsx",
+    managedAgentMessages: [],
+    failedToolCallCounts: new Map(),
+    buildCurrentTaskTargetingProfile: createPermissiveTargetingProfile,
+    approvedPlanActionOnlyRecoveryActive: false,
+    allowApprovedPlanRecoveryFileRead: false,
+    executeRecoveryState: {
+      mode: "normal",
+      reason: "",
+      expectedTarget: null,
+      attempts: 0,
+      iterationCount: 0,
+      consecutiveBlockedReadFileCount: 0,
+      repeatedEditValidationAttempts: 0,
+    },
+    effectiveExecuteRecoveryFileRead: false,
+    readOnlyResultCache: new Map(),
+    readOnlyDuplicateSkipCounts: new Map(),
+    fileReadStates: new Map(),
+    browserValidationCache: new Map(),
+    iterationContext: { eventThreadId: "thread", eventTurnId: "turn" },
+    emitTurnEvent: () => {},
+    ...overrides,
+  };
+}
 
 function createExecuteNoToolHarness(language = "en") {
   const appended = [];
@@ -436,6 +567,401 @@ test("an unavailable stale read is blocked before execute-recovery batch deferra
   assert.doesNotMatch(result.preExecutionResults[0].content, /BATCH_DEFERRED/);
 });
 
+test("read_file cache is range-and-version aware and never falls back to stale generic cache", async () => {
+  const args = { path: "src/App.tsx", start_line: 1, max_lines: 100 };
+  const modelContent = [
+    "READ_FILE_RESULT",
+    "path: src/App.tsx",
+    "truncated: true",
+    "totalLines: 300",
+    "totalChars: 6000",
+    "returnedLines: 1-100",
+    "returnedChars: 1800",
+    "nextStartLine: 101",
+    "---CONTENT START---",
+    "export function App() {}",
+    "---CONTENT END---",
+  ].join("\n");
+  const fileSignature = buildFileReadSignature("src/App.tsx", args);
+  const genericSignature = buildReadOnlyCacheSignature("read_file", args);
+  const staleState = {
+    signature: fileSignature,
+    path: "src/App.tsx",
+    argsKey: "stale",
+    contentHash: "old-hash",
+    contentLength: modelContent.length,
+    sizeBytes: 100,
+    modifiedMs: 1,
+    modelContent,
+    updatedAt: 1,
+  };
+
+  globalThis.mockIpcInvoke = async (cmd) => cmd === "get_file_metadata"
+    ? { path: "src/App.tsx", sizeBytes: 120, modifiedMs: 2 }
+    : {};
+  const changed = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    managedAgentMessages: [{ role: "tool", content: modelContent }],
+    fileReadStates: new Map([[fileSignature, staleState]]),
+    readOnlyResultCache: new Map([[genericSignature, {
+      name: "read_file",
+      target: "src/App.tsx",
+      content: "stale generic cache content",
+    }]]),
+  }));
+
+  assert.equal(changed.preExecutionResults.length, 0);
+  assert.equal(changed.readOnlyCalls.length, 1);
+
+  const currentState = {
+    ...staleState,
+    sizeBytes: 120,
+    modifiedMs: 2,
+    contentHash: "current-hash",
+  };
+  const active = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    managedAgentMessages: [{ role: "tool", content: modelContent }],
+    fileReadStates: new Map([[fileSignature, currentState]]),
+  }));
+
+  assert.equal(active.readOnlyCalls.length, 0);
+  assert.equal(active.preExecutionResults.length, 1);
+  assert.match(active.preExecutionResults[0].content, /FILE_UNCHANGED_STUB/);
+
+  const compacted = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    managedAgentMessages: [],
+    fileReadStates: new Map([[fileSignature, currentState]]),
+  }));
+
+  assert.equal(compacted.preExecutionResults.length, 0);
+  assert.equal(compacted.readOnlyCalls.length, 1);
+});
+
+test("stale windows are removed before coverage narrowing can reuse them", async () => {
+  const windowContent = (start, end) => [
+    "READ_FILE_RESULT",
+    "path: src/App.tsx",
+    "truncated: true",
+    "totalLines: 300",
+    "totalChars: 6000",
+    `returnedLines: ${start}-${end}`,
+    "returnedChars: 1800",
+    `nextStartLine: ${end + 1}`,
+    "---CONTENT START---",
+    `window ${start}-${end}`,
+    "---CONTENT END---",
+  ].join("\n");
+  const currentArgs = { path: "src/App.tsx", start_line: 1, max_lines: 100 };
+  const staleNarrowedArgs = { path: "src/App.tsx", start_line: 101, end_line: 200 };
+  const currentContent = windowContent(1, 100);
+  const staleContent = windowContent(101, 200);
+  const currentSignature = buildFileReadSignature("src/App.tsx", currentArgs);
+  const staleSignature = buildFileReadSignature("src/App.tsx", staleNarrowedArgs);
+  const fileReadStates = new Map([
+    [currentSignature, {
+      signature: currentSignature,
+      path: "src/App.tsx",
+      argsKey: "current",
+      contentHash: "current",
+      contentLength: currentContent.length,
+      sizeBytes: 120,
+      modifiedMs: 2,
+      modelContent: currentContent,
+      updatedAt: 2,
+    }],
+    [staleSignature, {
+      signature: staleSignature,
+      path: "src/App.tsx",
+      argsKey: "stale",
+      contentHash: "stale",
+      contentLength: staleContent.length,
+      sizeBytes: 100,
+      modifiedMs: 1,
+      modelContent: staleContent,
+      updatedAt: 1,
+    }],
+  ]);
+  globalThis.mockIpcInvoke = async (cmd) => cmd === "get_file_metadata"
+    ? { path: "src/App.tsx", sizeBytes: 120, modifiedMs: 2 }
+    : {};
+
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "read-overlap",
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/App.tsx", start_line: 1, max_lines: 200 }),
+    }],
+    managedAgentMessages: [
+      { role: "tool", content: currentContent },
+      { role: "tool", content: staleContent },
+    ],
+    fileReadStates,
+  }));
+
+  assert.equal(fileReadStates.has(staleSignature), false);
+  assert.equal(result.preExecutionResults.length, 0);
+  assert.equal(result.readOnlyCalls.length, 1);
+  assert.deepEqual(JSON.parse(result.readOnlyCalls[0].arguments), {
+    path: "src/App.tsx",
+    start_line: 101,
+    max_lines: 100,
+    end_line: 200,
+  });
+});
+
+test("a large-file semantic summary never claims exact line coverage", () => {
+  const args = { path: "src/huge.ts" };
+  const signature = buildFileReadSignature("src/huge.ts", args);
+  const states = new Map([[signature, {
+    signature,
+    path: "src/huge.ts",
+    argsKey: "full",
+    contentHash: "summary",
+    contentLength: 80,
+    sizeBytes: 100_000,
+    modifiedMs: 7,
+    modelContent: "[FILE MAP-REDUCE SUMMARY]\nArchitecture only; exact source lines omitted.",
+    updatedAt: 1,
+  }]]);
+
+  const coverage = getReadFileCoverageForPath({
+    states,
+    path: "src/huge.ts",
+    metadata: { path: "src/huge.ts", sizeBytes: 100_000, modifiedMs: 7 },
+    currentSignature: buildFileReadSignature("src/huge.ts", {
+      path: "src/huge.ts",
+      start_line: 401,
+      max_lines: 100,
+    }),
+  });
+
+  assert.equal(coverage.fullFileState, null);
+  assert.deepEqual(coverage.ranges, []);
+});
+
+test("a successful mutation invalidates file windows and args-only observations", () => {
+  const signature = buildFileReadSignature("src/App.tsx", {
+    path: "src/App.tsx",
+    start_line: 1,
+    max_lines: 100,
+  });
+  const fileReadStates = new Map([[signature, {
+    signature,
+    path: `${workspaceRoot}/src/App.tsx`,
+    argsKey: "window",
+    contentHash: "old",
+    contentLength: 20,
+    sizeBytes: 100,
+    modifiedMs: 1,
+    modelContent: "READ_FILE_RESULT old",
+    updatedAt: 1,
+  }]]);
+  const readOnlyResultCache = new Map([
+    ["grep_search::App", { name: "grep_search", content: "old result" }],
+    ["git_diff::App", { name: "git_diff", content: "old diff" }],
+  ]);
+  const duplicateCounts = new Map([[signature, 2]]);
+
+  const invalidation = invalidateWorkspaceReadCachesAfterMutation({
+    toolName: "apply_patch",
+    args: { patch: "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-old\n+new\n*** End Patch" },
+    fileReadStates,
+    readOnlyResultCache,
+    readOnlyDuplicateSkipCounts: duplicateCounts,
+  });
+
+  assert.deepEqual(invalidation.invalidatedFileReadSignatures, [signature]);
+  assert.equal(invalidation.invalidatedReadOnlyEntries, 2);
+  assert.equal(fileReadStates.size, 0);
+  assert.equal(readOnlyResultCache.size, 0);
+  assert.equal(duplicateCounts.size, 0);
+
+  const commandState = (key, filePath) => ({
+      signature: key,
+      path: filePath,
+      argsKey: "window",
+      contentHash: "old",
+      contentLength: 20,
+      sizeBytes: 100,
+      modifiedMs: 1,
+      modelContent: "READ_FILE_RESULT old",
+      updatedAt: 1,
+  });
+  const commandStates = new Map([
+    ["a", commandState("a", "src/a.ts")],
+    ["b", commandState("b", "src/b.ts")],
+  ]);
+  const commandCache = new Map([["grep", { content: "old" }]]);
+  const commandInvalidation = invalidateWorkspaceReadCachesAfterMutation({
+    toolName: "run_command",
+    args: { command: "npm run format" },
+    target: "npm run format",
+    fileReadStates: commandStates,
+    readOnlyResultCache: commandCache,
+  });
+  assert.equal(commandInvalidation.invalidatedFileReadSignatures.length, 2);
+  assert.equal(commandStates.size, 0);
+  assert.equal(commandCache.size, 0);
+});
+
+test("only real mutations and opaque workspace actions advance the observation epoch", () => {
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("write_file", {
+    content: JSON.stringify({ success: true, noOp: true }),
+    isError: false,
+  }), false);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("replace_in_file", {
+    content: "NO_EFFECT_MUTATION: content already matched",
+    isError: false,
+  }), false);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("apply_patch", {
+    content: "patched",
+    isError: false,
+  }), true);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("delete_workspace_path", {
+    content: JSON.stringify({ success: true }),
+    isError: false,
+  }), true);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("run_command", {
+    content: JSON.stringify({ exitCode: 0, stdout: "no-op appears in test output" }),
+    isError: false,
+  }), true);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("send_pty_input", {
+    content: "input sent",
+    isError: false,
+  }), true);
+});
+
+test("same-batch reads suppress only the exact duplicate signature", async () => {
+  globalThis.mockIpcInvoke = async (cmd) => cmd === "get_file_metadata"
+    ? { path: "src/App.tsx", sizeBytes: 120, modifiedMs: 2 }
+    : {};
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [
+      { id: "same-1", name: "read_file", arguments: JSON.stringify({ path: "src/App.tsx", start_line: 1, max_lines: 100 }) },
+      { id: "same-2", name: "read_file", arguments: JSON.stringify({ path: "src/App.tsx", start_line: 1, max_lines: 100 }) },
+      { id: "next", name: "read_file", arguments: JSON.stringify({ path: "src/App.tsx", start_line: 101, max_lines: 100 }) },
+    ],
+  }));
+
+  assert.equal(result.readOnlyCalls.length, 2);
+  assert.deepEqual(result.readOnlyCalls.map((call) => call.id), ["same-1", "next"]);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.match(result.preExecutionResults[0].content, /^FILE_UNCHANGED_STUB/);
+});
+
+test("a read after a same-batch mutation is deferred instead of executing against old source", async () => {
+  const registry = {
+    tools: {
+      ...partitionToolCapabilityRegistry.tools,
+      write_file: {
+        key: "write_file",
+        name: "write_file",
+        source: "built_in",
+        category: "file",
+        risk: "workspace_write",
+        enabled: true,
+        autoExecutable: false,
+      },
+    },
+    policy: partitionPermissionPolicy,
+  };
+  const input = createReadFilePartitionInput({
+    toolCalls: [
+      { id: "write-first", name: "write_file", arguments: JSON.stringify({ path: "src/App.tsx", content: "updated" }) },
+      { id: "verify-after", name: "read_file", arguments: JSON.stringify({ path: "src/App.tsx", start_line: 1, max_lines: 100 }) },
+    ],
+    availableToolNames: new Set(["write_file", "read_file"]),
+    toolCapabilityRegistry: registry,
+  });
+  input.callbacks = {
+    ...input.callbacks,
+    getAutoApproveToolScopes: () => ["workspace_write"],
+  };
+
+  const result = await partitionToolCallsForExecution(input);
+  assert.equal(result.writeCalls.length, 1);
+  assert.equal(result.readOnlyCalls.length, 0);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.equal(result.preExecutionResults[0].internalFeedback, true);
+  assert.match(result.preExecutionResults[0].content, /ORDERED_BATCH_CALL_DEFERRED/);
+
+  const orderedInput = createReadFilePartitionInput({
+    toolCalls: [
+      { id: "read-first", name: "read_file", arguments: JSON.stringify({ path: "src/App.tsx", start_line: 1, max_lines: 100 }) },
+      { id: "write-after", name: "write_file", arguments: JSON.stringify({ path: "src/App.tsx", content: "updated" }) },
+    ],
+    availableToolNames: new Set(["write_file", "read_file"]),
+    toolCapabilityRegistry: registry,
+  });
+  orderedInput.callbacks = {
+    ...orderedInput.callbacks,
+    getAutoApproveToolScopes: () => ["workspace_write"],
+  };
+  const ordered = await partitionToolCallsForExecution(orderedInput);
+  assert.equal(ordered.readOnlyCalls.length, 1);
+  assert.equal(ordered.writeCalls.length, 1);
+  assert.equal(ordered.preExecutionResults.length, 0);
+});
+
+test("all workspace observations after a same-batch action are deferred", async () => {
+  const registry = {
+    tools: {
+      ...partitionToolCapabilityRegistry.tools,
+      execute_command: {
+        key: "execute_command",
+        name: "execute_command",
+        source: "built_in",
+        category: "shell",
+        risk: "shell",
+        enabled: true,
+        autoExecutable: false,
+      },
+      grep_search: {
+        key: "grep_search",
+        name: "grep_search",
+        source: "built_in",
+        category: "workspace_read",
+        risk: "read_only",
+        enabled: true,
+        autoExecutable: true,
+      },
+      get_pty_status: {
+        key: "get_pty_status",
+        name: "get_pty_status",
+        source: "built_in",
+        category: "workspace_read",
+        risk: "read_only",
+        enabled: true,
+        autoExecutable: true,
+      },
+    },
+    policy: partitionPermissionPolicy,
+  };
+  const input = createReadFilePartitionInput({
+    toolCalls: [
+      { id: "start", name: "execute_command", arguments: JSON.stringify({ command: "npm run dev" }) },
+      { id: "pty-after", name: "get_pty_status", arguments: JSON.stringify({ session_id: "pty-1" }) },
+      { id: "grep-after", name: "grep_search", arguments: JSON.stringify({ query: "updated", path: "src" }) },
+    ],
+    availableToolNames: new Set(["execute_command", "get_pty_status", "grep_search"]),
+    toolCapabilityRegistry: registry,
+  });
+  input.callbacks = {
+    ...input.callbacks,
+    getAutoApproveToolScopes: () => ["shell"],
+  };
+
+  const result = await partitionToolCallsForExecution(input);
+  assert.deepEqual(result.writeCalls.map((call) => call.id), ["start"]);
+  assert.equal(result.readOnlyCalls.length, 0);
+  assert.deepEqual(result.preExecutionResults.map((entry) => entry.toolCallId), [
+    "pty-after",
+    "grep-after",
+  ]);
+  assert.ok(result.preExecutionResults.every((entry) =>
+    entry.qualityGateReason === "ordered_batch_call_deferred"
+  ));
+});
+
 test("an actual patch mismatch opens one context-read phase before mutation recovery", () => {
   const tools = ["read_file", "grep_search", "apply_patch", "run_command"].map((name) => ({
     type: "function",
@@ -699,6 +1225,113 @@ test("failed finite validation recovery exposes only run_command", () => {
   assert.match(prompt, /intentionally limited to `run_command`/);
   assert.match(prompt, /do not reread an already-modified source file/i);
   assert.match(prompt, /exitCode 0/);
+});
+
+test("failed finite validation recovery preserves explicit command evidence", () => {
+  const explicitPolicy = resolveFailedFiniteValidationRecoveryPolicy({
+    failedCommand: "npm test 2>&1",
+    tasks: [{ evidence: [{ kind: "cmd", value: "npm test" }] }],
+  });
+  assert.deepEqual(explicitPolicy, {
+    allowAlternativeCommand: false,
+    requiredCommand: "npm test",
+  });
+  const explicitPrompt = buildFailedFiniteValidationRecoveryPrompt({
+    command: "npm test 2>&1",
+    result: '{"exitCode":1,"stderr":"test failed"}',
+    ...explicitPolicy,
+  });
+  assert.match(explicitPrompt, /requires this exact command evidence: npm test/);
+  assert.match(explicitPrompt, /retry that same command/);
+  assert.match(explicitPrompt, /Do not substitute a different/);
+  assert.match(explicitPrompt, /keep `npm test` as the acceptance boundary/);
+  assert.doesNotMatch(explicitPrompt, /call one different finite validation command/);
+  assert.doesNotMatch(explicitPrompt, /Do not repeat the failed command unchanged/);
+
+  const placeholderPolicy = resolveFailedFiniteValidationRecoveryPolicy({
+    failedCommand: "npm run build",
+    tasks: [{ evidence: [{ kind: "cmd", value: "focused validation command" }] }],
+  });
+  assert.deepEqual(placeholderPolicy, {
+    allowAlternativeCommand: true,
+    requiredCommand: "",
+  });
+  const placeholderPrompt = buildFailedFiniteValidationRecoveryPrompt({
+    command: "npm run build",
+    result: '{"exitCode":1,"stderr":"missing script"}',
+    ...placeholderPolicy,
+  });
+  assert.match(placeholderPrompt, /generic finite-validation placeholder/);
+  assert.match(placeholderPrompt, /call one different finite validation command/);
+});
+
+test("failed finite validation recovery ignores runtime availability probes", () => {
+  assert.equal(shouldEnterFailedFiniteValidationRecovery("npm run build"), true);
+  assert.equal(shouldEnterFailedFiniteValidationRecovery("npx tsc --noEmit"), true);
+  assert.equal(
+    shouldEnterFailedFiniteValidationRecovery("lsof -i :5173 2>/dev/null | head -5"),
+    false,
+  );
+  assert.equal(
+    shouldEnterFailedFiniteValidationRecovery("curl -f http://localhost:5173"),
+    false,
+  );
+  assert.equal(hasPendingPlanCommandEvidence([{
+    evidence: [{ kind: "cmd", value: "focused validation command" }],
+  }]), true);
+  assert.equal(hasPendingPlanCommandEvidence([{
+    evidence: [{ kind: "browser_dom", value: "http://localhost:5173" }],
+  }]), false);
+});
+
+test("failed finite validation recovery distinguishes invocation errors from real validation failures", () => {
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: JSON.stringify({ exitCode: 127, stderr: "tool: command not found" }),
+  }), "invocation_error");
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: JSON.stringify({ exitCode: 1, stderr: "npm error Missing script: build" }),
+  }), "invocation_error");
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: JSON.stringify({ exitCode: 1, stderr: "TS2322: Type 'string' is not assignable to type 'number'" }),
+  }), "validation_failure");
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: JSON.stringify({ exitCode: 1, stderr: "TS2322: compile failed" }),
+    isToolError: true,
+    lifecycleState: "failed",
+  }), "validation_failure");
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: JSON.stringify({ exitCode: 1, stdout: "1 test failed" }),
+  }), "validation_failure");
+  assert.equal(classifyFailedFiniteValidationOutcome({
+    result: JSON.stringify({ exitCode: -1, timedOut: true, stderr: "" }),
+  }), "validation_failure");
+
+  const explicitTasks = [{ evidence: [{ kind: "cmd", value: "npm test" }] }];
+  assert.equal(failedFiniteValidationMatchesPendingPlanEvidence({
+    failedCommand: "npm test -- --runInBand",
+    tasks: explicitTasks,
+  }), true);
+  assert.equal(failedFiniteValidationMatchesPendingPlanEvidence({
+    failedCommand: "npm run build",
+    tasks: explicitTasks,
+  }), false);
+  assert.equal(failedFiniteValidationMatchesPendingPlanEvidence({
+    failedCommand: "npm run build",
+    tasks: [{ evidence: [{ kind: "cmd", value: "focused validation command" }] }],
+  }), true);
+
+  const compacted = compactStructuredCommandResult(JSON.stringify({
+    command: "npm run build",
+    stdout: "x".repeat(20_000),
+    stderr: "TS2322: compile failed\n" + "y".repeat(20_000),
+    exitCode: 1,
+    timedOut: false,
+    durationMs: 10,
+    success: false,
+  }), 2_000);
+  assert.ok(compacted.length <= 2_000);
+  assert.equal(JSON.parse(compacted).exitCode, 1);
+  assert.equal(classifyFailedFiniteValidationOutcome({ result: compacted }), "validation_failure");
 });
 
 test("third consecutive edit to one target forces validation before another write", () => {
@@ -991,6 +1624,20 @@ test("recovery batch selection serializes different model call shapes by phase",
   assert.equal(validation.selectedCallId, "validate-first");
   assert.equal(validation.deferredCallIds.includes("edit"), true);
 
+  const finiteValidation = resolveExecuteRecoveryBatchDecision({
+    mode: "finite_validation_only",
+    calls: [
+      { id: "probe", name: "run_command", target: "lsof -i :5173" },
+      { id: "finite", name: "run_command", target: "npm test" },
+    ],
+  });
+  assert.equal(
+    finiteValidation.selectedCallId,
+    "finite",
+    "finite recovery must not spend its serialized transaction on an availability probe",
+  );
+  assert.deepEqual(finiteValidation.deferredCallIds, ["probe"]);
+
   const toolCallPartitioningSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
     "utf8",
@@ -1061,6 +1708,38 @@ test("local cached-read loop recovers before no-progress pause boundary", () => 
   assert.equal(decision.shouldRecover, true);
   assert.equal(decision.reason, "read_only_no_progress");
   assert.deepEqual(summarizeRepeatedExecuteTargets(recent), ["src-tauri/src/main.rs"]);
+});
+
+test("no-progress markers are recognized only as runtime-owned result prefixes", () => {
+  assert.equal(isReadOnlyNoProgressDetail("FILE_UNCHANGED_STUB: src/App.tsx"), true);
+  assert.equal(isReadOnlyNoProgressDetail("CACHED_FILE_REPLAY: src/App.tsx"), true);
+  assert.equal(isReadOnlyNoProgressDetail("READ_FILE_REPEAT_LIMIT: duplicate"), true);
+  assert.equal(isReadOnlyNoProgressDetail("READ_FILE_WINDOW_NARROWED: returned missing lines"), false);
+  assert.equal(isReadOnlyNoProgressDetail([
+    "READ_FILE_RESULT",
+    "path: src/lib/orchestrator/fileReadCache.ts",
+    "const marker = 'FILE_UNCHANGED_STUB';",
+  ].join("\n")), false);
+
+  const decision = resolveReadOnlyNoProgressTrigger({
+    results: [{
+      name: "read_file",
+      target: "src/lib/orchestrator/fileReadCache.ts",
+      content: "READ_FILE_RESULT\nconst marker = 'FILE_UNCHANGED_STUB';",
+      isError: false,
+    }],
+    recentActivity: Array.from({ length: 8 }, () => ({
+      name: "read_file",
+      status: "succeeded",
+      target: "src/lib/orchestrator/fileReadCache.ts",
+      detail: "FILE_UNCHANGED_STUB: previous duplicate",
+    })),
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    minCachedReadOnlyActivities: 1,
+    minRepeatedReadOnlyTargetScore: 1,
+  });
+  assert.equal(decision.shouldRecover, false, "fresh source wins over earlier cached reads");
 });
 
 test("chat read-only no-progress is eligible for final synthesis before max iterations", () => {
@@ -1459,7 +2138,7 @@ test("execute recovery detects cached reads across changing batch signatures", (
   assert.equal(decision.cachedReadOnlyActivityCount, 3);
 });
 
-test("execute recovery treats covered-window reads on the same target as no progress", () => {
+test("execute recovery does not mistake a narrowed fresh window for no progress", () => {
   const recent = [
     { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "READ_FILE_RESULT lines 1-120" },
     { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "READ_FILE_WINDOW_NARROWED: overlapping unchanged lines already in context" },
@@ -1477,9 +2156,39 @@ test("execute recovery treats covered-window reads on the same target as no prog
     minRepeatedReadOnlyTargetScore: 6,
   });
 
-  assert.equal(decision.shouldRecover, true);
-  assert.equal(decision.reason, "target_repeated_read_only");
-  assert.equal(decision.repeatedReadOnlyTargetScore >= 6, true);
+  assert.equal(decision.shouldRecover, false);
+  assert.equal(decision.reason, "");
+  assert.equal(decision.repeatedReadOnlyTargetScore, 1);
+});
+
+test("execute recovery allows many distinct windows even past count and character thresholds", () => {
+  const recent = Array.from({ length: 8 }, (_value, index) => ({
+    name: "read_file",
+    status: "succeeded",
+    target: "src/main.js",
+    detail: `READ_FILE_RESULT lines ${index * 100 + 1}-${(index + 1) * 100}`,
+  }));
+  const decision = resolveExecuteReadOnlyRecoveryTrigger({
+    results: [{
+      name: "read_file",
+      target: "src/main.js",
+      content: `READ_FILE_RESULT lines 701-800\n${"source\n".repeat(6_000)}`,
+      isError: false,
+    }],
+    recentActivity: recent,
+    readOnlyTools,
+    sawExecuteOperationEvidence: false,
+    noProgressBatchRepeatCount: 4,
+    minReadOnlyActivities: 2,
+    maxReadOnlyToolChars: 100,
+    minRepeatedReadOnlyTargetScore: 1,
+    minCachedReadOnlyActivities: 1,
+  });
+
+  assert.equal(decision.readOnlyActivityCount, 8);
+  assert.equal(decision.batchToolChars > 100, true);
+  assert.equal(decision.repeatedReadOnlyTargetScore, 0);
+  assert.equal(decision.shouldRecover, false);
 });
 
 test("targeting search recovery opens read_file path to see context", () => {

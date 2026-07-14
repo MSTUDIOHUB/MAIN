@@ -5,10 +5,7 @@ import {
   hasOnlyReadOnlyPermissionReplyOptions,
   shouldPauseForReplyOptions,
 } from "../../replyOptions";
-import {
-  isPlanRuntimeFinalizationPhase,
-  resolvePlanSuppressedToolRecovery,
-} from "../../planRuntime";
+import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import type { LegacyWorkflowMode } from "../../runIntent";
 import type { PlanRuntimePhase, ReplyOption } from "../../workflowModels";
 
@@ -104,18 +101,14 @@ export function resolveClosedPlanReadOnlyContinuation(input: {
   ) {
     return { action: "none" };
   }
-  const recovery = resolvePlanSuppressedToolRecovery({
-    workflowMode: input.workflowMode,
-    isPlanApproved: input.isPlanApproved,
-    // The runtime intentionally closed this finalization phase only after it
-    // had frozen a usable evidence bundle.  A model request here gets one
-    // bounded re-open, not the broader insufficient-evidence retry budget.
-    evidenceReadiness: "ready_for_plan",
-    targetedRecoveryPasses: input.targetedRecoveryPasses,
-  });
-  return recovery.action === "targeted_evidence"
-    ? { action: "targeted_evidence", reason: recovery.reason }
-    : { action: "defer", reason: recovery.reason };
+  // This is a request to perform a read, not a completed recovery pass. Do not
+  // reject a later request merely because another range/file was read before.
+  // Exact unchanged-window loops are classified from the eventual tool result
+  // and bounded by the no-progress guard.
+  return {
+    action: "targeted_evidence",
+    reason: "suppressed_tool_ready_evidence_missing_visible_plan",
+  };
 }
 
 export function resolveAssistantReplyOptionRouting(input: {

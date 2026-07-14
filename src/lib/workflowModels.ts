@@ -960,6 +960,10 @@ function commandLooksLikePlaywrightOrBrowserTest(value: string): boolean {
 
 const FOCUSED_VALIDATION_COMMAND = "focused validation command";
 
+export function isFlexiblePlanValidationCommandEvidence(value: string): boolean {
+  return normalizeCommandEvidenceValue(value) === FOCUSED_VALIDATION_COMMAND;
+}
+
 // `execute_command` writes into the shared PTY and only reports the first
 // chunk of output.  A successful dispatch is not enough to prove that a
 // server or desktop runtime actually came up: the next PTY observation is
@@ -1024,13 +1028,62 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
   );
 }
 
+export function planCommandEvidenceMatchesExecution(
+  expectedCommand: string,
+  actualCommand: string,
+): boolean {
+  return commandEvidenceMatches(expectedCommand, actualCommand);
+}
+
+function latestRunCommandOutcomesForEvidence(
+  evidence: PlanTaskEvidence,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): PlanExecutionEvidenceEntry[] {
+  const matching = evidenceLedger.filter((record) =>
+    record.sourceTool === "run_command" && evidenceMatchesRecord(evidence, record)
+  );
+  if (!isFlexiblePlanValidationCommandEvidence(evidence.value)) {
+    return matching.length > 0 ? [matching[matching.length - 1]] : [];
+  }
+
+  // A focused placeholder accepts any finite command, but each concrete
+  // command keeps its own latest outcome. A passing lint command therefore
+  // cannot erase an unresolved build/test/typecheck failure; rerunning that
+  // failed command successfully replaces only its own negative outcome.
+  const latestByCommand = new Map<string, PlanExecutionEvidenceEntry>();
+  for (const record of matching) {
+    const key = normalizeCommandEvidenceValue(record.value || record.target || "");
+    if (key) latestByCommand.set(key, record);
+  }
+  return Array.from(latestByCommand.values());
+}
+
+function latestFailedFiniteCommandForEvidence(
+  evidence: PlanTaskEvidence,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): PlanExecutionEvidenceEntry | null {
+  return latestRunCommandOutcomesForEvidence(evidence, evidenceLedger)
+    .find((record) => record.observationStatus === "failed") || null;
+}
+
 function commandEvidenceSatisfiedByLedger(
   evidence: PlanTaskEvidence,
   evidenceLedger: PlanExecutionEvidenceEntry[],
 ): boolean {
   const matchingCommands = evidenceLedger.filter((record) => evidenceMatchesRecord(evidence, record));
   if (matchingCommands.length === 0) return false;
-  if (!requiresPtyObservationForPlanCommand(evidence.value)) return true;
+  if (!requiresPtyObservationForPlanCommand(evidence.value)) {
+    const latestRunCommandOutcomes = latestRunCommandOutcomesForEvidence(
+      evidence,
+      evidenceLedger,
+    );
+    if (latestRunCommandOutcomes.some((record) => record.observationStatus === "failed")) {
+      return false;
+    }
+    return matchingCommands.some((record) =>
+      record.sourceTool !== "run_command" || record.observationStatus !== "failed"
+    );
+  }
 
   // Only the newest dispatch owns readiness. An older successful launch must
   // not complete a later restart that is still waiting or has already failed.
@@ -1498,13 +1551,20 @@ function resolvePlanTaskEvidenceStatus(
   const failedPtyObservation = evidence.find((item) =>
     item.kind === "cmd" && latestFailedPtyObservationForCommand(item, evidenceLedger)
   );
+  const failedFiniteValidation = evidence.find((item) =>
+    item.kind === "cmd" && latestFailedFiniteCommandForEvidence(item, evidenceLedger)
+  );
 
   return {
-    status: failedPtyObservation ? "blocked" : matched > 0 ? "partial" : "missing",
+    status: failedPtyObservation || failedFiniteValidation
+      ? "blocked"
+      : matched > 0 ? "partial" : "missing",
     matched,
     total: evidence.length,
     blockedReason: failedPtyObservation
       ? "长驻启动命令的最新 PTY 观察显示启动失败或已经停止；必须修复或重新启动后再验证"
+      : failedFiniteValidation
+      ? "有限验证命令已真实执行但失败；必须修复诊断中的源码、测试或配置问题，并重新运行同一命令成功"
       : awaitingPtyObservation
       ? "长驻启动命令已发送，但尚未通过 PTY 的 read_pty_since、read_pty_tail 或 get_pty_status 检查启动输出"
       : matched > 0
@@ -1807,6 +1867,10 @@ const RUNTIME_TASK_VALIDATION_SECTION_RE =
   /^(?:\d+\s*[.)、:：-]?\s*)?(?:验证(?:方式|方案|标准|步骤|结果)?|测试(?:方式|方案|标准|步骤|结果)?|验收(?:方式|方案|标准|步骤|结果)?|Validation(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Verification(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Testing(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Acceptance(?:\s+(?:Criteria|Tests?|Steps|Results))?)\s*$/i;
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
   /(?:用户目标|目标|摘要|概要|当前状态|状态发现|已确认发现|已确认事实|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|证据|已读证据|最相关证据|假设|默认值|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|User Goals?|Goals?|Summary|Overview|Current State|Confirmed Findings|Findings|Background|Root Cause|Tech Stack|Architecture|Evidence|Read Evidence|Most Relevant Evidence|Assumptions|Defaults|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
+const RUNTIME_TASK_DIAGNOSTIC_SECTION_RE =
+  /^(?:\d+\s*[.)、:：-]?\s*)?(?:问题诊断|诊断(?:结果|结论|分析)?|Problem\s+Diagnosis|Diagnosis|Diagnostic\s+(?:Findings|Results|Analysis))\s*$/i;
+const RUNTIME_TASK_SCOPE_SECTION_RE =
+  /^(?:\d+\s*[.)、:：-]?\s*)?(?:影响范围|变更范围|Impact\s+Scope|Change\s+Scope|Affected\s+Scope)\s*$/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
   /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO)/i;
 const RUNTIME_TASK_CHANGE_HEADING_RE =
@@ -1815,6 +1879,13 @@ const RUNTIME_TASK_CHANGE_DETAIL_RE =
   /^(?:改动(?:内容)?|变更(?:内容)?|changes?|implementation(?: details)?)\s*[：:]\s*(.+)$/i;
 const RUNTIME_TASK_FILE_TABLE_SECTION_RE =
   /(?:关键(?:实现)?改动|实现改动|改动\s*\d+|影响文件|涉及文件|文件变更|变更文件|key changes?|implementation changes?|affected files?|files? to change|file changes?|^files?$)/i;
+
+function isRuntimeTaskExcludedSectionHeading(heading: string): boolean {
+  const normalized = String(heading || "").replace(/\*\*/g, "").trim();
+  return RUNTIME_TASK_EXCLUDED_SECTION_RE.test(normalized) ||
+    RUNTIME_TASK_DIAGNOSTIC_SECTION_RE.test(normalized) ||
+    RUNTIME_TASK_SCOPE_SECTION_RE.test(normalized);
+}
 
 function stripMarkdownTaskLine(line: string): string {
   return String(line || "")
@@ -1885,7 +1956,7 @@ export function collectRuntimeTaskCandidateLines(content: string): string[] {
     const heading = line.match(/^\s*#{1,4}\s+(.+)$/);
     if (heading) {
       const headingText = heading[1] || "";
-      inExcludedSection = RUNTIME_TASK_EXCLUDED_SECTION_RE.test(headingText);
+      inExcludedSection = isRuntimeTaskExcludedSectionHeading(headingText);
       inValidationSection =
         !inExcludedSection &&
         RUNTIME_TASK_VALIDATION_SECTION_RE.test(headingText.replace(/\*\*/g, "").trim());
@@ -1932,7 +2003,7 @@ function stripRuntimeExcludedSections(content: string): string {
   for (const line of lines) {
     const heading = line.match(/^\s*#{1,4}\s+(.+)$/);
     if (heading) {
-      inExcludedSection = RUNTIME_TASK_EXCLUDED_SECTION_RE.test(heading[1] || "");
+      inExcludedSection = isRuntimeTaskExcludedSectionHeading(heading[1] || "");
       if (!inExcludedSection) kept.push(line);
       continue;
     }
@@ -2113,6 +2184,12 @@ function collectRuntimeTaskProseSectionTasks(
   let inCodeFence = false;
   let pendingFiles: string[] = [];
 
+  const ensureMutationFiles = (files: string[]) => {
+    for (const filePath of files) {
+      if (!descriptionsByFile.has(filePath)) descriptionsByFile.set(filePath, []);
+    }
+  };
+
   const remember = (files: string[], description: string) => {
     const clean = stripMarkdownTaskLine(description).replace(/^[\s:：—–-]+/, "").trim();
     // Validation labels such as “集成验证” / “integration validation” contain
@@ -2154,7 +2231,7 @@ function collectRuntimeTaskProseSectionTasks(
       }
       inActionableSection =
         RUNTIME_TASK_SECTION_RE.test(headingText) &&
-        !RUNTIME_TASK_EXCLUDED_SECTION_RE.test(headingText);
+        !isRuntimeTaskExcludedSectionHeading(headingText);
       inValidationSection =
         inActionableSection &&
         RUNTIME_TASK_VALIDATION_SECTION_RE.test(headingText);
@@ -2169,6 +2246,11 @@ function collectRuntimeTaskProseSectionTasks(
     const directFiles = extractWorkspaceFileReferencesFromText(normalized);
     const isFileLabel = /^(?:文件|目标文件|修改文件|file|target file|file to change)\s*[:：]/i.test(normalized);
     if (isFileLabel && directFiles.length > 0) {
+      // An explicit file-to-change label inside an actionable implementation
+      // section is itself a reviewed mutation boundary. Do not discard it just
+      // because the following prose uses a domain verb outside the generic
+      // mutation vocabulary (for example “assign creator to creatorName”).
+      ensureMutationFiles(directFiles);
       pendingFiles = directFiles;
       continue;
     }

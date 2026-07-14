@@ -22,6 +22,7 @@ import type { TurnInputContextSignals } from "../../turnIntake";
 import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
+import type { PlanEvidenceRecoveryObjective } from "./planRuntimeState";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -41,6 +42,7 @@ export type ReasoningDominatedNoToolRecoveryResult = {
   status: "none" | "continue" | "stopped";
   consecutiveReasoningDominatedCount: number;
   planReasoningOnlyRecoveryPasses: number;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   approvedPlanActionOnlyRecoveryActive: boolean;
 };
 
@@ -59,6 +61,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   lastAssistantTextForCheckpoint: string | null;
   planEvidenceRecoveryPasses: number;
   planReasoningOnlyRecoveryPasses: number;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   consecutiveReasoningDominatedCount: number;
   approvedPlanActionOnlyRecoveryActive: boolean;
   setPlanRuntimePhase: SetPlanRuntimePhase;
@@ -83,6 +86,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   } = input;
 
   let planReasoningOnlyRecoveryPasses = input.planReasoningOnlyRecoveryPasses;
+  let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
   let consecutiveReasoningDominatedCount = input.consecutiveReasoningDominatedCount;
   let approvedPlanActionOnlyRecoveryActive = input.approvedPlanActionOnlyRecoveryActive;
 
@@ -92,6 +96,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
     status,
     consecutiveReasoningDominatedCount,
     planReasoningOnlyRecoveryPasses,
+    planEvidenceRecoveryObjective,
     approvedPlanActionOnlyRecoveryActive,
   });
 
@@ -141,6 +146,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
     if (recoveryDecision.action === "targeted_evidence") {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       planReasoningOnlyRecoveryPasses += 1;
+      planEvidenceRecoveryObjective = "model_draft";
       setPlanRuntimePhase("needs_evidence", readiness.reason);
       callbacks.onStatusChange("running");
       callbacks.appendMessage({
@@ -155,6 +161,7 @@ export function handleReasoningDominatedNoToolRecovery(input: {
 
     if (recoveryDecision.action === "pause_blocked") {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+      planEvidenceRecoveryObjective = "none";
       setPlanRuntimePhase("blocked", readiness.reason, "failed");
       callbacks.onNonActionableStop(
         buildPlanEvidenceBlockedPauseMessage({

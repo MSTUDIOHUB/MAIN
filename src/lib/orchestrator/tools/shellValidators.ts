@@ -135,8 +135,8 @@ export function buildShellReadValidationError(
   if (isShellRead) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
-      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 直接读取文件内容以防止上下文过载。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline 或基于已有缓存直接 patch/验证/最终说明，不要改用 cat/sed/head/tail 绕行。`
-      : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled to prevent context overload. Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline or proceed from cached context to patching, validation, or the final answer instead of cat/sed/head/tail.`;
+      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 绕过文件读取工具。原因不是终端本身占用上下文，而是 cat/sed/head/tail 的原始输出绕过 read_file 的分页、文件版本、读取范围缓存和修改后失效语义，可能把旧内容或相同窗口误当成新证据。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline，或基于已有证据继续 patch、验证或说明精确阻塞。`
+      : `SHELL_READ_FORBIDDEN: Do not bypass the file-reading tools with terminal command (${command}). The issue is not terminal context use: raw cat/sed/head/tail output bypasses read_file paging, file-version checks, range caching, and post-mutation invalidation, so stale or duplicate content can be mistaken for fresh evidence. Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline, continue from existing evidence, or state the exact blocker.`;
     const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
     emitToolPreflightBlocked(callbacks, {

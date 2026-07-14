@@ -166,7 +166,7 @@ test("non-blocking plan choice auto-continuation forces finalization at its retr
   });
 });
 
-test("closed drafting surface reopens bounded targeted evidence for a read-only continuation request", () => {
+test("closed drafting surface reopens targeted evidence without a raw read-count cap", () => {
   const first = resolveClosedPlanReadOnlyContinuation({
     suppressPlanContinuationReplyOptions: true,
     replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
@@ -182,7 +182,7 @@ test("closed drafting surface reopens bounded targeted evidence for a read-only 
     reason: "suppressed_tool_ready_evidence_missing_visible_plan",
   });
 
-  const exhausted = resolveClosedPlanReadOnlyContinuation({
+  const laterDistinctRead = resolveClosedPlanReadOnlyContinuation({
     suppressPlanContinuationReplyOptions: true,
     replyOptions: [{ label: "继续读取配置", value: "继续读取配置", action: "continue_readonly_once" }],
     toolCallCount: 0,
@@ -192,9 +192,9 @@ test("closed drafting surface reopens bounded targeted evidence for a read-only 
     planRuntimePhase: "drafting",
     targetedRecoveryPasses: 1,
   });
-  assert.deepEqual(exhausted, {
-    action: "defer",
-    reason: "suppressed_tool_ready_evidence_missing_visible_plan_after_recovery",
+  assert.deepEqual(laterDistinctRead, {
+    action: "targeted_evidence",
+    reason: "suppressed_tool_ready_evidence_missing_visible_plan",
   });
 
   const modelOwnedGroundingChoice = resolveClosedPlanReadOnlyContinuation({

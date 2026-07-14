@@ -51,6 +51,24 @@ export interface ReadFileWindowPayload {
   nextStartLine?: number | null;
 }
 
+export interface OptionalLargeFileSummary {
+  content: string;
+  summarized: boolean;
+}
+
+/**
+ * A failed or unnecessary Map-Reduce attempt must not erase the bounded
+ * READ_FILE_RESULT envelope. That envelope is the model's paging contract:
+ * it carries the versioned window and nextStartLine needed to request new
+ * source instead of blindly repeating the same full-file read.
+ */
+export function resolveReadFileResultAfterLargeFileSummary(
+  originalResult: string,
+  summary: OptionalLargeFileSummary,
+): string {
+  return summary.summarized ? summary.content : originalResult;
+}
+
 function parsePositiveInteger(value: unknown): number | undefined {
   if (typeof value === "number" && Number.isFinite(value)) {
     const rounded = Math.floor(value);

@@ -21,6 +21,7 @@ import type { ResolvedUserIntent } from "../../runIntent";
 import { getTaskTargetingEvidenceKey, type TaskOrchestratorPhase } from "../../taskTargeting";
 import { isPlanTaskTrustedComplete, type PlanRuntimePhase } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
+import type { PlanEvidenceRecoveryObjective } from "./planRuntimeState";
 import {
   extractDelegatedSubagentActivities,
   isVerificationEvidenceResult,
@@ -47,6 +48,7 @@ type RecentSuccessfulProjectWrite = { name: string; target: string } | null;
 
 export type ToolResultPostProcessingResult = {
   planRuntimePhase: PlanRuntimePhase;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   recentSuccessfulProjectWrite: RecentSuccessfulProjectWrite;
   recoveringFromEmptyAssistantReplyAfterWrite: boolean;
   unityConsoleFinalVerificationRequired: boolean;
@@ -76,6 +78,7 @@ export function handleToolResultPostProcessing(input: {
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
   planRuntimePhase: PlanRuntimePhase;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planDraftingRecoveryReadCount: number;
   hasPlanDecisionOutput: boolean;
   unityConsoleDiagnosticsRequested: boolean;
@@ -280,8 +283,11 @@ export function handleToolResultPostProcessing(input: {
     const bundle = closureInput.evidenceBundle;
     const closureAssessment = assessPlanClosureEvidence(bundle);
     const modelAuthoredDraftReady = isPlanEvidenceBundleReady(bundle);
+    const deterministicClosureRecoveryActive =
+      String(planRuntimePhase) === "needs_evidence" &&
+      input.planEvidenceRecoveryObjective !== "model_draft";
     const shouldAdvanceToDrafting = closureAssessment.ready || (
-      modelAuthoredDraftReady && String(planRuntimePhase) !== "needs_evidence"
+      modelAuthoredDraftReady && !deterministicClosureRecoveryActive
     );
     if (shouldAdvanceToDrafting) {
       setPlanRuntimePhase(
@@ -299,6 +305,7 @@ export function handleToolResultPostProcessing(input: {
         closureReady: closureAssessment.ready,
         modelAuthoredDraftReady,
         deterministicMaterializationReady: closureAssessment.ready,
+        evidenceRecoveryObjective: input.planEvidenceRecoveryObjective,
         closureReason: closureAssessment.reason,
         objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
         defectSignalMatches: closureAssessment.defectSignalMatches,
@@ -321,6 +328,7 @@ export function handleToolResultPostProcessing(input: {
         closureReady: false,
         modelAuthoredDraftReady,
         deterministicMaterializationReady: false,
+        evidenceRecoveryObjective: input.planEvidenceRecoveryObjective,
         closureReason: closureAssessment.reason,
         objectiveTargetMatches: closureAssessment.objectiveTargetMatches,
         defectSignalMatches: closureAssessment.defectSignalMatches,
@@ -435,6 +443,7 @@ export function handleToolResultPostProcessing(input: {
   }
   return {
     planRuntimePhase: effectivePlanRuntimePhase,
+    planEvidenceRecoveryObjective: input.planEvidenceRecoveryObjective,
     recentSuccessfulProjectWrite,
     recoveringFromEmptyAssistantReplyAfterWrite,
     unityConsoleFinalVerificationRequired,

@@ -76,6 +76,7 @@ function createFixtureState() {
     planLastMissingSections: ["risks"],
     planFacetMappingSource: "# Prior candidate",
     planArtifactQualityRejected: false,
+    planEvidenceRecoveryObjective: "none",
     planEvidenceRecoveryPasses: 1,
     planEvidenceNoProgressPasses: 2,
     planReasoningOnlyRecoveryPasses: 3,
@@ -106,6 +107,10 @@ test("plan loop runtime state starts in the correct phase for each workflow", ()
     workflowMode: "plan",
     isPlanApproved: false,
   }).planFacetMappingSource, "");
+  assert.equal(createPlanLoopRuntimeState({
+    workflowMode: "plan",
+    isPlanApproved: false,
+  }).planEvidenceRecoveryObjective, "none");
 
   assert.equal(createPlanLoopRuntimeState({
     workflowMode: "plan",

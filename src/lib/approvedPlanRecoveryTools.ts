@@ -1,4 +1,5 @@
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
 
 export interface ApprovedPlanRecoveryActivityLike {
   name?: string;
@@ -66,11 +67,9 @@ export function isPatchMismatchRecoveryActivity(activity: ApprovedPlanRecoveryAc
 }
 
 function isCachedReadOnlyResult(result: ApprovedPlanToolResultLike): boolean {
-  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test([
-    result.detail,
-    result.displayContent,
-    result.content,
-  ].map((value) => String(value || "")).join("\n"));
+  return isReadOnlyNoProgressDetail(
+    result.detail || result.displayContent || result.content || "",
+  );
 }
 
 export function isApprovedPlanCachedReadOnlyNoProgressBatch(input: {

@@ -31,6 +31,7 @@ const {
   extractReadFileWindowMetadata,
   formatReadFileWindowForModel,
   planReadFileWindowCoverage,
+  resolveReadFileResultAfterLargeFileSummary,
 } = await loadReadFileWindowModule();
 
 function numberedLines(count, suffix = "") {
@@ -85,6 +86,26 @@ test("duplicate truncated read guidance points to the next read_file window", ()
   assert.match(guidance, /bounded window, not the whole file/);
   assert.match(guidance, /Do not use run_command/);
   assert.doesNotMatch(guidance, /full content already in context/i);
+});
+
+test("an unnecessary large-file summary preserves the bounded paging envelope", () => {
+  const content = numberedLines(500, "x".repeat(80));
+  const original = formatReadFileWindowForModel("src/main.js", content);
+  const metadata = extractReadFileWindowMetadata(original);
+
+  const preserved = resolveReadFileResultAfterLargeFileSummary(original, {
+    content,
+    summarized: false,
+  });
+  const summarized = resolveReadFileResultAfterLargeFileSummary(original, {
+    content: "[FILE MAP-REDUCE SUMMARY]\nmain.js application flow",
+    summarized: true,
+  });
+
+  assert.equal(preserved, original);
+  assert.ok(metadata?.nextStartLine);
+  assert.match(preserved, new RegExp(`nextStartLine: ${metadata.nextStartLine}`));
+  assert.equal(summarized, "[FILE MAP-REDUCE SUMMARY]\nmain.js application flow");
 });
 
 test("read_file coverage planner narrows overlapping windows to missing lines", () => {

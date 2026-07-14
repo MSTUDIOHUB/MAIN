@@ -3,6 +3,7 @@ import {
   extractReadFileWindowMetadata,
   type planReadFileWindowCoverage,
 } from "../readFileWindow";
+import { workspacePathsReferToSameFile } from "../workspacePaths";
 
 export interface FileReadState {
   signature: string;
@@ -40,6 +41,84 @@ export function pruneFileReadStates(states: Map<string, FileReadState>): void {
     .slice(0, states.size - MAX_FILE_READ_STATES_PER_SESSION)
     .map(([key]) => key);
   staleKeys.forEach((key) => states.delete(key));
+}
+
+function collectMutationTargets(
+  toolName: string,
+  args: Record<string, unknown>,
+  fallbackTarget: string,
+): string[] {
+  if (toolName !== "apply_patch") {
+    return [String(args.path || fallbackTarget || "").trim()].filter(Boolean);
+  }
+
+  const patch = String(args.patch || "");
+  const targets: string[] = [];
+  for (const match of patch.matchAll(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/gmi)) {
+    if (match[1]) targets.push(match[1].trim());
+  }
+  for (const match of patch.matchAll(/^\+\+\+\s+(?:b\/)?([^\s]+)$/gmi)) {
+    if (match[1] && match[1] !== "/dev/null") targets.push(match[1].trim());
+  }
+  return [...new Set(targets.length > 0 ? targets : [fallbackTarget].filter(Boolean))];
+}
+
+/**
+ * A successful workspace action starts a new observation epoch. Invalidate
+ * every cached range for changed files and every args-only workspace
+ * observation (grep/outline/AST/repo-map/git-diff), so post-action validation
+ * cannot replay old evidence even when size and mtime happen to match. Shell
+ * commands are opaque and may run formatters/codegen, so they invalidate all
+ * file windows conservatively.
+ */
+export function invalidateWorkspaceReadCachesAfterMutation(input: {
+  toolName: string;
+  args: Record<string, unknown>;
+  target?: string;
+  fileReadStates: Map<string, FileReadState>;
+  readOnlyResultCache?: Map<string, unknown>;
+  readOnlyDuplicateSkipCounts?: Map<string, number>;
+}): { invalidatedFileReadSignatures: string[]; invalidatedReadOnlyEntries: number } {
+  const targets = collectMutationTargets(
+    input.toolName,
+    input.args,
+    String(input.target || ""),
+  );
+  const invalidateAllFileReads =
+    input.toolName === "run_command" ||
+    input.toolName === "execute_command" ||
+    input.toolName === "send_pty_input";
+  const invalidatedFileReadSignatures: string[] = [];
+  for (const [signature, state] of input.fileReadStates.entries()) {
+    if (
+      !invalidateAllFileReads &&
+      !targets.some((target) => workspacePathsReferToSameFile(state.path, target))
+    ) continue;
+    input.fileReadStates.delete(signature);
+    input.readOnlyDuplicateSkipCounts?.delete(signature);
+    invalidatedFileReadSignatures.push(signature);
+  }
+
+  const invalidatedReadOnlyEntries = input.readOnlyResultCache?.size || 0;
+  input.readOnlyResultCache?.clear();
+  return { invalidatedFileReadSignatures, invalidatedReadOnlyEntries };
+}
+
+/** Remove all older metadata epochs for a path before planning window coverage. */
+export function invalidateStaleFileReadStatesForPath(input: {
+  states: Map<string, FileReadState>;
+  path: string;
+  sizeBytes: number;
+  modifiedMs: number;
+}): string[] {
+  const invalidated: string[] = [];
+  for (const [signature, state] of input.states.entries()) {
+    if (!workspacePathsReferToSameFile(state.path, input.path)) continue;
+    if (state.sizeBytes === input.sizeBytes && state.modifiedMs === input.modifiedMs) continue;
+    input.states.delete(signature);
+    invalidated.push(signature);
+  }
+  return invalidated;
 }
 
 export function isOptionalTasksMdRead(toolName: string, target: string): boolean {
@@ -178,7 +257,13 @@ export function getReadFileCoverageForPath(input: {
         startLine: windowMetadata.returnedStartLine,
         endLine: windowMetadata.returnedEndLine,
       });
-    } else if (!fullFileState) {
+    } else if (
+      !fullFileState &&
+      !/^\s*\[FILE MAP-REDUCE SUMMARY\]/i.test(state.modelContent)
+    ) {
+      // A semantic summary is useful evidence, but it is not proof that every
+      // exact line range is present in context. Keep later targeted windows
+      // readable.
       fullFileState = state;
     }
   }

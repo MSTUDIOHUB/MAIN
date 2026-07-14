@@ -756,7 +756,7 @@ test("plan evidence ignores plan-file writes and identical write_file no-ops", (
   assert.equal(reconciled[0].evidenceStatus, "missing");
 });
 
-test("plan evidence records successful commands and deduplicates repeated records", () => {
+test("plan evidence records ordered finite command outcomes", () => {
   const failedCommand = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
     target: "python3 -m py_compile snake.py",
@@ -772,9 +772,45 @@ test("plan evidence records successful commands and deduplicates repeated record
 
   assert.equal(isPlanExecutionEvidenceTool("read_file", "snake.py"), false);
   assert.equal(isPlanExecutionEvidenceTool("write_file", ".MAIN/plans/tasks.md"), false);
-  assert.equal(failedCommand, null);
+  assert.equal(failedCommand?.observationStatus, "failed");
   assert.equal(firstLedger.length, 1);
-  assert.equal(secondLedger, firstLedger);
+  assert.equal(secondLedger.length, 2);
+});
+
+test("focused validation evidence cannot hide an unresolved command failure behind an unrelated pass", () => {
+  const failedBuild = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm run build",
+    result: JSON.stringify({ exitCode: 1, stderr: "TS2322: invalid assignment" }),
+  });
+  const passedLint = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm run lint",
+    result: JSON.stringify({ exitCode: 0, stdout: "ok" }),
+  });
+  const passedBuild = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm run build",
+    result: JSON.stringify({ exitCode: 0, stdout: "built" }),
+  });
+  const task = {
+    id: "focused-validation",
+    text: "Run focused validation",
+    status: "pending",
+    evidence: [{ kind: "cmd", value: "focused validation command" }],
+  };
+  const unresolvedLedger = appendPlanEvidenceEntry(
+    appendPlanEvidenceEntry([], failedBuild),
+    passedLint,
+  );
+  const unresolved = reconcilePlanTaskCompletion([], [task], unresolvedLedger);
+  assert.equal(unresolved[0].evidenceStatus, "blocked");
+  assert.match(unresolved[0].blockedReason || "", /同一命令成功/);
+
+  const repairedLedger = appendPlanEvidenceEntry(unresolvedLedger, passedBuild);
+  const repaired = reconcilePlanTaskCompletion([], [task], repairedLedger);
+  assert.equal(repaired[0].evidenceStatus, "satisfied");
+  assert.equal(repaired[0].status, "completed");
 });
 
 test("plan verification reads only satisfy explicit tool evidence", () => {
@@ -1137,6 +1173,120 @@ test("runtime task derivation keeps browser evidence for real UI validation task
   assert.equal(storeTask?.evidence?.[0]?.value, "src/store/dashboardStore.ts");
   assert.equal(syncTask?.evidence?.[0]?.kind, "browser_dom");
   assert.equal(visualTask?.evidence?.[0]?.kind, "browser_dom");
+});
+
+test("runtime task derivation keeps diagnosis and impact facts out of the approved mutation scope", () => {
+  const plan = [
+    "# Proposed Plan",
+    "",
+    "## 目标",
+    "修复 `src/hooks/useCsvParser.ts` 中的 `normalizeCsvOrder`，使 CSV `creator` 正确映射到 Dashboard 使用的 `creatorName`。",
+    "",
+    "## 问题诊断",
+    "1. **CSV 文件结构**：表头为 `creator,amount`。",
+    "- **目标类型定义**：`src/types/order.ts` 定义 `Order` 包含 `creatorName: string`。",
+    "- **当前实现缺陷**：`normalizeCsvOrder` 只设置 `creator`，缺少 `creatorName`。",
+    "- **Store 配置**：`src/store/dashboardStore.ts` 导出 `creatorField = 'creatorName'`，确认 Dashboard 使用 `creatorName` 作为字段名。",
+    "",
+    "## 实现改动",
+    "**修改文件**：`src/hooks/useCsvParser.ts`",
+    "",
+    "**改动内容**：在 `normalizeCsvOrder` 返回对象中添加 `creatorName`，值来自 `row.creator` 或 `row['创建者']`。",
+    "",
+    "## 影响范围",
+    "- **仅修改 1 个文件**：`src/hooks/useCsvParser.ts`。",
+    "- **接口兼容性**：`CsvOrder` 已声明 `creatorName?: string`，无需修改接口。",
+    "- **下游消费**：Dashboard 通过 `creatorName` 读取数据，修改后将正确获取值。",
+    "",
+    "## 验证方案",
+    "1. **静态检查**：修改后运行 TypeScript 编译检查，确保无类型错误。",
+    "- **功能验证**：",
+    "  - 解析 CSV 文件 `cn_tutorial_orders_by_creator_20260512.csv`。",
+    "  - 检查解析后的 `Order` 对象是否包含 `creatorName: 'alice'`。",
+    "  - 确认 Dashboard 组件能正确渲染 creator 数据。",
+    "",
+    "## 假设与默认值",
+    "- CSV 中 `creator` 始终存在。",
+    "- 不修改其他文件（`src/types/order.ts`、`src/store/dashboardStore.ts`）。",
+    "",
+    "## 验收标准",
+    "- `normalizeCsvOrder` 返回的对象同时包含 `creator` 和 `creatorName`。",
+    "- `creatorName` 的值与 `creator` 一致。",
+    "- TypeScript 编译通过。",
+    "- Dashboard 能正确显示 creator 名称。",
+  ].join("\n");
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: plan,
+  }], { language: "zh" });
+
+  const fileTargets = Array.from(new Set(tasks.flatMap((task) =>
+    (task.evidence || []).filter((item) => item.kind === "file").map((item) => item.value)
+  )));
+  assert.deepEqual(fileTargets, ["src/hooks/useCsvParser.ts"]);
+  assert.equal(tasks.some((task) => /Store 配置/.test(task.text)), false);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "browser_dom")), true);
+
+  const mutation = createPlanExecutionEvidenceEntry({
+    toolName: "apply_patch",
+    target: "src/hooks/useCsvParser.ts",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: "return { creator: row.creator };",
+      new: "return { creator: row.creator, creatorName: row.creator };",
+      path: "src/hooks/useCsvParser.ts",
+    },
+  });
+  const finiteCommand = createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npx tsc --noEmit",
+    result: JSON.stringify({ exitCode: 0, stdout: "" }),
+  });
+  const browser = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:5173/dashboard creator render",
+    result: JSON.stringify({ ok: true, assertions: [{ passed: true }] }),
+  });
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks,
+    evidenceLedger: [mutation, finiteCommand, browser].filter(Boolean),
+  });
+
+  assert.equal(audit.allTrustedComplete, true, JSON.stringify(audit));
+});
+
+test("English Diagnosis sections remain evidence context instead of mutation tasks", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## Problem Diagnosis",
+      "- `src/store/dashboardStore.ts` exports `creatorField`; confirm Dashboard reads `creatorName`.",
+      "",
+      "## Implementation Changes",
+      "**File to change:** `src/hooks/useCsvParser.ts`",
+      "",
+      "Add `creatorName` to the normalized order object.",
+      "",
+      "## Validation",
+      "- Verify that Dashboard displays `creatorName`.",
+    ].join("\n"),
+  }], { language: "en" });
+
+  assert.deepEqual(
+    Array.from(new Set(tasks.flatMap((task) =>
+      (task.evidence || []).filter((item) => item.kind === "file").map((item) => item.value)
+    ))),
+    ["src/hooks/useCsvParser.ts"],
+  );
 });
 
 test("runtime plan task derivation accepts Qwen-style file change tables", () => {

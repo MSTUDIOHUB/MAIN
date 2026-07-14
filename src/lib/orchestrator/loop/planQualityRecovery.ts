@@ -11,9 +11,10 @@ import {
 } from "../../planEvidence";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
+  buildPlanTargetedEvidenceRecoveryPrompt,
   MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
-  MAX_PLAN_EVIDENCE_RECOVERY_PASSES,
 } from "../../planRuntime";
+import { isReadOnlyNoProgressDetail } from "../../executeRecoveryTools";
 import {
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   collectPlanClosureMaterializationInput,
@@ -27,7 +28,10 @@ import {
   type PlanRuntimePhase,
 } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
-import type { PlanRuntimePhaseQualitySnapshot } from "./planRuntimeState";
+import type {
+  PlanEvidenceRecoveryObjective,
+  PlanRuntimePhaseQualitySnapshot,
+} from "./planRuntimeState";
 
 export type PlanQualityRecoveryResult = {
   planQualityRejectCount: number;
@@ -35,6 +39,7 @@ export type PlanQualityRecoveryResult = {
   planLastMissingSections: string[];
   planAutoScaffoldPromptIssued: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses: number;
   planArtifactQualityRejected: boolean;
@@ -64,6 +69,7 @@ type PlanQualityRecoveryInput = {
   planArtifactQualityRejected?: boolean;
   planAutoScaffoldPromptIssued: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses?: number;
   setPlanRuntimePhase: (
@@ -84,14 +90,9 @@ function isPlanArtifactQualityRejectionResult(
   );
 }
 
-const PLAN_EVIDENCE_NO_PROGRESS_RESULT_RE =
-  /Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|FILE_UNCHANGED_STUB|already called with identical arguments/i;
-
 function evidenceRecoveryResultProvidesNewEvidence(result: ToolExecutionResult): boolean {
   if (result.isError) return false;
-  return !PLAN_EVIDENCE_NO_PROGRESS_RESULT_RE.test(
-    `${result.displayContent || ""}\n${result.content || ""}`,
-  );
+  return !isReadOnlyNoProgressDetail(result.displayContent || result.content || "");
 }
 
 export function shouldPauseForReviewablePlanArtifactAfterToolResults(input: {
@@ -131,6 +132,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
   let planLastMissingSections = input.planLastMissingSections;
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
   let planClosureEvidenceRecoveryIssued = input.planClosureEvidenceRecoveryIssued;
+  let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
   let planEvidenceRecoveryPasses = input.planEvidenceRecoveryPasses;
   let planEvidenceNoProgressPasses = input.planEvidenceNoProgressPasses ?? 0;
   let planArtifactQualityRejected = input.planArtifactQualityRejected === true;
@@ -140,12 +142,19 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     input.evidenceRecoveryResults.some((result) =>
       !result.internalFeedback && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
     );
+  const hasObjectiveRecoveryRead =
+    (input.planEvidenceRecoveryObjective ?? "none") !== "none" &&
+    input.evidenceRecoveryResults.some((result) =>
+      !result.internalFeedback && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
+    );
   // Tool-result reconciliation may advance needs_evidence -> drafting as soon
   // as a new bundle becomes closure-ready. The outstanding recovery request
   // still belongs to that read batch and must be consumed here; otherwise the
   // next uncovered facet is incorrectly suppressed as a duplicate request.
   const wasPlanEvidenceRecoveryPhase =
-    String(planRuntimePhase) === "needs_evidence" || hasOutstandingEvidenceRecoveryRead;
+    String(planRuntimePhase) === "needs_evidence" ||
+    hasOutstandingEvidenceRecoveryRead ||
+    hasObjectiveRecoveryRead;
   const setQualityPhase = (
     phase: PlanRuntimePhase,
     reason?: string,
@@ -161,6 +170,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     planLastMissingSections,
     planAutoScaffoldPromptIssued,
     planClosureEvidenceRecoveryIssued,
+    planEvidenceRecoveryObjective,
     planEvidenceRecoveryPasses,
     planEvidenceNoProgressPasses,
     planArtifactQualityRejected,
@@ -216,7 +226,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       hasQualityClosureEvidence &&
       hasStructuredQualityClosureEvidence &&
       !planClosureEvidenceRecoveryIssued &&
-      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+      planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES;
     const effectiveRecoveryAction = shouldRequestTargetedEvidenceAfterQualityGate
       ? "targeted_evidence"
       : latestQualityResult.recoveryAction;
@@ -260,6 +270,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     });
     if (shouldRequestTargetedEvidenceAfterQualityGate) {
       planClosureEvidenceRecoveryIssued = true;
+      planEvidenceRecoveryObjective = "deterministic_closure";
       setQualityPhase(
         "needs_evidence",
         closureEvidenceAssessment.ready
@@ -277,25 +288,20 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       );
     } else if (
       planClosureEvidenceRecoveryIssued &&
-      !closureEvidenceAssessment.ready &&
-      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES
+      planEvidenceRecoveryObjective !== "none" &&
+      !closureEvidenceAssessment.ready
     ) {
+      // A typed recovery objective represents a real outstanding read
+      // transaction. Do not replace it with a scaffold merely because another
+      // weak draft arrived before the requested evidence result.
       setQualityPhase("needs_evidence", closureEvidenceAssessment.reason);
     } else if (
-      latestQualityResult.recoveryAction === "targeted_evidence" &&
-      planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES
-    ) {
-      setQualityPhase("needs_evidence", planLastQualityGateReason);
-    } else if (
       latestQualityResult.recoveryAction === "auto_scaffold" ||
-      planQualityRejectCount >= 2 ||
-      (
-        latestQualityResult.recoveryAction === "targeted_evidence" &&
-        planEvidenceRecoveryPasses >= MAX_PLAN_EVIDENCE_RECOVERY_PASSES
-      )
+      planQualityRejectCount >= 2
     ) {
       if (!planAutoScaffoldPromptIssued) {
         planAutoScaffoldPromptIssued = true;
+        planEvidenceRecoveryObjective = "none";
         setQualityPhase("needs_rewrite", "auto scaffold after quality gate");
         pendingPlanRuntimeRecoveryPrompt = buildPlanAutoScaffoldPrompt({
           language: MODEL_CONTROL_LANGUAGE,
@@ -305,9 +311,20 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           missingSections: planLastMissingSections,
         });
       } else {
+        planEvidenceRecoveryObjective = "none";
         setQualityPhase("needs_rewrite", planLastQualityGateReason);
       }
+    } else if (
+      planClosureEvidenceRecoveryIssued &&
+      !closureEvidenceAssessment.ready
+    ) {
+      setQualityPhase("needs_evidence", closureEvidenceAssessment.reason);
+    } else if (
+      latestQualityResult.recoveryAction === "targeted_evidence"
+    ) {
+      setQualityPhase("needs_evidence", planLastQualityGateReason);
     } else {
+      planEvidenceRecoveryObjective = "none";
       setQualityPhase("needs_rewrite", planLastQualityGateReason);
     }
   } else if (input.acceptedPersistedArtifact) {
@@ -315,6 +332,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     // a later plan-artifact mutation that completes without quality feedback
     // proves that the persisted artifact has passed the gate.
     planArtifactQualityRejected = false;
+    planEvidenceRecoveryObjective = "none";
     planLastQualityGateReason = "";
     planLastMissingSections = [];
   }
@@ -330,14 +348,68 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     pendingPlanRuntimeRecoveryPrompt == null
   ) {
     // A completed read consumes the outstanding recovery request. A later,
-    // still-uncovered facet may use the next bounded pass; without a read,
-    // the flag remains set and duplicate prompts stay suppressed.
+    // still-uncovered facet may open another targeted transaction; without a
+    // read, the flag remains set and duplicate prompts stay suppressed.
     planClosureEvidenceRecoveryIssued = false;
     const successfulEvidenceResults = evidenceRecoveryBatchResults.filter(
       evidenceRecoveryResultProvidesNewEvidence,
     );
     const hasSuccessfulEvidence = successfulEvidenceResults.length > 0;
-    if (hasSuccessfulEvidence) {
+    const recoveryObjectiveForBatch = planEvidenceRecoveryObjective;
+    const recoveredModelDraftInput = collectPlanClosureMaterializationInput(
+      callbacks,
+      recentPlanToolActivity,
+      attemptedPlanWriteTargets,
+      latestUserPromptText,
+    );
+    const recoveredModelDraftReady = isPlanEvidenceBundleReady(
+      recoveredModelDraftInput.evidenceBundle,
+    );
+    if (planEvidenceRecoveryObjective === "model_draft" && hasSuccessfulEvidence) {
+      // The finalization surface was reopened for one model-requested read.
+      // Completing that transaction must use the same model-draft threshold
+      // that originally closed the surface. Requiring deterministic closure
+      // here changes the contract mid-flight and turns valid file windows into
+      // a false evidence-exhaustion loop.
+      const recoveredClosureAssessment = assessPlanClosureEvidence(
+        recoveredModelDraftInput.evidenceBundle,
+      );
+      planEvidenceNoProgressPasses = 0;
+      logAgentEvent("plan_evidence_recovery_assessed", {
+        iteration,
+        recoveryPass: planEvidenceRecoveryPasses,
+        recoveryObjective: "model_draft",
+        modelAuthoredDraftReady: recoveredModelDraftReady,
+        closureReady: recoveredClosureAssessment.ready,
+        closureReason: recoveredClosureAssessment.reason,
+        resultProvidedNewEvidence: hasSuccessfulEvidence,
+        recoveryBudgetRemaining: true,
+        semanticFacts: recoveredModelDraftInput.evidenceBundle.facts.length,
+        changeTargets: recoveredModelDraftInput.evidenceBundle.changeTargets.length,
+      });
+      if (recoveredModelDraftReady) {
+        planEvidenceRecoveryObjective = "none";
+        setQualityPhase("drafting", "model-authored evidence recovery complete");
+        pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryClosurePrompt({
+          language: MODEL_CONTROL_LANGUAGE,
+          recentToolActivity: recentPlanToolActivity,
+          qualityGateReason: planLastQualityGateReason,
+          missingSections: planLastMissingSections,
+        });
+      } else {
+        // New source is progress, but it has not yet produced a minimally
+        // grounded model-authored draft bundle. Preserve the original
+        // objective instead of silently escalating to deterministic closure.
+        planClosureEvidenceRecoveryIssued = true;
+        planEvidenceRecoveryObjective = "model_draft";
+        setQualityPhase("needs_evidence", "model draft evidence incomplete");
+        pendingPlanRuntimeRecoveryPrompt = buildPlanTargetedEvidenceRecoveryPrompt({
+          language: MODEL_CONTROL_LANGUAGE,
+          reason: "model draft evidence incomplete",
+          trigger: "closed_read_request",
+        });
+      }
+    } else if (hasSuccessfulEvidence) {
       planEvidenceRecoveryPasses += 1;
       planEvidenceNoProgressPasses = 0;
       const recoveredClosureInput = collectPlanClosureMaterializationInput(
@@ -349,12 +421,17 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       const recoveredClosureAssessment = assessPlanClosureEvidence(
         recoveredClosureInput.evidenceBundle,
       );
-      const recoveryBudgetRemaining =
-        planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+      // Successful distinct evidence is progress regardless of how many
+      // earlier windows were needed. Global loop/context limits remain the
+      // safety boundary; only unchanged/no-progress reads are locally bounded.
+      const recoveryBudgetRemaining = true;
       logAgentEvent("plan_evidence_recovery_assessed", {
         iteration,
         recoveryPass: planEvidenceRecoveryPasses,
-        maxRecoveryPasses: MAX_PLAN_EVIDENCE_RECOVERY_PASSES,
+        recoveryObjective: planEvidenceRecoveryObjective || "deterministic_closure",
+        modelAuthoredDraftReady: isPlanEvidenceBundleReady(
+          recoveredClosureInput.evidenceBundle,
+        ),
         closureReady: recoveredClosureAssessment.ready,
         closureReason: recoveredClosureAssessment.reason,
         objectiveTargetMatches: recoveredClosureAssessment.objectiveTargetMatches,
@@ -368,6 +445,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       });
       if (!recoveredClosureAssessment.ready && recoveryBudgetRemaining) {
         planClosureEvidenceRecoveryIssued = true;
+        planEvidenceRecoveryObjective = "deterministic_closure";
         setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
         pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
           MODEL_CONTROL_LANGUAGE,
@@ -379,6 +457,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           },
         );
       } else if (recoveredClosureAssessment.ready) {
+        planEvidenceRecoveryObjective = "none";
         setQualityPhase(
           "drafting",
           "evidence recovery complete",
@@ -388,15 +467,6 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           recentToolActivity: recentPlanToolActivity,
           qualityGateReason: planLastQualityGateReason,
           missingSections: planLastMissingSections,
-        });
-      } else {
-        setQualityPhase("blocked", "evidence recovery budget exhausted", "failed");
-        pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
-          language: MODEL_CONTROL_LANGUAGE,
-          recentToolActivity: recentPlanToolActivity,
-          qualityGateReason: recoveredClosureAssessment.reason,
-          missingSections: planLastMissingSections,
-          requireResolvedEvidence: true,
         });
       }
     } else if (evidenceRecoveryBatchResults.some((result) => !result.isError)) {
@@ -414,8 +484,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         evidenceRecoveryBatchResults.map((result) => String(result.target || "").trim()).filter(Boolean),
       )];
       const canRetryWithoutProgress =
-        planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES &&
-        planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES;
+        planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES;
       logAgentEvent("plan_evidence_recovery_no_progress", {
         iteration,
         noProgressPass: planEvidenceNoProgressPasses,
@@ -425,21 +494,37 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
         repeatedTargets: avoidTargets,
         canRetry: canRetryWithoutProgress,
+        recoveryObjective: planEvidenceRecoveryObjective || "deterministic_closure",
       });
       if (canRetryWithoutProgress) {
         planClosureEvidenceRecoveryIssued = true;
+        planEvidenceRecoveryObjective = recoveryObjectiveForBatch === "model_draft"
+          ? "model_draft"
+          : "deterministic_closure";
         setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
-        pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
-          MODEL_CONTROL_LANGUAGE,
-          recoveredClosureAssessment.reason,
-          latestUserPromptText,
-          {
-            unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
-            confirmedChangeTargets: recoveredClosureInput.evidenceBundle.changeTargets,
-            avoidTargets,
-          },
-        );
+        pendingPlanRuntimeRecoveryPrompt = recoveryObjectiveForBatch === "model_draft"
+          ? [
+              buildPlanTargetedEvidenceRecoveryPrompt({
+                language: MODEL_CONTROL_LANGUAGE,
+                reason: "requested window produced no new evidence",
+                trigger: "closed_read_request",
+              }),
+              avoidTargets.length > 0
+                ? `Do not repeat unchanged target/window(s): ${avoidTargets.join(", ")}. Request a missing range or a different evidence owner.`
+                : "Request a missing range or a different evidence owner.",
+            ].join("\n")
+          : buildPlanClosureEvidenceRecoveryPrompt(
+              MODEL_CONTROL_LANGUAGE,
+              recoveredClosureAssessment.reason,
+              latestUserPromptText,
+              {
+                unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+                confirmedChangeTargets: recoveredClosureInput.evidenceBundle.changeTargets,
+                avoidTargets,
+              },
+            );
       } else {
+        planEvidenceRecoveryObjective = "none";
         setQualityPhase("blocked", "evidence recovery repeated without progress", "failed");
         pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
           language: MODEL_CONTROL_LANGUAGE,
@@ -450,13 +535,58 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         });
       }
     } else {
-      setQualityPhase("blocked", "evidence recovery failed", "failed");
-      pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
-        language: MODEL_CONTROL_LANGUAGE,
-        recentToolActivity: recentPlanToolActivity,
-        qualityGateReason: planLastQualityGateReason,
-        missingSections: planLastMissingSections,
+      // A wrong path or transient read failure is not proof that the Plan is
+      // impossible. Treat it as a no-progress transaction, allow one different
+      // target/owner, and only block after the bounded retry also fails.
+      planEvidenceNoProgressPasses += 1;
+      const avoidTargets = [...new Set(
+        evidenceRecoveryBatchResults
+          .map((result) => String(result.target || "").trim())
+          .filter(Boolean),
+      )];
+      const canRetryAfterError =
+        planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES;
+      logAgentEvent("plan_evidence_recovery_error", {
+        iteration,
+        noProgressPass: planEvidenceNoProgressPasses,
+        maxNoProgressPasses: MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
+        repeatedTargets: avoidTargets,
+        canRetry: canRetryAfterError,
+        recoveryObjective: recoveryObjectiveForBatch || "deterministic_closure",
       });
+      if (canRetryAfterError) {
+        planClosureEvidenceRecoveryIssued = true;
+        planEvidenceRecoveryObjective = recoveryObjectiveForBatch === "model_draft"
+          ? "model_draft"
+          : "deterministic_closure";
+        setQualityPhase("needs_evidence", "evidence read failed; choose another target");
+        pendingPlanRuntimeRecoveryPrompt = recoveryObjectiveForBatch === "model_draft"
+          ? [
+              buildPlanTargetedEvidenceRecoveryPrompt({
+                language: MODEL_CONTROL_LANGUAGE,
+                reason: "evidence read failed; choose another target",
+                trigger: "closed_read_request",
+              }),
+              avoidTargets.length > 0
+                ? `Do not retry failed target(s): ${avoidTargets.join(", ")}. Use a different path, range, or evidence owner.`
+                : "Use a different path, range, or evidence owner.",
+            ].join("\n")
+          : buildPlanClosureEvidenceRecoveryPrompt(
+              MODEL_CONTROL_LANGUAGE,
+              "evidence read failed; choose another target",
+              latestUserPromptText,
+              { avoidTargets },
+            );
+      } else {
+        planEvidenceRecoveryObjective = "none";
+        setQualityPhase("blocked", "evidence recovery repeatedly failed", "failed");
+        pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryBlockedPrompt({
+          language: MODEL_CONTROL_LANGUAGE,
+          recentToolActivity: recentPlanToolActivity,
+          qualityGateReason: planLastQualityGateReason,
+          missingSections: planLastMissingSections,
+        });
+      }
     }
   }
 
@@ -509,18 +639,20 @@ export function handlePlanQualityRecoveryAfterVisibleMaterialization(
   // another prompt so the caller can stop instead of looping forever.
   if (result.pendingPlanRuntimeRecoveryPrompt == null && result.planQualityRejectCount === 1) {
     if (
-      recoveryAction === "targeted_evidence" &&
-      result.planEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES
+      recoveryAction === "targeted_evidence"
     ) {
       result.planClosureEvidenceRecoveryIssued = true;
+      result.planEvidenceRecoveryObjective = "deterministic_closure";
       result.pendingPlanRuntimeRecoveryPrompt = buildPlanClosureEvidenceRecoveryPrompt(
         MODEL_CONTROL_LANGUAGE,
         result.planLastQualityGateReason,
         input.latestUserPromptText,
       );
     } else if (recoveryAction === "ask_user") {
+      result.planEvidenceRecoveryObjective = "none";
       result.pendingPlanRuntimeRecoveryPrompt = "PLAN_NEEDS_USER_DECISION: The draft contains a real blocking choice. Do not read more files or guess a default; present 2-4 mutually exclusive `<user_options>` and stop for the user. Keep the option labels in MAIN's configured response language.";
     } else {
+      result.planEvidenceRecoveryObjective = "none";
       result.pendingPlanRuntimeRecoveryPrompt = buildPlanPostConvergenceToolRedirectPrompt({
         language: MODEL_CONTROL_LANGUAGE,
         toolNames: [],

@@ -315,6 +315,40 @@ test.beforeEach(async ({ page }) => {
       currentWindow: { label: "main" },
       currentWebview: { label: "main" },
     };
+    let ptyActive = false;
+    let ptyBuffer = "";
+    let ptyForegroundPid: number | null = null;
+    let ptyShellAvailable = true;
+    const appendPtyOutput = (value: string) => {
+      ptyBuffer += value;
+      emitTauriEvent("pty-data", { chunk: value });
+    };
+    const ptyReadResult = (startOffset: number, maxCharsRaw?: unknown) => {
+      const boundedStart = Math.max(0, Math.min(Math.floor(startOffset), ptyBuffer.length));
+      const maxChars = Math.max(100, Math.min(Number(maxCharsRaw) || 8_000, 200_000));
+      const available = ptyBuffer.slice(boundedStart);
+      const text = available.slice(0, maxChars);
+      return {
+        text,
+        startOffset: boundedStart,
+        endOffset: boundedStart + text.length,
+        truncated: text.length < available.length,
+        bufferStartOffset: 0,
+        bufferEndOffset: ptyBuffer.length,
+      };
+    };
+    const ptyStatus = () => ({
+      active: ptyActive,
+      running: ptyActive,
+      pid: ptyActive ? 4100 : null,
+      foregroundPid: ptyForegroundPid,
+      shellAvailable: ptyShellAvailable,
+      exitCode: null,
+      bufferStartOffset: 0,
+      bufferEndOffset: ptyBuffer.length,
+      bufferBytes: ptyBuffer.length,
+      tail: ptyBuffer.slice(-8_000),
+    });
     internals.invoke = async (cmd: string, args?: Record<string, unknown>) => {
       if (cmd === "append_debug_log") {
         debugEntries.push(args || {});
@@ -342,6 +376,47 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "list_project_sessions") return [];
       if (cmd === "get_workspace_root") return workspace;
       if (cmd === "set_workspace_root" || cmd === "canonicalize_workspace_path") return String(args?.path || workspace);
+      if (cmd === "spawn_pty") {
+        ptyActive = true;
+        ptyForegroundPid = null;
+        ptyShellAvailable = true;
+        return null;
+      }
+      if (cmd === "resize_pty") return null;
+      if (cmd === "get_pty_status") return ptyStatus();
+      if (cmd === "write_pty") {
+        if (!ptyActive) throw new Error("PTY not started");
+        const input = String(args?.input || "");
+        if (input.includes("\u0003")) {
+          appendPtyOutput("^C\n");
+          ptyForegroundPid = null;
+          ptyShellAvailable = true;
+          return null;
+        }
+        appendPtyOutput(input);
+        if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|preview|start|serve)\b|\bvite\b/i.test(input)) {
+          appendPtyOutput("\nVITE v6.0.0 ready in 120 ms\n\n  Local: http://localhost:5173/\n");
+          ptyForegroundPid = 4102;
+          ptyShellAvailable = false;
+        }
+        return null;
+      }
+      if (cmd === "read_pty_buffer") {
+        const maxChars = Math.max(100, Math.min(Number(args?.maxChars) || ptyBuffer.length || 8_000, 200_000));
+        return ptyBuffer.slice(-maxChars);
+      }
+      if (cmd === "read_pty_since") {
+        return ptyReadResult(Number(args?.offset) || 0, args?.maxChars);
+      }
+      if (cmd === "read_pty_tail") {
+        const maxChars = Math.max(100, Math.min(Number(args?.maxChars) || 8_000, 200_000));
+        const startOffset = Math.max(0, ptyBuffer.length - maxChars);
+        return ptyReadResult(startOffset, maxChars);
+      }
+      if (cmd === "clear_pty_buffer") {
+        ptyBuffer = "";
+        return ptyReadResult(0, args?.maxChars);
+      }
       if (cmd === "cancel_proxy_request") return null;
       if (cmd === "cancel_chat_stream") {
         const streamId = String(args?.streamId || args?.stream_id || "");

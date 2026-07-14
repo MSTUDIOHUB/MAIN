@@ -82,7 +82,7 @@ test("approved plan scope blocks recover within the reviewed scope before comple
   assert.doesNotMatch(phaseSource, /approved_plan_scope_revision_required/);
 });
 
-test("approved Plan finite command failures enter command-only recovery", () => {
+test("approved Plan finite command failures split invocation recovery from source repair", () => {
   const appendIndex = phaseSource.indexOf(
     "appendToolResultsToHistory({",
     phaseSource.indexOf("handleNoProgressRecovery({"),
@@ -95,8 +95,16 @@ test("approved Plan finite command failures enter command-only recovery", () => 
   assert.notEqual(goalCheckpointIndex, -1);
   assert.ok(appendIndex < recoveryIndex);
   assert.ok(recoveryIndex < goalCheckpointIndex);
+  assert.match(phaseSource, /classifyFailedFiniteValidationOutcome\(\{/);
+  assert.match(phaseSource, /failedFiniteValidationOutcome === "invocation_error"[\s\S]*?"finite_validation_only"/);
   assert.match(phaseSource, /"finite_validation_only",\s*"failed_finite_validation_command"/);
+  assert.match(phaseSource, /shouldEnterFailedFiniteValidationRecovery\(command\)/);
+  assert.match(phaseSource, /remainingPlanTasksAfterFailedFiniteValidation[\s\S]*?hasPendingPlanCommandEvidence\(remainingPlanTasksAfterFailedFiniteValidation\)/);
+  assert.match(phaseSource, /resolveFailedFiniteValidationRecoveryPolicy\(\{/);
   assert.match(phaseSource, /buildFailedFiniteValidationRecoveryPrompt\(\{/);
+  assert.match(phaseSource, /failedFiniteValidationOutcome === "validation_failure"[\s\S]*?failedFiniteValidationMatchesPendingPlanEvidence\(\{/);
+  assert.match(phaseSource, /approved_plan_finite_validation_requires_repair/);
+  assert.match(phaseSource, /clearExecuteRecoveryRuntimeState\(executeRecoveryState\)/);
 });
 
 test("tool iteration phase delegates tool-result recovery internals to the phase helper", () => {

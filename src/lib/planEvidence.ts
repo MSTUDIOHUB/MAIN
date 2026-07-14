@@ -8,6 +8,7 @@ import {
 } from "./workflowModels";
 import type { ToolDiffPreview } from "./toolDiff";
 import { preserveNumberedUserGoalLines } from "./numberedGoalFacets";
+import { classifyFailedFiniteValidationOutcome } from "./commandValidationOutcome";
 
 export interface PlanEvidenceFactInput {
   tool: string;
@@ -811,7 +812,22 @@ export function createPlanExecutionEvidenceEntry(input: {
     };
   }
   if (COMMAND_EVIDENCE_TOOLS.has(input.toolName)) {
-    if (!commandResultLooksSuccessful(input.toolName, input.result)) return null;
+    if (!commandResultLooksSuccessful(input.toolName, input.result)) {
+      if (
+        input.toolName !== "run_command" ||
+        classifyFailedFiniteValidationOutcome({ result: input.result }) !== "validation_failure"
+      ) {
+        return null;
+      }
+      // A validation that really ran but failed is durable negative evidence.
+      // Keeping it in the ordered command ledger prevents an unrelated later
+      // command from satisfying a generic focused-validation placeholder.
+      return {
+        ...base,
+        kind: "cmd",
+        observationStatus: "failed",
+      };
+    }
     return {
       ...base,
       kind: "cmd",
@@ -850,6 +866,7 @@ export function appendPlanEvidenceEntry(
   // facts. Keeping only the first identical value lets an old ready state
   // satisfy a later restart, so always retain their latest bounded sequence.
   if (
+    entry.sourceTool === "run_command" ||
     entry.sourceTool === "execute_command" ||
     entry.sourceTool === "send_pty_input" ||
     PTY_OBSERVATION_EVIDENCE_TOOLS.has(entry.sourceTool)

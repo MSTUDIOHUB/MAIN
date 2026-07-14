@@ -22,7 +22,7 @@ export function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: 
         "请先根据已有工具结果判断任务是否已经完成：如果完成，直接输出最终总结并停止，不要再调用工具。",
         "如果 read_file 当前不可用，不要继续请求 read_file，也不要改用 cat/sed/head/tail 通过 shell 读取文件。",
         "如果 grep_search/get_file_outline 已经给出足够定位信息，请直接用 replace_in_file/apply_patch 做最小修改，或运行一次验证命令；不要再调用新的搜索/泛读工具。",
-        "不要重复读取、重复验证或继续改同一个目标而没有新证据。",
+        "不要在文件和上下文都未变化时重复同一读取窗口、重复同一验证或继续修改同一目标而没有新证据；修改后的复读和新的必要范围属于有效验证。",
       ].join("\n")
     : [
         `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
@@ -30,7 +30,7 @@ export function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: 
         "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
         "If read_file is unavailable, do not keep requesting read_file and do not switch to cat/sed/head/tail shell file reads.",
         "If grep_search/get_file_outline already provide enough location context, directly apply the smallest replace_in_file/apply_patch edit or run one validation command; do not call new search or broad read tools.",
-        "Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
+        "Do not repeat the same read window or validation while file/context state is unchanged, or keep editing the same target without new evidence; a post-mutation reread or a newly required range is valid verification.",
     ].join("\n");
 }
 
@@ -103,15 +103,15 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
       "The user already allowed read-only inspection for this session, but the previous turn still did not make useful tool progress.",
       "Do not ask for permission again and do not narrate a future read.",
       workflowMode === "plan"
-        ? "If the evidence is sufficient, output a visible `<proposed_plan>` for runtime validation and materialization; if one fact is still missing, call exactly one targeted read/search tool now. If the target was already cached, reuse the existing content instead of rereading it."
-        : "If you need evidence, call one targeted read/search tool now. If the target was already cached, reuse the existing content and move to the next real action: patch/write, run a finite command, browser validation, or state the exact blocker.",
+        ? "If the evidence is sufficient, output a visible `<proposed_plan>` for runtime validation and materialization; if one fact is still missing, call exactly one targeted read/search tool now. Reuse a cached result only when the same unchanged version and range remain active; a different range or changed file may be read."
+        : "If you need evidence, call one targeted read/search tool now. Reuse a cached result only when the same unchanged version and range remain active; otherwise a different range or changed file may be read before the next real action: patch/write, finite command, browser validation, or an exact blocker.",
     ].join("\n");
   }
   return [
     "用户已经允许本会话的只读检查，但上一轮仍没有产生有效工具进展。",
     "不要再次询问许可，也不要只描述接下来要读取什么。",
     workflowMode === "plan"
-      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交给 runtime 校验和物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，不要重复读取。"
-      : "如果还需要证据，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，并进入下一个真实动作：写入/替换、运行有限命令、浏览器验证，或说明精确阻塞。",
+      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交给 runtime 校验和物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取。"
+      : "如果还需要证据，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取，然后进入写入/替换、有限命令、浏览器验证或精确阻塞。",
   ].join("\n");
 }

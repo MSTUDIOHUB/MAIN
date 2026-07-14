@@ -455,7 +455,10 @@ export function handleAssistantOutputPhase(input: {
       );
     }
     planRuntimeState = applyPlanEvidenceRecoveryRuntimeState(planRuntimeState, {
-      planEvidenceRecoveryPasses: planRuntimeState.planEvidenceRecoveryPasses + 1,
+      // Opening the tool surface is not evidence. Count only completed
+      // deterministic recovery batches; valid later windows must remain legal.
+      planEvidenceRecoveryPasses: planRuntimeState.planEvidenceRecoveryPasses,
+      planEvidenceRecoveryObjective: "model_draft",
     });
     setPlanRuntimePhaseAndSync(
       "needs_evidence",

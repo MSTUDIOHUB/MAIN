@@ -116,7 +116,14 @@ export function toolResultCountsAsExecutionEvidence(
   if (feedbackStatus === "no_op" || feedbackStatus === "no_effect_mutation" || feedbackStatus === "cached") {
     return false;
   }
-  if (/"noOp"\s*:\s*true|NO_EFFECT_MUTATION|FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|no-op|nothing to (?:change|patch|write)|already matched requested content/i.test(result.content || "")) {
+  const isWorkspaceMutation =
+    result.name === "apply_patch" ||
+    result.name === "replace_in_file" ||
+    result.name === "write_file";
+  if (
+    isWorkspaceMutation &&
+    /"noOp"\s*:\s*true|NO_EFFECT_MUTATION|no-op|nothing to (?:change|patch|write)|already matched requested content/i.test(result.content || "")
+  ) {
     return false;
   }
   if (isSuccessfulPlanArtifactWriteResult(result) || isExecutionPlanArtifactWrite(result.name, args) || isTasksPlanWrite(result.name, args)) {

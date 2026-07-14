@@ -499,6 +499,42 @@ test("approval readiness treats a plain prose change section as mutation-oriente
   assert.equal(readiness.ok, true, JSON.stringify(readiness));
 });
 
+test("approval task projection keeps an explicit modification file when its detail uses a domain verb", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Proposed Plan",
+    "",
+    "## 1. 目标",
+    "修复 `src/hooks/useCsvParser.ts`，使 CSV creator 正确映射到 creatorName。",
+    "",
+    "## 2. 根因分析",
+    "- 当前解析结果缺少 creatorName。",
+    "",
+    "## 3. 实现改动",
+    "**修改文件**：`src/hooks/useCsvParser.ts`",
+    "",
+    "**具体逻辑**：",
+    "在 `normalizeCsvOrder` 函数中，将 `creator` 字段的值同时赋值给 `creatorName`。",
+    "",
+    "## 4. 测试方案",
+    "1. 类型检查：确保 `CsvOrder` 接口包含 `creatorName` 字段。",
+    "2. 逻辑验证：确认 Dashboard 优先读取 `creatorName`。",
+  ].join("\n"));
+  const state = baseState({ planArtifacts: [artifact], isPlanApproved: false });
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.concreteMutationTaskCount, 1, JSON.stringify(executionPlanTasks));
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) =>
+      evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts"
+    )
+  ));
+});
+
 test("approval readiness preserves the native contract for a design-only review artifact", () => {
   const artifact = reviewablePlanArtifact([
     "# 文件打开链路设计",

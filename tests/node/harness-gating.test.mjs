@@ -375,33 +375,23 @@ test("validated Plan replace is promoted to one exact full-content write", async
   });
 });
 
-test("buildLoopDetectionValidationError blocks repetitive writes on the same file path", () => {
-  const readCall = {
-    id: "call_read_1",
-    function: {
-      name: "read_file",
-      arguments: JSON.stringify({ path: "src/App.tsx" }),
-    },
-  };
-  const writeCall = {
-    id: "call_write_1",
-    function: {
-      name: "write_file",
-      arguments: JSON.stringify({ path: "src/App.tsx", content: "new" }),
-    },
-  };
-
-  const messages = [
-    { role: "assistant", tool_calls: [readCall] },
-    { role: "tool", tool_call_id: "call_read_1", content: "ok" },
-    { role: "assistant", tool_calls: [writeCall] },
-    { role: "tool", tool_call_id: "call_write_1", content: "success" },
-    { role: "assistant", tool_calls: [readCall] },
-    { role: "tool", tool_call_id: "call_read_1", content: "ok" },
-    { role: "assistant", tool_calls: [writeCall] },
-    { role: "tool", tool_call_id: "call_write_1", content: "success" },
-    { role: "assistant", tool_calls: [readCall] },
-  ];
+test("buildLoopDetectionValidationError blocks repeated failed mutations on the same file path", () => {
+  const messages = Array.from({ length: 5 }, (_value, index) => {
+    const id = `call_write_${index + 1}`;
+    return [
+      {
+        role: "assistant",
+        tool_calls: [{
+          id,
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({ path: "src/App.tsx", content: `new-${index}` }),
+          },
+        }],
+      },
+      { role: "tool", tool_call_id: id, content: "Error: mutation failed" },
+    ];
+  }).flat();
 
   const callbacks = createMockCallbacks({ messages });
   const tc = { id: "call_write_new", name: "write_file" };
@@ -415,27 +405,151 @@ test("buildLoopDetectionValidationError blocks repetitive writes on the same fil
   assert.equal(ok, null);
 });
 
-test("buildLoopDetectionValidationError returns clear non-error guidance for repeated read_file", () => {
+test("a successful mutation resets the same-path failure streak", () => {
+  const outcomes = [
+    "Error: mutation failed 1",
+    "Error: mutation failed 2",
+    "Error: mutation failed 3",
+    "updated successfully",
+    "Error: mutation failed 4",
+    "Error: mutation failed 5",
+  ];
+  const messages = outcomes.flatMap((content, index) => {
+    const id = `call_write_reset_${index + 1}`;
+    return [
+      {
+        role: "assistant",
+        tool_calls: [{
+          id,
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({ path: "src/App.tsx", content: `new-${index}` }),
+          },
+        }],
+      },
+      { role: "tool", tool_call_id: id, content },
+    ];
+  });
+
+  const result = buildLoopDetectionValidationError(
+    { id: "call_write_after_reset", name: "write_file" },
+    { path: "src/App.tsx" },
+    createMockCallbacks({ messages }),
+  );
+
+  assert.equal(result, null);
+});
+
+test("a successful apply_patch resets failures for every patched target", () => {
+  const messages = [];
+  for (let index = 0; index < 3; index += 1) {
+    const id = `failed_before_patch_${index}`;
+    messages.push({
+      role: "assistant",
+      tool_calls: [{
+        id,
+        function: {
+          name: "write_file",
+          arguments: JSON.stringify({ path: "src/App.tsx", content: `bad-${index}` }),
+        },
+      }],
+    });
+    messages.push({ role: "tool", tool_call_id: id, content: "Error: mutation failed" });
+  }
+  messages.push({
+    role: "assistant",
+    tool_calls: [{
+      id: "successful_patch",
+      function: {
+        name: "apply_patch",
+        arguments: JSON.stringify({
+          patch: "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-old\n+new\n*** End Patch",
+        }),
+      },
+    }],
+  });
+  messages.push({ role: "tool", tool_call_id: "successful_patch", content: "patched" });
+  for (let index = 0; index < 2; index += 1) {
+    const id = `failed_after_patch_${index}`;
+    messages.push({
+      role: "assistant",
+      tool_calls: [{
+        id,
+        function: {
+          name: "replace_in_file",
+          arguments: JSON.stringify({ path: "./src/App.tsx", search_text: "x", replace_text: "y" }),
+        },
+      }],
+    });
+    messages.push({ role: "tool", tool_call_id: id, content: "Error: mutation failed" });
+  }
+
+  const result = buildLoopDetectionValidationError(
+    { id: "write_after_patch_reset", name: "write_file" },
+    { path: "src/App.tsx" },
+    createMockCallbacks({ messages }),
+  );
+  assert.equal(result, null);
+});
+
+test("an unexecuted sibling mutation does not reset an existing failure streak", () => {
+  const messages = Array.from({ length: 5 }, (_value, index) => {
+    const id = `historical_failure_${index}`;
+    return [
+      {
+        role: "assistant",
+        tool_calls: [{
+          id,
+          function: {
+            name: "write_file",
+            arguments: JSON.stringify({ path: "src/App.tsx", content: `bad-${index}` }),
+          },
+        }],
+      },
+      { role: "tool", tool_call_id: id, content: "Error: mutation failed" },
+    ];
+  }).flat();
+  messages.push({
+    role: "assistant",
+    tool_calls: [{
+      id: "pending_sibling",
+      function: {
+        name: "write_file",
+        arguments: JSON.stringify({ path: "src/App.tsx", content: "not executed yet" }),
+      },
+    }],
+  });
+
+  const result = buildLoopDetectionValidationError(
+    { id: "current_write", name: "write_file" },
+    { path: "/workspace/src/App.tsx" },
+    createMockCallbacks({ messages }),
+  );
+  assert.ok(result);
+  assert.match(result.content, /LOOP_DETECTED/);
+});
+
+test("path-level loop detection never blocks distinct read_file windows", () => {
   const debugEvents = [];
   const doneEvents = [];
-  const readCall = (id) => ({
+  const readCall = (id, startLine) => ({
     id,
     function: {
       name: "read_file",
-      arguments: JSON.stringify({ path: "src/App.tsx" }),
+      arguments: JSON.stringify({ path: "src/App.tsx", start_line: startLine, max_lines: 100 }),
     },
   });
   const messages = [
     { role: "user", content: "modify App" },
-    { role: "assistant", tool_calls: [readCall("call_read_1")] },
+    { role: "assistant", tool_calls: [readCall("call_read_1", 1)] },
     { role: "tool", tool_call_id: "call_read_1", content: "ok" },
-    { role: "assistant", tool_calls: [readCall("call_read_2")] },
+    { role: "assistant", tool_calls: [readCall("call_read_2", 101)] },
     { role: "tool", tool_call_id: "call_read_2", content: "ok" },
-    { role: "assistant", tool_calls: [readCall("call_read_3")] },
+    { role: "assistant", tool_calls: [readCall("call_read_3", 201)] },
     { role: "tool", tool_call_id: "call_read_3", content: "ok" },
-    { role: "assistant", tool_calls: [readCall("call_read_4")] },
+    { role: "assistant", tool_calls: [readCall("call_read_4", 301)] },
     { role: "tool", tool_call_id: "call_read_4", content: "ok" },
-    { role: "assistant", tool_calls: [readCall("call_read_5")] },
+    { role: "assistant", tool_calls: [readCall("call_read_5", 401)] },
   ];
 
   const callbacks = createMockCallbacks({
@@ -445,17 +559,37 @@ test("buildLoopDetectionValidationError returns clear non-error guidance for rep
   });
   const result = buildLoopDetectionValidationError(
     { id: "call_read_new", name: "read_file" },
-    { path: "src/App.tsx" },
+    { path: "src/App.tsx", start_line: 501, max_lines: 100 },
     callbacks,
   );
 
-  assert.ok(result);
-  assert.equal(result.isError, false);
-  assert.equal(result.lifecycleState, "completed");
-  assert.match(result.content, /READ_FILE_REPEAT_LIMIT/);
-  assert.equal(doneEvents.length, 1);
-  assert.equal(debugEvents[0].event, "agent.tool_preflight_blocked");
-  assert.equal(debugEvents[0].data.reason, "read_file_repeat_limit");
+  assert.equal(result, null);
+  assert.equal(doneEvents.length, 0);
+  assert.equal(debugEvents.length, 0);
+});
+
+test("distinct read_file windows do not contribute to a later mutation limit", () => {
+  const readCall = (id, startLine) => ({
+    id,
+    function: {
+      name: "read_file",
+      arguments: JSON.stringify({ path: "src/App.tsx", start_line: startLine, max_lines: 100 }),
+    },
+  });
+  const messages = [{ role: "user", content: "inspect then update App" }];
+  for (let index = 0; index < 6; index += 1) {
+    const id = `window_${index}`;
+    messages.push({ role: "assistant", tool_calls: [readCall(id, index * 100 + 1)] });
+    messages.push({ role: "tool", tool_call_id: id, content: "READ_FILE_RESULT" });
+  }
+
+  const result = buildLoopDetectionValidationError(
+    { id: "first_write", name: "write_file" },
+    { path: "src/App.tsx", content: "updated" },
+    createMockCallbacks({ messages }),
+  );
+
+  assert.equal(result, null);
 });
 
 test("read_file repeat-limit batches summarize into a pause signal", () => {

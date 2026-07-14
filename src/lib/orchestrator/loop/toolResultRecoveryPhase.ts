@@ -1,5 +1,10 @@
 import {
   buildFailedFiniteValidationRecoveryPrompt,
+  classifyFailedFiniteValidationOutcome,
+  failedFiniteValidationMatchesPendingPlanEvidence,
+  hasPendingPlanCommandEvidence,
+  resolveFailedFiniteValidationRecoveryPolicy,
+  shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
 import {
   isReviewablePlanStage,
@@ -34,6 +39,7 @@ import {
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import {
   applyCrossIterationReadFileRecoveryState,
+  clearExecuteRecoveryRuntimeState,
   setRepeatedEditValidationRecoveryAttempts,
 } from "./executeRecoveryRuntime";
 import type {
@@ -415,20 +421,55 @@ export async function handleToolResultRecoveryPhase(input: {
     emitTurnEvent: input.emitTurnEvent,
   });
 
-  const failedFiniteValidation = input.results.find((result) =>
-    result.name === "run_command" &&
-    !result.internalFeedback &&
-    (result.isError || !commandResultLooksSuccessful(result.name, result.content || ""))
-  );
-  if (
-    failedFiniteValidation &&
+  const failedFiniteValidation = input.results.find((result) => {
+    if (
+      result.name !== "run_command" ||
+      result.internalFeedback ||
+      !(result.isError || !commandResultLooksSuccessful(result.name, result.content || ""))
+    ) {
+      return false;
+    }
+    const args = input.toolArgsByCallId.get(result.toolCallId) || {};
+    const command = String(args.command || args.cmd || result.target || "").trim();
+    return shouldEnterFailedFiniteValidationRecovery(command);
+  });
+  const failedFiniteValidationCommand = failedFiniteValidation
+    ? (() => {
+        const args = input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {};
+        return String(
+          args.command || args.cmd || failedFiniteValidation.target || "",
+        ).trim();
+      })()
+    : "";
+  const failedFiniteValidationOutcome = failedFiniteValidation
+    ? classifyFailedFiniteValidationOutcome({
+        result: failedFiniteValidation.content || failedFiniteValidation.displayContent || "",
+        isToolError: failedFiniteValidation.isError,
+        lifecycleState: failedFiniteValidation.lifecycleState,
+      })
+    : null;
+  const remainingPlanTasksAfterFailedFiniteValidation = failedFiniteValidation &&
     input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved()
+    ? buildPlanTaskEvidenceAudit({
+        tasks: input.callbacks.getPlanTasks(),
+        evidenceLedger: input.callbacks.getPlanExecutionEvidenceLedger(),
+        preserveMissing: true,
+        highlightNext: true,
+      }).remainingTasks
+    : [];
+  if (
+    failedFiniteValidation &&
+    failedFiniteValidationOutcome === "invocation_error" &&
+    input.workflowMode === "plan" &&
+    input.callbacks.getIsPlanApproved() &&
+    hasPendingPlanCommandEvidence(remainingPlanTasksAfterFailedFiniteValidation)
   ) {
-    const args = input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {};
-    const command = String(
-      args.command || args.cmd || failedFiniteValidation.target || "",
-    ).trim();
+    const command = failedFiniteValidationCommand;
+    const recoveryPolicy = resolveFailedFiniteValidationRecoveryPolicy({
+      failedCommand: command,
+      tasks: remainingPlanTasksAfterFailedFiniteValidation,
+    });
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "finite_validation_only",
       "failed_finite_validation_command",
@@ -437,6 +478,7 @@ export async function handleToolResultRecoveryPhase(input: {
     const recoveryPrompt = buildFailedFiniteValidationRecoveryPrompt({
       command,
       result: failedFiniteValidation.content || failedFiniteValidation.displayContent || "",
+      ...recoveryPolicy,
     });
     logAgentEvent("approved_plan_finite_validation_recovery", {
       iteration: input.iteration,
@@ -447,9 +489,56 @@ export async function handleToolResultRecoveryPhase(input: {
     input.emitPlanExecutionProgress("running", {
       currentTool: "run_command",
       recoveryReason: "failed_finite_validation_command",
+      nextStep: recoveryPolicy.allowAlternativeCommand
+        ? input.callbacks.getPreferredLanguage() === "zh"
+          ? "改用与项目运行时匹配的一次性验证命令"
+          : "run a different finite validation command compatible with the project runtime"
+        : input.callbacks.getPreferredLanguage() === "zh"
+          ? `修正调用前提后重新运行计划要求的命令：${recoveryPolicy.requiredCommand}`
+          : `correct the invocation prerequisite and rerun the required command: ${recoveryPolicy.requiredCommand}`,
+    });
+    input.callbacks.onStatusChange("running");
+    input.callbacks.appendMessage({ role: "user", content: recoveryPrompt });
+    return finish("continue");
+  }
+
+  const failedValidationMatchesPendingTask =
+    failedFiniteValidation &&
+    failedFiniteValidationOutcome === "validation_failure" &&
+    failedFiniteValidationMatchesPendingPlanEvidence({
+      failedCommand: failedFiniteValidationCommand,
+      tasks: remainingPlanTasksAfterFailedFiniteValidation,
+    });
+  if (
+    failedFiniteValidation &&
+    failedValidationMatchesPendingTask &&
+    input.workflowMode === "plan" &&
+    input.callbacks.getIsPlanApproved()
+  ) {
+    // A validation that actually ran has produced a source/test/config
+    // diagnostic. Command-only recovery cannot fix it. Return the next turn to
+    // the normal repair surface; the failed command remains negative evidence
+    // until that same concrete command succeeds.
+    executeRecoveryState = clearExecuteRecoveryRuntimeState(executeRecoveryState);
+    const recoveryPrompt = [
+      "FINITE_VALIDATION_REPAIR_REQUIRED: The finite validation command executed, but its validation failed.",
+      `Failed command: ${failedFiniteValidationCommand}`,
+      "MAIN restored the normal read/mutation/validation tool surface. Inspect the structured stdout/stderr/exitCode already returned, repair the implicated source, test, or configuration, then rerun this same command.",
+      "Do not substitute an unrelated successful command: this failed validation remains pending Plan evidence until the same concrete command succeeds.",
+    ].join("\n");
+    logAgentEvent("approved_plan_finite_validation_requires_repair", {
+      iteration: input.iteration,
+      command: failedFiniteValidationCommand,
+      target: failedFiniteValidation.target || "",
+      previousRecoveryMode: input.executeRecoveryState.mode,
+      nextRecoveryMode: executeRecoveryState.mode,
+    });
+    input.emitPlanExecutionProgress("running", {
+      currentTool: "apply_patch",
+      recoveryReason: "failed_finite_validation_requires_repair",
       nextStep: input.callbacks.getPreferredLanguage() === "zh"
-        ? "改用与项目运行时匹配的一次性验证命令"
-        : "run a different finite validation command compatible with the project runtime",
+        ? "根据命令诊断修复源码、测试或配置，然后重新运行同一验证命令"
+        : "repair the diagnosed source, test, or configuration issue, then rerun the same validation command",
     });
     input.callbacks.onStatusChange("running");
     input.callbacks.appendMessage({ role: "user", content: recoveryPrompt });
@@ -599,6 +688,9 @@ export async function handleToolResultRecoveryPhase(input: {
     planReadOnlyConvergenceTools: planRuntimeState.planReadOnlyConvergenceTools,
     usedPlanReadOnlyConvergencePrompt:
       planRuntimeState.usedPlanReadOnlyConvergencePrompt,
+    planEvidenceRecoveryObjective:
+      planRuntimeState.planEvidenceRecoveryObjective,
+    planRuntimePhase: planRuntimeState.planRuntimePhase,
     turnInputContextSignals: input.turnInputContextSignals,
     recentPlanToolActivity: input.recentPlanToolActivity,
     lastAssistantTextForCheckpoint:

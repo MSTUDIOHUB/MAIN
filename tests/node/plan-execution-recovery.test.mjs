@@ -176,6 +176,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"));
 
 const {
+  handleCrossIterationReadFileLoopRecovery,
   handleReadFileRepeatLimitRecovery,
   handleStrictRepeatGuardRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
@@ -971,6 +972,7 @@ test("pending closure-evidence recovery wins over deterministic materialization"
     planQualityRejectCount: result.planQualityRejectCount,
     planLastQualityGateReason: result.planLastQualityGateReason,
     planClosureEvidenceRecoveryIssued: result.planClosureEvidenceRecoveryIssued,
+    planEvidenceRecoveryObjective: result.planEvidenceRecoveryObjective,
     planEvidenceRecoveryPasses: result.planEvidenceRecoveryPasses,
     planAutoScaffoldPromptIssued: result.planAutoScaffoldPromptIssued,
     recentPlanToolActivity: [
@@ -1608,6 +1610,62 @@ test("approved execution repeated cached reads replay prior content after the fi
     toolCallPartitioningSource,
     /replayApprovedExecutionRead[\s\S]*duplicateCount\s*>=\s*2[\s\S]*buildFileUnchangedReplayContent/,
   );
+});
+
+test("cross-iteration read recovery counts unchanged windows, not fresh ranges or versions", () => {
+  const appended = [];
+  const activations = [];
+  const callbacks = {
+    appendMessage: (message) => appended.push(message),
+    getPreferredLanguage: () => "en",
+  };
+  const crossIterationFileReads = new Map([["src/main.js", 2]]);
+  const fresh = handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    runtimeIntent: "execute",
+    iteration: 4,
+    results: [{
+      toolCallId: "fresh-window",
+      name: "read_file",
+      target: "src/main.js",
+      content: "READ_FILE_RESULT lines 301-400",
+      isError: false,
+    }],
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+
+  assert.equal(fresh.executeRecoveryMode, "normal");
+  assert.equal(crossIterationFileReads.has("src/main.js"), false);
+  assert.equal(activations.length, 0);
+
+  const cached = handleCrossIterationReadFileLoopRecovery({
+    callbacks,
+    runtimeIntent: "execute",
+    iteration: 5,
+    results: Array.from({ length: 3 }, (_value, index) => ({
+      toolCallId: `cached-window-${index}`,
+      name: "read_file",
+      target: "src/main.js",
+      content: "FILE_UNCHANGED_STUB: requested range already cached",
+      isError: false,
+    })),
+    snapshotContextLimit: 16_000,
+    crossIterationFileReads,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    consecutiveBlockedReadFileInRecoveryCount: 0,
+    activateExecuteRecovery: (...args) => activations.push(args),
+  });
+
+  assert.equal(cached.executeRecoveryMode, "mutation_first");
+  assert.equal(crossIterationFileReads.get("src/main.js"), 3);
+  assert.equal(activations.length, 1);
+  assert.match(appended.at(-1)?.content || "", /unchanged-window/);
 });
 
 test("approved plan execution starts with the normal execute tool surface", () => {

@@ -58,6 +58,10 @@ const PLAN_TARGETED_EVIDENCE_TOOL_NAMES = new Set([
   "get_pty_status",
 ]);
 
+export function isPlanTargetedEvidenceToolName(name: string): boolean {
+  return PLAN_TARGETED_EVIDENCE_TOOL_NAMES.has(String(name || ""));
+}
+
 const PLAN_STRUCTURE_EXPLORATION_TOOL_NAMES = new Set([
   "get_project_skeleton",
   "spawn_subagent",

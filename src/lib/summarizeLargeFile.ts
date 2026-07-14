@@ -3,18 +3,28 @@ import type { AppConfig } from "./appTypes";
 import { type ProtocolChatMessage } from "./cloudProtocol";
 import { invokeModelWithMessages, type GenerateGitCommitMessageParams } from "./gitCommitMessage";
 
+export interface LargeFileSummaryResult {
+  content: string;
+  summarized: boolean;
+  reason: "summarized" | "below_chunk_threshold" | "read_failed";
+}
+
 export async function summarizeLargeFile(
   path: string,
   workspace: string,
   sessionKey: string | undefined,
   config: AppConfig,
-): Promise<string> {
+): Promise<LargeFileSummaryResult> {
   // Read full file by bypassing window limits
   let content = "";
   try {
     content = await invoke<string>("read_file", { path, workspace, sessionKey });
   } catch (e) {
-    return `[FILE MAP-REDUCE SUMMARY ERROR]\nError reading full file for summarization: ${e}`;
+    return {
+      content: `[FILE MAP-REDUCE SUMMARY ERROR]\nError reading full file for summarization: ${e}`,
+      summarized: false,
+      reason: "read_failed",
+    };
   }
 
   // Chunking
@@ -25,8 +35,14 @@ export async function summarizeLargeFile(
   }
 
   if (chunks.length === 1) {
-    // Should not happen if this is only called for large files, but just in case
-    return content;
+    // Preserve the original READ_FILE_RESULT window in the caller. Returning
+    // raw content here used to discard nextStartLine and then hit the generic
+    // model-output character cap for files between that cap and CHUNK_SIZE.
+    return {
+      content,
+      summarized: false,
+      reason: "below_chunk_threshold",
+    };
   }
 
   const params: GenerateGitCommitMessageParams = {
@@ -73,8 +89,16 @@ export async function summarizeLargeFile(
 
   try {
     const finalSummary = await invokeModelWithMessages(params, reduceMessages);
-    return `[FILE MAP-REDUCE SUMMARY]\nThis file was too large and was automatically summarized via Map-Reduce.\n\n${finalSummary || combined}`;
+    return {
+      content: `[FILE MAP-REDUCE SUMMARY]\nThis file was too large and was automatically summarized via Map-Reduce.\n\n${finalSummary || combined}`,
+      summarized: true,
+      reason: "summarized",
+    };
   } catch (e) {
-    return `[FILE MAP-REDUCE SUMMARY]\n${combined}\n\n(Error during final reduce: ${e})`;
+    return {
+      content: `[FILE MAP-REDUCE SUMMARY]\n${combined}\n\n(Error during final reduce: ${e})`,
+      summarized: true,
+      reason: "summarized",
+    };
   }
 }

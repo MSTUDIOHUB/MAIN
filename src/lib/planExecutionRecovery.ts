@@ -10,6 +10,7 @@ import {
   type PlanTask,
 } from "./workflowModels";
 import type { MainThreadProgressUpdate } from "./turnEvents";
+import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
 
@@ -138,7 +139,7 @@ function summarizeToolActivity(activity: PlanToolActivitySummary): string {
 }
 
 export function isCachedReadOnlyPlanActivity(activity: PlanToolActivitySummary): boolean {
-  return /FILE_UNCHANGED_STUB|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT/i.test(activity.detail || "");
+  return isReadOnlyNoProgressDetail(activity.detail);
 }
 
 export function summarizeRepeatedPlanTargetsFromToolActivity(activity: PlanToolActivitySummary[], limit = 4): string[] {

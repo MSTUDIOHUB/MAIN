@@ -116,6 +116,7 @@ function createPostProcessingInput(overrides = {}) {
     recentToolActivity,
     recentPlanToolActivity,
     planRuntimePhase: "drafting",
+    planEvidenceRecoveryObjective: "none",
     planDraftingRecoveryReadCount: 0,
     hasPlanDecisionOutput: false,
     unityConsoleDiagnosticsRequested: false,
@@ -191,6 +192,15 @@ test("tool activity tracking counts only successful commands browser checks and 
     target: "npm test",
     content: JSON.stringify({ exitCode: 0, stdout: "ok" }),
   }), {}), true);
+
+  assert.equal(toolResultCountsAsExecutionEvidence(result({
+    name: "run_command",
+    target: "npm test",
+    content: JSON.stringify({
+      exitCode: 0,
+      stdout: "tests passed for FILE_UNCHANGED_STUB and READ_FILE_REPEAT_LIMIT",
+    }),
+  }), {}), true, "source marker text in command output is not cached-read feedback");
 
   assert.equal(toolResultCountsAsExecutionEvidence(result({
     name: "browser_evaluate",
@@ -568,6 +578,7 @@ test("targeted evidence recovery still waits for confirmed closure rationale", (
     turnIntent: "plan",
     runtimeIntent: "plan",
     planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: "deterministic_closure",
     results: [result({
       toolCallId: "impact_recovery_structural",
       name: "repo_map_impact",
@@ -592,6 +603,44 @@ test("targeted evidence recovery still waits for confirmed closure rationale", (
 
   assert.equal(post.planRuntimePhase, "needs_evidence");
   assert.deepEqual(harness.planRuntimePhases, []);
+});
+
+test("model-draft evidence recovery accepts the same structural bundle threshold", () => {
+  const harness = createPostProcessingInput({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: "model_draft",
+    results: [result({
+      toolCallId: "impact_model_draft_recovery",
+      name: "repo_map_impact",
+      target: "src-tauri/src/main.rs",
+      content: "main registers Tauri builder handlers and emits file-open events to the frontend",
+    })],
+    toolArgsByCallId: new Map([["impact_model_draft_recovery", { path: "src-tauri/src/main.rs" }]]),
+    recentSuccessfulProjectWrite: null,
+    recoveringFromEmptyAssistantReplyAfterWrite: false,
+  });
+  harness.input.callbacks = {
+    ...harness.input.callbacks,
+    getMessages: () => [{
+      role: "user",
+      content: "Find why opening a Markdown file shows a blank window and prepare a repair plan.",
+    }],
+    getCurrentTurnId: () => "turn-plan-model-draft-recovery",
+    getContextMemoryState: () => null,
+  };
+
+  const post = handleToolResultPostProcessing(harness.input);
+
+  assert.equal(post.planRuntimePhase, "drafting");
+  assert.equal(post.planEvidenceRecoveryObjective, "model_draft");
+  assert.deepEqual(harness.planRuntimePhases, [{
+    phase: "drafting",
+    reason: "model-authored plan evidence ready",
+    status: "running",
+  }]);
 });
 
 test("a targeted read leaves structure exploration even before semantic evidence is ready", () => {

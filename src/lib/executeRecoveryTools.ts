@@ -1,4 +1,14 @@
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import {
+  isFinitePlanValidationCommand,
+  isFlexiblePlanValidationCommandEvidence,
+  planCommandEvidenceMatchesExecution,
+} from "./workflowModels";
+export {
+  classifyFailedFiniteValidationOutcome,
+  compactStructuredCommandResult,
+  type FailedFiniteValidationOutcome,
+} from "./commandValidationOutcome";
 
 export type ExecuteRecoveryMode =
   | "normal"
@@ -83,7 +93,10 @@ export const EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS = new Set([
   ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
 ]);
 
-const READ_ONLY_NO_PROGRESS_DETAIL_RE = /FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|already called with identical arguments|already been read with the same range|already covered by unchanged earlier read_file results|Covered read windows already in context|READ_FILE_WINDOW_NARROWED|overlapping unchanged lines already in context/i;
+// Runtime-owned no-progress feedback always starts with a marker. Never scan
+// the whole payload: freshly read source may legitimately contain these
+// strings (MAIN's own cache implementation does).
+const READ_ONLY_NO_PROGRESS_DETAIL_RE = /^\s*(?:FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT)\b/i;
 
 export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMode {
   return value === "mutation_first" ||
@@ -235,7 +248,12 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     /^(?:workspace patch)?$/i.test(String(eligible[0]?.target || "").trim());
   const selected = requiresTargetMatch
     ? matchingTargetCall || (soleUnresolvedPatch ? eligible[0] : undefined)
-    : eligible[0];
+    : mode === "finite_validation_only"
+      ? eligible.find((call) =>
+          call.name === "run_command" &&
+          shouldEnterFailedFiniteValidationRecovery(String(call.target || ""))
+        ) || eligible[0]
+      : eligible[0];
   return {
     active: true,
     phase,
@@ -304,6 +322,80 @@ export function isReadOnlyNoProgressDetail(value: string | undefined): boolean {
   return READ_ONLY_NO_PROGRESS_DETAIL_RE.test(String(value || ""));
 }
 
+/**
+ * Failed shell diagnostics must stay on the normal execution surface. Only a
+ * command that can actually satisfy finite Plan command evidence should enter
+ * the run_command-only recovery transaction; otherwise probes such as `lsof`
+ * or `curl` can hide the PTY/browser tools needed to finish the real check.
+ */
+export function shouldEnterFailedFiniteValidationRecovery(command: string): boolean {
+  return isFinitePlanValidationCommand(command);
+}
+
+export function hasPendingPlanCommandEvidence(
+  tasks: ReadonlyArray<{ evidence?: ReadonlyArray<{ kind?: string; value?: string }> }>,
+): boolean {
+  // Inferred validation tasks intentionally use the semantic placeholder
+  // "focused validation command". The actual failed command is classified
+  // separately, so this gate only asks whether command evidence remains.
+  return tasks.some((task) =>
+    (task.evidence || []).some((evidence) => evidence.kind === "cmd")
+  );
+}
+
+export function failedFiniteValidationMatchesPendingPlanEvidence(input: {
+  failedCommand: string;
+  tasks: ReadonlyArray<{ evidence?: ReadonlyArray<{ kind?: string; value?: string }> }>;
+}): boolean {
+  return input.tasks.some((task) =>
+    (task.evidence || []).some((evidence) =>
+      evidence.kind === "cmd" && (
+        isFlexiblePlanValidationCommandEvidence(String(evidence.value || "")) ||
+        planCommandEvidenceMatchesExecution(
+          String(evidence.value || ""),
+          input.failedCommand,
+        )
+      )
+    )
+  );
+}
+
+export function resolveFailedFiniteValidationRecoveryPolicy(input: {
+  failedCommand: string;
+  tasks: ReadonlyArray<{ evidence?: ReadonlyArray<{ kind?: string; value?: string }> }>;
+}): { allowAlternativeCommand: boolean; requiredCommand: string } {
+  const pendingCommands = input.tasks.flatMap((task) =>
+    (task.evidence || [])
+      .filter((evidence) => evidence.kind === "cmd")
+      .map((evidence) => String(evidence.value || "").trim())
+      .filter(Boolean)
+  );
+  const matchingExplicitCommand = pendingCommands.find((command) =>
+    !isFlexiblePlanValidationCommandEvidence(command) &&
+    planCommandEvidenceMatchesExecution(command, input.failedCommand)
+  );
+  if (matchingExplicitCommand) {
+    return {
+      allowAlternativeCommand: false,
+      requiredCommand: matchingExplicitCommand,
+    };
+  }
+
+  // The semantic placeholder deliberately accepts any finite validation
+  // command. It takes ownership of an otherwise-unmatched failed command;
+  // explicit commands later in the task list retain their own exact boundary.
+  if (pendingCommands.some(isFlexiblePlanValidationCommandEvidence)) {
+    return { allowAlternativeCommand: true, requiredCommand: "" };
+  }
+
+  const firstExplicitCommand = pendingCommands.find((command) =>
+    !isFlexiblePlanValidationCommandEvidence(command)
+  );
+  return firstExplicitCommand
+    ? { allowAlternativeCommand: false, requiredCommand: firstExplicitCommand }
+    : { allowAlternativeCommand: true, requiredCommand: "" };
+}
+
 export function countRecentCachedReadOnlyActivities(
   recentActivity: ExecuteRecoveryActivityLike[],
   readOnlyTools: Set<string>,
@@ -337,8 +429,8 @@ export function getMaxRepeatedReadOnlyTargetScore(
     const target = String(activity.target || "").trim();
     if (!target) continue;
     const targetKey = resolveEquivalentRecoveryTargetKey(counts, target);
-    const cachedWeight = isReadOnlyNoProgressDetail(activity.detail) ? 2 : 1;
-    counts.set(targetKey, (counts.get(targetKey) || 0) + cachedWeight);
+    if (!isReadOnlyNoProgressDetail(activity.detail)) continue;
+    counts.set(targetKey, (counts.get(targetKey) || 0) + 1);
   }
   return Math.max(0, ...counts.values());
 }
@@ -401,6 +493,18 @@ export function resolveReadOnlyNoProgressTrigger(input: {
     return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
+  const visibleSuccessfulResults = input.results.filter(
+    (result) => !result.internalFeedback && !result.isError,
+  );
+  const currentBatchHasFreshReadOnlyEvidence = visibleSuccessfulResults.some((result) =>
+    !isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
+  );
+  if (currentBatchHasFreshReadOnlyEvidence) {
+    // Raw call count and output size are context-management signals, not proof
+    // of a loop. A distinct window/version is progress and must remain legal.
+    return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
+  }
+
   const repeatLimit = input.maxNoProgressReadOnlyRepeats ?? 2;
   if ((input.noProgressBatchRepeatCount ?? 0) >= repeatLimit) {
     return { shouldRecover: true, reason: "read_only_no_progress", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
@@ -411,21 +515,10 @@ export function resolveReadOnlyNoProgressTrigger(input: {
     return { shouldRecover: true, reason: "target_repeated_read_only", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
-  const readLimit = input.minReadOnlyActivities ?? 32;
-  if (readOnlyActivityCount >= readLimit) {
-    return { shouldRecover: true, reason: "read_only_budget_exhausted", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
-  }
-
-  const charLimit = input.maxReadOnlyToolChars ?? 30_000;
-  if (batchToolChars >= charLimit) {
-    return { shouldRecover: true, reason: "read_only_tool_chars_exhausted", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
-  }
-
-  const visibleResults = input.results.filter((result) => !result.internalFeedback && !result.isError);
-  const allSuccessfulReadsAreCached = visibleResults.length > 0 && visibleResults.every((result) =>
+  const allSuccessfulReadsAreCached = visibleSuccessfulResults.length > 0 && visibleSuccessfulResults.every((result) =>
     isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
   );
-  const currentBatchHasCachedReadOnly = visibleResults.some((result) =>
+  const currentBatchHasCachedReadOnly = visibleSuccessfulResults.some((result) =>
     isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
   );
   const cachedReadLimit = input.minCachedReadOnlyActivities ?? 0;
@@ -551,8 +644,12 @@ export function buildExecuteValidationRecoveryPrompt(input: {
 export function buildFailedFiniteValidationRecoveryPrompt(input: {
   command: string;
   result: string;
+  allowAlternativeCommand?: boolean;
+  requiredCommand?: string;
 }): string {
   const command = String(input.command || "").trim() || "the failed finite command";
+  const requiredCommand = String(input.requiredCommand || "").trim();
+  const allowAlternativeCommand = input.allowAlternativeCommand !== false || !requiredCommand;
   const result = String(input.result || "")
     .replace(/\s+/g, " ")
     .trim()
@@ -561,9 +658,13 @@ export function buildFailedFiniteValidationRecoveryPrompt(input: {
     "FINITE_VALIDATION_RECOVERY: The last `run_command` failed and cannot satisfy the approved Plan's command evidence.",
     `Failed command: ${command}`,
     result ? `Observed result: ${result}` : "Observed result: no usable command output was returned.",
-    "The next tool surface is intentionally limited to `run_command`. Call one different finite validation command that matches the actual project runtime and source format (for example an existing test, build, typecheck, lint, or compile command).",
+    allowAlternativeCommand
+      ? "The pending Plan evidence is a generic finite-validation placeholder. The next tool surface is intentionally limited to `run_command`; call one different finite validation command that matches the actual project runtime and source format (for example an existing test, build, typecheck, lint, or compile command)."
+      : `The approved Plan requires this exact command evidence: ${requiredCommand}. The next tool surface is intentionally limited to \`run_command\`; retry that same command after correcting its prerequisites or invocation. Do not substitute a different build, test, lint, or typecheck command, because it cannot satisfy this explicit Plan task.`,
     "Do not switch this finite check to `execute_command` or PTY tools, do not reread an already-modified source file, and do not infer that a successful file edit was reverted merely because the validation command itself was invalid.",
-    "Use stdout, stderr, and exitCode to distinguish a real source/test failure from a wrong command. If the diagnostic names a real source defect, repair it in a later normal execution transaction; otherwise choose a compatible finite command now. Do not repeat the failed command unchanged and do not claim completion before exitCode 0.",
+    allowAlternativeCommand
+      ? "Use stdout, stderr, and exitCode to distinguish a real source/test failure from a wrong command. If the diagnostic names a real source defect, repair it in a later normal execution transaction; otherwise choose a compatible finite command now. Do not repeat the failed command unchanged and do not claim completion before exitCode 0."
+      : `Use stdout, stderr, and exitCode to diagnose and correct the failure, but keep \`${requiredCommand}\` as the acceptance boundary. Retry that exact command and do not claim completion until that command returns exitCode 0.`,
   ].join("\n");
 }
 

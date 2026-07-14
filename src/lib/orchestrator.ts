@@ -38,6 +38,8 @@ import { acquireModelLane } from "./modelLaneCoordinator";
 import { MODEL_CONTROL_LANGUAGE } from "./modelControlLanguage";
 import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
+import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
+import { workspacePathsReferToSameFile } from "./workspacePaths";
 import { parseApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import {
   commitResolvedPlanArtifactUpdate,
@@ -46,6 +48,7 @@ import {
 } from "./planArtifactSync";
 import {
   buildReadFileWindowContinuationGuidance,
+  resolveReadFileResultAfterLargeFileSummary,
 } from "./readFileWindow";
 import {
   FILE_UNCHANGED_STUB,
@@ -198,6 +201,7 @@ import {
   isPlanEvidenceBundleReady,
   type PlanEvidenceBundle,
 } from "./planEvidence";
+import { compactStructuredCommandResult } from "./commandValidationOutcome";
 import { VERIFICATION_TOOL_NAMES } from "./verificationEvidence";
 import {
   buildBrowserValidationFailureContent,
@@ -1013,8 +1017,8 @@ export function buildShellReadValidationError(
   if (isShellRead) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
-      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 直接读取文件内容——这会占用 LLM 上下文窗口的 token 容量（与系统内存无关）。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline 或基于已有缓存直接 patch/验证/最终说明，不要改用 cat/sed/head/tail 绕行。`
-      : `SHELL_READ_FORBIDDEN: Reading files via terminal commands (${command}) is disabled — this would consume LLM context window token capacity (unrelated to system memory). Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline or proceed from cached context to patching, validation, or the final answer instead of cat/sed/head/tail.`;
+      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 绕过文件读取工具。原因不是终端本身占用系统内存，而是 cat/sed/head/tail 的原始输出绕过 read_file 的分页、文件版本和重复窗口缓存，容易把相同内容反复灌入 LLM 上下文。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline 或基于已有缓存直接 patch/验证/最终说明。`
+      : `SHELL_READ_FORBIDDEN: Do not bypass the file-reading tools with terminal command (${command}). The issue is not terminal memory use: raw cat/sed/head/tail output bypasses read_file paging, file-version checks, and duplicate-window caching, so identical content can be injected into the LLM context repeatedly. Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline or proceed from cached context to patching, validation, or the final answer.`;
     const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
     emitToolPreflightBlocked(callbacks, {
@@ -1039,17 +1043,37 @@ export function buildShellReadValidationError(
 }
 
 /**
- * Detect repetitive read/write loops on the same file path and enforce a circuit-breaker.
+ * Detect repetitive mutation loops on the same file path and enforce a circuit-breaker.
+ * read_file has its own versioned, range-aware cache and must not be limited by
+ * a path-only count: distinct windows and post-mutation verification are valid.
  */
+function collectMutationPathsForLoopGuard(
+  toolName: string,
+  args: Record<string, unknown>,
+): string[] {
+  if (toolName !== "apply_patch") {
+    return [String(args.path || args.TargetFile || "").trim()].filter(Boolean);
+  }
+  const parsed = parseApplyPatch(String(args.patch || ""));
+  if (!parsed.ok) return [];
+  return [...new Set(parsed.operations.flatMap((operation) =>
+    [operation.path, operation.newPath || ""].filter(Boolean)
+  ))];
+}
+
 export function buildLoopDetectionValidationError(
   tc: ToolCallToExecute,
   args: Record<string, unknown>,
   callbacks: OrchestratorCallbacks,
 ): ToolExecutionResult | null {
-  if (tc.name !== "write_file" && tc.name !== "replace_in_file" && tc.name !== "read_file") return null;
+  if (
+    tc.name !== "write_file" &&
+    tc.name !== "replace_in_file" &&
+    tc.name !== "apply_patch"
+  ) return null;
 
-  const path = typeof args.path === "string" ? args.path.trim() : "";
-  if (!path) return null;
+  const currentPaths = collectMutationPathsForLoopGuard(tc.name, args);
+  if (currentPaths.length === 0) return null;
 
   const messages = callbacks.getMessages();
   const currentTurnMessages: AgentMessage[] = [];
@@ -1069,26 +1093,35 @@ export function buildLoopDetectionValidationError(
     const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content ?? "");
     successfulToolResultsByCallId.set(
       toolCallId,
-      !/^\s*Error:|"\s*status\s*"\s*:\s*"(?:failed|blocked|declined)"|"\s*isError\s*"\s*:\s*true|LOOP_DETECTED|REPEATED_FAILURE_BLOCKED/i.test(content),
+      !/^\s*Error:|"\s*status\s*"\s*:\s*"(?:failed|blocked|declined|no_op|no_effect_mutation)"|"\s*isError\s*"\s*:\s*true|"\s*noOp\s*"\s*:\s*true|NO_EFFECT_MUTATION|LOOP_DETECTED|REPEATED_FAILURE_BLOCKED/i.test(content),
     );
   }
 
-  const samePathCalls: Array<{ name: string; id?: string; order: number; successful: boolean }> = [];
+  const samePathCalls = new Map<string, Array<{ order: number; successful: boolean }>>(
+    currentPaths.map((path) => [path, []]),
+  );
   currentTurnMessages.forEach((msg, order) => {
     if (msg.role === "assistant" && Array.isArray(msg.tool_calls)) {
       for (const call of msg.tool_calls) {
         const c = call as { id?: string; function?: { name?: string; arguments?: string } };
-        if (c.function?.name === "write_file" || c.function?.name === "replace_in_file" || c.function?.name === "apply_patch" || c.function?.name === "read_file") {
+        if (c.function?.name === "write_file" || c.function?.name === "replace_in_file" || c.function?.name === "apply_patch") {
           if (c.id === tc.id) continue;
           try {
             const parsed = JSON.parse(c.function.arguments || "{}");
-            const parsedPath = String(parsed.path || parsed.TargetFile || "").trim();
-            if (parsedPath === path) {
-              samePathCalls.push({
-                name: c.function.name,
-                id: c.id,
+            const resultSucceeded = c.id
+              ? successfulToolResultsByCallId.get(c.id)
+              : undefined;
+            // A sibling call in the current unexecuted batch has no result yet.
+            // It is neutral and must not reset a real historical failure streak.
+            if (resultSucceeded == null) continue;
+            const parsedPaths = collectMutationPathsForLoopGuard(c.function.name, parsed);
+            for (const currentPath of currentPaths) {
+              if (!parsedPaths.some((candidate) =>
+                workspacePathsReferToSameFile(candidate, currentPath)
+              )) continue;
+              samePathCalls.get(currentPath)?.push({
                 order,
-                successful: c.id ? successfulToolResultsByCallId.get(c.id) !== false : true,
+                successful: resultSucceeded,
               });
             }
           } catch {
@@ -1099,56 +1132,23 @@ export function buildLoopDetectionValidationError(
     }
   });
 
-  const repetitions = samePathCalls.length;
-  if (repetitions >= 5) {
+  // Successful iterative edits are real progress. This legacy safety net is
+  // only for repeated failed mutations on the same target; exact-argument
+  // failures and no-op writes are handled by the more specific guards.
+  const blockedPath = currentPaths.find((currentPath) => {
+    const calls = samePathCalls.get(currentPath) || [];
+    const repetitions = calls.reduce(
+      (streak, call) => call.successful ? 0 : streak + 1,
+      0,
+    );
+    return repetitions >= 5;
+  });
+  if (blockedPath) {
     const target = getToolTarget(tc.name, args);
-    if (tc.name === "read_file") {
-      const mutations = samePathCalls
-        .filter((call) => call.name === "write_file" || call.name === "replace_in_file" || call.name === "apply_patch");
-      const latestMutation = mutations[mutations.length - 1];
-      const readsAfterLatestMutation = latestMutation
-        ? samePathCalls.filter((call) => call.name === "read_file" && call.order > latestMutation.order).length
-        : Number.POSITIVE_INFINITY;
-      if (latestMutation && readsAfterLatestMutation === 0) return null;
-
-      const language = callbacks.getPreferredLanguage();
-      const message = language === "zh"
-        ? [
-            `READ_FILE_REPEAT_LIMIT: ${path} 已在当前回合被重复读取/修改多次，本次 read_file 不再重新读取。`,
-            "请复用已有缓存内容；read_file 仍开放时，只能改用 start_line/end_line/max_lines 读取真正缺失的窗口。",
-            "如果本轮工具面已经关闭 read_file，请改用 grep_search/get_file_outline，或基于已有上下文直接 patch/验证/最终说明；不要用 shell cat/sed/head/tail 绕过。",
-            "如果已有上下文不足以继续，请在正文中说明缺失信息和阻塞点，不要原样重试。",
-          ].join("\n")
-        : [
-            `READ_FILE_REPEAT_LIMIT: ${path} has already been read/edited repeatedly in this turn, so this read_file call was not re-run.`,
-            "Reuse cached content; when read_file is still exposed, only narrow the next request with start_line/end_line/max_lines for a genuinely missing window.",
-            "If the current tool surface has closed read_file, switch to grep_search/get_file_outline, or proceed from existing context to patching, validation, or the final answer; do not bypass this with shell cat/sed/head/tail.",
-            "If the available context is insufficient, explain the missing information and blocker in prose instead of retrying the same call.",
-          ].join("\n");
-      callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
-      emitToolPreflightBlocked(callbacks, {
-        reason: "read_file_repeat_limit",
-        tool: tc.name,
-        target,
-        message,
-        toolCallId: tc.id,
-        lifecycleState: "completed",
-      });
-      callbacks.onToolDone(tc.name, target, message, { toolCallId: tc.id });
-      return {
-        toolCallId: tc.id,
-        name: tc.name,
-        target,
-        content: message,
-        isError: false,
-        lifecycleState: "completed",
-      };
-    }
-
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
-      ? `LOOP_DETECTED: 检测到你在文件 ${path} 上执行了多次重复的读取/修改操作。为防止死循环，本次调用已拦截。请暂停并在正文中解释为什么之前的改动未能成功应用（如编译错误或环境问题），然后使用 <user_options> 请用户确认方向。`
-      : `LOOP_DETECTED: Detected multiple repetitive read/write operations on ${path}. To prevent an infinite execution loop, this call has been blocked. Please pause and explain in prose why previous edits failed (e.g. build errors or environment issues), then use <user_options> to ask the user for guidance.`;
+      ? `LOOP_DETECTED: 检测到你在文件 ${blockedPath} 上执行了多次连续失败的修改。为防止死循环，本次调用已拦截。请暂停并在正文中解释为什么之前的改动未能成功应用（如编译错误或环境问题），然后使用 <user_options> 请用户确认方向。`
+      : `LOOP_DETECTED: Detected multiple consecutively failed mutations on ${blockedPath}. To prevent an infinite execution loop, this call has been blocked. Please pause and explain in prose why previous edits failed (e.g. build errors or environment issues), then use <user_options> to ask the user for guidance.`;
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
     emitToolPreflightBlocked(callbacks, {
       reason: "loop_detected",
@@ -1938,7 +1938,7 @@ export function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: 
         "请先根据已有工具结果判断任务是否已经完成：如果完成，直接输出最终总结并停止，不要再调用工具。",
         "如果 read_file 当前不可用，不要继续请求 read_file，也不要改用 cat/sed/head/tail 通过 shell 读取文件。",
         "如果 grep_search/get_file_outline 已经给出足够定位信息，请直接用 replace_in_file/apply_patch 做最小修改，或运行一次验证命令；不要再调用新的搜索/泛读工具。",
-        "不要重复读取、重复验证或继续改同一个目标而没有新证据。",
+        "不要在文件和上下文都未变化时重复同一读取窗口、重复同一验证或继续修改同一目标而没有新证据；修改后的复读和新的必要范围属于有效验证。",
       ].join("\n")
     : [
         `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
@@ -1946,7 +1946,7 @@ export function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: 
         "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
         "If read_file is unavailable, do not keep requesting read_file and do not switch to cat/sed/head/tail shell file reads.",
         "If grep_search/get_file_outline already provide enough location context, directly apply the smallest replace_in_file/apply_patch edit or run one validation command; do not call new search or broad read tools.",
-        "Do not repeat reads, repeat validation, or keep editing the same target without new evidence.",
+        "Do not repeat the same read window or validation while file/context state is unchanged, or keep editing the same target without new evidence; a post-mutation reread or a newly required range is valid verification.",
     ].join("\n");
 }
 
@@ -2027,8 +2027,8 @@ export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en",
     "用户已经允许本会话的只读检查，但上一轮仍没有产生有效工具进展。",
     "不要再次询问许可，也不要只描述接下来要读取什么。",
     workflowMode === "plan"
-      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交由 MAIN runtime 物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，不要重复读取。"
-      : "如果还需要证据，现在只调用一次定向读取/搜索工具。目标已缓存时复用已有内容，并进入下一个真实动作：写入/替换、运行有限命令、浏览器验证，或说明精确阻塞。",
+      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交由 MAIN runtime 物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取。"
+      : "如果还需要证据，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取，然后进入写入/替换、有限命令、浏览器验证或精确阻塞。",
   ].join("\n");
 }
 
@@ -2595,8 +2595,8 @@ export function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallb
     approvalChoiceHint +
     (callbacks.getPlanTasks().length > 0
       ? language === "zh"
-        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，ExecutionCapsule 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。如果某个源码文件已经读过，再读只返回 `FILE_UNCHANGED_STUB`，不要重复读取，必须转向 `apply_patch`/`replace_in_file`/`write_file`、运行验证、读取不同目标，或明确暂停说明阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
-        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so ExecutionCapsule can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. If a source file has already been read and another read only returns `FILE_UNCHANGED_STUB`, do not reread it; switch to `apply_patch`/`replace_in_file`/`write_file`, run validation, inspect a different target, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，ExecutionCapsule 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。只有同一文件版本、同一读取范围仍在当前上下文且再次读取只返回 `FILE_UNCHANGED_STUB` 时，才应停止该无进展重复；文件修改后、结果已淘汰或需要不同范围时可以重新读取。否则转向 `apply_patch`/`replace_in_file`/`write_file`、验证、其他必要范围或精确阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so ExecutionCapsule can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Stop rereading only when the same range of the same unchanged file version is still active and another read returns `FILE_UNCHANGED_STUB`; reread after mutation, eviction, or for a different required range. Otherwise patch/write, validate, inspect another needed range, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
       : language === "zh"
       ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行。\n"
       : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
@@ -3818,8 +3818,8 @@ function buildToolResultHistoryContent(result: ToolExecutionResult): string {
   const isNoOp = /"noOp"\s*:\s*true/.test(result.content || "");
   const isNoEffectMutation = /NO_EFFECT_MUTATION/i.test(result.content || "");
   const isCachedReuse =
-    result.content.includes(FILE_UNCHANGED_STUB) ||
-    /Repeated read-only tool call skipped:|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT/i.test(result.content);
+    PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name) &&
+    isReadOnlyNoProgressDetail(result.displayContent || result.content);
   const status: ToolFeedbackStatus =
     lifecycleState === "declined"
       ? "declined"
@@ -4154,9 +4154,30 @@ async function executeToolCallWithLifecycle(
     // Auto Map-Reduce for large files during read_file
     if (tc.name === "read_file" && resultStr.includes("truncated: true") && !resolvedArgs.start_line) {
       const { summarizeLargeFile } = await import("./summarizeLargeFile");
-      const summary = await summarizeLargeFile(resolvedArgs.path as string, workspace, sessionKey, callbacks.getConfig());
-      resultStr = summary;
-      rawResult = summary;
+      const summary = await summarizeLargeFile(
+        resolvedArgs.path as string,
+        workspace,
+        sessionKey,
+        callbacks.getConfig(),
+      );
+      const resolvedSummaryResult = resolveReadFileResultAfterLargeFileSummary(
+        resultStr,
+        summary,
+      );
+      if (summary.summarized) {
+        resultStr = resolvedSummaryResult;
+        rawResult = resolvedSummaryResult;
+      } else {
+        // Keep the bounded READ_FILE_RESULT envelope. It carries totalLines,
+        // returnedLines and nextStartLine, so a model can request a genuinely
+        // new window instead of repeating the whole file after raw content is
+        // clipped by the generic tool-result character budget.
+        logAgentEvent("large_file_summary_skipped", {
+          target,
+          reason: summary.reason,
+          preservedReadWindow: true,
+        });
+      }
     }
 
     const mutationAfterMeta = mutationVerificationPath
@@ -4211,8 +4232,12 @@ async function executeToolCallWithLifecycle(
     }
     const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
     const budgets = getToolResultBudgets(tc.name, cloudProfile);
-    const modelContent = truncateToolContent(resultStr, budgets.modelChars);
-    const displayContent = truncateToolContent(resultStr, budgets.displayChars);
+    const modelContent = tc.name === "run_command"
+      ? compactStructuredCommandResult(resultStr, budgets.modelChars)
+      : truncateToolContent(resultStr, budgets.modelChars);
+    const displayContent = tc.name === "run_command"
+      ? compactStructuredCommandResult(resultStr, budgets.displayChars)
+      : truncateToolContent(resultStr, budgets.displayChars);
 
     const planArtifactSyncCallbacks = {
       onPlanArtifactUpdated: callbacks.onPlanArtifactUpdated,

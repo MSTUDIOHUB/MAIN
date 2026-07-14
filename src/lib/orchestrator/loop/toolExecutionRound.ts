@@ -2,6 +2,7 @@ import type { HooksConfig } from "../../hooks";
 import type { FileReadState } from "../../orchestrator/fileReadCache";
 import {
   hashString,
+  invalidateWorkspaceReadCachesAfterMutation,
   pruneFileReadStates,
 } from "../../orchestrator/fileReadCache";
 import {
@@ -40,6 +41,31 @@ export type LocalFileReadToolCallForRound = ToolCallToExecute & {
 export type WriteToolCallForRound = ToolCallToExecute & {
   skipUserReview?: boolean;
 };
+
+export function shouldAdvanceWorkspaceObservationEpoch(
+  toolName: string,
+  result: Pick<ToolExecutionResult, "content" | "displayContent" | "isError" | "lifecycleState">,
+): boolean {
+  const isExplicitWorkspaceMutation =
+    toolName === "apply_patch" ||
+    toolName === "replace_in_file" ||
+    toolName === "write_file" ||
+    toolName === "delete_workspace_path";
+  const isOpaqueWorkspaceAction =
+    toolName === "run_command" ||
+    toolName === "execute_command" ||
+    toolName === "send_pty_input";
+  if (!isExplicitWorkspaceMutation && !isOpaqueWorkspaceAction) return false;
+  if (
+    result.isError ||
+    result.lifecycleState === "blocked" ||
+    result.lifecycleState === "declined"
+  ) return false;
+  if (!isExplicitWorkspaceMutation) return true;
+  return !/"noOp"\s*:\s*true|NO_EFFECT_MUTATION|"status"\s*:\s*"(?:no_op|no_effect_mutation)"/i.test(
+    result.content || result.displayContent || "",
+  );
+}
 
 export type ToolExecutionRoundResult =
   | {
@@ -117,7 +143,19 @@ export async function executeToolExecutionRound(input: {
       },
     );
     const normalizedReadResults: ToolExecutionResult[] = [];
+    let sawSuccessfulPtyObservation = false;
     for (const result of readResults) {
+      if (
+        !result.isError &&
+        (
+          result.name === "read_pty_buffer" ||
+          result.name === "read_pty_tail" ||
+          result.name === "read_pty_since" ||
+          result.name === "get_pty_status"
+        )
+      ) {
+        sawSuccessfulPtyObservation = true;
+      }
       const readFileRepeatLimitResult = isReadFileRepeatLimitResult(result);
       const narrowedNote = readFileWindowNarrowedNotes.get(result.toolCallId);
       const resultForModel = narrowedNote && !result.isError
@@ -175,6 +213,24 @@ export async function executeToolExecutionRound(input: {
       }
       normalizedReadResults.push(resultForModel);
     }
+    if (sawSuccessfulPtyObservation) {
+      // A long-running process can mutate files between PTY polls. Treat each
+      // successful observation as a new workspace epoch and invalidate after
+      // processing the entire concurrent read batch, so a later result in the
+      // same batch cannot repopulate a cache that was just cleared.
+      const invalidation = invalidateWorkspaceReadCachesAfterMutation({
+        toolName: "execute_command",
+        args: {},
+        fileReadStates,
+        readOnlyResultCache,
+        readOnlyDuplicateSkipCounts,
+      });
+      logAgentEvent("workspace_read_cache_invalidated_after_pty_observation", {
+        iteration,
+        invalidatedFileReadStates: invalidation.invalidatedFileReadSignatures.length,
+        invalidatedReadOnlyEntries: invalidation.invalidatedReadOnlyEntries,
+      });
+    }
     allResults.push(...normalizedReadResults);
     if (abortSignal.aborted) return finishAborted();
   }
@@ -231,6 +287,24 @@ export async function executeToolExecutionRound(input: {
       },
     );
     allResults.push(result);
+    if (shouldAdvanceWorkspaceObservationEpoch(tc.name, result)) {
+      const toolArgs = parseToolCallArguments(tc, workspace);
+      const invalidation = invalidateWorkspaceReadCachesAfterMutation({
+        toolName: tc.name,
+        args: toolArgs,
+        target: result.target,
+        fileReadStates,
+        readOnlyResultCache,
+        readOnlyDuplicateSkipCounts,
+      });
+      logAgentEvent("workspace_read_cache_invalidated_after_mutation", {
+        iteration,
+        tool: tc.name,
+        target: result.target,
+        invalidatedFileReadStates: invalidation.invalidatedFileReadSignatures.length,
+        invalidatedReadOnlyEntries: invalidation.invalidatedReadOnlyEntries,
+      });
+    }
     if (
       tc.name !== "browser_evaluate" &&
       browserValidationCache.size > 0 &&

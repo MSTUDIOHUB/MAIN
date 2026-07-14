@@ -17,11 +17,13 @@ import {
   CONCISE_PLAN_ARTIFACT_HINT_ZH,
   logAgentEvent,
 } from "../../orchestrator";
-import { MAX_PLAN_EVIDENCE_RECOVERY_PASSES } from "../../planRuntime";
 import type { OrchestratorCallbacks } from "../types";
 import { resolveExecuteNoToolCheckpointLimit } from "./executeNoToolRecovery";
 import { handlePlanQualityRecoveryAfterVisibleMaterialization } from "./planQualityRecovery";
-import type { PlanRuntimePhaseQualitySnapshot } from "./planRuntimeState";
+import type {
+  PlanEvidenceRecoveryObjective,
+  PlanRuntimePhaseQualitySnapshot,
+} from "./planRuntimeState";
 
 export type PlanNoToolRecoveryStatus = "none" | "continue" | "stopped";
 export type PlanClosureAttemptResult = "not_attempted" | "failed" | "stopped" | "approved_continue";
@@ -36,6 +38,7 @@ export type PlanNoToolRecoveryResult = {
   planLastMissingSections: string[];
   planFacetMappingSource: string;
   planArtifactQualityRejected: boolean;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planAutoScaffoldPromptIssued: boolean;
   planEvidenceRecoveryPasses: number;
 };
@@ -268,6 +271,7 @@ export async function handlePlanNoToolRecovery(input: {
   usedPlanRecoveryPrompt: boolean;
   planClosureEvidenceRecoveryIssued: boolean;
   planRuntimePhase: PlanRuntimePhase;
+  planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
@@ -334,6 +338,7 @@ export async function handlePlanNoToolRecovery(input: {
   let planLastMissingSections = initialPlanLastMissingSections ?? [];
   let currentPlanFacetMappingSource = initialPlanFacetMappingSource || "";
   let currentPlanArtifactQualityRejected = planArtifactQualityRejected === true;
+  let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
   let currentPlanEvidenceRecoveryPasses = planEvidenceRecoveryPasses;
   const finish = (status: PlanNoToolRecoveryStatus): PlanNoToolRecoveryResult => ({
@@ -346,6 +351,7 @@ export async function handlePlanNoToolRecovery(input: {
     planLastMissingSections,
     planFacetMappingSource: currentPlanFacetMappingSource,
     planArtifactQualityRejected: currentPlanArtifactQualityRejected,
+    planEvidenceRecoveryObjective,
     planAutoScaffoldPromptIssued,
     planEvidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
   });
@@ -416,6 +422,7 @@ export async function handlePlanNoToolRecovery(input: {
       planLastQualityGateReason: currentPlanLastQualityGateReason,
       planLastMissingSections,
       planArtifactQualityRejected: currentPlanArtifactQualityRejected,
+      planEvidenceRecoveryObjective,
       planAutoScaffoldPromptIssued,
       planClosureEvidenceRecoveryIssued,
       planEvidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
@@ -428,6 +435,7 @@ export async function handlePlanNoToolRecovery(input: {
     currentPlanArtifactQualityRejected = recovery.planArtifactQualityRejected;
     planAutoScaffoldPromptIssued = recovery.planAutoScaffoldPromptIssued;
     planClosureEvidenceRecoveryIssued = recovery.planClosureEvidenceRecoveryIssued;
+    planEvidenceRecoveryObjective = recovery.planEvidenceRecoveryObjective;
     currentPlanEvidenceRecoveryPasses = recovery.planEvidenceRecoveryPasses;
 
     const newlyIssuedClosureEvidenceRecovery =
@@ -492,6 +500,7 @@ export async function handlePlanNoToolRecovery(input: {
         // manufacture a prompt-history flag that never reached the model.
         planAutoScaffoldPromptIssued = priorPlanAutoScaffoldPromptIssued;
         planClosureEvidenceRecoveryIssued = priorPlanClosureEvidenceRecoveryIssued;
+        planEvidenceRecoveryObjective = "none";
         const language = callbacks.getPreferredLanguage();
         return finish(await handOffApprovedPlan({
           callbacks,
@@ -511,13 +520,13 @@ export async function handlePlanNoToolRecovery(input: {
 
       if (
         evidenceMaterialized.quality?.recoveryAction === "targeted_evidence" &&
-        !planClosureEvidenceRecoveryIssued &&
-        currentPlanEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES
+        !planClosureEvidenceRecoveryIssued
       ) {
         const materializationReason = evidenceMaterialized.reason || "deterministic_plan_needs_targeted_evidence";
         currentPlanArtifactQualityRejected = true;
         currentPlanLastQualityGateReason = materializationReason;
         planClosureEvidenceRecoveryIssued = true;
+        planEvidenceRecoveryObjective = "deterministic_closure";
         setPlanRuntimePhase("needs_evidence", materializationReason);
         const targetedPrompt = buildPlanClosureEvidenceRecoveryPrompt(
           MODEL_CONTROL_LANGUAGE,
@@ -796,8 +805,9 @@ export async function handlePlanNoToolRecovery(input: {
           iteration,
           visibleChars: sourceVisibleText.length,
         });
-        if (!planClosureEvidenceRecoveryIssued && currentPlanEvidenceRecoveryPasses < MAX_PLAN_EVIDENCE_RECOVERY_PASSES) {
+        if (!planClosureEvidenceRecoveryIssued) {
           planClosureEvidenceRecoveryIssued = true;
+          planEvidenceRecoveryObjective = "deterministic_closure";
           setPlanRuntimePhase("needs_evidence", "plan closure failed");
           callbacks.onStatusChange("running");
           callbacks.appendMessage({
