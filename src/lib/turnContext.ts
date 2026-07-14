@@ -1,4 +1,5 @@
 import { isContextMemoryText } from "./contextMemory";
+import { looksLikeSyntheticContinuationText } from "./syntheticContinuation";
 import { extractPrimaryUserRequestText } from "./turnIntake";
 
 export interface TurnContextMessageLike {
@@ -36,6 +37,7 @@ export function isSyntheticRecoveryUserText(text: string): boolean {
   if (!value) return true;
   return (
     isContextMemoryText(value) ||
+    looksLikeSyntheticContinuationText(value) ||
     /^\[(?:System|FORCED WRITE|PLAN_[A-Z_]+|EXECUTE_[A-Z_]+|TOOL_[A-Z_]+|APPROVED_PLAN_[A-Z_]+)\b/i.test(value) ||
     /^(?:PLAN_[A-Z_]+|EXECUTE_[A-Z_]+|TOOL_[A-Z_]+|APPROVED_PLAN_[A-Z_]+)\s*:/i.test(value) ||
     /^(?:计划已批准(?:[，。]|$)|The plan is approved(?:[,.]|$))/i.test(value) ||

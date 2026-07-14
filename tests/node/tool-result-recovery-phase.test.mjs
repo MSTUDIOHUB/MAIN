@@ -32,6 +32,20 @@ test("tool result recovery phase owns post-tool recovery ordering", () => {
   assert.match(phaseSource, /handleExecuteConvergencePrompt\(\{[\s\S]*?logAgentEvent\("post_tool_result_continuation"/);
 });
 
+test("Goal evidence is checked immediately after tool results enter history", () => {
+  const appendIndex = phaseSource.indexOf("appendToolResultsToHistory({", phaseSource.indexOf("handleNoProgressRecovery({"));
+  const checkpointIndex = phaseSource.indexOf("evaluateGoalToolResultCheckpoint?.(");
+  const readRecoveryIndex = phaseSource.indexOf("handleReadFileRepeatLimitRecovery({");
+
+  assert.notEqual(appendIndex, -1);
+  assert.notEqual(checkpointIndex, -1);
+  assert.notEqual(readRecoveryIndex, -1);
+  assert.ok(appendIndex < checkpointIndex);
+  assert.ok(checkpointIndex < readRecoveryIndex);
+  assert.match(phaseSource, /return finish\("goal_completed"\)/);
+  assert.match(orchestratorSource, /toolIterationPhase\.status === "goal_completed"[\s\S]*?goal_inner_loop_evidence_boundary[\s\S]*?return;/);
+});
+
 test("tool result recovery phase owns runtime state folds", () => {
   assert.match(
     phaseSource,

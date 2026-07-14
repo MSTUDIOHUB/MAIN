@@ -188,7 +188,12 @@ export function resolveAgentLoopTurnInputContext(
     .reverse()
     .find((message) => message.role === "user");
   const latestUserPromptFullText = latestUserPrompt ? extractCompatibilityTextContent(latestUserPrompt.content) : "";
-  const latestUserPromptText = canonicalUserContext.texts.join("\n\n") ||
+  // Goal slices keep the outer conversation intent (`execute`) for tool
+  // policy compatibility. The structured contract, not that legacy intent,
+  // is the authoritative signal that this is a Goal continuation.
+  const goalObjective = String(callbacks.getGoalTurnContract?.()?.objective || "").trim();
+  const latestUserPromptText = goalObjective ||
+    canonicalUserContext.texts.join("\n\n") ||
     extractPrimaryUserRequestText(latestUserPromptFullText) ||
     latestUserPromptFullText;
   const traceContext = callbacks.getRuntimeTraceContext?.();
@@ -197,7 +202,8 @@ export function resolveAgentLoopTurnInputContext(
     turnId: turnId || null,
     runId: traceContext?.runId || callbacks.getCurrentRunIdentity?.().runId || marker?.runId || null,
     parentRunId: traceContext?.parentRunId ?? callbacks.getCurrentRunIdentity?.().parentRunId ?? marker?.parentRunId ?? null,
-    source: canonicalUserContext.source,
+    source: goalObjective ? "goal_contract_objective" : canonicalUserContext.source,
+    goalObjectiveChars: goalObjective.length,
     turnStartMessageIndex: canonicalUserContext.turnStartMessageIndex,
     canonicalUserMessageCount: canonicalUserContext.texts.length,
     canonicalUserChars: canonicalUserContext.texts.reduce((total, text) => total + text.length, 0),

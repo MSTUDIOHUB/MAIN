@@ -10,7 +10,7 @@ import {
   summarizeToolsForDiagnostics,
 } from "../../orchestrator";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
-import type { StreamResult } from "../../streaming";
+import type { OpenAiToolChoice, StreamResult } from "../../streaming";
 import type { ToolDefinition } from "../../toolSchemas";
 import { PolicyFactory } from "../policies/PolicyFactory";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
@@ -34,21 +34,57 @@ export function resolveRecoveryToolChoice(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   approvedPlanActionOnlyRecoveryActive: boolean;
   approvedPlanNoToolRecoveryFileReadActive: boolean;
-  llmToolCount: number;
+  llmToolNames: string[];
   forceXmlTools: boolean;
+  preferExplicitFunction?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
-}): "required" | undefined {
-  if (input.llmToolCount <= 0 || input.forceXmlTools) return undefined;
+}): OpenAiToolChoice | undefined {
+  const availableToolNames = new Set(input.llmToolNames);
+  if (availableToolNames.size <= 0 || input.forceXmlTools) return undefined;
   const executeRecoveryRequiresAction =
     input.isExecuteRecoveryEligible && input.executeRecoveryMode !== "normal";
   const approvedPlanRecoveryRequiresAction =
     input.approvedPlanActionOnlyRecoveryActive ||
     input.approvedPlanNoToolRecoveryFileReadActive;
-  return executeRecoveryRequiresAction ||
+  const requiresTool = executeRecoveryRequiresAction ||
     approvedPlanRecoveryRequiresAction ||
-    input.preapprovalPlanQualityRecoveryToolChoice === "required"
-    ? "required"
-    : undefined;
+    input.preapprovalPlanQualityRecoveryToolChoice === "required";
+  if (!requiresTool) return undefined;
+
+  if (input.preferExplicitFunction) {
+    const firstAvailable = (candidates: string[]): string | null =>
+      candidates.find((name) => availableToolNames.has(name)) || null;
+    let selectedTool: string | null = null;
+    if (input.isExecuteRecoveryEligible) {
+      if (input.executeRecoveryMode === "patch_recovery_read") {
+        selectedTool = firstAvailable(["read_file"]);
+      } else if (
+        input.executeRecoveryMode === "mutation_first" ||
+        input.executeRecoveryMode === "action_only"
+      ) {
+        selectedTool = firstAvailable(["apply_patch", "replace_in_file", "write_file"]);
+      } else if (input.executeRecoveryMode === "validation_only") {
+        selectedTool = firstAvailable([
+          "run_command",
+          "execute_command",
+          "browser_evaluate",
+          "git_diff",
+          "git_status",
+        ]);
+      }
+    }
+    if (!selectedTool && input.approvedPlanActionOnlyRecoveryActive) {
+      selectedTool = firstAvailable(["apply_patch", "replace_in_file", "write_file"]);
+    }
+    if (!selectedTool && input.approvedPlanNoToolRecoveryFileReadActive) {
+      selectedTool = firstAvailable(["read_file"]);
+    }
+    if (selectedTool) {
+      return { type: "function", function: { name: selectedTool } };
+    }
+  }
+
+  return "required";
 }
 
 export type InitialStreamInvocationResult =
@@ -229,8 +265,9 @@ export async function invokeInitialStreamForIteration(input: {
     executeRecoveryMode,
     approvedPlanActionOnlyRecoveryActive,
     approvedPlanNoToolRecoveryFileReadActive,
-    llmToolCount: llmTools.length,
+    llmToolNames: llmTools.map((tool) => tool.function.name),
     forceXmlTools,
+    preferExplicitFunction: config.activeProfile === "local",
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
   });

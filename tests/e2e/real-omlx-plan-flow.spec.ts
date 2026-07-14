@@ -896,7 +896,7 @@ for (const model of models) {
     await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
 
     const dispatchResult = await page.evaluate(() => (window as any).__CODELY_E2E__?.sendGoalMessage?.(
-      "修改 src/hooks/useCsvParser.ts，将 CSV creator 字段映射到 Dashboard 使用的 creatorName。完成标准：源码已修改且运行测试或类型检查通过；约束：保持 creator 向后兼容。",
+      "修改 src/hooks/useCsvParser.ts，将 CSV creator 字段映射到 Dashboard 使用的 creatorName。完成标准：源码已修改且运行测试或类型检查通过；约束：保持 creator 向后兼容。可以在存在不重叠范围时开启多个 subagent 协同工作。",
     ));
     await page.waitForTimeout(1_000);
     const dispatchSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
@@ -927,6 +927,47 @@ for (const model of models) {
     expect(snapshot?.activeGoal).not.toBeNull();
     expect(snapshot?.goalIterations).toBeGreaterThan(0);
     expect(snapshot?.goalIterations).toBeLessThanOrEqual(6);
+
+    const goalDebug = ([
+      ...(dispatchSnapshot?.debugTail || []),
+      ...(snapshot?.debugTail || []),
+    ] as Array<{ source?: string; message?: string }>).map((entry) => {
+      try {
+        return { eventSource: entry.source, ...JSON.parse(entry.message || "{}") };
+      } catch {
+        return { eventSource: entry.source, message: entry.message };
+      }
+    });
+    const continuationStarts = goalDebug.filter((entry) => entry.eventSource === "goal_continuation_start");
+    const turnContext = goalDebug.find((entry) => entry.eventSource === "agent.turn_context_sources");
+    const intake = goalDebug.find((entry) =>
+      entry.eventSource === "agent.task_orchestrator_phase" && entry.phase === "INTAKE_PARSE"
+    );
+    expect(continuationStarts.length).toBeGreaterThan(0);
+    expect(continuationStarts.every((entry) => entry.phase === "execute")).toBe(true);
+    expect(turnContext).toEqual(expect.objectContaining({
+      source: "goal_contract_objective",
+    }));
+    expect(Number(turnContext?.goalObjectiveChars || 0)).toBeGreaterThan(0);
+    expect(intake).toEqual(expect.objectContaining({ subagentPreference: "preferred" }));
+
+    const hasGoalEvent = (name: string) => goalDebug.some((entry) =>
+      entry.eventSource === name || entry.eventSource === `agent.${name}`
+    );
+    expect(hasGoalEvent("goal_tool_result_checkpoint_completed")).toBe(true);
+    expect(hasGoalEvent("goal_inner_loop_evidence_boundary")).toBe(true);
+    const taskFlow = snapshot?.taskFlowPreview || [];
+    const validationIndex = taskFlow
+      .map((block: { toolName?: string }) => block.toolName || "")
+      .lastIndexOf("run_command");
+    expect(validationIndex).toBeGreaterThanOrEqual(0);
+    expect(taskFlow.slice(validationIndex + 1).some((block: { toolName?: string }) =>
+      block.toolName === "read_file" || block.toolName === "grep_search"
+    )).toBe(false);
+
+    if (/qwen3\.6-35b-a3b/i.test(model) || process.env.REAL_OMLX_GOAL_REQUIRE_COMPLETION === "1") {
+      expect(snapshot?.goalStatus).toBe("completed");
+    }
 
     const trigger = page.getByTestId("goal-capsule-trigger");
     if (snapshot?.goalStatus === "completed") {

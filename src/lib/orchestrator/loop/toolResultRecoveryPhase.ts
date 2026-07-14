@@ -130,7 +130,7 @@ function buildApprovedPlanScopeRevisionPauseMessage(input: {
 
 export type ToolResultRecoveryPhaseResult =
   | {
-      status: "continue" | "stopped" | "plan_completed";
+      status: "continue" | "stopped" | "plan_completed" | "goal_completed";
       planRuntimeState: PlanLoopRuntimeState;
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
@@ -413,6 +413,19 @@ export async function handleToolResultRecoveryPhase(input: {
     iterationContext: input.iterationContext,
     emitTurnEvent: input.emitTurnEvent,
   });
+
+  const goalCheckpoint = input.callbacks.evaluateGoalToolResultCheckpoint?.(
+    input.results,
+  );
+  if (goalCheckpoint?.complete) {
+    logAgentEvent("goal_tool_result_checkpoint_completed", {
+      iteration: input.iteration,
+      resultCount: input.results.length,
+      evidenceCount: goalCheckpoint.evidenceCount,
+      supportingEvidenceIds: goalCheckpoint.supportingEvidenceIds,
+    });
+    return finish("goal_completed");
+  }
 
   const readFileRepeatLimitRecovery = handleReadFileRepeatLimitRecovery({
     callbacks: input.callbacks,

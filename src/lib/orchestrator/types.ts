@@ -143,6 +143,12 @@ export interface OrchestratorCallbacks {
     reason: string;
     expectedTarget: string | null;
   }) => void;
+  evaluateGoalToolResultCheckpoint?: (results: ToolExecutionResult[]) => {
+    complete: boolean;
+    reasons: string[];
+    evidenceCount: number;
+    supportingEvidenceIds: string[];
+  };
   getPendingSubagentIds?: () => string[];
   runSubagent?: (
     request: SpawnSubagentRequest,

@@ -99,12 +99,14 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"));
 
 const {
+  handleNoProgressRecovery,
   handleRepeatedEditValidationRecovery,
+  resolveDirectMutationPreflightRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
 
 const {
-  resolveDirectMutationPreflightRecovery,
-} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
+  partitionToolCallsForExecution,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"));
 
 const readOnlyTools = new Set([
   "get_project_skeleton",
@@ -328,7 +330,112 @@ test("execute recovery mutation-first surface removes broad reads and search too
   }), false);
 });
 
-test("Goal Runtime opens one context-read phase before mutation recovery", () => {
+test("a repeated read-only loop enters mutation-first instead of patch-context reread", () => {
+  const activations = [];
+  const result = handleNoProgressRecovery({
+    callbacks: {
+      getIsPlanApproved: () => false,
+      getPreferredLanguage: () => "zh",
+    },
+    activeProfile: "local",
+    workflowMode: "edit",
+    runtimeIntent: "goal",
+    iteration: 3,
+    results: [{
+      toolCallId: "read-3",
+      name: "read_file",
+      target: "src/App.tsx",
+      content: "FILE_UNCHANGED_STUB: src/App.tsx",
+      isError: false,
+    }],
+    recentToolActivity: [
+      { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
+      { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "FILE_UNCHANGED_STUB" },
+    ],
+    recentPlanToolActivity: [],
+    sawExecuteOperationEvidence: false,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    executeRecoveryAttempts: 0,
+    repairExecutionRequestInChat: false,
+    latestUserPromptText: "修复白屏",
+    isUnapprovedPlanReadOnlyBatch: false,
+    planReadOnlyConvergenceBatches: 0,
+    planReadOnlyConvergenceTools: 0,
+    approvedPlanNoProgressRecoveryAttempts: 0,
+    tracking: {
+      lastNoProgressBatchSignature: "",
+      noProgressBatchRepeatCount: 0,
+      consecutiveReadFileOnlyCacheHits: 2,
+    },
+    activateExecuteRecovery: (mode, reason, context) => activations.push({ mode, reason, context }),
+    activateChatFinalSynthesis: () => {},
+    emitTaskOrchestratorPhase: () => {},
+  });
+
+  assert.equal(result.status, "none");
+  assert.equal(activations[0].mode, "mutation_first");
+  assert.equal(activations[0].reason, "read_file_only_loop");
+  assert.match(result.pendingExecuteRecoveryPrompt, /mutation_only/);
+  assert.doesNotMatch(result.pendingExecuteRecoveryPrompt, /可使用定向 `read_file`/);
+});
+
+test("an unavailable stale read is blocked before execute-recovery batch deferral", async () => {
+  const toolErrors = [];
+  const toolDone = [];
+  const result = await partitionToolCallsForExecution({
+    toolCalls: [{ id: "stale-read", name: "read_file", arguments: JSON.stringify({ path: "src/App.tsx" }) }],
+    workspace: workspaceRoot,
+    callbacks: {
+      getIsPlanApproved: () => false,
+      getPreferredLanguage: () => "zh",
+      onToolError: (...args) => toolErrors.push(args),
+      onToolDone: (...args) => toolDone.push(args),
+    },
+    iteration: 6,
+    workflowMode: "edit",
+    runtimeIntent: "goal",
+    planRuntimePhase: "idle",
+    availableToolNames: new Set(["apply_patch", "replace_in_file", "write_file"]),
+    toolCapabilityRegistry: new Map(),
+    toolPermissionPolicy: {},
+    recentPlanToolActivity: [],
+    recentToolActivity: [],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "修复白屏",
+    managedAgentMessages: [],
+    failedToolCallCounts: new Map(),
+    buildCurrentTaskTargetingProfile: () => ({}),
+    approvedPlanActionOnlyRecoveryActive: false,
+    allowApprovedPlanRecoveryFileRead: false,
+    executeRecoveryState: {
+      mode: "mutation_first",
+      reason: "read_file_only_loop",
+      expectedTarget: "src/App.tsx",
+      attempts: 1,
+      iterationCount: 1,
+      consecutiveBlockedReadFileCount: 0,
+      repeatedEditValidationAttempts: 0,
+    },
+    effectiveExecuteRecoveryFileRead: false,
+    readOnlyResultCache: new Map(),
+    readOnlyDuplicateSkipCounts: new Map(),
+    fileReadStates: new Map(),
+    browserValidationCache: new Map(),
+    iterationContext: { eventThreadId: "thread", eventTurnId: "turn" },
+    emitTurnEvent: () => {},
+  });
+
+  assert.equal(toolDone.length, 0, "unavailable calls must not be reported as successful deferrals");
+  assert.equal(toolErrors.length, 1);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.equal(result.preExecutionResults[0].isError, true);
+  assert.equal(result.preExecutionResults[0].lifecycleState, "blocked");
+  assert.equal(result.preExecutionResults[0].qualityGateReason, "execute_recovery_tool_unavailable");
+  assert.doesNotMatch(result.preExecutionResults[0].content, /BATCH_DEFERRED/);
+});
+
+test("an actual patch mismatch opens one context-read phase before mutation recovery", () => {
   const tools = ["read_file", "grep_search", "apply_patch", "run_command"].map((name) => ({
     type: "function",
     function: { name, description: name, parameters: { type: "object", properties: {} } },
@@ -346,7 +453,7 @@ test("Goal Runtime opens one context-read phase before mutation recovery", () =>
     runtimeIntent: "goal",
     rawIterationAllTools: tools,
     executeRecoveryMode: "patch_recovery_read",
-    executeRecoveryReason: "read_file_only_loop",
+    executeRecoveryReason: "target_progress_patch_mismatch",
     executeRecoveryAttempts: 1,
     recoveryIterationCount: 1,
     maxRecoveryIterations: 6,

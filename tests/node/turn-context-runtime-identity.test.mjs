@@ -189,6 +189,22 @@ test("canonical turn context never promotes ContextState or wrapped hidden appro
   assert.equal(result.filteredSyntheticMessages, 3);
 });
 
+test("canonical turn context filters execute max-iteration boundary prompts", () => {
+  const result = turnContext.collectCanonicalTurnUserContext({
+    messages: [
+      { role: "user", content: "修复白屏并运行浏览器验证。" },
+      {
+        role: "user",
+        content: "本轮 Execute 已进行 8/8 轮工具循环，接近安全边界。\nMAIN 会临时收窄工具面。",
+      },
+    ],
+    turnStartMessageIndex: 0,
+  });
+
+  assert.deepEqual(result.texts, ["修复白屏并运行浏览器验证。"]);
+  assert.equal(result.filteredSyntheticMessages, 1);
+});
+
 test("approved Plan child context keeps prior turns, canonical input, and the exact reviewed artifact only", () => {
   const reviewedPlan = "# 计划\n\n## 摘要\n- 修复文件打开链路。\n\n## 测试方案\n- 双击文件并验证内容加载。";
   const compacted = turnContext.compactPlanReviewTurnMessages({

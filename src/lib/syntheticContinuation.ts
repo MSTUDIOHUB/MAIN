@@ -17,6 +17,8 @@ const SYNTHETIC_PREFIX_PATTERNS: RegExp[] = [
 const SYNTHETIC_STRONG_PATTERNS: RegExp[] = [
   /^\[goal_continuation\b/i,
   /^EXECUTE_RECOVERY:/i,
+  /^本轮\s*Execute\s*已进行\s*\d+\s*\/\s*\d+\s*轮工具循环/i,
+  /^This Execute turn has reached\s*\d+\s*\/\s*\d+\s*tool-loop iterations/i,
   /用户已经批准本轮执行，但上一条回复/i,
   /The user already approved this execution turn, but the previous response/i,
   /不要询问用户指示[^。\n]{0,40}(?:自己做决定并执行|自行决定并执行)/i,

@@ -35,6 +35,11 @@ export interface GoalCompletionGateResult {
   supportingEvidenceIds: string[];
 }
 
+export interface GoalEvidenceCheckpointResult extends GoalCompletionGateResult {
+  evidence: GoalEvidenceEntry[];
+  observedEvidence: GoalEvidenceEntry[];
+}
+
 function readArgumentString(args: Record<string, unknown> | undefined, keys: string[]): string {
   if (!args) return "";
   for (const key of keys) {
@@ -176,6 +181,43 @@ export function createGoalEvidenceEntries(input: {
     };
   });
   return assignGoalEvidenceCriterionIds(goal, entries);
+}
+
+/**
+ * Evaluate a Goal at a tool-result boundary. The outer Goal loop still owns
+ * terminal state; this checkpoint only tells the inner agent loop that it can
+ * return as soon as the runtime has enough fresh evidence to make that
+ * decision. Keeping the same completion gate here prevents a fast path from
+ * weakening multi-criterion or post-mutation verification requirements.
+ */
+export function evaluateGoalEvidenceCheckpoint(input: {
+  goal: GoalDefinition;
+  iteration: number;
+  evidence: GoalEvidenceEntry[];
+  observations: GoalToolObservation[];
+  now?: number;
+}): GoalEvidenceCheckpointResult {
+  const observedEvidence = createGoalEvidenceEntries({
+    goal: input.goal,
+    iteration: input.iteration,
+    observations: input.observations,
+    now: input.now,
+  });
+  const evidence = assignGoalEvidenceCriterionIds(
+    input.goal,
+    [...input.evidence, ...observedEvidence],
+  );
+  const gate = evaluateGoalCompletion({
+    goal: input.goal,
+    evidence,
+    completionCandidate: true,
+    unresolvedBlockers: [],
+  });
+  return {
+    ...gate,
+    evidence,
+    observedEvidence,
+  };
 }
 
 export function goalRequiresMutation(goal: GoalDefinition): boolean {

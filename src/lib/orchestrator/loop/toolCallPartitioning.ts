@@ -220,6 +220,65 @@ export async function partitionToolCallsForExecution(input: {
     const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
     toolFailureSignatures.set(tc.id, failureSignature);
 
+    const isAllowedPlanDraftMutation =
+      workflowMode === "plan" &&
+      !callbacks.getIsPlanApproved() &&
+      isPreApprovalPlanDraftWrite(tc.name, toolArgs);
+    if (!availableToolNames.has(tc.name) && !isAllowedPlanDraftMutation) {
+      const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
+      const message = planUnsupportedToolFeedbackMessage({
+        language: callbacks.getPreferredLanguage(),
+        toolName: tc.name,
+        runtimeIntent,
+        workflowMode,
+        isPlanApproved: callbacks.getIsPlanApproved(),
+        planRuntimePhase,
+        availableToolNames: Array.from(availableToolNames),
+      });
+      if (executeRecoveryBatchDecision.active) {
+        logAgentEvent("execute_recovery_unavailable_tool_call", {
+          iteration,
+          phase: executeRecoveryBatchDecision.phase,
+          mode: executeRecoveryMode,
+          tool: tc.name,
+          target,
+          expectedTarget: executeRecoveryState.expectedTarget,
+          availableToolNames: Array.from(availableToolNames).slice(0, 12),
+          outcome: "blocked_before_batch_deferral",
+        });
+      }
+      logAgentEvent("plan_unsupported_tool_call_suppressed", {
+        iteration,
+        reason: "unavailable_before_execution",
+        toolNames: [tc.name],
+        tool: tc.name,
+        target,
+        runtimeIntent,
+        workflowMode,
+        isPlanApproved: callbacks.getIsPlanApproved(),
+        availableToolNames: Array.from(availableToolNames).slice(0, 12),
+        planRuntimePhase,
+        preservedVisibleText: false,
+        internalFeedback: isUnapprovedPlanContext,
+      });
+      if (!isUnapprovedPlanContext) {
+        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+      }
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: `Error: ${message}`,
+        isError: true,
+        lifecycleState: "blocked",
+        ...(executeRecoveryBatchDecision.active
+          ? { qualityGateReason: "execute_recovery_tool_unavailable" }
+          : {}),
+        ...(isUnapprovedPlanContext ? { internalFeedback: true, displayContent: "" } : {}),
+      });
+      continue;
+    }
+
     if (
       executeRecoveryBatchDecision.active &&
       executeRecoveryBatchDecision.selectedCallId !== tc.id
@@ -441,50 +500,6 @@ export async function partitionToolCallsForExecution(input: {
         content: `Error: ${message}`,
         isError: true,
         lifecycleState: "blocked",
-      });
-      continue;
-    }
-
-    const isAllowedPlanDraftMutation =
-      workflowMode === "plan" &&
-      !callbacks.getIsPlanApproved() &&
-      isPreApprovalPlanDraftWrite(tc.name, toolArgs);
-    if (!availableToolNames.has(tc.name) && !isAllowedPlanDraftMutation) {
-      const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
-      const message = planUnsupportedToolFeedbackMessage({
-        language: callbacks.getPreferredLanguage(),
-        toolName: tc.name,
-        runtimeIntent,
-        workflowMode,
-        isPlanApproved: callbacks.getIsPlanApproved(),
-        planRuntimePhase,
-        availableToolNames: Array.from(availableToolNames),
-      });
-      logAgentEvent("plan_unsupported_tool_call_suppressed", {
-        iteration,
-        reason: "unavailable_before_execution",
-        toolNames: [tc.name],
-        tool: tc.name,
-        target,
-        runtimeIntent,
-        workflowMode,
-        isPlanApproved: callbacks.getIsPlanApproved(),
-        availableToolNames: Array.from(availableToolNames).slice(0, 12),
-        planRuntimePhase,
-        preservedVisibleText: false,
-        internalFeedback: isUnapprovedPlanContext,
-      });
-      if (!isUnapprovedPlanContext) {
-        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
-      }
-      preExecutionResults.push({
-        toolCallId: tc.id,
-        name: tc.name,
-        target,
-        content: `Error: ${message}`,
-        isError: true,
-        lifecycleState: "blocked",
-        ...(isUnapprovedPlanContext ? { internalFeedback: true, displayContent: "" } : {}),
       });
       continue;
     }

@@ -600,6 +600,14 @@ export class AgentOrchestrator {
         applyToolIterationMutableState(loopState, toolIterationPhase);
         publishExecuteRecoveryState();
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
+        if (toolIterationPhase.status === "goal_completed") {
+          callbacks.onDebugEvent?.("goal_inner_loop_evidence_boundary", {
+            iteration,
+            reason: "goal_tool_result_checkpoint_completed",
+            pendingSubagentIds: callbacks.getPendingSubagentIds?.() || [],
+          });
+          return;
+        }
         if (toolIterationPhase.status === "plan_completed") {
           const audit = toolIterationPhase.completionAudit || {
             completedCount: callbacks.getPlanTasks().length,

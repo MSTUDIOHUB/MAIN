@@ -176,11 +176,11 @@ function buildIterationInstructions(
     const lines: string[] = [
       "## 当前连续执行指令",
       "",
-      "这是同一个持续目标在内部安全边界后的连续执行。沿用已有上下文，遵循 Plan → Execute → Observe 循环：",
+      "这是同一个持续目标在内部安全边界后的连续执行。当前处于自主执行态，不是等待审批的 Plan 模式。沿用已有上下文，按以下闭环继续：",
       "",
-      "1. **Plan**: 分析当前状态，从剩余任务中选择一个最小可行任务。",
-      "2. **Execute**: 使用工具实现该任务（编辑文件、运行命令等）。",
-      "3. **Observe**: 运行相关验证（测试/构建/lint），确认修改正确。",
+      "1. **定位**: 用已有证据确定当前最小可验证动作；只在缺少关键事实时补充读取。",
+      "2. **行动**: 立即调用工具推进该动作；证据足够时不得只输出诊断、修复方案或等待批准。",
+      "3. **验证**: 对真实改动运行相关测试、构建、lint 或界面验证。",
       "",
     ];
 
@@ -194,6 +194,7 @@ function buildIterationInstructions(
       "**约束**:",
       "- 继续推进一个明确、可验证的里程碑；不要重新开始任务，也不要在模型内部自行开启无限循环",
       "- 复用已有读取、工具结果和文件状态；只有工作区证据变化或确有缺口时才重复操作",
+      "- 不要输出 `<proposed_plan>`，也不要把完整修复计划当作本轮交付；简短说明后必须继续执行真实工具动作",
       "- 每次修改文件后必须运行验证命令",
       "- 遇到阻塞时记录具体阻塞原因并尝试替代方案",
       "- 不要修改 `.MAIN/goals/` 中的运行时状态文件；Goal Runtime 会根据真实工具结果保存进度、检查点和证据",
@@ -208,11 +209,11 @@ function buildIterationInstructions(
   const lines: string[] = [
     "## Current Continuation Instructions",
     "",
-    "This continues the same persistent goal after an internal safety boundary. Reuse the retained context and follow the Plan → Execute → Observe cycle:",
+    "This continues the same persistent goal after an internal safety boundary. This is autonomous execution, not Plan mode awaiting approval. Reuse retained context and continue this loop:",
     "",
-    "1. **Plan**: Analyze current state, pick one small verifiable task from remaining work.",
-    "2. **Execute**: Use tools to implement it (edit files, run commands, etc.).",
-    "3. **Observe**: Run relevant verification (tests/build/lint) to confirm correctness.",
+    "1. **Orient**: Select the smallest verifiable action from existing evidence; read only when a key fact is missing.",
+    "2. **Act**: Call tools immediately. Once evidence is sufficient, do not stop at diagnosis, a repair proposal, or an approval request.",
+    "3. **Verify**: Run relevant tests, build, lint, or UI validation for real changes.",
     "",
   ];
 
@@ -226,6 +227,7 @@ function buildIterationInstructions(
     "**Constraints**:",
     "- Continue one clear, verifiable milestone. Do not restart the task or start an unbounded model-side loop.",
     "- Reuse existing reads, tool results, and file state. Repeat an operation only when workspace evidence changed or a real gap remains.",
+    "- Do not output `<proposed_plan>` or treat a full repair plan as this continuation's deliverable. After a brief orientation, continue with a real tool action.",
     "- Run verification commands after every file change.",
     "- When blocked, record the specific blocker and try an alternative approach.",
     "- Do not modify runtime state files under `.MAIN/goals/`; Goal Runtime persists progress, checkpoints, and evidence from real tool results.",
@@ -265,11 +267,12 @@ export function buildGoalTurnContract(input: GoalIterationContextInput): GoalTur
   return {
     goalId: goal.id,
     goalSliceId,
+    objective: goal.objective,
     revision,
     iteration: input.nextIteration,
     maxIterations: goal.iterationBudget,
     status: goal.status,
-    phase: input.checkpoint?.currentPhase || "plan",
+    phase: "execute",
     context,
     cacheKey: `${goal.id}:${revision}:${input.nextIteration}:${input.checkpoint?.iteration || 0}:${input.checkpoint?.evidenceCursor || 0}`,
   };

@@ -71,6 +71,55 @@ test("Goal Runtime creates a versioned contract with structured completion crite
   assert.deepEqual(goal.constraints, ["保持兼容"]);
 });
 
+test("Goal tool-result checkpoints stop only after every criterion has fresh evidence", () => {
+  const goal = goalState.createGoalDefinition({
+    objective: "更新两个模块并验证",
+    definitionOfDone: [
+      "修改 src/a.ts",
+      "修改 src/b.ts",
+      "运行类型检查通过",
+    ],
+  });
+
+  const first = goalRuntime.evaluateGoalEvidenceCheckpoint({
+    goal,
+    iteration: 1,
+    evidence: [],
+    observations: [
+      { name: "apply_patch", target: "src/a.ts", result: "Patch applied" },
+      { name: "run_command", target: "npx tsc --noEmit", result: "exitCode: 0" },
+    ],
+    now: 100,
+  });
+  assert.equal(first.passed, false);
+  assert.ok(first.reasons.some((reason) => reason.startsWith("criterion_evidence_required:")));
+
+  const second = goalRuntime.evaluateGoalEvidenceCheckpoint({
+    goal,
+    iteration: 1,
+    evidence: first.evidence,
+    observations: [
+      { name: "apply_patch", target: "src/b.ts", result: "Patch applied" },
+    ],
+    now: 200,
+  });
+  assert.equal(second.passed, false);
+  assert.ok(second.reasons.includes("verification_stale_after_mutation"));
+
+  const third = goalRuntime.evaluateGoalEvidenceCheckpoint({
+    goal,
+    iteration: 1,
+    evidence: second.evidence,
+    observations: [
+      { name: "run_command", target: "npx tsc --noEmit", result: "exitCode: 0" },
+    ],
+    now: 300,
+  });
+  assert.equal(third.passed, true);
+  assert.equal(third.reasons.length, 0);
+  assert.equal(third.criteria.every((criterion) => criterion.status === "satisfied"), true);
+});
+
 test("Goal events use the session runtime key and remain on the owner turn", () => {
   assert.deepEqual(goalEventIdentity.resolveGoalEventOwnerIdentity({
     goal: { sessionKey: "/workspace:42", ownerTurnId: "turn-goal" },
@@ -369,7 +418,10 @@ test("read-only shell inspection does not count as Goal execution progress", () 
 });
 
 test("GoalTurnContract is revisioned, continuous, and asks for runtime-gated completion", () => {
-  const goal = goalState.createGoalDefinition({ objective: "实现持久目标并运行测试", iterationBudget: 25 });
+  const goal = goalState.createGoalDefinition({
+    objective: "实现持久目标并运行测试，可以开启多个 subagent 协同工作",
+    iterationBudget: 25,
+  });
   const contract = goalContext.buildGoalTurnContract({
     goal,
     checkpoint: null,
@@ -380,14 +432,25 @@ test("GoalTurnContract is revisioned, continuous, and asks for runtime-gated com
 
   assert.equal(contract.iteration, 4);
   assert.equal(contract.goalSliceId, `${goal.id}:slice:4`);
+  assert.equal(contract.objective, goal.objective);
+  assert.equal(contract.phase, "execute");
   assert.equal(contract.maxIterations, 25);
   assert.match(contract.cacheKey, new RegExp(`^${goal.id}:1:4:`));
   assert.match(contract.context, /同一个持续目标/);
   assert.doesNotMatch(contract.context, /连续执行 4\/25|迭代 4\/25/);
   assert.match(contract.context, /GOAL_COMPLETION_CANDIDATE/);
+  assert.match(contract.context, /自主执行态/);
+  assert.match(contract.context, /立即调用工具推进/);
+  assert.match(contract.context, /子智能体协作偏好/);
+  assert.doesNotMatch(contract.context, /Plan → Execute → Observe/);
   assert.match(contract.context, /不要在模型内部自行开启无限循环/);
   assert.match(contract.context, /不要修改 `.MAIN\/goals\/` 中的运行时状态文件/);
   assert.doesNotMatch(contract.context, /完成本轮任务后，更新/);
+});
+
+test("new Goal continuations begin in execute rather than plan phase", () => {
+  const iteration = goalState.createGoalIteration(2, "goal-phase", 1);
+  assert.equal(iteration.phase, "execute");
 });
 
 test("restoring an interrupted Goal pauses it and excludes offline time", () => {

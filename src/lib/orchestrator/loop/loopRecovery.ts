@@ -305,16 +305,16 @@ export function handleNoProgressRecovery(input: {
   const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
   if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    activateTrackedExecuteRecovery("patch_recovery_read", "read_file_only_loop", {
+    activateTrackedExecuteRecovery("mutation_first", "read_file_only_loop", {
       repeatedTargets,
     });
     pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
       language: callbacks.getPreferredLanguage(),
       reason: "read_file_only_loop",
-      mode: "patch_recovery_read",
+      mode: "mutation_first",
       repeatedTargets,
       recentActivity: recentToolActivity,
-      allowFileRead: true,
+      allowFileRead: false,
     });
   }
 
@@ -342,9 +342,9 @@ export function handleNoProgressRecovery(input: {
     const language = callbacks.getPreferredLanguage();
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
     if (currentExecuteRecoveryAttempts < 2) {
-      // Give every provider one causal context step. The partition executes a
-      // single read and defers any same-response edit until that result exists.
-      const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = "patch_recovery_read";
+      // Read-only convergence already has context. Move to one mutation step;
+      // the context-read phase is reserved for an actual patch mismatch.
+      const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = "mutation_first";
       activateTrackedExecuteRecovery(nextMode, executeReadOnlyRecovery.reason, {
         readOnlyActivityCount: executeReadOnlyRecovery.readOnlyActivityCount,
         batchToolChars: executeReadOnlyRecovery.batchToolChars,

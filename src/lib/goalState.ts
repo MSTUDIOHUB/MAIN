@@ -318,6 +318,8 @@ export interface GoalRuntimeSnapshot {
 export interface GoalTurnContract {
   goalId: string;
   goalSliceId: string;
+  /** Canonical user-authored objective retained across internal continuations. */
+  objective: string;
   revision: number;
   iteration: number;
   maxIterations: number;
@@ -416,7 +418,7 @@ export function buildGoalSliceId(goalId: string, iteration: number): string {
 export function createGoalIteration(index: number, goalId?: string, goalRevision = 1): GoalIteration {
   return {
     index,
-    phase: "plan",
+    phase: "execute",
     goalSliceId: goalId ? buildGoalSliceId(goalId, index) : undefined,
     goalRevision: Math.max(1, Number(goalRevision) || 1),
     startedAt: Date.now(),

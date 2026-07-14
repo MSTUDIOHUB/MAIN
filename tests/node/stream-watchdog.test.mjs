@@ -122,7 +122,7 @@ test("approved plan action recovery requires a native tool call even while execu
     executeRecoveryMode: "normal",
     approvedPlanActionOnlyRecoveryActive: true,
     approvedPlanNoToolRecoveryFileReadActive: false,
-    llmToolCount: 7,
+    llmToolNames: ["read_file", "apply_patch", "run_command"],
     forceXmlTools: false,
   }), "required");
   assert.equal(resolveRecoveryToolChoice({
@@ -130,7 +130,7 @@ test("approved plan action recovery requires a native tool call even while execu
     executeRecoveryMode: "normal",
     approvedPlanActionOnlyRecoveryActive: false,
     approvedPlanNoToolRecoveryFileReadActive: false,
-    llmToolCount: 7,
+    llmToolNames: ["read_file", "apply_patch", "run_command"],
     forceXmlTools: false,
   }), undefined);
 });
@@ -141,7 +141,7 @@ test("preapproval plan quality recovery requires a native plan artifact call", (
     executeRecoveryMode: "normal",
     approvedPlanActionOnlyRecoveryActive: false,
     approvedPlanNoToolRecoveryFileReadActive: false,
-    llmToolCount: 2,
+    llmToolNames: ["read_file", "write_plan"],
     forceXmlTools: false,
   };
   assert.equal(resolveRecoveryToolChoice({
@@ -153,6 +153,28 @@ test("preapproval plan quality recovery requires a native plan artifact call", (
     forceXmlTools: true,
     preapprovalPlanQualityRecoveryToolChoice: "required",
   }), undefined);
+});
+
+test("local execute recovery binds the request to the current transaction tool", () => {
+  assert.deepEqual(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: "mutation_first",
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["apply_patch", "replace_in_file", "write_file"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+  }), { type: "function", function: { name: "apply_patch" } });
+
+  assert.deepEqual(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: "patch_recovery_read",
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["read_file"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+  }), { type: "function", function: { name: "read_file" } });
 });
 
 test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {

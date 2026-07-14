@@ -32,7 +32,7 @@ test("tool iteration phase owns the execution-to-recovery handoff", () => {
 });
 
 test("tool iteration phase returns one folded runtime-state result to the orchestrator", () => {
-  assert.match(phaseSource, /status: "aborted" \| "stopped" \| "continue" \| "completed"/);
+  assert.match(phaseSource, /status: "aborted" \| "stopped" \| "continue" \| "completed" \| "plan_completed" \| "goal_completed"/);
   assert.match(phaseSource, /noToolRuntimeState: toolCallPhase\.noToolRuntimeState/);
   assert.match(phaseSource, /planRuntimeState: toolResultRecoveryPhase\.planRuntimeState/);
   assert.match(phaseSource, /loopGuardRuntimeState: toolResultRecoveryPhase\.loopGuardRuntimeState/);
@@ -44,6 +44,7 @@ test("tool iteration phase returns one folded runtime-state result to the orches
 test("agent orchestrator delegates tool execution and result recovery to one iteration phase", () => {
   assert.match(orchestratorSource, /handleToolIterationPhase\(\{/);
   assert.match(orchestratorSource, /toolIterationPhase\.status === "aborted"/);
+  assert.match(orchestratorSource, /toolIterationPhase\.status === "goal_completed"/);
   assert.match(orchestratorSource, /toolIterationPhase\.status === "stopped"/);
   assert.match(orchestratorSource, /toolIterationPhase\.status === "continue"/);
   assert.doesNotMatch(orchestratorSource, /executeToolCallPhase\(\{/);

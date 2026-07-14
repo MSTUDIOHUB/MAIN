@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 
 const {
   createTaskTargetingRuntime,
+  resolveAgentLoopTurnInputContext,
   runAgentLoopStartHooks,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/turnPreparation.ts"),
@@ -98,6 +99,29 @@ test("turn preparation task targeting runtime builds scoped intake profile", () 
   assert.ok(profile.mentionedFilePaths.includes("src/App.tsx"));
   assert.equal(profile.imageParts, 1);
   assert.equal(profile.hasUserProvidedContext, true);
+});
+
+test("Goal turn intake uses the canonical objective instead of an internal continuation prompt", () => {
+  const debugEvents = [];
+  const objective = "修复白屏并验证，可以开启多个 subagent 协同工作";
+  const result = resolveAgentLoopTurnInputContext(baseRuntimeState({
+    // Goal slices retain the outer execute intent in the agent loop.
+    turnIntent: "execute",
+    workflowMode: "edit",
+    initialMessages: [{
+      role: "user",
+      content: "本轮 Execute 已进行 8/8 轮工具循环，接近安全边界。",
+    }],
+  }), {
+    getSessionKey: () => "goal-turn-intake",
+    getGoalTurnContract: () => ({ objective }),
+    getMainModeKey: () => "agent",
+    onDebugEvent: (name, payload) => debugEvents.push({ name, payload }),
+  });
+
+  assert.equal(result.latestUserPromptText, objective);
+  assert.equal(debugEvents[0].payload.source, "goal_contract_objective");
+  assert.equal(debugEvents[0].payload.goalObjectiveChars, objective.length);
 });
 
 test("turn preparation start hooks are a no-op when hooks are disabled", async () => {

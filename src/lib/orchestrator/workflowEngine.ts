@@ -1,6 +1,7 @@
 import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import {
+  evaluateGoalEvidenceCheckpoint,
   goalRequiresMutation,
   mergeGoalToolObservations,
   type GoalToolObservation,
@@ -3492,6 +3493,9 @@ export class WorkflowEngine {
           return Promise.resolve({ status: "error", reason: "no_active_goal" });
         }
         
+        let latestGoalEvidence = [
+          ...(sessionGet().goalRuntime?.progress?.evidence || sessionGet().goalProgress?.evidence || []),
+        ];
         const goalCallbacks: GoalEngineCallbacks = {
           getPreferredLanguage: callbacks.getPreferredLanguage,
           getWorkspacePath: () => resolveSessionWorkspaceKey(sessionGet().currentWorkspace) || "",
@@ -3552,6 +3556,7 @@ export class WorkflowEngine {
                 reason: "",
                 expectedTarget: null,
               };
+            let checkpointEvidence = [...latestGoalEvidence];
             const iterCallbacks = {
               ...callbacks,
               getGoalTurnContract: () => iterInput.goalTurnContract,
@@ -3600,6 +3605,52 @@ export class WorkflowEngine {
                 providerOutputTokens += usage.outputTokens;
                 providerTotalTokens += usage.totalTokens;
                 callbacks.onModelUsage?.(usage);
+              },
+              evaluateGoalToolResultCheckpoint: (results: import("../orchestrator").ToolExecutionResult[]) => {
+                const observations: GoalToolObservation[] = results
+                  .filter((result) => !result.internalFeedback)
+                  .map((result) => ({
+                    id: result.toolCallId,
+                    name: result.name,
+                    target: result.target,
+                    result: result.content,
+                    success: !result.isError,
+                  }));
+                if (observations.length === 0) {
+                  return {
+                    complete: false,
+                    reasons: ["no_external_tool_results"],
+                    evidenceCount: checkpointEvidence.length,
+                    supportingEvidenceIds: [],
+                  };
+                }
+                const checkpoint = evaluateGoalEvidenceCheckpoint({
+                  goal: activeGoal,
+                  iteration: iterInput.iteration,
+                  evidence: checkpointEvidence,
+                  observations,
+                });
+                checkpointEvidence = checkpoint.evidence;
+                callbacks.onDebugEvent?.("goal_tool_result_checkpoint", {
+                  continuationId: iterInput.goalSliceId,
+                  continuation: iterInput.iteration,
+                  complete: checkpoint.passed,
+                  reasons: checkpoint.reasons,
+                  observedEvidence: checkpoint.observedEvidence.map((entry) => ({
+                    kind: entry.kind,
+                    status: entry.status,
+                    tool: entry.sourceTool,
+                    target: entry.target,
+                  })),
+                  evidenceCount: checkpoint.evidence.length,
+                  supportingEvidenceIds: checkpoint.supportingEvidenceIds,
+                });
+                return {
+                  complete: checkpoint.passed,
+                  reasons: checkpoint.reasons,
+                  evidenceCount: checkpoint.evidence.length,
+                  supportingEvidenceIds: checkpoint.supportingEvidenceIds,
+                };
               },
               onNonActionableStop: (...args: Parameters<OrchestratorCallbacks["onNonActionableStop"]>) => {
                 deferredNonActionableStops.push(args);
@@ -3794,7 +3845,10 @@ export class WorkflowEngine {
             }
           },
           isAborted: () => abortCtrl.signal.aborted,
-          onGoalProgressUpdate: (progress, goal) => callbacks.onGoalProgressUpdate?.(progress, goal),
+          onGoalProgressUpdate: (progress, goal) => {
+            latestGoalEvidence = [...(progress.evidence || [])];
+            callbacks.onGoalProgressUpdate?.(progress, goal);
+          },
           onGoalRuntimeUpdate: (runtime) => callbacks.onGoalRuntimeUpdate?.(runtime),
           onGoalIterationStart: (iter) => callbacks.onGoalIterationStart?.(iter),
           onGoalIterationEnd: (iter) => callbacks.onGoalIterationEnd?.(iter),

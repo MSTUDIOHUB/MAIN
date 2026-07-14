@@ -27,7 +27,7 @@ type ToolIterationPhaseInput = ToolCallPhaseInput &
   >;
 
 export type ToolIterationPhaseResult = {
-  status: "aborted" | "stopped" | "continue" | "completed" | "plan_completed";
+  status: "aborted" | "stopped" | "continue" | "completed" | "plan_completed" | "goal_completed";
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
   loopGuardRuntimeState: AgentLoopGuardRuntimeState;

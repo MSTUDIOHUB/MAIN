@@ -125,6 +125,23 @@ test("execute recovery prompts do not replace the original latest user request",
   assert.doesNotMatch(goals, /用户已经批准本轮执行/);
 });
 
+test("execute max-iteration boundary prompts do not become durable user goals", () => {
+  const state = buildContextMemoryState([
+    { role: "user", content: "修复白屏并完成浏览器验证。" },
+    {
+      role: "user",
+      content: [
+        "本轮 Execute 已进行 8/8 轮工具循环，接近安全边界。",
+        "MAIN 会临时收窄工具面，请继续调用修改工具。",
+      ].join("\n"),
+    },
+  ], { now: 101 });
+
+  assert.equal(state.latestUserRequest?.text, "修复白屏并完成浏览器验证。");
+  const goals = state.goals.map((item) => item.text).join("\n");
+  assert.doesNotMatch(goals, /8\/8|安全边界|收窄工具面/);
+});
+
 test("polluted previous memory entries are cleaned before reuse", () => {
   const previous = {
     version: 1,
