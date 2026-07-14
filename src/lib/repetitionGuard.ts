@@ -143,7 +143,6 @@ function getToolProgressFamily(name: string, target?: string): RecentTargetToolC
   if (
     name === "run_command" ||
     name === "execute_command" ||
-    name === "send_pty_input" ||
     name === "read_pty_buffer" ||
     name === "read_pty_tail" ||
     name === "read_pty_since" ||
@@ -166,7 +165,7 @@ export function getShellMutationTargetForLoopGuard(
   name: string,
   args: Record<string, unknown>,
 ): string | null {
-  if (name !== "run_command" && name !== "execute_command" && name !== "send_pty_input") return null;
+  if (name !== "run_command" && name !== "execute_command") return null;
   const command = getShellCommandArgument(args);
   if (!command) return null;
 

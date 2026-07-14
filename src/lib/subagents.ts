@@ -101,6 +101,7 @@ export interface SubagentEvidenceItem {
   tool: string;
   target: string;
   detail: string;
+  facts?: string[];
 }
 
 export interface SubagentResultEnvelope {

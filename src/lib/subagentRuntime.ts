@@ -23,6 +23,11 @@ import {
 } from "./subagents";
 import { withEventSchema, type MainThreadEvent } from "./turnEvents";
 import { generateId } from "./utils";
+import {
+  extractPlanEvidenceFacts,
+  mergePlanEvidenceFacts,
+  summarizePlanEvidenceDetail,
+} from "./planMaterialization";
 
 const SUBAGENT_NAMES = ["Euler", "Mendel", "Herschel", "Noether", "Turing", "Curie"];
 
@@ -45,22 +50,45 @@ function compactText(value: unknown, maxChars: number): string {
   return text.length > maxChars ? `${text.slice(0, maxChars).trimEnd()}...` : text;
 }
 
+function compactEvidenceFragment(value: unknown, maxChars: number): string {
+  const text = String(value || "").trim();
+  if (text.length <= maxChars) return text;
+  const separator = " … ";
+  const headBudget = Math.max(0, Math.ceil((maxChars - separator.length) * 0.55));
+  const tailBudget = Math.max(0, maxChars - separator.length - headBudget);
+  return `${text.slice(0, headBudget).trimEnd()}${separator}${text.slice(-tailBudget).trimStart()}`;
+}
+
 function compactEvidence(
   evidence: SubagentResultEnvelope["evidence"],
 ): SubagentResultEnvelope["evidence"] {
-  const seen = new Set<string>();
   const compacted: SubagentResultEnvelope["evidence"] = [];
+  const indexByKey = new Map<string, number>();
   for (const item of evidence) {
     const tool = compactText(item.tool, 80);
     const target = compactText(item.target, 300);
     if (!tool || !target) continue;
     const key = `${tool}:${target}`.toLowerCase();
-    if (seen.has(key)) continue;
-    seen.add(key);
+    const detail = compactEvidenceFragment(item.detail, 400);
+    const facts = mergePlanEvidenceFacts(item.facts, extractPlanEvidenceFacts(item.detail));
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex !== undefined) {
+      const existing = compacted[existingIndex];
+      existing.facts = mergePlanEvidenceFacts(existing.facts, facts);
+      if (!detail || existing.detail === detail) continue;
+      const previous = String(existing.detail || "").trim();
+      const separator = previous ? " | " : "";
+      const incomingBudget = Math.min(detail.length, 250);
+      const previousBudget = Math.max(0, 400 - separator.length - incomingBudget);
+      existing.detail = `${compactEvidenceFragment(previous, previousBudget)}${separator}${compactEvidenceFragment(detail, incomingBudget)}`;
+      continue;
+    }
+    indexByKey.set(key, compacted.length);
     compacted.push({
       tool,
       target,
-      detail: compactText(item.detail, 400),
+      detail,
+      ...(facts.length > 0 ? { facts } : {}),
     });
     if (compacted.length >= 10) break;
   }
@@ -518,10 +546,21 @@ export async function executeControlledSubagent(input: {
     },
     onToolDone: (tool, target, result) => {
       completedToolCalls += 1;
+      const detail = summarizePlanEvidenceDetail({
+        tool,
+        target,
+        content: result,
+        maxChars: 400,
+      }) || compactText(result, 1_000);
+      const facts = extractPlanEvidenceFacts(detail);
       evidence.push({
         tool,
         target,
-        detail: compactText(result, 1_000),
+        // Summarize from the complete bounded read result before truncation.
+        // Configuration facts often occur below imports/comments, and slicing
+        // first silently removes values such as the actual dev-server port.
+        detail,
+        ...(facts.length > 0 ? { facts } : {}),
       });
       emitUpdate({
         status: "running",

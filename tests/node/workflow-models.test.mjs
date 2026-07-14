@@ -923,6 +923,38 @@ test("runtime plan task derivation binds prose change sections with a labeled fi
   assert.match(sourceTask.text, /修改.*useCsvParser\.ts.*normalizeCsvOrder/);
 });
 
+test("runtime plan task derivation carries an affected-file bullet into a nested concrete-change section", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 关键实现改动",
+      "### 受影响文件",
+      "- `src/hooks/useCsvParser.ts`",
+      "",
+      "### 具体改动",
+      "1. **修改 `normalizeCsvOrder` 函数的返回值**：",
+      "   - 将 `creator` 改为 `creatorName`。",
+      "",
+      "## 测试方案",
+      "- 验证返回对象包含 `creatorName`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const sourceTask = tasks.find((task) =>
+    task.executionKind === "mutation" &&
+    task.evidence?.some((evidence) =>
+      evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts"
+    )
+  );
+  assert.ok(sourceTask, JSON.stringify(tasks));
+  assert.match(sourceTask.text, /normalizeCsvOrder/);
+});
+
 test("runtime plan task derivation inherits implementation context for nested file headings", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([{
     kind: "plan",
@@ -1856,6 +1888,44 @@ test("runtime plan task derivation skips goals and diagnosis from OMLX plan pros
   assert.equal(tasks.some((task) => /修改.*useCsvParser\.ts/.test(task.text)), true);
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/hooks/useCsvParser.ts")), true);
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value.includes("workflow-models"))), true);
+});
+
+test("runtime plan task derivation does not promote an evidence preamble into a second mutation", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "根据证据，问题根因是 normalizeCsvOrder 返回了 creator 字段。",
+      "",
+      "**证据归因：**",
+      "- `src/types/order.ts` 定义 `Order` 接口使用 `creatorName: string`",
+      "- `src/store/dashboardStore.ts` 导出 `creatorField = 'creatorName'`，Dashboard 按此字段聚合",
+      "- `src/hooks/useCsvParser.ts` 的 `normalizeCsvOrder` 返回 `{ creator: ... }`，字段名不匹配",
+      "",
+      "# Proposed Plan",
+      "",
+      "## 改动范围",
+      "**唯一修改文件：** `src/hooks/useCsvParser.ts`",
+      "",
+      "### 具体改动",
+      "- 修改 `normalizeCsvOrder`，让返回对象写入 `creatorName`。",
+      "",
+      "## 验证方式",
+      "1. 修改后 TypeScript 编译通过（无类型错误）",
+      "2. 确认 Dashboard 聚合逻辑能正确读取该字段",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationTasks = tasks.filter((task) => task.executionKind === "mutation");
+  assert.equal(mutationTasks.length, 1, JSON.stringify(tasks));
+  assert.equal(mutationTasks[0].evidence?.some((item) =>
+    item.kind === "file" && item.value === "src/hooks/useCsvParser.ts"
+  ), true);
+  assert.equal(tasks.some((task) => task.executionKind === "mutation" && task.evidence?.some((item) =>
+    item.kind === "file" && item.value === "src/store/dashboardStore.ts"
+  )), false);
 });
 
 test("runtime plan task derivation skips malformed markdown table rows", () => {

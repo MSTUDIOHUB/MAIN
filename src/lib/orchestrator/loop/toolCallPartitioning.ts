@@ -932,12 +932,29 @@ export async function partitionToolCallsForExecution(input: {
         } else {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
-          if (!contentStillActive) {
-            // Context compaction may evict the tool message while the runtime
-            // still owns the exact versioned window. Replay the retained
-            // source so the model can use it, but mark it as an observation
-            // replay rather than fresh execution progress. A successful
-            // mutation invalidates this state before a post-edit read.
+          const approvedPlanExecutionRead =
+            workflowMode === "plan" &&
+            callbacks.getIsPlanApproved() &&
+            runtimeIntent === "execute" &&
+            tc.name === "read_file";
+          const contextEvictionEpoch = fileReadState.contextEvictionEpoch || 0;
+          const replayedCurrentEviction =
+            fileReadState.lastReplayContextEvictionEpoch === contextEvictionEpoch;
+          const repeatedWithoutVersionProgress =
+            approvedPlanExecutionRead && (fileReadState.replayCountSinceVersion || 0) >= 2;
+          if (
+            !contentStillActive &&
+            !replayedCurrentEviction &&
+            !repeatedWithoutVersionProgress
+          ) {
+            // Context management, rather than the filesystem, may evict an
+            // exact source window. Restore it once for each real eviction
+            // epoch. This is deliberately not a lifetime read cap: another
+            // compaction can restore the same unchanged version again, and a
+            // mutation creates a fresh version. The independent approved-plan
+            // no-progress budget prevents replay itself from becoming a loop.
+            fileReadState.lastReplayContextEvictionEpoch = contextEvictionEpoch;
+            fileReadState.replayCountSinceVersion = (fileReadState.replayCountSinceVersion || 0) + 1;
             const content = buildFileUnchangedReplayContent(fileReadState, duplicateCount);
             logAgentEvent("file_read_cache_hit", {
               iteration,
@@ -1000,26 +1017,29 @@ export async function partitionToolCallsForExecution(input: {
             modifiedMs: fileReadState.modifiedMs,
             contentHash: fileReadState.contentHash,
           });
-          const replayApprovedExecutionRead =
-            workflowMode === "plan" &&
-            callbacks.getIsPlanApproved() &&
-            runtimeIntent === "execute" &&
-            tc.name === "read_file" &&
-            duplicateCount >= 2 &&
-            !shouldPushPlanReadLimit;
           const shouldPushApprovedPlanReadLimit =
-            replayApprovedExecutionRead &&
-            duplicateCount >= 3;
+            approvedPlanExecutionRead &&
+            (contentStillActive ? duplicateCount >= 3 : repeatedWithoutVersionProgress);
           const approvedPlanReadLimitMessage = shouldPushApprovedPlanReadLimit
             ? callbacks.getPreferredLanguage() === "zh"
-              ? [
-                  `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 已在已批准计划执行中重复读取，本次不再重新读取。`,
-                  "请复用上方缓存内容，改为 apply_patch/replace_in_file/write_file、运行验证，或说明明确阻塞。",
-                ].join("\n")
-              : [
-                  `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} was reread repeatedly during approved plan execution, so this read was not re-run.`,
-                  "Reuse the cached context and switch to apply_patch/replace_in_file/write_file, validation, or a concrete blocker.",
-                ].join("\n")
+              ? contentStillActive
+                ? [
+                    `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 已在已批准计划执行中重复读取，本次不再重新读取。`,
+                    "请复用当前上下文中的源码，改为 apply_patch/replace_in_file/write_file、运行验证，或说明明确阻塞。",
+                  ].join("\n")
+                : [
+                    `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 的同一未修改范围已在上下文淘汰后恢复两次，继续恢复会形成无进展循环。`,
+                    "如确实缺少源码，请读取更窄或不同的行范围；否则请执行修改、运行验证，或说明明确阻塞。文件发生真实修改后可重新读取。",
+                  ].join("\n")
+              : contentStillActive
+                ? [
+                    `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} was reread repeatedly during approved plan execution, so this read was not re-run.`,
+                    "Reuse the source still present in active context and switch to apply_patch/replace_in_file/write_file, validation, or a concrete blocker.",
+                  ].join("\n")
+                : [
+                    `READ_FILE_REPEAT_LIMIT: the same unchanged range of ${target || fileReadState.path} was restored after context eviction twice; another restore would be a no-progress loop.`,
+                    "If source is genuinely missing, request a narrower or different line window. Otherwise edit, validate, or report a concrete blocker. A real file change permits a fresh read.",
+                  ].join("\n")
             : "";
           if (shouldPushApprovedPlanReadLimit) {
             emitToolPreflightBlocked(callbacks, {
@@ -1033,8 +1053,6 @@ export async function partitionToolCallsForExecution(input: {
           }
           const baseStub = shouldPushApprovedPlanReadLimit
             ? approvedPlanReadLimitMessage
-            : replayApprovedExecutionRead
-            ? buildFileUnchangedReplayContent(fileReadState, duplicateCount)
             : buildFileUnchangedStub(fileReadState);
           const closurePrompt = shouldPushPlanReadLimit
             ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets, latestUserPromptText)}`
@@ -1061,7 +1079,7 @@ export async function partitionToolCallsForExecution(input: {
               sizeBytes: fileReadState.sizeBytes,
               modifiedMs: fileReadState.modifiedMs,
               contentHash: fileReadState.contentHash,
-              source: replayApprovedExecutionRead ? "replay" : "stub",
+              source: "stub",
             }),
           });
           continue;

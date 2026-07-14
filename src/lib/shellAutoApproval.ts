@@ -1,4 +1,5 @@
 import type { ShellPermissionApproval, ShellPermissionDecision } from "./ipc";
+import { isPtyControlInput } from "./ptyCommandRuntime";
 import { applyShellCwd } from "./toolExecutionContract";
 
 type ShellPermissionPreflight = (
@@ -40,6 +41,8 @@ export function getShellPermissionCommandForTool(
 
   if (toolName === "send_pty_input") {
     const input = asNonEmptyString(args.input);
+    const control = asNonEmptyString(args.control);
+    if (isPtyControlInput(input || "", control || undefined)) return null;
     if (!input) return null;
     if (usesAppendNewline(args) || /[\r\n]/.test(input)) {
       return input.trim();

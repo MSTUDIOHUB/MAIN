@@ -58,6 +58,7 @@ export interface PlanMaterializationToolActivityLike {
   target?: string;
   status?: string;
   detail?: string;
+  facts?: string[];
 }
 
 export interface PlanEvidenceRecord {
@@ -65,6 +66,7 @@ export interface PlanEvidenceRecord {
   target: string;
   status: string;
   summary?: string;
+  facts?: string[];
   hash?: string;
 }
 
@@ -484,11 +486,276 @@ function planEvidenceSourceSignalScore(line: string): number {
   return score;
 }
 
+function buildSourceCodeMask(source: string): Uint8Array {
+  const mask = new Uint8Array(source.length);
+  let quote: "" | "'" | '"' | "`" = "";
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = 0; index < source.length; index += 1) {
+    const char = source[index] || "";
+    const next = source[index + 1] || "";
+    if (lineComment) {
+      if (char === "\n") {
+        lineComment = false;
+        mask[index] = 1;
+      }
+      continue;
+    }
+    if (blockComment) {
+      if (char === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (char === "'" || char === '"' || char === "`") {
+      quote = char;
+      continue;
+    }
+    mask[index] = 1;
+  }
+  return mask;
+}
+
+function findMatchingSourceDelimiter(
+  source: string,
+  mask: Uint8Array,
+  openIndex: number,
+  openChar: string,
+  closeChar: string,
+): number {
+  let depth = 0;
+  for (let index = openIndex; index < source.length; index += 1) {
+    if (!mask[index]) continue;
+    const char = source[index] || "";
+    if (char === openChar) {
+      depth += 1;
+      continue;
+    }
+    if (char !== closeChar) continue;
+    depth -= 1;
+    if (depth === 0) return index;
+  }
+  return -1;
+}
+
+function findListenerCallbackBodyOpen(
+  source: string,
+  mask: Uint8Array,
+  callOpenIndex: number,
+  callCloseIndex: number,
+): number {
+  let arrowBodyOpen = -1;
+  for (let index = callOpenIndex + 1; index < callCloseIndex - 1; index += 1) {
+    if (!mask[index] || !mask[index + 1]) continue;
+    if (source[index] !== "=" || source[index + 1] !== ">") continue;
+    let bodyOpen = index + 2;
+    while (bodyOpen < callCloseIndex && /\s/.test(source[bodyOpen] || "")) bodyOpen += 1;
+    if (source[bodyOpen] === "{" && mask[bodyOpen]) {
+      arrowBodyOpen = bodyOpen;
+      break;
+    }
+  }
+
+  let functionBodyOpen = -1;
+  const functionPattern = /\b(?:async\s+)?function(?:\s+[A-Za-z_$][A-Za-z0-9_$]*)?\s*\([^)]*\)\s*\{/g;
+  for (const match of source.matchAll(functionPattern)) {
+    const matchIndex = match.index ?? -1;
+    if (matchIndex <= callOpenIndex || matchIndex >= callCloseIndex || !mask[matchIndex]) continue;
+    const braceOffset = (match[0] || "").lastIndexOf("{");
+    const bodyOpen = matchIndex + braceOffset;
+    if (braceOffset >= 0 && bodyOpen < callCloseIndex && mask[bodyOpen]) {
+      functionBodyOpen = bodyOpen;
+      break;
+    }
+  }
+
+  if (arrowBodyOpen < 0) return functionBodyOpen;
+  if (functionBodyOpen < 0) return arrowBodyOpen;
+  return Math.min(arrowBodyOpen, functionBodyOpen);
+}
+
+const NON_LISTENER_BODY_CALL_IDENTIFIERS = new Set([
+  "addEventListener",
+  "catch",
+  "for",
+  "function",
+  "if",
+  "switch",
+  "while",
+  "with",
+]);
+
+function extractTopLevelListenerBodyCalls(
+  source: string,
+  mask: Uint8Array,
+  bodyOpenIndex: number,
+  bodyCloseIndex: number,
+): string[] {
+  const calls: string[] = [];
+  let braceDepth = 0;
+  let parenthesisDepth = 0;
+  let bracketDepth = 0;
+  for (let index = bodyOpenIndex + 1; index < bodyCloseIndex; index += 1) {
+    if (!mask[index]) continue;
+    const char = source[index] || "";
+    if (char === "{") {
+      braceDepth += 1;
+      continue;
+    }
+    if (char === "}") {
+      braceDepth = Math.max(0, braceDepth - 1);
+      continue;
+    }
+    if (char === "(") {
+      parenthesisDepth += 1;
+      continue;
+    }
+    if (char === ")") {
+      parenthesisDepth = Math.max(0, parenthesisDepth - 1);
+      continue;
+    }
+    if (char === "[") {
+      bracketDepth += 1;
+      continue;
+    }
+    if (char === "]") {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      continue;
+    }
+    if (braceDepth !== 0 || parenthesisDepth !== 0 || bracketDepth !== 0) continue;
+    if (!/[A-Za-z_$]/.test(char)) continue;
+
+    let identifierEnd = index + 1;
+    while (
+      identifierEnd < bodyCloseIndex &&
+      mask[identifierEnd] &&
+      /[A-Za-z0-9_$]/.test(source[identifierEnd] || "")
+    ) {
+      identifierEnd += 1;
+    }
+    const identifier = source.slice(index, identifierEnd);
+    let nextCodeIndex = identifierEnd;
+    while (
+      nextCodeIndex < bodyCloseIndex &&
+      (!mask[nextCodeIndex] || /\s/.test(source[nextCodeIndex] || ""))
+    ) {
+      nextCodeIndex += 1;
+    }
+    if (source[nextCodeIndex] !== "(" || !mask[nextCodeIndex]) {
+      index = identifierEnd - 1;
+      continue;
+    }
+
+    let previousCodeIndex = index - 1;
+    while (
+      previousCodeIndex > bodyOpenIndex &&
+      (!mask[previousCodeIndex] || /\s/.test(source[previousCodeIndex] || ""))
+    ) {
+      previousCodeIndex -= 1;
+    }
+    const previousChar = source[previousCodeIndex] || "";
+    let previousWordStart = previousCodeIndex;
+    while (
+      previousWordStart > bodyOpenIndex &&
+      mask[previousWordStart - 1] &&
+      /[A-Za-z0-9_$]/.test(source[previousWordStart - 1] || "")
+    ) {
+      previousWordStart -= 1;
+    }
+    const previousWord = source.slice(previousWordStart, previousCodeIndex + 1);
+    const isDefinition = previousWord === "function";
+    const isMemberCall = previousChar === "." || previousChar === "?" || previousChar === "#";
+    if (
+      !isDefinition &&
+      !isMemberCall &&
+      !NON_LISTENER_BODY_CALL_IDENTIFIERS.has(identifier) &&
+      !calls.includes(identifier)
+    ) {
+      calls.push(identifier);
+      if (calls.length >= 8) break;
+    }
+    index = identifierEnd - 1;
+  }
+  return calls;
+}
+
+function collectDomListenerSourceCandidate(
+  lines: string[],
+  index: number,
+): { event: string; listenerCalls: string[] } | null {
+  if (!/\baddEventListener\s*\(/i.test(lines[index] || "")) return null;
+  const boundedSource = lines.slice(index, Math.min(lines.length, index + 80)).join("\n");
+  const listenerMatch = boundedSource.match(/\baddEventListener\s*\(\s*[`'"]?([A-Za-z0-9_.:-]+)[`'"]?/i);
+  const event = listenerMatch?.[1] || "";
+  const listenerStart = listenerMatch?.index ?? -1;
+  if (!event || listenerStart < 0) return null;
+
+  const mask = buildSourceCodeMask(boundedSource);
+  const callOpenIndex = boundedSource.indexOf("(", listenerStart);
+  if (callOpenIndex < 0 || !mask[callOpenIndex]) return { event, listenerCalls: [] };
+  const callCloseIndex = findMatchingSourceDelimiter(boundedSource, mask, callOpenIndex, "(", ")");
+  if (callCloseIndex < 0) return { event, listenerCalls: [] };
+  const bodyOpenIndex = findListenerCallbackBodyOpen(
+    boundedSource,
+    mask,
+    callOpenIndex,
+    callCloseIndex,
+  );
+  if (bodyOpenIndex < 0) return { event, listenerCalls: [] };
+  const bodyCloseIndex = findMatchingSourceDelimiter(boundedSource, mask, bodyOpenIndex, "{", "}");
+  if (bodyCloseIndex < 0 || bodyCloseIndex > callCloseIndex) return { event, listenerCalls: [] };
+  return {
+    event,
+    listenerCalls: extractTopLevelListenerBodyCalls(
+      boundedSource,
+      mask,
+      bodyOpenIndex,
+      bodyCloseIndex,
+    ),
+  };
+}
+
 function compactPlanEvidenceSourceCandidate(
   lines: string[],
   index: number,
 ): { text: string; endIndex: number } {
   const line = lines[index] || "";
+  const domListener = collectDomListenerSourceCandidate(lines, index);
+  if (domListener) {
+    return {
+      text: [
+        `L${index + 1}: event_dom_listener_contract(${domListener.event})`,
+        domListener.listenerCalls.length > 0
+          ? `listener_calls(${domListener.listenerCalls.join(",")})`
+          : "",
+      ].filter(Boolean).join(" "),
+      // Keep scanning the body so nested event contracts remain available as
+      // independent facts. The lookahead above is only for this listener.
+      endIndex: index,
+    };
+  }
   const multilineContract = /(?:generate_handler!\s*\[|["']permissions["']\s*:\s*\[)/i.test(line);
   let endIndex = index;
   if (multilineContract) {
@@ -526,13 +793,6 @@ function compactPlanEvidenceSourceCandidate(
   if (emittedEvent) {
     return {
       text: `L${index + 1}: event_emit_contract(${emittedEvent})`,
-      endIndex,
-    };
-  }
-  const domListenedEvent = joined.match(/addEventListener\s*\(\s*[`'"]?([A-Za-z0-9_.:-]+)[`'"]?/i)?.[1] || "";
-  if (domListenedEvent) {
-    return {
-      text: `L${index + 1}: event_dom_listener_contract(${domListenedEvent})`,
       endIndex,
     };
   }
@@ -593,11 +853,11 @@ function collectPlanEvidenceSourceSignals(body: string, maxChars: number): strin
   return compactPlanLine(fallback, maxChars, true);
 }
 
-function stripReadFileMetadataText(value: string): string {
+function stripReadFileMetadataText(value: string, maxChars: number): string {
   if (!READ_FILE_RESULT_RE.test(value)) return value;
   const body = extractDelimitedReadFileBody(value);
   if (!body) return "";
-  return collectPlanEvidenceSourceSignals(body, 220);
+  return collectPlanEvidenceSourceSignals(body, maxChars);
 }
 
 function evidenceDetailLooksLikePathEcho(detail: string, target: string): boolean {
@@ -630,7 +890,7 @@ export function summarizePlanEvidenceDetail(input: {
   const source = parsedFeedback ? (parsedFeedback.body || parsedFeedback.envelope.summary || "") : raw;
   const target = normalizePathLikeCandidate(input.target || parsedFeedback?.envelope.target || "");
 
-  const withoutReadMetadata = stripReadFileMetadataText(source);
+  const withoutReadMetadata = stripReadFileMetadataText(source, maxChars);
   const stripped = withoutReadMetadata || (!READ_FILE_RESULT_RE.test(source) ? source : "");
   if (!stripped) return "";
 
@@ -642,6 +902,56 @@ export function summarizePlanEvidenceDetail(input: {
   if (!cleanDetail) return "";
   if (evidenceDetailLooksLikePathEcho(cleanDetail, target)) return "";
   return cleanDetail;
+}
+
+const STRUCTURED_PLAN_EVIDENCE_FACT_RE =
+  /\b(?:(?:handler|permission|event_(?:emit|dom_listener|tauri_listener)|command_invoke)_contract|listener_calls)\([^\n)]{1,240}\)/gi;
+const STRUCTURED_PLAN_CONFIG_FACT_RE =
+  /\b(?:devUrl\s*["']?\s*[:=]\s*["']?[^\s"']{1,160}|port\s*["']?\s*[:=]\s*\d{1,5}|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):\d{1,5})/gi;
+
+function planEvidenceFactPriority(value: string): number {
+  if (/event_dom_listener_contract\(DOMContentLoaded\)/i.test(value)) return 120;
+  if (/\blistener_calls\(/i.test(value)) return 118;
+  if (/\b(?:devUrl|port)\b|https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):/i.test(value)) return 115;
+  if (/\b(?:handler|permission)_contract\(/i.test(value)) return 105;
+  if (/\bevent_(?:emit|dom_listener|tauri_listener)_contract\(/i.test(value)) return 100;
+  if (/\bcommand_invoke_contract\(/i.test(value)) return 90;
+  return 50;
+}
+
+/**
+ * Keep source contracts as bounded structured facts alongside human-readable
+ * excerpts. Repeated character slicing can otherwise delete a middle fact
+ * (for example DOMContentLoaded) when several windows of one file are merged.
+ */
+export function extractPlanEvidenceFacts(value: unknown): string[] {
+  const text = String(value || "");
+  const candidates = [
+    ...Array.from(text.matchAll(STRUCTURED_PLAN_EVIDENCE_FACT_RE), (match) => match[0] || ""),
+    ...Array.from(text.matchAll(STRUCTURED_PLAN_CONFIG_FACT_RE), (match) => match[0] || ""),
+  ];
+  return mergePlanEvidenceFacts(candidates);
+}
+
+export function mergePlanEvidenceFacts(...groups: Array<Iterable<string> | null | undefined>): string[] {
+  const unique = new Map<string, { value: string; order: number }>();
+  let order = 0;
+  for (const group of groups) {
+    if (!group) continue;
+    for (const raw of group) {
+      const value = compactPlanLine(String(raw || ""), 240, true);
+      if (!value) continue;
+      const key = value.toLowerCase().replace(/\s+/g, " ");
+      if (!unique.has(key)) unique.set(key, { value, order: order++ });
+    }
+  }
+  return [...unique.values()]
+    .sort((left, right) =>
+      planEvidenceFactPriority(right.value) - planEvidenceFactPriority(left.value) ||
+      left.order - right.order
+    )
+    .slice(0, 24)
+    .map((entry) => entry.value);
 }
 
 function stripToolMetaFields(value: string): string {
@@ -727,7 +1037,7 @@ export function formatPlanEvidenceRecord(record: PlanEvidenceRecord, language: "
     tool: record.tool,
     target: record.target,
     status: record.status,
-    detail: record.summary,
+    detail: [record.summary, ...(record.facts || [])].filter(Boolean).join(" "),
   });
   if (!normalized) return "";
   return summarizeEvidenceLine(normalized, language);
@@ -1435,6 +1745,286 @@ function extractPlanGroundingSectionBody(content: string, headingPattern: RegExp
   return body.join("\n").trim();
 }
 
+const PLAN_VALIDATION_TARGET_HEADING_RE =
+  /^(?:验证(?:方式|标准|方案|步骤)?|测试(?:方案|计划|场景|步骤)?|验收(?:标准|方案|步骤)?|Validation(?:\s+(?:Plan|Steps|Standards?|Strategy))?|Verification(?:\s+(?:Plan|Steps|Standards?|Strategy))?|Testing|Tests?|Test Plan|Acceptance(?:\s+(?:Criteria|Plan|Steps))?)$/i;
+const LOCALHOST_WITH_PORT_RE = /(https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):)(\d{1,5})/gi;
+const DEV_SERVER_CONFIG_TARGET_RE =
+  /(?:^|\/)(?:package\.json|angular\.json|tauri\.conf\.json|(?:electron\.)?vite\.config\.[cm]?[jt]s|webpack\.config\.[cm]?[jt]s|rspack\.config\.[cm]?[jt]s|rsbuild\.config\.[cm]?[jt]s|next\.config\.[cm]?[jt]s|nuxt\.config\.[cm]?[jt]s|astro\.config\.[cm]?[jt]s|svelte\.config\.[cm]?[jt]s|wxt\.config\.[cm]?[jt]s)$/i;
+
+function extractDevServerPortsFromConfigEvidence(value: string): number[] {
+  const ports = new Set<number>();
+  const add = (raw: string | undefined) => {
+    const port = Number(raw);
+    if (port > 0 && port <= 65_535) ports.add(port);
+  };
+  for (const match of String(value || "").matchAll(/https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):(\d{1,5})/gi)) {
+    add(match[1]);
+  }
+  for (const match of String(value || "").matchAll(/\bdevUrl\b\s*["']?\s*[:=]\s*["']?[^\s"']*?:(\d{1,5})\b/gi)) {
+    add(match[1]);
+  }
+  for (const match of String(value || "").matchAll(/\b(?:devServer|server)\b[^\n]{0,120}?\bport\b\s*["']?\s*[:=]\s*(\d{1,5})\b/gi)) {
+    add(match[1]);
+  }
+  // The caller has already restricted this evidence to a known frontend
+  // dev-server configuration owner. Evidence summarization commonly reduces
+  // a multiline Vite block to `L4: port: 1420`, so accept the owned bare
+  // assignment here instead of requiring the surrounding `server` token to
+  // survive compaction.
+  for (const match of String(value || "").matchAll(/\bport\b\s*["']?\s*[:=]\s*(\d{1,5})\b/gi)) {
+    add(match[1]);
+  }
+  for (const match of String(value || "").matchAll(/--port(?:=|\s+)(\d{1,5})\b/gi)) {
+    add(match[1]);
+  }
+  return [...ports];
+}
+
+function collectObservedDevServerPorts(input: {
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): { ports: number[]; targets: string[] } {
+  const observations = [
+    ...(input.evidenceRecords || [])
+      .filter((record) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(record.tool || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(record.status || ""))
+      )
+      .map((record) => ({
+        target: String(record.target || ""),
+        detail: [record.summary, ...(record.facts || [])].filter(Boolean).join(" "),
+      })),
+    ...(input.recentToolActivity || [])
+      .filter((activity) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(activity.name || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(activity.status || ""))
+      )
+      .map((activity) => ({
+        target: String(activity.target || ""),
+        detail: [activity.detail, ...(activity.facts || [])].filter(Boolean).join(" "),
+      })),
+  ];
+  const ports = new Set<number>();
+  const targets = new Set<string>();
+  for (const observation of observations) {
+    const target = normalizePlanGroundingPath(observation.target);
+    // A generic `src/server.ts` or API configuration can also contain a
+    // `port` field. Only configuration owners that actually define frontend
+    // dev-server startup are eligible to repair a browser validation origin.
+    if (!DEV_SERVER_CONFIG_TARGET_RE.test(target)) continue;
+    const observed = extractDevServerPortsFromConfigEvidence(observation.detail);
+    if (observed.length === 0) continue;
+    targets.add(target);
+    observed.forEach((port) => ports.add(port));
+  }
+  return { ports: [...ports], targets: [...targets] };
+}
+
+/**
+ * A validation URL is executable Plan data. When a single port has already
+ * been observed from project reads, keep localhost checks on that port rather
+ * than allowing a model-default value (commonly 5173) into approval.
+ */
+export function repairPlanValidationTargetFromEvidence(input: {
+  content: string;
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): { content: string; repaired: boolean; expectedPort?: number } {
+  const observed = collectObservedDevServerPorts(input);
+  const observedPorts = observed.ports;
+  if (observedPorts.length !== 1) return { content: input.content, repaired: false };
+
+  const keyChanges = extractPlanGroundingSectionBody(input.content, PLAN_KEY_CHANGES_HEADING_RE);
+  const normalizedKeyChanges = normalizePlanGroundingPath(keyChanges);
+  const explicitlyProposedPorts = extractDevServerPortsFromConfigEvidence(keyChanges);
+  const mentionsObservedConfig = observed.targets.some((target) => {
+    const basename = target.split("/").pop() || target;
+    return normalizedKeyChanges.includes(target) || normalizedKeyChanges.includes(basename);
+  });
+  const changesPortConfiguration = mentionsObservedConfig &&
+    explicitlyProposedPorts.some((port) => port !== observedPorts[0]);
+  if (changesPortConfiguration) return { content: input.content, repaired: false };
+
+  const expectedPort = observedPorts[0];
+  let inValidationSection = false;
+  let validationHeadingLevel = 0;
+  let repaired = false;
+  const lines = String(input.content || "").split(/\r?\n/).map((line) => {
+    const heading = line.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const level = heading[1]?.length || 0;
+      if (inValidationSection && level <= validationHeadingLevel) inValidationSection = false;
+      if (PLAN_VALIDATION_TARGET_HEADING_RE.test(heading[2] || "")) {
+        inValidationSection = true;
+        validationHeadingLevel = level;
+      }
+      return line;
+    }
+    if (!inValidationSection) return line;
+    return line.replace(LOCALHOST_WITH_PORT_RE, (match, prefix: string, rawPort: string) => {
+      if (Number(rawPort) === expectedPort) return match;
+      repaired = true;
+      return `${prefix}${expectedPort}`;
+    });
+  });
+  return {
+    content: lines.join("\n"),
+    repaired,
+    expectedPort,
+  };
+}
+
+const PLAN_ABSENCE_CLAIM_RE =
+  /(?:缺少|不存在|没有|未(?:注册|添加|实现|调用|使用|定义|监听)|\bmissing\b|\babsent\b|\bwithout\b|\bnot\s+(?:present|registered|implemented|called|used|defined)\b)/i;
+
+function collectReadEvidenceForClaimGrounding(input: {
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): Array<{ target: string; detail: string }> {
+  return [
+    ...(input.evidenceRecords || [])
+      .filter((record) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(record.tool || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(record.status || ""))
+      )
+      .map((record) => ({
+        target: String(record.target || ""),
+        detail: [record.summary, ...(record.facts || [])].filter(Boolean).join(" "),
+      })),
+    ...(input.recentToolActivity || [])
+      .filter((activity) =>
+        PLAN_GROUNDING_READ_TOOLS.has(String(activity.name || "")) &&
+        !/failed|blocked|rejected|declined/i.test(String(activity.status || ""))
+      )
+      .map((activity) => ({
+        target: String(activity.target || ""),
+        detail: [activity.detail, ...(activity.facts || [])].filter(Boolean).join(" "),
+      })),
+  ];
+}
+
+function escapePlanEvidenceRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function findContradictedDomReadyOrderingClaim(
+  content: string,
+  evidence: Array<{ target: string; detail: string }>,
+): string | null {
+  const patterns = [
+    /`?([A-Za-z_$][A-Za-z0-9_$]{3,})`?\s*(?:\(\))?.{0,100}(?:DOM|document|文档).{0,50}(?:就绪|加载|ready).{0,20}(?:前|之前|before)/i,
+    /`?([A-Za-z_$][A-Za-z0-9_$]{3,})`?\s*(?:\(\))?.{0,100}(?:before|早于).{0,50}(?:DOM|document|文档).{0,30}(?:就绪|加载|ready)/i,
+    /(?:DOM|document|文档).{0,50}(?:就绪|加载|ready).{0,20}(?:前|之前|before).{0,100}`?([A-Za-z_$][A-Za-z0-9_$]{3,})`?\s*(?:\(\))?/i,
+  ];
+  for (const line of String(content || "").split(/\r?\n/)) {
+    const lineTargets = [...line.matchAll(PLAN_CHANGE_TARGET_FILE_RE)]
+      .map((targetMatch) => normalizePlanGroundingPath(targetMatch[0] || ""));
+    const relevantEvidence = lineTargets.length > 0
+      ? evidence.filter((item) => lineTargets.some((target) => planGroundingPathsMatch(target, item.target)))
+      : evidence;
+    const hasDomReadyBeforeClaim =
+      /(?:DOM|document|文档).{0,50}(?:就绪|加载|ready).{0,20}(?:前|之前|before)/i.test(line) ||
+      /(?:before|早于).{0,50}(?:DOM|document|文档).{0,30}(?:就绪|加载|ready)/i.test(line);
+    if (hasDomReadyBeforeClaim) {
+      for (const item of relevantEvidence) {
+        if (!/event_dom_listener_contract\(DOMContentLoaded\)/i.test(item.detail)) continue;
+        for (const callsMatch of item.detail.matchAll(/listener_calls\(([^)]*)\)/gi)) {
+          const listenerIdentifiers = String(callsMatch[1] || "")
+            .split(",")
+            .map((value) => value.trim())
+            .filter((value) => /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(value));
+          const observedIdentifier = listenerIdentifiers.find((identifier) => {
+            return new RegExp(`\\b${escapePlanEvidenceRegExp(identifier)}\\b`).test(line);
+          });
+          if (observedIdentifier) return observedIdentifier;
+        }
+      }
+    }
+    const match = patterns.map((pattern) => line.match(pattern)).find(Boolean);
+    const identifier = match?.[1] || "";
+    if (!identifier) continue;
+    const escapedIdentifier = escapePlanEvidenceRegExp(identifier);
+    const listenerCall = new RegExp(`listener_calls\\([^)]*\\b${escapedIdentifier}\\b`, "i");
+    if (relevantEvidence.some((item) =>
+      /event_dom_listener_contract\(DOMContentLoaded\)/i.test(item.detail) &&
+      listenerCall.test(item.detail)
+    )) {
+      return identifier;
+    }
+  }
+  return null;
+}
+
+function evidenceContainsPositiveIdentifierObservation(
+  detail: string,
+  identifier: string,
+  claimLine: string,
+): boolean {
+  const lowerIdentifier = identifier.toLowerCase();
+  const callAbsenceClaim =
+    /(?:没有|未|从未).{0,12}(?:调用|执行)|(?:not|never).{0,16}(?:called|invoked|executed)|without\s+(?:calling|invoking|executing)/i.test(claimLine);
+  if (callAbsenceClaim) {
+    const escapedIdentifier = escapePlanEvidenceRegExp(identifier);
+    const listenerCall = new RegExp(`listener_calls\\([^)]*\\b${escapedIdentifier}\\b`, "i");
+    if (listenerCall.test(detail)) return true;
+    const callPattern = new RegExp(`\\b${escapedIdentifier}\\s*\\(`, "gi");
+    for (const match of detail.matchAll(callPattern)) {
+      const preceding = detail.slice(Math.max(0, (match.index || 0) - 48), match.index || 0);
+      if (!/(?:function|fn|def|class|interface|type|const|let|var)\s+$/i.test(preceding)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  const lowerDetail = detail.toLowerCase();
+  let index = lowerDetail.indexOf(lowerIdentifier);
+  while (index >= 0) {
+    // Evidence that repeats the same negative statement supports the
+    // diagnosis; it is not a contradiction. Require a source-like positive
+    // occurrence outside an absence window.
+    const preceding = detail.slice(Math.max(0, index - 100), index);
+    if (!PLAN_ABSENCE_CLAIM_RE.test(preceding)) return true;
+    index = lowerDetail.indexOf(lowerIdentifier, index + lowerIdentifier.length);
+  }
+  return false;
+}
+
+/** Reject an absence claim when the cited source observation contains it. */
+export function findContradictedPlanDiagnosticClaim(input: {
+  content: string;
+  evidenceRecords?: PlanEvidenceRecord[];
+  recentToolActivity?: PlanMaterializationToolActivityLike[];
+}): string | null {
+  const evidence = collectReadEvidenceForClaimGrounding(input);
+  if (evidence.length === 0) return null;
+  const orderingContradiction = findContradictedDomReadyOrderingClaim(input.content, evidence);
+  if (orderingContradiction) return orderingContradiction;
+  for (const line of String(input.content || "").split(/\r?\n/)) {
+    const claim = line.match(PLAN_ABSENCE_CLAIM_RE);
+    if (!claim || claim.index == null) continue;
+    const claimedTail = line.slice(claim.index + claim[0].length, claim.index + claim[0].length + 100);
+    const identifiers = [...claimedTail.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]{3,}\b/g)]
+      .map((match) => match[0] || "")
+      .filter((value) => /[A-Z_$]|[a-z][A-Z]/.test(value));
+    if (identifiers.length === 0) continue;
+    const lineTargets = [...line.matchAll(PLAN_CHANGE_TARGET_FILE_RE)]
+      .map((match) => normalizePlanGroundingPath(match[0] || ""));
+    const relevantEvidence = lineTargets.length > 0
+      ? evidence.filter((item) => lineTargets.some((target) => planGroundingPathsMatch(target, item.target)))
+      : evidence;
+    for (const identifier of identifiers) {
+      const hasPositiveObservation = relevantEvidence.some((item) => {
+        return evidenceContainsPositiveIdentifierObservation(item.detail, identifier, line);
+      });
+      if (hasPositiveObservation) {
+        return identifier;
+      }
+    }
+  }
+  return null;
+}
+
 export function validatePlanEvidenceGrounding(input: {
   content: string;
   evidence?: string[];
@@ -1442,6 +2032,13 @@ export function validatePlanEvidenceGrounding(input: {
   recentToolActivity?: PlanMaterializationToolActivityLike[];
   evidenceBundle?: PlanEvidenceBundle;
 }): PlanArtifactQualityResult {
+  const contradictedClaim = findContradictedPlanDiagnosticClaim(input);
+  if (contradictedClaim) {
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: `plan_diagnostic_claim_contradicted:${contradictedClaim}`,
+    });
+  }
   const readTargets = [
     ...collectReadEvidenceTargets(input),
     ...(input.evidenceBundle?.facts.map((fact) => fact.target) || []),
@@ -2848,6 +3445,17 @@ export function materializePlanArtifactFromVisibleText(input: {
 
   let content = normalizePlanContent(raw);
   let source: PlanMaterializationSource = input.sourceHint || "visible_plan";
+  const validationTargetRepair = repairPlanValidationTargetFromEvidence({
+    content,
+    evidenceRecords: input.evidenceRecords,
+    recentToolActivity: input.recentToolActivity,
+  });
+  if (validationTargetRepair.repaired) {
+    content = validationTargetRepair.content;
+    source = input.sourceHint === "deterministic_evidence"
+      ? "deterministic_evidence"
+      : "grounding_repaired_visible_plan";
+  }
   if (countPlanShapeSignals(content) < 5) return rejectPlanMaterialization({ reason: "not_structured" });
   const decisionFork = analyzePlanDecisionFork(content);
 

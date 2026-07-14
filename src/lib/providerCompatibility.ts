@@ -165,6 +165,16 @@ export function ensureProviderCompatibilityMode(
 }
 
 export function buildCompatibilityRetryMessages(messages: CompatibilityMessage[]): CompatibilityMessage[] {
+  const toolNamesByCallId = new Map<string, string>();
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
+    for (const toolCall of message.tool_calls) {
+      if (toolCall.id && toolCall.function?.name) {
+        toolNamesByCallId.set(toolCall.id, toolCall.function.name);
+      }
+    }
+  }
+
   return messages.map((message) => {
     const textContent = extractCompatibilityTextContent(message.content);
     const compatibilityText = [
@@ -187,9 +197,21 @@ export function buildCompatibilityRetryMessages(messages: CompatibilityMessage[]
         ? message.content
         : compatibilityText || String(message.content);
       const parsedEnvelope = parseToolFeedbackEnvelope(rawToolContent);
+      const toolName = parsedEnvelope?.envelope.tool || (
+        message.tool_call_id ? toolNamesByCallId.get(message.tool_call_id) : ""
+      );
+      const preserveExactFileRead =
+        toolName === "read_file" ||
+        /(?:^|\n)(?:READ_FILE_RESULT|CACHED_FILE_REPLAY)\b/.test(rawToolContent);
       if (parsedEnvelope) {
         const envelopeHeader = `${TOOL_FEEDBACK_ENVELOPE_PREFIX}${JSON.stringify(parsedEnvelope.envelope)}`;
-        const body = parsedEnvelope.body.slice(0, 800);
+        // XML/compat mode changes the role representation, not the file-read
+        // observation itself. Context management already owns token budgets;
+        // truncating an exact read window here makes the model request the same
+        // range while the cache incorrectly believes the full source is active.
+        const body = preserveExactFileRead
+          ? parsedEnvelope.body
+          : parsedEnvelope.body.slice(0, 800);
         return {
           role: "user",
           content: [
@@ -201,7 +223,9 @@ export function buildCompatibilityRetryMessages(messages: CompatibilityMessage[]
       }
       return {
         role: "user",
-        content: `[Tool result]: ${(compatibilityText || String(message.content)).slice(0, 800)}`,
+        content: `[Tool result]: ${preserveExactFileRead
+          ? compatibilityText || String(message.content)
+          : (compatibilityText || String(message.content)).slice(0, 800)}`,
       };
     }
 

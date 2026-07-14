@@ -211,7 +211,7 @@ const TOOL_REQUIRED_ARGUMENTS: Record<string, string> = {
   run_command: "command, cwd, description, timeout_ms?",
   browser_evaluate: "url, actions?, checks?, wait_for_text?, screenshot?, timeout_ms?",
   execute_command: "command, cwd, description, wait_ms?, max_chars?",
-  send_pty_input: "input, wait_ms?, max_chars?",
+  send_pty_input: "input?, control?, wait_ms?, max_chars?",
   read_pty_tail: "max_chars?, wait_ms?",
   read_pty_since: "offset, max_chars?, wait_ms?",
   get_pty_status: "wait_ms?",
@@ -1103,7 +1103,7 @@ export function buildSystemPrompt(
     addToolDescription("run_command", "- run_command: 同步执行一次性 shell 命令并等待完成，返回 stdout、stderr、exitCode、timedOut、durationMs。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），长命令设置 `timeout_ms`。运行测试、构建、Python 脚本、Git 提交/推送等有限命令时使用，并基于返回结果总结成功/失败；Git 状态与差异优先用 git_status/git_diff，不要把 shell 当作常规文件分页读取工具。");
     addToolDescription("browser_evaluate", "- browser_evaluate: 打开本地 dev server 或工作区内 file:// 页面进行真实浏览器验证。必须传 `url`；可传 `actions`（逐行：click/fill/press/select_file/wait_for_selector/wait_for_text）和 `checks`（逐行：text/not_text/selector/not_selector/title/console/not_console/no_console_errors）。默认自动截图，并自动检查页面运行时异常和空白渲染；任务行为仍应给出具体 checks。若结果为 BROWSER_VALIDATION_FAILED，先依据 failureSummary/pageErrors 修复或改变验证目标，不要原样重试。不要用 curl/grep/cat 替代它。");
     addToolDescription("execute_command", "- execute_command: 向集成 PTY 发送命令，适合开发服务器、watch 模式、交互式程序或需要保留终端上下文的命令。必须传 `description` 和工作区相对 `cwd`（根目录用 `.`），不要在 command 里用 `cd ... &&` 代替 cwd。可传 `wait_ms` 等待输出，默认 4000，最多 30000。它返回本次发送后的新增输出和 offset；后续用 read_pty_since/read_pty_tail/get_pty_status 继续检查。");
-    addToolDescription("send_pty_input", "- send_pty_input: 向当前 PTY 前台进程发送原始输入，适合回答交互提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）。可传 `wait_ms` 等待交互程序回显。");
+    addToolDescription("send_pty_input", "- send_pty_input: 仅向已有 PTY 前台进程发送原始输入，适合回答交互提示或发送单次 Ctrl+C。Ctrl+C 使用 `control: interrupt`（兼容 `input: CTRL_C`），不得同时附带普通 input 或 append_newline；发送后根据返回的 deliveryState、foregroundState 与 generation 继续，禁止原样重发。可传 `wait_ms` 等待回显。");
     addToolDescription("read_pty_tail", "- read_pty_tail: 读取终端最近日志，适合快速查看错误栈或长任务尾部输出。命令还在跑且需要观察时，传 `wait_ms` 先等一小段时间再读。");
     addToolDescription("read_pty_since", "- read_pty_since: 按 offset 读取新增终端输出，适合检查某次命令之后发生了什么。命令还在跑且输出未完整时，传 `wait_ms` 等待后再观察，不要用 shell sleep 来等待。");
     addToolDescription("get_pty_status", "- get_pty_status: 检查 PTY 是否运行、当前 buffer offset、最近输出；可传 `wait_ms` 在检查前等待。");

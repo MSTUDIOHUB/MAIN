@@ -45,6 +45,7 @@ pub mod web_search;
 // region: 全局常量与状态
 
 const PTY_BUFFER_LIMIT_BYTES: usize = 512 * 1024;
+const PTY_TAIL_DEFAULT_CHARS: usize = 8_000;
 const GREP_MATCH_LIMIT: usize = 2000;
 const GREP_OUTPUT_LIMIT_BYTES: usize = 512 * 1024;
 const COMMAND_OUTPUT_LIMIT_BYTES: usize = 1024 * 1024;
@@ -276,6 +277,9 @@ struct PtySession {
     child: Box<dyn portable_pty::Child + Send>,
     workspace: PathBuf,
     pending_command: String,
+    foreground_generation: u64,
+    foreground_generation_start_offset: u64,
+    delivered_control_ids: HashSet<String>,
 }
 
 #[derive(Default)]
@@ -293,6 +297,8 @@ struct PtyReadResult {
     truncated: bool,
     buffer_start_offset: u64,
     buffer_end_offset: u64,
+    foreground_generation: u64,
+    foreground_generation_start_offset: u64,
 }
 
 #[derive(Serialize)]
@@ -303,11 +309,26 @@ struct PtyStatus {
     pid: Option<u32>,
     foreground_pid: Option<u32>,
     shell_available: bool,
+    foreground_state: String,
+    foreground_generation: u64,
+    foreground_generation_start_offset: u64,
     exit_code: Option<i32>,
     buffer_start_offset: u64,
     buffer_end_offset: u64,
     buffer_bytes: usize,
     tail: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PtyWriteResult {
+    accepted: bool,
+    duplicate: bool,
+    delivery_state: String,
+    foreground_pid: Option<u32>,
+    foreground_state: String,
+    foreground_generation: u64,
+    error: Option<String>,
 }
 
 struct CapturedPipe {
@@ -504,27 +525,6 @@ impl PtyBuffer {
         self.read_since(self.start_offset, max_chars)
     }
 
-    fn read_tail(&self, max_chars: Option<usize>) -> PtyReadResult {
-        let end_offset = self.end_offset();
-        let text = decode_utf8_lossy_for_display(&self.bytes);
-        let max = max_chars.unwrap_or(8_000).clamp(1, 200_000);
-        let (tail, truncated_by_chars) = take_tail_chars(&text, max);
-        let start_offset = if truncated_by_chars {
-            end_offset.saturating_sub(tail.as_bytes().len() as u64)
-        } else {
-            self.start_offset
-        };
-
-        PtyReadResult {
-            text: tail,
-            start_offset,
-            end_offset,
-            truncated: truncated_by_chars,
-            buffer_start_offset: self.start_offset,
-            buffer_end_offset: end_offset,
-        }
-    }
-
     fn read_since(&self, requested_offset: u64, max_chars: Option<usize>) -> PtyReadResult {
         let buffer_end = self.end_offset();
         let mut truncated = false;
@@ -554,8 +554,59 @@ impl PtyBuffer {
             truncated: truncated || truncated_by_chars,
             buffer_start_offset: self.start_offset,
             buffer_end_offset: buffer_end,
+            foreground_generation: 0,
+            foreground_generation_start_offset: 0,
         }
     }
+}
+
+fn read_pty_generation_since(
+    buffer: &PtyBuffer,
+    requested_offset: u64,
+    max_chars: Option<usize>,
+    foreground_generation: u64,
+    generation_start_offset: u64,
+) -> PtyReadResult {
+    let mut result = buffer.read_since(requested_offset.max(generation_start_offset), max_chars);
+    if requested_offset < generation_start_offset {
+        result.truncated = true;
+    }
+    result.foreground_generation = foreground_generation;
+    result.foreground_generation_start_offset = generation_start_offset;
+    result
+}
+
+fn read_pty_current_generation_view(
+    buffer: &PtyBuffer,
+    max_chars: Option<usize>,
+    foreground_generation: u64,
+    generation_start_offset: u64,
+) -> PtyReadResult {
+    if foreground_generation == 0 {
+        return buffer.read_all(max_chars);
+    }
+    read_pty_generation_since(
+        buffer,
+        generation_start_offset,
+        max_chars,
+        foreground_generation,
+        generation_start_offset,
+    )
+}
+
+fn read_pty_generation_tail(
+    buffer: &PtyBuffer,
+    max_chars: Option<usize>,
+    foreground_generation: u64,
+    generation_start_offset: u64,
+) -> PtyReadResult {
+    read_pty_generation_since(
+        buffer,
+        generation_start_offset,
+        Some(max_chars.unwrap_or(PTY_TAIL_DEFAULT_CHARS)),
+        foreground_generation,
+        generation_start_offset,
+    )
 }
 
 impl WorkspaceState {
@@ -1770,6 +1821,21 @@ fn pty_shell_available(running: bool, shell_pid: Option<u32>, foreground_pid: Op
     match (shell_pid, foreground_pid) {
         (Some(shell_pid), Some(foreground_pid)) => shell_pid == foreground_pid,
         _ => true,
+    }
+}
+
+fn pty_foreground_state(
+    running: bool,
+    shell_pid: Option<u32>,
+    foreground_pid: Option<u32>,
+) -> &'static str {
+    if !running {
+        return "stopped";
+    }
+    match (shell_pid, foreground_pid) {
+        (Some(shell_pid), Some(foreground_pid)) if shell_pid == foreground_pid => "idle",
+        (Some(_), Some(_)) => "busy",
+        _ => "unknown",
     }
 }
 
@@ -4729,6 +4795,9 @@ fn spawn_pty(
             child,
             workspace: root,
             pending_command: String::new(),
+            foreground_generation: 0,
+            foreground_generation_start_offset: 0,
+            delivered_control_ids: HashSet::new(),
         },
     );
 
@@ -4769,7 +4838,10 @@ fn write_pty(
     permission_approval: Option<harness::permissions::ShellPermissionApproval>,
     user_terminal: Option<bool>,
     allow_foreground_input: Option<bool>,
-) -> Result<(), String> {
+    expected_foreground_pid: Option<u32>,
+    expected_foreground_generation: Option<u64>,
+    control_id: Option<String>,
+) -> Result<PtyWriteResult, String> {
     let mut guard = state
         .sessions
         .lock()
@@ -4780,6 +4852,46 @@ fn write_pty(
         .ok_or_else(|| "PTY 尚未启动，请先调用 spawn_pty".to_string())?;
     let shell_pid = session.child.process_id();
     let foreground_pid = pty_foreground_process_id(session.master.as_ref());
+    let foreground_state = pty_foreground_state(true, shell_pid, foreground_pid);
+    let foreground_generation = session.foreground_generation;
+    if allow_foreground_input == Some(true) {
+        if foreground_state == "idle" {
+            return Err(
+                "PTY_INPUT_NO_ACTIVE_FOREGROUND: the integrated terminal shell is idle."
+                    .to_string(),
+            );
+        }
+        if let Some(expected) = expected_foreground_generation {
+            if expected != foreground_generation {
+                return Err(format!(
+                    "PTY_FOREGROUND_CHANGED: expected generation {expected}, current generation {foreground_generation}."
+                ));
+            }
+        }
+        if let Some(expected) = expected_foreground_pid {
+            if foreground_pid != Some(expected) {
+                return Err(format!(
+                    "PTY_FOREGROUND_CHANGED: expected foreground pid {expected}, current foreground pid {}.",
+                    foreground_pid
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                ));
+            }
+        }
+        if let Some(id) = control_id.as_ref() {
+            if session.delivered_control_ids.contains(id) {
+                return Ok(PtyWriteResult {
+                    accepted: false,
+                    duplicate: true,
+                    delivery_state: "duplicate".to_string(),
+                    foreground_pid,
+                    foreground_state: foreground_state.to_string(),
+                    foreground_generation,
+                    error: None,
+                });
+            }
+        }
+    }
     if user_terminal != Some(true)
         && allow_foreground_input != Some(true)
         && !pty_shell_available(true, shell_pid, foreground_pid)
@@ -4804,14 +4916,66 @@ fn write_pty(
     } else {
         session.pending_command.clear();
     }
+    let starts_new_generation =
+        (user_terminal != Some(true) && allow_foreground_input != Some(true))
+            || (user_terminal == Some(true) && input.chars().any(|ch| ch == '\r' || ch == '\n'));
+    if starts_new_generation {
+        session.foreground_generation_start_offset = session
+            .buffer
+            .lock()
+            .map_err(|_| "无法读取 PTY 缓冲区：buffer 锁已损坏".to_string())?
+            .end_offset();
+        session.foreground_generation = session.foreground_generation.saturating_add(1);
+        session.delivered_control_ids.clear();
+    }
+    let write_generation = session.foreground_generation;
+    if let Some(id) = control_id.as_ref() {
+        // Reserve the id before attempting the write. A partial write, flush
+        // failure, or lost IPC response has unknown delivery and must not be
+        // replayed as a second control action.
+        session.delivered_control_ids.insert(id.clone());
+    }
     let mut writer = session
         .writer
         .lock()
         .map_err(|_| "无法写入 PTY：writer 锁已损坏".to_string())?;
-    writer
-        .write_all(input.as_bytes())
-        .map_err(|e| format!("写入 PTY 失败: {e}"))?;
-    writer.flush().map_err(|e| format!("刷新 PTY 失败: {e}"))
+    if let Err(error) = writer.write_all(input.as_bytes()) {
+        if control_id.is_some() {
+            return Ok(PtyWriteResult {
+                accepted: true,
+                duplicate: false,
+                delivery_state: "unknown".to_string(),
+                foreground_pid,
+                foreground_state: foreground_state.to_string(),
+                foreground_generation: write_generation,
+                error: Some(format!("写入 PTY 失败: {error}")),
+            });
+        }
+        return Err(format!("写入 PTY 失败: {error}"));
+    }
+    if let Err(error) = writer.flush() {
+        if control_id.is_some() {
+            return Ok(PtyWriteResult {
+                accepted: true,
+                duplicate: false,
+                delivery_state: "unknown".to_string(),
+                foreground_pid,
+                foreground_state: foreground_state.to_string(),
+                foreground_generation: write_generation,
+                error: Some(format!("刷新 PTY 失败: {error}")),
+            });
+        }
+        return Err(format!("刷新 PTY 失败: {error}"));
+    }
+    Ok(PtyWriteResult {
+        accepted: true,
+        duplicate: false,
+        delivery_state: "delivered".to_string(),
+        foreground_pid,
+        foreground_state: foreground_state.to_string(),
+        foreground_generation: write_generation,
+        error: None,
+    })
 }
 
 #[tauri::command]
@@ -4832,7 +4996,16 @@ fn read_pty_buffer(
         .buffer
         .lock()
         .map_err(|_| "无法读取 PTY 缓冲区：buffer 锁已损坏".to_string())?;
-    let result = buffer.read_all(max_chars);
+    // Keep the legacy String return shape for the integrated terminal and old
+    // tool callers, but once an agent command generation exists, expose only
+    // that generation. Otherwise a prior launch's ready/error marker can be
+    // replayed as evidence for the current launch.
+    let result = read_pty_current_generation_view(
+        &buffer,
+        max_chars,
+        session.foreground_generation,
+        session.foreground_generation_start_offset,
+    );
     if result.truncated {
         Ok(format!(
             "[terminal output truncated; buffer offsets {}..{}]\n{}",
@@ -4861,7 +5034,15 @@ fn read_pty_tail(
         .buffer
         .lock()
         .map_err(|_| "无法读取 PTY 缓冲区：buffer 锁已损坏".to_string())?;
-    Ok(buffer.read_tail(max_chars))
+    // Tail observations belong to the current command generation. Replaying
+    // an older generation's ready/error marker can incorrectly satisfy or
+    // fail a newly launched dev server before it emits any output.
+    Ok(read_pty_generation_tail(
+        &buffer,
+        max_chars,
+        session.foreground_generation,
+        session.foreground_generation_start_offset,
+    ))
 }
 
 #[tauri::command]
@@ -4883,7 +5064,13 @@ fn read_pty_since(
         .buffer
         .lock()
         .map_err(|_| "无法读取 PTY 缓冲区：buffer 锁已损坏".to_string())?;
-    Ok(buffer.read_since(offset, max_chars))
+    Ok(read_pty_generation_since(
+        &buffer,
+        offset,
+        max_chars,
+        session.foreground_generation,
+        session.foreground_generation_start_offset,
+    ))
 }
 
 #[tauri::command]
@@ -4912,6 +5099,8 @@ fn clear_pty_buffer(
         truncated: had_content,
         buffer_start_offset: buffer.start_offset,
         buffer_end_offset: buffer.end_offset(),
+        foreground_generation: session.foreground_generation,
+        foreground_generation_start_offset: session.foreground_generation_start_offset,
     })
 }
 
@@ -4933,6 +5122,9 @@ fn get_pty_status(
             pid: None,
             foreground_pid: None,
             shell_available: false,
+            foreground_state: "stopped".to_string(),
+            foreground_generation: 0,
+            foreground_generation_start_offset: 0,
             exit_code: None,
             buffer_start_offset: 0,
             buffer_end_offset: 0,
@@ -4950,11 +5142,14 @@ fn get_pty_status(
     let pid = session.child.process_id();
     let foreground_pid = pty_foreground_process_id(session.master.as_ref());
     let shell_available = pty_shell_available(running, pid, foreground_pid);
+    let foreground_state = pty_foreground_state(running, pid, foreground_pid);
     let buffer = session
         .buffer
         .lock()
         .map_err(|_| "无法读取 PTY 缓冲区：buffer 锁已损坏".to_string())?;
-    let tail = buffer.read_tail(Some(2_000)).text;
+    let tail = buffer
+        .read_since(session.foreground_generation_start_offset, Some(2_000))
+        .text;
 
     Ok(PtyStatus {
         active: true,
@@ -4962,6 +5157,9 @@ fn get_pty_status(
         pid,
         foreground_pid,
         shell_available,
+        foreground_state: foreground_state.to_string(),
+        foreground_generation: session.foreground_generation,
+        foreground_generation_start_offset: session.foreground_generation_start_offset,
         exit_code,
         buffer_start_offset: buffer.start_offset,
         buffer_end_offset: buffer.end_offset(),
@@ -10556,11 +10754,12 @@ mod tests {
         browser_evaluate_supervisor_timeout, compare_file_nodes, delete_plan_files_in_dir,
         is_supported_attachment_path, is_valid_git_branch_name, looks_long_running_shell_command,
         merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
-        parse_git_porcelain_entries, parse_git_porcelain_status, pty_shell_available,
-        read_session_transcript_with_fallback, resolve_existing_path,
+        parse_git_porcelain_entries, parse_git_porcelain_status, pty_foreground_state,
+        pty_shell_available, read_pty_current_generation_view, read_pty_generation_since,
+        read_pty_generation_tail, read_session_transcript_with_fallback, resolve_existing_path,
         resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
         should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
-        write_json_atomic, write_jsonl_atomic, FileNode, SessionTranscript,
+        write_json_atomic, write_jsonl_atomic, FileNode, SessionTranscript, PTY_TAIL_DEFAULT_CHARS,
     };
     use serde_json::json;
     use std::fs;
@@ -10631,6 +10830,66 @@ mod tests {
         assert!(!pty_shell_available(true, Some(100), Some(200)));
         assert!(!pty_shell_available(false, Some(100), Some(100)));
         assert!(pty_shell_available(true, Some(100), None));
+        assert_eq!(pty_foreground_state(true, Some(100), Some(100)), "idle");
+        assert_eq!(pty_foreground_state(true, Some(100), Some(200)), "busy");
+        assert_eq!(pty_foreground_state(true, Some(100), None), "unknown");
+        assert_eq!(pty_foreground_state(false, Some(100), Some(100)), "stopped");
+    }
+
+    #[test]
+    fn pty_generation_tail_excludes_previous_command_markers() {
+        let mut buffer = super::PtyBuffer::default();
+        buffer.append(b"Error: old launch failed\nLocal: http://localhost:5173/\n");
+        let generation_start = buffer.end_offset();
+        buffer.append(b"Starting development server\nLocal: http://localhost:1420/\n");
+
+        let current = read_pty_generation_since(&buffer, 0, Some(2_000), 2, generation_start);
+        assert!(!current.text.contains("old launch failed"));
+        assert!(!current.text.contains("localhost:5173"));
+        assert!(current.text.contains("localhost:1420"));
+        assert!(current.truncated);
+        assert_eq!(current.foreground_generation, 2);
+        assert_eq!(current.foreground_generation_start_offset, generation_start);
+    }
+
+    #[test]
+    fn pty_legacy_buffer_view_excludes_previous_generation_markers() {
+        let mut buffer = super::PtyBuffer::default();
+        buffer.append(b"Error: old launch failed\nLocal: http://localhost:5173/\n");
+        let generation_start = buffer.end_offset();
+        buffer.append(b"Starting development server\nLocal: http://localhost:1420/\n");
+
+        let current = read_pty_current_generation_view(&buffer, None, 2, generation_start);
+        assert!(!current.text.contains("old launch failed"));
+        assert!(!current.text.contains("localhost:5173"));
+        assert!(current.text.contains("localhost:1420"));
+        assert!(!current.truncated);
+        assert_eq!(current.start_offset, generation_start);
+        assert_eq!(current.foreground_generation, 2);
+        assert_eq!(current.foreground_generation_start_offset, generation_start);
+
+        let initial = read_pty_current_generation_view(&buffer, None, 0, 0);
+        assert!(initial.text.contains("localhost:5173"));
+        assert!(initial.text.contains("localhost:1420"));
+    }
+
+    #[test]
+    fn pty_generation_tail_defaults_to_eight_thousand_characters() {
+        let mut buffer = super::PtyBuffer::default();
+        buffer.append(b"previous generation\n");
+        let generation_start = buffer.end_offset();
+        buffer.append("x".repeat(PTY_TAIL_DEFAULT_CHARS + 500).as_bytes());
+
+        let current = read_pty_generation_tail(&buffer, None, 3, generation_start);
+        assert_eq!(current.text.chars().count(), PTY_TAIL_DEFAULT_CHARS);
+        assert!(current.truncated);
+        assert!(!current.text.contains("previous generation"));
+        assert_eq!(
+            current.end_offset - current.start_offset,
+            PTY_TAIL_DEFAULT_CHARS as u64
+        );
+        assert_eq!(current.foreground_generation, 3);
+        assert_eq!(current.foreground_generation_start_offset, generation_start);
     }
 
     #[test]

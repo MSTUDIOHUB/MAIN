@@ -26,6 +26,8 @@ import {
   shouldTreatCloudGatewayErrorAsCompatibility,
 } from "../../orchestrator";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
+import type { FileReadState } from "../fileReadCache";
+import { advanceFileReadContextEvictionEpochs } from "./contextManagement";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
 import {
   APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS,
@@ -180,6 +182,8 @@ export type StreamWithRecoveryResult =
       status: "streamed";
       streamResult: StreamResult;
       snapshotContextLimit: number | undefined;
+      /** Exact logical message array passed to fetchLLMStream for this result. */
+      messagesSentToLLM: AgentMessage[];
     }
   | {
       status: "stopped";
@@ -281,10 +285,11 @@ function emitReactiveContextCompression(input: {
   }
 }
 
-function replaceMessagesForRetry(input: {
+export function replaceMessagesForRetry(input: {
   callbacks: OrchestratorCallbacks;
   iteration: number;
   messages: AgentMessage[];
+  fileReadStates: Map<string, FileReadState>;
   reason: string;
   onlyWhenChanged?: boolean;
   changed?: boolean;
@@ -293,6 +298,7 @@ function replaceMessagesForRetry(input: {
     callbacks,
     iteration,
     messages,
+    fileReadStates,
     reason,
     onlyWhenChanged = false,
     changed = true,
@@ -301,7 +307,20 @@ function replaceMessagesForRetry(input: {
     return;
   }
   try {
+    const beforeMessages = callbacks.getMessages() as AgentMessage[];
     callbacks.replaceMessages(messages);
+    const evictedWindows = advanceFileReadContextEvictionEpochs({
+      fileReadStates,
+      beforeMessages,
+      afterMessages: messages,
+    });
+    if (evictedWindows > 0) {
+      logAgentEvent("file_read_context_eviction_epoch_advanced", {
+        iteration,
+        evictedWindows,
+        reason,
+      });
+    }
   } catch (replaceErr) {
     logAgentEvent("replace_messages_error", {
       iteration,
@@ -310,6 +329,29 @@ function replaceMessagesForRetry(input: {
       reason,
     });
   }
+}
+
+export function observeFileReadContextForMessagesSent(input: {
+  fileReadStates: Map<string, FileReadState>;
+  beforeMessages: AgentMessage[];
+  messagesSentToLLM: AgentMessage[];
+  iteration: number;
+  reason: string;
+}): number {
+  const evictedWindows = advanceFileReadContextEvictionEpochs({
+    fileReadStates: input.fileReadStates,
+    beforeMessages: input.beforeMessages,
+    afterMessages: input.messagesSentToLLM,
+  });
+  if (evictedWindows > 0) {
+    logAgentEvent("file_read_context_eviction_epoch_advanced", {
+      iteration: input.iteration,
+      evictedWindows,
+      reason: input.reason,
+      source: "messages_sent_to_llm",
+    });
+  }
+  return evictedWindows;
 }
 
 export async function invokeStreamWithRecoveryForIteration(input: {
@@ -344,6 +386,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   approvedPlanRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
+  fileReadStates: Map<string, FileReadState>;
   pauseApprovedPlanStreamWatchdog: (message: string, logContext?: Record<string, unknown>) => boolean;
   emitPlanExecutionProgress: (
     phase: PlanExecutionProgressPhase,
@@ -381,6 +424,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     getPlanStreamWatchdogOptions,
     approvedPlanRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
+    fileReadStates,
     pauseApprovedPlanStreamWatchdog,
     emitPlanExecutionProgress,
   } = input;
@@ -447,10 +491,18 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     if (initialStreamInvocation.status === "stopped") {
       return { status: "stopped", snapshotContextLimit };
     }
+    observeFileReadContextForMessagesSent({
+      fileReadStates,
+      beforeMessages: managedAgentMessages,
+      messagesSentToLLM: initialStreamInvocation.messagesSentToLLM,
+      iteration,
+      reason: "initial_stream_protocol_messages",
+    });
     return {
       status: "streamed",
       streamResult: initialStreamInvocation.streamResult,
       snapshotContextLimit,
+      messagesSentToLLM: initialStreamInvocation.messagesSentToLLM,
     };
   } catch (err) {
     let activeError: unknown = err;
@@ -499,11 +551,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           : "running one bounded tool-call recovery",
       });
       try {
+        const retrySourceMessages = [
+          ...managedAgentMessages,
+          { role: "user" as const, content: retryPrompt },
+        ];
         const retryMessages = prepareMessagesForToolProtocol(
-          [
-            ...managedAgentMessages,
-            { role: "user" as const, content: retryPrompt },
-          ],
+          retrySourceMessages,
           config,
           settings,
           providerCompatibilityOverride,
@@ -532,7 +585,14 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           toolCalls: streamResult.toolCalls?.length || 0,
           finishReason: streamResult.finishReason || null,
         });
-        return { status: "streamed", streamResult, snapshotContextLimit };
+        observeFileReadContextForMessagesSent({
+          fileReadStates,
+          beforeMessages: retrySourceMessages,
+          messagesSentToLLM: retryMessages,
+          iteration,
+          reason: "approved_plan_watchdog_retry_protocol_messages",
+        });
+        return { status: "streamed", streamResult, snapshotContextLimit, messagesSentToLLM: retryMessages };
       } catch (retryError) {
         if (isAbortError(retryError)) {
           callbacks.onStatusChange("idle");
@@ -587,6 +647,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             finishReason: "tool_calls",
           },
           snapshotContextLimit,
+          messagesSentToLLM: prepareMessagesForToolProtocol(
+            managedAgentMessages,
+            config,
+            settings,
+            providerCompatibilityOverride,
+          ),
         };
       }
       const baseRetryWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
@@ -615,11 +681,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
       callbacks.onStatusChange("running");
       try {
+        const retrySourceMessages = [
+          ...managedAgentMessages,
+          { role: "user" as const, content: retryPrompt },
+        ];
         const retryMessages = prepareMessagesForToolProtocol(
-          [
-            ...managedAgentMessages,
-            { role: "user" as const, content: retryPrompt },
-          ],
+          retrySourceMessages,
           config,
           settings,
           providerCompatibilityOverride,
@@ -650,7 +717,14 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           toolCalls: streamResult.toolCalls?.length || 0,
           finishReason: streamResult.finishReason || null,
         });
-        return { status: "streamed", streamResult, snapshotContextLimit };
+        observeFileReadContextForMessagesSent({
+          fileReadStates,
+          beforeMessages: retrySourceMessages,
+          messagesSentToLLM: retryMessages,
+          iteration,
+          reason: "preapproval_plan_watchdog_retry_protocol_messages",
+        });
+        return { status: "streamed", streamResult, snapshotContextLimit, messagesSentToLLM: retryMessages };
       } catch (retryError) {
         if (isAbortError(retryError)) {
           callbacks.onStatusChange("idle");
@@ -752,6 +826,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         callbacks,
         iteration,
         messages: aggressivelyManaged,
+        fileReadStates,
         reason: "reactive_context_trim",
       });
       emitReactiveContextCompression({
@@ -787,7 +862,19 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         if (llmTools.length > 0) {
           callbacks.onProviderNativeToolSuccess?.();
         }
-        return { status: "streamed", streamResult, snapshotContextLimit };
+        observeFileReadContextForMessagesSent({
+          fileReadStates,
+          beforeMessages: aggressivelyManaged,
+          messagesSentToLLM: aggressivelyManagedForLLM,
+          iteration,
+          reason: "reactive_context_trim_protocol_messages",
+        });
+        return {
+          status: "streamed",
+          streamResult,
+          snapshotContextLimit,
+          messagesSentToLLM: aggressivelyManagedForLLM,
+        };
       } catch (retryErr) {
         if (isAbortError(retryErr)) {
           callbacks.onStatusChange("idle");
@@ -830,13 +917,18 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         callbacks.onContextMemoryBuilt?.(emergencyManagedResult.memoryState, emergencyManagedResult.memoryPacket);
         const emergencyManaged = emergencyManagedResult.messages as AgentMessage[];
 
+        // Compatibility flattening happens before manageContext and may evict
+        // an exact file window even when manageContext itself reports zero
+        // token reduction. Persist/compare the actual emergency base
+        // unconditionally; UI compression telemetry remains reduction-gated.
+        replaceMessagesForRetry({
+          callbacks,
+          iteration,
+          messages: emergencyManaged,
+          fileReadStates,
+          reason: "emergency_context_trim",
+        });
         if (emergencyManagedResult.changed && emergencyManagedResult.tokenReduction > 0) {
-          replaceMessagesForRetry({
-            callbacks,
-            iteration,
-            messages: emergencyManaged,
-            reason: "emergency_context_trim",
-          });
           emitReactiveContextCompression({
             callbacks,
             iteration,
@@ -871,7 +963,19 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           if (llmTools.length > 0) {
             callbacks.onProviderNativeToolSuccess?.();
           }
-          return { status: "streamed", streamResult, snapshotContextLimit };
+          observeFileReadContextForMessagesSent({
+            fileReadStates,
+            beforeMessages: emergencyManaged,
+            messagesSentToLLM: emergencyManagedForLLM,
+            iteration,
+            reason: "emergency_context_trim_protocol_messages",
+          });
+          return {
+            status: "streamed",
+            streamResult,
+            snapshotContextLimit,
+            messagesSentToLLM: emergencyManagedForLLM,
+          };
         } catch (finalErr) {
           if (isAbortError(finalErr)) {
             callbacks.onStatusChange("idle");
@@ -949,6 +1053,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         callbacks,
         iteration,
         messages: cloudManagedMessages,
+        fileReadStates,
         reason: "cloud_context_retry",
         onlyWhenChanged: true,
         changed: cloudManagedResult.changed,
@@ -986,7 +1091,19 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         if (llmTools.length > 0) {
           callbacks.onProviderNativeToolSuccess?.();
         }
-        return { status: "streamed", streamResult, snapshotContextLimit };
+        observeFileReadContextForMessagesSent({
+          fileReadStates,
+          beforeMessages: cloudManagedMessages,
+          messagesSentToLLM: cloudManagedForLLM,
+          iteration,
+          reason: "cloud_context_retry_protocol_messages",
+        });
+        return {
+          status: "streamed",
+          streamResult,
+          snapshotContextLimit,
+          messagesSentToLLM: cloudManagedForLLM,
+        };
       } catch (cloudRetryErr) {
         if (isAbortError(cloudRetryErr)) {
           callbacks.onStatusChange("idle");
@@ -1030,6 +1147,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         callbacks,
         iteration,
         messages: compatibilityMessages,
+        fileReadStates,
         reason: "compatibility_fallback",
       });
       logAgentEvent("native_tool_fallback", {
@@ -1058,7 +1176,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             runtimeIntent,
           }, 0),
         );
-        return { status: "streamed", streamResult, snapshotContextLimit };
+        return {
+          status: "streamed",
+          streamResult,
+          snapshotContextLimit,
+          messagesSentToLLM: compatibilityMessages,
+        };
       } catch (retryErr) {
         if (isAbortError(retryErr)) {
           callbacks.onStatusChange("idle");
@@ -1098,6 +1221,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           callbacks,
           iteration,
           messages: providerCompatibilityMessages,
+          fileReadStates,
           reason: "provider_compatibility_retry",
         });
         try {
@@ -1116,7 +1240,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
               runtimeIntent,
             }, 0),
           );
-          return { status: "streamed", streamResult, snapshotContextLimit };
+          return {
+            status: "streamed",
+            streamResult,
+            snapshotContextLimit,
+            messagesSentToLLM: providerCompatibilityMessages,
+          };
         } catch (finalErr) {
           if (isAbortError(finalErr)) {
             callbacks.onStatusChange("idle");
@@ -1145,6 +1274,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             callbacks,
             iteration,
             messages: transcriptMessages,
+            fileReadStates,
             reason: "transcript_retry",
           });
           try {
@@ -1163,7 +1293,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
                 runtimeIntent,
               }, 0),
             );
-            return { status: "streamed", streamResult, snapshotContextLimit };
+            return {
+              status: "streamed",
+              streamResult,
+              snapshotContextLimit,
+              messagesSentToLLM: transcriptMessages,
+            };
           } catch (lastErr) {
             if (isAbortError(lastErr)) {
               callbacks.onStatusChange("idle");

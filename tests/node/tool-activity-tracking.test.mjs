@@ -219,6 +219,12 @@ test("tool activity tracking counts only successful commands browser checks and 
     target: "src/App.tsx",
     content: "updated source file",
   }), {}), true);
+
+  assert.equal(toolResultCountsAsExecutionEvidence(result({
+    name: "send_pty_input",
+    target: "CTRL_C",
+    content: JSON.stringify({ accepted: true, controlAction: "interrupt" }),
+  }), { control: "interrupt" }), false);
 });
 
 test("browser validation cache ignores timeout-only retries while preserving meaningful checks", () => {
@@ -386,6 +392,11 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
             tool: "read_file",
             target: "src/lib/subagents.ts",
             detail: "The resolveSubagentCapacityPolicy function incorrectly limits local child workflows before model-lane admission.",
+            facts: ["event_dom_listener_contract(DOMContentLoaded)", "listener_calls(initToolbar)"],
+          }, {
+            tool: "read_file",
+            target: "src/lib/subagents.ts",
+            detail: `${"implementation context ".repeat(16)} | L90: server port: 1420`,
           }],
         }, {
           subagentId: "subagent-b",
@@ -407,6 +418,10 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
     "src/lib/modelLaneCoordinator.ts",
   ]);
   assert.ok(promoted.every((item) => item.status === "succeeded"));
+  assert.match(promoted[0].detail || "", /resolveSubagentCapacityPolicy/);
+  assert.match(promoted[0].detail || "", /port:\s*1420/);
+  assert.ok(promoted[0].facts?.includes("event_dom_listener_contract(DOMContentLoaded)"));
+  assert.ok(promoted[0].facts?.includes("listener_calls(initToolbar)"));
 
   const debugEvents = [];
   const harness = createPostProcessingInput({

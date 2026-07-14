@@ -15,6 +15,7 @@ import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import { isWorkspaceMutationToolCall } from "../../workspaceMutationTools";
+import { isPtyControlInput } from "../../ptyCommandRuntime";
 import {
   executeLocalFileReadToolWithReview,
   executeReadOnlyToolsConcurrently,
@@ -50,10 +51,15 @@ export function shouldAdvanceWorkspaceObservationEpoch(
   toolArgs: Record<string, unknown> = {},
 ): boolean {
   const isExplicitWorkspaceMutation = isWorkspaceMutationToolCall(toolName, toolArgs);
+  const isNonControlPtyInteraction = toolName === "send_pty_input" &&
+    !isPtyControlInput(
+      typeof toolArgs.input === "string" ? toolArgs.input : "",
+      typeof toolArgs.control === "string" ? toolArgs.control : undefined,
+    );
   const isOpaqueWorkspaceAction =
     toolName === "run_command" ||
     toolName === "execute_command" ||
-    toolName === "send_pty_input";
+    isNonControlPtyInteraction;
   if (!isExplicitWorkspaceMutation && !isOpaqueWorkspaceAction) return false;
   if (
     result.isError ||
@@ -226,21 +232,18 @@ export async function executeToolExecutionRound(input: {
       normalizedReadResults.push(resultForModel);
     }
     if (sawSuccessfulPtyObservation) {
-      // A long-running process can mutate files between PTY polls. Treat each
-      // successful observation as a new workspace epoch and invalidate after
-      // processing the entire concurrent read batch, so a later result in the
-      // same batch cannot repopulate a cache that was just cleared.
-      const invalidation = invalidateWorkspaceReadCachesAfterMutation({
-        toolName: "execute_command",
-        args: {},
-        fileReadStates,
-        readOnlyResultCache,
-        readOnlyDuplicateSkipCounts,
-      });
+      // A long-running process can mutate files between PTY polls. Exact
+      // read_file windows are already guarded by current size/mtime and must
+      // retain their versioned replay count; only args-only observations lack
+      // that guard and need refreshing here.
+      const invalidatedReadOnlyEntries = readOnlyResultCache.size;
+      const invalidatedKeys = [...readOnlyResultCache.keys()];
+      readOnlyResultCache.clear();
+      invalidatedKeys.forEach((key) => readOnlyDuplicateSkipCounts.delete(key));
       logAgentEvent("workspace_read_cache_invalidated_after_pty_observation", {
         iteration,
-        invalidatedFileReadStates: invalidation.invalidatedFileReadSignatures.length,
-        invalidatedReadOnlyEntries: invalidation.invalidatedReadOnlyEntries,
+        invalidatedFileReadStates: 0,
+        invalidatedReadOnlyEntries,
       });
     }
     allResults.push(...normalizedReadResults);
@@ -300,7 +303,15 @@ export async function executeToolExecutionRound(input: {
     );
     allResults.push(result);
     const toolArgs = parseToolCallArguments(tc, workspace);
-    if (shouldAdvanceWorkspaceObservationEpoch(tc.name, result, toolArgs)) {
+    const refreshAfterPtyControl = tc.name === "send_pty_input" &&
+      isPtyControlInput(
+        typeof toolArgs.input === "string" ? toolArgs.input : "",
+        typeof toolArgs.control === "string" ? toolArgs.control : undefined,
+      ) &&
+      !result.isError &&
+      result.lifecycleState !== "blocked" &&
+      result.lifecycleState !== "declined";
+    if (shouldAdvanceWorkspaceObservationEpoch(tc.name, result, toolArgs) || refreshAfterPtyControl) {
       const invalidation = invalidateWorkspaceReadCachesAfterMutation({
         toolName: tc.name,
         args: toolArgs,

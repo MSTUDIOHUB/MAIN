@@ -502,6 +502,8 @@ export interface PtyReadResult {
   truncated: boolean;
   bufferStartOffset: number;
   bufferEndOffset: number;
+  foregroundGeneration?: number;
+  foregroundGenerationStartOffset?: number;
 }
 
 export interface PtyStatus {
@@ -510,11 +512,24 @@ export interface PtyStatus {
   pid?: number | null;
   foregroundPid?: number | null;
   shellAvailable?: boolean;
+  foregroundState?: "busy" | "idle" | "unknown" | "stopped";
+  foregroundGeneration?: number;
+  foregroundGenerationStartOffset?: number;
   exitCode?: number | null;
   bufferStartOffset: number;
   bufferEndOffset: number;
   bufferBytes: number;
   tail: string;
+}
+
+export interface PtyWriteResult {
+  accepted: boolean;
+  duplicate: boolean;
+  deliveryState: "delivered" | "unknown" | "duplicate";
+  foregroundPid?: number | null;
+  foregroundState?: "busy" | "idle" | "unknown" | "stopped";
+  foregroundGeneration?: number;
+  error?: string | null;
 }
 
 export interface DocumentBlock {
@@ -1230,13 +1245,19 @@ export function writePty(
   permissionApproval?: ShellPermissionApproval,
   userTerminal?: boolean,
   allowForegroundInput?: boolean,
-): Promise<void> {
-  return invoke<void>("write_pty", {
+  expectedForegroundPid?: number,
+  expectedForegroundGeneration?: number,
+  controlId?: string,
+): Promise<PtyWriteResult> {
+  return invoke<PtyWriteResult>("write_pty", {
     input,
     sessionKey,
     permissionApproval,
     userTerminal,
     allowForegroundInput,
+    expectedForegroundPid,
+    expectedForegroundGeneration,
+    controlId,
   });
 }
 

@@ -1003,9 +1003,10 @@ test("read_file cache is range-and-version aware and never falls back to stale g
   assert.match(active.preExecutionResults[0].content, /FILE_UNCHANGED_STUB/);
   assert.equal(active.preExecutionResults[0].readFileObservation?.source, "stub");
 
+  const compactedStates = new Map([[fileSignature, currentState]]);
   const compacted = await partitionToolCallsForExecution(createReadFilePartitionInput({
     managedAgentMessages: [],
-    fileReadStates: new Map([[fileSignature, currentState]]),
+    fileReadStates: compactedStates,
   }));
 
   assert.equal(compacted.preExecutionResults.length, 1);
@@ -1017,6 +1018,86 @@ test("read_file cache is range-and-version aware and never falls back to stale g
     compacted.preExecutionResults[0].readFileObservation?.key,
     active.preExecutionResults[0].readFileObservation?.key,
   );
+
+  const afterSecondCompaction = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    managedAgentMessages: [],
+    fileReadStates: compactedStates,
+    readOnlyDuplicateSkipCounts: new Map([[fileSignature, 1]]),
+  }));
+  assert.equal(afterSecondCompaction.preExecutionResults.length, 1);
+  assert.doesNotMatch(afterSecondCompaction.preExecutionResults[0].content, /CACHED_FILE_REPLAY/);
+  assert.match(afterSecondCompaction.preExecutionResults[0].content, /FILE_UNCHANGED_STUB/);
+
+  currentState.contextEvictionEpoch = (currentState.contextEvictionEpoch || 0) + 1;
+  const afterNewEvictionEpoch = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    managedAgentMessages: [],
+    fileReadStates: compactedStates,
+    readOnlyDuplicateSkipCounts: new Map([[fileSignature, 1]]),
+  }));
+  assert.equal(afterNewEvictionEpoch.preExecutionResults.length, 1);
+  assert.match(afterNewEvictionEpoch.preExecutionResults[0].content, /CACHED_FILE_REPLAY/);
+  assert.match(afterNewEvictionEpoch.preExecutionResults[0].content, /export function App/);
+});
+
+test("active-context stubs do not consume the context-eviction replay budget", async () => {
+  const args = { path: "src/App.tsx", start_line: 1, max_lines: 100 };
+  const signature = buildFileReadSignature("src/App.tsx", args);
+  const modelContent = [
+    "READ_FILE_RESULT",
+    "path: src/App.tsx",
+    "---CONTENT START---",
+    "export function App() { return null; }",
+    "---CONTENT END---",
+  ].join("\n");
+  const state = {
+    signature,
+    path: "src/App.tsx",
+    argsKey: "window",
+    contentHash: "same-version",
+    contentLength: modelContent.length,
+    sizeBytes: 120,
+    modifiedMs: 2,
+    modelContent,
+    contextEvictionEpoch: 0,
+    updatedAt: 1,
+  };
+  const duplicateCounts = new Map([[signature, 1]]);
+  globalThis.mockIpcInvoke = async (cmd) => cmd === "get_file_metadata"
+    ? { path: "src/App.tsx", sizeBytes: 120, modifiedMs: 2 }
+    : {};
+  const callbacks = {
+    ...createReadFilePartitionInput().callbacks,
+    getIsPlanApproved: () => true,
+    getPlanStage: () => "executing",
+    getPlanTasks: () => [{
+      id: "edit-app",
+      text: "Modify src/App.tsx",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "file", value: "src/App.tsx" }],
+    }],
+  };
+
+  const active = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    callbacks,
+    workflowMode: "plan",
+    managedAgentMessages: [{ role: "tool", content: modelContent }],
+    fileReadStates: new Map([[signature, state]]),
+    readOnlyDuplicateSkipCounts: duplicateCounts,
+  }));
+  assert.match(active.preExecutionResults[0].content, /FILE_UNCHANGED_STUB/);
+  assert.equal(state.replayCountSinceVersion || 0, 0);
+
+  state.contextEvictionEpoch = 1;
+  const evicted = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    callbacks,
+    workflowMode: "plan",
+    managedAgentMessages: [],
+    fileReadStates: new Map([[signature, state]]),
+    readOnlyDuplicateSkipCounts: duplicateCounts,
+  }));
+  assert.match(evicted.preExecutionResults[0].content, /CACHED_FILE_REPLAY/);
+  assert.equal(state.replayCountSinceVersion, 1);
 });
 
 test("stale windows are removed before coverage narrowing can reuse them", async () => {
@@ -1245,6 +1326,22 @@ test("a successful mutation invalidates file windows and args-only observations"
   });
   assert.equal(inspectInvalidation.invalidatedFileReadSignatures.length, 0);
   assert.equal(inspectStates.size, 1);
+
+  const controlStates = new Map([["control-read", commandState("control-read", "src/App.tsx")]]);
+  const controlCache = new Map([["read_file:{}", "cached source"]]);
+  const controlInvalidation = invalidateWorkspaceReadCachesAfterMutation({
+    toolName: "send_pty_input",
+    args: { control: "interrupt" },
+    target: "CTRL_C",
+    fileReadStates: controlStates,
+    readOnlyResultCache: controlCache,
+  });
+  assert.deepEqual(controlInvalidation, {
+    invalidatedFileReadSignatures: [],
+    invalidatedReadOnlyEntries: 1,
+  });
+  assert.equal(controlStates.size, 1);
+  assert.equal(controlCache.size, 0);
 });
 
 test("only real mutations and opaque workspace actions advance the observation epoch", () => {
@@ -1283,7 +1380,11 @@ test("only real mutations and opaque workspace actions advance the observation e
   assert.equal(shouldAdvanceWorkspaceObservationEpoch("send_pty_input", {
     content: "input sent",
     isError: false,
-  }), true);
+  }, { input: "\\u0003" }), false);
+  assert.equal(shouldAdvanceWorkspaceObservationEpoch("send_pty_input", {
+    content: "interactive answer sent",
+    isError: false,
+  }, { input: "y" }), true);
 });
 
 test("same-batch reads suppress only the exact duplicate signature", async () => {

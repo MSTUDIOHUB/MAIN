@@ -121,6 +121,21 @@ test("shell auto approval resolves command text for shell tools", () => {
     }),
     null,
   );
+
+  assert.equal(
+    getShellPermissionCommandForTool("send_pty_input", {
+      control: "interrupt",
+    }),
+    null,
+  );
+
+  assert.equal(
+    getShellPermissionCommandForTool("send_pty_input", {
+      input: "\\u0003",
+      append_newline: true,
+    }),
+    null,
+  );
 });
 
 test("shell auto approval builds approval for ask decisions", async () => {

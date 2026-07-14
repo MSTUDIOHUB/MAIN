@@ -685,7 +685,7 @@ const NON_EXECUTION_EVIDENCE_TOOLS = new Set([
   "find_symbol_references", "git_status", "git_diff", "read_file", "read_document",
   "knowledge_search", "knowledge_get_excerpt", "analyze_tabular_document", "query_tabular_document",
   "index_workspace_documents", "read_pty_buffer", "read_pty_tail", "read_pty_since",
-  "get_pty_status", "clear_pty_buffer",
+  "get_pty_status", "clear_pty_buffer", "send_pty_input",
 ]);
 
 const VERIFICATION_EVIDENCE_TOOLS = new Set([
@@ -694,7 +694,7 @@ const VERIFICATION_EVIDENCE_TOOLS = new Set([
   "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status",
 ]);
 
-const COMMAND_EVIDENCE_TOOLS = new Set(["run_command", "execute_command", "send_pty_input"]);
+const COMMAND_EVIDENCE_TOOLS = new Set(["run_command", "execute_command"]);
 const PTY_OBSERVATION_EVIDENCE_TOOLS = new Set([
   "read_pty_buffer",
   "read_pty_tail",
@@ -792,6 +792,10 @@ export function createPlanExecutionEvidenceEntry(input: {
 }): PlanExecutionEvidenceEntry | null {
   const target = String(input.target || "").trim();
   if (!target || input.noOp || isPlanArtifactPath(target)) return null;
+  // Foreground input is a process-lifecycle action, not durable proof of a
+  // command, mutation, or validation. Readiness comes from a later PTY
+  // observation and workspace completion from a verified diff.
+  if (input.toolName === "send_pty_input") return null;
   const timestamp = Date.now();
   const base = {
     id: `evidence-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
@@ -882,7 +886,6 @@ export function appendPlanEvidenceEntry(
   if (
     entry.sourceTool === "run_command" ||
     entry.sourceTool === "execute_command" ||
-    entry.sourceTool === "send_pty_input" ||
     PTY_OBSERVATION_EVIDENCE_TOOLS.has(entry.sourceTool)
   ) {
     return [...ledger, entry].slice(-200);

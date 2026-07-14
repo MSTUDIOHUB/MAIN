@@ -21,6 +21,7 @@ import {
 } from "../../orchestrator";
 import { isApprovedPlanCachedReadOnlyNoProgressBatch } from "../../approvedPlanRecoveryTools";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
+import { isPtyControlInput } from "../../ptyCommandRuntime";
 import {
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
@@ -1511,6 +1512,30 @@ export function handleStrictRepeatGuardRecovery(input: {
     if (!repeatCheck.repeated) continue;
 
     const target = getToolTarget(toolCall.name, toolArgs);
+    const repeatedPtyControl = toolCall.name === "send_pty_input" && isPtyControlInput(
+      typeof toolArgs.input === "string" ? toolArgs.input : "",
+      typeof toolArgs.control === "string" ? toolArgs.control : undefined,
+    );
+    if (repeatedPtyControl) {
+      const recoveryMessage = callbacks.getPreferredLanguage() === "zh"
+        ? "PTY_CONTROL_ALREADY_SENT: 同一终端控制动作已经投递；不要再次发送。下一步必须使用 get_pty_status/read_pty_since 观察当前代状态，或直接继续下一个任务。"
+        : "PTY_CONTROL_ALREADY_SENT: the same terminal control was already delivered; do not send it again. Next, observe the current generation with get_pty_status/read_pty_since or continue the next task.";
+      recentToolCalls.length = 0;
+      repeatGuardRecoveredSignatures.add(repeatCheck.signature);
+      callbacks.onToolDone(toolCall.name, target, recoveryMessage, {
+        toolCallId: toolCall.id,
+        internalFeedback: true,
+        qualityGateReason: "pty_control_observation_required",
+      });
+      callbacks.appendMessage({ role: "system", content: `[System: ${recoveryMessage}]` });
+      logAgentEvent("pty_control_repeat_redirected", {
+        iteration,
+        tool: toolCall.name,
+        target,
+        threshold: repeatCheck.threshold,
+      });
+      return { status: "continue" };
+    }
     if (repeatGuardReadOnly && (readOnlyShellInspection || !repeatGuardRecoveredSignatures.has(repeatCheck.signature))) {
       const recoveryMessage = formatRepeatLoopRecoveryMessage(
         toolCall.name,

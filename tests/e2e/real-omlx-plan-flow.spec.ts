@@ -319,6 +319,9 @@ test.beforeEach(async ({ page }) => {
     let ptyBuffer = "";
     let ptyForegroundPid: number | null = null;
     let ptyShellAvailable = true;
+    let ptyForegroundState: "busy" | "idle" | "unknown" | "stopped" = "idle";
+    let ptyForegroundGeneration = 0;
+    const deliveredControlIds = new Set<string>();
     const appendPtyOutput = (value: string) => {
       ptyBuffer += value;
       emitTauriEvent("pty-data", { chunk: value });
@@ -343,6 +346,8 @@ test.beforeEach(async ({ page }) => {
       pid: ptyActive ? 4100 : null,
       foregroundPid: ptyForegroundPid,
       shellAvailable: ptyShellAvailable,
+      foregroundState: ptyForegroundState,
+      foregroundGeneration: ptyForegroundGeneration,
       exitCode: null,
       bufferStartOffset: 0,
       bufferEndOffset: ptyBuffer.length,
@@ -380,6 +385,9 @@ test.beforeEach(async ({ page }) => {
         ptyActive = true;
         ptyForegroundPid = null;
         ptyShellAvailable = true;
+        ptyForegroundState = "idle";
+        ptyForegroundGeneration = 0;
+        deliveredControlIds.clear();
         return null;
       }
       if (cmd === "resize_pty") return null;
@@ -387,19 +395,51 @@ test.beforeEach(async ({ page }) => {
       if (cmd === "write_pty") {
         if (!ptyActive) throw new Error("PTY not started");
         const input = String(args?.input || "");
+        const controlId = String(args?.controlId || "");
+        if (controlId && deliveredControlIds.has(controlId)) {
+          return {
+            accepted: false,
+            duplicate: true,
+            deliveryState: "duplicate",
+            foregroundPid: ptyForegroundPid,
+            foregroundState: ptyForegroundState,
+            foregroundGeneration: ptyForegroundGeneration,
+          };
+        }
+        if (controlId) deliveredControlIds.add(controlId);
         if (input.includes("\u0003")) {
           appendPtyOutput("^C\n");
           ptyForegroundPid = null;
           ptyShellAvailable = true;
-          return null;
+          ptyForegroundState = "idle";
+          return {
+            accepted: true,
+            duplicate: false,
+            deliveryState: "delivered",
+            foregroundPid: ptyForegroundPid,
+            foregroundState: ptyForegroundState,
+            foregroundGeneration: ptyForegroundGeneration,
+          };
+        }
+        if (args?.allowForegroundInput !== true && args?.userTerminal !== true) {
+          ptyForegroundGeneration += 1;
+          deliveredControlIds.clear();
         }
         appendPtyOutput(input);
         if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|preview|start|serve)\b|\bvite\b/i.test(input)) {
           appendPtyOutput("\nVITE v6.0.0 ready in 120 ms\n\n  Local: http://localhost:5173/\n");
           ptyForegroundPid = 4102;
           ptyShellAvailable = false;
+          ptyForegroundState = "busy";
         }
-        return null;
+        return {
+          accepted: true,
+          duplicate: false,
+          deliveryState: "delivered",
+          foregroundPid: ptyForegroundPid,
+          foregroundState: ptyForegroundState,
+          foregroundGeneration: ptyForegroundGeneration,
+        };
       }
       if (cmd === "read_pty_buffer") {
         const maxChars = Math.max(100, Math.min(Number(args?.maxChars) || ptyBuffer.length || 8_000, 200_000));

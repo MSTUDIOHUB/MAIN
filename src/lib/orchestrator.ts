@@ -44,6 +44,7 @@ import {
   WORKSPACE_MUTATION_TOOL_NAMES,
   resolveWorkspaceMutationTargets,
 } from "./workspaceMutationTools";
+import { formatPtyInputTarget } from "./ptyCommandRuntime";
 import { parseApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
 import {
   commitResolvedPlanArtifactUpdate,
@@ -1674,7 +1675,10 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     case "git_status": return "git status";
     case "git_diff": return (args.path as string) || (args.filter as string) || "workspace diff";
     case "execute_command": return (args.command as string) || "";
-    case "send_pty_input":  return (args.input as string) || "terminal input";
+    case "send_pty_input":  return formatPtyInputTarget(
+      typeof args.input === "string" ? args.input : "",
+      typeof args.control === "string" ? args.control : undefined,
+    );
     case "run_command":     return (args.command as string) || "";
     case "browser_evaluate": return (args.url as string) || "";
     case "read_pty_buffer": return "terminal";
@@ -2421,12 +2425,14 @@ export function collectPlanClosureMaterializationInput(
     .filter((item) => item.status === "succeeded")
     .map((item) => {
       const summary = item.detail || "";
-      const hashInput = [item.name, item.target, summary].filter(Boolean).join("\n");
+      const facts = item.facts || [];
+      const hashInput = [item.name, item.target, summary, ...facts].filter(Boolean).join("\n");
       return {
         tool: item.name,
         target: item.target,
         status: "succeeded",
         ...(summary ? { summary } : {}),
+        ...(facts.length > 0 ? { facts } : {}),
         hash: stableProgressHash(hashInput),
       };
     });

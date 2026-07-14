@@ -271,15 +271,18 @@ function createApprovedPlanNoToolHarness(language = "en") {
 function createStrictRepeatGuardHarness(language = "en") {
   const harness = createApprovedPlanNoToolHarness(language);
   const toolErrors = [];
+  const toolDone = [];
   const errors = [];
   return {
     ...harness,
     toolErrors,
+    toolDone,
     errors,
     callbacks: {
       ...harness.callbacks,
       getApprovedLocalFileReadPaths: () => [],
       onToolError: (tool, target, message, metadata) => toolErrors.push({ tool, target, message, metadata }),
+      onToolDone: (tool, target, message, metadata) => toolDone.push({ tool, target, message, metadata }),
       onError: (message) => errors.push(message),
     },
   };
@@ -1247,6 +1250,31 @@ test("strict repeat guard pauses repeated approved-plan browser validation after
   assert.match(harness.stops[0].message, /浏览器验证重复调用/);
   assert.equal(harness.stops[0].metadata.recoveryReason, "approved_plan_repeated_browser_validation");
   assert.deepEqual(harness.statuses.slice(-1), ["idle"]);
+});
+
+test("strict repeat guard redirects repeated PTY controls to observation without failing the task", () => {
+  const harness = createStrictRepeatGuardHarness("zh");
+  const recentToolCalls = [];
+  let result = null;
+
+  for (let i = 0; i < 3; i += 1) {
+    result = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+      effectiveToolCalls: [{
+        id: `call_interrupt_${i}`,
+        name: "send_pty_input",
+        arguments: JSON.stringify({ control: "interrupt" }),
+      }],
+      recentToolCalls,
+      availableToolNames: new Set(["send_pty_input", "get_pty_status", "read_pty_since"]),
+    }));
+  }
+
+  assert.equal(result.status, "continue");
+  assert.equal(harness.toolErrors.length, 0);
+  assert.equal(harness.stops.length, 0);
+  assert.equal(harness.toolDone.length, 1);
+  assert.match(harness.toolDone[0].message, /PTY_CONTROL_ALREADY_SENT/);
+  assert.match(harness.appended.at(-1)?.content || "", /get_pty_status\/read_pty_since/);
 });
 
 test("max-iteration checkpoint keeps internal plan files out of project-source evidence", () => {

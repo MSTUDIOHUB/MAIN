@@ -6,6 +6,7 @@ import { describeExecuteRecoveryToolSurface } from "../../executeRecoveryTools";
 import {
   computeContextForceReason,
   computeManagedContextLimit,
+  isContentInActiveMessages,
   logAgentEvent,
   shouldUseXmlToolProtocol,
 } from "../../orchestrator";
@@ -29,6 +30,24 @@ export interface IterationContextManagementResult {
   providerCompatibilityOverride: boolean | undefined;
   forceXmlTools: boolean;
   llmTools: ToolDefinition[];
+}
+
+export function advanceFileReadContextEvictionEpochs(input: {
+  fileReadStates: Map<string, FileReadState>;
+  beforeMessages: AgentMessage[];
+  afterMessages: AgentMessage[];
+}): number {
+  let evictions = 0;
+  for (const state of input.fileReadStates.values()) {
+    if (
+      isContentInActiveMessages(state.modelContent, input.beforeMessages) &&
+      !isContentInActiveMessages(state.modelContent, input.afterMessages)
+    ) {
+      state.contextEvictionEpoch = (state.contextEvictionEpoch || 0) + 1;
+      evictions += 1;
+    }
+  }
+  return evictions;
 }
 
 export function buildContextPackTelemetry(input: {
@@ -438,6 +457,18 @@ export function prepareManagedMessagesForIteration(input: {
       toolCharsBefore,
       toolCharsAfterPrune,
       toolCharsAfter: countToolResultChars(managedAgentMessages),
+    });
+  }
+
+  const fileReadContextEvictions = advanceFileReadContextEvictionEpochs({
+    fileReadStates,
+    beforeMessages: sourceAgentMessages,
+    afterMessages: managedAgentMessages,
+  });
+  if (fileReadContextEvictions > 0) {
+    logAgentEvent("file_read_context_eviction_epoch_advanced", {
+      iteration,
+      evictedWindows: fileReadContextEvictions,
     });
   }
 

@@ -62,6 +62,56 @@ test("PTY observation analysis distinguishes waiting, readiness, and later failu
     tail: "VITE ready in 812 ms\nLocal: http://localhost:1420/\nError: process exited with code 1",
   }));
   assert.equal(failed.status, "failed");
+
+  const restartedAfterOldFailure = devServerRuntime.analyzePtyObservationResult(JSON.stringify({
+    active: true,
+    running: true,
+    foregroundState: "busy",
+    tail: "Error: old launch failed\nStarting development server",
+  }));
+  assert.equal(restartedAfterOldFailure.status, "running");
+});
+
+test("PTY observation uses foreground ownership instead of the persistent login shell", () => {
+  const readyReadPayload = devServerRuntime.analyzePtyObservationResult(JSON.stringify({
+    text: "VITE ready in 120 ms\nLocal: http://localhost:1420/",
+    startOffset: 100,
+    endOffset: 158,
+    truncated: false,
+  }));
+  assert.equal(readyReadPayload.status, "ready");
+  assert.equal(readyReadPayload.url, "http://localhost:1420/");
+
+  const occupied = devServerRuntime.analyzePtyObservationResult(JSON.stringify({
+    active: true,
+    running: true,
+    pid: 100,
+    foregroundPid: 200,
+    shellAvailable: false,
+    tail: "",
+  }));
+  assert.equal(occupied.status, "running");
+
+  const released = devServerRuntime.analyzePtyObservationResult(JSON.stringify({
+    active: true,
+    running: true,
+    pid: 100,
+    foregroundPid: 100,
+    shellAvailable: true,
+    tail: "VITE ready in 500 ms\nLocal: http://localhost:1420/",
+  }));
+  assert.equal(released.status, "stopped");
+
+  const unsupportedForegroundInspection = devServerRuntime.analyzePtyObservationResult(JSON.stringify({
+    active: true,
+    running: true,
+    pid: 100,
+    foregroundPid: null,
+    shellAvailable: true,
+    foregroundState: "unknown",
+    tail: "",
+  }));
+  assert.equal(unsupportedForegroundInspection.status, "running");
 });
 
 test("latest pending launch invalidates an older observed dev-server URL", () => {
@@ -90,6 +140,23 @@ test("latest pending launch invalidates an older observed dev-server URL", () =>
     status: "pending",
     url: null,
   });
+
+  const unknownTail = {
+    id: "unknown-tail",
+    kind: "tool",
+    value: "terminal",
+    sourceTool: "read_pty_tail",
+    observationStatus: "unknown",
+    createdAt: 3,
+  };
+  assert.deepEqual(devServerRuntime.resolveDevServerRuntimeObservation([...restartedLedger, unknownTail]), {
+    status: "pending",
+    url: null,
+  });
+  assert.equal(devServerRuntime.resolveBrowserValidationPreflight({
+    requestedUrl: "http://localhost:5173/",
+    ledger: [...restartedLedger, unknownTail],
+  }).action, "block");
 });
 
 test("browser validation adopts the runtime-observed local origin", () => {
@@ -210,6 +277,236 @@ test("PTY command admission rejects shell commands while a foreground process ow
     shellAvailable: true,
   });
   assert.deepEqual(idle, { allowed: true });
+
+  const freshUnknown = {
+    active: true,
+    running: true,
+    pid: 100,
+    foregroundPid: null,
+    shellAvailable: true,
+    foregroundState: "unknown",
+    foregroundGeneration: 0,
+  };
+  assert.deepEqual(ptyCommandRuntime.resolvePtyCommandAdmission(freshUnknown), { allowed: true });
+  assert.equal(ptyCommandRuntime.hasActivePtyForeground(freshUnknown), false);
+
+  const managedUnknown = { ...freshUnknown, foregroundGeneration: 1 };
+  assert.equal(ptyCommandRuntime.resolvePtyCommandAdmission(managedUnknown).allowed, false);
+  assert.match(ptyCommandRuntime.resolvePtyCommandAdmission(managedUnknown).reason || "", /PTY_FOREGROUND_UNKNOWN/);
+  assert.equal(ptyCommandRuntime.hasActivePtyForeground(managedUnknown), true);
+});
+
+test("PTY input normalization is exact and does not generically unescape text", () => {
+  const structured = ptyCommandRuntime.normalizePtyInput("", "interrupt");
+  assert.equal(structured.value.length, 1);
+  assert.equal(structured.value.charCodeAt(0), 3);
+  assert.equal(structured.controlAction, "interrupt");
+
+  const ordinary = ptyCommandRuntime.normalizePtyInput("\\n");
+  assert.equal(ordinary.value, "\\n");
+  assert.equal(ordinary.controlAction, null);
+});
+
+test("PTY control arguments reject conflicting text and appended newlines", async () => {
+  await assert.rejects(
+    toolExecutor.executeTool(
+      "send_pty_input",
+      { control: "interrupt", input: "y", wait_ms: 0 },
+      workspaceRoot,
+      "pty-control-conflict-test",
+    ),
+    /PTY_CONTROL_INPUT_CONFLICT/,
+  );
+  await assert.rejects(
+    toolExecutor.executeTool(
+      "send_pty_input",
+      { control: "interrupt", append_newline: true, wait_ms: 0 },
+      workspaceRoot,
+      "pty-control-newline-test",
+    ),
+    /PTY_CONTROL_NEWLINE_FORBIDDEN/,
+  );
+});
+
+test("PTY interrupt aliases write one ETX byte and cannot be resent to the same foreground", async () => {
+  const before = {
+    active: true,
+    running: true,
+    pid: 100,
+    foregroundPid: 200,
+    shellAvailable: false,
+    foregroundState: "busy",
+    foregroundGeneration: 4,
+    bufferStartOffset: 0,
+    bufferEndOffset: 12,
+    bufferBytes: 12,
+    tail: "vite",
+  };
+  const after = {
+    ...before,
+    foregroundPid: 100,
+    shellAvailable: true,
+    foregroundState: "idle",
+    bufferEndOffset: 14,
+    bufferBytes: 14,
+    tail: "vite\n^C",
+  };
+  const statuses = [before, after, before];
+  const writes = [];
+  const originalGetPtyStatus = ipc.getPtyStatus;
+  const originalWritePty = ipc.writePty;
+  const originalReadPtySince = ipc.readPtySince;
+  ipc.getPtyStatus = async () => statuses.shift() || before;
+  ipc.writePty = async (input) => {
+    if (writes.length > 0) {
+      return {
+        accepted: false,
+        duplicate: true,
+        deliveryState: "duplicate",
+        foregroundGeneration: 4,
+      };
+    }
+    writes.push(input);
+    return {
+      accepted: true,
+      duplicate: false,
+      deliveryState: "delivered",
+      foregroundGeneration: 4,
+    };
+  };
+  ipc.readPtySince = async () => ({
+    text: "^C",
+    startOffset: 12,
+    endOffset: 14,
+    truncated: false,
+    bufferStartOffset: 0,
+    bufferEndOffset: 14,
+  });
+  try {
+    const raw = await toolExecutor.executeTool(
+      "send_pty_input",
+      { input: "\\u0003", wait_ms: 0 },
+      workspaceRoot,
+      "pty-control-alias-test",
+    );
+    const result = JSON.parse(raw);
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].length, 1);
+    assert.equal(writes[0].charCodeAt(0), 3);
+    assert.equal(result.input, "CTRL_C");
+    assert.equal(result.controlAction, "interrupt");
+    assert.equal(result.controlEffect, "foreground_released");
+    assert.equal(result.deliveryState, "delivered");
+    assert.equal(result.shellAvailableAfter, true);
+
+    const duplicateRaw = await toolExecutor.executeTool(
+      "send_pty_input",
+      { control: "interrupt", wait_ms: 0 },
+      workspaceRoot,
+      "pty-control-alias-test",
+    );
+    const duplicate = JSON.parse(duplicateRaw);
+    assert.equal(duplicate.accepted, true);
+    assert.equal(duplicate.duplicate, true);
+    assert.equal(duplicate.deliveryState, "duplicate");
+    assert.match(duplicate.nextAction, /get_pty_status/);
+    assert.equal(writes.length, 1);
+  } finally {
+    ipc.getPtyStatus = originalGetPtyStatus;
+    ipc.writePty = originalWritePty;
+    ipc.readPtySince = originalReadPtySince;
+  }
+});
+
+test("PTY control delivery remains accepted when post-write observation fails", async () => {
+  const status = {
+    active: true,
+    running: true,
+    pid: 110,
+    foregroundPid: 210,
+    shellAvailable: false,
+    foregroundState: "busy",
+    foregroundGeneration: 9,
+    bufferStartOffset: 0,
+    bufferEndOffset: 20,
+    bufferBytes: 20,
+    tail: "vite",
+  };
+  const originalGetPtyStatus = ipc.getPtyStatus;
+  const originalWritePty = ipc.writePty;
+  const originalReadPtySince = ipc.readPtySince;
+  let statusCalls = 0;
+  ipc.getPtyStatus = async () => {
+    statusCalls += 1;
+    if (statusCalls > 1) throw new Error("status channel unavailable");
+    return status;
+  };
+  ipc.writePty = async () => ({
+    accepted: true,
+    duplicate: false,
+    deliveryState: "delivered",
+    foregroundGeneration: 9,
+  });
+  ipc.readPtySince = async () => { throw new Error("tail channel unavailable"); };
+  try {
+    const raw = await toolExecutor.executeTool(
+      "send_pty_input",
+      { control: "interrupt", wait_ms: 0 },
+      workspaceRoot,
+      "pty-control-observation-test",
+    );
+    const result = JSON.parse(raw);
+    assert.equal(result.accepted, true);
+    assert.equal(result.deliveryState, "delivered");
+    assert.equal(result.controlEffect, "status_unknown");
+    assert.match(result.observationError, /tail channel unavailable/);
+    assert.match(result.observationError, /status channel unavailable/);
+  } finally {
+    ipc.getPtyStatus = originalGetPtyStatus;
+    ipc.writePty = originalWritePty;
+    ipc.readPtySince = originalReadPtySince;
+  }
+});
+
+test("PTY input rejects an explicitly idle foreground", async () => {
+  const originalGetPtyStatus = ipc.getPtyStatus;
+  ipc.getPtyStatus = async () => ({
+    active: true,
+    running: true,
+    pid: 120,
+    foregroundPid: 120,
+    shellAvailable: true,
+    foregroundState: "idle",
+    foregroundGeneration: 2,
+    bufferStartOffset: 0,
+    bufferEndOffset: 0,
+    bufferBytes: 0,
+    tail: "",
+  });
+  try {
+    await assert.rejects(
+      toolExecutor.executeTool(
+        "send_pty_input",
+        { input: "y", wait_ms: 0 },
+        workspaceRoot,
+        "pty-idle-input-test",
+      ),
+      /PTY_INPUT_NO_ACTIVE_FOREGROUND/,
+    );
+    const controlRaw = await toolExecutor.executeTool(
+      "send_pty_input",
+      { control: "interrupt", wait_ms: 0 },
+      workspaceRoot,
+      "pty-idle-input-test",
+    );
+    const controlResult = JSON.parse(controlRaw);
+    assert.equal(controlResult.accepted, true);
+    assert.equal(controlResult.duplicate, true);
+    assert.equal(controlResult.deliveryState, "not_needed");
+    assert.equal(controlResult.controlEffect, "foreground_released");
+  } finally {
+    ipc.getPtyStatus = originalGetPtyStatus;
+  }
 });
 
 test("PTY command output does not treat terminal echo as successful shell execution", () => {
@@ -249,4 +546,12 @@ test("process evidence entries retain ordering instead of deduplicating retries"
   );
   assert.equal(ledger.length, 2);
   assert.equal(ledger.every((entry) => entry.observationStatus === "pending"), true);
+});
+
+test("PTY lifecycle input is not promoted to Plan execution evidence", () => {
+  assert.equal(planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "send_pty_input",
+    target: "CTRL_C",
+    result: JSON.stringify({ accepted: true, controlAction: "interrupt" }),
+  }), null);
 });

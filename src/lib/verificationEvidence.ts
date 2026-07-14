@@ -12,7 +12,6 @@ export const VERIFICATION_TOOL_NAMES = new Set([
   "run_command",
   "browser_evaluate",
   "execute_command",
-  "send_pty_input",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -58,7 +57,7 @@ export function isSuccessfulVerificationToolObservation(
   if (observation.name === "browser_evaluate") {
     return browserResultLooksSuccessful(content);
   }
-  if (observation.name === "execute_command" || observation.name === "send_pty_input") {
+  if (observation.name === "execute_command") {
     return false;
   }
   if (PTY_OBSERVATION_TOOL_NAMES.has(observation.name)) {

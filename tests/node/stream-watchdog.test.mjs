@@ -79,11 +79,58 @@ const {
   PREAPPROVAL_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
   buildApprovedPlanStreamWatchdogRecoveryPrompt,
   buildPreapprovalPlanStreamWatchdogRecoveryPrompt,
+  observeFileReadContextForMessagesSent,
+  replaceMessagesForRetry,
   resolvePreapprovalPlanStreamWatchdogReadFallback,
   resolvePreapprovalPlanStreamWatchdogRecoveryTools,
   shouldAttemptApprovedPlanStreamWatchdogRecovery,
   shouldAttemptPreapprovalPlanStreamWatchdogRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"));
+
+test("exact messages sent to the model advance file-read eviction independently of token reduction", () => {
+  const exactRead = `READ_FILE_RESULT\n${"x".repeat(1_200)}\nTAIL_MARKER`;
+  const state = {
+    signature: "read_file::src/App.tsx::[]",
+    path: "src/App.tsx",
+    argsKey: "[]",
+    contentHash: "same-version",
+    contentLength: exactRead.length,
+    sizeBytes: 1_200,
+    modifiedMs: 1,
+    modelContent: exactRead,
+    contextEvictionEpoch: 2,
+    updatedAt: 1,
+  };
+  const fileReadStates = new Map([[state.signature, state]]);
+  const beforeMessages = [{ role: "tool", content: exactRead }];
+  const messagesSentToLLM = [{ role: "user", content: exactRead.slice(0, 800) }];
+
+  assert.equal(observeFileReadContextForMessagesSent({
+    fileReadStates,
+    beforeMessages,
+    messagesSentToLLM,
+    iteration: 3,
+    reason: "xml_protocol_test",
+  }), 1);
+  assert.equal(state.contextEvictionEpoch, 3);
+
+  let activeMessages = beforeMessages;
+  replaceMessagesForRetry({
+    callbacks: {
+      getMessages: () => activeMessages,
+      replaceMessages: (messages) => {
+        activeMessages = messages;
+      },
+    },
+    iteration: 4,
+    messages: messagesSentToLLM,
+    fileReadStates,
+    reason: "emergency_zero_reduction_test",
+    changed: false,
+  });
+  assert.deepEqual(activeMessages, messagesSentToLLM);
+  assert.equal(state.contextEvictionEpoch, 4);
+});
 
 test("classifies no-visible-token stream timeout as a plan watchdog timeout", () => {
   const error = createStreamNoVisibleTokenTimeoutError(125_000, "plan:preapproval_xml_tools");
@@ -277,6 +324,18 @@ test("local execute recovery binds the request to the current transaction tool",
     forceXmlTools: false,
     preferExplicitFunction: true,
   }), { type: "function", function: { name: "read_file" } });
+});
+
+test("broad validation recovery requires a tool without forcing finite command execution", () => {
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: "validation_only",
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["run_command", "execute_command", "browser_evaluate"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+  }), "required");
 });
 
 test("approved plan recovery binds native tool choice to the remaining evidence kind", () => {

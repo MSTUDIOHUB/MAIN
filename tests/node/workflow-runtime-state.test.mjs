@@ -542,6 +542,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(streamInvocationSource, /export async function invokeInitialStreamForIteration/);
   assert.match(streamInvocationSource, /llm_request_shape/);
   assert.match(streamInvocationSource, /fetchLLMStream/);
+  assert.match(streamInvocationSource, /messagesSentToLLM: messagesForLLM/);
   assert.match(streamInvocationSource, /buildMaxStepsFinalTextPrompt/);
   assert.match(streamInvocationSource, /buildChatFinalSynthesisPrompt/);
   assert.match(streamInvocationSource, /PolicyFactory\.createPolicy/);
@@ -555,6 +556,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(streamRecoverySource, /ensureProviderCompatibilityMode/);
   assert.match(streamRecoverySource, /computeManagedContextLimit/);
   assert.match(streamRecoverySource, /prepareMessagesForToolProtocol/);
+  assert.match(streamRecoverySource, /messagesSentToLLM: emergencyManagedForLLM/);
+  assert.match(source, /managedAgentMessages: messagesSentToLLM/);
   assert.match(toolCallPlanningSource, /export interface IterationToolSurfaceDecision/);
   assert.match(toolCallPlanningSource, /export function resolveIterationToolSurface/);
   assert.match(toolCallPlanningSource, /execute_recovery_tool_scope_applied/);

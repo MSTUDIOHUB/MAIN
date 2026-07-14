@@ -55,6 +55,10 @@ import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStat
 import { sanitizePtyOutput } from "./ptyOutputSanitizer";
 import {
   buildUnconfirmedPtyCommandError,
+  buildPtyControlId,
+  describePtyControlEffect,
+  hasActivePtyForeground,
+  normalizePtyInput,
   resolvePtyCommandAdmission,
 } from "./ptyCommandRuntime";
 import { runGitDiffTool, runGitStatusTool } from "./gitTools";
@@ -547,6 +551,8 @@ export async function executeTool(
         truncated: output.truncated,
         foregroundPid: statusAfter.foregroundPid ?? null,
         shellAvailable: statusAfter.shellAvailable ?? null,
+        foregroundState: statusAfter.foregroundState ?? null,
+        foregroundGeneration: statusAfter.foregroundGeneration ?? null,
         commandAccepted: true,
         note: "If the process is still running or output is incomplete, call read_pty_since with endOffset or read_pty_tail.",
       });
@@ -571,41 +577,136 @@ export async function executeTool(
       return sanitizePtyResult(await getPtyStatus(sessionKey));
 
     case "send_pty_input": {
-      const input = (args.input as string) || "";
-      if (!input) throw new Error("Missing required parameter 'input'.");
+      const rawInput = typeof args.input === "string" ? args.input : "";
+      const requestedControl = typeof args.control === "string" ? args.control : undefined;
+      if (!rawInput && !requestedControl) throw new Error("Missing required parameter 'input' or 'control'.");
+      const normalizedInput = normalizePtyInput(rawInput, requestedControl);
       const appendNewline = args.append_newline === true || args.append_newline === "true";
-      const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 1500, 0), 30_000);
+      if (requestedControl && rawInput) {
+        const rawOnly = normalizePtyInput(rawInput);
+        if (rawOnly.controlAction !== normalizedInput.controlAction) {
+          throw new Error("PTY_CONTROL_INPUT_CONFLICT: control and input describe different PTY actions.");
+        }
+      }
+      if (normalizedInput.controlAction && appendNewline) {
+        throw new Error("PTY_CONTROL_NEWLINE_FORBIDDEN: control actions cannot append a newline.");
+      }
+      const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 500, 0), 30_000);
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
-      let beforeOffset = 0;
-      try {
-        beforeOffset = (await ensurePtySession(sessionKey, workspace)).bufferEndOffset;
-        await writePty(
-          input + (appendNewline ? "\n" : ""),
-          sessionKey,
-          options.shellPermissionApproval,
-          false,
-          true,
-        );
-      } catch (error) {
-        if (!isMissingPtySessionError(error)) throw error;
-        await spawnPty(140, 40, sessionKey, workspace);
-        beforeOffset = (await getPtyStatus(sessionKey)).bufferEndOffset;
-        await writePty(
-          input + (appendNewline ? "\n" : ""),
-          sessionKey,
-          options.shellPermissionApproval,
-          false,
-          true,
+      const statusBefore = await getPtyStatus(sessionKey);
+      if (!hasActivePtyForeground(statusBefore)) {
+        if (normalizedInput.controlAction) {
+          // Interrupt/EOF controls are idempotent lifecycle requests. If the
+          // foreground has already gone away, the requested end state is
+          // satisfied; turning this into a tool failure makes weaker models
+          // resend the same control until the repetition guard stops the run.
+          return JSON.stringify({
+            input: normalizedInput.displayValue,
+            accepted: true,
+            duplicate: true,
+            controlAction: normalizedInput.controlAction,
+            controlEffect: "foreground_released",
+            deliveryState: "not_needed",
+            normalizedAlias: normalizedInput.normalizedAlias,
+            foregroundPidBefore: statusBefore.foregroundPid ?? null,
+            foregroundStateBefore: statusBefore.foregroundState ?? null,
+            foregroundGeneration: statusBefore.foregroundGeneration ?? null,
+            shellAvailableBefore: statusBefore.shellAvailable ?? null,
+            ptyRunningAfter: statusBefore.running ?? null,
+            exitCodeAfter: statusBefore.exitCode ?? null,
+            nextAction: "Observe with get_pty_status/read_pty_since or continue the next task; do not resend this control.",
+          });
+        }
+        throw new Error(
+          "PTY_INPUT_NO_ACTIVE_FOREGROUND: send_pty_input requires an existing foreground process. " +
+          "Do not create a shell or type into an idle prompt; use execute_command for a new command.",
         );
       }
+      const controlId = normalizedInput.controlAction
+        ? buildPtyControlId({
+          sessionKey: sessionKey || workspace,
+          action: normalizedInput.controlAction,
+          status: statusBefore,
+        })
+        : undefined;
+      const beforeOffset = statusBefore.bufferEndOffset;
+      let writeResult: Awaited<ReturnType<typeof writePty>> | undefined;
+      try {
+        writeResult = await writePty(
+          normalizedInput.value + (appendNewline ? "\n" : ""),
+          sessionKey,
+          options.shellPermissionApproval,
+          false,
+          true,
+          typeof statusBefore.foregroundPid === "number" ? statusBefore.foregroundPid : undefined,
+          typeof statusBefore.foregroundGeneration === "number" ? statusBefore.foregroundGeneration : undefined,
+          controlId,
+        );
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error || "");
+        if (!normalizedInput.controlAction || /PTY_(?:INPUT_NO_ACTIVE_FOREGROUND|FOREGROUND_CHANGED|CONTROL_INPUT_CONFLICT|CONTROL_NEWLINE_FORBIDDEN)/.test(message)) {
+          throw error;
+        }
+        // Once a control write crosses the IPC boundary, a transport rejection
+        // cannot prove that the byte was not delivered. Report an accepted
+        // attempt with unknown delivery so the model does not replay Ctrl+C.
+        return JSON.stringify({
+          input: normalizedInput.displayValue,
+          accepted: true,
+          controlAction: normalizedInput.controlAction,
+          controlEffect: "status_unknown",
+          deliveryState: "unknown",
+          controlId,
+          observationError: message || "PTY control delivery could not be observed.",
+          foregroundPidBefore: statusBefore.foregroundPid ?? null,
+          foregroundGeneration: statusBefore.foregroundGeneration ?? null,
+        });
+      }
       await sleep(waitMs);
-      const output = await readPtySince(beforeOffset, maxChars, sessionKey);
+      let output: Awaited<ReturnType<typeof readPtySince>> | null = null;
+      let statusAfter: Awaited<ReturnType<typeof getPtyStatus>> | null = null;
+      const observationErrors: string[] = [];
+      try {
+        output = await readPtySince(beforeOffset, maxChars, sessionKey);
+      } catch (error) {
+        observationErrors.push(error instanceof Error ? error.message : String(error || ""));
+      }
+      try {
+        statusAfter = await getPtyStatus(sessionKey);
+      } catch (error) {
+        observationErrors.push(error instanceof Error ? error.message : String(error || ""));
+      }
+      const controlEffect = normalizedInput.controlAction
+        ? statusAfter
+          ? describePtyControlEffect({ before: statusBefore, after: statusAfter })
+          : "status_unknown"
+        : undefined;
       return JSON.stringify({
-        input,
-        output: output.text,
-        startOffset: output.startOffset,
-        endOffset: output.endOffset,
-        truncated: output.truncated,
+        input: normalizedInput.displayValue,
+        accepted: true,
+        ...(writeResult?.duplicate ? { duplicate: true } : {}),
+        ...(normalizedInput.controlAction ? { controlAction: normalizedInput.controlAction, controlEffect } : {}),
+        deliveryState: writeResult?.deliveryState || "delivered",
+        ...(controlId ? { controlId } : {}),
+        ...(writeResult?.error ? { deliveryError: writeResult.error } : {}),
+        ...(observationErrors.length > 0 ? { observationError: observationErrors.join("; ") } : {}),
+        normalizedAlias: normalizedInput.normalizedAlias,
+        output: output?.text || "",
+        startOffset: output?.startOffset ?? beforeOffset,
+        endOffset: output?.endOffset ?? beforeOffset,
+        truncated: output?.truncated ?? false,
+        foregroundPidBefore: statusBefore.foregroundPid ?? null,
+        foregroundPidAfter: statusAfter?.foregroundPid ?? null,
+        foregroundStateBefore: statusBefore.foregroundState ?? null,
+        foregroundStateAfter: statusAfter?.foregroundState ?? null,
+        foregroundGeneration: statusBefore.foregroundGeneration ?? null,
+        shellAvailableBefore: statusBefore.shellAvailable ?? null,
+        shellAvailableAfter: statusAfter?.shellAvailable ?? null,
+        ptyRunningAfter: statusAfter?.running ?? null,
+        exitCodeAfter: statusAfter?.exitCode ?? null,
+        ...(writeResult?.duplicate
+          ? { nextAction: "Observe with get_pty_status/read_pty_since or continue the next task; do not resend this control." }
+          : {}),
       });
     }
 

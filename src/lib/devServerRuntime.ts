@@ -1,4 +1,5 @@
 import type { PlanExecutionEvidenceEntry } from "./workflowModels";
+import { resolvePtyForegroundState } from "./ptyCommandRuntime";
 
 export type PtyObservationStatus = "unknown" | "running" | "ready" | "failed" | "stopped";
 
@@ -62,18 +63,51 @@ export function analyzePtyObservationResult(value: string): PtyObservationAnalys
   const waitingIndex = lastMarkerIndex(text, WAITING_MARKER_RE);
   const failureIndex = lastMarkerIndex(text, FAILURE_MARKER_RE);
   const running = parsed?.running === true;
-  const active = parsed?.active === true;
+  const active = parsed?.active === true || running;
   const exitCode = typeof parsed?.exitCode === "number" ? parsed.exitCode : null;
+  // read_pty_since/read_pty_tail return structured output objects, but they do
+  // not own process lifecycle state. Treating their missing active/running
+  // fields as false turns a valid "VITE ready" observation into "stopped".
+  const hasLifecycleState = Boolean(parsed) && (
+    typeof parsed?.active === "boolean" ||
+    typeof parsed?.running === "boolean" ||
+    typeof parsed?.foregroundState === "string" ||
+    typeof parsed?.pid === "number" ||
+    typeof parsed?.foregroundPid === "number" ||
+    typeof parsed?.shellAvailable === "boolean" ||
+    typeof parsed?.exitCode === "number"
+  );
+  const foregroundState = parsed && hasLifecycleState
+    ? resolvePtyForegroundState({
+      active,
+      running,
+      pid: typeof parsed.pid === "number" ? parsed.pid : null,
+      foregroundPid: typeof parsed.foregroundPid === "number" ? parsed.foregroundPid : null,
+      shellAvailable: typeof parsed.shellAvailable === "boolean" ? parsed.shellAvailable : undefined,
+      foregroundState: typeof parsed.foregroundState === "string"
+        ? parsed.foregroundState as "busy" | "idle" | "unknown" | "stopped"
+        : undefined,
+    })
+    : "unknown";
 
   // Terminal tails can contain old failures followed by a later successful
   // restart. The newest semantic marker owns the observation state.
+  if (failureIndex >= 0 && failureIndex >= readyIndex && failureIndex >= waitingIndex) {
+    return { status: "failed", url: urls[urls.length - 1], text };
+  }
+  // The PTY login shell can remain alive after the managed foreground process
+  // exits. Only explicit idle/stopped ownership proves that the server ended;
+  // unsupported foreground inspection remains unknown on Windows.
+  if (foregroundState === "idle" || foregroundState === "stopped") {
+    return { status: "stopped", url: urls[urls.length - 1], text };
+  }
   if (readyIndex >= 0 && readyIndex > failureIndex && readyIndex >= waitingIndex) {
     return { status: "ready", url: urls[urls.length - 1], text };
   }
-  if (failureIndex >= 0 && failureIndex >= readyIndex) {
-    return { status: "failed", url: urls[urls.length - 1], text };
+  if (waitingIndex >= 0 && waitingIndex > failureIndex && waitingIndex > readyIndex) {
+    return { status: "running", url: urls[urls.length - 1], text };
   }
-  if (running || active) {
+  if (foregroundState === "busy" || foregroundState === "unknown" || running || active) {
     return { status: "running", url: urls[urls.length - 1], text };
   }
   if (exitCode !== null || parsed?.running === false || parsed?.active === false) {
@@ -120,6 +154,12 @@ export function resolveDevServerRuntimeObservation(
       entry.observationStatus &&
       ["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(entry.sourceTool)
     ) {
+      // An observation without a readiness/failure marker is inconclusive. It
+      // must not erase a pending launch or a known running state and thereby
+      // release browser validation against a guessed localhost port.
+      if (entry.observationStatus === "unknown" && status !== "none" && status !== "unknown") {
+        continue;
+      }
       status = entry.observationStatus;
       if (entry.observationStatus === "ready") {
         url = extractLocalDevServerUrls(entry.value)[0] || url;

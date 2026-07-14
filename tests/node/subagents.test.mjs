@@ -37,6 +37,8 @@ const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/sub
 const modelLanes = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/modelLaneCoordinator.ts"));
 const subagentRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagentRuntime.ts"));
 const subagentJoinRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/subagentJoinRuntime.ts"));
+const toolActivityTracking = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolActivityTracking.ts"));
+const planMaterialization = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planMaterialization.ts"));
 const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 
 function makeConfig(profile, overrides = {}) {
@@ -288,7 +290,7 @@ test("controlled child runtime isolates messages and returns its summary through
       contextHints: "Start with src/lib/turnEvents.ts",
       scopeKey: "turn-events",
       scope: "Inspect only the turn event contract",
-      allowedPaths: "src/lib/turnEvents.ts",
+      allowedPaths: "src/lib/turnEvents.ts,vite.config.js,src/main.js",
       expectedOutput: "Evidence summary",
     },
     parentCallbacks: {
@@ -313,6 +315,82 @@ test("controlled child runtime isolates messages and returns its summary through
       childCallbacks.onDebugEvent("child_trace_probe", {});
       childCallbacks.onToolExecuting("read_file", "src/lib/turnEvents.ts");
       childCallbacks.onToolDone("read_file", "src/lib/turnEvents.ts", "event schema");
+      childCallbacks.onToolDone("read_file", "vite.config.js", [
+        "READ_FILE_RESULT",
+        "path: vite.config.js",
+        "---CONTENT START---",
+        "import { defineConfig } from 'vite';",
+        "export default defineConfig({ plugins: [] });",
+        "---CONTENT END---",
+      ].join("\n"));
+      childCallbacks.onToolDone("read_file", "src/main.js", [
+        "READ_FILE_RESULT",
+        "path: src/main.js",
+        "---CONTENT START---",
+        "invoke('load_document');",
+        "invoke('save_document');",
+        "invoke('read_settings');",
+        "invoke('write_settings');",
+        "document.addEventListener('DOMContentLoaded', () => {",
+        "  initToolbar();",
+        "  initEditor();",
+        "  initPreview();",
+        "  initOutline();",
+        "  initStatusBar();",
+        "  initDragDrop();",
+        "  initKeyboardShortcuts();",
+        "  function localDefinition() { nestedDefinitionCall(); }",
+        "  window.addEventListener('file-open', handleFileOpen);",
+        "});",
+        "---CONTENT END---",
+      ].join("\n"));
+      const laterMainWindow = [
+        "READ_FILE_RESULT",
+        "path: src/main.js",
+        "---CONTENT START---",
+        "export function initializeMarkdownToolbarWithKeyboardBindings() {}",
+        "export function initializeMarkdownEditorWithPersistentDocumentState() {}",
+        "export function initializeMarkdownPreviewWithSanitizedRendering() {}",
+        "export function initializeDesktopFileEventsWithPayloadRouting() {}",
+        "export function initializeApplicationErrorBoundaryWithDiagnostics() {}",
+        "export function initializeWindowLifecycleWithCleanupHandlers() {}",
+        "---CONTENT END---",
+      ].join("\n");
+      const finalMainWindow = [
+        "READ_FILE_RESULT",
+        "path: src/main.js",
+        "---CONTENT START---",
+        "function initPreview() {}",
+        "function updatePreview() {}",
+        "function initOutline() {}",
+        "function updateOutline() {}",
+        "function initStatusBar() {}",
+        "---CONTENT END---",
+      ].join("\n");
+      // Mirror the logged MD Viewer reread sequence: first window, later
+      // window, first window replay, final window, then later/final replays.
+      childCallbacks.onToolDone("read_file", "src/main.js", laterMainWindow);
+      childCallbacks.onToolDone("read_file", "src/main.js", [
+        "READ_FILE_RESULT",
+        "path: src/main.js",
+        "---CONTENT START---",
+        "document.addEventListener('DOMContentLoaded', () => {",
+        "  initToolbar();",
+        "  initEditor();",
+        "});",
+        "---CONTENT END---",
+      ].join("\n"));
+      childCallbacks.onToolDone("read_file", "src/main.js", finalMainWindow);
+      childCallbacks.onToolDone("read_file", "src/main.js", laterMainWindow);
+      childCallbacks.onToolDone("read_file", "src/main.js", finalMainWindow);
+      childCallbacks.onToolDone("read_file", "vite.config.js", [
+        "READ_FILE_RESULT",
+        "path: vite.config.js",
+        "---CONTENT START---",
+        ...Array.from({ length: 80 }, (_, index) => `// setup comment ${index}`),
+        "export default defineConfig({ server: { port: 1420, strictPort: true } });",
+        "---CONTENT END---",
+      ].join("\n"));
       childCallbacks.onAssistantFinalText("The event boundary is versioned and durable.");
       return { status: "completed", reason: "agent_loop_completed" };
     },
@@ -327,7 +405,27 @@ test("controlled child runtime isolates messages and returns its summary through
   ]);
   const [record] = subagents.projectSubagentRuns(events);
   assert.equal(record.status, "completed");
-  assert.equal(record.activities.filter((activity) => activity.status === "completed").length, 2);
+  assert.equal(record.activities.filter((activity) => activity.status === "completed").length, 10);
+  assert.match(result.evidence.find((item) => item.target === "vite.config.js")?.detail || "", /port:\s*1420/);
+  const mainEvidence = result.evidence.find((item) => item.target === "src/main.js");
+  assert.ok(mainEvidence?.facts?.some((fact) => /event_dom_listener_contract\(DOMContentLoaded\)/.test(fact)));
+  assert.ok(mainEvidence?.facts?.some((fact) => /listener_calls\([^)]*\binitToolbar\b[^)]*\binitEditor\b/.test(fact)));
+  assert.ok(mainEvidence?.facts?.every((fact) => !/localDefinition|nestedDefinitionCall/.test(fact)));
+
+  const promoted = toolActivityTracking.extractDelegatedSubagentActivities({
+    toolCallId: "call_wait_logged_md_viewer",
+    name: "wait_subagents",
+    target: result.subagentId,
+    content: JSON.stringify({ results: [result], pendingIds: [] }),
+    isError: false,
+  });
+  const promotedMain = promoted.find((item) => item.target === "src/main.js");
+  assert.ok(promotedMain?.facts?.some((fact) => /event_dom_listener_contract\(DOMContentLoaded\)/.test(fact)));
+  assert.ok(promotedMain?.facts?.some((fact) => /listener_calls\([^)]*\binitToolbar\b[^)]*\binitEditor\b/.test(fact)));
+  assert.equal(planMaterialization.findContradictedPlanDiagnosticClaim({
+    content: "- `src/main.js` 中 `initToolbar()` 在 DOM 元素就绪前被调用（主因）。",
+    recentToolActivity: promoted,
+  }), "initToolbar");
   assert.equal(traceEvents[0].data.agentKind, "subagent");
   assert.equal(traceEvents[0].data.parentRunId, "run-parent");
   assert.match(traceEvents[0].data.runId, /^run-subagent-/);

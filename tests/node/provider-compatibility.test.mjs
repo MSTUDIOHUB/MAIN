@@ -191,3 +191,49 @@ test("compatibility retry preserves v1 envelope header for tool messages", () =>
   assert.match(retried[0].content, new RegExp(`\\${TOOL_FEEDBACK_ENVELOPE_PREFIX}\\{\"version\":1,\"status\":\"blocked\"`));
   assert.match(retried[0].content, /PLAN_STAGE_BLOCKED/);
 });
+
+test("XML compatibility preserves exact read_file windows beyond the generic 800 character cap", () => {
+  const exactRead = [
+    "READ_FILE_RESULT",
+    "path: src/App.tsx",
+    "---CONTENT START---",
+    "x".repeat(1_200),
+    "TAIL_MARKER_REQUIRED_FOR_PATCH",
+    "---CONTENT END---",
+  ].join("\n");
+  const enveloped = formatToolFeedbackEnvelope({
+    status: "completed",
+    toolCallId: "call_read_long",
+    tool: "read_file",
+    target: "src/App.tsx",
+    content: exactRead,
+  });
+
+  const [converted] = buildCompatibilityRetryMessages([{
+    role: "tool",
+    content: enveloped,
+    tool_call_id: "call_read_long",
+  }]);
+
+  assert.equal(converted.role, "user");
+  assert.equal(converted.content.includes(exactRead), true);
+  assert.match(converted.content, /TAIL_MARKER_REQUIRED_FOR_PATCH/);
+
+  const legacyConverted = buildCompatibilityRetryMessages([
+    {
+      role: "assistant",
+      content: "Inspecting source.",
+      tool_calls: [{
+        id: "call_legacy_read",
+        type: "function",
+        function: { name: "read_file", arguments: "{\"path\":\"src/App.tsx\"}" },
+      }],
+    },
+    {
+      role: "tool",
+      content: exactRead,
+      tool_call_id: "call_legacy_read",
+    },
+  ]);
+  assert.equal(legacyConverted[1].content.includes(exactRead), true);
+});

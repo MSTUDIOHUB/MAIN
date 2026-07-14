@@ -108,13 +108,12 @@ export function resolveRecoveryToolChoice(input: {
       } else if (input.executeRecoveryMode === "finite_validation_only") {
         selectedTool = firstAvailable(["run_command"]);
       } else if (input.executeRecoveryMode === "validation_only") {
-        selectedTool = firstAvailable([
-          "run_command",
-          "execute_command",
-          "browser_evaluate",
-          "git_diff",
-          "git_status",
-        ]);
+        // This state can require a finite test, a long-lived dev server, a
+        // browser assertion, or a diff check. Binding local models to the
+        // first available function previously forced long-running `npm run
+        // dev` through run_command. Keep the call required but let the model
+        // select from the already-scoped validation surface.
+        selectedTool = null;
       }
     }
     if (!selectedTool && input.approvedPlanActionOnlyRecoveryActive) {
@@ -136,7 +135,12 @@ export function resolveRecoveryToolChoice(input: {
 }
 
 export type InitialStreamInvocationResult =
-  | { status: "streamed"; streamResult: StreamResult }
+  | {
+      status: "streamed";
+      streamResult: StreamResult;
+      /** Exact logical message array passed to fetchLLMStream for this result. */
+      messagesSentToLLM: AgentMessage[];
+    }
   | { status: "stopped"; reason: "reasoning_dominated" };
 
 export async function invokeInitialStreamForIteration(input: {
@@ -458,5 +462,5 @@ export async function invokeInitialStreamForIteration(input: {
     contextLimitUnchanged: snapshotContextLimit ?? null,
   });
 
-  return { status: "streamed", streamResult };
+  return { status: "streamed", streamResult, messagesSentToLLM: messagesForLLM };
 }

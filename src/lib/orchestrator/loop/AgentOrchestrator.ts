@@ -457,6 +457,7 @@ export class AgentOrchestrator {
           getPlanStreamWatchdogOptions,
           approvedPlanRecoveryStreamMaxElapsedMs: APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS,
           preapprovalPlanQualityRecoveryStreamPolicy,
+          fileReadStates: loopState.toolExecutionRuntimeState.fileReadStates,
           pauseApprovedPlanStreamWatchdog,
           emitPlanExecutionProgress,
         });
@@ -470,6 +471,7 @@ export class AgentOrchestrator {
           return;
         }
         const streamResult = streamInvocation.streamResult;
+        const messagesSentToLLM = streamInvocation.messagesSentToLLM;
         if (streamResult.usage) {
           callbacks.onModelUsage?.(streamResult.usage);
         }
@@ -485,7 +487,7 @@ export class AgentOrchestrator {
           forceXmlTools,
           iterationAllTools,
           llmTools,
-          managedMessageCount: managedAgentMessages.length,
+          managedMessageCount: messagesSentToLLM.length,
           assistantMsgId,
           finalTextOnlyStep,
           availableToolNames,
@@ -563,7 +565,7 @@ export class AgentOrchestrator {
           recentToolActivity: loopState.recentToolActivity,
           attemptedPlanWriteTargets: loopState.attemptedPlanWriteTargets,
           latestUserPromptText,
-          managedAgentMessages,
+          managedAgentMessages: messagesSentToLLM,
           snapshotContextLimit,
           repairExecutionRequestInChat,
           allowApprovedPlanRecoveryFileRead,

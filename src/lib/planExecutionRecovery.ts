@@ -88,6 +88,7 @@ export interface PlanToolActivitySummary {
   target: string;
   status: PlanToolActivityStatus;
   detail?: string;
+  facts?: string[];
 }
 
 export interface PlanMaxIterationsCheckpoint {

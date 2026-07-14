@@ -1950,6 +1950,8 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 
 const RUNTIME_TASK_ACTION_RE =
   /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地)|\b(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate)\b/i;
+const RUNTIME_TASK_STANDALONE_ACTION_RE =
+  /^(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|replace|refactor|save)\b)|^(?:`?[^`\s]+\.[A-Za-z0-9]{1,10}`?)\s*[:：—-]\s*(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|replace|refactor|save)\b)/i;
 const RUNTIME_TASK_MUTATION_RE =
   /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
 const RUNTIME_TASK_VERIFICATION_RE =
@@ -1985,7 +1987,7 @@ const RUNTIME_TASK_MUTATION_SECTION_RE = new RegExp(
 );
 const RUNTIME_TASK_STRUCTURAL_EXECUTION_SECTION_RE = RUNTIME_TASK_MUTATION_SECTION_RE;
 const RUNTIME_TASK_FILE_CHANGE_SECTION_RE =
-  /^(?:\d+\s*[.)、:：-]?\s*)?(?:影响文件(?:清单)?|涉及文件(?:清单)?|文件变更|变更文件|Affected Files(?: List)?|Files? to Change|File Changes)(?:\s*(?:[（(][^()（）\r\n]{1,60}[）)]|[:：—-]\s*[^#\r\n]{1,60}))?\s*$/i;
+  /^(?:\d+\s*[.)、:：-]?\s*)?(?:(?:受)?影响文件(?:清单)?|涉及文件(?:清单)?|文件变更|变更文件|Affected Files(?: List)?|Files? to Change|File Changes)(?:\s*(?:[（(][^()（）\r\n]{1,60}[）)]|[:：—-]\s*[^#\r\n]{1,60}))?\s*$/i;
 
 export function isRuntimeTaskMutationSectionHeading(heading: string): boolean {
   const normalized = String(heading || "").replace(/\*\*/g, "").trim();
@@ -2185,6 +2187,18 @@ export function collectRuntimeTaskCandidateLines(content: string): string[] {
     if (text.length < 8 || text.length > 800) continue;
     if (isMarkdownTableSyntaxLine(text)) continue;
     if (RUNTIME_TASK_PLACEHOLDER_RE.test(text) || /^(?:\.{3}|…+)$/.test(text)) continue;
+    if (usefulSectionLevel === 0) {
+      // Outside an execution/validation section, file-bearing bullets are
+      // commonly evidence or diagnosis (for example, “store.ts exports X”).
+      // A path alone must not turn that observation into a mutation task.
+      // Preserve explicit checklists, commands, and imperative standalone
+      // actions so compact plans without formal headings still work.
+      const isExplicitChecklist = /^\s*[-*]\s+\[[ xX]\]\s+/.test(line);
+      const hasCommand = extractShellCommandsFromText(text).length > 0;
+      if (!isExplicitChecklist && !hasCommand && !RUNTIME_TASK_STANDALONE_ACTION_RE.test(text)) {
+        continue;
+      }
+    }
     const evidence = inferPlanTaskEvidence(text, extractShellCommandsFromText(text));
     if (
       validationSectionLevel > 0 &&
@@ -2522,7 +2536,7 @@ function collectRuntimeTaskProseSectionTasks(
     if (!normalized) continue;
     const directFiles = extractWorkspaceFileReferencesFromText(normalized);
     const isFileLabel = /^(?:文件|目标文件|修改文件|file|target file|file to change)\s*[:：]/i.test(normalized);
-    const normalizedFileOnlyLine = normalized
+    const normalizedFileOnlyLine = stripMarkdownTaskLine(normalized)
       .replace(/[`*_]/g, "")
       .trim();
     const isFileOnlyLine =

@@ -57,8 +57,11 @@ const {
   canonicalizePlanArtifactContent,
   composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
+  extractPlanEvidenceFacts,
+  findContradictedPlanDiagnosticClaim,
   isMaterializablePlanLikeText,
   materializePlanArtifactFromVisibleText,
+  repairPlanValidationTargetFromEvidence,
   sanitizePlanEvidenceInput,
   summarizePlanEvidenceDetail,
   validateExplicitPlanCodeChangeGrounding,
@@ -856,6 +859,153 @@ test("read-backed startup configuration values expose a generic cross-file misma
   assert.match(plan, /vite\.config\.js/);
 });
 
+test("validation localhost URLs are repaired from one read-backed dev-server port", () => {
+  const content = [
+    "# 正式计划",
+    "## 关键改动",
+    "- 修改 `src/main.js` 的页面布局。",
+    "## 验证标准",
+    "- 启动开发服务器后使用浏览器检查 http://localhost:5173/editor?mode=test。",
+    "## 风险",
+    "- 保持现有配置不变。",
+  ].join("\n");
+  const repaired = repairPlanValidationTargetFromEvidence({
+    content,
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "vite.config.js",
+      status: "succeeded",
+      summary: "L82: export default defineConfig({ server: { port: 1420, strictPort: true } })",
+    }],
+  });
+  assert.equal(repaired.repaired, true);
+  assert.equal(repaired.expectedPort, 1420);
+  assert.match(repaired.content, /http:\/\/localhost:1420\/editor\?mode=test/);
+  assert.doesNotMatch(repaired.content, /localhost:5173/);
+
+  const intentionalPortChange = repairPlanValidationTargetFromEvidence({
+    content: content.replace("修改 `src/main.js` 的页面布局", "更新 `vite.config.js`：设置 `server.port = 5173`"),
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "vite.config.js",
+      status: "succeeded",
+      summary: "L82: server port: 1420",
+    }],
+  });
+  assert.equal(intentionalPortChange.repaired, false);
+  assert.match(intentionalPortChange.content, /localhost:5173/);
+
+  const apiOnly = repairPlanValidationTargetFromEvidence({
+    content,
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/server.ts",
+      status: "succeeded",
+      summary: "export const server = { port: 3000 }",
+    }],
+  });
+  assert.equal(apiOnly.repaired, false);
+  assert.match(apiOnly.content, /localhost:5173/);
+
+  const frontendAndApi = repairPlanValidationTargetFromEvidence({
+    content,
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "vite.config.js",
+      status: "succeeded",
+      summary: "export default defineConfig({ server: { port: 1420 } })",
+    }, {
+      tool: "read_file",
+      target: "src/server.ts",
+      status: "succeeded",
+      summary: "export const server = { port: 3000 }",
+    }],
+  });
+  assert.equal(frontendAndApi.repaired, true);
+  assert.match(frontendAndApi.content, /localhost:1420/);
+});
+
+test("Plan diagnostic absence claims are rejected when read evidence contains the identifier", () => {
+  const content = [
+    "# 修复计划",
+    "## 根因",
+    "- `src/main.js` 可能缺少 DOMContentLoaded 保护。",
+    "## 关键改动",
+    "- 修改 `src/main.js` 的初始化顺序。",
+    "## 验证标准",
+    "- 运行测试。",
+    "## 风险",
+    "- 保持行为兼容。",
+  ].join("\n");
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "src/main.js",
+    status: "succeeded",
+    summary: "document.addEventListener('DOMContentLoaded', () => { initToolbar(); initEditor(); });",
+  }];
+  assert.equal(findContradictedPlanDiagnosticClaim({ content, evidenceRecords }), "DOMContentLoaded");
+  const materialized = materializePlanArtifactFromVisibleText({
+    visibleText: content,
+    userGoal: "修复白屏",
+    evidenceRecords,
+  });
+  assert.equal(materialized.ok, false);
+  assert.match(materialized.reason || "", /plan_diagnostic_claim_contradicted:DOMContentLoaded/);
+});
+
+test("Plan diagnostic ordering uses structured listener facts and does not confuse a definition with a call", () => {
+  const summary = summarizePlanEvidenceDetail({
+    tool: "read_file",
+    target: "src/main.js",
+    maxChars: 400,
+    content: [
+      "READ_FILE_RESULT",
+      "path: src/main.js",
+      "---CONTENT START---",
+      "document.addEventListener('DOMContentLoaded', () => {",
+      "  initToolbar();",
+      "  initEditor();",
+      "  initPreview();",
+      "  initOutline();",
+      "  function localDefinition() { nestedDefinitionCall(); }",
+      "  const localArrow = () => { nestedArrowCall(); };",
+      "  if (shouldDefer) { nestedConditionalCall(); }",
+      "  window.addEventListener('file-open', handleFileOpen);",
+      "});",
+      "function initToolbar() { return true; }",
+      "---CONTENT END---",
+    ].join("\n"),
+  });
+  const facts = extractPlanEvidenceFacts(summary);
+  assert.match(summary, /listener_calls\(initToolbar,initEditor,initPreview,initOutline\)/);
+  assert.ok(facts.some((fact) => /event_dom_listener_contract\(DOMContentLoaded\)/.test(fact)));
+  const listenerCallsFact = facts.find((fact) => /listener_calls\(/.test(fact)) || "";
+  assert.match(listenerCallsFact, /listener_calls\(initToolbar,initEditor,initPreview,initOutline\)/);
+  assert.doesNotMatch(listenerCallsFact, /localDefinition|nestedDefinitionCall|localArrow|nestedArrowCall|nestedConditionalCall/);
+
+  const orderingClaim = "- `src/main.js` 中 `initToolbar()` 在 DOM 元素就绪前被调用（主因）。";
+  assert.equal(findContradictedPlanDiagnosticClaim({
+    content: orderingClaim,
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "bounded excerpt",
+      facts,
+    }],
+  }), "initToolbar");
+
+  assert.equal(findContradictedPlanDiagnosticClaim({
+    content: "- `src/main.js` 没有调用 initToolbar。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "L20: function initToolbar() { return true; }",
+    }],
+  }), null);
+});
+
 test("numbered facets may close through an evidence-backed no-change decision", () => {
   const objective = [
     "完成两个独立目标：",
@@ -929,13 +1079,29 @@ test("source evidence summaries retain development port assignments", () => {
       "import { defineConfig } from 'vite';",
       "export default defineConfig({",
       "  server: {",
-      "    port: 5173,",
+      "    port: 1420,",
       "  },",
       "});",
     ].join("\n"),
   });
 
-  assert.match(summary, /port: 5173/);
+  assert.match(summary, /port: 1420/);
+
+  const repaired = repairPlanValidationTargetFromEvidence({
+    content: [
+      "# Plan",
+      "## Validation",
+      "- Open http://localhost:5173 and inspect the page.",
+    ].join("\n"),
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "vite.config.js",
+      status: "succeeded",
+      summary,
+    }],
+  });
+  assert.equal(repaired.repaired, true);
+  assert.match(repaired.content, /localhost:1420/);
 });
 
 test("plan evidence keeps related CSV consumers as facts without turning them into change targets", () => {

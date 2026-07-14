@@ -1,4 +1,5 @@
 import { buildRepeatLoopArgsKey } from "../repetitionGuard";
+import { isPtyControlInput } from "../ptyCommandRuntime";
 import {
   extractReadFileWindowMetadata,
   type planReadFileWindowCoverage,
@@ -19,6 +20,12 @@ export interface FileReadState {
   sizeBytes: number;
   modifiedMs: number;
   modelContent: string;
+  /** Increments only when context management actually evicts this exact source window. */
+  contextEvictionEpoch?: number;
+  /** The eviction epoch for which the retained source was most recently replayed. */
+  lastReplayContextEvictionEpoch?: number;
+  /** Actual cached-source replays since this file version was observed. */
+  replayCountSinceVersion?: number;
   updatedAt: number;
 }
 
@@ -83,6 +90,23 @@ export function invalidateWorkspaceReadCachesAfterMutation(input: {
   readOnlyResultCache?: Map<string, unknown>;
   readOnlyDuplicateSkipCounts?: Map<string, number>;
 }): { invalidatedFileReadSignatures: string[]; invalidatedReadOnlyEntries: number } {
+  if (
+    input.toolName === "send_pty_input" &&
+    isPtyControlInput(
+      typeof input.args.input === "string" ? input.args.input : "",
+      typeof input.args.control === "string" ? input.args.control : undefined,
+    )
+  ) {
+    // A control action does not change a file version, so exact versioned
+    // read_file windows remain valid. The foreground process may have changed
+    // generated files asynchronously before it stopped, however, so args-only
+    // grep/outline/AST/git caches must be observed again.
+    const invalidatedReadOnlyEntries = input.readOnlyResultCache?.size || 0;
+    const invalidatedKeys = [...(input.readOnlyResultCache?.keys() || [])];
+    input.readOnlyResultCache?.clear();
+    invalidatedKeys.forEach((key) => input.readOnlyDuplicateSkipCounts?.delete(key));
+    return { invalidatedFileReadSignatures: [], invalidatedReadOnlyEntries };
+  }
   if (isWorkspaceMutationToolName(input.toolName) && !isWorkspaceMutationToolCall(input.toolName, input.args)) {
     return { invalidatedFileReadSignatures: [], invalidatedReadOnlyEntries: 0 };
   }

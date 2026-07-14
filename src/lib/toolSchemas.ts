@@ -13,7 +13,7 @@ export interface ToolDefinition {
     description: string;
     parameters: {
       type: "object";
-      properties: Record<string, { type: string; description?: string }>;
+      properties: Record<string, { type: string; description?: string; enum?: string[] }>;
       required: string[];
     };
   };
@@ -534,16 +534,17 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "send_pty_input",
-      description: "向当前 PTY 前台进程发送原始输入。适合回答交互式提示、输入 y/n、发送 Ctrl+C（input 使用 \\u0003）等，不会额外解释为新的 shell 命令。",
+      description: "向已有 PTY 前台进程发送原始输入。适合回答交互式提示或发送控制动作；Ctrl+C 优先传 control=interrupt，也兼容 input=CTRL_C。不会创建 PTY，也不会把输入解释为新的 shell 命令。",
       parameters: {
         type: "object",
         properties: {
-          input: { type: "string", description: "要写入 PTY 的原始文本" },
-          append_newline: { type: "boolean", description: "是否在输入后追加换行，默认 false" },
+          input: { type: "string", description: "要写入 PTY 的原始文本；Ctrl+C 可传 CTRL_C" },
+          control: { type: "string", enum: ["interrupt"], description: "结构化控制动作；interrupt 表示单次 Ctrl+C" },
+          append_newline: { type: "boolean", description: "普通文本输入后是否追加换行，默认 false；控制动作禁止追加换行" },
           wait_ms: { type: "number", description: "写入后等待多少毫秒再读取新增输出，默认 500" },
           max_chars: { type: "number", description: "本次返回的新增终端输出最多多少字符，默认 8000" },
         },
-        required: ["input"],
+        required: [],
       },
     },
   },
@@ -636,7 +637,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "get_pty_status",
-      description: "可选等待后检查集成 PTY 是否已启动、shell 是否可接受新命令、当前前台进程组、捕获缓冲区 offset/字节数，以及最近少量输出。shellAvailable=false 表示已有长驻或交互进程占用终端。",
+      description: "可选等待后检查集成 PTY 是否已启动、shell 是否可接受新命令、当前前台进程组/代次/三态所有权、捕获缓冲区 offset/字节数，以及最近少量输出。foregroundState=busy 表示前台进程占用，idle 表示 shell 空闲，unknown 表示平台不支持可靠识别。",
       parameters: {
         type: "object",
         properties: {
