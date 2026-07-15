@@ -1990,6 +1990,41 @@ function evidenceContainsPositiveIdentifierObservation(
   return false;
 }
 
+/**
+ * Return only identifiers that are the grammatical subject/object of a
+ * source-absence assertion. A diagnostic line can legitimately say that one
+ * function uses the wrong identifier or fails to bind an event while naming
+ * several existing functions. Treating every identifier after words such as
+ * "没有" as absent turns those relationship diagnoses into false
+ * contradictions.
+ */
+function collectDirectAbsenceClaimIdentifiers(line: string): string[] {
+  const identifiers = new Set<string>();
+  const addMatches = (pattern: RegExp, group = 1) => {
+    for (const match of line.matchAll(pattern)) {
+      const identifier = String(match[group] || "").trim();
+      if (identifier) identifiers.add(identifier);
+    }
+  };
+
+  // Explicit call assertions are safe to check against structured call
+  // observations. Keep the called identifier close to the assertion verb so
+  // contextual function names later in the sentence are not captured.
+  addMatches(/(?:没有|未|从未)\s*(?:实际)?(?:调用|执行)\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  addMatches(/(?:not|never)\s+(?:called|invoked|executed)\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  addMatches(/without\s+(?:calling|invoking|executing)\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+
+  // Source-presence assertions. Deliberately exclude relational verbs such as
+  // 未使用、未实现、未注册 and phrases such as 没有在 ...; seeing an identifier
+  // elsewhere in source is not evidence that those relationships exist.
+  addMatches(/(?:缺少|没有|不存在|未定义)\s*(?:必要的|对应的|任何)?\s*[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  addMatches(/(?:missing|absent)\s+(?:an?\s+|the\s+)?[`'"“‘]?([A-Za-z_$][A-Za-z0-9_$]{3,})/gi);
+  addMatches(/\b([A-Za-z_$][A-Za-z0-9_$]{3,})\b\s*(?:\(\))?\s*(?:函数|方法|变量|监听器|保护)?\s*(?:不存在|未定义)/gi);
+  addMatches(/\b([A-Za-z_$][A-Za-z0-9_$]{3,})\b\s*(?:\(\))?\s+is\s+(?:missing|absent|not\s+(?:present|defined))/gi);
+
+  return [...identifiers];
+}
+
 /** Reject an absence claim when the cited source observation contains it. */
 export function findContradictedPlanDiagnosticClaim(input: {
   content: string;
@@ -2002,11 +2037,8 @@ export function findContradictedPlanDiagnosticClaim(input: {
   if (orderingContradiction) return orderingContradiction;
   for (const line of String(input.content || "").split(/\r?\n/)) {
     const claim = line.match(PLAN_ABSENCE_CLAIM_RE);
-    if (!claim || claim.index == null) continue;
-    const claimedTail = line.slice(claim.index + claim[0].length, claim.index + claim[0].length + 100);
-    const identifiers = [...claimedTail.matchAll(/\b[A-Za-z_$][A-Za-z0-9_$]{3,}\b/g)]
-      .map((match) => match[0] || "")
-      .filter((value) => /[A-Z_$]|[a-z][A-Z]/.test(value));
+    if (!claim) continue;
+    const identifiers = collectDirectAbsenceClaimIdentifiers(line);
     if (identifiers.length === 0) continue;
     const lineTargets = [...line.matchAll(PLAN_CHANGE_TARGET_FILE_RE)]
       .map((match) => normalizePlanGroundingPath(match[0] || ""));

@@ -20,6 +20,19 @@ const realOmlxRequest =
   process.env.REAL_OMLX_REQUEST ||
   "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。";
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
+const realOmlxFixture = String(process.env.REAL_OMLX_FIXTURE || "csv").trim().toLowerCase();
+const realOmlxMutationFile = String(
+  process.env.REAL_OMLX_MUTATION_FILE ||
+  (realOmlxFixture === "md-viewer" ? "src/main.js" : "src/hooks/useCsvParser.ts"),
+).replace(/^[/\\]+/, "");
+const realOmlxMutationExpectation = new RegExp(
+  process.env.REAL_OMLX_MUTATION_EXPECT ||
+  (realOmlxFixture === "md-viewer" ? "btn-new" : "creatorName\\s*:"),
+  "i",
+);
+const realOmlxDevServerUrl = String(
+  process.env.REAL_OMLX_DEV_SERVER_URL || "http://localhost:5173/",
+);
 const realOmlxPlanExpectation = new RegExp(
   process.env.REAL_OMLX_PLAN_EXPECT || "useCsvParser\\.ts|CSV|creator",
   "i",
@@ -64,7 +77,7 @@ test.beforeEach(async ({ page }) => {
     ? path.resolve(customWorkspace)
     : await fs.mkdtemp(path.join(os.tmpdir(), "e2e-real-omlx-"));
   (page as any).__realOmlxWorkspace = workspace;
-  const seedFiles: Record<string, string> = {
+  const csvSeedFiles: Record<string, string> = {
     "src/hooks/useCsvParser.ts": [
       "export interface CsvOrder {",
       "  creator?: string;",
@@ -98,6 +111,50 @@ test.beforeEach(async ({ page }) => {
     "src/components/FileUploader/DragUpload.tsx": "export function DragUpload() { return <input type=\"file\" />; }\n",
     "cn_tutorial_orders_by_creator_20260512.csv": "creator,amount\nalice,12\n",
   };
+  const mdViewerSeedFiles: Record<string, string> = {
+    "package.json": JSON.stringify({
+      name: "md-viewer-recovery-fixture",
+      private: true,
+      scripts: {
+        build: "tsc --noEmit",
+        dev: "vite --port 1420",
+      },
+    }, null, 2) + "\n",
+    "index.html": "<!doctype html><main><div id=\"toolbar\"></div><div id=\"status\"></div></main><script type=\"module\" src=\"/src/main.js\"></script>\n",
+    "src/components/toolbar.js": [
+      "export function renderToolbar(root) {",
+      "  root.innerHTML = [",
+      "    '<button id=\"btn-new\">New</button>',",
+      "    '<button id=\"btn-open\">Open</button>',",
+      "    '<button id=\"btn-save\">Save</button>',",
+      "  ].join('');",
+      "}",
+      "",
+    ].join("\n"),
+    "src/main.js": [
+      "import { renderToolbar } from './components/toolbar.js';",
+      "",
+      "const status = document.getElementById('status');",
+      "renderToolbar(document.getElementById('toolbar'));",
+      "",
+      "export function initToolbar() {",
+      "  const actions = {",
+      "    'new-btn': () => { status.textContent = 'new'; },",
+      "    'open-btn': () => { status.textContent = 'open'; },",
+      "    'save-btn': () => { status.textContent = 'save'; },",
+      "  };",
+      "  for (const [id, handler] of Object.entries(actions)) {",
+      "    document.getElementById(id)?.addEventListener('click', handler);",
+      "  }",
+      "}",
+      "",
+      "initToolbar();",
+      "",
+    ].join("\n"),
+  };
+  const seedFiles = realOmlxFixture === "md-viewer"
+    ? mdViewerSeedFiles
+    : csvSeedFiles;
   if (!customWorkspace) {
     for (const [relative, content] of Object.entries(seedFiles)) {
       const absolute = path.join(workspace, relative);
@@ -159,17 +216,17 @@ test.beforeEach(async ({ page }) => {
   });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
-    const parser = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
-    const hasCreatorNameAssignment = /creatorName\s*:\s*[^,}\n]+/.test(parser);
+    const mutationContent = await fs.readFile(path.join(workspace, realOmlxMutationFile), "utf8");
+    const hasExpectedMutation = realOmlxMutationExpectation.test(mutationContent);
     const isFiniteVerification = isFinitePlanValidationCommand(command);
-    const exitCode = hasCreatorNameAssignment && isFiniteVerification ? 0 : 1;
+    const exitCode = hasExpectedMutation && isFiniteVerification ? 0 : 1;
     return JSON.stringify({
       command,
       cwd: workspace,
       exitCode,
       stdout: exitCode === 0
-        ? "Fresh fixture verification passed: creatorName assignment is present."
-        : "Fresh fixture verification failed: expected a finite verification command and creatorName assignment.",
+        ? `Fresh fixture verification passed: ${realOmlxMutationFile} contains the expected mutation.`
+        : `Fresh fixture verification failed: expected a finite command and mutation matching ${realOmlxMutationExpectation.source}.`,
       stderr: "",
     });
   });
@@ -277,7 +334,7 @@ test.beforeEach(async ({ page }) => {
     return true;
   });
 
-  await page.addInitScript(({ workspace, endpoint, apiKey }) => {
+  await page.addInitScript(({ workspace, endpoint, apiKey, devServerUrl, fixture }) => {
     const debugEntries = ((window as any).__REAL_OMLX_DEBUG_LOGS__ ??= []);
     const canceledStreamIds = new Set<string>();
     const readText = async (path: string) => {
@@ -427,7 +484,7 @@ test.beforeEach(async ({ page }) => {
         }
         appendPtyOutput(input);
         if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:dev|preview|start|serve)\b|\bvite\b/i.test(input)) {
-          appendPtyOutput("\nVITE v6.0.0 ready in 120 ms\n\n  Local: http://localhost:5173/\n");
+          appendPtyOutput(`\nVITE v6.0.0 ready in 120 ms\n\n  Local: ${devServerUrl}\n`);
           ptyForegroundPid = 4102;
           ptyShellAvailable = false;
           ptyForegroundState = "busy";
@@ -783,11 +840,11 @@ test.beforeEach(async ({ page }) => {
           finalUrl: String(args?.url || ""),
           status: 200,
           title: "Real OMLX fixture",
-          assertions: [{ passed: true, description: "creatorName mapping fixture is ready" }],
+          assertions: [{ passed: true, description: `${fixture} fixture is ready` }],
           consoleErrors: [],
           pageErrors: [],
           failedRequests: [],
-          textPreview: "creatorName",
+          textPreview: fixture === "md-viewer" ? "New Open Save" : "creatorName",
           durationMs: 1,
         };
       }
@@ -796,12 +853,22 @@ test.beforeEach(async ({ page }) => {
       }
       return null;
     };
-  }, { workspace, endpoint: omlxEndpoint, apiKey: omlxApiKey });
+  }, {
+    workspace,
+    endpoint: omlxEndpoint,
+    apiKey: omlxApiKey,
+    devServerUrl: realOmlxDevServerUrl,
+    fixture: realOmlxFixture,
+  });
 });
 
 for (const model of models) {
   test(`real OMLX MAIN plan/approve/execute closes with ${model}`, async ({ page }) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
+    const originalMutationContent = await fs.readFile(
+      path.join(workspace, realOmlxMutationFile),
+      "utf8",
+    );
     page.on("console", (message) => {
       const text = message.text();
       if (text.includes("[real-omlx-invoke] append_debug_log")) return;
@@ -890,10 +957,16 @@ for (const model of models) {
     console.log(`[real-omlx-chat-plan:${model}] ${planChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
     expect(planChatText).toMatch(realOmlxPlanOnly
       ? /read_file|grep_search|code_ast_query|读取|搜索|计划|根因|修复/i
+      : realOmlxFixture === "md-viewer"
+      ? /read_file|list_directory|读取|计划|main\.js|toolbar|按钮/i
       : /read_file|list_directory|读取|计划|CSV|useCsvParser|creator/i);
     expect(planChatText).not.toMatch(forbiddenChatNoise);
     if (expectAgentExplanation) {
-      expect((planSnapshot?.agentTexts || []).join("\n")).toMatch(/问题|分析|修复|Dashboard|CSV|深色|creator/i);
+      expect((planSnapshot?.agentTexts || []).join("\n")).toMatch(
+        realOmlxFixture === "md-viewer"
+          ? /问题|分析|修复|toolbar|按钮|main\.js/i
+          : /问题|分析|修复|Dashboard|CSV|深色|creator/i,
+      );
     }
 
     if (realOmlxPlanOnly) {
@@ -937,11 +1010,14 @@ for (const model of models) {
       .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
         if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
-        const parser = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
+        const mutationContent = await fs.readFile(
+          path.join(workspace, realOmlxMutationFile),
+          "utf8",
+        );
         return {
           status: snapshot?.agentStatus,
           approved: snapshot?.isPlanApproved,
-          hasCreatorName: /creatorName\s*:/.test(parser),
+          hasExpectedMutation: realOmlxMutationExpectation.test(mutationContent),
           hasToolFailureCard: (snapshot?.toolBlocks || []).some((block: { status?: string; error?: string }) =>
             block.status === "failed" && /search_text|content|空变更|identical/i.test(String(block.error || "")),
           ),
@@ -949,25 +1025,16 @@ for (const model of models) {
       }, { timeout: 500_000 })
       .toMatchObject({
         approved: true,
-        hasCreatorName: true,
+        hasExpectedMutation: true,
         hasToolFailureCard: false,
       });
 
-    const parserOnDisk = await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8");
-    expect(parserOnDisk).toMatch(/creatorName\s*:/);
-    expect(parserOnDisk).not.toEqual([
-      "export interface CsvOrder {",
-      "  creator?: string;",
-      "  creatorName?: string;",
-      "}",
-      "",
-      "export function normalizeCsvOrder(row: Record<string, string>): CsvOrder {",
-      "  return {",
-      "    creator: row.creator || row['创建者'] || '',",
-      "  };",
-      "}",
-      "",
-    ].join("\n"));
+    const mutationOnDisk = await fs.readFile(
+      path.join(workspace, realOmlxMutationFile),
+      "utf8",
+    );
+    expect(mutationOnDisk).toMatch(realOmlxMutationExpectation);
+    expect(mutationOnDisk).not.toEqual(originalMutationContent);
 
     await expect
       .poll(async () => {
@@ -994,11 +1061,31 @@ for (const model of models) {
     const executionSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
     const executionChatText = JSON.stringify(executionSnapshot?.taskFlowPreview || []);
     console.log(`[real-omlx-chat-execute:${model}] ${executionChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
-    expect(executionChatText).toMatch(/apply_patch|write_file|replace_in_file|run_command|已完成|creatorName|useCsvParser/i);
+    expect(executionChatText).toMatch(/apply_patch|write_file|replace_in_file|run_command|browser_evaluate|已完成|completed/i);
     expect(executionSnapshot?.planExecutionEvidence || []).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "file", target: "src/hooks/useCsvParser.ts" }),
+      expect.objectContaining({ kind: "file", target: realOmlxMutationFile }),
       expect.objectContaining({ kind: "cmd" }),
     ]));
+    if (realOmlxFixture === "md-viewer") {
+      expect(executionSnapshot?.planExecutionEvidence || []).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: "browser_dom" }),
+      ]));
+      const executionToolNames = (executionSnapshot?.taskFlowPreview || [])
+        .map((block: { toolName?: string }) => block.toolName || "");
+      const launchIndex = executionToolNames.lastIndexOf("execute_command");
+      const ptyObservationIndex = Math.max(
+        executionToolNames.lastIndexOf("get_pty_status"),
+        executionToolNames.lastIndexOf("read_pty_since"),
+        executionToolNames.lastIndexOf("read_pty_tail"),
+      );
+      const browserIndex = executionToolNames.lastIndexOf("browser_evaluate");
+      expect(launchIndex).toBeGreaterThanOrEqual(0);
+      expect(ptyObservationIndex).toBeGreaterThan(launchIndex);
+      expect(browserIndex).toBeGreaterThan(ptyObservationIndex);
+      expect(JSON.stringify(executionSnapshot?.debugTail || [])).not.toMatch(
+        /READ_FILE_NOT_AVAILABLE_IN_RECOVERY|DEV_SERVER_NOT_READY|server (?:is )?occupied/i,
+      );
+    }
     expect(executionChatText).not.toMatch(forbiddenChatNoise);
     const terminalExecutionSummary = [...(executionSnapshot?.debugTail || [])]
       .reverse()

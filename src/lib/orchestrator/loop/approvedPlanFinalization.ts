@@ -1,6 +1,5 @@
 import {
   buildPlanTaskEvidenceAudit,
-  hasBrowserValidationCapability,
   type PlanExecutionProgressPhase,
   type PlanExecutionProgressUpdate,
   type PlanTask,
@@ -10,7 +9,6 @@ import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import {
   buildApprovedPlanContinuationPrompt,
   buildApprovedPlanNoToolPauseMessage,
-  buildApprovedPlanValidationPendingMessage,
   buildBrowserValidationContinuationPrompt,
   buildPlanCommandExecutionHint,
   formatPlanAuditRemainingTasks,
@@ -19,21 +17,68 @@ import {
 } from "../../orchestrator";
 import type { OrchestratorCallbacks } from "../types";
 import { resolveExecuteNoToolCheckpointLimit } from "./executeNoToolRecovery";
+import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
+import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 export type ApprovedPlanFinalizationResult = {
   status: "none" | "continue" | "stopped";
   consecutiveNoToolCount: number;
 };
 
+function formatUserValidationConclusionTasks(
+  tasks: PlanTask[],
+  language: "zh" | "en",
+): string {
+  return tasks.slice(0, 8).map((task, index) => {
+    const detail = String(task.blockedReason || "").trim();
+    return `${index + 1}. ${task.text}${detail ? ` — ${detail}` : ""}`;
+  }).join("\n") || (language === "zh" ? "1. 按实际运行环境复核最终交互。" : "1. Review the final interaction in the target runtime.");
+}
+
+/**
+ * External/user review belongs in the conclusion. It is intentionally not an
+ * acceptance gate once the runtime audit has accepted all automatable work.
+ */
+export function appendApprovedPlanUserValidationConclusion(input: {
+  text: string;
+  audit: Pick<PlanTaskEvidenceAudit, "acceptedCompletion" | "pendingUserValidationTasks"> | null;
+  language: "zh" | "en";
+}): string {
+  const pending = input.audit?.pendingUserValidationTasks || [];
+  if (!input.audit?.acceptedCompletion || pending.length === 0) {
+    return input.text;
+  }
+  const base = String(input.text || "").trim() || (input.language === "zh"
+    ? "自动执行与可用验证已完成。"
+    : "Automated execution and available validation are complete.");
+  const heading = input.language === "zh"
+    ? "建议用户复核（不影响本次任务完成状态）："
+    : "Suggested user review (does not affect this task's completed status):";
+  return `${base}\n\n${heading}\n${formatUserValidationConclusionTasks(pending, input.language)}`;
+}
+
 export function buildApprovedPlanEvidenceCompletionMessage(input: {
   language: "zh" | "en";
   completedCount: number;
   totalCount: number;
+  pendingUserValidationTasks?: PlanTask[];
 }): string {
-  if (input.language === "en") {
-    return `Completed the approved Plan (${input.completedCount}/${input.totalCount}). MAIN verified the planned mutations and validation evidence for every task; no additional model-authored completion claim was required.`;
-  }
-  return `已按批准的 Plan 完成全部任务（${input.completedCount}/${input.totalCount}）。MAIN 已逐项核验计划要求的修改和验证证据，无需再依赖模型额外声明完成。`;
+  const pending = input.pendingUserValidationTasks || [];
+  const base = input.language === "en"
+    ? pending.length > 0
+      ? "Completed all automatable work in the approved Plan. MAIN verified the available mutation and validation evidence; external user review is reported separately below."
+      : `Completed the approved Plan (${input.completedCount}/${input.totalCount}). MAIN verified the planned mutations and validation evidence for every task; no additional model-authored completion claim was required.`
+    : pending.length > 0
+    ? "已完成批准 Plan 中所有可自动执行和验收的工作。MAIN 已核验现有修改与自动验证证据；外部用户复核单独列在下方。"
+    : `已按批准的 Plan 完成全部任务（${input.completedCount}/${input.totalCount}）。MAIN 已逐项核验计划要求的修改和验证证据，无需再依赖模型额外声明完成。`;
+  return appendApprovedPlanUserValidationConclusion({
+    text: base,
+    audit: {
+      acceptedCompletion: true,
+      pendingUserValidationTasks: pending,
+    },
+    language: input.language,
+  });
 }
 
 function buildApprovedPlanContinuationForRemainingTasks(input: {
@@ -91,6 +136,7 @@ export function handleApprovedPlanFinalization(input: {
   rejectedCompletionClaim: boolean;
   availableToolNames: Set<string>;
   consecutiveNoToolCount: number;
+  executeRecoveryState?: ExecuteRecoveryRuntimeState | null;
   emitTaskOrchestratorPhase: (phase: TaskOrchestratorPhase, extra?: Record<string, unknown>) => void;
   emitPlanExecutionProgress: (
     phase: PlanExecutionProgressPhase,
@@ -118,17 +164,24 @@ export function handleApprovedPlanFinalization(input: {
     return finish("none");
   }
 
-  const approvedPlanAudit = approvedPlanAuditForNoTool ||
+  const baseApprovedPlanAudit = approvedPlanAuditForNoTool ||
     buildPlanTaskEvidenceAudit({
       tasks: callbacks.getPlanTasks(),
       evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
       highlightNext: true,
     });
+  const approvedPlanValidationBoundary = resolveApprovedPlanValidationBoundary({
+    audit: baseApprovedPlanAudit,
+    availableToolNames,
+  });
+  const approvedPlanAudit = approvedPlanValidationBoundary === "pause_external_validation"
+    ? { ...baseApprovedPlanAudit, acceptedCompletion: true }
+    : baseApprovedPlanAudit;
   const approvedPlanTasks = approvedPlanAudit.tasks || [];
   const approvedPlanMissingTasks = (approvedPlanAudit.totalCount || 0) === 0;
   const hasRemainingApprovedPlanTasks =
     !!approvedPlanAudit &&
-    (!approvedPlanAudit.allTrustedComplete || approvedPlanAudit.pendingExternalValidation);
+    !approvedPlanAudit.acceptedCompletion;
 
   if (approvedPlanMissingTasks || hasRemainingApprovedPlanTasks) {
     callbacks.onStatusChange("running");
@@ -141,39 +194,6 @@ export function handleApprovedPlanFinalization(input: {
         ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
         : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.",
     );
-    const validationBoundary = resolveApprovedPlanValidationBoundary({
-      audit: approvedPlanAudit,
-      availableToolNames,
-    });
-    const browserValidationAvailable = hasBrowserValidationCapability(availableToolNames);
-    if (validationBoundary === "pause_external_validation") {
-      logAgentEvent("plan_execution_validation_boundary", {
-        iteration,
-        reason: "external_validation_unavailable",
-        auditCompleted: approvedPlanAudit.completedCount,
-        auditTotal: approvedPlanAudit.totalCount,
-        remaining: approvedPlanAudit.remainingTasks.length,
-        pendingUserValidation: approvedPlanAudit.pendingUserValidationTasks.length,
-        browserValidationAvailable,
-      });
-      emitPlanExecutionProgress("paused", {
-        currentTask: language === "zh" ? "待用户验证" : "pending user validation",
-        nextStep: language === "zh"
-          ? "自动验证能力不足，等待用户完成浏览器/Tauri/人工确认"
-          : "automation boundary reached; wait for browser/Tauri/user confirmation",
-      });
-      callbacks.onNonActionableStop(
-        buildApprovedPlanValidationPendingMessage({
-          language,
-          audit: approvedPlanAudit,
-          browserValidationAvailable,
-        }),
-        "incomplete_plan",
-      );
-      callbacks.onStatusChange("idle");
-      return finish("stopped");
-    }
-
     if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
       logAgentEvent("loop_stop", {
         reason: "remaining_plan_tasks_limit",
@@ -217,35 +237,30 @@ export function handleApprovedPlanFinalization(input: {
     return finish("continue");
   }
 
-  if (approvedPlanAudit.pendingUserValidationTasks.length > 0) {
-    const language = callbacks.getPreferredLanguage();
-    emitPlanExecutionProgress("paused", {
-      currentTask: language === "zh" ? "待用户验证" : "pending user validation",
-      nextStep: language === "zh"
-        ? "自动部分已完成，等待用户完成剩余验证"
-        : "automated work is complete; waiting for remaining user validation",
-    });
-    callbacks.onNonActionableStop(
-      buildApprovedPlanValidationPendingMessage({
-        language,
-        audit: approvedPlanAudit,
-        browserValidationAvailable: hasBrowserValidationCapability(availableToolNames),
-      }),
-      "incomplete_plan",
-    );
-    callbacks.onStatusChange("idle");
-    return finish("stopped");
-  }
-
-  const finalPlanAudit = buildPlanTaskEvidenceAudit({
+  const baseFinalPlanAudit = buildPlanTaskEvidenceAudit({
     tasks: callbacks.getPlanTasks(),
     evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
     highlightNext: true,
   });
+  const finalValidationBoundary = resolveApprovedPlanValidationBoundary({
+    audit: baseFinalPlanAudit,
+    availableToolNames,
+  });
+  const finalPlanAudit = finalValidationBoundary === "pause_external_validation"
+    ? { ...baseFinalPlanAudit, acceptedCompletion: true }
+    : baseFinalPlanAudit;
+  const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
+    ledger: callbacks.getPlanExecutionEvidenceLedger(),
+    validationExpected: finalValidationBoundary !== "pause_external_validation",
+  });
+  const activeRecoveryPending = Boolean(
+    input.executeRecoveryState && input.executeRecoveryState.mode !== "normal",
+  );
   if (
     finalPlanAudit.totalCount === 0 ||
-    !finalPlanAudit.allTrustedComplete ||
-    finalPlanAudit.pendingExternalValidation
+    !finalPlanAudit.acceptedCompletion ||
+    !evidenceClosureAudit.completionAllowed ||
+    activeRecoveryPending
   ) {
     logAgentEvent("plan_completion_guard_reprompt", {
       iteration,
@@ -254,26 +269,31 @@ export function handleApprovedPlanFinalization(input: {
       remaining: finalPlanAudit.remainingTasks.length,
       pendingExternalValidation: finalPlanAudit.pendingExternalValidation,
       pendingUserValidation: finalPlanAudit.pendingUserValidationTasks.length,
+      evidenceClosureGap: evidenceClosureAudit.gap,
+      activeRecoveryMode: input.executeRecoveryState?.mode || "normal",
     });
     callbacks.onStatusChange("running");
     callbacks.appendMessage({
       role: "user",
       content: callbacks.getPreferredLanguage() === "zh"
-        ? [
+          ? [
             "MAIN 的完成闸门没有通过：当前已批准 Plan 不能仅凭模型正文或单次工具结果结束。",
-            "请继续真实执行并产生文件/命令/验证证据；如果只剩浏览器/Tauri/用户验证且自动工具不可用，请暂停并说明待用户验证。",
+            `请继续补齐仍可自动执行的文件、命令或浏览器证据（当前闭环缺口：${activeRecoveryPending ? `active_recovery:${input.executeRecoveryState?.mode}` : evidenceClosureAudit.gap}）；纯用户/Tauri/外部复核只写入最终结论，不作为任务成功闸门。`,
           ].join("\n")
         : [
             "MAIN's completion gate did not pass: the approved Plan cannot end from assistant prose or a single tool result alone.",
-            "Continue with real execution evidence from files, commands, or validation. If only browser/Tauri/user validation remains and automation is unavailable, pause and report pending user validation.",
+            `Continue with any still-automatable file, command, or browser evidence (current closure gap: ${activeRecoveryPending ? `active_recovery:${input.executeRecoveryState?.mode}` : evidenceClosureAudit.gap}). Pure user/Tauri/external review belongs in the final conclusion and is not a success gate.`,
           ].join("\n"),
     });
     return finish("continue");
   }
 
   emitTaskOrchestratorPhase("DONE", {
-    reason: "plan_evidence_complete",
+    reason: finalPlanAudit.pendingExternalValidation
+      ? "plan_automation_evidence_complete_external_review_advisory"
+      : "plan_evidence_complete",
     iteration,
+    pendingUserValidation: finalPlanAudit.pendingUserValidationTasks.length,
   });
   emitPlanExecutionProgress("completed");
   callbacks.onPlanStageChanged("completed");

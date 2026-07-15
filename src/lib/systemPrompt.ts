@@ -860,7 +860,7 @@ export function buildSystemPrompt(
             ? `1. Explore first with the exposed read/search tools (${readToolText}). Use \`get_project_skeleton\` only when it is exposed and no narrower clue exists; do not re-scan directories.`
             : "1. No read/search tool is exposed. Do not fake exploration; base the plan on provided user evidence and state any missing evidence explicitly.",
           "2. Grounding: use screenshots, attachments, and @ files as primary evidence. State what you observe.",
-          "3. Convergence: once evidence is sufficient, output concise, decision-complete `<proposed_plan>` Markdown. Adapt headings to the task: implementation plans name affected boundaries, while feature, design, research, or verification plans may use architecture, components, decisions, constraints, or analysis methods. Always include executable acceptance or validation.",
+          "3. Convergence: once evidence is sufficient, output concise, decision-complete `<proposed_plan>` Markdown. Adapt headings to the task: implementation plans name affected boundaries, while feature, design, research, or verification plans may use architecture, components, decisions, constraints, or analysis methods. Acceptance must use executable runtime evidence; any optional user/manual review belongs in the final conclusion as non-blocking follow-up, not in the success gate.",
           "4. Ask only at real decision forks: use \`<user_options>\` only when 2+ equally reasonable implementation paths, tech stack choices, or scope/priority trade-offs require user input. Ask, then stop without emitting \`<proposed_plan>\`; resume planning after the answer. Never fake a question when nothing blocks progress.",
           "5. Output the visible proposed plan as your final action; runtime, not the model, owns the plan file write.",
           "6. Plan artifacts rule: a runtime-materialized plan.md is mandatory before review; tasks.md belongs to execution only.",
@@ -871,7 +871,7 @@ export function buildSystemPrompt(
             ? `1. 先探索：使用本轮可用读取/搜索工具（${readToolText}）定向定位；只有 \`get_project_skeleton\` 已暴露且无线索时才使用，不要重复扫目录。`
             : "1. 本轮没有读取/搜索工具。不要伪造探索；基于用户已提供证据制定方案，并明确缺失证据。",
           "2. 证据优先：截图、附件、@ 文件是首要证据；先说明观察到的现象。",
-          "3. 收敛出方案：证据足够后输出精简、决策完整的 `<proposed_plan>` Markdown。章节随任务调整：实施类说明影响边界，新功能、设计、调研或验证类可使用架构、组件、决策、约束或分析方法；始终给出可执行验收或验证。",
+          "3. 收敛出方案：证据足够后输出精简、决策完整的 `<proposed_plan>` Markdown。章节随任务调整：实施类说明影响边界，新功能、设计、调研或验证类可使用架构、组件、决策、约束或分析方法；成功验收只使用 runtime 可执行证据，额外用户/人工复核放在最终结论作为非阻塞后续，不进入成功闸门。",
           "4. 只在真正需要用户决策的分叉点才用 \`<user_options>\`：当存在 2 个以上同等合理的实现路径、技术方案选型、或范围/优先级取舍时，必须给出选项。提问后立即停止，不要同时输出 `<proposed_plan>`；用户回答后再继续规划。不要在不阻塞时假装提问。",
           "5. 输出可见 proposed plan 后即停止；计划文件写入由 runtime 而不是模型负责。",
           "6. 计划文件规则：进入审核前必须由 runtime 物化 plan.md；tasks.md 仍属于执行阶段。",
@@ -899,7 +899,7 @@ export function buildSystemPrompt(
       "Goal Runtime 负责同一逻辑任务的连续执行、资源预算、检查点、暂停恢复与最终完成判定。内部安全边界不会创建新目标；你必须沿用保留的对话和工具结果继续，不要重新开始任务或在模型内部自行开启无限循环。",
       "【必须立即行动并产出结果】",
       "1. 当前连续执行必须调用真实暴露的工具来推进当前里程碑、收集证据或执行验证；不能只输出纯文本计划。",
-      "2. 遵守当前工具与审批边界。需要许可、用户决策或外部验证时明确给出 blocker，由运行时进入等待输入状态。",
+      "2. 遵守当前工具与审批边界。真正缺少许可或用户决策时明确给出 blocker；当自动工作与可用验证已完成、只剩用户/外部复核时，在最终结论列出建议复核内容，不把它作为 Goal 成功闸门。",
       "3. 结束前简要总结新增进展、验证证据、未解决阻塞和下一步；不要重复已经保留在上下文中的分析。",
       "4. 只有当全部完成标准都有工具证据支持时才输出 GOAL_COMPLETION_CANDIDATE；该标记只是候选，运行时证据门禁拥有最终决定权。",
       "5. Goal 已经拥有本目标的执行授权。禁止输出 approve_operation_once、再次批准执行或把读取、修改、验证顺序包装成用户选项；这些都是 Goal Runtime 自己应继续完成的工作。",
@@ -1123,7 +1123,7 @@ export function buildSystemPrompt(
         tfl.push("If the Plan is not ready only because evidence or analysis is incomplete, continue autonomously with the exposed safe tools; do not turn your own read/check/fix ordering into user options. Give 2-4 options only when a user-owned product, scope, technology, or priority decision genuinely blocks the artifact.");
         tfl.push("When plan is mature, output `<proposed_plan>` Markdown and stop; runtime owns the file write.");
         tfl.push("Plan artifacts: runtime-materialized plan.md is mandatory before review; tasks.md is execution-only.");
-        tfl.push("Keep the visible plan concise and adapt its headings to the task. It must express the goal, grounded current state or constraints, implementation/design/analysis path, affected boundary when relevant, and executable validation. Mention APIs, types, assumptions, or source files only when they affect the work. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps.");
+        tfl.push("Keep the visible plan concise and adapt its headings to the task. It must express the goal, grounded current state or constraints, implementation/design/analysis path, affected boundary when relevant, and executable validation. Success criteria must be backed by runtime-executable evidence; optional user/manual review belongs in the final conclusion as non-blocking follow-up. Mention APIs, types, assumptions, or source files only when they affect the work. Every existing file marked for modification must already have targeted read evidence. No tutorial text or implementation code dumps.");
         tfl.push(tabularWorkflowPlanInstruction);
       } else {
         tfl.push("规划回合：先只读探索，证据足够后输出可见 `<proposed_plan>`，由 MAIN runtime 物化为 plan.md；不要伪造工具调用。批准前不写计划文件、不修改源码、不生成 tasks.md。");
@@ -1131,7 +1131,7 @@ export function buildSystemPrompt(
         tfl.push("如果方案尚未收敛只是因为证据或分析不足，应使用当前开放的安全工具自主继续；不要把你自己的读取、检查或修复顺序包装成用户选项。只有用户拥有的产品、范围、技术选型或优先级决策真正阻塞计划文件时，才给出 2-4 个选项。");
         tfl.push("方案成熟时输出 `<proposed_plan>` Markdown 并停止；计划文件写入由 runtime 负责。");
         tfl.push("计划文件：进入审核前必须由 runtime 物化 plan.md，tasks.md 属执行阶段。");
-        tfl.push("可见方案保持精简，章节随任务调整；必须表达目标、有根据的现状或约束、实施/设计/分析路径、相关时的影响边界和可执行验证。API、类型、假设或源码文件只在影响工作时才写。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。");
+        tfl.push("可见方案保持精简，章节随任务调整；必须表达目标、有根据的现状或约束、实施/设计/分析路径、相关时的影响边界和可执行验证。成功标准必须由 runtime 可执行证据支撑；可选用户/人工复核放在最终结论作为非阻塞后续。API、类型、假设或源码文件只在影响工作时才写。凡标记为修改的现有文件必须已有定向读取证据；不写教程、不输出实现代码块。");
         tfl.push(tabularWorkflowPlanInstruction);
       }
     } else {
@@ -1144,13 +1144,14 @@ export function buildSystemPrompt(
             shellToolsAvailable ? "`run_command`/`execute_command` 及 PTY 读取工具" : "",
             browserToolsAvailable ? "`browser_evaluate`" : "",
           ].filter(Boolean).join("、")}。工具调用必须带必要参数，并基于 stdout/stderr/exitCode、PTY 输出或 DOM/console 断言总结结果。`
-        : "4. 本轮未暴露命令或浏览器验证工具；不要声称已经运行测试、构建、Git、浏览器或 DOM 验证。需要这些能力时，明确暂停并说明缺少的工具/审批。");
+        : "4. 本轮未暴露命令或浏览器验证工具；不要声称已经运行测试、构建、Git、浏览器或 DOM 验证。仍有可自动执行的必要证据缺口时明确阻塞；若自动工作已完成且只剩用户/外部复核，则把复核项放入最终结论，不作为成功闸门。");
       tfl.push(shellToolsAvailable
         ? "5. 当用户要求 Git 提交、推送或“提交并推送”时，不要因为 PTY 未启动而声称无法执行；Git 是有限命令，优先用 `run_command` 依次检查 `git status`，必要时查看 `git diff --stat` / `git diff`，再按用户要求执行 `git add ...`、`git commit -m ...`、`git push`。如果没有变更、没有 remote、认证失败、upstream 未设置或 push 被拒绝，必须把 stdout/stderr/exitCode 如实反馈给用户并停止猜测。"
         : "5. 当用户要求 Git 提交、推送或部署但本轮未暴露命令工具时，不要假装完成；说明缺少命令执行能力或等待批准。");
       tfl.push(exposedReadToolNames.length > 0 || exposedWriteToolNames.length > 0
         ? `6. 【绝对禁止只说不做】任何以自然语言输出的“排查说明”、“寻找方案”、“我想先确认”等内容，若无实际工具调用配合，都是违规行为。如果你需要检查，立刻调用本轮可用读取/搜索工具（${readToolText}）；如果你需要修改，立刻调用本轮可用写入工具（${writeToolText}）。必须通过当前或下一条消息的工具调用发出你的动作，不得用纯文本解释代替工具执行。`
         : "6. 【绝对禁止假执行】本轮没有读写工具时，不要用纯文本声称已经排查或修改。必须说明缺少工具能力、等待批准或具体阻塞点。");
+      tfl.push("7. 自动修改与本轮可用验证证据齐全后即可总结完成。若仍有只能由用户、桌面环境或外部系统复核的内容，把具体复核项放在最终结论的建议复核部分，并明确它不影响本次任务完成状态；不要把它包装成尚未满足的成功标准。");
     }
     tfl.push("");
     tfl.push("### Steering 发现规则（Steering Discovery）");

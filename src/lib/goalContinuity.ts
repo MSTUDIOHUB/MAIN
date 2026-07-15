@@ -10,7 +10,11 @@ import {
   isExecutePatchMismatchRecoveryActivity,
   isReadOnlyNoProgressDetail,
   normalizeExecuteRecoveryMode,
+  resolveExecuteRecoveryActionContract,
+  type ExecuteRecoveryContractPhase,
   type ExecuteRecoveryMode,
+  type ExecutionDecisionCheckpoint,
+  type RecoveryReadLease,
 } from "./executeRecoveryTools";
 import { looksLikeSyntheticContinuationText } from "./syntheticContinuation";
 import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
@@ -281,6 +285,11 @@ export function createGoalContinuationState(input: {
     mode: ExecuteRecoveryMode;
     reason?: string | null;
     expectedTarget?: string | null;
+    phase?: ExecuteRecoveryContractPhase;
+    phaseNoProgressCount?: number;
+    readLease?: RecoveryReadLease | null;
+    sourceObservationKey?: string | null;
+    decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   } | null;
   now?: number;
 }): GoalContinuationState {
@@ -295,11 +304,7 @@ export function createGoalContinuationState(input: {
     ? input.previous?.executeRecoveryState
     : input.executeRecoveryState;
   const executeRecoveryState = recoveryInput
-    ? {
-        mode: normalizeExecuteRecoveryMode(recoveryInput.mode),
-        reason: String(recoveryInput.reason || "").trim(),
-        expectedTarget: normalizeRecoveryTarget(recoveryInput.expectedTarget),
-      }
+    ? normalizeGoalContinuationRecoverySnapshot(recoveryInput)
     : undefined;
   return {
     sourceIteration: Math.max(0, Math.floor(Number(input.sourceIteration) || 0)),
@@ -336,6 +341,115 @@ export interface GoalContinuationExecuteRecoveryState {
   mode: Exclude<ExecuteRecoveryMode, "normal">;
   reason: string;
   expectedTarget: string | null;
+  phase: ExecuteRecoveryContractPhase;
+  phaseNoProgressCount: number;
+  readLease: RecoveryReadLease | null;
+  sourceObservationKey: string | null;
+  decisionCheckpoint: ExecutionDecisionCheckpoint | null;
+}
+
+function normalizeRecoveryReadLease(value: unknown): RecoveryReadLease | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Partial<RecoveryReadLease>;
+  const purpose = candidate.purpose;
+  const state = candidate.state;
+  const target = normalizeRecoveryTarget(candidate.target);
+  if (
+    !target ||
+    (purpose !== "initial_targeting" &&
+      purpose !== "patch_recovery" &&
+      purpose !== "missing_window" &&
+      purpose !== "context_restore" &&
+      purpose !== "post_mutation_verify") ||
+    (state !== "available" && state !== "active" && state !== "consumed")
+  ) {
+    return null;
+  }
+  const range = candidate.requestedRange && typeof candidate.requestedRange === "object"
+    ? candidate.requestedRange
+    : null;
+  const requestedRange = range
+    ? {
+        ...(Number.isFinite(range.startLine)
+          ? { startLine: Math.max(1, Math.floor(Number(range.startLine))) }
+          : {}),
+        ...(Number.isFinite(range.endLine)
+          ? { endLine: Math.max(1, Math.floor(Number(range.endLine))) }
+          : {}),
+        ...(Number.isFinite(range.maxLines)
+          ? { maxLines: Math.max(1, Math.floor(Number(range.maxLines))) }
+          : {}),
+      }
+    : null;
+  return {
+    purpose,
+    target,
+    ...(requestedRange && Object.keys(requestedRange).length > 0 ? { requestedRange } : {}),
+    observationKey: String(candidate.observationKey || "").trim() || null,
+    observedVersion: String(candidate.observedVersion || "").trim() || null,
+    state,
+  };
+}
+
+function normalizeExecutionDecisionCheckpoint(value: unknown): ExecutionDecisionCheckpoint | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Partial<ExecutionDecisionCheckpoint>;
+  const nextRequiredCapability = candidate.nextRequiredCapability;
+  if (
+    nextRequiredCapability !== "any" &&
+    nextRequiredCapability !== "targeted_read" &&
+    nextRequiredCapability !== "mutation" &&
+    nextRequiredCapability !== "validation" &&
+    nextRequiredCapability !== "launch_long_process" &&
+    nextRequiredCapability !== "reconcile_server" &&
+    nextRequiredCapability !== "observe_pty" &&
+    nextRequiredCapability !== "browser_validation"
+  ) {
+    return null;
+  }
+  return {
+    expectedTarget: normalizeRecoveryTarget(candidate.expectedTarget),
+    sourceObservationKey: String(candidate.sourceObservationKey || "").trim() || null,
+    nextRequiredCapability,
+    ...(candidate.evidenceVersion === undefined
+      ? {}
+      : { evidenceVersion: String(candidate.evidenceVersion || "").trim() || null }),
+  };
+}
+
+interface NormalizedGoalContinuationRecoverySnapshot {
+  mode: ExecuteRecoveryMode;
+  reason: string;
+  expectedTarget: string | null;
+  phase: ExecuteRecoveryContractPhase;
+  phaseNoProgressCount: number;
+  readLease: RecoveryReadLease | null;
+  sourceObservationKey: string | null;
+  decisionCheckpoint: ExecutionDecisionCheckpoint | null;
+}
+
+function normalizeGoalContinuationRecoverySnapshot(input: {
+  mode: ExecuteRecoveryMode;
+  reason?: string | null;
+  expectedTarget?: string | null;
+  phase?: ExecuteRecoveryContractPhase;
+  phaseNoProgressCount?: number;
+  readLease?: RecoveryReadLease | null;
+  sourceObservationKey?: string | null;
+  decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
+}): NormalizedGoalContinuationRecoverySnapshot {
+  const mode = normalizeExecuteRecoveryMode(input.mode);
+  const contract = resolveExecuteRecoveryActionContract(mode);
+  return {
+    mode,
+    reason: String(input.reason || "").trim(),
+    expectedTarget: normalizeRecoveryTarget(input.expectedTarget),
+    phase: contract.phase,
+    phaseNoProgressCount: Math.max(0, Math.floor(Number(input.phaseNoProgressCount) || 0)),
+    readLease: normalizeRecoveryReadLease(input.readLease),
+    sourceObservationKey: String(input.sourceObservationKey || "").trim() || null,
+    decisionCheckpoint: normalizeExecutionDecisionCheckpoint(input.decisionCheckpoint),
+  };
 }
 
 function parseGoalToolCallArguments(value: string): Record<string, unknown> {
@@ -381,10 +495,16 @@ function buildGoalContinuationRecoveryState(input: {
   reason: string;
   target: string | null;
 }): GoalContinuationExecuteRecoveryState {
+  const contract = resolveExecuteRecoveryActionContract(input.mode);
   return {
     mode: input.mode,
     reason: input.reason,
     expectedTarget: input.target,
+    phase: contract.phase,
+    phaseNoProgressCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: null,
   };
 }
 
@@ -402,10 +522,16 @@ export function resolveGoalContinuationExecuteRecoveryState(
   if (state.executeRecoveryState) {
     const mode = normalizeExecuteRecoveryMode(state.executeRecoveryState.mode);
     if (mode === "normal") return null;
+    const normalized = normalizeGoalContinuationRecoverySnapshot(state.executeRecoveryState);
     return {
       mode,
-      reason: state.executeRecoveryState.reason || "goal_continuation_runtime_state",
-      expectedTarget: normalizeRecoveryTarget(state.executeRecoveryState.expectedTarget),
+      reason: normalized.reason || "goal_continuation_runtime_state",
+      expectedTarget: normalized.expectedTarget,
+      phase: normalized.phase,
+      phaseNoProgressCount: normalized.phaseNoProgressCount,
+      readLease: normalized.readLease,
+      sourceObservationKey: normalized.sourceObservationKey,
+      decisionCheckpoint: normalized.decisionCheckpoint,
     };
   }
   const messages = restoreGoalContinuationMessages(state);

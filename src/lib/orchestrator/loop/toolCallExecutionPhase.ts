@@ -33,6 +33,7 @@ import {
   markExecuteOperationEvidenceRuntimeState,
 } from "./evidenceRuntimeState";
 import {
+  refundExecuteRecoveryRuntimeIteration,
   transitionExecuteRecoveryRuntimeState,
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
@@ -296,12 +297,29 @@ export async function executeToolCallPhase(input: {
     result.name === "read_file" &&
     !result.isError &&
     !result.internalFeedback &&
-    !isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
+    (result.readFileObservation?.source
+      ? result.readFileObservation.source !== "stub"
+      : !isReadOnlyNoProgressDetail(String(result.displayContent || result.content || "")))
   );
   const mutationResult = allResults.find((result) =>
     !result.internalFeedback && isProjectSourceWriteResult(result)
   );
   const validationResult = allResults.find(isVerificationEvidenceResult);
+  const recoveryIterationBudgetNeutral =
+    executeRecoveryState.mode !== "normal" &&
+    allResults.length > 0 &&
+    allResults.every((result) =>
+      result.internalFeedback === true ||
+      (
+        result.name === "read_file" &&
+        !result.isError &&
+        isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
+      ) ||
+      (
+        ["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(result.name) &&
+        !result.isError
+      )
+    );
   const expectedRecoveryTarget = executeRecoveryState.expectedTarget || (
     executeRecoveryState.mode === "patch_recovery_read"
       ? resolveExecutePatchRecoveryTarget(input.recentToolActivity)
@@ -312,8 +330,10 @@ export async function executeToolCallPhase(input: {
     {
       expectedTarget: expectedRecoveryTarget,
       freshReadTarget: freshReadResult?.target,
+      sourceObservationKey: freshReadResult?.readFileObservation?.key,
       mutationTarget: mutationResult?.target,
       validationTarget: validationResult?.target || validationResult?.name,
+      validationToolName: validationResult?.name,
     },
   );
   if (recoveryTransition.transition === "validation_to_normal") {
@@ -331,6 +351,20 @@ export async function executeToolCallPhase(input: {
       nextMode: executeRecoveryState.mode,
       target: recoveryTransition.target,
       executeRecoveryAttempts: executeRecoveryState.attempts,
+    });
+  } else if (recoveryIterationBudgetNeutral) {
+    executeRecoveryState = refundExecuteRecoveryRuntimeIteration(recoveryTransition.state);
+    logAgentEvent("execute_recovery_phase_budget_preserved", {
+      iteration: input.iteration,
+      mode: executeRecoveryState.mode,
+      reason: "policy_deferral_cache_stub_or_pty_wait",
+      phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+      resultKinds: allResults.map((result) => ({
+        name: result.name,
+        internalFeedback: result.internalFeedback === true,
+        isError: result.isError === true,
+        qualityGateReason: result.qualityGateReason || null,
+      })),
     });
   } else if (recoveryTransition.state !== executeRecoveryState) {
     // A known patch target remains part of the transaction even if the model

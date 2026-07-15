@@ -394,7 +394,7 @@ export function buildPlanAutoScaffoldPrompt(input: {
       "## Affected Files",
       "- path or interface",
       "## Validation Standards",
-      "- Exact test/build/manual validation that would prove the fix.",
+      "- Exact runtime-executable test/build validation that proves the fix. Put optional user/manual review in the final conclusion as non-blocking follow-up, not in acceptance.",
       "",
       "Output this scaffold as visible `<proposed_plan>` now. Do not call tools unless MAIN has explicitly reopened evidence recovery.",
     ].filter(Boolean).join("\n");
@@ -420,7 +420,7 @@ export function buildPlanAutoScaffoldPrompt(input: {
     "## 影响文件",
     "- path 或接口名。",
     "## 验证标准",
-    "- 能证明修复成立的测试/构建/人工验证。",
+    "- 能证明修复成立且 runtime 可执行的测试/构建验证；可选用户/人工复核放入最终结论作为非阻塞后续，不进入验收标准。",
     "",
     "现在把这个脚手架输出为可见 `<proposed_plan>`。除非 MAIN 已重新开放补证据，否则不要调用工具。",
   ].filter(Boolean).join("\n");
@@ -649,6 +649,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
       "- Keep `plan.md` decision-complete, but adapt its headings to the task. Bug fixes may use root cause, features may use architecture/components/data flow, and research or verification plans may use decisions/constraints without inventing source edits.",
       "- Screenshot/attachment observations, read evidence, and confirmed facts belong in the concise Summary only when real; do not inflate them into empty audit sections.",
       "- Every implementation or design decision must point to concrete files, interfaces, components, data flow, commands, validation, or an explicit default. Mention public API/interface/type disposition only when it affects execution.",
+      "- Success acceptance must rely on runtime-executable evidence. Put optional user/manual review in the final conclusion as non-blocking follow-up, never as an unfinished success criterion.",
       "- Do not include console.log/debug-log suggestions, generalized CSS/store guesses, or probability claims as execution steps unless a cited evidence line supports them; otherwise place them under unverified hypotheses.",
       "- If the user asks for analysis, explanation, or advice without explicitly requesting a file, respond directly in the ChatArea with Markdown text. Do NOT write any files to disk to prevent workspace pollution.",
       "- If the user explicitly requests saving a document/report, write the Markdown document directly to `docs/<filename>.md` with `write_file`.",
@@ -670,6 +671,7 @@ export function buildPlanRecoveryPromptFromContext(input: {
     "- `plan.md` 必须做到决策完整，但章节应随任务类型调整：修复类可写根因，新增功能可写架构/组件/数据流，调研或验证类可写决策/约束，不要虚构源码改动。",
     "- 截图/附件观察、已读证据和已确认事实只在确有内容时放进精简摘要，不要撑成空洞审计章节。",
     "- 每个实现或设计决策必须指向具体文件、接口、组件、数据流、命令、验证方式或明确默认值；公共 API/接口/类型只有在影响执行时才需要说明。",
+    "- 成功验收必须依赖 runtime 可执行证据；可选用户/人工复核放入最终结论作为非阻塞后续，不能作为未完成的成功标准。",
     "- 没有证据支撑时，不要把 console.log/调试日志建议、泛化 CSS/Store 猜测或概率判断写成执行步骤；只能放入未验证假设。",
     "- 若用户未明确要求生成磁盘文件，默认仅在 ChatArea 中回答 Markdown 分析，切勿擅自写磁盘文件污染用户 Git 工作区。",
     "- 若用户明确要求保存报告文件，直接用 `write_file` 保存至工作区 `docs/<文件名>.md`。",

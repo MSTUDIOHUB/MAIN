@@ -953,6 +953,37 @@ test("Plan diagnostic absence claims are rejected when read evidence contains th
   assert.match(materialized.reason || "", /plan_diagnostic_claim_contradicted:DOMContentLoaded/);
 });
 
+test("Plan diagnostic relation claims do not treat contextual function names as absent", () => {
+  const content = [
+    "# 修复计划",
+    "## 已确认事实",
+    "- `src/components/toolbar.js` 渲染 `btn-new`、`btn-open`、`btn-save`，而 `src/main.js` 当前仍使用旧 ID。",
+    "## 根因",
+    "- `src/main.js` 没有使用 `toolbar.js` 渲染的 `btn-new`、`btn-open`、`btn-save`；`initToolbar()` 仍绑定 `new-btn`、`open-btn`、`save-btn`，因此点击事件没有关联到真实 DOM 节点。",
+    "## 关键改动",
+    "- 修改 `src/main.js` 中 `initToolbar()` 的三个按钮 ID，使其与 `src/components/toolbar.js` 的渲染契约一致。",
+    "## 验证标准",
+    "- 运行 `npm run build` 并进行浏览器验证。",
+    "## 风险",
+    "- 不改变按钮回调行为。",
+  ].join("\n");
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "src/main.js",
+    status: "succeeded",
+    summary: "function initToolbar() { document.getElementById('new-btn')?.addEventListener('click', createFile); }",
+  }, {
+    tool: "read_file",
+    target: "src/components/toolbar.js",
+    status: "succeeded",
+    summary: "<button id=\"btn-new\">New</button><button id=\"btn-open\">Open</button><button id=\"btn-save\">Save</button>",
+  }];
+
+  assert.equal(findContradictedPlanDiagnosticClaim({ content, evidenceRecords }), null);
+  const grounded = validatePlanEvidenceGrounding({ content, evidenceRecords });
+  assert.equal(grounded.ok, true, grounded.reason);
+});
+
 test("Plan diagnostic ordering uses structured listener facts and does not confuse a definition with a call", () => {
   const summary = summarizePlanEvidenceDetail({
     tool: "read_file",
@@ -1145,6 +1176,28 @@ test("plan evidence keeps related CSV consumers as facts without turning them in
 
   assert.equal(bundle.facts.length, 4);
   assert.deepEqual(bundle.changeTargets, ["src/hooks/useCsvParser.ts"]);
+});
+
+test("plan evidence separates an explicit mutation owner from a referenced contract file", () => {
+  const objective = "检查 src/components/toolbar.js 与 src/main.js，修复 src/main.js 中 initToolbar 的按钮绑定，使其与 toolbar.js 渲染的 btn-new、btn-open、btn-save ID 一致。";
+  const bundle = buildPlanEvidenceBundle({
+    objective,
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/components/toolbar.js",
+      status: "succeeded",
+      summary: "renderToolbar returns button elements with ids btn-new, btn-open, and btn-save",
+    }, {
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "function initToolbar defines actions for new-btn, open-btn, and save-btn and registers click listeners",
+    }],
+  });
+
+  assert.equal(bundle.facts.length, 2);
+  assert.deepEqual(bundle.changeTargets, ["src/main.js"]);
+  assert.equal(assessPlanClosureEvidence(bundle).ready, true);
 });
 
 test("deterministic bundle materialization excludes legacy import-only cache noise", () => {

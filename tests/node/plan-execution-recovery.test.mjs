@@ -69,6 +69,7 @@ const {
   isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanSameTurnFallbackDecision,
+  resolveExecuteMaxIterationsRecoveryDecision,
   summarizeRepeatedPlanTargetsFromToolActivity,
   toPlanExecutionRuntimeProgressUpdate,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
@@ -172,6 +173,8 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"));
 
 const {
+  appendApprovedPlanUserValidationConclusion,
+  buildApprovedPlanEvidenceCompletionMessage,
   handleApprovedPlanFinalization,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"));
 
@@ -1113,7 +1116,7 @@ test("approved plan finalization continues when trusted evidence is still incomp
   assert.match(harness.appended[0].content, /Next priority tasks/i);
 });
 
-test("approved plan finalization pauses when pending user validation cannot be automated", () => {
+test("approved plan finalization completes automated work and leaves user validation in the conclusion", () => {
   const harness = createApprovedPlanNoToolHarness("zh");
   const pendingValidationTask = {
     ...tasks[1],
@@ -1122,7 +1125,10 @@ test("approved plan finalization pauses when pending user validation cannot be a
     evidence: [{ kind: "manual_user_validation", value: "user confirms the Tauri window", inferred: true }],
   };
   const result = handleApprovedPlanFinalization({
-    callbacks: harness.callbacks,
+    callbacks: {
+      ...harness.callbacks,
+      getPlanTasks: () => [tasks[0], pendingValidationTask],
+    },
     activeProfile: "cloud",
     iteration: 7,
     workflowMode: "plan",
@@ -1143,12 +1149,33 @@ test("approved plan finalization pauses when pending user validation cannot be a
     emitPlanExecutionProgress: (phase, overrides) => harness.progress.push({ phase, overrides }),
   });
 
-  assert.equal(result.status, "stopped");
-  assert.deepEqual(harness.statuses, ["running", "idle"]);
-  assert.equal(harness.stops.length, 1);
-  assert.equal(harness.stops[0].reason, "incomplete_plan");
-  assert.equal(harness.progress[0].phase, "paused");
-  assert.match(harness.stops[0].message, /待用户验证|用户/);
+  assert.equal(result.status, "none");
+  assert.deepEqual(harness.statuses, []);
+  assert.equal(harness.stops.length, 0);
+  assert.equal(harness.progress[0].phase, "completed");
+  assert.deepEqual(harness.stages, ["completed"]);
+  assert.equal(harness.taskPhases[0].extra.reason, "plan_automation_evidence_complete_external_review_advisory");
+
+  const conclusion = buildApprovedPlanEvidenceCompletionMessage({
+    language: "zh",
+    completedCount: 1,
+    totalCount: 2,
+    pendingUserValidationTasks: [pendingValidationTask],
+  });
+  assert.match(conclusion, /所有可自动执行和验收的工作/);
+  assert.match(conclusion, /建议用户复核（不影响本次任务完成状态）/);
+  assert.match(conclusion, /Add resume guard tests/);
+
+  const appended = appendApprovedPlanUserValidationConclusion({
+    text: "自动验证已通过。",
+    audit: {
+      acceptedCompletion: true,
+      pendingUserValidationTasks: [pendingValidationTask],
+    },
+    language: "zh",
+  });
+  assert.match(appended, /^自动验证已通过。/);
+  assert.match(appended, /不影响本次任务完成状态/);
 });
 
 test("approved plan finalization marks the plan completed when all evidence is trusted", () => {
@@ -1166,7 +1193,14 @@ test("approved plan finalization marks the plan completed when all evidence is t
     callbacks: {
       ...harness.callbacks,
       getPlanTasks: () => completeAudit.tasks,
-      getPlanExecutionEvidenceLedger: () => evidenceLedger,
+      getPlanExecutionEvidenceLedger: () => [...evidenceLedger, {
+        id: "validation",
+        kind: "cmd",
+        value: "npm test",
+        target: "npm test",
+        sourceTool: "run_command",
+        createdAt: 3,
+      }],
     },
     activeProfile: "cloud",
     iteration: 7,
@@ -1181,9 +1215,87 @@ test("approved plan finalization marks the plan completed when all evidence is t
 
   assert.equal(result.status, "none");
   assert.equal(result.consecutiveNoToolCount, 0);
-  assert.deepEqual(harness.taskPhases, [{ phase: "DONE", extra: { reason: "plan_evidence_complete", iteration: 7 } }]);
+  assert.deepEqual(harness.taskPhases, [{ phase: "DONE", extra: { reason: "plan_evidence_complete", iteration: 7, pendingUserValidation: 0 } }]);
   assert.deepEqual(harness.progress, [{ phase: "completed", overrides: undefined }]);
   assert.deepEqual(harness.stages, ["completed"]);
+});
+
+test("approved plan finalization does not publish completed before post-mutation validation", () => {
+  const harness = createApprovedPlanNoToolHarness("en");
+  const completeAudit = createApprovedPlanNoToolAudit({
+    tasks: [{ ...tasks[0], status: "completed", evidenceStatus: "satisfied" }],
+    completedCount: 1,
+    totalCount: 1,
+    remainingTasks: [],
+    automationComplete: true,
+    allTrustedComplete: true,
+    acceptedCompletion: true,
+  });
+  const result = handleApprovedPlanFinalization({
+    callbacks: {
+      ...harness.callbacks,
+      getPlanTasks: () => completeAudit.tasks,
+      getPlanExecutionEvidenceLedger: () => evidenceLedger,
+    },
+    activeProfile: "cloud",
+    iteration: 8,
+    workflowMode: "plan",
+    approvedPlanAuditForNoTool: completeAudit,
+    rejectedCompletionClaim: false,
+    availableToolNames: new Set(["read_file", "run_command"]),
+    consecutiveNoToolCount: 0,
+    emitTaskOrchestratorPhase: (phase, extra) => harness.taskPhases.push({ phase, extra }),
+    emitPlanExecutionProgress: (phase, overrides) => harness.progress.push({ phase, overrides }),
+  });
+
+  assert.equal(result.status, "continue");
+  assert.deepEqual(harness.taskPhases, []);
+  assert.deepEqual(harness.stages, []);
+  assert.equal(harness.progress.some((entry) => entry.phase === "completed"), false);
+  assert.match(harness.appended.at(-1)?.content || "", /validation_after_mutation_required/);
+});
+
+test("approved plan finalization does not publish completed while recovery is active", () => {
+  const harness = createApprovedPlanNoToolHarness("en");
+  const completeAudit = createApprovedPlanNoToolAudit({
+    tasks: [{ ...tasks[0], status: "completed", evidenceStatus: "satisfied" }],
+    completedCount: 1,
+    totalCount: 1,
+    remainingTasks: [],
+    automationComplete: true,
+    allTrustedComplete: true,
+    acceptedCompletion: true,
+  });
+  const result = handleApprovedPlanFinalization({
+    callbacks: {
+      ...harness.callbacks,
+      getPlanTasks: () => completeAudit.tasks,
+      getPlanExecutionEvidenceLedger: () => [...evidenceLedger, {
+        id: "validation",
+        kind: "cmd",
+        value: "npm test",
+        target: "npm test",
+        sourceTool: "run_command",
+        createdAt: 3,
+      }],
+    },
+    activeProfile: "cloud",
+    iteration: 9,
+    workflowMode: "plan",
+    approvedPlanAuditForNoTool: completeAudit,
+    rejectedCompletionClaim: false,
+    availableToolNames: new Set(["read_file", "run_command"]),
+    consecutiveNoToolCount: 0,
+    executeRecoveryState: { mode: "validation_only" },
+    emitTaskOrchestratorPhase: (phase, extra) => harness.taskPhases.push({ phase, extra }),
+    emitPlanExecutionProgress: (phase, overrides) => harness.progress.push({ phase, overrides }),
+  });
+
+  assert.equal(result.status, "continue");
+  assert.deepEqual(harness.taskPhases, []);
+  assert.deepEqual(harness.stages, []);
+  assert.equal(harness.progress.some((entry) => entry.phase === "completed"), false);
+  assert.match(harness.appended.at(-1)?.content || "", /active_recovery:validation_only/);
 });
 
 test("strict repeat guard recovers repeated read-only shell inspection and marks the signature failed", () => {
@@ -1346,6 +1458,125 @@ test("execute max-iteration notices describe a recoverable boundary instead of f
   assert.match(pauseNotice, /重复只读/);
   assert.match(prompt, /如果任务已经完成，直接输出最终总结/);
   assert.match(prompt, /普通 Execute 50 轮安全边界/);
+});
+
+test("execute max-iteration recovery resumes validation after a completed mutation", () => {
+  const mutation = {
+    id: "mutation-before-boundary",
+    kind: "file",
+    value: "src/App.tsx",
+    target: "src/App.tsx",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  };
+
+  const decision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [mutation],
+  });
+
+  assert.deepEqual(decision, {
+    mode: "finite_validation_only",
+    gap: "validation_after_mutation_required",
+    reason: "max_iterations_validation_after_mutation",
+  });
+});
+
+test("execute max-iteration recovery preserves a pending post-mutation read lease", () => {
+  const decision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [{
+      id: "mutation-before-post-check",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }],
+    recoveryState: {
+      mode: "validation_only",
+      expectedTarget: "src/App.tsx",
+      readLease: {
+        purpose: "post_mutation_verify",
+        target: "src/App.tsx",
+        state: "available",
+      },
+      sourceObservationKey: "src/App.tsx@after-mutation",
+    },
+  });
+
+  assert.deepEqual(decision, {
+    mode: "validation_only",
+    gap: "validation_after_mutation_required",
+    reason: "max_iterations_post_mutation_check_required",
+  });
+});
+
+test("execute max-iteration recovery permits final synthesis when evidence is already closed", () => {
+  const decision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [{
+      id: "mutation-before-validation",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }, {
+      id: "validation-before-boundary",
+      kind: "cmd",
+      value: "npm test",
+      target: "npm test",
+      sourceTool: "run_command",
+      createdAt: 2,
+    }],
+  });
+
+  assert.deepEqual(decision, {
+    mode: "normal",
+    gap: "none",
+    reason: "max_iterations_evidence_complete",
+  });
+});
+
+test("execute max-iteration recovery restores PTY observation then browser validation from ledger state", () => {
+  const mutation = {
+    id: "mutation-before-server",
+    kind: "file",
+    value: "src/App.tsx",
+    target: "src/App.tsx",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  };
+  const launch = {
+    id: "dev-server-launch",
+    kind: "cmd",
+    value: "npm run dev",
+    target: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "pending",
+    foregroundGeneration: 7,
+    createdAt: 2,
+  };
+
+  const observeDecision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [mutation, launch],
+  });
+  assert.equal(observeDecision.mode, "validation_only");
+  assert.equal(observeDecision.gap, "pty_observation_required");
+
+  const ready = {
+    id: "dev-server-ready",
+    kind: "dev_server_url",
+    value: "http://localhost:1420/",
+    target: "terminal",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 7,
+    createdAt: 3,
+  };
+  const browserDecision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [mutation, launch, ready],
+  });
+  assert.equal(browserDecision.mode, "validation_only");
+  assert.equal(browserDecision.gap, "browser_validation_required");
 });
 
 test("resume prompt requires fresh workspace reads and treats .MAIN plans as internal state", () => {
@@ -2387,7 +2618,10 @@ test("browser readiness preflight stays visible without counting as a browser ex
     browserPreflightBlockEnd,
   );
   assert.match(browserPreflightBlock, /toolFailureSignatures\.delete\(tc\.id\)/);
-  assert.doesNotMatch(browserPreflightBlock, /internalFeedback/);
+  assert.match(browserPreflightBlock, /callbacks\.onToolDone\(tc\.name, requestedUrl, message/);
+  assert.match(browserPreflightBlock, /internalFeedback:\s*true/);
+  assert.match(browserPreflightBlock, /isError:\s*!policyDeferral/);
+  assert.doesNotMatch(browserPreflightBlock, /callbacks\.onToolError/);
 });
 
 test("browser validation repeats are reused or paused without agent error", () => {

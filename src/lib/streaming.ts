@@ -144,6 +144,8 @@ export interface StreamResult {
   finishReason: "stop" | "length" | "tool_calls" | null;
   reasoningContent?: string;
   reasoningField?: "reasoning_content" | "reasoning";
+  /** Provider returned a terminal response that violated the requested tool protocol. */
+  protocolViolation?: "required_tool_call_missing";
   usage?: {
     inputTokens: number;
     outputTokens: number;

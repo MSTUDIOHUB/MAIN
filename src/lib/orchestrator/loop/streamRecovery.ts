@@ -34,7 +34,8 @@ import {
   invokeInitialStreamForIteration,
   type PlanStreamWatchdogOptionsResolver,
 } from "./streamInvocation";
-import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
+import type { ExecuteRecoveryMode, RecoveryActionContract } from "../../executeRecoveryTools";
+import { annotateRequiredToolCallProtocolResult } from "../../requiredToolProtocol";
 import {
   applyPreapprovalPlanQualityRecoveryStreamOptions,
   capPreapprovalPlanQualityRecoveryMaxEscalations,
@@ -373,6 +374,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string | null;
   allowExecuteRecoveryFileRead: boolean;
+  recoveryActionContract: RecoveryActionContract;
   isExecuteRecoveryEligible: boolean;
   approvedPlanActionOnlyRecoveryActive: boolean;
   approvedPlanNoToolRecoveryFileReadActive: boolean;
@@ -411,6 +413,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     executeRecoveryMode,
     executeRecoveryReason,
     allowExecuteRecoveryFileRead,
+    recoveryActionContract,
     isExecuteRecoveryEligible,
     approvedPlanActionOnlyRecoveryActive,
     approvedPlanNoToolRecoveryFileReadActive,
@@ -474,6 +477,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       executeRecoveryMode,
       executeRecoveryReason,
       allowExecuteRecoveryFileRead,
+      recoveryActionContract,
       isExecuteRecoveryEligible,
       approvedPlanActionOnlyRecoveryActive,
       approvedPlanNoToolRecoveryFileReadActive,
@@ -561,7 +565,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           settings,
           providerCompatibilityOverride,
         );
-        const streamResult = await fetchLLMStream(
+        const rawStreamResult = await fetchLLMStream(
           retryMessages,
           settings,
           assistantMsgId,
@@ -578,6 +582,10 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             workflowMode,
             runtimeIntent,
           }, llmTools.length),
+        );
+        const streamResult = annotateRequiredToolCallProtocolResult(
+          rawStreamResult,
+          "required",
         );
         callbacks.onProviderNativeToolSuccess?.();
         logAgentEvent("approved_plan_stream_watchdog_recovered", {
@@ -691,7 +699,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           settings,
           providerCompatibilityOverride,
         );
-        const streamResult = await fetchLLMStream(
+        const rawStreamResult = await fetchLLMStream(
           retryMessages,
           settings,
           assistantMsgId,
@@ -708,6 +716,10 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             workflowMode,
             runtimeIntent,
           }, recoveryTools.length),
+        );
+        const streamResult = annotateRequiredToolCallProtocolResult(
+          rawStreamResult,
+          recoveryTools.length > 0 ? "required" : undefined,
         );
         if (recoveryTools.length > 0) {
           callbacks.onProviderNativeToolSuccess?.();

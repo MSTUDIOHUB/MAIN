@@ -129,6 +129,7 @@ const {
   createPlanExecutionEvidenceEntry,
   isPlanEvidenceLedgerTool,
   isPlanExecutionEvidenceTool,
+  shouldRecordPlanExecutionFailure,
 } = loadPlanEvidenceModule();
 
 const { resolveApprovedPlanMutationScope } = loadApprovedPlanExecutionScopeModule();
@@ -808,6 +809,16 @@ test("plan evidence records ordered finite command outcomes", () => {
   assert.equal(secondLedger.length, 2);
 });
 
+test("only explicit executor failures qualify for the durable evidence ledger", () => {
+  assert.equal(shouldRecordPlanExecutionFailure(), false);
+  assert.equal(shouldRecordPlanExecutionFailure({ failureKind: "policy" }), false);
+  assert.equal(shouldRecordPlanExecutionFailure({
+    failureKind: "actual",
+    internalFeedback: true,
+  }), false);
+  assert.equal(shouldRecordPlanExecutionFailure({ failureKind: "actual" }), true);
+});
+
 test("focused validation evidence cannot hide an unresolved command failure behind an unrelated pass", () => {
   const failedBuild = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
@@ -921,6 +932,67 @@ test("runtime plan task derivation binds prose change sections with a labeled fi
   );
   assert.ok(sourceTask, JSON.stringify(tasks));
   assert.match(sourceTask.text, /修改.*useCsvParser\.ts.*normalizeCsvOrder/);
+});
+
+test("file heading owns mutation prose while referenced contract files remain evidence only", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan: 修复 MD Viewer 按钮绑定",
+      "",
+      "## 关键实现改动",
+      "### 文件：`src/main.js`",
+      "将 `initToolbar` 函数中 `actions` 对象的键从 `new-btn`、`open-btn`、`save-btn` 改为 `btn-new`、`btn-open`、`btn-save`，与 `toolbar.js` 渲染的 ID 保持一致。",
+      "",
+      "## 验证方案",
+      "1. 运行 `npm run build` 确认构建成功。",
+      "2. 运行 `npm run dev` 启动开发服务器，确认 `http://localhost:1420/` 就绪。",
+      "3. 用浏览器打开页面，点击 New、Open、Save 按钮。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationTasks = tasks.filter((task) => task.executionKind === "mutation");
+  assert.equal(mutationTasks.length, 1, JSON.stringify(tasks));
+  assert.equal(mutationTasks[0].evidence?.[0]?.value, "src/main.js");
+  assert.match(mutationTasks[0].text, /btn-new/);
+  assert.equal(
+    tasks.some((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "toolbar.js")),
+    false,
+    JSON.stringify(tasks),
+  );
+});
+
+test("mutation heading keeps comparison files as references instead of write owners", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# 修复 MD Viewer 按钮绑定",
+      "",
+      "## 关键实现改动",
+      "### 修改 `src/main.js` 以匹配 `src/components/toolbar.js`",
+      "将 initToolbar 的按钮 ID 调整为 toolbar 渲染的 btn-new、btn-open、btn-save。",
+      "",
+      "## 验证方案",
+      "- 运行 `npm run build`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationTasks = tasks.filter((task) => task.executionKind === "mutation");
+  assert.equal(mutationTasks.length, 1, JSON.stringify(tasks));
+  assert.equal(mutationTasks[0].evidence?.[0]?.value, "src/main.js");
+  assert.equal(
+    mutationTasks.some((task) => task.evidence?.some((item) =>
+      item.kind === "file" && item.value === "src/components/toolbar.js"
+    )),
+    false,
+    JSON.stringify(tasks),
+  );
 });
 
 test("runtime plan task derivation carries an affected-file bullet into a nested concrete-change section", () => {
@@ -2583,6 +2655,73 @@ test("a semantic confirmation step stays automatable unless it explicitly requir
   assert.equal(isPlanTaskAwaitingExternalValidation(manual[0]), true);
 });
 
+test("user review cannot hide missing automatic evidence in a composite task", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 修改 `src/App.tsx` 后由用户手动确认界面 — 证据: file:src/App.tsx, manual_user_validation:user reviews the UI",
+  );
+  const beforeMutation = reconcilePlanTaskCompletion([], parsed, []);
+  const beforeAudit = buildPlanTaskEvidenceAudit({ tasks: beforeMutation });
+
+  assert.equal(beforeMutation[0].evidenceStatus, "missing");
+  assert.equal(isPlanTaskAwaitingExternalValidation(beforeMutation[0]), false);
+  assert.equal(beforeAudit.acceptedCompletion, false);
+  assert.equal(beforeAudit.remainingTasks.length, 1);
+
+  const mutation = createPlanExecutionEvidenceEntry({
+    toolName: "replace_in_file",
+    target: "src/App.tsx",
+    result: JSON.stringify({ success: true, changed: true }),
+  });
+  const afterMutation = reconcilePlanTaskCompletion([], parsed, mutation ? [mutation] : []);
+  const afterAudit = buildPlanTaskEvidenceAudit({ tasks: afterMutation });
+
+  assert.equal(afterMutation[0].evidenceStatus, "requires_user_confirmation");
+  assert.equal(isPlanTaskAwaitingExternalValidation(afterMutation[0]), true);
+  assert.equal(afterAudit.acceptedCompletion, true);
+  assert.equal(afterAudit.remainingTasks.length, 0);
+  assert.equal(afterAudit.pendingUserValidationTasks.length, 1);
+});
+
+test("unlabelled mutation plus user review preserves file evidence and advisory review", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 修改 `src/App.tsx` 后由用户手动确认界面。",
+  );
+
+  assert.deepEqual(parsed[0].evidence?.map((item) => item.kind), [
+    "file",
+    "manual_user_validation",
+  ]);
+  const beforeMutation = reconcilePlanTaskCompletion([], parsed, []);
+  assert.equal(beforeMutation[0].evidenceStatus, "missing");
+
+  const mutation = createPlanExecutionEvidenceEntry({
+    toolName: "replace_in_file",
+    target: "src/App.tsx",
+    result: JSON.stringify({ success: true, changed: true }),
+  });
+  const afterMutation = reconcilePlanTaskCompletion([], parsed, mutation ? [mutation] : []);
+  const audit = buildPlanTaskEvidenceAudit({ tasks: afterMutation });
+  assert.equal(audit.acceptedCompletion, true);
+  assert.equal(audit.pendingUserValidationTasks.length, 1);
+});
+
+test("browser location in an explicit user review remains advisory, not browser acceptance", () => {
+  const manualOnly = extractPlanTasks(
+    "- [ ] 请用户在浏览器中手动验证页面按钮和主题切换是否正常。",
+  );
+  assert.deepEqual(manualOnly[0].evidence?.map((item) => item.kind), [
+    "manual_user_validation",
+  ]);
+
+  const automaticThenManual = extractPlanTasks(
+    "- [ ] 使用浏览器工具自动验证页面按钮，再请用户手动确认视觉效果。",
+  );
+  assert.deepEqual(automaticThenManual[0].evidence?.map((item) => item.kind), [
+    "browser_dom",
+    "manual_user_validation",
+  ]);
+});
+
 test("runtime task evidence does not classify dotted code properties as files", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([{
     kind: "plan",
@@ -3176,6 +3315,22 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
       planStage: "design",
       toolCallCount: 0,
       audit,
+    }),
+    false,
+  );
+
+  const advisoryAudit = buildPlanTaskEvidenceAudit({
+    tasks: extractPlanTasks("- [ ] 用户手动确认最终交互 — 证据: manual_user_validation:user confirmation"),
+    evidenceLedger: [],
+  });
+  assert.equal(advisoryAudit.acceptedCompletion, true);
+  assert.equal(
+    shouldHandleApprovedPlanExecutionNoTool({
+      workflowMode: "plan",
+      isPlanApproved: true,
+      planStage: "executing",
+      toolCallCount: 0,
+      audit: advisoryAudit,
     }),
     false,
   );

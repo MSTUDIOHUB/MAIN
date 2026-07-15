@@ -284,6 +284,13 @@ test("tool activity tracking records bounded recent activity and helper classifi
     name: "read_file",
     target: "src/App.tsx",
     content: "READ_FILE_RESULT path: src/App.tsx",
+    readFileObservation: {
+      key: "src/App.tsx::1-80::v3",
+      path: "src/App.tsx",
+      requestSignature: "1:80",
+      versionToken: "v3",
+      source: "fresh",
+    },
   }));
   rememberToolActivity(activity, result({
     name: "apply_patch",
@@ -299,6 +306,13 @@ test("tool activity tracking records bounded recent activity and helper classifi
   assert.equal(activity.length, 2);
   assert.deepEqual(activity.map((item) => item.name), ["read_file", "apply_patch"]);
   assert.equal(activity[0].detail, undefined);
+  assert.deepEqual(activity[0].readFileObservation, {
+    key: "src/App.tsx::1-80::v3",
+    path: "src/App.tsx",
+    requestSignature: "1:80",
+    versionToken: "v3",
+    source: "fresh",
+  });
   assert.match(activity[1].detail, /Applied patch/);
   assert.equal(isEditProgressResult(result({ name: "apply_patch" })), true);
   assert.equal(isEditProgressResult(result({ name: "run_command", target: "shell-write:npm test" })), true);

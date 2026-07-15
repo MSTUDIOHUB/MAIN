@@ -64,7 +64,10 @@ import {
 import {
   isReasoningDominatedLengthResult,
 } from "./orchestrator/agentRecovery";
-import type { MaxIterationsCheckpointHandling } from "./orchestrator/types";
+import type {
+  MaxIterationsCheckpointHandling,
+  ToolErrorLifecycleMeta,
+} from "./orchestrator/types";
 import {
   buildUnityApplyTextPolicyBlockedMessage,
   isUnityExecutionContext,
@@ -178,7 +181,10 @@ import {
   isApprovedPlanSourceEditFirstToolName,
 } from "./approvedPlanRecoveryTools";
 import {
+  type ExecuteRecoveryContractPhase,
   type ExecuteRecoveryMode,
+  type ExecutionDecisionCheckpoint,
+  type RecoveryReadLease,
 } from "./executeRecoveryTools";
 import { validateShellToolContract } from "./toolExecutionContract";
 import {
@@ -383,8 +389,8 @@ export function planUnsupportedToolFeedbackMessage(input: {
       .filter((name) => input.availableToolNames.includes(name));
     const alternativesText = alternatives.length > 0 ? alternatives.join(", ") : input.language === "zh" ? "已缓存上下文" : "cached context";
     return input.language === "zh"
-      ? `READ_FILE_NOT_AVAILABLE_IN_RECOVERY: read_file 在当前 ${input.runtimeIntent} 恢复步骤没有开放。请不要改用 shell/cat/sed/head/tail 读取文件；改用 ${alternativesText}，或直接基于已有缓存上下文进入 patch/验证/最终说明。`
-      : `READ_FILE_NOT_AVAILABLE_IN_RECOVERY: read_file is not exposed in the current ${input.runtimeIntent} recovery step. Do not switch to shell/cat/sed/head/tail file reads; use ${alternativesText}, or proceed from cached context to patching, validation, or the final answer.`;
+      ? `READ_SCOPE_DEFERRED: 当前事务的下一能力不是这个 read_file 调用。若目标文件版本已变化、所需范围尚未观察或上下文窗口已淘汰，请在对应读取阶段重新发起定向读取；否则使用 ${alternativesText} 继续当前阶段。不要用 shell/cat/sed/head/tail 绕过文件读取契约。`
+      : `READ_SCOPE_DEFERRED: This read_file call is not the current transaction's next capability. Request a targeted read in the matching read phase when the file version changed, a required range is missing, or the context window was evicted; otherwise continue the current phase with ${alternativesText}. Do not bypass the file-read contract through shell/cat/sed/head/tail.`;
   }
 
   return input.language === "zh"
@@ -737,6 +743,7 @@ function rebuildReadBeforeModifyEvidenceFromHistory(
           text.startsWith("PLAN_GROUNDING_TOOL_BLOCKED:") ||
           text.startsWith("PLAN_DRAFTING_TOOL_BLOCKED:") ||
           text.startsWith("PLAN_EXPLORE_STRUCTURE_TOOL_BLOCKED:") ||
+          text.startsWith("READ_SCOPE_DEFERRED:") ||
           text.startsWith("READ_FILE_NOT_AVAILABLE_IN_RECOVERY:");
         const isPruned =
           text.includes("Historical read content") &&
@@ -1321,6 +1328,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason?: string | null;
     expectedTarget?: string | null;
+    phase?: ExecuteRecoveryContractPhase;
+    phaseNoProgressCount?: number;
+    readLease?: RecoveryReadLease | null;
+    sourceObservationKey?: string | null;
+    decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   } | null;
   getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";
@@ -1349,6 +1361,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason: string;
     expectedTarget: string | null;
+    phase: ExecuteRecoveryContractPhase;
+    phaseNoProgressCount: number;
+    readLease: RecoveryReadLease | null;
+    sourceObservationKey: string | null;
+    decisionCheckpoint: ExecutionDecisionCheckpoint | null;
   }) => void;
   evaluateGoalToolResultCheckpoint?: (results: ToolExecutionResult[]) => {
     complete: boolean;
@@ -1498,7 +1515,7 @@ export interface OrchestratorCallbacks {
     toolName: string,
     target: string,
     error: string,
-    meta?: { toolCallId?: string; qualityGateReason?: string | null; planRecoveryReason?: string | null },
+    meta?: ToolErrorLifecycleMeta,
   ) => void;
 
   // Human-in-the-loop — only for write/execute tools.
@@ -3405,7 +3422,10 @@ async function writeMaterializedPlanArtifact(input: {
     };
   } catch (error) {
     const message = getErrorMessage(error, "Failed to write materialized plan artifact");
-    input.callbacks.onToolError("write_file", materialized.path, message, { toolCallId });
+    input.callbacks.onToolError("write_file", materialized.path, message, {
+      toolCallId,
+      failureKind: "actual",
+    });
     return {
       ok: false,
       path: materialized.path,
@@ -4087,7 +4107,10 @@ async function executeToolCallWithLifecycle(
         const failureContent = buildBrowserValidationFailureContent(resultStr);
         const modelFailureContent = truncateToolContent(failureContent, budgets.modelChars);
         const displayFailureContent = truncateToolContent(failureContent, budgets.displayChars);
-        callbacks.onToolError(tc.name, target, displayFailureContent, { toolCallId: tc.id });
+        callbacks.onToolError(tc.name, target, displayFailureContent, {
+          toolCallId: tc.id,
+          failureKind: "actual",
+        });
         const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
           toolName: tc.name,
           toolArgs: resolvedArgs,
@@ -4169,7 +4192,10 @@ async function executeToolCallWithLifecycle(
         verificationPath: mutationVerificationPath,
         result: resultStr,
       });
-      callbacks.onToolError(tc.name, target, noEffectMessage, { toolCallId: tc.id });
+      callbacks.onToolError(tc.name, target, noEffectMessage, {
+        toolCallId: tc.id,
+        failureKind: "actual",
+      });
       const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
         toolName: tc.name,
         toolArgs: resolvedArgs,
@@ -4421,7 +4447,10 @@ async function executeToolCallWithLifecycle(
         ],
       };
     }
-    callbacks.onToolError(tc.name, target, errorMsg, { toolCallId: tc.id });
+    callbacks.onToolError(tc.name, target, errorMsg, {
+      toolCallId: tc.id,
+      failureKind: "actual",
+    });
     const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
       toolName: tc.name,
       toolArgs: resolvedArgs,

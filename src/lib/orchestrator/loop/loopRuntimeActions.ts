@@ -3,6 +3,7 @@ import {
   shouldAllowExecuteRecoveryFileRead,
   summarizeRepeatedExecuteTargets,
   type ExecuteRecoveryMode,
+  type RecoveryReadLease,
 } from "../../executeRecoveryTools";
 import {
   logAgentEvent,
@@ -10,6 +11,7 @@ import {
 import { buildPlanRuntimeCapsuleNarration } from "../../orchestrator/planOrchestration";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { PlanRuntimePhase } from "../../workflowModels";
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import type { OrchestratorCallbacks } from "../types";
 import {
   activateExecuteRecoveryRuntimeState,
@@ -52,6 +54,26 @@ export interface AgentLoopRuntimeActions {
     status?: "pending" | "running" | "done" | "failed",
     qualitySnapshot?: PlanRuntimePhaseQualitySnapshot,
   ) => void;
+}
+
+function requestedRangeFromObservationSignature(
+  requestSignature: string,
+): RecoveryReadLease["requestedRange"] {
+  const argsSeparator = requestSignature.lastIndexOf("::");
+  if (argsSeparator < 0) return null;
+  try {
+    const entries = JSON.parse(requestSignature.slice(argsSeparator + 2));
+    if (!Array.isArray(entries)) return null;
+    const args = Object.fromEntries(entries) as Record<string, unknown>;
+    const requestedRange = {
+      ...(Number.isFinite(args.start_line) ? { startLine: Number(args.start_line) } : {}),
+      ...(Number.isFinite(args.end_line) ? { endLine: Number(args.end_line) } : {}),
+      ...(Number.isFinite(args.max_lines) ? { maxLines: Number(args.max_lines) } : {}),
+    };
+    return Object.keys(requestedRange).length > 0 ? requestedRange : null;
+  } catch {
+    return null;
+  }
 }
 
 export function createAgentLoopRuntimeActions(input: {
@@ -112,9 +134,39 @@ export function createAgentLoopRuntimeActions(input: {
         : repeatedTargets.length === 1
           ? repeatedTargets[0]
           : null;
+    const explicitObservation = context.readFileObservation && typeof context.readFileObservation === "object"
+      ? context.readFileObservation as PlanToolActivitySummary["readFileObservation"]
+      : null;
+    const retainedObservation = explicitObservation || [...recentToolActivity]
+      .reverse()
+      .find((activity) =>
+        activity.readFileObservation &&
+        expectedTarget &&
+        workspacePathsReferToSameFile(activity.readFileObservation.path, expectedTarget)
+      )?.readFileObservation || null;
+    const sourceObservationKey = typeof context.sourceObservationKey === "string"
+      ? context.sourceObservationKey.trim() || null
+      : retainedObservation?.key || null;
+    const explicitReadLease = context.readLease && typeof context.readLease === "object"
+      ? context.readLease as RecoveryReadLease
+      : null;
+    const readLease: RecoveryReadLease | null = explicitReadLease || (
+      retainedObservation && expectedTarget
+        ? {
+            purpose: mode === "patch_recovery_read" ? "patch_recovery" : "context_restore",
+            target: expectedTarget,
+            requestedRange: requestedRangeFromObservationSignature(
+              retainedObservation.requestSignature,
+            ),
+            observationKey: retainedObservation.key,
+            observedVersion: retainedObservation.versionToken,
+            state: mode === "patch_recovery_read" ? "active" : "consumed",
+          }
+        : null
+    );
     const nextState = activateExecuteRecoveryRuntimeState(
       getExecuteRecoveryState(),
-      { mode, reason, expectedTarget },
+      { mode, reason, expectedTarget, readLease, sourceObservationKey },
     );
     setExecuteRecoveryState(nextState);
     logAgentEvent("execute_recovery_activated", {
@@ -122,6 +174,10 @@ export function createAgentLoopRuntimeActions(input: {
       executeRecoveryMode: nextState.mode,
       executeRecoveryAttempts: nextState.attempts,
       reason,
+      sourceObservationKey,
+      readLeasePurpose: readLease?.purpose || null,
+      readLeaseRange: readLease?.requestedRange || null,
+      observedVersion: readLease?.observedVersion || null,
       recoveryToolSurface: describeExecuteRecoveryToolSurface(
         nextState.mode,
         shouldAllowExecuteRecoveryFileRead(recentToolActivity, nextState.mode),

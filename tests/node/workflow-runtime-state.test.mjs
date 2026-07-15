@@ -120,6 +120,26 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
   );
 });
 
+test("onToolError records only explicit executor failures in the evidence ledger", () => {
+  const workflowSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const onToolErrorStart = workflowSource.indexOf("onToolError: (");
+  const onToolErrorEnd = workflowSource.indexOf("requestReview:", onToolErrorStart);
+  const onToolError = workflowSource.slice(onToolErrorStart, onToolErrorEnd);
+
+  assert.match(onToolError, /const failureKind = meta\?\.failureKind \|\| "policy"/);
+  assert.match(
+    onToolError,
+    /shouldRecordPlanExecutionFailure\(meta\)\s*\? createPlanExecutionFailureEntry/,
+  );
+  assert.match(onToolError, /const evidencePatch = failureEntry\s*\?/);
+  assert.match(onToolError, /if \(meta\?\.internalFeedback === true\)[\s\S]*return;/);
+  assert.match(
+    orchestratorSource,
+    /catch \(err\)[\s\S]*callbacks\.onToolError\(tc\.name, target, errorMsg, \{\s*toolCallId: tc\.id,\s*failureKind: "actual",/,
+  );
+});
+
 test("workflow engine closes harness from structured agent loop outcome", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
@@ -690,7 +710,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(approvedPlanNoToolRecoverySource, /approved_plan_reasoning_length_no_action/);
   assert.match(assistantCompletionPhaseSource, /handleApprovedPlanFinalization\(\{/);
   assert.match(approvedPlanFinalizationSource, /export function handleApprovedPlanFinalization/);
-  assert.match(approvedPlanFinalizationSource, /plan_execution_validation_boundary/);
+  assert.match(approvedPlanNoToolRecoverySource, /plan_execution_validation_boundary/);
   assert.match(approvedPlanFinalizationSource, /remaining_plan_tasks_limit/);
   assert.match(approvedPlanFinalizationSource, /plan_completion_guard_reprompt/);
   assert.match(approvedPlanFinalizationSource, /plan_evidence_complete/);
@@ -1046,7 +1066,7 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(guardsSource, /sawExecutionEvidence/);
   assert.match(runnerSource, /sawExecutionEvidence: orchestrator\.hasExecuteOperationEvidence\(\)/);
   assert.match(guardsSource, /execute_completion_outcome_without_evidence/);
-  assert.match(guardsSource, /reason: "execution_evidence_required"/);
+  assert.match(guardsSource, /"execution_evidence_required"/);
   assert.match(source, /handleToolIterationPhase\(\{/);
   assert.match(source, /markExecuteOperationEvidence/);
   assert.match(toolIterationPhaseSource, /executeToolCallPhase\(input\)/);
@@ -1110,7 +1130,14 @@ test("workflow engine owns one hidden auto-resume at max-iteration checkpoints",
   assert.match(planHandler, /executionConsentGranted: true/);
   assert.match(executeHandler, /buildExecuteMaxIterationsResumePrompt/);
   assert.match(executeHandler, /runtimeIntentOverride: "execute"/);
-  assert.match(executeHandler, /forceExecuteRecoveryMode: "action_plus_targeting"/);
+  assert.match(executeHandler, /resolveExecuteMaxIterationsRecoveryDecision/);
+  assert.match(executeHandler, /forceExecuteRecoveryMode: executeRecoveryDecision\.mode/);
+  assert.match(executeHandler, /forceExecuteRecoveryState: forcedExecuteRecoveryState/);
+  assert.match(executeHandler, /latestExecuteRecoveryState\?\.expectedTarget/);
+  assert.match(executeHandler, /readLease: latestExecuteRecoveryState\?\.readLease \|\| null/);
+  assert.match(executeHandler, /sourceObservationKey: latestExecuteRecoveryState\?\.sourceObservationKey \|\| null/);
+  assert.match(executeHandler, /phaseNoProgressCount: recoveryPhaseChanged/);
+  assert.doesNotMatch(executeHandler, /forceExecuteRecoveryMode: "action_plus_targeting"/);
   assert.match(executeHandler, /executionConsentGranted: true/);
   assert.notEqual(terminalStart, -1);
   assert.notEqual(terminalEnd, -1);

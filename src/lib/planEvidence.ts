@@ -1,6 +1,9 @@
 import { extractPrimaryUserRequestText } from "./turnIntake";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
-import { analyzePtyObservationResult } from "./devServerRuntime";
+import {
+  analyzePtyObservationResult,
+  classifyPtyCommandFailure,
+} from "./devServerRuntime";
 import {
   normalizePlanEvidenceValue,
   requiresPtyObservationForPlanCommand,
@@ -84,6 +87,8 @@ const SOURCE_TARGET_RE = /\.(?:tsx?|jsx?|mjs|cjs|rs|py|go|swift|java|kt|cs|cpp|c
 const PLAN_PATH_RE = /(?:^|[\\/])\.MAIN[\\/]plans[\\/]/i;
 const LOW_SIGNAL_TARGET_RE = /(?:^|[\\/])(?:package-lock\.json|pnpm-lock\.yaml|yarn\.lock)$/i;
 const PATH_LIKE_RE = /(?:^|[\s`'"(])([A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z0-9]+)(?=$|[\s`'"),:;])/g;
+const OBJECTIVE_SOURCE_REFERENCE_RE = /(?:\.{1,2}\/|[A-Za-z0-9_.@-]+\/)*[A-Za-z0-9_.-]+\.(?:tsx?|jsx?|mjs|cjs|rs|py|go|swift|java|kt|cs|cpp|c|h|hpp|vue|svelte|css|scss|html|json|toml|ya?ml)/gi;
+const OBJECTIVE_MUTATION_VERB_RE = /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|替换|重构|删除|创建|implement|change|update|modify|fix|add|replace|refactor|delete|create)/gi;
 const MAX_PLAN_EVIDENCE_FACTS = 24;
 
 function stableHash(value: string): string {
@@ -145,6 +150,60 @@ function objectiveMentionsTarget(objective: string, target: string): boolean {
   const normalizedTarget = target.replace(/\\/g, "/").toLowerCase();
   const basename = normalizedTarget.split("/").pop() || normalizedTarget;
   return normalizedObjective.includes(normalizedTarget) || (!!basename && normalizedObjective.includes(basename));
+}
+
+function objectiveAssignsMutationToTarget(objective: string, target: string): boolean {
+  const normalizedTarget = target.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+  const targetBasename = normalizedTarget.split("/").pop() || normalizedTarget;
+  const referenceMatchesTarget = (reference: string) => {
+    const normalizedReference = reference.replace(/\\/g, "/").replace(/^\.\//, "").toLowerCase();
+    return normalizedReference === normalizedTarget ||
+      (!normalizedReference.includes("/") && normalizedReference === targetBasename);
+  };
+
+  // Clause boundaries separate requests such as "inspect A and B, fix B".
+  // Inside a mutation clause the first path after the action verb owns the
+  // change; immediately coordinated paths ("A and B") share ownership, while
+  // later contract references ("change A to match B") do not.
+  for (const clause of String(objective || "").split(/[\n。；;，,]+/)) {
+    const references = [...clause.matchAll(new RegExp(OBJECTIVE_SOURCE_REFERENCE_RE.source, "gi"))]
+      .map((match) => ({
+        value: String(match[0] || ""),
+        start: match.index || 0,
+        end: (match.index || 0) + String(match[0] || "").length,
+      }));
+    if (references.length === 0) continue;
+    for (const verb of clause.matchAll(new RegExp(OBJECTIVE_MUTATION_VERB_RE.source, "gi"))) {
+      const verbStart = verb.index || 0;
+      const verbEnd = verbStart + String(verb[0] || "").length;
+      const following = references.filter((reference) => reference.start >= verbEnd);
+      if (following.length > 0 && following[0].start - verbEnd <= 100) {
+        const owned = [following[0]];
+        for (let index = 1; index < following.length; index += 1) {
+          const previous = owned[owned.length - 1];
+          const connector = clause.slice(previous.end, following[index].start)
+            .replace(/[`'"“”‘’\s]/g, "");
+          if (!/^(?:、|和|与|及|&|and)$/i.test(connector)) break;
+          owned.push(following[index]);
+        }
+        if (owned.some((reference) => referenceMatchesTarget(reference.value))) return true;
+      }
+
+      const precedingReferences = references.filter((reference) => reference.end <= verbStart);
+      const preceding = precedingReferences[precedingReferences.length - 1];
+      if (preceding) {
+        const relation = clause.slice(preceding.end, verbStart);
+        if (
+          relation.length <= 48 &&
+          /(?:需要|需|应该|应当|必须|待|needs?(?:\s+to)?|should|must|to\s+be)\s*$/i.test(relation) &&
+          referenceMatchesTarget(preceding.value)
+        ) {
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 function summaryExposesTargetDefect(summary: string): boolean {
@@ -398,7 +457,7 @@ function factIsChangeTargetForContractMismatch(
 
 function isActionableChangeTarget(fact: PlanEvidenceFact, objective: string): boolean {
   if (!SOURCE_TARGET_RE.test(fact.target) || LOW_SIGNAL_TARGET_RE.test(fact.target)) return false;
-  if (!objectiveMentionsTarget(objective, fact.target) && !summaryExposesTargetDefect(fact.summary)) return false;
+  if (!objectiveAssignsMutationToTarget(objective, fact.target) && !summaryExposesTargetDefect(fact.summary)) return false;
   const normalizedTarget = fact.target.replace(/\\/g, "/").toLowerCase();
   if (normalizedTarget.endsWith("/package.json") || normalizedTarget === "package.json") {
     return /dependency|dependencies|script|plugin|exports|module|version|package manager|依赖|脚本|插件|导出|模块|版本/i.test(fact.summary) &&
@@ -831,6 +890,29 @@ export function createPlanExecutionEvidenceEntry(input: {
   }
   if (COMMAND_EVIDENCE_TOOLS.has(input.toolName)) {
     if (!commandResultLooksSuccessful(input.toolName, input.result)) {
+      if (input.toolName === "execute_command") {
+        const semantics = classifyPtyCommandFailure(input.result);
+        // PTY_BUSY is lifecycle evidence: the existing foreground process must
+        // be observed. It is neither a port-conflict failure nor successful
+        // validation of the requested launch.
+        if (semantics.kind === "pty_occupied") {
+          return {
+            ...base,
+            kind: "cmd",
+            observationStatus: "running",
+            terminalBusy: true,
+          };
+        }
+        // Preserve real launch failures in the ordered ledger so completion
+        // cannot erase them. Address-in-use remains unconfirmed until an
+        // existing service is probed and observed healthy.
+        return {
+          ...base,
+          kind: "cmd",
+          observationStatus: "failed",
+          ...(semantics.portConflict ? { portConflict: true } : {}),
+        };
+      }
       if (
         input.toolName !== "run_command" ||
         classifyFailedFiniteValidationOutcome({ result: input.result }) !== "validation_failure"
@@ -846,12 +928,23 @@ export function createPlanExecutionEvidenceEntry(input: {
         observationStatus: "failed",
       };
     }
+    const ptyRuntime = input.toolName === "execute_command"
+      ? analyzePtyObservationResult(input.result)
+      : null;
     return {
       ...base,
       kind: "cmd",
       ...(input.toolName === "execute_command" && requiresPtyObservationForPlanCommand(target)
         ? { observationStatus: "pending" as const }
         : {}),
+      ...(ptyRuntime?.foregroundGeneration !== undefined
+        ? { foregroundGeneration: ptyRuntime.foregroundGeneration }
+        : {}),
+      ...(ptyRuntime?.outputSequence !== undefined
+        ? { outputSequence: ptyRuntime.outputSequence }
+        : {}),
+      ...(ptyRuntime?.terminalBusy ? { terminalBusy: true } : {}),
+      ...(ptyRuntime?.portConflict ? { portConflict: true } : {}),
     };
   }
   if (PTY_OBSERVATION_EVIDENCE_TOOLS.has(input.toolName)) {
@@ -861,6 +954,14 @@ export function createPlanExecutionEvidenceEntry(input: {
       kind: observation.status === "ready" && observation.url ? "dev_server_url" : "tool",
       value: observation.status === "ready" && observation.url ? observation.url : target,
       observationStatus: observation.status,
+      ...(observation.foregroundGeneration !== undefined
+        ? { foregroundGeneration: observation.foregroundGeneration }
+        : {}),
+      ...(observation.outputSequence !== undefined
+        ? { outputSequence: observation.outputSequence }
+        : {}),
+      ...(observation.terminalBusy ? { terminalBusy: true } : {}),
+      ...(observation.portConflict ? { portConflict: true } : {}),
     };
   }
   if (sourceToolLooksLikeBrowserAutomation(input.toolName)) {
@@ -875,6 +976,63 @@ export function createPlanExecutionEvidenceEntry(input: {
   return null;
 }
 
+/**
+ * Build a durable negative-evidence entry after the lifecycle classification
+ * has passed `shouldRecordPlanExecutionFailure`. Failed records cannot satisfy
+ * Plan acceptance criteria, but a later matching success can reconcile them
+ * deterministically.
+ */
+export function createPlanExecutionFailureEntry(input: {
+  toolName: string;
+  target: string;
+  error: string;
+}): PlanExecutionEvidenceEntry | null {
+  const target = String(input.target || "").trim();
+  if (!target || isPlanArtifactPath(target)) return null;
+  const timestamp = Date.now();
+  const base = {
+    id: `failure-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+    value: target,
+    target,
+    references: extractWorkspaceFileReferences(target, input.error),
+    sourceTool: input.toolName,
+    createdAt: timestamp,
+  };
+  if (input.toolName === "execute_command") {
+    const semantics = classifyPtyCommandFailure(input.error);
+    if (semantics.kind === "pty_occupied") {
+      return {
+        ...base,
+        kind: "cmd",
+        observationStatus: "running",
+        terminalBusy: true,
+      };
+    }
+    return {
+      ...base,
+      kind: "cmd",
+      observationStatus: "failed",
+      ...(semantics.portConflict ? { portConflict: true } : {}),
+    };
+  }
+  if (input.toolName === "run_command") {
+    return { ...base, kind: "cmd", observationStatus: "failed" };
+  }
+  return { ...base, kind: "tool", observationStatus: "failed" };
+}
+
+/**
+ * Only failures emitted by the real executor are durable negative evidence.
+ * Preflight/policy feedback and internal recovery feedback describe harness
+ * control flow, not a failed attempt against the user's acceptance criteria.
+ */
+export function shouldRecordPlanExecutionFailure(meta?: {
+  failureKind?: "actual" | "policy";
+  internalFeedback?: boolean;
+}): boolean {
+  return meta?.failureKind === "actual" && meta.internalFeedback !== true;
+}
+
 export function appendPlanEvidenceEntry(
   ledger: PlanExecutionEvidenceEntry[],
   entry: PlanExecutionEvidenceEntry | null,
@@ -884,6 +1042,13 @@ export function appendPlanEvidenceEntry(
   // facts. Keeping only the first identical value lets an old ready state
   // satisfy a later restart, so always retain their latest bounded sequence.
   if (
+    entry.observationStatus === "failed" ||
+    entry.observationStatus === "running" ||
+    entry.kind === "file" ||
+    entry.kind === "deliverable" ||
+    entry.kind === "browser_dom" ||
+    entry.kind === "browser_screenshot" ||
+    entry.kind === "tauri_required" ||
     entry.sourceTool === "run_command" ||
     entry.sourceTool === "execute_command" ||
     PTY_OBSERVATION_EVIDENCE_TOOLS.has(entry.sourceTool)

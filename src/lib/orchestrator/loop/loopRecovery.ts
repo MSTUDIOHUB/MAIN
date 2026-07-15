@@ -28,6 +28,7 @@ import {
   buildExecuteValidationRecoveryPrompt,
   isExecutePatchMismatchRecoveryActivity,
   isReadOnlyNoProgressDetail,
+  resolveExecuteRecoveryActionContract,
   resolveExecuteReadOnlyRecoveryTrigger,
   resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
@@ -864,8 +865,8 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
       callbacks.appendMessage({
         role: "system",
         content: callbacks.getPreferredLanguage() === "zh"
-          ? "[System: 已解除文件读取恢复模式限制。请切至变动修改或运行验证命令，避免重复读取同一文件。]"
-          : "[System: Read-only recovery restriction lifted. Avoid re-reading identical files; pivot to editing or validation.]",
+          ? "[System: 已重置连续读取失败计数并恢复普通工具面。请根据文件版本和缺失行范围决定是否需要一次定向读取；不要重复请求同一未变化窗口。]"
+          : "[System: Consecutive read failures were reset and the normal tool surface restored. Use the file version and missing line range to decide whether one targeted read is needed; do not repeat the same unchanged window.]",
       });
       return {
         executeRecoveryMode,
@@ -875,7 +876,10 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
     }
 
     const usedTools = results.map((result) => result.name).filter(Boolean).join(", ");
-    const recoveryPrompt = "[System: read_file is not available in the current recovery mode. You have attempted to read multiple times and the tool has blocked this action. Immediately act with available tools: use replace_in_file, write_file, apply_patch to edit code, or execute_command to run validation. Do not attempt read_file again.]";
+    const recoveryContract = resolveExecuteRecoveryActionContract(executeRecoveryMode);
+    const recoveryPrompt = callbacks.getPreferredLanguage() === "zh"
+      ? `[System: READ_SCOPE_DEFERRED：上一个 read_file 没有产生新的目标源码证据。当前阶段为 ${recoveryContract.phase}，下一能力为 ${recoveryContract.nextRequiredCapability}。如果目标文件版本已变化、上下文缺失或需要新区间，可对当前事务目标再发起一次定向读取；否则复用已有观察并执行修改或验证。不要重复同一未变化窗口，也不要用 shell 读取绕行。]`
+      : `[System: READ_SCOPE_DEFERRED: The previous read_file produced no new target-source evidence. The current phase is ${recoveryContract.phase} and the next capability is ${recoveryContract.nextRequiredCapability}. If the target version changed, context was evicted, or a different range is missing, issue one targeted read for the transaction target; otherwise reuse the current observation and mutate or validate. Do not repeat the same unchanged window or bypass this with shell reads.]`;
     callbacks.appendMessage({ role: "user", content: recoveryPrompt });
     logAgentEvent("blocked_read_file_recovery_prompt_injected", {
       iteration,

@@ -9,11 +9,147 @@ import {
   type PlanExecutionProgressUpdate,
   type PlanTask,
 } from "./workflowModels";
+import type { FileReadObservationIdentity } from "./orchestrator/fileReadCache";
 import type { MainThreadProgressUpdate } from "./turnEvents";
-import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
+import {
+  isReadOnlyNoProgressDetail,
+  type ExecuteRecoveryMode,
+  type ForcedExecuteRecoveryRuntimeState,
+} from "./executeRecoveryTools";
 import { isPlanReadOnlyToolName } from "./planReadOnlyConvergence";
+import {
+  buildExecuteEvidenceClosureAudit,
+  type ExecuteEvidenceGap,
+} from "./verificationEvidence";
+import { isWorkspaceMutationToolName } from "./workspaceMutationTools";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
+
+export interface ExecuteMaxIterationsRecoveryDecision {
+  mode: ExecuteRecoveryMode;
+  gap: ExecuteEvidenceGap;
+  reason: string;
+}
+
+const PTY_OBSERVATION_TOOL_NAMES = new Set([
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+]);
+
+/**
+ * Rebuild the first recovery capability at an Execute iteration boundary from
+ * the append-only evidence ledger. A fixed action/mutation mode loses causal
+ * state when the previous loop already mutated a file and only validation (or
+ * PTY/browser observation) remains.
+ */
+export function resolveExecuteMaxIterationsRecoveryDecision(input: {
+  evidenceLedger: PlanExecutionEvidenceEntry[];
+  recoveryState?: ForcedExecuteRecoveryRuntimeState | null;
+}): ExecuteMaxIterationsRecoveryDecision {
+  const ledger = Array.isArray(input.evidenceLedger) ? input.evidenceLedger : [];
+  const closure = buildExecuteEvidenceClosureAudit({
+    ledger,
+    validationExpected: true,
+  });
+
+  const postMutationReadLease = input.recoveryState?.readLease;
+  if (
+    postMutationReadLease?.purpose === "post_mutation_verify" &&
+    (postMutationReadLease.state === "available" || postMutationReadLease.state === "active")
+  ) {
+    return {
+      mode: "validation_only",
+      gap: closure.gap,
+      reason: "max_iterations_post_mutation_check_required",
+    };
+  }
+
+  if (closure.gap === "validation_after_mutation_required") {
+    return {
+      mode: "finite_validation_only",
+      gap: closure.gap,
+      reason: "max_iterations_validation_after_mutation",
+    };
+  }
+  if (
+    closure.gap === "pty_observation_required" ||
+    closure.gap === "browser_validation_required"
+  ) {
+    // validation_only is refined by RecoveryActionContract from the retained
+    // PTY generation/readiness ledger into observe_pty or browser_validation.
+    return {
+      mode: "validation_only",
+      gap: closure.gap,
+      reason: closure.gap === "pty_observation_required"
+        ? "max_iterations_pty_observation_required"
+        : "max_iterations_browser_validation_required",
+    };
+  }
+
+  if (closure.gap === "unreconciled_failure") {
+    const latestMutationIndex = ledger.reduce(
+      (latest, entry, index) =>
+        entry.kind === "file" || entry.kind === "deliverable" ? index : latest,
+      -1,
+    );
+    const epoch = latestMutationIndex >= 0 ? ledger.slice(latestMutationIndex) : ledger;
+    const latestFailure = [...epoch].reverse().find((entry) =>
+      entry.observationStatus === "failed" || entry.portConflict === true
+    );
+    const sourceTool = String(latestFailure?.sourceTool || "");
+    const browserFailure =
+      latestFailure?.kind === "browser_dom" ||
+      latestFailure?.kind === "browser_screenshot" ||
+      /(?:browser|playwright|puppeteer|cypress)/i.test(sourceTool);
+    const devServerFailure =
+      sourceTool === "execute_command" ||
+      PTY_OBSERVATION_TOOL_NAMES.has(sourceTool) ||
+      latestFailure?.portConflict === true;
+
+    if (browserFailure || devServerFailure) {
+      return {
+        mode: "validation_only",
+        gap: closure.gap,
+        reason: devServerFailure
+          ? "max_iterations_dev_server_reconciliation"
+          : "max_iterations_browser_validation_retry",
+      };
+    }
+    if (sourceTool === "run_command") {
+      return {
+        mode: "finite_validation_only",
+        gap: closure.gap,
+        reason: "max_iterations_finite_validation_retry",
+      };
+    }
+    if (isWorkspaceMutationToolName(sourceTool)) {
+      return {
+        mode: "action_plus_targeting",
+        gap: closure.gap,
+        reason: "max_iterations_mutation_reconciliation",
+      };
+    }
+  }
+
+  if (closure.gap === "none") {
+    // The boundary can be reached after the final validation but before the
+    // assistant emitted its conclusion. Keep the normal surface and permit a
+    // text-only synthesis; forcing another mutation would reopen completed work.
+    return {
+      mode: "normal",
+      gap: closure.gap,
+      reason: "max_iterations_evidence_complete",
+    };
+  }
+
+  return {
+    mode: "action_plus_targeting",
+    gap: closure.gap,
+    reason: "max_iterations_action_recovery",
+  };
+}
 
 export type ApprovedPlanSameTurnFallbackDecision =
   | "start"
@@ -89,6 +225,8 @@ export interface PlanToolActivitySummary {
   status: PlanToolActivityStatus;
   detail?: string;
   facts?: string[];
+  /** Exact versioned read window retained across checkpoints and compaction. */
+  readFileObservation?: FileReadObservationIdentity;
 }
 
 export interface PlanMaxIterationsCheckpoint {
@@ -139,7 +277,10 @@ function summarizeEvidence(entry: PlanExecutionEvidenceEntry): string {
 function summarizeToolActivity(activity: PlanToolActivitySummary): string {
   const target = activity.target ? ` ${activity.target}` : "";
   const detail = activity.detail ? ` - ${activity.detail}` : "";
-  return compactLine(`${activity.status}:${activity.name}${target}${detail}`);
+  const observation = activity.readFileObservation
+    ? ` [read=${activity.readFileObservation.source}; version=${activity.readFileObservation.versionToken}; request=${activity.readFileObservation.requestSignature}]`
+    : "";
+  return compactLine(`${activity.status}:${activity.name}${target}${observation}${detail}`);
 }
 
 export function isCachedReadOnlyPlanActivity(activity: PlanToolActivitySummary): boolean {
@@ -167,9 +308,31 @@ export function buildPlanProgressSignatureFromToolActivity(
     .slice(-6)
     .map((item) => {
       const cached = isCachedReadOnlyPlanActivity(item) ? "cached" : "fresh";
-      return `${item.name}:${normalizeMatchText(item.target || "")}:${item.status}:${cached}`;
+      const observation = item.readFileObservation;
+      return `${item.name}:${normalizeMatchText(item.target || "")}:${item.status}:${cached}:${observation?.key || observation?.versionToken || "none"}`;
     })
     .join("|");
+}
+
+function summarizeObservedToolActivity(
+  activity: PlanToolActivitySummary[],
+  limit = 8,
+): string[] {
+  return activity
+    .filter((item) =>
+      item.status === "succeeded" &&
+      !isInternalPlanPath(item.target) &&
+      !isCachedReadOnlyPlanActivity(item)
+    )
+    .slice(-limit)
+    .map((item) => item.readFileObservation
+      ? compactLine(
+          `observed:${item.readFileObservation.path} version=${item.readFileObservation.versionToken} ` +
+          `request=${item.readFileObservation.requestSignature} source=${item.readFileObservation.source}`,
+        )
+      : compactLine(`observed_activity:${item.name}:${item.target || "(no target)"}`)
+    )
+    .filter(Boolean);
 }
 
 export function buildPlanNoProgressLoopPauseNotice(input: {
@@ -630,6 +793,7 @@ export function buildPlanMaxIterationsCheckpoint(input: {
   });
   const remaining = audit.remainingTasks;
   const completedEvidence = summarizeCompletedPlanExecutionEvidence(input.evidenceLedger);
+  const observedActivity = summarizeObservedToolActivity(input.recentToolActivity);
   const currentTask = remaining[0]
     ? summarizeTask(remaining[0])
     : "No task with unsatisfied evidence was found; verify the runtime task list and current workspace state. tasks.md is optional; do not read it just to check existence.";
@@ -647,7 +811,7 @@ export function buildPlanMaxIterationsCheckpoint(input: {
       8,
     ),
     completedEvidence: topLines(
-      completedEvidence,
+      completedEvidence.length > 0 ? completedEvidence : observedActivity,
       "No trusted project-source evidence yet.",
       8,
     ),

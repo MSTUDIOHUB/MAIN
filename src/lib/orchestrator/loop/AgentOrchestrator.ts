@@ -27,6 +27,8 @@ import { completeAssistantTurn } from "./finalTurnCompletion";
 import { buildApprovedPlanEvidenceCompletionMessage } from "./approvedPlanFinalization";
 import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
+import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
+import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -34,6 +36,7 @@ export class AgentOrchestrator {
     private sawExecutionEvidence = false;
     private latestTurnContract: EffectiveTurnContract | null = null;
     private latestRunPauseReason: string | null = null;
+    private latestExecuteRecoveryState: ExecuteRecoveryRuntimeState | null = null;
     private loopThread: LegacyConversationThread | null = null;
     private activeTurnEvents: TurnEventEmitter | null = null;
 
@@ -49,6 +52,10 @@ export class AgentOrchestrator {
         return this.latestRunPauseReason;
     }
 
+    getLatestExecuteRecoveryState(): ExecuteRecoveryRuntimeState | null {
+        return this.latestExecuteRecoveryState;
+    }
+
     failActiveRun(message: string): void {
         this.activeTurnEvents?.emitTurnFailedEvent(message);
     }
@@ -57,6 +64,7 @@ export class AgentOrchestrator {
         this.sawExecutionEvidence = false;
         this.latestTurnContract = null;
         this.latestRunPauseReason = null;
+        this.latestExecuteRecoveryState = null;
         const runtimeState = await prepareAgentLoopRuntimeState(callbacks);
         const {
           config,
@@ -143,10 +151,34 @@ export class AgentOrchestrator {
           unityMcpRuntimeState: initialUnityMcpRuntimeState,
         });
         const publishExecuteRecoveryState = () => {
+          this.latestExecuteRecoveryState = {
+            ...loopState.executeRecoveryState,
+            readLease: loopState.executeRecoveryState.readLease
+              ? { ...loopState.executeRecoveryState.readLease }
+              : null,
+            decisionCheckpoint: loopState.executeRecoveryState.decisionCheckpoint
+              ? { ...loopState.executeRecoveryState.decisionCheckpoint }
+              : null,
+          };
+          const contract = resolveExecuteRecoveryActionContract(
+            loopState.executeRecoveryState.mode,
+            {
+              expectedTarget: loopState.executeRecoveryState.expectedTarget,
+              readLease: loopState.executeRecoveryState.readLease,
+              sourceObservationKey: loopState.executeRecoveryState.sourceObservationKey,
+              decisionCheckpoint: loopState.executeRecoveryState.decisionCheckpoint,
+              phaseNoProgressCount: loopState.executeRecoveryState.phaseNoProgressCount,
+            },
+          );
           callbacks.onExecuteRecoveryStateChange?.({
             mode: loopState.executeRecoveryState.mode,
             reason: loopState.executeRecoveryState.reason,
             expectedTarget: loopState.executeRecoveryState.expectedTarget,
+            phase: contract.phase,
+            phaseNoProgressCount: loopState.executeRecoveryState.phaseNoProgressCount,
+            readLease: loopState.executeRecoveryState.readLease,
+            sourceObservationKey: loopState.executeRecoveryState.sourceObservationKey,
+            decisionCheckpoint: loopState.executeRecoveryState.decisionCheckpoint,
           });
         };
         publishExecuteRecoveryState();
@@ -371,7 +403,7 @@ export class AgentOrchestrator {
         this.loopThread = turnIterationContext.thread;
 
         // ── Pre-LLM Turn Preparation ──
-        const iterationStreamPreparation = prepareIterationStreamRequest({
+        const iterationStreamPreparation = await prepareIterationStreamRequest({
           callbacks,
           runtimeState,
           iteration,
@@ -418,6 +450,7 @@ export class AgentOrchestrator {
           isExecuteRecoveryEligible,
           allowExecuteRecoveryFileRead,
           effectiveExecuteRecoveryFileRead,
+          recoveryActionContract,
           allowApprovedPlanRecoveryFileRead,
           iterationAllTools,
           availableToolNames,
@@ -443,6 +476,7 @@ export class AgentOrchestrator {
           executeRecoveryMode: loopState.executeRecoveryState.mode,
           executeRecoveryReason: loopState.executeRecoveryState.reason,
           allowExecuteRecoveryFileRead,
+          recoveryActionContract,
           isExecuteRecoveryEligible,
           ...loopState.approvedPlanRecoveryState,
           finalTextOnlyStep,
@@ -520,6 +554,7 @@ export class AgentOrchestrator {
           pauseForReviewablePlanArtifact,
           tryClosePlanWithEvidence,
           waitForPlanApprovalIfNeeded,
+          getExecuteRecoveryState: () => loopState.executeRecoveryState,
         });
         applyAssistantIterationMutableState(loopState, assistantIterationPhase);
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
@@ -615,11 +650,13 @@ export class AgentOrchestrator {
           const audit = toolIterationPhase.completionAudit || {
             completedCount: callbacks.getPlanTasks().length,
             totalCount: callbacks.getPlanTasks().length,
+            pendingUserValidationTasks: [],
           };
           const finalText = buildApprovedPlanEvidenceCompletionMessage({
             language: callbacks.getPreferredLanguage(),
             completedCount: audit.completedCount,
             totalCount: audit.totalCount,
+            pendingUserValidationTasks: audit.pendingUserValidationTasks,
           });
           callbacks.onTurnSummaryReady(finalText);
           callbacks.onAssistantFinalText(finalText, [], {

@@ -75,6 +75,12 @@ const {
   resolveRecoveryToolChoice,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"));
 const {
+  resolveExecuteRecoveryActionContract,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
+const {
+  resolveExecuteMaxIterationsRecoveryDecision,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
+const {
   APPROVED_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
   PREAPPROVAL_PLAN_STREAM_WATCHDOG_RETRY_MAX_ELAPSED_MS,
   buildApprovedPlanStreamWatchdogRecoveryPrompt,
@@ -323,6 +329,74 @@ test("local execute recovery binds the request to the current transaction tool",
     llmToolNames: ["read_file"],
     forceXmlTools: false,
     preferExplicitFunction: true,
+  }), { type: "function", function: { name: "read_file" } });
+});
+
+test("local max-iteration continuation binds the first post-mutation action to run_command", () => {
+  const decision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [{
+      id: "mutation-before-boundary",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }],
+  });
+
+  assert.equal(decision.mode, "finite_validation_only");
+  assert.deepEqual(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: decision.mode,
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["read_file", "run_command"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+  }), { type: "function", function: { name: "run_command" } });
+});
+
+test("local recovery tool choice follows the contract next capability, not the legacy mode label", () => {
+  const common = {
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: "action_plus_targeting",
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+  };
+  const observePty = resolveExecuteRecoveryActionContract("action_plus_targeting", {
+    devServerStatus: "running",
+    devServerNextCapability: "observe_pty",
+  });
+  assert.deepEqual(resolveRecoveryToolChoice({
+    ...common,
+    recoveryActionContract: observePty,
+    llmToolNames: ["read_pty_since", "get_pty_status"],
+  }), { type: "function", function: { name: "read_pty_since" } });
+
+  const browser = resolveExecuteRecoveryActionContract("action_plus_targeting", {
+    devServerStatus: "ready",
+    devServerNextCapability: "browser",
+  });
+  assert.deepEqual(resolveRecoveryToolChoice({
+    ...common,
+    recoveryActionContract: browser,
+    llmToolNames: ["browser_evaluate"],
+  }), { type: "function", function: { name: "browser_evaluate" } });
+
+  const postMutation = resolveExecuteRecoveryActionContract("validation_only", {
+    readLease: {
+      purpose: "post_mutation_verify",
+      target: "src/App.tsx",
+      state: "available",
+    },
+  });
+  assert.deepEqual(resolveRecoveryToolChoice({
+    ...common,
+    executeRecoveryMode: "validation_only",
+    recoveryActionContract: postMutation,
+    llmToolNames: ["read_file"],
   }), { type: "function", function: { name: "read_file" } });
 });
 

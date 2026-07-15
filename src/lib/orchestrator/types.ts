@@ -11,7 +11,12 @@ import { type ResolvedInstructionSet } from "../instructions";
 import { type HookDefinition, type HookExecutionRecord, type HookEvent } from "../hooks";
 import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "../gameStudio/catalog";
 import { type PlanMaxIterationsCheckpoint, type PlanToolActivitySummary } from "../planExecutionRecovery";
-import { type ExecuteRecoveryMode } from "../executeRecoveryTools";
+import {
+  type ExecuteRecoveryContractPhase,
+  type ExecuteRecoveryMode,
+  type ExecutionDecisionCheckpoint,
+  type RecoveryReadLease,
+} from "../executeRecoveryTools";
 import { type MainThreadEvent } from "../turnEvents";
 import { type PlanMaterializationSource } from "../planMaterialization";
 import { type ProgressNarration } from "../progressNarration";
@@ -74,6 +79,16 @@ export type MaxIterationsCheckpointHandling =
       checkpoint: PlanMaxIterationsCheckpoint;
     };
 
+export type ToolFailureKind = "actual" | "policy";
+
+export interface ToolErrorLifecycleMeta {
+  toolCallId?: string;
+  qualityGateReason?: string | null;
+  planRecoveryReason?: string | null;
+  failureKind?: ToolFailureKind;
+  internalFeedback?: boolean;
+}
+
 export interface OrchestratorCallbacks {
   // State accessors
   getMessages: () => AgentMessage[];
@@ -114,6 +129,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason?: string | null;
     expectedTarget?: string | null;
+    phase?: ExecuteRecoveryContractPhase;
+    phaseNoProgressCount?: number;
+    readLease?: RecoveryReadLease | null;
+    sourceObservationKey?: string | null;
+    decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   } | null;
   getCommandDirective?: () => CommandDirective | null;
   getWorkflowMode: () => "chat" | "edit" | "plan";
@@ -142,6 +162,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason: string;
     expectedTarget: string | null;
+    phase: ExecuteRecoveryContractPhase;
+    phaseNoProgressCount: number;
+    readLease: RecoveryReadLease | null;
+    sourceObservationKey: string | null;
+    decisionCheckpoint: ExecutionDecisionCheckpoint | null;
   }) => void;
   evaluateGoalToolResultCheckpoint?: (results: ToolExecutionResult[]) => {
     complete: boolean;
@@ -291,7 +316,7 @@ export interface OrchestratorCallbacks {
     toolName: string,
     target: string,
     error: string,
-    meta?: { toolCallId?: string; qualityGateReason?: string | null; planRecoveryReason?: string | null },
+    meta?: ToolErrorLifecycleMeta,
   ) => void;
 
   // Human-in-the-loop — only for write/execute tools.

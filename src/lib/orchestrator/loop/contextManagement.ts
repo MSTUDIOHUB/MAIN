@@ -1,7 +1,15 @@
 import type { AppConfig } from "../../appTypes";
 import { compactContextForExecuteRecovery, computeContextBudgets, manageContext } from "../../contextTrim";
-import { type ExecuteRecoveryMode } from "../../executeRecoveryTools";
-import { type FileReadState } from "../../orchestrator/fileReadCache";
+import {
+  resolveExecuteRecoveryActionContract,
+  type ExecuteRecoveryMode,
+} from "../../executeRecoveryTools";
+import {
+  buildFileReadWindowIdentity,
+  getFileReadObservationForState,
+  selectFileReadStateForRecoveryContext,
+  type FileReadState,
+} from "../../orchestrator/fileReadCache";
 import { describeExecuteRecoveryToolSurface } from "../../executeRecoveryTools";
 import {
   computeContextForceReason,
@@ -30,6 +38,50 @@ export interface IterationContextManagementResult {
   providerCompatibilityOverride: boolean | undefined;
   forceXmlTools: boolean;
   llmTools: ToolDefinition[];
+}
+
+export function buildExecuteRecoverySourceContextMessage(
+  state: FileReadState,
+  language: "zh" | "en",
+): string {
+  const observation = getFileReadObservationForState(state, "replay");
+  const window = state.window || buildFileReadWindowIdentity(state.modelContent);
+  const windowLabel = window
+    ? `${window.startLine}-${window.endLine}/${window.totalLines}`
+    : "full-or-summary";
+  const identity = `observation=${observation.key}; version=${observation.versionToken}; window=${windowLabel}`;
+  return language === "zh"
+    ? `[System: 恢复源码窗口] 以下是本次修改所依据的精确缓存窗口 (${state.path}; ${identity})。请直接基于该版本和范围修正修改；若工具报告文件版本已变化，再重新读取目标范围。\n\n${state.modelContent}`
+    : `[System: Recovery source window] This is the exact cached source window used by the pending edit (${state.path}; ${identity}). Correct the edit from this version and range; reread the target range only if the tool reports a changed file version.\n\n${state.modelContent}`;
+}
+
+export function resolveRecoverySourceContextFreshness(input: {
+  state: FileReadState;
+  currentMetadata: { path: string; sizeBytes: number; modifiedMs: number } | null;
+}): {
+  current: boolean;
+  observedVersion: string;
+  currentVersion: string | null;
+  reason: "metadata_match" | "metadata_changed" | "metadata_unavailable";
+} {
+  const observedVersion = `${input.state.sizeBytes}:${input.state.modifiedMs}`;
+  if (!input.currentMetadata) {
+    return {
+      current: false,
+      observedVersion,
+      currentVersion: null,
+      reason: "metadata_unavailable",
+    };
+  }
+  const currentVersion = `${input.currentMetadata.sizeBytes}:${input.currentMetadata.modifiedMs}`;
+  const current = input.state.sizeBytes === input.currentMetadata.sizeBytes &&
+    input.state.modifiedMs === input.currentMetadata.modifiedMs;
+  return {
+    current,
+    observedVersion,
+    currentVersion,
+    reason: current ? "metadata_match" : "metadata_changed",
+  };
 }
 
 export function advanceFileReadContextEvictionEpochs(input: {
@@ -95,6 +147,8 @@ export function prepareManagedMessagesForIteration(input: {
   isExecuteRecoveryEligible: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
+  executeRecoveryExpectedTarget?: string | null;
+  executeRecoverySourceObservationKey?: string | null;
   recentToolActivity: PlanToolActivitySummary[];
   fileReadStates: Map<string, FileReadState>;
   allowExecuteRecoveryFileRead: boolean;
@@ -113,6 +167,8 @@ export function prepareManagedMessagesForIteration(input: {
     isExecuteRecoveryEligible,
     executeRecoveryMode,
     executeRecoveryReason,
+    executeRecoveryExpectedTarget,
+    executeRecoverySourceObservationKey,
     recentToolActivity,
     fileReadStates,
     allowExecuteRecoveryFileRead,
@@ -156,9 +212,7 @@ export function prepareManagedMessagesForIteration(input: {
         workflowMode,
         isPlanApproved: callbacks.getIsPlanApproved(),
         inputBudget: contextBudgetsForManagement.inputBudget,
-        proactiveTriggerBudget: isExecuteRecoveryEligible
-          ? Math.min(16000, contextBudgetsForManagement.proactiveTriggerBudget)
-          : contextBudgetsForManagement.proactiveTriggerBudget,
+        proactiveTriggerBudget: contextBudgetsForManagement.proactiveTriggerBudget,
       })
     : null;
   let executeRecoveryContextAlreadyCompacted = false;
@@ -221,37 +275,6 @@ export function prepareManagedMessagesForIteration(input: {
       }
     }
 
-    if (executeRecoveryMode !== "normal" && recentToolActivity.length > 0) {
-      const lastActivity = recentToolActivity[recentToolActivity.length - 1];
-      if (lastActivity && lastActivity.target && lastActivity.status === "failed") {
-        const targetPath = lastActivity.target.trim().replace(/^['"]|['"]$/g, "");
-        let matchedState;
-        for (const state of fileReadStates.values()) {
-          if (targetPath.includes(state.path) || state.path.includes(targetPath)) {
-            matchedState = state;
-            break;
-          }
-        }
-        if (matchedState && matchedState.modelContent) {
-          const lines = matchedState.modelContent.split("\n");
-          const truncatedContent = lines.slice(0, 150).join("\n");
-          const isTruncated = lines.length > 150;
-          const language = callbacks.getPreferredLanguage();
-          const adaptiveMessage = language === "zh"
-            ? `[System: 恢复模式自适应上下文保留] 这是你最近尝试修改但失败的文件 (${matchedState.path}) 的缓存内容${isTruncated ? "（前 150 行）" : ""}：\n\n${truncatedContent}\n\n[请基于此内容重新生成正确的修改操作]`
-            : `[System: Recovery Mode Adaptive Context] Here is the cached content of the file you recently failed to edit (${matchedState.path})${isTruncated ? " (first 150 lines)" : ""}:\n\n${truncatedContent}\n\n[Please base your corrected edit on this content]`;
-          managedAgentMessages = [
-            ...managedAgentMessages,
-            { role: "system", content: adaptiveMessage } as AgentMessage,
-          ];
-          logAgentEvent("execute_recovery_adaptive_context_injected", {
-            iteration,
-            target: matchedState.path,
-            lines: Math.min(lines.length, 150),
-          });
-        }
-      }
-    }
     executeRecoveryContextAlreadyCompacted = true;
     logAgentEvent("execute_recovery_context_compacted", {
       iteration,
@@ -265,6 +288,10 @@ export function prepareManagedMessagesForIteration(input: {
       droppedMessageCount: recoveryManagedResult.droppedMessageCount,
       tokenBefore: Math.round(recoveryManagedResult.tokenCountBefore),
       tokenAfter: Math.round(recoveryManagedResult.tokenCountAfter),
+      tokenReduction: Math.round(recoveryManagedResult.tokenReduction),
+      compressionRatio: recoveryManagedResult.tokenCountBefore > 0
+        ? Number((recoveryManagedResult.tokenReduction / recoveryManagedResult.tokenCountBefore).toFixed(3))
+        : 0,
       toolResultMessagesAfter: managedAgentMessages.filter((message) => message.role === "tool").length,
       toolCharsAfter: managedAgentMessages.reduce((sum, message) =>
         message.role === "tool" && typeof message.content === "string"
@@ -458,6 +485,59 @@ export function prepareManagedMessagesForIteration(input: {
       toolCharsAfterPrune,
       toolCharsAfter: countToolResultChars(managedAgentMessages),
     });
+  }
+
+  const recoverySourceContract = resolveExecuteRecoveryActionContract(executeRecoveryMode);
+  if (
+    executeRecoveryMode !== "normal" &&
+    (recoverySourceContract.phase === "context" || recoverySourceContract.phase === "mutation")
+  ) {
+    const lastActivity = recentToolActivity[recentToolActivity.length - 1];
+    const failedTarget = lastActivity?.status === "failed" ? lastActivity.target : "";
+    const activityObservation = lastActivity?.readFileObservation;
+    const observationKey = executeRecoverySourceObservationKey || activityObservation?.key;
+    const targetPath = executeRecoveryExpectedTarget || failedTarget;
+    if (observationKey || targetPath) {
+      const matchedState = selectFileReadStateForRecoveryContext({
+        states: fileReadStates,
+        targetPath,
+        observationKey,
+        requestSignature: activityObservation?.requestSignature,
+        versionToken: activityObservation?.versionToken,
+      });
+      if (matchedState?.modelContent) {
+        const observation = getFileReadObservationForState(matchedState, "replay");
+        const window = matchedState.window || buildFileReadWindowIdentity(matchedState.modelContent);
+        const sourceAlreadyActive = isContentInActiveMessages(
+          matchedState.modelContent,
+          managedAgentMessages,
+        );
+        if (!sourceAlreadyActive) {
+          managedAgentMessages = [
+            ...managedAgentMessages,
+            {
+              role: "system",
+              content: buildExecuteRecoverySourceContextMessage(
+                matchedState,
+                callbacks.getPreferredLanguage(),
+              ),
+            } as AgentMessage,
+          ];
+        }
+        logAgentEvent("execute_recovery_source_context_pinned", {
+          iteration,
+          target: matchedState.path,
+          observationKey: observation.key,
+          versionToken: observation.versionToken,
+          requestSignature: observation.requestSignature,
+          windowStartLine: window?.startLine ?? null,
+          windowEndLine: window?.endLine ?? null,
+          totalLines: window?.totalLines ?? null,
+          sourceAlreadyActive,
+          contentChars: matchedState.modelContent.length,
+        });
+      }
+    }
   }
 
   const fileReadContextEvictions = advanceFileReadContextEvictionEpochs({

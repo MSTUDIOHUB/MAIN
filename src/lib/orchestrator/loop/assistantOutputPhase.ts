@@ -23,6 +23,7 @@ import type {
 } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolCallToExecute } from "../types";
 import { resolveApprovedPlanNoToolRoute } from "./approvedPlanNoToolRouting";
+import { appendApprovedPlanUserValidationConclusion } from "./approvedPlanFinalization";
 import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import { resetApprovedPlanLongReasoningNoActionCount } from "./approvedPlanRecoveryRuntime";
 import {
@@ -191,6 +192,7 @@ export function handleAssistantOutputPhase(input: {
     planTasks: callbacks.getPlanTasks(),
     evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
     userVisibleText,
+    availableToolNames: input.availableToolNames,
   });
   const approvedPlanAuditForNoTool = approvedPlanNoToolRoute.audit;
   const approvedPlanMissingTasksForNoTool =
@@ -267,6 +269,11 @@ export function handleAssistantOutputPhase(input: {
     return finishControl("continue");
   }
   let visibleAssistantText = languageRecovery.visibleAssistantText;
+  visibleAssistantText = appendApprovedPlanUserValidationConclusion({
+    text: visibleAssistantText,
+    audit: approvedPlanAuditForNoTool,
+    language: callbacks.getPreferredLanguage(),
+  });
 
   const isAllowedUnapprovedPlanDraftMutationCall = (
     call: ToolCallToExecute,

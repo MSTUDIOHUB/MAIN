@@ -10,6 +10,7 @@ import {
   isReviewablePlanStage,
   isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
+  resolveApprovedPlanValidationBoundary,
 } from "../../orchestrator";
 import { commandResultLooksSuccessful } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
@@ -23,8 +24,10 @@ import type {
   PlanExecutionProgressPhase,
   PlanExecutionProgressUpdate,
   PlanRuntimePhase,
+  PlanTask,
 } from "../../workflowModels";
 import { buildPlanTaskEvidenceAudit } from "../../workflowModels";
+import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
 import type { ApprovedPlanNoProgressDecision } from "./loopRecovery";
 import {
@@ -40,6 +43,7 @@ import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import {
   applyCrossIterationReadFileRecoveryState,
   clearExecuteRecoveryRuntimeState,
+  resolvePtyObservationPolicyDeferral,
   setRepeatedEditValidationRecoveryAttempts,
 } from "./executeRecoveryRuntime";
 import type {
@@ -70,6 +74,12 @@ import { appendToolResultsToHistory } from "./toolResultHistory";
 import type { TurnIterationContext } from "./turnIterationContext";
 
 type WorkflowMode = "chat" | "edit" | "plan";
+
+type ApprovedPlanCompletionAudit = {
+  completedCount: number;
+  totalCount: number;
+  pendingUserValidationTasks?: PlanTask[];
+};
 
 type SetPlanRuntimePhase = (
   phase: PlanRuntimePhase,
@@ -147,7 +157,7 @@ export type ToolResultRecoveryPhaseResult =
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
       approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
-      completionAudit?: { completedCount: number; totalCount: number };
+      completionAudit?: ApprovedPlanCompletionAudit;
     }
   | {
       status: "completed";
@@ -156,7 +166,7 @@ export type ToolResultRecoveryPhaseResult =
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
       approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
-      completionAudit?: { completedCount: number; totalCount: number };
+      completionAudit?: ApprovedPlanCompletionAudit;
     };
 
 export async function handleToolResultRecoveryPhase(input: {
@@ -213,7 +223,7 @@ export async function handleToolResultRecoveryPhase(input: {
   let executeRecoveryState = input.executeRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
   let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
-  let completionAudit: { completedCount: number; totalCount: number } | undefined;
+  let completionAudit: ApprovedPlanCompletionAudit | undefined;
   const activateExecuteRecoveryAndSync: ActivateExecuteRecovery = (mode, reason, context) => {
     // The callback updates the outer loop immediately. Mirror the returned
     // state locally so this phase cannot fold an older `normal` state back over
@@ -238,6 +248,31 @@ export async function handleToolResultRecoveryPhase(input: {
         : {}),
     }, { phase, reason }).state;
   };
+
+  const ptyObservationDeferral = resolvePtyObservationPolicyDeferral(input.results);
+  if (executeRecoveryState.mode === "normal" && ptyObservationDeferral) {
+    // browser_evaluate was deferred before execution because the foreground
+    // server has no ready evidence for its current PTY generation. Turn that
+    // structured policy outcome into an active recovery transaction before
+    // completion/no-progress gates run. The next iteration can then derive an
+    // observe_pty-only surface from the retained dev-server ledger; once that
+    // same generation is ready, the same contract derives browser-only.
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "validation_only",
+      "browser_validation_deferred_for_pty_observation",
+      {
+        requestedUrl: ptyObservationDeferral.requestedUrl,
+        nextCapability: "observe_pty",
+      },
+    );
+    logAgentEvent("execute_recovery_activated_from_pty_observation_deferral", {
+      iteration: input.iteration,
+      requestedUrl: ptyObservationDeferral.requestedUrl,
+      nextCapability: "observe_pty",
+      executeRecoveryMode: executeRecoveryState.mode,
+      executeRecoveryAttempts: executeRecoveryState.attempts,
+    });
+  }
 
   const planQualityRecovery = handlePlanQualityRecoveryAfterToolResults({
     callbacks: input.callbacks,
@@ -318,15 +353,27 @@ export async function handleToolResultRecoveryPhase(input: {
   // turn asking it to narrate or declare completion.  Persist the current tool
   // results first, then close the execution lease deterministically.
   if (input.workflowMode === "plan" && input.callbacks.getIsPlanApproved()) {
-    const audit = buildPlanTaskEvidenceAudit({
+    const baseAudit = buildPlanTaskEvidenceAudit({
       tasks: input.callbacks.getPlanTasks(),
       evidenceLedger: input.callbacks.getPlanExecutionEvidenceLedger(),
       highlightNext: true,
     });
+    const validationBoundary = resolveApprovedPlanValidationBoundary({
+      audit: baseAudit,
+      availableToolNames: input.availableToolNames,
+    });
+    const audit = validationBoundary === "pause_external_validation"
+      ? { ...baseAudit, acceptedCompletion: true }
+      : baseAudit;
+    const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
+      ledger: input.callbacks.getPlanExecutionEvidenceLedger(),
+      validationExpected: validationBoundary !== "pause_external_validation",
+    });
     if (
       audit.totalCount > 0 &&
-      audit.allTrustedComplete &&
-      !audit.pendingExternalValidation
+      audit.acceptedCompletion &&
+      evidenceClosureAudit.completionAllowed &&
+      executeRecoveryState.mode === "normal"
     ) {
       appendToolResultsToHistory({
         callbacks: input.callbacks,
@@ -354,10 +401,14 @@ export async function handleToolResultRecoveryPhase(input: {
         total: audit.totalCount,
         evidenceCount: input.callbacks.getPlanExecutionEvidenceLedger().length,
         modelCompletionClaimRequired: false,
+        pendingUserValidation: audit.pendingUserValidationTasks.length,
+        evidenceClosureGap: evidenceClosureAudit.gap,
+        activeRecoveryMode: executeRecoveryState.mode,
       });
       completionAudit = {
         completedCount: audit.completedCount,
         totalCount: audit.totalCount,
+        pendingUserValidationTasks: audit.pendingUserValidationTasks,
       };
       return finish("plan_completed");
     }

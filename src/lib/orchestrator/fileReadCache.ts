@@ -20,6 +20,10 @@ export interface FileReadState {
   sizeBytes: number;
   modifiedMs: number;
   modelContent: string;
+  /** Stable identity for the exact request window and file version. */
+  observation?: FileReadObservationIdentity;
+  /** Parsed source window retained with this observation, when read_file returned one. */
+  window?: FileReadWindowIdentity;
   /** Increments only when context management actually evicts this exact source window. */
   contextEvictionEpoch?: number;
   /** The eviction epoch for which the retained source was most recently replayed. */
@@ -40,12 +44,83 @@ export interface FileReadObservationIdentity {
   source: FileReadObservationSource;
 }
 
+export interface FileReadWindowIdentity {
+  startLine: number;
+  endLine: number;
+  totalLines: number;
+  truncated: boolean;
+}
+
+export type ReadFileEligibilityKind =
+  | "fresh_read"
+  | "context_replay"
+  | "unchanged_stub"
+  | "scope_deferred";
+
+export interface ReadFileEligibilityDecision {
+  kind: ReadFileEligibilityKind;
+  reason:
+    | "transaction_scope_mismatch"
+    | "recovery_read_lease"
+    | "missing_window"
+    | "content_version_changed"
+    | "context_window_evicted"
+    | "same_snapshot_window_active"
+    | "same_context_epoch_already_replayed";
+  observedVersion: string | null;
+  currentVersion: string | null;
+  contextEpoch: number;
+}
+
 export const FILE_UNCHANGED_STUB = "FILE_UNCHANGED_STUB";
 
 const MAX_FILE_READ_STATES_PER_SESSION = 240;
 const sessionFileReadStates = new Map<string, Map<string, FileReadState>>();
 
 type ReadFileWindowCoveragePlan = ReturnType<typeof planReadFileWindowCoverage>;
+
+/**
+ * Decide read eligibility before recovery-mode tool restrictions are applied.
+ * The decision depends only on transaction scope, exact window/version state,
+ * context residency, and an explicit one-shot lease.
+ */
+export function resolveReadFileEligibilityDecision(input: {
+  scopeMatches: boolean;
+  bypassCacheForLease: boolean;
+  hasCachedWindow: boolean;
+  observedVersion?: string | null;
+  currentVersion?: string | null;
+  contentInContext: boolean;
+  contextEpoch?: number;
+  replayedContextEpoch?: number | null;
+}): ReadFileEligibilityDecision {
+  const observedVersion = input.observedVersion || null;
+  const currentVersion = input.currentVersion || null;
+  const contextEpoch = Math.max(0, Math.floor(input.contextEpoch || 0));
+  const decision = (
+    kind: ReadFileEligibilityKind,
+    reason: ReadFileEligibilityDecision["reason"],
+  ): ReadFileEligibilityDecision => ({
+    kind,
+    reason,
+    observedVersion,
+    currentVersion,
+    contextEpoch,
+  });
+  if (!input.scopeMatches) return decision("scope_deferred", "transaction_scope_mismatch");
+  if (input.bypassCacheForLease) return decision("fresh_read", "recovery_read_lease");
+  if (!input.hasCachedWindow) return decision("fresh_read", "missing_window");
+  if (!observedVersion || !currentVersion || observedVersion !== currentVersion) {
+    return decision("fresh_read", "content_version_changed");
+  }
+  if (input.contentInContext) {
+    return decision("unchanged_stub", "same_snapshot_window_active");
+  }
+  if (input.replayedContextEpoch !== contextEpoch) {
+    return decision("context_replay", "context_window_evicted");
+  }
+  return decision("unchanged_stub", "same_context_epoch_already_replayed");
+}
 
 export function getSessionFileReadStates(sessionKey: string): Map<string, FileReadState> {
   const key = sessionKey || "default";
@@ -74,18 +149,53 @@ function collectMutationTargets(
   return resolveWorkspaceMutationTargets(toolName, args, fallbackTarget);
 }
 
+function normalizeChangedPaths(values: unknown): string[] {
+  if (!Array.isArray(values)) return [];
+  return [...new Set(values
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.trim())
+    .filter(Boolean))];
+}
+
+/**
+ * Read only top-level structured mutation metadata. Command stdout is opaque
+ * user output and must not be interpreted as a cache-control instruction.
+ */
+export function extractStructuredChangedPaths(
+  ...contents: Array<string | undefined>
+): string[] {
+  for (const content of contents) {
+    if (!content?.trim()) continue;
+    try {
+      const parsed = JSON.parse(content) as Record<string, unknown>;
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
+      const changedPaths = [
+        ...normalizeChangedPaths(parsed.changedPaths),
+        ...normalizeChangedPaths(parsed.changedFiles),
+      ];
+      if (changedPaths.length > 0) return [...new Set(changedPaths)];
+    } catch {
+      // Non-JSON tool output has no structured changed-path guarantee.
+    }
+  }
+  return [];
+}
+
 /**
  * A successful workspace action starts a new observation epoch. Invalidate
  * every cached range for changed files and every args-only workspace
  * observation (grep/outline/AST/repo-map/git-diff), so post-action validation
- * cannot replay old evidence even when size and mtime happen to match. Shell
- * commands are opaque and may run formatters/codegen, so they invalidate all
- * file windows conservatively.
+ * cannot replay old evidence even when size and mtime happen to match. Exact
+ * read_file windows survive opaque commands: their metadata is checked before
+ * reuse, while unversioned grep/outline/AST/repo-map/git caches are cleared.
+ * A command may invalidate exact windows only when it reports changed paths in
+ * a structured result envelope.
  */
 export function invalidateWorkspaceReadCachesAfterMutation(input: {
   toolName: string;
   args: Record<string, unknown>;
   target?: string;
+  changedPaths?: string[];
   fileReadStates: Map<string, FileReadState>;
   readOnlyResultCache?: Map<string, unknown>;
   readOnlyDuplicateSkipCounts?: Map<string, number>;
@@ -115,16 +225,13 @@ export function invalidateWorkspaceReadCachesAfterMutation(input: {
     input.args,
     String(input.target || ""),
   );
-  const invalidateAllFileReads =
-    input.toolName === "run_command" ||
-    input.toolName === "execute_command" ||
-    input.toolName === "send_pty_input";
+  const exactChangedPaths = [...new Set([
+    ...targets,
+    ...normalizeChangedPaths(input.changedPaths),
+  ])];
   const invalidatedFileReadSignatures: string[] = [];
   for (const [signature, state] of input.fileReadStates.entries()) {
-    if (
-      !invalidateAllFileReads &&
-      !targets.some((target) => workspacePathsReferToSameFile(state.path, target))
-    ) continue;
+    if (!exactChangedPaths.some((target) => workspacePathsReferToSameFile(state.path, target))) continue;
     input.fileReadStates.delete(signature);
     input.readOnlyDuplicateSkipCounts?.delete(signature);
     invalidatedFileReadSignatures.push(signature);
@@ -214,6 +321,62 @@ export function buildFileReadObservationIdentity(input: {
     ...(input.contentHash ? { contentHash: input.contentHash } : {}),
     source: input.source,
   };
+}
+
+export function buildFileReadWindowIdentity(modelContent: string): FileReadWindowIdentity | undefined {
+  const metadata = extractReadFileWindowMetadata(modelContent);
+  if (!metadata) return undefined;
+  return {
+    startLine: metadata.returnedStartLine,
+    endLine: metadata.returnedEndLine,
+    totalLines: metadata.totalLines,
+    truncated: metadata.truncated,
+  };
+}
+
+export function getFileReadObservationForState(
+  state: FileReadState,
+  source: FileReadObservationSource = "replay",
+): FileReadObservationIdentity {
+  const observation = state.observation || buildFileReadObservationIdentity({
+    requestSignature: state.signature,
+    path: state.path,
+    sizeBytes: state.sizeBytes,
+    modifiedMs: state.modifiedMs,
+    contentHash: state.contentHash,
+    source,
+  });
+  return observation.source === source ? observation : { ...observation, source };
+}
+
+/**
+ * Resolve the exact source observation to pin during edit recovery. Prefer an
+ * explicit observation/request/version identity; only fall back to the newest
+ * window for the exact same workspace path. Map insertion order breaks
+ * millisecond timestamp ties so a later targeted range wins over an older
+ * file-head read.
+ */
+export function selectFileReadStateForRecoveryContext(input: {
+  states: Map<string, FileReadState>;
+  targetPath?: string | null;
+  observationKey?: string;
+  requestSignature?: string;
+  versionToken?: string;
+}): FileReadState | null {
+  const targetPath = String(input.targetPath || "")
+    .trim()
+    .replace(/^[`'\"]+|[`'\"]+$/g, "")
+    .replace(/:(?:line\s*)?\d+(?:-\d+)?$/i, "");
+  const candidates = [...input.states.values()]
+    .map((state, index) => ({ state, index, observation: getFileReadObservationForState(state) }))
+    .filter(({ state }) => !targetPath || workspacePathsReferToSameFile(state.path, targetPath))
+    .filter(({ observation }) => !input.observationKey || observation.key === input.observationKey)
+    .filter(({ state }) => !input.requestSignature || state.signature === input.requestSignature)
+    .filter(({ observation }) => !input.versionToken || observation.versionToken === input.versionToken)
+    .sort((left, right) =>
+      right.state.updatedAt - left.state.updatedAt || right.index - left.index
+    );
+  return candidates[0]?.state || null;
 }
 
 export function buildFileUnchangedStub(state: FileReadState): string {

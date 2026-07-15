@@ -1,6 +1,17 @@
-import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
+import {
+  resolveExecuteRecoveryActionContract,
+  summarizeRepeatedExecuteTargets,
+} from "../../executeRecoveryTools";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
-import { collectPlanClosureMaterializationInput, logAgentEvent } from "../../orchestrator";
+import {
+  collectPlanClosureMaterializationInput,
+  logAgentEvent,
+  readFileMetadataIfAvailable,
+} from "../../orchestrator";
+import {
+  invalidateStaleFileReadStatesForPath,
+  selectFileReadStateForRecoveryContext,
+} from "../../orchestrator/fileReadCache";
 import {
   assessPlanClosureEvidence,
   formatPlanEvidenceBundleForModel,
@@ -13,8 +24,12 @@ import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanExecutionProgressPhase } from "../../workflowModels";
 import { generateId } from "../../utils";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
-import { prepareManagedMessagesForIteration } from "./contextManagement";
 import {
+  prepareManagedMessagesForIteration,
+  resolveRecoverySourceContextFreshness,
+} from "./contextManagement";
+import {
+  activateExecuteRecoveryRuntimeState,
   advanceExecuteRecoveryRuntimeIteration,
   buildExecuteRecoveryMaxIterationsPrompt,
   type ExecuteRecoveryRuntimeState,
@@ -96,7 +111,7 @@ export interface IterationStreamPreparationResult {
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
 }
 
-export function prepareIterationStreamRequest(input: {
+export async function prepareIterationStreamRequest(input: {
   callbacks: OrchestratorCallbacks;
   runtimeState: AgentLoopRuntimeState;
   iteration: number;
@@ -123,7 +138,7 @@ export function prepareIterationStreamRequest(input: {
   ) => ExecuteRecoveryRuntimeState;
   getMaxOutputEscalations: () => number;
   emitPlanExecutionProgress: (phase: PlanExecutionProgressPhase) => void;
-}): IterationStreamPreparationResult {
+}): Promise<IterationStreamPreparationResult> {
   const {
     callbacks,
     runtimeState,
@@ -208,6 +223,83 @@ export function prepareIterationStreamRequest(input: {
     });
   }
 
+  const recoverySourceContract = resolveExecuteRecoveryActionContract(executeRecoveryState.mode, {
+    expectedTarget: executeRecoveryState.expectedTarget,
+    readLease: executeRecoveryState.readLease,
+    sourceObservationKey: executeRecoveryState.sourceObservationKey,
+    decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
+    phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+  });
+  if (
+    executeRecoveryState.sourceObservationKey &&
+    executeRecoveryState.expectedTarget &&
+    (recoverySourceContract.phase === "context" || recoverySourceContract.phase === "mutation")
+  ) {
+    const sourceState = selectFileReadStateForRecoveryContext({
+      states: toolExecutionRuntimeState.fileReadStates,
+      targetPath: executeRecoveryState.expectedTarget,
+      observationKey: executeRecoveryState.sourceObservationKey,
+    });
+    if (sourceState) {
+      const currentMetadata = await readFileMetadataIfAvailable(sourceState.path, runtimeState.config.workspace);
+      const freshness = resolveRecoverySourceContextFreshness({
+        state: sourceState,
+        currentMetadata,
+      });
+      if (!freshness.current) {
+        const invalidatedSignatures = currentMetadata
+          ? invalidateStaleFileReadStatesForPath({
+              states: toolExecutionRuntimeState.fileReadStates,
+              path: currentMetadata.path,
+              sizeBytes: currentMetadata.sizeBytes,
+              modifiedMs: currentMetadata.modifiedMs,
+            })
+          : [...toolExecutionRuntimeState.fileReadStates.entries()]
+              .filter(([, state]) => state === sourceState)
+              .map(([signature]) => {
+                toolExecutionRuntimeState.fileReadStates.delete(signature);
+                return signature;
+              });
+        const target = executeRecoveryState.expectedTarget;
+        const nextCheckpoint = {
+          expectedTarget: target,
+          sourceObservationKey: null,
+          nextRequiredCapability: "targeted_read" as const,
+          evidenceVersion: freshness.currentVersion,
+        };
+        executeRecoveryState = {
+          ...activateExecuteRecoveryRuntimeState(executeRecoveryState, {
+            mode: "patch_recovery_read",
+            reason: "recovery_source_version_changed",
+            expectedTarget: target,
+            readLease: {
+              purpose: "context_restore",
+              target,
+              observedVersion: freshness.observedVersion,
+              state: "available",
+            },
+            decisionCheckpoint: nextCheckpoint,
+          }),
+          sourceObservationKey: null,
+          decisionCheckpoint: nextCheckpoint,
+        };
+        callbacks.appendMessage({
+          role: "system",
+          content: `RECOVERY_SOURCE_VERSION_CHANGED: The retained source observation for ${target} is no longer current (${freshness.observedVersion} -> ${freshness.currentVersion || "unknown"}). Read the exact target range again before modifying it; do not reuse the stale cached window.`,
+        });
+        logAgentEvent("execute_recovery_source_context_invalidated", {
+          iteration,
+          target,
+          reason: freshness.reason,
+          observedVersion: freshness.observedVersion,
+          currentVersion: freshness.currentVersion,
+          invalidatedCount: invalidatedSignatures.length,
+          nextCapability: "targeted_read",
+        });
+      }
+    }
+  }
+
   const toolSurfaceDecision = resolveIterationToolSurface({
     callbacks,
     iteration,
@@ -217,6 +309,10 @@ export function prepareIterationStreamRequest(input: {
     executeRecoveryMode: executeRecoveryState.mode,
     executeRecoveryReason: executeRecoveryState.reason,
     executeRecoveryAttempts: executeRecoveryState.attempts,
+    executeRecoveryExpectedTarget: executeRecoveryState.expectedTarget,
+    executeRecoveryReadLease: executeRecoveryState.readLease,
+    executeRecoverySourceObservationKey: executeRecoveryState.sourceObservationKey,
+    executeRecoveryDecisionCheckpoint: executeRecoveryState.decisionCheckpoint,
     recoveryIterationCount: executeRecoveryState.iterationCount,
     maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
     ...approvedPlanRecoveryState,
@@ -241,6 +337,8 @@ export function prepareIterationStreamRequest(input: {
     isExecuteRecoveryEligible: toolSurfaceDecision.isExecuteRecoveryEligible,
     executeRecoveryMode: executeRecoveryState.mode,
     executeRecoveryReason: executeRecoveryState.reason,
+    executeRecoveryExpectedTarget: executeRecoveryState.expectedTarget,
+    executeRecoverySourceObservationKey: executeRecoveryState.sourceObservationKey,
     recentToolActivity,
     fileReadStates: toolExecutionRuntimeState.fileReadStates,
     allowExecuteRecoveryFileRead: toolSurfaceDecision.allowExecuteRecoveryFileRead,

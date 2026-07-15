@@ -114,6 +114,257 @@ test("PTY observation uses foreground ownership instead of the persistent login 
   assert.equal(unsupportedForegroundInspection.status, "running");
 });
 
+test("PTY busy means observe the existing foreground process, not port or terminal failure", () => {
+  const busy = devServerRuntime.analyzePtyObservationResult(
+    "PTY_BUSY: integrated terminal is occupied by foreground generation=4",
+  );
+  assert.equal(busy.status, "running");
+  assert.equal(busy.terminalBusy, true);
+  assert.equal(busy.portConflict, false);
+  assert.deepEqual(
+    devServerRuntime.classifyPtyCommandFailure("PTY_BUSY: foreground process is still running"),
+    {
+      kind: "pty_occupied",
+      terminalBusy: true,
+      portConflict: false,
+      nextCapability: "observe_pty",
+    },
+  );
+  assert.deepEqual(
+    devServerRuntime.classifyPtyCommandFailure("Error: listen EADDRINUSE: address already in use"),
+    {
+      kind: "port_conflict",
+      terminalBusy: false,
+      portConflict: true,
+      nextCapability: "probe_existing_service",
+    },
+  );
+});
+
+test("dev-server lifecycle ignores stale PTY generations and opens browser only after current readiness", () => {
+  const launch = {
+    id: "launch-2",
+    kind: "cmd",
+    value: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "pending",
+    foregroundGeneration: 2,
+    outputSequence: 80,
+    createdAt: 10,
+  };
+  const staleReady = {
+    id: "ready-1",
+    kind: "dev_server_url",
+    value: "http://localhost:1111/",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 1,
+    outputSequence: 120,
+    createdAt: 11,
+  };
+  assert.deepEqual(devServerRuntime.resolveDevServerRuntimeState([launch, staleReady]), {
+    status: "pending",
+    url: null,
+    foregroundGeneration: 2,
+    outputSequence: 80,
+    terminalBusy: false,
+    portConflict: false,
+    nextCapability: "observe_pty",
+  });
+
+  const currentReady = {
+    ...staleReady,
+    id: "ready-2",
+    value: "http://localhost:1420/",
+    foregroundGeneration: 2,
+    outputSequence: 180,
+    terminalBusy: true,
+    createdAt: 12,
+  };
+  const readyState = devServerRuntime.resolveDevServerRuntimeState([launch, staleReady, currentReady]);
+  assert.equal(readyState.status, "ready");
+  assert.equal(readyState.url, "http://localhost:1420/");
+  assert.equal(readyState.nextCapability, "browser");
+  assert.equal(readyState.foregroundGeneration, 2);
+  assert.equal(readyState.outputSequence, 180);
+
+  const preflight = devServerRuntime.resolveBrowserValidationPreflight({
+    requestedUrl: "http://localhost:5173/",
+    ledger: [launch, staleReady, currentReady],
+  });
+  assert.equal(preflight.action, "correct");
+  assert.equal(preflight.url, "http://localhost:1420/");
+  assert.equal(preflight.nextCapability, "browser");
+  assert.equal(preflight.reason, null);
+});
+
+test("readiness stays sticky for one PTY generation and a healthy existing service reconciles a real port conflict", () => {
+  const launch = {
+    id: "launch",
+    kind: "cmd",
+    value: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "pending",
+    foregroundGeneration: 5,
+    createdAt: 1,
+  };
+  const ready = {
+    id: "ready",
+    kind: "dev_server_url",
+    value: "http://localhost:1420/",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 5,
+    createdAt: 2,
+  };
+  const incrementalRunning = {
+    id: "running",
+    kind: "tool",
+    value: "terminal",
+    sourceTool: "read_pty_since",
+    observationStatus: "running",
+    foregroundGeneration: 5,
+    outputSequence: 240,
+    createdAt: 3,
+  };
+  const sticky = devServerRuntime.resolveDevServerRuntimeState([launch, ready, incrementalRunning]);
+  assert.equal(sticky.status, "ready");
+  assert.equal(sticky.url, "http://localhost:1420/");
+  assert.equal(sticky.nextCapability, "browser");
+  assert.equal(sticky.outputSequence, 240);
+
+  const conflict = {
+    id: "conflict",
+    kind: "cmd",
+    value: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "failed",
+    portConflict: true,
+    createdAt: 4,
+  };
+  const conflicted = devServerRuntime.resolveDevServerRuntimeState([conflict]);
+  assert.equal(conflicted.status, "failed");
+  assert.equal(conflicted.portConflict, true);
+  assert.equal(conflicted.nextCapability, "reconcile");
+
+  const healthyProbe = {
+    id: "probe",
+    kind: "cmd",
+    value: "curl -fsS http://localhost:1420/",
+    sourceTool: "run_command",
+    createdAt: 5,
+  };
+  const reused = devServerRuntime.resolveDevServerRuntimeState([conflict, healthyProbe]);
+  assert.equal(reused.status, "ready");
+  assert.equal(reused.url, "http://localhost:1420/");
+  assert.equal(reused.portConflict, false);
+  assert.equal(reused.nextCapability, "browser");
+});
+
+test("a running execute_command starts a new generation and cannot inherit old readiness", () => {
+  const oldLaunch = {
+    id: "launch-old",
+    kind: "cmd",
+    value: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "pending",
+    foregroundGeneration: 8,
+    createdAt: 1,
+  };
+  const oldReady = {
+    id: "ready-old",
+    kind: "dev_server_url",
+    value: "http://localhost:1420/",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 8,
+    createdAt: 2,
+  };
+  const newRunningLaunch = {
+    id: "launch-new",
+    kind: "cmd",
+    value: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "running",
+    foregroundGeneration: 9,
+    outputSequence: 20,
+    createdAt: 3,
+  };
+  const staleTail = {
+    ...oldReady,
+    id: "stale-tail",
+    createdAt: 4,
+  };
+
+  const state = devServerRuntime.resolveDevServerRuntimeState([
+    oldLaunch,
+    oldReady,
+    newRunningLaunch,
+    staleTail,
+  ]);
+  assert.equal(state.status, "running");
+  assert.equal(state.url, null);
+  assert.equal(state.foregroundGeneration, 9);
+  assert.equal(state.outputSequence, 20);
+  assert.equal(state.nextCapability, "observe_pty");
+});
+
+test("PTY evidence retains generation and output cursor for resume", () => {
+  const launch = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "execute_command",
+    target: "npm run dev",
+    result: JSON.stringify({
+      command: "npm run dev",
+      output: "starting",
+      foregroundGeneration: 7,
+      endOffset: 88,
+    }),
+  });
+  assert.equal(launch.observationStatus, "pending");
+  assert.equal(launch.foregroundGeneration, 7);
+  assert.equal(launch.outputSequence, 88);
+
+  const ready = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "read_pty_since",
+    target: "terminal",
+    result: JSON.stringify({
+      text: "VITE ready in 100 ms\nLocal: http://localhost:1420/",
+      foregroundGeneration: 7,
+      endOffset: 144,
+    }),
+  });
+  assert.equal(ready.observationStatus, "ready");
+  assert.equal(ready.foregroundGeneration, 7);
+  assert.equal(ready.outputSequence, 144);
+});
+
+test("ordered evidence ledger retains repeated mutations and browser validations", () => {
+  const mutation = {
+    id: "mutation-1",
+    kind: "file",
+    value: "src/App.tsx",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  };
+  const browser = {
+    id: "browser-1",
+    kind: "browser_dom",
+    value: "http://localhost:1420/",
+    sourceTool: "browser_evaluate",
+    createdAt: 2,
+  };
+  let ledger = planEvidence.appendPlanEvidenceEntry([], mutation);
+  ledger = planEvidence.appendPlanEvidenceEntry(ledger, { ...mutation, id: "mutation-2", createdAt: 3 });
+  ledger = planEvidence.appendPlanEvidenceEntry(ledger, browser);
+  ledger = planEvidence.appendPlanEvidenceEntry(ledger, { ...browser, id: "browser-2", createdAt: 4 });
+  assert.deepEqual(ledger.map((entry) => entry.id), [
+    "mutation-1",
+    "mutation-2",
+    "browser-1",
+    "browser-2",
+  ]);
+});
+
 test("latest pending launch invalidates an older observed dev-server URL", () => {
   const ready = {
     id: "ready",

@@ -29,6 +29,7 @@ import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import { applyPlanNoToolRuntimeState, applyPlanRuntimePhase } from "./planRuntimeState";
 import type { TurnIterationContext } from "./turnIterationContext";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
+import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -110,6 +111,7 @@ export async function handleAssistantCompletionPhase(input: {
   setPlanRuntimePhase: Parameters<typeof handlePlanNoToolRecovery>[0]["setPlanRuntimePhase"];
   waitForPlanApprovalIfNeeded: Parameters<typeof handlePlanNoToolRecovery>[0]["waitForPlanApprovalIfNeeded"];
   tryClosePlanWithEvidence: Parameters<typeof handlePlanNoToolRecovery>[0]["tryClosePlanWithEvidence"];
+  getExecuteRecoveryState: () => ExecuteRecoveryRuntimeState;
 }): Promise<AssistantCompletionPhaseResult> {
   let noToolRuntimeState = input.noToolRuntimeState;
   let planRuntimeState = input.planRuntimeState;
@@ -213,6 +215,7 @@ export async function handleAssistantCompletionPhase(input: {
     shouldPauseForUserChoice: input.shouldPauseForUserChoice,
     sawExecuteOperationEvidence: input.sawExecuteOperationEvidence,
     visibleText: input.visibleAssistantText || input.userVisibleText,
+    protocolViolation: input.normalized.protocolViolation,
     assistantMsgId: input.assistantMsgId,
     consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,
   });
@@ -355,6 +358,7 @@ export async function handleAssistantCompletionPhase(input: {
     consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,
     emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
     emitPlanExecutionProgress: input.emitPlanExecutionProgress,
+    executeRecoveryState: input.getExecuteRecoveryState(),
   });
   noToolRuntimeState = applyConsecutiveNoToolRuntimeState(
     noToolRuntimeState,

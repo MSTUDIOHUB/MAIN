@@ -1010,7 +1010,59 @@ test("Goal continuation restores the unfinished recovery phase across slices", (
     mode: "mutation_first",
     reason: "recovery_context_observed",
     expectedTarget: "src/App.tsx",
+    phase: "mutation",
+    phaseNoProgressCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: null,
   });
+});
+
+test("Goal continuation preserves the exact recovery contract snapshot across slices", () => {
+  const recoveryState = {
+    mode: "patch_recovery_read",
+    reason: "patch_context_required",
+    expectedTarget: "src/toolbar.ts",
+    phaseNoProgressCount: 3,
+    readLease: {
+      purpose: "patch_recovery",
+      target: "src/toolbar.ts",
+      requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+      observationKey: "src/toolbar.ts:205-256:v7",
+      observedVersion: "v7",
+      state: "active",
+    },
+    sourceObservationKey: "src/toolbar.ts:205-256:v7",
+    decisionCheckpoint: {
+      expectedTarget: "src/toolbar.ts",
+      sourceObservationKey: "src/toolbar.ts:205-256:v7",
+      nextRequiredCapability: "targeted_read",
+      evidenceVersion: "v7",
+    },
+  };
+  const first = goalContinuity.createGoalContinuationState({
+    sourceIteration: 5,
+    messages: [{ role: "assistant", content: "Resume the exact source window." }],
+    executeRecoveryState: recoveryState,
+    now: 100,
+  });
+  const second = goalContinuity.createGoalContinuationState({
+    sourceIteration: 6,
+    previous: first,
+    messages: [{ role: "assistant", content: "Continue without losing the lease." }],
+    now: 200,
+  });
+
+  const expected = {
+    ...recoveryState,
+    phase: "context",
+  };
+  assert.deepEqual(first.executeRecoveryState, expected);
+  assert.deepEqual(second.executeRecoveryState, expected);
+  assert.deepEqual(goalContinuity.resolveGoalContinuationExecuteRecoveryState(
+    second,
+    { mutationRequired: true },
+  ), expected);
 });
 
 test("Goal continuation treats structured feedback status as authoritative", () => {
@@ -1140,6 +1192,11 @@ test("Goal continuation restores one target-scoped recovery transaction", () => 
     mode: "mutation_first",
     reason: "goal_continuation_context_observed",
     expectedTarget: "/workspace/src/App.tsx",
+    phase: "mutation",
+    phaseNoProgressCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: null,
   });
 
   const noEffectMutation = createState([
@@ -1287,6 +1344,11 @@ test("Goal runtime normalization preserves durable continuation memory idempoten
     mode: "validation_only",
     reason: "recovery_mutation_observed",
     expectedTarget: "src/lib/goalRuntime.ts",
+    phase: "validation",
+    phaseNoProgressCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: null,
   });
 });
 

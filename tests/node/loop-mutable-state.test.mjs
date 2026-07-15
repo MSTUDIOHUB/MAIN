@@ -129,6 +129,21 @@ test("loop mutable state restores a target-scoped forced recovery transaction", 
         mode: "validation_only",
         reason: "goal_continuation_mutation_observed",
         expectedTarget: "src/App.tsx",
+        phaseNoProgressCount: 4,
+        readLease: {
+          purpose: "post_mutation_verify",
+          target: "src/App.tsx",
+          observationKey: "src/App.tsx:v2",
+          observedVersion: "v2",
+          state: "available",
+        },
+        sourceObservationKey: "src/App.tsx:v2",
+        decisionCheckpoint: {
+          expectedTarget: "src/App.tsx",
+          sourceObservationKey: "src/App.tsx:v2",
+          nextRequiredCapability: "validation",
+          evidenceVersion: "v2",
+        },
       }),
       getSessionKey: () => "session-1",
     },
@@ -139,6 +154,10 @@ test("loop mutable state restores a target-scoped forced recovery transaction", 
   assert.equal(state.executeRecoveryState.mode, "validation_only");
   assert.equal(state.executeRecoveryState.reason, "goal_continuation_mutation_observed");
   assert.equal(state.executeRecoveryState.expectedTarget, "src/App.tsx");
+  assert.equal(state.executeRecoveryState.phaseNoProgressCount, 4);
+  assert.equal(state.executeRecoveryState.readLease.purpose, "post_mutation_verify");
+  assert.equal(state.executeRecoveryState.sourceObservationKey, "src/App.tsx:v2");
+  assert.equal(state.executeRecoveryState.decisionCheckpoint.nextRequiredCapability, "validation");
 });
 
 test("agent orchestrator delegates mutable runtime state creation and folds", () => {
@@ -151,6 +170,10 @@ test("agent orchestrator delegates mutable runtime state creation and folds", ()
   assert.match(orchestratorSource, /resetAgentLoopMutableStateForApprovedPlanExecution\(loopState\)/);
   assert.match(orchestratorSource, /publishExecuteRecoveryState/);
   assert.match(orchestratorSource, /onExecuteRecoveryStateChange/);
+  assert.match(orchestratorSource, /phaseNoProgressCount: loopState\.executeRecoveryState\.phaseNoProgressCount/);
+  assert.match(orchestratorSource, /readLease: loopState\.executeRecoveryState\.readLease/);
+  assert.match(orchestratorSource, /sourceObservationKey: loopState\.executeRecoveryState\.sourceObservationKey/);
+  assert.match(orchestratorSource, /decisionCheckpoint: loopState\.executeRecoveryState\.decisionCheckpoint/);
   assert.doesNotMatch(orchestratorSource, /createAgentLoopGuardRuntimeState\(\)/);
   assert.doesNotMatch(orchestratorSource, /createAgentLoopStreamRuntimeState\(\)/);
   assert.doesNotMatch(orchestratorSource, /markExecuteOperationEvidenceRuntimeState\(/);

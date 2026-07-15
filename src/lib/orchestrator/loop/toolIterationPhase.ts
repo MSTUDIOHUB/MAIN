@@ -8,6 +8,7 @@ import type { AgentLoopNoToolRuntimeState } from "./noToolRuntimeState";
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntimeState";
 import type { UnityMcpRuntimeState } from "./unityMcpRuntime";
+import type { PlanTask } from "../../workflowModels";
 
 type ToolCallPhaseInput = Parameters<typeof executeToolCallPhase>[0];
 type ToolResultRecoveryInput = Parameters<typeof handleToolResultRecoveryPhase>[0];
@@ -36,7 +37,11 @@ export type ToolIterationPhaseResult = {
   unityMcpRuntimeState: UnityMcpRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
-  completionAudit?: { completedCount: number; totalCount: number };
+  completionAudit?: {
+    completedCount: number;
+    totalCount: number;
+    pendingUserValidationTasks?: PlanTask[];
+  };
 };
 
 export async function handleToolIterationPhase(

@@ -543,6 +543,7 @@ test("plan prompt keeps plan.md materialization runtime-owned even when write to
 
   assert.match(prompt, /MAIN runtime validates and materializes `\.MAIN\/plans\/plan\.md`/);
   assert.match(prompt, /output visible `<proposed_plan>` Markdown/i);
+  assert.match(prompt, /optional user\/manual review belongs in the final conclusion as non-blocking follow-up/i);
   assert.doesNotMatch(prompt, /\.\.MAIN\/plans\/plan\.md|\.\\\.MAIN\/plans\/plan\.md/);
   assert.doesNotMatch(prompt, /用本轮可用计划写入工具|证据足够后用 `write_file`/);
 });
@@ -827,6 +828,8 @@ test("execute prompt enforces strict immediate tool execution constraints", () =
   assert.match(prompt, /绝对禁止输出类似“我接下来的计划是：”/);
   assert.match(prompt, /必须立刻发起本轮真实暴露的工具调用/);
   assert.match(prompt, /【绝对禁止只说不做】/);
+  assert.match(prompt, /建议复核部分/);
+  assert.match(prompt, /不影响本次任务完成状态/);
 });
 
 test("goal prompt embeds the runtime-owned bounded turn contract", () => {
@@ -868,6 +871,7 @@ test("goal prompt embeds the runtime-owned bounded turn contract", () => {
   assert.match(prompt, /禁止输出 approve_operation_once/);
   assert.match(prompt, /只有真正由用户拥有的产品行为、业务规则、范围边界、技术选型或优先级分叉/);
   assert.match(prompt, /GOAL_COMPLETION_CANDIDATE/);
+  assert.match(prompt, /只剩用户\/外部复核时，在最终结论列出建议复核内容/);
   assert.match(prompt, /GOAL_RUNTIME_CONTRACT_SENTINEL/);
   assert.doesNotMatch(prompt, /Goal Runtime contract unavailable/);
 });

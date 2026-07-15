@@ -56,6 +56,9 @@ function appendBoundedToolActivity(
     );
     if (existing) {
       existing.facts = mergePlanEvidenceFacts(existing.facts, activity.facts);
+      if (activity.readFileObservation) {
+        existing.readFileObservation = { ...activity.readFileObservation };
+      }
       const details = [existing.detail, activity.detail]
         .map((detail) => String(detail || "").trim())
         .filter((detail, index, all) => detail && all.indexOf(detail) === index);
@@ -195,6 +198,9 @@ export function rememberToolActivity(
     status: result.isError ? "failed" : "succeeded",
     ...(detail ? { detail } : {}),
     ...(facts.length > 0 ? { facts } : {}),
+    ...(result.readFileObservation
+      ? { readFileObservation: { ...result.readFileObservation } }
+      : {}),
   }, options.evidenceLedger ? MAX_PLAN_EVIDENCE_TOOL_ACTIVITY : MAX_RECENT_PLAN_TOOL_ACTIVITY, options.evidenceLedger);
 }
 

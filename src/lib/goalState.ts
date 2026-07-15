@@ -3,7 +3,12 @@
 // Tracks goal definition, iteration progress, and checkpoints.
 // ────────────────────────────────────────────────────────────────────
 
-import type { ExecuteRecoveryMode } from "./executeRecoveryTools";
+import type {
+  ExecuteRecoveryContractPhase,
+  ExecuteRecoveryMode,
+  ExecutionDecisionCheckpoint,
+  RecoveryReadLease,
+} from "./executeRecoveryTools";
 
 export type GoalStatus =
   | "active"           // Currently executing
@@ -154,6 +159,15 @@ export interface GoalContinuationState {
     mode: ExecuteRecoveryMode;
     reason: string;
     expectedTarget: string | null;
+    /** Derived contract phase retained for diagnostics and schema consistency. */
+    phase?: ExecuteRecoveryContractPhase;
+    /** Consecutive no-progress turns in this phase, not a transaction-wide budget. */
+    phaseNoProgressCount?: number;
+    /** Exact source read permission/identity carried across Goal slice boundaries. */
+    readLease?: RecoveryReadLease | null;
+    sourceObservationKey?: string | null;
+    /** Evidence identity and required next capability for deterministic resume. */
+    decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   };
 }
 

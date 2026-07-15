@@ -57,16 +57,23 @@ import {
   buildPlanMaxIterationsResumePrompt,
   buildPlanExecutionProgressUpdate,
   normalizePlanExecutionProgressSnapshot,
+  resolveExecuteMaxIterationsRecoveryDecision,
   resolveApprovedPlanSameTurnFallbackDecision,
   toPlanExecutionRuntimeProgressUpdate,
   type PlanMaxIterationsCheckpoint,
 } from "../planExecutionRecovery";
-import { createPlanExecutionEvidenceEntry, appendPlanEvidenceEntry } from "../planEvidence";
+import {
+  appendPlanEvidenceEntry,
+  createPlanExecutionEvidenceEntry,
+  createPlanExecutionFailureEntry,
+  shouldRecordPlanExecutionFailure,
+} from "../planEvidence";
 import { closeHarnessRunMarker, getHarnessActionRunId, isHarnessRunMarkerOwnedByRun, persistHarnessRunMarkerIfOwned, type HarnessRunMarker } from "../harnessCrashTelemetry";
 import { generateId } from "../utils";
 import { runAfterNextPaint } from "../uiScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
 import { findToolLifecycleBlockIndex, type ToolLifecycleMeta } from "../toolLifecycle";
+import type { ToolErrorLifecycleMeta } from "./types";
 import { deriveToolIntentSummary } from "../toolPresentation";
 import { buildToolProgressNarration, summarizeToolObservation } from "../progressNarration";
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
@@ -96,6 +103,10 @@ import { resolveRuntimeRunIdentity, type RuntimeRunIdentity } from "../runIdenti
 import { buildDurableTurnContext, shouldCanonicalizeTerminalTurnContext } from "../durableTurnContext";
 import { reduceRunTransition } from "../runTransitionReducer";
 import { findLatestRunOwnedAgentBlock } from "./runOwnedAgentBlocks";
+import {
+  resolveExecuteRecoveryActionContract,
+  type ForcedExecuteRecoveryRuntimeState,
+} from "../executeRecoveryTools";
 
 type WorkflowStoreState = any;
 
@@ -214,6 +225,18 @@ export class WorkflowEngine {
     const runtimeRunIntent = context.runtimeRunIntent;
     const effectiveCommandDirective = context.effectiveCommandDirective;
     const options = context.options;
+    let latestExecuteRecoveryState: ForcedExecuteRecoveryRuntimeState | null =
+      options?.forceExecuteRecoveryState
+        ? {
+            ...options.forceExecuteRecoveryState,
+            readLease: options.forceExecuteRecoveryState.readLease
+              ? { ...options.forceExecuteRecoveryState.readLease }
+              : null,
+            decisionCheckpoint: options.forceExecuteRecoveryState.decisionCheckpoint
+              ? { ...options.forceExecuteRecoveryState.decisionCheckpoint }
+              : null,
+          }
+        : null;
     // const attachedFilesSnapshot = context.attachedFilesSnapshot;
     // const mentionSnapshot = context.mentionSnapshot;
     const remoteFeishu = context.remoteFeishu;
@@ -863,7 +886,22 @@ export class WorkflowEngine {
         const consent = sessionGet().currentTurnExecutionConsent;
         return consent?.granted === true && !!consent.turnId && consent.turnId === turnId;
       },
-      getForcedExecuteRecoveryMode: () => options?.forceExecuteRecoveryMode ?? null,
+      getForcedExecuteRecoveryState: () => latestExecuteRecoveryState,
+      getForcedExecuteRecoveryMode: () =>
+        latestExecuteRecoveryState?.mode ?? options?.forceExecuteRecoveryMode ?? null,
+      onExecuteRecoveryStateChange: (state) => {
+        latestExecuteRecoveryState = {
+          mode: state.mode,
+          reason: state.reason,
+          expectedTarget: state.expectedTarget,
+          phaseNoProgressCount: state.phaseNoProgressCount,
+          readLease: state.readLease ? { ...state.readLease } : null,
+          sourceObservationKey: state.sourceObservationKey,
+          decisionCheckpoint: state.decisionCheckpoint
+            ? { ...state.decisionCheckpoint }
+            : null,
+        };
+      },
       getCommandDirective: () => effectiveCommandDirective,
       getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
       getIsPlanApproved: () => sessionGet().isPlanApproved,
@@ -2227,10 +2265,50 @@ export class WorkflowEngine {
         }));
       },
 
-      onToolError: (toolName: string, target: string, error: string, meta?: { toolCallId?: string }) => {
+      onToolError: (
+        toolName: string,
+        target: string,
+        error: string,
+        meta?: ToolErrorLifecycleMeta,
+      ) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
         const executionId = lifecycleMeta.toolCallId || undefined;
         const errorText = String(error || "");
+        const failureKind = meta?.failureKind || "policy";
+        if (meta?.internalFeedback === true) {
+          logStoreEvent("tool_error_internal_feedback", {
+            turnId,
+            sessionKey: runSessionKey,
+            workspace: runWorkspace || null,
+            toolName,
+            target,
+            executionId,
+            failureKind,
+            qualityGateReason: meta.qualityGateReason || null,
+            planRecoveryReason: meta.planRecoveryReason || null,
+            errorChars: errorText.length,
+          });
+          sessionSet((s: any) => {
+            const existingIndex = findCurrentToolLifecycleBlockIndex(
+              s.taskFlow,
+              toolName,
+              target,
+              ["pending", "running", "failed"],
+              lifecycleMeta,
+            );
+            if (existingIndex < 0) return {};
+            const blockId = s.taskFlow[existingIndex]?.id;
+            return {
+              taskFlow: s.taskFlow.filter((_: any, index: number) => index !== existingIndex),
+              conversationTurns: s.conversationTurns.map((turn: any) =>
+                blockId != null && turn.blockIds.includes(blockId)
+                  ? { ...turn, blockIds: turn.blockIds.filter((id: number) => id !== blockId) }
+                  : turn
+              ),
+            };
+          });
+          return;
+        }
         const observationSummary = summarizeToolObservation({
           toolName,
           target,
@@ -2250,6 +2328,13 @@ export class WorkflowEngine {
           hypothesisStatus: "blocked",
           sourceToolCallIds: executionId ? [executionId] : [],
         });
+        const failureEntry = shouldRecordPlanExecutionFailure(meta)
+          ? createPlanExecutionFailureEntry({
+              toolName,
+              target,
+              error: errorText,
+            })
+          : null;
         logStoreEvent("tool_result", {
           turnId,
           sessionKey: runSessionKey,
@@ -2258,6 +2343,9 @@ export class WorkflowEngine {
           executionId,
           resultChars: error?.length ?? 0,
           isError: true,
+          failureKind,
+          failureKindExplicit: meta?.failureKind != null,
+          ledgerRecorded: failureEntry != null,
         });
 
         sessionSet((s: any) => {
@@ -2268,8 +2356,35 @@ export class WorkflowEngine {
             ["pending", "running", "failed"],
             lifecycleMeta,
           );
-          if (existingIndex < 0) return {};
+          const evidencePatch = failureEntry
+            ? (() => {
+                const nextLedger = appendPlanEvidenceEntry(
+                  s.planExecutionEvidenceLedger || [],
+                  failureEntry,
+                );
+                const nextTasks = reconcilePlanTaskCompletion(
+                  s.planTasks || [],
+                  s.planTasks || [],
+                  nextLedger,
+                  {
+                    preserveMissing:
+                      s.isPlanApproved ||
+                      s.planStage === "executing" ||
+                      s.planStage === "completed" ||
+                      s.planTasks.length > 0,
+                    highlightNext: s.isPlanApproved && nextLedger.length > 0,
+                  },
+                );
+                return {
+                  planExecutionEvidenceLedger: nextLedger,
+                  planExecutionEvidenceCount: nextLedger.length,
+                  planTasks: nextTasks,
+                };
+              })()
+            : {};
+          if (existingIndex < 0) return evidencePatch;
           return {
+            ...evidencePatch,
             taskFlow: s.taskFlow.map((block: any, index: number) => {
               if (index !== existingIndex) return block;
               const failedPhase = withTurnRuntimePhaseStatus(
@@ -2718,6 +2833,70 @@ export class WorkflowEngine {
           ...checkpoint,
           autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
         };
+        const executeEvidenceLedger = sessionGet().planExecutionEvidenceLedger || [];
+        const executeRecoveryDecision = resolveExecuteMaxIterationsRecoveryDecision({
+          evidenceLedger: executeEvidenceLedger,
+          recoveryState: latestExecuteRecoveryState,
+        });
+        const latestMutationEvidence = [...executeEvidenceLedger].reverse().find((entry: any) =>
+          entry?.kind === "file" || entry?.kind === "deliverable"
+        );
+        const expectedTarget =
+          latestExecuteRecoveryState?.expectedTarget?.trim() ||
+          String(latestMutationEvidence?.target || latestMutationEvidence?.value || "").trim() ||
+          null;
+        const previousRecoveryContract = latestExecuteRecoveryState
+          ? resolveExecuteRecoveryActionContract(latestExecuteRecoveryState.mode, {
+              expectedTarget: latestExecuteRecoveryState.expectedTarget,
+              readLease: latestExecuteRecoveryState.readLease,
+              sourceObservationKey: latestExecuteRecoveryState.sourceObservationKey,
+              decisionCheckpoint: latestExecuteRecoveryState.decisionCheckpoint,
+              phaseNoProgressCount: latestExecuteRecoveryState.phaseNoProgressCount,
+            })
+          : null;
+        const nextRecoveryContract = resolveExecuteRecoveryActionContract(
+          executeRecoveryDecision.mode,
+          {
+            expectedTarget,
+            readLease: latestExecuteRecoveryState?.readLease || null,
+            sourceObservationKey: latestExecuteRecoveryState?.sourceObservationKey || null,
+            decisionCheckpoint: latestExecuteRecoveryState?.decisionCheckpoint || null,
+            phaseNoProgressCount: latestExecuteRecoveryState?.phaseNoProgressCount || 0,
+          },
+        );
+        const recoveryPhaseChanged =
+          previousRecoveryContract?.phase !== nextRecoveryContract.phase;
+        const forcedExecuteRecoveryState: ForcedExecuteRecoveryRuntimeState = {
+          mode: executeRecoveryDecision.mode,
+          reason: executeRecoveryDecision.reason,
+          expectedTarget,
+          phaseNoProgressCount: recoveryPhaseChanged
+            ? 0
+            : Math.max(0, latestExecuteRecoveryState?.phaseNoProgressCount || 0),
+          readLease:
+            nextRecoveryContract.phase === "context" ||
+            nextRecoveryContract.phase === "mutation" ||
+            nextRecoveryContract.phase === "post_mutation_check"
+              ? latestExecuteRecoveryState?.readLease
+                ? { ...latestExecuteRecoveryState.readLease }
+                : null
+              : null,
+          sourceObservationKey: latestExecuteRecoveryState?.sourceObservationKey || null,
+          decisionCheckpoint: executeRecoveryDecision.mode === "normal"
+            ? null
+            : {
+                expectedTarget,
+                sourceObservationKey:
+                  latestExecuteRecoveryState?.sourceObservationKey || null,
+                nextRequiredCapability: nextRecoveryContract.nextRequiredCapability,
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.evidenceVersion
+                  ? {
+                      evidenceVersion:
+                        latestExecuteRecoveryState.decisionCheckpoint.evidenceVersion,
+                    }
+                  : {}),
+              },
+        };
         const notice = shouldAutoResume
           ? buildExecuteMaxIterationsAutoResumeNotice(effectiveCheckpoint, phaseLanguage)
           : buildExecuteMaxIterationsPauseNotice(effectiveCheckpoint, phaseLanguage);
@@ -2731,6 +2910,8 @@ export class WorkflowEngine {
             turnId,
             uiDisplayTurnId: context.uiDisplayTurnId,
             checkpoint: effectiveCheckpoint,
+            executeRecoveryDecision,
+            forcedExecuteRecoveryState,
             notice,
           },
         );
@@ -2882,7 +3063,8 @@ export class WorkflowEngine {
                   preservePlanState: true,
                   resolvedIntent: "execute",
                   runtimeIntentOverride: "execute",
-                  forceExecuteRecoveryMode: "action_plus_targeting",
+                  forceExecuteRecoveryMode: executeRecoveryDecision.mode,
+                  forceExecuteRecoveryState: forcedExecuteRecoveryState,
                   executionConsentGranted: true,
                   parentRunIdOverride: activeRuntimeRunIdentity.runId,
                   skipIntentResolution: true,
@@ -3566,13 +3748,26 @@ export class WorkflowEngine {
                 executeRecoveryMode: continuationRecoveryState.mode,
                 executeRecoveryReason: continuationRecoveryState.reason,
                 expectedTarget: continuationRecoveryState.expectedTarget,
+                executeRecoveryPhase: continuationRecoveryState.phase,
+                phaseNoProgressCount: continuationRecoveryState.phaseNoProgressCount,
+                readLeasePurpose: continuationRecoveryState.readLease?.purpose || null,
+                readLeaseState: continuationRecoveryState.readLease?.state || null,
+                sourceObservationKey: continuationRecoveryState.sourceObservationKey,
+                nextRequiredCapability:
+                  continuationRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
               });
             }
-            let latestExecuteRecoveryState = continuationRecoveryState ||
-              iterInput.continuation?.executeRecoveryState || {
+            let latestExecuteRecoveryState: Parameters<
+              NonNullable<OrchestratorCallbacks["onExecuteRecoveryStateChange"]>
+            >[0] = continuationRecoveryState || {
                 mode: "normal" as const,
                 reason: "",
                 expectedTarget: null,
+                phase: "normal" as const,
+                phaseNoProgressCount: 0,
+                readLease: null,
+                sourceObservationKey: null,
+                decisionCheckpoint: null,
               };
             let checkpointEvidence = [...latestGoalEvidence];
             const iterCallbacks = {

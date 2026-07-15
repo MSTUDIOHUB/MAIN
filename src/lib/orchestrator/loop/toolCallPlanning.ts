@@ -3,11 +3,13 @@ import {
   describeApprovedPlanSourceEditFirstToolSurface,
   shouldAllowApprovedPlanRecoveryFileRead,
 } from "../../approvedPlanRecoveryTools";
-import { resolveDevServerRuntimeObservation } from "../../devServerRuntime";
+import { resolveDevServerRuntimeState } from "../../devServerRuntime";
 import {
-  describeExecuteRecoveryToolSurface,
   isExecuteRecoveryToolName,
-  shouldAllowExecuteRecoveryFileRead,
+  resolveExecuteRecoveryActionContract,
+  type ExecutionDecisionCheckpoint,
+  type RecoveryActionContract,
+  type RecoveryReadLease,
   type ExecuteRecoveryMode,
 } from "../../executeRecoveryTools";
 import {
@@ -33,6 +35,7 @@ export interface IterationToolSurfaceDecision {
   isExecuteRecoveryEligible: boolean;
   allowExecuteRecoveryFileRead: boolean;
   effectiveExecuteRecoveryFileRead: boolean;
+  recoveryActionContract: RecoveryActionContract;
   approvedPlanSourceEditFirstActive: boolean;
   allowApprovedPlanRecoveryFileRead: boolean;
   iterationAllTools: ToolDefinition[];
@@ -48,6 +51,10 @@ export function resolveIterationToolSurface(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
   executeRecoveryAttempts: number;
+  executeRecoveryExpectedTarget?: string | null;
+  executeRecoveryReadLease?: RecoveryReadLease | null;
+  executeRecoverySourceObservationKey?: string | null;
+  executeRecoveryDecisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   recoveryIterationCount: number;
   maxRecoveryIterations: number;
   approvedPlanActionOnlyRecoveryActive: boolean;
@@ -70,13 +77,16 @@ export function resolveIterationToolSurface(input: {
     executeRecoveryMode,
     executeRecoveryReason,
     executeRecoveryAttempts,
+    executeRecoveryExpectedTarget,
+    executeRecoveryReadLease,
+    executeRecoverySourceObservationKey,
+    executeRecoveryDecisionCheckpoint,
     recoveryIterationCount,
     maxRecoveryIterations,
     approvedPlanActionOnlyRecoveryActive,
     approvedPlanNoToolRecoveryFileReadActive,
     approvedPlanNoProgressRecoveryAttempts,
     approvedPlanLongReasoningNoActionCount,
-    recentToolActivity,
     recentPlanToolActivity,
     planRuntimePhase,
     usedPlanReadOnlyConvergencePrompt,
@@ -84,16 +94,27 @@ export function resolveIterationToolSurface(input: {
     lastAssistantTextForCheckpoint,
   } = input;
 
+  const devServerRuntimeObservation = resolveDevServerRuntimeState(
+    callbacks.getPlanExecutionEvidenceLedger(),
+  );
   const isExecuteRecoveryEligible =
     (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
     isMutationRuntimeIntent(runtimeIntent) &&
     executeRecoveryMode !== "normal";
-  const allowExecuteRecoveryFileRead = shouldAllowExecuteRecoveryFileRead(
-    recentToolActivity,
-    executeRecoveryMode,
-  );
-  const effectiveExecuteRecoveryFileRead =
-    executeRecoveryMode === "patch_recovery_read" || allowExecuteRecoveryFileRead;
+  const recoveryActionContract = resolveExecuteRecoveryActionContract(executeRecoveryMode, {
+    expectedTarget: executeRecoveryExpectedTarget,
+    readLease: executeRecoveryReadLease,
+    sourceObservationKey: executeRecoverySourceObservationKey,
+    decisionCheckpoint: executeRecoveryDecisionCheckpoint,
+    phaseNoProgressCount: recoveryIterationCount,
+    devServerStatus: devServerRuntimeObservation.status,
+    devServerNextCapability: devServerRuntimeObservation.nextCapability,
+    devServerUrl: devServerRuntimeObservation.url,
+    ptyGeneration: devServerRuntimeObservation.foregroundGeneration,
+    ptyOutputSequence: devServerRuntimeObservation.outputSequence,
+  });
+  const allowExecuteRecoveryFileRead = recoveryActionContract.allowTargetedFileRead;
+  const effectiveExecuteRecoveryFileRead = recoveryActionContract.allowTargetedFileRead;
   const recoveryIterationAllTools = isExecuteRecoveryEligible
     ? rawIterationAllTools.filter((tool) => isExecuteRecoveryToolName(
         tool.function.name,
@@ -101,6 +122,7 @@ export function resolveIterationToolSurface(input: {
         {
           mode: executeRecoveryMode,
           allowFileRead: allowExecuteRecoveryFileRead,
+          contract: recoveryActionContract,
         },
       ))
     : rawIterationAllTools;
@@ -110,9 +132,17 @@ export function resolveIterationToolSurface(input: {
       executeRecoveryMode,
       executeRecoveryReason,
       executeRecoveryAttempts,
+      recoveryPhase: recoveryActionContract.phase,
+      nextRequiredCapability: recoveryActionContract.nextRequiredCapability,
+      phaseNoProgressCount: recoveryActionContract.phaseNoProgressCount,
+      devServerStatus: recoveryActionContract.devServerStatus,
+      devServerNextCapability: devServerRuntimeObservation.nextCapability,
+      devServerUrl: recoveryActionContract.devServerUrl,
+      ptyGeneration: recoveryActionContract.ptyGeneration,
+      ptyOutputSequence: recoveryActionContract.ptyOutputSequence,
       allowFileRead: effectiveExecuteRecoveryFileRead,
       adaptiveFileReadAllowed: allowExecuteRecoveryFileRead,
-      recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, effectiveExecuteRecoveryFileRead),
+      recoveryToolSurface: recoveryActionContract.surfaceDescription,
       rawTools: rawIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
       scopedTools: recoveryIterationAllTools.map((tool) => tool.function.name),
       removedToolCount: Math.max(0, rawIterationAllTools.length - recoveryIterationAllTools.length),
@@ -144,9 +174,6 @@ export function resolveIterationToolSurface(input: {
     !approvedPlanActionOnlyRecoveryActive;
   const allowApprovedPlanRecoveryFileRead =
     approvedPlanSourceEditFileReadAllowed || approvedPlanPatchRecoveryFileReadAllowed;
-  const devServerRuntimeObservation = resolveDevServerRuntimeObservation(
-    callbacks.getPlanExecutionEvidenceLedger(),
-  );
   const preservePtyLifecycle =
     devServerRuntimeObservation.status === "pending" ||
     devServerRuntimeObservation.status === "running";
@@ -159,6 +186,9 @@ export function resolveIterationToolSurface(input: {
       executeRecoveryMode,
       executeRecoveryReason,
       executeRecoveryAttempts,
+      recoveryPhase: recoveryActionContract.phase,
+      nextRequiredCapability: recoveryActionContract.nextRequiredCapability,
+      phaseNoProgressCount: recoveryActionContract.phaseNoProgressCount,
       recoveryIterationCount,
       maxRecoveryIterations,
       approvedPlanActionOnlyRecoveryActive,
@@ -175,8 +205,12 @@ export function resolveIterationToolSurface(input: {
     approvedPlanActionOnlyRecoveryActive &&
     workflowMode === "plan" &&
     callbacks.getIsPlanApproved();
+  const executeContractOwnsSurface =
+    isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
   const baseIterationAllTools =
-    approvedPlanActionRecoveryActive
+    executeContractOwnsSurface
+      ? recoveryIterationAllTools
+      : approvedPlanActionRecoveryActive
       ? recoveryIterationAllTools.filter((tool) => isApprovedPlanRecoveryTool(tool, {
           allowFileRead: approvedPlanPatchRecoveryFileReadAllowed,
         }))
@@ -186,7 +220,11 @@ export function resolveIterationToolSurface(input: {
           preservePtyLifecycle,
         }))
       : recoveryIterationAllTools;
-  if (approvedPlanSourceEditFirstActive && baseIterationAllTools.length !== recoveryIterationAllTools.length) {
+  if (
+    !executeContractOwnsSurface &&
+    approvedPlanSourceEditFirstActive &&
+    baseIterationAllTools.length !== recoveryIterationAllTools.length
+  ) {
     logAgentEvent("approved_plan_source_edit_first_tool_scope_applied", {
       iteration,
       allowFileRead: allowApprovedPlanRecoveryFileRead,
@@ -252,6 +290,7 @@ export function resolveIterationToolSurface(input: {
       approvedPlanSourceEditFirstActive,
       approvedPlanActionOnlyRecoveryActive,
       approvedPlanNoToolRecoveryFileReadActive,
+      executeContractOwnsSurface,
       // Report the effective surface, not an upstream eligibility hint. Those
       // can legitimately be true while a later phase filter removes read_file.
       allowFileRead: scopedToolNameSet.has("read_file"),
@@ -265,7 +304,7 @@ export function resolveIterationToolSurface(input: {
             allowApprovedPlanRecoveryFileRead,
             preservePtyLifecycle,
           )
-        : describeExecuteRecoveryToolSurface(executeRecoveryMode, effectiveExecuteRecoveryFileRead),
+        : recoveryActionContract.surfaceDescription,
       rawToolCount: rawToolNames.length,
       scopedToolCount: scopedToolNames.length,
       removedToolCount: Math.max(0, rawToolNames.length - scopedToolNames.length),
@@ -289,6 +328,7 @@ export function resolveIterationToolSurface(input: {
     isExecuteRecoveryEligible,
     allowExecuteRecoveryFileRead,
     effectiveExecuteRecoveryFileRead,
+    recoveryActionContract,
     approvedPlanSourceEditFirstActive,
     allowApprovedPlanRecoveryFileRead,
     iterationAllTools,

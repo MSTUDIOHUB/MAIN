@@ -69,5 +69,6 @@ export async function executeAgentLoop(
     callbacks,
     latestTurnContract: orchestrator.getLatestTurnContract(),
     sawExecutionEvidence: orchestrator.hasExecuteOperationEvidence(),
+    executeRecoveryState: orchestrator.getLatestExecuteRecoveryState?.() ?? null,
   });
 }

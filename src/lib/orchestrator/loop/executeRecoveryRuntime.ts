@@ -1,7 +1,12 @@
 import {
   normalizeExecuteRecoveryMode,
+  resolveExecuteRecoveryActionContract,
+  type ExecutionDecisionCheckpoint,
   type ExecuteRecoveryMode,
+  type ForcedExecuteRecoveryRuntimeState,
+  type RecoveryReadLease,
 } from "../../executeRecoveryTools";
+import { isLocalDevServerHealthProbeCommand } from "../../devServerRuntime";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
 
 export const MAX_EXECUTE_RECOVERY_ITERATIONS = 6;
@@ -12,15 +17,24 @@ export interface ExecuteRecoveryRuntimeState {
   /** File identity carried by the complete context -> mutation -> validation transaction. */
   expectedTarget: string | null;
   attempts: number;
+  /** Consecutive iterations without fresh evidence inside the current phase. */
+  phaseNoProgressCount: number;
+  /** @deprecated Compatibility mirror for persisted/logged recovery counters. */
   iterationCount: number;
+  readLease: RecoveryReadLease | null;
+  sourceObservationKey: string | null;
+  decisionCheckpoint: ExecutionDecisionCheckpoint | null;
   consecutiveBlockedReadFileCount: number;
   repeatedEditValidationAttempts: number;
 }
 
 export type ExecuteRecoveryPhaseTransition =
   | "none"
+  | "context_refreshed"
+  | "validation_progress"
   | "context_to_mutation"
   | "mutation_to_validation"
+  | "post_mutation_check_to_validation"
   | "validation_to_normal";
 
 export interface ExecuteRecoveryObservation {
@@ -28,12 +42,63 @@ export interface ExecuteRecoveryObservation {
   freshReadTarget?: string | null;
   mutationTarget?: string | null;
   validationTarget?: string | null;
+  validationToolName?: string | null;
+  /** Present only for a fresh/replayed source observation, never a cache stub. */
+  sourceObservationKey?: string | null;
 }
 
-export interface ForcedExecuteRecoveryRuntimeState {
-  mode: ExecuteRecoveryMode;
-  reason?: string | null;
-  expectedTarget?: string | null;
+export interface PtyObservationPolicyDeferral {
+  requestedUrl: string | null;
+}
+
+/**
+ * Recognize the structured browser-preflight outcome that means the current
+ * dev-server generation still needs PTY observation. This is a policy-owned
+ * phase deferral, not a browser failure, so callers must not infer it from the
+ * localized feedback text.
+ */
+export function resolvePtyObservationPolicyDeferral(
+  results: Array<{
+    name?: string | null;
+    target?: string | null;
+    internalFeedback?: boolean;
+    qualityGateReason?: string | null;
+  }>,
+): PtyObservationPolicyDeferral | null {
+  const deferredBrowser = results.find((result) =>
+    result.name === "browser_evaluate" &&
+    result.internalFeedback === true &&
+    result.qualityGateReason === "pty_observation_required"
+  );
+  if (!deferredBrowser) return null;
+  return {
+    requestedUrl: deferredBrowser.target?.trim() || null,
+  };
+}
+
+function resetExecuteRecoveryPhaseProgress<T extends ExecuteRecoveryRuntimeState>(state: T): T {
+  return {
+    ...state,
+    phaseNoProgressCount: 0,
+    iterationCount: 0,
+  };
+}
+
+function buildExecuteRecoveryDecisionCheckpoint(input: {
+  expectedTarget: string | null;
+  sourceObservationKey: string | null;
+  nextRequiredCapability: ExecutionDecisionCheckpoint["nextRequiredCapability"];
+  previous: ExecutionDecisionCheckpoint | null;
+}): ExecutionDecisionCheckpoint | null {
+  if (!input.expectedTarget && !input.previous) return null;
+  return {
+    expectedTarget: input.expectedTarget,
+    sourceObservationKey: input.sourceObservationKey,
+    nextRequiredCapability: input.nextRequiredCapability,
+    ...(input.previous?.evidenceVersion
+      ? { evidenceVersion: input.previous.evidenceVersion }
+      : {}),
+  };
 }
 
 export function createExecuteRecoveryRuntimeState(input: {
@@ -41,9 +106,18 @@ export function createExecuteRecoveryRuntimeState(input: {
   forcedMode?: ExecuteRecoveryMode | null;
   forcedState?: ForcedExecuteRecoveryRuntimeState | null;
 }): ExecuteRecoveryRuntimeState {
-  const mode = input.workflowMode === "edit"
+  const hasForcedRecovery = normalizeExecuteRecoveryMode(
+    input.forcedState?.mode ?? input.forcedMode,
+  ) !== "normal";
+  const recoveryEligible =
+    input.workflowMode === "edit" ||
+    (input.workflowMode === "plan" && hasForcedRecovery);
+  const mode = recoveryEligible
     ? normalizeExecuteRecoveryMode(input.forcedState?.mode ?? input.forcedMode)
     : "normal";
+  const phaseNoProgressCount = mode === "normal"
+    ? 0
+    : Math.max(0, input.forcedState?.phaseNoProgressCount || 0);
   return {
     mode,
     reason: mode === "normal"
@@ -53,7 +127,15 @@ export function createExecuteRecoveryRuntimeState(input: {
       ? null
       : input.forcedState?.expectedTarget?.trim() || null,
     attempts: mode === "normal" ? 0 : 1,
-    iterationCount: 0,
+    phaseNoProgressCount,
+    iterationCount: phaseNoProgressCount,
+    readLease: mode === "normal" ? null : input.forcedState?.readLease || null,
+    sourceObservationKey: mode === "normal"
+      ? null
+      : input.forcedState?.sourceObservationKey?.trim() || null,
+    decisionCheckpoint: mode === "normal"
+      ? null
+      : input.forcedState?.decisionCheckpoint || null,
     consecutiveBlockedReadFileCount: 0,
     repeatedEditValidationAttempts: 0,
   };
@@ -65,15 +147,41 @@ export function activateExecuteRecoveryRuntimeState(
     mode: Exclude<ExecuteRecoveryMode, "normal">;
     reason: string;
     expectedTarget?: string | null;
+    readLease?: RecoveryReadLease | null;
+    sourceObservationKey?: string | null;
+    decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   },
 ): ExecuteRecoveryRuntimeState {
-  return {
+  const nextMode = normalizeExecuteRecoveryMode(input.mode) as Exclude<ExecuteRecoveryMode, "normal">;
+  const expectedTarget = input.expectedTarget?.trim() || state.expectedTarget;
+  const previousContract = resolveExecuteRecoveryActionContract(state.mode);
+  const nextContract = resolveExecuteRecoveryActionContract(nextMode);
+  const phaseChanged = previousContract.phase !== nextContract.phase;
+  const targetChanged = Boolean(
+    expectedTarget &&
+    (!state.expectedTarget ||
+      !workspacePathsReferToSameFile(expectedTarget, state.expectedTarget)),
+  );
+  const nextState: ExecuteRecoveryRuntimeState = {
     ...state,
-    mode: normalizeExecuteRecoveryMode(input.mode) as Exclude<ExecuteRecoveryMode, "normal">,
+    mode: nextMode,
     reason: input.reason,
-    expectedTarget: input.expectedTarget?.trim() || state.expectedTarget,
+    expectedTarget,
     attempts: state.attempts + 1,
+    readLease: input.readLease === undefined ? state.readLease : input.readLease,
+    sourceObservationKey: input.sourceObservationKey?.trim() || state.sourceObservationKey,
+    decisionCheckpoint: input.decisionCheckpoint === undefined
+      ? buildExecuteRecoveryDecisionCheckpoint({
+          expectedTarget,
+          sourceObservationKey: input.sourceObservationKey?.trim() || state.sourceObservationKey,
+          nextRequiredCapability: nextContract.nextRequiredCapability,
+          previous: state.decisionCheckpoint,
+        })
+      : input.decisionCheckpoint,
   };
+  return phaseChanged || targetChanged
+    ? resetExecuteRecoveryPhaseProgress(nextState)
+    : nextState;
 }
 
 export function clearExecuteRecoveryRuntimeState(
@@ -85,7 +193,11 @@ export function clearExecuteRecoveryRuntimeState(
     reason: "",
     expectedTarget: null,
     attempts: 0,
+    phaseNoProgressCount: 0,
     iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: null,
   };
 }
 
@@ -113,8 +225,15 @@ export function transitionExecuteRecoveryRuntimeState(
   const transactionState = expectedTarget && expectedTarget !== state.expectedTarget
     ? { ...state, expectedTarget }
     : state;
+  const contract = resolveExecuteRecoveryActionContract(state.mode, {
+    expectedTarget,
+    readLease: state.readLease,
+    sourceObservationKey: state.sourceObservationKey,
+    decisionCheckpoint: state.decisionCheckpoint,
+    phaseNoProgressCount: state.phaseNoProgressCount,
+  });
 
-  if (state.mode === "patch_recovery_read" && observation.freshReadTarget) {
+  if (contract.phase === "context" && observation.freshReadTarget) {
     const contextTarget = expectedTarget || observation.freshReadTarget;
     if (!workspacePathsReferToSameFile(observation.freshReadTarget, contextTarget)) {
       return {
@@ -124,20 +243,71 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
-    return {
-      state: {
+    const sourceObservationKey = observation.sourceObservationKey?.trim() || state.sourceObservationKey;
+    const nextState = resetExecuteRecoveryPhaseProgress({
         ...transactionState,
         mode: "mutation_first",
         reason: "recovery_context_observed",
         expectedTarget: contextTarget,
-      },
+        sourceObservationKey,
+        readLease: state.readLease && workspacePathsReferToSameFile(state.readLease.target, contextTarget)
+          ? { ...state.readLease, state: "consumed", observationKey: sourceObservationKey }
+          : state.readLease,
+        decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
+          expectedTarget: contextTarget,
+          sourceObservationKey,
+          nextRequiredCapability: "mutation",
+          previous: state.decisionCheckpoint,
+        }),
+      });
+    return {
+      state: nextState,
       transition: "context_to_mutation",
       target: contextTarget,
       consumedExpectedRead: true,
     };
   }
 
-  if ((state.mode === "mutation_first" || state.mode === "action_only") && observation.mutationTarget) {
+  if (contract.phase !== "context" && observation.freshReadTarget) {
+    const contextTarget = expectedTarget || observation.freshReadTarget;
+    if (!workspacePathsReferToSameFile(observation.freshReadTarget, contextTarget)) {
+      return {
+        state: transactionState,
+        transition: "none",
+        target: contextTarget,
+        consumedExpectedRead: false,
+      };
+    }
+    const sourceObservationKey = observation.sourceObservationKey?.trim() || state.sourceObservationKey;
+    const completesPostMutationCheck = contract.phase === "post_mutation_check";
+    return {
+      state: resetExecuteRecoveryPhaseProgress({
+        ...transactionState,
+        reason: completesPostMutationCheck
+          ? "recovery_post_mutation_context_observed"
+          : transactionState.reason,
+        sourceObservationKey,
+        readLease: state.readLease && workspacePathsReferToSameFile(state.readLease.target, contextTarget)
+          ? { ...state.readLease, state: "consumed", observationKey: sourceObservationKey }
+          : state.readLease,
+        decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
+          expectedTarget: contextTarget,
+          sourceObservationKey,
+          nextRequiredCapability: completesPostMutationCheck
+            ? "validation"
+            : contract.nextRequiredCapability,
+          previous: state.decisionCheckpoint,
+        }),
+      }),
+      transition: completesPostMutationCheck
+        ? "post_mutation_check_to_validation"
+        : "context_refreshed",
+      target: contextTarget,
+      consumedExpectedRead: true,
+    };
+  }
+
+  if (contract.phase === "mutation" && observation.mutationTarget) {
     const mutationTarget = expectedTarget || observation.mutationTarget;
     if (!workspacePathsReferToSameFile(observation.mutationTarget, mutationTarget)) {
       return {
@@ -148,12 +318,23 @@ export function transitionExecuteRecoveryRuntimeState(
       };
     }
     return {
-      state: {
+      state: resetExecuteRecoveryPhaseProgress({
         ...transactionState,
         mode: "validation_only",
         reason: "recovery_mutation_observed",
         expectedTarget: mutationTarget,
-      },
+        readLease: {
+          purpose: "post_mutation_verify",
+          target: mutationTarget,
+          state: "available",
+        },
+        decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
+          expectedTarget: mutationTarget,
+          sourceObservationKey: state.sourceObservationKey,
+          nextRequiredCapability: "validation",
+          previous: state.decisionCheckpoint,
+        }),
+      }),
       transition: "mutation_to_validation",
       target: mutationTarget,
       consumedExpectedRead: false,
@@ -161,7 +342,53 @@ export function transitionExecuteRecoveryRuntimeState(
   }
 
   if (
-    (state.mode === "validation_only" || state.mode === "finite_validation_only") &&
+    (state.mode === "action_plus_targeting" || state.mode === "validation_only") &&
+    observation.validationTarget
+  ) {
+    const validationToolName = observation.validationToolName?.trim() || "";
+    const ptyObservation = [
+      "read_pty_buffer",
+      "read_pty_tail",
+      "read_pty_since",
+      "get_pty_status",
+    ].includes(validationToolName);
+    const healthyServerReconciliation =
+      validationToolName === "run_command" &&
+      isLocalDevServerHealthProbeCommand(observation.validationTarget);
+    if (ptyObservation || healthyServerReconciliation) {
+      return {
+        state: resetExecuteRecoveryPhaseProgress({
+          ...transactionState,
+          reason: healthyServerReconciliation
+            ? "recovery_existing_server_reconciled"
+            : "recovery_pty_observation_observed",
+          decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
+            expectedTarget,
+            sourceObservationKey: state.sourceObservationKey,
+            nextRequiredCapability: "browser_validation",
+            previous: state.decisionCheckpoint,
+          }),
+        }),
+        transition: "validation_progress",
+        target: expectedTarget || observation.validationTarget,
+        consumedExpectedRead: false,
+      };
+    }
+    if (state.mode === "action_plus_targeting") {
+      return {
+        state: clearExecuteRecoveryRuntimeState(transactionState),
+        transition: "validation_to_normal",
+        target: expectedTarget || observation.validationTarget,
+        consumedExpectedRead: false,
+      };
+    }
+    // validation_only falls through to the generic finite/browser validation
+    // close below. The special PTY branch above ensures readiness advances the
+    // same transaction instead of being mistaken for final acceptance.
+  }
+
+  if (
+    contract.phase === "validation" &&
     observation.validationTarget
   ) {
     return {
@@ -197,14 +424,44 @@ export function advanceExecuteRecoveryRuntimeIteration(
     };
   }
 
+  const phaseNoProgressCount = Math.max(
+    0,
+    Number.isFinite(state.phaseNoProgressCount)
+      ? state.phaseNoProgressCount
+      : state.iterationCount || 0,
+  ) + 1;
   const nextState = {
     ...state,
-    iterationCount: state.iterationCount + 1,
+    phaseNoProgressCount,
+    iterationCount: phaseNoProgressCount,
   };
   return {
     state: nextState,
     maxIterations: MAX_EXECUTE_RECOVERY_ITERATIONS,
-    reachedMaxIterations: nextState.iterationCount >= MAX_EXECUTE_RECOVERY_ITERATIONS,
+    reachedMaxIterations: nextState.phaseNoProgressCount >= MAX_EXECUTE_RECOVERY_ITERATIONS,
+  };
+}
+
+/**
+ * Undo the iteration-start debit when the runtime itself deferred a call,
+ * returned an unchanged cache stub, or only observed a still-running PTY.
+ * These outcomes add no diagnostic failure and must not exhaust the six-step
+ * no-progress budget merely because the model followed the requested gate.
+ */
+export function refundExecuteRecoveryRuntimeIteration(
+  state: ExecuteRecoveryRuntimeState,
+): ExecuteRecoveryRuntimeState {
+  if (state.mode === "normal") return state;
+  const phaseNoProgressCount = Math.max(
+    0,
+    (Number.isFinite(state.phaseNoProgressCount)
+      ? state.phaseNoProgressCount
+      : state.iterationCount || 0) - 1,
+  );
+  return {
+    ...state,
+    phaseNoProgressCount,
+    iterationCount: phaseNoProgressCount,
   };
 }
 
@@ -216,13 +473,22 @@ export function applyCrossIterationReadFileRecoveryState(
     consecutiveBlockedReadFileCount: number;
   },
 ): ExecuteRecoveryRuntimeState {
-  return {
+  const nextMode = normalizeExecuteRecoveryMode(input.mode);
+  const previousPhase = resolveExecuteRecoveryActionContract(state.mode).phase;
+  const nextPhase = resolveExecuteRecoveryActionContract(nextMode).phase;
+  const nextState: ExecuteRecoveryRuntimeState = {
     ...state,
-    mode: input.mode,
+    mode: nextMode,
     reason: input.reason,
-    expectedTarget: input.mode === "normal" ? null : state.expectedTarget,
+    expectedTarget: nextMode === "normal" ? null : state.expectedTarget,
+    readLease: nextMode === "normal" ? null : state.readLease,
+    sourceObservationKey: nextMode === "normal" ? null : state.sourceObservationKey,
+    decisionCheckpoint: nextMode === "normal" ? null : state.decisionCheckpoint,
     consecutiveBlockedReadFileCount: input.consecutiveBlockedReadFileCount,
   };
+  return previousPhase !== nextPhase
+    ? resetExecuteRecoveryPhaseProgress(nextState)
+    : nextState;
 }
 
 export function setRepeatedEditValidationRecoveryAttempts(
@@ -241,6 +507,6 @@ export function buildExecuteRecoveryMaxIterationsPrompt(input: {
 }): string {
   const maxIterations = input.maxIterations ?? MAX_EXECUTE_RECOVERY_ITERATIONS;
   return input.language === "zh"
-    ? `[System: 恢复模式已持续 ${maxIterations} 次迭代未取得进展。已自动退出恢复模式，所有工具已恢复可用。请重新读取目标文件（使用 start_line/max_lines 限定范围），然后执行修改。如果确实无法完成，请向用户说明原因。]`
-    : `[System: Recovery mode has persisted for ${maxIterations} iterations without progress. Exiting recovery - all tools are now available. Re-read the target file (with start_line/max_lines), then make your edit. If genuinely blocked, explain why to the user.]`;
+    ? `[System: 当前恢复阶段已连续 ${maxIterations} 次迭代没有获得新证据。已退出该恢复事务并恢复普通工具面。请按目标文件的版本/范围判断是否需要定向读取，然后继续修改或验证；如果确实无法完成，请说明精确阻塞。]`
+    : `[System: The current recovery phase produced no fresh evidence for ${maxIterations} consecutive iterations. The transaction was cleared and the normal tool surface restored. Decide whether a targeted file read is needed from its version/range, then continue mutation or validation; if genuinely blocked, report the exact blocker.]`;
 }

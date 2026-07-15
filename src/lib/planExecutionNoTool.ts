@@ -20,11 +20,7 @@ export function shouldHandleApprovedPlanExecutionNoTool(input: {
   if (input.toolCallCount > 0) return false;
   if (!input.audit) return false;
   return input.audit.totalCount === 0 ||
-    !input.audit.acceptedCompletion ||
-    !input.audit.allTrustedComplete ||
-    input.audit.pendingExternalValidation ||
-    (input.audit.pendingUserValidationTasks?.length ?? 0) > 0 ||
-    (input.audit.remainingTasks?.length ?? 0) > 0;
+    !input.audit.acceptedCompletion;
 }
 
 export function buildPlanExecutionNoToolRecoveryPrompt(input: {

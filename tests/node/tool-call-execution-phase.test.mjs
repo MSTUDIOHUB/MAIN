@@ -57,6 +57,9 @@ test("tool call execution phase preserves callback-owned state through the phase
     phaseSource,
     /transitionExecuteRecoveryRuntimeState\([\s\S]*?recoveryTransition\.transition === "validation_to_normal"[\s\S]*?clearExecuteRecoveryAndSync\(/,
   );
+  assert.match(phaseSource, /sourceObservationKey: freshReadResult\?\.readFileObservation\?\.key/);
+  assert.match(phaseSource, /validationToolName: validationResult\?\.name/);
+  assert.match(phaseSource, /readFileObservation\?\.source[\s\S]*?source !== "stub"/);
   assert.doesNotMatch(phaseSource, /clearExecuteRecovery: clearExecuteRecoveryAndSync/);
   assert.match(phaseSource, /executeRecoveryState,[\s\S]*?loopGuardRuntimeState,/);
 });

@@ -526,6 +526,7 @@ export function normalizeAssistantTurn(
     hasExplicitUserChoiceRequest,
     toolCalls,
     finishReason: result.finishReason,
+    ...(result.protocolViolation ? { protocolViolation: result.protocolViolation } : {}),
   };
 }
 

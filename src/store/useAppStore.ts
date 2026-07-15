@@ -4,7 +4,10 @@
 import { create, type StateCreator } from "zustand";
 import { persist } from "zustand/middleware";
 import { type AgentMessage, type ReviewDecision, type ContentPart } from "../lib/orchestrator";
-import type { ExecuteRecoveryMode } from "../lib/executeRecoveryTools";
+import type {
+  ExecuteRecoveryMode,
+  ForcedExecuteRecoveryRuntimeState,
+} from "../lib/executeRecoveryTools";
 import type { SessionAutoApproveScope } from "../lib/runtimeTools";
 import {
   analyzeTabularDocument,
@@ -1301,6 +1304,7 @@ export interface AppState {
       resolvedIntent?: ResolvedUserIntent;
       runtimeIntentOverride?: ResolvedUserIntent;
       forceExecuteRecoveryMode?: ExecuteRecoveryMode;
+      forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
       commandDirective?: CommandDirective | null;
       executionConsentGranted?: boolean;
       skipIntentResolution?: boolean;
@@ -7356,6 +7360,7 @@ export const useAppStore = create<AppState>()(
     resolvedIntent?: ResolvedRunIntent;
     runtimeIntentOverride?: ResolvedRunIntent;
     forceExecuteRecoveryMode?: ExecuteRecoveryMode;
+    forceExecuteRecoveryState?: ForcedExecuteRecoveryRuntimeState;
     commandDirective?: CommandDirective | null;
     executionConsentGranted?: boolean;
     skipIntentResolution?: boolean;

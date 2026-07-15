@@ -82,6 +82,42 @@ test("approved plan scope blocks recover within the reviewed scope before comple
   assert.doesNotMatch(phaseSource, /approved_plan_scope_revision_required/);
 });
 
+test("approved plan completion is committed only after closure and active-recovery gates", () => {
+  const closureIndex = phaseSource.indexOf("const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({");
+  const recoveryGateIndex = phaseSource.indexOf('executeRecoveryState.mode === "normal"', closureIndex);
+  const doneIndex = phaseSource.indexOf('input.emitTaskOrchestratorPhase("DONE"', closureIndex);
+  const completedStageIndex = phaseSource.indexOf('input.callbacks.onPlanStageChanged("completed")', closureIndex);
+
+  assert.notEqual(closureIndex, -1);
+  assert.notEqual(recoveryGateIndex, -1);
+  assert.notEqual(doneIndex, -1);
+  assert.notEqual(completedStageIndex, -1);
+  assert.ok(closureIndex < recoveryGateIndex);
+  assert.ok(recoveryGateIndex < doneIndex);
+  assert.ok(doneIndex < completedStageIndex);
+  assert.match(phaseSource, /evidenceClosureAudit\.completionAllowed/);
+});
+
+test("premature browser validation activates PTY observation recovery before completion auditing", () => {
+  const deferralIndex = phaseSource.indexOf("resolvePtyObservationPolicyDeferral(input.results)");
+  const activationIndex = phaseSource.indexOf(
+    '"browser_validation_deferred_for_pty_observation"',
+    deferralIndex,
+  );
+  const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({");
+
+  assert.notEqual(deferralIndex, -1);
+  assert.notEqual(activationIndex, -1);
+  assert.notEqual(completionAuditIndex, -1);
+  assert.ok(deferralIndex < activationIndex);
+  assert.ok(activationIndex < completionAuditIndex);
+  assert.match(
+    phaseSource,
+    /executeRecoveryState\.mode === "normal" && ptyObservationDeferral[\s\S]*?activateExecuteRecoveryAndSync\(\s*"validation_only"/,
+  );
+  assert.match(phaseSource, /nextCapability: "observe_pty"/);
+});
+
 test("approved Plan finite command failures split invocation recovery from source repair", () => {
   const appendIndex = phaseSource.indexOf(
     "appendToolResultsToHistory({",

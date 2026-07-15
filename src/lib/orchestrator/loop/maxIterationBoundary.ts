@@ -215,7 +215,7 @@ export async function handleMaxIterationBoundary(input: {
       autoResumeCount: callbacks.getPlanAutoResumeCount?.() ?? 0,
       autoResumeEligible,
       tasks: [],
-      evidenceLedger: [],
+      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger?.() || [],
       recentToolActivity,
       lastAssistantText: lastAssistantTextForCheckpoint,
       unresolvedBlockers: [

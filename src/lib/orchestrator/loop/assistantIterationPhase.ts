@@ -18,6 +18,7 @@ import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntim
 import type { AgentLoopStreamRuntimeState } from "./streamRuntimeState";
 import type { TurnIterationContext } from "./turnIterationContext";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
+import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import {
   handleUnityMcpNoToolRecovery,
   type UnityMcpRuntimeState,
@@ -98,6 +99,7 @@ export async function handleAssistantIterationPhase(input: {
   pauseForReviewablePlanArtifact: PauseForReviewablePlanArtifact;
   tryClosePlanWithEvidence: TryClosePlanWithEvidence;
   waitForPlanApprovalIfNeeded: WaitForPlanApprovalIfNeeded;
+  getExecuteRecoveryState: () => ExecuteRecoveryRuntimeState;
 }): Promise<AssistantIterationPhaseResult> {
   let noToolRuntimeState = input.noToolRuntimeState;
   let planRuntimeState = input.planRuntimeState;
@@ -378,6 +380,7 @@ export async function handleAssistantIterationPhase(input: {
     setPlanRuntimePhase: input.setPlanRuntimePhase,
     waitForPlanApprovalIfNeeded: input.waitForPlanApprovalIfNeeded,
     tryClosePlanWithEvidence: input.tryClosePlanWithEvidence,
+    getExecuteRecoveryState: input.getExecuteRecoveryState,
   });
   noToolRuntimeState = assistantCompletionPhase.noToolRuntimeState;
   planRuntimeState = assistantCompletionPhase.planRuntimeState;

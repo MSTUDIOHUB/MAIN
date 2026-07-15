@@ -3,16 +3,42 @@ import { resolvePtyForegroundState } from "./ptyCommandRuntime";
 
 export type PtyObservationStatus = "unknown" | "running" | "ready" | "failed" | "stopped";
 
+export type DevServerNextCapability = "launch" | "observe_pty" | "browser" | "reconcile";
+
 export interface PtyObservationAnalysis {
   status: PtyObservationStatus;
   url?: string;
   text: string;
+  foregroundGeneration?: number;
+  outputSequence?: number;
+  terminalBusy: boolean;
+  portConflict: boolean;
+}
+
+export interface DevServerRuntimeState {
+  status: "none" | "pending" | PtyObservationStatus;
+  url: string | null;
+  foregroundGeneration: number | null;
+  outputSequence: number | null;
+  terminalBusy: boolean;
+  portConflict: boolean;
+  nextCapability: DevServerNextCapability;
+}
+
+export interface PtyCommandFailureSemantics {
+  kind: "pty_occupied" | "port_conflict" | "other";
+  terminalBusy: boolean;
+  portConflict: boolean;
+  nextCapability: "observe_pty" | "probe_existing_service" | "launch";
 }
 
 const LOCAL_DEV_SERVER_URL_RE = /https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\])(?::\d+)?(?:\/[^\s'"`<>()\]}]*)?/gi;
 const READY_MARKER_RE = /(?:\bready\s+in\b|\blocal:\s*https?:\/\/|\blistening\s+(?:at|on)\b|\bserver\s+(?:is\s+)?(?:ready|running|started)\b|\bdev\s+server\s+(?:is\s+)?(?:ready|running|started)\b|\bcompiled\s+successfully\b|\brunning\s+[`'"].*?(?:target\/debug|target\/release)|\bapplication\s+started\b)/i;
 const WAITING_MARKER_RE = /(?:waiting\s+for\s+your\s+frontend\s+dev\s+server|still\s+waiting|starting\s+development\s+server)/i;
 const FAILURE_MARKER_RE = /(?:could\s+not\s+connect|connection\s+refused|address\s+already\s+in\s+use|command\s+not\s+found|failed\s+to\s+(?:start|compile|build|connect)|timed?\s*out|exited?\s+with\s+(?:code|status)\s*[1-9]\d*|\b(?:error|fatal):)/i;
+const PTY_OCCUPIED_MARKER_RE = /\b(?:PTY_BUSY|PTY_FOREGROUND_UNKNOWN)\b/i;
+const PORT_CONFLICT_MARKER_RE = /\b(?:address\s+already\s+in\s+use|EADDRINUSE)\b/i;
+const LOCAL_HEALTH_PROBE_RE = /\b(?:curl|wget|http(?:ie)?)\b[\s\S]{0,180}\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::\d+)?/i;
 
 function normalizeLocalDevServerUrl(value: string): string {
   return value.replace(/[.,;:!?]+$/g, "");
@@ -46,6 +72,69 @@ function collectPtyText(raw: string, parsed: Record<string, unknown> | null): st
     .join("\n");
 }
 
+function finiteNumber(...values: unknown[]): number | undefined {
+  for (const value of values) {
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+  }
+  return undefined;
+}
+
+function resolvePtyRuntimeMetadata(parsed: Record<string, unknown> | null): {
+  foregroundGeneration?: number;
+  outputSequence?: number;
+} {
+  if (!parsed) return {};
+  const foregroundGeneration = finiteNumber(
+    parsed.foregroundGeneration,
+    parsed.generation,
+  );
+  const outputSequence = finiteNumber(
+    parsed.endOffset,
+    parsed.bufferEndOffset,
+    parsed.outputSequence,
+    parsed.sequence,
+  );
+  return {
+    ...(foregroundGeneration !== undefined ? { foregroundGeneration } : {}),
+    ...(outputSequence !== undefined ? { outputSequence } : {}),
+  };
+}
+
+/**
+ * A busy integrated PTY means that its foreground process is still alive. It
+ * is an observation requirement, not proof that the dev-server port is in use
+ * and not proof that every command channel is unavailable.
+ */
+export function classifyPtyCommandFailure(value: string): PtyCommandFailureSemantics {
+  const text = String(value || "");
+  if (PTY_OCCUPIED_MARKER_RE.test(text)) {
+    return {
+      kind: "pty_occupied",
+      terminalBusy: true,
+      portConflict: false,
+      nextCapability: "observe_pty",
+    };
+  }
+  if (PORT_CONFLICT_MARKER_RE.test(text)) {
+    return {
+      kind: "port_conflict",
+      terminalBusy: false,
+      portConflict: true,
+      nextCapability: "probe_existing_service",
+    };
+  }
+  return {
+    kind: "other",
+    terminalBusy: false,
+    portConflict: false,
+    nextCapability: "launch",
+  };
+}
+
+export function isLocalDevServerHealthProbeCommand(value: string): boolean {
+  return LOCAL_HEALTH_PROBE_RE.test(String(value || ""));
+}
+
 function lastMarkerIndex(text: string, pattern: RegExp): number {
   const flags = pattern.flags.includes("g") ? pattern.flags : `${pattern.flags}g`;
   const globalPattern = new RegExp(pattern.source, flags);
@@ -62,6 +151,9 @@ export function analyzePtyObservationResult(value: string): PtyObservationAnalys
   const readyIndex = lastMarkerIndex(text, READY_MARKER_RE);
   const waitingIndex = lastMarkerIndex(text, WAITING_MARKER_RE);
   const failureIndex = lastMarkerIndex(text, FAILURE_MARKER_RE);
+  const occupiedIndex = lastMarkerIndex(text, PTY_OCCUPIED_MARKER_RE);
+  const portConflictIndex = lastMarkerIndex(text, PORT_CONFLICT_MARKER_RE);
+  const metadata = resolvePtyRuntimeMetadata(parsed);
   const running = parsed?.running === true;
   const active = parsed?.active === true || running;
   const exitCode = typeof parsed?.exitCode === "number" ? parsed.exitCode : null;
@@ -92,83 +184,234 @@ export function analyzePtyObservationResult(value: string): PtyObservationAnalys
 
   // Terminal tails can contain old failures followed by a later successful
   // restart. The newest semantic marker owns the observation state.
+  if (
+    occupiedIndex >= 0 &&
+    occupiedIndex >= failureIndex &&
+    occupiedIndex >= readyIndex &&
+    occupiedIndex >= waitingIndex
+  ) {
+    return {
+      status: "running",
+      url: urls[urls.length - 1],
+      text,
+      ...metadata,
+      terminalBusy: true,
+      portConflict: false,
+    };
+  }
   if (failureIndex >= 0 && failureIndex >= readyIndex && failureIndex >= waitingIndex) {
-    return { status: "failed", url: urls[urls.length - 1], text };
+    return {
+      status: "failed",
+      url: urls[urls.length - 1],
+      text,
+      ...metadata,
+      terminalBusy: false,
+      portConflict: portConflictIndex >= 0 && portConflictIndex >= readyIndex,
+    };
   }
   // The PTY login shell can remain alive after the managed foreground process
   // exits. Only explicit idle/stopped ownership proves that the server ended;
   // unsupported foreground inspection remains unknown on Windows.
   if (foregroundState === "idle" || foregroundState === "stopped") {
-    return { status: "stopped", url: urls[urls.length - 1], text };
+    return {
+      status: "stopped",
+      url: urls[urls.length - 1],
+      text,
+      ...metadata,
+      terminalBusy: false,
+      portConflict: false,
+    };
   }
   if (readyIndex >= 0 && readyIndex > failureIndex && readyIndex >= waitingIndex) {
-    return { status: "ready", url: urls[urls.length - 1], text };
+    return {
+      status: "ready",
+      url: urls[urls.length - 1],
+      text,
+      ...metadata,
+      terminalBusy: foregroundState === "busy",
+      portConflict: false,
+    };
   }
   if (waitingIndex >= 0 && waitingIndex > failureIndex && waitingIndex > readyIndex) {
-    return { status: "running", url: urls[urls.length - 1], text };
+    return {
+      status: "running",
+      url: urls[urls.length - 1],
+      text,
+      ...metadata,
+      terminalBusy: foregroundState === "busy" || running || active,
+      portConflict: false,
+    };
   }
   if (foregroundState === "busy" || foregroundState === "unknown" || running || active) {
-    return { status: "running", url: urls[urls.length - 1], text };
+    return {
+      status: "running",
+      url: urls[urls.length - 1],
+      text,
+      ...metadata,
+      terminalBusy: foregroundState === "busy" || running || active,
+      portConflict: false,
+    };
   }
   if (exitCode !== null || parsed?.running === false || parsed?.active === false) {
-    return { status: exitCode === 0 ? "stopped" : "failed", url: urls[urls.length - 1], text };
+    return {
+      status: exitCode === 0 ? "stopped" : "failed",
+      url: urls[urls.length - 1],
+      text,
+      ...metadata,
+      terminalBusy: false,
+      portConflict: false,
+    };
   }
-  return { status: "unknown", url: urls[urls.length - 1], text };
+  return {
+    status: "unknown",
+    url: urls[urls.length - 1],
+    text,
+    ...metadata,
+    terminalBusy: false,
+    portConflict: false,
+  };
 }
 
 export function resolveLatestObservedDevServerUrl(
   ledger: PlanExecutionEvidenceEntry[],
 ): string | null {
-  let latestReadyIndex = -1;
-  let latestReadyUrl: string | null = null;
-  let latestPendingCommandIndex = -1;
+  const state = resolveDevServerRuntimeState(ledger);
+  return state.status === "ready" ? state.url : null;
+}
 
-  ledger.forEach((entry, index) => {
+function observationBelongsToLaunch(
+  entry: PlanExecutionEvidenceEntry,
+  launch: PlanExecutionEvidenceEntry | null,
+): boolean {
+  if (!launch) return true;
+  if (Number(entry.createdAt || 0) < Number(launch.createdAt || 0)) return false;
+  if (
+    typeof launch.foregroundGeneration === "number" &&
+    entry.foregroundGeneration !== launch.foregroundGeneration
+  ) {
+    // Once the launch has a generation identity, an unversioned terminal tail
+    // is not allowed to prove readiness. It may contain stale ready text from
+    // an older foreground process.
+    return false;
+  }
+  return true;
+}
+
+export function resolveDevServerRuntimeState(
+  ledger: PlanExecutionEvidenceEntry[],
+): DevServerRuntimeState {
+  let latestLaunch: PlanExecutionEvidenceEntry | null = null;
+  let status: DevServerRuntimeState["status"] = "none";
+  let url: string | null = null;
+  let foregroundGeneration: number | null = null;
+  let outputSequence: number | null = null;
+  let terminalBusy = false;
+  let portConflict = false;
+
+  for (const entry of ledger) {
     if (entry.sourceTool === "execute_command" && entry.observationStatus === "pending") {
-      latestPendingCommandIndex = index;
+      latestLaunch = entry;
+      status = "pending";
+      url = null;
+      foregroundGeneration = entry.foregroundGeneration ?? null;
+      outputSequence = entry.outputSequence ?? null;
+      terminalBusy = entry.terminalBusy === true;
+      portConflict = entry.portConflict === true;
+      continue;
     }
-    if (entry.kind === "dev_server_url" && entry.observationStatus === "ready") {
-      latestReadyIndex = index;
-      const urls = extractLocalDevServerUrls(entry.value);
-      latestReadyUrl = urls[urls.length - 1] || entry.value;
+    if (entry.sourceTool === "execute_command" && entry.observationStatus === "failed") {
+      latestLaunch = entry;
+      status = "failed";
+      url = null;
+      foregroundGeneration = entry.foregroundGeneration ?? foregroundGeneration;
+      outputSequence = entry.outputSequence ?? outputSequence;
+      terminalBusy = false;
+      portConflict = entry.portConflict === true;
+      continue;
     }
-  });
+    if (entry.sourceTool === "execute_command" && entry.observationStatus === "running") {
+      // A running execute_command entry is itself a launch boundary. Record it
+      // exactly like a pending launch so later PTY observations must match its
+      // generation; otherwise an old ready tail can incorrectly validate the
+      // newly started server. Readiness is sticky only for PTY observations
+      // inside one generation, never across a new execute_command launch.
+      latestLaunch = entry;
+      status = "running";
+      url = null;
+      foregroundGeneration = entry.foregroundGeneration ?? null;
+      outputSequence = entry.outputSequence ?? null;
+      terminalBusy = true;
+      portConflict = false;
+      continue;
+    }
+    if (
+      entry.sourceTool === "run_command" &&
+      entry.observationStatus !== "failed" &&
+      status === "failed" &&
+      portConflict &&
+      isLocalDevServerHealthProbeCommand(entry.value || entry.target || "")
+    ) {
+      const probeUrls = extractLocalDevServerUrls(entry.value || entry.target || "");
+      status = "ready";
+      url = probeUrls[probeUrls.length - 1] || url;
+      portConflict = false;
+      continue;
+    }
+    if (
+      !entry.observationStatus ||
+      !["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(entry.sourceTool) ||
+      !observationBelongsToLaunch(entry, latestLaunch)
+    ) {
+      continue;
+    }
+    if (entry.observationStatus === "unknown" && status !== "none" && status !== "unknown") {
+      continue;
+    }
+    // Readiness is sticky for the current generation. A later incremental
+    // observation that merely says the process is still running must not send
+    // the lifecycle backwards to starting; only stopped/failed or a new launch
+    // can invalidate a ready state.
+    status = status === "ready" && entry.observationStatus === "running"
+      ? "ready"
+      : entry.observationStatus;
+    foregroundGeneration = entry.foregroundGeneration ?? foregroundGeneration;
+    outputSequence = entry.outputSequence ?? outputSequence;
+    terminalBusy = entry.terminalBusy === true || entry.observationStatus === "running";
+    portConflict = entry.portConflict === true;
+    if (entry.observationStatus === "ready") {
+      url = extractLocalDevServerUrls(entry.value)[0] || url;
+    } else if (entry.observationStatus === "failed" || entry.observationStatus === "stopped") {
+      url = null;
+      terminalBusy = false;
+    }
+  }
 
-  return latestReadyUrl && latestReadyIndex > latestPendingCommandIndex
-    ? latestReadyUrl
-    : null;
+  const nextCapability: DevServerNextCapability =
+    status === "pending" || status === "running" || status === "unknown"
+      ? "observe_pty"
+      : status === "ready"
+      ? "browser"
+      : status === "failed" && portConflict
+      ? "reconcile"
+      : status === "failed" || status === "stopped" || status === "none"
+      ? "launch"
+      : "reconcile";
+  return {
+    status,
+    url,
+    foregroundGeneration,
+    outputSequence,
+    terminalBusy,
+    portConflict,
+    nextCapability,
+  };
 }
 
 export function resolveDevServerRuntimeObservation(
   ledger: PlanExecutionEvidenceEntry[],
 ): { status: "none" | "pending" | PtyObservationStatus; url: string | null } {
-  let status: "none" | "pending" | PtyObservationStatus = "none";
-  let url: string | null = null;
-  for (const entry of ledger) {
-    if (entry.sourceTool === "execute_command" && entry.observationStatus === "pending") {
-      status = "pending";
-      url = null;
-      continue;
-    }
-    if (
-      entry.observationStatus &&
-      ["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(entry.sourceTool)
-    ) {
-      // An observation without a readiness/failure marker is inconclusive. It
-      // must not erase a pending launch or a known running state and thereby
-      // release browser validation against a guessed localhost port.
-      if (entry.observationStatus === "unknown" && status !== "none" && status !== "unknown") {
-        continue;
-      }
-      status = entry.observationStatus;
-      if (entry.observationStatus === "ready") {
-        url = extractLocalDevServerUrls(entry.value)[0] || url;
-      } else if (entry.observationStatus === "failed" || entry.observationStatus === "stopped") {
-        url = null;
-      }
-    }
-  }
-  return { status, url };
+  const state = resolveDevServerRuntimeState(ledger);
+  return { status: state.status, url: state.url };
 }
 
 function localUrlOrigin(value: string): string | null {
@@ -212,8 +455,10 @@ export function resolveBrowserValidationPreflight(input: {
   action: "allow" | "block" | "correct";
   url: string;
   runtimeStatus: "none" | "pending" | PtyObservationStatus;
+  reason: "PTY_OBSERVATION_REQUIRED" | "DEV_SERVER_PORT_CONFLICT_UNCONFIRMED" | "DEV_SERVER_START_FAILED" | "DEV_SERVER_STOPPED" | null;
+  nextCapability: DevServerNextCapability;
 } {
-  const observation = resolveDevServerRuntimeObservation(input.ledger);
+  const observation = resolveDevServerRuntimeState(input.ledger);
   if (
     observation.url === null &&
     ["pending", "running", "failed", "stopped"].includes(observation.status)
@@ -222,6 +467,14 @@ export function resolveBrowserValidationPreflight(input: {
       action: "block",
       url: input.requestedUrl,
       runtimeStatus: observation.status,
+      reason: observation.status === "failed" && observation.portConflict
+        ? "DEV_SERVER_PORT_CONFLICT_UNCONFIRMED"
+        : observation.status === "failed"
+        ? "DEV_SERVER_START_FAILED"
+        : observation.status === "stopped"
+        ? "DEV_SERVER_STOPPED"
+        : "PTY_OBSERVATION_REQUIRED",
+      nextCapability: observation.nextCapability,
     };
   }
   const corrected = reconcileBrowserValidationUrl({
@@ -232,5 +485,7 @@ export function resolveBrowserValidationPreflight(input: {
     action: corrected.corrected ? "correct" : "allow",
     url: corrected.url,
     runtimeStatus: observation.status,
+    reason: null,
+    nextCapability: observation.status === "ready" ? "browser" : "reconcile",
   };
 }

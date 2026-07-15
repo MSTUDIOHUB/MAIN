@@ -1,5 +1,10 @@
 import { buildChatFinalSynthesisPrompt, buildMaxStepsFinalTextPrompt } from "../../agentLoopSafety";
-import { describeExecuteRecoveryToolSurface, summarizeRepeatedExecuteTargets, type ExecuteRecoveryMode } from "../../executeRecoveryTools";
+import {
+  resolveExecuteRecoveryActionContract,
+  summarizeRepeatedExecuteTargets,
+  type ExecuteRecoveryMode,
+  type RecoveryActionContract,
+} from "../../executeRecoveryTools";
 import { classifyAssistantCompletion } from "../../normalizedTurn";
 import {
   fetchLLMStream,
@@ -11,6 +16,7 @@ import {
 } from "../../orchestrator";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { OpenAiToolChoice, StreamResult } from "../../streaming";
+import { annotateRequiredToolCallProtocolResult } from "../../requiredToolProtocol";
 import type { ToolDefinition } from "../../toolSchemas";
 import {
   buildPlanTaskEvidenceAudit,
@@ -80,11 +86,14 @@ export function resolveRecoveryToolChoice(input: {
   preferExplicitFunction?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
   approvedPlanRecoveryPreferredToolNames?: string[];
+  recoveryActionContract?: RecoveryActionContract;
 }): OpenAiToolChoice | undefined {
   const availableToolNames = new Set(input.llmToolNames);
   if (availableToolNames.size <= 0 || input.forceXmlTools) return undefined;
+  const recoveryActionContract = input.recoveryActionContract ||
+    resolveExecuteRecoveryActionContract(input.executeRecoveryMode);
   const executeRecoveryRequiresAction =
-    input.isExecuteRecoveryEligible && input.executeRecoveryMode !== "normal";
+    input.isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
   const approvedPlanRecoveryRequiresAction =
     input.approvedPlanActionOnlyRecoveryActive ||
     input.approvedPlanNoToolRecoveryFileReadActive;
@@ -98,16 +107,24 @@ export function resolveRecoveryToolChoice(input: {
       candidates.find((name) => availableToolNames.has(name)) || null;
     let selectedTool: string | null = null;
     if (input.isExecuteRecoveryEligible) {
-      if (input.executeRecoveryMode === "patch_recovery_read") {
+      if (recoveryActionContract.nextRequiredCapability === "targeted_read") {
         selectedTool = firstAvailable(["read_file"]);
-      } else if (
-        input.executeRecoveryMode === "mutation_first" ||
-        input.executeRecoveryMode === "action_only"
-      ) {
+      } else if (recoveryActionContract.nextRequiredCapability === "mutation") {
         selectedTool = firstAvailable(["apply_patch", "replace_in_file", "write_file"]);
+      } else if (recoveryActionContract.nextRequiredCapability === "observe_pty") {
+        selectedTool = firstAvailable([
+          "read_pty_since",
+          "get_pty_status",
+        ]);
+      } else if (recoveryActionContract.nextRequiredCapability === "browser_validation") {
+        selectedTool = firstAvailable(["browser_evaluate"]);
+      } else if (recoveryActionContract.nextRequiredCapability === "launch_long_process") {
+        selectedTool = firstAvailable(["execute_command"]);
+      } else if (recoveryActionContract.nextRequiredCapability === "reconcile_server") {
+        selectedTool = firstAvailable(["run_command"]);
       } else if (input.executeRecoveryMode === "finite_validation_only") {
         selectedTool = firstAvailable(["run_command"]);
-      } else if (input.executeRecoveryMode === "validation_only") {
+      } else if (recoveryActionContract.nextRequiredCapability === "validation") {
         // This state can require a finite test, a long-lived dev server, a
         // browser assertion, or a diff check. Binding local models to the
         // first available function previously forced long-running `npm run
@@ -162,6 +179,7 @@ export async function invokeInitialStreamForIteration(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string | null;
   allowExecuteRecoveryFileRead: boolean;
+  recoveryActionContract: RecoveryActionContract;
   isExecuteRecoveryEligible: boolean;
   approvedPlanActionOnlyRecoveryActive: boolean;
   approvedPlanNoToolRecoveryFileReadActive: boolean;
@@ -195,6 +213,7 @@ export async function invokeInitialStreamForIteration(input: {
     executeRecoveryMode,
     executeRecoveryReason,
     allowExecuteRecoveryFileRead,
+    recoveryActionContract,
     isExecuteRecoveryEligible,
     approvedPlanActionOnlyRecoveryActive,
     approvedPlanNoToolRecoveryFileReadActive,
@@ -329,6 +348,7 @@ export async function invokeInitialStreamForIteration(input: {
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
     approvedPlanRecoveryPreferredToolNames,
+    recoveryActionContract,
   });
   const policyCurrentMaxTokens =
     capPreapprovalPlanQualityRecoveryMaxTokens(
@@ -365,7 +385,10 @@ export async function invokeInitialStreamForIteration(input: {
     compatibilityOverride: !!providerCompatibilityOverride,
     executeRecoveryMode,
     executeRecoveryReason,
-    recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
+    recoveryPhase: recoveryActionContract.phase,
+    nextRequiredCapability: recoveryActionContract.nextRequiredCapability,
+    recoveryToolSurface: recoveryActionContract.surfaceDescription,
+    allowExecuteRecoveryFileRead,
     finalTextOnlyStep,
     chatFinalSynthesisActive,
     chatFinalSynthesisReason,
@@ -406,7 +429,7 @@ export async function invokeInitialStreamForIteration(input: {
     ? executionPolicy.getResponseFormatSchema?.()
     : undefined;
 
-  const streamResult = await fetchLLMStream(
+  const rawStreamResult = await fetchLLMStream(
     messagesForLLM,
     settings,
     assistantMsgId,
@@ -423,6 +446,20 @@ export async function invokeInitialStreamForIteration(input: {
       responseFormat: responseSchema,
     },
   );
+  const streamResult = annotateRequiredToolCallProtocolResult(
+    rawStreamResult,
+    recoveryToolChoice,
+  );
+  if (streamResult.protocolViolation) {
+    logAgentEvent("required_tool_call_protocol_violation", {
+      iteration,
+      violation: streamResult.protocolViolation,
+      toolChoice: recoveryToolChoice ?? null,
+      availableTools: llmTools.map((tool) => tool.function.name),
+      finishReason: streamResult.finishReason || null,
+      visibleChars: streamResult.content.length,
+    });
+  }
 
   const totalOutputChars = streamResult.content.length + (streamResult.reasoningContent || "").length;
   const isLengthTruncated = streamResult.finishReason === "length";
@@ -450,6 +487,7 @@ export async function invokeInitialStreamForIteration(input: {
     contentChars: streamResult.content.length,
     reasoningChars: (streamResult.reasoningContent || "").length,
     toolCalls: streamResult.toolCalls?.length || 0,
+    protocolViolation: streamResult.protocolViolation ?? null,
     contextLimitUnchanged: snapshotContextLimit ?? null,
   });
   else logAgentEvent("assistant_completion_classified", {

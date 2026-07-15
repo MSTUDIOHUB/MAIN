@@ -135,3 +135,79 @@ test("approved plan no-tool route does not intervene outside approved execution"
   assert.equal(decision.shouldSuppressApprovedPlanNoToolText, false);
   assert.equal(decision.shouldLogApprovedPlanNoToolRoute, false);
 });
+
+test("user-only review is a conclusion advisory instead of a no-tool completion blocker", () => {
+  const decision = route({
+    planTasks: [{
+      id: "task-review",
+      text: "User reviews the target desktop interaction",
+      status: "pending",
+      evidence: [{ kind: "manual_user_validation", value: "user confirmation" }],
+    }],
+    availableToolNames: new Set(["read_file", "run_command"]),
+    userVisibleText: "Automated work is complete.",
+  });
+
+  assert.equal(decision.audit.acceptedCompletion, true);
+  assert.equal(decision.audit.pendingUserValidationTasks.length, 1);
+  assert.equal(decision.hasRemainingApprovedPlanTasks, false);
+  assert.equal(decision.shouldHandleApprovedPlanNoTool, false);
+  assert.equal(decision.shouldSuppressApprovedPlanNoToolText, false);
+});
+
+test("browser review becomes advisory only when browser automation is unavailable", () => {
+  const planTasks = [{
+    id: "task-browser",
+    text: "Verify the rendered page",
+    status: "pending",
+    evidence: [{ kind: "browser_dom", value: "browser DOM validation" }],
+  }];
+  const unavailable = route({
+    planTasks,
+    availableToolNames: new Set(["read_file", "run_command"]),
+  });
+  const available = route({
+    planTasks,
+    availableToolNames: new Set(["browser_evaluate"]),
+  });
+
+  assert.equal(unavailable.audit.acceptedCompletion, true);
+  assert.equal(unavailable.shouldHandleApprovedPlanNoTool, false);
+  assert.equal(available.audit.acceptedCompletion, false);
+  assert.equal(available.shouldHandleApprovedPlanNoTool, true);
+});
+
+test("an unavailable browser cannot hide a missing mutation in the same task", () => {
+  const planTasks = [{
+    id: "task-mutation-and-browser",
+    text: "Update the page, then verify the rendered result",
+    status: "pending",
+    evidence: [
+      { kind: "file", value: "src/App.tsx" },
+      { kind: "browser_dom", value: "browser DOM validation" },
+    ],
+  }];
+  const beforeMutation = route({
+    planTasks,
+    availableToolNames: new Set(["read_file", "run_command"]),
+  });
+  const afterMutation = route({
+    planTasks,
+    evidenceLedger: [{
+      id: "mutation",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }],
+    availableToolNames: new Set(["read_file", "run_command"]),
+  });
+
+  assert.equal(beforeMutation.audit.tasks[0].evidenceStatus, "missing");
+  assert.equal(beforeMutation.audit.acceptedCompletion, false);
+  assert.equal(beforeMutation.shouldHandleApprovedPlanNoTool, true);
+  assert.equal(afterMutation.audit.tasks[0].evidenceStatus, "requires_browser_validation");
+  assert.equal(afterMutation.audit.acceptedCompletion, true);
+  assert.equal(afterMutation.shouldHandleApprovedPlanNoTool, false);
+});

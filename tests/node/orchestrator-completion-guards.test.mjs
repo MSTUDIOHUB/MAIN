@@ -172,8 +172,28 @@ test("execution evidence completion guard pauses completed execute turns without
   assert.equal(events.statuses.at(-1), "idle");
 });
 
-test("execution evidence completion guard allows turns that already have evidence", () => {
-  const { callbacks, events } = createCallbacks();
+test("execution evidence completion guard allows a mutation only after fresh validation", () => {
+  const ledger = [
+    {
+      id: "mutation",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    },
+    {
+      id: "validation",
+      kind: "cmd",
+      value: "npm test",
+      target: "npm test",
+      sourceTool: "run_command",
+      createdAt: 2,
+    },
+  ];
+  const { callbacks, events } = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => ledger,
+  });
   const result = runExecutionEvidenceCompletionGuard({
     outcome: { status: "completed", reason: "agent_loop_completed" },
     callbacks,
@@ -182,6 +202,7 @@ test("execution evidence completion guard allows turns that already have evidenc
       runtimeIntent: "execute",
       approvalState: "approved",
       mutationExpected: true,
+      validationExpected: true,
       completionEvidenceRequired: "execution_evidence",
     },
     approvedPlanAlreadyAudited: false,
@@ -190,6 +211,455 @@ test("execution evidence completion guard allows turns that already have evidenc
 
   assert.equal(result, null);
   assert.equal(events.stops.length, 0);
+});
+
+test("an active recovery phase blocks final completion even when prior evidence is otherwise sufficient", () => {
+  const { callbacks, events } = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [
+      {
+        id: "mutation",
+        kind: "file",
+        value: "src/App.tsx",
+        sourceTool: "apply_patch",
+        createdAt: 1,
+      },
+      {
+        id: "validation",
+        kind: "cmd",
+        value: "npm test",
+        sourceTool: "run_command",
+        createdAt: 2,
+      },
+    ],
+  });
+  const result = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    finalTurnContract: {
+      conversationIntent: "execute",
+      runtimeIntent: "execute",
+      approvalState: "approved",
+      mutationExpected: true,
+      validationExpected: true,
+      completionEvidenceRequired: "execution_evidence",
+    },
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+    executeRecoveryState: {
+      mode: "validation_only",
+      reason: "recovery_mutation_observed",
+      expectedTarget: "src/App.tsx",
+      attempts: 1,
+      phaseNoProgressCount: 1,
+      iterationCount: 1,
+      readLease: null,
+      sourceObservationKey: null,
+      decisionCheckpoint: null,
+      consecutiveBlockedReadFileCount: 0,
+      repeatedEditValidationAttempts: 0,
+    },
+  });
+  assert.equal(result.reason, "execution_evidence_gap:recovery_phase_pending");
+  assert.match(events.stops[0].message, /恢复事务仍处于 validation 阶段/);
+});
+
+test("execution evidence completion guard rejects mutation without later validation", () => {
+  const { callbacks, events } = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [{
+      id: "mutation",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 2,
+    }],
+  });
+  const result = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    finalTurnContract: {
+      conversationIntent: "execute",
+      runtimeIntent: "execute",
+      approvalState: "approved",
+      mutationExpected: true,
+      validationExpected: true,
+      completionEvidenceRequired: "execution_evidence",
+    },
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+
+  assert.deepEqual(result, {
+    status: "stopped_no_action",
+    reason: "execution_evidence_gap:validation_after_mutation_required",
+  });
+  assert.match(events.stops[0].message, /最新修改之后没有可信/);
+  assert.equal(events.stops[0].progress.recoveryReason, "execution_evidence_gap:validation_after_mutation_required");
+});
+
+test("validation before a newer mutation cannot close the execution evidence gate", () => {
+  const { callbacks } = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [
+      {
+        id: "old-validation",
+        kind: "cmd",
+        value: "npm test",
+        sourceTool: "run_command",
+        createdAt: 1,
+      },
+      {
+        id: "new-mutation",
+        kind: "file",
+        value: "src/App.tsx",
+        sourceTool: "apply_patch",
+        createdAt: 2,
+      },
+    ],
+  });
+  const result = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    finalTurnContract: {
+      conversationIntent: "execute",
+      runtimeIntent: "execute",
+      approvalState: "approved",
+      mutationExpected: true,
+      validationExpected: true,
+      completionEvidenceRequired: "execution_evidence",
+    },
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(result.reason, "execution_evidence_gap:validation_after_mutation_required");
+});
+
+test("a later actual browser failure remains unresolved until the same browser target succeeds", () => {
+  const contract = {
+    conversationIntent: "execute",
+    runtimeIntent: "execute",
+    approvalState: "approved",
+    mutationExpected: true,
+    validationExpected: true,
+    completionEvidenceRequired: "execution_evidence",
+  };
+  const failedLedger = [
+    {
+      id: "mutation",
+      kind: "file",
+      value: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    },
+    {
+      id: "finite-validation",
+      kind: "cmd",
+      value: "npm test",
+      sourceTool: "run_command",
+      createdAt: 2,
+    },
+    {
+      id: "browser-failure",
+      kind: "tool",
+      value: "http://localhost:1420/",
+      target: "http://localhost:1420/",
+      sourceTool: "browser_evaluate",
+      observationStatus: "failed",
+      createdAt: 3,
+    },
+  ];
+  const failedHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => failedLedger,
+  });
+  const blocked = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: failedHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(blocked.reason, "execution_evidence_gap:unreconciled_failure");
+
+  const recoveredHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [...failedLedger, {
+      id: "browser-success",
+      kind: "browser_dom",
+      value: "http://localhost:1420/",
+      target: "http://localhost:1420/",
+      sourceTool: "browser_evaluate",
+      createdAt: 4,
+    }],
+  });
+  const recovered = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: recoveredHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(recovered, null);
+});
+
+test("ledger append order, not equal millisecond timestamps, determines post-mutation validation", () => {
+  const contract = {
+    conversationIntent: "execute",
+    runtimeIntent: "execute",
+    approvalState: "approved",
+    mutationExpected: true,
+    validationExpected: true,
+    completionEvidenceRequired: "execution_evidence",
+  };
+  const blockedHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [
+      {
+        id: "validation-first",
+        kind: "cmd",
+        value: "npm test",
+        sourceTool: "run_command",
+        createdAt: 10,
+      },
+      {
+        id: "mutation-second",
+        kind: "file",
+        value: "src/App.tsx",
+        sourceTool: "apply_patch",
+        createdAt: 10,
+      },
+    ],
+  });
+  const blocked = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: blockedHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(blocked.reason, "execution_evidence_gap:validation_after_mutation_required");
+
+  const closedHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [
+      {
+        id: "mutation-first",
+        kind: "file",
+        value: "src/App.tsx",
+        sourceTool: "apply_patch",
+        createdAt: 10,
+      },
+      {
+        id: "validation-second",
+        kind: "cmd",
+        value: "npm test",
+        sourceTool: "run_command",
+        createdAt: 10,
+      },
+    ],
+  });
+  const closed = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: closedHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(closed, null);
+});
+
+test("long-running execution requires current PTY readiness and browser validation", () => {
+  const baseLedger = [
+    {
+      id: "mutation",
+      kind: "file",
+      value: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    },
+    {
+      id: "launch",
+      kind: "cmd",
+      value: "npm run dev",
+      sourceTool: "execute_command",
+      observationStatus: "pending",
+      foregroundGeneration: 3,
+      createdAt: 2,
+    },
+  ];
+  const contract = {
+    conversationIntent: "execute",
+    runtimeIntent: "execute",
+    approvalState: "approved",
+    mutationExpected: true,
+    validationExpected: true,
+    completionEvidenceRequired: "execution_evidence",
+  };
+  const pendingHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => baseLedger,
+  });
+  const pending = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: pendingHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(pending.reason, "execution_evidence_gap:pty_observation_required");
+
+  const readyLedger = [...baseLedger, {
+    id: "ready",
+    kind: "dev_server_url",
+    value: "http://localhost:1420/",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 3,
+    createdAt: 3,
+  }];
+  const readyHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => readyLedger,
+  });
+  const ready = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: readyHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(ready.reason, "execution_evidence_gap:browser_validation_required");
+
+  const browserHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [...readyLedger, {
+      id: "browser",
+      kind: "browser_dom",
+      value: "http://localhost:1420/",
+      sourceTool: "browser_evaluate",
+      createdAt: 4,
+    }],
+  });
+  const closed = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: browserHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(closed, null);
+});
+
+test("validation-only long-running execution cannot complete before PTY and browser evidence", () => {
+  const launch = {
+    id: "validation-only-launch",
+    kind: "cmd",
+    value: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "pending",
+    foregroundGeneration: 7,
+    createdAt: 1,
+  };
+  const contract = {
+    conversationIntent: "execute",
+    runtimeIntent: "execute",
+    approvalState: "approved",
+    mutationExpected: false,
+    validationExpected: true,
+    completionEvidenceRequired: "execution_evidence",
+  };
+  const guard = (ledger) => runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: createCallbacks({
+      getPlanExecutionEvidenceLedger: () => ledger,
+    }).callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+
+  assert.equal(
+    guard([launch])?.reason,
+    "execution_evidence_gap:pty_observation_required",
+  );
+  const ready = {
+    id: "validation-only-ready",
+    kind: "dev_server_url",
+    value: "http://localhost:1420/",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 7,
+    createdAt: 2,
+  };
+  assert.equal(
+    guard([launch, ready])?.reason,
+    "execution_evidence_gap:browser_validation_required",
+  );
+  const browser = {
+    id: "validation-only-browser",
+    kind: "browser_dom",
+    value: "http://localhost:1420/",
+    sourceTool: "browser_evaluate",
+    createdAt: 3,
+  };
+  assert.equal(guard([launch, ready, browser]), null);
+});
+
+test("a healthy existing server reconciles a port conflict but still requires browser validation", () => {
+  const contract = {
+    conversationIntent: "execute",
+    runtimeIntent: "execute",
+    approvalState: "approved",
+    mutationExpected: true,
+    validationExpected: true,
+    completionEvidenceRequired: "execution_evidence",
+  };
+  const reconciledLedger = [
+    {
+      id: "mutation",
+      kind: "file",
+      value: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    },
+    {
+      id: "port-conflict",
+      kind: "cmd",
+      value: "npm run dev",
+      sourceTool: "execute_command",
+      observationStatus: "failed",
+      portConflict: true,
+      createdAt: 2,
+    },
+    {
+      id: "healthy-existing-server",
+      kind: "cmd",
+      value: "curl -fsS http://localhost:1420/",
+      sourceTool: "run_command",
+      createdAt: 3,
+    },
+  ];
+  const reconciledHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => reconciledLedger,
+  });
+  const reconciled = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: reconciledHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(reconciled.reason, "execution_evidence_gap:browser_validation_required");
+
+  const browserHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => [...reconciledLedger, {
+      id: "browser",
+      kind: "browser_dom",
+      value: "http://localhost:1420/",
+      sourceTool: "browser_evaluate",
+      createdAt: 4,
+    }],
+  });
+  const closed = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: browserHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(closed, null);
 });
 
 test("approved plan completion guard pauses completed plan execution without audit evidence", () => {
@@ -211,6 +681,40 @@ test("approved plan completion guard pauses completed plan execution without aud
   assert.equal(events.stops[0].reason, "incomplete_plan");
   assert.equal(events.stops[0].progress.recoveryReason, "approved_plan_completion_guard_no_evidence");
   assert.equal(events.statuses.at(-1), "idle");
+});
+
+test("approved plan completion treats user review as a conclusion advisory", () => {
+  const ledger = [{
+    id: "mutation",
+    kind: "file",
+    value: "src/App.tsx",
+    target: "src/App.tsx",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  }];
+  const { callbacks, events } = createCallbacks({
+    getWorkflowMode: () => "plan",
+    getIsPlanApproved: () => true,
+    getPlanStage: () => "completed",
+    getPlanTasks: () => [{
+      id: "task-with-review",
+      text: "Update the page and let the user review the target interaction",
+      status: "pending",
+      evidence: [
+        { kind: "file", value: "src/App.tsx" },
+        { kind: "manual_user_validation", value: "user reviews the target interaction" },
+      ],
+    }],
+    getPlanExecutionEvidenceLedger: () => ledger,
+  });
+  const result = runApprovedPlanCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks,
+    sawExecutionEvidence: true,
+  });
+
+  assert.equal(result, null);
+  assert.equal(events.stops.length, 0);
 });
 
 test("approved plan completion is deferred until the current loop consumes the execution transition", () => {

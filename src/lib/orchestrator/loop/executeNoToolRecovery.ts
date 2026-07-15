@@ -51,6 +51,7 @@ export function handleExecuteNoToolRecovery(input: {
   shouldPauseForUserChoice: boolean;
   sawExecuteOperationEvidence: boolean;
   visibleText: string;
+  protocolViolation?: "required_tool_call_missing";
   assistantMsgId: string;
   consecutiveNoToolCount: number;
 }): ExecuteNoToolRecoveryResult {
@@ -84,6 +85,42 @@ export function handleExecuteNoToolRecovery(input: {
     turnIntent,
     runtimeIntent,
   });
+  if (
+    isExecuteRuntimeWithoutEvidence &&
+    input.protocolViolation === "required_tool_call_missing"
+  ) {
+    callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
+    callbacks.onStatusChange("running");
+    consecutiveNoToolCount += 1;
+    logAgentEvent("execute_required_tool_call_missing", {
+      iteration,
+      consecutiveNoToolCount,
+      workflowMode,
+      turnIntent,
+      runtimeIntent,
+      availableTools: Array.from(availableToolNames),
+    });
+    if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
+      callbacks.onNonActionableStop(
+        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
+        "missing_tool_loop",
+        {
+          phase: "paused",
+          recoveryReason: "required_tool_call_protocol_violation",
+          nextStep: callbacks.getPreferredLanguage() === "zh"
+            ? "模型在 required 工具阶段连续返回零工具调用；从当前证据检查点恢复，不能把 stop 当作完成。"
+            : "The model repeatedly returned no tool call while tool use was required; resume from the evidence checkpoint instead of treating stop as completion.",
+        },
+      );
+      callbacks.onStatusChange("idle");
+      return finish("stopped");
+    }
+    callbacks.appendMessage({
+      role: "user",
+      content: "TOOL_PROTOCOL_RECOVERY: The previous response violated required tool use by returning no tool call. Do not restart analysis or claim completion; call exactly one currently available tool that closes the active evidence gap.",
+    });
+    return finish("continue");
+  }
   const rejectedExecuteCompletionClaim =
     isExecuteRuntimeWithoutEvidence &&
     finalReplyOptionsCount === 0 &&

@@ -1,5 +1,6 @@
 import { shouldBypassApprovedPlanReadCacheForPatchRecovery } from "../../approvedPlanRecoveryTools";
 import {
+  resolveExecuteRecoveryActionContract,
   resolveExecuteRecoveryBatchDecision,
   shouldUseExecutePatchRecoveryReadLease,
   type ExecuteRecoveryMode,
@@ -15,6 +16,7 @@ import {
   formatReadFileWindowNarrowedNote,
   getReadFileCoverageForPath,
   invalidateStaleFileReadStatesForPath,
+  resolveReadFileEligibilityDecision,
   type FileReadState,
 } from "../../orchestrator/fileReadCache";
 import {
@@ -70,6 +72,7 @@ import {
 import { shouldCacheReadOnlyToolResult } from "../../readOnlyToolCachePolicy";
 import {
   resolveBrowserValidationPreflight,
+  resolveDevServerRuntimeState,
 } from "../../devServerRuntime";
 import type {
   AgentMessage,
@@ -174,6 +177,21 @@ export async function partitionToolCallsForExecution(input: {
   let executePatchRecoveryReadLeaseClaimed = false;
   let sawOrderSensitiveWorkspaceAction = false;
   let deferRemainingCallsForBatchOrder = false;
+  const executeRecoveryDevServerObservation = resolveDevServerRuntimeState(
+    callbacks.getPlanExecutionEvidenceLedger(),
+  );
+  const executeRecoveryContract = resolveExecuteRecoveryActionContract(executeRecoveryMode, {
+    expectedTarget: executeRecoveryState.expectedTarget,
+    readLease: executeRecoveryState.readLease,
+    sourceObservationKey: executeRecoveryState.sourceObservationKey,
+    decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
+    phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount ?? executeRecoveryState.iterationCount,
+    devServerStatus: executeRecoveryDevServerObservation.status,
+    devServerNextCapability: executeRecoveryDevServerObservation.nextCapability,
+    devServerUrl: executeRecoveryDevServerObservation.url,
+    ptyGeneration: executeRecoveryDevServerObservation.foregroundGeneration,
+    ptyOutputSequence: executeRecoveryDevServerObservation.outputSequence,
+  });
   const executeRecoveryBatchDecision = resolveExecuteRecoveryBatchDecision({
     mode: executeRecoveryMode,
     calls: toolCalls.map((call) => {
@@ -186,6 +204,7 @@ export async function partitionToolCallsForExecution(input: {
     }),
     recentActivity: recentToolActivity,
     expectedTarget: executeRecoveryState.expectedTarget,
+    contract: executeRecoveryContract,
   });
 
   for (const tc of toolCalls) {
@@ -225,7 +244,24 @@ export async function partitionToolCallsForExecution(input: {
       toolCallId: tc.id,
       streamStatus: "tool_called",
     });
-    const failureSignature = buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
+    const baseFailureSignature = buildRepeatLoopSignature(
+      tc.name,
+      buildRepeatLoopArgsKey(toolArgs),
+    );
+    const recoveryFailureScope = executeRecoveryMode === "normal"
+      ? ""
+      : [
+          executeRecoveryContract.phase,
+          executeRecoveryContract.nextRequiredCapability,
+          executeRecoveryState.expectedTarget || "no-target",
+          executeRecoveryState.sourceObservationKey ||
+            executeRecoveryState.readLease?.observedVersion ||
+            "no-file-version",
+          executeRecoveryContract.ptyGeneration ?? "no-pty-generation",
+        ].join("::");
+    const failureSignature = recoveryFailureScope
+      ? `${baseFailureSignature}::recovery=${recoveryFailureScope}`
+      : baseFailureSignature;
     toolFailureSignatures.set(tc.id, failureSignature);
 
     const isAllowedPlanDraftMutation =
@@ -234,7 +270,7 @@ export async function partitionToolCallsForExecution(input: {
       isPreApprovalPlanDraftWrite(tc.name, toolArgs);
     if (!availableToolNames.has(tc.name) && !isAllowedPlanDraftMutation) {
       const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
-      const message = planUnsupportedToolFeedbackMessage({
+      const unsupportedMessage = planUnsupportedToolFeedbackMessage({
         language: callbacks.getPreferredLanguage(),
         toolName: tc.name,
         runtimeIntent,
@@ -243,16 +279,29 @@ export async function partitionToolCallsForExecution(input: {
         planRuntimePhase,
         availableToolNames: Array.from(availableToolNames),
       });
+      const isExecuteRecoveryScopeCorrection = executeRecoveryBatchDecision.active;
+      const isReadScopeDeferred = tc.name === "read_file";
+      const isInternalScopeDeferral = isExecuteRecoveryScopeCorrection || isReadScopeDeferred;
+      const message = isExecuteRecoveryScopeCorrection
+        ? tc.name === "read_file"
+          ? callbacks.getPreferredLanguage() === "zh"
+            ? `READ_SCOPE_DEFERRED: 当前恢复事务未暴露这个读取调用。请保持目标为 ${executeRecoveryState.expectedTarget || "当前任务目标"}，并按文件版本/缺失行范围发起一次定向 read_file；不要改用 shell 读取绕行。`
+            : `READ_SCOPE_DEFERRED: This read was not exposed by the current recovery transaction. Keep the target scoped to ${executeRecoveryState.expectedTarget || "the current task target"} and request one targeted read_file for a changed version or missing line window; do not bypass this with shell file reads.`
+          : callbacks.getPreferredLanguage() === "zh"
+            ? `EXECUTE_RECOVERY_SCOPE_DEFERRED: ${tc.name} 不属于当前 ${executeRecoveryBatchDecision.phase} 阶段；请使用当前工具面完成下一能力。`
+            : `EXECUTE_RECOVERY_SCOPE_DEFERRED: ${tc.name} is outside the current ${executeRecoveryBatchDecision.phase} phase; use the active tool surface for the next capability.`
+        : unsupportedMessage;
       if (executeRecoveryBatchDecision.active) {
-        logAgentEvent("execute_recovery_unavailable_tool_call", {
+        logAgentEvent("execute_recovery_scope_deferred", {
           iteration,
           phase: executeRecoveryBatchDecision.phase,
+          nextRequiredCapability: executeRecoveryContract.nextRequiredCapability,
           mode: executeRecoveryMode,
           tool: tc.name,
           target,
           expectedTarget: executeRecoveryState.expectedTarget,
           availableToolNames: Array.from(availableToolNames).slice(0, 12),
-          outcome: "blocked_before_batch_deferral",
+          outcome: "internal_scope_feedback",
         });
       }
       logAgentEvent("plan_unsupported_tool_call_suppressed", {
@@ -267,22 +316,39 @@ export async function partitionToolCallsForExecution(input: {
         availableToolNames: Array.from(availableToolNames).slice(0, 12),
         planRuntimePhase,
         preservedVisibleText: false,
-        internalFeedback: isUnapprovedPlanContext,
+        internalFeedback: isUnapprovedPlanContext || isInternalScopeDeferral,
       });
-      if (!isUnapprovedPlanContext) {
+      if (!isUnapprovedPlanContext && !isInternalScopeDeferral) {
         callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+      } else if (isInternalScopeDeferral) {
+        toolFailureSignatures.delete(tc.id);
+        callbacks.onToolDone(tc.name, target, message, {
+          toolCallId: tc.id,
+          internalFeedback: true,
+          qualityGateReason: isExecuteRecoveryScopeCorrection
+            ? "execute_recovery_scope_deferred"
+            : "read_scope_deferred",
+        });
       }
       preExecutionResults.push({
         toolCallId: tc.id,
         name: tc.name,
         target,
-        content: `Error: ${message}`,
-        isError: true,
-        lifecycleState: "blocked",
-        ...(executeRecoveryBatchDecision.active
-          ? { qualityGateReason: "execute_recovery_tool_unavailable" }
+        content: isInternalScopeDeferral ? message : `Error: ${message}`,
+        isError: !isInternalScopeDeferral,
+        lifecycleState: isInternalScopeDeferral ? "completed" : "blocked",
+        ...(isInternalScopeDeferral
+          ? {
+              qualityGateReason: isExecuteRecoveryScopeCorrection
+                ? "execute_recovery_scope_deferred"
+                : "read_scope_deferred",
+              internalFeedback: true,
+              displayContent: "",
+            }
           : {}),
-        ...(isUnapprovedPlanContext ? { internalFeedback: true, displayContent: "" } : {}),
+        ...(isUnapprovedPlanContext && !isExecuteRecoveryScopeCorrection
+          ? { internalFeedback: true, displayContent: "" }
+          : {}),
       });
       continue;
     }
@@ -342,6 +408,18 @@ export async function partitionToolCallsForExecution(input: {
       executeRecoveryBatchDecision.selectedCallId !== tc.id
     ) {
       const language = callbacks.getPreferredLanguage();
+      const readOutsideTransactionScope =
+        tc.name === "read_file" &&
+        Boolean(executeRecoveryState.expectedTarget) &&
+        !workspacePathsReferToSameFile(target, executeRecoveryState.expectedTarget || "");
+      const readScopeDecision = readOutsideTransactionScope
+        ? resolveReadFileEligibilityDecision({
+            scopeMatches: false,
+            bypassCacheForLease: false,
+            hasCachedWindow: false,
+            contentInContext: false,
+          })
+        : null;
       const selectedTool = executeRecoveryBatchDecision.selectedToolName || (
         executeRecoveryBatchDecision.phase === "need_context"
           ? "read_file"
@@ -362,14 +440,21 @@ export async function partitionToolCallsForExecution(input: {
               ? ` The transaction target is ${executeRecoveryState.expectedTarget}; the next call must mutate that target.`
               : ` The transaction target must remain ${executeRecoveryState.expectedTarget}.`
         : "";
-      const message = language === "zh"
-        ? `EXECUTE_RECOVERY_BATCH_DEFERRED: 当前恢复事务处于 ${executeRecoveryBatchDecision.phase}，本批只执行一个 ${selectedTool}。${tc.name} 已推迟；请先消费本批工具结果，再在下一条回复中调用下一阶段的一个工具。${expectedTargetHint}`
-        : `EXECUTE_RECOVERY_BATCH_DEFERRED: The recovery transaction is in ${executeRecoveryBatchDecision.phase}; this batch executes only one ${selectedTool}. ${tc.name} was deferred. Consume this tool result, then call one tool for the next phase in the next response.${expectedTargetHint}`;
+      const message = readOutsideTransactionScope
+        ? language === "zh"
+          ? `READ_SCOPE_DEFERRED: ${target || "该读取"} 不属于当前恢复事务目标 ${executeRecoveryState.expectedTarget}。本次没有执行读取；请只读取事务目标的变化版本或缺失行范围。`
+          : `READ_SCOPE_DEFERRED: ${target || "This read"} is outside the current recovery target ${executeRecoveryState.expectedTarget}. The read did not execute; request only a changed version or missing line window of the transaction target.`
+        : language === "zh"
+          ? `EXECUTE_RECOVERY_BATCH_DEFERRED: 当前恢复事务处于 ${executeRecoveryBatchDecision.phase}，本批只执行一个 ${selectedTool}。${tc.name} 已推迟；请先消费本批工具结果，再在下一条回复中调用下一阶段的一个工具。${expectedTargetHint}`
+          : `EXECUTE_RECOVERY_BATCH_DEFERRED: The recovery transaction is in ${executeRecoveryBatchDecision.phase}; this batch executes only one ${selectedTool}. ${tc.name} was deferred. Consume this tool result, then call one tool for the next phase in the next response.${expectedTargetHint}`;
       callbacks.onToolDone(tc.name, target, message, {
         toolCallId: tc.id,
         internalFeedback: true,
-        qualityGateReason: "execute_recovery_batch_deferred",
+        qualityGateReason: readOutsideTransactionScope
+          ? "execute_recovery_read_scope_deferred"
+          : "execute_recovery_batch_deferred",
       });
+      toolFailureSignatures.delete(tc.id);
       logAgentEvent("execute_recovery_batch_call_deferred", {
         iteration,
         phase: executeRecoveryBatchDecision.phase,
@@ -379,6 +464,8 @@ export async function partitionToolCallsForExecution(input: {
         deferredTool: tc.name,
         target,
         expectedTarget: executeRecoveryState.expectedTarget,
+        reason: readScopeDecision?.reason || "serialized_recovery_step",
+        readEligibility: readScopeDecision?.kind || null,
       });
       preExecutionResults.push({
         toolCallId: tc.id,
@@ -389,7 +476,9 @@ export async function partitionToolCallsForExecution(input: {
         isError: false,
         lifecycleState: "completed",
         internalFeedback: true,
-        qualityGateReason: "execute_recovery_batch_deferred",
+        qualityGateReason: readOutsideTransactionScope
+          ? "execute_recovery_read_scope_deferred"
+          : "execute_recovery_batch_deferred",
       });
       continue;
     }
@@ -568,18 +657,42 @@ export async function partitionToolCallsForExecution(input: {
       });
       if (browserPreflight.action === "block") {
         const requestedUrl = toolArgs.url;
-        const failed = browserPreflight.runtimeStatus === "failed" || browserPreflight.runtimeStatus === "stopped";
-        const message = failed
-          ? `DEV_SERVER_START_FAILED: the latest PTY observation shows that the dev server failed. Repair or restart it, then inspect PTY readiness before browser validation at ${requestedUrl}.`
-          : `DEV_SERVER_NOT_READY: the latest long-running command is still ${browserPreflight.runtimeStatus}. Call read_pty_since/read_pty_tail/get_pty_status and wait for a ready URL before browser validation at ${requestedUrl}.`;
-        // The browser tool did not execute, so this transient readiness gate must not
-        // poison the repeated-failure history for a later, ready browser validation.
+        // browser_evaluate has not executed yet. Every preflight outcome is a
+        // lifecycle/reconciliation result owned by the dev-server transaction,
+        // never an actual browser failure. Real launch failures remain in the
+        // evidence ledger under execute_command/PTY observations.
+        const policyDeferral = true;
+        const language = callbacks.getPreferredLanguage();
+        const message = browserPreflight.reason === "PTY_OBSERVATION_REQUIRED"
+          ? language === "zh"
+            ? `PTY_OBSERVATION_REQUIRED: 长进程当前为 ${browserPreflight.runtimeStatus}，尚未形成同一 PTY generation 的 ready 证据。请调用 get_pty_status 或 read_pty_since 观察现有前台进程；不要用 sleep 轮询，也不要把 PTY_BUSY 解释为端口或全部终端被占用。ready 后再访问 ${requestedUrl}。`
+            : `PTY_OBSERVATION_REQUIRED: The long-running process is ${browserPreflight.runtimeStatus} and has no ready evidence for the current PTY generation. Observe the existing foreground process with get_pty_status or read_pty_since; do not poll with sleep or interpret PTY_BUSY as a port/global-terminal failure. Browser-validate ${requestedUrl} after readiness.`
+          : browserPreflight.reason === "DEV_SERVER_PORT_CONFLICT_UNCONFIRMED"
+          ? language === "zh"
+            ? `DEV_SERVER_PORT_CONFLICT_UNCONFIRMED: 检测到明确端口冲突，但尚未证明现有服务健康。请用独立有限命令通道探测 ${requestedUrl}；健康则复用该 URL 并继续浏览器验收，否则再修复或重启服务。`
+            : `DEV_SERVER_PORT_CONFLICT_UNCONFIRMED: An explicit port conflict was observed, but the existing service is not yet proven healthy. Probe ${requestedUrl} through an independent finite-command channel; reuse it for browser validation if healthy, otherwise repair or restart the service.`
+          : browserPreflight.reason === "DEV_SERVER_STOPPED"
+          ? language === "zh"
+            ? `DEV_SERVER_STOPPED: 最新 PTY 生命周期表明开发服务器已经退出。重新启动并观察 ready 后，才能访问 ${requestedUrl}。`
+            : `DEV_SERVER_STOPPED: The latest PTY lifecycle shows that the dev server exited. Restart it and observe readiness before browser validation at ${requestedUrl}.`
+          : language === "zh"
+            ? `DEV_SERVER_START_FAILED: 最新 PTY 证据表明开发服务器启动失败。请先修复或重启，再观察 ready，之后访问 ${requestedUrl}。`
+            : `DEV_SERVER_START_FAILED: The latest PTY evidence shows that the dev server failed to start. Repair or restart it, observe readiness, then browser-validate ${requestedUrl}.`;
+        // Readiness/reconciliation is a deterministic phase transition. Keep
+        // it out of failedToolCallCounts so the ready URL remains usable later.
         toolFailureSignatures.delete(tc.id);
-        callbacks.onToolError(tc.name, requestedUrl, message, { toolCallId: tc.id });
+        callbacks.onToolDone(tc.name, requestedUrl, message, {
+          toolCallId: tc.id,
+          internalFeedback: true,
+          qualityGateReason: browserPreflight.reason?.toLowerCase() || "browser_preflight_deferred",
+        });
         logAgentEvent("browser_validation_blocked_until_dev_server_ready", {
           iteration,
           requestedUrl,
           runtimeStatus: browserPreflight.runtimeStatus,
+          reason: browserPreflight.reason,
+          nextCapability: browserPreflight.nextCapability,
+          policyDeferral,
           ptyObservationToolsAvailable: ["read_pty_since", "read_pty_tail", "get_pty_status"]
             .filter((name) => availableToolNames.has(name)),
         });
@@ -587,9 +700,16 @@ export async function partitionToolCallsForExecution(input: {
           toolCallId: tc.id,
           name: tc.name,
           target: requestedUrl,
-          content: `Error: ${message}`,
-          isError: true,
-          lifecycleState: "blocked",
+          content: policyDeferral ? message : `Error: ${message}`,
+          displayContent: policyDeferral ? "" : undefined,
+          isError: !policyDeferral,
+          lifecycleState: policyDeferral ? "completed" : "blocked",
+          ...(policyDeferral
+            ? {
+                internalFeedback: true,
+                qualityGateReason: browserPreflight.reason?.toLowerCase() || "browser_preflight_deferred",
+              }
+            : {}),
         });
         continue;
       }
@@ -909,13 +1029,27 @@ export async function partitionToolCallsForExecution(input: {
           metadata != null &&
           metadata.sizeBytes === fileReadState.sizeBytes &&
           metadata.modifiedMs === fileReadState.modifiedMs;
+        const contextEvictionEpoch = fileReadState.contextEvictionEpoch || 0;
+        const eligibility = resolveReadFileEligibilityDecision({
+          scopeMatches: true,
+          bypassCacheForLease: false,
+          hasCachedWindow: true,
+          observedVersion: `${fileReadState.sizeBytes}:${fileReadState.modifiedMs}`,
+          currentVersion: metadata
+            ? `${metadata.sizeBytes}:${metadata.modifiedMs}`
+            : null,
+          contentInContext: contentStillActive,
+          contextEpoch: contextEvictionEpoch,
+          replayedContextEpoch: fileReadState.lastReplayContextEvictionEpoch,
+        });
 
-        if (!unchanged) {
+        if (!unchanged || eligibility.kind === "fresh_read") {
           fileReadStates.delete(fileReadSignature);
           logAgentEvent("file_read_cache_invalidated", {
             iteration,
             target: target || fileReadState.path,
-            reason: metadata ? "metadata_changed" : "metadata_unavailable",
+            reason: eligibility.reason,
+            eligibility: eligibility.kind,
             signature: truncateForLog(fileReadSignature, 180),
             previous: {
               sizeBytes: fileReadState.sizeBytes,
@@ -937,15 +1071,11 @@ export async function partitionToolCallsForExecution(input: {
             callbacks.getIsPlanApproved() &&
             runtimeIntent === "execute" &&
             tc.name === "read_file";
-          const contextEvictionEpoch = fileReadState.contextEvictionEpoch || 0;
           const replayedCurrentEviction =
             fileReadState.lastReplayContextEvictionEpoch === contextEvictionEpoch;
-          const repeatedWithoutVersionProgress =
-            approvedPlanExecutionRead && (fileReadState.replayCountSinceVersion || 0) >= 2;
           if (
-            !contentStillActive &&
-            !replayedCurrentEviction &&
-            !repeatedWithoutVersionProgress
+            eligibility.kind === "context_replay" &&
+            !replayedCurrentEviction
           ) {
             // Context management, rather than the filesystem, may evict an
             // exact source window. Restore it once for each real eviction
@@ -960,6 +1090,7 @@ export async function partitionToolCallsForExecution(input: {
               iteration,
               target: target || fileReadState.path,
               decision: "context_evicted_replay",
+              eligibilityReason: eligibility.reason,
               signature: truncateForLog(fileReadSignature, 180),
               duplicateCount,
               sizeBytes: fileReadState.sizeBytes,
@@ -1011,6 +1142,7 @@ export async function partitionToolCallsForExecution(input: {
             iteration,
             target: target || fileReadState.path,
             decision: shouldPushPlanReadLimit ? "unchanged_stub_with_plan_redirect" : "unchanged_stub",
+            eligibilityReason: eligibility.reason,
             signature: truncateForLog(fileReadSignature, 180),
             duplicateCount,
             sizeBytes: fileReadState.sizeBytes,
@@ -1019,27 +1151,18 @@ export async function partitionToolCallsForExecution(input: {
           });
           const shouldPushApprovedPlanReadLimit =
             approvedPlanExecutionRead &&
-            (contentStillActive ? duplicateCount >= 3 : repeatedWithoutVersionProgress);
+            contentStillActive &&
+            duplicateCount >= 3;
           const approvedPlanReadLimitMessage = shouldPushApprovedPlanReadLimit
             ? callbacks.getPreferredLanguage() === "zh"
-              ? contentStillActive
-                ? [
-                    `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 已在已批准计划执行中重复读取，本次不再重新读取。`,
-                    "请复用当前上下文中的源码，改为 apply_patch/replace_in_file/write_file、运行验证，或说明明确阻塞。",
-                  ].join("\n")
-                : [
-                    `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 的同一未修改范围已在上下文淘汰后恢复两次，继续恢复会形成无进展循环。`,
-                    "如确实缺少源码，请读取更窄或不同的行范围；否则请执行修改、运行验证，或说明明确阻塞。文件发生真实修改后可重新读取。",
-                  ].join("\n")
-              : contentStillActive
-                ? [
-                    `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} was reread repeatedly during approved plan execution, so this read was not re-run.`,
-                    "Reuse the source still present in active context and switch to apply_patch/replace_in_file/write_file, validation, or a concrete blocker.",
-                  ].join("\n")
-                : [
-                    `READ_FILE_REPEAT_LIMIT: the same unchanged range of ${target || fileReadState.path} was restored after context eviction twice; another restore would be a no-progress loop.`,
-                    "If source is genuinely missing, request a narrower or different line window. Otherwise edit, validate, or report a concrete blocker. A real file change permits a fresh read.",
-                  ].join("\n")
+              ? [
+                  `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 已在已批准计划执行中重复读取，本次不再重新读取。`,
+                  "请复用当前上下文中的源码，改为 apply_patch/replace_in_file/write_file、运行验证，或说明明确阻塞。",
+                ].join("\n")
+              : [
+                  `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} was reread repeatedly during approved plan execution, so this read was not re-run.`,
+                  "Reuse the source still present in active context and switch to apply_patch/replace_in_file/write_file, validation, or a concrete blocker.",
+                ].join("\n")
             : "";
           if (shouldPushApprovedPlanReadLimit) {
             emitToolPreflightBlocked(callbacks, {

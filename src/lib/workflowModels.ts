@@ -304,6 +304,14 @@ export interface PlanExecutionEvidenceEntry {
   changedIdentifiers?: string[];
   /** Runtime-owned state for long-lived PTY commands and their observations. */
   observationStatus?: "pending" | "unknown" | "running" | "ready" | "failed" | "stopped";
+  /** PTY foreground identity; stale observations from older generations do not satisfy a restart. */
+  foregroundGeneration?: number;
+  /** Monotonic PTY buffer cursor used to resume observation without sleep polling. */
+  outputSequence?: number;
+  /** Busy means this integrated PTY owns a foreground process, not that the port or all terminals are unavailable. */
+  terminalBusy?: boolean;
+  /** Set only for explicit address-in-use/EADDRINUSE evidence. */
+  portConflict?: boolean;
   createdAt: number;
 }
 
@@ -511,6 +519,7 @@ export interface NormalizedStreamState {
   hasExplicitUserChoiceRequest: boolean;
   toolCalls: NormalizedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
+  protocolViolation?: "required_tool_call_missing";
 }
 
 // endregion
@@ -1102,7 +1111,11 @@ function commandEvidenceSatisfiedByLedger(
   const observations = evidenceLedger
     .filter((record) =>
       PTY_OBSERVATION_TOOL_NAMES.has(record.sourceTool) &&
-      Number(record.createdAt || 0) >= Number(latestCommand.createdAt || 0)
+      Number(record.createdAt || 0) >= Number(latestCommand.createdAt || 0) &&
+      (
+        typeof latestCommand.foregroundGeneration !== "number" ||
+        record.foregroundGeneration === latestCommand.foregroundGeneration
+      )
     );
   const latestObservation = observations[observations.length - 1];
   if (!latestObservation) return false;
@@ -1124,7 +1137,11 @@ function latestFailedPtyObservationForCommand(
   const observations = evidenceLedger
     .filter((record) =>
       PTY_OBSERVATION_TOOL_NAMES.has(record.sourceTool) &&
-      Number(record.createdAt || 0) >= Number(latestCommand.createdAt || 0)
+      Number(record.createdAt || 0) >= Number(latestCommand.createdAt || 0) &&
+      (
+        typeof latestCommand.foregroundGeneration !== "number" ||
+        record.foregroundGeneration === latestCommand.foregroundGeneration
+      )
     );
   const observation = observations[observations.length - 1];
   return observation?.observationStatus === "failed" || observation?.observationStatus === "stopped"
@@ -1165,35 +1182,55 @@ const CODE_IDENTIFIER_REF_RE =
 function inferValidationTaskEvidence(text: string, commands: string[] = []): PlanTaskEvidence[] {
   const normalized = String(text || "");
   if (!VALIDATION_ACTION_RE.test(normalized)) return [];
-  if (commands.some(commandLooksLikePlaywrightOrBrowserTest)) {
-    return [];
-  }
-
   const hasAutomatableValidationAlternative =
     /(?:聚焦测试|构建检查|类型检查|单元测试|(?:测试|检查).{0,30}(?:构建|编译)|(?:构建|编译).{0,30}(?:测试|检查)|focused tests?|build checks?|typechecks?|unit tests?|(?:tests?|checks?).{0,40}(?:build|compile)|(?:build|compile).{0,40}(?:tests?|checks?))/i.test(normalized);
+  const explicitHumanOwner =
+    /(?:用户(?:自己)?|你自己|自行|需(?:要)?\s*手动(?:确认|检查|验收)|由用户手动|human|user confirmation|user validation|manually confirmed by (?:the )?user|visually inspect)/i.test(normalized);
+  // "测试、构建或人工检查" offers an automatable alternative; it does not
+  // assign an additional blocking review to a person. A genuinely user-owned
+  // review remains advisory even when an automatic check also appears.
+  const explicitUserValidation = MANUAL_VALIDATION_RE.test(normalized) &&
+    (!hasAutomatableValidationAlternative || explicitHumanOwner);
+  const advisoryEvidence: PlanTaskEvidence[] = [];
+  if (explicitUserValidation) {
+    const parsed = makePlanTaskEvidence("manual_user_validation", "user confirmation", true);
+    if (parsed) advisoryEvidence.push(parsed);
+  }
+  const withAdvisoryEvidence = (automaticEvidence: PlanTaskEvidence[]) =>
+    dedupePlanTaskEvidence([...automaticEvidence, ...advisoryEvidence]);
+
+  if (commands.some(commandLooksLikePlaywrightOrBrowserTest)) {
+    return withAdvisoryEvidence([]);
+  }
+
   if (hasAutomatableValidationAlternative) {
     const parsed = makePlanTaskEvidence("cmd", FOCUSED_VALIDATION_COMMAND, true);
-    return parsed ? [parsed] : [];
+    return withAdvisoryEvidence(parsed ? [parsed] : []);
   }
 
   if (TAURI_VALIDATION_RE.test(normalized)) {
     const parsed = makePlanTaskEvidence("tauri_required", "tauri runtime validation", true);
-    return parsed ? [parsed] : [];
+    return withAdvisoryEvidence(parsed ? [parsed] : []);
   }
 
   if (BROWSER_VALIDATION_RE.test(normalized) || MARKDOWN_VIEWER_VALIDATION_RE.test(normalized)) {
+    // "请用户在浏览器中手动验证" names the browser as the place where
+    // the user will review the result; it does not authorize the runtime to
+    // manufacture browser evidence. Preserve both obligations only when the
+    // line independently asks for an automated browser capability.
+    const explicitlyAutomatedBrowserValidation =
+      /(?:自动|使用|通过|运行|调用|用)\s*(?:内置)?(?:浏览器工具|browser[_ -]?(?:evaluate|screenshot)|Playwright|Cypress|Puppeteer)/i.test(normalized) ||
+      /(?:浏览器工具|browser[_ -]?(?:evaluate|screenshot)|Playwright|Cypress|Puppeteer).{0,24}(?:自动|验证|检查|截图|evaluate|inspect|check|verify)/i.test(normalized);
+    if (explicitUserValidation && !explicitlyAutomatedBrowserValidation) {
+      return withAdvisoryEvidence([]);
+    }
     const parsed = makePlanTaskEvidence("browser_dom", "browser DOM validation", true);
-    return parsed ? [parsed] : [];
-  }
-
-  if (MANUAL_VALIDATION_RE.test(normalized)) {
-    const parsed = makePlanTaskEvidence("manual_user_validation", "user confirmation", true);
-    return parsed ? [parsed] : [];
+    return withAdvisoryEvidence(parsed ? [parsed] : []);
   }
 
   if (/(?:localhost|127\.0\.0\.1|\bdev server\b|开发服务器|服务器|服务|端口|\bport\b)/i.test(normalized)) {
     const parsed = makePlanTaskEvidence("dev_server_url", "dev server reachable", true);
-    return parsed ? [parsed] : [];
+    return withAdvisoryEvidence(parsed ? [parsed] : []);
   }
 
   // A reviewed plan can describe a concrete assertion without knowing the
@@ -1201,12 +1238,12 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
   // object contains creatorName"). Preserve that assertion as an executable
   // runtime obligation. The execution loop must still run a finite validation
   // command and record trusted evidence before the task can complete.
-  if (CONCRETE_VALIDATION_OUTCOME_RE.test(normalized)) {
+  if (!explicitUserValidation && CONCRETE_VALIDATION_OUTCOME_RE.test(normalized)) {
     const parsed = makePlanTaskEvidence("cmd", FOCUSED_VALIDATION_COMMAND, true);
     return parsed ? [parsed] : [];
   }
 
-  return [];
+  return withAdvisoryEvidence([]);
 }
 
 function planTaskEvidenceStatusForUnmatchedValidation(evidence: PlanTaskEvidence[]): {
@@ -1218,14 +1255,14 @@ function planTaskEvidenceStatusForUnmatchedValidation(evidence: PlanTaskEvidence
     return {
       status: "requires_tauri_validation",
       capability: "tauri_runtime",
-      reason: "需要 Tauri/桌面运行时或用户手动确认，普通 Vite/HTTP 验证不能替代",
+      reason: "建议在 Tauri/桌面运行时由用户复核；普通 Vite/HTTP 不能替代，但该外部复核不阻止自动工作完成",
     };
   }
   if (evidence.some((item) => item.kind === "manual_user_validation")) {
     return {
       status: "requires_user_confirmation",
       capability: "manual_user_validation",
-      reason: "该任务需要用户确认，模型不能用命令输出替代人工验收",
+      reason: "建议用户复核该项；模型不能伪造人工确认，该复核不作为自动任务成功闸门",
     };
   }
   if (evidence.some((item) => item.kind === "browser_dom" || item.kind === "browser_screenshot")) {
@@ -1245,12 +1282,29 @@ function planTaskEvidenceStatusForUnmatchedValidation(evidence: PlanTaskEvidence
   return {};
 }
 
+function initialEvidenceDecisionForEvidence(evidence: PlanTaskEvidence[]): ReturnType<typeof planTaskEvidenceStatusForUnmatchedValidation> {
+  const automaticEvidence = evidence.filter((item) =>
+    item.kind !== "tauri_required" && item.kind !== "manual_user_validation"
+  );
+  const automaticPrerequisites = automaticEvidence.filter((item) =>
+    item.kind !== "browser_dom" && item.kind !== "browser_screenshot"
+  );
+  // User/desktop review is an advisory boundary, not a substitute for missing
+  // file, command, deliverable, or browser evidence in the same task.
+  if (automaticEvidence.length > 0) {
+    return planTaskEvidenceStatusForUnmatchedValidation(
+      automaticPrerequisites.length > 0 ? automaticPrerequisites : automaticEvidence,
+    );
+  }
+  return planTaskEvidenceStatusForUnmatchedValidation(evidence);
+}
+
 function initialEvidenceStatusForEvidence(evidence: PlanTaskEvidence[]): PlanTaskEvidenceStatus {
-  return planTaskEvidenceStatusForUnmatchedValidation(evidence).status || "missing";
+  return initialEvidenceDecisionForEvidence(evidence).status || "missing";
 }
 
 function validationCapabilityForEvidence(evidence: PlanTaskEvidence[]): PlanTaskValidationCapability | undefined {
-  return planTaskEvidenceStatusForUnmatchedValidation(evidence).capability;
+  return initialEvidenceDecisionForEvidence(evidence).capability;
 }
 
 function isPackageManifestEvidence(value: string): boolean {
@@ -1472,15 +1526,19 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
     if (parsed) fileEvidence.push(parsed);
   }
 
+  const advisoryValidationEvidence = inferValidationTaskEvidence(text, commands).filter((item) =>
+    item.kind === "manual_user_validation" || item.kind === "tauri_required"
+  );
+
   if (isLikelySourceMutationTask(text)) {
     const sourceEvidence = dedupePlanTaskEvidence([
       ...fileEvidence,
       ...inferSourceEvidenceFromCodeIdentifiers(text),
     ]);
     if (sourceEvidence.length > 0) {
-      return dedupePlanTaskEvidence([...evidence, ...sourceEvidence]);
+      return dedupePlanTaskEvidence([...evidence, ...sourceEvidence, ...advisoryValidationEvidence]);
     }
-    return dedupePlanTaskEvidence(evidence);
+    return dedupePlanTaskEvidence([...evidence, ...advisoryValidationEvidence]);
   }
 
   // A concrete reviewed command is stronger evidence than a fuzzy modality
@@ -1489,7 +1547,7 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
   // should one validation line materialize both a generic task and the exact
   // command task. Keep the explicit command as the single executable contract.
   if (evidence.length > 0) {
-    return dedupePlanTaskEvidence(evidence);
+    return dedupePlanTaskEvidence([...evidence, ...advisoryValidationEvidence]);
   }
 
   const validationEvidence = inferValidationTaskEvidence(text, commands);
@@ -1564,6 +1622,16 @@ function evidenceMatchesRecord(
   return false;
 }
 
+function evidenceRecordCanSatisfyAcceptance(
+  record: PlanExecutionEvidenceEntry,
+): boolean {
+  return record.observationStatus !== "failed" &&
+    record.observationStatus !== "pending" &&
+    record.observationStatus !== "unknown" &&
+    record.observationStatus !== "running" &&
+    record.observationStatus !== "stopped";
+}
+
 /**
  * A composite task can remain incomplete because its validation command is
  * pending even after the source edit is already proven. Recovery must inspect
@@ -1581,7 +1649,9 @@ export function planTaskHasUnsatisfiedSourceMutationEvidence(
   const fileEvidence = evidence.filter((item) => item.kind === "file");
   if (fileEvidence.length === 0) return true;
   return fileEvidence.some((item) =>
-    !evidenceLedger.some((record) => evidenceMatchesRecord(item, record))
+    !evidenceLedger.some((record) =>
+      evidenceRecordCanSatisfyAcceptance(record) && evidenceMatchesRecord(item, record)
+    )
   );
 }
 
@@ -1596,7 +1666,10 @@ export function findFirstPlanTaskEvidenceRecord(
 
   for (let ledgerIndex = 0; ledgerIndex < evidenceLedger.length; ledgerIndex += 1) {
     const record = evidenceLedger[ledgerIndex];
-    if (evidence.some((item) => evidenceMatchesRecord(item, record))) {
+    if (
+      evidenceRecordCanSatisfyAcceptance(record) &&
+      evidence.some((item) => evidenceMatchesRecord(item, record))
+    ) {
       return { record, ledgerIndex };
     }
   }
@@ -1620,17 +1693,53 @@ function resolvePlanTaskEvidenceStatus(
     };
   }
 
-  const matched = evidence.filter((item) =>
+  const evidenceMatchesLedger = (item: PlanTaskEvidence): boolean =>
     item.kind === "cmd"
       ? commandEvidenceSatisfiedByLedger(item, evidenceLedger)
-      : evidenceLedger.some((record) => evidenceMatchesRecord(item, record))
-  ).length;
+      : evidenceLedger.some((record) =>
+          evidenceRecordCanSatisfyAcceptance(record) && evidenceMatchesRecord(item, record)
+        );
+  const matched = evidence.filter(evidenceMatchesLedger).length;
 
   if (matched === evidence.length) {
     return { status: "satisfied", matched, total: evidence.length };
   }
 
-  const validation = planTaskEvidenceStatusForUnmatchedValidation(evidence);
+  const automaticEvidence = evidence.filter((item) =>
+    item.kind !== "tauri_required" && item.kind !== "manual_user_validation"
+  );
+  const matchedAutomatic = automaticEvidence.filter(evidenceMatchesLedger).length;
+  const unmatchedAutomatic = automaticEvidence.filter((item) => !evidenceMatchesLedger(item));
+  const unmatchedAutomaticPrerequisites = unmatchedAutomatic.filter((item) =>
+    item.kind !== "browser_dom" && item.kind !== "browser_screenshot"
+  );
+
+  // External/user review is intentionally non-blocking only after every
+  // automatable obligation in the same task has trusted evidence. This keeps
+  // a composite "modify file, then ask the user to check" task from being
+  // accepted before the file mutation actually happened.
+  if (matchedAutomatic === automaticEvidence.length) {
+    const externalValidation = planTaskEvidenceStatusForUnmatchedValidation(
+      evidence.filter((item) => !evidenceMatchesLedger(item)),
+    );
+    if (externalValidation.status) {
+      return {
+        status: externalValidation.status,
+        matched,
+        total: evidence.length,
+        blockedReason: externalValidation.reason,
+        validationCapability: externalValidation.capability,
+      };
+    }
+  }
+
+  // Browser review is downstream of mutations, commands, deliverables, and
+  // dev-server readiness in the same task. Do not let an unavailable browser
+  // reclassify a still-missing file/command obligation as external advisory.
+  const automaticEvidenceForCurrentGap = unmatchedAutomaticPrerequisites.length > 0
+    ? unmatchedAutomaticPrerequisites
+    : unmatchedAutomatic;
+  const validation = planTaskEvidenceStatusForUnmatchedValidation(automaticEvidenceForCurrentGap);
   if (validation.status) {
     return {
       status: validation.status,
@@ -1641,13 +1750,13 @@ function resolvePlanTaskEvidenceStatus(
     };
   }
 
-  const awaitingPtyObservation = evidence.some((item) =>
+  const awaitingPtyObservation = automaticEvidenceForCurrentGap.some((item) =>
     commandEvidenceIsAwaitingPtyObservation(item, evidenceLedger)
   );
-  const failedPtyObservation = evidence.find((item) =>
+  const failedPtyObservation = automaticEvidenceForCurrentGap.find((item) =>
     item.kind === "cmd" && latestFailedPtyObservationForCommand(item, evidenceLedger)
   );
-  const failedFiniteValidation = evidence.find((item) =>
+  const failedFiniteValidation = automaticEvidenceForCurrentGap.find((item) =>
     item.kind === "cmd" && latestFailedFiniteCommandForEvidence(item, evidenceLedger)
   );
 
@@ -1720,18 +1829,18 @@ export function describePlanValidationDecision(input: {
         : "Next use browser automation: open the real dev-server URL, run DOM assertions, and take a screenshot if needed; do not substitute curl/grep/cat for rendered-page validation.";
     }
     return input.language === "zh"
-      ? "当前缺少浏览器自动化能力，自动验证到此为止；该项应标为待用户验证。"
-      : "Browser automation is not available, so automated validation stops here; this item should be left for user validation.";
+      ? "当前缺少浏览器自动化能力；将具体复核项放入最终结论供用户检查，不阻止已满足自动证据的任务完成。"
+      : "Browser automation is unavailable; put the concrete review item in the final conclusion without blocking completion of already-satisfied automated evidence.";
   }
   if (status === "requires_tauri_validation") {
     return input.language === "zh"
-      ? "该项需要 Tauri/桌面运行时验证；普通 Vite 页面只能验证网页渲染，不能替代文件对话框或系统集成。"
-      : "This item requires Tauri/desktop-runtime validation; a Vite page can only validate web rendering, not file dialogs or system integration.";
+      ? "该项需要 Tauri/桌面运行时复核；普通 Vite 页面不能替代，将它作为最终结论中的非阻塞用户复核项。"
+      : "This item needs Tauri/desktop-runtime review; a Vite page cannot substitute for it, so report it as non-blocking user review in the final conclusion.";
   }
   if (status === "requires_user_confirmation") {
     return input.language === "zh"
-      ? "该项需要用户确认，模型应暂停并保留待验证状态。"
-      : "This item requires user confirmation; the model should pause and keep it pending validation.";
+      ? "该项需要用户确认；在最终结论中列出建议复核内容，不把它作为任务成功闸门。"
+      : "This item requires user confirmation; list it as suggested review in the final conclusion instead of making it a task-success gate.";
   }
   return "";
 }
@@ -2278,7 +2387,7 @@ function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
     ...(evidence.length > 0 ? { evidence } : {}),
     ...(validationCapabilityForEvidence(evidence) ? { validationCapability: validationCapabilityForEvidence(evidence) } : {}),
     evidenceStatus: initialEvidenceStatusForEvidence(evidence),
-    blockedReason: planTaskEvidenceStatusForUnmatchedValidation(evidence).reason ||
+    blockedReason: initialEvidenceDecisionForEvidence(evidence).reason ||
       (language === "en"
         ? "Waiting for trusted execution evidence"
         : "等待真实执行证据确认完成"),
@@ -2305,7 +2414,7 @@ function makeRuntimeTaskFromEvidenceText(
     ...(evidence.kind === "cmd" ? { commands: [evidence.value] } : {}),
     ...(validationCapabilityForEvidence([evidence]) ? { validationCapability: validationCapabilityForEvidence([evidence]) } : {}),
     evidenceStatus: initialEvidenceStatusForEvidence([evidence]),
-    blockedReason: planTaskEvidenceStatusForUnmatchedValidation([evidence]).reason ||
+    blockedReason: initialEvidenceDecisionForEvidence([evidence]).reason ||
       (language === "en"
         ? "Waiting for trusted execution evidence"
         : "等待真实执行证据确认完成"),
@@ -2333,6 +2442,64 @@ function extractWorkspaceFileReferencesFromText(text: string): string[] {
     refs.push(value);
   }
   return refs;
+}
+
+/**
+ * Project mutation prose can mention both the file being changed and a
+ * contract/reference file. Project only the grammatical mutation owners:
+ * the first path after an action verb plus immediately coordinated paths.
+ * Later relational references (for example, "change A to match B") remain
+ * evidence context and never widen the approved write scope.
+ */
+function selectMutationOwnerFileReferences(text: string, files: string[]): string[] {
+  const clean = stripMarkdownTaskLine(text);
+  const lower = clean.toLowerCase();
+  const references: Array<{ value: string; start: number; end: number }> = [];
+  let cursor = 0;
+  for (const value of files) {
+    const normalized = value.toLowerCase();
+    let start = lower.indexOf(normalized, cursor);
+    if (start < 0) start = lower.indexOf(normalized);
+    if (start < 0) continue;
+    references.push({ value, start, end: start + value.length });
+    cursor = start + value.length;
+  }
+  if (references.length === 0) return [];
+
+  const mutationVerbRe = /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|替换|重构|删除|创建|implement|change|update|modify|fix|add|replace|refactor|delete|create)/gi;
+  for (const verb of clean.matchAll(mutationVerbRe)) {
+    const verbStart = verb.index || 0;
+    const verbEnd = verbStart + String(verb[0] || "").length;
+    const following = references.filter((reference) => reference.start >= verbEnd);
+    if (following.length > 0 && following[0].start - verbEnd <= 100) {
+      const owned = [following[0]];
+      for (let index = 1; index < following.length; index += 1) {
+        const previous = owned[owned.length - 1];
+        const connector = clean.slice(previous.end, following[index].start)
+          .replace(/[`'"“”‘’\s]/g, "");
+        if (!/^(?:、|和|与|及|&|and)$/i.test(connector)) break;
+        owned.push(following[index]);
+      }
+      return owned.map((entry) => entry.value);
+    }
+
+    const preceding = references.filter((reference) => reference.end <= verbStart);
+    const lastPreceding = preceding[preceding.length - 1];
+    if (!lastPreceding) continue;
+    const relation = clean.slice(lastPreceding.end, verbStart);
+    const ownsPrecedingGroup = relation.length <= 48 &&
+      /(?:需要|需|应该|应当|必须|待|中|内|里|needs?(?:\s+to)?|should|must|within|in)\s*$/i.test(relation);
+    if (!ownsPrecedingGroup) continue;
+    const owned = [lastPreceding];
+    for (let index = preceding.length - 2; index >= 0; index -= 1) {
+      const connector = clean.slice(preceding[index].end, owned[0].start)
+        .replace(/[`'"“”‘’\s]/g, "");
+      if (!/^(?:、|和|与|及|&|and)$/i.test(connector)) break;
+      owned.unshift(preceding[index]);
+    }
+    return owned.map((entry) => entry.value);
+  }
+  return [];
 }
 
 function collectRuntimeTaskChangeHeadingTasks(
@@ -2373,7 +2540,9 @@ function collectRuntimeTaskChangeHeadingTasks(
 
       const headingBody = change[1] || "";
       const headingTarget = headingBody.split(/\s+(?:—|–|-)\s+/u, 1)[0] || headingBody;
-      const files = extractWorkspaceFileReferencesFromText(headingTarget);
+      const referencedFiles = extractWorkspaceFileReferencesFromText(headingTarget);
+      const selectedOwnerFiles = selectMutationOwnerFileReferences(headingBody, referencedFiles);
+      const files = selectedOwnerFiles.length > 0 ? selectedOwnerFiles : referencedFiles;
       if (files.length === 0) continue;
       let headingSummary = headingBody;
       for (const filePath of files) {
@@ -2424,6 +2593,7 @@ function collectRuntimeTaskProseSectionTasks(
   let excludedSectionLevel = 0;
   let inCodeFence = false;
   let pendingFiles: string[] = [];
+  let pendingFilesAreExplicitOwner = false;
 
   const ensureMutationFiles = (files: string[]) => {
     for (const filePath of files) {
@@ -2466,6 +2636,7 @@ function collectRuntimeTaskProseSectionTasks(
         validationSectionLevel = 0;
         excludedSectionLevel = 0;
         pendingFiles = [];
+        pendingFilesAreExplicitOwner = false;
         continue;
       }
 
@@ -2480,6 +2651,7 @@ function collectRuntimeTaskProseSectionTasks(
         actionableSectionLevel = 0;
         validationSectionLevel = 0;
         pendingFiles = [];
+        pendingFilesAreExplicitOwner = false;
         continue;
       }
 
@@ -2497,6 +2669,7 @@ function collectRuntimeTaskProseSectionTasks(
           inValidationSection = true;
           validationSectionLevel = headingLevel;
           pendingFiles = [];
+          pendingFilesAreExplicitOwner = false;
           continue;
         }
         const isExplicitFileHeading =
@@ -2513,9 +2686,16 @@ function collectRuntimeTaskProseSectionTasks(
           nestedHeadingFiles.length > 0 &&
           (isExplicitFileHeading || isFileOnlyHeading || isLikelySourceMutationTask(headingText))
         ) {
-          ensureMutationFiles(nestedHeadingFiles);
-          remember(nestedHeadingFiles, headingText);
-          pendingFiles = nestedHeadingFiles;
+          const mutationOwnerFiles = isExplicitFileHeading || isFileOnlyHeading
+            ? nestedHeadingFiles
+            : selectMutationOwnerFileReferences(headingText, nestedHeadingFiles);
+          const effectiveOwnerFiles = mutationOwnerFiles.length > 0
+            ? mutationOwnerFiles
+            : nestedHeadingFiles;
+          ensureMutationFiles(effectiveOwnerFiles);
+          remember(effectiveOwnerFiles, headingText);
+          pendingFiles = effectiveOwnerFiles;
+          pendingFilesAreExplicitOwner = true;
         }
         continue;
       }
@@ -2528,6 +2708,7 @@ function collectRuntimeTaskProseSectionTasks(
       actionableSectionLevel = inActionableSection ? headingLevel : 0;
       validationSectionLevel = inValidationSection ? headingLevel : 0;
       pendingFiles = [];
+      pendingFilesAreExplicitOwner = false;
       continue;
     }
     if (!inActionableSection || isMarkdownTableSyntaxLine(rawLine)) continue;
@@ -2549,12 +2730,34 @@ function collectRuntimeTaskProseSectionTasks(
       // mutation vocabulary (for example “assign creator to creatorName”).
       ensureMutationFiles(directFiles);
       pendingFiles = directFiles;
+      pendingFilesAreExplicitOwner = true;
+      continue;
+    }
+
+    if (
+      !inValidationSection &&
+      pendingFilesAreExplicitOwner &&
+      pendingFiles.length > 0 &&
+      isLikelySourceMutationTask(normalized) &&
+      selectMutationOwnerFileReferences(normalized, directFiles).length === 0
+    ) {
+      // A file heading owns the prose beneath it. Other file names in that
+      // prose are normally interface/contract references (for example,
+      // "change src/main.js to match toolbar.js"), not additional mutation
+      // targets. Only an explicit imperative aimed at the referenced path may
+      // open a new owner.
+      remember(pendingFiles, normalized);
       continue;
     }
 
     if (!inValidationSection && directFiles.length > 0 && isLikelySourceMutationTask(normalized)) {
-      remember(directFiles, normalized);
-      pendingFiles = directFiles;
+      const mutationOwnerFiles = selectMutationOwnerFileReferences(normalized, directFiles);
+      const effectiveOwnerFiles = mutationOwnerFiles.length > 0
+        ? mutationOwnerFiles
+        : directFiles;
+      remember(effectiveOwnerFiles, normalized);
+      pendingFiles = effectiveOwnerFiles;
+      pendingFilesAreExplicitOwner = false;
       continue;
     }
     if (!inValidationSection && pendingFiles.length > 0 && isLikelySourceMutationTask(normalized)) {
@@ -3022,8 +3225,8 @@ export function repairActionablePlanArtifactContent(input: {
   if (missingSections.includes("validation") || missingSections.includes("test_plan")) {
     const isTestPlan = missingSections.includes("test_plan");
     const section = language === "en"
-      ? (isTestPlan ? "## Test Plan\n- Run the focused tests, build, or manual checks named by the affected surface and record the result before execution is considered complete." : "## Validation Standards\n- Run the focused tests, build, or manual checks named by the affected surface and record the result before execution is considered complete.")
-      : (isTestPlan ? "## 测试方案\n- 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。" : "## 验证标准\n- 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。");
+      ? (isTestPlan ? "## Test Plan\n- Run focused runtime-executable tests or builds for the affected surface. Report optional user/manual review separately in the final conclusion; it is not a completion gate." : "## Validation Standards\n- Run focused runtime-executable tests or builds for the affected surface. Report optional user/manual review separately in the final conclusion; it is not a completion gate.")
+      : (isTestPlan ? "## 测试方案\n- 运行与受影响范围匹配、runtime 可执行的测试或构建。可选用户/人工复核在最终结论中单列，不作为完成闸门。" : "## 验证标准\n- 运行与受影响范围匹配、runtime 可执行的测试或构建。可选用户/人工复核在最终结论中单列，不作为完成闸门。");
     repaired = `${repaired}\n\n${section}`.trim();
     repairedSections.push(isTestPlan ? "test_plan" : "validation");
   }

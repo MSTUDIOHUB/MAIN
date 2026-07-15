@@ -2,6 +2,8 @@ import type { HooksConfig } from "../../hooks";
 import type { FileReadState } from "../../orchestrator/fileReadCache";
 import {
   buildFileReadObservationIdentity,
+  buildFileReadWindowIdentity,
+  extractStructuredChangedPaths,
   hashString,
   invalidateWorkspaceReadCachesAfterMutation,
   pruneFileReadStates,
@@ -186,17 +188,21 @@ export async function executeToolExecutionRound(input: {
         const path = typeof args.path === "string" ? args.path : result.target;
         const metadata = await readFileMetadataIfAvailable(path, workspace);
         const contentHash = hashString(result.content);
-        if (metadata) {
-          resultForModel = {
-            ...resultForModel,
-            readFileObservation: buildFileReadObservationIdentity({
+        const observation = metadata
+          ? buildFileReadObservationIdentity({
               requestSignature: fileReadSignature,
               path: metadata.path,
               sizeBytes: metadata.sizeBytes,
               modifiedMs: metadata.modifiedMs,
               contentHash,
               source: "fresh",
-            }),
+            })
+          : undefined;
+        const window = buildFileReadWindowIdentity(result.content);
+        if (metadata) {
+          resultForModel = {
+            ...resultForModel,
+            readFileObservation: observation,
           };
         }
         const previous = fileReadStates.get(fileReadSignature);
@@ -212,6 +218,8 @@ export async function executeToolExecutionRound(input: {
             sizeBytes: metadata.sizeBytes,
             modifiedMs: metadata.modifiedMs,
             modelContent: result.content,
+            observation,
+            window,
             updatedAt: Date.now(),
           });
           pruneFileReadStates(fileReadStates);
@@ -226,6 +234,14 @@ export async function executeToolExecutionRound(input: {
             contentChars: result.content.length,
             contentHash,
           });
+        } else if (metadata && previous) {
+          // Preserve the exact identity/range even when a fresh tool call
+          // confirms the same bytes and metadata as the retained observation.
+          previous.observation = observation;
+          previous.window = window;
+          previous.modelContent = result.content;
+          previous.contentLength = result.content.length;
+          previous.updatedAt = Date.now();
         }
         readOnlyDuplicateSkipCounts.delete(fileReadSignature);
       }
@@ -312,10 +328,12 @@ export async function executeToolExecutionRound(input: {
       result.lifecycleState !== "blocked" &&
       result.lifecycleState !== "declined";
     if (shouldAdvanceWorkspaceObservationEpoch(tc.name, result, toolArgs) || refreshAfterPtyControl) {
+      const changedPaths = extractStructuredChangedPaths(result.content);
       const invalidation = invalidateWorkspaceReadCachesAfterMutation({
         toolName: tc.name,
         args: toolArgs,
         target: result.target,
+        changedPaths,
         fileReadStates,
         readOnlyResultCache,
         readOnlyDuplicateSkipCounts,
@@ -324,6 +342,7 @@ export async function executeToolExecutionRound(input: {
         iteration,
         tool: tc.name,
         target: result.target,
+        changedPaths,
         invalidatedFileReadStates: invalidation.invalidatedFileReadSignatures.length,
         invalidatedReadOnlyEntries: invalidation.invalidatedReadOnlyEntries,
       });
