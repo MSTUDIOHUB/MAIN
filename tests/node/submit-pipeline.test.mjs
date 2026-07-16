@@ -360,7 +360,7 @@ test("submit pipeline reuses awaiting-choice turns only with exact request ident
   assert.equal(staleIdentity.turnReuse.reuseCurrentTurn, false);
 });
 
-test("hidden plan recovery can explicitly reuse its original logical turn", () => {
+test("hidden approved-plan execution can reuse its logical turn with execute intent", () => {
   const planTurn = turn({ id: "turn-plan", mode: "plan", intent: "plan", status: "paused" });
   const newerTurn = turn({ id: "turn-newer", status: "done" });
   const decision = buildSubmitPipelineDecision({
@@ -370,7 +370,7 @@ test("hidden plan recovery can explicitly reuse its original logical turn", () =
       reuseCurrentTurn: true,
       turnIdOverride: "turn-plan",
       preservePlanState: true,
-      resolvedIntent: "plan",
+      resolvedIntent: "execute",
       executionConsentGranted: true,
     },
     snapshot: baseSnapshot({
@@ -940,25 +940,24 @@ test("effective intent decision preserves explicit Unity setup-engine directive"
   assert.equal(decision.effectiveCommandDirective.requiresApproval, false);
 });
 
-test("runtime decision maps plan execution override to execute display without losing planning status", () => {
+test("approved-plan child run uses canonical execute intent and default execute workflow", () => {
   const decision = resolveSubmitRuntimeDecision({
-    effectiveRunIntent: "plan",
-    runtimeIntentOverride: "execute",
+    effectiveRunIntent: "execute",
     currentMainModeKey: "main_mode",
-    isPlanApproved: false,
+    isPlanApproved: true,
     autoApproveTools: false,
-    executionConsentGranted: false,
+    executionConsentGranted: true,
     shouldExecuteOnceFromReplyOption: false,
-    preservePlanState: false,
+    preservePlanState: true,
     isLocalStudioCommand: false,
   });
 
-  assert.equal(decision.effectiveWorkflowMode, "plan");
+  assert.equal(decision.effectiveWorkflowMode, "edit");
   assert.equal(decision.runtimeRunIntent, "execute");
   assert.equal(decision.effectiveDisplayIntent, "execute");
-  assert.equal(decision.initialTurnStatus, "planning");
-  assert.equal(decision.shouldGrantExecutionConsentForTurn, false);
-  assert.equal(decision.shouldResetPlanState, true);
+  assert.equal(decision.initialTurnStatus, "executing");
+  assert.equal(decision.shouldGrantExecutionConsentForTurn, true);
+  assert.equal(decision.shouldResetPlanState, false);
 });
 
 test("runtime decision resumes Game Studio reply options as studio workflow with execution consent", () => {

@@ -40,7 +40,7 @@ function numberedLines(count, suffix = "") {
   ).join("\n");
 }
 
-test("large read_file results return a bounded first window with truncation metadata", () => {
+test("large read_file results return a 32K-bounded first window with truncation metadata", () => {
   const content = numberedLines(500, "x".repeat(80));
   const result = formatReadFileWindowForModel("src/components/Sidebar.tsx", content);
   const metadata = extractReadFileWindowMetadata(result);
@@ -53,9 +53,37 @@ test("large read_file results return a bounded first window with truncation meta
   assert.equal(metadata.returnedStartLine, 1);
   assert.ok(metadata.returnedEndLine < 500);
   assert.equal(metadata.nextStartLine, metadata.returnedEndLine + 1);
-  assert.match(result, /nextRead: read_file\(\{"path":"src\/components\/Sidebar\.tsx","start_line":\d+,"max_lines":180\}\)/);
+  assert.ok(metadata.returnedChars <= 32_000);
+  assert.doesNotMatch(result, /nextRead:/);
+  assert.match(result, /Do not automatically continue paging/i);
+  assert.match(result, /only when the current decision needs specific missing lines/i);
   assert.match(result, /do not use run_command merely to page file contents/i);
-  assert.ok(result.length < 8000);
+  assert.ok(result.length < 33_000);
+});
+
+test("an ordinary 894-line source file around 27KB stays in one observation", () => {
+  const content = numberedLines(894, "x".repeat(20));
+
+  assert.ok(content.length > 26_000);
+  assert.ok(content.length < 32_000);
+
+  const result = formatReadFileWindowForModel("src/main.js", content);
+
+  assert.equal(result, content);
+  assert.equal(extractReadFileWindowMetadata(result), null);
+  assert.match(result, /line-894/);
+});
+
+test("the default read window remains bounded to 1000 lines", () => {
+  const content = numberedLines(1001);
+  const result = formatReadFileWindowForModel("src/generated.ts", content);
+  const metadata = extractReadFileWindowMetadata(result);
+
+  assert.ok(metadata);
+  assert.equal(metadata.truncated, true);
+  assert.equal(metadata.returnedStartLine, 1);
+  assert.equal(metadata.returnedEndLine, 1000);
+  assert.equal(metadata.nextStartLine, 1001);
 });
 
 test("read_file explicit start_line and max_lines return the requested window", () => {
@@ -75,16 +103,20 @@ test("read_file explicit start_line and max_lines return the requested window", 
   assert.doesNotMatch(result, /line-008/);
 });
 
-test("duplicate truncated read guidance points to the next read_file window", () => {
-  const content = numberedLines(300, "x".repeat(80));
+test("duplicate truncated read guidance exposes missing-line metadata without auto-paging", () => {
+  const content = numberedLines(500, "x".repeat(80));
   const result = formatReadFileWindowForModel("src/components/Sidebar.tsx", content);
   const metadata = extractReadFileWindowMetadata(result);
   const guidance = buildReadFileWindowContinuationGuidance(result);
 
   assert.ok(metadata?.nextStartLine);
-  assert.match(guidance, new RegExp(`start_line=${metadata.nextStartLine}`));
+  assert.match(guidance, new RegExp(`line ${metadata.nextStartLine}`));
   assert.match(guidance, /bounded window, not the whole file/);
+  assert.match(guidance, /If the current decision needs missing source/i);
+  assert.match(guidance, /otherwise continue to mutation or validation/i);
   assert.match(guidance, /Do not use run_command/);
+  assert.match(result, /Do not automatically continue paging/i);
+  assert.doesNotMatch(guidance, /nextRead:/);
   assert.doesNotMatch(guidance, /full content already in context/i);
 });
 

@@ -6,15 +6,17 @@ import type {
   ToolExecutionResult,
 } from "./orchestrator/types";
 import {
-  acquireSubagentScopeLease,
+  activateSubagentScopeLease,
   buildSubagentPolicyDeferral,
   findSubagentLeaseOverlap,
   getSubagentBurstAdmission,
   registerSubagentAbortController,
   registerCoordinatedSubagentRun,
+  recordSubagentRuntimeSample,
   reportSubagentCapacityFailure,
   parseSubagentAllowedPaths,
   releaseSubagentScopeLease,
+  reserveSubagentScope,
   resolveSubagentCapacityPolicy,
   unregisterSubagentAbortController,
   withSubagentCapacity,
@@ -405,7 +407,7 @@ export async function executeControlledSubagent(input: {
     elasticCandidate: policy.profile === "local" && input.existingRunCount >= policy.maxActiveRequests,
     allowedPathCount: allowedPaths.length,
   });
-  acquireSubagentScopeLease({
+  reserveSubagentScope({
     threadId: snapshot.threadId,
     parentTurnId: input.parentTurnId,
     subagentId,
@@ -413,6 +415,11 @@ export async function executeControlledSubagent(input: {
     workspace: parentConfig.workspace,
     allowedPaths,
     createdAt: now,
+  });
+  emitChildDebug("subagent_scope_reserved", {
+    scopeKey,
+    allowedPathCount: allowedPaths.length,
+    parentBlocking: false,
   });
 
   const childAbortController = new AbortController();
@@ -438,6 +445,7 @@ export async function executeControlledSubagent(input: {
   let activitySequence = 0;
   let lastProgressEmitAt = 0;
   let childForceXmlTools = false;
+  let scopeLeaseActivated = false;
 
   const emitUpdate = (patch: SubagentRunPatch, activity?: SubagentActivity) => {
     input.emitEvent(withEventSchema({
@@ -613,6 +621,16 @@ export async function executeControlledSubagent(input: {
     onContextMemoryBuilt: undefined,
     onContextCompress: () => {},
     onToolExecuting: (tool, target) => {
+      if (!scopeLeaseActivated) {
+        scopeLeaseActivated = activateSubagentScopeLease(subagentId);
+        emitChildDebug("subagent_scope_lease_activated", {
+          scopeKey,
+          tool,
+          target,
+          activated: scopeLeaseActivated,
+          waitBeforeActivationMs: Date.now() - lifecycleStartedAt,
+        });
+      }
       emitUpdate({
         status: "running",
         progress: {
@@ -713,10 +731,12 @@ export async function executeControlledSubagent(input: {
   };
 
   let finalStatus: SubagentStatus = "failed";
+  let runtimeCompletedSuccessfully = false;
   let finalSummary = "";
   let wallClockTimedOut = false;
   const lifecycleStartedAt = Date.now();
   let capacityQueuedAt: number | null = null;
+  let runtimeStartedAt: number | null = null;
   try {
     return await withSubagentCapacity({
       policy,
@@ -752,6 +772,7 @@ export async function executeControlledSubagent(input: {
       },
       task: async () => {
         const startedAt = Date.now();
+        runtimeStartedAt = startedAt;
         const burstAdmission = getSubagentBurstAdmission(policy);
         const elasticCandidate = policy.profile === "local" &&
           input.existingRunCount >= policy.maxActiveRequests;
@@ -790,6 +811,7 @@ export async function executeControlledSubagent(input: {
           .finally(() => clearTimeout(wallClockTimer));
         finalStatus = resolveOutcomeStatus(outcome, childAbortController.signal.aborted);
         if (wallClockTimedOut) finalStatus = "blocked";
+        runtimeCompletedSuccessfully = finalStatus === "completed";
         const candidateSummary = compactText(
           finalText || turnSummary || streamText || childMessages
             .filter((message) => message.role === "assistant" && typeof message.content === "string")
@@ -929,6 +951,15 @@ export async function executeControlledSubagent(input: {
     };
   } finally {
     const closedAt = Date.now();
+    if (runtimeStartedAt !== null) {
+      recordSubagentRuntimeSample({
+        laneKey: policy.laneKey,
+        startupMs: runtimeStartedAt - lifecycleStartedAt,
+        capacityWaitMs: capacityQueuedAt == null ? 0 : runtimeStartedAt - capacityQueuedAt,
+        successful: runtimeCompletedSuccessfully,
+        recordedAt: closedAt,
+      });
+    }
     emitChildDebug("subagent_finished", {
       status: finalStatus,
       durationMs: closedAt - lifecycleStartedAt,
@@ -939,6 +970,7 @@ export async function executeControlledSubagent(input: {
       ).length,
       summaryTrust: "unverified_hypothesis",
       blocker: compactText(lastError, 300) || null,
+      scopeLeaseActivated,
     });
     input.emitEvent(withEventSchema({
       type: "subagent.closed",

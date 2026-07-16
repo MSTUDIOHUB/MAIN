@@ -156,7 +156,9 @@ function UserContextPillRow({
       {visibleItems.map((item, index) => {
         const isImage = item.kind === "image";
         const isMention = item.kind === "mention";
-        const canPreview = isImage && !!item.previewDataUrl;
+        const thumbnailDataUrl = item.thumbnailDataUrl || item.previewDataUrl;
+        const fullPreviewDataUrl = item.previewDataUrl || item.thumbnailDataUrl;
+        const canPreview = isImage && !!fullPreviewDataUrl;
         const label = item.label || (language === "en" ? `Image ${index + 1}` : `截图 ${index + 1}`);
         const displayLabel = isMention ? String(label).replace(/^@\s*/, "") : label;
         const statusTitle = item.status === "failed"
@@ -164,11 +166,12 @@ function UserContextPillRow({
           : item.path || label;
         const content = (
           <>
-            {isImage && item.previewDataUrl ? (
+            {isImage && thumbnailDataUrl ? (
               <img
-                src={item.previewDataUrl}
-                alt=""
-                className="h-5 w-5 rounded-[5px] border border-[#3f3f46] object-cover"
+                src={thumbnailDataUrl}
+                alt={label}
+                data-testid="user-context-image-thumbnail"
+                className="h-8 w-10 rounded-md border border-[#3f3f46] object-cover"
               />
             ) : isImage ? (
               <IconImageIcon className="h-3.5 w-3.5" />
@@ -184,7 +187,7 @@ function UserContextPillRow({
           </>
         );
         const className = [
-          "inline-flex h-7 max-w-full items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-mono transition-colors",
+          `inline-flex ${isImage && thumbnailDataUrl ? "h-10" : "h-7"} max-w-full items-center gap-1.5 rounded-full border px-2.5 text-[11px] font-mono transition-colors`,
           item.status === "failed"
             ? "border-[rgba(251,191,36,0.28)] bg-[rgba(251,191,36,0.10)] text-[#fbbf24]"
             : "border-[#27272a] bg-[#09090b] text-[#d4d4d8]",
@@ -198,7 +201,9 @@ function UserContextPillRow({
             data-testid="user-context-pill"
             className={className}
             title={statusTitle}
-            onClick={() => onPreviewImage(item)}
+            onClick={() => onPreviewImage(
+              item.previewDataUrl ? item : { ...item, previewDataUrl: fullPreviewDataUrl },
+            )}
           >
             {content}
           </button>
@@ -213,6 +218,55 @@ function UserContextPillRow({
           </span>
         );
       })}
+    </div>
+  );
+}
+
+function VisualContextDeliveryBadge({
+  progress,
+  language,
+}: {
+  progress: any;
+  language: "zh" | "en";
+}) {
+  const status = String(progress?.visualContext?.status || "queued");
+  const recognition = String(progress?.visualContext?.recognition || (
+    status === "delivered" || status === "queued" ? "pending" : "unverified"
+  ));
+  const observationSummary = String(progress?.visualContext?.observationSummary || "").trim();
+  const terminalWithoutObservation = progress?.visualRunTerminal === true && recognition === "pending";
+  const observed = status === "delivered" && recognition === "observed" && observationSummary.length > 0;
+  const title = observed
+    ? language === "zh" ? "模型已报告截图观察" : "Model reported a screenshot observation"
+    : terminalWithoutObservation
+    ? language === "zh" ? "未形成明确截图观察" : "No explicit screenshot observation"
+    : status === "delivered" || status === "queued"
+    ? language === "zh" ? "正在识别截图证据" : "Inspecting screenshot evidence"
+    : String(progress?.title || (language === "zh" ? "截图未送达模型" : "Screenshot not delivered to model"));
+  const summary = observationSummary || String(progress?.summary || "");
+  const tone = observed
+    ? "text-[#86efac]"
+    : terminalWithoutObservation || status === "provider_unsupported" || status === "not_delivered" || status === "partially_delivered"
+    ? "text-[#fbbf24]"
+    : "text-[#93c5fd]";
+  const dot = observed
+    ? "bg-[#34d399]"
+    : terminalWithoutObservation || status === "provider_unsupported" || status === "not_delivered" || status === "partially_delivered"
+    ? "bg-[#f59e0b]"
+    : "bg-[#60a5fa] animate-pulse";
+  return (
+    <div
+      data-testid="visual-context-delivery-status"
+      data-status={status}
+      data-recognition={terminalWithoutObservation ? "unverified" : recognition}
+      aria-live="polite"
+      className={`mt-2 flex items-center justify-end gap-1.5 text-[10px] leading-4 ${tone}`}
+      title={summary || title}
+    >
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${dot}`} />
+      <span className="max-w-[280px] truncate">
+        {title}{observed ? ` · ${observationSummary}` : ""}
+      </span>
     </div>
   );
 }
@@ -2568,6 +2622,40 @@ export default function ChatArea({
     goalRuntime: useAppStore((s) => s.goalRuntime),
   };
   const subagentRuns = useMemo(() => projectSubagentRuns(runtimeEvents), [runtimeEvents]);
+  const visualContextProgressByTurnId = useMemo(() => {
+    const latestByTurnId = new Map<string, { timestampMs: number; progress: any }>();
+    const terminalAtByTurnId = new Map<string, number>();
+    for (const event of Array.isArray(runtimeEvents) ? runtimeEvents : []) {
+      const turnId = String(event.turnId || "").trim();
+      if (!turnId) continue;
+      const timestampMs = Number(event.timestampMs) || 0;
+      if (
+        event?.type === "turn.completed" ||
+        event?.type === "turn.failed" ||
+        event?.type === "run.completed" ||
+        event?.type === "run.failed" ||
+        event?.type === "run.paused"
+      ) {
+        terminalAtByTurnId.set(turnId, Math.max(terminalAtByTurnId.get(turnId) || 0, timestampMs));
+        continue;
+      }
+      if (event?.type !== "progress.updated" || event?.progress?.tool !== "visual_context") continue;
+      if (!event.progress?.visualContext) continue;
+      const previous = latestByTurnId.get(turnId);
+      if (!previous || timestampMs >= previous.timestampMs) {
+        latestByTurnId.set(turnId, { timestampMs, progress: event.progress });
+      }
+    }
+    return new Map(
+      [...latestByTurnId.entries()].map(([turnId, value]) => [
+        turnId,
+        {
+          ...value.progress,
+          visualRunTerminal: (terminalAtByTurnId.get(turnId) || 0) >= value.timestampMs,
+        },
+      ]),
+    );
+  }, [runtimeEvents]);
   const isImageStudioMode = selectedMainModeKey === "image_studio";
   const isWebFallbackImageEngine = imageStudio.config.provider === "web_fallback";
   const imageStudioLocalFamilyLabel = imageStudio.config.local.serviceFamily === "ollama"
@@ -3248,17 +3336,34 @@ export default function ChatArea({
   const renderBlock = (block, index) => {
     if (block.type === "user") {
       const existingContextItems = Array.isArray(block.contextItems) ? block.contextItems : [];
-      const hasImageContextItem = existingContextItems.some((item: UserContextItem) => item.kind === "image");
-      const legacyImageItems = !hasImageContextItem && Array.isArray(block.images)
-        ? block.images.map((dataUrl: string, imgIdx: number) => ({
+      const blockImages = Array.isArray(block.images)
+        ? block.images.filter((dataUrl: unknown): dataUrl is string => typeof dataUrl === "string" && dataUrl.length > 0)
+        : [];
+      let imageCursor = 0;
+      const hydratedContextItems = existingContextItems.map((item: UserContextItem) => {
+        if (item.kind !== "image") return item;
+        const fallbackPreview = blockImages[imageCursor];
+        imageCursor += 1;
+        return !item.previewDataUrl && !item.thumbnailDataUrl && fallbackPreview
+          ? { ...item, previewDataUrl: fallbackPreview }
+          : item;
+      });
+      const legacyImageItems = blockImages.slice(imageCursor)
+        .map((dataUrl: string, relativeIndex: number) => {
+          const imgIdx = imageCursor + relativeIndex;
+          return {
             id: `legacy-image:${block.id}:${imgIdx}`,
             kind: "image",
             label: language === "en" ? `Image ${imgIdx + 1}` : `截图 ${imgIdx + 1}`,
             status: "ready",
             previewDataUrl: dataUrl,
-          }))
-        : [];
-      const userContextItems = [...existingContextItems, ...legacyImageItems];
+          };
+        });
+      const userContextItems = [...hydratedContextItems, ...legacyImageItems];
+      const hasImageContext = userContextItems.some((item: UserContextItem) => item.kind === "image");
+      const visualContextProgress = hasImageContext
+        ? visualContextProgressByTurnId.get(String(block.turnId || ""))
+        : null;
       return (
         <div key={`${block.id}-${index}`} className="flex w-full justify-end">
           <div className="theme-subtle-bg theme-subtle-border max-w-[85%] rounded-2xl rounded-tr-sm border p-4">
@@ -3279,6 +3384,12 @@ export default function ChatArea({
               language={language}
               onPreviewImage={setPreviewImageItem}
             />
+            {visualContextProgress && (
+              <VisualContextDeliveryBadge
+                progress={visualContextProgress}
+                language={language}
+              />
+            )}
           </div>
         </div>
       );

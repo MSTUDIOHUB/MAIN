@@ -62,7 +62,13 @@ const {
   path.join(workspaceRoot, "src/lib/orchestrator/loop/reasoningNoToolRecovery.ts"),
 );
 
-function makeCallbacks({ language = "en", approved = false, planStage = "drafting" } = {}) {
+function makeCallbacks({
+  language = "en",
+  approved = false,
+  planStage = "drafting",
+  planTasks = [],
+  evidenceLedger = [],
+} = {}) {
   const events = [];
   return {
     events,
@@ -70,6 +76,8 @@ function makeCallbacks({ language = "en", approved = false, planStage = "draftin
       getPreferredLanguage: () => language,
       getIsPlanApproved: () => approved,
       getPlanStage: () => planStage,
+      getPlanTasks: () => planTasks,
+      getPlanExecutionEvidenceLedger: () => evidenceLedger,
       getMessages: () => [{ role: "user", content: "Need a concrete fix." }],
       onStreamToken: (token, id) => events.push({ type: "token", token, id }),
       onStatusChange: (status) => events.push({ type: "status", status }),
@@ -113,7 +121,6 @@ function baseInput(overrides = {}) {
     planEvidenceRecoveryPasses: 0,
     planReasoningOnlyRecoveryPasses: 0,
     consecutiveReasoningDominatedCount: 0,
-    approvedPlanActionOnlyRecoveryActive: false,
     setPlanRuntimePhase: () => {},
     activateExecuteRecovery: () => {},
     ...overrides,
@@ -152,6 +159,58 @@ test("second reasoning dominated turn pauses without another recovery prompt", (
   assert.equal(events.some((event) => event.type === "stop" && event.reason === "no_output"), true);
   assert.equal(events.some((event) => event.type === "status" && event.status === "idle"), true);
   assert.equal(events.some((event) => event.type === "append"), false);
+});
+
+test("approved execute reasoning recovery follows Plan evidence provenance", () => {
+  const planTasks = [{
+    id: "edit-app",
+    text: "Modify src/App.tsx and run tests",
+    status: "in_progress",
+    executionKind: "mutation",
+    evidence: [
+      { kind: "file", value: "src/App.tsx" },
+      { kind: "cmd", value: "npm test" },
+    ],
+  }];
+  const pending = makeCallbacks({ approved: true, planStage: "executing", planTasks });
+  const pendingActivations = [];
+  handleReasoningDominatedNoToolRecovery(baseInput({
+    callbacks: pending.callbacks,
+    activateExecuteRecovery: (...args) => pendingActivations.push(args),
+  }));
+  assert.equal(pendingActivations[0]?.[0], "mutation_first");
+
+  const sourceSatisfied = makeCallbacks({
+    approved: true,
+    planStage: "executing",
+    planTasks,
+    evidenceLedger: [{
+      id: "file-proof",
+      planTaskId: "edit-app",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }],
+  });
+  const satisfiedActivations = [];
+  handleReasoningDominatedNoToolRecovery(baseInput({
+    callbacks: sourceSatisfied.callbacks,
+    activateExecuteRecovery: (...args) => satisfiedActivations.push(args),
+  }));
+  assert.equal(satisfiedActivations.length, 0);
+
+  handleReasoningDominatedNoToolRecovery(baseInput({
+    callbacks: sourceSatisfied.callbacks,
+    consecutiveReasoningDominatedCount: 1,
+  }));
+  assert.equal(
+    sourceSatisfied.events.some((event) =>
+      event.type === "stop" && event.reason === "incomplete_plan"
+    ),
+    true,
+  );
 });
 
 test("unapproved plan reasoning-only result asks for targeted evidence first", () => {

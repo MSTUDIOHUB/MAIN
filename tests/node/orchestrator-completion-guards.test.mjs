@@ -255,8 +255,6 @@ test("an active recovery phase blocks final completion even when prior evidence 
       readLease: null,
       sourceObservationKey: null,
       decisionCheckpoint: null,
-      consecutiveBlockedReadFileCount: 0,
-      repeatedEditValidationAttempts: 0,
     },
   });
   assert.equal(result.reason, "execution_evidence_gap:recovery_phase_pending");
@@ -463,13 +461,14 @@ test("ledger append order, not equal millisecond timestamps, determines post-mut
   assert.equal(closed, null);
 });
 
-test("long-running execution requires current PTY readiness and browser validation", () => {
+test("long-running execution requires PTY readiness and only interaction work requires a browser", () => {
   const baseLedger = [
     {
       id: "mutation",
       kind: "file",
       value: "src/App.tsx",
       sourceTool: "apply_patch",
+      changedIdentifiers: ["formatDocument"],
       createdAt: 1,
     },
     {
@@ -521,15 +520,58 @@ test("long-running execution requires current PTY readiness and browser validati
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assert.equal(ready.reason, "execution_evidence_gap:browser_validation_required");
+  assert.equal(ready, null);
+
+  const interactionReadyLedger = readyLedger.map((entry) => entry.id === "mutation"
+    ? {
+        ...entry,
+        interactionMutation: true,
+        interactionBehaviorTargets: ["#new-btn"],
+      }
+    : entry);
+  const interactionReadyHarness = createCallbacks({
+    getPlanExecutionEvidenceLedger: () => interactionReadyLedger,
+  });
+  const interactionReady = runExecutionEvidenceCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: interactionReadyHarness.callbacks,
+    finalTurnContract: contract,
+    approvedPlanAlreadyAudited: false,
+    sawExecutionEvidence: true,
+  });
+  assert.equal(interactionReady.reason, "execution_evidence_gap:browser_validation_required");
 
   const browserHarness = createCallbacks({
-    getPlanExecutionEvidenceLedger: () => [...readyLedger, {
+    getPlanExecutionEvidenceLedger: () => [...interactionReadyLedger, {
       id: "browser",
       kind: "browser_dom",
       value: "http://localhost:1420/",
+      target: "http://localhost:1420/",
       sourceTool: "browser_evaluate",
       createdAt: 4,
+      browserInteraction: {
+        actions: [{
+          id: "click-new",
+          kind: "click",
+          target: "#new-btn",
+          succeeded: true,
+          stateChanged: true,
+          changedFields: ["bodyText"],
+          effectChangedFields: ["bodyText"],
+          effectStateChanged: true,
+        }],
+        assertions: [{
+          kind: "text",
+          target: "Untitled",
+          passed: true,
+          beforePassed: false,
+          changedAfterAction: true,
+          causallyLinked: true,
+          afterActionId: "click-new",
+        }],
+        pageErrors: [],
+        consoleErrors: [],
+      },
     }],
   });
   const closed = runExecutionEvidenceCompletionGuard({
@@ -542,7 +584,7 @@ test("long-running execution requires current PTY readiness and browser validati
   assert.equal(closed, null);
 });
 
-test("validation-only long-running execution cannot complete before PTY and browser evidence", () => {
+test("validation-only long-running execution completes after current PTY readiness", () => {
   const launch = {
     id: "validation-only-launch",
     kind: "cmd",
@@ -584,17 +626,9 @@ test("validation-only long-running execution cannot complete before PTY and brow
     createdAt: 2,
   };
   assert.equal(
-    guard([launch, ready])?.reason,
-    "execution_evidence_gap:browser_validation_required",
+    guard([launch, ready]),
+    null,
   );
-  const browser = {
-    id: "validation-only-browser",
-    kind: "browser_dom",
-    value: "http://localhost:1420/",
-    sourceTool: "browser_evaluate",
-    createdAt: 3,
-  };
-  assert.equal(guard([launch, ready, browser]), null);
 });
 
 test("a healthy existing server reconciles a port conflict but still requires browser validation", () => {
@@ -612,6 +646,8 @@ test("a healthy existing server reconciles a port conflict but still requires br
       kind: "file",
       value: "src/App.tsx",
       sourceTool: "apply_patch",
+      interactionMutation: true,
+      interactionBehaviorTargets: ["#new-btn"],
       createdAt: 1,
     },
     {
@@ -621,6 +657,7 @@ test("a healthy existing server reconciles a port conflict but still requires br
       sourceTool: "execute_command",
       observationStatus: "failed",
       portConflict: true,
+      devServerPort: 1420,
       createdAt: 2,
     },
     {
@@ -628,6 +665,7 @@ test("a healthy existing server reconciles a port conflict but still requires br
       kind: "cmd",
       value: "curl -fsS http://localhost:1420/",
       sourceTool: "run_command",
+      devServerPort: 1420,
       createdAt: 3,
     },
   ];
@@ -648,8 +686,32 @@ test("a healthy existing server reconciles a port conflict but still requires br
       id: "browser",
       kind: "browser_dom",
       value: "http://localhost:1420/",
+      target: "http://localhost:1420/",
       sourceTool: "browser_evaluate",
       createdAt: 4,
+      browserInteraction: {
+        actions: [{
+          id: "click-new",
+          kind: "click",
+          target: "#new-btn",
+          succeeded: true,
+          stateChanged: true,
+          changedFields: ["bodyText"],
+          effectChangedFields: ["bodyText"],
+          effectStateChanged: true,
+        }],
+        assertions: [{
+          kind: "text",
+          target: "Untitled",
+          passed: true,
+          beforePassed: false,
+          changedAfterAction: true,
+          causallyLinked: true,
+          afterActionId: "click-new",
+        }],
+        pageErrors: [],
+        consoleErrors: [],
+      },
     }],
   });
   const closed = runExecutionEvidenceCompletionGuard({
@@ -662,9 +724,9 @@ test("a healthy existing server reconciles a port conflict but still requires br
   assert.equal(closed, null);
 });
 
-test("approved plan completion guard pauses completed plan execution without audit evidence", () => {
+test("approved plan provenance keeps its completion guard in default execute workflow", () => {
   const { callbacks, events } = createCallbacks({
-    getWorkflowMode: () => "plan",
+    getWorkflowMode: () => "edit",
     getIsPlanApproved: () => true,
   });
   const result = runApprovedPlanCompletionGuard({
@@ -839,6 +901,7 @@ test("agent loop runner preserves awaiting-choice pauses as a structured outcome
 
 test("subagent runner strips reply options and preserves the evidence summary", async () => {
   const finals = [];
+  const terminalCommits = [];
   class SubagentChoiceOrchestrator {
     async execute(callbacks) {
       callbacks.onAssistantFinalText(
@@ -861,6 +924,21 @@ test("subagent runner strips reply options and preserves the evidence summary", 
     hasExecuteOperationEvidence() {
       return false;
     }
+
+    hasPendingTurnCompletion() {
+      return true;
+    }
+
+    commitPendingTurnCompletion() {
+      terminalCommits.push("commit");
+      return true;
+    }
+
+    discardPendingTurnCompletion() {
+      terminalCommits.push("discard");
+      return true;
+    }
+
   }
   const { executeAgentLoop } = loadAgentLoopRunnerWithFake(SubagentChoiceOrchestrator, []);
   const outcome = await executeAgentLoop({
@@ -876,6 +954,103 @@ test("subagent runner strips reply options and preserves the evidence summary", 
   assert.equal(finals[0][0], "Useful evidence summary");
   assert.deepEqual(finals[0][1], []);
   assert.equal(finals[0][2].awaitingInput, false);
+  assert.deepEqual(terminalCommits, ["commit"]);
+});
+
+test("agent loop runner never defaults an uncommitted return to completed", async () => {
+  class MissingTerminalOrchestrator {
+    async execute() {}
+
+    getLatestTurnContract() {
+      return {
+        conversationIntent: "respond",
+        runtimeIntent: "respond",
+        approvalState: "not_required",
+        mutationExpected: false,
+        completionEvidenceRequired: "none",
+      };
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+  }
+  const logs = [];
+  const stops = [];
+  const statuses = [];
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(MissingTerminalOrchestrator, logs);
+  const outcome = await executeAgentLoop({
+    getPreferredLanguage: () => "en",
+    getWorkflowMode: () => "chat",
+    getIsPlanApproved: () => false,
+    onAssistantFinalText: () => {},
+    onNonActionableStop: (message, reason, progress) => stops.push({ message, reason, progress }),
+    onStatusChange: (status) => statuses.push(status),
+    onError: () => {},
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "stopped_no_action",
+    reason: "agent_loop_no_terminal_outcome",
+  });
+  assert.equal(stops[0].progress.recoveryReason, "agent_loop_no_terminal_outcome");
+  assert.deepEqual(statuses, ["idle"]);
+  assert.equal(logs.some((entry) => entry.event === "agent_loop_missing_terminal_outcome"), true);
+});
+
+test("completion guards discard staged completion instead of publishing a false success", async () => {
+  const terminalCommits = [];
+  class GuardedCompletionOrchestrator {
+    async execute() {}
+
+    hasPendingTurnCompletion() {
+      return true;
+    }
+
+    commitPendingTurnCompletion() {
+      terminalCommits.push("commit");
+      return true;
+    }
+
+    discardPendingTurnCompletion() {
+      terminalCommits.push("discard");
+      return true;
+    }
+
+    pauseActiveRun(reason) {
+      terminalCommits.push(`pause:${reason}`);
+      return true;
+    }
+
+    getLatestTurnContract() {
+      return {
+        conversationIntent: "execute",
+        runtimeIntent: "execute",
+        approvalState: "approved",
+        mutationExpected: true,
+        completionEvidenceRequired: "execution_evidence",
+      };
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+  }
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(GuardedCompletionOrchestrator, []);
+  const { callbacks } = createCallbacks({
+    getWorkflowMode: () => "edit",
+  });
+  const outcome = await executeAgentLoop({
+    ...callbacks,
+    onAssistantFinalText: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assert.equal(outcome.status, "stopped_no_action");
+  assert.deepEqual(terminalCommits, [
+    "discard",
+    "pause:execution_evidence_required",
+  ]);
 });
 
 test("agent loop runner preserves a bounded error reason for Goal Runtime diagnostics", async () => {
@@ -949,6 +1124,43 @@ test("a run.paused boundary cannot fall through as agent_loop_completed", async 
   assert.deepEqual(outcome, {
     status: "paused",
     reason: "plan_review_required",
+  });
+});
+
+test("a start-hook block is a resumable pause, never an implicit completion", async () => {
+  class StartHookBlockedOrchestrator {
+    async execute() {}
+
+    getLatestRunPauseReason() {
+      return "start_hook_blocked";
+    }
+
+    getLatestTurnContract() {
+      return {
+        conversationIntent: "execute",
+        runtimeIntent: "execute",
+        approvalState: "approved",
+        mutationExpected: true,
+        completionEvidenceRequired: "execution_evidence",
+      };
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+  }
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(StartHookBlockedOrchestrator, []);
+  const outcome = await executeAgentLoop({
+    getWorkflowMode: () => "edit",
+    getIsPlanApproved: () => false,
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "paused",
+    reason: "start_hook_blocked",
   });
 });
 

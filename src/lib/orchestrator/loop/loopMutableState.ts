@@ -1,9 +1,5 @@
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { OrchestratorCallbacks } from "../types";
-import {
-  createApprovedPlanRecoveryRuntimeState,
-  type ApprovedPlanRecoveryRuntimeState,
-} from "./approvedPlanRecoveryRuntime";
 import type { AssistantIterationPhaseResult } from "./assistantIterationPhase";
 import {
   createAgentLoopEvidenceRuntimeState,
@@ -54,7 +50,6 @@ export interface AgentLoopMutableState {
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   recentPlanToolActivity: PlanToolActivitySummary[];
   recentToolActivity: PlanToolActivitySummary[];
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
   toolExecutionRuntimeState: AgentLoopToolExecutionRuntimeState;
   unityMcpRuntimeState: UnityMcpRuntimeState;
@@ -79,7 +74,6 @@ export function createAgentLoopMutableState(input: {
     evidenceRuntimeState: createAgentLoopEvidenceRuntimeState(),
     recentPlanToolActivity: [],
     recentToolActivity: [],
-    approvedPlanRecoveryState: createApprovedPlanRecoveryRuntimeState(),
     executeRecoveryState: createExecuteRecoveryRuntimeState({
       workflowMode: input.workflowMode,
       forcedMode: input.callbacks.getForcedExecuteRecoveryMode?.(),
@@ -107,7 +101,6 @@ export function resetAgentLoopMutableStateForApprovedPlanExecution(
     isPlanApproved: true,
   });
   state.evidenceRuntimeState = createAgentLoopEvidenceRuntimeState();
-  state.approvedPlanRecoveryState = createApprovedPlanRecoveryRuntimeState();
   state.executeRecoveryState = createExecuteRecoveryRuntimeState({
     workflowMode: "plan",
   });
@@ -146,7 +139,6 @@ export function applyAssistantIterationMutableState(
 ): void {
   state.noToolRuntimeState = result.noToolRuntimeState;
   state.planRuntimeState = result.planRuntimeState;
-  state.approvedPlanRecoveryState = result.approvedPlanRecoveryState;
   state.recoveryPromptState = result.recoveryPromptState;
   state.evidenceRuntimeState = result.evidenceRuntimeState;
   state.unityMcpRuntimeState = result.unityMcpRuntimeState;
@@ -163,5 +155,4 @@ export function applyToolIterationMutableState(
   state.recoveryPromptState = result.recoveryPromptState;
   state.unityMcpRuntimeState = result.unityMcpRuntimeState;
   state.evidenceRuntimeState = result.evidenceRuntimeState;
-  state.approvedPlanRecoveryState = result.approvedPlanRecoveryState;
 }

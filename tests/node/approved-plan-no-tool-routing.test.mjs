@@ -62,7 +62,6 @@ const { resolveApprovedPlanNoToolRoute } = loadTranspiledModuleSync(
 
 function route(overrides = {}) {
   return resolveApprovedPlanNoToolRoute({
-    workflowMode: "plan",
     isPlanApproved: true,
     planStage: "executing",
     toolCallCount: 0,

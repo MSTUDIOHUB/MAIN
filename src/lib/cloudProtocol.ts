@@ -267,14 +267,20 @@ function extractTextContent(content: string | ProtocolContentPart[]): string {
     .join("\n");
 }
 
+function parseBase64DataUrlImage(url: string): { mimeType: string; data: string } | null {
+  const match = String(url || "").match(/^data:(image\/[^;]+);base64,(.+)$/);
+  if (!match) return null;
+  return { mimeType: match[1], data: match[2] };
+}
+
 function extractAnthropicTextBlocks(content: string | ProtocolContentPart[]): AnthropicTextBlock[] {
   const text = extractTextContent(content);
   return text ? [{ type: "text", text }] : [];
 }
 
 function parseDataUrlImage(url: string): AnthropicImageBlock | null {
-  const match = url.match(/^data:(image\/[^;]+);base64,(.+)$/);
-  if (!match) {
+  const dataUrl = parseBase64DataUrlImage(url);
+  if (!dataUrl) {
     if (/^https?:\/\//i.test(url)) {
       return {
         type: "image",
@@ -290,8 +296,8 @@ function parseDataUrlImage(url: string): AnthropicImageBlock | null {
     type: "image",
     source: {
       type: "base64",
-      media_type: match[1],
-      data: match[2],
+      media_type: dataUrl.mimeType,
+      data: dataUrl.data,
     },
   };
 }
@@ -783,12 +789,34 @@ export function extractOpenAiResponseText(
   return "";
 }
 
+type ResponsesInputContentPart =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string };
+
+function responsesInputContentParts(content: ProtocolContentPart[]): ResponsesInputContentPart[] {
+  const parts: ResponsesInputContentPart[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      parts.push({ type: "input_text", text: part.text });
+    } else {
+      parts.push({ type: "input_image", image_url: part.image_url.url });
+    }
+  }
+  return parts;
+}
+
+function hasImageContentPart(content: ProtocolChatMessage["content"]): content is ProtocolContentPart[] {
+  return Array.isArray(content) && content.some((part) => part.type === "image_url");
+}
+
 function mapMessageForResponsesLegacyInput(message: ProtocolChatMessage): Record<string, unknown> {
   const role = message.role === "tool" ? "user" : message.role;
   return {
     type: "message",
     role,
-    content: extractTextContent(message.content),
+    content: hasImageContentPart(message.content)
+      ? responsesInputContentParts(message.content)
+      : extractTextContent(message.content),
   };
 }
 
@@ -796,12 +824,9 @@ function mapMessageForResponsesInputTextArray(message: ProtocolChatMessage): Rec
   const role = message.role === "tool" ? "user" : message.role;
   return {
     role,
-    content: [
-      {
-        type: "input_text",
-        text: extractTextContent(message.content),
-      },
-    ],
+    content: hasImageContentPart(message.content)
+      ? responsesInputContentParts(message.content)
+      : [{ type: "input_text", text: extractTextContent(message.content) }],
   };
 }
 
@@ -848,7 +873,9 @@ function truncateTextForCloud(value: string, maxChars: number): string {
 
 function compactProtocolMessageForCloud(
   message: ProtocolChatMessage,
-  options: Pick<CloudResponsesMessageCompactionOptions, "aggressive"> = {},
+  options: Pick<CloudResponsesMessageCompactionOptions, "aggressive"> & {
+    preserveImages?: boolean;
+  } = {},
 ): ProtocolChatMessage {
   const text = extractTextContent(message.content);
   const maxChars = options.aggressive
@@ -863,9 +890,26 @@ function compactProtocolMessageForCloud(
         ? 1200
         : 2200;
 
+  const compactedText = truncateTextForCloud(text, maxChars);
+  const messageContent = message.content;
+  let compactedContent: ProtocolChatMessage["content"] = compactedText;
+  if (options.preserveImages && hasImageContentPart(messageContent)) {
+    const parts: ProtocolContentPart[] = [];
+    const firstTextIndex = messageContent.findIndex((candidate) => candidate.type === "text");
+    for (let index = 0; index < messageContent.length; index += 1) {
+      const part = messageContent[index];
+      if (part.type === "image_url") {
+        parts.push({ type: "image_url", image_url: { url: part.image_url.url } });
+      } else if (index === firstTextIndex && compactedText) {
+        parts.push({ type: "text", text: compactedText });
+      }
+    }
+    compactedContent = parts;
+  }
+
   return {
     ...message,
-    content: truncateTextForCloud(text, maxChars),
+    content: compactedContent,
     ...(message.tool_calls ? { tool_calls: message.tool_calls.slice(-3) } : {}),
   };
 }
@@ -895,6 +939,9 @@ export function compactCloudResponsesMessages(
   const systemMessages = messages.filter((message) => message.role === "system");
   const memoryMessage = buildCloudMemoryMessage(messages, options);
   const conversationMessages = messages.filter((message) => message.role !== "system" && !isContextMemoryMessage(message));
+  const latestImageMessage = [...conversationMessages]
+    .reverse()
+    .find((message) => hasImageContentPart(message.content));
   const maxInputMessages = Math.max(
     aggressive ? 4 : 6,
     options.maxInputMessages ||
@@ -912,7 +959,10 @@ export function compactCloudResponsesMessages(
     return [
       ...systemMessages,
       ...(memoryMessage ? [memoryMessage] : []),
-      ...conversationMessages.map((message) => compactProtocolMessageForCloud(message, { aggressive })),
+      ...conversationMessages.map((message) => compactProtocolMessageForCloud(message, {
+        aggressive,
+        preserveImages: message === latestImageMessage,
+      })),
     ];
   }
 
@@ -944,7 +994,10 @@ export function compactCloudResponsesMessages(
         summary,
       ].filter(Boolean).join("\n"),
     },
-    ...recent.map((message) => compactProtocolMessageForCloud(message, { aggressive })),
+    ...recent.map((message) => compactProtocolMessageForCloud(message, {
+      aggressive,
+      preserveImages: message === latestImageMessage,
+    })),
   ];
 }
 
@@ -956,7 +1009,18 @@ export function compactCloudResponsesInstructions(
   const maxChars = options.aggressive ? 3000 : CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS;
   if (!options.aggressive && instructions.length <= maxChars) return instructions;
 
-  const lines = instructions.split(/\r?\n/);
+  // Visual observations are an execution contract, not ordinary prompt
+  // prose. If compaction keeps the image but drops this block, transport can
+  // truthfully report `delivered` while the model is never asked to emit the
+  // observation receipt that distinguishes pixel inspection from a guess.
+  // Preserve the newest block verbatim and compact only the remaining prose.
+  const visualProtocolPattern = /\[visual_observation_protocol\][\s\S]*?\[\/visual_observation_protocol\]/gi;
+  const visualProtocolBlocks = [...instructions.matchAll(visualProtocolPattern)]
+    .map((match) => String(match[0] || "").trim())
+    .filter(Boolean);
+  const protectedVisualProtocol = visualProtocolBlocks[visualProtocolBlocks.length - 1] || "";
+  const compactableInstructions = instructions.replace(visualProtocolPattern, "");
+  const lines = compactableInstructions.split(/\r?\n/);
   const keepPatterns = [
     /当前工作区|相对路径|workspace|工作区/i,
     /M Studio|Unity|游戏开发|教程|中文|Region|注释/i,
@@ -995,6 +1059,7 @@ export function compactCloudResponsesInstructions(
 
   const compact = [
     ...requiredToolReminder,
+    ...(protectedVisualProtocol ? ["", protectedVisualProtocol] : []),
     "",
     ...keptLines,
     "",
@@ -1221,15 +1286,41 @@ function mapGeminiRole(role: ProtocolChatMessage["role"]): "user" | "model" {
   return role === "assistant" ? "model" : "user";
 }
 
+type GeminiRequestContentPart =
+  | { text: string }
+  | { inlineData: { mimeType: string; data: string } };
+
+function mapGeminiContentParts(content: ProtocolChatMessage["content"]): GeminiRequestContentPart[] {
+  if (typeof content === "string") return [{ text: content }];
+  if (!hasImageContentPart(content)) return [{ text: extractTextContent(content) }];
+  const parts: GeminiRequestContentPart[] = [];
+  for (const part of content) {
+    if (part.type === "text") {
+      parts.push({ text: part.text });
+      continue;
+    }
+    const image = parseBase64DataUrlImage(part.image_url.url);
+    if (image) {
+      parts.push({ inlineData: { mimeType: image.mimeType, data: image.data } });
+    }
+  }
+  return parts;
+}
+
+function geminiPartHasContent(part: GeminiRequestContentPart): boolean {
+  if ("text" in part) return part.text.trim().length > 0;
+  return true;
+}
+
 export function buildGeminiRequestBody(options: BuildGeminiRequestOptions): Record<string, unknown> {
   const systemInstruction = extractOpenAiResponsesInstructions(options.messages);
   const contents = options.messages
     .filter((message) => message.role !== "system")
     .map((message) => ({
       role: mapGeminiRole(message.role),
-      parts: [{ text: extractTextContent(message.content) }],
+      parts: mapGeminiContentParts(message.content),
     }))
-    .filter((item) => String(item.parts[0].text || "").trim().length > 0);
+    .filter((item) => item.parts.some(geminiPartHasContent));
 
   const body: Record<string, unknown> = {
     contents: contents.length > 0 ? contents : [{ role: "user", parts: [{ text: "" }] }],

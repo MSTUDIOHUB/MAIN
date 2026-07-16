@@ -26,7 +26,7 @@ import {
   buildAssistantHistoryMessage,
   collectPlanClosureMaterializationInput,
   getOriginalUserPromptForPlanFallback,
-  hasPlanUserContextObservation,
+  hasPlanVisualContextGrounding,
   logAgentEvent,
 } from "../../orchestrator";
 import type { AgentMessage, OrchestratorCallbacks, ToolCallToExecute } from "../types";
@@ -76,7 +76,6 @@ export function handlePlanReadOnlyConvergence(input: {
     successfulReadOnlyExplorationResultCount,
     turnInputContextSignals,
     recentPlanToolActivity,
-    lastAssistantTextForCheckpoint,
     setPlanRuntimePhase,
   } = input;
 
@@ -111,9 +110,9 @@ export function handlePlanReadOnlyConvergence(input: {
     userGoal,
     userContext: turnInputContextSignals,
     recentToolActivity: recentPlanToolActivity,
-    hasObservedUserContext: hasPlanUserContextObservation(
+    hasGroundedVisualContext: hasPlanVisualContextGrounding(
       callbacks.getMessages() as AgentMessage[],
-      lastAssistantTextForCheckpoint,
+      callbacks.getCurrentTurnId?.(),
     ),
   });
   const shouldConvergeUnapprovedPlanReadOnly = shouldTriggerPlanReadOnlyConvergence({
@@ -124,7 +123,7 @@ export function handlePlanReadOnlyConvergence(input: {
     userGoal,
     userContext: turnInputContextSignals,
     recentToolActivity: recentPlanToolActivity,
-    hasObservedUserContext: planEvidenceReadinessForConvergence.status !== "needs_observation",
+    hasGroundedVisualContext: planEvidenceReadinessForConvergence.status !== "needs_observation",
     convergencePromptAlreadyUsed: usedPlanReadOnlyConvergencePrompt,
   });
 
@@ -254,7 +253,6 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     usedPlanReadOnlyConvergencePrompt,
     turnInputContextSignals,
     recentPlanToolActivity,
-    lastAssistantTextForCheckpoint,
     visibleAssistantText,
     assistantHistoryText,
     providerReasoningForHistory,
@@ -288,9 +286,9 @@ export function handlePlanPostConvergenceToolRedirect(input: {
     userGoal: latestUserPromptText || getOriginalUserPromptForPlanFallback(callbacks),
     userContext: turnInputContextSignals,
     recentToolActivity: recentPlanToolActivity,
-    hasObservedUserContext: hasPlanUserContextObservation(
+    hasGroundedVisualContext: hasPlanVisualContextGrounding(
       callbacks.getMessages() as AgentMessage[],
-      lastAssistantTextForCheckpoint || visibleAssistantText,
+      callbacks.getCurrentTurnId?.(),
     ),
   });
   const shouldRedirectPostConvergenceToolCalls = shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence({

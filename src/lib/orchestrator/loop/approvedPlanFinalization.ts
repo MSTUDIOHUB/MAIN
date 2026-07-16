@@ -17,7 +17,10 @@ import {
 } from "../../orchestrator";
 import type { OrchestratorCallbacks } from "../types";
 import { resolveExecuteNoToolCheckpointLimit } from "./executeNoToolRecovery";
-import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
+import {
+  buildExecuteEvidenceClosureAudit,
+  resolveCommandEvidenceRequirements,
+} from "../../verificationEvidence";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 export type ApprovedPlanFinalizationResult = {
@@ -134,7 +137,6 @@ export function handleApprovedPlanFinalization(input: {
   callbacks: OrchestratorCallbacks;
   activeProfile: string;
   iteration: number;
-  workflowMode: "chat" | "edit" | "plan";
   approvedPlanAuditForNoTool: PlanTaskEvidenceAudit | null;
   rejectedCompletionClaim: boolean;
   availableToolNames: Set<string>;
@@ -150,7 +152,6 @@ export function handleApprovedPlanFinalization(input: {
     callbacks,
     activeProfile,
     iteration,
-    workflowMode,
     approvedPlanAuditForNoTool,
     rejectedCompletionClaim,
     availableToolNames,
@@ -163,7 +164,7 @@ export function handleApprovedPlanFinalization(input: {
     consecutiveNoToolCount,
   });
 
-  if (workflowMode !== "plan" || !callbacks.getIsPlanApproved()) {
+  if (!callbacks.getIsPlanApproved()) {
     return finish("none");
   }
 
@@ -255,6 +256,11 @@ export function handleApprovedPlanFinalization(input: {
   const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
     ledger: callbacks.getPlanExecutionEvidenceLedger(),
     validationExpected: true,
+    transactionId: callbacks.getCurrentTurnId?.() || null,
+    requiredCommandEvidence: resolveCommandEvidenceRequirements({
+      tasks: callbacks.getPlanTasks(),
+      commandDirective: callbacks.getCommandDirective?.() || null,
+    }),
   });
   const activeRecoveryPending = Boolean(
     input.executeRecoveryState && input.executeRecoveryState.mode !== "normal",

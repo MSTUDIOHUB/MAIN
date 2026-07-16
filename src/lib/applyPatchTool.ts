@@ -322,7 +322,7 @@ export async function previewApplyPatch(
     for (const hunk of operation.hunks) {
       const updated = replaceFirstExact(next, hunk.oldText, hunk.newText);
       if (updated == null) {
-        return { ok: false, changes: [], error: `Patch context was not found in ${operation.path}. Read the current file once, then retry with exact context.` };
+        return { ok: false, changes: [], error: `Patch context was not found in ${operation.path}.` };
       }
       next = updated;
     }

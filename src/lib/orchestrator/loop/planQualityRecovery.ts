@@ -266,19 +266,21 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       qualityClosureEvidence.evidenceBundle,
     );
     const hasStructuredQualityClosureEvidence = qualityClosureEvidence.evidenceRecords.length > 0;
-    const closureGapNeedsTargetedEvidence =
+    // The quality gate owns the recovery action. A stricter deterministic
+    // closure assessment must not turn a requested rewrite/scaffold into more
+    // discovery merely because already-grounded source facts do not yet state
+    // the final rationale in the exact shape used by fallback materialization.
+    // Reopen one read only when the quality gate explicitly requests evidence
+    // or the structured assessment names an unresolved source-side contract
+    // counterpart.
+    const explicitSourceEvidenceGap =
       latestQualityResult.recoveryAction !== "ask_user" &&
-      hasQualityClosureEvidence &&
-      hasStructuredQualityClosureEvidence &&
-      !closureEvidenceAssessment.ready;
+      closureEvidenceAssessment.reason === "contract_counterpart_unverified";
     const shouldRequestTargetedEvidenceAfterQualityGate =
       (
         latestQualityResult.recoveryAction === "targeted_evidence" ||
-        closureGapNeedsTargetedEvidence
+        explicitSourceEvidenceGap
       ) &&
-      planQualityRejectCount >= 1 &&
-      hasQualityClosureEvidence &&
-      hasStructuredQualityClosureEvidence &&
       !planClosureEvidenceRecoveryIssued &&
       planEvidenceNoProgressPasses < MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES;
     const effectiveRecoveryAction = shouldRequestTargetedEvidenceAfterQualityGate
@@ -303,6 +305,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       effectiveRecoveryAction,
       hasGroundedEvidence: hasQualityClosureEvidence,
       hasStructuredEvidence: hasStructuredQualityClosureEvidence,
+      explicitSourceEvidenceGap,
       closureEvidenceReady: closureEvidenceAssessment.ready,
       closureEvidenceReason: closureEvidenceAssessment.reason,
       objectiveTargetMatches: closureEvidenceAssessment.objectiveTargetMatches,

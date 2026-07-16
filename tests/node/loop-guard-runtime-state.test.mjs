@@ -55,18 +55,15 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   applyNoProgressTrackingRuntimeState,
   applyToolFailureSignatureRuntimeState,
-  clearCrossIterationReadTrackingForTarget,
   createAgentLoopGuardRuntimeState,
   getNoProgressTrackingRuntimeState,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/loopGuardRuntimeState.ts"),
 );
 
-test("loop guard runtime state initializes mutable guard collections", () => {
+test("loop guard runtime state initializes the unified no-progress and repeat guards", () => {
   const state = createAgentLoopGuardRuntimeState();
 
-  assert.equal(state.crossIterationFileReads.size, 0);
-  assert.equal(state.successfulEditTargetsSinceVerification.size, 0);
   assert.equal(state.lastNoProgressBatchSignature, "");
   assert.equal(state.noProgressBatchRepeatCount, 0);
   assert.equal(state.consecutiveReadFileOnlyCacheHits, 0);
@@ -77,13 +74,9 @@ test("loop guard runtime state initializes mutable guard collections", () => {
   assert.equal(state.failedToolCallCounts.size, 0);
 });
 
-test("no-progress tracking snapshot and reducer preserve guard collection ownership", () => {
+test("no-progress tracking snapshot and reducer preserve unrelated guard collection ownership", () => {
   const state = createAgentLoopGuardRuntimeState();
-  state.crossIterationFileReads.set("window-app", {
-    path: "src/app.ts",
-    versionToken: "1:1",
-    count: 2,
-  });
+  state.failedToolCallCounts.set("run_command:npm-test", 2);
 
   assert.deepEqual(getNoProgressTrackingRuntimeState(state), {
     lastNoProgressBatchSignature: "",
@@ -98,36 +91,14 @@ test("no-progress tracking snapshot and reducer preserve guard collection owners
     consecutiveReadFileOnlyCacheHits: 2,
     lastReadFileOnlyObservationSignature: "window-app",
   });
-  assert.equal(next.crossIterationFileReads, state.crossIterationFileReads);
-  assert.equal(next.crossIterationFileReads.get("window-app")?.count, 2);
+  assert.equal(next.failedToolCallCounts, state.failedToolCallCounts);
+  assert.equal(next.failedToolCallCounts.get("run_command:npm-test"), 2);
   assert.deepEqual(getNoProgressTrackingRuntimeState(next), {
     lastNoProgressBatchSignature: "read_file:src/app.ts",
     noProgressBatchRepeatCount: 3,
     consecutiveReadFileOnlyCacheHits: 2,
     lastReadFileOnlyObservationSignature: "window-app",
   });
-});
-
-test("cross-iteration read tracking can be cleared for the affected recovery target", () => {
-  const state = createAgentLoopGuardRuntimeState();
-  state.crossIterationFileReads.set("window-a", {
-    path: "src/a.ts",
-    versionToken: "1:1",
-    count: 4,
-  });
-  state.crossIterationFileReads.set("window-b", {
-    path: "src/b.ts",
-    versionToken: "1:1",
-    count: 2,
-  });
-
-  const next = clearCrossIterationReadTrackingForTarget(state, "src/a.ts");
-  assert.equal(next, state);
-  assert.equal(state.crossIterationFileReads.has("window-a"), false);
-  assert.equal(state.crossIterationFileReads.get("window-b")?.count, 2);
-
-  assert.equal(clearCrossIterationReadTrackingForTarget(state, "missing.ts"), state);
-  assert.equal(clearCrossIterationReadTrackingForTarget(state, null), state);
 });
 
 test("tool failure signature reducer increments errors and clears on success", () => {

@@ -71,7 +71,8 @@ test("replace_in_file preflight blocks mismatched search_text before review", as
 
   assert.equal(result.ok, false);
   assert.equal(result.reason, "search_text_mismatch");
-  assert.match(result.message || "", /不要请求用户审批/);
+  assert.match(result.message || "", /当前版本化源码观察/);
+  assert.match(result.message || "", /文件版本变化|缺少精确范围/);
 });
 
 test("replace_in_file preflight blocks empty/no-op replacements", async () => {
@@ -146,7 +147,8 @@ test("apply_patch preflight blocks invalid, no-op, and mismatched patches before
   assert.equal(invalid.ok, false);
   assert.equal(invalid.reason, "invalid_patch");
   assert.equal(invalid.path, "src/App.tsx");
-  assert.match(invalid.message || "", /Do not ask for approval/);
+  assert.match(invalid.message || "", /active source observation/);
+  assert.doesNotMatch(invalid.message || "", /Read the current file once/);
 
   const valid = await preflightWorkspaceMutation({
     toolName: "apply_patch",

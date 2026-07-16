@@ -93,7 +93,43 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
   assert.equal(requests[0].reasoning.effort, "xhigh");
 });
 
-test("OpenAI Responses gateway timeouts retry with aggressive transcript fallback", async () => {
+test("OpenAI Responses reports image delivery from the accepted serialized request", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
+    requests.push(JSON.parse(args.body));
+    return JSON.stringify({ output_text: "observed" });
+  });
+  const imageUrl = "data:image/png;base64,AAAA";
+  const result = await streamChatCompletion(
+    [{
+      role: "user",
+      content: [
+        { type: "image_url", image_url: { url: imageUrl } },
+        { type: "text", text: "Inspect this screenshot" },
+      ],
+    }],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: (error) => { throw error; } },
+  );
+
+  assert.equal(JSON.stringify(requests[0]).includes('"type":"input_image"'), true);
+  assert.deepEqual(result.visualTransportReceipt, {
+    protocol: "openai_responses",
+    requestAccepted: true,
+    logicalImageParts: 1,
+    serializedImageParts: 1,
+    omittedImageParts: 0,
+  });
+});
+
+test("OpenAI Responses gateway timeouts preserve the current image in aggressive structured fallback", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
     assert.equal(command, "proxy_request");
@@ -121,7 +157,13 @@ test("OpenAI Responses gateway timeouts retry with aggressive transcript fallbac
         role: index % 3 === 0 ? "tool" : index % 2 === 0 ? "user" : "assistant",
         content: `message ${index} ${longChunk}`,
       })),
-      { role: "user", content: "请继续完成计划文件。" },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "请继续检查当前截图并完成计划文件。" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,CURRENT" } },
+        ],
+      },
     ],
     {
       baseUrl: "https://www.aiwanwu.cc/v1",
@@ -156,14 +198,23 @@ test("OpenAI Responses gateway timeouts retry with aggressive transcript fallbac
   assert.equal(requests[0].tools[0].name, "write_file");
   assert.deepEqual(requests[0].reasoning, { effort: "xhigh" });
 
-  assert.equal(typeof requests[1].input, "string");
+  assert.equal(Array.isArray(requests[1].input), true);
+  assert.match(JSON.stringify(requests[1].input), /input_image/);
+  assert.match(JSON.stringify(requests[1].input), /CURRENT/);
   assert.equal(requests[1].tools, undefined);
   assert.equal(requests[1].reasoning, undefined);
   assert.equal(requests[1].user_prompt_id, undefined);
   assert.equal(requests[1].store, false);
   assert.match(requests[1].instructions, /Cloud Gateway Compact Instructions/);
   assert.ok(requests[1].instructions.length <= 3100);
-  assert.ok(requests[1].input.length < 12000);
+  assert.ok(JSON.stringify(requests[1].input).length < 12000);
+  assert.deepEqual(result.visualTransportReceipt, {
+    protocol: "openai_responses",
+    requestAccepted: true,
+    logicalImageParts: 1,
+    serializedImageParts: 1,
+    omittedImageParts: 0,
+  });
 });
 
 test("OpenAI ChatGPT OAuth cloud requests pass token references to the Rust proxy without sampling params", async () => {
@@ -283,6 +334,87 @@ test("Gemini OAuth cloud requests use native generateContent endpoint and token 
   );
 
   assert.equal(result.content, "ok");
+});
+
+test("Gemini reports delivery only for an accepted inlineData image part", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
+    requests.push(JSON.parse(args.body));
+    return JSON.stringify({ candidates: [{ content: { parts: [{ text: "observed" }] } }] });
+  });
+  const result = await streamChatCompletion(
+    [{
+      role: "user",
+      content: [
+        { type: "text", text: "Inspect" },
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64,BBBB" } },
+      ],
+    }],
+    {
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "test-key",
+      model: "gemini-2.5-pro",
+      apiProtocol: "gemini",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: (error) => { throw error; } },
+  );
+
+  assert.deepEqual(requests[0].contents[0].parts[1], {
+    inlineData: { mimeType: "image/jpeg", data: "BBBB" },
+  });
+  assert.deepEqual(result.visualTransportReceipt, {
+    protocol: "gemini",
+    requestAccepted: true,
+    logicalImageParts: 1,
+    serializedImageParts: 1,
+    omittedImageParts: 0,
+  });
+});
+
+test("a serialized historical image cannot impersonate an omitted current screenshot", async () => {
+  const requests = [];
+  const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
+    requests.push(JSON.parse(args.body));
+    return JSON.stringify({ candidates: [{ content: { parts: [{ text: "observed" }] } }] });
+  });
+  const result = await streamChatCompletion(
+    [
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Old screenshot" },
+          { type: "image_url", image_url: { url: "data:image/png;base64,OLD" } },
+        ],
+      },
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "Inspect the current screenshot" },
+          { type: "image_url", image_url: { url: "https://example.test/current.png" } },
+        ],
+      },
+    ],
+    {
+      baseUrl: "https://generativelanguage.googleapis.com",
+      apiKey: "test-key",
+      model: "gemini-2.5-pro",
+      apiProtocol: "gemini",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: (error) => { throw error; } },
+  );
+
+  assert.equal(JSON.stringify(requests[0]).includes("OLD"), true);
+  assert.equal(JSON.stringify(requests[0]).includes("current.png"), false);
+  assert.deepEqual(result.visualTransportReceipt, {
+    protocol: "gemini",
+    requestAccepted: true,
+    logicalImageParts: 1,
+    serializedImageParts: 0,
+    omittedImageParts: 1,
+    omissionReason: "serialization_omitted_images",
+  });
 });
 
 test("OpenAI Responses respects XML tool protocol by omitting native tools", async () => {
@@ -503,6 +635,10 @@ test("local Rust stream read errors fall back to a non-streaming request", async
       const body = JSON.parse(args.body);
       assert.equal(body.stream, false);
       assert.equal(args.url, "http://127.0.0.1:1234/v1/chat/completions");
+      assert.deepEqual(body.messages[0].content, [
+        { type: "text", text: "继续检查截图" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,FALLBACK" } },
+      ]);
       return JSON.stringify({
         choices: [
           {
@@ -519,7 +655,13 @@ test("local Rust stream read errors fall back to a non-streaming request", async
   const errors = [];
   let doneCount = 0;
   const result = await streamChatCompletion(
-    [{ role: "user", content: "继续总结刚才读取的文件" }],
+    [{
+      role: "user",
+      content: [
+        { type: "text", text: "继续检查截图" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,FALLBACK" } },
+      ],
+    }],
     {
       baseUrl: "http://127.0.0.1:1234/v1",
       apiKey: "not-needed",
@@ -538,6 +680,13 @@ test("local Rust stream read errors fall back to a non-streaming request", async
   assert.deepEqual(tokens, ["partial ", "__ESCALATION_RESET__:", "fallback ok"]);
   assert.deepEqual(errors, []);
   assert.equal(doneCount, 1);
+  assert.deepEqual(result.visualTransportReceipt, {
+    protocol: "openai_chat_completions",
+    requestAccepted: true,
+    logicalImageParts: 1,
+    serializedImageParts: 1,
+    omittedImageParts: 0,
+  });
   assert.deepEqual(invokeCalls.map((call) => call.command), ["start_chat_stream", "proxy_request"]);
 });
 
@@ -1143,7 +1292,7 @@ test("OpenAI Responses retries 524 failures with aggressive compact input withou
   assert.equal(requests[0].reasoning.effort, "xhigh");
   assert.equal(requests[1].reasoning, undefined);
   assert.equal(requests[1].tools, undefined);
-  assert.equal(typeof requests[1].input, "string");
+  assert.equal(Array.isArray(requests[1].input), true);
 });
 
 test("OpenAI Responses retries 502 upstream failures with compact input", async () => {
@@ -1180,7 +1329,7 @@ test("OpenAI Responses retries 502 upstream failures with compact input", async 
   assert.equal(requests[0].reasoning.effort, "xhigh");
   assert.equal(requests[1].reasoning, undefined);
   assert.equal(requests[1].tools, undefined);
-  assert.equal(typeof requests[1].input, "string");
+  assert.equal(Array.isArray(requests[1].input), true);
 });
 
 test("OpenAI Responses falls back when a successful candidate returns empty content and no tool calls", async () => {
@@ -1286,7 +1435,7 @@ test("OpenAI Responses sends compacted system instructions for cloud requests", 
   assert.equal(requests[0].reasoning.effort, "xhigh");
 });
 
-test("OpenAI Responses stops after one compact retry when 524 persists", async () => {
+test("OpenAI Responses stops after bounded structured and transcript retries when 524 persists", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
     requests.push(JSON.parse(args.body));
@@ -1314,10 +1463,11 @@ test("OpenAI Responses stops after one compact retry when 524 persists", async (
     /HTTP 524/,
   );
 
-  assert.equal(requests.length, 2);
+  assert.equal(requests.length, 3);
   assert.equal(requests[0].reasoning.effort, "xhigh");
   assert.equal(requests[1].reasoning, undefined);
   assert.equal(requests[1].tools, undefined);
-  assert.equal(typeof requests[1].input, "string");
+  assert.equal(Array.isArray(requests[1].input), true);
+  assert.equal(typeof requests[2].input, "string");
 });
 // #endregion

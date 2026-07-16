@@ -778,3 +778,101 @@ test("active child run filters parent harness telemetry", () => {
   assert.equal(items[0].runId, "run-child");
   assert.doesNotMatch(items[0].summary, /parent failed/);
 });
+
+test("visual progress keeps delivery distinct from recognition and surfaces provider omission", () => {
+  const queued = withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-visual",
+    turnId: "turn-visual",
+    runId: "run-visual",
+    parentRunId: null,
+    timestampMs: 10,
+    progress: {
+      phase: "understanding",
+      title: "截图待发送",
+      status: "running",
+      audience: "user",
+      tool: "visual_context",
+      target: "images:1",
+      dedupeKey: "visual-context:turn-visual",
+      visualContext: {
+        status: "queued",
+        expectedImageParts: 1,
+        deliveredImageParts: 0,
+        omittedImageParts: 0,
+        recognition: "pending",
+      },
+    },
+  });
+  const unsupported = withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-visual",
+    turnId: "turn-visual",
+    runId: "run-visual",
+    parentRunId: null,
+    timestampMs: 20,
+    progress: {
+      phase: "blocked",
+      title: "当前模型或端点不支持截图",
+      status: "failed",
+      audience: "user",
+      summary: "截图未提供给模型，不计为识别证据。",
+      tool: "visual_context",
+      target: "images:1",
+      dedupeKey: "visual-context:turn-visual",
+      visualContext: {
+        status: "provider_unsupported",
+        expectedImageParts: 1,
+        deliveredImageParts: 0,
+        omittedImageParts: 1,
+      },
+    },
+  });
+
+  assert.equal(unsupported.progress.visualContext.status, "provider_unsupported");
+  const items = buildRuntimeProgressLedger({
+    events: [queued, unsupported],
+    turnId: "turn-visual",
+    activeRunId: "run-visual",
+    language: "zh",
+  });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].status, "failed");
+  assert.equal(items[0].title, "当前模型或端点不支持截图");
+  assert.doesNotMatch(items[0].title, /已识别/);
+  const projection = buildRunStatusProjection(items, "zh");
+  assert.ok(projection.healthSignals.some((signal) => signal.kind === "failure"));
+});
+
+test("visual progress preserves an explicit bounded observation separately from delivery", () => {
+  const observed = withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-visual-observed",
+    turnId: "turn-visual-observed",
+    runId: "run-visual-observed",
+    parentRunId: null,
+    timestampMs: 30,
+    progress: {
+      phase: "understanding",
+      title: "模型已报告截图观察",
+      status: "done",
+      audience: "user",
+      tool: "visual_context",
+      target: "images:1",
+      visualContext: {
+        status: "delivered",
+        expectedImageParts: 1,
+        deliveredImageParts: 1,
+        omittedImageParts: 0,
+        recognition: "observed",
+        observationSummary: "A compact toolbar is visible.",
+        observationId: "visual-observed-1",
+      },
+    },
+  });
+
+  assert.equal(observed.progress.visualContext.status, "delivered");
+  assert.equal(observed.progress.visualContext.recognition, "observed");
+  assert.equal(observed.progress.visualContext.observationSummary, "A compact toolbar is visible.");
+  assert.equal(observed.progress.visualContext.observationId, "visual-observed-1");
+});

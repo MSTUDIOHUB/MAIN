@@ -45,6 +45,13 @@ export interface ApprovedPlanScopeConflictIdentity {
   plannedTargets: string[];
 }
 
+export interface ApprovedPlanCommandScopeDecision {
+  applies: boolean;
+  allowed: boolean;
+  requestedCommand: string;
+  plannedCommands: string[];
+}
+
 function normalizeScopeIdentityTargets(values: string[]): string[] {
   return Array.from(new Set(
     (values || []).map(normalizePath).filter(Boolean),
@@ -71,21 +78,59 @@ export function buildApprovedPlanScopeConflictFingerprint(
   });
 }
 
+function commandFromArgs(args: Record<string, unknown>): string {
+  const command = args.command ?? args.cmd ?? args.input;
+  return typeof command === "string"
+    ? command.replace(/\s+/g, " ").trim()
+    : "";
+}
+
+/**
+ * Plan approval authorizes reviewed commands, not an unrestricted shell.
+ * Shell syntax is too broad to prove read-only with a deny-list (`find
+ * -delete`, `git diff --output`, interpreters, and compound commands can all
+ * mutate). Dedicated read tools remain available; every shell command must be
+ * present verbatim in structured Plan evidence.
+ */
+export function resolveApprovedPlanCommandScope(input: {
+  isPlanApproved: boolean;
+  toolName: string;
+  args: Record<string, unknown>;
+  tasks: PlanTask[];
+}): ApprovedPlanCommandScopeDecision {
+  const isShellTool = input.toolName === "run_command" || input.toolName === "execute_command";
+  const applies = input.isPlanApproved && isShellTool;
+  if (!applies) {
+    return { applies: false, allowed: true, requestedCommand: "", plannedCommands: [] };
+  }
+  const requestedCommand = commandFromArgs(input.args);
+  const plannedCommands = Array.from(new Set(input.tasks.flatMap((task) =>
+    (task.evidence || [])
+      .filter((evidence) => evidence.kind === "cmd")
+      .map((evidence) => String(evidence.value || "").replace(/\s+/g, " ").trim())
+      .filter(Boolean),
+  )));
+  return {
+    applies: true,
+    allowed: !!requestedCommand && plannedCommands.includes(requestedCommand),
+    requestedCommand,
+    plannedCommands,
+  };
+}
+
 /**
  * Enforce the approved Plan as an execution scope, not merely a prompt.  The
  * model may choose how to implement a task, but workspace mutations
  * cannot touch files absent from the reviewed runtime task projection.
  */
 export function resolveApprovedPlanMutationScope(input: {
-  workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
   toolName: string;
   args: Record<string, unknown>;
   target: string;
   tasks: PlanTask[];
 }): ApprovedPlanMutationScopeDecision {
-  const applies = input.workflowMode === "plan" &&
-    input.isPlanApproved &&
+  const applies = input.isPlanApproved &&
     isWorkspaceMutationToolCall(input.toolName, input.args);
   if (!applies) {
     return {

@@ -1,4 +1,5 @@
 import {
+  buildExecutionActionContractCard,
   resolveExecuteRecoveryActionContract,
   summarizeRepeatedExecuteTargets,
 } from "../../executeRecoveryTools";
@@ -34,7 +35,6 @@ import {
   buildExecuteRecoveryMaxIterationsPrompt,
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
 import type { PlanLoopRuntimeState } from "./planRuntimeState";
 import {
@@ -126,7 +126,6 @@ export async function prepareIterationStreamRequest(input: {
   snapshotContextLimit: number | undefined;
   streamRuntimeState: AgentLoopStreamRuntimeState;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
   toolExecutionRuntimeState: Pick<AgentLoopToolExecutionRuntimeState, "fileReadStates">;
   iterationContext: Pick<TurnIterationContext, "eventTurnId" | "turnContext">;
@@ -153,7 +152,6 @@ export async function prepareIterationStreamRequest(input: {
     iteration,
     effectiveMaxIterations,
     snapshotContextLimit,
-    approvedPlanRecoveryState,
     planRuntimeState,
     toolExecutionRuntimeState,
     iterationContext,
@@ -350,7 +348,6 @@ export async function prepareIterationStreamRequest(input: {
     executeRecoveryProtocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
     recoveryIterationCount: executeRecoveryState.iterationCount,
     maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
-    ...approvedPlanRecoveryState,
     recentToolActivity,
     recentPlanToolActivity,
     ...planRuntimeState,
@@ -376,6 +373,7 @@ export async function prepareIterationStreamRequest(input: {
     recoveryActionContract: toolSurfaceDecision.recoveryActionContract,
     executeRecoveryExpectedTarget: executeRecoveryState.expectedTarget,
     executeRecoverySourceObservationKey: executeRecoveryState.sourceObservationKey,
+    executeRecoverySourceObservationKeys: executeRecoveryState.readLease?.observationKeys || [],
     recentToolActivity,
     fileReadStates: toolExecutionRuntimeState.fileReadStates,
     emitPlanExecutionProgress,
@@ -385,6 +383,29 @@ export async function prepareIterationStreamRequest(input: {
     managedAgentMessages: contextManagementResult.managedAgentMessages,
     iteration,
   });
+  if (toolSurfaceDecision.recoveryActionContract.phase !== "normal") {
+    const contractCard = buildExecutionActionContractCard({
+      contract: toolSurfaceDecision.recoveryActionContract,
+      language: MODEL_CONTROL_LANGUAGE,
+      availableToolNames: toolSurfaceDecision.iterationAllTools.map(
+        (tool) => tool.function.name,
+      ),
+    });
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      { role: "system", content: contractCard },
+    ];
+    logAgentEvent("execution_action_contract_injected", {
+      iteration,
+      phase: toolSurfaceDecision.recoveryActionContract.phase,
+      nextRequiredCapability:
+        toolSurfaceDecision.recoveryActionContract.nextRequiredCapability,
+      expectedTarget: toolSurfaceDecision.recoveryActionContract.expectedTarget,
+      sourceObservationKey:
+        toolSurfaceDecision.recoveryActionContract.sourceObservationKey,
+      toolCount: toolSurfaceDecision.iterationAllTools.length,
+    });
+  }
   const shouldInjectPlanEvidenceBundle =
     workflowMode === "plan" &&
     !callbacks.getIsPlanApproved() &&

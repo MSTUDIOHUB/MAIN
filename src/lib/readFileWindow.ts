@@ -1,8 +1,11 @@
 export const READ_FILE_RESULT_MARKER = "READ_FILE_RESULT";
 
-const DEFAULT_WINDOW_MAX_LINES = 180;
-const DEFAULT_WINDOW_MAX_CHARS = 6800;
-const MAX_REQUESTED_WINDOW_LINES = 600;
+// Keep ordinary source files in one observation. The former 180/6.8K
+// defaults turned a 27KB file into five model round trips despite ample
+// context. Explicit ranges remain bounded for genuinely large files.
+const DEFAULT_WINDOW_MAX_LINES = 1000;
+const DEFAULT_WINDOW_MAX_CHARS = 32000;
+const MAX_REQUESTED_WINDOW_LINES = 2000;
 
 interface NormalizedReadFileWindow {
   startLine: number;
@@ -326,8 +329,6 @@ export function formatReadFileWindowForModel(
   const nextStartLine = moreFileLines || moreRequestedLines || lineTruncated
     ? Math.max(returnedEndLine + 1, normalized.startLine + 1)
     : undefined;
-  const suggestedMaxLines = normalized.requestedMaxLines || DEFAULT_WINDOW_MAX_LINES;
-
   const header = [
     READ_FILE_RESULT_MARKER,
     `path: ${path}`,
@@ -337,10 +338,7 @@ export function formatReadFileWindowForModel(
     `returnedLines: ${returnedStartLine}-${returnedEndLine}`,
     `returnedChars: ${windowContent.length}`,
     nextStartLine ? `nextStartLine: ${nextStartLine}` : "",
-    nextStartLine
-      ? `nextRead: read_file({"path":${JSON.stringify(path)},"start_line":${nextStartLine},"max_lines":${suggestedMaxLines}})`
-      : "",
-    "note: read_file returns a bounded content window for large or ranged reads. For more source, call read_file with start_line/end_line/max_lines; do not use run_command merely to page file contents.",
+    "note: This is a bounded window only when truncated=true. Do not automatically continue paging; request another read_file window only when the current decision needs specific missing lines. Do not use run_command merely to page file contents.",
     "---CONTENT START---",
   ].filter(Boolean);
 
@@ -350,7 +348,7 @@ export function formatReadFileWindowForModel(
 export function formatReadFileWindowPayloadForModel(
   path: string,
   payload: ReadFileWindowPayload,
-  args: Record<string, unknown> = {},
+  _args: Record<string, unknown> = {},
 ): string {
   const content = String(payload.content || "");
   const returnedStartLine = Math.max(0, Number(payload.startLine) || 0);
@@ -359,11 +357,6 @@ export function formatReadFileWindowPayloadForModel(
   const totalChars = Math.max(0, Number(payload.totalChars) || 0);
   const returnedChars = Math.max(0, Number(payload.returnedChars ?? content.length) || 0);
   const nextStartLine = parsePositiveInteger(payload.nextStartLine);
-  const requestedMaxLines = Math.min(
-    parsePositiveInteger(args.max_lines) ?? DEFAULT_WINDOW_MAX_LINES,
-    MAX_REQUESTED_WINDOW_LINES,
-  );
-
   const header = [
     READ_FILE_RESULT_MARKER,
     `path: ${path}`,
@@ -373,10 +366,7 @@ export function formatReadFileWindowPayloadForModel(
     `returnedLines: ${returnedStartLine}-${returnedEndLine}`,
     `returnedChars: ${returnedChars}`,
     nextStartLine ? `nextStartLine: ${nextStartLine}` : "",
-    nextStartLine
-      ? `nextRead: read_file({"path":${JSON.stringify(path)},"start_line":${nextStartLine},"max_lines":${requestedMaxLines}})`
-      : "",
-    "note: read_file returns a bounded content window for large or ranged reads. For more source, call read_file with start_line/end_line/max_lines; do not use run_command merely to page file contents.",
+    "note: This is a bounded window only when truncated=true. Do not automatically continue paging; request another read_file window only when the current decision needs specific missing lines. Do not use run_command merely to page file contents.",
     "---CONTENT START---",
   ].filter(Boolean);
 
@@ -390,8 +380,8 @@ export function buildReadFileWindowContinuationGuidance(content: string): string
   return [
     "The earlier read_file result was a bounded window, not the whole file.",
     metadata.nextStartLine
-      ? `Next: call read_file with start_line=${metadata.nextStartLine} and max_lines to continue, or use a narrower start_line/end_line range around the line you need.`
-      : "Next: call read_file with a different start_line/end_line/max_lines range around the line you need.",
+      ? `If the current decision needs missing source, request the specific range beginning at or after line ${metadata.nextStartLine}; otherwise continue to mutation or validation.`
+      : "Request another start_line/end_line window only when the current decision identifies specific missing source.",
     "Do not use run_command merely to page file contents.",
   ].join("\n");
 }

@@ -1370,7 +1370,7 @@ test("Goal continuation restores the unfinished recovery phase across slices", (
   assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
     afterMismatch,
     { mutationRequired: true },
-  ), "patch_recovery_read");
+  ), null, "legacy localized failure prose must not invent a recovery transaction");
 
   for (const noEffectResult of [
     '{"noOp":true}',
@@ -1393,7 +1393,7 @@ test("Goal continuation restores the unfinished recovery phase across slices", (
     assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
       legacyNoEffect,
       { mutationRequired: true },
-    ), "mutation_first", `${noEffectResult} must not become successful legacy mutation evidence`);
+    ), null, `${noEffectResult} must not invent recovery from legacy prose`);
   }
   assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
     persistedAfterRead,
@@ -1441,6 +1441,8 @@ test("Goal continuation preserves the exact recovery contract snapshot across sl
       sourceObservationKey: "src/toolbar.ts:205-256:v7",
       nextRequiredCapability: "targeted_read",
       evidenceVersion: "v7",
+      planTaskId: "task-toolbar",
+      requirementRef: "REQ-TOOLBAR",
     },
   };
   const first = goalContinuity.createGoalContinuationState({
@@ -1466,6 +1468,47 @@ test("Goal continuation preserves the exact recovery contract snapshot across sl
     second,
     { mutationRequired: true },
   ), expected);
+});
+
+test("Goal continuation uses the core segmented-read and targeting normalizers", () => {
+  const state = goalContinuity.createGoalContinuationState({
+    sourceIteration: 8,
+    messages: [{ role: "assistant", content: "Continue the reviewed range." }],
+    executeRecoveryState: {
+      mode: "patch_recovery_read",
+      reason: "reviewed_range_incomplete",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "plan_line_context",
+        target: "src/main.js",
+        requestedRange: { startLine: 381, endLine: 900, maxLines: 520 },
+        requiredRange: { startLine: 205, endLine: 900, maxLines: 696 },
+        coveredRanges: [{ startLine: 205, endLine: 380 }],
+        coverageMode: "segmented_exact",
+        observationKeys: ["main:205-380:v1"],
+        observedVersion: "v1",
+        state: "available",
+      },
+      decisionCheckpoint: {
+        expectedTarget: "src/main.js",
+        sourceObservationKey: "main:205-380:v1",
+        nextRequiredCapability: "targeting",
+        evidenceVersion: "v1",
+      },
+    },
+  });
+  assert.equal(state.executeRecoveryState.readLease.purpose, "plan_line_context");
+  assert.equal(state.executeRecoveryState.readLease.coverageMode, "segmented_exact");
+  assert.deepEqual(state.executeRecoveryState.readLease.requiredRange, {
+    startLine: 205,
+    endLine: 900,
+    maxLines: 696,
+  });
+  assert.deepEqual(state.executeRecoveryState.readLease.coveredRanges, [
+    { startLine: 205, endLine: 380 },
+  ]);
+  assert.deepEqual(state.executeRecoveryState.readLease.observationKeys, ["main:205-380:v1"]);
+  assert.equal(state.executeRecoveryState.decisionCheckpoint.nextRequiredCapability, "targeting");
 });
 
 test("Goal continuation preserves recover_process as the next required capability", () => {
@@ -1615,21 +1658,10 @@ test("Goal continuation restores one target-scoped recovery transaction", () => 
       body: "Error: stale legacy text inside a completed structured result",
     },
   ]);
-  assert.deepEqual(goalContinuity.resolveGoalContinuationExecuteRecoveryState(
+  assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryState(
     afterTargetedRead,
     { mutationRequired: true },
-  ), {
-    mode: "mutation_first",
-    reason: "goal_continuation_context_observed",
-    expectedTarget: "/workspace/src/App.tsx",
-    phase: "mutation",
-    phaseNoProgressCount: 0,
-    protocolNoProgressCount: 0,
-    protocolNoProgressFingerprint: null,
-    readLease: null,
-    sourceObservationKey: null,
-    decisionCheckpoint: null,
-  });
+  ), null, "tool prose without a persisted contract must not recreate hidden recovery state");
 
   const noEffectMutation = createState([
     {
@@ -1656,7 +1688,7 @@ test("Goal continuation restores one target-scoped recovery transaction", () => 
   assert.equal(goalContinuity.resolveGoalContinuationExecuteRecoveryMode(
     noEffectMutation,
     { mutationRequired: true },
-  ), "mutation_first");
+  ), null, "a structured no-effect result cannot create a transaction without a persisted checkpoint");
 });
 
 test("Goal continuation uses live verification semantics and does not reopen after validation", () => {

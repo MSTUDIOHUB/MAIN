@@ -610,7 +610,7 @@ export function buildSystemPrompt(
     ? `探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，优先使用本轮可用读取/搜索工具（${readToolText}）定向定位；只有没有任何可用线索、且 \`get_project_skeleton\` 本轮可用时，才调用一次浅层 \`get_project_skeleton(depth: 2)\`。`
     : "探索必须先收窄目标：如果用户给了路径、文件名、组件名、函数名或报错关键词，但本轮没有暴露读取/搜索工具，不要伪造工具调用；用用户可见 Markdown 说明缺少读取能力或等待批准。");
   parts.push("当 `list_directory`、`glob_search` 或其他工具返回文件/目录路径时，后续工具调用必须优先复用返回的完整相对路径，不要自行裁掉父目录。");
-  parts.push("`read_file` 返回的是源码/文本内容窗口；如果结果包含 `truncated: true`、`returnedLines` 或 `nextStartLine`，说明这不是完整文件。需要更多内容时继续调用 `read_file` 并传 `start_line` / `end_line` / `max_lines`，" + filePagingWarning);
+  parts.push("`read_file` 返回源码/文本内容；只有结果包含 `truncated: true` 时才是不完整窗口。不要看到 `nextStartLine` 就自动顺序翻页；先判断当前修改决策是否确实缺少具体行，只有缺失时才用 `start_line` / `end_line` / `max_lines` 定向补读，" + filePagingWarning);
   parts.push("遇到 TypeScript、测试、构建或 lint 报错行号时，优先读取报错行附近的小窗口，例如 `read_file(path, start_line, max_lines)`；不要先全量读取大型源文件。");
   if (workspaceTree) { parts.push("该目录的基础结构如下：\n" + workspaceTree); }
   parts.push(buildLanguageContract({
@@ -627,7 +627,7 @@ export function buildSystemPrompt(
     "MAIN may attach second-level command metadata for this turn; use it to choose the concrete tool family, but keep the top-level intent boundary intact.",
     "Native tool calls may be emitted directly; the UI will display tool progress, approvals, diffs, terminal output, and failures.",
     "Do not add placeholder prose solely to announce a native tool call, and do not claim tools are unavailable when they are listed.",
-    "Read-before-modify is mandatory: before changing an existing file, Unity asset, scene, prefab, or generated reference target, inspect the relevant current file/asset/context first.",
+    "Read-before-modify is mandatory: before changing an existing file, Unity asset, scene, prefab, or generated reference target, inspect the relevant current file/asset/context first. A current versioned source observation already present in context satisfies this rule; do not reread an unchanged covered window merely to satisfy it again.",
     "If the same tool call fails repeatedly with identical arguments, stop retrying it verbatim; diagnose the latest error and change the parameters, tool, or strategy.",
     "For complex work with three or more concrete steps, maintain a visible checklist; when the plan workflow is active, MAIN may provide a runtime task list and `.MAIN/plans/tasks.md` is only required for long-running, cross-session, or audit-file work. Keep only one item in progress at a time.",
     exposedWriteToolNames.length > 0

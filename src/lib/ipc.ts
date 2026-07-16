@@ -481,6 +481,35 @@ export interface GitDiffEntry {
   binary?: boolean;
 }
 
+/**
+ * Keep every Git-diff consumer on one stable collection contract. Tauri's
+ * native command returns an array, but older/test bridges can legitimately
+ * resolve an empty command payload as null. Treat that as an empty diff and
+ * discard malformed records before they reach tool formatting or the UI.
+ */
+export function normalizeGitDiffEntries(payload: unknown): GitDiffEntry[] {
+  if (!Array.isArray(payload)) return [];
+  const entries: GitDiffEntry[] = [];
+  for (const candidate of payload) {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) continue;
+    const record = candidate as Record<string, unknown>;
+    const path = typeof record.path === "string" ? record.path.trim() : "";
+    if (!path) continue;
+    const oldText = typeof record.old === "string" ? record.old : "";
+    const newText = typeof record.new === "string" ? record.new : "";
+    entries.push({
+      path,
+      status: typeof record.status === "string" && record.status.trim() ? record.status.trim() : "M",
+      old: oldText,
+      new: newText,
+      existed: typeof record.existed === "boolean" ? record.existed : oldText.length > 0,
+      fullFile: typeof record.fullFile === "boolean" ? record.fullFile : true,
+      ...(record.binary === true ? { binary: true } : {}),
+    });
+  }
+  return entries;
+}
+
 export interface GitStatus {
   isRepo: boolean;
   gitAvailable: boolean;
@@ -1217,8 +1246,9 @@ export function getGitFileList(workspace: string, filter?: string): Promise<GitF
   return invoke<GitFileEntry[]>("get_git_file_list", { workspace, filter });
 }
 
-export function getGitDiff(workspace: string, path?: string, filter?: string): Promise<GitDiffEntry[]> {
-  return invoke<GitDiffEntry[]>("get_git_diff", { workspace, path, filter });
+export async function getGitDiff(workspace: string, path?: string, filter?: string): Promise<GitDiffEntry[]> {
+  const payload = await invoke<unknown>("get_git_diff", { workspace, path, filter });
+  return normalizeGitDiffEntries(payload);
 }
 
 export function gitCommitAll(workspace: string, message: string): Promise<GitStatus> {

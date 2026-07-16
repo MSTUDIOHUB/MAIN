@@ -5,11 +5,26 @@ import {
   rememberDelegatedSubagentActivities,
 } from "./toolActivityTracking";
 
+export function shouldJoinPendingSubagentsAfterScopeDeferral(
+  results: ToolExecutionResult[],
+): boolean {
+  const hasParentScopeDeferral = results.some((result) =>
+    result.internalFeedback === true &&
+    result.qualityGateReason === "subagent_scope_policy_deferred"
+  );
+  // A mixed batch may contain a real mutation/validation outcome whose normal
+  // recovery and failure accounting must not be skipped. Deterministic join is
+  // the whole-batch outcome only when every result is runtime-owned feedback.
+  return hasParentScopeDeferral && results.every((result) =>
+    result.internalFeedback === true
+  );
+}
+
 export async function joinPendingSubagentsForParent(input: {
   callbacks: OrchestratorCallbacks;
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
-  reason: "plan_finalization" | "parent_final_response";
+  reason: "plan_finalization" | "parent_final_response" | "scope_conflict";
 }): Promise<boolean> {
   const pendingIds = input.callbacks.getPendingSubagentIds?.() || [];
   if (pendingIds.length === 0 || !input.callbacks.waitSubagents) return false;

@@ -15,6 +15,7 @@ import {
   assessPlanConfigurationContracts,
   assessPlanClosureEvidence,
   buildPlanCandidate,
+  isPlanEvidenceBundleReady,
   validatePlanCandidate,
   type PlanCandidate,
   type PlanConfigurationContractAssessment,
@@ -3665,6 +3666,34 @@ export function materializePlanArtifactFromVisibleText(input: {
     if (candidateFailures.length > 0) {
       return rejectPlanMaterialization({ reason: `plan_candidate_invalid:${candidateFailures.join(",")}` });
     }
+  }
+  if (input.evidenceBundle && input.sourceHint === "deterministic_evidence") {
+    const closure = assessPlanClosureEvidence(input.evidenceBundle);
+    if (!closure.ready) {
+      // The frozen evidence bundle is the approval boundary for both runtime-
+      // generated and model-authored plans. Run this after the candidate's
+      // own grounding/facet checks so a more precise missing target/facet is
+      // preserved, but never publish plan.md from an open evidence closure.
+      const reason = closure.unresolvedContractKinds.length > 0
+        ? `unverified_plan_contract_counterpart:${closure.unresolvedContractKinds.join(",")}`
+        : `insufficient_grounded_evidence:${closure.reason}`;
+      return rejectPlanMaterialization({
+        reason,
+        quality: classifyPlanArtifactQualityResult({ ok: false, reason }),
+      });
+    }
+  } else if (input.evidenceBundle && !isPlanEvidenceBundleReady(input.evidenceBundle)) {
+    // A model-authored plan may infer a repair from trusted observations, but
+    // it still needs a non-empty frozen bundle and grounded change targets.
+    // The inference remains a review candidate; it is never promoted back
+    // into runtime facts or accepted as execution/validation evidence.
+    return rejectPlanMaterialization({
+      reason: "insufficient_grounded_evidence:bundle_not_ready",
+      quality: classifyPlanArtifactQualityResult({
+        ok: false,
+        reason: "insufficient_grounded_evidence:bundle_not_ready",
+      }),
+    });
   }
   return {
     ok: true,

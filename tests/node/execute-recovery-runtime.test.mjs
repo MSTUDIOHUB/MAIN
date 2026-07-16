@@ -57,20 +57,21 @@ const {
   MAX_EXECUTE_RECOVERY_ITERATIONS,
   activateExecuteRecoveryRuntimeState,
   advanceExecuteRecoveryRuntimeIteration,
-  applyCrossIterationReadFileRecoveryState,
   buildExecuteRecoveryMaxIterationsPrompt,
   clearExecuteRecoveryRuntimeState,
   createExecuteRecoveryRuntimeState,
   refundExecuteRecoveryRuntimeIteration,
   registerExecuteRecoveryProtocolNoProgress,
   resolvePtyObservationPolicyDeferral,
-  setRepeatedEditValidationRecoveryAttempts,
   transitionExecuteRecoveryRuntimeState,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"),
 );
 const { buildApprovedPlanScopeConflictFingerprint } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/approvedPlanExecutionScope.ts"),
+);
+const { resolveDirectMutationPreflightRecovery } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/mutationFailureRecovery.ts"),
 );
 
 test("PTY observation policy deferral is recognized only from structured browser preflight feedback", () => {
@@ -102,7 +103,7 @@ test("execute recovery state restores forced edit and approved-Plan continuation
     workflowMode: "edit",
     forcedMode: "patch_recovery_read",
   });
-  assert.equal(forcedEdit.mode, "patch_recovery_read");
+  assert.equal(forcedEdit.mode, "mutation_first");
   assert.equal(forcedEdit.reason, "forced_execute_recovery");
   assert.equal(forcedEdit.expectedTarget, null);
   assert.equal(forcedEdit.attempts, 1);
@@ -138,9 +139,10 @@ test("execute recovery state restores forced edit and approved-Plan continuation
   assert.equal(restoredTransaction.phaseNoProgressCount, 3);
   assert.equal(restoredTransaction.protocolNoProgressCount, 4);
   assert.equal(restoredTransaction.protocolNoProgressFingerprint, "validation_only::src/app.tsx::read_unchanged");
-  assert.equal(restoredTransaction.readLease?.purpose, "post_mutation_verify");
+  assert.equal(restoredTransaction.readLease, null);
   assert.equal(restoredTransaction.sourceObservationKey, "src/App.tsx@version-2:20-40");
   assert.equal(restoredTransaction.decisionCheckpoint?.evidenceVersion, "ledger-7");
+  assert.equal(restoredTransaction.decisionCheckpoint?.nextRequiredCapability, "validation");
 
   const restoredApprovedPlanTransaction = createExecuteRecoveryRuntimeState({
     workflowMode: "plan",
@@ -163,13 +165,8 @@ test("execute recovery state restores forced edit and approved-Plan continuation
   assert.equal(forcedChat.attempts, 0);
 });
 
-test("execute recovery state activates, advances, and clears without losing loop counters", () => {
+test("execute recovery state activates, advances, and clears through the unified phase budget", () => {
   let state = createExecuteRecoveryRuntimeState({ workflowMode: "plan" });
-  state = {
-    ...state,
-    consecutiveBlockedReadFileCount: 1,
-    repeatedEditValidationAttempts: 1,
-  };
 
   state = activateExecuteRecoveryRuntimeState(state, {
     mode: "mutation_first",
@@ -198,11 +195,9 @@ test("execute recovery state activates, advances, and clears without losing loop
   assert.equal(state.expectedTarget, null);
   assert.equal(state.attempts, 0);
   assert.equal(state.iterationCount, 0);
-  assert.equal(state.consecutiveBlockedReadFileCount, 1);
-  assert.equal(state.repeatedEditValidationAttempts, 1);
 });
 
-test("execute recovery state records blocked-read and validation recovery counters", () => {
+test("execute recovery state preserves an explicit missing-source lease without a legacy read-loop fold", () => {
   const leasedState = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
     {
@@ -217,33 +212,13 @@ test("execute recovery state records blocked-read and validation recovery counte
       },
     },
   );
-  const canonicalLeasedState = applyCrossIterationReadFileRecoveryState(leasedState, {
-    mode: "mutation_first",
-    reason: "compatibility_restore",
-    consecutiveBlockedReadFileCount: 0,
-  });
   assert.equal(
-    canonicalLeasedState.mode,
+    leasedState.mode,
     "patch_recovery_read",
-    "an unconsumed read lease remains authoritative across compatibility state folds",
+    "an available read lease is the single authority for the targeted-read phase",
   );
-
-  let state = activateExecuteRecoveryRuntimeState(
-    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
-    { mode: "mutation_first", reason: "read_loop", expectedTarget: "src/App.tsx" },
-  );
-  state = applyCrossIterationReadFileRecoveryState(state, {
-    mode: "normal",
-    reason: "",
-    consecutiveBlockedReadFileCount: 0,
-  });
-  assert.equal(state.mode, "normal");
-  assert.equal(state.reason, "");
-  assert.equal(state.expectedTarget, null);
-  assert.equal(state.attempts, 1);
-
-  state = setRepeatedEditValidationRecoveryAttempts(state, 2);
-  assert.equal(state.repeatedEditValidationAttempts, 2);
+  assert.equal(leasedState.readLease?.state, "available");
+  assert.equal(leasedState.readLease?.target, "src/App.tsx");
 });
 
 test("execute recovery max-iteration prompt is generated from the shared limit", () => {
@@ -257,7 +232,43 @@ test("execute recovery max-iteration prompt is generated from the shared limit",
   );
 });
 
-test("execute recovery transaction advances read to mutation to validation without spending attempts", () => {
+test("patch mismatch reuses an active source observation instead of forcing another read", () => {
+  const decision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    executeRecoveryMode: "mutation_first",
+    retainedSourceObservation: {
+      key: "src/main.js::26895:1784042986186::361-540",
+      path: "src/main.js",
+      requestSignature: 'read_file::src/main.js::[["max_lines",180],["start_line",361]]',
+      versionToken: "26895:1784042986186",
+      source: "fresh",
+    },
+    results: [{
+      name: "apply_patch",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
+      isError: true,
+      mutationPreflightReason: "invalid_patch",
+    }],
+  });
+
+  assert.equal(decision?.mode, "mutation_first");
+  assert.equal(decision?.readLease, null);
+  assert.equal(decision?.sourceObservationKey, "src/main.js::26895:1784042986186::361-540");
+  assert.equal(decision?.decisionCheckpoint.nextRequiredCapability, "mutation");
+  assert.equal(decision?.decisionCheckpoint.evidenceVersion, "26895:1784042986186");
+
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    decision,
+  );
+  assert.equal(state.mode, "mutation_first");
+  assert.equal(state.readLease, null);
+  assert.equal(state.sourceObservationKey, "src/main.js::26895:1784042986186::361-540");
+});
+
+test("execute recovery transaction advances a missing-window read to mutation and direct validation", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
     {
@@ -300,9 +311,9 @@ test("execute recovery transaction advances read to mutation to validation witho
   assert.equal(read.consumedExpectedRead, true);
   state = read.state;
 
-  const validationTooEarly = transitionExecuteRecoveryRuntimeState(state, { validationTarget: "npm test" });
-  assert.equal(validationTooEarly.transition, "none");
-  assert.equal(validationTooEarly.state.mode, "mutation_first");
+  const validationAlternative = transitionExecuteRecoveryRuntimeState(state, { validationTarget: "npm test" });
+  assert.equal(validationAlternative.transition, "none");
+  assert.equal(validationAlternative.state.mode, "mutation_first");
 
   const wrongMutation = transitionExecuteRecoveryRuntimeState(state, {
     mutationTarget: "src/other.ts",
@@ -318,21 +329,14 @@ test("execute recovery transaction advances read to mutation to validation witho
   assert.equal(mutation.state.mode, "validation_only");
   assert.equal(mutation.state.expectedTarget, "src/App.tsx");
   assert.equal(mutation.state.attempts, attempts);
+  assert.equal(mutation.state.readLease, null);
+  assert.equal(mutation.state.decisionCheckpoint?.nextRequiredCapability, "validation");
   state = mutation.state;
 
-  const validationBeforePostMutationRead = transitionExecuteRecoveryRuntimeState(state, {
+  const verified = transitionExecuteRecoveryRuntimeState(state, {
     validationTarget: "npm test",
     validationToolName: "run_command",
   });
-  assert.equal(validationBeforePostMutationRead.transition, "none");
-  const postMutationRead = transitionExecuteRecoveryRuntimeState(state, {
-    freshReadTarget: "src/App.tsx",
-    sourceObservationKey: "src/App.tsx::post-mutation::v2",
-  });
-  assert.equal(postMutationRead.transition, "post_mutation_check_to_validation");
-  state = postMutationRead.state;
-
-  const verified = transitionExecuteRecoveryRuntimeState(state, { validationTarget: "npm test" });
   assert.equal(verified.transition, "validation_to_normal");
   assert.equal(verified.target, "src/App.tsx", "validation keeps the transaction target instead of its command label");
   assert.equal(verified.state.mode, "normal");
@@ -361,7 +365,53 @@ test("failed-process recovery accepts a bounded target repair before returning t
   assert.equal(repaired.transition, "mutation_to_validation");
   assert.equal(repaired.state.mode, "validation_only");
   assert.equal(repaired.state.expectedTarget, "src/App.tsx");
-  assert.equal(repaired.state.readLease?.purpose, "post_mutation_verify");
+  assert.equal(repaired.state.readLease, null);
+  assert.equal(repaired.state.decisionCheckpoint?.nextRequiredCapability, "validation");
+});
+
+test("failed finite validation clears stale source ownership and reads the current target window before repair", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "mutation_first",
+      reason: "approved_plan_finite_validation_requires_repair",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "context_restore",
+        target: "src/main.js",
+        requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+        state: "available",
+      },
+      sourceObservationKey: null,
+      decisionCheckpoint: {
+        expectedTarget: "src/main.js",
+        sourceObservationKey: null,
+        nextRequiredCapability: "targeted_read",
+      },
+    },
+  );
+
+  assert.equal(state.mode, "patch_recovery_read");
+  assert.equal(state.expectedTarget, "src/main.js");
+  assert.equal(state.sourceObservationKey, null);
+  assert.equal(state.readLease?.purpose, "context_restore");
+  assert.deepEqual(state.readLease?.requestedRange, {
+    startLine: 205,
+    endLine: 256,
+    maxLines: 52,
+  });
+  assert.equal(state.decisionCheckpoint?.nextRequiredCapability, "targeted_read");
+
+  const refreshed = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "src/main.js::current-v2::205-256",
+    sourceRequestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    sourceObservedVersion: "current-v2",
+  });
+  assert.equal(refreshed.transition, "context_to_mutation");
+  assert.equal(refreshed.state.mode, "mutation_first");
+  assert.equal(refreshed.state.sourceObservationKey, "src/main.js::current-v2::205-256");
+  assert.equal(refreshed.state.decisionCheckpoint?.nextRequiredCapability, "mutation");
 });
 
 test("structural targeting evidence resets the phase budget before its exact range read", () => {
@@ -448,18 +498,17 @@ test("recovery no-progress budget resets only for fresh phase evidence", () => {
   });
   assert.equal(mutation.transition, "mutation_to_validation");
   assert.equal(mutation.state.phaseNoProgressCount, 0);
-  assert.equal(mutation.state.readLease.purpose, "post_mutation_verify");
+  assert.equal(mutation.state.readLease, null);
+  assert.equal(mutation.state.decisionCheckpoint.nextRequiredCapability, "validation");
 
   state = advanceExecuteRecoveryRuntimeIteration(mutation.state).state;
-  const postMutationRead = transitionExecuteRecoveryRuntimeState(state, {
-    freshReadTarget: "src/App.tsx",
-    sourceObservationKey: "src/App.tsx::205-256::v3",
+  const validation = transitionExecuteRecoveryRuntimeState(state, {
+    validationTarget: "npm test",
+    validationToolName: "run_command",
   });
-  assert.equal(postMutationRead.transition, "post_mutation_check_to_validation");
-  assert.equal(postMutationRead.state.mode, "validation_only");
-  assert.equal(postMutationRead.state.phaseNoProgressCount, 0);
-  assert.equal(postMutationRead.state.readLease.state, "consumed");
-  assert.equal(postMutationRead.state.decisionCheckpoint.nextRequiredCapability, "validation");
+  assert.equal(validation.transition, "validation_to_normal");
+  assert.equal(validation.state.mode, "normal");
+  assert.equal(validation.state.phaseNoProgressCount, 0);
 });
 
 test("patch recovery consumes only the leased target, source range, and version", () => {
@@ -612,6 +661,7 @@ test("reviewed Plan line ranges accumulate versioned read segments before mutati
     maxLines: 520,
   });
   assert.deepEqual(first.state.readLease.coveredRanges, [{ startLine: 205, endLine: 380 }]);
+  assert.deepEqual(first.state.readLease.observationKeys, ["main:205-380:v1"]);
 
   const changedMidRange = transitionExecuteRecoveryRuntimeState(first.state, {
     freshReadTarget: "src/main.js",
@@ -626,6 +676,7 @@ test("reviewed Plan line ranges accumulate versioned read segments before mutati
     maxLines: 696,
   });
   assert.deepEqual(changedMidRange.state.readLease.coveredRanges, []);
+  assert.deepEqual(changedMidRange.state.readLease.observationKeys, []);
   assert.equal(changedMidRange.state.readLease.observedVersion, "90010:401");
 
   const second = transitionExecuteRecoveryRuntimeState(first.state, {
@@ -641,6 +692,10 @@ test("reviewed Plan line ranges accumulate versioned read segments before mutati
     { startLine: 381, endLine: 900 },
   ]);
   assert.equal(second.state.readLease.state, "consumed");
+  assert.deepEqual(second.state.readLease.observationKeys, [
+    "main:205-380:v1",
+    "main:381-900:v1",
+  ]);
 });
 
 test("policy deferrals, cache stubs, and PTY waits can refund the current phase debit", () => {
@@ -656,7 +711,7 @@ test("policy deferrals, cache stubs, and PTY waits can refund the current phase 
   assert.equal(refundExecuteRecoveryRuntimeIteration(state).phaseNoProgressCount, 0);
 });
 
-test("six identical semantic retries stop recovery even when phase debits are refunded", () => {
+test("six identical unchanged-read stubs stop through the unified protocol budget", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
     {
@@ -671,7 +726,7 @@ test("six identical semantic retries stop recovery even when phase debits are re
       },
     },
   );
-  const fingerprint = "patch_recovery_read::src/main.js::read_no_progress";
+  const fingerprint = "patch_recovery_read::src/main.js::unchanged_stub";
   for (let index = 1; index <= MAX_EXECUTE_RECOVERY_ITERATIONS; index += 1) {
     state = advanceExecuteRecoveryRuntimeIteration(state).state;
     state = refundExecuteRecoveryRuntimeIteration(state);
@@ -743,56 +798,151 @@ test("approved Plan scope conflicts stop after six semantic retries across mutat
   assert.equal(revisedPlan.protocolNoProgressCount, 1);
 });
 
-test("action-plus recovery observes PTY readiness before browser validation clears the transaction", () => {
-  let state = activateExecuteRecoveryRuntimeState(
-    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
-    {
-      mode: "action_plus_targeting",
-      reason: "goal_slice_recovery",
-      expectedTarget: "src/App.tsx",
-    },
-  );
-  state = advanceExecuteRecoveryRuntimeIteration(state).state;
-  const pty = transitionExecuteRecoveryRuntimeState(state, {
-    validationTarget: "terminal status",
-    validationToolName: "get_pty_status",
-  });
-  assert.equal(pty.transition, "validation_progress");
-  assert.equal(pty.state.mode, "action_plus_targeting");
-  assert.equal(pty.state.phaseNoProgressCount, 0);
-  assert.equal(pty.state.decisionCheckpoint.nextRequiredCapability, "browser_validation");
-
-  const browser = transitionExecuteRecoveryRuntimeState(pty.state, {
-    validationTarget: "http://localhost:1420/",
-    validationToolName: "browser_evaluate",
-  });
-  assert.equal(browser.transition, "validation_to_normal");
-  assert.equal(browser.state.mode, "normal");
-});
-
-test("validation recovery keeps the transaction open when PTY becomes ready", () => {
+test("PTY readiness closes an ordinary watch process without inventing a browser obligation", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
     {
       mode: "validation_only",
-      reason: "recovery_mutation_observed",
-      expectedTarget: "src/App.tsx",
+      reason: "goal_slice_recovery",
+      expectedTarget: "npm run watch",
+      decisionCheckpoint: {
+        expectedTarget: "npm run watch",
+        sourceObservationKey: null,
+        nextRequiredCapability: "observe_pty",
+      },
     },
   );
   state = advanceExecuteRecoveryRuntimeIteration(state).state;
-  const pty = transitionExecuteRecoveryRuntimeState(state, {
-    validationTarget: "terminal status",
-    validationToolName: "read_pty_since",
+  const ready = transitionExecuteRecoveryRuntimeState(state, {
+    validationTarget: "npm run watch",
+    validationToolName: "get_pty_status",
   });
-  assert.equal(pty.transition, "validation_progress");
-  assert.equal(pty.state.mode, "validation_only");
-  assert.equal(pty.state.phaseNoProgressCount, 0);
-  assert.equal(pty.state.decisionCheckpoint.nextRequiredCapability, "browser_validation");
+  assert.equal(ready.transition, "validation_to_normal");
+  assert.equal(ready.state.mode, "normal");
+});
 
-  const browser = transitionExecuteRecoveryRuntimeState(pty.state, {
-    validationTarget: "http://localhost:1420/",
-    validationToolName: "browser_evaluate",
+test("long-running desktop validation requires launch and PTY readiness, not browser evidence", () => {
+  let state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "validation_only",
+      reason: "validation_after_mutation_required",
+      expectedTarget: "src/App.tsx",
+      decisionCheckpoint: {
+        expectedTarget: "src/App.tsx",
+        sourceObservationKey: "src/App.tsx::v2",
+        nextRequiredCapability: "launch_long_process",
+      },
+    },
+  );
+
+  const launched = transitionExecuteRecoveryRuntimeState(state, {
+    validationTarget: "cargo tauri dev",
+    validationToolName: "execute_command",
   });
-  assert.equal(browser.transition, "validation_to_normal");
-  assert.equal(browser.state.mode, "normal");
+  assert.equal(launched.transition, "validation_progress");
+  assert.equal(launched.state.mode, "validation_only");
+  assert.equal(launched.state.decisionCheckpoint?.nextRequiredCapability, "observe_pty");
+
+  const inputSent = transitionExecuteRecoveryRuntimeState(launched.state, {
+    validationTarget: "y",
+    validationToolName: "send_pty_input",
+  });
+  assert.equal(inputSent.transition, "validation_progress");
+  assert.equal(inputSent.state.decisionCheckpoint?.nextRequiredCapability, "observe_pty");
+
+  const observed = transitionExecuteRecoveryRuntimeState(inputSent.state, {
+    validationTarget: "cargo tauri dev",
+    validationToolName: "get_pty_status",
+  });
+  assert.equal(observed.transition, "validation_to_normal");
+  assert.equal(observed.state.mode, "normal");
+});
+
+test("failed worker reconciliation ignores unrelated commands and closes on a healthy process probe", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "action_plus_targeting",
+      reason: "precompletion_evidence_gap:unreconciled_failure",
+      expectedTarget: "node worker.js",
+      decisionCheckpoint: {
+        expectedTarget: "node worker.js",
+        sourceObservationKey: null,
+        nextRequiredCapability: "recover_process",
+      },
+    },
+  );
+
+  const unrelated = transitionExecuteRecoveryRuntimeState(state, {
+    validationTarget: "npm test",
+    validationToolName: "run_command",
+  });
+  assert.equal(unrelated.transition, "none");
+  assert.equal(unrelated.state.mode, "action_plus_targeting");
+
+  const healthy = transitionExecuteRecoveryRuntimeState(unrelated.state, {
+    validationTarget: "curl -sS http://localhost:1420/",
+    validationToolName: "run_command",
+  });
+  assert.equal(healthy.transition, "validation_to_normal");
+  assert.equal(healthy.state.mode, "normal");
+});
+
+test("complex execution transaction reduces observe, repair, mutate, and validate through one kernel", () => {
+  let state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "mutation_first",
+      reason: "read_only_evidence_budget",
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src/main.js::v1::1-500",
+      decisionCheckpoint: {
+        expectedTarget: "src/main.js",
+        sourceObservationKey: "src/main.js::v1::1-500",
+        nextRequiredCapability: "mutation",
+        evidenceVersion: "v1",
+        planTaskId: "task-main-runtime",
+        requirementRef: "REQ-MAIN",
+      },
+    },
+  );
+  state = advanceExecuteRecoveryRuntimeIteration(state).state;
+
+  const refreshed = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "src/main.js::v1::501-894",
+    sourceRequestedRange: { startLine: 501, endLine: 894 },
+    sourceObservedVersion: "v1",
+  });
+  assert.equal(refreshed.transition, "context_refreshed");
+  assert.equal(refreshed.state.mode, "mutation_first");
+  assert.equal(refreshed.state.phaseNoProgressCount, 0);
+  assert.equal(refreshed.state.decisionCheckpoint?.nextRequiredCapability, "mutation");
+  assert.equal(refreshed.state.decisionCheckpoint?.planTaskId, "task-main-runtime");
+  assert.equal(refreshed.state.decisionCheckpoint?.requirementRef, "REQ-MAIN");
+
+  const mutated = transitionExecuteRecoveryRuntimeState(refreshed.state, {
+    mutationTarget: "src/main.js",
+  });
+  assert.equal(mutated.transition, "mutation_to_validation");
+  assert.equal(mutated.state.mode, "validation_only");
+  assert.equal(mutated.state.readLease, null);
+  assert.equal(mutated.state.decisionCheckpoint?.planTaskId, "task-main-runtime");
+
+  const repairedDuringValidation = transitionExecuteRecoveryRuntimeState(
+    advanceExecuteRecoveryRuntimeIteration(mutated.state).state,
+    { mutationTarget: "src/main.js" },
+  );
+  assert.equal(repairedDuringValidation.transition, "mutation_to_validation");
+  assert.equal(repairedDuringValidation.state.mode, "validation_only");
+  assert.equal(repairedDuringValidation.state.phaseNoProgressCount, 0);
+
+  const validated = transitionExecuteRecoveryRuntimeState(repairedDuringValidation.state, {
+    validationTarget: "npm test",
+    validationToolName: "run_command",
+  });
+  assert.equal(validated.transition, "validation_to_normal");
+  assert.equal(validated.state.mode, "normal");
+  assert.equal(validated.state.expectedTarget, null);
 });

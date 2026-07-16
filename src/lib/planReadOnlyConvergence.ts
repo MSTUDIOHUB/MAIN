@@ -106,10 +106,6 @@ export function isPlanPostConvergenceArtifactToolName(name: string): boolean {
   return PLAN_DRAFT_WRITE_TOOL_NAMES.has(String(name || ""));
 }
 
-function isPlanRuntimeReadOnlyPhase(phase?: PlanRuntimePhase): boolean {
-  return phase === "explore_structure" || phase === "grounding" || phase === "synthesis" || phase === "needs_evidence";
-}
-
 function isPlanRuntimeFinalizationPhase(phase?: PlanRuntimePhase): boolean {
   return (
     phase === "synthesis" ||
@@ -152,11 +148,12 @@ export function assessPlanEvidenceReadiness(input: {
   userGoal?: string;
   userContext?: TurnInputContextLike;
   recentToolActivity?: PlanToolActivityLike[];
+  hasGroundedVisualContext?: boolean;
+  /** @deprecated Use hasGroundedVisualContext. Kept for persisted callers. */
   hasObservedUserContext?: boolean;
   hasBlockingUserChoice?: boolean;
 }): PlanEvidenceReadinessResult {
   const userContext = normalizeTurnInputContextSignals(input.userContext);
-  const hasProvidedContext = hasTurnProvidedContext(userContext);
   const activity = Array.isArray(input.recentToolActivity) ? input.recentToolActivity : [];
   const successful = activity.filter(isSuccessfulActivity);
   const successfulTargetedReads = successful.filter((item) =>
@@ -185,6 +182,8 @@ export function assessPlanEvidenceReadiness(input: {
   const semanticFacts = semanticBundle.facts.length;
   const changeTargets = semanticBundle.changeTargets.length;
   const counts = { successfulTargetedReads, successfulSearches, semanticFacts, changeTargets };
+  const hasGroundedVisualContext =
+    input.hasGroundedVisualContext ?? input.hasObservedUserContext ?? false;
 
   if (input.hasBlockingUserChoice) {
     return {
@@ -194,10 +193,18 @@ export function assessPlanEvidenceReadiness(input: {
     };
   }
 
-  if (hasProvidedContext && !input.hasObservedUserContext) {
+  if (userContext.imageParts > 0 && !hasGroundedVisualContext) {
     return {
       status: "needs_observation",
-      reason: "provided_context_not_observed",
+      reason: "visual_context_not_model_visible",
+      ...counts,
+    };
+  }
+
+  if (providedPaths.length > 0 && !readProvidedPath) {
+    return {
+      status: "needs_observation",
+      reason: "provided_file_not_read",
       ...counts,
     };
   }
@@ -272,27 +279,6 @@ export function filterPlanToolNamesAfterReadOnlyConvergence(input: {
   return input.toolNames.filter(isPlanPostConvergenceArtifactToolName);
 }
 
-export function filterPlanToolNamesForRuntimePhase(input: {
-  toolNames: string[];
-  workflowMode: "chat" | "edit" | "plan";
-  isPlanApproved: boolean;
-  planRuntimePhase?: PlanRuntimePhase;
-}): string[] {
-  if (input.workflowMode !== "plan" || input.isPlanApproved || !input.planRuntimePhase) {
-    return input.toolNames;
-  }
-  if (input.planRuntimePhase === "explore_structure") {
-    return input.toolNames.filter((name) => name === "get_project_skeleton");
-  }
-  if (isPlanRuntimeReadOnlyPhase(input.planRuntimePhase)) {
-    return input.toolNames.filter(isPlanReadOnlyToolName);
-  }
-  if (isPlanRuntimeFinalizationPhase(input.planRuntimePhase)) {
-    return input.toolNames.filter(isPlanPostConvergenceArtifactToolName);
-  }
-  return input.toolNames;
-}
-
 export function shouldTriggerPlanReadOnlyConvergence(input: {
   isUnapprovedPlanReadOnlyBatch: boolean;
   hasPlanDecisionOutput: boolean;
@@ -301,6 +287,8 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
   userGoal?: string;
   userContext?: TurnInputContextLike;
   recentToolActivity?: PlanToolActivityLike[];
+  hasGroundedVisualContext?: boolean;
+  /** @deprecated Use hasGroundedVisualContext. Kept for persisted callers. */
   hasObservedUserContext?: boolean;
   convergencePromptAlreadyUsed?: boolean;
 }): boolean {
@@ -317,7 +305,8 @@ export function shouldTriggerPlanReadOnlyConvergence(input: {
     userGoal: input.userGoal,
     userContext,
     recentToolActivity: input.recentToolActivity,
-    hasObservedUserContext: input.hasObservedUserContext,
+    hasGroundedVisualContext:
+      input.hasGroundedVisualContext ?? input.hasObservedUserContext,
   });
   if (
     readiness.status === "needs_targeted_read" &&

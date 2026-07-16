@@ -14,9 +14,6 @@ import type {
 } from "../../workflowModels";
 import type { OrchestratorCallbacks, ToolCallToExecute } from "../types";
 import { handleApprovedPlanFinalization } from "./approvedPlanFinalization";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
-import { applyApprovedPlanNoToolRecoveryState } from "./approvedPlanRecoveryRuntime";
-import { handleApprovedPlanNoToolRecovery } from "./approvedPlanNoToolRecovery";
 import type { ProviderReasoningForHistory } from "./assistantResponseProcessing";
 import { handleExecuteNoToolRecovery } from "./executeNoToolRecovery";
 import { handleFinalNoToolAssistantTurn, handleReplyOptionsPause } from "./finalTurnCompletion";
@@ -34,6 +31,7 @@ import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
 import { resolvePreCompletionEvidenceRecoveryDecision } from "./preCompletionEvidenceRecovery";
+import { resolveCommandEvidenceRequirements } from "../../verificationEvidence";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -51,7 +49,6 @@ export type AssistantCompletionPhaseResult = {
   status: "completed" | "continue" | "stopped";
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
 };
 
 export async function handleAssistantCompletionPhase(input: {
@@ -74,14 +71,12 @@ export async function handleAssistantCompletionPhase(input: {
   shouldSuppressApprovedPlanNoToolText: boolean;
   hasStructuredProposal: boolean;
   currentPlanStageForReview: ReturnType<OrchestratorCallbacks["getPlanStage"]>;
-  isApprovedPlanExecutionTurn: boolean;
   approvedPlanAuditForNoTool: PlanTaskEvidenceAudit | null;
   rejectedCompletionClaim: boolean;
   wasTruncated: boolean;
   sawExecuteOperationEvidence: boolean;
   normalized: NormalizedStreamState;
   streamText: string;
-  iterationRequestStartedAt: number;
   recentPlanToolActivity: PlanToolActivitySummary[];
   recentToolActivity: PlanToolActivitySummary[];
   attemptedPlanWriteTargets: string[];
@@ -105,7 +100,6 @@ export async function handleAssistantCompletionPhase(input: {
   turnInputContextSignals: Parameters<typeof handlePlanNoToolRecovery>[0]["turnInputContextSignals"];
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   unityConsoleDiagnosticsRequested: boolean;
   unityConsoleFinalVerificationRequired: boolean;
   iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId">;
@@ -125,7 +119,6 @@ export async function handleAssistantCompletionPhase(input: {
 }): Promise<AssistantCompletionPhaseResult> {
   let noToolRuntimeState = input.noToolRuntimeState;
   let planRuntimeState = input.planRuntimeState;
-  let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   const effectiveToolCallCount = input.effectiveToolCalls.length;
   const completion = {
     assistantHistoryText: input.assistantHistoryText,
@@ -167,46 +160,6 @@ export async function handleAssistantCompletionPhase(input: {
     return finish("stopped");
   }
 
-  const approvedPlanNoToolRecovery = handleApprovedPlanNoToolRecovery({
-    callbacks: input.callbacks,
-    activeProfile: input.activeProfile,
-    iteration: input.iteration,
-    workflowMode: input.workflowMode,
-    runtimeIntent: input.runtimeIntent,
-    planStage: input.currentPlanStageForReview,
-    isApprovedPlanExecutionTurn: input.isApprovedPlanExecutionTurn,
-    effectiveToolCallCount,
-    shouldSuppressApprovedPlanNoToolText: input.shouldSuppressApprovedPlanNoToolText,
-    approvedPlanAuditForNoTool: input.approvedPlanAuditForNoTool,
-    rejectedCompletionClaim: input.rejectedCompletionClaim,
-    availableToolNames: input.availableToolNames,
-    wasTruncated: input.wasTruncated,
-    sawExecuteOperationEvidence: input.sawExecuteOperationEvidence,
-    normalized: input.normalized,
-    finalReplyOptionsCount: input.finalReplyOptions.length,
-    streamText: input.streamText,
-    iterationRequestStartedAt: input.iterationRequestStartedAt,
-    recentPlanToolActivity: input.recentPlanToolActivity,
-    consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,
-    ...approvedPlanRecoveryState,
-    emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
-    emitPlanExecutionProgress: input.emitPlanExecutionProgress,
-  });
-  noToolRuntimeState = applyConsecutiveNoToolRuntimeState(
-    noToolRuntimeState,
-    approvedPlanNoToolRecovery,
-  );
-  approvedPlanRecoveryState = applyApprovedPlanNoToolRecoveryState(
-    approvedPlanRecoveryState,
-    approvedPlanNoToolRecovery,
-  );
-  if (approvedPlanNoToolRecovery.status === "stopped") {
-    return finish("stopped");
-  }
-  if (approvedPlanNoToolRecovery.status === "continue") {
-    return finish("continue");
-  }
-
   if (effectiveToolCallCount > 0) {
     return finish("completed");
   }
@@ -215,7 +168,7 @@ export async function handleAssistantCompletionPhase(input: {
   // heuristic. A completion-looking sentence cannot redirect a known ledger
   // gap into a generic reprompt or end the turn.
   const externalReviewIsAdvisory = Boolean(
-    input.workflowMode === "plan" &&
+    input.callbacks.getIsPlanApproved() &&
     input.approvedPlanAuditForNoTool?.acceptedCompletion &&
     input.approvedPlanAuditForNoTool.pendingExternalValidation
   );
@@ -225,7 +178,17 @@ export async function handleAssistantCompletionPhase(input: {
     // Manual/user review remains an advisory conclusion. It never turns off
     // the independent post-mutation automatic validation contract.
     validationExpected: input.effectiveTurnContract?.validationExpected === true,
+    mutationExpected: input.effectiveTurnContract?.mutationExpected === true,
+    transactionId: input.iterationContext.eventTurnId,
+    requiredCommandEvidence: resolveCommandEvidenceRequirements({
+      tasks: input.callbacks.getIsPlanApproved()
+        ? input.callbacks.getPlanTasks()
+        : [],
+      commandDirective: input.callbacks.getCommandDirective?.() || null,
+    }),
     currentRecoveryMode: currentExecuteRecoveryState.mode,
+    currentRequiredCapability:
+      currentExecuteRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
     availableToolNames: input.availableToolNames,
   });
   if (preCompletionRecovery) {
@@ -262,6 +225,7 @@ export async function handleAssistantCompletionPhase(input: {
       nextRequiredCapability: preCompletionRecovery.nextRequiredCapability,
       draftChars: input.visibleAssistantText.length,
       validationExpected: input.effectiveTurnContract?.validationExpected === true,
+      mutationExpected: input.effectiveTurnContract?.mutationExpected === true,
       externalReviewIsAdvisory,
     });
     return finish("continue");
@@ -282,6 +246,9 @@ export async function handleAssistantCompletionPhase(input: {
     return finish("continue");
   }
 
+  // Evidence closure has already been decided above. This fallback handles
+  // protocol shape only; assistant prose must not synthesize a new user turn
+  // or select a recovery phase by wording.
   const executeNoToolRecovery = handleExecuteNoToolRecovery({
     callbacks: input.callbacks,
     activeProfile: input.activeProfile,
@@ -432,7 +399,6 @@ export async function handleAssistantCompletionPhase(input: {
     callbacks: input.callbacks,
     activeProfile: input.activeProfile,
     iteration: input.iteration,
-    workflowMode: input.workflowMode,
     approvedPlanAuditForNoTool: input.approvedPlanAuditForNoTool,
     rejectedCompletionClaim: input.rejectedCompletionClaim,
     availableToolNames: input.availableToolNames,
@@ -475,7 +441,6 @@ export async function handleAssistantCompletionPhase(input: {
       status,
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
     };
   }
 }

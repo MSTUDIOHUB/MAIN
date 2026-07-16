@@ -29,6 +29,13 @@ import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import {
+  parseVisualContextRecognition,
+  persistVisualContextDeliveryObservation,
+  resolveMonotonicVisualContextStatus,
+  resolveVisualContextDeliveryStateFromReceipt,
+  type VisualContextDeliveryStatus,
+} from "../../visualContext";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -52,11 +59,30 @@ export class AgentOrchestrator {
         return this.latestRunPauseReason;
     }
 
+    hasPendingTurnCompletion(): boolean {
+        return this.activeTurnEvents?.hasStagedTurnCompletion() ?? false;
+    }
+
+    commitPendingTurnCompletion(): boolean {
+        return this.activeTurnEvents?.commitStagedTurnCompletion() ?? false;
+    }
+
+    discardPendingTurnCompletion(): boolean {
+        return this.activeTurnEvents?.discardStagedTurnCompletion() ?? false;
+    }
+
+    pauseActiveRun(reason: string, message: string): boolean {
+        const emitted = this.activeTurnEvents?.emitRunPausedEvent(reason, message) ?? false;
+        if (emitted) this.latestRunPauseReason = reason;
+        return emitted;
+    }
+
     getLatestExecuteRecoveryState(): ExecuteRecoveryRuntimeState | null {
         return this.latestExecuteRecoveryState;
     }
 
     failActiveRun(message: string): void {
+        this.discardPendingTurnCompletion();
         this.activeTurnEvents?.emitTurnFailedEvent(message);
     }
 
@@ -65,6 +91,7 @@ export class AgentOrchestrator {
         this.latestTurnContract = null;
         this.latestRunPauseReason = null;
         this.latestExecuteRecoveryState = null;
+        this.activeTurnEvents = null;
         const runtimeState = await prepareAgentLoopRuntimeState(callbacks);
         const {
           config,
@@ -111,6 +138,9 @@ export class AgentOrchestrator {
           gameStudioScriptEditRequested,
           unityScriptEditRequested,
         } = turnInputContext;
+        let visualContextRunStatus: VisualContextDeliveryStatus =
+          turnInputContextSignals.imageParts > 0 ? "queued" : "none";
+        let visualRecognitionObservation = null as ReturnType<typeof parseVisualContextRecognition>["observation"];
         const toolRegistryState = await prepareAgentLoopToolRegistry({
           config,
           skills,
@@ -259,6 +289,9 @@ export class AgentOrchestrator {
           setLatestTurnContract: (contract) => {
             this.latestTurnContract = contract;
           },
+          visualObservationRequest: turnInputContextSignals.imageParts > 0
+            ? { turnId: eventTurnId, imageCount: turnInputContextSignals.imageParts }
+            : null,
         });
         const initialRuntimeIntent = resolveRuntimeIntent();
         startModelProbeForTurn(settings);
@@ -270,6 +303,13 @@ export class AgentOrchestrator {
           associatedPaths,
         });
         if (startHooksResult === "blocked") {
+          emitRunPausedEvent(
+            "start_hook_blocked",
+            callbacks.getPreferredLanguage() === "zh"
+              ? "启动钩子阻止了本轮执行；处理钩子要求后可在同一任务中恢复。"
+              : "A start hook blocked this run; address the hook requirement, then resume in the same task.",
+          );
+          callbacks.onStatusChange("idle");
           return;
         }
 
@@ -291,10 +331,6 @@ export class AgentOrchestrator {
           getStreamRuntimeState: () => loopState.streamRuntimeState,
           setStreamRuntimeState: (state) => {
             loopState.streamRuntimeState = state;
-          },
-          getLoopGuardRuntimeState: () => loopState.loopGuardRuntimeState,
-          setLoopGuardRuntimeState: (state) => {
-            loopState.loopGuardRuntimeState = state;
           },
           getPlanRuntimeState: () => loopState.planRuntimeState,
           setPlanRuntimeState: (state) => {
@@ -323,10 +359,6 @@ export class AgentOrchestrator {
           setPlanRuntimeState: (state) => {
             loopState.planRuntimeState = state;
           },
-          getApprovedPlanRecoveryState: () => loopState.approvedPlanRecoveryState,
-          setApprovedPlanRecoveryState: (state) => {
-            loopState.approvedPlanRecoveryState = state;
-          },
           setPlanRuntimePhase,
         });
 
@@ -341,10 +373,6 @@ export class AgentOrchestrator {
           setStreamRuntimeState: (state) => {
             loopState.streamRuntimeState = state;
           },
-          getApprovedPlanRecoveryState: () => loopState.approvedPlanRecoveryState,
-          setApprovedPlanRecoveryState: (state) => {
-            loopState.approvedPlanRecoveryState = state;
-          },
           getPlanRuntimeState: () => loopState.planRuntimeState,
           emitTaskOrchestratorPhase,
           setPlanRuntimePhase,
@@ -354,9 +382,7 @@ export class AgentOrchestrator {
           emitPlanExecutionProgress,
           getMaxOutputEscalations,
           getPlanStreamWatchdogOptions,
-          pauseApprovedPlanNoProgressLoop,
           pauseApprovedPlanStreamWatchdog,
-          continueApprovedPlanWithStrategySwitch,
         } = loopControl;
         const loopStartRuntimeIntent = resolveRuntimeIntent();
         const loopStartTools = resolveAllToolsForRuntime(loopStartRuntimeIntent);
@@ -416,7 +442,6 @@ export class AgentOrchestrator {
           snapshotContextLimit,
           streamRuntimeState: loopState.streamRuntimeState,
           executeRecoveryState: loopState.executeRecoveryState,
-          approvedPlanRecoveryState: loopState.approvedPlanRecoveryState,
           planRuntimeState: loopState.planRuntimeState,
           toolExecutionRuntimeState: loopState.toolExecutionRuntimeState,
           iterationContext: turnIterationContext,
@@ -473,7 +498,6 @@ export class AgentOrchestrator {
         const {
           isExecuteRecoveryEligible,
           allowExecuteRecoveryFileRead,
-          effectiveExecuteRecoveryFileRead,
           recoveryActionContract,
           iterationAllTools,
           availableToolNames,
@@ -484,7 +508,7 @@ export class AgentOrchestrator {
           preStreamTurnContract?.completionEvidenceRequired === "execution_evidence" ||
           preStreamTurnContract?.mutationExpected === true ||
           preStreamTurnContract?.validationExpected === true ||
-          (workflowMode === "plan" && callbacks.getIsPlanApproved());
+          callbacks.getIsPlanApproved();
         const holdExecuteConclusionDraft =
           runtimeIntent === "execute" &&
           requiresExecutionEvidence;
@@ -514,7 +538,6 @@ export class AgentOrchestrator {
           allowExecuteRecoveryFileRead,
           recoveryActionContract,
           isExecuteRecoveryEligible,
-          ...loopState.approvedPlanRecoveryState,
           finalTextOnlyStep,
           chatFinalSynthesisActive: loopState.streamRuntimeState.chatFinalSynthesisActive,
           chatFinalSynthesisReason: loopState.streamRuntimeState.chatFinalSynthesisReason,
@@ -523,7 +546,6 @@ export class AgentOrchestrator {
             markChatFinalSynthesisPromptUsedMutableState(loopState);
           },
           recentToolActivity: loopState.recentToolActivity,
-          consecutiveNoToolCount: loopState.noToolRuntimeState.consecutiveNoToolCount,
           getPlanStreamWatchdogOptions,
           approvedPlanRecoveryStreamMaxElapsedMs: APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS,
           preapprovalPlanQualityRecoveryStreamPolicy,
@@ -540,8 +562,172 @@ export class AgentOrchestrator {
           );
           return;
         }
-        const streamResult = streamInvocation.streamResult;
+        let streamResult = streamInvocation.streamResult;
         const messagesSentToLLM = streamInvocation.messagesSentToLLM;
+        const currentVisualContextDelivery = resolveVisualContextDeliveryStateFromReceipt({
+          expectedImageParts: turnInputContextSignals.imageParts,
+          receipt: streamResult.visualTransportReceipt,
+        });
+        if (turnInputContextSignals.imageParts > 0) {
+          const visualContext = currentVisualContextDelivery;
+          const nextVisualContextRunStatus = resolveMonotonicVisualContextStatus(
+            visualContextRunStatus,
+            visualContext.status,
+          );
+          const persistedVisualContext = persistVisualContextDeliveryObservation(
+            callbacks.getMessages(),
+            { turnId: eventTurnId, state: visualContext },
+          );
+          if (persistedVisualContext.changed) {
+            callbacks.replaceMessages(persistedVisualContext.messages);
+          }
+          const shouldPublishVisualContext = nextVisualContextRunStatus !== visualContextRunStatus;
+          if (shouldPublishVisualContext) {
+            visualContextRunStatus = nextVisualContextRunStatus;
+            const language = callbacks.getPreferredLanguage();
+            const delivered = visualContext.status === "delivered";
+            const partiallyDelivered = visualContext.status === "partially_delivered";
+            const providerUnsupported = visualContext.status === "provider_unsupported";
+            const publishedVisualContext = delivered
+              ? {
+                  ...visualContext,
+                  recognition: visualRecognitionObservation ? "observed" as const : "pending" as const,
+                  ...(visualRecognitionObservation
+                    ? {
+                        observationSummary: visualRecognitionObservation.summary,
+                        observationId: visualRecognitionObservation.observationId,
+                      }
+                    : {}),
+                }
+              : { ...visualContext, recognition: "unverified" as const };
+            const alreadyObserved = delivered && !!visualRecognitionObservation;
+            emitTurnEvent({
+              type: "progress.updated",
+              threadId: eventThreadId,
+              turnId: eventTurnId,
+              timestampMs: Date.now(),
+              progress: {
+                phase: delivered ? "understanding" : "blocked",
+                title: language === "zh"
+                  ? delivered
+                    ? alreadyObserved ? "模型已报告截图观察" : "正在识别截图证据"
+                    : providerUnsupported
+                    ? "当前模型或端点不支持截图"
+                    : partiallyDelivered
+                    ? "截图仅部分随请求发送"
+                    : "截图未随请求发送"
+                  : delivered
+                  ? alreadyObserved ? "Model reported a screenshot observation" : "Inspecting screenshot evidence"
+                  : providerUnsupported
+                  ? "Current model or endpoint does not support screenshots"
+                  : partiallyDelivered
+                  ? "Screenshots only partially sent"
+                  : "Screenshots were not sent",
+                status: delivered ? alreadyObserved ? "done" : "running" : "failed",
+                audience: "user",
+                summary: language === "zh"
+                  ? delivered
+                    ? alreadyObserved
+                      ? visualRecognitionObservation!.summary
+                      : `${visualContext.deliveredImageParts} 张截图已作为视觉内容实际送入模型请求；模型会结合其可见内容继续分析，但送达本身不冒充视觉结论。`
+                    : providerUnsupported
+                    ? `兼容重试已移除 ${visualContext.omittedImageParts || visualContext.expectedImageParts} 张截图并明确标记为未提供；MAIN 不会把本轮文本计为截图识别证据。`
+                    : `预期发送 ${visualContext.expectedImageParts} 张截图，实际送达 ${visualContext.deliveredImageParts} 张；未送达部分不会作为视觉证据。`
+                  : delivered
+                  ? alreadyObserved
+                    ? visualRecognitionObservation!.summary
+                    : `${visualContext.deliveredImageParts} screenshot${visualContext.deliveredImageParts === 1 ? "" : "s"} were included as actual visual content for model analysis. Delivery alone is not promoted to a visual conclusion.`
+                  : providerUnsupported
+                  ? `Compatibility retry omitted ${visualContext.omittedImageParts || visualContext.expectedImageParts} screenshot${(visualContext.omittedImageParts || visualContext.expectedImageParts) === 1 ? "" : "s"} and marked them unavailable. MAIN will not count the resulting text as screenshot recognition evidence.`
+                  : `Expected ${visualContext.expectedImageParts} screenshot${visualContext.expectedImageParts === 1 ? "" : "s"}, but ${visualContext.deliveredImageParts} reached the model. Missing images are not visual evidence.`,
+                tool: "visual_context",
+                canonicalTarget: `images:${visualContext.expectedImageParts}`,
+                dedupeKey: `visual-context:${eventTurnId}`,
+                visualContext: publishedVisualContext,
+              },
+            });
+          }
+        }
+        if (turnInputContextSignals.imageParts > 0) {
+          const parsedVisualRecognition = parseVisualContextRecognition({
+            text: streamResult.content,
+            expectedTurnId: eventTurnId,
+            expectedImageParts: turnInputContextSignals.imageParts,
+            // Recognition belongs to the exact provider request that produced
+            // this response. A prior delivered request cannot authorize a
+            // marker emitted after later context trimming removed the image.
+            deliveryStatus: currentVisualContextDelivery.status,
+          });
+          const stripVisualProtocol = (text: string | undefined): string | undefined =>
+            typeof text === "string"
+              ? parseVisualContextRecognition({
+                  text,
+                  expectedTurnId: eventTurnId,
+                  expectedImageParts: turnInputContextSignals.imageParts,
+                  deliveryStatus: "not_delivered",
+                }).cleanedText
+              : text;
+          if (
+            parsedVisualRecognition.cleanedText !== streamResult.content ||
+            (typeof streamResult.actionableContent === "string" &&
+              stripVisualProtocol(streamResult.actionableContent) !== streamResult.actionableContent) ||
+            (typeof streamResult.semanticContent === "string" &&
+              stripVisualProtocol(streamResult.semanticContent) !== streamResult.semanticContent) ||
+            (typeof streamResult.reasoningContent === "string" &&
+              stripVisualProtocol(streamResult.reasoningContent) !== streamResult.reasoningContent)
+          ) {
+            streamResult = {
+              ...streamResult,
+              content: parsedVisualRecognition.cleanedText,
+              actionableContent: stripVisualProtocol(streamResult.actionableContent),
+              semanticContent: stripVisualProtocol(streamResult.semanticContent),
+              reasoningContent: stripVisualProtocol(streamResult.reasoningContent),
+            };
+          }
+          const observation = parsedVisualRecognition.observation;
+          if (
+            observation &&
+            observation.observationId !== visualRecognitionObservation?.observationId
+          ) {
+            visualRecognitionObservation = observation;
+            const language = callbacks.getPreferredLanguage();
+            const visualContext = {
+              status: "delivered" as const,
+              expectedImageParts: observation.imageCount,
+              deliveredImageParts: observation.imageCount,
+              omittedImageParts: 0,
+              recognition: "observed" as const,
+              observationSummary: observation.summary,
+              observationId: observation.observationId,
+            };
+            emitTurnEvent({
+              type: "progress.updated",
+              threadId: eventThreadId,
+              turnId: eventTurnId,
+              timestampMs: Date.now(),
+              progress: {
+                phase: "understanding",
+                title: language === "zh" ? "模型已报告截图观察" : "Model reported a screenshot observation",
+                status: "done",
+                audience: "user",
+                summary: observation.summary,
+                evidence: observation.summary,
+                tool: "visual_context",
+                canonicalTarget: `images:${observation.imageCount}`,
+                sourceToolCallIds: [observation.observationId],
+                dedupeKey: `visual-context:${eventTurnId}`,
+                visualContext,
+              },
+            });
+            callbacks.onDebugEvent?.("agent.visual_context_observed", {
+              turnId: eventTurnId,
+              imageCount: observation.imageCount,
+              observationId: observation.observationId,
+              summaryChars: observation.summary.length,
+              evidenceMeaning: observation.evidenceMeaning,
+            });
+          }
+        }
         if (streamResult.usage) {
           callbacks.onModelUsage?.(streamResult.usage);
         }
@@ -574,7 +760,6 @@ export class AgentOrchestrator {
           streamRuntimeState: loopState.streamRuntimeState,
           noToolRuntimeState: loopState.noToolRuntimeState,
           planRuntimeState: loopState.planRuntimeState,
-          approvedPlanRecoveryState: loopState.approvedPlanRecoveryState,
           recoveryPromptState: loopState.recoveryPromptState,
           evidenceRuntimeState: loopState.evidenceRuntimeState,
           loopGuardRuntimeState: loopState.loopGuardRuntimeState,
@@ -596,6 +781,9 @@ export class AgentOrchestrator {
         applyAssistantIterationMutableState(loopState, assistantIterationPhase);
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (assistantIterationPhase.status === "stopped") {
+          if (turnEvents.hasStagedTurnCompletion()) {
+            return;
+          }
           const pauseReason = workflowMode === "plan" && !callbacks.getIsPlanApproved() && callbacks.getStatus() === "pending_review"
             ? "plan_review_required"
             : "assistant_stopped";
@@ -640,7 +828,6 @@ export class AgentOrchestrator {
           managedAgentMessages: messagesSentToLLM,
           snapshotContextLimit,
           repairExecutionRequestInChat,
-          effectiveExecuteRecoveryFileRead,
           recoveryActionContract,
           hooksConfig,
           turnInputContextSignals,
@@ -653,7 +840,6 @@ export class AgentOrchestrator {
           recoveryPromptState: loopState.recoveryPromptState,
           unityMcpRuntimeState: loopState.unityMcpRuntimeState,
           evidenceRuntimeState: loopState.evidenceRuntimeState,
-          approvedPlanRecoveryState: loopState.approvedPlanRecoveryState,
           toolExecutionRuntimeState: loopState.toolExecutionRuntimeState,
           failedToolCallCounts: loopState.loopGuardRuntimeState.failedToolCallCounts,
           buildCurrentTaskTargetingProfile,
@@ -668,14 +854,13 @@ export class AgentOrchestrator {
           emitPlanExecutionProgress,
           activateExecuteRecovery,
           activateChatFinalSynthesis,
-          continueApprovedPlanWithStrategySwitch,
-          pauseApprovedPlanNoProgressLoop,
           pauseForReviewablePlanArtifact,
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);
         publishExecuteRecoveryState();
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (toolIterationPhase.status === "goal_completed") {
+          turnEvents.stageTurnCompletion(emitTurnCompletedEvent);
           callbacks.onDebugEvent?.("goal_inner_loop_evidence_boundary", {
             iteration,
             reason: "goal_tool_result_checkpoint_completed",
@@ -740,6 +925,8 @@ export class AgentOrchestrator {
           sawExecuteOperationEvidence:
             loopState.evidenceRuntimeState.sawExecuteOperationEvidence,
           executeRecoveryMode: loopState.executeRecoveryState.mode,
+          executeRecoveryState: loopState.executeRecoveryState,
+          transactionId: eventTurnId,
           emitPlanExecutionProgress,
           emitRunPausedEvent,
         });

@@ -4,7 +4,6 @@ import type { StreamResult } from "../../streaming";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { OrchestratorCallbacks, ToolCallToExecute } from "../types";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import { handleAssistantCompletionPhase } from "./assistantCompletionPhase";
 import { handleAssistantDisplayActionPhase } from "./assistantDisplayActionPhase";
 import { handleAssistantOutputPhase } from "./assistantOutputPhase";
@@ -37,7 +36,6 @@ type EmitTurnEvent = Parameters<typeof handleAssistantCompletionPhase>[0]["emitT
 type AssistantIterationBaseResult = {
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   unityMcpRuntimeState: UnityMcpRuntimeState;
@@ -83,7 +81,6 @@ export async function handleAssistantIterationPhase(input: {
   streamRuntimeState: AgentLoopStreamRuntimeState;
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   loopGuardRuntimeState: AgentLoopGuardRuntimeState;
@@ -104,7 +101,6 @@ export async function handleAssistantIterationPhase(input: {
 }): Promise<AssistantIterationPhaseResult> {
   let noToolRuntimeState = input.noToolRuntimeState;
   let planRuntimeState = input.planRuntimeState;
-  let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
   let evidenceRuntimeState = input.evidenceRuntimeState;
   let unityMcpRuntimeState = input.unityMcpRuntimeState;
@@ -154,7 +150,6 @@ export async function handleAssistantIterationPhase(input: {
         input.evidenceRuntimeState.recentSuccessfulProjectWrite,
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
       recoveryPromptState,
       iterationContext,
       emitTurnEvent: input.emitTurnEvent,
@@ -168,8 +163,6 @@ export async function handleAssistantIterationPhase(input: {
     assistantStreamPostProcessingPhase.noToolRuntimeState;
   planRuntimeState =
     assistantStreamPostProcessingPhase.planRuntimeState;
-  approvedPlanRecoveryState =
-    assistantStreamPostProcessingPhase.approvedPlanRecoveryState;
   recoveryPromptState =
     assistantStreamPostProcessingPhase.recoveryPromptState;
   if (assistantStreamPostProcessingPhase.status !== "completed") {
@@ -177,7 +170,6 @@ export async function handleAssistantIterationPhase(input: {
       status: assistantStreamPostProcessingPhase.status,
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
       recoveryPromptState,
       evidenceRuntimeState,
       unityMcpRuntimeState,
@@ -224,7 +216,6 @@ export async function handleAssistantIterationPhase(input: {
       status: assistantDisplayActionPhase.status,
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
       recoveryPromptState,
       evidenceRuntimeState,
       unityMcpRuntimeState,
@@ -251,7 +242,6 @@ export async function handleAssistantIterationPhase(input: {
       status: "continue",
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
       recoveryPromptState,
       evidenceRuntimeState,
       unityMcpRuntimeState,
@@ -295,7 +285,6 @@ export async function handleAssistantIterationPhase(input: {
     turnInputContextSignals: input.turnInputContextSignals,
     noToolRuntimeState,
     planRuntimeState,
-    approvedPlanRecoveryState,
     evidenceRuntimeState,
     recoveryPromptState,
     activateChatFinalSynthesis: input.activateChatFinalSynthesis,
@@ -303,8 +292,6 @@ export async function handleAssistantIterationPhase(input: {
   });
   noToolRuntimeState = assistantOutputPhase.noToolRuntimeState;
   planRuntimeState = assistantOutputPhase.planRuntimeState;
-  approvedPlanRecoveryState =
-    assistantOutputPhase.approvedPlanRecoveryState;
   evidenceRuntimeState = assistantOutputPhase.evidenceRuntimeState;
   recoveryPromptState = assistantOutputPhase.recoveryPromptState;
   if (assistantOutputPhase.status !== "completed") {
@@ -312,7 +299,6 @@ export async function handleAssistantIterationPhase(input: {
       status: assistantOutputPhase.status,
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
       recoveryPromptState,
       evidenceRuntimeState,
       unityMcpRuntimeState,
@@ -340,7 +326,6 @@ export async function handleAssistantIterationPhase(input: {
       assistantOutputPhase.shouldSuppressApprovedPlanNoToolText,
     hasStructuredProposal: assistantDisplayActionPhase.hasStructuredProposal,
     currentPlanStageForReview: assistantDisplayActionPhase.currentPlanStageForReview,
-    isApprovedPlanExecutionTurn: assistantDisplayActionPhase.isApprovedPlanExecutionTurn,
     approvedPlanAuditForNoTool: assistantOutputPhase.approvedPlanAuditForNoTool,
     rejectedCompletionClaim: assistantOutputPhase.rejectedCompletionClaim,
     wasTruncated: assistantOutputPhase.wasTruncated,
@@ -348,7 +333,6 @@ export async function handleAssistantIterationPhase(input: {
       evidenceRuntimeState.sawExecuteOperationEvidence,
     normalized,
     streamText,
-    iterationRequestStartedAt: input.iterationRequestStartedAt,
     recentPlanToolActivity: input.recentPlanToolActivity,
     recentToolActivity: input.recentToolActivity,
     attemptedPlanWriteTargets: input.attemptedPlanWriteTargets,
@@ -373,7 +357,6 @@ export async function handleAssistantIterationPhase(input: {
     turnInputContextSignals: input.turnInputContextSignals,
     noToolRuntimeState,
     planRuntimeState,
-    approvedPlanRecoveryState,
     unityConsoleDiagnosticsRequested: input.unityConsoleDiagnosticsRequested,
     unityConsoleFinalVerificationRequired:
       unityMcpRuntimeState.consoleFinalVerificationRequired,
@@ -390,14 +373,11 @@ export async function handleAssistantIterationPhase(input: {
   });
   noToolRuntimeState = assistantCompletionPhase.noToolRuntimeState;
   planRuntimeState = assistantCompletionPhase.planRuntimeState;
-  approvedPlanRecoveryState =
-    assistantCompletionPhase.approvedPlanRecoveryState;
   if (assistantCompletionPhase.status !== "completed") {
     return {
       status: assistantCompletionPhase.status,
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
       recoveryPromptState,
       evidenceRuntimeState,
       unityMcpRuntimeState,
@@ -408,7 +388,6 @@ export async function handleAssistantIterationPhase(input: {
     status: "completed",
     noToolRuntimeState,
     planRuntimeState,
-    approvedPlanRecoveryState,
     recoveryPromptState,
     evidenceRuntimeState,
     unityMcpRuntimeState,

@@ -1,7 +1,11 @@
 import {
   buildPlanTaskEvidenceAudit,
+  findUnsatisfiedPlanTaskEvidence,
+  inferPlanTaskEvidence,
   isPlanTaskAwaitingBrowserValidation,
   isPlanTaskAwaitingExternalValidation,
+  planTaskHasUnsatisfiedSourceMutationEvidence,
+  requiresPtyObservationForPlanCommand,
   type PlanArtifact,
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressPhase,
@@ -22,11 +26,161 @@ import {
 import { isPlanReadOnlyToolName } from "./planReadOnlyConvergence";
 import {
   buildExecuteEvidenceClosureAudit,
+  scopeExecutionEvidenceLedger,
   type ExecuteEvidenceGap,
 } from "./verificationEvidence";
 import { isWorkspaceMutationToolName } from "./workspaceMutationTools";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
+
+export function hasPendingApprovedPlanSourceMutation(
+  tasks: PlanTask[],
+  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
+): boolean {
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: Array.isArray(tasks) ? tasks : [],
+    evidenceLedger,
+    preserveMissing: true,
+    highlightNext: true,
+  });
+  return audit.remainingTasks.some((task) =>
+    planTaskHasUnsatisfiedSourceMutationEvidence(task, evidenceLedger)
+  );
+}
+
+/**
+ * Start approved execution from the first reviewed obligation instead of
+ * reopening an unconstrained diagnostic turn. The stable recovery surface
+ * still exposes a targeted read when exact source text is genuinely missing;
+ * this checkpoint only fixes the task, target, and next capability.
+ */
+export function resolveApprovedPlanInitialExecutionRecovery(
+  tasks: PlanTask[],
+  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
+): ForcedExecuteRecoveryRuntimeState | null {
+  const pending = (Array.isArray(tasks) ? tasks : []).filter((task) =>
+    task.status !== "completed" && task.evidenceStatus !== "satisfied"
+  );
+  for (const task of pending) {
+    const planTaskId = String(task.id || "").trim();
+    const requirementRef = String(task.requirementRef || planTaskId).trim();
+    const taskCheckpointIdentity = {
+      ...(planTaskId ? { planTaskId } : {}),
+      ...(requirementRef ? { requirementRef } : {}),
+    };
+    const evidence = task.evidence && task.evidence.length > 0
+      ? task.evidence
+      : inferPlanTaskEvidence(task.text, task.commands || []);
+    if (planTaskHasUnsatisfiedSourceMutationEvidence(task, evidenceLedger)) {
+      const target = evidence
+        .find((item) => item.kind === "file" && !isInternalPlanPath(item.value))
+        ?.value?.trim();
+      if (target) {
+        return {
+          mode: "mutation_first",
+          reason: "approved_plan_execution_handoff",
+          expectedTarget: target,
+          attempts: 0,
+          phaseNoProgressCount: 0,
+          protocolNoProgressCount: 0,
+          protocolNoProgressFingerprint: null,
+          readLease: null,
+          sourceObservationKey: null,
+          decisionCheckpoint: {
+            expectedTarget: target,
+            sourceObservationKey: null,
+            nextRequiredCapability: "mutation",
+            ...taskCheckpointIdentity,
+          },
+        };
+      }
+    }
+
+    const unsatisfiedEvidence = findUnsatisfiedPlanTaskEvidence(task, evidenceLedger);
+    const command = unsatisfiedEvidence.find((item) => item.kind === "cmd")?.value?.trim();
+    if (command && requiresPtyObservationForPlanCommand(command)) {
+      return {
+        mode: "validation_only",
+        reason: "approved_plan_long_process_handoff",
+        expectedTarget: null,
+        attempts: 0,
+        phaseNoProgressCount: 0,
+        protocolNoProgressCount: 0,
+        protocolNoProgressFingerprint: null,
+        readLease: null,
+        sourceObservationKey: null,
+        decisionCheckpoint: {
+          expectedTarget: null,
+          sourceObservationKey: null,
+          nextRequiredCapability: "launch_long_process",
+          ...taskCheckpointIdentity,
+        },
+      };
+    }
+    if (command) {
+      return {
+        mode: "finite_validation_only",
+        reason: "approved_plan_command_handoff",
+        expectedTarget: null,
+        attempts: 0,
+        phaseNoProgressCount: 0,
+        protocolNoProgressCount: 0,
+        protocolNoProgressFingerprint: null,
+        readLease: null,
+        sourceObservationKey: null,
+        decisionCheckpoint: {
+          expectedTarget: null,
+          sourceObservationKey: null,
+          nextRequiredCapability: "validation",
+          ...taskCheckpointIdentity,
+        },
+      };
+    }
+
+    if (unsatisfiedEvidence.some((item) => item.kind === "dev_server_url")) {
+      return {
+        mode: "validation_only",
+        reason: "approved_plan_dev_server_handoff",
+        expectedTarget: null,
+        attempts: 0,
+        phaseNoProgressCount: 0,
+        protocolNoProgressCount: 0,
+        protocolNoProgressFingerprint: null,
+        readLease: null,
+        sourceObservationKey: null,
+        decisionCheckpoint: {
+          expectedTarget: null,
+          sourceObservationKey: null,
+          nextRequiredCapability: "launch_long_process",
+          ...taskCheckpointIdentity,
+        },
+      };
+    }
+
+    if (unsatisfiedEvidence.some((item) =>
+      item.kind === "browser_dom" || item.kind === "browser_screenshot"
+    )) {
+      return {
+        mode: "validation_only",
+        reason: "approved_plan_browser_handoff",
+        expectedTarget: null,
+        attempts: 0,
+        phaseNoProgressCount: 0,
+        protocolNoProgressCount: 0,
+        protocolNoProgressFingerprint: null,
+        readLease: null,
+        sourceObservationKey: null,
+        decisionCheckpoint: {
+          expectedTarget: null,
+          sourceObservationKey: null,
+          nextRequiredCapability: "browser_validation",
+          ...taskCheckpointIdentity,
+        },
+      };
+    }
+  }
+  return null;
+}
 
 export interface ExecuteMaxIterationsRecoveryDecision {
   mode: ExecuteRecoveryMode;
@@ -50,30 +204,27 @@ const PTY_OBSERVATION_TOOL_NAMES = new Set([
 export function resolveExecuteMaxIterationsRecoveryDecision(input: {
   evidenceLedger: PlanExecutionEvidenceEntry[];
   recoveryState?: ForcedExecuteRecoveryRuntimeState | null;
+  transactionId?: string | null;
 }): ExecuteMaxIterationsRecoveryDecision {
-  const ledger = Array.isArray(input.evidenceLedger) ? input.evidenceLedger : [];
+  const ledger = scopeExecutionEvidenceLedger(
+    Array.isArray(input.evidenceLedger) ? input.evidenceLedger : [],
+    input.transactionId,
+  );
   const closure = buildExecuteEvidenceClosureAudit({
     ledger,
     validationExpected: true,
   });
 
-  const postMutationReadLease = input.recoveryState?.readLease;
   if (
-    postMutationReadLease?.purpose === "post_mutation_verify" &&
-    (postMutationReadLease.state === "available" || postMutationReadLease.state === "active")
+    closure.gap === "validation_required" ||
+    closure.gap === "validation_after_mutation_required"
   ) {
-    return {
-      mode: "validation_only",
-      gap: closure.gap,
-      reason: "max_iterations_post_mutation_check_required",
-    };
-  }
-
-  if (closure.gap === "validation_after_mutation_required") {
     return {
       mode: "finite_validation_only",
       gap: closure.gap,
-      reason: "max_iterations_validation_after_mutation",
+      reason: closure.gap === "validation_required"
+        ? "max_iterations_validation_required"
+        : "max_iterations_validation_after_mutation",
     };
   }
   if (
@@ -487,12 +638,17 @@ function resolveActivePlanTask(input: {
   recentToolActivity: PlanToolActivitySummary[];
   currentTool?: string;
   latestEvidence?: string;
+  includeCompleted?: boolean;
 }): PlanTask | undefined {
   const targets = collectActivityTargets(input);
   let bestTask: PlanTask | undefined;
   let bestScore = 0;
   let bestIndex = -1;
   input.tasks.forEach((task, index) => {
+    if (
+      !input.includeCompleted &&
+      (task.status === "completed" || task.evidenceStatus === "satisfied")
+    ) return;
     const score = scoreTaskForActivity(task, targets);
     if (score < 3) return;
     if (!bestTask || score > bestScore || (score === bestScore && index > bestIndex)) {
@@ -672,6 +828,7 @@ export function buildPlanExecutionProgressUpdate(input: {
     recentToolActivity: input.recentToolActivity,
     currentTool: input.currentTool,
     latestEvidence: input.latestEvidence || recentEvidence,
+    includeCompleted: input.phase === "tool_done",
   });
   const derivedCurrentTask = activeTask
     ? summarizeTask(activeTask)

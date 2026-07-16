@@ -140,7 +140,6 @@ export function resolveAssistantTurnDisplayDecision(input: {
   const suppressApprovedPlanExecutionReplyOptions =
     shouldSuppressApprovedPlanExecutionReplyOptions({
       replyOptions: normalizedReplyOptions,
-      workflowMode: input.workflowMode,
       isPlanApproved: input.isPlanApproved,
       planStage: currentPlanStageForReview,
       toolCallCount: input.effectiveToolCallCount,

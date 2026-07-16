@@ -19,8 +19,7 @@ export interface SubmitPlanExecutionResumeOptions {
   reuseCurrentTurn: boolean;
   turnIdOverride?: string;
   preservePlanState: true;
-  resolvedIntent: "plan";
-  runtimeIntentOverride: "execute";
+  resolvedIntent: "execute";
   commandDirective: CommandDirective | null | undefined;
   executionConsentGranted: true;
   skipIntentResolution: true;
@@ -217,8 +216,7 @@ export async function runSubmitPlanExecutionResumeEffect<TState extends SubmitPl
       reuseCurrentTurn: !!continuationTurnId,
       turnIdOverride: continuationTurnId,
       preservePlanState: true,
-      resolvedIntent: "plan",
-      runtimeIntentOverride: "execute",
+      resolvedIntent: "execute",
       commandDirective: input.commandDirective,
       executionConsentGranted: true,
       skipIntentResolution: true,

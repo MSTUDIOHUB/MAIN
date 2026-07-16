@@ -515,22 +515,22 @@ test("real MD Viewer trace keeps one semantic evidence bundle through determinis
   assert.equal(mismatched.reason, "evidence_bundle_hash_mismatch");
 });
 
-test("line excerpts without a confirmed defect cannot auto-materialize a symptom-only plan", () => {
+test("grounded model inference is reviewable while deterministic auto-materialization stays strict", () => {
   const bundle = buildPlanEvidenceBundle({
     turnId: "turn-md-viewer-excerpt-only",
-    objective: "修复双击 Markdown 打开空白窗口和工具栏打开按钮失效的问题。",
+    objective: "修复 Markdown Viewer 工具栏按钮没有真实功能的问题。",
     evidenceRecords: [
       {
         tool: "read_file",
-        target: "src-tauri/src/main.rs",
+        target: "src/main.js",
         status: "succeeded",
-        summary: "L21: Store file paths for later processing; L23: FILES.get_or_init(...)",
+        summary: "function initToolbar maps new-btn, open-btn, and save-btn to click actions.",
       },
       {
         tool: "read_file",
         target: "src/components/toolbar.js",
         status: "succeeded",
-        summary: "工具栏组件导入 invoke，并定义 handleOpenFile。",
+        summary: "function renderToolbar creates controls with btn-new, btn-open, and btn-save IDs.",
       },
     ],
   });
@@ -546,6 +546,87 @@ test("line excerpts without a confirmed defect cannot auto-materialize a symptom
     contractMismatchKinds: [],
     unresolvedContractKinds: [],
   });
+
+  const modelAuthoredDraft = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# 修复工具栏行为",
+      "",
+      "## 用户目标",
+      "- 修复 Markdown Viewer 工具栏按钮没有真实功能的问题。",
+      "",
+      "## 已确认证据",
+      "- `src/main.js` 绑定 `new-btn`、`open-btn`、`save-btn`。",
+      "- `src/components/toolbar.js` 渲染 `btn-new`、`btn-open`、`btn-save`。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/components/toolbar.js` 的三个控件 ID，使其与 `src/main.js` 的绑定契约一致。",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 不修改公共 API。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm run build` 并执行桌面打开交互验证。",
+      "",
+      "## 假设与默认值",
+      "- 保持三个按钮现有回调行为不变。",
+    ].join("\n"),
+    userGoal: bundle.objective,
+    evidenceRecords: bundle.facts.map((fact) => ({
+      tool: fact.tool,
+      target: fact.target,
+      status: "succeeded",
+      summary: fact.summary,
+    })),
+    files: bundle.changeTargets,
+    language: "zh",
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+  });
+
+  assert.equal(modelAuthoredDraft.ok, true, modelAuthoredDraft.reason);
+  assert.equal(modelAuthoredDraft.source, "visible_plan");
+
+  const deterministicDraft = materializePlanArtifactFromVisibleText({
+    visibleText: modelAuthoredDraft.content,
+    sourceHint: "deterministic_evidence",
+    userGoal: bundle.objective,
+    evidenceRecords: bundle.facts.map((fact) => ({
+      tool: fact.tool,
+      target: fact.target,
+      status: "succeeded",
+      summary: fact.summary,
+    })),
+    files: bundle.changeTargets,
+    language: "zh",
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+  });
+
+  assert.equal(deterministicDraft.ok, false);
+  assert.equal(
+    deterministicDraft.reason,
+    "insufficient_grounded_evidence:change_targets_lack_confirmed_rationale",
+  );
+  assert.equal(deterministicDraft.quality?.recoveryAction, "targeted_evidence");
+});
+
+test("source-derived structured facts survive bundle construction", () => {
+  const bundle = buildPlanEvidenceBundle({
+    objective: "检查 src/main.js 并规划初始化修复。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "bounded source excerpt",
+      facts: [
+        "event_dom_listener_contract(DOMContentLoaded)",
+        "listener_calls(initToolbar,initEditor)",
+      ],
+    }],
+  });
+
+  assert.match(bundle.facts[0]?.summary || "", /event_dom_listener_contract\(DOMContentLoaded\)/);
+  assert.match(bundle.facts[0]?.summary || "", /listener_calls\(initToolbar,initEditor\)/);
 });
 
 test("error-handling strings from the logged MD Viewer run cannot become a reviewable repair plan", () => {
@@ -3237,6 +3318,40 @@ test("actionable plan quality rejects implementation-heavy code dumps", () => {
   assert.equal(validation.reason, "excessive_plan_code_dump");
 });
 
+test("a bounded implementation example does not invalidate an otherwise reviewable plan", () => {
+  const content = [
+    "# 计划",
+    "",
+    "## 摘要",
+    "- 修复已确认的控件绑定不一致。",
+    "",
+    "## 用户目标",
+    "- 让工具栏控件触发已有回调。",
+    "",
+    "## 已确认证据",
+    "- `src/components/toolbar.js` 与 `src/main.js` 使用不同的控件标识符。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/components/toolbar.js` 的标识符，使其与 `src/main.js` 的绑定一致。",
+    "",
+    "```javascript",
+    "root.innerHTML = '<button id=\"create-button\">Create</button>';",
+    "```",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 无公共 API 变化。",
+    "",
+    "## 测试方案",
+    "- 运行构建并在浏览器点击 Create，断言页面状态变化。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有回调行为不变。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason);
+});
+
 test("implementation-heavy plan drafts are deterministically compacted without another model pass", () => {
   const largeCode = "const selected = await open({ multiple: false });\n".repeat(32);
   const result = materializePlanArtifactFromVisibleText({
@@ -3283,19 +3398,19 @@ test("MD Viewer trace derives grounded targets from semantic source reads and ma
       tool: "read_file",
       target: "src-tauri/src/main.rs",
       status: "succeeded",
-      summary: "The Tauri builder registers open_files and stores FILES and FILE_CONTENTS, while the setup chain contains the application event wiring.",
+      summary: "The Tauri builder registers open_files but does not forward the application file-open event payload to the frontend loader.",
     },
     {
       tool: "read_file",
       target: "src/main.js",
       status: "succeeded",
-      summary: "window.addEventListener('file-open', handleFileOpen) is the frontend entry point for an externally opened Markdown file.",
+      summary: "window.addEventListener('file-open', handleFileOpen) uses a DOM listener and never installs the required Tauri event listener.",
     },
     {
       tool: "read_file",
       target: "src/components/toolbar.js",
       status: "succeeded",
-      summary: "openFiles invokes the Tauri open_files command and then forwards selected file data to the editor loading flow.",
+      summary: "openFiles invokes the Tauri open_files command but does not await the file-dialog result before forwarding data to the editor loading flow.",
     },
   ];
   const bundle = buildPlanEvidenceBundle({

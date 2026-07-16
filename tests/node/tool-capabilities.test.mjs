@@ -163,10 +163,6 @@ test("intent filtering exposes read-only tools for chat and write/shell tools fo
     ["read_file", "write_file", "web_search"],
   );
   assert.deepEqual(
-    filterToolDefinitionsForIntent(tools, "plan", registry, { planApproved: true }).map((item) => item.function.name),
-    ["read_file", "write_file", "run_command", "web_search"],
-  );
-  assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "plan", registry, { runtimeIntent: "execute" }).map((item) => item.function.name),
     ["read_file", "write_file", "run_command", "web_search"],
   );
@@ -213,10 +209,6 @@ test("approved execution exposes browser validation while keeping it approval ga
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "plan", registry).map((item) => item.function.name),
     ["read_file", "write_file"],
-  );
-  assert.deepEqual(
-    filterToolDefinitionsForIntent(tools, "plan", registry, { planApproved: true }).map((item) => item.function.name),
-    ["read_file", "write_file", "browser_evaluate"],
   );
   assert.deepEqual(
     filterToolDefinitionsForIntent(tools, "execute", registry).map((item) => item.function.name),

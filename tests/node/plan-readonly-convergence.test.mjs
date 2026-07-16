@@ -95,18 +95,18 @@ function createPlanConvergenceCallbacks(language = "en") {
   };
 }
 
-test("plan evidence readiness requires observed user context and targeted reads", () => {
+test("plan evidence readiness requires model-visible visual context and targeted reads", () => {
   assert.deepEqual(
     assessPlanEvidenceReadiness({
       userContext: { imageParts: 1 },
-      hasObservedUserContext: false,
+      hasGroundedVisualContext: false,
       recentToolActivity: [
         { name: "grep_search", target: "csv/import/loadData", status: "succeeded" },
       ],
     }),
     {
       status: "needs_observation",
-      reason: "provided_context_not_observed",
+      reason: "visual_context_not_model_visible",
       successfulTargetedReads: 0,
       successfulSearches: 1,
       semanticFacts: 0,
@@ -116,7 +116,7 @@ test("plan evidence readiness requires observed user context and targeted reads"
 
   assert.equal(
     assessPlanEvidenceReadiness({
-      hasObservedUserContext: true,
+      hasGroundedVisualContext: true,
       recentToolActivity: [
         { name: "grep_search", target: "csv/import/loadData", status: "succeeded" },
       ],
@@ -126,7 +126,7 @@ test("plan evidence readiness requires observed user context and targeted reads"
 
   assert.equal(
     assessPlanEvidenceReadiness({
-      hasObservedUserContext: true,
+      hasGroundedVisualContext: true,
       recentToolActivity: [
         { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
       ],
@@ -136,13 +136,42 @@ test("plan evidence readiness requires observed user context and targeted reads"
 
   assert.equal(
     assessPlanEvidenceReadiness({
-      hasObservedUserContext: true,
+      hasGroundedVisualContext: true,
       recentToolActivity: [
         { name: "grep_search", target: "csv/import/loadData", status: "succeeded" },
         { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
       ],
     }).status,
     "ready_for_plan",
+  );
+});
+
+test("provided files are grounded by exact successful reads, not assistant claims", () => {
+  assert.equal(
+    assessPlanEvidenceReadiness({
+      userContext: { attachedFilePaths: ["logs/main-debug.log"] },
+      hasGroundedVisualContext: false,
+      recentToolActivity: [
+        { name: "grep_search", target: "main-debug", status: "succeeded" },
+      ],
+    }).reason,
+    "provided_file_not_read",
+  );
+
+  assert.notEqual(
+    assessPlanEvidenceReadiness({
+      userContext: { attachedFilePaths: ["logs/main-debug.log"] },
+      hasGroundedVisualContext: false,
+      recentToolActivity: [
+        {
+          name: "read_file",
+          target: "logs/main-debug.log",
+          status: "succeeded",
+          detail: "The log records a deterministic execution stop at the completion gate",
+        },
+      ],
+    }).reason,
+    "provided_file_not_read",
   );
 });
 
@@ -281,7 +310,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     batchCount: 2,
     toolCount: 2,
     userContext: { imageParts: 2 },
-    hasObservedUserContext: false,
+    hasGroundedVisualContext: false,
     recentToolActivity: [
       { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
@@ -293,7 +322,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     batchCount: 2,
     toolCount: 2,
     userContext: { imageParts: 2 },
-    hasObservedUserContext: true,
+    hasGroundedVisualContext: true,
     recentToolActivity: [
       { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
     ],
@@ -305,7 +334,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     batchCount: 2,
     toolCount: 2,
     userContext: { imageParts: 2 },
-    hasObservedUserContext: true,
+    hasGroundedVisualContext: true,
     recentToolActivity: [
       { name: "grep_search", target: "csv|dashboard", status: "succeeded" },
       { name: "read_file", target: "src/hooks/useCsvParser.ts", status: "succeeded", detail: "normalizeCsvOrder currently maps creator but never assigns creatorName consumed by Dashboard" },
@@ -318,7 +347,7 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     batchCount: 1,
     toolCount: 6,
     userContext: { attachedFilePaths: ["logs/main-debug.log"] },
-    hasObservedUserContext: true,
+    hasGroundedVisualContext: true,
     recentToolActivity: [
       { name: "read_file", target: "logs/main-debug.log", status: "succeeded", detail: "log records the exact plan_generation_failed stop after evidence materialization rejection" },
     ],
@@ -330,11 +359,11 @@ test("plan read-only convergence tightens when user supplied screenshots or file
     batchCount: 1,
     toolCount: 5,
     userContext: { mentionedFilePaths: ["src/App.tsx"] },
-    hasObservedUserContext: true,
+    hasGroundedVisualContext: true,
     recentToolActivity: [
       { name: "grep_search", target: "App", status: "succeeded" },
     ],
-  }), true);
+  }), false);
 });
 
 test("plan convergence helper emits the first convergence prompt and updates counters", () => {
@@ -508,10 +537,12 @@ test("plan quality recovery routes rejected plan drafts to targeted evidence", (
   assert.equal(result.planLastQualityGateReason, "missing_plan_required_sections:read_evidence");
   assert.deepEqual(result.planLastMissingSections, ["Read Evidence"]);
   assert.equal(result.planArtifactQualityRejected, true);
-  assert.equal(result.pendingPlanRuntimeRecoveryPrompt, null);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.equal(result.planEvidenceRecoveryObjective, "deterministic_closure");
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.deepEqual(phases, [{
     phase: "needs_evidence",
-    reason: "missing_plan_required_sections:read_evidence",
+    reason: "bundle_not_ready",
     status: "running",
   }]);
 });
@@ -562,6 +593,59 @@ test("plan quality recovery keeps structural rewrites out of evidence recovery",
   }]);
 });
 
+test("grounded source evidence preserves an auto-scaffold recovery without reopening reads", () => {
+  const harness = createPlanConvergenceCallbacks("zh");
+  const phases = [];
+  const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    iteration: 8,
+    quality: {
+      ok: false,
+      reason: "insufficient_actionable_plan_signals",
+      missingSections: [],
+      recoveryAction: "auto_scaffold",
+      canAutoRepair: false,
+    },
+    planRuntimePhase: "drafting",
+    recentPlanToolActivity: [
+      {
+        name: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+        detail: "initToolbar registers the New Open and Save button handlers during application initialization",
+      },
+      {
+        name: "read_file",
+        target: "src/components/toolbar.js",
+        status: "succeeded",
+        detail: "renderToolbar creates the New Open and Save controls and exposes their callback contract",
+      },
+    ],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "按钮没有真实功能，基于已读源码形成可执行修复计划。",
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planArtifactQualityRejected: false,
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: false,
+    planEvidenceRecoveryObjective: "none",
+    planEvidenceRecoveryPasses: 0,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  });
+
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
+  assert.equal(result.planEvidenceRecoveryObjective, "none");
+  assert.equal(result.planAutoScaffoldPromptIssued, true);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_AUTO_SCAFFOLD/);
+  assert.deepEqual(phases, [{
+    phase: "needs_rewrite",
+    reason: "auto scaffold after quality gate",
+    status: "running",
+  }]);
+});
+
 test("visible candidate rejection recovers without poisoning persisted artifact state", () => {
   const harness = createPlanConvergenceCallbacks("zh");
   const phases = [];
@@ -605,7 +689,7 @@ test("visible candidate rejection recovers without poisoning persisted artifact 
   }]);
 });
 
-test("second short diagnostic draft requests evidence instead of forcing an invalid scaffold", () => {
+test("second short diagnostic draft scaffolds from grounded source instead of reopening discovery", () => {
   const harness = createPlanConvergenceCallbacks("zh");
   const phases = [];
   const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
@@ -647,10 +731,11 @@ test("second short diagnostic draft requests evidence instead of forcing an inva
   });
 
   assert.equal(result.planQualityRejectCount, 2);
-  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
-  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
-  assert.equal(phases.at(-1)?.phase, "needs_evidence");
-  assert.equal(phases.at(-1)?.reason, "change_targets_lack_confirmed_rationale");
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
+  assert.equal(result.planAutoScaffoldPromptIssued, true);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_AUTO_SCAFFOLD/);
+  assert.equal(phases.at(-1)?.phase, "needs_rewrite");
+  assert.equal(phases.at(-1)?.reason, "auto scaffold after quality gate");
 });
 
 test("a first rejected draft prioritizes an unresolved contract counterpart over text rewrite", () => {

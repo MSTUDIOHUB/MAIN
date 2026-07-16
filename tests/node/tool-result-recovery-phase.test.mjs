@@ -20,8 +20,11 @@ const toolIterationPhaseSource = fsSync.readFileSync(
 test("tool result recovery phase owns post-tool recovery ordering", () => {
   assert.match(phaseSource, /export async function handleToolResultRecoveryPhase/);
   assert.match(phaseSource, /handlePlanQualityRecoveryAfterToolResults\(\{[\s\S]*?handleNoProgressRecovery\(\{/);
-  assert.match(phaseSource, /appendToolResultsToHistory\(\{[\s\S]*?handleReadFileRepeatLimitRecovery\(\{/);
-  assert.match(phaseSource, /handleCrossIterationReadFileLoopRecovery\(\{[\s\S]*?handleRepeatedEditValidationRecovery\(\{/);
+  assert.match(phaseSource, /handleNoProgressRecovery\(\{[\s\S]*?appendToolResultsToHistory\(\{/);
+  assert.doesNotMatch(
+    phaseSource,
+    /handleReadFileRepeatLimitRecovery|handleCrossIterationReadFileLoopRecovery|handleRepeatedEditValidationRecovery/,
+  );
   assert.match(phaseSource, /handlePlanReadOnlyConvergence\(\{[\s\S]*?pauseForReviewablePlanArtifact/);
   assert.match(phaseSource, /shouldPauseForReviewablePlanArtifactAfterToolResults\(\{[\s\S]*?pauseForReviewablePlanArtifact/);
   assert.match(
@@ -29,19 +32,44 @@ test("tool result recovery phase owns post-tool recovery ordering", () => {
     /pauseForReviewablePlanArtifact\([\s\S]*?post_tool_plan_artifact_write[\s\S]*?planArtifactQualityRejected:\s*planRuntimeState\.planArtifactQualityRejected/,
   );
   assert.match(phaseSource, /handleStrictRepeatGuardRecovery\(\{[\s\S]*?handleTargetProgressLoopRecovery\(\{/);
+  assert.match(
+    phaseSource,
+    /handleStrictRepeatGuardRecovery\(\{[\s\S]*?results:\s*input\.results/,
+    "strict repetition must classify post-partition outcomes before counting a call",
+  );
   assert.match(phaseSource, /handleExecuteConvergencePrompt\(\{[\s\S]*?logAgentEvent\("post_tool_result_continuation"/);
+});
+
+test("parent overlap with an active child joins before generic no-progress accounting", () => {
+  const deferralIndex = phaseSource.indexOf(
+    "shouldJoinPendingSubagentsAfterScopeDeferral(input.results)",
+  );
+  const joinIndex = phaseSource.indexOf(
+    'reason: "scope_conflict"',
+    deferralIndex,
+  );
+  const noProgressIndex = phaseSource.indexOf(
+    "const noProgressRecovery = handleNoProgressRecovery({",
+  );
+
+  assert.notEqual(deferralIndex, -1);
+  assert.notEqual(joinIndex, -1);
+  assert.notEqual(noProgressIndex, -1);
+  assert.ok(deferralIndex < joinIndex);
+  assert.ok(joinIndex < noProgressIndex);
+  assert.match(
+    phaseSource.slice(deferralIndex, noProgressIndex),
+    /appendToolResultsToHistory\(\{[\s\S]*?await joinPendingSubagentsForParent\(\{[\s\S]*?return finish\("continue"\)/,
+  );
 });
 
 test("Goal evidence is checked immediately after tool results enter history", () => {
   const appendIndex = phaseSource.indexOf("appendToolResultsToHistory({", phaseSource.indexOf("handleNoProgressRecovery({"));
   const checkpointIndex = phaseSource.indexOf("evaluateGoalToolResultCheckpoint?.(");
-  const readRecoveryIndex = phaseSource.indexOf("handleReadFileRepeatLimitRecovery({");
 
   assert.notEqual(appendIndex, -1);
   assert.notEqual(checkpointIndex, -1);
-  assert.notEqual(readRecoveryIndex, -1);
   assert.ok(appendIndex < checkpointIndex);
-  assert.ok(checkpointIndex < readRecoveryIndex);
   assert.match(phaseSource, /return finish\("goal_completed"\)/);
   assert.match(orchestratorSource, /toolIterationPhase\.status === "goal_completed"[\s\S]*?goal_inner_loop_evidence_boundary[\s\S]*?return;/);
 });
@@ -60,12 +88,12 @@ test("tool result recovery phase owns runtime state folds", () => {
   assert.match(phaseSource, /applyPlanQualityRuntimeState\(/);
   assert.match(phaseSource, /applyNoProgressTrackingRuntimeState\(/);
   assert.match(phaseSource, /applyToolFailureSignatureRuntimeState\(/);
-  assert.match(phaseSource, /applyCrossIterationReadFileRecoveryState\(/);
-  assert.match(phaseSource, /setRepeatedEditValidationRecoveryAttempts\(/);
+  assert.doesNotMatch(phaseSource, /applyCrossIterationReadFileRecoveryState\(/);
+  assert.doesNotMatch(phaseSource, /setRepeatedEditValidationRecoveryAttempts\(/);
   assert.match(phaseSource, /applyPlanReadOnlyConvergenceRuntimeState\(/);
   assert.match(phaseSource, /applyExecuteConvergencePromptState\(/);
-  assert.match(phaseSource, /approvedPlanRecoveryState = input\.continueApprovedPlanWithStrategySwitch/);
-  assert.match(phaseSource, /approvedPlanRecoveryState,/);
+  assert.match(phaseSource, /activateExecuteRecoveryAndSync\(/);
+  assert.match(phaseSource, /executeRecoveryState,/);
 });
 
 test("approved plan scope blocks recover within the reviewed scope before completion can be audited", () => {
@@ -117,6 +145,17 @@ test("approved plan completion is committed only after closure and active-recove
   assert.ok(recoveryGateIndex < doneIndex);
   assert.ok(doneIndex < completedStageIndex);
   assert.match(phaseSource, /evidenceClosureAudit\.completionAllowed/);
+  assert.match(phaseSource, /if \(input\.callbacks\.getIsPlanApproved\(\)\)/);
+  assert.doesNotMatch(
+    phaseSource,
+    /workflowMode === "plan"\s*&&\s*input\.callbacks\.getIsPlanApproved\(\)/,
+  );
+  const closureCall = phaseSource.slice(closureIndex, recoveryGateIndex);
+  assert.match(closureCall, /mutationExpected:\s*planTasks\.some\(isPlanTaskSourceMutationObligation\)/);
+  assert.match(
+    closureCall,
+    /requiredCommandEvidence:\s*resolveCommandEvidenceRequirements\(\{[\s\S]*?tasks:\s*planTasks,[\s\S]*?getCommandDirective/,
+  );
 });
 
 test("the first decision-complete approved target read atomically enters mutation", () => {
@@ -140,7 +179,8 @@ test("the first decision-complete approved target read atomically enters mutatio
     phaseSource,
     /activateExecuteRecoveryAndSync\(\s*"mutation_first",\s*"approved_plan_target_context_observed",[\s\S]*?expectedTarget: approvedPlanInitialMutationRead\.target,[\s\S]*?sourceObservationKey:/,
   );
-  assert.match(phaseSource, /SOURCE_CONTEXT_LOCKED:[\s\S]*?Do not read or investigate again/);
+  assert.match(phaseSource, /approved_plan_target_context_observed[\s\S]*?nextRequiredCapability:\s*"mutation"/);
+  assert.doesNotMatch(phaseSource, /SOURCE_CONTEXT_LOCKED|Do not read or investigate again|Call exactly one exposed mutation tool/);
 });
 
 test("premature browser validation activates PTY observation recovery before completion auditing", () => {
@@ -188,6 +228,16 @@ test("a long-process result atomically narrows the next turn to PTY observation 
     phaseSource,
     /activateExecuteRecoveryAndSync\(\s*"validation_only",[\s\S]*?nextCapability,[\s\S]*?foregroundGeneration/,
   );
+  assert.match(
+    phaseSource,
+    /executeRecoveryState\.mode === "normal" \|\|\s*currentRecoveryCapability !== devServerRecoveryCapability/,
+    "fresh PTY/browser evidence must be able to replace a stale active command-validation contract",
+  );
+  assert.match(
+    phaseSource,
+    /decisionCheckpoint:[\s\S]*?nextRequiredCapability: nextCapability/,
+    "the lifecycle transition must persist the exact next capability instead of relying on a log-only hint",
+  );
   assert.match(phaseSource, /return finish\("continue"\)/);
 });
 
@@ -212,8 +262,16 @@ test("approved Plan finite command failures split invocation recovery from sourc
   assert.match(phaseSource, /resolveFailedFiniteValidationRecoveryPolicy\(\{/);
   assert.match(phaseSource, /buildFailedFiniteValidationRecoveryPrompt\(\{/);
   assert.match(phaseSource, /failedFiniteValidationOutcome === "validation_failure"[\s\S]*?failedFiniteValidationMatchesPendingPlanEvidence\(\{/);
+  assert.match(phaseSource, /buildFailedValidationRepairReadLease\(\{/);
+  assert.match(phaseSource, /"mutation_first",[\s\S]*?repairReadLease \? \{ readLease: repairReadLease \}/);
+  assert.match(phaseSource, /repairReadLease \? \{ sourceObservationKey: null \}/);
+  assert.match(phaseSource, /nextRequiredCapability: repairReadLease \? "targeted_read" : "mutation"/);
   assert.match(phaseSource, /approved_plan_finite_validation_requires_repair/);
-  assert.match(phaseSource, /clearExecuteRecoveryRuntimeState\(executeRecoveryState\)/);
+  assert.doesNotMatch(
+    phaseSource,
+    /clearExecuteRecoveryRuntimeState\(executeRecoveryState\)/,
+    "a failed validation stays inside the active repair transaction",
+  );
 });
 
 test("tool iteration phase delegates tool-result recovery internals to the phase helper", () => {
@@ -222,7 +280,7 @@ test("tool iteration phase delegates tool-result recovery internals to the phase
   assert.match(toolIterationPhaseSource, /planRuntimeState: toolCallPhase\.planRuntimeState/);
   assert.match(toolIterationPhaseSource, /recoveryPromptState: toolCallPhase\.recoveryPromptState/);
   assert.match(toolIterationPhaseSource, /results: toolCallPhase\.allResults/);
-  assert.match(toolIterationPhaseSource, /approvedPlanRecoveryState: toolResultRecoveryPhase\.approvedPlanRecoveryState/);
+  assert.match(toolIterationPhaseSource, /executeRecoveryState: toolResultRecoveryPhase\.executeRecoveryState/);
   assert.doesNotMatch(orchestratorSource, /handleToolResultRecoveryPhase\(\{/);
   assert.doesNotMatch(orchestratorSource, /appendToolResultsToHistory\(/);
   assert.doesNotMatch(orchestratorSource, /handleNoProgressRecovery\(/);

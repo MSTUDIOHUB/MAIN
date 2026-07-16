@@ -1,7 +1,6 @@
 import type { PlanTaskEvidenceAudit } from "./workflowModels";
 
 export function shouldHandleApprovedPlanExecutionNoTool(input: {
-  workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
   planStage: string;
   toolCallCount: number;

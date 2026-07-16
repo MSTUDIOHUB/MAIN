@@ -1,11 +1,11 @@
 import type { HooksConfig } from "../../hooks";
+import { analyzePtyObservationResult } from "../../devServerRuntime";
 import {
   buildPatchRecoveryReadNoProgressFingerprint,
   isReadOnlyNoProgressDetail,
   readEvidenceSatisfiesRecoveryLease,
   requestedRangeFromReadObservationSignature,
   resolveExecuteRecoveryActionContract,
-  resolveExecutePatchRecoveryTarget,
   type ReadProgressFingerprint,
   type RecoveryActionContract,
 } from "../../executeRecoveryTools";
@@ -16,7 +16,10 @@ import {
   isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
 } from "../../orchestrator";
-import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import {
+  resolveApprovedPlanInitialExecutionRecovery,
+  type PlanToolActivitySummary,
+} from "../../planExecutionRecovery";
 import { extractReadFileWindowMetadata } from "../../readFileWindow";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { TaskOrchestratorPhase, TaskTargetingProfile } from "../../taskTargeting";
@@ -25,6 +28,7 @@ import type { ToolDefinition } from "../../toolSchemas";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import type {
   AgentMessage,
   OrchestratorCallbacks,
@@ -32,21 +36,19 @@ import type {
   ToolCallToExecute,
   ToolExecutionResult,
 } from "../types";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
-import { applyApprovedPlanToolResultRecoveryState } from "./approvedPlanRecoveryRuntime";
 import type { AgentLoopEvidenceRuntimeState } from "./evidenceRuntimeState";
 import {
   applyRecentSuccessfulProjectWriteRuntimeState,
   markExecuteOperationEvidenceRuntimeState,
 } from "./evidenceRuntimeState";
 import {
+  createExecuteRecoveryRuntimeState,
   refundExecuteRecoveryRuntimeIteration,
   registerExecuteRecoveryProtocolNoProgress,
   transitionExecuteRecoveryRuntimeState,
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
 import type { AgentLoopGuardRuntimeState } from "./loopGuardRuntimeState";
-import { clearCrossIterationReadTrackingForTarget } from "./loopGuardRuntimeState";
 import type { AgentLoopNoToolRuntimeState } from "./noToolRuntimeState";
 import {
   applyRecoveringFromEmptyAssistantReplyRuntimeState,
@@ -117,6 +119,8 @@ function buildReadProgressFingerprint(
         checkpoint.sourceObservationKey || "",
         checkpoint.nextRequiredCapability,
         checkpoint.evidenceVersion || "",
+        checkpoint.planTaskId || "",
+        checkpoint.requirementRef || "",
       ].join(":")
     : "none";
   const phase = resolveExecuteRecoveryActionContract(state.mode, {
@@ -177,6 +181,16 @@ function buildRecoveryProtocolNoProgressFingerprint(
   }
   const resultKinds = results.map((result) => {
     const detail = String(result.displayContent || result.content || "");
+    if (["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(result.name)) {
+      const observation = analyzePtyObservationResult(detail);
+      return [
+        result.name,
+        String(result.target || "").replace(/\\/g, "/").toLowerCase(),
+        `pty:${observation.status}`,
+        `generation:${observation.foregroundGeneration ?? "unknown"}`,
+        `sequence:${observation.outputSequence ?? "unknown"}`,
+      ].join(":");
+    }
     const category = /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(detail)
       ? "read_overlap_extension"
       : isReadOnlyNoProgressDetail(detail)
@@ -258,7 +272,6 @@ export type ToolCallExecutionPhaseResult =
       evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
-      approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
       allResults: ToolExecutionResult[];
       toolArgsByCallId: Map<string, Record<string, unknown>>;
       toolFailureSignatures: Map<string, string>;
@@ -272,7 +285,6 @@ export type ToolCallExecutionPhaseResult =
       evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
-      approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
       allResults: ToolExecutionResult[];
       toolArgsByCallId: Map<string, Record<string, unknown>>;
       toolFailureSignatures: Map<string, string>;
@@ -305,7 +317,6 @@ export async function executeToolCallPhase(input: {
   attemptedPlanWriteTargets: string[];
   latestUserPromptText: string;
   managedAgentMessages: AgentMessage[];
-  effectiveExecuteRecoveryFileRead: boolean;
   recoveryActionContract: RecoveryActionContract;
   hooksConfig: HooksConfig;
   turnInputContextSignals: TurnInputContextSignals;
@@ -318,7 +329,6 @@ export async function executeToolCallPhase(input: {
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
   loopGuardRuntimeState: AgentLoopGuardRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   toolExecutionRuntimeState: AgentLoopToolExecutionRuntimeState;
   toolFeedbackFormat: ToolFeedbackFormat;
   failedToolCallCounts: Map<string, number>;
@@ -350,7 +360,6 @@ export async function executeToolCallPhase(input: {
   let evidenceRuntimeState = input.evidenceRuntimeState;
   let executeRecoveryState = input.executeRecoveryState;
   let loopGuardRuntimeState = input.loopGuardRuntimeState;
-  let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   const effectiveToolCalls = normalizeLeaseBackedReadToolCalls(
     input.effectiveToolCalls,
     executeRecoveryState,
@@ -377,18 +386,11 @@ export async function executeToolCallPhase(input: {
     reason: string,
     resetTarget?: string,
   ) => {
-    const recoveryWasActive = executeRecoveryState.mode !== "normal";
     executeRecoveryState = input.clearExecuteRecovery(
       reason,
       resetTarget,
       executeRecoveryState,
     );
-    if (recoveryWasActive) {
-      loopGuardRuntimeState = clearCrossIterationReadTrackingForTarget(
-        loopGuardRuntimeState,
-        resetTarget,
-      );
-    }
     return executeRecoveryState;
   };
 
@@ -436,10 +438,8 @@ export async function executeToolCallPhase(input: {
     managedAgentMessages: input.managedAgentMessages,
     failedToolCallCounts: input.failedToolCallCounts,
     buildCurrentTaskTargetingProfile: input.buildCurrentTaskTargetingProfile,
-    ...approvedPlanRecoveryState,
     executeRecoveryState,
     recoveryActionContract: input.recoveryActionContract,
-    effectiveExecuteRecoveryFileRead: input.effectiveExecuteRecoveryFileRead,
     ...input.toolExecutionRuntimeState,
     iterationContext: input.iterationContext,
     emitTurnEvent: input.emitTurnEvent,
@@ -535,11 +535,7 @@ export async function executeToolCallPhase(input: {
         !result.isError
       )
     );
-  const expectedRecoveryTarget = executeRecoveryState.expectedTarget || (
-    executeRecoveryState.mode === "patch_recovery_read"
-      ? resolveExecutePatchRecoveryTarget(input.recentToolActivity)
-      : null
-  );
+  const expectedRecoveryTarget = executeRecoveryState.expectedTarget;
   const attemptedPatchRecoveryRead = Boolean(
     activePatchReadLease?.state === "available" &&
     allResults.some((result) =>
@@ -596,34 +592,27 @@ export async function executeToolCallPhase(input: {
     });
   } else if (recoveryIterationBudgetNeutral) {
     executeRecoveryState = refundExecuteRecoveryRuntimeIteration(recoveryTransition.state);
-    const ptyWaitOnly = allResults.every((result) =>
-      ["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(result.name) &&
-      !result.isError
+    const protocolFingerprint = buildRecoveryProtocolNoProgressFingerprint(
+      executeRecoveryState,
+      allResults,
     );
-    let semanticNoProgressFingerprint: string | null = null;
-    if (!ptyWaitOnly) {
-      const protocolFingerprint = buildRecoveryProtocolNoProgressFingerprint(
-        executeRecoveryState,
-        allResults,
-      );
-      semanticNoProgressFingerprint =
-        executeRecoveryState.reason === "approved_plan_scope_blocked" &&
-        executeRecoveryState.protocolNoProgressFingerprint
-          ? executeRecoveryState.protocolNoProgressFingerprint
-          : protocolFingerprint.semanticKey;
-      executeRecoveryState = registerExecuteRecoveryProtocolNoProgress(
-        executeRecoveryState,
-        semanticNoProgressFingerprint,
-      );
-      logAgentEvent("execute_recovery_read_progress_fingerprint", {
-        iteration: input.iteration,
-        fingerprints: protocolFingerprint.readProgress,
-      });
-    }
+    const semanticNoProgressFingerprint =
+      executeRecoveryState.reason === "approved_plan_scope_blocked" &&
+      executeRecoveryState.protocolNoProgressFingerprint
+        ? executeRecoveryState.protocolNoProgressFingerprint
+        : protocolFingerprint.semanticKey;
+    executeRecoveryState = registerExecuteRecoveryProtocolNoProgress(
+      executeRecoveryState,
+      semanticNoProgressFingerprint,
+    );
+    logAgentEvent("execute_recovery_read_progress_fingerprint", {
+      iteration: input.iteration,
+      fingerprints: protocolFingerprint.readProgress,
+    });
     logAgentEvent("execute_recovery_phase_budget_preserved", {
       iteration: input.iteration,
       mode: executeRecoveryState.mode,
-      reason: "policy_deferral_cache_stub_or_pty_wait",
+      reason: "policy_deferral_cache_stub_or_pty_observation",
       phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
       protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
       protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
@@ -639,6 +628,39 @@ export async function executeToolCallPhase(input: {
     // A known patch target remains part of the transaction even if the model
     // attempted an unrelated read or mutation that cannot advance the phase.
     executeRecoveryState = recoveryTransition.state;
+  }
+
+  if (input.callbacks.getIsPlanApproved()) {
+    const nextPlanObligation = resolveApprovedPlanInitialExecutionRecovery(
+      input.callbacks.getPlanTasks(),
+      input.callbacks.getPlanExecutionEvidenceLedger(),
+    );
+    const currentTaskId = executeRecoveryState.decisionCheckpoint?.planTaskId?.trim() || "";
+    const nextTaskId = nextPlanObligation?.decisionCheckpoint?.planTaskId?.trim() || "";
+    const nextTarget = nextPlanObligation?.expectedTarget?.trim() || "";
+    const targetAdvanced = Boolean(
+      nextTarget &&
+      (!executeRecoveryState.expectedTarget ||
+        !workspacePathsReferToSameFile(nextTarget, executeRecoveryState.expectedTarget))
+    );
+    if (
+      nextPlanObligation &&
+      (!currentTaskId || currentTaskId !== nextTaskId || targetAdvanced)
+    ) {
+      const previousTaskId = currentTaskId || null;
+      executeRecoveryState = createExecuteRecoveryRuntimeState({
+        workflowMode: input.workflowMode,
+        forcedState: nextPlanObligation,
+      });
+      logAgentEvent("approved_plan_recovery_obligation_advanced", {
+        iteration: input.iteration,
+        previousTaskId,
+        nextTaskId: nextTaskId || null,
+        nextRequiredCapability:
+          nextPlanObligation.decisionCheckpoint?.nextRequiredCapability || null,
+        expectedTarget: nextPlanObligation.expectedTarget,
+      });
+    }
   }
 
   const hasPlanDecisionOutput =
@@ -672,7 +694,6 @@ export async function executeToolCallPhase(input: {
       evidenceRuntimeState.recentSuccessfulProjectWrite,
     recoveringFromEmptyAssistantReplyAfterWrite:
       noToolRuntimeState.recoveringFromEmptyAssistantReplyAfterWrite,
-    ...approvedPlanRecoveryState,
     markExecuteOperationEvidence: markExecuteOperationEvidenceAndSync,
     activateUnityMcpFallback: input.activateUnityMcpFallback,
     setPlanRuntimePhase: input.setPlanRuntimePhase,
@@ -692,10 +713,6 @@ export async function executeToolCallPhase(input: {
   );
   planRuntimeState = applyToolResultPlanRuntimeState(
     planRuntimeState,
-    toolResultPostProcessing,
-  );
-  approvedPlanRecoveryState = applyApprovedPlanToolResultRecoveryState(
-    approvedPlanRecoveryState,
     toolResultPostProcessing,
   );
 
@@ -743,7 +760,6 @@ export async function executeToolCallPhase(input: {
       evidenceRuntimeState,
       executeRecoveryState,
       loopGuardRuntimeState,
-      approvedPlanRecoveryState,
       allResults: protocolResults,
       toolArgsByCallId,
       toolFailureSignatures,
@@ -759,7 +775,6 @@ export async function executeToolCallPhase(input: {
     evidenceRuntimeState,
     executeRecoveryState,
     loopGuardRuntimeState,
-    approvedPlanRecoveryState,
     allResults,
     toolArgsByCallId,
     toolFailureSignatures,

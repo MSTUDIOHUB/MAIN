@@ -9,83 +9,53 @@ import {
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
 import {
+  resolveExecuteRecoveryActionContract,
   summarizeRepeatedExecuteTargets,
   type ExecuteRecoveryMode,
 } from "../../executeRecoveryTools";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type {
-  PlanExecutionEvidenceEntry,
   PlanExecutionProgressPhase,
   PlanExecutionProgressUpdate,
 } from "../../workflowModels";
-import { isFinitePlanValidationCommand } from "../../workflowModels";
-import { browserResultLooksSuccessful } from "../../planEvidence";
+import { logAgentEvent, truncateForLog } from "../../orchestrator";
+import type {
+  MaxIterationsCheckpointHandling,
+  OrchestratorCallbacks,
+} from "../types";
 import {
-  EDIT_PROGRESS_TOOL_NAMES,
-  logAgentEvent,
-  truncateForLog,
-} from "../../orchestrator";
-import type { OrchestratorCallbacks } from "../types";
-import { hasResolvedWorkspaceMutationTarget } from "../../workspaceMutationTools";
+  hasDurableExecutionProgress,
+  scopeExecutionEvidenceLedger,
+} from "../../verificationEvidence";
+import { resolveDevServerRuntimeState } from "../../devServerRuntime";
+import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 export type MaxIterationBoundaryResult = {
   status: "handled";
 };
 
-const PTY_OBSERVATION_ACTIVITY_TOOLS = new Set([
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
-]);
-
-const NON_DURABLE_ACTIVITY_DETAIL_RE =
-  /NO_EFFECT_MUTATION|FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|no-?op|nothing to (?:change|patch|write)|(?:assertion|validation|command).{0,40}(?:failed|error)|"(?:ok|success)"\s*:\s*false|exit(?:Code|_code)?[=:"\s]+[1-9]/i;
-
-function hasRecentReadyPtyEvidence(
-  activity: PlanToolActivitySummary[],
-  evidenceLedger: PlanExecutionEvidenceEntry[],
-): boolean {
-  const recentPtyTools = new Set(activity
-    .filter((entry) =>
-      entry.status === "succeeded" &&
-      PTY_OBSERVATION_ACTIVITY_TOOLS.has(entry.name) &&
-      !NON_DURABLE_ACTIVITY_DETAIL_RE.test(String(entry.detail || ""))
-    )
-    .map((entry) => entry.name));
-  if (recentPtyTools.size === 0) return false;
-  const latestObservation = [...evidenceLedger].reverse().find((entry) =>
-    recentPtyTools.has(entry.sourceTool)
-  );
-  return latestObservation?.observationStatus === "ready";
-}
-
-function hasDurableExecutionActivity(
-  activity: PlanToolActivitySummary[],
-  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
-): boolean {
-  const hasDurableActivity = activity.some((entry) => {
-    if (
-      entry.status !== "succeeded" ||
-      /(?:^|[\\/])\.MAIN[\\/]plans[\\/]/i.test(String(entry.target || "")) ||
-      NON_DURABLE_ACTIVITY_DETAIL_RE.test(String(entry.detail || ""))
-    ) {
-      return false;
-    }
-    if (
-      (EDIT_PROGRESS_TOOL_NAMES.has(entry.name) &&
-        hasResolvedWorkspaceMutationTarget(entry.name, entry.target || "")) ||
-      String(entry.target || "").startsWith("shell-write:")
-    ) {
-      return true;
-    }
-    if (entry.name === "run_command") {
-      return isFinitePlanValidationCommand(String(entry.target || ""));
-    }
-    return entry.name === "browser_evaluate" &&
-      browserResultLooksSuccessful(String(entry.detail || ""));
-  });
-  return hasDurableActivity || hasRecentReadyPtyEvidence(activity, evidenceLedger);
+async function resolveCheckpointHandling(
+  checkpoint: ReturnType<typeof buildPlanMaxIterationsCheckpoint>,
+  handler?: (
+    value: ReturnType<typeof buildPlanMaxIterationsCheckpoint>,
+  ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>,
+  getAutoResumeCount?: () => number,
+) {
+  const handling = await handler?.(checkpoint);
+  const explicitAutoResume = checkpoint.autoResumeEligible &&
+    typeof handling === "object" &&
+    handling.status === "auto_resume_scheduled";
+  const effectiveAutoResumeCount = explicitAutoResume
+    ? Math.max(checkpoint.autoResumeCount, handling.checkpoint.autoResumeCount)
+    : Math.max(checkpoint.autoResumeCount, getAutoResumeCount?.() ?? checkpoint.autoResumeCount);
+  return {
+    handled: handling === true || explicitAutoResume,
+    autoResumeScheduled: checkpoint.autoResumeEligible && (
+      explicitAutoResume ||
+      (handling === true && effectiveAutoResumeCount > checkpoint.autoResumeCount)
+    ),
+    checkpoint: { ...checkpoint, autoResumeCount: effectiveAutoResumeCount },
+  };
 }
 
 export async function handleMaxIterationBoundary(input: {
@@ -98,6 +68,8 @@ export async function handleMaxIterationBoundary(input: {
   lastAssistantTextForCheckpoint: string;
   sawExecuteOperationEvidence: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
+  executeRecoveryState?: ExecuteRecoveryRuntimeState | null;
+  transactionId?: string | null;
   emitPlanExecutionProgress: (
     phase: PlanExecutionProgressPhase,
     overrides?: Partial<PlanExecutionProgressUpdate>,
@@ -118,62 +90,103 @@ export async function handleMaxIterationBoundary(input: {
     emitRunPausedEvent,
   } = input;
 
-  if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
-    const autoResumeEligible =
-      sawExecuteOperationEvidence &&
-      hasDurableExecutionActivity(
-        recentPlanToolActivity,
-        callbacks.getPlanExecutionEvidenceLedger(),
-      );
+  // Approved Plan execution uses the normal execute workflow. Plan-specific
+  // checkpointing is selected from durable approval provenance, not mode.
+  const approvedPlanBoundary = callbacks.getIsPlanApproved();
+  if (approvedPlanBoundary || workflowMode === "edit") {
+    const isPlanBoundary = approvedPlanBoundary;
+    const recentActivity = isPlanBoundary ? recentPlanToolActivity : recentToolActivity;
+    const evidenceLedger = callbacks.getPlanExecutionEvidenceLedger?.() || [];
+    const transactionId = input.transactionId ?? callbacks.getCurrentTurnId?.() ?? null;
+    const scopedLedger = scopeExecutionEvidenceLedger(evidenceLedger, transactionId);
+    const devServerState = resolveDevServerRuntimeState(scopedLedger);
+    const recoveryState = input.executeRecoveryState;
+    const recoveryActionContract = resolveExecuteRecoveryActionContract(
+      recoveryState?.mode || executeRecoveryMode,
+      {
+        expectedTarget: recoveryState?.expectedTarget,
+        readLease: recoveryState?.readLease,
+        sourceObservationKey: recoveryState?.sourceObservationKey,
+        decisionCheckpoint: recoveryState?.decisionCheckpoint,
+        phaseNoProgressCount: recoveryState?.phaseNoProgressCount,
+        protocolNoProgressCount: recoveryState?.protocolNoProgressCount,
+        protocolNoProgressFingerprint: recoveryState?.protocolNoProgressFingerprint,
+        devServerStatus: devServerState.status,
+        devServerNextCapability: devServerState.nextCapability,
+        devServerUrl: devServerState.url,
+        ptyGeneration: devServerState.foregroundGeneration,
+        ptyOutputSequence: devServerState.outputSequence,
+      },
+    );
+    const autoResumeEligible = hasDurableExecutionProgress({
+      ledger: evidenceLedger,
+      transactionId,
+      recoveryActionContract,
+    });
     const checkpoint = buildPlanMaxIterationsCheckpoint({
       iterationCount: effectiveMaxIterations,
       maxIterations: effectiveMaxIterations,
       autoResumeCount: callbacks.getPlanAutoResumeCount?.() ?? 0,
       autoResumeEligible,
-      tasks: callbacks.getPlanTasks(),
-      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-      recentToolActivity: recentPlanToolActivity,
+      tasks: isPlanBoundary ? callbacks.getPlanTasks() : [],
+      evidenceLedger,
+      recentToolActivity: recentActivity,
       lastAssistantText: lastAssistantTextForCheckpoint,
       unresolvedBlockers: [
-        `Agent loop reached maximum iterations (${effectiveMaxIterations}) while plan execution was still active.`,
+        `Agent loop reached maximum iterations (${effectiveMaxIterations}) while ${
+          isPlanBoundary ? "plan execution" : "execute runtime"
+        } was still active.`,
       ],
     });
-    logAgentEvent("max_iterations_checkpoint", {
+    logAgentEvent(isPlanBoundary
+      ? "max_iterations_checkpoint"
+      : "execute_max_iterations_checkpoint", {
       workflowMode,
       iteration: effectiveMaxIterations,
       autoResumeCount: checkpoint.autoResumeCount,
-      remainingTasks: checkpoint.remainingTasks.length,
       recentToolActivity: checkpoint.recentToolActivity.length,
+      ...(isPlanBoundary ? { remainingTasks: checkpoint.remainingTasks.length } : {}),
+      ...(!isPlanBoundary ? { sawExecuteOperationEvidence, executeRecoveryMode } : {}),
+      transactionId,
+      recoveryPhase: recoveryActionContract.phase,
+      nextRequiredCapability: recoveryActionContract.nextRequiredCapability,
+      structuredEvidenceCount: scopedLedger.length,
       autoResumeEligible,
     });
-    const handling = await callbacks.onPlanMaxIterationsCheckpoint?.(checkpoint);
-    const explicitAutoResume = checkpoint.autoResumeEligible &&
-      typeof handling === "object" &&
-      handling?.status === "auto_resume_scheduled";
-    const handled = handling === true || explicitAutoResume;
-    const effectiveAutoResumeCount = explicitAutoResume
-      ? Math.max(checkpoint.autoResumeCount, handling.checkpoint.autoResumeCount)
-      : Math.max(
-          checkpoint.autoResumeCount,
-          callbacks.getPlanAutoResumeCount?.() ?? checkpoint.autoResumeCount,
-        );
-    const autoResumeScheduled = checkpoint.autoResumeEligible && (explicitAutoResume || (
-      handling === true && effectiveAutoResumeCount > checkpoint.autoResumeCount
-    ));
-    const boundaryCheckpoint = {
-      ...checkpoint,
-      autoResumeCount: effectiveAutoResumeCount,
-    };
-    const boundaryNotice = autoResumeScheduled
-      ? buildPlanMaxIterationsAutoResumeNotice(
-          boundaryCheckpoint,
+    const handling = await resolveCheckpointHandling(
+      checkpoint,
+      isPlanBoundary
+        ? callbacks.onPlanMaxIterationsCheckpoint
+          ? (value) => callbacks.onPlanMaxIterationsCheckpoint?.(value) ?? false
+          : undefined
+        : callbacks.onExecuteMaxIterationsCheckpoint
+        ? (value) => callbacks.onExecuteMaxIterationsCheckpoint?.(value) ?? false
+        : undefined,
+      callbacks.getPlanAutoResumeCount
+        ? () => callbacks.getPlanAutoResumeCount?.() ?? 0
+        : undefined,
+    );
+    const boundaryNotice = handling.autoResumeScheduled
+      ? isPlanBoundary
+        ? buildPlanMaxIterationsAutoResumeNotice(
+            handling.checkpoint,
+            callbacks.getPreferredLanguage(),
+          )
+        : buildExecuteMaxIterationsAutoResumeNotice(
+            handling.checkpoint,
+            callbacks.getPreferredLanguage(),
+          )
+      : isPlanBoundary
+      ? buildPlanMaxIterationsPauseNotice(
+          handling.checkpoint,
           callbacks.getPreferredLanguage(),
         )
-      : buildPlanMaxIterationsPauseNotice(
-          boundaryCheckpoint,
+      : buildExecuteMaxIterationsPauseNotice(
+          handling.checkpoint,
           callbacks.getPreferredLanguage(),
         );
-    if (!handled) {
+
+    if (isPlanBoundary && !handling.handled) {
       emitPlanExecutionProgress("paused", {
         nextStep: callbacks.getPreferredLanguage() === "zh"
           ? "点击 Resume Execution 后从检查点继续"
@@ -181,96 +194,32 @@ export async function handleMaxIterationBoundary(input: {
       });
     }
     emitRunPausedEvent(
-      autoResumeScheduled ? "max_iterations_auto_resume" : "max_iterations_boundary",
+      handling.autoResumeScheduled ? "max_iterations_auto_resume" : "max_iterations_boundary",
       boundaryNotice,
     );
-    callbacks.onStatusChange("idle");
-    if (handled) return { status: "handled" };
-    callbacks.onNonActionableStop(
-      boundaryNotice,
-      "incomplete_plan",
-      {
-        phase: "paused",
-        recoveryReason: "plan_max_iterations_checkpoint",
-        repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
-        progressSignature: buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity),
-        nextStep: callbacks.getPreferredLanguage() === "zh"
-          ? "点击 Resume Execution 后复用检查点，先核查当前 workspace，再继续未满足证据的任务"
-          : "click Resume Execution to reuse the checkpoint, inspect current workspace, and continue evidence-unsatisfied tasks",
-      },
-    );
-    return { status: "handled" };
-  }
-
-  if (workflowMode === "edit") {
-    const autoResumeEligible =
-      sawExecuteOperationEvidence &&
-      hasDurableExecutionActivity(
-        recentToolActivity,
-        callbacks.getPlanExecutionEvidenceLedger?.() || [],
-      );
-    const checkpoint = buildPlanMaxIterationsCheckpoint({
-      iterationCount: effectiveMaxIterations,
-      maxIterations: effectiveMaxIterations,
-      autoResumeCount: callbacks.getPlanAutoResumeCount?.() ?? 0,
-      autoResumeEligible,
-      tasks: [],
-      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger?.() || [],
-      recentToolActivity,
-      lastAssistantText: lastAssistantTextForCheckpoint,
-      unresolvedBlockers: [
-        `Agent loop reached maximum iterations (${effectiveMaxIterations}) while execute runtime was still active.`,
-      ],
-    });
-    logAgentEvent("execute_max_iterations_checkpoint", {
-      workflowMode,
-      iteration: effectiveMaxIterations,
-      autoResumeCount: checkpoint.autoResumeCount,
-      recentToolActivity: checkpoint.recentToolActivity.length,
-      sawExecuteOperationEvidence,
-      executeRecoveryMode,
-      autoResumeEligible,
-    });
-    const handling = await callbacks.onExecuteMaxIterationsCheckpoint?.(checkpoint);
-    const explicitAutoResume = checkpoint.autoResumeEligible &&
-      typeof handling === "object" &&
-      handling?.status === "auto_resume_scheduled";
-    const handled = handling === true || explicitAutoResume;
-    const effectiveAutoResumeCount = explicitAutoResume
-      ? Math.max(checkpoint.autoResumeCount, handling.checkpoint.autoResumeCount)
-      : Math.max(
-          checkpoint.autoResumeCount,
-          callbacks.getPlanAutoResumeCount?.() ?? checkpoint.autoResumeCount,
-        );
-    const autoResumeScheduled = checkpoint.autoResumeEligible && (explicitAutoResume || (
-      handling === true && effectiveAutoResumeCount > checkpoint.autoResumeCount
-    ));
-    const boundaryCheckpoint = {
-      ...checkpoint,
-      autoResumeCount: effectiveAutoResumeCount,
-    };
-    const boundaryNotice = autoResumeScheduled
-      ? buildExecuteMaxIterationsAutoResumeNotice(
-          boundaryCheckpoint,
-          callbacks.getPreferredLanguage(),
-        )
-      : buildExecuteMaxIterationsPauseNotice(
-          boundaryCheckpoint,
-          callbacks.getPreferredLanguage(),
-        );
-    emitRunPausedEvent(
-      autoResumeScheduled ? "max_iterations_auto_resume" : "max_iterations_boundary",
-      boundaryNotice,
-    );
-    if (handled) {
+    if (handling.handled) {
       callbacks.onStatusChange("idle");
       return { status: "handled" };
     }
-    callbacks.onNonActionableStop(
-      boundaryNotice,
-      "no_action",
-    );
-    callbacks.onStatusChange("idle");
+    if (isPlanBoundary) {
+      callbacks.onStatusChange("idle");
+      callbacks.onNonActionableStop(
+        boundaryNotice,
+        "incomplete_plan",
+        {
+          phase: "paused",
+          recoveryReason: "plan_max_iterations_checkpoint",
+          repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
+          progressSignature: buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity),
+          nextStep: callbacks.getPreferredLanguage() === "zh"
+            ? "点击 Resume Execution 后复用检查点，先核查当前 workspace，再继续未满足证据的任务"
+            : "click Resume Execution to reuse the checkpoint, inspect current workspace, and continue evidence-unsatisfied tasks",
+        },
+      );
+    } else {
+      callbacks.onNonActionableStop(boundaryNotice, "no_action");
+      callbacks.onStatusChange("idle");
+    }
     return { status: "handled" };
   }
 

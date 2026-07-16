@@ -35,7 +35,7 @@ test("tool call execution phase owns post-processing runtime state updates", () 
   assert.match(phaseSource, /applyRecoveringFromEmptyAssistantReplyRuntimeState\(/);
   assert.match(phaseSource, /applyUnityMcpToolResultState\(/);
   assert.match(phaseSource, /applyToolResultPlanRuntimeState\(/);
-  assert.match(phaseSource, /applyApprovedPlanToolResultRecoveryState\(/);
+  assert.doesNotMatch(phaseSource, /applyApprovedPlanToolResultRecoveryState\(/);
   assert.match(phaseSource, /unityMcpFallbackPrompt: toolResultPostProcessing\.unityMcpFallbackPrompt/);
   assert.match(phaseSource, /isUnapprovedPlanReadOnlyBatch:\s*toolResultPostProcessing\.isUnapprovedPlanReadOnlyBatch/);
 });
@@ -47,8 +47,9 @@ test("tool call execution phase preserves callback-owned state through the phase
   );
   assert.match(
     phaseSource,
-    /const clearExecuteRecoveryAndSync[\s\S]*?executeRecoveryState = input\.clearExecuteRecovery\([\s\S]*?executeRecoveryState[\s\S]*?loopGuardRuntimeState = clearCrossIterationReadTrackingForTarget/,
+    /const clearExecuteRecoveryAndSync[\s\S]*?executeRecoveryState = input\.clearExecuteRecovery\([\s\S]*?return executeRecoveryState/,
   );
+  assert.doesNotMatch(phaseSource, /clearCrossIterationReadTrackingForTarget/);
   assert.match(
     phaseSource,
     /markExecuteOperationEvidence: markExecuteOperationEvidenceAndSync/,
@@ -73,6 +74,34 @@ test("approved Plan scope recovery keeps one semantic fingerprint across policy-
     phaseSource,
     /registerExecuteRecoveryProtocolNoProgress\(\s*executeRecoveryState,\s*semanticNoProgressFingerprint/,
   );
+});
+
+test("approved Plan recovery advances the runtime contract after task evidence closes", () => {
+  assert.match(
+    phaseSource,
+    /resolveApprovedPlanInitialExecutionRecovery\(\s*input\.callbacks\.getPlanTasks\(\),\s*input\.callbacks\.getPlanExecutionEvidenceLedger\(\)/,
+  );
+  assert.match(
+    phaseSource,
+    /currentTaskId !== nextTaskId \|\| targetAdvanced/,
+  );
+  assert.match(
+    phaseSource,
+    /createExecuteRecoveryRuntimeState\(\{[\s\S]*?forcedState: nextPlanObligation/,
+  );
+  assert.match(phaseSource, /approved_plan_recovery_obligation_advanced/);
+});
+
+test("unchanged PTY observations consume semantic progress while new output changes the fingerprint", () => {
+  assert.match(
+    phaseSource,
+    /pty:\$\{observation\.status\}[\s\S]*?generation:\$\{observation\.foregroundGeneration[\s\S]*?sequence:\$\{observation\.outputSequence/,
+  );
+  assert.match(
+    phaseSource,
+    /recoveryIterationBudgetNeutral[\s\S]*?buildRecoveryProtocolNoProgressFingerprint\([\s\S]*?registerExecuteRecoveryProtocolNoProgress\(/,
+  );
+  assert.doesNotMatch(phaseSource, /if \(!ptyWaitOnly\)/);
 });
 
 test("partial abort reconciles observed tool results before returning and closes protocol calls", () => {

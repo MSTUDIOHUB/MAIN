@@ -70,12 +70,6 @@ function createControl(overrides = {}) {
     currentMaxTokens: undefined,
     loggedLocalPlanNoVisibleTokenNoticeOnly: false,
   };
-  let approvedPlanRecoveryState = {
-    approvedPlanNoProgressRecoveryAttempts: 0,
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-    approvedPlanLongReasoningNoActionCount: 0,
-  };
   let planRuntimeState = {
     planRuntimePhase: "grounding",
     planQualityRejectCount: 0,
@@ -106,8 +100,8 @@ function createControl(overrides = {}) {
         model: "test-model",
       },
       effectiveToolProtocol: "native",
-      turnIntent: "plan",
-      workflowMode: "plan",
+      turnIntent: "execute",
+      workflowMode: "edit",
     },
     recentPlanToolActivity: [],
     getIteration: () => 2,
@@ -116,10 +110,6 @@ function createControl(overrides = {}) {
     getStreamRuntimeState: () => streamRuntimeState,
     setStreamRuntimeState: (state) => {
       streamRuntimeState = state;
-    },
-    getApprovedPlanRecoveryState: () => approvedPlanRecoveryState,
-    setApprovedPlanRecoveryState: (state) => {
-      approvedPlanRecoveryState = state;
     },
     getPlanRuntimeState: () => planRuntimeState,
     emitTaskOrchestratorPhase: (phase, extra) => phases.push({ phase, extra }),
@@ -131,7 +121,6 @@ function createControl(overrides = {}) {
     control,
     progress,
     phases,
-    getApprovedPlanRecoveryState: () => approvedPlanRecoveryState,
     setPlanRuntimeState: (state) => {
       planRuntimeState = state;
     },
@@ -173,6 +162,19 @@ test("loop control extends only an active rejected Plan draft", () => {
       getIsPlanApproved: () => false,
     },
     input: {
+      runtimeState: {
+        config: {
+          activeProfile: "local",
+          local: { contextLimit: 4096 },
+        },
+        settings: {
+          provider: "test-provider",
+          model: "test-model",
+        },
+        effectiveToolProtocol: "native",
+        turnIntent: "plan",
+        workflowMode: "plan",
+      },
       getRuntimeIntent: () => "plan",
       getPlanRuntimeState: () => planRuntimeState,
     },
@@ -187,7 +189,7 @@ test("loop control extends only an active rejected Plan draft", () => {
   assert.equal(control.getEffectiveMaxIterations(), 29);
 });
 
-test("loop control emits approved plan execution progress with iteration metadata", () => {
+test("approved Plan provenance selects execution progress and budget in execute workflow", () => {
   const { control, progress } = createControl();
 
   control.emitPlanExecutionProgress("running");
@@ -196,32 +198,26 @@ test("loop control emits approved plan execution progress with iteration metadat
   assert.equal(progress[0].phase, "running");
   assert.equal(progress[0].iteration, 2);
   assert.equal(progress[0].maxIterations, control.getEffectiveMaxIterations());
+  assert.equal(control.getEffectiveMaxIterations(), 50);
 });
 
-test("loop control grants the full execution budget after same-loop plan approval", () => {
-  let approved = false;
-  let iteration = 18;
+test("approved execute run starts its dedicated Plan execution budget at iteration zero", () => {
+  let iteration = 0;
   const progress = [];
   const { control } = createControl({
     callbacks: {
-      getIsPlanApproved: () => approved,
       onPlanExecutionProgress: (update) => progress.push(update),
     },
     input: {
       getIteration: () => iteration,
-      getRuntimeIntent: () => approved ? "execute" : "plan",
     },
   });
 
-  assert.equal(control.getEffectiveMaxIterations(), 25);
-  approved = true;
-  assert.equal(control.getEffectiveMaxIterations(), 68);
-  iteration = 19;
+  assert.equal(control.getEffectiveMaxIterations(), 50);
+  iteration = 1;
   control.emitPlanExecutionProgress("running");
   assert.equal(progress.at(-1).iteration, 1);
   assert.equal(progress.at(-1).maxIterations, 50);
-  iteration = 40;
-  assert.equal(control.getEffectiveMaxIterations(), 68);
 });
 
 test("loop control startLoop moves unapproved plan turns into explore phase", () => {
@@ -229,6 +225,21 @@ test("loop control startLoop moves unapproved plan turns into explore phase", ()
     callbacks: {
       getIsPlanApproved: () => false,
       onPlanExecutionProgress: (update) => progress.push(update),
+    },
+    input: {
+      runtimeState: {
+        config: {
+          activeProfile: "local",
+          local: { contextLimit: 4096 },
+        },
+        settings: {
+          provider: "test-provider",
+          model: "test-model",
+        },
+        effectiveToolProtocol: "native",
+        turnIntent: "plan",
+        workflowMode: "plan",
+      },
     },
   });
 
@@ -254,6 +265,21 @@ test("loop control skips root exploration when task targeting already has a scop
     callbacks: {
       getIsPlanApproved: () => false,
     },
+    input: {
+      runtimeState: {
+        config: {
+          activeProfile: "local",
+          local: { contextLimit: 4096 },
+        },
+        settings: {
+          provider: "test-provider",
+          model: "test-model",
+        },
+        effectiveToolProtocol: "native",
+        turnIntent: "plan",
+        workflowMode: "plan",
+      },
+    },
   });
 
   control.startLoop({
@@ -270,17 +296,4 @@ test("loop control skips root exploration when task targeting already has a scop
     reason: "start with targeted grounding",
     status: undefined,
   });
-});
-
-test("strategy switch returns and persists the folded approved-plan recovery state", () => {
-  const { control, getApprovedPlanRecoveryState } = createControl();
-
-  const nextState = control.continueApprovedPlanWithStrategySwitch({
-    reason: "no_progress_cached_read_only_batch",
-    remainingText: "Modify src/App.tsx",
-  });
-
-  assert.equal(nextState.approvedPlanNoProgressRecoveryAttempts, 1);
-  assert.equal(nextState.approvedPlanActionOnlyRecoveryActive, true);
-  assert.deepEqual(getApprovedPlanRecoveryState(), nextState);
 });

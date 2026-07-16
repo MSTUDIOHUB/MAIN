@@ -163,6 +163,7 @@ export function prepareManagedMessagesForIteration(input: {
   recoveryActionContract: RecoveryActionContract;
   executeRecoveryExpectedTarget?: string | null;
   executeRecoverySourceObservationKey?: string | null;
+  executeRecoverySourceObservationKeys?: string[];
   recentToolActivity: PlanToolActivitySummary[];
   fileReadStates: Map<string, FileReadState>;
   emitPlanExecutionProgress: (phase: PlanExecutionProgressPhase) => void;
@@ -183,6 +184,7 @@ export function prepareManagedMessagesForIteration(input: {
     recoveryActionContract,
     executeRecoveryExpectedTarget,
     executeRecoverySourceObservationKey,
+    executeRecoverySourceObservationKeys = [],
     recentToolActivity,
     fileReadStates,
     emitPlanExecutionProgress,
@@ -509,15 +511,21 @@ export function prepareManagedMessagesForIteration(input: {
     const lastActivity = recentToolActivity[recentToolActivity.length - 1];
     const failedTarget = lastActivity?.status === "failed" ? lastActivity.target : "";
     const activityObservation = lastActivity?.readFileObservation;
-    const observationKey = executeRecoverySourceObservationKey || activityObservation?.key;
+    const observationKeys = Array.from(new Set([
+      ...executeRecoverySourceObservationKeys,
+      ...(executeRecoverySourceObservationKey ? [executeRecoverySourceObservationKey] : []),
+      ...(activityObservation?.key ? [activityObservation.key] : []),
+    ].map((key) => String(key || "").trim()).filter(Boolean)));
     const targetPath = executeRecoveryExpectedTarget || failedTarget;
-    if (observationKey || targetPath) {
+    // Never substitute "the newest window for this path" for a missing
+    // observation identity. That previously pinned an unrelated tail window
+    // after a patch mismatch and made the recovery prompt contradict its
+    // exact target range.
+    for (const observationKey of observationKeys) {
       const matchedState = selectFileReadStateForRecoveryContext({
         states: fileReadStates,
         targetPath,
         observationKey,
-        requestSignature: activityObservation?.requestSignature,
-        versionToken: activityObservation?.versionToken,
       });
       if (matchedState?.modelContent) {
         const observation = getFileReadObservationForState(matchedState, "replay");

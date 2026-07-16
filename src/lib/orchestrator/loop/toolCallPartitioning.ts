@@ -1,11 +1,12 @@
 import {
-  normalizeRecoveryReadRange,
   resolveExecuteRecoveryBatchDecision,
-  shouldUseExecutePatchRecoveryReadLease,
   type ExecuteRecoveryMode,
   type RecoveryActionContract,
 } from "../../executeRecoveryTools";
-import { resolveApprovedPlanMutationScope } from "../../approvedPlanExecutionScope";
+import {
+  resolveApprovedPlanCommandScope,
+  resolveApprovedPlanMutationScope,
+} from "../../approvedPlanExecutionScope";
 import {
   FILE_UNCHANGED_STUB,
   buildFileReadObservationIdentity,
@@ -54,14 +55,17 @@ import { planReadFileWindowCoverage } from "../../readFileWindow";
 import {
   buildRepeatLoopArgsKey,
   buildRepeatLoopSignature,
-  isReadOnlyShellInspectionToolCall,
 } from "../../repetitionGuard";
-import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
+import type { ResolvedUserIntent } from "../../runIntent";
 import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../runtimeTools";
 import { shouldBlockToolCallForTargeting, type TaskTargetingProfile } from "../../taskTargeting";
 import { isLocalFileReadApproved, type ToolCapabilityRegistry, type ToolPermissionPolicy } from "../../toolCapabilities";
 import type { MainThreadEventInput, MainThreadItem } from "../../turnEvents";
-import type { PlanRuntimePhase } from "../../workflowModels";
+import {
+  isFinitePlanValidationCommand,
+  isFlexiblePlanValidationCommandEvidence,
+  type PlanRuntimePhase,
+} from "../../workflowModels";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { findSubagentScopeConflict, validateSubagentScopeTarget } from "../../subagents";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
@@ -71,6 +75,8 @@ import {
 } from "../../workspaceMutationTools";
 import { shouldCacheReadOnlyToolResult } from "../../readOnlyToolCachePolicy";
 import {
+  extractLocalDevServerPort,
+  isLocalDevServerHealthProbeCommand,
   resolveBrowserValidationPreflight,
 } from "../../devServerRuntime";
 import type {
@@ -122,6 +128,30 @@ function parentHasReusableDelegatedSourceWindow(input: {
   });
 }
 
+function recoveryContractAuthorizesApprovedPlanCommand(input: {
+  toolName: string;
+  command: string;
+  plannedCommands: string[];
+  contract: RecoveryActionContract;
+}): boolean {
+  if (input.toolName !== "run_command") return false;
+  if (
+    input.contract.nextRequiredCapability === "validation" &&
+    input.plannedCommands.every(isFlexiblePlanValidationCommandEvidence)
+  ) {
+    return isFinitePlanValidationCommand(input.command);
+  }
+  if (
+    input.contract.nextRequiredCapability !== "reconcile_server" ||
+    !isLocalDevServerHealthProbeCommand(input.command)
+  ) {
+    return false;
+  }
+  const expectedPort = extractLocalDevServerPort(input.contract.devServerUrl || "");
+  const requestedPort = extractLocalDevServerPort(input.command);
+  return expectedPort !== null && requestedPort === expectedPort;
+}
+
 export function findDelegatedObservationRequiringParentReread(input: {
   mutationTargets: string[];
   recentToolActivity: PlanToolActivitySummary[];
@@ -164,10 +194,8 @@ export async function partitionToolCallsForExecution(input: {
   managedAgentMessages: AgentMessage[];
   failedToolCallCounts: Map<string, number>;
   buildCurrentTaskTargetingProfile: () => TaskTargetingProfile;
-  approvedPlanActionOnlyRecoveryActive: boolean;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
   recoveryActionContract: RecoveryActionContract;
-  effectiveExecuteRecoveryFileRead: boolean;
   readOnlyResultCache: Map<string, CachedReadOnlyToolResult>;
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
@@ -193,10 +221,8 @@ export async function partitionToolCallsForExecution(input: {
     managedAgentMessages,
     failedToolCallCounts,
     buildCurrentTaskTargetingProfile,
-    approvedPlanActionOnlyRecoveryActive,
     executeRecoveryState,
     recoveryActionContract,
-    effectiveExecuteRecoveryFileRead,
     readOnlyResultCache,
     readOnlyDuplicateSkipCounts,
     fileReadStates,
@@ -218,7 +244,6 @@ export async function partitionToolCallsForExecution(input: {
   const queuedFileReadSignatures = new Set<string>();
   const toolFailureSignatures = new Map<string, string>();
   const preExecutionResults: ToolExecutionResult[] = [];
-  let executePatchRecoveryReadLeaseClaimed = false;
   let sawOrderSensitiveWorkspaceAction = false;
   let deferRemainingCallsForBatchOrder = false;
   const executeRecoveryContract = recoveryActionContract;
@@ -317,8 +342,8 @@ export async function partitionToolCallsForExecution(input: {
       const message = isExecuteRecoveryScopeCorrection
         ? tc.name === "read_file"
           ? callbacks.getPreferredLanguage() === "zh"
-            ? `READ_SCOPE_DEFERRED: 当前恢复事务未暴露这个读取调用。请保持目标为 ${executeRecoveryState.expectedTarget || "当前任务目标"}，并按文件版本/缺失行范围发起一次定向 read_file；不要改用 shell 读取绕行。`
-            : `READ_SCOPE_DEFERRED: This read was not exposed by the current recovery transaction. Keep the target scoped to ${executeRecoveryState.expectedTarget || "the current task target"} and request one targeted read_file for a changed version or missing line window; do not bypass this with shell file reads.`
+            ? `READ_SCOPE_DEFERRED: read_file 不在本次请求的实际工具面中，因此没有执行。请不要原样重试或用 shell 绕行；改用实际列出的工具推进 ${executeRecoveryContract.nextRequiredCapability}。`
+            : `READ_SCOPE_DEFERRED: read_file is not in this request's actual tool surface, so it did not run. Do not retry it unchanged or bypass it through shell commands; use the tools actually listed to advance ${executeRecoveryContract.nextRequiredCapability}.`
           : callbacks.getPreferredLanguage() === "zh"
             ? `EXECUTE_RECOVERY_SCOPE_DEFERRED: ${tc.name} 不属于当前 ${executeRecoveryBatchDecision.phase} 阶段；请使用当前工具面完成下一能力。`
             : `EXECUTE_RECOVERY_SCOPE_DEFERRED: ${tc.name} is outside the current ${executeRecoveryBatchDecision.phase} phase; use the active tool surface for the next capability.`
@@ -464,20 +489,14 @@ export async function partitionToolCallsForExecution(input: {
         Boolean(executeRecoveryState.expectedTarget) &&
         !workspacePathsReferToSameFile(target, executeRecoveryState.expectedTarget || "");
       const readScopeDecision = readOutsideTransactionScope
-        ? resolveReadFileEligibilityDecision({
+          ? resolveReadFileEligibilityDecision({
             scopeMatches: false,
-            bypassCacheForLease: false,
             hasCachedWindow: false,
             contentInContext: false,
           })
         : null;
-      const selectedTool = executeRecoveryBatchDecision.selectedToolName || (
-        executeRecoveryBatchDecision.phase === "need_context"
-          ? "read_file"
-          : executeRecoveryBatchDecision.phase === "need_mutation"
-            ? "apply_patch/replace_in_file/write_file"
-            : "run_command/browser_evaluate"
-      );
+      const selectedTool = executeRecoveryBatchDecision.selectedToolName ||
+        executeRecoveryContract.nextRequiredCapability;
       const expectedTargetHint = executeRecoveryState.expectedTarget
         ? language === "zh"
           ? executeRecoveryBatchDecision.phase === "need_context"
@@ -656,24 +675,25 @@ export async function partitionToolCallsForExecution(input: {
           .filter((state) => workspacePathsReferToSameFile(state.path, target))
           .sort((a, b) => b.updatedAt - a.updatedAt)[0];
         const currentMeta = await readFileMetadataIfAvailable(target, workspace);
-        const sourceBody = String(latestRead?.modelContent || "")
-          .replace(/^[\s\S]*?---CONTENT START---\s*/i, "")
-          .replace(/\s*---CONTENT END---[\s\S]*$/i, "");
-        const sourceLineCount = sourceBody ? sourceBody.split(/\r?\n/).length : Number.POSITIVE_INFINITY;
         const snapshotStillCurrent = !!latestRead && !!currentMeta &&
           latestRead.sizeBytes === currentMeta.sizeBytes &&
           latestRead.modifiedMs === currentMeta.modifiedMs;
-        const fullWriteAllowed = sourceLineCount <= 400 && snapshotStillCurrent;
+        const exactFullFileObserved = !!latestRead?.window &&
+          latestRead.window.startLine === 1 &&
+          latestRead.window.endLine >= latestRead.window.totalLines &&
+          !latestRead.window.truncated;
+        const fullWriteAllowed = exactFullFileObserved && snapshotStillCurrent;
         callbacks.onDebugEvent?.("patch_recovery_full_write_decision", {
           target,
           failedPatchCount,
-          sourceLineCount: Number.isFinite(sourceLineCount) ? sourceLineCount : null,
+          observedWindow: latestRead?.window || null,
+          exactFullFileObserved,
           snapshotStillCurrent,
           decision: fullWriteAllowed ? "allowed" : "blocked",
           latestReadHash: latestRead?.contentHash || null,
         });
         if (!fullWriteAllowed) {
-          const message = `WRITE_FILE_AFTER_PATCH_FAILURE_BLOCKED: ${failedPatchCount} precise patches failed for '${target}'. Full-file replacement requires a current complete read of at most 400 lines whose size and modified-time still match the latest read snapshot.`;
+          const message = `WRITE_FILE_AFTER_PATCH_FAILURE_BLOCKED: ${failedPatchCount} precise patches failed for '${target}'. Full-file replacement requires an exact complete-file observation whose version still matches the current file.`;
           callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
           preExecutionResults.push({
             toolCallId: tc.id,
@@ -816,7 +836,6 @@ export async function partitionToolCallsForExecution(input: {
           availableToolNames,
           language: callbacks.getPreferredLanguage(),
           allowApprovedPlanDesignWrite:
-            workflowMode === "plan" &&
             callbacks.getIsPlanApproved() &&
             runtimeIntent === "execute",
         });
@@ -850,8 +869,61 @@ export async function partitionToolCallsForExecution(input: {
       continue;
     }
 
+    const approvedPlanCommandScope = resolveApprovedPlanCommandScope({
+      isPlanApproved: callbacks.getIsPlanApproved(),
+      toolName: tc.name,
+      args: toolArgs,
+      tasks: callbacks.getPlanTasks(),
+    });
+    const approvedPlanCommandRecoveryLease =
+      approvedPlanCommandScope.applies &&
+      !approvedPlanCommandScope.allowed &&
+      recoveryContractAuthorizesApprovedPlanCommand({
+        toolName: tc.name,
+        command: approvedPlanCommandScope.requestedCommand,
+        plannedCommands: approvedPlanCommandScope.plannedCommands,
+        contract: executeRecoveryContract,
+      });
+    if (approvedPlanCommandScope.applies && !approvedPlanCommandScope.allowed && !approvedPlanCommandRecoveryLease) {
+      const reviewed = approvedPlanCommandScope.plannedCommands.join(" | ") || "none";
+      const message = callbacks.getPreferredLanguage() === "zh"
+        ? `APPROVED_PLAN_COMMAND_DEFERRED: 该 shell 命令不是已批准 Plan 中的精确命令，因此未执行。已审核命令：${reviewed}。请使用已审核命令或专用读写工具，或提交包含该命令的新 revision。`
+        : `APPROVED_PLAN_COMMAND_DEFERRED: This shell command is not an exact command from the approved Plan, so it did not run. Reviewed commands: ${reviewed}. Use a reviewed command or a dedicated read/write tool, or submit a revision containing this command.`;
+      logAgentEvent("approved_plan_command_scope_deferred", {
+        iteration,
+        tool: tc.name,
+        command: approvedPlanCommandScope.requestedCommand,
+        plannedCommands: approvedPlanCommandScope.plannedCommands,
+      });
+      toolFailureSignatures.delete(tc.id);
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "approved_plan_command_scope_deferred",
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        isError: false,
+        internalFeedback: true,
+        qualityGateReason: "approved_plan_command_scope_deferred",
+        lifecycleState: "blocked",
+      });
+      continue;
+    }
+    if (approvedPlanCommandRecoveryLease) {
+      logAgentEvent("execute_recovery_validation_command_lease_consumed", {
+        iteration,
+        tool: tc.name,
+        command: approvedPlanCommandScope.requestedCommand,
+        recoveryPhase: executeRecoveryContract.phase,
+        nextRequiredCapability: executeRecoveryContract.nextRequiredCapability,
+        devServerUrl: executeRecoveryContract.devServerUrl,
+      });
+    }
     const approvedPlanMutationScope = resolveApprovedPlanMutationScope({
-      workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
       toolName: tc.name,
       args: toolArgs,
@@ -936,39 +1008,6 @@ export async function partitionToolCallsForExecution(input: {
         });
         continue;
       }
-    }
-
-    if (
-      workflowMode === "plan" &&
-      callbacks.getIsPlanApproved() &&
-      approvedPlanActionOnlyRecoveryActive &&
-      isReadOnlyShellInspectionToolCall(tc.name, toolArgs)
-    ) {
-      const message = callbacks.getPreferredLanguage() === "zh"
-        ? [
-            "APPROVED_PLAN_SHELL_READ_BLOCKED: 已批准计划的执行阶段不能在首次项目写入前用 shell 分页读取源码。",
-            "请复用已批准 plan.md 和已确认的源码证据，直接使用 `apply_patch`、`replace_in_file` 或 `write_file` 修改目标源码文件；写入后再运行验证命令。",
-          ].join("\n")
-        : [
-            "APPROVED_PLAN_SHELL_READ_BLOCKED: approved plan execution must not page source files through shell before the first project write.",
-            "Reuse the approved plan and confirmed source evidence, then call `apply_patch`, `replace_in_file`, or `write_file` against the target source file. Run validation commands after the write.",
-          ].join("\n");
-      callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
-      logAgentEvent("approved_plan_shell_read_blocked", {
-        iteration,
-        tool: tc.name,
-        target,
-        actionOnly: approvedPlanActionOnlyRecoveryActive,
-      });
-      preExecutionResults.push({
-        toolCallId: tc.id,
-        name: tc.name,
-        target,
-        content: `Error: ${message}`,
-        isError: true,
-        lifecycleState: "blocked",
-      });
-      continue;
     }
 
     const approvedLocalFileReadPaths = callbacks.getApprovedLocalFileReadPaths();
@@ -1071,42 +1110,9 @@ export async function partitionToolCallsForExecution(input: {
         }
         fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
       }
-      const bypassExecutePatchRecoveryReadCache =
-        isMutationRuntimeIntent(runtimeIntent) &&
-        shouldUseExecutePatchRecoveryReadLease({
-          toolName: tc.name,
-          allowFileRead: effectiveExecuteRecoveryFileRead,
-          target,
-          requestedRange: normalizeRecoveryReadRange(effectiveToolArgs),
-          observedVersion: fileReadMetadata
-            ? `${fileReadMetadata.sizeBytes}:${fileReadMetadata.modifiedMs}`
-            : null,
-          activeReadLease: executeRecoveryState.readLease,
-          leaseClaimed: executePatchRecoveryReadLeaseClaimed,
-        });
-      if (bypassExecutePatchRecoveryReadCache) executePatchRecoveryReadLeaseClaimed = true;
-      const bypassPatchRecoveryReadCache = bypassExecutePatchRecoveryReadCache;
-      if (bypassPatchRecoveryReadCache) {
-        logAgentEvent("execute_patch_recovery_read_cache_bypass", {
-            iteration,
-            target,
-            leaseScope: "recovery_action_contract",
-            readLeasePurpose: executeRecoveryState.readLease?.purpose || null,
-            readLeaseState: executeRecoveryState.readLease?.state || null,
-            recentActivity: recentToolActivity
-              .slice(-4)
-              .map((activity) => ({
-                name: activity.name,
-                target: activity.target,
-                status: activity.status,
-              })),
-          });
-      }
-
       if (
         fileReadSignature &&
-        queuedFileReadSignatures.has(fileReadSignature) &&
-        !bypassPatchRecoveryReadCache
+        queuedFileReadSignatures.has(fileReadSignature)
       ) {
         const content = [
           `${FILE_UNCHANGED_STUB}: an identical read_file path/range is already queued in this tool batch.`,
@@ -1139,7 +1145,7 @@ export async function partitionToolCallsForExecution(input: {
         continue;
       }
 
-      if (fileReadState && !bypassPatchRecoveryReadCache) {
+      if (fileReadState) {
         const contentStillActive = isContentInActiveMessages(
           fileReadState.modelContent,
           managedAgentMessages,
@@ -1152,7 +1158,6 @@ export async function partitionToolCallsForExecution(input: {
         const contextEvictionEpoch = fileReadState.contextEvictionEpoch || 0;
         const eligibility = resolveReadFileEligibilityDecision({
           scopeMatches: true,
-          bypassCacheForLease: false,
           hasCachedWindow: true,
           observedVersion: `${fileReadState.sizeBytes}:${fileReadState.modifiedMs}`,
           currentVersion: metadata
@@ -1186,11 +1191,6 @@ export async function partitionToolCallsForExecution(input: {
         } else {
           const duplicateCount = (readOnlyDuplicateSkipCounts.get(fileReadSignature) ?? 0) + 1;
           readOnlyDuplicateSkipCounts.set(fileReadSignature, duplicateCount);
-          const approvedPlanExecutionRead =
-            workflowMode === "plan" &&
-            callbacks.getIsPlanApproved() &&
-            runtimeIntent === "execute" &&
-            tc.name === "read_file";
           const replayedCurrentEviction =
             fileReadState.lastReplayContextEvictionEpoch === contextEvictionEpoch;
           if (
@@ -1269,34 +1269,11 @@ export async function partitionToolCallsForExecution(input: {
             modifiedMs: fileReadState.modifiedMs,
             contentHash: fileReadState.contentHash,
           });
-          const shouldPushApprovedPlanReadLimit =
-            approvedPlanExecutionRead &&
-            contentStillActive &&
-            duplicateCount >= 3;
-          const approvedPlanReadLimitMessage = shouldPushApprovedPlanReadLimit
-            ? callbacks.getPreferredLanguage() === "zh"
-              ? [
-                  `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} 已在已批准计划执行中重复读取，本次不再重新读取。`,
-                  "请复用当前上下文中的源码，改为 apply_patch/replace_in_file/write_file、运行验证，或说明明确阻塞。",
-                ].join("\n")
-              : [
-                  `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path} was reread repeatedly during approved plan execution, so this read was not re-run.`,
-                  "Reuse the source still present in active context and switch to apply_patch/replace_in_file/write_file, validation, or a concrete blocker.",
-                ].join("\n")
-            : "";
-          if (shouldPushApprovedPlanReadLimit) {
-            emitToolPreflightBlocked(callbacks, {
-              reason: "read_file_repeat_limit",
-              tool: tc.name,
-              target: target || fileReadState.path,
-              message: approvedPlanReadLimitMessage,
-              toolCallId: tc.id,
-              lifecycleState: "completed",
-            });
-          }
-          const baseStub = shouldPushApprovedPlanReadLimit
-            ? approvedPlanReadLimitMessage
-            : buildFileUnchangedStub(fileReadState);
+          // An unchanged covered read is always a successful cache stub. Do
+          // not manufacture a second approved-Plan failure path after an
+          // arbitrary duplicate count; the RecoveryActionContract owns the
+          // bounded semantic no-progress budget for this request.
+          const baseStub = buildFileUnchangedStub(fileReadState);
           const closurePrompt = shouldPushPlanReadLimit
             ? `\n\n${buildPlanClosurePromptFromEvidence(callbacks, recentPlanToolActivity, attemptedPlanWriteTargets, latestUserPromptText)}`
             : "";
@@ -1312,9 +1289,7 @@ export async function partitionToolCallsForExecution(input: {
             name: tc.name,
             target,
             content,
-            displayContent: shouldPushApprovedPlanReadLimit
-              ? `READ_FILE_REPEAT_LIMIT: ${target || fileReadState.path}`
-              : `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
+            displayContent: `${FILE_UNCHANGED_STUB}: ${target || fileReadState.path}`,
             isError: false,
             readFileObservation: buildFileReadObservationIdentity({
               requestSignature: fileReadSignature,
@@ -1332,8 +1307,7 @@ export async function partitionToolCallsForExecution(input: {
       if (
         tc.name === "read_file" &&
         typeof toolArgs.path === "string" &&
-        fileReadMetadata &&
-        !bypassPatchRecoveryReadCache
+        fileReadMetadata
       ) {
         const coverage = getReadFileCoverageForPath({
           states: fileReadStates,
@@ -1468,7 +1442,6 @@ export async function partitionToolCallsForExecution(input: {
 
       if (
         cacheableReadOnlyTool &&
-        !bypassPatchRecoveryReadCache &&
         (cached || queuedReadOnlySignatures.has(signature))
       ) {
         const duplicateCount = (readOnlyDuplicateSkipCounts.get(signature) ?? 0) + 1;

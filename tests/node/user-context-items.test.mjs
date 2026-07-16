@@ -61,8 +61,15 @@ const {
   formatUserContextPathLabel,
   sanitizeUserContextItemsForPersist,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/userContextItems.ts"));
+const {
+  registerPersistedImageThumbnail,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/utils/imageUtils.ts"));
 
 test("builds mention, attachment, and image pills for a sent user message", () => {
+  registerPersistedImageThumbnail(
+    "data:image/png;base64,abc",
+    "data:image/jpeg;base64,thumbnail",
+  );
   const items = buildUserContextItems({
     contextMentions: ["/repo/src/App.tsx"],
     attachedFiles: [{
@@ -83,6 +90,7 @@ test("builds mention, attachment, and image pills for a sent user message", () =
   assert.equal(items[1].label, "report.csv");
   assert.equal(items[2].label, "截图 1");
   assert.equal(items[2].previewDataUrl, "data:image/png;base64,abc");
+  assert.equal(items[2].thumbnailDataUrl, "data:image/jpeg;base64,thumbnail");
 });
 
 test("path labels prefer workspace-relative paths and compact outside paths", () => {
@@ -90,7 +98,8 @@ test("path labels prefer workspace-relative paths and compact outside paths", ()
   assert.equal(formatUserContextPathLabel("/Users/michael/Desktop/DataFiles/report.csv", "/repo"), ".../DataFiles/report.csv");
 });
 
-test("context item sanitizer keeps pill metadata but drops image data urls", () => {
+test("context item sanitizer keeps only a hard-capped generated thumbnail", () => {
+  const thumbnailDataUrl = "data:image/jpeg;base64,thumb";
   const persistedItems = sanitizeUserContextItemsForPersist([
     {
       id: "image:0",
@@ -98,6 +107,7 @@ test("context item sanitizer keeps pill metadata but drops image data urls", () 
       label: "截图 1",
       status: "ready",
       previewDataUrl: "data:image/png;base64,abc",
+      thumbnailDataUrl,
     },
     {
       id: "mention:/repo/src/App.tsx",
@@ -110,8 +120,35 @@ test("context item sanitizer keeps pill metadata but drops image data urls", () 
 
   assert.equal(persistedItems.length, 2);
   assert.equal(persistedItems[0].previewDataUrl, undefined);
+  assert.equal(persistedItems[0].thumbnailDataUrl, thumbnailDataUrl);
   assert.equal(persistedItems[0].label, "截图 1");
   assert.equal(persistedItems[1].path, "/repo/src/App.tsx");
+});
+
+test("context item sanitizer rejects original-size or oversized preview payloads", () => {
+  const oversizedThumbnail = `data:image/jpeg;base64,${"x".repeat(24_000)}`;
+  const persisted = sanitizeUserContextItemsForPersist([
+    {
+      id: "image:0",
+      kind: "image",
+      label: "Screenshot",
+      previewDataUrl: "data:image/png;base64,original",
+      thumbnailDataUrl: oversizedThumbnail,
+    },
+  ]);
+
+  assert.equal(persisted[0].previewDataUrl, undefined);
+  assert.equal(persisted[0].thumbnailDataUrl, undefined);
+
+  const sourceReusedAsThumbnail = "data:image/png;base64,same-source";
+  const reused = sanitizeUserContextItemsForPersist([{
+    id: "image:1",
+    kind: "image",
+    label: "Screenshot 2",
+    previewDataUrl: sourceReusedAsThumbnail,
+    thumbnailDataUrl: sourceReusedAsThumbnail,
+  }]);
+  assert.equal(reused[0].thumbnailDataUrl, undefined);
 });
 
 test("context item sanitizer rejects invalid items", () => {

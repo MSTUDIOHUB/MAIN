@@ -7252,7 +7252,6 @@ function seedCloudToolProtocolScenario(scenario: string) {
         undefined,
         {
           resolvedIntent: "execute",
-          runtimeIntentOverride: "execute",
           executionConsentGranted: true,
           skipIntentResolution: true,
         },
@@ -7980,6 +7979,8 @@ function seedUserContextPillsScenario() {
   const now = Date.now();
   const previewDataUrl =
     "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=";
+  const thumbnailDataUrl =
+    "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
 
@@ -8037,6 +8038,7 @@ function seedUserContextPillsScenario() {
             label: "截图 1",
             status: "ready",
             previewDataUrl,
+            thumbnailDataUrl,
           },
           {
             id: "image:restored",
@@ -8072,6 +8074,34 @@ function seedUserContextPillsScenario() {
             ].join("\n"),
           },
         ],
+      },
+    ],
+    runtimeEvents: [
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "progress.updated",
+        threadId: "e2e-user-context-pills-thread",
+        turnId,
+        timestampMs: now,
+        progress: {
+          phase: "understanding",
+          title: "模型已报告截图观察",
+          status: "done",
+          audience: "user",
+          summary: "截图中可见文件、附件和两张截图上下文胶囊。",
+          tool: "visual_context",
+          canonicalTarget: "images:1",
+          dedupeKey: `visual-context:${turnId}`,
+          visualContext: {
+            status: "delivered",
+            expectedImageParts: 1,
+            deliveredImageParts: 1,
+            omittedImageParts: 0,
+            recognition: "observed",
+            observationSummary: "截图中可见文件、附件和两张截图上下文胶囊。",
+            observationId: "visual-e2e-observed",
+          },
+        },
       },
     ],
     conversationTurns: [

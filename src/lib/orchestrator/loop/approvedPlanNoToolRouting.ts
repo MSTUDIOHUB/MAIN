@@ -1,5 +1,4 @@
 import { shouldHandleApprovedPlanExecutionNoTool } from "../../planExecutionNoTool";
-import type { LegacyWorkflowMode } from "../../runIntent";
 import { looksLikePlanCompletionClaim } from "../../orchestrator/prompts/executePrompts";
 import { resolveApprovedPlanValidationBoundary } from "../../orchestrator/prompts/planPrompts";
 import {
@@ -21,7 +20,6 @@ export interface ApprovedPlanNoToolRoute {
 }
 
 export function resolveApprovedPlanNoToolRoute(input: {
-  workflowMode: LegacyWorkflowMode;
   isPlanApproved: boolean;
   planStage: string;
   toolCallCount: number;
@@ -43,10 +41,10 @@ export function resolveApprovedPlanNoToolRoute(input: {
     : null;
   const validationBoundary = resolveApprovedPlanValidationBoundary({
     audit: baseAudit,
-    // Older direct callers do not provide a tool surface. Default to the
-    // conservative "browser may be available" path so missing metadata never
-    // downgrades an automatable browser obligation into advisory user review.
-    availableToolNames: input.availableToolNames || new Set<string>(["browser_evaluate"]),
+    // Missing capability metadata is not evidence that a browser exists.
+    // Keep an automatable browser obligation unresolved until the actual tool
+    // surface exposes it; manual review remains advisory and cannot close it.
+    availableToolNames: input.availableToolNames || new Set<string>(),
   });
   const audit = baseAudit && validationBoundary === "pause_external_validation"
     ? { ...baseAudit, acceptedCompletion: true }
@@ -57,7 +55,6 @@ export function resolveApprovedPlanNoToolRoute(input: {
     !!audit &&
     !audit.acceptedCompletion;
   const shouldHandleApprovedPlanNoTool = shouldHandleApprovedPlanExecutionNoTool({
-    workflowMode: input.workflowMode,
     isPlanApproved: input.isPlanApproved,
     planStage: input.planStage,
     toolCallCount: input.toolCallCount,

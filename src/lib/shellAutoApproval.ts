@@ -1,6 +1,6 @@
 import type { ShellPermissionApproval, ShellPermissionDecision } from "./ipc";
 import { isPtyControlInput } from "./ptyCommandRuntime";
-import { applyShellCwd } from "./toolExecutionContract";
+import { applyShellCwd, looksDangerousShellCommand } from "./toolExecutionContract";
 
 type ShellPermissionPreflight = (
   command: string,
@@ -10,7 +10,8 @@ type ShellPermissionPreflight = (
 export interface ShellAutoApprovalResolution {
   command: string | null;
   decision?: ShellPermissionDecision;
-  approval?: ShellPermissionApproval;
+  /** True when this shell call must pass through the human review gate. */
+  requiresUserReview?: boolean;
   error?: string;
 }
 
@@ -90,6 +91,22 @@ export function buildShellPermissionApproval(
   };
 }
 
+/**
+ * Auto Review may skip MAIN's generic tool card only after the shell policy
+ * has explicitly allowed the concrete command.  An `ask` decision is a
+ * permission boundary, not an invitation for the client to mint an approval.
+ * Commands independently classified as destructive stay gated as
+ * defense in depth if a stale or custom backend policy returns `allow`.
+ */
+export function canApplyShellAutoReview(
+  resolution: ShellAutoApprovalResolution,
+): boolean {
+  if (!resolution.command) return true;
+  return !resolution.error &&
+    resolution.decision?.decision === "allow" &&
+    resolution.requiresUserReview !== true;
+}
+
 export async function resolveShellAutoApproval(input: {
   toolName: string;
   args: Record<string, unknown>;
@@ -101,17 +118,16 @@ export async function resolveShellAutoApproval(input: {
 
   try {
     const decision = await input.preflight(command, input.workspace);
-    if (decision.decision === "ask" && decision.requiresApproval) {
-      return {
-        command,
-        decision,
-        approval: buildShellPermissionApproval(decision, "session"),
-      };
-    }
-    return { command, decision };
+    return {
+      command,
+      decision,
+      requiresUserReview:
+        decision.decision === "ask" || looksDangerousShellCommand(command),
+    };
   } catch (error) {
     return {
       command,
+      requiresUserReview: true,
       error: error instanceof Error ? error.message : String(error || "Unknown shell permission preflight error"),
     };
   }

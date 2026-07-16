@@ -86,6 +86,19 @@ const END_OF_DOCUMENT_LINE_RE = /^\s*\(End of [^)]+ document\)\s*$/i;
 const PLAN_PATH_NOISE_LINE_RE = /^\s*(?:path\s*:?\s*)?\.MAIN\/plans\/[^\s]+\.md\}?\s*$/i;
 const LATEX_ARROW_RE = /\$\\(?:right|Right)arrow\$/g;
 const LATEX_DOUBLE_ARROW_RE = /\$\\(?:Right|left)arrow\$/g;
+const VISUAL_OBSERVATION_COMMENT_RE =
+  /<!--\s*MAIN_VISUAL_OBSERVATION\s*[\s\S]*?-->/gi;
+const UNTERMINATED_VISUAL_OBSERVATION_COMMENT_RE =
+  /<!--\s*MAIN_VISUAL_OBSERVATION\b[\s\S]*$/gi;
+
+/** Strip complete or interrupted internal visual-observation metadata. */
+export function stripVisualObservationProtocolComments(text: string): string {
+  return String(text || "")
+    .replace(VISUAL_OBSERVATION_COMMENT_RE, "")
+    .replace(UNTERMINATED_VISUAL_OBSERVATION_COMMENT_RE, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
 
 export interface ExtractedToolCall {
   toolName: string;
@@ -361,7 +374,9 @@ export function sanitizePlanArtifactContent(text: string): string {
 
 export function sanitizeAIOutput(text: string): string {
   if (!text) return "";
-  let out = stripModelProtocolMarkers(stripPlanBlocks(text));
+  let out = stripVisualObservationProtocolComments(
+    stripModelProtocolMarkers(stripPlanBlocks(text)),
+  );
   out = stripReasoningBlocks(out);
   out = stripRawToolCallBlocks(out);
   out = extractToolCalls(out).cleanText;
@@ -380,7 +395,7 @@ export function sanitizeVisibleAssistantText(text: string): string {
 
 export function sanitizeAssistantDisplayContent(text: string): string {
   if (!text) return "";
-  let out = stripModelProtocolMarkers(text);
+  let out = stripVisualObservationProtocolComments(stripModelProtocolMarkers(text));
   out = stripReasoningBlocks(out);
   out = stripRawToolCallBlocks(out);
   out = extractToolCalls(out).cleanText;

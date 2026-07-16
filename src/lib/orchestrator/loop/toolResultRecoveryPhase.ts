@@ -1,10 +1,10 @@
 import {
+  buildFailedValidationRepairReadLease,
   buildFailedFiniteValidationRecoveryPrompt,
   classifyFailedFiniteValidationOutcome,
   failedFiniteValidationMatchesPendingPlanEvidence,
   hasPendingPlanCommandEvidence,
   resolveFailedFiniteValidationRecoveryPolicy,
-  resolveExecuteRecoveryActionContract,
   requestedRangeFromReadObservationSignature,
   shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
@@ -39,28 +39,24 @@ import type {
 import {
   buildPlanTaskEvidenceAudit,
   inferPlanTaskEvidence,
+  isPlanTaskSourceMutationObligation,
   planTaskHasUnsatisfiedSourceMutationEvidence,
 } from "../../workflowModels";
-import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
+import {
+  buildExecuteEvidenceClosureAudit,
+  resolveCommandEvidenceRequirements,
+  scopeExecutionEvidenceLedger,
+} from "../../verificationEvidence";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
-import type { ApprovedPlanNoProgressDecision } from "./loopRecovery";
 import {
-  handleCrossIterationReadFileLoopRecovery,
   handleExecuteConvergencePrompt,
   handleNoProgressRecovery,
-  handleReadFileRepeatLimitRecovery,
-  handleRepeatedEditValidationRecovery,
   handleStrictRepeatGuardRecovery,
   handleTargetProgressLoopRecovery,
 } from "./loopRecovery";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
-import {
-  applyCrossIterationReadFileRecoveryState,
-  clearExecuteRecoveryRuntimeState,
-  resolvePtyObservationPolicyDeferral,
-  setRepeatedEditValidationRecoveryAttempts,
-} from "./executeRecoveryRuntime";
+import { resolvePtyObservationPolicyDeferral } from "./executeRecoveryRuntime";
 import type {
   PlanLoopRuntimeState,
   PlanRuntimePhaseQualitySnapshot,
@@ -79,13 +75,16 @@ import {
 import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntimeState";
 import { applyExecuteConvergencePromptState } from "./recoveryPromptRuntimeState";
 import type { AgentLoopEvidenceRuntimeState } from "./evidenceRuntimeState";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import {
   handlePlanQualityRecoveryAfterToolResults,
   shouldPauseForReviewablePlanArtifactAfterToolResults,
 } from "./planQualityRecovery";
 import { handlePlanReadOnlyConvergence } from "./planConvergence";
 import { appendToolResultsToHistory } from "./toolResultHistory";
+import {
+  joinPendingSubagentsForParent,
+  shouldJoinPendingSubagentsAfterScopeDeferral,
+} from "./subagentJoinRuntime";
 import type { TurnIterationContext } from "./turnIterationContext";
 
 type WorkflowMode = "chat" | "edit" | "plan";
@@ -123,11 +122,6 @@ type ActivateChatFinalSynthesis = (
   reason: string,
   context?: Record<string, unknown>,
 ) => void;
-
-type ApprovedPlanNoProgressAction = (input: ApprovedPlanNoProgressDecision) => void;
-type ApprovedPlanNoProgressRecoveryAction = (
-  input: ApprovedPlanNoProgressDecision,
-) => ApprovedPlanRecoveryRuntimeState;
 
 const APPROVED_PLAN_SCOPE_BLOCKED_RE = /\bAPPROVED_PLAN_SCOPE_BLOCKED\b/;
 
@@ -541,7 +535,7 @@ function resolveParentSourceRereadRequirement(input: {
   recentToolActivity: PlanToolActivitySummary[];
 }): {
   target: string;
-  requestedRange: { startLine?: number; endLine?: number; maxLines?: number };
+  requestedRange: { startLine?: number; endLine?: number; maxLines?: number } | null;
   observedVersion: string | null;
   sourceObservationKey: string | null;
 } | null {
@@ -562,7 +556,7 @@ function resolveParentSourceRereadRequirement(input: {
           endLine: sourceRange.endLine,
           maxLines: Math.max(1, sourceRange.endLine - sourceRange.startLine + 1),
         }
-      : { startLine: 1, maxLines: 180 },
+      : null,
     // The child version is diagnostic only; the parent must accept and bind
     // the current version it actually rereads in the exact delegated range.
     observedVersion: null,
@@ -577,7 +571,6 @@ export type ToolResultRecoveryPhaseResult =
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
-      approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
       completionAudit?: ApprovedPlanCompletionAudit;
     }
   | {
@@ -586,7 +579,6 @@ export type ToolResultRecoveryPhaseResult =
       loopGuardRuntimeState: AgentLoopGuardRuntimeState;
       executeRecoveryState: ExecuteRecoveryRuntimeState;
       recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
-      approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
       completionAudit?: ApprovedPlanCompletionAudit;
     };
 
@@ -621,7 +613,6 @@ export async function handleToolResultRecoveryPhase(input: {
   planRuntimeState: PlanLoopRuntimeState;
   loopGuardRuntimeState: AgentLoopGuardRuntimeState;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId" | "turnContext">;
@@ -631,8 +622,6 @@ export async function handleToolResultRecoveryPhase(input: {
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
   activateExecuteRecovery: ActivateExecuteRecovery;
   activateChatFinalSynthesis: ActivateChatFinalSynthesis;
-  continueApprovedPlanWithStrategySwitch: ApprovedPlanNoProgressRecoveryAction;
-  pauseApprovedPlanNoProgressLoop: ApprovedPlanNoProgressAction;
   setPlanRuntimePhase: SetPlanRuntimePhase;
   pauseForReviewablePlanArtifact: (
     trigger: string,
@@ -643,7 +632,6 @@ export async function handleToolResultRecoveryPhase(input: {
   let loopGuardRuntimeState = input.loopGuardRuntimeState;
   let executeRecoveryState = input.executeRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
-  let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   let completionAudit: ApprovedPlanCompletionAudit | undefined;
   const activateExecuteRecoveryAndSync: ActivateExecuteRecovery = (mode, reason, context) => {
     // The callback updates the outer loop immediately. Mirror the returned
@@ -695,6 +683,40 @@ export async function handleToolResultRecoveryPhase(input: {
     });
   }
 
+  // An active child owns this exact source scope. Close the parent's deferred
+  // tool call in protocol history, then join the child deterministically
+  // before any generic no-progress or failure accounting can run. Relying on
+  // the model to interpret the policy message and call wait_subagents caused
+  // repeated parent reads against the same lease and wasted whole iterations.
+  if (shouldJoinPendingSubagentsAfterScopeDeferral(input.results)) {
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: input.results,
+      toolArgsByCallId: input.toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    const joined = await joinPendingSubagentsForParent({
+      callbacks: input.callbacks,
+      recentToolActivity: input.recentToolActivity,
+      recentPlanToolActivity: input.recentPlanToolActivity,
+      reason: "scope_conflict",
+    });
+    logAgentEvent("parent_scope_conflict_join_completed", {
+      iteration: input.iteration,
+      joined,
+      pendingSubagentIds: input.callbacks.getPendingSubagentIds?.() || [],
+      deferredTargets: input.results
+        .filter((result) => result.qualityGateReason === "subagent_scope_policy_deferred")
+        .map((result) => result.target)
+        .filter(Boolean),
+      failureKind: "policy",
+    });
+    input.callbacks.onStatusChange("running");
+    return finish("continue");
+  }
+
   const planQualityRecovery = handlePlanQualityRecoveryAfterToolResults({
     callbacks: input.callbacks,
     workflowMode: input.workflowMode,
@@ -720,7 +742,6 @@ export async function handleToolResultRecoveryPhase(input: {
   // temporary path; only a genuinely necessary source expansion needs a new
   // reviewed revision.
   if (
-    input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved() &&
     approvedPlanScopeBlockedTargets.length > 0
   ) {
@@ -814,14 +835,16 @@ export async function handleToolResultRecoveryPhase(input: {
       "subagent_parent_source_reread_required",
       {
         target: parentSourceRereadRequirement.target,
-        requestedRange: parentSourceRereadRequirement.requestedRange,
+        ...(parentSourceRereadRequirement.requestedRange
+          ? { requestedRange: parentSourceRereadRequirement.requestedRange }
+          : {}),
         observedVersion: parentSourceRereadRequirement.observedVersion,
         sourceObservationKey: parentSourceRereadRequirement.sourceObservationKey,
       },
     );
     input.callbacks.appendMessage({
       role: "user",
-      content: `PARENT_SOURCE_READ_LEASE: Read only ${parentSourceRereadRequirement.target} in the leased range, then continue with the pending parent mutation. Do not reopen broad investigation.`,
+      content: `PARENT_SOURCE_READ_LEASE: Read ${parentSourceRereadRequirement.target}${parentSourceRereadRequirement.requestedRange ? " in the delegated range" : " with the ordinary bounded file window"}, then continue with the pending parent mutation. Do not reopen broad investigation.`,
     });
     logAgentEvent("subagent_parent_reread_recovery_activated", {
       iteration: input.iteration,
@@ -846,7 +869,6 @@ export async function handleToolResultRecoveryPhase(input: {
         executeRecoveryState.decisionCheckpoint?.nextRequiredCapability === "targeting"
       )
     ) &&
-    input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved() &&
     isMutationRuntimeIntent(input.runtimeIntent)
       ? resolveApprovedPlanMutationContextDecision({
@@ -1013,10 +1035,6 @@ export async function handleToolResultRecoveryPhase(input: {
         : "reuse the bound source observation and perform the mutation without reopening diagnosis",
     });
     input.callbacks.onStatusChange("running");
-    input.callbacks.appendMessage({
-      role: "user",
-      content: "SOURCE_CONTEXT_LOCKED: The approved task now has one exact versioned source observation. Do not read or investigate again. Call exactly one exposed mutation tool for this target and implement the reviewed change.",
-    });
     return finish("continue");
   }
 
@@ -1024,9 +1042,10 @@ export async function handleToolResultRecoveryPhase(input: {
   // approved revision has fresh trusted evidence, do not spend another model
   // turn asking it to narrate or declare completion.  Persist the current tool
   // results first, then close the execution lease deterministically.
-  if (input.workflowMode === "plan" && input.callbacks.getIsPlanApproved()) {
+  if (input.callbacks.getIsPlanApproved()) {
+    const planTasks = input.callbacks.getPlanTasks();
     const baseAudit = buildPlanTaskEvidenceAudit({
-      tasks: input.callbacks.getPlanTasks(),
+      tasks: planTasks,
       evidenceLedger: input.callbacks.getPlanExecutionEvidenceLedger(),
       highlightNext: true,
     });
@@ -1042,6 +1061,12 @@ export async function handleToolResultRecoveryPhase(input: {
       // External/user review can remain pending after automation completes, but
       // it cannot substitute for a fresh automatic check after a mutation.
       validationExpected: true,
+      mutationExpected: planTasks.some(isPlanTaskSourceMutationObligation),
+      transactionId: input.iterationContext.eventTurnId,
+      requiredCommandEvidence: resolveCommandEvidenceRequirements({
+        tasks: planTasks,
+        commandDirective: input.callbacks.getCommandDirective?.() || null,
+      }),
     });
     if (
       audit.totalCount > 0 &&
@@ -1089,11 +1114,15 @@ export async function handleToolResultRecoveryPhase(input: {
   }
 
   const devServerRuntime = resolveDevServerRuntimeState(
-    input.callbacks.getPlanExecutionEvidenceLedger(),
+    scopeExecutionEvidenceLedger(
+      input.callbacks.getPlanExecutionEvidenceLedger(),
+      input.iterationContext.eventTurnId,
+    ),
   );
   const devServerEvidenceGap = buildExecuteEvidenceClosureAudit({
     ledger: input.callbacks.getPlanExecutionEvidenceLedger(),
     validationExpected: true,
+    transactionId: input.iterationContext.eventTurnId,
   }).gap;
   const shouldObservePty =
     devServerRuntime.nextCapability === "observe_pty" &&
@@ -1101,8 +1130,21 @@ export async function handleToolResultRecoveryPhase(input: {
   const shouldBrowserValidate =
     devServerRuntime.nextCapability === "browser" &&
     devServerEvidenceGap === "browser_validation_required";
+  const devServerRecoveryCapability = shouldObservePty
+    ? "observe_pty"
+    : shouldBrowserValidate
+    ? "browser_validation"
+    : null;
+  const currentRecoveryCapability =
+    executeRecoveryState.decisionCheckpoint?.nextRequiredCapability || null;
   const canEnterDevServerEvidenceRecovery =
-    executeRecoveryState.mode === "normal" &&
+    Boolean(
+      devServerRecoveryCapability &&
+      (
+        executeRecoveryState.mode === "normal" ||
+        currentRecoveryCapability !== devServerRecoveryCapability
+      )
+    ) &&
     isMutationRuntimeIntent(input.runtimeIntent) &&
     (input.workflowMode !== "plan" || input.callbacks.getIsPlanApproved());
   if (canEnterDevServerEvidenceRecovery && (shouldObservePty || shouldBrowserValidate)) {
@@ -1114,14 +1156,26 @@ export async function handleToolResultRecoveryPhase(input: {
       iterationContext: input.iterationContext,
       emitTurnEvent: input.emitTurnEvent,
     });
-    const nextCapability = shouldObservePty ? "observe_pty" : "browser_validation";
+    const nextCapability = devServerRecoveryCapability as
+      | "observe_pty"
+      | "browser_validation";
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "validation_only",
       shouldObservePty
         ? "long_process_pty_observation_required"
         : "ready_server_browser_validation_required",
       {
-        nextCapability,
+        decisionCheckpoint: {
+          expectedTarget: executeRecoveryState.expectedTarget,
+          sourceObservationKey: executeRecoveryState.sourceObservationKey,
+          nextRequiredCapability: nextCapability,
+          ...(executeRecoveryState.decisionCheckpoint?.planTaskId
+            ? { planTaskId: executeRecoveryState.decisionCheckpoint.planTaskId }
+            : {}),
+          ...(executeRecoveryState.decisionCheckpoint?.requirementRef
+            ? { requirementRef: executeRecoveryState.decisionCheckpoint.requirementRef }
+            : {}),
+        },
         requestedUrl: devServerRuntime.url,
         foregroundGeneration: devServerRuntime.foregroundGeneration,
         outputSequence: devServerRuntime.outputSequence,
@@ -1174,8 +1228,6 @@ export async function handleToolResultRecoveryPhase(input: {
     planReadOnlyConvergenceBatches: planRuntimeState.planReadOnlyConvergenceBatches,
     planReadOnlyConvergenceTools: planRuntimeState.planReadOnlyConvergenceTools,
     remainingTaskText: input.remainingTaskText,
-    approvedPlanNoProgressRecoveryAttempts:
-      input.approvedPlanRecoveryState.approvedPlanNoProgressRecoveryAttempts,
     tracking: getNoProgressTrackingRuntimeState(loopGuardRuntimeState),
     activateExecuteRecovery: activateExecuteRecoveryAndSync,
     activateChatFinalSynthesis: input.activateChatFinalSynthesis,
@@ -1193,7 +1245,6 @@ export async function handleToolResultRecoveryPhase(input: {
   }
   let pendingExecuteRecoveryPrompt = noProgressRecovery.pendingExecuteRecoveryPrompt;
   let pendingExecuteNoProgressPause = noProgressRecovery.pendingExecuteNoProgressPause;
-  const approvedPlanNoProgressDecision = noProgressRecovery.approvedPlanNoProgressDecision;
 
   loopGuardRuntimeState = applyToolFailureSignatureRuntimeState(
     loopGuardRuntimeState,
@@ -1240,7 +1291,6 @@ export async function handleToolResultRecoveryPhase(input: {
       })
     : null;
   const remainingPlanTasksAfterFailedFiniteValidation = failedFiniteValidation &&
-    input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved()
     ? buildPlanTaskEvidenceAudit({
         tasks: input.callbacks.getPlanTasks(),
@@ -1252,7 +1302,6 @@ export async function handleToolResultRecoveryPhase(input: {
   if (
     failedFiniteValidation &&
     failedFiniteValidationOutcome === "invocation_error" &&
-    input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved() &&
     hasPendingPlanCommandEvidence(remainingPlanTasksAfterFailedFiniteValidation)
   ) {
@@ -1303,18 +1352,41 @@ export async function handleToolResultRecoveryPhase(input: {
   if (
     failedFiniteValidation &&
     failedValidationMatchesPendingTask &&
-    input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved()
   ) {
     // A validation that actually ran has produced a source/test/config
-    // diagnostic. Command-only recovery cannot fix it. Return the next turn to
-    // the normal repair surface; the failed command remains negative evidence
-    // until that same concrete command succeeds.
-    executeRecoveryState = clearExecuteRecoveryRuntimeState(executeRecoveryState);
+    // diagnostic. Command-only recovery cannot fix it, but the current
+    // transaction target and failed evidence must remain owned by the same
+    // contract. Returning to `normal` here used to reopen broad discovery.
+    const repairTarget = executeRecoveryState.expectedTarget;
+    const repairReadLease = repairTarget
+      ? buildFailedValidationRepairReadLease({
+          target: repairTarget,
+          sourceObservationKey: executeRecoveryState.sourceObservationKey,
+        })
+      : null;
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "mutation_first",
+      "failed_finite_validation_requires_repair",
+      {
+        expectedTarget: repairTarget,
+        ...(repairReadLease ? { readLease: repairReadLease } : {}),
+        ...(repairReadLease ? { sourceObservationKey: null } : {}),
+        decisionCheckpoint: {
+          expectedTarget: repairTarget,
+          sourceObservationKey: repairReadLease
+            ? null
+            : executeRecoveryState.sourceObservationKey,
+          nextRequiredCapability: repairReadLease ? "targeted_read" : "mutation",
+        },
+      },
+    );
     const recoveryPrompt = [
       "FINITE_VALIDATION_REPAIR_REQUIRED: The finite validation command executed, but its validation failed.",
       `Failed command: ${failedFiniteValidationCommand}`,
-      "MAIN restored the normal read/mutation/validation tool surface. Inspect the structured stdout/stderr/exitCode already returned, repair the implicated source, test, or configuration, then rerun this same command.",
+      repairReadLease
+        ? `MAIN retained the current execution transaction. Read the current ${repairTarget} source once because the successful mutation invalidated its pre-mutation observation; then repair the diagnostic and rerun this same command.`
+        : "MAIN retained the current execution transaction. Inspect the structured stdout/stderr/exitCode already returned, repair the implicated source, test, or configuration, then rerun this same command.",
       "Do not substitute an unrelated successful command: this failed validation remains pending Plan evidence until the same concrete command succeeds.",
     ].join("\n");
     logAgentEvent("approved_plan_finite_validation_requires_repair", {
@@ -1323,13 +1395,20 @@ export async function handleToolResultRecoveryPhase(input: {
       target: failedFiniteValidation.target || "",
       previousRecoveryMode: input.executeRecoveryState.mode,
       nextRecoveryMode: executeRecoveryState.mode,
+      nextRequiredCapability:
+        executeRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
+      repairReadLeaseRange: repairReadLease?.requestedRange || null,
     });
     input.emitPlanExecutionProgress("running", {
-      currentTool: "apply_patch",
+      currentTool: repairReadLease ? "read_file" : "apply_patch",
       recoveryReason: "failed_finite_validation_requires_repair",
       nextStep: input.callbacks.getPreferredLanguage() === "zh"
-        ? "根据命令诊断修复源码、测试或配置，然后重新运行同一验证命令"
-        : "repair the diagnosed source, test, or configuration issue, then rerun the same validation command",
+        ? repairReadLease
+          ? "先读取修改后的当前源码，再根据命令诊断修复并重新运行同一验证命令"
+          : "根据命令诊断修复源码、测试或配置，然后重新运行同一验证命令"
+        : repairReadLease
+          ? "read the current post-mutation source, repair the diagnostic, then rerun the same validation command"
+          : "repair the diagnosed source, test, or configuration issue, then rerun the same validation command",
     });
     input.callbacks.onStatusChange("running");
     input.callbacks.appendMessage({ role: "user", content: recoveryPrompt });
@@ -1349,55 +1428,6 @@ export async function handleToolResultRecoveryPhase(input: {
     return finish("goal_completed");
   }
 
-  const readFileRepeatLimitRecovery = handleReadFileRepeatLimitRecovery({
-    callbacks: input.callbacks,
-    workflowMode: input.workflowMode,
-    runtimeIntent: input.runtimeIntent,
-    iteration: input.iteration,
-    results: input.results,
-    recentPlanToolActivity: input.recentPlanToolActivity,
-    recentToolActivity: input.recentToolActivity,
-    executeRecoveryAttempts: executeRecoveryState.attempts,
-    activateExecuteRecovery: activateExecuteRecoveryAndSync,
-    emitTaskOrchestratorPhase: input.emitTaskOrchestratorPhase,
-  });
-  if (readFileRepeatLimitRecovery.status === "stopped") {
-    return finish("stopped");
-  }
-  if (readFileRepeatLimitRecovery.status === "pending_prompt") {
-    pendingExecuteRecoveryPrompt = readFileRepeatLimitRecovery.prompt;
-  }
-
-  const crossIterationReadFileRecovery = handleCrossIterationReadFileLoopRecovery({
-    callbacks: input.callbacks,
-    workflowMode: input.workflowMode,
-    runtimeIntent: input.runtimeIntent,
-    iteration: input.iteration,
-    results: input.results,
-    snapshotContextLimit: input.snapshotContextLimit,
-    crossIterationFileReads: loopGuardRuntimeState.crossIterationFileReads,
-    executeRecoveryMode: executeRecoveryState.mode,
-    executeRecoveryReason: executeRecoveryState.reason,
-    recoveryActionContract: resolveExecuteRecoveryActionContract(executeRecoveryState.mode, {
-      expectedTarget: executeRecoveryState.expectedTarget,
-      readLease: executeRecoveryState.readLease,
-      sourceObservationKey: executeRecoveryState.sourceObservationKey,
-      decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
-      phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
-      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
-      protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
-    }),
-    consecutiveBlockedReadFileInRecoveryCount:
-      executeRecoveryState.consecutiveBlockedReadFileCount,
-    activateExecuteRecovery: activateExecuteRecoveryAndSync,
-  });
-  executeRecoveryState = applyCrossIterationReadFileRecoveryState(executeRecoveryState, {
-    mode: crossIterationReadFileRecovery.executeRecoveryMode,
-    reason: crossIterationReadFileRecovery.executeRecoveryReason,
-    consecutiveBlockedReadFileCount:
-      crossIterationReadFileRecovery.consecutiveBlockedReadFileInRecoveryCount,
-  });
-
   if (input.unityMcpFallbackPrompt) {
     input.callbacks.appendMessage({
       role: "user",
@@ -1405,35 +1435,6 @@ export async function handleToolResultRecoveryPhase(input: {
     });
   }
 
-  const repeatedEditValidationRecovery = handleRepeatedEditValidationRecovery({
-    callbacks: input.callbacks,
-    workflowMode: input.workflowMode,
-    runtimeIntent: input.runtimeIntent,
-    iteration: input.iteration,
-    results: input.results,
-    availableToolNames: input.availableToolNames,
-    recentToolActivity: input.recentToolActivity,
-    successfulEditTargetsSinceVerification:
-      loopGuardRuntimeState.successfulEditTargetsSinceVerification,
-    repeatedEditValidationRecoveryAttempts:
-      executeRecoveryState.repeatedEditValidationAttempts,
-    activateExecuteRecovery: activateExecuteRecoveryAndSync,
-    emitPlanExecutionProgress: input.emitPlanExecutionProgress,
-  });
-  executeRecoveryState = setRepeatedEditValidationRecoveryAttempts(
-    executeRecoveryState,
-    repeatedEditValidationRecovery.repeatedEditValidationRecoveryAttempts,
-  );
-  if (repeatedEditValidationRecovery.status === "stopped") {
-    return finish("stopped");
-  }
-  if (repeatedEditValidationRecovery.status === "pending_prompt") {
-    input.callbacks.appendMessage({
-      role: "user",
-      content: repeatedEditValidationRecovery.prompt,
-    });
-    return finish("continue");
-  }
   if (pendingExecuteRecoveryPrompt) {
     input.callbacks.onStatusChange("running");
     input.callbacks.appendMessage({
@@ -1465,17 +1466,6 @@ export async function handleToolResultRecoveryPhase(input: {
       content: pendingPlanRuntimeRecoveryPrompt,
     });
     return finish("continue");
-  }
-
-  if (approvedPlanNoProgressDecision) {
-    if (approvedPlanNoProgressDecision.action === "recover") {
-      approvedPlanRecoveryState = input.continueApprovedPlanWithStrategySwitch(
-        approvedPlanNoProgressDecision,
-      );
-      return finish("continue");
-    }
-    input.pauseApprovedPlanNoProgressLoop(approvedPlanNoProgressDecision);
-    return finish("stopped");
   }
 
   const planReadOnlyConvergence = handlePlanReadOnlyConvergence({
@@ -1538,14 +1528,13 @@ export async function handleToolResultRecoveryPhase(input: {
   }
 
   if (
-    input.workflowMode === "plan" &&
     input.callbacks.getIsPlanApproved() &&
     input.results.some((result) => !result.isError)
   ) {
     input.callbacks.onPlanStageChanged("executing");
   }
 
-  if (input.workflowMode === "plan" && input.callbacks.getIsPlanApproved()) {
+  if (input.callbacks.getIsPlanApproved()) {
     if (input.results.some((result) => result.isError)) {
       input.emitPlanExecutionProgress("tool_error");
     } else if (input.results.some((result) => !result.isError)) {
@@ -1556,10 +1545,10 @@ export async function handleToolResultRecoveryPhase(input: {
   const strictRepeatGuardRecovery = handleStrictRepeatGuardRecovery({
     callbacks: input.callbacks,
     workspace: input.workspace,
-    workflowMode: input.workflowMode,
     runtimeIntent: input.runtimeIntent,
     iteration: input.iteration,
     effectiveToolCalls: input.effectiveToolCalls,
+    results: input.results,
     recentToolCalls: loopGuardRuntimeState.recentToolCalls,
     repeatGuardRecoveredSignatures:
       loopGuardRuntimeState.repeatGuardRecoveredSignatures,
@@ -1621,9 +1610,6 @@ export async function handleToolResultRecoveryPhase(input: {
     pendingExecuteRecovery: !!pendingExecuteRecoveryPrompt,
     pendingPlanRecovery: !!pendingPlanRuntimeRecoveryPrompt,
     usedExecuteConvergencePrompt: recoveryPromptState.usedExecuteConvergencePrompt,
-    repeatedEditTargets: Array.from(
-      loopGuardRuntimeState.successfulEditTargetsSinceVerification.entries(),
-    ).slice(-6),
     runtimeIntent: input.runtimeIntent,
     workflowMode: input.workflowMode,
     planApproved: input.callbacks.getIsPlanApproved(),
@@ -1640,7 +1626,6 @@ export async function handleToolResultRecoveryPhase(input: {
       loopGuardRuntimeState,
       executeRecoveryState,
       recoveryPromptState,
-      approvedPlanRecoveryState,
       ...(completionAudit ? { completionAudit } : {}),
     };
   }

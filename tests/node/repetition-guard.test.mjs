@@ -96,6 +96,23 @@ test("read-only shell inspection includes safe find commands", () => {
   );
 });
 
+test("shell commands with write or execution arguments are never classified as read-only", () => {
+  for (const command of [
+    "find . -delete",
+    "find src -exec rm {} ;",
+    "sort package.json -o src/unplanned.ts",
+    "sed -n '1w src/unplanned.ts' package.json",
+    "git diff --output=src/unplanned.patch",
+    "git diff --ext-diff",
+  ]) {
+    assert.equal(
+      isReadOnlyShellInspectionToolCall("run_command", { command }),
+      false,
+      command,
+    );
+  }
+});
+
 test("repeat guard keeps non-inspection shell commands on the strict threshold", () => {
   const args = { command: "npm test" };
   const history = [];
@@ -238,5 +255,12 @@ test("target progress guard converges repeated shell writes to the same file", (
   assert.match(
     formatTargetProgressLoopRecoveryMessage(result.family, result.targetKey, result.threshold),
     /shell-write target/,
+  );
+  assert.equal(
+    getShellMutationTargetForLoopGuard("run_command", {
+      command: "npm test -- src-tauri/icons/icon.png",
+    }),
+    null,
+    "a file argument without a structural write operation is not a shell mutation",
   );
 });

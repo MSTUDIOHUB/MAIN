@@ -1,6 +1,7 @@
 import type { ToolLifecycleState } from "./runtimeTools";
 import type { SubagentActivity, SubagentRunPatch, SubagentRunSnapshot } from "./subagents";
 import type { ActionRequestKind } from "./actionRequest";
+import type { VisualContextDeliveryState } from "./visualContext";
 
 export const MAIN_THREAD_EVENT_SCHEMA_VERSION = 2 as const;
 
@@ -49,6 +50,8 @@ export interface MainThreadProgressUpdate {
   dedupeKey?: string;
   repeatCount?: number;
   iteration?: number;
+  /** Exact visual-input delivery state; delivery is not recognition evidence. */
+  visualContext?: VisualContextDeliveryState;
   /** Internal diagnostics are persisted/logged but never projected as user work. */
   audience?: "user" | "internal";
 }
@@ -86,12 +89,32 @@ export function normalizeMainThreadProgressUpdate(
       .map((id) => String(id || "").trim())
       .filter(Boolean),
   )).slice(0, 12);
+  const visualContext = progress.visualContext && typeof progress.visualContext === "object"
+    ? {
+        status: progress.visualContext.status,
+        expectedImageParts: Math.max(0, Math.floor(Number(progress.visualContext.expectedImageParts) || 0)),
+        deliveredImageParts: Math.max(0, Math.floor(Number(progress.visualContext.deliveredImageParts) || 0)),
+        omittedImageParts: Math.max(0, Math.floor(Number(progress.visualContext.omittedImageParts) || 0)),
+        ...(progress.visualContext.recognition === "pending" ||
+        progress.visualContext.recognition === "observed" ||
+        progress.visualContext.recognition === "unverified"
+          ? { recognition: progress.visualContext.recognition }
+          : {}),
+        ...(progress.visualContext.observationSummary
+          ? { observationSummary: String(progress.visualContext.observationSummary).trim().slice(0, 360) }
+          : {}),
+        ...(progress.visualContext.observationId
+          ? { observationId: String(progress.visualContext.observationId).trim().slice(0, 96) }
+          : {}),
+      }
+    : undefined;
 
   return {
     ...progress,
     ...(tool ? { tool } : {}),
     ...(canonicalTarget ? { target: canonicalTarget, canonicalTarget } : {}),
     sourceToolCallIds,
+    ...(visualContext ? { visualContext } : {}),
   };
 }
 

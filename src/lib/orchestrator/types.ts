@@ -317,6 +317,8 @@ export interface OrchestratorCallbacks {
       diff?: ToolDiffPreview;
       internalFeedback?: boolean;
       qualityGateReason?: string | null;
+      /** Exact structured payload for evidence parsing when the UI result is truncated. */
+      evidenceResult?: string;
     },
   ) => void;
   /** Structured post-execution observation used by non-UI evidence collectors. */

@@ -10,9 +10,11 @@ import {
 import type { AgentLoopOutcome, OrchestratorCallbacks } from "../types";
 import {
   buildExecuteEvidenceClosureAudit,
+  resolveCommandEvidenceRequirements,
   type ExecuteEvidenceClosureAudit,
 } from "../../verificationEvidence";
 import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
+import { resolveApprovedPlanTurnExpectations } from "./turnContractRuntime";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 type NonActionableStopReason = Parameters<OrchestratorCallbacks["onNonActionableStop"]>[1];
@@ -48,10 +50,20 @@ function describeEvidenceClosureGap(
 ): { message: string; nextStep: string } {
   if (language === "zh") {
     switch (audit.gap) {
+      case "mutation_required":
+        return {
+          message: "执行已暂停：本轮明确要求修改，但证据账本中没有任何真实文件修改。成功命令不能替代缺失的源码写入。",
+          nextStep: "复用已读源码，执行目标内的真实修改，再运行对应验证。",
+        };
+      case "validation_required":
+        return {
+          message: "执行已暂停：本轮是命令或 Git 执行任务，虽然不要求修改文件，但证据账本中没有成功的目标命令证据。其他只读工具不能替代实际执行。",
+          nextStep: "执行任务要求的命令并保存成功结果；若命令失败，请如实报告失败而不是完成。",
+        };
       case "pty_observation_required":
         return {
           message: "执行已暂停：开发服务器已启动，但最新修改之后尚未获得同一 PTY generation 的就绪观察。PTY_BUSY 只表示当前集成 PTY 正承载前台服务，不表示端口或所有终端不可用。",
-          nextStep: "调用 get_pty_status 或 read_pty_since 观察现有进程；确认 ready URL 后再做浏览器验收。",
+          nextStep: "调用 get_pty_status 或 read_pty_since 观察现有进程；确认 ready 后重新核对剩余义务，仅在存在浏览器交互义务时进入浏览器验收。",
         };
       case "browser_validation_required":
         return {
@@ -71,10 +83,20 @@ function describeEvidenceClosureGap(
     }
   }
   switch (audit.gap) {
+    case "mutation_required":
+      return {
+        message: "Execution paused: this turn required a mutation, but the evidence ledger contains no real file change. A successful command cannot substitute for the missing source edit.",
+        nextStep: "Reuse the observed source, make the in-scope change, then run the corresponding validation.",
+      };
+    case "validation_required":
+      return {
+        message: "Execution paused: this command or Git task did not require a file mutation, but the ledger contains no successful command evidence for the requested operation. Other read-only tools cannot substitute for execution.",
+        nextStep: "Run the requested command and retain its successful result; if it fails, report the failure instead of completion.",
+      };
     case "pty_observation_required":
       return {
         message: "Execution paused: the dev server was launched, but no ready observation for the current PTY generation exists after the latest mutation. PTY_BUSY means this integrated PTY is hosting a foreground process; it does not mean the port or every terminal is unavailable.",
-        nextStep: "Observe the existing process with get_pty_status or read_pty_since, then browser-validate the ready URL.",
+        nextStep: "Observe the existing process with get_pty_status or read_pty_since, then reconcile the remaining obligations; enter browser validation only when an interaction obligation exists.",
       };
     case "browser_validation_required":
       return {
@@ -113,10 +135,12 @@ export function resolveFinalTurnContractForCompletion(input: {
   if (input.latestTurnContract) return input.latestTurnContract;
   const { callbacks } = input;
   const finalRuntimeIntent: ResolvedUserIntent =
-    callbacks.getRuntimeRunIntent?.() ??
-    (callbacks.getCurrentRunIntent() === "plan" && callbacks.getIsPlanApproved()
-      ? "execute"
-      : callbacks.getCurrentRunIntent());
+    callbacks.getRuntimeRunIntent?.() ?? callbacks.getCurrentRunIntent();
+  const approvedPlanExpectations = resolveApprovedPlanTurnExpectations({
+    planApproved: callbacks.getIsPlanApproved(),
+    tasks: callbacks.getPlanTasks(),
+    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+  });
   return buildEffectiveTurnContract({
     conversationIntent: callbacks.getCurrentRunIntent(),
     runtimeIntent: finalRuntimeIntent,
@@ -125,6 +149,7 @@ export function resolveFinalTurnContractForCompletion(input: {
     executionConsentGranted:
       callbacks.getExecutionConsentGranted?.() === true ||
       callbacks.getIsPlanApproved(),
+    ...approvedPlanExpectations,
   });
 }
 
@@ -136,7 +161,7 @@ export function runApprovedPlanCompletionGuard(input: {
 }): AgentLoopOutcome | null {
   const { outcome, callbacks, sawExecutionEvidence } = input;
   if (outcome.status !== "completed") return null;
-  if (callbacks.getWorkflowMode() !== "plan" || !callbacks.getIsPlanApproved()) return null;
+  if (!callbacks.getIsPlanApproved()) return null;
   if (callbacks.getIsApprovedPlanExecutionTransitionPending?.() === true) {
     logAgentEvent("plan_completion_guard_deferred_pending_same_turn_execution", {
       reason: "approval_transition_not_consumed_by_current_loop",
@@ -156,6 +181,11 @@ export function runApprovedPlanCompletionGuard(input: {
   const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
     ledger: callbacks.getPlanExecutionEvidenceLedger(),
     validationExpected: true,
+    transactionId: callbacks.getCurrentTurnId?.() || null,
+    requiredCommandEvidence: resolveCommandEvidenceRequirements({
+      tasks: callbacks.getPlanTasks(),
+      commandDirective: callbacks.getCommandDirective?.() || null,
+    }),
   });
   const activeRecoveryPending = Boolean(
     input.executeRecoveryState && input.executeRecoveryState.mode !== "normal",
@@ -252,29 +282,38 @@ export function runExecutionEvidenceCompletionGuard(input: {
   const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
     ledger: callbacks.getPlanExecutionEvidenceLedger(),
     validationExpected: finalTurnContract.validationExpected === true,
+    mutationExpected: finalTurnContract.mutationExpected === true,
+    transactionId: callbacks.getCurrentTurnId?.() || null,
+    requiredCommandEvidence: resolveCommandEvidenceRequirements({
+      tasks: callbacks.getIsPlanApproved()
+        ? callbacks.getPlanTasks()
+        : [],
+      commandDirective: callbacks.getCommandDirective?.() || null,
+    }),
   });
   const missingAnyExecutionEvidence = !sawExecutionEvidence;
-  const missingRequiredValidationClosure =
+  const missingRequiredEvidenceClosure =
     !evidenceClosureAudit.completionAllowed &&
     (
+      finalTurnContract.mutationExpected === true ||
       finalTurnContract.validationExpected === true ||
       evidenceClosureAudit.unresolvedFailureCount > 0
     );
   const activeRecoveryPending = Boolean(
     executeRecoveryState && executeRecoveryState.mode !== "normal",
   );
-  if (!missingAnyExecutionEvidence && !missingRequiredValidationClosure && !activeRecoveryPending) return null;
+  if (!missingAnyExecutionEvidence && !missingRequiredEvidenceClosure && !activeRecoveryPending) return null;
 
   const language = callbacks.getPreferredLanguage();
   const recoveryGap = activeRecoveryPending && executeRecoveryState
     ? describePendingRecoveryPhase(executeRecoveryState, language)
     : null;
-  const closureGap = recoveryGap || (missingRequiredValidationClosure
+  const closureGap = recoveryGap || (missingRequiredEvidenceClosure
     ? describeEvidenceClosureGap(evidenceClosureAudit, language)
     : null);
   logAgentEvent(
-    missingRequiredValidationClosure
-      ? "execute_completion_outcome_without_post_mutation_validation"
+    missingRequiredEvidenceClosure
+      ? "execute_completion_outcome_with_evidence_gap"
       : "execute_completion_outcome_without_evidence",
     {
     conversationIntent: finalTurnContract.conversationIntent,
@@ -302,7 +341,9 @@ export function runExecutionEvidenceCompletionGuard(input: {
       phase: "paused",
       recoveryReason: activeRecoveryPending
         ? "execution_evidence_gap:recovery_phase_pending"
-        : missingRequiredValidationClosure
+        : missingAnyExecutionEvidence
+        ? "execution_evidence_required"
+        : missingRequiredEvidenceClosure
         ? `execution_evidence_gap:${evidenceClosureAudit.gap}`
         : "execution_evidence_required",
       nextStep: closureGap?.nextStep || (language === "zh"
@@ -315,7 +356,9 @@ export function runExecutionEvidenceCompletionGuard(input: {
     status: "stopped_no_action",
     reason: activeRecoveryPending
       ? "execution_evidence_gap:recovery_phase_pending"
-      : missingRequiredValidationClosure
+      : missingAnyExecutionEvidence
+      ? "execution_evidence_required"
+      : missingRequiredEvidenceClosure
       ? `execution_evidence_gap:${evidenceClosureAudit.gap}`
       : "execution_evidence_required",
   };
@@ -332,7 +375,6 @@ export function runAgentLoopCompletionGuards(input: {
   if (approvedPlanGuardOutcome) return approvedPlanGuardOutcome;
 
   const approvedPlanAlreadyAudited =
-    input.callbacks.getWorkflowMode() === "plan" &&
     input.callbacks.getIsPlanApproved();
   const finalTurnContract = resolveFinalTurnContractForCompletion({
     callbacks: input.callbacks,

@@ -62,6 +62,7 @@ const {
 );
 const {
   collectRuntimeTaskCandidateLines,
+  deriveRuntimeValidationTasksFromUserRequest,
   inferPlanTaskEvidence,
   isRuntimeTaskActionableText,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
@@ -768,6 +769,312 @@ test("approval task projection keeps the real OMLX deterministic evidence change
   assert.ok(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts")
   ));
+});
+
+test("approval preserves an explicit user UI interaction when a compact Plan collapses validation into commands", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Toolbar behavior fix",
+    "",
+    "## Summary",
+    "- Fix the toolbar action binding without changing unrelated editor behavior.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.js` owns the toolbar initialization path.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.js` to bind the rendered toolbar actions.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API changes.",
+    "",
+    "## Test Plan",
+    "- Run `npm run build`.",
+    "- Run `npm run dev` and validate toolbar functionality in the browser.",
+    "",
+    "## Assumptions",
+    "- Preserve unrelated editor behavior.",
+  ].join("\n"));
+  const state = baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+    conversationTurns: [{
+      id: "turn-1",
+      userPrompt: "修复工具栏。批准后运行 npm build/dev，再通过浏览器实际点击 New 并检查编辑器内容清空、状态栏变为 new。",
+    }],
+  });
+
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(state, "zh");
+  const interaction = executionPlanTasks.find((entry) =>
+    entry.evidence?.some((evidence) =>
+      evidence.kind === "browser_dom" && evidence.requiresInteraction === true
+    )
+  );
+
+  assert.ok(interaction, JSON.stringify(executionPlanTasks));
+  assert.match(interaction.text, /点击 New/i);
+  assert.equal(interaction.validationCapability, "browser_dom");
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "cmd" && evidence.value === "npm run build")
+  ));
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "cmd" && evidence.value === "npm run dev")
+  ));
+
+  const resumedTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: executionPlanTasks,
+    isPlanApproved: true,
+    conversationTurns: [{ id: "turn-1", userPrompt: "Continue the approved plan." }],
+  }), "zh");
+  assert.ok(resumedTasks.some((entry) =>
+    /^USER-VALIDATION-/.test(entry.requirementRef || "") &&
+    entry.evidence?.some((evidence) =>
+      evidence.kind === "browser_dom" && evidence.requiresInteraction === true
+    )
+  ), JSON.stringify(resumedTasks));
+});
+
+test("approval does not duplicate a durable interaction already owned by the reviewed Plan", () => {
+  const userPrompt = "修复工具栏；批准后通过浏览器实际点击 New，并检查状态栏变为 new。";
+  const compactArtifact = reviewablePlanArtifact([
+    "# Toolbar behavior fix",
+    "",
+    "## Summary",
+    "- Fix toolbar behavior.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.js` owns toolbar initialization.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.js` to bind toolbar actions.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API changes.",
+    "",
+    "## Test Plan",
+    "- Run `npm run build`.",
+    "",
+    "## Assumptions",
+    "- Preserve unrelated behavior.",
+  ].join("\n"));
+  const initialTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [compactArtifact],
+    isPlanApproved: false,
+    conversationTurns: [{ id: "turn-1", userPrompt }],
+  }), "zh");
+  assert.equal(initialTasks.filter((task) => /^USER-VALIDATION-/.test(task.requirementRef || "")).length, 1);
+
+  const reviewedArtifact = reviewablePlanArtifact([
+    "# Toolbar behavior fix",
+    "",
+    "## Summary",
+    "- Fix toolbar behavior.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.js` owns toolbar initialization.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.js` to bind toolbar actions.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API changes.",
+    "",
+    "## Test Plan",
+    "- Run `npm run build`.",
+    "- 使用浏览器工具实际点击 `#new-btn`，随后检查状态栏变为 new。",
+    "- 使用浏览器工具实际点击 `#open-btn`，随后检查状态栏变为 open。",
+    "- 使用浏览器工具实际点击 `#save-btn`，随后检查状态栏变为 save。",
+    "",
+    "## Assumptions",
+    "- Preserve unrelated behavior.",
+  ].join("\n"));
+  const executionTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [reviewedArtifact],
+    planTasks: initialTasks,
+    isPlanApproved: true,
+    conversationTurns: [{ id: "turn-1", userPrompt }],
+  }), "zh");
+  const newInteractions = executionTasks.filter((task) =>
+    task.evidence?.some((evidence) =>
+      evidence.kind === "browser_dom" &&
+      evidence.requiresInteraction === true &&
+      /new/i.test(evidence.value)
+    )
+  );
+
+  assert.equal(newInteractions.length, 1, JSON.stringify(executionTasks, null, 2));
+  assert.equal(/^USER-VALIDATION-/.test(newInteractions[0].requirementRef || ""), false);
+});
+
+test("approval hydration collapses an already-persisted equivalent USER validation task", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Toolbar behavior fix",
+    "",
+    "## Summary",
+    "- Fix toolbar behavior.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.js` owns toolbar initialization.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.js` to bind toolbar actions.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API changes.",
+    "",
+    "## Test Plan",
+    '- 验证：点击 New 按钮，状态栏显示 "new"。',
+    "",
+    "## Assumptions",
+    "- Preserve unrelated behavior.",
+  ].join("\n"));
+  const userPrompt = '实际点击 New，并检查状态栏变为 "new"。';
+  const initialTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+    conversationTurns: [{ id: "turn-1", userPrompt }],
+  }), "zh");
+  const planInteraction = initialTasks.find((task) =>
+    task.evidence?.some((evidence) => evidence.requiresInteraction === true) &&
+    !/^USER-VALIDATION-/.test(task.requirementRef || "")
+  );
+  const legacyUserTask = {
+    ...planInteraction,
+    id: "legacy-user-validation",
+    requirementRef: "USER-VALIDATION-legacy",
+    text: userPrompt,
+  };
+  const resumed = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact, {
+      kind: "tasks",
+      path: ".MAIN/plans/tasks.md",
+      title: "Tasks",
+      revision: 1,
+      updatedAt: 1,
+      content: "- [ ] 修复并验证工具栏",
+    }],
+    planTasks: [...initialTasks, legacyUserTask],
+    isPlanApproved: true,
+    conversationTurns: [{ id: "turn-1", userPrompt: "Continue the approved plan." }],
+  }), "zh");
+  const newInteractions = resumed.filter((task) =>
+    task.evidence?.some((evidence) => evidence.requiresInteraction === true && /new/i.test(evidence.value))
+  );
+
+  assert.equal(newInteractions.length, 1, JSON.stringify(resumed, null, 2));
+  assert.equal(/^USER-VALIDATION-/.test(newInteractions[0].requirementRef || ""), false);
+});
+
+test("approval preserves nested parent interaction context and removes its durable USER duplicate", () => {
+  const userPrompt = "批准后真实修改，再通过浏览器实际点击 New 验证状态变化。";
+  const artifact = reviewablePlanArtifact([
+    "# Proposed Plan",
+    "",
+    "## Summary",
+    "- Fix toolbar behavior.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.js` owns toolbar initialization.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.js` to bind toolbar actions.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API changes.",
+    "",
+    "## Test Plan",
+    "1. 依次点击 New、Open、Save 按钮，验证：",
+    '   - New：编辑器清空，状态栏显示 "新文档已创建"。',
+    "   - Open：对话框出现，状态栏显示 open。",
+    "   - Save：页面显示保存完成。",
+    "",
+    "## Assumptions",
+    "- Preserve unrelated behavior.",
+  ].join("\n"));
+  const durableUserTask = deriveRuntimeValidationTasksFromUserRequest(userPrompt, {
+    language: "zh",
+  })[0];
+  assert.ok(durableUserTask);
+
+  const runtimeTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [durableUserTask],
+    isPlanApproved: true,
+    conversationTurns: [{ id: "turn-1", userPrompt }],
+  }), "zh");
+  const newInteractions = runtimeTasks.filter((task) =>
+    task.evidence?.some((evidence) =>
+      evidence.kind === "browser_dom" &&
+      evidence.requiresInteraction === true &&
+      /new/i.test(evidence.value)
+    )
+  );
+
+  assert.equal(newInteractions.length, 1, JSON.stringify(runtimeTasks, null, 2));
+  assert.equal(/^USER-VALIDATION-/.test(newInteractions[0].requirementRef || ""), false);
+});
+
+test("optional Plan validation remains visible prose instead of a blocking runtime task", () => {
+  const artifact = reviewablePlanArtifact([
+    "# Toolbar behavior fix",
+    "",
+    "## Summary",
+    "- Fix toolbar initialization.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.js` owns toolbar initialization.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.js` to bind toolbar actions.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API changes.",
+    "",
+    "## Test Plan",
+    "- Run `npm run build`.",
+    "- Automated testing (optional):",
+    "  - Check that the toolbar status updates correctly.",
+    "  - Run `npx playwright test tests/e2e/toolbar.spec.ts` if needed.",
+    "",
+    "## Assumptions",
+    "- Preserve unrelated editor behavior.",
+  ].join("\n"));
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+    conversationTurns: [{ id: "turn-1", userPrompt: "Fix toolbar initialization." }],
+  }), "en");
+
+  assert.ok(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "cmd" && evidence.value === "npm run build")
+  ));
+  assert.equal(executionPlanTasks.some((entry) => /toolbar status|playwright/i.test(entry.text)), false);
+  assert.equal(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) =>
+      evidence.kind === "cmd" &&
+      (evidence.value === "focused validation command" || /playwright/.test(evidence.value))
+    )
+  ), false, JSON.stringify(executionPlanTasks));
+});
+
+test("user-owned native UI interactions inherited at approval remain advisory", () => {
+  const artifact = reviewablePlanArtifact(executableMutationPlan());
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+    conversationTurns: [{
+      id: "turn-1",
+      userPrompt: "修复文件打开链路；完成后请用户手动点击 Open 并确认系统文件对话框出现。",
+    }],
+  }), "zh");
+  const advisory = executionPlanTasks.find((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "manual_user_validation")
+  );
+
+  assert.ok(advisory, JSON.stringify(executionPlanTasks));
+  assert.equal(advisory.evidence?.some((evidence) => evidence.kind === "tauri_required"), true);
+  assert.equal(advisory.evidence?.some((evidence) => evidence.kind === "browser_dom"), false);
+  assert.equal(advisory.evidenceStatus, "requires_tauri_validation");
 });
 
 test("approval readiness treats a plain prose change section as mutation-oriented", () => {

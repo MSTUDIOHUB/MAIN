@@ -1,5 +1,9 @@
 import type { ExecuteRecoveryNextCapability, ExecuteRecoveryMode } from "../../executeRecoveryTools";
-import { buildExecuteEvidenceClosureAudit, type ExecuteEvidenceGap } from "../../verificationEvidence";
+import {
+  buildExecuteEvidenceClosureAudit,
+  scopeExecutionEvidenceLedger,
+  type ExecuteEvidenceGap,
+} from "../../verificationEvidence";
 import type { PlanExecutionEvidenceEntry } from "../../workflowModels";
 import { WORKSPACE_MUTATION_TOOL_NAMES } from "../../workspaceMutationTools";
 
@@ -9,6 +13,24 @@ export interface PreCompletionEvidenceRecoveryDecision {
   reason: string;
   expectedTarget: string | null;
   nextRequiredCapability: ExecuteRecoveryNextCapability;
+}
+
+function reconcileWithActiveRecovery(
+  decision: PreCompletionEvidenceRecoveryDecision,
+  input: {
+    currentRecoveryMode: ExecuteRecoveryMode;
+    currentRequiredCapability?: ExecuteRecoveryNextCapability | null;
+  },
+): PreCompletionEvidenceRecoveryDecision | null {
+  if (input.currentRecoveryMode === "normal") return decision;
+  // Older callers/snapshots do not carry the active capability. Preserve the
+  // existing transaction rather than guessing and resetting its progress.
+  if (!input.currentRequiredCapability) return null;
+  // Re-activating the same capability on every no-tool turn would reset the
+  // phase budget. Only a changed ledger gap may replace an active contract.
+  return input.currentRequiredCapability === decision.nextRequiredCapability
+    ? null
+    : decision;
 }
 
 function latestMutationTarget(ledger: PlanExecutionEvidenceEntry[]): string | null {
@@ -35,53 +57,74 @@ function hasAnyTool(availableToolNames: Set<string>, toolNames: Iterable<string>
 export function resolvePreCompletionEvidenceRecoveryDecision(input: {
   ledger: PlanExecutionEvidenceEntry[];
   validationExpected: boolean;
+  mutationExpected: boolean;
+  transactionId?: string | null;
+  requiredCommandEvidence?: string[];
   currentRecoveryMode: ExecuteRecoveryMode;
+  currentRequiredCapability?: ExecuteRecoveryNextCapability | null;
   availableToolNames: Set<string>;
 }): PreCompletionEvidenceRecoveryDecision | null {
-  if (input.currentRecoveryMode !== "normal") return null;
   const audit = buildExecuteEvidenceClosureAudit({
     ledger: input.ledger,
     validationExpected: input.validationExpected,
+    mutationExpected: input.mutationExpected,
+    transactionId: input.transactionId,
+    requiredCommandEvidence: input.requiredCommandEvidence,
   });
   if (audit.completionAllowed || audit.gap === "none") return null;
-  const expectedTarget = latestMutationTarget(input.ledger);
+  const expectedTarget = latestMutationTarget(
+    scopeExecutionEvidenceLedger(input.ledger, input.transactionId),
+  );
 
   if (
-    audit.gap === "validation_after_mutation_required" &&
+    audit.gap === "mutation_required" &&
+    hasAnyTool(input.availableToolNames, WORKSPACE_MUTATION_TOOL_NAMES)
+  ) {
+    return reconcileWithActiveRecovery({
+      gap: audit.gap,
+      mode: "mutation_first",
+      reason: `precompletion_evidence_gap:${audit.gap}`,
+      expectedTarget,
+      nextRequiredCapability: "mutation",
+    }, input);
+  }
+
+  if (
+    (audit.gap === "validation_required" || audit.gap === "validation_after_mutation_required") &&
     input.availableToolNames.has("run_command")
   ) {
-    return {
+    return reconcileWithActiveRecovery({
       gap: audit.gap,
       mode: "finite_validation_only",
       reason: `precompletion_evidence_gap:${audit.gap}`,
       expectedTarget,
       nextRequiredCapability: "validation",
-    };
+    }, input);
   }
   if (
     audit.gap === "pty_observation_required" &&
     hasAnyTool(input.availableToolNames, ["get_pty_status", "read_pty_since"])
   ) {
-    return {
+    return reconcileWithActiveRecovery({
       gap: audit.gap,
       mode: "validation_only",
       reason: `precompletion_evidence_gap:${audit.gap}`,
       expectedTarget,
       nextRequiredCapability: "observe_pty",
-    };
+    }, input);
   }
   if (
     audit.gap === "browser_validation_required" &&
     (audit.longRunningStatus === "ready" || audit.latestReadyAt !== null) &&
     input.availableToolNames.has("browser_evaluate")
   ) {
-    return {
+    return reconcileWithActiveRecovery({
       gap: audit.gap,
       mode: "validation_only",
       reason: `precompletion_evidence_gap:${audit.gap}`,
       expectedTarget,
       nextRequiredCapability: "browser_validation",
-    };
+    }, input);
   }
   if (
     audit.gap === "browser_validation_required" &&
@@ -90,25 +133,25 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
       audit.longRunningStatus === "unknown") &&
     hasAnyTool(input.availableToolNames, ["get_pty_status", "read_pty_since"])
   ) {
-    return {
+    return reconcileWithActiveRecovery({
       gap: audit.gap,
       mode: "validation_only",
       reason: `precompletion_evidence_gap:${audit.gap}`,
       expectedTarget,
       nextRequiredCapability: "observe_pty",
-    };
+    }, input);
   }
   if (
     audit.gap === "browser_validation_required" &&
     input.availableToolNames.has("execute_command")
   ) {
-    return {
+    return reconcileWithActiveRecovery({
       gap: audit.gap,
       mode: "validation_only",
       reason: `precompletion_evidence_gap:${audit.gap}`,
       expectedTarget,
       nextRequiredCapability: "launch_long_process",
-    };
+    }, input);
   }
   if (
     audit.gap === "unreconciled_failure" &&
@@ -118,7 +161,7 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
       hasAnyTool(input.availableToolNames, WORKSPACE_MUTATION_TOOL_NAMES)
     )
   ) {
-    return {
+    return reconcileWithActiveRecovery({
       gap: audit.gap,
       mode: "action_plus_targeting",
       reason: `precompletion_evidence_gap:${audit.gap}`,
@@ -127,7 +170,7 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
         audit.longRunningStatus === "failed" || audit.longRunningStatus === "stopped"
           ? "recover_process"
           : "reconcile_server",
-    };
+    }, input);
   }
   return null;
 }

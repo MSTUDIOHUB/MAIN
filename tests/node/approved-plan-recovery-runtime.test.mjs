@@ -2,140 +2,45 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import fsSync from "node:fs";
 import path from "node:path";
-import { createRequire } from "node:module";
-
-import ts from "typescript";
 
 const workspaceRoot = process.cwd();
-const transpiledModuleCache = new Map();
+const loopRoot = path.join(workspaceRoot, "src/lib/orchestrator/loop");
 
-function loadTranspiledModuleSync(sourcePath) {
-  const normalizedPath = path.resolve(sourcePath);
-  if (transpiledModuleCache.has(normalizedPath)) {
-    return transpiledModuleCache.get(normalizedPath);
-  }
+test("legacy approved-plan recovery state and no-tool modules stay deleted", () => {
+  assert.equal(
+    fsSync.existsSync(path.join(loopRoot, "approvedPlanRecoveryRuntime.ts")),
+    false,
+  );
+  assert.equal(
+    fsSync.existsSync(path.join(loopRoot, "approvedPlanNoToolRecovery.ts")),
+    false,
+  );
 
-  const source = fsSync.readFileSync(normalizedPath, "utf8");
-  const transpiled = ts.transpileModule(source, {
-    compilerOptions: {
-      module: ts.ModuleKind.CommonJS,
-      target: ts.ScriptTarget.ES2020,
-    },
-    fileName: normalizedPath,
-  }).outputText;
-
-  const module = { exports: {} };
-  transpiledModuleCache.set(normalizedPath, module.exports);
-  const localRequire = createRequire(normalizedPath);
-  const runtimeRequire = (specifier) => {
-    if (specifier.startsWith(".")) {
-      const basePath = path.resolve(path.dirname(normalizedPath), specifier);
-      const candidates = [
-        basePath,
-        `${basePath}.ts`,
-        `${basePath}.tsx`,
-        path.join(basePath, "index.ts"),
-      ];
-
-      for (const candidate of candidates) {
-        if (!fsSync.existsSync(candidate)) continue;
-        if (candidate.endsWith(".ts") || candidate.endsWith(".tsx")) {
-          return loadTranspiledModuleSync(candidate);
-        }
-      }
-    }
-
-    return localRequire(specifier);
-  };
-  const factory = new Function("exports", "module", "require", transpiled);
-  factory(module.exports, module, runtimeRequire);
-  transpiledModuleCache.set(normalizedPath, module.exports);
-  return module.exports;
-}
-
-const {
-  applyApprovedPlanActionOnlyRecoveryState,
-  applyApprovedPlanNoToolRecoveryState,
-  applyApprovedPlanStrategySwitchRecoveryState,
-  applyApprovedPlanToolResultRecoveryState,
-  createApprovedPlanRecoveryRuntimeState,
-  resetApprovedPlanHandoffRecoveryState,
-  resetApprovedPlanLongReasoningNoActionCount,
-} = loadTranspiledModuleSync(
-  path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanRecoveryRuntime.ts"),
-);
-
-test("approved plan recovery state starts with normal execution surface", () => {
-  assert.deepEqual(createApprovedPlanRecoveryRuntimeState(), {
-    approvedPlanNoProgressRecoveryAttempts: 0,
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-    approvedPlanLongReasoningNoActionCount: 0,
-  });
+  const loopSource = fsSync.readdirSync(loopRoot)
+    .filter((name) => name.endsWith(".ts"))
+    .map((name) => fsSync.readFileSync(path.join(loopRoot, name), "utf8"))
+    .join("\n");
+  assert.doesNotMatch(
+    loopSource,
+    /ApprovedPlanRecoveryRuntimeState|approvedPlanRecoveryState|approvedPlanNoProgressRecoveryAttempts/,
+  );
+  assert.doesNotMatch(
+    loopSource,
+    /handleApprovedPlanNoToolRecovery|continueApprovedPlanWithStrategySwitch|pauseApprovedPlanNoProgressLoop/,
+  );
 });
 
-test("approved plan recovery state applies strategy-switch and no-tool results", () => {
-  let state = createApprovedPlanRecoveryRuntimeState();
-  state = applyApprovedPlanStrategySwitchRecoveryState(state, {
-    approvedPlanNoProgressRecoveryAttempts: 1,
-    approvedPlanActionOnlyRecoveryActive: true,
-  });
-  assert.equal(state.approvedPlanNoProgressRecoveryAttempts, 1);
-  assert.equal(state.approvedPlanActionOnlyRecoveryActive, true);
+test("approved-plan stream watchdog remains independent of deleted recovery state", () => {
+  const actionsSource = fsSync.readFileSync(
+    path.join(loopRoot, "approvedPlanRecoveryActions.ts"),
+    "utf8",
+  );
+  const controlSource = fsSync.readFileSync(
+    path.join(loopRoot, "loopControlRuntime.ts"),
+    "utf8",
+  );
 
-  state = applyApprovedPlanNoToolRecoveryState(state, {
-    approvedPlanNoProgressRecoveryAttempts: 2,
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: true,
-    approvedPlanLongReasoningNoActionCount: 1,
-  });
-  assert.deepEqual(state, {
-    approvedPlanNoProgressRecoveryAttempts: 2,
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: true,
-    approvedPlanLongReasoningNoActionCount: 1,
-  });
-});
-
-test("approved plan recovery state applies tool-result and reset slices independently", () => {
-  let state = {
-    approvedPlanNoProgressRecoveryAttempts: 2,
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: true,
-    approvedPlanLongReasoningNoActionCount: 3,
-  };
-
-  state = resetApprovedPlanLongReasoningNoActionCount(state);
-  assert.equal(state.approvedPlanLongReasoningNoActionCount, 0);
-  assert.equal(state.approvedPlanActionOnlyRecoveryActive, true);
-
-  state = applyApprovedPlanActionOnlyRecoveryState(state, {
-    approvedPlanActionOnlyRecoveryActive: false,
-  });
-  assert.equal(state.approvedPlanActionOnlyRecoveryActive, false);
-  assert.equal(state.approvedPlanNoToolRecoveryFileReadActive, true);
-
-  state = applyApprovedPlanToolResultRecoveryState(state, {
-    approvedPlanNoProgressRecoveryAttempts: 0,
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-  });
-  assert.equal(state.approvedPlanNoProgressRecoveryAttempts, 0);
-  assert.equal(state.approvedPlanNoToolRecoveryFileReadActive, false);
-});
-
-test("approved plan handoff reset preserves existing file-read recovery flag", () => {
-  const state = resetApprovedPlanHandoffRecoveryState({
-    approvedPlanNoProgressRecoveryAttempts: 2,
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: true,
-    approvedPlanLongReasoningNoActionCount: 4,
-  });
-
-  assert.deepEqual(state, {
-    approvedPlanNoProgressRecoveryAttempts: 0,
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: true,
-    approvedPlanLongReasoningNoActionCount: 0,
-  });
+  assert.match(actionsSource, /export function pauseApprovedPlanStreamWatchdog/);
+  assert.match(actionsSource, /approved_plan_stream_watchdog_paused/);
+  assert.match(controlSource, /pauseApprovedPlanStreamWatchdogAction\(\{/);
 });

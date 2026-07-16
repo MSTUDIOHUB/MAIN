@@ -37,7 +37,7 @@ test("assistant stream post-processing phase owns runtime state folds", () => {
 
   assert.match(phaseSource, /applyReasoningDominatedNoToolRuntimeState\(/);
   assert.match(phaseSource, /applyReasoningNoToolPlanRuntimeState\(/);
-  assert.match(phaseSource, /applyApprovedPlanActionOnlyRecoveryState\(/);
+  assert.doesNotMatch(phaseSource, /applyApprovedPlanActionOnlyRecoveryState\(/);
   assert.match(phaseSource, /applyEmptyResponseNoToolRuntimeState\(/);
   assert.match(phaseSource, /applyMalformedToolUseRecoveryPromptState\(/);
   assert.match(phaseSource, /resetEmptyAndReasoningNoToolRuntimeState\(/);

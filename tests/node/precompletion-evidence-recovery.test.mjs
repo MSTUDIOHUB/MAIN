@@ -397,6 +397,69 @@ test("all interaction mutations in one epoch keep independent obligations", () =
   assert.equal(completeAudit.gap, "none");
 });
 
+test("one mutation with several changed controls requires one browser proof per control", () => {
+  const toolbarMutation = {
+    ...mutation(),
+    id: "mutation-toolbar-controls",
+    interactionMutation: true,
+    interactionBehaviorTargets: [
+      "new-btn", "#new-btn",
+      "open-btn", "#open-btn",
+      "save-btn", "#save-btn",
+    ],
+  };
+  const browserEvidence = (names) => ({
+    id: `browser-${names.join("-").toLowerCase()}`,
+    kind: "browser_dom",
+    value: "http://localhost:1420/",
+    target: "http://localhost:1420/",
+    sourceTool: "browser_evaluate",
+    createdAt: 10,
+    browserInteraction: {
+      actions: names.map((name, index) => ({
+        id: `action-${index + 1}`,
+        kind: "click",
+        target: `#${name.toLowerCase()}-btn`,
+        succeeded: true,
+        stateChanged: true,
+        changedFields: ["bodyText"],
+        effectChangedFields: ["bodyText"],
+        effectStateChanged: true,
+      })),
+      assertions: names.map((name, index) => ({
+        kind: "text",
+        target: name.toLowerCase(),
+        passed: true,
+        beforePassed: false,
+        changedAfterAction: true,
+        causallyLinked: true,
+        afterActionId: `action-${index + 1}`,
+      })),
+      pageErrors: [],
+      consoleErrors: [],
+    },
+  });
+
+  const partial = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [toolbarMutation, ...launchAndReady(), browserEvidence(["New"])],
+    validationExpected: true,
+  });
+  assert.equal(partial.validationObligations.length, 3);
+  assert.deepEqual(
+    partial.validationObligations.map((item) => item.status).sort(),
+    ["open", "open", "satisfied"],
+  );
+  assert.equal(partial.gap, "browser_validation_required");
+
+  const complete = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [toolbarMutation, ...launchAndReady(), browserEvidence(["New", "Open", "Save"])],
+    validationExpected: true,
+  });
+  assert.equal(complete.validationObligations.length, 3);
+  assert.equal(complete.validationObligations.every((item) => item.status === "satisfied"), true);
+  assert.equal(complete.gap, "none");
+});
+
 test("a newer failed browser interaction invalidates an older success", () => {
   const browserEvidence = (id, succeeded, effectStateChanged) => ({
     id,
@@ -625,4 +688,205 @@ test("pre-completion audit selects the exact next capability", () => {
     availableToolNames: new Set(["run_command"]),
   });
   assert.equal(alreadyRecovering, null);
+});
+
+test("ready browser evidence supersedes a stale finite-validation recovery contract", () => {
+  const staleFiniteRecovery = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: [mutation(), ...launchAndReady()],
+    validationExpected: true,
+    currentRecoveryMode: "finite_validation_only",
+    currentRequiredCapability: "validation",
+    availableToolNames: new Set(["run_command", "browser_evaluate"]),
+  });
+
+  assert.equal(staleFiniteRecovery.gap, "browser_validation_required");
+  assert.equal(staleFiniteRecovery.mode, "validation_only");
+  assert.equal(staleFiniteRecovery.nextRequiredCapability, "browser_validation");
+
+  const alreadyBrowserRecovery = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: [mutation(), ...launchAndReady()],
+    validationExpected: true,
+    currentRecoveryMode: "validation_only",
+    currentRequiredCapability: "browser_validation",
+    availableToolNames: new Set(["run_command", "browser_evaluate"]),
+  });
+  assert.equal(
+    alreadyBrowserRecovery,
+    null,
+    "the same evidence/capability must not reactivate recovery and reset its budget",
+  );
+});
+
+test("a successful validation cannot replace a required mutation", () => {
+  const commandOnlyLedger = [{
+    id: "command-only",
+    kind: "cmd",
+    value: "npm test",
+    target: "npm test",
+    sourceTool: "run_command",
+    observationStatus: "ready",
+    createdAt: 1,
+  }];
+  const audit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: commandOnlyLedger,
+    mutationExpected: true,
+    validationExpected: true,
+  });
+  assert.equal(audit.mutationCount, 0);
+  assert.equal(audit.validationCount, 1);
+  assert.equal(audit.gap, "mutation_required");
+  assert.equal(audit.completionAllowed, false);
+
+  const recovery = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: commandOnlyLedger,
+    mutationExpected: true,
+    validationExpected: true,
+    currentRecoveryMode: "normal",
+    availableToolNames: new Set(["apply_patch", "run_command"]),
+  });
+  assert.equal(recovery.mode, "mutation_first");
+  assert.equal(recovery.nextRequiredCapability, "mutation");
+});
+
+test("command-only completion is bound to the structured requested command", () => {
+  const unrelated = {
+    id: "unrelated",
+    kind: "cmd",
+    value: "npm test",
+    target: "npm test",
+    sourceTool: "run_command",
+    createdAt: 1,
+  };
+  const wrongAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [unrelated],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence: ["git status"],
+  });
+  assert.equal(wrongAudit.gap, "validation_required");
+  assert.equal(wrongAudit.completionAllowed, false);
+
+  const matching = {
+    ...unrelated,
+    id: "matching",
+    value: "git status --short",
+    target: "git status --short",
+  };
+  const matchingAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [matching],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence: ["git status"],
+  });
+  assert.equal(matchingAudit.gap, "none");
+  assert.equal(matchingAudit.completionAllowed, true);
+});
+
+test("command-only completion satisfies multiple requirements across the command evidence set", () => {
+  const lint = {
+    id: "lint",
+    kind: "cmd",
+    value: "npm run lint",
+    target: "npm run lint",
+    sourceTool: "run_command",
+    createdAt: 1,
+  };
+  const tests = {
+    id: "tests",
+    kind: "cmd",
+    value: "npm test",
+    target: "npm test",
+    sourceTool: "run_command",
+    createdAt: 2,
+  };
+  const requiredCommandEvidence = ["npm run lint", "npm test"];
+
+  const partialAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [lint],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence,
+  });
+  assert.equal(partialAudit.gap, "validation_required");
+  assert.equal(partialAudit.validationCount, 0);
+
+  const completeAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [lint, tests],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence,
+  });
+  assert.equal(completeAudit.gap, "none");
+  assert.equal(completeAudit.validationCount, 2);
+  assert.equal(completeAudit.completionAllowed, true);
+});
+
+test("precompletion recovery never inherits a mutation target from another transaction", () => {
+  const oldMutation = {
+    ...nonInteractionMutation(),
+    value: "src/old.js",
+    target: "src/old.js",
+    transactionId: "turn-old",
+  };
+  const mutationDecision = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: [oldMutation],
+    transactionId: "turn-current",
+    mutationExpected: true,
+    validationExpected: true,
+    currentRecoveryMode: "normal",
+    availableToolNames: new Set(["apply_patch", "run_command"]),
+  });
+  assert.equal(mutationDecision.gap, "mutation_required");
+  assert.equal(mutationDecision.expectedTarget, null);
+
+  const currentMutation = {
+    ...oldMutation,
+    id: "current-mutation",
+    value: "src/current.js",
+    target: "src/current.js",
+    transactionId: "turn-current",
+  };
+  const validationDecision = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: [oldMutation, currentMutation],
+    transactionId: "turn-current",
+    mutationExpected: true,
+    validationExpected: true,
+    currentRecoveryMode: "normal",
+    availableToolNames: new Set(["apply_patch", "run_command"]),
+  });
+  assert.equal(validationDecision.gap, "validation_after_mutation_required");
+  assert.equal(validationDecision.expectedTarget, "src/current.js");
+});
+
+test("completion evidence cannot cross logical execution transactions", () => {
+  const oldMutation = {
+    ...nonInteractionMutation(),
+    transactionId: "turn-old",
+  };
+  const currentValidation = {
+    id: "current-validation",
+    transactionId: "turn-current",
+    kind: "cmd",
+    value: "npm test",
+    target: "npm test",
+    sourceTool: "run_command",
+    createdAt: 2,
+  };
+  const audit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [oldMutation, currentValidation],
+    transactionId: "turn-current",
+    mutationExpected: true,
+    validationExpected: true,
+  });
+  assert.equal(audit.mutationCount, 0);
+  assert.equal(audit.gap, "mutation_required");
+
+  const resumedMutation = { ...oldMutation, transactionId: "turn-current" };
+  const resumedAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [resumedMutation, currentValidation],
+    transactionId: "turn-current",
+    mutationExpected: true,
+    validationExpected: true,
+  });
+  assert.equal(resumedAudit.gap, "none");
 });

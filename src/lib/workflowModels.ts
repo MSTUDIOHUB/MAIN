@@ -4,6 +4,7 @@ import {
   resolveRunIntentFromLegacyWorkflowMode,
 } from "./runIntent";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import { looksLongRunningShellCommand } from "./toolExecutionContract";
 
 // lib/workflowModels.ts
 // 计划面板、回合视图、流式归一化共享模型。
@@ -284,6 +285,13 @@ export interface PlanTaskEvidence {
   value: string;
   inferred?: boolean;
   /**
+   * The approved browser check requires a real action and a causally-linked
+   * post-action assertion.  This is derived once at the Plan boundary; the
+   * evidence audit must not later treat navigation or a screenshot as the
+   * interaction itself.
+   */
+  requiresInteraction?: boolean;
+  /**
    * Explicit code/config identifiers that must occur in the fresh changed
    * lines for a file mutation to satisfy this evidence.  This prevents a
    * write to the right path but unrelated content from completing a Plan
@@ -366,6 +374,14 @@ export interface ValidationObligation {
 
 export interface PlanExecutionEvidenceEntry {
   id: string;
+  /** Logical execution transaction that produced this evidence (normally the turn id). */
+  transactionId?: string;
+  /** Concrete runtime run that observed the evidence; resumptions may share a transaction. */
+  runId?: string;
+  /** Approved Plan task that owned the recovery transaction producing this evidence. */
+  planTaskId?: string;
+  /** Stable requirement reference retained alongside the concrete task id. */
+  requirementRef?: string;
   kind: PlanTaskEvidenceKind;
   value: string;
   sourceTool: string;
@@ -391,6 +407,8 @@ export interface PlanExecutionEvidenceEntry {
   terminalBusy?: boolean;
   /** Set only for explicit address-in-use/EADDRINUSE evidence. */
   portConflict?: boolean;
+  /** Local dev-server port owned by this launch/probe transaction, when observable. */
+  devServerPort?: number;
   createdAt: number;
 }
 
@@ -1068,8 +1086,6 @@ export function isFlexiblePlanValidationCommandEvidence(value: string): boolean 
 // where compiler/runtime failures usually appear.  Keep this command-shape
 // rule in the durable Plan evidence layer so every provider gets the same
 // completion boundary, rather than relying on a model to remember it.
-const LONG_RUNNING_PLAN_COMMAND_RE =
-  /\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:tauri\s+dev|dev|start|serve|watch|preview|storybook)\b|\b(?:cargo\s+)?tauri\s+dev\b|\b(?:vite|next|nuxt|nuxi|astro|webpack-dev-server|storybook)\s+(?:dev|start|serve|preview)\b/i;
 const PTY_OBSERVATION_TOOL_NAMES = new Set([
   "read_pty_buffer",
   "read_pty_since",
@@ -1078,7 +1094,7 @@ const PTY_OBSERVATION_TOOL_NAMES = new Set([
 ]);
 
 export function requiresPtyObservationForPlanCommand(value: string): boolean {
-  return LONG_RUNNING_PLAN_COMMAND_RE.test(String(value || ""));
+  return looksLongRunningShellCommand(value);
 }
 
 export function isFinitePlanValidationCommand(value: string): boolean {
@@ -1248,6 +1264,17 @@ const BROWSER_VALIDATION_RE =
   /(?:浏览器|页面|前端|截图|可视|可见|视觉|渲染|预览|图表|颜色|深色|浅色|主题切换|localhost|127\.0\.0\.1|\b(?:UI|DOM|Playwright|Cypress|Puppeteer|browser|page|frontend|screenshot|render|preview)\b)/i;
 const BROWSER_INTERACTION_VALIDATION_RE =
   /(?:(?:点击|按下|填写|选择|切换)|\b(?:click|press|fill|select|toggle)\b)[\s\S]{0,120}(?:(?:按钮|链接|输入框|复选框|单选框|标签页|菜单|对话框)|\b(?:button|link|input|checkbox|radio|tab|menu|dialog)\b)|(?:(?:按钮|链接|输入框|复选框|单选框|标签页|菜单|对话框)|\b(?:button|link|input|checkbox|radio|tab|menu|dialog)\b)[\s\S]{0,120}(?:显示|更新|变化|出现|\b(?:display|update|change|appear)\b)/i;
+// An approved UI interaction does not need to know the repository's final
+// selector.  It does need to describe a causal pair: a direct UI action,
+// followed by an assertion against observable post-action state.  Keeping the
+// two clauses structural prevents a lone verb such as "click" or a passive
+// page-load check from becoming interaction evidence.
+const DIRECT_UI_INTERACTION_ACTION_RE =
+  /(?:实际\s*)?(?:点击|双击|填写|选择|切换|拖拽|拖放|提交)|\b(?:actually\s+)?(?:click|double[- ]?click|fill|select|toggle|drag|drop|submit)\b/i;
+const POST_INTERACTION_ASSERTION_CUE_RE =
+  /(?:→|->|=>|(?:操作|动作|点击|选择|切换|提交)?(?:完成)?后|然后|随后|接着|并(?:检查|验证|确认|断言|观察)|(?:验证|检查|确认|断言|观察)|\b(?:then|after(?:wards)?|and\s+(?:verify|check|confirm|assert|observe)|(?:verify|check|confirm|assert|observe))\b)/i;
+const OBSERVABLE_UI_POST_STATE_RE =
+  /(?:状态(?:栏)?|编辑器|内容|文本|页面|面板|区域|视图|工具栏|标题|主题|模式|输入|列表|标签|计数|值|选中|可见|显示|清空|出现|消失|更新|变化|切换|恢复|重置|\b(?:state|status|editor|content|text|page|panel|region|view|toolbar|title|theme|mode|input|list|tab|count|value|selected|visible|display|empty|appear|disappear|update|change|switch|reset|restore)\b)/i;
 const MARKDOWN_VIEWER_VALIDATION_RE =
   /(?:Markdown|\bmd\b|test-sample\.md|mermaid|代码块|表格|脚注|标题|\bpreview\b|预览|渲染)/i;
 const TAURI_VALIDATION_RE =
@@ -1259,13 +1286,122 @@ const SOURCE_MUTATION_TASK_RE =
 const PRIMARY_VALIDATION_TASK_RE =
   /(?:^\s*(?:(?:静态|逻辑|行为|功能|单元|集成|端到端|回归|构建|类型|编译|运行时|自动化)?(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图))(?:\s|[（(]|[:：]|$)|^\s*(?:运行|执行)\s+(?:(?:npm|pnpm|yarn|bun|npx|node|cargo|pytest|python|go|swift|dotnet|mvn|gradle)\b|[^\r\n]{0,100}(?:测试|验证|检查|验收|构建|编译|lint|类型检查))|^\s*(?:(?:static|logical?|behavioral|functional|unit|integration|end-to-end|e2e|regression|build|type|compile|runtime|automated)\s+)?(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
 const NEGATED_SOURCE_MUTATION_SPAN_RE =
-  /(?:无需|不(?:需要|必|要)|不会)\s*(?:进行|做|作)?\s*(?:任何|额外)?\s*(?:修改|改动|变更|更新|调整)|保持(?:现有|当前)?[^，。；;]{0,40}不变|(?:no|without)\s+(?:code\s+)?changes?\s+(?:are\s+)?(?:needed|required)|does\s+not\s+require[^.;]{0,50}(?:changes?|updates?|modifications?)|(?:leave|keep|remain)\s+[^.;]{0,50}\s+unchanged|without\s+(?:modifying|changing|updating)|do\s+not\s+(?:modify|change|update)/gi;
+  /(?:无需|不(?:需要|必|要)|不会)\s*(?:进行|做|作)?\s*(?:任何|额外)?\s*(?:修改|改动|变更|更新|调整)|(?:无|没有)\s*(?:任何|实际|具体)?\s*(?:修改|改动|变更|更新|调整)|保持(?:现有|当前)?[^，。；;]{0,40}不变|(?:no|without)\s+(?:code\s+)?changes?\s+(?:are\s+)?(?:needed|required)|does\s+not\s+require[^.;]{0,50}(?:changes?|updates?|modifications?)|(?:leave|keep|remain)\s+[^.;]{0,50}\s+unchanged|without\s+(?:modifying|changing|updating)|do\s+not\s+(?:modify|change|update)|(?:^|[\s—–:;,.])unchanged(?:$|[\s:;,.])/gi;
 const CODE_IDENTIFIER_REF_RE =
   /`([A-Za-z_$][\w$]*)`|(?:^|[\s（(【\[{:：，,])((?:use[A-Z][A-Za-z0-9_]*|[a-z][A-Za-z0-9_]*Store))(?=$|[\s）)】\]}，,。.;；:：])/g;
 
+const EXPLICIT_DOM_SELECTOR_RE =
+  /(?:^|[\s`'"(（,:：])((?:#[A-Za-z_][\w-]*|\.[A-Za-z_][\w-]*|\[[A-Za-z_:][^\]\r\n]{0,80}\]))(?![A-Za-z0-9_-])/g;
+const DOM_QUERY_SELECTOR_RE =
+  /(?:querySelector(?:All)?\s*\(\s*|(?:selector|选择器)\s*[:=：]\s*)['"`]([^'"`\r\n]{1,120})['"`]/gi;
+const DOM_ID_LOOKUP_RE =
+  /getElementById\s*\(\s*['"`]([A-Za-z_][\w-]*)['"`]\s*\)/gi;
+
+function extractExplicitDomAssertionTargets(text: string): string[] {
+  const targets: string[] = [];
+  const push = (value: string) => {
+    const clean = String(value || "").trim();
+    if (clean && !targets.includes(clean)) targets.push(clean);
+  };
+  for (const matched of String(text || "").matchAll(EXPLICIT_DOM_SELECTOR_RE)) push(matched[1] || "");
+  for (const matched of String(text || "").matchAll(DOM_QUERY_SELECTOR_RE)) push(matched[1] || "");
+  for (const matched of String(text || "").matchAll(DOM_ID_LOOKUP_RE)) push(`#${matched[1] || ""}`);
+  return targets.slice(0, 6);
+}
+
+interface StructuredBrowserInteractionContract {
+  actionTarget: string;
+  assertionTarget: string;
+}
+
+function parseStructuredBrowserInteraction(
+  text: string,
+): StructuredBrowserInteractionContract | null {
+  const normalized = String(text || "");
+  const action = DIRECT_UI_INTERACTION_ACTION_RE.exec(normalized);
+  if (!action || action.index === undefined) return null;
+
+  const afterAction = normalized.slice(action.index + action[0].length);
+  const assertionCue = POST_INTERACTION_ASSERTION_CUE_RE.exec(afterAction);
+  let actionEnd = assertionCue?.index;
+  let assertionStart = assertionCue?.index === undefined
+    ? undefined
+    : assertionCue.index + assertionCue[0].length;
+
+  // Compact plans often express a causal check as two punctuation-separated
+  // clauses ("click control, status displays value") instead of using an
+  // explicit then/verify cue. Accept that grammar only when the second clause
+  // contains both observable UI state and a concrete outcome.
+  if (actionEnd === undefined || assertionStart === undefined) {
+    for (const boundary of afterAction.matchAll(/(?:[,，;；:：]\s*|\band\b\s*|并(?:且)?\s*)/gi)) {
+      if (boundary.index === undefined) continue;
+      const candidatePostState = afterAction.slice(boundary.index + boundary[0].length);
+      if (
+        OBSERVABLE_UI_POST_STATE_RE.test(candidatePostState) &&
+        CONCRETE_VALIDATION_OUTCOME_RE.test(candidatePostState)
+      ) {
+        actionEnd = boundary.index;
+        assertionStart = boundary.index + boundary[0].length;
+        break;
+      }
+    }
+  }
+  if (actionEnd === undefined || assertionStart === undefined) return null;
+
+  const postState = afterAction.slice(assertionStart).trim().slice(0, 160);
+  if (
+    !OBSERVABLE_UI_POST_STATE_RE.test(postState) &&
+    extractExplicitDomAssertionTargets(postState).length === 0
+  ) return null;
+
+  const actionTarget = afterAction
+    .slice(0, actionEnd)
+    .replace(/^[\s`'"“”‘’([{]+|[\s`'"“”‘’\])},，,:：;；]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+
+  return actionTarget && postState
+    ? { actionTarget, assertionTarget: postState }
+    : null;
+}
+
+function inferStructuredBrowserInteraction(text: string): PlanTaskEvidence | null {
+  const contract = parseStructuredBrowserInteraction(text);
+  if (!contract) return null;
+
+  return makePlanTaskEvidence(
+    "browser_dom",
+    `browser interaction: ${contract.actionTarget}`,
+    true,
+    [],
+    true,
+  );
+}
+
+function inferStructuredBrowserDomAssertion(text: string): PlanTaskEvidence | null {
+  const normalized = String(text || "");
+  const targets = extractExplicitDomAssertionTargets(normalized);
+  if (
+    targets.length === 0 ||
+    !VALIDATION_ACTION_RE.test(normalized) ||
+    !CONCRETE_VALIDATION_OUTCOME_RE.test(normalized)
+  ) return null;
+
+  return makePlanTaskEvidence(
+    "browser_dom",
+    `DOM assertion: ${targets.join(", ")}`,
+    true,
+    [],
+    BROWSER_INTERACTION_VALIDATION_RE.test(normalized) ||
+      inferStructuredBrowserInteraction(normalized) !== null,
+  );
+}
+
 function inferValidationTaskEvidence(text: string, commands: string[] = []): PlanTaskEvidence[] {
   const normalized = String(text || "");
-  if (!VALIDATION_ACTION_RE.test(normalized)) return [];
+  const structuredBrowserInteraction = inferStructuredBrowserInteraction(normalized);
+  if (!VALIDATION_ACTION_RE.test(normalized) && !structuredBrowserInteraction) return [];
   const hasAutomatableValidationAlternative =
     /(?:聚焦测试|构建检查|类型检查|单元测试|(?:测试|检查).{0,30}(?:构建|编译)|(?:构建|编译).{0,30}(?:测试|检查)|focused tests?|build checks?|typechecks?|unit tests?|(?:tests?|checks?).{0,40}(?:build|compile)|(?:build|compile).{0,40}(?:tests?|checks?))/i.test(normalized);
   const explicitHumanOwner =
@@ -1287,7 +1423,13 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
     return withAdvisoryEvidence([]);
   }
 
-  if (hasAutomatableValidationAlternative) {
+  const structuredDomAssertion = inferStructuredBrowserDomAssertion(normalized);
+
+  if (
+    hasAutomatableValidationAlternative &&
+    !structuredDomAssertion &&
+    !structuredBrowserInteraction
+  ) {
     const parsed = makePlanTaskEvidence("cmd", FOCUSED_VALIDATION_COMMAND, true);
     return withAdvisoryEvidence(parsed ? [parsed] : []);
   }
@@ -1300,7 +1442,9 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
   if (
     BROWSER_VALIDATION_RE.test(normalized) ||
     BROWSER_INTERACTION_VALIDATION_RE.test(normalized) ||
-    MARKDOWN_VIEWER_VALIDATION_RE.test(normalized)
+    MARKDOWN_VIEWER_VALIDATION_RE.test(normalized) ||
+    structuredBrowserInteraction ||
+    structuredDomAssertion
   ) {
     // "请用户在浏览器中手动验证" names the browser as the place where
     // the user will review the result; it does not authorize the runtime to
@@ -1312,7 +1456,13 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
     if (explicitUserValidation && !explicitlyAutomatedBrowserValidation) {
       return withAdvisoryEvidence([]);
     }
-    const parsed = makePlanTaskEvidence("browser_dom", "browser DOM validation", true);
+    const parsed = structuredDomAssertion || structuredBrowserInteraction || makePlanTaskEvidence(
+      "browser_dom",
+      "browser DOM validation",
+      true,
+      [],
+      BROWSER_INTERACTION_VALIDATION_RE.test(normalized),
+    );
     return withAdvisoryEvidence(parsed ? [parsed] : []);
   }
 
@@ -1431,6 +1581,7 @@ function makePlanTaskEvidence(
   value: string,
   inferred = false,
   requiredTerms: string[] = [],
+  requiresInteraction = false,
 ): PlanTaskEvidence | null {
   const clean = String(value || "").replace(/^['"`]+|['"`]+$/g, "").trim();
   if (!clean) return null;
@@ -1443,6 +1594,7 @@ function makePlanTaskEvidence(
     value: clean,
     ...(inferred ? { inferred: true } : {}),
     ...(normalizedRequiredTerms.length > 0 ? { requiredTerms: normalizedRequiredTerms } : {}),
+    ...(requiresInteraction ? { requiresInteraction: true } : {}),
   };
 }
 
@@ -1565,7 +1717,7 @@ function dedupePlanTaskEvidence(evidence: PlanTaskEvidence[]): PlanTaskEvidence[
   const seen = new Set<string>();
   const deduped: PlanTaskEvidence[] = [];
   for (const item of evidence) {
-    const key = `${item.kind}:${normalizePlanEvidenceValue(item.value)}:${(item.requiredTerms || []).join(",")}`;
+    const key = `${item.kind}:${normalizePlanEvidenceValue(item.value)}:${(item.requiredTerms || []).join(",")}:${item.requiresInteraction === true ? "interaction" : "passive"}`;
     if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(item);
@@ -1581,7 +1733,17 @@ function parsePlanTaskEvidenceLabel(rawText: string): { text: string; evidence: 
   const evidence: PlanTaskEvidence[] = [];
   for (const item of evidenceText.matchAll(PLAN_TASK_EVIDENCE_ITEM_RE)) {
     const kind = normalizeEvidenceKind(item[1] || "");
-    const parsed = makePlanTaskEvidence(kind, item[2] || "");
+    const parsed = makePlanTaskEvidence(
+      kind,
+      item[2] || "",
+      false,
+      [],
+      (kind === "browser_dom" || kind === "browser_screenshot") &&
+        (
+          BROWSER_INTERACTION_VALIDATION_RE.test(rawText) ||
+          inferStructuredBrowserInteraction(rawText) !== null
+        ),
+    );
     if (parsed) evidence.push(parsed);
   }
 
@@ -1599,15 +1761,32 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
     if (parsed) evidence.push(parsed);
   }
 
-  const fileEvidence: PlanTaskEvidence[] = [];
-  const mutationRequiredTerms = isLikelySourceMutationTask(text)
+  // Observable UI state often uses mutation-shaped words such as "update" or
+  // "切换". Once the same sentence forms an action -> post-state contract it
+  // is validation provenance, not a request to edit an unnamed source file.
+  const mutationTask = inferStructuredBrowserInteraction(text) === null &&
+    isLikelySourceMutationTask(text);
+  const referencedFiles: string[] = [];
+  const mutationRequiredTerms = mutationTask
     ? inferMutationRequiredTerms(text)
     : [];
   for (const matched of String(text || "").matchAll(PLAN_TASK_FILE_REF_RE)) {
     if (!isLikelyWorkspaceFileReference(matched[1] || "")) continue;
+    referencedFiles.push(matched[1] || "");
+  }
+  // A file-shaped literal is not automatically a workspace write target.
+  // Mutation prose may mention an output name, fixture, comparison contract,
+  // or download artifact. Only references grammatically owned by a mutation
+  // verb become file obligations; structural file headings are projected by
+  // the artifact scanners and do not need this heuristic fallback.
+  const evidenceFiles = mutationTask
+    ? selectMutationOwnerFileReferences(text, referencedFiles)
+    : referencedFiles;
+  const fileEvidence: PlanTaskEvidence[] = [];
+  for (const file of evidenceFiles) {
     const parsed = makePlanTaskEvidence(
       "file",
-      matched[1] || "",
+      file,
       true,
       mutationRequiredTerms,
     );
@@ -1618,7 +1797,7 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
     item.kind === "manual_user_validation" || item.kind === "tauri_required"
   );
 
-  if (isLikelySourceMutationTask(text)) {
+  if (mutationTask) {
     const sourceEvidence = dedupePlanTaskEvidence([
       ...fileEvidence,
       ...inferSourceEvidenceFromCodeIdentifiers(text),
@@ -1648,6 +1827,360 @@ export function inferPlanTaskEvidence(text: string, commands: string[] = []): Pl
   return dedupePlanTaskEvidence(evidence);
 }
 
+function splitExplicitRequestValidationSegments(text: string): string[] {
+  return String(text || "")
+    .split(/\r?\n+|[。！？；]+|[!?;]+|\.(?=\s+(?:[A-Z]|$)|\s*$)/g)
+    .map((segment) => segment.replace(/^\s*(?:[-*]|\d+[.)、:：-])\s*/, "").trim())
+    .filter(Boolean);
+}
+
+/**
+ * Preserve explicit acceptance constraints from the user turn when a compact
+ * model paraphrases them away in plan.md. Only causal UI interactions are
+ * inherited here; passive browser mentions and general validation prose stay
+ * owned by the reviewed Plan artifact.
+ */
+export function deriveRuntimeValidationTasksFromUserRequest(
+  text: string,
+  options: Pick<RuntimePlanTaskDerivationOptions, "language" | "maxTasks"> = {},
+): PlanTask[] {
+  const language = options.language === "en" ? "en" : "zh";
+  const maxTasks = Math.max(1, Math.min(8, Number(options.maxTasks) || 4));
+  const tasks: PlanTask[] = [];
+  const seen = new Set<string>();
+
+  for (const segment of splitExplicitRequestValidationSegments(text)) {
+    const interaction = inferStructuredBrowserInteraction(segment);
+    if (!interaction) continue;
+
+    const inferred = inferValidationTaskEvidence(segment, []).filter((item) =>
+      (
+        (item.kind === "browser_dom" || item.kind === "browser_screenshot") &&
+        item.requiresInteraction === true
+      ) ||
+      item.kind === "manual_user_validation" ||
+      item.kind === "tauri_required"
+    );
+    if (inferred.length === 0) continue;
+
+    const automaticInteraction = inferred.some((item) =>
+      (item.kind === "browser_dom" || item.kind === "browser_screenshot") &&
+      item.requiresInteraction === true
+    );
+    const action = DIRECT_UI_INTERACTION_ACTION_RE.exec(segment);
+    const taskText = stripMarkdownTaskLine(
+      automaticInteraction && action?.index !== undefined
+        ? segment.slice(action.index)
+        : segment,
+    );
+    if (!taskText) continue;
+
+    const evidence = dedupePlanTaskEvidence(inferred);
+    const requirementRef = `USER-VALIDATION-${hashStringStable(
+      `${normalizePlanTaskText(taskText)}:${evidence.map((item) => `${item.kind}:${item.value}`).join("|")}`,
+    )}`;
+    const task: PlanTask = {
+      id: createPlanTaskId(taskText, requirementRef),
+      text: taskText,
+      status: "pending",
+      executionKind: "validation",
+      claimedStatus: "pending",
+      requirementRef,
+      evidence,
+      ...(validationCapabilityForEvidence(evidence)
+        ? { validationCapability: validationCapabilityForEvidence(evidence) }
+        : {}),
+      evidenceStatus: initialEvidenceStatusForEvidence(evidence),
+      blockedReason: initialEvidenceDecisionForEvidence(evidence).reason ||
+        (language === "en"
+          ? "Waiting for trusted execution evidence"
+          : "等待真实执行证据确认完成"),
+    };
+    const identity = getPlanTaskIdentity(task);
+    if (seen.has(identity)) continue;
+    seen.add(identity);
+    tasks.push(task);
+    if (tasks.length >= maxTasks) break;
+  }
+
+  return tasks;
+}
+
+export function isUserRequestValidationTask(task: Pick<PlanTask, "requirementRef">): boolean {
+  return /^USER-VALIDATION-/i.test(String(task.requirementRef || ""));
+}
+
+function browserInteractionTargetForTask(task: PlanTask): string {
+  const explicit = (task.evidence || []).find((item) =>
+    (item.kind === "browser_dom" || item.kind === "browser_screenshot") &&
+    item.requiresInteraction === true &&
+    /^browser interaction:\s*/i.test(item.value)
+  );
+  if (explicit) return explicit.value.replace(/^browser interaction:\s*/i, "").trim();
+  const inferred = inferStructuredBrowserInteraction(task.text);
+  return inferred?.value.replace(/^browser interaction:\s*/i, "").trim() || "";
+}
+
+const GENERIC_BROWSER_ACTION_ATOMS = new Set([
+  "button", "btn", "control", "trigger", "link", "input", "checkbox",
+  "radio", "tab", "menu", "dialog", "click", "press", "fill", "select",
+  "toggle", "the", "a", "an", "按钮", "控件", "链接", "输入框", "复选框", "单选框", "标签页", "菜单", "对话框",
+]);
+
+function meaningfulBrowserActionAtoms(value: string): Set<string> {
+  return new Set([...browserContractAtoms(value)].filter((atom) =>
+    !GENERIC_BROWSER_ACTION_ATOMS.has(atom)
+  ));
+}
+
+function browserActionTargetsEquivalent(left: string, right: string): boolean {
+  const leftAtoms = meaningfulBrowserActionAtoms(left);
+  const rightAtoms = meaningfulBrowserActionAtoms(right);
+  if (leftAtoms.size === 0 || rightAtoms.size === 0) return false;
+  const overlap = [...leftAtoms].filter((atom) => rightAtoms.has(atom));
+  return overlap.length === Math.min(leftAtoms.size, rightAtoms.size);
+}
+
+function browserAssertionContractForTask(task: PlanTask): string {
+  return parseStructuredBrowserInteraction(task.text)?.assertionTarget || "";
+}
+
+function observableBrowserAssertionAtoms(value: string): string[] {
+  const matcher = new RegExp(OBSERVABLE_UI_POST_STATE_RE.source, "giu");
+  return [...String(value || "").matchAll(matcher)]
+    .map((match) => String(match[0] || "").toLocaleLowerCase().trim())
+    .filter(Boolean);
+}
+
+function assertionSubjectsCompatible(required: string, candidate: string): boolean {
+  const requiredSubject = observableBrowserAssertionAtoms(required)[0] || "";
+  const candidateSubjects = observableBrowserAssertionAtoms(candidate);
+  if (!requiredSubject) return true;
+  return candidateSubjects.some((subject) =>
+    subject === requiredSubject ||
+    subject.includes(requiredSubject) ||
+    requiredSubject.includes(subject)
+  );
+}
+
+function distinctiveAsciiContractAtoms(value: string): Set<string> {
+  const generic = new Set([
+    "state", "status", "page", "content", "text", "value", "visible", "display",
+    "displays", "displayed", "show", "shows", "shown", "change", "changed", "update",
+    "updated", "verify", "check", "confirm", "assert", "the", "a", "an", "should",
+    "must", "can", "will", "become", "becomes", "became",
+  ]);
+  return new Set(
+    (String(value || "").toLocaleLowerCase().match(/[a-z0-9_$-]{2,}/g) || [])
+      .map((atom) => atom.replace(/^[-_$]+|[-_$]+$/g, ""))
+      .filter((atom) => atom && !generic.has(atom)),
+  );
+}
+
+function planTaskCoversRequestValidation(candidate: PlanTask, required: PlanTask): boolean {
+  if (candidate.id === required.id || getPlanTaskIdentity(candidate) === getPlanTaskIdentity(required)) {
+    return true;
+  }
+
+  const requiredInteraction = (required.evidence || []).some((item) =>
+    (item.kind === "browser_dom" || item.kind === "browser_screenshot") &&
+    item.requiresInteraction === true
+  );
+  if (!requiredInteraction) return false;
+  const candidateInteraction = (candidate.evidence || []).some((item) =>
+    (item.kind === "browser_dom" || item.kind === "browser_screenshot") &&
+    item.requiresInteraction === true
+  );
+  if (!candidateInteraction) return false;
+
+  const requiredTarget = browserInteractionTargetForTask(required);
+  const candidateTarget = browserInteractionTargetForTask(candidate);
+  if (!requiredTarget || !candidateTarget) return false;
+  if (!browserActionTargetsEquivalent(requiredTarget, candidateTarget)) return false;
+
+  // Preserve explicit machine-readable postconditions from the request. A
+  // more specific reviewed assertion may cover a generic "state changed"
+  // requirement, but a different literal outcome must remain a separate gap.
+  const requiredOutcomeAtoms = distinctiveAsciiContractAtoms(
+    browserAssertionContractForTask(required),
+  );
+  const requiredAssertion = browserAssertionContractForTask(required);
+  const candidateAssertion = browserAssertionContractForTask(candidate);
+  if (!assertionSubjectsCompatible(requiredAssertion, candidateAssertion)) return false;
+  if (requiredOutcomeAtoms.size === 0) return true;
+  const candidateOutcomeAtoms = distinctiveAsciiContractAtoms(
+    candidateAssertion,
+  );
+  return [...requiredOutcomeAtoms].every((atom) => candidateOutcomeAtoms.has(atom));
+}
+
+/**
+ * Merge durable validation requirements into the reviewed runtime task set.
+ * A requirement may have been captured before Plan approval, so identity
+ * cannot rely on the generated task id alone: a reviewed Plan task that
+ * describes the same causal browser interaction owns that obligation.
+ */
+export function mergeRuntimeValidationTaskRequirements(
+  tasks: PlanTask[],
+  required: PlanTask[],
+): PlanTask[] {
+  const canonicalTasks = tasks.filter((task) => !isUserRequestValidationTask(task));
+  const durableRequirements = [
+    ...tasks.filter(isUserRequestValidationTask),
+    ...required,
+  ];
+  if (durableRequirements.length === 0) return tasks;
+  const merged = [...canonicalTasks];
+  for (const task of durableRequirements) {
+    if (merged.some((candidate) => planTaskCoversRequestValidation(candidate, task))) continue;
+    merged.push(task);
+  }
+  return merged;
+}
+
+export function mergeUserRequestValidationIntoRuntimeTasks(
+  tasks: PlanTask[],
+  userRequest: string,
+  options: Pick<RuntimePlanTaskDerivationOptions, "language" | "maxTasks"> = {},
+): PlanTask[] {
+  return mergeRuntimeValidationTaskRequirements(
+    tasks,
+    deriveRuntimeValidationTasksFromUserRequest(userRequest, options),
+  );
+}
+
+interface BrowserInteractionProofUnit {
+  actionTarget: string;
+  assertionTarget: string;
+}
+
+/**
+ * One interaction proof unit is deliberately stricter than a successful
+ * browser call.  It requires an observable non-native effect and a later
+ * assertion that the browser adapter causally linked to that exact action.
+ */
+function browserInteractionProofUnits(
+  record: PlanExecutionEvidenceEntry,
+): BrowserInteractionProofUnit[] {
+  const interaction = record.browserInteraction;
+  if (
+    !interaction ||
+    interaction.pageErrors.length > 0 ||
+    interaction.consoleErrors.length > 0
+  ) return [];
+
+  return interaction.actions.flatMap((action) => {
+    if (
+      !action.id ||
+      !action.succeeded ||
+      action.stateChanged !== true ||
+      action.effectStateChanged !== true ||
+      !Array.isArray(action.effectChangedFields) ||
+      action.effectChangedFields.length === 0
+    ) return [];
+
+    return interaction.assertions.flatMap((assertion) => {
+      if (
+        !assertion.passed ||
+        assertion.beforePassed !== false ||
+        assertion.changedAfterAction !== true ||
+        assertion.causallyLinked !== true ||
+        assertion.afterActionId !== action.id ||
+        !String(assertion.target || "").trim()
+      ) return [];
+      return [{
+        actionTarget: String(action.target || "").trim(),
+        assertionTarget: String(assertion.target || "").trim(),
+      }];
+    });
+  });
+}
+
+function browserContractAtoms(value: string): Set<string> {
+  const separated = String(value || "")
+    .replace(/([\p{Ll}\p{N}])([\p{Lu}])/gu, "$1 $2")
+    .toLocaleLowerCase();
+  return new Set(
+    (separated.match(/[\p{L}\p{N}]+/gu) || [])
+      .map((atom) => atom.trim())
+      .filter((atom) => atom.length >= 2),
+  );
+}
+
+function compactBrowserContract(value: string): string {
+  return String(value || "")
+    .toLocaleLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+function browserTargetMatchScore(contract: string, target: string): number {
+  const contractAtoms = browserContractAtoms(contract);
+  const targetAtoms = browserContractAtoms(target);
+  let score = [...targetAtoms].filter((atom) => contractAtoms.has(atom)).length;
+  const compactTarget = compactBrowserContract(target);
+  if (
+    compactTarget.length >= 2 &&
+    compactBrowserContract(contract).includes(compactTarget)
+  ) score += 3;
+  return score;
+}
+
+function browserProofUnitMatch(
+  task: Pick<PlanTask, "text" | "evidence">,
+  unit: BrowserInteractionProofUnit,
+): { relevant: boolean; score: number } {
+  const structuredAction = browserInteractionTargetForTask(task as PlanTask);
+  const structuredAssertion = browserAssertionContractForTask(task as PlanTask);
+  const legacyContract = [
+    task.text,
+    ...(task.evidence || []).map((item) => item.value),
+  ].join(" ");
+  const actionContract = structuredAction || legacyContract;
+  const assertionContract = structuredAssertion || legacyContract;
+  const actionScore = browserTargetMatchScore(actionContract, unit.actionTarget);
+  const assertionScore = browserTargetMatchScore(assertionContract, unit.assertionTarget);
+  return {
+    // Keep action and post-state roles separate. An action name mentioned in
+    // another task's expected outcome must not create an ownership tie.
+    relevant: actionScore > 0,
+    score: (actionScore * 4) + assertionScore,
+  };
+}
+
+function planTaskHasBrowserEvidence(task: Pick<PlanTask, "text" | "commands" | "evidence">): boolean {
+  return planTaskEvidenceItems(task).some((item) =>
+    item.kind === "browser_dom" || item.kind === "browser_screenshot"
+  );
+}
+
+/**
+ * A browser result may contain several independent action/assertion pairs.
+ * Assign each pair only to the uniquely best matching reviewed task.  This
+ * lets one batched browser call prove several controls without letting an
+ * unrelated click or page load satisfy every generic browser_dom item.
+ */
+function browserRecordStructurallyProvesPlanTask(
+  record: PlanExecutionEvidenceEntry,
+  task: PlanTask,
+  taskIndex: number,
+  tasks: PlanTask[],
+): boolean {
+  if (!planTaskHasBrowserEvidence(task)) return false;
+  const browserTaskIndexes = tasks.flatMap((candidate, index) =>
+    planTaskHasBrowserEvidence(candidate) ? [index] : []
+  );
+  return browserInteractionProofUnits(record).some((unit) => {
+    const scores = browserTaskIndexes.map((index) => ({
+      index,
+      ...browserProofUnitMatch(tasks[index], unit),
+    }));
+    const current = scores.find((candidate) => candidate.index === taskIndex);
+    if (!current?.relevant || current.score <= 0) return false;
+    const best = Math.max(...scores.map((candidate) => candidate.score));
+    return current.score === best && scores.filter((candidate) => candidate.score === best).length === 1;
+  });
+}
+
 function evidenceMatchesRecord(
   evidence: PlanTaskEvidence,
   record: PlanExecutionEvidenceEntry,
@@ -1674,6 +2207,9 @@ function evidenceMatchesRecord(
   }
 
   if (evidence.kind === "browser_dom" || evidence.kind === "browser_screenshot") {
+    if (evidence.requiresInteraction && browserInteractionProofUnits(record).length === 0) {
+      return false;
+    }
     if (record.kind === "browser_dom" || record.kind === "browser_screenshot") return true;
     if (record.kind === "cmd" && commandLooksLikePlaywrightOrBrowserTest(record.value || record.target || "")) return true;
     return sourceToolLooksLikeBrowserAutomation(record.sourceTool);
@@ -1724,6 +2260,148 @@ function evidenceRecordCanSatisfyAcceptance(
     record.observationStatus !== "stopped";
 }
 
+function evidenceRecordBelongsToPlanTask(
+  task: Pick<PlanTask, "id" | "requirementRef">,
+  record: PlanExecutionEvidenceEntry,
+): boolean {
+  const recordTaskId = String(record.planTaskId || "").trim();
+  if (recordTaskId) return recordTaskId === String(task.id || "").trim();
+  const recordRequirementRef = String(record.requirementRef || "").trim();
+  if (!recordRequirementRef) return true;
+  return recordRequirementRef === String(task.requirementRef || "").trim();
+}
+
+function planTaskEvidenceItems(
+  task: Pick<PlanTask, "text" | "commands" | "evidence">,
+): PlanTaskEvidence[] {
+  return task.evidence && task.evidence.length > 0
+    ? task.evidence
+    : inferPlanTaskEvidence(task.text, task.commands || []);
+}
+
+function planTaskScopedEvidenceLedger(
+  task: Pick<PlanTask, "id" | "requirementRef">,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): PlanExecutionEvidenceEntry[] {
+  return evidenceLedger.filter((record) => evidenceRecordBelongsToPlanTask(task, record));
+}
+
+function planTaskEvidenceItemSatisfied(
+  evidence: PlanTaskEvidence,
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): boolean {
+  return evidence.kind === "cmd"
+    ? commandEvidenceSatisfiedByLedger(evidence, evidenceLedger)
+    : evidenceLedger.some((record) =>
+        evidenceRecordCanSatisfyAcceptance(record) && evidenceMatchesRecord(evidence, record)
+      );
+}
+
+function ptyObservationContinuesPlanCommand(
+  evidence: PlanTaskEvidence,
+  taskEvidenceLedger: PlanExecutionEvidenceEntry[],
+  record: PlanExecutionEvidenceEntry,
+): boolean {
+  if (
+    evidence.kind !== "cmd" ||
+    !requiresPtyObservationForPlanCommand(evidence.value) ||
+    !PTY_OBSERVATION_TOOL_NAMES.has(record.sourceTool)
+  ) return false;
+
+  const launch = [...taskEvidenceLedger].reverse().find((candidate) =>
+    candidate.sourceTool === "execute_command" && evidenceMatchesRecord(evidence, candidate)
+  );
+  if (!launch) return false;
+  return typeof launch.foregroundGeneration !== "number" ||
+    typeof record.foregroundGeneration !== "number" ||
+    launch.foregroundGeneration === record.foregroundGeneration;
+}
+
+function planTaskEvidenceItemAcceptsRecord(
+  evidence: PlanTaskEvidence,
+  taskEvidenceLedger: PlanExecutionEvidenceEntry[],
+  record: PlanExecutionEvidenceEntry,
+): boolean {
+  return evidenceMatchesRecord(evidence, record) ||
+    ptyObservationContinuesPlanCommand(evidence, taskEvidenceLedger, record);
+}
+
+export interface PlanExecutionEvidenceIdentity {
+  planTaskId: string;
+  requirementRef: string;
+}
+
+/**
+ * Attribute a tool result to the concrete unsatisfied Plan obligation it can
+ * advance. A recovery checkpoint is only a preference: once the tool result
+ * no longer matches that task (for example browser evidence after a dev-server
+ * task became ready), ownership advances to the first matching pending task.
+ */
+export function resolvePlanExecutionEvidenceIdentity(input: {
+  tasks: PlanTask[];
+  evidenceLedger?: PlanExecutionEvidenceEntry[];
+  record: PlanExecutionEvidenceEntry;
+  preferredPlanTaskId?: string | null;
+  preferredRequirementRef?: string | null;
+}): PlanExecutionEvidenceIdentity | null {
+  const tasks = Array.isArray(input.tasks) ? input.tasks : [];
+  const evidenceLedger = Array.isArray(input.evidenceLedger) ? input.evidenceLedger : [];
+  const preferredTaskId = String(input.preferredPlanTaskId || "").trim();
+  const preferredRequirementRef = String(input.preferredRequirementRef || "").trim();
+
+  const taskAcceptsRecord = (task: PlanTask): boolean => {
+    const taskLedger = planTaskScopedEvidenceLedger(task, evidenceLedger);
+    return planTaskEvidenceItems(task).some((evidence) =>
+      !planTaskEvidenceItemSatisfied(evidence, taskLedger) &&
+      planTaskEvidenceItemAcceptsRecord(evidence, taskLedger, input.record)
+    );
+  };
+  const toIdentity = (task: PlanTask): PlanExecutionEvidenceIdentity | null => {
+    const planTaskId = String(task.id || "").trim();
+    if (!planTaskId) return null;
+    return {
+      planTaskId,
+      requirementRef: String(task.requirementRef || planTaskId).trim(),
+    };
+  };
+
+  const preferredTask = tasks.find((task) =>
+    (preferredTaskId && String(task.id || "").trim() === preferredTaskId) ||
+    (
+      !preferredTaskId &&
+      preferredRequirementRef &&
+      String(task.requirementRef || "").trim() === preferredRequirementRef
+    )
+  );
+  if (preferredTask && taskAcceptsRecord(preferredTask)) {
+    return toIdentity(preferredTask);
+  }
+
+  for (const task of tasks) {
+    if (!taskAcceptsRecord(task)) continue;
+    const identity = toIdentity(task);
+    if (identity) return identity;
+  }
+  return null;
+}
+
+export function findUnsatisfiedPlanTaskEvidence(
+  task: Pick<PlanTask, "id" | "requirementRef" | "text" | "commands" | "evidence">,
+  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
+): PlanTaskEvidence[] {
+  const taskLedger = planTaskScopedEvidenceLedger(task, evidenceLedger);
+  return planTaskEvidenceItems(task).filter((evidence) =>
+    !planTaskEvidenceItemSatisfied(evidence, taskLedger)
+  );
+}
+
+export function findFirstUnsatisfiedPlanTaskEvidence(
+  task: Pick<PlanTask, "id" | "requirementRef" | "text" | "commands" | "evidence">,
+  evidenceLedger: PlanExecutionEvidenceEntry[] = [],
+): PlanTaskEvidence | null {
+  return findUnsatisfiedPlanTaskEvidence(task, evidenceLedger)[0] || null;
+}
+
 /**
  * A composite task can remain incomplete because its validation command is
  * pending even after the source edit is already proven. Recovery must inspect
@@ -1735,30 +2413,26 @@ export function planTaskHasUnsatisfiedSourceMutationEvidence(
   evidenceLedger: PlanExecutionEvidenceEntry[] = [],
 ): boolean {
   if (!isPlanTaskSourceMutationObligation(task)) return false;
-  const evidence = task.evidence && task.evidence.length > 0
-    ? task.evidence
-    : inferPlanTaskEvidence(task.text, task.commands || []);
+  const evidence = planTaskEvidenceItems(task);
   const fileEvidence = evidence.filter((item) => item.kind === "file");
   if (fileEvidence.length === 0) return true;
+  const taskEvidenceLedger = planTaskScopedEvidenceLedger(task, evidenceLedger);
   return fileEvidence.some((item) =>
-    !evidenceLedger.some((record) =>
-      evidenceRecordCanSatisfyAcceptance(record) && evidenceMatchesRecord(item, record)
-    )
+    !planTaskEvidenceItemSatisfied(item, taskEvidenceLedger)
   );
 }
 
 export function findFirstPlanTaskEvidenceRecord(
-  task: Pick<PlanTask, "text" | "commands" | "evidence">,
+  task: Pick<PlanTask, "id" | "requirementRef" | "text" | "commands" | "evidence">,
   evidenceLedger: PlanExecutionEvidenceEntry[] = [],
 ): { record: PlanExecutionEvidenceEntry; ledgerIndex: number } | null {
-  const evidence = task.evidence && task.evidence.length > 0
-    ? task.evidence
-    : inferPlanTaskEvidence(task.text, task.commands || []);
+  const evidence = planTaskEvidenceItems(task);
   if (evidence.length === 0 || evidenceLedger.length === 0) return null;
 
   for (let ledgerIndex = 0; ledgerIndex < evidenceLedger.length; ledgerIndex += 1) {
     const record = evidenceLedger[ledgerIndex];
     if (
+      evidenceRecordBelongsToPlanTask(task, record) &&
       evidenceRecordCanSatisfyAcceptance(record) &&
       evidence.some((item) => evidenceMatchesRecord(item, record))
     ) {
@@ -1772,10 +2446,9 @@ export function findFirstPlanTaskEvidenceRecord(
 function resolvePlanTaskEvidenceStatus(
   task: PlanTask,
   evidenceLedger: PlanExecutionEvidenceEntry[],
+  ledgerAlreadyScoped = false,
 ): { status: PlanTaskEvidenceStatus; matched: number; total: number; blockedReason?: string; validationCapability?: PlanTaskValidationCapability } {
-  const evidence = task.evidence && task.evidence.length > 0
-    ? task.evidence
-    : inferPlanTaskEvidence(task.text, task.commands || []);
+  const evidence = planTaskEvidenceItems(task);
   if (evidence.length === 0) {
     return {
       status: "missing",
@@ -1785,12 +2458,12 @@ function resolvePlanTaskEvidenceStatus(
     };
   }
 
+  const taskEvidenceLedger = ledgerAlreadyScoped
+    ? evidenceLedger
+    : planTaskScopedEvidenceLedger(task, evidenceLedger);
+
   const evidenceMatchesLedger = (item: PlanTaskEvidence): boolean =>
-    item.kind === "cmd"
-      ? commandEvidenceSatisfiedByLedger(item, evidenceLedger)
-      : evidenceLedger.some((record) =>
-          evidenceRecordCanSatisfyAcceptance(record) && evidenceMatchesRecord(item, record)
-        );
+    planTaskEvidenceItemSatisfied(item, taskEvidenceLedger);
   const matched = evidence.filter(evidenceMatchesLedger).length;
 
   if (matched === evidence.length) {
@@ -1843,13 +2516,13 @@ function resolvePlanTaskEvidenceStatus(
   }
 
   const awaitingPtyObservation = automaticEvidenceForCurrentGap.some((item) =>
-    commandEvidenceIsAwaitingPtyObservation(item, evidenceLedger)
+    commandEvidenceIsAwaitingPtyObservation(item, taskEvidenceLedger)
   );
   const failedPtyObservation = automaticEvidenceForCurrentGap.find((item) =>
-    item.kind === "cmd" && latestFailedPtyObservationForCommand(item, evidenceLedger)
+    item.kind === "cmd" && latestFailedPtyObservationForCommand(item, taskEvidenceLedger)
   );
   const failedFiniteValidation = automaticEvidenceForCurrentGap.find((item) =>
-    item.kind === "cmd" && latestFailedFiniteCommandForEvidence(item, evidenceLedger)
+    item.kind === "cmd" && latestFailedFiniteCommandForEvidence(item, taskEvidenceLedger)
   );
 
   return {
@@ -1937,6 +2610,48 @@ export function describePlanValidationDecision(input: {
   return "";
 }
 
+/**
+ * Old ledgers did not carry task identity. Preserve them conservatively, but
+ * consume an ambiguous generic same-file mutation only once in Plan order.
+ * Two historical mutations can still satisfy two tasks one-to-one.
+ */
+function assignLegacyGenericFileEvidenceOwners(
+  tasks: PlanTask[],
+  evidenceLedger: PlanExecutionEvidenceEntry[],
+): Map<number, number> {
+  const owners = new Map<number, number>();
+  const consumedTaskEvidence = new Set<string>();
+  evidenceLedger.forEach((record, ledgerIndex) => {
+    if (
+      record.planTaskId ||
+      record.requirementRef ||
+      (record.kind !== "file" && record.kind !== "deliverable")
+    ) return;
+    const candidates: Array<{ taskIndex: number; evidenceKey: string }> = [];
+    tasks.forEach((task, taskIndex) => {
+      const taskEvidence = task.evidence && task.evidence.length > 0
+        ? task.evidence
+        : inferPlanTaskEvidence(task.text, task.commands || []);
+      const genericMatch = taskEvidence.find((item) =>
+        (item.kind === "file" || item.kind === "deliverable") &&
+        (item.requiredTerms || []).length === 0 &&
+        evidenceMatchesRecord(item, record)
+      );
+      if (genericMatch) {
+        candidates.push({
+          taskIndex,
+          evidenceKey: `${taskIndex}:${genericMatch.kind}:${normalizePlanEvidenceValue(genericMatch.value)}`,
+        });
+      }
+    });
+    if (candidates.length <= 1) return;
+    const owner = candidates.find((candidate) => !consumedTaskEvidence.has(candidate.evidenceKey)) || candidates[0];
+    owners.set(ledgerIndex, owner.taskIndex);
+    consumedTaskEvidence.add(owner.evidenceKey);
+  });
+  return owners;
+}
+
 export function reconcilePlanTaskCompletion(
   previousTasks: PlanTask[],
   parsedTasks: PlanTask[],
@@ -1944,11 +2659,40 @@ export function reconcilePlanTaskCompletion(
   options: { preserveMissing?: boolean; highlightNext?: boolean } = {},
 ): PlanTask[] {
   const merged = mergePlanTasks(previousTasks, parsedTasks, options.preserveMissing ?? true);
-  const reconciled = merged.map((task) => {
+  const legacyGenericFileOwners = assignLegacyGenericFileEvidenceOwners(merged, evidenceLedger);
+  const reconciled = merged.map((task, taskIndex) => {
     const evidence = task.evidence && task.evidence.length > 0
       ? task.evidence
       : inferPlanTaskEvidence(task.text, task.commands || []);
-    const evidenceResult = resolvePlanTaskEvidenceStatus({ ...task, evidence }, evidenceLedger);
+    const taskEvidenceLedger = evidenceLedger.filter((record, ledgerIndex) => {
+      const browserRecord =
+        record.kind === "browser_dom" ||
+        record.kind === "browser_screenshot" ||
+        sourceToolLooksLikeBrowserAutomation(record.sourceTool);
+      const structuredBrowserProof = browserRecord &&
+        browserRecordStructurallyProvesPlanTask(record, { ...task, evidence }, taskIndex, merged);
+      if (structuredBrowserProof) return true;
+      if (
+        browserRecord &&
+        evidence.some((item) =>
+          (item.kind === "browser_dom" || item.kind === "browser_screenshot") &&
+          item.requiresInteraction === true
+        )
+      ) return false;
+      if (!evidenceRecordBelongsToPlanTask(task, record)) return false;
+      const legacyOwner = legacyGenericFileOwners.get(ledgerIndex);
+      if (legacyOwner === undefined || legacyOwner === taskIndex) return true;
+      return evidence.some((item) =>
+        (item.kind === "file" || item.kind === "deliverable") &&
+        (item.requiredTerms || []).length > 0 &&
+        evidenceMatchesRecord(item, record)
+      );
+    });
+    const evidenceResult = resolvePlanTaskEvidenceStatus(
+      { ...task, evidence },
+      taskEvidenceLedger,
+      true,
+    );
     const claimedStatus = task.claimedStatus || task.status;
     const status: PlanTaskStatus =
       evidenceResult.status === "satisfied"
@@ -2107,6 +2851,7 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
     if (!matched) continue;
 
     const rawText = matched[2].trim();
+    if (RUNTIME_TASK_OPTIONAL_RE.test(stripMarkdownTaskLine(rawText))) continue;
     const requirementMatched = rawText.match(/REQ-[A-Za-z0-9_-]+/);
     const withoutRequirement = rawText.replace(/\s*→\s*对应需求[:：]?\s*REQ-[A-Za-z0-9_-]+/i, "").trim();
     const parsedEvidence = parsePlanTaskEvidenceLabel(withoutRequirement);
@@ -2173,6 +2918,8 @@ const RUNTIME_TASK_SCOPE_SECTION_RE =
   /^(?:\d+\s*[.)、:：-]?\s*)?(?:影响范围|变更范围|Impact\s+Scope|Change\s+Scope|Affected\s+Scope)\s*$/i;
 const RUNTIME_TASK_PLACEHOLDER_RE =
   /(?:使用方式|示例|建议|当前状态|状态发现|项目基于|技术栈|本设计要解决的问题|总体思路|为什么这样拆分|哪些部分保持不变|数据分析类任务|模块\s*\/\s*文件|状态\s*\/\s*数据流|交互\s*\/\s*UX|错误处理\s*\/\s*回退|允许修改的区域|暂不修改的区域|需要哪些测试|REQ-xxx|占位|TBD|TODO)/i;
+const RUNTIME_TASK_OPTIONAL_RE =
+  /(?:[（(]\s*(?:可选|optional)\s*[）)]|(?:^|[\s:：—–-])(?:可选|optional|if needed|when needed|必要时|如需|若需要)(?=$|[\s:：—–-]))/i;
 const RUNTIME_TASK_CHANGE_HEADING_RE =
   /^(?:改动|变更|changes?)\s*\d*\s*[：:]\s*(.+)$/i;
 const RUNTIME_TASK_CHANGE_DETAIL_RE =
@@ -2287,6 +3034,8 @@ export function isRuntimeTaskActionableText(text: string): boolean {
     return true;
   }
 
+  if (inferStructuredBrowserInteraction(normalized)) return true;
+
   // A read/inspect sentence can contain mutation nouns such as “the complete
   // implementation”. Treat the leading intent as authoritative unless the
   // same sentence explicitly pivots from inspection to a write action or
@@ -2309,16 +3058,71 @@ export function isRuntimeTaskActionableText(text: string): boolean {
   return RUNTIME_TASK_ACTION_RE.test(normalized);
 }
 
+interface PendingRuntimeInteractionParent {
+  indent: number;
+  actionVerb: string;
+  actionTarget: string;
+}
+
+function parsePendingRuntimeInteractionParent(
+  text: string,
+  indent: number,
+): PendingRuntimeInteractionParent | null {
+  if (!/[:：]\s*$/.test(text)) return null;
+  const action = DIRECT_UI_INTERACTION_ACTION_RE.exec(text);
+  if (!action || action.index === undefined) return null;
+  const afterAction = text.slice(action.index + action[0].length);
+  const assertionCue = POST_INTERACTION_ASSERTION_CUE_RE.exec(afterAction);
+  const actionTarget = afterAction
+    .slice(0, assertionCue?.index ?? afterAction.length)
+    .replace(/^[\s`'"“”‘’([{]+|[\s`'"“”‘’\])},，,:：;；]+$/g, "")
+    .trim();
+  if (meaningfulBrowserActionAtoms(actionTarget).size === 0) return null;
+  return { indent, actionVerb: action[0], actionTarget };
+}
+
+function inheritRuntimeInteractionFromParent(
+  parent: PendingRuntimeInteractionParent,
+  text: string,
+  indent: number,
+): string | null {
+  if (indent <= parent.indent) return null;
+  const child = text.match(/^([^:：]{1,80})[:：]\s*(.{2,})$/s);
+  if (!child) return null;
+  const label = String(child[1] || "").trim();
+  const postState = String(child[2] || "").trim();
+  if (
+    !label ||
+    !OBSERVABLE_UI_POST_STATE_RE.test(postState) ||
+    !CONCRETE_VALIDATION_OUTCOME_RE.test(postState)
+  ) return null;
+
+  const parentAtoms = meaningfulBrowserActionAtoms(parent.actionTarget);
+  const labelAtoms = meaningfulBrowserActionAtoms(label);
+  const compactLabel = compactBrowserContract(label);
+  const parentOwnsLabel = labelAtoms.size > 0
+    ? [...labelAtoms].every((atom) => parentAtoms.has(atom))
+    : compactLabel.length >= 2 && compactBrowserContract(parent.actionTarget).includes(compactLabel);
+  if (!parentOwnsLabel) return null;
+
+  // The arrow is already part of the provider-neutral causal grammar parsed
+  // by `parseStructuredBrowserInteraction`; no model-, control-, or language-
+  // specific validation rule is introduced here.
+  return `${parent.actionVerb} ${label} → ${postState}`;
+}
+
 export function collectRuntimeTaskCandidateLines(content: string): string[] {
   const lines = String(content || "").split(/\r?\n/);
   const candidates: string[] = [];
   let usefulSectionLevel = 0;
   let excludedSectionLevel = 0;
   let validationSectionLevel = 0;
+  let pendingInteractionParent: PendingRuntimeInteractionParent | null = null;
 
   for (const line of lines) {
     const heading = line.match(/^\s*(#{1,6})\s+(.+)$/);
     if (heading) {
+      pendingInteractionParent = null;
       const headingLevel = (heading[1] || "").length;
       const headingText = heading[2] || "";
 
@@ -2370,15 +3174,29 @@ export function collectRuntimeTaskCandidateLines(content: string): string[] {
     }
 
     if (excludedSectionLevel > 0) continue;
-    if (!/^\s*(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line)) continue;
+    const listItem = line.match(/^(\s*)(?:[-*]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/);
+    if (!listItem) {
+      if (line.trim()) pendingInteractionParent = null;
+      continue;
+    }
     if (isMarkdownTableSyntaxLine(line)) continue;
     const rawText = stripMarkdownTaskLine(line);
+    const indent = String(listItem[1] || "").length;
+    if (pendingInteractionParent && indent <= pendingInteractionParent.indent) {
+      pendingInteractionParent = null;
+    }
+    const inheritedInteraction = pendingInteractionParent
+      ? inheritRuntimeInteractionFromParent(pendingInteractionParent, rawText, indent)
+      : null;
+    const nextInteractionParent = parsePendingRuntimeInteractionParent(rawText, indent);
+    if (nextInteractionParent) pendingInteractionParent = nextInteractionParent;
     const text =
+      inheritedInteraction || (
       validationSectionLevel > 0 &&
       !PRIMARY_VALIDATION_TASK_RE.test(rawText) &&
       CONCRETE_VALIDATION_OUTCOME_RE.test(rawText)
         ? `${/[\u3400-\u9fff]/.test(rawText) ? "验证：" : "Verify: "}${rawText}`
-        : rawText;
+        : rawText);
     // PlanCandidate change lines intentionally preserve concrete rationale and
     // evidence references, so a valid mutation bullet can be substantially
     // longer than a chat-sized task label. Rejecting it here made approval see
@@ -2452,10 +3270,58 @@ function stripRuntimeExcludedSections(content: string): string {
   return kept.join("\n");
 }
 
+/**
+ * Optional Plan prose remains visible in the approved artifact, but it is not
+ * a completion obligation. Remove optional headings, list parents, their
+ * nested children, and inline optional task rows before task/command
+ * materialization so a suggestion cannot become a blocking synthetic check.
+ */
+function stripRuntimeOptionalTasks(content: string): string {
+  const kept: string[] = [];
+  let optionalSectionLevel = 0;
+  let optionalListIndent: number | null = null;
+
+  for (const rawLine of String(content || "").split(/\r?\n/)) {
+    const heading = rawLine.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const level = (heading[1] || "").length;
+      if (optionalSectionLevel > 0 && level > optionalSectionLevel) continue;
+      if (optionalSectionLevel > 0 && level <= optionalSectionLevel) {
+        optionalSectionLevel = 0;
+      }
+      optionalListIndent = null;
+      if (RUNTIME_TASK_OPTIONAL_RE.test((heading[2] || "").replace(/\*\*/g, "").trim())) {
+        optionalSectionLevel = level;
+        continue;
+      }
+      kept.push(rawLine);
+      continue;
+    }
+    if (optionalSectionLevel > 0) continue;
+
+    const trimmed = rawLine.trim();
+    const indent = rawLine.length - rawLine.trimStart().length;
+    if (optionalListIndent !== null) {
+      if (!trimmed || indent > optionalListIndent) continue;
+      optionalListIndent = null;
+    }
+
+    const listItem = /^\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(rawLine);
+    if (RUNTIME_TASK_OPTIONAL_RE.test(trimmed)) {
+      if (listItem) optionalListIndent = indent;
+      continue;
+    }
+    kept.push(rawLine);
+  }
+
+  return kept.join("\n");
+}
+
 function makeRuntimeTask(text: string, language: "zh" | "en"): PlanTask | null {
   const clean = stripMarkdownTaskLine(text);
   if (!clean) return null;
   if (isMarkdownTableSyntaxLine(clean)) return null;
+  if (RUNTIME_TASK_OPTIONAL_RE.test(clean)) return null;
 
   const parsedEvidence = parsePlanTaskEvidenceLabel(clean);
   const taskText = parsedEvidence.text || clean;
@@ -2563,7 +3429,16 @@ function selectMutationOwnerFileReferences(text: string, files: string[]): strin
     const verbStart = verb.index || 0;
     const verbEnd = verbStart + String(verb[0] || "").length;
     const following = references.filter((reference) => reference.start >= verbEnd);
-    if (following.length > 0 && following[0].start - verbEnd <= 100) {
+    const followingRelation = following.length > 0
+      ? clean.slice(verbEnd, following[0].start)
+      : "";
+    // The target must be the direct grammatical object of the mutation verb.
+    // A distance-only rule incorrectly crossed whole clauses and promoted
+    // output names such as a download filename to workspace write scope.
+    const directlyOwnsFollowingReference =
+      following.length > 0 &&
+      /^\s*(?:(?:(?:以下|下列|目标|对应|相关|源码|源代码|配置|测试|脚本|组件|模块)?\s*(?:文件|路径)|(?:the\s+)?(?:(?:following|target|corresponding|related|source|configuration|config|test|script|component|module)\s+)?(?:files?|paths?))\s*[:：]?\s*)?[`'"“”‘’]*\s*$/i.test(followingRelation);
+    if (directlyOwnsFollowingReference) {
       const owned = [following[0]];
       for (let index = 1; index < following.length; index += 1) {
         const previous = owned[owned.length - 1];
@@ -2897,7 +3772,7 @@ function collectRuntimeTaskTableTasks(
     if (!filePath) continue;
 
     const rowText = cells.join(" ");
-    if (/(?:可选|optional|if needed|必要时|如需|若需要)/i.test(rowText)) continue;
+    if (RUNTIME_TASK_OPTIONAL_RE.test(rowText)) continue;
 
     const actionCell = (cells[1] || "").replace(/\*\*/g, "").trim();
     const detail = cells.slice(2).join(" ").replace(/\*\*/g, "").trim();
@@ -2951,6 +3826,66 @@ function runtimeMutationEvidenceOverlaps(
   return matches.length === 1;
 }
 
+function collectCanonicalRuntimePlanFilePaths(content: string): string[] {
+  const byIdentity = new Map<string, string>();
+  for (const reference of extractWorkspaceFileReferencesFromText(content)) {
+    const clean = String(reference || "").replace(/\\/g, "/").trim();
+    const normalized = normalizePlanEvidenceValue(clean);
+    if (
+      !normalized.includes("/") ||
+      /^\.{1,2}\//.test(normalized) ||
+      isInternalPlanEvidenceValue(normalized)
+    ) {
+      continue;
+    }
+    if (!byIdentity.has(normalized)) byIdentity.set(normalized, clean);
+  }
+  return Array.from(byIdentity.values());
+}
+
+function canonicalizeRuntimeTaskFileEvidence(
+  task: PlanTask,
+  canonicalPaths: string[],
+): PlanTask {
+  if (!task.evidence?.length || canonicalPaths.length === 0) return task;
+  let changed = false;
+  const evidence = task.evidence.map((item) => {
+    if (item.kind !== "file") return item;
+    const candidate = normalizePlanEvidenceValue(item.value);
+    if (!candidate) return item;
+    const matches = canonicalPaths.filter((known) => {
+      const normalizedKnown = normalizePlanEvidenceValue(known);
+      return normalizedKnown === candidate ||
+        normalizedKnown.endsWith(`/${candidate}`) ||
+        candidate.endsWith(`/${normalizedKnown}`);
+    });
+    if (matches.length === 0) return item;
+    const ordered = [...matches].sort((left, right) => right.length - left.length);
+    const selected = ordered[0];
+    const selectedIdentity = normalizePlanEvidenceValue(selected);
+    const uniquelyNested = ordered.every((match) => {
+      const identity = normalizePlanEvidenceValue(match);
+      return identity === selectedIdentity || selectedIdentity.endsWith(`/${identity}`);
+    });
+    if (!uniquelyNested || selectedIdentity === candidate) return item;
+    changed = true;
+    return { ...item, value: selected };
+  });
+  return changed ? { ...task, evidence } : task;
+}
+
+/**
+ * A model may explain alternatives before emitting the protocol-owned plan
+ * document. Once the canonical H1 exists, only that document is approval
+ * scope; promoting earlier analysis into executable tasks can schedule both a
+ * rejected alternative and the selected implementation.
+ */
+function selectCanonicalRuntimePlanContent(content: string): string {
+  const source = String(content || "");
+  const marker = /^#\s+Proposed Plan\s*$/im.exec(source);
+  return marker?.index === undefined ? source : source.slice(marker.index);
+}
+
 export function deriveRuntimePlanTasksFromArtifacts(
   artifacts: PlanArtifact[],
   options: RuntimePlanTaskDerivationOptions = {},
@@ -2960,28 +3895,36 @@ export function deriveRuntimePlanTasksFromArtifacts(
   const sourceArtifacts = artifacts.filter((artifact) =>
     artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "requirements"
   );
-  const combinedContent = sourceArtifacts.map((artifact) => artifact.content).join("\n\n");
+  const combinedContent = sourceArtifacts
+    .map((artifact) => selectCanonicalRuntimePlanContent(artifact.content))
+    .join("\n\n");
   if (!combinedContent.trim()) return [];
   const normalizedRuntimeContent = normalizeRuntimePlanSectionHeadings(combinedContent);
-  const runtimeRelevantContent = stripRuntimeExcludedSections(normalizedRuntimeContent);
+  const runtimeRelevantContent = stripRuntimeOptionalTasks(
+    stripRuntimeExcludedSections(normalizedRuntimeContent),
+  );
   const runtimeCommands = extractShellCommandsFromText(runtimeRelevantContent);
+  const canonicalFilePaths = collectCanonicalRuntimePlanFilePaths(normalizedRuntimeContent);
   const sourceTaskLimit = runtimeCommands.length > 0
     ? Math.max(1, maxTasks - 1)
     : maxTasks;
 
   const tasks: PlanTask[] = [];
   const seen = new Set<string>();
-  const pushTask = (task: PlanTask | null) => {
-    if (!task) return;
+  const pushTask = (candidate: PlanTask | null): PlanTask | null => {
+    if (!candidate) return null;
+    const task = canonicalizeRuntimeTaskFileEvidence(candidate, canonicalFilePaths);
     const key = getPlanTaskIdentity(task);
-    if (seen.has(key)) return;
+    if (seen.has(key)) return null;
     seen.add(key);
     tasks.push(task);
+    return task;
   };
 
   const structuredMutationFiles = new Set<string>();
-  for (const task of collectRuntimeTaskChangeHeadingTasks(runtimeRelevantContent, language)) {
-    pushTask(task);
+  for (const candidate of collectRuntimeTaskChangeHeadingTasks(runtimeRelevantContent, language)) {
+    const task = pushTask(candidate);
+    if (!task) continue;
     for (const evidence of task.evidence || []) {
       if (evidence.kind === "file") {
         structuredMutationFiles.add(normalizePlanEvidenceValue(evidence.value));
@@ -2991,7 +3934,8 @@ export function deriveRuntimePlanTasksFromArtifacts(
   }
 
   if (tasks.length < sourceTaskLimit) {
-    for (const task of collectRuntimeTaskProseSectionTasks(runtimeRelevantContent, language)) {
+    for (const candidate of collectRuntimeTaskProseSectionTasks(runtimeRelevantContent, language)) {
+      const task = canonicalizeRuntimeTaskFileEvidence(candidate, canonicalFilePaths);
       const fileEvidence = (task.evidence || [])
         .filter((item) => item.kind === "file")
         .map((item) => normalizePlanEvidenceValue(item.value));
@@ -3007,7 +3951,8 @@ export function deriveRuntimePlanTasksFromArtifacts(
   }
 
   if (tasks.length < sourceTaskLimit) {
-    for (const task of collectRuntimeTaskTableTasks(runtimeRelevantContent, language)) {
+    for (const candidate of collectRuntimeTaskTableTasks(runtimeRelevantContent, language)) {
+      const task = canonicalizeRuntimeTaskFileEvidence(candidate, canonicalFilePaths);
       const fileEvidence = (task.evidence || [])
         .filter((item) => item.kind === "file")
         .map((item) => normalizePlanEvidenceValue(item.value));
@@ -3028,7 +3973,10 @@ export function deriveRuntimePlanTasksFromArtifacts(
   if (tasks.length < sourceTaskLimit) {
     for (const line of collectRuntimeTaskCandidateLines(runtimeRelevantContent)) {
       const task = makeRuntimeTask(line, language);
-      const fileEvidence = (task?.evidence || [])
+      const canonicalTask = task
+        ? canonicalizeRuntimeTaskFileEvidence(task, canonicalFilePaths)
+        : null;
+      const fileEvidence = (canonicalTask?.evidence || [])
         .filter((item) => item.kind === "file")
         .map((item) => normalizePlanEvidenceValue(item.value));
       if (fileEvidence.some((value) =>
@@ -3036,7 +3984,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
       )) {
         continue;
       }
-      pushTask(task);
+      pushTask(canonicalTask);
       fileEvidence.forEach((value) => structuredMutationFiles.add(value));
       if (tasks.length >= sourceTaskLimit) break;
     }
@@ -3652,19 +4600,6 @@ export function validateActionablePlanArtifact(
     (fencedCodeBlocks.length > 1 || fencedCodeChars > raw.length * 0.2)
   ) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "excessive_plan_code_dump" });
-  }
-  const keyChangesBody = extractPlanSectionBody(
-    raw,
-    RUNTIME_TASK_STRUCTURAL_EXECUTION_SECTION_RE,
-  );
-  const keyChangeCodeFragments = keyChangesBody
-    .split(/\r?\n/)
-    .map((line) => line.trim().replace(/^[-*]\s+/, ""))
-    .filter((line) =>
-      /^(?:```|\/\/|\/\*|\*\/|import\s|export\s|(?:async\s+)?function\s|(?:const|let|var)\s|class\s|interface\s|type\s+\w+\s*=|[{}]\s*$)/i.test(line)
-    );
-  if (/```/.test(keyChangesBody) || keyChangeCodeFragments.length >= 2) {
-    return classifyPlanArtifactQualityResult({ ok: false, reason: "code_fragments_in_plan_key_changes" });
   }
   if (/(?:如果确实缺少关键业务选择，用\s*提问|tsx\s*约束|imageParts\s*[0-9]|turn_intake|可见计划必须对齐|创建\s*plan\.md\s*是\s*runtime|本轮处于\s*PLAN\s*模式)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "prompt_leakage_in_plan" });

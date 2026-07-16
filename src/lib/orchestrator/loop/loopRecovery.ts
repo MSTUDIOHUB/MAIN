@@ -1,20 +1,14 @@
 import {
-  EXECUTION_VERIFICATION_TOOL_NAMES,
   EXECUTE_CONVERGENCE_PROMPT_RATIO,
-  MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS,
-  MAX_CONSECUTIVE_READ_ONLY_ITERATIONS,
   MAX_NO_PROGRESS_LOOP_REPEATS,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO,
   buildExecuteConvergencePrompt,
   buildNoProgressBatchSignature,
-  buildReadFileRepeatLimitBatchPauseNotice,
   getToolTarget,
-  isReadFileRepeatLimitResult,
   isReadFileOnlyPattern,
   logAgentEvent,
   parseToolCallArguments,
-  summarizeReadFileRepeatLimitBatch,
   targetProgressOutcomeForToolResult,
   targetProgressReasonForToolResult,
   truncateForLog,
@@ -25,7 +19,6 @@ import { isPtyControlInput } from "../../ptyCommandRuntime";
 import {
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
-  buildExecuteValidationRecoveryPrompt,
   isReadOnlyNoProgressDetail,
   resolveExecuteRecoveryActionContract,
   resolveExecuteReadOnlyRecoveryTrigger,
@@ -36,6 +29,7 @@ import {
 import {
   buildPlanNoProgressLoopPauseNotice,
   buildPlanProgressSignatureFromToolActivity,
+  hasPendingApprovedPlanSourceMutation,
   summarizeRepeatedPlanTargetsFromToolActivity,
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
@@ -50,9 +44,7 @@ import {
   registerToolCallForRepeatGuard,
 } from "../../repetitionGuard";
 import {
-  buildPlanTaskEvidenceAudit,
   isPlanTaskTrustedComplete,
-  planTaskHasUnsatisfiedSourceMutationEvidence,
 } from "../../workflowModels";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import {
@@ -61,18 +53,10 @@ import {
   type ToolPermissionPolicy,
 } from "../../toolCapabilities";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
-import {
-  isEditProgressResult,
-  isVerificationEvidenceResult,
-} from "./toolActivityTracking";
-import type { CrossIterationFileReadObservation } from "./loopGuardRuntimeState";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
 
 export { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
-
-const DEFAULT_CROSS_ITERATION_READ_CONTEXT_LIMIT = 128000;
-const SMALL_CONTEXT_READ_LOOP_THRESHOLD = 16384;
 
 function resolveRuntimeRecoveryActionContract(state: ExecuteRecoveryRuntimeState) {
   return resolveExecuteRecoveryActionContract(state.mode, {
@@ -85,27 +69,6 @@ function resolveRuntimeRecoveryActionContract(state: ExecuteRecoveryRuntimeState
     protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
   });
 }
-const MEDIUM_CONTEXT_READ_LOOP_THRESHOLD = 65536;
-const SMALL_CONTEXT_MAX_CROSS_READS = 3;
-const MEDIUM_CONTEXT_MAX_CROSS_READS = 4;
-const LARGE_CONTEXT_MAX_CROSS_READS = 5;
-const BLOCKED_READS_BEFORE_RECOVERY_RESET = 2;
-
-function hasPendingApprovedPlanSourceMutation(callbacks: OrchestratorCallbacks): boolean {
-  if (!callbacks.getIsPlanApproved()) return false;
-  const tasks = callbacks.getPlanTasks();
-  if (!Array.isArray(tasks) || tasks.length === 0) return false;
-  const audit = buildPlanTaskEvidenceAudit({
-    tasks,
-    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-    preserveMissing: true,
-    highlightNext: true,
-  });
-  const evidenceLedger = callbacks.getPlanExecutionEvidenceLedger();
-  return audit.remainingTasks.some((task) =>
-    planTaskHasUnsatisfiedSourceMutationEvidence(task, evidenceLedger)
-  );
-}
 
 function isExecuteMutationRecoveryEligible(input: {
   callbacks: OrchestratorCallbacks;
@@ -113,16 +76,12 @@ function isExecuteMutationRecoveryEligible(input: {
   runtimeIntent: ResolvedUserIntent;
 }): boolean {
   if (!isMutationRuntimeIntent(input.runtimeIntent)) return false;
-  if (input.workflowMode === "edit") return true;
-  return input.workflowMode === "plan" &&
-    hasPendingApprovedPlanSourceMutation(input.callbacks);
-}
-
-function resolveCrossIterationReadThreshold(contextLimit?: number): number {
-  const effectiveContextLimit = contextLimit ?? DEFAULT_CROSS_ITERATION_READ_CONTEXT_LIMIT;
-  if (effectiveContextLimit <= SMALL_CONTEXT_READ_LOOP_THRESHOLD) return SMALL_CONTEXT_MAX_CROSS_READS;
-  if (effectiveContextLimit <= MEDIUM_CONTEXT_READ_LOOP_THRESHOLD) return MEDIUM_CONTEXT_MAX_CROSS_READS;
-  return LARGE_CONTEXT_MAX_CROSS_READS;
+  if (input.workflowMode !== "edit") return false;
+  if (!input.callbacks.getIsPlanApproved()) return true;
+  return hasPendingApprovedPlanSourceMutation(
+    input.callbacks.getPlanTasks(),
+    input.callbacks.getPlanExecutionEvidenceLedger(),
+  );
 }
 
 export interface NoProgressTrackingState {
@@ -159,14 +118,6 @@ export interface PendingExecuteNoProgressPause {
   reason: string;
 }
 
-export interface ApprovedPlanNoProgressDecision {
-  action: "recover" | "pause";
-  reason: string;
-  remainingText: string;
-  repeats: number;
-  logContext: Record<string, unknown>;
-}
-
 export type NoProgressRecoveryResult =
   | {
       status: "none";
@@ -174,7 +125,6 @@ export type NoProgressRecoveryResult =
       noProgressBatchSignature: string;
       pendingExecuteRecoveryPrompt: string | null;
       pendingExecuteNoProgressPause: PendingExecuteNoProgressPause | null;
-      approvedPlanNoProgressDecision: ApprovedPlanNoProgressDecision | null;
     }
   | {
       status: "continue";
@@ -182,7 +132,6 @@ export type NoProgressRecoveryResult =
       noProgressBatchSignature: string;
       pendingExecuteRecoveryPrompt: string | null;
       pendingExecuteNoProgressPause: PendingExecuteNoProgressPause | null;
-      approvedPlanNoProgressDecision: ApprovedPlanNoProgressDecision | null;
     }
   | {
       status: "stopped";
@@ -190,7 +139,6 @@ export type NoProgressRecoveryResult =
       noProgressBatchSignature: string;
       pendingExecuteRecoveryPrompt: string | null;
       pendingExecuteNoProgressPause: PendingExecuteNoProgressPause | null;
-      approvedPlanNoProgressDecision: ApprovedPlanNoProgressDecision | null;
     };
 
 export function handleNoProgressRecovery(input: {
@@ -213,7 +161,6 @@ export function handleNoProgressRecovery(input: {
   planReadOnlyConvergenceBatches: number;
   planReadOnlyConvergenceTools: number;
   remainingTaskText?: string | null;
-  approvedPlanNoProgressRecoveryAttempts: number;
   tracking: NoProgressTrackingState;
   activateExecuteRecovery: (
     mode: Exclude<ExecuteRecoveryMode, "normal">,
@@ -242,7 +189,6 @@ export function handleNoProgressRecovery(input: {
     planReadOnlyConvergenceBatches,
     planReadOnlyConvergenceTools,
     remainingTaskText,
-    approvedPlanNoProgressRecoveryAttempts,
     activateExecuteRecovery,
     activateChatFinalSynthesis,
     emitTaskOrchestratorPhase,
@@ -293,7 +239,6 @@ export function handleNoProgressRecovery(input: {
 
   let pendingExecuteRecoveryPrompt: string | null = null;
   let pendingExecuteNoProgressPause: PendingExecuteNoProgressPause | null = null;
-  let approvedPlanNoProgressDecision: ApprovedPlanNoProgressDecision | null = null;
   let currentExecuteRecoveryMode = executeRecoveryMode;
   let currentExecuteRecoveryReason = executeRecoveryReason;
   let currentExecuteRecoveryAttempts = executeRecoveryAttempts;
@@ -331,7 +276,6 @@ export function handleNoProgressRecovery(input: {
   const directMutationPreflightRecovery = resolveDirectMutationPreflightRecovery({
     workflowMode,
     runtimeIntent,
-    isPlanApproved: callbacks.getIsPlanApproved(),
     executeRecoveryMode: currentExecuteRecoveryMode,
     retainedSourceObservation: retainedMutationSourceObservation,
     results,
@@ -354,21 +298,6 @@ export function handleNoProgressRecovery(input: {
     pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
       language: MODEL_CONTROL_LANGUAGE,
       reason: directMutationPreflightRecovery.reason,
-      contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
-      repeatedTargets,
-      recentActivity: recentToolActivity,
-    });
-  }
-
-  const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
-  if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && executeMutationRecoveryEligible) {
-    const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    const activatedRecovery = activateTrackedExecuteRecovery("mutation_first", "read_file_only_loop", {
-      repeatedTargets,
-    });
-    pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
-      language: MODEL_CONTROL_LANGUAGE,
-      reason: "read_file_only_loop",
       contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
       repeatedTargets,
       recentActivity: recentToolActivity,
@@ -489,7 +418,6 @@ export function handleNoProgressRecovery(input: {
         noProgressBatchSignature,
         pendingExecuteRecoveryPrompt,
         pendingExecuteNoProgressPause,
-        approvedPlanNoProgressDecision,
       };
     }
     activateChatFinalSynthesis(chatReadOnlyNoProgress.reason, {
@@ -515,39 +443,46 @@ export function handleNoProgressRecovery(input: {
       noProgressBatchSignature,
       pendingExecuteRecoveryPrompt,
       pendingExecuteNoProgressPause,
-      approvedPlanNoProgressDecision,
     };
   }
 
   const approvedPlanCachedReadOnlyBatch =
-    workflowMode === "plan" &&
     callbacks.getIsPlanApproved() &&
+    hasPendingApprovedPlanSourceMutation(
+      callbacks.getPlanTasks(),
+      callbacks.getPlanExecutionEvidenceLedger(),
+    ) &&
     isApprovedPlanCachedReadOnlyNoProgressBatch({
       results,
       readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
       sawExecutionEvidence: sawExecuteOperationEvidence,
     });
   if (approvedPlanCachedReadOnlyBatch) {
-    const remainingText = remainingTaskText || (
-      callbacks.getPreferredLanguage() === "zh"
-        ? "当前已批准计划仍有任务缺少写入、命令或浏览器验证证据。"
-        : "the approved plan still has tasks missing write, command, or browser validation evidence"
+    const repeatedTargets = summarizeRepeatedExecuteTargets(
+      recentToolActivity.slice(-12),
     );
-    const recoveryInput = {
-      reason: "no_progress_cached_read_only_batch",
-      remainingText,
-      logContext: {
+    const activatedRecovery = activateTrackedExecuteRecovery(
+      "mutation_first",
+      "no_progress_cached_read_only_batch",
+      {
+        repeatedTargets,
         currentBatchTools: results.map((result) => result.name).slice(0, 8),
         currentBatchTargets: results.map((result) => result.target).filter(Boolean).slice(0, 8),
       },
-    };
-    approvedPlanNoProgressDecision = {
-      ...recoveryInput,
-      action: approvedPlanNoProgressRecoveryAttempts < MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS
-        ? "recover"
-        : "pause",
-      repeats: Math.max(1, noProgressBatchRepeatCount),
-    };
+    );
+    pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
+      language: MODEL_CONTROL_LANGUAGE,
+      reason: "no_progress_cached_read_only_batch",
+      contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
+      repeatedTargets,
+      recentActivity: recentToolActivity,
+    });
+    logAgentEvent("approved_plan_cached_read_only_entered_execute_recovery", {
+      iteration,
+      repeatedTargets,
+      phase: resolveRuntimeRecoveryActionContract(activatedRecovery).phase,
+      protocolNoProgressCount: activatedRecovery.protocolNoProgressCount,
+    });
   }
 
   if (noProgressBatchRepeatCount >= MAX_NO_PROGRESS_LOOP_REPEATS) {
@@ -619,7 +554,6 @@ export function handleNoProgressRecovery(input: {
         noProgressBatchSignature,
         pendingExecuteRecoveryPrompt,
         pendingExecuteNoProgressPause,
-        approvedPlanNoProgressDecision,
       };
     } else {
       const remainingText = remainingTaskText || (
@@ -684,7 +618,6 @@ export function handleNoProgressRecovery(input: {
         noProgressBatchSignature,
         pendingExecuteRecoveryPrompt,
         pendingExecuteNoProgressPause,
-        approvedPlanNoProgressDecision,
       };
     }
   }
@@ -695,209 +628,6 @@ export function handleNoProgressRecovery(input: {
     noProgressBatchSignature,
     pendingExecuteRecoveryPrompt,
     pendingExecuteNoProgressPause,
-    approvedPlanNoProgressDecision,
-  };
-}
-
-export type ReadFileRepeatLimitRecoveryResult =
-  | { status: "none" }
-  | { status: "stopped" }
-  | { status: "pending_prompt"; prompt: string };
-
-export interface CrossIterationReadFileLoopRecoveryResult {
-  executeRecoveryMode: ExecuteRecoveryMode;
-  executeRecoveryReason: string;
-  consecutiveBlockedReadFileInRecoveryCount: number;
-}
-
-export function handleCrossIterationReadFileLoopRecovery(input: {
-  callbacks: OrchestratorCallbacks;
-  workflowMode: "chat" | "edit" | "plan";
-  runtimeIntent: ResolvedUserIntent;
-  iteration: number;
-  results: ToolExecutionResult[];
-  snapshotContextLimit?: number;
-  crossIterationFileReads: Map<string, CrossIterationFileReadObservation>;
-  executeRecoveryMode: ExecuteRecoveryMode;
-  executeRecoveryReason: string;
-  recoveryActionContract: ReturnType<typeof resolveExecuteRecoveryActionContract>;
-  consecutiveBlockedReadFileInRecoveryCount: number;
-  activateExecuteRecovery: (
-    mode: Exclude<ExecuteRecoveryMode, "normal">,
-    reason: string,
-    context?: Record<string, unknown>,
-  ) => ExecuteRecoveryRuntimeState;
-}): CrossIterationReadFileLoopRecoveryResult {
-  const {
-    callbacks,
-    runtimeIntent,
-    iteration,
-    results,
-    snapshotContextLimit,
-    crossIterationFileReads,
-    activateExecuteRecovery,
-  } = input;
-
-  let executeRecoveryMode = input.executeRecoveryMode;
-  let executeRecoveryReason = input.executeRecoveryReason;
-  let recoveryActionContract = input.recoveryActionContract ||
-    resolveExecuteRecoveryActionContract(executeRecoveryMode);
-  let consecutiveBlockedReadFileInRecoveryCount = input.consecutiveBlockedReadFileInRecoveryCount;
-  if (!isExecuteMutationRecoveryEligible({
-    callbacks,
-    workflowMode: input.workflowMode,
-    runtimeIntent,
-  })) {
-    return {
-      executeRecoveryMode,
-      executeRecoveryReason,
-      consecutiveBlockedReadFileInRecoveryCount,
-    };
-  }
-
-  let matchingMutationProgressObserved = false;
-  for (const result of results) {
-    if (!isEditProgressResult(result) || !result.target) continue;
-    for (const [key, observation] of [...crossIterationFileReads.entries()]) {
-      if (!workspacePathsReferToSameFile(observation.path, result.target)) continue;
-      crossIterationFileReads.delete(key);
-      matchingMutationProgressObserved = true;
-    }
-  }
-  // A successful command or an edit to another file does not change the
-  // cached version/range of this read target. Keeping its streak prevents
-  // read A -> pwd/edit B -> read A from evading loop recovery indefinitely.
-  if (matchingMutationProgressObserved) consecutiveBlockedReadFileInRecoveryCount = 0;
-
-  let blockedReadFileDetected = false;
-  for (const result of results) {
-    if (result.internalFeedback) continue;
-    if (result.name !== "read_file") continue;
-    const target = result.target;
-    if (!target) continue;
-    const readObservation = result.readFileObservation;
-
-    if (!result.isError) {
-      const noProgressRead = isReadOnlyNoProgressDetail(
-        String(result.displayContent || result.content || ""),
-      );
-      if (!noProgressRead) {
-        // A fresh read of a new range is legal and must not erase another
-        // range's streak. A conservative command-cache invalidation can also
-        // re-execute the same unchanged range; keeping that exact identity
-        // prevents `read A -> pwd -> read A` from evading loop recovery.
-        // Only a genuinely new file version retires older version streaks.
-        if (readObservation) {
-          for (const [key, observation] of [...crossIterationFileReads.entries()]) {
-            if (!workspacePathsReferToSameFile(observation.path, readObservation.path)) continue;
-            if (observation.versionToken !== readObservation.versionToken) {
-              crossIterationFileReads.delete(key);
-            }
-          }
-        }
-        continue;
-      }
-      // Count only observations the cache has proved were already seen for
-      // this file version/range. This detects loops without imposing a raw
-      // limit on how often a large or newly changed file may be read.
-      const observationKey = readObservation?.key || buildNoProgressBatchSignature([result]);
-      if (!observationKey) continue;
-      const previousObservation = crossIterationFileReads.get(observationKey);
-      const count = (previousObservation?.count || 0) + 1;
-      crossIterationFileReads.set(observationKey, {
-        path: readObservation?.path || target,
-        versionToken: readObservation?.versionToken || "legacy",
-        count,
-      });
-      if (crossIterationFileReads.size > 240) {
-        const oldestKey = crossIterationFileReads.keys().next().value;
-        if (oldestKey) crossIterationFileReads.delete(oldestKey);
-      }
-      const crossReadThreshold = resolveCrossIterationReadThreshold(snapshotContextLimit);
-      if (count >= crossReadThreshold && executeRecoveryMode === "normal") {
-        const reason = "cross_iteration_file_read_loop";
-        executeRecoveryMode = "mutation_first";
-        executeRecoveryReason = reason;
-        const activatedRecovery = activateExecuteRecovery("mutation_first", reason, {
-          target,
-          crossIterationReads: count,
-        });
-        if (activatedRecovery?.mode) {
-          executeRecoveryMode = activatedRecovery.mode;
-          recoveryActionContract = resolveRuntimeRecoveryActionContract(activatedRecovery);
-        } else {
-          // Compatibility for legacy embedding callbacks. Production returns
-          // the full state; this fallback is safe because the transition above
-          // starts from normal and creates no read lease.
-          executeRecoveryMode = "mutation_first";
-          recoveryActionContract = resolveExecuteRecoveryActionContract("mutation_first", {
-            expectedTarget: target,
-          });
-        }
-        callbacks.appendMessage({
-          role: "system",
-          content: `[System: Cross-iteration observation-only read_file loop detected for ${target} (${count} reads without task progress; latest=${noProgressRead ? "cached/replayed" : "fresh observation"}). The reads remain valid evidence, but the pending mutation task has not advanced. Act now with a scoped write, validation, or an exact blocker. Do not output long prose.]`,
-        });
-        logAgentEvent("cross_iteration_file_read_loop", {
-          iteration,
-          target,
-          crossIterationReads: count,
-          latestReadKind: "cached_or_replayed",
-        });
-      }
-      continue;
-    }
-
-    const repeatedTargetReadCount = [...crossIterationFileReads.values()]
-      .filter((observation) => workspacePathsReferToSameFile(observation.path, target))
-      .reduce((max, observation) => Math.max(max, observation.count), 0);
-    if (executeRecoveryMode !== "normal" || repeatedTargetReadCount >= 2) {
-      blockedReadFileDetected = true;
-    }
-  }
-
-  if (blockedReadFileDetected) {
-    consecutiveBlockedReadFileInRecoveryCount += 1;
-    if (consecutiveBlockedReadFileInRecoveryCount >= BLOCKED_READS_BEFORE_RECOVERY_RESET) {
-      executeRecoveryMode = "normal";
-      recoveryActionContract = resolveExecuteRecoveryActionContract("normal");
-      consecutiveBlockedReadFileInRecoveryCount = 0;
-      logAgentEvent("execute_recovery_reset_after_blocked_reads", {
-        iteration,
-        executeRecoveryMode,
-      });
-      callbacks.appendMessage({
-        role: "system",
-        content: callbacks.getPreferredLanguage() === "zh"
-          ? "[System: 已重置连续读取失败计数并恢复普通工具面。请根据文件版本和缺失行范围决定是否需要一次定向读取；不要重复请求同一未变化窗口。]"
-          : "[System: Consecutive read failures were reset and the normal tool surface restored. Use the file version and missing line range to decide whether one targeted read is needed; do not repeat the same unchanged window.]",
-      });
-      return {
-        executeRecoveryMode,
-        executeRecoveryReason: "",
-        consecutiveBlockedReadFileInRecoveryCount,
-      };
-    }
-
-    const usedTools = results.map((result) => result.name).filter(Boolean).join(", ");
-    const recoveryContract = recoveryActionContract;
-    const recoveryPrompt = callbacks.getPreferredLanguage() === "zh"
-      ? `[System: READ_SCOPE_DEFERRED：上一个 read_file 没有产生新的目标源码证据。当前阶段为 ${recoveryContract.phase}，下一能力为 ${recoveryContract.nextRequiredCapability}。如果目标文件版本已变化、上下文缺失或需要新区间，可对当前事务目标再发起一次定向读取；否则复用已有观察并执行修改或验证。不要重复同一未变化窗口，也不要用 shell 读取绕行。]`
-      : `[System: READ_SCOPE_DEFERRED: The previous read_file produced no new target-source evidence. The current phase is ${recoveryContract.phase} and the next capability is ${recoveryContract.nextRequiredCapability}. If the target version changed, context was evicted, or a different range is missing, issue one targeted read for the transaction target; otherwise reuse the current observation and mutate or validate. Do not repeat the same unchanged window or bypass this with shell reads.]`;
-    callbacks.appendMessage({ role: "user", content: recoveryPrompt });
-    logAgentEvent("blocked_read_file_recovery_prompt_injected", {
-      iteration,
-      usedTools,
-      executeRecoveryMode,
-    });
-  } else {
-    consecutiveBlockedReadFileInRecoveryCount = 0;
-  }
-
-  return {
-    executeRecoveryMode,
-    executeRecoveryReason,
-    consecutiveBlockedReadFileInRecoveryCount,
   };
 }
 
@@ -958,9 +688,8 @@ export function handleTargetProgressLoopRecovery(input: {
       progressCheck.threshold,
     );
     const isExecuteTargetRecoveryEligible =
-      isMutationRuntimeIntent(runtimeIntent) &&
+      isExecuteMutationRecoveryEligible({ callbacks, workflowMode, runtimeIntent }) &&
       progressCheck.family === "edit" &&
-      (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
       (outcome === "blocked" || outcome === "failed" || outcome === "no_change");
     const displayTarget = String(target || progressCheck.targetKey || "").replace(/^shell-write:/, "");
     const appendExecuteTargetRecoveryPrompt = (
@@ -993,7 +722,7 @@ export function handleTargetProgressLoopRecovery(input: {
         content: `[System: ${recoveryMessage}]`,
       });
       if (isExecuteTargetRecoveryEligible && executeRecoveryAttempts < 2) {
-        appendExecuteTargetRecoveryPrompt("patch_recovery_read", "target_progress_patch_mismatch");
+        appendExecuteTargetRecoveryPrompt("mutation_first", "target_progress_mutation_failure");
       }
       return { status: "continue" };
     }
@@ -1057,11 +786,9 @@ export function handleExecuteConvergencePrompt(input: {
     activateExecuteRecovery,
   } = input;
 
-  const shouldConvergeExecuteTurn =
-    workflowMode === "edit" ||
-    (workflowMode === "plan" && callbacks.getIsPlanApproved() && runtimeIntent === "execute");
+  const shouldConvergeExecuteTurn = workflowMode === "edit";
   const convergencePromptRatio =
-    workflowMode === "plan" && callbacks.getIsPlanApproved()
+    callbacks.getIsPlanApproved()
       ? PLAN_EXECUTE_CONVERGENCE_PROMPT_RATIO
       : EXECUTE_CONVERGENCE_PROMPT_RATIO;
 
@@ -1093,370 +820,6 @@ export function handleExecuteConvergencePrompt(input: {
   return { usedExecuteConvergencePrompt: true };
 }
 
-export function handleReadFileRepeatLimitRecovery(input: {
-  callbacks: OrchestratorCallbacks;
-  workflowMode: "chat" | "edit" | "plan";
-  runtimeIntent: ResolvedUserIntent;
-  iteration: number;
-  results: ToolExecutionResult[];
-  recentPlanToolActivity: PlanToolActivitySummary[];
-  recentToolActivity: PlanToolActivitySummary[];
-  executeRecoveryAttempts: number;
-  activateExecuteRecovery: (
-    mode: Exclude<ExecuteRecoveryMode, "normal">,
-    reason: string,
-    context?: Record<string, unknown>,
-  ) => ExecuteRecoveryRuntimeState;
-  emitTaskOrchestratorPhase: (phase: "EXECUTE_RECOVERY" | "PAUSED", details?: Record<string, unknown>) => void;
-}): ReadFileRepeatLimitRecoveryResult {
-  const {
-    callbacks,
-    workflowMode,
-    runtimeIntent,
-    iteration,
-    results,
-    recentPlanToolActivity,
-    recentToolActivity,
-    executeRecoveryAttempts,
-    activateExecuteRecovery,
-    emitTaskOrchestratorPhase,
-  } = input;
-
-  const approvedPlanReadFileRepeatLimit =
-    workflowMode === "plan" &&
-    callbacks.getIsPlanApproved() &&
-    runtimeIntent === "execute" &&
-    results.some(isReadFileRepeatLimitResult);
-  if (approvedPlanReadFileRepeatLimit) {
-    const language = callbacks.getPreferredLanguage();
-    const repeatResults = results.filter(isReadFileRepeatLimitResult);
-    const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity)
-      .concat(repeatResults.map((result) => result.target).filter((target): target is string => Boolean(target)))
-      .filter((target, index, all) => target && all.indexOf(target) === index)
-      .slice(0, 4);
-    const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
-    if (executeRecoveryAttempts < MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS) {
-      const recoveryReason = "approved_plan_read_file_repeat_limit";
-      const activatedRecovery = activateExecuteRecovery("mutation_first", recoveryReason, {
-        repeatedTargets,
-        repeatResults: repeatResults.length,
-      });
-      logAgentEvent("approved_plan_read_file_repeat_limit_recovery", {
-        iteration,
-        repeatedTargets,
-        progressSignature: truncateForLog(progressSignature, 220),
-        repeatResults: repeatResults.length,
-        executeRecoveryAttempts,
-        recoveryToolSurface: "action_only",
-      });
-      emitTaskOrchestratorPhase("EXECUTE_RECOVERY", {
-        reason: recoveryReason,
-        iteration,
-        repeatedTargets,
-        remainingTask: language === "zh"
-          ? "禁止再次读取缓存目标；改为源码修改、命令/浏览器验证或明确阻塞。"
-          : "do not reread cached targets; switch to source edits, command/browser validation, or a concrete blocker",
-      });
-      return {
-        status: "pending_prompt",
-        prompt: buildExecuteRecoveryPrompt({
-          language: MODEL_CONTROL_LANGUAGE,
-          reason: recoveryReason,
-          contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
-          repeatedTargets,
-          recentActivity: recentPlanToolActivity,
-        }),
-      };
-    }
-    const notice = language === "zh"
-      ? [
-          "计划执行已暂停：模型再次请求了已被重复读取保护拦截的 read_file。",
-          repeatedTargets.length ? `重复目标：${repeatedTargets.join("、")}` : "",
-          "MAIN 已保留当前缓存文件内容和工具结果；继续时应复用这些上下文，改为精确 patch/replace、运行验证命令、浏览器验证，或说明真实阻塞。",
-        ].filter(Boolean).join("\n")
-      : [
-          "Plan execution paused: the model asked for a read_file call that the repeat-read guard already blocked.",
-          repeatedTargets.length ? `Repeated targets: ${repeatedTargets.join(", ")}` : "",
-          "MAIN kept the cached file content and tool results; on resume, reuse that context and switch to a precise patch/replace, command validation, browser validation, or a concrete blocker.",
-        ].filter(Boolean).join("\n");
-    logAgentEvent("loop_stop", {
-      reason: "approved_plan_read_file_repeat_limit",
-      iteration,
-      repeatedTargets,
-      progressSignature: truncateForLog(progressSignature, 220),
-      repeatResults: repeatResults.length,
-    });
-    emitTaskOrchestratorPhase("PAUSED", {
-      reason: "approved_plan_read_file_repeat_limit",
-      iteration,
-      repeatedTargets,
-      remainingTask: language === "zh"
-        ? "复用已读文件上下文，改为源码修改、命令/浏览器验证或明确阻塞。"
-        : "reuse cached file context and switch to source edits, command/browser validation, or a concrete blocker",
-    });
-    callbacks.onNonActionableStop(
-      notice,
-      "no_action",
-      {
-        progressSignature,
-        repeatedTargets,
-        recoveryReason: "approved_plan_read_file_repeat_limit",
-        nextStep: language === "zh"
-          ? "复用缓存内容，转向 patch/replace、验证或阻塞说明"
-          : "reuse cached context and pivot to patch/replace, validation, or blocker",
-      },
-    );
-    callbacks.onStatusChange("idle");
-    return { status: "stopped" };
-  }
-
-  const readFileRepeatLimitBatch = workflowMode === "edit"
-    ? summarizeReadFileRepeatLimitBatch(results)
-    : null;
-  if (!readFileRepeatLimitBatch) {
-    return { status: "none" };
-  }
-
-  const language = callbacks.getPreferredLanguage();
-  const repeatedTargets = [readFileRepeatLimitBatch.target].filter(Boolean);
-  if (isMutationRuntimeIntent(runtimeIntent) && executeRecoveryAttempts < 2) {
-    const activatedRecovery = activateExecuteRecovery("mutation_first", "read_file_repeat_limit_batch", {
-      target: readFileRepeatLimitBatch.target,
-      total: readFileRepeatLimitBatch.total,
-      targetCount: readFileRepeatLimitBatch.targetCount,
-      repeatedTargets,
-    });
-    logAgentEvent("read_file_repeat_limit_recovery", {
-      iteration,
-      target: readFileRepeatLimitBatch.target,
-      total: readFileRepeatLimitBatch.total,
-      targetCount: readFileRepeatLimitBatch.targetCount,
-      executeRecoveryAttempts,
-    });
-    emitTaskOrchestratorPhase("EXECUTE_RECOVERY", {
-      reason: "read_file_repeat_limit_batch",
-      iteration,
-      repeatedTargets,
-      remainingTask: language === "zh"
-        ? "复用已读文件上下文，下一轮禁用重复读取并转向修改、命令/浏览器验证或明确阻塞。"
-        : "reuse cached file context; next step disables repeated reads and pivots to patching, command/browser validation, or a blocker",
-    });
-    return {
-      status: "pending_prompt",
-      prompt: buildExecuteRecoveryPrompt({
-        language: MODEL_CONTROL_LANGUAGE,
-        reason: "read_file_repeat_limit_batch",
-        contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
-        repeatedTargets,
-        recentActivity: recentToolActivity,
-      }),
-    };
-  }
-
-  const pauseNotice = buildReadFileRepeatLimitBatchPauseNotice({
-    language,
-    target: readFileRepeatLimitBatch.target,
-    total: readFileRepeatLimitBatch.total,
-    targetCount: readFileRepeatLimitBatch.targetCount,
-  });
-  logAgentEvent("loop_stop", {
-    reason: "read_file_repeat_limit_batch",
-    iteration,
-    target: readFileRepeatLimitBatch.target,
-    total: readFileRepeatLimitBatch.total,
-    targetCount: readFileRepeatLimitBatch.targetCount,
-  });
-  emitTaskOrchestratorPhase("PAUSED", {
-    reason: "read_file_repeat_limit_batch",
-    iteration,
-    repeatedTargets,
-    remainingTask: language === "zh"
-      ? "复用已读文件上下文，改为修改、验证或说明阻塞。"
-      : "reuse cached file context and switch to patching, validation, or a blocker",
-  });
-  callbacks.onNonActionableStop(
-    pauseNotice,
-    "no_action",
-    {
-      repeatedTargets,
-      recoveryReason: "read_file_repeat_limit_batch",
-      nextStep: language === "zh"
-        ? "复用缓存内容，转向 patch/验证/阻塞说明"
-        : "reuse cached context and pivot to patch/validation/blocker",
-    },
-  );
-  callbacks.onStatusChange("idle");
-  return { status: "stopped" };
-}
-
-export type RepeatedEditValidationRecoveryResult =
-  | {
-      status: "none";
-      repeatedEditValidationRecoveryAttempts: number;
-    }
-  | {
-      status: "pending_prompt";
-      prompt: string;
-      repeatedEditValidationRecoveryAttempts: number;
-    }
-  | {
-      status: "stopped";
-      repeatedEditValidationRecoveryAttempts: number;
-    };
-
-function normalizeLoopGuardTarget(target: string): string {
-  return String(target || "")
-    .replace(/^shell-write:/, "")
-    .replace(/\\/g, "/")
-    .replace(/\s+/g, " ")
-    .trim()
-    .toLowerCase();
-}
-
-export function handleRepeatedEditValidationRecovery(input: {
-  callbacks: OrchestratorCallbacks;
-  workflowMode: "chat" | "edit" | "plan";
-  runtimeIntent: ResolvedUserIntent;
-  iteration: number;
-  results: ToolExecutionResult[];
-  availableToolNames: Set<string>;
-  recentToolActivity: PlanToolActivitySummary[];
-  successfulEditTargetsSinceVerification: Map<string, number>;
-  repeatedEditValidationRecoveryAttempts: number;
-  activateExecuteRecovery: (
-    mode: Exclude<ExecuteRecoveryMode, "normal">,
-    reason: string,
-    context?: Record<string, unknown>,
-  ) => void;
-  emitPlanExecutionProgress: (phase: "running", update?: Record<string, unknown>) => void;
-}): RepeatedEditValidationRecoveryResult {
-  const {
-    callbacks,
-    workflowMode,
-    runtimeIntent,
-    iteration,
-    results,
-    availableToolNames,
-    recentToolActivity,
-    successfulEditTargetsSinceVerification,
-    activateExecuteRecovery,
-    emitPlanExecutionProgress,
-  } = input;
-  let repeatedEditValidationRecoveryAttempts = input.repeatedEditValidationRecoveryAttempts;
-
-  if (results.some(isVerificationEvidenceResult)) {
-    successfulEditTargetsSinceVerification.clear();
-    repeatedEditValidationRecoveryAttempts = 0;
-  }
-
-  for (const result of results) {
-    if (result.isError || result.internalFeedback || !isEditProgressResult(result)) continue;
-    const targetKey = normalizeLoopGuardTarget(result.target);
-    if (!targetKey) continue;
-
-    // Editing a different file resets older edit counters, so cross-file
-    // refactors can still alternate targets without tripping this guard.
-    for (const key of Array.from(successfulEditTargetsSinceVerification.keys())) {
-      if (key !== targetKey) {
-        successfulEditTargetsSinceVerification.delete(key);
-      }
-    }
-
-    const count = (successfulEditTargetsSinceVerification.get(targetKey) || 0) + 1;
-    successfulEditTargetsSinceVerification.set(targetKey, count);
-    // Three successful writes to the same target without validation is enough
-    // to detect a stale-edit loop. Waiting for five allowed local models to
-    // repeatedly damage syntax before the runtime forced a compile/test step.
-    if (count < 3) continue;
-
-    const displayTarget = String(result.target || targetKey).replace(/^shell-write:/, "");
-    const language = callbacks.getPreferredLanguage();
-    const availableValidationTools = Array.from(availableToolNames)
-      .filter((name) => EXECUTION_VERIFICATION_TOOL_NAMES.has(name))
-      .filter((name) => name !== "send_pty_input" && name !== "clear_pty_buffer");
-    const canAttemptValidationRecovery =
-      isMutationRuntimeIntent(runtimeIntent) &&
-      (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
-      repeatedEditValidationRecoveryAttempts < 1 &&
-      availableValidationTools.length > 0;
-    if (canAttemptValidationRecovery) {
-      repeatedEditValidationRecoveryAttempts += 1;
-      activateExecuteRecovery("validation_only", "repeat_edit_target_without_validation", {
-        target: displayTarget,
-        editCount: count,
-        validationTools: availableValidationTools,
-      });
-      logAgentEvent("repeat_edit_target_validation_recovery", {
-        iteration,
-        target: displayTarget,
-        editCount: count,
-        attempts: repeatedEditValidationRecoveryAttempts,
-        validationTools: availableValidationTools,
-      });
-      emitPlanExecutionProgress("running", {
-        repeatedTargets: [displayTarget],
-        recoveryReason: "repeat_edit_target_without_validation",
-        nextStep: language === "zh"
-          ? "同一目标已连续修改；下一轮强制先运行命令或浏览器验证"
-          : "same target was edited repeatedly; next turn must run command or browser validation first",
-      });
-      callbacks.onStatusChange("running");
-      return {
-        status: "pending_prompt",
-        repeatedEditValidationRecoveryAttempts,
-        prompt: buildExecuteValidationRecoveryPrompt({
-          language: MODEL_CONTROL_LANGUAGE,
-          reason: "repeat_edit_target_without_validation",
-          target: displayTarget,
-          editCount: count,
-          recentActivity: recentToolActivity,
-          availableValidationTools,
-        }),
-      };
-    }
-
-    logAgentEvent("loop_stop", {
-      reason: "repeat_edit_target_without_validation",
-      iteration,
-      target: displayTarget,
-      editCount: count,
-      validationRecoveryAttempts: repeatedEditValidationRecoveryAttempts,
-      validationTools: availableValidationTools,
-    });
-    callbacks.onNonActionableStop(
-      language === "zh"
-        ? [
-            "执行已暂停：同一回合连续修改同一目标，但期间没有新的验证证据。",
-            `重复目标：${displayTarget}`,
-            "继续前请先运行测试、命令或浏览器验证；如果无法验证，请说明真实阻塞并给出当前状态。",
-          ].join("\n")
-        : [
-            "Execution paused: this turn kept editing the same target without fresh validation evidence.",
-            `Repeated target: ${displayTarget}`,
-            "Before continuing, run a test, command, or browser validation; if validation is blocked, state the blocker and current status.",
-          ].join("\n"),
-      "no_action",
-      {
-        repeatedTargets: [displayTarget],
-        recoveryReason: "repeat_edit_target_without_validation",
-        nextStep: language === "zh"
-          ? "先验证当前目标，再决定继续修改、换目标或总结"
-          : "validate this target before editing it again, switching targets, or summarizing",
-      },
-    );
-    callbacks.onStatusChange("idle");
-    return {
-      status: "stopped",
-      repeatedEditValidationRecoveryAttempts,
-    };
-  }
-
-  return {
-    status: "none",
-    repeatedEditValidationRecoveryAttempts,
-  };
-}
-
 export type StrictRepeatGuardRecoveryResult =
   | { status: "none" }
   | { status: "continue" }
@@ -1465,10 +828,10 @@ export type StrictRepeatGuardRecoveryResult =
 export function handleStrictRepeatGuardRecovery(input: {
   callbacks: OrchestratorCallbacks;
   workspace: string;
-  workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
   iteration: number;
   effectiveToolCalls: ToolCallToExecute[];
+  results: ToolExecutionResult[];
   recentToolCalls: Array<{ name: string; argsKey: string }>;
   repeatGuardRecoveredSignatures: Set<string>;
   failedToolCallCounts: Map<string, number>;
@@ -1481,10 +844,10 @@ export function handleStrictRepeatGuardRecovery(input: {
   const {
     callbacks,
     workspace,
-    workflowMode,
     runtimeIntent,
     iteration,
     effectiveToolCalls,
+    results,
     recentToolCalls,
     repeatGuardRecoveredSignatures,
     failedToolCallCounts,
@@ -1495,7 +858,17 @@ export function handleStrictRepeatGuardRecovery(input: {
     emitTurnFailedEvent,
   } = input;
 
+  const resultByToolCallId = new Map(
+    results.map((result) => [result.toolCallId, result]),
+  );
+
   for (const toolCall of effectiveToolCalls) {
+    const executionResult = resultByToolCallId.get(toolCall.id);
+    // The strict guard protects real repeated executions. Calls converted by
+    // preflight/recovery policy into internal feedback never reached a tool,
+    // so their bounded convergence belongs to RecoveryActionContract's
+    // protocol-no-progress counter instead of this global fatal guard.
+    if (!executionResult || executionResult.internalFeedback) continue;
     const toolArgs = parseToolCallArguments(toolCall, workspace);
     const autoExecutable = isToolAutoExecutableForCall(
       toolCall.name,
@@ -1562,7 +935,7 @@ export function handleStrictRepeatGuardRecovery(input: {
       return { status: "continue" };
     }
 
-    if (workflowMode === "plan" && callbacks.getIsPlanApproved() && toolCall.name === "browser_evaluate") {
+    if (callbacks.getIsPlanApproved() && toolCall.name === "browser_evaluate") {
       const recoveryMessage = formatRepeatLoopRecoveryMessage(
         toolCall.name,
         target,

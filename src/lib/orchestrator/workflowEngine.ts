@@ -47,7 +47,7 @@ import {
   withEventSchema,
   type MainThreadProgressUpdate,
 } from "../turnEvents";
-import { type DurableTurnContext, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, canonicalizePlanArtifactPath, detectPlanArtifactKind } from "../workflowModels";
+import { type DurableTurnContext, type PlanExecutionEvidenceEntry, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, resolvePlanExecutionEvidenceIdentity, canonicalizePlanArtifactPath, detectPlanArtifactKind } from "../workflowModels";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
   buildExecuteMaxIterationsAutoResumeNotice,
@@ -111,6 +111,7 @@ import {
   resolveExecuteRecoveryActionContract,
   type ForcedExecuteRecoveryRuntimeState,
 } from "../executeRecoveryTools";
+import { scopeExecutionEvidenceLedger } from "../verificationEvidence";
 
 type WorkflowStoreState = any;
 
@@ -243,6 +244,21 @@ export class WorkflowEngine {
               : null,
           }
         : null;
+    const resolveCurrentPlanEvidenceIdentity = (record: PlanExecutionEvidenceEntry): {
+      planTaskId?: string;
+      requirementRef?: string;
+    } => {
+      const state = sessionGet();
+      if (!state.isPlanApproved) return {};
+      const checkpoint = latestExecuteRecoveryState?.decisionCheckpoint;
+      return resolvePlanExecutionEvidenceIdentity({
+        tasks: state.planTasks || [],
+        evidenceLedger: state.planExecutionEvidenceLedger || [],
+        record,
+        preferredPlanTaskId: checkpoint?.planTaskId || null,
+        preferredRequirementRef: checkpoint?.requirementRef || null,
+      }) || {};
+    };
     // const attachedFilesSnapshot = context.attachedFilesSnapshot;
     // const mentionSnapshot = context.mentionSnapshot;
     const remoteFeishu = context.remoteFeishu;
@@ -732,7 +748,7 @@ export class WorkflowEngine {
     };
 
     const isUnapprovedPlanRuntime = () =>
-      getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode === "plan" &&
+      getIntentPolicy(effectiveRunIntent).workflowMode === "plan" &&
       sessionGet().isPlanApproved !== true;
 
     const emitLocalPlanExecutionProgress = (phase: PlanExecutionProgressPhase, update: Partial<PlanExecutionProgressUpdate>) => {
@@ -893,7 +909,10 @@ export class WorkflowEngine {
       onHookStart: (_event: any, _hook: any) => { /* UI feedback placeholder */ },
       onHookResult: (record: any) => sessionGet().appendHookExecutionRecords([record]),
       onHookBlocked: (_event: any, _reason: any, _record: any) => { /* UI feedback placeholder */ },
-      getCurrentRunIntent: () => sessionGet().getCurrentRunIntent(),
+      // Intent and workflow mode are immutable properties of this run. Store
+      // selection may move while a background run is active, so deriving them
+      // from the currently displayed turn would reintroduce a second truth.
+      getCurrentRunIntent: () => effectiveRunIntent,
       getRuntimeRunIntent: () => runtimeRunIntent,
       getExecutionConsentGranted: () => {
         const consent = sessionGet().currentTurnExecutionConsent;
@@ -919,7 +938,7 @@ export class WorkflowEngine {
         };
       },
       getCommandDirective: () => effectiveCommandDirective,
-      getWorkflowMode: () => getIntentPolicy(sessionGet().getCurrentRunIntent()).workflowMode,
+      getWorkflowMode: () => getIntentPolicy(effectiveRunIntent).workflowMode,
       getIsPlanApproved: () => sessionGet().isPlanApproved,
       getPlanApprovalChoice: () => sessionGet().planApprovalChoice,
       getReadOnlyAutoApproveForSession: () => sessionGet().readOnlyAutoApproveForSession,
@@ -2185,6 +2204,7 @@ export class WorkflowEngine {
           diff?: any;
           internalFeedback?: boolean;
           qualityGateReason?: string | null;
+          evidenceResult?: string;
         },
       ) => {
         const lifecycleMeta = normalizeToolLifecycleMeta(meta);
@@ -2223,14 +2243,22 @@ export class WorkflowEngine {
           return;
         }
         const completedDiff = shouldAttachToolDiffPreview(toolName, target, meta?.diff) ? meta?.diff : undefined;
-        const noOp = isNoOpToolResult(resultText);
-        const entry = createPlanExecutionEvidenceEntry({
+        const evidenceResultText = typeof meta?.evidenceResult === "string"
+          ? meta.evidenceResult
+          : resultText;
+        const noOp = isNoOpToolResult(evidenceResultText);
+        const unownedEntry = createPlanExecutionEvidenceEntry({
           toolName,
           target,
-          result: resultText,
+          result: evidenceResultText,
           noOp,
           diff: completedDiff,
+          transactionId: turnId,
+          runId: activeRuntimeRunIdentity.runId,
         });
+        const entry = unownedEntry
+          ? { ...unownedEntry, ...resolveCurrentPlanEvidenceIdentity(unownedEntry) }
+          : null;
         const observationSummary = summarizeToolObservation({
           toolName,
           target,
@@ -2414,12 +2442,20 @@ export class WorkflowEngine {
           hypothesisStatus: "blocked",
           sourceToolCallIds: executionId ? [executionId] : [],
         });
-        const failureEntry = shouldRecordPlanExecutionFailure(meta)
+        const unownedFailureEntry = shouldRecordPlanExecutionFailure(meta)
           ? createPlanExecutionFailureEntry({
               toolName,
               target,
               error: errorText,
+              transactionId: turnId,
+              runId: activeRuntimeRunIdentity.runId,
             })
+          : null;
+        const failureEntry = unownedFailureEntry
+          ? {
+              ...unownedFailureEntry,
+              ...resolveCurrentPlanEvidenceIdentity(unownedFailureEntry),
+            }
           : null;
         logStoreEvent("tool_result", {
           turnId,
@@ -2873,8 +2909,7 @@ export class WorkflowEngine {
                   reuseCurrentTurn: true,
                   turnIdOverride: context.uiDisplayTurnId || turnId,
                   preservePlanState: true,
-                  resolvedIntent: "plan",
-                  runtimeIntentOverride: "execute",
+                  resolvedIntent: "execute",
                   executionConsentGranted: true,
                   parentRunIdOverride: activeRuntimeRunIdentity.runId,
                   skipIntentResolution: true,
@@ -2920,11 +2955,16 @@ export class WorkflowEngine {
           autoResumeCount: shouldAutoResume ? currentCount + 1 : currentCount,
         };
         const executeEvidenceLedger = sessionGet().planExecutionEvidenceLedger || [];
+        const scopedExecuteEvidenceLedger = scopeExecutionEvidenceLedger(
+          executeEvidenceLedger,
+          turnId,
+        );
         const executeRecoveryDecision = resolveExecuteMaxIterationsRecoveryDecision({
           evidenceLedger: executeEvidenceLedger,
           recoveryState: latestExecuteRecoveryState,
+          transactionId: turnId,
         });
-        const latestMutationEvidence = [...executeEvidenceLedger].reverse().find((entry: any) =>
+        const latestMutationEvidence = [...scopedExecuteEvidenceLedger].reverse().find((entry: any) =>
           entry?.kind === "file" || entry?.kind === "deliverable"
         );
         const expectedTarget =
@@ -2972,8 +3012,7 @@ export class WorkflowEngine {
             : latestExecuteRecoveryState?.protocolNoProgressFingerprint || null,
           readLease:
             nextRecoveryContract.phase === "context" ||
-            nextRecoveryContract.phase === "mutation" ||
-            nextRecoveryContract.phase === "post_mutation_check"
+            nextRecoveryContract.phase === "mutation"
               ? latestExecuteRecoveryState?.readLease
                 ? { ...latestExecuteRecoveryState.readLease }
                 : null
@@ -2990,6 +3029,18 @@ export class WorkflowEngine {
                   ? {
                       evidenceVersion:
                         latestExecuteRecoveryState.decisionCheckpoint.evidenceVersion,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.planTaskId
+                  ? {
+                      planTaskId:
+                        latestExecuteRecoveryState.decisionCheckpoint.planTaskId,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.requirementRef
+                  ? {
+                      requirementRef:
+                        latestExecuteRecoveryState.decisionCheckpoint.requirementRef,
                     }
                   : {}),
               },
@@ -3159,7 +3210,6 @@ export class WorkflowEngine {
                   turnIdOverride: context.uiDisplayTurnId || turnId,
                   preservePlanState: true,
                   resolvedIntent: "execute",
-                  runtimeIntentOverride: "execute",
                   forceExecuteRecoveryMode: executeRecoveryDecision.mode,
                   forceExecuteRecoveryState: forcedExecuteRecoveryState,
                   executionConsentGranted: true,
@@ -3952,6 +4002,8 @@ export class WorkflowEngine {
                 sourceObservationKey: continuationRecoveryState.sourceObservationKey,
                 nextRequiredCapability:
                   continuationRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
+                planTaskId: continuationRecoveryState.decisionCheckpoint?.planTaskId || null,
+                requirementRef: continuationRecoveryState.decisionCheckpoint?.requirementRef || null,
               });
             }
             let latestExecuteRecoveryState: Parameters<

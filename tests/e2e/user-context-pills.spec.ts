@@ -27,10 +27,31 @@ test("@ files, attachments, and screenshots render as compact user context pills
 
   await expect(page.locator("img.max-h-48")).toHaveCount(0);
   await expect(page.locator('img[alt^="user-image"]')).toHaveCount(0);
+  const thumbnail = page.getByTestId("user-context-image-thumbnail");
+  await expect(thumbnail).toHaveCount(1);
+  await expect(thumbnail).toHaveAttribute(
+    "src",
+    "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==",
+  );
+  const thumbnailBox = await thumbnail.boundingBox();
+  expect(thumbnailBox).not.toBeNull();
+  expect(thumbnailBox!.width).toBeLessThanOrEqual(40);
+  expect(thumbnailBox!.height).toBeLessThanOrEqual(32);
+  const deliveryStatus = page.getByTestId("visual-context-delivery-status");
+  await expect(deliveryStatus).toHaveCount(1);
+  await expect(deliveryStatus).toHaveAttribute("data-status", "delivered");
+  await expect(deliveryStatus).toHaveAttribute("data-recognition", "observed");
+  await expect(deliveryStatus).toContainText("模型已报告截图观察");
+  await expect(deliveryStatus).toContainText("截图中可见文件、附件和两张截图上下文胶囊");
 
   await pills.nth(2).click();
   await expect(page.getByTestId("user-image-preview-modal")).toBeVisible();
-  await expect(page.getByTestId("user-image-preview")).toBeVisible();
+  const fullPreview = page.getByTestId("user-image-preview");
+  await expect(fullPreview).toBeVisible();
+  await expect(fullPreview).toHaveAttribute(
+    "src",
+    "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=",
+  );
 
   const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
   expect(snapshot.userContextItems.map((item: { kind: string }) => item.kind)).toEqual([

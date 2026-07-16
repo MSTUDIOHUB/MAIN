@@ -14,6 +14,10 @@ type WorkflowMode = "chat" | "edit" | "plan";
 type CompletionStatus = "none" | "stopped";
 type ProviderReasoningForHistory = Parameters<typeof buildAssistantHistoryMessage>[1];
 
+type StagedTurnCompletionEmitter = (() => void) & {
+  stageCompletion?: (commit: () => void) => void;
+};
+
 type AssistantTurnCompletionInput = {
   callbacks: OrchestratorCallbacks;
   assistantHistoryText: string;
@@ -47,25 +51,27 @@ export function completeAssistantTurn(input: AssistantTurnCompletionInput): void
   } = input;
   const { eventThreadId, eventTurnId } = iterationContext;
 
-  callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
-  emitTurnEvent({
-    type: "item.completed",
-    threadId: eventThreadId,
-    turnId: eventTurnId,
-    timestampMs: Date.now(),
-    item: {
-      id: assistantMsgId,
-      details: {
-        type: "agent_message",
-        text: assistantHistoryText,
-      },
-    } as MainThreadItem,
-  });
-  if (nonActionableStop) {
-    callbacks.onNonActionableStop(nonActionableStop.message, nonActionableStop.reason);
-  }
-  callbacks.onStatusChange("idle");
-  if (completionMode === "paused") {
+  const publishAssistantItem = () => {
+    callbacks.appendMessage(buildAssistantHistoryMessage(assistantHistoryText, providerReasoningForHistory));
+    emitTurnEvent({
+      type: "item.completed",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+      item: {
+        id: assistantMsgId,
+        details: {
+          type: "agent_message",
+          text: assistantHistoryText,
+        },
+      } as MainThreadItem,
+    });
+    if (nonActionableStop) {
+      callbacks.onNonActionableStop(nonActionableStop.message, nonActionableStop.reason);
+    }
+  };
+  const publishPausedCompletion = () => {
+    publishAssistantItem();
     const attachedRunIdentity = (
       emitTurnEvent as typeof emitTurnEvent & {
         runIdentity?: {
@@ -88,9 +94,24 @@ export function completeAssistantTurn(input: AssistantTurnCompletionInput): void
       reason: pauseReason || nonActionableStop?.reason || "awaiting_input",
       message: pauseMessage || nonActionableStop?.message || assistantHistoryText,
     });
+    callbacks.onStatusChange("idle");
+  };
+  if (completionMode === "paused") {
+    publishPausedCompletion();
     return;
   }
-  emitTurnCompletedEvent();
+
+  const commitCompletedTurn = () => {
+    publishAssistantItem();
+    emitTurnCompletedEvent();
+    callbacks.onStatusChange("idle");
+  };
+  const stagedEmitter = emitTurnCompletedEvent as StagedTurnCompletionEmitter;
+  if (stagedEmitter.stageCompletion) {
+    stagedEmitter.stageCompletion(commitCompletedTurn);
+    return;
+  }
+  commitCompletedTurn();
 }
 
 export function handleReplyOptionsPause(input: {

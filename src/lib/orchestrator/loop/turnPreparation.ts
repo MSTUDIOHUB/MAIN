@@ -42,6 +42,11 @@ import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import { formatWebResearchLocalDate } from "../../webResearchGuard";
 import { createProbeRunner, runModelProbe } from "../../modelProbe";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
+import {
+  appendVisualObservationProtocol,
+  preserveVisualContextDeliveryObservationsInSystemPrompt,
+} from "../../visualContext";
+import { resolveApprovedPlanTurnExpectations } from "./turnContractRuntime";
 
 export interface AgentLoopRuntimeState {
   config: ReturnType<OrchestratorCallbacks["getConfig"]>;
@@ -72,6 +77,10 @@ export interface TurnEventEmitter {
   emitTurnCompletedEvent: () => void;
   emitTurnFailedEvent: (message: string) => void;
   emitRunPausedEvent: (reason: string, message: string, progress?: MainThreadProgressUpdate) => boolean;
+  stageTurnCompletion: (commit: () => void) => void;
+  hasStagedTurnCompletion: () => boolean;
+  commitStagedTurnCompletion: () => boolean;
+  discardStagedTurnCompletion: () => boolean;
 }
 
 export interface AgentLoopTurnInputContext {
@@ -260,6 +269,7 @@ export function createSystemPromptApplier(input: {
   unityConsoleDiagnosticsRequested: boolean;
   getUnityMcpFirstPhaseActive: () => boolean;
   setLatestTurnContract: (contract: EffectiveTurnContract) => void;
+  visualObservationRequest?: { turnId: string; imageCount: number } | null;
 }): SystemPromptApplier {
   const {
     callbacks,
@@ -272,6 +282,7 @@ export function createSystemPromptApplier(input: {
     unityConsoleDiagnosticsRequested,
     getUnityMcpFirstPhaseActive,
     setLatestTurnContract,
+    visualObservationRequest,
   } = input;
   const {
     config,
@@ -294,6 +305,11 @@ export function createSystemPromptApplier(input: {
 
   const applySystemPromptForRuntime = (runtimeIntent: ResolvedUserIntent, tools: ToolDefinition[]) => {
     const availableToolNameList = tools.map((tool) => tool.function.name);
+    const approvedPlanExpectations = resolveApprovedPlanTurnExpectations({
+      planApproved: callbacks.getIsPlanApproved(),
+      tasks: callbacks.getPlanTasks(),
+      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+    });
     const effectiveTurnContract = buildEffectiveTurnContract({
       conversationIntent: callbacks.getCurrentRunIntent(),
       runtimeIntent,
@@ -303,6 +319,7 @@ export function createSystemPromptApplier(input: {
         !callbacks.getIsPlanApproved() &&
         (callbacks.getPlanArtifacts?.() || []).some((artifact) => artifact.kind === "plan"),
       executionConsentGranted: callbacks.getExecutionConsentGranted?.() === true,
+      ...approvedPlanExpectations,
     });
     setLatestTurnContract(effectiveTurnContract);
     const webResearchPromptDate = (
@@ -341,13 +358,15 @@ export function createSystemPromptApplier(input: {
       modelProtocolProfile.reasoning,
       modelProtocolProfile.notes.join(","),
       availableToolNameList.join(","),
+      visualObservationRequest?.turnId || "no-visual-turn",
+      visualObservationRequest?.imageCount || 0,
     ].join("|");
     if (systemPromptKey === appliedSystemPromptKey) return;
 
     const mcpToolNames = availableToolNameList.filter((name) => mcpToolNameSet.has(name));
     const customToolNames = availableToolNameList.filter((name) => skillToolNameSet.has(name));
     const subagentScope = callbacks.getSubagentScope?.() ?? null;
-    const systemPrompt = subagentScope
+    const baseSystemPrompt = subagentScope
       ? buildSubagentSystemPrompt({
           workspace,
           language: MODEL_CONTROL_LANGUAGE,
@@ -406,12 +425,21 @@ export function createSystemPromptApplier(input: {
       effectiveTurnContract,
       goalTurnContract,
     );
+    const systemPrompt = visualObservationRequest
+      ? appendVisualObservationProtocol(baseSystemPrompt, visualObservationRequest)
+      : baseSystemPrompt;
     const currentMessages = callbacks.getMessages();
     if (currentMessages.length === 0) {
       callbacks.appendMessage({ role: "system", content: systemPrompt });
     } else if (currentMessages[0].role === "system") {
       const refreshed = [...currentMessages];
-      refreshed[0] = { ...refreshed[0], content: systemPrompt };
+      refreshed[0] = {
+        ...refreshed[0],
+        content: preserveVisualContextDeliveryObservationsInSystemPrompt(
+          systemPrompt,
+          currentMessages,
+        ),
+      };
       callbacks.replaceMessages(refreshed);
     } else {
       callbacks.replaceMessages([{ role: "system", content: systemPrompt }, ...currentMessages]);
@@ -512,7 +540,6 @@ export async function runAgentLoopStartHooks(input: {
       .forEach((message) => callbacks.appendMessage(message));
     callbacks.markSessionHookInitialized(sessionKey);
     if (sessionHookResult.blocked) {
-      callbacks.onStatusChange("idle");
       return "blocked";
     }
   }
@@ -537,7 +564,6 @@ export async function runAgentLoopStartHooks(input: {
   createHookContextMessages("UserPromptSubmit", promptHookResult.additionalContexts)
     .forEach((message) => callbacks.appendMessage(message));
   if (promptHookResult.blocked) {
-    callbacks.onStatusChange("idle");
     return "blocked";
   }
 
@@ -660,6 +686,7 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
   };
   let turnEventTerminalEmitted = false;
   let runTerminalEmitted = false;
+  let stagedTurnCompletion: (() => void) | null = null;
   const emitTurnEvent = (event: MainThreadEventInput): void => {
     if (
       event.type === "run.paused" ||
@@ -709,6 +736,28 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
       turnId: eventTurnId,
       timestampMs: Date.now(),
     });
+  };
+  const stageTurnCompletion = (commit: () => void) => {
+    if (stagedTurnCompletion || turnEventTerminalEmitted || runTerminalEmitted) return;
+    stagedTurnCompletion = commit;
+  };
+  Object.defineProperty(emitTurnCompletedEvent, "stageCompletion", {
+    configurable: false,
+    enumerable: false,
+    value: stageTurnCompletion,
+  });
+  const hasStagedTurnCompletion = () => stagedTurnCompletion !== null;
+  const commitStagedTurnCompletion = () => {
+    const commit = stagedTurnCompletion;
+    if (!commit) return false;
+    stagedTurnCompletion = null;
+    commit();
+    return true;
+  };
+  const discardStagedTurnCompletion = () => {
+    if (!stagedTurnCompletion) return false;
+    stagedTurnCompletion = null;
+    return true;
   };
   const emitTurnFailedEvent = (message: string) => {
     if (turnEventTerminalEmitted) return;
@@ -782,6 +831,10 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     emitTurnCompletedEvent,
     emitTurnFailedEvent,
     emitRunPausedEvent,
+    stageTurnCompletion,
+    hasStagedTurnCompletion,
+    commitStagedTurnCompletion,
+    discardStagedTurnCompletion,
   };
 }
 
@@ -835,13 +888,39 @@ export function emitInitialTurnPreparationEvents(input: {
     parentRunId: eventParentRunId,
     ...(eventGoalSliceId ? { goalSliceId: eventGoalSliceId } : {}),
   });
+  const imageParts = extractTurnInputContextSignalsFromMessages(callbacks.getMessages()).imageParts;
+  if (imageParts > 0) {
+    const language = callbacks.getPreferredLanguage();
+    emitTurnEvent({
+      type: "progress.updated",
+      threadId: eventThreadId,
+      turnId: eventTurnId,
+      timestampMs: Date.now(),
+      progress: {
+        phase: "understanding",
+        title: language === "zh" ? "正在识别截图证据" : "Inspecting screenshot evidence",
+        status: "running",
+        audience: "user",
+        summary: language === "zh"
+          ? `${imageParts} 张截图已加入本轮视觉请求，正在发送给模型识别，并确认端点是否实际接收。`
+          : `${imageParts} screenshot${imageParts === 1 ? "" : "s"} queued for visual inspection while MAIN confirms actual provider delivery.`,
+        tool: "visual_context",
+        canonicalTarget: `images:${imageParts}`,
+        dedupeKey: `visual-context:${eventTurnId}`,
+        visualContext: {
+          status: "queued",
+          expectedImageParts: imageParts,
+          deliveredImageParts: 0,
+          omittedImageParts: 0,
+          recognition: "pending",
+        },
+      },
+    });
+  }
   if (turnIntent !== "respond" && turnIntent !== "discuss") {
     const language = callbacks.getPreferredLanguage();
     const userGoal = compactDiagnosticText(getOriginalUserPromptForPlanFallback(callbacks), 220);
-    const hasImages = callbacks.getMessages().some((message) =>
-      Array.isArray(message.content) &&
-      message.content.some((part: any) => part?.type === "image_url" || part?.type === "input_image")
-    );
+    const hasImages = imageParts > 0;
     emitTurnEvent({
       type: "progress.updated",
       threadId: eventThreadId,

@@ -616,13 +616,11 @@ export function hasExecutableProposalReplyOptions(replyOptions: ReplyOption[]): 
 
 export function shouldSuppressApprovedPlanExecutionReplyOptions(params: {
   replyOptions: ReplyOption[];
-  workflowMode: "chat" | "edit" | "plan";
   isPlanApproved?: boolean;
   planStage?: string | null;
   toolCallCount?: number;
 }): boolean {
   if (
-    params.workflowMode !== "plan" ||
     params.isPlanApproved !== true ||
     params.planStage !== "executing"
   ) {
@@ -929,7 +927,7 @@ export function shouldPauseForReplyOptions(params: {
   // Once the user has approved a plan, the runtime owns execution. Even an
   // explicit model option cannot coexist with tool calls in that same turn;
   // without calls only an explicit, non-runtime user decision may pause it.
-  if (workflowMode === "plan" && isPlanApproved) {
+  if (isPlanApproved) {
     if (toolCallCount > 0) return false;
     return hasExplicitUserOwnedMutationDecisionOptions(replyOptions);
   }

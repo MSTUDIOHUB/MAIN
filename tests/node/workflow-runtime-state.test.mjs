@@ -5,6 +5,37 @@ import path from "node:path";
 
 const workspaceRoot = process.cwd();
 
+function collectFilesRecursively(root) {
+  return fsSync.readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    const absolutePath = path.join(root, entry.name);
+    return entry.isDirectory() ? collectFilesRecursively(absolutePath) : [absolutePath];
+  });
+}
+
+test("retired model policies and validator modules have no runtime consumers", () => {
+  const retiredPaths = [
+    "src/lib/orchestrator/policies/CloudModelPolicy.ts",
+    "src/lib/orchestrator/policies/ExecutionPolicy.ts",
+    "src/lib/orchestrator/policies/LocalModelPolicy.ts",
+    "src/lib/orchestrator/policies/PolicyFactory.ts",
+    "src/lib/orchestrator/prompts/validationPrompts.ts",
+    "src/lib/orchestrator/tools/shellValidators.ts",
+    "src/lib/orchestrator/tools/toolValidators.ts",
+  ];
+  for (const retiredPath of retiredPaths) {
+    assert.equal(fsSync.existsSync(path.join(workspaceRoot, retiredPath)), false, retiredPath);
+  }
+
+  const runtimeSource = collectFilesRecursively(path.join(workspaceRoot, "src"))
+    .filter((file) => /\.(?:ts|tsx)$/.test(file))
+    .map((file) => fsSync.readFileSync(file, "utf8"))
+    .join("\n");
+  assert.doesNotMatch(
+    runtimeSource,
+    /CloudModelPolicy|ExecutionPolicy|LocalModelPolicy|PolicyFactory|validationPrompts|shellValidators|toolValidators/,
+  );
+});
+
 test("assistant progress before tool calls keeps the run active", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
@@ -102,6 +133,7 @@ test("onAssistantFinalText leaves terminal status and abort cleanup to the publi
 
 test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
   const onToolDoneStart = source.indexOf("onToolDone: (");
   const internalFeedbackGuard = source.indexOf("if (meta?.internalFeedback === true)", onToolDoneStart);
   const evidenceCreation = source.indexOf("createPlanExecutionEvidenceEntry", onToolDoneStart);
@@ -109,6 +141,8 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
   assert.match(source, /createPlanExecutionEvidenceEntry/);
   assert.match(source, /appendPlanEvidenceEntry/);
   assert.match(source, /reconcilePlanTaskCompletion/);
+  assert.match(source, /const unownedEntry = createPlanExecutionEvidenceEntry/);
+  assert.match(source, /resolvePlanExecutionEvidenceIdentity\(\{[\s\S]*?record,[\s\S]*?preferredPlanTaskId/);
   const lifecycleMissReturn = source.indexOf("if (existingIndex < 0) return evidencePatch", evidenceCreation);
   const evidenceAppend = source.indexOf("appendPlanEvidenceEntry", evidenceCreation);
   assert.ok(evidenceAppend > evidenceCreation && evidenceAppend < lifecycleMissReturn);
@@ -120,6 +154,21 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
   assert.match(
     source.slice(internalFeedbackGuard, evidenceCreation),
     /tool_result_internal_feedback[\s\S]*taskFlow:\s*s\.taskFlow\.filter[\s\S]*return;/,
+  );
+  assert.match(
+    orchestratorSource,
+    /callbacks\.onToolDone\(tc\.name, completedTarget, finalDisplayContent,[\s\S]{0,420}tc\.name === "browser_evaluate"[\s\S]{0,100}evidenceResult: resultStr/,
+    "browser evidence must cross the UI boundary as exact structured JSON",
+  );
+  assert.match(
+    source.slice(onToolDoneStart, evidenceCreation + 500),
+    /const evidenceResultText = typeof meta\?\.evidenceResult === "string"[\s\S]*?result: evidenceResultText/,
+    "the evidence ledger must parse the exact payload instead of the truncated UI result",
+  );
+  assert.match(
+    source.slice(onToolDoneStart, evidenceCreation + 1_000),
+    /summarizeToolObservation\(\{[\s\S]*?result: resultText/,
+    "UI narration should continue using the bounded display result",
   );
 });
 
@@ -193,9 +242,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   const maxIterationBoundarySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/maxIterationBoundary.ts"), "utf8");
   const approvedPlanNoToolRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRouting.ts"), "utf8");
   const approvedPlanRecoveryActionsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanRecoveryActions.ts"), "utf8");
-  const approvedPlanRecoveryRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanRecoveryRuntime.ts"), "utf8");
-  const approvedPlanNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"), "utf8");
   const approvedPlanFinalizationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"), "utf8");
+  const preCompletionEvidenceRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/preCompletionEvidenceRecovery.ts"), "utf8");
   const executeNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeNoToolRecovery.ts"), "utf8");
   const executeRecoveryRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"), "utf8");
   const missingToolNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/missingToolNoToolRecovery.ts"), "utf8");
@@ -247,19 +295,16 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolCallExecutionPhaseSource, /executeToolExecutionRound\(\{/);
   assert.match(toolResultRecoveryPhaseSource, /appendToolResultsToHistory\(\{/);
   assert.match(toolCallExecutionPhaseSource, /handleToolResultPostProcessing\(\{/);
-  assert.match(toolResultRecoveryPhaseSource, /handleReadFileRepeatLimitRecovery\(\{/);
-  assert.match(toolResultRecoveryPhaseSource, /handleRepeatedEditValidationRecovery\(\{/);
+  assert.doesNotMatch(toolResultRecoveryPhaseSource, /handleReadFileRepeatLimitRecovery\(\{/);
+  assert.doesNotMatch(toolResultRecoveryPhaseSource, /handleRepeatedEditValidationRecovery\(\{/);
   assert.match(toolResultRecoveryPhaseSource, /handleStrictRepeatGuardRecovery\(\{/);
   assert.match(source, /handleMaxIterationBoundary\(\{/);
   assert.match(assistantOutputPhaseSource, /resolveApprovedPlanNoToolRoute\(\{/);
   assert.match(source, /createAgentLoopControlRuntime\(\{/);
   assert.match(source, /loopControl\.startLoop\(\{/);
-  assert.match(loopControlRuntimeSource, /pauseApprovedPlanNoProgressLoopAction\(\{/);
   assert.match(loopControlRuntimeSource, /pauseApprovedPlanStreamWatchdogAction\(\{/);
-  assert.match(loopControlRuntimeSource, /continueApprovedPlanWithStrategySwitchAction\(\{/);
   assert.match(source, /handleAssistantIterationPhase\(\{/);
   assert.match(assistantIterationPhaseSource, /handleAssistantCompletionPhase\(\{/);
-  assert.match(assistantCompletionPhaseSource, /handleApprovedPlanNoToolRecovery\(\{/);
   assert.match(assistantCompletionPhaseSource, /handleExecuteNoToolRecovery\(\{/);
   assert.match(assistantCompletionPhaseSource, /handleMissingToolNoToolRecovery\(\{/);
   assert.match(assistantCompletionPhaseSource, /handlePlanNoToolRecovery\(\{/);
@@ -355,7 +400,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolResultRecoveryPhaseSource, /getNoProgressTrackingRuntimeState\(loopGuardRuntimeState\)/);
   assert.match(toolResultRecoveryPhaseSource, /applyNoProgressTrackingRuntimeState\(/);
   assert.match(toolResultRecoveryPhaseSource, /applyToolFailureSignatureRuntimeState\(/);
-  assert.match(loopRuntimeActionsSource, /clearCrossIterationReadTrackingForTarget\(/);
+  assert.doesNotMatch(loopRuntimeActionsSource, /clearCrossIterationReadTrackingForTarget\(/);
   assert.match(loopMutableStateSource, /createAgentLoopToolExecutionRuntimeState\(/);
   assert.match(iterationStreamPreparationSource, /fileReadStates: toolExecutionRuntimeState\.fileReadStates/);
   assert.match(toolCallExecutionPhaseSource, /\.\.\.input\.toolExecutionRuntimeState/);
@@ -368,7 +413,6 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(source, /waitForPlanApprovalIfNeeded,/);
   assert.match(source, /pauseForReviewablePlanArtifact,/);
   assert.match(source, /tryClosePlanWithEvidence,/);
-  assert.match(loopMutableStateSource, /createApprovedPlanRecoveryRuntimeState\(\)/);
   assert.match(approvedPlanNoToolRoutingSource, /buildPlanTaskEvidenceAudit/);
   assert.match(approvedPlanNoToolRoutingSource, /shouldHandleApprovedPlanExecutionNoTool/);
   assert.match(approvedPlanNoToolRoutingSource, /looksLikePlanCompletionClaim/);
@@ -377,9 +421,6 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolProgressRoutingSource, /looksLikeSubstantivePlanAssistantText/);
   assert.match(toolProgressRoutingSource, /shouldInjectRuntimeToolNarration/);
   assert.match(toolProgressRoutingSource, /resolveToolProgressPresentation/);
-  assert.match(loopControlRuntimeSource, /applyApprovedPlanStrategySwitchRecoveryState/);
-  assert.match(assistantCompletionPhaseSource, /applyApprovedPlanNoToolRecoveryState/);
-  assert.match(toolCallExecutionPhaseSource, /applyApprovedPlanToolResultRecoveryState/);
   assert.match(assistantNoToolRecoveryRoutingSource, /shouldTriggerChatFinalSynthesis/);
   assert.match(assistantNoToolRecoveryRoutingSource, /looksLikeToolUnavailableClaim/);
   assert.match(assistantNoToolRecoveryRoutingSource, /action: "activate_chat_final_synthesis"/);
@@ -433,7 +474,6 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.doesNotMatch(source, /handleExecuteConvergencePrompt\(/);
   assert.doesNotMatch(source, /handlePlanQualityRecoveryAfterToolResults\(/);
   assert.doesNotMatch(source, /handlePlanReadOnlyConvergence\(/);
-  assert.doesNotMatch(source, /handleApprovedPlanNoToolRecovery\(/);
   assert.doesNotMatch(source, /handleExecuteNoToolRecovery\(/);
   assert.doesNotMatch(source, /handleMissingToolNoToolRecovery\(/);
   assert.doesNotMatch(source, /handlePlanNoToolRecovery\(/);
@@ -526,8 +566,6 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.doesNotMatch(source, /let executeRecoveryMode/);
   assert.doesNotMatch(source, /let executeRecoveryReason/);
   assert.doesNotMatch(source, /let executeRecoveryAttempts/);
-  assert.doesNotMatch(source, /let approvedPlanActionOnlyRecoveryActive/);
-  assert.doesNotMatch(source, /let approvedPlanNoProgressRecoveryAttempts/);
   assert.doesNotMatch(source, /const MAX_RECOVERY_ITERATIONS\s*=\s*6/);
   assert.doesNotMatch(source, /plan_reasoning_only_recovery_decision/);
   assert.doesNotMatch(source, /reasoning_dominated_recovery/);
@@ -568,7 +606,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(streamInvocationSource, /messagesSentToLLM: messagesForLLM/);
   assert.match(streamInvocationSource, /buildMaxStepsFinalTextPrompt/);
   assert.match(streamInvocationSource, /buildChatFinalSynthesisPrompt/);
-  assert.match(streamInvocationSource, /PolicyFactory\.createPolicy/);
+  assert.doesNotMatch(streamInvocationSource, /PolicyFactory|responseFormat|response_format/);
+  assert.doesNotMatch(streamInvocationSource, /reasoningRatio|getReasoningDominatedStopMessage/);
   assert.match(streamRecoverySource, /export async function invokeStreamWithRecoveryForIteration/);
   assert.match(streamRecoverySource, /invokeInitialStreamForIteration/);
   assert.match(streamRecoverySource, /handlePlanDraftStreamTimeout/);
@@ -584,7 +623,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolCallPlanningSource, /export interface IterationToolSurfaceDecision/);
   assert.match(toolCallPlanningSource, /export function resolveIterationToolSurface/);
   assert.match(toolCallPlanningSource, /execute_recovery_tool_scope_applied/);
-  assert.match(toolCallPlanningSource, /approved_plan_source_edit_first_tool_scope_applied/);
+  assert.doesNotMatch(toolCallPlanningSource, /approved_plan_source_edit_first_tool_scope_applied/);
   assert.match(toolCallPlanningSource, /logAgentEvent\("tool_surface_decision"/);
   assert.match(toolCallPlanningSource, /plan_runtime_tool_scope_applied/);
   assert.match(contextManagementSource, /export interface IterationContextManagementResult/);
@@ -652,18 +691,14 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(loopRecoverySource, /no_progress_deferred_to_plan_readonly_convergence/);
   assert.match(loopRecoverySource, /no_progress_batch_loop/);
   assert.match(loopRecoverySource, /currentExecuteRecoveryAttempts/);
-  assert.match(toolResultRecoveryPhaseSource, /handleCrossIterationReadFileLoopRecovery\(\{/);
-  assert.match(loopRecoverySource, /export function handleCrossIterationReadFileLoopRecovery/);
-  assert.match(loopRecoverySource, /resolveCrossIterationReadThreshold/);
-  assert.match(loopRecoverySource, /DEFAULT_CROSS_ITERATION_READ_CONTEXT_LIMIT/);
-  assert.match(loopRecoverySource, /cross_iteration_file_read_loop/);
-  assert.match(loopRecoverySource, /blocked_read_file_recovery_prompt_injected/);
-  assert.match(loopRecoverySource, /execute_recovery_reset_after_blocked_reads/);
+  assert.doesNotMatch(toolResultRecoveryPhaseSource, /handleCrossIterationReadFileLoopRecovery\(\{/);
+  assert.doesNotMatch(loopRecoverySource, /export function handleCrossIterationReadFileLoopRecovery/);
+  assert.doesNotMatch(loopRecoverySource, /resolveCrossIterationReadThreshold/);
   assert.match(toolResultRecoveryPhaseSource, /handleTargetProgressLoopRecovery\(\{/);
   assert.match(loopRecoverySource, /export function handleTargetProgressLoopRecovery/);
   assert.match(loopRecoverySource, /registerTargetProgressEventForLoopGuard/);
   assert.match(loopRecoverySource, /formatTargetProgressLoopRecoveryMessage/);
-  assert.match(loopRecoverySource, /target_progress_patch_mismatch/);
+  assert.match(loopRecoverySource, /target_progress_mutation_failure/);
   assert.match(loopRecoverySource, /target_progress_no_diff_chain/);
   assert.match(toolResultRecoveryPhaseSource, /handleExecuteConvergencePrompt\(\{/);
   assert.match(loopRecoverySource, /export function handleExecuteConvergencePrompt/);
@@ -671,19 +706,15 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(loopRecoverySource, /EXECUTE_CONVERGENCE_PROMPT_RATIO/);
   assert.match(loopRecoverySource, /buildExecuteConvergencePrompt/);
   assert.match(loopRecoverySource, /execute_convergence_prompt/);
-  assert.match(loopRecoverySource, /export function handleReadFileRepeatLimitRecovery/);
-  assert.match(loopRecoverySource, /export function handleRepeatedEditValidationRecovery/);
+  assert.doesNotMatch(loopRecoverySource, /export function handleReadFileRepeatLimitRecovery/);
+  assert.doesNotMatch(loopRecoverySource, /export function handleRepeatedEditValidationRecovery/);
   assert.match(loopRecoverySource, /export function handleStrictRepeatGuardRecovery/);
   assert.match(loopRecoverySource, /registerToolCallForRepeatGuard/);
   assert.match(loopRecoverySource, /formatRepeatLoopRecoveryMessage/);
   assert.match(loopRecoverySource, /formatRepeatLoopFatalMessage/);
-  assert.match(loopRecoverySource, /approved_plan_read_file_repeat_limit/);
-  assert.match(loopRecoverySource, /approved_plan_repeated_read_file/);
   assert.match(loopRecoverySource, /approved_plan_repeated_browser_validation/);
-  assert.match(loopRecoverySource, /read_file_repeat_limit_recovery/);
-  assert.match(loopRecoverySource, /repeat_edit_target_validation_recovery/);
-  assert.match(loopRecoverySource, /buildReadFileRepeatLimitBatchPauseNotice/);
-  assert.match(loopRecoverySource, /buildExecuteValidationRecoveryPrompt/);
+  assert.doesNotMatch(loopRecoverySource, /approved_plan_read_file_repeat_limit/);
+  assert.doesNotMatch(loopRecoverySource, /repeat_edit_target_validation_recovery/);
   assert.doesNotMatch(source, /formatRepeatLoopFatalMessage/);
   assert.doesNotMatch(source, /formatRepeatLoopRecoveryMessage/);
   assert.doesNotMatch(source, /approved_plan_repeated_read_file/);
@@ -692,28 +723,19 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(maxIterationBoundarySource, /buildPlanMaxIterationsCheckpoint/);
   assert.match(maxIterationBoundarySource, /buildPlanMaxIterationsPauseNotice/);
   assert.match(maxIterationBoundarySource, /buildExecuteMaxIterationsPauseNotice/);
-  assert.match(maxIterationBoundarySource, /logAgentEvent\("max_iterations_checkpoint"/);
-  assert.match(maxIterationBoundarySource, /logAgentEvent\("execute_max_iterations_checkpoint"/);
+  assert.match(maxIterationBoundarySource, /logAgentEvent\(isPlanBoundary[\s\S]*?"max_iterations_checkpoint"[\s\S]*?"execute_max_iterations_checkpoint"/);
   assert.match(maxIterationBoundarySource, /reason: "max_iterations_boundary"/);
-  assert.match(approvedPlanRecoveryActionsSource, /export function pauseApprovedPlanNoProgressLoop/);
   assert.match(approvedPlanRecoveryActionsSource, /export function pauseApprovedPlanStreamWatchdog/);
-  assert.match(approvedPlanRecoveryActionsSource, /export function continueApprovedPlanWithStrategySwitch/);
-  assert.match(approvedPlanRecoveryActionsSource, /buildPlanNoProgressLoopPauseNotice/);
-  assert.match(approvedPlanRecoveryActionsSource, /buildApprovedPlanNoProgressStrategySwitchPrompt/);
   assert.match(approvedPlanRecoveryActionsSource, /approved_plan_stream_watchdog_paused/);
-  assert.match(approvedPlanRecoveryActionsSource, /plan_execution_strategy_switch_reprompt/);
-  assert.match(approvedPlanRecoveryRuntimeSource, /export interface ApprovedPlanRecoveryRuntimeState/);
-  assert.match(approvedPlanRecoveryRuntimeSource, /export function createApprovedPlanRecoveryRuntimeState/);
-  assert.match(approvedPlanRecoveryRuntimeSource, /export function resetApprovedPlanHandoffRecoveryState/);
-  assert.match(approvedPlanRecoveryRuntimeSource, /export function applyApprovedPlanNoToolRecoveryState/);
-  assert.match(approvedPlanNoToolRecoverySource, /export function handleApprovedPlanNoToolRecovery/);
-  assert.match(approvedPlanNoToolRecoverySource, /resolveApprovedPlanNoToolCheckpointLimit/);
-  assert.match(approvedPlanNoToolRecoverySource, /plan_execution_no_tool_reprompt/);
-  assert.match(approvedPlanNoToolRecoverySource, /approved_plan_no_tool_recovery_tool_surface/);
-  assert.match(approvedPlanNoToolRecoverySource, /approved_plan_reasoning_length_no_action/);
+  assert.match(preCompletionEvidenceRecoverySource, /export function resolvePreCompletionEvidenceRecoveryDecision/);
+  const preCompletionAuditIndex = assistantCompletionPhaseSource.indexOf("resolvePreCompletionEvidenceRecoveryDecision({");
+  const activeContractIndex = assistantCompletionPhaseSource.indexOf('currentExecuteRecoveryState.mode !== "normal"');
+  const executeNoToolIndex = assistantCompletionPhaseSource.indexOf("handleExecuteNoToolRecovery({");
+  assert.ok(preCompletionAuditIndex >= 0);
+  assert.ok(preCompletionAuditIndex < activeContractIndex);
+  assert.ok(activeContractIndex < executeNoToolIndex);
   assert.match(assistantCompletionPhaseSource, /handleApprovedPlanFinalization\(\{/);
   assert.match(approvedPlanFinalizationSource, /export function handleApprovedPlanFinalization/);
-  assert.match(approvedPlanNoToolRecoverySource, /plan_execution_validation_boundary/);
   assert.match(approvedPlanFinalizationSource, /remaining_plan_tasks_limit/);
   assert.match(approvedPlanFinalizationSource, /plan_completion_guard_reprompt/);
   assert.match(approvedPlanFinalizationSource, /plan_evidence_complete/);
@@ -726,8 +748,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(executeNoToolRecoverySource, /export function handleExecuteNoToolRecovery/);
   assert.match(executeNoToolRecoverySource, /export function resolveExecuteNoToolCheckpointLimit/);
   assert.match(executeNoToolRecoverySource, /export function isExecuteRuntimeRequiringEvidence/);
-  assert.match(executeNoToolRecoverySource, /execute_completion_claim_without_evidence/);
-  assert.match(executeNoToolRecoverySource, /execute_replanning_text_without_evidence/);
+  assert.doesNotMatch(executeNoToolRecoverySource, /execute_completion_claim_without_evidence/);
+  assert.doesNotMatch(executeNoToolRecoverySource, /execute_replanning_text_without_evidence/);
   assert.match(executeNoToolRecoverySource, /execute_xml_text_without_action/);
   assert.match(executeRecoveryRuntimeSource, /export interface ExecuteRecoveryRuntimeState/);
   assert.match(executeRecoveryRuntimeSource, /export const MAX_EXECUTE_RECOVERY_ITERATIONS = 6/);
@@ -779,8 +801,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(planQualityRecoverySource, /plan_quality_gate_recovery_decision/);
   assert.match(reasoningNoToolRecoverySource, /export function handleReasoningDominatedNoToolRecovery/);
   assert.match(reasoningNoToolRecoverySource, /plan_reasoning_only_recovery_decision/);
-  assert.match(reasoningNoToolRecoverySource, /reasoning_dominated_recovery/);
-  assert.match(reasoningNoToolRecoverySource, /approved_plan_reasoning_recovery_tool_surface/);
+  assert.match(reasoningNoToolRecoverySource, /activateExecuteRecovery\("mutation_first", "reasoning_dominated_recovery"/);
   assert.match(reasoningNoToolRecoverySource, /plan_reasoning_only_evidence_blocked/);
   assert.match(emptyResponseRecoverySource, /export async function handleEmptyResponseRecovery/);
   assert.match(emptyResponseRecoverySource, /plan_review_ready_after_empty_response/);
@@ -856,7 +877,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(loopGuardRuntimeStateSource, /export function createAgentLoopGuardRuntimeState/);
   assert.match(loopGuardRuntimeStateSource, /export function getNoProgressTrackingRuntimeState/);
   assert.match(loopGuardRuntimeStateSource, /export function applyNoProgressTrackingRuntimeState/);
-  assert.match(loopGuardRuntimeStateSource, /export function clearCrossIterationReadTrackingForTarget/);
+  assert.doesNotMatch(loopGuardRuntimeStateSource, /export function clearCrossIterationReadTrackingForTarget/);
   assert.match(loopGuardRuntimeStateSource, /export function applyToolFailureSignatureRuntimeState/);
   assert.match(toolExecutionRuntimeStateSource, /export interface AgentLoopToolExecutionRuntimeState/);
   assert.match(toolExecutionRuntimeStateSource, /export function createAgentLoopToolExecutionRuntimeState/);
@@ -941,7 +962,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.doesNotMatch(source, /cross_iteration_file_read_loop/);
   assert.doesNotMatch(source, /blocked_read_file_recovery_prompt_injected/);
   assert.doesNotMatch(source, /execute_recovery_reset_after_blocked_reads/);
-  assert.doesNotMatch(source, /target_progress_patch_mismatch/);
+  assert.doesNotMatch(source, /target_progress_mutation_failure/);
   assert.doesNotMatch(source, /target_progress_no_diff_chain/);
   assert.doesNotMatch(source, /formatTargetProgressLoopRecoveryMessage/);
   assert.doesNotMatch(source, /registerTargetProgressEventForLoopGuard/);
@@ -998,13 +1019,13 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.doesNotMatch(source, /plan_suppressed_tool_forced_write_injected/);
 });
 
-test("approved plan no-tool guard uses execution checkpoint helper and no-action outcome", () => {
+test("approved plan no-tool turns use evidence recovery, the active contract, then generic no-tool recovery", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
   const assistantIterationPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantIterationPhase.ts"), "utf8");
   const assistantOutputPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantOutputPhase.ts"), "utf8");
   const assistantCompletionPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantCompletionPhase.ts"), "utf8");
   const approvedPlanNoToolRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRouting.ts"), "utf8");
-  const approvedPlanNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"), "utf8");
+  const executeNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeNoToolRecovery.ts"), "utf8");
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
   const workflowEngine = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
@@ -1013,9 +1034,15 @@ test("approved plan no-tool guard uses execution checkpoint helper and no-action
   assert.match(assistantIterationPhaseSource, /handleAssistantCompletionPhase\(\{/);
   assert.match(approvedPlanNoToolRoutingSource, /shouldHandleApprovedPlanExecutionNoTool/);
   assert.match(assistantOutputPhaseSource, /approved_plan_no_tool_route/);
-  assert.match(assistantCompletionPhaseSource, /handleApprovedPlanNoToolRecovery\(\{/);
-  assert.match(approvedPlanNoToolRecoverySource, /plan_execution_no_tool_reprompt/);
-  assert.match(approvedPlanNoToolRecoverySource, /resolveApprovedPlanNoToolCheckpointLimit/);
+  const evidenceAuditIndex = assistantCompletionPhaseSource.indexOf("resolvePreCompletionEvidenceRecoveryDecision({");
+  const activeContractIndex = assistantCompletionPhaseSource.indexOf('currentExecuteRecoveryState.mode !== "normal"');
+  const genericRecoveryIndex = assistantCompletionPhaseSource.indexOf("handleExecuteNoToolRecovery({");
+  assert.ok(evidenceAuditIndex >= 0);
+  assert.ok(evidenceAuditIndex < activeContractIndex);
+  assert.ok(activeContractIndex < genericRecoveryIndex);
+  assert.match(assistantCompletionPhaseSource, /precompletion_evidence_recovery_activated/);
+  assert.match(executeNoToolRecoverySource, /required_tool_call_protocol_violation/);
+  assert.match(executeNoToolRecoverySource, /availableTools: Array\.from\(availableToolNames\)/);
   assert.match(guardsSource, /approved_plan_completion_guard_no_evidence/);
   assert.match(guardsSource, /return \{ status: "stopped_no_action", reason: "approved_plan_completion_guard" \}/);
   assert.match(workflowEngine, /progress\?\.recoveryReason === "approved_plan_completion_guard_no_evidence"[\s\S]*?"stopped_no_action"/);
@@ -1028,7 +1055,7 @@ test("approved plan no-tool guard uses execution checkpoint helper and no-action
 test("approved plan max-iteration boundary pauses instead of surfacing agent error", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
   const maxIterationBoundarySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/maxIterationBoundary.ts"), "utf8");
-  const checkpointIndex = maxIterationBoundarySource.indexOf("logAgentEvent(\"max_iterations_checkpoint\"");
+  const checkpointIndex = maxIterationBoundarySource.indexOf("if (isPlanBoundary && !handling.handled)");
   const branch = maxIterationBoundarySource.slice(checkpointIndex, checkpointIndex + 2200);
 
   assert.match(source, /handleMaxIterationBoundary\(\{/);
@@ -1128,12 +1155,18 @@ test("workflow engine owns one hidden auto-resume at max-iteration checkpoints",
     assert.match(handler, /type: "system",\s*content: pauseNotice,/);
   }
   assert.match(planHandler, /buildPlanMaxIterationsResumePrompt/);
-  assert.match(planHandler, /resolvedIntent: "plan"/);
-  assert.match(planHandler, /runtimeIntentOverride: "execute"/);
+  assert.match(planHandler, /resolvedIntent: "execute"/);
+  assert.doesNotMatch(planHandler, /runtimeIntentOverride/);
   assert.match(planHandler, /executionConsentGranted: true/);
   assert.match(executeHandler, /buildExecuteMaxIterationsResumePrompt/);
-  assert.match(executeHandler, /runtimeIntentOverride: "execute"/);
+  assert.doesNotMatch(executeHandler, /runtimeIntentOverride/);
   assert.match(executeHandler, /resolveExecuteMaxIterationsRecoveryDecision/);
+  assert.match(
+    executeHandler,
+    /scopeExecutionEvidenceLedger\(\s*executeEvidenceLedger,\s*turnId,?\s*\)/,
+  );
+  assert.match(executeHandler, /transactionId: turnId/);
+  assert.match(executeHandler, /\[\.\.\.scopedExecuteEvidenceLedger\]\.reverse\(\)/);
   assert.match(executeHandler, /forceExecuteRecoveryMode: executeRecoveryDecision\.mode/);
   assert.match(executeHandler, /forceExecuteRecoveryState: forcedExecuteRecoveryState/);
   assert.match(executeHandler, /latestExecuteRecoveryState\?\.expectedTarget/);
@@ -1472,6 +1505,12 @@ test("approved plan execution stays in one logical turn and has one runtime owne
   assert.match(storeSource, /source:\s*"store_fallback"/);
   assert.match(storeSource, /reuseCurrentTurn:\s*true/);
   assert.match(storeSource, /createVisibleTurnForHiddenMessage:\s*false/);
+  const approvedExecutionStarter = storeSource.slice(
+    storeSource.indexOf("export function startApprovedPlanExecutionInCurrentTurn"),
+    storeSource.indexOf("async function hydrateExistingPlanArtifactsForWorkspace"),
+  );
+  assert.match(approvedExecutionStarter, /resolvedIntent:\s*"execute"/);
+  assert.doesNotMatch(approvedExecutionStarter, /runtimeIntentOverride/);
   assert.doesNotMatch(approvePlanMethod, /parentPlanTurnId/);
   assert.doesNotMatch(
     approvePlanMethod,
@@ -1485,6 +1524,11 @@ test("approved plan execution stays in one logical turn and has one runtime owne
   assert.match(workflowEngineSource, /plan_approval_same_turn_execution_started/);
   assert.match(workflowEngineSource, /plan_approval_handoff_deduped/);
   assert.doesNotMatch(workflowEngineSource, /approvedPlanHandoff/);
+  assert.match(workflowEngineSource, /getCurrentRunIntent:\s*\(\) => effectiveRunIntent/);
+  assert.match(
+    workflowEngineSource,
+    /getWorkflowMode:\s*\(\) => getIntentPolicy\(effectiveRunIntent\)\.workflowMode/,
+  );
 });
 
 test("tool-result recovery returns the activated execute-recovery state", () => {

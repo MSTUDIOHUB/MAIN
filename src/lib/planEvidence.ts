@@ -3,6 +3,7 @@ import { workspacePathsReferToSameFile } from "./workspacePaths";
 import {
   analyzePtyObservationResult,
   classifyPtyCommandFailure,
+  extractLocalDevServerPort,
 } from "./devServerRuntime";
 import {
   normalizePlanEvidenceValue,
@@ -24,6 +25,7 @@ export interface PlanEvidenceFactInput {
   target: string;
   status: string;
   summary?: string;
+  facts?: string[];
   hash?: string;
 }
 
@@ -120,8 +122,15 @@ function unique(values: string[], limit = 16): string[] {
   return output;
 }
 
+function sourceDerivedFactSummary(input: PlanEvidenceFactInput): string {
+  return compact([
+    ...(Array.isArray(input.facts) ? input.facts : []),
+    input.summary,
+  ].filter(Boolean).join(" "), 320);
+}
+
 function isSemanticFact(input: PlanEvidenceFactInput): boolean {
-  const summary = compact(input.summary);
+  const summary = sourceDerivedFactSummary(input);
   const target = compact(input.target);
   if (!summary || summary.length < 12 || !target || PLAN_PATH_RE.test(target)) return false;
   const normalizedSummary = summary.toLowerCase().replace(/\\/g, "/");
@@ -216,7 +225,7 @@ function summaryExposesTargetDefect(summary: string): boolean {
   // what must change, and previously let placeholder plans pass the approval
   // gate. Keep this matcher provider/language neutral by requiring a concrete
   // missing, wrong, empty, or omitted implementation relation.
-  return /(?:\b(?:missing|incorrect(?:ly)?|wrong(?:ly)?|broken|unimplemented|stubbed?|no-op|empty handler)\b|\b(?:does not|doesn't|never)\s+(?:assigns?|maps?|registers?|listens?|awaits?|returns?|sets?|handles?|calls?|emits?|forwards?|exports?|defines?|binds?|installs?|initiali[sz]es?|renders?)\b|\bwithout\s+(?:assigning|mapping|registering|listening|awaiting|returning|setting|handling|calling|emitting|forwarding|exporting|defining|binding|installing|initiali[sz]ing|rendering)\b|\bonly\s+(?:returns?|sets?|writes?|handles?|calls?|emits?)\b|缺少|缺失|不正确|失效|未实现|未注册|未监听|未等待|从未(?:映射|注册|监听|等待|返回|设置|处理|调用|转发|导出|定义|绑定|安装|初始化|渲染)|没有(?:映射|注册|监听|等待|返回|设置|处理|调用|转发|导出|定义|绑定|安装|初始化|渲染)|为空|空实现|只(?:返回|设置|写入|处理|调用)|仅(?:返回|设置|写入|处理|调用))/i.test(withoutDiagnosticMessages);
+  return /(?:\b(?:missing|incorrect(?:ly)?|wrong(?:ly)?|broken|unimplemented|stubbed?|no-op|empty handler)\b|\b(?:lacks?|has\s+no)\s+(?:an?\s+|the\s+)?(?:[\w$.-]+\s+){0,4}(?:handler|listener|registration|binding|mapping|call|await|return|forwarding|export|definition|initialization|rendering)\b|\b(?:does not|doesn't|never)\s+(?:assigns?|maps?|registers?|listens?|awaits?|returns?|sets?|handles?|calls?|emits?|forwards?|exports?|defines?|binds?|installs?|initiali[sz]es?|renders?)\b|\bwithout\s+(?:assigning|mapping|registering|listening|awaiting|returning|setting|handling|calling|emitting|forwarding|exporting|defining|binding|installing|initiali[sz]ing|rendering)\b|\bonly\s+(?:returns?|sets?|writes?|handles?|calls?|emits?)\b|缺少|缺失|不正确|失效|未实现|未注册|未监听|未等待|从未(?:映射|注册|监听|等待|返回|设置|处理|调用|转发|导出|定义|绑定|安装|初始化|渲染)|没有(?:映射|注册|监听|等待|返回|设置|处理|调用|转发|导出|定义|绑定|安装|初始化|渲染)|为空|空实现|只(?:返回|设置|写入|处理|调用)|仅(?:返回|设置|写入|处理|调用))/i.test(withoutDiagnosticMessages);
 }
 
 function summaryExposesImplementationStructure(summary: string): boolean {
@@ -490,7 +499,7 @@ export function buildPlanEvidenceBundle(input: {
   const semanticFacts = (input.evidenceRecords || [])
     .filter((record) => record.status === "succeeded" && isSemanticFact(record))
     .map((record, index) => {
-      const summary = compact(record.summary, 320);
+      const summary = sourceDerivedFactSummary(record);
       const target = compact(record.target, 220);
       const hash = compact(record.hash) || stableHash(`${record.tool}\n${target}\n${summary}`);
       return {
@@ -1192,6 +1201,10 @@ export function createPlanExecutionEvidenceEntry(input: {
   result: string;
   noOp?: boolean;
   diff?: ToolDiffPreview;
+  transactionId?: string;
+  runId?: string;
+  planTaskId?: string;
+  requirementRef?: string;
 }): PlanExecutionEvidenceEntry | null {
   const target = String(input.target || "").trim();
   if (!target || input.noOp || isPlanArtifactPath(target)) return null;
@@ -1202,6 +1215,10 @@ export function createPlanExecutionEvidenceEntry(input: {
   const timestamp = Date.now();
   const base = {
     id: `evidence-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+    ...(input.transactionId ? { transactionId: input.transactionId } : {}),
+    ...(input.runId ? { runId: input.runId } : {}),
+    ...(input.planTaskId?.trim() ? { planTaskId: input.planTaskId.trim() } : {}),
+    ...(input.requirementRef?.trim() ? { requirementRef: input.requirementRef.trim() } : {}),
     value: target,
     target,
     references: extractWorkspaceFileReferences(target, input.result),
@@ -1260,6 +1277,9 @@ export function createPlanExecutionEvidenceEntry(input: {
           kind: "cmd",
           observationStatus: "failed",
           ...(semantics.portConflict ? { portConflict: true } : {}),
+          ...(semantics.portConflict && extractLocalDevServerPort(input.result) !== null
+            ? { devServerPort: extractLocalDevServerPort(input.result) as number }
+            : {}),
         };
       }
       if (
@@ -1294,6 +1314,9 @@ export function createPlanExecutionEvidenceEntry(input: {
         : {}),
       ...(ptyRuntime?.terminalBusy ? { terminalBusy: true } : {}),
       ...(ptyRuntime?.portConflict ? { portConflict: true } : {}),
+      ...((extractLocalDevServerPort(input.result) ?? extractLocalDevServerPort(target)) !== null
+        ? { devServerPort: (extractLocalDevServerPort(input.result) ?? extractLocalDevServerPort(target)) as number }
+        : {}),
     };
   }
   if (PTY_OBSERVATION_EVIDENCE_TOOLS.has(input.toolName)) {
@@ -1311,6 +1334,9 @@ export function createPlanExecutionEvidenceEntry(input: {
         : {}),
       ...(observation.terminalBusy ? { terminalBusy: true } : {}),
       ...(observation.portConflict ? { portConflict: true } : {}),
+      ...(extractLocalDevServerPort(observation.url || input.result) !== null
+        ? { devServerPort: extractLocalDevServerPort(observation.url || input.result) as number }
+        : {}),
     };
   }
   if (sourceToolLooksLikeBrowserAutomation(input.toolName)) {
@@ -1358,12 +1384,20 @@ export function createPlanExecutionFailureEntry(input: {
   toolName: string;
   target: string;
   error: string;
+  transactionId?: string;
+  runId?: string;
+  planTaskId?: string;
+  requirementRef?: string;
 }): PlanExecutionEvidenceEntry | null {
   const target = String(input.target || "").trim();
   if (!target || isPlanArtifactPath(target)) return null;
   const timestamp = Date.now();
   const base = {
     id: `failure-${timestamp}-${Math.random().toString(36).slice(2, 8)}`,
+    ...(input.transactionId ? { transactionId: input.transactionId } : {}),
+    ...(input.runId ? { runId: input.runId } : {}),
+    ...(input.planTaskId?.trim() ? { planTaskId: input.planTaskId.trim() } : {}),
+    ...(input.requirementRef?.trim() ? { requirementRef: input.requirementRef.trim() } : {}),
     value: target,
     target,
     references: extractWorkspaceFileReferences(target, input.error),
@@ -1385,6 +1419,9 @@ export function createPlanExecutionFailureEntry(input: {
       kind: "cmd",
       observationStatus: "failed",
       ...(semantics.portConflict ? { portConflict: true } : {}),
+      ...(semantics.portConflict && extractLocalDevServerPort(input.error) !== null
+        ? { devServerPort: extractLocalDevServerPort(input.error) as number }
+        : {}),
     };
   }
   if (input.toolName === "run_command") {
@@ -1427,8 +1464,10 @@ export function appendPlanEvidenceEntry(
   ) {
     return [...ledger, entry].slice(-200);
   }
-  const entryKey = `${entry.kind}:${normalizePlanEvidenceValue(entry.value)}:${entry.sourceTool}`;
-  if (ledger.some((item) => `${item.kind}:${normalizePlanEvidenceValue(item.value)}:${item.sourceTool}` === entryKey)) {
+  const entryKey = `${entry.transactionId || "legacy"}:${entry.planTaskId || entry.requirementRef || "unscoped"}:${entry.kind}:${normalizePlanEvidenceValue(entry.value)}:${entry.sourceTool}`;
+  if (ledger.some((item) =>
+    `${item.transactionId || "legacy"}:${item.planTaskId || item.requirementRef || "unscoped"}:${item.kind}:${normalizePlanEvidenceValue(item.value)}:${item.sourceTool}` === entryKey
+  )) {
     return ledger;
   }
   return [...ledger, entry].slice(-200);

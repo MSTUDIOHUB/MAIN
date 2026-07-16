@@ -1,5 +1,3 @@
-import { workspacePathsReferToSameFile } from "../../workspacePaths";
-
 export type RecentLoopGuardToolCall = {
   name: string;
   argsKey: string;
@@ -11,15 +9,7 @@ export type RecentTargetProgressToolCall = {
   family: "edit" | "verify" | "other";
 };
 
-export interface CrossIterationFileReadObservation {
-  path: string;
-  versionToken: string;
-  count: number;
-}
-
 export interface AgentLoopGuardRuntimeState {
-  crossIterationFileReads: Map<string, CrossIterationFileReadObservation>;
-  successfulEditTargetsSinceVerification: Map<string, number>;
   lastNoProgressBatchSignature: string;
   noProgressBatchRepeatCount: number;
   consecutiveReadFileOnlyCacheHits: number;
@@ -47,8 +37,6 @@ export type ToolFailureSignatureResult = {
 
 export function createAgentLoopGuardRuntimeState(): AgentLoopGuardRuntimeState {
   return {
-    crossIterationFileReads: new Map(),
-    successfulEditTargetsSinceVerification: new Map(),
     lastNoProgressBatchSignature: "",
     noProgressBatchRepeatCount: 0,
     consecutiveReadFileOnlyCacheHits: 0,
@@ -83,19 +71,6 @@ export function applyNoProgressTrackingRuntimeState(
     consecutiveReadFileOnlyCacheHits: input.consecutiveReadFileOnlyCacheHits,
     lastReadFileOnlyObservationSignature: input.lastReadFileOnlyObservationSignature,
   };
-}
-
-export function clearCrossIterationReadTrackingForTarget(
-  state: AgentLoopGuardRuntimeState,
-  target?: string | null,
-): AgentLoopGuardRuntimeState {
-  if (!target) return state;
-  for (const [key, observation] of state.crossIterationFileReads) {
-    if (workspacePathsReferToSameFile(observation.path, target)) {
-      state.crossIterationFileReads.delete(key);
-    }
-  }
-  return state;
 }
 
 export function applyToolFailureSignatureRuntimeState(

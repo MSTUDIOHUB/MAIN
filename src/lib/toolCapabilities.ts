@@ -48,7 +48,6 @@ export interface ToolCallRiskContext {
 
 export interface ToolIntentFilterOptions {
   runtimeIntent?: ResolvedUserIntent;
-  planApproved?: boolean;
 }
 
 const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set(["write_file", "replace_in_file"]);
@@ -715,9 +714,7 @@ export function filterToolDefinitionsForIntent(
   registry: ToolCapabilityRegistry,
   options: ToolIntentFilterOptions = {},
 ): ToolDefinition[] {
-  const effectiveIntent =
-    options.runtimeIntent ??
-    (intent === "plan" && options.planApproved ? "execute" : intent);
+  const effectiveIntent = options.runtimeIntent ?? intent;
 
   return tools.filter((tool) => {
     const name = tool.function.name;

@@ -1,6 +1,5 @@
 import { executeToolCallPhase } from "./toolCallExecutionPhase";
 import { handleToolResultRecoveryPhase } from "./toolResultRecoveryPhase";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import type { AgentLoopEvidenceRuntimeState } from "./evidenceRuntimeState";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import type { AgentLoopGuardRuntimeState } from "./loopGuardRuntimeState";
@@ -36,7 +35,6 @@ export type ToolIterationPhaseResult = {
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   unityMcpRuntimeState: UnityMcpRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   completionAudit?: {
     completedCount: number;
     totalCount: number;
@@ -58,7 +56,6 @@ export async function handleToolIterationPhase(
       recoveryPromptState: toolCallPhase.recoveryPromptState,
       unityMcpRuntimeState: toolCallPhase.unityMcpRuntimeState,
       evidenceRuntimeState: toolCallPhase.evidenceRuntimeState,
-      approvedPlanRecoveryState: toolCallPhase.approvedPlanRecoveryState,
     };
   }
 
@@ -69,7 +66,6 @@ export async function handleToolIterationPhase(
     executeRecoveryState: toolCallPhase.executeRecoveryState,
     recoveryPromptState: toolCallPhase.recoveryPromptState,
     evidenceRuntimeState: toolCallPhase.evidenceRuntimeState,
-    approvedPlanRecoveryState: toolCallPhase.approvedPlanRecoveryState,
     results: toolCallPhase.allResults,
     toolArgsByCallId: toolCallPhase.toolArgsByCallId,
     toolFailureSignatures: toolCallPhase.toolFailureSignatures,
@@ -91,7 +87,6 @@ export async function handleToolIterationPhase(
     recoveryPromptState: toolResultRecoveryPhase.recoveryPromptState,
     unityMcpRuntimeState: toolCallPhase.unityMcpRuntimeState,
     evidenceRuntimeState: toolCallPhase.evidenceRuntimeState,
-    approvedPlanRecoveryState: toolResultRecoveryPhase.approvedPlanRecoveryState,
     ...(toolResultRecoveryPhase.completionAudit
       ? { completionAudit: toolResultRecoveryPhase.completionAudit }
       : {}),

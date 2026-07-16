@@ -1,4 +1,7 @@
-import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import {
+  hasPendingApprovedPlanSourceMutation,
+  type PlanToolActivitySummary,
+} from "../../planExecutionRecovery";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import {
@@ -13,7 +16,7 @@ import {
 } from "../../orchestrator/agentRecovery";
 import {
   getOriginalUserPromptForPlanFallback,
-  hasPlanUserContextObservation,
+  hasPlanVisualContextGrounding,
   logAgentEvent,
 } from "../../orchestrator";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
@@ -43,7 +46,6 @@ export type ReasoningDominatedNoToolRecoveryResult = {
   consecutiveReasoningDominatedCount: number;
   planReasoningOnlyRecoveryPasses: number;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
-  approvedPlanActionOnlyRecoveryActive: boolean;
 };
 
 export function handleReasoningDominatedNoToolRecovery(input: {
@@ -63,7 +65,6 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   planReasoningOnlyRecoveryPasses: number;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   consecutiveReasoningDominatedCount: number;
-  approvedPlanActionOnlyRecoveryActive: boolean;
   setPlanRuntimePhase: SetPlanRuntimePhase;
   activateExecuteRecovery: ActivateExecuteRecovery;
 }): ReasoningDominatedNoToolRecoveryResult {
@@ -79,7 +80,6 @@ export function handleReasoningDominatedNoToolRecovery(input: {
     assistantMsgId,
     turnInputContextSignals,
     recentPlanToolActivity,
-    lastAssistantTextForCheckpoint,
     planEvidenceRecoveryPasses,
     setPlanRuntimePhase,
     activateExecuteRecovery,
@@ -88,7 +88,6 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   let planReasoningOnlyRecoveryPasses = input.planReasoningOnlyRecoveryPasses;
   let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
   let consecutiveReasoningDominatedCount = input.consecutiveReasoningDominatedCount;
-  let approvedPlanActionOnlyRecoveryActive = input.approvedPlanActionOnlyRecoveryActive;
 
   const finish = (
     status: ReasoningDominatedNoToolRecoveryResult["status"],
@@ -97,7 +96,6 @@ export function handleReasoningDominatedNoToolRecovery(input: {
     consecutiveReasoningDominatedCount,
     planReasoningOnlyRecoveryPasses,
     planEvidenceRecoveryObjective,
-    approvedPlanActionOnlyRecoveryActive,
   });
 
   if (
@@ -113,9 +111,9 @@ export function handleReasoningDominatedNoToolRecovery(input: {
       userGoal: getOriginalUserPromptForPlanFallback(callbacks),
       userContext: turnInputContextSignals,
       recentToolActivity: recentPlanToolActivity,
-      hasObservedUserContext: hasPlanUserContextObservation(
+      hasGroundedVisualContext: hasPlanVisualContextGrounding(
         callbacks.getMessages() as AgentMessage[],
-        lastAssistantTextForCheckpoint ?? undefined,
+        callbacks.getCurrentTurnId?.(),
       ),
     });
     const targetedRecoveryPasses = Math.max(
@@ -201,20 +199,22 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   if (consecutiveReasoningDominatedCount >= 2) {
     callbacks.onNonActionableStop(
       buildReasoningDominatedPauseMessage(callbacks.getPreferredLanguage(), workflowMode),
-      workflowMode === "plan" ? "incomplete_plan" : "no_output",
+      callbacks.getIsPlanApproved() || workflowMode === "plan"
+        ? "incomplete_plan"
+        : "no_output",
     );
     callbacks.onStatusChange("idle");
     return finish("stopped");
   }
 
-  if (workflowMode === "plan" && callbacks.getIsPlanApproved()) {
-    approvedPlanActionOnlyRecoveryActive = true;
-    logAgentEvent("approved_plan_reasoning_recovery_tool_surface", {
-      iteration,
-      recoveryToolSurface: "approved_plan_action_only",
-      allowFileRead: false,
-    });
-  } else if (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) {
+  const shouldActivateMutationRecovery =
+    workflowMode === "edit" &&
+    isMutationRuntimeIntent(runtimeIntent) &&
+    (!callbacks.getIsPlanApproved() || hasPendingApprovedPlanSourceMutation(
+      callbacks.getPlanTasks(),
+      callbacks.getPlanExecutionEvidenceLedger(),
+    ));
+  if (shouldActivateMutationRecovery) {
     activateExecuteRecovery("mutation_first", "reasoning_dominated_recovery", {
       consecutiveReasoningDominatedCount,
       contentChars: streamResult.content.length,

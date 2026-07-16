@@ -58,14 +58,15 @@ export async function runGitStatusTool(
 }
 
 export async function runGitDiffTool(
-  args: Record<string, unknown>,
+  args: Record<string, unknown> | null | undefined,
   workspace: string,
 ): Promise<string> {
-  const path = typeof args.path === "string" && args.path.trim() ? args.path.trim() : undefined;
-  const filter = typeof args.filter === "string" && args.filter.trim() ? args.filter.trim() : undefined;
-  const maxFiles = clampInteger(args.max_files ?? args.maxFiles, 20, 1, 60);
-  const maxChars = clampInteger(args.max_chars ?? args.maxChars, 24_000, 2_000, 80_000);
-  const contextLines = clampInteger(args.context_lines ?? args.contextLines, 3, 0, 12);
+  const normalizedArgs = args && typeof args === "object" && !Array.isArray(args) ? args : {};
+  const path = typeof normalizedArgs.path === "string" && normalizedArgs.path.trim() ? normalizedArgs.path.trim() : undefined;
+  const filter = typeof normalizedArgs.filter === "string" && normalizedArgs.filter.trim() ? normalizedArgs.filter.trim() : undefined;
+  const maxFiles = clampInteger(normalizedArgs.max_files ?? normalizedArgs.maxFiles, 20, 1, 60);
+  const maxChars = clampInteger(normalizedArgs.max_chars ?? normalizedArgs.maxChars, 24_000, 2_000, 80_000);
+  const contextLines = clampInteger(normalizedArgs.context_lines ?? normalizedArgs.contextLines, 3, 0, 12);
   const allEntries = await getGitDiff(workspace, path, filter);
   const selected = allEntries.slice(0, maxFiles);
   let remainingChars = maxChars;
@@ -95,6 +96,8 @@ export async function runGitDiffTool(
     returnedFiles: entries.length,
     entries,
     truncated: outputTruncated,
-    note: "Structured HEAD-to-worktree diff, including staged, unstaged, and untracked changes. Use path to narrow large results.",
+    note: allEntries.length === 0
+      ? "No HEAD-to-worktree differences matched this request. The empty result is valid and needs no pagination."
+      : "Structured HEAD-to-worktree diff, including staged, unstaged, and untracked changes. Use path to narrow large results.",
   });
 }

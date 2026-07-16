@@ -1,11 +1,8 @@
 import {
-  buildExecutePatchMismatchFingerprint,
   isExecutePatchMismatchRecoveryActivity,
-  requestedRangeFromReadObservationSignature,
   type ExecutionDecisionCheckpoint,
   type ExecuteRecoveryMode,
   type PatchRecoveryMismatchEvidence,
-  type RecoveryReadLease,
 } from "../../executeRecoveryTools";
 import type { FileReadObservationIdentity } from "../fileReadCache";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
@@ -29,19 +26,19 @@ interface MutationFailureResultLike {
 }
 
 /**
- * Complete recovery action for one mutation preflight mismatch.
- *
- * The caller must not independently choose a mode, lease, or checkpoint. A
- * failed patch/search mutation always rebinds one exact source observation
- * before another mutation attempt. Repeating the same target/range/version is
- * bounded later by the lease identity and protocol no-progress counter.
+ * Complete recovery action for one mutation preflight mismatch. A failed
+ * patch stays in the same execution transaction and reuses the versioned
+ * source observation already in context. read_file remains available through
+ * the stable execution surface; its cache decides whether a later request is
+ * a changed/missing window or an unchanged stub. No forced cache bypass is
+ * created here.
  */
 export interface DirectMutationPreflightRecoveryDecision {
-  mode: "patch_recovery_read";
+  mode: "mutation_first";
   reason: MutationPreflightRecoveryReason;
   target: string;
-  readLease: RecoveryReadLease;
-  sourceObservationKey: null;
+  readLease: null;
+  sourceObservationKey: string | null;
   decisionCheckpoint: ExecutionDecisionCheckpoint;
 }
 
@@ -95,14 +92,11 @@ function retainedObservationForTarget(
 export function resolveDirectMutationPreflightRecovery(input: {
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
-  isPlanApproved: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
   retainedSourceObservation?: FileReadObservationIdentity | null;
   results: MutationFailureResultLike[];
 }): DirectMutationPreflightRecoveryDecision | null {
-  const eligibleWorkflow =
-    input.workflowMode === "edit" ||
-    (input.workflowMode === "plan" && input.isPlanApproved);
+  const eligibleWorkflow = input.workflowMode === "edit";
   if (
     !eligibleWorkflow ||
     !isMutationRuntimeIntent(input.runtimeIntent) ||
@@ -124,34 +118,20 @@ export function resolveDirectMutationPreflightRecovery(input: {
       input.retainedSourceObservation,
       target,
     );
-    const requestedRange = mismatchEvidence?.requestedRange ||
-      requestedRangeFromReadObservationSignature(
-        retainedObservation?.requestSignature || "",
-      ) ||
-      { startLine: 1, maxLines: 180 };
     const observedVersion = mismatchEvidence?.observedVersion ||
       retainedObservation?.versionToken ||
       null;
-    const mismatchFingerprint = mismatchEvidence?.mismatchFingerprint ||
-      buildExecutePatchMismatchFingerprint({ reason, target });
-    const readLease: RecoveryReadLease = {
-      purpose: "patch_recovery",
-      target,
-      requestedRange,
-      observedVersion,
-      mismatchFingerprint,
-      state: "available",
-    };
+    const sourceObservationKey = retainedObservation?.key || null;
     return {
-      mode: "patch_recovery_read",
+      mode: "mutation_first",
       reason,
       target,
-      readLease,
-      sourceObservationKey: null,
+      readLease: null,
+      sourceObservationKey,
       decisionCheckpoint: {
         expectedTarget: target,
-        sourceObservationKey: null,
-        nextRequiredCapability: "targeted_read",
+        sourceObservationKey,
+        nextRequiredCapability: "mutation",
         evidenceVersion: observedVersion,
       },
     };

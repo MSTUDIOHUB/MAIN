@@ -39,8 +39,9 @@ const sanitizer = loadTs(path.join(workspaceRoot, "src/lib/ptyOutputSanitizer.ts
 const ipc = loadTs(path.join(workspaceRoot, "src/lib/ipc.ts"));
 const toolExecutor = loadTs(path.join(workspaceRoot, "src/lib/toolExecutor.ts"));
 const ptyCommandRuntime = loadTs(path.join(workspaceRoot, "src/lib/ptyCommandRuntime.ts"));
-const recoveryTools = loadTs(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
+const recoveryTools = loadTs(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
 const planEvidence = loadTs(path.join(workspaceRoot, "src/lib/planEvidence.ts"));
+const verificationEvidence = loadTs(path.join(workspaceRoot, "src/lib/verificationEvidence.ts"));
 
 test("PTY observation analysis distinguishes waiting, readiness, and later failure", () => {
   const waiting = devServerRuntime.analyzePtyObservationResult(JSON.stringify({
@@ -240,6 +241,7 @@ test("readiness stays sticky for one PTY generation and a healthy existing servi
     sourceTool: "execute_command",
     observationStatus: "failed",
     portConflict: true,
+    devServerPort: 1420,
     createdAt: 4,
   };
   const conflicted = devServerRuntime.resolveDevServerRuntimeState([conflict]);
@@ -252,6 +254,7 @@ test("readiness stays sticky for one PTY generation and a healthy existing servi
     kind: "cmd",
     value: "curl -fsS http://localhost:1420/",
     sourceTool: "run_command",
+    devServerPort: 1420,
     createdAt: 5,
   };
   const reused = devServerRuntime.resolveDevServerRuntimeState([conflict, healthyProbe]);
@@ -259,6 +262,17 @@ test("readiness stays sticky for one PTY generation and a healthy existing servi
   assert.equal(reused.url, "http://localhost:1420/");
   assert.equal(reused.portConflict, false);
   assert.equal(reused.nextCapability, "browser");
+
+  const wrongPortProbe = {
+    ...healthyProbe,
+    id: "wrong-port-probe",
+    value: "curl -fsS http://localhost:9999/",
+    devServerPort: 9999,
+  };
+  const stillConflicted = devServerRuntime.resolveDevServerRuntimeState([conflict, wrongPortProbe]);
+  assert.equal(stillConflicted.status, "failed");
+  assert.equal(stillConflicted.portConflict, true);
+  assert.equal(stillConflicted.nextCapability, "reconcile");
 });
 
 test("a running execute_command starts a new generation and cannot inherit old readiness", () => {
@@ -444,6 +458,81 @@ test("browser validation adopts the runtime-observed local origin", () => {
   });
   assert.equal(corrected.action, "correct");
   assert.equal(corrected.url, "http://localhost:1420/");
+
+  const correctedFromFileUrl = devServerRuntime.resolveBrowserValidationPreflight({
+    requestedUrl: "file:///tmp/unrelated.html",
+    ledger: [{
+      id: "ready",
+      kind: "dev_server_url",
+      value: "http://localhost:1420/",
+      sourceTool: "read_pty_since",
+      observationStatus: "ready",
+      createdAt: 2,
+    }],
+  });
+  assert.equal(correctedFromFileUrl.action, "correct");
+  assert.equal(correctedFromFileUrl.url, "http://localhost:1420/");
+});
+
+test("completion rejects a health probe from another origin without inventing a browser obligation", () => {
+  const conflict = {
+    id: "conflict",
+    kind: "cmd",
+    value: "npm run dev -- --port 1420",
+    sourceTool: "execute_command",
+    observationStatus: "failed",
+    portConflict: true,
+    devServerPort: 1420,
+    createdAt: 1,
+  };
+  const wrongProbe = {
+    id: "probe-9999",
+    kind: "cmd",
+    value: "curl -fsS http://localhost:9999/",
+    sourceTool: "run_command",
+    devServerPort: 9999,
+    createdAt: 2,
+  };
+  const wrongProbeAudit = verificationEvidence.buildExecuteEvidenceClosureAudit({
+    ledger: [conflict, wrongProbe],
+    validationExpected: true,
+    mutationExpected: false,
+  });
+  assert.equal(wrongProbeAudit.gap, "unreconciled_failure");
+
+  const launch = {
+    id: "launch",
+    kind: "cmd",
+    value: "npm run dev -- --port 1420",
+    sourceTool: "execute_command",
+    observationStatus: "pending",
+    foregroundGeneration: 7,
+    devServerPort: 1420,
+    createdAt: 3,
+  };
+  const ready = {
+    id: "ready",
+    kind: "dev_server_url",
+    value: "http://localhost:1420/",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 7,
+    devServerPort: 1420,
+    createdAt: 4,
+  };
+  const wrongPage = {
+    id: "wrong-page",
+    kind: "browser_dom",
+    value: "file:///tmp/unrelated.html",
+    sourceTool: "browser_evaluate",
+    createdAt: 5,
+  };
+  const wrongPageAudit = verificationEvidence.buildExecuteEvidenceClosureAudit({
+    ledger: [launch, ready, wrongPage],
+    validationExpected: true,
+    mutationExpected: false,
+  });
+  assert.equal(wrongPageAudit.gap, "none");
 });
 
 test("volatile terminal observations are never eligible for the read-only cache", () => {
@@ -455,18 +544,25 @@ test("volatile terminal observations are never eligible for the read-only cache"
   assert.equal(cachePolicy.shouldCacheReadOnlyToolResult("read_file"), true);
 });
 
-test("action-only Plan recovery preserves the PTY process lifecycle surface", () => {
+test("the unified execute recovery surface preserves the PTY process lifecycle", () => {
   const readOnlyTools = new Set(["read_pty_tail", "get_pty_status"]);
+  const contract = recoveryTools.resolveExecuteRecoveryActionContract("validation_only", {
+    devServerStatus: "running",
+    devServerNextCapability: "observe_pty",
+  });
   for (const name of [
-    "execute_command",
     "send_pty_input",
     "read_pty_buffer",
     "read_pty_tail",
     "read_pty_since",
     "get_pty_status",
   ]) {
-    assert.equal(recoveryTools.isApprovedPlanRecoveryToolName(name, readOnlyTools), true, name);
+    assert.equal(recoveryTools.isExecuteRecoveryToolName(name, readOnlyTools, { contract }), true, name);
   }
+  assert.equal(
+    recoveryTools.isExecuteRecoveryToolName("execute_command", readOnlyTools, { contract }),
+    false,
+  );
 });
 
 test("PTY sanitizer preserves warnings cleared by carriage-return and strips terminal control", () => {
@@ -506,6 +602,41 @@ test("get_pty_status sanitation lets a newer ANSI-decorated VITE launch supersed
   assert.match(status.tail, /Error: Port 1420 is already in use/);
   assert.equal(observation.status, "ready");
   assert.equal(observation.url, "http://localhost:1420/");
+});
+
+test("read_pty_buffer includes current PTY generation and output sequence", async () => {
+  const originalReadPtyBuffer = ipc.readPtyBuffer;
+  const originalGetPtyStatus = ipc.getPtyStatus;
+  ipc.readPtyBuffer = async () => "VITE ready in 25 ms\nLocal: http://localhost:1420/";
+  ipc.getPtyStatus = async () => ({
+    active: true,
+    running: true,
+    foregroundState: "busy",
+    foregroundGeneration: 11,
+    bufferStartOffset: 20,
+    bufferEndOffset: 88,
+    bufferBytes: 68,
+    tail: "ready",
+  });
+  try {
+    const raw = await toolExecutor.executeTool(
+      "read_pty_buffer",
+      { max_chars: 1000 },
+      workspaceRoot,
+      "pty-buffer-identity-test",
+    );
+    const payload = JSON.parse(raw);
+    assert.equal(payload.foregroundGeneration, 11);
+    assert.equal(payload.startOffset, 20);
+    assert.equal(payload.endOffset, 88);
+    const observation = devServerRuntime.analyzePtyObservationResult(raw);
+    assert.equal(observation.foregroundGeneration, 11);
+    assert.equal(observation.outputSequence, 88);
+    assert.equal(observation.status, "ready");
+  } finally {
+    ipc.readPtyBuffer = originalReadPtyBuffer;
+    ipc.getPtyStatus = originalGetPtyStatus;
+  }
 });
 
 test("PTY command admission rejects shell commands while a foreground process owns the terminal", () => {

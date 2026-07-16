@@ -22,6 +22,12 @@ test("loop runtime actions own mutable recovery and phase reducers", () => {
   assert.match(actionsSource, /activateExecuteRecoveryRuntimeState\(/);
   assert.match(actionsSource, /expectedTarget/);
   assert.match(actionsSource, /repeatedTargets\.length === 1/);
+  assert.match(actionsSource, /hasExplicitSourceObservationKey[\s\S]*?Object\.prototype\.hasOwnProperty\.call/);
+  assert.match(
+    actionsSource,
+    /const sourceObservationKey = hasExplicitSourceObservationKey[\s\S]*?explicitSourceObservationKey[\s\S]*?retainedObservation\?\.key/,
+    "an explicit null must clear stale pre-mutation source ownership",
+  );
   assert.match(actionsSource, /patchRecoveryLeaseIdentityMatches\(/);
   assert.match(actionsSource, /registerExecuteRecoveryProtocolNoProgress\(/);
   assert.match(
@@ -30,7 +36,7 @@ test("loop runtime actions own mutable recovery and phase reducers", () => {
   );
   assert.match(actionsSource, /activateChatFinalSynthesisState\(/);
   assert.match(actionsSource, /clearExecuteRecoveryRuntimeState\(stateOverride\)/);
-  assert.match(actionsSource, /clearCrossIterationReadTrackingForTarget\(/);
+  assert.doesNotMatch(actionsSource, /clearCrossIterationReadTrackingForTarget\(/);
   assert.match(actionsSource, /applyPlanRuntimePhase\(/);
   assert.match(actionsSource, /buildPlanRuntimeCapsuleNarration\(/);
   assert.match(actionsSource, /onPlanRuntimeNarration\?\./);

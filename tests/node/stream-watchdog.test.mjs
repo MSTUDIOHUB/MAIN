@@ -60,6 +60,7 @@ const {
   createStreamMaxElapsedTimeoutError,
   createStreamNoVisibleTokenTimeoutError,
   buildPlanExplorationBudget,
+  computeContextForceReason,
   isReasoningDominatedLengthResult,
   isReasoningDominatedNoActionResult,
   isStreamWatchdogTimeoutMessage,
@@ -67,13 +68,16 @@ const {
   shouldDeferNoProgressStopToPlanReadOnlyConvergence,
   shouldUsePlanNoVisibleTokenWatchdog,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
+const streamInvocationSource = fsSync.readFileSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
+  "utf8",
+);
 const {
   shouldSuppressPlanTruncationWarning,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
-const {
-  resolveApprovedPlanRecoveryPreferredToolNames,
-  resolveRecoveryToolChoice,
-} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"));
+const { resolveRecoveryToolChoice } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
+);
 const {
   resolveExecuteRecoveryActionContract,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
@@ -136,6 +140,23 @@ test("exact messages sent to the model advance file-read eviction independently 
   });
   assert.deepEqual(activeMessages, messagesSentToLLM);
   assert.equal(state.contextEvictionEpoch, 4);
+});
+
+test("approved Plan provenance keeps execute compaction and stream bounds in edit workflow", () => {
+  const force = computeContextForceReason({
+    messages: [{ role: "tool", content: "x".repeat(40_000) }],
+    iteration: 6,
+    workflowMode: "edit",
+    isPlanApproved: true,
+    inputBudget: 20_000,
+    proactiveTriggerBudget: 20_000,
+  });
+  assert.equal(force.shouldForce, true);
+  assert.equal(force.reason, "approved_plan_loop_interval");
+  assert.doesNotMatch(
+    streamInvocationSource,
+    /workflowMode === "plan"\s*&&\s*callbacks\.getIsPlanApproved\(\)/,
+  );
 });
 
 test("classifies no-visible-token stream timeout as a plan watchdog timeout", () => {
@@ -271,20 +292,10 @@ test("classifies recovery stream max elapsed timeout as watchdog pause", () => {
   assert.equal(isStreamWatchdogTimeoutMessage(error.message), true);
 });
 
-test("approved plan action recovery requires a native tool call even while execute recovery is normal", () => {
+test("normal execution does not require a tool before recovery is activated", () => {
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-    llmToolNames: ["read_file", "apply_patch", "run_command"],
-    forceXmlTools: false,
-  }), "required");
-  assert.equal(resolveRecoveryToolChoice({
-    isExecuteRecoveryEligible: false,
-    executeRecoveryMode: "normal",
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     llmToolNames: ["read_file", "apply_patch", "run_command"],
     forceXmlTools: false,
   }), undefined);
@@ -294,8 +305,6 @@ test("preapproval plan quality recovery requires a native plan artifact call", (
   const common = {
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     llmToolNames: ["read_file", "write_plan"],
     forceXmlTools: false,
   };
@@ -311,31 +320,60 @@ test("preapproval plan quality recovery requires a native plan artifact call", (
 });
 
 test("local recovery binds only genuinely single-capability phases", () => {
+  const streamInvocationSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(
+    streamInvocationSource,
+    /nextRequiredCapability\s*===/,
+    "the provider transport must not maintain a second capability-to-tool mapping",
+  );
+  assert.deepEqual(
+    resolveExecuteRecoveryActionContract("normal").toolCallRequirement,
+    { kind: "optional" },
+  );
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "mutation_first",
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     llmToolNames: ["apply_patch", "replace_in_file", "write_file"],
     forceXmlTools: false,
     preferExplicitFunction: true,
   }), "required");
 
+  const targetedReadContract = resolveExecuteRecoveryActionContract("patch_recovery_read", {
+    expectedTarget: "src/App.tsx",
+    readLease: {
+      purpose: "missing_window",
+      target: "src/App.tsx",
+      state: "available",
+    },
+  });
+  assert.deepEqual(targetedReadContract.toolCallRequirement, {
+    kind: "required_named",
+    toolName: "read_file",
+  });
   assert.deepEqual(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "patch_recovery_read",
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     llmToolNames: ["read_file"],
     forceXmlTools: false,
     preferExplicitFunction: true,
+    recoveryActionContract: targetedReadContract,
   }), { type: "function", function: { name: "read_file" } });
 
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "patch_recovery_read",
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["run_command"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+    recoveryActionContract: targetedReadContract,
+  }), "required", "a named requirement falls back to required-any when the tool is unavailable");
+
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: "patch_recovery_read",
     llmToolNames: ["read_file", "wait_subagents"],
     forceXmlTools: false,
     preferExplicitFunction: true,
@@ -358,8 +396,6 @@ test("local max-iteration continuation binds the first post-mutation action to r
   assert.deepEqual(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: decision.mode,
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     llmToolNames: ["read_file", "run_command"],
     forceXmlTools: false,
     preferExplicitFunction: true,
@@ -370,8 +406,6 @@ test("local recovery tool choice follows the contract next capability, not the l
   const common = {
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "action_plus_targeting",
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     forceXmlTools: false,
     preferExplicitFunction: true,
   };
@@ -419,77 +453,38 @@ test("local recovery tool choice follows the contract next capability, not the l
     recoveryActionContract: browser,
     llmToolNames: ["browser_evaluate"],
   }), { type: "function", function: { name: "browser_evaluate" } });
+  assert.deepEqual(resolveRecoveryToolChoice({
+    ...common,
+    recoveryActionContract: browser,
+    llmToolNames: ["browser_evaluate", "git_status", "read_file"],
+  }), { type: "function", function: { name: "browser_evaluate" } },
+  "an exact browser checkpoint must bind the browser even when the stable execution surface has other tools");
 
-  const postMutation = resolveExecuteRecoveryActionContract("validation_only", {
+  const migratedPostMutation = resolveExecuteRecoveryActionContract("validation_only", {
     readLease: {
       purpose: "post_mutation_verify",
       target: "src/App.tsx",
       state: "available",
     },
   });
-  assert.deepEqual(resolveRecoveryToolChoice({
+  assert.equal(migratedPostMutation.readLease, null);
+  assert.equal(migratedPostMutation.nextRequiredCapability, "validation");
+  assert.equal(resolveRecoveryToolChoice({
     ...common,
     executeRecoveryMode: "validation_only",
-    recoveryActionContract: postMutation,
+    recoveryActionContract: migratedPostMutation,
     llmToolNames: ["read_file"],
-  }), { type: "function", function: { name: "read_file" } });
+  }), "required", "legacy state must not force a redundant post-mutation reread");
 });
 
-test("broad validation recovery requires a tool without forcing finite command execution", () => {
-  assert.equal(resolveRecoveryToolChoice({
+test("validation recovery binds the command capability selected by the action contract", () => {
+  assert.deepEqual(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "validation_only",
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     llmToolNames: ["run_command", "execute_command", "browser_evaluate"],
     forceXmlTools: false,
     preferExplicitFunction: true,
-  }), "required");
-});
-
-test("approved plan action recovery preserves its multi-tool capability surface", () => {
-  const validationTasks = [{
-    id: "validate",
-    text: "Run a focused validation",
-    status: "pending",
-    evidence: [{ kind: "cmd", value: "focused validation command" }],
-    evidenceStatus: "missing",
-  }];
-  const validationPreferred = resolveApprovedPlanRecoveryPreferredToolNames({
-    tasks: validationTasks,
-    evidenceLedger: [],
-  });
-  assert.deepEqual(validationPreferred.slice(0, 2), ["run_command", "execute_command"]);
-  assert.equal(resolveRecoveryToolChoice({
-    isExecuteRecoveryEligible: false,
-    executeRecoveryMode: "normal",
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-    llmToolNames: ["apply_patch", "run_command", "browser_evaluate"],
-    forceXmlTools: false,
-    preferExplicitFunction: true,
-    approvedPlanRecoveryPreferredToolNames: validationPreferred,
-  }), "required");
-
-  const browserPreferred = resolveApprovedPlanRecoveryPreferredToolNames({
-    tasks: [{
-      ...validationTasks[0],
-      id: "browser",
-      text: "Check rendered DOM",
-      evidence: [{ kind: "browser_dom", value: "main dashboard" }],
-    }],
-    evidenceLedger: [],
-  });
-  assert.equal(resolveRecoveryToolChoice({
-    isExecuteRecoveryEligible: false,
-    executeRecoveryMode: "normal",
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-    llmToolNames: ["apply_patch", "run_command", "browser_evaluate"],
-    forceXmlTools: false,
-    preferExplicitFunction: true,
-    approvedPlanRecoveryPreferredToolNames: browserPreferred,
-  }), "required");
+  }), { type: "function", function: { name: "run_command" } });
 });
 
 test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {
@@ -501,16 +496,15 @@ test("approved plan watchdog timeout gets exactly one bounded native-tool recove
     runtimeIntent: "execute",
     isPlanApproved: true,
     isExecuteRecoveryEligible: false,
-    approvedPlanActionOnlyRecoveryActive: true,
-    approvedPlanNoToolRecoveryFileReadActive: false,
     llmToolCount: 7,
     forceXmlTools: false,
   };
   assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery(base), true);
-  assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery({
-    ...base,
-    approvedPlanActionOnlyRecoveryActive: false,
-  }), true, "normal approved execution also gets one bounded watchdog retry");
+  assert.equal(
+    shouldAttemptApprovedPlanStreamWatchdogRecovery(base),
+    true,
+    "normal approved execution gets one bounded watchdog retry",
+  );
   assert.equal(shouldAttemptApprovedPlanStreamWatchdogRecovery({
     ...base,
     forceXmlTools: true,

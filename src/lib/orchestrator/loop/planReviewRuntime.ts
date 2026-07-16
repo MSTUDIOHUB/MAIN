@@ -12,7 +12,6 @@ import { buildPlanApprovalIdentity } from "../../planApprovalIdentity";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { OrchestratorCallbacks } from "../types";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
 import {
   markPlanClosurePromptIssued,
   type PlanLoopRuntimeState,
@@ -62,8 +61,6 @@ export function createPlanReviewRuntimeHandlers(input: {
   getIteration: () => number;
   getPlanRuntimeState: () => PlanLoopRuntimeState;
   setPlanRuntimeState: (state: PlanLoopRuntimeState) => void;
-  getApprovedPlanRecoveryState: () => ApprovedPlanRecoveryRuntimeState;
-  setApprovedPlanRecoveryState: (state: ApprovedPlanRecoveryRuntimeState) => void;
   setPlanRuntimePhase: SetPlanRuntimePhase;
 }): PlanReviewRuntimeHandlers {
   const {

@@ -54,8 +54,12 @@ export function buildRepeatLoopSignature(name: string, argsKey: string): string 
 }
 
 const READ_ONLY_SHELL_TOOL_NAMES = new Set(["run_command", "execute_command"]);
-const READ_ONLY_SHELL_COMMAND_RE = /^(?:pwd|ls(?:\s|$)|find\s+|cat\s+|awk\b|sed\s+-n\b|grep\b|rg\b|head\b|tail\b|wc\b|cut\b|sort\b|uniq\b|diff\b|stat\b|file\b|strings\b|git\s+(?:status|diff|show|log|branch)\b)/i;
+// Keep sed admission intentionally narrow: only the common line-range print
+// form is inspection. Broader sed scripts may write through `w` or `-i` and
+// therefore remain outside the read-only recovery path.
+const READ_ONLY_SHELL_COMMAND_RE = /^(?:pwd|ls(?:\s|$)|find\s+|cat\s+|grep\b|rg\b|head\b|tail\b|wc\b|cut\b|uniq\b|diff\b|stat\b|file\b|strings\b|sed\s+-n\s+['"]?\d+(?:,\d+)?p['"]?(?:\s|$)|git\s+status\b)/i;
 const UNSAFE_SHELL_INSPECTION_RE = /(?:^|\s)(?:sudo|rm|mv|cp|chmod|chown|touch|mkdir|rmdir|git\s+(?:add|commit|checkout|switch|reset|clean|push|pull|merge|rebase)|npm|pnpm|yarn|bun|cargo|python|python3|node|sh|bash|zsh)\b/i;
+const MUTATING_INSPECTION_ARGUMENT_RE = /(?:^|\s)(?:-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)\b|--(?:output|ext-diff)(?:\s|=|$))/i;
 
 function getShellCommandArgument(args: Record<string, unknown>): string {
   const command = args.command ?? args.cmd ?? args.input;
@@ -88,6 +92,7 @@ export function isReadOnlyShellInspectionToolCall(
   return executableSegments.length > 0 &&
     executableSegments.every((segment) =>
       !UNSAFE_SHELL_INSPECTION_RE.test(segment) &&
+      !MUTATING_INSPECTION_ARGUMENT_RE.test(segment) &&
       READ_ONLY_SHELL_COMMAND_RE.test(segment)
     );
 }
@@ -182,10 +187,7 @@ export function getShellMutationTargetForLoopGuard(
   const openPath = command.match(/\bopen\(\s*(['"])([^'"]+)\1\s*,\s*(['"])[wa]/i);
   const openTarget = normalizeShellMutationPath(openPath?.[2] || "");
   if (openTarget) return `shell-write:${openTarget}`;
-
-  const filePath = command.match(/(?:^|\s)(\.?\/?[A-Za-z0-9_.@-][A-Za-z0-9_./@-]*\.(?:png|jpg|jpeg|gif|ico|icns|svg|json|md|txt|ts|tsx|js|jsx|rs|py|css|html|toml|yaml|yml))(?:\s|$|&&|;|\|)/i);
-  const fileTarget = normalizeShellMutationPath(filePath?.[1] || "");
-  return fileTarget ? `shell-write:${fileTarget}` : null;
+  return null;
 }
 
 function normalizeTargetKey(target: string): string {

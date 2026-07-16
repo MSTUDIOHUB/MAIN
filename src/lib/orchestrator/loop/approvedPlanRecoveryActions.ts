@@ -1,21 +1,14 @@
 import {
-  buildPlanNoProgressLoopPauseNotice,
   buildPlanProgressSignatureFromToolActivity,
   summarizeRepeatedPlanTargetsFromToolActivity,
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
-import {
-  describeApprovedPlanRecoveryToolSurface,
-  shouldAllowApprovedPlanRecoveryFileRead,
-} from "../../approvedPlanRecoveryTools";
-import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import type {
   PlanExecutionProgressPhase,
   PlanExecutionProgressUpdate,
 } from "../../workflowModels";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import {
-  buildApprovedPlanNoProgressStrategySwitchPrompt,
   isStreamWatchdogTimeoutMessage,
   logAgentEvent,
   truncateForLog,
@@ -32,77 +25,8 @@ type EmitTaskOrchestratorPhase = (
   extra?: Record<string, unknown>,
 ) => void;
 
-export function pauseApprovedPlanNoProgressLoop(input: {
-  callbacks: OrchestratorCallbacks;
-  iteration: number;
-  recentPlanToolActivity: PlanToolActivitySummary[];
-  emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
-  emitPlanExecutionProgress: EmitPlanExecutionProgress;
-  reason: string;
-  repeats: number;
-  remainingText?: string;
-  logContext?: Record<string, unknown>;
-}): void {
-  const {
-    callbacks,
-    iteration,
-    recentPlanToolActivity,
-    emitTaskOrchestratorPhase,
-    emitPlanExecutionProgress,
-  } = input;
-  const language = callbacks.getPreferredLanguage();
-  const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
-  const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
-  const nextStep = language === "zh"
-    ? "换目标、改为写入/命令/浏览器验证，或说明真实阻塞"
-    : "switch target, patch/run/browser-verify, or state the real blocker";
-  const repeats = Math.max(1, input.repeats);
-  const pauseNotice = buildPlanNoProgressLoopPauseNotice({
-    language,
-    repeats,
-    remainingTask: input.remainingText,
-    evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-    recentToolActivity: recentPlanToolActivity,
-    repeatedTargets,
-  });
-
-  logAgentEvent("loop_stop", {
-    reason: input.reason,
-    iteration,
-    repeats,
-    repeatedTargets,
-    progressSignature: truncateForLog(progressSignature, 220),
-    ...(input.logContext || {}),
-  });
-  emitTaskOrchestratorPhase("PAUSED", {
-    reason: input.reason,
-    iteration,
-    repeats,
-    remainingTask: input.remainingText || "",
-    repeatedTargets,
-  });
-  emitPlanExecutionProgress("paused", {
-    progressSignature,
-    repeatedTargets,
-    recoveryReason: input.reason,
-    nextStep,
-  });
-  callbacks.onNonActionableStop(
-    pauseNotice,
-    "no_action",
-    {
-      progressSignature,
-      repeatedTargets,
-      recoveryReason: input.reason,
-      nextStep,
-    },
-  );
-  callbacks.onStatusChange("idle");
-}
-
 export function pauseApprovedPlanStreamWatchdog(input: {
   callbacks: OrchestratorCallbacks;
-  workflowMode: "chat" | "edit" | "plan";
   iteration: number;
   recentPlanToolActivity: PlanToolActivitySummary[];
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
@@ -112,7 +36,6 @@ export function pauseApprovedPlanStreamWatchdog(input: {
 }): boolean {
   const {
     callbacks,
-    workflowMode,
     iteration,
     recentPlanToolActivity,
     emitTaskOrchestratorPhase,
@@ -120,7 +43,7 @@ export function pauseApprovedPlanStreamWatchdog(input: {
     message,
     logContext,
   } = input;
-  if (workflowMode !== "plan" || !callbacks.getIsPlanApproved() || !isStreamWatchdogTimeoutMessage(message)) {
+  if (!callbacks.getIsPlanApproved() || !isStreamWatchdogTimeoutMessage(message)) {
     return false;
   }
 
@@ -182,70 +105,4 @@ export function pauseApprovedPlanStreamWatchdog(input: {
   );
   callbacks.onStatusChange("idle");
   return true;
-}
-
-export function continueApprovedPlanWithStrategySwitch(input: {
-  callbacks: OrchestratorCallbacks;
-  iteration: number;
-  recentPlanToolActivity: PlanToolActivitySummary[];
-  approvedPlanNoProgressRecoveryAttempts: number;
-  emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
-  emitPlanExecutionProgress: EmitPlanExecutionProgress;
-  reason: string;
-  remainingText: string;
-  logContext?: Record<string, unknown>;
-}): {
-  approvedPlanNoProgressRecoveryAttempts: number;
-  approvedPlanActionOnlyRecoveryActive: true;
-} {
-  const {
-    callbacks,
-    iteration,
-    recentPlanToolActivity,
-    emitTaskOrchestratorPhase,
-    emitPlanExecutionProgress,
-  } = input;
-  const language = callbacks.getPreferredLanguage();
-  const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
-  const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
-  const allowFileRead = shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
-  const approvedPlanNoProgressRecoveryAttempts = input.approvedPlanNoProgressRecoveryAttempts + 1;
-  logAgentEvent("plan_execution_strategy_switch_reprompt", {
-    reason: input.reason,
-    iteration,
-    attempts: approvedPlanNoProgressRecoveryAttempts,
-    repeatedTargets,
-    progressSignature: truncateForLog(progressSignature, 220),
-    recoveryToolSurface: describeApprovedPlanRecoveryToolSurface(allowFileRead),
-    ...(input.logContext || {}),
-  });
-  emitTaskOrchestratorPhase("EXECUTE_STEP", {
-    reason: input.reason,
-    iteration,
-    attempts: approvedPlanNoProgressRecoveryAttempts,
-    repeatedTargets,
-  });
-  emitPlanExecutionProgress("running", {
-    progressSignature,
-    repeatedTargets,
-    recoveryReason: input.reason,
-    nextStep: language === "zh"
-      ? "下一轮保留行动工具和定向恢复读取；避免重复缓存目标，优先写入/命令/浏览器验证"
-      : "next turn keeps action tools and targeted recovery reads; avoid cached rereads and prioritize patching, commands, or browser validation",
-  });
-  callbacks.onStatusChange("running");
-  callbacks.appendMessage({
-    role: "user",
-    content: buildApprovedPlanNoProgressStrategySwitchPrompt({
-      language: MODEL_CONTROL_LANGUAGE,
-      remainingText: input.remainingText,
-      repeatedTargets,
-      recentToolActivity: recentPlanToolActivity,
-      allowFileRead,
-    }),
-  });
-  return {
-    approvedPlanNoProgressRecoveryAttempts,
-    approvedPlanActionOnlyRecoveryActive: true,
-  };
 }

@@ -9,21 +9,14 @@ import { classifyAssistantCompletion } from "../../normalizedTurn";
 import {
   fetchLLMStream,
   logAgentEvent,
-  MAX_NO_ACTION_RETRIES,
   prepareMessagesForToolProtocol,
   summarizeMessagesForDiagnostics,
   summarizeToolsForDiagnostics,
 } from "../../orchestrator";
-import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
+import type { ResolvedUserIntent } from "../../runIntent";
 import type { OpenAiToolChoice, StreamResult } from "../../streaming";
 import { annotateRequiredToolCallProtocolResult } from "../../requiredToolProtocol";
 import type { ToolDefinition } from "../../toolSchemas";
-import {
-  buildPlanTaskEvidenceAudit,
-  type PlanExecutionEvidenceEntry,
-  type PlanTask,
-} from "../../workflowModels";
-import { PolicyFactory } from "../policies/PolicyFactory";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { AgentMessage, FetchLLMStreamOptions, OrchestratorCallbacks } from "../types";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
@@ -38,54 +31,17 @@ export type PlanStreamWatchdogOptionsResolver = (
   nativeToolCount: number,
 ) => FetchLLMStreamOptions | undefined;
 
+// Shared timeout policy for the bounded approved-Plan watchdog retry. It no
+// longer activates or narrows an action-only tool surface.
 export const APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS = 45_000;
-
-export function resolveApprovedPlanRecoveryPreferredToolNames(input: {
-  tasks: PlanTask[];
-  evidenceLedger: PlanExecutionEvidenceEntry[];
-}): string[] {
-  const audit = buildPlanTaskEvidenceAudit({
-    tasks: input.tasks,
-    evidenceLedger: input.evidenceLedger,
-    preserveMissing: true,
-    highlightNext: true,
-  });
-  const evidenceKinds = new Set(
-    audit.remainingTasks.flatMap((task) => (task.evidence || []).map((item) => item.kind)),
-  );
-  const namedTools = audit.remainingTasks
-    .flatMap((task) => task.evidence || [])
-    .filter((item) => item.kind === "tool")
-    .map((item) => item.value)
-    .filter(Boolean);
-
-  const preferred: string[] = [...namedTools];
-  if (evidenceKinds.has("browser_dom") || evidenceKinds.has("browser_screenshot")) {
-    preferred.push("browser_evaluate");
-  }
-  if (evidenceKinds.has("cmd")) {
-    preferred.push("run_command", "execute_command");
-  }
-  if (evidenceKinds.has("dev_server_url")) {
-    preferred.push("execute_command", "browser_evaluate");
-  }
-  if (evidenceKinds.has("file") || evidenceKinds.has("deliverable") || evidenceKinds.has("text")) {
-    preferred.push("apply_patch", "replace_in_file", "write_file");
-  }
-
-  return [...new Set(preferred)];
-}
 
 export function resolveRecoveryToolChoice(input: {
   isExecuteRecoveryEligible: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
-  approvedPlanActionOnlyRecoveryActive: boolean;
-  approvedPlanNoToolRecoveryFileReadActive: boolean;
   llmToolNames: string[];
   forceXmlTools: boolean;
   preferExplicitFunction?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
-  approvedPlanRecoveryPreferredToolNames?: string[];
   recoveryActionContract?: RecoveryActionContract;
 }): OpenAiToolChoice | undefined {
   const availableToolNames = new Set(input.llmToolNames);
@@ -94,11 +50,7 @@ export function resolveRecoveryToolChoice(input: {
     resolveExecuteRecoveryActionContract(input.executeRecoveryMode);
   const executeRecoveryRequiresAction =
     input.isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
-  const approvedPlanRecoveryRequiresAction =
-    input.approvedPlanActionOnlyRecoveryActive ||
-    input.approvedPlanNoToolRecoveryFileReadActive;
   const requiresTool = executeRecoveryRequiresAction ||
-    approvedPlanRecoveryRequiresAction ||
     input.preapprovalPlanQualityRecoveryToolChoice === "required";
   if (!requiresTool) return undefined;
 
@@ -107,53 +59,13 @@ export function resolveRecoveryToolChoice(input: {
     // ahead of any new parent action. A named function choice would wrongly
     // quarantine this contract-owned coordination call.
     if (availableToolNames.has("wait_subagents")) return "required";
-    const firstAvailable = (candidates: string[]): string | null =>
-      candidates.find((name) => availableToolNames.has(name)) || null;
-    let selectedTool: string | null = null;
-    if (input.isExecuteRecoveryEligible) {
-      if (recoveryActionContract.nextRequiredCapability === "targeted_read") {
-        selectedTool = firstAvailable(["read_file"]);
-      } else if (recoveryActionContract.nextRequiredCapability === "mutation") {
-        // Mutation is a capability, not one concrete function. apply_patch,
-        // replace_in_file, write_file, and scoped MCP edits are equivalent
-        // legal implementations of this phase, so keep the call required but
-        // let the model choose from the already-filtered tool surface.
-        selectedTool = null;
-      } else if (recoveryActionContract.nextRequiredCapability === "observe_pty") {
-        // A running foreground process may be waiting for interactive input.
-        // Keep the call required, but do not bind compatibility models to a
-        // read-only observer and thereby hide send_pty_input forever.
-        selectedTool = null;
-      } else if (recoveryActionContract.nextRequiredCapability === "browser_validation") {
-        selectedTool = firstAvailable(["browser_evaluate"]);
-      } else if (recoveryActionContract.nextRequiredCapability === "launch_long_process") {
-        selectedTool = firstAvailable(["execute_command"]);
-      } else if (recoveryActionContract.nextRequiredCapability === "recover_process") {
-        // Failed/stopped processes need a choice between reading retained PTY
-        // diagnostics, repairing the current target, running a bounded check,
-        // or restarting. A forced execute_command would skip that evidence.
-        selectedTool = null;
-      } else if (recoveryActionContract.nextRequiredCapability === "reconcile_server") {
-        selectedTool = firstAvailable(["run_command"]);
-      } else if (input.executeRecoveryMode === "finite_validation_only") {
-        selectedTool = firstAvailable(["run_command"]);
-      } else if (recoveryActionContract.nextRequiredCapability === "validation") {
-        // This state can require a finite test, a long-lived dev server, a
-        // browser assertion, or a diff check. Binding local models to the
-        // first available function previously forced long-running `npm run
-        // dev` through run_command. Keep the call required but let the model
-        // select from the already-scoped validation surface.
-        selectedTool = null;
-      }
-    }
-    // Action-only Plan recovery can close different evidence kinds. Preferred
-    // names order the prompt/surface but do not turn a multi-capability phase
-    // into an exact function contract.
-    if (!selectedTool && input.approvedPlanNoToolRecoveryFileReadActive) {
-      selectedTool = firstAvailable(["read_file"]);
-    }
-    if (selectedTool) {
-      return { type: "function", function: { name: selectedTool } };
+    const requirement = recoveryActionContract.toolCallRequirement;
+    if (
+      input.isExecuteRecoveryEligible &&
+      requirement.kind === "required_named" &&
+      availableToolNames.has(requirement.toolName)
+    ) {
+      return { type: "function", function: { name: requirement.toolName } };
     }
   }
 
@@ -166,8 +78,7 @@ export type InitialStreamInvocationResult =
       streamResult: StreamResult;
       /** Exact logical message array passed to fetchLLMStream for this result. */
       messagesSentToLLM: AgentMessage[];
-    }
-  | { status: "stopped"; reason: "reasoning_dominated" };
+    };
 
 export async function invokeInitialStreamForIteration(input: {
   callbacks: OrchestratorCallbacks;
@@ -190,15 +101,12 @@ export async function invokeInitialStreamForIteration(input: {
   allowExecuteRecoveryFileRead: boolean;
   recoveryActionContract: RecoveryActionContract;
   isExecuteRecoveryEligible: boolean;
-  approvedPlanActionOnlyRecoveryActive: boolean;
-  approvedPlanNoToolRecoveryFileReadActive: boolean;
   finalTextOnlyStep: boolean;
   chatFinalSynthesisActive: boolean;
   chatFinalSynthesisReason: string;
   usedChatFinalSynthesisPrompt: boolean;
   markChatFinalSynthesisPromptUsed: () => void;
   recentToolActivity: PlanToolActivitySummary[];
-  consecutiveNoToolCount: number;
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   approvedPlanRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
@@ -224,15 +132,12 @@ export async function invokeInitialStreamForIteration(input: {
     allowExecuteRecoveryFileRead,
     recoveryActionContract,
     isExecuteRecoveryEligible,
-    approvedPlanActionOnlyRecoveryActive,
-    approvedPlanNoToolRecoveryFileReadActive,
     finalTextOnlyStep,
     chatFinalSynthesisActive,
     chatFinalSynthesisReason,
     usedChatFinalSynthesisPrompt,
     markChatFinalSynthesisPromptUsed,
     recentToolActivity,
-    consecutiveNoToolCount,
     getPlanStreamWatchdogOptions,
     approvedPlanRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
@@ -280,21 +185,13 @@ export async function invokeInitialStreamForIteration(input: {
   const baseStreamWatchdogOptions = getPlanStreamWatchdogOptions(llmTools.length) ?? {};
   const approvedPlanRecoveryStreamHardTimeoutActive =
     config.activeProfile === "local" &&
-    workflowMode === "plan" &&
     callbacks.getIsPlanApproved() &&
     runtimeIntent === "execute" &&
-    (isExecuteRecoveryEligible || approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive);
-  const recoveryStreamMaxElapsedMs =
-    approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive
-      ? Math.min(
-          APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS,
-          approvedPlanRecoveryStreamMaxElapsedMs,
-        )
-      : approvedPlanRecoveryStreamMaxElapsedMs;
+    isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
+  const recoveryStreamMaxElapsedMs = approvedPlanRecoveryStreamMaxElapsedMs;
   const childStreamBounded = (callbacks.getSubagentDepth?.() ?? 0) > 0;
   const normalApprovedLocalExecutionBounded =
     config.activeProfile === "local" &&
-    workflowMode === "plan" &&
     callbacks.getIsPlanApproved() &&
     runtimeIntent === "execute";
   const boundedNoVisibleMs = childStreamBounded || normalApprovedLocalExecutionBounded ? 45_000 : 0;
@@ -340,23 +237,14 @@ export async function invokeInitialStreamForIteration(input: {
       baseResolvedStreamWatchdogOptions,
       llmTools.length,
     );
-  const approvedPlanRecoveryPreferredToolNames = approvedPlanActionOnlyRecoveryActive
-    ? resolveApprovedPlanRecoveryPreferredToolNames({
-        tasks: callbacks.getPlanTasks(),
-        evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
-      })
-    : [];
   const recoveryToolChoice = resolveRecoveryToolChoice({
     isExecuteRecoveryEligible,
     executeRecoveryMode,
-    approvedPlanActionOnlyRecoveryActive,
-    approvedPlanNoToolRecoveryFileReadActive,
     llmToolNames: llmTools.map((tool) => tool.function.name),
     forceXmlTools,
     preferExplicitFunction: config.activeProfile === "local",
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
-    approvedPlanRecoveryPreferredToolNames,
     recoveryActionContract,
   });
   const policyCurrentMaxTokens =
@@ -405,7 +293,6 @@ export async function invokeInitialStreamForIteration(input: {
     allTools: summarizeToolsForDiagnostics(iterationAllTools),
     llmTools: summarizeToolsForDiagnostics(llmTools),
     toolChoice: recoveryToolChoice ?? null,
-    approvedPlanRecoveryPreferredToolNames,
     watchdog: {
       hardTimeoutMs: streamWatchdogOptions.noVisibleTokenTimeoutMs ?? null,
       label: streamWatchdogOptions.noVisibleTokenTimeoutLabel ?? null,
@@ -432,12 +319,6 @@ export async function invokeInitialStreamForIteration(input: {
         : null,
   });
 
-  const isExecute = isMutationRuntimeIntent(runtimeIntent);
-  const executionPolicy = PolicyFactory.createPolicy(config);
-  const responseSchema = (isExecute && config.activeProfile === "local")
-    ? executionPolicy.getResponseFormatSchema?.()
-    : undefined;
-
   const rawStreamResult = await fetchLLMStream(
     messagesForLLM,
     settings,
@@ -452,7 +333,6 @@ export async function invokeInitialStreamForIteration(input: {
       toolChoice: recoveryToolChoice,
       workflowMode,
       runtimeIntent,
-      responseFormat: responseSchema,
     },
   );
   const streamResult = annotateRequiredToolCallProtocolResult(
@@ -472,21 +352,6 @@ export async function invokeInitialStreamForIteration(input: {
       finishReason: streamResult.finishReason || null,
       visibleChars: streamResult.content.length,
     });
-  }
-
-  const totalOutputChars = streamResult.content.length + (streamResult.reasoningContent || "").length;
-  const isLengthTruncated = streamResult.finishReason === "length";
-  if (!isLengthTruncated && totalOutputChars > 200 && (!streamResult.toolCalls || streamResult.toolCalls.length === 0)) {
-    const reasoningRatio = (streamResult.reasoningContent || "").length / totalOutputChars;
-    if (reasoningRatio > 0.8 && consecutiveNoToolCount >= (config.activeProfile === "local" ? 4 : MAX_NO_ACTION_RETRIES)) {
-      const stopMessage = executionPolicy.getReasoningDominatedStopMessage?.(
-        callbacks.getPreferredLanguage(),
-        reasoningRatio,
-      ) || "Halted: reasoning-dominated output.";
-      callbacks.onNonActionableStop(stopMessage, "no_action");
-      callbacks.onStatusChange("idle");
-      return { status: "stopped", reason: "reasoning_dominated" };
-    }
   }
 
   if (llmTools.length > 0) {

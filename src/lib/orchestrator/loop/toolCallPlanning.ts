@@ -1,8 +1,3 @@
-import {
-  describeApprovedPlanRecoveryToolSurface,
-  describeApprovedPlanSourceEditFirstToolSurface,
-  shouldAllowApprovedPlanRecoveryFileRead,
-} from "../../approvedPlanRecoveryTools";
 import { resolveDevServerRuntimeState } from "../../devServerRuntime";
 import {
   isExecuteRecoveryToolName,
@@ -15,12 +10,9 @@ import {
 import {
   EXECUTION_VERIFICATION_TOOL_NAMES,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
-  approvedPlanNeedsSourceEditBeforeValidation,
   filterPlanRuntimeToolDefinitionsForPhase,
   getOriginalUserPromptForPlanFallback,
-  hasPlanUserContextObservation,
-  isApprovedPlanRecoveryTool,
-  isApprovedPlanSourceEditFirstTool,
+  hasPlanVisualContextGrounding,
   logAgentEvent,
 } from "../../orchestrator";
 import { summarizeRepeatedPlanTargetsFromToolActivity, type PlanToolActivitySummary } from "../../planExecutionRecovery";
@@ -28,8 +20,10 @@ import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import { shouldClosePlanToolSurfaceAfterReadOnlyConvergence } from "../../planRuntime";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import {
+  getSubagentAdmissionHealth,
   normalizeIndependentDelegationScopeKeys,
   resolveDelegationDecision,
+  resolveSubagentCapacityPolicy,
   type DelegationDecision,
   type DelegationRuntimePhase,
 } from "../../subagents";
@@ -39,16 +33,14 @@ import {
   type TurnInputContextSignals,
 } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
+import { scopeExecutionEvidenceLedger } from "../../verificationEvidence";
 import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 
 export interface IterationToolSurfaceDecision {
   isExecuteRecoveryEligible: boolean;
   allowExecuteRecoveryFileRead: boolean;
-  effectiveExecuteRecoveryFileRead: boolean;
   recoveryActionContract: RecoveryActionContract;
-  approvedPlanSourceEditFirstActive: boolean;
-  allowApprovedPlanRecoveryFileRead: boolean;
   delegationDecision: DelegationDecision;
   iterationAllTools: ToolDefinition[];
   availableToolNames: Set<string>;
@@ -71,10 +63,6 @@ export function resolveIterationToolSurface(input: {
   executeRecoveryProtocolNoProgressFingerprint?: string | null;
   recoveryIterationCount: number;
   maxRecoveryIterations: number;
-  approvedPlanActionOnlyRecoveryActive: boolean;
-  approvedPlanNoToolRecoveryFileReadActive: boolean;
-  approvedPlanNoProgressRecoveryAttempts: number;
-  approvedPlanLongReasoningNoActionCount: number;
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
   planRuntimePhase: PlanRuntimePhase;
@@ -100,26 +88,25 @@ export function resolveIterationToolSurface(input: {
     executeRecoveryProtocolNoProgressFingerprint = null,
     recoveryIterationCount,
     maxRecoveryIterations,
-    approvedPlanActionOnlyRecoveryActive,
-    approvedPlanNoToolRecoveryFileReadActive,
-    approvedPlanNoProgressRecoveryAttempts,
-    approvedPlanLongReasoningNoActionCount,
     recentToolActivity,
     recentPlanToolActivity,
     planRuntimePhase,
     usedPlanReadOnlyConvergencePrompt,
     turnInputContextSignals,
-    lastAssistantTextForCheckpoint,
     latestUserPromptText = "",
   } = input;
 
   const devServerRuntimeObservation = resolveDevServerRuntimeState(
-    callbacks.getPlanExecutionEvidenceLedger(),
+    scopeExecutionEvidenceLedger(
+      callbacks.getPlanExecutionEvidenceLedger(),
+      callbacks.getCurrentTurnId?.(),
+    ),
   );
   const isExecuteRecoveryEligible =
-    (workflowMode === "edit" || (workflowMode === "plan" && callbacks.getIsPlanApproved())) &&
+    workflowMode === "edit" &&
     isMutationRuntimeIntent(runtimeIntent) &&
     executeRecoveryMode !== "normal";
+  const pendingSubagentCount = callbacks.getPendingSubagentIds?.().length || 0;
   const recoveryActionContract = resolveExecuteRecoveryActionContract(executeRecoveryMode, {
     expectedTarget: executeRecoveryExpectedTarget,
     readLease: executeRecoveryReadLease,
@@ -135,17 +122,22 @@ export function resolveIterationToolSurface(input: {
     ptyOutputSequence: devServerRuntimeObservation.outputSequence,
   });
   const allowExecuteRecoveryFileRead = recoveryActionContract.allowTargetedFileRead;
-  const effectiveExecuteRecoveryFileRead = recoveryActionContract.allowTargetedFileRead;
   const recoveryIterationAllTools = isExecuteRecoveryEligible
-    ? rawIterationAllTools.filter((tool) => isExecuteRecoveryToolName(
-        tool.function.name,
-        PLAN_EXPLORATION_READ_ONLY_TOOLS,
-        {
-          mode: executeRecoveryMode,
-          allowFileRead: allowExecuteRecoveryFileRead,
-          contract: recoveryActionContract,
-        },
-      ))
+    ? rawIterationAllTools.filter((tool) =>
+        (
+          tool.function.name !== "wait_subagents" ||
+          pendingSubagentCount > 0
+        ) &&
+        isExecuteRecoveryToolName(
+          tool.function.name,
+          PLAN_EXPLORATION_READ_ONLY_TOOLS,
+          {
+            mode: executeRecoveryMode,
+            allowFileRead: allowExecuteRecoveryFileRead,
+            contract: recoveryActionContract,
+          },
+        )
+      )
     : rawIterationAllTools;
   if (isExecuteRecoveryEligible && recoveryIterationAllTools.length !== rawIterationAllTools.length) {
     logAgentEvent("execute_recovery_tool_scope_applied", {
@@ -163,7 +155,7 @@ export function resolveIterationToolSurface(input: {
       devServerUrl: recoveryActionContract.devServerUrl,
       ptyGeneration: recoveryActionContract.ptyGeneration,
       ptyOutputSequence: recoveryActionContract.ptyOutputSequence,
-      allowFileRead: effectiveExecuteRecoveryFileRead,
+      allowFileRead: allowExecuteRecoveryFileRead,
       adaptiveFileReadAllowed: allowExecuteRecoveryFileRead,
       recoveryToolSurface: recoveryActionContract.surfaceDescription,
       rawTools: rawIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
@@ -172,36 +164,7 @@ export function resolveIterationToolSurface(input: {
     });
   }
 
-  const approvedPlanSourceEditFirstActive =
-    workflowMode === "plan" &&
-    callbacks.getIsPlanApproved() &&
-    approvedPlanNeedsSourceEditBeforeValidation(
-      callbacks.getPlanTasks(),
-      callbacks.getPlanExecutionEvidenceLedger(),
-    );
-  const approvedPlanInitialSourceReadAllowed =
-    approvedPlanSourceEditFirstActive &&
-    runtimeIntent === "execute" &&
-    recentPlanToolActivity.length === 0 &&
-    callbacks.getPlanExecutionEvidenceLedger().length === 0;
-  const approvedPlanPatchRecoveryFileReadAllowed =
-    approvedPlanNoToolRecoveryFileReadActive ||
-    shouldAllowApprovedPlanRecoveryFileRead(recentPlanToolActivity);
-  // Source-edit execution may span several files. Keep the narrowly scoped
-  // read_file tool available until a no-progress strategy switch explicitly
-  // moves the loop to action-only recovery; cached-read guards still prevent
-  // repeated exploration.
-  const approvedPlanSourceEditFileReadAllowed =
-    approvedPlanSourceEditFirstActive &&
-    runtimeIntent === "execute" &&
-    !approvedPlanActionOnlyRecoveryActive;
-  const allowApprovedPlanRecoveryFileRead =
-    approvedPlanSourceEditFileReadAllowed || approvedPlanPatchRecoveryFileReadAllowed;
-  const preservePtyLifecycle =
-    devServerRuntimeObservation.status === "pending" ||
-    devServerRuntimeObservation.status === "running";
-
-  if (executeRecoveryMode !== "normal" || approvedPlanActionOnlyRecoveryActive || approvedPlanNoToolRecoveryFileReadActive) {
+  if (executeRecoveryMode !== "normal") {
     logAgentEvent("recovery_loop_summary", {
       iteration,
       workflowMode,
@@ -216,39 +179,15 @@ export function resolveIterationToolSurface(input: {
       protocolNoProgressFingerprint: recoveryActionContract.protocolNoProgressFingerprint,
       recoveryIterationCount,
       maxRecoveryIterations,
-      approvedPlanActionOnlyRecoveryActive,
-      approvedPlanNoToolRecoveryFileReadActive,
-      approvedPlanNoProgressRecoveryAttempts,
-      approvedPlanLongReasoningNoActionCount,
-      allowApprovedPlanRecoveryFileRead,
       recentPlanToolActivity: recentPlanToolActivity.length,
       repeatedTargets: summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity),
     });
   }
 
-  const approvedPlanActionRecoveryActive =
-    approvedPlanActionOnlyRecoveryActive &&
-    workflowMode === "plan" &&
-    callbacks.getIsPlanApproved();
   const executeContractOwnsSurface =
     isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
-  const initialBaseIterationAllTools =
-    executeContractOwnsSurface
-      ? recoveryIterationAllTools
-      : approvedPlanActionRecoveryActive
-      ? recoveryIterationAllTools.filter((tool) => isApprovedPlanRecoveryTool(tool, {
-          allowFileRead: approvedPlanPatchRecoveryFileReadAllowed,
-        }))
-      : approvedPlanSourceEditFirstActive
-      ? recoveryIterationAllTools.filter((tool) => isApprovedPlanSourceEditFirstTool(tool, {
-          allowFileRead: allowApprovedPlanRecoveryFileRead,
-          preservePtyLifecycle,
-        }))
-      : recoveryIterationAllTools;
-  const recoveryScopesDelegation =
-    executeRecoveryMode !== "normal" ||
-    approvedPlanActionOnlyRecoveryActive ||
-    approvedPlanNoToolRecoveryFileReadActive;
+  const initialBaseIterationAllTools = recoveryIterationAllTools;
+  const recoveryScopesDelegation = executeContractOwnsSurface;
   const joinedChildNeedsParentReread = [...recentToolActivity, ...recentPlanToolActivity]
     .some((activity) => activity.delegatedObservation?.requiresParentReread === true);
   const canExposeParentReread =
@@ -258,7 +197,9 @@ export function resolveIterationToolSurface(input: {
       recoveryActionContract.nextRequiredCapability === "targeted_read"
     );
   const extraRecoveryToolNames = new Set<string>();
-  if (recoveryScopesDelegation) extraRecoveryToolNames.add("wait_subagents");
+  if (recoveryScopesDelegation && pendingSubagentCount > 0) {
+    extraRecoveryToolNames.add("wait_subagents");
+  }
   if (joinedChildNeedsParentReread && canExposeParentReread) extraRecoveryToolNames.add("read_file");
   const baseIterationAllTools = extraRecoveryToolNames.size > 0
     ? [
@@ -273,30 +214,6 @@ export function resolveIterationToolSurface(input: {
         ),
       ]
     : initialBaseIterationAllTools;
-  if (
-    !executeContractOwnsSurface &&
-    approvedPlanSourceEditFirstActive &&
-    baseIterationAllTools.length !== recoveryIterationAllTools.length
-  ) {
-    logAgentEvent("approved_plan_source_edit_first_tool_scope_applied", {
-      iteration,
-      allowFileRead: allowApprovedPlanRecoveryFileRead,
-      preservePtyLifecycle,
-      devServerRuntimeStatus: devServerRuntimeObservation.status,
-      initialSourceReadAllowed: approvedPlanInitialSourceReadAllowed,
-      sourceEditFileReadAllowed: approvedPlanSourceEditFileReadAllowed,
-      recoveryToolSurface: describeApprovedPlanSourceEditFirstToolSurface(
-        allowApprovedPlanRecoveryFileRead,
-        preservePtyLifecycle,
-      ),
-      rawTools: recoveryIterationAllTools.map((tool) => tool.function.name).slice(0, 24),
-      scopedTools: baseIterationAllTools.map((tool) => tool.function.name),
-      removedToolCount: Math.max(0, recoveryIterationAllTools.length - baseIterationAllTools.length),
-      taskCount: callbacks.getPlanTasks().length,
-      evidenceCount: callbacks.getPlanExecutionEvidenceLedger().length,
-    });
-  }
-
   const phaseScopedIterationAllTools = filterPlanRuntimeToolDefinitionsForPhase({
     tools: baseIterationAllTools,
     workflowMode,
@@ -332,11 +249,7 @@ export function resolveIterationToolSurface(input: {
     delegationPhase = "context";
   } else if (recoveryPhase === "mutation") {
     delegationPhase = "mutation";
-  } else if (
-    recoveryPhase === "post_mutation_check" ||
-    recoveryPhase === "validation" ||
-    recoveryPhase === "reconcile"
-  ) {
+  } else if (recoveryPhase === "validation" || recoveryPhase === "reconcile") {
     delegationPhase = "validation";
   } else if (
     latestDecisiveRuntimeActivity &&
@@ -373,10 +286,16 @@ export function resolveIterationToolSurface(input: {
   ]);
   const explicitScopeCount = normalizeIndependentDelegationScopeKeys(explicitScopeKeys).length;
   const observedScopeCount = normalizeIndependentDelegationScopeKeys(observedScopeKeys).length;
-  const pendingSubagentCount = callbacks.getPendingSubagentIds?.().length || 0;
   const plannedWorkItemCount = workflowMode === "plan"
     ? callbacks.getPlanTasks().length
     : 0;
+  const runtimeConfig = callbacks.getConfig?.();
+  const delegationRuntimeHealth = runtimeConfig?.activeProfile &&
+    runtimeConfig.local &&
+    runtimeConfig.cloud &&
+    Array.isArray(runtimeConfig.cloudServers)
+    ? getSubagentAdmissionHealth(resolveSubagentCapacityPolicy(runtimeConfig))
+    : null;
   const delegationDecision = resolveDelegationDecision({
     preference: resolveSubagentDelegationPreference(latestUserPromptText),
     phase: delegationPhase,
@@ -387,6 +306,7 @@ export function resolveIterationToolSurface(input: {
     independentScopeKeys: normalizedIndependentScopeKeys,
     pendingSubagentCount,
     subagentDepth: callbacks.getSubagentDepth?.() || 0,
+    runtimeHealth: delegationRuntimeHealth,
   });
   const delegationScopedIterationAllTools = delegationDecision.action === "admit"
     ? phaseScopedIterationAllTools
@@ -407,6 +327,14 @@ export function resolveIterationToolSurface(input: {
       observedScopeCount: delegationDecision.observedScopeCount,
       plannedWorkItemCount: delegationDecision.plannedWorkItemCount,
       pendingSubagentCount: delegationDecision.pendingSubagentCount,
+      runtimeHealthState: delegationRuntimeHealth?.state || "unknown",
+      activeChildren: delegationRuntimeHealth?.activeChildren ?? null,
+      queuedChildren: delegationRuntimeHealth?.queuedChildren ?? null,
+      capacityLimit: delegationRuntimeHealth?.capacityLimit ?? null,
+      memorySafety: delegationRuntimeHealth?.memorySafety || "unknown",
+      recentSuccessfulRuns: delegationRuntimeHealth?.recentSuccessfulRuns ?? 0,
+      latestStartupMs: delegationRuntimeHealth?.latestStartupMs ?? null,
+      latestCapacityWaitMs: delegationRuntimeHealth?.latestCapacityWaitMs ?? null,
       spawnToolExposed: delegationDecision.action === "admit" &&
         phaseScopedIterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
       providerNeutral: true,
@@ -421,9 +349,9 @@ export function resolveIterationToolSurface(input: {
       userGoal: getOriginalUserPromptForPlanFallback(callbacks),
       userContext: turnInputContextSignals,
       recentToolActivity: recentPlanToolActivity,
-      hasObservedUserContext: hasPlanUserContextObservation(
+      hasGroundedVisualContext: hasPlanVisualContextGrounding(
         callbacks.getMessages() as AgentMessage[],
-        lastAssistantTextForCheckpoint,
+        callbacks.getCurrentTurnId?.(),
       ),
     }).status,
   });
@@ -434,9 +362,7 @@ export function resolveIterationToolSurface(input: {
   const shouldLogToolSurfaceDecision =
     rawIterationAllTools.length !== iterationAllTools.length ||
     executeRecoveryMode !== "normal" ||
-    approvedPlanActionOnlyRecoveryActive ||
-    approvedPlanNoToolRecoveryFileReadActive ||
-    (workflowMode === "plan" && callbacks.getIsPlanApproved());
+    callbacks.getIsPlanApproved();
   if (shouldLogToolSurfaceDecision) {
     const rawToolNames = rawIterationAllTools.map((tool) => tool.function.name);
     const scopedToolNames = iterationAllTools.map((tool) => tool.function.name);
@@ -449,24 +375,12 @@ export function resolveIterationToolSurface(input: {
       isPlanApproved: callbacks.getIsPlanApproved(),
       executeRecoveryMode,
       executeRecoveryReason,
-      approvedPlanSourceEditFirstActive,
-      approvedPlanActionOnlyRecoveryActive,
-      approvedPlanNoToolRecoveryFileReadActive,
       executeContractOwnsSurface,
       // Report the effective surface, not an upstream eligibility hint. Those
       // can legitimately be true while a later phase filter removes read_file.
       allowFileRead: scopedToolNameSet.has("read_file"),
       readFileExposed: scopedToolNameSet.has("read_file"),
-      approvedPlanPatchRecoveryFileReadAllowed,
-      approvedPlanSourceEditFileReadAllowed,
-      recoveryToolSurface: approvedPlanActionRecoveryActive || approvedPlanNoToolRecoveryFileReadActive
-        ? describeApprovedPlanRecoveryToolSurface(approvedPlanPatchRecoveryFileReadAllowed)
-        : approvedPlanSourceEditFirstActive
-        ? describeApprovedPlanSourceEditFirstToolSurface(
-            allowApprovedPlanRecoveryFileRead,
-            preservePtyLifecycle,
-          )
-        : recoveryActionContract.surfaceDescription,
+      recoveryToolSurface: recoveryActionContract.surfaceDescription,
       rawToolCount: rawToolNames.length,
       scopedToolCount: scopedToolNames.length,
       removedToolCount: Math.max(0, rawToolNames.length - scopedToolNames.length),
@@ -489,10 +403,7 @@ export function resolveIterationToolSurface(input: {
   return {
     isExecuteRecoveryEligible,
     allowExecuteRecoveryFileRead,
-    effectiveExecuteRecoveryFileRead,
     recoveryActionContract,
-    approvedPlanSourceEditFirstActive,
-    allowApprovedPlanRecoveryFileRead,
     delegationDecision,
     iterationAllTools,
     availableToolNames: new Set(iterationAllTools.map((tool) => tool.function.name)),

@@ -8,6 +8,7 @@ import {
   buildCompatibilityRetryMessages,
   buildTranscriptCompatibilityRetryMessages,
   ensureProviderCompatibilityMode,
+  isProviderImageContentCompatibilityErrorMessage,
   isProviderCompatibilityErrorMessage,
 } from "../../providerCompatibility";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
@@ -35,6 +36,7 @@ import {
   type PlanStreamWatchdogOptionsResolver,
 } from "./streamInvocation";
 import type { ExecuteRecoveryMode, RecoveryActionContract } from "../../executeRecoveryTools";
+import { countVisualContentParts } from "../../visualContext";
 import { annotateRequiredToolCallProtocolResult } from "../../requiredToolProtocol";
 import {
   applyPreapprovalPlanQualityRecoveryStreamOptions,
@@ -122,8 +124,6 @@ export function shouldAttemptApprovedPlanStreamWatchdogRecovery(input: {
   runtimeIntent: ResolvedUserIntent;
   isPlanApproved: boolean;
   isExecuteRecoveryEligible: boolean;
-  approvedPlanActionOnlyRecoveryActive: boolean;
-  approvedPlanNoToolRecoveryFileReadActive: boolean;
   llmToolCount: number;
   forceXmlTools: boolean;
 }): boolean {
@@ -376,15 +376,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
   allowExecuteRecoveryFileRead: boolean;
   recoveryActionContract: RecoveryActionContract;
   isExecuteRecoveryEligible: boolean;
-  approvedPlanActionOnlyRecoveryActive: boolean;
-  approvedPlanNoToolRecoveryFileReadActive: boolean;
   finalTextOnlyStep: boolean;
   chatFinalSynthesisActive: boolean;
   chatFinalSynthesisReason: string;
   usedChatFinalSynthesisPrompt: boolean;
   markChatFinalSynthesisPromptUsed: () => void;
   recentToolActivity: PlanToolActivitySummary[];
-  consecutiveNoToolCount: number;
   getPlanStreamWatchdogOptions: PlanStreamWatchdogOptionsResolver;
   approvedPlanRecoveryStreamMaxElapsedMs: number;
   preapprovalPlanQualityRecoveryStreamPolicy: PreapprovalPlanQualityRecoveryStreamPolicy;
@@ -415,15 +412,12 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     allowExecuteRecoveryFileRead,
     recoveryActionContract,
     isExecuteRecoveryEligible,
-    approvedPlanActionOnlyRecoveryActive,
-    approvedPlanNoToolRecoveryFileReadActive,
     finalTextOnlyStep,
     chatFinalSynthesisActive,
     chatFinalSynthesisReason,
     usedChatFinalSynthesisPrompt,
     markChatFinalSynthesisPromptUsed,
     recentToolActivity,
-    consecutiveNoToolCount,
     getPlanStreamWatchdogOptions,
     approvedPlanRecoveryStreamMaxElapsedMs,
     preapprovalPlanQualityRecoveryStreamPolicy,
@@ -479,22 +473,16 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       allowExecuteRecoveryFileRead,
       recoveryActionContract,
       isExecuteRecoveryEligible,
-      approvedPlanActionOnlyRecoveryActive,
-      approvedPlanNoToolRecoveryFileReadActive,
       finalTextOnlyStep,
       chatFinalSynthesisActive,
       chatFinalSynthesisReason,
       usedChatFinalSynthesisPrompt,
       markChatFinalSynthesisPromptUsed,
       recentToolActivity,
-      consecutiveNoToolCount,
       getPlanStreamWatchdogOptions,
       approvedPlanRecoveryStreamMaxElapsedMs,
       preapprovalPlanQualityRecoveryStreamPolicy,
     });
-    if (initialStreamInvocation.status === "stopped") {
-      return { status: "stopped", snapshotContextLimit };
-    }
     observeFileReadContextForMessagesSent({
       fileReadStates,
       beforeMessages: managedAgentMessages,
@@ -523,8 +511,6 @@ export async function invokeStreamWithRecoveryForIteration(input: {
       runtimeIntent,
       isPlanApproved: callbacks.getIsPlanApproved(),
       isExecuteRecoveryEligible,
-      approvedPlanActionOnlyRecoveryActive,
-      approvedPlanNoToolRecoveryFileReadActive,
       llmToolCount: llmTools.length,
       forceXmlTools,
     })) {
@@ -1147,14 +1133,22 @@ export async function invokeStreamWithRecoveryForIteration(input: {
     }
 
     if (isCompatibilityError) {
+      const hasVisualContext = countVisualContentParts(managedAgentMessages) > 0;
+      const compatibilityImageHandling = hasVisualContext &&
+        isProviderImageContentCompatibilityErrorMessage(errMsg)
+        ? "omit_unsupported" as const
+        : "preserve" as const;
       logAgentEvent("provider_compatibility_retry", {
         iteration,
         reason: errMsg.slice(0, 240),
         nativeToolsAttempted: nativeToolsWereAttempted,
+        visualContext: hasVisualContext ? compatibilityImageHandling : "none",
       });
       callbacks.onProviderCompatibilityFallback?.(errMsg);
       const compatibilityMessages = ensureProviderCompatibilityMode(
-        buildCompatibilityRetryMessages(managedAgentMessages),
+        buildCompatibilityRetryMessages(managedAgentMessages, {
+          imageHandling: compatibilityImageHandling,
+        }),
         workflowMode,
       );
       replaceMessagesForRetry({
@@ -1227,10 +1221,21 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           return { status: "stopped", snapshotContextLimit };
         }
 
+        const providerCompatibilityImageHandling = compatibilityImageHandling === "omit_unsupported" ||
+          (hasVisualContext && isProviderImageContentCompatibilityErrorMessage(retryMsg))
+          ? "omit_unsupported" as const
+          : "preserve" as const;
         const providerCompatibilityMessages = ensureProviderCompatibilityMode(
-          compatibilityMessages,
+          buildCompatibilityRetryMessages(managedAgentMessages, {
+            imageHandling: providerCompatibilityImageHandling,
+          }),
           workflowMode,
         );
+        logAgentEvent("provider_compatibility_retry_visual_context", {
+          iteration,
+          visualContext: hasVisualContext ? providerCompatibilityImageHandling : "none",
+          reason: retryMsg.slice(0, 240),
+        });
         replaceMessagesForRetry({
           callbacks,
           iteration,

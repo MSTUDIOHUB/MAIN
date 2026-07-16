@@ -70,8 +70,6 @@ const {
   isPreApprovalPlanDraftWrite,
   isPlanArtifactPath,
   getProtectedPlanArtifactMutationViolation,
-  summarizeReadFileRepeatLimitBatch,
-  buildReadFileRepeatLimitBatchPauseNotice,
   collectPlanClosureMaterializationInput,
   getOriginalUserPromptForPlanFallback,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
@@ -160,6 +158,10 @@ test("buildShellReadValidationError blocks shell file reads but permits in-place
   assert.ok(errCat);
   assert.equal(errCat.isError, true);
   assert.match(errCat.content, /SHELL_READ_FORBIDDEN/);
+  assert.match(errCat.content, /请使用 read_file|Use read_file instead/);
+  assert.match(errCat.content, /文件版本变化、新范围、上下文淘汰、补丁失配或修改后核验|changed version, new range, evicted context, patch mismatch, or post-mutation check/);
+  assert.match(errCat.content, /同版本同窗口.*缓存 stub.*修改、验证或精确阻塞|same active version\/window returns a cache stub and should lead to mutation, validation, or an exact blocker/);
+  assert.doesNotMatch(errCat.content, /read_file (?:is )?(?:unavailable|not available|disabled)/i);
 
   assert.ok(errHead);
   assert.equal(okSedWrite, null);
@@ -590,34 +592,6 @@ test("distinct read_file windows do not contribute to a later mutation limit", (
   );
 
   assert.equal(result, null);
-});
-
-test("read_file repeat-limit batches summarize into a pause signal", () => {
-  const results = Array.from({ length: 9 }, (_, index) => ({
-    toolCallId: `call_${index}`,
-    name: "read_file",
-    target: index < 8 ? "Assets/Scripts/Entities/SnakeController.cs" : "Assets/Scripts/Core/GridManager.cs",
-    content: "READ_FILE_REPEAT_LIMIT: duplicate read",
-    isError: false,
-    lifecycleState: "completed",
-  }));
-
-  const summary = summarizeReadFileRepeatLimitBatch(results);
-  assert.deepEqual(summary, {
-    total: 9,
-    target: "Assets/Scripts/Entities/SnakeController.cs",
-    targetCount: 8,
-  });
-
-  assert.match(
-    buildReadFileRepeatLimitBatchPauseNotice({
-      language: "zh",
-      target: summary.target,
-      total: summary.total,
-      targetCount: summary.targetCount,
-    }),
-    /不要原样重试同一个 read_file/,
-  );
 });
 
 test("run_command batches do not create no-progress signatures", () => {

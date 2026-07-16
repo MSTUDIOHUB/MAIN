@@ -147,13 +147,13 @@ function buildMessage(input: {
       case "read_failed":
         return `MUTATION_PREFLIGHT_BLOCKED: Could not read ${input.path} before patching (${input.detail || "read failed"}). Do not ask for approval; read the correct target or report the blocker.`;
       case "search_text_mismatch":
-        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. Do not ask for approval; read the current file once, then retry with an exact patch or explain the blocker.`;
+        return `MUTATION_PREFLIGHT_BLOCKED: search_text was not found in ${input.path}. Reuse the active versioned source observation and correct the edit; reread only when the file version changed or the exact required range is missing.`;
       case "empty_change":
         return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} would not change ${input.path}. Do not ask for approval; provide a real edit, run validation, or explain the blocker.`;
       case "identical_content":
         return `MUTATION_PREFLIGHT_BLOCKED: write_file content is identical to ${input.path}. Do not ask for approval; choose a real edit, validation, or a blocker report.`;
       case "invalid_patch":
-        return `MUTATION_PREFLIGHT_BLOCKED: apply_patch is invalid or would not apply (${input.detail || "invalid patch"}). Do not ask for approval; read the exact target once if needed, then retry with a valid patch.`;
+        return `MUTATION_PREFLIGHT_BLOCKED: apply_patch is invalid or would not apply (${input.detail || "invalid patch"}). Correct the patch from the active source observation; reread only for a changed version or a genuinely missing range.`;
     }
   }
 
@@ -163,13 +163,13 @@ function buildMessage(input: {
     case "read_failed":
       return `MUTATION_PREFLIGHT_BLOCKED: patch 前无法读取 ${input.path}（${input.detail || "读取失败"}）。不要请求用户审批；请读取正确目标或明确阻塞。`;
     case "search_text_mismatch":
-      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中不存在。不要请求用户审批；允许先定向 read_file 一次，然后必须用精确 patch 重试、验证或说明阻塞。`;
+      return `MUTATION_PREFLIGHT_BLOCKED: search_text 在 ${input.path} 中不存在。请复用当前版本化源码观察并修正编辑；只有文件版本变化或确实缺少精确范围时才重新读取。`;
     case "empty_change":
       return `MUTATION_PREFLIGHT_BLOCKED: ${input.toolName} 不会改变 ${input.path}。不要请求用户审批；请给出真实改动、执行验证或说明阻塞。`;
     case "identical_content":
       return `MUTATION_PREFLIGHT_BLOCKED: write_file 内容与 ${input.path} 完全相同。不要请求用户审批；请改为真实改动、验证或阻塞说明。`;
     case "invalid_patch":
-      return `MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（${input.detail || "无效 patch"}）。不要请求用户审批；必要时只定向读取一次目标，然后用有效 patch 重试。`;
+      return `MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（${input.detail || "无效 patch"}）。请依据当前源码观察修正 patch；只有版本变化或确实缺少范围时才重新读取。`;
   }
 }
 

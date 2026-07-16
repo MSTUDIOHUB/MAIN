@@ -39,6 +39,7 @@ const FAILURE_MARKER_RE = /(?:could\s+not\s+connect|connection\s+refused|address
 const PTY_OCCUPIED_MARKER_RE = /\b(?:PTY_BUSY|PTY_FOREGROUND_UNKNOWN)\b/i;
 const PORT_CONFLICT_MARKER_RE = /\b(?:address\s+already\s+in\s+use|EADDRINUSE)\b/i;
 const LOCAL_HEALTH_PROBE_RE = /\b(?:curl|wget|http(?:ie)?)\b[\s\S]{0,180}\bhttps?:\/\/(?:localhost|127\.0\.0\.1|\[?::1\]?)(?::\d+)?/i;
+const LOCAL_PORT_CANDIDATE_RE = /(?:--port(?:=|\s+)|\bport\s+|(?:localhost|127\.0\.0\.1|0\.0\.0\.0|\[?::1\]?|:{2,3}):?)(\d{2,5})\b/gi;
 
 function normalizeLocalDevServerUrl(value: string): string {
   return value.replace(/[.,;:!?]+$/g, "");
@@ -133,6 +134,26 @@ export function classifyPtyCommandFailure(value: string): PtyCommandFailureSeman
 
 export function isLocalDevServerHealthProbeCommand(value: string): boolean {
   return LOCAL_HEALTH_PROBE_RE.test(String(value || ""));
+}
+
+export function extractLocalDevServerPort(value: string): number | null {
+  const text = String(value || "");
+  const urls = extractLocalDevServerUrls(text);
+  if (urls.length > 0) {
+    try {
+      const parsed = new URL(urls[urls.length - 1]);
+      const port = Number(parsed.port || (parsed.protocol === "https:" ? 443 : 80));
+      if (Number.isInteger(port) && port > 0 && port <= 65_535) return port;
+    } catch {
+      // Fall through to explicit port flags and address-in-use output.
+    }
+  }
+  let latest: number | null = null;
+  for (const match of text.matchAll(LOCAL_PORT_CANDIDATE_RE)) {
+    const port = Number(match[1]);
+    if (Number.isInteger(port) && port > 0 && port <= 65_535) latest = port;
+  }
+  return latest;
 }
 
 function lastMarkerIndex(text: string, pattern: RegExp): number {
@@ -349,7 +370,9 @@ export function resolveDevServerRuntimeState(
       entry.observationStatus !== "failed" &&
       status === "failed" &&
       portConflict &&
-      isLocalDevServerHealthProbeCommand(entry.value || entry.target || "")
+      isLocalDevServerHealthProbeCommand(entry.value || entry.target || "") &&
+      latestLaunch?.devServerPort !== undefined &&
+      entry.devServerPort === latestLaunch.devServerPort
     ) {
       const probeUrls = extractLocalDevServerUrls(entry.value || entry.target || "");
       status = "ready";
@@ -416,12 +439,19 @@ export function resolveDevServerRuntimeObservation(
 
 function localUrlOrigin(value: string): string | null {
   try {
-    const url = new URL(value);
+    const embeddedUrls = extractLocalDevServerUrls(value);
+    const url = new URL(embeddedUrls[embeddedUrls.length - 1] || value);
     if (!/^(?:localhost|127\.0\.0\.1|\[::1\])$/i.test(url.hostname)) return null;
     return url.origin;
   } catch {
     return null;
   }
+}
+
+export function localDevServerUrlsShareOrigin(left: string, right: string): boolean {
+  const leftOrigin = localUrlOrigin(left);
+  const rightOrigin = localUrlOrigin(right);
+  return Boolean(leftOrigin && rightOrigin && leftOrigin === rightOrigin);
 }
 
 export function reconcileBrowserValidationUrl(input: {
@@ -432,8 +462,12 @@ export function reconcileBrowserValidationUrl(input: {
   const observed = String(input.observedUrl || "").trim();
   const requestedOrigin = localUrlOrigin(requested);
   const observedOrigin = localUrlOrigin(observed);
-  if (!requestedOrigin || !observedOrigin || requestedOrigin === observedOrigin) {
+  if (!observedOrigin || requestedOrigin === observedOrigin) {
     return { url: requested, corrected: false };
+  }
+
+  if (!requestedOrigin) {
+    return { url: observed, corrected: true };
   }
 
   try {

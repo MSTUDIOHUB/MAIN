@@ -38,7 +38,6 @@ test("tool iteration phase returns one folded runtime-state result to the orches
   assert.match(phaseSource, /loopGuardRuntimeState: toolResultRecoveryPhase\.loopGuardRuntimeState/);
   assert.match(phaseSource, /executeRecoveryState: toolResultRecoveryPhase\.executeRecoveryState/);
   assert.match(phaseSource, /recoveryPromptState: toolResultRecoveryPhase\.recoveryPromptState/);
-  assert.match(phaseSource, /approvedPlanRecoveryState: toolResultRecoveryPhase\.approvedPlanRecoveryState/);
 });
 
 test("agent orchestrator delegates tool execution and result recovery to one iteration phase", () => {

@@ -144,7 +144,8 @@ test("plan panel keeps resume action available for paused approved execution", (
 
   assert.match(source, /const canResumeExecution =[\s\S]*?isPlanApproved[\s\S]*?planStage === "executing"[\s\S]*?\(agentStatus === "idle" \|\| agentStatus === "error"\);/);
   assert.doesNotMatch(source, /canResumeExecution[\s\S]*?allTrustedComplete/);
-  assert.match(source, /runtimeIntentOverride:\s*"execute"/);
+  assert.match(source, /resolvedIntent:\s*"execute"/);
+  assert.doesNotMatch(source, /runtimeIntentOverride:\s*"execute"/);
   assert.match(source, /executionConsentGranted:\s*true/);
   assert.match(source, /createVisibleTurnForHiddenMessage:\s*!resumeTurnId/);
   assert.match(source, /reuseCurrentTurn:\s*!!resumeTurnId/);

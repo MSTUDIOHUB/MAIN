@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  completeAssistantTurn,
   handleFinalNoToolAssistantTurn,
   handleReplyOptionsPause,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/finalTurnCompletion.ts"));
@@ -170,4 +171,41 @@ test("normal no-tool final text completes without a non-actionable stop", () => 
   assert.deepEqual(harness.statuses, ["idle"]);
   assert.equal(harness.completed.length, 1);
   assert.equal(harness.appended[0].content, "Assistant answer");
+});
+
+test("normal completion is staged until the outer completion guard commits it", () => {
+  const order = [];
+  let stagedCommit = null;
+  const emitTurnCompletedEvent = () => order.push("turn.completed");
+  emitTurnCompletedEvent.stageCompletion = (commit) => {
+    stagedCommit = commit;
+  };
+
+  completeAssistantTurn({
+    callbacks: {
+      appendMessage: () => order.push("append"),
+      onNonActionableStop: () => order.push("stop"),
+      onStatusChange: (status) => order.push(`status:${status}`),
+    },
+    assistantHistoryText: "Guarded answer",
+    providerReasoningForHistory: null,
+    assistantMsgId: "assistant_guarded",
+    iterationContext: {
+      eventThreadId: "thread_guarded",
+      eventTurnId: "turn_guarded",
+    },
+    emitTurnEvent: (event) => order.push(event.type),
+    emitTurnCompletedEvent,
+  });
+
+  assert.deepEqual(order, []);
+  assert.equal(typeof stagedCommit, "function");
+
+  stagedCommit();
+  assert.deepEqual(order, [
+    "append",
+    "item.completed",
+    "turn.completed",
+    "status:idle",
+  ]);
 });

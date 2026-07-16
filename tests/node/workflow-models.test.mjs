@@ -110,10 +110,13 @@ const {
   isRuntimeTaskActionableText,
   looksLikeReasoningLeakTitle,
   mergePlanTasks,
+  mergeRuntimeValidationTaskRequirements,
+  deriveRuntimeValidationTasksFromUserRequest,
   normalizeConversationDisplayTitle,
   normalizeResponseLanguagePolicy,
   planTaskHasUnsatisfiedSourceMutationEvidence,
   reconcilePlanTaskCompletion,
+  resolvePlanExecutionEvidenceIdentity,
   resolveTurnResponseLanguage,
   resolveActiveConversationTurn,
   resolvePinnedConversationTurn,
@@ -134,6 +137,7 @@ const {
 
 const {
   buildApprovedPlanScopeConflictFingerprint,
+  resolveApprovedPlanCommandScope,
   resolveApprovedPlanMutationScope,
 } = loadApprovedPlanExecutionScopeModule();
 
@@ -968,6 +972,86 @@ test("file heading owns mutation prose while referenced contract files remain ev
   );
 });
 
+test("nested browser acceptance rows inherit their explicit parent interaction", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 改动范围",
+      "- 修改 `src/main.js`，接入工具栏事件。",
+      "",
+      "## 验证方案",
+      "1. 运行 `npm run build`。",
+      "2. 依次点击 New、Open、Save 按钮，验证：",
+      "   - New：编辑器清空，状态栏显示 new。",
+      "   - Open：对话框出现，状态栏显示 open。",
+      "   - Save：页面显示保存完成。",
+    ].join("\n"),
+  }], { language: "zh", maxTasks: 12 });
+
+  const interactions = tasks.filter((task) =>
+    task.evidence?.some((evidence) =>
+      evidence.kind === "browser_dom" && evidence.requiresInteraction === true
+    )
+  );
+  assert.equal(interactions.length, 3, JSON.stringify(tasks, null, 2));
+  assert.deepEqual(
+    interactions.map((task) => task.text),
+    [
+      "点击 New → 编辑器清空，状态栏显示 new。",
+      "点击 Open → 对话框出现，状态栏显示 open。",
+      "点击 Save → 页面显示保存完成。",
+    ],
+  );
+
+  const required = deriveRuntimeValidationTasksFromUserRequest(
+    "再通过浏览器实际点击 New 验证状态变化。",
+    { language: "zh" },
+  );
+  const merged = mergeRuntimeValidationTaskRequirements(tasks, required);
+  assert.equal(
+    merged.filter((task) =>
+      task.evidence?.some((evidence) => evidence.requiresInteraction === true && /New/i.test(evidence.value))
+    ).length,
+    1,
+    JSON.stringify(merged, null, 2),
+  );
+  assert.equal(merged.some((task) => /^USER-VALIDATION-/.test(task.requirementRef || "")), false);
+});
+
+test("an isolated validation row cannot invent a browser click without a matching parent", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 改动范围",
+      "- 修改 `src/main.js`，接入工具栏事件。",
+      "",
+      "## 验证方案",
+      "- New：状态栏显示 new。",
+      "- 点击 Open 按钮，验证：",
+      "  - Save：状态栏显示 save。",
+    ].join("\n"),
+  }], { language: "zh", maxTasks: 12 });
+
+  assert.equal(
+    tasks.some((task) =>
+      task.evidence?.some((evidence) => evidence.requiresInteraction === true) &&
+      /New|Save/.test(task.text)
+    ),
+    false,
+    JSON.stringify(tasks, null, 2),
+  );
+});
+
 test("mutation heading keeps comparison files as references instead of write owners", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([{
     kind: "plan",
@@ -1162,6 +1246,51 @@ test("runtime plan task derivation excludes files explicitly marked as unchanged
   assert.deepEqual(mutationFiles, ["src/hooks/useCsvParser.ts"], JSON.stringify(tasks));
 });
 
+test("runtime plan projection does not promote unchanged headings or output filenames to write targets", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 改动范围",
+      "### 1. `src/components/toolbar.js` — 无改动",
+      "按钮 ID 保持不变。",
+      "",
+      "### 2. `src/main.js` — 核心修改",
+      "- 修复按钮 ID 并实现保存功能。",
+      "- 创建临时 `<a>` 元素触发下载，文件名默认为 `document.md`。",
+      "",
+      "## 验证方案",
+      "- 运行 `npm run build`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationFiles = tasks
+    .filter((task) => task.executionKind === "mutation")
+    .flatMap((task) => task.evidence || [])
+    .filter((evidence) => evidence.kind === "file")
+    .map((evidence) => evidence.value);
+  assert.deepEqual(mutationFiles, ["src/main.js"], JSON.stringify(tasks));
+  assert.equal(mutationFiles.includes("src/components/toolbar.js"), false);
+  assert.equal(mutationFiles.includes("document.md"), false);
+});
+
+test("mutation evidence requires a direct file owner in equivalent English prose", () => {
+  const directOwner = inferPlanTaskEvidence("Modify the source file `src/main.js` to bind the toolbar actions.");
+  const outputLiteral = inferPlanTaskEvidence(
+    "Create a temporary anchor to trigger a download, using `document.md` as the default output filename.",
+  );
+
+  assert.equal(
+    directOwner.some((evidence) => evidence.kind === "file" && evidence.value === "src/main.js"),
+    true,
+  );
+  assert.equal(outputLiteral.some((evidence) => evidence.kind === "file"), false);
+});
+
 test("runtime plan task derivation ignores status findings and tech-stack bullets", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
@@ -1331,10 +1460,129 @@ test("interactive control outcomes use browser evidence instead of a synthetic c
   assert.equal(tasks.length, 2, JSON.stringify(tasks));
   for (const task of tasks) {
     assert.equal(task.evidence?.some((item) => item.kind === "browser_dom"), true, JSON.stringify(task));
+    assert.equal(task.evidence?.some((item) => item.requiresInteraction === true), true, JSON.stringify(task));
     assert.equal(task.evidence?.some((item) =>
       item.kind === "cmd" && item.value === "focused validation command"
     ), false, JSON.stringify(task));
   }
+});
+
+test("named UI actions with observable post-state infer browser interaction without selectors or control nouns", () => {
+  const assertions = [
+    inferPlanTaskEvidence("实际点击 New 并检查编辑器内容清空、状态栏变为 new。"),
+    inferPlanTaskEvidence("Click New, then assert the editor content is empty and status changes to new."),
+    inferPlanTaskEvidence("切换 Theme → 页面主题更新为 dark。"),
+  ];
+
+  for (const [index, evidence] of assertions.entries()) {
+    const browser = evidence.find((item) => item.kind === "browser_dom");
+    assert.ok(browser, `${index}:${JSON.stringify(evidence)}`);
+    assert.equal(browser.requiresInteraction, true, `${index}:${JSON.stringify(evidence)}`);
+    assert.equal(evidence.some((item) =>
+      item.kind === "cmd" && item.value === "focused validation command"
+    ), false, `${index}:${JSON.stringify(evidence)}`);
+  }
+});
+
+test("runtime Plan projection preserves a selector-free click and state assertion as browser validation", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 关键实现改动",
+      "- 修改 `src/main.js`，修复工具栏事件绑定。",
+      "",
+      "## 验证方案",
+      "1. 运行 `npm run build`。",
+      "2. 运行 `npm run dev`。",
+      "3. 实际点击 New 并检查编辑器内容清空、状态栏变为 new。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const clickTask = tasks.find((task) => /点击 New/.test(task.text));
+  assert.ok(clickTask, JSON.stringify(tasks));
+  assert.equal(clickTask.validationCapability, "browser_dom", JSON.stringify(clickTask));
+  assert.equal(clickTask.evidence?.some((item) =>
+    item.kind === "browser_dom" && item.requiresInteraction === true
+  ), true, JSON.stringify(clickTask));
+  assert.equal(clickTask.evidence?.some((item) =>
+    item.kind === "cmd" && item.value === "focused validation command"
+  ), false, JSON.stringify(clickTask));
+});
+
+test("explicit user-owned and native-dialog interactions remain external review", () => {
+  const manual = inferPlanTaskEvidence(
+    "请用户手动点击 Save 并确认状态变化。",
+  );
+  const nativeDialog = inferPlanTaskEvidence(
+    "请用户手动点击 Open 并确认系统文件对话框出现。",
+  );
+
+  assert.deepEqual(manual.map((item) => item.kind), ["manual_user_validation"]);
+  assert.equal(nativeDialog.some((item) => item.kind === "manual_user_validation"), true);
+  assert.equal(nativeDialog.some((item) => item.kind === "tauri_required"), true);
+  assert.equal(nativeDialog.some((item) => item.kind === "browser_dom"), false);
+});
+
+test("terminal keypress assertions do not become browser interactions", () => {
+  const evidence = inferPlanTaskEvidence(
+    "在终端按下 Enter 并检查命令退出码是否为 0。",
+  );
+
+  assert.equal(evidence.some((item) => item.kind === "browser_dom"), false);
+  assert.equal(evidence.some((item) => item.kind === "cmd"), true);
+});
+
+test("explicit DOM selectors infer browser evidence in both languages", () => {
+  const assertions = [
+    inferPlanTaskEvidence("验证 `#status` 区域分别显示 `new`、`open`、`save`。"),
+    inferPlanTaskEvidence("Verify that `#status` displays `new`, `open`, and `save` respectively."),
+    inferPlanTaskEvidence("检查 `document.getElementById('status')` 显示当前操作结果。"),
+    inferPlanTaskEvidence("Check that `document.querySelector('[data-status]')` displays the current result."),
+  ];
+
+  for (const [index, evidence] of assertions.entries()) {
+    assert.equal(evidence.some((item) => item.kind === "browser_dom"), true, `${index}:${JSON.stringify(evidence)}`);
+    assert.equal(evidence.some((item) =>
+      item.kind === "cmd" && item.value === "focused validation command"
+    ), false, `${index}:${JSON.stringify(evidence)}`);
+  }
+  assert.match(assertions[0][0]?.value || "", /#status/);
+  assert.match(assertions[1][0]?.value || "", /#status/);
+});
+
+test("selector assertions retain existing interaction requirements", () => {
+  const zh = inferPlanTaskEvidence(
+    "点击各工具栏按钮后，验证 `#status` 的 `textContent` 显示对应状态。",
+  );
+  const en = inferPlanTaskEvidence(
+    "Click each toolbar button, then verify that `#status` textContent displays the corresponding state.",
+  );
+
+  for (const evidence of [zh, en]) {
+    const browser = evidence.find((item) => item.kind === "browser_dom");
+    assert.ok(browser, JSON.stringify(evidence));
+    assert.equal(browser.requiresInteraction, true, JSON.stringify(evidence));
+  }
+});
+
+test("explicit build and test commands remain command evidence when DOM inference is available", () => {
+  const build = inferPlanTaskEvidence("运行 `npm run build` 并检查构建结果。", ["npm run build"]);
+  const testCommand = inferPlanTaskEvidence(
+    "Run `node --test tests/node/workflow-models.test.mjs` and check the exit code.",
+    ["node --test tests/node/workflow-models.test.mjs"],
+  );
+
+  assert.deepEqual(build, [{ kind: "cmd", value: "npm run build", inferred: true }]);
+  assert.deepEqual(testCommand, [{
+    kind: "cmd",
+    value: "node --test tests/node/workflow-models.test.mjs",
+    inferred: true,
+  }]);
 });
 
 test("runtime task derivation keeps diagnosis and impact facts out of the approved mutation scope", () => {
@@ -2027,6 +2275,40 @@ test("runtime plan task derivation does not promote an evidence preamble into a 
   )), false);
 });
 
+test("runtime plan projection ignores rejected alternatives before the canonical plan", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "## 修复方案",
+      "1. 修改 `src/components/toolbar.js` 与现有监听器对齐。",
+      "2. 修改 `src/main.js` 与现有按钮对齐。",
+      "推荐方案 1。",
+      "",
+      "# Proposed Plan",
+      "",
+      "## 关键实现改动",
+      "### 1. 修改 `src/components/toolbar.js`",
+      "统一 New、Open、Save 的按钮 ID。",
+      "",
+      "### 2. 无需修改 `src/main.js`",
+      "现有事件绑定保持不变。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm run build`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationFiles = tasks
+    .filter((task) => task.executionKind === "mutation")
+    .flatMap((task) => task.evidence || [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.value);
+  assert.deepEqual(mutationFiles, ["src/components/toolbar.js"], JSON.stringify(tasks));
+});
+
 test("runtime plan task derivation resolves a unique short path to the reviewed mutation", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([{
     kind: "plan",
@@ -2054,6 +2336,49 @@ test("runtime plan task derivation resolves a unique short path to the reviewed 
   assert.equal(mutationTasks[0].evidence?.some((item) =>
     item.kind === "file" && item.value === "src/components/toolbar.js"
   ), true);
+});
+
+test("runtime plan projection canonicalizes short execution targets from qualified affected files", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## Execution Steps",
+      "1. 修改 `toolbar.js`：统一按钮 ID。",
+      "2. 修改 `main.js`：完善事件处理。",
+      "3. 运行 `npm run build`。",
+      "",
+      "## Affected Files",
+      "- `src/components/toolbar.js`：修改按钮 ID",
+      "- `src/main.js`：完善按钮事件处理逻辑",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationPaths = tasks
+    .filter((task) => task.executionKind === "mutation")
+    .flatMap((task) => task.evidence || [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.value);
+  assert.deepEqual(new Set(mutationPaths), new Set([
+    "src/components/toolbar.js",
+    "src/main.js",
+  ]), JSON.stringify(tasks));
+  assert.equal(mutationPaths.includes("toolbar.js"), false);
+  assert.equal(mutationPaths.includes("main.js"), false);
+
+  const toolbarScope = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "replace_in_file",
+    args: { path: "src/components/toolbar.js" },
+    target: "src/components/toolbar.js",
+    tasks,
+  });
+  assert.equal(toolbarScope.allowed, true, JSON.stringify(toolbarScope));
 });
 
 test("runtime plan task derivation does not collapse an ambiguous basename", () => {
@@ -2259,7 +2584,7 @@ test("approved Plan blocks workspace mutations outside the reviewed task targets
     "- [ ] 修改 `src/hooks/useCsvParser.ts`，将 `creator` 映射为 `creatorName`。",
   );
   const allowed = resolveApprovedPlanMutationScope({
-    workflowMode: "plan",
+    workflowMode: "edit",
     isPlanApproved: true,
     toolName: "write_file",
     args: { path: "src/hooks/useCsvParser.ts" },
@@ -2267,7 +2592,7 @@ test("approved Plan blocks workspace mutations outside the reviewed task targets
     tasks,
   });
   const blocked = resolveApprovedPlanMutationScope({
-    workflowMode: "plan",
+    workflowMode: "edit",
     isPlanApproved: true,
     toolName: "apply_patch",
     args: { patch: "*** Begin Patch\n*** Update File: src/App.tsx\n@@\n-old\n+new\n*** End Patch" },
@@ -2278,6 +2603,52 @@ test("approved Plan blocks workspace mutations outside the reviewed task targets
   assert.equal(allowed.allowed, true);
   assert.equal(blocked.allowed, false);
   assert.deepEqual(blocked.unexpectedTargets, ["src/app.tsx"]);
+});
+
+test("approved Plan executes only exactly reviewed shell commands", () => {
+  const tasks = extractPlanTasks([
+    "- [ ] 修改 `src/main.js` 修复初始化顺序。",
+    "- [ ] 运行 `npm test` 验证。",
+  ].join("\n"));
+  const allowed = resolveApprovedPlanCommandScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "run_command",
+    args: { command: "npm test" },
+    tasks,
+  });
+  const readOnly = resolveApprovedPlanCommandScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "run_command",
+    args: { command: "git status" },
+    tasks,
+  });
+  const blocked = resolveApprovedPlanCommandScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "execute_command",
+    args: { command: "npm test; touch src/unplanned.ts" },
+    tasks,
+  });
+
+  assert.equal(allowed.allowed, true);
+  assert.equal(readOnly.allowed, false);
+  assert.equal(blocked.allowed, false);
+  assert.deepEqual(blocked.plannedCommands, ["npm test"]);
+  for (const command of [
+    "find src -delete",
+    "git diff --output=src/unplanned.patch",
+    "sort input.txt -o src/unplanned.ts",
+  ]) {
+    assert.equal(resolveApprovedPlanCommandScope({
+      workflowMode: "plan",
+      isPlanApproved: true,
+      toolName: "run_command",
+      args: { command },
+      tasks,
+    }).allowed, false, command);
+  }
 });
 
 test("approved Plan scope conflict identity is based on revision and targets, not mutation tool", () => {
@@ -2507,6 +2878,247 @@ test("browser or Playwright evidence satisfies browser render validation", () =>
   assert.equal(isPlanTaskTrustedComplete(commandReconciled[0]), true);
 });
 
+function browserInteractionTask(name) {
+  return {
+    id: `browser-${name.toLowerCase()}`,
+    text: `Control ${name} expects state ${name.toLowerCase()}`,
+    status: "pending",
+    executionKind: "validation",
+    evidence: [{
+      kind: "browser_dom",
+      value: "browser DOM validation",
+      requiresInteraction: true,
+    }],
+  };
+}
+
+function browserInteractionResult(names) {
+  return JSON.stringify({
+    ok: true,
+    actions: names.map((name, index) => ({
+      id: `action-${index + 1}`,
+      kind: "click",
+      value: `#${name.toLowerCase()}-trigger`,
+      ok: true,
+      stateChanged: true,
+      effectStateChanged: true,
+      effectChangedFields: ["bodyText", "externalDomFingerprint"],
+    })),
+    assertions: names.map((name, index) => ({
+      kind: "text",
+      value: `[data-state="${name.toLowerCase()}"]`,
+      passed: true,
+      beforePassed: false,
+      changedAfterAction: true,
+      causallyLinked: true,
+      afterActionId: `action-${index + 1}`,
+    })),
+    pageErrors: [],
+    consoleErrors: [],
+  });
+}
+
+test("a reviewed browser interaction subsumes the same durable user-request obligation", () => {
+  const reviewed = extractPlanTasks(
+    "- [ ] 使用浏览器工具实际点击 `#new-btn`，随后检查状态栏变为 new。",
+  );
+  const durable = deriveRuntimeValidationTasksFromUserRequest(
+    "通过浏览器实际点击 New，并检查状态栏变为 new。",
+    { language: "zh" },
+  );
+  const merged = mergeRuntimeValidationTaskRequirements(reviewed, durable);
+
+  assert.equal(reviewed.length, 1);
+  assert.equal(durable.length, 1);
+  assert.equal(merged.length, 1, JSON.stringify(merged, null, 2));
+  assert.equal(/^USER-VALIDATION-/.test(merged[0].requirementRef || ""), false);
+});
+
+test("punctuation-separated action and post-state form a structured browser contract", () => {
+  const [task] = extractPlanTasks(
+    '- [ ] 验证：点击 New 按钮，状态栏显示 "new"。',
+  );
+
+  assert.equal(task.evidence?.[0]?.requiresInteraction, true);
+  assert.match(task.evidence?.[0]?.value || "", /^browser interaction:\s*New 按钮$/i);
+});
+
+test("browser requirement coalescing keeps different controls and literal outcomes distinct", () => {
+  const reviewedOpen = extractPlanTasks(
+    '- [ ] 点击 Open 按钮，状态栏显示 "open"。',
+  );
+  const requiredNew = deriveRuntimeValidationTasksFromUserRequest(
+    '实际点击 New，并检查状态栏变为 "new"。',
+    { language: "zh" },
+  );
+  const mergedControls = mergeRuntimeValidationTaskRequirements(reviewedOpen, requiredNew);
+  assert.equal(mergedControls.length, 2);
+
+  const reviewedWrongOutcome = extractPlanTasks(
+    '- [ ] 点击 New 按钮，状态栏显示 "draft"。',
+  );
+  const mergedOutcomes = mergeRuntimeValidationTaskRequirements(reviewedWrongOutcome, requiredNew);
+  assert.equal(mergedOutcomes.length, 2);
+
+  const reviewedDifferentSubject = extractPlanTasks(
+    '- [ ] 点击 New 按钮，状态栏显示 "new"。',
+  );
+  const requiredEditorClear = deriveRuntimeValidationTasksFromUserRequest(
+    "实际点击 New，并检查编辑器内容清空。",
+    { language: "zh" },
+  );
+  assert.equal(
+    mergeRuntimeValidationTaskRequirements(reviewedDifferentSubject, requiredEditorClear).length,
+    2,
+  );
+});
+
+test("English coordinated action and post-state coalesce into one browser obligation", () => {
+  const reviewed = extractPlanTasks(
+    "- [ ] Verify: click the Open button and the status should display open.",
+  );
+  const required = deriveRuntimeValidationTasksFromUserRequest(
+    "Actually click Open and verify the status displays open.",
+    { language: "en" },
+  );
+
+  assert.match(reviewed[0].evidence?.[0]?.value || "", /^browser interaction:\s*the Open button$/i);
+  assert.equal(mergeRuntimeValidationTaskRequirements(reviewed, required).length, 1);
+});
+
+test("browser proof matches action and assertion roles independently", () => {
+  const tasks = extractPlanTasks([
+    "- [ ] Click Toggle, then verify status displays new.",
+    "- [ ] Click New, then verify status displays toggled.",
+  ].join("\n"));
+  const evidence = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: browserInteractionResult(["New"]),
+  });
+  const reconciled = reconcilePlanTaskCompletion([], tasks, evidence ? [evidence] : []);
+
+  assert.deepEqual(reconciled.map((task) => task.evidenceStatus), [
+    "requires_browser_validation",
+    "satisfied",
+  ]);
+});
+
+test("one structured browser result distributes distinct proof units across matching Plan tasks", () => {
+  const tasks = ["New", "Open", "Save"].map(browserInteractionTask);
+  const evidence = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: browserInteractionResult(["New", "Open", "Save"]),
+    // A stale recovery owner must not hide the other independently proven
+    // interactions in the same browser envelope.
+    planTaskId: "mutation-task",
+    requirementRef: "mutation-task",
+  });
+  const reconciled = reconcilePlanTaskCompletion([], tasks, evidence ? [evidence] : []);
+
+  assert.deepEqual(reconciled.map((task) => task.evidenceStatus), [
+    "satisfied",
+    "satisfied",
+    "satisfied",
+  ]);
+  assert.equal(reconciled.every(isPlanTaskTrustedComplete), true);
+});
+
+test("three independent browser calls satisfy their matching Plan tasks despite stale evidence owners", () => {
+  const tasks = ["New", "Open", "Save"].map(browserInteractionTask);
+  const evidence = ["New", "Open", "Save"].map((name) => createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: browserInteractionResult([name]),
+    // Runtime recovery may still carry the previous mutation owner. Exact
+    // structured interaction proof must win over that stale advisory owner.
+    planTaskId: "stale-mutation-task",
+    requirementRef: "stale-mutation-task",
+  })).filter(Boolean);
+  const reconciled = reconcilePlanTaskCompletion([], tasks, evidence);
+
+  assert.deepEqual(reconciled.map((task) => task.evidenceStatus), [
+    "satisfied",
+    "satisfied",
+    "satisfied",
+  ]);
+  assert.equal(reconciled.every(isPlanTaskTrustedComplete), true);
+});
+
+test("browser interaction proof is parsed from the exact result rather than a truncated display payload", () => {
+  const task = browserInteractionTask("New");
+  const rawResult = JSON.stringify({
+    ...JSON.parse(browserInteractionResult(["New"])),
+    textPreview: "rendered content ".repeat(1_000),
+  });
+  const displayResult = `${rawResult.slice(0, 10_000)}\n...[truncated]`;
+  const displayEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: displayResult,
+  });
+  const exactEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: rawResult,
+  });
+
+  const displayReconciled = reconcilePlanTaskCompletion(
+    [],
+    [task],
+    displayEvidence ? [displayEvidence] : [],
+  );
+  const exactReconciled = reconcilePlanTaskCompletion(
+    [],
+    [task],
+    exactEvidence ? [exactEvidence] : [],
+  );
+
+  assert.equal(displayEvidence?.browserInteraction, undefined);
+  assert.equal(displayReconciled[0].evidenceStatus, "requires_browser_validation");
+  assert.ok(exactEvidence?.browserInteraction);
+  assert.equal(exactReconciled[0].evidenceStatus, "satisfied");
+});
+
+test("a browser proof unit is not reused for a different interaction task", () => {
+  const tasks = ["New", "Open", "Save"].map(browserInteractionTask);
+  const evidence = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: browserInteractionResult(["New"]),
+    planTaskId: "mutation-task",
+  });
+  const reconciled = reconcilePlanTaskCompletion([], tasks, evidence ? [evidence] : []);
+
+  assert.deepEqual(reconciled.map((task) => task.evidenceStatus), [
+    "satisfied",
+    "requires_browser_validation",
+    "requires_browser_validation",
+  ]);
+});
+
+test("page load and unrelated browser actions cannot satisfy an interaction Plan task", () => {
+  const task = browserInteractionTask("New");
+  const pageLoad = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: JSON.stringify({ ok: true, actions: [], assertions: [] }),
+    planTaskId: task.id,
+  });
+  const unrelated = createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: browserInteractionResult(["Archive"]),
+    planTaskId: task.id,
+  });
+
+  const afterPageLoad = reconcilePlanTaskCompletion([], [task], pageLoad ? [pageLoad] : []);
+  const afterUnrelatedAction = reconcilePlanTaskCompletion([], [task], unrelated ? [unrelated] : []);
+  assert.equal(afterPageLoad[0].evidenceStatus, "requires_browser_validation");
+  assert.equal(afterUnrelatedAction[0].evidenceStatus, "requires_browser_validation");
+});
+
 test("failed browser validation does not satisfy browser render evidence", () => {
   const parsed = extractPlanTasks("- [x] 手动测试：打开 test-sample.md，验证所有 Markdown 元素渲染正确");
   const failedBrowserEvidence = createPlanExecutionEvidenceEntry({
@@ -2612,6 +3224,19 @@ test("long-running desktop startup requires execute_command plus a later PTY obs
 
   assert.ok(startupTask, JSON.stringify(tasks, null, 2));
   assert.ok(externalTask, JSON.stringify(tasks, null, 2));
+
+  const bareViteDispatch = createPlanExecutionEvidenceEntry({
+    toolName: "execute_command",
+    target: "vite --host 127.0.0.1 --port 1420",
+    result: JSON.stringify({
+      command: "vite --host 127.0.0.1 --port 1420",
+      output: "command accepted",
+      foregroundGeneration: 3,
+    }),
+  });
+  assert.equal(bareViteDispatch?.observationStatus, "pending");
+  assert.equal(bareViteDispatch?.foregroundGeneration, 3);
+  assert.equal(bareViteDispatch?.devServerPort, 1420);
 
   const dispatched = createPlanExecutionEvidenceEntry({
     toolName: "execute_command",
@@ -3463,7 +4088,6 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
 
   assert.equal(
     shouldHandleApprovedPlanExecutionNoTool({
-      workflowMode: "plan",
       isPlanApproved: true,
       planStage: "executing",
       toolCallCount: 0,
@@ -3473,7 +4097,6 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
   );
   assert.equal(
     shouldHandleApprovedPlanExecutionNoTool({
-      workflowMode: "plan",
       isPlanApproved: true,
       planStage: "design",
       toolCallCount: 0,
@@ -3489,7 +4112,6 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
   assert.equal(advisoryAudit.acceptedCompletion, true);
   assert.equal(
     shouldHandleApprovedPlanExecutionNoTool({
-      workflowMode: "plan",
       isPlanApproved: true,
       planStage: "executing",
       toolCallCount: 0,
@@ -3585,4 +4207,178 @@ test("collectChangeEntries includes MCP Unity edit diffs", () => {
   assert.equal(result.entries[0].target, "Assets/Scripts/Managers/GameManager.cs");
   assert.equal(result.entries[0].displayTarget, "GameManager.cs");
   assert.equal(result.entries[0].taskId, 41);
+});
+
+test("Plan evidence identity isolates same-file tasks and legacy records are consumed one-to-one", () => {
+  const tasks = ["task-a", "task-b"].map((id) => ({
+    id,
+    text: `Modify shared source for ${id}`,
+    status: "pending",
+    evidenceStatus: "missing",
+    executionKind: "mutation",
+    evidence: [{ kind: "file", value: "src/shared.ts" }],
+  }));
+  const mutation = (planTaskId) => createPlanExecutionEvidenceEntry({
+    toolName: "apply_patch",
+    target: "src/shared.ts",
+    result: "patched",
+    diff: { old: "before", new: `after ${planTaskId || "legacy"}`, path: "src/shared.ts" },
+    ...(planTaskId ? { planTaskId, requirementRef: planTaskId } : {}),
+  });
+
+  const scopedAudit = buildPlanTaskEvidenceAudit({
+    tasks,
+    evidenceLedger: [mutation("task-b")],
+  });
+  assert.equal(scopedAudit.tasks[0].evidenceStatus, "missing");
+  assert.equal(scopedAudit.tasks[1].evidenceStatus, "satisfied");
+
+  const oneLegacyAudit = buildPlanTaskEvidenceAudit({
+    tasks,
+    evidenceLedger: [mutation(null)],
+  });
+  assert.equal(oneLegacyAudit.tasks[0].evidenceStatus, "satisfied");
+  assert.equal(oneLegacyAudit.tasks[1].evidenceStatus, "missing");
+
+  const twoLegacyAudit = buildPlanTaskEvidenceAudit({
+    tasks,
+    evidenceLedger: [mutation(null), mutation(null)],
+  });
+  assert.equal(twoLegacyAudit.tasks[0].evidenceStatus, "satisfied");
+  assert.equal(twoLegacyAudit.tasks[1].evidenceStatus, "satisfied");
+});
+
+test("Plan evidence ownership advances when the checkpoint obligation does not match the tool result", () => {
+  const tasks = [
+    {
+      id: "mutation",
+      requirementRef: "REQ-MUTATION",
+      text: "Modify toolbar",
+      status: "in_progress",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "file", value: "src/toolbar.js" }],
+    },
+    {
+      id: "build",
+      requirementRef: "REQ-BUILD",
+      text: "Build project",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "cmd", value: "npm run build" }],
+    },
+    {
+      id: "dev",
+      requirementRef: "REQ-DEV",
+      text: "Start development server",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "cmd", value: "npm run dev" }],
+    },
+    {
+      id: "browser",
+      requirementRef: "REQ-BROWSER",
+      text: "Inspect rendered page",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "browser_dom", value: "rendered page" }],
+    },
+  ];
+  const preferred = {
+    preferredPlanTaskId: "mutation",
+    preferredRequirementRef: "REQ-MUTATION",
+  };
+  const buildRecord = {
+    id: "build-result",
+    kind: "cmd",
+    value: "npm run build",
+    target: "npm run build",
+    sourceTool: "run_command",
+    createdAt: 1,
+  };
+  assert.deepEqual(resolvePlanExecutionEvidenceIdentity({
+    tasks,
+    evidenceLedger: [],
+    record: buildRecord,
+    ...preferred,
+  }), {
+    planTaskId: "build",
+    requirementRef: "REQ-BUILD",
+  });
+
+  const devLaunch = {
+    id: "dev-launch",
+    planTaskId: "dev",
+    requirementRef: "REQ-DEV",
+    kind: "cmd",
+    value: "npm run dev",
+    target: "npm run dev",
+    sourceTool: "execute_command",
+    observationStatus: "pending",
+    foregroundGeneration: 4,
+    createdAt: 2,
+  };
+  const readyObservation = {
+    id: "dev-ready",
+    kind: "dev_server_url",
+    value: "http://localhost:1420/",
+    target: "terminal",
+    sourceTool: "read_pty_since",
+    observationStatus: "ready",
+    foregroundGeneration: 4,
+    createdAt: 3,
+  };
+  assert.equal(resolvePlanExecutionEvidenceIdentity({
+    tasks,
+    evidenceLedger: [devLaunch],
+    record: readyObservation,
+    preferredPlanTaskId: "dev",
+  })?.planTaskId, "dev");
+
+  const browserRecord = {
+    id: "browser-result",
+    kind: "browser_dom",
+    value: "http://localhost:1420/",
+    target: "http://localhost:1420/",
+    sourceTool: "browser_evaluate",
+    createdAt: 4,
+  };
+  assert.equal(resolvePlanExecutionEvidenceIdentity({
+    tasks,
+    evidenceLedger: [devLaunch, { ...readyObservation, planTaskId: "dev", requirementRef: "REQ-DEV" }],
+    record: browserRecord,
+    preferredPlanTaskId: "dev",
+  })?.planTaskId, "browser");
+});
+
+test("composite Plan task keeps ownership only for its matching obligations", () => {
+  const task = {
+    id: "composite",
+    requirementRef: "REQ-COMPOSITE",
+    text: "Modify and build",
+    status: "in_progress",
+    evidenceStatus: "missing",
+    evidence: [
+      { kind: "file", value: "src/main.ts" },
+      { kind: "cmd", value: "npm run build" },
+    ],
+  };
+  const buildFailure = {
+    id: "build-failure",
+    kind: "cmd",
+    value: "npm run build",
+    target: "npm run build",
+    sourceTool: "run_command",
+    observationStatus: "failed",
+    createdAt: 1,
+  };
+  assert.equal(resolvePlanExecutionEvidenceIdentity({
+    tasks: [task],
+    record: buildFailure,
+    preferredPlanTaskId: "composite",
+  })?.planTaskId, "composite");
+  assert.equal(resolvePlanExecutionEvidenceIdentity({
+    tasks: [task],
+    record: { ...buildFailure, id: "unrelated", value: "npm run dev", target: "npm run dev" },
+    preferredPlanTaskId: "composite",
+  }), null);
 });

@@ -44,6 +44,10 @@ import {
   detectVisibleTextRepetition,
   type VisibleTextRepetitionMatch,
 } from "./visibleTextRepetition";
+import {
+  countProviderOmittedVisualParts,
+  type VisualTransportReceipt,
+} from "./visualContext";
 
 function emitStreamingConsole(
   source: "streaming" | "streamViaRustProxy",
@@ -161,6 +165,8 @@ export interface StreamResult {
     totalTokens: number;
   };
   streamDiagnostics?: StreamSemanticDiagnostics;
+  /** Receipt for the exact accepted request that produced this response. */
+  visualTransportReceipt?: VisualTransportReceipt;
 }
 
 export type StreamMirrorKind =
@@ -650,6 +656,151 @@ function mapMessageForApi(
   return { role: m.role, content: typeof m.content === "string" ? m.content : m.content, ...assistantReasoning };
 }
 
+function visualPayloadIdentity(value: unknown, rawBase64 = false): string | null {
+  const text = String(value || "").trim();
+  if (!text) return null;
+  const dataUrl = text.match(/^data:image\/[^;]+;base64,(.+)$/s);
+  if (dataUrl) return `base64:${dataUrl[1]}`;
+  if (/^https?:\/\//i.test(text)) return `url:${text}`;
+  return rawBase64 ? `base64:${text}` : null;
+}
+
+function visualPayloadIdentitiesFromMessage(message: ChatMessage): string[] {
+  if (!Array.isArray(message.content)) return [];
+  return message.content.flatMap((part) => {
+    if (part.type !== "image_url") return [];
+    const identity = visualPayloadIdentity(part.image_url.url);
+    return identity ? [identity] : [];
+  });
+}
+
+function latestLogicalVisualPayload(messages: ChatMessage[]): {
+  identities: string[];
+  omittedParts: number;
+} {
+  // Bind the receipt to the newest visual-bearing logical message. An image
+  // left in history must never make a newer image that was dropped during
+  // provider serialization look delivered.
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const identities = visualPayloadIdentitiesFromMessage(message);
+    const omittedParts = countProviderOmittedVisualParts([message]);
+    if (identities.length > 0 || omittedParts > 0) return { identities, omittedParts };
+  }
+  return { identities: [], omittedParts: 0 };
+}
+
+function collectSerializedVisualPayloadIdentities(
+  value: unknown,
+  output: string[] = [],
+  seen = new Set<object>(),
+): string[] {
+  if (!value || typeof value !== "object") return output;
+  if (seen.has(value as object)) return output;
+  seen.add(value as object);
+  if (Array.isArray(value)) {
+    value.forEach((item) => collectSerializedVisualPayloadIdentities(item, output, seen));
+    return output;
+  }
+
+  const record = value as Record<string, unknown>;
+  const type = String(record.type || "").toLowerCase();
+  if (type === "image_url" || type === "input_image") {
+    const imageUrl = typeof record.image_url === "string"
+      ? record.image_url
+      : (record.image_url as Record<string, unknown> | undefined)?.url;
+    const identity = visualPayloadIdentity(imageUrl);
+    if (identity) output.push(identity);
+  }
+  if (type === "image") {
+    const source = record.source as Record<string, unknown> | undefined;
+    const sourceType = String(source?.type || "").toLowerCase();
+    const identity = sourceType === "base64"
+      ? visualPayloadIdentity(source?.data, true)
+      : visualPayloadIdentity(source?.url);
+    if (identity) output.push(identity);
+  }
+  const inlineData = (record.inlineData || record.inline_data) as Record<string, unknown> | undefined;
+  if (inlineData && typeof inlineData.data === "string") {
+    const identity = visualPayloadIdentity(inlineData.data, true);
+    if (identity) output.push(identity);
+  }
+  if (Array.isArray(record.images)) {
+    for (const image of record.images) {
+      const identity = visualPayloadIdentity(image, true);
+      if (identity) output.push(identity);
+    }
+  }
+  for (const [key, child] of Object.entries(record)) {
+    if (
+      key === "image_url" ||
+      key === "source" ||
+      key === "inlineData" ||
+      key === "inline_data" ||
+      key === "images"
+    ) continue;
+    collectSerializedVisualPayloadIdentities(child, output, seen);
+  }
+  return output;
+}
+
+function countCurrentSerializedVisualParts(
+  logicalIdentities: string[],
+  body: Record<string, unknown>,
+): number {
+  const serializedCounts = new Map<string, number>();
+  for (const identity of collectSerializedVisualPayloadIdentities(body)) {
+    serializedCounts.set(identity, (serializedCounts.get(identity) || 0) + 1);
+  }
+  let matched = 0;
+  for (const identity of logicalIdentities) {
+    const remaining = serializedCounts.get(identity) || 0;
+    if (remaining <= 0) continue;
+    serializedCounts.set(identity, remaining - 1);
+    matched += 1;
+  }
+  return matched;
+}
+
+function buildVisualTransportReceipt(
+  messages: ChatMessage[],
+  body: Record<string, unknown>,
+  protocol: string,
+): VisualTransportReceipt {
+  const currentVisual = latestLogicalVisualPayload(messages);
+  const logicalImageParts = currentVisual.identities.length;
+  const serializedImageParts = countCurrentSerializedVisualParts(currentVisual.identities, body);
+  const providerOmittedParts = currentVisual.omittedParts;
+  const omittedImageParts = Math.max(
+    providerOmittedParts,
+    logicalImageParts - serializedImageParts,
+  );
+  return {
+    protocol,
+    requestAccepted: true,
+    logicalImageParts,
+    serializedImageParts,
+    omittedImageParts,
+    ...(providerOmittedParts > 0
+      ? { omissionReason: "provider_unsupported" }
+      : omittedImageParts > 0
+      ? { omissionReason: "serialization_omitted_images" }
+      : {}),
+  };
+}
+
+function attachVisualTransportReceipt(
+  result: StreamResult,
+  messages: ChatMessage[],
+  body: Record<string, unknown>,
+  protocol: string,
+): StreamResult {
+  return {
+    ...result,
+    visualTransportReceipt: buildVisualTransportReceipt(messages, body, protocol),
+  };
+}
+
 function buildOllamaOptions(settings: StreamSettings, maxTokens: number): Record<string, unknown> {
   return {
     num_predict: maxTokens,
@@ -981,15 +1132,21 @@ async function requestOpenAiNonStreaming(
       : buildCloudHeaders("openai", settings.apiKey, true, settings.customHeaders, settings.authMode);
     const minimalCompatibilityMode = isTranscriptCompatibilityRequest(messages);
     let payload: unknown;
+    let acceptedRequestBody: Record<string, unknown> | null = null;
+    let acceptedRequestProtocol = isGemini ? "gemini" : apiFormat === "responses"
+      ? "openai_responses"
+      : "openai_chat_completions";
 
     if (isGemini) {
+      const requestBody = geminiRequest?.body ?? {};
       payload = await postJsonRequest(
         apiUrl,
         headers,
-        geminiRequest?.body ?? {},
+        requestBody,
         settings,
         signal,
       );
+      acceptedRequestBody = requestBody;
     } else if (apiFormat === "responses") {
       const shouldIncludeTools = !minimalCompatibilityMode && shouldSendNativeTools(settings);
       const requestCandidates = buildOpenAiResponsesRequestCandidates({
@@ -1010,6 +1167,7 @@ async function requestOpenAiNonStreaming(
       let lastCompatibilityError: Error | null = null;
       let sawRetryableGatewayError = false;
       let gatewayCompactCandidates: ReturnType<typeof buildOpenAiResponsesRequestCandidates> | null = null;
+      let gatewayCompactStructuredCandidate: (typeof requestCandidates)[number] | null = null;
       let gatewayCompactTranscriptCandidate: (typeof requestCandidates)[number] | null = null;
       let sawEmptyResponseCandidate = false;
       let lastEmptyResponseMode: string | null = null;
@@ -1034,12 +1192,13 @@ async function requestOpenAiNonStreaming(
             reasoningEffort: settings.reasoningEffort ?? "none",
             nativeTools: candidateTools.length,
           });
+          const candidateBody = settings.authMode === "openai_chatgpt_oauth"
+            ? ensureOpenAiChatGptCodexRequestBody(candidate.body)
+            : candidate.body;
           const candidatePayload = await postJsonRequest(
             apiUrl,
             headers,
-            settings.authMode === "openai_chatgpt_oauth"
-              ? ensureOpenAiChatGptCodexRequestBody(candidate.body)
-              : candidate.body,
+            candidateBody,
             settings,
             signal,
           );
@@ -1053,6 +1212,7 @@ async function requestOpenAiNonStreaming(
             continue;
           }
           payload = candidatePayload;
+          acceptedRequestBody = candidateBody;
           if (candidate.mode !== "message_text") {
             emitStreamingConsole("streaming", "info", `OpenAI responses fallback succeeded with ${candidate.mode}`);
           }
@@ -1082,15 +1242,21 @@ async function requestOpenAiNonStreaming(
                   ? Math.min(6000, computeContextBudgets(settings.contextLimit, maxTokens).inputBudget)
                   : 6000,
               });
+              const compactStructuredCandidate = gatewayCompactCandidates.find((item) => item.mode === "message_text");
               const compactTranscriptCandidate = gatewayCompactCandidates.find((item) => item.mode === "transcript_text");
-              if (compactTranscriptCandidate) {
-                gatewayCompactTranscriptCandidate = compactTranscriptCandidate;
-                requestCandidates.splice(candidateIndex + 1, 0, compactTranscriptCandidate);
-              }
+              gatewayCompactStructuredCandidate = compactStructuredCandidate || null;
+              gatewayCompactTranscriptCandidate = compactTranscriptCandidate || null;
+              requestCandidates.splice(
+                candidateIndex + 1,
+                0,
+                ...[gatewayCompactStructuredCandidate, gatewayCompactTranscriptCandidate].filter(
+                  (item): item is (typeof requestCandidates)[number] => !!item,
+                ),
+              );
               emitStreamingConsole(
                 "streaming",
                 "warn",
-                `OpenAI responses retryable gateway failure with ${candidate.mode}; retrying with aggressive compact transcript input`,
+                `OpenAI responses retryable gateway failure with ${candidate.mode}; retrying with aggressive compact structured input before transcript fallback`,
                 errMsg,
               );
             }
@@ -1115,10 +1281,12 @@ async function requestOpenAiNonStreaming(
     } else {
       const chatBody: Record<string, unknown> = {
         model: settings.model,
-        messages: messages.map((message) => ({
-          role: message.role === "tool" ? "user" : message.role,
-          content: extractTextContent(message.content),
-        })),
+        messages: messages.map((message) => {
+          const mapped = mapMessageForApi(message, false);
+          return mapped.role === "tool"
+            ? { role: "user", content: mapped.content }
+            : mapped;
+        }),
         stream: false,
         ...(!minimalCompatibilityMode && tools && tools.length > 0 ? { tools: normalizeToolDefinitions(tools) } : {}),
         ...(!minimalCompatibilityMode ? { max_tokens: maxTokens } : {}),
@@ -1134,6 +1302,7 @@ async function requestOpenAiNonStreaming(
         settings,
         signal,
       );
+      acceptedRequestBody = chatBody;
     }
 
     const content = isGemini ? extractGeminiResponseText(payload) : extractOpenAiResponseText(payload, apiFormat);
@@ -1150,7 +1319,7 @@ async function requestOpenAiNonStreaming(
       reasoningContent: reasoning.reasoningContent,
     });
     const completedAt = Date.now();
-    const result: StreamResult = {
+    const baseResult: StreamResult = {
       content,
       actionableContent: semanticProgress.actionableContent,
       semanticContent: semanticProgress.semanticContent,
@@ -1180,6 +1349,14 @@ async function requestOpenAiNonStreaming(
       },
       ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
     };
+    const result = acceptedRequestBody
+      ? attachVisualTransportReceipt(
+          baseResult,
+          messages,
+          acceptedRequestBody,
+          acceptedRequestProtocol,
+        )
+      : baseResult;
 
     const displayContent = semanticProgress.mirrorKind === "none"
       ? content
@@ -1274,6 +1451,13 @@ async function streamViaRustProxy(
     body.tools = normalizeToolDefinitions(tools);
   }
   applyOpenAiToolChoice(body, settings, tools, options.toolChoice);
+  const visualProtocol = isOllama
+    ? "ollama"
+    : isAnthropic
+    ? "anthropic"
+    : isGemini
+    ? "gemini"
+    : "openai_chat_completions";
 
   const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
   const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
@@ -1286,12 +1470,12 @@ async function streamViaRustProxy(
       const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
       const content = extractGeminiResponseText(payload);
       if (content) onToken(content);
-      const result: StreamResult = {
+      const result = attachVisualTransportReceipt({
         content,
         toolCalls: [],
         finishReason: "stop",
         ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
-      };
+      }, messages, body, visualProtocol);
       onDone(result);
       return result;
     } catch (err) {
@@ -1419,7 +1603,7 @@ async function streamViaRustProxy(
     if (semanticDelta) onToken(semanticDelta);
   };
 
-  const buildCurrentOpenAiCompatibleResult = (): StreamResult => ({
+  const buildCurrentOpenAiCompatibleResult = (): StreamResult => attachVisualTransportReceipt({
     content: fullContent,
     actionableContent: semanticProgress.actionableContent,
     semanticContent: semanticProgress.semanticContent,
@@ -1433,7 +1617,7 @@ async function streamViaRustProxy(
           ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
         }
       : {}),
-  });
+  }, messages, body, visualProtocol);
 
   const stopReasoningOnlyRunaway = () => {
     if (resolved || anthropicProcessor) return false;
@@ -1817,7 +2001,7 @@ async function streamViaRustProxy(
         reasoningGarbled = true; // prevent further buffering
 
         const result: StreamResult = anthropicProcessor
-          ? anthropicProcessor.getResult()
+          ? attachVisualTransportReceipt(anthropicProcessor.getResult(), messages, body, visualProtocol)
           : buildCurrentOpenAiCompatibleResult();
         onDone(result);
         resolveResult?.(result);
@@ -1945,6 +2129,13 @@ export async function streamChatCompletion(
     body.tools = normalizeToolDefinitions(tools);
   }
   applyOpenAiToolChoice(body, settings, tools, options.toolChoice);
+  const visualProtocol = isOllama
+    ? "ollama"
+    : isAnthropic
+    ? "anthropic"
+    : isGemini
+    ? "gemini"
+    : "openai_chat_completions";
 
   const apiUrl = geminiRequest?.url ?? buildApiUrl(settings);
   const protocol: CloudApiProtocol = isAnthropic ? "anthropic" : isGemini ? "gemini" : "openai";
@@ -1957,12 +2148,12 @@ export async function streamChatCompletion(
       const payload = await postJsonRequest(apiUrl, headers, body, settings, signal);
       const content = extractGeminiResponseText(payload);
       if (content) onToken(content);
-      const result: StreamResult = {
+      const result = attachVisualTransportReceipt({
         content,
         toolCalls: [],
         finishReason: "stop",
         ...(extractProviderTokenUsage(payload) ? { usage: extractProviderTokenUsage(payload) } : {}),
-      };
+      }, messages, body, visualProtocol);
       onDone(result);
       return result;
     } catch (err) {
@@ -2125,7 +2316,7 @@ export async function streamChatCompletion(
   // Accumulate tool calls across deltas, keyed by index
   const toolCallsMap = new Map<number, StreamedToolCall>();
 
-  const buildCurrentOpenAiCompatibleResult = (): StreamResult => ({
+  const buildCurrentOpenAiCompatibleResult = (): StreamResult => attachVisualTransportReceipt({
     content: fullContent,
     actionableContent: semanticProgress.actionableContent,
     semanticContent: semanticProgress.semanticContent,
@@ -2139,7 +2330,7 @@ export async function streamChatCompletion(
           ...(providerReasoningField ? { reasoningField: providerReasoningField } : {}),
         }
       : {}),
-  });
+  }, messages, body, visualProtocol);
 
   const throwIfVisibleTextRepetition = () => {
     if (toolCallsMap.size > 0) return;
@@ -2398,7 +2589,7 @@ export async function streamChatCompletion(
   reasoningGarbled = true;
 
   const result: StreamResult = anthropicProcessor
-    ? anthropicProcessor.getResult()
+    ? attachVisualTransportReceipt(anthropicProcessor.getResult(), messages, body, visualProtocol)
     : buildCurrentOpenAiCompatibleResult();
 
   if (result.finishReason === "length") {

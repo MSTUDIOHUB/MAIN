@@ -359,6 +359,43 @@ test("streaming display policy buffers short protocol/noise tokens in plan execu
   assert.equal(continuation.text, " world");
 });
 
+test("visual observation metadata never appears in streaming or final assistant text", () => {
+  const marker = '<!--MAIN_VISUAL_OBSERVATION {"turnId":"turn-1","imageCount":1,"summary":"A compact toolbar is visible."}-->';
+  for (const cleaned of [
+    sanitizeAIOutput(`${marker}\nVisible conclusion.`),
+    sanitizeAssistantDisplayContent(`${marker}\nVisible conclusion.`),
+    sanitizeVisibleAssistantText(`${marker}\nVisible conclusion.`),
+  ]) {
+    assert.equal(cleaned, "Visible conclusion.");
+  }
+
+  const complete = resolveStreamingAssistantDisplay({
+    text: `${marker}\nVisible conclusion.`,
+    language: "en",
+    workflowMode: "chat",
+    runIntent: "chat",
+    hasVisibleAgentBlock: true,
+  });
+  assert.equal(complete.action, "show");
+  assert.equal(complete.text, "Visible conclusion.");
+
+  const partial = resolveStreamingAssistantDisplay({
+    text: '<!--MAIN_VISUAL_OBSERVATION {"turnId":"turn-1"',
+    language: "en",
+    workflowMode: "chat",
+    runIntent: "chat",
+    hasVisibleAgentBlock: true,
+  });
+  assert.equal(partial.action, "buffer");
+  assert.equal(partial.text, "");
+  assert.equal(
+    sanitizeAssistantDisplayContent(
+      'Visible preface.\n<!-- MAIN_VISUAL_OBSERVATION {"turnId":"turn-1"',
+    ),
+    "Visible preface.",
+  );
+});
+
 test("streaming display policy preserves normal markdown tables", () => {
   const decision = resolveStreamingAssistantDisplay({
     text: "| 文件 | 状态 |\n| --- | --- |\n| src/App.tsx | 已读 |",

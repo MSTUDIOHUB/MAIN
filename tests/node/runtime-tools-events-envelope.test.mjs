@@ -182,7 +182,7 @@ test("runtime tool planner classifies lifecycle actions and initial states", () 
 
 test("approved plan execution blocks shell and source writes until runtime tasks exist", () => {
   const base = {
-    workflowMode: "plan",
+    workflowMode: "edit",
     runtimeIntent: "execute",
     isPlanApproved: true,
     planTaskCount: 0,
@@ -245,7 +245,7 @@ test("approved plan execution blocks shell and source writes until runtime tasks
 
 test("approved plan execution allows source work when runtime tasks exist", () => {
   const base = {
-    workflowMode: "plan",
+    workflowMode: "edit",
     runtimeIntent: "execute",
     isPlanApproved: true,
     planTaskCount: 2,
@@ -275,7 +275,7 @@ test("approved plan execution allows source work when runtime tasks exist", () =
 
 test("approved plan execution can route browser validation tools when runtime tasks exist", () => {
   const browserRun = planRuntimeToolCall(createPlanInput({
-    workflowMode: "plan",
+    workflowMode: "edit",
     runtimeIntent: "execute",
     isPlanApproved: true,
     planTaskCount: 2,
@@ -498,6 +498,48 @@ test("Goal slice completion terminates only the child run, not the long-lived tu
   emitter.emitTurnCompletedEvent();
   assert.deepEqual(events.map((event) => event.type), ["run.completed"]);
   assert.equal(events[0].goalSliceId, "goal-1:slice:1");
+});
+
+test("turn completion emitter stages exactly one terminal commit", () => {
+  const events = [];
+  const emitter = turnPreparation.createTurnEventEmitter({
+    getSessionKey: () => "session-staged",
+    getCurrentTurnId: () => "turn-staged",
+    getGoalTurnContract: () => null,
+    onTurnEvent: (event) => events.push(event),
+  });
+  let committed = 0;
+
+  emitter.stageTurnCompletion(() => {
+    committed += 1;
+    emitter.emitTurnCompletedEvent();
+  });
+  emitter.stageTurnCompletion(() => {
+    committed += 10;
+  });
+
+  assert.equal(emitter.hasStagedTurnCompletion(), true);
+  assert.deepEqual(events, []);
+  assert.equal(emitter.commitStagedTurnCompletion(), true);
+  assert.equal(emitter.commitStagedTurnCompletion(), false);
+  assert.equal(committed, 1);
+  assert.equal(emitter.hasStagedTurnCompletion(), false);
+  assert.deepEqual(events.map((event) => event.type), ["run.completed", "turn.completed"]);
+});
+
+test("discarding a staged turn completion publishes no terminal event", () => {
+  const events = [];
+  const emitter = turnPreparation.createTurnEventEmitter({
+    getSessionKey: () => "session-discarded",
+    getCurrentTurnId: () => "turn-discarded",
+    getGoalTurnContract: () => null,
+    onTurnEvent: (event) => events.push(event),
+  });
+
+  emitter.stageTurnCompletion(() => emitter.emitTurnCompletedEvent());
+  assert.equal(emitter.discardStagedTurnCompletion(), true);
+  assert.equal(emitter.hasStagedTurnCompletion(), false);
+  assert.deepEqual(events, []);
 });
 
 test("tool feedback envelope v1 supports parse/format roundtrip", () => {

@@ -61,6 +61,7 @@ const {
   buildCompatibilityRetryMessages,
   buildTranscriptCompatibilityRetryMessages,
   isProviderCompatibilityErrorMessage,
+  isProviderImageContentCompatibilityErrorMessage,
   isNativeToolCompatibilityErrorMessage,
 } = providerCompatibility;
 
@@ -99,6 +100,14 @@ test("provider compatibility error helper matches weak OpenAI-compatible gateway
     isProviderCompatibilityErrorMessage('HTTP 502 Bad Gateway: {"error":{"message":"Upstream request failed","type":"upstream_error"}}'),
     false,
   );
+  assert.equal(
+    isProviderImageContentCompatibilityErrorMessage('HTTP 400 Bad Request: {"error":{"message":"Unsupported image_url content type"}}'),
+    true,
+  );
+  assert.equal(
+    isProviderImageContentCompatibilityErrorMessage('HTTP 400: invalid tools payload'),
+    false,
+  );
 });
 
 test("provider compatibility prompt exposes XML write tools for implementation mode", () => {
@@ -113,7 +122,7 @@ test("provider compatibility prompt exposes XML write tools for implementation m
   assert.match(message.content, /<tool>write_file<\/tool>/);
 });
 
-test("compatibility retry flattens multimodal and tool history into plain text", () => {
+test("XML tool compatibility preserves multimodal user content while flattening tool history", () => {
   const messages = buildCompatibilityRetryMessages([
     {
       role: "user",
@@ -141,8 +150,10 @@ test("compatibility retry flattens multimodal and tool history into plain text",
 
   assert.equal(messages.length, 3);
   assert.equal(messages[0].role, "user");
-  assert.match(messages[0].content, /请看截图/);
-  assert.match(messages[0].content, /Image omitted/);
+  assert.equal(Array.isArray(messages[0].content), true);
+  assert.equal(messages[0].content[0].text, "请看截图");
+  assert.equal(messages[0].content[1].type, "image_url");
+  assert.equal(messages[0].content[1].image_url.url, "data:image/png;base64,abc");
   assert.equal(messages[1].role, "assistant");
   assert.equal(messages[1].content, "我先检查文件。");
   assert.equal(messages[1].reasoning_content, undefined);
@@ -150,10 +161,31 @@ test("compatibility retry flattens multimodal and tool history into plain text",
   assert.match(messages[2].content, /\[Tool result\]/);
 });
 
+test("explicit image incompatibility omits images with structured unsupported state", () => {
+  const [message] = buildCompatibilityRetryMessages([{
+    role: "user",
+    content: [
+      { type: "text", text: "Inspect the screenshot" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+    ],
+  }], { imageHandling: "omit_unsupported" });
+
+  assert.equal(message.role, "user");
+  assert.equal(typeof message.content, "string");
+  assert.match(message.content, /\[visual_context_omission\]/);
+  assert.match(message.content, /status: provider_unsupported/);
+  assert.match(message.content, /imageCount: 1/);
+  assert.match(message.content, /Do not infer or claim visual details/);
+  assert.doesNotMatch(message.content, /data:image/);
+});
+
 test("transcript compatibility retry collapses history into one plain-text user message", () => {
   const messages = buildTranscriptCompatibilityRetryMessages([
     { role: "system", content: "You are helpful." },
-    { role: "user", content: "帮我读一下 src/App.tsx" },
+    { role: "user", content: [
+      { type: "text", text: "帮我读一下 src/App.tsx 和截图" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,abc" } },
+    ] },
     { role: "assistant", content: "我先检查。" },
     { role: "tool", content: "{\"ok\":true}" },
   ], "edit");
@@ -167,6 +199,8 @@ test("transcript compatibility retry collapses history into one plain-text user 
   assert.match(messages[0].content, /\[Assistant 3\]/);
   assert.match(messages[0].content, /\[User 4\]/);
   assert.match(messages[0].content, /emit XML <tool_use> blocks only/);
+  assert.match(messages[0].content, /status: provider_unsupported/);
+  assert.match(messages[0].content, /imageCount: 1/);
 });
 
 test("compatibility retry preserves v1 envelope header for tool messages", () => {

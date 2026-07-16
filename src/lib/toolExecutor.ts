@@ -558,8 +558,19 @@ export async function executeTool(
       });
     }
 
-    case "read_pty_buffer":
-      return sanitizePtyOutput(await readPtyBuffer(parseOptionalNumber(args.max_chars), sessionKey));
+    case "read_pty_buffer": {
+      const [text, status] = await Promise.all([
+        readPtyBuffer(parseOptionalNumber(args.max_chars), sessionKey),
+        getPtyStatus(sessionKey),
+      ]);
+      return JSON.stringify(sanitizePtyResult({
+        ...status,
+        text,
+        startOffset: status.bufferStartOffset,
+        endOffset: status.bufferEndOffset,
+        truncated: false,
+      }));
+    }
 
     case "read_pty_tail":
       await sleep(Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 0, 0), 30_000));

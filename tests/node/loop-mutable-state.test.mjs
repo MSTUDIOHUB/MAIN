@@ -62,7 +62,6 @@ test("loop mutable state owns per-loop runtime state initialization", () => {
   assert.match(stateSource, /createAgentLoopRecoveryPromptRuntimeState\(\)/);
   assert.match(stateSource, /createPlanLoopRuntimeState\(\{/);
   assert.match(stateSource, /createAgentLoopEvidenceRuntimeState\(\)/);
-  assert.match(stateSource, /createApprovedPlanRecoveryRuntimeState\(\)/);
   assert.match(stateSource, /createExecuteRecoveryRuntimeState\(\{/);
   assert.match(stateSource, /createAgentLoopToolExecutionRuntimeState\(/);
   assert.match(stateSource, /unityMcpRuntimeState: input\.unityMcpRuntimeState/);
@@ -75,7 +74,6 @@ test("loop mutable state owns common phase result folds", () => {
   assert.match(stateSource, /state\.streamRuntimeState = result\.streamRuntimeState/);
   assert.match(stateSource, /state\.executeRecoveryState = result\.executeRecoveryState/);
   assert.match(stateSource, /applyAssistantIterationMutableState/);
-  assert.match(stateSource, /state\.approvedPlanRecoveryState = result\.approvedPlanRecoveryState/);
   assert.match(stateSource, /state\.unityMcpRuntimeState = result\.unityMcpRuntimeState/);
   assert.match(stateSource, /applyToolIterationMutableState/);
   assert.match(stateSource, /state\.loopGuardRuntimeState = result\.loopGuardRuntimeState/);
@@ -98,9 +96,7 @@ test("approved Plan phase reset removes planning counters while preserving the t
   state.recentToolActivity.push({ name: "read_file", status: "succeeded", target: "src/main.rs" });
   state.attemptedPlanWriteTargets.push(".MAIN/plans/plan.md");
   state.noToolRuntimeState.consecutiveNoToolCount = 4;
-  state.loopGuardRuntimeState.crossIterationFileReads.set("src/main.rs", 3);
   state.loopGuardRuntimeState.failedToolCallCounts.set("replace:src/main.rs", 2);
-  state.approvedPlanRecoveryState.approvedPlanActionOnlyRecoveryActive = true;
   state.executeRecoveryState.mode = "mutation_first";
 
   resetAgentLoopMutableStateForApprovedPlanExecution(state);
@@ -112,15 +108,13 @@ test("approved Plan phase reset removes planning counters while preserving the t
   assert.equal(state.recentToolActivity.length, 0);
   assert.equal(state.attemptedPlanWriteTargets.length, 0);
   assert.equal(state.noToolRuntimeState.consecutiveNoToolCount, 0);
-  assert.equal(state.loopGuardRuntimeState.crossIterationFileReads.size, 0);
   assert.equal(state.loopGuardRuntimeState.failedToolCallCounts.size, 0);
-  assert.equal(state.approvedPlanRecoveryState.approvedPlanActionOnlyRecoveryActive, false);
   assert.equal(state.executeRecoveryState.mode, "normal");
   assert.equal(state.planRuntimeState.planRuntimePhase, "grounding");
   assert.equal(state.evidenceRuntimeState.sawExecuteOperationEvidence, false);
 });
 
-test("loop mutable state restores a target-scoped forced recovery transaction", () => {
+test("loop mutable state migrates legacy post-mutation reads into validation", () => {
   const state = createAgentLoopMutableState({
     callbacks: {
       getIsPlanApproved: () => false,
@@ -155,7 +149,7 @@ test("loop mutable state restores a target-scoped forced recovery transaction", 
   assert.equal(state.executeRecoveryState.reason, "goal_continuation_mutation_observed");
   assert.equal(state.executeRecoveryState.expectedTarget, "src/App.tsx");
   assert.equal(state.executeRecoveryState.phaseNoProgressCount, 4);
-  assert.equal(state.executeRecoveryState.readLease.purpose, "post_mutation_verify");
+  assert.equal(state.executeRecoveryState.readLease, null);
   assert.equal(state.executeRecoveryState.sourceObservationKey, "src/App.tsx:v2");
   assert.equal(state.executeRecoveryState.decisionCheckpoint.nextRequiredCapability, "validation");
 });

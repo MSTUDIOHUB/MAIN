@@ -39,7 +39,7 @@ export function resolveAgentLoopMaxIterations(input: {
   if (input.runtimeIntent === "goal") {
     return positiveInt(limits.goalIteration, DEFAULT_AGENT_LOOP_ITERATION_LIMITS.goalIteration);
   }
-  if (input.workflowMode === "plan" && input.isPlanApproved) {
+  if (input.isPlanApproved) {
     return positiveInt(limits.planExecution, DEFAULT_AGENT_LOOP_ITERATION_LIMITS.planExecution);
   }
   if (input.workflowMode === "plan") {
@@ -62,8 +62,9 @@ export interface AgentLoopIterationBudget {
 }
 
 /**
- * Resolves an absolute loop ceiling while preserving a full execution budget
- * when an unapproved Plan turns into approved execution inside the same loop.
+ * Resolves an absolute loop ceiling. Approved Plan execution runs in the
+ * canonical execute workflow; approval provenance still selects its dedicated
+ * execution budget without reintroducing Plan as a runtime mode.
  */
 export function resolveAgentLoopIterationBudget(input: {
   workflowMode: "chat" | "edit" | "plan";
@@ -75,7 +76,7 @@ export function resolveAgentLoopIterationBudget(input: {
   subagentDepth?: number;
 }): AgentLoopIterationBudget {
   const currentIteration = Math.max(0, Math.floor(Number(input.currentIteration) || 0));
-  if (input.workflowMode === "plan" && input.isPlanApproved) {
+  if (input.isPlanApproved) {
     const phaseStartIteration = input.planExecutionStartIteration == null
       ? currentIteration
       : Math.max(0, Math.floor(Number(input.planExecutionStartIteration) || 0));
@@ -112,7 +113,7 @@ export function shouldUseMaxStepsFinalTextOnly(input: {
 }): boolean {
   if (input.alreadyPrompted) return false;
   if (input.iteration < input.maxIterations) return false;
-  if (input.workflowMode === "plan" && input.isPlanApproved) return false;
+  if (input.isPlanApproved) return false;
   return input.workflowMode === "chat" && (
     input.runtimeIntent === "respond" || input.runtimeIntent === "analyze"
   );

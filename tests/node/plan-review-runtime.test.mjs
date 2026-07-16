@@ -92,12 +92,6 @@ function createHandlers(overrides = {}) {
   const abortController = overrides.abortController ?? new AbortController();
   let currentStatus = "running";
   let planRuntimeState = basePlanRuntimeState(overrides.planRuntimeState);
-  let approvedPlanRecoveryState = {
-    approvedPlanNoProgressRecoveryAttempts: 0,
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-    approvedPlanLongReasoningNoActionCount: 0,
-  };
   const callbacks = {
     getIsPlanApproved: () => false,
     getStatus: () => currentStatus,
@@ -120,10 +114,6 @@ function createHandlers(overrides = {}) {
     setPlanRuntimeState: (state) => {
       planRuntimeState = state;
     },
-    getApprovedPlanRecoveryState: () => approvedPlanRecoveryState,
-    setApprovedPlanRecoveryState: (state) => {
-      approvedPlanRecoveryState = state;
-    },
     setPlanRuntimePhase: (phase, reason, status) =>
       events.push({ type: "phase", phase, reason, status }),
     ...overrides.handlerInput,
@@ -133,7 +123,6 @@ function createHandlers(overrides = {}) {
     events,
     handlers,
     getPlanRuntimeState: () => planRuntimeState,
-    getApprovedPlanRecoveryState: () => approvedPlanRecoveryState,
   };
 }
 
@@ -238,7 +227,7 @@ test("an accepted rewrite can enter review with the current tool-phase quality s
   assert.equal(events.some((event) => event.type === "phase" && event.phase === "review_ready"), true);
 });
 
-test("plan review pauses the current run and the approved child run reopens the initial source read", async () => {
+test("plan review pauses the current run and approved execution keeps the normal tool surface", async () => {
   const trace = [];
   const lifecycle = [];
   const appendedMessages = [];
@@ -305,10 +294,6 @@ test("plan review pauses the current run and the approved child run reopens the 
     executeRecoveryAttempts: 0,
     recoveryIterationCount: 0,
     maxRecoveryIterations: 6,
-    approvedPlanActionOnlyRecoveryActive: false,
-    approvedPlanNoToolRecoveryFileReadActive: false,
-    approvedPlanNoProgressRecoveryAttempts: 0,
-    approvedPlanLongReasoningNoActionCount: 0,
     recentToolActivity: [],
     recentPlanToolActivity,
     planRuntimePhase: "executing",
@@ -317,6 +302,6 @@ test("plan review pauses the current run and the approved child run reopens the 
     turnInputContextSignals: {},
     lastAssistantTextForCheckpoint: "",
   });
-  assert.equal(surface.allowApprovedPlanRecoveryFileRead, true);
+  assert.equal(surface.recoveryActionContract.phase, "normal");
   assert.equal(surface.iterationAllTools.some((tool) => tool.function.name === "read_file"), true);
 });

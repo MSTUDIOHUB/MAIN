@@ -180,6 +180,82 @@ test("approved plan conversation becomes execute runtime for completion evidence
   assert.equal(contract.completionEvidenceRequired, "execution_evidence");
 });
 
+test("shell and git execution require command evidence without inventing a file mutation", () => {
+  for (const kind of ["shell", "git"]) {
+    const contract = buildEffectiveTurnContract({
+      conversationIntent: "execute",
+      runtimeIntent: "execute",
+      commandDirective: {
+        kind,
+        source: "natural_language",
+        requiresApproval: true,
+      },
+      executionConsentGranted: true,
+    });
+    assert.equal(contract.mutationExpected, false, kind);
+    assert.equal(contract.validationExpected, true, kind);
+    assert.equal(contract.completionEvidenceRequired, "execution_evidence", kind);
+  }
+});
+
+test("approved command-only Plans require validation without inventing a workspace mutation", () => {
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: "plan",
+    runtimeIntent: "execute",
+    commandDirective: {
+      kind: "plan_resume",
+      source: "natural_language",
+      requiresApproval: true,
+    },
+    planApproved: true,
+    executionConsentGranted: true,
+    workspaceMutationExpected: false,
+  });
+  assert.equal(contract.mutationExpected, false);
+  assert.equal(contract.validationExpected, true);
+  assert.equal(contract.completionEvidenceRequired, "execution_evidence");
+});
+
+test("approved Plan execution retains a pending validation contract after intent normalization", () => {
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: "execute",
+    runtimeIntent: "execute",
+    commandDirective: {
+      kind: "none",
+      source: "natural_language",
+      requiresApproval: false,
+    },
+    planApproved: true,
+    executionConsentGranted: true,
+    workspaceMutationExpected: false,
+    workspaceValidationExpected: true,
+  });
+
+  assert.equal(contract.mutationExpected, false);
+  assert.equal(contract.validationExpected, true);
+  assert.equal(contract.completionEvidenceRequired, "execution_evidence");
+});
+
+test("approved Plan execution does not turn advisory-only review into an automatic validation gate", () => {
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: "execute",
+    runtimeIntent: "execute",
+    commandDirective: {
+      kind: "none",
+      source: "natural_language",
+      requiresApproval: false,
+    },
+    planApproved: true,
+    executionConsentGranted: true,
+    workspaceMutationExpected: false,
+    workspaceValidationExpected: false,
+  });
+
+  assert.equal(contract.mutationExpected, false);
+  assert.equal(contract.validationExpected, false);
+  assert.equal(contract.completionEvidenceRequired, "none");
+});
+
 test("a new unapproved Plan turn never inherits operation consent from another run", () => {
   const contract = buildEffectiveTurnContract({
     conversationIntent: "plan",

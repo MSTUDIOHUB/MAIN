@@ -227,7 +227,6 @@ export function planRuntimeToolCall(input: PlanRuntimeToolCallInput): RuntimeToo
   }
 
   if (
-    input.workflowMode === "plan" &&
     input.isPlanApproved &&
     input.runtimeIntent === "execute" &&
     input.planTaskCount === 0

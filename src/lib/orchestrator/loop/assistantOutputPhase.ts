@@ -24,8 +24,6 @@ import type {
 import type { OrchestratorCallbacks, ToolCallToExecute } from "../types";
 import { resolveApprovedPlanNoToolRoute } from "./approvedPlanNoToolRouting";
 import { appendApprovedPlanUserValidationConclusion } from "./approvedPlanFinalization";
-import type { ApprovedPlanRecoveryRuntimeState } from "./approvedPlanRecoveryRuntime";
-import { resetApprovedPlanLongReasoningNoActionCount } from "./approvedPlanRecoveryRuntime";
 import {
   isHiddenThoughtOnlyNoToolStop,
   resolveClosedPlanReadOnlyContinuation,
@@ -70,7 +68,6 @@ type WorkflowMode = "chat" | "edit" | "plan";
 type AssistantOutputBaseResult = {
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
 };
@@ -130,7 +127,6 @@ export function handleAssistantOutputPhase(input: {
   turnInputContextSignals: Parameters<typeof handlePlanPostConvergenceToolRedirect>[0]["turnInputContextSignals"];
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   activateChatFinalSynthesis: (
@@ -155,7 +151,6 @@ export function handleAssistantOutputPhase(input: {
   } = input;
   let noToolRuntimeState = input.noToolRuntimeState;
   let planRuntimeState = input.planRuntimeState;
-  let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   let evidenceRuntimeState = input.evidenceRuntimeState;
   let recoveryPromptState = input.recoveryPromptState;
   const setPlanRuntimePhaseAndSync: typeof input.setPlanRuntimePhase = (phase, reason) => {
@@ -169,7 +164,6 @@ export function handleAssistantOutputPhase(input: {
     status,
     noToolRuntimeState,
     planRuntimeState,
-    approvedPlanRecoveryState,
     evidenceRuntimeState,
     recoveryPromptState,
   });
@@ -185,7 +179,6 @@ export function handleAssistantOutputPhase(input: {
   }
 
   const approvedPlanNoToolRoute = resolveApprovedPlanNoToolRoute({
-    workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
     planStage: input.currentPlanStageForReview,
     toolCallCount: effectiveToolCalls.length,
@@ -713,11 +706,6 @@ export function handleAssistantOutputPhase(input: {
     hasMeaningfulVisibleText,
     hiddenThought: normalized.hiddenThought,
   });
-  if (effectiveToolCalls.length > 0) {
-    approvedPlanRecoveryState =
-      resetApprovedPlanLongReasoningNoActionCount(approvedPlanRecoveryState);
-  }
-
   logAgentEvent("normalized_turn", {
     iteration,
     visibleChars: normalized.visibleText.length,
@@ -783,7 +771,6 @@ export function handleAssistantOutputPhase(input: {
     status: "completed",
     noToolRuntimeState,
     planRuntimeState,
-    approvedPlanRecoveryState,
     evidenceRuntimeState,
     recoveryPromptState,
     shouldPauseForUserChoice,

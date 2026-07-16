@@ -155,3 +155,17 @@ test("turn preparation start hooks are a no-op when hooks are disabled", async (
   assert.equal(result, "continue");
   assert.deepEqual(events, []);
 });
+
+test("blocked start hooks defer idle publication to the orchestrator terminal boundary", () => {
+  const hookFunctionSource = runAgentLoopStartHooks.toString();
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
+    "utf8",
+  );
+
+  assert.doesNotMatch(hookFunctionSource, /onStatusChange\("idle"\)/);
+  assert.match(
+    orchestratorSource,
+    /if \(startHooksResult === "blocked"\) \{[\s\S]*?emitRunPausedEvent\([\s\S]*?"start_hook_blocked"[\s\S]*?callbacks\.onStatusChange\("idle"\)/,
+  );
+});

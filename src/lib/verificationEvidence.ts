@@ -1,6 +1,7 @@
 import {
   analyzePtyObservationResult,
   isLocalDevServerHealthProbeCommand,
+  localDevServerUrlsShareOrigin,
   resolveDevServerRuntimeState,
 } from "./devServerRuntime";
 import {
@@ -13,9 +14,13 @@ import {
 } from "./toolFeedbackEnvelope";
 import {
   isFinitePlanValidationCommand,
+  planCommandEvidenceMatchesExecution,
   type PlanExecutionEvidenceEntry,
+  type PlanTask,
   type ValidationObligation,
 } from "./workflowModels";
+import type { CommandDirective } from "./runIntent";
+import type { RecoveryActionContract } from "./executeRecoveryTools";
 import { isWorkspaceMutationToolName } from "./workspaceMutationTools";
 
 export const VERIFICATION_TOOL_NAMES = new Set([
@@ -45,6 +50,8 @@ export interface VerificationToolObservation {
 
 export type ExecuteEvidenceGap =
   | "none"
+  | "mutation_required"
+  | "validation_required"
   | "validation_after_mutation_required"
   | "pty_observation_required"
   | "browser_validation_required"
@@ -65,6 +72,54 @@ export interface ExecuteEvidenceClosureAudit {
   gap: ExecuteEvidenceGap;
 }
 
+export function scopeExecutionEvidenceLedger(
+  ledger: PlanExecutionEvidenceEntry[],
+  transactionId?: string | null,
+): PlanExecutionEvidenceEntry[] {
+  return transactionId
+    ? ledger.filter((entry) => entry.transactionId === transactionId)
+    : [...ledger];
+}
+
+function isSuccessfulStructuredEvidence(entry: PlanExecutionEvidenceEntry): boolean {
+  return !["failed", "pending", "unknown", "running", "stopped"].includes(
+    String(entry.observationStatus || ""),
+  );
+}
+
+/**
+ * Decide max-iteration continuation from trusted transaction evidence only.
+ * Tool-call prose and successful cache/policy responses never participate.
+ */
+export function hasDurableExecutionProgress(input: {
+  ledger: PlanExecutionEvidenceEntry[];
+  transactionId?: string | null;
+  recoveryActionContract: Pick<RecoveryActionContract, "ptyGeneration">;
+}): boolean {
+  const ledger = scopeExecutionEvidenceLedger(input.ledger, input.transactionId);
+  if (ledger.some((entry) => isSuccessfulStructuredEvidence(entry) && (
+    (entry.kind === "file" && isWorkspaceMutationToolName(entry.sourceTool)) ||
+    (entry.kind === "cmd" && entry.sourceTool === "run_command" &&
+      isFinitePlanValidationCommand(entry.value || entry.target || "")) ||
+    entry.kind === "browser_dom" || entry.kind === "browser_screenshot"
+  ))) return true;
+
+  const generation = input.recoveryActionContract.ptyGeneration;
+  if (typeof generation !== "number") return false;
+  const devServerState = resolveDevServerRuntimeState(ledger);
+  return devServerState.status === "ready" &&
+    devServerState.foregroundGeneration === generation &&
+    ledger.some((entry) =>
+    entry.sourceTool === "execute_command" &&
+    (entry.observationStatus === "pending" || entry.observationStatus === "running") &&
+    entry.foregroundGeneration === generation
+  ) && ledger.some((entry) =>
+    PTY_OBSERVATION_TOOL_NAMES.has(entry.sourceTool) &&
+    entry.observationStatus === "ready" &&
+    entry.foregroundGeneration === generation
+  );
+}
+
 function evidenceTime(entry: PlanExecutionEvidenceEntry): number {
   const value = Number(entry.createdAt || 0);
   return Number.isFinite(value) ? value : 0;
@@ -75,20 +130,70 @@ function isMutationEvidenceEntry(entry: PlanExecutionEvidenceEntry): boolean {
 }
 
 function isSuccessfulValidationEvidenceEntry(entry: PlanExecutionEvidenceEntry): boolean {
-  if (
-    entry.observationStatus === "failed" ||
-    entry.observationStatus === "pending" ||
-    entry.observationStatus === "unknown" ||
-    entry.observationStatus === "running" ||
-    entry.observationStatus === "stopped"
-  ) {
-    return false;
-  }
+  if (!isSuccessfulStructuredEvidence(entry)) return false;
   if (entry.kind === "browser_dom" || entry.kind === "browser_screenshot") return true;
   if (entry.automaticValidation === true) return true;
   return entry.kind === "cmd" &&
     entry.sourceTool === "run_command" &&
     isFinitePlanValidationCommand(entry.value || entry.target || "");
+}
+
+function isSuccessfulOperationalCommandEntry(
+  entry: PlanExecutionEvidenceEntry,
+): boolean {
+  return entry.kind === "cmd" &&
+    entry.sourceTool === "run_command" &&
+    isSuccessfulStructuredEvidence(entry);
+}
+
+function operationalCommandEvidenceSatisfiesRequirements(
+  entries: PlanExecutionEvidenceEntry[],
+  requiredCommands: string[],
+): boolean {
+  return requiredCommands.length > 0 && requiredCommands.every((required) =>
+    entries.some((entry) =>
+      planCommandEvidenceMatchesExecution(required, entry.value || entry.target || "")
+    )
+  );
+}
+
+function normalizeCommandRequirement(value: unknown): string {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * Derive command ownership from structured Plan/directive metadata. A bare
+ * successful shell call is not enough to complete a command-only turn.
+ */
+export function resolveCommandEvidenceRequirements(input: {
+  tasks?: PlanTask[];
+  commandDirective?: CommandDirective | null;
+}): string[] {
+  const requirements = (input.tasks || []).flatMap((task) =>
+    (task.evidence || [])
+      .filter((evidence) => evidence.kind === "cmd")
+      .map((evidence) => normalizeCommandRequirement(evidence.value))
+      .filter(Boolean)
+  );
+  const directive = input.commandDirective;
+  if (requirements.length === 0 && directive?.kind === "shell") {
+    const target = normalizeCommandRequirement(directive.target);
+    const action = normalizeCommandRequirement(directive.action);
+    if (target && !/^(?:shell|terminal|command)$/i.test(target)) requirements.push(target);
+    else if (action && !/^(?:run|execute|command)$/i.test(action)) requirements.push(action);
+  }
+  if (requirements.length === 0 && directive?.kind === "git") {
+    const target = normalizeCommandRequirement(directive.target);
+    if (/^git\s+/i.test(target)) {
+      requirements.push(target);
+    } else {
+      const actionParts = normalizeCommandRequirement(directive.action)
+        .split(/[_\s-]+/g)
+        .filter((part) => part && !/^(?:and|then)$/i.test(part));
+      for (const part of actionParts) requirements.push(`git ${part}`);
+    }
+  }
+  return Array.from(new Set(requirements));
 }
 
 const INTERACTION_BINDING_IDENTIFIER_RE = /^(?:addEventListener|on[A-Z_$][\w$]*|on(?:click|change|input|submit|keydown|keyup|pointer\w*|mouse\w*|touch\w*)|handle[A-Z_$][\w$]*|[\w$]*(?:Handler|Callback|Listener))$/;
@@ -109,6 +214,7 @@ function identifierParts(value: string): string[] {
 function deriveInteractionRequirement(entry: PlanExecutionEvidenceEntry): {
   required: boolean;
   behaviorTargets: string[];
+  behaviorTargetGroups: string[][];
 } {
   const structuralTargets = (entry.interactionBehaviorTargets || [])
     .map((target) => String(target || "").trim())
@@ -117,18 +223,44 @@ function deriveInteractionRequirement(entry: PlanExecutionEvidenceEntry): {
     return {
       required: true,
       behaviorTargets: Array.from(new Set(structuralTargets)).slice(0, 80),
+      behaviorTargetGroups: groupStructuralInteractionTargets(structuralTargets),
     };
   }
   const identifiers = entry.changedIdentifiers || [];
   if (!identifiers.some((identifier) => INTERACTION_BINDING_IDENTIFIER_RE.test(identifier))) {
-    return { required: false, behaviorTargets: [] };
+    return { required: false, behaviorTargets: [], behaviorTargetGroups: [] };
   }
+  const behaviorTargets = Array.from(new Set(identifiers.filter((identifier) =>
+    !INTERACTION_BINDING_IDENTIFIER_RE.test(identifier) && identifierParts(identifier).length > 0
+  ))).slice(0, 80);
   return {
     required: true,
-    behaviorTargets: Array.from(new Set(identifiers.filter((identifier) =>
-      !INTERACTION_BINDING_IDENTIFIER_RE.test(identifier) && identifierParts(identifier).length > 0
-    ))).slice(0, 80),
+    behaviorTargets,
+    // Legacy identifier-only evidence cannot prove which names are aliases
+    // for one control. Preserve its former single obligation conservatively.
+    behaviorTargetGroups: [behaviorTargets],
   };
+}
+
+function canonicalStructuralInteractionTarget(value: string): string {
+  return String(value || "")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/^[#.](?=[a-z0-9_-]+$)/, "")
+    .replace(/[^a-z0-9_-]+/g, "");
+}
+
+function groupStructuralInteractionTargets(targets: string[]): string[][] {
+  const groups = new Map<string, string[]>();
+  for (const target of targets) {
+    const clean = String(target || "").trim();
+    if (!clean) continue;
+    const key = canonicalStructuralInteractionTarget(clean) || clean.toLocaleLowerCase();
+    const group = groups.get(key) || [];
+    if (!group.includes(clean)) group.push(clean);
+    groups.set(key, group);
+  }
+  return groups.size > 0 ? [...groups.values()] : [[]];
 }
 
 function actionMatchesBehaviorTargets(actionTarget: string, behaviorTargets: string[]): boolean {
@@ -229,41 +361,42 @@ export function buildValidationObligations(
     if (!isMutationEvidenceEntry(mutation)) return;
     const interactionRequirement = deriveInteractionRequirement(mutation);
     if (!interactionRequirement.required) return;
-    const behaviorTargets = interactionRequirement.behaviorTargets;
     const laterBrowserEntries = indexedBrowserEntries.filter(({ index }) => index > mutationIndex);
-    const latestRelevantBrowser = [...laterBrowserEntries].reverse().find(({ entry }) => {
-      const interaction = entry.browserInteraction;
-      if (entry.observationStatus === "failed" && (!interaction || interaction.actions.length === 0)) {
-        return true;
-      }
-      return Boolean(interaction?.actions.some((action) =>
-        actionMatchesBehaviorTargets(action.target, behaviorTargets)
-      ));
-    })?.entry;
-    // Browser evidence is temporal: a later failed interaction invalidates an
-    // older success for the same behavior target. Completion must describe the
-    // latest observed page state, not cherry-pick a historical passing click.
-    const satisfyingEntry = latestRelevantBrowser &&
-      browserInteractionSatisfiesObligation(latestRelevantBrowser, behaviorTargets)
-      ? latestRelevantBrowser
-      : undefined;
-    const latestInteraction = latestRelevantBrowser?.browserInteraction;
-    const latestFailed = Boolean(
-      latestRelevantBrowser?.observationStatus === "failed" ||
-      latestInteraction?.pageErrors.length ||
-      latestInteraction?.consoleErrors.length ||
-      latestInteraction?.actions.some((action) => !action.succeeded) ||
-      latestInteraction?.assertions.some((assertion) => !assertion.passed) ||
-      (latestRelevantBrowser && !browserInteractionSatisfiesObligation(latestRelevantBrowser, behaviorTargets))
-    );
-    obligations.push({
-      id: `browser-interaction:${mutation.id}`,
-      kind: "browser_interaction",
-      mutationEvidenceId: mutation.id,
-      target: mutation.target || mutation.value,
-      behaviorTargets,
-      status: latestFailed ? "failed" : satisfyingEntry ? "satisfied" : "open",
-      ...(satisfyingEntry ? { satisfiedByEvidenceId: satisfyingEntry.id } : {}),
+    interactionRequirement.behaviorTargetGroups.forEach((behaviorTargets, groupIndex) => {
+      const latestRelevantBrowser = [...laterBrowserEntries].reverse().find(({ entry }) => {
+        const interaction = entry.browserInteraction;
+        if (entry.observationStatus === "failed" && (!interaction || interaction.actions.length === 0)) {
+          return true;
+        }
+        return Boolean(interaction?.actions.some((action) =>
+          actionMatchesBehaviorTargets(action.target, behaviorTargets)
+        ));
+      })?.entry;
+      // Browser evidence is temporal per independent behavior target. A click
+      // on one changed control cannot certify every other control in the same
+      // source patch.
+      const satisfyingEntry = latestRelevantBrowser &&
+        browserInteractionSatisfiesObligation(latestRelevantBrowser, behaviorTargets)
+        ? latestRelevantBrowser
+        : undefined;
+      const latestInteraction = latestRelevantBrowser?.browserInteraction;
+      const latestFailed = Boolean(
+        latestRelevantBrowser?.observationStatus === "failed" ||
+        latestInteraction?.pageErrors.length ||
+        latestInteraction?.consoleErrors.length ||
+        latestInteraction?.actions.some((action) => !action.succeeded) ||
+        latestInteraction?.assertions.some((assertion) => !assertion.passed) ||
+        (latestRelevantBrowser && !browserInteractionSatisfiesObligation(latestRelevantBrowser, behaviorTargets))
+      );
+      obligations.push({
+        id: `browser-interaction:${mutation.id}:${groupIndex + 1}`,
+        kind: "browser_interaction",
+        mutationEvidenceId: mutation.id,
+        target: mutation.target || mutation.value,
+        behaviorTargets,
+        status: latestFailed ? "failed" : satisfyingEntry ? "satisfied" : "open",
+        ...(satisfyingEntry ? { satisfiedByEvidenceId: satisfyingEntry.id } : {}),
+      });
     });
   });
   return obligations;
@@ -302,18 +435,23 @@ function latestUnresolvedFailures(
 /**
  * Runtime-owned completion audit. A source mutation opens a new verification
  * epoch: only evidence created after that mutation can close it. A long-lived
- * launch additionally requires fresh PTY readiness and a later browser check;
- * merely starting the process or rereading source cannot complete the turn.
+ * launch additionally requires fresh PTY readiness. Browser validation is a
+ * separate obligation and is required only when structured interaction
+ * evidence opened one; merely starting the process or rereading source cannot
+ * complete the turn.
  */
 export function buildExecuteEvidenceClosureAudit(input: {
   ledger: PlanExecutionEvidenceEntry[];
   validationExpected: boolean;
+  mutationExpected?: boolean;
+  transactionId?: string | null;
+  requiredCommandEvidence?: string[];
 }): ExecuteEvidenceClosureAudit {
   // The ledger is append-only and therefore supplies a stronger causal order
   // than millisecond timestamps. Multiple tool results can legitimately share
   // one Date.now() tick; sorting/filtering only by time could let a validation
   // that occurred before the mutation close the new verification epoch.
-  const ordered = [...input.ledger];
+  const ordered = scopeExecutionEvidenceLedger(input.ledger, input.transactionId);
   const mutations = ordered.filter(isMutationEvidenceEntry);
   let latestMutationIndex = -1;
   for (let index = ordered.length - 1; index >= 0; index -= 1) {
@@ -331,6 +469,12 @@ export function buildExecuteEvidenceClosureAudit(input: {
   const unsatisfiedObligations = validationObligations.filter((obligation) =>
     obligation.status === "open" || obligation.status === "failed"
   );
+  const hasBrowserInteractionObligation = validationObligations.some((obligation) =>
+    obligation.kind === "browser_interaction"
+  );
+  const hasUnsatisfiedBrowserInteraction = unsatisfiedObligations.some((obligation) =>
+    obligation.kind === "browser_interaction"
+  );
   const unresolvedFailures = latestUnresolvedFailures(epoch);
   const devServerLaunches = epoch.filter((entry) =>
     entry.sourceTool === "execute_command" &&
@@ -341,11 +485,39 @@ export function buildExecuteEvidenceClosureAudit(input: {
     )
   );
   const hasDevServerLifecycle = devServerLaunches.length > 0;
-  // A real long-running launch creates its own causal validation obligation,
-  // even when the task did not mutate a file. Do not let the no-mutation fast
-  // path skip PTY readiness and the later browser observation.
+  const devServerState = hasDevServerLifecycle
+    ? resolveDevServerRuntimeState(epoch)
+    : null;
+  if (input.mutationExpected === true && latestMutationAt === null) {
+    const validations = ordered.filter(isSuccessfulValidationEvidenceEntry);
+    const gap: ExecuteEvidenceGap = unresolvedFailures.length > 0 ||
+      devServerState?.status === "failed" ||
+      devServerState?.portConflict === true
+      ? "unreconciled_failure"
+      : "mutation_required";
+    return {
+      mutationCount: 0,
+      validationCount: validations.length,
+      latestMutationAt: null,
+      latestValidationAt: validations.length > 0
+        ? evidenceTime(validations[validations.length - 1])
+        : null,
+      latestReadyAt: null,
+      longRunningStatus: devServerState?.status ?? "none",
+      unresolvedFailureCount: unresolvedFailures.length,
+      validationObligations,
+      unsatisfiedObligationCount: unsatisfiedObligations.length,
+      validationAfterLatestMutation: false,
+      completionAllowed: false,
+      gap,
+    };
+  }
+  // A real long-running launch creates its own causal validation obligation.
+  // A command-only task also requires successful command evidence even though
+  // it intentionally has no file mutation. "No mutation" must never collapse
+  // into "no execution required".
   if (
-    (latestMutationAt === null || !input.validationExpected) &&
+    !input.validationExpected &&
     !hasDevServerLifecycle &&
     unsatisfiedObligations.length === 0
   ) {
@@ -366,12 +538,31 @@ export function buildExecuteEvidenceClosureAudit(input: {
     };
   }
 
-  const successfulValidations = epoch.filter(isSuccessfulValidationEvidenceEntry);
+  const requiredCommandEvidence = input.requiredCommandEvidence || [];
+  const successfulOperationalCommands = epoch.filter(isSuccessfulOperationalCommandEntry);
+  const commandRequirementsSatisfied = operationalCommandEvidenceSatisfiesRequirements(
+    successfulOperationalCommands,
+    requiredCommandEvidence,
+  );
+  const successfulValidations = epoch.filter((entry) => {
+    const commandOnlyExecution =
+      latestMutationAt === null &&
+      input.validationExpected &&
+      entry.kind === "cmd" &&
+      entry.sourceTool === "run_command";
+    if (commandOnlyExecution) {
+      if (!commandRequirementsSatisfied || !isSuccessfulOperationalCommandEntry(entry)) {
+        return false;
+      }
+      const actual = entry.value || entry.target || "";
+      return requiredCommandEvidence.some((required) =>
+        planCommandEvidenceMatchesExecution(required, actual)
+      );
+    }
+    return isSuccessfulValidationEvidenceEntry(entry);
+  });
   const latestValidationAt = successfulValidations.length > 0
     ? evidenceTime(successfulValidations[successfulValidations.length - 1])
-    : null;
-  const devServerState = hasDevServerLifecycle
-    ? resolveDevServerRuntimeState(epoch)
     : null;
   let latestLaunchIndex = -1;
   for (let index = epoch.length - 1; index >= 0; index -= 1) {
@@ -396,7 +587,9 @@ export function buildExecuteEvidenceClosureAudit(input: {
       const healthyExistingServer =
         entry.sourceTool === "run_command" &&
         entry.observationStatus !== "failed" &&
-        isLocalDevServerHealthProbeCommand(entry.value || entry.target || "");
+        isLocalDevServerHealthProbeCommand(entry.value || entry.target || "") &&
+        !!devServerState.url &&
+        localDevServerUrlsShareOrigin(entry.value || entry.target || "", devServerState.url);
       if (!readyPtyObservation && !healthyExistingServer) continue;
       latestReadyIndex = index;
       break;
@@ -409,6 +602,8 @@ export function buildExecuteEvidenceClosureAudit(input: {
     index > latestReadyIndex &&
     (entry.kind === "browser_dom" || entry.kind === "browser_screenshot") &&
     isSuccessfulValidationEvidenceEntry(entry) &&
+    !!devServerState?.url &&
+    localDevServerUrlsShareOrigin(entry.target || entry.value || "", devServerState.url) &&
     (
       !validationObligations.some((obligation) => obligation.kind === "browser_interaction") ||
       validationObligations.some((obligation) =>
@@ -428,17 +623,19 @@ export function buildExecuteEvidenceClosureAudit(input: {
     gap = devServerState?.status === "failed"
       ? "unreconciled_failure"
       : "pty_observation_required";
-  } else if (hasDevServerLifecycle && !browserAfterReady) {
-    gap = "browser_validation_required";
-  } else if (unsatisfiedObligations.some((obligation) => obligation.kind === "browser_interaction")) {
+  } else if (
+    hasUnsatisfiedBrowserInteraction ||
+    (hasDevServerLifecycle && hasBrowserInteractionObligation && !browserAfterReady)
+  ) {
     gap = "browser_validation_required";
   } else if (
     !hasDevServerLifecycle &&
     input.validationExpected &&
-    latestMutationAt !== null &&
     latestValidationAt === null
   ) {
-    gap = "validation_after_mutation_required";
+    gap = latestMutationAt === null
+      ? "validation_required"
+      : "validation_after_mutation_required";
   }
 
   return {

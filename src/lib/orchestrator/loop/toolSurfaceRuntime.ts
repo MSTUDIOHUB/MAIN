@@ -54,17 +54,7 @@ export function createAgentLoopToolSurfaceRuntime(input: {
   const { workflowMode } = runtimeState;
 
   const resolveRuntimeIntent = (): ResolvedUserIntent => {
-    const currentConversationIntent = callbacks.getCurrentRunIntent();
-    const requestedRuntimeIntent =
-      callbacks.getRuntimeRunIntent?.() ?? currentConversationIntent;
-    if (
-      currentConversationIntent === "plan" &&
-      callbacks.getIsPlanApproved() &&
-      requestedRuntimeIntent === "plan"
-    ) {
-      return "execute";
-    }
-    return requestedRuntimeIntent;
+    return callbacks.getRuntimeRunIntent?.() ?? callbacks.getCurrentRunIntent();
   };
 
   const activateUnityMcpFallback = (reason: string) => {
@@ -87,12 +77,8 @@ export function createAgentLoopToolSurfaceRuntime(input: {
   ): ToolDefinition[] => {
     const intentFiltered = filterToolDefinitionsForIntent(
       routedToolDefinitions,
-      callbacks.getCurrentRunIntent(),
+      runtimeIntent,
       toolCapabilityRegistry,
-      {
-        runtimeIntent,
-        planApproved: callbacks.getIsPlanApproved(),
-      },
     );
     const filtered = filterGlobalChatToolDefinitions({
       tools: intentFiltered,

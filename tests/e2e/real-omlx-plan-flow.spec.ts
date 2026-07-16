@@ -55,6 +55,7 @@ const realOmlxExecutionTimeoutMs = Math.max(
 const allowSafeExecutionPause = process.env.REAL_OMLX_ALLOW_SAFE_PAUSE === "1";
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
+const completedTurnStatuses = new Set(["done", "completed", "completed_with_changes"]);
 
 const useSemanticMdViewerMutationOracle =
   realOmlxFixture === "md-viewer" &&
@@ -1144,9 +1145,7 @@ for (const model of models) {
       expect(mutationAfterPlanPause).toEqual(originalMutationContents);
       expect(planTerminalSnapshot?.planArtifacts || []).toHaveLength(0);
       expect(planTerminalSnapshot?.planStage).not.toBe("completed");
-      expect(["done", "completed_with_changes"]).not.toContain(
-        String(planTerminalSnapshot?.currentTurnStatus || ""),
-      );
+      expect(completedTurnStatuses.has(String(planTerminalSnapshot?.currentTurnStatus || ""))).toBe(false);
       const planTerminalSummary = [...(planTerminalSnapshot?.debugTail || [])]
         .reverse()
         .map((entry: { source?: string; message?: string }) => {
@@ -1291,9 +1290,7 @@ for (const model of models) {
       expect(allowSafeExecutionPause, "Set REAL_OMLX_ALLOW_SAFE_PAUSE=1 when model incapability may be accepted as an honest bounded pause.").toBe(true);
       expect(mutationAfterEarlyOutcome.contents).toEqual(originalMutationContents);
       expect(earlyExecutionSnapshot?.planStage).not.toBe("completed");
-      expect(["done", "completed_with_changes"]).not.toContain(
-        String(earlyExecutionSnapshot?.currentTurnStatus || ""),
-      );
+      expect(completedTurnStatuses.has(String(earlyExecutionSnapshot?.currentTurnStatus || ""))).toBe(false);
       const executeTerminalSummary = [...(earlyExecutionSnapshot?.debugTail || [])]
         .reverse()
         .map((entry: { source?: string; message?: string }) => {
@@ -1331,7 +1328,7 @@ for (const model of models) {
         if (
           snapshot?.isGenerating === false &&
           snapshot?.planStage === "completed" &&
-          ["done", "completed_with_changes"].includes(String(snapshot?.currentTurnStatus || ""))
+          completedTurnStatuses.has(String(snapshot?.currentTurnStatus || ""))
         ) return "completed";
         if (snapshot?.isGenerating === false) {
           terminalExecutionSnapshot = snapshot;

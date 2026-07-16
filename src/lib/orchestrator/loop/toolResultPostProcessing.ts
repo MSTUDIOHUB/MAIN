@@ -57,9 +57,6 @@ export type ToolResultPostProcessingResult = {
   unityConsoleMissingFirstToolRepromptIssued: boolean;
   unityMcpFallbackPrompt: string | null;
   planDraftingRecoveryReadCount: number;
-  approvedPlanActionOnlyRecoveryActive: boolean;
-  approvedPlanNoToolRecoveryFileReadActive: boolean;
-  approvedPlanNoProgressRecoveryAttempts: number;
   remainingTaskText: string | null;
   successfulReadOnlyExplorationResultCount: number;
   nonReadOnlySuccessfulResultCount: number;
@@ -88,9 +85,6 @@ export function handleToolResultPostProcessing(input: {
   unityConsoleMissingFirstToolRepromptIssued: boolean;
   recentSuccessfulProjectWrite: RecentSuccessfulProjectWrite;
   recoveringFromEmptyAssistantReplyAfterWrite: boolean;
-  approvedPlanActionOnlyRecoveryActive: boolean;
-  approvedPlanNoToolRecoveryFileReadActive: boolean;
-  approvedPlanNoProgressRecoveryAttempts: number;
   markExecuteOperationEvidence: () => void;
   activateUnityMcpFallback: (reason: string) => void;
   setPlanRuntimePhase: SetPlanRuntimePhase;
@@ -123,9 +117,6 @@ export function handleToolResultPostProcessing(input: {
   let unityMcpForceConsoleFirstPending = input.unityMcpForceConsoleFirstPending;
   let unityConsoleMissingFirstToolRepromptIssued = input.unityConsoleMissingFirstToolRepromptIssued;
   let planDraftingRecoveryReadCount = input.planDraftingRecoveryReadCount;
-  let approvedPlanActionOnlyRecoveryActive = input.approvedPlanActionOnlyRecoveryActive;
-  let approvedPlanNoToolRecoveryFileReadActive = input.approvedPlanNoToolRecoveryFileReadActive;
-  let approvedPlanNoProgressRecoveryAttempts = input.approvedPlanNoProgressRecoveryAttempts;
   let effectivePlanRuntimePhase = planRuntimePhase;
   const setPlanRuntimePhase: SetPlanRuntimePhase = (phase, reason, status) => {
     effectivePlanRuntimePhase = phase;
@@ -245,7 +236,7 @@ export function handleToolResultPostProcessing(input: {
     if (digest) callbacks.onExecutionDigestUpdate(digest);
   }
 
-  if (workflowMode === "plan") {
+  if (workflowMode === "plan" || callbacks.getIsPlanApproved()) {
     directlyTrackedResults.forEach((result) => rememberToolActivity(
       recentPlanToolActivity,
       result,
@@ -438,19 +429,6 @@ export function handleToolResultPostProcessing(input: {
     resultCountsAsExecutionEvidence(result) &&
     !PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)
   ).length;
-  if (
-    workflowMode === "plan" &&
-    callbacks.getIsPlanApproved() &&
-    approvedPlanNoToolRecoveryFileReadActive &&
-    externalResults.some((result) => result.name === "read_file")
-  ) {
-    approvedPlanNoToolRecoveryFileReadActive = false;
-  }
-  if (workflowMode === "plan" && callbacks.getIsPlanApproved() && nonReadOnlySuccessfulResultCount > 0) {
-    approvedPlanActionOnlyRecoveryActive = false;
-    approvedPlanNoToolRecoveryFileReadActive = false;
-    approvedPlanNoProgressRecoveryAttempts = 0;
-  }
   return {
     planRuntimePhase: effectivePlanRuntimePhase,
     planEvidenceRecoveryObjective: input.planEvidenceRecoveryObjective,
@@ -462,9 +440,6 @@ export function handleToolResultPostProcessing(input: {
     unityConsoleMissingFirstToolRepromptIssued,
     unityMcpFallbackPrompt,
     planDraftingRecoveryReadCount,
-    approvedPlanActionOnlyRecoveryActive,
-    approvedPlanNoToolRecoveryFileReadActive,
-    approvedPlanNoProgressRecoveryAttempts,
     remainingTaskText,
     successfulReadOnlyExplorationResultCount,
     nonReadOnlySuccessfulResultCount,

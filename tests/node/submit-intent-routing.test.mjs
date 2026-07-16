@@ -206,8 +206,7 @@ test("hidden skip-intent control prompts do not infer shell directives from embe
     text: "计划已批准。请执行源码修改，然后运行 `npm test`。",
     isHidden: true,
     options: {
-      resolvedIntent: "plan",
-      runtimeIntentOverride: "execute",
+      resolvedIntent: "execute",
       skipIntentResolution: true,
       preservePlanState: true,
     },
@@ -219,7 +218,7 @@ test("hidden skip-intent control prompts do not infer shell directives from embe
   const result = harness.resolve();
 
   assert.equal(result.handled, false);
-  assert.equal(result.effectiveRunIntent, "plan");
+  assert.equal(result.effectiveRunIntent, "execute");
   assert.equal(result.effectiveCommandDirective, null);
   assert.deepEqual(harness.calls.preflights, []);
 });

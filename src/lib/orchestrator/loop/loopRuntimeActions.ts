@@ -25,10 +25,6 @@ import {
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
 import {
-  clearCrossIterationReadTrackingForTarget,
-  type AgentLoopGuardRuntimeState,
-} from "./loopGuardRuntimeState";
-import {
   applyPlanRuntimePhase,
   type PlanLoopRuntimeState,
   type PlanRuntimePhaseQualitySnapshot,
@@ -71,8 +67,6 @@ export function createAgentLoopRuntimeActions(input: {
   setExecuteRecoveryState: (state: ExecuteRecoveryRuntimeState) => void;
   getStreamRuntimeState: () => AgentLoopStreamRuntimeState;
   setStreamRuntimeState: (state: AgentLoopStreamRuntimeState) => void;
-  getLoopGuardRuntimeState: () => AgentLoopGuardRuntimeState;
-  setLoopGuardRuntimeState: (state: AgentLoopGuardRuntimeState) => void;
   getPlanRuntimeState: () => PlanLoopRuntimeState;
   setPlanRuntimeState: (state: PlanLoopRuntimeState) => void;
 }): AgentLoopRuntimeActions {
@@ -85,8 +79,6 @@ export function createAgentLoopRuntimeActions(input: {
     setExecuteRecoveryState,
     getStreamRuntimeState,
     setStreamRuntimeState,
-    getLoopGuardRuntimeState,
-    setLoopGuardRuntimeState,
     getPlanRuntimeState,
     setPlanRuntimeState,
   } = input;
@@ -135,10 +127,16 @@ export function createAgentLoopRuntimeActions(input: {
             workspacePathsReferToSameFile(activity.readFileObservation.path, expectedTarget)
           )?.readFileObservation || null
     );
+    const hasExplicitSourceObservationKey = Object.prototype.hasOwnProperty.call(
+      context,
+      "sourceObservationKey",
+    );
     const explicitSourceObservationKey = typeof context.sourceObservationKey === "string"
       ? context.sourceObservationKey.trim() || null
       : null;
-    const sourceObservationKey = explicitSourceObservationKey || retainedObservation?.key || null;
+    const sourceObservationKey = hasExplicitSourceObservationKey
+      ? explicitSourceObservationKey
+      : retainedObservation?.key || null;
     const explicitReadLease = context.readLease && typeof context.readLease === "object"
       ? context.readLease as RecoveryReadLease
       : null;
@@ -225,6 +223,12 @@ export function createAgentLoopRuntimeActions(input: {
         ...(currentRecoveryState.decisionCheckpoint?.evidenceVersion
           ? { evidenceVersion: currentRecoveryState.decisionCheckpoint.evidenceVersion }
           : {}),
+        ...(currentRecoveryState.decisionCheckpoint?.planTaskId
+          ? { planTaskId: currentRecoveryState.decisionCheckpoint.planTaskId }
+          : {}),
+        ...(currentRecoveryState.decisionCheckpoint?.requirementRef
+          ? { requirementRef: currentRecoveryState.decisionCheckpoint.requirementRef }
+          : {}),
       };
       nextState = registerExecuteRecoveryProtocolNoProgress(
         {
@@ -276,6 +280,8 @@ export function createAgentLoopRuntimeActions(input: {
       mismatchFingerprint: nextState.readLease?.mismatchFingerprint || null,
       repeatedPatchMismatch,
       protocolNoProgressCount: nextState.protocolNoProgressCount,
+      planTaskId: nextState.decisionCheckpoint?.planTaskId || null,
+      requirementRef: nextState.decisionCheckpoint?.requirementRef || null,
       recoveryToolSurface: resolveExecuteRecoveryActionContract(nextState.mode, {
         expectedTarget: nextState.expectedTarget,
         readLease: nextState.readLease,
@@ -326,12 +332,6 @@ export function createAgentLoopRuntimeActions(input: {
       reason,
       resetTarget: resetTarget || null,
     });
-    setLoopGuardRuntimeState(
-      clearCrossIterationReadTrackingForTarget(
-        getLoopGuardRuntimeState(),
-        resetTarget,
-      ),
-    );
     return nextState;
   };
 

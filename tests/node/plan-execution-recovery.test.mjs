@@ -68,11 +68,143 @@ const {
   isCachedReadOnlyPlanActivity,
   isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
+  resolveApprovedPlanInitialExecutionRecovery,
   resolveApprovedPlanSameTurnFallbackDecision,
   resolveExecuteMaxIterationsRecoveryDecision,
   summarizeRepeatedPlanTargetsFromToolActivity,
   toPlanExecutionRuntimeProgressUpdate,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
+
+test("approved Plan handoff derives the first executable recovery contract", () => {
+  const sourceMutation = resolveApprovedPlanInitialExecutionRecovery([{
+    id: "edit-main",
+    text: "Modify the backend",
+    requirementRef: "REQ-BACKEND",
+    status: "pending",
+    evidenceStatus: "missing",
+    evidence: [{ kind: "file", value: "src/main.rs" }],
+  }]);
+  assert.equal(sourceMutation?.mode, "mutation_first");
+  assert.equal(sourceMutation?.expectedTarget, "src/main.rs");
+  assert.equal(sourceMutation?.decisionCheckpoint?.nextRequiredCapability, "mutation");
+  assert.equal(sourceMutation?.decisionCheckpoint?.planTaskId, "edit-main");
+  assert.equal(sourceMutation?.decisionCheckpoint?.requirementRef, "REQ-BACKEND");
+
+  const finiteCommand = resolveApprovedPlanInitialExecutionRecovery([{
+    id: "test",
+    text: "Run the approved validation",
+    status: "pending",
+    evidenceStatus: "missing",
+    evidence: [{ kind: "cmd", value: "npm test" }],
+  }]);
+  assert.equal(finiteCommand?.mode, "finite_validation_only");
+  assert.equal(finiteCommand?.decisionCheckpoint?.nextRequiredCapability, "validation");
+  assert.equal(finiteCommand?.decisionCheckpoint?.planTaskId, "test");
+  assert.equal(finiteCommand?.decisionCheckpoint?.requirementRef, "test");
+
+  const longProcess = resolveApprovedPlanInitialExecutionRecovery([{
+    id: "dev",
+    text: "Start the reviewed development server",
+    status: "pending",
+    evidenceStatus: "missing",
+    evidence: [{ kind: "cmd", value: "npm run dev" }],
+  }]);
+  assert.equal(longProcess?.mode, "validation_only");
+  assert.equal(longProcess?.reason, "approved_plan_long_process_handoff");
+  assert.equal(longProcess?.decisionCheckpoint?.nextRequiredCapability, "launch_long_process");
+  assert.equal(longProcess?.decisionCheckpoint?.planTaskId, "dev");
+
+  const manualOnly = resolveApprovedPlanInitialExecutionRecovery([{
+    id: "manual-review",
+    text: "Review the native dialog",
+    status: "pending",
+    evidenceStatus: "requires_user_confirmation",
+    evidence: [{ kind: "manual_user_validation", value: "Review the native dialog" }],
+  }]);
+  assert.equal(manualOnly, null);
+});
+
+test("approved Plan recovery advances to the next unsatisfied task identity", () => {
+  const tasks = [
+    {
+      id: "edit-toolbar",
+      requirementRef: "REQ-EDIT",
+      text: "Modify toolbar",
+      status: "in_progress",
+      evidenceStatus: "partial",
+      evidence: [{ kind: "file", value: "src/toolbar.js" }],
+    },
+    {
+      id: "build",
+      requirementRef: "REQ-BUILD",
+      text: "Build project",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "cmd", value: "npm run build" }],
+    },
+    {
+      id: "dev",
+      requirementRef: "REQ-DEV",
+      text: "Start dev server",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "cmd", value: "npm run dev" }],
+    },
+  ];
+  const mutation = {
+    id: "mutation",
+    planTaskId: "edit-toolbar",
+    requirementRef: "REQ-EDIT",
+    kind: "file",
+    value: "src/toolbar.js",
+    target: "src/toolbar.js",
+    sourceTool: "apply_patch",
+    createdAt: 1,
+  };
+  const buildRecovery = resolveApprovedPlanInitialExecutionRecovery(tasks, [mutation]);
+  assert.equal(buildRecovery?.mode, "finite_validation_only");
+  assert.equal(buildRecovery?.decisionCheckpoint?.planTaskId, "build");
+  assert.equal(buildRecovery?.decisionCheckpoint?.requirementRef, "REQ-BUILD");
+
+  const build = {
+    id: "build-result",
+    planTaskId: "build",
+    requirementRef: "REQ-BUILD",
+    kind: "cmd",
+    value: "npm run build",
+    target: "npm run build",
+    sourceTool: "run_command",
+    createdAt: 2,
+  };
+  const devRecovery = resolveApprovedPlanInitialExecutionRecovery(tasks, [mutation, build]);
+  assert.equal(devRecovery?.mode, "validation_only");
+  assert.equal(devRecovery?.decisionCheckpoint?.nextRequiredCapability, "launch_long_process");
+  assert.equal(devRecovery?.decisionCheckpoint?.planTaskId, "dev");
+  assert.equal(devRecovery?.decisionCheckpoint?.requirementRef, "REQ-DEV");
+  const launchContract = resolveExecuteRecoveryActionContract(
+    devRecovery.mode,
+    devRecovery,
+  );
+  const batch = resolveExecuteRecoveryBatchDecision({
+    mode: devRecovery.mode,
+    contract: launchContract,
+    calls: [{ id: "launch-dev", name: "execute_command", target: "npm run dev" }],
+  });
+  assert.equal(batch.selectedCallId, "launch-dev");
+  assert.deepEqual(batch.deferredCallIds, []);
+});
+
+test("approved Plan store handoff forwards the derived recovery state", () => {
+  const appStoreSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  assert.match(
+    appStoreSource,
+    /const\s+initialExecuteRecoveryState\s*=\s*resolveApprovedPlanInitialExecutionRecovery\(\s*latest\.planTasks,?\s*\);/,
+  );
+  assert.match(
+    appStoreSource,
+    /forceExecuteRecoveryMode:\s*initialExecuteRecoveryState\.mode,[\s\S]*?forceExecuteRecoveryState:\s*initialExecuteRecoveryState/,
+  );
+});
 
 test("plan review awaiting approval is not an active execution lease", () => {
   assert.equal(isPlanReviewExecutionLeaseActive({
@@ -157,19 +289,14 @@ test("approved plan same-turn fallback retries busy once only while the exact tr
 });
 
 const {
-  describeApprovedPlanRecoveryToolSurface,
-  describeApprovedPlanSourceEditFirstToolSurface,
   isApprovedPlanCachedReadOnlyNoProgressBatch,
-  isApprovedPlanRecoveryToolName,
-  isApprovedPlanSourceEditFirstToolName,
-  resolveApprovedPlanPatchRecoveryTarget,
-  shouldAllowApprovedPlanRecoveryFileRead,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
 
 const {
-  handleApprovedPlanNoToolRecovery,
-  resolveApprovedPlanNoToolCheckpointLimit,
-} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"));
+  isExecuteRecoveryToolName,
+  resolveExecuteRecoveryActionContract,
+  resolveExecuteRecoveryBatchDecision,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
 
 const {
   appendApprovedPlanUserValidationConclusion,
@@ -178,9 +305,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"));
 
 const {
-  handleCrossIterationReadFileLoopRecovery,
   handleExecuteConvergencePrompt,
-  handleReadFileRepeatLimitRecovery,
   handleStrictRepeatGuardRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
 
@@ -316,6 +441,15 @@ const repeatGuardToolCapabilityRegistry = {
       enabled: true,
       autoExecutable: false,
     },
+    execute_command: {
+      key: "execute_command",
+      name: "execute_command",
+      source: "built_in",
+      category: "shell",
+      risk: "shell",
+      enabled: true,
+      autoExecutable: false,
+    },
     browser_evaluate: {
       key: "browser_evaluate",
       name: "browser_evaluate",
@@ -330,13 +464,22 @@ const repeatGuardToolCapabilityRegistry = {
 };
 
 function createRepeatGuardInput(harness, overrides = {}) {
+  const effectiveToolCalls = overrides.effectiveToolCalls || [];
   return {
     callbacks: harness.callbacks,
     workspace: workspaceRoot,
     workflowMode: "plan",
     runtimeIntent: "execute",
     iteration: 4,
-    effectiveToolCalls: [],
+    effectiveToolCalls,
+    results: effectiveToolCalls.map((call) => ({
+      toolCallId: call.id,
+      name: call.name,
+      target: "",
+      content: "completed",
+      isError: false,
+      lifecycleState: "completed",
+    })),
     recentToolCalls: [],
     repeatGuardRecoveredSignatures: new Set(),
     failedToolCallCounts: new Map(),
@@ -363,47 +506,6 @@ function createApprovedPlanNoToolAudit(overrides = {}) {
     pendingUserValidationReasons: [],
     acceptedCompletion: false,
     ...overrides,
-  };
-}
-
-function createApprovedPlanNoToolInput(overrides = {}) {
-  const harness = overrides.harness || createApprovedPlanNoToolHarness("en");
-  return {
-    harness,
-    input: {
-      callbacks: harness.callbacks,
-      activeProfile: "cloud",
-      iteration: 3,
-      workflowMode: "plan",
-      runtimeIntent: "execute",
-      planStage: "executing",
-      isApprovedPlanExecutionTurn: true,
-      effectiveToolCallCount: 0,
-      shouldSuppressApprovedPlanNoToolText: true,
-      approvedPlanAuditForNoTool: createApprovedPlanNoToolAudit(),
-      rejectedCompletionClaim: false,
-      availableToolNames: new Set(["read_file", "write_file", "replace_in_file", "run_command"]),
-      wasTruncated: false,
-      sawExecuteOperationEvidence: false,
-      normalized: {
-        finishReason: "stop",
-        hiddenThought: "",
-        visibleText: "I will continue.",
-        toolCalls: [],
-      },
-      finalReplyOptionsCount: 0,
-      streamText: "I will continue.",
-      iterationRequestStartedAt: Date.now(),
-      recentPlanToolActivity: [],
-      consecutiveNoToolCount: 0,
-      approvedPlanNoProgressRecoveryAttempts: 0,
-      approvedPlanActionOnlyRecoveryActive: false,
-      approvedPlanNoToolRecoveryFileReadActive: false,
-      approvedPlanLongReasoningNoActionCount: 0,
-      emitTaskOrchestratorPhase: (phase, extra) => harness.taskPhases.push({ phase, extra }),
-      emitPlanExecutionProgress: (phase, overrides) => harness.progress.push({ phase, overrides }),
-      ...(overrides.input || {}),
-    },
   };
 }
 
@@ -930,7 +1032,7 @@ test("failed deterministic fallback sends the prepared model scaffold before exh
   assert.equal(exhaustedHarness.appended.length, 0);
 });
 
-test("pending closure-evidence recovery wins over deterministic materialization", async () => {
+test("grounded rewrite recovery scaffolds without reopening deterministic evidence", async () => {
   const harness = createPlanNoToolHarness("zh");
   const sourceVisibleText = "我还需要继续分析当前状态同步实现。";
   const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
@@ -961,10 +1063,11 @@ test("pending closure-evidence recovery wins over deterministic materialization"
 
   assert.equal(result.status, "continue");
   assert.equal(result.planQualityRejectCount, 2);
-  assert.equal(result.planClosureEvidenceRecoveryIssued, true);
+  assert.equal(result.planClosureEvidenceRecoveryIssued, false);
+  assert.equal(result.planAutoScaffoldPromptIssued, true);
   assert.equal(harness.stops.length, 0);
-  assert.match(harness.appended.at(-1)?.content || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
-  assert.equal(harness.phases.at(-1)?.phase, "needs_evidence");
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_AUTO_SCAFFOLD/);
+  assert.equal(harness.phases.at(-1)?.phase, "needs_rewrite");
 
   const repeatedHarness = createPlanNoToolHarness("zh");
   const repeated = await handlePlanNoToolRecovery(createPlanNoToolInput(repeatedHarness, {
@@ -1092,13 +1195,12 @@ test("plan closure evidence recovery prompt keeps planning read-only and targete
   assert.match(en, /Do not call broad directory scans/);
 });
 
-test("approved plan finalization continues when trusted evidence is still incomplete", () => {
+test("approved plan finalization continues from provenance in execute workflow", () => {
   const harness = createApprovedPlanNoToolHarness("en");
   const result = handleApprovedPlanFinalization({
     callbacks: harness.callbacks,
     activeProfile: "cloud",
     iteration: 7,
-    workflowMode: "plan",
     approvedPlanAuditForNoTool: createApprovedPlanNoToolAudit(),
     rejectedCompletionClaim: true,
     availableToolNames: new Set(["read_file", "replace_in_file", "run_command"]),
@@ -1399,6 +1501,65 @@ test("strict repeat guard redirects repeated PTY controls to observation without
   assert.match(harness.appended.at(-1)?.content || "", /get_pty_status\/read_pty_since/);
 });
 
+test("strict repeat guard leaves policy deferrals to protocol no-progress while retaining real command protection", () => {
+  const harness = createStrictRepeatGuardHarness("en");
+  const recentToolCalls = [];
+  let result = null;
+
+  for (let i = 0; i < 3; i += 1) {
+    const call = {
+      id: `call_deferred_dev_${i}`,
+      name: "execute_command",
+      arguments: JSON.stringify({ command: "npm run dev" }),
+    };
+    result = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+      effectiveToolCalls: [call],
+      results: [{
+        toolCallId: call.id,
+        name: call.name,
+        target: "npm run dev",
+        content: "EXECUTE_RECOVERY_BATCH_DEFERRED",
+        displayContent: "",
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "execute_recovery_batch_deferred",
+      }],
+      recentToolCalls,
+      availableToolNames: new Set(["execute_command"]),
+    }));
+  }
+
+  assert.equal(result.status, "none");
+  assert.equal(recentToolCalls.length, 0);
+  assert.equal(harness.errors.length, 0);
+
+  for (let i = 0; i < 3; i += 1) {
+    const call = {
+      id: `call_executed_dev_${i}`,
+      name: "execute_command",
+      arguments: JSON.stringify({ command: "npm run dev" }),
+    };
+    result = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+      effectiveToolCalls: [call],
+      results: [{
+        toolCallId: call.id,
+        name: call.name,
+        target: "npm run dev",
+        content: "command completed",
+        isError: false,
+        lifecycleState: "completed",
+      }],
+      recentToolCalls,
+      availableToolNames: new Set(["execute_command"]),
+    }));
+  }
+
+  assert.equal(result.status, "stopped");
+  assert.equal(harness.errors.length > 0, true);
+  assert.match(harness.errors[0], /repetition loop/i);
+});
+
 test("max-iteration checkpoint keeps internal plan files out of project-source evidence", () => {
   const checkpoint = buildPlanMaxIterationsCheckpoint({
     iterationCount: 50,
@@ -1491,7 +1652,28 @@ test("execute max-iteration recovery resumes validation after a completed mutati
   });
 });
 
-test("execute max-iteration recovery preserves a pending post-mutation read lease", () => {
+test("execute max-iteration recovery ignores evidence from older transactions", () => {
+  const decision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [{
+      id: "old-mutation",
+      transactionId: "turn-old",
+      kind: "file",
+      value: "src/old.ts",
+      target: "src/old.ts",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }],
+    transactionId: "turn-current",
+  });
+
+  assert.deepEqual(decision, {
+    mode: "finite_validation_only",
+    gap: "validation_required",
+    reason: "max_iterations_validation_required",
+  });
+});
+
+test("execute max-iteration recovery migrates a legacy post-mutation read lease to validation", () => {
   const decision = resolveExecuteMaxIterationsRecoveryDecision({
     evidenceLedger: [{
       id: "mutation-before-post-check",
@@ -1514,9 +1696,9 @@ test("execute max-iteration recovery preserves a pending post-mutation read leas
   });
 
   assert.deepEqual(decision, {
-    mode: "validation_only",
+    mode: "finite_validation_only",
     gap: "validation_after_mutation_required",
-    reason: "max_iterations_post_mutation_check_required",
+    reason: "max_iterations_validation_after_mutation",
   });
 });
 
@@ -1546,7 +1728,7 @@ test("execute max-iteration recovery permits final synthesis when evidence is al
   });
 });
 
-test("execute max-iteration recovery restores PTY observation then browser validation from ledger state", () => {
+test("execute max-iteration recovery observes every long process but requests browser only for interaction obligations", () => {
   const mutation = {
     id: "mutation-before-server",
     kind: "file",
@@ -1582,8 +1764,20 @@ test("execute max-iteration recovery restores PTY observation then browser valid
     foregroundGeneration: 7,
     createdAt: 3,
   };
-  const browserDecision = resolveExecuteMaxIterationsRecoveryDecision({
+  const readyProcessDecision = resolveExecuteMaxIterationsRecoveryDecision({
     evidenceLedger: [mutation, launch, ready],
+  });
+  assert.equal(readyProcessDecision.mode, "normal");
+  assert.equal(readyProcessDecision.gap, "none");
+
+  const interactionMutation = {
+    ...mutation,
+    id: "interaction-mutation-before-server",
+    interactionMutation: true,
+    interactionBehaviorTargets: ["#new-btn"],
+  };
+  const browserDecision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [interactionMutation, launch, ready],
   });
   assert.equal(browserDecision.mode, "validation_only");
   assert.equal(browserDecision.gap, "browser_validation_required");
@@ -1809,113 +2003,14 @@ test("cached read-only helpers identify repeated plan targets", () => {
   );
 });
 
-test("approved plan strategy switch continues the agent loop after recovery prompt", () => {
-  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"), "utf8"));
-  const approvedPlanNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"), "utf8");
+test("approved cached reads enter the unified execute recovery contract", () => {
   const loopRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"), "utf8");
-  const toolResultRecoveryPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"), "utf8");
 
   assert.match(
-    approvedPlanNoToolRecoverySource,
-    /if\s*\(\s*truncatedAfterCachedReadOnly\s*\)\s*{[\s\S]*?continueApprovedPlanWithStrategySwitch\(\{[\s\S]*?return finish\("continue"\);/,
-  );
-  assert.match(
-    toolResultRecoveryPhaseSource,
-    /if\s*\(\s*approvedPlanNoProgressDecision\s*\)\s*{[\s\S]*?approvedPlanNoProgressDecision\.action\s*===\s*"recover"[\s\S]*?approvedPlanRecoveryState\s*=\s*input\.continueApprovedPlanWithStrategySwitch\([\s\S]*?approvedPlanNoProgressDecision[\s\S]*?return finish\("continue"\);/,
+    loopRecoverySource,
+    /approvedPlanCachedReadOnlyBatch[\s\S]*?activateTrackedExecuteRecovery\(\s*"mutation_first",\s*"no_progress_cached_read_only_batch"/,
   );
   assert.match(loopRecoverySource, /isApprovedPlanCachedReadOnlyNoProgressBatch/);
-  assert.match(loopRecoverySource, /no_progress_cached_read_only_batch/);
-  assert.doesNotMatch(orchestratorSource, /isApprovedPlanCachedReadOnlyNoProgressBatch/);
-});
-
-test("approved plan no-tool helper appends recovery prompt and opens action recovery surface", () => {
-  const { harness, input } = createApprovedPlanNoToolInput();
-  const result = handleApprovedPlanNoToolRecovery(input);
-
-  assert.equal(result.status, "continue");
-  assert.equal(result.consecutiveNoToolCount, 1);
-  assert.equal(result.approvedPlanActionOnlyRecoveryActive, true);
-  assert.equal(result.approvedPlanNoToolRecoveryFileReadActive, true);
-  assert.equal(result.approvedPlanNoProgressRecoveryAttempts, 0);
-  assert.deepEqual(harness.statuses, ["running"]);
-  assert.equal(harness.appended.length, 1);
-  assert.equal(harness.appended[0].role, "user");
-  assert.match(harness.appended[0].content, /TOOL_ONLY_RECOVERY/);
-  assert.equal(harness.stops.length, 0);
-  assert.equal(resolveApprovedPlanNoToolCheckpointLimit("local"), 5);
-});
-
-test("approved plan external review is advisory after automatic evidence closes", () => {
-  const harness = createApprovedPlanNoToolHarness("zh");
-  const pendingReviewTask = {
-    ...tasks[1],
-    status: "in_progress",
-    evidenceStatus: "requires_user_confirmation",
-    evidence: [{ kind: "manual_user_validation", value: "user reviews the Tauri window" }],
-  };
-  harness.callbacks.getPlanTasks = () => [tasks[0], pendingReviewTask];
-  harness.callbacks.getPlanExecutionEvidenceLedger = () => [
-    ...evidenceLedger,
-    {
-      id: "automatic-validation",
-      kind: "cmd",
-      value: "npm test",
-      target: "npm test",
-      sourceTool: "run_command",
-      createdAt: 3,
-    },
-  ];
-  const { input } = createApprovedPlanNoToolInput({
-    harness,
-    input: {
-      approvedPlanAuditForNoTool: createApprovedPlanNoToolAudit({
-        tasks: [tasks[0], pendingReviewTask],
-        remainingTasks: [],
-        pendingUserValidationTasks: [pendingReviewTask],
-        automationComplete: true,
-        pendingExternalValidation: true,
-        pendingUserValidationReasons: ["review the Tauri window"],
-      }),
-      availableToolNames: new Set(["read_file", "run_command"]),
-    },
-  });
-
-  const result = handleApprovedPlanNoToolRecovery(input);
-
-  assert.equal(result.status, "none");
-  assert.equal(harness.stops.length, 0);
-  assert.equal(harness.progress.length, 0);
-  assert.equal(harness.appended.length, 0);
-  assert.deepEqual(harness.statuses, ["running"]);
-});
-
-test("approved plan no-tool helper switches strategy at the local checkpoint boundary", () => {
-  const { harness, input } = createApprovedPlanNoToolInput({
-    input: {
-      activeProfile: "local",
-      consecutiveNoToolCount: 4,
-      rejectedCompletionClaim: true,
-      normalized: {
-        finishReason: "stop",
-        hiddenThought: "",
-        visibleText: "Done.",
-        toolCalls: [],
-      },
-      streamText: "Done.",
-    },
-  });
-  const result = handleApprovedPlanNoToolRecovery(input);
-
-  assert.equal(result.status, "continue");
-  assert.equal(result.consecutiveNoToolCount, 0);
-  assert.equal(result.approvedPlanActionOnlyRecoveryActive, true);
-  assert.equal(result.approvedPlanNoToolRecoveryFileReadActive, true);
-  assert.equal(result.approvedPlanNoProgressRecoveryAttempts, 1);
-  assert.deepEqual(harness.statuses, ["running", "running"]);
-  assert.equal(harness.appended.length, 1);
-  assert.match(harness.appended[0].content, /继续执行|Continue now/);
-  assert.equal(harness.stops.length, 0);
-  assert.deepEqual(harness.progress.map((entry) => entry.phase), ["running"]);
 });
 
 test("approved execution repeated cached reads replay prior content after the first stub", () => {
@@ -1942,376 +2037,6 @@ test("approved execution repeated cached reads replay prior content after the fi
   assert.match(toolCallPartitioningSource, /buildFileUnchangedReplayContent/);
 });
 
-test("cross-iteration read recovery keeps fresh ranges legal but requires mutation-task progress", () => {
-  const appended = [];
-  const activations = [];
-  const callbacks = {
-    appendMessage: (message) => appended.push(message),
-    getPreferredLanguage: () => "en",
-  };
-  const crossIterationFileReads = new Map();
-  const fresh = handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 4,
-    results: [{
-      toolCallId: "fresh-window",
-      name: "read_file",
-      target: "src/main.js",
-      content: "READ_FILE_RESULT lines 301-400",
-      isError: false,
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-
-  assert.equal(fresh.executeRecoveryMode, "normal");
-  assert.equal(crossIterationFileReads.has("src/main.js"), false);
-  assert.equal(activations.length, 0);
-
-  const secondFresh = handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 5,
-    results: [{
-      toolCallId: "fresh-window-2",
-      name: "read_file",
-      target: "src/main.js",
-      content: "READ_FILE_RESULT lines 401-500",
-      isError: false,
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-
-  assert.equal(secondFresh.executeRecoveryMode, "normal");
-  assert.equal(crossIterationFileReads.has("src/main.js"), false);
-  assert.equal(activations.length, 0);
-
-  let cached;
-  for (let replay = 1; replay <= 3; replay += 1) {
-    cached = handleCrossIterationReadFileLoopRecovery({
-      callbacks,
-      workflowMode: "edit",
-      runtimeIntent: "execute",
-      iteration: 5 + replay,
-      results: [{
-        toolCallId: `cached-window-${replay}`,
-        name: "read_file",
-        target: "src/main.js",
-        content: "CACHED_FILE_REPLAY: requested range restored after compaction",
-        isError: false,
-      }],
-      snapshotContextLimit: 16_000,
-      crossIterationFileReads,
-      executeRecoveryMode: "normal",
-      executeRecoveryReason: "",
-      consecutiveBlockedReadFileInRecoveryCount: 0,
-      activateExecuteRecovery: (...args) => activations.push(args),
-    });
-  }
-
-  assert.equal(cached?.executeRecoveryMode, "mutation_first");
-  assert.equal(Math.max(...[...crossIterationFileReads.values()].map((entry) => entry.count)), 3);
-  assert.equal(activations.length, 1);
-  assert.match(appended.at(-1)?.content || "", /observation-only/);
-});
-
-test("fresh file windows have no raw read-count cap and no-op writes do not reset repeated replay state", () => {
-  const activations = [];
-  const callbacks = {
-    appendMessage: () => {},
-    getPreferredLanguage: () => "en",
-  };
-  const crossIterationFileReads = new Map();
-
-  for (let index = 0; index < 20; index += 1) {
-    const result = handleCrossIterationReadFileLoopRecovery({
-      callbacks,
-      workflowMode: "edit",
-      runtimeIntent: "execute",
-      iteration: index + 1,
-      results: [{
-        toolCallId: `fresh-${index}`,
-        name: "read_file",
-        target: "src/large-file.ts",
-        content: `READ_FILE_RESULT lines ${index * 100 + 1}-${(index + 1) * 100}`,
-        isError: false,
-      }],
-      snapshotContextLimit: 16_000,
-      crossIterationFileReads,
-      executeRecoveryMode: "normal",
-      executeRecoveryReason: "",
-      consecutiveBlockedReadFileInRecoveryCount: 0,
-      activateExecuteRecovery: (...args) => activations.push(args),
-    });
-    assert.equal(result.executeRecoveryMode, "normal");
-  }
-  assert.equal(crossIterationFileReads.size, 0);
-  assert.equal(activations.length, 0);
-
-  crossIterationFileReads.set("window-large", {
-    path: "src/large-file.ts",
-    versionToken: "1000:1",
-    count: 2,
-  });
-  handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 21,
-    results: [{
-      toolCallId: "no-op-write",
-      name: "write_file",
-      target: "src/large-file.ts",
-      content: "NO_EFFECT_MUTATION: content already matched requested content",
-      isError: false,
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(crossIterationFileReads.get("window-large")?.count, 2);
-
-  handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 22,
-    results: [{
-      toolCallId: "unrelated-write",
-      name: "write_file",
-      target: "src/other-file.ts",
-      content: "WRITE_FILE_RESULT: changed src/other-file.ts",
-      isError: false,
-    }, {
-      toolCallId: "unrelated-command",
-      name: "run_command",
-      target: "pwd",
-      content: "exitCode=0",
-      isError: false,
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(crossIterationFileReads.get("window-large")?.count, 2);
-
-  handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 23,
-    results: [{
-      toolCallId: "third-replay",
-      name: "read_file",
-      target: "src/large-file.ts",
-      content: "CACHED_FILE_REPLAY: unchanged range",
-      isError: false,
-      readFileObservation: {
-        key: "window-large",
-        path: "src/large-file.ts",
-        requestSignature: "read_file::src/large-file.ts::range-a",
-        versionToken: "1000:1",
-        source: "replay",
-      },
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(crossIterationFileReads.get("window-large")?.count, 3);
-  assert.equal(activations.at(-1)?.[0], "mutation_first");
-});
-
-test("cross-iteration read recovery isolates range signatures and file versions", () => {
-  const activations = [];
-  const callbacks = {
-    appendMessage: () => {},
-    getPreferredLanguage: () => "en",
-  };
-  const makeObservation = (key, versionToken, source = "replay") => ({
-    key,
-    path: "src/large-file.ts",
-    requestSignature: `read_file::src/large-file.ts::${key}`,
-    versionToken,
-    source,
-  });
-  const crossIterationFileReads = new Map();
-
-  for (const key of ["range-a", "range-b", "range-c"]) {
-    const result = handleCrossIterationReadFileLoopRecovery({
-      callbacks,
-      workflowMode: "edit",
-      runtimeIntent: "execute",
-      iteration: crossIterationFileReads.size + 1,
-      results: [{
-        toolCallId: key,
-        name: "read_file",
-        target: "src/large-file.ts",
-        content: `CACHED_FILE_REPLAY: ${key}`,
-        isError: false,
-        readFileObservation: makeObservation(key, "v1"),
-      }],
-      snapshotContextLimit: 16_000,
-      crossIterationFileReads,
-      executeRecoveryMode: "normal",
-      executeRecoveryReason: "",
-      consecutiveBlockedReadFileInRecoveryCount: 0,
-      activateExecuteRecovery: (...args) => activations.push(args),
-    });
-    assert.equal(result.executeRecoveryMode, "normal");
-  }
-  assert.deepEqual(
-    [...crossIterationFileReads.values()].map((entry) => entry.count),
-    [1, 1, 1],
-  );
-  assert.equal(activations.length, 0);
-
-  crossIterationFileReads.set("range-a", {
-    path: "src/large-file.ts",
-    versionToken: "v1",
-    count: 2,
-  });
-  handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 4,
-    results: [{
-      toolCallId: "fresh-b",
-      name: "read_file",
-      target: "src/large-file.ts",
-      content: "READ_FILE_RESULT range-b",
-      isError: false,
-      readFileObservation: makeObservation("range-b", "v1", "fresh"),
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(crossIterationFileReads.get("range-a")?.count, 2);
-
-  const repeatedA = handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 5,
-    results: [{
-      toolCallId: "replay-a-3",
-      name: "read_file",
-      target: "src/large-file.ts",
-      content: "CACHED_FILE_REPLAY: range-a",
-      isError: false,
-      readFileObservation: makeObservation("range-a", "v1"),
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(repeatedA.executeRecoveryMode, "mutation_first");
-
-  const nextVersionReads = new Map([["range-a-v1", {
-    path: "src/large-file.ts",
-    versionToken: "v1",
-    count: 2,
-  }]]);
-  handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 6,
-    results: [{
-      toolCallId: "fresh-v2",
-      name: "read_file",
-      target: "src/large-file.ts",
-      content: "READ_FILE_RESULT range-a v2",
-      isError: false,
-      readFileObservation: makeObservation("range-a-v2", "v2", "fresh"),
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads: nextVersionReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(nextVersionReads.has("range-a-v1"), false);
-
-  const commandInvalidatedReads = new Map([["range-a", {
-    path: "src/large-file.ts",
-    versionToken: "v1",
-    count: 2,
-  }]]);
-  handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 7,
-    results: [{
-      toolCallId: "fresh-a-after-pwd",
-      name: "read_file",
-      target: "src/large-file.ts",
-      content: "READ_FILE_RESULT range-a after command cache invalidation",
-      isError: false,
-      readFileObservation: makeObservation("range-a", "v1", "fresh"),
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads: commandInvalidatedReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(commandInvalidatedReads.get("range-a")?.count, 2);
-  const afterCommandReplay = handleCrossIterationReadFileLoopRecovery({
-    callbacks,
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    iteration: 8,
-    results: [{
-      toolCallId: "replay-a-after-pwd",
-      name: "read_file",
-      target: "src/large-file.ts",
-      content: "CACHED_FILE_REPLAY: range-a after command cache invalidation",
-      isError: false,
-      readFileObservation: makeObservation("range-a", "v1"),
-    }],
-    snapshotContextLimit: 16_000,
-    crossIterationFileReads: commandInvalidatedReads,
-    executeRecoveryMode: "normal",
-    executeRecoveryReason: "",
-    consecutiveBlockedReadFileInRecoveryCount: 0,
-    activateExecuteRecovery: (...args) => activations.push(args),
-  });
-  assert.equal(afterCommandReplay.executeRecoveryMode, "mutation_first");
-});
-
 test("approved plan convergence activates mutation recovery for an unfinished source task", () => {
   const appended = [];
   const activations = [];
@@ -2330,7 +2055,7 @@ test("approved plan convergence activates mutation recovery for an unfinished so
 
   const result = handleExecuteConvergencePrompt({
     callbacks,
-    workflowMode: "plan",
+    workflowMode: "edit",
     runtimeIntent: "execute",
     iteration: 12,
     effectiveMaxIterations: 50,
@@ -2381,7 +2106,7 @@ test("approved plan convergence moves to validation after composite task source 
 
   const result = handleExecuteConvergencePrompt({
     callbacks,
-    workflowMode: "plan",
+    workflowMode: "edit",
     runtimeIntent: "execute",
     iteration: 12,
     effectiveMaxIterations: 50,
@@ -2402,16 +2127,13 @@ test("approved plan convergence moves to validation after composite task source 
 
 test("approved plan execution starts with the normal execute tool surface", () => {
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
-  const approvedPlanRecoveryActionsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanRecoveryActions.ts"), "utf8");
-  const approvedPlanRecoveryRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanRecoveryRuntime.ts"), "utf8");
   const planReviewRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planReviewRuntime.ts"), "utf8");
   const appStoreSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
-  const loopControlRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopControlRuntime.ts"), "utf8");
   const loopMutableStateSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopMutableState.ts"), "utf8");
 
   assert.match(
     loopMutableStateSource,
-    /approvedPlanRecoveryState:\s*createApprovedPlanRecoveryRuntimeState\(\),/,
+    /executeRecoveryState:\s*createExecuteRecoveryRuntimeState\(\{/,
   );
   assert.match(planReviewRuntimeSource, /Approval belongs to a fresh child run/);
   assert.match(
@@ -2419,204 +2141,67 @@ test("approved plan execution starts with the normal execute tool surface", () =
     /planStage:\s*"executing"[\s\S]*plan_review_run_paused_for_child_execution/,
   );
   assert.match(appStoreSource, /startApprovedPlanExecutionInCurrentTurn/);
-  assert.match(
-    loopControlRuntimeSource,
-    /const\s+result\s*=\s*continueApprovedPlanWithStrategySwitchAction\(\{[\s\S]*?const\s+nextState\s*=\s*applyApprovedPlanStrategySwitchRecoveryState\([\s\S]*?setApprovedPlanRecoveryState\(nextState\);[\s\S]*?return nextState;/,
-  );
-  assert.match(
-    approvedPlanRecoveryActionsSource,
-    /approvedPlanActionOnlyRecoveryActive:\s*true/,
-  );
-  assert.match(
-    approvedPlanRecoveryRuntimeSource,
-    /approvedPlanActionOnlyRecoveryActive:\s*false/,
-  );
-  assert.doesNotMatch(
-    orchestratorSource,
-    /let\s+approvedPlanActionOnlyRecoveryActive\s*=\s*workflowMode\s*===\s*"plan"\s*&&\s*callbacks\.getIsPlanApproved\(\)/,
-  );
 });
 
-test("approved plan no-progress recovery keeps targeted reads without broad discovery", () => {
-  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
-  const approvedPlanNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"), "utf8");
-  const toolCallPlanningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"), "utf8");
-  const toolCallPartitioningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"), "utf8");
-  const readOnlyTools = new Set([
-    "get_project_skeleton",
-    "list_directory",
-    "glob_search",
-    "grep_search",
-    "read_file",
-    "get_file_outline",
-    "read_pty_buffer",
-    "get_pty_status",
-  ]);
-  const fullToolNames = [
-    "list_directory",
-    "glob_search",
-    "grep_search",
-    "read_file",
-    "apply_patch",
-    "replace_in_file",
-    "write_file",
-    "run_command",
-    "execute_command",
-    "send_pty_input",
-    "browser_evaluate",
-    "get_file_outline",
-    "get_pty_status",
-  ];
+test("approved plan no-progress recovery uses the unified execution contract", () => {
+  const readOnlyTools = new Set(["read_file"]);
+  const mutationContract = resolveExecuteRecoveryActionContract("mutation_first", {
+    expectedTarget: "src/App.tsx",
+  });
 
-  const cachedReadRecoveryTools = fullToolNames.filter((name) =>
-    isApprovedPlanRecoveryToolName(name, readOnlyTools, { allowFileRead: false })
+  assert.equal(mutationContract.phase, "mutation");
+  assert.equal(mutationContract.surfaceDescription, "capability:mutation");
+  assert.equal(mutationContract.allowTargetedFileRead, true);
+  for (const toolName of ["read_file", "apply_patch"]) {
+    assert.equal(
+      isExecuteRecoveryToolName(toolName, readOnlyTools, { contract: mutationContract }),
+      true,
+      toolName,
+    );
+  }
+  assert.equal(
+    isExecuteRecoveryToolName("run_command", readOnlyTools, { contract: mutationContract }),
+    false,
   );
-  const patchRecoveryTools = fullToolNames.filter((name) =>
-    isApprovedPlanRecoveryToolName(name, readOnlyTools, { allowFileRead: true })
+  assert.equal(
+    isExecuteRecoveryToolName("list_directory", readOnlyTools, { contract: mutationContract }),
+    false,
   );
 
-  assert.deepEqual(cachedReadRecoveryTools, [
-    "apply_patch",
-    "replace_in_file",
-    "write_file",
-    "run_command",
-    "execute_command",
-    "send_pty_input",
-    "browser_evaluate",
-    "get_pty_status",
-  ]);
-  assert.equal(cachedReadRecoveryTools.includes("send_pty_input"), true);
-  assert.equal(cachedReadRecoveryTools.includes("get_pty_status"), true);
-  assert.equal(patchRecoveryTools.includes("read_file"), true);
-  assert.equal(patchRecoveryTools.includes("list_directory"), false);
-  assert.equal(
-    shouldAllowApprovedPlanRecoveryFileRead([
-      { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "FILE_UNCHANGED_STUB" },
-    ]),
-    false,
+  const patchReadContract = resolveExecuteRecoveryActionContract("patch_recovery_read", {
+    expectedTarget: "src/App.tsx",
+    readLease: {
+      purpose: "patch_recovery",
+      target: "src/App.tsx",
+      state: "available",
+    },
+  });
+  assert.equal(patchReadContract.phase, "context");
+  assert.equal(patchReadContract.nextRequiredCapability, "targeted_read");
+
+  const toolCallPlanningSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"),
+    "utf8",
   );
-  assert.equal(
-    shouldAllowApprovedPlanRecoveryFileRead([
-      { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text 与文件内容不一致，未执行写入。" },
-    ]),
-    true,
+  const toolCallPartitioningSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
+    "utf8",
   );
-  assert.equal(
-    shouldAllowApprovedPlanRecoveryFileRead([
-      { name: "apply_patch", target: "src/hooks/useCsvParser.ts", status: "failed", detail: "Unsupported apply_patch line: --- a/src/hooks/useCsvParser.ts" },
-    ]),
-    true,
-  );
-  assert.equal(
-    shouldAllowApprovedPlanRecoveryFileRead([
-      { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text 与文件内容不一致，未执行写入。" },
-      { name: "read_file", target: "src/App.tsx", status: "succeeded", detail: "READ_FILE_RESULT" },
-    ]),
-    false,
-  );
-  assert.equal(
-    shouldAllowApprovedPlanRecoveryFileRead([
-      { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text mismatch" },
-      { name: "write_file", target: "src/App.tsx", status: "succeeded", detail: "written" },
-    ]),
-    false,
-  );
-  const unresolvedMismatch = [
-    { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text mismatch" },
-  ];
-  assert.equal(resolveApprovedPlanPatchRecoveryTarget(unresolvedMismatch), "src/App.tsx");
-  assert.equal(resolveApprovedPlanPatchRecoveryTarget([
-    ...unresolvedMismatch,
-    ...Array.from({ length: 8 }, (_, index) => ({
-      name: "grep_search",
-      target: `symbol-${index}`,
-      status: "succeeded",
-      detail: "one match",
-    })),
-  ]), "src/App.tsx");
-  assert.equal(describeApprovedPlanRecoveryToolSurface(false), "action_only");
-  assert.equal(describeApprovedPlanRecoveryToolSurface(true), "action_plus_patch_file_read");
-  assert.equal(
-    isApprovedPlanCachedReadOnlyNoProgressBatch({
-      readOnlyTools,
-      results: [
-        { name: "read_file", isError: false, detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
-        { name: "read_file", isError: false, detail: "READ_FILE_RESULT path: src/index.css" },
-      ],
-    }),
-    false,
-  );
-  assert.equal(
-    isApprovedPlanCachedReadOnlyNoProgressBatch({
-      readOnlyTools,
-      results: [
-        { name: "read_file", isError: false, detail: "FILE_UNCHANGED_STUB: src/App.tsx" },
-        { name: "read_file", isError: false, content: "Repeated read-only tool call skipped: src/hooks/useCsvParser.ts" },
-      ],
-    }),
-    true,
-  );
-  assert.match(
-    toolCallPlanningSource,
-    /recoveryIterationAllTools\.filter\(\(tool\)\s*=>\s*isApprovedPlanRecoveryTool\(tool,[\s\S]*allowFileRead: allowApprovedPlanRecoveryFileRead/,
-  );
-  assert.doesNotMatch(
-    toolCallPlanningSource,
-    /function\s+isApprovedPlanRecoveryTool[\s\S]*?if\s*\(\s*name\s*===\s*"read_file"\s*\)\s*return\s+true;/,
-  );
-  assert.doesNotMatch(
-    toolCallPlanningSource,
-    /function\s+isApprovedPlanSourceEditFirstTool[\s\S]*?if\s*\(\s*tool\.function\.name\s*===\s*"read_file"\s*\)\s*return\s+true;/,
-  );
-  assert.match(toolCallPlanningSource, /approvedPlanNoToolRecoveryFileReadActive/);
-  assert.match(approvedPlanNoToolRecoverySource, /approved_plan_no_tool_recovery_tool_surface/);
-  assert.doesNotMatch(
-    orchestratorSource,
-    /rawIterationAllTools\.filter\(isApprovedPlanActionTool\)/,
-  );
-  assert.match(orchestratorSource, /patch-recovery `read_file` only/);
-  assert.match(orchestratorSource, /exact current content/);
-  assert.doesNotMatch(toolCallPartitioningSource, /approved_plan_patch_recovery_read_cache_bypass/);
-  assert.doesNotMatch(toolCallPartitioningSource, /bypassApprovedPlanPatchRecoveryReadCache/);
-  assert.match(toolCallPartitioningSource, /activeReadLease:\s*executeRecoveryState\.readLease/);
+  assert.match(toolCallPlanningSource, /const initialBaseIterationAllTools = recoveryIterationAllTools/);
+  assert.match(toolCallPlanningSource, /recoveryToolSurface: recoveryActionContract\.surfaceDescription/);
+  assert.doesNotMatch(toolCallPartitioningSource, /patch_recovery_read_cache_bypass/);
 });
-
-test("approved plan source edit first surface blocks validation before first write", () => {
-  assert.equal(isApprovedPlanSourceEditFirstToolName("apply_patch"), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("replace_in_file"), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("write_file"), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("delete_workspace_path"), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("script_apply_edits"), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("apply_text_edits"), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("run_command"), false);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("browser_evaluate"), false);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("get_pty_status"), false);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("get_pty_status", { preservePtyLifecycle: true }), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("read_pty_since", { preservePtyLifecycle: true }), true);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("read_file"), false);
-  assert.equal(isApprovedPlanSourceEditFirstToolName("read_file", { allowFileRead: true }), true);
-  assert.equal(describeApprovedPlanSourceEditFirstToolSurface(false), "source_edit_only");
-  assert.equal(describeApprovedPlanSourceEditFirstToolSurface(true), "source_edit_plus_patch_file_read");
-  assert.equal(
-    describeApprovedPlanSourceEditFirstToolSurface(true, true),
-    "source_edit_plus_patch_file_read_plus_pty_lifecycle",
-  );
-
+test("approved plan execution has no source-edit-first tool surface or shell veto", () => {
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
   const iterationStreamPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"), "utf8");
   const toolCallPlanningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"), "utf8");
   const toolCallPartitioningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"), "utf8");
   assert.match(orchestratorSource, /prepareIterationStreamRequest\(\{/);
   assert.match(iterationStreamPreparationSource, /resolveIterationToolSurface\(\{/);
-  assert.match(toolCallPlanningSource, /approvedPlanNeedsSourceEditBeforeValidation/);
-  assert.match(toolCallPlanningSource, /approved_plan_source_edit_first_tool_scope_applied/);
-  assert.match(toolCallPlanningSource, /approvedPlanInitialSourceReadAllowed/);
-  assert.match(toolCallPlanningSource, /recentPlanToolActivity\.length === 0/);
-  assert.match(toolCallPlanningSource, /initialSourceReadAllowed:\s*approvedPlanInitialSourceReadAllowed/);
-  assert.match(toolCallPlanningSource, /approvedPlanSourceEditFileReadAllowed/);
-  assert.match(toolCallPlanningSource, /preservePtyLifecycle/);
-  assert.match(toolCallPlanningSource, /!approvedPlanActionOnlyRecoveryActive/);
-  assert.match(toolCallPlanningSource, /approvedPlanActionRecoveryActive[\s\S]*?isApprovedPlanRecoveryTool/);
+  assert.doesNotMatch(orchestratorSource, /buildApprovedPlanSourceEditFirstPrompt/);
+  assert.doesNotMatch(toolCallPlanningSource, /approvedPlanSourceEditFirst|source_edit_first/);
+  assert.doesNotMatch(toolCallPartitioningSource, /APPROVED_PLAN_SHELL_READ_BLOCKED/);
+  assert.doesNotMatch(toolCallPartitioningSource, /approved_plan_shell_read_blocked/);
   assert.match(toolCallPlanningSource, /readFileExposed:\s*scopedToolNameSet\.has\("read_file"\)/);
 
   const unavailableCheckIndex = toolCallPartitioningSource.indexOf("!availableToolNames.has(tc.name)");
@@ -2664,82 +2249,36 @@ test("browser validation repeats are reused or paused without agent error", () =
   );
 });
 
-test("approved plan repeat-read guard switches to an action-only recovery before it pauses", () => {
-  const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
-  const toolIterationPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolIterationPhase.ts"), "utf8");
-  const toolResultRecoveryPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"), "utf8");
-  const toolCallPartitioningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"), "utf8");
-  const loopRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"), "utf8");
-
-  assert.match(orchestratorSource, /handleToolIterationPhase\(\{/);
-  assert.match(toolIterationPhaseSource, /handleToolResultRecoveryPhase\(\{/);
-  assert.match(toolResultRecoveryPhaseSource, /handleReadFileRepeatLimitRecovery\(\{/);
-  assert.match(toolResultRecoveryPhaseSource, /handleStrictRepeatGuardRecovery\(\{/);
-  assert.match(loopRecoverySource, /approvedPlanReadFileRepeatLimit/);
-  assert.match(loopRecoverySource, /approved_plan_read_file_repeat_limit/);
-  assert.match(loopRecoverySource, /approved_plan_read_file_repeat_limit_recovery/);
-  assert.match(toolCallPartitioningSource, /shouldPushApprovedPlanReadLimit/);
-  assert.match(toolCallPartitioningSource, /READ_FILE_REPEAT_LIMIT: \$\{target \|\| fileReadState\.path\}/);
-  assert.match(loopRecoverySource, /approved_plan_repeated_read_file/);
-  assert.match(loopRecoverySource, /callbacks\.onNonActionableStop\([\s\S]*?recoveryReason:\s*"approved_plan_read_file_repeat_limit"/);
-  assert.match(loopRecoverySource, /callbacks\.onNonActionableStop\([\s\S]*?recoveryReason:\s*"approved_plan_repeated_read_file"/);
-  assert.match(
-    loopRecoverySource,
-    /const approvedPlanReadFileRepeatLimit =[\s\S]*workflowMode === "plan" &&[\s\S]*callbacks\.getIsPlanApproved\(\) &&[\s\S]*runtimeIntent === "execute" &&[\s\S]*results\.some\(isReadFileRepeatLimitResult\)/,
+test("execution recovery has one no-progress handler and no legacy read/edit budgets", () => {
+  const loopRecoverySource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"),
+    "utf8",
   );
-  assert.match(loopRecoverySource, /reason: "approved_plan_read_file_repeat_limit"/);
-  assert.match(loopRecoverySource, /const readFileRepeatLimitBatch = workflowMode === "edit"\s*\? summarizeReadFileRepeatLimitBatch\(results\)/);
-  assert.match(loopRecoverySource, /activateExecuteRecovery\("mutation_first",\s*"read_file_repeat_limit_batch"/);
-  assert.match(loopRecoverySource, /read_file_repeat_limit_recovery/);
-  assert.match(loopRecoverySource, /prompt: buildExecuteRecoveryPrompt\({[\s\S]*?reason: "read_file_repeat_limit_batch"/);
+  const toolResultRecoverySource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"),
+    "utf8",
+  );
+  const executeRecoveryRuntimeSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"),
+    "utf8",
+  );
+  const combined = [loopRecoverySource, toolResultRecoverySource, executeRecoveryRuntimeSource].join("\n");
+
+  assert.match(loopRecoverySource, /export function handleNoProgressRecovery/);
+  assert.match(toolResultRecoverySource, /handleNoProgressRecovery\(\{/);
+  assert.match(executeRecoveryRuntimeSource, /registerExecuteRecoveryProtocolNoProgress/);
+  assert.doesNotMatch(
+    combined,
+    /handleReadFileRepeatLimitRecovery|handleCrossIterationReadFileLoopRecovery|handleRepeatedEditValidationRecovery/,
+  );
+  assert.doesNotMatch(
+    combined,
+    /consecutiveBlockedReadFileCount|repeatedEditValidationAttempts/,
+  );
 });
 
-test("approved plan repeat-read limit preserves the run and requests an action-only pivot", () => {
-  const prompts = [];
-  const phases = [];
-  const stops = [];
-  const recoveries = [];
-  const result = handleReadFileRepeatLimitRecovery({
-    callbacks: {
-      getIsPlanApproved: () => true,
-      getPreferredLanguage: () => "zh",
-      getPlanTasks: () => [{ id: "task-1", text: "修复 toolbar", status: "in_progress" }],
-      appendMessage: (message) => prompts.push(message),
-      onNonActionableStop: (...args) => stops.push(args),
-      onStatusChange: () => {},
-    },
-    workflowMode: "plan",
-    runtimeIntent: "execute",
-    iteration: 31,
-    results: [{
-      name: "read_file",
-      target: "src/components/toolbar.js",
-      content: "READ_FILE_REPEAT_LIMIT: src/components/toolbar.js",
-      isError: false,
-    }],
-    recentPlanToolActivity: [{
-      name: "read_file",
-      target: "src/components/toolbar.js",
-      status: "succeeded",
-      detail: "READ_FILE_REPEAT_LIMIT: src/components/toolbar.js",
-    }],
-    recentToolActivity: [],
-    executeRecoveryAttempts: 0,
-    activateExecuteRecovery: (mode, reason, context) => recoveries.push({ mode, reason, context }),
-    emitTaskOrchestratorPhase: (phase, details) => phases.push({ phase, details }),
-  });
-
-  assert.equal(result.status, "pending_prompt");
-  assert.match(result.prompt, /mutation_(?:first|only)|validation/i);
-  assert.deepEqual(recoveries.map((entry) => entry.mode), ["mutation_first"]);
-  assert.equal(recoveries[0].reason, "approved_plan_read_file_repeat_limit");
-  assert.equal(phases[0].phase, "EXECUTE_RECOVERY");
-  assert.equal(stops.length, 0);
-  assert.equal(prompts.length, 0);
-});
-
-test("approved plan recovery logs tool surfaces and pauses long reasoning without action", () => {
-  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"), "utf8"));
+test("approved plan recovery keeps watchdogs and derives tool scope from the active contract", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
   const iterationStreamPreparationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"), "utf8");
   const streamInvocationSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"), "utf8");
   const toolCallPlanningSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPlanning.ts"), "utf8");
@@ -2749,35 +2288,12 @@ test("approved plan recovery logs tool surfaces and pauses long reasoning withou
   assert.match(streamInvocationSource, /maxStreamElapsedMs:\s*minPositive\([\s\S]*?recoveryStreamMaxElapsedMs/);
   assert.match(streamInvocationSource, /boundedMaxElapsedMs[\s\S]*?120_000/);
   assert.match(streamInvocationSource, /APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS\s*=\s*45_000/);
-  assert.match(streamInvocationSource, /approvedPlanActionOnlyRecoveryActive[\s\S]*?resolveRecoveryToolChoice/);
+  assert.match(streamInvocationSource, /recoveryActionContract[\s\S]*?resolveRecoveryToolChoice/);
   assert.match(streamInvocationSource, /maxStreamElapsedLabel:\s*"approved_plan_recovery"/);
   assert.match(source, /prepareIterationStreamRequest\(\{/);
   assert.match(iterationStreamPreparationSource, /resolveIterationToolSurface\(\{/);
   assert.match(toolCallPlanningSource, /logAgentEvent\("tool_surface_decision"/);
   assert.match(toolCallPlanningSource, /logAgentEvent\("recovery_loop_summary"/);
-  assert.match(source, /logAgentEvent\("long_reasoning_no_action"/);
-  assert.match(source, /approved_plan_reasoning_length_no_action/);
-  assert.match(source, /approvedPlanLongReasoningNoActionCount === 1/);
-  assert.match(source, /pauseApprovedPlanNoProgressLoop\(\{[\s\S]*repeats: Math\.max\(1, approvedPlanLongReasoningNoActionCount\)/);
-});
-
-test("approved plan repeated edits route to validation recovery before pausing", () => {
-  const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
-  const toolIterationPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolIterationPhase.ts"), "utf8");
-  const toolResultRecoveryPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"), "utf8");
-  const loopRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"), "utf8");
-
-  assert.match(orchestratorSource, /handleToolIterationPhase\(\{/);
-  assert.match(toolIterationPhaseSource, /handleToolResultRecoveryPhase\(\{/);
-  assert.match(toolResultRecoveryPhaseSource, /repeatedEditValidationRecoveryAttempts/);
-  assert.match(toolResultRecoveryPhaseSource, /handleRepeatedEditValidationRecovery\(\{/);
-  assert.match(loopRecoverySource, /activateExecuteRecovery\("validation_only",\s*"repeat_edit_target_without_validation"/);
-  assert.match(loopRecoverySource, /buildExecuteValidationRecoveryPrompt/);
-  assert.match(loopRecoverySource, /repeat_edit_target_validation_recovery/);
-  assert.match(
-    loopRecoverySource,
-    /validationRecoveryAttempts:\s*repeatedEditValidationRecoveryAttempts/,
-  );
 });
 
 test("approved plan summaries publish only on no-tool or substantive plan turns", () => {
@@ -2793,30 +2309,6 @@ test("approved plan summaries publish only on no-tool or substantive plan turns"
     assistantOutputPhaseSource,
     /if\s*\([\s\S]*?!shouldHideApprovedPlanNoToolText[\s\S]*?\(visibleAssistantText \|\| finalReplyOptions\.length > 0\)[\s\S]*?\)\s*{/,
   );
-});
-
-test("approved plan no-tool checkpoint reports protocol failure and available tools", () => {
-  const approvedPlanNoToolRecoverySource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"),
-    "utf8",
-  );
-  const orchestratorSource = (
-    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") +
-    "\n" +
-    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8") +
-    "\n" +
-    approvedPlanNoToolRecoverySource +
-    "\n" +
-    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"), "utf8")
-  );
-
-  assert.match(orchestratorSource, /formatApprovedPlanNoToolAvailableTools/);
-  assert.match(orchestratorSource, /暂停原因不是工具缺失/);
-  assert.match(orchestratorSource, /模型没有按执行协议调用工具/);
-  assert.match(orchestratorSource, /Array\.from\(availableToolNames\)/);
-  assert.match(orchestratorSource, /validationBoundary === "browser_prompt"[\s\S]*buildBrowserValidationContinuationPrompt/);
-  assert.match(orchestratorSource, /validationBoundary === "pause_external_validation"[\s\S]*reason: "external_validation_advisory"/);
-  assert.doesNotMatch(approvedPlanNoToolRecoverySource, /buildApprovedPlanValidationPendingMessage/);
 });
 
 test("plan progress snapshot carries no-progress recovery metadata", () => {
@@ -2873,6 +2365,50 @@ test("plan execution progress prefers active tool-matched task over broad first 
 
   assert.match(update.currentTask, /DragUpload/);
   assert.doesNotMatch(update.currentTask, /^目标：/);
+});
+
+test("plan execution progress does not keep a completed command as the current task", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "running",
+    iterationCount: 8,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    tasks: [
+      {
+        id: "build",
+        text: "运行 npm run build",
+        status: "completed",
+        evidenceStatus: "satisfied",
+        evidence: [{ kind: "cmd", value: "npm run build" }],
+      },
+      {
+        id: "dev",
+        text: "运行 npm run dev 并观察 readiness",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "cmd", value: "npm run dev" }],
+      },
+    ],
+    evidenceLedger: [{
+      id: "build-result",
+      planTaskId: "build",
+      requirementRef: "build",
+      kind: "cmd",
+      value: "npm run build",
+      target: "npm run build",
+      sourceTool: "run_command",
+      createdAt: 1,
+    }],
+    recentToolActivity: [{
+      name: "run_command",
+      target: "npm run build",
+      status: "succeeded",
+    }],
+  });
+
+  assert.match(update.currentTask, /npm run dev/);
+  assert.doesNotMatch(update.currentTask, /npm run build/);
 });
 
 test("plan execution progress shows current action when first pending task is too broad", () => {

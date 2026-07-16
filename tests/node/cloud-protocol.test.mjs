@@ -352,6 +352,93 @@ test("responses helpers build multiple compatibility input shapes", () => {
   );
 });
 
+test("responses helpers preserve image inputs in both structured candidates", () => {
+  const imageUrl = "data:image/png;base64,AAAA";
+  const messages = [{
+    role: "user",
+    content: [
+      { type: "image_url", image_url: { url: imageUrl } },
+      { type: "text", text: "Inspect this screenshot" },
+    ],
+  }];
+
+  const candidates = buildOpenAiResponsesInputCandidates(messages);
+  assert.deepEqual(candidates[0].input, [{
+    type: "message",
+    role: "user",
+    content: [
+      { type: "input_image", image_url: imageUrl },
+      { type: "input_text", text: "Inspect this screenshot" },
+    ],
+  }]);
+  assert.deepEqual(candidates[1].input, [{
+    role: "user",
+    content: [
+      { type: "input_image", image_url: imageUrl },
+      { type: "input_text", text: "Inspect this screenshot" },
+    ],
+  }]);
+  assert.equal(candidates[2].input, "[User 1]\nInspect this screenshot");
+
+  const textOnlyParts = buildOpenAiResponsesInputCandidates([{
+    role: "user",
+    content: [
+      { type: "text", text: "First" },
+      { type: "text", text: "Second" },
+    ],
+  }]);
+  assert.deepEqual(textOnlyParts[0].input, [
+    { type: "message", role: "user", content: "First\nSecond" },
+  ]);
+  assert.deepEqual(textOnlyParts[1].input, [
+    { role: "user", content: [{ type: "input_text", text: "First\nSecond" }] },
+  ]);
+});
+
+test("responses compaction retains only the latest image message and serializes it", () => {
+  const oldImageUrl = "data:image/png;base64,OLD";
+  const currentImageUrl = "data:image/jpeg;base64,CURRENT";
+  const messages = [
+    { role: "system", content: "Follow rules." },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: "Old screenshot" },
+        { type: "image_url", image_url: { url: oldImageUrl } },
+      ],
+    },
+    { role: "assistant", content: "Earlier answer" },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: `Current screenshot ${"x".repeat(3000)}` },
+        { type: "image_url", image_url: { url: currentImageUrl } },
+      ],
+    },
+  ];
+
+  const compacted = compactCloudResponsesMessages(messages);
+  const imageParts = compacted.flatMap((message) => Array.isArray(message.content)
+    ? message.content.filter((part) => part.type === "image_url")
+    : []);
+  assert.deepEqual(imageParts, [{ type: "image_url", image_url: { url: currentImageUrl } }]);
+  const latestUser = compacted[compacted.length - 1];
+  assert.equal(Array.isArray(latestUser.content), true);
+  assert.match(latestUser.content.find((part) => part.type === "text").text, /truncated \d+ chars/);
+
+  const requests = buildOpenAiResponsesRequestCandidates({
+    messages,
+    model: "gpt-5.4",
+    compact: true,
+    includeTools: false,
+  });
+  const structuredInput = requests[0].body.input;
+  const serializedImages = structuredInput.flatMap((message) => Array.isArray(message.content)
+    ? message.content.filter((part) => part.type === "input_image")
+    : []);
+  assert.deepEqual(serializedImages, [{ type: "input_image", image_url: currentImageUrl }]);
+});
+
 test("responses helpers build Codex-style store and reasoning options", () => {
   assert.deepEqual(
     buildOpenAiResponsesRequestExtras({
@@ -553,6 +640,55 @@ test("gemini helpers build native generateContent requests and extract text", ()
   assert.equal(standardOauthRequest.body.contents[0].parts[0].text, "Say ok");
 });
 
+test("gemini helpers serialize data URL images as inlineData without dropping text", () => {
+  const body = buildGeminiRequestBody({
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "Inspect both screenshots" },
+        { type: "image_url", image_url: { url: "data:image/png;base64,AAAA" } },
+        { type: "image_url", image_url: { url: "https://example.com/not-inlined.png" } },
+        { type: "image_url", image_url: { url: "data:image/jpeg;base64,BBBB" } },
+      ],
+    }],
+    model: "gemini-2.5-pro",
+    maxTokens: 64,
+  });
+
+  assert.deepEqual(body.contents[0], {
+    role: "user",
+    parts: [
+      { text: "Inspect both screenshots" },
+      { inlineData: { mimeType: "image/png", data: "AAAA" } },
+      { inlineData: { mimeType: "image/jpeg", data: "BBBB" } },
+    ],
+  });
+
+  const codeAssist = buildGeminiRequestForAuthMode("", {
+    messages: [{
+      role: "user",
+      content: [{ type: "image_url", image_url: { url: "data:image/webp;base64,CCCC" } }],
+    }],
+    model: "custom-code-assist-model",
+    projectId: "project-1",
+  }, "gemini_google_oauth");
+  assert.deepEqual(codeAssist.body.request.contents[0].parts, [
+    { inlineData: { mimeType: "image/webp", data: "CCCC" } },
+  ]);
+
+  const textOnlyParts = buildGeminiRequestBody({
+    messages: [{
+      role: "user",
+      content: [
+        { type: "text", text: "First" },
+        { type: "text", text: "Second" },
+      ],
+    }],
+    model: "gemini-2.5-pro",
+  });
+  assert.deepEqual(textOnlyParts.contents[0].parts, [{ text: "First\nSecond" }]);
+});
+
 test("cloud headers support Gemini API key and OAuth bearer modes", () => {
   assert.deepEqual(
     buildCloudHeaders("gemini", "api-key", true, undefined, "api_key"),
@@ -666,6 +802,31 @@ test("cloud responses compact instructions preserve workspace write tools", () =
   assert.match(compacted, /run_command/);
   assert.match(compacted, /M Studio Unity/);
   assert.match(compacted, /Never claim write tools or folder access are unavailable/);
+});
+
+test("cloud responses compact instructions preserve the current visual observation contract", () => {
+  const visualProtocol = [
+    "[visual_observation_protocol]",
+    "This turn contains 1 image part. Inspect the actual pixels before relying on visual details.",
+    "After inspection, emit exactly one hidden HTML comment named MAIN_VISUAL_OBSERVATION whose body is a JSON object.",
+    'The JSON fields are: turnId (exactly "turn-image-current"), imageCount (exactly 1), and summary (one concise statement of directly visible facts).',
+    "Do not emit the comment when the images are unavailable.",
+    "[/visual_observation_protocol]",
+  ].join("\n");
+  const longInstructions = [
+    "当前工作区绝对路径为：/tmp/workspace",
+    "low priority filler ".repeat(1200),
+    visualProtocol,
+    "more low priority filler ".repeat(1200),
+  ].join("\n");
+
+  const compacted = compactCloudResponsesInstructions(longInstructions);
+
+  assert.ok(compacted.length <= 8000);
+  assert.match(compacted, /\[visual_observation_protocol\]/);
+  assert.match(compacted, /MAIN_VISUAL_OBSERVATION/);
+  assert.match(compacted, /turn-image-current/);
+  assert.match(compacted, /\[\/visual_observation_protocol\]/);
 });
 
 test("cloud responses compact messages keep recent context and summarize old history", () => {

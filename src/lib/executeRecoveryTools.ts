@@ -1,4 +1,5 @@
 import { workspacePathsReferToSameFile } from "./workspacePaths";
+import { isLocalDevServerHealthProbeCommand } from "./devServerRuntime";
 import { WORKSPACE_MUTATION_TOOL_NAMES } from "./workspaceMutationTools";
 import {
   isFinitePlanValidationCommand,
@@ -17,8 +18,7 @@ export type ExecuteRecoveryMode =
   | "action_plus_targeting"
   | "patch_recovery_read"
   | "validation_only"
-  | "finite_validation_only"
-  | "action_only";
+  | "finite_validation_only";
 
 export interface ExecuteRecoveryActivityLike {
   name?: string;
@@ -54,7 +54,6 @@ export type ExecuteRecoveryContractPhase =
   | "normal"
   | "context"
   | "mutation"
-  | "post_mutation_check"
   | "validation"
   | "reconcile";
 
@@ -75,8 +74,7 @@ export type RecoveryReadLeasePurpose =
   | "plan_line_context"
   | "patch_recovery"
   | "missing_window"
-  | "context_restore"
-  | "post_mutation_verify";
+  | "context_restore";
 
 export interface RecoveryReadLease {
   purpose: RecoveryReadLeasePurpose;
@@ -93,6 +91,8 @@ export interface RecoveryReadLease {
    */
   coverageMode?: "exact" | "bounded_prefix" | "segmented_exact";
   observationKey?: string | null;
+  /** Exact source windows that jointly satisfy a segmented read lease. */
+  observationKeys?: string[];
   observedVersion?: string | null;
   /** Stable identity of the patch failure that granted this one-shot read. */
   mismatchFingerprint?: string | null;
@@ -111,6 +111,10 @@ export interface ExecutionDecisionCheckpoint {
   sourceObservationKey: string | null;
   nextRequiredCapability: ExecuteRecoveryNextCapability;
   evidenceVersion?: string | null;
+  /** Approved Plan task that owns the current recovery transaction. */
+  planTaskId?: string | null;
+  /** Stable requirement reference used for diagnostics and legacy task remapping. */
+  requirementRef?: string | null;
 }
 
 export interface ReadProgressFingerprint {
@@ -154,10 +158,9 @@ export interface ForcedExecuteRecoveryRuntimeState {
  * persistence/logging label; callers must not maintain a second mode-specific
  * tool allowlist.
  *
- * read_file is exposed only by an explicit context/read lease (including
- * patch recovery and post-mutation verification). Mutation and validation
- * phases are strict: a provider cannot turn a named mutation request back into
- * open-ended exploration by returning another read call.
+ * The next capability owns the request's exact tool surface as well as its
+ * evidence-accounting state. File version/range eligibility remains a later
+ * decision for capabilities that legitimately expose read_file.
  */
 export interface RecoveryActionContract {
   modeLabel: ExecuteRecoveryMode;
@@ -178,7 +181,18 @@ export interface RecoveryActionContract {
   allowsAllTools: boolean;
   allowedToolNames: ReadonlySet<string>;
   surfaceDescription: string;
+  toolCallRequirement: RecoveryToolCallRequirement;
 }
+
+/**
+ * Provider-neutral tool-call requirement for the current recovery phase.
+ * Transport adapters may translate this into their native tool-choice shape,
+ * but capability-to-tool-name selection belongs to the recovery contract.
+ */
+export type RecoveryToolCallRequirement =
+  | { kind: "optional" }
+  | { kind: "required_any" }
+  | { kind: "required_named"; toolName: string };
 
 export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
   "code_ast_query",
@@ -208,28 +222,6 @@ export const EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS = new Set([
 
 export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set(WORKSPACE_MUTATION_TOOL_NAMES);
 
-export const EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
-  ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
-]);
-
-const EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
-]);
-
-const EXECUTE_RECOVERY_TARGETED_ACTION_CONTRACT_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
-  ...EXECUTE_RECOVERY_TARGETING_TOOLS,
-]);
-
-const EXECUTE_RECOVERY_VALIDATION_CONTRACT_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
-]);
-
-const EXECUTE_RECOVERY_FINITE_VALIDATION_CONTRACT_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS,
-]);
-
 const EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS = new Set([
   "read_pty_buffer",
   "read_pty_tail",
@@ -250,18 +242,73 @@ const EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS = new Set([
   "execute_command",
 ]);
 
-const EXECUTE_RECOVERY_SERVER_RECONCILE_CONTRACT_TOOLS = new Set([
-  "run_command",
-  ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
-]);
-
-const EXECUTE_RECOVERY_PROCESS_FAILURE_CONTRACT_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
-  "run_command",
-  "execute_command",
+const EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_MUTATION_TOOLS,
   ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
 ]);
+
+const EXECUTE_RECOVERY_RECONCILE_SERVER_CONTRACT_TOOLS = new Set([
+  ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
+  ...EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS,
+]);
+
+/** Broad fallback retained only for an actually failed/stopped process. */
+export const EXECUTE_RECOVERY_CORE_TOOLS = new Set([
+  ...EXECUTE_RECOVERY_TARGETING_TOOLS,
+  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
+  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
+  ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
+]);
+
+/**
+ * One capability owns both the next action and its real schema surface. This
+ * prevents a model from selecting a visible-but-guaranteed-to-be-deferred
+ * tool for six rounds. Mutation deliberately retains read_file: version,
+ * range, and context eligibility still decide whether that reread is useful.
+ */
+function resolveRecoveryAllowedToolNames(
+  nextCapability: ExecuteRecoveryNextCapability,
+): ReadonlySet<string> {
+  switch (nextCapability) {
+    case "targeted_read":
+      return EXECUTE_RECOVERY_PATCH_READ_TOOLS;
+    case "targeting":
+      return EXECUTE_RECOVERY_TARGETING_TOOLS;
+    case "mutation":
+      return EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS;
+    case "validation":
+      return EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS;
+    case "launch_long_process":
+      return EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS;
+    case "observe_pty":
+      return EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS;
+    case "browser_validation":
+      return EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS;
+    case "reconcile_server":
+      return EXECUTE_RECOVERY_RECONCILE_SERVER_CONTRACT_TOOLS;
+    case "recover_process":
+      return EXECUTE_RECOVERY_CORE_TOOLS;
+    default:
+      return new Set<string>();
+  }
+}
+
+function resolveRecoveryToolCallRequirement(
+  nextCapability: ExecuteRecoveryNextCapability,
+): RecoveryToolCallRequirement {
+  const toolName = nextCapability === "targeted_read"
+    ? "read_file"
+    : nextCapability === "browser_validation"
+    ? "browser_evaluate"
+    : nextCapability === "launch_long_process"
+    ? "execute_command"
+    : nextCapability === "validation"
+    ? "run_command"
+    : null;
+  return toolName
+    ? { kind: "required_named", toolName }
+    : { kind: nextCapability === "any" ? "optional" : "required_any" };
+}
 
 // Runtime-owned no-progress feedback always starts with a marker. Never scan
 // the whole payload: freshly read source may legitimately contain these
@@ -269,15 +316,35 @@ const EXECUTE_RECOVERY_PROCESS_FAILURE_CONTRACT_TOOLS = new Set([
 const READ_ONLY_NO_PROGRESS_DETAIL_RE = /^\s*(?:FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|READ_FILE_WINDOW_NARROWED|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT)\b/i;
 
 export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMode {
+  // Compatibility for snapshots written before approved-Plan action recovery
+  // was separated from the execute transaction.
+  if (value === "action_only") return "mutation_first";
   return value === "mutation_first" ||
     value === "action_plus_targeting" ||
     value === "patch_recovery_read" ||
     value === "validation_only" ||
     value === "finite_validation_only" ||
-    value === "action_only" ||
     value === "normal"
     ? value
     : "normal";
+}
+
+/** Drop the mandatory post-mutation reread lease used by older snapshots. */
+export function isLegacyPostMutationReadLease(value: unknown): boolean {
+  return Boolean(
+    value &&
+    typeof value === "object" &&
+    (value as { purpose?: unknown }).purpose === "post_mutation_verify",
+  );
+}
+
+export function migrateRecoveryReadLease(
+  value: RecoveryReadLease | null | undefined,
+): RecoveryReadLease | null {
+  if (!value) return null;
+  return isLegacyPostMutationReadLease(value)
+    ? null
+    : normalizeRecoveryReadLeaseSnapshot(value);
 }
 
 export function resolveExecuteRecoveryActionContract(
@@ -298,12 +365,15 @@ export function resolveExecuteRecoveryActionContract(
   } = {},
 ): RecoveryActionContract {
   const mode = normalizeExecuteRecoveryMode(value);
+  // Old snapshots may contain the removed mandatory post-mutation read lease.
+  // Treat it as already migrated to validation instead of reviving that phase.
+  const normalizedReadLease = migrateRecoveryReadLease(context.readLease);
   const shared = {
     expectedTarget: context.expectedTarget?.trim() || null,
-    readLease: context.readLease || null,
+    readLease: normalizedReadLease,
     sourceObservationKey: context.sourceObservationKey?.trim() || (
-      context.readLease?.state === "consumed"
-        ? context.readLease.observationKey?.trim() || null
+      normalizedReadLease?.state === "consumed"
+        ? normalizedReadLease.observationKey?.trim() || null
         : null
     ),
     decisionCheckpoint: context.decisionCheckpoint || null,
@@ -325,71 +395,43 @@ export function resolveExecuteRecoveryActionContract(
       allowsAllTools: true,
       allowedToolNames: new Set<string>(),
       surfaceDescription: "normal",
+      toolCallRequirement: resolveRecoveryToolCallRequirement("any"),
     };
   }
-  if (
-    context.readLease?.purpose !== "post_mutation_verify" &&
-    (context.readLease?.state === "available" || context.readLease?.state === "active")
+  let phase: ExecuteRecoveryContractPhase = "mutation";
+  let nextRequiredCapability: ExecuteRecoveryNextCapability = "mutation";
+  const checkpointCapability = context.decisionCheckpoint?.nextRequiredCapability;
+  const explicitLongRunningValidation = checkpointCapability === "launch_long_process" ||
+    checkpointCapability === "recover_process" ||
+    checkpointCapability === "reconcile_server" ||
+    checkpointCapability === "observe_pty" ||
+    checkpointCapability === "browser_validation";
+  const longRunningValidationActive = mode === "action_plus_targeting" ||
+    mode === "validation_only" ||
+    explicitLongRunningValidation;
+  const activeReadLease = normalizedReadLease &&
+    (normalizedReadLease.state === "available" || normalizedReadLease.state === "active")
+      ? normalizedReadLease
+      : null;
+
+  if (activeReadLease) {
+    phase = "context";
+    nextRequiredCapability = "targeted_read";
+  } else if (
+    checkpointCapability === "targeting"
   ) {
-    return {
-      ...shared,
-      modeLabel: "patch_recovery_read",
-      phase: "context",
-      nextRequiredCapability: "targeted_read",
-      allowTargetedFileRead: true,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_PATCH_READ_TOOLS,
-      surfaceDescription: "targeted_context_read",
-    };
-  }
-  if (
-    mode === "validation_only" &&
-    context.readLease?.purpose === "post_mutation_verify" &&
-    (context.readLease.state === "available" || context.readLease.state === "active")
-  ) {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "post_mutation_check",
-      nextRequiredCapability: "targeted_read",
-      allowTargetedFileRead: true,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_PATCH_READ_TOOLS,
-      surfaceDescription: "post_mutation_target_read",
-    };
-  }
-  if (
-    mode === "action_plus_targeting" &&
-    context.decisionCheckpoint?.nextRequiredCapability === "targeting"
-  ) {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "context",
-      nextRequiredCapability: "targeting",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_TARGETING_TOOLS,
-      surfaceDescription: "structural_targeting_only",
-    };
-  }
-  const longRunningValidationActive = mode === "action_plus_targeting" || mode === "validation_only";
-  if (
+    phase = "context";
+    nextRequiredCapability = "targeting";
+  } else if (
     longRunningValidationActive &&
-    context.devServerNextCapability === "reconcile"
+    (
+      context.devServerNextCapability === "reconcile" ||
+      context.decisionCheckpoint?.nextRequiredCapability === "reconcile_server"
+    )
   ) {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "reconcile",
-      nextRequiredCapability: "reconcile_server",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_SERVER_RECONCILE_CONTRACT_TOOLS,
-      surfaceDescription: "dev_server_reconcile_only",
-    };
-  }
-  if (
+    phase = "reconcile";
+    nextRequiredCapability = "reconcile_server";
+  } else if (
     longRunningValidationActive &&
     (
       shared.devServerStatus === "failed" ||
@@ -400,139 +442,59 @@ export function resolveExecuteRecoveryActionContract(
       )
     )
   ) {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "reconcile",
-      nextRequiredCapability: "recover_process",
-      allowTargetedFileRead: true,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_PROCESS_FAILURE_CONTRACT_TOOLS,
-      surfaceDescription: "dev_server_failure_recovery",
-    };
-  }
-  if (
+    phase = "reconcile";
+    nextRequiredCapability = "recover_process";
+  } else if (
     longRunningValidationActive &&
     context.decisionCheckpoint?.nextRequiredCapability === "launch_long_process" &&
     shared.devServerStatus === "none"
   ) {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "validation",
-      nextRequiredCapability: "launch_long_process",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS,
-      surfaceDescription: "dev_server_launch_only",
-    };
-  }
-  if (
+    phase = "validation";
+    nextRequiredCapability = "launch_long_process";
+  } else if (
     longRunningValidationActive &&
-    (context.devServerNextCapability === "observe_pty" ||
+    (context.decisionCheckpoint?.nextRequiredCapability === "observe_pty" ||
+      context.devServerNextCapability === "observe_pty" ||
       shared.devServerStatus === "pending" ||
       shared.devServerStatus === "running" ||
       shared.devServerStatus === "unknown")
   ) {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "validation",
-      nextRequiredCapability: "observe_pty",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS,
-      surfaceDescription: "pty_observation_only",
-    };
-  }
-  if (
+    phase = "validation";
+    nextRequiredCapability = "observe_pty";
+  } else if (
     longRunningValidationActive &&
-    (context.devServerNextCapability === "browser" || shared.devServerStatus === "ready")
+    (context.decisionCheckpoint?.nextRequiredCapability === "browser_validation" ||
+      context.devServerNextCapability === "browser" ||
+      shared.devServerStatus === "ready")
   ) {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "validation",
-      nextRequiredCapability: "browser_validation",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS,
-      surfaceDescription: "browser_validation_only",
-    };
+    phase = "validation";
+    nextRequiredCapability = "browser_validation";
+  } else if (mode === "validation_only" || mode === "finite_validation_only") {
+    phase = "validation";
+    nextRequiredCapability = "validation";
   }
-  if (mode === "patch_recovery_read") {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "context",
-      nextRequiredCapability: "targeted_read",
-      allowTargetedFileRead: true,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_PATCH_READ_TOOLS,
-      surfaceDescription: "targeted_context_read",
-    };
-  }
-  if (mode === "validation_only") {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "validation",
-      nextRequiredCapability: "validation",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_VALIDATION_CONTRACT_TOOLS,
-      surfaceDescription: "validation_only",
-    };
-  }
-  if (mode === "finite_validation_only") {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "validation",
-      nextRequiredCapability: "validation",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_FINITE_VALIDATION_CONTRACT_TOOLS,
-      surfaceDescription: "finite_validation_only",
-    };
-  }
-  if (mode === "action_plus_targeting") {
-    return {
-      ...shared,
-      modeLabel: mode,
-      phase: "mutation",
-      nextRequiredCapability: "mutation",
-      allowTargetedFileRead: false,
-      allowsAllTools: false,
-      allowedToolNames: EXECUTE_RECOVERY_TARGETED_ACTION_CONTRACT_TOOLS,
-      surfaceDescription: "mutation_with_targeting",
-    };
-  }
+
+  const allowedToolNames = resolveRecoveryAllowedToolNames(nextRequiredCapability);
   return {
     ...shared,
     modeLabel: mode,
-    phase: "mutation",
-    nextRequiredCapability: "mutation",
-    allowTargetedFileRead: false,
+    phase,
+    nextRequiredCapability,
+    // Version/range/context eligibility decides whether a visible read_file
+    // performs IPC, replays context, or returns a cache stub.
+    allowTargetedFileRead: allowedToolNames.has("read_file"),
     allowsAllTools: false,
-    allowedToolNames: EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS,
-    surfaceDescription: "mutation_only",
+    allowedToolNames,
+    surfaceDescription: `capability:${nextRequiredCapability}`,
+    toolCallRequirement: resolveRecoveryToolCallRequirement(nextRequiredCapability),
   };
 }
 
 export function isExecutePatchMismatchRecoveryActivity(activity: ExecuteRecoveryActivityLike): boolean {
   if ((activity.name !== "replace_in_file" && activity.name !== "apply_patch") || activity.status !== "failed") return false;
-  return /(?:search_text|not\s+found|no\s+match|mismatch|不一致|未匹配|未找到|patch)/i.test(activity.detail || "");
-}
-
-export function shouldAllowExecuteRecoveryFileRead(
-  _recentActivity: ExecuteRecoveryActivityLike[],
-  mode: ExecuteRecoveryMode = "normal",
-): boolean {
-  // Tool definitions are chosen before path/range/version arguments are known.
-  // Keep the conditional capability visible; argument-aware cache/scope logic
-  // decides whether the concrete read is fresh, replayed, stubbed, or deferred.
-  return resolveExecuteRecoveryActionContract(mode).allowTargetedFileRead;
+  // Only stable internal reason codes participate in recovery. Localized
+  // executor prose must not become a hidden state-machine input.
+  return /\b(?:MUTATION_PREFLIGHT_BLOCKED|invalid_patch|search_text_mismatch)\b/i.test(activity.detail || "");
 }
 
 function normalizeExecuteRecoveryTarget(value: unknown): string {
@@ -560,6 +522,101 @@ export function normalizeRecoveryReadRange(
       : {}),
   };
   return Object.keys(range).length > 0 ? range : null;
+}
+
+/** Canonical persisted/read-lease normalizer shared by live and Goal loops. */
+export function normalizeRecoveryReadLeaseSnapshot(value: unknown): RecoveryReadLease | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (isLegacyPostMutationReadLease(value)) return null;
+  const candidate = value as Partial<RecoveryReadLease>;
+  const purposes = new Set<RecoveryReadLeasePurpose>([
+    "initial_targeting",
+    "plan_line_context",
+    "patch_recovery",
+    "missing_window",
+    "context_restore",
+  ]);
+  const states = new Set<RecoveryReadLease["state"]>(["available", "active", "consumed"]);
+  const purpose = candidate.purpose;
+  const state = candidate.state;
+  const target = String(candidate.target || "").trim();
+  if (!target || !purpose || !purposes.has(purpose) || !state || !states.has(state)) return null;
+  const requestedRange = normalizeRecoveryReadRange(candidate.requestedRange);
+  const requiredRange = normalizeRecoveryReadRange(candidate.requiredRange);
+  const coveredRanges = Array.isArray(candidate.coveredRanges)
+    ? candidate.coveredRanges.flatMap((range) => {
+        const normalized = normalizeRecoveryReadRange(range);
+        const startLine = normalized?.startLine;
+        const endLine = normalized?.endLine ?? (
+          startLine && normalized?.maxLines
+            ? startLine + normalized.maxLines - 1
+            : undefined
+        );
+        return startLine && endLine && endLine >= startLine
+          ? [{ startLine, endLine }]
+          : [];
+      })
+    : [];
+  const coverageMode = candidate.coverageMode === "exact" ||
+    candidate.coverageMode === "bounded_prefix" ||
+    candidate.coverageMode === "segmented_exact"
+    ? candidate.coverageMode
+    : undefined;
+  return {
+    purpose,
+    target,
+    ...(requestedRange ? { requestedRange } : {}),
+    ...(requiredRange ? { requiredRange } : {}),
+    ...(coveredRanges.length > 0 ? { coveredRanges } : {}),
+    ...(coverageMode ? { coverageMode } : {}),
+    observationKey: String(candidate.observationKey || "").trim() || null,
+    ...(Array.isArray(candidate.observationKeys) && candidate.observationKeys.length > 0
+      ? {
+          observationKeys: Array.from(new Set(candidate.observationKeys
+            .map((key) => String(key || "").trim())
+            .filter(Boolean))),
+        }
+      : {}),
+    observedVersion: String(candidate.observedVersion || "").trim() || null,
+    mismatchFingerprint: String(candidate.mismatchFingerprint || "").trim() || null,
+    state,
+  };
+}
+
+/** Canonical persisted checkpoint normalizer shared by live and Goal loops. */
+export function normalizeExecutionDecisionCheckpointSnapshot(
+  value: unknown,
+): ExecutionDecisionCheckpoint | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Partial<ExecutionDecisionCheckpoint>;
+  const capabilities = new Set<ExecuteRecoveryNextCapability>([
+    "any",
+    "targeting",
+    "targeted_read",
+    "mutation",
+    "validation",
+    "launch_long_process",
+    "recover_process",
+    "reconcile_server",
+    "observe_pty",
+    "browser_validation",
+  ]);
+  const nextRequiredCapability = candidate.nextRequiredCapability;
+  if (!nextRequiredCapability || !capabilities.has(nextRequiredCapability)) return null;
+  return {
+    expectedTarget: String(candidate.expectedTarget || "").trim() || null,
+    sourceObservationKey: String(candidate.sourceObservationKey || "").trim() || null,
+    nextRequiredCapability,
+    ...(candidate.evidenceVersion === undefined
+      ? {}
+      : { evidenceVersion: String(candidate.evidenceVersion || "").trim() || null }),
+    ...(candidate.planTaskId === undefined
+      ? {}
+      : { planTaskId: String(candidate.planTaskId || "").trim() || null }),
+    ...(candidate.requirementRef === undefined
+      ? {}
+      : { requirementRef: String(candidate.requirementRef || "").trim() || null }),
+  };
 }
 
 export function recoveryReadRangesMatch(
@@ -599,6 +656,33 @@ export function requestedRangeFromReadObservationSignature(
   } catch {
     return null;
   }
+}
+
+/**
+ * A real validation failure occurs after the mutation epoch that invalidated
+ * the source window used to author that mutation. Grant exactly one read of
+ * the same target/range before asking for a repair, but do not bind the lease
+ * to the stale pre-mutation version.
+ */
+export function buildFailedValidationRepairReadLease(input: {
+  target: string;
+  sourceObservationKey?: string | null;
+}): RecoveryReadLease {
+  const target = String(input.target || "").trim();
+  const sourceObservationKey = String(input.sourceObservationKey || "").trim();
+  const versionMarker = sourceObservationKey.indexOf("::version=");
+  const requestSignature = versionMarker > 0
+    ? sourceObservationKey.slice(0, versionMarker)
+    : sourceObservationKey;
+  const requestedRange = requestSignature
+    ? requestedRangeFromReadObservationSignature(requestSignature)
+    : null;
+  return {
+    purpose: "context_restore",
+    target,
+    ...(requestedRange ? { requestedRange } : {}),
+    state: "available",
+  };
 }
 
 export function buildExecutePatchMismatchFingerprint(input: {
@@ -726,64 +810,6 @@ export function readEvidenceSatisfiesRecoveryLease(input: {
   return !expectedVersion || !observedVersion || expectedVersion === observedVersion;
 }
 
-function isSuccessfulExecutePatchRecoveryResolution(
-  activity: ExecuteRecoveryActivityLike,
-  mismatchTarget: string,
-): boolean {
-  if (activity.status !== "succeeded") return false;
-  if (!workspacePathsReferToSameFile(String(activity.target || ""), mismatchTarget)) return false;
-  return activity.name === "read_file" || EXECUTE_RECOVERY_MUTATION_TOOLS.has(String(activity.name || ""));
-}
-
-/**
- * Return the newest patch-mismatch target that has not yet received a fresh
- * read or a successful mutation. This is a target-scoped, one-shot cache lease.
- */
-export function resolveExecutePatchRecoveryTarget(
-  recentActivity: ExecuteRecoveryActivityLike[],
-): string | null {
-  // recentToolActivity is already bounded by the runtime. Inspect the whole
-  // retained window so unrelated tool calls cannot prematurely expire an
-  // unresolved patch mismatch.
-  const recent = recentActivity.slice(-12);
-  for (let index = recent.length - 1; index >= 0; index -= 1) {
-    const activity = recent[index];
-    if (!isExecutePatchMismatchRecoveryActivity(activity)) continue;
-    const mismatchTarget = normalizeExecuteRecoveryTarget(activity.target);
-    if (!mismatchTarget) continue;
-    const alreadyResolved = recent
-      .slice(index + 1)
-      .some((next) => isSuccessfulExecutePatchRecoveryResolution(next, mismatchTarget));
-    if (!alreadyResolved) return mismatchTarget;
-  }
-  return null;
-}
-
-export function shouldUseExecutePatchRecoveryReadLease(input: {
-  toolName: string;
-  allowFileRead: boolean;
-  target: string;
-  requestedRange?: RecoveryReadLease["requestedRange"];
-  observedVersion?: string | null;
-  activeReadLease?: RecoveryReadLease | null;
-  leaseClaimed: boolean;
-}): boolean {
-  const lease = input.activeReadLease;
-  return Boolean(
-    !input.leaseClaimed &&
-    input.toolName === "read_file" &&
-    input.allowFileRead &&
-    lease?.purpose === "patch_recovery" &&
-    lease.state === "available" &&
-    readEvidenceSatisfiesRecoveryLease({
-      lease,
-      target: input.target,
-      requestedRange: input.requestedRange,
-      observedVersion: input.observedVersion,
-    })
-  );
-}
-
 /**
  * Normalize native, XML, and compatibility-model multi-call responses into a
  * single recovery transaction step. A read and an edit generated in the same
@@ -813,21 +839,22 @@ export function resolveExecuteRecoveryBatchDecision(input: {
   const phase = contract.nextRequiredCapability === "targeted_read" ||
     contract.nextRequiredCapability === "targeting"
     ? "need_context" as const
-    : contract.nextRequiredCapability === "mutation" && mode !== "action_plus_targeting"
+    : contract.nextRequiredCapability === "mutation"
       ? "need_mutation" as const
       : (contract.phase === "validation" || contract.phase === "reconcile")
         ? "need_validation" as const
         : "legacy_action" as const;
-  const eligible = calls.filter((call) => isExecuteRecoveryToolName(
-    call.name,
-    new Set(EXECUTE_RECOVERY_PATCH_READ_TOOLS),
-    { mode, allowFileRead: contract.allowTargetedFileRead, contract },
-  ));
-  const transactionTarget = String(input.expectedTarget || "").trim() || (
-    mode === "patch_recovery_read"
-      ? resolveExecutePatchRecoveryTarget(input.recentActivity || [])
-      : null
+  const eligible = calls.filter((call) =>
+    call.name === "wait_subagents" ||
+    isExecuteRecoveryToolName(
+      call.name,
+      new Set(EXECUTE_RECOVERY_PATCH_READ_TOOLS),
+      { mode, allowFileRead: contract.allowTargetedFileRead, contract },
+    )
   );
+  // The runtime checkpoint owns target identity. Inferring it again from
+  // localized failure prose revived stale targets after unrelated tool calls.
+  const transactionTarget = String(input.expectedTarget || "").trim() || null;
   const isTargetScopedCall = (call: ExecuteRecoveryBatchCallLike): boolean =>
     call.name === "read_file" ||
     call.name === "code_ast_query" ||
@@ -855,34 +882,48 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     EXECUTE_RECOVERY_TARGETING_TOOLS.has(call.name)
   );
   const matchingJoin = scopedEligible.find((call) => call.name === "wait_subagents");
-  const matchingValidation = mode === "finite_validation_only"
-    ? scopedEligible.find((call) =>
-          call.name === "run_command" &&
-          shouldEnterFailedFiniteValidationRecovery(String(call.target || ""))
-        ) || scopedEligible.find((call) => call.name === "run_command")
-    : scopedEligible.find((call) => EXECUTE_RECOVERY_VALIDATION_TOOLS.has(call.name));
-  const matchingNextCapability = contract.nextRequiredCapability === "observe_pty"
-    ? scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS.has(call.name))
-    : contract.nextRequiredCapability === "browser_validation"
-      ? scopedEligible.find((call) => EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS.has(call.name))
-      : contract.nextRequiredCapability === "launch_long_process"
-        ? scopedEligible.find((call) => EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS.has(call.name))
-        : contract.nextRequiredCapability === "recover_process"
-          ? scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS.has(call.name)) ||
-            scopedEligible.find((call) => call.name === "read_file") ||
-            scopedEligible.find((call) => EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)) ||
-            scopedEligible.find((call) => call.name === "run_command") ||
-            scopedEligible.find((call) => call.name === "execute_command")
-        : contract.nextRequiredCapability === "reconcile_server"
-          ? scopedEligible.find((call) => EXECUTE_RECOVERY_SERVER_RECONCILE_CONTRACT_TOOLS.has(call.name))
-      : undefined;
-  const selected = matchingJoin || (contract.nextRequiredCapability === "targeted_read"
-    ? matchingRead
-    : contract.nextRequiredCapability === "targeting"
-      ? matchingTargeting
-    : contract.nextRequiredCapability === "mutation"
-      ? matchingMutation
-      : matchingNextCapability || matchingValidation || matchingRead);
+  const matchingValidation = scopedEligible.find((call) =>
+    call.name === "run_command" &&
+    shouldEnterFailedFiniteValidationRecovery(String(call.target || ""))
+  ) || scopedEligible.find((call) => call.name === "run_command");
+  const matchingNextCapability = (() => {
+    switch (contract.nextRequiredCapability) {
+      case "targeted_read":
+        return matchingRead;
+      case "targeting":
+        return matchingTargeting;
+      case "mutation":
+        // A targeted reread may refresh the exact observation before mutation.
+        return matchingMutation || matchingRead;
+      case "validation":
+        return matchingValidation;
+      case "launch_long_process":
+        return scopedEligible.find((call) => EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS.has(call.name));
+      case "observe_pty":
+        return scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS.has(call.name));
+      case "browser_validation":
+        return scopedEligible.find((call) => EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS.has(call.name));
+      case "recover_process":
+        return scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS.has(call.name)) ||
+          matchingRead ||
+          matchingMutation ||
+          scopedEligible.find((call) => call.name === "run_command") ||
+          scopedEligible.find((call) => call.name === "execute_command");
+      case "reconcile_server":
+        return scopedEligible.find((call) =>
+          EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS.has(call.name) ||
+          (
+            call.name === "run_command" &&
+            isLocalDevServerHealthProbeCommand(String(call.target || ""))
+          )
+        );
+      default:
+        return undefined;
+    }
+  })();
+  // Joining an already-running child releases its scope lease; it is the one
+  // housekeeping exception to the action capability selected by the contract.
+  const selected = matchingJoin || matchingNextCapability;
   return {
     active: true,
     phase,
@@ -907,20 +948,70 @@ export function isExecuteRecoveryToolName(
     normalizeExecuteRecoveryMode(options.mode),
   );
   if (contract.allowsAllTools) return true;
-  // Recovery may narrow new work, but it must not strand already-running
-  // children. Joining releases their scope lease and is not new exploration.
-  if (name === "wait_subagents") return true;
-  // allowFileRead is retained for call-site compatibility. The action contract
-  // is authoritative: legal changed-version/missing-window reads first switch
-  // into a lease-backed context phase, so mutation cannot silently expose it.
+  // allowFileRead is retained for call-site compatibility. The capability
+  // contract controls visibility; path/version/range eligibility is evaluated
+  // later when concrete read arguments are available.
   return contract.allowedToolNames.has(name);
 }
 
-export function describeExecuteRecoveryToolSurface(
-  mode: ExecuteRecoveryMode,
-  _allowFileRead = false,
-): string {
-  return resolveExecuteRecoveryActionContract(mode).surfaceDescription;
+/**
+ * Ephemeral per-request contract card. It is appended after historical
+ * recovery prompts, so a phase transition atomically replaces stale advice
+ * without adding another durable transcript message.
+ */
+export function buildExecutionActionContractCard(input: {
+  contract: RecoveryActionContract;
+  language: "zh" | "en";
+  /** Final request surface after Plan, provider-capability, and policy filtering. */
+  availableToolNames?: Iterable<string>;
+}): string {
+  const { contract } = input;
+  const target = contract.expectedTarget || "(current task target)";
+  const observation = contract.sourceObservationKey ||
+    contract.readLease?.observationKey ||
+    "(none)";
+  const readRange = contract.readLease?.requestedRange;
+  const range = readRange
+    ? `${readRange.startLine || 1}-${readRange.endLine || "?"}`
+    : "(none)";
+  const availableToolNames = new Set(
+    input.availableToolNames || contract.allowedToolNames,
+  );
+  const tools = [...availableToolNames].sort().join(", ");
+  const readFileVisible = availableToolNames.has("read_file");
+  const hasSourceObservation = observation !== "(none)";
+  const planTaskId = contract.decisionCheckpoint?.planTaskId || "(none)";
+  const requirementRef = contract.decisionCheckpoint?.requirementRef || "(none)";
+  if (input.language === "zh") {
+    return [
+      "[EXECUTION_ACTION_CONTRACT]",
+      `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
+      `planTask=${planTaskId}; requirement=${requirementRef}`,
+      `sourceObservation=${observation}; readLeaseRange=${range}`,
+      `availableTools=${tools}`,
+      hasSourceObservation
+        ? "当前源码 observation 已满足修改前读取要求；不要仅为满足规则而复读未变化的相同窗口。"
+        : "当前没有绑定源码 observation；只有确实缺少修改所需精确文本时才定向读取，否则直接修正修改调用。",
+      readFileVisible
+        ? "read_file 当前可见，但只有文件版本变化、缺失范围或真实上下文淘汰才会返回新源码；相同快照/已覆盖窗口只返回 stub，并计入同一语义请求的无进展预算。"
+        : "read_file 不在本次请求的实际工具面中；不要请求它或用 shell 绕行，复用现有 observation 并从 availableTools 选择 next 能力。",
+      "优先执行 next 指定的一个能力。修改后直接进入所需验证；源码复读或 git diff 只是可选的修改后检查，不能替代命令或浏览器验收。",
+    ].join("\n");
+  }
+  return [
+    "[EXECUTION_ACTION_CONTRACT]",
+    `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
+    `planTask=${planTaskId}; requirement=${requirementRef}`,
+    `sourceObservation=${observation}; readLeaseRange=${range}`,
+    `availableTools=${tools}`,
+    hasSourceObservation
+      ? "The active source observation already satisfies read-before-modify; do not reread an unchanged covered window merely to satisfy that rule."
+      : "No source observation is bound to this checkpoint; request a targeted read only when exact mutation text is genuinely missing, otherwise correct the mutation call directly.",
+    readFileVisible
+      ? "read_file is visible now, but only a changed version, missing range, or real context eviction returns source; the same snapshot/window returns a stub and counts toward the same semantic request's no-progress budget."
+      : "read_file is not in this request's actual tool surface; do not request it or use a shell-read bypass. Reuse the current observation and choose the next capability from availableTools.",
+    "Prefer one call for the next capability. After a mutation, perform the required validation; a source reread or git diff is an optional post-mutation check, not a replacement for command or browser acceptance.",
+  ].join("\n");
 }
 
 export function countRecentReadOnlyActivities(
@@ -1113,9 +1204,18 @@ export function resolveReadOnlyNoProgressTrigger(input: {
   const currentBatchHasFreshReadOnlyEvidence = visibleSuccessfulResults.some((result) =>
     !isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
   );
+  const readOnlyActivityLimit = input.minReadOnlyActivities ?? Infinity;
+  if (readOnlyActivityCount >= readOnlyActivityLimit) {
+    return { shouldRecover: true, reason: "read_only_evidence_budget", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
+  }
+  const readOnlyCharLimit = input.maxReadOnlyToolChars ?? Infinity;
+  if (batchToolChars >= readOnlyCharLimit) {
+    return { shouldRecover: true, reason: "read_only_context_budget", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
+  }
   if (currentBatchHasFreshReadOnlyEvidence) {
-    // Raw call count and output size are context-management signals, not proof
-    // of a loop. A distinct window/version is progress and must remain legal.
+    // A distinct window/version is useful source evidence, but it is not an
+    // unlimited phase reset. The bounded budgets above force an execution
+    // checkpoint after enough context has been collected.
     return { shouldRecover: false, reason: "", readOnlyActivityCount, batchToolChars, cachedReadOnlyActivityCount, repeatedReadOnlyTargetScore };
   }
 
@@ -1161,10 +1261,6 @@ export function buildExecuteRecoveryPrompt(input: {
   recentActivity?: ExecuteRecoveryActivityLike[];
 }): string {
   const contract = input.contract;
-  const surface = contract.surfaceDescription;
-  const fileReadAvailable = contract.allowTargetedFileRead;
-  const isPatchMismatchRecovery =
-    /patch|mismatch|target_progress_patch_mismatch|search_text|not\s+found/i.test(input.reason || "");
   const repeatedTargets = input.repeatedTargets?.length
     ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
     : input.language === "zh" ? "最近已读目标" : "recently read targets";
@@ -1175,44 +1271,24 @@ export function buildExecuteRecoveryPrompt(input: {
 
   if (input.language === "en") {
     return [
-      isPatchMismatchRecovery
-        ? "EXECUTE_RECOVERY: The last edit failed because the patch or replacement context did not match the current file."
-        : "EXECUTE_RECOVERY: The current Execute turn has spent its read-only budget without producing write, command, or browser validation evidence.",
+      "EXECUTE_RECOVERY: the current transaction still lacks required execution evidence.",
       `Recovery reason: ${input.reason || "read_only_no_action"}.`,
-      `Recovery tool surface: ${surface}.`,
-      `Repeated/known targets: ${repeatedTargets}.`,
+      `Checkpoint: phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${contract.expectedTarget || repeatedTargets}.`,
       recent ? `Recent tool activity: ${recent}.` : "",
-      isPatchMismatchRecovery
-        ? "Use one targeted `read_file` only if needed, then base the next edit on text copied from that latest result. Prefer `replace_in_file` for a small exact replacement, or run validation / browser checks if the target already satisfies the task. Do not retry an `apply_patch` built from stale context."
-        : fileReadAvailable
-        ? "A targeted `read_file` is available to repair exact-content or patch mismatch problems; after that, patch, run a finite command, use browser validation, or state the exact blocker."
-        : "No `read_file` is available in this recovery step. Reuse cached context and take the next concrete action: `apply_patch`/`replace_in_file`/`write_file`, run a finite command, use browser validation, or state the exact blocker. If grep_search already returned a line containing the failing code, treat that line as enough context for a minimal exact replacement.",
-      fileReadAvailable
-        ? "Uniform action protocol (use the first applicable branch and call one tool): 1) if the intended edit target's exact current text is missing, call one targeted `read_file` for that target; 2) otherwise call one mutation tool; 3) after a successful mutation, call one finite validation tool. Never batch multiple speculative reads."
-        : "Uniform action protocol (use the first applicable branch and call one tool): 1) mutate from the retained exact context; 2) after a successful mutation, call one finite validation tool; 3) if neither is possible, report the exact blocker without claiming completion.",
-      "For edits, call exactly one small Codex-style patch transaction: prefer `apply_patch`, touch only the minimal file(s), and keep the patch to 1-3 focused hunks. Do not paste source code or full files into chat Markdown.",
-      "Do not start a new broad scan, do not reread the same files, do not use cat/sed/head/tail shell file reads as a workaround, and do not output another plan instead of action.",
+      "Reuse the retained versioned observation. If exact source is genuinely missing and read_file is actually available, request one targeted window; otherwise perform the checkpoint's next capability.",
+      "A failed patch may be malformed, a no-op, or a context mismatch. Follow the structured tool error instead of assuming that another read is required.",
+      "Call one useful tool for this checkpoint. Do not start another broad scan, repeat an unchanged window, bypass file reads through shell commands, or claim completion without validation evidence.",
     ].filter(Boolean).join("\n");
   }
 
   return [
-    isPatchMismatchRecovery
-      ? "EXECUTE_RECOVERY: 上一次编辑失败，因为 patch 或替换上下文与当前文件不匹配。"
-      : "EXECUTE_RECOVERY: 当前 Execute 回合已经耗尽只读预算，但还没有产生写入、命令或浏览器验证证据。",
+    "EXECUTE_RECOVERY：当前事务仍缺少所需执行证据。",
     `恢复原因：${input.reason || "read_only_no_action"}。`,
-    `恢复工具面：${surface}。`,
-    `重复/已知目标：${repeatedTargets}。`,
+    `检查点：phase=${contract.phase}；next=${contract.nextRequiredCapability}；target=${contract.expectedTarget || repeatedTargets}。`,
     recent ? `最近工具活动：${recent}。` : "",
-    isPatchMismatchRecovery
-      ? "只在必要时使用一次定向 `read_file`，下一次编辑必须基于最新结果中复制出来的真实文本。小范围修改优先用 `replace_in_file` 精确替换；如果目标已经满足任务，转向命令/浏览器验证。不要继续重试基于旧上下文的 `apply_patch`。"
-      : fileReadAvailable
-      ? "现在可使用定向 `read_file` 来修复精确内容或 patch mismatch；随后必须改为写入、运行有限命令、浏览器验证，或说明精确阻塞。"
-      : "这个恢复步骤不再开放 `read_file`。请复用已缓存上下文，执行下一个具体动作：`apply_patch` / `replace_in_file` / `write_file`、运行有限命令、浏览器验证，或说明精确阻塞。如果 grep_search 已经返回包含失败代码的行，把该行视为最小精确替换的足够上下文。",
-    fileReadAvailable
-      ? "统一行动协议（按顺序选择第一个适用分支，并且只调用一个工具）：1）缺少待编辑目标的当前精确文本时，只对该目标调用一次定向 `read_file`；2）已有精确文本时，调用一个修改工具；3）修改成功后，调用一个有限验证工具。不要在同一批次发起多个猜测性读取。"
-      : "统一行动协议（按顺序选择第一个适用分支，并且只调用一个工具）：1）基于保留的精确上下文执行修改；2）修改成功后调用一个有限验证工具；3）两者都无法执行时，只报告精确阻塞，不能声称完成。",
-    "编辑时必须调用一次小型 Codex-style patch 事务：优先 `apply_patch`，只触碰最小必要文件，patch 控制在 1-3 个聚焦 hunk 内。不要把源码或完整文件粘贴到聊天 Markdown。",
-    "不要开启新一轮泛读，不要重复读取同一批文件，不要用 cat/sed/head/tail shell 读文件绕行，也不要用新的方案文档替代执行动作。",
+    "复用已保留的版本化源码观察。只有确实缺少精确源码且本轮实际提供 read_file 时，才定向补读一个窗口；否则执行检查点指定的 next 能力。",
+    "补丁失败可能是格式错误、无变化或上下文不匹配；应依据结构化工具错误处理，不能默认再读一次文件。",
+    "本检查点只调用一个有用工具。不要重新泛读、重复未变化窗口、用 shell 绕过文件读取，也不要在缺少验证证据时声称完成。",
   ].filter(Boolean).join("\n");
 }
 
@@ -1240,8 +1316,8 @@ export function buildExecuteValidationRecoveryPrompt(input: {
       `Repeated target: ${input.target || "unknown target"} (${input.editCount} edits since the last validation).`,
       tools ? `Available validation tools: ${tools}.` : "",
       recent ? `Recent tool activity: ${recent}.` : "",
-      "Next response must call exactly one validation tool, preferably `run_command` for a finite build/test/lint command or `browser_evaluate` for DOM/screenshot validation.",
-      "Do not edit files, reread source, or summarize completion until validation returns. If the runtime detects a changed target version or missing post-mutation window, it will first switch to a separate targeted-read lease; a read never satisfies validation. If automated validation is impossible, state the exact blocker without claiming completion.",
+      "The next evidence priority is one successful validation result: use a finite command for build/test/lint evidence or browser validation for DOM/screenshot evidence.",
+      "The request schema now exposes only tools owned by this validation checkpoint. A real validation failure may transition the contract back to diagnosis or repair; do not use unrelated tools to bypass the current obligation. If automated validation is impossible, state the exact blocker without claiming completion.",
     ].filter(Boolean).join("\n");
   }
 
@@ -1251,8 +1327,8 @@ export function buildExecuteValidationRecoveryPrompt(input: {
     `重复目标：${input.target || "未知目标"}（距上次验证后已修改 ${input.editCount} 次）。`,
     tools ? `本轮可用验证工具：${tools}。` : "",
     recent ? `最近工具活动：${recent}。` : "",
-    "下一条回复必须只调用一个验证工具；有限的构建/测试/lint 优先用 `run_command`，页面 DOM/截图验证用 `browser_evaluate`。",
-    "不要继续编辑文件，也不要在验证返回前总结完成。只有目标版本变化、源码窗口被淘汰或缺少修改后区间时，才允许一次定向 read_file；该读取不能替代验证。如果无法自动验证，请说明精确阻塞，不能声称任务完成。",
+    "下一证据优先级是一条成功验证结果：构建/测试/lint 使用有限命令，页面 DOM/截图使用浏览器验证。",
+    "本轮请求只暴露当前验证检查点拥有的工具。真实验证失败后，契约可以再转回诊断或修复；不要用无关工具绕过当前义务。如果无法自动验证，请说明精确阻塞，不能声称任务完成。",
   ].filter(Boolean).join("\n");
 }
 
@@ -1274,9 +1350,9 @@ export function buildFailedFiniteValidationRecoveryPrompt(input: {
     `Failed command: ${command}`,
     result ? `Observed result: ${result}` : "Observed result: no usable command output was returned.",
     allowAlternativeCommand
-      ? "The pending Plan evidence is a generic finite-validation placeholder. `run_command` is the required next capability; call one different finite validation command that matches the actual project runtime and source format (for example an existing test, build, typecheck, lint, or compile command). Source reads are not part of this validation phase."
-      : `The approved Plan requires this exact command evidence: ${requiredCommand}. \`run_command\` is the required next capability; retry that same command after correcting its prerequisites or invocation. Source reads are not part of this validation phase. Do not substitute a different build, test, lint, or typecheck command.`,
-    "Do not switch this finite check to `execute_command` or PTY tools. Do not repeat an unchanged source window, and do not infer that a successful file edit was reverted merely because the validation command itself was invalid.",
+      ? "The pending Plan evidence is a generic finite-validation placeholder. The next required evidence is one compatible finite command for the actual project runtime and source format."
+      : `The approved Plan requires this exact command evidence: ${requiredCommand}. Correct its prerequisites or invocation, then retry that command; a different command cannot replace the reviewed acceptance boundary.`,
+    "This checkpoint exposes the finite-command capability only. A real source failure may open a later repair transaction, but reads, edits, long-running commands, and PTY observations cannot replace this command evidence. Do not infer that a successful edit was reverted merely because the command invocation was invalid.",
     allowAlternativeCommand
       ? "Use stdout, stderr, and exitCode to distinguish a real source/test failure from a wrong command. If the diagnostic names a real source defect, repair it in a later normal execution transaction; otherwise choose a compatible finite command now. Do not repeat the failed command unchanged and do not claim completion before exitCode 0."
       : `Use stdout, stderr, and exitCode to diagnose and correct the failure, but keep \`${requiredCommand}\` as the acceptance boundary. Retry that exact command and do not claim completion until that command returns exitCode 0.`,

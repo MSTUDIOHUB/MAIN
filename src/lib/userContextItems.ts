@@ -1,4 +1,8 @@
 import { attachmentIdentity, getAttachmentDisplayName, normalizeAttachedFile, type AttachedFile } from "./attachments";
+import {
+  getRegisteredPersistedImageThumbnail,
+  MAX_PERSISTED_IMAGE_THUMBNAIL_CHARS,
+} from "../utils/imageUtils";
 import { relativizeToWorkspacePath } from "./workspacePaths";
 
 export type UserContextItemKind = "mention" | "attachment" | "image";
@@ -11,6 +15,8 @@ export interface UserContextItem {
   path?: string;
   status?: UserContextItemStatus;
   previewDataUrl?: string;
+  /** Small persisted preview generated independently from the model input. */
+  thumbnailDataUrl?: string;
 }
 
 function normalizePathForDisplay(value: string): string {
@@ -76,12 +82,14 @@ export function buildUserContextItems(input: {
 
   (input.images || []).forEach((previewDataUrl, index) => {
     const id = `image:${index}`;
+    const thumbnailDataUrl = getRegisteredPersistedImageThumbnail(previewDataUrl);
     items.push({
       id,
       kind: "image",
       label: language === "en" ? `Image ${index + 1}` : `截图 ${index + 1}`,
       status: "ready",
       previewDataUrl,
+      ...(thumbnailDataUrl ? { thumbnailDataUrl } : {}),
     });
   });
 
@@ -101,12 +109,20 @@ export function sanitizeUserContextItemsForPersist(items: unknown): UserContextI
       const label = String(raw.label || (kind === "image" ? `Image ${index + 1}` : raw.path || "attachment")).trim();
       if (!label) return null;
       const status = raw.status === "failed" ? "failed" : raw.status === "ready" ? "ready" : undefined;
+      const thumbnailDataUrl = kind === "image" &&
+        typeof raw.thumbnailDataUrl === "string" &&
+        raw.thumbnailDataUrl.startsWith("data:image/") &&
+        raw.thumbnailDataUrl !== raw.previewDataUrl &&
+        raw.thumbnailDataUrl.length <= MAX_PERSISTED_IMAGE_THUMBNAIL_CHARS
+        ? raw.thumbnailDataUrl
+        : undefined;
       return {
         id: String(raw.id || `${kind}:${index}`),
         kind,
         label,
         ...(typeof raw.path === "string" && raw.path.trim() ? { path: raw.path } : {}),
         ...(status ? { status } : {}),
+        ...(thumbnailDataUrl ? { thumbnailDataUrl } : {}),
       };
     })
     .filter((item): item is UserContextItem => !!item);

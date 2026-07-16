@@ -21,15 +21,7 @@ import {
 } from "../../orchestrator";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { FetchLLMStreamOptions, OrchestratorCallbacks } from "../types";
-import {
-  continueApprovedPlanWithStrategySwitch as continueApprovedPlanWithStrategySwitchAction,
-  pauseApprovedPlanNoProgressLoop as pauseApprovedPlanNoProgressLoopAction,
-  pauseApprovedPlanStreamWatchdog as pauseApprovedPlanStreamWatchdogAction,
-} from "./approvedPlanRecoveryActions";
-import {
-  applyApprovedPlanStrategySwitchRecoveryState,
-  type ApprovedPlanRecoveryRuntimeState,
-} from "./approvedPlanRecoveryRuntime";
+import { pauseApprovedPlanStreamWatchdog as pauseApprovedPlanStreamWatchdogAction } from "./approvedPlanRecoveryActions";
 import {
   resolveMaxOutputEscalations,
   resolvePlanStreamWatchdogState,
@@ -56,21 +48,10 @@ export interface AgentLoopControlRuntime {
   ) => void;
   getMaxOutputEscalations: () => number;
   getPlanStreamWatchdogOptions: (nativeToolCount: number) => FetchLLMStreamOptions | undefined;
-  pauseApprovedPlanNoProgressLoop: (input: {
-    reason: string;
-    repeats: number;
-    remainingText?: string;
-    logContext?: Record<string, unknown>;
-  }) => void;
   pauseApprovedPlanStreamWatchdog: (
     message: string,
     logContext?: Record<string, unknown>,
   ) => boolean;
-  continueApprovedPlanWithStrategySwitch: (input: {
-    reason: string;
-    remainingText: string;
-    logContext?: Record<string, unknown>;
-  }) => ApprovedPlanRecoveryRuntimeState;
   startLoop: (input: {
     runtimeIntent: ResolvedUserIntent;
     loopStartTools: ToolDefinition[];
@@ -110,8 +91,6 @@ export function createAgentLoopControlRuntime(input: {
   getExecuteRecoveryMode: () => ExecuteRecoveryMode;
   getStreamRuntimeState: () => AgentLoopStreamRuntimeState;
   setStreamRuntimeState: (state: AgentLoopStreamRuntimeState) => void;
-  getApprovedPlanRecoveryState: () => ApprovedPlanRecoveryRuntimeState;
-  setApprovedPlanRecoveryState: (state: ApprovedPlanRecoveryRuntimeState) => void;
   getPlanRuntimeState: () => {
     planRuntimePhase: PlanRuntimePhase;
     planQualityRejectCount: number;
@@ -129,8 +108,6 @@ export function createAgentLoopControlRuntime(input: {
     getExecuteRecoveryMode,
     getStreamRuntimeState,
     setStreamRuntimeState,
-    getApprovedPlanRecoveryState,
-    setApprovedPlanRecoveryState,
     getPlanRuntimeState,
     emitTaskOrchestratorPhase,
     setPlanRuntimePhase,
@@ -146,7 +123,7 @@ export function createAgentLoopControlRuntime(input: {
     agentLoop?: { iterationLimits?: AgentLoopIterationLimits | null } | null;
   };
   let planExecutionStartIteration: number | null =
-    workflowMode === "plan" && callbacks.getIsPlanApproved() ? 0 : null;
+    callbacks.getIsPlanApproved() ? 0 : null;
   let didLogPlanExecutionBudget = planExecutionStartIteration === 0;
   let didLogPlanDraftQualityRecoveryReserve = false;
   const resolveIterationBudget = () => {
@@ -206,7 +183,7 @@ export function createAgentLoopControlRuntime(input: {
     phase: PlanExecutionProgressPhase,
     overrides: Partial<PlanExecutionProgressUpdate> = {},
   ) => {
-    if (workflowMode !== "plan" || !callbacks.getIsPlanApproved() || !callbacks.onPlanExecutionProgress) return;
+    if (!callbacks.getIsPlanApproved() || !callbacks.onPlanExecutionProgress) return;
     const budget = resolveIterationBudget();
     const displayIteration = budget.phase === "plan_execution"
       ? Math.max(0, getIteration() - budget.phaseStartIteration)
@@ -255,24 +232,12 @@ export function createAgentLoopControlRuntime(input: {
     return watchdogDecision.options;
   };
 
-  const pauseApprovedPlanNoProgressLoop: AgentLoopControlRuntime["pauseApprovedPlanNoProgressLoop"] = (pauseInput) => {
-    pauseApprovedPlanNoProgressLoopAction({
-      callbacks,
-      iteration: getIteration(),
-      recentPlanToolActivity,
-      emitTaskOrchestratorPhase,
-      emitPlanExecutionProgress,
-      ...pauseInput,
-    });
-  };
-
   const pauseApprovedPlanStreamWatchdog: AgentLoopControlRuntime["pauseApprovedPlanStreamWatchdog"] = (
     message,
     logContext,
   ) => {
     return pauseApprovedPlanStreamWatchdogAction({
       callbacks,
-      workflowMode,
       iteration: getIteration(),
       recentPlanToolActivity,
       emitTaskOrchestratorPhase,
@@ -280,26 +245,6 @@ export function createAgentLoopControlRuntime(input: {
       message,
       logContext,
     });
-  };
-
-  const continueApprovedPlanWithStrategySwitch: AgentLoopControlRuntime["continueApprovedPlanWithStrategySwitch"] = (strategyInput) => {
-    const approvedPlanRecoveryState = getApprovedPlanRecoveryState();
-    const result = continueApprovedPlanWithStrategySwitchAction({
-      callbacks,
-      iteration: getIteration(),
-      recentPlanToolActivity,
-      approvedPlanNoProgressRecoveryAttempts:
-        approvedPlanRecoveryState.approvedPlanNoProgressRecoveryAttempts,
-      emitTaskOrchestratorPhase,
-      emitPlanExecutionProgress,
-      ...strategyInput,
-    });
-    const nextState = applyApprovedPlanStrategySwitchRecoveryState(
-      approvedPlanRecoveryState,
-      result,
-    );
-    setApprovedPlanRecoveryState(nextState);
-    return nextState;
   };
 
   const startLoop: AgentLoopControlRuntime["startLoop"] = (startInput) => {
@@ -350,9 +295,7 @@ export function createAgentLoopControlRuntime(input: {
     emitPlanExecutionProgress,
     getMaxOutputEscalations,
     getPlanStreamWatchdogOptions,
-    pauseApprovedPlanNoProgressLoop,
     pauseApprovedPlanStreamWatchdog,
-    continueApprovedPlanWithStrategySwitch,
     startLoop,
   };
 }

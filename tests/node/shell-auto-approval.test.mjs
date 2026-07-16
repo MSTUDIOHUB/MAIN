@@ -57,6 +57,7 @@ const shellAutoApproval = loadTranspiledModuleSync(path.join(workspaceRoot, "src
 
 const {
   buildShellPermissionApproval,
+  canApplyShellAutoReview,
   getShellPermissionCommandForTool,
   resolveShellAutoApproval,
   suggestedShellPermissionRules,
@@ -138,7 +139,7 @@ test("shell auto approval resolves command text for shell tools", () => {
   );
 });
 
-test("shell auto approval builds approval for ask decisions", async () => {
+test("shell auto approval never promotes an ask decision", async () => {
   const decision = createDecision();
   const resolution = await resolveShellAutoApproval({
     toolName: "run_command",
@@ -156,9 +157,9 @@ test("shell auto approval builds approval for ask decisions", async () => {
 
   assert.equal(resolution.command, decision.command);
   assert.equal(resolution.decision, decision);
-  assert.equal(resolution.approval.command, decision.command);
-  assert.equal(resolution.approval.scope, "session");
-  assert.deepEqual(resolution.approval.rules, ["git"]);
+  assert.equal(resolution.approval, undefined);
+  assert.equal(resolution.requiresUserReview, true);
+  assert.equal(canApplyShellAutoReview(resolution), false);
 });
 
 test("shell auto approval leaves allow and deny decisions to the permission guard", async () => {
@@ -180,6 +181,8 @@ test("shell auto approval leaves allow and deny decisions to the permission guar
   });
   assert.equal(allowResolution.approval, undefined);
   assert.equal(allowResolution.decision.decision, "allow");
+  assert.equal(allowResolution.requiresUserReview, false);
+  assert.equal(canApplyShellAutoReview(allowResolution), true);
 
   const denyResolution = await resolveShellAutoApproval({
     toolName: "execute_command",
@@ -210,6 +213,35 @@ test("shell auto approval leaves allow and deny decisions to the permission guar
   });
   assert.equal(denyResolution.approval, undefined);
   assert.equal(denyResolution.decision.decision, "deny");
+  assert.equal(canApplyShellAutoReview(denyResolution), false);
+});
+
+test("parameter-level shell mutations cannot inherit session auto review", async () => {
+  for (const command of [
+    "find . -delete",
+    "rm build/output.txt",
+    "git diff --output=changes.patch",
+    "sort input.txt -o output.txt",
+  ]) {
+    const resolution = await resolveShellAutoApproval({
+      toolName: "run_command",
+      args: { command, cwd: "." },
+      workspace: "/tmp/project",
+      // Defense in depth: even a stale/custom policy that says allow cannot
+      // make these parameter shapes eligible for client-side Auto Review.
+      preflight: async () => createDecision({
+        command,
+        decision: "allow",
+        requiresApproval: false,
+        suggestedRule: null,
+        suggestedRules: [],
+        segmentDecisions: [],
+      }),
+    });
+
+    assert.equal(resolution.requiresUserReview, true, command);
+    assert.equal(canApplyShellAutoReview(resolution), false, command);
+  }
 });
 
 test("shell approval rules are deduped across decision and segments", () => {
@@ -259,6 +291,7 @@ test("game studio shell commands use the same auto approval path", async () => {
   });
 
   assert.equal(resolution.command, "godot --headless --export-release macOS");
-  assert.equal(resolution.approval.command, "godot --headless --export-release macOS");
-  assert.deepEqual(resolution.approval.rules, ["godot"]);
+  assert.equal(resolution.approval, undefined);
+  assert.equal(resolution.requiresUserReview, true);
+  assert.equal(canApplyShellAutoReview(resolution), false);
 });

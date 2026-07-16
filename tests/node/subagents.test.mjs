@@ -130,6 +130,18 @@ test("capacity policy permits two local children and bounded cloud parallelism",
 });
 
 test("adaptive delegation admits only useful context or diagnostic fan-out", () => {
+  const readyRuntimeHealth = {
+    laneKey: "local:test",
+    profile: "local",
+    state: "ready",
+    activeChildren: 0,
+    queuedChildren: 0,
+    capacityLimit: 2,
+    memorySafety: "safe",
+    recentSuccessfulRuns: 1,
+    latestStartupMs: 120,
+    latestCapacityWaitMs: 0,
+  };
   const simple = subagents.resolveDelegationDecision({
     phase: "context",
     hasWorkspace: true,
@@ -138,14 +150,64 @@ test("adaptive delegation admits only useful context or diagnostic fan-out", () 
   assert.equal(simple.action, "defer");
   assert.equal(simple.reason, "insufficient_independent_scope");
 
-  const multiScope = subagents.resolveDelegationDecision({
+  const observedOnly = subagents.resolveDelegationDecision({
     phase: "diagnostic",
     hasWorkspace: true,
     observedScopeCount: 2,
     independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
   });
-  assert.equal(multiScope.action, "admit");
-  assert.equal(multiScope.reason, "adaptive_multi_scope");
+  assert.equal(observedOnly.action, "defer");
+  assert.equal(observedOnly.reason, "insufficient_independent_scope");
+  assert.equal(observedOnly.observedScopeCount, 2);
+  assert.equal(observedOnly.independentScopeCount, 2);
+
+  const structuredScopes = subagents.resolveDelegationDecision({
+    phase: "context",
+    hasWorkspace: true,
+    explicitScopeCount: 2,
+    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
+    runtimeHealth: readyRuntimeHealth,
+  });
+  assert.equal(structuredScopes.action, "admit");
+  assert.equal(structuredScopes.reason, "adaptive_multi_scope");
+
+  const unknownRuntimeHealth = subagents.resolveDelegationDecision({
+    phase: "context",
+    hasWorkspace: true,
+    explicitScopeCount: 2,
+    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
+  });
+  assert.equal(unknownRuntimeHealth.action, "defer");
+  assert.equal(unknownRuntimeHealth.reason, "runtime_health_unavailable");
+
+  const busyRuntimeHealth = subagents.resolveDelegationDecision({
+    phase: "context",
+    hasWorkspace: true,
+    explicitScopeCount: 2,
+    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
+    runtimeHealth: { ...readyRuntimeHealth, state: "busy", queuedChildren: 1 },
+  });
+  assert.equal(busyRuntimeHealth.action, "defer");
+  assert.equal(busyRuntimeHealth.reason, "runtime_capacity_busy");
+
+  const scopesAlreadyUnderDiagnosis = subagents.resolveDelegationDecision({
+    phase: "diagnostic",
+    hasWorkspace: true,
+    explicitScopeCount: 2,
+    observedScopeCount: 2,
+    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
+  });
+  assert.equal(scopesAlreadyUnderDiagnosis.action, "defer");
+  assert.equal(scopesAlreadyUnderDiagnosis.reason, "insufficient_independent_scope");
+
+  const plannedIndependentWork = subagents.resolveDelegationDecision({
+    phase: "context",
+    hasWorkspace: true,
+    plannedWorkItemCount: 2,
+    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
+  });
+  assert.equal(plannedIndependentWork.action, "defer");
+  assert.equal(plannedIndependentWork.reason, "insufficient_independent_scope");
 
   const preferred = subagents.resolveDelegationDecision({
     preference: "preferred",
@@ -302,6 +364,118 @@ test("local capacity scheduler runs at most two child workflows at once", async 
   assert.deepEqual(executionOrder.slice(0, 2), ["start:0", "start:1"]);
   assert.equal(executionOrder.filter((entry) => entry.startsWith("start:")).length, 3);
   assert.equal(executionOrder.filter((entry) => entry.startsWith("end:")).length, 3);
+});
+
+test("Auto delegation uses observed capacity health instead of assuming a fresh lane is safe", () => {
+  subagents.resetSubagentRuntimeForTests();
+  const policy = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
+  const unknown = subagents.getSubagentAdmissionHealth(policy);
+  assert.equal(unknown.state, "unknown");
+  assert.equal(unknown.latestStartupMs, null);
+
+  subagents.recordSubagentRuntimeSample({
+    laneKey: policy.laneKey,
+    startupMs: 240,
+    capacityWaitMs: 0,
+    successful: true,
+  });
+  const ready = subagents.getSubagentAdmissionHealth(policy);
+  assert.equal(ready.state, "ready");
+  assert.equal(ready.recentSuccessfulRuns, 1);
+  assert.equal(ready.latestStartupMs, 240);
+  assert.equal(ready.latestCapacityWaitMs, 0);
+
+  subagents.reportSubagentCapacityFailure(policy, new Error("out of memory"));
+  const degraded = subagents.getSubagentAdmissionHealth(policy);
+  assert.equal(degraded.state, "degraded");
+});
+
+test("queued children reserve child scope without blocking the parent until real tool work", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const policy = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
+  let releaseOccupiers;
+  const occupierGate = new Promise((resolve) => { releaseOccupiers = resolve; });
+  let occupiedCount = 0;
+  let resolveOccupied;
+  const occupied = new Promise((resolve) => { resolveOccupied = resolve; });
+  const occupiers = [0, 1].map(() => subagents.withSubagentCapacity({
+    policy,
+    task: async () => {
+      occupiedCount += 1;
+      if (occupiedCount === 2) resolveOccupied();
+      await occupierGate;
+    },
+  }));
+  await occupied;
+
+  let resolveChildLoopStarted;
+  const childLoopStarted = new Promise((resolve) => { resolveChildLoopStarted = resolve; });
+  let allowToolStart;
+  const toolStartGate = new Promise((resolve) => { allowToolStart = resolve; });
+  let resolveToolActivated;
+  const toolActivated = new Promise((resolve) => { resolveToolActivated = resolve; });
+  let releaseChild;
+  const childGate = new Promise((resolve) => { releaseChild = resolve; });
+  const completion = subagentRuntime.executeControlledSubagent({
+    request: {
+      name: "Noether",
+      objective: "Inspect scope admission ordering",
+      scopeKey: "lease-order",
+      allowedPaths: "src/lib/subagents.ts",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-lease-order",
+      getMessages: () => [{ role: "user", content: "parent" }],
+    },
+    parentTurnId: "turn-lease-order",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      resolveChildLoopStarted();
+      await toolStartGate;
+      childCallbacks.onToolExecuting("read_file", "src/lib/subagents.ts");
+      resolveToolActivated();
+      await childGate;
+      childCallbacks.onToolDone("read_file", "src/lib/subagents.ts", "observed");
+      childCallbacks.onAssistantFinalText("Scope ordering inspected.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.ok(subagents.findSubagentLeaseOverlap({
+    threadId: "thread-lease-order",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib/subagents.ts"],
+  }));
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-lease-order",
+    targetPath: "src/lib/subagents.ts",
+  }), null);
+
+  releaseOccupiers();
+  await Promise.all(occupiers);
+  await childLoopStarted;
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-lease-order",
+    targetPath: "src/lib/subagents.ts",
+  }), null);
+
+  allowToolStart();
+  await toolActivated;
+  assert.ok(subagents.findSubagentScopeConflict({
+    threadId: "thread-lease-order",
+    targetPath: "src/lib/subagents.ts",
+  }));
+
+  releaseChild();
+  const result = await completion;
+  assert.equal(result.status, "completed");
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-lease-order",
+    targetPath: "src/lib/subagents.ts",
+  }), null);
 });
 
 test("a queued third local child starts only after two safe model-overlap samples", async () => {
@@ -892,6 +1066,54 @@ test("runtime parent join injects structured child evidence before finalization"
   assert.equal(recent[0].delegatedObservation.requiresParentReread, true);
   assert.deepEqual(recentPlan, recent);
   assert.deepEqual(events.map((entry) => entry.event), ["parent_join_required", "parent_join_injected"]);
+});
+
+test("only a structured parent scope deferral requests deterministic child join", () => {
+  assert.equal(subagentJoinRuntime.shouldJoinPendingSubagentsAfterScopeDeferral([{
+    toolCallId: "parent-read-css",
+    name: "read_file",
+    target: "src/styles/main.css",
+    content: "PARENT_SCOPE_DEFERRED_TO_SUBAGENT",
+    isError: false,
+    lifecycleState: "completed",
+    internalFeedback: true,
+    qualityGateReason: "subagent_scope_policy_deferred",
+  }]), true);
+  assert.equal(subagentJoinRuntime.shouldJoinPendingSubagentsAfterScopeDeferral([{
+    toolCallId: "child-scope-escape",
+    name: "grep_search",
+    target: "src",
+    content: "SUBAGENT_SCOPE_BLOCKED",
+    isError: true,
+    lifecycleState: "blocked",
+  }]), false);
+  assert.equal(subagentJoinRuntime.shouldJoinPendingSubagentsAfterScopeDeferral([{
+    toolCallId: "ordinary-policy-deferral",
+    name: "read_file",
+    target: "src/main.js",
+    content: "READ_SCOPE_DEFERRED",
+    isError: false,
+    lifecycleState: "completed",
+    internalFeedback: true,
+    qualityGateReason: "read_scope_deferred",
+  }]), false);
+  assert.equal(subagentJoinRuntime.shouldJoinPendingSubagentsAfterScopeDeferral([{
+    toolCallId: "parent-read-css",
+    name: "read_file",
+    target: "src/styles/main.css",
+    content: "PARENT_SCOPE_DEFERRED_TO_SUBAGENT",
+    isError: false,
+    lifecycleState: "completed",
+    internalFeedback: true,
+    qualityGateReason: "subagent_scope_policy_deferred",
+  }, {
+    toolCallId: "failed-validation",
+    name: "run_command",
+    target: "npm test",
+    content: "tests failed",
+    isError: true,
+    lifecycleState: "failed",
+  }]), false);
 });
 
 test("blocked child results preserve their useful summary instead of becoming tool errors", async () => {

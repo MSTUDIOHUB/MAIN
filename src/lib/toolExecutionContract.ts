@@ -63,8 +63,15 @@ export function applyShellCwd(command: string, args: Record<string, unknown>): s
 }
 
 const DANGEROUS_SHELL_PATTERNS = [
-  /\brm\s+-[^\n;&|]*r[^\n;&|]*f\b/i,
-  /\brm\s+-[^\n;&|]*f[^\n;&|]*r\b/i,
+  // Any direct removal is destructive.  `rm` without `-rf` still deletes
+  // user data and must never inherit the generic shell auto-review scope.
+  /\brm(?:\s|$)/i,
+  // Commands commonly used for inspection can mutate when particular
+  // arguments are present.  Classify the call from the full command, not
+  // only from its executable prefix.
+  /\bfind\b[^\n;&|]*\s-(?:delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)(?=\s|$)/i,
+  /\bgit\s+diff\b[^\n;&|]*\s--(?:output(?:=|\s)|ext-diff(?=\s|$))/i,
+  /\bsort\b[^\n;&|]*\s(?:-o(?=\s|=|\S)|--output(?=\s|=|$))/i,
   /\bgit\s+reset\s+--hard\b/i,
   /\bgit\s+clean\s+-[^\n;&|]*[df][^\n;&|]*[df]?\b/i,
   /\bgit\s+checkout\s+(?:--|\.)\b/i,

@@ -121,7 +121,23 @@ export type DelegationDecisionReason =
   | "subagent_recursion_forbidden"
   | "turn_capacity_reached"
   | "overlapping_active_scope"
-  | "parent_scope_already_observed";
+  | "parent_scope_already_observed"
+  | "runtime_health_unavailable"
+  | "runtime_capacity_busy"
+  | "runtime_capacity_degraded";
+
+export interface DelegationRuntimeHealth {
+  laneKey: string;
+  profile: "local" | "cloud";
+  state: "ready" | "busy" | "degraded" | "unknown";
+  activeChildren: number;
+  queuedChildren: number;
+  capacityLimit: number;
+  memorySafety: "safe" | "unsafe" | "unknown" | "not_applicable";
+  recentSuccessfulRuns: number;
+  latestStartupMs: number | null;
+  latestCapacityWaitMs: number | null;
+}
 
 export interface DelegationDecision {
   action: DelegationDecisionAction;
@@ -133,6 +149,7 @@ export interface DelegationDecision {
   observedScopeCount: number;
   plannedWorkItemCount: number;
   pendingSubagentCount: number;
+  runtimeHealthState: DelegationRuntimeHealth["state"] | "not_provided";
 }
 
 export type SpawnSubagentResult =
@@ -276,6 +293,7 @@ export function resolveDelegationDecision(input: {
   independentScopeKeys?: string[];
   pendingSubagentCount?: number;
   subagentDepth?: number;
+  runtimeHealth?: DelegationRuntimeHealth | null;
 }): DelegationDecision {
   const preference = input.preference || "unspecified";
   const explicitScopeCount = boundedCount(input.explicitScopeCount);
@@ -298,6 +316,7 @@ export function resolveDelegationDecision(input: {
     observedScopeCount,
     plannedWorkItemCount,
     pendingSubagentCount,
+    runtimeHealthState: input.runtimeHealth?.state || "not_provided",
   });
 
   if (boundedCount(input.subagentDepth) > 0) {
@@ -313,7 +332,25 @@ export function resolveDelegationDecision(input: {
   }
   if (preference === "preferred") return decision("admit", "explicit_preference");
   if (preference === "allowed") return decision("admit", "explicit_permission");
-  if (independentScopeCount >= 2) return decision("admit", "adaptive_multi_scope");
+  // Auto delegation is an initial-context optimization only. Files already
+  // read by the parent and checklist length are evidence/telemetry, not a
+  // reason to reopen fan-out during diagnosis.
+  if (
+    input.phase === "context" &&
+    explicitScopeCount >= 2 &&
+    independentScopeCount >= 2
+  ) {
+    if (!input.runtimeHealth || input.runtimeHealth.state === "unknown") {
+      return decision("defer", "runtime_health_unavailable");
+    }
+    if (input.runtimeHealth.state === "degraded") {
+      return decision("defer", "runtime_capacity_degraded");
+    }
+    if (input.runtimeHealth.state === "busy") {
+      return decision("defer", "runtime_capacity_busy");
+    }
+    return decision("admit", "adaptive_multi_scope");
+  }
   return decision("defer", "insufficient_independent_scope");
 }
 
@@ -473,6 +510,16 @@ interface CapacityLaneState {
 const capacityLanes = new Map<string, CapacityLaneState>();
 const degradedUntilByLane = new Map<string, number>();
 const childAbortControllers = new Map<string, AbortController>();
+const SUBAGENT_RUNTIME_HEALTH_TTL_MS = 10 * 60_000;
+
+interface SubagentRuntimeSample {
+  recordedAt: number;
+  startupMs: number;
+  capacityWaitMs: number;
+  successful: boolean;
+}
+
+const runtimeSamplesByLane = new Map<string, SubagentRuntimeSample[]>();
 
 export interface CoordinatedSubagentRun {
   threadId: string;
@@ -499,6 +546,9 @@ export interface SubagentScopeLease {
 
 const coordinatedRuns = new Map<string, CoordinatedSubagentRun>();
 const scopeLeases = new Map<string, SubagentScopeLease>();
+// Reservations serialize child ownership without blocking the parent. They
+// become active leases only when a child begins a real source-tool operation.
+const scopeReservations = new Map<string, SubagentScopeLease>();
 const createdRunCounts = new Map<string, number>();
 const COORDINATED_RESULT_TTL_MS = 10 * 60_000;
 
@@ -584,8 +634,24 @@ export function acquireSubagentScopeLease(input: SubagentScopeLease): void {
   });
 }
 
+export function reserveSubagentScope(input: SubagentScopeLease): void {
+  scopeReservations.set(input.subagentId, {
+    ...input,
+    allowedPaths: input.allowedPaths.map(normalizeWorkspacePathIdentity).filter(Boolean),
+  });
+}
+
+export function activateSubagentScopeLease(subagentId: string): boolean {
+  if (scopeLeases.has(subagentId)) return true;
+  const reservation = scopeReservations.get(subagentId);
+  if (!reservation) return false;
+  scopeLeases.set(subagentId, reservation);
+  return true;
+}
+
 export function releaseSubagentScopeLease(subagentId: string): void {
   scopeLeases.delete(subagentId);
+  scopeReservations.delete(subagentId);
 }
 
 export function findSubagentScopeConflict(input: {
@@ -615,7 +681,11 @@ export function findSubagentLeaseOverlap(input: {
   const candidates = input.allowedPaths
     .map((path) => normalizeWorkspacePathIdentity(relativizeToWorkspacePath(path, input.workspace)))
     .filter(Boolean);
-  for (const lease of scopeLeases.values()) {
+  const childOwnership = new Map<string, SubagentScopeLease>([
+    ...scopeReservations.entries(),
+    ...scopeLeases.entries(),
+  ]);
+  for (const lease of childOwnership.values()) {
     if (lease.threadId !== input.threadId) continue;
     if (candidates.some((candidate) => lease.allowedPaths.some((allowed) =>
       pathContains(allowed, candidate) || pathContains(candidate, allowed)
@@ -764,6 +834,75 @@ function effectiveLaneLimit(policy: SubagentCapacityPolicy): number {
     return policy.maxBurstActiveRequests;
   }
   return policy.maxActiveRequests;
+}
+
+export function recordSubagentRuntimeSample(input: {
+  laneKey: string;
+  startupMs: number;
+  capacityWaitMs: number;
+  successful: boolean;
+  recordedAt?: number;
+}): void {
+  const recordedAt = input.recordedAt || Date.now();
+  const samples = runtimeSamplesByLane.get(input.laneKey) || [];
+  runtimeSamplesByLane.set(input.laneKey, [
+    ...samples.filter((sample) =>
+      recordedAt - sample.recordedAt <= SUBAGENT_RUNTIME_HEALTH_TTL_MS
+    ),
+    {
+      recordedAt,
+      startupMs: Math.max(0, Math.floor(input.startupMs)),
+      capacityWaitMs: Math.max(0, Math.floor(input.capacityWaitMs)),
+      successful: input.successful,
+    },
+  ].slice(-8));
+}
+
+/**
+ * A read-only snapshot used by Auto delegation. Missing runtime observations
+ * stay unknown; policy limits are not fabricated into proof that a local
+ * model has enough memory or that child startup is inexpensive.
+ */
+export function getSubagentAdmissionHealth(
+  policy: SubagentCapacityPolicy,
+  now = Date.now(),
+): DelegationRuntimeHealth {
+  const lane = capacityLanes.get(policy.laneKey);
+  const capacityLimit = effectiveLaneLimit(policy);
+  const activeChildren = lane?.active || 0;
+  const queuedChildren = lane?.queue.length || 0;
+  const degraded = (degradedUntilByLane.get(policy.laneKey) || 0) > now;
+  const recentSamples = (runtimeSamplesByLane.get(policy.laneKey) || [])
+    .filter((sample) => now - sample.recordedAt <= SUBAGENT_RUNTIME_HEALTH_TTL_MS);
+  const successfulSamples = recentSamples.filter((sample) => sample.successful);
+  const latestSuccessfulSample = successfulSamples[successfulSamples.length - 1] || null;
+  const burstAdmission = getModelLaneBurstAdmission(policy.laneKey);
+  const memorySafety: DelegationRuntimeHealth["memorySafety"] = policy.profile === "cloud"
+    ? "not_applicable"
+    : burstAdmission.allowed
+      ? "safe"
+      : burstAdmission.reason === "degraded" || burstAdmission.reason === "memory_probe_unavailable"
+        ? "unsafe"
+        : "unknown";
+  const state: DelegationRuntimeHealth["state"] = degraded || memorySafety === "unsafe"
+    ? "degraded"
+    : queuedChildren > 0 || activeChildren >= capacityLimit
+      ? "busy"
+      : latestSuccessfulSample || memorySafety === "safe"
+        ? "ready"
+        : "unknown";
+  return {
+    laneKey: policy.laneKey,
+    profile: policy.profile,
+    state,
+    activeChildren,
+    queuedChildren,
+    capacityLimit,
+    memorySafety,
+    recentSuccessfulRuns: successfulSamples.length,
+    latestStartupMs: latestSuccessfulSample?.startupMs ?? null,
+    latestCapacityWaitMs: latestSuccessfulSample?.capacityWaitMs ?? null,
+  };
 }
 
 export function getSubagentBurstAdmission(policy: SubagentCapacityPolicy) {
@@ -965,7 +1104,9 @@ export function resetSubagentRuntimeForTests(): void {
   capacityLanes.clear();
   degradedUntilByLane.clear();
   childAbortControllers.clear();
+  runtimeSamplesByLane.clear();
   coordinatedRuns.clear();
   createdRunCounts.clear();
   scopeLeases.clear();
+  scopeReservations.clear();
 }

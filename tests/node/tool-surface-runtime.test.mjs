@@ -36,6 +36,21 @@ test("tool surface runtime owns tool-surface fallback telemetry", () => {
   assert.match(runtimeSource, /activateUnityMcpFallbackState\(/);
 });
 
+test("tool surface runtime consumes one canonical runtime intent without plan approval correction", () => {
+  const runtimeSource = sourceFor("src/lib/orchestrator/loop/toolSurfaceRuntime.ts");
+
+  assert.match(
+    runtimeSource,
+    /return callbacks\.getRuntimeRunIntent\?\.\(\) \?\? callbacks\.getCurrentRunIntent\(\)/,
+  );
+  assert.match(
+    runtimeSource,
+    /filterToolDefinitionsForIntent\(\s*routedToolDefinitions,\s*runtimeIntent,\s*toolCapabilityRegistry,?\s*\)/,
+  );
+  assert.doesNotMatch(runtimeSource, /currentConversationIntent === "plan"/);
+  assert.doesNotMatch(runtimeSource, /planApproved:/);
+});
+
 test("agent loop delegates tool surface details to runtime module", () => {
   const orchestratorSource = sourceFor("src/lib/orchestrator/loop/AgentOrchestrator.ts");
 

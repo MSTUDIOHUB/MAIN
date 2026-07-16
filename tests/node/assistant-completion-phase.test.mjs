@@ -21,17 +21,17 @@ test("assistant completion phase owns the no-tool assistant completion ordering"
   assert.match(phaseSource, /export async function handleAssistantCompletionPhase/);
 
   const replyOptionsPause = indexOfRequired(phaseSource, /handleReplyOptionsPause\(\{/);
-  const approvedPlanNoToolRecovery = indexOfRequired(phaseSource, /handleApprovedPlanNoToolRecovery\(\{/);
+  const preCompletionEvidenceAudit = indexOfRequired(phaseSource, /resolvePreCompletionEvidenceRecoveryDecision\(\{/);
+  const activeRecoveryContract = indexOfRequired(phaseSource, /currentExecuteRecoveryState\.mode !== "normal"/);
   const executeNoToolRecovery = indexOfRequired(phaseSource, /handleExecuteNoToolRecovery\(\{/);
   const planNoToolRecovery = indexOfRequired(phaseSource, /handlePlanNoToolRecovery\(\{/);
   const missingToolNoToolRecovery = indexOfRequired(phaseSource, /handleMissingToolNoToolRecovery\(\{/);
   const approvedPlanFinalization = indexOfRequired(phaseSource, /handleApprovedPlanFinalization\(\{/);
-  const preCompletionEvidenceAudit = indexOfRequired(phaseSource, /resolvePreCompletionEvidenceRecoveryDecision\(\{/);
   const finalNoToolAssistantTurn = indexOfRequired(phaseSource, /handleFinalNoToolAssistantTurn\(\{/);
 
-  assert.ok(replyOptionsPause < approvedPlanNoToolRecovery);
-  assert.ok(approvedPlanNoToolRecovery < preCompletionEvidenceAudit);
-  assert.ok(preCompletionEvidenceAudit < executeNoToolRecovery);
+  assert.ok(replyOptionsPause < preCompletionEvidenceAudit);
+  assert.ok(preCompletionEvidenceAudit < activeRecoveryContract);
+  assert.ok(activeRecoveryContract < executeNoToolRecovery);
   assert.ok(executeNoToolRecovery < planNoToolRecovery);
   assert.ok(planNoToolRecovery < missingToolNoToolRecovery);
   assert.ok(missingToolNoToolRecovery < approvedPlanFinalization);
@@ -89,7 +89,6 @@ test("assistant completion phase owns no-tool runtime state folds", () => {
   const phaseSource = sourceFor("src/lib/orchestrator/loop/assistantCompletionPhase.ts");
 
   assert.match(phaseSource, /applyConsecutiveNoToolRuntimeState\(/);
-  assert.match(phaseSource, /applyApprovedPlanNoToolRecoveryState\(/);
   assert.match(phaseSource, /applyPlanNoToolRuntimeState\(/);
   assert.match(phaseSource, /setPlanRuntimePhaseAndSync/);
   assert.match(phaseSource, /input\.setPlanRuntimePhase\(phase, reason, status, qualitySnapshot\)/);
@@ -106,7 +105,6 @@ test("assistant iteration phase delegates assistant completion details to the ph
   assert.match(iterationPhaseSource, /handleAssistantCompletionPhase\(\{/);
   assert.doesNotMatch(orchestratorSource, /handleAssistantCompletionPhase\(\{/);
   assert.doesNotMatch(orchestratorSource, /handleReplyOptionsPause\(\{/);
-  assert.doesNotMatch(orchestratorSource, /handleApprovedPlanNoToolRecovery\(\{/);
   assert.doesNotMatch(orchestratorSource, /handleExecuteNoToolRecovery\(\{/);
   assert.doesNotMatch(orchestratorSource, /handlePlanNoToolRecovery\(\{/);
   assert.doesNotMatch(orchestratorSource, /handleMissingToolNoToolRecovery\(\{/);

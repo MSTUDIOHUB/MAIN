@@ -705,12 +705,38 @@ fn allow_rule_needs_review(command: &str, rule: &str) -> Option<String> {
     if command_has_high_risk_shell_shape(command) {
         return Some("Allowed command uses shell syntax or paths that require review".to_string());
     }
+    if allowed_inspection_has_side_effects(command, rule) {
+        return Some(
+            "Inspection command uses arguments that can execute code or mutate files".to_string(),
+        );
+    }
     if is_workspace_mutation_rule(rule) && command_mentions_external_path(command) {
         return Some(
             "Workspace mutation command references an external or parent path".to_string(),
         );
     }
     None
+}
+
+fn allowed_inspection_has_side_effects(command: &str, rule: &str) -> bool {
+    let lower = command.to_ascii_lowercase();
+    match rule.trim() {
+        "find" => [
+            " -delete",
+            " -exec",
+            " -execdir",
+            " -ok",
+            " -okdir",
+            " -fprint",
+            " -fprint0",
+            " -fprintf",
+            " -fls",
+        ]
+        .iter()
+        .any(|flag| lower.contains(flag)),
+        "git diff" => lower.contains("--output") || lower.contains("--ext-diff"),
+        _ => false,
+    }
 }
 
 fn is_workspace_mutation_rule(rule: &str) -> bool {
@@ -1127,6 +1153,28 @@ shell:
                 command,
                 decision.decision
             );
+        }
+    }
+
+    #[test]
+    fn inspection_prefixes_with_side_effect_arguments_require_approval() {
+        let guard = PermissionGuard::new(PermissionConfig::default_runtime_foundation());
+
+        for command in [
+            "find . -delete",
+            "find src -exec rm -f {} ;",
+            "git diff --output=src/unplanned.patch",
+            "git diff --ext-diff",
+        ] {
+            let decision = guard.inspect(command);
+            assert_eq!(
+                decision.decision,
+                super::PermissionDecisionKind::Ask,
+                "command '{}' should require approval, got {:?}",
+                command,
+                decision.decision
+            );
+            assert!(decision.requires_approval);
         }
     }
 

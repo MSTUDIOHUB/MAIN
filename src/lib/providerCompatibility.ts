@@ -2,6 +2,7 @@ import {
   TOOL_FEEDBACK_ENVELOPE_PREFIX,
   parseToolFeedbackEnvelope,
 } from "./toolFeedbackEnvelope";
+import { buildProviderUnsupportedVisualContextNotice } from "./visualContext";
 
 export interface CompatibilityToolCall {
   id: string;
@@ -90,6 +91,34 @@ function hasImageContent(content: CompatibilityMessage["content"]): boolean {
   return Array.isArray(content) && content.some((part) => part.type === "image_url");
 }
 
+function countImageContent(content: CompatibilityMessage["content"]): number {
+  return Array.isArray(content)
+    ? content.filter((part) => part.type === "image_url").length
+    : 0;
+}
+
+export type CompatibilityImageHandling = "preserve" | "omit_unsupported";
+
+/**
+ * Detect errors that reject multimodal message content itself. Tool-schema
+ * fallback and image fallback are separate capabilities: an XML tool lane can
+ * still accept OpenAI-compatible image content.
+ */
+export function isProviderImageContentCompatibilityErrorMessage(message: string): boolean {
+  const normalized = String(message || "").toLowerCase();
+  if (
+    /\b(?:image_url|input_image|image|vision|multimodal)\b/.test(normalized) &&
+    /(?:unsupported|not supported|invalid|reject|cannot|can't|does not accept)/.test(normalized)
+  ) return true;
+  if (!isProviderCompatibilityErrorMessage(normalized)) return false;
+  return (
+    normalized.includes("unsupported content type") ||
+    /invalid type for messages\[\d+\]\.content/.test(normalized) ||
+    /messages\[\d+\]\.content.{0,80}(?:string|array|object)/.test(normalized) ||
+    /content.{0,50}(?:must be|expected).{0,30}string/.test(normalized)
+  );
+}
+
 function buildProviderCompatibilityInstructionText(
   workflowMode: "chat" | "edit" | "plan",
 ): string {
@@ -164,7 +193,11 @@ export function ensureProviderCompatibilityMode(
   return [...messages, buildProviderCompatibilitySystemMessage(workflowMode)];
 }
 
-export function buildCompatibilityRetryMessages(messages: CompatibilityMessage[]): CompatibilityMessage[] {
+export function buildCompatibilityRetryMessages(
+  messages: CompatibilityMessage[],
+  options: { imageHandling?: CompatibilityImageHandling } = {},
+): CompatibilityMessage[] {
+  const imageHandling = options.imageHandling || "preserve";
   const toolNamesByCallId = new Map<string, string>();
   for (const message of messages) {
     if (message.role !== "assistant" || !Array.isArray(message.tool_calls)) continue;
@@ -177,9 +210,12 @@ export function buildCompatibilityRetryMessages(messages: CompatibilityMessage[]
 
   return messages.map((message) => {
     const textContent = extractCompatibilityTextContent(message.content);
+    const imageCount = countImageContent(message.content);
     const compatibilityText = [
       textContent,
-      hasImageContent(message.content) ? "[Image omitted for provider compatibility retry]" : "",
+      imageCount > 0 && imageHandling === "omit_unsupported"
+        ? buildProviderUnsupportedVisualContextNotice(imageCount)
+        : "",
     ]
       .filter(Boolean)
       .join("\n\n")
@@ -189,6 +225,18 @@ export function buildCompatibilityRetryMessages(messages: CompatibilityMessage[]
       return {
         role: "assistant",
         content: compatibilityText || `[Tool call: ${message.tool_calls.map((tc) => tc.function.name).join(", ")}]`,
+      };
+    }
+
+    // XML/native-tool compatibility changes the tool-call representation, not
+    // the user's visual input. Preserve multimodal user content unless the
+    // provider explicitly rejected the content shape itself.
+    if (message.role === "user" && Array.isArray(message.content) && hasImageContent(message.content) && imageHandling === "preserve") {
+      return {
+        role: "user",
+        content: message.content.map((part) => part.type === "text"
+          ? { type: "text" as const, text: part.text }
+          : { type: "image_url" as const, image_url: { url: part.image_url.url } }),
       };
     }
 
@@ -257,7 +305,11 @@ export function buildTranscriptCompatibilityRetryMessages(
   messages: CompatibilityMessage[],
   workflowMode: "chat" | "edit" | "plan",
 ): CompatibilityMessage[] {
-  const flattened = buildCompatibilityRetryMessages(messages);
+  // A transcript retry is intentionally plain text. Record the visual loss as
+  // structured unsupported context so the model cannot pretend it saw images.
+  const flattened = buildCompatibilityRetryMessages(messages, {
+    imageHandling: "omit_unsupported",
+  });
   const transcript = flattened
     .map((message, index) => {
       const text = extractCompatibilityTextContent(message.content).trim();

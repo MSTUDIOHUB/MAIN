@@ -66,7 +66,17 @@ test("shell cwd is workspace-relative and can be applied to commands", () => {
 test("dangerous shell detection catches destructive command shapes", () => {
   assert.equal(looksDangerousShellCommand("git reset --hard HEAD"), true);
   assert.equal(looksDangerousShellCommand("rm -rf dist"), true);
+  assert.equal(looksDangerousShellCommand("rm build/output.txt"), true);
+  assert.equal(looksDangerousShellCommand("find . -delete"), true);
+  assert.equal(looksDangerousShellCommand("find src -exec rm -f {} ;"), true);
+  assert.equal(looksDangerousShellCommand("git diff --output=changes.patch"), true);
+  assert.equal(looksDangerousShellCommand("git diff --ext-diff"), true);
+  assert.equal(looksDangerousShellCommand("sort input.txt -o output.txt"), true);
+  assert.equal(looksDangerousShellCommand("sort --output=output.txt input.txt"), true);
   assert.equal(looksDangerousShellCommand("git status --short"), false);
+  assert.equal(looksDangerousShellCommand("find . -name package.json"), false);
+  assert.equal(looksDangerousShellCommand("git diff --stat"), false);
+  assert.equal(looksDangerousShellCommand("sort input.txt"), false);
 });
 
 test("run_command rejects long-running dev servers and watchers", () => {

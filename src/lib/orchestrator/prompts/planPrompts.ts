@@ -1,5 +1,4 @@
 
-import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import {
   type PlanTaskEvidenceAudit,
   describePlanValidationDecision,
@@ -7,69 +6,6 @@ import {
   isPlanTaskAwaitingExternalValidation,
   hasBrowserValidationCapability
 } from "../../workflowModels";
-
-export function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
-  language: "zh" | "en";
-  remainingText: string;
-  repeatedTargets: string[];
-  recentToolActivity: PlanToolActivitySummary[];
-  allowFileRead?: boolean;
-}): string {
-  const repeatedTargets = input.repeatedTargets.length > 0
-    ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
-    : input.language === "zh" ? "最近已读目标" : "recently read targets";
-  const recent = input.recentToolActivity
-    .slice(-4)
-    .map((item) => [item.status, item.name, item.target, item.detail].filter(Boolean).join(" "))
-    .join(input.language === "zh" ? "；" : "; ");
-
-  if (input.language === "en") {
-    return [
-      "The approved Plan is still executing, but recent steps did not satisfy the remaining trusted evidence.",
-      "Continue now. Do not stop and do not re-plan.",
-      `Repeated/known targets: ${repeatedTargets}`,
-      recent ? `Recent tool evidence: ${recent}` : "",
-      recent && /(?:failed|failure|error)/i.test(recent)
-        ? "Inspect the latest failed tool result and switch to a compatible validation or mutation action. Do not repeat the failed command or substitute a completion summary."
-        : "",
-      `Unsatisfied task: ${input.remainingText}`,
-      input.allowFileRead
-        ? "For the next response, MAIN keeps action tools plus targeted file reads available for exact-content or patch recovery. Use one only when needed, then patch or validate."
-        : "For the next response, MAIN keeps action tools plus patch-recovery `read_file` only when a patch mismatch just happened. Use `apply_patch`/`replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
-      "Do not call read/list/search again for the same cached target. If exact current content is needed, perform one targeted read and immediately continue with patching or validation.",
-    ].filter(Boolean).join("\n");
-  }
-
-  return [
-    "已批准的 Plan 仍在执行，但最近步骤尚未满足剩余的可信证据。",
-    "现在继续执行，不要停止，也不要重新规划。",
-    `重复/已知目标：${repeatedTargets}`,
-    recent ? `最近工具证据：${recent}` : "",
-    recent && /(?:failed|failure|error|失败|错误)/i.test(recent)
-      ? "请读取最近失败工具的结果并切换到兼容的验证或修改动作；不要重复失败命令，也不要用完成总结替代证据。"
-      : "",
-    `证据未满足任务：${input.remainingText}`,
-    input.allowFileRead
-      ? "下一轮 MAIN 会保留行动工具和定向文件读取，用于精确内容或 patch 恢复。只在需要时读一次，随后必须写入或验证。"
-      : "下一轮 MAIN 会保留行动工具；只有刚发生 patch 不匹配时才开放一次定向 `read_file`。请优先使用 `apply_patch` / `replace_in_file` / `write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
-    "不要再次对同一缓存目标调用 read/list/search；如果确实需要精确当前内容，只做一次定向读取，然后立即继续 patch 或验证。",
-  ].filter(Boolean).join("\n");
-}
-
-export function buildApprovedPlanSourceEditFirstPrompt(language: "zh" | "en"): string {
-  if (language === "en") {
-    return [
-      "Approved execution must start with real project action, not another exploration loop.",
-      "If the approved plan includes a source-file edit, the next tool call should be `apply_patch`, `replace_in_file`, or `write_file` against the named source file.",
-      "Do not read `.MAIN/plans/plan.md` again, and do not use `run_command`/`cat`/`head`/`grep`/`rg` to page source files before the first project write. Validation commands are for after the write.",
-    ].join("\n");
-  }
-  return [
-    "批准后的执行必须从真实项目动作开始，不能再次进入探索循环。",
-    "如果已批准计划包含源码修改，下一次工具调用应直接对命名源码文件使用 `apply_patch`、`replace_in_file` 或 `write_file`。",
-    "不要再次读取 `.MAIN/plans/plan.md`，也不要在第一次项目写入前用 `run_command`/`cat`/`head`/`grep`/`rg` 分页读取源码；验证命令应在写入之后再运行。",
-  ].join("\n");
-}
 
 export function formatPlanAuditRemainingTasks(
   audit: PlanTaskEvidenceAudit,
@@ -231,7 +167,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
   if (input.language === "zh") {
     return [
       "当前剩余任务需要浏览器级验证。下一步必须调用可用的 Browser/Playwright 工具，而不是继续用 curl、grep、cat 或重复启动 dev server。",
-      "验证策略：使用当前实际 dev server URL；打开页面；执行 DOM 断言；必要时截图；如果是 Markdown Viewer/test-sample.md 场景，读取样例内容后注入编辑器 textarea，触发 input，再检查 preview 中标题、代码块、表格、脚注、Mermaid 容器和关键样式。",
+      "验证策略：先复用已经确认 ready 的实际 dev server URL；只执行待验证任务中记录的结构化验证义务、动作和断言。任务要求交互时，必须执行对应动作并核对动作后的状态；未提供具体动作或断言时，只做通用的页面可达性和任务所需 DOM 状态检查，不臆造项目专用步骤。必要时截图。",
       "若 Browser/Playwright 工具调用失败或不可用，因自动浏览器证据缺失而如实暂停；可把具体人工复核写入结论建议，但不能用人工复核关闭自动验收缺口，也不要继续兜圈。",
       "待验证任务：",
       input.remainingText,
@@ -239,7 +175,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
   }
   return [
     "The remaining task requires browser-level validation. Next, call an available Browser/Playwright tool; do not keep using curl, grep, cat, or repeated dev-server starts.",
-    "Validation strategy: use the actual dev-server URL, open the page, run DOM assertions, and take a screenshot if needed. For Markdown Viewer/test-sample.md, read the sample content, inject it into the editor textarea, dispatch input, then assert the preview contains headings, code blocks, tables, footnotes, Mermaid containers, and key styles.",
+    "Validation strategy: reuse the actual dev-server URL only after readiness is confirmed, and perform only the structured validation obligation, action, and assertion recorded in the pending task. When interaction is required, perform that action and check the resulting state. If no concrete action or assertion is provided, use only a generic page-reachability and task-required DOM-state check; do not invent project-specific steps. Take a screenshot only when useful.",
     "If Browser/Playwright is unavailable or fails, pause honestly because automatic browser evidence is missing. You may list a concrete manual check as an advisory, but it cannot close the automatic acceptance gap; do not loop.",
     "Pending validation:",
     input.remainingText,

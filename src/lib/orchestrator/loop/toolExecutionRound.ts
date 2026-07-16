@@ -22,7 +22,6 @@ import {
   executeLocalFileReadToolWithReview,
   executeReadOnlyToolsConcurrently,
   executeWriteToolWithReview,
-  isReadFileRepeatLimitResult,
   logAgentEvent,
   parseToolCallArguments,
   readFileMetadataIfAvailable,
@@ -163,7 +162,6 @@ export async function executeToolExecutionRound(input: {
       ) {
         sawSuccessfulPtyObservation = true;
       }
-      const readFileRepeatLimitResult = isReadFileRepeatLimitResult(result);
       const narrowedNote = readFileWindowNarrowedNotes.get(result.toolCallId);
       let resultForModel = narrowedNote && !result.isError
         ? {
@@ -173,7 +171,7 @@ export async function executeToolExecutionRound(input: {
           }
         : result;
       const signature = readOnlyCallSignatures.get(result.toolCallId);
-      if (signature && !result.isError && !readFileRepeatLimitResult) {
+      if (signature && !result.isError) {
         readOnlyResultCache.set(signature, {
           name: result.name,
           target: result.target,
@@ -182,7 +180,7 @@ export async function executeToolExecutionRound(input: {
         readOnlyDuplicateSkipCounts.delete(signature);
       }
       const fileReadSignature = readOnlyCallSignatures.get(`${result.toolCallId}:file_read`);
-      if (fileReadSignature && result.name === "read_file" && !result.isError && !readFileRepeatLimitResult) {
+      if (fileReadSignature && result.name === "read_file" && !result.isError) {
         const parsedCall = readOnlyCalls.find((call) => call.id === result.toolCallId);
         const args = parsedCall ? parseToolCallArguments(parsedCall, workspace) : {};
         const path = typeof args.path === "string" ? args.path : result.target;

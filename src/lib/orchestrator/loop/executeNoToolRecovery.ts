@@ -5,12 +5,8 @@ import {
 import type { ResolvedUserIntent } from "../../runIntent";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
-  buildExecuteCompletionEvidencePrompt,
-  buildExecuteReplanningEvidencePrompt,
   buildNonActionableStopMessage,
   logAgentEvent,
-  looksLikeExecutionReplanningText,
-  looksLikeOperationCompletionClaim,
   MAX_NO_ACTION_RETRIES,
 } from "../../orchestrator";
 import type { OrchestratorCallbacks } from "../types";
@@ -83,13 +79,13 @@ export function handleExecuteNoToolRecovery(input: {
 
   if (effectiveToolCallCount > 0) return finish("none");
 
-  const isExecuteRuntimeWithoutEvidence = isExecuteRuntimeRequiringEvidence({
+  const isExecuteRuntime = isExecuteRuntimeRequiringEvidence({
     workflowMode,
     turnIntent,
     runtimeIntent,
   });
   if (
-    isExecuteRuntimeWithoutEvidence &&
+    isExecuteRuntime &&
     (input.protocolViolation === "required_tool_call_missing" ||
       input.protocolViolation === "required_function_call_mismatch" ||
       input.protocolViolation === "required_tool_call_not_available")
@@ -146,84 +142,6 @@ export function handleExecuteNoToolRecovery(input: {
     });
     return finish("continue");
   }
-  const rejectedExecuteCompletionClaim =
-    isExecuteRuntimeWithoutEvidence &&
-    finalReplyOptionsCount === 0 &&
-    !sawExecuteOperationEvidence &&
-    looksLikeOperationCompletionClaim(visibleText);
-  if (rejectedExecuteCompletionClaim) {
-    callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
-    callbacks.onStatusChange("running");
-    consecutiveNoToolCount += 1;
-    logAgentEvent("execute_completion_claim_without_evidence", {
-      iteration,
-      consecutiveNoToolCount,
-      workflowMode,
-      turnIntent,
-      runtimeIntent,
-      visibleChars: visibleText.length,
-    });
-
-    if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
-      logAgentEvent("loop_stop", {
-        reason: "execute_completion_claim_without_evidence",
-        iteration,
-        consecutiveNoToolCount,
-      });
-      callbacks.onNonActionableStop(
-        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
-        "no_action",
-      );
-      callbacks.onStatusChange("idle");
-      return finish("stopped");
-    }
-
-    callbacks.appendMessage({
-      role: "user",
-      content: buildExecuteCompletionEvidencePrompt(MODEL_CONTROL_LANGUAGE, consecutiveNoToolCount),
-    });
-    return finish("continue");
-  }
-
-  const rejectedExecuteReplanningText =
-    isExecuteRuntimeWithoutEvidence &&
-    finalReplyOptionsCount === 0 &&
-    !sawExecuteOperationEvidence &&
-    looksLikeExecutionReplanningText(visibleText);
-  if (rejectedExecuteReplanningText) {
-    callbacks.onStreamToken("__ESCALATION_RESET__:", assistantMsgId);
-    callbacks.onStatusChange("running");
-    consecutiveNoToolCount += 1;
-    logAgentEvent("execute_replanning_text_without_evidence", {
-      iteration,
-      consecutiveNoToolCount,
-      workflowMode,
-      turnIntent,
-      runtimeIntent,
-      visibleChars: visibleText.length,
-    });
-
-    if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
-      logAgentEvent("loop_stop", {
-        reason: "execute_replanning_text_without_evidence",
-        iteration,
-        consecutiveNoToolCount,
-      });
-      callbacks.onNonActionableStop(
-        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
-        "no_action",
-      );
-      callbacks.onStatusChange("idle");
-      return finish("stopped");
-    }
-
-    callbacks.appendMessage({
-      role: "user",
-      content: buildExecuteReplanningEvidencePrompt(MODEL_CONTROL_LANGUAGE, consecutiveNoToolCount),
-    });
-    return finish("continue");
-  }
-
   const shouldRecoverExecuteXmlText =
     shouldRecoverExecuteXmlTextWithoutAction({
       workflowMode,

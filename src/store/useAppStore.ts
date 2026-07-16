@@ -45,6 +45,7 @@ import {
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
 import { setMcpToolServerMap, type MCPServer, type MCPTool } from "../lib/mcpClient";
 import { sanitizePlanArtifactContent } from "../lib/sanitize";
+import { stripVisualObservationProtocolComments } from "../lib/sanitize";
 import {
   loadResolvedInstructions,
   type InstructionSource,
@@ -128,6 +129,7 @@ import {
   buildPlanExecutionProgressUpdate,
   isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
+  resolveApprovedPlanInitialExecutionRecovery,
   resolveApprovedPlanSameTurnFallbackDecision,
   toPlanExecutionRuntimeProgressUpdate,
 } from "../lib/planExecutionRecovery";
@@ -3033,7 +3035,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           turnId: b.turnId,
           ...persistedTurnPhase(b),
           type: "agent" as const,
-          content: String(b.content),
+          content: stripVisualObservationProtocolComments(String(b.content)),
           ...(b.hiddenProcess ? { hiddenProcess: true } : {}),
           ...(b.visibility ? { visibility: b.visibility } : {}),
           ...(b.archivedAfterChoice ? { archivedAfterChoice: true } : {}),
@@ -3384,11 +3386,19 @@ export function sanitizeAgentMessagesForPersist(messages: AgentMessage[]): Agent
     const content: string | ContentPart[] = Array.isArray(message.content)
       ? message.content.reduce<ContentPart[]>((parts, part) => {
           if (part.type === "text") {
-            parts.push({ type: "text", text: String(part.text ?? "") });
+            const text = String(part.text ?? "");
+            parts.push({
+              type: "text",
+              text: message.role === "assistant"
+                ? stripVisualObservationProtocolComments(text)
+                : text,
+            });
           }
           // Avoid persisting large data URLs in local storage snapshots.
           return parts;
         }, [])
+      : message.role === "assistant"
+      ? stripVisualObservationProtocolComments(String(message.content ?? ""))
       : String(message.content ?? "");
 
     return {
@@ -3627,6 +3637,9 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
     executionPlanTasks: latest.planTasks,
     normalizedApprovalChoice: latest.planApprovalChoice,
   });
+  const initialExecuteRecoveryState = resolveApprovedPlanInitialExecutionRecovery(
+    latest.planTasks,
+  );
 
   latest.updateConversationTurn(input.planTurnId, {
     status: "executing",
@@ -3702,8 +3715,16 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
       reuseCurrentTurn: true,
       turnIdOverride: input.planTurnId,
       preservePlanState: true,
-      resolvedIntent: "plan",
-      runtimeIntentOverride: "execute",
+      // Approval starts a new execute run. The reviewed Plan remains durable
+      // scope/evidence provenance through preservePlanState; it is no longer a
+      // second runtime mode that the tool layer has to reinterpret.
+      resolvedIntent: "execute",
+      ...(initialExecuteRecoveryState
+        ? {
+            forceExecuteRecoveryMode: initialExecuteRecoveryState.mode,
+            forceExecuteRecoveryState: initialExecuteRecoveryState,
+          }
+        : {}),
       executionConsentGranted: true,
       parentRunIdOverride: input.handoff.parentRunId || undefined,
       runIdOverride: input.handoff.executionRunId,

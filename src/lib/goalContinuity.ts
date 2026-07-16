@@ -9,7 +9,9 @@ import {
   EXECUTE_RECOVERY_MUTATION_TOOLS,
   isExecutePatchMismatchRecoveryActivity,
   isReadOnlyNoProgressDetail,
+  normalizeExecutionDecisionCheckpointSnapshot,
   normalizeExecuteRecoveryMode,
+  normalizeRecoveryReadLeaseSnapshot,
   resolveExecuteRecoveryActionContract,
   type ExecuteRecoveryContractPhase,
   type ExecuteRecoveryMode,
@@ -354,77 +356,6 @@ export interface GoalContinuationExecuteRecoveryState {
   decisionCheckpoint: ExecutionDecisionCheckpoint | null;
 }
 
-function normalizeRecoveryReadLease(value: unknown): RecoveryReadLease | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const candidate = value as Partial<RecoveryReadLease>;
-  const purpose = candidate.purpose;
-  const state = candidate.state;
-  const target = normalizeRecoveryTarget(candidate.target);
-  if (
-    !target ||
-    (purpose !== "initial_targeting" &&
-      purpose !== "patch_recovery" &&
-      purpose !== "missing_window" &&
-      purpose !== "context_restore" &&
-      purpose !== "post_mutation_verify") ||
-    (state !== "available" && state !== "active" && state !== "consumed")
-  ) {
-    return null;
-  }
-  const range = candidate.requestedRange && typeof candidate.requestedRange === "object"
-    ? candidate.requestedRange
-    : null;
-  const requestedRange = range
-    ? {
-        ...(Number.isFinite(range.startLine)
-          ? { startLine: Math.max(1, Math.floor(Number(range.startLine))) }
-          : {}),
-        ...(Number.isFinite(range.endLine)
-          ? { endLine: Math.max(1, Math.floor(Number(range.endLine))) }
-          : {}),
-        ...(Number.isFinite(range.maxLines)
-          ? { maxLines: Math.max(1, Math.floor(Number(range.maxLines))) }
-          : {}),
-      }
-    : null;
-  return {
-    purpose,
-    target,
-    ...(requestedRange && Object.keys(requestedRange).length > 0 ? { requestedRange } : {}),
-    observationKey: String(candidate.observationKey || "").trim() || null,
-    observedVersion: String(candidate.observedVersion || "").trim() || null,
-    mismatchFingerprint: String(candidate.mismatchFingerprint || "").trim() || null,
-    state,
-  };
-}
-
-function normalizeExecutionDecisionCheckpoint(value: unknown): ExecutionDecisionCheckpoint | null {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const candidate = value as Partial<ExecutionDecisionCheckpoint>;
-  const nextRequiredCapability = candidate.nextRequiredCapability;
-  if (
-    nextRequiredCapability !== "any" &&
-    nextRequiredCapability !== "targeted_read" &&
-    nextRequiredCapability !== "mutation" &&
-    nextRequiredCapability !== "validation" &&
-    nextRequiredCapability !== "launch_long_process" &&
-    nextRequiredCapability !== "recover_process" &&
-    nextRequiredCapability !== "reconcile_server" &&
-    nextRequiredCapability !== "observe_pty" &&
-    nextRequiredCapability !== "browser_validation"
-  ) {
-    return null;
-  }
-  return {
-    expectedTarget: normalizeRecoveryTarget(candidate.expectedTarget),
-    sourceObservationKey: String(candidate.sourceObservationKey || "").trim() || null,
-    nextRequiredCapability,
-    ...(candidate.evidenceVersion === undefined
-      ? {}
-      : { evidenceVersion: String(candidate.evidenceVersion || "").trim() || null }),
-  };
-}
-
 interface NormalizedGoalContinuationRecoverySnapshot {
   mode: ExecuteRecoveryMode;
   reason: string;
@@ -452,11 +383,15 @@ function normalizeGoalContinuationRecoverySnapshot(input: {
   sourceObservationKey?: string | null;
   decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
 }): NormalizedGoalContinuationRecoverySnapshot {
-  const mode = normalizeExecuteRecoveryMode(input.mode);
+  const requestedMode = normalizeExecuteRecoveryMode(input.mode);
   const expectedTarget = normalizeRecoveryTarget(input.expectedTarget);
-  const readLease = normalizeRecoveryReadLease(input.readLease);
+  const readLease = normalizeRecoveryReadLeaseSnapshot(input.readLease);
   const sourceObservationKey = String(input.sourceObservationKey || "").trim() || null;
-  const decisionCheckpoint = normalizeExecutionDecisionCheckpoint(input.decisionCheckpoint);
+  const decisionCheckpoint = normalizeExecutionDecisionCheckpointSnapshot(input.decisionCheckpoint);
+  const mode = requestedMode === "patch_recovery_read" &&
+    !(readLease && (readLease.state === "available" || readLease.state === "active"))
+    ? "mutation_first"
+    : requestedMode;
   const contract = resolveExecuteRecoveryActionContract(mode, {
     expectedTarget,
     readLease,
@@ -616,8 +551,8 @@ export function resolveGoalContinuationExecuteRecoveryState(
       detail: diagnostic,
     })) {
       recoveryState = buildGoalContinuationRecoveryState({
-        mode: "patch_recovery_read",
-        reason: "goal_continuation_patch_mismatch",
+        mode: "mutation_first",
+        reason: "goal_continuation_mutation_failure",
         target,
       });
       continue;

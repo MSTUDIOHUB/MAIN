@@ -61,7 +61,6 @@ export interface ReadFileEligibilityDecision {
   kind: ReadFileEligibilityKind;
   reason:
     | "transaction_scope_mismatch"
-    | "recovery_read_lease"
     | "missing_window"
     | "content_version_changed"
     | "context_window_evicted"
@@ -82,11 +81,10 @@ type ReadFileWindowCoveragePlan = ReturnType<typeof planReadFileWindowCoverage>;
 /**
  * Decide read eligibility before recovery-mode tool restrictions are applied.
  * The decision depends only on transaction scope, exact window/version state,
- * context residency, and an explicit one-shot lease.
+ * and context residency. Recovery cannot bypass this versioned cache.
  */
 export function resolveReadFileEligibilityDecision(input: {
   scopeMatches: boolean;
-  bypassCacheForLease: boolean;
   hasCachedWindow: boolean;
   observedVersion?: string | null;
   currentVersion?: string | null;
@@ -108,7 +106,6 @@ export function resolveReadFileEligibilityDecision(input: {
     contextEpoch,
   });
   if (!input.scopeMatches) return decision("scope_deferred", "transaction_scope_mismatch");
-  if (input.bypassCacheForLease) return decision("fresh_read", "recovery_read_lease");
   if (!input.hasCachedWindow) return decision("fresh_read", "missing_window");
   if (!observedVersion || !currentVersion || observedVersion !== currentVersion) {
     return decision("fresh_read", "content_version_changed");
@@ -386,8 +383,8 @@ export function buildFileUnchangedStub(state: FileReadState): string {
       `${FILE_UNCHANGED_STUB}: "${state.path}" has already been read with the same range/options, and the file is unchanged.`,
       `Previous read window: lines ${readFileWindow.returnedStartLine}-${readFileWindow.returnedEndLine} of ${readFileWindow.totalLines}, ${state.contentLength.toLocaleString()} result chars, file size ${state.sizeBytes.toLocaleString()} bytes, modified ${state.modifiedMs}, hash ${state.contentHash}.`,
       readFileWindow.nextStartLine
-        ? `This was not the whole file. Next: call read_file with start_line=${readFileWindow.nextStartLine} and max_lines to continue, or use start_line/end_line around the exact error line.`
-        : "This was not the whole file. Next: call read_file with a different start_line/end_line/max_lines range around the exact line you need.",
+        ? `This was not the whole file. Request lines at or after ${readFileWindow.nextStartLine} only if the current decision needs that missing range; otherwise continue to mutation or validation.`
+        : "This was not the whole file. Request a different window only after identifying the exact missing range needed for the current decision.",
       "Do not use run_command merely to page file contents; run_command is for tests, builds, diagnostics, and other shell work.",
     ].join("\n");
   }
@@ -396,7 +393,7 @@ export function buildFileUnchangedStub(state: FileReadState): string {
     `${FILE_UNCHANGED_STUB}: "${state.path}" has already been read with the same range/options, and the content is unchanged.`,
     `Previous read: ${state.contentLength.toLocaleString()} chars, file size ${state.sizeBytes.toLocaleString()} bytes, modified ${state.modifiedMs}, hash ${state.contentHash}.`,
     "Reuse the earlier file content already in context. Do not call read_file for this same file/range again unless you have reason to believe it changed.",
-    "Next: inspect a different file, use get_file_outline/grep_search for a narrower question, or continue the implementation/answer from the cached content.",
+    "Continue the implementation/answer from the cached content; inspect another target only when a concrete unresolved question requires it.",
   ].join("\n");
 }
 

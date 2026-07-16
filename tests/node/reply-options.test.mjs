@@ -203,7 +203,6 @@ test("screenshot-like diagnostic and self-directed numbered text never becomes a
     shouldPauseForReplyOptions({
       replyOptions: legacyInferredDiagnostics,
       toolCallCount: 2,
-      workflowMode: "plan",
       isPlanApproved: true,
       forcePause: true,
       finishReason: "tool_calls",
@@ -214,7 +213,6 @@ test("screenshot-like diagnostic and self-directed numbered text never becomes a
     shouldSuppressApprovedPlanExecutionReplyOptions({
       replyOptions: legacyInferredDiagnostics,
       toolCallCount: 2,
-      workflowMode: "plan",
       isPlanApproved: true,
       planStage: "executing",
     }),
@@ -250,7 +248,6 @@ test("explicit blocking choices remain available without tool calls, including o
     shouldSuppressApprovedPlanExecutionReplyOptions({
       replyOptions: explicitBlocking.replyOptions,
       toolCallCount: 0,
-      workflowMode: "plan",
       isPlanApproved: true,
       planStage: "executing",
     }),
@@ -297,7 +294,6 @@ test("approved plan execution ignores explicit but non-blocking workflow choices
     shouldPauseForReplyOptions({
       replyOptions: nonBlocking.replyOptions,
       toolCallCount: 0,
-      workflowMode: "plan",
       isPlanApproved: true,
       finishReason: "stop",
     }),
@@ -307,7 +303,6 @@ test("approved plan execution ignores explicit but non-blocking workflow choices
     shouldSuppressApprovedPlanExecutionReplyOptions({
       replyOptions: nonBlocking.replyOptions,
       toolCallCount: 0,
-      workflowMode: "plan",
       isPlanApproved: true,
       planStage: "executing",
     }),
@@ -1085,7 +1080,6 @@ test("approved plan execution suppresses stale approval options while tool calls
   assert.equal(
     shouldSuppressApprovedPlanExecutionReplyOptions({
       replyOptions,
-      workflowMode: "plan",
       isPlanApproved: true,
       planStage: "executing",
     }),
@@ -1096,7 +1090,7 @@ test("approved plan execution suppresses stale approval options while tool calls
     shouldPauseForReplyOptions({
       replyOptions: [],
       toolCallCount: 6,
-      workflowMode: "plan",
+      workflowMode: "edit",
       hasStructuredProposal: false,
       hasReadyPlanArtifacts: false,
       isPlanApproved: true,

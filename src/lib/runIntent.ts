@@ -720,6 +720,8 @@ export function buildEffectiveTurnContract(input: {
   planApproved?: boolean;
   planReviewReady?: boolean;
   executionConsentGranted?: boolean;
+  workspaceMutationExpected?: boolean;
+  workspaceValidationExpected?: boolean;
 }): EffectiveTurnContract {
   const conversationIntent = input.conversationIntent;
   const runtimeIntent =
@@ -737,15 +739,21 @@ export function buildEffectiveTurnContract(input: {
     directiveKind === "plan_resume" ||
     directiveKind === "plan_approval";
   const mutationExpected =
-    runtimeIntent === "execute" ||
     runtimeIntent === "studio_workflow" ||
-    (conversationIntent === "plan" && input.planApproved === true) ||
+    (
+      input.planApproved === true &&
+      input.workspaceMutationExpected !== false
+    ) ||
     directiveKind === "file_modify" ||
-    directiveKind === "shell" ||
-    directiveKind === "git" ||
     directiveKind === "studio";
   const validationExpected =
     mutationExpected ||
+    (
+      input.planApproved === true &&
+      input.workspaceValidationExpected !== false
+    ) ||
+    directiveKind === "shell" ||
+    directiveKind === "git" ||
     directiveKind === "unity" ||
     directiveKind === "mcp";
   const isUnapprovedPlanDraft =
@@ -775,7 +783,7 @@ export function buildEffectiveTurnContract(input: {
     ? "awaiting_review"
     : "not_ready";
   const completionEvidenceRequired: EffectiveTurnCompletionEvidence =
-    mutationExpected
+    mutationExpected || validationExpected
       ? "execution_evidence"
       : conversationIntent === "plan"
       ? "plan_artifact"

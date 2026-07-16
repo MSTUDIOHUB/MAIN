@@ -6,6 +6,9 @@ import {
   isLikelySourceMutationTask,
   isRuntimeTaskMutationSectionHeading,
   isPlanTaskSourceMutationObligation,
+  isUserRequestValidationTask,
+  mergeRuntimeValidationTaskRequirements,
+  mergeUserRequestValidationIntoRuntimeTasks,
   normalizeRuntimePlanSectionHeadings,
   reconcilePlanTaskCompletion,
   validateActionablePlanArtifact,
@@ -318,6 +321,25 @@ export function ensureApprovedPlanRuntimeTasksForState(
   language: "zh" | "en",
 ): PlanTask[] {
   const hasPersistedTasksArtifact = state.planArtifacts.some((artifact) => artifact.kind === "tasks");
+  const currentPlanTurn = state.currentTurnId
+    ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)
+    : null;
+  const durableUserValidationTasks = state.planTasks.filter(isUserRequestValidationTask);
+  const withUserRequestValidation = (tasks: PlanTask[]): PlanTask[] => {
+    const withDurableValidation = mergeRuntimeValidationTaskRequirements(
+      tasks,
+      durableUserValidationTasks,
+    );
+    return normalizeApprovedPlanTaskStatuses(
+      mergeUserRequestValidationIntoRuntimeTasks(
+        withDurableValidation,
+        currentPlanTurn?.userPrompt || "",
+        { language, maxTasks: 4 },
+      ),
+      state.planExecutionEvidenceLedger,
+      state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
+    );
+  };
   if (state.planTasks.length > 0) {
     const normalizedTasks = normalizeApprovedPlanTaskStatuses(
       state.planTasks,
@@ -330,7 +352,7 @@ export function ensureApprovedPlanRuntimeTasksForState(
         maxTasks: 8,
       });
       if (derivedRuntimeTasks.length > 0) {
-        return reconcilePlanTaskCompletion(
+        return withUserRequestValidation(reconcilePlanTaskCompletion(
           normalizedTasks,
           derivedRuntimeTasks,
           state.planExecutionEvidenceLedger,
@@ -338,18 +360,18 @@ export function ensureApprovedPlanRuntimeTasksForState(
             preserveMissing: false,
             highlightNext: state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
           },
-        );
+        ));
       }
     }
-    return normalizedTasks;
+    return withUserRequestValidation(normalizedTasks);
   }
   if (hasPersistedTasksArtifact) {
-    return state.planTasks;
+    return withUserRequestValidation(state.planTasks);
   }
-  return deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
+  return withUserRequestValidation(deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
     language,
     maxTasks: 8,
-  });
+  }));
 }
 
 export function formatPlanTaskListForPrompt(tasks: PlanTask[], language: "zh" | "en", limit = 12): string {

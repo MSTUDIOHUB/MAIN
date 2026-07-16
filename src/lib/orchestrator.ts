@@ -80,7 +80,12 @@ import {
   buildPlanRecoveryPromptFromContext,
   resolvePlanClosureArtifactKind,
 } from "./orchestrator/planOrchestration";
-import { stripControlPromptForPlanFallback } from "./orchestrator/prompts/planPrompts";
+import {
+  detectRequestedRootMarkdownDeliverables,
+  isPlanControlUserPrompt,
+  isPlanRuntimeInstructionMemory,
+  stripControlPromptForPlanFallback,
+} from "./orchestrator/prompts/planPrompts";
 
 export {
   buildExecuteXmlTextActionRecoveryPrompt,
@@ -102,25 +107,33 @@ export {
 export {
   buildPlanReadOnlyConvergencePrompt,
 } from "./orchestrator/planOrchestration";
+export {
+  buildExecuteConvergencePrompt,
+  buildHiddenThoughtOnlyContinuationPrompt,
+  buildReadOnlyPermissionHardRecoveryPrompt,
+  looksLikeOperationCompletionClaim,
+  looksLikePlanCompletionClaim,
+} from "./orchestrator/prompts/executePrompts";
+export {
+  buildApprovedPlanNoToolPauseMessage,
+  buildApprovedPlanValidationPendingMessage,
+  buildBrowserValidationContinuationPrompt,
+  formatPlanAuditRemainingTasks,
+  resolveApprovedPlanValidationBoundary,
+} from "./orchestrator/prompts/planPrompts";
 import {
   type SessionAutoApproveScope,
   type ToolLifecycleState,
 } from "./runtimeTools";
 import type { AppConfig, Skill } from "./appTypes";
 import {
-  buildPlanTaskEvidenceAudit,
   canonicalizePlanArtifactPath,
   classifyPlanArtifactQualityResult,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
   getPendingPlanTaskCommandFocus,
-  hasBrowserValidationCapability,
-  describePlanValidationDecision,
-  isPlanTaskAwaitingBrowserValidation,
-  isPlanTaskAwaitingExternalValidation,
   isEphemeralPlanArtifactPath,
-  planTaskHasUnsatisfiedSourceMutationEvidence,
   isPlanTaskTrustedComplete,
   analyzePlanDecisionFork,
   repairActionablePlanArtifactContent,
@@ -131,7 +144,6 @@ import {
   type PlanExecutionEvidenceEntry,
   type PlanExecutionProgressUpdate,
   type PlanRuntimePhase,
-  type PlanTaskEvidenceAudit,
   type PlanTask,
   type ReplyOption,
 } from "./workflowModels";
@@ -164,6 +176,9 @@ import {
   hasProviderNativeToolsDisabled,
 } from "./providerCompatibility";
 import {
+  latestVisualContextIsModelVisible,
+} from "./visualContext";
+import {
   getModelInstructionProfile,
   normalizeCloudToolProtocol,
   normalizeLocalToolProtocol,
@@ -180,10 +195,6 @@ import {
   type PlanMaxIterationsCheckpoint,
   type PlanToolActivitySummary,
 } from "./planExecutionRecovery";
-import {
-  isApprovedPlanRecoveryToolName,
-  isApprovedPlanSourceEditFirstToolName,
-} from "./approvedPlanRecoveryTools";
 import {
   type ExecuteRecoveryContractPhase,
   type ExecuteRecoveryMode,
@@ -230,7 +241,7 @@ import {
 } from "./progressNarration";
 import { shouldUseRustProxyForLocalProvider } from "./localProviderRouting";
 import type { ShellPermissionApproval, ShellPermissionDecision } from "./ipc";
-import { resolveShellAutoApproval } from "./shellAutoApproval";
+import { canApplyShellAutoReview, resolveShellAutoApproval } from "./shellAutoApproval";
 import {
   isPlanReadOnlyToolName,
 } from "./planReadOnlyConvergence";
@@ -316,13 +327,14 @@ function getMessageContentText(content: AgentMessage["content"]): string {
     .join("\n");
 }
 
-export function hasPlanUserContextObservation(messages: AgentMessage[], latestAssistantText = ""): boolean {
-  const assistantTexts = messages
-    .filter((message) => message.role === "assistant")
-    .map((message) => getMessageContentText(message.content))
-    .concat(latestAssistantText)
-    .join("\n");
-  return /(?:截图观察|从截图(?:中)?(?:我)?观察到|图片中可见|图\s*\d|screenshot observations|screenshot shows|image shows|visible in the provided image)/i.test(assistantTexts);
+export function hasPlanVisualContextGrounding(
+  messages: AgentMessage[],
+  turnId?: string | null,
+): boolean {
+  // This is transport grounding, not proof that the model interpreted the
+  // screenshot correctly. Never promote free-form assistant prose to visual
+  // evidence.
+  return latestVisualContextIsModelVisible(messages, turnId);
 }
 
 export function filterPlanRuntimeToolDefinitionsForPhase(input: {
@@ -464,7 +476,6 @@ export function computeContextForceReason(input: {
     return result(true, "tool_message_threshold");
   }
   if (
-    input.workflowMode === "plan" &&
     input.isPlanApproved &&
     input.iteration > 1 &&
     input.iteration % FORCE_CONTEXT_TOOL_LOOP_INTERVAL === 0 &&
@@ -1027,8 +1038,8 @@ export function buildShellReadValidationError(
   if (isShellRead) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
-      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 绕过文件读取工具。原因不是终端本身占用系统内存，而是 cat/sed/head/tail 的原始输出绕过 read_file 的分页、文件版本和重复窗口缓存，容易把相同内容反复灌入 LLM 上下文。read_file 可用时请使用 read_file + start_line/max_lines；恢复模式未开放 read_file 时，请使用 grep_search/get_file_outline 或基于已有缓存直接 patch/验证/最终说明。`
-      : `SHELL_READ_FORBIDDEN: Do not bypass the file-reading tools with terminal command (${command}). The issue is not terminal memory use: raw cat/sed/head/tail output bypasses read_file paging, file-version checks, and duplicate-window caching, so identical content can be injected into the LLM context repeatedly. Use read_file with start_line/max_lines when available; if recovery mode has not exposed read_file, use grep_search/get_file_outline or proceed from cached context to patching, validation, or the final answer.`;
+      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 绕过文件读取工具。原因不是终端占用上下文，而是 cat/sed/head/tail 的原始输出绕过 read_file 的分页、文件版本、范围缓存和修改后失效语义。请使用 read_file；文件版本变化、新范围、上下文淘汰、补丁失配或修改后核验都允许复读，同版本同窗口仍在上下文时会返回缓存 stub，应直接转向修改、验证或精确阻塞。`
+      : `SHELL_READ_FORBIDDEN: Do not bypass file tools with terminal command (${command}). The issue is not terminal context use: raw cat/sed/head/tail output bypasses read_file paging, version checks, range caching, and post-mutation invalidation. Use read_file instead. A changed version, new range, evicted context, patch mismatch, or post-mutation check permits another read; the same active version/window returns a cache stub and should lead to mutation, validation, or an exact blocker.`;
     const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
     emitToolPreflightBlocked(callbacks, {
@@ -1519,6 +1530,8 @@ export interface OrchestratorCallbacks {
       diff?: ToolDiffPreview;
       internalFeedback?: boolean;
       qualityGateReason?: string | null;
+      /** Exact structured payload for evidence parsing when the UI result is truncated. */
+      evidenceResult?: string;
     },
   ) => void;
   /** Structured post-execution observation used by non-UI evidence collectors. */
@@ -1803,36 +1816,6 @@ export function buildNoProgressBatchSignature(results: ToolExecutionResult[]): s
   return fragments.join("||");
 }
 
-export function isApprovedPlanRecoveryTool(
-  tool: ToolDefinition,
-  options: { allowFileRead?: boolean } = {},
-): boolean {
-  return isApprovedPlanRecoveryToolName(tool.function.name, PLAN_EXPLORATION_READ_ONLY_TOOLS, options);
-}
-
-export function isApprovedPlanSourceEditFirstTool(
-  tool: ToolDefinition,
-  options: { allowFileRead?: boolean; preservePtyLifecycle?: boolean } = {},
-): boolean {
-  return isApprovedPlanSourceEditFirstToolName(tool.function.name, options);
-}
-
-export function approvedPlanNeedsSourceEditBeforeValidation(
-  tasks: PlanTask[],
-  evidenceLedger: PlanExecutionEvidenceEntry[],
-): boolean {
-  if (!Array.isArray(tasks) || tasks.length === 0) return false;
-  const audit = buildPlanTaskEvidenceAudit({
-    tasks,
-    evidenceLedger,
-    preserveMissing: true,
-    highlightNext: true,
-  });
-  return audit.remainingTasks.some((task) =>
-    planTaskHasUnsatisfiedSourceMutationEvidence(task, evidenceLedger)
-  );
-}
-
 function looksLikeProseCodeDump(text: string): boolean {
   const content = text.trim();
   if (content.length < PROSE_CODE_DUMP_MIN_CHARS) return false;
@@ -1940,393 +1923,6 @@ export function isSuccessfulPlanArtifactWriteResult(result: ToolExecutionResult)
   );
 }
 
-export function buildHiddenThoughtOnlyContinuationPrompt(language: "zh" | "en", consecutiveNoToolCount: number): string {
-  return language === "zh"
-    ? [
-        `上一条回复只有后台思考，没有给用户可见结论（第 ${consecutiveNoToolCount} 次）。`,
-        "你已经读取/搜索了上下文；现在必须直接输出面向用户的 Markdown 结论。",
-        "不要继续只返回 thinking/analysis 标签；除非真的缺少关键证据，否则不要再读同一批文件。",
-        "结论至少包含：是否已经实现、哪些证据支持、仍缺什么或下一步。",
-      ].join("\n")
-    : [
-        `The previous reply only contained hidden thinking and no user-visible conclusion (${consecutiveNoToolCount} time).`,
-        "You have already read/searched the context; now output a user-visible Markdown conclusion.",
-        "Do not return only thinking/analysis tags again. Do not reread the same files unless a key fact is still missing.",
-        "Include at least: whether it is implemented, supporting evidence, and what is still missing or next.",
-      ].join("\n");
-}
-
-export function buildExecuteConvergencePrompt(language: "zh" | "en", iteration: number, maxIterations: number): string {
-  return language === "zh"
-    ? [
-        `本轮 Execute 已进行 ${iteration}/${maxIterations} 轮工具循环，接近安全边界。`,
-        "MAIN 会临时收窄工具面：宽泛读取和搜索都会被收起，只保留小补丁/写入工具以及有限命令或浏览器验证。",
-        "请先根据已有工具结果判断任务是否已经完成：如果完成，直接输出最终总结并停止，不要再调用工具。",
-        "如果 read_file 当前不可用，不要继续请求 read_file，也不要改用 cat/sed/head/tail 通过 shell 读取文件。",
-        "如果 grep_search/get_file_outline 已经给出足够定位信息，请直接用 replace_in_file/apply_patch 做最小修改，或运行一次验证命令；不要再调用新的搜索/泛读工具。",
-        "不要在文件和上下文都未变化时重复同一读取窗口、重复同一验证或继续修改同一目标而没有新证据；修改后的复读和新的必要范围属于有效验证。",
-      ].join("\n")
-    : [
-        `This Execute turn has reached ${iteration}/${maxIterations} tool-loop iterations and is approaching the safety boundary.`,
-        "MAIN will temporarily narrow the tool surface: broad reads and searches are withheld, leaving small patch/write tools plus finite command or browser validation.",
-        "First decide from existing tool results whether the task is already complete. If it is complete, output the final summary and stop without more tools.",
-        "If read_file is unavailable, do not keep requesting read_file and do not switch to cat/sed/head/tail shell file reads.",
-        "If grep_search/get_file_outline already provide enough location context, directly apply the smallest replace_in_file/apply_patch edit or run one validation command; do not call new search or broad read tools.",
-        "Do not repeat the same read window or validation while file/context state is unchanged, or keep editing the same target without new evidence; a post-mutation reread or a newly required range is valid verification.",
-    ].join("\n");
-}
-
-export function looksLikePlanCompletionClaim(text: string): boolean {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  if (!normalized) return false;
-  return (
-    /(?:全部|所有|全[部都]?|已|已经).{0,24}(?:完成|满足|通过)|(?:任务|证据).{0,16}(?:全部|全都).{0,16}(?:完成|满足|通过)|\b\d+\s*\/\s*\d+\b.{0,24}(?:完成|complete|completed|done|satisfied|passed)/i.test(normalized) ||
-    /(?:all|every).{0,40}(?:task|evidence|item).{0,40}(?:complete|completed|done|satisfied|passed)|(?:complete|completed|done|satisfied).{0,40}(?:all|every).{0,40}(?:task|evidence|item)/i.test(normalized)
-  );
-}
-
-export function looksLikeOperationCompletionClaim(text: string): boolean {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  if (!normalized) return false;
-  const hasCompletionClaim =
-    /(?:已|已经|现已|刚刚|成功).{0,24}(?:修复|修改|实现|更新|写入|生成|执行|完成|验证|通过)|(?:修复|修改|实现|更新|写入|生成|执行|验证).{0,16}(?:完成|好了|成功|通过)|(?:done|fixed|implemented|patched|updated|completed|wrote|created|generated|ran|verified|passed)\b/i.test(normalized);
-  if (!hasCompletionClaim) return false;
-  const looksLikeProposalOnly =
-    /(?:方案|建议|计划|将会|可以|应该|准备|下一步|如果|待|需要用户|是否|proposal|plan|suggest|would|will|should|can|could|next step|ready to|once)/i.test(normalized) &&
-    !/(?:已|已经|成功)|\b(?:done|fixed|implemented|patched|updated|completed|verified|passed)\b/i.test(normalized);
-  return !looksLikeProposalOnly;
-}
-
-export function looksLikeExecutionReplanningText(text: string): boolean {
-  const normalized = String(text || "").replace(/\s+/g, " ").trim();
-  if (normalized.length < 240) return false;
-  const hasPlanShape =
-    /(?:修复方案|实现方案|执行方案|实施步骤|下一步|计划|方案|建议|Proposal|Implementation Plan|Execution Plan|Next steps?)/i.test(normalized);
-  const hasFutureAction =
-    /(?:将|会|建议|可以|应该|需要|下一步|准备|开始|执行|修改|修复|实现|验证|will|would|should|can|could|need to|next|propose|recommend|start|execute|modify|fix|implement|verify)/i.test(normalized);
-  const hasConcreteWork =
-    /(?:src\/|\.tsx?|\.jsx?|\.py|\.rs|\.go|\.json|\.md|read_file|write_file|replace_in_file|run_command|browser_evaluate|文件|代码|接口|组件|测试|验证|file|code|component|test|validation)/i.test(normalized);
-  return hasPlanShape && hasFutureAction && hasConcreteWork && !looksLikeOperationCompletionClaim(normalized);
-}
-
-export function buildExecuteCompletionEvidencePrompt(language: "zh" | "en", retryCount: number): string {
-  if (language === "en") {
-    return [
-      "The previous reply claimed the operation was complete, but MAIN has no real tool evidence for this execution turn.",
-      "Do not repeat the completion claim. Start real tool actions now: inspect the relevant files, write or patch files if needed, run the necessary command/verification, then summarize only after tool results exist.",
-      retryCount > 1 ? "This is a repeated failure. If you cannot perform the operation, stop and state the exact blocker instead of claiming success." : "",
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "上一条回复声称操作已完成，但 MAIN 没有看到本轮执行的真实工具证据。",
-    "不要重复完成声明。现在必须开始真实工具操作：读取相关文件，必要时写入或打补丁，运行必要命令/验证，然后只能基于工具结果总结。",
-    retryCount > 1 ? "这已经是重复失败。如果无法执行，请明确说明具体阻塞，不要声称成功。" : "",
-  ].filter(Boolean).join("\n");
-}
-
-export function buildExecuteReplanningEvidencePrompt(language: "zh" | "en", retryCount: number): string {
-  if (language === "en") {
-    return [
-      "The user already approved execution for this turn, but the previous reply produced another plan instead of real tool evidence.",
-      "Do not re-plan. Start the smallest necessary real tool action now: write/patch files, run a command, use Browser/Playwright validation, or pause with the exact blocker.",
-      retryCount > 1 ? "This is a repeated failure. Stop with a concrete blocker if no real action is possible." : "",
-    ].filter(Boolean).join("\n");
-  }
-  return [
-    "用户已经批准本轮执行，但上一条回复又输出了新的方案，没有产生真实工具证据。",
-    "不要重新规划。现在必须开始最小必要的真实工具动作：写入/替换文件、运行命令、调用 Browser/Playwright 验证，或明确暂停说明具体阻塞。",
-    retryCount > 1 ? "这已经是重复失败。如果无法真实执行，请直接给出具体阻塞，不要继续输出方案。" : "",
-  ].filter(Boolean).join("\n");
-}
-
-export function buildReadOnlyPermissionHardRecoveryPrompt(language: "zh" | "en", workflowMode: "chat" | "edit" | "plan"): string {
-  if (language === "en") {
-    return [
-      "The user already allowed read-only inspection for this session, but the previous turn still did not make useful tool progress.",
-      "Do not ask for permission again and do not narrate a future read.",
-      workflowMode === "plan"
-        ? "If the evidence is sufficient, output visible `<proposed_plan>` for MAIN runtime to materialize; if one fact is still missing, call exactly one targeted read/search tool now. Reuse cached content instead of rereading it."
-        : "If you need evidence, call one targeted read/search tool now. If the target was already cached, reuse the existing content and move to the next real action: patch/write, run a finite command, browser validation, or state the exact blocker.",
-    ].join("\n");
-  }
-  return [
-    "用户已经允许本会话的只读检查，但上一轮仍没有产生有效工具进展。",
-    "不要再次询问许可，也不要只描述接下来要读取什么。",
-    workflowMode === "plan"
-      ? "如果证据已经足够，直接输出可见 `<proposed_plan>` 交由 MAIN runtime 物化；如果只缺一个事实，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取。"
-      : "如果还需要证据，现在只调用一次定向读取/搜索工具。仅当同一未变化版本和范围仍在上下文时复用缓存；不同范围或文件已变化时可以读取，然后进入写入/替换、有限命令、浏览器验证或精确阻塞。",
-  ].join("\n");
-}
-
-export function buildApprovedPlanNoProgressStrategySwitchPrompt(input: {
-  language: "zh" | "en";
-  remainingText: string;
-  repeatedTargets: string[];
-  recentToolActivity: PlanToolActivitySummary[];
-  allowFileRead?: boolean;
-}): string {
-  const repeatedTargets = input.repeatedTargets.length > 0
-    ? input.repeatedTargets.join(input.language === "zh" ? "、" : ", ")
-    : input.language === "zh" ? "最近已读目标" : "recently read targets";
-  const recent = input.recentToolActivity
-    .slice(-4)
-    .map((item) => [item.status, item.name, item.target, item.detail].filter(Boolean).join(" "))
-    .join(input.language === "zh" ? "；" : "; ");
-
-  if (input.language === "en") {
-    return [
-      "The approved Plan is still executing, but the last read-only batch reused already-known file content and did not create action evidence.",
-      "Continue now. Do not stop and do not re-plan.",
-      `Repeated/known targets: ${repeatedTargets}`,
-      recent ? `Recent tool evidence: ${recent}` : "",
-      `Unsatisfied task: ${input.remainingText}`,
-	      input.allowFileRead
-	        ? "For the next response, MAIN keeps action tools plus targeted file reads available for exact-content or patch recovery. Use one only when needed, then patch or validate."
-	        : "For the next response, MAIN keeps action tools plus patch-recovery `read_file` only when a patch mismatch just happened. Use `apply_patch`/`replace_in_file`/`write_file`, run a command, use Browser/Playwright validation, or state the exact blocker if no real action is possible.",
-	      input.allowFileRead
-	        ? "Do not call read/list/search again for the same cached target. If exact current content is needed, perform one targeted read and immediately continue with patching or validation."
-	        : "Do not call read/list/search again for the same cached target. If exact current content is still missing, state that blocker instead of requesting an unavailable read tool.",
-	    ].filter(Boolean).join("\n");
-	  }
-
-  return [
-    "已批准的 Plan 仍在执行，但上一批只读工具只是复用了已知文件内容，没有产生行动证据。",
-    "现在继续执行，不要停止，也不要重新规划。",
-    `重复/已知目标：${repeatedTargets}`,
-    recent ? `最近工具证据：${recent}` : "",
-    `证据未满足任务：${input.remainingText}`,
-	    input.allowFileRead
-	      ? "下一轮 MAIN 会保留行动工具和定向文件读取，用于精确内容或 patch 恢复。只在需要时读一次，随后必须写入或验证。"
-	      : "下一轮 MAIN 会保留行动工具；只有刚发生 patch 不匹配时才开放一次定向 `read_file`。请优先使用 `apply_patch` / `replace_in_file` / `write_file` 修改，运行命令，执行 Browser/Playwright 验证，或说明无法真实行动的具体阻塞。",
-	    input.allowFileRead
-	      ? "不要再次对同一缓存目标调用 read/list/search；如果确实需要精确当前内容，只做一次定向读取，然后立即继续 patch 或验证。"
-	      : "不要再次对同一缓存目标调用 read/list/search；如果仍缺精确当前内容，请说明这是阻塞点，不要请求当前工具面不可用的读取工具。",
-	  ].filter(Boolean).join("\n");
-}
-
-function buildApprovedPlanSourceEditFirstPrompt(language: "zh" | "en"): string {
-  if (language === "en") {
-    return [
-      "Approved execution must start with real project action, not another exploration loop.",
-      "If the approved plan includes a source-file edit, the next tool call should be `apply_patch`, `replace_in_file`, or `write_file` against the named source file.",
-      "Do not read `.MAIN/plans/plan.md` again, and do not use `run_command`/`cat`/`head`/`grep`/`rg` to page source files before the first project write. Validation commands are for after the write.",
-    ].join("\n");
-  }
-  return [
-    "批准后的执行必须从真实项目动作开始，不能再次进入探索循环。",
-    "如果已批准计划包含源码修改，下一次工具调用应直接对命名源码文件使用 `apply_patch`、`replace_in_file` 或 `write_file`。",
-    "不要再次读取 `.MAIN/plans/plan.md`，也不要在第一次项目写入前用 `run_command`/`cat`/`head`/`grep`/`rg` 分页读取源码；验证命令应在写入之后再运行。",
-  ].join("\n");
-}
-
-export function formatPlanAuditRemainingTasks(
-  audit: PlanTaskEvidenceAudit,
-  language: "zh" | "en",
-  fallback: string,
-  limit = 8,
-): string {
-  const lines = audit.remainingTasks.slice(0, limit).map((task, index) => {
-    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
-      (language === "zh" ? "缺少证据标签" : "missing evidence label");
-    const status = task.evidenceStatus || task.status || "missing";
-    const reason = task.blockedReason || (language === "zh" ? "证据未满足" : "evidence is not satisfied");
-    return `- ${index + 1}. ${task.text} [${status}; ${evidence}] - ${reason}`;
-  });
-  return lines.length > 0 ? lines.join("\n") : fallback;
-}
-
-function formatApprovedPlanNoToolAvailableTools(
-  language: "zh" | "en",
-  toolNames?: Iterable<string> | null,
-): string {
-  if (!toolNames) return "";
-  const available = new Set(Array.from(toolNames).map((name) => String(name || "")));
-  const preferred = [
-    "read_file",
-    "apply_patch",
-    "replace_in_file",
-    "write_file",
-    "run_command",
-    "execute_command",
-    "browser_evaluate",
-  ].filter((name) => available.has(name));
-  if (preferred.length === 0) return "";
-  return language === "zh"
-    ? `本轮已开放关键工具：${preferred.map((name) => `\`${name}\``).join("、")}。暂停原因不是工具缺失，而是模型没有按执行协议调用工具。`
-    : `Key tools were available this turn: ${preferred.map((name) => `\`${name}\``).join(", ")}. This pause is not caused by missing tools; the model did not follow the execution protocol and call one.`;
-}
-
-export function buildApprovedPlanNoToolPauseMessage(
-  language: "zh" | "en",
-  remainingText: string,
-  consecutiveNoToolCount: number,
-  audit?: PlanTaskEvidenceAudit,
-  completionClaimRejected = false,
-  availableToolNames?: Iterable<string> | null,
-): string {
-  const auditLine = audit && audit.totalCount > 0
-    ? language === "zh"
-      ? `可信审计进度：${audit.completedCount}/${audit.totalCount}`
-      : `Trusted audit progress: ${audit.completedCount}/${audit.totalCount}`
-    : "";
-  const availableToolsLine = formatApprovedPlanNoToolAvailableTools(language, availableToolNames);
-
-  return language === "zh"
-    ? [
-        completionClaimRejected ? "完成声明未验证" : "计划执行已暂停",
-        "",
-        completionClaimRejected
-          ? `原因：模型声称计划已完成，但可信任务审计没有通过；模型正文不会被当作完成证据。`
-          : `原因：模型连续 ${consecutiveNoToolCount} 次提前停止，返回了正文但没有继续调用工具；当前任务清单仍有证据未满足的任务。`,
-        "已保留当前 workspace、工具结果和任务证据，不会把这次正文当作完成证据。",
-        ...(auditLine ? [auditLine] : []),
-        ...(availableToolsLine ? [availableToolsLine] : []),
-        "",
-        "未完成任务：",
-        remainingText,
-        "",
-        "下一步：点击 Resume Execution 后，MAIN 应先重新读取当前 workspace 状态，再选择证据未满足且与当前诊断最相关的任务继续。",
-        "",
-        "RecoveryDetails:",
-        "- type: remaining_plan_tasks_limit",
-        `- noToolStops: ${consecutiveNoToolCount}`,
-        `- completionClaimRejected: ${completionClaimRejected ? "true" : "false"}`,
-        "- action: Resume Execution",
-      ].join("\n")
-    : [
-        completionClaimRejected ? "Completion claim not accepted" : "Plan execution paused",
-        "",
-        completionClaimRejected
-          ? "Reason: the model claimed the plan was complete, but the trusted task audit did not pass. Assistant prose is not completion evidence."
-          : `Reason: the model stopped early ${consecutiveNoToolCount} time(s), returned prose, and did not continue with tool calls while the current task list still has unsatisfied evidence.`,
-        "MAIN preserved the current workspace, tool results, and evidence ledger. This prose is not treated as completion evidence.",
-        ...(auditLine ? [auditLine] : []),
-        ...(availableToolsLine ? [availableToolsLine] : []),
-        "",
-        "Remaining tasks:",
-        remainingText,
-        "",
-        "Next: click Resume Execution so MAIN rereads current workspace state and continues with the evidence-unsatisfied task that best matches the current diagnosis.",
-        "",
-        "RecoveryDetails:",
-        "- type: remaining_plan_tasks_limit",
-        `- noToolStops: ${consecutiveNoToolCount}`,
-        `- completionClaimRejected: ${completionClaimRejected ? "true" : "false"}`,
-        "- action: Resume Execution",
-      ].join("\n");
-}
-
-function formatPendingValidationTasks(
-  audit: PlanTaskEvidenceAudit,
-  language: "zh" | "en",
-  browserValidationAvailable: boolean,
-): string {
-  const tasks = audit.pendingUserValidationTasks.length > 0
-    ? audit.pendingUserValidationTasks
-    : audit.remainingTasks.filter((task) =>
-        isPlanTaskAwaitingBrowserValidation(task) || isPlanTaskAwaitingExternalValidation(task)
-      );
-  const lines = tasks.slice(0, 8).map((task, index) => {
-    const decision = describePlanValidationDecision({
-      task,
-      language,
-      browserValidationAvailable,
-    });
-    const evidence = task.evidence?.map((item) => `${item.kind}:${item.value}`).join(", ") ||
-      (language === "zh" ? "缺少证据标签" : "missing evidence label");
-    return `- ${index + 1}. ${task.text} [${task.evidenceStatus || "missing"}; ${evidence}]${decision ? ` - ${decision}` : ""}`;
-  });
-  return lines.length > 0
-    ? lines.join("\n")
-    : language === "zh"
-    ? "- 当前没有需要外部验证的任务。"
-    : "- No external validation tasks are pending.";
-}
-
-export function buildApprovedPlanValidationPendingMessage(input: {
-  language: "zh" | "en";
-  audit: PlanTaskEvidenceAudit;
-  browserValidationAvailable: boolean;
-}): string {
-  const pendingText = formatPendingValidationTasks(input.audit, input.language, input.browserValidationAvailable);
-  return input.language === "zh"
-    ? [
-        "自动执行已到验证边界",
-        "",
-        `可信审计进度：${input.audit.completedCount}/${input.audit.totalCount}；剩余项需要浏览器/Tauri/用户确认，不能用 curl、grep 或 cat 替代。`,
-        "",
-        "待验证项：",
-        pendingText,
-        "",
-        "状态：已保留当前 workspace、端口/命令证据和任务清单；不会继续尝试 kill 端口或重复启动本地服务。",
-      ].join("\n")
-    : [
-        "Automated execution reached a validation boundary",
-        "",
-        `Trusted audit progress: ${input.audit.completedCount}/${input.audit.totalCount}. The remaining item(s) require browser, Tauri, or user confirmation and cannot be replaced by curl, grep, or cat.`,
-        "",
-        "Pending validation:",
-        pendingText,
-        "",
-        "State: MAIN preserved the workspace, port/command evidence, and task list; it will not keep killing ports or restarting local servers.",
-      ].join("\n");
-}
-
-export function buildBrowserValidationContinuationPrompt(input: {
-  language: "zh" | "en";
-  remainingText: string;
-}): string {
-  if (input.language === "zh") {
-    return [
-      "当前剩余任务需要浏览器级验证。下一步必须调用可用的 Browser/Playwright 工具，而不是继续用 curl、grep、cat 或重复启动 dev server。",
-      "验证策略：使用当前实际 dev server URL；打开页面；执行 DOM 断言；必要时截图；如果是 Markdown Viewer/test-sample.md 场景，读取样例内容后注入编辑器 textarea，触发 input，再检查 preview 中标题、代码块、表格、脚注、Mermaid 容器和关键样式。",
-      "若 Browser/Playwright 工具调用失败或不可用，因自动浏览器证据缺失而如实暂停；可把具体人工复核写入结论建议，但不能用人工复核关闭自动验收缺口，也不要继续兜圈。",
-      "待验证任务：",
-      input.remainingText,
-    ].join("\n");
-  }
-  return [
-    "The remaining task requires browser-level validation. Next, call an available Browser/Playwright tool; do not keep using curl, grep, cat, or repeated dev-server starts.",
-    "Validation strategy: use the actual dev-server URL, open the page, run DOM assertions, and take a screenshot if needed. For Markdown Viewer/test-sample.md, read the sample content, inject it into the editor textarea, dispatch input, then assert the preview contains headings, code blocks, tables, footnotes, Mermaid containers, and key styles.",
-    "If Browser/Playwright is unavailable or fails, pause honestly because automatic browser evidence is missing. You may list a concrete manual check as an advisory, but it cannot close the automatic acceptance gap; do not loop.",
-    "Pending validation:",
-    input.remainingText,
-  ].join("\n");
-}
-
-export function resolveApprovedPlanValidationBoundary(input: {
-  audit: PlanTaskEvidenceAudit | null;
-  availableToolNames: Set<string>;
-}): "none" | "browser_prompt" | "pause_browser_unavailable" | "pause_external_validation" {
-  const audit = input.audit;
-  if (!audit) return "none";
-  const browserAvailable = hasBrowserValidationCapability(input.availableToolNames);
-  if (audit.pendingExternalValidation && audit.automationComplete) {
-    return "pause_external_validation";
-  }
-  if (audit.allTrustedComplete) return "none";
-  const remaining = audit.remainingTasks;
-  if (remaining.length === 0) return "none";
-  const allBrowser = remaining.every(isPlanTaskAwaitingBrowserValidation);
-  const allExternal = remaining.every(isPlanTaskAwaitingExternalValidation);
-  if (allBrowser && browserAvailable) return "browser_prompt";
-  if (allBrowser) return "pause_browser_unavailable";
-  if (allExternal) return "pause_external_validation";
-  return "none";
-}
-
-function isPlanRuntimeInstructionMemory(text: string): boolean {
-  return /(?:本轮处于\s*PLAN\s*模式|This turn is in PLAN mode|上一条\s*Plan\s*回复|previous Plan reply|PLAN_REPEAT_READ_LIMIT|PLAN_QUALITY_GATE|如果确实缺少关键业务选择|critical business choice|真正阻塞执行的选择|plan direction is unclear|用\s*`?\s*<?user_options>?\s*`?\s*提问|ask with\s*`?\s*<?user_options>?|可见计划必须|visible\s+`?<proposed_plan>`|创建\s*plan\.md\s*是\s*runtime|MAIN\s+runtime\s+会物化|物化为\s*`?\.MAIN\/plans\/plan\.md|Codex app\s*计划结构|Codex app plan shape|tsx\s*约束|imageParts\s*[0-9]|turn_intake|不要重复扫描目录|Do not repeat directory scans|不要为了完成规划而调用|Do not call\s+`?(?:write_file|replace_in_file)`?\s+just to finish planning)/i.test(
-    String(text || "").replace(/\\/g, "/"),
-  );
-}
-
-function isPlanControlUserPrompt(text: string): boolean {
-  return /^(?:上一条规划内容过长|当前规划还没有进入可执行阶段|计划已批准|请继续上一轮 PLAN|The previous planning reply was too long|The current plan has not reached|The plan is approved|Continue the previous PLAN turn)/i.test(
-    String(text || "").trim(),
-  );
-}
-
 export function getOriginalUserPromptForPlanFallback(callbacks: OrchestratorCallbacks): string {
   const userMessages = callbacks.getMessages()
     .filter((message) => message.role === "user")
@@ -2341,23 +1937,6 @@ export function getOriginalUserPromptForPlanFallback(callbacks: OrchestratorCall
     })
     .filter(Boolean);
   return userMessages.find((text) => !isPlanControlUserPrompt(text)) || userMessages[0] || "";
-}
-
-function detectRequestedRootMarkdownDeliverables(text: string): string[] {
-  const source = String(text || "");
-  const hasRootHint = /(?:根目录|项目根目录|当前项目|workspace root|project root|root directory)/i.test(source);
-  const matches = Array.from(source.matchAll(/(?:^|[^\w./-])([A-Za-z][\w.-]*\.md|README\.md|Readme\.md|readme\.md)(?=$|[^\w./-])/g))
-    .map((match) => match[1])
-    .filter(Boolean);
-  const normalized = matches
-    .map((name) => name.replace(/^readme\.md$/i, "Readme.md"))
-    .filter((name) => !/^(?:requirements|design|tasks|bugfix)\.md$/i.test(name));
-
-  if (normalized.length === 0 && hasRootHint && /(?:md\s*文档|markdown|说明文档|总结.*文档|Readme|README)/i.test(source)) {
-    normalized.push("Readme.md");
-  }
-
-  return [...new Set(normalized)];
 }
 
 function collectFallbackToolHighlights(callbacks: OrchestratorCallbacks, attemptedTargets: string[] = []): string[] {
@@ -2610,7 +2189,6 @@ export function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallb
   const approvalChoiceHint = buildPlanApprovalChoiceHint(callbacks.getPlanApprovalChoice(), language);
   const requestedDocs = detectRequestedRootMarkdownDeliverables(getOriginalUserPromptForPlanFallback(callbacks));
   const runtimeTaskList = formatPlanTasksForContinuationPrompt(callbacks.getPlanTasks(), language);
-  const sourceEditFirstPrompt = buildApprovedPlanSourceEditFirstPrompt(language);
   const deliverableHint = requestedDocs.length > 0
     ? language === "zh"
       ? `6. 用户明确要求最终文档：${requestedDocs.map((name) => `项目根目录 \`${name}\``).join("、")}。必须把它写进当前任务清单；如果持久化 tasks.md，也作为最后交付步骤，并在计划完成前真实写入。\n`
@@ -2628,8 +2206,6 @@ export function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallb
       : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence. Tauri or manual review that cannot be automated belongs only in the final conclusion: it cannot close an automatic validation gap and must not by itself pause the run. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Stop only after every automatable task has real file/command/deliverable/browser evidence, and list any remaining user review suggestions in the conclusion.\n") +
     deliverableHint +
     (runtimeTaskList ? "\n" + runtimeTaskList + "\n" : "") +
-    "\n" +
-    sourceEditFirstPrompt +
     "\n" +
     buildPlanCommandExecutionHint(callbacks.getPlanTasks(), language)
   );
@@ -3206,81 +2782,6 @@ function getToolResultDiagnosticText(result?: ToolExecutionResult): string {
   ].filter(Boolean).join("\n");
 }
 
-export function isReadFileRepeatLimitResult(result: ToolExecutionResult): boolean {
-  return result.name === "read_file" && /^READ_FILE_REPEAT_LIMIT\b/i.test(result.content || "");
-}
-
-export function summarizeReadFileRepeatLimitBatch(results: ToolExecutionResult[]): {
-  total: number;
-  target: string;
-  targetCount: number;
-} | null {
-  const repeatResults = results.filter(isReadFileRepeatLimitResult);
-  if (repeatResults.length < 8) return null;
-  const targetCounts = new Map<string, number>();
-  for (const result of repeatResults) {
-    const target = String(result.target || "").trim() || "(unknown)";
-    targetCounts.set(target, (targetCounts.get(target) || 0) + 1);
-  }
-  const top = [...targetCounts.entries()].sort((a, b) => b[1] - a[1])[0];
-  if (!top || top[1] < 6) return null;
-  return {
-    total: repeatResults.length,
-    target: top[0],
-    targetCount: top[1],
-  };
-}
-
-export function buildReadFileRepeatLimitBatchPauseNotice(input: {
-  language: "zh" | "en";
-  target: string;
-  total: number;
-  targetCount: number;
-}): string {
-  if (input.language === "en") {
-    return [
-      "Execution paused: the model kept retrying the same blocked read_file call instead of using the cached context.",
-      `Repeated target: ${input.target} (${input.targetCount}/${input.total} blocked reads in this batch).`,
-      "Resume by reusing the existing file context and moving to a patch, validation command, or an explicit blocker. Do not retry the same read_file call.",
-    ].join("\n");
-  }
-  return [
-    "执行已暂停：模型持续重试同一个已拦截的 read_file，而不是复用已读上下文。",
-    `重复目标：${input.target}（本批次 ${input.targetCount}/${input.total} 次读取被拦截）。`,
-    "继续时请复用已有文件上下文，转向 patch、验证命令，或说明明确阻塞；不要原样重试同一个 read_file。",
-  ].join("\n");
-}
-
-// Build a patch-mismatch recovery hint. Returns null when there is no mismatch.
-// When apply_patch fails with context mismatch, this tells the model to
-// fall back to read_file + replace_in_file/write_file for precise editing.
-export function buildApplyPatchMismatchHint(
-  result: ToolExecutionResult,
-  language: "en" | "zh",
-): string | null {
-  const diagnostic = getToolResultDiagnosticText(result);
-  const isPatchMismatch = /search_text_mismatch|MUTATION_PREFLIGHT_BLOCKED|patch.*(?:mismatch|failed to apply)|replacement text was not found|context.*not.*found|Patch context/i.test(diagnostic) ||
-    (result.name === "apply_patch" && /invalid_patch|invalid patch/i.test(diagnostic));
-  if (!isPatchMismatch) return null;
-
-  if (language === "zh") {
-    return (
-      "apply_patch 上下文匹配失败。请使用以下策略重试：" +
-      "\n1. 先用 read_file 读取目标文件的最新内容" +
-      "\n2. 改用 replace_in_file 进行精确行替换，或使用 write_file 写入完整文件" +
-      "\n3. 确保 diff 中的 search_text 与文件实际内容完全一致"
-    );
-  }
-  return (
-    "apply_patch context match failed. Use this strategy to retry:" +
-    "\n1. First read_file to get the latest file content" +
-    "\n2. Switch to replace_in_file for precise line replacement, or write_file for full file write" +
-    "\n3. Ensure the diff search_text exactly matches the actual file content"
-  );
-}
-
-
-
 export function targetProgressOutcomeForToolResult(result?: ToolExecutionResult): TargetProgressOutcome {
   if (!result) return "failed";
   const diagnostic = getToolResultDiagnosticText(result);
@@ -3755,7 +3256,7 @@ function buildNoEffectMutationMessage(input: {
 
 function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars: number; displayChars: number } {
   if (cloudProfile) {
-    if (name === "read_file") return { modelChars: 8000, displayChars: 8000 };
+    if (name === "read_file") return { modelChars: 36000, displayChars: 10000 };
     if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
       return { modelChars: 7000, displayChars: 8000 };
     }
@@ -3763,7 +3264,7 @@ function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars
     return { modelChars: 6000, displayChars: 8000 };
   }
 
-  if (name === "read_file") return { modelChars: 24000, displayChars: 10000 };
+  if (name === "read_file") return { modelChars: 36000, displayChars: 10000 };
   if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
     return { modelChars: 16000, displayChars: 10000 };
   }
@@ -4397,6 +3898,7 @@ async function executeToolCallWithLifecycle(
       diff: completedDiffPreview,
       ...(isInternalFeedback ? { internalFeedback: true } : {}),
       ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
+      ...(tc.name === "browser_evaluate" ? { evidenceResult: resultStr } : {}),
     });
     return {
       toolCallId: tc.id,
@@ -5268,13 +4770,12 @@ export async function executeWriteToolWithReview(
     };
   }
 
-  if (options.skipUserReview) {
+  if (options.skipUserReview && canApplyShellAutoReview(shellApprovalResolution)) {
     logAgentEvent("session_auto_review_applied", {
       tool: tc.name,
       target,
       shellPermissionCommand: shellApprovalResolution.command,
       shellPermissionDecision: shellApprovalResolution.decision?.decision || null,
-      shellPermissionApprovalAttached: !!shellApprovalResolution.approval,
     });
     return await executeToolCallWithLifecycle(
       tc,
@@ -5283,12 +4784,22 @@ export async function executeWriteToolWithReview(
       allTools,
       hooksConfig,
       {
-        shellPermissionApproval: shellApprovalResolution.approval,
         turnContext: options.turnContext,
         recentPlanToolActivity: options.recentPlanToolActivity,
         attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,
       },
     );
+  }
+
+  if (options.skipUserReview && shellApprovalResolution.command) {
+    logAgentEvent("session_auto_review_deferred_to_shell_permission", {
+      tool: tc.name,
+      target,
+      shellPermissionCommand: shellApprovalResolution.command,
+      shellPermissionDecision: shellApprovalResolution.decision?.decision || null,
+      requiresUserReview: shellApprovalResolution.requiresUserReview === true,
+      preflightFailed: !!shellApprovalResolution.error,
+    });
   }
 
   let decision: ReviewDecision;

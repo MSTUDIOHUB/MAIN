@@ -28,12 +28,6 @@ import {
   resetEmptyAndReasoningNoToolRuntimeState,
 } from "./noToolRuntimeState";
 import type {
-  ApprovedPlanRecoveryRuntimeState,
-} from "./approvedPlanRecoveryRuntime";
-import {
-  applyApprovedPlanActionOnlyRecoveryState,
-} from "./approvedPlanRecoveryRuntime";
-import type {
   AgentLoopRecoveryPromptRuntimeState,
 } from "./recoveryPromptRuntimeState";
 import {
@@ -54,7 +48,6 @@ type TryClosePlanWithEvidence = Parameters<typeof handleEmptyResponseRecovery>[0
 type AssistantStreamPostProcessingBaseResult = {
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
 };
 
@@ -105,7 +98,6 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
   recentSuccessfulProjectWrite: Parameters<typeof handleEmptyResponseRecovery>[0]["recentSuccessfulProjectWrite"];
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
-  approvedPlanRecoveryState: ApprovedPlanRecoveryRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId">;
   emitTurnEvent: Parameters<typeof handleFinalTextOnlyToolCalls>[0]["emitTurnEvent"];
@@ -117,7 +109,6 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
 }): Promise<AssistantStreamPostProcessingPhaseResult> {
   let noToolRuntimeState = input.noToolRuntimeState;
   let planRuntimeState = input.planRuntimeState;
-  let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
   let recoveryPromptState = input.recoveryPromptState;
 
   const {
@@ -181,7 +172,6 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     ...planRuntimeState,
     consecutiveReasoningDominatedCount:
       noToolRuntimeState.consecutiveReasoningDominatedCount,
-    ...approvedPlanRecoveryState,
     setPlanRuntimePhase: input.setPlanRuntimePhase,
     activateExecuteRecovery: input.activateExecuteRecovery,
   });
@@ -191,10 +181,6 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
   );
   planRuntimeState = applyReasoningNoToolPlanRuntimeState(
     planRuntimeState,
-    reasoningDominatedNoToolRecovery,
-  );
-  approvedPlanRecoveryState = applyApprovedPlanActionOnlyRecoveryState(
-    approvedPlanRecoveryState,
     reasoningDominatedNoToolRecovery,
   );
   if (reasoningDominatedNoToolRecovery.status === "stopped") {
@@ -313,7 +299,6 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     return {
       noToolRuntimeState,
       planRuntimeState,
-      approvedPlanRecoveryState,
       recoveryPromptState,
     };
   }
