@@ -50,14 +50,38 @@ function appendBoundedToolActivity(
 ): void {
   if (mergeByTarget) {
     const normalizedTarget = String(activity.target || "").replace(/\\/g, "/").toLowerCase();
+    const delegatedIdentity = (item: PlanToolActivitySummary): string => {
+      const delegated = item.delegatedObservation;
+      if (!delegated) return "";
+      if (delegated.sourceObservationKey) return delegated.sourceObservationKey;
+      const range = delegated.sourceRange;
+      return [
+        delegated.sourceVersion || "",
+        range ? `${range.startLine}-${range.endLine}/${range.totalLines}` : "",
+      ].filter(Boolean).join("::");
+    };
+    const activityDelegatedIdentity = delegatedIdentity(activity);
     const existing = targetList.find((item) =>
       item.name === activity.name &&
-      String(item.target || "").replace(/\\/g, "/").toLowerCase() === normalizedTarget
+      String(item.target || "").replace(/\\/g, "/").toLowerCase() === normalizedTarget &&
+      (
+        !activityDelegatedIdentity ||
+        delegatedIdentity(item) === activityDelegatedIdentity
+      )
     );
     if (existing) {
       existing.facts = mergePlanEvidenceFacts(existing.facts, activity.facts);
       if (activity.readFileObservation) {
         existing.readFileObservation = { ...activity.readFileObservation };
+      }
+      if (activity.delegatedObservation) {
+        existing.delegatedObservation = {
+          ...activity.delegatedObservation,
+          owner: { ...activity.delegatedObservation.owner },
+          ...(activity.delegatedObservation.sourceRange
+            ? { sourceRange: { ...activity.delegatedObservation.sourceRange } }
+            : {}),
+        };
       }
       const details = [existing.detail, activity.detail]
         .map((detail) => String(detail || "").trim())
@@ -107,14 +131,46 @@ export function extractDelegatedSubagentActivities(
       ? envelope as Record<string, unknown>
       : {};
     const status = String(record.status || "");
+    const envelopeSubagentId = String(record.subagentId || "").trim();
     if (!/^(?:completed|blocked|degraded)$/.test(status) || !Array.isArray(record.evidence)) continue;
     for (const item of record.evidence) {
       const evidence = item && typeof item === "object" ? item as Record<string, unknown> : {};
+      const provenance = evidence.provenance && typeof evidence.provenance === "object"
+        ? evidence.provenance as Record<string, unknown>
+        : {};
+      const sourceObservation = provenance.sourceObservation &&
+          typeof provenance.sourceObservation === "object"
+        ? provenance.sourceObservation as Record<string, unknown>
+        : null;
+      const sourceToolCallId = String(provenance.sourceToolCallId || "").trim();
+      const sourceObservationKey = String(sourceObservation?.key || "").trim();
+      const ownerRecord = provenance.owner && typeof provenance.owner === "object"
+        ? provenance.owner as Record<string, unknown>
+        : null;
+      const ownerSubagentId = String(ownerRecord?.subagentId || "").trim();
+      // Child summary prose and legacy unprovenanced payloads are hypotheses,
+      // never ledger evidence. At least one concrete tool/observation identity
+      // and an owner matching the enclosing child result must accompany a
+      // runtime-authored tool_observation entry.
+      if (
+        provenance.source !== "tool_observation" ||
+        (!sourceToolCallId && !sourceObservationKey) ||
+        ownerRecord?.agentKind !== "subagent" ||
+        !ownerSubagentId ||
+        ownerSubagentId !== envelopeSubagentId
+      ) continue;
       const name = String(evidence.tool || "").trim();
       const target = String(evidence.target || "").trim();
       if (!SUBAGENT_EVIDENCE_TOOLS.has(name) || !target) continue;
       const rawFacts = Array.isArray(evidence.facts)
         ? evidence.facts.map((fact) => String(fact || ""))
+        : [];
+      const referencedFacts = Array.isArray(provenance.factReferences)
+        ? provenance.factReferences.map((reference) =>
+            reference && typeof reference === "object"
+              ? String((reference as Record<string, unknown>).fact || "")
+              : ""
+          )
         : [];
       const detail = summarizePlanEvidenceDetail({
         tool: name,
@@ -126,13 +182,47 @@ export function extractDelegatedSubagentActivities(
         // found in a later window of the same file).
         maxChars: 440,
       });
-      const facts = mergePlanEvidenceFacts(rawFacts, extractPlanEvidenceFacts(detail));
+      const facts = mergePlanEvidenceFacts(rawFacts, referencedFacts);
+      const sourceRangeRecord = provenance.sourceRange && typeof provenance.sourceRange === "object"
+        ? provenance.sourceRange as Record<string, unknown>
+        : null;
+      const sourceRange = sourceRangeRecord &&
+          Number.isFinite(Number(sourceRangeRecord.startLine)) &&
+          Number.isFinite(Number(sourceRangeRecord.endLine)) &&
+          Number.isFinite(Number(sourceRangeRecord.totalLines))
+        ? {
+            startLine: Math.max(1, Math.floor(Number(sourceRangeRecord.startLine))),
+            endLine: Math.max(1, Math.floor(Number(sourceRangeRecord.endLine))),
+            totalLines: Math.max(1, Math.floor(Number(sourceRangeRecord.totalLines))),
+            truncated: Boolean(sourceRangeRecord.truncated),
+          }
+        : undefined;
       appendBoundedToolActivity(activities, {
         name,
         target,
         status: "succeeded",
         ...(detail ? { detail } : {}),
         ...(facts.length > 0 ? { facts } : {}),
+        delegatedObservation: {
+          owner: {
+            agentKind: "subagent",
+            subagentId: ownerSubagentId,
+            ...(String(ownerRecord.parentTurnId || "").trim()
+              ? { parentTurnId: String(ownerRecord.parentTurnId).trim() }
+              : {}),
+            ...(String(ownerRecord.runId || "").trim()
+              ? { runId: String(ownerRecord.runId).trim() }
+              : {}),
+          },
+          ...(sourceToolCallId ? { sourceToolCallId } : {}),
+          ...(sourceObservationKey ? { sourceObservationKey } : {}),
+          ...(String(provenance.sourceVersion || sourceObservation?.versionToken || "").trim()
+            ? { sourceVersion: String(provenance.sourceVersion || sourceObservation?.versionToken).trim() }
+            : {}),
+          ...(sourceRange ? { sourceRange } : {}),
+          parentContextState: "reference_only",
+          requiresParentReread: true,
+        },
       }, MAX_RECENT_PLAN_TOOL_ACTIVITY, true);
       if (activities.length >= MAX_RECENT_PLAN_TOOL_ACTIVITY) return activities;
     }

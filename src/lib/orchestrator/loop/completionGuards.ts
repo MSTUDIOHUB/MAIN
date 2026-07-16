@@ -153,11 +153,9 @@ export function runApprovedPlanCompletionGuard(input: {
     evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
     highlightNext: true,
   });
-  const externalReviewIsAdvisory =
-    callbacks.getPlanStage?.() === "completed" && audit.pendingExternalValidation;
   const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
     ledger: callbacks.getPlanExecutionEvidenceLedger(),
-    validationExpected: !externalReviewIsAdvisory,
+    validationExpected: true,
   });
   const activeRecoveryPending = Boolean(
     input.executeRecoveryState && input.executeRecoveryState.mode !== "normal",

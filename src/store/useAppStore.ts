@@ -8157,6 +8157,8 @@ export const useAppStore = create<AppState>()(
                   type: "harness.telemetry",
                   threadId: marker.sessionKey || resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) || "default",
                   turnId: marker.turnId || undefined,
+                  runId: marker.activeRunId || marker.runId || undefined,
+                  parentRunId: marker.activeParentRunId || marker.parentRunId || null,
                   timestampMs: Date.now(),
                   telemetry: {
                     name: "unclean_termination",

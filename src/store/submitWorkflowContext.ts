@@ -73,6 +73,8 @@ export function createSubmitWorkflowContext(
     currentThoughtBlockId: null,
     thoughtStartTime: null,
     streamingAssistantDisplayBuffer: "",
+    executionEvidenceDraftHeld: false,
+    executionEvidenceDraftBuffer: "",
     understandingProgressBlockId: null,
     understandingProgressClosed: false,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: input.PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,

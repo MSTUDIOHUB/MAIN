@@ -88,13 +88,16 @@ test("completed useful thought summaries remain visible after streaming ends", (
   assert.match(source, /processTextsOverlap\(finalAgentSummaryText, summary\)/);
 });
 
-test("onStreamDone preserves abortController when agentStatus is pending_review", () => {
+test("onAssistantFinalText leaves terminal status and abort cleanup to the publication gate", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const finalTextStart = source.indexOf("onAssistantFinalText:");
+  const toolExecutingStart = source.indexOf("onToolExecuting:", finalTextStart);
+  const finalTextCallback = source.slice(finalTextStart, toolExecutingStart);
 
-  assert.match(
-    source,
-    /\.\.\.\(s\.agentStatus === "pending_review" \? \{\} : \{ abortController: null \}\)/
-  );
+  assert.notEqual(finalTextStart, -1);
+  assert.ok(toolExecutingStart > finalTextStart);
+  assert.doesNotMatch(finalTextCallback, /abortController:\s*null/);
+  assert.doesNotMatch(finalTextCallback, /agentStatus:\s*"idle"/);
 });
 
 test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks", () => {
@@ -1501,4 +1504,68 @@ test("tool-result recovery returns the activated execute-recovery state", () => 
   assert.match(phaseSource, /activateExecuteRecovery: activateExecuteRecoveryAndSync/);
   assert.doesNotMatch(phaseSource, /activateExecuteRecovery: input\.activateExecuteRecovery/);
   assert.match(actionsSource, /return nextState;/);
+});
+
+test("six no-progress recovery attempts pause before another model stream", () => {
+  const preparationSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"),
+    "utf8",
+  );
+  const orchestratorSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"),
+    "utf8",
+  );
+  const pauseCheck = orchestratorSource.indexOf("if (iterationStreamPreparation.recoveryPause)");
+  const streamCall = orchestratorSource.indexOf("invokeStreamWithRecoveryForIteration", pauseCheck);
+
+  assert.match(preparationSource, /recoveryPause:\s*\{/);
+  assert.match(preparationSource, /execute_recovery_max_iterations_reached/);
+  assert.match(orchestratorSource, /execute_recovery_no_progress_limit/);
+  assert.ok(pauseCheck >= 0 && streamCall > pauseCheck, "the terminal pause must be persisted before another LLM stream starts");
+});
+
+test("terminal runs persist the turn projection before publishing idle", () => {
+  const workflowEngineSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const finalTextStart = workflowEngineSource.indexOf("onAssistantFinalText:");
+  const toolExecutingStart = workflowEngineSource.indexOf("onToolExecuting:", finalTextStart);
+  const finalTextCallback = workflowEngineSource.slice(finalTextStart, toolExecutingStart);
+  const commitIndex = workflowEngineSource.indexOf("commitTerminalProjectionBeforeStatusPublication(loopOutcome)");
+  const closeIndex = workflowEngineSource.indexOf("closeHarnessForAgentLoopOutcome(loopOutcome)", commitIndex);
+  const persistIndex = workflowEngineSource.indexOf("persistCurrentSessionRuntime(latestState)", closeIndex);
+  const gateCommitIndex = workflowEngineSource.indexOf("terminalStatusPublicationGate.commitTerminal({");
+  const persistProjectionIndex = workflowEngineSource.indexOf("persistTerminalProjection:", gateCommitIndex);
+  const publishStatusIndex = workflowEngineSource.indexOf("publishTerminalStatus:", gateCommitIndex);
+
+  assert.notEqual(commitIndex, -1);
+  assert.notEqual(finalTextStart, -1);
+  assert.ok(toolExecutingStart > finalTextStart);
+  assert.doesNotMatch(
+    finalTextCallback,
+    /agentStatus:\s*s\.agentStatus === "pending_review" \? "pending_review" : "idle"/,
+    "final text must not publish idle before the outer terminal projection is persisted",
+  );
+  assert.doesNotMatch(
+    finalTextCallback,
+    /agentStatus:\s*"idle"/,
+    "awaiting-input final text must leave idle publication to the terminal gate",
+  );
+  assert.notEqual(closeIndex, -1);
+  assert.notEqual(persistIndex, -1);
+  assert.ok(commitIndex < closeIndex);
+  assert.ok(closeIndex < persistIndex);
+  assert.ok(gateCommitIndex >= 0 && persistProjectionIndex > gateCommitIndex);
+  assert.ok(publishStatusIndex > persistProjectionIndex);
+  assert.match(workflowEngineSource, /terminal_idle_notification_deferred/);
+  assert.match(
+    workflowEngineSource,
+    /terminalTurnIds\.has\(candidate\.id\)[\s\S]*?status: terminalTurnStatus/,
+  );
+  assert.match(workflowEngineSource, /terminal_run_projection_committed/);
+  assert.match(
+    workflowEngineSource,
+    /isIntentionalActionPause[\s\S]*?pendingAction\?\.status === "pending"/,
+  );
 });

@@ -24,8 +24,8 @@ export async function joinPendingSubagentsForParent(input: {
   input.callbacks.appendMessage({
     role: "user",
     content: input.callbacks.getPreferredLanguage() === "zh"
-      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。请基于下面的结构化摘要和证据继续整合，不要重新探索其租约范围。\n${content}`
-      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. Continue from the structured summaries and evidence below without re-exploring their leased scopes.\n${content}`,
+      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。summary 是子模型生成的未验证假设，不能单独作为事实；只有 provenance.source=tool_observation、带 owner 且带工具调用或源码观察身份的 evidence 才是可信线索。join 仅注入紧凑引用，不会把 child 的源码窗口变成 parent 已消费上下文；在据此修改文件前，必须在租约释放后对相同目标做一次定向 read_file。\n${content}`
+      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. Each summary is an unverified child hypothesis and is not evidence by itself; only evidence with provenance.source=tool_observation, an owner, and a tool-call or source-observation identity is a trusted lead. Join injects only a compact reference and never turns a child's source window into parent-consumed context; before mutating from it, perform a targeted read_file for the same target after the lease is released.\n${content}`,
   });
   const syntheticResult: ToolExecutionResult = {
     toolCallId: `runtime-wait-subagents-${Date.now()}`,
@@ -36,6 +36,13 @@ export async function joinPendingSubagentsForParent(input: {
     lifecycleState: "completed",
   };
   const delegatedActivities = extractDelegatedSubagentActivities(syntheticResult);
+  const sourceEvidenceCount = joined.results.reduce(
+    (count, entry) => count + entry.evidence.length,
+    0,
+  );
+  const distinctEvidenceTargets = new Set(
+    delegatedActivities.map((activity) => activity.target).filter(Boolean),
+  ).size;
   rememberDelegatedSubagentActivities(input.recentToolActivity, delegatedActivities);
   rememberDelegatedSubagentActivities(input.recentPlanToolActivity, delegatedActivities);
   input.callbacks.onDebugEvent?.("parent_join_injected", {
@@ -44,6 +51,19 @@ export async function joinPendingSubagentsForParent(input: {
     resultIds: joined.results.map((entry) => entry.subagentId),
     statuses: joined.results.map((entry) => entry.status),
     evidenceCount: delegatedActivities.length,
+    sourceEvidenceCount,
+    evidenceAdoptionRate: sourceEvidenceCount > 0
+      ? delegatedActivities.length / sourceEvidenceCount
+      : 0,
+    distinctEvidenceTargets,
+    requiredParentRereads: delegatedActivities.filter((activity) =>
+      activity.delegatedObservation?.requiresParentReread === true
+    ).length,
+    potentialParentDiscoveryReadsAvoided: distinctEvidenceTargets,
+    baselineComparison: "not_available",
+    summaryProseTrusted: false,
+    provenanceBackedEvidenceCount: delegatedActivities.length,
+    delegatedObservationReuse: "reference_only_requires_parent_reread",
     pendingIds: joined.pendingIds,
   });
   return true;

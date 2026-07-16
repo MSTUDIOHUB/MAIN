@@ -1,7 +1,13 @@
 import type { AppConfig } from "./appTypes";
-import type { AgentLoopOutcome, AgentMessage, OrchestratorCallbacks } from "./orchestrator/types";
+import type {
+  AgentLoopOutcome,
+  AgentMessage,
+  OrchestratorCallbacks,
+  ToolExecutionResult,
+} from "./orchestrator/types";
 import {
   acquireSubagentScopeLease,
+  buildSubagentPolicyDeferral,
   findSubagentLeaseOverlap,
   getSubagentBurstAdmission,
   registerSubagentAbortController,
@@ -23,6 +29,7 @@ import {
 } from "./subagents";
 import { withEventSchema, type MainThreadEvent } from "./turnEvents";
 import { generateId } from "./utils";
+import { buildFileReadWindowIdentity } from "./orchestrator/fileReadCache";
 import {
   extractPlanEvidenceFacts,
   mergePlanEvidenceFacts,
@@ -30,6 +37,16 @@ import {
 } from "./planMaterialization";
 
 const SUBAGENT_NAMES = ["Euler", "Mendel", "Herschel", "Noether", "Turing", "Curie"];
+const SUBAGENT_EVIDENCE_TOOL_NAMES = new Set([
+  "read_file",
+  "read_file_window",
+  "read_document",
+  "get_file_outline",
+  "grep_search",
+  "code_ast_query",
+  "find_symbol_references",
+  "git_diff",
+]);
 
 type ExecuteAgentLoop = (
   callbacks: OrchestratorCallbacks,
@@ -68,13 +85,50 @@ function compactEvidence(
     const tool = compactText(item.tool, 80);
     const target = compactText(item.target, 300);
     if (!tool || !target) continue;
-    const key = `${tool}:${target}`.toLowerCase();
+    const sourceObservationKey = String(item.provenance.sourceObservation?.key || "").trim();
+    const sourceVersion = String(
+      item.provenance.sourceVersion || item.provenance.sourceObservation?.versionToken || "",
+    ).trim();
+    const sourceRange = item.provenance.sourceRange;
+    const sourceRangeKey = sourceRange
+      ? `${sourceRange.startLine}-${sourceRange.endLine}/${sourceRange.totalLines}`
+      : "";
+    // A target can contribute several disjoint source windows. Keep each
+    // observation as its own evidence item so facts never inherit the range of
+    // whichever window happened to be observed last.
+    const provenanceIdentity = sourceObservationKey ||
+      [sourceVersion, sourceRangeKey].filter(Boolean).join("::") ||
+      "unversioned";
+    const key = `${tool}:${target}:${provenanceIdentity}`.toLowerCase();
     const detail = compactEvidenceFragment(item.detail, 400);
     const facts = mergePlanEvidenceFacts(item.facts, extractPlanEvidenceFacts(item.detail));
+    const factReferences = (item.provenance.factReferences || []).slice(0, 24);
     const existingIndex = indexByKey.get(key);
     if (existingIndex !== undefined) {
       const existing = compacted[existingIndex];
       existing.facts = mergePlanEvidenceFacts(existing.facts, facts);
+      const existingReferences = existing.provenance.factReferences || [];
+      const referenceKeys = new Set(existingReferences.map((reference) => [
+        reference.fact,
+        reference.sourceToolCallId || "",
+        reference.sourceObservationKey || "",
+      ].join("::")));
+      existing.provenance = {
+        ...item.provenance,
+        factReferences: [
+          ...existingReferences,
+          ...factReferences.filter((reference) => {
+            const referenceKey = [
+              reference.fact,
+              reference.sourceToolCallId || "",
+              reference.sourceObservationKey || "",
+            ].join("::");
+            if (referenceKeys.has(referenceKey)) return false;
+            referenceKeys.add(referenceKey);
+            return true;
+          }),
+        ].slice(0, 24),
+      };
       if (!detail || existing.detail === detail) continue;
       const previous = String(existing.detail || "").trim();
       const separator = previous ? " | " : "";
@@ -89,6 +143,10 @@ function compactEvidence(
       target,
       detail,
       ...(facts.length > 0 ? { facts } : {}),
+      provenance: {
+        ...item.provenance,
+        ...(factReferences.length > 0 ? { factReferences } : {}),
+      },
     });
     if (compacted.length >= 10) break;
   }
@@ -172,14 +230,21 @@ export function scheduleControlledSubagent(input: {
   executeAgentLoop: ExecuteAgentLoop;
 }): SpawnSubagentResult {
   const parentConfig = input.parentCallbacks.getConfig();
-  const language = input.parentCallbacks.getPreferredLanguage();
   const policy = resolveSubagentCapacityPolicy(parentConfig);
   if (input.existingRunCount >= policy.maxCreatedPerTurn) {
-    throw new Error(
-      language === "zh"
-        ? `本轮最多创建 ${policy.maxCreatedPerTurn} 个子智能体。`
-        : `This turn can create at most ${policy.maxCreatedPerTurn} subagents.`,
-    );
+    const deferred = buildSubagentPolicyDeferral({
+      name: input.request.name,
+      scopeKey: input.request.scopeKey || input.request.scope,
+      reason: "turn_capacity_reached",
+    });
+    input.parentCallbacks.onDebugEvent?.("delegation_admission_decision", {
+      decision: "deferred",
+      reason: deferred.reason,
+      existingRunCount: input.existingRunCount,
+      maxCreatedPerTurn: policy.maxCreatedPerTurn,
+      profile: policy.profile,
+    });
+    return deferred;
   }
 
   const subagentId = `subagent-${generateId()}`;
@@ -198,6 +263,7 @@ export function scheduleControlledSubagent(input: {
   if (policy.profile === "local" && allowedPaths.length > 6) {
     throw new Error("SUBAGENT_SCOPE_TOO_BROAD: local subagents may own at most 6 paths.");
   }
+  const scopeKey = compactText(input.request.scopeKey || input.request.scope || objective, 96);
   const leaseOverlap = findSubagentLeaseOverlap({
     threadId: input.parentCallbacks.getSessionKey(),
     workspace: parentConfig.workspace,
@@ -205,17 +271,20 @@ export function scheduleControlledSubagent(input: {
   });
   if (leaseOverlap) {
     input.parentCallbacks.onDebugEvent?.("delegation_scope_decision", {
-      decision: "rejected",
-      reason: "duplicate_subagent_scope",
+      decision: "deferred",
+      reason: "overlapping_active_scope",
       conflictingSubagentId: leaseOverlap.subagentId,
       conflictingScopeKey: leaseOverlap.scopeKey,
       allowedPaths,
     });
-    throw new Error(
-      `SUBAGENT_DUPLICATE_SCOPE: allowed_paths overlap ${leaseOverlap.subagentId} (${leaseOverlap.scopeKey}). Delegate a distinct scope.`,
-    );
+    return buildSubagentPolicyDeferral({
+      name,
+      scopeKey,
+      reason: "overlapping_active_scope",
+      conflictingSubagentId: leaseOverlap.subagentId,
+      conflictingScopeKey: leaseOverlap.scopeKey,
+    });
   }
-  const scopeKey = compactText(input.request.scopeKey || input.request.scope || objective, 96);
   const prepared: PreparedSubagentRun = {
     subagentId,
     name,
@@ -234,6 +303,8 @@ export function scheduleControlledSubagent(input: {
     burstChildCapacity: policy.maxBurstActiveRequests,
     elasticCandidate: policy.profile === "local" && input.existingRunCount >= policy.maxActiveRequests,
     allowedPathCount: allowedPaths.length,
+    delegationDecision: "admitted",
+    delegationReason: "runtime_scope_admitted",
   });
   const completion = executeControlledSubagent({ ...input, prepared });
   registerCoordinatedSubagentRun({
@@ -546,22 +617,6 @@ export async function executeControlledSubagent(input: {
     },
     onToolDone: (tool, target, result) => {
       completedToolCalls += 1;
-      const detail = summarizePlanEvidenceDetail({
-        tool,
-        target,
-        content: result,
-        maxChars: 400,
-      }) || compactText(result, 1_000);
-      const facts = extractPlanEvidenceFacts(detail);
-      evidence.push({
-        tool,
-        target,
-        // Summarize from the complete bounded read result before truncation.
-        // Configuration facts often occur below imports/comments, and slicing
-        // first silently removes values such as the actual dev-server port.
-        detail,
-        ...(facts.length > 0 ? { facts } : {}),
-      });
       emitUpdate({
         status: "running",
         progress: {
@@ -572,6 +627,66 @@ export async function executeControlledSubagent(input: {
           completedToolCalls,
         },
       }, makeActivity("completed", language === "zh" ? "工具调用完成" : "Tool call completed", tool, target, result));
+    },
+    onToolResultObserved: (result: ToolExecutionResult) => {
+      if (
+        result.isError ||
+        result.internalFeedback ||
+        !SUBAGENT_EVIDENCE_TOOL_NAMES.has(result.name) ||
+        !String(result.target || "").trim()
+      ) return;
+      // Evidence must come from the model-facing structured tool payload. The
+      // display payload may be a shortened UI status (for example a cache
+      // badge) and must not replace the source observation used for facts.
+      const rawObservation = result.content || result.displayContent || "";
+      const detail = summarizePlanEvidenceDetail({
+        tool: result.name,
+        target: result.target,
+        content: rawObservation,
+        maxChars: 400,
+      }) || compactText(rawObservation, 1_000);
+      const facts = extractPlanEvidenceFacts(detail);
+      const sourceObservation = result.readFileObservation
+        ? { ...result.readFileObservation }
+        : undefined;
+      const sourceRange = result.name === "read_file"
+        ? buildFileReadWindowIdentity(rawObservation)
+        : undefined;
+      const factReferences = facts.map((fact) => ({
+        fact,
+        sourceToolCallId: result.toolCallId,
+        ...(sourceObservation?.key
+          ? { sourceObservationKey: sourceObservation.key }
+          : {}),
+        ...(sourceObservation?.versionToken
+          ? { sourceVersion: sourceObservation.versionToken }
+          : {}),
+        ...(sourceRange ? { sourceRange: { ...sourceRange } } : {}),
+      }));
+      evidence.push({
+        tool: result.name,
+        target: result.target,
+        // This detail is derived exclusively from a completed tool result. The
+        // child-authored final summary is deliberately kept outside evidence.
+        detail,
+        ...(facts.length > 0 ? { facts } : {}),
+        provenance: {
+          source: "tool_observation",
+          owner: {
+            agentKind: "subagent",
+            subagentId,
+            parentTurnId: input.parentTurnId,
+            runId: childRunId,
+          },
+          sourceToolCallId: result.toolCallId,
+          ...(sourceObservation ? { sourceObservation } : {}),
+          ...(sourceObservation?.versionToken
+            ? { sourceVersion: sourceObservation.versionToken }
+            : {}),
+          ...(sourceRange ? { sourceRange: { ...sourceRange } } : {}),
+          ...(factReferences.length > 0 ? { factReferences } : {}),
+        },
+      });
     },
     onToolError: (tool, target, error) => {
       emitUpdate({
@@ -640,6 +755,7 @@ export async function executeControlledSubagent(input: {
         }
         emitChildDebug("subagent_started", {
           profile: policy.profile,
+          startupMs: Math.max(0, startedAt - lifecycleStartedAt),
           capacityWaitMs: capacityQueuedAt == null ? 0 : startedAt - capacityQueuedAt,
           childCapacity: policy.maxActiveRequests,
           burstChildCapacity: policy.maxBurstActiveRequests,
@@ -748,6 +864,7 @@ export async function executeControlledSubagent(input: {
           scopeKey,
           status: finalStatus,
           summary: finalSummary,
+          summaryTrust: "unverified_hypothesis",
           evidence: compactEvidence(evidence),
           ...(finalStatus === "completed" ? {} : { blocker: lastError || outcome.reason }),
           ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
@@ -795,6 +912,7 @@ export async function executeControlledSubagent(input: {
       scopeKey,
       status: finalStatus,
       summary: finalSummary,
+      summaryTrust: "unverified_hypothesis",
       evidence: compactEvidence(evidence),
       blocker: lastError,
       ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
@@ -807,6 +925,10 @@ export async function executeControlledSubagent(input: {
       durationMs: closedAt - lifecycleStartedAt,
       completedToolCalls,
       evidenceCount: compactEvidence(evidence).length,
+      trustedEvidenceCount: compactEvidence(evidence).filter((item) =>
+        item.provenance.source === "tool_observation"
+      ).length,
+      summaryTrust: "unverified_hypothesis",
       blocker: compactText(lastError, 300) || null,
     });
     input.emitEvent(withEventSchema({

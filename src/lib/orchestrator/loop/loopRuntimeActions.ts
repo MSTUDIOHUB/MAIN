@@ -1,7 +1,13 @@
 import {
+  buildExecutePatchMismatchFingerprint,
+  buildPatchRecoveryReadNoProgressFingerprint,
   describeExecuteRecoveryToolSurface,
+  normalizeRecoveryReadRange,
+  patchRecoveryLeaseIdentityMatches,
+  requestedRangeFromReadObservationSignature,
   shouldAllowExecuteRecoveryFileRead,
   summarizeRepeatedExecuteTargets,
+  type ExecutionDecisionCheckpoint,
   type ExecuteRecoveryMode,
   type RecoveryReadLease,
 } from "../../executeRecoveryTools";
@@ -16,6 +22,7 @@ import type { OrchestratorCallbacks } from "../types";
 import {
   activateExecuteRecoveryRuntimeState,
   clearExecuteRecoveryRuntimeState,
+  registerExecuteRecoveryProtocolNoProgress,
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
 import {
@@ -54,26 +61,6 @@ export interface AgentLoopRuntimeActions {
     status?: "pending" | "running" | "done" | "failed",
     qualitySnapshot?: PlanRuntimePhaseQualitySnapshot,
   ) => void;
-}
-
-function requestedRangeFromObservationSignature(
-  requestSignature: string,
-): RecoveryReadLease["requestedRange"] {
-  const argsSeparator = requestSignature.lastIndexOf("::");
-  if (argsSeparator < 0) return null;
-  try {
-    const entries = JSON.parse(requestSignature.slice(argsSeparator + 2));
-    if (!Array.isArray(entries)) return null;
-    const args = Object.fromEntries(entries) as Record<string, unknown>;
-    const requestedRange = {
-      ...(Number.isFinite(args.start_line) ? { startLine: Number(args.start_line) } : {}),
-      ...(Number.isFinite(args.end_line) ? { endLine: Number(args.end_line) } : {}),
-      ...(Number.isFinite(args.max_lines) ? { maxLines: Number(args.max_lines) } : {}),
-    };
-    return Object.keys(requestedRange).length > 0 ? requestedRange : null;
-  } catch {
-    return null;
-  }
 }
 
 export function createAgentLoopRuntimeActions(input: {
@@ -134,40 +121,132 @@ export function createAgentLoopRuntimeActions(input: {
         : repeatedTargets.length === 1
           ? repeatedTargets[0]
           : null;
+    const currentRecoveryState = getExecuteRecoveryState();
     const explicitObservation = context.readFileObservation && typeof context.readFileObservation === "object"
       ? context.readFileObservation as PlanToolActivitySummary["readFileObservation"]
       : null;
-    const retainedObservation = explicitObservation || [...recentToolActivity]
-      .reverse()
-      .find((activity) =>
-        activity.readFileObservation &&
-        expectedTarget &&
-        workspacePathsReferToSameFile(activity.readFileObservation.path, expectedTarget)
-      )?.readFileObservation || null;
+    const retainedObservation = explicitObservation || (
+      mode === "patch_recovery_read"
+        ? null
+        : [...recentToolActivity]
+          .reverse()
+          .find((activity) =>
+            activity.readFileObservation &&
+            expectedTarget &&
+            workspacePathsReferToSameFile(activity.readFileObservation.path, expectedTarget)
+          )?.readFileObservation || null
+    );
     const sourceObservationKey = typeof context.sourceObservationKey === "string"
       ? context.sourceObservationKey.trim() || null
       : retainedObservation?.key || null;
     const explicitReadLease = context.readLease && typeof context.readLease === "object"
       ? context.readLease as RecoveryReadLease
       : null;
-    const readLease: RecoveryReadLease | null = explicitReadLease || (
-      retainedObservation && expectedTarget
+    const explicitDecisionCheckpoint = context.decisionCheckpoint && typeof context.decisionCheckpoint === "object"
+      ? context.decisionCheckpoint as ExecutionDecisionCheckpoint
+      : undefined;
+    const priorTargetLease = expectedTarget && currentRecoveryState.readLease &&
+      workspacePathsReferToSameFile(currentRecoveryState.readLease.target, expectedTarget)
+        ? currentRecoveryState.readLease
+        : null;
+    const requestedRange = normalizeRecoveryReadRange(context.requestedRange) ||
+      normalizeRecoveryReadRange(explicitReadLease?.requestedRange) ||
+      normalizeRecoveryReadRange(priorTargetLease?.requestedRange) ||
+      (explicitObservation
+        ? requestedRangeFromReadObservationSignature(explicitObservation.requestSignature)
+        : null);
+    const observedVersion = String(
+      context.observedVersion ||
+      explicitReadLease?.observedVersion ||
+      priorTargetLease?.observedVersion ||
+      explicitObservation?.versionToken ||
+      "",
+    ).trim() || null;
+    const patchReadLeaseCandidate: RecoveryReadLease | null =
+      mode === "patch_recovery_read" && expectedTarget
         ? {
-            purpose: mode === "patch_recovery_read" ? "patch_recovery" : "context_restore",
+            purpose: "patch_recovery",
             target: expectedTarget,
-            requestedRange: requestedRangeFromObservationSignature(
+            ...(requestedRange ? { requestedRange } : {}),
+            observationKey:
+              explicitReadLease?.observationKey || priorTargetLease?.observationKey || null,
+            observedVersion,
+            mismatchFingerprint: String(
+              context.mismatchFingerprint || explicitReadLease?.mismatchFingerprint ||
+              buildExecutePatchMismatchFingerprint({ reason, target: expectedTarget }),
+            ).trim(),
+            state: "available",
+          }
+        : null;
+    const repeatedPatchMismatch = patchRecoveryLeaseIdentityMatches(
+      currentRecoveryState.readLease,
+      patchReadLeaseCandidate,
+    );
+    const readLease: RecoveryReadLease | null = repeatedPatchMismatch
+      ? currentRecoveryState.readLease
+      : patchReadLeaseCandidate || explicitReadLease || (
+        retainedObservation && expectedTarget
+        ? {
+            purpose: "context_restore",
+            target: expectedTarget,
+            requestedRange: requestedRangeFromReadObservationSignature(
               retainedObservation.requestSignature,
             ),
             observationKey: retainedObservation.key,
             observedVersion: retainedObservation.versionToken,
-            state: mode === "patch_recovery_read" ? "active" : "consumed",
+            state: "consumed",
           }
         : null
-    );
-    const nextState = activateExecuteRecoveryRuntimeState(
-      getExecuteRecoveryState(),
-      { mode, reason, expectedTarget, readLease, sourceObservationKey },
-    );
+      );
+    // A lease is one-shot for a target/version/range mismatch identity. If the
+    // next patch still misses the same snapshot, stay in mutation instead of
+    // minting another read phase; the monotonic protocol counter will bound
+    // retries even when cache stubs or policy deferrals are budget-neutral.
+    let nextState: ExecuteRecoveryRuntimeState;
+    if (repeatedPatchMismatch && patchReadLeaseCandidate?.mismatchFingerprint) {
+      const mutationCheckpoint: ExecutionDecisionCheckpoint = explicitDecisionCheckpoint || {
+        expectedTarget,
+        sourceObservationKey: currentRecoveryState.sourceObservationKey,
+        nextRequiredCapability: "mutation",
+        ...(currentRecoveryState.decisionCheckpoint?.evidenceVersion
+          ? { evidenceVersion: currentRecoveryState.decisionCheckpoint.evidenceVersion }
+          : {}),
+      };
+      nextState = registerExecuteRecoveryProtocolNoProgress(
+        {
+          ...currentRecoveryState,
+          mode: "mutation_first",
+          reason,
+          expectedTarget,
+          readLease,
+          decisionCheckpoint: mutationCheckpoint,
+        },
+        buildPatchRecoveryReadNoProgressFingerprint(patchReadLeaseCandidate.target),
+      );
+    } else {
+      nextState = activateExecuteRecoveryRuntimeState(
+        currentRecoveryState,
+        {
+          mode,
+          reason,
+          expectedTarget,
+          readLease,
+          decisionCheckpoint: explicitDecisionCheckpoint,
+          sourceObservationKey: mode === "patch_recovery_read"
+            ? explicitObservation?.key || null
+            : sourceObservationKey,
+        },
+      );
+    }
+    const explicitProtocolNoProgressFingerprint = String(
+      context.protocolNoProgressFingerprint || "",
+    ).trim();
+    if (explicitProtocolNoProgressFingerprint) {
+      nextState = registerExecuteRecoveryProtocolNoProgress(
+        nextState,
+        explicitProtocolNoProgressFingerprint,
+      );
+    }
     setExecuteRecoveryState(nextState);
     logAgentEvent("execute_recovery_activated", {
       iteration: getIteration(),
@@ -178,6 +257,9 @@ export function createAgentLoopRuntimeActions(input: {
       readLeasePurpose: readLease?.purpose || null,
       readLeaseRange: readLease?.requestedRange || null,
       observedVersion: readLease?.observedVersion || null,
+      mismatchFingerprint: readLease?.mismatchFingerprint || null,
+      repeatedPatchMismatch,
+      protocolNoProgressCount: nextState.protocolNoProgressCount,
       recoveryToolSurface: describeExecuteRecoveryToolSurface(
         nextState.mode,
         shouldAllowExecuteRecoveryFileRead(recentToolActivity, nextState.mode),

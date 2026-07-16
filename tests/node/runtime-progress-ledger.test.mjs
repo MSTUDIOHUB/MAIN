@@ -51,6 +51,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   buildRuntimeProgressLedger,
   buildRuntimeProgressProjection,
+  buildRunStatusProjection,
   summarizeRuntimeProgressLedger,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runtimeProgressLedger.ts"));
 const {
@@ -446,4 +447,334 @@ test("runtime pause projection hides raw repeated read diagnostics", () => {
   assert.doesNotMatch(projection.activityText, /FILE_UNCHANGED_STUB/);
   assert.doesNotMatch(projection.activityText, /succeeded:read_file/);
   assert.doesNotMatch(projection.summary, /FILE_UNCHANGED_STUB/);
+});
+
+test("runtime progress events normalize structured tool identity before ledger aggregation", () => {
+  const events = Array.from({ length: 4 }, (_, index) => withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    runId: "run-a",
+    parentRunId: null,
+    timestampMs: 10 + index,
+    progress: {
+      phase: "investigating",
+      title: "读取 src/main.js",
+      status: "done",
+      summary: "已获得后续判断所需上下文。",
+      toolName: "read_file",
+      targets: ["src\\main.js"],
+      sourceToolCallIds: [`read-${index + 1}`, `read-${index + 1}`],
+      dedupeKey: `tool:read-${index + 1}`,
+    },
+  }));
+
+  assert.equal(events[0].runId, "run-a");
+  assert.equal(events[0].progress.tool, "read_file");
+  assert.equal(events[0].progress.target, "src/main.js");
+  assert.equal(events[0].progress.canonicalTarget, "src/main.js");
+  assert.deepEqual(events[0].progress.sourceToolCallIds, ["read-1"]);
+
+  const items = buildRuntimeProgressLedger({
+    events,
+    turnId: "turn-a",
+    activeRunId: "run-a",
+    language: "zh",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].target, "src/main.js");
+  assert.equal(items[0].tool, "read_file");
+  assert.equal(items[0].repeatCount, 4);
+  assert.deepEqual(items[0].sourceToolCallIds, ["read-1", "read-2", "read-3", "read-4"]);
+  const projection = buildRunStatusProjection(items, "zh");
+  assert.equal(projection.currentActivity.repeatCount, 4);
+  assert.deepEqual(projection.milestones, []);
+  assert.deepEqual(projection.healthSignals, []);
+});
+
+test("runtime progress ledger counts a tool call once across running, done, and transcript block", () => {
+  const running = withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    runId: "run-a",
+    parentRunId: null,
+    timestampMs: 10,
+    progress: {
+      phase: "investigating",
+      title: "正在读取 main.js",
+      status: "running",
+      tool: "read_file",
+      target: "src/main.js",
+      sourceToolCallIds: ["read-1"],
+    },
+  });
+  const done = withEventSchema({
+    ...running,
+    timestampMs: 20,
+    progress: {
+      ...running.progress,
+      title: "已读取 main.js",
+      status: "done",
+      summary: "读取完成。",
+    },
+  });
+
+  const items = buildRuntimeProgressLedger({
+    blocks: [{
+      id: 1,
+      turnId: "turn-a",
+      runId: "run-a",
+      type: "tool",
+      toolName: "read_file",
+      target: "src/main.js",
+      toolCallId: "read-1",
+      toolStatus: "executed",
+      observationSummary: "读取完成。",
+    }],
+    events: [running, done],
+    turnId: "turn-a",
+    activeRunId: "run-a",
+    language: "zh",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].repeatCount, 1);
+  assert.deepEqual(items[0].sourceToolCallIds, ["read-1"]);
+});
+
+test("runtime progress ledger never merges the same target across run identities", () => {
+  const events = ["run-parent", "run-child"].map((runId, index) => withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    runId,
+    parentRunId: index === 0 ? null : "run-parent",
+    timestampMs: 10 + index,
+    progress: {
+      phase: "investigating",
+      title: "已读取 main.js",
+      status: "done",
+      tool: "read_file",
+      target: "src/main.js",
+      sourceToolCallIds: [`read-${index}`],
+    },
+  }));
+
+  const items = buildRuntimeProgressLedger({ events, turnId: "turn-a", language: "zh" });
+
+  assert.equal(items.length, 2);
+  assert.deepEqual(items.map((item) => item.runId), ["run-parent", "run-child"]);
+  assert.ok(items.every((item) => item.repeatCount === 1));
+});
+
+test("run status projection separates current activity, three milestones, and health signals", () => {
+  const events = [
+    ...Array.from({ length: 4 }, (_, index) => withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      runId: "run-a",
+      parentRunId: null,
+      timestampMs: 10 + index,
+      progress: {
+        phase: index === 0 ? "investigating" : "editing",
+        title: index === 0 ? "已读取 main.js" : `已编辑 file-${index}.ts`,
+        status: "done",
+        tool: index === 0 ? "read_file" : "apply_patch",
+        target: index === 0 ? "src/main.js" : `src/file-${index}.ts`,
+        sourceToolCallIds: [`tool-${index}`],
+      },
+    })),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      runId: "run-a",
+      parentRunId: null,
+      timestampMs: 20,
+      progress: {
+        phase: "investigating",
+        title: "已读取 main.js",
+        status: "done",
+        summary: "再次核对同一文件。",
+        tool: "read_file",
+        target: "src/main.js",
+        sourceToolCallIds: ["tool-read-again"],
+      },
+    }),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-a",
+      turnId: "turn-a",
+      runId: "run-a",
+      parentRunId: null,
+      timestampMs: 30,
+      progress: {
+        phase: "verifying",
+        title: "正在运行回归测试",
+        status: "running",
+        tool: "execute_command",
+        target: "npm test",
+        sourceToolCallIds: ["command-1"],
+      },
+    }),
+  ];
+
+  const items = buildRuntimeProgressLedger({
+    events,
+    turnId: "turn-a",
+    activeRunId: "run-a",
+    language: "zh",
+  });
+  const projection = buildRunStatusProjection(items, "zh", 9);
+
+  assert.equal(projection.currentActivity.title, "正在运行回归测试");
+  assert.equal(projection.milestones.length, 3);
+  assert.equal(projection.healthSignals.length, 1);
+  assert.equal(projection.healthSignals[0].kind, "repetition");
+  assert.match(projection.healthSignals[0].title, /重复读取 main\.js/);
+  assert.match(projection.healthSignals[0].summary, /2 次/);
+});
+
+test("run status projection keeps cache-only stubs out of current activity and milestones", () => {
+  const event = withEventSchema({
+    type: "progress.updated",
+    threadId: "thread-a",
+    turnId: "turn-a",
+    runId: "run-a",
+    parentRunId: null,
+    timestampMs: 10,
+    progress: {
+      phase: "investigating",
+      title: "已读取 main.js",
+      status: "done",
+      summary: "FILE_UNCHANGED_STUB: src/main.js",
+      tool: "read_file",
+      target: "src/main.js",
+      sourceToolCallIds: ["read-cache-1"],
+    },
+  });
+  const items = buildRuntimeProgressLedger({
+    events: [event],
+    turnId: "turn-a",
+    activeRunId: "run-a",
+    language: "zh",
+  });
+  const projection = buildRunStatusProjection(items, "zh");
+
+  assert.equal(projection.currentActivity, null);
+  assert.deepEqual(projection.milestones, []);
+  assert.equal(projection.healthSignals[0].kind, "repetition");
+});
+
+test("newer completed paused and failed terminal states override older running activity", () => {
+  for (const terminal of ["completed", "paused", "failed"]) {
+    const running = withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-terminal",
+      turnId: `turn-${terminal}`,
+      runId: `run-${terminal}`,
+      parentRunId: null,
+      timestampMs: 10,
+      progress: {
+        phase: "investigating",
+        title: "正在读取 App.tsx",
+        status: "running",
+        tool: "read_file",
+        target: "src/App.tsx",
+        sourceToolCallIds: [`read-${terminal}`],
+      },
+    });
+    const terminalEvent = terminal === "completed"
+      ? withEventSchema({
+          type: "run.completed",
+          threadId: "thread-terminal",
+          turnId: `turn-${terminal}`,
+          runId: `run-${terminal}`,
+          parentRunId: null,
+          timestampMs: 20,
+          summary: "All runtime evidence is complete.",
+        })
+      : terminal === "paused"
+      ? withEventSchema({
+          type: "run.paused",
+          threadId: "thread-terminal",
+          turnId: `turn-${terminal}`,
+          runId: `run-${terminal}`,
+          parentRunId: null,
+          timestampMs: 20,
+          reason: "bounded_recovery",
+          message: "Recovery paused after the bounded retry limit.",
+        })
+      : withEventSchema({
+          type: "run.failed",
+          threadId: "thread-terminal",
+          turnId: `turn-${terminal}`,
+          runId: `run-${terminal}`,
+          parentRunId: null,
+          timestampMs: 20,
+          error: { code: "VALIDATION_FAILED", message: "Validation failed." },
+        });
+    const items = buildRuntimeProgressLedger({
+      events: [running, terminalEvent],
+      turnId: `turn-${terminal}`,
+      activeRunId: `run-${terminal}`,
+      language: "zh",
+    });
+    const projection = buildRunStatusProjection(items, "zh");
+
+    assert.equal(projection.currentActivity, null, `${terminal} must clear stale running activity`);
+    if (terminal === "completed") {
+      assert.ok(projection.milestones.some((item) => item.status === "completed"));
+      assert.match(projection.activityText, /运行已完成/);
+    } else {
+      assert.ok(projection.healthSignals.some((signal) => signal.kind === (terminal === "paused" ? "pause" : "failure")));
+    }
+    assert.doesNotMatch(projection.activityText, /正在读取 App\.tsx/);
+  }
+});
+
+test("active child run filters parent harness telemetry", () => {
+  const events = [
+    withEventSchema({
+      type: "harness.telemetry",
+      threadId: "thread-run-filter",
+      turnId: "turn-run-filter",
+      runId: "run-parent",
+      parentRunId: null,
+      timestampMs: 10,
+      telemetry: {
+        name: "stream_error",
+        details: { activeStreamId: "parent-stream", lastStreamError: "parent failed" },
+      },
+    }),
+    withEventSchema({
+      type: "progress.updated",
+      threadId: "thread-run-filter",
+      turnId: "turn-run-filter",
+      runId: "run-child",
+      parentRunId: "run-parent",
+      timestampMs: 20,
+      progress: {
+        phase: "verifying",
+        title: "正在验证子运行",
+        status: "running",
+        tool: "run_command",
+        target: "npm test",
+        sourceToolCallIds: ["child-test"],
+      },
+    }),
+  ];
+  const items = buildRuntimeProgressLedger({
+    events,
+    turnId: "turn-run-filter",
+    activeRunId: "run-child",
+    language: "zh",
+  });
+
+  assert.equal(items.length, 1);
+  assert.equal(items[0].runId, "run-child");
+  assert.doesNotMatch(items[0].summary, /parent failed/);
 });

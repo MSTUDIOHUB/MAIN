@@ -155,7 +155,7 @@ test("user-only review is a conclusion advisory instead of a no-tool completion 
   assert.equal(decision.shouldSuppressApprovedPlanNoToolText, false);
 });
 
-test("browser review becomes advisory only when browser automation is unavailable", () => {
+test("browser review remains an automatic evidence blocker when browser automation is unavailable", () => {
   const planTasks = [{
     id: "task-browser",
     text: "Verify the rendered page",
@@ -171,8 +171,9 @@ test("browser review becomes advisory only when browser automation is unavailabl
     availableToolNames: new Set(["browser_evaluate"]),
   });
 
-  assert.equal(unavailable.audit.acceptedCompletion, true);
-  assert.equal(unavailable.shouldHandleApprovedPlanNoTool, false);
+  assert.equal(unavailable.audit.acceptedCompletion, false);
+  assert.equal(unavailable.hasRemainingApprovedPlanTasks, true);
+  assert.equal(unavailable.shouldHandleApprovedPlanNoTool, true);
   assert.equal(available.audit.acceptedCompletion, false);
   assert.equal(available.shouldHandleApprovedPlanNoTool, true);
 });
@@ -208,6 +209,7 @@ test("an unavailable browser cannot hide a missing mutation in the same task", (
   assert.equal(beforeMutation.audit.acceptedCompletion, false);
   assert.equal(beforeMutation.shouldHandleApprovedPlanNoTool, true);
   assert.equal(afterMutation.audit.tasks[0].evidenceStatus, "requires_browser_validation");
-  assert.equal(afterMutation.audit.acceptedCompletion, true);
-  assert.equal(afterMutation.shouldHandleApprovedPlanNoTool, false);
+  assert.equal(afterMutation.audit.acceptedCompletion, false);
+  assert.equal(afterMutation.hasRemainingApprovedPlanTasks, true);
+  assert.equal(afterMutation.shouldHandleApprovedPlanNoTool, true);
 });

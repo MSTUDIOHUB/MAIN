@@ -29,6 +29,7 @@ import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -168,14 +169,19 @@ export class AgentOrchestrator {
               sourceObservationKey: loopState.executeRecoveryState.sourceObservationKey,
               decisionCheckpoint: loopState.executeRecoveryState.decisionCheckpoint,
               phaseNoProgressCount: loopState.executeRecoveryState.phaseNoProgressCount,
+              protocolNoProgressCount: loopState.executeRecoveryState.protocolNoProgressCount,
+              protocolNoProgressFingerprint: loopState.executeRecoveryState.protocolNoProgressFingerprint,
             },
           );
           callbacks.onExecuteRecoveryStateChange?.({
             mode: loopState.executeRecoveryState.mode,
             reason: loopState.executeRecoveryState.reason,
             expectedTarget: loopState.executeRecoveryState.expectedTarget,
+            attempts: loopState.executeRecoveryState.attempts,
             phase: contract.phase,
             phaseNoProgressCount: loopState.executeRecoveryState.phaseNoProgressCount,
+            protocolNoProgressCount: loopState.executeRecoveryState.protocolNoProgressCount,
+            protocolNoProgressFingerprint: loopState.executeRecoveryState.protocolNoProgressFingerprint,
             readLease: loopState.executeRecoveryState.readLease,
             sourceObservationKey: loopState.executeRecoveryState.sourceObservationKey,
             decisionCheckpoint: loopState.executeRecoveryState.decisionCheckpoint,
@@ -416,6 +422,7 @@ export class AgentOrchestrator {
           toolExecutionRuntimeState: loopState.toolExecutionRuntimeState,
           iterationContext: turnIterationContext,
           turnInputContextSignals,
+          latestUserPromptText,
           recentToolActivity: loopState.recentToolActivity,
           recentPlanToolActivity: loopState.recentPlanToolActivity,
           lastAssistantTextForCheckpoint:
@@ -433,6 +440,24 @@ export class AgentOrchestrator {
           iterationStreamPreparation,
         );
         publishExecuteRecoveryState();
+        if (iterationStreamPreparation.recoveryPause) {
+          const pause = iterationStreamPreparation.recoveryPause;
+          callbacks.onNonActionableStop(
+            pause.message,
+            "no_action",
+            {
+              phase: "paused",
+              recoveryReason: "execute_recovery_no_progress_limit",
+              nextStep: pause.message,
+            },
+          );
+          emitRunPausedEvent(
+            "execute_recovery_no_progress_limit",
+            pause.message,
+          );
+          callbacks.onStatusChange("idle");
+          return;
+        }
         const {
           runtimeIntent,
           finalTextOnlyStep,
@@ -451,10 +476,28 @@ export class AgentOrchestrator {
           allowExecuteRecoveryFileRead,
           effectiveExecuteRecoveryFileRead,
           recoveryActionContract,
-          allowApprovedPlanRecoveryFileRead,
           iterationAllTools,
           availableToolNames,
         } = toolSurfaceDecision;
+
+        const preStreamLedger = callbacks.getPlanExecutionEvidenceLedger();
+        const preStreamTurnContract = this.getLatestTurnContract();
+        const preStreamEvidenceAudit = buildExecuteEvidenceClosureAudit({
+          ledger: preStreamLedger,
+          validationExpected: preStreamTurnContract?.validationExpected === true,
+        });
+        const requiresExecutionEvidence =
+          preStreamTurnContract?.completionEvidenceRequired === "execution_evidence" ||
+          preStreamTurnContract?.mutationExpected === true ||
+          preStreamTurnContract?.validationExpected === true ||
+          (workflowMode === "plan" && callbacks.getIsPlanApproved());
+        const holdExecuteConclusionDraft =
+          runtimeIntent === "execute" &&
+          requiresExecutionEvidence &&
+          (preStreamLedger.length === 0 || !preStreamEvidenceAudit.completionAllowed);
+        if (holdExecuteConclusionDraft) {
+          callbacks.onStreamToken("__EVIDENCE_DRAFT_HOLD__:execution_evidence", assistantMsgId);
+        }
 
         // 2. Stream LLM response
         const streamInvocation = await invokeStreamWithRecoveryForIteration({
@@ -518,6 +561,7 @@ export class AgentOrchestrator {
           effectiveMaxIterations,
           iterationRequestStartedAt,
           runtimeIntent,
+          effectiveTurnContract: this.latestTurnContract,
           forceXmlTools,
           iterationAllTools,
           llmTools,
@@ -603,7 +647,6 @@ export class AgentOrchestrator {
           managedAgentMessages: messagesSentToLLM,
           snapshotContextLimit,
           repairExecutionRequestInChat,
-          allowApprovedPlanRecoveryFileRead,
           effectiveExecuteRecoveryFileRead,
           hooksConfig,
           turnInputContextSignals,

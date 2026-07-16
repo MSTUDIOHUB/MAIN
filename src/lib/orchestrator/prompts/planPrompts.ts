@@ -232,7 +232,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
     return [
       "当前剩余任务需要浏览器级验证。下一步必须调用可用的 Browser/Playwright 工具，而不是继续用 curl、grep、cat 或重复启动 dev server。",
       "验证策略：使用当前实际 dev server URL；打开页面；执行 DOM 断言；必要时截图；如果是 Markdown Viewer/test-sample.md 场景，读取样例内容后注入编辑器 textarea，触发 input，再检查 preview 中标题、代码块、表格、脚注、Mermaid 容器和关键样式。",
-      "若 Browser/Playwright 工具调用失败或不可用，暂停并说明待用户验证，不要继续兜圈。",
+      "若 Browser/Playwright 工具调用失败或不可用，因自动浏览器证据缺失而如实暂停；可把具体人工复核写入结论建议，但不能用人工复核关闭自动验收缺口，也不要继续兜圈。",
       "待验证任务：",
       input.remainingText,
     ].join("\n");
@@ -240,7 +240,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
   return [
     "The remaining task requires browser-level validation. Next, call an available Browser/Playwright tool; do not keep using curl, grep, cat, or repeated dev-server starts.",
     "Validation strategy: use the actual dev-server URL, open the page, run DOM assertions, and take a screenshot if needed. For Markdown Viewer/test-sample.md, read the sample content, inject it into the editor textarea, dispatch input, then assert the preview contains headings, code blocks, tables, footnotes, Mermaid containers, and key styles.",
-    "If Browser/Playwright is unavailable or fails, pause and report pending user validation instead of looping.",
+    "If Browser/Playwright is unavailable or fails, pause honestly because automatic browser evidence is missing. You may list a concrete manual check as an advisory, but it cannot close the automatic acceptance gap; do not loop.",
     "Pending validation:",
     input.remainingText,
   ].join("\n");
@@ -249,7 +249,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
 export function resolveApprovedPlanValidationBoundary(input: {
   audit: PlanTaskEvidenceAudit | null;
   availableToolNames: Set<string>;
-}): "none" | "browser_prompt" | "pause_external_validation" {
+}): "none" | "browser_prompt" | "pause_browser_unavailable" | "pause_external_validation" {
   const audit = input.audit;
   if (!audit) return "none";
   const browserAvailable = hasBrowserValidationCapability(input.availableToolNames);
@@ -260,11 +260,9 @@ export function resolveApprovedPlanValidationBoundary(input: {
   const remaining = audit.remainingTasks;
   if (remaining.length === 0) return "none";
   const allBrowser = remaining.every(isPlanTaskAwaitingBrowserValidation);
-  const allExternal = remaining.every((task) =>
-    isPlanTaskAwaitingExternalValidation(task) ||
-    (isPlanTaskAwaitingBrowserValidation(task) && !browserAvailable)
-  );
+  const allExternal = remaining.every(isPlanTaskAwaitingExternalValidation);
   if (allBrowser && browserAvailable) return "browser_prompt";
+  if (allBrowser) return "pause_browser_unavailable";
   if (allExternal) return "pause_external_validation";
   return "none";
 }

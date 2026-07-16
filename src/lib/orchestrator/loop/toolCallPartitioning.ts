@@ -1,5 +1,5 @@
-import { shouldBypassApprovedPlanReadCacheForPatchRecovery } from "../../approvedPlanRecoveryTools";
 import {
+  normalizeRecoveryReadRange,
   resolveExecuteRecoveryActionContract,
   resolveExecuteRecoveryBatchDecision,
   shouldUseExecutePatchRecoveryReadLease,
@@ -101,6 +101,52 @@ export interface ToolCallPartitioningResult {
   preExecutionResults: ToolExecutionResult[];
 }
 
+function parentHasReusableDelegatedSourceWindow(input: {
+  activity: PlanToolActivitySummary;
+  fileReadStates: Map<string, FileReadState>;
+  managedAgentMessages: AgentMessage[];
+}): boolean {
+  const delegated = input.activity.delegatedObservation;
+  if (!delegated || delegated.parentContextState !== "reference_only") return true;
+  return [...input.fileReadStates.values()].some((state) => {
+    if (!workspacePathsReferToSameFile(state.path, input.activity.target)) return false;
+    if (!isContentInActiveMessages(state.modelContent, input.managedAgentMessages)) return false;
+    if (
+      delegated.sourceVersion &&
+      state.observation?.versionToken &&
+      delegated.sourceVersion !== state.observation.versionToken
+    ) return false;
+    if (!delegated.sourceRange) return true;
+    if (!state.window) return false;
+    return state.window.startLine <= delegated.sourceRange.startLine &&
+      state.window.endLine >= delegated.sourceRange.endLine;
+  });
+}
+
+export function findDelegatedObservationRequiringParentReread(input: {
+  mutationTargets: string[];
+  recentToolActivity: PlanToolActivitySummary[];
+  fileReadStates: Map<string, FileReadState>;
+  managedAgentMessages: AgentMessage[];
+}): PlanToolActivitySummary | null {
+  for (const target of input.mutationTargets) {
+    const delegatedActivities = [...input.recentToolActivity].reverse().filter((activity) =>
+      activity.delegatedObservation?.requiresParentReread === true &&
+      workspacePathsReferToSameFile(activity.target, target)
+    );
+    for (const delegatedActivity of delegatedActivities) {
+      if (!parentHasReusableDelegatedSourceWindow({
+          activity: delegatedActivity,
+          fileReadStates: input.fileReadStates,
+          managedAgentMessages: input.managedAgentMessages,
+        })) {
+        return delegatedActivity;
+      }
+    }
+  }
+  return null;
+}
+
 export async function partitionToolCallsForExecution(input: {
   toolCalls: ToolCallToExecute[];
   workspace: string;
@@ -120,7 +166,6 @@ export async function partitionToolCallsForExecution(input: {
   failedToolCallCounts: Map<string, number>;
   buildCurrentTaskTargetingProfile: () => TaskTargetingProfile;
   approvedPlanActionOnlyRecoveryActive: boolean;
-  allowApprovedPlanRecoveryFileRead: boolean;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
   effectiveExecuteRecoveryFileRead: boolean;
   readOnlyResultCache: Map<string, CachedReadOnlyToolResult>;
@@ -149,7 +194,6 @@ export async function partitionToolCallsForExecution(input: {
     failedToolCallCounts,
     buildCurrentTaskTargetingProfile,
     approvedPlanActionOnlyRecoveryActive,
-    allowApprovedPlanRecoveryFileRead,
     executeRecoveryState,
     effectiveExecuteRecoveryFileRead,
     readOnlyResultCache,
@@ -173,7 +217,6 @@ export async function partitionToolCallsForExecution(input: {
   const queuedFileReadSignatures = new Set<string>();
   const toolFailureSignatures = new Map<string, string>();
   const preExecutionResults: ToolExecutionResult[] = [];
-  let approvedPlanPatchRecoveryReadLeaseClaimed = false;
   let executePatchRecoveryReadLeaseClaimed = false;
   let sawOrderSensitiveWorkspaceAction = false;
   let deferRemainingCallsForBatchOrder = false;
@@ -186,6 +229,8 @@ export async function partitionToolCallsForExecution(input: {
     sourceObservationKey: executeRecoveryState.sourceObservationKey,
     decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
     phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount ?? executeRecoveryState.iterationCount,
+    protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+    protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
     devServerStatus: executeRecoveryDevServerObservation.status,
     devServerNextCapability: executeRecoveryDevServerObservation.nextCapability,
     devServerUrl: executeRecoveryDevServerObservation.url,
@@ -281,7 +326,9 @@ export async function partitionToolCallsForExecution(input: {
       });
       const isExecuteRecoveryScopeCorrection = executeRecoveryBatchDecision.active;
       const isReadScopeDeferred = tc.name === "read_file";
-      const isInternalScopeDeferral = isExecuteRecoveryScopeCorrection || isReadScopeDeferred;
+      const isDelegationPolicyDeferral = tc.name === "spawn_subagent";
+      const isInternalScopeDeferral =
+        isExecuteRecoveryScopeCorrection || isReadScopeDeferred || isDelegationPolicyDeferral;
       const message = isExecuteRecoveryScopeCorrection
         ? tc.name === "read_file"
           ? callbacks.getPreferredLanguage() === "zh"
@@ -290,6 +337,10 @@ export async function partitionToolCallsForExecution(input: {
           : callbacks.getPreferredLanguage() === "zh"
             ? `EXECUTE_RECOVERY_SCOPE_DEFERRED: ${tc.name} 不属于当前 ${executeRecoveryBatchDecision.phase} 阶段；请使用当前工具面完成下一能力。`
             : `EXECUTE_RECOVERY_SCOPE_DEFERRED: ${tc.name} is outside the current ${executeRecoveryBatchDecision.phase} phase; use the active tool surface for the next capability.`
+        : isDelegationPolicyDeferral
+        ? callbacks.getPreferredLanguage() === "zh"
+          ? "SUBAGENT_DELEGATION_DEFERRED: 当前阶段或自适应准入没有开放新的子智能体。请继续主体的当前步骤；若已有子智能体正在运行，请先 wait_subagents 汇合。"
+          : "SUBAGENT_DELEGATION_DEFERRED: The current phase or adaptive admission does not allow another subagent. Continue the parent's current step; join any running children with wait_subagents first."
         : unsupportedMessage;
       if (executeRecoveryBatchDecision.active) {
         logAgentEvent("execute_recovery_scope_deferred", {
@@ -302,6 +353,17 @@ export async function partitionToolCallsForExecution(input: {
           expectedTarget: executeRecoveryState.expectedTarget,
           availableToolNames: Array.from(availableToolNames).slice(0, 12),
           outcome: "internal_scope_feedback",
+        });
+      }
+      if (isDelegationPolicyDeferral) {
+        logAgentEvent("delegation_admission_deferred", {
+          iteration,
+          reason: "spawn_unavailable_on_current_tool_surface",
+          workflowMode,
+          runtimeIntent,
+          planRuntimePhase,
+          availableToolNames: Array.from(availableToolNames).slice(0, 12),
+          failureKind: "policy",
         });
       }
       logAgentEvent("plan_unsupported_tool_call_suppressed", {
@@ -327,6 +389,8 @@ export async function partitionToolCallsForExecution(input: {
           internalFeedback: true,
           qualityGateReason: isExecuteRecoveryScopeCorrection
             ? "execute_recovery_scope_deferred"
+            : isDelegationPolicyDeferral
+            ? "subagent_delegation_deferred"
             : "read_scope_deferred",
         });
       }
@@ -341,6 +405,8 @@ export async function partitionToolCallsForExecution(input: {
           ? {
               qualityGateReason: isExecuteRecoveryScopeCorrection
                 ? "execute_recovery_scope_deferred"
+                : isDelegationPolicyDeferral
+                ? "subagent_delegation_deferred"
                 : "read_scope_deferred",
               internalFeedback: true,
               displayContent: "",
@@ -505,10 +571,14 @@ export async function partitionToolCallsForExecution(input: {
             !scopeTarget || !validateSubagentScopeTarget(subagentScope, scopeTarget)
           )
         : !!scopeConflict;
+      const parentScopeDeferred = !subagentScope && !!scopeConflict;
       callbacks.onDebugEvent?.("delegation_scope_decision", {
         tool: tc.name,
         targets: scopeTargets,
-        decision: scopeBlocked ? "blocked" : "allowed",
+        decision: parentScopeDeferred ? "deferred" : scopeBlocked ? "blocked" : "allowed",
+        reason: parentScopeDeferred
+          ? "overlapping_active_scope"
+          : scopeBlocked ? "subagent_scope_escape" : "no_scope_conflict",
         agentKind: subagentScope ? "subagent" : "parent",
         subagentId: subagentScope?.subagentId || scopeConflict?.subagentId || null,
         scopeKey: subagentScope?.scopeKey || scopeConflict?.scopeKey || null,
@@ -516,15 +586,39 @@ export async function partitionToolCallsForExecution(input: {
       if (scopeBlocked) {
         const message = subagentScope
           ? `SUBAGENT_SCOPE_BLOCKED: ${tc.name} targets '${scopeTargets.join(", ") || "<missing path>"}' are outside allowed_paths for scope '${subagentScope.scopeKey}'.`
-          : `PARENT_SCOPE_OWNED_BY_SUBAGENT: '${scopeTargets.join(", ")}' overlaps the lease held by ${scopeConflict?.subagentId} (${scopeConflict?.scopeKey}). Continue non-overlapping work and call wait_subagents before accessing it.`;
-        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+          : `PARENT_SCOPE_DEFERRED_TO_SUBAGENT: '${scopeTargets.join(", ")}' overlaps the active lease held by ${scopeConflict?.subagentId} (${scopeConflict?.scopeKey}). This is a policy deferral, not a tool failure; continue non-overlapping work and call wait_subagents before accessing it.`;
+        if (parentScopeDeferred) {
+          toolFailureSignatures.delete(tc.id);
+          callbacks.onToolDone(tc.name, target, message, {
+            toolCallId: tc.id,
+            internalFeedback: true,
+            qualityGateReason: "subagent_scope_policy_deferred",
+          });
+          logAgentEvent("delegation_scope_deferred", {
+            iteration,
+            tool: tc.name,
+            targets: scopeTargets,
+            conflictingSubagentId: scopeConflict?.subagentId || null,
+            conflictingScopeKey: scopeConflict?.scopeKey || null,
+            failureKind: "policy",
+          });
+        } else {
+          callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+        }
         preExecutionResults.push({
           toolCallId: tc.id,
           name: tc.name,
           target,
-          content: `Error: ${message}`,
-          isError: true,
-          lifecycleState: "blocked",
+          content: parentScopeDeferred ? message : `Error: ${message}`,
+          displayContent: parentScopeDeferred ? "" : undefined,
+          isError: !parentScopeDeferred,
+          lifecycleState: parentScopeDeferred ? "completed" : "blocked",
+          ...(parentScopeDeferred
+            ? {
+                internalFeedback: true,
+                qualityGateReason: "subagent_scope_policy_deferred",
+              }
+            : {}),
         });
         continue;
       }
@@ -801,8 +895,62 @@ export async function partitionToolCallsForExecution(input: {
         content: `Error: ${message}`,
         isError: true,
         lifecycleState: "blocked",
+        approvedPlanScopeConflict: {
+          requestedTargets: approvedPlanMutationScope.requestedTargets,
+          unexpectedTargets: approvedPlanMutationScope.unexpectedTargets,
+          plannedTargets: approvedPlanMutationScope.plannedTargets,
+        },
       });
       continue;
+    }
+
+    if (isWorkspaceMutationToolCall(tc.name, toolArgs)) {
+      const mutationTargets = resolveWorkspaceMutationTargets(tc.name, toolArgs, target);
+      const delegatedSource = findDelegatedObservationRequiringParentReread({
+        mutationTargets,
+        recentToolActivity,
+        fileReadStates,
+        managedAgentMessages,
+      });
+      if (delegatedSource) {
+        const rereadTarget = mutationTargets.find((candidate) =>
+          workspacePathsReferToSameFile(candidate, delegatedSource.target)
+        ) || delegatedSource.target;
+        const readToolAvailable = availableToolNames.has("read_file");
+        const message = callbacks.getPreferredLanguage() === "zh"
+          ? `PARENT_SOURCE_REREAD_REQUIRED: ${delegatedSource.target} 的证据由子智能体 ${delegatedSource.delegatedObservation?.owner.subagentId} 观察，join 只注入了紧凑引用，不能作为父任务已消费的源码窗口。${readToolAvailable ? `请先对 ${rereadTarget} 调用一次定向 read_file，再根据父任务实际看到的版本修改。` : `当前工具面缺少 read_file；请保持修改暂停，直到恢复契约重新开放该定向读取能力。`}`
+          : `PARENT_SOURCE_REREAD_REQUIRED: evidence for ${delegatedSource.target} was observed by child ${delegatedSource.delegatedObservation?.owner.subagentId}; join injected only a compact reference, not parent-consumed source. ${readToolAvailable ? `Call one targeted read_file for ${rereadTarget}, then mutate from the version actually seen by the parent.` : "read_file is absent from the current tool surface; keep the mutation paused until the recovery contract exposes that targeted read."}`;
+        toolFailureSignatures.delete(tc.id);
+        callbacks.onToolDone(tc.name, target, message, {
+          toolCallId: tc.id,
+          internalFeedback: true,
+          qualityGateReason: "subagent_parent_reread_required",
+        });
+        logAgentEvent("subagent_parent_reread_required", {
+          iteration,
+          tool: tc.name,
+          target,
+          rereadTarget,
+          ownerSubagentId: delegatedSource.delegatedObservation?.owner.subagentId || null,
+          sourceObservationKey: delegatedSource.delegatedObservation?.sourceObservationKey || null,
+          sourceVersion: delegatedSource.delegatedObservation?.sourceVersion || null,
+          sourceRange: delegatedSource.delegatedObservation?.sourceRange || null,
+          readToolAvailable,
+          failureKind: "policy",
+        });
+        preExecutionResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: message,
+          displayContent: "",
+          isError: false,
+          lifecycleState: "completed",
+          internalFeedback: true,
+          qualityGateReason: "subagent_parent_reread_required",
+        });
+        continue;
+      }
     }
 
     if (
@@ -938,49 +1086,36 @@ export async function partitionToolCallsForExecution(input: {
         }
         fileReadState = fileReadSignature ? fileReadStates.get(fileReadSignature) : undefined;
       }
-      const bypassApprovedPlanPatchRecoveryReadCache =
-        !approvedPlanPatchRecoveryReadLeaseClaimed &&
-        workflowMode === "plan" &&
-        callbacks.getIsPlanApproved() &&
-        isMutationRuntimeIntent(runtimeIntent) &&
-        shouldBypassApprovedPlanReadCacheForPatchRecovery({
-          toolName: tc.name,
-          allowFileRead: allowApprovedPlanRecoveryFileRead,
-          target,
-          recentActivity: recentPlanToolActivity,
-        });
       const bypassExecutePatchRecoveryReadCache =
-        workflowMode === "edit" &&
         isMutationRuntimeIntent(runtimeIntent) &&
         shouldUseExecutePatchRecoveryReadLease({
           toolName: tc.name,
           allowFileRead: effectiveExecuteRecoveryFileRead,
           target,
-          recentActivity: recentToolActivity,
+          requestedRange: normalizeRecoveryReadRange(effectiveToolArgs),
+          observedVersion: fileReadMetadata
+            ? `${fileReadMetadata.sizeBytes}:${fileReadMetadata.modifiedMs}`
+            : null,
+          activeReadLease: executeRecoveryState.readLease,
           leaseClaimed: executePatchRecoveryReadLeaseClaimed,
         });
-      if (bypassApprovedPlanPatchRecoveryReadCache) approvedPlanPatchRecoveryReadLeaseClaimed = true;
       if (bypassExecutePatchRecoveryReadCache) executePatchRecoveryReadLeaseClaimed = true;
-      const bypassPatchRecoveryReadCache =
-        bypassApprovedPlanPatchRecoveryReadCache || bypassExecutePatchRecoveryReadCache;
+      const bypassPatchRecoveryReadCache = bypassExecutePatchRecoveryReadCache;
       if (bypassPatchRecoveryReadCache) {
-        logAgentEvent(
-          bypassApprovedPlanPatchRecoveryReadCache
-            ? "approved_plan_patch_recovery_read_cache_bypass"
-            : "execute_patch_recovery_read_cache_bypass",
-          {
+        logAgentEvent("execute_patch_recovery_read_cache_bypass", {
             iteration,
             target,
-            leaseScope: "one_targeted_read_per_batch",
-            recentActivity: (workflowMode === "plan" ? recentPlanToolActivity : recentToolActivity)
+            leaseScope: "recovery_action_contract",
+            readLeasePurpose: executeRecoveryState.readLease?.purpose || null,
+            readLeaseState: executeRecoveryState.readLease?.state || null,
+            recentActivity: recentToolActivity
               .slice(-4)
               .map((activity) => ({
                 name: activity.name,
                 target: activity.target,
                 status: activity.status,
               })),
-          },
-        );
+          });
       }
 
       if (

@@ -79,6 +79,7 @@ function createFixtureState() {
     planEvidenceRecoveryObjective: "none",
     planEvidenceRecoveryPasses: 1,
     planEvidenceNoProgressPasses: 2,
+    planEvidenceProgressFingerprint: "",
     planReasoningOnlyRecoveryPasses: 3,
     planAutoScaffoldPromptIssued: true,
     planDraftingRecoveryReadCount: 4,

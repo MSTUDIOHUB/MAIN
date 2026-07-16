@@ -39,13 +39,60 @@ export interface MainThreadProgressUpdate {
   action?: string;
   evidence?: string;
   next?: string;
+  /** Canonical structured target used by runtime projections and deduplication. */
+  canonicalTarget?: string;
+  /** Legacy target alias retained for persisted pre-v2 progress events. */
   target?: string;
   tool?: string;
+  /** Tool calls that produced this progress snapshot. */
+  sourceToolCallIds?: string[];
   dedupeKey?: string;
   repeatCount?: number;
   iteration?: number;
   /** Internal diagnostics are persisted/logged but never projected as user work. */
   audience?: "user" | "internal";
+}
+
+type MainThreadProgressUpdateInput = MainThreadProgressUpdate & {
+  targets?: unknown;
+  toolName?: unknown;
+};
+
+function normalizeProgressTarget(value: unknown): string {
+  const normalized = String(value || "").trim().replace(/\\/g, "/");
+  if (!normalized) return "";
+  const scheme = normalized.match(/^([a-z][a-z0-9+.-]*:\/\/)(.*)$/i);
+  if (scheme) {
+    const suffix = scheme[2].replace(/\/{2,}/g, "/").replace(/\/$/, "");
+    return `${scheme[1]}${suffix}`;
+  }
+  return normalized.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+}
+
+/**
+ * Normalize progress at the event boundary so UI projections never have to
+ * infer tool identity or targets from localized presentation text.
+ */
+export function normalizeMainThreadProgressUpdate(
+  progress: MainThreadProgressUpdateInput,
+): MainThreadProgressUpdate {
+  const legacyTargets = Array.isArray(progress.targets) ? progress.targets : [];
+  const canonicalTarget = normalizeProgressTarget(
+    progress.canonicalTarget || progress.target || legacyTargets[0] || "",
+  );
+  const tool = String(progress.tool || progress.toolName || "").trim();
+  const sourceToolCallIds = Array.from(new Set(
+    (Array.isArray(progress.sourceToolCallIds) ? progress.sourceToolCallIds : [])
+      .map((id) => String(id || "").trim())
+      .filter(Boolean),
+  )).slice(0, 12);
+
+  return {
+    ...progress,
+    ...(tool ? { tool } : {}),
+    ...(canonicalTarget ? { target: canonicalTarget, canonicalTarget } : {}),
+    sourceToolCallIds,
+  };
 }
 
 export interface MainThreadItem {
@@ -75,7 +122,7 @@ export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "slash.command.failed"; threadId: string; turnId?: string; timestampMs: number; command: string; executionMode: "local_fast" | "model_workflow"; error: MainThreadError }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "path_alias_hit"; threadId: string; turnId: string; timestampMs: number; tool: string; field: string; from: string; to: string; rule: string }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "plan_state_hydrated"; threadId: string; turnId?: string; timestampMs: number; reason: string; taskCount: number; artifactPaths: string[] }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "harness.telemetry"; threadId: string; turnId?: string; timestampMs: number; telemetry: MainThreadHarnessTelemetry }
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "harness.telemetry"; threadId: string; turnId?: string; timestampMs: number; telemetry: MainThreadHarnessTelemetry } & Partial<MainThreadRunIdentity>)
   // Progress belongs to a concrete run whenever the emitter can identify one.
   // Keep the identity optional so persisted pre-v2 events remain readable.
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "progress.updated"; threadId: string; turnId: string; timestampMs: number; progress: MainThreadProgressUpdate } & Partial<MainThreadRunIdentity>)
@@ -130,9 +177,15 @@ export function normalizeToolFeedbackFormat(value: unknown, fallback: ToolFeedba
 }
 
 export function withEventSchema<T extends MainThreadEventInput>(event: T): MainThreadEvent {
+  const normalizedEvent = event.type === "progress.updated"
+    ? {
+        ...event,
+        progress: normalizeMainThreadProgressUpdate(event.progress as MainThreadProgressUpdateInput),
+      }
+    : event;
   return {
     schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
-    ...event,
+    ...normalizedEvent,
   } as MainThreadEvent;
 }
 

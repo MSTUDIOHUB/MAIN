@@ -26,14 +26,49 @@ test("assistant completion phase owns the no-tool assistant completion ordering"
   const planNoToolRecovery = indexOfRequired(phaseSource, /handlePlanNoToolRecovery\(\{/);
   const missingToolNoToolRecovery = indexOfRequired(phaseSource, /handleMissingToolNoToolRecovery\(\{/);
   const approvedPlanFinalization = indexOfRequired(phaseSource, /handleApprovedPlanFinalization\(\{/);
+  const preCompletionEvidenceAudit = indexOfRequired(phaseSource, /resolvePreCompletionEvidenceRecoveryDecision\(\{/);
   const finalNoToolAssistantTurn = indexOfRequired(phaseSource, /handleFinalNoToolAssistantTurn\(\{/);
 
   assert.ok(replyOptionsPause < approvedPlanNoToolRecovery);
-  assert.ok(approvedPlanNoToolRecovery < executeNoToolRecovery);
+  assert.ok(approvedPlanNoToolRecovery < preCompletionEvidenceAudit);
+  assert.ok(preCompletionEvidenceAudit < executeNoToolRecovery);
   assert.ok(executeNoToolRecovery < planNoToolRecovery);
   assert.ok(planNoToolRecovery < missingToolNoToolRecovery);
   assert.ok(missingToolNoToolRecovery < approvedPlanFinalization);
   assert.ok(approvedPlanFinalization < finalNoToolAssistantTurn);
+  assert.match(phaseSource, /onStreamToken\("__ESCALATION_RESET__:evidence_recovery", input\.assistantMsgId\)/);
+  assert.match(phaseSource, /onStreamToken\("__EVIDENCE_DRAFT_COMMIT__:evidence_closed", input\.assistantMsgId\)/);
+  assert.match(phaseSource, /precompletion_evidence_recovery_activated/);
+  assert.match(
+    phaseSource,
+    /validationExpected: input\.effectiveTurnContract\?\.validationExpected === true/,
+  );
+  assert.doesNotMatch(
+    phaseSource,
+    /validationExpected:[\s\S]{0,160}!externalReviewIsAdvisory/,
+  );
+  assert.match(phaseSource, /currentExecuteRecoveryState\.mode !== "normal"/);
+  assert.match(phaseSource, /precompletion_evidence_recovery_still_active/);
+  assert.ok(
+    indexOfRequired(phaseSource, /currentExecuteRecoveryState\.mode !== "normal"/) <
+      indexOfRequired(phaseSource, /__EVIDENCE_DRAFT_COMMIT__:evidence_closed/),
+  );
+});
+
+test("execute conclusions are held until evidence audit commits or discards the draft", () => {
+  const orchestratorSource = sourceFor("src/lib/orchestrator/loop/AgentOrchestrator.ts");
+  const workflowSource = sourceFor("src/lib/orchestrator/workflowEngine.ts");
+  const iterationSource = sourceFor("src/lib/orchestrator/loop/assistantIterationPhase.ts");
+
+  assert.match(orchestratorSource, /__EVIDENCE_DRAFT_HOLD__:execution_evidence/);
+  assert.match(workflowSource, /executionEvidenceDraftHeld/);
+  assert.match(workflowSource, /executionEvidenceDraftBuffer \+= token/);
+  assert.match(workflowSource, /pendingEvidenceDraftFinalPresentation = \{/);
+  assert.match(workflowSource, /execution_evidence_final_presentation_held/);
+  assert.match(workflowSource, /if \(finalPresentation\) \{[\s\S]*callbacks\.onAssistantFinalText\(/);
+  assert.match(workflowSource, /else if \(draft && commitReason === "tool_call"\)/);
+  assert.match(workflowSource, /isUnapprovedPlanRuntime\(\) \|\| context\.executionEvidenceDraftHeld/);
+  assert.match(iterationSource, /__EVIDENCE_DRAFT_COMMIT__:tool_call/);
 });
 
 test("assistant completion phase owns no-tool runtime state folds", () => {

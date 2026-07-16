@@ -11,7 +11,6 @@ import {
 } from "../../approvedPlanRecoveryTools";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
-  buildApprovedPlanValidationPendingMessage,
   buildBrowserValidationContinuationPrompt,
   buildPlanCommandExecutionHint,
   formatPlanAuditRemainingTasks,
@@ -26,6 +25,7 @@ import {
   type PlanExecutionProgressUpdate,
   type PlanTaskEvidenceAudit,
 } from "../../workflowModels";
+import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { OrchestratorCallbacks } from "../types";
 import {
@@ -167,32 +167,29 @@ export function handleApprovedPlanNoToolRecovery(input: {
     .map((item) => [item.status, item.name, item.target, item.detail].filter(Boolean).join(" "))
     .join(language === "zh" ? "；" : "; ");
 
-  if (validationBoundary === "pause_external_validation" && approvedPlanAuditForNoTool) {
+  const automaticEvidenceClosure = buildExecuteEvidenceClosureAudit({
+    ledger: callbacks.getPlanExecutionEvidenceLedger(),
+    validationExpected: true,
+  });
+  if (
+    validationBoundary === "pause_external_validation" &&
+    approvedPlanAuditForNoTool &&
+    automaticEvidenceClosure.completionAllowed
+  ) {
     logAgentEvent("plan_execution_validation_boundary", {
       iteration,
-      reason: "external_validation_unavailable",
+      reason: "external_validation_advisory",
       auditCompleted: approvedPlanAuditForNoTool.completedCount,
       auditTotal: approvedPlanAuditForNoTool.totalCount,
       remaining: approvedPlanAuditForNoTool.remainingTasks.length,
       pendingUserValidation: approvedPlanAuditForNoTool.pendingUserValidationTasks.length,
       browserValidationAvailable,
     });
-    emitPlanExecutionProgress("paused", {
-      currentTask: language === "zh" ? "待用户验证" : "pending user validation",
-      nextStep: language === "zh"
-        ? "自动验证能力不足，等待用户完成浏览器/Tauri/人工确认"
-        : "automation boundary reached; wait for browser/Tauri/user confirmation",
-    });
-    callbacks.onNonActionableStop(
-      buildApprovedPlanValidationPendingMessage({
-        language,
-        audit: approvedPlanAuditForNoTool,
-        browserValidationAvailable,
-      }),
-      "incomplete_plan",
-    );
-    callbacks.onStatusChange("idle");
-    return finish("stopped");
+    // User/Tauri review is a conclusion advisory, not a success criterion.
+    // Once all automatable obligations are closed, let deterministic Plan
+    // finalization publish the result and its review suggestions; do not turn
+    // the run into an artificial pause that waits for impossible tool proof.
+    return finish("none");
   }
 
   if (approvedPlanLengthNoAction) {
@@ -335,7 +332,8 @@ export function handleApprovedPlanNoToolRecovery(input: {
 
   callbacks.appendMessage({
     role: "user",
-    content: validationBoundary === "browser_prompt"
+    content: validationBoundary === "browser_prompt" ||
+        validationBoundary === "pause_browser_unavailable"
       ? buildBrowserValidationContinuationPrompt({ language: MODEL_CONTROL_LANGUAGE, remainingText })
       : buildPlanExecutionNoToolRecoveryPrompt({
           language: MODEL_CONTROL_LANGUAGE,

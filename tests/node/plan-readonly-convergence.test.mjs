@@ -961,6 +961,13 @@ test("missing-visible-plan recovery retries an unchanged window, then accepts a 
       target: "src/main.js",
       content: "READ_FILE_RESULT lines 101-200 with renderer initialization",
       isError: false,
+      readFileObservation: {
+        key: "src/main.js::v1::101-200",
+        path: "src/main.js",
+        requestSignature: "101-200",
+        versionToken: "v1",
+        source: "fresh",
+      },
     }],
     planRuntimePhase: "needs_evidence",
     planEvidenceRecoveryObjective: retry.planEvidenceRecoveryObjective,
@@ -974,6 +981,7 @@ test("missing-visible-plan recovery retries an unchanged window, then accepts a 
     planClosureEvidenceRecoveryIssued: retry.planClosureEvidenceRecoveryIssued,
     planEvidenceRecoveryPasses: retry.planEvidenceRecoveryPasses,
     planEvidenceNoProgressPasses: retry.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: retry.planEvidenceProgressFingerprint,
     setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
   });
 
@@ -989,7 +997,7 @@ test("missing-visible-plan recovery retries an unchanged window, then accepts a 
   });
 });
 
-test("model-draft recovery retries one failed read before blocking repeated errors", () => {
+test("model-draft recovery blocks repeated errors at the bounded no-progress limit", () => {
   const harness = createPlanConvergenceCallbacks("en");
   const phases = [];
   const result = handlePlanQualityRecoveryAfterToolResults({
@@ -1019,12 +1027,12 @@ test("model-draft recovery retries one failed read before blocking repeated erro
     planAutoScaffoldPromptIssued: false,
     planClosureEvidenceRecoveryIssued: true,
     planEvidenceRecoveryPasses: 0,
-    planEvidenceNoProgressPasses: 0,
+    planEvidenceNoProgressPasses: 4,
     setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
   });
 
   assert.equal(result.planEvidenceRecoveryObjective, "model_draft");
-  assert.equal(result.planEvidenceNoProgressPasses, 1);
+  assert.equal(result.planEvidenceNoProgressPasses, 5);
   assert.doesNotMatch(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_COMPLETE/);
   assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_TARGETED_EVIDENCE_RECOVERY/);
   assert.deepEqual(phases.at(-1), {
@@ -1059,6 +1067,7 @@ test("model-draft recovery retries one failed read before blocking repeated erro
     setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
   });
 
+  assert.equal(repeated.planEvidenceNoProgressPasses, 6);
   assert.equal(repeated.planEvidenceRecoveryObjective, "none");
   assert.match(repeated.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_BLOCKED/);
   assert.deepEqual(phases.at(-1), {
@@ -1066,6 +1075,65 @@ test("model-draft recovery retries one failed read before blocking repeated erro
     reason: "evidence recovery repeatedly failed",
     status: "failed",
   });
+});
+
+test("an initial read error persists the Plan baseline before a raw success", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: "model_draft",
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      detail: "application initialization and renderer wiring",
+    }],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Find the blank-render cause and prepare a repair plan.",
+    planQualityRejectCount: 0,
+    planLastQualityGateReason: "",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: true,
+    setPlanRuntimePhase: () => {},
+  };
+  const failed = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 42,
+    results: [{
+      toolCallId: "read-baseline-error",
+      name: "read_file",
+      target: "src/main.js",
+      content: "Error: file unavailable",
+      isError: true,
+    }],
+    planEvidenceRecoveryPasses: 0,
+    planEvidenceNoProgressPasses: 0,
+    planEvidenceProgressFingerprint: "",
+  });
+
+  assert.equal(failed.planEvidenceNoProgressPasses, 1);
+  assert.ok(failed.planEvidenceProgressFingerprint);
+
+  const rawRead = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 43,
+    results: [{
+      toolCallId: "read-unproven-after-error",
+      name: "read_file",
+      target: "src/main.js",
+      content: "READ_FILE_RESULT with no structured observation identity",
+      isError: false,
+    }],
+    planEvidenceRecoveryPasses: failed.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: failed.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: failed.planEvidenceProgressFingerprint,
+  });
+
+  assert.equal(rawRead.planEvidenceRecoveryPasses, 0);
+  assert.equal(rawRead.planEvidenceNoProgressPasses, 2);
 });
 
 test("fresh but insufficient model-draft evidence preserves the model-draft objective", () => {
@@ -1242,7 +1310,7 @@ test("an outstanding evidence request is consumed after reconciliation advances 
   }]);
 });
 
-test("cached evidence recovery retries a different owner once, then pauses without consuming evidence budget", () => {
+test("cached evidence recovery pauses at the bounded no-progress limit without consuming evidence budget", () => {
   const harness = createPlanConvergenceCallbacks("en");
   const recentActivity = [
     {
@@ -1286,12 +1354,12 @@ test("cached evidence recovery retries a different owner once, then pauses witho
   const retry = handlePlanQualityRecoveryAfterToolResults({
     ...common,
     iteration: 10,
-    planEvidenceNoProgressPasses: 0,
+    planEvidenceNoProgressPasses: 4,
     results: [repeatedRead],
   });
 
   assert.equal(retry.planEvidenceRecoveryPasses, 1);
-  assert.equal(retry.planEvidenceNoProgressPasses, 1);
+  assert.equal(retry.planEvidenceNoProgressPasses, 5);
   assert.equal(retry.planClosureEvidenceRecoveryIssued, true);
   assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_CLOSURE_NEEDS_EVIDENCE/);
   assert.match(retry.pendingPlanRuntimeRecoveryPrompt || "", /src\/main\.ts/);
@@ -1310,7 +1378,7 @@ test("cached evidence recovery retries a different owner once, then pauses witho
   });
 
   assert.equal(blocked.planEvidenceRecoveryPasses, 1);
-  assert.equal(blocked.planEvidenceNoProgressPasses, 2);
+  assert.equal(blocked.planEvidenceNoProgressPasses, 6);
   assert.equal(blocked.planClosureEvidenceRecoveryIssued, false);
   assert.match(blocked.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_BLOCKED/);
   assert.match(blocked.pendingPlanRuntimeRecoveryPrompt || "", /do not draft a plan that assumes the unresolved evidence/i);
@@ -1319,6 +1387,244 @@ test("cached evidence recovery retries a different owner once, then pauses witho
     reason: "evidence recovery repeated without progress",
     status: "failed",
   });
+});
+
+test("unproven read payloads cannot extend Plan recovery when the semantic evidence bundle is unchanged", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const phases = [];
+  const recentActivity = [{
+    name: "read_file",
+    target: "src/main.ts",
+    status: "succeeded",
+    detail: "main imports the toolbar component and initializes the application shell",
+  }];
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: "deterministic_closure",
+    recentPlanToolActivity: recentActivity,
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Plan a grounded repair for the toolbar interaction failure.",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "change_targets_lack_confirmed_rationale",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: true,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  };
+  const first = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 20,
+    results: [{
+      toolCallId: "read-semantic-baseline",
+      name: "read_file",
+      target: "src/main.ts",
+      content: "READ_FILE_RESULT lines 1-120",
+      isError: false,
+    }],
+    planEvidenceRecoveryPasses: 0,
+    planEvidenceNoProgressPasses: 0,
+    planEvidenceProgressFingerprint: "",
+  });
+
+  assert.equal(first.planEvidenceRecoveryPasses, 1);
+  assert.equal(first.planEvidenceNoProgressPasses, 0);
+  assert.ok(first.planEvidenceProgressFingerprint);
+
+  let blocked = first;
+  for (let attempt = 1; attempt <= 6; attempt += 1) {
+    blocked = handlePlanQualityRecoveryAfterToolResults({
+      ...common,
+      iteration: 20 + attempt,
+      results: [{
+        toolCallId: `read-unproven-window-${attempt}`,
+        name: "read_file",
+        target: attempt % 2 === 0 ? "src/toolbar.ts" : "src/main.ts",
+        // Text cannot self-assert a new window. Production reads carry a
+        // structured readFileObservation identity when coverage is fresh.
+        content: `READ_FILE_RESULT claimed window ${attempt}`,
+        isError: false,
+      }],
+      planEvidenceRecoveryPasses: blocked.planEvidenceRecoveryPasses,
+      planEvidenceNoProgressPasses: blocked.planEvidenceNoProgressPasses,
+      planEvidenceProgressFingerprint: blocked.planEvidenceProgressFingerprint,
+    });
+  }
+
+  assert.equal(blocked.planEvidenceRecoveryPasses, 1);
+  assert.equal(blocked.planEvidenceNoProgressPasses, 6);
+  assert.equal(blocked.planEvidenceRecoveryObjective, "none");
+  assert.match(blocked.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_BLOCKED/);
+  assert.deepEqual(phases.at(-1), {
+    phase: "blocked",
+    reason: "evidence recovery repeated without progress",
+    status: "failed",
+  });
+});
+
+test("an initial cache stub persists the Plan evidence baseline before a later raw read", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: "model_draft",
+    recentPlanToolActivity: [{
+      name: "read_file",
+      target: "src/main.ts",
+      status: "succeeded",
+      detail: "main initializes the application shell",
+    }],
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Plan a grounded repair for the toolbar interaction failure.",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "change_targets_lack_confirmed_rationale",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: true,
+    setPlanRuntimePhase: () => {},
+  };
+  const stub = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 40,
+    results: [{
+      toolCallId: "read-initial-stub",
+      name: "read_file",
+      target: "src/main.ts",
+      content: "FILE_UNCHANGED_STUB: reuse the existing observation",
+      isError: false,
+    }],
+    planEvidenceRecoveryPasses: 0,
+    planEvidenceNoProgressPasses: 0,
+    planEvidenceProgressFingerprint: "",
+  });
+
+  assert.equal(stub.planEvidenceNoProgressPasses, 1);
+  assert.ok(stub.planEvidenceProgressFingerprint);
+
+  const rawRead = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 41,
+    results: [{
+      toolCallId: "read-unproven-after-stub",
+      name: "read_file",
+      target: "src/main.ts",
+      content: "READ_FILE_RESULT with no structured observation identity",
+      isError: false,
+    }],
+    planEvidenceRecoveryPasses: stub.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: stub.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: stub.planEvidenceProgressFingerprint,
+  });
+
+  assert.equal(rawRead.planEvidenceRecoveryPasses, 0);
+  assert.equal(rawRead.planEvidenceNoProgressPasses, 2);
+});
+
+test("structured non-overlapping fresh coverage resets Plan no-progress without inventing semantic facts", () => {
+  const harness = createPlanConvergenceCallbacks("en");
+  const phases = [];
+  const recentActivity = [{
+    name: "read_file",
+    target: "src/main.ts",
+    status: "succeeded",
+    detail: "main imports the toolbar component and initializes the application shell",
+  }];
+  const common = {
+    callbacks: harness.callbacks,
+    workflowMode: "plan",
+    planRuntimePhase: "needs_evidence",
+    planEvidenceRecoveryObjective: "deterministic_closure",
+    recentPlanToolActivity: recentActivity,
+    attemptedPlanWriteTargets: [],
+    latestUserPromptText: "Plan a grounded repair for the toolbar interaction failure.",
+    planQualityRejectCount: 1,
+    planLastQualityGateReason: "change_targets_lack_confirmed_rationale",
+    planLastMissingSections: [],
+    planAutoScaffoldPromptIssued: false,
+    planClosureEvidenceRecoveryIssued: true,
+    setPlanRuntimePhase: (phase, reason, status = "running") => phases.push({ phase, reason, status }),
+  };
+  const observation = (key, requestSignature, source = "fresh") => ({
+    key,
+    path: "src/main.ts",
+    requestSignature,
+    versionToken: "v1",
+    source,
+  });
+  const baseline = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 30,
+    results: [{
+      toolCallId: "read-window-1-120",
+      name: "read_file",
+      target: "src/main.ts",
+      content: "READ_FILE_RESULT lines 1-120",
+      isError: false,
+      readFileObservation: observation("src/main.ts::v1::1-120", "1-120"),
+    }],
+    planEvidenceRecoveryPasses: 0,
+    planEvidenceNoProgressPasses: 0,
+    planEvidenceProgressFingerprint: "",
+  });
+  const narrowed = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 31,
+    results: [{
+      toolCallId: "read-overlap-1-121",
+      name: "read_file",
+      target: "src/main.ts",
+      content: "READ_FILE_WINDOW_NARROWED: requested 1-121; returned only line 121",
+      isError: false,
+      readFileObservation: observation("src/main.ts::v1::1-121", "1-121"),
+    }],
+    planEvidenceRecoveryPasses: baseline.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: baseline.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: baseline.planEvidenceProgressFingerprint,
+  });
+
+  assert.equal(narrowed.planEvidenceRecoveryPasses, 1);
+  assert.equal(narrowed.planEvidenceNoProgressPasses, 1);
+
+  const nextWindow = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 32,
+    results: [{
+      toolCallId: "read-window-121-240",
+      name: "read_file",
+      target: "src/main.ts",
+      content: "READ_FILE_RESULT lines 121-240",
+      isError: false,
+      readFileObservation: observation("src/main.ts::v1::121-240", "121-240"),
+    }],
+    planEvidenceRecoveryPasses: narrowed.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: narrowed.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: narrowed.planEvidenceProgressFingerprint,
+  });
+
+  assert.equal(nextWindow.planEvidenceRecoveryPasses, 2);
+  assert.equal(nextWindow.planEvidenceNoProgressPasses, 0);
+  assert.equal(nextWindow.planEvidenceRecoveryObjective, "deterministic_closure");
+
+  const replay = handlePlanQualityRecoveryAfterToolResults({
+    ...common,
+    iteration: 33,
+    results: [{
+      toolCallId: "replay-window-121-240",
+      name: "read_file",
+      target: "src/main.ts",
+      content: "CACHED_FILE_REPLAY: lines 121-240",
+      isError: false,
+      readFileObservation: observation("src/main.ts::v1::121-240", "121-240", "replay"),
+    }],
+    planEvidenceRecoveryPasses: nextWindow.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: nextWindow.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: nextWindow.planEvidenceProgressFingerprint,
+  });
+
+  assert.equal(replay.planEvidenceRecoveryPasses, 2);
+  assert.equal(replay.planEvidenceNoProgressPasses, 1);
 });
 
 function createPostConvergenceInput(overrides = {}) {

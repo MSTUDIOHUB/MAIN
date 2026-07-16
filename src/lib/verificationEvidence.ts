@@ -14,6 +14,7 @@ import {
 import {
   isFinitePlanValidationCommand,
   type PlanExecutionEvidenceEntry,
+  type ValidationObligation,
 } from "./workflowModels";
 import { isWorkspaceMutationToolName } from "./workspaceMutationTools";
 
@@ -57,6 +58,8 @@ export interface ExecuteEvidenceClosureAudit {
   latestReadyAt: number | null;
   longRunningStatus: ReturnType<typeof resolveDevServerRuntimeState>["status"];
   unresolvedFailureCount: number;
+  validationObligations: ValidationObligation[];
+  unsatisfiedObligationCount: number;
   validationAfterLatestMutation: boolean;
   completionAllowed: boolean;
   gap: ExecuteEvidenceGap;
@@ -82,10 +85,188 @@ function isSuccessfulValidationEvidenceEntry(entry: PlanExecutionEvidenceEntry):
     return false;
   }
   if (entry.kind === "browser_dom" || entry.kind === "browser_screenshot") return true;
-  if (entry.kind === "tauri_required") return true;
+  if (entry.automaticValidation === true) return true;
   return entry.kind === "cmd" &&
     entry.sourceTool === "run_command" &&
     isFinitePlanValidationCommand(entry.value || entry.target || "");
+}
+
+const INTERACTION_BINDING_IDENTIFIER_RE = /^(?:addEventListener|on[A-Z_$][\w$]*|on(?:click|change|input|submit|keydown|keyup|pointer\w*|mouse\w*|touch\w*)|handle[A-Z_$][\w$]*|[\w$]*(?:Handler|Callback|Listener))$/;
+const GENERIC_IDENTIFIER_PARTS = new Set([
+  "add", "event", "listener", "handle", "handler", "callback", "function",
+  "const", "let", "var", "document", "window", "element", "target", "current",
+  "query", "selector", "get", "by", "id", "class", "name", "click", "change",
+]);
+
+function identifierParts(value: string): string[] {
+  return String(value || "")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((part) => part.length > 1 && !GENERIC_IDENTIFIER_PARTS.has(part));
+}
+
+function deriveInteractionRequirement(entry: PlanExecutionEvidenceEntry): {
+  required: boolean;
+  behaviorTargets: string[];
+} {
+  const structuralTargets = (entry.interactionBehaviorTargets || [])
+    .map((target) => String(target || "").trim())
+    .filter(Boolean);
+  if (entry.interactionMutation === true) {
+    return {
+      required: true,
+      behaviorTargets: Array.from(new Set(structuralTargets)).slice(0, 80),
+    };
+  }
+  const identifiers = entry.changedIdentifiers || [];
+  if (!identifiers.some((identifier) => INTERACTION_BINDING_IDENTIFIER_RE.test(identifier))) {
+    return { required: false, behaviorTargets: [] };
+  }
+  return {
+    required: true,
+    behaviorTargets: Array.from(new Set(identifiers.filter((identifier) =>
+      !INTERACTION_BINDING_IDENTIFIER_RE.test(identifier) && identifierParts(identifier).length > 0
+    ))).slice(0, 80),
+  };
+}
+
+function actionMatchesBehaviorTargets(actionTarget: string, behaviorTargets: string[]): boolean {
+  // A browser action can close an interaction obligation only when the source
+  // mutation supplied a concrete behavior target. Treating an empty target
+  // set as a wildcard would let an unrelated click certify unknown behavior.
+  if (behaviorTargets.length === 0) return false;
+  const normalizedAction = String(actionTarget || "").toLowerCase().replace(/[^a-z0-9]+/g, "");
+  const actionParts = new Set(identifierParts(actionTarget));
+  return behaviorTargets.some((behaviorTarget) => {
+    const normalizedBehavior = behaviorTarget.toLowerCase().replace(/[^a-z0-9]+/g, "");
+    if (normalizedBehavior.length >= 3 && normalizedAction.includes(normalizedBehavior)) return true;
+    const behaviorParts = identifierParts(behaviorTarget);
+    if (behaviorParts.length === 0) return false;
+    const overlap = behaviorParts.filter((part) => actionParts.has(part));
+    return overlap.length >= Math.min(2, behaviorParts.length) ||
+      overlap.some((part) => part.length >= 4);
+  });
+}
+
+function assertionMatchesActionEffect(
+  assertionKind: string,
+  effectChangedFields: string[],
+): boolean {
+  const fields = new Set(effectChangedFields);
+  if (assertionKind === "text" || assertionKind === "not_text") {
+    return fields.has("bodyText") ||
+      fields.has("externalDomFingerprint") ||
+      fields.has("target.text");
+  }
+  if (assertionKind === "selector" || assertionKind === "not_selector") {
+    return fields.has("externalDomFingerprint") ||
+      [...fields].some((field) => field.startsWith("target."));
+  }
+  return assertionKind === "title" && fields.has("title");
+}
+
+export function browserInteractionSatisfiesObligation(
+  entry: PlanExecutionEvidenceEntry,
+  behaviorTargets: string[],
+): boolean {
+  const interaction = entry.browserInteraction;
+  if (
+    behaviorTargets.length === 0 ||
+    entry.observationStatus === "failed" ||
+    !interaction ||
+    interaction.pageErrors.length > 0 ||
+    interaction.consoleErrors.length > 0 ||
+    interaction.actions.length === 0 ||
+    interaction.assertions.length === 0 ||
+    interaction.actions.some((action) => !action.succeeded) ||
+    interaction.assertions.some((assertion) => !assertion.passed)
+  ) {
+    return false;
+  }
+  return interaction.actions.some((action) => {
+    if (
+      !action.succeeded ||
+      action.stateChanged !== true ||
+      action.effectStateChanged !== true ||
+      !Array.isArray(action.effectChangedFields) ||
+      action.effectChangedFields.length === 0 ||
+      !action.id ||
+      !actionMatchesBehaviorTargets(action.target, behaviorTargets)
+    ) return false;
+    return interaction.assertions.some((assertion) =>
+      assertion.passed &&
+      assertion.beforePassed === false &&
+      assertion.changedAfterAction === true &&
+      assertion.causallyLinked === true &&
+      assertion.afterActionId === action.id &&
+      assertion.kind !== "no_console_errors" &&
+      assertionMatchesActionEffect(assertion.kind, action.effectChangedFields || []) &&
+      String(assertion.target || "").trim().length > 0
+    );
+  });
+}
+
+/** Build acceptance work only from structured mutation and tool evidence. */
+export function buildValidationObligations(
+  ledger: PlanExecutionEvidenceEntry[],
+): ValidationObligation[] {
+  const obligations: ValidationObligation[] = ledger
+    .filter((entry) => entry.kind === "tauri_required")
+    .map((entry) => ({
+      id: `external-advisory:${entry.id}`,
+      kind: "external_advisory" as const,
+      target: entry.target || entry.value,
+      status: "advisory" as const,
+    }));
+  const indexedBrowserEntries = ledger.flatMap((entry, index) => (
+    entry.kind === "browser_dom" ||
+    entry.kind === "browser_screenshot" ||
+    /(?:browser|playwright|puppeteer|cypress)/i.test(entry.sourceTool)
+  ) ? [{ entry, index }] : []);
+
+  ledger.forEach((mutation, mutationIndex) => {
+    if (!isMutationEvidenceEntry(mutation)) return;
+    const interactionRequirement = deriveInteractionRequirement(mutation);
+    if (!interactionRequirement.required) return;
+    const behaviorTargets = interactionRequirement.behaviorTargets;
+    const laterBrowserEntries = indexedBrowserEntries.filter(({ index }) => index > mutationIndex);
+    const latestRelevantBrowser = [...laterBrowserEntries].reverse().find(({ entry }) => {
+      const interaction = entry.browserInteraction;
+      if (entry.observationStatus === "failed" && (!interaction || interaction.actions.length === 0)) {
+        return true;
+      }
+      return Boolean(interaction?.actions.some((action) =>
+        actionMatchesBehaviorTargets(action.target, behaviorTargets)
+      ));
+    })?.entry;
+    // Browser evidence is temporal: a later failed interaction invalidates an
+    // older success for the same behavior target. Completion must describe the
+    // latest observed page state, not cherry-pick a historical passing click.
+    const satisfyingEntry = latestRelevantBrowser &&
+      browserInteractionSatisfiesObligation(latestRelevantBrowser, behaviorTargets)
+      ? latestRelevantBrowser
+      : undefined;
+    const latestInteraction = latestRelevantBrowser?.browserInteraction;
+    const latestFailed = Boolean(
+      latestRelevantBrowser?.observationStatus === "failed" ||
+      latestInteraction?.pageErrors.length ||
+      latestInteraction?.consoleErrors.length ||
+      latestInteraction?.actions.some((action) => !action.succeeded) ||
+      latestInteraction?.assertions.some((assertion) => !assertion.passed) ||
+      (latestRelevantBrowser && !browserInteractionSatisfiesObligation(latestRelevantBrowser, behaviorTargets))
+    );
+    obligations.push({
+      id: `browser-interaction:${mutation.id}`,
+      kind: "browser_interaction",
+      mutationEvidenceId: mutation.id,
+      target: mutation.target || mutation.value,
+      behaviorTargets,
+      status: latestFailed ? "failed" : satisfyingEntry ? "satisfied" : "open",
+      ...(satisfyingEntry ? { satisfiedByEvidenceId: satisfyingEntry.id } : {}),
+    });
+  });
+  return obligations;
 }
 
 function latestUnresolvedFailures(
@@ -146,6 +327,10 @@ export function buildExecuteEvidenceClosureAudit(input: {
   const epoch = latestMutationIndex >= 0
     ? ordered.slice(latestMutationIndex)
     : ordered;
+  const validationObligations = buildValidationObligations(ordered);
+  const unsatisfiedObligations = validationObligations.filter((obligation) =>
+    obligation.status === "open" || obligation.status === "failed"
+  );
   const unresolvedFailures = latestUnresolvedFailures(epoch);
   const devServerLaunches = epoch.filter((entry) =>
     entry.sourceTool === "execute_command" &&
@@ -159,7 +344,11 @@ export function buildExecuteEvidenceClosureAudit(input: {
   // A real long-running launch creates its own causal validation obligation,
   // even when the task did not mutate a file. Do not let the no-mutation fast
   // path skip PTY readiness and the later browser observation.
-  if ((latestMutationAt === null || !input.validationExpected) && !hasDevServerLifecycle) {
+  if (
+    (latestMutationAt === null || !input.validationExpected) &&
+    !hasDevServerLifecycle &&
+    unsatisfiedObligations.length === 0
+  ) {
     const completionAllowed = unresolvedFailures.length === 0;
     return {
       mutationCount: mutations.length,
@@ -169,6 +358,8 @@ export function buildExecuteEvidenceClosureAudit(input: {
       latestReadyAt: null,
       longRunningStatus: "none",
       unresolvedFailureCount: unresolvedFailures.length,
+      validationObligations,
+      unsatisfiedObligationCount: unsatisfiedObligations.length,
       validationAfterLatestMutation: completionAllowed,
       completionAllowed,
       gap: completionAllowed ? "none" : "unreconciled_failure",
@@ -217,7 +408,14 @@ export function buildExecuteEvidenceClosureAudit(input: {
   const browserAfterReady = latestReadyIndex >= 0 && epoch.some((entry, index) =>
     index > latestReadyIndex &&
     (entry.kind === "browser_dom" || entry.kind === "browser_screenshot") &&
-    isSuccessfulValidationEvidenceEntry(entry)
+    isSuccessfulValidationEvidenceEntry(entry) &&
+    (
+      !validationObligations.some((obligation) => obligation.kind === "browser_interaction") ||
+      validationObligations.some((obligation) =>
+        obligation.kind === "browser_interaction" &&
+        obligation.satisfiedByEvidenceId === entry.id
+      )
+    )
   );
 
   let gap: ExecuteEvidenceGap = "none";
@@ -231,6 +429,8 @@ export function buildExecuteEvidenceClosureAudit(input: {
       ? "unreconciled_failure"
       : "pty_observation_required";
   } else if (hasDevServerLifecycle && !browserAfterReady) {
+    gap = "browser_validation_required";
+  } else if (unsatisfiedObligations.some((obligation) => obligation.kind === "browser_interaction")) {
     gap = "browser_validation_required";
   } else if (
     !hasDevServerLifecycle &&
@@ -249,6 +449,8 @@ export function buildExecuteEvidenceClosureAudit(input: {
     latestReadyAt,
     longRunningStatus: devServerState?.status ?? "none",
     unresolvedFailureCount: unresolvedFailures.length,
+    validationObligations,
+    unsatisfiedObligationCount: unsatisfiedObligations.length,
     validationAfterLatestMutation: gap === "none",
     completionAllowed: gap === "none",
     gap,

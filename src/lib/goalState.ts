@@ -159,10 +159,15 @@ export interface GoalContinuationState {
     mode: ExecuteRecoveryMode;
     reason: string;
     expectedTarget: string | null;
+    /** Recovery activations already spent before this Goal continuation. */
+    attempts?: number;
     /** Derived contract phase retained for diagnostics and schema consistency. */
     phase?: ExecuteRecoveryContractPhase;
     /** Consecutive no-progress turns in this phase, not a transaction-wide budget. */
     phaseNoProgressCount?: number;
+    /** Monotonic retries of the same semantic request, separate from tool failures. */
+    protocolNoProgressCount?: number;
+    protocolNoProgressFingerprint?: string | null;
     /** Exact source read permission/identity carried across Goal slice boundaries. */
     readLease?: RecoveryReadLease | null;
     sourceObservationKey?: string | null;

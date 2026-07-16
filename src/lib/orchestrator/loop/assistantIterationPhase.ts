@@ -1,5 +1,5 @@
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
-import type { ResolvedUserIntent } from "../../runIntent";
+import type { EffectiveTurnContract, ResolvedUserIntent } from "../../runIntent";
 import type { StreamResult } from "../../streaming";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
@@ -63,6 +63,7 @@ export async function handleAssistantIterationPhase(input: {
   effectiveMaxIterations: number;
   iterationRequestStartedAt: number;
   runtimeIntent: ResolvedUserIntent;
+  effectiveTurnContract: EffectiveTurnContract | null;
   forceXmlTools: boolean;
   iterationAllTools: ToolDefinition[];
   llmTools: ToolDefinition[];
@@ -230,6 +231,9 @@ export async function handleAssistantIterationPhase(input: {
     };
   }
   effectiveToolCalls = assistantDisplayActionPhase.effectiveToolCalls;
+  if (effectiveToolCalls.length > 0) {
+    callbacks.onStreamToken("__EVIDENCE_DRAFT_COMMIT__:tool_call", input.assistantMsgId);
+  }
 
   const unityMcpNoToolRecovery = handleUnityMcpNoToolRecovery({
     callbacks,
@@ -322,6 +326,7 @@ export async function handleAssistantIterationPhase(input: {
     workflowMode,
     turnIntent,
     runtimeIntent,
+    effectiveTurnContract: input.effectiveTurnContract,
     mainModeKey,
     commandDirectiveAction: input.commandDirectiveAction,
     workspace,
@@ -381,6 +386,7 @@ export async function handleAssistantIterationPhase(input: {
     waitForPlanApprovalIfNeeded: input.waitForPlanApprovalIfNeeded,
     tryClosePlanWithEvidence: input.tryClosePlanWithEvidence,
     getExecuteRecoveryState: input.getExecuteRecoveryState,
+    activateExecuteRecovery: input.activateExecuteRecovery,
   });
   noToolRuntimeState = assistantCompletionPhase.noToolRuntimeState;
   planRuntimeState = assistantCompletionPhase.planRuntimeState;

@@ -11,12 +11,14 @@ export type RuntimeProgressStatus = "running" | "done" | "failed" | "paused" | "
 
 export interface RuntimeProgressLedgerItem {
   key: string;
+  runId: string;
   phase: string;
   title: string;
   status: RuntimeProgressStatus;
   summary: string;
   target: string;
   tool: string;
+  sourceToolCallIds: string[];
   repeatCount: number;
   cacheHits: number;
   firstSeenAt: number;
@@ -30,20 +32,40 @@ export interface RuntimeProgressProjection {
   activityText: string;
 }
 
+export interface RunStatusHealthSignal {
+  key: string;
+  kind: "failure" | "pause" | "waiting" | "repetition";
+  status: RuntimeProgressStatus;
+  title: string;
+  summary: string;
+  lastSeenAt: number;
+}
+
+export interface RunStatusProjection {
+  currentActivity: RuntimeProgressLedgerItem | null;
+  milestones: RuntimeProgressLedgerItem[];
+  healthSignals: RunStatusHealthSignal[];
+  activityText: string;
+}
+
 type RuntimeProgressAggregation = "snapshot" | "occurrence";
 
 type RuntimeProgressLedgerCandidate = Omit<
   RuntimeProgressLedgerItem,
-  "repeatCount" | "cacheHits"
+  "repeatCount" | "cacheHits" | "sourceToolCallIds"
 > & {
   repeatCount?: number;
   cacheHits?: number;
+  sourceToolCallIds?: string[];
   aggregation?: RuntimeProgressAggregation;
 };
 
 type RuntimeProgressLedgerAccumulator = RuntimeProgressLedgerItem & {
   occurrenceCount: number;
   explicitRepeatCount: number;
+  seenSourceToolCallIds: Set<string>;
+  cachedSourceToolCallIds: Set<string>;
+  legacyCacheHits: number;
   aggregation: RuntimeProgressAggregation;
 };
 
@@ -67,11 +89,18 @@ function normalizeStatus(value: unknown): RuntimeProgressStatus {
 }
 
 function normalizeTarget(value: unknown): string {
-  return String(value || "")
-    .trim()
-    .replace(/\\/g, "/")
-    .replace(/\/+/g, "/")
-    .replace(/\/$/, "");
+  const normalized = String(value || "").trim().replace(/\\/g, "/");
+  if (!normalized) return "";
+  const scheme = normalized.match(/^([a-z][a-z0-9+.-]*:\/\/)(.*)$/i);
+  if (scheme) return `${scheme[1]}${scheme[2].replace(/\/{2,}/g, "/").replace(/\/$/, "")}`;
+  return normalized.replace(/\/{2,}/g, "/").replace(/\/$/, "");
+}
+
+function normalizeSourceToolCallIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(
+    value.map((id) => String(id || "").trim()).filter(Boolean),
+  )).slice(0, 12);
 }
 
 function compactTarget(value: unknown): string {
@@ -139,18 +168,21 @@ function titleForTool(tool: string, target: string, status: RuntimeProgressStatu
 }
 
 function keyForProgress(input: {
+  runId?: string;
   phase?: string;
   title?: string;
   target?: string;
   tool?: string;
   dedupeKey?: string;
 }): string {
+  const runId = compactLine(input.runId || "", 96).toLowerCase();
+  const runPrefix = runId ? `run:${runId}:` : "legacy:";
   const tool = String(input.tool || "").trim();
   const target = normalizeTarget(input.target || "");
-  if (tool || target) return `${toolFamily(tool)}:${tool}:${target}`.toLowerCase();
+  if (tool || target) return `${runPrefix}${toolFamily(tool)}:${tool}:${target}`.toLowerCase();
   const explicit = compactLine(input.dedupeKey || "", 180);
-  if (explicit) return explicit;
-  return `progress:${String(input.phase || "").toLowerCase()}:${compactLine(input.title || "", 120).toLowerCase()}`;
+  if (explicit) return `${runPrefix}${explicit}`;
+  return `${runPrefix}progress:${String(input.phase || "").toLowerCase()}:${compactLine(input.title || "", 120).toLowerCase()}`;
 }
 
 function addItem(
@@ -158,22 +190,33 @@ function addItem(
   item: RuntimeProgressLedgerCandidate,
 ): void {
   const aggregation = item.aggregation === "occurrence" ? "occurrence" : "snapshot";
+  const sourceToolCallIds = normalizeSourceToolCallIds(item.sourceToolCallIds);
   const explicitRepeatCount = Number.isFinite(Number(item.repeatCount))
     ? Math.max(0, Number(item.repeatCount) || 0)
     : 0;
-  const occurrenceIncrement = aggregation === "occurrence"
+  const occurrenceIncrement = sourceToolCallIds.length > 0
+    ? sourceToolCallIds.length
+    : aggregation === "occurrence"
     ? Math.max(1, explicitRepeatCount || 1)
     : 0;
   const existing = map.get(item.key);
   if (!existing) {
     const occurrenceCount = occurrenceIncrement;
+    const cachedSourceToolCallIds = new Set(
+      item.cacheHits ? sourceToolCallIds.slice(0, Math.max(1, item.cacheHits)) : [],
+    );
+    const legacyCacheHits = sourceToolCallIds.length > 0 ? 0 : Math.max(0, item.cacheHits || 0);
     map.set(item.key, {
       ...item,
       aggregation,
+      sourceToolCallIds,
       repeatCount: Math.max(1, occurrenceCount, explicitRepeatCount),
-      cacheHits: Math.max(0, item.cacheHits || 0),
+      cacheHits: cachedSourceToolCallIds.size + legacyCacheHits,
       occurrenceCount,
       explicitRepeatCount,
+      seenSourceToolCallIds: new Set(sourceToolCallIds),
+      cachedSourceToolCallIds,
+      legacyCacheHits,
     });
     return;
   }
@@ -192,12 +235,24 @@ function addItem(
     existing.tool = existing.tool || item.tool;
     existing.phase = existing.phase || item.phase;
   }
-  existing.occurrenceCount += occurrenceIncrement;
+  if (sourceToolCallIds.length > 0) {
+    for (const sourceToolCallId of sourceToolCallIds) {
+      if (!existing.seenSourceToolCallIds.has(sourceToolCallId)) {
+        existing.seenSourceToolCallIds.add(sourceToolCallId);
+        existing.occurrenceCount += 1;
+      }
+      if (item.cacheHits) existing.cachedSourceToolCallIds.add(sourceToolCallId);
+    }
+    existing.sourceToolCallIds = [...existing.seenSourceToolCallIds].slice(-12);
+  } else {
+    existing.occurrenceCount += occurrenceIncrement;
+    existing.legacyCacheHits = aggregation === "occurrence"
+      ? existing.legacyCacheHits + Math.max(0, item.cacheHits || 0)
+      : Math.max(existing.legacyCacheHits, Math.max(0, item.cacheHits || 0));
+  }
   existing.explicitRepeatCount = Math.max(existing.explicitRepeatCount, explicitRepeatCount);
   existing.repeatCount = Math.max(1, existing.occurrenceCount, existing.explicitRepeatCount);
-  existing.cacheHits = aggregation === "occurrence"
-    ? existing.cacheHits + Math.max(0, item.cacheHits || 0)
-    : Math.max(existing.cacheHits, Math.max(0, item.cacheHits || 0));
+  existing.cacheHits = existing.cachedSourceToolCallIds.size + existing.legacyCacheHits;
   existing.lastSeenAt = Math.max(existing.lastSeenAt, item.lastSeenAt);
 }
 
@@ -205,10 +260,12 @@ function itemFromProgressEvent(
   progress: MainThreadProgressUpdate,
   timestampMs: number,
   language: RuntimeProgressLanguage,
+  runId = "",
 ): RuntimeProgressLedgerCandidate | null {
   if (isInternalRuntimeProgressUpdate(progress)) return null;
-  const target = normalizeTarget(progress.target || "");
+  const target = normalizeTarget(progress.canonicalTarget || progress.target || "");
   const tool = String(progress.tool || "").trim();
+  const sourceToolCallIds = normalizeSourceToolCallIds(progress.sourceToolCallIds);
   const status = normalizeStatus(progress.status);
   const title = compactLine(progress.title || titleForTool(tool, target, status, language), 160);
   if (!title && !target && !tool) return null;
@@ -217,13 +274,15 @@ function itemFromProgressEvent(
     ? compactPauseSummary(rawSummary || progress.next || title, language)
     : compactLine(rawSummary, 220);
   return {
-    key: keyForProgress({ phase: progress.phase, title, target, tool, dedupeKey: progress.dedupeKey }),
+    key: keyForProgress({ runId, phase: progress.phase, title, target, tool, dedupeKey: progress.dedupeKey }),
+    runId,
     phase: String(progress.phase || ""),
     title,
     status,
     summary,
     target,
     tool,
+    sourceToolCallIds,
     firstSeenAt: timestampMs,
     lastSeenAt: timestampMs,
     ...(Number.isFinite(Number(progress.repeatCount)) && Number(progress.repeatCount) > 0
@@ -274,8 +333,10 @@ function itemFromHarnessTelemetry(
     : name === "stream_cancelled"
     ? "当前模型流已取消。"
     : `已收到首个流式 chunk，但${seconds ? ` ${seconds} 秒内` : ""}没有新的输出；MAIN 正在等待，持续空闲会暂停本轮。`;
+  const runId = String((event as any).runId || "");
   return {
-    key: `model-stream:${streamId || String((event as any).turnId || "") || name}`,
+    key: `model-stream:${runId}:${streamId || String((event as any).turnId || "") || name}`,
+    runId,
     phase: "blocked",
     title,
     status,
@@ -295,19 +356,22 @@ function itemFromBlock(
 ): RuntimeProgressLedgerCandidate | null {
   if (isInternalRuntimeProgressBlock(block)) return null;
   const timestamp = Number(block?.createdAt || block?.updatedAt || index + 1);
+  const runId = String(block?.runId || "").trim();
   if (block?.type === "progress") {
-    const target = normalizeTarget(block.target || block.targets?.[0] || "");
-    const tool = String(block.toolName || "").trim();
+    const target = normalizeTarget(block.canonicalTarget || block.target || block.targets?.[0] || "");
+    const tool = String(block.tool || block.toolName || "").trim();
     const title = compactLine(block.title || titleForTool(tool, target, normalizeStatus(block.status), language), 160);
     const summary = compactLine(block.observedFact || block.evidence || block.action || block.next || block.why || "", 220);
     return {
-      key: keyForProgress({ phase: block.phase, title, target, tool, dedupeKey: block.dedupeKey }),
+      key: keyForProgress({ runId, phase: block.phase, title, target, tool, dedupeKey: block.dedupeKey }),
+      runId,
       phase: String(block.phase || ""),
       title,
       status: normalizeStatus(block.status),
       summary,
       target,
       tool,
+      sourceToolCallIds: normalizeSourceToolCallIds(block.sourceToolCallIds),
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
       cacheHits: isCachedText(summary) ? 1 : 0,
@@ -316,17 +380,21 @@ function itemFromBlock(
   }
   if (block?.type === "tool") {
     const tool = String(block.toolName || "").trim();
-    const target = normalizeTarget(block.target || "");
+    const target = normalizeTarget(block.canonicalTarget || block.target || "");
     const status = normalizeStatus(block.toolStatus || block.status);
     const text = [block.observationSummary, block.evidence, block.message].map((value) => String(value || "")).find(Boolean) || "";
     return {
-      key: keyForProgress({ target, tool }),
+      key: keyForProgress({ runId, target, tool }),
+      runId,
       phase: toolFamily(tool),
       title: titleForTool(tool, target, status, language),
       status,
       summary: compactLine(text, 220),
       target,
       tool,
+      sourceToolCallIds: normalizeSourceToolCallIds([
+        block.toolCallId || block.executionId || "",
+      ]),
       firstSeenAt: timestamp,
       lastSeenAt: timestamp,
       cacheHits: isCachedText(text) ? 1 : 0,
@@ -336,7 +404,8 @@ function itemFromBlock(
   if (block?.type === "system" && /暂停|paused|missing_tool_loop|no progress|重复/i.test(String(block.content || ""))) {
     const summary = compactPauseSummary(block.content, language);
     return {
-      key: `pause:${summary.slice(0, 80).toLowerCase()}`,
+      key: `pause:${runId}:${summary.slice(0, 80).toLowerCase()}`,
+      runId,
       phase: "blocked",
       title: language === "zh" ? "运行已暂停" : "Run paused",
       status: "paused",
@@ -396,21 +465,23 @@ export function buildRuntimeProgressLedger(input: {
     const isRunOwnedEvent = event.type === "progress.updated" ||
       event.type === "run.paused" ||
       event.type === "run.completed" ||
-      event.type === "run.failed";
+      event.type === "run.failed" ||
+      event.type === "harness.telemetry";
     if (activeRunId && isRunOwnedEvent && eventRunId !== activeRunId) continue;
     if (hasLivePlanExecution && event.type === "run.paused" && event.reason === "plan_review") continue;
     if (event.type === "progress.updated") {
-      const item = itemFromProgressEvent(event.progress, event.timestampMs, language);
+      const item = itemFromProgressEvent(event.progress, event.timestampMs, language, eventRunId);
       if (item) addItem(byKey, item);
     } else if (event.type === "run.paused") {
       const progressItem = event.progress
-        ? itemFromProgressEvent(event.progress, event.timestampMs, language)
+        ? itemFromProgressEvent(event.progress, event.timestampMs, language, eventRunId)
         : null;
       if (progressItem) {
         addItem(byKey, { ...progressItem, status: "paused" });
       } else {
         addItem(byKey, {
-          key: `pause:${compactLine(event.reason || event.message, 100).toLowerCase()}`,
+          key: `pause:${eventRunId}:${compactLine(event.reason || event.message, 100).toLowerCase()}`,
+          runId: eventRunId,
           phase: "blocked",
           title: language === "zh" ? "运行已暂停" : "Run paused",
           status: "paused",
@@ -421,9 +492,23 @@ export function buildRuntimeProgressLedger(input: {
           lastSeenAt: event.timestampMs,
         });
       }
+    } else if (event.type === "run.completed") {
+      addItem(byKey, {
+        key: `run-completed:${eventRunId || event.turnId}`,
+        runId: eventRunId,
+        phase: "completed",
+        title: language === "zh" ? "运行已完成" : "Run completed",
+        status: "completed",
+        summary: compactLine(event.summary || "", 260),
+        target: "",
+        tool: "",
+        firstSeenAt: event.timestampMs,
+        lastSeenAt: event.timestampMs,
+      });
     } else if (event.type === "run.failed") {
       addItem(byKey, {
         key: `run-failed:${eventRunId || event.turnId}`,
+        runId: eventRunId,
         phase: "blocked",
         title: language === "zh" ? "运行失败" : "Run failed",
         status: "failed",
@@ -448,6 +533,7 @@ export function buildRuntimeProgressLedger(input: {
       }),
       Math.max(0, Number(snapshot.updatedAt) || 0),
       language,
+      snapshotRunId || activeRunId,
     );
     if (item) addItem(byKey, item);
   }
@@ -456,6 +542,9 @@ export function buildRuntimeProgressLedger(input: {
     .map(({
       occurrenceCount: _occurrenceCount,
       explicitRepeatCount: _explicitRepeatCount,
+      seenSourceToolCallIds: _seenSourceToolCallIds,
+      cachedSourceToolCallIds: _cachedSourceToolCallIds,
+      legacyCacheHits: _legacyCacheHits,
       aggregation: _aggregation,
       ...item
     }) => item);
@@ -535,6 +624,108 @@ export function buildRuntimeProgressProjection(
     latest,
     recent,
     summary,
+    activityText,
+  };
+}
+
+/**
+ * Project the raw ledger into the compact M popover contract. The full turn
+ * timeline remains the audit surface; this projection only exposes what is
+ * happening now, a few completed milestones, and actionable health signals.
+ */
+export function buildRunStatusProjection(
+  items: RuntimeProgressLedgerItem[],
+  language: RuntimeProgressLanguage = "zh",
+  maxMilestones = 3,
+): RunStatusProjection {
+  const normalizedLanguage = normalizeLanguage(language);
+  const ordered = [...items].sort((a, b) => {
+    const lastDiff = a.lastSeenAt - b.lastSeenAt;
+    return lastDiff !== 0 ? lastDiff : a.firstSeenAt - b.firstSeenAt;
+  });
+  const latest = ordered[ordered.length - 1] || null;
+  const latestIsTerminal = latest?.status === "paused" ||
+    latest?.status === "failed" ||
+    latest?.status === "completed";
+  const currentActivity = latestIsTerminal
+    ? null
+    : [...ordered].reverse().find((item) =>
+        item.status === "running" && item.phase !== "blocked"
+      ) || (latest &&
+    (latest.status === "done" || latest.status === "completed") &&
+    latest.cacheHits < latest.repeatCount
+      ? latest
+      : null);
+  const milestones = ordered
+    .filter((item) =>
+      (item.status === "done" || item.status === "completed") &&
+      item.cacheHits < item.repeatCount &&
+      item.repeatCount === 1 &&
+      item.key !== currentActivity?.key
+    )
+    .slice(-Math.max(1, Math.min(3, maxMilestones)));
+
+  const healthSignals = ordered.flatMap<RunStatusHealthSignal>((item) => {
+    if (item.status === "failed") {
+      return [{
+        key: `${item.key}:failure`,
+        kind: "failure",
+        status: item.status,
+        title: item.title,
+        summary: item.summary,
+        lastSeenAt: item.lastSeenAt,
+      }];
+    }
+    if (item.status === "paused") {
+      return [{
+        key: `${item.key}:pause`,
+        kind: "pause",
+        status: item.status,
+        title: item.title,
+        summary: item.summary,
+        lastSeenAt: item.lastSeenAt,
+      }];
+    }
+    if (item.phase === "blocked") {
+      return [{
+        key: `${item.key}:waiting`,
+        kind: "waiting",
+        status: item.status,
+        title: item.title,
+        summary: item.summary,
+        lastSeenAt: item.lastSeenAt,
+      }];
+    }
+    if ((item.repeatCount > 1 || item.cacheHits > 0) && item.key !== currentActivity?.key) {
+      const family = toolFamily(item.tool);
+      const target = compactTarget(item.target) || item.title;
+      const read = family === "read";
+      const title = normalizedLanguage === "zh"
+        ? `${read ? "重复读取" : "重复操作"} ${target}`
+        : `${read ? "Repeated reads" : "Repeated activity"}: ${target}`;
+      const summary = normalizedLanguage === "zh"
+        ? `同一目标共 ${item.repeatCount} 次${item.cacheHits ? `，其中 ${item.cacheHits} 次为缓存复用` : ""}。`
+        : `${item.repeatCount} calls for the same target${item.cacheHits ? `, including ${item.cacheHits} cached` : ""}.`;
+      return [{
+        key: `${item.key}:repetition`,
+        kind: "repetition",
+        status: item.status,
+        title,
+        summary,
+        lastSeenAt: item.lastSeenAt,
+      }];
+    }
+    return [];
+  }).slice(-3);
+
+  const activitySource = currentActivity || latest;
+  const activityText = activitySource
+    ? buildRuntimeProgressProjection([activitySource], normalizedLanguage, 1).activityText
+    : "";
+  return {
+    currentActivity,
+    milestones,
+    healthSignals,
     activityText,
   };
 }

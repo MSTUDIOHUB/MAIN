@@ -65,6 +65,7 @@ test("read_file narration keeps the action and specific hypothesis without templ
     language: "zh",
     userGoal: "优化 ChatArea 的 agent 操作过程展示",
     currentHypothesis: "可能是 hiddenProcess 导致公开说明不可见。",
+    sourceToolCallIds: ["call-read-chat-area", "call-read-chat-area"],
   });
 
   assert.equal(progress.phase, "investigating");
@@ -73,6 +74,10 @@ test("read_file narration keeps the action and specific hypothesis without templ
   assert.doesNotMatch(progress.why, /代码证据|确认后再继续|等待/);
   assert.equal(progress.evidence, "");
   assert.equal(progress.next, "");
+  assert.equal(progress.tool, "read_file");
+  assert.equal(progress.target, "src/components/ChatArea.tsx");
+  assert.equal(progress.canonicalTarget, "src/components/ChatArea.tsx");
+  assert.deepEqual(progress.sourceToolCallIds, ["call-read-chat-area"]);
 });
 
 test("replace_in_file narration uses observed facts instead of generic why/evidence text", () => {

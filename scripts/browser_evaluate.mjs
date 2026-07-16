@@ -307,10 +307,236 @@ function pushBounded(list, item, max) {
   if (list.length > max) list.splice(0, list.length - max);
 }
 
-async function runActions(page, input, result, timeoutMs, workspace) {
-  for (const line of parseLines(input.actions)) {
+const STATEFUL_ACTION_KINDS = new Set([
+  "click",
+  "fill",
+  "press",
+  "select_file",
+  "set_input_files",
+  "upload",
+]);
+
+function selectorForAction(kind, value) {
+  if (kind === "fill" || kind === "press" || kind === "select_file" || kind === "set_input_files" || kind === "upload") {
+    return splitSelectorValue(value)[0];
+  }
+  return kind === "click" ? value : "";
+}
+
+async function captureInteractionState(page, selector) {
+  return page.evaluate((targetSelector) => {
+    const stableHash = (value) => {
+      let hash = 2166136261;
+      for (let index = 0; index < value.length; index += 1) {
+        hash ^= value.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      return (hash >>> 0).toString(36);
+    };
+    let target = null;
+    if (targetSelector) {
+      try {
+        target = document.querySelector(targetSelector);
+      } catch {
+        target = null;
+      }
+    }
+    const targetState = target
+      ? {
+          tag: target.tagName.toLowerCase(),
+          type: "type" in target ? String(target.type || "") : "",
+          id: target.id || "",
+          className: typeof target.className === "string" ? target.className : "",
+          text: String(target.textContent || "").trim().slice(0, 400),
+          value: "value" in target ? String(target.value ?? "").slice(0, 400) : "",
+          checked: "checked" in target ? Boolean(target.checked) : false,
+          disabled: "disabled" in target ? Boolean(target.disabled) : false,
+          ariaPressed: target.getAttribute("aria-pressed") || "",
+          ariaSelected: target.getAttribute("aria-selected") || "",
+          dataState: target.getAttribute("data-state") || "",
+        }
+      : null;
+    let externalDomFingerprint = "";
+    if (document.body) {
+      const clone = document.body.cloneNode(true);
+      if (targetSelector) {
+        try {
+          const clonedTarget = clone.matches?.(targetSelector)
+            ? clone
+            : clone.querySelector(targetSelector);
+          clonedTarget?.replaceWith(document.createComment("browser-action-target"));
+        } catch {
+          // Invalid selectors are reported by the action itself. Keep a whole-body fingerprint here.
+        }
+      }
+      externalDomFingerprint = stableHash(String(clone.innerHTML || ""));
+    }
+    return {
+      url: location.href,
+      title: document.title,
+      bodyText: String(document.body?.innerText || "").trim().slice(0, 1600),
+      bodyClass: document.body?.className || "",
+      htmlClass: document.documentElement?.className || "",
+      externalDomFingerprint,
+      target: targetState,
+    };
+  }, selector);
+}
+
+function changedInteractionStateFields(beforeState, afterState) {
+  if (!beforeState || !afterState) return [];
+  const changed = Object.keys({ ...beforeState, ...afterState })
+    .filter((key) => key !== "target")
+    .filter((key) => JSON.stringify(beforeState[key]) !== JSON.stringify(afterState[key]));
+  const beforeTarget = beforeState.target || {};
+  const afterTarget = afterState.target || {};
+  for (const key of Object.keys({ ...beforeTarget, ...afterTarget })) {
+    if (JSON.stringify(beforeTarget[key]) !== JSON.stringify(afterTarget[key])) {
+      changed.push(`target.${key}`);
+    }
+  }
+  return changed;
+}
+
+function nativeInteractionStateFields(action) {
+  if (action.kind === "fill" || action.kind === "select_file" || action.kind === "set_input_files" || action.kind === "upload") {
+    return new Set(["target.value", "target.checked"]);
+  }
+  if (action.kind === "press") {
+    return new Set(["target.value", "target.checked"]);
+  }
+  const targetType = String(action.beforeState?.target?.type || action.afterState?.target?.type || "").toLowerCase();
+  if (action.kind === "click" && (targetType === "checkbox" || targetType === "radio")) {
+    return new Set(["target.checked"]);
+  }
+  return new Set();
+}
+
+function refreshActionState(action, afterState) {
+  action.afterState = afterState;
+  action.changedFields = changedInteractionStateFields(action.beforeState, action.afterState);
+  const nativeFields = nativeInteractionStateFields(action);
+  action.nativeChangedFields = action.changedFields.filter((field) => nativeFields.has(field));
+  action.effectChangedFields = action.changedFields.filter((field) => !nativeFields.has(field));
+  action.stateChanged = action.changedFields.length > 0;
+  action.effectStateChanged = action.effectChangedFields.length > 0;
+}
+
+function parseCheckDirectives(input) {
+  return parseLines(input.checks).map((line) => normalizeActionName(line) === "no_console_errors"
+    ? { kind: "no_console_errors", value: "" }
+    : parseDirective(line, "text"));
+}
+
+async function evaluateCheck(page, result, check) {
+  const { kind, value } = check;
+  const consoleText = result.consoleMessages.map((item) => item.text).join("\n");
+  const consoleErrors = [...result.consoleErrors, ...result.pageErrors];
+  if (kind === "text" || kind === "not_text") {
+    const text = await bodyText(page);
+    const includes = text.includes(value);
+    return {
+      passed: kind === "text" ? includes : !includes,
+      detail: kind === "text"
+        ? (includes ? "text found" : "text not found in body")
+        : (!includes ? "text absent" : "unexpected text found in body"),
+    };
+  }
+  if (kind === "selector" || kind === "not_selector") {
+    const count = await page.locator(value).count();
+    return {
+      passed: kind === "selector" ? count > 0 : count === 0,
+      detail: `matched ${count} element(s)`,
+    };
+  }
+  if (kind === "title") {
+    const title = await page.title();
+    return { passed: title.includes(value), detail: `title: ${title}` };
+  }
+  if (kind === "console" || kind === "not_console") {
+    const includes = consoleText.includes(value);
+    return {
+      passed: kind === "console" ? includes : !includes,
+      detail: kind === "console"
+        ? (includes ? "console text found" : "console text not found")
+        : (!includes ? "console text absent" : "unexpected console text found"),
+    };
+  }
+  if (kind === "no_console_errors") {
+    return {
+      passed: consoleErrors.length === 0,
+      detail: consoleErrors.length === 0 ? "no console errors" : `${consoleErrors.length} console/page error(s)`,
+    };
+  }
+  return { passed: false, detail: `unsupported assertion kind: ${kind}` };
+}
+
+async function createAssertionTrackers(page, input, result) {
+  const trackers = [];
+  for (const check of parseCheckDirectives(input)) {
+    const baseline = await evaluateCheck(page, result, check);
+    trackers.push({
+      ...check,
+      beforePassed: baseline.passed,
+      currentPassed: baseline.passed,
+      causalActionId: null,
+      changedAfterAction: false,
+    });
+  }
+  return trackers;
+}
+
+async function observeAssertionTransitions(page, result, trackers, action) {
+  if (!action) return;
+  for (const tracker of trackers) {
+    const observed = await evaluateCheck(page, result, tracker);
+    if (
+      tracker.beforePassed === false &&
+      tracker.currentPassed === false &&
+      observed.passed === true &&
+      !tracker.causalActionId
+    ) {
+      tracker.causalActionId = action.id;
+      tracker.changedAfterAction = true;
+    }
+    tracker.currentPassed = observed.passed;
+  }
+}
+
+function assertionEffectFieldsMatch(kind, changedFields) {
+  const fields = new Set(changedFields || []);
+  if (kind === "text" || kind === "not_text") {
+    return fields.has("bodyText") || fields.has("externalDomFingerprint") || fields.has("target.text");
+  }
+  if (kind === "selector" || kind === "not_selector") {
+    return fields.has("externalDomFingerprint") || [...fields].some((field) => field.startsWith("target."));
+  }
+  if (kind === "title") return fields.has("title");
+  return false;
+}
+
+async function runActions(page, input, result, timeoutMs, workspace, assertionTrackers) {
+  const actionLines = parseLines(input.actions);
+  let latestStatefulAction = null;
+  for (let index = 0; index < actionLines.length; index += 1) {
+    const line = actionLines[index];
     const { kind, value } = parseDirective(line, "click");
-    const action = { kind, value, ok: false };
+    const selector = selectorForAction(kind, value);
+    const action = {
+      id: `action-${index + 1}`,
+      kind,
+      value,
+      ok: false,
+      beforeState: STATEFUL_ACTION_KINDS.has(kind)
+        ? await captureInteractionState(page, selector)
+        : null,
+      afterState: null,
+      stateChanged: false,
+      changedFields: [],
+      nativeChangedFields: [],
+      effectChangedFields: [],
+      effectStateChanged: false,
+    };
     result.actions.push(action);
     if (!value && kind !== "no_console_errors") throw new Error(`Action ${kind} requires a value.`);
 
@@ -346,49 +572,52 @@ async function runActions(page, input, result, timeoutMs, workspace) {
       throw new Error(`Unsupported browser action: ${kind}`);
     }
     action.ok = true;
+    if (STATEFUL_ACTION_KINDS.has(kind)) {
+      latestStatefulAction = action;
+      await page.waitForTimeout(25);
+      refreshActionState(action, await captureInteractionState(page, selector));
+    } else if (latestStatefulAction) {
+      const latestSelector = selectorForAction(latestStatefulAction.kind, latestStatefulAction.value);
+      refreshActionState(latestStatefulAction, await captureInteractionState(page, latestSelector));
+    }
+    await observeAssertionTransitions(page, result, assertionTrackers, latestStatefulAction);
   }
 }
 
-async function runChecks(page, input, result) {
+async function runChecks(page, result, assertionTrackers) {
   const text = await bodyText(page);
-  const consoleText = result.consoleMessages.map((item) => item.text).join("\n");
-  const consoleErrors = [...result.consoleErrors, ...result.pageErrors];
 
-  for (const line of parseLines(input.checks)) {
-    const { kind, value } = parseDirective(line, "text");
-    const assertion = { kind, value, passed: false, detail: "" };
+  const latestStatefulAction = [...result.actions]
+    .reverse()
+    .find((action) => action.ok && STATEFUL_ACTION_KINDS.has(action.kind));
+  if (latestStatefulAction) {
+    const selector = selectorForAction(latestStatefulAction.kind, latestStatefulAction.value);
+    refreshActionState(latestStatefulAction, await captureInteractionState(page, selector));
+    await observeAssertionTransitions(page, result, assertionTrackers, latestStatefulAction);
+  }
+
+  for (const tracker of assertionTrackers) {
+    const { kind, value } = tracker;
+    const observed = await evaluateCheck(page, result, tracker);
+    const linkedAction = result.actions.find((action) => action.id === tracker.causalActionId);
+    const causallyLinked = Boolean(
+      observed.passed &&
+      tracker.beforePassed === false &&
+      tracker.changedAfterAction &&
+      linkedAction?.effectStateChanged === true &&
+      assertionEffectFieldsMatch(kind, linkedAction.effectChangedFields)
+    );
+    const assertion = {
+      kind,
+      value,
+      passed: observed.passed,
+      detail: observed.detail,
+      beforePassed: tracker.beforePassed,
+      changedAfterAction: tracker.changedAfterAction,
+      afterActionId: tracker.causalActionId,
+      causallyLinked,
+    };
     result.assertions.push(assertion);
-
-    if (kind === "text") {
-      assertion.passed = text.includes(value);
-      assertion.detail = assertion.passed ? "text found" : "text not found in body";
-    } else if (kind === "not_text") {
-      assertion.passed = !text.includes(value);
-      assertion.detail = assertion.passed ? "text absent" : "unexpected text found in body";
-    } else if (kind === "selector") {
-      const count = await page.locator(value).count();
-      assertion.passed = count > 0;
-      assertion.detail = `matched ${count} element(s)`;
-    } else if (kind === "not_selector") {
-      const count = await page.locator(value).count();
-      assertion.passed = count === 0;
-      assertion.detail = `matched ${count} element(s)`;
-    } else if (kind === "title") {
-      const title = await page.title();
-      assertion.passed = title.includes(value);
-      assertion.detail = `title: ${title}`;
-    } else if (kind === "console") {
-      assertion.passed = consoleText.includes(value);
-      assertion.detail = assertion.passed ? "console text found" : "console text not found";
-    } else if (kind === "not_console") {
-      assertion.passed = !consoleText.includes(value);
-      assertion.detail = assertion.passed ? "console text absent" : "unexpected console text found";
-    } else if (kind === "no_console_errors") {
-      assertion.passed = consoleErrors.length === 0;
-      assertion.detail = assertion.passed ? "no console errors" : `${consoleErrors.length} console/page error(s)`;
-    } else {
-      assertion.detail = `unsupported assertion kind: ${kind}`;
-    }
   }
 
   result.textPreview = text.slice(0, MAX_PREVIEW_CHARS);
@@ -489,8 +718,9 @@ async function main() {
       }
     }
 
-    await runActions(page, input, result, timeoutMs, workspace);
-    await runChecks(page, input, result);
+    const assertionTrackers = await createAssertionTrackers(page, input, result);
+    await runActions(page, input, result, timeoutMs, workspace, assertionTrackers);
+    await runChecks(page, result, assertionTrackers);
 
     await capturePageDiagnostics(page, result);
   } catch (error) {

@@ -13,6 +13,7 @@ import {
   type ExecuteRecoveryMode,
 } from "../../executeRecoveryTools";
 import {
+  EXECUTION_VERIFICATION_TOOL_NAMES,
   PLAN_EXPLORATION_READ_ONLY_TOOLS,
   approvedPlanNeedsSourceEditBeforeValidation,
   filterPlanRuntimeToolDefinitionsForPhase,
@@ -26,9 +27,19 @@ import { summarizeRepeatedPlanTargetsFromToolActivity, type PlanToolActivitySumm
 import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import { shouldClosePlanToolSurfaceAfterReadOnlyConvergence } from "../../planRuntime";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
+import {
+  normalizeIndependentDelegationScopeKeys,
+  resolveDelegationDecision,
+  type DelegationDecision,
+  type DelegationRuntimePhase,
+} from "../../subagents";
 import type { ToolDefinition } from "../../toolSchemas";
-import type { TurnInputContextSignals } from "../../turnIntake";
+import {
+  resolveSubagentDelegationPreference,
+  type TurnInputContextSignals,
+} from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
+import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 
 export interface IterationToolSurfaceDecision {
@@ -38,6 +49,7 @@ export interface IterationToolSurfaceDecision {
   recoveryActionContract: RecoveryActionContract;
   approvedPlanSourceEditFirstActive: boolean;
   allowApprovedPlanRecoveryFileRead: boolean;
+  delegationDecision: DelegationDecision;
   iterationAllTools: ToolDefinition[];
   availableToolNames: Set<string>;
 }
@@ -55,6 +67,8 @@ export function resolveIterationToolSurface(input: {
   executeRecoveryReadLease?: RecoveryReadLease | null;
   executeRecoverySourceObservationKey?: string | null;
   executeRecoveryDecisionCheckpoint?: ExecutionDecisionCheckpoint | null;
+  executeRecoveryProtocolNoProgressCount?: number;
+  executeRecoveryProtocolNoProgressFingerprint?: string | null;
   recoveryIterationCount: number;
   maxRecoveryIterations: number;
   approvedPlanActionOnlyRecoveryActive: boolean;
@@ -67,6 +81,7 @@ export function resolveIterationToolSurface(input: {
   usedPlanReadOnlyConvergencePrompt: boolean;
   turnInputContextSignals: TurnInputContextSignals;
   lastAssistantTextForCheckpoint: string;
+  latestUserPromptText?: string;
 }): IterationToolSurfaceDecision {
   const {
     callbacks,
@@ -81,17 +96,21 @@ export function resolveIterationToolSurface(input: {
     executeRecoveryReadLease,
     executeRecoverySourceObservationKey,
     executeRecoveryDecisionCheckpoint,
+    executeRecoveryProtocolNoProgressCount = 0,
+    executeRecoveryProtocolNoProgressFingerprint = null,
     recoveryIterationCount,
     maxRecoveryIterations,
     approvedPlanActionOnlyRecoveryActive,
     approvedPlanNoToolRecoveryFileReadActive,
     approvedPlanNoProgressRecoveryAttempts,
     approvedPlanLongReasoningNoActionCount,
+    recentToolActivity,
     recentPlanToolActivity,
     planRuntimePhase,
     usedPlanReadOnlyConvergencePrompt,
     turnInputContextSignals,
     lastAssistantTextForCheckpoint,
+    latestUserPromptText = "",
   } = input;
 
   const devServerRuntimeObservation = resolveDevServerRuntimeState(
@@ -107,6 +126,8 @@ export function resolveIterationToolSurface(input: {
     sourceObservationKey: executeRecoverySourceObservationKey,
     decisionCheckpoint: executeRecoveryDecisionCheckpoint,
     phaseNoProgressCount: recoveryIterationCount,
+    protocolNoProgressCount: executeRecoveryProtocolNoProgressCount,
+    protocolNoProgressFingerprint: executeRecoveryProtocolNoProgressFingerprint,
     devServerStatus: devServerRuntimeObservation.status,
     devServerNextCapability: devServerRuntimeObservation.nextCapability,
     devServerUrl: devServerRuntimeObservation.url,
@@ -135,6 +156,8 @@ export function resolveIterationToolSurface(input: {
       recoveryPhase: recoveryActionContract.phase,
       nextRequiredCapability: recoveryActionContract.nextRequiredCapability,
       phaseNoProgressCount: recoveryActionContract.phaseNoProgressCount,
+      protocolNoProgressCount: recoveryActionContract.protocolNoProgressCount,
+      protocolNoProgressFingerprint: recoveryActionContract.protocolNoProgressFingerprint,
       devServerStatus: recoveryActionContract.devServerStatus,
       devServerNextCapability: devServerRuntimeObservation.nextCapability,
       devServerUrl: recoveryActionContract.devServerUrl,
@@ -189,6 +212,8 @@ export function resolveIterationToolSurface(input: {
       recoveryPhase: recoveryActionContract.phase,
       nextRequiredCapability: recoveryActionContract.nextRequiredCapability,
       phaseNoProgressCount: recoveryActionContract.phaseNoProgressCount,
+      protocolNoProgressCount: recoveryActionContract.protocolNoProgressCount,
+      protocolNoProgressFingerprint: recoveryActionContract.protocolNoProgressFingerprint,
       recoveryIterationCount,
       maxRecoveryIterations,
       approvedPlanActionOnlyRecoveryActive,
@@ -207,7 +232,7 @@ export function resolveIterationToolSurface(input: {
     callbacks.getIsPlanApproved();
   const executeContractOwnsSurface =
     isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
-  const baseIterationAllTools =
+  const initialBaseIterationAllTools =
     executeContractOwnsSurface
       ? recoveryIterationAllTools
       : approvedPlanActionRecoveryActive
@@ -220,6 +245,32 @@ export function resolveIterationToolSurface(input: {
           preservePtyLifecycle,
         }))
       : recoveryIterationAllTools;
+  const recoveryScopesDelegation =
+    executeRecoveryMode !== "normal" ||
+    approvedPlanActionOnlyRecoveryActive ||
+    approvedPlanNoToolRecoveryFileReadActive;
+  const joinedChildNeedsParentReread = [...recentToolActivity, ...recentPlanToolActivity]
+    .some((activity) => activity.delegatedObservation?.requiresParentReread === true);
+  const canExposeParentReread =
+    recoveryActionContract.phase === "normal" ||
+    recoveryActionContract.phase === "context" ||
+    recoveryActionContract.phase === "mutation";
+  const extraRecoveryToolNames = new Set<string>();
+  if (recoveryScopesDelegation) extraRecoveryToolNames.add("wait_subagents");
+  if (joinedChildNeedsParentReread && canExposeParentReread) extraRecoveryToolNames.add("read_file");
+  const baseIterationAllTools = extraRecoveryToolNames.size > 0
+    ? [
+        ...initialBaseIterationAllTools.filter((tool) =>
+          !recoveryScopesDelegation || tool.function.name !== "spawn_subagent"
+        ),
+        ...rawIterationAllTools.filter((tool) =>
+          extraRecoveryToolNames.has(tool.function.name) &&
+          !initialBaseIterationAllTools.some((candidate) =>
+            candidate.function.name === tool.function.name
+          )
+        ),
+      ]
+    : initialBaseIterationAllTools;
   if (
     !executeContractOwnsSurface &&
     approvedPlanSourceEditFirstActive &&
@@ -250,6 +301,115 @@ export function resolveIterationToolSurface(input: {
     isPlanApproved: callbacks.getIsPlanApproved(),
     planRuntimePhase,
   });
+  const delegationActivities = workflowMode === "plan" && !callbacks.getIsPlanApproved()
+    ? recentPlanToolActivity
+    : recentToolActivity;
+  const recoveryPhase = recoveryActionContract.phase;
+  // Once a turn has crossed a decisive mutation/validation boundary, a later
+  // source reread must not make delegation look diagnostic again. Rereads are
+  // expected during post-mutation checks and patch recovery; reopening child
+  // fan-out there would regress the runtime into discovery at the most
+  // resource-sensitive part of the transaction.
+  const latestDecisiveRuntimeActivity = [...delegationActivities]
+    .reverse()
+    .find((activity) =>
+      activity.status === "succeeded" &&
+      (
+        isWorkspaceMutationToolName(activity.name) ||
+        EXECUTION_VERIFICATION_TOOL_NAMES.has(activity.name)
+      )
+    );
+  let delegationPhase: DelegationRuntimePhase;
+  if (workflowMode === "plan" && !callbacks.getIsPlanApproved()) {
+    delegationPhase = planRuntimePhase === "explore_structure"
+      ? "context"
+      : planRuntimePhase === "grounding" || planRuntimePhase === "needs_evidence"
+      ? "diagnostic"
+      : "finalization";
+  } else if (recoveryPhase === "context") {
+    delegationPhase = "context";
+  } else if (recoveryPhase === "mutation") {
+    delegationPhase = "mutation";
+  } else if (
+    recoveryPhase === "post_mutation_check" ||
+    recoveryPhase === "validation" ||
+    recoveryPhase === "reconcile"
+  ) {
+    delegationPhase = "validation";
+  } else if (
+    latestDecisiveRuntimeActivity &&
+    isWorkspaceMutationToolName(latestDecisiveRuntimeActivity.name)
+  ) {
+    delegationPhase = "mutation";
+  } else if (
+    latestDecisiveRuntimeActivity &&
+    EXECUTION_VERIFICATION_TOOL_NAMES.has(latestDecisiveRuntimeActivity.name)
+  ) {
+    delegationPhase = "validation";
+  } else if (delegationActivities.some((activity) =>
+    activity.status === "succeeded" && PLAN_EXPLORATION_READ_ONLY_TOOLS.has(activity.name)
+  )) {
+    delegationPhase = "diagnostic";
+  } else {
+    delegationPhase = "context";
+  }
+  const explicitScopeKeys = [
+    ...(turnInputContextSignals.mentionedFilePaths || []),
+    ...(turnInputContextSignals.attachedFilePaths || []),
+  ];
+  const observedScopeKeys = delegationActivities
+    .filter((activity) =>
+      activity.status === "succeeded" &&
+      PLAN_EXPLORATION_READ_ONLY_TOOLS.has(activity.name) &&
+      !!String(activity.target || "").trim() &&
+      activity.target !== "."
+    )
+    .map((activity) => activity.target);
+  const normalizedIndependentScopeKeys = normalizeIndependentDelegationScopeKeys([
+    ...explicitScopeKeys,
+    ...observedScopeKeys,
+  ]);
+  const explicitScopeCount = normalizeIndependentDelegationScopeKeys(explicitScopeKeys).length;
+  const observedScopeCount = normalizeIndependentDelegationScopeKeys(observedScopeKeys).length;
+  const pendingSubagentCount = callbacks.getPendingSubagentIds?.().length || 0;
+  const plannedWorkItemCount = workflowMode === "plan"
+    ? callbacks.getPlanTasks().length
+    : 0;
+  const delegationDecision = resolveDelegationDecision({
+    preference: resolveSubagentDelegationPreference(latestUserPromptText),
+    phase: delegationPhase,
+    hasWorkspace: !!String(callbacks.getConfig?.().workspace || "").trim(),
+    explicitScopeCount,
+    observedScopeCount,
+    plannedWorkItemCount,
+    independentScopeKeys: normalizedIndependentScopeKeys,
+    pendingSubagentCount,
+    subagentDepth: callbacks.getSubagentDepth?.() || 0,
+  });
+  const delegationScopedIterationAllTools = delegationDecision.action === "admit"
+    ? phaseScopedIterationAllTools
+    : phaseScopedIterationAllTools.filter((tool) => tool.function.name !== "spawn_subagent");
+  if (
+    phaseScopedIterationAllTools.some((tool) => tool.function.name === "spawn_subagent") ||
+    pendingSubagentCount > 0 ||
+    delegationDecision.preference !== "unspecified"
+  ) {
+    logAgentEvent("delegation_admission_decision", {
+      iteration,
+      action: delegationDecision.action,
+      reason: delegationDecision.reason,
+      phase: delegationDecision.phase,
+      preference: delegationDecision.preference,
+      independentScopeCount: delegationDecision.independentScopeCount,
+      explicitScopeCount: delegationDecision.explicitScopeCount,
+      observedScopeCount: delegationDecision.observedScopeCount,
+      plannedWorkItemCount: delegationDecision.plannedWorkItemCount,
+      pendingSubagentCount: delegationDecision.pendingSubagentCount,
+      spawnToolExposed: delegationDecision.action === "admit" &&
+        phaseScopedIterationAllTools.some((tool) => tool.function.name === "spawn_subagent"),
+      providerNeutral: true,
+    });
+  }
   const shouldClosePlanToolSurface = shouldClosePlanToolSurfaceAfterReadOnlyConvergence({
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
@@ -267,7 +427,7 @@ export function resolveIterationToolSurface(input: {
   });
   const iterationAllTools = shouldClosePlanToolSurface
     ? []
-    : phaseScopedIterationAllTools;
+    : delegationScopedIterationAllTools;
 
   const shouldLogToolSurfaceDecision =
     rawIterationAllTools.length !== iterationAllTools.length ||
@@ -331,6 +491,7 @@ export function resolveIterationToolSurface(input: {
     recoveryActionContract,
     approvedPlanSourceEditFirstActive,
     allowApprovedPlanRecoveryFileRead,
+    delegationDecision,
     iterationAllTools,
     availableToolNames: new Set(iterationAllTools.map((tool) => tool.function.name)),
   };

@@ -285,8 +285,11 @@ export function createGoalContinuationState(input: {
     mode: ExecuteRecoveryMode;
     reason?: string | null;
     expectedTarget?: string | null;
+    attempts?: number;
     phase?: ExecuteRecoveryContractPhase;
     phaseNoProgressCount?: number;
+    protocolNoProgressCount?: number;
+    protocolNoProgressFingerprint?: string | null;
     readLease?: RecoveryReadLease | null;
     sourceObservationKey?: string | null;
     decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
@@ -341,8 +344,11 @@ export interface GoalContinuationExecuteRecoveryState {
   mode: Exclude<ExecuteRecoveryMode, "normal">;
   reason: string;
   expectedTarget: string | null;
+  attempts?: number;
   phase: ExecuteRecoveryContractPhase;
   phaseNoProgressCount: number;
+  protocolNoProgressCount: number;
+  protocolNoProgressFingerprint: string | null;
   readLease: RecoveryReadLease | null;
   sourceObservationKey: string | null;
   decisionCheckpoint: ExecutionDecisionCheckpoint | null;
@@ -387,6 +393,7 @@ function normalizeRecoveryReadLease(value: unknown): RecoveryReadLease | null {
     ...(requestedRange && Object.keys(requestedRange).length > 0 ? { requestedRange } : {}),
     observationKey: String(candidate.observationKey || "").trim() || null,
     observedVersion: String(candidate.observedVersion || "").trim() || null,
+    mismatchFingerprint: String(candidate.mismatchFingerprint || "").trim() || null,
     state,
   };
 }
@@ -401,6 +408,7 @@ function normalizeExecutionDecisionCheckpoint(value: unknown): ExecutionDecision
     nextRequiredCapability !== "mutation" &&
     nextRequiredCapability !== "validation" &&
     nextRequiredCapability !== "launch_long_process" &&
+    nextRequiredCapability !== "recover_process" &&
     nextRequiredCapability !== "reconcile_server" &&
     nextRequiredCapability !== "observe_pty" &&
     nextRequiredCapability !== "browser_validation"
@@ -421,8 +429,11 @@ interface NormalizedGoalContinuationRecoverySnapshot {
   mode: ExecuteRecoveryMode;
   reason: string;
   expectedTarget: string | null;
+  attempts?: number;
   phase: ExecuteRecoveryContractPhase;
   phaseNoProgressCount: number;
+  protocolNoProgressCount: number;
+  protocolNoProgressFingerprint: string | null;
   readLease: RecoveryReadLease | null;
   sourceObservationKey: string | null;
   decisionCheckpoint: ExecutionDecisionCheckpoint | null;
@@ -432,23 +443,40 @@ function normalizeGoalContinuationRecoverySnapshot(input: {
   mode: ExecuteRecoveryMode;
   reason?: string | null;
   expectedTarget?: string | null;
+  attempts?: number;
   phase?: ExecuteRecoveryContractPhase;
   phaseNoProgressCount?: number;
+  protocolNoProgressCount?: number;
+  protocolNoProgressFingerprint?: string | null;
   readLease?: RecoveryReadLease | null;
   sourceObservationKey?: string | null;
   decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
 }): NormalizedGoalContinuationRecoverySnapshot {
   const mode = normalizeExecuteRecoveryMode(input.mode);
-  const contract = resolveExecuteRecoveryActionContract(mode);
+  const expectedTarget = normalizeRecoveryTarget(input.expectedTarget);
+  const readLease = normalizeRecoveryReadLease(input.readLease);
+  const sourceObservationKey = String(input.sourceObservationKey || "").trim() || null;
+  const decisionCheckpoint = normalizeExecutionDecisionCheckpoint(input.decisionCheckpoint);
+  const contract = resolveExecuteRecoveryActionContract(mode, {
+    expectedTarget,
+    readLease,
+    sourceObservationKey,
+    decisionCheckpoint,
+  });
   return {
     mode,
     reason: String(input.reason || "").trim(),
-    expectedTarget: normalizeRecoveryTarget(input.expectedTarget),
+    expectedTarget,
+    ...(input.attempts === undefined
+      ? {}
+      : { attempts: Math.max(1, Math.floor(Number(input.attempts) || 1)) }),
     phase: contract.phase,
     phaseNoProgressCount: Math.max(0, Math.floor(Number(input.phaseNoProgressCount) || 0)),
-    readLease: normalizeRecoveryReadLease(input.readLease),
-    sourceObservationKey: String(input.sourceObservationKey || "").trim() || null,
-    decisionCheckpoint: normalizeExecutionDecisionCheckpoint(input.decisionCheckpoint),
+    protocolNoProgressCount: Math.max(0, Math.floor(Number(input.protocolNoProgressCount) || 0)),
+    protocolNoProgressFingerprint: String(input.protocolNoProgressFingerprint || "").trim() || null,
+    readLease,
+    sourceObservationKey,
+    decisionCheckpoint,
   };
 }
 
@@ -502,6 +530,8 @@ function buildGoalContinuationRecoveryState(input: {
     expectedTarget: input.target,
     phase: contract.phase,
     phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
     readLease: null,
     sourceObservationKey: null,
     decisionCheckpoint: null,
@@ -527,8 +557,11 @@ export function resolveGoalContinuationExecuteRecoveryState(
       mode,
       reason: normalized.reason || "goal_continuation_runtime_state",
       expectedTarget: normalized.expectedTarget,
+      ...(normalized.attempts === undefined ? {} : { attempts: normalized.attempts }),
       phase: normalized.phase,
       phaseNoProgressCount: normalized.phaseNoProgressCount,
+      protocolNoProgressCount: normalized.protocolNoProgressCount,
+      protocolNoProgressFingerprint: normalized.protocolNoProgressFingerprint,
       readLease: normalized.readLease,
       sourceObservationKey: normalized.sourceObservationKey,
       decisionCheckpoint: normalized.decisionCheckpoint,

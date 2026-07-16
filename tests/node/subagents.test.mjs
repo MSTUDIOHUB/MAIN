@@ -68,6 +68,22 @@ function makeConfig(profile, overrides = {}) {
   };
 }
 
+let observedToolSequence = 0;
+function recordChildToolResult(callbacks, tool, target, content, options = {}) {
+  const toolCallId = options.toolCallId || `child-tool-${++observedToolSequence}`;
+  callbacks.onToolDone(tool, target, content, { toolCallId });
+  callbacks.onToolResultObserved?.({
+    toolCallId,
+    name: tool,
+    target,
+    content,
+    isError: false,
+    ...(options.readFileObservation
+      ? { readFileObservation: options.readFileObservation }
+      : {}),
+  });
+}
+
 test("subagent allowed paths preserve execution casing while deduplicating identities", () => {
   assert.deepEqual(subagents.parseSubagentAllowedPaths(
     "src/hooks/useCsvParser.ts,./src/hooks/usecsvparser.ts,src/store/DashboardStore.ts",
@@ -95,6 +111,76 @@ test("capacity policy permits two local children and bounded cloud parallelism",
   assert.equal(cloud.maxBurstActiveRequests, 3);
   assert.equal(cloud.maxCreatedPerTurn, 6);
   assert.equal(cloud.model, "gpt-cloud");
+});
+
+test("adaptive delegation admits only useful context or diagnostic fan-out", () => {
+  const simple = subagents.resolveDelegationDecision({
+    phase: "context",
+    hasWorkspace: true,
+    explicitScopeCount: 1,
+  });
+  assert.equal(simple.action, "defer");
+  assert.equal(simple.reason, "insufficient_independent_scope");
+
+  const multiScope = subagents.resolveDelegationDecision({
+    phase: "diagnostic",
+    hasWorkspace: true,
+    observedScopeCount: 2,
+    independentScopeKeys: ["src/lib/runtime", "src/components/ChatArea.tsx"],
+  });
+  assert.equal(multiScope.action, "admit");
+  assert.equal(multiScope.reason, "adaptive_multi_scope");
+
+  const preferred = subagents.resolveDelegationDecision({
+    preference: "preferred",
+    phase: "context",
+    hasWorkspace: true,
+  });
+  assert.equal(preferred.action, "admit");
+  assert.equal(preferred.reason, "explicit_preference");
+
+  const afterMutation = subagents.resolveDelegationDecision({
+    preference: "preferred",
+    phase: "mutation",
+    hasWorkspace: true,
+    explicitScopeCount: 4,
+  });
+  assert.equal(afterMutation.action, "defer");
+  assert.equal(afterMutation.reason, "phase_not_eligible");
+
+  const pendingJoin = subagents.resolveDelegationDecision({
+    preference: "preferred",
+    phase: "diagnostic",
+    hasWorkspace: true,
+    pendingSubagentCount: 1,
+  });
+  assert.equal(pendingJoin.action, "defer");
+  assert.equal(pendingJoin.reason, "pending_subagents_require_join");
+
+  const forbidden = subagents.resolveDelegationDecision({
+    preference: "forbidden",
+    phase: "context",
+    hasWorkspace: true,
+    explicitScopeCount: 3,
+  });
+  assert.equal(forbidden.action, "deny");
+  assert.equal(forbidden.reason, "user_forbidden");
+
+  const checklistOnly = subagents.resolveDelegationDecision({
+    phase: "context",
+    hasWorkspace: true,
+    plannedWorkItemCount: 6,
+  });
+  assert.equal(checklistOnly.action, "defer");
+  assert.equal(checklistOnly.independentScopeCount, 0);
+
+  const overlappingHints = subagents.resolveDelegationDecision({
+    phase: "diagnostic",
+    hasWorkspace: true,
+    independentScopeKeys: ["src/lib", "src/lib/subagents.ts", "./src/lib"],
+  });
+  assert.equal(overlappingHints.action, "defer");
+  assert.equal(overlappingHints.independentScopeCount, 1);
 });
 
 test("runtime event projection preserves completion while recording thread closure", () => {
@@ -314,8 +400,8 @@ test("controlled child runtime isolates messages and returns its summary through
       assert.equal(childCallbacks.getCurrentRunIdentity().parentRunId, "run-parent");
       childCallbacks.onDebugEvent("child_trace_probe", {});
       childCallbacks.onToolExecuting("read_file", "src/lib/turnEvents.ts");
-      childCallbacks.onToolDone("read_file", "src/lib/turnEvents.ts", "event schema");
-      childCallbacks.onToolDone("read_file", "vite.config.js", [
+      recordChildToolResult(childCallbacks, "read_file", "src/lib/turnEvents.ts", "event schema");
+      recordChildToolResult(childCallbacks, "read_file", "vite.config.js", [
         "READ_FILE_RESULT",
         "path: vite.config.js",
         "---CONTENT START---",
@@ -323,7 +409,7 @@ test("controlled child runtime isolates messages and returns its summary through
         "export default defineConfig({ plugins: [] });",
         "---CONTENT END---",
       ].join("\n"));
-      childCallbacks.onToolDone("read_file", "src/main.js", [
+      recordChildToolResult(childCallbacks, "read_file", "src/main.js", [
         "READ_FILE_RESULT",
         "path: src/main.js",
         "---CONTENT START---",
@@ -369,8 +455,8 @@ test("controlled child runtime isolates messages and returns its summary through
       ].join("\n");
       // Mirror the logged MD Viewer reread sequence: first window, later
       // window, first window replay, final window, then later/final replays.
-      childCallbacks.onToolDone("read_file", "src/main.js", laterMainWindow);
-      childCallbacks.onToolDone("read_file", "src/main.js", [
+      recordChildToolResult(childCallbacks, "read_file", "src/main.js", laterMainWindow);
+      recordChildToolResult(childCallbacks, "read_file", "src/main.js", [
         "READ_FILE_RESULT",
         "path: src/main.js",
         "---CONTENT START---",
@@ -380,10 +466,10 @@ test("controlled child runtime isolates messages and returns its summary through
         "});",
         "---CONTENT END---",
       ].join("\n"));
-      childCallbacks.onToolDone("read_file", "src/main.js", finalMainWindow);
-      childCallbacks.onToolDone("read_file", "src/main.js", laterMainWindow);
-      childCallbacks.onToolDone("read_file", "src/main.js", finalMainWindow);
-      childCallbacks.onToolDone("read_file", "vite.config.js", [
+      recordChildToolResult(childCallbacks, "read_file", "src/main.js", finalMainWindow);
+      recordChildToolResult(childCallbacks, "read_file", "src/main.js", laterMainWindow);
+      recordChildToolResult(childCallbacks, "read_file", "src/main.js", finalMainWindow);
+      recordChildToolResult(childCallbacks, "read_file", "vite.config.js", [
         "READ_FILE_RESULT",
         "path: vite.config.js",
         "---CONTENT START---",
@@ -398,6 +484,11 @@ test("controlled child runtime isolates messages and returns its summary through
 
   assert.equal(result.status, "completed");
   assert.equal(result.summary, "The event boundary is versioned and durable.");
+  assert.equal(result.summaryTrust, "unverified_hypothesis");
+  assert.ok(result.evidence.every((item) =>
+    item.provenance?.source === "tool_observation" &&
+    !!item.provenance?.sourceToolCallId
+  ));
   assert.deepEqual(events.map((event) => event.type).filter((type, index, all) => index === 0 || type !== all[index - 1]), [
     "subagent.created",
     "subagent.updated",
@@ -437,6 +528,164 @@ test("controlled child runtime isolates messages and returns its summary through
   ));
 });
 
+test("subagent evidence retains tool-call, version, range, and fact provenance", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const content = [
+    "READ_FILE_RESULT",
+    "path: src/main.js",
+    "truncated: true",
+    "totalLines: 120",
+    "totalChars: 4800",
+    "returnedLines: 20-24",
+    "returnedChars: 180",
+    "nextStartLine: 25",
+    "---CONTENT START---",
+    "document.addEventListener('DOMContentLoaded', initToolbar);",
+    "---CONTENT END---",
+  ].join("\n");
+  const observation = {
+    key: "read-main-window::version=4800:100::content=abc",
+    path: "src/main.js",
+    requestSignature: "read_file::src/main.js::start_line=20,end_line=24",
+    versionToken: "4800:100",
+    contentHash: "abc",
+    source: "fresh",
+  };
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect one event binding",
+      scopeKey: "main-window",
+      allowedPaths: "src/main.js",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-provenance",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-provenance",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(childCallbacks, "read_file", "src/main.js", content, {
+        toolCallId: "child-read-main-window",
+        readFileObservation: observation,
+      });
+      childCallbacks.onAssistantFinalText("The event binding looks relevant.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  const [evidence] = result.evidence;
+  assert.equal(evidence.provenance.source, "tool_observation");
+  assert.deepEqual(evidence.provenance.owner, {
+    agentKind: "subagent",
+    subagentId: result.subagentId,
+    parentTurnId: "turn-provenance",
+    runId: `run-${result.subagentId}`,
+  });
+  assert.equal(evidence.provenance.sourceToolCallId, "child-read-main-window");
+  assert.equal(evidence.provenance.sourceObservation.key, observation.key);
+  assert.equal(evidence.provenance.sourceVersion, "4800:100");
+  assert.deepEqual(evidence.provenance.sourceRange, {
+    startLine: 20,
+    endLine: 24,
+    totalLines: 120,
+    truncated: true,
+  });
+  assert.ok((evidence.provenance.factReferences || []).length > 0);
+  assert.ok((evidence.provenance.factReferences || []).every((reference) =>
+    reference.sourceToolCallId === "child-read-main-window" &&
+    reference.sourceObservationKey === observation.key
+  ));
+});
+
+test("subagent evidence keeps disjoint windows of the same file as separate observations", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const readResult = (startLine, endLine, content) => [
+    "READ_FILE_RESULT",
+    "path: src/main.js",
+    "truncated: true",
+    "totalLines: 120",
+    "totalChars: 4800",
+    `returnedLines: ${startLine}-${endLine}`,
+    `returnedChars: ${content.length}`,
+    `nextStartLine: ${endLine + 1}`,
+    "---CONTENT START---",
+    content,
+    "---CONTENT END---",
+  ].join("\n");
+  const observation = (startLine, endLine, hash) => ({
+    key: `src/main.js:${startLine}-${endLine}:v1:${hash}`,
+    path: "src/main.js",
+    requestSignature: `read_file::src/main.js::${startLine}-${endLine}`,
+    versionToken: "v1",
+    contentHash: hash,
+    source: "fresh",
+  });
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect two independent event binding windows",
+      scopeKey: "main-two-windows",
+      allowedPaths: "src/main.js",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-two-windows",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-two-windows",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/main.js",
+        readResult(1, 20, "document.addEventListener('DOMContentLoaded', initEditor);"),
+        {
+          toolCallId: "child-read-main-head",
+          readFileObservation: observation(1, 20, "head"),
+        },
+      );
+      recordChildToolResult(
+        childCallbacks,
+        "read_file",
+        "src/main.js",
+        readResult(80, 100, "document.querySelector('#new-btn').addEventListener('click', createNew);"),
+        {
+          toolCallId: "child-read-main-toolbar",
+          readFileObservation: observation(80, 100, "toolbar"),
+        },
+      );
+      childCallbacks.onAssistantFinalText("Two windows inspected.");
+      return { status: "completed", reason: "agent_loop_completed" };
+    },
+  });
+
+  assert.equal(result.evidence.length, 2);
+  assert.deepEqual(
+    result.evidence.map((item) => item.provenance.sourceRange),
+    [
+      { startLine: 1, endLine: 20, totalLines: 120, truncated: true },
+      { startLine: 80, endLine: 100, totalLines: 120, truncated: true },
+    ],
+  );
+  const promoted = toolActivityTracking.extractDelegatedSubagentActivities({
+    toolCallId: "wait-two-windows",
+    name: "wait_subagents",
+    target: result.subagentId,
+    content: JSON.stringify({ results: [result], pendingIds: [] }),
+    isError: false,
+  });
+  assert.equal(promoted.length, 2);
+  assert.deepEqual(
+    promoted.map((item) => item.delegatedObservation.sourceObservationKey),
+    ["src/main.js:1-20:v1:head", "src/main.js:80-100:v1:toolbar"],
+  );
+});
+
 test("async spawn returns a handle before completion and wait preserves structured results", async () => {
   subagents.resetSubagentRuntimeForTests();
   const events = [];
@@ -464,7 +713,7 @@ test("async spawn returns a handle before completion and wait preserves structur
     emitEvent: (event) => events.push(event),
     executeAgentLoop: async (childCallbacks) => {
       await childGate;
-      childCallbacks.onToolDone("read_file", "src/lib/turnEvents.ts", "versioned events");
+      recordChildToolResult(childCallbacks, "read_file", "src/lib/turnEvents.ts", "versioned events");
       childCallbacks.onAssistantFinalText("Turn events are versioned and persisted.");
       return { status: "completed", reason: "agent_loop_completed" };
     },
@@ -485,6 +734,10 @@ test("async spawn returns a handle before completion and wait preserves structur
   assert.equal(joined.results[0].evidence[0].target, "src/lib/turnEvents.ts");
   assert.deepEqual(subagents.getPendingCoordinatedSubagentIds("thread-async", "turn-async"), []);
   assert.equal(subagents.getCoordinatedSubagentRunCount("thread-async", "turn-async"), 1);
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-async",
+    targetPath: "src/lib/turnEvents.ts",
+  }), null);
 });
 
 test("parent finalization cancels live children and releases coordinator state", async () => {
@@ -498,8 +751,18 @@ test("parent finalization cancels live children and releases coordinator state",
     scopeKey: "runtime",
     status: "canceled",
     summary: "Partial evidence retained.",
+    summaryTrust: "unverified_hypothesis",
     evidence: [],
   }), { once: true });
+  subagents.acquireSubagentScopeLease({
+    threadId: "thread-finalize",
+    parentTurnId: "turn-finalize",
+    subagentId: "subagent-finalize",
+    scopeKey: "runtime",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib/subagents.ts"],
+    createdAt: Date.now(),
+  });
   subagents.registerSubagentAbortController("subagent-finalize", controller);
   subagents.registerCoordinatedSubagentRun({
     threadId: "thread-finalize",
@@ -522,6 +785,10 @@ test("parent finalization cancels live children and releases coordinator state",
   assert.deepEqual(result.timedOutIds, []);
   assert.equal(result.releasedCount, 1);
   assert.equal(subagents.getCoordinatedSubagentRunCount("thread-finalize", "turn-finalize"), 0);
+  assert.equal(subagents.findSubagentScopeConflict({
+    threadId: "thread-finalize",
+    targetPath: "src/lib/subagents.ts",
+  }), null);
 });
 
 test("completed child remains joinable until the parent consumes its result", async () => {
@@ -532,6 +799,7 @@ test("completed child remains joinable until the parent consumes its result", as
     scopeKey: "ready-result",
     status: "completed",
     summary: "Ready before the parent reached its join boundary.",
+    summaryTrust: "unverified_hypothesis",
     evidence: [],
   });
   subagents.registerCoordinatedSubagentRun({
@@ -573,7 +841,20 @@ test("runtime parent join injects structured child evidence before finalization"
           scopeKey: "events",
           status: "completed",
           summary: "Found the event boundary.",
-          evidence: [{ tool: "read_file", target: "src/lib/turnEvents.ts", detail: "Versioned events." }],
+          summaryTrust: "unverified_hypothesis",
+          evidence: [{
+            tool: "read_file",
+            target: "src/lib/turnEvents.ts",
+            detail: "Versioned events.",
+            provenance: {
+              source: "tool_observation",
+              owner: {
+                agentKind: "subagent",
+                subagentId: "subagent-euler",
+              },
+              sourceToolCallId: "child-read-events",
+            },
+          }],
         }],
       }),
       getPreferredLanguage: () => "en",
@@ -587,7 +868,12 @@ test("runtime parent join injects structured child evidence before finalization"
 
   assert.equal(joined, true);
   assert.match(messages[0].content, /SUBAGENT_JOIN_RESULT/);
+  assert.match(messages[0].content, /unverified child hypothesis/);
+  assert.match(messages[0].content, /targeted read_file/);
   assert.deepEqual(recent.map((entry) => [entry.name, entry.target]), [["read_file", "src/lib/turnEvents.ts"]]);
+  assert.equal(recent[0].readFileObservation, undefined);
+  assert.equal(recent[0].delegatedObservation.owner.subagentId, "subagent-euler");
+  assert.equal(recent[0].delegatedObservation.requiresParentReread, true);
   assert.deepEqual(recentPlan, recent);
   assert.deepEqual(events.map((entry) => entry.event), ["parent_join_required", "parent_join_injected"]);
 });
@@ -612,7 +898,7 @@ test("blocked child results preserve their useful summary instead of becoming to
     existingRunCount: 0,
     emitEvent: () => {},
     executeAgentLoop: async (childCallbacks) => {
-      childCallbacks.onToolDone("read_file", "src/lib/subagents.ts", "lease registry located");
+      recordChildToolResult(childCallbacks, "read_file", "src/lib/subagents.ts", "lease registry located");
       childCallbacks.onAssistantFinalText("The lease registry is usable evidence.", [
         { label: "Approve", value: "approve" },
       ], { awaitingInput: true });
@@ -646,7 +932,7 @@ test("iteration boundary with evidence is a blocked partial result, not a failur
     existingRunCount: 0,
     emitEvent: () => {},
     executeAgentLoop: async (childCallbacks) => {
-      childCallbacks.onToolDone("read_file", "src/lib/subagents.ts", "Coordinator evidence");
+      recordChildToolResult(childCallbacks, "read_file", "src/lib/subagents.ts", "Coordinator evidence");
       childCallbacks.onAssistantFinalText("The coordinator retains a bounded partial result.");
       childCallbacks.onNonActionableStop("Iteration boundary reached.", "no_action", {
         recoveryReason: "max_iterations_boundary",
@@ -659,6 +945,52 @@ test("iteration boundary with evidence is a blocked partial result, not a failur
   assert.match(result.summary, /bounded partial result/);
   assert.equal(result.evidence.length, 1);
   assert.ok(traceEvents.some((entry) => entry.event === "subagent_partial_result_preserved"));
+});
+
+test("overlapping child scope is a policy deferral rather than a failed spawn", () => {
+  subagents.resetSubagentRuntimeForTests();
+  subagents.acquireSubagentScopeLease({
+    threadId: "thread-overlap",
+    parentTurnId: "turn-overlap",
+    subagentId: "subagent-existing",
+    scopeKey: "existing-scope",
+    workspace: "/workspace",
+    allowedPaths: ["src/lib/subagents.ts"],
+    createdAt: Date.now(),
+  });
+  const debugEvents = [];
+  const result = subagentRuntime.scheduleControlledSubagent({
+    request: {
+      name: "Mendel",
+      objective: "Inspect the same runtime coordinator",
+      scopeKey: "overlapping-scope",
+      allowedPaths: "src/lib",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-overlap",
+      onDebugEvent: (event, data) => debugEvents.push({ event, data }),
+    },
+    parentTurnId: "turn-overlap",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async () => {
+      throw new Error("deferred work must not start");
+    },
+  });
+
+  assert.equal(result.status, "deferred");
+  assert.equal(result.reason, "overlapping_active_scope");
+  assert.equal(result.subagentId, null);
+  assert.equal(result.conflictingSubagentId, "subagent-existing");
+  assert.deepEqual(
+    subagents.getPendingCoordinatedSubagentIds("thread-overlap", "turn-overlap"),
+    [],
+  );
+  assert.ok(debugEvents.some((entry) =>
+    entry.event === "delegation_scope_decision" && entry.data.decision === "deferred"
+  ));
 });
 
 test("scope leases reject child escape and parent overlap", () => {

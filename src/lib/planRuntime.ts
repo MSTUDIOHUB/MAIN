@@ -159,7 +159,7 @@ export function shouldRedirectPlanRuntimeToolsAfterReadOnlyConvergence(input: {
 }
 
 export const MAX_PLAN_EVIDENCE_RECOVERY_PASSES = 3;
-export const MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES = 2;
+export const MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES = 6;
 export const MAX_PLAN_REASONING_ONLY_READY_RECOVERY_PASSES = 1;
 
 export function resolvePlanNoActionRecovery(input: {

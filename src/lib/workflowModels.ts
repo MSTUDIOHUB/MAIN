@@ -293,6 +293,77 @@ export interface PlanTaskEvidence {
   requiredTerms?: string[];
 }
 
+export type ValidationObligationKind =
+  | "finite_command"
+  | "browser_dom"
+  | "browser_interaction"
+  | "external_advisory";
+
+export interface BrowserInteractionAction {
+  id?: string;
+  kind: string;
+  target: string;
+  succeeded: boolean;
+  beforeState?: BrowserInteractionState | null;
+  afterState?: BrowserInteractionState | null;
+  stateChanged?: boolean;
+  changedFields?: string[];
+  /** Native control changes (for example an input's own value) are not business effects. */
+  nativeChangedFields?: string[];
+  /** Observable changes outside the action's native browser behavior. */
+  effectChangedFields?: string[];
+  effectStateChanged?: boolean;
+}
+
+export interface BrowserInteractionAssertion {
+  kind: string;
+  target: string;
+  passed: boolean;
+  detail?: string;
+  afterActionId?: string;
+  /** Result of the same assertion immediately before the action sequence. */
+  beforePassed?: boolean;
+  /** True only when this assertion transitioned from failing to passing after the linked action. */
+  changedAfterAction?: boolean;
+  /** Runtime-derived temporal/observable link; never inferred from model prose. */
+  causallyLinked?: boolean;
+}
+
+export interface BrowserInteractionState {
+  url?: string;
+  title?: string;
+  bodyText?: string;
+  bodyClass?: string;
+  htmlClass?: string;
+  /** Stable hash of the document outside the acted-on element. */
+  externalDomFingerprint?: string;
+  target?: Record<string, string | number | boolean | null> | null;
+}
+
+/**
+ * Structured browser evidence captured from browser_evaluate's result JSON.
+ * Keeping actions and assertions separate prevents a successful navigation or
+ * screenshot from being mistaken for proof that an interactive control works.
+ */
+export interface BrowserInteractionEvidence {
+  evidenceId?: string;
+  actions: BrowserInteractionAction[];
+  assertions: BrowserInteractionAssertion[];
+  pageErrors: string[];
+  consoleErrors: string[];
+}
+
+/** Runtime-owned acceptance work derived from trusted task/mutation evidence. */
+export interface ValidationObligation {
+  id: string;
+  kind: ValidationObligationKind;
+  mutationEvidenceId?: string;
+  target: string;
+  behaviorTargets?: string[];
+  status: "open" | "satisfied" | "failed" | "advisory";
+  satisfiedByEvidenceId?: string;
+}
+
 export interface PlanExecutionEvidenceEntry {
   id: string;
   kind: PlanTaskEvidenceKind;
@@ -302,6 +373,14 @@ export interface PlanExecutionEvidenceEntry {
   references?: string[];
   /** Identifiers observed in fresh added/changed lines of this mutation. */
   changedIdentifiers?: string[];
+  /** Structural source evidence that this mutation changes interactive behavior. */
+  interactionMutation?: boolean;
+  /** Actionable controls/selectors structurally associated with that behavior. */
+  interactionBehaviorTargets?: string[];
+  /** Browser actions/checks, when the adapter returned structured evidence. */
+  browserInteraction?: BrowserInteractionEvidence;
+  /** True only for a completed automation adapter result, never for an external-review marker. */
+  automaticValidation?: boolean;
   /** Runtime-owned state for long-lived PTY commands and their observations. */
   observationStatus?: "pending" | "unknown" | "running" | "ready" | "failed" | "stopped";
   /** PTY foreground identity; stale observations from older generations do not satisfy a restart. */
@@ -1164,6 +1243,8 @@ const CONCRETE_VALIDATION_OUTCOME_RE =
   /(?:是否|确保|应(?:当|该)?|能够|可以|正确|正常|成功|失败|不再|保持|返回|包含|产生|显示|可见|一致|兼容|生效|完成|expected|should|must|can\b|correct|success|fail|no longer|remain|return|contain|include|produce|render|display|visible|match|consistent|compatible|work(?:s|ing)?\b)/i;
 const BROWSER_VALIDATION_RE =
   /(?:浏览器|页面|前端|截图|可视|可见|视觉|渲染|预览|图表|颜色|深色|浅色|主题切换|localhost|127\.0\.0\.1|\b(?:UI|DOM|Playwright|Cypress|Puppeteer|browser|page|frontend|screenshot|render|preview)\b)/i;
+const BROWSER_INTERACTION_VALIDATION_RE =
+  /(?:(?:点击|按下|填写|选择|切换)|\b(?:click|press|fill|select|toggle)\b)[\s\S]{0,120}(?:(?:按钮|链接|输入框|复选框|单选框|标签页|菜单|对话框)|\b(?:button|link|input|checkbox|radio|tab|menu|dialog)\b)|(?:(?:按钮|链接|输入框|复选框|单选框|标签页|菜单|对话框)|\b(?:button|link|input|checkbox|radio|tab|menu|dialog)\b)[\s\S]{0,120}(?:显示|更新|变化|出现|\b(?:display|update|change|appear)\b)/i;
 const MARKDOWN_VIEWER_VALIDATION_RE =
   /(?:Markdown|\bmd\b|test-sample\.md|mermaid|代码块|表格|脚注|标题|\bpreview\b|预览|渲染)/i;
 const TAURI_VALIDATION_RE =
@@ -1213,7 +1294,11 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
     return withAdvisoryEvidence(parsed ? [parsed] : []);
   }
 
-  if (BROWSER_VALIDATION_RE.test(normalized) || MARKDOWN_VIEWER_VALIDATION_RE.test(normalized)) {
+  if (
+    BROWSER_VALIDATION_RE.test(normalized) ||
+    BROWSER_INTERACTION_VALIDATION_RE.test(normalized) ||
+    MARKDOWN_VIEWER_VALIDATION_RE.test(normalized)
+  ) {
     // "请用户在浏览器中手动验证" names the browser as the place where
     // the user will review the result; it does not authorize the runtime to
     // manufacture browser evidence. Preserve both obligations only when the
@@ -1592,7 +1677,11 @@ function evidenceMatchesRecord(
   }
 
   if (evidence.kind === "tauri_required") {
-    return record.kind === "tauri_required" || sourceToolLooksLikeTauriAutomation(record.sourceTool);
+    // A tauri_required record is an advisory marker, not automated proof.
+    // Desktop/computer tools qualify only when their structured result proved
+    // an action and a post-action assertion.
+    return sourceToolLooksLikeTauriAutomation(record.sourceTool) &&
+      record.automaticValidation === true;
   }
 
   if (evidence.kind === "manual_user_validation") {
@@ -2838,6 +2927,27 @@ function collectRuntimeTaskTableTasks(
   return tasks;
 }
 
+function runtimeMutationEvidenceOverlaps(
+  candidateRaw: string,
+  knownMutationFiles: Set<string>,
+): boolean {
+  const candidate = normalizePlanEvidenceValue(candidateRaw);
+  if (!candidate) return false;
+  if (knownMutationFiles.has(candidate)) return true;
+
+  // Plan prose often shortens an already-reviewed path (for example,
+  // `src/components/toolbar.js` -> `toolbar.js`). Treat that as the same
+  // mutation only when the suffix resolves uniquely inside the current Plan.
+  // This deliberately does not weaken workspacePathsReferToSameFile: two
+  // relative files with the same basename remain distinct when ambiguous.
+  const matches = Array.from(knownMutationFiles).filter((known) =>
+    known === candidate ||
+    known.endsWith(`/${candidate}`) ||
+    candidate.endsWith(`/${known}`)
+  );
+  return matches.length === 1;
+}
+
 export function deriveRuntimePlanTasksFromArtifacts(
   artifacts: PlanArtifact[],
   options: RuntimePlanTaskDerivationOptions = {},
@@ -2882,7 +2992,9 @@ export function deriveRuntimePlanTasksFromArtifacts(
       const fileEvidence = (task.evidence || [])
         .filter((item) => item.kind === "file")
         .map((item) => normalizePlanEvidenceValue(item.value));
-      if (fileEvidence.some((value) => structuredMutationFiles.has(value))) {
+      if (fileEvidence.some((value) =>
+        runtimeMutationEvidenceOverlaps(value, structuredMutationFiles)
+      )) {
         continue;
       }
       pushTask(task);
@@ -2896,7 +3008,12 @@ export function deriveRuntimePlanTasksFromArtifacts(
       const fileEvidence = (task.evidence || [])
         .filter((item) => item.kind === "file")
         .map((item) => normalizePlanEvidenceValue(item.value));
-      if (fileEvidence.length > 0 && fileEvidence.every((value) => structuredMutationFiles.has(value))) {
+      if (
+        fileEvidence.length > 0 &&
+        fileEvidence.every((value) =>
+          runtimeMutationEvidenceOverlaps(value, structuredMutationFiles)
+        )
+      ) {
         continue;
       }
       pushTask(task);
@@ -2911,7 +3028,9 @@ export function deriveRuntimePlanTasksFromArtifacts(
       const fileEvidence = (task?.evidence || [])
         .filter((item) => item.kind === "file")
         .map((item) => normalizePlanEvidenceValue(item.value));
-      if (fileEvidence.some((value) => structuredMutationFiles.has(value))) {
+      if (fileEvidence.some((value) =>
+        runtimeMutationEvidenceOverlaps(value, structuredMutationFiles)
+      )) {
         continue;
       }
       pushTask(task);

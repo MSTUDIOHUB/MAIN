@@ -64,6 +64,7 @@ export type ExecuteRecoveryNextCapability =
   | "mutation"
   | "validation"
   | "launch_long_process"
+  | "recover_process"
   | "reconcile_server"
   | "observe_pty"
   | "browser_validation";
@@ -81,7 +82,16 @@ export interface RecoveryReadLease {
   requestedRange?: { startLine?: number; endLine?: number; maxLines?: number } | null;
   observationKey?: string | null;
   observedVersion?: string | null;
+  /** Stable identity of the patch failure that granted this one-shot read. */
+  mismatchFingerprint?: string | null;
   state: "available" | "active" | "consumed";
+}
+
+export interface PatchRecoveryMismatchEvidence {
+  mismatchFingerprint: string;
+  target: string;
+  requestedRange?: RecoveryReadLease["requestedRange"];
+  observedVersion?: string | null;
 }
 
 export interface ExecutionDecisionCheckpoint {
@@ -91,12 +101,36 @@ export interface ExecutionDecisionCheckpoint {
   evidenceVersion?: string | null;
 }
 
+export interface ReadProgressFingerprint {
+  phase: ExecuteRecoveryContractPhase;
+  target: string;
+  observedVersion: string | null;
+  purpose: RecoveryReadLeasePurpose | "unleased";
+  coverage: {
+    kind: "same_window" | "overlap_extension" | "new_window";
+    startLine?: number;
+    endLine?: number;
+    maxLines?: number;
+  } | null;
+  decisionCheckpoint: ExecutionDecisionCheckpoint | null;
+  /**
+   * Stable semantic identity used by the monotonic protocol retry counter.
+   * Tiny overlap extensions deliberately share an identity; a new version,
+   * phase, purpose, or decision checkpoint does not.
+   */
+  semanticKey: string;
+}
+
 /** Portable recovery transaction state used when a loop is resumed. */
 export interface ForcedExecuteRecoveryRuntimeState {
   mode: ExecuteRecoveryMode;
   reason?: string | null;
   expectedTarget?: string | null;
+  /** Recovery activations already spent before a callback or Goal slice boundary. */
+  attempts?: number;
   phaseNoProgressCount?: number;
+  protocolNoProgressCount?: number;
+  protocolNoProgressFingerprint?: string | null;
   readLease?: RecoveryReadLease | null;
   sourceObservationKey?: string | null;
   decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
@@ -121,6 +155,8 @@ export interface RecoveryActionContract {
   sourceObservationKey: string | null;
   decisionCheckpoint: ExecutionDecisionCheckpoint | null;
   phaseNoProgressCount: number;
+  protocolNoProgressCount: number;
+  protocolNoProgressFingerprint: string | null;
   devServerStatus: "none" | "pending" | "running" | "ready" | "unknown" | "failed" | "stopped";
   devServerUrl: string | null;
   ptyGeneration: number | null;
@@ -188,9 +224,16 @@ const EXECUTE_RECOVERY_FINITE_VALIDATION_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
 ]);
 
-const EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS = new Set([
+const EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS = new Set([
+  "read_pty_buffer",
+  "read_pty_tail",
   "read_pty_since",
   "get_pty_status",
+]);
+
+const EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS = new Set([
+  "send_pty_input",
+  ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
 ]);
 
 const EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS = new Set([
@@ -203,12 +246,21 @@ const EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS = new Set([
 
 const EXECUTE_RECOVERY_SERVER_RECONCILE_CONTRACT_TOOLS = new Set([
   "run_command",
+  ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
+]);
+
+const EXECUTE_RECOVERY_PROCESS_FAILURE_CONTRACT_TOOLS = new Set([
+  ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
+  "run_command",
+  "execute_command",
+  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
+  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
 ]);
 
 // Runtime-owned no-progress feedback always starts with a marker. Never scan
 // the whole payload: freshly read source may legitimately contain these
 // strings (MAIN's own cache implementation does).
-const READ_ONLY_NO_PROGRESS_DETAIL_RE = /^\s*(?:FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT)\b/i;
+const READ_ONLY_NO_PROGRESS_DETAIL_RE = /^\s*(?:FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|READ_FILE_WINDOW_NARROWED|Repeated read-only tool call skipped|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT)\b/i;
 
 export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMode {
   return value === "mutation_first" ||
@@ -230,6 +282,8 @@ export function resolveExecuteRecoveryActionContract(
     sourceObservationKey?: string | null;
     decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
     phaseNoProgressCount?: number;
+    protocolNoProgressCount?: number;
+    protocolNoProgressFingerprint?: string | null;
     devServerStatus?: "none" | "pending" | "running" | "ready" | "unknown" | "failed" | "stopped";
     devServerNextCapability?: "launch" | "observe_pty" | "browser" | "reconcile";
     devServerUrl?: string | null;
@@ -244,6 +298,8 @@ export function resolveExecuteRecoveryActionContract(
     sourceObservationKey: context.sourceObservationKey?.trim() || null,
     decisionCheckpoint: context.decisionCheckpoint || null,
     phaseNoProgressCount: Math.max(0, context.phaseNoProgressCount || 0),
+    protocolNoProgressCount: Math.max(0, context.protocolNoProgressCount || 0),
+    protocolNoProgressFingerprint: context.protocolNoProgressFingerprint?.trim() || null,
     devServerStatus: context.devServerStatus || "none" as const,
     devServerUrl: context.devServerUrl?.trim() || null,
     ptyGeneration: Number.isFinite(context.ptyGeneration) ? context.ptyGeneration as number : null,
@@ -295,8 +351,30 @@ export function resolveExecuteRecoveryActionContract(
   }
   if (
     longRunningValidationActive &&
-    context.devServerNextCapability === "launch" &&
-    (context.devServerStatus === "failed" || context.devServerStatus === "stopped")
+    (
+      shared.devServerStatus === "failed" ||
+      shared.devServerStatus === "stopped" ||
+      (
+        shared.devServerStatus === "none" &&
+        context.decisionCheckpoint?.nextRequiredCapability === "recover_process"
+      )
+    )
+  ) {
+    return {
+      ...shared,
+      modeLabel: mode,
+      phase: "reconcile",
+      nextRequiredCapability: "recover_process",
+      allowTargetedFileRead: true,
+      allowsAllTools: false,
+      allowedToolNames: EXECUTE_RECOVERY_PROCESS_FAILURE_CONTRACT_TOOLS,
+      surfaceDescription: "dev_server_failure_recovery",
+    };
+  }
+  if (
+    longRunningValidationActive &&
+    context.decisionCheckpoint?.nextRequiredCapability === "launch_long_process" &&
+    shared.devServerStatus === "none"
   ) {
     return {
       ...shared,
@@ -312,9 +390,9 @@ export function resolveExecuteRecoveryActionContract(
   if (
     longRunningValidationActive &&
     (context.devServerNextCapability === "observe_pty" ||
-      context.devServerStatus === "pending" ||
-      context.devServerStatus === "running" ||
-      context.devServerStatus === "unknown")
+      shared.devServerStatus === "pending" ||
+      shared.devServerStatus === "running" ||
+      shared.devServerStatus === "unknown")
   ) {
     return {
       ...shared,
@@ -329,7 +407,7 @@ export function resolveExecuteRecoveryActionContract(
   }
   if (
     longRunningValidationActive &&
-    (context.devServerNextCapability === "browser" || context.devServerStatus === "ready")
+    (context.devServerNextCapability === "browser" || shared.devServerStatus === "ready")
   ) {
     return {
       ...shared,
@@ -425,6 +503,132 @@ function normalizeExecuteRecoveryTarget(value: unknown): string {
     .replace(/\/+/g, "/");
 }
 
+export function normalizeRecoveryReadRange(
+  value: unknown,
+): RecoveryReadLease["requestedRange"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Record<string, unknown>;
+  const range = {
+    ...(Number.isFinite(candidate.startLine ?? candidate.start_line)
+      ? { startLine: Math.max(1, Math.floor(Number(candidate.startLine ?? candidate.start_line))) }
+      : {}),
+    ...(Number.isFinite(candidate.endLine ?? candidate.end_line)
+      ? { endLine: Math.max(1, Math.floor(Number(candidate.endLine ?? candidate.end_line))) }
+      : {}),
+    ...(Number.isFinite(candidate.maxLines ?? candidate.max_lines)
+      ? { maxLines: Math.max(1, Math.floor(Number(candidate.maxLines ?? candidate.max_lines))) }
+      : {}),
+  };
+  return Object.keys(range).length > 0 ? range : null;
+}
+
+export function recoveryReadRangesMatch(
+  expected: RecoveryReadLease["requestedRange"],
+  observed: RecoveryReadLease["requestedRange"],
+): boolean {
+  const normalizedExpected = normalizeRecoveryReadRange(expected);
+  if (!normalizedExpected) return true;
+  const normalizedObserved = normalizeRecoveryReadRange(observed);
+  if (!normalizedObserved) return false;
+  const expectedStart = normalizedExpected.startLine || 1;
+  const observedStart = normalizedObserved.startLine || 1;
+  if (expectedStart !== observedStart) return false;
+  const expectedEnd = normalizedExpected.endLine ?? (
+    normalizedExpected.maxLines
+      ? expectedStart + normalizedExpected.maxLines - 1
+      : null
+  );
+  const observedEnd = normalizedObserved.endLine ?? (
+    normalizedObserved.maxLines
+      ? observedStart + normalizedObserved.maxLines - 1
+      : null
+  );
+  return expectedEnd === observedEnd;
+}
+
+export function requestedRangeFromReadObservationSignature(
+  requestSignature: string,
+): RecoveryReadLease["requestedRange"] {
+  const argsSeparator = requestSignature.lastIndexOf("::");
+  if (argsSeparator < 0) return null;
+  try {
+    const entries = JSON.parse(requestSignature.slice(argsSeparator + 2));
+    return Array.isArray(entries)
+      ? normalizeRecoveryReadRange(Object.fromEntries(entries))
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+export function buildExecutePatchMismatchFingerprint(input: {
+  reason: string;
+  target: string;
+  failureIdentity?: string | null;
+}): string {
+  const reason = String(input.reason || "patch_mismatch")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_:-]+/g, "_");
+  const failureIdentity = String(input.failureIdentity || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_:-]+/g, "_");
+  return [
+    "patch_mismatch",
+    normalizeExecuteRecoveryTarget(input.target).toLowerCase(),
+    reason || "patch_mismatch",
+    ...(failureIdentity ? [failureIdentity] : []),
+  ].join("::");
+}
+
+export function buildPatchRecoveryReadNoProgressFingerprint(target: string): string {
+  const normalizedTarget = normalizeExecuteRecoveryTarget(target).toLowerCase();
+  return [
+    "patch_recovery_read",
+    normalizedTarget,
+    `read_file:${normalizedTarget}:read_unchanged`,
+  ].join("::");
+}
+
+export function patchRecoveryLeaseIdentityMatches(
+  current: RecoveryReadLease | null | undefined,
+  candidate: RecoveryReadLease | null | undefined,
+): boolean {
+  if (
+    current?.purpose !== "patch_recovery" ||
+    candidate?.purpose !== "patch_recovery" ||
+    !workspacePathsReferToSameFile(current.target, candidate.target)
+  ) {
+    return false;
+  }
+  const currentFingerprint = String(current.mismatchFingerprint || "").trim();
+  const candidateFingerprint = String(candidate.mismatchFingerprint || "").trim();
+  if (!currentFingerprint || !candidateFingerprint || currentFingerprint !== candidateFingerprint) {
+    return false;
+  }
+  if (!recoveryReadRangesMatch(current.requestedRange, candidate.requestedRange) ||
+      !recoveryReadRangesMatch(candidate.requestedRange, current.requestedRange)) {
+    return false;
+  }
+  return String(current.observedVersion || "").trim() ===
+    String(candidate.observedVersion || "").trim();
+}
+
+export function readEvidenceSatisfiesRecoveryLease(input: {
+  lease: RecoveryReadLease | null | undefined;
+  target: string;
+  requestedRange?: RecoveryReadLease["requestedRange"];
+  observedVersion?: string | null;
+}): boolean {
+  const lease = input.lease;
+  if (!lease || !workspacePathsReferToSameFile(input.target, lease.target)) return false;
+  if (!recoveryReadRangesMatch(lease.requestedRange, input.requestedRange)) return false;
+  const expectedVersion = String(lease.observedVersion || "").trim();
+  const observedVersion = String(input.observedVersion || "").trim();
+  return !expectedVersion || !observedVersion || expectedVersion === observedVersion;
+}
+
 function isSuccessfulExecutePatchRecoveryResolution(
   activity: ExecuteRecoveryActivityLike,
   mismatchTarget: string,
@@ -458,25 +662,29 @@ export function resolveExecutePatchRecoveryTarget(
   return null;
 }
 
-export function shouldBypassExecuteReadCacheForPatchRecovery(input: {
-  toolName: string;
-  allowFileRead: boolean;
-  target: string;
-  recentActivity: ExecuteRecoveryActivityLike[];
-}): boolean {
-  if (input.toolName !== "read_file" || !input.allowFileRead) return false;
-  const recoveryTarget = resolveExecutePatchRecoveryTarget(input.recentActivity);
-  return recoveryTarget !== null && workspacePathsReferToSameFile(input.target, recoveryTarget);
-}
-
 export function shouldUseExecutePatchRecoveryReadLease(input: {
   toolName: string;
   allowFileRead: boolean;
   target: string;
-  recentActivity: ExecuteRecoveryActivityLike[];
+  requestedRange?: RecoveryReadLease["requestedRange"];
+  observedVersion?: string | null;
+  activeReadLease?: RecoveryReadLease | null;
   leaseClaimed: boolean;
 }): boolean {
-  return !input.leaseClaimed && shouldBypassExecuteReadCacheForPatchRecovery(input);
+  const lease = input.activeReadLease;
+  return Boolean(
+    !input.leaseClaimed &&
+    input.toolName === "read_file" &&
+    input.allowFileRead &&
+    lease?.purpose === "patch_recovery" &&
+    lease.state === "available" &&
+    readEvidenceSatisfiesRecoveryLease({
+      lease,
+      target: input.target,
+      requestedRange: input.requestedRange,
+      observedVersion: input.observedVersion,
+    })
+  );
 }
 
 /**
@@ -542,6 +750,7 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)
   ) || (soleUnresolvedPatch ? eligible[0] : undefined);
   const matchingRead = scopedEligible.find((call) => call.name === "read_file");
+  const matchingJoin = scopedEligible.find((call) => call.name === "wait_subagents");
   const matchingValidation = mode === "finite_validation_only"
     ? scopedEligible.find((call) =>
           call.name === "run_command" &&
@@ -554,14 +763,20 @@ export function resolveExecuteRecoveryBatchDecision(input: {
       ? scopedEligible.find((call) => EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS.has(call.name))
       : contract.nextRequiredCapability === "launch_long_process"
         ? scopedEligible.find((call) => EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS.has(call.name))
+        : contract.nextRequiredCapability === "recover_process"
+          ? scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS.has(call.name)) ||
+            scopedEligible.find((call) => call.name === "read_file") ||
+            scopedEligible.find((call) => EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)) ||
+            scopedEligible.find((call) => call.name === "run_command") ||
+            scopedEligible.find((call) => call.name === "execute_command")
         : contract.nextRequiredCapability === "reconcile_server"
           ? scopedEligible.find((call) => EXECUTE_RECOVERY_SERVER_RECONCILE_CONTRACT_TOOLS.has(call.name))
       : undefined;
-  const selected = contract.nextRequiredCapability === "targeted_read"
+  const selected = matchingJoin || (contract.nextRequiredCapability === "targeted_read"
     ? matchingRead
     : contract.nextRequiredCapability === "mutation"
       ? matchingMutation || matchingRead || scopedEligible[0]
-      : matchingNextCapability || matchingValidation || matchingRead;
+      : matchingNextCapability || matchingValidation || matchingRead);
   return {
     active: true,
     phase,
@@ -586,6 +801,9 @@ export function isExecuteRecoveryToolName(
     normalizeExecuteRecoveryMode(options.mode),
   );
   if (contract.allowsAllTools) return true;
+  // Recovery may narrow new work, but it must not strand already-running
+  // children. Joining releases their scope lease and is not new exploration.
+  if (name === "wait_subagents") return true;
   // allowFileRead is retained for call-site compatibility, but cannot hide a
   // potentially legal changed-version/missing-window read before arguments are
   // available. The contract and argument-aware partitioner own that decision.

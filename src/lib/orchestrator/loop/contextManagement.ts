@@ -90,6 +90,7 @@ export function advanceFileReadContextEvictionEpochs(input: {
   afterMessages: AgentMessage[];
 }): number {
   let evictions = 0;
+  const removedObservationIds: string[] = [];
   for (const state of input.fileReadStates.values()) {
     if (
       isContentInActiveMessages(state.modelContent, input.beforeMessages) &&
@@ -97,7 +98,20 @@ export function advanceFileReadContextEvictionEpochs(input: {
     ) {
       state.contextEvictionEpoch = (state.contextEvictionEpoch || 0) + 1;
       evictions += 1;
+      removedObservationIds.push(getFileReadObservationForState(state, "replay").key);
     }
+  }
+  if (removedObservationIds.length > 0) {
+    const messageChars = (messages: AgentMessage[]) => messages.reduce(
+      (sum, message) => sum + String(message.content || "").length,
+      0,
+    );
+    logAgentEvent("file_read_context_eviction_advanced", {
+      evictedObservationCount: removedObservationIds.length,
+      removedObservationIds: removedObservationIds.slice(0, 24),
+      contextCharsBefore: messageChars(input.beforeMessages),
+      contextCharsAfter: messageChars(input.afterMessages),
+    });
   }
   return evictions;
 }

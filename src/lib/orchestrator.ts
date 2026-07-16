@@ -38,7 +38,10 @@ import { acquireModelLane } from "./modelLaneCoordinator";
 import { MODEL_CONTROL_LANGUAGE } from "./modelControlLanguage";
 import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } from "./toolDiff";
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
-import { isReadOnlyNoProgressDetail } from "./executeRecoveryTools";
+import {
+  isReadOnlyNoProgressDetail,
+  type PatchRecoveryMismatchEvidence,
+} from "./executeRecoveryTools";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
 import {
   WORKSPACE_MUTATION_TOOL_NAMES,
@@ -1328,8 +1331,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason?: string | null;
     expectedTarget?: string | null;
+    attempts?: number;
     phase?: ExecuteRecoveryContractPhase;
     phaseNoProgressCount?: number;
+    protocolNoProgressCount?: number;
+    protocolNoProgressFingerprint?: string | null;
     readLease?: RecoveryReadLease | null;
     sourceObservationKey?: string | null;
     decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
@@ -1361,8 +1367,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason: string;
     expectedTarget: string | null;
+    attempts: number;
     phase: ExecuteRecoveryContractPhase;
     phaseNoProgressCount: number;
+    protocolNoProgressCount: number;
+    protocolNoProgressFingerprint: string | null;
     readLease: RecoveryReadLease | null;
     sourceObservationKey: string | null;
     decisionCheckpoint: ExecutionDecisionCheckpoint | null;
@@ -1511,6 +1520,8 @@ export interface OrchestratorCallbacks {
       qualityGateReason?: string | null;
     },
   ) => void;
+  /** Structured post-execution observation used by non-UI evidence collectors. */
+  onToolResultObserved?: (result: ToolExecutionResult) => void;
   onToolError: (
     toolName: string,
     target: string,
@@ -1729,7 +1740,8 @@ export function isReadFileOnlyPattern(results: ToolExecutionResult[]): boolean {
     (
       res.content.includes("FILE_UNCHANGED_STUB") ||
       res.content.includes("CACHED_FILE_REPLAY") ||
-      res.content.includes("READ_FILE_REPEAT_LIMIT")
+      res.content.includes("READ_FILE_REPEAT_LIMIT") ||
+      res.content.includes("READ_FILE_WINDOW_NARROWED")
     )
   );
 }
@@ -1762,6 +1774,13 @@ function stableProgressHash(input: string): string {
 function normalizeNoProgressResultContent(result: ToolExecutionResult): string {
   const raw = String(result.content || "");
   if (!PLAN_EXPLORATION_READ_ONLY_TOOLS.has(result.name)) return raw;
+  if (/^\s*READ_FILE_WINDOW_NARROWED\b/i.test(raw)) {
+    // A request such as 1-21 followed by 1-22 may legitimately return the
+    // missing line, but it is the same semantic decision request. Keep the
+    // read legal while preventing tiny overlap expansions from resetting the
+    // convergence counter every turn.
+    return "READ_FILE_WINDOW_NARROWED";
+  }
   return raw
     .replace(/Duplicate skip count in this run:\s*\d+\./gi, "Duplicate skip count in this run: [n].")
     .replace(/\(duplicate\s+\d+\)/gi, "(duplicate [n])")
@@ -2260,7 +2279,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
     return [
       "当前剩余任务需要浏览器级验证。下一步必须调用可用的 Browser/Playwright 工具，而不是继续用 curl、grep、cat 或重复启动 dev server。",
       "验证策略：使用当前实际 dev server URL；打开页面；执行 DOM 断言；必要时截图；如果是 Markdown Viewer/test-sample.md 场景，读取样例内容后注入编辑器 textarea，触发 input，再检查 preview 中标题、代码块、表格、脚注、Mermaid 容器和关键样式。",
-      "若 Browser/Playwright 工具调用失败或不可用，暂停并说明待用户验证，不要继续兜圈。",
+      "若 Browser/Playwright 工具调用失败或不可用，因自动浏览器证据缺失而如实暂停；可把具体人工复核写入结论建议，但不能用人工复核关闭自动验收缺口，也不要继续兜圈。",
       "待验证任务：",
       input.remainingText,
     ].join("\n");
@@ -2268,7 +2287,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
   return [
     "The remaining task requires browser-level validation. Next, call an available Browser/Playwright tool; do not keep using curl, grep, cat, or repeated dev-server starts.",
     "Validation strategy: use the actual dev-server URL, open the page, run DOM assertions, and take a screenshot if needed. For Markdown Viewer/test-sample.md, read the sample content, inject it into the editor textarea, dispatch input, then assert the preview contains headings, code blocks, tables, footnotes, Mermaid containers, and key styles.",
-    "If Browser/Playwright is unavailable or fails, pause and report pending user validation instead of looping.",
+    "If Browser/Playwright is unavailable or fails, pause honestly because automatic browser evidence is missing. You may list a concrete manual check as an advisory, but it cannot close the automatic acceptance gap; do not loop.",
     "Pending validation:",
     input.remainingText,
   ].join("\n");
@@ -2277,7 +2296,7 @@ export function buildBrowserValidationContinuationPrompt(input: {
 export function resolveApprovedPlanValidationBoundary(input: {
   audit: PlanTaskEvidenceAudit | null;
   availableToolNames: Set<string>;
-}): "none" | "browser_prompt" | "pause_external_validation" {
+}): "none" | "browser_prompt" | "pause_browser_unavailable" | "pause_external_validation" {
   const audit = input.audit;
   if (!audit) return "none";
   const browserAvailable = hasBrowserValidationCapability(input.availableToolNames);
@@ -2288,11 +2307,9 @@ export function resolveApprovedPlanValidationBoundary(input: {
   const remaining = audit.remainingTasks;
   if (remaining.length === 0) return "none";
   const allBrowser = remaining.every(isPlanTaskAwaitingBrowserValidation);
-  const allExternal = remaining.every((task) =>
-    isPlanTaskAwaitingExternalValidation(task) ||
-    (isPlanTaskAwaitingBrowserValidation(task) && !browserAvailable)
-  );
+  const allExternal = remaining.every(isPlanTaskAwaitingExternalValidation);
   if (allBrowser && browserAvailable) return "browser_prompt";
+  if (allBrowser) return "pause_browser_unavailable";
   if (allExternal) return "pause_external_validation";
   return "none";
 }
@@ -2603,11 +2620,11 @@ export function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallb
     approvalChoiceHint +
     (callbacks.getPlanTasks().length > 0
       ? language === "zh"
-        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，ExecutionCapsule 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。只有同一文件版本、同一读取范围仍在当前上下文且再次读取只返回 `FILE_UNCHANGED_STUB` 时，才应停止该无进展重复；文件修改后、结果已淘汰或需要不同范围时可以重新读取。否则转向 `apply_patch`/`replace_in_file`/`write_file`、验证、其他必要范围或精确阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行；如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
-        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so ExecutionCapsule can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Stop rereading only when the same range of the same unchanged file version is still active and another read returns `FILE_UNCHANGED_STUB`; reread after mutation, eviction, or for a different required range. Otherwise patch/write, validate, inspect another needed range, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. If Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation; if tasks.md exists, update the matching checkbox after evidence exists.\n"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，ExecutionCapsule 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。只有同一文件版本、同一读取范围仍在当前上下文且再次读取只返回 `FILE_UNCHANGED_STUB` 时，才应停止该无进展重复；文件修改后、结果已淘汰或需要不同范围时可以重新读取。否则转向 `apply_patch`/`replace_in_file`/`write_file`、验证、其他必要范围或精确阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；不可自动执行的 Tauri/人工复核只记录为最终结论中的建议项，不能关闭任何自动验证缺口，也不能仅因此暂停。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部可自动执行的任务都有真实文件/命令/交付物/浏览器证据满足后才能结束执行；剩余 Tauri/人工复核必须明确列在结论中。如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so ExecutionCapsule can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Stop rereading only when the same range of the same unchanged file version is still active and another read returns `FILE_UNCHANGED_STUB`; reread after mutation, eviction, or for a different required range. Otherwise patch/write, validate, inspect another needed range, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. Tauri or manual review that cannot be automated is only an advisory in the final conclusion: it cannot close any automatic validation gap and must not by itself pause the run. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Stop only after every automatable task has real file/command/deliverable/browser evidence, and list any remaining Tauri/manual review explicitly in the conclusion; if tasks.md exists, update the matching checkbox after evidence exists.\n"
       : language === "zh"
-      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；Tauri/人工验证不可自动完成时要暂停说明待用户验证。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部任务都有真实文件/命令/交付物/浏览器证据满足，或剩余项明确待用户验证后，才能结束执行。\n"
-      : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; if Tauri or manual validation cannot be automated, pause and report pending user validation. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Only stop when every task has satisfied real file/command/deliverable/browser evidence, or remaining items are explicitly pending user validation.\n") +
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；不可自动执行的 Tauri/人工复核只记录在最终结论中，不能关闭自动验证缺口，也不能仅因此暂停。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部可自动执行任务都有真实文件/命令/交付物/浏览器证据满足后才能结束，并在结论中列出剩余用户复核建议。\n"
+      : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence. Tauri or manual review that cannot be automated belongs only in the final conclusion: it cannot close an automatic validation gap and must not by itself pause the run. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Stop only after every automatable task has real file/command/deliverable/browser evidence, and list any remaining user review suggestions in the conclusion.\n") +
     deliverableHint +
     (runtimeTaskList ? "\n" + runtimeTaskList + "\n" : "") +
     "\n" +
@@ -3198,6 +3215,12 @@ interface ToolExecutionResult {
   planRecoveryAction?: PlanArtifactRecoveryAction;
   missingPlanSections?: string[];
   readFileObservation?: import("./orchestrator/fileReadCache").FileReadObservationIdentity;
+  patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
+  approvedPlanScopeConflict?: {
+    requestedTargets: string[];
+    unexpectedTargets: string[];
+    plannedTargets: string[];
+  };
 }
 
 function getToolResultDiagnosticText(result?: ToolExecutionResult): string {
@@ -5178,6 +5201,17 @@ export async function executeWriteToolWithReview(
     args: toolArgs,
     language: callbacks.getPreferredLanguage(),
     readFile: async (path) => String(await executeTool("read_file", { path, __raw: true }, workspace, callbacks.getSessionKey()) ?? ""),
+    readFileMetadata: async (path) => {
+      try {
+        const metadata = await getFileMetadata(path, workspace);
+        return {
+          sizeBytes: Number(metadata.sizeBytes) || 0,
+          modifiedMs: Number(metadata.modifiedMs) || 0,
+        };
+      } catch {
+        return null;
+      }
+    },
   });
   if (!mutationPreflight.ok) {
     const recoveryTarget = String(mutationPreflight.path || "").trim() || target;
@@ -5193,6 +5227,9 @@ export async function executeWriteToolWithReview(
       content: `Error: ${mutationPreflight.message || "MUTATION_PREFLIGHT_BLOCKED"}`,
       isError: true,
       lifecycleState: "blocked",
+      ...(mutationPreflight.patchRecoveryMismatch
+        ? { patchRecoveryMismatch: mutationPreflight.patchRecoveryMismatch }
+        : {}),
     };
   }
 

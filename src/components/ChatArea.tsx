@@ -48,7 +48,7 @@ import { deriveDynamicFirstPersonText } from "../lib/capsuleStagingHelper";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
   buildRuntimeProgressLedger,
-  buildRuntimeProgressProjection,
+  buildRunStatusProjection,
 } from "../lib/runtimeProgressLedger";
 import { getChatFeedbackStatusCopy, normalizeChatFeedbackStatus } from "../lib/chatFeedback";
 import { appendDebugLog } from "../lib/debugLog";
@@ -2616,6 +2616,8 @@ export default function ChatArea({
   const showGoalPopover = capsulePopover === "goal";
   const popoverRef = useRef<HTMLDivElement>(null);
   const mButtonRef = useRef<HTMLButtonElement>(null);
+  const runStatusCloseButtonRef = useRef<HTMLButtonElement>(null);
+  const wasProgressPopoverOpenRef = useRef(false);
   const tasksPopoverRef = useRef<HTMLDivElement>(null);
   const tasksButtonRef = useRef<HTMLButtonElement>(null);
   const goalPopoverRef = useRef<HTMLDivElement>(null);
@@ -2652,6 +2654,22 @@ export default function ChatArea({
       document.removeEventListener("keydown", handleDocumentKeyDown);
     };
   }, [capsulePopover]);
+
+  useEffect(() => {
+    if (showProgressPopover) {
+      wasProgressPopoverOpenRef.current = true;
+      const frame = window.requestAnimationFrame(() => {
+        runStatusCloseButtonRef.current?.focus();
+      });
+      return () => window.cancelAnimationFrame(frame);
+    }
+    if (!wasProgressPopoverOpenRef.current) return;
+    wasProgressPopoverOpenRef.current = false;
+    const frame = window.requestAnimationFrame(() => {
+      mButtonRef.current?.focus();
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [showProgressPopover]);
 
   useEffect(() => {
     setCapsulePopover(null);
@@ -2969,8 +2987,8 @@ export default function ChatArea({
     language,
     runtimeEvents,
   ]);
-  const capsuleProgressProjection = useMemo(
-    () => buildRuntimeProgressProjection(capsuleProgressLedger, language, 4),
+  const capsuleRunStatus = useMemo(
+    () => buildRunStatusProjection(capsuleProgressLedger, language, 3),
     [capsuleProgressLedger, language],
   );
   // 缓存并锁死当前轮次下模型输出的最新的非空第一人称说明，防止被工具调用瞬间冲刷掉
@@ -3057,10 +3075,10 @@ export default function ChatArea({
     if (capsuleExplanationBySource.model) return capsuleExplanationBySource.model;
     if (activeTurnExplanation.text) return activeTurnExplanation.text;
     if (explanationInfo.text) return explanationInfo.text;
-    const progressText = normalizeCapsuleProgressText(capsuleProgressProjection.activityText);
+    const progressText = normalizeCapsuleProgressText(capsuleRunStatus.activityText);
     if (progressText) return progressText;
     return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought));
-  }, [planExecutionCapsuleProjection?.headline, capsuleIsRunActive, capsuleTurn, capsuleExplanationBySource, activeTurnExplanation.text, explanationInfo.text, capsuleProgressProjection.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
+  }, [planExecutionCapsuleProjection?.headline, capsuleIsRunActive, capsuleTurn, capsuleExplanationBySource, activeTurnExplanation.text, explanationInfo.text, capsuleRunStatus.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
 
   useEffect(() => {
     const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
@@ -4639,7 +4657,12 @@ export default function ChatArea({
           {showProgressPopover && !isCapsuleCollapsed && (
             <div
               ref={popoverRef}
+              id="run-status-popover"
               data-testid="effective-progress-popover"
+              data-runtime-surface="run-status"
+              role="dialog"
+              aria-modal="false"
+              aria-labelledby="run-status-popover-title"
               className={`pointer-events-auto mb-3 w-full max-w-xl rounded-2xl border p-4 backdrop-blur-md text-left transition-all duration-200 ${
                 isLightThemeMode
                   ? "border-[#d4d4d8] bg-white/95 shadow-[0_12px_40px_rgba(0,0,0,0.12)] text-[#18181b]"
@@ -4654,12 +4677,14 @@ export default function ChatArea({
               <div className={`flex items-center justify-between border-b pb-2 mb-2 ${
                 isLightThemeMode ? "border-[#e4e4e7]" : "border-[rgba(255,255,255,0.08)]"
               }`}>
-                <span className="font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent-light)] font-semibold">
-                  {language === "zh" ? "有效进展" : "Effective Progress"}
+                <span id="run-status-popover-title" className="font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--accent-light)] font-semibold">
+                  {language === "zh" ? "运行状态" : "Run Status"}
                 </span>
                 <button
+                  ref={runStatusCloseButtonRef}
                   type="button"
                   onClick={() => setCapsulePopover(null)}
+                  aria-label={language === "zh" ? "关闭运行状态" : "Close run status"}
                   className={`rounded p-1 transition-colors ${
                     isLightThemeMode
                       ? "text-[#71717a] hover:bg-[#f4f4f5] hover:text-[#18181b]"
@@ -4672,47 +4697,138 @@ export default function ChatArea({
                 </button>
               </div>
 
-              {capsuleProgressLedger.length === 0 ? (
-                <div className="py-6 text-center text-[#71717a] italic">
-                  {language === "zh" ? "暂无有效进展" : "No effective progress yet"}
+              {!capsuleRunStatus.currentActivity &&
+              capsuleRunStatus.milestones.length === 0 &&
+              capsuleRunStatus.healthSignals.length === 0 ? (
+                <div className={`py-6 text-center italic ${
+                  isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                }`}>
+                  {language === "zh" ? "暂无运行状态" : "No run status yet"}
                 </div>
               ) : (
-                <div className="max-h-[220px] overflow-y-auto space-y-2 pr-1">
-                  {capsuleProgressLedger.map((item, index) => (
-                    <div
-                      key={`${item.key}:${index}`}
-                      className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border text-[11px] ${
-                        isLightThemeMode
-                          ? "border-[#e4e4e7] bg-[#f8fafc]"
-                          : isBlackThemeMode
-                          ? "border-[#202026] bg-[#030304]"
-                          : "border-[#202026] bg-[#09090b]"
-                      }`}
-                    >
-                      <span className={`mt-1.5 h-2 w-2 rounded-full ${
-                        item.status === "failed" || item.status === "paused"
-                          ? "bg-[#f87171]"
-                          : item.status === "running"
-                          ? "bg-[var(--accent-light)] shadow-[0_0_8px_var(--accent)]"
-                          : "bg-[#10b981]"
-                      }`} />
-                      <span className="min-w-0 flex-1">
-                        <span className={`block font-medium truncate ${
-                          isLightThemeMode ? "text-[#18181b]" : "text-white"
-                        }`}>{item.title}</span>
-                        {item.summary && (
-                          <span className={`mt-0.5 block truncate ${
-                            isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
-                          }`}>{item.summary}</span>
-                        )}
-                      </span>
-                      {(item.repeatCount > 1 || item.cacheHits > 0) && (
-                        <span className="shrink-0 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-1.5 py-0.5 text-[9px] text-[var(--accent-light)]">
-                          x{item.repeatCount}{item.cacheHits ? ` / ${item.cacheHits} cached` : ""}
+                <div className="max-h-[260px] overflow-y-auto space-y-3 pr-1">
+                  {capsuleRunStatus.currentActivity && (
+                    <section data-testid="run-status-current-activity">
+                      <div className={`mb-1 text-[9px] font-semibold uppercase tracking-[0.12em] ${
+                        isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                      }`}>
+                        {language === "zh" ? "当前活动" : "Current activity"}
+                      </div>
+                      <div
+                        className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border text-[11px] ${
+                          isLightThemeMode
+                            ? "border-[#e4e4e7] bg-[#f8fafc]"
+                            : isBlackThemeMode
+                            ? "border-[#202026] bg-[#030304]"
+                            : "border-[#202026] bg-[#09090b]"
+                        }`}
+                      >
+                        <span className={`mt-1.5 h-2 w-2 rounded-full ${
+                          capsuleRunStatus.currentActivity.status === "running"
+                            ? "bg-[var(--accent-light)] shadow-[0_0_8px_var(--accent)]"
+                            : "bg-[#10b981]"
+                        }`} />
+                        <span className="min-w-0 flex-1">
+                          <span className={`block font-medium truncate ${
+                            isLightThemeMode ? "text-[#18181b]" : "text-white"
+                          }`}>{capsuleRunStatus.currentActivity.title}</span>
+                          {capsuleRunStatus.currentActivity.summary && (
+                            <span className={`mt-0.5 block truncate ${
+                              isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                            }`}>{capsuleRunStatus.currentActivity.summary}</span>
+                          )}
                         </span>
-                      )}
-                    </div>
-                  ))}
+                        {(capsuleRunStatus.currentActivity.repeatCount > 1 || capsuleRunStatus.currentActivity.cacheHits > 0) && (
+                          <span className="shrink-0 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-1.5 py-0.5 text-[9px] text-[var(--accent-light)]">
+                            ×{capsuleRunStatus.currentActivity.repeatCount}
+                          </span>
+                        )}
+                      </div>
+                    </section>
+                  )}
+
+                  {capsuleRunStatus.milestones.length > 0 && (
+                    <section data-testid="run-status-milestones">
+                      <div className={`mb-1 text-[9px] font-semibold uppercase tracking-[0.12em] ${
+                        isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                      }`}>
+                        {language === "zh" ? "最近里程碑" : "Recent milestones"}
+                      </div>
+                      <div className="space-y-1.5">
+                        {capsuleRunStatus.milestones.map((item) => (
+                          <div
+                            key={item.key}
+                            data-testid="run-status-milestone"
+                            className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-2.5 rounded-lg px-2 py-1.5 border text-[11px] ${
+                              isLightThemeMode
+                                ? "border-[#e4e4e7] bg-[#f8fafc]"
+                                : isBlackThemeMode
+                                ? "border-[#202026] bg-[#030304]"
+                                : "border-[#202026] bg-[#09090b]"
+                            }`}
+                          >
+                            <span className="mt-1.5 h-2 w-2 rounded-full bg-[#10b981]" />
+                            <span className="min-w-0 flex-1">
+                              <span className={`block font-medium truncate ${
+                                isLightThemeMode ? "text-[#18181b]" : "text-white"
+                              }`}>{item.title}</span>
+                              {item.summary && (
+                                <span className={`mt-0.5 block truncate ${
+                                  isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                                }`}>{item.summary}</span>
+                              )}
+                            </span>
+                            {item.repeatCount > 1 && (
+                              <span className="shrink-0 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] px-1.5 py-0.5 text-[9px] text-[var(--accent-light)]">
+                                ×{item.repeatCount}
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
+
+                  {capsuleRunStatus.healthSignals.length > 0 && (
+                    <section data-testid="run-status-health-signals">
+                      <div className={`mb-1 text-[9px] font-semibold uppercase tracking-[0.12em] ${
+                        isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                      }`}>
+                        {language === "zh" ? "运行健康" : "Run health"}
+                      </div>
+                      <div className="space-y-1.5">
+                        {capsuleRunStatus.healthSignals.map((signal) => (
+                          <div
+                            key={signal.key}
+                            data-testid="run-status-health-signal"
+                            className={`grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-2.5 rounded-lg border px-2 py-1.5 text-[11px] ${
+                              isLightThemeMode
+                                ? "border-[#e4e4e7] bg-[#f8fafc]"
+                                : isBlackThemeMode
+                                ? "border-[#202026] bg-[#030304]"
+                                : "border-[#202026] bg-[#09090b]"
+                            }`}
+                          >
+                            <span className={`mt-1.5 h-2 w-2 rounded-full ${
+                              signal.kind === "failure" || signal.kind === "pause"
+                                ? "bg-[#f87171]"
+                                : "bg-[#f59e0b]"
+                            }`} />
+                            <span className="min-w-0">
+                              <span className={`block font-medium truncate ${
+                                isLightThemeMode ? "text-[#18181b]" : "text-white"
+                              }`}>{signal.title}</span>
+                              {signal.summary && (
+                                <span className={`mt-0.5 block truncate ${
+                                  isLightThemeMode ? "text-[#71717a]" : "text-[#a1a1aa]"
+                                }`}>{signal.summary}</span>
+                              )}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </section>
+                  )}
                 </div>
               )}
             </div>
@@ -4897,8 +5013,10 @@ export default function ChatArea({
                               e.stopPropagation();
                               setCapsulePopover(showProgressPopover ? null : "progress");
                             }}
+                            aria-expanded={showProgressPopover}
+                            aria-controls="run-status-popover"
                             className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:scale-105 active:scale-95 transition-all cursor-pointer"
-                            title={language === "zh" ? "查看有效进展" : "View Effective Progress"}
+                            title={language === "zh" ? "查看运行状态" : "View Run Status"}
                           >
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
                           </button>

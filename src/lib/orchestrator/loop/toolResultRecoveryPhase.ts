@@ -6,16 +6,19 @@ import {
   resolveFailedFiniteValidationRecoveryPolicy,
   shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
+import { buildApprovedPlanScopeConflictFingerprint } from "../../approvedPlanExecutionScope";
+import { resolveDevServerRuntimeState } from "../../devServerRuntime";
 import {
   isReviewablePlanStage,
   isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
   resolveApprovedPlanValidationBoundary,
 } from "../../orchestrator";
+import { buildPlanApprovalIdentity } from "../../planApprovalIdentity";
 import { commandResultLooksSuccessful } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
@@ -116,16 +119,42 @@ type ApprovedPlanNoProgressRecoveryAction = (
 
 const APPROVED_PLAN_SCOPE_BLOCKED_RE = /\bAPPROVED_PLAN_SCOPE_BLOCKED\b/;
 
-function getApprovedPlanScopeBlockedTargets(results: ToolExecutionResult[]): string[] {
-  return Array.from(new Set(
-    results
-      .filter((result) =>
-        result.isError &&
-        APPROVED_PLAN_SCOPE_BLOCKED_RE.test(String(result.content || ""))
-      )
-      .map((result) => String(result.target || "").trim())
-      .filter(Boolean),
-  ));
+function getApprovedPlanScopeConflict(results: ToolExecutionResult[]): {
+  requestedTargets: string[];
+  unexpectedTargets: string[];
+  plannedTargets: string[];
+} {
+  const requestedTargets = new Set<string>();
+  const unexpectedTargets = new Set<string>();
+  const plannedTargets = new Set<string>();
+  for (const result of results) {
+    const conflict = result.approvedPlanScopeConflict;
+    if (
+      !result.isError ||
+      (!conflict && !APPROVED_PLAN_SCOPE_BLOCKED_RE.test(String(result.content || "")))
+    ) {
+      continue;
+    }
+    if (conflict) {
+      conflict.requestedTargets.forEach((target) => requestedTargets.add(String(target || "").trim()));
+      conflict.unexpectedTargets.forEach((target) => unexpectedTargets.add(String(target || "").trim()));
+      conflict.plannedTargets.forEach((target) => plannedTargets.add(String(target || "").trim()));
+      continue;
+    }
+    // Backward-compatible fallback for an in-flight result created before the
+    // structured conflict envelope was added. New results never derive the
+    // semantic identity from localized feedback or the mutation tool name.
+    const target = String(result.target || "").trim();
+    if (target) {
+      requestedTargets.add(target);
+      unexpectedTargets.add(target);
+    }
+  }
+  return {
+    requestedTargets: Array.from(requestedTargets).filter(Boolean),
+    unexpectedTargets: Array.from(unexpectedTargets).filter(Boolean),
+    plannedTargets: Array.from(plannedTargets).filter(Boolean),
+  };
 }
 
 function buildApprovedPlanScopeRecoveryPrompt(input: {
@@ -138,14 +167,14 @@ function buildApprovedPlanScopeRecoveryPrompt(input: {
   if (input.language === "en") {
     return [
       "The attempted write to " + targets + " was blocked because it is outside the approved Plan scope (" + planned + ").",
-      "Do not pause merely to add a temporary verification helper. Continue the approved work using existing tests, an inline command, a temporary location outside the workspace, or read-only inspection.",
-      "Only if the source change genuinely requires this additional workspace target, output a focused Plan revision for review; otherwise continue execution and validation now.",
+      "A bounded scope-recovery transaction is active. Reuse the retained source observation and make the exact mutation inside an approved target; read only if an exact current range is genuinely missing.",
+      "Do not use shell commands or another tool to bypass the scope. If the source change genuinely requires the blocked target, write a focused Plan revision for review instead.",
     ].join("\n");
   }
   return [
     "对 " + targets + " 的写入已被拦截，因为它不在已批准 Plan 的修改范围内（当前范围：" + planned + "）。",
-    "不要仅为添加临时验证脚本而暂停；请改用现有测试、内联命令、工作区外临时位置或只读检查，继续完成已批准任务。",
-    "只有当源码修复确实必须修改这个额外目标时，才输出聚焦的 Plan revision 供审核；否则现在继续执行和验证。",
+    "当前已进入有界范围恢复事务。请复用已有源码观察，在已批准目标内完成精确修改；只有确实缺失当前精确区间时才定向读取。",
+    "不要用 shell 或换工具绕过范围限制；如果源码修复确实必须修改被拦截目标，请改为写出聚焦的 Plan revision 供审核。",
   ].join("\n");
 }
 
@@ -290,7 +319,8 @@ export async function handleToolResultRecoveryPhase(input: {
     planQualityRecovery,
   );
   const pendingPlanRuntimeRecoveryPrompt = planQualityRecovery.pendingPlanRuntimeRecoveryPrompt;
-  const approvedPlanScopeBlockedTargets = getApprovedPlanScopeBlockedTargets(input.results);
+  const approvedPlanScopeConflict = getApprovedPlanScopeConflict(input.results);
+  const approvedPlanScopeBlockedTargets = approvedPlanScopeConflict.unexpectedTargets;
 
   // Keep the reviewed mutation boundary intact without turning every omitted
   // implementation detail into a user checkpoint. A blocked helper/test-file
@@ -310,15 +340,36 @@ export async function handleToolResultRecoveryPhase(input: {
       iterationContext: input.iterationContext,
       emitTurnEvent: input.emitTurnEvent,
     });
-    const plannedTargets = Array.from(new Set(
-      input.callbacks.getPlanTasks().flatMap((task) =>
-        (task.evidence || [])
-          .filter((evidence) => evidence.kind === "file" || evidence.kind === "deliverable")
-          .map((evidence) => String(evidence.value || "").trim())
-          .filter(Boolean),
-      ),
-    ));
+    const plannedTargets = approvedPlanScopeConflict.plannedTargets.length > 0
+      ? approvedPlanScopeConflict.plannedTargets
+      : Array.from(new Set(
+          input.callbacks.getPlanTasks().flatMap((task) =>
+            (task.evidence || [])
+              .filter((evidence) => evidence.kind === "file" || evidence.kind === "deliverable")
+              .map((evidence) => String(evidence.value || "").trim())
+              .filter(Boolean),
+          ),
+        ));
     const language = input.callbacks.getPreferredLanguage();
+    const planRevision = buildPlanApprovalIdentity(
+      input.callbacks.getPlanArtifacts?.() || [],
+    )?.revision ?? null;
+    const protocolNoProgressFingerprint = buildApprovedPlanScopeConflictFingerprint({
+      planRevision,
+      unexpectedTargets: approvedPlanScopeBlockedTargets,
+      plannedTargets,
+    });
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "mutation_first",
+      "approved_plan_scope_blocked",
+      {
+        expectedTarget: plannedTargets[0] || null,
+        repeatedTargets: approvedPlanScopeBlockedTargets,
+        planRevision,
+        plannedTargets,
+        protocolNoProgressFingerprint,
+      },
+    );
     const recoveryPrompt = buildApprovedPlanScopeRecoveryPrompt({
       language: MODEL_CONTROL_LANGUAGE,
       targets: approvedPlanScopeBlockedTargets,
@@ -329,6 +380,11 @@ export async function handleToolResultRecoveryPhase(input: {
       targets: approvedPlanScopeBlockedTargets,
       plannedTargets,
       resultCount: input.results.length,
+      planRevision,
+      protocolNoProgressFingerprint,
+      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+      recoveryMode: executeRecoveryState.mode,
+      expectedTarget: executeRecoveryState.expectedTarget,
     });
     input.emitPlanExecutionProgress("running", {
       currentTask: language === "zh" ? "在已批准范围内继续" : "continuing within approved Plan scope",
@@ -337,8 +393,8 @@ export async function handleToolResultRecoveryPhase(input: {
       recoveryReason: "approved_plan_scope_block_recovering",
       repeatedTargets: approvedPlanScopeBlockedTargets,
       nextStep: language === "zh"
-        ? "改用计划内验证方式并继续执行"
-        : "use an in-scope validation method and continue execution",
+        ? "修改已批准目标，或提交聚焦的 Plan revision"
+        : "mutate an approved target or submit a focused Plan revision",
     });
     input.callbacks.onStatusChange("running");
     input.callbacks.appendMessage({
@@ -367,7 +423,9 @@ export async function handleToolResultRecoveryPhase(input: {
       : baseAudit;
     const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
       ledger: input.callbacks.getPlanExecutionEvidenceLedger(),
-      validationExpected: validationBoundary !== "pause_external_validation",
+      // External/user review can remain pending after automation completes, but
+      // it cannot substitute for a fresh automatic check after a mutation.
+      validationExpected: true,
     });
     if (
       audit.totalCount > 0 &&
@@ -412,6 +470,71 @@ export async function handleToolResultRecoveryPhase(input: {
       };
       return finish("plan_completed");
     }
+  }
+
+  const devServerRuntime = resolveDevServerRuntimeState(
+    input.callbacks.getPlanExecutionEvidenceLedger(),
+  );
+  const devServerEvidenceGap = buildExecuteEvidenceClosureAudit({
+    ledger: input.callbacks.getPlanExecutionEvidenceLedger(),
+    validationExpected: true,
+  }).gap;
+  const shouldObservePty =
+    devServerRuntime.nextCapability === "observe_pty" &&
+    devServerEvidenceGap === "pty_observation_required";
+  const shouldBrowserValidate =
+    devServerRuntime.nextCapability === "browser" &&
+    devServerEvidenceGap === "browser_validation_required";
+  const canEnterDevServerEvidenceRecovery =
+    executeRecoveryState.mode === "normal" &&
+    isMutationRuntimeIntent(input.runtimeIntent) &&
+    (input.workflowMode !== "plan" || input.callbacks.getIsPlanApproved());
+  if (canEnterDevServerEvidenceRecovery && (shouldObservePty || shouldBrowserValidate)) {
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: input.results,
+      toolArgsByCallId: input.toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    const nextCapability = shouldObservePty ? "observe_pty" : "browser_validation";
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "validation_only",
+      shouldObservePty
+        ? "long_process_pty_observation_required"
+        : "ready_server_browser_validation_required",
+      {
+        nextCapability,
+        requestedUrl: devServerRuntime.url,
+        foregroundGeneration: devServerRuntime.foregroundGeneration,
+        outputSequence: devServerRuntime.outputSequence,
+      },
+    );
+    logAgentEvent("execute_recovery_activated_from_dev_server_evidence", {
+      iteration: input.iteration,
+      devServerStatus: devServerRuntime.status,
+      nextCapability,
+      evidenceGap: devServerEvidenceGap,
+      requestedUrl: devServerRuntime.url,
+      foregroundGeneration: devServerRuntime.foregroundGeneration,
+      outputSequence: devServerRuntime.outputSequence,
+      executeRecoveryMode: executeRecoveryState.mode,
+    });
+    const language = input.callbacks.getPreferredLanguage();
+    input.emitPlanExecutionProgress("running", {
+      currentTask: shouldObservePty
+        ? language === "zh" ? "观察开发服务器状态" : "observing dev-server status"
+        : language === "zh" ? "执行浏览器交互验收" : "running browser interaction validation",
+      currentTool: "",
+      latestEvidence: devServerRuntime.url || "",
+      recoveryReason: `execution_evidence_gap:${devServerEvidenceGap}`,
+      nextStep: shouldObservePty
+        ? language === "zh" ? "读取当前 PTY generation 的增量输出或状态" : "read incremental output or status for the current PTY generation"
+        : language === "zh" ? "访问 ready URL 并执行动作后断言" : "open the ready URL and run post-action assertions",
+    });
+    input.callbacks.onStatusChange("running");
+    return finish("continue");
   }
 
   const noProgressRecovery = handleNoProgressRecovery({

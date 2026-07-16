@@ -1,4 +1,10 @@
 import { previewApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import {
+  buildExecutePatchMismatchFingerprint,
+  normalizeRecoveryReadRange,
+  type PatchRecoveryMismatchEvidence,
+  type RecoveryReadLease,
+} from "./executeRecoveryTools";
 
 export type WorkspaceMutationPreflightReason =
   | "not_applicable"
@@ -15,6 +21,7 @@ export interface WorkspaceMutationPreflightResult {
   message?: string;
   /** Best available workspace target for recovery and progress correlation. */
   path?: string;
+  patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
 }
 
 export interface WorkspaceMutationPreflightInput {
@@ -22,10 +29,63 @@ export interface WorkspaceMutationPreflightInput {
   args: Record<string, unknown>;
   language?: "zh" | "en";
   readFile: (path: string) => Promise<string>;
+  readFileMetadata?: (
+    path: string,
+  ) => Promise<{ sizeBytes: number; modifiedMs: number } | null>;
 }
 
 function asText(value: unknown): string {
   return typeof value === "string" ? value : String(value ?? "");
+}
+
+function extractApplyPatchRequestedRange(
+  patch: string,
+  target: string,
+): RecoveryReadLease["requestedRange"] {
+  const normalizedTarget = String(target || "").trim().replace(/\\/g, "/").replace(/^\.\//, "");
+  const lines = String(patch || "").replace(/\r\n/g, "\n").split("\n");
+  let inTargetSection = !normalizedTarget;
+  for (const line of lines) {
+    const fileHeader = line.match(/^\*\*\*\s+(?:Update|Delete)\s+File:\s*(.+)$/);
+    if (fileHeader) {
+      const headerTarget = fileHeader[1].trim().replace(/\\/g, "/").replace(/^\.\//, "");
+      inTargetSection = !normalizedTarget || headerTarget === normalizedTarget;
+      continue;
+    }
+    if (!inTargetSection) continue;
+    const hunk = line.match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@/);
+    if (!hunk) continue;
+    const startLine = Math.max(1, Number(hunk[1]) || 1);
+    const maxLines = Math.max(1, Number(hunk[2]) || 1);
+    return {
+      startLine,
+      endLine: startLine + maxLines - 1,
+      maxLines,
+    };
+  }
+  return null;
+}
+
+async function buildPatchRecoveryMismatchEvidence(input: {
+  reason: "invalid_patch" | "search_text_mismatch";
+  target: string;
+  requestedRange?: RecoveryReadLease["requestedRange"];
+  readFileMetadata?: WorkspaceMutationPreflightInput["readFileMetadata"];
+}): Promise<PatchRecoveryMismatchEvidence> {
+  const metadata = input.readFileMetadata
+    ? await input.readFileMetadata(input.target).catch(() => null)
+    : null;
+  return {
+    mismatchFingerprint: buildExecutePatchMismatchFingerprint({
+      reason: input.reason,
+      target: input.target,
+    }),
+    target: input.target,
+    ...(input.requestedRange ? { requestedRange: input.requestedRange } : {}),
+    observedVersion: metadata
+      ? `${Number(metadata.sizeBytes) || 0}:${Number(metadata.modifiedMs) || 0}`
+      : null,
+  };
 }
 
 function buildMessage(input: {
@@ -74,12 +134,16 @@ function blocked(input: {
   path: string;
   language: "zh" | "en";
   detail?: string;
+  patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
 }): WorkspaceMutationPreflightResult {
   return {
     ok: false,
     reason: input.reason,
     message: buildMessage(input),
     path: input.path,
+    ...(input.patchRecoveryMismatch
+      ? { patchRecoveryMismatch: input.patchRecoveryMismatch }
+      : {}),
   };
 }
 
@@ -104,12 +168,20 @@ export async function preflightWorkspaceMutation(
       "patch";
     const preview = await previewApplyPatch(patch, input.readFile);
     if (!preview.ok) {
+      const recoveryTarget = preview.changes[0]?.path || patchTarget;
+      const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({
+        reason: "invalid_patch",
+        target: recoveryTarget,
+        requestedRange: extractApplyPatchRequestedRange(patch, recoveryTarget),
+        readFileMetadata: input.readFileMetadata,
+      });
       return blocked({
         reason: "invalid_patch",
         toolName,
-        path: preview.changes[0]?.path || patchTarget,
+        path: recoveryTarget,
         language,
         detail: preview.error,
+        patchRecoveryMismatch,
       });
     }
     return { ok: true };
@@ -150,7 +222,19 @@ export async function preflightWorkspaceMutation(
   }
 
   if (!current.includes(searchText)) {
-    return blocked({ reason: "search_text_mismatch", toolName, path, language });
+    const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({
+      reason: "search_text_mismatch",
+      target: path,
+      requestedRange: normalizeRecoveryReadRange(input.args),
+      readFileMetadata: input.readFileMetadata,
+    });
+    return blocked({
+      reason: "search_text_mismatch",
+      toolName,
+      path,
+      language,
+      patchRecoveryMismatch,
+    });
   }
   const updated = current.replace(searchText, replaceText);
   if (updated === current) {

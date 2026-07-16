@@ -112,14 +112,19 @@ export function resolveRecoveryToolChoice(input: {
       } else if (recoveryActionContract.nextRequiredCapability === "mutation") {
         selectedTool = firstAvailable(["apply_patch", "replace_in_file", "write_file"]);
       } else if (recoveryActionContract.nextRequiredCapability === "observe_pty") {
-        selectedTool = firstAvailable([
-          "read_pty_since",
-          "get_pty_status",
-        ]);
+        // A running foreground process may be waiting for interactive input.
+        // Keep the call required, but do not bind compatibility models to a
+        // read-only observer and thereby hide send_pty_input forever.
+        selectedTool = null;
       } else if (recoveryActionContract.nextRequiredCapability === "browser_validation") {
         selectedTool = firstAvailable(["browser_evaluate"]);
       } else if (recoveryActionContract.nextRequiredCapability === "launch_long_process") {
         selectedTool = firstAvailable(["execute_command"]);
+      } else if (recoveryActionContract.nextRequiredCapability === "recover_process") {
+        // Failed/stopped processes need a choice between reading retained PTY
+        // diagnostics, repairing the current target, running a bounded check,
+        // or restarting. A forced execute_command would skip that evidence.
+        selectedTool = null;
       } else if (recoveryActionContract.nextRequiredCapability === "reconcile_server") {
         selectedTool = firstAvailable(["run_command"]);
       } else if (input.executeRecoveryMode === "finite_validation_only") {

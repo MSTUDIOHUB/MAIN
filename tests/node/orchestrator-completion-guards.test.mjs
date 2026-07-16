@@ -683,15 +683,16 @@ test("approved plan completion guard pauses completed plan execution without aud
   assert.equal(events.statuses.at(-1), "idle");
 });
 
-test("approved plan completion treats user review as a conclusion advisory", () => {
-  const ledger = [{
+test("approved plan completion keeps user review advisory without disabling automatic validation", () => {
+  const mutation = {
     id: "mutation",
     kind: "file",
     value: "src/App.tsx",
     target: "src/App.tsx",
     sourceTool: "apply_patch",
     createdAt: 1,
-  }];
+  };
+  const ledger = [mutation];
   const { callbacks, events } = createCallbacks({
     getWorkflowMode: () => "plan",
     getIsPlanApproved: () => true,
@@ -713,8 +714,39 @@ test("approved plan completion treats user review as a conclusion advisory", () 
     sawExecutionEvidence: true,
   });
 
-  assert.equal(result, null);
-  assert.equal(events.stops.length, 0);
+  assert.deepEqual(result, {
+    status: "stopped_no_action",
+    reason: "approved_plan_completion_guard",
+  });
+  assert.equal(events.stops.length, 1);
+  assert.equal(
+    events.stops[0].progress.recoveryReason,
+    "approved_plan_completion_guard_no_evidence",
+  );
+
+  const automaticValidation = {
+    id: "automatic-validation",
+    kind: "cmd",
+    value: "npm test",
+    target: "npm test",
+    sourceTool: "run_command",
+    createdAt: 2,
+  };
+  const validated = createCallbacks({
+    getWorkflowMode: () => "plan",
+    getIsPlanApproved: () => true,
+    getPlanStage: () => "completed",
+    getPlanTasks: callbacks.getPlanTasks,
+    getPlanExecutionEvidenceLedger: () => [mutation, automaticValidation],
+  });
+  const validatedResult = runApprovedPlanCompletionGuard({
+    outcome: { status: "completed", reason: "agent_loop_completed" },
+    callbacks: validated.callbacks,
+    sawExecutionEvidence: true,
+  });
+
+  assert.equal(validatedResult, null);
+  assert.equal(validated.events.stops.length, 0);
 });
 
 test("approved plan completion is deferred until the current loop consumes the execution transition", () => {

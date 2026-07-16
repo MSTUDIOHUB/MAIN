@@ -26,6 +26,10 @@ export interface ProgressNarration {
   evidence: string;
   next: string;
   targets: string[];
+  /** Structured runtime identity; presentation consumers should not infer it from title/action. */
+  tool?: string;
+  target?: string;
+  canonicalTarget?: string;
   status: ProgressNarrationStatus;
   source: ProgressNarrationSource;
   evidenceExcerpt?: string;
@@ -379,6 +383,9 @@ export function buildToolProgressNarration(input: ToolProgressNarrationInput): P
     evidence: buildEvidence({ phase: toolPhase, progressPhase, status, language, role, result: input.result, noOp: input.noOp }),
     next: buildNext({ phase: toolPhase, progressPhase, status, language }),
     targets: [compactToolPresentationTarget(target, input.toolName, language)].filter(Boolean),
+    tool: String(input.toolName || "").trim(),
+    target,
+    canonicalTarget: target,
     status,
     source: input.source || "runtime",
     evidenceExcerpt: input.evidenceExcerpt || (input.result ? compactEvidenceExcerpt(input.result) : ""),
@@ -582,6 +589,8 @@ export function normalizeProgressNarration(progress: ProgressNarration): Progres
     : "investigating";
   const status: ProgressNarrationStatus = progress.status === "done" || progress.status === "failed" ? progress.status : "running";
   const source: ProgressNarrationSource = progress.source === "model" || progress.source === "tool_result" ? progress.source : "runtime";
+  const tool = String(progress.tool || "").trim();
+  const canonicalTarget = String(progress.canonicalTarget || progress.target || "").trim();
   return {
     phase,
     title: compactLine(progress.title, 120),
@@ -590,6 +599,8 @@ export function normalizeProgressNarration(progress: ProgressNarration): Progres
     evidence: compactLine(progress.evidence, 220),
     next: compactLine(progress.next, 220),
     targets: Array.from(new Set((progress.targets || []).map((target) => compactLine(target, 80)).filter(Boolean))).slice(0, 6),
+    ...(tool ? { tool } : {}),
+    ...(canonicalTarget ? { target: canonicalTarget, canonicalTarget } : {}),
     status,
     source,
     evidenceExcerpt: compactMarkdownSnippet(progress.evidenceExcerpt || "", 220),

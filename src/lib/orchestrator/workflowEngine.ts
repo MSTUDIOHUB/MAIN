@@ -79,6 +79,7 @@ import { buildToolProgressNarration, summarizeToolObservation } from "../progres
 import { deriveTurnRuntimePhaseForTool, withTurnRuntimePhaseStatus } from "../turnPhase";
 import { scheduleControlledSubagent } from "../subagentRuntime";
 import {
+  buildSubagentPolicyDeferral,
   cancelSubagentRun,
   finalizeCoordinatedSubagentsForParent,
   getCoordinatedSubagentRunCount,
@@ -102,6 +103,7 @@ import { buildPlanApprovalIdentity } from "../planApprovalIdentity";
 import { resolveRuntimeRunIdentity, type RuntimeRunIdentity } from "../runIdentity";
 import { buildDurableTurnContext, shouldCanonicalizeTerminalTurnContext } from "../durableTurnContext";
 import { reduceRunTransition } from "../runTransitionReducer";
+import { createTerminalStatusPublicationGate } from "../terminalStatusPublication";
 import { findLatestRunOwnedAgentBlock } from "./runOwnedAgentBlocks";
 import {
   resolveExecuteRecoveryActionContract,
@@ -185,6 +187,8 @@ export interface WorkflowContext {
   currentThoughtBlockId: number | null;
   thoughtStartTime: number | null;
   streamingAssistantDisplayBuffer: string;
+  executionEvidenceDraftHeld: boolean;
+  executionEvidenceDraftBuffer: string;
   understandingProgressBlockId: number | null;
   understandingProgressClosed: boolean;
 
@@ -271,6 +275,11 @@ export class WorkflowEngine {
       kind: "plan" | "execute";
       start: () => void;
       cancel: (reason: string, options?: { visible?: boolean }) => void;
+    } | null = null;
+    let pendingEvidenceDraftFinalPresentation: {
+      text: any;
+      replyOptions: any[];
+      meta: any;
     } | null = null;
     const logStoreEvent = (event: string, data: Record<string, unknown> = {}) => {
       const state = sessionGet();
@@ -834,6 +843,8 @@ export class WorkflowEngine {
       });
     };
 
+    const terminalStatusPublicationGate = createTerminalStatusPublicationGate();
+
     const callbacks: OrchestratorCallbacks = {
       getMessages: () => sessionGet().agentMessages,
       getConfig: () => ({ ...sessionGet().config, workspace: runWorkspace || "" }),
@@ -894,7 +905,10 @@ export class WorkflowEngine {
           mode: state.mode,
           reason: state.reason,
           expectedTarget: state.expectedTarget,
+          attempts: state.attempts,
           phaseNoProgressCount: state.phaseNoProgressCount,
+          protocolNoProgressCount: state.protocolNoProgressCount,
+          protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
           readLease: state.readLease ? { ...state.readLease } : null,
           sourceObservationKey: state.sourceObservationKey,
           decisionCheckpoint: state.decisionCheckpoint
@@ -1268,6 +1282,51 @@ export class WorkflowEngine {
       },
 
       onStreamToken: (token: string, _msgId: string | undefined | null) => {
+        if (token.startsWith("__EVIDENCE_DRAFT_HOLD__:")) {
+          streamBuffer.reset();
+          thinkingInterceptor.reset();
+          context.executionEvidenceDraftHeld = true;
+          context.executionEvidenceDraftBuffer = "";
+          pendingEvidenceDraftFinalPresentation = null;
+          context.streamingAssistantDisplayBuffer = "";
+          logStoreEvent("execution_evidence_draft_held", {
+            turnId,
+            reason: token.slice("__EVIDENCE_DRAFT_HOLD__:".length) || "execution_evidence",
+          });
+          return;
+        }
+        if (token.startsWith("__EVIDENCE_DRAFT_COMMIT__:")) {
+          if (!context.executionEvidenceDraftHeld) return;
+          const commitReason = token.slice("__EVIDENCE_DRAFT_COMMIT__:".length) || "evidence_closed";
+          const draft = context.executionEvidenceDraftBuffer;
+          const finalPresentation = pendingEvidenceDraftFinalPresentation;
+          context.executionEvidenceDraftHeld = false;
+          context.executionEvidenceDraftBuffer = "";
+          pendingEvidenceDraftFinalPresentation = null;
+          if (finalPresentation) {
+            // No-tool final text is published exactly once, only after the
+            // runtime evidence audit commits it. Publishing the raw stream as
+            // well would create a duplicate streaming block after onStreamDone.
+            callbacks.onAssistantFinalText(
+              finalPresentation.text,
+              finalPresentation.replyOptions,
+              finalPresentation.meta,
+            );
+          } else if (draft && commitReason === "tool_call") {
+            // Tool-call prose is committed before assistantOutputPhase produces
+            // its normalized final presentation. Keep the existing streaming
+            // path for that non-terminal progress case only.
+            streamBuffer.append(draft);
+            streamBuffer.flush();
+          }
+          logStoreEvent("execution_evidence_draft_committed", {
+            turnId,
+            reason: commitReason,
+            draftChars: draft.length,
+            finalPresentationCommitted: Boolean(finalPresentation),
+          });
+          return;
+        }
         // Handle escalation reset signal
         if (token.startsWith("__ESCALATION_RESET__:")) {
           const resetType = token.slice("__ESCALATION_RESET__:".length) || "unknown";
@@ -1285,6 +1344,9 @@ export class WorkflowEngine {
           if (resetType === "quality_gate") {
             // Only reset the streaming buffer, not the displayed content
             context.streamingAssistantDisplayBuffer = "";
+            context.executionEvidenceDraftHeld = false;
+            context.executionEvidenceDraftBuffer = "";
+            pendingEvidenceDraftFinalPresentation = null;
             context.firstStreamTokenAt = null;
             context.streamTokenCount = 0;
             context.streamTextChars = 0;
@@ -1298,6 +1360,9 @@ export class WorkflowEngine {
           
           // Standard reset behavior for other reset types (evidence_recovery, unknown, etc.)
           streamBuffer.reset();
+          context.executionEvidenceDraftHeld = false;
+          context.executionEvidenceDraftBuffer = "";
+          pendingEvidenceDraftFinalPresentation = null;
           if (thinkingInterceptor) {
             thinkingInterceptor.reset();
           }
@@ -1389,6 +1454,10 @@ export class WorkflowEngine {
         context.iterationStreamTextChars += token.length;
         context.runStreamTokenCount++;
         context.runStreamTextChars += token.length;
+        if (context.executionEvidenceDraftHeld) {
+          context.executionEvidenceDraftBuffer += token;
+          return;
+        }
         streamBuffer.append(token);
       },
 
@@ -1672,6 +1741,28 @@ export class WorkflowEngine {
       onAssistantFinalText: (text: any, replyOptions: any[] = [], meta: any) => {
         const hasToolCalls = meta?.hasToolCalls === true;
         const awaitingInput = meta?.awaitingInput === true && replyOptions.length > 0;
+        if (context.executionEvidenceDraftHeld && !awaitingInput) {
+          pendingEvidenceDraftFinalPresentation = {
+            text,
+            replyOptions: [...replyOptions],
+            meta: meta ? { ...meta } : meta,
+          };
+          logStoreEvent("execution_evidence_final_presentation_held", {
+            turnId,
+            visibleChars: String(text || "").length,
+            replyOptions: replyOptions.length,
+            hasToolCalls,
+          });
+          return;
+        }
+        if (context.executionEvidenceDraftHeld && awaitingInput) {
+          // A real user-choice pause is not a completion claim. Publish the
+          // choice UI, but discard the raw held stream so it cannot be replayed
+          // later as a second assistant block.
+          context.executionEvidenceDraftHeld = false;
+          context.executionEvidenceDraftBuffer = "";
+          pendingEvidenceDraftFinalPresentation = null;
+        }
         // A pre-approval Plan response is only a quality candidate. The Plan
         // runtime decides after this callback whether it becomes a materialized
         // artifact, needs another bounded rewrite, or pauses. Do not publish a
@@ -1928,9 +2019,6 @@ export class WorkflowEngine {
             return {
               taskFlow,
               conversationTurns,
-              agentStatus: "idle",
-              isGenerating: false,
-              abortController: null,
             };
           }
 
@@ -1955,9 +2043,6 @@ export class WorkflowEngine {
           return {
             taskFlow,
             conversationTurns,
-            agentStatus: s.agentStatus === "pending_review" ? "pending_review" : "idle",
-            isGenerating: false,
-            ...(s.agentStatus === "pending_review" ? {} : { abortController: null }),
           };
         });
       },
@@ -2852,6 +2937,8 @@ export class WorkflowEngine {
               sourceObservationKey: latestExecuteRecoveryState.sourceObservationKey,
               decisionCheckpoint: latestExecuteRecoveryState.decisionCheckpoint,
               phaseNoProgressCount: latestExecuteRecoveryState.phaseNoProgressCount,
+              protocolNoProgressCount: latestExecuteRecoveryState.protocolNoProgressCount,
+              protocolNoProgressFingerprint: latestExecuteRecoveryState.protocolNoProgressFingerprint,
             })
           : null;
         const nextRecoveryContract = resolveExecuteRecoveryActionContract(
@@ -2862,6 +2949,8 @@ export class WorkflowEngine {
             sourceObservationKey: latestExecuteRecoveryState?.sourceObservationKey || null,
             decisionCheckpoint: latestExecuteRecoveryState?.decisionCheckpoint || null,
             phaseNoProgressCount: latestExecuteRecoveryState?.phaseNoProgressCount || 0,
+            protocolNoProgressCount: latestExecuteRecoveryState?.protocolNoProgressCount || 0,
+            protocolNoProgressFingerprint: latestExecuteRecoveryState?.protocolNoProgressFingerprint || null,
           },
         );
         const recoveryPhaseChanged =
@@ -2870,9 +2959,16 @@ export class WorkflowEngine {
           mode: executeRecoveryDecision.mode,
           reason: executeRecoveryDecision.reason,
           expectedTarget,
+          attempts: Math.max(0, latestExecuteRecoveryState?.attempts || 0),
           phaseNoProgressCount: recoveryPhaseChanged
             ? 0
             : Math.max(0, latestExecuteRecoveryState?.phaseNoProgressCount || 0),
+          protocolNoProgressCount: recoveryPhaseChanged
+            ? 0
+            : Math.max(0, latestExecuteRecoveryState?.protocolNoProgressCount || 0),
+          protocolNoProgressFingerprint: recoveryPhaseChanged
+            ? null
+            : latestExecuteRecoveryState?.protocolNoProgressFingerprint || null,
           readLease:
             nextRecoveryContract.phase === "context" ||
             nextRecoveryContract.phase === "mutation" ||
@@ -3098,6 +3194,16 @@ export class WorkflowEngine {
       },
 
       onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => {
+        const publicationDecision = terminalStatusPublicationGate.requestStatus(status);
+        if (!publicationDecision.publishNow) {
+          logStoreEvent("terminal_idle_notification_deferred", {
+            sessionKey: runSessionKey,
+            turnId,
+            runId: activeRuntimeRunIdentity.runId,
+            deferredIdleCount: publicationDecision.deferredIdleCount,
+          });
+          return;
+        }
         const latest = sessionGet();
         const planApprovalIdentity = status === "pending_review"
           ? buildPlanApprovalIdentity(latest.planArtifacts)
@@ -3440,7 +3546,7 @@ export class WorkflowEngine {
       },
 
       onTurnSummaryReady: (summary: string) => {
-        if (isUnapprovedPlanRuntime()) return;
+        if (isUnapprovedPlanRuntime() || context.executionEvidenceDraftHeld) return;
         sessionSet((s: any) => ({
           conversationTurns: s.conversationTurns.map((turn: any) =>
             turn.id === turnId ? { ...turn, summary } : turn
@@ -3473,15 +3579,19 @@ export class WorkflowEngine {
       )).length;
       const independentReviewer = /reviewer|independent[_ -]?review/i.test(request.role || "");
       if (!independentReviewer && allowedPaths.length > 0 && duplicateCount / allowedPaths.length > 0.5) {
+        const deferred = buildSubagentPolicyDeferral({
+          name: request.name,
+          scopeKey: request.scopeKey || request.scope || request.objective,
+          reason: "parent_scope_already_observed",
+        });
         callbacks.onDebugEvent?.("delegation_scope_decision", {
-          decision: "rejected",
-          reason: "duplicate_parent_scope",
+          decision: "deferred",
+          reason: deferred.reason,
           allowedPaths,
           duplicateCount,
+          failureKind: "policy",
         });
-        return Promise.reject(new Error(
-          `SUBAGENT_DUPLICATE_SCOPE: ${duplicateCount}/${allowedPaths.length} allowed paths were already explored by the parent. Delegate an independent scope or use role=reviewer for an explicit independent review.`,
-        ));
+        return Promise.resolve(deferred);
       }
       return Promise.resolve(scheduleControlledSubagent({
         request,
@@ -3503,6 +3613,7 @@ export class WorkflowEngine {
     );
     callbacks.waitSubagents = async (request) => {
       const parentTurnId = context.uiDisplayTurnId || turnId;
+      const waitStartedAt = Date.now();
       callbacks.onDebugEvent?.("parent_wait", {
         subagentIds: request.subagentIds || [],
         parentTurnId,
@@ -3516,6 +3627,7 @@ export class WorkflowEngine {
         subagentIds: result.results.map((entry) => entry.subagentId),
         statuses: result.results.map((entry) => entry.status),
         parentTurnId,
+        parentBlockedMs: Math.max(0, Date.now() - waitStartedAt),
       });
       callbacks.onDebugEvent?.("coordinated_run_released", {
         parentTurnId,
@@ -3546,6 +3658,60 @@ export class WorkflowEngine {
           closeCurrentHarnessRunMarker("error", outcome.reason || "agent_loop_error");
           break;
       }
+    };
+
+    const commitTerminalProjectionBeforeStatusPublication = (outcome: AgentLoopOutcome) => {
+      const current = sessionGet();
+      const pendingAction = current.activeActionRequest as ActionRequest | null;
+      const isIntentionalActionPause =
+        outcome.status === "paused" &&
+        pendingAction?.status === "pending";
+      if (isIntentionalActionPause) {
+        // The action-request reducer already projected awaiting_input or
+        // awaiting_approval. Persist it before outer cleanup can publish any
+        // different UI status.
+        persistCurrentSessionRuntime(current);
+        terminalStatusPublicationGate.discardDeferredIdle();
+        return;
+      }
+
+      const terminalTurnStatus = outcome.status === "completed"
+        ? "completed"
+        : outcome.status === "error"
+        ? "error"
+        : outcome.status === "stopped_no_output"
+        ? "stopped_no_output"
+        : outcome.status === "stopped_no_action"
+        ? "stopped_no_action"
+        : "paused";
+      const terminalTurnIds = new Set([turnId, context.uiDisplayTurnId].filter(Boolean));
+      terminalStatusPublicationGate.commitTerminal({
+        persistTerminalProjection: () => {
+          sessionSet((state: any) => ({
+            conversationTurns: state.conversationTurns.map((candidate: any) =>
+              terminalTurnIds.has(candidate.id)
+                ? { ...candidate, status: terminalTurnStatus, collapsed: false }
+                : candidate
+            ),
+          }));
+          persistCurrentSessionRuntime(sessionGet());
+        },
+        publishTerminalStatus: () => {
+          sessionSet({
+            agentStatus: outcome.status === "error" ? "error" : "idle",
+            isGenerating: false,
+            abortController: null,
+          });
+        },
+      });
+      const committed = sessionGet();
+      logStoreEvent("terminal_run_projection_committed", {
+        outcomeStatus: outcome.status,
+        turnStatus: terminalTurnStatus,
+        turnIds: Array.from(terminalTurnIds),
+        planStage: committed.planStage,
+        isPlanApproved: committed.isPlanApproved,
+      });
     };
 
     const commitTerminalTurnContext = (loopOutcome: AgentLoopOutcome) => {
@@ -3748,8 +3914,11 @@ export class WorkflowEngine {
                 executeRecoveryMode: continuationRecoveryState.mode,
                 executeRecoveryReason: continuationRecoveryState.reason,
                 expectedTarget: continuationRecoveryState.expectedTarget,
+                executeRecoveryAttempts: continuationRecoveryState.attempts || 0,
                 executeRecoveryPhase: continuationRecoveryState.phase,
                 phaseNoProgressCount: continuationRecoveryState.phaseNoProgressCount,
+                protocolNoProgressCount: continuationRecoveryState.protocolNoProgressCount,
+                protocolNoProgressFingerprint: continuationRecoveryState.protocolNoProgressFingerprint,
                 readLeasePurpose: continuationRecoveryState.readLease?.purpose || null,
                 readLeaseState: continuationRecoveryState.readLease?.state || null,
                 sourceObservationKey: continuationRecoveryState.sourceObservationKey,
@@ -3759,12 +3928,20 @@ export class WorkflowEngine {
             }
             let latestExecuteRecoveryState: Parameters<
               NonNullable<OrchestratorCallbacks["onExecuteRecoveryStateChange"]>
-            >[0] = continuationRecoveryState || {
+            >[0] = continuationRecoveryState
+              ? {
+                  ...continuationRecoveryState,
+                  attempts: Math.max(1, continuationRecoveryState.attempts || 1),
+                }
+              : {
                 mode: "normal" as const,
                 reason: "",
                 expectedTarget: null,
+                attempts: 0,
                 phase: "normal" as const,
                 phaseNoProgressCount: 0,
+                protocolNoProgressCount: 0,
+                protocolNoProgressFingerprint: null,
                 readLease: null,
                 sourceObservationKey: null,
                 decisionCheckpoint: null,
@@ -4134,6 +4311,10 @@ export class WorkflowEngine {
         title: "Closed with parent run",
         reason: "canceled",
       });
+      // Persist the terminal turn projection before the run marker closes and
+      // before any idle UI notification can be observed. Otherwise a stopped
+      // or completed turn can remain serialized as `executing`.
+      commitTerminalProjectionBeforeStatusPublication(loopOutcome);
       closeHarnessForAgentLoopOutcome(loopOutcome);
       clearInterval(timerInterval);
       commitFinalElapsedTime();

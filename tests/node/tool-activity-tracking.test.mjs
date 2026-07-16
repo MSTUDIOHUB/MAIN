@@ -85,6 +85,18 @@ function result(overrides) {
   };
 }
 
+function toolObservationProvenance(sourceToolCallId, overrides = {}) {
+  return {
+    source: "tool_observation",
+    owner: {
+      agentKind: "subagent",
+      subagentId: "subagent-a",
+    },
+    sourceToolCallId,
+    ...overrides,
+  };
+}
+
 function createPostProcessingInput(overrides = {}) {
   const digests = [];
   const taskPhases = [];
@@ -407,10 +419,17 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
             target: "src/lib/subagents.ts",
             detail: "The resolveSubagentCapacityPolicy function incorrectly limits local child workflows before model-lane admission.",
             facts: ["event_dom_listener_contract(DOMContentLoaded)", "listener_calls(initToolbar)"],
+            provenance: toolObservationProvenance("subagent-a-read-1", {
+              factReferences: [
+                { fact: "event_dom_listener_contract(DOMContentLoaded)", sourceToolCallId: "subagent-a-read-1" },
+                { fact: "listener_calls(initToolbar)", sourceToolCallId: "subagent-a-read-1" },
+              ],
+            }),
           }, {
             tool: "read_file",
             target: "src/lib/subagents.ts",
             detail: `${"implementation context ".repeat(16)} | L90: server port: 1420`,
+            provenance: toolObservationProvenance("subagent-a-read-2"),
           }],
         }, {
           subagentId: "subagent-b",
@@ -419,6 +438,12 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
             tool: "read_file",
             target: "src/lib/modelLaneCoordinator.ts",
             detail: "The acquireModelLane function enforces the shared parent and child model-stream limit.",
+            provenance: toolObservationProvenance("subagent-b-read-1", {
+              owner: {
+                agentKind: "subagent",
+                subagentId: "subagent-b",
+              },
+            }),
           }],
         }],
         pendingIds: [],
@@ -436,6 +461,9 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
   assert.match(promoted[0].detail || "", /port:\s*1420/);
   assert.ok(promoted[0].facts?.includes("event_dom_listener_contract(DOMContentLoaded)"));
   assert.ok(promoted[0].facts?.includes("listener_calls(initToolbar)"));
+  assert.equal(promoted[0].readFileObservation, undefined);
+  assert.equal(promoted[0].delegatedObservation.owner.subagentId, "subagent-a");
+  assert.equal(promoted[0].delegatedObservation.parentContextState, "reference_only");
 
   const debugEvents = [];
   const harness = createPostProcessingInput({
@@ -482,6 +510,58 @@ test("wait_subagents promotes child file evidence instead of recording orchestra
   ]);
   assert.equal(executionHarness.executeEvidenceMarks.length, 0);
   assert.match(executionHarness.digests[0], /read_file src\/lib\/modelLaneCoordinator\.ts/);
+});
+
+test("child summary prose and unprovenanced evidence are not promoted as trusted evidence", () => {
+  const waitResult = result({
+    toolCallId: "wait_untrusted",
+    name: "wait_subagents",
+    target: "subagent-untrusted",
+    content: JSON.stringify({
+      results: [{
+        subagentId: "subagent-untrusted",
+        status: "completed",
+        summary: "The callback definitely exists and is wired correctly.",
+        summaryTrust: "unverified_hypothesis",
+        evidence: [{
+          tool: "read_file",
+          target: "src/main.js",
+          detail: "The callback definitely exists and is wired correctly.",
+        }],
+      }],
+      pendingIds: [],
+    }),
+  });
+
+  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+});
+
+test("delegated evidence owner must match the enclosing child result", () => {
+  const waitResult = result({
+    toolCallId: "wait_owner_mismatch",
+    name: "wait_subagents",
+    target: "subagent-a",
+    content: JSON.stringify({
+      results: [{
+        subagentId: "subagent-a",
+        status: "completed",
+        evidence: [{
+          tool: "read_file",
+          target: "src/main.js",
+          detail: "source detail",
+          provenance: toolObservationProvenance("child-read", {
+            owner: {
+              agentKind: "subagent",
+              subagentId: "subagent-b",
+            },
+          }),
+        }],
+      }],
+      pendingIds: [],
+    }),
+  });
+
+  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
 });
 
 test("tool result post-processing records source-write evidence without clearing recovery before validation", () => {

@@ -164,7 +164,6 @@ const {
   isApprovedPlanSourceEditFirstToolName,
   resolveApprovedPlanPatchRecoveryTarget,
   shouldAllowApprovedPlanRecoveryFileRead,
-  shouldBypassApprovedPlanReadCacheForPatchRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/approvedPlanRecoveryTools.ts"));
 
 const {
@@ -1128,6 +1127,17 @@ test("approved plan finalization completes automated work and leaves user valida
     callbacks: {
       ...harness.callbacks,
       getPlanTasks: () => [tasks[0], pendingValidationTask],
+      getPlanExecutionEvidenceLedger: () => [
+        ...evidenceLedger,
+        {
+          id: "automatic-validation",
+          kind: "cmd",
+          value: "npm test",
+          target: "npm test",
+          sourceTool: "run_command",
+          createdAt: 3,
+        },
+      ],
     },
     activeProfile: "cloud",
     iteration: 7,
@@ -1248,11 +1258,11 @@ test("approved plan finalization does not publish completed before post-mutation
     emitPlanExecutionProgress: (phase, overrides) => harness.progress.push({ phase, overrides }),
   });
 
-  assert.equal(result.status, "continue");
+  assert.equal(result.status, "none");
   assert.deepEqual(harness.taskPhases, []);
   assert.deepEqual(harness.stages, []);
   assert.equal(harness.progress.some((entry) => entry.phase === "completed"), false);
-  assert.match(harness.appended.at(-1)?.content || "", /validation_after_mutation_required/);
+  assert.deepEqual(harness.appended, []);
 });
 
 test("approved plan finalization does not publish completed while recovery is active", () => {
@@ -1833,6 +1843,50 @@ test("approved plan no-tool helper appends recovery prompt and opens action reco
   assert.match(harness.appended[0].content, /TOOL_ONLY_RECOVERY/);
   assert.equal(harness.stops.length, 0);
   assert.equal(resolveApprovedPlanNoToolCheckpointLimit("local"), 5);
+});
+
+test("approved plan external review is advisory after automatic evidence closes", () => {
+  const harness = createApprovedPlanNoToolHarness("zh");
+  const pendingReviewTask = {
+    ...tasks[1],
+    status: "in_progress",
+    evidenceStatus: "requires_user_confirmation",
+    evidence: [{ kind: "manual_user_validation", value: "user reviews the Tauri window" }],
+  };
+  harness.callbacks.getPlanTasks = () => [tasks[0], pendingReviewTask];
+  harness.callbacks.getPlanExecutionEvidenceLedger = () => [
+    ...evidenceLedger,
+    {
+      id: "automatic-validation",
+      kind: "cmd",
+      value: "npm test",
+      target: "npm test",
+      sourceTool: "run_command",
+      createdAt: 3,
+    },
+  ];
+  const { input } = createApprovedPlanNoToolInput({
+    harness,
+    input: {
+      approvedPlanAuditForNoTool: createApprovedPlanNoToolAudit({
+        tasks: [tasks[0], pendingReviewTask],
+        remainingTasks: [],
+        pendingUserValidationTasks: [pendingReviewTask],
+        automationComplete: true,
+        pendingExternalValidation: true,
+        pendingUserValidationReasons: ["review the Tauri window"],
+      }),
+      availableToolNames: new Set(["read_file", "run_command"]),
+    },
+  });
+
+  const result = handleApprovedPlanNoToolRecovery(input);
+
+  assert.equal(result.status, "none");
+  assert.equal(harness.stops.length, 0);
+  assert.equal(harness.progress.length, 0);
+  assert.equal(harness.appended.length, 0);
+  assert.deepEqual(harness.statuses, ["running"]);
 });
 
 test("approved plan no-tool helper switches strategy at the local checkpoint boundary", () => {
@@ -2471,33 +2525,6 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
     { name: "replace_in_file", target: "src/App.tsx", status: "failed", detail: "search_text mismatch" },
   ];
   assert.equal(resolveApprovedPlanPatchRecoveryTarget(unresolvedMismatch), "src/App.tsx");
-  assert.equal(
-    shouldBypassApprovedPlanReadCacheForPatchRecovery({
-      toolName: "read_file",
-      allowFileRead: true,
-      target: "./src/App.tsx",
-      recentActivity: unresolvedMismatch,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldBypassApprovedPlanReadCacheForPatchRecovery({
-      toolName: "read_file",
-      allowFileRead: true,
-      target: "/tmp/workspace/src/App.tsx",
-      recentActivity: unresolvedMismatch,
-    }),
-    true,
-  );
-  assert.equal(
-    shouldBypassApprovedPlanReadCacheForPatchRecovery({
-      toolName: "read_file",
-      allowFileRead: true,
-      target: "src/main.js",
-      recentActivity: unresolvedMismatch,
-    }),
-    false,
-  );
   assert.equal(resolveApprovedPlanPatchRecoveryTarget([
     ...unresolvedMismatch,
     ...Array.from({ length: 8 }, (_, index) => ({
@@ -2507,15 +2534,6 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
       detail: "one match",
     })),
   ]), "src/App.tsx");
-  assert.equal(
-    shouldBypassApprovedPlanReadCacheForPatchRecovery({
-      toolName: "grep_search",
-      allowFileRead: true,
-      target: "src/App.tsx",
-      recentActivity: unresolvedMismatch,
-    }),
-    false,
-  );
   assert.equal(describeApprovedPlanRecoveryToolSurface(false), "action_only");
   assert.equal(describeApprovedPlanRecoveryToolSurface(true), "action_plus_patch_file_read");
   assert.equal(
@@ -2558,8 +2576,9 @@ test("approved plan no-progress recovery keeps targeted reads without broad disc
   );
   assert.match(orchestratorSource, /patch-recovery `read_file` only/);
   assert.match(orchestratorSource, /exact current content/);
-  assert.match(toolCallPartitioningSource, /approved_plan_patch_recovery_read_cache_bypass/);
-  assert.match(toolCallPartitioningSource, /bypassApprovedPlanPatchRecoveryReadCache/);
+  assert.doesNotMatch(toolCallPartitioningSource, /approved_plan_patch_recovery_read_cache_bypass/);
+  assert.doesNotMatch(toolCallPartitioningSource, /bypassApprovedPlanPatchRecoveryReadCache/);
+  assert.match(toolCallPartitioningSource, /activeReadLease:\s*executeRecoveryState\.readLease/);
 });
 
 test("approved plan source edit first surface blocks validation before first write", () => {
@@ -2777,12 +2796,16 @@ test("approved plan no-tool prose is preserved unless it is a rejected completio
 });
 
 test("approved plan no-tool checkpoint reports protocol failure and available tools", () => {
+  const approvedPlanNoToolRecoverySource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"),
+    "utf8",
+  );
   const orchestratorSource = (
     fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") +
     "\n" +
     fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8") +
     "\n" +
-    fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanNoToolRecovery.ts"), "utf8") +
+    approvedPlanNoToolRecoverySource +
     "\n" +
     fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/approvedPlanFinalization.ts"), "utf8")
   );
@@ -2792,7 +2815,8 @@ test("approved plan no-tool checkpoint reports protocol failure and available to
   assert.match(orchestratorSource, /模型没有按执行协议调用工具/);
   assert.match(orchestratorSource, /Array\.from\(availableToolNames\)/);
   assert.match(orchestratorSource, /validationBoundary === "browser_prompt"[\s\S]*buildBrowserValidationContinuationPrompt/);
-  assert.match(orchestratorSource, /validationBoundary === "pause_external_validation"[\s\S]*buildApprovedPlanValidationPendingMessage/);
+  assert.match(orchestratorSource, /validationBoundary === "pause_external_validation"[\s\S]*reason: "external_validation_advisory"/);
+  assert.doesNotMatch(approvedPlanNoToolRecoverySource, /buildApprovedPlanValidationPendingMessage/);
 });
 
 test("plan progress snapshot carries no-progress recovery metadata", () => {

@@ -64,6 +64,17 @@ test("tool call execution phase preserves callback-owned state through the phase
   assert.match(phaseSource, /executeRecoveryState,[\s\S]*?loopGuardRuntimeState,/);
 });
 
+test("approved Plan scope recovery keeps one semantic fingerprint across policy-deferred tool changes", () => {
+  assert.match(
+    phaseSource,
+    /executeRecoveryState\.reason === "approved_plan_scope_blocked"[\s\S]*?executeRecoveryState\.protocolNoProgressFingerprint[\s\S]*?semanticNoProgressFingerprint/,
+  );
+  assert.match(
+    phaseSource,
+    /registerExecuteRecoveryProtocolNoProgress\(\s*executeRecoveryState,\s*semanticNoProgressFingerprint/,
+  );
+});
+
 test("partial abort reconciles observed tool results before returning and closes protocol calls", () => {
   const postProcessIndex = phaseSource.indexOf("handleToolResultPostProcessing({");
   const abortedReturnIndex = phaseSource.indexOf('status: "aborted"', postProcessIndex);

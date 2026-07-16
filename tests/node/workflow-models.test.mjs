@@ -132,7 +132,10 @@ const {
   shouldRecordPlanExecutionFailure,
 } = loadPlanEvidenceModule();
 
-const { resolveApprovedPlanMutationScope } = loadApprovedPlanExecutionScopeModule();
+const {
+  buildApprovedPlanScopeConflictFingerprint,
+  resolveApprovedPlanMutationScope,
+} = loadApprovedPlanExecutionScopeModule();
 
 const {
   buildPlanApprovalChoiceHint,
@@ -1310,6 +1313,30 @@ test("runtime task derivation keeps browser evidence for real UI validation task
   assert.equal(visualTask?.evidence?.[0]?.kind, "browser_dom");
 });
 
+test("interactive control outcomes use browser evidence instead of a synthetic command", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 测试方案",
+      "- 验证：点击 \"New\" 按钮，底部状态区域应显示 \"new\"。",
+      "- Verify: click the Open button and the status should display open.",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  assert.equal(tasks.length, 2, JSON.stringify(tasks));
+  for (const task of tasks) {
+    assert.equal(task.evidence?.some((item) => item.kind === "browser_dom"), true, JSON.stringify(task));
+    assert.equal(task.evidence?.some((item) =>
+      item.kind === "cmd" && item.value === "focused validation command"
+    ), false, JSON.stringify(task));
+  }
+});
+
 test("runtime task derivation keeps diagnosis and impact facts out of the approved mutation scope", () => {
   const plan = [
     "# Proposed Plan",
@@ -2000,6 +2027,66 @@ test("runtime plan task derivation does not promote an evidence preamble into a 
   )), false);
 });
 
+test("runtime plan task derivation resolves a unique short path to the reviewed mutation", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 关键实现改动",
+      "",
+      "### 1. 修改 `src/components/toolbar.js`",
+      "将按钮 ID 与事件监听器保持一致。",
+      "",
+      "### 2. 无需修改 `src/main.js`",
+      "`main.js` 中的事件已正确定义，只需修正 `toolbar.js` 的 ID 即可。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm run build`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutationTasks = tasks.filter((task) => task.executionKind === "mutation");
+  assert.equal(mutationTasks.length, 1, JSON.stringify(tasks));
+  assert.equal(mutationTasks[0].evidence?.some((item) =>
+    item.kind === "file" && item.value === "src/components/toolbar.js"
+  ), true);
+});
+
+test("runtime plan task derivation does not collapse an ambiguous basename", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## Key Changes",
+      "",
+      "### Modify `src/client/config.ts`",
+      "Update the browser defaults.",
+      "",
+      "### Modify `src/server/config.ts`",
+      "Update the server defaults.",
+      "",
+      "- Modify `config.ts` after confirming which runtime owns the fallback.",
+    ].join("\n"),
+  }], { language: "en" });
+
+  const mutationFiles = tasks
+    .filter((task) => task.executionKind === "mutation")
+    .flatMap((task) => task.evidence || [])
+    .filter((item) => item.kind === "file")
+    .map((item) => item.value);
+  assert.equal(mutationFiles.includes("src/client/config.ts"), true, JSON.stringify(tasks));
+  assert.equal(mutationFiles.includes("src/server/config.ts"), true, JSON.stringify(tasks));
+  assert.equal(mutationFiles.includes("config.ts"), true, JSON.stringify(tasks));
+});
+
 test("runtime plan task derivation skips malformed markdown table rows", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([
     {
@@ -2191,6 +2278,43 @@ test("approved Plan blocks workspace mutations outside the reviewed task targets
   assert.equal(allowed.allowed, true);
   assert.equal(blocked.allowed, false);
   assert.deepEqual(blocked.unexpectedTargets, ["src/app.tsx"]);
+});
+
+test("approved Plan scope conflict identity is based on revision and targets, not mutation tool", () => {
+  const tasks = extractPlanTasks("- [ ] 修改 `src/main.js` 修复初始化顺序。");
+  const writeConflict = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "write_file",
+    args: { path: "src/components/toolbar.js" },
+    target: "src/components/toolbar.js",
+    tasks,
+  });
+  const patchConflict = resolveApprovedPlanMutationScope({
+    workflowMode: "plan",
+    isPlanApproved: true,
+    toolName: "apply_patch",
+    args: {
+      patch: "*** Begin Patch\n*** Update File: src/components/toolbar.js\n@@\n-old\n+new\n*** End Patch",
+    },
+    target: "src/components/toolbar.js",
+    tasks,
+  });
+
+  assert.equal(writeConflict.allowed, false);
+  assert.equal(patchConflict.allowed, false);
+  assert.equal(
+    buildApprovedPlanScopeConflictFingerprint({
+      planRevision: 2,
+      unexpectedTargets: writeConflict.unexpectedTargets,
+      plannedTargets: writeConflict.plannedTargets,
+    }),
+    buildApprovedPlanScopeConflictFingerprint({
+      planRevision: 2,
+      unexpectedTargets: patchConflict.unexpectedTargets,
+      plannedTargets: patchConflict.plannedTargets,
+    }),
+  );
 });
 
 test("approved Plan applies the same target scope to MCP edits and deletes", () => {
@@ -2395,7 +2519,8 @@ test("failed browser validation does not satisfy browser render evidence", () =>
   });
   const reconciled = reconcilePlanTaskCompletion([], parsed, failedBrowserEvidence ? [failedBrowserEvidence] : []);
 
-  assert.equal(failedBrowserEvidence, null);
+  assert.equal(failedBrowserEvidence?.observationStatus, "failed");
+  assert.equal(failedBrowserEvidence?.browserInteraction?.assertions?.[0]?.passed, false);
   assert.equal(isPlanTaskTrustedComplete(reconciled[0]), false);
   assert.equal(isPlanTaskAwaitingBrowserValidation(reconciled[0]), true);
 });
@@ -2419,6 +2544,44 @@ test("Tauri runtime validation pauses as user/external validation instead of cur
   assert.equal(audit.pendingExternalValidation, true);
   assert.equal(audit.remainingTasks.length, 0);
   assert.equal(audit.pendingUserValidationTasks.length, 1);
+});
+
+test("unstructured desktop output cannot satisfy tauri automation evidence", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 在实际 Tauri 桌面窗口中验证打开文件行为。 （证据：tauri_required:desktop runtime interaction）",
+  );
+  const screenshotOnly = createPlanExecutionEvidenceEntry({
+    toolName: "computer_use",
+    target: "desktop runtime interaction",
+    result: "opened screenshot without a verified interaction",
+  });
+  const structuredDesktop = createPlanExecutionEvidenceEntry({
+    toolName: "tauri_driver",
+    target: "desktop runtime interaction",
+    result: JSON.stringify({
+      ok: true,
+      actions: [{ kind: "click", target: "open", ok: true }],
+      assertions: [{ kind: "dialog", target: "file picker", passed: true }],
+    }),
+  });
+  const unverified = reconcilePlanTaskCompletion(
+    [],
+    parsed,
+    screenshotOnly ? [screenshotOnly] : [],
+  );
+  const verified = reconcilePlanTaskCompletion(
+    [],
+    parsed,
+    structuredDesktop ? [structuredDesktop] : [],
+  );
+  const unverifiedAudit = buildPlanTaskEvidenceAudit({ tasks: unverified });
+
+  assert.equal(screenshotOnly?.automaticValidation, undefined);
+  assert.equal(isPlanTaskTrustedComplete(unverified[0]), false);
+  assert.equal(unverified[0].evidenceStatus, "requires_tauri_validation");
+  assert.equal(unverifiedAudit.pendingUserValidationTasks.length, 1);
+  assert.equal(structuredDesktop?.automaticValidation, true);
+  assert.equal(isPlanTaskTrustedComplete(verified[0]), true);
 });
 
 test("long-running desktop startup requires execute_command plus a later PTY observation before completion", () => {

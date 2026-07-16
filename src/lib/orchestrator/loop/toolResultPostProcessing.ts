@@ -134,6 +134,7 @@ export function handleToolResultPostProcessing(input: {
   // Internal quality-gate feedback is model/runtime control flow. It must not
   // become user progress, execution evidence, task targeting or success usage.
   const externalResults = results.filter((result) => !result.internalFeedback);
+  externalResults.forEach((result) => callbacks.onToolResultObserved?.(result));
   const delegatedActivities = externalResults.flatMap(extractDelegatedSubagentActivities);
   const directlyTrackedResults = externalResults.filter((result) =>
     result.name !== "spawn_subagent" && result.name !== "wait_subagents"
@@ -194,6 +195,15 @@ export function handleToolResultPostProcessing(input: {
     callbacks.onDebugEvent?.("subagent_evidence_promoted", {
       iteration,
       evidenceCount: delegatedActivities.length,
+      provenanceSource: "tool_observation",
+      summaryProseTrusted: false,
+      childOwnedObservationCount: delegatedActivities.filter((activity) =>
+        activity.delegatedObservation?.owner.agentKind === "subagent"
+      ).length,
+      parentConsumedObservationCount: 0,
+      requiresParentRereadCount: delegatedActivities.filter((activity) =>
+        activity.delegatedObservation?.requiresParentReread === true
+      ).length,
       targets: delegatedActivities.map((activity) => activity.target).slice(0, 12),
     });
   }

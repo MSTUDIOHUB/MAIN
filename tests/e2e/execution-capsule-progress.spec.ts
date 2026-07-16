@@ -33,10 +33,10 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   await expect(page.getByTestId("plan-task-progress")).toContainText("T9: 更新");
 });
 
-test("approved child-run progress replaces its parent review pause in Effective Progress", async ({ page }) => {
+test("approved child-run progress replaces its parent review pause in Run Status", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-plan-task-progress");
 
-  await page.getByTitle("查看有效进展").click();
+  await page.getByTitle("查看运行状态").click();
   const progressPopover = page.getByTestId("effective-progress-popover");
   await expect(progressPopover).toBeVisible();
   await expect(progressPopover).toContainText("正在执行已批准计划");
@@ -59,8 +59,8 @@ test("preapproval Plan recovery keeps internal phases and heartbeats out of user
   await expect(page.locator("[data-plan-runtime-phase]")).toHaveCount(0);
   await expect(page.getByTestId("plan-review-capsule")).toHaveCount(0);
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
-  await page.getByTitle("查看有效进展").click();
-  await expect(page.getByTestId("effective-progress-popover")).toContainText("暂无有效进展");
+  await page.getByTitle("查看运行状态").click();
+  await expect(page.getByTestId("effective-progress-popover")).toContainText("暂无运行状态");
   await expect(page.locator("body")).not.toContainText(/Needs rewrite|Drafting|草稿结构不完整|65 秒|隐藏推理正文不会展示|SECRET MODEL REASONING/);
 });
 

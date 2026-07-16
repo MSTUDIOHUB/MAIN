@@ -1,6 +1,10 @@
 import type { AppConfig } from "./appTypes";
 import { resolveRuntimeLaneKey } from "./appConfig";
 import { getModelLaneBurstAdmission } from "./modelLaneCoordinator";
+import type {
+  FileReadObservationIdentity,
+  FileReadWindowIdentity,
+} from "./orchestrator/fileReadCache";
 import { appendRuntimeEvent, withEventSchema, type MainThreadEvent } from "./turnEvents";
 import {
   normalizeWorkspacePathIdentity,
@@ -90,11 +94,88 @@ export interface SpawnSubagentRequest {
   expectedOutput?: string;
 }
 
-export interface SpawnSubagentResult {
+export type SubagentDelegationPreference =
+  | "unspecified"
+  | "forbidden"
+  | "allowed"
+  | "preferred";
+
+export type DelegationRuntimePhase =
+  | "context"
+  | "diagnostic"
+  | "mutation"
+  | "validation"
+  | "finalization";
+
+export type DelegationDecisionAction = "admit" | "defer" | "deny";
+
+export type DelegationDecisionReason =
+  | "explicit_preference"
+  | "explicit_permission"
+  | "adaptive_multi_scope"
+  | "insufficient_independent_scope"
+  | "pending_subagents_require_join"
+  | "phase_not_eligible"
+  | "user_forbidden"
+  | "workspace_unavailable"
+  | "subagent_recursion_forbidden"
+  | "turn_capacity_reached"
+  | "overlapping_active_scope"
+  | "parent_scope_already_observed";
+
+export interface DelegationDecision {
+  action: DelegationDecisionAction;
+  reason: DelegationDecisionReason;
+  phase: DelegationRuntimePhase;
+  preference: SubagentDelegationPreference;
+  independentScopeCount: number;
+  explicitScopeCount: number;
+  observedScopeCount: number;
+  plannedWorkItemCount: number;
+  pendingSubagentCount: number;
+}
+
+export type SpawnSubagentResult =
+  | {
+      subagentId: string;
+      name: string;
+      status: "queued" | "running";
+      scopeKey: string;
+    }
+  | {
+      subagentId: null;
+      name: string;
+      status: "deferred";
+      scopeKey: string;
+      reason: DelegationDecisionReason;
+      conflictingSubagentId?: string;
+      conflictingScopeKey?: string;
+    };
+
+export interface SubagentEvidenceFactReference {
+  fact: string;
+  sourceToolCallId?: string;
+  sourceObservationKey?: string;
+  sourceVersion?: string;
+  sourceRange?: FileReadWindowIdentity;
+}
+
+export interface SubagentObservationOwner {
+  agentKind: "subagent";
   subagentId: string;
-  name: string;
-  status: "queued" | "running";
-  scopeKey: string;
+  parentTurnId?: string;
+  runId?: string;
+}
+
+export interface SubagentEvidenceProvenance {
+  source: "tool_observation";
+  /** The child run that actually observed this source. */
+  owner: SubagentObservationOwner;
+  sourceToolCallId?: string;
+  sourceObservation?: FileReadObservationIdentity;
+  sourceVersion?: string;
+  sourceRange?: FileReadWindowIdentity;
+  factReferences?: SubagentEvidenceFactReference[];
 }
 
 export interface SubagentEvidenceItem {
@@ -102,6 +183,7 @@ export interface SubagentEvidenceItem {
   target: string;
   detail: string;
   facts?: string[];
+  provenance: SubagentEvidenceProvenance;
 }
 
 export interface SubagentResultEnvelope {
@@ -110,6 +192,8 @@ export interface SubagentResultEnvelope {
   scopeKey: string;
   status: SubagentStatus;
   summary: string;
+  /** Child-authored synthesis is a hypothesis; only provenance-backed evidence is trusted. */
+  summaryTrust: "unverified_hypothesis";
   evidence: SubagentEvidenceItem[];
   blocker?: string;
   remainingWork?: string;
@@ -151,6 +235,108 @@ export interface SubagentCapacityPolicy {
   maxBurstActiveRequests: number;
   maxCreatedPerTurn: number;
   childMaxIterations: number;
+}
+
+function boundedCount(value: unknown): number {
+  return Math.max(0, Math.floor(Number(value || 0)));
+}
+
+/**
+ * Reduce path-like delegation hints to non-overlapping, canonical scopes.
+ * Task count is deliberately excluded: several checklist items can still own
+ * the same file and therefore do not prove that parallel work is independent.
+ */
+export function normalizeIndependentDelegationScopeKeys(values: unknown[]): string[] {
+  const normalized = [...new Set(values
+    .map((value) => normalizeWorkspacePathIdentity(String(value || "")))
+    .filter((value) => value && value !== "."))]
+    .sort((left, right) => left.length - right.length || left.localeCompare(right));
+  const independent: string[] = [];
+  for (const candidate of normalized) {
+    if (independent.some((scope) => pathContains(scope, candidate) || pathContains(candidate, scope))) {
+      continue;
+    }
+    independent.push(candidate);
+  }
+  return independent;
+}
+
+/**
+ * Provider-neutral delegation admission. The runtime exposes delegation only
+ * while independent read-only work can still improve context or diagnosis;
+ * model/provider identity never participates in the decision.
+ */
+export function resolveDelegationDecision(input: {
+  preference?: SubagentDelegationPreference;
+  phase: DelegationRuntimePhase;
+  hasWorkspace: boolean;
+  explicitScopeCount?: number;
+  observedScopeCount?: number;
+  plannedWorkItemCount?: number;
+  independentScopeKeys?: string[];
+  pendingSubagentCount?: number;
+  subagentDepth?: number;
+}): DelegationDecision {
+  const preference = input.preference || "unspecified";
+  const explicitScopeCount = boundedCount(input.explicitScopeCount);
+  const observedScopeCount = boundedCount(input.observedScopeCount);
+  const plannedWorkItemCount = boundedCount(input.plannedWorkItemCount);
+  const pendingSubagentCount = boundedCount(input.pendingSubagentCount);
+  const independentScopeCount = normalizeIndependentDelegationScopeKeys(
+    input.independentScopeKeys || [],
+  ).length;
+  const decision = (
+    action: DelegationDecisionAction,
+    reason: DelegationDecisionReason,
+  ): DelegationDecision => ({
+    action,
+    reason,
+    phase: input.phase,
+    preference,
+    independentScopeCount,
+    explicitScopeCount,
+    observedScopeCount,
+    plannedWorkItemCount,
+    pendingSubagentCount,
+  });
+
+  if (boundedCount(input.subagentDepth) > 0) {
+    return decision("deny", "subagent_recursion_forbidden");
+  }
+  if (!input.hasWorkspace) return decision("deny", "workspace_unavailable");
+  if (preference === "forbidden") return decision("deny", "user_forbidden");
+  if (input.phase !== "context" && input.phase !== "diagnostic") {
+    return decision("defer", "phase_not_eligible");
+  }
+  if (pendingSubagentCount > 0) {
+    return decision("defer", "pending_subagents_require_join");
+  }
+  if (preference === "preferred") return decision("admit", "explicit_preference");
+  if (preference === "allowed") return decision("admit", "explicit_permission");
+  if (independentScopeCount >= 2) return decision("admit", "adaptive_multi_scope");
+  return decision("defer", "insufficient_independent_scope");
+}
+
+export function buildSubagentPolicyDeferral(input: {
+  name?: string;
+  scopeKey?: string;
+  reason: DelegationDecisionReason;
+  conflictingSubagentId?: string;
+  conflictingScopeKey?: string;
+}): Extract<SpawnSubagentResult, { status: "deferred" }> {
+  return {
+    subagentId: null,
+    name: String(input.name || "delegation").trim().slice(0, 32) || "delegation",
+    status: "deferred",
+    scopeKey: String(input.scopeKey || "delegation").trim().slice(0, 96) || "delegation",
+    reason: input.reason,
+    ...(input.conflictingSubagentId
+      ? { conflictingSubagentId: input.conflictingSubagentId }
+      : {}),
+    ...(input.conflictingScopeKey
+      ? { conflictingScopeKey: input.conflictingScopeKey }
+      : {}),
+  };
 }
 
 const TERMINAL_SUBAGENT_STATUSES = new Set<SubagentStatus>([
@@ -329,6 +515,10 @@ function releaseCoordinatedRun(key: string): boolean {
   if (!run) return false;
   if (run.cleanupTimer) clearTimeout(run.cleanupTimer);
   coordinatedRuns.delete(key);
+  // Coordination records can be released by join, TTL cleanup, or parent
+  // finalization. All are terminal ownership boundaries for this parent turn,
+  // so a stale scope lease must never survive the record that owned it.
+  releaseSubagentScopeLease(run.subagentId);
   return true;
 }
 
@@ -703,6 +893,7 @@ export function reconcileOrphanedSubagentEvents(
   let reconciled = [...events];
   for (const run of projectSubagentRuns(events)) {
     if (!isSubagentActiveStatus(run.status) || hasLiveSubagentController(run.id)) continue;
+    releaseSubagentScopeLease(run.id);
     const error = "SUBAGENT_ORPHANED_AFTER_RESTART: the persisted run has no live runtime controller and was closed during session restore.";
     reconciled = appendRuntimeEvent(reconciled, withEventSchema({
       type: "subagent.updated",

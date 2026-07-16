@@ -62,11 +62,15 @@ const {
   clearExecuteRecoveryRuntimeState,
   createExecuteRecoveryRuntimeState,
   refundExecuteRecoveryRuntimeIteration,
+  registerExecuteRecoveryProtocolNoProgress,
   resolvePtyObservationPolicyDeferral,
   setRepeatedEditValidationRecoveryAttempts,
   transitionExecuteRecoveryRuntimeState,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"),
+);
+const { buildApprovedPlanScopeConflictFingerprint } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/approvedPlanExecutionScope.ts"),
 );
 
 test("PTY observation policy deferral is recognized only from structured browser preflight feedback", () => {
@@ -109,7 +113,10 @@ test("execute recovery state restores forced edit and approved-Plan continuation
       mode: "validation_only",
       reason: "goal_slice_recovery_restored",
       expectedTarget: "src/App.tsx",
+      attempts: 5,
       phaseNoProgressCount: 3,
+      protocolNoProgressCount: 4,
+      protocolNoProgressFingerprint: "validation_only::src/app.tsx::read_unchanged",
       readLease: {
         purpose: "post_mutation_verify",
         target: "src/App.tsx",
@@ -127,7 +134,10 @@ test("execute recovery state restores forced edit and approved-Plan continuation
   assert.equal(restoredTransaction.mode, "validation_only");
   assert.equal(restoredTransaction.reason, "goal_slice_recovery_restored");
   assert.equal(restoredTransaction.expectedTarget, "src/App.tsx");
+  assert.equal(restoredTransaction.attempts, 5);
   assert.equal(restoredTransaction.phaseNoProgressCount, 3);
+  assert.equal(restoredTransaction.protocolNoProgressCount, 4);
+  assert.equal(restoredTransaction.protocolNoProgressFingerprint, "validation_only::src/app.tsx::read_unchanged");
   assert.equal(restoredTransaction.readLease?.purpose, "post_mutation_verify");
   assert.equal(restoredTransaction.sourceObservationKey, "src/App.tsx@version-2:20-40");
   assert.equal(restoredTransaction.decisionCheckpoint?.evidenceVersion, "ledger-7");
@@ -175,12 +185,12 @@ test("execute recovery state activates, advances, and clears without losing loop
   );
   assert.equal(state.expectedTarget, "src/App.tsx", "reactivation preserves the active transaction target");
 
-  for (let i = 1; i <= MAX_EXECUTE_RECOVERY_ITERATIONS; i += 1) {
+  for (let i = 1; i <= MAX_EXECUTE_RECOVERY_ITERATIONS + 1; i += 1) {
     const advanced = advanceExecuteRecoveryRuntimeIteration(state);
     state = advanced.state;
-    assert.equal(advanced.reachedMaxIterations, i === MAX_EXECUTE_RECOVERY_ITERATIONS);
+    assert.equal(advanced.reachedMaxIterations, i === MAX_EXECUTE_RECOVERY_ITERATIONS + 1);
   }
-  assert.equal(state.iterationCount, MAX_EXECUTE_RECOVERY_ITERATIONS);
+  assert.equal(state.iterationCount, MAX_EXECUTE_RECOVERY_ITERATIONS + 1);
 
   state = clearExecuteRecoveryRuntimeState(state);
   assert.equal(state.mode, "normal");
@@ -292,6 +302,30 @@ test("execute recovery transaction advances read to mutation to validation witho
   assert.equal(verified.state.attempts, 0);
 });
 
+test("failed-process recovery accepts a bounded target repair before returning to validation", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "action_plus_targeting",
+      reason: "precompletion_evidence_gap:unreconciled_failure",
+      expectedTarget: "src/App.tsx",
+      decisionCheckpoint: {
+        expectedTarget: "src/App.tsx",
+        sourceObservationKey: null,
+        nextRequiredCapability: "recover_process",
+      },
+    },
+  );
+
+  const repaired = transitionExecuteRecoveryRuntimeState(state, {
+    mutationTarget: "./src/App.tsx",
+  });
+  assert.equal(repaired.transition, "mutation_to_validation");
+  assert.equal(repaired.state.mode, "validation_only");
+  assert.equal(repaired.state.expectedTarget, "src/App.tsx");
+  assert.equal(repaired.state.readLease?.purpose, "post_mutation_verify");
+});
+
 test("recovery no-progress budget resets only for fresh phase evidence", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
@@ -347,6 +381,56 @@ test("recovery no-progress budget resets only for fresh phase evidence", () => {
   assert.equal(postMutationRead.state.decisionCheckpoint.nextRequiredCapability, "validation");
 });
 
+test("patch recovery consumes only the leased target, source range, and version", () => {
+  const lease = {
+    purpose: "patch_recovery",
+    target: "src/main.js",
+    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    observedVersion: "8192:1700000000000",
+    mismatchFingerprint: "patch_mismatch::src/main.js::mutation_preflight_invalid_patch",
+    state: "available",
+  };
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "mutation_preflight_invalid_patch",
+      expectedTarget: "src/main.js",
+      readLease: lease,
+    },
+  );
+
+  const wrongRange = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:1-52:v1",
+    sourceRequestedRange: { startLine: 1, endLine: 52, maxLines: 52 },
+    sourceObservedVersion: "8192:1700000000000",
+  });
+  assert.equal(wrongRange.transition, "none");
+  assert.equal(wrongRange.state.readLease.state, "available");
+
+  const wrongVersion = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:205-256:v2",
+    sourceRequestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    sourceObservedVersion: "8193:1700000000001",
+  });
+  assert.equal(wrongVersion.transition, "none");
+  assert.equal(wrongVersion.state.readLease.state, "available");
+
+  const exact = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "/tmp/workspace/src/main.js",
+    sourceObservationKey: "main:205-256:v1",
+    sourceRequestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    sourceObservedVersion: "8192:1700000000000",
+  });
+  assert.equal(exact.transition, "context_to_mutation");
+  assert.equal(exact.state.readLease.state, "consumed");
+  assert.equal(exact.state.readLease.observationKey, "main:205-256:v1");
+  assert.deepEqual(exact.state.readLease.requestedRange, lease.requestedRange);
+  assert.equal(exact.state.readLease.observedVersion, lease.observedVersion);
+});
+
 test("policy deferrals, cache stubs, and PTY waits can refund the current phase debit", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
@@ -358,6 +442,91 @@ test("policy deferrals, cache stubs, and PTY waits can refund the current phase 
   assert.equal(state.phaseNoProgressCount, 0);
   assert.equal(state.iterationCount, 0);
   assert.equal(refundExecuteRecoveryRuntimeIteration(state).phaseNoProgressCount, 0);
+});
+
+test("six identical semantic retries stop recovery even when phase debits are refunded", () => {
+  let state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "patch_mismatch",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "patch_recovery",
+        target: "src/main.js",
+        state: "active",
+      },
+    },
+  );
+  const fingerprint = "patch_recovery_read::src/main.js::read_no_progress";
+  for (let index = 1; index <= MAX_EXECUTE_RECOVERY_ITERATIONS; index += 1) {
+    state = advanceExecuteRecoveryRuntimeIteration(state).state;
+    state = refundExecuteRecoveryRuntimeIteration(state);
+    state = registerExecuteRecoveryProtocolNoProgress(state, fingerprint);
+    assert.equal(state.phaseNoProgressCount, 0);
+    assert.equal(state.protocolNoProgressCount, index);
+  }
+  const boundary = advanceExecuteRecoveryRuntimeIteration(state);
+  assert.equal(boundary.reachedMaxIterations, true);
+
+  const changedRequest = registerExecuteRecoveryProtocolNoProgress(
+    state,
+    "patch_recovery_read::src/main.js::different-evidence-version",
+  );
+  assert.equal(changedRequest.protocolNoProgressCount, 1);
+  assert.equal(changedRequest.protocolNoProgressFingerprint.includes("different-evidence-version"), true);
+
+  const progressed = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "src/main.js::v2::205-256",
+  });
+  assert.equal(progressed.transition, "context_to_mutation");
+  assert.equal(progressed.state.protocolNoProgressCount, 0);
+  assert.equal(progressed.state.protocolNoProgressFingerprint, null);
+});
+
+test("approved Plan scope conflicts stop after six semantic retries across mutation tool changes", () => {
+  const fingerprint = buildApprovedPlanScopeConflictFingerprint({
+    planRevision: 4,
+    unexpectedTargets: ["src/components/toolbar.js"],
+    plannedTargets: ["src/main.js"],
+  });
+  const normalizedFingerprint = buildApprovedPlanScopeConflictFingerprint({
+    planRevision: 4,
+    unexpectedTargets: ["./src/components/TOOLBAR.js"],
+    plannedTargets: ["./src/main.js"],
+  });
+  assert.equal(normalizedFingerprint, fingerprint);
+
+  let state = createExecuteRecoveryRuntimeState({ workflowMode: "plan" });
+  for (let attempt = 1; attempt <= MAX_EXECUTE_RECOVERY_ITERATIONS; attempt += 1) {
+    state = activateExecuteRecoveryRuntimeState(state, {
+      mode: "mutation_first",
+      reason: "approved_plan_scope_blocked",
+      expectedTarget: "src/main.js",
+    });
+    state = registerExecuteRecoveryProtocolNoProgress(state, fingerprint);
+    assert.equal(state.protocolNoProgressCount, attempt);
+    if (attempt < MAX_EXECUTE_RECOVERY_ITERATIONS) {
+      const nextTurn = advanceExecuteRecoveryRuntimeIteration(state);
+      assert.equal(nextTurn.reachedMaxIterations, false);
+      state = nextTurn.state;
+    }
+  }
+
+  const boundary = advanceExecuteRecoveryRuntimeIteration(state);
+  assert.equal(boundary.reachedMaxIterations, true);
+  assert.equal(boundary.state.protocolNoProgressCount, MAX_EXECUTE_RECOVERY_ITERATIONS);
+
+  const revisedPlan = registerExecuteRecoveryProtocolNoProgress(
+    state,
+    buildApprovedPlanScopeConflictFingerprint({
+      planRevision: 5,
+      unexpectedTargets: ["src/components/toolbar.js"],
+      plannedTargets: ["src/main.js", "src/components/toolbar.js"],
+    }),
+  );
+  assert.equal(revisedPlan.protocolNoProgressCount, 1);
 });
 
 test("action-plus recovery observes PTY readiness before browser validation clears the transaction", () => {

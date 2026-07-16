@@ -71,11 +71,32 @@ test("tool result recovery phase owns runtime state folds", () => {
 test("approved plan scope blocks recover within the reviewed scope before completion can be audited", () => {
   const scopeCheckpointIndex = phaseSource.indexOf("const approvedPlanScopeBlockedTargets");
   const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({");
+  const recoveryActivationIndex = phaseSource.indexOf(
+    '"approved_plan_scope_blocked"',
+    scopeCheckpointIndex,
+  );
+  const recoveryPromptAppendIndex = phaseSource.indexOf(
+    "content: recoveryPrompt",
+    scopeCheckpointIndex,
+  );
 
   assert.notEqual(scopeCheckpointIndex, -1);
   assert.notEqual(completionAuditIndex, -1);
+  assert.notEqual(recoveryActivationIndex, -1);
+  assert.notEqual(recoveryPromptAppendIndex, -1);
   assert.ok(scopeCheckpointIndex < completionAuditIndex);
-  assert.match(phaseSource, /getApprovedPlanScopeBlockedTargets\(input\.results\)/);
+  assert.ok(recoveryActivationIndex < recoveryPromptAppendIndex);
+  assert.match(phaseSource, /getApprovedPlanScopeConflict\(input\.results\)/);
+  assert.match(
+    phaseSource,
+    /const conflict = result\.approvedPlanScopeConflict;[\s\S]*?\(!conflict && !APPROVED_PLAN_SCOPE_BLOCKED_RE/,
+  );
+  assert.match(
+    phaseSource,
+    /activateExecuteRecoveryAndSync\(\s*"mutation_first",\s*"approved_plan_scope_blocked",[\s\S]*?expectedTarget: plannedTargets\[0\][\s\S]*?protocolNoProgressFingerprint/,
+  );
+  assert.match(phaseSource, /buildApprovedPlanScopeConflictFingerprint\(\{/);
+  assert.match(phaseSource, /buildPlanApprovalIdentity\([\s\S]*?getPlanArtifacts/);
   assert.match(phaseSource, /logAgentEvent\("approved_plan_scope_block_recovering"/);
   assert.match(phaseSource, /emitPlanExecutionProgress\("running",[\s\S]*?approved_plan_scope_block_recovering/);
   assert.match(phaseSource, /appendMessage\(\{[\s\S]*?content: recoveryPrompt/);
@@ -116,6 +137,34 @@ test("premature browser validation activates PTY observation recovery before com
     /executeRecoveryState\.mode === "normal" && ptyObservationDeferral[\s\S]*?activateExecuteRecoveryAndSync\(\s*"validation_only"/,
   );
   assert.match(phaseSource, /nextCapability: "observe_pty"/);
+});
+
+test("a long-process result atomically narrows the next turn to PTY observation or browser validation", () => {
+  const runtimeIndex = phaseSource.indexOf("const devServerRuntime = resolveDevServerRuntimeState(");
+  const noProgressIndex = phaseSource.indexOf("const noProgressRecovery = handleNoProgressRecovery({");
+  const activationIndex = phaseSource.indexOf(
+    '"execute_recovery_activated_from_dev_server_evidence"',
+    runtimeIndex,
+  );
+
+  assert.notEqual(runtimeIndex, -1);
+  assert.notEqual(noProgressIndex, -1);
+  assert.notEqual(activationIndex, -1);
+  assert.ok(runtimeIndex < activationIndex);
+  assert.ok(activationIndex < noProgressIndex);
+  assert.match(
+    phaseSource,
+    /devServerRuntime\.nextCapability === "observe_pty"[\s\S]*?devServerEvidenceGap === "pty_observation_required"/,
+  );
+  assert.match(
+    phaseSource,
+    /devServerRuntime\.nextCapability === "browser"[\s\S]*?devServerEvidenceGap === "browser_validation_required"/,
+  );
+  assert.match(
+    phaseSource,
+    /activateExecuteRecoveryAndSync\(\s*"validation_only",[\s\S]*?nextCapability,[\s\S]*?foregroundGeneration/,
+  );
+  assert.match(phaseSource, /return finish\("continue"\)/);
 });
 
 test("approved Plan finite command failures split invocation recovery from source repair", () => {

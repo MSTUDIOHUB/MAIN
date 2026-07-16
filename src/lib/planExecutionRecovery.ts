@@ -9,7 +9,10 @@ import {
   type PlanExecutionProgressUpdate,
   type PlanTask,
 } from "./workflowModels";
-import type { FileReadObservationIdentity } from "./orchestrator/fileReadCache";
+import type {
+  FileReadObservationIdentity,
+  FileReadWindowIdentity,
+} from "./orchestrator/fileReadCache";
 import type { MainThreadProgressUpdate } from "./turnEvents";
 import {
   isReadOnlyNoProgressDetail,
@@ -227,6 +230,25 @@ export interface PlanToolActivitySummary {
   facts?: string[];
   /** Exact versioned read window retained across checkpoints and compaction. */
   readFileObservation?: FileReadObservationIdentity;
+  /**
+   * Provenance for a child-owned observation. Joined summaries only inject a
+   * compact reference, never the complete source window, so the parent must
+   * perform its own targeted read before using it as mutation context.
+   */
+  delegatedObservation?: {
+    owner: {
+      agentKind: "subagent";
+      subagentId: string;
+      parentTurnId?: string;
+      runId?: string;
+    };
+    sourceToolCallId?: string;
+    sourceObservationKey?: string;
+    sourceVersion?: string;
+    sourceRange?: FileReadWindowIdentity;
+    parentContextState: "reference_only";
+    requiresParentReread: true;
+  };
 }
 
 export interface PlanMaxIterationsCheckpoint {

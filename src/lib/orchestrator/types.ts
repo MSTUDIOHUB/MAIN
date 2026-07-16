@@ -15,6 +15,7 @@ import {
   type ExecuteRecoveryContractPhase,
   type ExecuteRecoveryMode,
   type ExecutionDecisionCheckpoint,
+  type PatchRecoveryMismatchEvidence,
   type RecoveryReadLease,
 } from "../executeRecoveryTools";
 import { type MainThreadEvent } from "../turnEvents";
@@ -129,8 +130,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason?: string | null;
     expectedTarget?: string | null;
+    attempts?: number;
     phase?: ExecuteRecoveryContractPhase;
     phaseNoProgressCount?: number;
+    protocolNoProgressCount?: number;
+    protocolNoProgressFingerprint?: string | null;
     readLease?: RecoveryReadLease | null;
     sourceObservationKey?: string | null;
     decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
@@ -162,8 +166,11 @@ export interface OrchestratorCallbacks {
     mode: ExecuteRecoveryMode;
     reason: string;
     expectedTarget: string | null;
+    attempts: number;
     phase: ExecuteRecoveryContractPhase;
     phaseNoProgressCount: number;
+    protocolNoProgressCount: number;
+    protocolNoProgressFingerprint: string | null;
     readLease: RecoveryReadLease | null;
     sourceObservationKey: string | null;
     decisionCheckpoint: ExecutionDecisionCheckpoint | null;
@@ -312,6 +319,8 @@ export interface OrchestratorCallbacks {
       qualityGateReason?: string | null;
     },
   ) => void;
+  /** Structured post-execution observation used by non-UI evidence collectors. */
+  onToolResultObserved?: (result: ToolExecutionResult) => void;
   onToolError: (
     toolName: string,
     target: string,
@@ -363,6 +372,13 @@ export interface ToolExecutionResult {
   missingPlanSections?: string[];
   /** Internal identity for one versioned read_file request window. */
   readFileObservation?: import("./fileReadCache").FileReadObservationIdentity;
+  patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
+  /** Structured policy identity for an out-of-scope approved-Plan mutation. */
+  approvedPlanScopeConflict?: {
+    requestedTargets: string[];
+    unexpectedTargets: string[];
+    plannedTargets: string[];
+  };
 }
 
 export interface PlanMaterializationResultForLoop {

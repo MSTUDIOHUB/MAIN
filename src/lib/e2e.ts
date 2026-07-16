@@ -6490,6 +6490,13 @@ function seedRealOmlxPlanFlowScenario() {
         requestId: state.activeActionRequest.requestId,
         turnId: state.activeActionRequest.turnId,
         runId: state.activeActionRequest.runId,
+        ...(state.activeActionRequest.kind === "tool_permission"
+          ? {
+              toolName: state.activeActionRequest.toolName,
+              target: state.activeActionRequest.target,
+              risk: state.activeActionRequest.risk || "unknown",
+            }
+          : {}),
       } : null,
       agentTexts,
       toolBlocks,

@@ -1012,6 +1012,8 @@ test("Goal continuation restores the unfinished recovery phase across slices", (
     expectedTarget: "src/App.tsx",
     phase: "mutation",
     phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
     readLease: null,
     sourceObservationKey: null,
     decisionCheckpoint: null,
@@ -1023,13 +1025,17 @@ test("Goal continuation preserves the exact recovery contract snapshot across sl
     mode: "patch_recovery_read",
     reason: "patch_context_required",
     expectedTarget: "src/toolbar.ts",
+    attempts: 4,
     phaseNoProgressCount: 3,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
     readLease: {
       purpose: "patch_recovery",
       target: "src/toolbar.ts",
       requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
       observationKey: "src/toolbar.ts:205-256:v7",
       observedVersion: "v7",
+      mismatchFingerprint: "patch_mismatch::src/toolbar.ts::invalid_patch",
       state: "active",
     },
     sourceObservationKey: "src/toolbar.ts:205-256:v7",
@@ -1063,6 +1069,33 @@ test("Goal continuation preserves the exact recovery contract snapshot across sl
     second,
     { mutationRequired: true },
   ), expected);
+});
+
+test("Goal continuation preserves recover_process as the next required capability", () => {
+  const state = goalContinuity.createGoalContinuationState({
+    sourceIteration: 7,
+    messages: [{ role: "assistant", content: "Recover the failed foreground process." }],
+    executeRecoveryState: {
+      mode: "validation_only",
+      reason: "foreground_process_exited",
+      expectedTarget: "npm run dev",
+      phase: "reconcile",
+      decisionCheckpoint: {
+        expectedTarget: "npm run dev",
+        sourceObservationKey: null,
+        nextRequiredCapability: "recover_process",
+        evidenceVersion: "pty-generation-4",
+      },
+    },
+    now: 300,
+  });
+  const restored = goalContinuity.resolveGoalContinuationExecuteRecoveryState(
+    state,
+    { mutationRequired: true },
+  );
+
+  assert.equal(restored.decisionCheckpoint.nextRequiredCapability, "recover_process");
+  assert.equal(restored.phase, "reconcile");
 });
 
 test("Goal continuation treats structured feedback status as authoritative", () => {
@@ -1194,6 +1227,8 @@ test("Goal continuation restores one target-scoped recovery transaction", () => 
     expectedTarget: "/workspace/src/App.tsx",
     phase: "mutation",
     phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
     readLease: null,
     sourceObservationKey: null,
     decisionCheckpoint: null,
@@ -1346,6 +1381,8 @@ test("Goal runtime normalization preserves durable continuation memory idempoten
     expectedTarget: "src/lib/goalRuntime.ts",
     phase: "validation",
     phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
     readLease: null,
     sourceObservationKey: null,
     decisionCheckpoint: null,

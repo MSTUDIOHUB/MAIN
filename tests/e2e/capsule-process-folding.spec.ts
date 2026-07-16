@@ -18,11 +18,41 @@ test("capsule preserves model explanation while tools are folded", async ({ page
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
 
-  await page.getByTitle("查看有效进展").click();
+  const runStatusTrigger = page.getByTitle("查看运行状态");
+  await runStatusTrigger.click();
   const progressPopover = page.getByTestId("effective-progress-popover");
   await expect(progressPopover).toBeVisible();
+  await expect(page.getByRole("button", { name: "关闭运行状态" })).toBeFocused();
+  await expect(progressPopover).toContainText("运行状态");
+  await expect(progressPopover).toContainText("当前活动");
+  await expect(progressPopover).toContainText("最近里程碑");
+  await expect(page.getByTestId("run-status-current-activity")).toContainText("ChatArea.tsx");
+  await expect(page.getByTestId("run-status-milestone")).toHaveCount(2);
   await expect(progressPopover).toContainText("ChatArea.tsx");
   await expect(progressPopover).toContainText("npm run test:workflow-assets");
+
+  for (const mode of ["light", "dark", "black"] as const) {
+    await page.evaluate((themeMode) => (window as any).__CODELY_E2E__?.setThemeMode?.(themeMode), mode);
+    await expect.poll(async () => (
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().themeMode ?? null)
+    )).toBe(mode);
+    await expect(progressPopover).toBeVisible();
+    const surface = await progressPopover.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return {
+        backgroundColor: style.backgroundColor,
+        borderColor: style.borderTopColor,
+        fitsViewport: element.getBoundingClientRect().width <= window.innerWidth,
+      };
+    });
+    expect(surface.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+    expect(surface.borderColor).not.toBe("rgba(0, 0, 0, 0)");
+    expect(surface.fitsViewport).toBe(true);
+  }
+
+  await page.keyboard.press("Escape");
+  await expect(progressPopover).toBeHidden();
+  await expect(runStatusTrigger).toBeFocused();
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();

@@ -41,6 +41,8 @@ export type PlanNoToolRecoveryResult = {
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planAutoScaffoldPromptIssued: boolean;
   planEvidenceRecoveryPasses: number;
+  planEvidenceNoProgressPasses: number;
+  planEvidenceProgressFingerprint: string;
 };
 
 export { buildPlanClosureEvidenceRecoveryPrompt } from "../planOrchestration";
@@ -273,6 +275,8 @@ export async function handlePlanNoToolRecovery(input: {
   planRuntimePhase: PlanRuntimePhase;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
+  planEvidenceNoProgressPasses: number;
+  planEvidenceProgressFingerprint: string;
   planQualityRejectCount: number;
   planLastQualityGateReason: string;
   planLastMissingSections: string[];
@@ -341,6 +345,8 @@ export async function handlePlanNoToolRecovery(input: {
   let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
   let planAutoScaffoldPromptIssued = input.planAutoScaffoldPromptIssued;
   let currentPlanEvidenceRecoveryPasses = planEvidenceRecoveryPasses;
+  let currentPlanEvidenceNoProgressPasses = input.planEvidenceNoProgressPasses ?? 0;
+  let currentPlanEvidenceProgressFingerprint = input.planEvidenceProgressFingerprint ?? "";
   const finish = (status: PlanNoToolRecoveryStatus): PlanNoToolRecoveryResult => ({
     status,
     consecutiveNoToolCount,
@@ -354,6 +360,8 @@ export async function handlePlanNoToolRecovery(input: {
     planEvidenceRecoveryObjective,
     planAutoScaffoldPromptIssued,
     planEvidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses: currentPlanEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint: currentPlanEvidenceProgressFingerprint,
   });
 
   const currentPlanStage = callbacks.getPlanStage();
@@ -426,6 +434,8 @@ export async function handlePlanNoToolRecovery(input: {
       planAutoScaffoldPromptIssued,
       planClosureEvidenceRecoveryIssued,
       planEvidenceRecoveryPasses: currentPlanEvidenceRecoveryPasses,
+      planEvidenceNoProgressPasses: currentPlanEvidenceNoProgressPasses,
+      planEvidenceProgressFingerprint: currentPlanEvidenceProgressFingerprint,
       setPlanRuntimePhase,
       quality,
     });
@@ -437,6 +447,8 @@ export async function handlePlanNoToolRecovery(input: {
     planClosureEvidenceRecoveryIssued = recovery.planClosureEvidenceRecoveryIssued;
     planEvidenceRecoveryObjective = recovery.planEvidenceRecoveryObjective;
     currentPlanEvidenceRecoveryPasses = recovery.planEvidenceRecoveryPasses;
+    currentPlanEvidenceNoProgressPasses = recovery.planEvidenceNoProgressPasses;
+    currentPlanEvidenceProgressFingerprint = recovery.planEvidenceProgressFingerprint;
 
     const newlyIssuedClosureEvidenceRecovery =
       !!recovery.pendingPlanRuntimeRecoveryPrompt &&

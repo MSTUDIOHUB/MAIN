@@ -22,6 +22,12 @@ test("loop runtime actions own mutable recovery and phase reducers", () => {
   assert.match(actionsSource, /activateExecuteRecoveryRuntimeState\(/);
   assert.match(actionsSource, /expectedTarget/);
   assert.match(actionsSource, /repeatedTargets\.length === 1/);
+  assert.match(actionsSource, /patchRecoveryLeaseIdentityMatches\(/);
+  assert.match(actionsSource, /registerExecuteRecoveryProtocolNoProgress\(/);
+  assert.match(
+    actionsSource,
+    /context\.protocolNoProgressFingerprint[\s\S]*?registerExecuteRecoveryProtocolNoProgress\(/,
+  );
   assert.match(actionsSource, /activateChatFinalSynthesisState\(/);
   assert.match(actionsSource, /clearExecuteRecoveryRuntimeState\(stateOverride\)/);
   assert.match(actionsSource, /clearCrossIterationReadTrackingForTarget\(/);
@@ -35,6 +41,8 @@ test("loop runtime actions keep recovery telemetry next to the state mutation", 
   const actionsSource = sourceFor("src/lib/orchestrator/loop/loopRuntimeActions.ts");
 
   const activateRecovery = indexOfRequired(actionsSource, /activateExecuteRecoveryRuntimeState\(/);
+  const comparePatchLease = indexOfRequired(actionsSource, /patchRecoveryLeaseIdentityMatches\(/);
+  const countPatchLeaseRetry = indexOfRequired(actionsSource, /registerExecuteRecoveryProtocolNoProgress\(/);
   const activateRecoveryLog = indexOfRequired(actionsSource, /execute_recovery_activated/);
   const chatSynthesis = indexOfRequired(actionsSource, /activateChatFinalSynthesisState\(/);
   const chatSynthesisLog = indexOfRequired(actionsSource, /chat_final_synthesis_activated/);
@@ -42,6 +50,9 @@ test("loop runtime actions keep recovery telemetry next to the state mutation", 
   const clearRecoveryLog = indexOfRequired(actionsSource, /execute_recovery_cleared/);
 
   assert.ok(activateRecovery < activateRecoveryLog);
+  assert.ok(comparePatchLease < activateRecovery);
+  assert.ok(comparePatchLease < countPatchLeaseRetry);
+  assert.ok(countPatchLeaseRetry < activateRecoveryLog);
   assert.ok(chatSynthesis < chatSynthesisLog);
   assert.ok(clearRecovery < clearRecoveryLog);
 });

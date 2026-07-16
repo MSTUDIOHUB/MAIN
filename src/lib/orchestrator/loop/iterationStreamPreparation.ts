@@ -99,6 +99,13 @@ export interface IterationStreamPreparationResult {
   streamRuntimeState: AgentLoopStreamRuntimeState;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
   executeRecoveryIterationAdvance: ReturnType<typeof advanceExecuteRecoveryRuntimeIteration>;
+  recoveryPause: {
+    message: string;
+    previousMode: ExecuteRecoveryRuntimeState["mode"];
+    expectedTarget: string | null;
+    phaseNoProgressCount: number;
+    protocolNoProgressCount: number;
+  } | null;
   finalTextOnlyStep: boolean;
   toolSurfaceDecision: IterationToolSurfaceDecision;
   managedAgentMessages: AgentMessage[];
@@ -124,6 +131,7 @@ export async function prepareIterationStreamRequest(input: {
   toolExecutionRuntimeState: Pick<AgentLoopToolExecutionRuntimeState, "fileReadStates">;
   iterationContext: Pick<TurnIterationContext, "eventTurnId" | "turnContext">;
   turnInputContextSignals: TurnInputContextSignals;
+  latestUserPromptText?: string;
   recentToolActivity: PlanToolActivitySummary[];
   recentPlanToolActivity: PlanToolActivitySummary[];
   lastAssistantTextForCheckpoint: string;
@@ -150,6 +158,7 @@ export async function prepareIterationStreamRequest(input: {
     toolExecutionRuntimeState,
     iterationContext,
     turnInputContextSignals,
+    latestUserPromptText = "",
     recentToolActivity,
     recentPlanToolActivity,
     lastAssistantTextForCheckpoint,
@@ -197,14 +206,29 @@ export async function prepareIterationStreamRequest(input: {
   let executeRecoveryIterationAdvance =
     advanceExecuteRecoveryRuntimeIteration(input.executeRecoveryState);
   let executeRecoveryState = executeRecoveryIterationAdvance.state;
+  let recoveryPause: IterationStreamPreparationResult["recoveryPause"] = null;
   if (executeRecoveryIterationAdvance.reachedMaxIterations) {
+    const exhaustedState = executeRecoveryState;
+    const pauseMessage = buildExecuteRecoveryMaxIterationsPrompt({
+      language: callbacks.getPreferredLanguage(),
+      maxIterations: executeRecoveryIterationAdvance.maxIterations,
+    });
     logAgentEvent("execute_recovery_max_iterations_reached", {
       iteration,
       executeRecoveryMode: executeRecoveryState.mode,
       executeRecoveryAttempts: executeRecoveryState.attempts,
       recoveryIterationCount: executeRecoveryState.iterationCount,
+      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+      protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
       maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
     });
+    recoveryPause = {
+      message: pauseMessage,
+      previousMode: exhaustedState.mode,
+      expectedTarget: exhaustedState.expectedTarget,
+      phaseNoProgressCount: exhaustedState.phaseNoProgressCount,
+      protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
+    };
     executeRecoveryState = clearExecuteRecovery(
       "max_recovery_iterations_reached",
       undefined,
@@ -214,13 +238,6 @@ export async function prepareIterationStreamRequest(input: {
       ...executeRecoveryIterationAdvance,
       state: executeRecoveryState,
     };
-    callbacks.appendMessage({
-      role: "system",
-      content: buildExecuteRecoveryMaxIterationsPrompt({
-        language: MODEL_CONTROL_LANGUAGE,
-        maxIterations: executeRecoveryIterationAdvance.maxIterations,
-      }),
-    });
   }
 
   const recoverySourceContract = resolveExecuteRecoveryActionContract(executeRecoveryState.mode, {
@@ -229,6 +246,8 @@ export async function prepareIterationStreamRequest(input: {
     sourceObservationKey: executeRecoveryState.sourceObservationKey,
     decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
     phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+    protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+    protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
   });
   if (
     executeRecoveryState.sourceObservationKey &&
@@ -313,6 +332,8 @@ export async function prepareIterationStreamRequest(input: {
     executeRecoveryReadLease: executeRecoveryState.readLease,
     executeRecoverySourceObservationKey: executeRecoveryState.sourceObservationKey,
     executeRecoveryDecisionCheckpoint: executeRecoveryState.decisionCheckpoint,
+    executeRecoveryProtocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+    executeRecoveryProtocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
     recoveryIterationCount: executeRecoveryState.iterationCount,
     maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
     ...approvedPlanRecoveryState,
@@ -320,6 +341,7 @@ export async function prepareIterationStreamRequest(input: {
     recentPlanToolActivity,
     ...planRuntimeState,
     turnInputContextSignals,
+    latestUserPromptText,
     lastAssistantTextForCheckpoint,
   });
   applySystemPromptForRuntime(runtimeIntent, toolSurfaceDecision.iterationAllTools);
@@ -455,6 +477,7 @@ export async function prepareIterationStreamRequest(input: {
     streamRuntimeState,
     executeRecoveryState,
     executeRecoveryIterationAdvance,
+    recoveryPause,
     finalTextOnlyStep,
     toolSurfaceDecision,
     managedAgentMessages,

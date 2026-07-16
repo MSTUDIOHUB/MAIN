@@ -114,7 +114,10 @@ function buildApprovedPlanContinuationForRemainingTasks(input: {
     availableToolNames,
   });
 
-  if (validationBoundary === "browser_prompt") {
+  if (
+    validationBoundary === "browser_prompt" ||
+    validationBoundary === "pause_browser_unavailable"
+  ) {
     return buildBrowserValidationContinuationPrompt({ language, remainingText });
   }
 
@@ -251,11 +254,30 @@ export function handleApprovedPlanFinalization(input: {
     : baseFinalPlanAudit;
   const evidenceClosureAudit = buildExecuteEvidenceClosureAudit({
     ledger: callbacks.getPlanExecutionEvidenceLedger(),
-    validationExpected: finalValidationBoundary !== "pause_external_validation",
+    validationExpected: true,
   });
   const activeRecoveryPending = Boolean(
     input.executeRecoveryState && input.executeRecoveryState.mode !== "normal",
   );
+  if (
+    finalPlanAudit.totalCount > 0 &&
+    finalPlanAudit.acceptedCompletion &&
+    !evidenceClosureAudit.completionAllowed &&
+    !activeRecoveryPending
+  ) {
+    // The shared pre-completion phase owns exact capability selection. Do not
+    // emit a generic Plan reprompt here: returning "none" lets the caller
+    // atomically activate finite validation, PTY observation, browser action,
+    // or reconciliation before any final text is committed.
+    logAgentEvent("plan_completion_evidence_recovery_delegated", {
+      iteration,
+      evidenceClosureGap: evidenceClosureAudit.gap,
+      mutations: evidenceClosureAudit.mutationCount,
+      validations: evidenceClosureAudit.validationCount,
+      unsatisfiedObligations: evidenceClosureAudit.unsatisfiedObligationCount,
+    });
+    return finish("none");
+  }
   if (
     finalPlanAudit.totalCount === 0 ||
     !finalPlanAudit.acceptedCompletion ||

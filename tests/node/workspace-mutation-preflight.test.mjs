@@ -157,3 +157,63 @@ test("apply_patch preflight blocks invalid, no-op, and mismatched patches before
 
   assert.equal(valid.ok, true);
 });
+
+test("patch mismatch preflight carries target, range, and current-version identity", async () => {
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/main.js",
+    "@@ -205,52 +205,52 @@",
+    "-stale toolbar block",
+    "+fixed toolbar block",
+    "*** End Patch",
+  ].join("\n");
+  const result = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: { patch },
+    language: "en",
+    readFile: async () => "current toolbar block\n",
+    readFileMetadata: async () => ({
+      sizeBytes: 8192,
+      modifiedMs: 1700000000000,
+    }),
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.patchRecoveryMismatch?.target, "src/main.js");
+  assert.deepEqual(result.patchRecoveryMismatch?.requestedRange, {
+    startLine: 205,
+    endLine: 256,
+    maxLines: 52,
+  });
+  assert.equal(result.patchRecoveryMismatch?.observedVersion, "8192:1700000000000");
+  assert.match(
+    result.patchRecoveryMismatch?.mismatchFingerprint || "",
+    /^patch_mismatch::src\/main\.js::invalid_patch$/,
+  );
+
+  const same = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: { patch },
+    language: "en",
+    readFile: async () => "current toolbar block\n",
+    readFileMetadata: async () => ({ sizeBytes: 8192, modifiedMs: 1700000000000 }),
+  });
+  assert.equal(
+    same.patchRecoveryMismatch?.mismatchFingerprint,
+    result.patchRecoveryMismatch?.mismatchFingerprint,
+    "the same target and mismatch kind must retain one stable identity",
+  );
+
+  const changedPatchSameSnapshot = await preflightWorkspaceMutation({
+    toolName: "apply_patch",
+    args: { patch: patch.replace("stale toolbar block", "different stale block") },
+    language: "en",
+    readFile: async () => "current toolbar block\n",
+    readFileMetadata: async () => ({ sizeBytes: 8192, modifiedMs: 1700000000000 }),
+  });
+  assert.equal(
+    changedPatchSameSnapshot.patchRecoveryMismatch?.mismatchFingerprint,
+    result.patchRecoveryMismatch?.mismatchFingerprint,
+    "changing patch prose alone must not mint another read lease for the same snapshot",
+  );
+});

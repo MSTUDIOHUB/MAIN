@@ -39,6 +39,38 @@ export interface ApprovedPlanMutationScopeDecision {
   unexpectedTargets: string[];
 }
 
+export interface ApprovedPlanScopeConflictIdentity {
+  planRevision: number | null;
+  unexpectedTargets: string[];
+  plannedTargets: string[];
+}
+
+function normalizeScopeIdentityTargets(values: string[]): string[] {
+  return Array.from(new Set(
+    (values || []).map(normalizePath).filter(Boolean),
+  )).sort();
+}
+
+/**
+ * Identify one approved-Plan scope conflict independently of the mutation tool
+ * the model happened to choose. Recovery counters must survive a switch from
+ * write_file to apply_patch (or another editor) when the reviewed revision,
+ * blocked target, and allowed scope are unchanged.
+ */
+export function buildApprovedPlanScopeConflictFingerprint(
+  input: ApprovedPlanScopeConflictIdentity,
+): string {
+  const revision = input.planRevision == null
+    ? null
+    : Math.max(1, Math.floor(Number(input.planRevision) || 1));
+  return JSON.stringify({
+    kind: "approved_plan_scope_conflict",
+    revision,
+    blocked: normalizeScopeIdentityTargets(input.unexpectedTargets),
+    planned: normalizeScopeIdentityTargets(input.plannedTargets),
+  });
+}
+
 /**
  * Enforce the approved Plan as an execution scope, not merely a prompt.  The
  * model may choose how to implement a task, but workspace mutations

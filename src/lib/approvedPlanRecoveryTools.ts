@@ -130,17 +130,6 @@ export function resolveApprovedPlanPatchRecoveryTarget(
   return null;
 }
 
-export function shouldBypassApprovedPlanReadCacheForPatchRecovery(input: {
-  toolName: string;
-  allowFileRead: boolean;
-  target: string;
-  recentActivity: ApprovedPlanRecoveryActivityLike[];
-}): boolean {
-  if (input.toolName !== "read_file" || !input.allowFileRead) return false;
-  const recoveryTarget = resolveApprovedPlanPatchRecoveryTarget(input.recentActivity);
-  return recoveryTarget !== null && workspacePathsReferToSameFile(input.target, recoveryTarget);
-}
-
 export function isApprovedPlanRecoveryToolName(
   name: string,
   readOnlyTools: Set<string>,

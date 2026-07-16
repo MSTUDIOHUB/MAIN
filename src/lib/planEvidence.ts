@@ -7,6 +7,7 @@ import {
 import {
   normalizePlanEvidenceValue,
   requiresPtyObservationForPlanCommand,
+  type BrowserInteractionEvidence,
   type PlanExecutionEvidenceEntry,
 } from "./workflowModels";
 import type { ToolDiffPreview } from "./toolDiff";
@@ -802,6 +803,19 @@ export function browserResultLooksSuccessful(result: string): boolean {
       const record = parsed as Record<string, unknown>;
       if (record.ok === false || record.success === false) return false;
       if (typeof record.error === "string" && record.error.trim()) return false;
+      if (Array.isArray(record.pageErrors) && record.pageErrors.some((item) => String(item || "").trim())) {
+        return false;
+      }
+      if (Array.isArray(record.consoleErrors) && record.consoleErrors.some((item) => String(item || "").trim())) {
+        return false;
+      }
+      if (Array.isArray(record.actions)) {
+        const failedAction = record.actions.some((item) =>
+          item && typeof item === "object" &&
+          ((item as Record<string, unknown>).ok === false || (item as Record<string, unknown>).success === false)
+        );
+        if (failedAction) return false;
+      }
       if (Array.isArray(record.assertions)) {
         return !record.assertions.some((item) =>
           item && typeof item === "object" && (item as Record<string, unknown>).passed === false
@@ -812,6 +826,133 @@ export function browserResultLooksSuccessful(result: string): boolean {
     // Plain-text adapters are accepted unless they carry a clear failure marker.
   }
   return !/(?:"ok"\s*:\s*false|"success"\s*:\s*false|browser validation failed|assertion failed|DEV_SERVER_NOT_READY|REPEATED_FAILURE_BLOCKED|navigation timeout|timed?\s*out|page (?:runtime )?error|error:)/i.test(result);
+}
+
+function structuredStringList(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => String(item || "").trim())
+    .filter(Boolean)
+    .slice(0, 50);
+}
+
+/** Parse the browser adapter result without inferring success from prose. */
+export function parseBrowserInteractionEvidence(result: string): BrowserInteractionEvidence | null {
+  try {
+    const parsed = JSON.parse(result);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+    const record = parsed as Record<string, unknown>;
+    const actions = Array.isArray(record.actions)
+      ? record.actions.flatMap((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+          const action = item as Record<string, unknown>;
+          const kind = String(action.kind || action.type || "").trim();
+          const target = String(action.target || action.value || action.selector || "").trim();
+          if (!kind && !target) return [];
+          const beforeState = action.beforeState && typeof action.beforeState === "object" && !Array.isArray(action.beforeState)
+            ? action.beforeState as BrowserInteractionEvidence["actions"][number]["beforeState"]
+            : null;
+          const afterState = action.afterState && typeof action.afterState === "object" && !Array.isArray(action.afterState)
+            ? action.afterState as BrowserInteractionEvidence["actions"][number]["afterState"]
+            : null;
+          return [{
+            ...(String(action.id || "").trim() ? { id: String(action.id).trim() } : {}),
+            kind: kind || "action",
+            target,
+            succeeded: action.ok === true || action.success === true,
+            ...(beforeState ? { beforeState } : {}),
+            ...(afterState ? { afterState } : {}),
+            ...(typeof action.stateChanged === "boolean" ? { stateChanged: action.stateChanged } : {}),
+            ...(Array.isArray(action.changedFields)
+              ? { changedFields: action.changedFields.map((field) => String(field || "").trim()).filter(Boolean).slice(0, 24) }
+              : {}),
+            ...(Array.isArray(action.nativeChangedFields)
+              ? { nativeChangedFields: action.nativeChangedFields.map((field) => String(field || "").trim()).filter(Boolean).slice(0, 24) }
+              : {}),
+            ...(Array.isArray(action.effectChangedFields)
+              ? { effectChangedFields: action.effectChangedFields.map((field) => String(field || "").trim()).filter(Boolean).slice(0, 24) }
+              : {}),
+            ...(typeof action.effectStateChanged === "boolean"
+              ? { effectStateChanged: action.effectStateChanged }
+              : {}),
+          }];
+        }).slice(0, 50)
+      : [];
+    const assertions = Array.isArray(record.assertions)
+      ? record.assertions.flatMap((item) => {
+          if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+          const assertion = item as Record<string, unknown>;
+          const kind = String(assertion.kind || assertion.type || "").trim();
+          const target = String(assertion.target || assertion.value || assertion.selector || "").trim();
+          if (!kind && !target) return [];
+          const detail = String(assertion.detail || "").trim();
+          return [{
+            kind: kind || "assertion",
+            target,
+            passed: assertion.passed === true,
+            ...(detail ? { detail } : {}),
+            ...(String(assertion.afterActionId || assertion.actionId || "").trim()
+              ? { afterActionId: String(assertion.afterActionId || assertion.actionId).trim() }
+              : {}),
+            ...(typeof assertion.beforePassed === "boolean"
+              ? { beforePassed: assertion.beforePassed }
+              : {}),
+            ...(typeof assertion.changedAfterAction === "boolean"
+              ? { changedAfterAction: assertion.changedAfterAction }
+              : {}),
+            ...(typeof assertion.causallyLinked === "boolean"
+              ? { causallyLinked: assertion.causallyLinked }
+              : {}),
+          }];
+        }).slice(0, 50)
+      : [];
+    return {
+      actions,
+      assertions,
+      pageErrors: structuredStringList(record.pageErrors),
+      consoleErrors: structuredStringList(record.consoleErrors),
+    };
+  } catch {
+    return null;
+  }
+}
+
+type StructuredAutomationOutcome = "verified" | "failed" | "unverified";
+
+function resolveStructuredDesktopAutomationOutcome(result: string): StructuredAutomationOutcome {
+  try {
+    const parsed = JSON.parse(result);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unverified";
+    const record = parsed as Record<string, unknown>;
+    const actions = Array.isArray(record.actions)
+      ? record.actions.filter((item): item is Record<string, unknown> =>
+          !!item && typeof item === "object" && !Array.isArray(item)
+        )
+      : [];
+    const assertions = Array.isArray(record.assertions)
+      ? record.assertions.filter((item): item is Record<string, unknown> =>
+          !!item && typeof item === "object" && !Array.isArray(item)
+        )
+      : [];
+    const hasExplicitFailure =
+      record.ok === false ||
+      record.success === false ||
+      Boolean(String(record.error || "").trim()) ||
+      actions.some((action) => action.ok === false || action.success === false) ||
+      assertions.some((assertion) => assertion.passed === false) ||
+      structuredStringList(record.pageErrors).length > 0 ||
+      structuredStringList(record.consoleErrors).length > 0;
+    if (hasExplicitFailure) return "failed";
+    const hasVerifiedEnvelope =
+      (record.ok === true || record.success === true) &&
+      actions.length > 0 &&
+      actions.every((action) => action.ok === true || action.success === true) &&
+      assertions.length > 0 &&
+      assertions.every((assertion) => assertion.passed === true);
+    return hasVerifiedEnvelope ? "verified" : "unverified";
+  } catch {
+    return "unverified";
+  }
 }
 
 export function isPlanExecutionEvidenceTool(toolName: string, target: string): boolean {
@@ -840,6 +981,203 @@ function extractWorkspaceFileReferences(...values: string[]): string[] {
     }
   }
   return references;
+}
+
+const INTERACTION_SOURCE_PATH_RE = /\.(?:[cm]?[jt]sx?|vue|svelte|html?)$/i;
+const INTERACTION_SOURCE_SYNTAX_RE = /(?:\baddEventListener\s*\(|\bon[A-Z][\w$]*\s*=|\.on(?:click|change|input|submit|keydown|keyup|pointer\w*|mouse\w*|touch\w*)\s*=)/;
+const INTERACTION_CONTROL_ID_SYNTAX_RE = /<(?:button|input|select|textarea|a)\b[^>]*\bid\s*=\s*["'`][^"'`]+["'`]/i;
+const INTERACTION_HANDLER_NAME_RE = /^(?:on[A-Z_$][\w$]*|handle[A-Z_$][\w$]*|[\w$]*(?:Handler|Callback|Listener))$/;
+
+interface SourceFunctionRegion {
+  name: string;
+  start: number;
+  end: number;
+  source: string;
+}
+
+function findClosingBrace(source: string, openingIndex: number): number {
+  let depth = 0;
+  let quote = "";
+  let escaped = false;
+  let lineComment = false;
+  let blockComment = false;
+  for (let index = openingIndex; index < source.length; index += 1) {
+    const current = source[index];
+    const next = source[index + 1] || "";
+    if (lineComment) {
+      if (current === "\n") lineComment = false;
+      continue;
+    }
+    if (blockComment) {
+      if (current === "*" && next === "/") {
+        blockComment = false;
+        index += 1;
+      }
+      continue;
+    }
+    if (quote) {
+      if (escaped) {
+        escaped = false;
+      } else if (current === "\\") {
+        escaped = true;
+      } else if (current === quote) {
+        quote = "";
+      }
+      continue;
+    }
+    if (current === "/" && next === "/") {
+      lineComment = true;
+      index += 1;
+      continue;
+    }
+    if (current === "/" && next === "*") {
+      blockComment = true;
+      index += 1;
+      continue;
+    }
+    if (current === "'" || current === '"' || current === "`") {
+      quote = current;
+      continue;
+    }
+    if (current === "{") depth += 1;
+    if (current === "}") {
+      depth -= 1;
+      if (depth === 0) return index + 1;
+    }
+  }
+  return source.length;
+}
+
+function findSourceFunctionRegions(source: string): SourceFunctionRegion[] {
+  const patterns = [
+    /\bfunction\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g,
+    /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>\s*\{/g,
+    /(?:^|\n)\s*(?:async\s+)?([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{/g,
+  ];
+  const excludedNames = new Set(["if", "for", "while", "switch", "catch", "with"]);
+  const regions: SourceFunctionRegion[] = [];
+  const seen = new Set<string>();
+  for (const pattern of patterns) {
+    for (const match of source.matchAll(pattern)) {
+      const name = String(match[1] || "");
+      if (!name || excludedNames.has(name)) continue;
+      const matchStart = match.index || 0;
+      const openingIndex = source.indexOf("{", matchStart + String(match[0] || "").lastIndexOf("{"));
+      if (openingIndex < 0) continue;
+      const end = findClosingBrace(source, openingIndex);
+      const key = `${matchStart}:${end}:${name}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      regions.push({ name, start: matchStart, end, source: source.slice(matchStart, end) });
+    }
+  }
+  return regions;
+}
+
+function changedNewLineOffsets(before: string, after: string): number[] {
+  const beforeLines = new Set(String(before || "").split(/\r?\n/));
+  const lines = String(after || "").split(/\r?\n/);
+  const offsets: number[] = [];
+  let offset = 0;
+  for (const line of lines) {
+    if (!beforeLines.has(line)) offsets.push(offset);
+    offset += line.length + 1;
+  }
+  if (offsets.length > 0 || before === after) return offsets;
+  let prefix = 0;
+  while (prefix < before.length && prefix < after.length && before[prefix] === after[prefix]) prefix += 1;
+  return [prefix];
+}
+
+function collectInteractionTargets(source: string, output: Set<string>): void {
+  for (const match of source.matchAll(/\bgetElementById\s*\(\s*["'`]([^"'`]+)["'`]/g)) {
+    const value = String(match[1] || "").trim();
+    if (value) {
+      output.add(value);
+      output.add(`#${value}`);
+    }
+  }
+  for (const match of source.matchAll(/\bquerySelector(?:All)?\s*\(\s*["'`]([^"'`]+)["'`]/g)) {
+    const value = String(match[1] || "").trim();
+    if (value) output.add(value);
+  }
+  for (const match of source.matchAll(/\bid\s*=\s*["'`]([^"'`]+)["'`]/g)) {
+    const value = String(match[1] || "").trim();
+    if (value) {
+      output.add(value);
+      output.add(`#${value}`);
+    }
+  }
+}
+
+function collectHandlerRegistrationTargets(source: string, handlerName: string, output: Set<string>): void {
+  const escapedName = handlerName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const references = [
+    new RegExp(`\\baddEventListener\\s*\\([\\s\\S]{0,180}?,\\s*${escapedName}\\b`, "g"),
+    new RegExp(`\\bon[A-Z][\\w$]*\\s*=\\s*\\{?\\s*${escapedName}\\b`, "g"),
+    new RegExp(`\\.on(?:click|change|input|submit|keydown|keyup|pointer\\w*|mouse\\w*|touch\\w*)\\s*=\\s*${escapedName}\\b`, "g"),
+  ];
+  for (const pattern of references) {
+    for (const match of source.matchAll(pattern)) {
+      const start = Math.max(0, (match.index || 0) - 240);
+      const end = Math.min(source.length, (match.index || 0) + String(match[0] || "").length + 80);
+      collectInteractionTargets(source.slice(start, end), output);
+    }
+  }
+}
+
+function deriveInteractionMutationEvidence(input: {
+  target: string;
+  diff?: ToolDiffPreview;
+}): { interactionMutation: boolean; interactionBehaviorTargets: string[] } {
+  const sourcePath = String(input.diff?.path || input.target || "").trim();
+  if (!input.diff || !INTERACTION_SOURCE_PATH_RE.test(sourcePath)) {
+    return { interactionMutation: false, interactionBehaviorTargets: [] };
+  }
+  const before = String(input.diff.old || "");
+  const after = String(input.diff.new || "");
+  if (!after || before === after) {
+    return { interactionMutation: false, interactionBehaviorTargets: [] };
+  }
+  const changedOffsets = changedNewLineOffsets(before, after);
+  const beforeLines = new Set(before.split(/\r?\n/));
+  const changedLines = after.split(/\r?\n/).filter((line) => !beforeLines.has(line));
+  const changedSource = changedLines.join("\n");
+  const bindingHandlerNames = new Set<string>();
+  for (const match of after.matchAll(/\baddEventListener\s*\(\s*[^,]+,\s*([A-Za-z_$][\w$]*)/g)) {
+    bindingHandlerNames.add(String(match[1] || ""));
+  }
+  for (const match of after.matchAll(/\bon[A-Z][\w$]*\s*=\s*\{?\s*([A-Za-z_$][\w$]*)/g)) {
+    bindingHandlerNames.add(String(match[1] || ""));
+  }
+
+  const targets = new Set<string>();
+  let interactionMutation =
+    INTERACTION_SOURCE_SYNTAX_RE.test(changedSource) ||
+    INTERACTION_CONTROL_ID_SYNTAX_RE.test(changedSource);
+  if (interactionMutation) collectInteractionTargets(changedSource, targets);
+
+  for (const region of findSourceFunctionRegions(after)) {
+    const containsChangedLine = changedOffsets.some((offset) => offset >= region.start && offset < region.end);
+    if (!containsChangedLine) continue;
+    const regionOwnsInteraction =
+      INTERACTION_SOURCE_SYNTAX_RE.test(region.source) ||
+      INTERACTION_HANDLER_NAME_RE.test(region.name) ||
+      bindingHandlerNames.has(region.name);
+    if (!regionOwnsInteraction) continue;
+    interactionMutation = true;
+    collectInteractionTargets(region.source, targets);
+    if (bindingHandlerNames.has(region.name)) {
+      // The actionable selector commonly lives at the unchanged registration
+      // site while the changed behavior lives in the referenced handler body.
+      collectHandlerRegistrationTargets(after, region.name, targets);
+    }
+  }
+
+  return {
+    interactionMutation,
+    interactionBehaviorTargets: Array.from(targets).slice(0, 80),
+  };
 }
 
 export function createPlanExecutionEvidenceEntry(input: {
@@ -882,10 +1220,15 @@ export function createPlanExecutionEvidenceEntry(input: {
     const changedIdentifiers = Array.from(new Set(
       Array.from(changedText.matchAll(/[A-Za-z_$][\w$-]*/g), (match) => match[0]),
     )).slice(0, 200);
+    const interaction = deriveInteractionMutationEvidence({ target, diff: input.diff });
     return {
       ...base,
       kind: "file",
       ...(changedIdentifiers.length > 0 ? { changedIdentifiers } : {}),
+      ...(interaction.interactionMutation ? { interactionMutation: true } : {}),
+      ...(interaction.interactionBehaviorTargets.length > 0
+        ? { interactionBehaviorTargets: interaction.interactionBehaviorTargets }
+        : {}),
     };
   }
   if (COMMAND_EVIDENCE_TOOLS.has(input.toolName)) {
@@ -965,11 +1308,34 @@ export function createPlanExecutionEvidenceEntry(input: {
     };
   }
   if (sourceToolLooksLikeBrowserAutomation(input.toolName)) {
-    if (!browserResultLooksSuccessful(input.result)) return null;
+    const browserInteraction = parseBrowserInteractionEvidence(input.result);
+    const interactionWithIdentity = browserInteraction
+      ? { ...browserInteraction, evidenceId: base.id }
+      : null;
+    if (!browserResultLooksSuccessful(input.result)) {
+      return {
+        ...base,
+        kind: "tool",
+        observationStatus: "failed",
+        ...(interactionWithIdentity ? { browserInteraction: interactionWithIdentity } : {}),
+      };
+    }
     const screenshot = /screenshot|snapshot|capture/i.test(input.toolName) || /screenshot|image|png|jpeg|webp/i.test(input.result);
-    return { ...base, kind: screenshot ? "browser_screenshot" : "browser_dom" };
+    return {
+      ...base,
+      kind: screenshot ? "browser_screenshot" : "browser_dom",
+      ...(interactionWithIdentity ? { browserInteraction: interactionWithIdentity } : {}),
+    };
   }
-  if (sourceToolLooksLikeTauriAutomation(input.toolName)) return { ...base, kind: "tauri_required" };
+  if (sourceToolLooksLikeTauriAutomation(input.toolName)) {
+    const outcome = resolveStructuredDesktopAutomationOutcome(input.result);
+    return {
+      ...base,
+      kind: "tool",
+      ...(outcome === "verified" ? { automaticValidation: true } : {}),
+      ...(outcome === "failed" ? { observationStatus: "failed" as const } : {}),
+    };
+  }
   if (VERIFICATION_EVIDENCE_TOOLS.has(input.toolName)) {
     return { ...base, kind: commandLooksLikeDevServerOrHttpProbe(target) ? "dev_server_url" : "tool" };
   }

@@ -42,6 +42,7 @@ export type PlanQualityRecoveryResult = {
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses: number;
+  planEvidenceProgressFingerprint: string;
   planArtifactQualityRejected: boolean;
   pendingPlanRuntimeRecoveryPrompt: string | null;
 };
@@ -72,6 +73,7 @@ type PlanQualityRecoveryInput = {
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses?: number;
+  planEvidenceProgressFingerprint?: string;
   setPlanRuntimePhase: (
     phase: PlanRuntimePhase,
     reason?: string,
@@ -93,6 +95,56 @@ function isPlanArtifactQualityRejectionResult(
 function evidenceRecoveryResultProvidesNewEvidence(result: ToolExecutionResult): boolean {
   if (result.isError) return false;
   return !isReadOnlyNoProgressDetail(result.displayContent || result.content || "");
+}
+
+type PlanEvidenceProgressState = {
+  bundleHash: string;
+  coverageKeys: Set<string>;
+};
+
+function parsePlanEvidenceProgressFingerprint(value: string): PlanEvidenceProgressState {
+  if (!value) return { bundleHash: "", coverageKeys: new Set() };
+  try {
+    const parsed = JSON.parse(value) as { bundleHash?: unknown; coverageKeys?: unknown };
+    return {
+      bundleHash: typeof parsed.bundleHash === "string" ? parsed.bundleHash : "",
+      coverageKeys: new Set(
+        Array.isArray(parsed.coverageKeys)
+          ? parsed.coverageKeys.filter((item): item is string => typeof item === "string" && !!item)
+          : [],
+      ),
+    };
+  } catch {
+    // Old snapshots stored only a bundle hash. Treat it as the semantic
+    // baseline and rebuild structured coverage from later fresh reads.
+    return { bundleHash: value, coverageKeys: new Set() };
+  }
+}
+
+function buildPlanEvidenceProgressFingerprint(input: PlanEvidenceProgressState): string {
+  return JSON.stringify({
+    bundleHash: input.bundleHash,
+    // Set preserves insertion order; retain the most recent identities so a
+    // newly observed window cannot be discarded merely by lexical sorting.
+    coverageKeys: Array.from(input.coverageKeys).slice(-64),
+  });
+}
+
+function collectFreshPlanReadCoverageKeys(results: ToolExecutionResult[]): string[] {
+  return Array.from(new Set(results.flatMap((result) => {
+    if (result.name !== "read_file" || result.isError) return [];
+    const detail = String(result.displayContent || result.content || "");
+    if (isReadOnlyNoProgressDetail(detail)) return [];
+    const observation = result.readFileObservation;
+    if (!observation || observation.source !== "fresh") return [];
+    return [
+      observation.key || [
+        observation.path,
+        observation.versionToken,
+        observation.requestSignature,
+      ].join("::"),
+    ];
+  })));
 }
 
 export function shouldPauseForReviewablePlanArtifactAfterToolResults(input: {
@@ -135,6 +187,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
   let planEvidenceRecoveryObjective = input.planEvidenceRecoveryObjective ?? "none";
   let planEvidenceRecoveryPasses = input.planEvidenceRecoveryPasses;
   let planEvidenceNoProgressPasses = input.planEvidenceNoProgressPasses ?? 0;
+  let planEvidenceProgressFingerprint = input.planEvidenceProgressFingerprint ?? "";
   let planArtifactQualityRejected = input.planArtifactQualityRejected === true;
   let pendingPlanRuntimeRecoveryPrompt: string | null = null;
   const hasOutstandingEvidenceRecoveryRead =
@@ -173,6 +226,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     planEvidenceRecoveryObjective,
     planEvidenceRecoveryPasses,
     planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint,
     planArtifactQualityRejected,
     pendingPlanRuntimeRecoveryPrompt,
   });
@@ -269,6 +323,15 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       changeTargets: qualityClosureEvidence.evidenceBundle.changeTargets.length,
     });
     if (shouldRequestTargetedEvidenceAfterQualityGate) {
+      const baselineFingerprint = qualityClosureEvidence.evidenceBundle.hash;
+      const progressState = parsePlanEvidenceProgressFingerprint(
+        planEvidenceProgressFingerprint,
+      );
+      if (progressState.bundleHash !== baselineFingerprint) {
+        progressState.bundleHash = baselineFingerprint;
+        planEvidenceProgressFingerprint = buildPlanEvidenceProgressFingerprint(progressState);
+        planEvidenceNoProgressPasses = 0;
+      }
       planClosureEvidenceRecoveryIssued = true;
       planEvidenceRecoveryObjective = "deterministic_closure";
       setQualityPhase(
@@ -333,6 +396,8 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     // proves that the persisted artifact has passed the gate.
     planArtifactQualityRejected = false;
     planEvidenceRecoveryObjective = "none";
+    planEvidenceNoProgressPasses = 0;
+    planEvidenceProgressFingerprint = "";
     planLastQualityGateReason = "";
     planLastMissingSections = [];
   }
@@ -365,7 +430,33 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     const recoveredModelDraftReady = isPlanEvidenceBundleReady(
       recoveredModelDraftInput.evidenceBundle,
     );
-    if (planEvidenceRecoveryObjective === "model_draft" && hasSuccessfulEvidence) {
+    const recoveredEvidenceBundleHash = recoveredModelDraftInput.evidenceBundle.hash;
+    const previousProgressState = parsePlanEvidenceProgressFingerprint(
+      planEvidenceProgressFingerprint,
+    );
+    const freshCoverageKeys = collectFreshPlanReadCoverageKeys(
+      evidenceRecoveryBatchResults,
+    );
+    const newCoverageKeys = freshCoverageKeys.filter(
+      (key) => !previousProgressState.coverageKeys.has(key),
+    );
+    const semanticEvidenceAdvanced =
+      hasSuccessfulEvidence &&
+      (
+        !previousProgressState.bundleHash ||
+        previousProgressState.bundleHash !== recoveredEvidenceBundleHash
+      );
+    const readCoverageAdvanced = newCoverageKeys.length > 0;
+    const decisionEvidenceAdvanced =
+      hasSuccessfulEvidence &&
+      (semanticEvidenceAdvanced || readCoverageAdvanced);
+    const nextProgressState: PlanEvidenceProgressState = {
+      bundleHash: recoveredEvidenceBundleHash,
+      coverageKeys: new Set(previousProgressState.coverageKeys),
+    };
+    freshCoverageKeys.forEach((key) => nextProgressState.coverageKeys.add(key));
+    const nextProgressFingerprint = buildPlanEvidenceProgressFingerprint(nextProgressState);
+    if (planEvidenceRecoveryObjective === "model_draft" && decisionEvidenceAdvanced) {
       // The finalization surface was reopened for one model-requested read.
       // Completing that transaction must use the same model-draft threshold
       // that originally closed the surface. Requiring deterministic closure
@@ -374,6 +465,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       const recoveredClosureAssessment = assessPlanClosureEvidence(
         recoveredModelDraftInput.evidenceBundle,
       );
+      planEvidenceProgressFingerprint = nextProgressFingerprint;
       planEvidenceNoProgressPasses = 0;
       logAgentEvent("plan_evidence_recovery_assessed", {
         iteration,
@@ -383,6 +475,10 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         closureReady: recoveredClosureAssessment.ready,
         closureReason: recoveredClosureAssessment.reason,
         resultProvidedNewEvidence: hasSuccessfulEvidence,
+        semanticEvidenceAdvanced,
+        readCoverageAdvanced,
+        newCoverageKeys,
+        evidenceBundleHash: recoveredEvidenceBundleHash,
         recoveryBudgetRemaining: true,
         semanticFacts: recoveredModelDraftInput.evidenceBundle.facts.length,
         changeTargets: recoveredModelDraftInput.evidenceBundle.changeTargets.length,
@@ -409,8 +505,9 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           trigger: "closed_read_request",
         });
       }
-    } else if (hasSuccessfulEvidence) {
+    } else if (decisionEvidenceAdvanced) {
       planEvidenceRecoveryPasses += 1;
+      planEvidenceProgressFingerprint = nextProgressFingerprint;
       planEvidenceNoProgressPasses = 0;
       const recoveredClosureInput = collectPlanClosureMaterializationInput(
         callbacks,
@@ -439,6 +536,10 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         contractMismatchMatches: recoveredClosureAssessment.contractMismatchMatches,
         contractMismatchKinds: recoveredClosureAssessment.contractMismatchKinds,
         unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
+        semanticEvidenceAdvanced,
+        readCoverageAdvanced,
+        newCoverageKeys,
+        evidenceBundleHash: recoveredEvidenceBundleHash,
         recoveryBudgetRemaining,
         semanticFacts: recoveredClosureInput.evidenceBundle.facts.length,
         changeTargets: recoveredClosureInput.evidenceBundle.changeTargets.length,
@@ -470,6 +571,11 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         });
       }
     } else if (evidenceRecoveryBatchResults.some((result) => !result.isError)) {
+      // Persist the current semantic/coverage baseline even when this batch did
+      // not advance it. Some recovery entry points can begin without a prior
+      // fingerprint; leaving it empty would let a later unchanged read claim
+      // the same bundle as first-time progress.
+      planEvidenceProgressFingerprint = nextProgressFingerprint;
       planEvidenceNoProgressPasses += 1;
       const recoveredClosureInput = collectPlanClosureMaterializationInput(
         callbacks,
@@ -490,6 +596,11 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         noProgressPass: planEvidenceNoProgressPasses,
         maxNoProgressPasses: MAX_PLAN_EVIDENCE_NO_PROGRESS_PASSES,
         evidenceRecoveryPasses: planEvidenceRecoveryPasses,
+        rawReadProvidedContent: hasSuccessfulEvidence,
+        semanticEvidenceAdvanced,
+        readCoverageAdvanced,
+        newCoverageKeys,
+        evidenceBundleHash: recoveredEvidenceBundleHash,
         closureReason: recoveredClosureAssessment.reason,
         unresolvedContractKinds: recoveredClosureAssessment.unresolvedContractKinds,
         repeatedTargets: avoidTargets,
@@ -535,6 +646,9 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         });
       }
     } else {
+      // Failed reads still observe the current semantic baseline. Preserve it
+      // so changing only the tool result shape cannot reset the progress gate.
+      planEvidenceProgressFingerprint = nextProgressFingerprint;
       // A wrong path or transient read failure is not proof that the Plan is
       // impossible. Treat it as a no-progress transaction, allow one different
       // target/owner, and only block after the bounded retry also fails.

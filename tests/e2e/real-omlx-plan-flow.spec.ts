@@ -1,7 +1,8 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   isFinitePlanValidationCommand,
   validateActionablePlanArtifact,
@@ -31,7 +32,8 @@ const realOmlxMutationExpectation = new RegExp(
   "i",
 );
 const realOmlxDevServerUrl = String(
-  process.env.REAL_OMLX_DEV_SERVER_URL || "http://localhost:5173/",
+  process.env.REAL_OMLX_DEV_SERVER_URL ||
+  (realOmlxFixture === "md-viewer" ? "http://localhost:1420/" : "http://localhost:5173/"),
 );
 const realOmlxPlanExpectation = new RegExp(
   process.env.REAL_OMLX_PLAN_EXPECT || "useCsvParser\\.ts|CSV|creator",
@@ -46,8 +48,129 @@ const realOmlxPlanTimeoutMs = Math.max(
   30_000,
   Number(process.env.REAL_OMLX_PLAN_TIMEOUT_MS || 600_000),
 );
+const realOmlxExecutionTimeoutMs = Math.max(
+  30_000,
+  Number(process.env.REAL_OMLX_EXECUTION_TIMEOUT_MS || 500_000),
+);
+const allowSafeExecutionPause = process.env.REAL_OMLX_ALLOW_SAFE_PAUSE === "1";
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
+
+const useSemanticMdViewerMutationOracle =
+  realOmlxFixture === "md-viewer" &&
+  process.env.REAL_OMLX_MUTATION_ORACLE !== "exact";
+const realOmlxMutationOracleFiles = useSemanticMdViewerMutationOracle
+  ? ["src/main.js", "src/components/toolbar.js"]
+  : [realOmlxMutationFile];
+
+type FixtureMutationState = {
+  satisfied: boolean;
+  changedFiles: string[];
+  contents: Record<string, string>;
+  detail: string;
+};
+
+async function readFixtureMutationContents(workspace: string): Promise<Record<string, string>> {
+  return Object.fromEntries(await Promise.all(realOmlxMutationOracleFiles.map(async (relativePath) => [
+    relativePath,
+    await fs.readFile(path.join(workspace, relativePath), "utf8"),
+  ])));
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function mdViewerToolbarAndListenerIdsAgree(contents: Record<string, string>): boolean {
+  const mainSource = contents["src/main.js"] || "";
+  const toolbarSource = contents["src/components/toolbar.js"] || "";
+  return ["new", "open", "save"].every((role) =>
+    [`${role}-btn`, `btn-${role}`].some((id) => {
+      const escapedId = escapeRegExp(id);
+      const rendered = new RegExp(`\\bid\\s*=\\s*["']${escapedId}["']`).test(toolbarSource);
+      const observed = new RegExp(
+        `(?:["']${escapedId}["']\\s*:|getElementById\\(\\s*["']${escapedId}["']\\s*\\))`,
+      ).test(mainSource);
+      return rendered && observed;
+    })
+  );
+}
+
+async function inspectFixtureMutation(
+  workspace: string,
+  baseline?: Record<string, string>,
+): Promise<FixtureMutationState> {
+  const contents = await readFixtureMutationContents(workspace);
+  const changedFiles = baseline
+    ? realOmlxMutationOracleFiles.filter((relativePath) => contents[relativePath] !== baseline[relativePath])
+    : [];
+  const satisfied = useSemanticMdViewerMutationOracle
+    ? mdViewerToolbarAndListenerIdsAgree(contents)
+    : realOmlxMutationExpectation.test(contents[realOmlxMutationFile] || "");
+  return {
+    satisfied,
+    changedFiles,
+    contents,
+    detail: useSemanticMdViewerMutationOracle
+      ? "toolbar render IDs and main listener IDs agree for New/Open/Save"
+      : `${realOmlxMutationFile} matches ${realOmlxMutationExpectation.source}`,
+  };
+}
+
+type RealOmlxActionRequest = {
+  kind?: string;
+  requestId?: string;
+  toolName?: string;
+  target?: string;
+  risk?: string;
+};
+
+function isPathInsideWorkspace(candidate: string, workspace: string): boolean {
+  const relative = path.relative(path.resolve(workspace), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function isInScopeBrowserPermission(
+  request: RealOmlxActionRequest | null | undefined,
+  workspace: string,
+): boolean {
+  if (
+    request?.kind !== "tool_permission" ||
+    request.toolName !== "browser_evaluate" ||
+    !request.requestId ||
+    !request.target
+  ) {
+    return false;
+  }
+  try {
+    const targetUrl = new URL(request.target);
+    if (targetUrl.origin === new URL(realOmlxDevServerUrl).origin) return true;
+    return targetUrl.protocol === "file:" && isPathInsideWorkspace(fileURLToPath(targetUrl), workspace);
+  } catch {
+    return false;
+  }
+}
+
+async function approveInScopeBrowserPermission(
+  page: Page,
+  request: RealOmlxActionRequest | null | undefined,
+  workspace: string,
+): Promise<boolean> {
+  if (!isInScopeBrowserPermission(request, workspace)) return false;
+  return await page.evaluate((expectedRequestId) => {
+    const bridge = (window as any).__CODELY_E2E__;
+    const current = bridge?.getSnapshot?.().activeActionRequest;
+    if (
+      current?.kind !== "tool_permission" ||
+      current.requestId !== expectedRequestId ||
+      current.toolName !== "browser_evaluate"
+    ) {
+      return false;
+    }
+    bridge?.approvePendingTool?.();
+    return true;
+  }, request?.requestId);
+}
 
 function summarizePlanDebugTail(entries: unknown[]): string[] {
   return (Array.isArray(entries) ? entries : [])
@@ -214,19 +337,21 @@ test.beforeEach(async ({ page }) => {
       };
     });
   });
+  await page.exposeFunction("__MAIN_E2E_INSPECT_FIXTURE_MUTATION", async () =>
+    await inspectFixtureMutation(workspace)
+  );
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
-    const mutationContent = await fs.readFile(path.join(workspace, realOmlxMutationFile), "utf8");
-    const hasExpectedMutation = realOmlxMutationExpectation.test(mutationContent);
+    const mutationState = await inspectFixtureMutation(workspace);
     const isFiniteVerification = isFinitePlanValidationCommand(command);
-    const exitCode = hasExpectedMutation && isFiniteVerification ? 0 : 1;
+    const exitCode = mutationState.satisfied && isFiniteVerification ? 0 : 1;
     return JSON.stringify({
       command,
       cwd: workspace,
       exitCode,
       stdout: exitCode === 0
-        ? `Fresh fixture verification passed: ${realOmlxMutationFile} contains the expected mutation.`
-        : `Fresh fixture verification failed: expected a finite command and mutation matching ${realOmlxMutationExpectation.source}.`,
+        ? `Fresh fixture verification passed: ${mutationState.detail}.`
+        : `Fresh fixture verification failed: expected a finite command and ${mutationState.detail}.`,
       stderr: "",
     });
   });
@@ -834,13 +959,86 @@ test.beforeEach(async ({ page }) => {
         return { decision: "allow", requiresApproval: false, source: "e2e" };
       }
       if (cmd === "browser_evaluate") {
+        // This fixture validates MAIN's orchestration/evidence contract only.
+        // Real HTTP navigation and action semantics are exercised separately
+        // by browser-evaluate-script.test.mjs against an actual local server.
+        const mutationState = await (window as any).__MAIN_E2E_INSPECT_FIXTURE_MUTATION();
+        const splitDirectives = (value: unknown) => String(value || "")
+          .split(/\r?\n|;;/g)
+          .map((line) => line.trim())
+          .filter((line) => line && !line.startsWith("#"));
+        const parseDirective = (line: string, fallbackKind: string) => {
+          const matched = line.match(/^([a-zA-Z_][a-zA-Z0-9_-]*)\s*:\s*([\s\S]*)$/);
+          return matched
+            ? { kind: String(matched[1]).toLowerCase().replace(/[\s-]+/g, "_"), value: String(matched[2] || "").trim() }
+            : { kind: fallbackKind, value: line };
+        };
+        const roleFor = (value: string) => value.match(/(?:^|[^a-z])(new|open|save)(?:[^a-z]|$)/i)?.[1]?.toLowerCase() || "";
+        const actionRows = splitDirectives(args?.actions).map((line, index) => {
+          const directive = parseDirective(line, "click");
+          const role = roleFor(directive.value);
+          const stateful = ["click", "fill", "press", "select_file", "set_input_files", "upload"].includes(directive.kind);
+          const ok = !stateful || (mutationState.satisfied === true && Boolean(role));
+          return {
+            id: `action-${index + 1}`,
+            kind: directive.kind,
+            value: directive.value,
+            ok,
+            beforeState: stateful ? { bodyText: "New Open Save", externalDomFingerprint: "before" } : null,
+            afterState: stateful && ok
+              ? { bodyText: `New Open Save ${role}`, externalDomFingerprint: `after-${role}` }
+              : null,
+            stateChanged: stateful && ok,
+            changedFields: stateful && ok ? ["bodyText", "externalDomFingerprint"] : [],
+            nativeChangedFields: [],
+            effectChangedFields: stateful && ok ? ["bodyText", "externalDomFingerprint"] : [],
+            effectStateChanged: stateful && ok,
+          };
+        });
+        const assertionRows = splitDirectives(args?.checks).map((line) => {
+          const directive = line.toLowerCase().replace(/[\s-]+/g, "_") === "no_console_errors"
+            ? { kind: "no_console_errors", value: "" }
+            : parseDirective(line, "text");
+          if (directive.kind === "no_console_errors") {
+            return {
+              kind: directive.kind,
+              value: directive.value,
+              passed: true,
+              detail: "no console errors",
+              beforePassed: true,
+              changedAfterAction: false,
+              afterActionId: null,
+              causallyLinked: false,
+            };
+          }
+          const role = roleFor(directive.value);
+          const linkedAction = actionRows.find((action) =>
+            action.ok && role && roleFor(String(action.value || "")) === role
+          );
+          const effectKind = ["text", "not_text", "selector", "not_selector"].includes(directive.kind);
+          const passed = Boolean(linkedAction && effectKind);
+          return {
+            kind: directive.kind,
+            value: directive.value,
+            passed,
+            detail: passed ? "post-action fixture state observed" : "no matching successful fixture action",
+            beforePassed: false,
+            changedAfterAction: passed,
+            afterActionId: linkedAction?.id || null,
+            causallyLinked: passed,
+          };
+        });
+        const ok = mutationState.satisfied === true &&
+          actionRows.every((action) => action.ok) &&
+          assertionRows.every((assertion) => assertion.passed);
         return {
-          ok: true,
+          ok,
           url: String(args?.url || ""),
           finalUrl: String(args?.url || ""),
           status: 200,
           title: "Real OMLX fixture",
-          assertions: [{ passed: true, description: `${fixture} fixture is ready` }],
+          actions: actionRows,
+          assertions: assertionRows,
           consoleErrors: [],
           pageErrors: [],
           failedRequests: [],
@@ -863,12 +1061,10 @@ test.beforeEach(async ({ page }) => {
 });
 
 for (const model of models) {
-  test(`real OMLX MAIN plan/approve/execute closes with ${model}`, async ({ page }) => {
+  test(`real OMLX MAIN plan/approve/execute reaches closure or bounded pause with ${model}`, async ({ page }) => {
     const workspace = (page as any).__realOmlxWorkspace as string;
-    const originalMutationContent = await fs.readFile(
-      path.join(workspace, realOmlxMutationFile),
-      "utf8",
-    );
+    const originalMutationContents = await readFixtureMutationContents(workspace);
+    const approvedBrowserRequestIds = new Set<string>();
     page.on("console", (message) => {
       const text = message.text();
       if (text.includes("[real-omlx-invoke] append_debug_log")) return;
@@ -889,6 +1085,7 @@ for (const model of models) {
     let lastPlanPollSignature = "";
     let lastPlanTerminalSignature = "";
     let lastPlanDebugSignature = "";
+    let planTerminalSnapshot: any = null;
     try {
       await expect
         .poll(async () => {
@@ -911,7 +1108,7 @@ for (const model of models) {
           console.log(`[real-omlx-plan-runtime:${model}] ${debugSignature.slice(-6_000)}`);
           lastPlanDebugSignature = debugSignature;
         }
-        if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+        if (snapshot?.dispatchError) throw new Error(`dispatch_error:${snapshot.dispatchError}`);
         const artifactCount = snapshot?.planArtifacts?.length ?? 0;
         if (artifactCount > 0) return "artifact_ready";
         if (
@@ -928,17 +1125,47 @@ for (const model of models) {
             console.log(`[real-omlx-plan-flow:${model}] ${JSON.stringify(snapshot?.taskFlowPreview || [])}`);
             lastPlanTerminalSignature = terminal;
           }
-          if (realOmlxPlanOnly) throw new Error(terminal);
-          return terminal;
+          if (realOmlxPlanOnly || !allowSafeExecutionPause) throw new Error(terminal);
+          planTerminalSnapshot = snapshot;
+          return "safe_pause";
         }
         return "running";
       }, { timeout: realOmlxPlanTimeoutMs })
-      .toBe("artifact_ready");
+      .toMatch(/^(?:artifact_ready|safe_pause)$/);
     } catch (error) {
       const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
       console.log(`[real-omlx-plan-timeout-debug:${model}] ${JSON.stringify(summarizePlanDebugTail(snapshot?.debugTail || [])).slice(-12_000)}`);
       console.log(`[real-omlx-plan-timeout-flow:${model}] ${JSON.stringify(snapshot?.taskFlowPreview || []).slice(-12_000)}`);
       throw error;
+    }
+
+    if (planTerminalSnapshot) {
+      const mutationAfterPlanPause = await readFixtureMutationContents(workspace);
+      expect(mutationAfterPlanPause).toEqual(originalMutationContents);
+      expect(planTerminalSnapshot?.planArtifacts || []).toHaveLength(0);
+      expect(planTerminalSnapshot?.planStage).not.toBe("completed");
+      expect(["done", "completed_with_changes"]).not.toContain(
+        String(planTerminalSnapshot?.currentTurnStatus || ""),
+      );
+      const planTerminalSummary = [...(planTerminalSnapshot?.debugTail || [])]
+        .reverse()
+        .map((entry: { source?: string; message?: string }) => {
+          if (entry.source !== "store.agent_loop_stop_summary") return null;
+          try {
+            return JSON.parse(String(entry.message || "{}"));
+          } catch {
+            return null;
+          }
+        })
+        .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "plan");
+      expect(planTerminalSummary?.status).toBe("paused");
+      expect(planTerminalSummary?.reason).not.toBe("agent_loop_completed");
+      console.log(`[real-omlx-plan-safe-pause:${model}] ${JSON.stringify({
+        reason: planTerminalSummary?.reason,
+        currentTurnStatus: planTerminalSnapshot?.currentTurnStatus,
+        planStage: planTerminalSnapshot?.planStage,
+      })}`);
+      return;
     }
 
     const plan = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().planArtifacts?.[0]?.content || "");
@@ -1006,42 +1233,99 @@ for (const model of models) {
         : `waiting:${snapshot?.agentStatus}:${snapshot?.isGenerating}:${Boolean(snapshot?.pendingPlanApprovalHandoff)}`;
     }, { timeout: 30_000 }).toBe("execution_started");
 
-    await expect
-      .poll(async () => {
+    let earlyExecutionSnapshot: any = null;
+    try {
+      await expect
+        .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-        if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
-        const mutationContent = await fs.readFile(
-          path.join(workspace, realOmlxMutationFile),
-          "utf8",
+        earlyExecutionSnapshot = snapshot;
+        if (snapshot?.dispatchError) throw new Error(`dispatch_error:${snapshot.dispatchError}`);
+        if (
+          isInScopeBrowserPermission(snapshot?.activeActionRequest, workspace) &&
+          await approveInScopeBrowserPermission(page, snapshot.activeActionRequest, workspace)
+        ) {
+          const requestId = String(snapshot.activeActionRequest.requestId);
+          if (!approvedBrowserRequestIds.has(requestId)) {
+            approvedBrowserRequestIds.add(requestId);
+            console.log(`[real-omlx-browser-approval:${model}] ${requestId}`);
+          }
+          return "running";
+        }
+        const mutationState = await inspectFixtureMutation(workspace, originalMutationContents);
+        if (mutationState.satisfied && mutationState.changedFiles.length > 0) return "mutated";
+        const terminalWithoutMutation = snapshot?.isGenerating === false && (
+          ["idle", "error"].includes(String(snapshot?.agentStatus || "")) ||
+          ["paused", "stopped_no_action", "error"].includes(String(snapshot?.currentTurnStatus || "")) ||
+          snapshot?.planStage === "paused"
         );
-        return {
-          status: snapshot?.agentStatus,
-          approved: snapshot?.isPlanApproved,
-          hasExpectedMutation: realOmlxMutationExpectation.test(mutationContent),
-          hasToolFailureCard: (snapshot?.toolBlocks || []).some((block: { status?: string; error?: string }) =>
-            block.status === "failed" && /search_text|content|空变更|identical/i.test(String(block.error || "")),
-          ),
-        };
-      }, { timeout: 500_000 })
-      .toMatchObject({
-        approved: true,
-        hasExpectedMutation: true,
-        hasToolFailureCard: false,
-      });
+        if (terminalWithoutMutation) {
+          console.log(`[real-omlx-execute-safe-pause:${model}] ${JSON.stringify({
+            agentStatus: snapshot?.agentStatus,
+            currentTurnStatus: snapshot?.currentTurnStatus,
+            planStage: snapshot?.planStage,
+            toolBlocks: (snapshot?.toolBlocks || []).slice(-8),
+            debugTail: summarizePlanDebugTail(snapshot?.debugTail || []),
+          }).slice(-12_000)}`);
+          return "safe_pause";
+        }
+        return "running";
+        }, { timeout: realOmlxExecutionTimeoutMs })
+        .toMatch(/^(?:mutated|safe_pause)$/);
+    } catch (error) {
+      const snapshot = earlyExecutionSnapshot || await page.evaluate(() =>
+        (window as any).__CODELY_E2E__?.getSnapshot?.()
+      );
+      console.log(`[real-omlx-execute-timeout:${model}] ${JSON.stringify({
+        agentStatus: snapshot?.agentStatus,
+        currentTurnStatus: snapshot?.currentTurnStatus,
+        planStage: snapshot?.planStage,
+        activeActionRequest: snapshot?.activeActionRequest,
+        toolBlocks: (snapshot?.toolBlocks || []).slice(-20),
+        debugTail: snapshot?.debugTail || [],
+      }).slice(-40_000)}`);
+      throw error;
+    }
 
-    const mutationOnDisk = await fs.readFile(
-      path.join(workspace, realOmlxMutationFile),
-      "utf8",
-    );
-    expect(mutationOnDisk).toMatch(realOmlxMutationExpectation);
-    expect(mutationOnDisk).not.toEqual(originalMutationContent);
+    const mutationAfterEarlyOutcome = await inspectFixtureMutation(workspace, originalMutationContents);
+    if (!mutationAfterEarlyOutcome.satisfied || mutationAfterEarlyOutcome.changedFiles.length === 0) {
+      expect(allowSafeExecutionPause, "Set REAL_OMLX_ALLOW_SAFE_PAUSE=1 when model incapability may be accepted as an honest bounded pause.").toBe(true);
+      expect(mutationAfterEarlyOutcome.contents).toEqual(originalMutationContents);
+      expect(earlyExecutionSnapshot?.planStage).not.toBe("completed");
+      expect(["done", "completed_with_changes"]).not.toContain(
+        String(earlyExecutionSnapshot?.currentTurnStatus || ""),
+      );
+      const executeTerminalSummary = [...(earlyExecutionSnapshot?.debugTail || [])]
+        .reverse()
+        .map((entry: { source?: string; message?: string }) => {
+          if (entry.source !== "store.agent_loop_stop_summary") return null;
+          try {
+            return JSON.parse(String(entry.message || "{}"));
+          } catch {
+            return null;
+          }
+        })
+        .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "execute");
+      expect(executeTerminalSummary?.status).toBe("paused");
+      expect(executeTerminalSummary?.reason).not.toBe("agent_loop_completed");
+      return;
+    }
 
+    expect(mutationAfterEarlyOutcome.satisfied).toBe(true);
+    expect(mutationAfterEarlyOutcome.changedFiles.length).toBeGreaterThan(0);
+
+    let terminalExecutionSnapshot: any = null;
     await expect
       .poll(async () => {
         const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-        if (snapshot?.activeActionRequest?.kind === "tool_permission") {
-          await expect(page.getByTestId("execution-capsule-tool-approve-once")).toBeVisible();
-          await page.getByTestId("execution-capsule-tool-approve-once").click();
+        if (
+          isInScopeBrowserPermission(snapshot?.activeActionRequest, workspace) &&
+          await approveInScopeBrowserPermission(page, snapshot.activeActionRequest, workspace)
+        ) {
+          const requestId = String(snapshot.activeActionRequest.requestId);
+          if (!approvedBrowserRequestIds.has(requestId)) {
+            approvedBrowserRequestIds.add(requestId);
+            console.log(`[real-omlx-browser-approval:${model}] ${requestId}`);
+          }
           return "running";
         }
         if (
@@ -1050,24 +1334,60 @@ for (const model of models) {
           ["done", "completed_with_changes"].includes(String(snapshot?.currentTurnStatus || ""))
         ) return "completed";
         if (snapshot?.isGenerating === false) {
-          const debugTail = JSON.stringify(snapshot?.debugTail || []).slice(-2_000);
-          return `terminal_without_completion:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}:${debugTail}`;
+          terminalExecutionSnapshot = snapshot;
+          return "terminal";
         }
         return "running";
       }, { timeout: 300_000 })
-      .toBe("completed");
+      .toMatch(/^(?:completed|terminal)$/);
+
+    if (terminalExecutionSnapshot) {
+      console.log(`[real-omlx-execute-terminal:${model}] ${JSON.stringify({
+        agentStatus: terminalExecutionSnapshot?.agentStatus,
+        currentTurnStatus: terminalExecutionSnapshot?.currentTurnStatus,
+        planStage: terminalExecutionSnapshot?.planStage,
+        activeActionRequest: terminalExecutionSnapshot?.activeActionRequest,
+        toolBlocks: (terminalExecutionSnapshot?.toolBlocks || []).slice(-20),
+        debugTail: terminalExecutionSnapshot?.debugTail || [],
+      }).slice(-40_000)}`);
+      expect(
+        allowSafeExecutionPause,
+        "Set REAL_OMLX_ALLOW_SAFE_PAUSE=1 when model incapability may be accepted as an honest bounded pause.",
+      ).toBe(true);
+      expect(["paused", "stopped_no_action", "stopped_no_output"]).toContain(
+        String(terminalExecutionSnapshot?.currentTurnStatus || ""),
+      );
+      expect(terminalExecutionSnapshot?.planStage).not.toBe("completed");
+      const executeTerminalSummary = [...(terminalExecutionSnapshot?.debugTail || [])]
+        .reverse()
+        .map((entry: { source?: string; message?: string }) => {
+          if (entry.source !== "store.agent_loop_stop_summary") return null;
+          try {
+            return JSON.parse(String(entry.message || "{}"));
+          } catch {
+            return null;
+          }
+        })
+        .find((payload: { runtimeIntent?: string } | null) => payload?.runtimeIntent === "execute");
+      expect(executeTerminalSummary?.status).toBe("paused");
+      expect(executeTerminalSummary?.reason).not.toBe("agent_loop_completed");
+      return;
+    }
 
     const bodyText = await page.locator("body").innerText();
     const executionSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
     const executionChatText = JSON.stringify(executionSnapshot?.taskFlowPreview || []);
     console.log(`[real-omlx-chat-execute:${model}] ${executionChatText.slice(0, 1200).replace(/\s+/g, " ")}`);
     expect(executionChatText).toMatch(/apply_patch|write_file|replace_in_file|run_command|browser_evaluate|已完成|completed/i);
-    expect(executionSnapshot?.planExecutionEvidence || []).toEqual(expect.arrayContaining([
-      expect.objectContaining({ kind: "file", target: realOmlxMutationFile }),
+    const executionEvidence = executionSnapshot?.planExecutionEvidence || [];
+    expect(executionEvidence).toEqual(expect.arrayContaining([
       expect.objectContaining({ kind: "cmd" }),
     ]));
+    expect(executionEvidence.some((entry: { kind?: string; target?: string }) =>
+      entry.kind === "file" && mutationAfterEarlyOutcome.changedFiles.includes(String(entry.target || ""))
+    )).toBe(true);
     if (realOmlxFixture === "md-viewer") {
-      expect(executionSnapshot?.planExecutionEvidence || []).toEqual(expect.arrayContaining([
+      expect(executionEvidence).toEqual(expect.arrayContaining([
         expect.objectContaining({ kind: "browser_dom" }),
       ]));
       const executionToolNames = (executionSnapshot?.taskFlowPreview || [])

@@ -369,11 +369,21 @@ test("local recovery tool choice follows the contract next capability, not the l
     devServerStatus: "running",
     devServerNextCapability: "observe_pty",
   });
-  assert.deepEqual(resolveRecoveryToolChoice({
+  assert.equal(resolveRecoveryToolChoice({
     ...common,
     recoveryActionContract: observePty,
-    llmToolNames: ["read_pty_since", "get_pty_status"],
-  }), { type: "function", function: { name: "read_pty_since" } });
+    llmToolNames: ["send_pty_input", "read_pty_tail", "read_pty_since", "get_pty_status"],
+  }), "required");
+
+  const recoverProcess = resolveExecuteRecoveryActionContract("action_plus_targeting", {
+    devServerStatus: "failed",
+    devServerNextCapability: "launch",
+  });
+  assert.equal(resolveRecoveryToolChoice({
+    ...common,
+    recoveryActionContract: recoverProcess,
+    llmToolNames: ["read_pty_tail", "run_command", "execute_command"],
+  }), "required");
 
   const browser = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     devServerStatus: "ready",

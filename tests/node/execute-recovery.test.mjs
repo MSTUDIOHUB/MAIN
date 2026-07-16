@@ -66,12 +66,16 @@ const {
   compactStructuredCommandResult,
   buildExecuteRecoveryPrompt,
   buildExecuteValidationRecoveryPrompt,
+  buildExecutePatchMismatchFingerprint,
+  buildPatchRecoveryReadNoProgressFingerprint,
   describeExecuteRecoveryToolSurface,
   failedFiniteValidationMatchesPendingPlanEvidence,
   hasPendingPlanCommandEvidence,
   isExecutePatchMismatchRecoveryActivity,
   isExecuteRecoveryToolName,
   isReadOnlyNoProgressDetail,
+  patchRecoveryLeaseIdentityMatches,
+  readEvidenceSatisfiesRecoveryLease,
   resolveExecuteRecoveryActionContract,
   resolveExecuteRecoveryBatchDecision,
   resolveExecuteReadOnlyRecoveryTrigger,
@@ -79,7 +83,6 @@ const {
   resolveFailedFiniteValidationRecoveryPolicy,
   resolveReadOnlyNoProgressTrigger,
   shouldAllowExecuteRecoveryFileRead,
-  shouldBypassExecuteReadCacheForPatchRecovery,
   shouldEnterFailedFiniteValidationRecovery,
   shouldUseExecutePatchRecoveryReadLease,
   summarizeRepeatedExecuteTargets,
@@ -120,6 +123,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
 
 const {
+  findDelegatedObservationRequiringParentReread,
   partitionToolCallsForExecution,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"));
 const {
@@ -140,6 +144,8 @@ const {
   buildExecuteRecoverySourceContextMessage,
   resolveRecoverySourceContextFreshness,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/contextManagement.ts"));
+
+const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
 
 const {
   approvedPlanNeedsSourceEditBeforeValidation,
@@ -783,6 +789,8 @@ test("one recovery contract atomically advances long-running validation from PTY
   assert.equal(pending.surfaceDescription, "pty_observation_only");
   assert.equal(pending.ptyGeneration, 4);
   assert.equal(pending.allowedToolNames.has("get_pty_status"), true);
+  assert.equal(pending.allowedToolNames.has("read_pty_tail"), true);
+  assert.equal(pending.allowedToolNames.has("send_pty_input"), true);
   assert.equal(pending.allowedToolNames.has("browser_evaluate"), false);
   assert.equal(pending.allowedToolNames.has("read_file"), false);
   const pendingBatch = resolveExecuteRecoveryBatchDecision({
@@ -794,6 +802,16 @@ test("one recovery contract atomically advances long-running validation from PTY
     ],
   });
   assert.equal(pendingBatch.selectedCallId, "observe");
+
+  const interactiveBatch = resolveExecuteRecoveryBatchDecision({
+    mode: "action_plus_targeting",
+    contract: pending,
+    calls: [
+      { id: "answer-prompt", name: "send_pty_input", target: "y" },
+      { id: "tail-after-input", name: "read_pty_tail", target: "terminal tail" },
+    ],
+  });
+  assert.equal(interactiveBatch.selectedCallId, "answer-prompt");
 
   const ready = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     devServerStatus: "ready",
@@ -817,6 +835,57 @@ test("one recovery contract atomically advances long-running validation from PTY
     ],
   });
   assert.equal(readyBatch.selectedCallId, "browser");
+
+  const failed = resolveExecuteRecoveryActionContract("action_plus_targeting", {
+    expectedTarget: "src/App.tsx",
+    devServerStatus: "failed",
+    devServerNextCapability: "launch",
+  });
+  assert.equal(failed.phase, "reconcile");
+  assert.equal(failed.nextRequiredCapability, "recover_process");
+  assert.equal(failed.surfaceDescription, "dev_server_failure_recovery");
+  assert.equal(failed.allowTargetedFileRead, true);
+  for (const name of [
+    "read_pty_tail",
+    "read_pty_since",
+    "get_pty_status",
+    "read_file",
+    "apply_patch",
+    "run_command",
+    "execute_command",
+  ]) {
+    assert.equal(failed.allowedToolNames.has(name), true, `${name} should remain available after failure`);
+  }
+  assert.equal(failed.allowedToolNames.has("send_pty_input"), false);
+  const stopped = resolveExecuteRecoveryActionContract("validation_only", {
+    expectedTarget: "src/App.tsx",
+    devServerStatus: "stopped",
+    devServerNextCapability: "launch",
+  });
+  assert.equal(stopped.nextRequiredCapability, "recover_process");
+  assert.equal(stopped.allowedToolNames.has("read_pty_tail"), true);
+  assert.equal(stopped.allowedToolNames.has("run_command"), true);
+  assert.equal(stopped.allowedToolNames.has("execute_command"), true);
+  const failedBatch = resolveExecuteRecoveryBatchDecision({
+    mode: "action_plus_targeting",
+    expectedTarget: "src/App.tsx",
+    contract: failed,
+    calls: [
+      { id: "restart-too-soon", name: "execute_command", target: "npm run dev" },
+      { id: "read-error", name: "read_pty_tail", target: "terminal tail" },
+      { id: "repair", name: "apply_patch", target: "src/App.tsx" },
+    ],
+  });
+  assert.equal(failedBatch.selectedCallId, "read-error");
+
+  const portConflict = resolveExecuteRecoveryActionContract("validation_only", {
+    devServerStatus: "failed",
+    devServerNextCapability: "reconcile",
+  });
+  assert.equal(portConflict.nextRequiredCapability, "reconcile_server");
+  assert.equal(portConflict.allowedToolNames.has("read_pty_tail"), true);
+  assert.equal(portConflict.allowedToolNames.has("run_command"), true);
+  assert.equal(portConflict.allowedToolNames.has("execute_command"), false);
 });
 
 test("approved Plan source-edit gate is task-targeted and accepts matching MCP evidence", () => {
@@ -1861,11 +1930,419 @@ test("an actual patch mismatch opens one context-read phase before mutation reco
   assert.deepEqual(decision.iterationAllTools.map((tool) => tool.function.name), ["read_file"]);
 });
 
+test("adaptive delegation exposes spawn only during useful context or diagnosis phases", () => {
+  const tools = ["read_file", "spawn_subagent", "wait_subagents", "apply_patch"].map((name) => ({
+    type: "function",
+    function: { name, description: name, parameters: { type: "object", properties: {} } },
+  }));
+  const makeInput = (overrides = {}) => ({
+    callbacks: {
+      getConfig: () => ({ workspace: "/workspace" }),
+      getIsPlanApproved: () => false,
+      getPlanTasks: () => [],
+      getPlanExecutionEvidenceLedger: () => [],
+      getMessages: () => [],
+      getPlanStage: () => "idle",
+      getPendingSubagentIds: () => [],
+    },
+    iteration: 1,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    rawIterationAllTools: tools,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    executeRecoveryAttempts: 0,
+    recoveryIterationCount: 0,
+    maxRecoveryIterations: 6,
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    approvedPlanNoProgressRecoveryAttempts: 0,
+    approvedPlanLongReasoningNoActionCount: 0,
+    recentToolActivity: [],
+    recentPlanToolActivity: [],
+    planRuntimePhase: "idle",
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+    },
+    lastAssistantTextForCheckpoint: "",
+    latestUserPromptText: "可以开启多个 subagent 协同检查",
+    ...overrides,
+  });
+
+  const context = resolveIterationToolSurface(makeInput());
+  assert.equal(context.delegationDecision.action, "admit");
+  assert.equal(context.delegationDecision.phase, "context");
+  assert.equal(context.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
+
+  const mutation = resolveIterationToolSurface(makeInput({
+    recentToolActivity: [
+      {
+        name: "apply_patch",
+        target: "src/main.js",
+        status: "succeeded",
+      },
+      {
+        name: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+      },
+    ],
+  }));
+  assert.equal(mutation.delegationDecision.action, "defer");
+  assert.equal(mutation.delegationDecision.phase, "mutation");
+  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
+  assert.equal(mutation.iterationAllTools.some((tool) => tool.function.name === "wait_subagents"), true);
+
+  const validation = resolveIterationToolSurface(makeInput({
+    recentToolActivity: [
+      {
+        name: "run_command",
+        target: "npm test",
+        status: "succeeded",
+      },
+      {
+        name: "read_file",
+        target: "src/main.js",
+        status: "succeeded",
+      },
+    ],
+  }));
+  assert.equal(validation.delegationDecision.phase, "validation");
+  assert.equal(validation.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
+
+  const simple = resolveIterationToolSurface(makeInput({
+    latestUserPromptText: "读取 src/main.js",
+  }));
+  assert.equal(simple.delegationDecision.reason, "insufficient_independent_scope");
+  assert.equal(simple.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
+});
+
+test("parent mutation requires every delegated source window, not only the latest one", () => {
+  const laterWindowContent = "parent observed lines 80 through 100";
+  const delegated = (startLine, endLine, key) => ({
+    name: "read_file",
+    target: "src/main.js",
+    status: "succeeded",
+    delegatedObservation: {
+      owner: { agentKind: "subagent", subagentId: "subagent-euler" },
+      sourceObservationKey: key,
+      sourceVersion: "v1",
+      sourceRange: { startLine, endLine, totalLines: 120, truncated: true },
+      parentContextState: "reference_only",
+      requiresParentReread: true,
+    },
+  });
+  const missing = findDelegatedObservationRequiringParentReread({
+    mutationTargets: ["src/main.js"],
+    recentToolActivity: [
+      delegated(1, 20, "src/main.js:1-20:v1"),
+      delegated(80, 100, "src/main.js:80-100:v1"),
+    ],
+    fileReadStates: new Map([[
+      "read_file::src/main.js::80-100",
+      {
+        signature: "read_file::src/main.js::80-100",
+        path: "src/main.js",
+        argsKey: "80-100",
+        contentHash: "later",
+        contentLength: laterWindowContent.length,
+        sizeBytes: 1200,
+        modifiedMs: 1,
+        modelContent: laterWindowContent,
+        observation: {
+          key: "src/main.js:80-100:v1",
+          path: "src/main.js",
+          requestSignature: "read_file::src/main.js::80-100",
+          versionToken: "v1",
+          source: "fresh",
+        },
+        window: { startLine: 80, endLine: 100, totalLines: 120, truncated: true },
+        updatedAt: 1,
+      },
+    ]]),
+    managedAgentMessages: [{ role: "tool", content: laterWindowContent }],
+  });
+
+  assert.equal(missing?.delegatedObservation?.sourceObservationKey, "src/main.js:1-20:v1");
+});
+
+test("plan checklist length is telemetry, not an independent-scope admission signal", () => {
+  const tools = ["read_file", "spawn_subagent", "wait_subagents"].map((name) => ({
+    type: "function",
+    function: { name, description: name, parameters: { type: "object", properties: {} } },
+  }));
+  const decision = resolveIterationToolSurface({
+    callbacks: {
+      getConfig: () => ({ workspace: "/workspace" }),
+      getIsPlanApproved: () => false,
+      getPlanTasks: () => Array.from({ length: 5 }, (_, index) => ({
+        id: `task-${index}`,
+        text: `Inspect item ${index}`,
+        status: "pending",
+      })),
+      getPlanExecutionEvidenceLedger: () => [],
+      getMessages: () => [],
+      getPlanStage: () => "requirements",
+      getPendingSubagentIds: () => [],
+    },
+    iteration: 2,
+    workflowMode: "plan",
+    runtimeIntent: "plan",
+    rawIterationAllTools: tools,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    executeRecoveryAttempts: 0,
+    recoveryIterationCount: 0,
+    maxRecoveryIterations: 6,
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    approvedPlanNoProgressRecoveryAttempts: 0,
+    approvedPlanLongReasoningNoActionCount: 0,
+    recentToolActivity: [],
+    recentPlanToolActivity: [],
+    planRuntimePhase: "grounding",
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: {},
+    lastAssistantTextForCheckpoint: "",
+    latestUserPromptText: "Inspect the repository and prepare a plan",
+  });
+
+  assert.equal(decision.delegationDecision.plannedWorkItemCount, 5);
+  assert.equal(decision.delegationDecision.independentScopeCount, 0);
+  assert.equal(decision.delegationDecision.action, "defer");
+  assert.equal(decision.availableToolNames.has("spawn_subagent"), false);
+});
+
+test("recovery hides new child creation but keeps join available and selects it before phase work", () => {
+  const tools = ["read_file", "spawn_subagent", "wait_subagents", "apply_patch"].map((name) => ({
+    type: "function",
+    function: { name, description: name, parameters: { type: "object", properties: {} } },
+  }));
+  const decision = resolveIterationToolSurface({
+    callbacks: {
+      getConfig: () => ({ workspace: "/workspace" }),
+      getIsPlanApproved: () => false,
+      getPlanTasks: () => [],
+      getPlanExecutionEvidenceLedger: () => [],
+      getMessages: () => [],
+      getPlanStage: () => "idle",
+      getPendingSubagentIds: () => ["subagent-running"],
+    },
+    iteration: 3,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    rawIterationAllTools: tools,
+    executeRecoveryMode: "mutation_first",
+    executeRecoveryReason: "resume_mutation",
+    executeRecoveryAttempts: 1,
+    recoveryIterationCount: 1,
+    maxRecoveryIterations: 6,
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    approvedPlanNoProgressRecoveryAttempts: 0,
+    approvedPlanLongReasoningNoActionCount: 0,
+    recentToolActivity: [],
+    recentPlanToolActivity: [],
+    planRuntimePhase: "idle",
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: {},
+    lastAssistantTextForCheckpoint: "",
+  });
+
+  assert.equal(decision.availableToolNames.has("spawn_subagent"), false);
+  assert.equal(decision.availableToolNames.has("wait_subagents"), true);
+  assert.equal(isExecuteRecoveryToolName("wait_subagents", readOnlyTools, {
+    mode: "mutation_first",
+  }), true);
+  const batch = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [
+      { id: "join", name: "wait_subagents", target: "subagent-running" },
+      { id: "edit", name: "apply_patch", target: "src/App.tsx" },
+    ],
+  });
+  assert.equal(batch.selectedToolName, "wait_subagents");
+  assert.deepEqual(batch.deferredCallIds, ["edit"]);
+});
+
+test("a spawn omitted by adaptive admission is a policy deferral, not a tool failure", async () => {
+  const done = [];
+  const errors = [];
+  const input = createReadFilePartitionInput({
+    toolCalls: [{
+      id: "spawn-deferred",
+      name: "spawn_subagent",
+      arguments: JSON.stringify({
+        objective: "Inspect one simple file",
+        allowed_paths: "src/App.tsx",
+      }),
+    }],
+    availableToolNames: new Set(["read_file"]),
+  });
+  input.callbacks = {
+    ...input.callbacks,
+    onToolDone: (...args) => done.push(args),
+    onToolError: (...args) => errors.push(args),
+  };
+
+  const partitioned = await partitionToolCallsForExecution(input);
+  assert.equal(partitioned.preExecutionResults.length, 1);
+  assert.equal(partitioned.preExecutionResults[0].isError, false);
+  assert.equal(partitioned.preExecutionResults[0].internalFeedback, true);
+  assert.equal(partitioned.preExecutionResults[0].qualityGateReason, "subagent_delegation_deferred");
+  assert.equal(errors.length, 0);
+  assert.equal(done.length, 1);
+  assert.equal(partitioned.toolFailureSignatures?.size || 0, 0);
+});
+
+test("parent access to an active child lease is deferred without incrementing failures", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  subagents.acquireSubagentScopeLease({
+    threadId: "read-cache-test",
+    parentTurnId: "turn-parent-scope",
+    subagentId: "subagent-owner",
+    scopeKey: "app-owner",
+    workspace: workspaceRoot,
+    allowedPaths: ["src/App.tsx"],
+    createdAt: Date.now(),
+  });
+  const done = [];
+  const errors = [];
+  const input = createReadFilePartitionInput();
+  input.callbacks = {
+    ...input.callbacks,
+    onToolDone: (...args) => done.push(args),
+    onToolError: (...args) => errors.push(args),
+  };
+
+  const partitioned = await partitionToolCallsForExecution(input);
+  assert.equal(partitioned.preExecutionResults.length, 1);
+  assert.equal(partitioned.preExecutionResults[0].isError, false);
+  assert.equal(partitioned.preExecutionResults[0].internalFeedback, true);
+  assert.equal(partitioned.preExecutionResults[0].qualityGateReason, "subagent_scope_policy_deferred");
+  assert.match(partitioned.preExecutionResults[0].content, /policy deferral/i);
+  assert.equal(errors.length, 0);
+  assert.equal(done.length, 1);
+  assert.equal(partitioned.toolFailureSignatures?.size || 0, 0);
+  subagents.resetSubagentRuntimeForTests();
+});
+
+test("child-owned source references require a parent-visible targeted read before mutation", async () => {
+  const registry = {
+    tools: {
+      ...partitionToolCapabilityRegistry.tools,
+      write_file: {
+        key: "write_file",
+        name: "write_file",
+        source: "built_in",
+        category: "file",
+        risk: "workspace_write",
+        enabled: true,
+        autoExecutable: false,
+      },
+    },
+    policy: partitionPermissionPolicy,
+  };
+  const delegatedActivity = {
+    name: "read_file",
+    target: "src/App.tsx",
+    status: "succeeded",
+    delegatedObservation: {
+      owner: {
+        agentKind: "subagent",
+        subagentId: "subagent-source-owner",
+        parentTurnId: "turn",
+        runId: "run-child",
+      },
+      sourceToolCallId: "child-read",
+      sourceObservationKey: "child-window",
+      sourceVersion: "120:2",
+      sourceRange: {
+        startLine: 1,
+        endLine: 10,
+        totalLines: 40,
+        truncated: true,
+      },
+      parentContextState: "reference_only",
+      requiresParentReread: true,
+    },
+  };
+  const done = [];
+  const base = createReadFilePartitionInput({
+    toolCalls: [{
+      id: "write-from-child",
+      name: "write_file",
+      arguments: JSON.stringify({ path: "src/App.tsx", content: "updated" }),
+    }],
+    availableToolNames: new Set(["read_file", "write_file"]),
+    toolCapabilityRegistry: registry,
+    recentToolActivity: [delegatedActivity],
+  });
+  base.callbacks = {
+    ...base.callbacks,
+    getAutoApproveToolScopes: () => ["workspace_write"],
+    onToolDone: (...args) => done.push(args),
+  };
+
+  const blocked = await partitionToolCallsForExecution(base);
+  assert.equal(blocked.writeCalls.length, 0);
+  assert.equal(blocked.preExecutionResults[0].qualityGateReason, "subagent_parent_reread_required");
+  assert.equal(blocked.preExecutionResults[0].isError, false);
+  assert.match(blocked.preExecutionResults[0].content, /targeted read_file/i);
+  assert.equal(blocked.toolFailureSignatures.size, 0);
+
+  const modelContent = [
+    "READ_FILE_RESULT",
+    "path: src/App.tsx",
+    "returnedLines: 1-40",
+    "---CONTENT START---",
+    "export const App = () => null;",
+    "---CONTENT END---",
+  ].join("\n");
+  const parentObserved = await partitionToolCallsForExecution({
+    ...base,
+    managedAgentMessages: [{ role: "user", content: modelContent }],
+    fileReadStates: new Map([["parent-window", {
+      signature: "parent-window",
+      path: "src/App.tsx",
+      argsKey: "start=1",
+      contentHash: "parent-hash",
+      contentLength: modelContent.length,
+      sizeBytes: 120,
+      modifiedMs: 2,
+      modelContent,
+      observation: {
+        key: "parent-window",
+        path: "src/App.tsx",
+        requestSignature: "read_file::src/App.tsx::1-40",
+        versionToken: "120:2",
+        source: "fresh",
+      },
+      window: {
+        startLine: 1,
+        endLine: 40,
+        totalLines: 40,
+        truncated: false,
+      },
+      updatedAt: Date.now(),
+    }]]),
+  });
+  assert.equal(parentObserved.preExecutionResults.length, 0);
+  assert.equal(parentObserved.writeCalls.length, 1);
+});
+
 test("iteration tool planning derives action-plus PTY and browser surfaces from the lifecycle ledger", () => {
   const tools = [
     "read_file",
     "apply_patch",
+    "run_command",
     "execute_command",
+    "send_pty_input",
+    "read_pty_buffer",
+    "read_pty_tail",
     "read_pty_since",
     "get_pty_status",
     "browser_evaluate",
@@ -1917,6 +2394,9 @@ test("iteration tool planning derives action-plus PTY and browser surfaces from 
   });
   assert.equal(pending.recoveryActionContract.nextRequiredCapability, "observe_pty");
   assert.deepEqual(pending.iterationAllTools.map((tool) => tool.function.name), [
+    "send_pty_input",
+    "read_pty_buffer",
+    "read_pty_tail",
     "read_pty_since",
     "get_pty_status",
   ]);
@@ -1966,6 +2446,33 @@ test("iteration tool planning derives action-plus PTY and browser surfaces from 
   assert.equal(postMutation.recoveryActionContract.phase, "post_mutation_check");
   assert.equal(postMutation.recoveryActionContract.nextRequiredCapability, "targeted_read");
   assert.deepEqual(postMutation.iterationAllTools.map((tool) => tool.function.name), ["read_file"]);
+
+  const failed = resolveIterationToolSurface({
+    ...baseInput,
+    executeRecoveryExpectedTarget: "src/App.tsx",
+    callbacks: {
+      ...baseInput.callbacks,
+      getPlanExecutionEvidenceLedger: () => [{
+        id: "failed-launch",
+        kind: "cmd",
+        value: "npm run dev",
+        sourceTool: "execute_command",
+        observationStatus: "failed",
+        createdAt: 3,
+      }],
+    },
+  });
+  assert.equal(failed.recoveryActionContract.nextRequiredCapability, "recover_process");
+  assert.deepEqual(failed.iterationAllTools.map((tool) => tool.function.name), [
+    "read_file",
+    "apply_patch",
+    "run_command",
+    "execute_command",
+    "read_pty_buffer",
+    "read_pty_tail",
+    "read_pty_since",
+    "get_pty_status",
+  ]);
 });
 
 function createApprovedPlanToolSurfaceInput(overrides = {}) {
@@ -2384,24 +2891,6 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
     true,
   );
   assert.equal(resolveExecutePatchRecoveryTarget(recent), "src/App.tsx");
-  assert.equal(shouldBypassExecuteReadCacheForPatchRecovery({
-    toolName: "read_file",
-    allowFileRead: true,
-    target: "./src/App.tsx",
-    recentActivity: recent,
-  }), true, "relative aliases should resolve to the patch target");
-  assert.equal(shouldBypassExecuteReadCacheForPatchRecovery({
-    toolName: "read_file",
-    allowFileRead: true,
-    target: "/tmp/workspace/src/App.tsx",
-    recentActivity: recent,
-  }), true, "absolute workspace aliases should resolve to the patch target");
-  assert.equal(shouldBypassExecuteReadCacheForPatchRecovery({
-    toolName: "read_file",
-    allowFileRead: true,
-    target: "src/index.html",
-    recentActivity: recent,
-  }), false, "a patch mismatch may bypass cache only for its own target");
   assert.equal(resolveExecutePatchRecoveryTarget([
     ...recent,
     { name: "read_file", status: "succeeded", target: "src/App.tsx", detail: "READ_FILE_RESULT" },
@@ -2423,16 +2912,73 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
     toolName: "read_file",
     allowFileRead: true,
     target: "src/App.tsx",
-    recentActivity: recent,
+    activeReadLease: {
+      purpose: "patch_recovery",
+      target: "src/App.tsx",
+      state: "available",
+    },
     leaseClaimed: false,
   }), true);
   assert.equal(shouldUseExecutePatchRecoveryReadLease({
     toolName: "read_file",
     allowFileRead: true,
     target: "src/App.tsx",
-    recentActivity: recent,
+    activeReadLease: {
+      purpose: "patch_recovery",
+      target: "src/App.tsx",
+      state: "available",
+    },
     leaseClaimed: true,
   }), false, "only one same-batch call may claim the targeted cache-bypass lease");
+
+  const mismatchFingerprint = buildExecutePatchMismatchFingerprint({
+    reason: "mutation_preflight_invalid_patch",
+    target: "./src/App.tsx",
+  });
+  assert.equal(
+    buildPatchRecoveryReadNoProgressFingerprint("./src/App.tsx"),
+    "patch_recovery_read::./src/app.tsx::read_file:./src/app.tsx:read_unchanged",
+  );
+  const exactLease = {
+    purpose: "patch_recovery",
+    target: "src/App.tsx",
+    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    observedVersion: "4096:1700000000000",
+    mismatchFingerprint,
+    state: "available",
+  };
+  assert.equal(readEvidenceSatisfiesRecoveryLease({
+    lease: exactLease,
+    target: "/tmp/workspace/src/App.tsx",
+    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    observedVersion: "4096:1700000000000",
+  }), true, "the first exact target/range/version read remains eligible");
+  assert.equal(shouldUseExecutePatchRecoveryReadLease({
+    toolName: "read_file",
+    allowFileRead: true,
+    target: "src/App.tsx",
+    requestedRange: { startLine: 1, endLine: 52, maxLines: 52 },
+    observedVersion: "4096:1700000000000",
+    activeReadLease: exactLease,
+    leaseClaimed: false,
+  }), false, "a different source window cannot claim an exact mismatch lease");
+  assert.equal(shouldUseExecutePatchRecoveryReadLease({
+    toolName: "read_file",
+    allowFileRead: true,
+    target: "src/App.tsx",
+    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    observedVersion: "4097:1700000000001",
+    activeReadLease: exactLease,
+    leaseClaimed: false,
+  }), false, "a different observed file version cannot claim the old lease");
+  assert.equal(patchRecoveryLeaseIdentityMatches(
+    { ...exactLease, state: "consumed" },
+    { ...exactLease, state: "available" },
+  ), true, "the same mismatch identity must not mint a second lease");
+  assert.equal(patchRecoveryLeaseIdentityMatches(
+    { ...exactLease, state: "consumed" },
+    { ...exactLease, observedVersion: "4097:1700000000001", state: "available" },
+  ), false, "new version evidence may mint a distinct lease");
 
   const prompt = buildExecuteRecoveryPrompt({
     language: "zh",
@@ -2484,6 +3030,69 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
     mode: "patch_recovery_read",
     reason: "mutation_preflight_invalid_patch",
     target: "src-tauri/src/main.rs",
+  });
+
+  const mutationFirstDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    isPlanApproved: false,
+    executeRecoveryMode: "mutation_first",
+    executeRecoveryAttempts: 1,
+    results: [{
+      name: "apply_patch",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED: invalid_patch",
+      isError: true,
+    }],
+  });
+  assert.equal(mutationFirstDecision?.mode, "patch_recovery_read");
+  assert.equal(mutationFirstDecision?.target, "src/main.js");
+
+  const accumulatedAttemptDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    isPlanApproved: false,
+    executeRecoveryMode: "mutation_first",
+    executeRecoveryAttempts: 7,
+    results: [{
+      name: "replace_in_file",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED: search_text mismatch",
+      isError: true,
+    }],
+  });
+  assert.equal(
+    accumulatedAttemptDecision?.mode,
+    "patch_recovery_read",
+    "historical recovery activations must not suppress a new target/version mismatch contract",
+  );
+
+  const versionedDecision = resolveDirectMutationPreflightRecovery({
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    isPlanApproved: false,
+    executeRecoveryMode: "normal",
+    executeRecoveryAttempts: 0,
+    results: [{
+      name: "apply_patch",
+      target: "src/main.js",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED: invalid_patch",
+      isError: true,
+      patchRecoveryMismatch: {
+        mismatchFingerprint: "patch_mismatch::src/main.js::invalid_patch::mutation-a1",
+        target: "./src/main.js",
+        requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+        observedVersion: "8192:1700000000000",
+      },
+    }],
+  });
+  assert.deepEqual(versionedDecision, {
+    mode: "patch_recovery_read",
+    reason: "mutation_preflight_invalid_patch",
+    target: "src/main.js",
+    mismatchFingerprint: "patch_mismatch::src/main.js::invalid_patch::mutation-a1",
+    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    observedVersion: "8192:1700000000000",
   });
 
   assert.equal(resolveDirectMutationPreflightRecovery({
@@ -2679,7 +3288,7 @@ test("no-progress markers are recognized only as runtime-owned result prefixes",
   assert.equal(isReadOnlyNoProgressDetail("FILE_UNCHANGED_STUB: src/App.tsx"), true);
   assert.equal(isReadOnlyNoProgressDetail("CACHED_FILE_REPLAY: src/App.tsx"), true);
   assert.equal(isReadOnlyNoProgressDetail("READ_FILE_REPEAT_LIMIT: duplicate"), true);
-  assert.equal(isReadOnlyNoProgressDetail("READ_FILE_WINDOW_NARROWED: returned missing lines"), false);
+  assert.equal(isReadOnlyNoProgressDetail("READ_FILE_WINDOW_NARROWED: returned missing lines"), true);
   assert.equal(isReadOnlyNoProgressDetail([
     "READ_FILE_RESULT",
     "path: src/lib/orchestrator/fileReadCache.ts",
@@ -3104,7 +3713,7 @@ test("execute recovery detects cached reads across changing batch signatures", (
   assert.equal(decision.cachedReadOnlyActivityCount, 3);
 });
 
-test("execute recovery does not mistake a narrowed fresh window for no progress", () => {
+test("a narrowed overlap counts as semantic repetition without blocking a later distinct window", () => {
   const recent = [
     { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "READ_FILE_RESULT lines 1-120" },
     { name: "read_file", status: "succeeded", target: "src/lib/orchestrator/loop/AgentOrchestrator.ts", detail: "READ_FILE_WINDOW_NARROWED: overlapping unchanged lines already in context" },
@@ -3124,7 +3733,7 @@ test("execute recovery does not mistake a narrowed fresh window for no progress"
 
   assert.equal(decision.shouldRecover, false);
   assert.equal(decision.reason, "");
-  assert.equal(decision.repeatedReadOnlyTargetScore, 1);
+  assert.equal(decision.repeatedReadOnlyTargetScore, 2);
 });
 
 test("execute recovery allows many distinct windows even past count and character thresholds", () => {

@@ -1,6 +1,8 @@
 import type { MainModeKey } from "../../mainModes";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
+import type { EffectiveTurnContract } from "../../runIntent";
+import { logAgentEvent } from "../../orchestrator";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { MainThreadEventInput } from "../../turnEvents";
 import type {
@@ -30,6 +32,8 @@ import { applyPlanNoToolRuntimeState, applyPlanRuntimePhase } from "./planRuntim
 import type { TurnIterationContext } from "./turnIterationContext";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
+import { resolvePreCompletionEvidenceRecoveryDecision } from "./preCompletionEvidenceRecovery";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -57,6 +61,7 @@ export async function handleAssistantCompletionPhase(input: {
   workflowMode: WorkflowMode;
   turnIntent: ResolvedUserIntent;
   runtimeIntent: ResolvedUserIntent;
+  effectiveTurnContract: EffectiveTurnContract | null;
   mainModeKey?: MainModeKey;
   commandDirectiveAction?: string | null;
   workspace: string;
@@ -112,6 +117,11 @@ export async function handleAssistantCompletionPhase(input: {
   waitForPlanApprovalIfNeeded: Parameters<typeof handlePlanNoToolRecovery>[0]["waitForPlanApprovalIfNeeded"];
   tryClosePlanWithEvidence: Parameters<typeof handlePlanNoToolRecovery>[0]["tryClosePlanWithEvidence"];
   getExecuteRecoveryState: () => ExecuteRecoveryRuntimeState;
+  activateExecuteRecovery: (
+    mode: Exclude<ExecuteRecoveryMode, "normal">,
+    reason: string,
+    context?: Record<string, unknown>,
+  ) => void;
 }): Promise<AssistantCompletionPhaseResult> {
   let noToolRuntimeState = input.noToolRuntimeState;
   let planRuntimeState = input.planRuntimeState;
@@ -199,6 +209,77 @@ export async function handleAssistantCompletionPhase(input: {
 
   if (effectiveToolCallCount > 0) {
     return finish("completed");
+  }
+
+  // Runtime evidence owns the next action before any prose-based missing-tool
+  // heuristic. A completion-looking sentence cannot redirect a known ledger
+  // gap into a generic reprompt or end the turn.
+  const externalReviewIsAdvisory = Boolean(
+    input.workflowMode === "plan" &&
+    input.approvedPlanAuditForNoTool?.acceptedCompletion &&
+    input.approvedPlanAuditForNoTool.pendingExternalValidation
+  );
+  const currentExecuteRecoveryState = input.getExecuteRecoveryState();
+  const preCompletionRecovery = resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: input.callbacks.getPlanExecutionEvidenceLedger(),
+    // Manual/user review remains an advisory conclusion. It never turns off
+    // the independent post-mutation automatic validation contract.
+    validationExpected: input.effectiveTurnContract?.validationExpected === true,
+    currentRecoveryMode: currentExecuteRecoveryState.mode,
+    availableToolNames: input.availableToolNames,
+  });
+  if (preCompletionRecovery) {
+    input.callbacks.onStreamToken("__ESCALATION_RESET__:evidence_recovery", input.assistantMsgId);
+    input.activateExecuteRecovery(
+      preCompletionRecovery.mode,
+      preCompletionRecovery.reason,
+      {
+        expectedTarget: preCompletionRecovery.expectedTarget,
+        evidenceGap: preCompletionRecovery.gap,
+        nextRequiredCapability: preCompletionRecovery.nextRequiredCapability,
+        decisionCheckpoint: {
+          expectedTarget: preCompletionRecovery.expectedTarget,
+          sourceObservationKey: null,
+          nextRequiredCapability: preCompletionRecovery.nextRequiredCapability,
+        },
+        source: "precompletion_evidence_audit",
+      },
+    );
+    const nextState = input.getExecuteRecoveryState();
+    input.callbacks.onStatusChange("running");
+    const language = input.callbacks.getPreferredLanguage();
+    input.callbacks.appendMessage({
+      role: "system",
+      content: language === "zh"
+        ? `[System: 最终结论暂存，尚未提交。执行证据缺口为 ${preCompletionRecovery.gap}；下一步必须调用 ${preCompletionRecovery.nextRequiredCapability} 能力取得真实证据，再重新核对完成条件。]`
+        : `[System: The final conclusion is being held as a draft. The execution-evidence gap is ${preCompletionRecovery.gap}; next call the ${preCompletionRecovery.nextRequiredCapability} capability, collect real evidence, and re-audit completion.]`,
+    });
+    logAgentEvent("precompletion_evidence_recovery_activated", {
+      iteration: input.iteration,
+      gap: preCompletionRecovery.gap,
+      recoveryMode: nextState.mode,
+      expectedTarget: nextState.expectedTarget,
+      nextRequiredCapability: preCompletionRecovery.nextRequiredCapability,
+      draftChars: input.visibleAssistantText.length,
+      validationExpected: input.effectiveTurnContract?.validationExpected === true,
+      externalReviewIsAdvisory,
+    });
+    return finish("continue");
+  }
+  if (currentExecuteRecoveryState.mode !== "normal") {
+    // The active recovery transaction still owns the next capability. The
+    // resolver deliberately does not reactivate an existing transaction, but
+    // that must never be interpreted as evidence closure or permission to
+    // publish the held final draft.
+    input.callbacks.onStreamToken("__ESCALATION_RESET__:evidence_recovery", input.assistantMsgId);
+    input.callbacks.onStatusChange("running");
+    logAgentEvent("precompletion_evidence_recovery_still_active", {
+      iteration: input.iteration,
+      recoveryMode: currentExecuteRecoveryState.mode,
+      expectedTarget: currentExecuteRecoveryState.expectedTarget,
+      nextRequiredCapability: currentExecuteRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
+    });
+    return finish("continue");
   }
 
   const executeNoToolRecovery = handleExecuteNoToolRecovery({
@@ -371,6 +452,7 @@ export async function handleAssistantCompletionPhase(input: {
     return finish("continue");
   }
 
+  input.callbacks.onStreamToken("__EVIDENCE_DRAFT_COMMIT__:evidence_closed", input.assistantMsgId);
   const finalNoToolAssistantTurn = handleFinalNoToolAssistantTurn({
     callbacks: input.callbacks,
     iteration: input.iteration,

@@ -1,7 +1,12 @@
 import type { HooksConfig } from "../../hooks";
 import {
+  buildPatchRecoveryReadNoProgressFingerprint,
   isReadOnlyNoProgressDetail,
+  readEvidenceSatisfiesRecoveryLease,
+  requestedRangeFromReadObservationSignature,
+  resolveExecuteRecoveryActionContract,
   resolveExecutePatchRecoveryTarget,
+  type ReadProgressFingerprint,
 } from "../../executeRecoveryTools";
 import {
   buildAssistantHistoryMessage,
@@ -34,6 +39,7 @@ import {
 } from "./evidenceRuntimeState";
 import {
   refundExecuteRecoveryRuntimeIteration,
+  registerExecuteRecoveryProtocolNoProgress,
   transitionExecuteRecoveryRuntimeState,
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
@@ -66,6 +72,114 @@ import {
 
 type WorkflowMode = "chat" | "edit" | "plan";
 type ProviderReasoningForHistory = Parameters<typeof buildAssistantHistoryMessage>[1];
+
+function buildReadProgressFingerprint(
+  state: ExecuteRecoveryRuntimeState,
+  result: ToolExecutionResult,
+): ReadProgressFingerprint | null {
+  if (result.name !== "read_file") return null;
+  const detail = String(result.displayContent || result.content || "");
+  const coverageKind = /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(detail)
+    ? "overlap_extension" as const
+    : isReadOnlyNoProgressDetail(detail)
+    ? "same_window" as const
+    : "new_window" as const;
+  const requestedRange = requestedRangeFromReadObservationSignature(
+    result.readFileObservation?.requestSignature || "",
+  );
+  const target = String(result.target || state.expectedTarget || "")
+    .replace(/\\/g, "/")
+    .trim()
+    .toLowerCase();
+  const observedVersion = result.readFileObservation?.versionToken || null;
+  const checkpoint = state.decisionCheckpoint
+    ? { ...state.decisionCheckpoint }
+    : null;
+  const checkpointKey = checkpoint
+    ? [
+        checkpoint.expectedTarget || "",
+        checkpoint.sourceObservationKey || "",
+        checkpoint.nextRequiredCapability,
+        checkpoint.evidenceVersion || "",
+      ].join(":")
+    : "none";
+  const phase = resolveExecuteRecoveryActionContract(state.mode, {
+    expectedTarget: state.expectedTarget,
+    readLease: state.readLease,
+    sourceObservationKey: state.sourceObservationKey,
+    decisionCheckpoint: state.decisionCheckpoint,
+    phaseNoProgressCount: state.phaseNoProgressCount,
+    protocolNoProgressCount: state.protocolNoProgressCount,
+    protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
+  }).phase;
+  const purpose = state.readLease?.purpose || "unleased";
+  return {
+    phase,
+    target,
+    observedVersion,
+    purpose,
+    coverage: requestedRange
+      ? { kind: coverageKind, ...requestedRange }
+      : { kind: coverageKind },
+    decisionCheckpoint: checkpoint,
+    semanticKey: [
+      phase,
+      target,
+      observedVersion || "unknown-version",
+      purpose,
+      coverageKind,
+      checkpointKey,
+    ].join("::"),
+  };
+}
+
+function buildRecoveryProtocolNoProgressFingerprint(
+  state: ExecuteRecoveryRuntimeState,
+  results: ToolExecutionResult[],
+): { semanticKey: string; readProgress: ReadProgressFingerprint[] } {
+  const target = String(state.expectedTarget || "")
+    .replace(/\\/g, "/")
+    .trim()
+    .toLowerCase();
+  const readProgress = results
+    .map((result) => buildReadProgressFingerprint(state, result))
+    .filter((item): item is ReadProgressFingerprint => item !== null);
+  if (
+    state.mode === "patch_recovery_read" &&
+    results.some((result) =>
+      result.name === "read_file" &&
+      isReadOnlyNoProgressDetail(String(result.displayContent || result.content || ""))
+    )
+  ) {
+    return {
+      semanticKey: [
+        buildPatchRecoveryReadNoProgressFingerprint(state.expectedTarget || ""),
+        ...readProgress.map((item) => item.semanticKey),
+      ].join("::"),
+      readProgress,
+    };
+  }
+  const resultKinds = results.map((result) => {
+    const detail = String(result.displayContent || result.content || "");
+    const category = /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(detail)
+      ? "read_overlap_extension"
+      : isReadOnlyNoProgressDetail(detail)
+      ? "read_unchanged"
+      : result.internalFeedback
+      ? `policy:${result.qualityGateReason || result.lifecycleState || "deferred"}`
+      : result.isError
+      ? "actual_failure"
+      : "unchanged";
+    return `${result.name}:${String(result.target || "").replace(/\\/g, "/").toLowerCase()}:${category}`;
+  }).sort();
+  return {
+    semanticKey: [
+      `${state.mode}::${target}::${resultKinds.join("|")}`,
+      ...readProgress.map((item) => item.semanticKey),
+    ].join("::"),
+    readProgress,
+  };
+}
 
 type SetPlanRuntimePhase = (
   phase: PlanRuntimePhase,
@@ -135,7 +249,6 @@ export async function executeToolCallPhase(input: {
   attemptedPlanWriteTargets: string[];
   latestUserPromptText: string;
   managedAgentMessages: AgentMessage[];
-  allowApprovedPlanRecoveryFileRead: boolean;
   effectiveExecuteRecoveryFileRead: boolean;
   hooksConfig: HooksConfig;
   turnInputContextSignals: TurnInputContextSignals;
@@ -251,7 +364,6 @@ export async function executeToolCallPhase(input: {
     failedToolCallCounts: input.failedToolCallCounts,
     buildCurrentTaskTargetingProfile: input.buildCurrentTaskTargetingProfile,
     ...approvedPlanRecoveryState,
-    allowApprovedPlanRecoveryFileRead: input.allowApprovedPlanRecoveryFileRead,
     executeRecoveryState,
     effectiveExecuteRecoveryFileRead: input.effectiveExecuteRecoveryFileRead,
     ...input.toolExecutionRuntimeState,
@@ -293,14 +405,34 @@ export async function executeToolCallPhase(input: {
   allResults.push(...toolExecutionRound.results);
   const wasAborted = toolExecutionRound.status === "aborted";
 
-  const freshReadResult = allResults.find((result) =>
-    result.name === "read_file" &&
-    !result.isError &&
-    !result.internalFeedback &&
-    (result.readFileObservation?.source
+  const recoveryStateAtBatchStart = executeRecoveryState;
+  const activePatchReadLease =
+    recoveryStateAtBatchStart.mode === "patch_recovery_read" &&
+    recoveryStateAtBatchStart.readLease?.purpose === "patch_recovery" &&
+    (recoveryStateAtBatchStart.readLease.state === "available" ||
+      recoveryStateAtBatchStart.readLease.state === "active")
+      ? recoveryStateAtBatchStart.readLease
+      : null;
+  const freshReadResult = allResults.find((result) => {
+    if (result.name !== "read_file" || result.isError || result.internalFeedback) return false;
+    const detail = String(result.displayContent || result.content || "");
+    const overlapExtension = /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(detail);
+    const satisfiesPatchReadLease = Boolean(
+      activePatchReadLease &&
+      readEvidenceSatisfiesRecoveryLease({
+        lease: activePatchReadLease,
+        target: result.target,
+        requestedRange: requestedRangeFromReadObservationSignature(
+          result.readFileObservation?.requestSignature || "",
+        ),
+        observedVersion: result.readFileObservation?.versionToken || null,
+      })
+    );
+    if (overlapExtension && !satisfiesPatchReadLease) return false;
+    return result.readFileObservation?.source
       ? result.readFileObservation.source !== "stub"
-      : !isReadOnlyNoProgressDetail(String(result.displayContent || result.content || "")))
-  );
+      : !isReadOnlyNoProgressDetail(detail);
+  });
   const mutationResult = allResults.find((result) =>
     !result.internalFeedback && isProjectSourceWriteResult(result)
   );
@@ -325,12 +457,36 @@ export async function executeToolCallPhase(input: {
       ? resolveExecutePatchRecoveryTarget(input.recentToolActivity)
       : null
   );
+  const attemptedPatchRecoveryRead = Boolean(
+    activePatchReadLease?.state === "available" &&
+    allResults.some((result) =>
+      result.name === "read_file" &&
+      readEvidenceSatisfiesRecoveryLease({
+        lease: activePatchReadLease,
+        target: result.target,
+        requestedRange: requestedRangeFromReadObservationSignature(
+          result.readFileObservation?.requestSignature || "",
+        ),
+        observedVersion: result.readFileObservation?.versionToken || null,
+      })
+    )
+  );
+  if (attemptedPatchRecoveryRead && executeRecoveryState.readLease) {
+    executeRecoveryState = {
+      ...executeRecoveryState,
+      readLease: { ...executeRecoveryState.readLease, state: "active" },
+    };
+  }
   const recoveryTransition = transitionExecuteRecoveryRuntimeState(
     executeRecoveryState,
     {
       expectedTarget: expectedRecoveryTarget,
       freshReadTarget: freshReadResult?.target,
       sourceObservationKey: freshReadResult?.readFileObservation?.key,
+      sourceRequestedRange: requestedRangeFromReadObservationSignature(
+        freshReadResult?.readFileObservation?.requestSignature || "",
+      ),
+      sourceObservedVersion: freshReadResult?.readFileObservation?.versionToken || null,
       mutationTarget: mutationResult?.target,
       validationTarget: validationResult?.target || validationResult?.name,
       validationToolName: validationResult?.name,
@@ -354,11 +510,38 @@ export async function executeToolCallPhase(input: {
     });
   } else if (recoveryIterationBudgetNeutral) {
     executeRecoveryState = refundExecuteRecoveryRuntimeIteration(recoveryTransition.state);
+    const ptyWaitOnly = allResults.every((result) =>
+      ["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"].includes(result.name) &&
+      !result.isError
+    );
+    let semanticNoProgressFingerprint: string | null = null;
+    if (!ptyWaitOnly) {
+      const protocolFingerprint = buildRecoveryProtocolNoProgressFingerprint(
+        executeRecoveryState,
+        allResults,
+      );
+      semanticNoProgressFingerprint =
+        executeRecoveryState.reason === "approved_plan_scope_blocked" &&
+        executeRecoveryState.protocolNoProgressFingerprint
+          ? executeRecoveryState.protocolNoProgressFingerprint
+          : protocolFingerprint.semanticKey;
+      executeRecoveryState = registerExecuteRecoveryProtocolNoProgress(
+        executeRecoveryState,
+        semanticNoProgressFingerprint,
+      );
+      logAgentEvent("execute_recovery_read_progress_fingerprint", {
+        iteration: input.iteration,
+        fingerprints: protocolFingerprint.readProgress,
+      });
+    }
     logAgentEvent("execute_recovery_phase_budget_preserved", {
       iteration: input.iteration,
       mode: executeRecoveryState.mode,
       reason: "policy_deferral_cache_stub_or_pty_wait",
       phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+      protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
+      semanticNoProgressFingerprint,
       resultKinds: allResults.map((result) => ({
         name: result.name,
         internalFeedback: result.internalFeedback === true,

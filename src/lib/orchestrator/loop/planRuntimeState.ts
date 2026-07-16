@@ -22,6 +22,13 @@ export interface PlanLoopRuntimeState {
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   planEvidenceRecoveryPasses: number;
   planEvidenceNoProgressPasses: number;
+  /**
+   * Bounded checkpoint of the last semantic Plan evidence bundle plus the
+   * structured fresh-read coverage identities already observed. Raw read
+   * success is not progress unless the semantic bundle or decision-relevant
+   * coverage advances.
+   */
+  planEvidenceProgressFingerprint: string;
   planReasoningOnlyRecoveryPasses: number;
   planAutoScaffoldPromptIssued: boolean;
   planDraftingRecoveryReadCount: number;
@@ -59,6 +66,7 @@ export function createPlanLoopRuntimeState(input: {
     planEvidenceRecoveryObjective: "none",
     planEvidenceRecoveryPasses: 0,
     planEvidenceNoProgressPasses: 0,
+    planEvidenceProgressFingerprint: "",
     planReasoningOnlyRecoveryPasses: 0,
     planAutoScaffoldPromptIssued: false,
     planDraftingRecoveryReadCount: 0,
@@ -158,7 +166,8 @@ export function applyPlanNoToolRuntimeState(
     | "planEvidenceRecoveryObjective"
     | "planAutoScaffoldPromptIssued"
     | "planEvidenceRecoveryPasses"
-  >,
+    | "planEvidenceNoProgressPasses"
+  > & Partial<Pick<PlanLoopRuntimeState, "planEvidenceProgressFingerprint">>,
 ): PlanLoopRuntimeState {
   return {
     ...state,
@@ -173,6 +182,10 @@ export function applyPlanNoToolRuntimeState(
       input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
     planAutoScaffoldPromptIssued: input.planAutoScaffoldPromptIssued ?? state.planAutoScaffoldPromptIssued,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses ?? state.planEvidenceRecoveryPasses,
+    planEvidenceNoProgressPasses:
+      input.planEvidenceNoProgressPasses ?? state.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint:
+      input.planEvidenceProgressFingerprint ?? state.planEvidenceProgressFingerprint ?? "",
   };
 }
 
@@ -206,7 +219,7 @@ export function applyPlanQualityRuntimeState(
     | "planEvidenceRecoveryObjective"
     | "planEvidenceRecoveryPasses"
     | "planEvidenceNoProgressPasses"
-  >,
+  > & Partial<Pick<PlanLoopRuntimeState, "planEvidenceProgressFingerprint">>,
 ): PlanLoopRuntimeState {
   return {
     ...state,
@@ -220,6 +233,8 @@ export function applyPlanQualityRuntimeState(
       input.planEvidenceRecoveryObjective ?? state.planEvidenceRecoveryObjective,
     planEvidenceRecoveryPasses: input.planEvidenceRecoveryPasses,
     planEvidenceNoProgressPasses: input.planEvidenceNoProgressPasses,
+    planEvidenceProgressFingerprint:
+      input.planEvidenceProgressFingerprint ?? state.planEvidenceProgressFingerprint ?? "",
   };
 }
 
