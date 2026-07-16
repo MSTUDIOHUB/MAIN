@@ -135,9 +135,10 @@ export function createAgentLoopRuntimeActions(input: {
             workspacePathsReferToSameFile(activity.readFileObservation.path, expectedTarget)
           )?.readFileObservation || null
     );
-    const sourceObservationKey = typeof context.sourceObservationKey === "string"
+    const explicitSourceObservationKey = typeof context.sourceObservationKey === "string"
       ? context.sourceObservationKey.trim() || null
-      : retainedObservation?.key || null;
+      : null;
+    const sourceObservationKey = explicitSourceObservationKey || retainedObservation?.key || null;
     const explicitReadLease = context.readLease && typeof context.readLease === "object"
       ? context.readLease as RecoveryReadLease
       : null;
@@ -262,15 +263,17 @@ export function createAgentLoopRuntimeActions(input: {
     }
     setExecuteRecoveryState(nextState);
     logAgentEvent("execute_recovery_activated", {
+      ...context,
       iteration: getIteration(),
       executeRecoveryMode: nextState.mode,
       executeRecoveryAttempts: nextState.attempts,
       reason,
-      sourceObservationKey,
-      readLeasePurpose: readLease?.purpose || null,
-      readLeaseRange: readLease?.requestedRange || null,
-      observedVersion: readLease?.observedVersion || null,
-      mismatchFingerprint: readLease?.mismatchFingerprint || null,
+      sourceObservationKey: nextState.sourceObservationKey,
+      readLeasePurpose: nextState.readLease?.purpose || null,
+      readLeaseRange: nextState.readLease?.requestedRange || null,
+      readLeaseState: nextState.readLease?.state || null,
+      observedVersion: nextState.readLease?.observedVersion || null,
+      mismatchFingerprint: nextState.readLease?.mismatchFingerprint || null,
       repeatedPatchMismatch,
       protocolNoProgressCount: nextState.protocolNoProgressCount,
       recoveryToolSurface: resolveExecuteRecoveryActionContract(nextState.mode, {
@@ -282,7 +285,6 @@ export function createAgentLoopRuntimeActions(input: {
         protocolNoProgressCount: nextState.protocolNoProgressCount,
         protocolNoProgressFingerprint: nextState.protocolNoProgressFingerprint,
       }).surfaceDescription,
-      ...context,
     });
     return nextState;
   };

@@ -123,9 +123,34 @@ export function createExecuteRecoveryRuntimeState(input: {
   const recoveryEligible =
     input.workflowMode === "edit" ||
     (input.workflowMode === "plan" && hasForcedRecovery);
-  const mode = recoveryEligible
+  const requestedMode = recoveryEligible
     ? normalizeExecuteRecoveryMode(input.forcedState?.mode ?? input.forcedMode)
     : "normal";
+  const forcedExpectedTarget = requestedMode === "normal"
+    ? null
+    : input.forcedState?.expectedTarget?.trim() || null;
+  const forcedReadObligation = requestedMode !== "normal" && Boolean(
+    requestedMode === "patch_recovery_read" ||
+    input.forcedState?.decisionCheckpoint?.nextRequiredCapability === "targeted_read"
+  );
+  const synthesizedReadLease = forcedReadObligation && forcedExpectedTarget &&
+    !input.forcedState?.readLease
+      ? {
+          purpose: "missing_window" as const,
+          target: forcedExpectedTarget,
+          requestedRange: { startLine: 1, maxLines: 180 },
+          observedVersion: input.forcedState?.decisionCheckpoint?.evidenceVersion || null,
+          state: "available" as const,
+        }
+      : null;
+  const readLease = requestedMode === "normal"
+    ? null
+    : input.forcedState?.readLease || synthesizedReadLease;
+  const mode = requestedMode !== "normal" && readLease &&
+    readLease.purpose !== "post_mutation_verify" &&
+    (readLease.state === "available" || readLease.state === "active")
+      ? "patch_recovery_read"
+      : requestedMode;
   const phaseNoProgressCount = mode === "normal"
     ? 0
     : Math.max(0, input.forcedState?.phaseNoProgressCount || 0);
@@ -136,7 +161,7 @@ export function createExecuteRecoveryRuntimeState(input: {
       : input.forcedState?.reason?.trim() || "forced_execute_recovery",
     expectedTarget: mode === "normal"
       ? null
-      : input.forcedState?.expectedTarget?.trim() || null,
+      : forcedExpectedTarget,
     attempts: mode === "normal"
       ? 0
       : Math.max(1, Math.floor(Number(input.forcedState?.attempts) || 1)),
@@ -148,7 +173,7 @@ export function createExecuteRecoveryRuntimeState(input: {
     protocolNoProgressFingerprint: mode === "normal"
       ? null
       : input.forcedState?.protocolNoProgressFingerprint?.trim() || null,
-    readLease: mode === "normal" ? null : input.forcedState?.readLease || null,
+    readLease,
     sourceObservationKey: mode === "normal"
       ? null
       : input.forcedState?.sourceObservationKey?.trim() || null,
@@ -171,8 +196,27 @@ export function activateExecuteRecoveryRuntimeState(
     decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   },
 ): ExecuteRecoveryRuntimeState {
-  const nextMode = normalizeExecuteRecoveryMode(input.mode) as Exclude<ExecuteRecoveryMode, "normal">;
+  const requestedMode = normalizeExecuteRecoveryMode(input.mode) as Exclude<ExecuteRecoveryMode, "normal">;
   const expectedTarget = input.expectedTarget?.trim() || state.expectedTarget;
+  const readLease = input.readLease === undefined ? state.readLease : input.readLease;
+  const hasActiveContextLease = Boolean(
+    readLease &&
+    readLease.purpose !== "post_mutation_verify" &&
+    (readLease.state === "available" || readLease.state === "active")
+  );
+  // Lease state is authoritative. Callers cannot request a mutation-only tool
+  // surface while simultaneously carrying an unconsumed context-read lease.
+  const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = hasActiveContextLease
+    ? "patch_recovery_read"
+    : requestedMode;
+  const requestedSourceObservationKey = input.sourceObservationKey === undefined
+    ? state.sourceObservationKey
+    : input.sourceObservationKey?.trim() || null;
+  const sourceObservationKey = requestedSourceObservationKey || (
+    readLease?.state === "consumed"
+      ? readLease.observationKey?.trim() || null
+      : null
+  );
   const previousContract = resolveExecuteRecoveryActionContract(state.mode, {
     expectedTarget: state.expectedTarget,
     readLease: state.readLease,
@@ -184,10 +228,8 @@ export function activateExecuteRecoveryRuntimeState(
   });
   const nextContract = resolveExecuteRecoveryActionContract(nextMode, {
     expectedTarget,
-    readLease: input.readLease === undefined ? state.readLease : input.readLease,
-    sourceObservationKey: input.sourceObservationKey === undefined
-      ? state.sourceObservationKey
-      : input.sourceObservationKey,
+    readLease,
+    sourceObservationKey,
     decisionCheckpoint: input.decisionCheckpoint === undefined
       ? state.decisionCheckpoint
       : input.decisionCheckpoint,
@@ -209,16 +251,12 @@ export function activateExecuteRecoveryRuntimeState(
     reason: input.reason,
     expectedTarget,
     attempts: state.attempts + 1,
-    readLease: input.readLease === undefined ? state.readLease : input.readLease,
-    sourceObservationKey: input.sourceObservationKey === undefined
-      ? state.sourceObservationKey
-      : input.sourceObservationKey?.trim() || null,
+    readLease,
+    sourceObservationKey,
     decisionCheckpoint: input.decisionCheckpoint === undefined
       ? buildExecuteRecoveryDecisionCheckpoint({
           expectedTarget,
-          sourceObservationKey: input.sourceObservationKey === undefined
-            ? state.sourceObservationKey
-            : input.sourceObservationKey?.trim() || null,
+          sourceObservationKey,
           nextRequiredCapability: nextContract.nextRequiredCapability,
           previous: state.decisionCheckpoint,
         })
@@ -789,19 +827,39 @@ export function applyCrossIterationReadFileRecoveryState(
     consecutiveBlockedReadFileCount: number;
   },
 ): ExecuteRecoveryRuntimeState {
-  const nextMode = normalizeExecuteRecoveryMode(input.mode);
-  const previousPhase = resolveExecuteRecoveryActionContract(state.mode).phase;
-  const nextPhase = resolveExecuteRecoveryActionContract(nextMode).phase;
-  const nextState: ExecuteRecoveryRuntimeState = {
+  const requestedMode = normalizeExecuteRecoveryMode(input.mode);
+  const previousPhase = resolveExecuteRecoveryActionContract(state.mode, {
+    expectedTarget: state.expectedTarget,
+    readLease: state.readLease,
+    sourceObservationKey: state.sourceObservationKey,
+    decisionCheckpoint: state.decisionCheckpoint,
+    phaseNoProgressCount: state.phaseNoProgressCount,
+    protocolNoProgressCount: state.protocolNoProgressCount,
+    protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
+  }).phase;
+  let nextState: ExecuteRecoveryRuntimeState = {
     ...state,
-    mode: nextMode,
+    mode: requestedMode,
     reason: input.reason,
-    expectedTarget: nextMode === "normal" ? null : state.expectedTarget,
-    readLease: nextMode === "normal" ? null : state.readLease,
-    sourceObservationKey: nextMode === "normal" ? null : state.sourceObservationKey,
-    decisionCheckpoint: nextMode === "normal" ? null : state.decisionCheckpoint,
+    expectedTarget: requestedMode === "normal" ? null : state.expectedTarget,
+    readLease: requestedMode === "normal" ? null : state.readLease,
+    sourceObservationKey: requestedMode === "normal" ? null : state.sourceObservationKey,
+    decisionCheckpoint: requestedMode === "normal" ? null : state.decisionCheckpoint,
     consecutiveBlockedReadFileCount: input.consecutiveBlockedReadFileCount,
   };
+  const nextContract = resolveExecuteRecoveryActionContract(nextState.mode, {
+    expectedTarget: nextState.expectedTarget,
+    readLease: nextState.readLease,
+    sourceObservationKey: nextState.sourceObservationKey,
+    decisionCheckpoint: nextState.decisionCheckpoint,
+    phaseNoProgressCount: nextState.phaseNoProgressCount,
+    protocolNoProgressCount: nextState.protocolNoProgressCount,
+    protocolNoProgressFingerprint: nextState.protocolNoProgressFingerprint,
+  });
+  if (nextState.mode !== nextContract.modeLabel) {
+    nextState = { ...nextState, mode: nextContract.modeLabel };
+  }
+  const nextPhase = nextContract.phase;
   return previousPhase !== nextPhase
     ? resetExecuteRecoveryPhaseProgress(nextState)
     : nextState;

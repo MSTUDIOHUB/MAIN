@@ -1,9 +1,9 @@
 import {
   normalizeRecoveryReadRange,
-  resolveExecuteRecoveryActionContract,
   resolveExecuteRecoveryBatchDecision,
   shouldUseExecutePatchRecoveryReadLease,
   type ExecuteRecoveryMode,
+  type RecoveryActionContract,
 } from "../../executeRecoveryTools";
 import { resolveApprovedPlanMutationScope } from "../../approvedPlanExecutionScope";
 import {
@@ -72,7 +72,6 @@ import {
 import { shouldCacheReadOnlyToolResult } from "../../readOnlyToolCachePolicy";
 import {
   resolveBrowserValidationPreflight,
-  resolveDevServerRuntimeState,
 } from "../../devServerRuntime";
 import type {
   AgentMessage,
@@ -167,6 +166,7 @@ export async function partitionToolCallsForExecution(input: {
   buildCurrentTaskTargetingProfile: () => TaskTargetingProfile;
   approvedPlanActionOnlyRecoveryActive: boolean;
   executeRecoveryState: ExecuteRecoveryRuntimeState;
+  recoveryActionContract: RecoveryActionContract;
   effectiveExecuteRecoveryFileRead: boolean;
   readOnlyResultCache: Map<string, CachedReadOnlyToolResult>;
   readOnlyDuplicateSkipCounts: Map<string, number>;
@@ -195,6 +195,7 @@ export async function partitionToolCallsForExecution(input: {
     buildCurrentTaskTargetingProfile,
     approvedPlanActionOnlyRecoveryActive,
     executeRecoveryState,
+    recoveryActionContract,
     effectiveExecuteRecoveryFileRead,
     readOnlyResultCache,
     readOnlyDuplicateSkipCounts,
@@ -220,23 +221,7 @@ export async function partitionToolCallsForExecution(input: {
   let executePatchRecoveryReadLeaseClaimed = false;
   let sawOrderSensitiveWorkspaceAction = false;
   let deferRemainingCallsForBatchOrder = false;
-  const executeRecoveryDevServerObservation = resolveDevServerRuntimeState(
-    callbacks.getPlanExecutionEvidenceLedger(),
-  );
-  const executeRecoveryContract = resolveExecuteRecoveryActionContract(executeRecoveryMode, {
-    expectedTarget: executeRecoveryState.expectedTarget,
-    readLease: executeRecoveryState.readLease,
-    sourceObservationKey: executeRecoveryState.sourceObservationKey,
-    decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
-    phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount ?? executeRecoveryState.iterationCount,
-    protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
-    protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
-    devServerStatus: executeRecoveryDevServerObservation.status,
-    devServerNextCapability: executeRecoveryDevServerObservation.nextCapability,
-    devServerUrl: executeRecoveryDevServerObservation.url,
-    ptyGeneration: executeRecoveryDevServerObservation.foregroundGeneration,
-    ptyOutputSequence: executeRecoveryDevServerObservation.outputSequence,
-  });
+  const executeRecoveryContract = recoveryActionContract;
   const executeRecoveryBatchDecision = resolveExecuteRecoveryBatchDecision({
     mode: executeRecoveryMode,
     calls: toolCalls.map((call) => {

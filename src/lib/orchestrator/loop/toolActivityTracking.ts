@@ -290,6 +290,10 @@ export function toolResultCountsAsExecutionEvidence(
 ): boolean {
   if (result.isError) return false;
   if (result.name === "send_pty_input") return false;
+  // Coordination lifecycle is not task execution evidence. Only concrete
+  // child tool observations promoted below, or a parent-side verification of
+  // them, may contribute evidence to the execution ledger.
+  if (result.name === "spawn_subagent" || result.name === "wait_subagents") return false;
   const envelope = parseToolFeedbackEnvelope(result.content || "");
   const feedbackStatus = envelope?.envelope.status || "";
   if (feedbackStatus === "no_op" || feedbackStatus === "no_effect_mutation" || feedbackStatus === "cached") {

@@ -227,7 +227,7 @@ function createPermissiveTargetingProfile() {
 }
 
 function createReadFilePartitionInput(overrides = {}) {
-  return {
+  const input = {
     toolCalls: [{
       id: "read-window",
       name: "read_file",
@@ -283,6 +283,11 @@ function createReadFilePartitionInput(overrides = {}) {
     iterationContext: { eventThreadId: "thread", eventTurnId: "turn" },
     emitTurnEvent: () => {},
     ...overrides,
+  };
+  return {
+    ...input,
+    recoveryActionContract: overrides.recoveryActionContract ||
+      resolveExecuteRecoveryActionContract(input.executeRecoveryState.mode, input.executeRecoveryState),
   };
 }
 
@@ -1028,7 +1033,17 @@ test("a repeated read-only loop enters mutation-first instead of patch-context r
       noProgressBatchRepeatCount: 0,
       consecutiveReadFileOnlyCacheHits: 2,
     },
-    activateExecuteRecovery: (mode, reason, context) => activations.push({ mode, reason, context }),
+    activateExecuteRecovery: (mode, reason, context) => {
+      activations.push({ mode, reason, context });
+      return activateExecuteRecoveryRuntimeState(
+        createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+        {
+          mode,
+          reason,
+          expectedTarget: context?.target || context?.repeatedTargets?.[0] || null,
+        },
+      );
+    },
     activateChatFinalSynthesis: () => {},
     emitTaskOrchestratorPhase: () => {},
   });
@@ -1136,6 +1151,9 @@ test("a recovery-surface mismatch is internal scope feedback and cannot poison f
       consecutiveBlockedReadFileCount: 0,
       repeatedEditValidationAttempts: 0,
     },
+    recoveryActionContract: resolveExecuteRecoveryActionContract("mutation_first", {
+      expectedTarget: "src/App.tsx",
+    }),
     effectiveExecuteRecoveryFileRead: false,
     readOnlyResultCache: new Map(),
     readOnlyDuplicateSkipCounts: new Map(),
@@ -3047,15 +3065,36 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
     { ...exactLease, state: "consumed" },
     { ...exactLease, observedVersion: "4097:1700000000001", state: "available" },
   ), false, "new version evidence may mint a distinct lease");
+  assert.equal(patchRecoveryLeaseIdentityMatches(
+    { ...exactLease, state: "consumed" },
+    {
+      ...exactLease,
+      requestedRange: { startLine: 206, endLine: 260, maxLines: 55 },
+      mismatchFingerprint: `${mismatchFingerprint}::different-patch-text`,
+      state: "available",
+    },
+  ), true, "overlapping hunk churn on the same version and failure class must not mint a lease");
+  assert.equal(patchRecoveryLeaseIdentityMatches(
+    { ...exactLease, state: "consumed" },
+    {
+      ...exactLease,
+      requestedRange: { startLine: 600, endLine: 660, maxLines: 61 },
+      state: "available",
+    },
+  ), false, "a disjoint window may add genuinely new source evidence");
 
   const prompt = buildExecuteRecoveryPrompt({
     language: "zh",
     reason: "target_progress_patch_mismatch",
-    mode: "patch_recovery_read",
+    contract: resolveExecuteRecoveryActionContract("mutation_first", {
+      expectedTarget: "src/App.tsx",
+      readLease: exactLease,
+    }),
     repeatedTargets: ["src/App.tsx"],
     recentActivity: recent,
   });
   assert.match(prompt, /上下文与当前文件不匹配/);
+  assert.match(prompt, /targeted_context_read/);
   assert.match(prompt, /不要继续重试基于旧上下文的 `apply_patch`/);
 });
 
@@ -3065,91 +3104,85 @@ test("mutation mismatch uses an anchored range or one bounded missing-window lea
     runtimeIntent: "execute",
     isPlanApproved: true,
     executeRecoveryMode: "normal",
-    executeRecoveryAttempts: 0,
     results: [{
       name: "replace_in_file",
       target: "src-tauri/src/main.rs",
-      content: "Error: MUTATION_PREFLIGHT_BLOCKED: search_text 在 src-tauri/src/main.rs 中不存在。",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
       isError: true,
       lifecycleState: "blocked",
+      mutationPreflightReason: "search_text_mismatch",
     }],
   });
-  assert.deepEqual(replaceDecision, {
-    mode: "patch_recovery_read",
-    reason: "mutation_preflight_search_text_mismatch",
-    target: "src-tauri/src/main.rs",
-    requestedRange: { startLine: 1, maxLines: 180 },
-  });
+  assert.equal(replaceDecision?.mode, "patch_recovery_read");
+  assert.equal(replaceDecision?.reason, "mutation_preflight_search_text_mismatch");
+  assert.deepEqual(replaceDecision?.readLease.requestedRange, { startLine: 1, maxLines: 180 });
+  assert.equal(replaceDecision?.decisionCheckpoint.nextRequiredCapability, "targeted_read");
 
   const patchDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "plan",
     runtimeIntent: "execute",
     isPlanApproved: true,
     executeRecoveryMode: "normal",
-    executeRecoveryAttempts: 0,
     results: [{
       name: "apply_patch",
       target: "src-tauri/src/main.rs",
-      content: "Error: MUTATION_PREFLIGHT_BLOCKED: apply_patch 无效或无法应用（Update File has no changes）。",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
       isError: true,
       lifecycleState: "blocked",
+      mutationPreflightReason: "invalid_patch",
     }],
   });
-  assert.deepEqual(patchDecision, {
-    mode: "patch_recovery_read",
-    reason: "mutation_preflight_invalid_patch",
-    target: "src-tauri/src/main.rs",
-    requestedRange: { startLine: 1, maxLines: 180 },
-  });
+  assert.equal(patchDecision?.mode, "patch_recovery_read");
+  assert.equal(patchDecision?.reason, "mutation_preflight_invalid_patch");
+  assert.deepEqual(patchDecision?.readLease.requestedRange, { startLine: 1, maxLines: 180 });
 
-  const mutationFirstDecision = resolveDirectMutationPreflightRecovery({
+  const retainedObservationDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
     runtimeIntent: "execute",
     isPlanApproved: false,
     executeRecoveryMode: "mutation_first",
-    executeRecoveryAttempts: 1,
-    hasRetainedSourceObservation: true,
+    retainedSourceObservation: {
+      key: "src/main.js::26895:1784042986186::361-540",
+      path: "src/main.js",
+      requestSignature: 'read_file::src/main.js::[["max_lines",180],["start_line",361]]',
+      versionToken: "26895:1784042986186",
+      source: "fresh",
+    },
     results: [{
       name: "apply_patch",
       target: "src/main.js",
-      content: "Error: MUTATION_PREFLIGHT_BLOCKED: invalid_patch",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
       isError: true,
+      mutationPreflightReason: "invalid_patch",
     }],
   });
-  assert.equal(mutationFirstDecision?.mode, "mutation_first");
-  assert.equal(mutationFirstDecision?.target, "src/main.js");
-
-  const accumulatedAttemptDecision = resolveDirectMutationPreflightRecovery({
-    workflowMode: "edit",
-    runtimeIntent: "execute",
-    isPlanApproved: false,
-    executeRecoveryMode: "mutation_first",
-    executeRecoveryAttempts: 7,
-    hasRetainedSourceObservation: true,
-    results: [{
-      name: "replace_in_file",
-      target: "src/main.js",
-      content: "Error: MUTATION_PREFLIGHT_BLOCKED: search_text mismatch",
-      isError: true,
-    }],
+  assert.equal(retainedObservationDecision?.mode, "patch_recovery_read");
+  assert.deepEqual(retainedObservationDecision?.readLease.requestedRange, {
+    startLine: 361,
+    maxLines: 180,
   });
-  assert.equal(
-    accumulatedAttemptDecision?.mode,
-    "mutation_first",
-    "an unanchored mismatch must retain mutation even after historical recovery activations",
+  assert.equal(retainedObservationDecision?.readLease.observedVersion, "26895:1784042986186");
+  assert.equal(retainedObservationDecision?.sourceObservationKey, null);
+  const activated = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    retainedObservationDecision,
   );
+  const activatedContract = resolveExecuteRecoveryActionContract(activated.mode, activated);
+  assert.equal(activated.mode, "patch_recovery_read");
+  assert.equal(activatedContract.nextRequiredCapability, "targeted_read");
+  assert.equal(activatedContract.allowedToolNames.has("read_file"), true);
 
   const versionedDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
     runtimeIntent: "execute",
     isPlanApproved: false,
     executeRecoveryMode: "normal",
-    executeRecoveryAttempts: 0,
     results: [{
       name: "apply_patch",
       target: "src/main.js",
-      content: "Error: MUTATION_PREFLIGHT_BLOCKED: invalid_patch",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
       isError: true,
+      mutationPreflightReason: "invalid_patch",
       patchRecoveryMismatch: {
         mismatchFingerprint: "patch_mismatch::src/main.js::invalid_patch::mutation-a1",
         target: "./src/main.js",
@@ -3158,26 +3191,29 @@ test("mutation mismatch uses an anchored range or one bounded missing-window lea
       },
     }],
   });
-  assert.deepEqual(versionedDecision, {
-    mode: "patch_recovery_read",
-    reason: "mutation_preflight_invalid_patch",
-    target: "src/main.js",
-    mismatchFingerprint: "patch_mismatch::src/main.js::invalid_patch::mutation-a1",
-    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
-    observedVersion: "8192:1700000000000",
+  assert.equal(versionedDecision?.mode, "patch_recovery_read");
+  assert.equal(
+    versionedDecision?.readLease.mismatchFingerprint,
+    "patch_mismatch::src/main.js::invalid_patch::mutation-a1",
+  );
+  assert.deepEqual(versionedDecision?.readLease.requestedRange, {
+    startLine: 205,
+    endLine: 256,
+    maxLines: 52,
   });
+  assert.equal(versionedDecision?.readLease.observedVersion, "8192:1700000000000");
 
   assert.equal(resolveDirectMutationPreflightRecovery({
     workflowMode: "plan",
     runtimeIntent: "execute",
     isPlanApproved: true,
     executeRecoveryMode: "patch_recovery_read",
-    executeRecoveryAttempts: 1,
     results: [{
       name: "apply_patch",
       target: "src-tauri/src/main.rs",
-      content: "Error: MUTATION_PREFLIGHT_BLOCKED: invalid_patch",
+      content: "Error: MUTATION_PREFLIGHT_BLOCKED",
       isError: true,
+      mutationPreflightReason: "invalid_patch",
     }],
   }), null, "an active recovery lease must not be reinitialized by the same failure");
 });
@@ -3636,10 +3672,17 @@ test("read-only budget triggers execute recovery before max iterations", () => {
   const prompt = buildExecuteRecoveryPrompt({
     language: "zh",
     reason: decision.reason,
-    mode: "patch_recovery_read",
+    contract: resolveExecuteRecoveryActionContract("patch_recovery_read", {
+      expectedTarget: "src/App.tsx",
+      readLease: {
+        purpose: "patch_recovery",
+        target: "src/App.tsx",
+        requestedRange: { startLine: 1, maxLines: 180 },
+        state: "available",
+      },
+    }),
     repeatedTargets: summarizeRepeatedExecuteTargets(recent),
     recentActivity: recent,
-    allowFileRead: shouldAllowExecuteRecoveryFileRead(recent, "patch_recovery_read"),
   });
   assert.match(prompt, /可使用定向 `read_file`/);
   assert.match(prompt, /统一行动协议/);

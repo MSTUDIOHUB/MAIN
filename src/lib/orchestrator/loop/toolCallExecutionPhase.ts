@@ -7,6 +7,7 @@ import {
   resolveExecuteRecoveryActionContract,
   resolveExecutePatchRecoveryTarget,
   type ReadProgressFingerprint,
+  type RecoveryActionContract,
 } from "../../executeRecoveryTools";
 import {
   buildAssistantHistoryMessage,
@@ -199,6 +200,7 @@ function buildRecoveryProtocolNoProgressFingerprint(
 function normalizeLeaseBackedReadToolCalls(
   calls: ToolCallToExecute[],
   state: ExecuteRecoveryRuntimeState,
+  contract: RecoveryActionContract,
 ): ToolCallToExecute[] {
   const lease = state.readLease;
   if (
@@ -207,15 +209,6 @@ function normalizeLeaseBackedReadToolCalls(
   ) {
     return calls;
   }
-  const contract = resolveExecuteRecoveryActionContract(state.mode, {
-    expectedTarget: state.expectedTarget,
-    readLease: lease,
-    sourceObservationKey: state.sourceObservationKey,
-    decisionCheckpoint: state.decisionCheckpoint,
-    phaseNoProgressCount: state.phaseNoProgressCount,
-    protocolNoProgressCount: state.protocolNoProgressCount,
-    protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
-  });
   if (contract.nextRequiredCapability !== "targeted_read") return calls;
   return calls.map((call) => {
     if (call.name !== "read_file") return call;
@@ -313,6 +306,7 @@ export async function executeToolCallPhase(input: {
   latestUserPromptText: string;
   managedAgentMessages: AgentMessage[];
   effectiveExecuteRecoveryFileRead: boolean;
+  recoveryActionContract: RecoveryActionContract;
   hooksConfig: HooksConfig;
   turnInputContextSignals: TurnInputContextSignals;
   taskTargetingEvidence: Set<string>;
@@ -360,6 +354,7 @@ export async function executeToolCallPhase(input: {
   const effectiveToolCalls = normalizeLeaseBackedReadToolCalls(
     input.effectiveToolCalls,
     executeRecoveryState,
+    input.recoveryActionContract,
   );
   if (effectiveToolCalls.some((call, index) =>
     call.arguments !== input.effectiveToolCalls[index]?.arguments
@@ -443,6 +438,7 @@ export async function executeToolCallPhase(input: {
     buildCurrentTaskTargetingProfile: input.buildCurrentTaskTargetingProfile,
     ...approvedPlanRecoveryState,
     executeRecoveryState,
+    recoveryActionContract: input.recoveryActionContract,
     effectiveExecuteRecoveryFileRead: input.effectiveExecuteRecoveryFileRead,
     ...input.toolExecutionRuntimeState,
     iterationContext: input.iterationContext,

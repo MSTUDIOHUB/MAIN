@@ -67,6 +67,13 @@ function compactText(value: unknown, maxChars: number): string {
   return text.length > maxChars ? `${text.slice(0, maxChars).trimEnd()}...` : text;
 }
 
+export function resolveReadOnlySubagentRole(_requestedRole: unknown): string {
+  // Every child runtime is intentionally read/search-only. Keep the persisted
+  // role aligned with its actual capability instead of displaying model-authored
+  // labels such as "coder" that imply it can modify the workspace.
+  return "investigator";
+}
+
 function compactEvidenceFragment(value: unknown, maxChars: number): string {
   const text = String(value || "").trim();
   if (text.length <= maxChars) return text;
@@ -161,7 +168,7 @@ function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"):
   if (language === "en") {
     return [
       "You are a bounded read-only subagent working for a parent task.",
-      `Role: ${request.role || "explorer"}`,
+      `Role: ${resolveReadOnlySubagentRole(request.role)} (read-only)`,
       `Objective: ${request.objective}`,
       scope ? `Owned scope: ${scope}` : "",
       hints ? `Context hints: ${hints}` : "",
@@ -173,7 +180,7 @@ function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"):
   }
   return [
     "你是主任务派生出的有界只读子智能体。",
-    `角色：${request.role || "explorer"}`,
+    `角色：${resolveReadOnlySubagentRole(request.role)}（只读调查）`,
     `目标：${request.objective}`,
     scope ? `负责范围：${scope}` : "",
     hints ? `上下文提示：${hints}` : "",
@@ -249,7 +256,8 @@ export function scheduleControlledSubagent(input: {
 
   const subagentId = `subagent-${generateId()}`;
   const name = sanitizeName(input.request.name, input.existingRunCount);
-  const role = compactText(input.request.role || "explorer", 48) || "explorer";
+  const requestedRole = compactText(input.request.role || "", 48);
+  const role = resolveReadOnlySubagentRole(requestedRole);
   const rawObjective = String(input.request.objective || "").trim();
   if (rawObjective.length > 800) {
     throw new Error("SUBAGENT_SCOPE_TOO_BROAD: objective must be 800 characters or fewer.");
@@ -297,6 +305,7 @@ export function scheduleControlledSubagent(input: {
     subagentId,
     name,
     role,
+    requestedRole: requestedRole || null,
     scopeKey,
     profile: policy.profile,
     childCapacity: policy.maxActiveRequests,
@@ -336,7 +345,7 @@ export async function executeControlledSubagent(input: {
     return {
       subagentId: `subagent-${generateId()}`,
       name: sanitizeName(input.request.name, input.existingRunCount),
-      role: compactText(input.request.role || "explorer", 48) || "explorer",
+      role: resolveReadOnlySubagentRole(input.request.role),
       objective,
       scopeKey: compactText(input.request.scopeKey || input.request.scope || objective, 96),
       allowedPaths: parseSubagentAllowedPaths(input.request.allowedPaths, parentConfig.workspace),

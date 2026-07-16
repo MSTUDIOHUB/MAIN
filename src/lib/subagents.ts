@@ -544,6 +544,31 @@ export function parseSubagentAllowedPaths(value: unknown, workspace = ""): strin
   });
 }
 
+/**
+ * Count delegated paths already covered by parent-owned source observations.
+ * `path:` is the canonical runtime evidence key; `file:` remains accepted for
+ * snapshots created before the targeting-ledger rename.
+ */
+export function countParentObservedDelegationPaths(input: {
+  allowedPaths: string[];
+  evidenceKeys: Iterable<string>;
+}): number {
+  const observedPaths = [...input.evidenceKeys]
+    .map((entry) => {
+      if (entry.startsWith("path:")) return entry.slice("path:".length);
+      if (entry.startsWith("file:")) return entry.slice("file:".length);
+      return "";
+    })
+    .map(normalizeWorkspacePathIdentity)
+    .filter(Boolean);
+  return input.allowedPaths
+    .map(normalizeWorkspacePathIdentity)
+    .filter(Boolean)
+    .filter((allowed) => observedPaths.some((observed) =>
+      pathContains(allowed, observed) || pathContains(observed, allowed)
+    )).length;
+}
+
 function pathContains(scopePath: string, targetPath: string): boolean {
   const scope = normalizeWorkspacePathIdentity(scopePath);
   const target = normalizeWorkspacePathIdentity(targetPath);

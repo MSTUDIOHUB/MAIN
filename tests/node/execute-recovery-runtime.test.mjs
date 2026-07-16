@@ -203,6 +203,31 @@ test("execute recovery state activates, advances, and clears without losing loop
 });
 
 test("execute recovery state records blocked-read and validation recovery counters", () => {
+  const leasedState = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "patch_mismatch",
+      expectedTarget: "src/App.tsx",
+      readLease: {
+        purpose: "patch_recovery",
+        target: "src/App.tsx",
+        requestedRange: { startLine: 205, endLine: 256 },
+        state: "available",
+      },
+    },
+  );
+  const canonicalLeasedState = applyCrossIterationReadFileRecoveryState(leasedState, {
+    mode: "mutation_first",
+    reason: "compatibility_restore",
+    consecutiveBlockedReadFileCount: 0,
+  });
+  assert.equal(
+    canonicalLeasedState.mode,
+    "patch_recovery_read",
+    "an unconsumed read lease remains authoritative across compatibility state folds",
+  );
+
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
     { mode: "mutation_first", reason: "read_loop", expectedTarget: "src/App.tsx" },

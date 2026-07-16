@@ -237,6 +237,17 @@ test("tool activity tracking counts only successful commands browser checks and 
     target: "CTRL_C",
     content: JSON.stringify({ accepted: true, controlAction: "interrupt" }),
   }), { control: "interrupt" }), false);
+
+  assert.equal(toolResultCountsAsExecutionEvidence(result({
+    name: "spawn_subagent",
+    target: "toolbar-investigation",
+    content: JSON.stringify({ status: "queued", subagentId: "child-1" }),
+  }), {}), false, "queuing a child is coordination, not execution evidence");
+  assert.equal(toolResultCountsAsExecutionEvidence(result({
+    name: "wait_subagents",
+    target: "child-1",
+    content: JSON.stringify({ status: "completed", subagentId: "child-1" }),
+  }), {}), false, "joining a child is coordination, not execution evidence");
 });
 
 test("browser validation cache ignores timeout-only retries while preserving meaningful checks", () => {

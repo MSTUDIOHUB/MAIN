@@ -4,6 +4,7 @@ import {
   failedFiniteValidationMatchesPendingPlanEvidence,
   hasPendingPlanCommandEvidence,
   resolveFailedFiniteValidationRecoveryPolicy,
+  resolveExecuteRecoveryActionContract,
   requestedRangeFromReadObservationSignature,
   shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
@@ -1377,6 +1378,15 @@ export async function handleToolResultRecoveryPhase(input: {
     crossIterationFileReads: loopGuardRuntimeState.crossIterationFileReads,
     executeRecoveryMode: executeRecoveryState.mode,
     executeRecoveryReason: executeRecoveryState.reason,
+    recoveryActionContract: resolveExecuteRecoveryActionContract(executeRecoveryState.mode, {
+      expectedTarget: executeRecoveryState.expectedTarget,
+      readLease: executeRecoveryState.readLease,
+      sourceObservationKey: executeRecoveryState.sourceObservationKey,
+      decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
+      phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+      protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
+    }),
     consecutiveBlockedReadFileInRecoveryCount:
       executeRecoveryState.consecutiveBlockedReadFileCount,
     activateExecuteRecovery: activateExecuteRecoveryAndSync,

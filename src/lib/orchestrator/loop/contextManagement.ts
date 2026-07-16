@@ -1,8 +1,8 @@
 import type { AppConfig } from "../../appTypes";
 import { compactContextForExecuteRecovery, computeContextBudgets, manageContext } from "../../contextTrim";
 import {
-  resolveExecuteRecoveryActionContract,
   type ExecuteRecoveryMode,
+  type RecoveryActionContract,
 } from "../../executeRecoveryTools";
 import {
   buildFileReadWindowIdentity,
@@ -10,7 +10,6 @@ import {
   selectFileReadStateForRecoveryContext,
   type FileReadState,
 } from "../../orchestrator/fileReadCache";
-import { describeExecuteRecoveryToolSurface } from "../../executeRecoveryTools";
 import {
   computeContextForceReason,
   computeManagedContextLimit,
@@ -161,11 +160,11 @@ export function prepareManagedMessagesForIteration(input: {
   isExecuteRecoveryEligible: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
+  recoveryActionContract: RecoveryActionContract;
   executeRecoveryExpectedTarget?: string | null;
   executeRecoverySourceObservationKey?: string | null;
   recentToolActivity: PlanToolActivitySummary[];
   fileReadStates: Map<string, FileReadState>;
-  allowExecuteRecoveryFileRead: boolean;
   emitPlanExecutionProgress: (phase: PlanExecutionProgressPhase) => void;
 }): IterationContextManagementResult {
   const {
@@ -181,11 +180,11 @@ export function prepareManagedMessagesForIteration(input: {
     isExecuteRecoveryEligible,
     executeRecoveryMode,
     executeRecoveryReason,
+    recoveryActionContract,
     executeRecoveryExpectedTarget,
     executeRecoverySourceObservationKey,
     recentToolActivity,
     fileReadStates,
-    allowExecuteRecoveryFileRead,
     emitPlanExecutionProgress,
   } = input;
   const { eventTurnId, turnContext } = iterationContext;
@@ -312,7 +311,7 @@ export function prepareManagedMessagesForIteration(input: {
           ? sum + message.content.length
           : sum,
       0),
-      recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
+      recoveryToolSurface: recoveryActionContract.surfaceDescription,
     });
   } else if (isExecuteRecoveryEligible) {
     logAgentEvent("execute_recovery_context_skipped", {
@@ -327,7 +326,7 @@ export function prepareManagedMessagesForIteration(input: {
         ? Number(contextForceForManagement.tokenPressure.toFixed(3))
         : null,
       proactiveTriggerBudget: contextBudgetsForManagement?.proactiveTriggerBudget ?? null,
-      recoveryToolSurface: describeExecuteRecoveryToolSurface(executeRecoveryMode, allowExecuteRecoveryFileRead),
+      recoveryToolSurface: recoveryActionContract.surfaceDescription,
     });
   }
   if (
@@ -502,7 +501,7 @@ export function prepareManagedMessagesForIteration(input: {
     });
   }
 
-  const recoverySourceContract = resolveExecuteRecoveryActionContract(executeRecoveryMode);
+  const recoverySourceContract = recoveryActionContract;
   if (
     executeRecoveryMode !== "normal" &&
     (recoverySourceContract.phase === "context" || recoverySourceContract.phase === "mutation")

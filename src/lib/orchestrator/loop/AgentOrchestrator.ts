@@ -641,6 +641,7 @@ export class AgentOrchestrator {
           snapshotContextLimit,
           repairExecutionRequestInChat,
           effectiveExecuteRecoveryFileRead,
+          recoveryActionContract,
           hooksConfig,
           turnInputContextSignals,
           taskTargetingEvidence,

@@ -82,6 +82,7 @@ import { scheduleControlledSubagent } from "../subagentRuntime";
 import {
   buildSubagentPolicyDeferral,
   cancelSubagentRun,
+  countParentObservedDelegationPaths,
   finalizeCoordinatedSubagentsForParent,
   getCoordinatedSubagentRunCount,
   getPendingCoordinatedSubagentIds,
@@ -3571,12 +3572,10 @@ export class WorkflowEngine {
       const parentTurnId = context.uiDisplayTurnId || turnId;
       const existingRunCount = getCoordinatedSubagentRunCount(runSessionKey, parentTurnId);
       const allowedPaths = parseSubagentAllowedPaths(request.allowedPaths, runWorkspace);
-      const parentEvidencePaths = [...getSessionTaskTargetingEvidence(runSessionKey)]
-        .filter((entry) => entry.startsWith("file:"))
-        .map((entry) => entry.slice("file:".length));
-      const duplicateCount = allowedPaths.filter((allowed) => parentEvidencePaths.some((path) =>
-        path === allowed || path.startsWith(`${allowed}/`) || allowed.startsWith(`${path}/`)
-      )).length;
+      const duplicateCount = countParentObservedDelegationPaths({
+        allowedPaths,
+        evidenceKeys: getSessionTaskTargetingEvidence(runSessionKey),
+      });
       const independentReviewer = /reviewer|independent[_ -]?review/i.test(request.role || "");
       if (!independentReviewer && allowedPaths.length > 0 && duplicateCount / allowedPaths.length > 0.5) {
         const deferred = buildSubagentPolicyDeferral({

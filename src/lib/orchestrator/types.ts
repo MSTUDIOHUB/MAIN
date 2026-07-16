@@ -373,6 +373,8 @@ export interface ToolExecutionResult {
   /** Internal identity for one versioned read_file request window. */
   readFileObservation?: import("./fileReadCache").FileReadObservationIdentity;
   patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
+  /** Structured workspace mutation preflight outcome; never inferred from localized text. */
+  mutationPreflightReason?: import("../workspaceMutationPreflight").WorkspaceMutationPreflightReason;
   /** Structured policy identity for an out-of-scope approved-Plan mutation. */
   approvedPlanScopeConflict?: {
     requestedTargets: string[];

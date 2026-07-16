@@ -26,15 +26,12 @@ import {
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
   buildExecuteValidationRecoveryPrompt,
-  isExecutePatchMismatchRecoveryActivity,
   isReadOnlyNoProgressDetail,
   resolveExecuteRecoveryActionContract,
   resolveExecuteReadOnlyRecoveryTrigger,
   resolveReadOnlyNoProgressTrigger,
-  shouldAllowExecuteRecoveryFileRead,
   summarizeRepeatedExecuteTargets,
   type ExecuteRecoveryMode,
-  type RecoveryReadLease,
 } from "../../executeRecoveryTools";
 import {
   buildPlanNoProgressLoopPauseNotice,
@@ -70,9 +67,24 @@ import {
 } from "./toolActivityTracking";
 import type { CrossIterationFileReadObservation } from "./loopGuardRuntimeState";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
+
+export { resolveDirectMutationPreflightRecovery } from "./mutationFailureRecovery";
 
 const DEFAULT_CROSS_ITERATION_READ_CONTEXT_LIMIT = 128000;
 const SMALL_CONTEXT_READ_LOOP_THRESHOLD = 16384;
+
+function resolveRuntimeRecoveryActionContract(state: ExecuteRecoveryRuntimeState) {
+  return resolveExecuteRecoveryActionContract(state.mode, {
+    expectedTarget: state.expectedTarget,
+    readLease: state.readLease,
+    sourceObservationKey: state.sourceObservationKey,
+    decisionCheckpoint: state.decisionCheckpoint,
+    phaseNoProgressCount: state.phaseNoProgressCount,
+    protocolNoProgressCount: state.protocolNoProgressCount,
+    protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
+  });
+}
 const MEDIUM_CONTEXT_READ_LOOP_THRESHOLD = 65536;
 const SMALL_CONTEXT_MAX_CROSS_READS = 3;
 const MEDIUM_CONTEXT_MAX_CROSS_READS = 4;
@@ -153,87 +165,6 @@ export interface ApprovedPlanNoProgressDecision {
   remainingText: string;
   repeats: number;
   logContext: Record<string, unknown>;
-}
-
-export interface DirectMutationPreflightRecoveryDecision {
-  mode: "patch_recovery_read" | "mutation_first";
-  reason: "mutation_preflight_invalid_patch" | "mutation_preflight_search_text_mismatch";
-  target: string;
-  mismatchFingerprint?: string;
-  requestedRange?: RecoveryReadLease["requestedRange"];
-  observedVersion?: string | null;
-}
-
-export function resolveDirectMutationPreflightRecovery(input: {
-  workflowMode: "chat" | "edit" | "plan";
-  runtimeIntent: ResolvedUserIntent;
-  isPlanApproved: boolean;
-  executeRecoveryMode: ExecuteRecoveryMode;
-  executeRecoveryAttempts: number;
-  hasRetainedSourceObservation?: boolean;
-  results: ToolExecutionResult[];
-}): DirectMutationPreflightRecoveryDecision | null {
-  const eligibleWorkflow =
-    input.workflowMode === "edit" ||
-    (input.workflowMode === "plan" && input.isPlanApproved);
-  if (
-    !eligibleWorkflow ||
-    !isMutationRuntimeIntent(input.runtimeIntent) ||
-    !["normal", "mutation_first", "action_plus_targeting"].includes(input.executeRecoveryMode)
-  ) {
-    return null;
-  }
-
-  for (const result of input.results) {
-    const diagnostic = [
-      result.content,
-      result.displayContent,
-      result.qualityGateReason,
-      result.lifecycleState,
-    ].filter(Boolean).join("\n");
-    if (!isExecutePatchMismatchRecoveryActivity({
-      name: result.name,
-      status: result.isError ? "failed" : "succeeded",
-      target: result.target,
-      detail: diagnostic,
-    })) {
-      continue;
-    }
-    const reason = /invalid_patch|invalid patch|无效|无法应用/i.test(diagnostic)
-      ? "mutation_preflight_invalid_patch"
-      : "mutation_preflight_search_text_mismatch";
-    const target = String(result.target || "").trim();
-    const mismatchEvidence = result.patchRecoveryMismatch &&
-      workspacePathsReferToSameFile(result.patchRecoveryMismatch.target, target)
-        ? result.patchRecoveryMismatch
-        : null;
-    const requestedRange = mismatchEvidence?.requestedRange || (
-      input.hasRetainedSourceObservation
-        ? null
-        : { startLine: 1, maxLines: 180 }
-    );
-    return {
-      // Prefer the failed hunk/search anchor. If the parent already retains an
-      // exact source observation, retry mutation from it; otherwise grant one
-      // bounded initial target window instead of trapping direct Edit runs in
-      // mutation-only with no source at all.
-      mode: requestedRange
-        ? "patch_recovery_read"
-        : "mutation_first",
-      reason,
-      target,
-      ...(mismatchEvidence
-        ? {
-            mismatchFingerprint: mismatchEvidence.mismatchFingerprint,
-            requestedRange,
-            observedVersion: mismatchEvidence.observedVersion,
-          }
-        : requestedRange
-          ? { requestedRange }
-          : {}),
-    };
-  }
-  return null;
 }
 
 export type NoProgressRecoveryResult =
@@ -382,27 +313,27 @@ export function handleNoProgressRecovery(input: {
     return activateExecuteRecovery(mode, reason, context);
   };
 
+  const mutationFailureTargets = results
+    .filter((result) =>
+      result.isError &&
+      (result.name === "apply_patch" || result.name === "replace_in_file") &&
+      !!String(result.target || "").trim()
+    )
+    .map((result) => result.target);
+  const retainedMutationSourceObservation = [...recentToolActivity]
+    .reverse()
+    .find((activity) =>
+      activity.readFileObservation &&
+      mutationFailureTargets.some((target) =>
+        workspacePathsReferToSameFile(activity.readFileObservation!.path, target)
+      )
+    )?.readFileObservation || null;
   const directMutationPreflightRecovery = resolveDirectMutationPreflightRecovery({
     workflowMode,
     runtimeIntent,
     isPlanApproved: callbacks.getIsPlanApproved(),
     executeRecoveryMode: currentExecuteRecoveryMode,
-    executeRecoveryAttempts: currentExecuteRecoveryAttempts,
-    hasRetainedSourceObservation: Boolean(
-      input.executeRecoverySourceObservationKey ||
-      [...recentToolActivity].reverse().some((activity) =>
-        activity.readFileObservation &&
-        results.some((result) =>
-          isExecutePatchMismatchRecoveryActivity({
-            name: result.name,
-            status: result.isError ? "failed" : "succeeded",
-            target: result.target,
-            detail: [result.content, result.displayContent].filter(Boolean).join("\n"),
-          }) &&
-          workspacePathsReferToSameFile(activity.target, result.target)
-        )
-      )
-    ),
+    retainedSourceObservation: retainedMutationSourceObservation,
     results,
   });
   if (directMutationPreflightRecovery) {
@@ -413,54 +344,34 @@ export function handleNoProgressRecovery(input: {
       directMutationPreflightRecovery.mode,
       directMutationPreflightRecovery.reason,
       {
-        target: directMutationPreflightRecovery.target || null,
+        expectedTarget: directMutationPreflightRecovery.target,
         repeatedTargets,
-        sourceObservationKey: null,
-        mismatchFingerprint: directMutationPreflightRecovery.mismatchFingerprint || null,
-        requestedRange: directMutationPreflightRecovery.requestedRange || null,
-        observedVersion: directMutationPreflightRecovery.observedVersion || null,
-        readLease: directMutationPreflightRecovery.mode === "patch_recovery_read" &&
-          directMutationPreflightRecovery.target
-          ? {
-              purpose: "patch_recovery",
-              target: directMutationPreflightRecovery.target,
-              ...(directMutationPreflightRecovery.requestedRange
-                ? { requestedRange: directMutationPreflightRecovery.requestedRange }
-                : {}),
-              observedVersion: directMutationPreflightRecovery.observedVersion || null,
-              mismatchFingerprint:
-                directMutationPreflightRecovery.mismatchFingerprint || null,
-              state: "available",
-            }
-          : null,
+        sourceObservationKey: directMutationPreflightRecovery.sourceObservationKey,
+        readLease: directMutationPreflightRecovery.readLease,
+        decisionCheckpoint: directMutationPreflightRecovery.decisionCheckpoint,
       },
     );
     pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
       language: MODEL_CONTROL_LANGUAGE,
       reason: directMutationPreflightRecovery.reason,
-      mode: activatedRecovery.mode,
+      contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
       repeatedTargets,
       recentActivity: recentToolActivity,
-      allowFileRead: shouldAllowExecuteRecoveryFileRead(
-        recentToolActivity,
-        activatedRecovery.mode,
-      ),
     });
   }
 
   const isReadFileOnlyLoop = consecutiveReadFileOnlyCacheHits >= MAX_CONSECUTIVE_READ_ONLY_ITERATIONS;
   if (isReadFileOnlyLoop && currentExecuteRecoveryMode === "normal" && executeMutationRecoveryEligible) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
-    activateTrackedExecuteRecovery("mutation_first", "read_file_only_loop", {
+    const activatedRecovery = activateTrackedExecuteRecovery("mutation_first", "read_file_only_loop", {
       repeatedTargets,
     });
     pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
       language: MODEL_CONTROL_LANGUAGE,
       reason: "read_file_only_loop",
-      mode: "mutation_first",
+      contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
       repeatedTargets,
       recentActivity: recentToolActivity,
-      allowFileRead: false,
     });
   }
 
@@ -490,7 +401,7 @@ export function handleNoProgressRecovery(input: {
       // Read-only convergence already has context. Move to one mutation step;
       // the context-read phase is reserved for an actual patch mismatch.
       const nextMode: Exclude<ExecuteRecoveryMode, "normal"> = "mutation_first";
-      activateTrackedExecuteRecovery(nextMode, executeReadOnlyRecovery.reason, {
+      const activatedRecovery = activateTrackedExecuteRecovery(nextMode, executeReadOnlyRecovery.reason, {
         readOnlyActivityCount: executeReadOnlyRecovery.readOnlyActivityCount,
         batchToolChars: executeReadOnlyRecovery.batchToolChars,
         repeatedTargets,
@@ -498,10 +409,9 @@ export function handleNoProgressRecovery(input: {
       pendingExecuteRecoveryPrompt = buildExecuteRecoveryPrompt({
         language: MODEL_CONTROL_LANGUAGE,
         reason: executeReadOnlyRecovery.reason,
-        mode: nextMode,
+        contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
         repeatedTargets,
         recentActivity: recentToolActivity,
-        allowFileRead: shouldAllowExecuteRecoveryFileRead(recentToolActivity, nextMode),
       });
     } else {
       const remainingText = callbacks.getPreferredLanguage() === "zh"
@@ -810,12 +720,13 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
   crossIterationFileReads: Map<string, CrossIterationFileReadObservation>;
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
+  recoveryActionContract: ReturnType<typeof resolveExecuteRecoveryActionContract>;
   consecutiveBlockedReadFileInRecoveryCount: number;
   activateExecuteRecovery: (
     mode: Exclude<ExecuteRecoveryMode, "normal">,
     reason: string,
     context?: Record<string, unknown>,
-  ) => void;
+  ) => ExecuteRecoveryRuntimeState;
 }): CrossIterationReadFileLoopRecoveryResult {
   const {
     callbacks,
@@ -829,6 +740,8 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
 
   let executeRecoveryMode = input.executeRecoveryMode;
   let executeRecoveryReason = input.executeRecoveryReason;
+  let recoveryActionContract = input.recoveryActionContract ||
+    resolveExecuteRecoveryActionContract(executeRecoveryMode);
   let consecutiveBlockedReadFileInRecoveryCount = input.consecutiveBlockedReadFileInRecoveryCount;
   if (!isExecuteMutationRecoveryEligible({
     callbacks,
@@ -905,10 +818,22 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
         const reason = "cross_iteration_file_read_loop";
         executeRecoveryMode = "mutation_first";
         executeRecoveryReason = reason;
-        activateExecuteRecovery("mutation_first", reason, {
+        const activatedRecovery = activateExecuteRecovery("mutation_first", reason, {
           target,
           crossIterationReads: count,
         });
+        if (activatedRecovery?.mode) {
+          executeRecoveryMode = activatedRecovery.mode;
+          recoveryActionContract = resolveRuntimeRecoveryActionContract(activatedRecovery);
+        } else {
+          // Compatibility for legacy embedding callbacks. Production returns
+          // the full state; this fallback is safe because the transition above
+          // starts from normal and creates no read lease.
+          executeRecoveryMode = "mutation_first";
+          recoveryActionContract = resolveExecuteRecoveryActionContract("mutation_first", {
+            expectedTarget: target,
+          });
+        }
         callbacks.appendMessage({
           role: "system",
           content: `[System: Cross-iteration observation-only read_file loop detected for ${target} (${count} reads without task progress; latest=${noProgressRead ? "cached/replayed" : "fresh observation"}). The reads remain valid evidence, but the pending mutation task has not advanced. Act now with a scoped write, validation, or an exact blocker. Do not output long prose.]`,
@@ -935,6 +860,7 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
     consecutiveBlockedReadFileInRecoveryCount += 1;
     if (consecutiveBlockedReadFileInRecoveryCount >= BLOCKED_READS_BEFORE_RECOVERY_RESET) {
       executeRecoveryMode = "normal";
+      recoveryActionContract = resolveExecuteRecoveryActionContract("normal");
       consecutiveBlockedReadFileInRecoveryCount = 0;
       logAgentEvent("execute_recovery_reset_after_blocked_reads", {
         iteration,
@@ -954,7 +880,7 @@ export function handleCrossIterationReadFileLoopRecovery(input: {
     }
 
     const usedTools = results.map((result) => result.name).filter(Boolean).join(", ");
-    const recoveryContract = resolveExecuteRecoveryActionContract(executeRecoveryMode);
+    const recoveryContract = recoveryActionContract;
     const recoveryPrompt = callbacks.getPreferredLanguage() === "zh"
       ? `[System: READ_SCOPE_DEFERRED：上一个 read_file 没有产生新的目标源码证据。当前阶段为 ${recoveryContract.phase}，下一能力为 ${recoveryContract.nextRequiredCapability}。如果目标文件版本已变化、上下文缺失或需要新区间，可对当前事务目标再发起一次定向读取；否则复用已有观察并执行修改或验证。不要重复同一未变化窗口，也不要用 shell 读取绕行。]`
       : `[System: READ_SCOPE_DEFERRED: The previous read_file produced no new target-source evidence. The current phase is ${recoveryContract.phase} and the next capability is ${recoveryContract.nextRequiredCapability}. If the target version changed, context was evicted, or a different range is missing, issue one targeted read for the transaction target; otherwise reuse the current observation and mutate or validate. Do not repeat the same unchanged window or bypass this with shell reads.]`;
@@ -995,7 +921,7 @@ export function handleTargetProgressLoopRecovery(input: {
     mode: Exclude<ExecuteRecoveryMode, "normal">,
     reason: string,
     context?: Record<string, unknown>,
-  ) => void;
+  ) => ExecuteRecoveryRuntimeState;
 }): TargetProgressLoopRecoveryResult {
   const {
     callbacks,
@@ -1041,7 +967,7 @@ export function handleTargetProgressLoopRecovery(input: {
       mode: Exclude<ExecuteRecoveryMode, "normal">,
       recoveryReason: string,
     ) => {
-      activateExecuteRecovery(mode, recoveryReason, {
+      const activatedRecovery = activateExecuteRecovery(mode, recoveryReason, {
         target: displayTarget,
         outcome,
         reason,
@@ -1051,10 +977,9 @@ export function handleTargetProgressLoopRecovery(input: {
         content: buildExecuteRecoveryPrompt({
           language: MODEL_CONTROL_LANGUAGE,
           reason: recoveryReason,
-          mode,
+          contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
           repeatedTargets: displayTarget ? [displayTarget] : summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12)),
           recentActivity: recentToolActivity,
-          allowFileRead: mode === "patch_recovery_read",
         }),
       });
     };
@@ -1181,7 +1106,7 @@ export function handleReadFileRepeatLimitRecovery(input: {
     mode: Exclude<ExecuteRecoveryMode, "normal">,
     reason: string,
     context?: Record<string, unknown>,
-  ) => void;
+  ) => ExecuteRecoveryRuntimeState;
   emitTaskOrchestratorPhase: (phase: "EXECUTE_RECOVERY" | "PAUSED", details?: Record<string, unknown>) => void;
 }): ReadFileRepeatLimitRecoveryResult {
   const {
@@ -1212,7 +1137,7 @@ export function handleReadFileRepeatLimitRecovery(input: {
     const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
     if (executeRecoveryAttempts < MAX_APPROVED_PLAN_NO_PROGRESS_RECOVERY_ATTEMPTS) {
       const recoveryReason = "approved_plan_read_file_repeat_limit";
-      activateExecuteRecovery("mutation_first", recoveryReason, {
+      const activatedRecovery = activateExecuteRecovery("mutation_first", recoveryReason, {
         repeatedTargets,
         repeatResults: repeatResults.length,
       });
@@ -1237,10 +1162,9 @@ export function handleReadFileRepeatLimitRecovery(input: {
         prompt: buildExecuteRecoveryPrompt({
           language: MODEL_CONTROL_LANGUAGE,
           reason: recoveryReason,
-          mode: "mutation_first",
+          contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
           repeatedTargets,
           recentActivity: recentPlanToolActivity,
-          allowFileRead: false,
         }),
       };
     }
@@ -1296,7 +1220,7 @@ export function handleReadFileRepeatLimitRecovery(input: {
   const language = callbacks.getPreferredLanguage();
   const repeatedTargets = [readFileRepeatLimitBatch.target].filter(Boolean);
   if (isMutationRuntimeIntent(runtimeIntent) && executeRecoveryAttempts < 2) {
-    activateExecuteRecovery("mutation_first", "read_file_repeat_limit_batch", {
+    const activatedRecovery = activateExecuteRecovery("mutation_first", "read_file_repeat_limit_batch", {
       target: readFileRepeatLimitBatch.target,
       total: readFileRepeatLimitBatch.total,
       targetCount: readFileRepeatLimitBatch.targetCount,
@@ -1322,7 +1246,7 @@ export function handleReadFileRepeatLimitRecovery(input: {
       prompt: buildExecuteRecoveryPrompt({
         language: MODEL_CONTROL_LANGUAGE,
         reason: "read_file_repeat_limit_batch",
-        mode: "mutation_first",
+        contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
         repeatedTargets,
         recentActivity: recentToolActivity,
       }),

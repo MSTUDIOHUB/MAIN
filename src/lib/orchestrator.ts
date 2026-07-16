@@ -40,7 +40,6 @@ import { buildToolDiffPreview, supportsToolDiffPreview, type ToolDiffPreview } f
 import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import {
   isReadOnlyNoProgressDetail,
-  type PatchRecoveryMismatchEvidence,
 } from "./executeRecoveryTools";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
 import {
@@ -69,7 +68,9 @@ import {
 } from "./orchestrator/agentRecovery";
 import type {
   MaxIterationsCheckpointHandling,
+  ToolCallToExecute,
   ToolErrorLifecycleMeta,
+  ToolExecutionResult,
 } from "./orchestrator/types";
 import {
   buildUnityApplyTextPolicyBlockedMessage,
@@ -3195,34 +3196,6 @@ export async function fetchLLMStream(
 
 // ── Tool Execution ─────────────────────────────────────────────────
 
-interface ToolCallToExecute {
-  id: string;
-  name: string;
-  arguments: string;
-}
-
-interface ToolExecutionResult {
-  toolCallId: string;
-  name: string;
-  target: string;
-  content: string; // model-facing result or error message
-  displayContent?: string; // UI-facing result, can differ from model-facing content
-  isError: boolean;
-  lifecycleState?: ToolLifecycleState;
-  additionalContexts?: string[];
-  internalFeedback?: boolean;
-  qualityGateReason?: string;
-  planRecoveryAction?: PlanArtifactRecoveryAction;
-  missingPlanSections?: string[];
-  readFileObservation?: import("./orchestrator/fileReadCache").FileReadObservationIdentity;
-  patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
-  approvedPlanScopeConflict?: {
-    requestedTargets: string[];
-    unexpectedTargets: string[];
-    plannedTargets: string[];
-  };
-}
-
 function getToolResultDiagnosticText(result?: ToolExecutionResult): string {
   if (!result) return "";
   return [
@@ -4303,6 +4276,22 @@ async function executeToolCallWithLifecycle(
     let isInternalFeedback = false;
     let planArtifactAccepted = true;
 
+    if (tc.name === "spawn_subagent") {
+      try {
+        const spawnOutcome = JSON.parse(resultStr) as {
+          status?: string;
+          reason?: string;
+        };
+        if (spawnOutcome.status === "deferred") {
+          finalQualityGateReason = `subagent_delegation_${spawnOutcome.reason || "deferred"}`;
+          isInternalFeedback = true;
+        }
+      } catch {
+        // A non-JSON child result is handled as a normal tool result. The
+        // coordinator always emits structured JSON for policy deferrals.
+      }
+    }
+
     const path = resolvedPlanArtifactUpdate?.path || (typeof resolvedArgs.path === "string" ? resolvedArgs.path : "");
     const kind = resolvedPlanArtifactUpdate?.kind || (path ? detectPlanArtifactKind(path) : null);
     if (kind && kind !== "summary" && PLAN_ARTIFACT_MUTATION_TOOLS.has(tc.name)) {
@@ -5227,6 +5216,7 @@ export async function executeWriteToolWithReview(
       content: `Error: ${mutationPreflight.message || "MUTATION_PREFLIGHT_BLOCKED"}`,
       isError: true,
       lifecycleState: "blocked",
+      mutationPreflightReason: mutationPreflight.reason,
       ...(mutationPreflight.patchRecoveryMismatch
         ? { patchRecoveryMismatch: mutationPreflight.patchRecoveryMismatch }
         : {}),

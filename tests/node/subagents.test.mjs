@@ -94,6 +94,22 @@ test("subagent allowed paths preserve execution casing while deduplicating ident
   ]);
 });
 
+test("parent path evidence prevents redundant delegation across current and legacy keys", () => {
+  assert.equal(subagents.countParentObservedDelegationPaths({
+    allowedPaths: ["src/main.js", "src/styles"],
+    evidenceKeys: new Set(["path:src/main.js", "file:src/styles/main.css"]),
+  }), 2);
+  assert.equal(subagents.countParentObservedDelegationPaths({
+    allowedPaths: ["src/main.js"],
+    evidenceKeys: new Set(["symbol:initToolbar", "path:src/editor.js"]),
+  }), 0);
+});
+
+test("read-only child roles never imply workspace mutation capability", () => {
+  assert.equal(subagentRuntime.resolveReadOnlySubagentRole("coder"), "investigator");
+  assert.equal(subagentRuntime.resolveReadOnlySubagentRole("reviewer"), "investigator");
+});
+
 test("capacity policy permits two local children and bounded cloud parallelism", () => {
   const local = subagents.resolveSubagentCapacityPolicy(makeConfig("local"));
   assert.equal(local.profile, "local");

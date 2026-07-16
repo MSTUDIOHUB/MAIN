@@ -373,11 +373,11 @@ export async function prepareIterationStreamRequest(input: {
     isExecuteRecoveryEligible: toolSurfaceDecision.isExecuteRecoveryEligible,
     executeRecoveryMode: executeRecoveryState.mode,
     executeRecoveryReason: executeRecoveryState.reason,
+    recoveryActionContract: toolSurfaceDecision.recoveryActionContract,
     executeRecoveryExpectedTarget: executeRecoveryState.expectedTarget,
     executeRecoverySourceObservationKey: executeRecoveryState.sourceObservationKey,
     recentToolActivity,
     fileReadStates: toolExecutionRuntimeState.fileReadStates,
-    allowExecuteRecoveryFileRead: toolSurfaceDecision.allowExecuteRecoveryFileRead,
     emitPlanExecutionProgress,
   });
   let managedAgentMessages = appendActiveRuntimeGuidance({

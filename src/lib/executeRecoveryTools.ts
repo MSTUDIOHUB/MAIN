@@ -301,7 +301,11 @@ export function resolveExecuteRecoveryActionContract(
   const shared = {
     expectedTarget: context.expectedTarget?.trim() || null,
     readLease: context.readLease || null,
-    sourceObservationKey: context.sourceObservationKey?.trim() || null,
+    sourceObservationKey: context.sourceObservationKey?.trim() || (
+      context.readLease?.state === "consumed"
+        ? context.readLease.observationKey?.trim() || null
+        : null
+    ),
     decisionCheckpoint: context.decisionCheckpoint || null,
     phaseNoProgressCount: Math.max(0, context.phaseNoProgressCount || 0),
     protocolNoProgressCount: Math.max(0, context.protocolNoProgressCount || 0),
@@ -321,6 +325,21 @@ export function resolveExecuteRecoveryActionContract(
       allowsAllTools: true,
       allowedToolNames: new Set<string>(),
       surfaceDescription: "normal",
+    };
+  }
+  if (
+    context.readLease?.purpose !== "post_mutation_verify" &&
+    (context.readLease?.state === "available" || context.readLease?.state === "active")
+  ) {
+    return {
+      ...shared,
+      modeLabel: "patch_recovery_read",
+      phase: "context",
+      nextRequiredCapability: "targeted_read",
+      allowTargetedFileRead: true,
+      allowsAllTools: false,
+      allowedToolNames: EXECUTE_RECOVERY_PATCH_READ_TOOLS,
+      surfaceDescription: "targeted_context_read",
     };
   }
   if (
@@ -625,15 +644,44 @@ export function patchRecoveryLeaseIdentityMatches(
   }
   const currentFingerprint = String(current.mismatchFingerprint || "").trim();
   const candidateFingerprint = String(candidate.mismatchFingerprint || "").trim();
-  if (!currentFingerprint || !candidateFingerprint || currentFingerprint !== candidateFingerprint) {
+  const failureClass = (fingerprint: string): string => {
+    const parts = fingerprint.toLowerCase().split("::");
+    return parts[0] === "patch_mismatch" && parts.length >= 3
+      ? parts[2]
+      : fingerprint.toLowerCase();
+  };
+  if (
+    !currentFingerprint ||
+    !candidateFingerprint ||
+    failureClass(currentFingerprint) !== failureClass(candidateFingerprint)
+  ) {
     return false;
   }
-  if (!recoveryReadRangesMatch(current.requestedRange, candidate.requestedRange) ||
-      !recoveryReadRangesMatch(candidate.requestedRange, current.requestedRange)) {
+  if (
+    String(current.observedVersion || "").trim() !==
+    String(candidate.observedVersion || "").trim()
+  ) {
     return false;
   }
-  return String(current.observedVersion || "").trim() ===
-    String(candidate.observedVersion || "").trim();
+  const currentRange = normalizeRecoveryReadRange(current.requestedRange);
+  const candidateRange = normalizeRecoveryReadRange(candidate.requestedRange);
+  // The retry identity is semantic, not a byte-for-byte lease identity. A
+  // model cannot obtain a fresh read merely by nudging or extending the same
+  // hunk. A genuinely disjoint window remains eligible because it can add new
+  // source evidence for the same file version.
+  if (!currentRange || !candidateRange) return true;
+  const toBounds = (range: NonNullable<RecoveryReadLease["requestedRange"]>) => {
+    const start = Math.max(1, range.startLine || 1);
+    const end = Math.max(
+      start,
+      range.endLine ?? (range.maxLines ? start + range.maxLines - 1 : start),
+    );
+    return { start, end };
+  };
+  const currentBounds = toBounds(currentRange);
+  const candidateBounds = toBounds(candidateRange);
+  return currentBounds.start <= candidateBounds.end &&
+    candidateBounds.start <= currentBounds.end;
 }
 
 export function readEvidenceSatisfiesRecoveryLease(input: {
@@ -1108,12 +1156,11 @@ export function resolveExecuteReadOnlyRecoveryTrigger(input: Parameters<typeof r
 export function buildExecuteRecoveryPrompt(input: {
   language: "zh" | "en";
   reason: string;
-  mode: ExecuteRecoveryMode;
+  contract: RecoveryActionContract;
   repeatedTargets?: string[];
   recentActivity?: ExecuteRecoveryActivityLike[];
-  allowFileRead?: boolean;
 }): string {
-  const contract = resolveExecuteRecoveryActionContract(input.mode);
+  const contract = input.contract;
   const surface = contract.surfaceDescription;
   const fileReadAvailable = contract.allowTargetedFileRead;
   const isPatchMismatchRecovery =
