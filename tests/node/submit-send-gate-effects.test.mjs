@@ -146,6 +146,11 @@ test("send gate effects queue visible submissions while preserving context snaps
     queuedWorkflowContext: {
       runtimeIntentOverride: "goal",
       goalSourceContextSnapshot: "[plan_artifact]\n- 修复批准生命周期",
+      goalCreationAuthorization: {
+        kind: "goal_creation_authorization",
+        intent: "goal",
+        source: "visible_goal_composer_capsule",
+      },
     },
   });
 
@@ -159,8 +164,49 @@ test("send gate effects queue visible submissions while preserving context snaps
   assert.equal(harness.calls.queued[0].options.attachedFiles[0].kind, "tabular");
   assert.equal(harness.calls.queued[0].options.runtimeIntentOverride, "goal");
   assert.match(harness.calls.queued[0].options.goalSourceContextSnapshot, /plan_artifact/);
+  assert.equal(
+    harness.calls.queued[0].options.goalCreationAuthorization.source,
+    "visible_goal_composer_capsule",
+  );
   assert.equal(harness.calls.logs.at(-1).event, "send_queued");
   assert.equal(harness.calls.logs.at(-1).data.reason, "generation_in_progress");
+});
+
+test("send gate effects preserve authorized Goal guidance without rebuilding it from text", () => {
+  const harness = createHarness({
+    isGenerating: true,
+    agentStatus: "running",
+    abortController: {},
+  });
+  const authorization = {
+    kind: "goal_continuation_authorization",
+    source: "goal_user_choice",
+    workspaceKey: "/repo",
+    sessionKey: "/repo:7",
+    goalId: "goal-1",
+    goalRevision: 2,
+    ownerTurnId: "turn-goal",
+    requestId: "request-1",
+  };
+  const result = harness.apply({
+    text: "显示给用户的选择文本",
+    queuedWorkflowContext: {
+      runtimeIntentOverride: "goal",
+      goalContinuationAuthorization: authorization,
+      goalContinuationGuidance: "精确注入 Goal 的用户指导",
+    },
+  });
+
+  assert.equal(result.shouldContinue, false);
+  assert.equal(harness.calls.queued.length, 1);
+  assert.equal(
+    harness.calls.queued[0].options.goalContinuationGuidance,
+    "精确注入 Goal 的用户指导",
+  );
+  assert.deepEqual(
+    harness.calls.queued[0].options.goalContinuationAuthorization,
+    authorization,
+  );
 });
 
 test("send gate effects reject hidden execution resumes while an owner is running without queueing internal prompts", () => {

@@ -59,6 +59,7 @@ import {
 } from "./goalContextStrategy";
 import {
   buildGoalProgressMarkdown,
+  isGoalRuntimeDeleted,
   resolveGoalEvidenceFilePath,
   resolveGoalRuntimeProgressFilePath,
   resolveGoalRuntimeStateFilePath,
@@ -1012,23 +1013,33 @@ async function persistProgress(
   language: "zh" | "en",
 ): Promise<void> {
   try {
+    const workspacePath = callbacks.getWorkspacePath();
+    const persistenceWasDeleted = () => isGoalRuntimeDeleted(workspacePath, goal.id);
+    if (persistenceWasDeleted()) {
+      callbacks.onDebugEvent?.("goal_persist_skipped_deleted", {
+        goalId: goal.id,
+        reason: "deletion_tombstone",
+      });
+      return;
+    }
     if (goal.status !== "active" && progress.usage?.activeStartedAt) {
       progress.usage.activeDurationMs += Math.max(0, Date.now() - progress.usage.activeStartedAt);
       progress.usage.activeStartedAt = null;
     }
     const markdown = buildGoalProgressMarkdown({ goal, progress, language });
     await callbacks.writeFile(progress.progressFile, markdown);
+    if (persistenceWasDeleted()) return;
     const runtimeSnapshot = buildGoalRuntimeSnapshot({
       goal,
       progress,
       phase: progress.iterations[progress.iterations.length - 1]?.phase || null,
       pauseReason: progress.pauseReason,
     });
-    const workspacePath = callbacks.getWorkspacePath();
     await callbacks.writeFile(
       resolveGoalRuntimeStateFilePath(workspacePath, goal.id),
       serializeGoalRuntimeSnapshot(runtimeSnapshot),
     );
+    if (persistenceWasDeleted()) return;
     await callbacks.writeFile(
       resolveGoalEvidenceFilePath(workspacePath, goal.id),
       serializeGoalEvidenceJsonl(progress),

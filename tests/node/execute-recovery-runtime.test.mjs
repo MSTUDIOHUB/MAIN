@@ -235,7 +235,18 @@ test("execute recovery max-iteration prompt is generated from the shared limit",
 test("execute recovery transaction advances read to mutation to validation without spending attempts", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
-    { mode: "patch_recovery_read", reason: "read_only_loop" },
+    {
+      mode: "patch_recovery_read",
+      reason: "read_only_loop",
+      expectedTarget: "src/App.tsx",
+      readLease: {
+        purpose: "missing_window",
+        target: "src/App.tsx",
+        requestedRange: { startLine: 1, endLine: 100, maxLines: 100 },
+        observedVersion: "v1",
+        state: "available",
+      },
+    },
   );
   const attempts = state.attempts;
 
@@ -254,6 +265,8 @@ test("execute recovery transaction advances read to mutation to validation witho
 
   const read = transitionExecuteRecoveryRuntimeState(wrongRead.state, {
     freshReadTarget: "./src/App.tsx",
+    sourceRequestedRange: { startLine: 1, endLine: 100, maxLines: 100 },
+    sourceObservedVersion: "v1",
   });
   assert.equal(read.transition, "context_to_mutation");
   assert.equal(read.state.mode, "mutation_first");
@@ -326,6 +339,47 @@ test("failed-process recovery accepts a bounded target repair before returning t
   assert.equal(repaired.state.readLease?.purpose, "post_mutation_verify");
 });
 
+test("structural targeting evidence resets the phase budget before its exact range read", () => {
+  let state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "plan", forcedMode: "action_plus_targeting" }),
+    {
+      mode: "action_plus_targeting",
+      reason: "approved_plan_symbol_targeting_required",
+      expectedTarget: "src/main.js",
+      decisionCheckpoint: {
+        expectedTarget: "src/main.js",
+        sourceObservationKey: "head-v1",
+        nextRequiredCapability: "targeting",
+        evidenceVersion: "9000:100",
+      },
+    },
+  );
+  state = advanceExecuteRecoveryRuntimeIteration(state).state;
+  assert.equal(state.phaseNoProgressCount, 1);
+
+  const ranged = activateExecuteRecoveryRuntimeState(state, {
+    mode: "patch_recovery_read",
+    reason: "approved_plan_declaration_range_required",
+    expectedTarget: "src/main.js",
+    readLease: {
+      purpose: "patch_recovery",
+      target: "src/main.js",
+      requestedRange: { startLine: 600, endLine: 650, maxLines: 51 },
+      observedVersion: "9000:100",
+      state: "available",
+    },
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: null,
+      nextRequiredCapability: "targeted_read",
+      evidenceVersion: "9000:100",
+    },
+  });
+  assert.equal(ranged.mode, "patch_recovery_read");
+  assert.equal(ranged.phaseNoProgressCount, 0);
+  assert.equal(ranged.decisionCheckpoint?.nextRequiredCapability, "targeted_read");
+});
+
 test("recovery no-progress budget resets only for fresh phase evidence", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
@@ -336,6 +390,7 @@ test("recovery no-progress budget resets only for fresh phase evidence", () => {
       readLease: {
         purpose: "patch_recovery",
         target: "src/App.tsx",
+        requestedRange: { startLine: 205, endLine: 256 },
         state: "active",
       },
     },
@@ -352,6 +407,7 @@ test("recovery no-progress budget resets only for fresh phase evidence", () => {
   const fresh = transitionExecuteRecoveryRuntimeState(state, {
     freshReadTarget: "src/App.tsx",
     sourceObservationKey: "src/App.tsx::205-256::v2",
+    sourceRequestedRange: { startLine: 205, endLine: 256 },
   });
   assert.equal(fresh.transition, "context_to_mutation");
   assert.equal(fresh.state.phaseNoProgressCount, 0);
@@ -415,8 +471,10 @@ test("patch recovery consumes only the leased target, source range, and version"
     sourceRequestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
     sourceObservedVersion: "8193:1700000000001",
   });
-  assert.equal(wrongVersion.transition, "none");
-  assert.equal(wrongVersion.state.readLease.state, "available");
+  assert.equal(wrongVersion.transition, "context_to_mutation");
+  assert.equal(wrongVersion.state.mode, "mutation_first");
+  assert.equal(wrongVersion.state.readLease.observedVersion, "8193:1700000000001");
+  assert.equal(wrongVersion.state.sourceObservationKey, "main:205-256:v2");
 
   const exact = transitionExecuteRecoveryRuntimeState(state, {
     freshReadTarget: "/tmp/workspace/src/main.js",
@@ -429,6 +487,135 @@ test("patch recovery consumes only the leased target, source range, and version"
   assert.equal(exact.state.readLease.observationKey, "main:205-256:v1");
   assert.deepEqual(exact.state.readLease.requestedRange, lease.requestedRange);
   assert.equal(exact.state.readLease.observedVersion, lease.observedVersion);
+});
+
+test("parser declaration leases accept one bounded source prefix", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "approved_plan_declaration_range_required",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "initial_targeting",
+        target: "src/main.js",
+        requestedRange: { startLine: 1, endLine: 1000, maxLines: 1000 },
+        coverageMode: "bounded_prefix",
+        observedVersion: "120000:300",
+        state: "available",
+      },
+    },
+  );
+
+  const bounded = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:1-60:v1",
+    sourceRequestedRange: { startLine: 1, endLine: 60, maxLines: 60 },
+    sourceObservedVersion: "120000:300",
+  });
+  assert.equal(bounded.transition, "context_to_mutation");
+  assert.equal(bounded.state.mode, "mutation_first");
+  assert.deepEqual(bounded.state.readLease.requestedRange, {
+    startLine: 1,
+    endLine: 60,
+    maxLines: 60,
+  });
+  assert.equal(bounded.state.readLease.observationKey, "main:1-60:v1");
+});
+
+test("a changed parser declaration version invalidates its lease and retargets", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "approved_plan_declaration_range_required",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "initial_targeting",
+        target: "src/main.js",
+        requestedRange: { startLine: 600, endLine: 850, maxLines: 251 },
+        coverageMode: "bounded_prefix",
+        observedVersion: "50000:300",
+        state: "available",
+      },
+    },
+  );
+  const changed = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:600-660:v2",
+    sourceRequestedRange: { startLine: 600, endLine: 660, maxLines: 61 },
+    sourceObservedVersion: "50010:301",
+  });
+  assert.equal(changed.transition, "context_version_changed_to_targeting");
+  assert.equal(changed.state.mode, "action_plus_targeting");
+  assert.equal(changed.state.readLease, null);
+  assert.equal(changed.state.decisionCheckpoint.nextRequiredCapability, "targeting");
+  assert.equal(changed.state.decisionCheckpoint.evidenceVersion, "50010:301");
+  assert.equal(changed.state.phaseNoProgressCount, 0);
+});
+
+test("reviewed Plan line ranges accumulate versioned read segments before mutation", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "approved_plan_declaration_range_required",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "plan_line_context",
+        target: "src/main.js",
+        requestedRange: { startLine: 205, endLine: 900, maxLines: 696 },
+        requiredRange: { startLine: 205, endLine: 900, maxLines: 696 },
+        coveredRanges: [],
+        coverageMode: "segmented_exact",
+        observedVersion: "90000:400",
+        state: "available",
+      },
+    },
+  );
+  const first = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:205-380:v1",
+    sourceRequestedRange: { startLine: 205, endLine: 380, maxLines: 176 },
+    sourceObservedVersion: "90000:400",
+  });
+  assert.equal(first.transition, "context_refreshed");
+  assert.equal(first.state.mode, "patch_recovery_read");
+  assert.deepEqual(first.state.readLease.requestedRange, {
+    startLine: 381,
+    endLine: 900,
+    maxLines: 520,
+  });
+  assert.deepEqual(first.state.readLease.coveredRanges, [{ startLine: 205, endLine: 380 }]);
+
+  const changedMidRange = transitionExecuteRecoveryRuntimeState(first.state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:381-500:v2",
+    sourceRequestedRange: { startLine: 381, endLine: 500, maxLines: 120 },
+    sourceObservedVersion: "90010:401",
+  });
+  assert.equal(changedMidRange.transition, "context_refreshed");
+  assert.deepEqual(changedMidRange.state.readLease.requestedRange, {
+    startLine: 205,
+    endLine: 900,
+    maxLines: 696,
+  });
+  assert.deepEqual(changedMidRange.state.readLease.coveredRanges, []);
+  assert.equal(changedMidRange.state.readLease.observedVersion, "90010:401");
+
+  const second = transitionExecuteRecoveryRuntimeState(first.state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:381-900:v1",
+    sourceRequestedRange: { startLine: 381, endLine: 900, maxLines: 520 },
+    sourceObservedVersion: "90000:400",
+  });
+  assert.equal(second.transition, "context_to_mutation");
+  assert.equal(second.state.mode, "mutation_first");
+  assert.deepEqual(second.state.readLease.coveredRanges, [
+    { startLine: 205, endLine: 380 },
+    { startLine: 381, endLine: 900 },
+  ]);
+  assert.equal(second.state.readLease.state, "consumed");
 });
 
 test("policy deferrals, cache stubs, and PTY waits can refund the current phase debit", () => {
@@ -454,6 +641,7 @@ test("six identical semantic retries stop recovery even when phase debits are re
       readLease: {
         purpose: "patch_recovery",
         target: "src/main.js",
+        requestedRange: { startLine: 205, endLine: 256 },
         state: "active",
       },
     },
@@ -479,6 +667,7 @@ test("six identical semantic retries stop recovery even when phase debits are re
   const progressed = transitionExecuteRecoveryRuntimeState(state, {
     freshReadTarget: "src/main.js",
     sourceObservationKey: "src/main.js::v2::205-256",
+    sourceRequestedRange: { startLine: 205, endLine: 256 },
   });
   assert.equal(progressed.transition, "context_to_mutation");
   assert.equal(progressed.state.protocolNoProgressCount, 0);

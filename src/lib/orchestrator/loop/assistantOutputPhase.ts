@@ -560,7 +560,10 @@ export function handleAssistantOutputPhase(input: {
   const { hasExecutablePlanProposalOptions, shouldPauseForUserChoice } =
     assistantReplyOptionRouting;
 
-  if (!shouldHideApprovedPlanNoToolText) {
+  if (
+    !shouldHideApprovedPlanNoToolText &&
+    (effectiveToolCalls.length === 0 || hasSubstantivePlanAssistantText)
+  ) {
     callbacks.onTurnSummaryReady(visibleAssistantText);
   }
 

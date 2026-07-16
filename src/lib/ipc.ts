@@ -187,6 +187,12 @@ export interface AstQueryResult {
   rootKind: string;
   hasErrors: boolean;
   errorCount: number;
+  /** Exact workspace snapshot parsed by Tree-sitter. */
+  sizeBytes: number;
+  modifiedMs: number;
+  versionToken: string;
+  query: string;
+  exactMatchCount: number;
   symbols: AstSymbol[];
   truncated: boolean;
   note: string;

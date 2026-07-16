@@ -310,8 +310,8 @@ test("preapproval plan quality recovery requires a native plan artifact call", (
   }), undefined);
 });
 
-test("local execute recovery binds the request to the current transaction tool", () => {
-  assert.deepEqual(resolveRecoveryToolChoice({
+test("local recovery binds only genuinely single-capability phases", () => {
+  assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "mutation_first",
     approvedPlanActionOnlyRecoveryActive: false,
@@ -319,7 +319,7 @@ test("local execute recovery binds the request to the current transaction tool",
     llmToolNames: ["apply_patch", "replace_in_file", "write_file"],
     forceXmlTools: false,
     preferExplicitFunction: true,
-  }), { type: "function", function: { name: "apply_patch" } });
+  }), "required");
 
   assert.deepEqual(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
@@ -330,6 +330,16 @@ test("local execute recovery binds the request to the current transaction tool",
     forceXmlTools: false,
     preferExplicitFunction: true,
   }), { type: "function", function: { name: "read_file" } });
+
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: "patch_recovery_read",
+    approvedPlanActionOnlyRecoveryActive: false,
+    approvedPlanNoToolRecoveryFileReadActive: false,
+    llmToolNames: ["read_file", "wait_subagents"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+  }), "required", "a pending child join must not be quarantined by named read_file choice");
 });
 
 test("local max-iteration continuation binds the first post-mutation action to run_command", () => {
@@ -365,6 +375,21 @@ test("local recovery tool choice follows the contract next capability, not the l
     forceXmlTools: false,
     preferExplicitFunction: true,
   };
+  const targeting = resolveExecuteRecoveryActionContract("action_plus_targeting", {
+    expectedTarget: "src/main.js",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "head-v1",
+      nextRequiredCapability: "targeting",
+      evidenceVersion: "9000:100",
+    },
+  });
+  assert.equal(resolveRecoveryToolChoice({
+    ...common,
+    recoveryActionContract: targeting,
+    llmToolNames: ["code_ast_query", "find_symbol_references", "get_file_outline"],
+  }), "required", "structural targeting is a capability surface, not one hard-coded parser call");
+
   const observePty = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     devServerStatus: "running",
     devServerNextCapability: "observe_pty",
@@ -422,7 +447,7 @@ test("broad validation recovery requires a tool without forcing finite command e
   }), "required");
 });
 
-test("approved plan recovery binds native tool choice to the remaining evidence kind", () => {
+test("approved plan action recovery preserves its multi-tool capability surface", () => {
   const validationTasks = [{
     id: "validate",
     text: "Run a focused validation",
@@ -435,7 +460,7 @@ test("approved plan recovery binds native tool choice to the remaining evidence 
     evidenceLedger: [],
   });
   assert.deepEqual(validationPreferred.slice(0, 2), ["run_command", "execute_command"]);
-  assert.deepEqual(resolveRecoveryToolChoice({
+  assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
     approvedPlanActionOnlyRecoveryActive: true,
@@ -444,7 +469,7 @@ test("approved plan recovery binds native tool choice to the remaining evidence 
     forceXmlTools: false,
     preferExplicitFunction: true,
     approvedPlanRecoveryPreferredToolNames: validationPreferred,
-  }), { type: "function", function: { name: "run_command" } });
+  }), "required");
 
   const browserPreferred = resolveApprovedPlanRecoveryPreferredToolNames({
     tasks: [{
@@ -455,7 +480,7 @@ test("approved plan recovery binds native tool choice to the remaining evidence 
     }],
     evidenceLedger: [],
   });
-  assert.deepEqual(resolveRecoveryToolChoice({
+  assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: false,
     executeRecoveryMode: "normal",
     approvedPlanActionOnlyRecoveryActive: true,
@@ -464,7 +489,7 @@ test("approved plan recovery binds native tool choice to the remaining evidence 
     forceXmlTools: false,
     preferExplicitFunction: true,
     approvedPlanRecoveryPreferredToolNames: browserPreferred,
-  }), { type: "function", function: { name: "browser_evaluate" } });
+  }), "required");
 });
 
 test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {

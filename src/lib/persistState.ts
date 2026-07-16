@@ -28,6 +28,15 @@ export const LEGACY_CONFIG_PERSIST_KEYS = [
   "thoughtDisplayMode",
 ] as const;
 
+/**
+ * Goal is a one-message composer choice, so a historical persisted value must
+ * never restore its capsule. Other composer intents retain their existing
+ * persistence behavior.
+ */
+export function sanitizeHydratedLockedComposerIntent(value: unknown): unknown {
+  return value === "goal" ? null : value;
+}
+
 export function stripLegacyConfigFields(config: unknown): Record<string, unknown> | undefined {
   if (!config || typeof config !== "object") return undefined;
   const nextConfig = { ...(config as Record<string, unknown>) };
@@ -71,6 +80,11 @@ export function stripLegacyRuntimeFieldsFromPersistedState(
     if (Object.prototype.hasOwnProperty.call(nextState, key)) {
       delete nextState[key];
     }
+  }
+  if (Object.prototype.hasOwnProperty.call(nextState, "lockedComposerIntent")) {
+    nextState.lockedComposerIntent = sanitizeHydratedLockedComposerIntent(
+      nextState.lockedComposerIntent,
+    );
   }
   if (nextState.sessionsByWorkspace) {
     nextState.sessionsByWorkspace = stripSessionsByWorkspaceForLocalPersist(

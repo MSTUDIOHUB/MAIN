@@ -59,6 +59,22 @@ export async function runSubmitPlanHydrationEffect(
     hydrated = null;
   }
 
+  // Hydration itself writes Plan state, so stale-session rejection must happen
+  // before applying the hydrated artifact projection, not only before the
+  // recursive submission below. The supplied identity is always populated by
+  // sendMessage, including workspace-only submissions without a session id.
+  const stateAfterHydrationRead = input.getState();
+  if (
+    input.sendOriginSessionKey &&
+    !input.isSessionRuntimeActive(stateAfterHydrationRead, input.sendOriginSessionKey)
+  ) {
+    input.logStoreEvent("send_async_resume_skipped_inactive_session", {
+      phase: "auto_plan_hydration",
+      sessionKey: input.sendOriginSessionKey,
+    });
+    return;
+  }
+
   const shouldPromoteToExecuting = shouldPromoteHydratedPlanToExecuting(input.reason);
   const hasHydratedData = !!hydrated && (hydrated.artifacts.length > 0 || hydrated.tasks.length > 0);
   if (hydrated && hasHydratedData) {

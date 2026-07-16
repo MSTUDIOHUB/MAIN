@@ -70,6 +70,7 @@ async function buildPatchRecoveryMismatchEvidence(input: {
   reason: "invalid_patch" | "search_text_mismatch";
   target: string;
   requestedRange?: RecoveryReadLease["requestedRange"];
+  failureIdentity?: string | null;
   readFileMetadata?: WorkspaceMutationPreflightInput["readFileMetadata"];
 }): Promise<PatchRecoveryMismatchEvidence> {
   const metadata = input.readFileMetadata
@@ -79,6 +80,7 @@ async function buildPatchRecoveryMismatchEvidence(input: {
     mismatchFingerprint: buildExecutePatchMismatchFingerprint({
       reason: input.reason,
       target: input.target,
+      failureIdentity: input.failureIdentity,
     }),
     target: input.target,
     ...(input.requestedRange ? { requestedRange: input.requestedRange } : {}),
@@ -86,6 +88,49 @@ async function buildPatchRecoveryMismatchEvidence(input: {
       ? `${Number(metadata.sizeBytes) || 0}:${Number(metadata.modifiedMs) || 0}`
       : null,
   };
+}
+
+function inferReplaceMismatchRecoveryRange(
+  current: string,
+  searchText: string,
+): RecoveryReadLease["requestedRange"] {
+  const lines = String(current || "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+  const searchLines = String(searchText || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 4)
+    .sort((left, right) => right.length - left.length);
+  let anchorIndex = -1;
+  for (const candidate of searchLines) {
+    anchorIndex = lines.findIndex((line) => line.includes(candidate));
+    if (anchorIndex >= 0) break;
+  }
+  if (anchorIndex < 0) {
+    const identifiers = [...new Set(String(searchText || "").match(/[A-Za-z_$][\w$]{3,}/g) || [])]
+      .filter((identifier) => !/^(?:function|return|const|class|import|export|async|await)$/i.test(identifier))
+      .slice(0, 12);
+    for (const identifier of identifiers) {
+      anchorIndex = lines.findIndex((line) => line.includes(identifier));
+      if (anchorIndex >= 0) break;
+    }
+  }
+  if (anchorIndex < 0) return null;
+  const startLine = Math.max(1, anchorIndex + 1 - 30);
+  const endLine = Math.min(Math.max(lines.length, 1), anchorIndex + 1 + 49);
+  return {
+    startLine,
+    endLine,
+    maxLines: Math.max(1, endLine - startLine + 1),
+  };
+}
+
+function buildReplaceMismatchFailureIdentity(searchText: string): string {
+  const identifiers = [...new Set(String(searchText || "").match(/[A-Za-z_$][\w$]{2,}/g) || [])]
+    .slice(0, 4)
+    .join("-");
+  return `search-${identifiers || "text"}-${String(searchText || "").length}`;
 }
 
 function buildMessage(input: {
@@ -225,7 +270,10 @@ export async function preflightWorkspaceMutation(
     const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({
       reason: "search_text_mismatch",
       target: path,
-      requestedRange: normalizeRecoveryReadRange(input.args),
+      requestedRange:
+        normalizeRecoveryReadRange(input.args) ||
+        inferReplaceMismatchRecoveryRange(current, searchText),
+      failureIdentity: buildReplaceMismatchFailureIdentity(searchText),
       readFileMetadata: input.readFileMetadata,
     });
     return blocked({

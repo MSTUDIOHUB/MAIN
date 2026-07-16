@@ -16,6 +16,7 @@ import {
   logAgentEvent,
 } from "../../orchestrator";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import { extractReadFileWindowMetadata } from "../../readFileWindow";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { TaskOrchestratorPhase, TaskTargetingProfile } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
@@ -72,6 +73,20 @@ import {
 
 type WorkflowMode = "chat" | "edit" | "plan";
 type ProviderReasoningForHistory = Parameters<typeof buildAssistantHistoryMessage>[1];
+
+function observedReadResultRange(result: ToolExecutionResult) {
+  const metadata = extractReadFileWindowMetadata(result.content || "");
+  if (metadata) {
+    return {
+      startLine: metadata.returnedStartLine,
+      endLine: metadata.returnedEndLine,
+      maxLines: Math.max(1, metadata.returnedEndLine - metadata.returnedStartLine + 1),
+    };
+  }
+  return requestedRangeFromReadObservationSignature(
+    result.readFileObservation?.requestSignature || "",
+  );
+}
 
 function buildReadProgressFingerprint(
   state: ExecuteRecoveryRuntimeState,
@@ -179,6 +194,54 @@ function buildRecoveryProtocolNoProgressFingerprint(
     ].join("::"),
     readProgress,
   };
+}
+
+function normalizeLeaseBackedReadToolCalls(
+  calls: ToolCallToExecute[],
+  state: ExecuteRecoveryRuntimeState,
+): ToolCallToExecute[] {
+  const lease = state.readLease;
+  if (
+    !lease ||
+    (lease.state !== "available" && lease.state !== "active")
+  ) {
+    return calls;
+  }
+  const contract = resolveExecuteRecoveryActionContract(state.mode, {
+    expectedTarget: state.expectedTarget,
+    readLease: lease,
+    sourceObservationKey: state.sourceObservationKey,
+    decisionCheckpoint: state.decisionCheckpoint,
+    phaseNoProgressCount: state.phaseNoProgressCount,
+    protocolNoProgressCount: state.protocolNoProgressCount,
+    protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
+  });
+  if (contract.nextRequiredCapability !== "targeted_read") return calls;
+  return calls.map((call) => {
+    if (call.name !== "read_file") return call;
+    let args: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(call.arguments || "{}");
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        args = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // The lease is authoritative even when a local model emitted malformed
+      // or incomplete arguments for the required read capability.
+    }
+    const range = lease.requestedRange;
+    const normalizedArgs: Record<string, unknown> = {
+      ...args,
+      path: lease.target,
+      ...(range?.startLine ? { start_line: range.startLine } : {}),
+      ...(range?.endLine ? { end_line: range.endLine } : {}),
+      ...(range?.maxLines ? { max_lines: range.maxLines } : {}),
+    };
+    return {
+      ...call,
+      arguments: JSON.stringify(normalizedArgs),
+    };
+  });
 }
 
 type SetPlanRuntimePhase = (
@@ -294,6 +357,21 @@ export async function executeToolCallPhase(input: {
   let executeRecoveryState = input.executeRecoveryState;
   let loopGuardRuntimeState = input.loopGuardRuntimeState;
   let approvedPlanRecoveryState = input.approvedPlanRecoveryState;
+  const effectiveToolCalls = normalizeLeaseBackedReadToolCalls(
+    input.effectiveToolCalls,
+    executeRecoveryState,
+  );
+  if (effectiveToolCalls.some((call, index) =>
+    call.arguments !== input.effectiveToolCalls[index]?.arguments
+  )) {
+    logAgentEvent("execute_recovery_read_args_normalized", {
+      iteration: input.iteration,
+      target: executeRecoveryState.readLease?.target || executeRecoveryState.expectedTarget,
+      purpose: executeRecoveryState.readLease?.purpose || null,
+      requestedRange: executeRecoveryState.readLease?.requestedRange || null,
+      coverageMode: executeRecoveryState.readLease?.coverageMode || "exact",
+    });
+  }
   const markExecuteOperationEvidenceAndSync = () => {
     input.markExecuteOperationEvidence();
     evidenceRuntimeState = markExecuteOperationEvidenceRuntimeState(
@@ -321,16 +399,16 @@ export async function executeToolCallPhase(input: {
 
   logAgentEvent("tool_calls_detected", {
     iteration: input.iteration,
-    count: input.effectiveToolCalls.length,
-    names: input.effectiveToolCalls.map((call) => call.name).slice(0, 12),
+    count: effectiveToolCalls.length,
+    names: effectiveToolCalls.map((call) => call.name).slice(0, 12),
   });
   input.emitTaskOrchestratorPhase("EXECUTE_STEP", {
     iteration: input.iteration,
-    toolCalls: input.effectiveToolCalls.length,
-    toolNames: input.effectiveToolCalls.map((call) => call.name).slice(0, 12),
+    toolCalls: effectiveToolCalls.length,
+    toolNames: effectiveToolCalls.map((call) => call.name).slice(0, 12),
   });
 
-  const toolCallsForMsg: ToolCallInMessage[] = input.effectiveToolCalls.map((tc) => ({
+  const toolCallsForMsg: ToolCallInMessage[] = effectiveToolCalls.map((tc) => ({
     id: tc.id,
     type: "function" as const,
     function: {
@@ -346,7 +424,7 @@ export async function executeToolCallPhase(input: {
   ));
 
   const partitionedToolCalls = await partitionToolCallsForExecution({
-    toolCalls: input.effectiveToolCalls,
+    toolCalls: effectiveToolCalls,
     workspace: input.workspace,
     callbacks: input.callbacks,
     iteration: input.iteration,
@@ -406,29 +484,38 @@ export async function executeToolCallPhase(input: {
   const wasAborted = toolExecutionRound.status === "aborted";
 
   const recoveryStateAtBatchStart = executeRecoveryState;
-  const activePatchReadLease =
-    recoveryStateAtBatchStart.mode === "patch_recovery_read" &&
-    recoveryStateAtBatchStart.readLease?.purpose === "patch_recovery" &&
+  const activeRecoveryReadLease =
+    recoveryStateAtBatchStart.readLease &&
     (recoveryStateAtBatchStart.readLease.state === "available" ||
       recoveryStateAtBatchStart.readLease.state === "active")
       ? recoveryStateAtBatchStart.readLease
+      : null;
+  const activePatchReadLease =
+    recoveryStateAtBatchStart.mode === "patch_recovery_read" &&
+    activeRecoveryReadLease?.purpose === "patch_recovery"
+      ? activeRecoveryReadLease
       : null;
   const freshReadResult = allResults.find((result) => {
     if (result.name !== "read_file" || result.isError || result.internalFeedback) return false;
     const detail = String(result.displayContent || result.content || "");
     const overlapExtension = /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(detail);
-    const satisfiesPatchReadLease = Boolean(
-      activePatchReadLease &&
+    const satisfiesActiveReadLease = Boolean(
+      activeRecoveryReadLease &&
       readEvidenceSatisfiesRecoveryLease({
-        lease: activePatchReadLease,
+        lease: activeRecoveryReadLease,
         target: result.target,
-        requestedRange: requestedRangeFromReadObservationSignature(
-          result.readFileObservation?.requestSignature || "",
-        ),
+        requestedRange: observedReadResultRange(result),
         observedVersion: result.readFileObservation?.versionToken || null,
       })
     );
-    if (overlapExtension && !satisfiesPatchReadLease) return false;
+    // Keep a real overlapping window visible to the recovery state machine
+    // while a lease is active. It may carry a newer file version even when it
+    // cannot satisfy the old range/version identity; the transition then
+    // invalidates the stale lease and returns to structural targeting.
+    if (overlapExtension && !satisfiesActiveReadLease && !activeRecoveryReadLease) return false;
+    if (result.readFileObservation?.source === "stub" && satisfiesActiveReadLease) {
+      return true;
+    }
     return result.readFileObservation?.source
       ? result.readFileObservation.source !== "stub"
       : !isReadOnlyNoProgressDetail(detail);
@@ -464,9 +551,7 @@ export async function executeToolCallPhase(input: {
       readEvidenceSatisfiesRecoveryLease({
         lease: activePatchReadLease,
         target: result.target,
-        requestedRange: requestedRangeFromReadObservationSignature(
-          result.readFileObservation?.requestSignature || "",
-        ),
+        requestedRange: observedReadResultRange(result),
         observedVersion: result.readFileObservation?.versionToken || null,
       })
     )
@@ -483,10 +568,15 @@ export async function executeToolCallPhase(input: {
       expectedTarget: expectedRecoveryTarget,
       freshReadTarget: freshReadResult?.target,
       sourceObservationKey: freshReadResult?.readFileObservation?.key,
-      sourceRequestedRange: requestedRangeFromReadObservationSignature(
-        freshReadResult?.readFileObservation?.requestSignature || "",
-      ),
+      sourceRequestedRange: freshReadResult
+        ? observedReadResultRange(freshReadResult)
+        : null,
       sourceObservedVersion: freshReadResult?.readFileObservation?.versionToken || null,
+      sourceRangeWasRuntimeNarrowed: freshReadResult
+        ? /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(String(
+            freshReadResult.displayContent || freshReadResult.content || "",
+          ))
+        : false,
       mutationTarget: mutationResult?.target,
       validationTarget: validationResult?.target || validationResult?.name,
       validationToolName: validationResult?.name,
@@ -621,7 +711,7 @@ export async function executeToolCallPhase(input: {
     const observedToolCallIds = new Set(allResults.map((result) => result.toolCallId));
     const protocolResults = [
       ...allResults,
-      ...input.effectiveToolCalls
+      ...effectiveToolCalls
         .filter((call) => !observedToolCallIds.has(call.id))
         .map((call): ToolExecutionResult => {
           const args = toolArgsByCallId.get(call.id) || {};

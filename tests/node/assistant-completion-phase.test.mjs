@@ -61,12 +61,26 @@ test("execute conclusions are held until evidence audit commits or discards the 
   const iterationSource = sourceFor("src/lib/orchestrator/loop/assistantIterationPhase.ts");
 
   assert.match(orchestratorSource, /__EVIDENCE_DRAFT_HOLD__:execution_evidence/);
+  assert.match(
+    orchestratorSource,
+    /const holdExecuteConclusionDraft =\s*runtimeIntent === "execute" &&\s*requiresExecutionEvidence/,
+  );
+  assert.doesNotMatch(orchestratorSource, /preStreamEvidenceAudit/);
   assert.match(workflowSource, /executionEvidenceDraftHeld/);
   assert.match(workflowSource, /executionEvidenceDraftBuffer \+= token/);
   assert.match(workflowSource, /pendingEvidenceDraftFinalPresentation = \{/);
   assert.match(workflowSource, /execution_evidence_final_presentation_held/);
   assert.match(workflowSource, /if \(finalPresentation\) \{[\s\S]*callbacks\.onAssistantFinalText\(/);
   assert.match(workflowSource, /else if \(draft && commitReason === "tool_call"\)/);
+  assert.doesNotMatch(
+    workflowSource,
+    /else if \(draft && commitReason === "tool_call"\)[\s\S]{0,500}streamBuffer\.append\(draft\)/,
+  );
+  assert.match(workflowSource, /structured tool\/progress events own[\s\S]*visible activity projection/);
+  assert.doesNotMatch(
+    workflowSource,
+    /: hasToolCalls[\s\S]{0,400}summary: normalizedFinal \|\| turn\.summary/,
+  );
   assert.match(workflowSource, /isUnapprovedPlanRuntime\(\) \|\| context\.executionEvidenceDraftHeld/);
   assert.match(iterationSource, /__EVIDENCE_DRAFT_COMMIT__:tool_call/);
 });

@@ -15,6 +15,8 @@ import {
   resolveSubmitExecutionApprovalDecision,
   type SubmitBlockingPreflightEffect,
   type SubmitEffectiveIntentInput,
+  type GoalCreationAuthorization,
+  type GoalContinuationAuthorization,
   type SubmitPipelineOptions,
 } from "../lib/submit/turnSubmission";
 import type { PlanStage } from "../lib/workflowModels";
@@ -44,6 +46,8 @@ export interface SubmitIntentRoutingInput<
   mainDebugShortcut: SubmitEffectiveIntentInput["mainDebugShortcut"];
   mainIntentShortcut: SubmitEffectiveIntentInput["mainIntentShortcut"];
   lockedComposerIntent: SubmitEffectiveIntentInput["lockedComposerIntent"];
+  goalCreationAuthorization: GoalCreationAuthorization | null;
+  goalContinuationAuthorization: GoalContinuationAuthorization | null;
   currentTurn: SubmitEffectiveIntentInput["currentTurn"];
   currentTurnIntent: ResolvedRunIntent;
   hasPlanArtifacts: boolean;
@@ -84,6 +88,7 @@ export type SubmitIntentRoutingResult =
       effectiveIntentSummary: string;
       effectiveCommandDirective: CommandDirective | null;
       shouldForceExecuteForAutoApprove: boolean;
+      goalCreationAuthorization: GoalCreationAuthorization | null;
     };
 
 function looksLikeExecutionIntent(params: {
@@ -147,6 +152,8 @@ export function resolveAndApplySubmitIntentRouting<
     mainDebugShortcut: input.mainDebugShortcut,
     mainIntentShortcut: input.mainIntentShortcut,
     lockedComposerIntent: input.lockedComposerIntent,
+    goalCreationAuthorization: input.goalCreationAuthorization,
+    goalContinuationAuthorization: input.goalContinuationAuthorization,
     currentTurn: input.currentTurn,
     currentTurnIntent: input.currentTurnIntent,
     shouldContinuePlanIntent: input.shouldContinuePlanIntent,
@@ -421,5 +428,8 @@ export function resolveAndApplySubmitIntentRouting<
     effectiveIntentSummary,
     effectiveCommandDirective,
     shouldForceExecuteForAutoApprove,
+    goalCreationAuthorization: effectiveRunIntent === "goal"
+      ? input.goalCreationAuthorization
+      : null,
   };
 }

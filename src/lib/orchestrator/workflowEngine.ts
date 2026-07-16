@@ -1,5 +1,6 @@
 import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
+import { isGoalRuntimeDeleted } from "../goalPersistence";
 import {
   evaluateGoalEvidenceCheckpoint,
   goalRequiresMutation,
@@ -1313,11 +1314,11 @@ export class WorkflowEngine {
               finalPresentation.meta,
             );
           } else if (draft && commitReason === "tool_call") {
-            // Tool-call prose is committed before assistantOutputPhase produces
-            // its normalized final presentation. Keep the existing streaming
-            // path for that non-terminal progress case only.
-            streamBuffer.append(draft);
-            streamBuffer.flush();
+            // Do not briefly publish model-authored tool narration and hide it
+            // a moment later. assistantOutputPhase persists the same text as a
+            // hidden process block while structured tool/progress events own
+            // the visible activity projection.
+            context.streamingAssistantDisplayBuffer = "";
           }
           logStoreEvent("execution_evidence_draft_committed", {
             turnId,
@@ -2005,7 +2006,6 @@ export class WorkflowEngine {
                       : isUnapprovedPlanRuntime()
                       ? "planning"
                       : "executing",
-                    summary: normalizedFinal || turn.summary,
                   }
                 : {
                     ...turn,
@@ -3858,14 +3858,43 @@ export class WorkflowEngine {
         if (!activeGoal) {
           return Promise.resolve({ status: "error", reason: "no_active_goal" });
         }
-        
+
+        const goalOwnerId = activeGoal.id;
+        const goalOwnerRevision = activeGoal.revision || 1;
+        const goalOwnerWorkspace = String(sessionGet().currentWorkspace || "").trim();
+        let staleGoalCallbackLogged = false;
+        const isCurrentGoalOwner = () => {
+          const state = sessionGet();
+          const currentGoal = state.goalRuntime?.goal || state.activeGoal;
+          return String(state.currentWorkspace || "").trim() === goalOwnerWorkspace &&
+            currentGoal?.id === goalOwnerId &&
+            (currentGoal.revision || 1) === goalOwnerRevision &&
+            !isGoalRuntimeDeleted(goalOwnerWorkspace, goalOwnerId);
+        };
+        const acceptGoalCallback = (callback: string) => {
+          const accepted = isCurrentGoalOwner();
+          if (!accepted && !staleGoalCallbackLogged) {
+            staleGoalCallbackLogged = true;
+            callbacks.onDebugEvent?.("goal_callback_ignored_stale_owner", {
+              callback,
+              goalId: goalOwnerId,
+              goalRevision: goalOwnerRevision,
+              workspace: goalOwnerWorkspace || null,
+            });
+          }
+          return accepted;
+        };
+
         let latestGoalEvidence = [
           ...(sessionGet().goalRuntime?.progress?.evidence || sessionGet().goalProgress?.evidence || []),
         ];
         const goalCallbacks: GoalEngineCallbacks = {
           getPreferredLanguage: callbacks.getPreferredLanguage,
-          getWorkspacePath: () => resolveSessionWorkspaceKey(sessionGet().currentWorkspace) || "",
+          getWorkspacePath: () => goalOwnerWorkspace || resolveSessionWorkspaceKey(null),
           runAgentIteration: async (iterInput) => {
+            if (!acceptGoalCallback("runAgentIteration")) {
+              throw new Error("GOAL_OWNER_RELEASED: the Goal was deleted or replaced");
+            }
             activeRuntimeRunIdentity = resolveRuntimeRunIdentity({
               marker: sessionGet().harnessRunMarker,
               sessionKey: runSessionKey,
@@ -3949,6 +3978,30 @@ export class WorkflowEngine {
             let checkpointEvidence = [...latestGoalEvidence];
             const iterCallbacks = {
               ...callbacks,
+              onStreamToken: (...args: Parameters<OrchestratorCallbacks["onStreamToken"]>) => {
+                if (acceptGoalCallback("onStreamToken")) callbacks.onStreamToken(...args);
+              },
+              onStreamDone: (...args: Parameters<OrchestratorCallbacks["onStreamDone"]>) => {
+                if (acceptGoalCallback("onStreamDone")) callbacks.onStreamDone(...args);
+              },
+              onThought: (...args: Parameters<OrchestratorCallbacks["onThought"]>) => {
+                if (acceptGoalCallback("onThought")) callbacks.onThought(...args);
+              },
+              onAssistantFinalText: (
+                ...args: Parameters<OrchestratorCallbacks["onAssistantFinalText"]>
+              ) => {
+                if (acceptGoalCallback("onAssistantFinalText")) {
+                  callbacks.onAssistantFinalText(...args);
+                }
+              },
+              requestReview: async (
+                ...args: Parameters<OrchestratorCallbacks["requestReview"]>
+              ) => {
+                if (!acceptGoalCallback("requestReview")) {
+                  return { action: "reject" as const };
+                }
+                return callbacks.requestReview(...args);
+              },
               getGoalTurnContract: () => iterInput.goalTurnContract,
               getForcedExecuteRecoveryState: () =>
                 continuationRecoveryState || callbacks.getForcedExecuteRecoveryState?.() || null,
@@ -4223,29 +4276,45 @@ export class WorkflowEngine {
             };
           },
           writeFile: async (path, content) => {
+            if (!acceptGoalCallback("writeFile")) return;
             const { writeFileAtomic } = await import("../ipc");
+            if (!acceptGoalCallback("writeFile")) return;
             await writeFileAtomic(path, content);
           },
           readFile: async (path) => {
+            if (!acceptGoalCallback("readFile")) return null;
             try {
               const { readFile } = await import("../ipc");
+              if (!acceptGoalCallback("readFile")) return null;
               return await readFile(path);
             } catch {
               return null;
             }
           },
-          isAborted: () => abortCtrl.signal.aborted,
+          isAborted: () => abortCtrl.signal.aborted || !isCurrentGoalOwner(),
           onGoalProgressUpdate: (progress, goal) => {
+            if (!acceptGoalCallback("onGoalProgressUpdate")) return;
             latestGoalEvidence = [...(progress.evidence || [])];
             callbacks.onGoalProgressUpdate?.(progress, goal);
           },
-          onGoalRuntimeUpdate: (runtime) => callbacks.onGoalRuntimeUpdate?.(runtime),
-          onGoalIterationStart: (iter) => callbacks.onGoalIterationStart?.(iter),
-          onGoalIterationEnd: (iter) => callbacks.onGoalIterationEnd?.(iter),
-          onGoalCheckpointSaved: (ckpt) => callbacks.onGoalCheckpointSaved?.(ckpt),
-          onGoalUserConfirmNeeded: async (message) =>
-            callbacks.onGoalUserConfirmNeeded?.(message) ?? false,
-          onGoalOutcome: (outcome) => callbacks.onGoalOutcome?.(outcome),
+          onGoalRuntimeUpdate: (runtime) => {
+            if (acceptGoalCallback("onGoalRuntimeUpdate")) callbacks.onGoalRuntimeUpdate?.(runtime);
+          },
+          onGoalIterationStart: (iter) => {
+            if (acceptGoalCallback("onGoalIterationStart")) callbacks.onGoalIterationStart?.(iter);
+          },
+          onGoalIterationEnd: (iter) => {
+            if (acceptGoalCallback("onGoalIterationEnd")) callbacks.onGoalIterationEnd?.(iter);
+          },
+          onGoalCheckpointSaved: (ckpt) => {
+            if (acceptGoalCallback("onGoalCheckpointSaved")) callbacks.onGoalCheckpointSaved?.(ckpt);
+          },
+          onGoalUserConfirmNeeded: async (message) => acceptGoalCallback("onGoalUserConfirmNeeded")
+            ? callbacks.onGoalUserConfirmNeeded?.(message) ?? false
+            : false,
+          onGoalOutcome: (outcome) => {
+            if (acceptGoalCallback("onGoalOutcome")) callbacks.onGoalOutcome?.(outcome);
+          },
           onDebugEvent: callbacks.onDebugEvent,
         };
 
@@ -4258,14 +4327,14 @@ export class WorkflowEngine {
               ?.goalContinuationGuidance || "",
           ).trim() || undefined,
         }).then((goalOutcome) => {
-          if (goalOutcome.status === "completed") {
+          if (isCurrentGoalOwner() && goalOutcome.status === "completed") {
             appendWorkflowRuntimeEvent({
               type: "turn.completed",
               threadId: runSessionKey,
               turnId,
               timestampMs: Date.now(),
             });
-          } else if (goalOutcome.status === "failed") {
+          } else if (isCurrentGoalOwner() && goalOutcome.status === "failed") {
             appendWorkflowRuntimeEvent({
               type: "turn.failed",
               threadId: runSessionKey,
@@ -4508,6 +4577,8 @@ export class WorkflowEngine {
               attachedFilesSnapshot: queuedAfterRun.attachedFiles || [],
               runtimeIntentOverride: queuedAfterRun.runtimeIntentOverride,
               goalSourceContextSnapshot: queuedAfterRun.goalSourceContextSnapshot,
+              goalContinuationGuidance: queuedAfterRun.goalContinuationGuidance,
+              queuedUserMessageId: queuedAfterRun.id,
             }) === true;
           } catch (error) {
             logStoreEvent("queued_user_message_submission_failed", {

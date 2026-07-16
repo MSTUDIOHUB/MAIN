@@ -3,7 +3,11 @@ import type { HarnessRunMarker } from "../lib/harnessCrashTelemetry";
 import type { PlanStage } from "../lib/workflowModels";
 import type { ResolvedRunIntent } from "../lib/runIntent";
 import { resolveSubmitRunLineage } from "../lib/runIdentity";
-import { buildSubmitHarnessRunMarkerDraft } from "../lib/submit/turnSubmission";
+import {
+  buildSubmitHarnessRunMarkerDraft,
+  isGoalCreationAuthorization,
+  type GoalCreationAuthorization,
+} from "../lib/submit/turnSubmission";
 
 export interface SubmitRunLeaseRuntimeSnapshot {
   agentMessagesLength: number;
@@ -27,6 +31,8 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   runtimeRunIntent: ResolvedRunIntent;
   /** Continue the identity-validated active Goal instead of creating a new one. */
   continueExistingGoal?: boolean;
+  /** Consumed by this lease only; callers cannot infer it from resolvedIntent. */
+  goalCreationAuthorization?: GoalCreationAuthorization | null;
   /** Exact paused run that an action continuation resumes. */
   parentRunIdOverride?: string;
   /** Preallocated child owner for approval handoffs. */
@@ -90,7 +96,15 @@ export function startSubmitRunLease<TAbortController>(
   const abortController = input.createAbortController();
   input.setAbortController(abortController);
 
-  if (input.effectiveRunIntent === "goal" && input.continueExistingGoal !== true) {
+  const hasExplicitGoalCreationAuthorization = isGoalCreationAuthorization(
+    input.goalCreationAuthorization,
+  );
+  if (
+    input.effectiveRunIntent === "goal" &&
+    input.runtimeRunIntent === "goal" &&
+    input.continueExistingGoal !== true &&
+    hasExplicitGoalCreationAuthorization
+  ) {
     const canonicalObjective = String(input.canonicalUserText || "").trim() || input.userContent.trim();
     input.startGoal(
       canonicalObjective,

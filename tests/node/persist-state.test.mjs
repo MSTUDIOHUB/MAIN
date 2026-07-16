@@ -59,6 +59,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const {
   LOCAL_PERSIST_SCHEMA_VERSION,
   buildPersistedAppState,
+  sanitizeHydratedLockedComposerIntent,
   stripLegacyRuntimeFieldsFromPersistedState,
   stripSessionsByWorkspaceForLocalPersist,
 } = loadTranspiledModuleSync(
@@ -67,6 +68,13 @@ const {
 
 test("persist schema version is bumped for runtime payload slimming", () => {
   assert.equal(LOCAL_PERSIST_SCHEMA_VERSION, 2);
+});
+
+test("hydration drops stale Goal composer intent without changing other intents", () => {
+  assert.equal(sanitizeHydratedLockedComposerIntent("goal"), null);
+  assert.equal(sanitizeHydratedLockedComposerIntent("plan"), "plan");
+  assert.equal(sanitizeHydratedLockedComposerIntent("analyze"), "analyze");
+  assert.equal(sanitizeHydratedLockedComposerIntent(null), null);
 });
 
 test("buildPersistedAppState keeps lightweight config/session metadata only", () => {
@@ -160,6 +168,7 @@ test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and 
     agentMessages: [{ role: "assistant", content: "x" }],
     conversationTurns: [{ id: "t1" }],
     input: "draft",
+    lockedComposerIntent: "goal",
     sessionsByWorkspace: {
       "/repo": [
         {
@@ -186,6 +195,7 @@ test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and 
   assert.equal(Object.prototype.hasOwnProperty.call(stripped, "agentMessages"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(stripped, "conversationTurns"), false);
   assert.equal(Object.prototype.hasOwnProperty.call(stripped, "input"), false);
+  assert.equal(stripped.lockedComposerIntent, null);
   assert.deepEqual(stripped.sessionsByWorkspace, {
     "/repo": [
       {
@@ -196,6 +206,14 @@ test("stripLegacyRuntimeFieldsFromPersistedState removes heavy runtime keys and 
       },
     ],
   });
+});
+
+test("legacy hydration preserves non-Goal composer intent", () => {
+  const stripped = stripLegacyRuntimeFieldsFromPersistedState({
+    lockedComposerIntent: "plan",
+  });
+
+  assert.equal(stripped.lockedComposerIntent, "plan");
 });
 
 test("stripSessionsByWorkspaceForLocalPersist keeps temporary recording-disabled sessions", () => {

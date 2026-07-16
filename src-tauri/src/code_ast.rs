@@ -1,6 +1,7 @@
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use tree_sitter::{Language, Node, Parser};
 use walkdir::WalkDir;
 
@@ -27,9 +28,14 @@ pub struct AstSymbol {
 pub struct AstQueryResult {
     pub path: String,
     pub language: String,
+    pub query: String,
     pub root_kind: String,
     pub has_errors: bool,
     pub error_count: usize,
+    pub size_bytes: u64,
+    pub modified_ms: u128,
+    pub version_token: String,
+    pub exact_match_count: usize,
     pub symbols: Vec<AstSymbol>,
     pub truncated: bool,
     pub note: String,
@@ -236,16 +242,36 @@ pub fn query_file(
     kinds: Option<&str>,
     max_results: Option<usize>,
 ) -> Result<AstQueryResult, String> {
-    let metadata =
+    let metadata_before =
         fs::metadata(path).map_err(|error| format!("AST_FILE_METADATA_FAILED: {error}"))?;
-    if metadata.len() > MAX_AST_FILE_BYTES {
+    if metadata_before.len() > MAX_AST_FILE_BYTES {
         return Err(format!(
             "AST_FILE_TOO_LARGE: {} bytes exceeds the {} byte parser limit.",
-            metadata.len(),
+            metadata_before.len(),
             MAX_AST_FILE_BYTES
         ));
     }
+    let modified_before = metadata_before
+        .modified()
+        .map_err(|error| format!("AST_FILE_METADATA_FAILED: {error}"))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("AST_FILE_METADATA_FAILED: {error}"))?
+        .as_millis();
     let source = fs::read(path).map_err(|error| format!("AST_FILE_READ_FAILED: {error}"))?;
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("AST_FILE_METADATA_FAILED: {error}"))?;
+    let modified_ms = metadata
+        .modified()
+        .map_err(|error| format!("AST_FILE_METADATA_FAILED: {error}"))?
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("AST_FILE_METADATA_FAILED: {error}"))?
+        .as_millis();
+    if metadata.len() != metadata_before.len() || modified_ms != modified_before {
+        return Err(
+            "AST_FILE_CHANGED_DURING_PARSE: retry the query against the current file version."
+                .to_string(),
+        );
+    }
     let (language, tree) = parse_source(path, &source)?;
     let root = tree.root_node();
     let query = query.unwrap_or_default().trim().to_ascii_lowercase();
@@ -258,8 +284,10 @@ pub fn query_file(
     let limit = max_results
         .unwrap_or(DEFAULT_RESULT_LIMIT)
         .clamp(1, MAX_RESULT_LIMIT);
-    let mut symbols = Vec::new();
+    let mut exact_symbols = Vec::new();
+    let mut fuzzy_symbols = Vec::new();
     let mut matched_count = 0;
+    let mut exact_match_count = 0;
     let mut stack = vec![root];
     while let Some(node) = stack.pop() {
         if node.is_named() && is_declaration_kind(node.kind()) {
@@ -267,8 +295,10 @@ pub fn query_file(
                 let name = compact_text(node_text(name_node, &source), 160);
                 let kind = normalized_symbol_kind(node.kind()).to_string();
                 let signature = signature_for_node(node, &source);
+                let normalized_name = name.to_ascii_lowercase();
+                let exact_query_match = !query.is_empty() && normalized_name == query;
                 let matches_query = query.is_empty()
-                    || name.to_ascii_lowercase().contains(&query)
+                    || normalized_name.contains(&query)
                     || signature.to_ascii_lowercase().contains(&query)
                     || node.kind().to_ascii_lowercase().contains(&query);
                 let matches_kind = kind_filter.is_empty()
@@ -277,9 +307,17 @@ pub fn query_file(
                         .any(|expected| expected == &kind || expected == node.kind());
                 if !name.is_empty() && matches_query && matches_kind {
                     matched_count += 1;
-                    if symbols.len() < limit {
+                    if exact_query_match {
+                        exact_match_count += 1;
+                    }
+                    let target = if exact_query_match {
+                        &mut exact_symbols
+                    } else {
+                        &mut fuzzy_symbols
+                    };
+                    if target.len() < limit {
                         let start = node.start_position();
-                        symbols.push(AstSymbol {
+                        target.push(AstSymbol {
                             name,
                             kind,
                             syntax_kind: node.kind().to_string(),
@@ -295,14 +333,23 @@ pub fn query_file(
         let mut cursor = node.walk();
         stack.extend(node.named_children(&mut cursor));
     }
-    symbols.sort_by_key(|symbol| (symbol.start_line, symbol.start_column));
+    exact_symbols.sort_by_key(|symbol| (symbol.start_line, symbol.start_column));
+    fuzzy_symbols.sort_by_key(|symbol| (symbol.start_line, symbol.start_column));
+    let remaining = limit.saturating_sub(exact_symbols.len());
+    let mut symbols = exact_symbols;
+    symbols.extend(fuzzy_symbols.into_iter().take(remaining));
     let error_count = count_errors(root);
     Ok(AstQueryResult {
         path: relative_path(workspace, path),
         language: language.to_string(),
+        query,
         root_kind: root.kind().to_string(),
         has_errors: root.has_error(),
         error_count,
+        size_bytes: metadata.len(),
+        modified_ms,
+        version_token: format!("{}:{}", metadata.len(), modified_ms),
+        exact_match_count,
         symbols,
         truncated: matched_count > limit,
         note: "Tree-sitter syntax tree query. Results are parser-backed but do not include compiler type resolution."
@@ -477,11 +524,49 @@ mod tests {
         .unwrap();
         let result = query_file(root.path(), &path, None, None, Some(20)).unwrap();
         assert_eq!(result.language, "typescript");
+        assert_eq!(result.query, "");
+        assert_eq!(result.exact_match_count, 0);
+        assert_eq!(result.size_bytes, fs::metadata(&path).unwrap().len());
+        assert_eq!(
+            result.version_token,
+            format!("{}:{}", result.size_bytes, result.modified_ms)
+        );
         assert!(result.symbols.iter().any(|symbol| symbol.name == "Greeter"));
         assert!(result
             .symbols
             .iter()
             .any(|symbol| symbol.name == "buildGreeter"));
+    }
+
+    #[test]
+    fn ast_query_prioritizes_exact_names_over_many_fuzzy_matches() {
+        let root = tempdir().unwrap();
+        let path = root.path().join("sample.ts");
+        let mut source = String::from("function target() { return 1; }\n");
+        for index in 0..24 {
+            source.push_str(&format!(
+                "function targetFuzzy{index}() {{ return {index}; }}\n"
+            ));
+        }
+        source.push_str("function target() { return 2; }\n");
+        fs::write(&path, source).unwrap();
+
+        let result = query_file(root.path(), &path, Some("  TARGET  "), None, Some(3)).unwrap();
+
+        assert_eq!(result.query, "target");
+        assert_eq!(result.exact_match_count, 2);
+        assert_eq!(result.symbols.len(), 3);
+        assert_eq!(result.symbols[0].name, "target");
+        assert_eq!(result.symbols[1].name, "target");
+        assert_eq!(
+            result
+                .symbols
+                .iter()
+                .filter(|symbol| symbol.name == "target")
+                .count(),
+            2
+        );
+        assert!(result.truncated);
     }
 
     #[test]

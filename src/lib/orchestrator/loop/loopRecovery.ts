@@ -156,7 +156,7 @@ export interface ApprovedPlanNoProgressDecision {
 }
 
 export interface DirectMutationPreflightRecoveryDecision {
-  mode: "patch_recovery_read";
+  mode: "patch_recovery_read" | "mutation_first";
   reason: "mutation_preflight_invalid_patch" | "mutation_preflight_search_text_mismatch";
   target: string;
   mismatchFingerprint?: string;
@@ -170,6 +170,7 @@ export function resolveDirectMutationPreflightRecovery(input: {
   isPlanApproved: boolean;
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryAttempts: number;
+  hasRetainedSourceObservation?: boolean;
   results: ToolExecutionResult[];
 }): DirectMutationPreflightRecoveryDecision | null {
   const eligibleWorkflow =
@@ -206,17 +207,30 @@ export function resolveDirectMutationPreflightRecovery(input: {
       workspacePathsReferToSameFile(result.patchRecoveryMismatch.target, target)
         ? result.patchRecoveryMismatch
         : null;
+    const requestedRange = mismatchEvidence?.requestedRange || (
+      input.hasRetainedSourceObservation
+        ? null
+        : { startLine: 1, maxLines: 180 }
+    );
     return {
-      mode: "patch_recovery_read",
+      // Prefer the failed hunk/search anchor. If the parent already retains an
+      // exact source observation, retry mutation from it; otherwise grant one
+      // bounded initial target window instead of trapping direct Edit runs in
+      // mutation-only with no source at all.
+      mode: requestedRange
+        ? "patch_recovery_read"
+        : "mutation_first",
       reason,
       target,
       ...(mismatchEvidence
         ? {
             mismatchFingerprint: mismatchEvidence.mismatchFingerprint,
-            requestedRange: mismatchEvidence.requestedRange,
+            requestedRange,
             observedVersion: mismatchEvidence.observedVersion,
           }
-        : {}),
+        : requestedRange
+          ? { requestedRange }
+          : {}),
     };
   }
   return null;
@@ -261,6 +275,7 @@ export function handleNoProgressRecovery(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
   executeRecoveryAttempts: number;
+  executeRecoverySourceObservationKey?: string | null;
   repairExecutionRequestInChat: boolean;
   latestUserPromptText: string;
   isUnapprovedPlanReadOnlyBatch: boolean;
@@ -373,6 +388,21 @@ export function handleNoProgressRecovery(input: {
     isPlanApproved: callbacks.getIsPlanApproved(),
     executeRecoveryMode: currentExecuteRecoveryMode,
     executeRecoveryAttempts: currentExecuteRecoveryAttempts,
+    hasRetainedSourceObservation: Boolean(
+      input.executeRecoverySourceObservationKey ||
+      [...recentToolActivity].reverse().some((activity) =>
+        activity.readFileObservation &&
+        results.some((result) =>
+          isExecutePatchMismatchRecoveryActivity({
+            name: result.name,
+            status: result.isError ? "failed" : "succeeded",
+            target: result.target,
+            detail: [result.content, result.displayContent].filter(Boolean).join("\n"),
+          }) &&
+          workspacePathsReferToSameFile(activity.target, result.target)
+        )
+      )
+    ),
     results,
   });
   if (directMutationPreflightRecovery) {
@@ -389,7 +419,8 @@ export function handleNoProgressRecovery(input: {
         mismatchFingerprint: directMutationPreflightRecovery.mismatchFingerprint || null,
         requestedRange: directMutationPreflightRecovery.requestedRange || null,
         observedVersion: directMutationPreflightRecovery.observedVersion || null,
-        readLease: directMutationPreflightRecovery.target
+        readLease: directMutationPreflightRecovery.mode === "patch_recovery_read" &&
+          directMutationPreflightRecovery.target
           ? {
               purpose: "patch_recovery",
               target: directMutationPreflightRecovery.target,

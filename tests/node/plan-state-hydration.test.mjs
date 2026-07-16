@@ -150,6 +150,23 @@ test("plan panel keeps resume action available for paused approved execution", (
   assert.match(source, /reuseCurrentTurn:\s*!!resumeTurnId/);
 });
 
+test("early Plan hydration busy gate retains validated Goal authority and refreshes its source context", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+
+  assert.match(
+    source,
+    /const hasEarlyGoalAuthority = !!earlyGoalCreationAuthorization \|\|[\s\S]*?!!goalContinuationAuthorization[\s\S]*?const earlyGoalQueuedWorkflowContext =?[\s\S]*?shouldUseEarlyPlanSendGate && hasEarlyGoalAuthority[\s\S]*?runtimeIntentOverride:\s*"goal"[\s\S]*?goalCreationAuthorization:\s*earlyGoalCreationAuthorization[\s\S]*?goalContinuationAuthorization/,
+  );
+  assert.match(
+    source,
+    /const shouldUseEarlyPlanSendGate =[\s\S]{0,150}?autoHydrationReason \|\| shouldRouteContinuationToPlanResume[\s\S]*?if \(shouldUseEarlyPlanSendGate\)[\s\S]{0,500}?applyCurrentSendGate\(\s*state,\s*earlyGoalQueuedWorkflowContext,?\s*\)/,
+  );
+  assert.match(
+    source,
+    /resumeSubmission:[\s\S]*?refreshedGoalSourceContextSnapshot[\s\S]*?goalSourceContextSnapshot:\s*refreshedGoalSourceContextSnapshot/,
+  );
+});
+
 test("new empty workspace sessions hydrate persisted plan tasks into resumable execution state", () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");

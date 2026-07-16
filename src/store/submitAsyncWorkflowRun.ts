@@ -22,6 +22,10 @@ import type {
   PlanStage,
 } from "../lib/workflowModels";
 import type { TurnInputContextSignals } from "../lib/turnIntake";
+import type {
+  GoalContinuationAuthorization,
+  GoalCreationAuthorization,
+} from "../lib/submit/turnSubmission";
 import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
 import {
   buildSubmitAttachmentContext,
@@ -109,6 +113,8 @@ export interface StartSubmitAsyncWorkflowRunInput<
   preferredLanguage: "zh" | "en";
   effectiveRunIntent: ResolvedRunIntent;
   runtimeRunIntent: ResolvedRunIntent;
+  goalCreationAuthorization: GoalCreationAuthorization | null;
+  goalContinuationAuthorization: GoalContinuationAuthorization | null;
   effectiveWorkflowMode: LegacyWorkflowMode;
   effectiveCommandDirective: CommandDirective | null;
   effectiveIntentSummary: string;
@@ -280,8 +286,8 @@ export async function runSubmitAsyncWorkflowRun<
     turnId: input.turnId,
     effectiveRunIntent: input.effectiveRunIntent,
     runtimeRunIntent: input.runtimeRunIntent,
-    continueExistingGoal:
-      (input.options as { continueExistingGoal?: boolean } | null | undefined)?.continueExistingGoal === true,
+    continueExistingGoal: !!input.goalContinuationAuthorization,
+    goalCreationAuthorization: input.goalCreationAuthorization,
     parentRunIdOverride: input.parentRunIdOverride,
     runIdOverride: input.runIdOverride,
     getRuntimeSnapshot: () => ({

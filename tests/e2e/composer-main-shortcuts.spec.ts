@@ -105,6 +105,171 @@ test("Shift+Tab toggles plan intent mode in the MAIN composer", async ({ page })
   await expect(textarea).toHaveValue("需要先规划这个改动");
 });
 
+test("Goal shortcut is consumed by one successful message", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/");
+  await page.getByTestId("main-shortcut-item-goal").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+    )
+    .toBe("goal");
+
+  await textarea.fill("持续修复白屏直到有运行时证据");
+  await page.getByTestId("composer-send-button").click();
+
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnPrompt ?? null),
+    )
+    .toBe("持续修复白屏直到有运行时证据");
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+    )
+    .toBe(null);
+  await expect
+    .poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnIntent ?? null),
+    )
+    .toBe("goal");
+});
+
+test("global chat neither offers nor starts Goal mode without a workspace", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+  await page.evaluate(() =>
+    (window as any).__CODELY_E2E__?.switchComposerSubmissionWorkspace?.(""),
+  );
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentWorkspace),
+  ).toBe("");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/");
+  await expect(page.getByTestId("main-shortcut-item-goal")).toHaveCount(0);
+
+  await textarea.fill("/goal 持续执行直到完成");
+  let dialogMessage = "";
+  page.once("dialog", async (dialog) => {
+    dialogMessage = dialog.message();
+    await dialog.accept();
+  });
+  await page.getByTestId("composer-send-button").click();
+  expect(dialogMessage).toContain("请先打开一个工作区");
+
+  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  expect(snapshot.activeGoalId).toBeNull();
+  expect(snapshot.currentTurnPrompt).toBeNull();
+});
+
+for (const submissionKind of ["capsule", "slash"] as const) {
+  test(`Goal ${submissionKind} submission cannot cross sessions before next paint`, async ({ page }) => {
+    await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+    const textarea = page.getByTestId("composer-textarea");
+    if (submissionKind === "capsule") {
+      await textarea.fill("/");
+      await page.getByTestId("main-shortcut-item-goal").click();
+      await textarea.fill("只在原会话创建这个目标");
+    } else {
+      await textarea.fill("/goal 只在原会话创建这个目标");
+    }
+
+    await page.evaluate(() => {
+      document.querySelector<HTMLButtonElement>("[data-testid='composer-send-button']")?.click();
+      (window as any).__CODELY_E2E__?.switchComposerSubmissionWorkspace?.(
+        "/tmp/e2e-composer-main-shortcuts-other",
+      );
+    });
+
+    await expect.poll(async () =>
+      page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentWorkspace),
+    ).toBe("/tmp/e2e-composer-main-shortcuts-other");
+    await page.waitForTimeout(100);
+    const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+    expect(snapshot.currentTurnPrompt).toBeNull();
+    expect(snapshot.currentTurnIntent).toBeNull();
+    expect(snapshot.activeGoalId).toBeNull();
+  });
+}
+
+test("Goal capsule keeps one-shot authority when App queues an agentStatus-busy submit", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/");
+  await page.getByTestId("main-shortcut-item-goal").click();
+  await textarea.fill("排队后继续修复直到验证完成");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setComposerRuntimeState?.({
+    isGenerating: false,
+    agentStatus: "running",
+  }));
+  await page.getByTestId("composer-send-button").click();
+
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().queuedUserMessage),
+  ).toMatchObject({
+    text: "排队后继续修复直到验证完成",
+    goalCreationAuthorizationSource: "visible_goal_composer_capsule",
+  });
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+  ).toBe(null);
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setComposerRuntimeState?.({
+    isGenerating: false,
+    agentStatus: "idle",
+  }));
+  await page.getByTestId("composer-guidance-button").click();
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnPrompt ?? null),
+  ).toBe("排队后继续修复直到验证完成");
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnIntent ?? null),
+  ).toBe("goal");
+});
+
+test("Goal capsule keeps one-shot authority through Composer's streaming direct queue", async ({ page }) => {
+  await page.goto("/?e2eScenario=composer-main-shortcuts");
+
+  const textarea = page.getByTestId("composer-textarea");
+  await textarea.fill("/");
+  await page.getByTestId("main-shortcut-item-goal").click();
+  await textarea.fill("当前轮结束后继续完成这个目标");
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setComposerRuntimeState?.({
+    isGenerating: true,
+    agentStatus: "running",
+  }));
+  await page.getByTestId("composer-send-button").click();
+
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().queuedUserMessage),
+  ).toMatchObject({
+    text: "当前轮结束后继续完成这个目标",
+    goalCreationAuthorizationSource: "visible_goal_composer_capsule",
+  });
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().lockedComposerIntent ?? null),
+  ).toBe(null);
+
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.setComposerRuntimeState?.({
+    isGenerating: false,
+    agentStatus: "idle",
+  }));
+  await page.getByTestId("composer-guidance-button").click();
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnPrompt ?? null),
+  ).toBe("当前轮结束后继续完成这个目标");
+  await expect.poll(async () =>
+    page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().currentTurnIntent ?? null),
+  ).toBe("goal");
+});
+
 test("user message bubble preserves multiline composer input", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-main-shortcuts");
 

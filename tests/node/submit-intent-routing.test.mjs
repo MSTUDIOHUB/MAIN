@@ -75,6 +75,7 @@ function createHarness(overrides = {}) {
     mainDebugShortcut: null,
     mainIntentShortcut: null,
     lockedComposerIntent: null,
+    goalCreationAuthorization: null,
     currentTurn: null,
     currentTurnIntent: "respond",
     hasPlanArtifacts: false,
@@ -221,4 +222,20 @@ test("hidden skip-intent control prompts do not infer shell directives from embe
   assert.equal(result.effectiveRunIntent, "plan");
   assert.equal(result.effectiveCommandDirective, null);
   assert.deepEqual(harness.calls.preflights, []);
+});
+
+test("intent routing does not promote internal resolved Goal intent into creation authority", () => {
+  const harness = createHarness({
+    text: "continue internally",
+    isHidden: true,
+    options: {
+      resolvedIntent: "goal",
+      skipIntentResolution: true,
+    },
+  });
+  const result = harness.resolve();
+
+  assert.equal(result.handled, false);
+  assert.equal(result.effectiveRunIntent, "execute");
+  assert.equal(result.goalCreationAuthorization, null);
 });

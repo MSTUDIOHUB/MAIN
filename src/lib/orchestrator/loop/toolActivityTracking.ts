@@ -42,6 +42,54 @@ function compactLatestActivityDetail(value: string, maxChars: number): string {
   return `${detail.slice(0, headBudget)}${separator}${detail.slice(-tailBudget)}`;
 }
 
+function extractAstObservation(
+  result: ToolExecutionResult,
+): PlanToolActivitySummary["astObservation"] | undefined {
+  if (result.name !== "code_ast_query" || result.isError) return undefined;
+  const parsedFeedback = parseToolFeedbackEnvelope(result.content || "");
+  const body = parsedFeedback?.body || result.content || "";
+  let payload: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(body);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    payload = parsed as Record<string, unknown>;
+  } catch {
+    return undefined;
+  }
+  const path = String(payload.path || result.target || "").trim();
+  const language = String(payload.language || "").trim();
+  const versionToken = String(payload.versionToken || "").trim();
+  const query = String(payload.query || "").trim();
+  const rawExactMatchCount = Number(payload.exactMatchCount);
+  if (!path || !language || !versionToken || !Array.isArray(payload.symbols)) return undefined;
+  const symbols = payload.symbols.flatMap((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+    const symbol = item as Record<string, unknown>;
+    const name = String(symbol.name || "").trim();
+    const kind = String(symbol.kind || "").trim();
+    const syntaxKind = String(symbol.syntaxKind || "").trim();
+    const rawStartLine = Number(symbol.startLine);
+    const rawEndLine = Number(symbol.endLine);
+    if (!Number.isFinite(rawStartLine) || !Number.isFinite(rawEndLine)) return [];
+    const startLine = Math.floor(rawStartLine);
+    const endLine = Math.floor(rawEndLine);
+    if (!name || !kind || !syntaxKind || startLine <= 0 || endLine < startLine) return [];
+    return [{ name, kind, syntaxKind, startLine, endLine }];
+  }).slice(0, 120);
+  return {
+    path,
+    language,
+    versionToken,
+    query,
+    exactMatchCount: Number.isFinite(rawExactMatchCount)
+      ? Math.max(0, Math.floor(rawExactMatchCount))
+      : 0,
+    hasErrors: payload.hasErrors === true,
+    truncated: payload.truncated === true || payload.symbols.length > symbols.length,
+    symbols,
+  };
+}
+
 function appendBoundedToolActivity(
   targetList: PlanToolActivitySummary[],
   activity: PlanToolActivitySummary,
@@ -73,6 +121,12 @@ function appendBoundedToolActivity(
       existing.facts = mergePlanEvidenceFacts(existing.facts, activity.facts);
       if (activity.readFileObservation) {
         existing.readFileObservation = { ...activity.readFileObservation };
+      }
+      if (activity.astObservation) {
+        existing.astObservation = {
+          ...activity.astObservation,
+          symbols: activity.astObservation.symbols.map((symbol) => ({ ...symbol })),
+        };
       }
       if (activity.delegatedObservation) {
         existing.delegatedObservation = {
@@ -282,6 +336,7 @@ export function rememberToolActivity(
     extractPlanEvidenceFacts(rawDetail),
     extractPlanEvidenceFacts(planEvidenceDetail),
   );
+  const astObservation = extractAstObservation(result);
   appendBoundedToolActivity(targetList, {
     name: result.name,
     target: result.target,
@@ -290,6 +345,9 @@ export function rememberToolActivity(
     ...(facts.length > 0 ? { facts } : {}),
     ...(result.readFileObservation
       ? { readFileObservation: { ...result.readFileObservation } }
+      : {}),
+    ...(astObservation
+      ? { astObservation }
       : {}),
   }, options.evidenceLedger ? MAX_PLAN_EVIDENCE_TOOL_ACTIVITY : MAX_RECENT_PLAN_TOOL_ACTIVITY, options.evidenceLedger);
 }

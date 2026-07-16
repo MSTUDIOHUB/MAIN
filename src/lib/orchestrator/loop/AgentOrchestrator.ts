@@ -29,7 +29,6 @@ import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
-import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -480,12 +479,7 @@ export class AgentOrchestrator {
           availableToolNames,
         } = toolSurfaceDecision;
 
-        const preStreamLedger = callbacks.getPlanExecutionEvidenceLedger();
         const preStreamTurnContract = this.getLatestTurnContract();
-        const preStreamEvidenceAudit = buildExecuteEvidenceClosureAudit({
-          ledger: preStreamLedger,
-          validationExpected: preStreamTurnContract?.validationExpected === true,
-        });
         const requiresExecutionEvidence =
           preStreamTurnContract?.completionEvidenceRequired === "execution_evidence" ||
           preStreamTurnContract?.mutationExpected === true ||
@@ -493,8 +487,7 @@ export class AgentOrchestrator {
           (workflowMode === "plan" && callbacks.getIsPlanApproved());
         const holdExecuteConclusionDraft =
           runtimeIntent === "execute" &&
-          requiresExecutionEvidence &&
-          (preStreamLedger.length === 0 || !preStreamEvidenceAudit.completionAllowed);
+          requiresExecutionEvidence;
         if (holdExecuteConclusionDraft) {
           callbacks.onStreamToken("__EVIDENCE_DRAFT_HOLD__:execution_evidence", assistantMsgId);
         }
@@ -704,7 +697,6 @@ export class AgentOrchestrator {
           callbacks.onTurnSummaryReady(finalText);
           callbacks.onAssistantFinalText(finalText, [], {
             hasToolCalls: false,
-            visibility: "user_progress",
             preserveAssistantText: true,
             capsuleCandidate: true,
             modelAuthored: false,

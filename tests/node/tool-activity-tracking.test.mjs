@@ -370,6 +370,54 @@ test("tool activity tracking records bounded recent activity and helper classifi
   assert.equal(isVerificationEvidenceResult(result({ name: "clear_pty_buffer", isError: false })), false);
 });
 
+test("code_ast_query activity retains parser-backed declaration ranges and file version", () => {
+  const activity = [];
+  rememberToolActivity(activity, result({
+    name: "code_ast_query",
+    target: "src/main.js",
+    content: JSON.stringify({
+      path: "src/main.js",
+      language: "javascript",
+      rootKind: "program",
+      hasErrors: false,
+      errorCount: 0,
+      sizeBytes: 9000,
+      modifiedMs: 100,
+      versionToken: "9000:100",
+      query: "inittoolbar",
+      exactMatchCount: 1,
+      truncated: false,
+      note: "Tree-sitter syntax tree query.",
+      symbols: [{
+        name: "initToolbar",
+        kind: "function",
+        syntaxKind: "function_declaration",
+        startLine: 600,
+        startColumn: 1,
+        endLine: 650,
+        signature: "function initToolbar()",
+      }],
+    }),
+  }));
+
+  assert.deepEqual(activity[0].astObservation, {
+    path: "src/main.js",
+    language: "javascript",
+    versionToken: "9000:100",
+    query: "inittoolbar",
+    exactMatchCount: 1,
+    hasErrors: false,
+    truncated: false,
+    symbols: [{
+      name: "initToolbar",
+      kind: "function",
+      syntaxKind: "function_declaration",
+      startLine: 600,
+      endLine: 650,
+    }],
+  });
+});
+
 test("Plan evidence activity outlives the short loop-detection window and merges rereads", () => {
   const recent = [];
   const ledger = [];

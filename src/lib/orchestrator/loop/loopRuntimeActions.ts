@@ -1,11 +1,10 @@
 import {
   buildExecutePatchMismatchFingerprint,
   buildPatchRecoveryReadNoProgressFingerprint,
-  describeExecuteRecoveryToolSurface,
   normalizeRecoveryReadRange,
   patchRecoveryLeaseIdentityMatches,
   requestedRangeFromReadObservationSignature,
-  shouldAllowExecuteRecoveryFileRead,
+  resolveExecuteRecoveryActionContract,
   summarizeRepeatedExecuteTargets,
   type ExecutionDecisionCheckpoint,
   type ExecuteRecoveryMode,
@@ -162,7 +161,20 @@ export function createAgentLoopRuntimeActions(input: {
       explicitObservation?.versionToken ||
       "",
     ).trim() || null;
-    const patchReadLeaseCandidate: RecoveryReadLease | null =
+    const declarationContextLease =
+      mode === "patch_recovery_read" &&
+      expectedTarget &&
+      (explicitReadLease?.purpose === "initial_targeting" ||
+        explicitReadLease?.purpose === "plan_line_context")
+        ? {
+            ...explicitReadLease,
+            target: expectedTarget,
+            ...(requestedRange ? { requestedRange } : {}),
+            observedVersion,
+            state: "available" as const,
+          }
+        : null;
+    const patchReadLeaseCandidate: RecoveryReadLease | null = declarationContextLease || (
       mode === "patch_recovery_read" && expectedTarget
         ? {
             purpose: "patch_recovery",
@@ -177,7 +189,8 @@ export function createAgentLoopRuntimeActions(input: {
             ).trim(),
             state: "available",
           }
-        : null;
+        : null
+    );
     const repeatedPatchMismatch = patchRecoveryLeaseIdentityMatches(
       currentRecoveryState.readLease,
       patchReadLeaseCandidate,
@@ -260,10 +273,15 @@ export function createAgentLoopRuntimeActions(input: {
       mismatchFingerprint: readLease?.mismatchFingerprint || null,
       repeatedPatchMismatch,
       protocolNoProgressCount: nextState.protocolNoProgressCount,
-      recoveryToolSurface: describeExecuteRecoveryToolSurface(
-        nextState.mode,
-        shouldAllowExecuteRecoveryFileRead(recentToolActivity, nextState.mode),
-      ),
+      recoveryToolSurface: resolveExecuteRecoveryActionContract(nextState.mode, {
+        expectedTarget: nextState.expectedTarget,
+        readLease: nextState.readLease,
+        sourceObservationKey: nextState.sourceObservationKey,
+        decisionCheckpoint: nextState.decisionCheckpoint,
+        phaseNoProgressCount: nextState.phaseNoProgressCount,
+        protocolNoProgressCount: nextState.protocolNoProgressCount,
+        protocolNoProgressFingerprint: nextState.protocolNoProgressFingerprint,
+      }).surfaceDescription,
       ...context,
     });
     return nextState;

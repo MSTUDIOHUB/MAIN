@@ -108,7 +108,12 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
     runSessionId: 7,
     turnId: "turn-1",
     effectiveRunIntent: "goal",
-    runtimeRunIntent: "execute",
+    runtimeRunIntent: "goal",
+    goalCreationAuthorization: {
+      kind: "goal_creation_authorization",
+      intent: "goal",
+      source: "visible_goal_shortcut",
+    },
     getRuntimeSnapshot: () => ({
       agentMessagesLength: agentMessages.length,
       planStage: "executing",
@@ -156,6 +161,37 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
   assert.equal(lease.harnessRunMarker.persisted, true);
   assert.equal(lease.runId, persistedMarkers[0].runId);
   assert.equal(lease.parentRunId, null);
+});
+
+test("submit run lease refuses inferred or internally resolved Goal creation without explicit authority", () => {
+  const agentMessages = [];
+  let startGoalCalls = 0;
+  startSubmitRunLease({
+    userContent: "internal goal request",
+    canonicalUserText: "internal goal request",
+    currentImages: [],
+    runSessionKey: "workspace-a:7",
+    runWorkspace: "/repo",
+    runSessionId: 7,
+    turnId: "turn-internal-goal",
+    effectiveRunIntent: "goal",
+    runtimeRunIntent: "goal",
+    getRuntimeSnapshot: () => ({
+      agentMessagesLength: agentMessages.length,
+      planStage: "idle",
+      isPlanApproved: false,
+    }),
+    appendAgentMessage: (message) => agentMessages.push(message),
+    createAbortController: () => ({ signal: { aborted: false } }),
+    setAbortController: () => {},
+    startGoal: () => { startGoalCalls += 1; },
+    getCurrentHarnessInstanceId: () => "instance-a",
+    persistHarnessRunMarker: (marker) => marker,
+    setHarnessRunMarker: () => {},
+    nowMs: () => 457,
+  });
+
+  assert.equal(startGoalCalls, 0);
 });
 
 test("submit run lease links only exact same-turn resumes", () => {

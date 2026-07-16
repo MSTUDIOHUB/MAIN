@@ -180,11 +180,7 @@ test("submit plan hydration skips async resume when origin session is inactive",
     sendOriginSessionKey: "/repo:7",
     getState: harness.getState,
     setState: harness.setState,
-    hydrateExistingPlanArtifactsForWorkspace: async () => ({
-      artifacts: [],
-      tasks: [],
-      hasTasksArtifact: false,
-    }),
+    hydrateExistingPlanArtifactsForWorkspace: async () => hydratedPlan(),
     derivePlanStageFromArtifacts: () => "idle",
     isSessionRuntimeActive: () => false,
     resumeSubmission: harness.resumeSubmission.bind(harness),
@@ -192,6 +188,9 @@ test("submit plan hydration skips async resume when origin session is inactive",
   });
 
   assert.deepEqual(harness.resumes, []);
+  assert.deepEqual(state.planArtifacts, []);
+  assert.deepEqual(state.planTasks, []);
+  assert.equal(state.planStage, "idle");
   assert.deepEqual(harness.logs, [
     {
       event: "send_async_resume_skipped_inactive_session",

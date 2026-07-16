@@ -61,6 +61,10 @@ const {
   buildSubmitLocalStudioTurnPatch,
   buildSubmitRunStatePatch,
   buildSubmitVisibleTurnPatch,
+  createGoalCreationAuthorization,
+  createGoalContinuationAuthorization,
+  createGoalContinuationAuthorizationBroker,
+  createVisibleGoalSubmissionAuthorizationBroker,
   resolvePendingReviewSubmissionDecision,
   resolveSubmitEffectiveIntentDecision,
   resolveSubmitExecutionApprovalDecision,
@@ -68,6 +72,11 @@ const {
   resolveSubmitPreflightResultDecision,
   resolveSubmitPreflightStalenessDecision,
   resolveSubmitRuntimeDecision,
+  resolveQueuedGoalCreationAuthorization,
+  resolveQueuedGoalContinuationAuthorization,
+  resolveVisibleGoalCreationAuthorization,
+  resolveVisibleGoalSubmissionSessionKey,
+  validateGoalContinuationAuthorization,
   resolveSubmitSemanticMetadataDecision,
   resolveSubmitSendGateDecision,
   resolveSubmitTurnTitleDecision,
@@ -83,7 +92,7 @@ function baseSnapshot(overrides = {}) {
     conversationTurns: [],
     taskFlow: [],
     selectedMainModeKey: "main_mode",
-    currentWorkspace: "",
+    currentWorkspace: "/tmp/main-project",
     contextMentions: [],
     attachedFilesCount: 0,
     planArtifactsCount: 0,
@@ -125,6 +134,8 @@ function baseEffectiveIntentInput(overrides = {}) {
     mainDebugShortcut: null,
     mainIntentShortcut: null,
     lockedComposerIntent: null,
+    goalCreationAuthorization: null,
+    goalContinuationAuthorization: null,
     currentTurn: null,
     currentTurnIntent: "respond",
     shouldContinuePlanIntent: false,
@@ -135,6 +146,18 @@ function baseEffectiveIntentInput(overrides = {}) {
     shouldExecuteOnceFromReplyOption: false,
     ...overrides,
   };
+}
+
+function goalContinuationAuthorization(overrides = {}) {
+  return createGoalContinuationAuthorization({
+    source: "goal_manual_resume",
+    workspaceKey: "/repo",
+    sessionKey: "/repo:7",
+    goalId: "goal-1",
+    goalRevision: 2,
+    ownerTurnId: "turn-goal",
+    ...overrides,
+  });
 }
 
 function baseEnvelopeState(overrides = {}) {
@@ -425,6 +448,398 @@ test("submit pipeline parses shortcuts before Game Studio suggestion", () => {
   assert.equal(decision.gameStudioModeSwitch.pendingRunDecision, null);
 });
 
+test("submit pipeline mints Goal creation authority only for visible shortcut text or a captured capsule", () => {
+  const slash = buildSubmitPipelineDecision({
+    text: "/goal fix the runtime",
+    snapshot: baseSnapshot(),
+  });
+  assert.deepEqual(slash.shortcuts.goalCreationAuthorization, {
+    kind: "goal_creation_authorization",
+    intent: "goal",
+    source: "visible_goal_shortcut",
+  });
+
+  const uncapturedCapsule = buildSubmitPipelineDecision({
+    text: "fix the runtime",
+    snapshot: baseSnapshot({ lockedComposerIntent: "goal" }),
+  });
+  assert.equal(uncapturedCapsule.shortcuts.goalCreationAuthorization, null);
+
+  const capsule = buildSubmitPipelineDecision({
+    text: "fix the runtime",
+    validatedVisibleGoalCreationAuthorization:
+      createGoalCreationAuthorization("visible_goal_composer_capsule"),
+    snapshot: baseSnapshot({ lockedComposerIntent: null }),
+  });
+  assert.equal(capsule.shortcuts.goalCreationAuthorization.source, "visible_goal_composer_capsule");
+
+  const internal = buildSubmitPipelineDecision({
+    text: "fix the runtime",
+    options: { hidden: true, resolvedIntent: "goal", skipIntentResolution: true },
+    snapshot: baseSnapshot({ lockedComposerIntent: "goal" }),
+  });
+  assert.equal(internal.shortcuts.goalCreationAuthorization, null);
+});
+
+test("submit pipeline refuses Goal creation authority without a workspace", () => {
+  const globalSlash = buildSubmitPipelineDecision({
+    text: "/goal fix the runtime",
+    snapshot: baseSnapshot({ currentWorkspace: "" }),
+  });
+  assert.equal(globalSlash.shortcuts.goalCreationAuthorization, null);
+
+  const globalCapsule = buildSubmitPipelineDecision({
+    text: "fix the runtime",
+    validatedVisibleGoalCreationAuthorization:
+      createGoalCreationAuthorization("visible_goal_composer_capsule"),
+    snapshot: baseSnapshot({ currentWorkspace: "", lockedComposerIntent: "goal" }),
+  });
+  assert.equal(globalCapsule.shortcuts.goalCreationAuthorization, null);
+});
+
+test("visible Goal authority resolver follows visible shortcut precedence without trusting hidden intent", () => {
+  assert.deepEqual(resolveVisibleGoalCreationAuthorization({
+    text: "keep fixing until verified",
+    currentMainModeKey: "main_mode",
+    lockedComposerIntent: "goal",
+  }), createGoalCreationAuthorization("visible_goal_composer_capsule"));
+  assert.deepEqual(resolveVisibleGoalCreationAuthorization({
+    text: "/goal keep fixing until verified",
+    currentMainModeKey: "main_mode",
+    lockedComposerIntent: null,
+  }), createGoalCreationAuthorization("visible_goal_shortcut"));
+  assert.equal(resolveVisibleGoalCreationAuthorization({
+    text: "/goal keep fixing until verified",
+    currentMainModeKey: "main_mode",
+    lockedComposerIntent: "plan",
+  }), null);
+  assert.equal(resolveVisibleGoalCreationAuthorization({
+    text: "/goal keep fixing until verified",
+    currentMainModeKey: "main_mode",
+    lockedComposerIntent: "goal",
+    isHidden: true,
+  }), null);
+});
+
+test("visible Goal submission envelope is exact, session-bound, expiring, and one-shot", () => {
+  let now = 100;
+  let nextId = 0;
+  const broker = createVisibleGoalSubmissionAuthorizationBroker({
+    now: () => now,
+    createId: () => `visible-${++nextId}`,
+    ttlMs: 20,
+  });
+  const envelope = broker.capture({
+    text: "keep fixing until verified",
+    sessionKey: "workspace::1",
+    currentMainModeKey: "main_mode",
+    lockedComposerIntent: "goal",
+  });
+  assert.deepEqual(envelope, {
+    kind: "visible_goal_submission_envelope",
+    id: "visible-1",
+  });
+  assert.deepEqual(broker.consume({
+    envelope,
+    text: "keep fixing until verified",
+    sessionKey: "workspace::1",
+  }), createGoalCreationAuthorization("visible_goal_composer_capsule"));
+  assert.equal(broker.consume({
+    envelope,
+    text: "keep fixing until verified",
+    sessionKey: "workspace::1",
+  }), null);
+
+  const mismatched = broker.capture({
+    text: "/goal exact request",
+    sessionKey: "workspace::1",
+    currentMainModeKey: "main_mode",
+  });
+  assert.equal(broker.consume({
+    envelope: mismatched,
+    text: "/goal changed request",
+    sessionKey: "workspace::1",
+  }), null);
+  assert.equal(broker.consume({
+    envelope: mismatched,
+    text: "/goal exact request",
+    sessionKey: "workspace::1",
+  }), null);
+
+  const carried = broker.carryValidated({
+    text: "resume after plan hydration",
+    sessionKey: "workspace::1",
+    authorization: createGoalCreationAuthorization("visible_goal_composer_capsule"),
+  });
+  assert.deepEqual(broker.consume({
+    envelope: carried,
+    text: "resume after plan hydration",
+    sessionKey: "workspace::1",
+  }), createGoalCreationAuthorization("visible_goal_composer_capsule"));
+
+  const expired = broker.capture({
+    text: "/goal expires",
+    sessionKey: "workspace::1",
+    currentMainModeKey: "main_mode",
+  });
+  now += 21;
+  assert.equal(broker.consume({
+    envelope: expired,
+    text: "/goal expires",
+    sessionKey: "workspace::1",
+  }), null);
+});
+
+test("visible Goal session binding remains workspace-scoped without a session id", () => {
+  const workspaceA = resolveVisibleGoalSubmissionSessionKey({
+    currentWorkspace: "/tmp/workspace-a",
+    currentSessionId: null,
+  });
+  const workspaceB = resolveVisibleGoalSubmissionSessionKey({
+    currentWorkspace: "/tmp/workspace-b",
+    currentSessionId: null,
+  });
+  const global = resolveVisibleGoalSubmissionSessionKey({
+    currentWorkspace: null,
+    currentSessionId: null,
+  });
+  assert.notEqual(workspaceA, workspaceB);
+  assert.notEqual(workspaceA, global);
+  assert.match(workspaceA, /workspace-a/);
+
+  const broker = createVisibleGoalSubmissionAuthorizationBroker({
+    createId: () => "cross-workspace",
+  });
+  const envelope = broker.capture({
+    text: "finish this goal",
+    sessionKey: workspaceA,
+    currentMainModeKey: "main_mode",
+    lockedComposerIntent: "goal",
+  });
+  assert.equal(broker.consume({
+    envelope,
+    text: "finish this goal",
+    sessionKey: workspaceB,
+  }), null);
+});
+
+test("Goal continuation envelope is one-shot and exact-text bound", () => {
+  const broker = createGoalContinuationAuthorizationBroker({
+    createId: () => "continuation-1",
+  });
+  const authorization = goalContinuationAuthorization();
+  const envelope = broker.issueValidated({
+    text: "resume exact goal",
+    authorization,
+  });
+  assert.deepEqual(envelope, {
+    kind: "goal_continuation_envelope",
+    id: "continuation-1",
+  });
+  assert.equal(broker.consume({
+    envelope,
+    text: "different text",
+  }), null);
+  assert.equal(broker.consume({
+    envelope,
+    text: "resume exact goal",
+  }), null);
+});
+
+test("Goal continuation authorization rejects Goal replacement deletion and session races", () => {
+  const authorization = goalContinuationAuthorization();
+  const activeGoal = {
+    id: "goal-1",
+    revision: 2,
+    sessionKey: "/repo:7",
+    ownerTurnId: "turn-goal",
+    status: "active",
+  };
+  assert.deepEqual(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal,
+  }), authorization);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal: { ...activeGoal, status: "paused" },
+  }), null);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal: { ...activeGoal, status: "pausing" },
+  }), null);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal: { ...activeGoal, revision: 3 },
+  }), null);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 8,
+    activeGoal,
+  }), null);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/other-repo",
+    currentSessionId: 7,
+    activeGoal,
+  }), null);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal: null,
+  }), null);
+});
+
+test("Goal choice continuation additionally requires the exact pending request", () => {
+  const authorization = goalContinuationAuthorization({
+    source: "goal_user_choice",
+    requestId: "request-1",
+  });
+  const activeGoal = {
+    id: "goal-1",
+    revision: 2,
+    sessionKey: "/repo:7",
+    ownerTurnId: "turn-goal",
+    status: "awaiting_input",
+  };
+  const request = {
+    schemaVersion: 1,
+    requestId: "request-1",
+    kind: "user_choice",
+    sessionKey: "/repo:7",
+    turnId: "turn-goal",
+    runId: "run-goal",
+    title: "Choose",
+    status: "pending",
+    createdAt: 1,
+    optionValues: ["A"],
+    allowCustomReply: false,
+  };
+  assert.deepEqual(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal,
+    activeActionRequest: request,
+  }), authorization);
+  assert.deepEqual(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal: { ...activeGoal, status: "paused" },
+    activeActionRequest: request,
+  }), authorization);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal: { ...activeGoal, status: "pausing" },
+    activeActionRequest: request,
+  }), null);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal,
+    activeActionRequest: { ...request, requestId: "request-new" },
+  }), null);
+});
+
+test("queued Goal continuation requires exact queue id text and session", () => {
+  const authorization = goalContinuationAuthorization();
+  assert.deepEqual(resolveQueuedGoalContinuationAuthorization({
+    queuedMessageId: "queued-1",
+    replayMessageId: "queued-1",
+    queuedText: "resume",
+    replayText: "resume",
+    queuedSessionKey: "/repo:7",
+    replaySessionKey: "/repo:7",
+    authorization,
+  }), authorization);
+  assert.equal(resolveQueuedGoalContinuationAuthorization({
+    queuedMessageId: "queued-1",
+    replayMessageId: "queued-1",
+    queuedText: "resume",
+    replayText: "resume changed",
+    queuedSessionKey: "/repo:7",
+    replaySessionKey: "/repo:7",
+    authorization,
+  }), null);
+});
+
+test("captured visible Goal authority survives capsule cleanup but hidden reuse is rejected", () => {
+  const authorization = createGoalCreationAuthorization("visible_goal_composer_capsule");
+  const visible = buildSubmitPipelineDecision({
+    text: "keep fixing until verified",
+    validatedVisibleGoalCreationAuthorization: authorization,
+    snapshot: baseSnapshot({ lockedComposerIntent: null }),
+  });
+  assert.equal(visible.shortcuts.lockedComposerIntent, "goal");
+  assert.deepEqual(visible.shortcuts.goalCreationAuthorization, authorization);
+
+  const hidden = buildSubmitPipelineDecision({
+    text: "keep fixing until verified",
+    options: { hidden: true, resolvedIntent: "goal", skipIntentResolution: true },
+    validatedVisibleGoalCreationAuthorization: authorization,
+    snapshot: baseSnapshot({ lockedComposerIntent: null }),
+  });
+  assert.equal(hidden.shortcuts.lockedComposerIntent, null);
+  assert.equal(hidden.shortcuts.goalCreationAuthorization, null);
+});
+
+test("queued Goal capsule authority is restored only for the exact queued message", () => {
+  const authorization = createGoalCreationAuthorization("visible_goal_composer_capsule");
+  const matched = resolveQueuedGoalCreationAuthorization({
+    queuedMessageId: "queued-1",
+    replayMessageId: "queued-1",
+    queuedText: "fix the runtime",
+    replayText: "fix the runtime",
+    queuedSessionKey: "workspace::1",
+    replaySessionKey: "workspace::1",
+    authorization,
+  });
+  assert.deepEqual(matched, authorization);
+  assert.equal(resolveQueuedGoalCreationAuthorization({
+    queuedMessageId: "queued-1",
+    replayMessageId: "queued-stale",
+    queuedText: "fix the runtime",
+    replayText: "fix the runtime",
+    queuedSessionKey: "workspace::1",
+    replaySessionKey: "workspace::1",
+    authorization,
+  }), null);
+
+  const replay = buildSubmitPipelineDecision({
+    text: "fix the runtime",
+    validatedQueuedGoalCreationAuthorization: matched,
+    snapshot: baseSnapshot({ lockedComposerIntent: null }),
+  });
+  assert.equal(replay.shortcuts.lockedComposerIntent, "goal");
+  assert.deepEqual(replay.shortcuts.goalCreationAuthorization, authorization);
+
+  const effective = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
+    lockedComposerIntent: replay.shortcuts.lockedComposerIntent,
+    goalCreationAuthorization: replay.shortcuts.goalCreationAuthorization,
+  }));
+  assert.equal(effective.effectiveRunIntent, "goal");
+
+  const staleLegacySlashReplay = buildSubmitPipelineDecision({
+    text: "/goal fix the runtime",
+    options: { queuedUserMessageId: "queued-legacy" },
+    snapshot: baseSnapshot({ lockedComposerIntent: null }),
+  });
+  assert.equal(staleLegacySlashReplay.shortcuts.goalCreationAuthorization, null);
+});
+
 test("submit pipeline returns Game Studio mode-switch decision as a store effect", () => {
   const decision = buildSubmitPipelineDecision({
     text: "帮我修复 Unity MonoBehaviour 的相机抖动问题",
@@ -468,9 +883,12 @@ test("effective intent decision keeps an identity-validated choice inside Goal r
     text: "显示欢迎页",
     options: {
       resolvedIntent: "goal",
-      continueExistingGoal: true,
       executionConsentGranted: true,
     },
+    goalContinuationAuthorization: goalContinuationAuthorization({
+      source: "goal_user_choice",
+      requestId: "request-1",
+    }),
     currentTurnIntent: "goal",
     shouldReuseExistingTurnIntent: true,
     shouldExecuteOnceFromReplyOption: true,
@@ -478,6 +896,33 @@ test("effective intent decision keeps an identity-validated choice inside Goal r
 
   assert.equal(decision.effectiveRunIntent, "goal");
   assert.equal(decision.shouldForceExecuteForAutoApprove, false);
+});
+
+test("effective intent decision downgrades untrusted Goal intents but preserves explicit creation", () => {
+  const internal = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
+    options: { resolvedIntent: "goal", skipIntentResolution: true },
+  }));
+  assert.equal(internal.effectiveRunIntent, "execute");
+
+  const legacyBareContinuation = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
+    options: {
+      resolvedIntent: "goal",
+      continueExistingGoal: true,
+      skipIntentResolution: true,
+    },
+  }));
+  assert.equal(legacyBareContinuation.effectiveRunIntent, "execute");
+
+  const explicit = resolveSubmitEffectiveIntentDecision(baseEffectiveIntentInput({
+    mainIntentShortcut: { intent: "goal", command: "/goal", rest: "fix it" },
+    lockedComposerIntent: "goal",
+    goalCreationAuthorization: {
+      kind: "goal_creation_authorization",
+      intent: "goal",
+      source: "visible_goal_shortcut",
+    },
+  }));
+  assert.equal(explicit.effectiveRunIntent, "goal");
 });
 
 test("effective intent decision preserves explicit Unity setup-engine directive", () => {
@@ -552,6 +997,34 @@ test("runtime decision keeps plan state for local Game Studio commands", () => {
   assert.equal(decision.runtimeRunIntent, "studio_workflow");
   assert.equal(decision.shouldGrantExecutionConsentForTurn, true);
   assert.equal(decision.shouldResetPlanState, false);
+});
+
+test("runtime decision cannot enter Goal without creation authority or an existing continuation", () => {
+  const rejected = resolveSubmitRuntimeDecision({
+    effectiveRunIntent: "execute",
+    runtimeIntentOverride: "goal",
+    currentMainModeKey: "main_mode",
+    isPlanApproved: false,
+    autoApproveTools: false,
+    shouldExecuteOnceFromReplyOption: false,
+    preservePlanState: false,
+    isLocalStudioCommand: false,
+    hasActiveGoal: true,
+  });
+  assert.equal(rejected.runtimeRunIntent, "execute");
+
+  const resumed = resolveSubmitRuntimeDecision({
+    effectiveRunIntent: "execute",
+    runtimeIntentOverride: "goal",
+    currentMainModeKey: "main_mode",
+    isPlanApproved: false,
+    autoApproveTools: false,
+    shouldExecuteOnceFromReplyOption: false,
+    preservePlanState: true,
+    isLocalStudioCommand: false,
+    goalContinuationAuthorization: goalContinuationAuthorization(),
+  });
+  assert.equal(resumed.runtimeRunIntent, "goal");
 });
 
 test("intent confirmation builder creates pre-submit plan confirmation choices", () => {

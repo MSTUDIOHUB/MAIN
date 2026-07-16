@@ -1,4 +1,5 @@
 import {
+  normalizeRecoveryReadRange,
   normalizeExecuteRecoveryMode,
   readEvidenceSatisfiesRecoveryLease,
   resolveExecuteRecoveryActionContract,
@@ -35,6 +36,7 @@ export interface ExecuteRecoveryRuntimeState {
 export type ExecuteRecoveryPhaseTransition =
   | "none"
   | "context_refreshed"
+  | "context_version_changed_to_targeting"
   | "validation_progress"
   | "context_to_mutation"
   | "mutation_to_validation"
@@ -51,6 +53,7 @@ export interface ExecuteRecoveryObservation {
   sourceObservationKey?: string | null;
   sourceRequestedRange?: RecoveryReadLease["requestedRange"];
   sourceObservedVersion?: string | null;
+  sourceRangeWasRuntimeNarrowed?: boolean;
 }
 
 export interface PtyObservationPolicyDeferral {
@@ -170,9 +173,31 @@ export function activateExecuteRecoveryRuntimeState(
 ): ExecuteRecoveryRuntimeState {
   const nextMode = normalizeExecuteRecoveryMode(input.mode) as Exclude<ExecuteRecoveryMode, "normal">;
   const expectedTarget = input.expectedTarget?.trim() || state.expectedTarget;
-  const previousContract = resolveExecuteRecoveryActionContract(state.mode);
-  const nextContract = resolveExecuteRecoveryActionContract(nextMode);
+  const previousContract = resolveExecuteRecoveryActionContract(state.mode, {
+    expectedTarget: state.expectedTarget,
+    readLease: state.readLease,
+    sourceObservationKey: state.sourceObservationKey,
+    decisionCheckpoint: state.decisionCheckpoint,
+    phaseNoProgressCount: state.phaseNoProgressCount,
+    protocolNoProgressCount: state.protocolNoProgressCount,
+    protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
+  });
+  const nextContract = resolveExecuteRecoveryActionContract(nextMode, {
+    expectedTarget,
+    readLease: input.readLease === undefined ? state.readLease : input.readLease,
+    sourceObservationKey: input.sourceObservationKey === undefined
+      ? state.sourceObservationKey
+      : input.sourceObservationKey,
+    decisionCheckpoint: input.decisionCheckpoint === undefined
+      ? state.decisionCheckpoint
+      : input.decisionCheckpoint,
+    phaseNoProgressCount: state.phaseNoProgressCount,
+    protocolNoProgressCount: state.protocolNoProgressCount,
+    protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
+  });
   const phaseChanged = previousContract.phase !== nextContract.phase;
+  const capabilityChanged =
+    previousContract.nextRequiredCapability !== nextContract.nextRequiredCapability;
   const targetChanged = Boolean(
     expectedTarget &&
     (!state.expectedTarget ||
@@ -199,7 +224,7 @@ export function activateExecuteRecoveryRuntimeState(
         })
       : input.decisionCheckpoint,
   };
-  return phaseChanged || targetChanged
+  return phaseChanged || capabilityChanged || targetChanged
     ? resetExecuteRecoveryPhaseProgress(nextState)
     : nextState;
 }
@@ -267,13 +292,205 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
-    const leaseMatchesEvidence = state.readLease?.purpose !== "patch_recovery" || readEvidenceSatisfiesRecoveryLease({
-      lease: state.readLease,
+    const activeReadLease = state.readLease &&
+      (state.readLease.state === "available" || state.readLease.state === "active")
+        ? state.readLease
+        : null;
+    if (activeReadLease?.coverageMode === "segmented_exact") {
+      const requiredRange = normalizeRecoveryReadRange(
+        activeReadLease.requiredRange || activeReadLease.requestedRange,
+      );
+      const remainingRange = normalizeRecoveryReadRange(activeReadLease.requestedRange);
+      const observedRange = normalizeRecoveryReadRange(observation.sourceRequestedRange);
+      if (!requiredRange || !remainingRange || !observedRange) {
+        return {
+          state: transactionState,
+          transition: "none",
+          target: contextTarget,
+          consumedExpectedRead: false,
+        };
+      }
+      const requiredStart = requiredRange.startLine || 1;
+      const requiredEnd = requiredRange.endLine ?? (
+        requiredRange.maxLines
+          ? requiredStart + requiredRange.maxLines - 1
+          : requiredStart
+      );
+      const remainingStart = remainingRange.startLine || requiredStart;
+      const observedStart = observedRange.startLine || remainingStart;
+      const observedEnd = observedRange.endLine ?? (
+        observedRange.maxLines
+          ? observedStart + observedRange.maxLines - 1
+          : observedStart
+      );
+      const expectedVersion = String(activeReadLease.observedVersion || "").trim();
+      const observedVersion = String(observation.sourceObservedVersion || "").trim();
+      if (expectedVersion && observedVersion && expectedVersion !== observedVersion) {
+        const sourceObservationKey = observation.sourceObservationKey?.trim() || null;
+        return {
+          state: resetExecuteRecoveryPhaseProgress({
+            ...transactionState,
+            reason: "recovery_plan_line_version_changed",
+            sourceObservationKey,
+            readLease: {
+              ...activeReadLease,
+              requestedRange: requiredRange,
+              requiredRange,
+              coveredRanges: [],
+              observedVersion,
+              observationKey: sourceObservationKey,
+              state: "available",
+            },
+            decisionCheckpoint: {
+              expectedTarget: contextTarget,
+              sourceObservationKey,
+              nextRequiredCapability: "targeted_read",
+              evidenceVersion: observedVersion,
+            },
+          }),
+          transition: "context_refreshed",
+          target: contextTarget,
+          consumedExpectedRead: false,
+        };
+      }
+      const runtimeNarrowedPrefix =
+        observation.sourceRangeWasRuntimeNarrowed === true &&
+        observedStart > remainingStart;
+      if (
+        (observedStart !== remainingStart && !runtimeNarrowedPrefix) ||
+        observedStart > requiredEnd ||
+        observedEnd < observedStart ||
+        observedEnd > requiredEnd
+      ) {
+        return {
+          state: transactionState,
+          transition: "none",
+          target: contextTarget,
+          consumedExpectedRead: false,
+        };
+      }
+      const sourceObservationKey = observation.sourceObservationKey?.trim() || state.sourceObservationKey;
+      const coveredRanges = [
+        ...(activeReadLease.coveredRanges || []),
+        { startLine: remainingStart, endLine: observedEnd },
+      ];
+      if (observedEnd < requiredEnd) {
+        const nextStartLine = observedEnd + 1;
+        return {
+          state: resetExecuteRecoveryPhaseProgress({
+            ...transactionState,
+            reason: "recovery_plan_line_segment_observed",
+            sourceObservationKey,
+            readLease: {
+              ...activeReadLease,
+              requestedRange: {
+                startLine: nextStartLine,
+                endLine: requiredEnd,
+                maxLines: requiredEnd - nextStartLine + 1,
+              },
+              requiredRange,
+              coveredRanges,
+              observedVersion: observedVersion || expectedVersion || null,
+              observationKey: sourceObservationKey,
+              state: "available",
+            },
+            decisionCheckpoint: {
+              expectedTarget: contextTarget,
+              sourceObservationKey,
+              nextRequiredCapability: "targeted_read",
+              evidenceVersion: observedVersion || expectedVersion || null,
+            },
+          }),
+          transition: "context_refreshed",
+          target: contextTarget,
+          consumedExpectedRead: false,
+        };
+      }
+      return {
+        state: resetExecuteRecoveryPhaseProgress({
+          ...transactionState,
+          mode: "mutation_first",
+          reason: "recovery_context_observed",
+          expectedTarget: contextTarget,
+          sourceObservationKey,
+          readLease: {
+            ...activeReadLease,
+            requestedRange: observation.sourceRequestedRange || remainingRange,
+            requiredRange,
+            coveredRanges,
+            observedVersion: observedVersion || expectedVersion || null,
+            observationKey: sourceObservationKey,
+            state: "consumed",
+          },
+          decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
+            expectedTarget: contextTarget,
+            sourceObservationKey,
+            nextRequiredCapability: "mutation",
+            previous: state.decisionCheckpoint,
+          }),
+        }),
+        transition: "context_to_mutation",
+        target: contextTarget,
+        consumedExpectedRead: true,
+      };
+    }
+    const expectedVersion = String(activeReadLease?.observedVersion || "").trim();
+    const observedVersion = String(observation.sourceObservedVersion || "").trim();
+    const sourceVersionChanged = Boolean(
+      activeReadLease && expectedVersion && observedVersion && expectedVersion !== observedVersion
+    );
+    if (sourceVersionChanged && activeReadLease?.purpose === "initial_targeting") {
+      const sourceObservationKey = observation.sourceObservationKey?.trim() || null;
+      return {
+        state: resetExecuteRecoveryPhaseProgress({
+          ...transactionState,
+          mode: "action_plus_targeting",
+          reason: "recovery_source_version_changed",
+          expectedTarget: contextTarget,
+          sourceObservationKey,
+          readLease: null,
+          decisionCheckpoint: {
+            expectedTarget: contextTarget,
+            sourceObservationKey,
+            nextRequiredCapability: "targeting",
+            evidenceVersion: observedVersion,
+          },
+        }),
+        transition: "context_version_changed_to_targeting",
+        target: contextTarget,
+        consumedExpectedRead: false,
+      };
+    }
+    const currentVersionLease = sourceVersionChanged && activeReadLease
+      ? { ...activeReadLease, observedVersion }
+      : activeReadLease;
+    const leaseMatchesEvidence = Boolean(currentVersionLease) && readEvidenceSatisfiesRecoveryLease({
+      lease: currentVersionLease,
       target: observation.freshReadTarget,
       requestedRange: observation.sourceRequestedRange,
       observedVersion: observation.sourceObservedVersion,
     });
     if (!leaseMatchesEvidence) {
+      if (sourceVersionChanged && currentVersionLease) {
+        const sourceObservationKey = observation.sourceObservationKey?.trim() || null;
+        return {
+          state: resetExecuteRecoveryPhaseProgress({
+            ...transactionState,
+            reason: "recovery_source_version_refreshed",
+            sourceObservationKey,
+            readLease: { ...currentVersionLease, state: "available" },
+            decisionCheckpoint: {
+              expectedTarget: contextTarget,
+              sourceObservationKey,
+              nextRequiredCapability: "targeted_read",
+              evidenceVersion: observedVersion,
+            },
+          }),
+          transition: "context_refreshed",
+          target: contextTarget,
+          consumedExpectedRead: false,
+        };
+      }
       return {
         state: transactionState,
         transition: "none",
@@ -322,8 +539,12 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
-    const leaseMatchesEvidence = state.readLease?.purpose !== "patch_recovery" || readEvidenceSatisfiesRecoveryLease({
-      lease: state.readLease,
+    const activeReadLease = state.readLease &&
+      (state.readLease.state === "available" || state.readLease.state === "active")
+        ? state.readLease
+        : null;
+    const leaseMatchesEvidence = Boolean(activeReadLease) && readEvidenceSatisfiesRecoveryLease({
+      lease: activeReadLease,
       target: observation.freshReadTarget,
       requestedRange: observation.sourceRequestedRange,
       observedVersion: observation.sourceObservedVersion,
@@ -341,6 +562,7 @@ export function transitionExecuteRecoveryRuntimeState(
     return {
       state: resetExecuteRecoveryPhaseProgress({
         ...transactionState,
+        expectedTarget: contextTarget,
         reason: completesPostMutationCheck
           ? "recovery_post_mutation_context_observed"
           : transactionState.reason,
@@ -506,6 +728,10 @@ export function advanceExecuteRecoveryRuntimeIteration(
     state: nextState,
     maxIterations: MAX_EXECUTE_RECOVERY_ITERATIONS,
     reachedMaxIterations:
+      // Phase attempts are debited immediately before a request. Allow counts
+      // 1..MAX to issue, then pause when the would-be seventh request advances
+      // to MAX+1. Protocol no-progress is recorded after results, so its
+      // boundary remains inclusive.
       nextState.phaseNoProgressCount > MAX_EXECUTE_RECOVERY_ITERATIONS ||
       nextState.protocolNoProgressCount >= MAX_EXECUTE_RECOVERY_ITERATIONS,
   };

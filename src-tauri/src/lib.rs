@@ -1424,6 +1424,120 @@ fn ensure_in_workspace(path: &Path, workspace: &Path) -> Result<(), String> {
     }
 }
 
+fn resolve_workspace_delete_parent(
+    parent: &Path,
+    workspace: &Path,
+) -> Result<Option<PathBuf>, String> {
+    let mut probe = parent;
+    loop {
+        match probe.canonicalize() {
+            Ok(canonical) => {
+                ensure_in_workspace(&canonical, workspace)?;
+                // If an ancestor rather than the requested parent was the first
+                // existing path, the requested entry cannot currently exist.
+                return Ok((probe == parent).then_some(canonical));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                probe = probe
+                    .parent()
+                    .ok_or_else(|| "待删除路径没有可解析的父目录".to_string())?;
+            }
+            Err(error) => return Err(format!("无法解析待删除路径父目录: {error}")),
+        }
+    }
+}
+
+fn remove_workspace_symlink(path: &Path) -> Result<(), String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        fs::remove_file(path).map_err(|error| format!("删除符号链接失败: {error}"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows distinguishes file and directory symlinks at deletion time.
+        // Both operations remove the reparse point itself rather than its target.
+        match fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(file_error) => fs::remove_dir(path).map_err(|dir_error| {
+                format!("删除符号链接失败: 文件链接错误 {file_error}; 目录链接错误 {dir_error}")
+            }),
+        }
+    }
+}
+
+fn delete_path_within_workspace(raw_path: &Path, workspace: &Path) -> Result<(), String> {
+    if raw_path == workspace {
+        return Err("禁止删除工作区根目录".to_string());
+    }
+
+    let file_name = raw_path
+        .file_name()
+        .ok_or_else(|| "待删除路径必须指向工作区内的文件或目录".to_string())?;
+    let parent = raw_path
+        .parent()
+        .ok_or_else(|| "待删除路径没有有效父目录".to_string())?;
+    let Some(canonical_parent) = resolve_workspace_delete_parent(parent, workspace)? else {
+        return Ok(());
+    };
+    let delete_path = canonical_parent.join(file_name);
+
+    let metadata = match fs::symlink_metadata(&delete_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("无法访问待删除路径: {error}")),
+    };
+
+    if !metadata.file_type().is_symlink() {
+        let canonical_target = delete_path
+            .canonicalize()
+            .map_err(|error| format!("无法解析待删除路径: {error}"))?;
+        ensure_in_workspace(&canonical_target, workspace)?;
+        if canonical_target == workspace {
+            return Err("禁止删除工作区根目录".to_string());
+        }
+    }
+
+    // Operate through the already-canonical parent, and re-check it immediately
+    // before mutation. This prevents a parent symlink from redirecting deletion
+    // outside the workspace. The process-wide write lock serializes MAIN writes;
+    // this second check also narrows the remaining external TOCTOU window.
+    let current_parent = canonical_parent
+        .canonicalize()
+        .map_err(|error| format!("删除前无法重新解析父目录: {error}"))?;
+    ensure_in_workspace(&current_parent, workspace)?;
+    if current_parent != canonical_parent {
+        return Err("待删除路径的父目录在删除前发生变化".to_string());
+    }
+
+    let metadata = match fs::symlink_metadata(&delete_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("删除前无法访问目标路径: {error}")),
+    };
+    if metadata.file_type().is_symlink() {
+        return remove_workspace_symlink(&delete_path);
+    }
+
+    let canonical_target = delete_path
+        .canonicalize()
+        .map_err(|error| format!("删除前无法重新解析目标路径: {error}"))?;
+    ensure_in_workspace(&canonical_target, workspace)?;
+    if canonical_target == workspace {
+        return Err("禁止删除工作区根目录".to_string());
+    }
+
+    if metadata.is_dir() {
+        // std::fs::remove_dir_all does not follow symlinks encountered while
+        // walking. The final entry was also checked with symlink_metadata above.
+        fs::remove_dir_all(&delete_path).map_err(|error| format!("删除目录失败: {error}"))?;
+    } else {
+        fs::remove_file(&delete_path).map_err(|error| format!("删除文件失败: {error}"))?;
+    }
+
+    Ok(())
+}
+
 fn resolve_existing_path(input: &str, workspace: &Path) -> Result<PathBuf, String> {
     let raw = if Path::new(input).is_absolute() {
         PathBuf::from(input)
@@ -9849,23 +9963,7 @@ fn delete_workspace_path(
     } else {
         workspace.join(&path)
     };
-
-    if !raw_path.exists() {
-        return Ok(());
-    }
-
-    let real_path = raw_path
-        .canonicalize()
-        .map_err(|e| format!("无法解析待删除路径: {e}"))?;
-    ensure_in_workspace(&real_path, &workspace)?;
-
-    if real_path.is_dir() {
-        fs::remove_dir_all(&real_path).map_err(|e| format!("删除目录失败: {e}"))?;
-    } else {
-        fs::remove_file(&real_path).map_err(|e| format!("删除文件失败: {e}"))?;
-    }
-
-    Ok(())
+    delete_path_within_workspace(&raw_path, &workspace)
 }
 
 #[tauri::command]
@@ -10751,15 +10849,16 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_evaluate_supervisor_timeout, compare_file_nodes, delete_plan_files_in_dir,
-        is_supported_attachment_path, is_valid_git_branch_name, looks_long_running_shell_command,
-        merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
-        parse_git_porcelain_entries, parse_git_porcelain_status, pty_foreground_state,
-        pty_shell_available, read_pty_current_generation_view, read_pty_generation_since,
-        read_pty_generation_tail, read_session_transcript_with_fallback, resolve_existing_path,
-        resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
-        should_hide_list_directory_entry, should_skip_recursive_search_dir, validate_pty_input,
-        write_json_atomic, write_jsonl_atomic, FileNode, SessionTranscript, PTY_TAIL_DEFAULT_CHARS,
+        browser_evaluate_supervisor_timeout, compare_file_nodes, delete_path_within_workspace,
+        delete_plan_files_in_dir, is_supported_attachment_path, is_valid_git_branch_name,
+        looks_long_running_shell_command, merge_json_rows_by_id, parse_git_branch_line,
+        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
+        pty_foreground_state, pty_shell_available, read_pty_current_generation_view,
+        read_pty_generation_since, read_pty_generation_tail, read_session_transcript_with_fallback,
+        resolve_existing_path, resolve_open_file_external_path,
+        resolve_session_transcript_to_write, resolve_write_path, should_hide_list_directory_entry,
+        should_skip_recursive_search_dir, validate_pty_input, write_json_atomic,
+        write_jsonl_atomic, FileNode, SessionTranscript, PTY_TAIL_DEFAULT_CHARS,
     };
     use serde_json::json;
     use std::fs;
@@ -10804,6 +10903,124 @@ mod tests {
             assert!(!plans_dir.join(name).exists(), "{name} should be deleted");
         }
         assert!(plans_dir.join("notes.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_delete_unlinks_directory_symlink_without_deleting_target() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = make_temp_workspace("delete-directory-symlink");
+        let target = workspace.join("kept-directory");
+        let link = workspace.join("directory-link");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("keep.txt"), "keep").unwrap();
+        symlink(&target, &link).unwrap();
+
+        delete_path_within_workspace(&link, &workspace).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read_to_string(target.join("keep.txt")).unwrap(), "keep");
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_delete_unlinks_file_symlink_without_deleting_target() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = make_temp_workspace("delete-file-symlink");
+        let target = workspace.join("kept-file.txt");
+        let link = workspace.join("file-link.txt");
+        fs::write(&target, "keep").unwrap();
+        symlink(&target, &link).unwrap();
+
+        delete_path_within_workspace(&link, &workspace).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep");
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_delete_removes_dangling_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let workspace = make_temp_workspace("delete-dangling-symlink");
+        let link = workspace.join("dangling-link");
+        symlink(workspace.join("missing-target"), &link).unwrap();
+
+        delete_path_within_workspace(&link, &workspace).unwrap();
+
+        assert!(fs::symlink_metadata(&link).is_err());
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn workspace_delete_removes_real_directory() {
+        let workspace = make_temp_workspace("delete-real-directory");
+        let target = workspace.join("real-directory");
+        fs::create_dir_all(target.join("nested")).unwrap();
+        fs::write(target.join("nested").join("file.txt"), "delete").unwrap();
+
+        delete_path_within_workspace(&target, &workspace).unwrap();
+
+        assert!(!target.exists());
+        fs::remove_dir_all(&workspace).unwrap();
+    }
+
+    #[test]
+    fn workspace_delete_rejects_path_outside_workspace() {
+        let parent = make_temp_workspace("delete-outside-parent");
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "keep").unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+
+        let error = delete_path_within_workspace(&outside, &workspace).unwrap_err();
+
+        assert!(error.contains("路径越界"));
+        assert!(outside.join("keep.txt").exists());
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_delete_rejects_parent_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let parent = make_temp_workspace("delete-parent-symlink-escape");
+        let workspace = parent.join("workspace");
+        let outside = parent.join("outside");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(outside.join("victim")).unwrap();
+        fs::write(outside.join("victim").join("keep.txt"), "keep").unwrap();
+        symlink(&outside, workspace.join("outside-link")).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+
+        let error = delete_path_within_workspace(
+            &workspace.join("outside-link").join("victim"),
+            &workspace,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("路径越界"));
+        assert!(outside.join("victim").join("keep.txt").exists());
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn workspace_delete_rejects_workspace_root() {
+        let workspace = make_temp_workspace("delete-workspace-root");
+
+        let error = delete_path_within_workspace(&workspace, &workspace).unwrap_err();
+
+        assert!(error.contains("工作区根目录"));
+        assert!(workspace.exists());
+        fs::remove_dir_all(&workspace).unwrap();
     }
 
     #[test]

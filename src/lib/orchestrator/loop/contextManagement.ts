@@ -334,7 +334,8 @@ export function prepareManagedMessagesForIteration(input: {
     !executeRecoveryContextAlreadyCompacted &&
     effectiveContextLimitForManagement != null &&
     contextBudgetsForManagement &&
-    contextForceForManagement
+    contextForceForManagement &&
+    (contextForceForManagement.shouldForce || cloudResponsesCompact)
   ) {
     const effectiveContextLimit = effectiveContextLimitForManagement;
     const contextBudgets = contextBudgetsForManagement;

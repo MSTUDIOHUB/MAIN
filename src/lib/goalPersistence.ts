@@ -19,6 +19,151 @@ export const GOAL_PROGRESS_FILE = "progress.md";
 export const GOAL_CHECKPOINT_DIR = "checkpoints";
 export const GOAL_STATE_FILE = "state.json";
 export const GOAL_EVIDENCE_FILE = "evidence.jsonl";
+export const GOAL_DELETION_FENCE_DIR = ".deleted";
+
+const SAFE_GOAL_ID_PATH_SEGMENT_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const deletedGoalRuntimeKeys = new Set<string>();
+const liveGoalDeletionFenceKeys = new Set<string>();
+
+function normalizeGoalRuntimeDeletionKey(workspacePath: string, goalId: string): string {
+  return `${String(workspacePath || "").trim()}\0${assertSafeGoalIdPathSegment(goalId)}`;
+}
+
+/** Goal ids are persisted as a single directory segment. Never let restored or
+ * UI-supplied state turn that segment into an absolute or traversing path. */
+export function assertSafeGoalIdPathSegment(goalId: string): string {
+  const normalized = String(goalId || "");
+  if (!SAFE_GOAL_ID_PATH_SEGMENT_RE.test(normalized)) {
+    throw new Error("Invalid Goal id path segment");
+  }
+  return normalized;
+}
+
+/** Relative path is intentional: delete_workspace_path resolves it against the
+ * captured workspace and applies its existing workspace-containment check. */
+export function resolveGoalRuntimeRelativeDirPath(goalId: string): string {
+  return `.MAIN/${GOAL_DIR_NAME}/${assertSafeGoalIdPathSegment(goalId)}`;
+}
+
+export function resolveGoalDeletionFenceDirPath(): string {
+  return `.MAIN/${GOAL_DIR_NAME}/${GOAL_DELETION_FENCE_DIR}`;
+}
+
+export function resolveGoalDeletionFenceRelativePath(goalId: string): string {
+  return `${resolveGoalDeletionFenceDirPath()}/${assertSafeGoalIdPathSegment(goalId)}.json`;
+}
+
+export function serializeGoalDeletionFence(input: {
+  goalId: string;
+  ownerSessionKey: string;
+  deletedAt: number;
+}): string {
+  return `${JSON.stringify({
+    schemaVersion: 1,
+    goalId: assertSafeGoalIdPathSegment(input.goalId),
+    ownerSessionKey: String(input.ownerSessionKey || "").trim(),
+    deletedAt: Math.max(0, Number(input.deletedAt) || Date.now()),
+  }, null, 2)}\n`;
+}
+
+export interface GoalDeletionFence {
+  schemaVersion: 1;
+  goalId: string;
+  ownerSessionKey: string;
+  deletedAt: number;
+}
+
+export function deserializeGoalDeletionFence(
+  json: string,
+  expectedGoalId?: string,
+): GoalDeletionFence | null {
+  try {
+    const parsed = JSON.parse(json) as Partial<GoalDeletionFence>;
+    const goalId = assertSafeGoalIdPathSegment(String(parsed.goalId || ""));
+    const ownerSessionKey = String(parsed.ownerSessionKey || "").trim();
+    const deletedAt = Number(parsed.deletedAt);
+    if (
+      parsed.schemaVersion !== 1 ||
+      (expectedGoalId && goalId !== assertSafeGoalIdPathSegment(expectedGoalId)) ||
+      !ownerSessionKey ||
+      !Number.isFinite(deletedAt) ||
+      deletedAt <= 0
+    ) {
+      return null;
+    }
+    return { schemaVersion: 1, goalId, ownerSessionKey, deletedAt };
+  } catch {
+    return null;
+  }
+}
+
+/** Marker filenames are sufficient identity: they are workspace-contained,
+ * validated as one safe segment, and created only before destructive delete. */
+export function registerGoalDeletionFenceEntries(
+  workspacePath: string,
+  entries: Array<{ name?: string; is_dir?: boolean }>,
+): string[] {
+  const registered: string[] = [];
+  for (const entry of entries) {
+    if (entry?.is_dir || typeof entry?.name !== "string" || !entry.name.endsWith(".json")) {
+      continue;
+    }
+    const goalId = entry.name.slice(0, -5);
+    try {
+      markGoalRuntimeDeleted(workspacePath, goalId);
+      registered.push(goalId);
+    } catch {
+      // Ignore malformed or traversing marker names.
+    }
+  }
+  return registered;
+}
+
+/** A deletion tombstone closes the race where an aborted Goal loop finishes a
+ * late persistence callback after the user has requested deletion. */
+export function markGoalRuntimeDeleted(
+  workspacePath: string,
+  goalId: string,
+  options?: { retainFenceForProcess?: boolean },
+): void {
+  const key = normalizeGoalRuntimeDeletionKey(workspacePath, goalId);
+  deletedGoalRuntimeKeys.add(key);
+  if (options?.retainFenceForProcess) {
+    liveGoalDeletionFenceKeys.add(key);
+  }
+}
+
+export function unmarkGoalRuntimeDeleted(workspacePath: string, goalId: string): void {
+  const key = normalizeGoalRuntimeDeletionKey(workspacePath, goalId);
+  deletedGoalRuntimeKeys.delete(key);
+  liveGoalDeletionFenceKeys.delete(key);
+}
+
+export function isGoalRuntimeDeleted(workspacePath: string, goalId: string): boolean {
+  try {
+    return deletedGoalRuntimeKeys.has(normalizeGoalRuntimeDeletionKey(workspacePath, goalId));
+  } catch {
+    return true;
+  }
+}
+
+/** A fence created by this live process must survive until restart. Session
+ * autosaves are asynchronous and an older in-flight write can finish after
+ * the explicit cleared-session save. The next process has no entry in this
+ * set, so startup recovery can safely scrub the final on-disk snapshot and
+ * remove the fence. */
+export function shouldRetainGoalDeletionFenceForCurrentProcess(
+  workspacePath: string,
+  goalId: string,
+): boolean {
+  try {
+    return liveGoalDeletionFenceKeys.has(
+      normalizeGoalRuntimeDeletionKey(workspacePath, goalId),
+    );
+  } catch {
+    return true;
+  }
+}
 
 // ── Path helpers ─────────────────────────────────────────────────
 
@@ -35,7 +180,7 @@ export function resolveGoalProgressFilePath(workspacePath: string): string {
 }
 
 export function resolveGoalRuntimeDirPath(workspacePath: string, goalId: string): string {
-  return `${resolveGoalDirPath(workspacePath)}/${goalId}`;
+  return `${resolveGoalDirPath(workspacePath)}/${assertSafeGoalIdPathSegment(goalId)}`;
 }
 
 export function resolveGoalRuntimeStateFilePath(workspacePath: string, goalId: string): string {

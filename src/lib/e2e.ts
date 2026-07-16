@@ -11,6 +11,7 @@ import { buildPlanReviewActionRequest, buildUserChoiceActionRequest } from "./ac
 import { buildToolPermissionActionRequest } from "./pendingToolReview";
 import { buildPlanApprovalIdentity } from "./planApprovalIdentity";
 import type { HarnessRunMarker } from "./harnessCrashTelemetry";
+import { createGoalContinuationAuthorization } from "./submit/turnSubmission";
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./turnEvents";
 import { projectSubagentRuns } from "./subagents";
 import type { NexusModeKey } from "./gameStudio/catalog";
@@ -371,6 +372,14 @@ function bindBridgeSnapshot(scenario: string) {
       activeGoalId: state.activeGoal?.id ?? null,
       activeGoalObjective: state.activeGoal?.rawText || state.activeGoal?.objective || null,
       activeGoalRevision: state.activeGoal?.revision ?? null,
+      activeActionRequestKind: state.activeActionRequest?.kind ?? null,
+      pendingReplyOptionBlocks: agentBlocks.filter((block) =>
+        Array.isArray(block.options) && block.options.length > 0
+      ).length,
+      queuedGoalContinuationSource:
+        state.queuedUserMessage?.goalContinuationAuthorization?.source ?? null,
+      queuedGoalContinuationGuidance:
+        state.queuedUserMessage?.goalContinuationGuidance ?? null,
       seedCount: readSeedCount(scenario),
     };
   };
@@ -1960,6 +1969,7 @@ function seedReadContextAgentSegmentScenario() {
         "这说明上下文没有丢失；后续只需要核对 README 中的展示约束。",
       ].join("\n\n"),
       streaming: false,
+      visibility: "user_progress" as const,
     },
     {
       id: useAppStore.getState()._nextTaskId(),
@@ -5182,12 +5192,16 @@ function seedGoalCapsuleScenario() {
   const turnId = "e2e-goal-capsule-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
   const agentBlockId = useAppStore.getState()._nextTaskId();
-  const goal = createGoalDefinition({
+  const goal = {
+    ...createGoalDefinition({
     objective: "重构 Goal Runtime；完成标准：Loop 与 Capsule 通过测试；约束：兼容 dark、black、light 三大主题",
     iterationBudget: 40,
     maxDurationMs: 2 * 60 * 60 * 1000,
-    sessionKey: workspace,
-  });
+    sessionKey: `${workspace}:${sessionId}`,
+    ownerTurnId: turnId,
+    }),
+    id: "e2e_goal_capsule",
+  };
   const progress = createGoalProgress(goal.id, `${workspace}/.MAIN/goals/${goal.id}/progress.md`);
   progress.currentIteration = 3;
   progress.totalIterationsUsed = 3;
@@ -5261,7 +5275,15 @@ function seedGoalCapsuleScenario() {
     workspaces: [{ path: workspace, name: "E2E Goal Capsule", addedAt: now, lastActiveAt: now }],
     activeSessionByWorkspace: { [workspace]: sessionId },
     sessionsByWorkspace: {
-      [workspace]: [{ id: sessionId, title: "E2E Goal Capsule", date: new Date(now).toISOString(), active: true, messages: [] }],
+      [workspace]: [{
+        id: sessionId,
+        title: "E2E Goal Capsule",
+        date: new Date(now).toISOString(),
+        active: true,
+        storageStatus: "ok" as const,
+        recordingDisabled: false,
+        messages: [],
+      }],
       [GLOBAL_CHAT_KEY]: [],
     },
     currentSessionId: sessionId,
@@ -5329,6 +5351,194 @@ function seedGoalCapsuleScenario() {
       updatedAt: Date.now(),
     };
     useAppStore.setState({ activeGoal: nextGoal, goalStatus: status, goalRuntime: nextRuntime });
+  };
+  bridge.setGoalUserChoicePending = () => {
+    const state = useAppStore.getState();
+    if (!state.activeGoal || !state.goalProgress) return;
+    const runId = "e2e-goal-capsule-choice-run";
+    const optionValues = ["继续修复按钮交互", "先暂停并检查日志"];
+    const request = {
+      ...buildUserChoiceActionRequest({
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        runId,
+        title: "Goal 等待用户选择",
+        optionValues,
+        allowCustomReply: true,
+        now: Date.now(),
+      }),
+      requestId: "e2e-goal-capsule-choice-request",
+    };
+    const awaitingGoal = {
+      ...state.activeGoal,
+      status: "awaiting_input" as const,
+      updatedAt: Date.now(),
+    };
+    const awaitingRuntime = {
+      ...(state.goalRuntime || buildGoalRuntimeSnapshot({
+        goal: awaitingGoal,
+        progress: state.goalProgress,
+        phase: "re_plan",
+      })),
+      goal: awaitingGoal,
+      status: "awaiting_input" as const,
+      phase: "re_plan" as const,
+      updatedAt: Date.now(),
+    };
+    const marker: HarnessRunMarker = {
+      schemaVersion: 1,
+      runId,
+      parentRunId: null,
+      instanceId: "e2e-goal-capsule-choice-instance",
+      sessionKey: `${workspace}:${sessionId}`,
+      workspace,
+      sessionId,
+      turnId,
+      status: "paused",
+      workflowMode: "edit",
+      runtimeIntent: "goal",
+      planStage: state.planStage,
+      isPlanApproved: state.isPlanApproved,
+      iteration: 3,
+      maxIterations: 40,
+      messagesLen: state.agentMessages.length,
+      toolCount: 8,
+      latestTool: null,
+      latestToolTarget: null,
+      activeStreamId: null,
+      streamStatus: "closed",
+      streamChunkCount: 0,
+      streamByteCount: 0,
+      streamElapsedMs: 0,
+      streamLifecycleStatus: "completed",
+      lastStreamError: null,
+      startedAt: Date.now() - 1_000,
+      updatedAt: Date.now(),
+      closedAt: Date.now(),
+      closeReason: "awaiting_user_choice",
+    };
+    useAppStore.setState((latest) => ({
+      activeGoal: awaitingGoal,
+      goalStatus: "awaiting_input",
+      goalRuntime: awaitingRuntime,
+      activeActionRequest: request,
+      harnessRunMarker: marker,
+      taskFlow: latest.taskFlow.map((block) =>
+        block.type === "agent" && block.turnId === turnId
+          ? {
+              ...block,
+              content: "请选择 Goal 的下一步。",
+              options: optionValues.map((value) => ({ label: value, value })),
+              choiceRequest: request,
+            }
+          : block
+      ),
+      conversationTurns: latest.conversationTurns.map((turn) =>
+        turn.id === turnId
+          ? { ...turn, status: "awaiting_input" as const }
+          : turn
+      ),
+      agentStatus: "idle",
+      isGenerating: false,
+      abortController: null,
+    }));
+  };
+  bridge.setExactGoalContinuationQueued = (guidance = "继续修复按钮交互") => {
+    const state = useAppStore.getState();
+    if (!state.activeGoal) return;
+    state.queueUserMessage(guidance, undefined, {
+      runtimeIntentOverride: "goal",
+      goalContinuationAuthorization: createGoalContinuationAuthorization({
+        source: "goal_manual_resume",
+        workspaceKey: workspace,
+        sessionKey: `${workspace}:${sessionId}`,
+        goalId: state.activeGoal.id,
+        goalRevision: state.activeGoal.revision || 1,
+        ownerTurnId: String(state.activeGoal.ownerTurnId || "").trim(),
+      }),
+      goalContinuationGuidance: guidance,
+    });
+  };
+  bridge.resumeGoalIntoBusyQueue = () => {
+    const state = useAppStore.getState();
+    state.pauseGoal();
+    useAppStore.getState().resumeGoal();
+    useAppStore.setState({
+      isGenerating: true,
+      agentStatus: "running",
+      abortController: new AbortController(),
+    });
+  };
+  bridge.replaceQueuedGoalContinuation = (text = "普通排队消息") => {
+    useAppStore.getState().queueUserMessage(text);
+  };
+  bridge.consumeQueuedGoalContinuation = () => {
+    const queued = useAppStore.getState().queuedUserMessage;
+    if (!queued) return false;
+    return useAppStore.getState().clearQueuedUserMessage({
+      expectedId: queued.id,
+      disposition: "consumed",
+      reason: "e2e_replay_run_lease_acquired",
+    });
+  };
+  bridge.switchAwayFromGoalSession = () => {
+    const state = useAppStore.getState();
+    state.saveCurrentRuntimeToSession();
+    const nextSessionId = sessionId + 1;
+    useAppStore.setState((latest) => ({
+      currentSessionId: nextSessionId,
+      activeSessionByWorkspace: {
+        ...latest.activeSessionByWorkspace,
+        [workspace]: nextSessionId,
+      },
+      sessionsByWorkspace: {
+        ...latest.sessionsByWorkspace,
+        [workspace]: [
+          ...(latest.sessionsByWorkspace[workspace] || []).map((session) => ({
+            ...session,
+            active: session.id === nextSessionId,
+          })),
+          ...((latest.sessionsByWorkspace[workspace] || []).some((session) => session.id === nextSessionId)
+            ? []
+            : [{
+                id: nextSessionId,
+                title: "E2E Goal Capsule Other Session",
+                date: new Date().toISOString(),
+                active: true,
+                storageStatus: "temporary" as const,
+                recordingDisabled: true,
+                messages: [],
+              }]),
+        ],
+      },
+      taskFlow: [],
+      agentMessages: [],
+      conversationTurns: [],
+      currentTurnId: null,
+      activeGoal: null,
+      goalProgress: null,
+      goalStatus: "paused" as const,
+      goalRuntime: null,
+      activeActionRequest: null,
+      harnessRunMarker: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+      abortController: null,
+      agentStatus: "idle" as const,
+      isGenerating: false,
+    }));
+  };
+  bridge.getGoalOwnerSnapshot = () => {
+    const state = useAppStore.getState();
+    const ownerRuntime = state.runtimeBySessionKey[`${workspace}:${sessionId}`];
+    const ownerSession = (state.sessionsByWorkspace[workspace] || []).find((session) => session.id === sessionId);
+    return {
+      runtimeGoalId: ownerRuntime?.activeGoal?.id || ownerRuntime?.goalRuntime?.goal?.id || null,
+      sessionGoalId: ownerSession?.runtimeSnapshot?.activeGoal?.id || ownerSession?.runtimeSnapshot?.goalRuntime?.goal?.id || null,
+      currentSessionId: state.currentSessionId,
+      currentGoalId: state.activeGoal?.id || null,
+    };
   };
 
   const cleanup = () => {
@@ -5589,9 +5799,60 @@ function seedComposerMainShortcutsScenario() {
       currentTurnStatus: state.currentTurnId
         ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId)?.status ?? null
         : null,
+      currentWorkspace: state.currentWorkspace,
+      activeGoalId: state.activeGoal?.id ?? null,
+      isGenerating: state.isGenerating,
+      agentStatus: state.agentStatus,
+      queuedUserMessage: state.queuedUserMessage
+        ? {
+            id: state.queuedUserMessage.id,
+            text: state.queuedUserMessage.text,
+            goalCreationAuthorizationSource:
+              state.queuedUserMessage.goalCreationAuthorization?.source ?? null,
+          }
+        : null,
       planStage: state.planStage,
       seedCount: readSeedCount(COMPOSER_MAIN_SHORTCUTS_SCENARIO),
     };
+  };
+
+  bridge.setComposerRuntimeState = (input: {
+    isGenerating: boolean;
+    agentStatus: "idle" | "running" | "pending_review";
+  }) => {
+    useAppStore.setState({
+      isGenerating: input.isGenerating,
+      agentStatus: input.agentStatus,
+    });
+  };
+
+  bridge.switchComposerSubmissionWorkspace = (workspace: string) => {
+    useAppStore.setState({
+      currentWorkspace: workspace,
+      selectedWorkspace: workspace,
+      currentSessionId: null,
+    });
+  };
+
+  bridge.submitQueuedComposerMessage = () => {
+    const queued = useAppStore.getState().queuedUserMessage;
+    if (!queued) return false;
+    useAppStore.setState({
+      isGenerating: false,
+      agentStatus: "idle",
+      abortController: null,
+    });
+    const started = useAppStore.getState().sendMessage(queued.text, queued.images, {
+      contextMentionsSnapshot: queued.contextMentions || [],
+      attachedFilesSnapshot: queued.attachedFiles || [],
+      runtimeIntentOverride: queued.runtimeIntentOverride,
+      goalSourceContextSnapshot: queued.goalSourceContextSnapshot,
+      queuedUserMessageId: queued.id,
+    });
+    if (started) {
+      useAppStore.setState({ queuedUserMessage: null });
+    }
+    return started;
   };
 
   const cleanup = () => {
@@ -6364,17 +6625,26 @@ function seedRealOmlxPlanFlowScenario() {
 
   bridge.sendGoalMessage = (text?: string) => {
     const objective = text || "修改 src/hooks/useCsvParser.ts，将 creator 正确映射到 creatorName，并运行验证。";
+    const ownerTurnId = `e2e-omlx-goal-${sessionId}`;
     const state = useAppStore.getState();
     state.startGoal(objective, {
       sessionKey: `${workspace}:${sessionId}`,
+      ownerTurnId,
       maxIterations: 6,
       maxDurationMs: 20 * 60 * 1000,
     });
-    return state.sendMessage(objective, undefined, {
+    const liveState = useAppStore.getState();
+    const goalContinuationEnvelope = liveState.captureGoalContinuationEnvelope(
+      objective,
+      { source: "goal_e2e_resume" },
+    );
+    return liveState.sendMessage(objective, undefined, {
       resolvedIntent: "execute",
       runtimeIntentOverride: "goal",
+      ...(goalContinuationEnvelope ? { goalContinuationEnvelope } : {}),
       skipIntentResolution: true,
       preservePlanState: true,
+      turnIdOverride: ownerTurnId,
       turnTitle: "OMLX Goal Runtime",
       intentSummary: "Run a bounded Goal Runtime loop with local OMLX",
     });

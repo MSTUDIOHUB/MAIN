@@ -256,6 +256,9 @@ export default function Composer({
   const setStoreInput = useAppStore((s) => s.setInput);
   const queuedUserMessage = useAppStore((s) => s.queuedUserMessage);
   const activeGuidance = useAppStore((s) => s.activeGuidance);
+  const captureVisibleGoalSubmissionEnvelope = useAppStore(
+    (s) => s.captureVisibleGoalSubmissionEnvelope,
+  );
   const queueUserMessage = useAppStore((s) => s.queueUserMessage);
   const clearQueuedUserMessage = useAppStore((s) => s.clearQueuedUserMessage);
   const setActiveGuidance = useAppStore((s) => s.setActiveGuidance);
@@ -285,8 +288,9 @@ export default function Composer({
     [language],
   );
   const mainIntentShortcuts = useMemo(
-    () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "main_mode" }),
-    [language],
+    () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "main_mode" })
+      .filter((item) => currentWorkspace || item.intent !== "goal"),
+    [currentWorkspace, language],
   );
   const gameStudioPlanShortcuts = useMemo(
     () => getMainIntentShortcuts(language === "en" ? "en" : "zh", { mainModeKey: "game_studio" }),
@@ -367,7 +371,12 @@ export default function Composer({
   const streamingPrimaryQueuesMessage = isStreaming && hasDraftPayload;
   const queuedMessagePreview = queuedUserMessage?.text?.trim() || (queuedUserMessage ? (language === "en" ? "Attachment message" : "含附件消息") : "");
   const activeGuidancePreview = activeGuidance?.text?.trim() || "";
-  const queuedCanGuide = Boolean(queuedUserMessage?.text?.trim());
+  const queuedIsGoalContinuation = Boolean(
+    queuedUserMessage?.goalContinuationAuthorization,
+  );
+  const queuedCanGuide = Boolean(
+    queuedUserMessage?.text?.trim() && !queuedIsGoalContinuation,
+  );
   const autoReviewToggleDisabled = Boolean(autoApproveTools && isStreaming);
   const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
   const webSearchProviderOptions = useMemo(
@@ -596,6 +605,12 @@ export default function Composer({
     previousMainModeRef.current = selectedMainModeKey;
     previousWorkspaceRef.current = currentWorkspace;
   }, [currentWorkspace, currentWorkspaceOnboardingKey, imageStudio.status.state, isGameStudioMode, isImageStudioMode, selectedMainModeKey, setImageStudioSetupGuideOpen]);
+
+  useEffect(() => {
+    if (!currentWorkspace && lockedComposerIntent === "goal") {
+      setLockedComposerIntent(null);
+    }
+  }, [currentWorkspace, lockedComposerIntent, setLockedComposerIntent]);
 
   const currentTokens = useMemo(() => {
     const historyTokens = estimateAgentMessagesTokens(agentMessages);
@@ -1226,13 +1241,29 @@ export default function Composer({
       return;
     }
 
+    const explicitIntent = parseMainIntentShortcutForMode(textToSend, selectedMainModeKey)?.intent;
+    if (!currentWorkspace && (lockedComposerIntent === "goal" || explicitIntent === "goal")) {
+      window.alert(
+        language === "en"
+          ? "Goal mode needs a workspace so its runtime state can be saved and deleted safely. Open a workspace first."
+          : "Goal 模式需要工作区来安全保存和删除运行状态，请先打开一个工作区。",
+      );
+      return;
+    }
+
     if (isStreaming) {
+      const visibleGoalSubmissionEnvelope =
+        captureVisibleGoalSubmissionEnvelope(textToSend);
       queueUserMessage(textToSend, pendingImages, {
         contextMentions,
         attachedFiles: attachedFiles.map((file) => normalizeAttachedFile(file)),
+        ...(visibleGoalSubmissionEnvelope ? { visibleGoalSubmissionEnvelope } : {}),
       });
       closeSlashMenu();
       setDraftInput("");
+      if (lockedComposerIntent === "goal") {
+        setLockedComposerIntent(null);
+      }
       setStoreInput("");
       setContextMentions([]);
       setAttachedFiles([]);
@@ -1253,13 +1284,32 @@ export default function Composer({
       return;
     }
     setDraftInput("");
-    setStoreInput("", { preserveLockedComposerIntent: true });
+    if (lockedComposerIntent === "goal") {
+      setLockedComposerIntent(null);
+      setStoreInput("");
+    } else {
+      setStoreInput("", { preserveLockedComposerIntent: true });
+    }
     setPendingImages([]);
-  }, [attachedFiles, closeSlashMenu, contextMentions, draftInput, isGameStudioMode, isStreaming, markStudioOnboardingUsed, onSendMessage, pendingImages, queueUserMessage, setAttachedFiles, setContextMentions, setStoreInput]);
+  }, [attachedFiles, captureVisibleGoalSubmissionEnvelope, closeSlashMenu, contextMentions, currentWorkspace, draftInput, isGameStudioMode, isStreaming, language, lockedComposerIntent, markStudioOnboardingUsed, onSendMessage, pendingImages, queueUserMessage, selectedMainModeKey, setAttachedFiles, setContextMentions, setLockedComposerIntent, setStoreInput]);
 
   const handleGuideQueuedMessage = useCallback(() => {
     const guidance = queuedUserMessage?.text?.trim() || "";
     if (!guidance) return;
+
+    // A queued Goal continuation is a pending run-lease handoff, not ordinary
+    // guidance for whichever run happens to be streaming. Never downgrade it
+    // into `activeGuidance`, which would inject it into a foreign run.
+    if (queuedUserMessage?.goalContinuationAuthorization) {
+      clearQueuedUserMessage({
+        expectedId: queuedUserMessage.id,
+        disposition: "discarded",
+        reason: "goal_continuation_cannot_guide_foreign_run",
+      });
+      closeSlashMenu();
+      setStoreInput("");
+      return;
+    }
 
     const appState = useAppStore.getState();
     if (appState.agentStatus === "pending_review") {
@@ -1279,13 +1329,18 @@ export default function Composer({
 
     if (isStreaming) {
       setActiveGuidance(guidance, currentTurnId);
-      clearQueuedUserMessage();
+      clearQueuedUserMessage({
+        expectedId: queuedUserMessage.id,
+        disposition: "consumed",
+        reason: "moved_to_active_guidance",
+      });
       closeSlashMenu();
       setStoreInput("");
     } else {
-      clearQueuedUserMessage();
       closeSlashMenu();
-      onSendMessage(guidance, queuedUserMessage.images || []);
+      onSendMessage(guidance, queuedUserMessage.images || [], {
+        queuedUserMessageId: queuedUserMessage.id,
+      });
     }
   }, [clearQueuedUserMessage, closeSlashMenu, currentTurnId, isStreaming, queuedUserMessage, setActiveGuidance, setStoreInput, onSendMessage]);
 
@@ -2105,14 +2160,23 @@ export default function Composer({
                       onClick={handleGuideQueuedMessage}
                       disabled={!queuedCanGuide}
                       className="inline-flex h-7 items-center gap-1.5 rounded-md border border-[rgba(52,211,153,0.30)] bg-[rgba(16,185,129,0.10)] px-2.5 text-[11px] font-semibold text-[#bbf7d0] transition-colors hover:bg-[rgba(16,185,129,0.18)] disabled:cursor-not-allowed disabled:opacity-45"
-                      title={guidanceButtonTitle}
+                      title={queuedIsGoalContinuation
+                        ? (language === "en"
+                            ? "Goal continuation is reserved for its own run and cannot guide the current run."
+                            : "Goal 续跑指令只能启动所属运行，不能注入当前运行。")
+                        : guidanceButtonTitle}
                     >
                       <IconZap className="h-3.5 w-3.5" />
                       {guidanceButtonLabel}
                     </button>
                     <button
                       type="button"
-                      onClick={clearQueuedUserMessage}
+                      data-testid="composer-queued-delete-button"
+                      onClick={() => clearQueuedUserMessage({
+                        expectedId: queuedUserMessage.id,
+                        disposition: "discarded",
+                        reason: "user_deleted_queue_entry",
+                      })}
                       className="flex h-7 w-7 items-center justify-center rounded-md border border-[#34343b] bg-[#050507] text-[#a1a1aa] transition-colors hover:border-[#52525b] hover:text-white"
                       title={language === "en" ? "Delete queued message" : "删除这条排队指令"}
                     >

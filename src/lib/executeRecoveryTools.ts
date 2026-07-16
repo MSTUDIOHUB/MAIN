@@ -60,6 +60,7 @@ export type ExecuteRecoveryContractPhase =
 
 export type ExecuteRecoveryNextCapability =
   | "any"
+  | "targeting"
   | "targeted_read"
   | "mutation"
   | "validation"
@@ -71,6 +72,7 @@ export type ExecuteRecoveryNextCapability =
 
 export type RecoveryReadLeasePurpose =
   | "initial_targeting"
+  | "plan_line_context"
   | "patch_recovery"
   | "missing_window"
   | "context_restore"
@@ -80,6 +82,16 @@ export interface RecoveryReadLease {
   purpose: RecoveryReadLeasePurpose;
   target: string;
   requestedRange?: { startLine?: number; endLine?: number; maxLines?: number } | null;
+  /** Full reviewed range retained while segmented exact reads advance. */
+  requiredRange?: { startLine?: number; endLine?: number; maxLines?: number } | null;
+  coveredRanges?: Array<{ startLine: number; endLine: number }>;
+  /**
+   * Parser-backed declaration ranges may be larger than read_file's bounded
+   * line/character envelope. In that case one exact declaration prefix is enough
+   * to bind mutation preflight to current source; patch recovery still
+   * requires exact coverage of its mismatch range.
+   */
+  coverageMode?: "exact" | "bounded_prefix" | "segmented_exact";
   observationKey?: string | null;
   observedVersion?: string | null;
   /** Stable identity of the patch failure that granted this one-shot read. */
@@ -142,9 +154,10 @@ export interface ForcedExecuteRecoveryRuntimeState {
  * persistence/logging label; callers must not maintain a second mode-specific
  * tool allowlist.
  *
- * read_file is deliberately exposed as a conditional capability in every
- * active transaction. Argument-aware partitioning decides whether a concrete
- * path/range/version is useful, cached, or outside the transaction scope.
+ * read_file is exposed only by an explicit context/read lease (including
+ * patch recovery and post-mutation verification). Mutation and validation
+ * phases are strict: a provider cannot turn a named mutation request back into
+ * open-ended exploration by returning another read call.
  */
 export interface RecoveryActionContract {
   modeLabel: ExecuteRecoveryMode;
@@ -168,10 +181,7 @@ export interface RecoveryActionContract {
 }
 
 export const EXECUTE_RECOVERY_TARGETING_TOOLS = new Set([
-  "grep_search",
-  "get_file_outline",
   "code_ast_query",
-  "find_symbol_references",
 ]);
 
 export const EXECUTE_RECOVERY_PATCH_READ_TOOLS = new Set([
@@ -205,23 +215,19 @@ export const EXECUTE_RECOVERY_MUTATION_FIRST_TOOLS = new Set([
 
 const EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_MUTATION_TOOLS,
-  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
 ]);
 
 const EXECUTE_RECOVERY_TARGETED_ACTION_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_MUTATION_TOOLS,
   ...EXECUTE_RECOVERY_TARGETING_TOOLS,
-  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
 ]);
 
 const EXECUTE_RECOVERY_VALIDATION_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
-  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
 ]);
 
 const EXECUTE_RECOVERY_FINITE_VALIDATION_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS,
-  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
 ]);
 
 const EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS = new Set([
@@ -333,6 +339,21 @@ export function resolveExecuteRecoveryActionContract(
       surfaceDescription: "post_mutation_target_read",
     };
   }
+  if (
+    mode === "action_plus_targeting" &&
+    context.decisionCheckpoint?.nextRequiredCapability === "targeting"
+  ) {
+    return {
+      ...shared,
+      modeLabel: mode,
+      phase: "context",
+      nextRequiredCapability: "targeting",
+      allowTargetedFileRead: false,
+      allowsAllTools: false,
+      allowedToolNames: EXECUTE_RECOVERY_TARGETING_TOOLS,
+      surfaceDescription: "structural_targeting_only",
+    };
+  }
   const longRunningValidationActive = mode === "action_plus_targeting" || mode === "validation_only";
   if (
     longRunningValidationActive &&
@@ -438,10 +459,10 @@ export function resolveExecuteRecoveryActionContract(
       modeLabel: mode,
       phase: "validation",
       nextRequiredCapability: "validation",
-      allowTargetedFileRead: true,
+      allowTargetedFileRead: false,
       allowsAllTools: false,
       allowedToolNames: EXECUTE_RECOVERY_VALIDATION_CONTRACT_TOOLS,
-      surfaceDescription: "validation_with_targeted_read",
+      surfaceDescription: "validation_only",
     };
   }
   if (mode === "finite_validation_only") {
@@ -450,10 +471,10 @@ export function resolveExecuteRecoveryActionContract(
       modeLabel: mode,
       phase: "validation",
       nextRequiredCapability: "validation",
-      allowTargetedFileRead: true,
+      allowTargetedFileRead: false,
       allowsAllTools: false,
       allowedToolNames: EXECUTE_RECOVERY_FINITE_VALIDATION_CONTRACT_TOOLS,
-      surfaceDescription: "finite_validation_with_targeted_read",
+      surfaceDescription: "finite_validation_only",
     };
   }
   if (mode === "action_plus_targeting") {
@@ -462,10 +483,10 @@ export function resolveExecuteRecoveryActionContract(
       modeLabel: mode,
       phase: "mutation",
       nextRequiredCapability: "mutation",
-      allowTargetedFileRead: true,
+      allowTargetedFileRead: false,
       allowsAllTools: false,
       allowedToolNames: EXECUTE_RECOVERY_TARGETED_ACTION_CONTRACT_TOOLS,
-      surfaceDescription: "mutation_with_targeting_and_targeted_read",
+      surfaceDescription: "mutation_with_targeting",
     };
   }
   return {
@@ -473,10 +494,10 @@ export function resolveExecuteRecoveryActionContract(
     modeLabel: mode,
     phase: "mutation",
     nextRequiredCapability: "mutation",
-    allowTargetedFileRead: true,
+    allowTargetedFileRead: false,
     allowsAllTools: false,
     allowedToolNames: EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS,
-    surfaceDescription: "mutation_with_targeted_read",
+    surfaceDescription: "mutation_only",
   };
 }
 
@@ -623,7 +644,35 @@ export function readEvidenceSatisfiesRecoveryLease(input: {
 }): boolean {
   const lease = input.lease;
   if (!lease || !workspacePathsReferToSameFile(input.target, lease.target)) return false;
-  if (!recoveryReadRangesMatch(lease.requestedRange, input.requestedRange)) return false;
+  if (lease.purpose === "patch_recovery" && !normalizeRecoveryReadRange(lease.requestedRange)) {
+    return false;
+  }
+  const expectedRange = normalizeRecoveryReadRange(lease.requestedRange);
+  const observedRange = normalizeRecoveryReadRange(input.requestedRange);
+  if (lease.coverageMode === "bounded_prefix" && expectedRange) {
+    if (!observedRange) return false;
+    const expectedStart = expectedRange.startLine || 1;
+    const expectedEnd = expectedRange.endLine ?? (
+      expectedRange.maxLines
+        ? expectedStart + expectedRange.maxLines - 1
+        : Number.MAX_SAFE_INTEGER
+    );
+    const observedStart = observedRange.startLine || 1;
+    const observedEnd = observedRange.endLine ?? (
+      observedRange.maxLines
+        ? observedStart + observedRange.maxLines - 1
+        : observedStart
+    );
+    if (
+      observedStart !== expectedStart ||
+      observedEnd < observedStart ||
+      observedEnd > expectedEnd
+    ) {
+      return false;
+    }
+  } else if (!recoveryReadRangesMatch(lease.requestedRange, input.requestedRange)) {
+    return false;
+  }
   const expectedVersion = String(lease.observedVersion || "").trim();
   const observedVersion = String(input.observedVersion || "").trim();
   return !expectedVersion || !observedVersion || expectedVersion === observedVersion;
@@ -713,7 +762,8 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     };
   }
 
-  const phase = contract.nextRequiredCapability === "targeted_read"
+  const phase = contract.nextRequiredCapability === "targeted_read" ||
+    contract.nextRequiredCapability === "targeting"
     ? "need_context" as const
     : contract.nextRequiredCapability === "mutation" && mode !== "action_plus_targeting"
       ? "need_mutation" as const
@@ -731,7 +781,10 @@ export function resolveExecuteRecoveryBatchDecision(input: {
       : null
   );
   const isTargetScopedCall = (call: ExecuteRecoveryBatchCallLike): boolean =>
-    call.name === "read_file" || EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name);
+    call.name === "read_file" ||
+    call.name === "code_ast_query" ||
+    call.name === "get_file_outline" ||
+    EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name);
   const scopedEligible = transactionTarget
     ? eligible.filter((call) =>
         !isTargetScopedCall(call) ||
@@ -750,6 +803,9 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)
   ) || (soleUnresolvedPatch ? eligible[0] : undefined);
   const matchingRead = scopedEligible.find((call) => call.name === "read_file");
+  const matchingTargeting = scopedEligible.find((call) =>
+    EXECUTE_RECOVERY_TARGETING_TOOLS.has(call.name)
+  );
   const matchingJoin = scopedEligible.find((call) => call.name === "wait_subagents");
   const matchingValidation = mode === "finite_validation_only"
     ? scopedEligible.find((call) =>
@@ -774,8 +830,10 @@ export function resolveExecuteRecoveryBatchDecision(input: {
       : undefined;
   const selected = matchingJoin || (contract.nextRequiredCapability === "targeted_read"
     ? matchingRead
+    : contract.nextRequiredCapability === "targeting"
+      ? matchingTargeting
     : contract.nextRequiredCapability === "mutation"
-      ? matchingMutation || matchingRead || scopedEligible[0]
+      ? matchingMutation
       : matchingNextCapability || matchingValidation || matchingRead);
   return {
     active: true,
@@ -804,9 +862,9 @@ export function isExecuteRecoveryToolName(
   // Recovery may narrow new work, but it must not strand already-running
   // children. Joining releases their scope lease and is not new exploration.
   if (name === "wait_subagents") return true;
-  // allowFileRead is retained for call-site compatibility, but cannot hide a
-  // potentially legal changed-version/missing-window read before arguments are
-  // available. The contract and argument-aware partitioner own that decision.
+  // allowFileRead is retained for call-site compatibility. The action contract
+  // is authoritative: legal changed-version/missing-window reads first switch
+  // into a lease-backed context phase, so mutation cannot silently expose it.
   return contract.allowedToolNames.has(name);
 }
 
@@ -1136,7 +1194,7 @@ export function buildExecuteValidationRecoveryPrompt(input: {
       tools ? `Available validation tools: ${tools}.` : "",
       recent ? `Recent tool activity: ${recent}.` : "",
       "Next response must call exactly one validation tool, preferably `run_command` for a finite build/test/lint command or `browser_evaluate` for DOM/screenshot validation.",
-      "Do not edit files or summarize completion until validation returns. One targeted read_file is allowed only for a changed target version, an evicted source window, or a missing post-mutation range; that read does not satisfy validation. If automated validation is impossible, state the exact blocker without claiming completion.",
+      "Do not edit files, reread source, or summarize completion until validation returns. If the runtime detects a changed target version or missing post-mutation window, it will first switch to a separate targeted-read lease; a read never satisfies validation. If automated validation is impossible, state the exact blocker without claiming completion.",
     ].filter(Boolean).join("\n");
   }
 
@@ -1169,8 +1227,8 @@ export function buildFailedFiniteValidationRecoveryPrompt(input: {
     `Failed command: ${command}`,
     result ? `Observed result: ${result}` : "Observed result: no usable command output was returned.",
     allowAlternativeCommand
-      ? "The pending Plan evidence is a generic finite-validation placeholder. `run_command` is the required next capability; call one different finite validation command that matches the actual project runtime and source format (for example an existing test, build, typecheck, lint, or compile command). A conditional read_file remains available only for a changed target version or missing source window and cannot satisfy command evidence."
-      : `The approved Plan requires this exact command evidence: ${requiredCommand}. \`run_command\` is the required next capability; retry that same command after correcting its prerequisites or invocation. A conditional read_file remains available only for a changed target version or missing source window and cannot satisfy this explicit command task. Do not substitute a different build, test, lint, or typecheck command.`,
+      ? "The pending Plan evidence is a generic finite-validation placeholder. `run_command` is the required next capability; call one different finite validation command that matches the actual project runtime and source format (for example an existing test, build, typecheck, lint, or compile command). Source reads are not part of this validation phase."
+      : `The approved Plan requires this exact command evidence: ${requiredCommand}. \`run_command\` is the required next capability; retry that same command after correcting its prerequisites or invocation. Source reads are not part of this validation phase. Do not substitute a different build, test, lint, or typecheck command.`,
     "Do not switch this finite check to `execute_command` or PTY tools. Do not repeat an unchanged source window, and do not infer that a successful file edit was reverted merely because the validation command itself was invalid.",
     allowAlternativeCommand
       ? "Use stdout, stderr, and exitCode to distinguish a real source/test failure from a wrong command. If the diagnostic names a real source defect, repair it in a later normal execution transaction; otherwise choose a compatible finite command now. Do not repeat the failed command unchanged and do not claim completion before exitCode 0."

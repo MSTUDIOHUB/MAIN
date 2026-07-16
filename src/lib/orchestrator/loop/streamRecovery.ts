@@ -586,6 +586,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         const streamResult = annotateRequiredToolCallProtocolResult(
           rawStreamResult,
           "required",
+          llmTools.map((tool) => tool.function.name),
         );
         callbacks.onProviderNativeToolSuccess?.();
         logAgentEvent("approved_plan_stream_watchdog_recovered", {
@@ -720,6 +721,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
         const streamResult = annotateRequiredToolCallProtocolResult(
           rawStreamResult,
           recoveryTools.length > 0 ? "required" : undefined,
+          recoveryTools.map((tool) => tool.function.name),
         );
         if (recoveryTools.length > 0) {
           callbacks.onProviderNativeToolSuccess?.();

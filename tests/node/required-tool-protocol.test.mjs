@@ -60,3 +60,66 @@ test("required tool protocol accepts a real call and leaves auto responses uncha
     auto,
   );
 });
+
+test("named function choice quarantines a different provider tool call", () => {
+  const mismatched = protocol.annotateRequiredToolCallProtocolResult(
+    streamResult({
+      toolCalls: [{ index: 0, id: "call-read", name: "read_file", arguments: "{}" }],
+      finishReason: "tool_calls",
+    }),
+    { type: "function", function: { name: "apply_patch" } },
+  );
+
+  assert.equal(mismatched.protocolViolation, "required_function_call_mismatch");
+  assert.equal(mismatched.protocolExpectedTool, "apply_patch");
+  assert.deepEqual(mismatched.protocolActualTools, ["read_file"]);
+  assert.deepEqual(mismatched.toolCalls, [], "the mismatched read must never reach IPC execution");
+});
+
+test("named function choice keeps only matching calls from a mixed provider response", () => {
+  const mixed = protocol.annotateRequiredToolCallProtocolResult(
+    streamResult({
+      toolCalls: [
+        { index: 0, id: "call-read", name: "read_file", arguments: "{}" },
+        { index: 1, id: "call-patch", name: "apply_patch", arguments: "{}" },
+      ],
+      finishReason: "tool_calls",
+    }),
+    { type: "function", function: { name: "apply_patch" } },
+  );
+
+  assert.equal(mixed.protocolViolation, undefined);
+  assert.deepEqual(mixed.toolCalls.map((call) => call.name), ["apply_patch"]);
+});
+
+test("required capability quarantines calls outside the exposed tool surface", () => {
+  const unavailable = protocol.annotateRequiredToolCallProtocolResult(
+    streamResult({
+      toolCalls: [{ index: 0, id: "call-read", name: "read_file", arguments: "{}" }],
+      finishReason: "tool_calls",
+    }),
+    "required",
+    ["apply_patch", "replace_in_file", "write_file", "wait_subagents"],
+  );
+
+  assert.equal(unavailable.protocolViolation, "required_tool_call_not_available");
+  assert.deepEqual(unavailable.protocolAllowedTools, [
+    "apply_patch",
+    "replace_in_file",
+    "write_file",
+    "wait_subagents",
+  ]);
+  assert.deepEqual(unavailable.protocolActualTools, ["read_file"]);
+  assert.deepEqual(unavailable.toolCalls, []);
+
+  const legalAlternative = protocol.annotateRequiredToolCallProtocolResult(
+    streamResult({
+      toolCalls: [{ index: 0, id: "call-replace", name: "replace_in_file", arguments: "{}" }],
+      finishReason: "tool_calls",
+    }),
+    "required",
+    ["apply_patch", "replace_in_file", "write_file"],
+  );
+  assert.equal(legalAlternative.protocolViolation, undefined);
+  assert.deepEqual(legalAlternative.toolCalls.map((call) => call.name), ["replace_in_file"]);
+});

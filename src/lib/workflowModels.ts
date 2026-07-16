@@ -598,7 +598,10 @@ export interface NormalizedStreamState {
   hasExplicitUserChoiceRequest: boolean;
   toolCalls: NormalizedToolCall[];
   finishReason: "stop" | "length" | "tool_calls" | null;
-  protocolViolation?: "required_tool_call_missing";
+  protocolViolation?:
+    | "required_tool_call_missing"
+    | "required_function_call_mismatch"
+    | "required_tool_call_not_available";
 }
 
 // endregion

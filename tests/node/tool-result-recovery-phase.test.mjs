@@ -70,7 +70,7 @@ test("tool result recovery phase owns runtime state folds", () => {
 
 test("approved plan scope blocks recover within the reviewed scope before completion can be audited", () => {
   const scopeCheckpointIndex = phaseSource.indexOf("const approvedPlanScopeBlockedTargets");
-  const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({");
+  const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({", scopeCheckpointIndex);
   const recoveryActivationIndex = phaseSource.indexOf(
     '"approved_plan_scope_blocked"',
     scopeCheckpointIndex,
@@ -119,13 +119,37 @@ test("approved plan completion is committed only after closure and active-recove
   assert.match(phaseSource, /evidenceClosureAudit\.completionAllowed/);
 });
 
+test("the first decision-complete approved target read atomically enters mutation", () => {
+  const checkpointIndex = phaseSource.indexOf("const approvedPlanInitialMutationRead");
+  const activationIndex = phaseSource.indexOf(
+    '"approved_plan_target_context_observed"',
+    checkpointIndex,
+  );
+  const noProgressIndex = phaseSource.indexOf("const noProgressRecovery = handleNoProgressRecovery({");
+
+  assert.notEqual(checkpointIndex, -1);
+  assert.notEqual(activationIndex, -1);
+  assert.notEqual(noProgressIndex, -1);
+  assert.ok(checkpointIndex < activationIndex);
+  assert.ok(activationIndex < noProgressIndex);
+  assert.match(phaseSource, /const pendingTask = audit\.remainingTasks\.find/);
+  assert.match(phaseSource, /approvedPlanReadCoversDecisionAnchor\(pendingTask, result\)/);
+  assert.match(phaseSource, /extractReadFileWindowMetadata/);
+  assert.match(phaseSource, /lineAnchors\.every/);
+  assert.match(
+    phaseSource,
+    /activateExecuteRecoveryAndSync\(\s*"mutation_first",\s*"approved_plan_target_context_observed",[\s\S]*?expectedTarget: approvedPlanInitialMutationRead\.target,[\s\S]*?sourceObservationKey:/,
+  );
+  assert.match(phaseSource, /SOURCE_CONTEXT_LOCKED:[\s\S]*?Do not read or investigate again/);
+});
+
 test("premature browser validation activates PTY observation recovery before completion auditing", () => {
   const deferralIndex = phaseSource.indexOf("resolvePtyObservationPolicyDeferral(input.results)");
   const activationIndex = phaseSource.indexOf(
     '"browser_validation_deferred_for_pty_observation"',
     deferralIndex,
   );
-  const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({");
+  const completionAuditIndex = phaseSource.indexOf("buildPlanTaskEvidenceAudit({", activationIndex);
 
   assert.notEqual(deferralIndex, -1);
   assert.notEqual(activationIndex, -1);

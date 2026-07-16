@@ -71,6 +71,9 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/useAppStore.ts"));
 const actionRequests = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/actionRequest.ts"));
 const pendingToolReview = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/pendingToolReview.ts"));
+const goalState = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalState.ts"));
+const goalRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalRuntime.ts"));
+const goalPersistence = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalPersistence.ts"));
 const {
   validatePlanArtifactContent,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
@@ -109,6 +112,45 @@ function buildApprovedPlanContent() {
     "",
   ].join("\n");
 }
+
+test("queued Goal continuation guidance survives session normalization only with authorization", () => {
+  const authorization = {
+    kind: "goal_continuation_authorization",
+    source: "goal_manual_resume",
+    workspaceKey: "/repo",
+    sessionKey: "/repo:7",
+    goalId: "goal-1",
+    goalRevision: 2,
+    ownerTurnId: "turn-goal",
+  };
+  const restored = normalizeSessionRuntimeSnapshot({
+    queuedUserMessage: {
+      id: "queued-goal-guidance",
+      sessionKey: "/repo:7",
+      text: "queue display text",
+      status: "queued",
+      createdAt: 100,
+      goalContinuationAuthorization: authorization,
+      goalContinuationGuidance: "exact continuation guidance",
+    },
+  });
+  assert.equal(
+    restored.queuedUserMessage.goalContinuationGuidance,
+    "exact continuation guidance",
+  );
+
+  const untrusted = normalizeSessionRuntimeSnapshot({
+    queuedUserMessage: {
+      id: "queued-untrusted-guidance",
+      sessionKey: "/repo:7",
+      text: "queue display text",
+      status: "queued",
+      createdAt: 100,
+      goalContinuationGuidance: "must not survive alone",
+    },
+  });
+  assert.equal(untrusted.queuedUserMessage.goalContinuationGuidance, undefined);
+});
 
 function planArtifact(content, overrides = {}) {
   return {
@@ -565,4 +607,227 @@ test("restore emits run.paused when a running marker was interrupted by restart"
   assert.equal(restored.harnessRunMarker.status, "paused");
   assert.deepEqual(restored.runtimeEvents.map((event) => event.type), ["run.started", "run.paused"]);
   assert.equal(restored.runtimeEvents[1].reason, "application_restarted");
+});
+
+test("a loaded durable Goal deletion fence prevents an old session snapshot from resurrecting", () => {
+  const workspace = "/tmp/deleted-goal-restore";
+  const sessionKey = `${workspace}:71`;
+  const turnId = "turn-deleted-goal";
+  const runId = "run-deleted-goal";
+  const goal = goalState.createGoalDefinition({
+    objective: "修复按钮并验证交互",
+    sessionKey,
+    ownerTurnId: turnId,
+  });
+  const progress = goalState.createGoalProgress(goal.id, "progress.md");
+  const runtime = goalRuntime.buildGoalRuntimeSnapshot({
+    goal,
+    progress,
+    phase: "execute",
+  });
+  const request = actionRequests.buildUserChoiceActionRequest({
+    sessionKey,
+    turnId,
+    runId,
+    title: "Goal choice",
+    optionValues: ["继续"],
+    allowCustomReply: true,
+    now: 200,
+  });
+
+  goalPersistence.markGoalRuntimeDeleted(workspace, goal.id);
+  try {
+    const restored = normalizeSessionRuntimeSnapshot({
+      activeGoal: goal,
+      goalProgress: progress,
+      goalStatus: "awaiting_input",
+      goalRuntime: { ...runtime, status: "awaiting_input" },
+      queuedUserMessage: {
+        id: "queued-deleted-goal",
+        sessionKey,
+        text: "继续",
+        status: "queued",
+        createdAt: 210,
+        runtimeIntentOverride: "goal",
+        goalContinuationAuthorization: {
+          kind: "goal_continuation_authorization",
+          source: "goal_user_choice",
+          workspaceKey: workspace,
+          sessionKey,
+          goalId: goal.id,
+          goalRevision: goal.revision || 1,
+          ownerTurnId: turnId,
+          requestId: request.requestId,
+        },
+        goalContinuationGuidance: "继续",
+      },
+      activeActionRequest: request,
+      harnessRunMarker: {
+        schemaVersion: 1,
+        instanceId: "deleted-goal-instance",
+        sessionKey,
+        workspace,
+        sessionId: 71,
+        turnId,
+        runId,
+        status: "paused",
+        workflowMode: "edit",
+        runtimeIntent: "goal",
+        planStage: "idle",
+        isPlanApproved: false,
+        iteration: 1,
+        maxIterations: 6,
+        messagesLen: 2,
+        toolCount: 0,
+        latestTool: null,
+        latestToolTarget: null,
+        activeStreamId: null,
+        streamStatus: "closed",
+        streamChunkCount: 0,
+        streamByteCount: 0,
+        streamElapsedMs: 0,
+        streamLifecycleStatus: "completed",
+        lastStreamError: null,
+        startedAt: 100,
+        updatedAt: 200,
+        closedAt: 200,
+        closeReason: "awaiting_user_choice",
+      },
+      taskFlow: [{
+        id: 501,
+        type: "agent",
+        turnId,
+        content: "请选择",
+        options: [{ label: "继续", value: "继续" }],
+        choiceRequest: request,
+      }],
+      conversationTurns: [{
+        id: turnId,
+        userPrompt: "修复按钮",
+        title: "Goal",
+        mode: "edit",
+        intent: "goal",
+        displayIntent: "goal",
+        status: "awaiting_input",
+        summary: "等待选择",
+        blockIds: [501],
+        collapsed: false,
+        createdAt: 100,
+      }],
+    }, {
+      restoreInterruptedGoal: true,
+      workspacePath: workspace,
+    });
+
+    assert.equal(restored.activeGoal, null);
+    assert.equal(restored.goalRuntime, null);
+    assert.equal(restored.goalProgress, null);
+    assert.equal(restored.goalStatus, "paused");
+    assert.equal(restored.queuedUserMessage, null);
+    assert.equal(restored.activeActionRequest, null);
+    assert.equal(restored.harnessRunMarker, null);
+    assert.deepEqual(restored.taskFlow[0].options, []);
+    assert.equal(restored.conversationTurns[0].status, "paused");
+  } finally {
+    goalPersistence.unmarkGoalRuntimeDeleted(workspace, goal.id);
+  }
+});
+
+test("a Goal deletion fence preserves an unrelated pending request in the same session", () => {
+  const workspace = "/tmp/deleted-goal-with-new-run";
+  const sessionKey = `${workspace}:72`;
+  const goalTurnId = "turn-old-goal";
+  const requestTurnId = "turn-current-run";
+  const requestRunId = "run-current-run";
+  const goal = goalState.createGoalDefinition({
+    objective: "旧 Goal",
+    sessionKey,
+    ownerTurnId: goalTurnId,
+  });
+  const progress = goalState.createGoalProgress(goal.id, "progress.md");
+  const runtime = goalRuntime.buildGoalRuntimeSnapshot({ goal, progress, phase: "execute" });
+  const request = actionRequests.buildUserChoiceActionRequest({
+    sessionKey,
+    turnId: requestTurnId,
+    runId: requestRunId,
+    title: "Current non-Goal choice",
+    optionValues: ["保留这个选择"],
+    allowCustomReply: true,
+    now: 300,
+  });
+
+  goalPersistence.markGoalRuntimeDeleted(workspace, goal.id);
+  try {
+    const restored = normalizeSessionRuntimeSnapshot({
+      activeGoal: goal,
+      goalProgress: progress,
+      goalStatus: "active",
+      goalRuntime: runtime,
+      activeActionRequest: request,
+      harnessRunMarker: {
+        schemaVersion: 1,
+        instanceId: "current-run-instance",
+        sessionKey,
+        workspace,
+        sessionId: 72,
+        turnId: requestTurnId,
+        runId: requestRunId,
+        status: "paused",
+        workflowMode: "edit",
+        runtimeIntent: "execute",
+        planStage: "idle",
+        isPlanApproved: false,
+        iteration: 1,
+        maxIterations: 6,
+        messagesLen: 2,
+        toolCount: 0,
+        latestTool: null,
+        latestToolTarget: null,
+        activeStreamId: null,
+        streamStatus: "closed",
+        streamChunkCount: 0,
+        streamByteCount: 0,
+        streamElapsedMs: 0,
+        streamLifecycleStatus: "completed",
+        lastStreamError: null,
+        startedAt: 200,
+        updatedAt: 300,
+        closedAt: 300,
+        closeReason: "awaiting_user_choice",
+      },
+      taskFlow: [{
+        id: 601,
+        type: "agent",
+        turnId: requestTurnId,
+        content: "请选择当前请求",
+        options: [{ label: "保留这个选择", value: "保留这个选择" }],
+        choiceRequest: request,
+      }],
+      conversationTurns: [{
+        id: requestTurnId,
+        userPrompt: "当前非 Goal 请求",
+        title: "Current request",
+        mode: "edit",
+        intent: "execute",
+        displayIntent: "execute",
+        status: "awaiting_input",
+        summary: "等待选择",
+        blockIds: [601],
+        collapsed: false,
+        createdAt: 200,
+      }],
+    }, {
+      restoreInterruptedGoal: true,
+      workspacePath: workspace,
+    });
+
+    assert.equal(restored.activeGoal, null);
+    assert.equal(restored.goalRuntime, null);
+    assert.equal(restored.activeActionRequest?.requestId, request.requestId);
+    assert.equal(restored.harnessRunMarker?.runId, requestRunId);
+    assert.equal(restored.taskFlow[0].options.length, 1);
+    assert.equal(restored.conversationTurns[0].status, "awaiting_input");
+  } finally {
+    goalPersistence.unmarkGoalRuntimeDeleted(workspace, goal.id);
+  }
 });

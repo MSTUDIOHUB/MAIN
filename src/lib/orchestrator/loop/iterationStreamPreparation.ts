@@ -294,7 +294,21 @@ export async function prepareIterationStreamRequest(input: {
             readLease: {
               purpose: "context_restore",
               target,
-              observedVersion: freshness.observedVersion,
+              ...(sourceState.window
+                ? {
+                    requestedRange: {
+                      startLine: sourceState.window.startLine,
+                      endLine: sourceState.window.endLine,
+                      maxLines: Math.max(
+                        1,
+                        sourceState.window.endLine - sourceState.window.startLine + 1,
+                      ),
+                    },
+                  }
+                : {}),
+              // This is the version the recovery read is expected to observe,
+              // not the stale version that triggered invalidation.
+              observedVersion: freshness.currentVersion,
               state: "available",
             },
             decisionCheckpoint: nextCheckpoint,

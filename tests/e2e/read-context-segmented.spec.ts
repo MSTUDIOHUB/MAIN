@@ -26,7 +26,7 @@ test("read/search progress stays accessible in the continuous process timeline w
   await expect(page.getByText("读取与命令交错完成，命令步骤已折叠保留。")).toBeVisible();
 });
 
-test("substantive stage summary remains in ChatArea while read/search evidence stays folded", async ({ page }) => {
+test("model-claimed stage summary stays out of ChatArea while read/search evidence remains available", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-agent-segment");
 
   await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);
@@ -34,7 +34,7 @@ test("substantive stage summary remains in ChatArea while read/search evidence s
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
   await expect(page.getByText("第二段读取完成。")).toBeVisible();
   const stageSummary = page.getByText("阶段性结论：第一段读取确认 ChatArea 会把读取记录按正文边界分段。");
-  await expect(stageSummary).toBeVisible();
+  await expect(stageSummary).toHaveCount(0);
 
   const processTimeline = page.getByTestId("live-turn-process-timeline");
   await expect(processTimeline).toBeVisible();

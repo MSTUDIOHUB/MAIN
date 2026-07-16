@@ -158,7 +158,7 @@ test("tool progress presentation marks runtime narration as user progress", () =
   assert.equal(decision.modelAuthored, false);
 });
 
-test("tool progress presentation preserves approved execution model-authored text", () => {
+test("tool progress presentation hides approved execution model narration", () => {
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 1,
     finalReplyOptionCount: 0,
@@ -171,8 +171,8 @@ test("tool progress presentation preserves approved execution model-authored tex
   });
 
   assert.equal(decision.shouldRenderToolProgress, true);
-  assert.equal(decision.shouldPreserveApprovedExecutionText, true);
-  assert.equal(decision.visibility, "user_progress");
-  assert.equal(decision.capsuleCandidate, true);
+  assert.equal(decision.shouldPreserveApprovedExecutionText, false);
+  assert.equal(decision.visibility, "hidden_process");
+  assert.equal(decision.capsuleCandidate, false);
   assert.equal(decision.modelAuthored, true);
 });

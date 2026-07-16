@@ -4,6 +4,7 @@ import {
   failedFiniteValidationMatchesPendingPlanEvidence,
   hasPendingPlanCommandEvidence,
   resolveFailedFiniteValidationRecoveryPolicy,
+  requestedRangeFromReadObservationSignature,
   shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
 import { buildApprovedPlanScopeConflictFingerprint } from "../../approvedPlanExecutionScope";
@@ -16,8 +17,13 @@ import {
 } from "../../orchestrator";
 import { buildPlanApprovalIdentity } from "../../planApprovalIdentity";
 import { commandResultLooksSuccessful } from "../../planEvidence";
-import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import type {
+  PlanAstObservation,
+  PlanAstSymbolObservation,
+  PlanToolActivitySummary,
+} from "../../planExecutionRecovery";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
+import { extractReadFileWindowMetadata } from "../../readFileWindow";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
@@ -29,8 +35,13 @@ import type {
   PlanRuntimePhase,
   PlanTask,
 } from "../../workflowModels";
-import { buildPlanTaskEvidenceAudit } from "../../workflowModels";
+import {
+  buildPlanTaskEvidenceAudit,
+  inferPlanTaskEvidence,
+  planTaskHasUnsatisfiedSourceMutationEvidence,
+} from "../../workflowModels";
 import { buildExecuteEvidenceClosureAudit } from "../../verificationEvidence";
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
 import type { ApprovedPlanNoProgressDecision } from "./loopRecovery";
 import {
@@ -176,6 +187,386 @@ function buildApprovedPlanScopeRecoveryPrompt(input: {
     "当前已进入有界范围恢复事务。请复用已有源码观察，在已批准目标内完成精确修改；只有确实缺失当前精确区间时才定向读取。",
     "不要用 shell 或换工具绕过范围限制；如果源码修复确实必须修改被拦截目标，请改为写出聚焦的 Plan revision 供审核。",
   ].join("\n");
+}
+
+function extractApprovedPlanSourceLineAnchors(text: string): number[] {
+  const anchors: number[] = [];
+  for (const match of String(text || "").matchAll(/(?:^|\W)(?:L|line\s+)(\d{1,7})(?:\s*[-–]\s*(\d{1,7}))?/gi)) {
+    const start = Number(match[1]);
+    const end = Number(match[2] || match[1]);
+    if (Number.isFinite(start) && start > 0) anchors.push(start);
+    if (Number.isFinite(end) && end > 0) anchors.push(end);
+  }
+  return [...new Set(anchors)];
+}
+
+function extractApprovedPlanSourceIdentifierAnchors(text: string): string[] {
+  const anchors = new Set<string>();
+  const add = (value: string) => {
+    const clean = String(value || "").trim().replace(/\(\)$/, "");
+    if (!/^[A-Za-z_$][\w$-]{2,}$/.test(clean)) return;
+    if (/^(?:apply_patch|replace_in_file|write_file|read_file|run_command|execute_command|function|return|switch|while|catch|await)$/i.test(clean)) return;
+    anchors.add(clean);
+  };
+  for (const match of String(text || "").matchAll(/`([A-Za-z_$][\w$-]*(?:\(\))?)`/g)) add(match[1]);
+  for (const match of String(text || "").matchAll(/\b([A-Za-z_$][\w$]*)\s*\(/g)) add(match[1]);
+  return [...anchors].slice(0, 12);
+}
+
+function approvedPlanReadWindow(input: ToolExecutionResult): {
+  wholeFile: boolean;
+  startLine: number;
+  endLine: number;
+} {
+  const metadata = extractReadFileWindowMetadata(input.content || "");
+  if (metadata) {
+    return {
+      wholeFile:
+        !metadata.truncated &&
+        metadata.returnedStartLine === 1 &&
+        metadata.returnedEndLine >= metadata.totalLines,
+      startLine: metadata.returnedStartLine,
+      endLine: metadata.returnedEndLine,
+    };
+  }
+  const requestedRange = requestedRangeFromReadObservationSignature(
+    input.readFileObservation?.requestSignature || "",
+  );
+  if (requestedRange) {
+    const startLine = requestedRange.startLine || 1;
+    return {
+      wholeFile: false,
+      startLine,
+      endLine: requestedRange.endLine || (
+        requestedRange.maxLines ? startLine + requestedRange.maxLines - 1 : startLine
+      ),
+    };
+  }
+  // read_file emits raw content only when the complete file fits in its
+  // bounded result. Stubs are excluded before this helper is called.
+  return { wholeFile: true, startLine: 1, endLine: Number.MAX_SAFE_INTEGER };
+}
+
+function approvedPlanReadCoversRange(
+  result: ToolExecutionResult,
+  range: { startLine: number; endLine: number },
+): boolean {
+  const window = approvedPlanReadWindow(result);
+  return window.wholeFile || (
+    window.startLine <= range.startLine && window.endLine >= range.endLine
+  );
+}
+
+function resolveApprovedPlanAstOwner(
+  identifiers: string[],
+  observation: PlanAstObservation,
+): { status: "resolved"; symbol: PlanAstSymbolObservation } | {
+  status: "unresolved" | "ambiguous" | "needs_precise_query";
+} {
+  if (observation.hasErrors || !observation.versionToken) {
+    return { status: "unresolved" };
+  }
+  if (observation.truncated) {
+    const normalizedQuery = String(observation.query || "").trim().toLowerCase();
+    const queriedIdentifier = identifiers.find((identifier) =>
+      identifier.toLowerCase() === normalizedQuery
+    );
+    if (!queriedIdentifier) return { status: "needs_precise_query" };
+    const exactMatches = observation.symbols.filter((symbol) =>
+      symbol.name === queriedIdentifier
+    );
+    const exactMatchCount = Math.max(0, Number(observation.exactMatchCount) || 0);
+    if (exactMatchCount === 1 && exactMatches.length === 1) {
+      return { status: "resolved", symbol: exactMatches[0] };
+    }
+    return exactMatchCount > 1
+      ? { status: "ambiguous" }
+      : { status: "unresolved" };
+  }
+  for (const identifier of identifiers) {
+    const matches = observation.symbols.filter((symbol) => symbol.name === identifier);
+    if (matches.length === 0) continue;
+    if (matches.length === 1) return { status: "resolved", symbol: matches[0] };
+    const nested = [...matches].sort((left, right) =>
+      (left.endLine - left.startLine) - (right.endLine - right.startLine) ||
+      right.startLine - left.startLine
+    )[0];
+    const nestedInsideEveryCandidate = matches.every((candidate) =>
+      candidate.startLine <= nested.startLine && candidate.endLine >= nested.endLine
+    );
+    return nestedInsideEveryCandidate
+      ? { status: "resolved", symbol: nested }
+      : { status: "ambiguous" };
+  }
+  return { status: "unresolved" };
+}
+
+export type ApprovedPlanMutationContextDecision =
+  | { status: "none" }
+  | {
+      status: "needs_targeting";
+      target: string;
+      identifiers: string[];
+      observedVersion: string | null;
+      sourceObservationKey: string | null;
+      targetingReason?: "missing_ast" | "stale_ast" | "precise_query_required";
+    }
+  | {
+      status: "needs_range_read";
+      target: string;
+      requestedRange: { startLine: number; endLine: number; maxLines: number };
+      observedVersion: string | null;
+      symbolName: string | null;
+      rangeSource: "plan_line" | "ast_declaration";
+    }
+  | {
+      status: "covered";
+      result: ToolExecutionResult;
+      requestedRange: { startLine: number; endLine: number; maxLines: number } | null;
+      symbolName: string | null;
+    };
+
+export function resolveApprovedPlanMutationContextDecision(input: {
+  tasks: PlanTask[];
+  evidenceLedger: ReturnType<OrchestratorCallbacks["getPlanExecutionEvidenceLedger"]>;
+  results: ToolExecutionResult[];
+  recentToolActivity?: PlanToolActivitySummary[];
+  expectedVersion?: string | null;
+}): ApprovedPlanMutationContextDecision {
+  const audit = buildPlanTaskEvidenceAudit({
+    tasks: input.tasks,
+    evidenceLedger: input.evidenceLedger,
+    preserveMissing: true,
+    highlightNext: true,
+  });
+  const pendingTask = audit.remainingTasks.find((task) =>
+    planTaskHasUnsatisfiedSourceMutationEvidence(task, input.evidenceLedger)
+  );
+  if (!pendingTask) return { status: "none" };
+  const evidence = pendingTask.evidence && pendingTask.evidence.length > 0
+    ? pendingTask.evidence
+    : inferPlanTaskEvidence(pendingTask.text, pendingTask.commands || []);
+  const pendingTargets = evidence
+    .filter((item) => item.kind === "file")
+    .map((item) => String(item.value || "").trim())
+    .filter(Boolean);
+  if (pendingTargets.length === 0) return { status: "none" };
+  const readResults = input.results.filter((result) =>
+    result.name === "read_file" &&
+    !result.isError &&
+    !result.internalFeedback &&
+    result.readFileObservation?.source !== "stub" &&
+    pendingTargets.some((target) => workspacePathsReferToSameFile(result.target, target))
+  );
+  const explicitlyCoveredRead = readResults.find((result) =>
+    approvedPlanReadCoversDecisionAnchor(pendingTask, result)
+  );
+  if (explicitlyCoveredRead) {
+    return {
+      status: "covered",
+      result: explicitlyCoveredRead,
+      requestedRange: null,
+      symbolName: null,
+    };
+  }
+
+  const target = pendingTargets.find((candidate) =>
+    readResults.some((result) => workspacePathsReferToSameFile(result.target, candidate)) ||
+    [...(input.recentToolActivity || [])].reverse().some((activity) =>
+      activity.astObservation && workspacePathsReferToSameFile(activity.astObservation.path, candidate)
+    )
+  ) || pendingTargets[0];
+  const lineAnchors = extractApprovedPlanSourceLineAnchors(pendingTask.text);
+  if (lineAnchors.length > 0) {
+    const requestedRange = {
+      startLine: Math.min(...lineAnchors),
+      endLine: Math.max(...lineAnchors),
+      maxLines: Math.max(1, Math.max(...lineAnchors) - Math.min(...lineAnchors) + 1),
+    };
+    const coveringRead = readResults.find((result) =>
+      workspacePathsReferToSameFile(result.target, target) &&
+      approvedPlanReadCoversRange(result, requestedRange)
+    );
+    return coveringRead
+      ? { status: "covered", result: coveringRead, requestedRange, symbolName: null }
+      : {
+          status: "needs_range_read",
+          target,
+          requestedRange,
+          observedVersion: readResults.find((result) =>
+            workspacePathsReferToSameFile(result.target, target)
+          )?.readFileObservation?.versionToken || null,
+          symbolName: null,
+          rangeSource: "plan_line",
+        };
+  }
+
+  const identifiers = extractApprovedPlanSourceIdentifierAnchors(pendingTask.text);
+  if (identifiers.length === 0) return { status: "none" };
+  const currentBatchRead = [...readResults].reverse().find((result) =>
+    workspacePathsReferToSameFile(result.target, target)
+  );
+  const retainedReadObservation = [...(input.recentToolActivity || [])].reverse().find((activity) =>
+    activity.status === "succeeded" &&
+    activity.readFileObservation &&
+    workspacePathsReferToSameFile(activity.readFileObservation.path, target)
+  )?.readFileObservation;
+  const currentReadVersion = currentBatchRead?.readFileObservation?.versionToken ||
+    retainedReadObservation?.versionToken || null;
+  const sourceObservationKey = currentBatchRead?.readFileObservation?.key ||
+    retainedReadObservation?.key || null;
+  const newestAstObservation = [...(input.recentToolActivity || [])].reverse().find((activity) =>
+    activity.status === "succeeded" &&
+    activity.name === "code_ast_query" &&
+    activity.astObservation &&
+    workspacePathsReferToSameFile(activity.astObservation.path, target)
+  )?.astObservation;
+  const currentBatchHasAstQuery = input.results.some((result) =>
+    result.name === "code_ast_query" &&
+    !result.isError &&
+    workspacePathsReferToSameFile(result.target, target)
+  );
+  const astObservation = newestAstObservation && (
+    currentBatchHasAstQuery ||
+    (currentReadVersion
+      ? newestAstObservation.versionToken === currentReadVersion
+      : !input.expectedVersion || newestAstObservation.versionToken === input.expectedVersion)
+  )
+    ? newestAstObservation
+    : undefined;
+  if (!astObservation) {
+    return currentReadVersion
+      ? {
+          status: "needs_targeting",
+          target,
+          identifiers,
+          observedVersion: currentReadVersion,
+          sourceObservationKey,
+          targetingReason: newestAstObservation ? "stale_ast" : "missing_ast",
+        }
+      : { status: "none" };
+  }
+  const owner = resolveApprovedPlanAstOwner(identifiers, astObservation);
+  if (owner.status === "needs_precise_query") {
+    return {
+      status: "needs_targeting",
+      target,
+      identifiers,
+      observedVersion: astObservation.versionToken,
+      sourceObservationKey,
+      targetingReason: "precise_query_required",
+    };
+  }
+  if (owner.status !== "resolved") return { status: "none" };
+  const requestedRange = {
+    startLine: owner.symbol.startLine,
+    endLine: owner.symbol.endLine,
+    maxLines: Math.max(1, owner.symbol.endLine - owner.symbol.startLine + 1),
+  };
+  const coveringRead = readResults.find((result) =>
+    workspacePathsReferToSameFile(result.target, target) &&
+    result.readFileObservation?.versionToken === astObservation.versionToken &&
+    approvedPlanReadCoversRange(result, requestedRange)
+  );
+  const declarationPrefixEnd = Math.min(
+    requestedRange.endLine,
+    requestedRange.startLine + 1,
+  );
+  const declarationPrefixRead = readResults.find((result) => {
+    if (
+      !workspacePathsReferToSameFile(result.target, target) ||
+      result.readFileObservation?.versionToken !== astObservation.versionToken
+    ) {
+      return false;
+    }
+    const window = approvedPlanReadWindow(result);
+    return window.wholeFile || (
+      window.startLine <= requestedRange.startLine &&
+      window.endLine >= declarationPrefixEnd
+    );
+  });
+  const mutationContextRead = coveringRead || declarationPrefixRead;
+  return mutationContextRead
+    ? {
+        status: "covered",
+        result: mutationContextRead,
+        requestedRange,
+        symbolName: owner.symbol.name,
+      }
+    : {
+        status: "needs_range_read",
+        target,
+        requestedRange,
+        observedVersion: astObservation.versionToken,
+        symbolName: owner.symbol.name,
+        rangeSource: "ast_declaration",
+      };
+}
+
+function approvedPlanReadCoversDecisionAnchor(task: PlanTask, result: ToolExecutionResult): boolean {
+  const metadata = extractReadFileWindowMetadata(result.content || "");
+  const fullFileRead = Boolean(
+    approvedPlanReadWindow(result).wholeFile,
+  );
+  if (fullFileRead) return true;
+
+  const lineAnchors = extractApprovedPlanSourceLineAnchors(task.text);
+  if (lineAnchors.length > 0) {
+    const requestedRange = requestedRangeFromReadObservationSignature(
+      result.readFileObservation?.requestSignature || "",
+    );
+    const startLine = metadata?.returnedStartLine || requestedRange?.startLine || 1;
+    const endLine = metadata?.returnedEndLine || requestedRange?.endLine || (
+      requestedRange?.maxLines ? startLine + requestedRange.maxLines - 1 : startLine
+    );
+    return lineAnchors.every((line) => line >= startLine && line <= endLine);
+  }
+
+  return false;
+}
+
+export function resolveApprovedPlanInitialMutationRead(input: {
+  tasks: PlanTask[];
+  evidenceLedger: ReturnType<OrchestratorCallbacks["getPlanExecutionEvidenceLedger"]>;
+  results: ToolExecutionResult[];
+  recentToolActivity?: PlanToolActivitySummary[];
+}): ToolExecutionResult | null {
+  const decision = resolveApprovedPlanMutationContextDecision(input);
+  return decision.status === "covered" ? decision.result : null;
+}
+
+function resolveParentSourceRereadRequirement(input: {
+  results: ToolExecutionResult[];
+  recentToolActivity: PlanToolActivitySummary[];
+}): {
+  target: string;
+  requestedRange: { startLine?: number; endLine?: number; maxLines?: number };
+  observedVersion: string | null;
+  sourceObservationKey: string | null;
+} | null {
+  const deferred = input.results.find((result) =>
+    result.qualityGateReason === "subagent_parent_reread_required"
+  );
+  if (!deferred?.target) return null;
+  const delegated = [...input.recentToolActivity].reverse().find((activity) =>
+    activity.delegatedObservation?.requiresParentReread === true &&
+    workspacePathsReferToSameFile(activity.target, deferred.target)
+  )?.delegatedObservation;
+  const sourceRange = delegated?.sourceRange;
+  return {
+    target: deferred.target,
+    requestedRange: sourceRange
+      ? {
+          startLine: sourceRange.startLine,
+          endLine: sourceRange.endLine,
+          maxLines: Math.max(1, sourceRange.endLine - sourceRange.startLine + 1),
+        }
+      : { startLine: 1, maxLines: 180 },
+    // The child version is diagnostic only; the parent must accept and bind
+    // the current version it actually rereads in the exact delegated range.
+    observedVersion: null,
+    sourceObservationKey: delegated?.sourceObservationKey || null,
+  };
 }
 
 export type ToolResultRecoveryPhaseResult =
@@ -404,6 +795,230 @@ export async function handleToolResultRecoveryPhase(input: {
     return finish("continue");
   }
 
+  const parentSourceRereadRequirement = resolveParentSourceRereadRequirement({
+    results: input.results,
+    recentToolActivity: input.recentToolActivity,
+  });
+  if (parentSourceRereadRequirement) {
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: input.results,
+      toolArgsByCallId: input.toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "patch_recovery_read",
+      "subagent_parent_source_reread_required",
+      {
+        target: parentSourceRereadRequirement.target,
+        requestedRange: parentSourceRereadRequirement.requestedRange,
+        observedVersion: parentSourceRereadRequirement.observedVersion,
+        sourceObservationKey: parentSourceRereadRequirement.sourceObservationKey,
+      },
+    );
+    input.callbacks.appendMessage({
+      role: "user",
+      content: `PARENT_SOURCE_READ_LEASE: Read only ${parentSourceRereadRequirement.target} in the leased range, then continue with the pending parent mutation. Do not reopen broad investigation.`,
+    });
+    logAgentEvent("subagent_parent_reread_recovery_activated", {
+      iteration: input.iteration,
+      target: parentSourceRereadRequirement.target,
+      requestedRange: parentSourceRereadRequirement.requestedRange,
+      observedVersion: parentSourceRereadRequirement.observedVersion,
+      sourceObservationKey: parentSourceRereadRequirement.sourceObservationKey,
+    });
+    return finish("continue");
+  }
+
+  // An approved source-edit task may need one exact parent-owned source
+  // observation before it can write. As soon as that observation exists, bind
+  // it to the transaction and switch atomically to mutation-only. Waiting for
+  // a generic loop detector here allowed valid plans to drift back into a
+  // multi-window investigation even though the next capability was known.
+  const approvedPlanMutationContextDecision =
+    (
+      executeRecoveryState.mode === "normal" ||
+      (
+        executeRecoveryState.mode === "action_plus_targeting" &&
+        executeRecoveryState.decisionCheckpoint?.nextRequiredCapability === "targeting"
+      )
+    ) &&
+    input.workflowMode === "plan" &&
+    input.callbacks.getIsPlanApproved() &&
+    isMutationRuntimeIntent(input.runtimeIntent)
+      ? resolveApprovedPlanMutationContextDecision({
+          tasks: input.callbacks.getPlanTasks(),
+          evidenceLedger: input.callbacks.getPlanExecutionEvidenceLedger(),
+          results: input.results,
+          recentToolActivity: input.recentPlanToolActivity,
+          expectedVersion: executeRecoveryState.decisionCheckpoint?.evidenceVersion || null,
+        })
+      : { status: "none" as const };
+  if (
+    approvedPlanMutationContextDecision.status === "needs_targeting"
+  ) {
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: input.results,
+      toolArgsByCallId: input.toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "action_plus_targeting",
+      "approved_plan_symbol_targeting_required",
+      {
+        expectedTarget: approvedPlanMutationContextDecision.target,
+        sourceObservationKey: approvedPlanMutationContextDecision.sourceObservationKey,
+        decisionCheckpoint: {
+          expectedTarget: approvedPlanMutationContextDecision.target,
+          sourceObservationKey: approvedPlanMutationContextDecision.sourceObservationKey,
+          nextRequiredCapability: "targeting",
+          evidenceVersion: approvedPlanMutationContextDecision.observedVersion,
+        },
+      },
+    );
+    input.callbacks.appendMessage({
+      role: "user",
+      content: [
+        "SOURCE_TARGETING_REQUIRED: The current read is only a reference/call window, not parser-backed mutation context.",
+        `Call code_ast_query for ${approvedPlanMutationContextDecision.target} with query set to one exact reviewed identifier (${approvedPlanMutationContextDecision.identifiers.join(", ")}) and max_results 200. This is the only targeting capability exposed.`,
+        approvedPlanMutationContextDecision.targetingReason === "precise_query_required"
+          ? "The previous AST result was truncated and cannot prove declaration uniqueness until the exact identifier query is used."
+          : approvedPlanMutationContextDecision.targetingReason === "stale_ast"
+          ? "The retained AST belongs to a different file version; query the current version before reading source again."
+          : "No current parser-backed declaration observation exists yet.",
+        "Do not reread the file or mutate until the runtime grants the exact declaration range.",
+      ].join("\n"),
+    });
+    logAgentEvent("approved_plan_symbol_targeting_activated", {
+      iteration: input.iteration,
+      target: approvedPlanMutationContextDecision.target,
+      identifiers: approvedPlanMutationContextDecision.identifiers,
+      observedVersion: approvedPlanMutationContextDecision.observedVersion,
+      sourceObservationKey: approvedPlanMutationContextDecision.sourceObservationKey,
+      targetingReason: approvedPlanMutationContextDecision.targetingReason || "missing_ast",
+      nextRequiredCapability: "targeting",
+    });
+    return finish("continue");
+  }
+  if (approvedPlanMutationContextDecision.status === "needs_range_read") {
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: input.results,
+      toolArgsByCallId: input.toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "patch_recovery_read",
+      "approved_plan_declaration_range_required",
+      {
+        expectedTarget: approvedPlanMutationContextDecision.target,
+        readLease: {
+          purpose: approvedPlanMutationContextDecision.rangeSource === "ast_declaration"
+            ? "initial_targeting"
+            : "plan_line_context",
+          target: approvedPlanMutationContextDecision.target,
+          requestedRange: approvedPlanMutationContextDecision.requestedRange,
+          ...(approvedPlanMutationContextDecision.rangeSource === "plan_line"
+            ? { requiredRange: approvedPlanMutationContextDecision.requestedRange, coveredRanges: [] }
+            : {}),
+          observedVersion: approvedPlanMutationContextDecision.observedVersion,
+          coverageMode: approvedPlanMutationContextDecision.rangeSource === "ast_declaration"
+            ? "bounded_prefix"
+            : "segmented_exact",
+          state: "available",
+        },
+        decisionCheckpoint: {
+          expectedTarget: approvedPlanMutationContextDecision.target,
+          sourceObservationKey: null,
+          nextRequiredCapability: "targeted_read",
+          evidenceVersion: approvedPlanMutationContextDecision.observedVersion,
+        },
+      },
+    );
+    input.callbacks.appendMessage({
+      role: "user",
+      content: [
+        approvedPlanMutationContextDecision.rangeSource === "ast_declaration"
+          ? "SOURCE_RANGE_READ_LEASE: Read the parser-backed declaration range now granted by the runtime. A bounded prefix returned by read_file is valid mutation context when the declaration exceeds the tool envelope."
+          : "SOURCE_RANGE_READ_LEASE: Read exactly the reviewed Plan line range now granted by the runtime.",
+        `Target: ${approvedPlanMutationContextDecision.target}; lines ${approvedPlanMutationContextDecision.requestedRange.startLine}-${approvedPlanMutationContextDecision.requestedRange.endLine}.`,
+        approvedPlanMutationContextDecision.symbolName
+          ? `Declaration: ${approvedPlanMutationContextDecision.symbolName}.`
+          : "The range comes from the reviewed Plan line anchor.",
+        "After the returned source window is bound to the same file version, the transaction switches to mutation-only; do not reopen diagnosis.",
+      ].join("\n"),
+    });
+    logAgentEvent("approved_plan_declaration_range_read_activated", {
+      iteration: input.iteration,
+      target: approvedPlanMutationContextDecision.target,
+      requestedRange: approvedPlanMutationContextDecision.requestedRange,
+      observedVersion: approvedPlanMutationContextDecision.observedVersion,
+      symbolName: approvedPlanMutationContextDecision.symbolName,
+      rangeSource: approvedPlanMutationContextDecision.rangeSource,
+    });
+    return finish("continue");
+  }
+  const approvedPlanInitialMutationRead = approvedPlanMutationContextDecision.status === "covered"
+    ? approvedPlanMutationContextDecision.result
+    : null;
+  if (approvedPlanInitialMutationRead?.readFileObservation) {
+    appendToolResultsToHistory({
+      callbacks: input.callbacks,
+      toolFeedbackFormat: input.toolFeedbackFormat,
+      results: input.results,
+      toolArgsByCallId: input.toolArgsByCallId,
+      iterationContext: input.iterationContext,
+      emitTurnEvent: input.emitTurnEvent,
+    });
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "mutation_first",
+      "approved_plan_target_context_observed",
+      {
+        expectedTarget: approvedPlanInitialMutationRead.target,
+        readFileObservation: approvedPlanInitialMutationRead.readFileObservation,
+        sourceObservationKey: approvedPlanInitialMutationRead.readFileObservation.key,
+        decisionCheckpoint: {
+          expectedTarget: approvedPlanInitialMutationRead.target,
+          sourceObservationKey: approvedPlanInitialMutationRead.readFileObservation.key,
+          nextRequiredCapability: "mutation",
+          evidenceVersion: approvedPlanInitialMutationRead.readFileObservation.versionToken,
+        },
+      },
+    );
+    logAgentEvent("approved_plan_context_to_mutation", {
+      iteration: input.iteration,
+      target: approvedPlanInitialMutationRead.target,
+      observationKey: approvedPlanInitialMutationRead.readFileObservation.key,
+      versionToken: approvedPlanInitialMutationRead.readFileObservation.versionToken,
+      requestSignature: approvedPlanInitialMutationRead.readFileObservation.requestSignature,
+      executeRecoveryMode: executeRecoveryState.mode,
+      nextRequiredCapability: "mutation",
+    });
+    const language = input.callbacks.getPreferredLanguage();
+    input.emitPlanExecutionProgress("running", {
+      currentTask: language === "zh" ? "按已批准计划修改目标源码" : "mutating the approved source target",
+      currentTool: "apply_patch",
+      latestEvidence: approvedPlanInitialMutationRead.target,
+      recoveryReason: "approved_plan_target_context_observed",
+      nextStep: language === "zh"
+        ? "复用已绑定的精确源码窗口执行修改，不再重新诊断"
+        : "reuse the bound source observation and perform the mutation without reopening diagnosis",
+    });
+    input.callbacks.onStatusChange("running");
+    input.callbacks.appendMessage({
+      role: "user",
+      content: "SOURCE_CONTEXT_LOCKED: The approved task now has one exact versioned source observation. Do not read or investigate again. Call exactly one exposed mutation tool for this target and implement the reviewed change.",
+    });
+    return finish("continue");
+  }
+
   // Codex-style Plan execution is runtime-owned: once every task in the
   // approved revision has fresh trusted evidence, do not spend another model
   // turn asking it to narrate or declare completion.  Persist the current tool
@@ -551,6 +1166,7 @@ export async function handleToolResultRecoveryPhase(input: {
     executeRecoveryMode: executeRecoveryState.mode,
     executeRecoveryReason: executeRecoveryState.reason,
     executeRecoveryAttempts: executeRecoveryState.attempts,
+    executeRecoverySourceObservationKey: executeRecoveryState.sourceObservationKey,
     repairExecutionRequestInChat: input.repairExecutionRequestInChat,
     latestUserPromptText: input.latestUserPromptText,
     isUnapprovedPlanReadOnlyBatch: input.isUnapprovedPlanReadOnlyBatch,

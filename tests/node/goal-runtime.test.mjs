@@ -42,6 +42,8 @@ const goalEngine = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/go
 const goalContinuity = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalContinuity.ts"));
 const goalSourceContext = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalSourceContext.ts"));
 const goalEventIdentity = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalEventIdentity.ts"));
+const goalPersistence = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalPersistence.ts"));
+const goalRunOwnership = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalRunOwnership.ts"));
 
 function createIteration(index) {
   return {
@@ -57,6 +59,374 @@ function createIteration(index) {
     unresolvedBlockers: [],
   };
 }
+
+test("Goal persistence deletion paths accept one safe id segment and reject traversal", () => {
+  assert.equal(
+    goalPersistence.resolveGoalRuntimeRelativeDirPath("goal_1783949110423_1"),
+    ".MAIN/goals/goal_1783949110423_1",
+  );
+  for (const unsafe of ["../goal-1", "goal/child", "goal\\child", ".", "..", " goal-1", "goal-1 "]) {
+    assert.throws(
+      () => goalPersistence.resolveGoalRuntimeRelativeDirPath(unsafe),
+      /Invalid Goal id path segment/,
+    );
+  }
+});
+
+test("Goal persistence deletion tombstones are scoped by workspace and goal id", () => {
+  const workspaceA = "/tmp/goal-delete-a";
+  const workspaceB = "/tmp/goal-delete-b";
+  const goalId = "goal_123_1";
+  goalPersistence.markGoalRuntimeDeleted(workspaceA, goalId);
+  assert.equal(goalPersistence.isGoalRuntimeDeleted(workspaceA, goalId), true);
+  assert.equal(goalPersistence.isGoalRuntimeDeleted(workspaceB, goalId), false);
+  assert.equal(goalPersistence.isGoalRuntimeDeleted(workspaceA, "goal_123_2"), false);
+  goalPersistence.unmarkGoalRuntimeDeleted(workspaceA, goalId);
+  assert.equal(goalPersistence.isGoalRuntimeDeleted(workspaceA, goalId), false);
+});
+
+test("a live Goal deletion keeps its durable fence until the next process", () => {
+  const workspace = "/tmp/goal-delete-live-fence";
+  const goalId = "goal_123_3";
+  goalPersistence.markGoalRuntimeDeleted(workspace, goalId, {
+    retainFenceForProcess: true,
+  });
+  assert.equal(
+    goalPersistence.shouldRetainGoalDeletionFenceForCurrentProcess(workspace, goalId),
+    true,
+  );
+  goalPersistence.unmarkGoalRuntimeDeleted(workspace, goalId);
+  assert.equal(
+    goalPersistence.shouldRetainGoalDeletionFenceForCurrentProcess(workspace, goalId),
+    false,
+  );
+});
+
+test("durable Goal deletion fences round-trip only safe exact identities", () => {
+  const goalId = "goal_123_9";
+  const serialized = goalPersistence.serializeGoalDeletionFence({
+    goalId,
+    ownerSessionKey: "/workspace:42",
+    deletedAt: 500,
+  });
+  assert.deepEqual(goalPersistence.deserializeGoalDeletionFence(serialized, goalId), {
+    schemaVersion: 1,
+    goalId,
+    ownerSessionKey: "/workspace:42",
+    deletedAt: 500,
+  });
+  assert.equal(
+    goalPersistence.resolveGoalDeletionFenceRelativePath(goalId),
+    `.MAIN/goals/.deleted/${goalId}.json`,
+  );
+  assert.equal(goalPersistence.deserializeGoalDeletionFence(serialized, "goal_other"), null);
+  assert.deepEqual(goalPersistence.registerGoalDeletionFenceEntries("/workspace", [
+    { name: `${goalId}.json`, is_dir: false },
+    { name: "../escape.json", is_dir: false },
+    { name: "nested", is_dir: true },
+  ]), [goalId]);
+  assert.equal(goalPersistence.isGoalRuntimeDeleted("/workspace", goalId), true);
+  goalPersistence.unmarkGoalRuntimeDeleted("/workspace", goalId);
+});
+
+test("Goal pause/delete recognizes only an exact queued continuation owner", () => {
+  const goal = {
+    id: "goal_123_1",
+    revision: 3,
+    sessionKey: "/workspace:42",
+    ownerTurnId: "turn-goal",
+  };
+  const queuedMessage = {
+    text: "resume exact goal",
+    sessionKey: "/workspace:42",
+    status: "queued",
+    goalContinuationAuthorization: {
+      kind: "goal_continuation_authorization",
+      source: "goal_manual_resume",
+      workspaceKey: "/workspace",
+      sessionKey: "/workspace:42",
+      goalId: "goal_123_1",
+      goalRevision: 3,
+      ownerTurnId: "turn-goal",
+    },
+  };
+  const exactInput = {
+    queuedMessage,
+    goal,
+    workspaceKey: "/workspace",
+    sessionKey: "/workspace:42",
+    expectedText: "resume exact goal",
+    expectedSource: "goal_manual_resume",
+  };
+
+  assert.equal(
+    goalRunOwnership.isQueuedGoalContinuationOwnedByGoal(exactInput),
+    true,
+  );
+  for (const mismatch of [
+    { queuedMessage: { ...queuedMessage, text: "unrelated user message" } },
+    { sessionKey: "/workspace:43" },
+    { goal: { ...goal, revision: 4 } },
+    { goal: { ...goal, ownerTurnId: "turn-other" } },
+    { expectedSource: "goal_user_choice" },
+  ]) {
+    assert.equal(
+      goalRunOwnership.isQueuedGoalContinuationOwnedByGoal({
+        ...exactInput,
+        ...mismatch,
+      }),
+      false,
+    );
+  }
+});
+
+test("removing an unleased queued Goal continuation rolls back only its exact owner", () => {
+  const goal = {
+    id: "goal_123_1",
+    revision: 3,
+    status: "active",
+    sessionKey: "/workspace:42",
+    ownerTurnId: "turn-goal",
+  };
+  const queuedMessage = {
+    id: "queue-goal-resume",
+    text: "resume exact goal",
+    sessionKey: "/workspace:42",
+    status: "queued",
+    goalContinuationAuthorization: {
+      kind: "goal_continuation_authorization",
+      source: "goal_manual_resume",
+      workspaceKey: "/workspace",
+      sessionKey: "/workspace:42",
+      goalId: goal.id,
+      goalRevision: goal.revision,
+      ownerTurnId: goal.ownerTurnId,
+    },
+  };
+  const foreignRunMarker = {
+    status: "running",
+    runtimeIntent: "execute",
+    workspace: "/workspace",
+    sessionKey: "/workspace:42",
+    turnId: "turn-foreign",
+  };
+  const baseInput = {
+    queuedMessage,
+    goal,
+    marker: foreignRunMarker,
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+  };
+
+  assert.deepEqual(
+    goalRunOwnership.resolveQueuedGoalContinuationRemoval({
+      ...baseInput,
+      mode: "discarded",
+    }),
+    {
+      shouldPauseGoal: true,
+      reason: "orphaned_before_run_lease",
+      leaseReason: "runtime_intent_mismatch",
+    },
+  );
+  assert.deepEqual(
+    goalRunOwnership.resolveQueuedGoalContinuationRemoval({
+      ...baseInput,
+      mode: "consumed",
+    }),
+    { shouldPauseGoal: false, reason: "replay_consumed" },
+  );
+  assert.deepEqual(
+    goalRunOwnership.resolveQueuedGoalContinuationRemoval({
+      ...baseInput,
+      mode: "replaced",
+      marker: {
+        status: "running",
+        runtimeIntent: "goal",
+        workspace: "/workspace",
+        sessionKey: "/workspace:42",
+        turnId: "turn-goal",
+      },
+    }),
+    {
+      shouldPauseGoal: false,
+      reason: "goal_run_lease_acquired",
+      leaseReason: "owned_goal_run",
+    },
+  );
+  assert.deepEqual(
+    goalRunOwnership.resolveQueuedGoalContinuationRemoval({
+      ...baseInput,
+      mode: "discarded",
+      currentSessionKey: "/workspace:43",
+    }),
+    { shouldPauseGoal: false, reason: "queue_owner_mismatch" },
+  );
+});
+
+test("Goal deletion aborts only the exact running Goal owner lease", () => {
+  const decision = goalRunOwnership.resolveGoalRunAbortOwnership({
+    goal: {
+      status: "active",
+      sessionKey: "/workspace:42",
+      ownerTurnId: "turn-goal",
+    },
+    marker: {
+      status: "running",
+      runtimeIntent: "goal",
+      sessionKey: "/workspace:42",
+      turnId: "turn-goal",
+      workspace: "/workspace",
+    },
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    isGenerating: true,
+    hasAbortController: true,
+  });
+
+  assert.deepEqual(decision, { owned: true, reason: "owned_goal_run" });
+});
+
+test("a stale active Goal cannot abort the current non-Goal run", () => {
+  const decision = goalRunOwnership.resolveGoalRunAbortOwnership({
+    goal: {
+      status: "active",
+      sessionKey: "/workspace:42",
+      ownerTurnId: "turn-old-goal",
+    },
+    marker: {
+      status: "running",
+      runtimeIntent: "execute",
+      sessionKey: "/workspace:42",
+      turnId: "turn-current-execute",
+      workspace: "/workspace",
+    },
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    isGenerating: true,
+    hasAbortController: true,
+  });
+
+  assert.deepEqual(decision, { owned: false, reason: "runtime_intent_mismatch" });
+});
+
+test("Goal deletion claims an action request only through the exact Goal marker", () => {
+  const goal = {
+    sessionKey: "/workspace:42",
+    ownerTurnId: "turn-shared",
+  };
+  const actionRequest = {
+    kind: "user_choice",
+    status: "pending",
+    sessionKey: "/workspace:42",
+    turnId: "turn-shared",
+    runId: "run-shared",
+  };
+  const marker = {
+    status: "paused",
+    runtimeIntent: "goal",
+    sessionKey: "/workspace:42",
+    turnId: "turn-shared",
+    workspace: "/workspace",
+    runId: "run-goal-outer",
+    activeRunId: "run-shared",
+  };
+
+  assert.deepEqual(goalRunOwnership.resolveGoalActionRequestOwnership({
+    goal,
+    marker,
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    actionRequest,
+  }), { owned: true, reason: "owned_goal_run" });
+
+  assert.deepEqual(goalRunOwnership.resolveGoalActionRequestOwnership({
+    goal,
+    marker: { ...marker, runtimeIntent: "execute" },
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    actionRequest,
+  }), { owned: false, reason: "runtime_intent_mismatch" });
+});
+
+test("a Goal-owned pending permission remains an abortable lease while generation is paused", () => {
+  const marker = {
+    status: "running",
+    runtimeIntent: "goal",
+    sessionKey: "/workspace:42",
+    turnId: "turn-goal",
+    workspace: "/workspace",
+    runId: "run-goal-outer",
+    activeRunId: "run-goal-review",
+  };
+  const goal = {
+    status: "active",
+    sessionKey: "/workspace:42",
+    ownerTurnId: "turn-goal",
+  };
+  const pending = goalRunOwnership.resolveGoalPendingReviewOwnership({
+    goal,
+    marker,
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    agentStatus: "pending_review",
+    actionRequest: {
+      kind: "tool_permission",
+      status: "pending",
+      sessionKey: "/workspace:42",
+      turnId: "turn-goal",
+      runId: "run-goal-review",
+      taskId: 73,
+    },
+    pendingReviewTaskId: 73,
+    hasPendingReviewResolver: true,
+  });
+
+  assert.deepEqual(pending, { owned: true, reason: "owned_goal_run" });
+  assert.deepEqual(goalRunOwnership.resolveGoalRunAbortOwnership({
+    goal,
+    marker,
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    isGenerating: false,
+    hasAbortController: true,
+    hasOwnedPendingReview: pending.owned,
+  }), { owned: true, reason: "owned_goal_run" });
+});
+
+test("a pending permission with a different action run cannot be claimed by Goal deletion", () => {
+  const decision = goalRunOwnership.resolveGoalPendingReviewOwnership({
+    goal: {
+      status: "active",
+      sessionKey: "/workspace:42",
+      ownerTurnId: "turn-goal",
+    },
+    marker: {
+      status: "running",
+      runtimeIntent: "goal",
+      sessionKey: "/workspace:42",
+      turnId: "turn-goal",
+      workspace: "/workspace",
+      runId: "run-goal-outer",
+      activeRunId: "run-goal-review-current",
+    },
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    agentStatus: "pending_review",
+    actionRequest: {
+      kind: "tool_permission",
+      status: "pending",
+      sessionKey: "/workspace:42",
+      turnId: "turn-goal",
+      runId: "run-goal-review-stale",
+      taskId: 73,
+    },
+    pendingReviewTaskId: 73,
+    hasPendingReviewResolver: true,
+  });
+
+  assert.deepEqual(decision, { owned: false, reason: "action_request_mismatch" });
+});
 
 test("Goal Runtime creates a versioned contract with structured completion criteria", () => {
   const goal = goalState.createGoalDefinition({
@@ -629,6 +999,33 @@ test("Goal Engine completes only after a tool-backed mutation and verification s
   assert.equal(harness.outcomes.at(-1).status, "completed");
   assert.ok(harness.writes.some((write) => write.filePath.endsWith(`/.MAIN/goals/${goal.id}/state.json`)));
   assert.ok(harness.writes.some((write) => write.filePath.endsWith(`/.MAIN/goals/${goal.id}/evidence.jsonl`)));
+});
+
+test("a deleted Goal tombstone prevents the aborted loop from recreating persistence files", async () => {
+  const workspace = "/tmp/goal-runtime-test";
+  const goal = goalState.createGoalDefinition({ objective: "Refactor Goal Runtime and run lint", iterationBudget: 10 });
+  const debugEvents = [];
+  const harness = createEngineCallbacks(async () => ({
+    assistantText: "Implemented and verified. GOAL_COMPLETION_CANDIDATE",
+    toolCalls: [
+      { name: "apply_patch", target: "src/lib/goalRuntime.ts", result: "Done" },
+      { name: "run_command", arguments: { command: "npm run lint" }, result: "0 errors" },
+    ],
+    tokensUsed: 120,
+    completed: true,
+    outcomeStatus: "completed",
+  }));
+  harness.callbacks.onDebugEvent = (event, data) => debugEvents.push({ event, data });
+
+  goalPersistence.markGoalRuntimeDeleted(workspace, goal.id);
+  try {
+    const outcome = await goalEngine.executeGoalLoop({ goal, callbacks: harness.callbacks });
+    assert.equal(outcome.status, "completed");
+    assert.equal(harness.writes.length, 0);
+    assert.ok(debugEvents.some(({ event }) => event === "goal_persist_skipped_deleted"));
+  } finally {
+    goalPersistence.unmarkGoalRuntimeDeleted(workspace, goal.id);
+  }
 });
 
 test("Goal Engine completes from verified evidence after a non-terminal provider stop without a model marker", async () => {

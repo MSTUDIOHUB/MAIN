@@ -2780,14 +2780,14 @@ test("approved plan repeated edits route to validation recovery before pausing",
   );
 });
 
-test("approved plan no-tool prose is preserved unless it is a rejected completion claim", () => {
+test("approved plan summaries publish only on no-tool or substantive plan turns", () => {
   const assistantOutputPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantOutputPhase.ts"), "utf8");
 
   assert.match(assistantOutputPhaseSource, /shouldHideApprovedPlanNoToolText/);
   assert.match(assistantOutputPhaseSource, /preservedVisibleText:\s*!shouldHideApprovedPlanNoToolText/);
   assert.match(
     assistantOutputPhaseSource,
-    /if\s*\(\s*!shouldHideApprovedPlanNoToolText\s*\)\s*{[\s\S]*?callbacks\.onTurnSummaryReady\(visibleAssistantText\)/,
+    /if\s*\(\s*!shouldHideApprovedPlanNoToolText\s*&&\s*\(\s*effectiveToolCalls\.length\s*===\s*0\s*\|\|\s*hasSubstantivePlanAssistantText\s*\)\s*\)\s*{[\s\S]*?callbacks\.onTurnSummaryReady\(visibleAssistantText\)/,
   );
   assert.match(
     assistantOutputPhaseSource,

@@ -103,6 +103,10 @@ export function resolveRecoveryToolChoice(input: {
   if (!requiresTool) return undefined;
 
   if (input.preferExplicitFunction) {
+    // Joining a running child releases a scope lease and must remain eligible
+    // ahead of any new parent action. A named function choice would wrongly
+    // quarantine this contract-owned coordination call.
+    if (availableToolNames.has("wait_subagents")) return "required";
     const firstAvailable = (candidates: string[]): string | null =>
       candidates.find((name) => availableToolNames.has(name)) || null;
     let selectedTool: string | null = null;
@@ -110,7 +114,11 @@ export function resolveRecoveryToolChoice(input: {
       if (recoveryActionContract.nextRequiredCapability === "targeted_read") {
         selectedTool = firstAvailable(["read_file"]);
       } else if (recoveryActionContract.nextRequiredCapability === "mutation") {
-        selectedTool = firstAvailable(["apply_patch", "replace_in_file", "write_file"]);
+        // Mutation is a capability, not one concrete function. apply_patch,
+        // replace_in_file, write_file, and scoped MCP edits are equivalent
+        // legal implementations of this phase, so keep the call required but
+        // let the model choose from the already-filtered tool surface.
+        selectedTool = null;
       } else if (recoveryActionContract.nextRequiredCapability === "observe_pty") {
         // A running foreground process may be waiting for interactive input.
         // Keep the call required, but do not bind compatibility models to a
@@ -138,13 +146,9 @@ export function resolveRecoveryToolChoice(input: {
         selectedTool = null;
       }
     }
-    if (!selectedTool && input.approvedPlanActionOnlyRecoveryActive) {
-      selectedTool = firstAvailable(
-        input.approvedPlanRecoveryPreferredToolNames?.length
-          ? input.approvedPlanRecoveryPreferredToolNames
-          : ["apply_patch", "replace_in_file", "write_file", "run_command", "execute_command", "browser_evaluate"],
-      );
-    }
+    // Action-only Plan recovery can close different evidence kinds. Preferred
+    // names order the prompt/surface but do not turn a multi-capability phase
+    // into an exact function contract.
     if (!selectedTool && input.approvedPlanNoToolRecoveryFileReadActive) {
       selectedTool = firstAvailable(["read_file"]);
     }
@@ -454,12 +458,16 @@ export async function invokeInitialStreamForIteration(input: {
   const streamResult = annotateRequiredToolCallProtocolResult(
     rawStreamResult,
     recoveryToolChoice,
+    llmTools.map((tool) => tool.function.name),
   );
   if (streamResult.protocolViolation) {
     logAgentEvent("required_tool_call_protocol_violation", {
       iteration,
       violation: streamResult.protocolViolation,
       toolChoice: recoveryToolChoice ?? null,
+      expectedTool: streamResult.protocolExpectedTool || null,
+      actualTools: streamResult.protocolActualTools || [],
+      allowedTools: streamResult.protocolAllowedTools || llmTools.map((tool) => tool.function.name),
       availableTools: llmTools.map((tool) => tool.function.name),
       finishReason: streamResult.finishReason || null,
       visibleChars: streamResult.content.length,

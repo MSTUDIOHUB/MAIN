@@ -36,7 +36,7 @@ interface GoalPanelProps {
   onPause: () => void;
   onResume: () => void;
   onEdit: (objective: string) => boolean;
-  onStop: () => void;
+  onStop: () => Promise<boolean> | boolean;
   onClose?: () => void;
 }
 
@@ -80,6 +80,8 @@ export default function GoalPanel({
   const [pendingEdit, setPendingEdit] = useState(false);
   const [draft, setDraft] = useState(goal.rawText || goal.objective);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
   const resolvedProgress = runtime?.progress || progress;
   const resolvedGoal = runtime?.goal || goal;
   const criteria = useMemo(() => normalizeGoalCriteria(resolvedGoal), [resolvedGoal]);
@@ -89,6 +91,8 @@ export default function GoalPanel({
     setEditing(false);
     setPendingEdit(false);
     setConfirmClear(false);
+    setClearing(false);
+    setClearError(null);
   }, [resolvedGoal.id, resolvedGoal.revision]);
 
   useEffect(() => {
@@ -147,6 +151,27 @@ export default function GoalPanel({
     const next = draft.trim();
     if (!next) return;
     if (onEdit(next)) setEditing(false);
+  };
+
+  const deleteGoal = async () => {
+    if (clearing) return;
+    setClearing(true);
+    setClearError(null);
+    try {
+      const deleted = await onStop();
+      if (!deleted) {
+        setClearError(language === "zh"
+          ? "目标身份或工作区已变化，未删除任何持久化数据。"
+          : "The Goal identity or workspace changed. No persisted data was deleted.");
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setClearError(language === "zh"
+        ? `删除目标失败：${detail}`
+        : `Failed to delete Goal: ${detail}`);
+    } finally {
+      setClearing(false);
+    }
   };
 
   return (
@@ -330,17 +355,22 @@ export default function GoalPanel({
 
           {confirmClear ? (
             <div className="goal-clear-confirm" data-testid="goal-clear-confirm">
-              <p>{language === "zh" ? "只清除目标跟踪，不会回滚文件修改。" : "This clears goal tracking and does not revert file changes."}</p>
-              <button type="button" className="goal-action-button goal-action-danger" onClick={onStop}>
+              <p>{language === "zh"
+                ? "删除目标跟踪及其 .MAIN/goals 持久化目录；不会回滚文件修改。"
+                : "Delete Goal tracking and its .MAIN/goals directory. File changes are not reverted."}</p>
+              {clearError && <p className="goal-verification-failed" role="alert" data-testid="goal-clear-error">{clearError}</p>}
+              <button type="button" className="goal-action-button goal-action-danger" onClick={deleteGoal} disabled={clearing}>
                 <IconTrash className="h-3.5 w-3.5" />
-                {language === "zh" ? "确认清除" : "Clear goal"}
+                {clearing
+                  ? (language === "zh" ? "正在删除" : "Deleting")
+                  : (language === "zh" ? "确认删除" : "Delete Goal")}
               </button>
-              <button type="button" className="goal-action-button" onClick={() => setConfirmClear(false)}>{language === "zh" ? "取消" : "Cancel"}</button>
+              <button type="button" className="goal-action-button" onClick={() => { setConfirmClear(false); setClearError(null); }} disabled={clearing}>{language === "zh" ? "取消" : "Cancel"}</button>
             </div>
           ) : (
-            <button type="button" className="goal-action-button goal-action-danger-muted" onClick={() => setConfirmClear(true)} data-testid="goal-clear-button">
+            <button type="button" className="goal-action-button goal-action-danger-muted" onClick={() => { setConfirmClear(true); setClearError(null); }} data-testid="goal-clear-button">
               <IconTrash className="h-3.5 w-3.5" />
-              {language === "zh" ? "清除" : "Clear"}
+              {language === "zh" ? "删除" : "Delete"}
             </button>
           )}
         </footer>

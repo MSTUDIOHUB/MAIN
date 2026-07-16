@@ -24,6 +24,7 @@ import {
   saveProjectSession,
   writeChatTempFile,
   writeFile,
+  writeFileAtomic,
   type GitDiffEntry,
   type KnowledgeBase,
   type ReadFileWindowResult,
@@ -173,6 +174,7 @@ import {
 import {
   LOCAL_PERSIST_SCHEMA_VERSION,
   buildPersistedAppState,
+  sanitizeHydratedLockedComposerIntent,
   stripLegacyConfigFields,
   stripLegacyRuntimeFieldsFromPersistedState,
 } from "../lib/persistState";
@@ -215,11 +217,25 @@ import {
   buildMainDebugPrompt,
   buildRunIntentSummary,
   buildSubmitPipelineDecision,
+  createGoalContinuationAuthorization,
+  createGoalContinuationAuthorizationBroker,
+  createVisibleGoalSubmissionAuthorizationBroker,
   isResolvedUserIntentChoice,
   normalizeIntentSummary,
   normalizeTaskFlowPatchForConsumedReplyOptions,
+  isGoalCreationAuthorization,
+  isGoalContinuationAuthorization,
+  isExactQueuedMessageReplay,
+  resolveQueuedGoalCreationAuthorization,
+  resolveQueuedGoalContinuationAuthorization,
+  resolveVisibleGoalSubmissionSessionKey,
   resolveSubmitRuntimeDecision,
   resolveSubmitSemanticMetadataDecision,
+  validateGoalContinuationAuthorization,
+  type GoalContinuationAuthorization,
+  type GoalContinuationEnvelope,
+  type GoalCreationAuthorization,
+  type VisibleGoalSubmissionEnvelope,
 } from "../lib/submit/turnSubmission";
 import {
   DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
@@ -231,7 +247,23 @@ import {
 import type { GoalDefinition, GoalProgress, GoalRuntimeSnapshot, GoalStatus } from "../lib/goalState";
 import type { GoalBudget } from "../lib/goalBudget";
 import { buildGoalRuntimeSnapshot, normalizeGoalRuntimeSnapshot, restoreGoalRuntimeSnapshot } from "../lib/goalRuntime";
-import { resolveGoalRuntimeProgressFilePath } from "../lib/goalPersistence";
+import {
+  isQueuedGoalContinuationOwnedByGoal,
+  resolveQueuedGoalContinuationRemoval,
+  resolveGoalActionRequestOwnership,
+  resolveGoalPendingReviewOwnership,
+  resolveGoalRunAbortOwnership,
+  type QueuedGoalContinuationRemovalMode,
+} from "../lib/goalRunOwnership";
+import {
+  isGoalRuntimeDeleted,
+  markGoalRuntimeDeleted,
+  resolveGoalDeletionFenceRelativePath,
+  resolveGoalRuntimeProgressFilePath,
+  resolveGoalRuntimeRelativeDirPath,
+  serializeGoalDeletionFence,
+  unmarkGoalRuntimeDeleted,
+} from "../lib/goalPersistence";
 import { CLOUD_EXPERIMENTAL_LOGIN_AVAILABLE } from "../lib/appConfig";
 import { PLAN_ARTIFACT_PATHS, hydratePlanArtifactsFromReader } from "../lib/planArtifactHydration";
 import { mapLegacyNexusModeToMainMode, mapMainModeToLegacyNexusMode, type MainModeKey } from "../lib/mainModes";
@@ -416,6 +448,28 @@ export function logStoreEvent(event: string, data: Record<string, unknown> = {})
 
 function nowMs() {
   return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
+const GOAL_DELETE_RUN_SETTLE_TIMEOUT_MS = 10_000;
+
+async function waitForGoalRunLeaseRelease(input: {
+  abortController: AbortController | null;
+  harnessRunId: string | null;
+  getLeaseSnapshot: () => Pick<AppState, "abortController" | "harnessRunMarker"> | null;
+  timeoutMs?: number;
+}): Promise<boolean> {
+  const deadline = Date.now() + Math.max(0, input.timeoutMs ?? GOAL_DELETE_RUN_SETTLE_TIMEOUT_MS);
+  while (true) {
+    const current = input.getLeaseSnapshot();
+    const controllerReleased = !input.abortController || current?.abortController !== input.abortController;
+    const markerReleased = !input.harnessRunId ||
+      !current?.harnessRunMarker ||
+      current.harnessRunMarker.runId !== input.harnessRunId ||
+      current.harnessRunMarker.status !== "running";
+    if (controllerReleased && markerReleased) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
 }
 
 function summarizePlanWorkspaceStateForLog(state: Pick<AppState,
@@ -1224,7 +1278,7 @@ export interface AppState {
   startGoal: (objective: string, options?: Partial<GoalBudget> & { sessionKey?: string; sourceContext?: string; ownerTurnId?: string }) => void;
   pauseGoal: (expected?: GoalControlIdentity) => void;
   resumeGoal: (expected?: GoalControlIdentity) => void;
-  clearGoal: (expected?: GoalControlIdentity) => void;
+  clearGoal: (expected: GoalControlIdentity) => Promise<boolean>;
   updateGoalText: (objective: string, expected?: GoalControlIdentity) => boolean;
   updateGoalProgress: (progress: GoalProgress) => void;
   updateGoalRuntime: (runtime: GoalRuntimeSnapshot) => void;
@@ -1263,6 +1317,16 @@ export interface AppState {
   setWebSearchEnabled: (v: boolean) => void;
   setWebSearchProvider: (provider: WebSearchProvider) => void;
   setReadOnlyAutoApproveForSession: (v: boolean) => void;
+  captureVisibleGoalSubmissionEnvelope: (
+    text: string,
+  ) => VisibleGoalSubmissionEnvelope | null;
+  captureGoalContinuationEnvelope: (
+    text: string,
+    options: {
+      source: GoalContinuationAuthorization["source"];
+      requestId?: string;
+    },
+  ) => GoalContinuationEnvelope | null;
   queueUserMessage: (
     text: string,
     images?: string[],
@@ -1271,12 +1335,24 @@ export interface AppState {
       attachedFiles?: AttachedFile[];
       runtimeIntentOverride?: ResolvedRunIntent;
       goalSourceContextSnapshot?: string;
+      /** Opaque one-shot capability captured by the visible composer submit. */
+      visibleGoalSubmissionEnvelope?: VisibleGoalSubmissionEnvelope;
+      /** Internal: already validated by the submit pipeline before send-gate queueing. */
+      goalCreationAuthorization?: GoalCreationAuthorization;
+      /** Internal: existing-Goal continuation validated before send-gate queueing. */
+      goalContinuationAuthorization?: GoalContinuationAuthorization;
+      /** Exact user guidance paired with the authorized Goal continuation. */
+      goalContinuationGuidance?: string;
       replyOptionRequestIdentity?: UserChoiceResolutionIdentity;
       replyOptionIsCustom?: boolean;
       parentRunIdOverride?: string;
     },
   ) => void;
-  clearQueuedUserMessage: () => void;
+  clearQueuedUserMessage: (options?: {
+    expectedId?: string;
+    disposition?: Exclude<QueuedGoalContinuationRemovalMode, "replaced">;
+    reason?: string;
+  }) => boolean;
   setActiveGuidance: (text: string, turnId?: string | null) => void;
   clearActiveGuidance: () => void;
   consumeActiveGuidance: (turnId?: string | null) => ActiveGuidance | null;
@@ -1318,9 +1394,15 @@ export interface AppState {
       contextMentionsSnapshot?: string[];
       attachedFilesSnapshot?: Array<AttachedFile | string>;
       goalSourceContextSnapshot?: string;
+      /** Opaque one-shot capability captured before visible UI state is cleared. */
+      visibleGoalSubmissionEnvelope?: VisibleGoalSubmissionEnvelope;
+      goalContinuationEnvelope?: GoalContinuationEnvelope;
+      queuedUserMessageId?: string;
+      submissionOriginSessionKey?: string;
       remoteFeishu?: FeishuRemoteContext;
       skipAutoPlanHydration?: boolean;
       parentRunIdOverride?: string;
+      /** @deprecated Ignored without a valid goalContinuationEnvelope. */
       continueExistingGoal?: boolean;
       goalContinuationGuidance?: string;
       /** Reserved child run identity for an approved Plan handoff. */
@@ -1697,9 +1779,25 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
   return normalized;
 }
 
+function isActionRequestOwnedByGoalForDeletion(input: {
+  request: ActionRequest | null;
+  marker: HarnessRunMarker | null;
+  goal: GoalDefinition | null;
+}): boolean {
+  const { request, marker, goal } = input;
+  if (!request || !marker || !goal) return false;
+  return resolveGoalActionRequestOwnership({
+    goal,
+    marker,
+    currentWorkspace: marker.workspace,
+    currentSessionKey: marker.sessionKey,
+    actionRequest: request,
+  }).owned;
+}
+
 export function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
-  options?: { restoreInterruptedGoal?: boolean },
+  options?: { restoreInterruptedGoal?: boolean; workspacePath?: string | null },
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
@@ -1715,25 +1813,41 @@ export function normalizeSessionRuntimeSnapshot(
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
   const queuedUserMessage = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
   const activeGuidance = normalizeActiveGuidance(snapshot.activeGuidance);
-  const legacyGoal = snapshot.activeGoal ? migrateGoalDefinition(snapshot.activeGoal) : null;
+  const migratedLegacyGoal = snapshot.activeGoal
+    ? migrateGoalDefinition(snapshot.activeGoal)
+    : null;
   const restoredRuntime = snapshot.goalRuntime && [2, 3].includes(Number(snapshot.goalRuntime.schemaVersion))
     ? {
         ...snapshot.goalRuntime,
         goal: migrateGoalDefinition(snapshot.goalRuntime.goal),
         progress: { ...snapshot.goalRuntime.progress },
       }
-    : legacyGoal
+    : migratedLegacyGoal
       ? buildGoalRuntimeSnapshot({
-          goal: legacyGoal,
-          progress: snapshot.goalProgress || createGoalProgress(legacyGoal.id, ""),
+          goal: migratedLegacyGoal,
+          progress: snapshot.goalProgress || createGoalProgress(migratedLegacyGoal.id, ""),
           phase: null,
         })
       : null;
-  const normalizedGoalRuntime = restoredRuntime
+  const candidateNormalizedGoalRuntime = restoredRuntime
     ? options?.restoreInterruptedGoal
       ? restoreGoalRuntimeSnapshot(restoredRuntime)
       : normalizeGoalRuntimeSnapshot(restoredRuntime)
     : null;
+  const restoredGoalCandidate = candidateNormalizedGoalRuntime?.goal || migratedLegacyGoal;
+  const goalDeletionFenced = !!(
+    options?.workspacePath &&
+    restoredGoalCandidate?.id &&
+    isGoalRuntimeDeleted(options.workspacePath, restoredGoalCandidate.id)
+  );
+  const legacyGoal = goalDeletionFenced ? null : migratedLegacyGoal;
+  const normalizedGoalRuntime = goalDeletionFenced
+    ? null
+    : candidateNormalizedGoalRuntime;
+  const restoredQueuedUserMessage = goalDeletionFenced &&
+    queuedUserMessage?.goalContinuationAuthorization?.goalId === restoredGoalCandidate?.id
+    ? null
+    : queuedUserMessage;
   const unapprovedPlanTurnIds = (snapshot.conversationTurns || [])
     .filter((turn) => isPlanConversationTurn(turn))
     .map((turn) => turn.id);
@@ -1774,22 +1888,36 @@ export function normalizeSessionRuntimeSnapshot(
         closeReason: normalizedHarnessRunMarker.closeReason || "application_restarted",
       }
     : normalizedHarnessRunMarker;
-  const restoredHarnessRunMarker = interruptedHarnessRunMarker
+  const restoredHarnessRunMarker = interruptedHarnessRunMarker && !(
+    goalDeletionFenced &&
+    interruptedHarnessRunMarker.runtimeIntent === "goal" &&
+    interruptedHarnessRunMarker.turnId === restoredGoalCandidate?.ownerTurnId &&
+    (
+      !restoredGoalCandidate?.sessionKey ||
+      interruptedHarnessRunMarker.sessionKey === restoredGoalCandidate.sessionKey
+    )
+  )
     ? {
         ...interruptedHarnessRunMarker,
         planStage: restoredPlanStage,
         isPlanApproved: restoredIsPlanApproved,
       }
     : null;
-  const restoredActionRequest = restorePendingActionRequest({
-    request: snapshot.activeActionRequest,
-    runOwner: restoredHarnessRunMarker,
-    planIdentity: restoredPlanIdentity,
-    taskFlow: rawTaskFlow,
-    goalRuntime: normalizedGoalRuntime,
-    unapprovedPlanTurnIds: restoredIsPlanApproved ? [] : unapprovedPlanTurnIds,
-  });
   const originalActionRequest = normalizeActionRequest(snapshot.activeActionRequest);
+  const deletionOwnedActionRequest = goalDeletionFenced &&
+    isActionRequestOwnedByGoalForDeletion({
+      request: originalActionRequest,
+      marker: interruptedHarnessRunMarker,
+      goal: restoredGoalCandidate,
+    });
+  const restoredActionRequest = restorePendingActionRequest({
+        request: deletionOwnedActionRequest ? null : originalActionRequest,
+        runOwner: restoredHarnessRunMarker,
+        planIdentity: restoredPlanIdentity,
+        taskFlow: rawTaskFlow,
+        goalRuntime: normalizedGoalRuntime,
+        unapprovedPlanTurnIds: restoredIsPlanApproved ? [] : unapprovedPlanTurnIds,
+      });
   const rejectedProceduralChoice =
     isInternalUnapprovedPlanChoiceRestore({
       request: originalActionRequest,
@@ -2199,11 +2327,15 @@ export function normalizeSessionRuntimeSnapshot(
     approvedShellPermissionRules: Array.isArray(snapshot.approvedShellPermissionRules)
       ? snapshot.approvedShellPermissionRules.filter((rule): rule is string => typeof rule === "string" && rule.trim().length > 0)
       : [],
-    queuedUserMessage,
+    queuedUserMessage: restoredQueuedUserMessage,
     activeGuidance,
     activeGoal: normalizedGoalRuntime?.goal ?? legacyGoal,
-    goalProgress: normalizedGoalRuntime?.progress ?? snapshot.goalProgress ?? null,
-    goalStatus: normalizedGoalRuntime?.status ?? snapshot.goalStatus ?? "paused",
+    goalProgress: goalDeletionFenced
+      ? null
+      : normalizedGoalRuntime?.progress ?? snapshot.goalProgress ?? null,
+    goalStatus: goalDeletionFenced
+      ? "paused"
+      : normalizedGoalRuntime?.status ?? snapshot.goalStatus ?? "paused",
     goalIterationBudget: normalizedGoalRuntime?.goal.iterationBudget
       ?? snapshot.goalIterationBudget
       ?? DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
@@ -2235,15 +2367,35 @@ export function normalizeQueuedUserMessage(value: unknown): QueuedUserMessage | 
     && record.goalSourceContextSnapshot.trim()
     ? record.goalSourceContextSnapshot.trim()
     : undefined;
+  const goalCreationAuthorization = isGoalCreationAuthorization(record.goalCreationAuthorization)
+    ? record.goalCreationAuthorization
+    : undefined;
+  const goalContinuationAuthorization = isGoalContinuationAuthorization(
+    record.goalContinuationAuthorization,
+  )
+    ? record.goalContinuationAuthorization
+    : undefined;
+  const goalContinuationGuidance = typeof record.goalContinuationGuidance === "string" &&
+    record.goalContinuationGuidance.trim()
+    ? record.goalContinuationGuidance.trim()
+    : undefined;
   if (!text && images.length === 0 && contextMentions.length === 0 && attachedFiles.length === 0) return null;
   return {
     id: typeof record.id === "string" && record.id.trim() ? record.id : `queued-${Date.now()}`,
+    ...(typeof record.sessionKey === "string" && record.sessionKey.trim()
+      ? { sessionKey: record.sessionKey.trim() }
+      : {}),
     text,
     ...(images.length > 0 ? { images } : {}),
     ...(contextMentions.length > 0 ? { contextMentions } : {}),
     ...(attachedFiles.length > 0 ? { attachedFiles } : {}),
     ...(runtimeIntentOverride ? { runtimeIntentOverride } : {}),
     ...(goalSourceContextSnapshot ? { goalSourceContextSnapshot } : {}),
+    ...(goalCreationAuthorization ? { goalCreationAuthorization } : {}),
+    ...(goalContinuationAuthorization ? { goalContinuationAuthorization } : {}),
+    ...(goalContinuationAuthorization && goalContinuationGuidance
+      ? { goalContinuationGuidance }
+      : {}),
     createdAt: Number.isFinite(Number(record.createdAt)) ? Number(record.createdAt) : Date.now(),
     status: "queued",
   };
@@ -2350,6 +2502,108 @@ function pickSessionRuntimePatch(source: Partial<SessionRuntimeState> | Record<s
 
 function isSessionRuntimeActive(state: Pick<AppState, "currentWorkspace" | "currentSessionId">, sessionKey: string | null) {
   return !!sessionKey && resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId) === sessionKey;
+}
+
+function buildQueuedGoalContinuationRemovalPatch(
+  state: AppState,
+  queuedMessage: QueuedUserMessage | null | undefined,
+  mode: QueuedGoalContinuationRemovalMode,
+  reason: string,
+): {
+  patch: Partial<AppState>;
+  goalId: string | null;
+  decisionReason: ReturnType<typeof resolveQueuedGoalContinuationRemoval>["reason"];
+  leaseReason?: ReturnType<typeof resolveQueuedGoalContinuationRemoval>["leaseReason"];
+} {
+  const goal = state.activeGoal;
+  if (!goal) {
+    return {
+      patch: {},
+      goalId: null,
+      decisionReason: "queue_owner_mismatch",
+    };
+  }
+  const workspaceKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+  const sessionKey = resolveVisibleGoalSubmissionSessionKey(state);
+  const decision = resolveQueuedGoalContinuationRemoval({
+    mode,
+    queuedMessage,
+    goal,
+    marker: state.harnessRunMarker,
+    currentWorkspace: workspaceKey,
+    currentSessionKey: sessionKey,
+  });
+  if (!decision.shouldPauseGoal) {
+    return {
+      patch: {},
+      goalId: goal.id,
+      decisionReason: decision.reason,
+      leaseReason: decision.leaseReason,
+    };
+  }
+
+  const now = Date.now();
+  const pauseReason = `Goal continuation removed before run lease acquisition (${reason})`;
+  const pausedGoal: GoalDefinition = {
+    ...goal,
+    status: "paused",
+    updatedAt: now,
+  };
+  const currentProgress = state.goalProgress?.goalId === goal.id
+    ? state.goalProgress
+    : null;
+  const pausedProgress = currentProgress
+    ? {
+        ...currentProgress,
+        pauseReason,
+        lastUpdatedAt: now,
+        ...(currentProgress.usage
+          ? { usage: { ...currentProgress.usage, activeStartedAt: null } }
+          : {}),
+      }
+    : null;
+  const currentRuntime = state.goalRuntime?.goal.id === goal.id &&
+      (state.goalRuntime.goal.revision || 1) === (goal.revision || 1)
+    ? state.goalRuntime
+    : null;
+  const pausedRuntime = currentRuntime
+    ? {
+        ...currentRuntime,
+        goal: pausedGoal,
+        progress: pausedProgress || currentRuntime.progress,
+        status: "paused" as const,
+        phase: "re_plan" as const,
+        pauseReason,
+        updatedAt: now,
+      }
+    : state.goalRuntime;
+
+  return {
+    patch: {
+      activeGoal: pausedGoal,
+      goalStatus: "paused",
+      ...(pausedProgress ? { goalProgress: pausedProgress } : {}),
+      goalRuntime: pausedRuntime,
+      runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+        type: "goal.state_changed",
+        ...resolveGoalEventOwnerIdentity({
+          goal: pausedGoal,
+          currentWorkspace: state.currentWorkspace,
+          currentSessionId: state.currentSessionId,
+          currentTurnId: goal.ownerTurnId || state.currentTurnId,
+        }),
+        timestampMs: now,
+        goalId: goal.id,
+        from: goal.status,
+        to: "paused",
+        phase: "re_plan",
+        reason: `queued_continuation_${mode}_before_run`,
+      })),
+    },
+    goalId: goal.id,
+    decisionReason: decision.reason,
+    leaseReason: decision.leaseReason,
+  };
 }
 
 function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntimeState {
@@ -2488,6 +2742,7 @@ function getSessionRuntimeUiPatch(
 export function buildRestoredSessionRuntimePatch(input: {
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined;
   fallbackState: Partial<AppState>;
+  workspacePath?: string | null;
   taskFlow?: TaskBlock[];
   conversationTurns?: ConversationTurn[];
   currentTurnId?: string | null;
@@ -2503,6 +2758,7 @@ export function buildRestoredSessionRuntimePatch(input: {
     : input.snapshot;
   const normalized = normalizeSessionRuntimeSnapshot(mergedSnapshot, {
     restoreInterruptedGoal: true,
+    workspacePath: input.workspacePath ?? input.fallbackState.currentWorkspace,
   });
   if (!normalized) return {};
   const taskFlow = normalized.taskFlow || [];
@@ -2522,6 +2778,9 @@ export function buildRestoredSessionRuntimePatch(input: {
     pendingToolCall: null,
     pendingPlanApprovalHandoff: null,
     readOnlyAutoApproveForSession: false,
+    lockedComposerIntent: sanitizeHydratedLockedComposerIntent(
+      input.fallbackState.lockedComposerIntent,
+    ) as MainIntentShortcut | null,
   });
   return getSessionRuntimeUiPatch(runtime, {
     resetPanels: input.resetPanels === true,
@@ -2554,7 +2813,10 @@ function normalizeSessionsByWorkspace(
       ...session,
       sessionModeAffinity: resolveSessionModeAffinity(session as SessionModeAffinityLike, "main_mode"),
       messages: sanitizeTaskBlocksForPersist(session.messages || []),
-      runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, { restoreInterruptedGoal: true }),
+      runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, {
+        restoreInterruptedGoal: true,
+        workspacePath: scopeKey,
+      }),
     }));
     const existing = normalizedEntries.get(scopeKey) || [];
     normalizedEntries.set(scopeKey, [...existing, ...normalizedSessions]);
@@ -3584,6 +3846,13 @@ const sessionSyncMiddleware =
     api.setState = customSet;
     return config(customSet, get, api);
   };
+
+// Transient capability broker: envelopes never enter persisted Zustand state.
+// They bridge the synchronous visible submit event to a next-paint Store call.
+const visibleGoalSubmissionAuthorizationBroker =
+  createVisibleGoalSubmissionAuthorizationBroker();
+const goalContinuationAuthorizationBroker =
+  createGoalContinuationAuthorizationBroker();
 
 // ── The Store ─────────────────────────────────────────────────────────
 
@@ -5421,7 +5690,17 @@ export const useAppStore = create<AppState>()(
   },
   restoreRuntimeForSession: (sessionKey: string | null, options: { requireTranscript?: boolean; resetPanels?: boolean } = {}) => {
     if (!sessionKey) return false;
-    const runtime = get().runtimeBySessionKey[sessionKey];
+    const state = get();
+    const storedRuntime = state.runtimeBySessionKey[sessionKey];
+    const normalizedRuntime = storedRuntime
+      ? normalizeSessionRuntimeSnapshot(storedRuntime, {
+          restoreInterruptedGoal: true,
+          workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
+        })
+      : undefined;
+    const runtime = storedRuntime && normalizedRuntime
+      ? { ...storedRuntime, ...normalizedRuntime }
+      : storedRuntime;
     if (!runtime) return false;
     if (options.requireTranscript && !hasSessionRuntimeTranscript(runtime)) return false;
     set({
@@ -6603,6 +6882,14 @@ export const useAppStore = create<AppState>()(
   goalIterationBudget: DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
   goalRuntime: null,
   startGoal: (objective, options) => {
+    const workspacePath = String(get().currentWorkspace || "").trim();
+    if (!workspacePath || workspacePath === GLOBAL_CHAT_KEY) {
+      logStoreEvent("goal_start_rejected_without_workspace", {
+        sessionKey: options?.sessionKey || null,
+        ownerTurnId: options?.ownerTurnId || get().currentTurnId || null,
+      });
+      return;
+    }
     const newGoal = createGoalDefinition({
       objective,
       sourceContext: options?.sourceContext,
@@ -6613,7 +6900,6 @@ export const useAppStore = create<AppState>()(
       sessionKey: options?.sessionKey,
       ownerTurnId: options?.ownerTurnId || get().currentTurnId || undefined,
     });
-    const workspacePath = resolveSessionWorkspaceKey(get().currentWorkspace) || "";
     const progress = createGoalProgress(
       newGoal.id,
       resolveGoalRuntimeProgressFilePath(workspacePath, newGoal.id),
@@ -6672,36 +6958,60 @@ export const useAppStore = create<AppState>()(
       pauseReason: "User requested pause",
       updatedAt: Date.now(),
     };
-    set((state) => ({
-      activeGoal: nextGoal,
-      goalProgress: nextRuntime.progress,
-      goalStatus: nextStatus,
-      goalRuntime: nextRuntime,
-      activeActionRequest: clearGoalConfirmationActionRequest(
-        state.activeActionRequest,
-        activeGoal.id,
-        expectedRevision,
-      ),
-      runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
-        type: "goal.state_changed",
-        ...resolveGoalEventOwnerIdentity({
-          goal: nextGoal,
-          currentWorkspace: state.currentWorkspace,
-          currentSessionId: state.currentSessionId,
-          currentTurnId: state.currentTurnId,
-        }),
-        timestampMs: Date.now(),
-        goalId: nextGoal.id,
-        from: activeGoal.status,
-        to: nextStatus,
-        phase: "re_plan",
-        reason: "user_pause",
-      })),
-    }));
+    set((state) => {
+      const workspaceKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+      const sessionKey = resolveVisibleGoalSubmissionSessionKey(state);
+      const clearQueuedContinuation = isQueuedGoalContinuationOwnedByGoal({
+        queuedMessage: state.queuedUserMessage,
+        goal: activeGoal,
+        workspaceKey,
+        sessionKey,
+      });
+      return {
+        activeGoal: nextGoal,
+        goalProgress: nextRuntime.progress,
+        goalStatus: nextStatus,
+        goalRuntime: nextRuntime,
+        ...(clearQueuedContinuation ? { queuedUserMessage: null } : {}),
+        activeActionRequest: clearGoalConfirmationActionRequest(
+          state.activeActionRequest,
+          activeGoal.id,
+          expectedRevision,
+        ),
+        runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+          type: "goal.state_changed",
+          ...resolveGoalEventOwnerIdentity({
+            goal: nextGoal,
+            currentWorkspace: state.currentWorkspace,
+            currentSessionId: state.currentSessionId,
+            currentTurnId: state.currentTurnId,
+          }),
+          timestampMs: Date.now(),
+          goalId: nextGoal.id,
+          from: activeGoal.status,
+          to: nextStatus,
+          phase: "re_plan",
+          reason: "user_pause",
+        })),
+      };
+    });
     abortController?.abort();
   },
   resumeGoal: (expectedIdentity) => {
-    const { activeGoal, goalProgress, goalRuntime, goalStatus, isGenerating, config, runtimeEvents, currentTurnId, activeActionRequest, harnessRunMarker } = get();
+    const {
+      activeGoal,
+      goalProgress,
+      goalRuntime,
+      goalStatus,
+      isGenerating,
+      config,
+      runtimeEvents,
+      currentTurnId,
+      activeActionRequest,
+      harnessRunMarker,
+      currentWorkspace,
+      currentSessionId,
+    } = get();
     if (!activeGoal) return;
     const expectedRevision = activeGoal.revision || 1;
     const exactControlResolution = expectedIdentity ? isCurrentGoalControlResolution({
@@ -6731,6 +7041,11 @@ export const useAppStore = create<AppState>()(
     const eventOwnerTurnId = goalStartedEvent?.turnId;
     const ownerTurnId = activeGoal.ownerTurnId || eventOwnerTurnId || currentTurnId || null;
     if (!ownerTurnId) return;
+    const ownerWorkspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
+    const ownerSessionKey = resolveVisibleGoalSubmissionSessionKey({
+      currentWorkspace,
+      currentSessionId,
+    });
     const resumedGoal = {
       ...activeGoal,
       ownerTurnId,
@@ -6796,90 +7111,660 @@ export const useAppStore = create<AppState>()(
         reason: "user_resume",
       })),
     }));
+    const language = config.language === "en" ? "en" : "zh";
+    const resumeText = language === "en"
+      ? `Resume the active goal ${resumedGoal.id} from its latest checkpoint.`
+      : `从最近检查点继续执行当前目标 ${resumedGoal.id}。`;
+    const goalContinuationEnvelope = get().captureGoalContinuationEnvelope(
+      resumeText,
+      { source: "goal_manual_resume" },
+    );
+    if (!goalContinuationEnvelope) {
+      const pausedGoal = { ...resumedGoal, status: "paused" as const };
+      set({
+        activeGoal: pausedGoal,
+        goalStatus: "paused",
+        goalRuntime: { ...resumedRuntime, goal: pausedGoal, status: "paused" },
+      });
+      return;
+    }
     setTimeout(() => {
-      const language = config.language === "en" ? "en" : "zh";
       const sent = get().sendMessage(
-        language === "en"
-          ? `Resume the active goal ${resumedGoal.id} from its latest checkpoint.`
-          : `从最近检查点继续执行当前目标 ${resumedGoal.id}。`,
+        resumeText,
         undefined,
         {
           hidden: true,
           resolvedIntent: "execute",
           runtimeIntentOverride: "goal",
+          goalContinuationEnvelope,
+          goalContinuationGuidance: resumeText,
           skipIntentResolution: true,
           reuseCurrentTurn: true,
           turnIdOverride: ownerTurnId,
           preservePlanState: false,
           createVisibleTurnForHiddenMessage: false,
+          submissionOriginSessionKey: ownerSessionKey,
         },
       );
       if (sent === false) {
         const current = get();
-        if (current.activeGoal?.id !== resumedGoal.id) return;
-        const pausedGoal = { ...resumedGoal, status: "paused" as const };
-        set({
-          activeGoal: pausedGoal,
-          goalStatus: "paused",
-          goalRuntime: current.goalRuntime ? {
-            ...current.goalRuntime,
-            goal: pausedGoal,
-            status: "paused",
-            pauseReason: "Unable to acquire a resume run lease",
-            updatedAt: Date.now(),
-          } : null,
+        const activeSessionKey = resolveVisibleGoalSubmissionSessionKey(current);
+        const ownerRuntime = activeSessionKey === ownerSessionKey
+          ? createSessionRuntimeFromState(current)
+          : current.runtimeBySessionKey[ownerSessionKey] || null;
+        if (!ownerRuntime) return;
+        if (isQueuedGoalContinuationOwnedByGoal({
+          queuedMessage: ownerRuntime.queuedUserMessage,
+          goal: resumedGoal,
+          workspaceKey: ownerWorkspaceKey,
+          sessionKey: ownerSessionKey,
+          expectedText: resumeText,
+          expectedSource: "goal_manual_resume",
+        })) {
+          logStoreEvent("goal_resume_waiting_in_exact_queue", {
+            goalId: resumedGoal.id,
+            goalRevision: resumedGoal.revision || 1,
+            ownerSessionKey,
+          });
+          return;
+        }
+
+        const buildResumeRejectedPatch = (
+          runtime: SessionRuntimeState,
+        ): Partial<SessionRuntimeState> => {
+          const runtimeGoal = runtime.activeGoal;
+          if (
+            runtimeGoal?.id !== resumedGoal.id ||
+            (runtimeGoal.revision || 1) !== (resumedGoal.revision || 1) ||
+            String(runtimeGoal.sessionKey || "").trim() !==
+              String(resumedGoal.sessionKey || "").trim() ||
+            String(runtimeGoal.ownerTurnId || "").trim() !==
+              String(resumedGoal.ownerTurnId || "").trim() ||
+            runtimeGoal.status !== "active"
+          ) {
+            return {};
+          }
+          const pausedGoal = { ...runtimeGoal, status: "paused" as const };
+          const runtimeSnapshot = runtime.goalRuntime;
+          return {
+            activeGoal: pausedGoal,
+            goalStatus: "paused",
+            goalRuntime: runtimeSnapshot &&
+              runtimeSnapshot.goal.id === resumedGoal.id &&
+              (runtimeSnapshot.goal.revision || 1) === (resumedGoal.revision || 1)
+              ? {
+                  ...runtimeSnapshot,
+                  goal: pausedGoal,
+                  status: "paused",
+                  pauseReason: "Unable to acquire a resume run lease",
+                  updatedAt: Date.now(),
+                }
+              : runtimeSnapshot,
+          };
+        };
+        if (activeSessionKey === ownerSessionKey) {
+          set((state) => pickSessionRuntimePatch(
+            buildResumeRejectedPatch(createSessionRuntimeFromState(state)),
+          ));
+        } else {
+          get().updateRuntimeForSession(ownerSessionKey, buildResumeRejectedPatch);
+        }
+        logStoreEvent("goal_resume_submission_rejected", {
+          goalId: resumedGoal.id,
+          goalRevision: resumedGoal.revision || 1,
+          ownerSessionKey,
+          activeSessionKey,
         });
       }
     }, 0);
   },
-  clearGoal: (expectedIdentity) => {
+  clearGoal: async (expectedIdentity) => {
     const current = get();
-    if (expectedIdentity && !isCurrentGoalAdministrativeControl({
+    const goal = current.activeGoal;
+    if (!goal || !isCurrentGoalAdministrativeControl({
       request: current.activeActionRequest,
       identity: expectedIdentity,
-      goalId: current.activeGoal?.id,
-      goalRevision: current.activeGoal?.revision || 1,
+      goalId: goal?.id,
+      goalRevision: goal?.revision || 1,
     })) {
       logStoreEvent("goal_clear_identity_mismatch", {
-        expectedGoalId: expectedIdentity.goalId,
-        activeGoalId: current.activeGoal?.id || null,
-        expectedRevision: expectedIdentity.goalRevision,
-        activeRevision: current.activeGoal?.revision || null,
-        expectedRequestId: expectedIdentity.requestId || null,
+        expectedGoalId: expectedIdentity?.goalId || null,
+        activeGoalId: goal?.id || null,
+        expectedRevision: expectedIdentity?.goalRevision || null,
+        activeRevision: goal?.revision || null,
+        expectedRequestId: expectedIdentity?.requestId || null,
         activeRequestId: current.activeActionRequest?.requestId || null,
       });
-      return;
+      return false;
     }
-    if (current.activeGoal?.status === "active" || current.activeGoal?.status === "pausing") {
-      current.abortController?.abort();
+
+    const goalRevision = goal.revision || 1;
+    const workspace = String(current.currentWorkspace || "").trim();
+    const ownerScopeKey = resolveSessionWorkspaceKey(workspace);
+    const currentSessionKey = resolveSessionRuntimeKey(
+      ownerScopeKey,
+      current.currentSessionId,
+    );
+    const goalSessionKey = String(goal.sessionKey || "").trim();
+    if (!workspace || !current.currentSessionId || !currentSessionKey || (
+      goalSessionKey &&
+      goalSessionKey !== workspace &&
+      goalSessionKey !== currentSessionKey
+    )) {
+      logStoreEvent("goal_clear_workspace_identity_mismatch", {
+        goalId: goal.id,
+        goalRevision,
+        workspace: workspace || null,
+        goalSessionKey: goalSessionKey || null,
+        currentSessionKey,
+      });
+      return false;
     }
-    set((state) => ({
-      activeGoal: null,
-      goalProgress: null,
-      goalStatus: "paused",
-      goalRuntime: null,
-      activeActionRequest: current.activeGoal
-        ? clearGoalConfirmationActionRequest(
-            state.activeActionRequest,
-            current.activeGoal.id,
-            current.activeGoal.revision || 1,
+    const ownerSessionKey = currentSessionKey;
+    const ownerSessionId = current.currentSessionId;
+    const ownerRuntimeSnapshot = createSessionRuntimeFromState(current);
+    get().updateRuntimeForSession(ownerSessionKey, () => ownerRuntimeSnapshot);
+    const hasDeletedGoalIdentity = (candidate: GoalDefinition | null | undefined) =>
+      candidate?.id === goal.id && (candidate.revision || 1) === goalRevision;
+    const runtimeHasDeletedGoal = (runtime: Pick<SessionRuntimeState, "activeGoal" | "goalRuntime">) =>
+      hasDeletedGoalIdentity(runtime.activeGoal) || hasDeletedGoalIdentity(runtime.goalRuntime?.goal);
+    const resolveActiveSessionKey = (state: Pick<AppState, "currentWorkspace" | "currentSessionId">) =>
+      resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(state.currentWorkspace),
+        state.currentSessionId,
+      );
+    const resolveOwnerRuntime = (): SessionRuntimeState => {
+      const state = get();
+      if (resolveActiveSessionKey(state) === ownerSessionKey) {
+        return createSessionRuntimeFromState(state);
+      }
+      return state.runtimeBySessionKey[ownerSessionKey] || ownerRuntimeSnapshot;
+    };
+    const applyOwnerRuntimePatch = (
+      updater: (runtime: SessionRuntimeState) => Partial<SessionRuntimeState>,
+    ) => {
+      let appliedToActiveProjection = false;
+      set((state) => {
+        if (resolveActiveSessionKey(state) !== ownerSessionKey) return {};
+        appliedToActiveProjection = true;
+        return pickSessionRuntimePatch(updater(createSessionRuntimeFromState(state)));
+      });
+      if (!appliedToActiveProjection) {
+        get().updateRuntimeForSession(ownerSessionKey, updater);
+      }
+    };
+    const updateOwnerSessionRecord = (
+      runtime: SessionRuntimeState,
+      savedSessionPatch?: Partial<Session>,
+    ) => {
+      const state = get();
+      const runtimeSnapshot = buildSessionRuntimeSnapshotFromStoreState({
+        ...state,
+        ...runtime,
+        currentWorkspace: workspace,
+        currentSessionId: ownerSessionId,
+      });
+      const messages = sanitizeTaskBlocksForPersist(runtime.taskFlow || []);
+      state.updateSession(ownerScopeKey, ownerSessionId, {
+        ...savedSessionPatch,
+        messages,
+        runtimeSnapshot,
+      });
+      return { messages, runtimeSnapshot };
+    };
+
+    let deletionPath: string;
+    let deletionFencePath: string;
+    try {
+      deletionPath = resolveGoalRuntimeRelativeDirPath(goal.id);
+      deletionFencePath = resolveGoalDeletionFenceRelativePath(goal.id);
+    } catch (error) {
+      logStoreEvent("goal_clear_invalid_goal_id", {
+        goalId: goal.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return false;
+    }
+    const deletionRequestedAt = Date.now();
+
+    const pendingReviewOwnership = resolveGoalPendingReviewOwnership({
+      goal,
+      marker: current.harnessRunMarker,
+      currentWorkspace: workspace,
+      currentSessionKey: ownerSessionKey,
+      agentStatus: current.agentStatus,
+      actionRequest: current.activeActionRequest,
+      pendingReviewTaskId: current.pendingReviewTaskId,
+      hasPendingReviewResolver: !!current.pendingReviewResolve,
+    });
+    const ownedPendingReviewResolve = pendingReviewOwnership.owned
+      ? current.pendingReviewResolve
+      : null;
+    const ownedPendingReviewTaskId = pendingReviewOwnership.owned
+      ? current.pendingReviewTaskId
+      : null;
+    const ownedPendingReviewRequestId = pendingReviewOwnership.owned
+      ? current.activeActionRequest?.requestId || null
+      : null;
+    const goalActionRunId = getHarnessActionRunId(current.harnessRunMarker);
+    const resolveOwnedGoalActionRequest = (
+      runtime: SessionRuntimeState,
+    ): ActionRequest | null => {
+      const request = runtime.activeActionRequest;
+      if (!request) return null;
+      const ownership = resolveGoalActionRequestOwnership({
+        goal,
+        marker: runtime.harnessRunMarker,
+        currentWorkspace: workspace,
+        currentSessionKey: ownerSessionKey,
+        actionRequest: request,
+      });
+      return ownership.owned ? request : null;
+    };
+    const ownedGoalUserChoice = current.activeActionRequest?.kind === "user_choice" &&
+      current.activeActionRequest.status === "pending" &&
+      current.harnessRunMarker?.status === "paused" &&
+      current.harnessRunMarker.runtimeIntent === "goal" &&
+      current.harnessRunMarker.sessionKey === ownerSessionKey &&
+      current.harnessRunMarker.turnId === goal.ownerTurnId &&
+      current.activeActionRequest.sessionKey === ownerSessionKey &&
+      current.activeActionRequest.turnId === goal.ownerTurnId &&
+      current.activeActionRequest.runId === goalActionRunId
+        ? current.activeActionRequest
+        : null;
+    const abortOwnership = resolveGoalRunAbortOwnership({
+      goal,
+      marker: current.harnessRunMarker,
+      currentWorkspace: workspace,
+      currentSessionKey: ownerSessionKey,
+      isGenerating: current.isGenerating,
+      hasAbortController: !!current.abortController,
+      hasOwnedPendingReview: pendingReviewOwnership.owned,
+    });
+    const runAbortController = abortOwnership.owned ? current.abortController : null;
+    if (
+      !abortOwnership.owned &&
+      (goal.status === "active" || goal.status === "pausing") &&
+      current.isGenerating &&
+      current.abortController
+    ) {
+      logStoreEvent("goal_clear_foreign_run_preserved", {
+        goalId: goal.id,
+        goalRevision,
+        reason: abortOwnership.reason,
+        markerRuntimeIntent: current.harnessRunMarker?.runtimeIntent || null,
+        markerSessionKey: current.harnessRunMarker?.sessionKey || null,
+        markerTurnId: current.harnessRunMarker?.turnId || null,
+      });
+    }
+    markGoalRuntimeDeleted(workspace, goal.id, { retainFenceForProcess: true });
+    try {
+      await writeFileAtomic(
+        deletionFencePath,
+        serializeGoalDeletionFence({
+          goalId: goal.id,
+          ownerSessionKey,
+          deletedAt: deletionRequestedAt,
+        }),
+        workspace,
+      );
+    } catch (error) {
+      unmarkGoalRuntimeDeleted(workspace, goal.id);
+      logStoreEvent("goal_clear_deletion_fence_write_failed", {
+        goalId: goal.id,
+        goalRevision,
+        ownerSessionKey,
+        path: deletionFencePath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error instanceof Error ? error : new Error(String(error));
+    }
+    const buildDeletionFailurePatch = (
+      runtime: SessionRuntimeState,
+      message: string,
+      tombstoneRetained: boolean,
+    ): Partial<SessionRuntimeState> => {
+      if (!runtimeHasDeletedGoal(runtime)) return {};
+      const nextStatus = tombstoneRetained ? "pausing" as const : "paused" as const;
+      const notice = tombstoneRetained
+        ? `Goal deletion is still pending: ${message}`
+        : `Goal deletion failed: ${message}`;
+      let runtimeGoal: GoalDefinition = goal;
+      if (runtime.goalRuntime && hasDeletedGoalIdentity(runtime.goalRuntime.goal)) {
+        runtimeGoal = runtime.goalRuntime.goal;
+      } else if (runtime.activeGoal && hasDeletedGoalIdentity(runtime.activeGoal)) {
+        runtimeGoal = runtime.activeGoal;
+      }
+      const pendingGoal = {
+        ...runtimeGoal,
+        status: nextStatus,
+        updatedAt: Date.now(),
+      };
+      const pendingProgress = runtime.goalProgress?.goalId === goal.id
+        ? {
+            ...runtime.goalProgress,
+            pauseReason: notice,
+            lastUpdatedAt: Date.now(),
+          }
+        : runtime.goalProgress;
+      const pendingRuntime = hasDeletedGoalIdentity(runtime.goalRuntime?.goal) && runtime.goalRuntime
+        ? {
+            ...runtime.goalRuntime,
+            goal: pendingGoal,
+            progress: pendingProgress || runtime.goalRuntime.progress,
+            status: nextStatus,
+            phase: "re_plan" as const,
+            pauseReason: notice,
+            lastError: message,
+            updatedAt: Date.now(),
+          }
+        : runtime.goalRuntime;
+      return {
+        ...(hasDeletedGoalIdentity(runtime.activeGoal) ? { activeGoal: pendingGoal } : {}),
+        goalProgress: pendingProgress,
+        goalStatus: nextStatus,
+        goalRuntime: pendingRuntime,
+        ...(isQueuedGoalContinuationOwnedByGoal({
+          queuedMessage: runtime.queuedUserMessage,
+          goal,
+          workspaceKey: ownerScopeKey,
+          sessionKey: ownerSessionKey,
+        })
+          ? { queuedUserMessage: null }
+          : {}),
+      };
+    };
+
+    // Record a visible deletion-pending projection before touching disk. It
+    // prevents a session switch or app interruption from restoring this Goal
+    // as actively running while the destructive transaction is in flight.
+    applyOwnerRuntimePatch((runtime) => buildDeletionFailurePatch(
+      runtime,
+      "waiting for the Goal run to stop and persistent data to be removed",
+      true,
+    ));
+    updateOwnerSessionRecord(resolveOwnerRuntime());
+
+    let ownerLeaseReleased = !runAbortController && !pendingReviewOwnership.owned;
+    let diskDeleted = false;
+
+    try {
+      runAbortController?.abort();
+      if (ownedPendingReviewResolve) {
+        applyOwnerRuntimePatch((runtime) => {
+          if (
+            runtime.pendingReviewResolve !== ownedPendingReviewResolve ||
+            runtime.pendingReviewTaskId !== ownedPendingReviewTaskId ||
+            runtime.activeActionRequest?.requestId !== ownedPendingReviewRequestId
+          ) {
+            return {};
+          }
+          return {
+            pendingReviewResolve: null,
+            pendingReviewTaskId: null,
+            activeActionRequest: null,
+            pendingToolCall: null,
+          };
+        });
+        ownedPendingReviewResolve({ action: "reject" });
+      }
+      if (runAbortController || pendingReviewOwnership.owned) {
+        const settled = await waitForGoalRunLeaseRelease({
+          abortController: runAbortController,
+          harnessRunId: current.harnessRunMarker?.runId || null,
+          getLeaseSnapshot: () => {
+            const state = get();
+            const runtime = resolveActiveSessionKey(state) === ownerSessionKey
+              ? state
+              : state.runtimeBySessionKey[ownerSessionKey] || null;
+            return runtime
+              ? {
+                  abortController: runtime.abortController,
+                  harnessRunMarker: runtime.harnessRunMarker || null,
+                }
+              : null;
+          },
+        });
+        if (!settled) {
+          throw new Error("The active Goal run did not stop before the deletion timeout");
+        }
+        ownerLeaseReleased = true;
+      }
+
+      await deleteWorkspacePath(deletionPath, workspace);
+      diskDeleted = true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      let deletionFenceRemoved = false;
+      try {
+        await deleteWorkspacePath(deletionFencePath, workspace);
+        deletionFenceRemoved = true;
+      } catch (fenceError) {
+        logStoreEvent("goal_clear_deletion_fence_cleanup_failed", {
+          goalId: goal.id,
+          goalRevision,
+          ownerSessionKey,
+          path: deletionFencePath,
+          error: fenceError instanceof Error ? fenceError.message : String(fenceError),
+        });
+      }
+      const tombstoneRetained = !ownerLeaseReleased || !deletionFenceRemoved;
+      if (!tombstoneRetained) {
+        unmarkGoalRuntimeDeleted(workspace, goal.id);
+      }
+      applyOwnerRuntimePatch((runtime) => buildDeletionFailurePatch(
+        runtime,
+        message,
+        tombstoneRetained,
+      ));
+      updateOwnerSessionRecord(resolveOwnerRuntime());
+      logStoreEvent("goal_clear_delete_failed", {
+        goalId: goal.id,
+        goalRevision,
+        workspace,
+        path: deletionPath,
+        error: message,
+        ownerSessionKey,
+        ownerLeaseReleased,
+        diskDeleted,
+        deletionFenceRemoved,
+        tombstoneRetained,
+        deletionRequestedAt,
+      });
+      throw error instanceof Error ? error : new Error(message);
+    }
+
+    const clearedEvent = withEventSchema({
+      type: "goal.cleared",
+      ...resolveGoalEventOwnerIdentity({
+        goal,
+        currentWorkspace: workspace,
+        currentSessionId: ownerSessionId,
+        currentTurnId: goal.ownerTurnId || current.currentTurnId,
+      }),
+      timestampMs: Date.now(),
+      goalId: goal.id,
+      previousStatus: current.goalStatus,
+    });
+    const buildClearedOwnerRuntime = (runtime: SessionRuntimeState): SessionRuntimeState => {
+      const runtimeOwnedActionRequest = resolveOwnedGoalActionRequest(runtime);
+      const runtimeOwnedGoalUserChoice = runtimeOwnedActionRequest?.kind === "user_choice"
+        ? runtimeOwnedActionRequest
+        : ownedGoalUserChoice &&
+          runtime.activeActionRequest?.requestId === ownedGoalUserChoice.requestId
+          ? ownedGoalUserChoice
+          : null;
+      const activeGoalMatches = hasDeletedGoalIdentity(runtime.activeGoal);
+      const runtimeGoalMatches = hasDeletedGoalIdentity(runtime.goalRuntime?.goal);
+      const progressMatches = runtime.goalProgress?.goalId === goal.id;
+      const nextActiveGoal = activeGoalMatches ? null : runtime.activeGoal;
+      const nextGoalRuntime = runtimeGoalMatches ? null : runtime.goalRuntime;
+      // An action request is global session runtime state. Clear it only when
+      // strict Goal marker ownership was proven; a stale Goal must not consume
+      // a request owned by a newer Execute run on the same logical turn.
+      let nextActionRequest = runtime.activeActionRequest;
+      if (
+        ownedPendingReviewRequestId &&
+        nextActionRequest?.requestId === ownedPendingReviewRequestId
+      ) {
+        nextActionRequest = null;
+      }
+      if (
+        ownedGoalUserChoice &&
+        nextActionRequest?.requestId === ownedGoalUserChoice.requestId
+      ) {
+        nextActionRequest = null;
+      }
+      if (
+        runtimeOwnedActionRequest &&
+        nextActionRequest?.requestId === runtimeOwnedActionRequest.requestId
+      ) {
+        nextActionRequest = null;
+      }
+      const pendingResolverMatches = !!ownedPendingReviewResolve &&
+        runtime.pendingReviewResolve === ownedPendingReviewResolve &&
+        runtime.pendingReviewTaskId === ownedPendingReviewTaskId;
+      const runtimePendingResolverMatches =
+        runtimeOwnedActionRequest?.kind === "tool_permission" &&
+        runtime.pendingReviewTaskId === runtimeOwnedActionRequest.taskId;
+      const runtimeEvents = runtime.runtimeEvents || [];
+      const alreadyRecorded = runtimeEvents.some((event) =>
+        event.type === "goal.cleared" && event.goalId === goal.id
+      );
+      const taskFlow = runtimeOwnedGoalUserChoice
+        ? (runtime.taskFlow || []).map((block) =>
+            block.type === "agent" &&
+            block.turnId === runtimeOwnedGoalUserChoice.turnId &&
+            block.choiceRequest?.requestId === runtimeOwnedGoalUserChoice.requestId
+              ? {
+                  ...block,
+                  options: undefined,
+                  choiceRequest: undefined,
+                  archivedAfterChoice: true,
+                }
+              : block
           )
-        : state.activeActionRequest,
-      runtimeEvents: current.activeGoal
-          ? appendRuntimeEvent(state.runtimeEvents, withEventSchema({
-            type: "goal.cleared",
-            ...resolveGoalEventOwnerIdentity({
-              goal: current.activeGoal,
-              currentWorkspace: state.currentWorkspace,
-              currentSessionId: state.currentSessionId,
-              currentTurnId: state.currentTurnId,
-            }),
-            timestampMs: Date.now(),
-            goalId: current.activeGoal.id,
-            previousStatus: current.goalStatus,
-          }))
-        : state.runtimeEvents,
-    }));
+        : runtime.taskFlow;
+      const conversationTurns = runtimeOwnedGoalUserChoice
+        ? (runtime.conversationTurns || []).map((turn) =>
+            turn.id === runtimeOwnedGoalUserChoice.turnId && turn.status === "awaiting_input"
+              ? { ...turn, status: "stopped_no_action" as const }
+              : turn
+            )
+        : runtime.conversationTurns;
+      return {
+        ...runtime,
+        taskFlow,
+        conversationTurns,
+        activeGoal: nextActiveGoal,
+        goalProgress: progressMatches ? null : runtime.goalProgress,
+        goalStatus: !nextActiveGoal && !nextGoalRuntime ? "paused" : runtime.goalStatus,
+        goalRuntime: nextGoalRuntime,
+        activeActionRequest: nextActionRequest,
+        ...(pendingResolverMatches || runtimePendingResolverMatches
+          ? {
+              pendingReviewResolve: null,
+              pendingReviewTaskId: null,
+              pendingToolCall: null,
+            }
+          : {}),
+        ...(runAbortController && runtime.abortController === runAbortController
+          ? { abortController: null }
+          : {}),
+        runtimeEvents: alreadyRecorded
+          ? runtimeEvents
+          : appendRuntimeEvent(runtimeEvents, clearedEvent),
+      };
+    };
+
+    const clearedOwnerRuntime = buildClearedOwnerRuntime(resolveOwnerRuntime());
+    const ownerSession = (get().sessionsByWorkspace[ownerScopeKey] || []).find(
+      (session) => session.id === ownerSessionId,
+    );
+    const clearedSessionRecord = updateOwnerSessionRecord(clearedOwnerRuntime);
+    const shouldPersistOwnerSession = !!ownerSession && (
+      ownerSession.storageStatus === "ok" ||
+      (get().config.sessionRecordingEnabled && ownerSession.recordingDisabled !== true)
+    );
+    let savedSessionPatch: Partial<Session> | undefined;
+    let ownerSessionSnapshotSaved = !shouldPersistOwnerSession;
+    let ownerSessionSaveError: unknown = null;
+    if (ownerSession && shouldPersistOwnerSession) {
+      for (let attempt = 1; attempt <= 2 && !ownerSessionSnapshotSaved; attempt += 1) {
+        try {
+          const saved = await saveProjectSession(ownerScopeKey, {
+            ...ownerSession,
+            messages: clearedSessionRecord.messages,
+            runtimeSnapshot: clearedSessionRecord.runtimeSnapshot,
+          });
+          if (saved && typeof saved === "object") {
+            savedSessionPatch = saved as Partial<Session>;
+          }
+          ownerSessionSnapshotSaved = true;
+        } catch (error) {
+          ownerSessionSaveError = error;
+          logStoreEvent(attempt === 1
+            ? "goal_clear_owner_session_save_failed"
+            : "goal_clear_owner_session_resave_failed", {
+            goalId: goal.id,
+            goalRevision,
+            ownerSessionKey,
+            attempt,
+            retryExhausted: attempt === 2,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    if (!ownerSessionSnapshotSaved) {
+      const persistenceDetail = ownerSessionSaveError instanceof Error
+        ? ownerSessionSaveError.message
+        : String(ownerSessionSaveError || "unknown session persistence error");
+      const message = `The Goal directory was removed, but the owner session could not record the deletion: ${persistenceDetail}. Retry deletion before restarting MAIN.`;
+      applyOwnerRuntimePatch((runtime) => buildDeletionFailurePatch(runtime, message, true));
+      updateOwnerSessionRecord(resolveOwnerRuntime());
+      logStoreEvent("goal_clear_session_commit_required", {
+        goalId: goal.id,
+        goalRevision,
+        ownerSessionKey,
+        diskDeleted: true,
+        error: persistenceDetail,
+      });
+      throw new Error(message);
+    }
+
+    // Disk deletion has succeeded. Commit the original owner session even
+    // if the user switched sessions or replaced the active UI projection
+    // while the async transaction was running.
+    applyOwnerRuntimePatch((runtime) => buildClearedOwnerRuntime(runtime));
+    const committedOwnerRuntime = resolveOwnerRuntime();
+    updateOwnerSessionRecord(committedOwnerRuntime, savedSessionPatch);
+    // Keep the durable fence for the rest of this process. An autosave that
+    // started before this transaction may still finish after the explicit
+    // cleared-session save and rewrite a stale Goal snapshot. Startup recovery
+    // in the next process performs the final scrub, then removes the marker.
+    logStoreEvent("goal_clear_deletion_fence_retained", {
+      goalId: goal.id,
+      goalRevision,
+      ownerSessionKey,
+      path: deletionFencePath,
+      committed: true,
+      cleanup: "next_process_startup_recovery",
+    });
+
+    if (resolveActiveSessionKey(get()) !== ownerSessionKey) {
+      logStoreEvent("goal_clear_late_identity_mismatch", {
+        deletedGoalId: goal.id,
+        deletedGoalRevision: goalRevision,
+        ownerSessionKey,
+        activeSessionKey: resolveActiveSessionKey(get()),
+        activeGoalId: get().activeGoal?.id || null,
+        activeGoalRevision: get().activeGoal?.revision || null,
+        diskDeleted: true,
+      });
+    }
+    return true;
   },
   updateGoalText: (objective, expectedIdentity) => {
     const { activeGoal, goalProgress, goalRuntime, goalStatus, activeActionRequest, harnessRunMarker } = get();
@@ -6941,12 +7826,22 @@ export const useAppStore = create<AppState>()(
   },
   updateGoalProgress: (progress) => {
     const state = get();
-    if (!state.activeGoal) {
-      set({ goalProgress: progress });
+    const activeGoal = state.activeGoal;
+    const workspace = String(state.currentWorkspace || "").trim();
+    if (
+      !activeGoal ||
+      progress.goalId !== activeGoal.id ||
+      isGoalRuntimeDeleted(workspace, progress.goalId)
+    ) {
+      logStoreEvent("goal_progress_update_ignored_stale", {
+        progressGoalId: progress.goalId,
+        activeGoalId: activeGoal?.id || null,
+        deletionTombstone: isGoalRuntimeDeleted(workspace, progress.goalId),
+      });
       return;
     }
     const runtime = buildGoalRuntimeSnapshot({
-      goal: state.activeGoal,
+      goal: activeGoal,
       progress,
       phase: state.goalRuntime?.phase || null,
       pauseReason: state.goalRuntime?.pauseReason,
@@ -6954,8 +7849,26 @@ export const useAppStore = create<AppState>()(
     set({ goalProgress: progress, goalRuntime: runtime });
   },
   updateGoalRuntime: (runtime) => {
-    const previous = get().goalRuntime;
+    const current = get();
+    const activeGoal = current.activeGoal;
+    const workspace = String(current.currentWorkspace || "").trim();
     const normalizedGoal = migrateGoalDefinition(runtime.goal);
+    if (
+      !activeGoal ||
+      normalizedGoal.id !== activeGoal.id ||
+      (normalizedGoal.revision || 1) !== (activeGoal.revision || 1) ||
+      isGoalRuntimeDeleted(workspace, normalizedGoal.id)
+    ) {
+      logStoreEvent("goal_runtime_update_ignored_stale", {
+        runtimeGoalId: normalizedGoal.id,
+        runtimeGoalRevision: normalizedGoal.revision || 1,
+        activeGoalId: activeGoal?.id || null,
+        activeGoalRevision: activeGoal?.revision || null,
+        deletionTombstone: isGoalRuntimeDeleted(workspace, normalizedGoal.id),
+      });
+      return;
+    }
+    const previous = current.goalRuntime;
     const normalizedRuntime = { ...runtime, goal: normalizedGoal, status: normalizedGoal.status };
     set((state) => ({
       activeGoal: normalizedGoal,
@@ -7040,22 +7953,128 @@ export const useAppStore = create<AppState>()(
   setWebSearchEnabled: (v) => set({ webSearchEnabled: v }),
   setWebSearchProvider: (provider) => set({ webSearchProvider: normalizeWebSearchProvider(provider) }),
   setReadOnlyAutoApproveForSession: (v) => set({ readOnlyAutoApproveForSession: v }),
+  captureVisibleGoalSubmissionEnvelope: (text) => {
+    const state = get();
+    if (!state.currentWorkspace || state.currentWorkspace === GLOBAL_CHAT_KEY) {
+      logStoreEvent("visible_goal_submission_authorization_rejected_without_workspace", {
+        sessionKey: resolveVisibleGoalSubmissionSessionKey(state),
+        textChars: text.length,
+      });
+      return null;
+    }
+    const sessionKey = resolveVisibleGoalSubmissionSessionKey(state);
+    const envelope = visibleGoalSubmissionAuthorizationBroker.capture({
+      text,
+      sessionKey,
+      currentMainModeKey: state.selectedMainModeKey,
+      lockedComposerIntent: state.lockedComposerIntent,
+    });
+    if (envelope) {
+      logStoreEvent("visible_goal_submission_authorization_captured", {
+        sessionKey,
+        textChars: text.length,
+        source: state.lockedComposerIntent === "goal" ? "capsule" : "shortcut",
+      });
+    }
+    return envelope;
+  },
+  captureGoalContinuationEnvelope: (text, options) => {
+    const state = get();
+    const goal = state.activeGoal;
+    if (!goal) return null;
+    const workspaceKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const sessionKey = resolveVisibleGoalSubmissionSessionKey(state);
+    const candidate = createGoalContinuationAuthorization({
+      source: options.source,
+      workspaceKey,
+      sessionKey,
+      goalId: goal.id,
+      goalRevision: goal.revision || 1,
+      ownerTurnId: String(goal.ownerTurnId || "").trim(),
+      ...(options.requestId ? { requestId: options.requestId } : {}),
+    });
+    const authorization = validateGoalContinuationAuthorization({
+      authorization: candidate,
+      currentWorkspace: state.currentWorkspace,
+      currentSessionId: state.currentSessionId,
+      activeGoal: goal,
+      activeActionRequest: state.activeActionRequest,
+    });
+    if (!authorization) {
+      logStoreEvent("goal_continuation_authorization_rejected", {
+        source: options.source,
+        goalId: goal.id,
+        requestId: options.requestId || null,
+      });
+      return null;
+    }
+    const envelope = goalContinuationAuthorizationBroker.issueValidated({
+      text,
+      authorization,
+    });
+    logStoreEvent("goal_continuation_authorization_captured", {
+      source: authorization.source,
+      goalId: authorization.goalId,
+      goalRevision: authorization.goalRevision,
+      ownerTurnId: authorization.ownerTurnId,
+      requestId: authorization.requestId || null,
+    });
+    return envelope;
+  },
   queueUserMessage: (text, images, options) => {
+    const state = get();
+    const sessionKey = resolveVisibleGoalSubmissionSessionKey(state);
+    const visibleGoalCreationAuthorization =
+      visibleGoalSubmissionAuthorizationBroker.consume({
+        envelope: options?.visibleGoalSubmissionEnvelope,
+        text,
+        sessionKey,
+      });
+    const goalCreationAuthorization = visibleGoalCreationAuthorization ||
+      (isGoalCreationAuthorization(options?.goalCreationAuthorization)
+        ? options.goalCreationAuthorization
+        : undefined);
+    const goalContinuationAuthorization =
+      isGoalContinuationAuthorization(options?.goalContinuationAuthorization)
+        ? options.goalContinuationAuthorization
+        : undefined;
     const queued = normalizeQueuedUserMessage({
       id: `queued-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      sessionKey,
       text,
       images,
       contextMentions: options?.contextMentions,
       attachedFiles: options?.attachedFiles,
       runtimeIntentOverride: options?.runtimeIntentOverride,
       goalSourceContextSnapshot: options?.goalSourceContextSnapshot,
+      goalCreationAuthorization,
+      goalContinuationAuthorization,
+      goalContinuationGuidance:
+        goalContinuationAuthorization && options?.goalContinuationGuidance?.trim()
+          ? options.goalContinuationGuidance.trim()
+          : undefined,
       createdAt: Date.now(),
       status: "queued",
     });
     if (!queued) return;
+    const removal = buildQueuedGoalContinuationRemovalPatch(
+      state,
+      state.queuedUserMessage,
+      "replaced",
+      "queue_replaced",
+    );
     set({
+      ...removal.patch,
       queuedUserMessage: queued,
     });
+    if (removal.decisionReason === "orphaned_before_run_lease") {
+      logStoreEvent("queued_goal_continuation_orphan_rolled_back", {
+        goalId: removal.goalId,
+        mode: "replaced",
+        replacementQueueId: queued.id,
+        leaseReason: removal.leaseReason || null,
+      });
+    }
     logStoreEvent("queued_user_message_set", {
       chars: queued.text.length,
       images: queued.images?.length || 0,
@@ -7063,11 +8082,50 @@ export const useAppStore = create<AppState>()(
       attachedFiles: queued.attachedFiles?.length || 0,
       runtimeIntentOverride: queued.runtimeIntentOverride || null,
       goalSourceContextChars: queued.goalSourceContextSnapshot?.length || 0,
+      goalCreationAuthorizationSource: queued.goalCreationAuthorization?.source || null,
+      goalContinuationAuthorizationSource:
+        queued.goalContinuationAuthorization?.source || null,
+      goalContinuationGuidanceChars: queued.goalContinuationGuidance?.length || 0,
+      visibleGoalSubmissionEnvelopeConsumed: !!visibleGoalCreationAuthorization,
     });
   },
-  clearQueuedUserMessage: () => {
-    set({ queuedUserMessage: null });
-    logStoreEvent("queued_user_message_cleared");
+  clearQueuedUserMessage: (options) => {
+    const state = get();
+    const queuedMessage = state.queuedUserMessage;
+    if (!queuedMessage) return false;
+    if (options?.expectedId && queuedMessage.id !== options.expectedId) {
+      logStoreEvent("queued_user_message_clear_identity_mismatch", {
+        expectedId: options.expectedId,
+        activeId: queuedMessage.id,
+      });
+      return false;
+    }
+    const disposition = options?.disposition || "discarded";
+    const removal = buildQueuedGoalContinuationRemovalPatch(
+      state,
+      queuedMessage,
+      disposition,
+      options?.reason || "queue_cleared",
+    );
+    set({
+      ...removal.patch,
+      queuedUserMessage: null,
+    });
+    if (removal.decisionReason === "orphaned_before_run_lease") {
+      logStoreEvent("queued_goal_continuation_orphan_rolled_back", {
+        goalId: removal.goalId,
+        mode: disposition,
+        queueId: queuedMessage.id,
+        leaseReason: removal.leaseReason || null,
+      });
+    }
+    logStoreEvent("queued_user_message_cleared", {
+      queueId: queuedMessage.id,
+      disposition,
+      reason: options?.reason || null,
+      goalRollbackReason: removal.decisionReason,
+    });
+    return true;
   },
   setActiveGuidance: (text, turnId) => {
     const guidance = normalizeActiveGuidance({
@@ -7384,8 +8442,42 @@ export const useAppStore = create<AppState>()(
     runIdOverride?: string;
     continueExistingGoal?: boolean;
     goalContinuationGuidance?: string;
+    visibleGoalSubmissionEnvelope?: VisibleGoalSubmissionEnvelope;
+    goalContinuationEnvelope?: GoalContinuationEnvelope;
+    queuedUserMessageId?: string;
+    submissionOriginSessionKey?: string;
   }) => {
     let state = get();
+    const visibleSubmissionSessionKey =
+      resolveVisibleGoalSubmissionSessionKey(state);
+    const suppliedSubmissionOriginSessionKey = String(
+      options?.submissionOriginSessionKey || "",
+    ).trim();
+    if (
+      suppliedSubmissionOriginSessionKey &&
+      suppliedSubmissionOriginSessionKey !== visibleSubmissionSessionKey
+    ) {
+      logStoreEvent("send_async_resume_skipped_inactive_session", {
+        phase: "submission_origin_guard",
+        sessionKey: suppliedSubmissionOriginSessionKey,
+        activeSessionKey: visibleSubmissionSessionKey,
+      });
+      return false;
+    }
+    const submissionOriginSessionKey = suppliedSubmissionOriginSessionKey ||
+      visibleSubmissionSessionKey;
+    const validatedVisibleGoalCreationAuthorization =
+      visibleGoalSubmissionAuthorizationBroker.consume({
+        envelope: options?.visibleGoalSubmissionEnvelope,
+        text,
+        sessionKey: visibleSubmissionSessionKey,
+        isHidden: options?.hidden === true,
+      });
+    const consumedGoalContinuationAuthorization =
+      goalContinuationAuthorizationBroker.consume({
+        envelope: options?.goalContinuationEnvelope,
+        text,
+      });
     const pendingReviewTransition = applySubmitPendingReviewTransition({
       text,
       executionConsentGranted: options?.executionConsentGranted,
@@ -7459,10 +8551,71 @@ export const useAppStore = create<AppState>()(
     if (inputEnvelope.shouldWarmWorkspaceTreeCache) {
       void getWorkspaceTree(state.currentWorkspace);
     }
+    if (options?.queuedUserMessageId && !isExactQueuedMessageReplay({
+      queuedMessageId: state.queuedUserMessage?.id,
+      replayMessageId: options.queuedUserMessageId,
+      queuedText: state.queuedUserMessage?.text,
+      replayText: text,
+      queuedSessionKey: state.queuedUserMessage?.sessionKey,
+      replaySessionKey: visibleSubmissionSessionKey,
+    })) {
+      logStoreEvent("queued_user_message_replay_identity_mismatch", {
+        queuedUserMessageId: options.queuedUserMessageId,
+        activeQueuedMessageId: state.queuedUserMessage?.id || null,
+        activeQueuedSessionKey: state.queuedUserMessage?.sessionKey || null,
+        replaySessionKey: visibleSubmissionSessionKey,
+      });
+      return false;
+    }
+    const validatedQueuedGoalCreationAuthorization = resolveQueuedGoalCreationAuthorization({
+      queuedMessageId: state.queuedUserMessage?.id,
+      replayMessageId: options?.queuedUserMessageId,
+      queuedText: state.queuedUserMessage?.text,
+      replayText: text,
+      queuedSessionKey: state.queuedUserMessage?.sessionKey,
+      replaySessionKey: visibleSubmissionSessionKey,
+      authorization: state.queuedUserMessage?.goalCreationAuthorization,
+    });
+    const queuedGoalContinuationAuthorization =
+      resolveQueuedGoalContinuationAuthorization({
+        queuedMessageId: state.queuedUserMessage?.id,
+        replayMessageId: options?.queuedUserMessageId,
+        queuedText: state.queuedUserMessage?.text,
+        replayText: text,
+        queuedSessionKey: state.queuedUserMessage?.sessionKey,
+        replaySessionKey: visibleSubmissionSessionKey,
+        authorization: state.queuedUserMessage?.goalContinuationAuthorization,
+      });
+    const goalContinuationAuthorization = validateGoalContinuationAuthorization({
+      authorization:
+        consumedGoalContinuationAuthorization || queuedGoalContinuationAuthorization,
+      currentWorkspace: state.currentWorkspace,
+      currentSessionId: state.currentSessionId,
+      activeGoal: state.activeGoal,
+      activeActionRequest: state.activeActionRequest,
+    });
+    const requestedGoalContinuation = !!options?.goalContinuationEnvelope ||
+      (
+        !!options?.queuedUserMessageId &&
+        isGoalContinuationAuthorization(
+          state.queuedUserMessage?.goalContinuationAuthorization,
+        )
+      );
+    if (requestedGoalContinuation && !goalContinuationAuthorization) {
+      logStoreEvent("goal_continuation_submission_rejected_stale", {
+        queuedUserMessageId: options?.queuedUserMessageId || null,
+        activeGoalId: state.activeGoal?.id || null,
+        activeGoalRevision: state.activeGoal?.revision || null,
+        sessionKey: visibleSubmissionSessionKey,
+      });
+      return false;
+    }
     const submitPipelineDecision = buildSubmitPipelineDecision({
       text,
       images,
       options,
+      validatedVisibleGoalCreationAuthorization,
+      validatedQueuedGoalCreationAuthorization,
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       workspaceTreeForGameDetection: cachedWorkspaceTreeForGameDetection,
       createGameStudioModeSwitchDecision,
@@ -7522,9 +8675,17 @@ export const useAppStore = create<AppState>()(
       queuedWorkflowContext?: {
         runtimeIntentOverride?: ResolvedRunIntent;
         goalSourceContextSnapshot?: string;
+        goalCreationAuthorization?: GoalCreationAuthorization;
+        goalContinuationAuthorization?: GoalContinuationAuthorization;
+        goalContinuationGuidance?: string;
       },
     ) => applySubmitSendGateEffects({
-      text,
+      // A busy visible /goal submission must retain the explicit shortcut so
+      // its later dequeue can mint a fresh one-shot authorization. The normal
+      // execution path still uses the already stripped canonical objective.
+      text: submitPipelineDecision.shortcuts.goalCreationAuthorization?.source === "visible_goal_shortcut"
+        ? submitPipelineDecision.originalText
+        : text,
       images,
       hasSupplementalInput,
       isHidden,
@@ -7554,11 +8715,43 @@ export const useAppStore = create<AppState>()(
       logStoreEvent,
     });
 
+    const earlyGoalCreationAuthorization =
+      submitPipelineDecision.shortcuts.goalCreationAuthorization;
+    const hasEarlyGoalAuthority = !!earlyGoalCreationAuthorization ||
+      !!goalContinuationAuthorization;
+    const shouldUseEarlyPlanSendGate =
+      !!autoHydrationReason || shouldRouteContinuationToPlanResume;
+    const earlyGoalQueuedWorkflowContext =
+      shouldUseEarlyPlanSendGate && hasEarlyGoalAuthority
+      ? {
+          runtimeIntentOverride: "goal" as const,
+          goalSourceContextSnapshot:
+            options?.goalSourceContextSnapshot || buildGoalSourceContextSnapshot({
+              objective: submitPipelineDecision.text,
+              agentMessages: state.agentMessages,
+              conversationTurns: state.conversationTurns,
+              planArtifacts: state.planArtifacts,
+            }),
+          ...(earlyGoalCreationAuthorization
+            ? { goalCreationAuthorization: earlyGoalCreationAuthorization }
+            : {}),
+          ...(goalContinuationAuthorization
+            ? { goalContinuationAuthorization }
+            : {}),
+          ...(goalContinuationAuthorization && options?.goalContinuationGuidance?.trim()
+            ? { goalContinuationGuidance: options.goalContinuationGuidance.trim() }
+            : {}),
+        }
+      : undefined;
+
     // Async Plan hydration and semantic Resume both mutate Plan state before
     // they recursively submit a hidden execution prompt. Acquire the owner gate
     // before either route can run.
-    if (autoHydrationReason || shouldRouteContinuationToPlanResume) {
-      const planResumeSendGateEffect = applyCurrentSendGate(state);
+    if (shouldUseEarlyPlanSendGate) {
+      const planResumeSendGateEffect = applyCurrentSendGate(
+        state,
+        earlyGoalQueuedWorkflowContext,
+      );
       if (!planResumeSendGateEffect.shouldContinue) {
         return planResumeSendGateEffect.returnValue ?? false;
       }
@@ -7572,14 +8765,46 @@ export const useAppStore = create<AppState>()(
         options,
         preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
         workspace: state.currentWorkspace,
-        sendOriginSessionKey,
+        sendOriginSessionKey: submissionOriginSessionKey,
         getState: get,
         setState: set,
         hydrateExistingPlanArtifactsForWorkspace,
         derivePlanStageFromArtifacts,
-        isSessionRuntimeActive,
+        isSessionRuntimeActive: (latestState, expectedSessionKey) =>
+          resolveVisibleGoalSubmissionSessionKey(latestState) === expectedSessionKey,
         resumeSubmission: (nextText, nextImages, nextOptions) => {
-          get().sendMessage(nextText, nextImages, nextOptions);
+          const goalCreationAuthorization =
+            submitPipelineDecision.shortcuts.goalCreationAuthorization;
+          const carriedVisibleGoalSubmissionEnvelope =
+            goalCreationAuthorization && nextOptions.hidden !== true
+              ? visibleGoalSubmissionAuthorizationBroker.carryValidated({
+                  text: nextText,
+                  sessionKey: visibleSubmissionSessionKey,
+                  authorization: goalCreationAuthorization,
+                })
+              : undefined;
+          const carriedGoalContinuationEnvelope = goalContinuationAuthorization
+            ? goalContinuationAuthorizationBroker.issueValidated({
+                text: nextText,
+                authorization: goalContinuationAuthorization,
+              })
+            : undefined;
+          const refreshedGoalSourceContextSnapshot =
+            goalCreationAuthorization || goalContinuationAuthorization
+            ? buildGoalSourceContextSnapshot({
+                objective: submitPipelineDecision.text,
+                agentMessages: get().agentMessages,
+                conversationTurns: get().conversationTurns,
+                planArtifacts: get().planArtifacts,
+              })
+            : undefined;
+          get().sendMessage(nextText, nextImages, {
+            ...nextOptions,
+            submissionOriginSessionKey,
+            goalSourceContextSnapshot: refreshedGoalSourceContextSnapshot,
+            visibleGoalSubmissionEnvelope: carriedVisibleGoalSubmissionEnvelope,
+            goalContinuationEnvelope: carriedGoalContinuationEnvelope,
+          });
         },
         logStoreEvent,
       });
@@ -7645,6 +8870,8 @@ export const useAppStore = create<AppState>()(
       mainDebugShortcut,
       mainIntentShortcut,
       lockedComposerIntent,
+      goalCreationAuthorization: submitPipelineDecision.shortcuts.goalCreationAuthorization,
+      goalContinuationAuthorization,
       currentTurn,
       currentTurnIntent,
       hasPlanArtifacts,
@@ -7708,6 +8935,7 @@ export const useAppStore = create<AppState>()(
       effectiveRunIntent,
       effectiveIntentSummary,
       effectiveCommandDirective,
+      goalCreationAuthorization,
     } = intentRouting;
 
     const runtimeDecision = resolveSubmitRuntimeDecision({
@@ -7720,6 +8948,8 @@ export const useAppStore = create<AppState>()(
       shouldExecuteOnceFromReplyOption,
       preservePlanState,
       isLocalStudioCommand,
+      goalCreationAuthorization,
+      goalContinuationAuthorization,
     });
     const effectiveWorkflowMode = runtimeDecision.effectiveWorkflowMode;
     const runtimeRunIntent = runtimeDecision.runtimeRunIntent;
@@ -7735,10 +8965,15 @@ export const useAppStore = create<AppState>()(
         })
       : undefined;
 
-    const sendGateEffect = applyCurrentSendGate(state, effectiveRunIntent === "goal"
+    const sendGateEffect = applyCurrentSendGate(state, runtimeRunIntent === "goal"
       ? {
           runtimeIntentOverride: "goal",
           goalSourceContextSnapshot,
+          ...(goalCreationAuthorization ? { goalCreationAuthorization } : {}),
+          ...(goalContinuationAuthorization ? { goalContinuationAuthorization } : {}),
+          ...(goalContinuationAuthorization && options?.goalContinuationGuidance?.trim()
+            ? { goalContinuationGuidance: options.goalContinuationGuidance.trim() }
+            : {}),
         }
       : undefined);
     if (!sendGateEffect.shouldContinue) {
@@ -8005,6 +9240,8 @@ export const useAppStore = create<AppState>()(
       preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
       effectiveRunIntent,
       runtimeRunIntent,
+      goalCreationAuthorization,
+      goalContinuationAuthorization,
       effectiveWorkflowMode,
       effectiveCommandDirective,
       effectiveIntentSummary,
@@ -8319,6 +9556,9 @@ export const useAppStore = create<AppState>()(
         activeStudioAgentKey: normalizeStudioAgentKey(persistedState.activeStudioAgentKey),
         gameStudioInitialized: persistedState.gameStudioInitialized === true,
         pendingSlashCommand: normalizedHydratedRuntime?.pendingSlashCommand || null,
+        lockedComposerIntent: sanitizeHydratedLockedComposerIntent(
+          persistedState.lockedComposerIntent,
+        ) as MainIntentShortcut | null,
         rightPanelTab,
         currentSessionId: hasHydratedCurrentSession ? persistedCurrentSessionId : null,
         currentTurnId: normalizedHydratedRuntime?.currentTurnId || null,

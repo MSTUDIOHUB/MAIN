@@ -8,6 +8,10 @@ import {
 } from "../lib/submit/turnSubmission";
 import type { ConversationTurnStatus } from "../lib/workflowModels";
 import type { ResolvedRunIntent } from "../lib/runIntent";
+import type {
+  GoalContinuationAuthorization,
+  GoalCreationAuthorization,
+} from "../lib/submit/turnSubmission";
 
 export interface SubmitSendGateEffectsState {
   isGenerating: boolean;
@@ -37,6 +41,9 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
   queuedWorkflowContext?: {
     runtimeIntentOverride?: ResolvedRunIntent;
     goalSourceContextSnapshot?: string;
+    goalCreationAuthorization?: GoalCreationAuthorization;
+    goalContinuationAuthorization?: GoalContinuationAuthorization;
+    goalContinuationGuidance?: string;
   };
   queueUserMessage: (
     text: string,
@@ -46,6 +53,9 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
       attachedFiles?: AttachedFile[];
       runtimeIntentOverride?: ResolvedRunIntent;
       goalSourceContextSnapshot?: string;
+      goalCreationAuthorization?: GoalCreationAuthorization;
+      goalContinuationAuthorization?: GoalContinuationAuthorization;
+      goalContinuationGuidance?: string;
     },
   ) => void;
   approvePendingReviewOnce: () => void;

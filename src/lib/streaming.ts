@@ -145,7 +145,16 @@ export interface StreamResult {
   reasoningContent?: string;
   reasoningField?: "reasoning_content" | "reasoning";
   /** Provider returned a terminal response that violated the requested tool protocol. */
-  protocolViolation?: "required_tool_call_missing";
+  protocolViolation?:
+    | "required_tool_call_missing"
+    | "required_function_call_mismatch"
+    | "required_tool_call_not_available";
+  /** Named tool requested by the runtime when a provider returned another tool. */
+  protocolExpectedTool?: string;
+  /** Tool names returned by the provider before the mismatched calls were quarantined. */
+  protocolActualTools?: string[];
+  /** Tools exposed by the active capability contract when returned calls were outside it. */
+  protocolAllowedTools?: string[];
   usage?: {
     inputTokens: number;
     outputTokens: number;

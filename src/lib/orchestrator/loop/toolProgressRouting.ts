@@ -13,7 +13,7 @@ export interface ToolProgressRoutingDecision {
 export interface ToolProgressPresentationDecision {
   shouldRenderToolProgress: boolean;
   shouldPreserveApprovedExecutionText: boolean;
-  visibility: "substantive_plan_text" | "user_progress" | undefined;
+  visibility: "substantive_plan_text" | "user_progress" | "hidden_process" | undefined;
   capsuleCandidate: boolean;
   modelAuthored: boolean;
 }
@@ -96,25 +96,27 @@ export function resolveToolProgressPresentation(input: {
     input.progressEligibleToolCallCount > 0 &&
     input.finalReplyOptionCount === 0 &&
     !input.hasSubstantivePlanAssistantText;
-  const shouldPreserveApprovedExecutionText =
+  const modelAuthoredToolNarration =
     shouldRenderToolProgress &&
-    input.workflowMode === "plan" &&
-    input.isPlanApproved &&
     !input.runtimeNarrationInjected &&
     input.visibleAssistantText.trim().length > 0;
+  // Model text emitted alongside a tool call is protocol narration, not an
+  // evidence-backed stage checkpoint. Keep it in the assistant/tool transcript
+  // for the next model turn, but hide it from the primary ChatArea projection;
+  // structured tool/progress events carry the user-visible activity instead.
+  const shouldPreserveApprovedExecutionText = false;
 
   return {
     shouldRenderToolProgress,
     shouldPreserveApprovedExecutionText,
     visibility: input.hasSubstantivePlanAssistantText
       ? "substantive_plan_text"
+      : modelAuthoredToolNarration
+      ? "hidden_process"
       : shouldRenderToolProgress || input.shouldSuppressApprovedPlanNoToolText
       ? "user_progress"
       : undefined,
-    capsuleCandidate:
-      shouldRenderToolProgress &&
-      !input.runtimeNarrationInjected &&
-      input.visibleAssistantText.trim().length > 0,
+    capsuleCandidate: false,
     modelAuthored: !input.runtimeNarrationInjected,
   };
 }

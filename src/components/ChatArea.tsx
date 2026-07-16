@@ -3514,7 +3514,11 @@ export default function ChatArea({
     const finalVisibleAgentIndex = [...blocks]
       .map((block, idx) => ({ block, idx }))
       .reverse()
-      .find(({ block }) => !block.hiddenProcess && hasRenderableAgentBlock(block))?.idx ?? -1;
+      .find(({ block }) =>
+        !block.hiddenProcess &&
+        block.visibility !== "user_progress" &&
+        hasRenderableAgentBlock(block)
+      )?.idx ?? -1;
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     const isFinishedTurn = isFinishedTurnStatus(turn.status);
     const showReasoningDebug = config.reasoningDisplay !== "hidden";
@@ -3524,6 +3528,11 @@ export default function ChatArea({
         if (idx === finalVisibleAgentIndex) return false;
         if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
         if (Array.isArray(block.options) && block.options.length > 0) return false;
+        // Only the reviewed Plan draft has an explicit semantic presentation
+        // identity here. Execute-stage model prose is process narration even
+        // when it says "root cause" or "confirmed"; runtime progress/checkpoint
+        // blocks, not wording heuristics, own visible stage summaries.
+        if (block.visibility !== "substantive_plan_text") return false;
         const text = getAgentVisibleMarkdownText(block);
         const content = String(text || "").trim();
         if (!content) return false;
@@ -3667,6 +3676,11 @@ export default function ChatArea({
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
+        // `user_progress` is runtime/process narration, including legacy
+        // persisted model prose that used to be promoted from tool-call text.
+        // Its structured tool evidence is rendered by the process timeline and
+        // capsule; repeating the prose in ChatArea creates a false checkpoint.
+        if (item.block?.type === "agent" && item.block.visibility === "user_progress") return null;
         // A completed turn's exact final assistant answer is canonical visible
         // context. Never let process-narration heuristics consume it merely
         // because it mentions the tool result that immediately preceded it.
@@ -4951,7 +4965,9 @@ export default function ChatArea({
                 onPause={() => goalControlIdentity && useAppStore.getState().pauseGoal(goalControlIdentity)}
                 onResume={() => goalControlIdentity && useAppStore.getState().resumeGoal(goalControlIdentity)}
                 onEdit={(objective) => goalControlIdentity && useAppStore.getState().updateGoalText(objective, goalControlIdentity)}
-                onStop={() => goalControlIdentity && useAppStore.getState().clearGoal(goalControlIdentity)}
+                onStop={() => goalControlIdentity
+                  ? useAppStore.getState().clearGoal(goalControlIdentity)
+                  : false}
                 onClose={() => setCapsulePopover(null)}
               />
             </div>

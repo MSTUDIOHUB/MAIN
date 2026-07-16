@@ -548,6 +548,33 @@ test("line excerpts without a confirmed defect cannot auto-materialize a symptom
   });
 });
 
+test("error-handling strings from the logged MD Viewer run cannot become a reviewable repair plan", () => {
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-md-viewer-error-handler-only",
+    objective: "修复应用启动后工具栏按钮没有真实功能的问题。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: [
+        "L12: event_dom_listener_contract(error)",
+        "L131: command_invoke_contract(save_file_content)",
+        "L140: console.error('保存文件失败:', error)",
+      ].join(" "),
+    }],
+  });
+
+  const assessment = assessPlanClosureEvidence(bundle);
+  assert.equal(assessment.ready, false);
+  assert.equal(assessment.reason, "change_targets_lack_confirmed_rationale");
+  assert.equal(assessment.defectSignalMatches, 0);
+  assert.equal(
+    hasDeterministicPlanMaterializationEvidence(bundle),
+    false,
+    "a generic failure message is not a diagnosed change contract",
+  );
+});
+
 test("source evidence preserves interface contracts and detects cross-file mismatches", () => {
   const summarizeRead = (target, body) => summarizePlanEvidenceDetail({
     tool: "read_file",

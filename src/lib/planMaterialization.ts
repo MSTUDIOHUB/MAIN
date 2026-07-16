@@ -2816,7 +2816,7 @@ function buildDeterministicChangeLine(input: {
     if (mismatchedConfigurationKeys.length > 0) {
       return `Align \`${mismatchedConfigurationKeys.join("`, `")}\` in \`${file}\` with the other read-backed configuration owner in the same startup path, changing only the side that differs from the canonical development command. Grounding evidence: ${evidence}.`;
     }
-    return `Update \`${file}\` at the implementation boundary confirmed by the evidence, preserve unrelated behavior, and verify the affected user-goal path. Grounding evidence: ${evidence}.`;
+    return `Repair the concrete implementation mismatch recorded for \`${file}\` (${evidence}) so it satisfies the reviewed objective: ${summarizeGoalForPlanChange(input.goal, "en")}. Preserve unrelated behavior and verify that exact path.`;
   }
 
   if (/\.rs$/i.test(lowerFile) && missingCommands.length > 0) {
@@ -2839,7 +2839,7 @@ function buildDeterministicChangeLine(input: {
   if (mismatchedConfigurationKeys.length > 0) {
     return `将 \`${file}\` 中的 \`${mismatchedConfigurationKeys.join("`、`")}\` 与同一启动链路的另一已读配置所有者对齐，只修改偏离规范开发命令的一侧。依据证据：${evidence}。`;
   }
-  return `在 \`${file}\` 的证据已确认实现边界实施必要改动，保持无关行为不变，并验证对应用户目标链路。依据证据：${evidence}。`;
+  return `修复 \`${file}\` 中已读证据明确记录的实现不一致（${evidence}），使其满足已审核目标“${summarizeGoalForPlanChange(input.goal, "zh")}”；保持无关行为不变，并验证这条精确链路。`;
 }
 
 function buildCodexStylePlanArtifact(input: {

@@ -253,8 +253,10 @@ export function resolveIterationToolSurface(input: {
     .some((activity) => activity.delegatedObservation?.requiresParentReread === true);
   const canExposeParentReread =
     recoveryActionContract.phase === "normal" ||
-    recoveryActionContract.phase === "context" ||
-    recoveryActionContract.phase === "mutation";
+    (
+      recoveryActionContract.phase === "context" &&
+      recoveryActionContract.nextRequiredCapability === "targeted_read"
+    );
   const extraRecoveryToolNames = new Set<string>();
   if (recoveryScopesDelegation) extraRecoveryToolNames.add("wait_subagents");
   if (joinedChildNeedsParentReread && canExposeParentReread) extraRecoveryToolNames.add("read_file");

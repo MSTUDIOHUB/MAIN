@@ -222,6 +222,25 @@ export function resolveApprovedPlanSameTurnFallbackDecision(input: {
 
 export type PlanToolActivityStatus = "called" | "succeeded" | "failed";
 
+export interface PlanAstSymbolObservation {
+  name: string;
+  kind: string;
+  syntaxKind: string;
+  startLine: number;
+  endLine: number;
+}
+
+export interface PlanAstObservation {
+  path: string;
+  language: string;
+  versionToken: string;
+  query?: string;
+  exactMatchCount?: number;
+  hasErrors: boolean;
+  truncated: boolean;
+  symbols: PlanAstSymbolObservation[];
+}
+
 export interface PlanToolActivitySummary {
   name: string;
   target: string;
@@ -230,6 +249,8 @@ export interface PlanToolActivitySummary {
   facts?: string[];
   /** Exact versioned read window retained across checkpoints and compaction. */
   readFileObservation?: FileReadObservationIdentity;
+  /** Parser-backed declaration ranges retained without source prose. */
+  astObservation?: PlanAstObservation;
   /**
    * Provenance for a child-owned observation. Joined summaries only inject a
    * compact reference, never the complete source window, so the parent must

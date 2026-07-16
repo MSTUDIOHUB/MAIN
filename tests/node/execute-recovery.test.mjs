@@ -145,6 +145,17 @@ const {
   resolveRecoverySourceContextFreshness,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/contextManagement.ts"));
 
+const {
+  activateExecuteRecoveryRuntimeState,
+  advanceExecuteRecoveryRuntimeIteration,
+  createExecuteRecoveryRuntimeState,
+  transitionExecuteRecoveryRuntimeState,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"));
+
+const {
+  resolveApprovedPlanMutationContextDecision,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultRecoveryPhase.ts"));
+
 const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/subagents.ts"));
 
 const {
@@ -702,7 +713,36 @@ test("execute no-tool recovery reprompts XML profiles to emit executable tool ca
   assert.match(harness.appended[0].content, /read_file, apply_patch, run_command/);
 });
 
-test("execute recovery mutation phase keeps a scoped read capability but removes broad exploration", () => {
+test("named-tool mismatches are quarantined and reprompt the exact runtime contract", () => {
+  const harness = createExecuteNoToolHarness("en");
+  const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
+    protocolViolation: "required_function_call_mismatch",
+    visibleText: "I will read the file again before editing.",
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.consecutiveNoToolCount, 1);
+  assert.equal(harness.appended.length, 1);
+  assert.match(harness.appended[0].content, /specific function/);
+  assert.match(harness.appended[0].content, /mismatched call was not executed/);
+  assert.match(harness.appended[0].content, /exactly the named tool/);
+});
+
+test("out-of-surface tool calls are quarantined as protocol recovery", () => {
+  const harness = createExecuteNoToolHarness("en");
+  const result = handleExecuteNoToolRecovery(createExecuteNoToolInput(harness, {
+    protocolViolation: "required_tool_call_not_available",
+    visibleText: "I will read the file again before editing.",
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(harness.appended.length, 1);
+  assert.match(harness.appended[0].content, /outside the active recovery surface/);
+  assert.match(harness.appended[0].content, /was not executed/);
+  assert.match(harness.appended[0].content, /actually exposed/);
+});
+
+test("execute recovery mutation phase is mutation-only", () => {
   const names = [
     "list_directory",
     "glob_search",
@@ -728,7 +768,6 @@ test("execute recovery mutation phase keeps a scoped read capability but removes
   }));
 
   assert.deepEqual(scoped, [
-    "read_file",
     "apply_patch",
     "replace_in_file",
     "write_file",
@@ -750,13 +789,13 @@ test("execute recovery mutation phase keeps a scoped read capability but removes
     expectedTarget: "Assets/Scripts/Foo.cs",
   });
   assert.equal(mcpDecision.selectedCallId, "mcp-edit");
-  assert.equal(describeExecuteRecoveryToolSurface("mutation_first"), "mutation_with_targeted_read");
-  assert.equal(describeExecuteRecoveryToolSurface("mutation_first", true), "mutation_with_targeted_read");
-  assert.equal(describeExecuteRecoveryToolSurface("action_plus_targeting", true), "mutation_with_targeting_and_targeted_read");
+  assert.equal(describeExecuteRecoveryToolSurface("mutation_first"), "mutation_only");
+  assert.equal(describeExecuteRecoveryToolSurface("mutation_first", true), "mutation_only");
+  assert.equal(describeExecuteRecoveryToolSurface("action_plus_targeting", true), "mutation_with_targeting");
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
-  }), true);
+  }), false);
   assert.equal(isExecuteRecoveryToolName("grep_search", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
@@ -764,6 +803,35 @@ test("execute recovery mutation phase keeps a scoped read capability but removes
 });
 
 test("one recovery contract atomically advances long-running validation from PTY observation to browser", () => {
+  const targeting = resolveExecuteRecoveryActionContract("action_plus_targeting", {
+    expectedTarget: "src/main.js",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "head-v1",
+      nextRequiredCapability: "targeting",
+      evidenceVersion: "9000:100",
+    },
+  });
+  assert.equal(targeting.phase, "context");
+  assert.equal(targeting.nextRequiredCapability, "targeting");
+  assert.equal(targeting.surfaceDescription, "structural_targeting_only");
+  assert.equal(targeting.allowedToolNames.has("code_ast_query"), true);
+  assert.equal(targeting.allowedToolNames.has("find_symbol_references"), false);
+  assert.equal(targeting.allowedToolNames.has("read_file"), false);
+  assert.equal(targeting.allowedToolNames.has("apply_patch"), false);
+  const targetingBatch = resolveExecuteRecoveryBatchDecision({
+    mode: "action_plus_targeting",
+    expectedTarget: "src/main.js",
+    contract: targeting,
+    calls: [
+      { id: "reread", name: "read_file", target: "src/main.js" },
+      { id: "ast", name: "code_ast_query", target: "src/main.js" },
+      { id: "premature-edit", name: "apply_patch", target: "src/main.js" },
+    ],
+  });
+  assert.equal(targetingBatch.selectedCallId, "ast");
+  assert.deepEqual(targetingBatch.deferredCallIds, ["reread", "premature-edit"]);
+
   const postMutation = resolveExecuteRecoveryActionContract("validation_only", {
     readLease: {
       purpose: "post_mutation_verify",
@@ -968,8 +1036,8 @@ test("a repeated read-only loop enters mutation-first instead of patch-context r
   assert.equal(result.status, "none");
   assert.equal(activations[0].mode, "mutation_first");
   assert.equal(activations[0].reason, "read_file_only_loop");
-  assert.match(result.pendingExecuteRecoveryPrompt, /mutation_with_targeted_read/);
-  assert.match(result.pendingExecuteRecoveryPrompt, /targeted `read_file` is available/i);
+  assert.match(result.pendingExecuteRecoveryPrompt, /mutation_only/);
+  assert.match(result.pendingExecuteRecoveryPrompt, /No `read_file` is available/i);
 });
 
 test("different cached file windows do not trip the global read-only streak", () => {
@@ -2641,7 +2709,7 @@ test("approved plan action-only recovery reopens read_file only for its unresolv
   assert.equal(patchRecovery.iterationAllTools.some((tool) => tool.function.name === "grep_search"), false);
 });
 
-test("repeat-edit validation recovery keeps conditional target reads but forbids more edits", () => {
+test("repeat-edit validation recovery exposes validation only", () => {
   assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
     mode: "validation_only",
   }), true);
@@ -2653,8 +2721,8 @@ test("repeat-edit validation recovery keeps conditional target reads but forbids
   }), false);
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "validation_only",
-  }), true);
-  assert.equal(describeExecuteRecoveryToolSurface("validation_only"), "validation_with_targeted_read");
+  }), false);
+  assert.equal(describeExecuteRecoveryToolSurface("validation_only"), "validation_only");
 
   const prompt = buildExecuteValidationRecoveryPrompt({
     language: "zh",
@@ -2669,7 +2737,7 @@ test("repeat-edit validation recovery keeps conditional target reads but forbids
   assert.match(prompt, /不能替代验证/);
 });
 
-test("failed finite validation recovery requires run_command while preserving conditional target reads", () => {
+test("failed finite validation recovery requires run_command without reopening source reads", () => {
   assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
     mode: "finite_validation_only",
   }), true);
@@ -2685,17 +2753,17 @@ test("failed finite validation recovery requires run_command while preserving co
   }
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "finite_validation_only",
-  }), true);
+  }), false);
   assert.equal(
     describeExecuteRecoveryToolSurface("finite_validation_only"),
-    "finite_validation_with_targeted_read",
+    "finite_validation_only",
   );
   const prompt = buildFailedFiniteValidationRecoveryPrompt({
     command: "node -e require('./src/example.js')",
     result: '{"exitCode":1,"stderr":"module not found"}',
   });
   assert.match(prompt, /`run_command` is the required next capability/);
-  assert.match(prompt, /conditional read_file remains available/);
+  assert.match(prompt, /Source reads are not part of this validation phase/);
   assert.match(prompt, /exitCode 0/);
 });
 
@@ -2918,7 +2986,7 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
       state: "available",
     },
     leaseClaimed: false,
-  }), true);
+  }), false, "an unanchored patch mismatch cannot grant a wildcard file read");
   assert.equal(shouldUseExecutePatchRecoveryReadLease({
     toolName: "read_file",
     allowFileRead: true,
@@ -2991,7 +3059,7 @@ test("patch mismatch recovery opens one targeted read_file path", () => {
   assert.match(prompt, /不要继续重试基于旧上下文的 `apply_patch`/);
 });
 
-test("first mutation preflight mismatch immediately enters targeted patch recovery", () => {
+test("mutation mismatch uses an anchored range or one bounded missing-window lease", () => {
   const replaceDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "plan",
     runtimeIntent: "execute",
@@ -3010,6 +3078,7 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
     mode: "patch_recovery_read",
     reason: "mutation_preflight_search_text_mismatch",
     target: "src-tauri/src/main.rs",
+    requestedRange: { startLine: 1, maxLines: 180 },
   });
 
   const patchDecision = resolveDirectMutationPreflightRecovery({
@@ -3030,6 +3099,7 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
     mode: "patch_recovery_read",
     reason: "mutation_preflight_invalid_patch",
     target: "src-tauri/src/main.rs",
+    requestedRange: { startLine: 1, maxLines: 180 },
   });
 
   const mutationFirstDecision = resolveDirectMutationPreflightRecovery({
@@ -3038,6 +3108,7 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
     isPlanApproved: false,
     executeRecoveryMode: "mutation_first",
     executeRecoveryAttempts: 1,
+    hasRetainedSourceObservation: true,
     results: [{
       name: "apply_patch",
       target: "src/main.js",
@@ -3045,7 +3116,7 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
       isError: true,
     }],
   });
-  assert.equal(mutationFirstDecision?.mode, "patch_recovery_read");
+  assert.equal(mutationFirstDecision?.mode, "mutation_first");
   assert.equal(mutationFirstDecision?.target, "src/main.js");
 
   const accumulatedAttemptDecision = resolveDirectMutationPreflightRecovery({
@@ -3054,6 +3125,7 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
     isPlanApproved: false,
     executeRecoveryMode: "mutation_first",
     executeRecoveryAttempts: 7,
+    hasRetainedSourceObservation: true,
     results: [{
       name: "replace_in_file",
       target: "src/main.js",
@@ -3063,8 +3135,8 @@ test("first mutation preflight mismatch immediately enters targeted patch recove
   });
   assert.equal(
     accumulatedAttemptDecision?.mode,
-    "patch_recovery_read",
-    "historical recovery activations must not suppress a new target/version mismatch contract",
+    "mutation_first",
+    "an unanchored mismatch must retain mutation even after historical recovery activations",
   );
 
   const versionedDecision = resolveDirectMutationPreflightRecovery({
@@ -3147,6 +3219,22 @@ test("recovery batch selection serializes different model call shapes by phase",
   assert.equal(mutation.selectedCallId, "edit", "validation order in model output cannot skip mutation");
   assert.equal(mutation.deferredCallIds.includes("validate-first"), true);
 
+  const mutationReadOnly = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [{ id: "read-again", name: "read_file", target: "src/App.tsx" }],
+    expectedTarget: "src/App.tsx",
+  });
+  assert.equal(mutationReadOnly.phase, "need_mutation");
+  assert.equal(mutationReadOnly.selectedCallId, null);
+  assert.deepEqual(mutationReadOnly.deferredCallIds, ["read-again"]);
+  const mutationContract = resolveExecuteRecoveryActionContract("mutation_first", {
+    expectedTarget: "src/App.tsx",
+    sourceObservationKey: "src/App.tsx::v1::1-100",
+  });
+  assert.equal(mutationContract.allowTargetedFileRead, false);
+  assert.equal(mutationContract.allowedToolNames.has("read_file"), false);
+  assert.equal(mutationContract.surfaceDescription, "mutation_only");
+
   const wrongMutationOnly = resolveExecuteRecoveryBatchDecision({
     mode: "mutation_first",
     calls: [{ id: "wrong-edit", name: "replace_in_file", target: "src/other.ts" }],
@@ -3224,6 +3312,306 @@ test("recovery batch selection serializes different model call shapes by phase",
     "utf8",
   );
   assert.match(toolCallExecutionPhaseSource, /partitionToolCallsForExecution\(\{[\s\S]*?executeRecoveryState,/);
+});
+
+test("an unleased fresh read cannot reset a mutation recovery checkpoint", () => {
+  const state = activateExecuteRecoveryRuntimeState(createExecuteRecoveryRuntimeState({ workflowMode: "edit" }), {
+    mode: "mutation_first",
+    reason: "approved_plan_target_context_observed",
+    expectedTarget: "src/App.tsx",
+    sourceObservationKey: "src/App.tsx::v1::1-100",
+    decisionCheckpoint: {
+      expectedTarget: "src/App.tsx",
+      sourceObservationKey: "src/App.tsx::v1::1-100",
+      nextRequiredCapability: "mutation",
+      evidenceVersion: "v1",
+    },
+  });
+  const advanced = advanceExecuteRecoveryRuntimeIteration(state).state;
+  const transition = transitionExecuteRecoveryRuntimeState(advanced, {
+    expectedTarget: "src/App.tsx",
+    freshReadTarget: "src/App.tsx",
+    sourceObservationKey: "src/App.tsx::v1::101-200",
+    sourceRequestedRange: { startLine: 101, endLine: 200, maxLines: 100 },
+    sourceObservedVersion: "v1",
+  });
+
+  assert.equal(transition.transition, "none");
+  assert.equal(transition.state.phaseNoProgressCount, 1);
+  assert.equal(transition.state.sourceObservationKey, "src/App.tsx::v1::1-100");
+  assert.equal(transition.state.expectedTarget, "src/App.tsx");
+});
+
+test("approved Plan source context requires a parser-backed declaration, not a call-site mention", () => {
+  const task = {
+    id: "task-toolbar",
+    text: "Modify `initToolbar()` in `src/main.js` to install the reviewed toolbar behavior.",
+    status: "pending",
+    evidence: [{ kind: "file", value: "src/main.js" }],
+  };
+  const readResult = (startLine, endLine, content, versionToken = "9000:100") => ({
+    toolCallId: `read-${startLine}`,
+    name: "read_file",
+    target: "src/main.js",
+    content: [
+      "READ_FILE_RESULT",
+      "path: src/main.js",
+      "truncated: true",
+      "totalLines: 700",
+      "totalChars: 30000",
+      `returnedLines: ${startLine}-${endLine}`,
+      `returnedChars: ${content.length}`,
+      "---CONTENT START---",
+      content,
+      "---CONTENT END---",
+    ].join("\n"),
+    isError: false,
+    readFileObservation: {
+      key: `read_file::src/main.js::[[\"start_line\",${startLine}],[\"end_line\",${endLine}]]::version=${versionToken}`,
+      path: "src/main.js",
+      requestSignature: `read_file::src/main.js::[[\"end_line\",${endLine}],[\"start_line\",${startLine}]]`,
+      versionToken,
+      source: "fresh",
+    },
+  });
+  const headRead = readResult(1, 50, "bootstrap();\ninitToolbar();");
+  const baseInput = {
+    tasks: [task],
+    evidenceLedger: [],
+    results: [headRead],
+  };
+
+  const withoutAst = resolveApprovedPlanMutationContextDecision(baseInput);
+  assert.equal(withoutAst.status, "needs_targeting");
+  assert.equal(withoutAst.target, "src/main.js");
+
+  const astObservation = {
+    name: "code_ast_query",
+    target: "src/main.js",
+    status: "succeeded",
+    astObservation: {
+      path: "src/main.js",
+      language: "javascript",
+      versionToken: "9000:100",
+      query: "",
+      exactMatchCount: 0,
+      hasErrors: false,
+      truncated: false,
+      symbols: [{
+        name: "initToolbar",
+        kind: "function",
+        syntaxKind: "function_declaration",
+        startLine: 600,
+        endLine: 650,
+      }],
+    },
+  };
+  const callSiteOnly = resolveApprovedPlanMutationContextDecision({
+    ...baseInput,
+    recentToolActivity: [astObservation],
+  });
+  assert.deepEqual(callSiteOnly, {
+    status: "needs_range_read",
+    target: "src/main.js",
+    requestedRange: { startLine: 600, endLine: 650, maxLines: 51 },
+    observedVersion: "9000:100",
+    symbolName: "initToolbar",
+    rangeSource: "ast_declaration",
+  });
+
+  const definitionRead = readResult(600, 650, "function initToolbar() {\n  bindToolbar();\n}");
+  const covered = resolveApprovedPlanMutationContextDecision({
+    ...baseInput,
+    results: [definitionRead],
+    recentToolActivity: [astObservation],
+  });
+  assert.equal(covered.status, "covered");
+  assert.equal(covered.result.toolCallId, "read-600");
+  assert.equal(covered.symbolName, "initToolbar");
+});
+
+test("reviewed Plan line anchors retain an exact read contract", () => {
+  const decision = resolveApprovedPlanMutationContextDecision({
+    tasks: [{
+      id: "task-lines",
+      text: "Modify `src/main.js` at L205-L256.",
+      status: "pending",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    }],
+    evidenceLedger: [],
+    results: [{
+      toolCallId: "read-lines-head",
+      name: "read_file",
+      target: "src/main.js",
+      content: "READ_FILE_RESULT\npath: src/main.js\ntruncated: true\ntotalLines: 700\ntotalChars: 30000\nreturnedLines: 1-20\nreturnedChars: 200\n---CONTENT START---\nbootstrap();\n---CONTENT END---",
+      isError: false,
+      readFileObservation: {
+        key: "lines-head-v1",
+        path: "src/main.js",
+        requestSignature: "read_file::src/main.js::[[\"end_line\",20],[\"start_line\",1]]",
+        versionToken: "30000:100",
+        source: "fresh",
+      },
+    }],
+  });
+  assert.deepEqual(decision, {
+    status: "needs_range_read",
+    target: "src/main.js",
+    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    observedVersion: "30000:100",
+    symbolName: null,
+    rangeSource: "plan_line",
+  });
+});
+
+test("approved Plan declaration targeting rejects stale, substring, and ambiguous AST evidence", () => {
+  const task = {
+    id: "task-toolbar",
+    text: "Modify `initToolbar()` in `src/main.js`.",
+    status: "pending",
+    evidence: [{ kind: "file", value: "src/main.js" }],
+  };
+  const read = {
+    toolCallId: "read-head",
+    name: "read_file",
+    target: "src/main.js",
+    content: "READ_FILE_RESULT\npath: src/main.js\ntruncated: true\ntotalLines: 700\ntotalChars: 30000\nreturnedLines: 1-50\nreturnedChars: 20\n---CONTENT START---\ninitToolbar();\n---CONTENT END---",
+    isError: false,
+    readFileObservation: {
+      key: "head-v2",
+      path: "src/main.js",
+      requestSignature: "read_file::src/main.js::[[\"end_line\",50],[\"start_line\",1]]",
+      versionToken: "9001:200",
+      source: "fresh",
+    },
+  };
+  const decide = (astObservation) => resolveApprovedPlanMutationContextDecision({
+    tasks: [task],
+    evidenceLedger: [],
+    results: [read],
+    recentToolActivity: [{
+      name: "code_ast_query",
+      target: "src/main.js",
+      status: "succeeded",
+      astObservation,
+    }],
+  });
+  const baseAst = {
+    path: "src/main.js",
+    language: "javascript",
+    versionToken: "9001:200",
+    query: "",
+    exactMatchCount: 0,
+    hasErrors: false,
+    truncated: false,
+  };
+
+  assert.equal(decide({
+    ...baseAst,
+    versionToken: "9000:100",
+    symbols: [{ name: "initToolbar", kind: "function", syntaxKind: "function_declaration", startLine: 600, endLine: 650 }],
+  }).status, "needs_targeting", "an AST snapshot from an older file version cannot own the edit");
+  assert.equal(decide({
+    ...baseAst,
+    symbols: [{ name: "initToolbarLegacy", kind: "function", syntaxKind: "function_declaration", startLine: 600, endLine: 650 }],
+  }).status, "none", "substring matches are not declaration identity");
+  assert.equal(decide({
+    ...baseAst,
+    symbols: [
+      { name: "initToolbar", kind: "function", syntaxKind: "function_declaration", startLine: 100, endLine: 120 },
+      { name: "initToolbar", kind: "function", syntaxKind: "function_declaration", startLine: 600, endLine: 650 },
+    ],
+  }).status, "none", "two disjoint declarations require an explicit reviewed range");
+});
+
+test("truncated AST targeting requires an exact identifier query and then converges", () => {
+  const task = {
+    id: "task-toolbar-truncated",
+    text: "Modify `initToolbar()` in `src/main.js`.",
+    status: "pending",
+    evidence: [{ kind: "file", value: "src/main.js" }],
+  };
+  const headRead = {
+    toolCallId: "read-head-truncated",
+    name: "read_file",
+    target: "src/main.js",
+    content: "READ_FILE_RESULT\npath: src/main.js\ntruncated: true\ntotalLines: 900\ntotalChars: 50000\nreturnedLines: 1-40\nreturnedChars: 1200\n---CONTENT START---\ninitToolbar();\n---CONTENT END---",
+    isError: false,
+    readFileObservation: {
+      key: "head-v3",
+      path: "src/main.js",
+      requestSignature: "read_file::src/main.js::[[\"end_line\",40],[\"start_line\",1]]",
+      versionToken: "50000:300",
+      source: "fresh",
+    },
+  };
+  const decide = (astObservation) => resolveApprovedPlanMutationContextDecision({
+    tasks: [task],
+    evidenceLedger: [],
+    results: [headRead],
+    recentToolActivity: [{
+      name: "code_ast_query",
+      target: "src/main.js",
+      status: "succeeded",
+      astObservation,
+    }],
+  });
+  const generic = decide({
+    path: "src/main.js",
+    language: "javascript",
+    versionToken: "50000:300",
+    query: "",
+    exactMatchCount: 0,
+    hasErrors: false,
+    truncated: true,
+    symbols: [{
+      name: "initToolbar",
+      kind: "function",
+      syntaxKind: "function_declaration",
+      startLine: 600,
+      endLine: 850,
+    }],
+  });
+  assert.equal(generic.status, "needs_targeting");
+  assert.equal(generic.targetingReason, "precise_query_required");
+
+  const precise = decide({
+    path: "src/main.js",
+    language: "javascript",
+    versionToken: "50000:300",
+    query: "inittoolbar",
+    exactMatchCount: 1,
+    hasErrors: false,
+    truncated: true,
+    symbols: [{
+      name: "initToolbar",
+      kind: "function",
+      syntaxKind: "function_declaration",
+      startLine: 600,
+      endLine: 850,
+    }],
+  });
+  assert.equal(precise.status, "needs_range_read");
+  assert.deepEqual(precise.requestedRange, {
+    startLine: 600,
+    endLine: 850,
+    maxLines: 251,
+  });
+});
+
+test("recovery allows six phase requests and pauses before the seventh", () => {
+  let state = activateExecuteRecoveryRuntimeState(createExecuteRecoveryRuntimeState({ workflowMode: "edit" }), {
+    mode: "mutation_first",
+    reason: "bounded_mutation_retry",
+    expectedTarget: "src/App.tsx",
+  });
+  let reached = false;
+  for (let index = 1; index <= 7; index += 1) {
+    const advanced = advanceExecuteRecoveryRuntimeIteration(state);
+    state = advanced.state;
+    reached = advanced.reachedMaxIterations;
+    assert.equal(reached, index === 7);
+  }
 });
 
 test("read-only budget triggers execute recovery before max iterations", () => {
@@ -3618,10 +4006,16 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.match(contextManagementSource, /execute_recovery_context_compacted/);
   assert.match(contextManagementSource, /isExecuteRecoveryEligible && contextForceForManagement\?\.shouldForce/);
   assert.match(contextManagementSource, /execute_recovery_context_skipped/);
+  assert.match(
+    contextManagementSource,
+    /contextForceForManagement\.shouldForce \|\| cloudResponsesCompact/,
+    "low-pressure local turns must not prune source observations every iteration",
+  );
   assert.match(source, /activateExecuteRecovery\("mutation_first", "execute_convergence_prompt"/);
   assert.match(streamInvocationSource, /const recoveryToolChoice =[\s\S]*toolChoice: recoveryToolChoice/);
   assert.match(executeRecoveryRuntimeSource, /attempts: state\.attempts \+ 1/);
   assert.match(executeRecoveryRuntimeSource, /MAX_EXECUTE_RECOVERY_ITERATIONS = 6/);
+  assert.match(executeRecoveryRuntimeSource, /phaseNoProgressCount > MAX_EXECUTE_RECOVERY_ITERATIONS/);
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);
   assert.match(loopControlRuntimeSource, /resolveAgentLoopIterationBudget/);
   assert.match(streamInvocationSource, /buildMaxStepsFinalTextPrompt/);

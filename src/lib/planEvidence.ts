@@ -210,7 +210,13 @@ function objectiveAssignsMutationToTarget(objective: string, target: string): bo
 function summaryExposesTargetDefect(summary: string): boolean {
   const withoutDiagnosticMessages = String(summary || "")
     .replace(/console\.(?:error|warn|log)\s*\([^)]*\)/gi, " ");
-  return /(?:\b(?:missing|incorrect(?:ly)?|wrong(?:ly)?|broken|unimplemented|stubbed?|fails?|failure|no-op|empty handler|does not|doesn't|without|never\s+(?:assigns?|maps?|registers?|listens?|returns?|sets?|handles?|calls?|emits?))\b|\bonly\s+(?:returns?|sets?|writes?|handles?|calls?|emits?)\b|缺少|缺失|错误|不正确|失效|失败|未实现|未注册|未监听|未等待|从未(?:映射|注册|监听|返回|设置|处理|调用)|没有(?:映射|注册|监听|返回|设置|处理)|为空|空实现|只(?:返回|设置|写入|处理|调用)|仅(?:返回|设置|写入|处理|调用))/i.test(withoutDiagnosticMessages);
+  // Runtime-generated plans need an actionable implementation mismatch, not
+  // merely an error-handling string such as `console.error("save failed")`.
+  // Generic "error/failure" words describe the user's symptom but do not say
+  // what must change, and previously let placeholder plans pass the approval
+  // gate. Keep this matcher provider/language neutral by requiring a concrete
+  // missing, wrong, empty, or omitted implementation relation.
+  return /(?:\b(?:missing|incorrect(?:ly)?|wrong(?:ly)?|broken|unimplemented|stubbed?|no-op|empty handler)\b|\b(?:does not|doesn't|never)\s+(?:assigns?|maps?|registers?|listens?|awaits?|returns?|sets?|handles?|calls?|emits?|forwards?|exports?|defines?|binds?|installs?|initiali[sz]es?|renders?)\b|\bwithout\s+(?:assigning|mapping|registering|listening|awaiting|returning|setting|handling|calling|emitting|forwarding|exporting|defining|binding|installing|initiali[sz]ing|rendering)\b|\bonly\s+(?:returns?|sets?|writes?|handles?|calls?|emits?)\b|缺少|缺失|不正确|失效|未实现|未注册|未监听|未等待|从未(?:映射|注册|监听|等待|返回|设置|处理|调用|转发|导出|定义|绑定|安装|初始化|渲染)|没有(?:映射|注册|监听|等待|返回|设置|处理|调用|转发|导出|定义|绑定|安装|初始化|渲染)|为空|空实现|只(?:返回|设置|写入|处理|调用)|仅(?:返回|设置|写入|处理|调用))/i.test(withoutDiagnosticMessages);
 }
 
 function summaryExposesImplementationStructure(summary: string): boolean {
@@ -589,7 +595,7 @@ export function assessPlanClosureEvidence(
   for (const fact of bundle.facts) {
     const target = fact.target.replace(/\\/g, "/").toLowerCase();
     if (!normalizedTargets.has(target)) continue;
-    if (objectiveMentionsTarget(bundle.objective, fact.target)) {
+    if (objectiveAssignsMutationToTarget(bundle.objective, fact.target)) {
       objectiveTargetMatches += 1;
     }
     if (summaryExposesTargetDefect(fact.summary)) {

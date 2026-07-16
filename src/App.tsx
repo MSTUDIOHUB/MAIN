@@ -27,6 +27,7 @@ import {
   sanitizeTaskBlocksForPersist,
   syncTaskIdCounterFromBlocks,
   normalizeInterruptedConversationTurnsForRestore,
+  normalizeSessionRuntimeSnapshot,
   buildSessionRuntimeSnapshotFromStoreState,
   buildRestoredSessionRuntimePatch,
 } from "./store/useAppStore";
@@ -34,12 +35,15 @@ import { getE2EQuickReplyHandler, initializeE2EScenarios } from "./lib/e2e";
 import {
   deleteChatSessionTempFiles,
   deleteProjectSession,
+  deleteWorkspacePath,
+  listDirectory,
   listProjectSessions,
   loadProjectSession,
   loadProjectSessionMeta,
   loadProjectSessionPage,
   type ProjectSessionPage,
   readAttachmentImageDataUrl,
+  readFile,
   rebuildProjectSessionsIndex,
   saveProjectSession,
   setWorkspaceRoot as setWorkspaceRootIpc,
@@ -63,6 +67,15 @@ import {
 import { resolveConversationTurnIntent } from "./lib/runIntent";
 import { resolvePlanApprovalQuickReplyAction } from "./lib/planControl";
 import { shouldContinueGoalFromUserChoice } from "./lib/goalChoiceContinuation";
+import {
+  deserializeGoalDeletionFence,
+  markGoalRuntimeDeleted,
+  resolveGoalDeletionFenceDirPath,
+  resolveGoalDeletionFenceRelativePath,
+  resolveGoalRuntimeRelativeDirPath,
+  shouldRetainGoalDeletionFenceForCurrentProcess,
+  type GoalDeletionFence,
+} from "./lib/goalPersistence";
 import { materializePlanArtifactFromVisibleText } from "./lib/planMaterialization";
 import { runAfterNextPaint } from "./lib/uiScheduling";
 import { checkForMainUpdate, installMainUpdate, type MainUpdateInfo, type MainUpdateProgress } from "./lib/updater";
@@ -77,6 +90,7 @@ import {
   type UserChoiceResolutionIdentity,
 } from "./lib/actionRequest";
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./lib/turnEvents";
+import { resolveVisibleGoalSubmissionSessionKey } from "./lib/submit/turnSubmission";
 import {
   buildFeishuMarkdownCard,
   createFeishuPairedUserFromMessage,
@@ -618,6 +632,198 @@ function mergeSessionsAfterDelete(
   return merged;
 }
 
+interface LoadedGoalDeletionFence extends GoalDeletionFence {
+  markerPath: string;
+  retainUntilRestart: boolean;
+}
+
+async function loadGoalDeletionFencesForWorkspace(
+  workspace: string,
+): Promise<LoadedGoalDeletionFence[]> {
+  if (!workspace || workspace === GLOBAL_CHAT_KEY) return [];
+  let entries: Awaited<ReturnType<typeof listDirectory>>;
+  try {
+    const listed = await listDirectory(resolveGoalDeletionFenceDirPath(), workspace);
+    entries = Array.isArray(listed) ? listed : [];
+  } catch {
+    return [];
+  }
+
+  const fences: LoadedGoalDeletionFence[] = [];
+  for (const entry of entries) {
+    if (entry.is_dir || !entry.name.endsWith(".json")) continue;
+    const expectedGoalId = entry.name.slice(0, -5);
+    const markerPath = resolveGoalDeletionFenceRelativePath(expectedGoalId);
+    try {
+      const content = await readFile(markerPath, workspace);
+      const fence = deserializeGoalDeletionFence(content, expectedGoalId);
+      if (!fence || !fence.ownerSessionKey.startsWith(`${workspace}:`)) continue;
+      const retainUntilRestart = shouldRetainGoalDeletionFenceForCurrentProcess(
+        workspace,
+        fence.goalId,
+      );
+      markGoalRuntimeDeleted(workspace, fence.goalId);
+      fences.push({ ...fence, markerPath, retainUntilRestart });
+    } catch (error) {
+      appendDebugLog("warn", "goal.deletionFence", {
+        phase: "load_failed",
+        workspace,
+        markerPath,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  return fences;
+}
+
+function resolveGoalDeletionFenceOwnerSessionId(
+  workspace: string,
+  ownerSessionKey: string,
+): number | null {
+  const prefix = `${workspace}:`;
+  if (!ownerSessionKey.startsWith(prefix)) return null;
+  const sessionId = Number(ownerSessionKey.slice(prefix.length));
+  return Number.isSafeInteger(sessionId) && sessionId > 0 ? sessionId : null;
+}
+
+function applyGoalDeletionFencesToLoadedStore(workspace: string): void {
+  useAppStore.setState((state: any) => {
+    const currentScope = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const activeSnapshot = currentScope === workspace
+      ? normalizeSessionRuntimeSnapshot(
+          buildSessionRuntimeSnapshotFromStoreState(state),
+          { restoreInterruptedGoal: true, workspacePath: workspace },
+        )
+      : undefined;
+    let runtimeChanged = false;
+    const runtimeBySessionKey = Object.fromEntries(
+      Object.entries(state.runtimeBySessionKey || {}).map(([sessionKey, runtime]) => {
+        if (!sessionKey.startsWith(`${workspace}:`)) return [sessionKey, runtime];
+        const normalized = normalizeSessionRuntimeSnapshot(runtime as any, {
+          restoreInterruptedGoal: true,
+          workspacePath: workspace,
+        });
+        if (!normalized) return [sessionKey, runtime];
+        runtimeChanged = true;
+        return [sessionKey, { ...(runtime as any), ...normalized }];
+      }),
+    );
+    const sessions = state.sessionsByWorkspace[workspace] || [];
+    const nextSessions = sessions.map((session: any) => {
+      if (!session.runtimeSnapshot) return session;
+      const normalized = normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, {
+        restoreInterruptedGoal: true,
+        workspacePath: workspace,
+      });
+      if (!normalized) return session;
+      return { ...session, messages: normalized.taskFlow || session.messages, runtimeSnapshot: normalized };
+    });
+    return {
+      ...(activeSnapshot
+        ? {
+            activeGoal: activeSnapshot.activeGoal,
+            goalProgress: activeSnapshot.goalProgress,
+            goalStatus: activeSnapshot.goalStatus,
+            goalRuntime: activeSnapshot.goalRuntime,
+            queuedUserMessage: activeSnapshot.queuedUserMessage,
+            activeActionRequest: activeSnapshot.activeActionRequest,
+            harnessRunMarker: activeSnapshot.harnessRunMarker,
+            taskFlow: activeSnapshot.taskFlow,
+            conversationTurns: activeSnapshot.conversationTurns,
+          }
+        : {}),
+      ...(runtimeChanged ? { runtimeBySessionKey } : {}),
+      sessionsByWorkspace: {
+        ...state.sessionsByWorkspace,
+        [workspace]: nextSessions,
+      },
+    };
+  });
+}
+
+async function recoverGoalDeletionFences(
+  workspace: string,
+  diskSessions: any[],
+  fences: LoadedGoalDeletionFence[],
+): Promise<any[]> {
+  if (fences.length === 0) return diskSessions;
+  let nextSessions = [...diskSessions];
+  for (const fence of fences) {
+    if (fence.retainUntilRestart) {
+      appendDebugLog("info", "goal.deletionFence", {
+        phase: "retained_until_restart",
+        workspace,
+        goalId: fence.goalId,
+      });
+      continue;
+    }
+    const ownerSessionId = resolveGoalDeletionFenceOwnerSessionId(
+      workspace,
+      fence.ownerSessionKey,
+    );
+    let goalDirectoryDeleted = false;
+    try {
+      await deleteWorkspacePath(resolveGoalRuntimeRelativeDirPath(fence.goalId), workspace);
+      goalDirectoryDeleted = true;
+    } catch (error) {
+      appendDebugLog("warn", "goal.deletionFence", {
+        phase: "goal_directory_retry_failed",
+        workspace,
+        goalId: fence.goalId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (!goalDirectoryDeleted || ownerSessionId == null) continue;
+
+    const listedOwner = nextSessions.find((session) => Number(session.id) === ownerSessionId);
+    if (!listedOwner) continue;
+    try {
+      let ownerSession = listedOwner;
+      try {
+        ownerSession = await loadProjectSession(workspace, ownerSessionId);
+      } catch {
+        // listProjectSessions may already contain the complete runtime snapshot.
+      }
+      const normalizedRuntime = normalizeSessionRuntimeSnapshot(
+        ownerSession.runtimeSnapshot,
+        { restoreInterruptedGoal: true, workspacePath: workspace },
+      );
+      if (!normalizedRuntime) continue;
+      const scrubbedSession = {
+        ...ownerSession,
+        messages: normalizedRuntime.taskFlow || ownerSession.messages || [],
+        runtimeSnapshot: normalizedRuntime,
+      };
+      const saved = await saveProjectSession(workspace, scrubbedSession);
+      const committedSession = saved && typeof saved === "object"
+        ? saved
+        : scrubbedSession;
+      nextSessions = nextSessions.map((session) =>
+        Number(session.id) === ownerSessionId
+          ? { ...session, ...committedSession }
+          : session
+      );
+      await deleteWorkspacePath(fence.markerPath, workspace);
+      appendDebugLog("info", "goal.deletionFence", {
+        phase: "recovered",
+        workspace,
+        goalId: fence.goalId,
+        ownerSessionId,
+      });
+    } catch (error) {
+      appendDebugLog("warn", "goal.deletionFence", {
+        phase: "session_scrub_failed",
+        workspace,
+        goalId: fence.goalId,
+        ownerSessionId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+  applyGoalDeletionFencesToLoadedStore(workspace);
+  return nextSessions;
+}
+
 const CLOSED_SESSION_PANEL_STATE = {
   showPlanPanel: false,
   showDiff: false,
@@ -683,6 +889,7 @@ function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackStat
       conversationTurns: entry.conversationTurns || [],
     },
     fallbackState,
+    workspacePath: entry.scopeKey,
     taskFlow: restoredTaskFlow,
     conversationTurns: entry.conversationTurns || [],
     currentTurnId:
@@ -944,9 +1151,18 @@ export default function App() {
     options: { rebuildIndex?: boolean } = {},
   ) => {
     try {
-      const diskSessions = options.rebuildIndex
+      const goalDeletionFences = await loadGoalDeletionFencesForWorkspace(scopeKey);
+      if (goalDeletionFences.length > 0) {
+        applyGoalDeletionFencesToLoadedStore(scopeKey);
+      }
+      let diskSessions = options.rebuildIndex
         ? await rebuildProjectSessionsIndex(scopeKey)
         : await listProjectSessions(scopeKey);
+      diskSessions = await recoverGoalDeletionFences(
+        scopeKey,
+        diskSessions,
+        goalDeletionFences,
+      );
       const existingBeforeMerge = useAppStore.getState().sessionsByWorkspace[scopeKey] || [];
       const existingTemporaryIds = new Set(
         existingBeforeMerge
@@ -1425,10 +1641,27 @@ export default function App() {
   // ── Send Message: delegates to store's sendMessage ─────────────────────
   // This replaces the old inline handleSendMessage + runAgentLoop + 
   // executeToolCall + parseFullText + SSE parsing monolith.
-  const handleSendMessage = useCallback((text: string, images?: string[]) => {
+  const handleSendMessage = useCallback((
+    text: string,
+    images?: string[],
+    submitOptions?: { queuedUserMessageId?: string },
+  ) => {
     const state = useAppStore.getState();
-    const contextMentionsSnapshot = [...state.contextMentions];
-    const attachedFilesSnapshot = [...state.attachedFiles];
+    const queuedReplay = submitOptions?.queuedUserMessageId
+      ? state.queuedUserMessage?.id === submitOptions.queuedUserMessageId &&
+        state.queuedUserMessage.text === text
+        ? state.queuedUserMessage
+        : null
+      : null;
+    if (submitOptions?.queuedUserMessageId && !queuedReplay) return false;
+    const submissionOriginSessionKey = queuedReplay?.sessionKey ||
+      resolveVisibleGoalSubmissionSessionKey(state);
+    const contextMentionsSnapshot = queuedReplay
+      ? [...(queuedReplay.contextMentions || [])]
+      : [...state.contextMentions];
+    const attachedFilesSnapshot = queuedReplay
+      ? [...(queuedReplay.attachedFiles || [])]
+      : [...state.attachedFiles];
     const hasPayload =
       text.trim().length > 0 ||
       contextMentionsSnapshot.length > 0 ||
@@ -1439,15 +1672,23 @@ export default function App() {
       return false;
     }
 
+    // Capture the visible Goal choice synchronously. Composer clears its
+    // one-shot capsule as soon as this handler accepts the message, while the
+    // normal Store submission starts on the next paint.
+    const visibleGoalSubmissionEnvelope =
+      queuedReplay ? null : state.captureVisibleGoalSubmissionEnvelope(text);
+
     if (state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review") {
       appendDebugLog("warn", "ui.sendMessage", {
         phase: "queued_busy",
         agentStatus: state.agentStatus,
         isGenerating: state.isGenerating,
       });
+      if (queuedReplay) return true;
       state.queueUserMessage(text, images, {
         contextMentions: contextMentionsSnapshot,
         attachedFiles: attachedFilesSnapshot,
+        ...(visibleGoalSubmissionEnvelope ? { visibleGoalSubmissionEnvelope } : {}),
       });
       return true;
     }
@@ -1464,10 +1705,32 @@ export default function App() {
     });
 
     runAfterNextPaint(() => {
-      useAppStore.getState().sendMessage(text, images, {
+      const latest = useAppStore.getState();
+      const started = latest.sendMessage(text, images, {
         contextMentionsSnapshot,
         attachedFilesSnapshot,
+        ...(visibleGoalSubmissionEnvelope ? { visibleGoalSubmissionEnvelope } : {}),
+        submissionOriginSessionKey,
+        ...(queuedReplay
+          ? {
+              queuedUserMessageId: queuedReplay.id,
+              runtimeIntentOverride: queuedReplay.runtimeIntentOverride,
+              goalSourceContextSnapshot: queuedReplay.goalSourceContextSnapshot,
+              goalContinuationGuidance: queuedReplay.goalContinuationGuidance,
+            }
+          : {}),
       });
+      if (
+        started &&
+        queuedReplay &&
+        useAppStore.getState().queuedUserMessage?.id === queuedReplay.id
+      ) {
+        useAppStore.getState().clearQueuedUserMessage({
+          expectedId: queuedReplay.id,
+          disposition: "consumed",
+          reason: "replay_run_lease_acquired",
+        });
+      }
     });
 
     return true;
@@ -1482,6 +1745,7 @@ export default function App() {
     const optionAction = typeof choice === "string" ? undefined : choice.action;
     const isCustomReply = typeof choice !== "string" && choice.source === "custom_reply";
     const state = useAppStore.getState();
+    const submissionOriginSessionKey = resolveVisibleGoalSubmissionSessionKey(state);
     const sourceTurn = sourceTurnId
       ? state.conversationTurns.find((turn) => turn.id === sourceTurnId) || null
       : null;
@@ -1632,9 +1896,17 @@ export default function App() {
       activeActionRequest: state.activeActionRequest,
       choiceRequest,
     });
+    const goalContinuationEnvelope = shouldContinueExistingGoal
+      ? state.captureGoalContinuationEnvelope(text, {
+          source: "goal_user_choice",
+          requestId: choiceRequest?.requestId,
+        })
+      : null;
+    const hasAuthorizedGoalContinuation =
+      shouldContinueExistingGoal && !!goalContinuationEnvelope;
     const executeQuickReplyIntent = state.selectedMainModeKey === "game_studio" ? "studio_workflow" as const : "execute" as const;
 
-    if (shouldContinueExistingGoal) {
+    if (hasAuthorizedGoalContinuation) {
       appendDebugLog("info", "ui.quickReply_goal_continuation", {
         sourceTurnId,
         goalId: state.activeGoal?.id || null,
@@ -1671,7 +1943,7 @@ export default function App() {
       ? {
           reuseCurrentTurn: true,
           preservePlanState: sourceIntent === "plan",
-          resolvedIntent: shouldContinueExistingGoal
+          resolvedIntent: hasAuthorizedGoalContinuation
             ? "goal" as const
             : shouldExecuteFromQuickReply ? executeQuickReplyIntent : sourceIntent,
           replyOptionSourceTurnId: sourceTurnId,
@@ -1679,11 +1951,11 @@ export default function App() {
           replyOptionRequestIdentity: choiceRequest,
           replyOptionIsCustom: isCustomReply,
           parentRunIdOverride: choiceRequest?.runId,
-          ...(shouldContinueExistingGoal
+          ...(hasAuthorizedGoalContinuation
             ? {
                 runtimeIntentOverride: "goal" as const,
                 executionConsentGranted: true,
-                continueExistingGoal: true,
+                goalContinuationEnvelope,
                 goalContinuationGuidance: text,
               }
             : shouldExecuteFromQuickReply
@@ -1751,7 +2023,10 @@ export default function App() {
     });
 
     runAfterNextPaint(() => {
-      useAppStore.getState().sendMessage(text, undefined, sendOptions);
+      useAppStore.getState().sendMessage(text, undefined, {
+        ...(sendOptions || {}),
+        submissionOriginSessionKey,
+      });
     });
   }, []);
 
@@ -2027,6 +2302,7 @@ export default function App() {
           conversationTurns: restoredConversationTurns,
         },
         fallbackState: useAppStore.getState(),
+        workspacePath: scopeKey,
         taskFlow: restoredTaskFlow,
         conversationTurns: restoredConversationTurns,
         currentTurnId: snapshot.currentTurnId ?? null,
