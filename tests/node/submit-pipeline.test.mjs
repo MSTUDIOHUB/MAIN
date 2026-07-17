@@ -1493,6 +1493,7 @@ test("semantic metadata decision builds a stable request and callback guard cont
       imageParts: 1,
       mentionedFilePaths: ["src/App.tsx"],
       attachedFilePaths: ["Uploads/screen.png"],
+      subagentPreference: "unspecified",
     },
   });
 });

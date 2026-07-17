@@ -9,6 +9,11 @@ import type {
   ExecutionDecisionCheckpoint,
   RecoveryReadLease,
 } from "./executeRecoveryTools";
+import {
+  normalizeSubagentDelegationPreference,
+  resolveEffectiveSubagentDelegationPreference,
+  type SubagentDelegationPreference,
+} from "./turnIntake";
 
 export type GoalStatus =
   | "active"           // Currently executing
@@ -195,6 +200,8 @@ export interface GoalDefinition {
   rawText?: string;
   /** Bounded runtime-supplied context kept separate from the canonical objective. */
   sourceContext?: string;
+  /** Effective user/session delegation preference retained across continuations. */
+  subagentPreference?: SubagentDelegationPreference;
   /** A polluted legacy objective was canonicalized and must be reviewed before resume. */
   migrationReviewRequired?: boolean;
   /** A referential objective could not be expanded into auditable criteria. */
@@ -339,6 +346,7 @@ export interface GoalTurnContract {
   goalSliceId: string;
   /** Canonical user-authored objective retained across internal continuations. */
   objective: string;
+  subagentPreference: SubagentDelegationPreference;
   revision: number;
   iteration: number;
   maxIterations: number;
@@ -382,6 +390,7 @@ function finitePositiveInt(value: unknown, fallback?: number): number | undefine
 export function createGoalDefinition(input: {
   objective: string;
   sourceContext?: string;
+  subagentPreference?: SubagentDelegationPreference;
   definitionOfDone?: string[];
   iterationBudget?: number;
   tokenBudget?: number;
@@ -408,6 +417,10 @@ export function createGoalDefinition(input: {
     objective,
     rawText: objective,
     sourceContext: canonicalInput.sourceContext,
+    subagentPreference: resolveEffectiveSubagentDelegationPreference({
+      rawUserInput: objective,
+      defaultPreference: input.subagentPreference,
+    }),
     criteriaReviewRequired,
     definitionOfDone,
     criteria: createGoalCriteria(definitionOfDone),
@@ -773,6 +786,9 @@ export function migrateGoalDefinition(goal: GoalDefinition): GoalDefinition {
     objective,
     rawText,
     sourceContext: canonicalInput.sourceContext,
+    subagentPreference: goal.subagentPreference
+      ? normalizeSubagentDelegationPreference(goal.subagentPreference)
+      : resolveEffectiveSubagentDelegationPreference({ rawUserInput: objective }),
     migrationReviewRequired: pollutedLegacyDefinition || goal.migrationReviewRequired === true,
     criteriaReviewRequired,
     definitionOfDone,
@@ -819,6 +835,10 @@ export function updateGoalDefinitionText(goal: GoalDefinition, rawText: string):
     objective,
     rawText: objective,
     sourceContext,
+    subagentPreference: resolveEffectiveSubagentDelegationPreference({
+      rawUserInput: objective,
+      defaultPreference: goal.subagentPreference,
+    }),
     migrationReviewRequired: false,
     criteriaReviewRequired,
     definitionOfDone,

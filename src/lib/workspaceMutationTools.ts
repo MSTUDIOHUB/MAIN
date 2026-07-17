@@ -1,3 +1,5 @@
+import { normalizeApplyPatchHeaderPath } from "./applyPatchTool";
+
 /**
  * Tools that can durably mutate files in the active workspace.
  *
@@ -55,10 +57,10 @@ function normalizeMutationPath(value: unknown): string {
 function extractApplyPatchTargets(patch: string): string[] {
   const targets: string[] = [];
   for (const match of String(patch || "").matchAll(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/gmi)) {
-    if (match[1]) targets.push(normalizeMutationPath(match[1]));
+    if (match[1]) targets.push(normalizeApplyPatchHeaderPath(match[1]));
   }
   for (const match of String(patch || "").matchAll(/^\+\+\+\s+(?:b\/)?([^\s]+)$/gmi)) {
-    if (match[1] && match[1] !== "/dev/null") targets.push(normalizeMutationPath(match[1]));
+    if (match[1] && match[1] !== "/dev/null") targets.push(normalizeApplyPatchHeaderPath(match[1]));
   }
   return [...new Set(targets.filter(Boolean))];
 }

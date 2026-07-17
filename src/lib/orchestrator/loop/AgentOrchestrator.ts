@@ -37,6 +37,7 @@ import {
   resolveVisualContextDeliveryStateFromReceipt,
   type VisualContextDeliveryStatus,
 } from "../../visualContext";
+import { resolveEffectiveSubagentDelegationPreference } from "../../turnIntake";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -139,6 +140,12 @@ export class AgentOrchestrator {
           gameStudioScriptEditRequested,
           unityScriptEditRequested,
         } = turnInputContext;
+        const effectiveSubagentPreference = resolveEffectiveSubagentDelegationPreference({
+          rawUserInput: latestUserPromptText,
+          defaultPreference: turnInputContextSignals.subagentPreference && turnInputContextSignals.subagentPreference !== "unspecified"
+            ? turnInputContextSignals.subagentPreference
+            : callbacks.getGoalTurnContract?.()?.subagentPreference,
+        });
         let visualContextRunStatus: VisualContextDeliveryStatus =
           turnInputContextSignals.imageParts > 0 ? "queued" : "none";
         let visualRecognitionObservation = null as ReturnType<typeof parseVisualContextRecognition>["observation"];
@@ -807,6 +814,23 @@ export class AgentOrchestrator {
         applyAssistantIterationMutableState(loopState, assistantIterationPhase);
         reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (assistantIterationPhase.status === "stopped") {
+          if (
+            effectiveSubagentPreference === "preferred" &&
+            !loopState.recentToolActivity.some((activity) =>
+              activity.name === "spawn_subagent" && activity.status === "succeeded"
+            )
+          ) {
+            callbacks.onDebugEvent?.("preferred_delegation_not_used", {
+              iteration,
+              reason: availableToolNames.has("spawn_subagent")
+                ? "model_declined_after_admission"
+                : "phase_scope_or_capacity_not_admitted",
+              workflowMode,
+              runtimeIntent,
+              spawnToolExposed: availableToolNames.has("spawn_subagent"),
+              recentToolNames: [...new Set(loopState.recentToolActivity.map((activity) => activity.name))].slice(0, 12),
+            });
+          }
           if (turnEvents.hasStagedTurnCompletion()) {
             return;
           }

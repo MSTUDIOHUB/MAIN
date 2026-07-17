@@ -1,6 +1,6 @@
 // @ts-nocheck
 import React, { useState, useEffect, useRef, useCallback, useMemo } from "react";
-import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconTrash, IconGlobe, IconShield } from "./Icons";
+import { IconAt, IconFile, IconClose, IconArrowUp, IconPlus, IconCode, IconChevronUp as IconChevronUpIcon, IconImageIcon, IconRefresh, IconSearch, IconSettings, IconStop, IconZap, IconTrash, IconGlobe, IconShield, IconSubagent } from "./Icons";
 import ImageStudioSetupModal from "./ImageStudioSetupModal";
 import MainModeSwitcher from "./composer/MainModeSwitcher";
 import GameStudioOnboardingPanel from "./gameStudio/GameStudioOnboardingPanel";
@@ -203,6 +203,8 @@ export default function Composer({
   onStopGeneration,
   autoApproveTools,
   onToggleAutoApprove,
+  preferSubagents,
+  onTogglePreferSubagents,
   onHeightChange,
   activeSessionKey,
   chatFontSize,
@@ -363,6 +365,16 @@ export default function Composer({
   const autoReviewLockedTitle = language === "en"
     ? "Auto Review is active for this run and can be changed after the run stops."
     : "自动审查已在本轮执行中启用，执行停止后才能关闭。";
+  const subagentPreferenceTitle = language === "en"
+    ? preferSubagents
+      ? "Subagent collaboration is preferred for this session. MAIN will delegate one or more useful independent read-only scopes when appropriate."
+      : "Prefer subagent collaboration for this session when useful independent read-only work exists."
+    : preferSubagents
+      ? "本会话已偏好子智能体协作；存在有价值的独立只读范围时，MAIN 会优先委派一个或多个子智能体。"
+      : "为本会话开启子智能体协作偏好；存在有价值的独立只读范围时优先委派。";
+  const subagentPreferenceLockedTitle = language === "en"
+    ? "Subagent preference is captured for the current run and can be changed after it stops."
+    : "本轮已捕获子智能体偏好，执行停止后才能更改。";
   const hasDraftPayload =
     draftInput.trim().length > 0 ||
     contextMentions.length > 0 ||
@@ -379,6 +391,10 @@ export default function Composer({
   );
   const autoReviewToggleDisabled = Boolean(autoApproveTools && isStreaming);
   const autoReviewButtonTitle = autoReviewToggleDisabled ? autoReviewLockedTitle : autoReviewTitle;
+  const subagentPreferenceToggleDisabled = Boolean(isStreaming);
+  const subagentPreferenceButtonTitle = subagentPreferenceToggleDisabled
+    ? subagentPreferenceLockedTitle
+    : subagentPreferenceTitle;
   const webSearchProviderOptions = useMemo(
     () => [
       {
@@ -1216,6 +1232,11 @@ export default function Composer({
     }
     onToggleAutoApprove(nextValue);
   }, [autoApproveTools, isStreaming, language, onToggleAutoApprove]);
+
+  const handleToggleSubagentPreference = useCallback(() => {
+    if (!onTogglePreferSubagents || isStreaming) return;
+    onTogglePreferSubagents(!preferSubagents);
+  }, [isStreaming, onTogglePreferSubagents, preferSubagents]);
 
   const handleToggleWebSearch = useCallback(() => {
     const nextValue = !webSearchEnabled;
@@ -2368,6 +2389,20 @@ export default function Composer({
                     )}
                   </div>
                 </>
+              )}
+              {!isImageStudioMode && onTogglePreferSubagents && (
+                <button
+                  type="button"
+                  data-testid="composer-subagent-preference-toggle"
+                  onClick={handleToggleSubagentPreference}
+                  disabled={subagentPreferenceToggleDisabled}
+                  className={`panel-tab-icon-button flex h-7 w-7 shrink-0 items-center justify-center rounded-[7px] p-0 transition-all duration-150 disabled:cursor-not-allowed disabled:opacity-70 ${preferSubagents ? "is-active" : ""}`}
+                  title={subagentPreferenceButtonTitle}
+                  aria-label={language === "en" ? "Prefer subagent collaboration" : "偏好子智能体协作"}
+                  aria-pressed={!!preferSubagents}
+                >
+                  <IconSubagent className="h-4 w-4" />
+                </button>
               )}
               {!isImageStudioMode && onToggleAutoApprove && (
                 <button

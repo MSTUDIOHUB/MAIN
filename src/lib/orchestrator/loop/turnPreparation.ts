@@ -25,7 +25,7 @@ import { withEventSchema, type MainThreadEventInput, type MainThreadProgressUpda
 import {
   extractPrimaryUserRequestText,
   extractTurnInputContextSignalsFromMessages,
-  resolveSubagentDelegationPreference,
+  resolveEffectiveSubagentDelegationPreference,
   type TurnInputContextSignals,
 } from "../../turnIntake";
 import { collectCanonicalTurnUserContext } from "../../turnContext";
@@ -602,7 +602,12 @@ export function createTaskTargetingRuntime(input: {
   });
 
   const initialTaskTargetingProfile = buildCurrentTaskTargetingProfile();
-  const subagentPreference = resolveSubagentDelegationPreference(latestUserPromptText);
+  const subagentPreference = resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: latestUserPromptText,
+    defaultPreference: turnInputContextSignals.subagentPreference && turnInputContextSignals.subagentPreference !== "unspecified"
+      ? turnInputContextSignals.subagentPreference
+      : callbacks.getGoalTurnContract?.()?.subagentPreference,
+  });
   emitTaskOrchestratorPhase("INTAKE_PARSE", {
     facets: initialTaskTargetingProfile.facets,
     explicitPaths: initialTaskTargetingProfile.explicitPaths.slice(0, 8),

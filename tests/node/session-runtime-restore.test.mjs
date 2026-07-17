@@ -67,6 +67,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildSessionRuntimeSnapshotFromStoreState,
   normalizeSessionRuntimeSnapshot,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/useAppStore.ts"));
 const actionRequests = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/actionRequest.ts"));
@@ -112,6 +113,15 @@ function buildApprovedPlanContent() {
     "",
   ].join("\n");
 }
+
+test("subagent collaboration preference is session-scoped and backward compatible", () => {
+  assert.equal(normalizeSessionRuntimeSnapshot({})?.preferSubagents, false);
+  assert.equal(normalizeSessionRuntimeSnapshot({ preferSubagents: true })?.preferSubagents, true);
+  assert.equal(
+    buildSessionRuntimeSnapshotFromStoreState({ preferSubagents: true }).preferSubagents,
+    true,
+  );
+});
 
 test("queued Goal continuation guidance survives session normalization only with authorization", () => {
   const authorization = {

@@ -39,6 +39,7 @@ const {
   extractPrimaryUserRequestText,
   extractTurnInputContextSignalsFromMessages,
   hasTurnProvidedContext,
+  resolveEffectiveSubagentDelegationPreference,
   resolveSubagentDelegationPreference,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnIntake.ts"));
 
@@ -86,6 +87,7 @@ test("turn intake signals can be recovered from multimodal messages", () => {
   assert.equal(signals.imageParts, 1);
   assert.deepEqual(signals.mentionedFilePaths, ["src/lib/replyOptions.ts"]);
   assert.deepEqual(signals.attachedFilePaths, ["main-debug.log"]);
+  assert.equal(signals.subagentPreference, "unspecified");
   assert.equal(hasTurnProvidedContext(signals), true);
 });
 
@@ -152,6 +154,36 @@ test("preferred subagent collaboration becomes an explicit runtime intake contra
   });
 
   assert.match(block, /subagentPreference: preferred/);
-  assert.match(block, /路径不重叠/);
-  assert.match(block, /尽早创建最多两个子智能体/);
+  assert.match(block, /存在一个独立范围时应尽早创建一个/);
+  assert.match(block, /当前运行容量创建多个/);
+});
+
+test("session preference supplies preferred only when user text is unspecified", () => {
+  assert.equal(resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: "检查这两个模块",
+    defaultPreference: "preferred",
+  }), "preferred");
+  assert.equal(resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: "这次不要使用子智能体",
+    defaultPreference: "preferred",
+  }), "forbidden");
+  assert.equal(resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: "可以使用一个 subagent 帮忙检查",
+    defaultPreference: "preferred",
+  }), "allowed");
+});
+
+test("turn intake persists a session-supplied subagent preference for runtime recovery", () => {
+  const block = buildTurnIntakeContextBlock({
+    rawUserInput: "检查 src/main.js 的启动流程",
+    signals: { subagentPreference: "preferred" },
+    language: "zh",
+    workflowMode: "edit",
+  });
+  const signals = extractTurnInputContextSignalsFromMessages([
+    { role: "user", content: block },
+  ]);
+
+  assert.match(block, /subagentPreference: preferred/);
+  assert.equal(signals.subagentPreference, "preferred");
 });

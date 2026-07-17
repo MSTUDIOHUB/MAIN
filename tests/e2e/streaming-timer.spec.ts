@@ -24,7 +24,11 @@ test("composer queues and guides additional input while a run is active", async 
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
   await expect(page.getByTestId("composer-send-button")).toHaveCount(0);
   const autoReviewToggle = page.getByTestId("composer-auto-review-toggle");
+  const subagentToggle = page.getByTestId("composer-subagent-preference-toggle");
   await expect(autoReviewToggle).toBeVisible();
+  await expect(subagentToggle).toBeVisible();
+  await expect(subagentToggle).toBeDisabled();
+  await expect(subagentToggle).toHaveAttribute("aria-pressed", "false");
 
   page.once("dialog", (dialog) => dialog.accept());
   await autoReviewToggle.click();
@@ -53,6 +57,33 @@ test("composer queues and guides additional input while a run is active", async 
   await expect
     .poll(async () => page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().activeGuidance?.text ?? null))
     .toBe("追加检查导入后的空状态");
+});
+
+test("composer subagent preference toggle activates after the current run stops", async ({ page }, testInfo) => {
+  await page.goto("/?e2eScenario=composer-running-guidance");
+
+  const subagentToggle = page.getByTestId("composer-subagent-preference-toggle");
+  await expect(subagentToggle).toBeDisabled();
+  await page.evaluate(() => (window as any).__CODELY_E2E__?.clearModelRuntimeLock?.());
+  await expect(subagentToggle).toBeEnabled();
+  await subagentToggle.click();
+  await expect(subagentToggle).toHaveAttribute("aria-pressed", "true");
+  await expect
+    .poll(async () => page.evaluate(() => Boolean((window as any).__CODELY_E2E__?.getSnapshot?.().preferSubagents)))
+    .toBe(true);
+
+  const autoReviewToggle = page.getByTestId("composer-auto-review-toggle");
+  await expect(
+    page.locator('[data-testid="composer-subagent-preference-toggle"] + [data-testid="composer-auto-review-toggle"]'),
+  ).toHaveCount(1);
+  for (const theme of ["light", "dark", "black"] as const) {
+    await page.evaluate((nextTheme) => (window as any).__CODELY_E2E__?.setThemeMode?.(nextTheme), theme);
+    await expect(page.locator("html")).toHaveAttribute("data-theme", theme);
+    await expect(subagentToggle).toBeVisible();
+    await expect(subagentToggle).toHaveClass(/is-active/);
+    await expect(autoReviewToggle).toBeVisible();
+    await subagentToggle.screenshot({ path: testInfo.outputPath(`subagent-toggle-${theme}.png`) });
+  }
 });
 
 test("chat history remains scrollable during rapid streaming updates", async ({ page }) => {

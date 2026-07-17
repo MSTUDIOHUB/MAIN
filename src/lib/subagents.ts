@@ -1,6 +1,8 @@
 import type { AppConfig } from "./appTypes";
 import { resolveRuntimeLaneKey } from "./appConfig";
 import { getModelLaneBurstAdmission } from "./modelLaneCoordinator";
+import type { SubagentDelegationPreference } from "./turnIntake";
+export type { SubagentDelegationPreference } from "./turnIntake";
 import type {
   FileReadObservationIdentity,
   FileReadWindowIdentity,
@@ -93,12 +95,6 @@ export interface SpawnSubagentRequest {
   allowedPaths?: string;
   expectedOutput?: string;
 }
-
-export type SubagentDelegationPreference =
-  | "unspecified"
-  | "forbidden"
-  | "allowed"
-  | "preferred";
 
 export type DelegationRuntimePhase =
   | "context"

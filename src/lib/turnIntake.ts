@@ -1,20 +1,22 @@
+export type SubagentDelegationPreference =
+  | "unspecified"
+  | "forbidden"
+  | "allowed"
+  | "preferred";
+
 export interface TurnInputContextSignals {
   imageParts: number;
   mentionedFilePaths: string[];
   attachedFilePaths: string[];
+  subagentPreference: SubagentDelegationPreference;
 }
 
 export interface TurnInputContextLike {
   imageParts?: number;
   mentionedFilePaths?: string[];
   attachedFilePaths?: string[];
+  subagentPreference?: SubagentDelegationPreference;
 }
-
-export type SubagentDelegationPreference =
-  | "unspecified"
-  | "forbidden"
-  | "allowed"
-  | "preferred";
 
 const SUBAGENT_REFERENCE_RE = /(?:sub[\s_-]?agents?|子智能体|子代理|多智能体|multi[\s_-]?agents?|multiple\s+agents?)/i;
 const SUBAGENT_FORBIDDEN_RE = /(?:(?:不要|禁止|无需|不需要|别|不可|不能).{0,24}(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:sub[\s_-]?agents?|子智能体|子代理|多智能体).{0,24}(?:不要|禁止|无需|不需要|不可|不能)|(?:do\s+not|don't|without|no)\s+(?:use\s+)?(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?))/i;
@@ -28,6 +30,24 @@ export function resolveSubagentDelegationPreference(input: string): SubagentDele
   if (SUBAGENT_PARALLEL_RE.test(text)) return "preferred";
   if (SUBAGENT_ALLOWED_RE.test(text)) return "allowed";
   return "allowed";
+}
+
+export function normalizeSubagentDelegationPreference(
+  value: unknown,
+): SubagentDelegationPreference {
+  return value === "forbidden" || value === "allowed" || value === "preferred"
+    ? value
+    : "unspecified";
+}
+
+export function resolveEffectiveSubagentDelegationPreference(input: {
+  rawUserInput: string;
+  defaultPreference?: SubagentDelegationPreference;
+}): SubagentDelegationPreference {
+  const explicitPreference = resolveSubagentDelegationPreference(input.rawUserInput);
+  return explicitPreference !== "unspecified"
+    ? explicitPreference
+    : normalizeSubagentDelegationPreference(input.defaultPreference);
 }
 
 type MessageLike = {
@@ -53,6 +73,7 @@ export function normalizeTurnInputContextSignals(input: TurnInputContextLike = {
     imageParts,
     mentionedFilePaths: uniq(input.mentionedFilePaths),
     attachedFilePaths: uniq(input.attachedFilePaths),
+    subagentPreference: normalizeSubagentDelegationPreference(input.subagentPreference),
   };
 }
 
@@ -76,7 +97,10 @@ export function buildTurnIntakeContextBlock(input: {
   if (!hasContext && !String(input.rawUserInput || "").trim()) return "";
 
   const rawUserInput = String(input.rawUserInput || "").trim();
-  const subagentPreference = resolveSubagentDelegationPreference(rawUserInput);
+  const subagentPreference = resolveEffectiveSubagentDelegationPreference({
+    rawUserInput,
+    defaultPreference: signals.subagentPreference,
+  });
   const lines: string[] = ["[turn_intake]"];
   lines.push(`workflowMode: ${input.workflowMode || "chat"}`);
   lines.push(`subagentPreference: ${subagentPreference}`);
@@ -88,8 +112,8 @@ export function buildTurnIntakeContextBlock(input: {
 
   if (subagentPreference === "preferred") {
     lines.push(input.language === "en"
-      ? "delegation: The user prefers parallel subagent collaboration. Before broad exploration, identify useful read-only scopes with disjoint paths; if at least two exist, spawn up to two early while the parent continues non-overlapping work. Do not create filler or duplicate scopes."
-      : "delegation: 用户明确偏好多子智能体并行协作。大范围探索前先识别路径不重叠且有实质价值的只读范围；若至少存在两个，应尽早创建最多两个子智能体，同时主体继续非重叠工作。不要为了凑数制造琐碎或重复范围。");
+      ? "delegation: The user prefers subagent collaboration. Before broad exploration, identify useful bounded read-only scopes. Spawn one early when one independent scope is valuable; when multiple disjoint scopes exist, spawn as many as current runtime capacity permits in the same response while the parent continues non-overlapping work. Join children before finalizing. Do not create filler or duplicate scopes, and use zero when delegation would not help."
+      : "delegation: 用户偏好子智能体协作。大范围探索前先识别有实质价值的有界只读范围；存在一个独立范围时应尽早创建一个，存在多个路径不重叠的范围时应在同一响应中按当前运行容量创建多个，同时主体继续非重叠工作，并在结束前汇合。不要为了凑数制造琐碎或重复范围；委派无益时可以不创建。");
   } else if (subagentPreference === "forbidden") {
     lines.push(input.language === "en"
       ? "delegation: The user explicitly disabled subagents for this turn."
@@ -189,10 +213,15 @@ export function extractTurnInputContextSignalsFromMessages(messages: MessageLike
 
   const intakeImage = text.match(/^imageParts:\s*(\d+)\s*$/mi);
   const imagePartsFromIntake = intakeImage ? Number(intakeImage[1]) : 0;
+  const intakeBlock = text.match(/\[turn_intake\]([\s\S]*?)\[\/turn_intake\]/i)?.[1] || "";
+  const intakeSubagentPreference = intakeBlock.match(
+    /^subagentPreference:\s*(unspecified|forbidden|allowed|preferred)\s*$/mi,
+  )?.[1];
   return normalizeTurnInputContextSignals({
     imageParts: Math.max(countImageParts(latestUser.content), Number.isFinite(imagePartsFromIntake) ? imagePartsFromIntake : 0),
     mentionedFilePaths,
     attachedFilePaths,
+    subagentPreference: normalizeSubagentDelegationPreference(intakeSubagentPreference),
   });
 }
 

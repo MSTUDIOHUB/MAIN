@@ -333,6 +333,7 @@ function bindBridgeSnapshot(scenario: string) {
       queuedUserMessage: state.queuedUserMessage,
       activeGuidance: state.activeGuidance,
       autoApproveTools: state.autoApproveTools,
+      preferSubagents: state.preferSubagents,
       planTasks: state.planTasks,
       selectedDiffTaskId: state.selectedDiffTaskId,
       showPlanPanel: state.showPlanPanel,

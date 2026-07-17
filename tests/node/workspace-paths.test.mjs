@@ -82,4 +82,9 @@ test("workspace path identity rejects an overlapping relative suffix but accepts
     ),
     true,
   );
+  assert.equal(
+    workspacePathsReferToSameFile("path=src/main.js", "src/main.js"),
+    false,
+    "ordinary workspace identity must not adopt apply_patch compatibility aliases",
+  );
 });

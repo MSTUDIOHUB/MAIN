@@ -43,6 +43,19 @@ function normalizePatchPath(path: string): string {
   return String(path || "").replace(/\\/g, "/").replace(/^\.\//, "").trim();
 }
 
+/**
+ * Compatibility normalization for file names carried by recognized
+ * apply_patch headers. This deliberately does not apply to ordinary tool
+ * arguments or workspace path identity.
+ */
+export function normalizeApplyPatchHeaderPath(path: string): string {
+  const normalized = String(path || "").replace(/\\/g, "/").trim();
+  const withoutCompatibilityPrefix = normalized.startsWith("path=")
+    ? normalized.slice("path=".length)
+    : normalized;
+  return withoutCompatibilityPrefix.replace(/^\.\//, "").trim();
+}
+
 function isUnsafePatchPath(path: string): boolean {
   const normalized = normalizePatchPath(path);
   return (
@@ -54,13 +67,13 @@ function isUnsafePatchPath(path: string): boolean {
 }
 
 function parseHeaderPath(line: string, prefix: string): string {
-  return normalizePatchPath(line.slice(prefix.length).trim());
+  return normalizeApplyPatchHeaderPath(line.slice(prefix.length).trim());
 }
 
 function normalizeUnifiedDiffPath(rawPath: string): string {
   const firstToken = String(rawPath || "").trim().split(/\s+/)[0] || "";
   if (firstToken === "/dev/null") return firstToken;
-  return normalizePatchPath(firstToken.replace(/^[ab]\//, ""));
+  return normalizeApplyPatchHeaderPath(firstToken.replace(/^[ab]\//, ""));
 }
 
 function looksLikeUnifiedDiff(lines: string[], index: number): boolean {

@@ -29,7 +29,7 @@ import {
 } from "../../subagents";
 import type { ToolDefinition } from "../../toolSchemas";
 import {
-  resolveSubagentDelegationPreference,
+  resolveEffectiveSubagentDelegationPreference,
   type TurnInputContextSignals,
 } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
@@ -296,8 +296,14 @@ export function resolveIterationToolSurface(input: {
     Array.isArray(runtimeConfig.cloudServers)
     ? getSubagentAdmissionHealth(resolveSubagentCapacityPolicy(runtimeConfig))
     : null;
+  const effectiveSubagentPreference = resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: latestUserPromptText,
+    defaultPreference: turnInputContextSignals.subagentPreference && turnInputContextSignals.subagentPreference !== "unspecified"
+      ? turnInputContextSignals.subagentPreference
+      : callbacks.getGoalTurnContract?.()?.subagentPreference,
+  });
   const delegationDecision = resolveDelegationDecision({
-    preference: resolveSubagentDelegationPreference(latestUserPromptText),
+    preference: effectiveSubagentPreference,
     phase: delegationPhase,
     hasWorkspace: !!String(callbacks.getConfig?.().workspace || "").trim(),
     explicitScopeCount,

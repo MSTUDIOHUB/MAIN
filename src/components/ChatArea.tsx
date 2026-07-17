@@ -2478,6 +2478,8 @@ export default function ChatArea({
   rejectToolAction,
   autoApproveTools,
   onToggleAutoApprove,
+  preferSubagents,
+  onTogglePreferSubagents,
   contextMentions,
   setContextMentions,
   attachedFiles,
@@ -5310,6 +5312,8 @@ export default function ChatArea({
         onStopGeneration={onStopGeneration}
         autoApproveTools={autoApproveTools}
         onToggleAutoApprove={onToggleAutoApprove}
+        preferSubagents={preferSubagents}
+        onTogglePreferSubagents={onTogglePreferSubagents}
         activeSessionKey={activeSessionKey}
         onHeightChange={setComposerHeight}
         chatFontSize={resolvedChatFontSize}

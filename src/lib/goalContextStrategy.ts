@@ -17,7 +17,7 @@ import type { VerificationResult } from "./goalVerification";
 import { buildCheckpointContextForLLM } from "./goalPersistence";
 import { buildVerificationSummary } from "./goalVerification";
 import { classifyGoalToolCapability } from "./goalToolCapabilities";
-import { resolveSubagentDelegationPreference } from "./turnIntake";
+import { resolveEffectiveSubagentDelegationPreference } from "./turnIntake";
 
 export interface GoalIterationContextInput {
   /** Current goal definition */
@@ -74,14 +74,17 @@ export function buildGoalIterationSystemContext(input: GoalIterationContextInput
     ].join("\n"));
   }
 
-  const subagentPreference = resolveSubagentDelegationPreference(goal.objective);
+  const subagentPreference = resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: goal.objective,
+    defaultPreference: goal.subagentPreference,
+  });
   if (subagentPreference === "preferred") {
     sections.push([
       isZh ? "## 子智能体协作偏好" : "## Subagent Collaboration Preference",
       "",
       isZh
-        ? "用户明确偏好多子智能体并行协作。先识别路径不重叠、可独立交付证据的只读范围；若至少存在两个实质范围，应尽早创建最多两个子智能体，主体同时推进非重叠工作。不要重复读取子智能体租约路径，也不要为凑数拆分琐碎任务。"
-        : "The user explicitly prefers parallel subagent collaboration. Identify read-only scopes with disjoint paths and independently useful evidence; when at least two substantial scopes exist, spawn up to two early while the parent advances non-overlapping work. Do not duplicate leased paths or manufacture filler tasks.",
+        ? "用户偏好子智能体协作。存在一个有实质价值的有界只读范围时尽早创建一个；存在多个路径不重叠的范围时，在同一响应中按当前容量创建多个，主体同时推进非重叠工作并在结束前汇合。不要重复读取子智能体租约路径，也不要为凑数拆分琐碎任务；委派无益时可以不创建。"
+        : "The user prefers subagent collaboration. Spawn one early when one bounded read-only scope is independently valuable; when multiple disjoint scopes exist, spawn as many as current capacity permits in the same response while the parent advances non-overlapping work, then join before finalizing. Do not duplicate leased paths or manufacture filler tasks; use zero when delegation would not help.",
       "",
     ].join("\n"));
   } else if (subagentPreference === "forbidden") {
@@ -262,12 +265,17 @@ export function detectGoalCompletionSignal(assistantText: string): {
 export function buildGoalTurnContract(input: GoalIterationContextInput): GoalTurnContract {
   const goal = input.goal;
   const context = buildGoalIterationSystemContext(input);
+  const subagentPreference = resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: goal.objective,
+    defaultPreference: goal.subagentPreference,
+  });
   const revision = Math.max(1, Number(goal.revision) || 1);
   const goalSliceId = buildGoalSliceId(goal.id, input.nextIteration);
   return {
     goalId: goal.id,
     goalSliceId,
     objective: goal.objective,
+    subagentPreference,
     revision,
     iteration: input.nextIteration,
     maxIterations: goal.iterationBudget,

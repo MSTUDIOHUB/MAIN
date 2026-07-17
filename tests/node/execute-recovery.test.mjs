@@ -936,6 +936,28 @@ test("execute recovery exposes only the current capability surface", () => {
   assert.doesNotMatch(convergencePrompt, /read_file (?:is )?(?:unavailable|not available|disabled)/i);
 });
 
+test("execute recovery admits apply_patch path= headers as the expected canonical target", () => {
+  const target = getToolTarget("apply_patch", {
+    patch: [
+      "*** Begin Patch",
+      "*** Update File: path=src/main.js",
+      "@@",
+      "-const ready = false;",
+      "+const ready = true;",
+      "*** End Patch",
+    ].join("\n"),
+  });
+  assert.equal(target, "src/main.js");
+
+  const decision = resolveExecuteRecoveryBatchDecision({
+    mode: "mutation_first",
+    calls: [{ id: "patch-main", name: "apply_patch", target }],
+    expectedTarget: "src/main.js",
+  });
+  assert.equal(decision.selectedCallId, "patch-main");
+  assert.deepEqual(decision.deferredCallIds, []);
+});
+
 test("one recovery contract atomically advances long-running validation from PTY observation to browser", () => {
   const targeting = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     expectedTarget: "src/main.js",
@@ -2523,6 +2545,7 @@ test("adaptive delegation exposes spawn only during useful context or diagnosis 
       imageParts: 0,
       mentionedFilePaths: [],
       attachedFilePaths: [],
+      subagentPreference: "unspecified",
     },
     lastAssistantTextForCheckpoint: "",
     latestUserPromptText: "可以开启多个 subagent 协同检查",
@@ -2533,6 +2556,31 @@ test("adaptive delegation exposes spawn only during useful context or diagnosis 
   assert.equal(context.delegationDecision.action, "admit");
   assert.equal(context.delegationDecision.phase, "context");
   assert.equal(context.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
+
+  const sessionPreferred = resolveIterationToolSurface(makeInput({
+    latestUserPromptText: "检查启动和菜单模块",
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "preferred",
+    },
+  }));
+  assert.equal(sessionPreferred.delegationDecision.preference, "preferred");
+  assert.equal(sessionPreferred.delegationDecision.action, "admit");
+  assert.equal(sessionPreferred.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
+
+  const sessionForbidden = resolveIterationToolSurface(makeInput({
+    latestUserPromptText: "检查启动和菜单模块",
+    turnInputContextSignals: {
+      imageParts: 0,
+      mentionedFilePaths: [],
+      attachedFilePaths: [],
+      subagentPreference: "forbidden",
+    },
+  }));
+  assert.equal(sessionForbidden.delegationDecision.reason, "user_forbidden");
+  assert.equal(sessionForbidden.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
 
   const mutation = resolveIterationToolSurface(makeInput({
     recentToolActivity: [

@@ -21,7 +21,7 @@ import type {
   PlanArtifact,
   PlanStage,
 } from "../lib/workflowModels";
-import type { TurnInputContextSignals } from "../lib/turnIntake";
+import type { SubagentDelegationPreference, TurnInputContextSignals } from "../lib/turnIntake";
 import type {
   GoalContinuationAuthorization,
   GoalCreationAuthorization,
@@ -70,7 +70,7 @@ export interface SubmitAsyncWorkflowRunState extends SubmitGameStudioPreparation
     sessionRecordingEnabled?: boolean;
     reasoningDisplay?: string;
   };
-  startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string }) => void;
+  startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => void;
 }
 
 export interface SubmitAsyncWorkflowElapsedTimer {
@@ -288,6 +288,7 @@ export async function runSubmitAsyncWorkflowRun<
     runtimeRunIntent: input.runtimeRunIntent,
     continueExistingGoal: !!input.goalContinuationAuthorization,
     goalCreationAuthorization: input.goalCreationAuthorization,
+    subagentPreference: input.turnInputContextSignals.subagentPreference,
     parentRunIdOverride: input.parentRunIdOverride,
     runIdOverride: input.runIdOverride,
     getRuntimeSnapshot: () => ({
@@ -303,7 +304,7 @@ export async function runSubmitAsyncWorkflowRun<
     setAbortController: (abortController: TAbortController) => {
       input.sessionSet({ abortController });
     },
-    startGoal: (objective: string, goalOptions: { sessionKey: string; sourceContext?: string; ownerTurnId: string }) => {
+    startGoal: (objective: string, goalOptions: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => {
       input.sessionGet().startGoal(objective, goalOptions);
     },
     getCurrentHarnessInstanceId: input.getCurrentHarnessInstanceId,

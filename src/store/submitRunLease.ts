@@ -3,6 +3,7 @@ import type { HarnessRunMarker } from "../lib/harnessCrashTelemetry";
 import type { PlanStage } from "../lib/workflowModels";
 import type { ResolvedRunIntent } from "../lib/runIntent";
 import { resolveSubmitRunLineage } from "../lib/runIdentity";
+import type { SubagentDelegationPreference } from "../lib/turnIntake";
 import {
   buildSubmitHarnessRunMarkerDraft,
   isGoalCreationAuthorization,
@@ -33,6 +34,7 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   continueExistingGoal?: boolean;
   /** Consumed by this lease only; callers cannot infer it from resolvedIntent. */
   goalCreationAuthorization?: GoalCreationAuthorization | null;
+  subagentPreference?: SubagentDelegationPreference;
   /** Exact paused run that an action continuation resumes. */
   parentRunIdOverride?: string;
   /** Preallocated child owner for approval handoffs. */
@@ -41,7 +43,7 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   appendAgentMessage: (message: AgentMessage) => void;
   createAbortController: () => TAbortController;
   setAbortController: (abortController: TAbortController) => void;
-  startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string }) => void;
+  startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => void;
   getCurrentHarnessInstanceId: () => string;
   persistHarnessRunMarker: (marker: HarnessRunMarker) => HarnessRunMarker;
   setHarnessRunMarker: (marker: HarnessRunMarker) => void;
@@ -108,7 +110,14 @@ export function startSubmitRunLease<TAbortController>(
     const canonicalObjective = String(input.canonicalUserText || "").trim() || input.userContent.trim();
     input.startGoal(
       canonicalObjective,
-      { sessionKey: input.runSessionKey, sourceContext: input.goalSourceContext, ownerTurnId: input.turnId },
+      {
+        sessionKey: input.runSessionKey,
+        sourceContext: input.goalSourceContext,
+        ownerTurnId: input.turnId,
+        ...(input.subagentPreference
+          ? { subagentPreference: input.subagentPreference }
+          : {}),
+      },
     );
   }
 

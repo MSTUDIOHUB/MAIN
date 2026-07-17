@@ -549,7 +549,8 @@ test("Goal context promotes an explicit multi-subagent preference without making
 
   assert.match(context, /子智能体协作偏好/);
   assert.match(context, /路径不重叠/);
-  assert.match(context, /最多两个子智能体/);
+  assert.match(context, /存在一个有实质价值的有界只读范围时尽早创建一个/);
+  assert.match(context, /当前容量创建多个/);
   assert.match(context, /不要为凑数/);
 });
 
@@ -952,32 +953,31 @@ test("a paused Goal resumes in place with retained evidence and one-shot user gu
   ));
 });
 
-test("preferred subagent work logs a skipped delegation decision when the model never spawns", async () => {
+test("preferred subagent work persists its structured preference through Goal contracts", async () => {
   const goal = goalState.createGoalDefinition({
     objective: "修复跨模块问题，可以开启多个subagent协同工作",
     iterationBudget: 4,
   });
-  const debugEvents = [];
-  const harness = createEngineCallbacks(async () => ({
-    assistantText: "Implemented and verified. GOAL_COMPLETION_CANDIDATE",
-    toolCalls: [
-      { name: "apply_patch", target: "src/runtime.ts", result: "Done" },
-      { name: "run_command", arguments: { command: "npm run lint" }, result: "0 errors" },
-    ],
-    tokensUsed: 50,
-    completed: true,
-    outcomeStatus: "completed",
-  }));
-  harness.callbacks.onDebugEvent = (event, data) => debugEvents.push({ event, data });
-
+  let observedContract = null;
+  const harness = createEngineCallbacks(async (input) => {
+    observedContract = input.goalTurnContract;
+    return {
+      assistantText: "Implemented and verified. GOAL_COMPLETION_CANDIDATE",
+      toolCalls: [
+        { name: "apply_patch", target: "src/runtime.ts", result: "Done" },
+        { name: "run_command", arguments: { command: "npm run lint" }, result: "0 errors" },
+      ],
+      tokensUsed: 50,
+      completed: true,
+      outcomeStatus: "completed",
+    };
+  });
   const outcome = await goalEngine.executeGoalLoop({ goal, callbacks: harness.callbacks });
 
   assert.equal(outcome.status, "completed");
-  assert.ok(debugEvents.some(({ event, data }) =>
-    event === "delegation_scope_decision"
-    && data?.decision === "skipped"
-    && data?.reason === "preferred_parallelism_not_used_in_first_goal_continuation"
-  ));
+  assert.equal(goal.subagentPreference, "preferred");
+  assert.equal(observedContract.subagentPreference, "preferred");
+  assert.match(observedContract.context, /Spawn one early when one bounded read-only scope is independently valuable/);
 });
 
 test("Goal Engine completes only after a tool-backed mutation and verification slice", async () => {

@@ -86,7 +86,7 @@ import {
   compactGoalAssistantContext,
   extractGoalAssistantSummary,
 } from "./goalContinuity";
-import { resolveSubagentDelegationPreference } from "./turnIntake";
+import { resolveEffectiveSubagentDelegationPreference } from "./turnIntake";
 
 // ── Goal Engine callbacks ────────────────────────────────────────
 
@@ -172,7 +172,10 @@ export async function executeGoalLoop(input: {
   });
   const language = callbacks.getPreferredLanguage();
   const workspacePath = callbacks.getWorkspacePath();
-  const subagentPreference = resolveSubagentDelegationPreference(goal.objective);
+  const subagentPreference = resolveEffectiveSubagentDelegationPreference({
+    rawUserInput: goal.objective,
+    defaultPreference: goal.subagentPreference,
+  });
   const progressFilePath = resolveGoalRuntimeProgressFilePath(workspacePath, goal.id);
 
   // Initialize or restore progress
@@ -544,20 +547,6 @@ export async function executeGoalLoop(input: {
       iteration: iteration.index,
       observations: agentResult.toolCalls,
     });
-    if (
-      iteration.index === 1 &&
-      subagentPreference === "preferred" &&
-      !agentResult.toolCalls.some((call) => call.name === "spawn_subagent")
-    ) {
-      callbacks.onDebugEvent?.("delegation_scope_decision", {
-        decision: "skipped",
-        reason: "preferred_parallelism_not_used_in_first_goal_continuation",
-        preference: subagentPreference,
-        continuationId: goalTurnContract.goalSliceId,
-        observedToolCalls: agentResult.toolCalls.length,
-        observedToolNames: [...new Set(agentResult.toolCalls.map((call) => call.name))].slice(0, 12),
-      });
-    }
     iteration.summary = extractIterationSummary(agentResult.assistantText, language, iterationEvidence);
     if (agentResult.continuation) {
       progress.continuation = agentResult.continuation;

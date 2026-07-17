@@ -140,6 +140,7 @@ import {
 import {
   buildSemanticMetadataContextLines,
   normalizeTurnInputContextSignals,
+  type SubagentDelegationPreference,
   type TurnInputContextSignals,
 } from "../lib/turnIntake";
 import {
@@ -874,6 +875,7 @@ export interface SessionRuntimeSnapshot {
   transcriptTotalTurns?: number;
   autoApproveTools?: boolean;
   autoApproveToolScopes?: SessionAutoApproveScope[];
+  preferSubagents?: boolean;
   webSearchEnabled?: boolean;
   webSearchProvider?: WebSearchProvider;
   approvedShellPermissionRules?: string[];
@@ -899,6 +901,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
   autoApproveTools: boolean;
+  preferSubagents: boolean;
   webSearchEnabled: boolean;
   webSearchProvider: WebSearchProvider;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
@@ -1277,7 +1280,7 @@ export interface AppState {
   goalStatus: GoalStatus;
   goalIterationBudget: number;
   goalRuntime: GoalRuntimeSnapshot | null;
-  startGoal: (objective: string, options?: Partial<GoalBudget> & { sessionKey?: string; sourceContext?: string; ownerTurnId?: string }) => void;
+  startGoal: (objective: string, options?: Partial<GoalBudget> & { sessionKey?: string; sourceContext?: string; ownerTurnId?: string; subagentPreference?: SubagentDelegationPreference }) => void;
   pauseGoal: (expected?: GoalControlIdentity) => void;
   resumeGoal: (expected?: GoalControlIdentity) => void;
   clearGoal: (expected: GoalControlIdentity) => Promise<boolean>;
@@ -1304,6 +1307,7 @@ export interface AppState {
   } | null;
   autoApproveTools: boolean;
   autoApproveToolScopes: SessionAutoApproveScope[];
+  preferSubagents: boolean;
   webSearchEnabled: boolean;
   webSearchProvider: WebSearchProvider;
   currentTurnExecutionConsent: { turnId: string | null; granted: boolean };
@@ -1316,6 +1320,7 @@ export interface AppState {
     | ((choice: "approve_once" | "approve_thread" | "cancel") => void)
     | null;
   setAutoApproveTools: (v: boolean) => void;
+  setPreferSubagents: (v: boolean) => void;
   setWebSearchEnabled: (v: boolean) => void;
   setWebSearchProvider: (provider: WebSearchProvider) => void;
   setReadOnlyAutoApproveForSession: (v: boolean) => void;
@@ -2324,6 +2329,7 @@ export function normalizeSessionRuntimeSnapshot(
     transcriptTotalTurns: Math.max(0, Number(snapshot.transcriptTotalTurns) || 0),
     autoApproveTools: effectiveAutoApproveToolScopes.length > 0,
     autoApproveToolScopes: effectiveAutoApproveToolScopes,
+    preferSubagents: snapshot.preferSubagents === true,
     webSearchEnabled: snapshot.webSearchEnabled === true,
     webSearchProvider: normalizeWebSearchProvider(snapshot.webSearchProvider),
     approvedShellPermissionRules: Array.isArray(snapshot.approvedShellPermissionRules)
@@ -2463,6 +2469,7 @@ const sessionRuntimeKeys = [
   "pendingRunDecisionResolver",
   "autoApproveTools",
   "autoApproveToolScopes",
+  "preferSubagents",
   "webSearchEnabled",
   "webSearchProvider",
   "currentTurnExecutionConsent",
@@ -2678,6 +2685,7 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     pendingRunDecisionResolver: state.pendingRunDecisionResolver ?? null,
     autoApproveTools: normalizedAutoApproveToolScopes.length > 0,
     autoApproveToolScopes: normalizedAutoApproveToolScopes,
+    preferSubagents: state.preferSubagents === true,
     webSearchEnabled: state.webSearchEnabled === true,
     webSearchProvider: normalizeWebSearchProvider(state.webSearchProvider),
     currentTurnExecutionConsent: state.currentTurnExecutionConsent || { turnId: null, granted: false },
@@ -3258,6 +3266,7 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
     selectedDiffTaskId: state.selectedDiffTaskId ?? null,
     autoApproveTools: state.autoApproveTools === true,
     autoApproveToolScopes: state.autoApproveToolScopes || [],
+    preferSubagents: state.preferSubagents === true,
     webSearchEnabled: state.webSearchEnabled === true,
     webSearchProvider: normalizeWebSearchProvider(state.webSearchProvider),
     approvedShellPermissionRules: Array.isArray(state.approvedShellPermissionRules)
@@ -3313,6 +3322,7 @@ function buildEmptySessionRuntimeSnapshot(state: any, affinity: SessionModeAffin
       selectedDiffTaskId: null,
       autoApproveTools: false,
       autoApproveToolScopes: [],
+      preferSubagents: false,
       webSearchEnabled: false,
       webSearchProvider: "duckduckgo",
       approvedShellPermissionRules: [],
@@ -4643,6 +4653,7 @@ export const useAppStore = create<AppState>()(
       currentTurnExecutionConsent: { turnId: null, granted: false },
       autoApproveTools: false,
       autoApproveToolScopes: [],
+      preferSubagents: false,
       webSearchEnabled: false,
       webSearchProvider: "duckduckgo",
       approvedLocalFileReadPaths: [],
@@ -5763,6 +5774,7 @@ export const useAppStore = create<AppState>()(
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        preferSubagents: false,
         webSearchEnabled: false,
         webSearchProvider: "duckduckgo",
         approvedLocalFileReadPaths: [],
@@ -5801,6 +5813,7 @@ export const useAppStore = create<AppState>()(
         sessionHookCache: [],
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        preferSubagents: false,
         webSearchEnabled: false,
         webSearchProvider: "duckduckgo",
         approvedLocalFileReadPaths: [],
@@ -5895,6 +5908,7 @@ export const useAppStore = create<AppState>()(
           ? {
               autoApproveTools: false,
               autoApproveToolScopes: [],
+              preferSubagents: false,
               webSearchEnabled: false,
               webSearchProvider: "duckduckgo",
               approvedLocalFileReadPaths: [],
@@ -5945,6 +5959,7 @@ export const useAppStore = create<AppState>()(
         [resolveSessionWorkspaceKey(s.currentWorkspace)]: id,
       },
       ...(s.currentSessionId !== id ? { autoApproveTools: false, autoApproveToolScopes: [] } : {}),
+      ...(s.currentSessionId !== id ? { preferSubagents: false } : {}),
       ...(s.currentSessionId !== id ? { webSearchEnabled: false, webSearchProvider: "duckduckgo" } : {}),
       ...(s.currentSessionId !== id ? { readOnlyAutoApproveForSession: false } : {}),
       ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
@@ -6138,6 +6153,7 @@ export const useAppStore = create<AppState>()(
         currentTurnExecutionConsent: { turnId: null, granted: false },
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        preferSubagents: false,
         webSearchEnabled: false,
         webSearchProvider: "duckduckgo",
         approvedLocalFileReadPaths: [],
@@ -6209,6 +6225,7 @@ export const useAppStore = create<AppState>()(
       currentTurnExecutionConsent: { turnId: null, granted: false },
       autoApproveTools: false,
       autoApproveToolScopes: [],
+      preferSubagents: false,
       webSearchEnabled: false,
       webSearchProvider: "duckduckgo",
       approvedLocalFileReadPaths: [],
@@ -6914,6 +6931,7 @@ export const useAppStore = create<AppState>()(
     const newGoal = createGoalDefinition({
       objective,
       sourceContext: options?.sourceContext,
+      subagentPreference: options?.subagentPreference,
       iterationBudget: options?.maxIterations,
       tokenBudget: options?.maxTokens,
       toolCallBudget: options?.maxToolCalls,
@@ -7934,6 +7952,7 @@ export const useAppStore = create<AppState>()(
   pendingToolCall: null,
   autoApproveTools: false,
   autoApproveToolScopes: [],
+  preferSubagents: false,
   webSearchEnabled: false,
   webSearchProvider: "duckduckgo",
   approvedLocalFileReadPaths: [],
@@ -7970,6 +7989,18 @@ export const useAppStore = create<AppState>()(
         }
       });
     }
+  },
+  setPreferSubagents: (v) => {
+    const state = get();
+    if (state.isGenerating || state.agentStatus === "running") {
+      logStoreEvent("subagent_preference_toggle_blocked", {
+        agentStatus: state.agentStatus,
+        isGenerating: state.isGenerating,
+      });
+      return;
+    }
+    set({ preferSubagents: v });
+    logStoreEvent("subagent_preference_toggled", { enabled: v });
   },
   setWebSearchEnabled: (v) => set({ webSearchEnabled: v }),
   setWebSearchProvider: (provider) => set({ webSearchProvider: normalizeWebSearchProvider(provider) }),
@@ -8356,6 +8387,7 @@ export const useAppStore = create<AppState>()(
       pendingFeishuApprovals: [],
       autoApproveTools: false,
       autoApproveToolScopes: [],
+      preferSubagents: false,
       webSearchEnabled: false,
       webSearchProvider: "duckduckgo",
       approvedLocalFileReadPaths: [],
@@ -8873,6 +8905,7 @@ export const useAppStore = create<AppState>()(
       contextMentions: mentionSnapshot.length,
       attachedFiles: attachedFilesSnapshot.length,
       images: images?.length ?? 0,
+      preferSubagents: state.preferSubagents,
       mainDebugShortcut: !!mainDebugShortcut,
     });
     const isLocalStudioCommand =
@@ -9070,6 +9103,7 @@ export const useAppStore = create<AppState>()(
       attachedFilesSnapshot,
       runWorkspace,
       preferredLanguage,
+      preferSubagents: state.preferSubagents,
       effectiveRunIntent,
       isMainDebugShortcut: !!mainDebugShortcut,
       reuseCurrentTurn,
@@ -9613,6 +9647,7 @@ export const useAppStore = create<AppState>()(
         pendingToolCall: null,
         autoApproveTools: false,
         autoApproveToolScopes: [],
+        preferSubagents: normalizedHydratedRuntime?.preferSubagents === true,
         webSearchEnabled: hasHydratedCurrentSession ? persistedState.webSearchEnabled === true : false,
         webSearchProvider: hasHydratedCurrentSession
           ? normalizeWebSearchProvider(persistedState.webSearchProvider)
