@@ -28,7 +28,6 @@ export default function PlanReviewCapsule({
     : isBlack
     ? "border-[#202026] bg-[#030304]"
     : "border-[#27272a] bg-[#09090b]";
-  const titleTone = isLight ? "text-[#18181b]" : "text-[#f4f4f5]";
   const secondaryTone = isLight ? "text-[#64748b]" : "text-[#a1a1aa]";
 
   return (
@@ -41,51 +40,49 @@ export default function PlanReviewCapsule({
       data-request-id={request.requestId}
       data-plan-revision={String(request.planRevision)}
       data-artifact-hash={request.artifactHash}
-      className={`w-full rounded-xl border p-3 ${surface}`}
+      className={`w-full rounded-xl border p-4 ${surface}`}
     >
-      <div className="flex min-w-0 items-start gap-3">
-        <span className="theme-plan-pill mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border">
-          <IconFileText className="h-4 w-4" />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className={`min-w-0 truncate text-[12px] font-semibold ${titleTone}`} title={request.title}>
-              {request.title}
-            </span>
-            <span className="theme-plan-pill shrink-0 rounded-full border px-2 py-0.5 text-[10px]">
+      <div className="flex min-w-0 flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex min-w-0 items-start gap-3">
+          <span className="theme-plan-pill flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border">
+            <IconFileText className="h-[18px] w-[18px]" />
+          </span>
+          <div className="min-w-0 flex-1 pt-0.5">
+            <span className="theme-plan-pill inline-flex rounded-full border px-2.5 py-1 text-[11px] font-medium leading-none">
               {language === "zh" ? `计划待审核 · 修订 ${request.planRevision}` : `Plan review · revision ${request.planRevision}`}
             </span>
-          </div>
-          <div className={`mt-1 text-[11px] leading-5 ${secondaryTone}`}>
-            {language === "zh"
-              ? "请审阅当前计划产物；批准后会在同一回合创建新的执行 run。"
-              : "Review the current Plan artifact. Approval starts a new execution run in the same turn."}
+            <p className={`mt-2 text-left text-[12px] leading-5 ${secondaryTone}`}>
+              {language === "zh"
+                ? "请审阅当前计划；批准后将立即创建新的执行任务。"
+                : "Review the current plan. Approval immediately starts a new execution run."}
+            </p>
           </div>
         </div>
-      </div>
-
-      <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
-        <button
-          type="button"
-          data-testid="plan-review-capsule-open"
-          onClick={onOpenPlan}
-          className={`rounded-lg border px-3 py-2 text-[11px] font-semibold transition-colors ${
-            isLight
-              ? "border-[#d4d4d8] bg-white text-[#334155] hover:border-[var(--accent)] hover:text-[#111827]"
-              : "border-[#3f3f46] bg-[#09090b] text-[#d4d4d8] hover:border-[var(--accent)] hover:bg-[#18181b] hover:text-white"
-          }`}
-        >
-          {language === "zh" ? "审阅计划" : "Review Plan"}
-        </button>
-        <button
-          type="button"
-          data-testid="plan-review-capsule-approve"
-          onClick={onApprove}
-          className="theme-plan-primary inline-flex items-center gap-1.5 rounded-lg px-3 py-2 text-[11px] font-semibold"
-        >
-          <IconCheck className="h-3.5 w-3.5" />
-          {language === "zh" ? "批准执行" : "Approve & Execute"}
-        </button>
+        <div className="flex w-full shrink-0 items-center gap-2 sm:w-auto sm:justify-end">
+          <button
+            type="button"
+            data-testid="plan-review-capsule-open"
+            onClick={onOpenPlan}
+            className={`inline-flex h-10 flex-1 items-center justify-center whitespace-nowrap rounded-lg border px-4 text-[12px] font-semibold transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 sm:flex-none ${
+              isLight
+                ? "border-[#d4d4d8] bg-white text-[#334155] hover:border-[var(--accent)] hover:text-[#111827] focus-visible:ring-offset-white"
+                : "border-[#3f3f46] bg-[#09090b] text-[#d4d4d8] hover:border-[var(--accent)] hover:bg-[#18181b] hover:text-white focus-visible:ring-offset-[#09090b]"
+            }`}
+          >
+            {language === "zh" ? "审阅计划" : "Review Plan"}
+          </button>
+          <button
+            type="button"
+            data-testid="plan-review-capsule-approve"
+            onClick={onApprove}
+            className={`theme-plan-primary inline-flex h-10 flex-1 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg px-4 text-[12px] font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--accent)] focus-visible:ring-offset-2 sm:flex-none ${
+              isLight ? "focus-visible:ring-offset-white" : "focus-visible:ring-offset-[#09090b]"
+            }`}
+          >
+            <IconCheck className="h-4 w-4" />
+            {language === "zh" ? "批准执行" : "Approve & Execute"}
+          </button>
+        </div>
       </div>
     </div>
   );

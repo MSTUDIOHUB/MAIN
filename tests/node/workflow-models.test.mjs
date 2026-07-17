@@ -826,7 +826,7 @@ test("only explicit executor failures qualify for the durable evidence ledger", 
   assert.equal(shouldRecordPlanExecutionFailure({ failureKind: "actual" }), true);
 });
 
-test("focused validation evidence cannot hide an unresolved command failure behind an unrelated pass", () => {
+test("exact command evidence cannot hide an unresolved failure behind an unrelated pass", () => {
   const failedBuild = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
     target: "npm run build",
@@ -843,10 +843,10 @@ test("focused validation evidence cannot hide an unresolved command failure behi
     result: JSON.stringify({ exitCode: 0, stdout: "built" }),
   });
   const task = {
-    id: "focused-validation",
-    text: "Run focused validation",
+    id: "build-validation",
+    text: "Run npm build",
     status: "pending",
-    evidence: [{ kind: "cmd", value: "focused validation command" }],
+    evidence: [{ kind: "cmd", value: "npm run build" }],
   };
   const unresolvedLedger = appendPlanEvidenceEntry(
     appendPlanEvidenceEntry([], failedBuild),
@@ -1142,7 +1142,7 @@ test("runtime plan task derivation inherits implementation context for nested fi
   );
   assert.equal(
     tasks.some((task) => task.evidence?.some((evidence) => evidence.kind === "cmd")),
-    true,
+    false,
     JSON.stringify(tasks),
   );
 });
@@ -1184,7 +1184,7 @@ test("runtime plan task derivation does not promote integration validation refer
   );
   assert.equal(
     tasks.some((task) => /集成验证/.test(task.text) && task.evidence?.some((evidence) => evidence.kind === "cmd")),
-    true,
+    false,
   );
 });
 
@@ -1215,7 +1215,7 @@ test("runtime plan task derivation turns outcome bullets under validation headin
   );
   assert.equal(
     tasks.some((task) => /验证：修改后/.test(task.text) && task.evidence?.some((evidence) => evidence.kind === "cmd")),
-    true,
+    false,
     JSON.stringify(tasks),
   );
 });
@@ -1273,7 +1273,11 @@ test("runtime plan projection does not promote unchanged headings or output file
     .flatMap((task) => task.evidence || [])
     .filter((evidence) => evidence.kind === "file")
     .map((evidence) => evidence.value);
-  assert.deepEqual(mutationFiles, ["src/main.js"], JSON.stringify(tasks));
+  assert.deepEqual(mutationFiles, ["src/main.js", "src/main.js"], JSON.stringify(tasks));
+  assert.equal(
+    new Set(tasks.filter((task) => task.executionKind === "mutation").map((task) => task.id)).size,
+    2,
+  );
   assert.equal(mutationFiles.includes("src/components/toolbar.js"), false);
   assert.equal(mutationFiles.includes("document.md"), false);
 });
@@ -1461,9 +1465,7 @@ test("interactive control outcomes use browser evidence instead of a synthetic c
   for (const task of tasks) {
     assert.equal(task.evidence?.some((item) => item.kind === "browser_dom"), true, JSON.stringify(task));
     assert.equal(task.evidence?.some((item) => item.requiresInteraction === true), true, JSON.stringify(task));
-    assert.equal(task.evidence?.some((item) =>
-      item.kind === "cmd" && item.value === "focused validation command"
-    ), false, JSON.stringify(task));
+    assert.equal(task.evidence?.some((item) => item.kind === "cmd"), false, JSON.stringify(task));
   }
 });
 
@@ -1478,9 +1480,7 @@ test("named UI actions with observable post-state infer browser interaction with
     const browser = evidence.find((item) => item.kind === "browser_dom");
     assert.ok(browser, `${index}:${JSON.stringify(evidence)}`);
     assert.equal(browser.requiresInteraction, true, `${index}:${JSON.stringify(evidence)}`);
-    assert.equal(evidence.some((item) =>
-      item.kind === "cmd" && item.value === "focused validation command"
-    ), false, `${index}:${JSON.stringify(evidence)}`);
+    assert.equal(evidence.some((item) => item.kind === "cmd"), false, `${index}:${JSON.stringify(evidence)}`);
   }
 });
 
@@ -1509,9 +1509,7 @@ test("runtime Plan projection preserves a selector-free click and state assertio
   assert.equal(clickTask.evidence?.some((item) =>
     item.kind === "browser_dom" && item.requiresInteraction === true
   ), true, JSON.stringify(clickTask));
-  assert.equal(clickTask.evidence?.some((item) =>
-    item.kind === "cmd" && item.value === "focused validation command"
-  ), false, JSON.stringify(clickTask));
+  assert.equal(clickTask.evidence?.some((item) => item.kind === "cmd"), false, JSON.stringify(clickTask));
 });
 
 test("explicit user-owned and native-dialog interactions remain external review", () => {
@@ -1534,7 +1532,7 @@ test("terminal keypress assertions do not become browser interactions", () => {
   );
 
   assert.equal(evidence.some((item) => item.kind === "browser_dom"), false);
-  assert.equal(evidence.some((item) => item.kind === "cmd"), true);
+  assert.equal(evidence.some((item) => item.kind === "cmd"), false);
 });
 
 test("explicit DOM selectors infer browser evidence in both languages", () => {
@@ -1547,9 +1545,7 @@ test("explicit DOM selectors infer browser evidence in both languages", () => {
 
   for (const [index, evidence] of assertions.entries()) {
     assert.equal(evidence.some((item) => item.kind === "browser_dom"), true, `${index}:${JSON.stringify(evidence)}`);
-    assert.equal(evidence.some((item) =>
-      item.kind === "cmd" && item.value === "focused validation command"
-    ), false, `${index}:${JSON.stringify(evidence)}`);
+    assert.equal(evidence.some((item) => item.kind === "cmd"), false, `${index}:${JSON.stringify(evidence)}`);
   }
   assert.match(assertions[0][0]?.value || "", /#status/);
   assert.match(assertions[1][0]?.value || "", /#status/);
@@ -1638,7 +1634,7 @@ test("runtime task derivation keeps diagnosis and impact facts out of the approv
   )));
   assert.deepEqual(fileTargets, ["src/hooks/useCsvParser.ts"]);
   assert.equal(tasks.some((task) => /Store 配置/.test(task.text)), false);
-  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd")), true);
+  assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "cmd")), false);
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "browser_dom")), true);
 
   const mutation = createPlanExecutionEvidenceEntry({
@@ -2028,15 +2024,19 @@ test("runtime plan task derivation parses change headings and keeps validation c
     },
   ], { language: "zh", maxTasks: 8 });
 
-  const rustTask = tasks.find((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src-tauri/src/main.rs"));
-  const jsTask = tasks.find((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/main.js"));
+  const rustTasks = tasks.filter((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src-tauri/src/main.rs"));
+  const jsTasks = tasks.filter((task) => task.evidence?.some((item) => item.kind === "file" && item.value === "src/main.js"));
   const commandTask = tasks.find((task) => task.evidence?.some((item) => item.kind === "cmd" && item.value === "npm run tauri dev"));
 
-  assert.ok(rustTask);
-  assert.ok(jsTask);
+  assert.equal(rustTasks.length, 2, JSON.stringify(tasks, null, 2));
+  assert.equal(jsTasks.length, 2, JSON.stringify(tasks, null, 2));
+  assert.equal(new Set(rustTasks.map((task) => task.id)).size, 2);
+  assert.equal(new Set(jsTasks.map((task) => task.id)).size, 2);
   assert.ok(commandTask);
-  assert.match(rustTask.text, /移除.*cfg_attr.*新增命令/u);
-  assert.match(jsTask.text, /替换旧的.*改用后端命令/u);
+  assert.equal(rustTasks.some((task) => /移除.*cfg_attr/u.test(task.text)), true);
+  assert.equal(rustTasks.some((task) => /新增命令/u.test(task.text)), true);
+  assert.equal(jsTasks.some((task) => /替换旧的/u.test(task.text)), true);
+  assert.equal(jsTasks.some((task) => /改用后端命令/u.test(task.text)), true);
   assert.equal(tasks.some((task) => /依据|read-only\.rs/.test(task.text)), false);
   assert.deepEqual(
     tasks
@@ -2044,12 +2044,58 @@ test("runtime plan task derivation parses change headings and keeps validation c
       .filter((item) => item.kind === "file")
       .map((item) => item.value)
       .sort(),
-    ["src-tauri/src/main.rs", "src/main.js"].sort(),
+    [
+      "src-tauri/src/main.rs",
+      "src-tauri/src/main.rs",
+      "src/main.js",
+      "src/main.js",
+    ].sort(),
   );
-  assert.equal(tasks.length, 3, JSON.stringify(tasks, null, 2));
+  assert.equal(tasks.length, 5, JSON.stringify(tasks, null, 2));
 });
 
-test("explicit build commands outrank browser keyword heuristics", () => {
+test("runtime prose projection keeps distinct same-file mutation obligations", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# Proposed Plan",
+      "",
+      "## 关键实现改动",
+      "### 文件：`src/main.js`",
+      "- 修改 `initToolbar`，绑定新的按钮 ID。",
+      "- 修改 `openFile`，保留选择后的文件路径。",
+      "",
+      "## 验证方案",
+      "- 运行 `npm run build`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutations = tasks.filter((task) =>
+    task.executionKind === "mutation" &&
+    task.evidence?.some((item) => item.kind === "file" && item.value === "src/main.js")
+  );
+  assert.equal(mutations.length, 2, JSON.stringify(tasks, null, 2));
+  assert.equal(new Set(mutations.map((task) => task.id)).size, 2);
+  assert.equal(mutations.some((task) => /initToolbar/.test(task.text)), true);
+  assert.equal(mutations.some((task) => /openFile/.test(task.text)), true);
+
+  const mutationEvidence = createPlanExecutionEvidenceEntry({
+    toolName: "apply_patch",
+    target: "src/main.js",
+    result: "patched initToolbar",
+    diff: { old: "old", new: "new", path: "src/main.js" },
+    planTaskId: mutations[0].id,
+    requirementRef: mutations[0].id,
+  });
+  const reconciled = reconcilePlanTaskCompletion([], mutations, [mutationEvidence]);
+  assert.equal(reconciled.filter((task) => task.status === "completed").length, 1);
+  assert.equal(reconciled.filter((task) => task.status !== "completed").length, 1);
+});
+
+test("only explicit build commands become command evidence", () => {
   const explicit = inferPlanTaskEvidence(
     "运行 `npm run build` 并检查退出码与输出。",
     ["npm run build"],
@@ -2058,7 +2104,7 @@ test("explicit build commands outrank browser keyword heuristics", () => {
 
   assert.deepEqual(explicit, [{ kind: "cmd", value: "npm run build", inferred: true }]);
   assert.equal(inferred.some((evidence) => evidence.kind === "browser_dom"), false);
-  assert.equal(inferred.some((evidence) => evidence.kind === "cmd"), true);
+  assert.equal(inferred.some((evidence) => evidence.kind === "cmd"), false);
 });
 
 test("runtime plan projection does not duplicate an explicit build validation as browser work", () => {
@@ -3363,7 +3409,7 @@ test("negated validation alternatives are not materialized as shell commands", (
   assert.equal(tasks.some((task) => task.evidence?.some((item) => item.kind === "tauri_required")), true);
 });
 
-test("focused test or build alternatives accept fresh command evidence without becoming Tauri-only", () => {
+test("test or build alternatives without a concrete command do not create command evidence", () => {
   const parsed = extractPlanTasks("- [x] 运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。");
   const commandEvidence = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
@@ -3372,10 +3418,10 @@ test("focused test or build alternatives accept fresh command evidence without b
   });
   const reconciled = reconcilePlanTaskCompletion([], parsed, commandEvidence ? [commandEvidence] : []);
 
-  assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
-  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
-  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
-  assert.equal(isPlanTaskAwaitingExternalValidation(reconciled[0]), false);
+  assert.equal(parsed[0].evidence?.some((item) => item.kind === "cmd"), false);
+  assert.equal(parsed[0].evidence?.some((item) => item.kind === "tauri_required"), true);
+  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), false);
+  assert.equal(isPlanTaskAwaitingExternalValidation(reconciled[0]), true);
 });
 
 test("bounded inline runtime assertions count as finite Plan validation", () => {
@@ -3391,22 +3437,24 @@ test("bounded inline runtime assertions count as finite Plan validation", () => 
   assert.equal(isFinitePlanValidationCommand("npm run dev"), false);
   assert.equal(isFinitePlanValidationCommand("node src/server.js"), false);
 
-  const parsed = extractPlanTasks(
-    "- [ ] 逻辑验证：确认 normalizeCsvOrder 返回正确的 creatorName。",
-  );
   const command = "node -e \"if (!'creatorName') process.exit(1)\"";
+  const parsed = extractPlanTasks(
+    `- [ ] 逻辑验证：运行 \`${command}\`。`,
+  );
+  const plannedCommand = parsed[0].evidence?.[0]?.value || "";
   const commandEvidence = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
-    target: command,
+    target: plannedCommand,
     result: JSON.stringify({ exitCode: 0, stdout: "inline assertion passed" }),
   });
   const reconciled = reconcilePlanTaskCompletion([], parsed, commandEvidence ? [commandEvidence] : []);
 
-  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
+  assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
+  assert.match(plannedCommand, /^node -e /);
   assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
 });
 
-test("test build or manual alternatives stay automatable when command validation is available", () => {
+test("test build or manual alternatives do not accept an unplanned command", () => {
   const parsed = extractPlanTasks("- [x] 运行与受影响范围匹配的测试、构建或人工检查，并记录结果后才视为执行完成。");
   const commandEvidence = createPlanExecutionEvidenceEntry({
     toolName: "run_command",
@@ -3415,26 +3463,22 @@ test("test build or manual alternatives stay automatable when command validation
   });
   const reconciled = reconcilePlanTaskCompletion([], parsed, commandEvidence ? [commandEvidence] : []);
 
-  assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
-  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
-  assert.equal(isPlanTaskTrustedComplete(reconciled[0]), true);
+  assert.equal(parsed.some((task) => task.evidence?.some((item) => item.kind === "cmd")), false);
+  assert.equal(reconciled.some(isPlanTaskTrustedComplete), false);
 });
 
-test("a semantic confirmation step stays automatable unless it explicitly requires a human", () => {
+test("semantic confirmation prose is not executable and explicit manual review stays advisory", () => {
   const parsed = extractPlanTasks(
     "- [ ] 代码审查：确认 normalizeCsvOrder 返回对象包含正确的 creatorName。",
   );
 
-  assert.equal(parsed[0].evidence?.[0]?.kind, "cmd");
-  assert.equal(parsed[0].evidence?.[0]?.value, "focused validation command");
-  assert.equal(isPlanTaskAwaitingExternalValidation(parsed[0]), false);
+  assert.equal(parsed.some((task) => task.evidence?.some((item) => item.kind === "cmd")), false);
 
   const technicallyAutomatableManualLabel = extractPlanTasks(
     "- [ ] 手动验证：`normalizeCsvOrder({ creator: 'alice' })` 返回 `{ creatorName: 'alice' }`。",
   );
-  assert.equal(technicallyAutomatableManualLabel[0].evidence?.[0]?.kind, "cmd");
-  assert.equal(technicallyAutomatableManualLabel[0].evidence?.[0]?.value, "focused validation command");
-  assert.equal(isPlanTaskAwaitingExternalValidation(technicallyAutomatableManualLabel[0]), false);
+  assert.equal(technicallyAutomatableManualLabel[0].evidence?.[0]?.kind, "manual_user_validation");
+  assert.equal(isPlanTaskAwaitingExternalValidation(technicallyAutomatableManualLabel[0]), true);
 
   const manual = extractPlanTasks(
     "- [ ] 用户手动确认结果正确。",

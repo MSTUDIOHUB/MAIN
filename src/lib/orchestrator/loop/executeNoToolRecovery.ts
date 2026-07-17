@@ -51,6 +51,8 @@ export function handleExecuteNoToolRecovery(input: {
     | "required_tool_call_missing"
     | "required_function_call_mismatch"
     | "required_tool_call_not_available";
+  /** Active evidence recovery only needs transport correction here. */
+  protocolViolationOnly?: boolean;
   assistantMsgId: string;
   consecutiveNoToolCount: number;
 }): ExecuteNoToolRecoveryResult {
@@ -142,6 +144,8 @@ export function handleExecuteNoToolRecovery(input: {
     });
     return finish("continue");
   }
+  if (input.protocolViolationOnly) return finish("none");
+
   const shouldRecoverExecuteXmlText =
     shouldRecoverExecuteXmlTextWithoutAction({
       workflowMode,

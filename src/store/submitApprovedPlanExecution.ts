@@ -3,6 +3,7 @@ import { getReviewablePlanArtifacts } from "../lib/planApprovalIdentity";
 import {
   deriveRuntimePlanTasksFromArtifacts,
   getPendingPlanTaskCommandFocus,
+  isFinitePlanValidationCommand,
   isLikelySourceMutationTask,
   isRuntimeTaskMutationSectionHeading,
   isPlanTaskSourceMutationObligation,
@@ -11,6 +12,7 @@ import {
   mergeUserRequestValidationIntoRuntimeTasks,
   normalizeRuntimePlanSectionHeadings,
   reconcilePlanTaskCompletion,
+  requiresPtyObservationForPlanCommand,
   validateActionablePlanArtifact,
   validatePlanArtifactContent,
   type ConversationTurn,
@@ -129,16 +131,20 @@ function isExecutableValidationTask(task: PlanTask): boolean {
   if (evidence.some((item) =>
     item.kind === "browser_dom" ||
     item.kind === "browser_screenshot" ||
-    item.kind === "dev_server_url" ||
-    item.kind === "tauri_required" ||
-    item.kind === "manual_user_validation"
+    item.kind === "dev_server_url"
   )) {
     return true;
   }
   const commands = [
     ...(task.commands || []),
     ...evidence.filter((item) => item.kind === "cmd").map((item) => item.value),
-  ].filter((value) => String(value || "").trim());
+  ].filter((value) => {
+    const command = String(value || "").trim();
+    return command && (
+      isFinitePlanValidationCommand(command) ||
+      requiresPtyObservationForPlanCommand(command)
+    );
+  });
   return commands.length > 0 && (
     VALIDATION_TASK_TEXT_RE.test(task.text) ||
     commands.some((command) => VALIDATION_COMMAND_RE.test(command))
@@ -334,7 +340,7 @@ export function ensureApprovedPlanRuntimeTasksForState(
       mergeUserRequestValidationIntoRuntimeTasks(
         withDurableValidation,
         currentPlanTurn?.userPrompt || "",
-        { language, maxTasks: 4 },
+        { language },
       ),
       state.planExecutionEvidenceLedger,
       state.isPlanApproved && state.planExecutionEvidenceLedger.length > 0,
@@ -349,7 +355,6 @@ export function ensureApprovedPlanRuntimeTasksForState(
     if (!hasPersistedTasksArtifact) {
       const derivedRuntimeTasks = deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
         language,
-        maxTasks: 8,
       });
       if (derivedRuntimeTasks.length > 0) {
         return withUserRequestValidation(reconcilePlanTaskCompletion(
@@ -370,7 +375,6 @@ export function ensureApprovedPlanRuntimeTasksForState(
   }
   return withUserRequestValidation(deriveRuntimePlanTasksFromArtifacts(state.planArtifacts, {
     language,
-    maxTasks: 8,
   }));
 }
 

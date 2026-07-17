@@ -60,10 +60,13 @@ import type { ResolvedUserIntent } from "../../runIntent";
 import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../runtimeTools";
 import { shouldBlockToolCallForTargeting, type TaskTargetingProfile } from "../../taskTargeting";
 import { isLocalFileReadApproved, type ToolCapabilityRegistry, type ToolPermissionPolicy } from "../../toolCapabilities";
+import {
+  looksDangerousShellCommand,
+  looksLongRunningShellCommand,
+} from "../../toolExecutionContract";
 import type { MainThreadEventInput, MainThreadItem } from "../../turnEvents";
 import {
   isFinitePlanValidationCommand,
-  isFlexiblePlanValidationCommandEvidence,
   type PlanRuntimePhase,
 } from "../../workflowModels";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
@@ -134,10 +137,25 @@ function recoveryContractAuthorizesApprovedPlanCommand(input: {
   plannedCommands: string[];
   contract: RecoveryActionContract;
 }): boolean {
+  if (
+    input.toolName === "execute_command" &&
+    (
+      input.contract.nextRequiredCapability === "launch_long_process" ||
+      input.contract.nextRequiredCapability === "recover_process"
+    )
+  ) {
+    const command = input.command.trim();
+    const reviewedLongProcess = input.plannedCommands.some(looksLongRunningShellCommand);
+    const isSingleProcessCommand = !/(?:\r?\n|&&|\|\||[;&|<>`]|\$\()/u.test(command);
+    return !reviewedLongProcess &&
+      isSingleProcessCommand &&
+      !looksDangerousShellCommand(command) &&
+      looksLongRunningShellCommand(command);
+  }
   if (input.toolName !== "run_command") return false;
   if (
     input.contract.nextRequiredCapability === "validation" &&
-    input.plannedCommands.every(isFlexiblePlanValidationCommandEvidence)
+    input.plannedCommands.length === 0
   ) {
     return isFinitePlanValidationCommand(input.command);
   }

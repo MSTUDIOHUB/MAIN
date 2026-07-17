@@ -293,6 +293,38 @@ test("approved plan execution normalizes existing runtime tasks without requirin
   assert.equal(statuses.length, 1);
 });
 
+test("approval task projection does not truncate reviewed changes at eight tasks", () => {
+  const changeLines = Array.from({ length: 10 }, (_, index) =>
+    `- 修改 \`src/features/change-${index + 1}.ts\`，实现第 ${index + 1} 个已审查改动。`
+  );
+  const artifact = reviewablePlanArtifact([
+    "# Multi-file execution plan",
+    "",
+    "## Summary",
+    "- Apply every reviewed feature change.",
+    "",
+    "## Confirmed Evidence",
+    "- The listed source files are the approved mutation scope.",
+    "",
+    "## Key Changes",
+    ...changeLines,
+    "",
+    "## Test Plan",
+    "- Run `npm test`.",
+  ].join("\n"));
+
+  const tasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    isPlanApproved: false,
+  }), "en");
+  const mutationTasks = tasks.filter((entry) => entry.executionKind === "mutation");
+
+  assert.equal(mutationTasks.length, 10, JSON.stringify(tasks, null, 2));
+  assert.equal(tasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "cmd" && evidence.value === "npm test")
+  ), true);
+});
+
 test("approval readiness rejects the logged MD Viewer plan before deriving a child execution run", () => {
   const artifact = reviewablePlanArtifact(loggedNonExecutableMdViewerPlan());
   const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
@@ -388,7 +420,7 @@ test("approval readiness preserves a nested mutation under a themed diagnosis pl
   );
 });
 
-test("approval readiness projects the recovered Qwen plan into mutation and executable validation roles", () => {
+test("approval readiness rejects a recovered Plan whose validation prose has no executable contract", () => {
   const artifact = reviewablePlanArtifact(realQwenCsvRecoveryPlan());
   const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
     planArtifacts: [artifact],
@@ -400,17 +432,17 @@ test("approval readiness projects the recovered Qwen plan into mutation and exec
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.reason, "executable_validation_task_missing");
   assert.equal(readiness.concreteMutationTaskCount, 1);
-  assert.ok(readiness.executableValidationTaskCount >= 1);
+  assert.equal(readiness.executableValidationTaskCount, 0);
   assert.ok(executionPlanTasks.some((task) =>
     task.executionKind === "mutation" &&
     task.evidence?.some((entry) => entry.kind === "file" && entry.value === "src/hooks/useCsvParser.ts")
   ), JSON.stringify(executionPlanTasks));
-  assert.ok(executionPlanTasks.some((task) =>
-    task.executionKind === "validation" &&
-    task.evidence?.some((entry) => entry.kind === "browser_dom" || entry.kind === "cmd")
-  ), JSON.stringify(executionPlanTasks));
+  assert.equal(executionPlanTasks.some((task) =>
+    task.evidence?.some((entry) => entry.kind === "cmd")
+  ), false, JSON.stringify(executionPlanTasks));
   assert.equal(executionPlanTasks.some((task) =>
     task.executionKind === "observation" &&
     task.evidence?.some((entry) => entry.value === "cn_tutorial_orders_by_creator_20260512.csv")
@@ -580,7 +612,7 @@ test("approval readiness accepts a semantically valid mutation plan with concret
   assert.ok(readiness.executableValidationTaskCount >= 1);
 });
 
-test("approval readiness materializes semantic validation outcomes without requiring a model-authored command", () => {
+test("approval readiness does not materialize semantic prose as a shell command", () => {
   const artifact = reviewablePlanArtifact([
     "# 修复 CSV 字段映射",
     "",
@@ -603,16 +635,15 @@ test("approval readiness materializes semantic validation outcomes without requi
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
-  assert.ok(executionPlanTasks.some((entry) =>
-    entry.evidence?.some((evidence) =>
-      evidence.kind === "cmd" && evidence.value === "focused validation command"
-    )
-  ));
-  assert.ok(readiness.executableValidationTaskCount >= 1);
+  assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.reason, "executable_validation_task_missing");
+  assert.equal(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "cmd")
+  ), false);
+  assert.equal(readiness.executableValidationTaskCount, 0);
 });
 
-test("approval readiness preserves semantic validation flattened into a canonical key-changes section", () => {
+test("approval readiness rejects flattened validation prose without a concrete command", () => {
   const artifact = reviewablePlanArtifact([
     "# 计划",
     "",
@@ -651,12 +682,11 @@ test("approval readiness preserves semantic validation flattened into a canonica
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
-  assert.ok(executionPlanTasks.some((entry) =>
-    entry.evidence?.some((evidence) =>
-      evidence.kind === "cmd" && evidence.value === "focused validation command"
-    )
-  ), JSON.stringify(executionPlanTasks));
+  assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.reason, "executable_validation_task_missing");
+  assert.equal(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "cmd")
+  ), false, JSON.stringify(executionPlanTasks));
 });
 
 test("approval readiness recognizes a mutation verb after a concrete file target", () => {
@@ -727,7 +757,7 @@ test("approval task projection preserves long grounded PlanCandidate changes", (
   assert.equal(readiness.concreteMutationTaskCount, 1, JSON.stringify(executionPlanTasks));
 });
 
-test("approval task projection keeps the real OMLX deterministic evidence change", () => {
+test("approval task projection keeps the OMLX mutation but rejects its vague validation alternatives", () => {
   const artifact = reviewablePlanArtifact([
     "# 计划",
     "",
@@ -759,13 +789,14 @@ test("approval task projection keeps the real OMLX deterministic evidence change
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true, JSON.stringify({
+  assert.equal(readiness.ok, false, JSON.stringify({
     readiness,
     executionPlanTasks,
     candidates: collectRuntimeTaskCandidateLines(artifact.content),
     directEvidence: inferPlanTaskEvidence("修复 `src/hooks/useCsvParser.ts` 的 CSV 列名到订单字段映射，确保 creatorName 正确赋值。"),
     actionable: isRuntimeTaskActionableText("修复 `src/hooks/useCsvParser.ts` 的 CSV 列名到订单字段映射，确保 creator、course、date、status、amount 等 Dashboard 所需字段不会在导入时丢失。依据证据：read file src/hooks/useCsvParser.ts: L1: export interface CsvOrder L2: creator?: string; L6: export function normalizeCsvOrder(row: Record<string, string ): CsvOrder L7: return L8: creator: row.creator || row '创建者' || ''...。"),
   }));
+  assert.equal(readiness.reason, "executable_validation_task_missing");
   assert.ok(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) => evidence.kind === "file" && evidence.value === "src/hooks/useCsvParser.ts")
   ));
@@ -1051,8 +1082,7 @@ test("optional Plan validation remains visible prose instead of a blocking runti
   assert.equal(executionPlanTasks.some((entry) => /toolbar status|playwright/i.test(entry.text)), false);
   assert.equal(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) =>
-      evidence.kind === "cmd" &&
-      (evidence.value === "focused validation command" || /playwright/.test(evidence.value))
+      evidence.kind === "cmd" && /playwright/.test(evidence.value)
     )
   ), false, JSON.stringify(executionPlanTasks));
 });
@@ -1104,7 +1134,7 @@ test("approval readiness treats a plain prose change section as mutation-oriente
   assert.equal(readiness.ok, true, JSON.stringify(readiness));
 });
 
-test("approval task projection keeps an explicit modification file when its detail uses a domain verb", () => {
+test("approval task projection keeps an explicit modification file while rejecting vague validation", () => {
   const artifact = reviewablePlanArtifact([
     "# Proposed Plan",
     "",
@@ -1131,7 +1161,8 @@ test("approval task projection keeps an explicit modification file when its deta
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.reason, "executable_validation_task_missing");
   assert.equal(readiness.concreteMutationTaskCount, 1, JSON.stringify(executionPlanTasks));
   assert.ok(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) =>

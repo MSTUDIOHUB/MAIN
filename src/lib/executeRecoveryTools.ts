@@ -3,7 +3,6 @@ import { isLocalDevServerHealthProbeCommand } from "./devServerRuntime";
 import { WORKSPACE_MUTATION_TOOL_NAMES } from "./workspaceMutationTools";
 import {
   isFinitePlanValidationCommand,
-  isFlexiblePlanValidationCommandEvidence,
   planCommandEvidenceMatchesExecution,
 } from "./workflowModels";
 export {
@@ -347,6 +346,82 @@ export function migrateRecoveryReadLease(
     : normalizeRecoveryReadLeaseSnapshot(value);
 }
 
+type DevServerLifecycleCapability =
+  | "launch_long_process"
+  | "recover_process"
+  | "reconcile_server"
+  | "observe_pty"
+  | "browser_validation";
+
+function isDevServerLifecycleCapability(
+  value: ExecuteRecoveryNextCapability | undefined,
+): value is DevServerLifecycleCapability {
+  return value === "launch_long_process" ||
+    value === "recover_process" ||
+    value === "reconcile_server" ||
+    value === "observe_pty" ||
+    value === "browser_validation";
+}
+
+/**
+ * A browser checkpoint is the final obligation, not permission to skip the
+ * process lifecycle. Runtime evidence owns launch -> PTY observation ->
+ * browser. An explicit finite-validation checkpoint stays independent from
+ * any unrelated development server already recorded in the ledger.
+ */
+function resolveDevServerLifecycleStep(input: {
+  mode: ExecuteRecoveryMode;
+  checkpointCapability?: ExecuteRecoveryNextCapability;
+  status: RecoveryActionContract["devServerStatus"];
+  nextCapability?: "launch" | "observe_pty" | "browser" | "reconcile";
+}): {
+  phase: ExecuteRecoveryContractPhase;
+  nextRequiredCapability: DevServerLifecycleCapability;
+} | null {
+  const explicitLifecycle = isDevServerLifecycleCapability(input.checkpointCapability);
+  const legacyObservedLifecycle = !input.checkpointCapability &&
+    (input.mode === "action_plus_targeting" || input.mode === "validation_only") &&
+    input.status !== "none";
+  if (!explicitLifecycle && !legacyObservedLifecycle) return null;
+
+  if (
+    input.checkpointCapability === "reconcile_server" ||
+    input.nextCapability === "reconcile"
+  ) {
+    return { phase: "reconcile", nextRequiredCapability: "reconcile_server" };
+  }
+  if (
+    input.status === "failed" ||
+    input.status === "stopped"
+  ) {
+    return { phase: "reconcile", nextRequiredCapability: "recover_process" };
+  }
+  // The checkpoint is the durable process obligation. Runtime transitions do
+  // not always carry the ledger's server status, so an explicit PTY gate must
+  // remain observable instead of falling back to a second launch.
+  if (input.checkpointCapability === "observe_pty") {
+    return { phase: "validation", nextRequiredCapability: "observe_pty" };
+  }
+  if (input.checkpointCapability === "recover_process" && input.status === "none") {
+    return { phase: "reconcile", nextRequiredCapability: "recover_process" };
+  }
+  if (input.status === "none") {
+    return { phase: "validation", nextRequiredCapability: "launch_long_process" };
+  }
+  if (
+    input.status === "pending" ||
+    input.status === "running" ||
+    input.status === "unknown" ||
+    input.nextCapability === "observe_pty"
+  ) {
+    return { phase: "validation", nextRequiredCapability: "observe_pty" };
+  }
+  if (input.status === "ready" || input.nextCapability === "browser") {
+    return { phase: "validation", nextRequiredCapability: "browser_validation" };
+  }
+  return null;
+}
+
 export function resolveExecuteRecoveryActionContract(
   value: ExecuteRecoveryMode,
   context: {
@@ -401,18 +476,16 @@ export function resolveExecuteRecoveryActionContract(
   let phase: ExecuteRecoveryContractPhase = "mutation";
   let nextRequiredCapability: ExecuteRecoveryNextCapability = "mutation";
   const checkpointCapability = context.decisionCheckpoint?.nextRequiredCapability;
-  const explicitLongRunningValidation = checkpointCapability === "launch_long_process" ||
-    checkpointCapability === "recover_process" ||
-    checkpointCapability === "reconcile_server" ||
-    checkpointCapability === "observe_pty" ||
-    checkpointCapability === "browser_validation";
-  const longRunningValidationActive = mode === "action_plus_targeting" ||
-    mode === "validation_only" ||
-    explicitLongRunningValidation;
   const activeReadLease = normalizedReadLease &&
     (normalizedReadLease.state === "available" || normalizedReadLease.state === "active")
       ? normalizedReadLease
       : null;
+  const devServerLifecycleStep = resolveDevServerLifecycleStep({
+    mode,
+    checkpointCapability,
+    status: shared.devServerStatus,
+    nextCapability: context.devServerNextCapability,
+  });
 
   if (activeReadLease) {
     phase = "context";
@@ -422,53 +495,9 @@ export function resolveExecuteRecoveryActionContract(
   ) {
     phase = "context";
     nextRequiredCapability = "targeting";
-  } else if (
-    longRunningValidationActive &&
-    (
-      context.devServerNextCapability === "reconcile" ||
-      context.decisionCheckpoint?.nextRequiredCapability === "reconcile_server"
-    )
-  ) {
-    phase = "reconcile";
-    nextRequiredCapability = "reconcile_server";
-  } else if (
-    longRunningValidationActive &&
-    (
-      shared.devServerStatus === "failed" ||
-      shared.devServerStatus === "stopped" ||
-      (
-        shared.devServerStatus === "none" &&
-        context.decisionCheckpoint?.nextRequiredCapability === "recover_process"
-      )
-    )
-  ) {
-    phase = "reconcile";
-    nextRequiredCapability = "recover_process";
-  } else if (
-    longRunningValidationActive &&
-    context.decisionCheckpoint?.nextRequiredCapability === "launch_long_process" &&
-    shared.devServerStatus === "none"
-  ) {
-    phase = "validation";
-    nextRequiredCapability = "launch_long_process";
-  } else if (
-    longRunningValidationActive &&
-    (context.decisionCheckpoint?.nextRequiredCapability === "observe_pty" ||
-      context.devServerNextCapability === "observe_pty" ||
-      shared.devServerStatus === "pending" ||
-      shared.devServerStatus === "running" ||
-      shared.devServerStatus === "unknown")
-  ) {
-    phase = "validation";
-    nextRequiredCapability = "observe_pty";
-  } else if (
-    longRunningValidationActive &&
-    (context.decisionCheckpoint?.nextRequiredCapability === "browser_validation" ||
-      context.devServerNextCapability === "browser" ||
-      shared.devServerStatus === "ready")
-  ) {
-    phase = "validation";
-    nextRequiredCapability = "browser_validation";
+  } else if (devServerLifecycleStep) {
+    phase = devServerLifecycleStep.phase;
+    nextRequiredCapability = devServerLifecycleStep.nextRequiredCapability;
   } else if (mode === "validation_only" || mode === "finite_validation_only") {
     phase = "validation";
     nextRequiredCapability = "validation";
@@ -982,35 +1011,44 @@ export function buildExecutionActionContractCard(input: {
   const hasSourceObservation = observation !== "(none)";
   const planTaskId = contract.decisionCheckpoint?.planTaskId || "(none)";
   const requirementRef = contract.decisionCheckpoint?.requirementRef || "(none)";
+  const sourcePhase = contract.phase === "context" || contract.phase === "mutation";
   if (input.language === "zh") {
     return [
       "[EXECUTION_ACTION_CONTRACT]",
       `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
       `planTask=${planTaskId}; requirement=${requirementRef}`,
-      `sourceObservation=${observation}; readLeaseRange=${range}`,
       `availableTools=${tools}`,
-      hasSourceObservation
-        ? "当前源码 observation 已满足修改前读取要求；不要仅为满足规则而复读未变化的相同窗口。"
-        : "当前没有绑定源码 observation；只有确实缺少修改所需精确文本时才定向读取，否则直接修正修改调用。",
-      readFileVisible
-        ? "read_file 当前可见，但只有文件版本变化、缺失范围或真实上下文淘汰才会返回新源码；相同快照/已覆盖窗口只返回 stub，并计入同一语义请求的无进展预算。"
-        : "read_file 不在本次请求的实际工具面中；不要请求它或用 shell 绕行，复用现有 observation 并从 availableTools 选择 next 能力。",
-      "优先执行 next 指定的一个能力。修改后直接进入所需验证；源码复读或 git diff 只是可选的修改后检查，不能替代命令或浏览器验收。",
+      ...(sourcePhase
+        ? [
+            `sourceObservation=${observation}; readLeaseRange=${range}`,
+            hasSourceObservation
+              ? "复用已绑定的源码 observation；不要为满足规则而复读未变化的相同窗口。"
+              : "仅在缺少修改所需精确文本时定向读取。",
+            readFileVisible
+              ? "相同文件版本和已覆盖窗口只返回缓存 stub；版本、范围或上下文变化后可重新读取。"
+              : "read_file 当前不可用；从 availableTools 选择 next 能力。",
+          ]
+        : []),
+      "只调用 availableTools 中能够完成 next 的一个工具；不要重启诊断或请求当前工具面之外的能力。",
     ].join("\n");
   }
   return [
     "[EXECUTION_ACTION_CONTRACT]",
     `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
     `planTask=${planTaskId}; requirement=${requirementRef}`,
-    `sourceObservation=${observation}; readLeaseRange=${range}`,
     `availableTools=${tools}`,
-    hasSourceObservation
-      ? "The active source observation already satisfies read-before-modify; do not reread an unchanged covered window merely to satisfy that rule."
-      : "No source observation is bound to this checkpoint; request a targeted read only when exact mutation text is genuinely missing, otherwise correct the mutation call directly.",
-    readFileVisible
-      ? "read_file is visible now, but only a changed version, missing range, or real context eviction returns source; the same snapshot/window returns a stub and counts toward the same semantic request's no-progress budget."
-      : "read_file is not in this request's actual tool surface; do not request it or use a shell-read bypass. Reuse the current observation and choose the next capability from availableTools.",
-    "Prefer one call for the next capability. After a mutation, perform the required validation; a source reread or git diff is an optional post-mutation check, not a replacement for command or browser acceptance.",
+    ...(sourcePhase
+      ? [
+          `sourceObservation=${observation}; readLeaseRange=${range}`,
+          hasSourceObservation
+            ? "Reuse the bound source observation; do not reread an unchanged covered window merely to satisfy a rule."
+            : "Request a targeted read only when exact mutation text is missing.",
+          readFileVisible
+            ? "The same file version and covered window returns a cache stub; a version, range, or context change permits a fresh read."
+            : "read_file is unavailable now; choose the next capability from availableTools.",
+        ]
+      : []),
+    "Call one tool from availableTools that satisfies next; do not restart diagnosis or request a capability outside the current surface.",
   ].join("\n");
 }
 
@@ -1040,9 +1078,6 @@ export function shouldEnterFailedFiniteValidationRecovery(command: string): bool
 export function hasPendingPlanCommandEvidence(
   tasks: ReadonlyArray<{ evidence?: ReadonlyArray<{ kind?: string; value?: string }> }>,
 ): boolean {
-  // Inferred validation tasks intentionally use the semantic placeholder
-  // "focused validation command". The actual failed command is classified
-  // separately, so this gate only asks whether command evidence remains.
   return tasks.some((task) =>
     (task.evidence || []).some((evidence) => evidence.kind === "cmd")
   );
@@ -1054,12 +1089,9 @@ export function failedFiniteValidationMatchesPendingPlanEvidence(input: {
 }): boolean {
   return input.tasks.some((task) =>
     (task.evidence || []).some((evidence) =>
-      evidence.kind === "cmd" && (
-        isFlexiblePlanValidationCommandEvidence(String(evidence.value || "")) ||
-        planCommandEvidenceMatchesExecution(
-          String(evidence.value || ""),
-          input.failedCommand,
-        )
+      evidence.kind === "cmd" && planCommandEvidenceMatchesExecution(
+        String(evidence.value || ""),
+        input.failedCommand,
       )
     )
   );
@@ -1076,7 +1108,6 @@ export function resolveFailedFiniteValidationRecoveryPolicy(input: {
       .filter(Boolean)
   );
   const matchingExplicitCommand = pendingCommands.find((command) =>
-    !isFlexiblePlanValidationCommandEvidence(command) &&
     planCommandEvidenceMatchesExecution(command, input.failedCommand)
   );
   if (matchingExplicitCommand) {
@@ -1086,16 +1117,7 @@ export function resolveFailedFiniteValidationRecoveryPolicy(input: {
     };
   }
 
-  // The semantic placeholder deliberately accepts any finite validation
-  // command. It takes ownership of an otherwise-unmatched failed command;
-  // explicit commands later in the task list retain their own exact boundary.
-  if (pendingCommands.some(isFlexiblePlanValidationCommandEvidence)) {
-    return { allowAlternativeCommand: true, requiredCommand: "" };
-  }
-
-  const firstExplicitCommand = pendingCommands.find((command) =>
-    !isFlexiblePlanValidationCommandEvidence(command)
-  );
+  const firstExplicitCommand = pendingCommands[0];
   return firstExplicitCommand
     ? { allowAlternativeCommand: false, requiredCommand: firstExplicitCommand }
     : { allowAlternativeCommand: true, requiredCommand: "" };
@@ -1350,7 +1372,7 @@ export function buildFailedFiniteValidationRecoveryPrompt(input: {
     `Failed command: ${command}`,
     result ? `Observed result: ${result}` : "Observed result: no usable command output was returned.",
     allowAlternativeCommand
-      ? "The pending Plan evidence is a generic finite-validation placeholder. The next required evidence is one compatible finite command for the actual project runtime and source format."
+      ? "No exact command was reviewed for this runtime-owned post-mutation check. The next required evidence is one compatible finite command for the actual project runtime and source format."
       : `The approved Plan requires this exact command evidence: ${requiredCommand}. Correct its prerequisites or invocation, then retry that command; a different command cannot replace the reviewed acceptance boundary.`,
     "This checkpoint exposes the finite-command capability only. A real source failure may open a later repair transaction, but reads, edits, long-running commands, and PTY observations cannot replace this command evidence. Do not infer that a successful edit was reverted merely because the command invocation was invalid.",
     allowAlternativeCommand

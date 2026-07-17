@@ -68,7 +68,6 @@ export function resolveApprovedPlanFiniteCommandInjection(input: {
     .map(normalizeCommand)
     .filter((command) =>
       command &&
-      command !== "focused validation command" &&
       isFinitePlanValidationCommand(command)
     );
   if (commands.length !== 1) return null;

@@ -732,8 +732,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   const activeContractIndex = assistantCompletionPhaseSource.indexOf('currentExecuteRecoveryState.mode !== "normal"');
   const executeNoToolIndex = assistantCompletionPhaseSource.indexOf("handleExecuteNoToolRecovery({");
   assert.ok(preCompletionAuditIndex >= 0);
-  assert.ok(preCompletionAuditIndex < activeContractIndex);
-  assert.ok(activeContractIndex < executeNoToolIndex);
+  assert.ok(preCompletionAuditIndex < executeNoToolIndex);
+  assert.ok(executeNoToolIndex < activeContractIndex);
   assert.match(assistantCompletionPhaseSource, /handleApprovedPlanFinalization\(\{/);
   assert.match(approvedPlanFinalizationSource, /export function handleApprovedPlanFinalization/);
   assert.match(approvedPlanFinalizationSource, /remaining_plan_tasks_limit/);
@@ -1038,8 +1038,8 @@ test("approved plan no-tool turns use evidence recovery, the active contract, th
   const activeContractIndex = assistantCompletionPhaseSource.indexOf('currentExecuteRecoveryState.mode !== "normal"');
   const genericRecoveryIndex = assistantCompletionPhaseSource.indexOf("handleExecuteNoToolRecovery({");
   assert.ok(evidenceAuditIndex >= 0);
-  assert.ok(evidenceAuditIndex < activeContractIndex);
-  assert.ok(activeContractIndex < genericRecoveryIndex);
+  assert.ok(evidenceAuditIndex < genericRecoveryIndex);
+  assert.ok(genericRecoveryIndex < activeContractIndex);
   assert.match(assistantCompletionPhaseSource, /precompletion_evidence_recovery_activated/);
   assert.match(executeNoToolRecoverySource, /required_tool_call_protocol_violation/);
   assert.match(executeNoToolRecoverySource, /availableTools: Array\.from\(availableToolNames\)/);

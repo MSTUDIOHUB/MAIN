@@ -1074,12 +1074,6 @@ function commandLooksLikePlaywrightOrBrowserTest(value: string): boolean {
   return /\b(?:playwright|cypress|puppeteer|browser\s+test|e2e)\b/i.test(String(value || ""));
 }
 
-const FOCUSED_VALIDATION_COMMAND = "focused validation command";
-
-export function isFlexiblePlanValidationCommandEvidence(value: string): boolean {
-  return normalizeCommandEvidenceValue(value) === FOCUSED_VALIDATION_COMMAND;
-}
-
 // `execute_command` writes into the shared PTY and only reports the first
 // chunk of output.  A successful dispatch is not enough to prove that a
 // server or desktop runtime actually came up: the next PTY observation is
@@ -1132,7 +1126,6 @@ function commandEvidenceMatches(expectedRaw: string, actualRaw: string): boolean
   const expected = normalizeCommandEvidenceValue(expectedRaw);
   const actual = normalizeCommandEvidenceValue(actualRaw);
   if (!expected || !actual) return false;
-  if (expected === FOCUSED_VALIDATION_COMMAND) return isFinitePlanValidationCommand(actual);
   if (expected === actual) return true;
 
   const actualSegments = splitCommandEvidenceSegments(actual);
@@ -1156,20 +1149,7 @@ function latestRunCommandOutcomesForEvidence(
   const matching = evidenceLedger.filter((record) =>
     record.sourceTool === "run_command" && evidenceMatchesRecord(evidence, record)
   );
-  if (!isFlexiblePlanValidationCommandEvidence(evidence.value)) {
-    return matching.length > 0 ? [matching[matching.length - 1]] : [];
-  }
-
-  // A focused placeholder accepts any finite command, but each concrete
-  // command keeps its own latest outcome. A passing lint command therefore
-  // cannot erase an unresolved build/test/typecheck failure; rerunning that
-  // failed command successfully replaces only its own negative outcome.
-  const latestByCommand = new Map<string, PlanExecutionEvidenceEntry>();
-  for (const record of matching) {
-    const key = normalizeCommandEvidenceValue(record.value || record.target || "");
-    if (key) latestByCommand.set(key, record);
-  }
-  return Array.from(latestByCommand.values());
+  return matching.length > 0 ? [matching[matching.length - 1]] : [];
 }
 
 function latestFailedFiniteCommandForEvidence(
@@ -1280,7 +1260,7 @@ const MARKDOWN_VIEWER_VALIDATION_RE =
 const TAURI_VALIDATION_RE =
   /(?:Tauri|invoke\(['"`](?:open_file|save_file|save_file_as)|open_file|save_file|文件选择|文件对话框|系统浏览器|桌面|窗口|原生|desktop|file\s+dialog|native|system integration)/i;
 const MANUAL_VALIDATION_RE =
-  /(?:人工|用户(?:自己)?|你自己|自行|肉眼|需(?:要)?\s*手动(?:确认|检查|验收)|由用户手动|human|user confirmation|user validation|manually confirmed by (?:the )?user|visually inspect)/i;
+  /(?:人工|用户(?:自己)?|你自己|自行|肉眼|手动(?:验证|确认|检查|验收)|需(?:要)?\s*手动(?:验证|确认|检查|验收)|由用户手动|human|user confirmation|user validation|manual(?:ly)? validation|manually confirmed by (?:the )?user|visually inspect)/i;
 const SOURCE_MUTATION_TASK_RE =
   /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|防御性编程)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
 const PRIMARY_VALIDATION_TASK_RE =
@@ -1425,15 +1405,6 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
 
   const structuredDomAssertion = inferStructuredBrowserDomAssertion(normalized);
 
-  if (
-    hasAutomatableValidationAlternative &&
-    !structuredDomAssertion &&
-    !structuredBrowserInteraction
-  ) {
-    const parsed = makePlanTaskEvidence("cmd", FOCUSED_VALIDATION_COMMAND, true);
-    return withAdvisoryEvidence(parsed ? [parsed] : []);
-  }
-
   if (TAURI_VALIDATION_RE.test(normalized)) {
     const parsed = makePlanTaskEvidence("tauri_required", "tauri runtime validation", true);
     return withAdvisoryEvidence(parsed ? [parsed] : []);
@@ -1469,16 +1440,6 @@ function inferValidationTaskEvidence(text: string, commands: string[] = []): Pla
   if (/(?:localhost|127\.0\.0\.1|\bdev server\b|开发服务器|服务器|服务|端口|\bport\b)/i.test(normalized)) {
     const parsed = makePlanTaskEvidence("dev_server_url", "dev server reachable", true);
     return withAdvisoryEvidence(parsed ? [parsed] : []);
-  }
-
-  // A reviewed plan can describe a concrete assertion without knowing the
-  // repository's exact test command yet (for example, "check that the return
-  // object contains creatorName"). Preserve that assertion as an executable
-  // runtime obligation. The execution loop must still run a finite validation
-  // command and record trusted evidence before the task can complete.
-  if (!explicitUserValidation && CONCRETE_VALIDATION_OUTCOME_RE.test(normalized)) {
-    const parsed = makePlanTaskEvidence("cmd", FOCUSED_VALIDATION_COMMAND, true);
-    return parsed ? [parsed] : [];
   }
 
   return withAdvisoryEvidence([]);
@@ -1845,7 +1806,10 @@ export function deriveRuntimeValidationTasksFromUserRequest(
   options: Pick<RuntimePlanTaskDerivationOptions, "language" | "maxTasks"> = {},
 ): PlanTask[] {
   const language = options.language === "en" ? "en" : "zh";
-  const maxTasks = Math.max(1, Math.min(8, Number(options.maxTasks) || 4));
+  const requestedMaxTasks = Number(options.maxTasks);
+  const maxTasks = Number.isFinite(requestedMaxTasks) && requestedMaxTasks > 0
+    ? Math.max(1, Math.floor(requestedMaxTasks))
+    : Number.POSITIVE_INFINITY;
   const tasks: PlanTask[] = [];
   const seen = new Set<string>();
 
@@ -3473,7 +3437,7 @@ function collectRuntimeTaskChangeHeadingTasks(
   content: string,
   language: "zh" | "en",
 ): PlanTask[] {
-  const descriptionsByFile = new Map<string, string[]>();
+  const tasks: PlanTask[] = [];
   let pendingChange: {
     files: string[];
     headingSummary: string;
@@ -3482,18 +3446,17 @@ function collectRuntimeTaskChangeHeadingTasks(
 
   const flushPendingChange = () => {
     if (!pendingChange) return;
-    const descriptions = pendingChange.details.length > 0
-      ? pendingChange.details
-      : pendingChange.headingSummary
-        ? [pendingChange.headingSummary]
-        : [];
     for (const filePath of pendingChange.files) {
-      const existing = descriptionsByFile.get(filePath) || [];
-      for (const description of descriptions) {
-        const clean = description.replace(/\s+/g, " ").trim();
-        if (clean && !existing.includes(clean)) existing.push(clean);
-      }
-      descriptionsByFile.set(filePath, existing);
+      const evidence = makePlanTaskEvidence("file", filePath, true);
+      if (!evidence) continue;
+      const descriptions = [pendingChange.headingSummary, ...pendingChange.details]
+        .map((description) => description.replace(/\s+/g, " ").trim())
+        .filter((description, index, values) => description && values.indexOf(description) === index);
+      const verb = language === "en" ? "Modify" : "修改";
+      const taskText = descriptions.length > 0
+        ? `${verb} ${filePath}：${descriptions.join(language === "en" ? "; " : "；")}`
+        : `${verb} ${filePath}`;
+      tasks.push(makeRuntimeTaskFromEvidenceText(taskText, evidence, language, "mutation"));
     }
     pendingChange = null;
   };
@@ -3534,17 +3497,6 @@ function collectRuntimeTaskChangeHeadingTasks(
     if (detail) pendingChange.details.push(detail);
   }
   flushPendingChange();
-
-  const tasks: PlanTask[] = [];
-  for (const [filePath, descriptions] of descriptionsByFile) {
-    const evidence = makePlanTaskEvidence("file", filePath, true);
-    if (!evidence) continue;
-    const verb = language === "en" ? "Modify" : "修改";
-    const taskText = descriptions.length > 0
-      ? `${verb} ${filePath}：${descriptions.join(language === "en" ? "; " : "；")}`
-      : `${verb} ${filePath}`;
-    tasks.push(makeRuntimeTaskFromEvidenceText(taskText, evidence, language, "mutation"));
-  }
   return tasks;
 }
 
@@ -3561,6 +3513,11 @@ function collectRuntimeTaskProseSectionTasks(
   let inCodeFence = false;
   let pendingFiles: string[] = [];
   let pendingFilesAreExplicitOwner = false;
+  let pendingHeadingSummary: {
+    files: string[];
+    text: string;
+    usedByDetail: boolean;
+  } | null = null;
 
   const ensureMutationFiles = (files: string[]) => {
     for (const filePath of files) {
@@ -3584,6 +3541,32 @@ function collectRuntimeTaskProseSectionTasks(
     }
   };
 
+  const samePendingFiles = (files: string[]): boolean => {
+    if (!pendingHeadingSummary || pendingHeadingSummary.files.length !== files.length) return false;
+    const expected = pendingHeadingSummary.files.map(normalizePlanEvidenceValue).sort();
+    const actual = files.map(normalizePlanEvidenceValue).sort();
+    return expected.every((value, index) => value === actual[index]);
+  };
+
+  const rememberOwnedDetail = (files: string[], description: string) => {
+    if (!pendingHeadingSummary || !samePendingFiles(files)) {
+      remember(files, description);
+      return;
+    }
+    pendingHeadingSummary.usedByDetail = true;
+    remember(
+      files,
+      `${pendingHeadingSummary.text}${language === "en" ? "; " : "；"}${description}`,
+    );
+  };
+
+  const flushPendingHeadingSummary = () => {
+    if (pendingHeadingSummary && !pendingHeadingSummary.usedByDetail) {
+      remember(pendingHeadingSummary.files, pendingHeadingSummary.text);
+    }
+    pendingHeadingSummary = null;
+  };
+
   for (const rawLine of String(content || "").split(/\r?\n/)) {
     if (/^\s*```/.test(rawLine)) {
       inCodeFence = !inCodeFence;
@@ -3593,6 +3576,7 @@ function collectRuntimeTaskProseSectionTasks(
 
     const heading = rawLine.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
     if (heading) {
+      flushPendingHeadingSummary();
       const headingLevel = (heading[1] || "").length;
       const headingText = (heading[2] || "").replace(/\*\*/g, "").trim();
 
@@ -3660,7 +3644,13 @@ function collectRuntimeTaskProseSectionTasks(
             ? mutationOwnerFiles
             : nestedHeadingFiles;
           ensureMutationFiles(effectiveOwnerFiles);
-          remember(effectiveOwnerFiles, headingText);
+          if (!isExplicitFileHeading && !isFileOnlyHeading) {
+            pendingHeadingSummary = {
+              files: effectiveOwnerFiles,
+              text: headingText,
+              usedByDetail: false,
+            };
+          }
           pendingFiles = effectiveOwnerFiles;
           pendingFilesAreExplicitOwner = true;
         }
@@ -3683,18 +3673,30 @@ function collectRuntimeTaskProseSectionTasks(
     const normalized = rawLine.replace(/\*\*/g, "").trim();
     if (!normalized) continue;
     const directFiles = extractWorkspaceFileReferencesFromText(normalized);
-    const isFileLabel = /^(?:文件|目标文件|修改文件|file|target file|file to change)\s*[:：]/i.test(normalized);
+    const isFileLabel = /^(?:文件|目标文件|(?:唯一)?修改文件|file|target file|(?:only|sole) file to change)\s*[:：]/i.test(normalized);
     const normalizedFileOnlyLine = stripMarkdownTaskLine(normalized)
       .replace(/[`*_]/g, "")
       .trim();
     const isFileOnlyLine =
       directFiles.length === 1 &&
       normalizedFileOnlyLine === directFiles[0];
-    if ((isFileLabel || isFileOnlyLine) && directFiles.length > 0) {
-      // An explicit file-to-change label inside an actionable implementation
-      // section is itself a reviewed mutation boundary. Do not discard it just
-      // because the following prose uses a domain verb outside the generic
-      // mutation vocabulary (for example “assign creator to creatorName”).
+    let mutationOwnerOnlyLine = false;
+    if (directFiles.length > 0) {
+      let ownerRemainder = stripMarkdownTaskLine(normalized);
+      for (const filePath of directFiles) {
+        ownerRemainder = ownerRemainder
+          .split(`\`${filePath}\``).join("")
+          .split(filePath).join("");
+      }
+      ownerRemainder = ownerRemainder
+        .replace(/^(?:修改|更新|变更|调整|修复|modify|update|change|fix)\s*(?:文件|file)?\s*/i, "")
+        .replace(/^[\s:：—–,，.。-]+|[\s:：—–,，.。-]+$/g, "")
+        .trim();
+      mutationOwnerOnlyLine = ownerRemainder.length === 0;
+    }
+    if ((isFileLabel || isFileOnlyLine || mutationOwnerOnlyLine) && directFiles.length > 0) {
+      // A location-only line establishes the owner for following changes; it
+      // is not an executable obligation by itself.
       ensureMutationFiles(directFiles);
       pendingFiles = directFiles;
       pendingFilesAreExplicitOwner = true;
@@ -3713,7 +3715,7 @@ function collectRuntimeTaskProseSectionTasks(
       // "change src/main.js to match toolbar.js"), not additional mutation
       // targets. Only an explicit imperative aimed at the referenced path may
       // open a new owner.
-      remember(pendingFiles, normalized);
+      rememberOwnedDetail(pendingFiles, normalized);
       continue;
     }
 
@@ -3722,25 +3724,29 @@ function collectRuntimeTaskProseSectionTasks(
       const effectiveOwnerFiles = mutationOwnerFiles.length > 0
         ? mutationOwnerFiles
         : directFiles;
-      remember(effectiveOwnerFiles, normalized);
+      rememberOwnedDetail(effectiveOwnerFiles, normalized);
       pendingFiles = effectiveOwnerFiles;
       pendingFilesAreExplicitOwner = false;
       continue;
     }
     if (!inValidationSection && pendingFiles.length > 0 && isLikelySourceMutationTask(normalized)) {
-      remember(pendingFiles, normalized);
+      rememberOwnedDetail(pendingFiles, normalized);
     }
   }
+
+  flushPendingHeadingSummary();
 
   const tasks: PlanTask[] = [];
   for (const [filePath, descriptions] of descriptionsByFile) {
     const evidence = makePlanTaskEvidence("file", filePath, true);
     if (!evidence) continue;
     const verb = language === "en" ? "Modify" : "修改";
-    const taskText = descriptions.length > 0
-      ? `${verb} ${filePath}：${descriptions.join(language === "en" ? "; " : "；")}`
-      : `${verb} ${filePath}`;
-    tasks.push(makeRuntimeTaskFromEvidenceText(taskText, evidence, language, "mutation"));
+    for (const description of descriptions.length > 0 ? descriptions : [""]) {
+      const taskText = description
+        ? `${verb} ${filePath}：${description}`
+        : `${verb} ${filePath}`;
+      tasks.push(makeRuntimeTaskFromEvidenceText(taskText, evidence, language, "mutation"));
+    }
   }
   return tasks;
 }
@@ -3891,7 +3897,10 @@ export function deriveRuntimePlanTasksFromArtifacts(
   options: RuntimePlanTaskDerivationOptions = {},
 ): PlanTask[] {
   const language = options.language === "en" ? "en" : "zh";
-  const maxTasks = Math.max(2, Math.min(20, Number(options.maxTasks) || 8));
+  const requestedMaxTasks = Number(options.maxTasks);
+  const maxTasks = Number.isFinite(requestedMaxTasks) && requestedMaxTasks > 0
+    ? Math.max(1, Math.floor(requestedMaxTasks))
+    : Number.POSITIVE_INFINITY;
   const sourceArtifacts = artifacts.filter((artifact) =>
     artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix" || artifact.kind === "requirements"
   );
@@ -3934,6 +3943,7 @@ export function deriveRuntimePlanTasksFromArtifacts(
   }
 
   if (tasks.length < sourceTaskLimit) {
+    const proseMutationFiles = new Set<string>();
     for (const candidate of collectRuntimeTaskProseSectionTasks(runtimeRelevantContent, language)) {
       const task = canonicalizeRuntimeTaskFileEvidence(candidate, canonicalFilePaths);
       const fileEvidence = (task.evidence || [])
@@ -3945,12 +3955,14 @@ export function deriveRuntimePlanTasksFromArtifacts(
         continue;
       }
       pushTask(task);
-      fileEvidence.forEach((value) => structuredMutationFiles.add(value));
+      fileEvidence.forEach((value) => proseMutationFiles.add(value));
       if (tasks.length >= sourceTaskLimit) break;
     }
+    proseMutationFiles.forEach((value) => structuredMutationFiles.add(value));
   }
 
   if (tasks.length < sourceTaskLimit) {
+    const tableMutationFiles = new Set<string>();
     for (const candidate of collectRuntimeTaskTableTasks(runtimeRelevantContent, language)) {
       const task = canonicalizeRuntimeTaskFileEvidence(candidate, canonicalFilePaths);
       const fileEvidence = (task.evidence || [])
@@ -3965,12 +3977,14 @@ export function deriveRuntimePlanTasksFromArtifacts(
         continue;
       }
       pushTask(task);
-      fileEvidence.forEach((value) => structuredMutationFiles.add(value));
+      fileEvidence.forEach((value) => tableMutationFiles.add(value));
       if (tasks.length >= sourceTaskLimit) break;
     }
+    tableMutationFiles.forEach((value) => structuredMutationFiles.add(value));
   }
 
   if (tasks.length < sourceTaskLimit) {
+    const candidateLineMutationFiles = new Set<string>();
     for (const line of collectRuntimeTaskCandidateLines(runtimeRelevantContent)) {
       const task = makeRuntimeTask(line, language);
       const canonicalTask = task
@@ -3985,9 +3999,10 @@ export function deriveRuntimePlanTasksFromArtifacts(
         continue;
       }
       pushTask(canonicalTask);
-      fileEvidence.forEach((value) => structuredMutationFiles.add(value));
+      fileEvidence.forEach((value) => candidateLineMutationFiles.add(value));
       if (tasks.length >= sourceTaskLimit) break;
     }
+    candidateLineMutationFiles.forEach((value) => structuredMutationFiles.add(value));
   }
 
   const existingCommandEvidence = new Set(
@@ -3996,7 +4011,8 @@ export function deriveRuntimePlanTasksFromArtifacts(
       .filter((item) => item.kind === "cmd")
       .map((item) => normalizeCommandEvidenceValue(item.value)),
   );
-  for (const command of runtimeCommands.slice(0, Math.max(1, maxTasks - tasks.length))) {
+  for (const command of runtimeCommands) {
+    if (tasks.length >= maxTasks) break;
     const normalizedCommand = normalizeCommandEvidenceValue(command);
     if (existingCommandEvidence.has(normalizedCommand)) continue;
     pushTask(makeRuntimeTaskFromEvidenceText(
@@ -4006,14 +4022,13 @@ export function deriveRuntimePlanTasksFromArtifacts(
       "validation",
     ));
     if (normalizedCommand) existingCommandEvidence.add(normalizedCommand);
-    if (tasks.length >= maxTasks) return tasks;
   }
 
   if (tasks.length === 0) {
     return [];
   }
 
-  return tasks.slice(0, maxTasks);
+  return tasks;
 }
 
 function mergePlanTaskStatus(previous: PlanTask | undefined, next: PlanTask): PlanTaskStatus {

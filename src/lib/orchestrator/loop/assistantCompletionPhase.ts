@@ -230,25 +230,10 @@ export async function handleAssistantCompletionPhase(input: {
     });
     return finish("continue");
   }
-  if (currentExecuteRecoveryState.mode !== "normal") {
-    // The active recovery transaction still owns the next capability. The
-    // resolver deliberately does not reactivate an existing transaction, but
-    // that must never be interpreted as evidence closure or permission to
-    // publish the held final draft.
-    input.callbacks.onStreamToken("__ESCALATION_RESET__:evidence_recovery", input.assistantMsgId);
-    input.callbacks.onStatusChange("running");
-    logAgentEvent("precompletion_evidence_recovery_still_active", {
-      iteration: input.iteration,
-      recoveryMode: currentExecuteRecoveryState.mode,
-      expectedTarget: currentExecuteRecoveryState.expectedTarget,
-      nextRequiredCapability: currentExecuteRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
-    });
-    return finish("continue");
-  }
 
-  // Evidence closure has already been decided above. This fallback handles
-  // protocol shape only; assistant prose must not synthesize a new user turn
-  // or select a recovery phase by wording.
+  // Transport errors must be observable before an active evidence contract
+  // sends the next identical request. Keep generic prose/XML recovery out of
+  // the evidence transaction; the contract already owns its next capability.
   const executeNoToolRecovery = handleExecuteNoToolRecovery({
     callbacks: input.callbacks,
     activeProfile: input.activeProfile,
@@ -264,6 +249,7 @@ export async function handleAssistantCompletionPhase(input: {
     sawExecuteOperationEvidence: input.sawExecuteOperationEvidence,
     visibleText: input.visibleAssistantText || input.userVisibleText,
     protocolViolation: input.normalized.protocolViolation,
+    protocolViolationOnly: currentExecuteRecoveryState.mode !== "normal",
     assistantMsgId: input.assistantMsgId,
     consecutiveNoToolCount: noToolRuntimeState.consecutiveNoToolCount,
   });
@@ -275,6 +261,22 @@ export async function handleAssistantCompletionPhase(input: {
     return finish("stopped");
   }
   if (executeNoToolRecovery.status === "continue") {
+    return finish("continue");
+  }
+
+  if (currentExecuteRecoveryState.mode !== "normal") {
+    // The active recovery transaction still owns the next capability. The
+    // resolver deliberately does not reactivate an existing transaction, but
+    // that must never be interpreted as evidence closure or permission to
+    // publish the held final draft.
+    input.callbacks.onStreamToken("__ESCALATION_RESET__:evidence_recovery", input.assistantMsgId);
+    input.callbacks.onStatusChange("running");
+    logAgentEvent("precompletion_evidence_recovery_still_active", {
+      iteration: input.iteration,
+      recoveryMode: currentExecuteRecoveryState.mode,
+      expectedTarget: currentExecuteRecoveryState.expectedTarget,
+      nextRequiredCapability: currentExecuteRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
+    });
     return finish("continue");
   }
 

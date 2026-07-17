@@ -845,6 +845,30 @@ test("out-of-surface tool calls are quarantined as protocol recovery", () => {
   assert.match(harness.appended[0].content, /actually exposed/);
 });
 
+test("active evidence recovery handles protocol violations without opening generic prose recovery", () => {
+  const quietHarness = createExecuteNoToolHarness("en");
+  const quiet = handleExecuteNoToolRecovery(createExecuteNoToolInput(quietHarness, {
+    activeProfile: "local",
+    forceXmlTools: true,
+    protocolViolationOnly: true,
+    visibleText: "I will inspect the source again.",
+  }));
+  assert.equal(quiet.status, "none");
+  assert.deepEqual(quietHarness.appended, []);
+
+  const violationHarness = createExecuteNoToolHarness("en");
+  const violation = handleExecuteNoToolRecovery(createExecuteNoToolInput(violationHarness, {
+    activeProfile: "local",
+    forceXmlTools: true,
+    protocolViolationOnly: true,
+    protocolViolation: "required_tool_call_not_available",
+    visibleText: "I will inspect the source again.",
+  }));
+  assert.equal(violation.status, "continue");
+  assert.equal(violationHarness.appended.length, 1);
+  assert.match(violationHarness.appended[0].content, /active recovery surface/);
+});
+
 test("execute recovery exposes only the current capability surface", () => {
   const names = [
     "list_directory",
@@ -1038,6 +1062,32 @@ test("one recovery contract atomically advances long-running validation from PTY
   });
   assert.equal(launchWrongOnly.selectedCallId, null);
 
+  const browserWithoutServer = resolveExecuteRecoveryActionContract("validation_only", {
+    decisionCheckpoint: {
+      expectedTarget: null,
+      sourceObservationKey: null,
+      nextRequiredCapability: "browser_validation",
+    },
+    devServerStatus: "none",
+    devServerNextCapability: "launch",
+  });
+  assert.equal(browserWithoutServer.nextRequiredCapability, "launch_long_process");
+  assert.equal(browserWithoutServer.allowedToolNames.has("execute_command"), true);
+  assert.equal(browserWithoutServer.allowedToolNames.has("browser_evaluate"), false);
+
+  const finiteValidationWithAmbientServer = resolveExecuteRecoveryActionContract("validation_only", {
+    decisionCheckpoint: {
+      expectedTarget: null,
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+    },
+    devServerStatus: "ready",
+    devServerNextCapability: "browser",
+  });
+  assert.equal(finiteValidationWithAmbientServer.nextRequiredCapability, "validation");
+  assert.equal(finiteValidationWithAmbientServer.allowedToolNames.has("run_command"), true);
+  assert.equal(finiteValidationWithAmbientServer.allowedToolNames.has("browser_evaluate"), false);
+
   const failed = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     expectedTarget: "src/App.tsx",
     devServerStatus: "failed",
@@ -1108,7 +1158,7 @@ test("one recovery contract atomically advances long-running validation from PTY
 
   const card = buildExecutionActionContractCard({ contract: targeting, language: "en" });
   assert.match(card, /availableTools=/);
-  assert.match(card, /read_file is not in this request's actual tool surface/);
+  assert.match(card, /read_file is unavailable now/);
   assert.match(card, /next=targeting/);
 
   const filteredCard = buildExecutionActionContractCard({
@@ -1117,7 +1167,14 @@ test("one recovery contract atomically advances long-running validation from PTY
     availableToolNames: ["apply_patch"],
   });
   assert.match(filteredCard, /availableTools=apply_patch/);
-  assert.match(filteredCard, /read_file is not in this request's actual tool surface/);
+  assert.match(filteredCard, /read_file is unavailable now/);
+
+  const browserCard = buildExecutionActionContractCard({
+    contract: ready,
+    language: "en",
+  });
+  assert.match(browserCard, /next=browser_validation/);
+  assert.doesNotMatch(browserCard, /sourceObservation|read_file|source reread/i);
 });
 
 test("a short cached-read streak does not create a second special recovery path", () => {
@@ -1402,6 +1459,82 @@ test("recovery contract can lease one bounded validation command absent from Pla
   const result = await partitionToolCallsForExecution(input);
   assert.equal(result.preExecutionResults.length, 0);
   assert.equal(result.writeCalls.length, 1);
+});
+
+test("browser lifecycle leases one safe dev-server launch without opening approved Plan shell scope", async () => {
+  const registry = {
+    tools: {
+      execute_command: {
+        key: "execute_command",
+        name: "execute_command",
+        source: "built_in",
+        category: "shell",
+        risk: "shell",
+        enabled: true,
+        autoExecutable: false,
+      },
+    },
+    policy: partitionPermissionPolicy,
+  };
+  const checkpoint = {
+    expectedTarget: null,
+    sourceObservationKey: null,
+    nextRequiredCapability: "browser_validation",
+  };
+  const contract = resolveExecuteRecoveryActionContract("validation_only", {
+    decisionCheckpoint: checkpoint,
+    devServerStatus: "none",
+    devServerNextCapability: "launch",
+  });
+  const run = async (command, evidence = [{ kind: "browser_dom", value: "browser interaction: click New", requiresInteraction: true }]) => {
+    const executeRecoveryState = {
+      mode: "validation_only",
+      reason: "approved_plan_browser_handoff",
+      expectedTarget: null,
+      attempts: 1,
+      iterationCount: 1,
+      decisionCheckpoint: checkpoint,
+    };
+    const input = createReadFilePartitionInput({
+      toolCalls: [{
+        id: `launch-${command}`,
+        name: "execute_command",
+        arguments: JSON.stringify({ command, cwd: ".", description: "Start the local development server" }),
+      }],
+      workflowMode: "plan",
+      planRuntimePhase: "executing",
+      availableToolNames: new Set(["execute_command"]),
+      toolCapabilityRegistry: registry,
+      executeRecoveryState,
+      recoveryActionContract: contract,
+    });
+    input.callbacks = {
+      ...input.callbacks,
+      getAutoApproveToolScopes: () => ["shell"],
+      getIsPlanApproved: () => true,
+      getPlanStage: () => "executing",
+      getPlanTasks: () => [{
+        id: "browser-check",
+        text: "Click New and assert that the empty editor is visible",
+        status: "pending",
+        executionKind: "validation",
+        evidence,
+      }],
+    };
+    return partitionToolCallsForExecution(input);
+  };
+
+  const launch = await run("npm run dev");
+  assert.equal(launch.preExecutionResults.length, 0);
+  assert.equal(launch.writeCalls.length, 1);
+
+  const compound = await run("npm run dev; touch src/unplanned.ts");
+  assert.equal(compound.writeCalls.length, 0);
+  assert.equal(compound.preExecutionResults[0]?.qualityGateReason, "approved_plan_command_scope_deferred");
+
+  const reviewedAlternative = await run("npm run dev", [{ kind: "cmd", value: "npm run preview" }]);
+  assert.equal(reviewedAlternative.writeCalls.length, 0);
+  assert.equal(reviewedAlternative.preExecutionResults[0]?.qualityGateReason, "approved_plan_command_scope_deferred");
 });
 
 test("reconcile-server lease accepts only a health probe for the observed port", async () => {
@@ -2742,6 +2875,26 @@ test("iteration tool planning derives action-plus PTY and browser surfaces from 
     turnInputContextSignals: {},
     lastAssistantTextForCheckpoint: "",
   };
+  const browserNeedsLaunch = resolveIterationToolSurface({
+    ...baseInput,
+    executeRecoveryMode: "validation_only",
+    executeRecoveryDecisionCheckpoint: {
+      expectedTarget: null,
+      sourceObservationKey: null,
+      nextRequiredCapability: "browser_validation",
+    },
+    callbacks: {
+      ...baseInput.callbacks,
+      getPlanExecutionEvidenceLedger: () => [],
+    },
+  });
+  assert.equal(browserNeedsLaunch.recoveryActionContract.devServerStatus, "none");
+  assert.equal(browserNeedsLaunch.recoveryActionContract.nextRequiredCapability, "launch_long_process");
+  assert.deepEqual(
+    browserNeedsLaunch.iterationAllTools.map((tool) => tool.function.name),
+    ["execute_command"],
+  );
+
   const pending = resolveIterationToolSurface({
     ...baseInput,
     callbacks: {
@@ -3015,21 +3168,21 @@ test("failed finite validation recovery preserves explicit command evidence", ()
   assert.doesNotMatch(explicitPrompt, /call one different finite validation command/);
   assert.doesNotMatch(explicitPrompt, /Do not repeat the failed command unchanged/);
 
-  const placeholderPolicy = resolveFailedFiniteValidationRecoveryPolicy({
+  const runtimeOwnedPolicy = resolveFailedFiniteValidationRecoveryPolicy({
     failedCommand: "npm run build",
-    tasks: [{ evidence: [{ kind: "cmd", value: "focused validation command" }] }],
+    tasks: [],
   });
-  assert.deepEqual(placeholderPolicy, {
+  assert.deepEqual(runtimeOwnedPolicy, {
     allowAlternativeCommand: true,
     requiredCommand: "",
   });
-  const placeholderPrompt = buildFailedFiniteValidationRecoveryPrompt({
+  const runtimeOwnedPrompt = buildFailedFiniteValidationRecoveryPrompt({
     command: "npm run build",
     result: '{"exitCode":1,"stderr":"missing script"}',
-    ...placeholderPolicy,
+    ...runtimeOwnedPolicy,
   });
-  assert.match(placeholderPrompt, /generic finite-validation placeholder/);
-  assert.match(placeholderPrompt, /one compatible finite command/);
+  assert.match(runtimeOwnedPrompt, /No exact command was reviewed/);
+  assert.match(runtimeOwnedPrompt, /one compatible finite command/);
 });
 
 test("failed finite validation recovery ignores runtime availability probes", () => {
@@ -3044,7 +3197,7 @@ test("failed finite validation recovery ignores runtime availability probes", ()
     false,
   );
   assert.equal(hasPendingPlanCommandEvidence([{
-    evidence: [{ kind: "cmd", value: "focused validation command" }],
+    evidence: [{ kind: "cmd", value: "npm run build" }],
   }]), true);
   assert.equal(hasPendingPlanCommandEvidence([{
     evidence: [{ kind: "browser_dom", value: "http://localhost:5173" }],
@@ -3084,8 +3237,8 @@ test("failed finite validation recovery distinguishes invocation errors from rea
   }), false);
   assert.equal(failedFiniteValidationMatchesPendingPlanEvidence({
     failedCommand: "npm run build",
-    tasks: [{ evidence: [{ kind: "cmd", value: "focused validation command" }] }],
-  }), true);
+    tasks: [],
+  }), false);
 
   const compacted = compactStructuredCommandResult(JSON.stringify({
     command: "npm run build",
@@ -3484,10 +3637,10 @@ test("recovery batch selection serializes different model call shapes by phase",
       nextRequiredCapability: "browser_validation",
     },
   });
-  assert.equal(finiteBrowserContract.nextRequiredCapability, "browser_validation");
+  assert.equal(finiteBrowserContract.nextRequiredCapability, "launch_long_process");
   assert.deepEqual(finiteBrowserContract.toolCallRequirement, {
     kind: "required_named",
-    toolName: "browser_evaluate",
+    toolName: "execute_command",
   });
   const finiteBrowserValidation = resolveExecuteRecoveryBatchDecision({
     mode: "finite_validation_only",
@@ -3495,14 +3648,15 @@ test("recovery batch selection serializes different model call shapes by phase",
     calls: [
       { id: "stale-command", name: "run_command", target: "npm test" },
       { id: "browser", name: "browser_evaluate", target: "http://localhost:1420/" },
+      { id: "launch", name: "execute_command", target: "npm run dev" },
     ],
   });
   assert.equal(
     finiteBrowserValidation.selectedCallId,
-    "browser",
-    "the checkpoint capability must advance a composite task from command validation to browser validation",
+    "launch",
+    "a browser obligation must satisfy its process prerequisite before browser validation",
   );
-  assert.deepEqual(finiteBrowserValidation.deferredCallIds, ["stale-command"]);
+  assert.deepEqual(finiteBrowserValidation.deferredCallIds, ["stale-command", "browser"]);
 
   const commandValidationContract = resolveExecuteRecoveryActionContract("validation_only", {
     decisionCheckpoint: {

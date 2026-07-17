@@ -30,8 +30,8 @@ test("assistant completion phase owns the no-tool assistant completion ordering"
   const finalNoToolAssistantTurn = indexOfRequired(phaseSource, /handleFinalNoToolAssistantTurn\(\{/);
 
   assert.ok(replyOptionsPause < preCompletionEvidenceAudit);
-  assert.ok(preCompletionEvidenceAudit < activeRecoveryContract);
-  assert.ok(activeRecoveryContract < executeNoToolRecovery);
+  assert.ok(preCompletionEvidenceAudit < executeNoToolRecovery);
+  assert.ok(executeNoToolRecovery < activeRecoveryContract);
   assert.ok(executeNoToolRecovery < planNoToolRecovery);
   assert.ok(planNoToolRecovery < missingToolNoToolRecovery);
   assert.ok(missingToolNoToolRecovery < approvedPlanFinalization);
@@ -49,6 +49,7 @@ test("assistant completion phase owns the no-tool assistant completion ordering"
   );
   assert.match(phaseSource, /currentExecuteRecoveryState\.mode !== "normal"/);
   assert.match(phaseSource, /precompletion_evidence_recovery_still_active/);
+  assert.match(phaseSource, /protocolViolationOnly: currentExecuteRecoveryState\.mode !== "normal"/);
   assert.ok(
     indexOfRequired(phaseSource, /currentExecuteRecoveryState\.mode !== "normal"/) <
       indexOfRequired(phaseSource, /__EVIDENCE_DRAFT_COMMIT__:evidence_closed/),
