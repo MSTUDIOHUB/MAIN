@@ -4776,6 +4776,7 @@ export async function executeWriteToolWithReview(
       target,
       shellPermissionCommand: shellApprovalResolution.command,
       shellPermissionDecision: shellApprovalResolution.decision?.decision || null,
+      shellPermissionApprovalScope: shellApprovalResolution.approval?.scope || null,
     });
     return await executeToolCallWithLifecycle(
       tc,
@@ -4784,6 +4785,7 @@ export async function executeWriteToolWithReview(
       allTools,
       hooksConfig,
       {
+        shellPermissionApproval: shellApprovalResolution.approval,
         turnContext: options.turnContext,
         recentPlanToolActivity: options.recentPlanToolActivity,
         attemptedPlanWriteTargets: options.attemptedPlanWriteTargets,

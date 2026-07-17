@@ -7,6 +7,7 @@ import {
   resolveTurnPresentationLifecycle,
   type TurnPresentationModel,
 } from "../lib/turnPresentation";
+import { getReviewablePlanArtifacts } from "../lib/planApprovalIdentity";
 
 interface PlanPanelProps {
   presentation?: TurnPresentationModel;
@@ -43,10 +44,10 @@ const COPY = {
     workspaceTitle: "计划工作区",
     currentPlan: "本轮计划",
     previewTitle: "方案预览",
-    previewHint: "当前回合说明预览",
+    draftPreview: "候选草稿",
+    draftPreviewHint: "尚未形成通过校验的正式计划",
     pendingApproval: "待审批",
     awaitingChoice: "待选择",
-    previewReady: "已生成预览",
     actionRequired: "待处理",
     paused: "已暂停",
     stopped: "未执行",
@@ -81,7 +82,7 @@ const COPY = {
     generatingFooter: "计划仍在补全中。先生成正式 plan.md 供确认，确认后再生成执行任务；数据分析类任务会优先形成分析方案，而不是直接改代码。",
     helperApproval: "计划已经准备完成。确认后会进入执行能力，写入与命令仍会逐项审查；如果当前是数据分析方案，也会继续保持分析/报表语义而不是默认切到代码实现。",
     helperChoice: "当前计划遇到了关键分叉，Agent 已暂停并等待你的选择。请先在聊天区点击一个选项，再继续生成正式方案或进入执行。",
-    helperIdlePreview: "正式的计划文件还没写入时，会先在这里展示当前回合的说明预览，避免右侧面板空白。",
+    helperDraftPreview: "这是模型生成的候选草稿，尚未形成通过校验的正式计划，不能审批或执行。",
     helperIdle: "切换到 Plan 模式后，Agent 会先在 .MAIN/plans 中生成规划文件（可以是工程方案，也可以是分析方案），并在这里展示审批与执行进展。",
     helperExecuting: "执行阶段会尽量保持任务列表和计划文档同步更新。",
     helperCompleted: "计划执行完成。这里会保留摘要与任务状态，聊天区也可以继续查看完整过程。",
@@ -106,10 +107,10 @@ const COPY = {
     workspaceTitle: "Plan Workspace",
     currentPlan: "Current Plan",
     previewTitle: "Plan Preview",
-    previewHint: "Current turn preview",
+    draftPreview: "Candidate Draft",
+    draftPreviewHint: "A validated plan artifact has not been created yet",
     pendingApproval: "Awaiting Approval",
     awaitingChoice: "Awaiting Choice",
-    previewReady: "Preview Ready",
     actionRequired: "Action Required",
     paused: "Paused",
     stopped: "No Action",
@@ -144,7 +145,7 @@ const COPY = {
     generatingFooter: "The plan is still being completed. Finish the formal plan proposal first; tasks will be generated after approval. Data-analysis plans should stay analysis-first instead of jumping straight to code changes.",
     helperApproval: "The plan is ready. After approval, execution tools are enabled while writes and commands remain review-gated. Data-analysis plans should keep their analysis/reporting semantics instead of defaulting to code implementation.",
     helperChoice: "The current plan hit a real branch point, so the agent is paused and waiting for your choice. Pick an option in chat before continuing the plan or execution.",
-    helperIdlePreview: "Before a formal plan file is written, the current-turn preview is shown here so the panel never feels blank.",
+    helperDraftPreview: "This is a model-authored candidate. It is not a validated plan and cannot be approved or executed.",
     helperIdle: "In Plan mode, the agent will first generate planning files in .MAIN/plans, whether they are engineering specs or analysis-plan documents, and then show review and execution progress here.",
     helperExecuting: "During execution, the task list and plan documents will stay in sync as much as possible.",
     helperCompleted: "Plan execution is complete. This panel keeps the summary and task state while the chat still shows the full process.",
@@ -217,6 +218,15 @@ export default function PlanPanel({
   const [isApproving, setIsApproving] = useState(false);
   const [adjustmentText, setAdjustmentText] = useState("");
   const approvingRef = useRef(false);
+  const previewMarkdown = fallbackPreview.trim();
+  const hasReviewablePlanArtifact = useMemo(
+    () => getReviewablePlanArtifacts(artifacts).length > 0,
+    [artifacts],
+  );
+  const displayArtifacts = useMemo(
+    () => (hasReviewablePlanArtifact || !previewMarkdown ? artifacts : []),
+    [artifacts, hasReviewablePlanArtifact, previewMarkdown],
+  );
 
   useEffect(() => {
     if (isApproved || stage === "executing" || stage === "completed") {
@@ -233,21 +243,21 @@ export default function PlanPanel({
   };
 
   useEffect(() => {
-    if (!artifacts.length) {
+    if (!displayArtifacts.length) {
       setActiveArtifactPath("");
       return;
     }
-    if (!artifacts.some((artifact) => artifact.path === activeArtifactPath)) {
-      setActiveArtifactPath(artifacts[artifacts.length - 1].path);
+    if (!displayArtifacts.some((artifact) => artifact.path === activeArtifactPath)) {
+      setActiveArtifactPath(displayArtifacts[displayArtifacts.length - 1].path);
     }
-  }, [artifacts, activeArtifactPath]);
+  }, [displayArtifacts, activeArtifactPath]);
 
   useEffect(() => {
     setSaveState("idle");
   }, [activeArtifactPath, fallbackPreview, fallbackTitle]);
 
-  const activeArtifact = artifacts.find((artifact) => artifact.path === activeArtifactPath) || artifacts[artifacts.length - 1];
-  const previewMarkdown = fallbackPreview.trim();
+  const activeArtifact = displayArtifacts.find((artifact) => artifact.path === activeArtifactPath) || displayArtifacts[displayArtifacts.length - 1];
+  const isCandidateOnly = !hasReviewablePlanArtifact && previewMarkdown.length > 0;
   const displayTasks = useMemo(
     () => (tasks.length > 0 ? tasks : previewMarkdown ? extractPlanTasks(previewMarkdown) : []),
     [tasks, previewMarkdown],
@@ -293,6 +303,8 @@ export default function PlanPanel({
     ? copy.awaitingChoice
     : presentationBehavior.mode === "action_required"
     ? copy.actionRequired
+    : isCandidateOnly
+    ? copy.draftPreview
     : presentationBehavior.mode === "resumable"
     ? copy.paused
     : presentationBehavior.mode === "success"
@@ -301,8 +313,6 @@ export default function PlanPanel({
     ? copy.stopped
     : presentationBehavior.mode === "failed"
     ? copy.failed
-    : stage === "idle" && previewMarkdown
-    ? copy.previewReady
     : copy.stage[stage];
   const stageTone = presentationBehavior.mode === "failed"
     ? getStageTone("bugfix")
@@ -325,13 +335,11 @@ export default function PlanPanel({
       return copy.helperChoice;
     }
     if (presentationBehavior.mode === "action_required") return copy.helperActionRequired;
+    if (isCandidateOnly) return copy.helperDraftPreview;
     if (presentationBehavior.mode === "resumable") return copy.pausedExecutionHint;
     if (presentationBehavior.mode === "success") return copy.helperCompleted;
     if (presentationBehavior.mode === "no_action") return copy.helperNoAction;
     if (presentationBehavior.mode === "failed") return copy.helperFailed;
-    if (stage === "idle" && previewMarkdown) {
-      return copy.helperIdlePreview;
-    }
     if (stage === "idle") {
       return copy.helperIdle;
     }
@@ -342,7 +350,7 @@ export default function PlanPanel({
       return copy.helperCompleted;
     }
     return copy.helperDefault;
-  }, [copy, presentationBehavior.mode, previewMarkdown, stage]);
+  }, [copy, isCandidateOnly, presentationBehavior.mode, stage]);
 
   const currentDocument = activeArtifact
     ? {
@@ -399,6 +407,7 @@ export default function PlanPanel({
       data-turn-lifecycle={presentation?.lifecycle}
       data-action-kind={presentation?.actionKind}
       data-plan-presentation={presentationBehavior.mode}
+      data-plan-document-kind={hasReviewablePlanArtifact ? "artifact" : isCandidateOnly ? "candidate" : "empty"}
       className="plan-review-panel flex h-full flex-col bg-[#050505]"
     >
       <div className="border-b border-[#27272a] px-4 py-3 bg-[#09090b]">
@@ -488,10 +497,10 @@ export default function PlanPanel({
 
       </div>
 
-      {artifacts.length > 0 ? (
+      {displayArtifacts.length > 0 ? (
         <>
           <div className="flex flex-wrap gap-2 border-b border-[#18181b] bg-[#070709] px-4 py-2">
-            {artifacts.map((artifact) => {
+            {displayArtifacts.map((artifact) => {
               const active = artifact.path === activeArtifact?.path;
               return (
                 <button
@@ -545,7 +554,9 @@ export default function PlanPanel({
             <div className="mb-4 flex items-center justify-between gap-3 border-b border-[#18181b] pb-3">
               <div>
                 <div className="text-[14px] font-semibold text-[#f5f5f5]">{fallbackTitle || activeTurn?.title || copy.previewTitle}</div>
-                <div className="mt-1 text-[11px] text-[#71717a]">{copy.previewHint}</div>
+                <div className="mt-1 text-[11px] text-[#71717a]">
+                  {copy.draftPreviewHint}
+                </div>
               </div>
               <div className="flex items-center gap-2">
                 {currentDocument && onSaveDocument && (

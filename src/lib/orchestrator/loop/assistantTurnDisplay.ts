@@ -80,11 +80,21 @@ export function resolveAssistantTurnDisplayDecision(input: {
   // models that omit <user_options>. Once this execution has real evidence,
   // inferred future-work suggestions must not reopen approval. Explicit model
   // choices remain untouched and can still pause at a genuine decision fork.
-  const normalizedReplyOptions = executionConclusionCandidate
-    ? input.normalizedReplyOptions.filter((option) => option.source !== "proposal_follow_up")
+  // Plan choices have a structured protocol. Numbered prose is commonly used
+  // for findings and implementation steps, so compatibility inference must
+  // not promote it into a user decision. This removes the need to classify
+  // every possible diagnostic sentence with language-specific keywords.
+  const protocolReplyOptions = input.workflowMode === "plan"
+    ? input.normalizedReplyOptions.filter((option) =>
+        option.source === "explicit_user_options"
+      )
     : input.normalizedReplyOptions;
+  const normalizedReplyOptions = executionConclusionCandidate
+    ? protocolReplyOptions.filter((option) => option.source !== "proposal_follow_up")
+    : protocolReplyOptions;
   const suppressInferredOperationApprovalAfterExecution =
-    normalizedReplyOptions.length !== input.normalizedReplyOptions.length;
+    executionConclusionCandidate &&
+    normalizedReplyOptions.length !== protocolReplyOptions.length;
   const compactedProseCodeDump = shouldCompactProseCodeDump({
     workflowMode: input.workflowMode,
     turnIntent: input.turnIntent,

@@ -16,7 +16,7 @@ const module = { exports: {} };
 new Function("exports", "module", "require", transpiled)(module.exports, module, localRequire);
 const { createTerminalStatusPublicationGate } = module.exports;
 
-test("terminal status gate persists the terminal projection before publishing idle", () => {
+test("terminal status gate awaits the terminal projection before publishing idle", async () => {
   const gate = createTerminalStatusPublicationGate();
   const order = [];
 
@@ -26,18 +26,29 @@ test("terminal status gate persists the terminal projection before publishing id
   });
   assert.deepEqual(order, []);
 
-  gate.commitTerminal({
-    persistTerminalProjection: () => order.push("persist_terminal_projection"),
+  const commit = gate.commitTerminal({
+    persistTerminalProjection: async () => {
+      order.push("persist_terminal_projection_started");
+      await Promise.resolve();
+      order.push("persist_terminal_projection_finished");
+    },
     publishTerminalStatus: () => order.push("publish_idle"),
   });
 
-  assert.deepEqual(order, ["persist_terminal_projection", "publish_idle"]);
+  assert.deepEqual(order, ["persist_terminal_projection_started"]);
+  assert.equal(gate.requestStatus("idle").publishNow, false);
+  await commit;
+  assert.deepEqual(order, [
+    "persist_terminal_projection_started",
+    "persist_terminal_projection_finished",
+    "publish_idle",
+  ]);
   assert.equal(gate.requestStatus("idle").publishNow, true);
 });
 
-test("a resumed running phase starts a fresh idle publication transaction", () => {
+test("a resumed running phase starts a fresh idle publication transaction", async () => {
   const gate = createTerminalStatusPublicationGate();
-  gate.commitTerminal({
+  await gate.commitTerminal({
     persistTerminalProjection: () => {},
     publishTerminalStatus: () => {},
   });
@@ -47,4 +58,40 @@ test("a resumed running phase starts a fresh idle publication transaction", () =
     publishNow: false,
     deferredIdleCount: 1,
   });
+});
+
+test("a failed durable write never publishes idle", async () => {
+  const gate = createTerminalStatusPublicationGate();
+  let published = false;
+
+  await assert.rejects(
+    gate.commitTerminal({
+      persistTerminalProjection: async () => {
+        throw new Error("disk unavailable");
+      },
+      publishTerminalStatus: () => {
+        published = true;
+      },
+    }),
+    /disk unavailable/,
+  );
+
+  assert.equal(published, false);
+  assert.equal(gate.requestStatus("idle").publishNow, false);
+});
+
+test("lost run ownership cancels terminal publication without publishing idle", async () => {
+  const gate = createTerminalStatusPublicationGate();
+  let published = false;
+
+  const committed = await gate.commitTerminal({
+    persistTerminalProjection: async () => false,
+    publishTerminalStatus: () => {
+      published = true;
+    },
+  });
+
+  assert.equal(committed, false);
+  assert.equal(published, false);
+  assert.equal(gate.requestStatus("idle").publishNow, false);
 });

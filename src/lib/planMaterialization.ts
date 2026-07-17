@@ -1397,7 +1397,6 @@ type PlanFacetReferencePrefix = "E" | "C" | "D" | "V";
 interface PlanFacetTraceabilityRow {
   index: number;
   body: string;
-  evidenceRefs: string[];
   changeRefs: string[];
   decisionRefs: string[];
   validationRefs: string[];
@@ -1425,7 +1424,6 @@ function parsePlanFacetTraceabilityRows(sections: ParsedPlanSection[]): PlanFace
       rows.push({
         index: Number(match[1]),
         body,
-        evidenceRefs: collectPlanReferenceIds(body, "E"),
         changeRefs: collectPlanReferenceIds(body, "C"),
         decisionRefs: collectPlanReferenceIds(body, "D"),
         validationRefs: collectPlanReferenceIds(body, "V"),
@@ -1435,10 +1433,9 @@ function parsePlanFacetTraceabilityRows(sections: ParsedPlanSection[]): PlanFace
   return rows;
 }
 
-function planFacetTraceabilityRowIsGrounded(input: {
+function planFacetTraceabilityRowCoversActionAndValidation(input: {
   row?: PlanFacetTraceabilityRow;
   facetTerms: Set<string>;
-  evidenceBody: string;
   changesBody: string;
   decisionsBody: string;
   validationBody: string;
@@ -1449,8 +1446,7 @@ function planFacetTraceabilityRowIsGrounded(input: {
     refs.length > 0 && refs.every((ref) => new RegExp(`\\[${ref}\\]`, "i").test(body));
   const groundedAction = referencesExist(row.changeRefs, input.changesBody) ||
     referencesExist(row.decisionRefs, input.decisionsBody);
-  return referencesExist(row.evidenceRefs, input.evidenceBody) &&
-    groundedAction &&
+  return groundedAction &&
     referencesExist(row.validationRefs, input.validationBody);
 }
 
@@ -1465,9 +1461,6 @@ export function validateNumberedUserGoalFacetCoverage(input: {
     .filter((section) => planSectionMatchesRole(section, patterns))
     .map((section) => `${section.ancestors.join("\n")}\n${section.title}\n${section.body}`)
     .join("\n");
-  const evidenceBody = collectRoleText([
-    /证据|发现|根因|现状|当前状态|当前实现|现有架构|背景|上下文|约束|依赖|边界|基线|需求依据|evidence|finding|root cause|current state|current implementation|existing architecture|background|context|constraint|dependenc|boundary|baseline/i,
-  ]);
   const changesBody = collectRoleText([
     /关键改动|实现改动|具体改动|改动|变更|修复方案|实现方案|实施方案|执行方案|架构|设计|组件|数据流|落地方案|key changes|changes?|implementation|fix plan|approach|architecture|design|components?|data flow|plan of work/i,
   ]);
@@ -1478,13 +1471,12 @@ export function validateNumberedUserGoalFacetCoverage(input: {
   const traceabilityRows = parsePlanFacetTraceabilityRows(sections);
   const uncovered = facets.filter((facet) => {
     const terms = semanticFacetTerms(facet.text);
-    const semanticCoverage = facetSectionCovered(terms, evidenceBody) &&
+    const semanticCoverage =
       (facetSectionCovered(terms, changesBody) || facetSectionCovered(terms, decisionsBody)) &&
       facetSectionCovered(terms, validationBody);
-    const referenceCoverage = planFacetTraceabilityRowIsGrounded({
+    const referenceCoverage = planFacetTraceabilityRowCoversActionAndValidation({
       row: traceabilityRows.find((row) => row.index === facet.index),
       facetTerms: terms,
-      evidenceBody,
       changesBody,
       decisionsBody,
       validationBody,

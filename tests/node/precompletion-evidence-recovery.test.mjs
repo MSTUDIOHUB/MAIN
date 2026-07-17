@@ -581,6 +581,7 @@ test("page runtime errors become durable negative evidence", () => {
 test("a browser runtime failure with a source reference returns to mutation instead of server reconciliation", () => {
   const browserPayload = JSON.stringify({
     ok: false,
+    screenshotPath: ".MAIN/browser-validation/browser-1784254183346-20946.png",
     actions: [{ kind: "click", target: "#new-btn", ok: true }],
     assertions: [],
     pageErrors: [
@@ -596,6 +597,7 @@ test("a browser runtime failure with a source reference returns to mutation inst
   const ledger = [mutation(), ...launchAndReady(), failed];
   const failure = verification.resolveLatestUnreconciledFailureSignal({ ledger });
   assert.equal(failed.browserInteraction.pageErrors.length, 1);
+  assert.ok(failed.references.includes(".MAIN/browser-validation/browser-1784254183346-20946.png"));
   assert.equal(failure.domain, "browser");
   assert.equal(failure.sourceTarget, "src/main.js");
 
@@ -618,6 +620,25 @@ test("a browser runtime failure with a source reference returns to mutation inst
   assert.equal(recovery.nextRequiredCapability, "mutation");
   assert.equal(recovery.expectedTarget, "src/main.js");
   assert.match(recovery.reason, /unreconciled_failure:browser/);
+});
+
+test("a browser screenshot receipt is never promoted to a source repair target", () => {
+  const failed = planEvidence.createPlanExecutionFailureEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    error: `BROWSER_VALIDATION_FAILED: runtime error\n${JSON.stringify({
+      ok: false,
+      screenshotPath: ".MAIN/browser-validation/browser-receipt.png",
+      pageErrors: ["Application closed before the assertion completed"],
+      consoleErrors: [],
+      actions: [],
+      assertions: [],
+    })}`,
+  });
+
+  const failure = verification.resolveLatestUnreconciledFailureSignal({ ledger: [failed] });
+  assert.equal(failure.domain, "browser");
+  assert.equal(failure.sourceTarget, null);
 });
 
 test("external review markers are advisory while actual automation is explicit evidence", () => {

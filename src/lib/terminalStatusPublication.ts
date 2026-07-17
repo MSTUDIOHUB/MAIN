@@ -27,14 +27,19 @@ export function createTerminalStatusPublicationGate() {
       return { publishNow: true, deferredIdleCount };
     },
 
-    commitTerminal(input: {
-      persistTerminalProjection: () => void;
+    async commitTerminal(input: {
+      persistTerminalProjection: () => boolean | void | Promise<boolean | void>;
       publishTerminalStatus: () => void;
-    }): void {
-      input.persistTerminalProjection();
+    }): Promise<boolean> {
+      const committed = await input.persistTerminalProjection();
+      if (committed === false) {
+        deferredIdleCount = 0;
+        return false;
+      }
       terminalProjectionCommitted = true;
       input.publishTerminalStatus();
       deferredIdleCount = 0;
+      return true;
     },
 
     discardDeferredIdle(): void {

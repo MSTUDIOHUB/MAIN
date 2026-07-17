@@ -139,7 +139,7 @@ test("shell auto approval resolves command text for shell tools", () => {
   );
 });
 
-test("shell auto approval never promotes an ask decision", async () => {
+test("shell auto approval supplies an exact approval for a non-destructive ask decision", async () => {
   const decision = createDecision();
   const resolution = await resolveShellAutoApproval({
     toolName: "run_command",
@@ -157,9 +157,10 @@ test("shell auto approval never promotes an ask decision", async () => {
 
   assert.equal(resolution.command, decision.command);
   assert.equal(resolution.decision, decision);
-  assert.equal(resolution.approval, undefined);
-  assert.equal(resolution.requiresUserReview, true);
-  assert.equal(canApplyShellAutoReview(resolution), false);
+  assert.equal(resolution.approval.command, decision.command);
+  assert.equal(resolution.approval.scope, "session");
+  assert.equal(resolution.requiresUserReview, false);
+  assert.equal(canApplyShellAutoReview(resolution), true);
 });
 
 test("shell auto approval leaves allow and deny decisions to the permission guard", async () => {
@@ -244,6 +245,30 @@ test("parameter-level shell mutations cannot inherit session auto review", async
   }
 });
 
+test("critical ask decisions remain behind explicit review", async () => {
+  const resolution = await resolveShellAutoApproval({
+    toolName: "execute_command",
+    args: { command: "custom-admin-command", cwd: "." },
+    workspace: "/tmp/project",
+    preflight: async () => createDecision({
+      command: "custom-admin-command",
+      riskLevel: "critical",
+      segmentDecisions: [{
+        command: "custom-admin-command",
+        decision: "ask",
+        matchedRule: null,
+        suggestedRule: "custom-admin-command",
+        riskLevel: "critical",
+        reviewReason: "Critical command requires explicit review",
+      }],
+    }),
+  });
+
+  assert.equal(resolution.approval, undefined);
+  assert.equal(resolution.requiresUserReview, true);
+  assert.equal(canApplyShellAutoReview(resolution), false);
+});
+
 test("shell approval rules are deduped across decision and segments", () => {
   const decision = createDecision({
     suggestedRules: ["git", "git"],
@@ -291,7 +316,7 @@ test("game studio shell commands use the same auto approval path", async () => {
   });
 
   assert.equal(resolution.command, "godot --headless --export-release macOS");
-  assert.equal(resolution.approval, undefined);
-  assert.equal(resolution.requiresUserReview, true);
-  assert.equal(canApplyShellAutoReview(resolution), false);
+  assert.equal(resolution.approval.command, "godot --headless --export-release macOS");
+  assert.equal(resolution.requiresUserReview, false);
+  assert.equal(canApplyShellAutoReview(resolution), true);
 });

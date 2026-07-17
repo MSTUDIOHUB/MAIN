@@ -192,18 +192,18 @@ test("onToolError records only explicit executor failures in the evidence ledger
   );
 });
 
-test("workflow engine closes harness from structured agent loop outcome", () => {
+test("workflow engine projects then closes harness from structured agent loop outcome", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
   assert.match(source, /type AgentLoopOutcome/);
-  assert.match(source, /const closeHarnessForAgentLoopOutcome = \(outcome: AgentLoopOutcome\) =>/);
+  assert.match(source, /const projectHarnessForAgentLoopOutcome = \(outcome: AgentLoopOutcome\)/);
   assert.match(source, /case "completed":[\s\S]*agent_loop_completed/);
-  assert.match(source, /case "paused":[\s\S]*closeCurrentHarnessRunMarker\("paused"/);
+  assert.match(source, /case "paused":[\s\S]*projectCurrentHarnessRunMarker\("paused"/);
   assert.match(source, /case "stopped_no_action":[\s\S]*agent_loop_no_action/);
+  assert.match(source, /publishCurrentHarnessRunMarkerClose/);
   assert.match(source, /agent_loop_stop_summary/);
-  assert.match(source, /streamElapsedMs:\s*marker\.streamElapsedMs/);
-  assert.match(source, /lastStreamError:\s*marker\.lastStreamError/);
-  assert.doesNotMatch(source, /closeCurrentHarnessRunMarker\("completed", "agent_loop_resolved"\)/);
+  assert.match(source, /streamElapsedMs:\s*source\.streamElapsedMs/);
+  assert.match(source, /lastStreamError:\s*source\.lastStreamError/);
 });
 
 test("agent loop returns structured non-completed outcomes for stops and approved-plan guard", () => {
@@ -1049,7 +1049,10 @@ test("approved plan no-tool turns use evidence recovery, the active contract, th
   assert.match(workflowEngine, /const stopBlock = \{/);
   assert.match(workflowEngine, /type: "system"/);
   assert.match(workflowEngine, /content: message/);
-  assert.match(workflowEngine, /variant: "execution_checkpoint"/);
+  assert.match(
+    workflowEngine,
+    /variant: isPlanGenerationFailure \? "plan_quality_gate" : "execution_checkpoint"/,
+  );
   assert.match(workflowEngine, /planExecutionProgress: progress/);
   assert.match(workflowEngine, /summary: message/);
 });
@@ -1080,7 +1083,11 @@ test("explicit reply options mark assistant text as awaiting input even when too
   assert.match(runnerSource, /agent_loop_awaiting_user_choice/);
   assert.match(workflowEngine, /const awaitingInput = meta\?\.awaitingInput === true && replyOptions\.length > 0/);
   assert.match(workflowEngine, /status:\s*"awaiting_input"/);
-  assert.match(workflowEngine, /agentStatus:\s*"idle"[\s\S]*?isGenerating:\s*false/);
+  assert.match(
+    workflowEngine,
+    /isIntentionalActionPause[\s\S]*?await persistCurrentSessionRuntime\(sessionGet\(\)\)[\s\S]*?agentStatus:[\s\S]*?: "idle"[\s\S]*?isGenerating: false/,
+    "awaiting-input turns may publish idle only after their checkpoint is durable",
+  );
 });
 
 test("agent loop blocks execute completion without execution evidence", () => {
@@ -1136,7 +1143,7 @@ test("workflow engine owns one hidden auto-resume at max-iteration checkpoints",
   const planHandler = source.slice(planStart, executeStart);
   const executeHandler = source.slice(executeStart, handlersEnd);
   const terminalStart = source.indexOf("const queuedAfterRun =", handlersEnd);
-  const terminalEnd = source.indexOf("return true;", terminalStart);
+  const terminalEnd = source.indexOf("}).catch(async", terminalStart);
   const terminalContinuation = source.slice(terminalStart, terminalEnd);
 
   assert.notEqual(planStart, -1);
@@ -1320,6 +1327,7 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitWorkflowEngineRunnerSource, /export function createSubmitWorkflowEngineHelpers/);
   assert.match(submitWorkflowEngineRunnerSource, /export function runSubmitWorkflowEngine/);
   assert.match(submitWorkflowEngineRunnerSource, /new WorkflowEngine/);
+  assert.match(submitWorkflowEngineRunnerSource, /persistSessionRecord: saveProjectSession/);
   assert.match(gameStudioLocalSlashBridgeSource, /export function createGameStudioLocalSlashBridge/);
   assert.match(gameStudioLocalSlashBridgeSource, /buildSubmitLocalStudioTurnPatch/);
   assert.match(gameStudioLocalSlashBridgeSource, /buildLocalSlashRuntimeSnapshot/);
@@ -1474,8 +1482,10 @@ test("global plan toolbar button is driven by live plan workspace, not historica
 
   assert.match(chatAreaSource, /hasLivePlanWorkspace/);
   assert.match(chatAreaSource, /const activePlanFallbackPreview = useMemo/);
-  assert.match(chatAreaSource, /extractStructuredPlanProposal/);
-  assert.match(chatAreaSource, /extractPlanDraftPreview/);
+  assert.match(chatAreaSource, /selectLatestPlanCandidatePreview\(entry\.blocks\)/);
+  assert.match(chatAreaSource, /if \(pinnedPlanTurn\.id === planArtifactOwnerTurnId\) return ""/);
+  assert.match(chatAreaSource, /hasReviewablePlanArtifact && turn\.id === planArtifactOwnerTurnId/);
+  assert.match(chatAreaSource, /hasGeneratedPlanContent\(blocks\)/);
   assert.match(chatAreaSource, /const hasLivePlanWorkspaceContent = useMemo\(\(\) => hasLivePlanWorkspace/);
   assert.match(chatAreaSource, /fallbackPlanPreview:\s*activePlanFallbackPreview/);
   assert.match(chatAreaSource, /\{hasLivePlanWorkspaceContent && \(/);
@@ -1578,11 +1588,17 @@ test("terminal runs persist the turn projection before publishing idle", () => {
   const finalTextStart = workflowEngineSource.indexOf("onAssistantFinalText:");
   const toolExecutingStart = workflowEngineSource.indexOf("onToolExecuting:", finalTextStart);
   const finalTextCallback = workflowEngineSource.slice(finalTextStart, toolExecutingStart);
-  const commitIndex = workflowEngineSource.indexOf("commitTerminalProjectionBeforeStatusPublication(loopOutcome)");
-  const closeIndex = workflowEngineSource.indexOf("closeHarnessForAgentLoopOutcome(loopOutcome)", commitIndex);
-  const persistIndex = workflowEngineSource.indexOf("persistCurrentSessionRuntime(latestState)", closeIndex);
+  const markerProjectionIndex = workflowEngineSource.indexOf(
+    "const harnessProjection = projectHarnessForAgentLoopOutcome(loopOutcome)",
+  );
+  const commitIndex = workflowEngineSource.indexOf(
+    "const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(",
+    markerProjectionIndex,
+  );
   const gateCommitIndex = workflowEngineSource.indexOf("terminalStatusPublicationGate.commitTerminal({");
   const persistProjectionIndex = workflowEngineSource.indexOf("persistTerminalProjection:", gateCommitIndex);
+  const durablePersistIndex = workflowEngineSource.indexOf("await persistCurrentSessionRuntime(sessionGet())", persistProjectionIndex);
+  const closeIndex = workflowEngineSource.indexOf("publishCurrentHarnessRunMarkerClose(harnessProjection)", durablePersistIndex);
   const publishStatusIndex = workflowEngineSource.indexOf("publishTerminalStatus:", gateCommitIndex);
 
   assert.notEqual(commitIndex, -1);
@@ -1598,20 +1614,63 @@ test("terminal runs persist the turn projection before publishing idle", () => {
     /agentStatus:\s*"idle"/,
     "awaiting-input final text must leave idle publication to the terminal gate",
   );
-  assert.notEqual(closeIndex, -1);
-  assert.notEqual(persistIndex, -1);
-  assert.ok(commitIndex < closeIndex);
-  assert.ok(closeIndex < persistIndex);
   assert.ok(gateCommitIndex >= 0 && persistProjectionIndex > gateCommitIndex);
-  assert.ok(publishStatusIndex > persistProjectionIndex);
+  assert.ok(markerProjectionIndex >= 0 && markerProjectionIndex < commitIndex);
+  assert.ok(durablePersistIndex > persistProjectionIndex);
+  assert.ok(closeIndex > durablePersistIndex);
+  assert.ok(publishStatusIndex > closeIndex);
+  assert.doesNotMatch(
+    workflowEngineSource.slice(commitIndex, workflowEngineSource.indexOf("if (pendingSameTurnExecution)", commitIndex)),
+    /persistCurrentSessionRuntime\(latestState\)/,
+    "the terminal session must have one durable write, not a second fake persistence pass",
+  );
   assert.match(workflowEngineSource, /terminal_idle_notification_deferred/);
   assert.match(
     workflowEngineSource,
     /terminalTurnIds\.has\(candidate\.id\)[\s\S]*?status: terminalTurnStatus/,
   );
   assert.match(workflowEngineSource, /terminal_run_projection_committed/);
+  assert.match(workflowEngineSource, /harnessProjection === "ownership_lost"/);
+  assert.match(workflowEngineSource, /if \(!terminalProjectionCommitted\)/);
   assert.match(
     workflowEngineSource,
     /isIntentionalActionPause[\s\S]*?pendingAction\?\.status === "pending"/,
   );
+  assert.match(
+    workflowEngineSource,
+    /const isPlanGenerationFailure =[\s\S]*?reason === "incomplete_plan" && progress\?\.recoveryReason === "plan_generation_failed"/,
+  );
+  assert.match(
+    workflowEngineSource,
+    /content: isPlanGenerationFailure \? agentContent : `❌ \*\*\$\{message\}\*\*`/,
+    "a rejected Plan candidate stays visible while the quality checkpoint is appended separately",
+  );
+  assert.match(
+    workflowEngineSource,
+    /variant: isPlanGenerationFailure \? "plan_quality_gate" : "execution_checkpoint"/,
+  );
+  assert.match(
+    workflowEngineSource,
+    /const shouldPersist =[\s\S]*?sessionRecordingEnabled === true && sessionRecord\?\.recordingDisabled !== true/,
+  );
+  assert.match(
+    workflowEngineSource,
+    /recordingDisabled: sessionRecord\?\.recordingDisabled === true \|\| !state\.config\.sessionRecordingEnabled/,
+  );
+  const crashStart = workflowEngineSource.indexOf(".catch(async (err: any) =>");
+  const errorProjectionIndex = workflowEngineSource.indexOf(
+    "projectCurrentHarnessRunMarker(",
+    crashStart,
+  );
+  const errorPersistIndex = workflowEngineSource.indexOf(
+    "await persistCurrentSessionRuntime(terminalState)",
+    errorProjectionIndex,
+  );
+  const errorPublishIndex = workflowEngineSource.indexOf(
+    "publishCurrentHarnessRunMarkerClose(errorHarnessProjection)",
+    errorPersistIndex,
+  );
+  assert.ok(crashStart >= 0 && errorProjectionIndex > crashStart);
+  assert.ok(errorPersistIndex > errorProjectionIndex);
+  assert.ok(errorPublishIndex > errorPersistIndex);
 });

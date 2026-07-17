@@ -151,6 +151,20 @@ test("plan panel keeps resume action available for paused approved execution", (
   assert.match(source, /reuseCurrentTurn:\s*!!resumeTurnId/);
 });
 
+test("plan UI distinguishes a candidate from an executable artifact without guessing failure", () => {
+  const rightPanelSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/RightPanel.tsx"), "utf8");
+  const planPanelSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/PlanPanel.tsx"), "utf8");
+  const chatAreaSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
+
+  assert.match(rightPanelSource, /selectLatestPlanCandidatePreview\(latestPlanEntry\.blocks\)/);
+  assert.match(planPanelSource, /data-plan-document-kind=/);
+  assert.match(planPanelSource, /这是模型生成的候选草稿，尚未形成通过校验的正式计划，不能审批或执行/);
+  assert.doesNotMatch(planPanelSource, /候选草稿未通过计划校验/);
+  assert.match(chatAreaSource, /计划草稿未通过校验/);
+  assert.match(chatAreaSource, /block\.variant === "plan_quality_gate"/);
+  assert.match(chatAreaSource, /hasReviewablePlanArtifact && turn\.id === planArtifactOwnerTurnId/);
+});
+
 test("early Plan hydration busy gate retains validated Goal authority and refreshes its source context", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
 

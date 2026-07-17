@@ -60,20 +60,6 @@ function buildPlanGenerationFailedProgress(reason: string) {
   };
 }
 
-export function shouldAttemptPlanEvidenceMaterialization(input: {
-  recoveryAction?: string | null;
-  qualityRejectCount: number;
-  qualityGateReason?: string | null;
-  finishReason?: string | null;
-}): boolean {
-  if (input.recoveryAction === "ask_user") return false;
-  return input.finishReason === "length" ||
-    input.qualityRejectCount >= 2 ||
-    /too_short|excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
-      String(input.qualityGateReason || ""),
-    );
-}
-
 export function resolvePlanNoToolRecoveryDecision(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
@@ -471,13 +457,7 @@ export async function handlePlanNoToolRecovery(input: {
       return finish("continue");
     }
 
-    const shouldAttemptEvidenceMaterialization = shouldAttemptPlanEvidenceMaterialization({
-      recoveryAction: quality.recoveryAction,
-      qualityRejectCount: recovery.planQualityRejectCount,
-      qualityGateReason: recovery.planLastQualityGateReason,
-      finishReason: normalizedFinishReason,
-    });
-    if (shouldAttemptEvidenceMaterialization) {
+    if (recovery.deterministicEvidenceMaterializationCandidate) {
       setPlanRuntimePhase("needs_rewrite", "runtime evidence materialization");
       const evidenceMaterialized = await autoMaterializePlanArtifactFromEvidence({
         workspace,
@@ -589,11 +569,9 @@ export async function handlePlanNoToolRecovery(input: {
         return finish("stopped");
       }
 
-      // A prepared auto-scaffold prompt is a model recovery path, not proof
-      // that the prompt reached the model. If deterministic materialization
-      // cannot meet its intentionally higher evidence bar, preserve the
-      // rejected conversational draft and let the model perform the bounded
-      // rewrite before declaring plan generation exhausted.
+      // A prepared typed prompt is a model recovery path, not proof that the
+      // prompt reached the model. Preserve the rejected draft and let the
+      // bounded rewrite run before declaring plan generation exhausted.
       if (recovery.pendingPlanRuntimeRecoveryPrompt) {
         callbacks.onStatusChange("running");
         preserveRejectedCandidateForRecovery();
@@ -611,23 +589,6 @@ export async function handlePlanNoToolRecovery(input: {
         return finish("continue");
       }
 
-      if (recovery.planQualityRejectCount >= 2) {
-        const failureReason = `evidence_materialization_rejected:${evidenceMaterialized.reason || recovery.planLastQualityGateReason || "quality_gate"}`;
-        logAgentEvent("loop_stop", {
-          reason: "plan_evidence_materialization_exhausted",
-          iteration,
-          qualityGateReason: recovery.planLastQualityGateReason,
-          qualityRejectCount: recovery.planQualityRejectCount,
-          materializationReason: evidenceMaterialized.reason || "",
-        });
-        callbacks.onNonActionableStop(
-          buildPlanGenerationFailedMessage(callbacks.getPreferredLanguage(), failureReason),
-          "incomplete_plan",
-          buildPlanGenerationFailedProgress(failureReason),
-        );
-        callbacks.onStatusChange("idle");
-        return finish("stopped");
-      }
     }
 
     if (recovery.pendingPlanRuntimeRecoveryPrompt) {

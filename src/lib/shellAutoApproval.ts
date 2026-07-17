@@ -10,6 +10,8 @@ type ShellPermissionPreflight = (
 export interface ShellAutoApprovalResolution {
   command: string | null;
   decision?: ShellPermissionDecision;
+  /** Exact approval passed to the shell guard when Auto Review accepts a safe `ask`. */
+  approval?: ShellPermissionApproval;
   /** True when this shell call must pass through the human review gate. */
   requiresUserReview?: boolean;
   error?: string;
@@ -24,6 +26,11 @@ function usesAppendNewline(args: Record<string, unknown>): boolean {
     args.append_newline === "true" ||
     args.appendNewline === true ||
     args.appendNewline === "true";
+}
+
+function shellDecisionIsCritical(decision: ShellPermissionDecision): boolean {
+  return decision.riskLevel === "critical" ||
+    decision.segmentDecisions.some((segment) => segment.riskLevel === "critical");
 }
 
 export function getShellPermissionCommandForTool(
@@ -92,19 +99,18 @@ export function buildShellPermissionApproval(
 }
 
 /**
- * Auto Review may skip MAIN's generic tool card only after the shell policy
- * has explicitly allowed the concrete command.  An `ask` decision is a
- * permission boundary, not an invitation for the client to mint an approval.
- * Commands independently classified as destructive stay gated as
- * defense in depth if a stale or custom backend policy returns `allow`.
+ * Auto Review is the user's session-level approval for non-destructive tool
+ * calls. A safe shell `ask` still needs an exact approval packet for the Rust
+ * permission guard, while deny decisions, preflight errors, and independently
+ * dangerous command shapes remain gated.
  */
 export function canApplyShellAutoReview(
   resolution: ShellAutoApprovalResolution,
 ): boolean {
   if (!resolution.command) return true;
-  return !resolution.error &&
-    resolution.decision?.decision === "allow" &&
-    resolution.requiresUserReview !== true;
+  if (resolution.error || resolution.requiresUserReview === true) return false;
+  if (resolution.decision?.decision === "allow") return true;
+  return resolution.decision?.decision === "ask" && !!resolution.approval;
 }
 
 export async function resolveShellAutoApproval(input: {
@@ -118,11 +124,17 @@ export async function resolveShellAutoApproval(input: {
 
   try {
     const decision = await input.preflight(command, input.workspace);
+    const requiresExplicitReview = looksDangerousShellCommand(command) ||
+      shellDecisionIsCritical(decision);
+    const approval = decision.decision === "ask" && !requiresExplicitReview
+      ? buildShellPermissionApproval(decision, "session")
+      : undefined;
     return {
       command,
       decision,
+      ...(approval ? { approval } : {}),
       requiresUserReview:
-        decision.decision === "ask" || looksDangerousShellCommand(command),
+        requiresExplicitReview || (decision.decision === "ask" && !approval),
     };
   } catch (error) {
     return {

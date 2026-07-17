@@ -456,7 +456,6 @@ export async function prepareIterationStreamRequest(input: {
       workflowMode,
       isPlanApproved: callbacks.getIsPlanApproved(),
       planRuntimePhase: planRuntimeState.planRuntimePhase,
-      planQualityRejectCount: planRuntimeState.planQualityRejectCount,
       planAutoScaffoldPromptIssued:
         planRuntimeState.planAutoScaffoldPromptIssued,
       llmToolNames: contextManagementResult.llmTools.map(

@@ -112,7 +112,7 @@ test("explicit plan code changes must be non-noop and match observed source stat
   assert.equal(observedBefore.ok, true);
 });
 
-test("numbered user-goal facets require evidence, change, and validation coverage", () => {
+test("numbered user-goal facets require change or decision plus validation coverage", () => {
   const userGoal = [
     "1、CSV 导入后课程名称为空。",
     "2、筛选订单状态后总金额没有更新。",
@@ -132,16 +132,12 @@ test("numbered user-goal facets require evidence, change, and validation coverag
   });
   assert.equal(incomplete.ok, false);
   assert.match(incomplete.reason || "", /uncovered_user_goal_facets:2,3/);
-  assert.equal(incomplete.recoveryAction, "targeted_evidence");
+  assert.equal(incomplete.recoveryAction, "rewrite");
 
   const complete = validateNumberedUserGoalFacetCoverage({
     userGoal,
     content: [
       "# 修复方案",
-      "## 已确认证据",
-      "- CSV 导入后的课程名称字段为空。",
-      "- 筛选订单状态后总金额仍使用未筛选数据。",
-      "- 导出报告的列定义没有包含日期列。",
       "## 关键改动",
       "- 修复 CSV 课程名称字段的导入映射。",
       "- 让订单状态筛选后的总金额使用筛选结果。",
@@ -155,16 +151,13 @@ test("numbered user-goal facets require evidence, change, and validation coverag
   assert.equal(complete.ok, true, complete.reason);
 });
 
-test("numbered facets can use a grounded E/C/V traceability ledger", () => {
+test("numbered facets can use a C/V traceability ledger without duplicating evidence", () => {
   const userGoal = [
     "1、保存后详情页仍显示旧标题。",
     "2、删除后列表计数没有更新。",
   ].join("\n");
   const content = [
     "# 计划",
-    "## 已确认证据",
-    "- [E1] `src/detail.ts` 的缓存写入边界与持久化结果不同步。",
-    "- [E2] `src/list.ts` 的集合派生值没有在删除事务后重算。",
     "## 关键改动",
     "- [C1] 修改 `src/detail.ts` 的缓存提交边界。",
     "- [C2] 修改 `src/list.ts` 的派生值更新边界。",
@@ -172,8 +165,8 @@ test("numbered facets can use a grounded E/C/V traceability ledger", () => {
     "- [V1] 对第一个用户分面执行独立行为验收。",
     "- [V2] 对第二个用户分面执行独立行为验收。",
     "## 需求分面追踪",
-    "- 分面 1（保存后详情页仍显示旧标题）：由 E1 约束，对应 C1，并由 V1 验收。",
-    "- 分面 2（删除后列表计数没有更新）：由 E2 约束，对应 C2，并由 V2 验收。",
+    "- 分面 1（保存后详情页仍显示旧标题）：对应 C1，并由 V1 验收。",
+    "- 分面 2（删除后列表计数没有更新）：对应 C2，并由 V2 验收。",
   ].join("\n");
 
   const result = validateNumberedUserGoalFacetCoverage({ userGoal, content });
@@ -844,7 +837,7 @@ test("logged MD Viewer diagnostics keep contract owners as change targets instea
   });
   assert.equal(materialized.ok, false);
   assert.match(materialized.reason || "", /uncovered_user_goal_facets:2/);
-  assert.equal(materialized.quality?.recoveryAction, "targeted_evidence");
+  assert.equal(materialized.quality?.recoveryAction, "rewrite");
 });
 
 test("facet mapping cannot borrow unrelated changes for unread or unowned targets", () => {
@@ -922,7 +915,7 @@ test("facet mapping cannot borrow unrelated changes for unread or unowned target
 
   assert.equal(materialized.ok, false);
   assert.match(materialized.reason || "", /uncovered_user_goal_facets:2,3/);
-  assert.equal(materialized.quality?.recoveryAction, "targeted_evidence");
+  assert.equal(materialized.quality?.recoveryAction, "rewrite");
   assert.doesNotMatch(plan, /分面 2（/);
   assert.doesNotMatch(plan, /分面 3（/);
 });

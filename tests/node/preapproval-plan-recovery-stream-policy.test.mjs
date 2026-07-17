@@ -71,7 +71,6 @@ function resolvePolicy(overrides = {}) {
     workflowMode: "plan",
     isPlanApproved: false,
     planRuntimePhase: "needs_rewrite",
-    planQualityRejectCount: 1,
     planAutoScaffoldPromptIssued: false,
     llmToolNames: ["replace_in_file", "write_file"],
     forceXmlTools: false,
@@ -102,13 +101,10 @@ test("preapproval plan rewrite gets one provider-neutral bounded stream lease", 
 });
 
 test("auto scaffold keeps the same single bounded lease and explicit stage", () => {
-  const byRejectCount = resolvePolicy({ planQualityRejectCount: 2 });
   const byIssuedPrompt = resolvePolicy({
-    planQualityRejectCount: 1,
     planAutoScaffoldPromptIssued: true,
   });
 
-  assert.equal(byRejectCount.stage, "auto_scaffold");
   assert.equal(byIssuedPrompt.stage, "auto_scaffold");
   assert.match(
     byIssuedPrompt.maxStreamElapsedLabel,

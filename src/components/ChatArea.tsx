@@ -68,7 +68,10 @@ import {
   getLastAgentSummaryText,
   hasGeneratedPlanContent,
   hasRenderableAgentBlock,
+  isPlanGenerationFailureBlock,
   isTransparentToolNarrationBlock,
+  resolvePlanArtifactOwnerTurnId,
+  selectLatestPlanCandidatePreview,
   shouldSuppressAgentAsExplanation,
   shouldSuppressAgentToolEcho,
 } from "../lib/chat/chatBlockVisibility";
@@ -98,7 +101,6 @@ import {
   isPlanReviewCapsulePresentationEligible,
   shouldRenderTurnBoundary,
 } from "../lib/turnPresentation";
-import { extractPlanDraftPreview, extractStructuredPlanProposal } from "../lib/planProposal";
 import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
@@ -651,24 +653,28 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
 }
 
 function PlanExecutionSystemNotice({ block, language }: { block: any; language: "zh" | "en" }) {
+  const isPlanGenerationFailure = isPlanGenerationFailureBlock(block);
   const isPlanCheckpoint = block.variant === "plan_execution_checkpoint";
   const isExecutionCheckpoint = block.variant === "execution_checkpoint";
   const isCheckpoint = isPlanCheckpoint || isExecutionCheckpoint;
   const progress = block.planExecutionProgress || null;
   const progressPhase = String(block.planExecutionProgress?.phase || "");
   const isPaused = progressPhase === "paused" || /已暂停|paused/i.test(String(block.content || ""));
-  const title = isExecutionCheckpoint
+  const title = isPlanGenerationFailure
+    ? language === "zh" ? "计划草稿未通过校验" : "Plan Draft Needs Revision"
+    : isExecutionCheckpoint
     ? language === "zh" ? "执行结果与恢复点" : "Execution Results & Recovery Point"
     : isCheckpoint
     ? language === "zh" ? "计划执行检查点" : "Plan Execution Checkpoint"
     : isPaused
     ? language === "zh" ? "计划执行已暂停" : "Plan Execution Paused"
     : language === "zh" ? "计划执行进度" : "Plan Execution Progress";
-  const tone = isCheckpoint
-    ? "theme-plan-surface theme-plan-text"
-    : "theme-plan-surface theme-plan-text";
   const details = progress
-    ? [
+    ? isPlanGenerationFailure
+      ? [
+          { label: language === "zh" ? "待补内容" : "Missing", value: progress.nextStep },
+        ].filter((item) => String(item.value || "").trim())
+      : [
         { label: language === "zh" ? "当前任务" : "Task", value: progress.currentTask },
         { label: language === "zh" ? "当前动作" : "Action", value: progress.currentTool },
         { label: language === "zh" ? "最新证据" : "Evidence", value: progress.latestEvidence },
@@ -678,11 +684,15 @@ function PlanExecutionSystemNotice({ block, language }: { block: any; language: 
   const repeatedTargets = Array.isArray(progress?.repeatedTargets)
     ? progress.repeatedTargets.filter(Boolean).slice(0, 4)
     : [];
-  const recoveryReason = String(progress?.recoveryReason || "").trim();
+  const recoveryReason = isPlanGenerationFailure ? "" : String(progress?.recoveryReason || "").trim();
 
   return (
     <div className="flex w-full justify-center">
-      <div data-testid={block.variant} className={`max-w-[min(760px,92%)] rounded-lg border px-3 py-2 text-left ${tone}`}>
+      <div
+        data-testid={block.variant}
+        data-plan-generation-failure={isPlanGenerationFailure || undefined}
+        className="theme-plan-surface theme-plan-text max-w-[min(760px,92%)] rounded-lg border px-3 py-2 text-left"
+      >
         <div className="text-[11px] font-medium uppercase tracking-[0.14em] text-[#a1a1aa]">{title}</div>
         <div className="mt-1 whitespace-pre-wrap break-words text-[12px] leading-5 text-[#e4e4e7]">{String(block.content || "")}</div>
         {details.length > 0 && (
@@ -2872,29 +2882,15 @@ export default function ChatArea({
   const pinnedPlanTurn = pinnedTurn && isPlanConversationTurn(pinnedTurn)
     ? pinnedTurn
     : null;
-  const activePlanFallbackPreview = useMemo(() => {
-    if (!pinnedPlanTurn) return "";
-    if (clearedPlanTurnId && pinnedPlanTurn.id === clearedPlanTurnId) return "";
-    const entry = groupedTurns.find((item) => item.turn?.id === pinnedPlanTurn.id);
-    if (!entry) return "";
-    for (const block of entry.blocks) {
-      if (block.type !== "agent") continue;
-      const content = String(block.content || "");
-      const proposal = extractStructuredPlanProposal(content);
-      if (proposal) return proposal.markdown;
-      const draft = extractPlanDraftPreview(content);
-      if (draft) return draft;
-    }
-    return "";
-  }, [clearedPlanTurnId, groupedTurns, pinnedPlanTurn?.id]);
-  const currentPlanApprovalIdentity = useMemo(
-    () => buildPlanApprovalIdentity(planArtifacts),
-    [planArtifacts],
-  );
   const harnessActionRunId = getHarnessActionRunId(harnessRunMarker);
   const planReviewOwnerTurn = activeActionRequest?.kind === "plan_review"
     ? conversationTurns.find((turn) => turn.id === activeActionRequest.turnId) || null
     : null;
+  const currentPlanApprovalIdentity = useMemo(
+    () => buildPlanApprovalIdentity(planArtifacts),
+    [planArtifacts],
+  );
+  const hasReviewablePlanArtifact = !!currentPlanApprovalIdentity;
   const planReviewActionRequest =
     activeActionRequest?.kind === "plan_review" &&
     isPlanConversationTurn(planReviewOwnerTurn) &&
@@ -2917,6 +2913,28 @@ export default function ChatArea({
     })
       ? activeActionRequest
       : null;
+  const planProgressOwnerTurn = planExecutionProgressSnapshot?.turnId
+    ? conversationTurns.find((turn) =>
+        turn.id === planExecutionProgressSnapshot.turnId && isPlanConversationTurn(turn)
+      ) || null
+    : null;
+  const reviewReadyPlanTurnId = [...groupedTurns].reverse().find((entry) =>
+    isPlanConversationTurn(entry.turn) && hasGeneratedPlanContent(entry.blocks)
+  )?.turn?.id || null;
+  const planArtifactOwnerTurnId = resolvePlanArtifactOwnerTurnId({
+    hasReviewableArtifact: hasReviewablePlanArtifact,
+    actionOwnerTurnId: planReviewActionRequest?.turnId,
+    progressOwnerTurnId: planProgressOwnerTurn?.id,
+    reviewReadyTurnId: reviewReadyPlanTurnId,
+  });
+  const activePlanFallbackPreview = useMemo(() => {
+    if (!pinnedPlanTurn) return "";
+    if (pinnedPlanTurn.id === planArtifactOwnerTurnId) return "";
+    if (clearedPlanTurnId && pinnedPlanTurn.id === clearedPlanTurnId) return "";
+    const entry = groupedTurns.find((item) => item.turn?.id === pinnedPlanTurn.id);
+    if (!entry) return "";
+    return selectLatestPlanCandidatePreview(entry.blocks);
+  }, [clearedPlanTurnId, groupedTurns, pinnedPlanTurn?.id, planArtifactOwnerTurnId]);
   const userChoiceActionRequest =
     activeActionRequest?.kind === "user_choice" &&
     activeActionRequest.status === "pending" &&
@@ -3403,6 +3421,9 @@ export default function ChatArea({
       if (block.variant === "context_compression") {
         return <ContextCompressionNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
+      if (block.variant === "plan_quality_gate") {
+        return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
+      }
       if (block.variant === "plan_execution_progress") {
         return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
@@ -3666,6 +3687,7 @@ export default function ChatArea({
       if (block.type === "progress" || block.type === "jobList") return true;
       if (block.type === "system") {
         return block.variant !== "context_compression" &&
+          block.variant !== "plan_quality_gate" &&
           block.variant !== "plan_execution_checkpoint" &&
           block.variant !== "execution_checkpoint" &&
           block.variant !== "game_studio_local_markdown";
@@ -3702,7 +3724,10 @@ export default function ChatArea({
     const collapsedProcessCount = finalVisibleAgentBlock
       ? processArchive?.stepCount ?? blocks.filter((block, idx) => block.type !== "user" && idx !== finalVisibleAgentIndex).length
       : hiddenCount + (shouldShowTurnChanges ? 1 : 0);
-    const hasPlanContent = isPlanTurn && hasGeneratedPlanContent(blocks);
+    const hasPlanContent = isPlanTurn && (
+      (hasReviewablePlanArtifact && turn.id === planArtifactOwnerTurnId) ||
+      hasGeneratedPlanContent(blocks)
+    );
     // Only show the PlanShortcutCard when the plan is truly complete — not
     // while it's still being generated. The card replaces all detailed blocks,
     // so it must only appear once the model has finished working on this turn.
@@ -3883,6 +3908,7 @@ export default function ChatArea({
         block.type === "jobList" ||
         (block.type === "system" &&
           block.variant !== "context_compression" &&
+          block.variant !== "plan_quality_gate" &&
           block.variant !== "plan_execution_checkpoint" &&
           block.variant !== "execution_checkpoint" &&
           block.variant !== "game_studio_local_markdown");

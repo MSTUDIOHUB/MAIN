@@ -87,6 +87,10 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatContentPreview.ts"));
 
 const {
+  hasGeneratedPlanContent,
+  isPlanGenerationFailureBlock,
+  resolvePlanArtifactOwnerTurnId,
+  selectLatestPlanCandidatePreview,
   shouldSuppressAgentToolEcho,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatBlockVisibility.ts"));
 
@@ -228,6 +232,106 @@ test("chat visibility keeps a substantive stage summary that adds meaning to too
   ];
 
   assert.equal(shouldSuppressAgentToolEcho(blocks, 1), false);
+});
+
+test("plan presentation selects the latest draft without promoting it to a reviewable artifact", () => {
+  const first = "<proposed_plan>\n# First draft\n\n## Change\n\n- Edit component A using the confirmed source contract.\n\n## Verification\n\n- Run focused test A and record its result.\n</proposed_plan>";
+  const latest = "<proposed_plan>\n# Latest draft\n\n## Change\n\n- Edit component B using the confirmed source contract.\n\n## Verification\n\n- Run focused test B and record its result.\n</proposed_plan>";
+  const blocks = [
+    { type: "agent", content: first },
+    { type: "agent", content: latest },
+  ];
+
+  assert.match(selectLatestPlanCandidatePreview(blocks), /Latest draft/);
+  assert.doesNotMatch(selectLatestPlanCandidatePreview(blocks), /First draft/);
+  assert.equal(hasGeneratedPlanContent(blocks), false);
+  assert.equal(hasGeneratedPlanContent([{ ...blocks[1], archivedProposal: true }]), false);
+});
+
+test("plan candidate preview recovers only the latest marked failed attempt from old snapshots", () => {
+  const legacyCandidate = [
+    "[PROPOSAL START]",
+    "# Proposed Plan",
+    "",
+    "## Change",
+    "",
+    "- Fix the latest confirmed contract mismatch.",
+    "",
+    "## Verification",
+    "",
+    "- Run the focused regression test and record the result.",
+    "[PROPOSAL END]",
+  ].join("\n");
+  const overwritten = {
+    type: "agent",
+    content: "Plan generation paused.",
+    failedAttempts: [
+      { content: "An older unmarked diagnostic note." },
+      { content: legacyCandidate },
+    ],
+  };
+
+  assert.match(selectLatestPlanCandidatePreview([overwritten]), /latest confirmed contract mismatch/);
+  assert.equal(selectLatestPlanCandidatePreview([{
+    ...overwritten,
+    failedAttempts: [{ content: "Unmarked structured failure\n\n## Detail\n- A\n- B\n- C" }],
+  }]), "");
+});
+
+test("a later reviewable artifact belongs only to its current Plan turn", () => {
+  const historicalRejectedTurnId = "turn-plan-rejected";
+  const laterPlanTurnId = "turn-plan-ready";
+  const ownerTurnId = resolvePlanArtifactOwnerTurnId({
+    hasReviewableArtifact: true,
+    reviewReadyTurnId: laterPlanTurnId,
+  });
+
+  assert.equal(ownerTurnId, laterPlanTurnId);
+  assert.notEqual(ownerTurnId, historicalRejectedTurnId);
+  assert.equal(resolvePlanArtifactOwnerTurnId({
+    hasReviewableArtifact: false,
+    reviewReadyTurnId: laterPlanTurnId,
+  }), null);
+  assert.equal(resolvePlanArtifactOwnerTurnId({
+    hasReviewableArtifact: true,
+  }), null);
+});
+
+test("only materialized or review-ready plan evidence counts as generated", () => {
+  assert.equal(hasGeneratedPlanContent([{
+    type: "tool",
+    toolName: "read_file",
+    target: ".MAIN/plans/plan.md",
+    toolStatus: "executed",
+  }]), false);
+  assert.equal(hasGeneratedPlanContent([{
+    type: "tool",
+    toolName: "write_file",
+    target: ".MAIN/plans/plan.md",
+    toolStatus: "executed",
+  }]), false);
+  assert.equal(hasGeneratedPlanContent([{
+    type: "progress",
+    turnPhase: { domain: "plan_runtime", id: "plan_review_ready" },
+  }]), true);
+});
+
+test("planning quality-gate failures are distinct from execution checkpoints", () => {
+  assert.equal(isPlanGenerationFailureBlock({
+    type: "system",
+    variant: "plan_quality_gate",
+    planExecutionProgress: { recoveryReason: "plan_generation_failed" },
+  }), true);
+  assert.equal(isPlanGenerationFailureBlock({
+    type: "system",
+    variant: "execution_checkpoint",
+    planExecutionProgress: { recoveryReason: "plan_generation_failed" },
+  }), true);
+  assert.equal(isPlanGenerationFailureBlock({
+    type: "system",
+    variant: "execution_checkpoint",
+    planExecutionProgress: { recoveryReason: "validation_failed" },
+  }), false);
 });
 
 test("chat render helpers dedupe read context entries and track cached reads", () => {

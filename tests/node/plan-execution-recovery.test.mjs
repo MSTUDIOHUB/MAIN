@@ -313,11 +313,13 @@ const {
   buildPlanClosureEvidenceRecoveryPrompt,
   handlePlanNoToolRecovery,
   resolvePlanNoToolRecoveryDecision,
-  shouldAttemptPlanEvidenceMaterialization,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planNoToolRecovery.ts"));
 const {
   handlePlanQualityRecoveryAfterVisibleMaterialization,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planQualityRecovery.ts"));
+const {
+  canDeterministicallyMaterializePlan,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
 const {
   hasGroundedPlanClosureEvidence,
   resolvePlanClosureArtifactKind,
@@ -681,42 +683,26 @@ test("blocked Plan evidence recovery cannot materialize a later contradictory pr
   assert.match(harness.stops[0].message, /change_targets_lack_confirmed_rationale/);
 });
 
-test("Plan evidence materialization replaces unbounded retries for logged quality failures", () => {
-  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+test("Plan evidence materialization is derived only from typed recovery and closure", () => {
+  assert.equal(canDeterministicallyMaterializePlan({
     recoveryAction: "rewrite",
-    qualityRejectCount: 1,
-    qualityGateReason: "too_short",
-    finishReason: "stop",
+    closureReady: true,
   }), true);
-  assert.equal(shouldAttemptPlanEvidenceMaterialization({
-    recoveryAction: "rewrite",
-    qualityRejectCount: 1,
-    qualityGateReason: "excessive_plan_code_dump",
-    finishReason: "stop",
-  }), true);
-  assert.equal(shouldAttemptPlanEvidenceMaterialization({
-    recoveryAction: "rewrite",
-    qualityRejectCount: 1,
-    qualityGateReason: "missing_plan_required_sections:summary,key_changes",
-    finishReason: "length",
-  }), true);
-  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+  assert.equal(canDeterministicallyMaterializePlan({
     recoveryAction: "auto_scaffold",
-    qualityRejectCount: 2,
-    qualityGateReason: "quality_gate",
-    finishReason: "stop",
+    closureReady: true,
   }), true);
-  assert.equal(shouldAttemptPlanEvidenceMaterialization({
-    recoveryAction: "targeted_evidence",
-    qualityRejectCount: 1,
-    qualityGateReason: "ungrounded_plan_change_targets:index.html",
-    finishReason: "stop",
+  assert.equal(canDeterministicallyMaterializePlan({
+    recoveryAction: "rewrite",
+    closureReady: false,
   }), false);
-  assert.equal(shouldAttemptPlanEvidenceMaterialization({
+  assert.equal(canDeterministicallyMaterializePlan({
+    recoveryAction: "targeted_evidence",
+    closureReady: true,
+  }), false);
+  assert.equal(canDeterministicallyMaterializePlan({
     recoveryAction: "ask_user",
-    qualityRejectCount: 3,
-    qualityGateReason: "blocking_decision",
-    finishReason: "length",
+    closureReady: true,
   }), false);
 });
 
@@ -977,7 +963,7 @@ test("visible plan materialization rejection enters typed recovery instead of fa
   assert.equal(nextCandidate.shouldMaterializeStructuredProposal, true);
 });
 
-test("failed deterministic fallback sends the prepared model scaffold before exhausting Plan recovery", async () => {
+test("closure-incomplete rewrite stays model-owned before exhausting Plan recovery", async () => {
   const sourceVisibleText = "我会继续分析白屏问题并稍后给出方案。";
   const activity = [{
     name: "read_file",
@@ -1003,12 +989,12 @@ test("failed deterministic fallback sends the prepared model scaffold before exh
 
   assert.equal(recovered.status, "continue");
   assert.equal(recovered.planQualityRejectCount, 2);
-  assert.equal(recovered.planAutoScaffoldPromptIssued, true);
+  assert.equal(recovered.planAutoScaffoldPromptIssued, false);
   assert.equal(harness.stops.length, 0);
   assert.equal(harness.appended.at(-2)?.role, "assistant");
   assert.equal(harness.appended.at(-2)?.content, sourceVisibleText);
   assert.equal(harness.appended.at(-1)?.role, "user");
-  assert.match(harness.appended.at(-1)?.content || "", /PLAN_AUTO_SCAFFOLD/);
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_NEEDS_REWRITE/);
 
   const exhaustedHarness = createPlanNoToolHarness("zh");
   const exhausted = await handlePlanNoToolRecovery(createPlanNoToolInput(exhaustedHarness, {
@@ -1032,7 +1018,7 @@ test("failed deterministic fallback sends the prepared model scaffold before exh
   assert.equal(exhaustedHarness.appended.length, 0);
 });
 
-test("grounded rewrite recovery scaffolds without reopening deterministic evidence", async () => {
+test("grounded rewrite recovery supersedes stale deterministic evidence without reopening reads", async () => {
   const harness = createPlanNoToolHarness("zh");
   const sourceVisibleText = "我还需要继续分析当前状态同步实现。";
   const result = await handlePlanNoToolRecovery(createPlanNoToolInput(harness, {
@@ -1045,6 +1031,8 @@ test("grounded rewrite recovery scaffolds without reopening deterministic eviden
     sawPlanModeToolActivity: true,
     planQualityRejectCount: 1,
     planLastQualityGateReason: "too_short",
+    planClosureEvidenceRecoveryIssued: true,
+    planEvidenceRecoveryObjective: "deterministic_closure",
     recentPlanToolActivity: [
       {
         name: "read_file",
@@ -1064,9 +1052,9 @@ test("grounded rewrite recovery scaffolds without reopening deterministic eviden
   assert.equal(result.status, "continue");
   assert.equal(result.planQualityRejectCount, 2);
   assert.equal(result.planClosureEvidenceRecoveryIssued, false);
-  assert.equal(result.planAutoScaffoldPromptIssued, true);
+  assert.equal(result.planAutoScaffoldPromptIssued, false);
   assert.equal(harness.stops.length, 0);
-  assert.match(harness.appended.at(-1)?.content || "", /PLAN_AUTO_SCAFFOLD/);
+  assert.match(harness.appended.at(-1)?.content || "", /PLAN_NEEDS_REWRITE/);
   assert.equal(harness.phases.at(-1)?.phase, "needs_rewrite");
 
   const repeatedHarness = createPlanNoToolHarness("zh");

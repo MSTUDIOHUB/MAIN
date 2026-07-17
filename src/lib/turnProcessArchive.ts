@@ -9,6 +9,11 @@ import type { ProgressNarrationPhase } from "./progressNarration";
 import { isInternalRuntimeProgressBlock } from "./runtimeProgressVisibility";
 import { normalizeTurnRuntimePhase, type TurnRuntimePhase } from "./turnPhase";
 import { deriveThoughtDisplay } from "./thoughtDisplay";
+import {
+  isPlanCandidateBlock,
+  isPlanGenerationFailureBlock,
+  isReviewablePlanBlock,
+} from "./chat/chatBlockVisibility";
 
 export type TurnArchiveStepKind = "thinking" | "discover" | "inspect" | "edit" | "command" | "verify" | "blocked" | "message";
 export type TurnArchiveStepStatus = "running" | "done" | "failed" | "rejected";
@@ -132,9 +137,12 @@ function isFinalConclusionBlock(block: any, finalVisibleAgentIndex: number, bloc
 function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, blockIndex: number): boolean {
   if (!block || block.type === "user") return false;
   if (isFinalConclusionBlock(block, finalVisibleAgentIndex, blockIndex)) return false;
+  if (isPlanGenerationFailureBlock(block)) return false;
+  if (isPlanCandidateBlock(block) && !isReviewablePlanBlock(block)) return false;
   if (block.type === "agent" && block.archivedProposal) return false;
   if (block.type === "system") {
     return block.variant !== "context_compression" &&
+      block.variant !== "plan_quality_gate" &&
       block.variant !== "plan_execution_checkpoint" &&
       block.variant !== "execution_checkpoint";
   }
@@ -143,10 +151,15 @@ function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, b
 
 function isLiveProcessCandidate(block: any): boolean {
   if (!block || block.type === "user" || block.type === "thought") return false;
-  if (block.type === "agent") return block.hiddenProcess === true;
+  if (isPlanGenerationFailureBlock(block)) return false;
+  if (block.type === "agent") {
+    return block.hiddenProcess === true &&
+      (!isPlanCandidateBlock(block) || isReviewablePlanBlock(block));
+  }
   if (block.type === "progress") return true;
   if (block.type === "system") {
     return block.variant !== "context_compression" &&
+      block.variant !== "plan_quality_gate" &&
       block.variant !== "plan_execution_checkpoint" &&
       block.variant !== "execution_checkpoint";
   }
@@ -532,6 +545,7 @@ function classifyToolActivityKind(toolName: string, status: TurnArchiveStepStatu
 }
 
 function classifyBlockActivityKind(block: any): ActivityCellKind {
+  if (isReviewablePlanBlock(block)) return "plan";
   if (isToolBlock(block)) {
     const status = mapToolStatus(block);
     return classifyToolActivityKind(String(block.toolName || ""), status);
@@ -549,12 +563,9 @@ function classifyBlockActivityKind(block: any): ActivityCellKind {
   if (block?.type === "system") {
     const variant = String(block.variant || "");
     if (variant === "plan_execution_checkpoint" || variant === "execution_checkpoint") return "blocked";
-    if (variant === "plan_quality_gate") return "plan";
     if (variant === "plan_execution_progress") return "message";
   }
   if (block?.type === "agent") {
-    const content = String(block.content || "");
-    if (/\[PROPOSAL START\]|#\s*Proposed Plan|<proposed_plan>|<plan[\s>]/i.test(content)) return "plan";
     if (Array.isArray(block.options) && block.options.length > 0) return "approval";
   }
   return "message";
@@ -605,19 +616,21 @@ function stripInternalPlanRuntimePresentation(block: any): any {
     phaseReason: _phaseReason,
     ...visibleBlock
   } = block;
-  return visibleBlock;
+  return getPlanRuntimeArchivePhase(block) === "review_ready"
+    ? { ...visibleBlock, turnPhase: block.turnPhase }
+    : visibleBlock;
 }
 
 function planRuntimeArchiveGroupLabel(phase: PlanRuntimeArchivePhase, language: ToolPresentationLanguage): string {
   if (language === "en") {
     if (phase === "needs_evidence") return "Needs evidence";
-    if (phase === "review_ready") return "Review ready";
+    if (phase === "review_ready") return "Plan validated";
     if (phase === "blocked") return "Blocked";
     if (phase === "drafting" || phase === "needs_rewrite") return "Drafting";
     return "Exploring";
   }
   if (phase === "needs_evidence") return "Needs evidence";
-  if (phase === "review_ready") return "Review ready";
+  if (phase === "review_ready") return "计划已通过校验";
   if (phase === "blocked") return "Blocked";
   if (phase === "drafting" || phase === "needs_rewrite") return "Drafting";
   return "Exploring";
@@ -1065,6 +1078,8 @@ export function buildCodexActivityGroups(
   const groups: ActivityCell[] = [];
   for (const rawBlock of blocks) {
     if (!rawBlock || rawBlock.type === "user" || isInternalRuntimeProgressBlock(rawBlock)) continue;
+    if (isPlanGenerationFailureBlock(rawBlock)) continue;
+    if (isPlanCandidateBlock(rawBlock) && !isReviewablePlanBlock(rawBlock)) continue;
     const block = stripInternalPlanRuntimePresentation(rawBlock);
     const activity = buildActivityCellFromItems([block], normalizeLanguage(language));
     const current = groups[groups.length - 1] || null;

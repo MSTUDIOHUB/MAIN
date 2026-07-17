@@ -508,8 +508,12 @@ export function resolveLatestUnreconciledFailureSignal(input: {
         entry.kind === "deliverable"
       ? "mutation"
       : "other";
-  const sourceTarget = (entry.references || []).find(isWorkspaceReference) ||
-    (domain === "browser" ? sourceTargetFromBrowserErrors(entry) : null) ||
+  // Browser references commonly start with the captured screenshot receipt.
+  // A receipt proves what was observed but is never the source to repair;
+  // runtime stack frames are the authoritative browser-to-source link.
+  const sourceTarget = (domain === "browser"
+    ? sourceTargetFromBrowserErrors(entry)
+    : (entry.references || []).find(isWorkspaceReference)) ||
     ((domain === "mutation" && isWorkspaceReference(entry.target || entry.value))
       ? String(entry.target || entry.value).trim()
       : null);

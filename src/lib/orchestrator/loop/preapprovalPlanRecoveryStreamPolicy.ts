@@ -36,7 +36,6 @@ export function resolvePreapprovalPlanQualityRecoveryStreamPolicy(input: {
   workflowMode: "chat" | "edit" | "plan";
   isPlanApproved: boolean;
   planRuntimePhase: PlanRuntimePhase;
-  planQualityRejectCount: number;
   planAutoScaffoldPromptIssued: boolean;
   llmToolNames: string[];
   forceXmlTools: boolean;
@@ -47,10 +46,9 @@ export function resolvePreapprovalPlanQualityRecoveryStreamPolicy(input: {
     input.planRuntimePhase === "needs_rewrite";
   if (!active) return INACTIVE_POLICY;
 
-  const stage: PreapprovalPlanQualityRecoveryStage =
-    input.planAutoScaffoldPromptIssued || input.planQualityRejectCount >= 2
-      ? "auto_scaffold"
-      : "rewrite";
+  const stage: PreapprovalPlanQualityRecoveryStage = input.planAutoScaffoldPromptIssued
+    ? "auto_scaffold"
+    : "rewrite";
   const canRequireNativePlanWrite =
     !input.forceXmlTools &&
     input.llmToolNames.some(isPlanDraftWriteToolName);

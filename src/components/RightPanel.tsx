@@ -17,7 +17,6 @@ import { save } from "@tauri-apps/plugin-dialog";
 import PlanPanel from "./PlanPanel";
 import { buildLineDiff, getDiffStats } from "../lib/diff";
 import { getE2EQuickReplyHandler, getE2EResumeExecutionHandler, getE2ESavePlanDocumentHandler } from "../lib/e2e";
-import { extractPlanDraftPreview, extractStructuredPlanProposal, hasPlanDraftPreview, hasStructuredPlanProposal } from "../lib/planProposal";
 import { resolveGlobalChatSessionKey, resolveSessionRuntimeKey, resolveSessionWorkspaceKey, type DiffRevertRequest, type TaskBlock, useAppStore } from "../store/useAppStore";
 import { deleteChatTempPath, exportTextFile, getPtyStatus, onPtyData, readPtyBuffer, resizePty, spawnPty, writePty, type GitDiffEntry } from "../lib/ipc";
 import { buildPlanTaskEvidenceAudit, collectChangeEntries, isPlanConversationTurn, type PlanArtifact, type PlanExecutionEvidenceEntry, type PlanTask } from "../lib/workflowModels";
@@ -32,6 +31,7 @@ import {
   resolvePlanPresentationBehavior,
 } from "../lib/turnPresentation";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
+import { isPlanCandidateBlock, isReviewablePlanBlock, selectLatestPlanCandidatePreview } from "../lib/chat/chatBlockVisibility";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -160,16 +160,8 @@ function looksBinary(content: string): boolean {
   return nonPrintable / sample.length > 0.1;
 }
 
-function turnHasGeneratedPlan(blocks: any[]) {
-  return blocks.some((block) => {
-    if (block.type === "tool") {
-      return /\.main\/plans\//i.test(String(block.target || ""));
-    }
-
-    if (block.type !== "agent") return false;
-    const raw = String(block.content || "");
-    return hasStructuredPlanProposal(raw) || hasPlanDraftPreview(raw);
-  });
+function turnHasPlanPreview(blocks: any[]) {
+  return blocks.some((block) => isPlanCandidateBlock(block) || isReviewablePlanBlock(block));
 }
 
 /** Integrated Terminal sub-component with xterm.js */
@@ -1054,7 +1046,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       blocks: taskFlow.filter((block) => block.turnId === turn.id),
     }));
 
-    return [...entries].reverse().find((entry) => turnHasGeneratedPlan(entry.blocks)) || null;
+    return [...entries].reverse().find((entry) => turnHasPlanPreview(entry.blocks)) || null;
   }, [conversationTurns, taskFlow]);
   const latestPlanTurn = useMemo(
     () => latestPlanEntry?.turn || [...conversationTurns].reverse().find((turn) => isPlanConversationTurn(turn)) || null,
@@ -1075,20 +1067,12 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       : taskFlow;
     return collectChangeEntries(scopedTaskFlow, getDiffStats);
   }, [latestPlanTurn, taskFlow]);
-  const fallbackPlanPreview = useMemo(() => {
-    if (!latestPlanEntry) return "";
-
-    for (const block of latestPlanEntry.blocks) {
-      if (block.type !== "agent") continue;
-      const proposal = extractStructuredPlanProposal(String(block.content || ""));
-      if (proposal) return proposal.markdown;
-      const draft = extractPlanDraftPreview(String(block.content || ""));
-      if (draft) return draft;
-    }
-
-    return "";
-  }, [latestPlanEntry]);
   const planApprovalIdentity = buildPlanApprovalIdentity(planArtifacts);
+  const hasReviewablePlanArtifact = !!planApprovalIdentity;
+  const fallbackPlanPreview = useMemo(() => {
+    if (hasReviewablePlanArtifact || !latestPlanEntry) return "";
+    return selectLatestPlanCandidatePreview(latestPlanEntry.blocks);
+  }, [hasReviewablePlanArtifact, latestPlanEntry]);
   const activeSessionKey = resolveSessionRuntimeKey(
     resolveSessionWorkspaceKey(currentWorkspace),
     currentSessionId,

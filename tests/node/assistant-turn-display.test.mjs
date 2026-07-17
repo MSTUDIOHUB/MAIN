@@ -172,13 +172,13 @@ test("assistant turn display hides inferred diagnostic choices while the approve
     ],
   });
 
-  assert.equal(decision.suppressInferredReplyOptionsForToolCalls, true);
+  assert.equal(decision.suppressInferredReplyOptionsForToolCalls, false);
   assert.equal(decision.suppressApprovedPlanExecutionReplyOptions, true);
   assert.deepEqual(decision.rawFinalReplyOptions, []);
   assert.deepEqual(decision.finalReplyOptions, []);
 });
 
-test("assistant turn display routes premature unapproved plan options into the artifact", () => {
+test("assistant turn display drops inferred follow-up options from unapproved Plan text", () => {
   const decision = resolveDecision({
     workflowMode: "plan",
     turnIntent: "plan",
@@ -196,13 +196,13 @@ test("assistant turn display routes premature unapproved plan options into the a
     }],
   });
 
-  assert.equal(decision.rawFinalReplyOptions.length, 1);
-  assert.equal(decision.planReplyOptionsRoutedToArtifact, true);
+  assert.equal(decision.rawFinalReplyOptions.length, 0);
+  assert.equal(decision.planReplyOptionsRoutedToArtifact, false);
   assert.equal(decision.finalReplyOptions.length, 0);
   assert.match(decision.finalVisibleText, /Implementation Plan/);
 });
 
-test("assistant turn display hides model-authored approval options once a structured plan is reviewable", () => {
+test("assistant turn display leaves structured Plan approval to the review action", () => {
   const decision = resolveDecision({
     workflowMode: "plan",
     turnIntent: "plan",
@@ -227,8 +227,88 @@ test("assistant turn display hides model-authored approval options once a struct
   });
 
   assert.equal(decision.hasStructuredProposal, true);
-  assert.equal(decision.planReplyOptionsRoutedToArtifact, true);
+  assert.equal(decision.planReplyOptionsRoutedToArtifact, false);
   assert.equal(decision.finalReplyOptions.length, 0);
+});
+
+test("assistant turn display keeps numbered Plan findings out of the user-choice protocol", () => {
+  const decision = resolveDecision({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    normalizedVisibleText: [
+      "已确认两个问题：",
+      "1. saveAsFile uses the wrong dialog contract.",
+      "2. openFiles does not restore the active document.",
+    ].join("\n"),
+    normalizedReplyOptions: [
+      {
+        label: "saveAsFile uses the wrong dialog contract",
+        value: "saveAsFile uses the wrong dialog contract",
+        source: "inferred_enumerated",
+      },
+      {
+        label: "openFiles does not restore the active document",
+        value: "openFiles does not restore the active document",
+        source: "inferred_enumerated",
+      },
+    ],
+  });
+
+  assert.deepEqual(decision.rawFinalReplyOptions, []);
+  assert.deepEqual(decision.finalReplyOptions, []);
+  assert.equal(decision.planReplyOptionsRoutedToArtifact, false);
+});
+
+test("assistant turn display accepts only explicit user_options in Plan workflow", () => {
+  const compatibilitySources = [
+    "proposal_follow_up",
+    "operation_approval",
+    "readonly_permission",
+  ];
+
+  for (const source of compatibilitySources) {
+    const decision = resolveDecision({
+      workflowMode: "plan",
+      turnIntent: "plan",
+      runtimeIntent: "plan",
+      normalizedVisibleText: "The Plan runtime owns its next action.",
+      normalizedReplyOptions: [{
+        label: `compatibility option from ${source}`,
+        value: `compatibility option from ${source}`,
+        source,
+      }],
+    });
+
+    assert.deepEqual(decision.rawFinalReplyOptions, [], source);
+    assert.deepEqual(decision.finalReplyOptions, [], source);
+    assert.equal(decision.planReplyOptionsRoutedToArtifact, false, source);
+  }
+});
+
+test("discarded Plan compatibility noise does not remove an explicit choice beside a tool call", () => {
+  const decision = resolveDecision({
+    workflowMode: "plan",
+    turnIntent: "plan",
+    runtimeIntent: "plan",
+    effectiveToolCallCount: 1,
+    normalizedVisibleText: "A source read is pending, and one product decision remains explicit.",
+    normalizedReplyOptions: [
+      {
+        label: "Keep existing behavior",
+        value: "Keep the existing behavior.",
+        source: "explicit_user_options",
+      },
+      {
+        label: "Continue investigating",
+        value: "Continue investigating.",
+        source: "proposal_follow_up",
+      },
+    ],
+  });
+
+  assert.equal(decision.suppressInferredReplyOptionsForToolCalls, false);
+  assert.deepEqual(decision.finalReplyOptions.map((option) => option.source), ["explicit_user_options"]);
 });
 
 test("assistant turn display does not expose model-self investigation and execution branches after Plan drafting", () => {

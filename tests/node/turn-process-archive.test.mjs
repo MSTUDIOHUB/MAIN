@@ -679,3 +679,67 @@ test("execution checkpoints remain visible terminal notices instead of process s
   });
   assert.equal(archive.blocks.some((block) => block.id === checkpoint.id), false);
 });
+
+test("rejected plan drafts stay out of completed plan milestones", () => {
+  const draft = {
+    id: 2,
+    turnId: "turn-plan-rejected",
+    type: "agent",
+    hiddenProcess: true,
+    content: [
+      "<proposed_plan>",
+      "# Candidate plan",
+      "",
+      "## Changes",
+      "",
+      "- Update src/main.js after validating the current contract.",
+      "- Run focused tests and record the result.",
+      "</proposed_plan>",
+    ].join("\n"),
+  };
+  const qualityGate = {
+    id: 3,
+    turnId: "turn-plan-rejected",
+    type: "system",
+    variant: "plan_quality_gate",
+    content: "Plan generation failed.",
+    planExecutionProgress: {
+      recoveryReason: "plan_generation_failed",
+      nextStep: "missing user goal mapping",
+    },
+  };
+
+  const groups = buildCodexActivityGroups([draft, qualityGate], "zh");
+  const live = buildLiveTurnProcessTimelineModel({ blocks: [draft, qualityGate], language: "zh" });
+
+  assert.equal(groups.length, 0);
+  assert.equal(live.totalCount, 0);
+  assert.doesNotMatch(JSON.stringify(groups), /已生成计划/);
+});
+
+test("only an explicit review-ready phase creates the plan milestone", () => {
+  const groups = buildCodexActivityGroups([{
+    id: 2,
+    turnId: "turn-plan-ready",
+    type: "agent",
+    content: [
+      "<proposed_plan>",
+      "# Accepted plan",
+      "",
+      "## Changes",
+      "",
+      "- Update src/main.js from verified evidence.",
+      "- Run focused validation and record the result.",
+      "</proposed_plan>",
+    ].join("\n"),
+    turnPhase: {
+      domain: "plan_runtime",
+      id: "plan_review_ready",
+      status: "done",
+    },
+  }], "zh");
+
+  assert.equal(groups.length, 1);
+  assert.equal(groups[0].kind, "plan");
+  assert.match(groups[0].title, /计划已通过校验/);
+});

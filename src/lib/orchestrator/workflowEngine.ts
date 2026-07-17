@@ -146,6 +146,7 @@ export interface WorkflowEngineStoreHelpers {
     sessionKey: string;
     source: "workflow_fallback";
   }) => void;
+  persistSessionRecord: (workspace: string, session: unknown) => Promise<unknown>;
   logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 
@@ -219,6 +220,7 @@ export class WorkflowEngine {
       compactCompletedTurnAgentMessages,
       normalizeQueuedUserMessage,
       startApprovedPlanExecutionInCurrentTurn,
+      persistSessionRecord,
       logStoreEvent: writeStoreEvent,
     } = this.helpers;
 
@@ -665,62 +667,93 @@ export class WorkflowEngine {
       }
     };
 
-	    const closeCurrentHarnessRunMarker = (status: "completed" | "paused" | "error", reason: string) => {
-	      const runtimeAtClose = sessionGet();
-	      const marker = runtimeAtClose.harnessRunMarker;
-	      if (isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner)) {
-	        const closedAt = Date.now();
-        const nextMarker: HarnessRunMarker = {
-          ...marker,
-          status,
-          planStage: runtimeAtClose.planStage,
-          isPlanApproved: runtimeAtClose.isPlanApproved,
-          updatedAt: closedAt,
-          closedAt,
-          closeReason: reason,
-        };
-	        sessionSet({ harnessRunMarker: nextMarker });
-	        closeHarnessRunMarker({ status, closeReason: reason }, harnessRunOwner);
-	        const latestRuntime = sessionGet();
-	        logStoreEvent("agent_loop_stop_summary", {
-	          turnId,
-	          sessionKey: runSessionKey,
-	          workspace: runWorkspace || null,
-	          status,
-	          reason,
-	          workflowMode: marker.workflowMode,
-	          runtimeIntent: marker.runtimeIntent,
-	          // Plan review and approval can change while the same run marker is
-	          // alive. Report reducer-owned current state, not the immutable
-	          // start snapshot (the latest log incorrectly said planStage=idle
-	          // immediately after plan.md revision 1 reached review).
-	          planStage: latestRuntime.planStage,
-	          isPlanApproved: latestRuntime.isPlanApproved,
-	          iteration: marker.iteration,
-	          maxIterations: marker.maxIterations,
-	          latestTool: marker.latestTool || null,
-	          latestToolTarget: marker.latestToolTarget || null,
-	          activeStreamId: marker.activeStreamId || null,
-	          streamStatus: marker.streamStatus || null,
-	          streamElapsedMs: marker.streamElapsedMs || 0,
-	          streamLifecycleStatus: marker.streamLifecycleStatus || null,
-	          lastStreamError: marker.lastStreamError || null,
-	          stopDiagnostic: lastNonActionableStopDiagnostic,
-	        });
-	      }
-	      else if (marker?.status === "running") {
-	        logStoreEvent("harness_close_skipped_owner_mismatch", {
-	          expected: harnessRunOwner,
-	          actual: {
-	            sessionKey: marker.sessionKey,
-	            turnId: marker.turnId,
-	            startedAt: marker.startedAt,
-	          },
-	          requestedStatus: status,
-	          reason,
-	        });
-	      }
-	    };
+    type TerminalHarnessProjection = {
+      source: HarnessRunMarker;
+      terminal: HarnessRunMarker;
+    };
+    type TerminalHarnessProjectionResult = TerminalHarnessProjection | "absent" | "ownership_lost";
+
+    const projectCurrentHarnessRunMarker = (
+      status: "completed" | "paused" | "error",
+      reason: string,
+      allowErrorOverride = false,
+    ): TerminalHarnessProjectionResult => {
+      const runtime = sessionGet();
+      const marker = runtime.harnessRunMarker as HarnessRunMarker | null;
+      if (!marker) return "absent";
+      const ownsIdentity =
+        marker.runId === harnessRunOwner.runId &&
+        marker.sessionKey === harnessRunOwner.sessionKey &&
+        marker.turnId === harnessRunOwner.turnId;
+      if (!isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner) && !(allowErrorOverride && ownsIdentity)) {
+        if (marker?.status === "running") {
+          logStoreEvent("harness_close_skipped_owner_mismatch", {
+            expected: harnessRunOwner,
+            actual: {
+              sessionKey: marker.sessionKey,
+              turnId: marker.turnId,
+              startedAt: marker.startedAt,
+            },
+            requestedStatus: status,
+            reason,
+          });
+        }
+        return "ownership_lost";
+      }
+      const closedAt = Date.now();
+      const terminal: HarnessRunMarker = {
+        ...marker,
+        status,
+        planStage: runtime.planStage,
+        isPlanApproved: runtime.isPlanApproved,
+        updatedAt: closedAt,
+        closedAt,
+        closeReason: reason,
+      };
+      sessionSet({ harnessRunMarker: terminal });
+      return { source: marker, terminal };
+    };
+
+    const publishCurrentHarnessRunMarkerClose = (result: TerminalHarnessProjectionResult): boolean => {
+      if (result === "absent") return true;
+      if (result === "ownership_lost") return false;
+      const { source, terminal } = result;
+      const closedMarker = closeHarnessRunMarker({
+        status: terminal.status,
+        closeReason: terminal.closeReason || "agent_loop_closed",
+      }, harnessRunOwner);
+      if (!closedMarker) {
+        logStoreEvent("harness_close_publish_skipped", {
+          expected: harnessRunOwner,
+          requestedStatus: terminal.status,
+          reason: terminal.closeReason,
+        });
+        return false;
+      }
+      const latestRuntime = sessionGet();
+      logStoreEvent("agent_loop_stop_summary", {
+        turnId,
+        sessionKey: runSessionKey,
+        workspace: runWorkspace || null,
+        status: terminal.status,
+        reason: terminal.closeReason,
+        workflowMode: source.workflowMode,
+        runtimeIntent: source.runtimeIntent,
+        planStage: latestRuntime.planStage,
+        isPlanApproved: latestRuntime.isPlanApproved,
+        iteration: source.iteration,
+        maxIterations: source.maxIterations,
+        latestTool: source.latestTool || null,
+        latestToolTarget: source.latestToolTarget || null,
+        activeStreamId: source.activeStreamId || null,
+        streamStatus: source.streamStatus || null,
+        streamElapsedMs: source.streamElapsedMs || 0,
+        streamLifecycleStatus: source.streamLifecycleStatus || null,
+        lastStreamError: source.lastStreamError || null,
+        stopDiagnostic: lastNonActionableStopDiagnostic,
+      });
+      return true;
+    };
 
     const emitProgressRuntimeEvent = (
       progress: MainThreadProgressUpdate,
@@ -3356,6 +3389,8 @@ export class WorkflowEngine {
           : reason === "incomplete_plan"
           ? "paused"
           : "stopped_no_action";
+        const isPlanGenerationFailure =
+          reason === "incomplete_plan" && progress?.recoveryReason === "plan_generation_failed";
         sessionSet((s: any) => {
           const currentStreamingBlockId = context.currentStreamingBlockId;
           const currentThoughtBlockId = context.currentThoughtBlockId;
@@ -3373,7 +3408,7 @@ export class WorkflowEngine {
 
                 return {
                   ...t,
-                  content: `❌ **${message}**`,
+                  content: isPlanGenerationFailure ? agentContent : `❌ **${message}**`,
                   streaming: false,
                   failedAttempts: [
                     ...existingAttempts,
@@ -3397,7 +3432,7 @@ export class WorkflowEngine {
             turnId,
             type: "system",
             content: message,
-            variant: "execution_checkpoint",
+            variant: isPlanGenerationFailure ? "plan_quality_gate" : "execution_checkpoint",
             ...(progress ? { planExecutionProgress: progress } : {}),
           } as TaskBlock;
           taskFlow = [...taskFlow, stopBlock];
@@ -3691,30 +3726,28 @@ export class WorkflowEngine {
       return result;
     };
 
-    const closeHarnessForAgentLoopOutcome = (outcome: AgentLoopOutcome) => {
+    const projectHarnessForAgentLoopOutcome = (outcome: AgentLoopOutcome): TerminalHarnessProjectionResult => {
       switch (outcome.status) {
         case "completed":
-          closeCurrentHarnessRunMarker("completed", outcome.reason || "agent_loop_completed");
-          break;
+          return projectCurrentHarnessRunMarker("completed", outcome.reason || "agent_loop_completed");
         case "paused":
-          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_paused");
-          break;
+          return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_paused");
         case "stopped_no_output":
-          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_output");
-          break;
+          return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_output");
         case "stopped_no_action":
-          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_action");
-          break;
+          return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_action");
         case "aborted":
-          closeCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_aborted");
-          break;
+          return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_aborted");
         case "error":
-          closeCurrentHarnessRunMarker("error", outcome.reason || "agent_loop_error");
-          break;
+          return projectCurrentHarnessRunMarker("error", outcome.reason || "agent_loop_error");
       }
     };
 
-    const commitTerminalProjectionBeforeStatusPublication = (outcome: AgentLoopOutcome) => {
+    const commitTerminalProjectionBeforeStatusPublication = async (
+      outcome: AgentLoopOutcome,
+      harnessProjection: TerminalHarnessProjectionResult,
+    ): Promise<boolean> => {
+      if (harnessProjection === "ownership_lost") return false;
       const current = sessionGet();
       const pendingAction = current.activeActionRequest as ActionRequest | null;
       const isIntentionalActionPause =
@@ -3724,9 +3757,19 @@ export class WorkflowEngine {
         // The action-request reducer already projected awaiting_input or
         // awaiting_approval. Persist it before outer cleanup can publish any
         // different UI status.
-        persistCurrentSessionRuntime(current);
+        await persistCurrentSessionRuntime(sessionGet());
+        if (!publishCurrentHarnessRunMarkerClose(harnessProjection)) {
+          return false;
+        }
         terminalStatusPublicationGate.discardDeferredIdle();
-        return;
+        sessionSet({
+          agentStatus: pendingAction?.kind === "plan_review" || pendingAction?.kind === "tool_permission"
+            ? "pending_review"
+            : "idle",
+          isGenerating: false,
+          abortController: null,
+        });
+        return true;
       }
 
       const terminalTurnStatus = outcome.status === "completed"
@@ -3739,8 +3782,8 @@ export class WorkflowEngine {
         ? "stopped_no_action"
         : "paused";
       const terminalTurnIds = new Set([turnId, context.uiDisplayTurnId].filter(Boolean));
-      terminalStatusPublicationGate.commitTerminal({
-        persistTerminalProjection: () => {
+      const terminalCommitted = await terminalStatusPublicationGate.commitTerminal({
+        persistTerminalProjection: async () => {
           sessionSet((state: any) => ({
             conversationTurns: state.conversationTurns.map((candidate: any) =>
               terminalTurnIds.has(candidate.id)
@@ -3748,7 +3791,8 @@ export class WorkflowEngine {
                 : candidate
             ),
           }));
-          persistCurrentSessionRuntime(sessionGet());
+          await persistCurrentSessionRuntime(sessionGet());
+          return publishCurrentHarnessRunMarkerClose(harnessProjection);
         },
         publishTerminalStatus: () => {
           sessionSet({
@@ -3758,14 +3802,17 @@ export class WorkflowEngine {
           });
         },
       });
-      const committed = sessionGet();
-      logStoreEvent("terminal_run_projection_committed", {
-        outcomeStatus: outcome.status,
-        turnStatus: terminalTurnStatus,
-        turnIds: Array.from(terminalTurnIds),
-        planStage: committed.planStage,
-        isPlanApproved: committed.isPlanApproved,
-      });
+      if (terminalCommitted) {
+        const committed = sessionGet();
+        logStoreEvent("terminal_run_projection_committed", {
+          outcomeStatus: outcome.status,
+          turnStatus: terminalTurnStatus,
+          turnIds: Array.from(terminalTurnIds),
+          planStage: committed.planStage,
+          isPlanApproved: committed.isPlanApproved,
+        });
+      }
+      return terminalCommitted;
     };
 
     const commitTerminalTurnContext = (loopOutcome: AgentLoopOutcome) => {
@@ -3854,13 +3901,21 @@ export class WorkflowEngine {
       return elapsedTime;
     };
 
-    const persistCurrentSessionRuntime = (state = sessionGet()) => {
-      if (!runSessionId) return;
+    const persistCurrentSessionRuntime = async (state = sessionGet()): Promise<void> => {
+      if (runSessionId == null) return;
       const messages = sanitizeTaskBlocksForPersist(state.taskFlow);
-      state.updateSession(runScopeKey, runSessionId, {
+      const sessionRecord = (state.sessionsByWorkspace?.[runScopeKey] || []).find(
+        (candidate: any) => candidate.id === runSessionId,
+      );
+      const shouldPersist =
+        state.config.sessionRecordingEnabled === true && sessionRecord?.recordingDisabled !== true;
+      const updatedAtMs = Date.now();
+      const sessionPatch = {
+        updatedAt: new Date(updatedAtMs).toISOString(),
+        updatedAtMs,
         messages,
-        storageStatus: state.config.sessionRecordingEnabled ? "ok" : "temporary",
-        recordingDisabled: !state.config.sessionRecordingEnabled,
+        storageStatus: "temporary" as const,
+        recordingDisabled: sessionRecord?.recordingDisabled === true || !state.config.sessionRecordingEnabled,
         runtimeSnapshot: normalizeSessionRuntimeSnapshot({
           runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
           runtimeEvents: state.runtimeEvents,
@@ -3903,7 +3958,32 @@ export class WorkflowEngine {
           goalIterationBudget: state.goalIterationBudget,
           goalRuntime: state.goalRuntime,
         }),
-      });
+      };
+      state.updateSession(runScopeKey, runSessionId, sessionPatch);
+      if (!shouldPersist) return;
+
+      if (!sessionRecord) {
+        throw new Error(`SESSION_RUNTIME_RECORD_MISSING: ${runScopeKey}:${runSessionId}`);
+      }
+
+      try {
+        const saved = await persistSessionRecord(runScopeKey, {
+          ...sessionRecord,
+          ...sessionPatch,
+        });
+        sessionGet().updateSession(runScopeKey, runSessionId, {
+          ...(saved && typeof saved === "object" ? saved : {}),
+          storageStatus: "ok",
+          recordingDisabled: false,
+        });
+      } catch (error) {
+        logStoreEvent("session_runtime_persist_failed", {
+          scopeKey: runScopeKey,
+          sessionId: runSessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
     };
 
     const executeLoopStrategy = (): Promise<AgentLoopOutcome> => {
@@ -4436,24 +4516,18 @@ export class WorkflowEngine {
         title: "Closed with parent run",
         reason: "canceled",
       });
-      // Persist the terminal turn projection before the run marker closes and
-      // before any idle UI notification can be observed. Otherwise a stopped
-      // or completed turn can remain serialized as `executing`.
-      commitTerminalProjectionBeforeStatusPublication(loopOutcome);
-      closeHarnessForAgentLoopOutcome(loopOutcome);
       clearInterval(timerInterval);
-      commitFinalElapsedTime();
-
-      const pausedActionRequest = sessionGet().activeActionRequest as ActionRequest | null;
-      if (loopOutcome.status !== "completed" && loopOutcome.status !== "error" && pausedActionRequest) {
-        sessionSet({
-          agentStatus: pausedActionRequest.kind === "plan_review" || pausedActionRequest.kind === "tool_permission"
-            ? "pending_review"
-            : "idle",
-          isGenerating: false,
-          abortController: null,
+      const harnessProjection = projectHarnessForAgentLoopOutcome(loopOutcome);
+      if (harnessProjection === "ownership_lost") {
+        logStoreEvent("terminal_run_publication_skipped", {
+          reason: "harness_ownership_lost",
+          sessionKey: runSessionKey,
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
         });
+        return true;
       }
+      commitFinalElapsedTime();
 
       if (loopOutcome.status === "completed" || loopOutcome.status === "error") {
         const request = sessionGet().activeActionRequest as ActionRequest | null;
@@ -4496,16 +4570,27 @@ export class WorkflowEngine {
         pendingMaxIterationsAutoResume = null;
         latestState = sessionGet();
       }
-      if (pendingSameTurnExecution) {
-        sessionSet({ agentStatus: "idle", isGenerating: false, abortController: null });
-        latestState = sessionGet();
-      }
       if (shouldCanonicalizeTerminalTurnContext(loopOutcome.status) && !pendingSameTurnExecution) {
         latestState = commitTerminalTurnContext(loopOutcome);
       }
 
-      // Save session messages (sanitized for serialization safety)
-      persistCurrentSessionRuntime(latestState);
+      // The closed run marker, elapsed time, durable turn context, and terminal
+      // turn status form one persistence boundary. Publish idle only after the
+      // durable session write completes.
+      const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(
+        loopOutcome,
+        harnessProjection,
+      );
+      if (!terminalProjectionCommitted) {
+        logStoreEvent("terminal_run_publication_skipped", {
+          reason: "harness_ownership_changed_before_publish",
+          sessionKey: runSessionKey,
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
+        });
+        return true;
+      }
+      latestState = sessionGet();
       if (pendingSameTurnExecution) {
         const attemptSameTurnExecutionFallback = (busyRetryAttempt: number) => {
           const latest = sessionGet();
@@ -4667,6 +4752,21 @@ export class WorkflowEngine {
       return true;
     }).catch(async (err: any) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      const errorHarnessProjection = projectCurrentHarnessRunMarker(
+        "error",
+        "agent_loop_crashed",
+        true,
+      );
+      if (errorHarnessProjection === "ownership_lost") {
+        clearInterval(timerInterval);
+        logStoreEvent("stale_run_error_publication_skipped", {
+          sessionKey: runSessionKey,
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
+          error: errorMessage,
+        });
+        return true;
+      }
       const parentTurnId = context.uiDisplayTurnId || turnId;
       const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
         threadId: runSessionKey,
@@ -4688,7 +4788,6 @@ export class WorkflowEngine {
           reason: "canceled",
         });
       }
-      closeCurrentHarnessRunMarker("error", "agent_loop_crashed");
       clearInterval(timerInterval);
       commitFinalElapsedTime();
       appendWorkflowRuntimeEvent({
@@ -4762,7 +4861,13 @@ export class WorkflowEngine {
         status: "error",
         reason: errorMessage,
       });
-      persistCurrentSessionRuntime(terminalState);
+      try {
+        await persistCurrentSessionRuntime(terminalState);
+      } catch {
+        // persistCurrentSessionRuntime already records the durable-write error.
+      } finally {
+        publishCurrentHarnessRunMarkerClose(errorHarnessProjection);
+      }
 
       return false;
     });

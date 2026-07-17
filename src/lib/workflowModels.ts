@@ -4136,7 +4136,7 @@ export function classifyPlanArtifactQualityResult(
   // Evidence gap: only when the validation reason explicitly mentions evidence problems.
   // Evidence sections are no longer part of missingRequiredSections in the unified path,
   // so we only classify as evidence gap for explicit evidence issues.
-  const hasEvidenceGap = /insufficient_grounded_evidence|noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|ungrounded_plan_change_targets|uncovered_user_goal_facets|unverified_plan_contract_counterpart|plan_before_state_not_observed/.test(reason);
+  const hasEvidenceGap = /insufficient_grounded_evidence|noisy_search_evidence|weak_path_echo_evidence|import_only_evidence|ungrounded_plan_change_targets|unverified_plan_contract_counterpart|plan_before_state_not_observed/.test(reason);
   const hasEvidencePresentationGap = /missing_plan_evidence_section/.test(reason);
   const hasOnlyStructuralGaps =
     missingSections.length > 0 &&
@@ -4169,15 +4169,7 @@ export function classifyPlanArtifactQualityResult(
       ...result,
       missingSections,
       recoveryAction: "rewrite",
-      canAutoRepair: missingSections.every((section) =>
-        section === "user_goal" ||
-        section === "execution_steps" ||
-        section === "affected_files" ||
-        section === "validation" ||
-        section === "test_plan" ||
-        section === "key_changes" ||
-        section === "public_interfaces"
-      ),
+      canAutoRepair: true,
     };
   }
 
@@ -4205,6 +4197,16 @@ export function classifyPlanArtifactQualityResult(
     recoveryAction: "rewrite",
     canAutoRepair: false,
   };
+}
+
+export function canDeterministicallyMaterializePlan(input: {
+  recoveryAction?: PlanArtifactRecoveryAction | null;
+  closureReady: boolean;
+}): boolean {
+  return input.closureReady && (
+    input.recoveryAction === "rewrite" ||
+    input.recoveryAction === "auto_scaffold"
+  );
 }
 
 function detectPlanLanguage(content: string): "zh" | "en" {

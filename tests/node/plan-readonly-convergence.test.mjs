@@ -689,7 +689,7 @@ test("visible candidate rejection recovers without poisoning persisted artifact 
   }]);
 });
 
-test("second short diagnostic draft scaffolds from grounded source instead of reopening discovery", () => {
+test("second short diagnostic draft keeps its typed rewrite instead of reopening discovery", () => {
   const harness = createPlanConvergenceCallbacks("zh");
   const phases = [];
   const result = handlePlanQualityRecoveryAfterVisibleMaterialization({
@@ -732,10 +732,10 @@ test("second short diagnostic draft scaffolds from grounded source instead of re
 
   assert.equal(result.planQualityRejectCount, 2);
   assert.equal(result.planClosureEvidenceRecoveryIssued, false);
-  assert.equal(result.planAutoScaffoldPromptIssued, true);
-  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_AUTO_SCAFFOLD/);
+  assert.equal(result.planAutoScaffoldPromptIssued, false);
+  assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_NEEDS_REWRITE/);
   assert.equal(phases.at(-1)?.phase, "needs_rewrite");
-  assert.equal(phases.at(-1)?.reason, "auto scaffold after quality gate");
+  assert.equal(phases.at(-1)?.reason, "too_short");
 });
 
 test("a first rejected draft prioritizes an unresolved contract counterpart over text rewrite", () => {
@@ -792,7 +792,7 @@ test("a first rejected draft prioritizes an unresolved contract counterpart over
   }]);
 });
 
-test("visible candidate quality recovery is bounded after rewrite and scaffold", () => {
+test("visible candidate quality recovery is bounded without changing the typed action", () => {
   const harness = createPlanConvergenceCallbacks("en");
   const common = {
     callbacks: harness.callbacks,
@@ -815,7 +815,7 @@ test("visible candidate quality recovery is bounded after rewrite and scaffold",
     planEvidenceRecoveryPasses: 0,
     setPlanRuntimePhase: () => {},
   };
-  const scaffold = handlePlanQualityRecoveryAfterVisibleMaterialization({
+  const secondRewrite = handlePlanQualityRecoveryAfterVisibleMaterialization({
     ...common,
     iteration: 9,
     planQualityRejectCount: 1,
@@ -824,12 +824,12 @@ test("visible candidate quality recovery is bounded after rewrite and scaffold",
   const exhausted = handlePlanQualityRecoveryAfterVisibleMaterialization({
     ...common,
     iteration: 10,
-    planQualityRejectCount: scaffold.planQualityRejectCount,
-    planAutoScaffoldPromptIssued: scaffold.planAutoScaffoldPromptIssued,
+    planQualityRejectCount: secondRewrite.planQualityRejectCount,
+    planAutoScaffoldPromptIssued: secondRewrite.planAutoScaffoldPromptIssued,
   });
 
-  assert.match(scaffold.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_AUTO_SCAFFOLD/);
-  assert.equal(scaffold.planAutoScaffoldPromptIssued, true);
+  assert.match(secondRewrite.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_NEEDS_REWRITE/);
+  assert.equal(secondRewrite.planAutoScaffoldPromptIssued, false);
   assert.equal(exhausted.planQualityRejectCount, 3);
   assert.equal(exhausted.pendingPlanRuntimeRecoveryPrompt, null);
   assert.equal(exhausted.planArtifactQualityRejected, false);

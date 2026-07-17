@@ -23,6 +23,7 @@ import {
 } from "../../orchestrator";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import {
+  canDeterministicallyMaterializePlan,
   classifyPlanArtifactQualityResult,
   type PlanArtifactRecoveryAction,
   type PlanRuntimePhase,
@@ -45,6 +46,7 @@ export type PlanQualityRecoveryResult = {
   planEvidenceProgressFingerprint: string;
   planArtifactQualityRejected: boolean;
   pendingPlanRuntimeRecoveryPrompt: string | null;
+  deterministicEvidenceMaterializationCandidate: boolean;
 };
 
 export type PlanQualityRejectionSource = "visible_candidate" | "persisted_artifact";
@@ -190,6 +192,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
   let planEvidenceProgressFingerprint = input.planEvidenceProgressFingerprint ?? "";
   let planArtifactQualityRejected = input.planArtifactQualityRejected === true;
   let pendingPlanRuntimeRecoveryPrompt: string | null = null;
+  let deterministicEvidenceMaterializationCandidate = false;
   const hasOutstandingEvidenceRecoveryRead =
     planClosureEvidenceRecoveryIssued &&
     input.evidenceRecoveryResults.some((result) =>
@@ -229,6 +232,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     planEvidenceProgressFingerprint,
     planArtifactQualityRejected,
     pendingPlanRuntimeRecoveryPrompt,
+    deterministicEvidenceMaterializationCandidate,
   });
 
   if (workflowMode !== "plan" || callbacks.getIsPlanApproved()) {
@@ -243,6 +247,19 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     const latestQualityResult = input.rejections[input.rejections.length - 1];
     planLastQualityGateReason = latestQualityResult.qualityGateReason || "quality_gate";
     planLastMissingSections = latestQualityResult.missingSections || [];
+    const supersedesDeterministicEvidenceRecovery =
+      latestQualityResult.source === "visible_candidate" &&
+      latestQualityResult.recoveryAction !== "targeted_evidence" &&
+      planClosureEvidenceRecoveryIssued &&
+      planEvidenceRecoveryObjective !== "model_draft";
+    if (supersedesDeterministicEvidenceRecovery) {
+      // A new model-authored candidate is the result of the previous turn. Its
+      // typed quality action now owns recovery; a stale deterministic-read flag
+      // must not reopen discovery before the candidate can be repaired.
+      planClosureEvidenceRecoveryIssued = false;
+      planEvidenceRecoveryObjective = "none";
+      planEvidenceNoProgressPasses = 0;
+    }
     logAgentEvent("plan_quality_recovery_action", {
       iteration,
       source: latestQualityResult.source,
@@ -251,6 +268,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       qualityGateReason: planLastQualityGateReason,
       missingSections: planLastMissingSections,
       evidenceRecoveryPasses: planEvidenceRecoveryPasses,
+      supersededDeterministicEvidenceRecovery: supersedesDeterministicEvidenceRecovery,
     });
 
     const qualityClosureEvidence = collectPlanClosureMaterializationInput(
@@ -286,16 +304,12 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     const effectiveRecoveryAction = shouldRequestTargetedEvidenceAfterQualityGate
       ? "targeted_evidence"
       : latestQualityResult.recoveryAction;
-    const deterministicEvidenceMaterializationCandidate =
+    deterministicEvidenceMaterializationCandidate =
       latestQualityResult.source === "visible_candidate" &&
-      latestQualityResult.recoveryAction !== "ask_user" &&
-      closureEvidenceAssessment.ready &&
-      (
-        planQualityRejectCount >= 2 ||
-        /excessive_plan_code_dump|insufficient_actionable_plan_signals|missing_plan_required_sections/i.test(
-          planLastQualityGateReason,
-        )
-      );
+      canDeterministicallyMaterializePlan({
+        recoveryAction: latestQualityResult.recoveryAction,
+        closureReady: closureEvidenceAssessment.ready,
+      });
     logAgentEvent("plan_quality_gate_recovery_decision", {
       iteration,
       source: latestQualityResult.source,
@@ -361,10 +375,7 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       // transaction. Do not replace it with a scaffold merely because another
       // weak draft arrived before the requested evidence result.
       setQualityPhase("needs_evidence", closureEvidenceAssessment.reason);
-    } else if (
-      latestQualityResult.recoveryAction === "auto_scaffold" ||
-      planQualityRejectCount >= 2
-    ) {
+    } else if (latestQualityResult.recoveryAction === "auto_scaffold") {
       if (!planAutoScaffoldPromptIssued) {
         planAutoScaffoldPromptIssued = true;
         planEvidenceRecoveryObjective = "none";
@@ -482,7 +493,6 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         readCoverageAdvanced,
         newCoverageKeys,
         evidenceBundleHash: recoveredEvidenceBundleHash,
-        recoveryBudgetRemaining: true,
         semanticFacts: recoveredModelDraftInput.evidenceBundle.facts.length,
         changeTargets: recoveredModelDraftInput.evidenceBundle.changeTargets.length,
       });
@@ -521,10 +531,6 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
       const recoveredClosureAssessment = assessPlanClosureEvidence(
         recoveredClosureInput.evidenceBundle,
       );
-      // Successful distinct evidence is progress regardless of how many
-      // earlier windows were needed. Global loop/context limits remain the
-      // safety boundary; only unchanged/no-progress reads are locally bounded.
-      const recoveryBudgetRemaining = true;
       logAgentEvent("plan_evidence_recovery_assessed", {
         iteration,
         recoveryPass: planEvidenceRecoveryPasses,
@@ -543,11 +549,10 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         readCoverageAdvanced,
         newCoverageKeys,
         evidenceBundleHash: recoveredEvidenceBundleHash,
-        recoveryBudgetRemaining,
         semanticFacts: recoveredClosureInput.evidenceBundle.facts.length,
         changeTargets: recoveredClosureInput.evidenceBundle.changeTargets.length,
       });
-      if (!recoveredClosureAssessment.ready && recoveryBudgetRemaining) {
+      if (!recoveredClosureAssessment.ready) {
         planClosureEvidenceRecoveryIssued = true;
         planEvidenceRecoveryObjective = "deterministic_closure";
         setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
@@ -750,11 +755,10 @@ export function handlePlanQualityRecoveryAfterVisibleMaterialization(
   });
 
   // Tool-written rejections are already visible to the model as tool
-  // feedback. A visible candidate has no such channel, so the first rejection
-  // needs one explicit recovery prompt. The second rejection is handled by the
-  // shared auto-scaffold branch; a later failure is intentionally left without
-  // another prompt so the caller can stop instead of looping forever.
-  if (result.pendingPlanRuntimeRecoveryPrompt == null && result.planQualityRejectCount === 1) {
+  // feedback. A visible candidate has no such channel, so allow two bounded
+  // prompts for the typed recovery action. Retry count limits the loop; it must
+  // not convert a rewrite into evidence discovery or a different action.
+  if (result.pendingPlanRuntimeRecoveryPrompt == null && result.planQualityRejectCount <= 2) {
     if (
       recoveryAction === "targeted_evidence"
     ) {

@@ -1,6 +1,6 @@
 import { isThinModelToolNarration, isSubstantiveModelFeedback } from "../modelFeedbackDedupe";
 import { parseMessageContent } from "../messageParser";
-import { hasPlanDraftPreview, hasTieredPlanProposal } from "../planProposal";
+import { extractPlanDraftPreview, extractTieredPlanProposal } from "../planProposal";
 import { sanitizeAIOutput } from "../sanitize";
 import {
   extractPathishTokens,
@@ -137,15 +137,71 @@ export function shouldSuppressAgentAsExplanation(block: any, _index: number, _bl
 }
 
 export function hasGeneratedPlanContent(blocks: any[]) {
-  return blocks.some((block) => {
-    if (block.type === "tool") {
-      return /\.main\/plans\//i.test(String(block.target || ""));
-    }
+  return blocks.some(isReviewablePlanBlock);
+}
 
-    if (block.type !== "agent") return false;
-    const raw = getAgentInspectableContent(block.content);
-    return hasTieredPlanProposal(raw) || hasPlanDraftPreview(raw);
-  });
+function getPlanCandidatePreview(block: any): string {
+  if (block?.type !== "agent") return "";
+  const parseCandidate = (source: unknown) => {
+    const raw = getAgentInspectableContent(String(source || ""));
+    const proposal = extractTieredPlanProposal(raw);
+    if (proposal?.markdown.trim()) return proposal.markdown.trim();
+    return extractPlanDraftPreview(raw)?.trim() || "";
+  };
+  const current = parseCandidate(block.content);
+  if (current) return current;
+
+  // Old snapshots replaced the final candidate with the stop message. Only
+  // recover the latest saved attempt when it still carries an explicit Plan
+  // protocol marker; current runs keep the candidate in block.content.
+  const latestFailedAttempt = Array.isArray(block.failedAttempts)
+    ? block.failedAttempts[block.failedAttempts.length - 1]
+    : null;
+  const legacySource = String(latestFailedAttempt?.content || "");
+  if (!/(?:\[PROPOSAL START\]|<proposed_plan\b|<plan>|^\s*#\s*Proposed Plan\b|^\s*\[STAGE:)/im.test(legacySource)) {
+    return "";
+  }
+  return parseCandidate(legacySource);
+}
+
+export function isPlanCandidateBlock(block: any): boolean {
+  return getPlanCandidatePreview(block).length > 0;
+}
+
+export function selectLatestPlanCandidatePreview(blocks: any[]): string {
+  for (const block of [...blocks].reverse()) {
+    const preview = getPlanCandidatePreview(block);
+    if (preview) return preview;
+  }
+  return "";
+}
+
+/**
+ * A plan-shaped assistant message is only a draft. Review readiness belongs
+ * to the materialized artifact/runtime lifecycle, never to Markdown wording.
+ */
+export function isReviewablePlanBlock(block: any): boolean {
+  const runtimePhase = String(block?.turnPhase?.id || "").replace(/^plan_/, "");
+  return runtimePhase === "review_ready";
+}
+
+/** Structured compatibility for old execution checkpoints and the canonical
+ * planning quality-gate notice. */
+export function isPlanGenerationFailureBlock(block: any): boolean {
+  return block?.type === "system" && (
+    block.variant === "plan_quality_gate" ||
+    String(block.planExecutionProgress?.recoveryReason || "") === "plan_generation_failed"
+  );
+}
+
+export function resolvePlanArtifactOwnerTurnId(input: {
+  hasReviewableArtifact: boolean;
+  actionOwnerTurnId?: string | null;
+  progressOwnerTurnId?: string | null;
+  reviewReadyTurnId?: string | null;
+}): string | null {
+  if (!input.hasReviewableArtifact) return null;
+  return input.actionOwnerTurnId || input.progressOwnerTurnId || input.reviewReadyTurnId || null;
 }
 
 export function isCompletedReadContextTool(block: any) {

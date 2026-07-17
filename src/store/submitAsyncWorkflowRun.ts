@@ -95,7 +95,7 @@ export interface SubmitAsyncWorkflowRunPhaseRunners<
 export interface StartSubmitAsyncWorkflowRunInput<
   TState extends SubmitAsyncWorkflowRunState,
   TAbortController extends AbortController,
-> extends WorkflowEngineStoreHelpers {
+> extends Omit<WorkflowEngineStoreHelpers, "persistSessionRecord"> {
   text: string;
   turnId: string;
   uiDisplayTurnId: string;
