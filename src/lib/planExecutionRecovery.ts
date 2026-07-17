@@ -26,10 +26,10 @@ import {
 import { isPlanReadOnlyToolName } from "./planReadOnlyConvergence";
 import {
   buildExecuteEvidenceClosureAudit,
+  resolveLatestUnreconciledFailureSignal,
   scopeExecutionEvidenceLedger,
   type ExecuteEvidenceGap,
 } from "./verificationEvidence";
-import { isWorkspaceMutationToolName } from "./workspaceMutationTools";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
 
@@ -188,13 +188,6 @@ export interface ExecuteMaxIterationsRecoveryDecision {
   reason: string;
 }
 
-const PTY_OBSERVATION_TOOL_NAMES = new Set([
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
-]);
-
 /**
  * Rebuild the first recovery capability at an Execute iteration boundary from
  * the append-only evidence ledger. A fixed action/mutation mode loses causal
@@ -243,42 +236,36 @@ export function resolveExecuteMaxIterationsRecoveryDecision(input: {
   }
 
   if (closure.gap === "unreconciled_failure") {
-    const latestMutationIndex = ledger.reduce(
-      (latest, entry, index) =>
-        entry.kind === "file" || entry.kind === "deliverable" ? index : latest,
-      -1,
-    );
-    const epoch = latestMutationIndex >= 0 ? ledger.slice(latestMutationIndex) : ledger;
-    const latestFailure = [...epoch].reverse().find((entry) =>
-      entry.observationStatus === "failed" || entry.portConflict === true
-    );
-    const sourceTool = String(latestFailure?.sourceTool || "");
-    const browserFailure =
-      latestFailure?.kind === "browser_dom" ||
-      latestFailure?.kind === "browser_screenshot" ||
-      /(?:browser|playwright|puppeteer|cypress)/i.test(sourceTool);
-    const devServerFailure =
-      sourceTool === "execute_command" ||
-      PTY_OBSERVATION_TOOL_NAMES.has(sourceTool) ||
-      latestFailure?.portConflict === true;
-
-    if (browserFailure || devServerFailure) {
+    const failure = resolveLatestUnreconciledFailureSignal({ ledger });
+    if (
+      failure?.domain === "browser" &&
+      (failure.sourceTarget || ledger.some((entry) =>
+        entry.kind === "file" || entry.kind === "deliverable"
+      ))
+    ) {
+      return {
+        mode: "mutation_first",
+        gap: closure.gap,
+        reason: "max_iterations_browser_source_repair",
+      };
+    }
+    if (failure?.domain === "process" || failure?.domain === "browser") {
       return {
         mode: "validation_only",
         gap: closure.gap,
-        reason: devServerFailure
+        reason: failure.domain === "process"
           ? "max_iterations_dev_server_reconciliation"
           : "max_iterations_browser_validation_retry",
       };
     }
-    if (sourceTool === "run_command") {
+    if (failure?.domain === "command") {
       return {
         mode: "finite_validation_only",
         gap: closure.gap,
         reason: "max_iterations_finite_validation_retry",
       };
     }
-    if (isWorkspaceMutationToolName(sourceTool)) {
+    if (failure?.domain === "mutation") {
       return {
         mode: "action_plus_targeting",
         gap: closure.gap,

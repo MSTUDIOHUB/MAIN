@@ -274,6 +274,23 @@ test("approved Plan finite command failures split invocation recovery from sourc
   );
 });
 
+test("browser runtime failures atomically leave browser-only validation for source repair", () => {
+  const failureIndex = phaseSource.indexOf("const failedBrowserValidation");
+  const finiteFailureIndex = phaseSource.indexOf("const failedFiniteValidation");
+  const branch = phaseSource.slice(failureIndex, finiteFailureIndex);
+
+  assert.notEqual(failureIndex, -1);
+  assert.notEqual(finiteFailureIndex, -1);
+  assert.ok(failureIndex < finiteFailureIndex);
+  assert.match(branch, /resolveLatestUnreconciledFailureSignal/);
+  assert.match(branch, /failure\?\.domain === "browser"/);
+  assert.match(branch, /buildFailedValidationRepairReadLease/);
+  assert.match(branch, /"browser_validation_requires_source_repair"/);
+  assert.match(branch, /nextRequiredCapability: "targeted_read"/);
+  assert.match(branch, /return finish\("continue"\)/);
+  assert.doesNotMatch(branch, /reconcile_server/);
+});
+
 test("tool iteration phase delegates tool-result recovery internals to the phase helper", () => {
   assert.match(orchestratorSource, /handleToolIterationPhase\(\{/);
   assert.match(toolIterationPhaseSource, /handleToolResultRecoveryPhase\(\{/);

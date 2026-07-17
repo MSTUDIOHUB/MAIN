@@ -60,10 +60,91 @@ const completionGuardsModule = loadTranspiledModuleSync(
 );
 
 const {
+  buildExecutionCheckpointPresentation,
   resolveNonActionableStopOutcome,
   runApprovedPlanCompletionGuard,
   runExecutionEvidenceCompletionGuard,
 } = completionGuardsModule;
+
+test("terminal execution checkpoint preserves mutations, readiness, and the concrete browser blocker", () => {
+  const ledger = [
+    {
+      id: "edit-toolbar",
+      kind: "file",
+      value: "src/toolbar.js",
+      target: "src/toolbar.js",
+      sourceTool: "write_file",
+      createdAt: 1,
+    },
+    {
+      id: "edit-main-1",
+      kind: "file",
+      value: "src/main.js",
+      target: "src/main.js",
+      sourceTool: "replace_in_file",
+      createdAt: 2,
+    },
+    {
+      id: "edit-main-2",
+      kind: "file",
+      value: "src/main.js",
+      target: "src/main.js",
+      sourceTool: "replace_in_file",
+      createdAt: 3,
+    },
+    {
+      id: "launch",
+      kind: "cmd",
+      value: "npm run dev",
+      target: "npm run dev",
+      sourceTool: "execute_command",
+      observationStatus: "pending",
+      foregroundGeneration: 2,
+      createdAt: 4,
+    },
+    {
+      id: "ready",
+      kind: "dev_server_url",
+      value: "http://localhost:1420/",
+      target: "pty-1",
+      sourceTool: "get_pty_status",
+      observationStatus: "ready",
+      foregroundGeneration: 2,
+      createdAt: 5,
+    },
+    {
+      id: "browser-failure",
+      kind: "tool",
+      value: "http://localhost:1420/",
+      target: "http://localhost:1420/",
+      sourceTool: "browser_evaluate",
+      observationStatus: "failed",
+      references: ["src/main.js"],
+      browserInteraction: {
+        actions: [{ kind: "click", target: "#new-btn", succeeded: true }],
+        assertions: [],
+        pageErrors: ["ReferenceError: handleFileOpen is not defined at src/main.js:92:42"],
+        consoleErrors: [],
+      },
+      createdAt: 6,
+    },
+  ];
+
+  const checkpoint = buildExecutionCheckpointPresentation({
+    ledger,
+    language: "zh",
+    fallbackMessage: "恢复阶段没有新证据。",
+  });
+
+  assert.match(checkpoint.message, /3 次文件修改/);
+  assert.match(checkpoint.message, /2 个文件/);
+  assert.match(checkpoint.message, /http:\/\/localhost:1420\//);
+  assert.match(checkpoint.message, /handleFileOpen is not defined/);
+  assert.match(checkpoint.nextStep, /src\/main\.js/);
+  assert.doesNotMatch(checkpoint.message, /已完成任务|执行已完成/);
+  assert.equal(checkpoint.target, "src/main.js");
+  assert.equal(checkpoint.tool, "browser_evaluate");
+});
 
 function loadAgentLoopRunnerWithFake(FakeAgentOrchestrator, logEvents) {
   const sourcePath = path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentLoopRunner.ts");

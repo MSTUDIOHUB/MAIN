@@ -72,6 +72,22 @@ export interface ExecuteEvidenceClosureAudit {
   gap: ExecuteEvidenceGap;
 }
 
+export type UnreconciledFailureDomain =
+  | "process"
+  | "browser"
+  | "command"
+  | "mutation"
+  | "other";
+
+export interface UnreconciledFailureSignal {
+  entry: PlanExecutionEvidenceEntry;
+  domain: UnreconciledFailureDomain;
+  /** Workspace source implicated by structured evidence, never model prose. */
+  sourceTarget: string | null;
+  /** Compact structured failure detail suitable for a runtime checkpoint. */
+  detail: string;
+}
+
 export function scopeExecutionEvidenceLedger(
   ledger: PlanExecutionEvidenceEntry[],
   transactionId?: string | null,
@@ -430,6 +446,82 @@ function latestUnresolvedFailures(
   return [...latestByOperation.values()].filter((entry) =>
     entry.observationStatus === "failed" || entry.portConflict === true
   );
+}
+
+function isWorkspaceReference(value: unknown): value is string {
+  const candidate = String(value || "").trim();
+  return Boolean(candidate) &&
+    !/^[a-z][a-z0-9+.-]*:\/\//i.test(candidate) &&
+    !/^(?:pty|terminal)(?:-|$)/i.test(candidate);
+}
+
+function sourceTargetFromBrowserErrors(entry: PlanExecutionEvidenceEntry): string | null {
+  const errors = [
+    ...(entry.browserInteraction?.pageErrors || []),
+    ...(entry.browserInteraction?.consoleErrors || []),
+  ].join("\n");
+  for (const match of errors.matchAll(/https?:\/\/[^\s)'"`]+/gi)) {
+    try {
+      const pathname = decodeURIComponent(new URL(match[0]).pathname)
+        .replace(/^\/+/, "")
+        .replace(/:\d+(?::\d+)?$/, "");
+      if (/\.[A-Za-z0-9]{1,10}$/.test(pathname)) return pathname;
+    } catch {
+      // Continue to the relative stack-frame form below.
+    }
+  }
+  const relative = errors.match(
+    /(?:^|[\s(])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,10})(?::\d+(?::\d+)?)?/m,
+  )?.[1];
+  return relative?.replace(/^\.\//, "") || null;
+}
+
+/**
+ * Return the latest still-live failure and its owning domain. Recovery uses
+ * this structured attribution instead of treating every failure observed
+ * while a dev server exists as a server failure.
+ */
+export function resolveLatestUnreconciledFailureSignal(input: {
+  ledger: PlanExecutionEvidenceEntry[];
+  transactionId?: string | null;
+}): UnreconciledFailureSignal | null {
+  const ledger = scopeExecutionEvidenceLedger(input.ledger, input.transactionId);
+  const unresolved = latestUnresolvedFailures(ledger);
+  const unresolvedIds = new Set(unresolved.map((entry) => entry.id));
+  const entry = [...ledger].reverse().find((candidate) => unresolvedIds.has(candidate.id));
+  if (!entry) return null;
+
+  const sourceTool = String(entry.sourceTool || "");
+  const domain: UnreconciledFailureDomain =
+    sourceTool === "execute_command" ||
+      PTY_OBSERVATION_TOOL_NAMES.has(sourceTool) ||
+      entry.portConflict === true
+      ? "process"
+      : entry.kind === "browser_dom" ||
+        entry.kind === "browser_screenshot" ||
+        /(?:browser|playwright|puppeteer|cypress)/i.test(sourceTool)
+      ? "browser"
+      : sourceTool === "run_command"
+      ? "command"
+      : isWorkspaceMutationToolName(sourceTool) ||
+        entry.kind === "file" ||
+        entry.kind === "deliverable"
+      ? "mutation"
+      : "other";
+  const sourceTarget = (entry.references || []).find(isWorkspaceReference) ||
+    (domain === "browser" ? sourceTargetFromBrowserErrors(entry) : null) ||
+    ((domain === "mutation" && isWorkspaceReference(entry.target || entry.value))
+      ? String(entry.target || entry.value).trim()
+      : null);
+  const interaction = entry.browserInteraction;
+  const detail = String(
+    interaction?.pageErrors[0] ||
+    interaction?.consoleErrors[0] ||
+    entry.target ||
+    entry.value ||
+    sourceTool,
+  ).replace(/\s+/g, " ").trim().slice(0, 600);
+  return { entry, domain, sourceTarget, detail };
 }
 
 /**

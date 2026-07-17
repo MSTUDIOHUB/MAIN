@@ -3398,6 +3398,7 @@ export class WorkflowEngine {
             type: "system",
             content: message,
             variant: "execution_checkpoint",
+            ...(progress ? { planExecutionProgress: progress } : {}),
           } as TaskBlock;
           taskFlow = [...taskFlow, stopBlock];
 
@@ -3408,6 +3409,10 @@ export class WorkflowEngine {
                 ? {
                     ...turn,
                     status: stoppedStatus,
+                    // A held model draft cannot own terminal presentation.
+                    // Persist the runtime-owned evidence checkpoint so a
+                    // paused turn remains understandable after reload.
+                    summary: message,
                     blockIds: Array.from(new Set([
                       ...turn.blockIds,
                       ...taskFlow

@@ -1783,6 +1783,40 @@ test("execute max-iteration recovery observes every long process but requests br
   assert.equal(browserDecision.gap, "browser_validation_required");
 });
 
+test("execute max-iteration recovery repairs browser-observed source failures instead of retrying server validation", () => {
+  const decision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [{
+      id: "browser-source-mutation",
+      kind: "file",
+      value: "src/main.js",
+      target: "src/main.js",
+      sourceTool: "replace_in_file",
+      createdAt: 1,
+    }, {
+      id: "browser-source-failure",
+      kind: "tool",
+      value: "http://localhost:1420/",
+      target: "http://localhost:1420/",
+      sourceTool: "browser_evaluate",
+      observationStatus: "failed",
+      references: ["src/main.js"],
+      browserInteraction: {
+        actions: [{ kind: "click", target: "#new-btn", succeeded: true }],
+        assertions: [],
+        pageErrors: ["ReferenceError: handleFileOpen is not defined at src/main.js:92:42"],
+        consoleErrors: [],
+      },
+      createdAt: 2,
+    }],
+  });
+
+  assert.deepEqual(decision, {
+    mode: "mutation_first",
+    gap: "unreconciled_failure",
+    reason: "max_iterations_browser_source_repair",
+  });
+});
+
 test("resume prompt requires fresh workspace reads and treats .MAIN plans as internal state", () => {
   const checkpoint = buildPlanMaxIterationsCheckpoint({
     iterationCount: 50,
@@ -2445,6 +2479,10 @@ test("ChatArea renders live approved-plan progress snapshots in expanded turns",
   assert.match(
     chatAreaSource,
     /block\.variant\s*===\s*"plan_execution_progress"[\s\S]*?<PlanExecutionSystemNotice/,
+  );
+  assert.match(
+    chatAreaSource,
+    /block\.variant\s*===\s*"execution_checkpoint"[\s\S]*?<PlanExecutionSystemNotice/,
   );
   assert.match(chatAreaSource, /const\s+livePlanProgressBlock\s*=/);
   assert.match(chatAreaSource, /planExecutionProgress:\s*turnProgressSnapshot/);

@@ -643,3 +643,39 @@ test("internal Plan runtime phases stay out of activity groups and archives whil
     /Needs evidence|Drafting|草稿缺少真实证据|read_evidence/,
   );
 });
+
+test("execution checkpoints remain visible terminal notices instead of process steps", () => {
+  const checkpoint = {
+    id: 3,
+    turnId: "turn-paused",
+    type: "system",
+    variant: "execution_checkpoint",
+    content: "执行尚未完成，但已修改 src/main.js；浏览器发现运行时错误。",
+  };
+  const blocks = [
+    {
+      id: 1,
+      turnId: "turn-paused",
+      type: "tool",
+      toolName: "replace_in_file",
+      target: "src/main.js",
+      toolStatus: "executed",
+    },
+    checkpoint,
+  ];
+  const live = buildLiveTurnProcessTimelineModel({ blocks, language: "zh" });
+  assert.ok(live);
+  assert.equal(live.blocks.some((block) => block.id === checkpoint.id), false);
+
+  const archivedBlocks = [
+    { id: 0, turnId: "turn-paused", type: "user", content: "修复按钮" },
+    ...blocks,
+    { id: 4, turnId: "turn-paused", type: "agent", content: "最终结论" },
+  ];
+  const archive = buildTurnProcessArchiveModel({
+    blocks: archivedBlocks,
+    finalVisibleAgentIndex: 3,
+    language: "zh",
+  });
+  assert.equal(archive.blocks.some((block) => block.id === checkpoint.id), false);
+});

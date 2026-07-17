@@ -651,11 +651,15 @@ function ContextCompressionNotice({ block, language }: { block: any; language: "
 }
 
 function PlanExecutionSystemNotice({ block, language }: { block: any; language: "zh" | "en" }) {
-  const isCheckpoint = block.variant === "plan_execution_checkpoint";
+  const isPlanCheckpoint = block.variant === "plan_execution_checkpoint";
+  const isExecutionCheckpoint = block.variant === "execution_checkpoint";
+  const isCheckpoint = isPlanCheckpoint || isExecutionCheckpoint;
   const progress = block.planExecutionProgress || null;
   const progressPhase = String(block.planExecutionProgress?.phase || "");
   const isPaused = progressPhase === "paused" || /已暂停|paused/i.test(String(block.content || ""));
-  const title = isCheckpoint
+  const title = isExecutionCheckpoint
+    ? language === "zh" ? "执行结果与恢复点" : "Execution Results & Recovery Point"
+    : isCheckpoint
     ? language === "zh" ? "计划执行检查点" : "Plan Execution Checkpoint"
     : isPaused
     ? language === "zh" ? "计划执行已暂停" : "Plan Execution Paused"
@@ -3405,6 +3409,9 @@ export default function ChatArea({
       if (block.variant === "plan_execution_checkpoint") {
         return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
       }
+      if (block.variant === "execution_checkpoint") {
+        return <PlanExecutionSystemNotice key={`${block.id}-${index}`} block={block} language={language} />;
+      }
       if (block.variant === "game_studio_local_markdown") {
         return (
           <div key={`${block.id}-${index}`} className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
@@ -3660,6 +3667,7 @@ export default function ChatArea({
       if (block.type === "system") {
         return block.variant !== "context_compression" &&
           block.variant !== "plan_execution_checkpoint" &&
+          block.variant !== "execution_checkpoint" &&
           block.variant !== "game_studio_local_markdown";
       }
       if (block.type === "tool") {
@@ -3876,6 +3884,7 @@ export default function ChatArea({
         (block.type === "system" &&
           block.variant !== "context_compression" &&
           block.variant !== "plan_execution_checkpoint" &&
+          block.variant !== "execution_checkpoint" &&
           block.variant !== "game_studio_local_markdown");
     };
     const phaseLabels = {

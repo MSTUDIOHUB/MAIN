@@ -1,6 +1,7 @@
 import type { ExecuteRecoveryNextCapability, ExecuteRecoveryMode } from "../../executeRecoveryTools";
 import {
   buildExecuteEvidenceClosureAudit,
+  resolveLatestUnreconciledFailureSignal,
   scopeExecutionEvidenceLedger,
   type ExecuteEvidenceGap,
 } from "../../verificationEvidence";
@@ -72,9 +73,8 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
     requiredCommandEvidence: input.requiredCommandEvidence,
   });
   if (audit.completionAllowed || audit.gap === "none") return null;
-  const expectedTarget = latestMutationTarget(
-    scopeExecutionEvidenceLedger(input.ledger, input.transactionId),
-  );
+  const scopedLedger = scopeExecutionEvidenceLedger(input.ledger, input.transactionId);
+  const expectedTarget = latestMutationTarget(scopedLedger);
 
   if (
     audit.gap === "mutation_required" &&
@@ -153,24 +153,60 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
       nextRequiredCapability: "launch_long_process",
     }, input);
   }
-  if (
-    audit.gap === "unreconciled_failure" &&
-    (
-      input.availableToolNames.has("run_command") ||
-      input.availableToolNames.has("browser_evaluate") ||
+  if (audit.gap === "unreconciled_failure") {
+    const failure = resolveLatestUnreconciledFailureSignal({
+      ledger: scopedLedger,
+    });
+    const repairTarget = failure?.sourceTarget || expectedTarget;
+
+    if (
+      failure?.domain !== "process" &&
+      repairTarget &&
       hasAnyTool(input.availableToolNames, WORKSPACE_MUTATION_TOOL_NAMES)
-    )
-  ) {
-    return reconcileWithActiveRecovery({
-      gap: audit.gap,
-      mode: "action_plus_targeting",
-      reason: `precompletion_evidence_gap:${audit.gap}`,
-      expectedTarget,
-      nextRequiredCapability:
-        audit.longRunningStatus === "failed" || audit.longRunningStatus === "stopped"
-          ? "recover_process"
-          : "reconcile_server",
-    }, input);
+    ) {
+      return reconcileWithActiveRecovery({
+        gap: audit.gap,
+        mode: "mutation_first",
+        reason: `precompletion_evidence_gap:${audit.gap}:${failure?.domain || "source"}`,
+        expectedTarget: repairTarget,
+        nextRequiredCapability: "mutation",
+      }, input);
+    }
+
+    if (failure?.domain === "process") {
+      return reconcileWithActiveRecovery({
+        gap: audit.gap,
+        mode: "action_plus_targeting",
+        reason: `precompletion_evidence_gap:${audit.gap}:process`,
+        expectedTarget: repairTarget,
+        nextRequiredCapability:
+          audit.longRunningStatus === "failed" || audit.longRunningStatus === "stopped"
+            ? "recover_process"
+            : "reconcile_server",
+      }, input);
+    }
+
+    if (failure?.domain === "browser" && input.availableToolNames.has("browser_evaluate")) {
+      return reconcileWithActiveRecovery({
+        gap: audit.gap,
+        mode: "validation_only",
+        reason: `precompletion_evidence_gap:${audit.gap}:browser`,
+        expectedTarget: repairTarget,
+        nextRequiredCapability: "browser_validation",
+      }, input);
+    }
+
+    if (input.availableToolNames.has("run_command")) {
+      return reconcileWithActiveRecovery({
+        gap: audit.gap,
+        mode: "finite_validation_only",
+        reason: `precompletion_evidence_gap:${audit.gap}:${failure?.domain || "unknown"}`,
+        expectedTarget: repairTarget,
+        nextRequiredCapability: "validation",
+      }, input);
+    }
+
+    return null;
   }
   return null;
 }

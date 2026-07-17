@@ -1,5 +1,8 @@
 import { buildEffectiveTurnContract, type EffectiveTurnContract, type ResolvedUserIntent } from "../../runIntent";
-import { buildPlanTaskEvidenceAudit } from "../../workflowModels";
+import {
+  buildPlanTaskEvidenceAudit,
+  type PlanExecutionEvidenceEntry,
+} from "../../workflowModels";
 import {
   buildApprovedPlanNoToolPauseMessage,
   formatPlanAuditRemainingTasks,
@@ -10,6 +13,8 @@ import {
 import type { AgentLoopOutcome, OrchestratorCallbacks } from "../types";
 import {
   buildExecuteEvidenceClosureAudit,
+  resolveLatestUnreconciledFailureSignal,
+  scopeExecutionEvidenceLedger,
   resolveCommandEvidenceRequirements,
   type ExecuteEvidenceClosureAudit,
 } from "../../verificationEvidence";
@@ -19,6 +24,127 @@ import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 
 type NonActionableStopReason = Parameters<OrchestratorCallbacks["onNonActionableStop"]>[1];
 type NonActionableStopProgress = Parameters<OrchestratorCallbacks["onNonActionableStop"]>[2];
+
+export interface ExecutionCheckpointPresentation {
+  message: string;
+  title: string;
+  summary: string;
+  target: string;
+  tool: string;
+  latestEvidence: string;
+  nextStep: string;
+}
+
+function uniqueMutationTargets(ledger: PlanExecutionEvidenceEntry[]): string[] {
+  const seen = new Set<string>();
+  const targets: string[] = [];
+  for (const entry of ledger) {
+    if (entry.kind !== "file" && entry.kind !== "deliverable") continue;
+    const target = String(entry.target || entry.value || "").trim().replace(/\\/g, "/");
+    const key = target.toLowerCase();
+    if (!target || seen.has(key)) continue;
+    seen.add(key);
+    targets.push(target);
+  }
+  return targets;
+}
+
+/**
+ * Build one user-visible terminal checkpoint from trusted execution evidence.
+ * This is intentionally independent of held model prose: a paused run must
+ * still say what changed, what automation observed, and what remains.
+ */
+export function buildExecutionCheckpointPresentation(input: {
+  ledger: PlanExecutionEvidenceEntry[];
+  transactionId?: string | null;
+  validationExpected?: boolean;
+  mutationExpected?: boolean;
+  language: "zh" | "en";
+  fallbackMessage: string;
+  fallbackNextStep?: string;
+}): ExecutionCheckpointPresentation {
+  const ledger = scopeExecutionEvidenceLedger(input.ledger, input.transactionId);
+  const audit = buildExecuteEvidenceClosureAudit({
+    ledger,
+    validationExpected: input.validationExpected !== false,
+    mutationExpected: input.mutationExpected,
+  });
+  const mutationTargets = uniqueMutationTargets(ledger);
+  const mutationCount = ledger.filter((entry) =>
+    entry.kind === "file" || entry.kind === "deliverable"
+  ).length;
+  const ready = [...ledger].reverse().find((entry) =>
+    entry.observationStatus === "ready" &&
+    /^https?:\/\//i.test(String(entry.value || entry.target || ""))
+  );
+  const readyUrl = ready ? String(ready.value || ready.target || "").trim() : "";
+  const failure = resolveLatestUnreconciledFailureSignal({ ledger });
+  const target = failure?.sourceTarget || mutationTargets[mutationTargets.length - 1] || "";
+  const detail = String(failure?.detail || input.fallbackMessage).replace(/\s+/g, " ").trim();
+  const tool = String(failure?.entry.sourceTool || "").trim();
+
+  if (input.language === "zh") {
+    const nextStep = failure?.domain === "browser" && target
+      ? `修复 ${target} 中浏览器验收捕获的问题，然后对同一行为重新执行浏览器交互验收。`
+      : failure?.domain === "process"
+      ? "根据现有 PTY generation 的状态恢复进程或健康检查；只有真实进程证据才重启服务器。"
+      : failure?.domain === "command"
+      ? `修复${target ? ` ${target} 的` : ""}命令诊断并重新运行同一验证命令。`
+      : input.fallbackNextStep || "从当前证据检查点恢复精确修改或验证。";
+    const title = failure?.domain === "browser"
+      ? "浏览器验收发现源码问题"
+      : "执行已暂停，结果已保留";
+    const lines = [
+      "执行尚未完成，但本轮可信结果已保留：",
+      mutationCount > 0
+        ? `- 已执行 ${mutationCount} 次文件修改，涉及 ${mutationTargets.length} 个文件：${mutationTargets.slice(0, 8).join("、")}${mutationTargets.length > 8 ? " 等" : ""}`
+        : "",
+      readyUrl ? `- 开发服务器已就绪：${readyUrl}` : "",
+      audit.validationCount > 0 ? `- 已通过 ${audit.validationCount} 项自动验证。` : "",
+      failure ? `- 当前阻断：${detail}` : `- 当前阻断：${input.fallbackMessage}`,
+      `- 下一步：${nextStep}`,
+    ].filter(Boolean);
+    return {
+      message: lines.join("\n"),
+      title,
+      summary: failure ? `自动验收未通过：${detail}` : input.fallbackMessage,
+      target,
+      tool,
+      latestEvidence: failure ? detail : readyUrl || input.fallbackMessage,
+      nextStep,
+    };
+  }
+
+  const nextStep = failure?.domain === "browser" && target
+    ? `Repair the browser-observed failure in ${target}, then rerun the same browser interaction validation.`
+    : failure?.domain === "process"
+    ? "Recover the process or health check from the current PTY generation; restart only when process evidence requires it."
+    : failure?.domain === "command"
+    ? `Repair the command diagnostic${target ? ` in ${target}` : ""} and rerun the same validation command.`
+    : input.fallbackNextStep || "Resume the exact mutation or validation from the current evidence checkpoint.";
+  const title = failure?.domain === "browser"
+    ? "Browser validation found a source failure"
+    : "Execution paused with results preserved";
+  const lines = [
+    "Execution is not complete, but trusted results from this run were preserved:",
+    mutationCount > 0
+      ? `- ${mutationCount} file mutations across ${mutationTargets.length} files: ${mutationTargets.slice(0, 8).join(", ")}${mutationTargets.length > 8 ? ", and others" : ""}`
+      : "",
+    readyUrl ? `- Dev server ready: ${readyUrl}` : "",
+    audit.validationCount > 0 ? `- ${audit.validationCount} automated validations passed.` : "",
+    failure ? `- Current blocker: ${detail}` : `- Current blocker: ${input.fallbackMessage}`,
+    `- Next: ${nextStep}`,
+  ].filter(Boolean);
+  return {
+    message: lines.join("\n"),
+    title,
+    summary: failure ? `Automated validation failed: ${detail}` : input.fallbackMessage,
+    target,
+    tool,
+    latestEvidence: failure ? detail : readyUrl || input.fallbackMessage,
+    nextStep,
+  };
+}
 
 function describePendingRecoveryPhase(
   state: ExecuteRecoveryRuntimeState,
@@ -72,8 +198,8 @@ function describeEvidenceClosureGap(
         };
       case "unreconciled_failure":
         return {
-          message: "执行已暂停：最新修改之后仍有未消解的实际命令或开发服务器失败证据，不能报告完成。",
-          nextStep: "修复失败原因并重新运行对应验证；策略延期或 PTY_BUSY 不应记为实际失败。",
+          message: "执行已暂停：最新修改之后仍有未消解的实际命令、进程、浏览器或源码失败证据，不能报告完成。",
+          nextStep: "按结构化失败来源修复源码、命令或进程，再重新运行对应验证；策略延期或 PTY_BUSY 不应记为实际失败。",
         };
       default:
         return {
@@ -105,8 +231,8 @@ function describeEvidenceClosureGap(
       };
     case "unreconciled_failure":
       return {
-        message: "Execution paused: an actual command or dev-server failure after the latest mutation remains unresolved, so completion would be untruthful.",
-        nextStep: "Repair and rerun the failed validation; policy deferrals and PTY_BUSY must not be recorded as actual failures.",
+        message: "Execution paused: an actual command, process, browser, or source failure after the latest mutation remains unresolved, so completion would be untruthful.",
+        nextStep: "Repair the structured source, command, or process failure and rerun its validation; policy deferrals and PTY_BUSY must not be recorded as actual failures.",
       };
     default:
       return {

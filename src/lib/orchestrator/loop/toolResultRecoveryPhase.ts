@@ -9,6 +9,7 @@ import {
   shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
 import { buildApprovedPlanScopeConflictFingerprint } from "../../approvedPlanExecutionScope";
+import { parseBrowserValidationOutcome } from "../../browserValidation";
 import { resolveDevServerRuntimeState } from "../../devServerRuntime";
 import {
   isReviewablePlanStage,
@@ -44,6 +45,7 @@ import {
 } from "../../workflowModels";
 import {
   buildExecuteEvidenceClosureAudit,
+  resolveLatestUnreconciledFailureSignal,
   resolveCommandEvidenceRequirements,
   scopeExecutionEvidenceLedger,
 } from "../../verificationEvidence";
@@ -1262,6 +1264,80 @@ export async function handleToolResultRecoveryPhase(input: {
     iterationContext: input.iterationContext,
     emitTurnEvent: input.emitTurnEvent,
   });
+
+  const failedBrowserValidation = input.results.find((result) => {
+    if (result.name !== "browser_evaluate" || result.internalFeedback) return false;
+    const outcome = parseBrowserValidationOutcome(result.content || "");
+    return result.isError || outcome?.ok === false;
+  });
+  if (failedBrowserValidation) {
+    const scopedLedger = scopeExecutionEvidenceLedger(
+      input.callbacks.getPlanExecutionEvidenceLedger(),
+      input.iterationContext.eventTurnId,
+    );
+    const failure = resolveLatestUnreconciledFailureSignal({ ledger: scopedLedger });
+    const repairTarget = failure?.domain === "browser"
+      ? failure.sourceTarget || executeRecoveryState.expectedTarget
+      : null;
+    if (repairTarget) {
+      const repairReadLease = buildFailedValidationRepairReadLease({
+        target: repairTarget,
+        sourceObservationKey: executeRecoveryState.sourceObservationKey,
+      });
+      const outcome = parseBrowserValidationOutcome(failedBrowserValidation.content || "");
+      const failureDetail = outcome?.failureSummary ||
+        outcome?.pageErrors[0] ||
+        outcome?.consoleErrors[0] ||
+        failure?.detail ||
+        "browser validation failed";
+      executeRecoveryState = activateExecuteRecoveryAndSync(
+        "mutation_first",
+        "browser_validation_requires_source_repair",
+        {
+          expectedTarget: repairTarget,
+          readLease: repairReadLease,
+          sourceObservationKey: null,
+          decisionCheckpoint: {
+            expectedTarget: repairTarget,
+            sourceObservationKey: null,
+            nextRequiredCapability: "targeted_read",
+          },
+          requestedUrl: failedBrowserValidation.target,
+        },
+      );
+      logAgentEvent("browser_validation_requires_source_repair", {
+        iteration: input.iteration,
+        target: repairTarget,
+        browserTarget: failedBrowserValidation.target,
+        failureDetail: String(failureDetail).slice(0, 600),
+        nextRequiredCapability:
+          executeRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
+      });
+      input.emitPlanExecutionProgress("running", {
+        currentTask: input.callbacks.getPreferredLanguage() === "zh"
+          ? "修复浏览器验收发现的源码错误"
+          : "repairing the source error found by browser validation",
+        currentTool: "read_file",
+        latestEvidence: String(failureDetail).slice(0, 600),
+        recoveryReason: "browser_validation_requires_source_repair",
+        nextStep: input.callbacks.getPreferredLanguage() === "zh"
+          ? `精确复读 ${repairTarget} 的当前版本，修复后重新执行同一浏览器交互验收`
+          : `reread the current ${repairTarget}, repair it, then rerun the same browser interaction validation`,
+      });
+      input.callbacks.onStatusChange("running");
+      input.callbacks.appendMessage({
+        role: "user",
+        content: [
+          "BROWSER_SOURCE_REPAIR_REQUIRED: Browser validation executed and found a real application failure.",
+          `Target source: ${repairTarget}`,
+          `Observed failure: ${String(failureDetail).slice(0, 600)}`,
+          `Read the current ${repairTarget} once under the granted lease, repair this failure, then rerun the same browser interaction validation against ${failedBrowserValidation.target}.`,
+          "The dev server is already ready; do not restart or reconcile it unless new process evidence shows an actual lifecycle failure.",
+        ].join("\n"),
+      });
+      return finish("continue");
+    }
+  }
 
   const failedFiniteValidation = input.results.find((result) => {
     if (

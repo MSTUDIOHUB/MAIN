@@ -1427,6 +1427,19 @@ export function createPlanExecutionFailureEntry(input: {
   if (input.toolName === "run_command") {
     return { ...base, kind: "cmd", observationStatus: "failed" };
   }
+  if (sourceToolLooksLikeBrowserAutomation(input.toolName)) {
+    const raw = String(input.error || "").trim();
+    const payload = raw.startsWith("BROWSER_VALIDATION_FAILED:") && raw.includes("\n")
+      ? raw.slice(raw.indexOf("\n") + 1).trim()
+      : raw;
+    const browserInteraction = parseBrowserInteractionEvidence(payload);
+    return {
+      ...base,
+      kind: "tool",
+      observationStatus: "failed",
+      ...(browserInteraction ? { browserInteraction: { ...browserInteraction, evidenceId: base.id } } : {}),
+    };
+  }
   return { ...base, kind: "tool", observationStatus: "failed" };
 }
 

@@ -29,6 +29,7 @@ import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import { buildExecutionCheckpointPresentation } from "./completionGuards";
 import {
   parseVisualContextRecognition,
   persistVisualContextDeliveryObservation,
@@ -466,18 +467,43 @@ export class AgentOrchestrator {
         publishExecuteRecoveryState();
         if (iterationStreamPreparation.recoveryPause) {
           const pause = iterationStreamPreparation.recoveryPause;
+          const checkpoint = buildExecutionCheckpointPresentation({
+            ledger: callbacks.getPlanExecutionEvidenceLedger(),
+            transactionId: eventTurnId,
+            language: callbacks.getPreferredLanguage(),
+            fallbackMessage: pause.message,
+            fallbackNextStep: callbacks.getPreferredLanguage() === "zh"
+              ? "从保留的证据检查点恢复当前精确修改或验证。"
+              : "Resume the exact mutation or validation from the preserved evidence checkpoint.",
+          });
           callbacks.onNonActionableStop(
-            pause.message,
+            checkpoint.message,
             "no_action",
             {
               phase: "paused",
+              currentTask: checkpoint.title,
+              currentTool: checkpoint.tool,
+              latestEvidence: checkpoint.latestEvidence,
               recoveryReason: "execute_recovery_no_progress_limit",
-              nextStep: pause.message,
+              nextStep: checkpoint.nextStep,
+              repeatedTargets: checkpoint.target ? [checkpoint.target] : [],
             },
           );
           emitRunPausedEvent(
             "execute_recovery_no_progress_limit",
-            pause.message,
+            checkpoint.message,
+            {
+              phase: "blocked",
+              title: checkpoint.title,
+              status: "paused",
+              summary: checkpoint.summary,
+              next: checkpoint.nextStep,
+              ...(checkpoint.target
+                ? { canonicalTarget: checkpoint.target, target: checkpoint.target }
+                : {}),
+              ...(checkpoint.tool ? { tool: checkpoint.tool } : {}),
+              dedupeKey: "execution-terminal-checkpoint",
+            },
           );
           callbacks.onStatusChange("idle");
           return;

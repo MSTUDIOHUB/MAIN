@@ -578,6 +578,48 @@ test("page runtime errors become durable negative evidence", () => {
   assert.equal(audit.gap, "unreconciled_failure");
 });
 
+test("a browser runtime failure with a source reference returns to mutation instead of server reconciliation", () => {
+  const browserPayload = JSON.stringify({
+    ok: false,
+    actions: [{ kind: "click", target: "#new-btn", ok: true }],
+    assertions: [],
+    pageErrors: [
+      "ReferenceError: handleFileOpen is not defined at http://localhost:1420/src/main.js:92:42",
+    ],
+    consoleErrors: [],
+  });
+  const failed = planEvidence.createPlanExecutionFailureEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    error: `BROWSER_VALIDATION_FAILED: runtime error\n${browserPayload}`,
+  });
+  const ledger = [mutation(), ...launchAndReady(), failed];
+  const failure = verification.resolveLatestUnreconciledFailureSignal({ ledger });
+  assert.equal(failed.browserInteraction.pageErrors.length, 1);
+  assert.equal(failure.domain, "browser");
+  assert.equal(failure.sourceTarget, "src/main.js");
+
+  const recovery = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger,
+    validationExpected: true,
+    currentRecoveryMode: "validation_only",
+    currentRequiredCapability: "browser_validation",
+    availableToolNames: new Set([
+      "browser_evaluate",
+      "read_file",
+      "replace_in_file",
+      "apply_patch",
+      "run_command",
+      "get_pty_status",
+    ]),
+  });
+
+  assert.equal(recovery.mode, "mutation_first");
+  assert.equal(recovery.nextRequiredCapability, "mutation");
+  assert.equal(recovery.expectedTarget, "src/main.js");
+  assert.match(recovery.reason, /unreconciled_failure:browser/);
+});
+
 test("external review markers are advisory while actual automation is explicit evidence", () => {
   const markerAudit = verification.buildExecuteEvidenceClosureAudit({
     ledger: [nonInteractionMutation(), {

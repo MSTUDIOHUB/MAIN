@@ -134,7 +134,9 @@ function isProcessArchiveCandidate(block: any, finalVisibleAgentIndex: number, b
   if (isFinalConclusionBlock(block, finalVisibleAgentIndex, blockIndex)) return false;
   if (block.type === "agent" && block.archivedProposal) return false;
   if (block.type === "system") {
-    return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
+    return block.variant !== "context_compression" &&
+      block.variant !== "plan_execution_checkpoint" &&
+      block.variant !== "execution_checkpoint";
   }
   return block.type === "tool" || block.type === "progress" || block.type === "thought" || block.type === "jobList" || block.type === "agent" || block.type === "system";
 }
@@ -144,7 +146,9 @@ function isLiveProcessCandidate(block: any): boolean {
   if (block.type === "agent") return block.hiddenProcess === true;
   if (block.type === "progress") return true;
   if (block.type === "system") {
-    return block.variant !== "context_compression" && block.variant !== "plan_execution_checkpoint";
+    return block.variant !== "context_compression" &&
+      block.variant !== "plan_execution_checkpoint" &&
+      block.variant !== "execution_checkpoint";
   }
   if (block.type === "tool") {
     const status = String(block.toolStatus || block.status || "").toLowerCase();

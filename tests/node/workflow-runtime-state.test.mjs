@@ -1050,6 +1050,8 @@ test("approved plan no-tool turns use evidence recovery, the active contract, th
   assert.match(workflowEngine, /type: "system"/);
   assert.match(workflowEngine, /content: message/);
   assert.match(workflowEngine, /variant: "execution_checkpoint"/);
+  assert.match(workflowEngine, /planExecutionProgress: progress/);
+  assert.match(workflowEngine, /summary: message/);
 });
 
 test("approved plan max-iteration boundary pauses instead of surfacing agent error", () => {
