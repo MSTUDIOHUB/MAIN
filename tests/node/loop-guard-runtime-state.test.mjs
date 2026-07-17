@@ -130,6 +130,50 @@ test("tool failure signature reducer increments errors and clears on success", (
   assert.equal(state.failedToolCallCounts.get("run_command:npm-test"), 1);
 });
 
+test("tool failure signatures use semantic command outcomes and preserve PTY running", () => {
+  const state = createAgentLoopGuardRuntimeState();
+  const signature = "run_command:npm-test";
+  const ptySignature = "execute_command:npm-dev";
+  const signatures = new Map([
+    ["failed-command", signature],
+    ["running-command", ptySignature],
+  ]);
+
+  applyToolFailureSignatureRuntimeState(state, {
+    toolFailureSignatures: signatures,
+    results: [{
+      toolCallId: "failed-command",
+      name: "run_command",
+      content: JSON.stringify({ exitCode: 1, success: false, stderr: 'Missing script: "test"' }),
+      isError: false,
+    }],
+  });
+  assert.equal(state.failedToolCallCounts.get(signature), 1);
+
+  state.failedToolCallCounts.set(ptySignature, 2);
+  applyToolFailureSignatureRuntimeState(state, {
+    toolFailureSignatures: signatures,
+    results: [{
+      toolCallId: "running-command",
+      name: "execute_command",
+      content: JSON.stringify({ success: false, stderr: "PTY_BUSY: foreground generation=4" }),
+      isError: false,
+    }],
+  });
+  assert.equal(state.failedToolCallCounts.get(ptySignature), 2);
+
+  applyToolFailureSignatureRuntimeState(state, {
+    toolFailureSignatures: signatures,
+    results: [{
+      toolCallId: "failed-command",
+      name: "run_command",
+      content: JSON.stringify({ exitCode: 0, success: true, stdout: "passed" }),
+      isError: false,
+    }],
+  });
+  assert.equal(state.failedToolCallCounts.has(signature), false);
+});
+
 test("browser readiness preflight blocks do not poison real browser failure counts", () => {
   const state = createAgentLoopGuardRuntimeState();
   const browserSignature = "browser_evaluate:http://localhost:1420/";

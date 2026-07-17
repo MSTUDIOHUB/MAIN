@@ -1091,21 +1091,38 @@ export function requiresPtyObservationForPlanCommand(value: string): boolean {
   return looksLongRunningShellCommand(value);
 }
 
-export function isFinitePlanValidationCommand(value: string): boolean {
+export type FiniteValidationCommandCapability =
+  | "test"
+  | "build"
+  | "lint"
+  | "typecheck"
+  | "check"
+  | "inline_assertion";
+
+export function classifyFiniteValidationCommandCapability(
+  value: string,
+): FiniteValidationCommandCapability | null {
   const command = String(value || "").trim();
-  if (!command || requiresPtyObservationForPlanCommand(command)) return false;
-  if (/(?:\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?(?:test|build|lint|typecheck|check)\b|\bnpx\s+(?:tsc|playwright|vitest|jest)\b|\b(?:node\s+--test|cargo\s+(?:test|check|clippy)|pytest|python\s+-m\s+(?:pytest|unittest)|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b)/i.test(command)) {
-    return true;
-  }
+  if (!command || requiresPtyObservationForPlanCommand(command)) return null;
+  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?test\b|\bnpx\s+(?:playwright|vitest|jest)\b|\b(?:node\s+--test|cargo\s+test|pytest|python\s+-m\s+(?:pytest|unittest)|go\s+test|dotnet\s+test|mvn\s+test|gradle\s+test)\b/i.test(command)) return "test";
+  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?build\b/i.test(command)) return "build";
+  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?lint\b|\bcargo\s+clippy\b/i.test(command)) return "lint";
+  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?typecheck\b|\bnpx\s+tsc\b/i.test(command)) return "typecheck";
+  if (/\b(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?check\b|\bcargo\s+check\b/i.test(command)) return "check";
 
   // Small repositories and one-file fixes do not always expose a package
   // script. A bounded inline assertion is still a legitimate finite check;
   // classifying it as non-validation made successful `node -e` / `python -c`
   // evidence invisible and sent compatible models back into recovery loops.
-  return /(?:^|\s*(?:&&|\|\||;)\s*)(?:node|bun|deno)\b[^\n;&|]{0,500}\s(?:-e|--eval)(?:\s|=)/i.test(command) ||
+  const inlineAssertion = /(?:^|\s*(?:&&|\|\||;)\s*)(?:node|bun|deno)\b[^\n;&|]{0,500}\s(?:-e|--eval)(?:\s|=)/i.test(command) ||
     /(?:^|\s*(?:&&|\|\||;)\s*)python3?\b[^\n;&|]{0,200}\s-c(?:\s|$)/i.test(command) ||
     /(?:^|\s*(?:&&|\|\||;)\s*)(?:ruby\b[^\n;&|]{0,200}\s-e|php\b[^\n;&|]{0,200}\s-r)(?:\s|$)/i.test(command) ||
     /(?:^|\s*(?:&&|\|\||;)\s*)npx\s+(?:tsx|ts-node)\b[^\n;&|]{0,500}\s(?:-e|--eval)(?:\s|=)/i.test(command);
+  return inlineAssertion ? "inline_assertion" : null;
+}
+
+export function isFinitePlanValidationCommand(value: string): boolean {
+  return classifyFiniteValidationCommandCapability(value) !== null;
 }
 
 function commandLooksLikeDevServerOrHttpProbe(value: string): boolean {

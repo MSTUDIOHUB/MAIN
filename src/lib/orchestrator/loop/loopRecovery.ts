@@ -864,6 +864,28 @@ export function handleStrictRepeatGuardRecovery(input: {
 
   for (const toolCall of effectiveToolCalls) {
     const executionResult = resultByToolCallId.get(toolCall.id);
+    if (executionResult?.internalFeedback === true &&
+      executionResult.qualityGateReason === "repeated_failure_blocked") {
+      callbacks.appendMessage({ role: "system", content: `[System: ${executionResult.content}]` });
+      return { status: "continue" };
+    }
+    if (executionResult?.internalFeedback === true &&
+      executionResult.qualityGateReason === "repeated_failure_exhausted") {
+      const target = executionResult.target || "";
+      const notice = callbacks.getPreferredLanguage() === "zh"
+        ? `执行已暂停：${toolCall.name}${target ? ` (${target})` : ""} 在策略纠正后仍被原样请求。`
+        : `Execution paused: ${toolCall.name}${target ? ` (${target})` : ""} was requested unchanged after policy correction.`;
+      callbacks.onNonActionableStop(notice, "no_action", {
+        recoveryReason: "repeated_failure_policy_no_progress",
+        repeatedTargets: target ? [target] : [],
+        nextStep: callbacks.getPreferredLanguage() === "zh"
+          ? "改变参数、目标或工具，或说明真实阻塞"
+          : "change arguments, target, or tool, or state the real blocker",
+      });
+      callbacks.onStatusChange("idle");
+      logAgentEvent("repeated_failure_policy_exhausted", { iteration, tool: toolCall.name, target });
+      return { status: "stopped" };
+    }
     // The strict guard protects real repeated executions. Calls converted by
     // preflight/recovery policy into internal feedback never reached a tool,
     // so their bounded convergence belongs to RecoveryActionContract's
@@ -1034,7 +1056,11 @@ export function handleStrictRepeatGuardRecovery(input: {
     }
 
     const fatalMessage = formatRepeatLoopFatalMessage(toolCall.name, target, repeatCheck.threshold);
-    const recentEvidence = callbacks.getPlanExecutionEvidenceLedger().slice(-5);
+    const recentEvidence = callbacks.getPlanExecutionEvidenceLedger()
+      .filter((entry) => !["failed", "pending", "running", "unknown", "stopped"].includes(
+        String(entry.observationStatus || ""),
+      ))
+      .slice(-5);
     const recentEvidenceText = recentEvidence.length > 0
       ? recentEvidence.map((entry) => `${entry.kind}:${entry.target || entry.value} via ${entry.sourceTool}`).join(" | ")
       : callbacks.getPreferredLanguage() === "zh" ? "无" : "none";

@@ -845,6 +845,197 @@ test("command-only completion is bound to the structured requested command", () 
   assert.equal(matchingAudit.completionAllowed, true);
 });
 
+test("natural-language shell targets are not treated as exact command evidence", () => {
+  const naturalRequirements = verification.resolveCommandEvidenceRequirements({
+    commandDirective: {
+      kind: "shell",
+      action: "test",
+      target: "运行软件测试",
+      source: "natural_language",
+    },
+  });
+  assert.deepEqual(naturalRequirements, ["capability:test"]);
+
+  const exactRequirements = verification.resolveCommandEvidenceRequirements({
+    commandDirective: {
+      kind: "shell",
+      action: "test",
+      target: "run the requested tests",
+      exactCommand: "npm test",
+      source: "natural_language",
+    },
+  });
+  assert.deepEqual(exactRequirements, ["npm test"]);
+
+  const successfulCommand = {
+    id: "successful-command",
+    kind: "cmd",
+    value: "npm run test",
+    target: "npm run test",
+    sourceTool: "run_command",
+    createdAt: 1,
+  };
+  const genericAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [successfulCommand],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence: naturalRequirements,
+  });
+  assert.equal(genericAudit.gap, "none");
+  assert.equal(genericAudit.completionAllowed, true);
+
+  const unrelatedCommand = {
+    ...successfulCommand,
+    id: "unrelated-command",
+    value: "pwd",
+    target: "pwd",
+  };
+  const unrelatedAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [unrelatedCommand],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence: naturalRequirements,
+  });
+  assert.equal(unrelatedAudit.gap, "validation_required");
+  assert.equal(unrelatedAudit.completionAllowed, false);
+
+  const wrongCapabilityAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [{
+      ...successfulCommand,
+      id: "wrong-capability-command",
+      value: "npm run build",
+      target: "npm run build",
+    }],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence: naturalRequirements,
+  });
+  assert.equal(wrongCapabilityAudit.gap, "validation_required");
+  assert.equal(wrongCapabilityAudit.completionAllowed, false);
+
+  const deployRequirements = verification.resolveCommandEvidenceRequirements({
+    commandDirective: {
+      kind: "shell",
+      action: "deploy",
+      target: "deploy to the configured production server",
+      source: "natural_language",
+    },
+  });
+  assert.deepEqual(deployRequirements, ["capability:operational"]);
+  const deployAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [{
+      ...successfulCommand,
+      id: "deploy-command",
+      value: "./scripts/deploy.sh",
+      target: "./scripts/deploy.sh",
+    }],
+    mutationExpected: false,
+    validationExpected: true,
+    requiredCommandEvidence: deployRequirements,
+  });
+  assert.equal(deployAudit.completionAllowed, true);
+});
+
+test("an invocation failure remains negative evidence until a finite validation succeeds", () => {
+  const failed = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm test",
+    result: JSON.stringify({ exitCode: 1, success: false, stderr: 'Missing script: "test"' }),
+    transactionId: "turn-command-repair",
+  });
+  assert.equal(failed?.observationStatus, "failed");
+
+  const failedAudit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [failed],
+    mutationExpected: false,
+    validationExpected: true,
+    transactionId: "turn-command-repair",
+  });
+  assert.equal(failedAudit.gap, "unreconciled_failure");
+  assert.equal(failedAudit.completionAllowed, false);
+
+  const buildPassed = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm run build",
+    result: JSON.stringify({ exitCode: 0, success: true, stdout: "built" }),
+    transactionId: "turn-command-repair",
+  });
+  const wrongCapability = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [failed, buildPassed],
+    mutationExpected: false,
+    validationExpected: true,
+    transactionId: "turn-command-repair",
+    requiredCommandEvidence: ["capability:test"],
+  });
+  assert.equal(wrongCapability.gap, "unreconciled_failure");
+  assert.equal(wrongCapability.completionAllowed, false);
+
+  const passed = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm run test:unit",
+    result: JSON.stringify({ exitCode: 0, success: true, stdout: "passed" }),
+    transactionId: "turn-command-repair",
+  });
+  const reconciled = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [failed, passed],
+    mutationExpected: false,
+    validationExpected: true,
+    transactionId: "turn-command-repair",
+    requiredCommandEvidence: ["capability:test"],
+  });
+  assert.equal(reconciled.gap, "none");
+  assert.equal(reconciled.completionAllowed, true);
+});
+
+test("PTY_BUSY is running process evidence rather than a failed tool operation", () => {
+  const payload = JSON.stringify({
+    success: false,
+    stderr: "PTY_BUSY: foreground generation=4",
+    foregroundGeneration: 4,
+  });
+  assert.equal(planEvidence.classifyCommandResultOutcome("execute_command", payload), "running");
+  const entry = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "execute_command",
+    target: "npm run dev",
+    result: payload,
+    transactionId: "turn-pty-running",
+  });
+  assert.equal(entry?.observationStatus, "running");
+  assert.equal(entry?.terminalBusy, true);
+});
+
+test("exploratory read failures do not poison a later real repair closure", () => {
+  const exploratoryFailure = planEvidence.createPlanExecutionFailureEntry({
+    toolName: "read_file",
+    target: ".goals/progress.md",
+    error: "file not found",
+    transactionId: "turn-exploration-repair",
+  });
+  const repair = {
+    id: "source-repair",
+    kind: "file",
+    value: "src/config.ts",
+    target: "src/config.ts",
+    sourceTool: "apply_patch",
+    transactionId: "turn-exploration-repair",
+    createdAt: 2,
+  };
+  const validation = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "run_command",
+    target: "npm run test",
+    result: JSON.stringify({ exitCode: 0, success: true, stdout: "passed" }),
+    transactionId: "turn-exploration-repair",
+  });
+  const audit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [exploratoryFailure, repair, validation],
+    mutationExpected: true,
+    validationExpected: true,
+    transactionId: "turn-exploration-repair",
+  });
+  assert.equal(audit.gap, "none");
+  assert.equal(audit.completionAllowed, true);
+});
+
 test("command-only completion satisfies multiple requirements across the command evidence set", () => {
   const lint = {
     id: "lint",

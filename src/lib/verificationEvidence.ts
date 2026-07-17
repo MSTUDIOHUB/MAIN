@@ -13,13 +13,18 @@ import {
   type ToolFeedbackStatus,
 } from "./toolFeedbackEnvelope";
 import {
+  classifyFiniteValidationCommandCapability,
   isFinitePlanValidationCommand,
   planCommandEvidenceMatchesExecution,
+  requiresPtyObservationForPlanCommand,
   type PlanExecutionEvidenceEntry,
   type PlanTask,
   type ValidationObligation,
 } from "./workflowModels";
-import type { CommandDirective } from "./runIntent";
+import {
+  looksLikeExplicitShellCommandInput,
+  type CommandDirective,
+} from "./runIntent";
 import type { RecoveryActionContract } from "./executeRecoveryTools";
 import { isWorkspaceMutationToolName } from "./workspaceMutationTools";
 
@@ -166,11 +171,34 @@ function operationalCommandEvidenceSatisfiesRequirements(
   entries: PlanExecutionEvidenceEntry[],
   requiredCommands: string[],
 ): boolean {
-  return requiredCommands.length > 0 && requiredCommands.every((required) =>
+  if (requiredCommands.length === 0) {
+    return entries.some((entry) =>
+      isFinitePlanValidationCommand(entry.value || entry.target || "")
+    );
+  }
+  return requiredCommands.every((required) =>
     entries.some((entry) =>
-      planCommandEvidenceMatchesExecution(required, entry.value || entry.target || "")
+      commandEvidenceRequirementMatchesExecution(
+        required,
+        entry.value || entry.target || "",
+      )
     )
   );
+}
+
+const COMMAND_CAPABILITY_REQUIREMENT_PREFIX = "capability:";
+
+function commandEvidenceRequirementMatchesExecution(
+  required: string,
+  actual: string,
+): boolean {
+  if (required.startsWith(COMMAND_CAPABILITY_REQUIREMENT_PREFIX)) {
+    const capability = required.slice(COMMAND_CAPABILITY_REQUIREMENT_PREFIX.length);
+    if (capability === "operational") return String(actual || "").trim().length > 0;
+    if (capability === "start") return requiresPtyObservationForPlanCommand(actual);
+    return classifyFiniteValidationCommandCapability(actual) === capability;
+  }
+  return planCommandEvidenceMatchesExecution(required, actual);
 }
 
 function normalizeCommandRequirement(value: unknown): string {
@@ -178,8 +206,10 @@ function normalizeCommandRequirement(value: unknown): string {
 }
 
 /**
- * Derive command ownership from structured Plan/directive metadata. A bare
- * successful shell call is not enough to complete a command-only turn.
+ * Derive exact command ownership from structured Plan/directive metadata.
+ * Natural-language targets describe intent; they are never executable
+ * acceptance strings. Without an exact command, a small structured capability
+ * (test/build/start/operational) owns the acceptable evidence class.
  */
 export function resolveCommandEvidenceRequirements(input: {
   tasks?: PlanTask[];
@@ -193,10 +223,22 @@ export function resolveCommandEvidenceRequirements(input: {
   );
   const directive = input.commandDirective;
   if (requirements.length === 0 && directive?.kind === "shell") {
-    const target = normalizeCommandRequirement(directive.target);
-    const action = normalizeCommandRequirement(directive.action);
-    if (target && !/^(?:shell|terminal|command)$/i.test(target)) requirements.push(target);
-    else if (action && !/^(?:run|execute|command)$/i.test(action)) requirements.push(action);
+    const exactCommand = normalizeCommandRequirement(directive.exactCommand);
+    const legacyExactTarget = normalizeCommandRequirement(directive.target);
+    if (exactCommand) requirements.push(exactCommand);
+    else if (
+      looksLikeExplicitShellCommandInput(legacyExactTarget)
+    ) requirements.push(legacyExactTarget);
+    else if (["test", "build", "lint", "typecheck", "check", "start"].includes(
+      normalizeCommandRequirement(directive.action),
+    )) {
+      requirements.push(
+        `${COMMAND_CAPABILITY_REQUIREMENT_PREFIX}${normalizeCommandRequirement(directive.action)}`,
+      );
+    }
+    else if (["run", "deploy"].includes(normalizeCommandRequirement(directive.action))) {
+      requirements.push(`${COMMAND_CAPABILITY_REQUIREMENT_PREFIX}operational`);
+    }
   }
   if (requirements.length === 0 && directive?.kind === "git") {
     const target = normalizeCommandRequirement(directive.target);
@@ -432,13 +474,30 @@ function latestUnresolvedFailures(
       entry.portConflict === true ||
       entry.observationStatus === "ready" ||
       isHealthyExistingServer;
+    const isMutationOperation = isWorkspaceMutationToolName(entry.sourceTool) ||
+      entry.kind === "file" || entry.kind === "deliverable";
+    const isBrowserOperation = entry.kind === "browser_dom" ||
+      entry.kind === "browser_screenshot" ||
+      /(?:browser|playwright|puppeteer|cypress)/i.test(entry.sourceTool);
+    const finiteValidationCapability = entry.sourceTool === "run_command"
+      ? classifyFiniteValidationCommandCapability(entry.value || entry.target || "")
+      : null;
+    // Exploratory read/search/list failures remain diagnostic evidence, but
+    // they do not own a task acceptance obligation and cannot hold completion
+    // open after a real mutation and validation succeed.
+    if (
+      !isDevServerReconciliation &&
+      !isMutationOperation &&
+      !isBrowserOperation &&
+      !finiteValidationCapability
+    ) continue;
     const key = isDevServerReconciliation
       ? "dev_server_runtime"
-      : isWorkspaceMutationToolName(entry.sourceTool) || entry.kind === "file" || entry.kind === "deliverable"
+      : finiteValidationCapability
+      ? `finite_validation:${finiteValidationCapability}`
+      : isMutationOperation
       ? `mutation:${normalizedTarget}`
-      : entry.kind === "browser_dom" ||
-        entry.kind === "browser_screenshot" ||
-        /(?:browser|playwright|puppeteer|cypress)/i.test(entry.sourceTool)
+      : isBrowserOperation
       ? `browser:${normalizedTarget}`
       : `${entry.sourceTool}:${normalizedTarget}`;
     latestByOperation.set(key, entry);
@@ -650,9 +709,12 @@ export function buildExecuteEvidenceClosureAudit(input: {
       if (!commandRequirementsSatisfied || !isSuccessfulOperationalCommandEntry(entry)) {
         return false;
       }
+      if (requiredCommandEvidence.length === 0) {
+        return isFinitePlanValidationCommand(entry.value || entry.target || "");
+      }
       const actual = entry.value || entry.target || "";
       return requiredCommandEvidence.some((required) =>
-        planCommandEvidenceMatchesExecution(required, actual)
+        commandEvidenceRequirementMatchesExecution(required, actual)
       );
     }
     return isSuccessfulValidationEvidenceEntry(entry);

@@ -277,7 +277,9 @@ test("durable turn context keeps canonical messages and structured evidence with
       { id: 4, turnId: "turn-durable", type: "tool", toolName: "apply_patch", target: "src/runtime.ts", status: "done", toolStatus: "executed", message: "raw patch output" },
       { id: 5, turnId: "turn-durable", type: "tool", toolName: "write_file", target: ".MAIN/plans/plan.md", status: "done", toolStatus: "executed" },
       { id: 6, turnId: "turn-durable", type: "tool", toolName: "run_command", target: "npm test", status: "done", toolStatus: "executed", message: "large test output" },
-      { id: 7, turnId: "turn-durable", type: "agent", content: "修复完成，测试通过。" },
+      { id: 7, turnId: "turn-durable", type: "tool", toolName: "run_command", target: "npm run lint", status: "done", toolStatus: "executed", message: JSON.stringify({ exitCode: 1, success: false, stderr: "lint failed" }) },
+      { id: 8, turnId: "turn-durable", type: "tool", toolName: "execute_command", target: "npm test --watch", status: "done", toolStatus: "executed", message: JSON.stringify({ success: false, stderr: "PTY_BUSY: foreground generation=4" }) },
+      { id: 9, turnId: "turn-durable", type: "agent", content: "修复完成，测试通过。" },
     ],
     artifactPaths: [".MAIN/plans/plan.md"],
   });
@@ -288,6 +290,7 @@ test("durable turn context keeps canonical messages and structured evidence with
   assert.deepEqual(durable.execution.decisions, ["采用统一状态机"]);
   assert.deepEqual(durable.execution.modifiedFiles, ["src/runtime.ts"]);
   assert.deepEqual(durable.execution.validations, ["run_command: npm test"]);
+  assert.deepEqual(durable.execution.failures, ["run_command: npm run lint"]);
   assert.deepEqual(durable.execution.artifacts, [".MAIN/plans/plan.md"]);
   const serialized = durableTurnContext.serializeDurableTurnContextForModel(durable);
   assert.match(serialized, /\[durable_turn_context\]/);

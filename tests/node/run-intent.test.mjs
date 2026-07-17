@@ -156,6 +156,57 @@ test("Chinese find-and-fix requests build an execution evidence contract", () =>
   assert.equal(contract.completionEvidenceRequired, "execution_evidence");
 });
 
+test("natural-language run-and-repair requests route by the requested repair outcome", () => {
+  const result = resolveTurnRunIntent("运行软件测试直接报错了，修复错误", createContext());
+  assert.equal(result.intent, "execute");
+  assert.equal(result.commandDirective.kind, "file_modify");
+  assert.equal(result.commandDirective.exactCommand, undefined);
+
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: result.intent,
+    runtimeIntent: result.intent,
+    commandDirective: result.commandDirective,
+    executionConsentGranted: true,
+  });
+  assert.equal(contract.mutationExpected, true);
+  assert.equal(contract.validationExpected, true);
+
+  const explicitMixed = resolveTurnRunIntent("npm test 然后修复错误", createContext());
+  assert.equal(explicitMixed.commandDirective.kind, "file_modify");
+
+  const commandOnly = resolveTurnRunIntent("npm test", createContext());
+  assert.equal(commandOnly.commandDirective.kind, "shell");
+  assert.equal(commandOnly.commandDirective.exactCommand, "npm test");
+  const commandOnlyContract = buildEffectiveTurnContract({
+    conversationIntent: commandOnly.intent,
+    runtimeIntent: commandOnly.intent,
+    commandDirective: commandOnly.commandDirective,
+    executionConsentGranted: true,
+  });
+  assert.equal(commandOnlyContract.mutationExpected, false);
+  assert.equal(commandOnlyContract.validationExpected, true);
+});
+
+test("an unapproved Plan describes future effects without entering execution evidence", () => {
+  const contract = buildEffectiveTurnContract({
+    conversationIntent: "plan",
+    runtimeIntent: "plan",
+    commandDirective: {
+      kind: "shell",
+      action: "test",
+      target: "run tests and repair the failure",
+      source: "natural_language",
+    },
+    planApproved: false,
+    executionConsentGranted: false,
+  });
+
+  assert.equal(contract.mutationExpected, false);
+  assert.equal(contract.validationExpected, false);
+  assert.equal(contract.completionEvidenceRequired, "plan_artifact");
+  assert.equal(contract.operationApprovalState, "not_required");
+});
+
 test("approved plan conversation becomes execute runtime for completion evidence", () => {
   const contract = buildEffectiveTurnContract({
     conversationIntent: "plan",

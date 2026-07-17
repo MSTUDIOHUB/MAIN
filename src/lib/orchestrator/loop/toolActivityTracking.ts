@@ -11,7 +11,7 @@ import {
   isWorkspaceMutationToolCall,
   isWorkspaceMutationToolName,
 } from "../../workspaceMutationTools";
-import { browserResultLooksSuccessful, commandResultLooksSuccessful } from "../../planEvidence";
+import { browserResultLooksSuccessful, classifyCommandResultOutcome } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import {
   extractPlanEvidenceFacts,
@@ -312,7 +312,7 @@ export function toolResultCountsAsExecutionEvidence(
   }
   if (
     (result.name === "run_command" || result.name === "execute_command") &&
-    !commandResultLooksSuccessful(result.name, result.content || "")
+    classifyCommandResultOutcome(result.name, result.content || "") !== "succeeded"
   ) {
     return false;
   }
@@ -341,10 +341,17 @@ export function rememberToolActivity(
     extractPlanEvidenceFacts(planEvidenceDetail),
   );
   const astObservation = extractAstObservation(result);
+  const commandOutcome = result.isError
+    ? "failed"
+    : classifyCommandResultOutcome(result.name, result.content || "");
   appendBoundedToolActivity(targetList, {
     name: result.name,
     target: result.target,
-    status: result.isError ? "failed" : "succeeded",
+    status: commandOutcome === "failed"
+      ? "failed"
+      : commandOutcome === "running"
+      ? "called"
+      : "succeeded",
     ...(detail ? { detail } : {}),
     ...(facts.length > 0 ? { facts } : {}),
     ...(result.readFileObservation

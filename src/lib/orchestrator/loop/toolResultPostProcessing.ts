@@ -14,6 +14,7 @@ import {
 import { isUnityScriptWriteToolCall } from "../../orchestrator/unityDiagnostics";
 import {
   assessPlanClosureEvidence,
+  classifyCommandResultOutcome,
   isPlanEvidenceBundleReady,
 } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
@@ -387,12 +388,18 @@ export function handleToolResultPostProcessing(input: {
     }
   }
 
-  const failedEvidenceResults = externalResults.filter((result) => result.isError);
+  const resultOutcomeForEvidence = (result: ToolExecutionResult) =>
+    result.isError ? "failed" : classifyCommandResultOutcome(result.name, result.content || "");
+  const failedEvidenceResults = externalResults.filter((result) =>
+    resultOutcomeForEvidence(result) === "failed"
+  );
   const firstFailedEvidenceResult = failedEvidenceResults[0];
   const firstFailedEvidenceLifecycleState = firstFailedEvidenceResult
-    ? inferLifecycleStateFromToolResult(firstFailedEvidenceResult)
+    ? inferLifecycleStateFromToolResult({ ...firstFailedEvidenceResult, isError: true })
     : null;
-  const successfulResultCount = externalResults.filter((result) => !result.isError).length;
+  const successfulResultCount = externalResults.filter((result) =>
+    resultOutcomeForEvidence(result) === "succeeded"
+  ).length;
   emitTaskOrchestratorPhase("EVIDENCE_RECONCILE", {
     iteration,
     results: externalResults.length,

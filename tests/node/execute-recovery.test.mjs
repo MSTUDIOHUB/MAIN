@@ -133,6 +133,10 @@ const {
   handleNoProgressRecovery,
   resolveDirectMutationPreflightRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopRecovery.ts"));
+const {
+  buildRepeatLoopArgsKey,
+  buildRepeatLoopSignature,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/repetitionGuard.ts"));
 
 const {
   findDelegatedObservationRequiringParentReread,
@@ -1346,6 +1350,52 @@ test("a recovery-surface mismatch is internal scope feedback and cannot poison f
   assert.equal(result.preExecutionResults[0].qualityGateReason, "execute_recovery_scope_deferred");
   assert.match(result.preExecutionResults[0].content, /READ_SCOPE_DEFERRED/);
   assert.equal(result.toolFailureSignatures.has("stale-read"), false);
+});
+
+test("repeated real failures become internal policy feedback instead of another tool failure", async () => {
+  const toolErrors = [];
+  const toolDone = [];
+  const args = { path: ".missing" };
+  const failureSignature = buildRepeatLoopSignature(
+    "list_directory",
+    buildRepeatLoopArgsKey(args),
+  );
+  const input = createReadFilePartitionInput({
+    toolCalls: [{
+      id: "repeated-missing-directory",
+      name: "list_directory",
+      arguments: JSON.stringify(args),
+    }],
+    availableToolNames: new Set(["list_directory"]),
+    failedToolCallCounts: new Map([[failureSignature, 2]]),
+  });
+  input.callbacks = {
+    ...input.callbacks,
+    onToolError: (...values) => toolErrors.push(values),
+    onToolDone: (...values) => toolDone.push(values),
+  };
+
+  const result = await partitionToolCallsForExecution(input);
+  assert.equal(result.readOnlyCalls.length, 0);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.equal(result.preExecutionResults[0].isError, false);
+  assert.equal(result.preExecutionResults[0].internalFeedback, true);
+  assert.equal(result.preExecutionResults[0].qualityGateReason, "repeated_failure_blocked");
+  assert.equal(input.failedToolCallCounts.get(failureSignature), 3);
+  assert.equal(result.toolFailureSignatures.has("repeated-missing-directory"), false);
+  assert.equal(toolErrors.length, 0);
+  assert.equal(toolDone.length, 1);
+  assert.equal(toolDone[0][3].internalFeedback, true);
+
+  const exhausted = await partitionToolCallsForExecution({
+    ...input,
+    toolCalls: [{
+      id: "repeated-missing-directory-again",
+      name: "list_directory",
+      arguments: JSON.stringify(args),
+    }],
+  });
+  assert.equal(exhausted.preExecutionResults[0].qualityGateReason, "repeated_failure_exhausted");
 });
 
 test("approved Plan execution rejects an unreviewed compound shell mutation before dispatch", async () => {

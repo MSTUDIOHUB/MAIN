@@ -65,6 +65,7 @@ import {
 } from "../planExecutionRecovery";
 import {
   appendPlanEvidenceEntry,
+  classifyCommandResultOutcome,
   createPlanExecutionEvidenceEntry,
   createPlanExecutionFailureEntry,
   shouldRecordPlanExecutionFailure,
@@ -2279,6 +2280,14 @@ export class WorkflowEngine {
         const evidenceResultText = typeof meta?.evidenceResult === "string"
           ? meta.evidenceResult
           : resultText;
+        const operationOutcome = classifyCommandResultOutcome(toolName, evidenceResultText);
+        const operationFailed = operationOutcome === "failed";
+        const operationRunning = operationOutcome === "running";
+        // The tool call itself finished even when it reported an already-live
+        // PTY process. Process liveness belongs to the evidence ledger; leaving
+        // the tool card running would make later lifecycle matching ambiguous.
+        const operationStatus = operationFailed ? "failed" : "done";
+        const operationToolStatus = operationFailed ? "failed" : "executed";
         const noOp = isNoOpToolResult(evidenceResultText);
         const unownedEntry = createPlanExecutionEvidenceEntry({
           toolName,
@@ -2303,14 +2312,18 @@ export class WorkflowEngine {
           toolName,
           target,
           language: phaseLanguage,
-          status: "done",
+          status: operationStatus,
           source: "tool_result",
           turnIntent: effectiveRunIntent,
           workflowMode: sessionGet().config.workflowMode,
           previousObservation: observationSummary,
           result: resultText,
           noOp,
-          hypothesisStatus: noOp ? "blocked" : "confirmed",
+          hypothesisStatus: noOp || operationFailed
+            ? "blocked"
+            : operationRunning
+            ? "unverified"
+            : "confirmed",
           sourceToolCallIds: executionId ? [executionId] : [],
         });
         logStoreEvent("tool_result", {
@@ -2320,7 +2333,7 @@ export class WorkflowEngine {
           toolName,
           executionId,
           resultChars: result?.length ?? 0,
-          isError: false,
+          isError: operationFailed,
         });
 
         sessionSet((s: any) => {
@@ -2363,15 +2376,15 @@ export class WorkflowEngine {
                   toolName,
                   target,
                   language: phaseLanguage,
-                  status: "done",
+                  status: operationStatus,
                 }),
-                "done",
+                operationStatus,
                 phaseLanguage,
               );
               return {
                 ...block,
-                status: "done",
-                toolStatus: "executed",
+                status: operationStatus,
+                toolStatus: operationToolStatus,
                 output: resultText,
                 message: resultText,
                 ...(completedDiff ? { diff: completedDiff } : block.diff ? { diff: block.diff } : {}),
@@ -2379,8 +2392,8 @@ export class WorkflowEngine {
                   toolName,
                   target,
                   language: phaseLanguage,
-                  status: "done",
-                  toolStatus: "executed",
+                  status: operationStatus,
+                  toolStatus: operationToolStatus,
                 }),
                 why: block.why || progress.why,
                 evidence: progress.evidence || block.evidence,

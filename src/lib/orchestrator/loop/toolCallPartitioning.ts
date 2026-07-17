@@ -728,6 +728,10 @@ export async function partitionToolCallsForExecution(input: {
 
     if ((failedToolCallCounts.get(failureSignature) ?? 0) >= 2) {
       const failureCount = failedToolCallCounts.get(failureSignature) ?? 0;
+      const policyReason = failureCount >= 3
+        ? "repeated_failure_exhausted"
+        : "repeated_failure_blocked";
+      failedToolCallCounts.set(failureSignature, failureCount + 1);
       const argsJson = typeof tc.arguments === "string" ? tc.arguments : "";
       logAgentEvent("repeated_failure_block_details", {
         iteration,
@@ -740,12 +744,12 @@ export async function partitionToolCallsForExecution(input: {
         firstSeenIteration: iteration - (failureCount - 1),
       });
       const message = callbacks.getPreferredLanguage() === "zh"
-        ? `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} 已用相同参数连续失败。请先诊断最近错误，改变参数或换一条策略，不要原样重试。`
-        : `REPEATED_FAILURE_BLOCKED: ${tc.name}${target ? ` (${target})` : ""} has failed repeatedly with identical arguments. Diagnose the latest error and change arguments or strategy before retrying.`;
+        ? `${policyReason.toUpperCase()}: ${tc.name}${target ? ` (${target})` : ""} 已用相同参数连续失败。请改变参数、目标或工具，不要原样重试。`
+        : `${policyReason.toUpperCase()}: ${tc.name}${target ? ` (${target})` : ""} has failed repeatedly with identical arguments. Change arguments, target, or tool instead of retrying unchanged.`;
       const _recentActivity = recentPlanToolActivity.slice(-MAX_RECENT_PLAN_TOOL_ACTIVITY);
       const _evidenceKeys = Array.from(getSessionTaskTargetingEvidence(callbacks.getSessionKey())).slice(0, 20);
       emitToolPreflightBlocked(callbacks, {
-        reason: "repeated_failure_blocked",
+        reason: policyReason,
         tool: tc.name,
         target,
         message,
@@ -755,13 +759,24 @@ export async function partitionToolCallsForExecution(input: {
           ? { recentToolActivity: JSON.stringify(_recentActivity.slice(-6).map((a) => `${a.name}->${a.target}`)), evidenceKeys: _evidenceKeys }
           : undefined,
       });
-      callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+      // This call never reached the executor. Keep the two real failures as
+      // evidence, but do not let the policy response become a third failure
+      // or feed the global fatal repeat guard.
+      toolFailureSignatures.delete(tc.id);
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: policyReason,
+      });
       preExecutionResults.push({
         toolCallId: tc.id,
         name: tc.name,
         target,
-        content: `Error: ${message}`,
-        isError: true,
+        content: message,
+        displayContent: message,
+        isError: false,
+        internalFeedback: true,
+        qualityGateReason: policyReason,
         lifecycleState: "blocked",
       });
       continue;

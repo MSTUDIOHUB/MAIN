@@ -66,6 +66,8 @@ export interface CommandDirective {
   kind: CommandDirectiveKind;
   action?: string;
   target?: string;
+  /** Exact user-supplied shell command. Natural-language targets never belong here. */
+  exactCommand?: string;
   source?: CommandDirectiveSource;
   requiresWorkspace?: boolean;
   requiresApproval?: boolean;
@@ -709,6 +711,7 @@ function createCommandDirective(
     confidence: patch.confidence ?? (kind === "none" ? 0.5 : 0.86),
     ...(patch.action ? { action: patch.action } : {}),
     ...(patch.target ? { target: patch.target } : {}),
+    ...(patch.exactCommand ? { exactCommand: patch.exactCommand } : {}),
     ...(patch.reason ? { reason: patch.reason } : {}),
   };
 }
@@ -738,28 +741,34 @@ export function buildEffectiveTurnContract(input: {
     directiveKind === "mcp" ||
     directiveKind === "plan_resume" ||
     directiveKind === "plan_approval";
-  const mutationExpected =
-    runtimeIntent === "studio_workflow" ||
-    (
-      input.planApproved === true &&
-      input.workspaceMutationExpected !== false
-    ) ||
-    directiveKind === "file_modify" ||
-    directiveKind === "studio";
-  const validationExpected =
-    mutationExpected ||
-    (
-      input.planApproved === true &&
-      input.workspaceValidationExpected !== false
-    ) ||
-    directiveKind === "shell" ||
-    directiveKind === "git" ||
-    directiveKind === "unity" ||
-    directiveKind === "mcp";
   const isUnapprovedPlanDraft =
     conversationIntent === "plan" &&
     runtimeIntent === "plan" &&
     input.planApproved !== true;
+  const mutationExpected =
+    !isUnapprovedPlanDraft &&
+    (
+      runtimeIntent === "studio_workflow" ||
+      (
+        input.planApproved === true &&
+        input.workspaceMutationExpected !== false
+      ) ||
+      directiveKind === "file_modify" ||
+      directiveKind === "studio"
+    );
+  const validationExpected =
+    !isUnapprovedPlanDraft &&
+    (
+      mutationExpected ||
+      (
+        input.planApproved === true &&
+        input.workspaceValidationExpected !== false
+      ) ||
+      directiveKind === "shell" ||
+      directiveKind === "git" ||
+      directiveKind === "unity" ||
+      directiveKind === "mcp"
+    );
   const needsApproval =
     !isUnapprovedPlanDraft &&
     input.executionConsentGranted !== true &&
@@ -828,6 +837,9 @@ export function normalizeCommandDirective(
     ...(normalizeDirectiveString(candidate.target) ?? fallback?.target
       ? { target: normalizeDirectiveString(candidate.target) ?? fallback?.target }
       : {}),
+    ...(normalizeDirectiveString(candidate.exactCommand, 1_000) ?? fallback?.exactCommand
+      ? { exactCommand: normalizeDirectiveString(candidate.exactCommand, 1_000) ?? fallback?.exactCommand }
+      : {}),
     requiresWorkspace: typeof candidate.requiresWorkspace === "boolean"
       ? candidate.requiresWorkspace
       : fallback?.requiresWorkspace,
@@ -860,6 +872,13 @@ function inferShellAction(input: string): string {
   return "run";
 }
 
+const WORKSPACE_MUTATION_REQUEST_RE = /(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|replace|add)\b/i;
+const EXPLICIT_SHELL_COMMAND_RE = /^(?:npm|pnpm|yarn|bun|node|python|python3|pytest|cargo|go|rustc|dotnet|bash|sh|make)\b/i;
+
+export function looksLikeExplicitShellCommandInput(value: unknown): boolean {
+  return EXPLICIT_SHELL_COMMAND_RE.test(String(value || "").trim());
+}
+
 const UNITY_CONSOLE_DIAGNOSTIC_RE = /console|报错|错误|warning|警告|compile|编译|编译失败|编译错误/i;
 const UNITY_CONSOLE_NEGATION_RE = /(?:没有|无|未见|不是|并非|不\s*是|not|no|without).{0,12}(?:console|报错|错误|warning|警告|compile|编译|编译失败|编译错误)|(?:console|报错|错误|warning|警告|compile|编译|编译失败|编译错误).{0,12}(?:没有|无|未见|不是|并非|not|no|without)/i;
 
@@ -888,6 +907,13 @@ export function inferCommandDirective(
   const source = options.source ?? "natural_language";
   const normalizedInput = normalizeInput(input);
   const lower = normalizedInput.toLowerCase();
+  const workspaceMutationExpected =
+    (intent === "execute" || intent === "plan") &&
+    WORKSPACE_MUTATION_REQUEST_RE.test(normalizedInput);
+  const explicitShellCommand = looksLikeExplicitShellCommandInput(lower);
+  const remoteShellOperation = /(?:同步|部署|上传|发布).{0,32}(?:服务器|远程|生产|线上|server|remote|production)|(?:服务器|远程|生产|线上|server|remote|production).{0,32}(?:同步|部署|上传|发布)/i.test(normalizedInput);
+  const naturalShellOperation = /\b(?:run|execute|start)\b.{0,24}\b(?:command|script|deploy|test|build|server)\b/i.test(lower) ||
+    /(?:执行|运行|启动).{0,16}(?:命令|脚本|测试|构建|服务|部署)/i.test(normalizedInput);
 
   if (options.controlAction === "approve_plan") {
     return createCommandDirective("plan_approval", {
@@ -959,7 +985,7 @@ export function inferCommandDirective(
     });
   }
 
-  if (/^(?:npm|pnpm|yarn|bun|node|python|python3|pytest|cargo|go|rustc|dotnet|bash|sh|make)\b/i.test(lower) || /\b(?:run|execute|start)\b.{0,24}\b(?:command|script|deploy|test|build|server)\b/i.test(lower) || /(?:执行|运行|启动).{0,16}(?:命令|脚本|测试|构建|服务|部署)/i.test(normalizedInput) || /(?:同步|部署|上传|发布).{0,32}(?:服务器|远程|生产|线上|server|remote|production)|(?:服务器|远程|生产|线上|server|remote|production).{0,32}(?:同步|部署|上传|发布)/i.test(normalizedInput)) {
+  if (remoteShellOperation) {
     return createCommandDirective("shell", {
       source,
       action: inferShellAction(normalizedInput),
@@ -982,7 +1008,7 @@ export function inferCommandDirective(
     });
   }
 
-  if (/(?:修改|实现|修复|解决|处理|写入|创建|生成|补上|改掉|落地|新增|增加|添加|加入|接入|完善|开发|删除|替换|重构)|\b(?:implement|fix|repair|resolve|write|create|generate|update|patch|modify|refactor|delete|replace|add)\b/i.test(normalizedInput) && (intent === "execute" || intent === "plan")) {
+  if (workspaceMutationExpected) {
     return createCommandDirective("file_modify", {
       source,
       action: intent === "plan" ? "plan_file_change" : "workspace_file_change",
@@ -990,6 +1016,21 @@ export function inferCommandDirective(
       requiresApproval: intent === "execute",
       confidence: 0.86,
       reason: "Workspace file modification intent detected.",
+    });
+  }
+
+  if (explicitShellCommand || naturalShellOperation) {
+    return createCommandDirective("shell", {
+      source,
+      action: inferShellAction(normalizedInput),
+      target: normalizeDirectiveString(normalizedInput, 80),
+      ...(explicitShellCommand
+        ? { exactCommand: normalizeDirectiveString(normalizedInput, 1_000) }
+        : {}),
+      requiresWorkspace: true,
+      requiresApproval: true,
+      confidence: 0.9,
+      reason: "Shell command intent detected.",
     });
   }
 

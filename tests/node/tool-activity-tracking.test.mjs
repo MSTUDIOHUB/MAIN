@@ -247,6 +247,36 @@ test("tool activity tracking counts only successful commands browser checks and 
   }), {}), false, "joining a child is coordination, not execution evidence");
 });
 
+test("tool activity records a nonzero command as failed even when transport completed", () => {
+  const activities = [];
+  rememberToolActivity(activities, result({
+    name: "run_command",
+    target: "npm test",
+    content: JSON.stringify({ exitCode: 1, success: false, stdout: "failed" }),
+    isError: false,
+  }));
+  assert.equal(activities.length, 1);
+  assert.equal(activities[0].status, "failed");
+
+  rememberToolActivity(activities, result({
+    toolCallId: "call_2",
+    name: "run_command",
+    target: "npm run build",
+    content: JSON.stringify({ exitCode: 0, success: true, stdout: "built" }),
+    isError: false,
+  }));
+  assert.equal(activities.at(-1).status, "succeeded");
+
+  rememberToolActivity(activities, result({
+    toolCallId: "call_3",
+    name: "execute_command",
+    target: "npm run dev",
+    content: JSON.stringify({ success: false, stderr: "PTY_BUSY: foreground generation=4" }),
+    isError: false,
+  }));
+  assert.equal(activities.at(-1).status, "called");
+});
+
 test("browser validation cache ignores timeout-only retries while preserving meaningful checks", () => {
   const first = buildBrowserValidationCacheSignature({
     url: "http://localhost:1420",
@@ -868,5 +898,6 @@ test("failed command validation does not become execution evidence or clear reco
   });
   assert.equal(post.recoveringFromEmptyAssistantReplyAfterWrite, true);
   assert.equal(harness.clearRecoveryCalls.length, 0);
-  assert.equal(harness.taskPhases[0].extra.successfulResults, 1);
+  assert.equal(harness.taskPhases[0].extra.successfulResults, 0);
+  assert.equal(harness.taskPhases[0].extra.failedResults, 1);
 });

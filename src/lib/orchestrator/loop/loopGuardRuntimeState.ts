@@ -1,3 +1,5 @@
+import { classifyCommandResultOutcome } from "../../planEvidence";
+
 export type RecentLoopGuardToolCall = {
   name: string;
   argsKey: string;
@@ -31,6 +33,8 @@ export type NoProgressLoopTrackingState = Pick<
 
 export type ToolFailureSignatureResult = {
   toolCallId: string;
+  name?: string;
+  content?: string;
   isError?: boolean;
   internalFeedback?: boolean;
 };
@@ -84,12 +88,15 @@ export function applyToolFailureSignatureRuntimeState(
     const signature = input.toolFailureSignatures.get(result.toolCallId);
     if (!signature) continue;
     if (result.internalFeedback) continue;
-    if (result.isError) {
+    const outcome = result.isError
+      ? "failed"
+      : classifyCommandResultOutcome(result.name || "", result.content || "");
+    if (outcome === "failed") {
       state.failedToolCallCounts.set(
         signature,
         (state.failedToolCallCounts.get(signature) ?? 0) + 1,
       );
-    } else {
+    } else if (outcome === "succeeded") {
       state.failedToolCallCounts.delete(signature);
     }
   }

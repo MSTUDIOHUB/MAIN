@@ -13,7 +13,6 @@ import {
 } from "./workflowModels";
 import type { ToolDiffPreview } from "./toolDiff";
 import { preserveNumberedUserGoalLines } from "./numberedGoalFacets";
-import { classifyFailedFiniteValidationOutcome } from "./commandValidationOutcome";
 import {
   EXTERNAL_WORKSPACE_MUTATION_TOOL_NAMES,
   hasResolvedWorkspaceMutationTarget,
@@ -811,6 +810,19 @@ export function commandResultLooksSuccessful(toolName: string, result: string): 
   return !/\b(exit\s*code\s*[=:]\s*[1-9]\d*|command failed|error:)\b/i.test(result);
 }
 
+export type CommandResultOutcome = "succeeded" | "failed" | "running";
+
+/** One lifecycle interpretation shared by evidence, UI, and durable context. */
+export function classifyCommandResultOutcome(
+  toolName: string,
+  result: string,
+): CommandResultOutcome {
+  if (toolName === "execute_command" && classifyPtyCommandFailure(result).kind === "pty_occupied") {
+    return "running";
+  }
+  return commandResultLooksSuccessful(toolName, result) ? "succeeded" : "failed";
+}
+
 export function browserResultLooksSuccessful(result: string): boolean {
   try {
     const parsed = JSON.parse(result);
@@ -1255,7 +1267,8 @@ export function createPlanExecutionEvidenceEntry(input: {
     };
   }
   if (COMMAND_EVIDENCE_TOOLS.has(input.toolName)) {
-    if (!commandResultLooksSuccessful(input.toolName, input.result)) {
+    const commandOutcome = classifyCommandResultOutcome(input.toolName, input.result);
+    if (commandOutcome !== "succeeded") {
       if (input.toolName === "execute_command") {
         const semantics = classifyPtyCommandFailure(input.result);
         // PTY_BUSY is lifecycle evidence: the existing foreground process must
@@ -1282,15 +1295,10 @@ export function createPlanExecutionEvidenceEntry(input: {
             : {}),
         };
       }
-      if (
-        input.toolName !== "run_command" ||
-        classifyFailedFiniteValidationOutcome({ result: input.result }) !== "validation_failure"
-      ) {
-        return null;
-      }
-      // A validation that really ran but failed is durable negative evidence.
-      // Keeping it in the ordered command ledger prevents an unrelated later
-      // command from satisfying a generic focused-validation placeholder.
+      if (input.toolName !== "run_command") return null;
+      // Invocation and assertion failures are both durable negative evidence.
+      // A later finite validation can reconcile a generic command failure;
+      // exact Plan command requirements still demand their exact success.
       return {
         ...base,
         kind: "cmd",

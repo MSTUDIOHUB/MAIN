@@ -142,6 +142,9 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
   assert.match(source, /appendPlanEvidenceEntry/);
   assert.match(source, /reconcilePlanTaskCompletion/);
   assert.match(source, /const unownedEntry = createPlanExecutionEvidenceEntry/);
+  assert.match(source, /const operationOutcome = classifyCommandResultOutcome/);
+  assert.match(source, /const operationRunning = operationOutcome === "running"/);
+  assert.match(source, /const operationStatus = operationFailed \? "failed" : "done"/);
   assert.match(source, /resolvePlanExecutionEvidenceIdentity\(\{[\s\S]*?record,[\s\S]*?preferredPlanTaskId/);
   const lifecycleMissReturn = source.indexOf("if (existingIndex < 0) return evidencePatch", evidenceCreation);
   const evidenceAppend = source.indexOf("appendPlanEvidenceEntry", evidenceCreation);
@@ -1121,7 +1124,7 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(toolActivityTrackingSource, /feedbackStatus === "no_op"/);
   assert.match(toolActivityTrackingSource, /feedbackStatus === "no_effect_mutation"/);
   assert.match(toolActivityTrackingSource, /already matched requested content/);
-  assert.match(toolActivityTrackingSource, /commandResultLooksSuccessful/);
+  assert.match(toolActivityTrackingSource, /classifyCommandResultOutcome/);
   assert.match(toolActivityTrackingSource, /browserResultLooksSuccessful/);
   assert.match(toolActivityTrackingSource, /export function rememberToolActivity/);
   assert.match(toolActivityTrackingSource, /export function isEditProgressResult/);

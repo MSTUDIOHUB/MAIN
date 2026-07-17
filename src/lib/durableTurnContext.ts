@@ -2,6 +2,7 @@ import type { TaskBlock } from "./taskTypes";
 import { classifyKnownBuiltInTool } from "./toolCapabilities";
 import { buildCanonicalCompletedTurnMessages } from "./turnContext";
 import { isEphemeralPlanArtifactPath, type DurableTurnContext } from "./workflowModels";
+import { classifyCommandResultOutcome } from "./planEvidence";
 
 const VALIDATION_TARGET_RE = /(?:\btest\b|pytest|vitest|jest|playwright|\bbuild\b|\blint\b|typecheck|\btsc\b|cargo\s+check|go\s+test)/i;
 
@@ -59,6 +60,16 @@ export function buildDurableTurnContext(input: {
     if (block.type !== "tool") continue;
     const risk = classifyKnownBuiltInTool(block.toolName);
     const target = compact(block.diff?.path || block.target || block.toolName);
+    const resultText = String(
+      (block as typeof block & { output?: string }).output ||
+      block.message ||
+      block.evidence ||
+      "",
+    );
+    const commandOutcome = block.toolStatus === "executed"
+      ? classifyCommandResultOutcome(block.toolName, resultText)
+      : null;
+    const commandFailed = commandOutcome === "failed";
     if (
       block.toolStatus === "executed" &&
       (risk === "workspace_write" || risk === "destructive") &&
@@ -68,11 +79,14 @@ export function buildDurableTurnContext(input: {
     }
     if (
       block.toolStatus === "executed" &&
-      (risk === "browser_control" || (risk === "shell" && VALIDATION_TARGET_RE.test(block.target || "")))
+      (
+        risk === "browser_control" ||
+        (risk === "shell" && commandOutcome === "succeeded" && VALIDATION_TARGET_RE.test(block.target || ""))
+      )
     ) {
       validations.push(`${block.toolName}: ${target}`);
     }
-    if (block.toolStatus === "failed") {
+    if (block.toolStatus === "failed" || commandFailed) {
       failures.push(`${block.toolName}: ${target}`);
     }
   }

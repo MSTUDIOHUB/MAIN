@@ -1548,6 +1548,51 @@ test("strict repeat guard leaves policy deferrals to protocol no-progress while 
   assert.match(harness.errors[0], /repetition loop/i);
 });
 
+test("repeated-failure policy feedback redirects once and then pauses without a fatal error", () => {
+  const harness = createStrictRepeatGuardHarness("en");
+  harness.callbacks.getIsPlanApproved = () => false;
+  const repeatGuardRecoveredSignatures = new Set();
+  const createCall = (id) => ({
+    id,
+    name: "list_directory",
+    arguments: JSON.stringify({ path: ".missing" }),
+  });
+  const createPolicyResult = (call, qualityGateReason = "repeated_failure_blocked") => ({
+    toolCallId: call.id,
+    name: call.name,
+    target: ".missing",
+    content: "REPEATED_FAILURE_BLOCKED",
+    displayContent: "REPEATED_FAILURE_BLOCKED",
+    isError: false,
+    lifecycleState: "blocked",
+    internalFeedback: true,
+    qualityGateReason,
+  });
+
+  const firstCall = createCall("policy-1");
+  const first = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+    effectiveToolCalls: [firstCall],
+    results: [createPolicyResult(firstCall)],
+    repeatGuardRecoveredSignatures,
+  }));
+  assert.equal(first.status, "continue");
+  assert.equal(harness.appended.length, 1);
+  assert.equal(harness.errors.length, 0);
+
+  const secondCall = createCall("policy-2");
+  const second = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+    effectiveToolCalls: [secondCall],
+    results: [createPolicyResult(secondCall, "repeated_failure_exhausted")],
+    repeatGuardRecoveredSignatures,
+  }));
+  assert.equal(second.status, "stopped");
+  assert.equal(harness.stops.length, 1);
+  assert.equal(harness.stops[0].reason, "no_action");
+  assert.equal(harness.stops[0].metadata.recoveryReason, "repeated_failure_policy_no_progress");
+  assert.equal(harness.errors.length, 0);
+  assert.deepEqual(harness.statuses.slice(-1), ["idle"]);
+});
+
 test("max-iteration checkpoint keeps internal plan files out of project-source evidence", () => {
   const checkpoint = buildPlanMaxIterationsCheckpoint({
     iterationCount: 50,
