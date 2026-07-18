@@ -731,7 +731,7 @@ test("tool result post-processing freezes a semantic evidence bundle before repe
   }]);
 });
 
-test("structural evidence can enter model-authored drafting without enabling deterministic materialization", () => {
+test("structural evidence keeps targeted reads open until a diagnosis rationale is confirmed", () => {
   const harness = createPostProcessingInput({
     workflowMode: "plan",
     turnIntent: "plan",
@@ -759,10 +759,10 @@ test("structural evidence can enter model-authored drafting without enabling det
 
   const post = handleToolResultPostProcessing(harness.input);
 
-  assert.equal(post.planRuntimePhase, "drafting");
+  assert.equal(post.planRuntimePhase, "grounding");
   assert.deepEqual(harness.planRuntimePhases, [{
-    phase: "drafting",
-    reason: "model-authored plan evidence ready",
+    phase: "grounding",
+    reason: "change_targets_lack_confirmed_rationale",
     status: "running",
   }]);
 });
@@ -800,7 +800,7 @@ test("targeted evidence recovery still waits for confirmed closure rationale", (
   assert.deepEqual(harness.planRuntimePhases, []);
 });
 
-test("model-draft evidence recovery accepts the same structural bundle threshold", () => {
+test("model-draft evidence recovery also waits for confirmed closure rationale", () => {
   const harness = createPostProcessingInput({
     workflowMode: "plan",
     turnIntent: "plan",
@@ -829,13 +829,9 @@ test("model-draft evidence recovery accepts the same structural bundle threshold
 
   const post = handleToolResultPostProcessing(harness.input);
 
-  assert.equal(post.planRuntimePhase, "drafting");
+  assert.equal(post.planRuntimePhase, "needs_evidence");
   assert.equal(post.planEvidenceRecoveryObjective, "model_draft");
-  assert.deepEqual(harness.planRuntimePhases, [{
-    phase: "drafting",
-    reason: "model-authored plan evidence ready",
-    status: "running",
-  }]);
+  assert.deepEqual(harness.planRuntimePhases, []);
 });
 
 test("a targeted read leaves structure exploration even before semantic evidence is ready", () => {

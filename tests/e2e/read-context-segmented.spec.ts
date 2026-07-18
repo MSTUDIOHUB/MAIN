@@ -26,7 +26,7 @@ test("read/search progress stays accessible in the continuous process timeline w
   await expect(page.getByText("读取与命令交错完成，命令步骤已折叠保留。")).toBeVisible();
 });
 
-test("model-claimed stage summary stays out of ChatArea while read/search evidence remains available", async ({ page }) => {
+test("runtime narration stays folded while the model-authored assistant update remains visible", async ({ page }) => {
   await page.goto("/?e2eScenario=read-context-agent-segment");
 
   await expect(page.getByTestId("turn-process-archive-toggle")).toHaveCount(0);

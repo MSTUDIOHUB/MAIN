@@ -58,24 +58,6 @@ export function shouldRetainStageSummary(text: string): boolean {
   return normalized.length >= 240 && sentenceCount >= 3;
 }
 
-/**
- * Intermediate execution prose is durable only when it closes an evidence
- * loop and tells the user what follows. A heading such as "stage summary" is
- * not sufficient by itself, and pure future tool narration remains hidden.
- */
-export function isActionableStageSummary(text: string): boolean {
-  const raw = String(text || "").trim();
-  if (!raw || isThinModelToolNarration(raw)) return false;
-  const normalized = raw.replace(/\s+/g, "");
-  const hasFindingOrReason =
-    /(?:已|已经)?(?:确认|发现|定位|验证|证明|排除)|(?:问题|根因|原因|依据|证据|结果|结论|风险|差异|现象)(?:是|为|在于|来自|显示|表明|：|:)|(?:可见|表现|影响)(?:为|是|：|:)/.test(normalized) ||
-    /\b(?:confirmed|found|located|verified|evidence|result|conclusion|root cause|cause|issue|problem|risk|visible symptom|impact)\b/i.test(raw);
-  const hasNextAction =
-    /(?:下一步|接下来|随后|因此将|所以将|将改为|准备)(?:会|将|先|直接|继续)?/.test(normalized) ||
-    /\b(?:next(?: step)?|next,|then|therefore,? (?:i|we|main) will|will now|proceed(?:ing)? to)\b/i.test(raw);
-  return hasFindingOrReason && hasNextAction && normalized.length >= 32;
-}
-
 export function isThinModelToolNarration(text: string): boolean {
   const raw = String(text || "").trim();
   const normalized = raw.replace(/\s+/g, "");

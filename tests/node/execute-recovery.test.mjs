@@ -83,6 +83,7 @@ const {
   isExecutePatchMismatchRecoveryActivity,
   isExecuteRecoveryToolName,
   isReadOnlyNoProgressDetail,
+  normalizeExecutionDecisionCheckpointSnapshot,
   patchRecoveryLeaseIdentityMatches,
   readEvidenceSatisfiesRecoveryLease,
   resolveExecuteRecoveryActionContract,
@@ -117,6 +118,9 @@ const {
   isExecuteRuntimeRequiringEvidence,
   resolveExecuteNoToolCheckpointLimit,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeNoToolRecovery.ts"));
+const {
+  resolveValidationMutationReopen,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantCompletionPhase.ts"));
 
 const {
   handleMaxIterationBoundary,
@@ -2512,7 +2516,7 @@ test("patch recovery without an active read lease returns to the mutation surfac
   ]);
 });
 
-test("direct file modification exposes source tools before structured mutation and validation tools after it", () => {
+test("direct file modification exposes source tools before mutation and only finite validation after it", () => {
   const tools = [
     "spawn_subagent",
     "read_file",
@@ -2572,9 +2576,13 @@ test("direct file modification exposes source tools before structured mutation a
     status: "succeeded",
   }]));
   assert.equal(validation.directFileModifyPhase, "validation");
-  assert.equal(validation.availableToolNames.has("execute_command"), true);
-  assert.equal(validation.availableToolNames.has("get_pty_status"), true);
-  assert.equal(validation.availableToolNames.has("browser_evaluate"), true);
+  assert.deepEqual(
+    validation.iterationAllTools.map((tool) => tool.function.name),
+    ["run_command"],
+  );
+  assert.equal(validation.availableToolNames.has("execute_command"), false);
+  assert.equal(validation.availableToolNames.has("get_pty_status"), false);
+  assert.equal(validation.availableToolNames.has("browser_evaluate"), false);
   assert.equal(validation.availableToolNames.has("web_search"), false);
 });
 
@@ -2660,6 +2668,89 @@ test("a tool outside the current request schema is internal correction, not a vi
   assert.equal(result.preExecutionResults[0].qualityGateReason, "tool_unavailable_for_turn_phase");
   assert.equal(toolDone.length, 1);
   assert.equal(toolErrors.length, 0);
+});
+
+test("finite commands requested through PTY are redirected to run_command without execution failure", async () => {
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "finite-through-pty",
+      name: "execute_command",
+      arguments: JSON.stringify({
+        command: "cargo check",
+        description: "check Rust",
+        cwd: "src-tauri",
+      }),
+    }],
+    availableToolNames: new Set(["execute_command", "run_command"]),
+  }));
+
+  assert.equal(result.writeCalls.length, 0);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.equal(result.preExecutionResults[0].lifecycleState, "blocked");
+  assert.equal(result.preExecutionResults[0].isError, false);
+  assert.equal(result.preExecutionResults[0].qualityGateReason, "finite_command_requires_run_command");
+  assert.match(result.preExecutionResults[0].content, /FINITE_COMMAND_REQUIRES_RUN_COMMAND/);
+});
+
+test("grep_search blocks external paths as policy feedback and points to read_file", async () => {
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "external-grep",
+      name: "grep_search",
+      arguments: JSON.stringify({
+        query: "blocking_pick_files",
+        path: "/Users/example/.cargo/registry/src/dialog/src/lib.rs",
+      }),
+    }],
+    availableToolNames: new Set(["grep_search", "read_file"]),
+  }));
+
+  assert.equal(result.readOnlyCalls.length, 0);
+  assert.equal(result.preExecutionResults[0].lifecycleState, "blocked");
+  assert.equal(result.preExecutionResults[0].isError, false);
+  assert.equal(result.preExecutionResults[0].qualityGateReason, "workspace_search_scope_blocked");
+  assert.match(result.preExecutionResults[0].content, /read_file/);
+});
+
+test("post-repair validation rejects a different command while keeping the exact checkpoint", async () => {
+  const executeRecoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src-tauri/src/main.rs",
+    attempts: 1,
+    iterationCount: 0,
+    decisionCheckpoint: {
+      expectedTarget: "src-tauri/src/main.rs",
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: {
+        command: "cargo check",
+        cwd: "src-tauri",
+      },
+    },
+  };
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "wrong-validation",
+      name: "run_command",
+      arguments: JSON.stringify({
+        command: "cargo test",
+        description: "run a different check",
+        cwd: "src-tauri",
+      }),
+    }],
+    executeRecoveryState,
+    recoveryActionContract: resolveExecuteRecoveryActionContract(
+      executeRecoveryState.mode,
+      executeRecoveryState,
+    ),
+    availableToolNames: new Set(["run_command"]),
+  }));
+
+  assert.equal(result.writeCalls.length, 0);
+  assert.equal(result.preExecutionResults[0].lifecycleState, "blocked");
+  assert.equal(result.preExecutionResults[0].qualityGateReason, "finite_validation_checkpoint_mismatch");
+  assert.match(result.preExecutionResults[0].content, /cargo check/);
 });
 
 test("adaptive delegation exposes spawn only during useful context or diagnosis phases", () => {
@@ -3387,6 +3478,33 @@ test("failed finite validation recovery keeps an exact run_command checkpoint", 
   assert.match(prompt, /finite-command capability only/);
   assert.match(prompt, /cannot replace this command evidence/);
   assert.match(prompt, /exitCode 0/);
+});
+
+test("finite validation checkpoints persist command, cwd, and timeout in the action contract", () => {
+  const checkpoint = normalizeExecutionDecisionCheckpointSnapshot({
+    expectedTarget: "src-tauri/src/main.rs",
+    sourceObservationKey: null,
+    nextRequiredCapability: "validation",
+    pendingFiniteValidation: {
+      command: "cargo check",
+      cwd: "src-tauri/",
+      timeoutMs: 120000,
+    },
+  });
+  assert.deepEqual(checkpoint?.pendingFiniteValidation, {
+    command: "cargo check",
+    cwd: "src-tauri",
+    timeoutMs: 120000,
+  });
+  const contract = resolveExecuteRecoveryActionContract("validation_only", {
+    expectedTarget: checkpoint?.expectedTarget,
+    decisionCheckpoint: checkpoint,
+  });
+  const card = buildExecutionActionContractCard({ contract, language: "en" });
+  assert.match(card, /validationCommand=cargo check/);
+  assert.match(card, /validationCwd=src-tauri/);
+  assert.match(card, /do not substitute a different acceptance boundary/);
+  assert.deepEqual([...contract.allowedToolNames], ["run_command"]);
 });
 
 test("failed finite validation recovery preserves explicit command evidence", () => {
@@ -4803,4 +4921,75 @@ test("segmented recovery reads use ordinary versioned cache eligibility without 
     /tc\.name === "read_file" &&\s*effectiveExecuteRecoveryFileRead\)/,
     "ordinary recovery reads must not bypass path + argument cache signatures",
   );
+});
+
+test("validation reopens mutation once when the provider requested an edit tool", () => {
+  const recoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src/main.js",
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: "src-main-v1",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src-main-v1",
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: { command: "npm test", cwd: "." },
+    },
+  };
+  assert.deepEqual(resolveValidationMutationReopen({
+    recoveryState,
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+  }), { requestedTools: ["replace_in_file"] });
+  assert.equal(resolveValidationMutationReopen({
+    recoveryState: { ...recoveryState, attempts: 2 },
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+  }), null, "a second mutation/validation oscillation stays bounded");
+  assert.equal(resolveValidationMutationReopen({
+    recoveryState,
+    protocolViolation: "required_tool_call_missing",
+    protocolActualTools: [],
+  }), null);
+  assert.equal(resolveValidationMutationReopen({
+    recoveryState,
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["read_file"],
+  }), null);
+});
+
+test("local stream invocation uses required-any instead of named function choice", () => {
+  const source = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
+    "utf8",
+  );
+  assert.match(source, /preferExplicitFunction:\s*config\.activeProfile === "cloud"/);
+  assert.doesNotMatch(source, /preferExplicitFunction:\s*config\.activeProfile === "local"/);
+});
+
+test("recovery action cards retain the original turn objective and finite validation", () => {
+  const contract = resolveExecuteRecoveryActionContract("validation_only", {
+    expectedTarget: "src/main.js",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "source-v1",
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: { command: "npm test", cwd: "." },
+    },
+  });
+  const card = buildExecutionActionContractCard({
+    contract,
+    language: "en",
+    availableToolNames: ["run_command"],
+    turnObjective: "Open the selected Markdown file and remove the inappropriate initial label.",
+  });
+  assert.match(card, /turnObjective=Open the selected Markdown file/);
+  assert.match(card, /validationCommand=npm test/);
+  assert.match(card, /validationCwd=\./);
 });

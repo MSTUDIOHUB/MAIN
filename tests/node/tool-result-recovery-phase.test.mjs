@@ -241,7 +241,7 @@ test("a long-process result atomically narrows the next turn to PTY observation 
   assert.match(phaseSource, /return finish\("continue"\)/);
 });
 
-test("approved Plan finite command failures split invocation recovery from source repair", () => {
+test("Plan and Direct Edit finite command failures split invocation recovery from source repair", () => {
   const appendIndex = phaseSource.indexOf(
     "appendToolResultsToHistory({",
     phaseSource.indexOf("handleNoProgressRecovery({"),
@@ -262,11 +262,20 @@ test("approved Plan finite command failures split invocation recovery from sourc
   assert.match(phaseSource, /resolveFailedFiniteValidationRecoveryPolicy\(\{/);
   assert.match(phaseSource, /buildFailedFiniteValidationRecoveryPrompt\(\{/);
   assert.match(phaseSource, /failedFiniteValidationOutcome === "validation_failure"[\s\S]*?failedFiniteValidationMatchesPendingPlanEvidence\(\{/);
-  assert.match(phaseSource, /buildFailedValidationRepairReadLease\(\{/);
-  assert.match(phaseSource, /"mutation_first",[\s\S]*?repairReadLease \? \{ readLease: repairReadLease \}/);
-  assert.match(phaseSource, /repairReadLease \? \{ sourceObservationKey: null \}/);
-  assert.match(phaseSource, /nextRequiredCapability: repairReadLease \? "targeted_read" : "mutation"/);
+  const sourceRepairBranch = phaseSource.slice(
+    phaseSource.indexOf("const failedValidationMatchesPendingTask"),
+    phaseSource.indexOf("const goalCheckpoint", phaseSource.indexOf("const failedValidationMatchesPendingTask")),
+  );
+  assert.match(sourceRepairBranch, /"mutation_first",\s*"failed_finite_validation_requires_repair"/);
+  assert.match(sourceRepairBranch, /sourceObservationKey: null/);
+  assert.match(sourceRepairBranch, /nextRequiredCapability: "mutation"/);
+  assert.doesNotMatch(sourceRepairBranch, /buildFailedValidationRepairReadLease/);
+  assert.doesNotMatch(sourceRepairBranch, /nextRequiredCapability: "targeted_read"/);
   assert.match(phaseSource, /approved_plan_finite_validation_requires_repair/);
+  assert.match(phaseSource, /direct_edit_finite_validation_recovery/);
+  assert.match(phaseSource, /direct_edit_finite_validation_requires_repair/);
+  assert.match(phaseSource, /resolveFiniteValidationRepairTarget\(\{/);
+  assert.match(sourceRepairBranch, /pendingFiniteValidation/);
   assert.doesNotMatch(
     phaseSource,
     /clearExecuteRecoveryRuntimeState\(executeRecoveryState\)/,

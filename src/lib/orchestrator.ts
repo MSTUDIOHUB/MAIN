@@ -224,6 +224,7 @@ import {
   assessPlanClosureEvidence,
   browserResultLooksSuccessful,
   buildPlanEvidenceBundle,
+  commandResultLooksSuccessful,
   isPlanEvidenceBundleReady,
   type PlanEvidenceBundle,
 } from "./planEvidence";
@@ -1001,16 +1002,53 @@ function sedSegmentMutatesInPlace(args: string[]): boolean {
   );
 }
 
+function grepSegmentHasFileOperand(args: string[]): boolean {
+  let patternConsumed = false;
+  let skipNextOptionValue = false;
+  for (const arg of args) {
+    if (!arg) continue;
+    if (skipNextOptionValue) {
+      skipNextOptionValue = false;
+      continue;
+    }
+    if (arg === "--") continue;
+    if (/^(?:-A|-B|-C|-m|--after-context|--before-context|--context|--max-count|-e|--regexp|-g|--glob|-t|--type|--type-add|--include|--exclude|--exclude-dir)$/.test(arg)) {
+      skipNextOptionValue = true;
+      if (/^(?:-e|--regexp)$/.test(arg)) patternConsumed = true;
+      continue;
+    }
+    if (/^(?:-[ABCm]\d+|--(?:after-context|before-context|context|max-count)=|--(?:glob|type|type-add|include|exclude|exclude-dir)=)/.test(arg)) {
+      continue;
+    }
+    if (/^(?:-e|--regexp)=?.+/i.test(arg)) {
+      patternConsumed = true;
+      continue;
+    }
+    if (/^(?:-f|--file)(?:=|$)/.test(arg)) return true;
+    if (/^-/.test(arg)) continue;
+    if (!patternConsumed) {
+      patternConsumed = true;
+      continue;
+    }
+    return true;
+  }
+  return false;
+}
+
 function isShellFileReadSegment(segment: string): boolean {
   const normalized = normalizeShellReadSegment(segment);
   if (!normalized || isDirectoryOnlyShellSegment(normalized)) return false;
   const [command = "", ...args] = shellSegmentWords(normalized);
-  if (/^(?:cat|head|tail)$/i.test(command)) {
-    return catHeadTailSegmentHasFileOperand(command, args);
+  const commandName = command.replace(/^.*[\\/]/, "");
+  if (/^(?:cat|head|tail)$/i.test(commandName)) {
+    return catHeadTailSegmentHasFileOperand(commandName, args);
   }
-  if (/^sed$/i.test(command)) {
+  if (/^sed$/i.test(commandName)) {
     if (sedSegmentMutatesInPlace(args)) return false;
     return sedSegmentHasFileOperand(args);
+  }
+  if (/^(?:grep|egrep|fgrep|rg|ripgrep)$/i.test(commandName)) {
+    return grepSegmentHasFileOperand(args);
   }
   return false;
 }
@@ -1038,8 +1076,8 @@ export function buildShellReadValidationError(
   if (isShellRead) {
     const language = callbacks.getPreferredLanguage();
     const message = language === "zh"
-      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 绕过文件读取工具。原因不是终端占用上下文，而是 cat/sed/head/tail 的原始输出绕过 read_file 的分页、文件版本、范围缓存和修改后失效语义。请使用 read_file；文件版本变化、新范围、上下文淘汰、补丁失配或修改后核验都允许复读，同版本同窗口仍在上下文时会返回缓存 stub，应直接转向修改、验证或精确阻塞。`
-      : `SHELL_READ_FORBIDDEN: Do not bypass file tools with terminal command (${command}). The issue is not terminal context use: raw cat/sed/head/tail output bypasses read_file paging, version checks, range caching, and post-mutation invalidation. Use read_file instead. A changed version, new range, evicted context, patch mismatch, or post-mutation check permits another read; the same active version/window returns a cache stub and should lead to mutation, validation, or an exact blocker.`;
+      ? `SHELL_READ_FORBIDDEN: 禁止通过终端命令 (${command}) 绕过文件读取工具。原因不是终端占用上下文，而是 cat/sed/head/tail/grep/rg 的文件输出绕过 read_file 的分页、文件版本、范围缓存和修改后失效语义。请使用 read_file；文件版本变化、新范围、上下文淘汰、补丁失配或修改后核验都允许复读，同版本同窗口仍在上下文时会返回缓存 stub，应直接转向修改、验证或精确阻塞。`
+      : `SHELL_READ_FORBIDDEN: Do not bypass file tools with terminal command (${command}). The issue is not terminal context use: file output from cat/sed/head/tail/grep/rg bypasses read_file paging, version checks, range caching, and post-mutation invalidation. Use read_file instead. A changed version, new range, evicted context, patch mismatch, or post-mutation check permits another read; the same active version/window returns a cache stub and should lead to mutation, validation, or an exact blocker.`;
     const target = getToolTarget(tc.name, args);
     callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
     emitToolPreflightBlocked(callbacks, {
@@ -1050,13 +1088,20 @@ export function buildShellReadValidationError(
       toolCallId: tc.id,
       lifecycleState: "blocked",
     });
-    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    callbacks.onToolDone(tc.name, target, message, {
+      toolCallId: tc.id,
+      internalFeedback: true,
+      qualityGateReason: "shell_read_forbidden",
+    });
     return {
       toolCallId: tc.id,
       name: tc.name,
       target,
-      content: `Error: ${message}`,
-      isError: true,
+      content: message,
+      displayContent: message,
+      isError: false,
+      internalFeedback: true,
+      qualityGateReason: "shell_read_forbidden",
       lifecycleState: "blocked",
     };
   }
@@ -1432,7 +1477,7 @@ export interface OrchestratorCallbacks {
     meta?: {
       hasToolCalls?: boolean;
       hiddenThought?: string;
-      visibility?: "user_progress" | "hidden_process" | "stage_summary" | "substantive_plan_text";
+      visibility?: "user_progress" | "hidden_process" | "assistant_update" | "stage_summary" | "substantive_plan_text";
       preserveAssistantText?: boolean;
       capsuleCandidate?: boolean;
       modelAuthored?: boolean;
@@ -3724,6 +3769,36 @@ async function executeToolCallWithLifecycle(
     const displayContent = tc.name === "run_command"
       ? compactStructuredCommandResult(resultStr, budgets.displayChars)
       : truncateToolContent(resultStr, budgets.displayChars);
+
+    if (tc.name === "run_command" && !commandResultLooksSuccessful(tc.name, resultStr)) {
+      callbacks.onToolError(tc.name, target, displayContent, {
+        toolCallId: tc.id,
+        failureKind: "actual",
+      });
+      const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
+        toolName: tc.name,
+        toolArgs: resolvedArgs,
+        toolResult: resultStr,
+        isError: true,
+        workspace,
+        workflowMode: callbacks.getWorkflowMode(),
+        language: callbacks.getPreferredLanguage(),
+        associatedPaths: callbacks.getAssociatedPaths(),
+      });
+      return {
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: modelContent,
+        displayContent,
+        isError: true,
+        lifecycleState: "failed",
+        additionalContexts: [
+          ...preHookResult.additionalContexts,
+          ...postHookResult.additionalContexts,
+        ],
+      };
+    }
 
     const planArtifactSyncCallbacks = {
       onPlanArtifactUpdated: callbacks.onPlanArtifactUpdated,

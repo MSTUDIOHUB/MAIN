@@ -203,3 +203,13 @@ export function buildUnconfirmedPtyCommandError(command: string, output: string)
     "The PTY may be owned by a foreground process. Do not resend it; inspect the existing process or use send_pty_input intentionally."
   );
 }
+
+const PTY_SHELL_LAUNCH_FAILURE_RE = /(?:^|\n)\s*(?:(?:zsh|bash|sh|fish):[^\n]*|(?:cd|env):[^\n]*)(?:command not found|no such file or directory|not a directory|permission denied)[^\n]*/i;
+
+/** Detect only shell-level launch failures, not compiler/application diagnostics. */
+export function buildPtyShellLaunchError(output: string): string | null {
+  const match = String(output || "").match(PTY_SHELL_LAUNCH_FAILURE_RE);
+  if (!match) return null;
+  const detail = match[0].trim().replace(/\s+/g, " ").slice(0, 800);
+  return `PTY_COMMAND_LAUNCH_FAILED: ${detail}`;
+}

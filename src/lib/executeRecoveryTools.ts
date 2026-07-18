@@ -105,6 +105,12 @@ export interface PatchRecoveryMismatchEvidence {
   observedVersion?: string | null;
 }
 
+export interface PendingFiniteValidationCheckpoint {
+  command: string;
+  cwd: string;
+  timeoutMs?: number;
+}
+
 export interface ExecutionDecisionCheckpoint {
   expectedTarget: string | null;
   sourceObservationKey: string | null;
@@ -114,6 +120,8 @@ export interface ExecutionDecisionCheckpoint {
   planTaskId?: string | null;
   /** Stable requirement reference used for diagnostics and legacy task remapping. */
   requirementRef?: string | null;
+  /** Exact finite validation that must succeed after the current repair. */
+  pendingFiniteValidation?: PendingFiniteValidationCheckpoint | null;
 }
 
 export interface ReadProgressFingerprint {
@@ -629,6 +637,27 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
   ]);
   const nextRequiredCapability = candidate.nextRequiredCapability;
   if (!nextRequiredCapability || !capabilities.has(nextRequiredCapability)) return null;
+  const pendingFiniteValidationCandidate = candidate.pendingFiniteValidation;
+  const pendingFiniteValidation = pendingFiniteValidationCandidate &&
+    typeof pendingFiniteValidationCandidate === "object" &&
+    !Array.isArray(pendingFiniteValidationCandidate)
+    ? (() => {
+        const command = String(pendingFiniteValidationCandidate.command || "").trim();
+        if (!command) return null;
+        const cwd = String(pendingFiniteValidationCandidate.cwd || ".")
+          .replace(/\\/g, "/")
+          .replace(/\/+$/, "")
+          .trim() || ".";
+        const timeoutMs = Number(pendingFiniteValidationCandidate.timeoutMs);
+        return {
+          command,
+          cwd,
+          ...(Number.isFinite(timeoutMs) && timeoutMs > 0
+            ? { timeoutMs: Math.floor(timeoutMs) }
+            : {}),
+        };
+      })()
+    : null;
   return {
     expectedTarget: String(candidate.expectedTarget || "").trim() || null,
     sourceObservationKey: String(candidate.sourceObservationKey || "").trim() || null,
@@ -642,6 +671,9 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
     ...(candidate.requirementRef === undefined
       ? {}
       : { requirementRef: String(candidate.requirementRef || "").trim() || null }),
+    ...(candidate.pendingFiniteValidation === undefined
+      ? {}
+      : { pendingFiniteValidation }),
   };
 }
 
@@ -987,6 +1019,8 @@ export function buildExecutionActionContractCard(input: {
   language: "zh" | "en";
   /** Final request surface after Plan, provider-capability, and policy filtering. */
   availableToolNames?: Iterable<string>;
+  /** Canonical user objective retained across recovery phase changes. */
+  turnObjective?: string;
 }): string {
   const { contract } = input;
   const target = contract.expectedTarget || "(current task target)";
@@ -1005,12 +1039,24 @@ export function buildExecutionActionContractCard(input: {
   const hasSourceObservation = observation !== "(none)";
   const planTaskId = contract.decisionCheckpoint?.planTaskId || "(none)";
   const requirementRef = contract.decisionCheckpoint?.requirementRef || "(none)";
+  const turnObjective = String(input.turnObjective || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 900);
+  const pendingFiniteValidation = contract.decisionCheckpoint?.pendingFiniteValidation || null;
   const sourcePhase = contract.phase === "context" || contract.phase === "mutation";
   if (input.language === "zh") {
     return [
       "[EXECUTION_ACTION_CONTRACT]",
       `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
       `planTask=${planTaskId}; requirement=${requirementRef}`,
+      ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
+      ...(pendingFiniteValidation
+        ? [
+            `validationCommand=${pendingFiniteValidation.command}`,
+            `validationCwd=${pendingFiniteValidation.cwd}`,
+          ]
+        : []),
       `availableTools=${tools}`,
       ...(sourcePhase
         ? [
@@ -1023,13 +1069,22 @@ export function buildExecutionActionContractCard(input: {
               : "read_file 当前不可用；从 availableTools 选择 next 能力。",
           ]
         : []),
-      "只调用 availableTools 中能够完成 next 的一个工具；不要重启诊断或请求当前工具面之外的能力。",
+      pendingFiniteValidation && contract.nextRequiredCapability === "validation"
+        ? "只用 run_command 在 validationCwd 重新运行 validationCommand；不要替换验收边界。"
+        : "只调用 availableTools 中能够完成 next 的一个工具；不要重启诊断或请求当前工具面之外的能力。",
     ].join("\n");
   }
   return [
     "[EXECUTION_ACTION_CONTRACT]",
     `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
     `planTask=${planTaskId}; requirement=${requirementRef}`,
+    ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
+    ...(pendingFiniteValidation
+      ? [
+          `validationCommand=${pendingFiniteValidation.command}`,
+          `validationCwd=${pendingFiniteValidation.cwd}`,
+        ]
+      : []),
     `availableTools=${tools}`,
     ...(sourcePhase
       ? [
@@ -1042,7 +1097,9 @@ export function buildExecutionActionContractCard(input: {
             : "read_file is unavailable now; choose the next capability from availableTools.",
         ]
       : []),
-    "Call one tool from availableTools that satisfies next; do not restart diagnosis or request a capability outside the current surface.",
+    pendingFiniteValidation && contract.nextRequiredCapability === "validation"
+      ? "Use run_command in validationCwd to rerun validationCommand; do not substitute a different acceptance boundary."
+      : "Call one tool from availableTools that satisfies next; do not restart diagnosis or request a capability outside the current surface.",
   ].join("\n");
 }
 
@@ -1362,7 +1419,7 @@ export function buildFailedFiniteValidationRecoveryPrompt(input: {
     .trim()
     .slice(0, 1_200);
   return [
-    "FINITE_VALIDATION_RECOVERY: The last `run_command` failed and cannot satisfy the approved Plan's command evidence.",
+    "FINITE_VALIDATION_RECOVERY: The last `run_command` failed and cannot satisfy the current turn's command evidence.",
     `Failed command: ${command}`,
     result ? `Observed result: ${result}` : "Observed result: no usable command output was returned.",
     allowAlternativeCommand

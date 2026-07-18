@@ -229,6 +229,12 @@ export function createAgentLoopRuntimeActions(input: {
         ...(currentRecoveryState.decisionCheckpoint?.requirementRef
           ? { requirementRef: currentRecoveryState.decisionCheckpoint.requirementRef }
           : {}),
+        ...(currentRecoveryState.decisionCheckpoint?.pendingFiniteValidation
+          ? {
+              pendingFiniteValidation:
+                currentRecoveryState.decisionCheckpoint.pendingFiniteValidation,
+            }
+          : {}),
       };
       nextState = registerExecuteRecoveryProtocolNoProgress(
         {

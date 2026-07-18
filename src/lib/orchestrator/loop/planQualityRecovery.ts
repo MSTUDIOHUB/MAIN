@@ -472,10 +472,8 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
     const nextProgressFingerprint = buildPlanEvidenceProgressFingerprint(nextProgressState);
     if (planEvidenceRecoveryObjective === "model_draft" && decisionEvidenceAdvanced) {
       // The finalization surface was reopened for one model-requested read.
-      // Completing that transaction must use the same model-draft threshold
-      // that originally closed the surface. Requiring deterministic closure
-      // here changes the contract mid-flight and turns valid file windows into
-      // a false evidence-exhaustion loop.
+      // Re-enter drafting only when that read closes the same evidence contract
+      // used by plan validation; file/symbol presence alone is not a diagnosis.
       const recoveredClosureAssessment = assessPlanClosureEvidence(
         recoveredModelDraftInput.evidenceBundle,
       );
@@ -496,9 +494,9 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
         semanticFacts: recoveredModelDraftInput.evidenceBundle.facts.length,
         changeTargets: recoveredModelDraftInput.evidenceBundle.changeTargets.length,
       });
-      if (recoveredModelDraftReady) {
+      if (recoveredClosureAssessment.ready) {
         planEvidenceRecoveryObjective = "none";
-        setQualityPhase("drafting", "model-authored evidence recovery complete");
+        setQualityPhase("drafting", "plan closure evidence recovery complete");
         pendingPlanRuntimeRecoveryPrompt = buildPlanEvidenceRecoveryClosurePrompt({
           language: MODEL_CONTROL_LANGUAGE,
           recentToolActivity: recentPlanToolActivity,
@@ -506,15 +504,15 @@ function handlePlanQualityRejections(input: PlanQualityRecoveryInput & {
           missingSections: planLastMissingSections,
         });
       } else {
-        // New source is progress, but it has not yet produced a minimally
-        // grounded model-authored draft bundle. Preserve the original
-        // objective instead of silently escalating to deterministic closure.
+        // New source is progress, but it has not yet connected the objective to
+        // a confirmed rationale. Preserve the read transaction instead of
+        // forcing a speculative draft.
         planClosureEvidenceRecoveryIssued = true;
         planEvidenceRecoveryObjective = "model_draft";
-        setQualityPhase("needs_evidence", "model draft evidence incomplete");
+        setQualityPhase("needs_evidence", recoveredClosureAssessment.reason);
         pendingPlanRuntimeRecoveryPrompt = buildPlanTargetedEvidenceRecoveryPrompt({
           language: MODEL_CONTROL_LANGUAGE,
-          reason: "model draft evidence incomplete",
+          reason: recoveredClosureAssessment.reason,
           trigger: "closed_read_request",
         });
       }

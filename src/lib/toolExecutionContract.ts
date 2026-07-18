@@ -54,12 +54,29 @@ function shellQuote(value: string): string {
   return `'${value.replace(/'/g, "'\\''")}'`;
 }
 
-export function applyShellCwd(command: string, args: Record<string, unknown>): string {
+export function applyShellCwd(
+  command: string,
+  args: Record<string, unknown>,
+  workspace?: string | null,
+): string {
   const cwd = getShellToolCwd(args);
   const cwdError = validateShellToolCwd(cwd);
   if (cwdError) throw new Error(cwdError);
-  if (!cwd || cwd === "." || cwd === "./") return command;
-  return `cd ${shellQuote(cwd)} && ${command}`;
+  const workspaceRoot = String(workspace || "")
+    .replace(/\\/g, "/")
+    .replace(/\/+$/, "")
+    .trim();
+  if (!workspaceRoot) {
+    if (!cwd || cwd === "." || cwd === "./") return command;
+    return `cd ${shellQuote(cwd)} && ${command}`;
+  }
+  const relativeCwd = cwd === "." || cwd === "./"
+    ? ""
+    : cwd.replace(/^\.\//, "").replace(/\/+$/, "");
+  const absoluteCwd = relativeCwd
+    ? `${workspaceRoot}/${relativeCwd}`
+    : workspaceRoot;
+  return `cd ${shellQuote(absoluteCwd)} && ${command}`;
 }
 
 const DANGEROUS_SHELL_PATTERNS = [

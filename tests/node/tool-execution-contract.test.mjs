@@ -61,6 +61,14 @@ test("shell cwd is workspace-relative and can be applied to commands", () => {
     applyShellCwd("npm test", { cwd: "apps/web", description: "Run tests" }),
     "cd 'apps/web' && npm test",
   );
+  assert.equal(
+    applyShellCwd("npm test", { cwd: ".", description: "Run tests" }, "/workspace/project"),
+    "cd '/workspace/project' && npm test",
+  );
+  assert.equal(
+    applyShellCwd("cargo check", { cwd: "src-tauri", description: "Check Rust" }, "/workspace/project"),
+    "cd '/workspace/project/src-tauri' && cargo check",
+  );
 });
 
 test("dangerous shell detection catches destructive command shapes", () => {

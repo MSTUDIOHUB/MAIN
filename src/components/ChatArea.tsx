@@ -3669,18 +3669,24 @@ export default function ChatArea({
         if (idx === finalVisibleAgentIndex) return false;
         if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
         if (Array.isArray(block.options) && block.options.length > 0) return false;
-        // Reviewed Plan text and runtime-classified stage summaries have an
-        // explicit semantic identity. Ordinary execute prose remains process
-        // narration; wording alone cannot promote it into ChatArea.
+        // Reviewed Plan text and model-authored assistant updates have an
+        // explicit semantic identity. Runtime narration remains process-only;
+        // wording heuristics do not decide whether an update is public.
+        const isAssistantUpdate = block.visibility === "assistant_update";
         if (
           block.visibility !== "substantive_plan_text" &&
+          !isAssistantUpdate &&
           block.visibility !== "stage_summary"
         ) return false;
         const text = getAgentVisibleMarkdownText(block);
         const content = String(text || "").trim();
         if (!content) return false;
-        if (!shouldRetainStageSummary(content)) return false;
-        if (shouldSuppressAgentToolEcho(blocks, idx)) return false;
+        // `stage_summary` is retained only for sessions persisted by the
+        // previous lexical classifier. New assistant updates bypass content
+        // guessing because their identity was assigned by the model/runtime
+        // channel before persistence.
+        if (!isAssistantUpdate && !shouldRetainStageSummary(content)) return false;
+        if (!isAssistantUpdate && shouldSuppressAgentToolEcho(blocks, idx)) return false;
         return true;
       })
       .map(({ block }) => block.id));

@@ -21,6 +21,7 @@ const realOmlxRequest =
   process.env.REAL_OMLX_REQUEST ||
   "请修复 src/hooks/useCsvParser.ts，让 CSV creator 字段正确映射为 Dashboard 使用的 creatorName。先生成可审批计划，批准后真实修改并验证。";
 const realOmlxPlanOnly = process.env.REAL_OMLX_PLAN_ONLY === "1";
+const runDirectEditRecovery = process.env.REAL_OMLX_DIRECT_EDIT_RECOVERY === "1";
 const realOmlxFixture = String(process.env.REAL_OMLX_FIXTURE || "csv").trim().toLowerCase();
 const realOmlxMutationFile = String(
   process.env.REAL_OMLX_MUTATION_FILE ||
@@ -202,6 +203,11 @@ test.beforeEach(async ({ page }) => {
     : await fs.mkdtemp(path.join(os.tmpdir(), "e2e-real-omlx-"));
   (page as any).__realOmlxWorkspace = workspace;
   const csvSeedFiles: Record<string, string> = {
+    "package.json": JSON.stringify({
+      name: "csv-direct-edit-recovery-fixture",
+      private: true,
+      scripts: { test: "tsc --noEmit" },
+    }, null, 2) + "\n",
     "src/hooks/useCsvParser.ts": [
       "export interface CsvOrder {",
       "  creator?: string;",
@@ -341,11 +347,26 @@ test.beforeEach(async ({ page }) => {
   await page.exposeFunction("__MAIN_E2E_INSPECT_FIXTURE_MUTATION", async () =>
     await inspectFixtureMutation(workspace)
   );
+  let requireDirectEditRepair = false;
+  await page.exposeFunction("__MAIN_E2E_REQUIRE_DIRECT_EDIT_REPAIR", async () => {
+    requireDirectEditRepair = true;
+  });
   await page.exposeFunction("__MAIN_E2E_RUN_VERIFICATION", async (rawCommand: string) => {
     const command = String(rawCommand || "").trim();
     const mutationState = await inspectFixtureMutation(workspace);
     const isFiniteVerification = isFinitePlanValidationCommand(command);
-    const exitCode = mutationState.satisfied && isFiniteVerification ? 0 : 1;
+    const directEditSource = requireDirectEditRepair && realOmlxFixture === "csv"
+      ? await fs.readFile(path.join(workspace, "src/hooks/useCsvParser.ts"), "utf8")
+      : "";
+    const directEditRepairSatisfied = !requireDirectEditRepair || (
+      /\bsource\??\s*:\s*string\b/.test(directEditSource) &&
+      /\bsource\s*:\s*["']csv["']/.test(directEditSource)
+    );
+    const exitCode = mutationState.satisfied &&
+      isFiniteVerification &&
+      directEditRepairSatisfied
+      ? 0
+      : 1;
     return JSON.stringify({
       command,
       cwd: workspace,
@@ -353,7 +374,12 @@ test.beforeEach(async ({ page }) => {
       stdout: exitCode === 0
         ? `Fresh fixture verification passed: ${mutationState.detail}.`
         : `Fresh fixture verification failed: expected a finite command and ${mutationState.detail}.`,
-      stderr: "",
+      stderr: requireDirectEditRepair && !directEditRepairSatisfied
+        ? [
+            "src/hooks/useCsvParser.ts:8:3 - error TS2741: Property 'source' is missing in normalized CsvOrder.",
+            "Declare source?: string on CsvOrder and return source: 'csv' from normalizeCsvOrder.",
+          ].join("\n")
+        : "",
     });
   });
 
@@ -957,7 +983,19 @@ test.beforeEach(async ({ page }) => {
         return null;
       }
       if (cmd === "shell_permission_preflight") {
-        return { decision: "allow", requiresApproval: false, source: "e2e" };
+        const command = String(args?.command || "");
+        return {
+          command,
+          decision: "allow",
+          source: "e2e",
+          segmentDecisions: [{
+            command,
+            decision: "allow",
+            riskLevel: "low",
+          }],
+          riskLevel: "low",
+          requiresApproval: false,
+        };
       }
       if (cmd === "browser_evaluate") {
         // This fixture validates MAIN's orchestration/evidence contract only.
@@ -1421,6 +1459,86 @@ for (const model of models) {
       planStage: "completed",
     });
     expect(bodyText).not.toMatch(forbiddenChatNoise);
+  });
+
+  test(`real OMLX Direct Edit repairs a failed finite validation with ${model}`, async ({ page }) => {
+    test.skip(!runDirectEditRecovery || realOmlxFixture !== "csv");
+    const workspace = (page as any).__realOmlxWorkspace as string;
+    await page.goto(`/?e2eScenario=real-omlx-plan-flow&model=${encodeURIComponent(model)}`);
+    await page.evaluate(async () => {
+      await (window as any).__MAIN_E2E_REQUIRE_DIRECT_EDIT_REPAIR?.();
+      const bridge = (window as any).__CODELY_E2E__;
+      Promise.resolve(bridge?.sendDirectEditMessage?.(
+        "直接修改 src/hooks/useCsvParser.ts，把 CSV creator 映射为 Dashboard 使用的 creatorName，并用 npm test 验证直到通过。不要生成计划。",
+      )).catch((error) => {
+        bridge.dispatchError = error instanceof Error ? error.message : String(error);
+      });
+    });
+
+    let terminalSnapshot: any = null;
+    await expect.poll(async () => {
+      const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+      if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+      if (snapshot?.isGenerating === false) {
+        terminalSnapshot = snapshot;
+        return "terminal";
+      }
+      return "running";
+    }, { timeout: realOmlxExecutionTimeoutMs }).toBe("terminal");
+    console.log(`[real-omlx-direct-edit:${model}] ${JSON.stringify({
+      currentTurnStatus: terminalSnapshot?.currentTurnStatus,
+      agentStatus: terminalSnapshot?.agentStatus,
+      toolBlocks: terminalSnapshot?.toolBlocks,
+      debugTail: terminalSnapshot?.debugTail,
+    }).slice(-40_000)}`);
+    expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
+
+    const source = await fs.readFile(
+      path.join(workspace, "src/hooks/useCsvParser.ts"),
+      "utf8",
+    );
+    expect(source).toMatch(/\bcreatorName\s*:/);
+    expect(source).toMatch(/\bsource\??\s*:\s*string\b/);
+    expect(source).toMatch(/\bsource\s*:\s*["']csv["']/);
+
+    const snapshot = terminalSnapshot;
+    const runtimeEvents = (snapshot?.debugTail || []).map((entry: { source?: string; message?: string }) => {
+      try {
+        return { source: entry.source, ...JSON.parse(String(entry.message || "{}")) };
+      } catch {
+        return { source: entry.source, message: entry.message };
+      }
+    });
+    const failedValidationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>) =>
+      entry.source === "store.tool_result" &&
+      entry.toolName === "run_command" &&
+      entry.isError === true
+    );
+    const repairMutationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>, index: number) =>
+      index > failedValidationIndex &&
+      entry.source === "store.tool_result" &&
+      ["apply_patch", "replace_in_file", "write_file"].includes(String(entry.toolName || "")) &&
+      entry.isError === false
+    );
+    const successfulValidationIndex = runtimeEvents.findIndex((entry: Record<string, unknown>, index: number) =>
+      index > repairMutationIndex &&
+      entry.source === "store.tool_result" &&
+      entry.toolName === "run_command" &&
+      entry.isError === false
+    );
+    expect(failedValidationIndex).toBeGreaterThanOrEqual(0);
+    expect(repairMutationIndex).toBeGreaterThan(failedValidationIndex);
+    expect(successfulValidationIndex).toBeGreaterThan(repairMutationIndex);
+    expect(runtimeEvents.some((entry: Record<string, unknown>) =>
+      entry.source === "agent.tool_calls_detected" &&
+      Array.isArray(entry.names) &&
+      entry.names.includes("execute_command")
+    )).toBe(false);
+
+    const debugText = JSON.stringify(snapshot?.debugTail || []);
+    expect(debugText).toMatch(/direct_edit_finite_validation_requires_repair/);
+    expect(debugText).toMatch(/recovery_mutation_observed/);
+    expect(debugText).not.toMatch(/repeated_failure_policy_no_progress/);
   });
 
   test(`real OMLX Goal Runtime completes with evidence or pauses safely with ${model}`, async ({ page }) => {

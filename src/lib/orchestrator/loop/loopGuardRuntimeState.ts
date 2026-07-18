@@ -102,3 +102,19 @@ export function applyToolFailureSignatureRuntimeState(
   }
   return state;
 }
+
+/** A real structured mutation starts a new read/fix/verify progress epoch. */
+export function resetLoopGuardRuntimeStateAfterMutation(
+  state: AgentLoopGuardRuntimeState,
+): AgentLoopGuardRuntimeState {
+  state.lastNoProgressBatchSignature = "";
+  state.noProgressBatchRepeatCount = 0;
+  state.consecutiveReadFileOnlyCacheHits = 0;
+  state.lastReadFileOnlyObservationSignature = "";
+  state.recentToolCalls.length = 0;
+  state.recentTargetToolCalls.length = 0;
+  state.repeatGuardRecoveredSignatures.clear();
+  state.targetProgressGuardRecoveredSignatures.clear();
+  state.failedToolCallCounts.clear();
+  return state;
+}

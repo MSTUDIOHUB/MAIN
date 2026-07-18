@@ -57,6 +57,7 @@ const {
   applyToolFailureSignatureRuntimeState,
   createAgentLoopGuardRuntimeState,
   getNoProgressTrackingRuntimeState,
+  resetLoopGuardRuntimeStateAfterMutation,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/loopGuardRuntimeState.ts"),
 );
@@ -172,6 +173,33 @@ test("tool failure signatures use semantic command outcomes and preserve PTY run
     }],
   });
   assert.equal(state.failedToolCallCounts.has(signature), false);
+});
+
+test("a durable mutation starts a fresh loop-guard progress epoch", () => {
+  const state = createAgentLoopGuardRuntimeState();
+  state.lastNoProgressBatchSignature = "run_command:npm-test";
+  state.noProgressBatchRepeatCount = 2;
+  state.consecutiveReadFileOnlyCacheHits = 3;
+  state.lastReadFileOnlyObservationSignature = "read:src/App.tsx";
+  state.recentToolCalls.push({ name: "run_command", argsKey: "npm test" });
+  state.recentTargetToolCalls.push({ name: "apply_patch", targetKey: "src/App.tsx", family: "edit" });
+  state.repeatGuardRecoveredSignatures.add("repeat");
+  state.targetProgressGuardRecoveredSignatures.add("target");
+  state.failedToolCallCounts.set("run_command:npm-test", 2);
+
+  const next = resetLoopGuardRuntimeStateAfterMutation(state);
+  assert.equal(next, state);
+  assert.deepEqual(getNoProgressTrackingRuntimeState(next), {
+    lastNoProgressBatchSignature: "",
+    noProgressBatchRepeatCount: 0,
+    consecutiveReadFileOnlyCacheHits: 0,
+    lastReadFileOnlyObservationSignature: "",
+  });
+  assert.equal(next.recentToolCalls.length, 0);
+  assert.equal(next.recentTargetToolCalls.length, 0);
+  assert.equal(next.repeatGuardRecoveredSignatures.size, 0);
+  assert.equal(next.targetProgressGuardRecoveredSignatures.size, 0);
+  assert.equal(next.failedToolCallCounts.size, 0);
 });
 
 test("browser readiness preflight blocks do not poison real browser failure counts", () => {

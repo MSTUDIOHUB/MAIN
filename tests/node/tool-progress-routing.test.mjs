@@ -159,7 +159,7 @@ test("tool progress presentation marks runtime narration as user progress", () =
   assert.equal(decision.modelAuthored, false);
 });
 
-test("tool progress presentation hides approved execution model narration", () => {
+test("tool progress presentation gives model-authored reporting an assistant update identity", () => {
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 1,
     unsupportedToolCallCount: 0,
@@ -168,18 +168,18 @@ test("tool progress presentation hides approved execution model narration", () =
     workflowMode: "plan",
     isPlanApproved: true,
     runtimeNarrationInjected: false,
-    visibleAssistantText: "I will patch the source now.",
+    visibleAssistantText: "The file-open callback reaches openFiles, so I am checking the backend command registration before choosing the repair boundary.",
     shouldSuppressApprovedPlanNoToolText: false,
   });
 
   assert.equal(decision.shouldRenderToolProgress, true);
-  assert.equal(decision.shouldPreserveApprovedExecutionText, false);
-  assert.equal(decision.visibility, "hidden_process");
+  assert.equal(decision.shouldPreserveApprovedExecutionText, true);
+  assert.equal(decision.visibility, "assistant_update");
   assert.equal(decision.capsuleCandidate, false);
   assert.equal(decision.modelAuthored, true);
 });
 
-test("tool progress presentation retains an evidence-backed stage summary with a next action", () => {
+test("assistant update identity does not depend on finding or next-step keywords", () => {
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 1,
     unsupportedToolCallCount: 0,
@@ -188,11 +188,11 @@ test("tool progress presentation retains an evidence-backed stage summary with a
     workflowMode: "edit",
     isPlanApproved: false,
     runtimeNarrationInjected: false,
-    visibleAssistantText: "已确认问题来自恢复阶段错误暴露了源码读取工具，用户因此只能看到重复读取。下一步将把 stopped PTY 的工具面收敛为状态检查和重新启动。",
+    visibleAssistantText: "前端回调会把选择结果交给 openFiles；我正在对照后端命令注册，判断文件内容能否回传。",
     shouldSuppressApprovedPlanNoToolText: false,
   });
 
-  assert.equal(decision.visibility, "stage_summary");
+  assert.equal(decision.visibility, "assistant_update");
   assert.equal(decision.shouldPreserveApprovedExecutionText, true);
 });
 

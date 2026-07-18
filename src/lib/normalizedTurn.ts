@@ -527,6 +527,9 @@ export function normalizeAssistantTurn(
     toolCalls,
     finishReason: result.finishReason,
     ...(result.protocolViolation ? { protocolViolation: result.protocolViolation } : {}),
+    ...(result.protocolExpectedTool ? { protocolExpectedTool: result.protocolExpectedTool } : {}),
+    ...(result.protocolActualTools ? { protocolActualTools: [...result.protocolActualTools] } : {}),
+    ...(result.protocolAllowedTools ? { protocolAllowedTools: [...result.protocolAllowedTools] } : {}),
   };
 }
 

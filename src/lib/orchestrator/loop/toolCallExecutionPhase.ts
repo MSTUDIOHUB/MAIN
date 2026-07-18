@@ -121,6 +121,9 @@ function buildReadProgressFingerprint(
         checkpoint.evidenceVersion || "",
         checkpoint.planTaskId || "",
         checkpoint.requirementRef || "",
+        checkpoint.pendingFiniteValidation?.command || "",
+        checkpoint.pendingFiniteValidation?.cwd || "",
+        checkpoint.pendingFiniteValidation?.timeoutMs || "",
       ].join(":")
     : "none";
   const phase = resolveExecuteRecoveryActionContract(state.mode, {

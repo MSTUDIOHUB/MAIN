@@ -156,7 +156,9 @@ test("buildShellReadValidationError blocks shell file reads but permits in-place
   }, callbacks);
 
   assert.ok(errCat);
-  assert.equal(errCat.isError, true);
+  assert.equal(errCat.isError, false);
+  assert.equal(errCat.lifecycleState, "blocked");
+  assert.equal(errCat.internalFeedback, true);
   assert.match(errCat.content, /SHELL_READ_FORBIDDEN/);
   assert.match(errCat.content, /请使用 read_file|Use read_file instead/);
   assert.match(errCat.content, /文件版本变化、新范围、上下文淘汰、补丁失配或修改后核验|changed version, new range, evicted context, patch mismatch, or post-mutation check/);
@@ -184,7 +186,12 @@ test("isShellFileReadCommand detects read commands after directory changes", () 
   assert.equal(isShellFileReadCommand("sed --in-place=.bak 's/a/b/g' src/App.tsx"), false);
   assert.equal(isShellFileReadCommand("sed -Ei 's/a/b/g' src/App.tsx"), false);
   assert.equal(isShellFileReadCommand("cd /tmp/project && npm run build"), false);
-  assert.equal(isShellFileReadCommand("grep -n \"loadOrders\" src/App.tsx"), false);
+  assert.equal(isShellFileReadCommand("grep -n \"loadOrders\" src/App.tsx"), true);
+  assert.equal(isShellFileReadCommand("grep -e\"loadOrders\" src/App.tsx"), true);
+  assert.equal(isShellFileReadCommand("grep --regexp=loadOrders src/App.tsx"), true);
+  assert.equal(isShellFileReadCommand("rg -n \"loadOrders\" src"), true);
+  assert.equal(isShellFileReadCommand("cargo check 2>&1 | grep \"error\""), false);
+  assert.equal(isShellFileReadCommand("printf '%s\\n' ok | rg \"ok\""), false);
 });
 
 test("orchestrator reports shell-read misuse before shell metadata errors", () => {

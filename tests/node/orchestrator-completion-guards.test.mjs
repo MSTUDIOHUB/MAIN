@@ -226,6 +226,15 @@ test("completion guard maps non-actionable stops to structured loop outcomes", (
       reason: "preapproval_plan_quality_recovery_stream_timeout",
     },
   );
+  assert.deepEqual(
+    resolveNonActionableStopOutcome("missing_tool_loop", {
+      recoveryReason: "required_tool_call_protocol_violation_after_change",
+    }),
+    {
+      status: "paused",
+      reason: "required_tool_call_protocol_violation_after_change",
+    },
+  );
 });
 
 test("execution evidence completion guard pauses completed execute turns without evidence", () => {
@@ -369,7 +378,7 @@ test("execution evidence completion guard rejects mutation without later validat
   });
 
   assert.deepEqual(result, {
-    status: "stopped_no_action",
+    status: "paused",
     reason: "execution_evidence_gap:validation_after_mutation_required",
   });
   assert.match(events.stops[0].message, /最新修改之后没有可信/);
@@ -858,13 +867,13 @@ test("approved plan completion keeps user review advisory without disabling auto
   });
 
   assert.deepEqual(result, {
-    status: "stopped_no_action",
+    status: "paused",
     reason: "approved_plan_completion_guard",
   });
   assert.equal(events.stops.length, 1);
   assert.equal(
     events.stops[0].progress.recoveryReason,
-    "approved_plan_completion_guard_no_evidence",
+    "approved_plan_completion_guard_incomplete_after_change",
   );
 
   const automaticValidation = {

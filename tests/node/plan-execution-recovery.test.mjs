@@ -1398,7 +1398,7 @@ test("approved plan finalization does not publish completed while recovery is ac
   assert.match(harness.appended.at(-1)?.content || "", /active_recovery:validation_only/);
 });
 
-test("strict repeat guard recovers repeated read-only shell inspection and marks the signature failed", () => {
+test("strict repeat guard redirects repeated successful shell inspection without rewriting it as failed", () => {
   const harness = createStrictRepeatGuardHarness("en");
   const recentToolCalls = [];
   const failedToolCallCounts = new Map();
@@ -1419,8 +1419,8 @@ test("strict repeat guard recovers repeated read-only shell inspection and marks
   assert.equal(result.status, "continue");
   assert.equal(harness.appended.length, 1);
   assert.match(harness.appended[0].content, /System:/);
-  assert.equal(harness.toolErrors.length, 1);
-  assert.deepEqual([...failedToolCallCounts.values()], [3]);
+  assert.equal(harness.toolErrors.length, 0);
+  assert.deepEqual([...failedToolCallCounts.values()], []);
 });
 
 test("strict repeat guard pauses repeated approved-plan browser validation after one recovery", () => {
@@ -1442,7 +1442,7 @@ test("strict repeat guard pauses repeated approved-plan browser validation after
   }
 
   assert.equal(result.status, "continue");
-  assert.equal(harness.toolErrors.length, 1);
+  assert.equal(harness.toolErrors.length, 0);
 
   for (let i = 0; i < 3; i += 1) {
     result = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {

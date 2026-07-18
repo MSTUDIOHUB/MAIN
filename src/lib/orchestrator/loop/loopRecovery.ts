@@ -834,7 +834,6 @@ export function handleStrictRepeatGuardRecovery(input: {
   results: ToolExecutionResult[];
   recentToolCalls: Array<{ name: string; argsKey: string }>;
   repeatGuardRecoveredSignatures: Set<string>;
-  failedToolCallCounts: Map<string, number>;
   recentPlanToolActivity: PlanToolActivitySummary[];
   availableToolNames: Set<string>;
   toolCapabilityRegistry: ToolCapabilityRegistry;
@@ -850,7 +849,6 @@ export function handleStrictRepeatGuardRecovery(input: {
     results,
     recentToolCalls,
     repeatGuardRecoveredSignatures,
-    failedToolCallCounts,
     recentPlanToolActivity,
     availableToolNames,
     toolCapabilityRegistry,
@@ -945,11 +943,7 @@ export function handleStrictRepeatGuardRecovery(input: {
         availableToolNames,
       );
       repeatGuardRecoveredSignatures.add(repeatCheck.signature);
-      if (readOnlyShellInspection) {
-        failedToolCallCounts.set(repeatCheck.signature, 3);
-      }
       recentToolCalls.length = 0;
-      callbacks.onToolError(toolCall.name, target, recoveryMessage, { toolCallId: toolCall.id });
       callbacks.appendMessage({
         role: "system",
         content: `[System: ${recoveryMessage}]`,
@@ -967,7 +961,6 @@ export function handleStrictRepeatGuardRecovery(input: {
       if (!repeatGuardRecoveredSignatures.has(repeatCheck.signature)) {
         repeatGuardRecoveredSignatures.add(repeatCheck.signature);
         recentToolCalls.length = 0;
-        callbacks.onToolError(toolCall.name, target, recoveryMessage, { toolCallId: toolCall.id });
         callbacks.appendMessage({
           role: "system",
           content: `[System: ${recoveryMessage}]`,

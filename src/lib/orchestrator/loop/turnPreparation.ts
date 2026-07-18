@@ -305,6 +305,11 @@ export function createSystemPromptApplier(input: {
 
   const applySystemPromptForRuntime = (runtimeIntent: ResolvedUserIntent, tools: ToolDefinition[]) => {
     const availableToolNameList = tools.map((tool) => tool.function.name);
+    const toolSchemaFingerprint = tools.map((tool) => {
+      const properties = Object.keys(tool.function.parameters?.properties || {}).join(",");
+      const required = (tool.function.parameters?.required || []).join(",");
+      return `${tool.function.name}(${properties})[${required}]`;
+    }).join(";");
     const approvedPlanExpectations = resolveApprovedPlanTurnExpectations({
       planApproved: callbacks.getIsPlanApproved(),
       tasks: callbacks.getPlanTasks(),
@@ -357,7 +362,7 @@ export function createSystemPromptApplier(input: {
       modelProtocolProfile.providerFamily,
       modelProtocolProfile.reasoning,
       modelProtocolProfile.notes.join(","),
-      availableToolNameList.join(","),
+      toolSchemaFingerprint,
       visualObservationRequest?.turnId || "no-visual-turn",
       visualObservationRequest?.imageCount || 0,
     ].join("|");
@@ -421,6 +426,7 @@ export function createSystemPromptApplier(input: {
           compatibilityForcedAtStart,
         ),
         modelProtocolNotes: modelProtocolProfile.notes,
+        toolDefinitions: tools,
       },
       effectiveTurnContract,
       goalTurnContract,

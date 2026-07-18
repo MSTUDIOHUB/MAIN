@@ -242,7 +242,11 @@ export async function invokeInitialStreamForIteration(input: {
     executeRecoveryMode,
     llmToolNames: llmTools.map((tool) => tool.function.name),
     forceXmlTools,
-    preferExplicitFunction: config.activeProfile === "local",
+    // Local OpenAI-compatible servers often accept tool_choice="required"
+    // but ignore or mishandle the named-function object. Recovery already
+    // narrows the schema surface, so required-any is both sufficient and more
+    // portable locally. Keep explicit named choice for compatible cloud paths.
+    preferExplicitFunction: config.activeProfile === "cloud",
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
     recoveryActionContract,

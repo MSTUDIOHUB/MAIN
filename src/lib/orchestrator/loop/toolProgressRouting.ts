@@ -1,5 +1,4 @@
 import { isPreApprovalPlanDraftWrite, parseToolCallArguments } from "../../orchestrator";
-import { isActionableStageSummary } from "../../modelFeedbackDedupe";
 import type { LegacyWorkflowMode } from "../../runIntent";
 import { looksLikeSubstantivePlanAssistantText } from "../../workflowModels";
 import type { ToolCallToExecute } from "../types";
@@ -14,7 +13,7 @@ export interface ToolProgressRoutingDecision {
 export interface ToolProgressPresentationDecision {
   shouldRenderToolProgress: boolean;
   shouldPreserveApprovedExecutionText: boolean;
-  visibility: "substantive_plan_text" | "stage_summary" | "user_progress" | "hidden_process" | undefined;
+  visibility: "substantive_plan_text" | "assistant_update" | "user_progress" | "hidden_process" | undefined;
   capsuleCandidate: boolean;
   modelAuthored: boolean;
 }
@@ -102,24 +101,23 @@ export function resolveToolProgressPresentation(input: {
     shouldRenderToolProgress &&
     !input.runtimeNarrationInjected &&
     input.visibleAssistantText.trim().length > 0;
-  const actionableStageSummary =
-    modelAuthoredToolNarration &&
-    isActionableStageSummary(input.visibleAssistantText);
   const unsupportedOnlyToolNarration =
     input.unsupportedToolCallCount > 0 &&
     input.progressEligibleToolCallCount === 0;
-  // Pure tool narration remains process-only. A compact evidence-backed
-  // finding that also names the next action is a durable stage summary and may
-  // stay in ChatArea; unsupported-tool corrections never qualify.
-  const shouldPreserveApprovedExecutionText = actionableStageSummary;
+  // Model-authored prose emitted with a real tool call is the assistant's
+  // public update channel. Runtime-injected tool narration and unsupported-tool
+  // corrections remain process-only; the UI must not infer this identity from
+  // words such as "confirmed" or "next".
+  const assistantUpdate = modelAuthoredToolNarration && !unsupportedOnlyToolNarration;
+  const shouldPreserveApprovedExecutionText = assistantUpdate;
 
   return {
     shouldRenderToolProgress,
     shouldPreserveApprovedExecutionText,
     visibility: input.hasSubstantivePlanAssistantText
       ? "substantive_plan_text"
-      : actionableStageSummary
-      ? "stage_summary"
+      : assistantUpdate
+      ? "assistant_update"
       : unsupportedOnlyToolNarration
       ? "hidden_process"
       : modelAuthoredToolNarration

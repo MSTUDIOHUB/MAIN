@@ -1065,7 +1065,7 @@ export function buildPlanMaxIterationsPauseNotice(
     return [
       `计划执行已暂停：连续第 ${checkpoint.iterationCount}/${checkpoint.maxIterations} 轮后仍未闭环。`,
       checkpoint.autoResumeEligible
-        ? "MAIN 已经自动恢复过一次，为避免无限循环，这次停在可恢复状态。"
+        ? "自上次获得新执行证据后，MAIN 已经自动恢复过一次；为避免无进展循环，这次停在可恢复状态。"
         : "本轮没有检测到可信写入、命令或验收进展，MAIN 不会自动开启另一个循环。",
       "",
       "RecoveryDetails:",
@@ -1089,7 +1089,7 @@ export function buildPlanMaxIterationsPauseNotice(
   return [
     `Plan execution paused after ${checkpoint.iterationCount}/${checkpoint.maxIterations} iterations without closure.`,
     checkpoint.autoResumeEligible
-      ? "MAIN has already auto-resumed once, so it is stopping here to avoid an infinite loop."
+      ? "MAIN has already auto-resumed once since the last fresh execution evidence, so it is stopping here to avoid a no-progress loop."
       : "This run produced no trusted write, command, or validation progress, so MAIN will not start another automatic loop.",
     "",
     "RecoveryDetails:",

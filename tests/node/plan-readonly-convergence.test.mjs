@@ -969,7 +969,7 @@ test("plan quality recovery keeps tools open when a successful read still lacks 
   }]);
 });
 
-test("missing-visible-plan recovery retries an unchanged window, then accepts a fresh window without a read-count charge", () => {
+test("missing-visible-plan recovery accepts a fresh window as progress without closing an unproven diagnosis", () => {
   const harness = createPlanConvergenceCallbacks("zh");
   const phases = [];
   const recentActivity = [
@@ -1072,12 +1072,12 @@ test("missing-visible-plan recovery retries an unchanged window, then accepts a 
 
   assert.equal(completed.planEvidenceRecoveryPasses, 0);
   assert.equal(completed.planEvidenceNoProgressPasses, 0);
-  assert.equal(completed.planClosureEvidenceRecoveryIssued, false);
-  assert.equal(completed.planEvidenceRecoveryObjective, "none");
-  assert.match(completed.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_EVIDENCE_RECOVERY_COMPLETE/);
+  assert.equal(completed.planClosureEvidenceRecoveryIssued, true);
+  assert.equal(completed.planEvidenceRecoveryObjective, "model_draft");
+  assert.match(completed.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_TARGETED_EVIDENCE_RECOVERY/);
   assert.deepEqual(phases.at(-1), {
-    phase: "drafting",
-    reason: "model-authored evidence recovery complete",
+    phase: "needs_evidence",
+    reason: "change_targets_lack_confirmed_rationale",
     status: "running",
   });
 });
@@ -1260,7 +1260,7 @@ test("fresh but insufficient model-draft evidence preserves the model-draft obje
   assert.match(result.pendingPlanRuntimeRecoveryPrompt || "", /PLAN_TARGETED_EVIDENCE_RECOVERY/);
   assert.deepEqual(phases.at(-1), {
     phase: "needs_evidence",
-    reason: "model draft evidence incomplete",
+    reason: "bundle_not_ready",
     status: "running",
   });
 });

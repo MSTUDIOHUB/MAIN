@@ -160,12 +160,12 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "grep_search",
-      description: "在特定目录快速正则搜索文本，无需读取完整文件内容。",
+      description: "仅在当前工作区内快速正则搜索文本，无需读取完整文件内容。不能搜索工作区外路径；已知的外部依赖文件请用 read_file 精确读取。",
       parameters: {
         type: "object",
         properties: {
           query: { type: "string", description: "正则搜索表达式" },
-          path: { type: "string", description: "要搜索的目录，默认为 ." },
+          path: { type: "string", description: "工作区相对目录，默认为 .；禁止绝对路径和 .." },
         },
         required: ["query"],
       },
@@ -438,7 +438,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "replace_in_file",
-      description: "局部修改文件。精确替换旧代码块。触发 UI 审查。",
+      description: "Replace one exact text block in an existing file and return a structured diff. Use the schema keys path, search_text, and replace_text exactly; search_text must match the current file verbatim.",
       parameters: {
         type: "object",
         properties: {
@@ -469,11 +469,11 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "apply_patch",
-      description: "使用 Codex 风格补丁修改工作区文件，也兼容常见 ---/+++ unified diff。适合多处精确编辑，比 replace_in_file 更稳；触发 UI 审查并展示 diff。",
+      description: "Apply a structured workspace patch and return changed paths plus diff evidence. Prefer Codex patch syntax with exactly one *** Begin Patch and one *** End Patch wrapper; put no stray patch markers outside that wrapper.",
       parameters: {
         type: "object",
         properties: {
-          patch: { type: "string", description: "补丁文本，优先使用 *** Begin Patch / *** End Patch；也可使用 --- a/file +++ b/file 的 unified diff" },
+          patch: { type: "string", description: "Complete patch text. Example: *** Begin Patch\n*** Update File: src/example.ts\n@@\n-old\n+new\n*** End Patch. A standard ---/+++ unified diff is also accepted." },
         },
         required: ["patch"],
       },

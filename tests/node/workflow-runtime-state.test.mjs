@@ -107,7 +107,8 @@ test("chat rendering keeps substantive intermediate conclusions out of process a
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
 
   assert.match(source, /hasSubstantiveIntermediateAgentText/);
-  assert.match(source, /shouldRetainStageSummary\(content\)/);
+  assert.match(source, /block\.visibility === "assistant_update"/);
+  assert.match(source, /!isAssistantUpdate && !shouldRetainStageSummary\(content\)/);
   assert.match(source, /!hasSubstantiveIntermediateAgentText/);
   assert.doesNotMatch(source, /if \(isTransparentToolNarrationBlock\(block\)\) return false;/);
 });
@@ -140,6 +141,8 @@ test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks"
 
   assert.match(source, /createPlanExecutionEvidenceEntry/);
   assert.match(source, /appendPlanEvidenceEntry/);
+  assert.match(source, /const gainedDurableExecutionEvidence = nextLedger !== currentLedger/);
+  assert.match(source, /gainedDurableExecutionEvidence \? \{ planAutoResumeCount: 0 \} : \{\}/);
   assert.match(source, /reconcilePlanTaskCompletion/);
   assert.match(source, /const unownedEntry = createPlanExecutionEvidenceEntry/);
   assert.match(source, /const operationOutcome = classifyCommandResultOutcome/);
@@ -1048,7 +1051,8 @@ test("approved plan no-tool turns use evidence recovery, the active contract, th
   assert.match(executeNoToolRecoverySource, /required_tool_call_protocol_violation/);
   assert.match(executeNoToolRecoverySource, /availableTools: Array\.from\(availableToolNames\)/);
   assert.match(guardsSource, /approved_plan_completion_guard_no_evidence/);
-  assert.match(guardsSource, /return \{ status: "stopped_no_action", reason: "approved_plan_completion_guard" \}/);
+  assert.match(guardsSource, /status: sawExecutionEvidence \? "paused" : "stopped_no_action"/);
+  assert.match(guardsSource, /approved_plan_completion_guard_incomplete_after_change/);
   assert.match(workflowEngine, /progress\?\.recoveryReason === "approved_plan_completion_guard_no_evidence"[\s\S]*?"stopped_no_action"/);
   assert.match(workflowEngine, /const stopBlock = \{/);
   assert.match(workflowEngine, /type: "system"/);
@@ -1136,7 +1140,7 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(workflowEngine, /currentTurnExecutionConsent/);
 });
 
-test("workflow engine owns one hidden auto-resume at max-iteration checkpoints", () => {
+test("workflow engine owns one hidden auto-resume between fresh evidence checkpoints", () => {
   const source = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",

@@ -620,6 +620,9 @@ export interface NormalizedStreamState {
     | "required_tool_call_missing"
     | "required_function_call_mismatch"
     | "required_tool_call_not_available";
+  protocolExpectedTool?: string;
+  protocolActualTools?: string[];
+  protocolAllowedTools?: string[];
 }
 
 // endregion

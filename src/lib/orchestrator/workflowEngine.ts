@@ -2344,7 +2344,9 @@ export class WorkflowEngine {
             ["pending", "running", "executed"],
             lifecycleMeta,
           );
-          const nextLedger = appendPlanEvidenceEntry(s.planExecutionEvidenceLedger || [], entry);
+          const currentLedger = s.planExecutionEvidenceLedger || [];
+          const nextLedger = appendPlanEvidenceEntry(currentLedger, entry);
+          const gainedDurableExecutionEvidence = nextLedger !== currentLedger;
           const nextTasks = reconcilePlanTaskCompletion(
             s.planTasks || [],
             s.planTasks || [],
@@ -2364,6 +2366,10 @@ export class WorkflowEngine {
             planExecutionEvidenceLedger: nextLedger,
             planExecutionEvidenceCount: nextLedger.length,
             planTasks: nextTasks,
+            // This is a consecutive no-progress checkpoint budget, not a
+            // lifetime task limit. Fresh durable evidence earns another
+            // context rotation when unfinished work remains.
+            ...(gainedDurableExecutionEvidence ? { planAutoResumeCount: 0 } : {}),
           };
           if (existingIndex < 0) return evidencePatch;
 
@@ -3399,6 +3405,10 @@ export class WorkflowEngine {
           ? "stopped_no_output"
           : progress?.recoveryReason === "approved_plan_completion_guard_no_evidence"
           ? "stopped_no_action"
+          : progress?.recoveryReason === "required_tool_call_protocol_violation_after_change" ||
+            progress?.recoveryReason === "execute_no_action_after_change" ||
+            progress?.recoveryReason?.startsWith("execution_evidence_gap:")
+          ? "paused"
           : reason === "incomplete_plan"
           ? "paused"
           : "stopped_no_action";

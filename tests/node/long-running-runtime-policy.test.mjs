@@ -912,6 +912,27 @@ test("PTY command output does not treat terminal echo as successful shell execut
   );
 });
 
+test("PTY command launch failures are errors without treating application diagnostics as shell failures", () => {
+  assert.match(
+    ptyCommandRuntime.buildPtyShellLaunchError(
+      "zsh: command not found: vite",
+    ) || "",
+    /PTY_COMMAND_LAUNCH_FAILED/,
+  );
+  assert.match(
+    ptyCommandRuntime.buildPtyShellLaunchError(
+      "cd: no such file or directory: src-tauri",
+    ) || "",
+    /PTY_COMMAND_LAUNCH_FAILED/,
+  );
+  assert.equal(
+    ptyCommandRuntime.buildPtyShellLaunchError(
+      "error[E0599]: no method named `into_path` found for struct Vec<FilePath>",
+    ),
+    null,
+  );
+});
+
 test("agent tool surface no longer exposes destructive PTY buffer clearing", () => {
   const toolSchemas = loadTs(path.join(workspaceRoot, "src/lib/toolSchemas.ts"));
   const names = toolSchemas.TOOL_DEFINITIONS.map((tool) => tool.function.name);

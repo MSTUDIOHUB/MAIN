@@ -271,11 +271,9 @@ export function handleToolResultPostProcessing(input: {
   ) {
     // Evidence convergence is a runtime decision, not a model/iteration-count
     // decision. Build the exact bundle that drafting and validation will use
-    // after every successful read batch. A model-authored draft can synthesize
-    // relationships across grounded source excerpts, so its read surface closes
-    // once the bundle has semantic facts and change owners. The stricter closure
-    // assessment is reserved for deterministic runtime materialization, which
-    // cannot safely infer a diagnosis that the evidence does not state.
+    // after every successful read batch. Do not close the read surface merely
+    // because files and symbols were observed: diagnosis/repair plans still need
+    // evidence that connects the user's objective to a confirmed rationale.
     const closureInput = collectPlanClosureMaterializationInput(
       callbacks,
       recentPlanToolActivity,
@@ -285,18 +283,11 @@ export function handleToolResultPostProcessing(input: {
     const bundle = closureInput.evidenceBundle;
     const closureAssessment = assessPlanClosureEvidence(bundle);
     const modelAuthoredDraftReady = isPlanEvidenceBundleReady(bundle);
-    const deterministicClosureRecoveryActive =
-      String(planRuntimePhase) === "needs_evidence" &&
-      input.planEvidenceRecoveryObjective !== "model_draft";
-    const shouldAdvanceToDrafting = closureAssessment.ready || (
-      modelAuthoredDraftReady && !deterministicClosureRecoveryActive
-    );
+    const shouldAdvanceToDrafting = closureAssessment.ready;
     if (shouldAdvanceToDrafting) {
       setPlanRuntimePhase(
         "drafting",
-        closureAssessment.ready
-          ? "plan closure evidence ready"
-          : "model-authored plan evidence ready",
+        "plan closure evidence ready",
       );
       logAgentEvent("plan_evidence_bundle_ready", {
         iteration,

@@ -1981,7 +1981,7 @@ function seedReadContextAgentSegmentScenario() {
         "下一步将核对 README 中的展示约束，并保留这条问题摘要作为后续修改依据。",
       ].join("\n\n"),
       streaming: false,
-      visibility: "stage_summary" as const,
+      visibility: "assistant_update" as const,
     },
     {
       id: useAppStore.getState()._nextTaskId(),
@@ -6637,6 +6637,25 @@ function seedRealOmlxPlanFlowScenario() {
         skipIntentResolution: true,
       },
     );
+
+  bridge.sendDirectEditMessage = (text?: string) => {
+    useAppStore.setState((state) => ({
+      ...state,
+      config: { ...state.config, workflowMode: "edit" },
+      planArtifacts: [],
+      planTasks: [],
+      planStage: "idle",
+      isPlanApproved: false,
+    }));
+    return useAppStore.getState().sendMessage(
+      text || "直接修改 src/hooks/useCsvParser.ts，把 creator 映射为 creatorName，并用 npm test 验证。",
+      undefined,
+      {
+        resolvedIntent: "execute",
+        skipIntentResolution: true,
+      },
+    );
+  };
 
   bridge.sendGoalMessage = (text?: string) => {
     const objective = text || "修改 src/hooks/useCsvParser.ts，将 creator 正确映射到 creatorName，并运行验证。";

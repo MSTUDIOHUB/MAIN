@@ -426,6 +426,7 @@ export async function prepareIterationStreamRequest(input: {
     const contractCard = buildExecutionActionContractCard({
       contract: toolSurfaceDecision.recoveryActionContract,
       language: MODEL_CONTROL_LANGUAGE,
+      turnObjective: latestUserPromptText,
       availableToolNames: toolSurfaceDecision.iterationAllTools.map(
         (tool) => tool.function.name,
       ),

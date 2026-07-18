@@ -74,15 +74,7 @@ const DIRECT_FILE_MODIFY_SOURCE_TOOLS = new Set([
 ]);
 
 const DIRECT_FILE_MODIFY_VALIDATION_TOOLS = new Set([
-  ...DIRECT_FILE_MODIFY_SOURCE_TOOLS,
-  "execute_command",
-  "send_pty_input",
-  "browser_evaluate",
-  "read_pty_buffer",
-  "read_pty_tail",
-  "read_pty_since",
-  "get_pty_status",
-  "clear_pty_buffer",
+  "run_command",
 ]);
 
 export function hasStructuredWorkspaceMutationEvidence(input: {
@@ -132,8 +124,8 @@ export function buildDirectFileModifyActionContractCard(input: {
         "run_command is available only for finite diagnostics in this phase. Do not use Python, shell redirection, sed, or temporary scripts to write workspace source, and do not start a dev server before structured file-mutation evidence exists.",
       ]
     : [
-        "Structured workspace mutation evidence exists. Use finite run_command validation next when appropriate; use execute_command only for a genuinely long-running process and inspect that process through the PTY tools before browser validation.",
-        "If validation identifies a source defect, repair it with apply_patch, replace_in_file, or write_file so the changed path and diff remain structured evidence.",
+        "Structured workspace mutation evidence exists. Validate it with the finite run_command tool now.",
+        "Long-running process and browser tools are not part of this finite checkpoint; MAIN exposes them only through an explicit process-lifecycle validation contract.",
       ];
   return [
     "[TURN_ACTION_CONTRACT]",

@@ -62,6 +62,7 @@ import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../r
 import { shouldBlockToolCallForTargeting, type TaskTargetingProfile } from "../../taskTargeting";
 import { isLocalFileReadApproved, type ToolCapabilityRegistry, type ToolPermissionPolicy } from "../../toolCapabilities";
 import {
+  getShellToolCwd,
   looksDangerousShellCommand,
   looksLongRunningShellCommand,
 } from "../../toolExecutionContract";
@@ -72,7 +73,10 @@ import {
 } from "../../workflowModels";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import { findSubagentScopeConflict, validateSubagentScopeTarget } from "../../subagents";
-import { workspacePathsReferToSameFile } from "../../workspacePaths";
+import {
+  isAbsoluteWorkspacePath,
+  workspacePathsReferToSameFile,
+} from "../../workspacePaths";
 import {
   isWorkspaceMutationToolCall,
   resolveWorkspaceMutationTargets,
@@ -109,6 +113,31 @@ export interface ToolCallPartitioningResult {
   readFileWindowNarrowedNotes: Map<string, string>;
   toolFailureSignatures: Map<string, string>;
   preExecutionResults: ToolExecutionResult[];
+}
+
+function finiteValidationCheckpointMatchesArgs(input: {
+  checkpoint: NonNullable<RecoveryActionContract["decisionCheckpoint"]>["pendingFiniteValidation"];
+  args: Record<string, unknown>;
+}): boolean {
+  const checkpoint = input.checkpoint;
+  if (!checkpoint) return true;
+  const command = String(input.args.command || input.args.cmd || "").trim();
+  if (command !== checkpoint.command.trim()) return false;
+  if (getShellToolCwd(input.args) !== checkpoint.cwd) return false;
+  if (checkpoint.timeoutMs !== undefined) {
+    const requestedTimeout = Number(input.args.timeout_ms);
+    if (!Number.isFinite(requestedTimeout) || requestedTimeout !== checkpoint.timeoutMs) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function grepSearchPathLeavesWorkspace(args: Record<string, unknown>): boolean {
+  const path = String(args.path || ".").trim().replace(/\\/g, "/");
+  if (!path || path === "." || path === "./") return false;
+  if (isAbsoluteWorkspacePath(path)) return true;
+  return path.split("/").some((part) => part === "..");
 }
 
 function parentHasReusableDelegatedSourceWindow(input: {
@@ -342,6 +371,118 @@ export async function partitionToolCallsForExecution(input: {
       ? `${baseFailureSignature}::recovery=${recoveryFailureScope}`
       : baseFailureSignature;
     toolFailureSignatures.set(tc.id, failureSignature);
+
+    const finiteCommandRequestedThroughPty =
+      tc.name === "execute_command" &&
+      availableToolNames.has("run_command") &&
+      isFinitePlanValidationCommand(String(toolArgs.command || ""));
+    if (finiteCommandRequestedThroughPty) {
+      const message = callbacks.getPreferredLanguage() === "zh"
+        ? "FINITE_COMMAND_REQUIRES_RUN_COMMAND: 这是一次性构建、测试或诊断命令，未启动 PTY。请用 run_command 和相同 cwd 执行，以获得明确的 exitCode、stdout 和 stderr。"
+        : "FINITE_COMMAND_REQUIRES_RUN_COMMAND: This is a finite build, test, or diagnostic command, so no PTY was started. Use run_command with the same cwd to obtain an explicit exitCode, stdout, and stderr.";
+      toolFailureSignatures.delete(tc.id);
+      emitToolPreflightBlocked(callbacks, {
+        reason: "finite_command_requires_run_command",
+        tool: tc.name,
+        target,
+        message,
+        toolCallId: tc.id,
+        lifecycleState: "blocked",
+      });
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "finite_command_requires_run_command",
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: message,
+        isError: false,
+        lifecycleState: "blocked",
+        internalFeedback: true,
+        qualityGateReason: "finite_command_requires_run_command",
+      });
+      continue;
+    }
+
+    const pendingFiniteValidation =
+      executeRecoveryContract.decisionCheckpoint?.pendingFiniteValidation || null;
+    const mismatchedFiniteValidationCheckpoint =
+      tc.name === "run_command" &&
+      executeRecoveryContract.nextRequiredCapability === "validation" &&
+      executeRecoveryState.reason !== "failed_finite_validation_command" &&
+      pendingFiniteValidation &&
+      !finiteValidationCheckpointMatchesArgs({
+        checkpoint: pendingFiniteValidation,
+        args: toolArgs,
+      });
+    if (mismatchedFiniteValidationCheckpoint) {
+      const message = callbacks.getPreferredLanguage() === "zh"
+        ? `FINITE_VALIDATION_CHECKPOINT_MISMATCH: 修复后的验收边界仍是 ${pendingFiniteValidation.command}（cwd=${pendingFiniteValidation.cwd}）。本次不同命令未执行，请原样重跑该验证。`
+        : `FINITE_VALIDATION_CHECKPOINT_MISMATCH: The post-repair acceptance boundary remains ${pendingFiniteValidation.command} (cwd=${pendingFiniteValidation.cwd}). The different command did not run; rerun that validation unchanged.`;
+      toolFailureSignatures.delete(tc.id);
+      emitToolPreflightBlocked(callbacks, {
+        reason: "finite_validation_checkpoint_mismatch",
+        tool: tc.name,
+        target,
+        message,
+        toolCallId: tc.id,
+        lifecycleState: "blocked",
+      });
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "finite_validation_checkpoint_mismatch",
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: message,
+        isError: false,
+        lifecycleState: "blocked",
+        internalFeedback: true,
+        qualityGateReason: "finite_validation_checkpoint_mismatch",
+      });
+      continue;
+    }
+
+    if (tc.name === "grep_search" && grepSearchPathLeavesWorkspace(toolArgs)) {
+      const path = String(toolArgs.path || "").trim();
+      const message = callbacks.getPreferredLanguage() === "zh"
+        ? `WORKSPACE_SEARCH_SCOPE_BLOCKED: grep_search 只能搜索当前工作区，未搜索 ${path}。如需读取已知的外部依赖文件，请直接调用 read_file，并使用精确路径和行范围。`
+        : `WORKSPACE_SEARCH_SCOPE_BLOCKED: grep_search is workspace-only, so ${path} was not searched. To inspect a known external dependency file, call read_file directly with its exact path and line range.`;
+      toolFailureSignatures.delete(tc.id);
+      emitToolPreflightBlocked(callbacks, {
+        reason: "workspace_search_scope_blocked",
+        tool: tc.name,
+        target: path,
+        message,
+        toolCallId: tc.id,
+        lifecycleState: "blocked",
+      });
+      callbacks.onToolDone(tc.name, path, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "workspace_search_scope_blocked",
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target: path,
+        content: message,
+        displayContent: message,
+        isError: false,
+        lifecycleState: "blocked",
+        internalFeedback: true,
+        qualityGateReason: "workspace_search_scope_blocked",
+      });
+      continue;
+    }
 
     const isAllowedPlanDraftMutation =
       workflowMode === "plan" &&

@@ -495,3 +495,19 @@ test("normalization preserves mirror-stripped XML tool protocol as actionable co
   assert.equal(normalized.toolCalls.length, 1);
   assert.equal(normalized.toolCalls[0]?.name, "read_file");
 });
+
+test("normalization preserves quarantined protocol tool metadata for semantic recovery", () => {
+  const normalized = normalizeAssistantTurn({
+    content: "",
+    toolCalls: [],
+    finishReason: "tool_calls",
+    protocolViolation: "required_tool_call_not_available",
+    protocolExpectedTool: "run_command",
+    protocolActualTools: ["replace_in_file"],
+    protocolAllowedTools: ["run_command"],
+  });
+  assert.equal(normalized.protocolViolation, "required_tool_call_not_available");
+  assert.equal(normalized.protocolExpectedTool, "run_command");
+  assert.deepEqual(normalized.protocolActualTools, ["replace_in_file"]);
+  assert.deepEqual(normalized.protocolAllowedTools, ["run_command"]);
+});

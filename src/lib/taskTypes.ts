@@ -55,6 +55,8 @@ export interface DiffRevertResult {
 export type AssistantTextVisibility =
   | "user_progress"
   | "hidden_process"
+  | "assistant_update"
+  /** @deprecated Persisted compatibility for the earlier lexical classifier. */
   | "stage_summary"
   | "substantive_plan_text";
 

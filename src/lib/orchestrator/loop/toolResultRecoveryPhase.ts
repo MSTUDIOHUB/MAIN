@@ -13,6 +13,7 @@ import { parseBrowserValidationOutcome } from "../../browserValidation";
 import { resolveDevServerRuntimeState } from "../../devServerRuntime";
 import {
   isReviewablePlanStage,
+  isProjectSourceWriteResult,
   isSuccessfulPlanArtifactWriteResult,
   logAgentEvent,
   resolveApprovedPlanValidationBoundary,
@@ -27,6 +28,7 @@ import type {
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { extractReadFileWindowMetadata } from "../../readFileWindow";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
+import { getShellToolCwd } from "../../toolExecutionContract";
 import type { TaskOrchestratorPhase } from "../../taskTargeting";
 import type { ToolCapabilityRegistry, ToolPermissionPolicy } from "../../toolCapabilities";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
@@ -49,7 +51,12 @@ import {
   resolveCommandEvidenceRequirements,
   scopeExecutionEvidenceLedger,
 } from "../../verificationEvidence";
-import { workspacePathsReferToSameFile } from "../../workspacePaths";
+import {
+  isAbsoluteWorkspacePath,
+  relativizeToWorkspacePath,
+  workspacePathsReferToSameFile,
+} from "../../workspacePaths";
+import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
 import type { OrchestratorCallbacks, ToolCallToExecute, ToolExecutionResult } from "../types";
 import {
   handleExecuteConvergencePrompt,
@@ -73,6 +80,7 @@ import {
   applyNoProgressTrackingRuntimeState,
   applyToolFailureSignatureRuntimeState,
   getNoProgressTrackingRuntimeState,
+  resetLoopGuardRuntimeStateAfterMutation,
 } from "./loopGuardRuntimeState";
 import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntimeState";
 import { applyExecuteConvergencePromptState } from "./recoveryPromptRuntimeState";
@@ -126,6 +134,95 @@ type ActivateChatFinalSynthesis = (
 ) => void;
 
 const APPROVED_PLAN_SCOPE_BLOCKED_RE = /\bAPPROVED_PLAN_SCOPE_BLOCKED\b/;
+
+function isDirectFileModifyExecution(input: {
+  callbacks: OrchestratorCallbacks;
+  workflowMode: WorkflowMode;
+  runtimeIntent: ResolvedUserIntent;
+}): boolean {
+  return input.workflowMode === "edit" &&
+    isMutationRuntimeIntent(input.runtimeIntent) &&
+    !input.callbacks.getIsPlanApproved() &&
+    input.callbacks.getCommandDirective?.()?.kind === "file_modify";
+}
+
+function structuredCommandDiagnosticText(result: ToolExecutionResult): string {
+  const raw = String(result.content || result.displayContent || "");
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return raw;
+    return [parsed.stderr, parsed.stdout]
+      .filter((value): value is string => typeof value === "string" && !!value.trim())
+      .join("\n");
+  } catch {
+    return raw;
+  }
+}
+
+function normalizeDiagnosticWorkspacePath(input: {
+  path: string;
+  cwd: string;
+  workspace: string;
+}): string | null {
+  let candidate = String(input.path || "")
+    .trim()
+    .replace(/^[`'"(]+|[`'"),]+$/g, "")
+    .replace(/\\/g, "/");
+  if (!candidate) return null;
+  if (isAbsoluteWorkspacePath(candidate)) {
+    candidate = relativizeToWorkspacePath(candidate, input.workspace);
+    if (isAbsoluteWorkspacePath(candidate)) return null;
+  } else {
+    const cwd = String(input.cwd || ".")
+      .replace(/\\/g, "/")
+      .replace(/^\.\//, "")
+      .replace(/\/+$/, "");
+    candidate = candidate.replace(/^\.\//, "");
+    if (cwd && cwd !== "." && !candidate.startsWith(`${cwd}/`)) {
+      candidate = `${cwd}/${candidate}`;
+    }
+  }
+  const normalizedParts: string[] = [];
+  for (const part of candidate.split("/").filter(Boolean)) {
+    if (part === ".") continue;
+    if (part === "..") return null;
+    normalizedParts.push(part);
+  }
+  return normalizedParts.join("/") || null;
+}
+
+function resolveFiniteValidationRepairTarget(input: {
+  result: ToolExecutionResult;
+  args: Record<string, unknown>;
+  workspace: string;
+  recentToolActivity: PlanToolActivitySummary[];
+  fallbackTarget?: string | null;
+}): string | null {
+  const diagnosticText = structuredCommandDiagnosticText(input.result)
+    .replace(/\u001b\[[0-9;?]*[ -/]*[@-~]/g, "");
+  const pathPatterns = [
+    /(?:^|\n)\s*(?:-->|:::)\s+(.+?):\d+:\d+/gm,
+    /(?:^|\n)\s*([^\n()]+\.[A-Za-z0-9]+)\(\d+,\d+\)\s*:/gm,
+    /(?:^|\n)\s*([^\n:]+\.[A-Za-z0-9]+):\d+:\d+/gm,
+  ];
+  const cwd = getShellToolCwd(input.args);
+  for (const pattern of pathPatterns) {
+    for (const match of diagnosticText.matchAll(pattern)) {
+      const target = normalizeDiagnosticWorkspacePath({
+        path: match[1] || "",
+        cwd,
+        workspace: input.workspace,
+      });
+      if (target) return target;
+    }
+  }
+  const latestMutationTarget = [...input.recentToolActivity].reverse().find((activity) =>
+    activity.status === "succeeded" &&
+    isWorkspaceMutationToolName(activity.name) &&
+    !!String(activity.target || "").trim()
+  )?.target;
+  return String(latestMutationTarget || input.fallbackTarget || "").trim() || null;
+}
 
 function getApprovedPlanScopeConflict(results: ToolExecutionResult[]): {
   requestedTargets: string[];
@@ -1255,6 +1352,20 @@ export async function handleToolResultRecoveryPhase(input: {
       toolFailureSignatures: input.toolFailureSignatures,
     },
   );
+  const durableStructuredMutation = input.results.find((result) =>
+    !result.internalFeedback && isProjectSourceWriteResult(result)
+  );
+  if (durableStructuredMutation) {
+    loopGuardRuntimeState = resetLoopGuardRuntimeStateAfterMutation(
+      loopGuardRuntimeState,
+    );
+    logAgentEvent("loop_guard_progress_epoch_reset", {
+      iteration: input.iteration,
+      tool: durableStructuredMutation.name,
+      target: durableStructuredMutation.target,
+      reason: "durable_structured_mutation",
+    });
+  }
 
   appendToolResultsToHistory({
     callbacks: input.callbacks,
@@ -1359,6 +1470,18 @@ export async function handleToolResultRecoveryPhase(input: {
         ).trim();
       })()
     : "";
+  const failedFiniteValidationArgs = failedFiniteValidation
+    ? input.toolArgsByCallId.get(failedFiniteValidation.toolCallId) || {}
+    : {};
+  const pendingFiniteValidation = failedFiniteValidationCommand
+    ? {
+        command: failedFiniteValidationCommand,
+        cwd: getShellToolCwd(failedFiniteValidationArgs),
+        ...(Number.isFinite(Number(failedFiniteValidationArgs.timeout_ms))
+          ? { timeoutMs: Math.floor(Number(failedFiniteValidationArgs.timeout_ms)) }
+          : {}),
+      }
+    : null;
   const failedFiniteValidationOutcome = failedFiniteValidation
     ? classifyFailedFiniteValidationOutcome({
         result: failedFiniteValidation.content || failedFiniteValidation.displayContent || "",
@@ -1375,11 +1498,14 @@ export async function handleToolResultRecoveryPhase(input: {
         highlightNext: true,
       }).remainingTasks
     : [];
+  const directFileModifyExecution = isDirectFileModifyExecution(input);
+  const approvedPlanInvocationRecovery = input.callbacks.getIsPlanApproved() &&
+    hasPendingPlanCommandEvidence(remainingPlanTasksAfterFailedFiniteValidation);
   if (
     failedFiniteValidation &&
     failedFiniteValidationOutcome === "invocation_error" &&
-    input.callbacks.getIsPlanApproved() &&
-    hasPendingPlanCommandEvidence(remainingPlanTasksAfterFailedFiniteValidation)
+    pendingFiniteValidation &&
+    (approvedPlanInvocationRecovery || directFileModifyExecution)
   ) {
     const command = failedFiniteValidationCommand;
     const recoveryPolicy = resolveFailedFiniteValidationRecoveryPolicy({
@@ -1389,14 +1515,26 @@ export async function handleToolResultRecoveryPhase(input: {
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "finite_validation_only",
       "failed_finite_validation_command",
-      { command, target: failedFiniteValidation.target || "run_command" },
+      {
+        command,
+        target: failedFiniteValidation.target || "run_command",
+        expectedTarget: executeRecoveryState.expectedTarget,
+        decisionCheckpoint: {
+          expectedTarget: executeRecoveryState.expectedTarget,
+          sourceObservationKey: executeRecoveryState.sourceObservationKey,
+          nextRequiredCapability: "validation",
+          pendingFiniteValidation,
+        },
+      },
     );
     const recoveryPrompt = buildFailedFiniteValidationRecoveryPrompt({
       command,
       result: failedFiniteValidation.content || failedFiniteValidation.displayContent || "",
       ...recoveryPolicy,
     });
-    logAgentEvent("approved_plan_finite_validation_recovery", {
+    logAgentEvent(input.callbacks.getIsPlanApproved()
+      ? "approved_plan_finite_validation_recovery"
+      : "direct_edit_finite_validation_recovery", {
       iteration: input.iteration,
       command,
       target: failedFiniteValidation.target || "",
@@ -1425,47 +1563,54 @@ export async function handleToolResultRecoveryPhase(input: {
       failedCommand: failedFiniteValidationCommand,
       tasks: remainingPlanTasksAfterFailedFiniteValidation,
     });
+  const failedValidationRequiresRepair = failedFiniteValidation &&
+    failedFiniteValidationOutcome === "validation_failure" &&
+    (
+      (input.callbacks.getIsPlanApproved() && failedValidationMatchesPendingTask) ||
+      directFileModifyExecution
+    );
   if (
     failedFiniteValidation &&
-    failedValidationMatchesPendingTask &&
-    input.callbacks.getIsPlanApproved()
+    failedValidationRequiresRepair &&
+    pendingFiniteValidation
   ) {
     // A validation that actually ran has produced a source/test/config
     // diagnostic. Command-only recovery cannot fix it, but the current
     // transaction target and failed evidence must remain owned by the same
     // contract. Returning to `normal` here used to reopen broad discovery.
-    const repairTarget = executeRecoveryState.expectedTarget;
-    const repairReadLease = repairTarget
-      ? buildFailedValidationRepairReadLease({
-          target: repairTarget,
-          sourceObservationKey: executeRecoveryState.sourceObservationKey,
-        })
-      : null;
+    const repairTarget = resolveFiniteValidationRepairTarget({
+      result: failedFiniteValidation,
+      args: failedFiniteValidationArgs,
+      workspace: input.workspace,
+      recentToolActivity: input.recentToolActivity,
+      fallbackTarget: executeRecoveryState.expectedTarget,
+    });
     executeRecoveryState = activateExecuteRecoveryAndSync(
       "mutation_first",
       "failed_finite_validation_requires_repair",
       {
         expectedTarget: repairTarget,
-        ...(repairReadLease ? { readLease: repairReadLease } : {}),
-        ...(repairReadLease ? { sourceObservationKey: null } : {}),
+        // The mutation contract already includes a targeted read. Keep both
+        // choices available so an actionable compiler/test diagnostic can be
+        // repaired immediately while an uncertain diagnosis can reread first.
+        sourceObservationKey: null,
         decisionCheckpoint: {
           expectedTarget: repairTarget,
-          sourceObservationKey: repairReadLease
-            ? null
-            : executeRecoveryState.sourceObservationKey,
-          nextRequiredCapability: repairReadLease ? "targeted_read" : "mutation",
+          sourceObservationKey: null,
+          nextRequiredCapability: "mutation",
+          pendingFiniteValidation,
         },
       },
     );
     const recoveryPrompt = [
       "FINITE_VALIDATION_REPAIR_REQUIRED: The finite validation command executed, but its validation failed.",
       `Failed command: ${failedFiniteValidationCommand}`,
-      repairReadLease
-        ? `MAIN retained the current execution transaction. Read the current ${repairTarget} source once because the successful mutation invalidated its pre-mutation observation; then repair the diagnostic and rerun this same command.`
-        : "MAIN retained the current execution transaction. Inspect the structured stdout/stderr/exitCode already returned, repair the implicated source, test, or configuration, then rerun this same command.",
-      "Do not substitute an unrelated successful command: this failed validation remains pending Plan evidence until the same concrete command succeeds.",
+      "MAIN retained the current execution transaction. Inspect the structured stdout/stderr/exitCode already returned, then either repair the implicated source, test, or configuration directly or reread the current target first when exact context is still missing. Rerun this same command after the repair.",
+      "Do not substitute an unrelated successful command: this failed validation remains pending turn evidence until the same concrete command succeeds.",
     ].join("\n");
-    logAgentEvent("approved_plan_finite_validation_requires_repair", {
+    logAgentEvent(input.callbacks.getIsPlanApproved()
+      ? "approved_plan_finite_validation_requires_repair"
+      : "direct_edit_finite_validation_requires_repair", {
       iteration: input.iteration,
       command: failedFiniteValidationCommand,
       target: failedFiniteValidation.target || "",
@@ -1473,18 +1618,13 @@ export async function handleToolResultRecoveryPhase(input: {
       nextRecoveryMode: executeRecoveryState.mode,
       nextRequiredCapability:
         executeRecoveryState.decisionCheckpoint?.nextRequiredCapability || null,
-      repairReadLeaseRange: repairReadLease?.requestedRange || null,
     });
     input.emitPlanExecutionProgress("running", {
-      currentTool: repairReadLease ? "read_file" : "apply_patch",
+      currentTool: "apply_patch",
       recoveryReason: "failed_finite_validation_requires_repair",
       nextStep: input.callbacks.getPreferredLanguage() === "zh"
-        ? repairReadLease
-          ? "先读取修改后的当前源码，再根据命令诊断修复并重新运行同一验证命令"
-          : "根据命令诊断修复源码、测试或配置，然后重新运行同一验证命令"
-        : repairReadLease
-          ? "read the current post-mutation source, repair the diagnostic, then rerun the same validation command"
-          : "repair the diagnosed source, test, or configuration issue, then rerun the same validation command",
+        ? "根据命令诊断直接修复；仅在缺少精确上下文时重读当前目标，然后重新运行同一验证命令"
+        : "repair the command diagnostic directly; reread the current target only when exact context is missing, then rerun the same validation command",
     });
     input.callbacks.onStatusChange("running");
     input.callbacks.appendMessage({ role: "user", content: recoveryPrompt });
@@ -1628,7 +1768,6 @@ export async function handleToolResultRecoveryPhase(input: {
     recentToolCalls: loopGuardRuntimeState.recentToolCalls,
     repeatGuardRecoveredSignatures:
       loopGuardRuntimeState.repeatGuardRecoveredSignatures,
-    failedToolCallCounts: loopGuardRuntimeState.failedToolCallCounts,
     recentPlanToolActivity: input.recentPlanToolActivity,
     availableToolNames: input.availableToolNames,
     toolCapabilityRegistry: input.toolCapabilityRegistry,

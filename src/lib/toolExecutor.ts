@@ -54,6 +54,7 @@ import { applyWorkspacePatch, summarizeApplyPatchTarget } from "./applyPatchTool
 import { repoMapContext, repoMapFiles, repoMapImpact, repoMapSearch, repoMapStatus } from "./repoMapTools";
 import { sanitizePtyOutput } from "./ptyOutputSanitizer";
 import {
+  buildPtyShellLaunchError,
   buildUnconfirmedPtyCommandError,
   buildPtyControlId,
   describePtyControlEffect,
@@ -496,7 +497,7 @@ export async function executeTool(
       return await runGitDiffTool(args, workspace);
 
     case "execute_command": {
-      const command = applyShellCwd((args.command as string) || "", args);
+      const command = applyShellCwd((args.command as string) || "", args, workspace);
       if (!command) throw new Error("Missing required parameter 'command'.");
       const waitMs = Math.min(Math.max(parseOptionalNumber(args.wait_ms) ?? 4000, 0), 30_000);
       const maxChars = Math.min(Math.max(parseOptionalNumber(args.max_chars) ?? 8000, 100), 200_000);
@@ -540,6 +541,8 @@ export async function executeTool(
       }
 
       const sanitizedOutput = sanitizePtyOutput(output.text);
+      const shellLaunchError = buildPtyShellLaunchError(sanitizedOutput);
+      if (shellLaunchError) throw new Error(shellLaunchError);
       const unconfirmedError = buildUnconfirmedPtyCommandError(command, sanitizedOutput);
       if (unconfirmedError) throw new Error(unconfirmedError);
 
@@ -722,7 +725,7 @@ export async function executeTool(
     }
 
     case "run_command": {
-      const command = applyShellCwd((args.command as string) || "", args);
+      const command = applyShellCwd((args.command as string) || "", args, workspace);
       if (!command) throw new Error("Missing required parameter 'command'.");
       return await runCommand(
         command,

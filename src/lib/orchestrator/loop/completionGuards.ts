@@ -249,6 +249,9 @@ export function resolveNonActionableStopOutcome(
   const status: AgentLoopOutcome["status"] =
     reason === "no_output" ? "stopped_no_output" :
     progress?.recoveryReason === "approved_plan_completion_guard_no_evidence" ? "stopped_no_action" :
+    progress?.recoveryReason === "required_tool_call_protocol_violation_after_change" ? "paused" :
+    progress?.recoveryReason === "execute_no_action_after_change" ? "paused" :
+    progress?.recoveryReason?.startsWith("execution_evidence_gap:") ? "paused" :
     reason === "incomplete_plan" ? "paused" :
     "stopped_no_action";
   return { status, reason: progress?.recoveryReason || reason };
@@ -371,14 +374,19 @@ export function runApprovedPlanCompletionGuard(input: {
     "incomplete_plan",
     {
       phase: "paused",
-      recoveryReason: "approved_plan_completion_guard_no_evidence",
+      recoveryReason: sawExecutionEvidence
+        ? "approved_plan_completion_guard_incomplete_after_change"
+        : "approved_plan_completion_guard_no_evidence",
       nextStep: closureGap?.nextStep || (language === "zh"
         ? "批准计划尚缺真实执行证据；恢复后必须写入、运行命令、做浏览器验证，或明确外部验证边界。"
         : "The approved plan still lacks real execution evidence; resume by writing, running commands, browser-validating, or stating the external validation boundary."),
     },
   );
   callbacks.onStatusChange("idle");
-  return { status: "stopped_no_action", reason: "approved_plan_completion_guard" };
+  return {
+    status: sawExecutionEvidence ? "paused" : "stopped_no_action",
+    reason: "approved_plan_completion_guard",
+  };
 }
 
 export function runExecutionEvidenceCompletionGuard(input: {
@@ -479,7 +487,7 @@ export function runExecutionEvidenceCompletionGuard(input: {
   );
   callbacks.onStatusChange("idle");
   return {
-    status: "stopped_no_action",
+    status: missingAnyExecutionEvidence ? "stopped_no_action" : "paused",
     reason: activeRecoveryPending
       ? "execution_evidence_gap:recovery_phase_pending"
       : missingAnyExecutionEvidence

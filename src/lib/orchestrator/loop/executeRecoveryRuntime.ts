@@ -107,6 +107,7 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
     : input.evidenceVersion;
   const planTaskId = input.previous?.planTaskId?.trim() || null;
   const requirementRef = input.previous?.requirementRef?.trim() || null;
+  const pendingFiniteValidation = input.previous?.pendingFiniteValidation || null;
   return {
     expectedTarget: input.expectedTarget,
     sourceObservationKey: input.sourceObservationKey,
@@ -116,6 +117,7 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
       : {}),
     ...(planTaskId ? { planTaskId } : {}),
     ...(requirementRef ? { requirementRef } : {}),
+    ...(pendingFiniteValidation ? { pendingFiniteValidation } : {}),
   };
 }
 
@@ -126,10 +128,13 @@ function inheritExecuteRecoveryCheckpointIdentity(
   if (!checkpoint) return checkpoint;
   const planTaskId = checkpoint.planTaskId?.trim() || previous?.planTaskId?.trim() || null;
   const requirementRef = checkpoint.requirementRef?.trim() || previous?.requirementRef?.trim() || null;
+  const pendingFiniteValidation = checkpoint.pendingFiniteValidation ||
+    previous?.pendingFiniteValidation || null;
   return {
     ...checkpoint,
     ...(planTaskId ? { planTaskId } : {}),
     ...(requirementRef ? { requirementRef } : {}),
+    ...(pendingFiniteValidation ? { pendingFiniteValidation } : {}),
   };
 }
 
@@ -717,9 +722,10 @@ export function transitionExecuteRecoveryRuntimeState(
         mode: "validation_only",
         reason: "recovery_mutation_observed",
         expectedTarget: mutationTarget,
-        // A successful mutation already carries structured changed-path/diff
-        // evidence. Do not force another source read. Validation may still
-        // choose git_diff or a targeted read when the obligation needs it.
+        // A successful mutation carries structured changed-path/diff evidence,
+        // but it does not prove the whole user objective is implemented. Move
+        // provisionally to validation; assistantCompletionPhase may reopen the
+        // mutation surface once when the model explicitly requests more edits.
         readLease: null,
         decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
           expectedTarget: mutationTarget,

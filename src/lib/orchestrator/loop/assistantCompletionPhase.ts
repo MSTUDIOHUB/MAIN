@@ -32,6 +32,7 @@ import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
 import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
 import { resolvePreCompletionEvidenceRecoveryDecision } from "./preCompletionEvidenceRecovery";
 import { resolveCommandEvidenceRequirements } from "../../verificationEvidence";
+import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -50,6 +51,33 @@ export type AssistantCompletionPhaseResult = {
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
 };
+
+export function resolveValidationMutationReopen(input: {
+  recoveryState: ExecuteRecoveryRuntimeState;
+  protocolViolation?: NormalizedStreamState["protocolViolation"];
+  protocolActualTools?: string[];
+}): { requestedTools: string[] } | null {
+  const validationActive =
+    input.recoveryState.mode === "validation_only" ||
+    input.recoveryState.mode === "finite_validation_only" ||
+    input.recoveryState.decisionCheckpoint?.nextRequiredCapability === "validation";
+  if (!validationActive) return null;
+  if (
+    input.protocolViolation !== "required_tool_call_not_available" &&
+    input.protocolViolation !== "required_function_call_mismatch"
+  ) return null;
+
+  const requestedTools = [...new Set((input.protocolActualTools || [])
+    .filter((name) => isWorkspaceMutationToolName(name)))];
+  if (requestedTools.length === 0) return null;
+
+  // One recovery activation establishes mutation -> validation. A single
+  // reopen is allowed when the model explicitly reports that more mutation is
+  // needed. A second reopen would indicate semantic no-progress and must be
+  // handled by the bounded checkpoint instead of oscillating forever.
+  if (input.recoveryState.attempts > 1) return null;
+  return { requestedTools };
+}
 
 export async function handleAssistantCompletionPhase(input: {
   callbacks: OrchestratorCallbacks;
@@ -227,6 +255,61 @@ export async function handleAssistantCompletionPhase(input: {
       validationExpected: input.effectiveTurnContract?.validationExpected === true,
       mutationExpected: input.effectiveTurnContract?.mutationExpected === true,
       externalReviewIsAdvisory,
+    });
+    return finish("continue");
+  }
+
+  const validationMutationReopen = resolveValidationMutationReopen({
+    recoveryState: currentExecuteRecoveryState,
+    protocolViolation: input.normalized.protocolViolation,
+    protocolActualTools: input.normalized.protocolActualTools,
+  });
+  if (validationMutationReopen) {
+    const currentCheckpoint = currentExecuteRecoveryState.decisionCheckpoint;
+    input.callbacks.onStreamToken("__ESCALATION_RESET__:validation_mutation_reopen", input.assistantMsgId);
+    input.activateExecuteRecovery(
+      "mutation_first",
+      "validation_followup_mutation_requested",
+      {
+        expectedTarget: currentExecuteRecoveryState.expectedTarget,
+        sourceObservationKey: currentExecuteRecoveryState.sourceObservationKey,
+        decisionCheckpoint: {
+          expectedTarget: currentExecuteRecoveryState.expectedTarget,
+          sourceObservationKey: currentExecuteRecoveryState.sourceObservationKey,
+          nextRequiredCapability: "mutation",
+          ...(currentCheckpoint?.evidenceVersion
+            ? { evidenceVersion: currentCheckpoint.evidenceVersion }
+            : {}),
+          ...(currentCheckpoint?.planTaskId
+            ? { planTaskId: currentCheckpoint.planTaskId }
+            : {}),
+          ...(currentCheckpoint?.requirementRef
+            ? { requirementRef: currentCheckpoint.requirementRef }
+            : {}),
+          ...(currentCheckpoint?.pendingFiniteValidation
+            ? { pendingFiniteValidation: currentCheckpoint.pendingFiniteValidation }
+            : {}),
+        },
+        source: "validation_requested_followup_mutation",
+      },
+    );
+    input.callbacks.onStatusChange("running");
+    const requestExcerpt = input.latestUserPromptText.replace(/\s+/g, " ").trim().slice(0, 800);
+    input.callbacks.appendMessage({
+      role: "system",
+      content: [
+        "VALIDATION_MUTATION_REOPEN: The validation checkpoint is retained, but the mutation surface has been reopened once because the previous response explicitly requested a workspace edit tool.",
+        `Requested edit tools: ${validationMutationReopen.requestedTools.join(", ")}.`,
+        requestExcerpt ? `Original turn objective: ${requestExcerpt}` : "",
+        "Make only the remaining task-relevant edit. Do not substitute a cosmetic or nearby change for an unresolved requested outcome. The retained finite validation will run after the mutation.",
+      ].filter(Boolean).join("\n"),
+    });
+    logAgentEvent("validation_mutation_surface_reopened", {
+      iteration: input.iteration,
+      requestedTools: validationMutationReopen.requestedTools,
+      expectedTarget: currentExecuteRecoveryState.expectedTarget,
+      recoveryAttempts: currentExecuteRecoveryState.attempts,
+      pendingFiniteValidation: currentCheckpoint?.pendingFiniteValidation || null,
     });
     return finish("continue");
   }

@@ -111,13 +111,24 @@ export function handleExecuteNoToolRecovery(input: {
         protocolViolation: input.protocolViolation,
       },
     );
-    if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
+    const protocolCheckpointLimit = input.protocolViolationOnly
+      ? Math.min(2, resolveExecuteNoToolCheckpointLimit(activeProfile))
+      : resolveExecuteNoToolCheckpointLimit(activeProfile);
+    if (consecutiveNoToolCount >= protocolCheckpointLimit) {
+      const stoppedAfterDurableChange = sawExecuteOperationEvidence;
+      const stopMessage = stoppedAfterDurableChange
+        ? callbacks.getPreferredLanguage() === "zh"
+          ? "执行已暂停：工作区已经产生真实变更，但模型未能完成后续工具协议或验证。现有变更和检查点均已保留；这不是“未执行任何操作”。"
+          : "Execution paused after real workspace changes because the model could not complete the follow-up tool protocol or validation. Existing changes and the checkpoint were preserved; this is not a no-action outcome."
+        : buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution");
       callbacks.onNonActionableStop(
-        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
+        stopMessage,
         "missing_tool_loop",
         {
           phase: "paused",
-          recoveryReason: "required_tool_call_protocol_violation",
+          recoveryReason: stoppedAfterDurableChange
+            ? "required_tool_call_protocol_violation_after_change"
+            : "required_tool_call_protocol_violation",
           nextStep: input.protocolViolation === "required_function_call_mismatch"
             ? callbacks.getPreferredLanguage() === "zh"
               ? "模型在具名工具阶段连续返回了其他工具；这些调用未执行。请从当前证据检查点恢复并调用契约指定的工具。"
@@ -178,9 +189,23 @@ export function handleExecuteNoToolRecovery(input: {
         iteration,
         consecutiveNoToolCount,
       });
+      const stoppedAfterDurableChange = sawExecuteOperationEvidence;
       callbacks.onNonActionableStop(
-        buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
+        stoppedAfterDurableChange
+          ? callbacks.getPreferredLanguage() === "zh"
+            ? "执行已暂停：工作区已有真实变更，但模型连续没有产生可执行的后续动作。现有变更已保留，可从当前检查点恢复。"
+            : "Execution paused after real workspace changes because the model repeatedly produced no executable follow-up action. Existing changes were preserved and the run can resume from this checkpoint."
+          : buildNonActionableStopMessage(callbacks.getPreferredLanguage(), "plain_text_execution"),
         "no_action",
+        stoppedAfterDurableChange
+          ? {
+              phase: "paused",
+              recoveryReason: "execute_no_action_after_change",
+              nextStep: callbacks.getPreferredLanguage() === "zh"
+                ? "从保留的变更继续完成剩余目标和验证。"
+                : "Resume from the preserved changes to complete the remaining outcomes and validation.",
+            }
+          : undefined,
       );
       callbacks.onStatusChange("idle");
       return finish("stopped");
