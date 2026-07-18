@@ -264,3 +264,14 @@ test("target progress guard converges repeated shell writes to the same file", (
     "a file argument without a structural write operation is not a shell mutation",
   );
 });
+
+test("shell mutation targeting recognizes Python pathlib, Node writes, and in-place edits", () => {
+  const cases = [
+    ["python3 -c \"Path('src/main.js').write_text('changed')\"", "shell-write:src/main.js"],
+    ["node -e \"writeFileSync('src/main.js', 'changed')\"", "shell-write:src/main.js"],
+    ["sed -i '' -e 's/old/new/' src/main.js", "shell-write:src/main.js"],
+  ];
+  for (const [command, expected] of cases) {
+    assert.equal(getShellMutationTargetForLoopGuard("run_command", { command }), expected);
+  }
+});

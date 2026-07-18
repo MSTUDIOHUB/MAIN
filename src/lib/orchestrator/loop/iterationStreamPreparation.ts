@@ -19,7 +19,7 @@ import {
   isPlanEvidenceBundleReady,
 } from "../../planEvidence";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
-import type { ResolvedUserIntent } from "../../runIntent";
+import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanExecutionProgressPhase } from "../../workflowModels";
@@ -42,6 +42,8 @@ import {
   type AgentLoopStreamRuntimeState,
 } from "./streamRuntimeState";
 import {
+  buildDirectFileModifyActionContractCard,
+  hasStructuredWorkspaceMutationEvidence,
   resolveIterationToolSurface,
   type IterationToolSurfaceDecision,
 } from "./toolCallPlanning";
@@ -201,8 +203,45 @@ export async function prepareIterationStreamRequest(input: {
   const rawIterationAllTools = finalTextOnlyStep || streamRuntimeState.chatFinalSynthesisActive
     ? []
     : resolveAllToolsForRuntime(runtimeIntent);
+  const structuredWorkspaceMutationObserved = hasStructuredWorkspaceMutationEvidence({
+    callbacks,
+    recentToolActivity,
+  });
+  const recoveryCheckpointCapability =
+    input.executeRecoveryState.decisionCheckpoint?.nextRequiredCapability || null;
+  const prematureFileModifyLifecycleRecovery =
+    callbacks.getCommandDirective?.()?.kind === "file_modify" &&
+    workflowMode === "edit" &&
+    isMutationRuntimeIntent(runtimeIntent) &&
+    !callbacks.getIsPlanApproved() &&
+    !structuredWorkspaceMutationObserved &&
+    input.executeRecoveryState.mode !== "normal" &&
+    new Set([
+      "launch_long_process",
+      "observe_pty",
+      "browser_validation",
+      "recover_process",
+      "reconcile_server",
+    ]).has(String(recoveryCheckpointCapability || ""));
+  const recoveryStateForIteration = prematureFileModifyLifecycleRecovery
+    ? clearExecuteRecovery(
+        "file_modify_requires_structured_mutation_before_process_validation",
+        undefined,
+        input.executeRecoveryState,
+      )
+    : input.executeRecoveryState;
+  if (prematureFileModifyLifecycleRecovery) {
+    logAgentEvent("premature_file_modify_lifecycle_recovery_cleared", {
+      iteration,
+      previousMode: input.executeRecoveryState.mode,
+      previousCapability: recoveryCheckpointCapability,
+      expectedTarget: input.executeRecoveryState.expectedTarget,
+      structuredMutationObserved: false,
+      nextPhase: "source_change",
+    });
+  }
   let executeRecoveryIterationAdvance =
-    advanceExecuteRecoveryRuntimeIteration(input.executeRecoveryState);
+    advanceExecuteRecoveryRuntimeIteration(recoveryStateForIteration);
   let executeRecoveryState = executeRecoveryIterationAdvance.state;
   let recoveryPause: IterationStreamPreparationResult["recoveryPause"] = null;
   if (executeRecoveryIterationAdvance.reachedMaxIterations) {
@@ -404,6 +443,26 @@ export async function prepareIterationStreamRequest(input: {
       sourceObservationKey:
         toolSurfaceDecision.recoveryActionContract.sourceObservationKey,
       toolCount: toolSurfaceDecision.iterationAllTools.length,
+    });
+  } else if (toolSurfaceDecision.directFileModifyPhase) {
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      {
+        role: "system",
+        content: buildDirectFileModifyActionContractCard({
+          phase: toolSurfaceDecision.directFileModifyPhase,
+          availableToolNames: toolSurfaceDecision.iterationAllTools.map(
+            (tool) => tool.function.name,
+          ),
+        }),
+      },
+    ];
+    logAgentEvent("direct_file_modify_action_contract_injected", {
+      iteration,
+      phase: toolSurfaceDecision.directFileModifyPhase,
+      toolCount: toolSurfaceDecision.iterationAllTools.length,
+      structuredMutationObserved:
+        toolSurfaceDecision.directFileModifyPhase === "validation",
     });
   }
   const shouldInjectPlanEvidenceBundle =

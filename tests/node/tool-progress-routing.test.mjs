@@ -143,6 +143,7 @@ test("tool progress presentation marks runtime narration as user progress", () =
 
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 1,
+    unsupportedToolCallCount: 0,
     finalReplyOptionCount: 0,
     hasSubstantivePlanAssistantText: false,
     workflowMode: "edit",
@@ -161,6 +162,7 @@ test("tool progress presentation marks runtime narration as user progress", () =
 test("tool progress presentation hides approved execution model narration", () => {
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 1,
+    unsupportedToolCallCount: 0,
     finalReplyOptionCount: 0,
     hasSubstantivePlanAssistantText: false,
     workflowMode: "plan",
@@ -175,4 +177,38 @@ test("tool progress presentation hides approved execution model narration", () =
   assert.equal(decision.visibility, "hidden_process");
   assert.equal(decision.capsuleCandidate, false);
   assert.equal(decision.modelAuthored, true);
+});
+
+test("tool progress presentation retains an evidence-backed stage summary with a next action", () => {
+  const decision = resolveToolProgressPresentation({
+    progressEligibleToolCallCount: 1,
+    unsupportedToolCallCount: 0,
+    finalReplyOptionCount: 0,
+    hasSubstantivePlanAssistantText: false,
+    workflowMode: "edit",
+    isPlanApproved: false,
+    runtimeNarrationInjected: false,
+    visibleAssistantText: "已确认问题来自恢复阶段错误暴露了源码读取工具，用户因此只能看到重复读取。下一步将把 stopped PTY 的工具面收敛为状态检查和重新启动。",
+    shouldSuppressApprovedPlanNoToolText: false,
+  });
+
+  assert.equal(decision.visibility, "stage_summary");
+  assert.equal(decision.shouldPreserveApprovedExecutionText, true);
+});
+
+test("unsupported-tool narration remains hidden even when it describes a next attempt", () => {
+  const decision = resolveToolProgressPresentation({
+    progressEligibleToolCallCount: 0,
+    unsupportedToolCallCount: 1,
+    finalReplyOptionCount: 0,
+    hasSubstantivePlanAssistantText: false,
+    workflowMode: "edit",
+    isPlanApproved: false,
+    runtimeNarrationInjected: false,
+    visibleAssistantText: "工具不可用，下一步将尝试另一个工具。",
+    shouldSuppressApprovedPlanNoToolText: false,
+  });
+
+  assert.equal(decision.visibility, "hidden_process");
+  assert.equal(decision.shouldPreserveApprovedExecutionText, false);
 });

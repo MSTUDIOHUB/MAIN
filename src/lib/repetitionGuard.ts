@@ -187,6 +187,18 @@ export function getShellMutationTargetForLoopGuard(
   const openPath = command.match(/\bopen\(\s*(['"])([^'"]+)\1\s*,\s*(['"])[wa]/i);
   const openTarget = normalizeShellMutationPath(openPath?.[2] || "");
   if (openTarget) return `shell-write:${openTarget}`;
+
+  const pathlibPath = command.match(/\bPath\(\s*(['"])([^'"]+)\1\s*\)\s*\.\s*write_(?:text|bytes)\s*\(/i);
+  const pathlibTarget = normalizeShellMutationPath(pathlibPath?.[2] || "");
+  if (pathlibTarget) return `shell-write:${pathlibTarget}`;
+
+  const nodeWritePath = command.match(/\b(?:writeFileSync|appendFileSync)\(\s*(['"])([^'"]+)\1/i);
+  const nodeWriteTarget = normalizeShellMutationPath(nodeWritePath?.[2] || "");
+  if (nodeWriteTarget) return `shell-write:${nodeWriteTarget}`;
+
+  const inPlaceEditPath = command.match(/(?:^|\s)(?:sed\s+-i(?:\.[^\s]+)?|perl\s+-pi(?:e)?)\b[^\n;&|]*\s(['"]?)([^'"\s;&|]+)\1/i);
+  const inPlaceEditTarget = normalizeShellMutationPath(inPlaceEditPath?.[2] || "");
+  if (inPlaceEditTarget) return `shell-write:${inPlaceEditTarget}`;
   return null;
 }
 

@@ -219,7 +219,7 @@ export interface OrchestratorCallbacks {
     meta?: {
       hasToolCalls?: boolean;
       hiddenThought?: string;
-      visibility?: "user_progress" | "hidden_process" | "substantive_plan_text";
+      visibility?: "user_progress" | "hidden_process" | "stage_summary" | "substantive_plan_text";
       preserveAssistantText?: boolean;
       capsuleCandidate?: boolean;
       modelAuthored?: boolean;

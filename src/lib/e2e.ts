@@ -1975,6 +1975,17 @@ function seedReadContextAgentSegmentScenario() {
     {
       id: useAppStore.getState()._nextTaskId(),
       turnId,
+      type: "agent" as const,
+      content: [
+        "已确认问题来自执行摘要没有独立的可见性身份，导致有依据的阶段结论和普通工具旁白一起被折叠。",
+        "下一步将核对 README 中的展示约束，并保留这条问题摘要作为后续修改依据。",
+      ].join("\n\n"),
+      streaming: false,
+      visibility: "stage_summary" as const,
+    },
+    {
+      id: useAppStore.getState()._nextTaskId(),
+      turnId,
       type: "tool" as const,
       toolName: "read_document",
       target: "README.md",
@@ -4711,7 +4722,10 @@ function seedExecutionCapsulePanelStabilityScenario() {
   bridge.failNextPlanExecutionSubmission = () => {
     const originalSendMessage = useAppStore.getState().sendMessage;
     const interceptSendMessage: typeof originalSendMessage = (text, images, options) => {
-      if (options?.runtimeIntentOverride === "execute" && options?.reuseCurrentTurn === true) {
+      if (
+        (options?.runtimeIntentOverride === "execute" || options?.resolvedIntent === "execute") &&
+        options?.reuseCurrentTurn === true
+      ) {
         useAppStore.setState({ sendMessage: originalSendMessage });
         appendBridgeEvent("plan_execution_submission_rejected");
         return false;

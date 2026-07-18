@@ -229,7 +229,6 @@ const EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS = new Set([
 ]);
 
 const EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS = new Set([
-  "send_pty_input",
   ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
 ]);
 
@@ -251,12 +250,10 @@ const EXECUTE_RECOVERY_RECONCILE_SERVER_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS,
 ]);
 
-/** Broad fallback retained only for an actually failed/stopped process. */
+/** A failed/stopped process may be inspected or relaunched, never source-edited. */
 export const EXECUTE_RECOVERY_CORE_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_TARGETING_TOOLS,
-  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
-  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
-  ...EXECUTE_RECOVERY_VALIDATION_TOOLS,
+  ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
+  ...EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS,
 ]);
 
 /**
@@ -934,9 +931,6 @@ export function resolveExecuteRecoveryBatchDecision(input: {
         return scopedEligible.find((call) => EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS.has(call.name));
       case "recover_process":
         return scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS.has(call.name)) ||
-          matchingRead ||
-          matchingMutation ||
-          scopedEligible.find((call) => call.name === "run_command") ||
           scopedEligible.find((call) => call.name === "execute_command");
       case "reconcile_server":
         return scopedEligible.find((call) =>

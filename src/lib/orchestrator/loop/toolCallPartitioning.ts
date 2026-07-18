@@ -55,6 +55,7 @@ import { planReadFileWindowCoverage } from "../../readFileWindow";
 import {
   buildRepeatLoopArgsKey,
   buildRepeatLoopSignature,
+  getShellMutationTargetForLoopGuard,
 } from "../../repetitionGuard";
 import type { ResolvedUserIntent } from "../../runIntent";
 import { initialLifecycleStateForPlanAction, planRuntimeToolCall } from "../../runtimeTools";
@@ -95,6 +96,7 @@ import type {
   WriteToolCallForRound,
 } from "./toolExecutionRound";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import { hasStructuredWorkspaceMutationEvidence } from "./toolCallPlanning";
 import type { TurnIterationContext } from "./turnIterationContext";
 
 export interface ToolCallPartitioningResult {
@@ -265,6 +267,10 @@ export async function partitionToolCallsForExecution(input: {
   let sawOrderSensitiveWorkspaceAction = false;
   let deferRemainingCallsForBatchOrder = false;
   const executeRecoveryContract = recoveryActionContract;
+  const structuredMutationObserved = hasStructuredWorkspaceMutationEvidence({
+    callbacks,
+    recentToolActivity,
+  });
   const executeRecoveryBatchDecision = resolveExecuteRecoveryBatchDecision({
     mode: executeRecoveryMode,
     calls: toolCalls.map((call) => {
@@ -342,7 +348,6 @@ export async function partitionToolCallsForExecution(input: {
       !callbacks.getIsPlanApproved() &&
       isPreApprovalPlanDraftWrite(tc.name, toolArgs);
     if (!availableToolNames.has(tc.name) && !isAllowedPlanDraftMutation) {
-      const isUnapprovedPlanContext = workflowMode === "plan" && !callbacks.getIsPlanApproved();
       const unsupportedMessage = planUnsupportedToolFeedbackMessage({
         language: callbacks.getPreferredLanguage(),
         toolName: tc.name,
@@ -355,8 +360,13 @@ export async function partitionToolCallsForExecution(input: {
       const isExecuteRecoveryScopeCorrection = executeRecoveryBatchDecision.active;
       const isReadScopeDeferred = tc.name === "read_file";
       const isDelegationPolicyDeferral = tc.name === "spawn_subagent";
-      const isInternalScopeDeferral =
-        isExecuteRecoveryScopeCorrection || isReadScopeDeferred || isDelegationPolicyDeferral;
+      const qualityGateReason = isExecuteRecoveryScopeCorrection
+        ? "execute_recovery_scope_deferred"
+        : isDelegationPolicyDeferral
+        ? "subagent_delegation_deferred"
+        : isReadScopeDeferred
+        ? "read_scope_deferred"
+        : "tool_unavailable_for_turn_phase";
       const message = isExecuteRecoveryScopeCorrection
         ? tc.name === "read_file"
           ? callbacks.getPreferredLanguage() === "zh"
@@ -406,43 +416,102 @@ export async function partitionToolCallsForExecution(input: {
         availableToolNames: Array.from(availableToolNames).slice(0, 12),
         planRuntimePhase,
         preservedVisibleText: false,
-        internalFeedback: isUnapprovedPlanContext || isInternalScopeDeferral,
+        internalFeedback: true,
       });
-      if (!isUnapprovedPlanContext && !isInternalScopeDeferral) {
-        callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
-      } else if (isInternalScopeDeferral) {
-        toolFailureSignatures.delete(tc.id);
-        callbacks.onToolDone(tc.name, target, message, {
-          toolCallId: tc.id,
-          internalFeedback: true,
-          qualityGateReason: isExecuteRecoveryScopeCorrection
-            ? "execute_recovery_scope_deferred"
-            : isDelegationPolicyDeferral
-            ? "subagent_delegation_deferred"
-            : "read_scope_deferred",
-        });
-      }
+      toolFailureSignatures.delete(tc.id);
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason,
+      });
       preExecutionResults.push({
         toolCallId: tc.id,
         name: tc.name,
         target,
-        content: isInternalScopeDeferral ? message : `Error: ${message}`,
-        isError: !isInternalScopeDeferral,
-        lifecycleState: isInternalScopeDeferral ? "completed" : "blocked",
-        ...(isInternalScopeDeferral
-          ? {
-              qualityGateReason: isExecuteRecoveryScopeCorrection
-                ? "execute_recovery_scope_deferred"
-                : isDelegationPolicyDeferral
-                ? "subagent_delegation_deferred"
-                : "read_scope_deferred",
-              internalFeedback: true,
-              displayContent: "",
-            }
-          : {}),
-        ...(isUnapprovedPlanContext && !isExecuteRecoveryScopeCorrection
-          ? { internalFeedback: true, displayContent: "" }
-          : {}),
+        content: message,
+        isError: false,
+        lifecycleState: "completed",
+        qualityGateReason,
+        internalFeedback: true,
+        displayContent: "",
+      });
+      continue;
+    }
+
+    const longProcessBeforeFileMutation =
+      callbacks.getCommandDirective?.()?.kind === "file_modify" &&
+      !structuredMutationObserved &&
+      (tc.name === "run_command" || tc.name === "execute_command") &&
+      looksLongRunningShellCommand(toolArgs.command);
+    if (longProcessBeforeFileMutation) {
+      const language = callbacks.getPreferredLanguage();
+      const message = language === "zh"
+        ? "LONG_PROCESS_BEFORE_FILE_MUTATION_DEFERRED: 文件修改回合尚无结构化源码改动证据。请先用 apply_patch、replace_in_file 或 write_file 完成改动；开发服务器和其他长进程会在修改后验证阶段开放。"
+        : "LONG_PROCESS_BEFORE_FILE_MUTATION_DEFERRED: This file-modification turn has no structured source mutation yet. Use apply_patch, replace_in_file, or write_file first; dev servers and other long processes become available in the post-mutation validation phase.";
+      toolFailureSignatures.delete(tc.id);
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "long_process_before_file_mutation_deferred",
+      });
+      logAgentEvent("long_process_before_file_mutation_deferred", {
+        iteration,
+        tool: tc.name,
+        target,
+        commandDirectiveKind: "file_modify",
+        structuredMutationObserved: false,
+        diskWritten: false,
+        internalFeedback: true,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: "",
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "long_process_before_file_mutation_deferred",
+      });
+      continue;
+    }
+
+    const shellMutationTarget = getShellMutationTargetForLoopGuard(tc.name, toolArgs);
+    if (
+      callbacks.getCommandDirective?.()?.kind === "file_modify" &&
+      shellMutationTarget
+    ) {
+      const language = callbacks.getPreferredLanguage();
+      const message = language === "zh"
+        ? `SHELL_SOURCE_MUTATION_DEFERRED: ${tc.name} 检测到写入动作 ${shellMutationTarget}。文件修改回合必须使用 apply_patch、replace_in_file 或 write_file，以保留 changedPaths、diff 和恢复证据；本次 shell 写入未执行。`
+        : `SHELL_SOURCE_MUTATION_DEFERRED: ${tc.name} contains the write action ${shellMutationTarget}. File-modification turns must use apply_patch, replace_in_file, or write_file so changedPaths, diffs, and recovery evidence remain structured; this shell write did not run.`;
+      toolFailureSignatures.delete(tc.id);
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "shell_source_mutation_deferred",
+      });
+      logAgentEvent("shell_source_mutation_deferred", {
+        iteration,
+        tool: tc.name,
+        target,
+        shellMutationTarget,
+        commandDirectiveKind: "file_modify",
+        nativeMutationTools: ["apply_patch", "replace_in_file", "write_file"],
+        diskWritten: false,
+        internalFeedback: true,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: "",
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "shell_source_mutation_deferred",
       });
       continue;
     }

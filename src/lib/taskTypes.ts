@@ -55,6 +55,7 @@ export interface DiffRevertResult {
 export type AssistantTextVisibility =
   | "user_progress"
   | "hidden_process"
+  | "stage_summary"
   | "substantive_plan_text";
 
 export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {

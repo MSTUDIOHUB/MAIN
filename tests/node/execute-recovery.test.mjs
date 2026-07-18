@@ -1013,7 +1013,7 @@ test("one recovery contract atomically advances long-running validation from PTY
   assert.equal(pending.ptyGeneration, 4);
   assert.equal(pending.allowedToolNames.has("get_pty_status"), true);
   assert.equal(pending.allowedToolNames.has("read_pty_tail"), true);
-  assert.equal(pending.allowedToolNames.has("send_pty_input"), true);
+  assert.equal(pending.allowedToolNames.has("send_pty_input"), false);
   assert.equal(pending.allowedToolNames.has("browser_evaluate"), false);
   assert.equal(pending.allowedToolNames.has("read_file"), false);
   const pendingBatch = resolveExecuteRecoveryBatchDecision({
@@ -1033,7 +1033,7 @@ test("one recovery contract atomically advances long-running validation from PTY
   assert.equal(pendingWrongOnly.selectedCallId, null);
   assert.deepEqual(pendingWrongOnly.deferredCallIds, ["restart-while-running"]);
 
-  const interactiveBatch = resolveExecuteRecoveryBatchDecision({
+  const observationBatch = resolveExecuteRecoveryBatchDecision({
     mode: "action_plus_targeting",
     contract: pending,
     calls: [
@@ -1041,7 +1041,7 @@ test("one recovery contract atomically advances long-running validation from PTY
       { id: "tail-after-input", name: "read_pty_tail", target: "terminal tail" },
     ],
   });
-  assert.equal(interactiveBatch.selectedCallId, "answer-prompt");
+  assert.equal(observationBatch.selectedCallId, "tail-after-input");
 
   const ready = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     devServerStatus: "ready",
@@ -1122,19 +1122,18 @@ test("one recovery contract atomically advances long-running validation from PTY
   assert.equal(failed.phase, "reconcile");
   assert.equal(failed.nextRequiredCapability, "recover_process");
   assert.equal(failed.surfaceDescription, "capability:recover_process");
-  assert.equal(failed.allowTargetedFileRead, true);
+  assert.equal(failed.allowTargetedFileRead, false);
   for (const name of [
     "read_pty_tail",
     "read_pty_since",
     "get_pty_status",
-    "read_file",
-    "apply_patch",
-    "run_command",
     "execute_command",
   ]) {
     assert.equal(failed.allowedToolNames.has(name), true, `${name} should remain available after failure`);
   }
-  assert.equal(failed.allowedToolNames.has("send_pty_input"), true);
+  for (const name of ["read_file", "apply_patch", "run_command", "send_pty_input", "browser_evaluate"]) {
+    assert.equal(failed.allowedToolNames.has(name), false, `${name} must stay outside process recovery`);
+  }
   const stopped = resolveExecuteRecoveryActionContract("validation_only", {
     expectedTarget: "src/App.tsx",
     devServerStatus: "stopped",
@@ -1142,7 +1141,7 @@ test("one recovery contract atomically advances long-running validation from PTY
   });
   assert.equal(stopped.nextRequiredCapability, "recover_process");
   assert.equal(stopped.allowedToolNames.has("read_pty_tail"), true);
-  assert.equal(stopped.allowedToolNames.has("run_command"), true);
+  assert.equal(stopped.allowedToolNames.has("run_command"), false);
   assert.equal(stopped.allowedToolNames.has("execute_command"), true);
   const failedBatch = resolveExecuteRecoveryBatchDecision({
     mode: "action_plus_targeting",
@@ -2513,6 +2512,156 @@ test("patch recovery without an active read lease returns to the mutation surfac
   ]);
 });
 
+test("direct file modification exposes source tools before structured mutation and validation tools after it", () => {
+  const tools = [
+    "spawn_subagent",
+    "read_file",
+    "apply_patch",
+    "run_command",
+    "execute_command",
+    "send_pty_input",
+    "get_pty_status",
+    "browser_evaluate",
+    "web_search",
+  ].map((name) => ({
+    type: "function",
+    function: { name, description: name, parameters: { type: "object", properties: {} } },
+  }));
+  const makeInput = (recentToolActivity = []) => ({
+    callbacks: {
+      getCommandDirective: () => ({ kind: "file_modify", action: "workspace_file_change" }),
+      getConfig: () => createLocalRuntimeConfig(),
+      getCurrentTurnId: () => "turn-file-modify",
+      getIsPlanApproved: () => false,
+      getPlanTasks: () => [],
+      getPlanExecutionEvidenceLedger: () => [],
+      getMessages: () => [],
+      getPlanStage: () => "idle",
+      getPendingSubagentIds: () => [],
+    },
+    iteration: 1,
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    rawIterationAllTools: tools,
+    executeRecoveryMode: "normal",
+    executeRecoveryReason: "",
+    executeRecoveryAttempts: 0,
+    recoveryIterationCount: 0,
+    maxRecoveryIterations: 6,
+    recentToolActivity,
+    recentPlanToolActivity: [],
+    planRuntimePhase: "idle",
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: {},
+    lastAssistantTextForCheckpoint: "",
+  });
+
+  const sourceChange = resolveIterationToolSurface(makeInput());
+  assert.equal(sourceChange.directFileModifyPhase, "source_change");
+  assert.equal(sourceChange.availableToolNames.has("read_file"), true);
+  assert.equal(sourceChange.availableToolNames.has("apply_patch"), true);
+  assert.equal(sourceChange.availableToolNames.has("run_command"), true);
+  assert.equal(sourceChange.availableToolNames.has("execute_command"), false);
+  assert.equal(sourceChange.availableToolNames.has("send_pty_input"), false);
+  assert.equal(sourceChange.availableToolNames.has("browser_evaluate"), false);
+  assert.equal(sourceChange.availableToolNames.has("web_search"), false);
+
+  const validation = resolveIterationToolSurface(makeInput([{
+    name: "apply_patch",
+    target: "src/main.js",
+    status: "succeeded",
+  }]));
+  assert.equal(validation.directFileModifyPhase, "validation");
+  assert.equal(validation.availableToolNames.has("execute_command"), true);
+  assert.equal(validation.availableToolNames.has("get_pty_status"), true);
+  assert.equal(validation.availableToolNames.has("browser_evaluate"), true);
+  assert.equal(validation.availableToolNames.has("web_search"), false);
+});
+
+test("file modification defers Python source writes as invisible internal feedback", async () => {
+  const toolDone = [];
+  const toolErrors = [];
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "python-source-write",
+      name: "run_command",
+      arguments: JSON.stringify({
+        command: "python3 <<'PY'\nwith open('src/main.js', 'w') as f:\n  f.write('changed')\nPY",
+        description: "rewrite source",
+        cwd: ".",
+      }),
+    }],
+    callbacks: {
+      ...createReadFilePartitionInput().callbacks,
+      getCommandDirective: () => ({ kind: "file_modify", action: "workspace_file_change" }),
+      onToolDone: (...args) => toolDone.push(args),
+      onToolError: (...args) => toolErrors.push(args),
+    },
+    availableToolNames: new Set(["run_command", "apply_patch", "replace_in_file", "write_file"]),
+  }));
+
+  assert.equal(result.writeCalls.length, 0);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.equal(result.preExecutionResults[0].internalFeedback, true);
+  assert.equal(result.preExecutionResults[0].displayContent, "");
+  assert.equal(result.preExecutionResults[0].qualityGateReason, "shell_source_mutation_deferred");
+  assert.equal(toolDone.length, 1);
+  assert.equal(toolErrors.length, 0);
+});
+
+test("file modification defers a dev server until structured mutation exists", async () => {
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "premature-dev-server",
+      name: "run_command",
+      arguments: JSON.stringify({
+        command: "npm run dev",
+        description: "start dev server",
+        cwd: ".",
+      }),
+    }],
+    callbacks: {
+      ...createReadFilePartitionInput().callbacks,
+      getCommandDirective: () => ({ kind: "file_modify", action: "workspace_file_change" }),
+    },
+    availableToolNames: new Set(["run_command", "apply_patch", "replace_in_file", "write_file"]),
+  }));
+
+  assert.equal(result.writeCalls.length, 0);
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.equal(result.preExecutionResults[0].internalFeedback, true);
+  assert.equal(result.preExecutionResults[0].displayContent, "");
+  assert.equal(
+    result.preExecutionResults[0].qualityGateReason,
+    "long_process_before_file_mutation_deferred",
+  );
+});
+
+test("a tool outside the current request schema is internal correction, not a visible tool error", async () => {
+  const toolDone = [];
+  const toolErrors = [];
+  const result = await partitionToolCallsForExecution(createReadFilePartitionInput({
+    toolCalls: [{
+      id: "unavailable-execute-command",
+      name: "execute_command",
+      arguments: JSON.stringify({ command: "npm run dev", description: "start", cwd: "." }),
+    }],
+    callbacks: {
+      ...createReadFilePartitionInput().callbacks,
+      onToolDone: (...args) => toolDone.push(args),
+      onToolError: (...args) => toolErrors.push(args),
+    },
+    availableToolNames: new Set(["read_file", "apply_patch", "run_command"]),
+  }));
+
+  assert.equal(result.preExecutionResults.length, 1);
+  assert.equal(result.preExecutionResults[0].internalFeedback, true);
+  assert.equal(result.preExecutionResults[0].displayContent, "");
+  assert.equal(result.preExecutionResults[0].qualityGateReason, "tool_unavailable_for_turn_phase");
+  assert.equal(toolDone.length, 1);
+  assert.equal(toolErrors.length, 0);
+});
+
 test("adaptive delegation exposes spawn only during useful context or diagnosis phases", () => {
   const tools = ["read_file", "spawn_subagent", "wait_subagents", "apply_patch"].map((name) => ({
     type: "function",
@@ -3011,7 +3160,7 @@ test("iteration tool planning derives action-plus PTY and browser surfaces from 
   assert.equal(pending.recoveryActionContract.nextRequiredCapability, "observe_pty");
   assert.deepEqual(
     pending.iterationAllTools.map((tool) => tool.function.name),
-    ["send_pty_input", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"],
+    ["read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status"],
   );
 
   const ready = resolveIterationToolSurface({
@@ -3087,16 +3236,11 @@ test("iteration tool planning derives action-plus PTY and browser surfaces from 
   assert.deepEqual(
     failed.iterationAllTools.map((tool) => tool.function.name),
     [
-      "read_file",
-      "apply_patch",
-      "run_command",
       "execute_command",
-      "send_pty_input",
       "read_pty_buffer",
       "read_pty_tail",
       "read_pty_since",
       "get_pty_status",
-      "browser_evaluate",
     ],
   );
 });

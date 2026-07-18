@@ -350,7 +350,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(loopMutableStateSource, /createExecuteRecoveryRuntimeState\(\{/);
   assert.match(source, /createAgentLoopRuntimeActions\(\{/);
   assert.match(loopRuntimeActionsSource, /activateExecuteRecoveryRuntimeState\(/);
-  assert.match(iterationStreamPreparationSource, /advanceExecuteRecoveryRuntimeIteration\(input\.executeRecoveryState\)/);
+  assert.match(iterationStreamPreparationSource, /advanceExecuteRecoveryRuntimeIteration\(recoveryStateForIteration\)/);
+  assert.match(iterationStreamPreparationSource, /premature_file_modify_lifecycle_recovery_cleared/);
   assert.match(loopRuntimeActionsSource, /clearExecuteRecoveryRuntimeState\(stateOverride\)/);
   assert.match(loopMutableStateSource, /createPlanLoopRuntimeState\(\{/);
   assert.match(loopRuntimeActionsSource, /applyPlanRuntimePhase\(/);

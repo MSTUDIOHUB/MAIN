@@ -552,7 +552,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "run_command",
-      description: "同步执行一个 shell 命令并等待结束，返回 stdout、stderr、exitCode、timedOut、durationMs。适合运行测试、构建、Python 脚本、一次性检查命令；比 execute_command 更适合需要明确成功/失败的步骤。",
+      description: "同步执行一个有限时 shell 命令并等待结束，返回 stdout、stderr、exitCode、timedOut、durationMs。适合测试、构建和一次性诊断；比 execute_command 更适合需要明确成功/失败的步骤。文件修改回合不得用 Python、重定向、sed 或临时脚本写工作区源码，必须改用 apply_patch、replace_in_file 或 write_file 以保留结构化 diff 与 changedPaths。",
       parameters: {
         type: "object",
         properties: {

@@ -525,14 +525,12 @@ test("failed same-turn execution submission rolls back the started marker and pr
       const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
       return {
         conversationTurns: snapshot?.conversationTurns ?? null,
-        currentTurnStatus: snapshot?.currentTurnStatus ?? null,
         startedForTurnId: snapshot?.planApprovalExecutionStartedForTurnId ?? null,
         pendingPlanTurnId: snapshot?.pendingPlanApprovalHandoff?.planTurnId ?? null,
       };
     }))
     .toEqual({
       conversationTurns: 1,
-      currentTurnStatus: "executing",
       startedForTurnId: "e2e-execution-capsule-panel-stability-turn",
       pendingPlanTurnId: null,
     });

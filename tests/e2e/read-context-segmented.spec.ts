@@ -35,6 +35,8 @@ test("model-claimed stage summary stays out of ChatArea while read/search eviden
   await expect(page.getByText("第二段读取完成。")).toBeVisible();
   const stageSummary = page.getByText("阶段性结论：第一段读取确认 ChatArea 会把读取记录按正文边界分段。");
   await expect(stageSummary).toHaveCount(0);
+  await expect(page.getByText("已确认问题来自执行摘要没有独立的可见性身份")).toBeVisible();
+  await expect(page.getByText("下一步将核对 README 中的展示约束")).toBeVisible();
 
   const processTimeline = page.getByTestId("live-turn-process-timeline");
   await expect(processTimeline).toBeVisible();

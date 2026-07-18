@@ -1,4 +1,5 @@
 import { isPreApprovalPlanDraftWrite, parseToolCallArguments } from "../../orchestrator";
+import { isActionableStageSummary } from "../../modelFeedbackDedupe";
 import type { LegacyWorkflowMode } from "../../runIntent";
 import { looksLikeSubstantivePlanAssistantText } from "../../workflowModels";
 import type { ToolCallToExecute } from "../types";
@@ -13,7 +14,7 @@ export interface ToolProgressRoutingDecision {
 export interface ToolProgressPresentationDecision {
   shouldRenderToolProgress: boolean;
   shouldPreserveApprovedExecutionText: boolean;
-  visibility: "substantive_plan_text" | "user_progress" | "hidden_process" | undefined;
+  visibility: "substantive_plan_text" | "stage_summary" | "user_progress" | "hidden_process" | undefined;
   capsuleCandidate: boolean;
   modelAuthored: boolean;
 }
@@ -84,6 +85,7 @@ export function shouldInjectRuntimeToolNarration(input: {
 
 export function resolveToolProgressPresentation(input: {
   progressEligibleToolCallCount: number;
+  unsupportedToolCallCount: number;
   finalReplyOptionCount: number;
   hasSubstantivePlanAssistantText: boolean;
   workflowMode: LegacyWorkflowMode;
@@ -100,17 +102,26 @@ export function resolveToolProgressPresentation(input: {
     shouldRenderToolProgress &&
     !input.runtimeNarrationInjected &&
     input.visibleAssistantText.trim().length > 0;
-  // Model text emitted alongside a tool call is protocol narration, not an
-  // evidence-backed stage checkpoint. Keep it in the assistant/tool transcript
-  // for the next model turn, but hide it from the primary ChatArea projection;
-  // structured tool/progress events carry the user-visible activity instead.
-  const shouldPreserveApprovedExecutionText = false;
+  const actionableStageSummary =
+    modelAuthoredToolNarration &&
+    isActionableStageSummary(input.visibleAssistantText);
+  const unsupportedOnlyToolNarration =
+    input.unsupportedToolCallCount > 0 &&
+    input.progressEligibleToolCallCount === 0;
+  // Pure tool narration remains process-only. A compact evidence-backed
+  // finding that also names the next action is a durable stage summary and may
+  // stay in ChatArea; unsupported-tool corrections never qualify.
+  const shouldPreserveApprovedExecutionText = actionableStageSummary;
 
   return {
     shouldRenderToolProgress,
     shouldPreserveApprovedExecutionText,
     visibility: input.hasSubstantivePlanAssistantText
       ? "substantive_plan_text"
+      : actionableStageSummary
+      ? "stage_summary"
+      : unsupportedOnlyToolNarration
+      ? "hidden_process"
       : modelAuthoredToolNarration
       ? "hidden_process"
       : shouldRenderToolProgress || input.shouldSuppressApprovedPlanNoToolText

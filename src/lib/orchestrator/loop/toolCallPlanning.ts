@@ -41,9 +41,107 @@ export interface IterationToolSurfaceDecision {
   isExecuteRecoveryEligible: boolean;
   allowExecuteRecoveryFileRead: boolean;
   recoveryActionContract: RecoveryActionContract;
+  directFileModifyPhase: DirectFileModifyPhase;
   delegationDecision: DelegationDecision;
   iterationAllTools: ToolDefinition[];
   availableToolNames: Set<string>;
+}
+
+export type DirectFileModifyPhase = "source_change" | "validation" | null;
+
+const DIRECT_FILE_MODIFY_SOURCE_TOOLS = new Set([
+  "spawn_subagent",
+  "wait_subagents",
+  "list_directory",
+  "glob_search",
+  "grep_search",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
+  "code_ast_query",
+  "find_symbol_references",
+  "read_file",
+  "replace_in_file",
+  "write_file",
+  "apply_patch",
+  "git_status",
+  "git_diff",
+  "run_command",
+  "get_project_skeleton",
+  "get_file_outline",
+]);
+
+const DIRECT_FILE_MODIFY_VALIDATION_TOOLS = new Set([
+  ...DIRECT_FILE_MODIFY_SOURCE_TOOLS,
+  "execute_command",
+  "send_pty_input",
+  "browser_evaluate",
+  "read_pty_buffer",
+  "read_pty_tail",
+  "read_pty_since",
+  "get_pty_status",
+  "clear_pty_buffer",
+]);
+
+export function hasStructuredWorkspaceMutationEvidence(input: {
+  callbacks: OrchestratorCallbacks;
+  recentToolActivity: PlanToolActivitySummary[];
+}): boolean {
+  if (input.recentToolActivity.some((activity) =>
+    activity.status === "succeeded" && isWorkspaceMutationToolName(activity.name)
+  )) return true;
+
+  return scopeExecutionEvidenceLedger(
+    input.callbacks.getPlanExecutionEvidenceLedger(),
+    input.callbacks.getCurrentTurnId?.(),
+  ).some((entry) =>
+    entry.kind === "file" && isWorkspaceMutationToolName(entry.sourceTool)
+  );
+}
+
+function resolveDirectFileModifyPhase(input: {
+  callbacks: OrchestratorCallbacks;
+  workflowMode: "chat" | "edit" | "plan";
+  runtimeIntent: ResolvedUserIntent;
+  executeRecoveryMode: ExecuteRecoveryMode;
+  recentToolActivity: PlanToolActivitySummary[];
+}): DirectFileModifyPhase {
+  if (
+    input.workflowMode !== "edit" ||
+    !isMutationRuntimeIntent(input.runtimeIntent) ||
+    input.executeRecoveryMode !== "normal" ||
+    input.callbacks.getIsPlanApproved() ||
+    input.callbacks.getCommandDirective?.()?.kind !== "file_modify"
+  ) return null;
+
+  return hasStructuredWorkspaceMutationEvidence(input)
+    ? "validation"
+    : "source_change";
+}
+
+export function buildDirectFileModifyActionContractCard(input: {
+  phase: Exclude<DirectFileModifyPhase, null>;
+  availableToolNames: Iterable<string>;
+}): string {
+  const availableTools = [...new Set(input.availableToolNames)].sort().join(", ");
+  const phaseGuidance = input.phase === "source_change"
+    ? [
+        "The user intent is a workspace file modification. Locate only the source context needed for the change, then modify source with apply_patch, replace_in_file, or write_file.",
+        "run_command is available only for finite diagnostics in this phase. Do not use Python, shell redirection, sed, or temporary scripts to write workspace source, and do not start a dev server before structured file-mutation evidence exists.",
+      ]
+    : [
+        "Structured workspace mutation evidence exists. Use finite run_command validation next when appropriate; use execute_command only for a genuinely long-running process and inspect that process through the PTY tools before browser validation.",
+        "If validation identifies a source defect, repair it with apply_patch, replace_in_file, or write_file so the changed path and diff remain structured evidence.",
+      ];
+  return [
+    "[TURN_ACTION_CONTRACT]",
+    `intent=file_modify; phase=${input.phase}`,
+    `availableTools=${availableTools}`,
+    ...phaseGuidance,
+    "Call only a tool in availableTools. MAIN changes the real tool schema when the execution phase advances.",
+  ].join("\n");
 }
 
 export function resolveIterationToolSurface(input: {
@@ -214,12 +312,50 @@ export function resolveIterationToolSurface(input: {
         ),
       ]
     : initialBaseIterationAllTools;
-  const phaseScopedIterationAllTools = filterPlanRuntimeToolDefinitionsForPhase({
+  const planPhaseScopedIterationAllTools = filterPlanRuntimeToolDefinitionsForPhase({
     tools: baseIterationAllTools,
     workflowMode,
     isPlanApproved: callbacks.getIsPlanApproved(),
     planRuntimePhase,
   });
+  const directFileModifyPhase = resolveDirectFileModifyPhase({
+    callbacks,
+    workflowMode,
+    runtimeIntent,
+    executeRecoveryMode,
+    recentToolActivity,
+  });
+  const directFileModifyAllowedTools = directFileModifyPhase === "source_change"
+    ? DIRECT_FILE_MODIFY_SOURCE_TOOLS
+    : directFileModifyPhase === "validation"
+    ? DIRECT_FILE_MODIFY_VALIDATION_TOOLS
+    : null;
+  const phaseScopedIterationAllTools = directFileModifyAllowedTools
+    ? planPhaseScopedIterationAllTools.filter((tool) =>
+        directFileModifyAllowedTools.has(tool.function.name)
+      )
+    : planPhaseScopedIterationAllTools;
+  if (
+    directFileModifyPhase &&
+    phaseScopedIterationAllTools.length !== planPhaseScopedIterationAllTools.length
+  ) {
+    logAgentEvent("direct_file_modify_tool_scope_applied", {
+      iteration,
+      phase: directFileModifyPhase,
+      commandDirectiveKind: callbacks.getCommandDirective?.()?.kind || null,
+      rawToolCount: planPhaseScopedIterationAllTools.length,
+      scopedToolCount: phaseScopedIterationAllTools.length,
+      removedTools: planPhaseScopedIterationAllTools
+        .map((tool) => tool.function.name)
+        .filter((name) => !directFileModifyAllowedTools!.has(name))
+        .slice(0, 24),
+      scopedTools: phaseScopedIterationAllTools
+        .map((tool) => tool.function.name)
+        .slice(0, 24),
+      structuredMutationObserved: directFileModifyPhase === "validation",
+      providerNeutral: true,
+    });
+  }
   const delegationActivities = workflowMode === "plan" && !callbacks.getIsPlanApproved()
     ? recentPlanToolActivity
     : recentToolActivity;
@@ -382,6 +518,7 @@ export function resolveIterationToolSurface(input: {
       executeRecoveryMode,
       executeRecoveryReason,
       executeContractOwnsSurface,
+      directFileModifyPhase,
       // Report the effective surface, not an upstream eligibility hint. Those
       // can legitimately be true while a later phase filter removes read_file.
       allowFileRead: scopedToolNameSet.has("read_file"),
@@ -410,6 +547,7 @@ export function resolveIterationToolSurface(input: {
     isExecuteRecoveryEligible,
     allowExecuteRecoveryFileRead,
     recoveryActionContract,
+    directFileModifyPhase,
     delegationDecision,
     iterationAllTools,
     availableToolNames: new Set(iterationAllTools.map((tool) => tool.function.name)),

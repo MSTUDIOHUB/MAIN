@@ -544,14 +544,13 @@ test("volatile terminal observations are never eligible for the read-only cache"
   assert.equal(cachePolicy.shouldCacheReadOnlyToolResult("read_file"), true);
 });
 
-test("the unified execute recovery surface preserves the PTY process lifecycle", () => {
+test("the unified execute recovery surface keeps PTY observation diagnostic-only", () => {
   const readOnlyTools = new Set(["read_pty_tail", "get_pty_status"]);
   const contract = recoveryTools.resolveExecuteRecoveryActionContract("validation_only", {
     devServerStatus: "running",
     devServerNextCapability: "observe_pty",
   });
   for (const name of [
-    "send_pty_input",
     "read_pty_buffer",
     "read_pty_tail",
     "read_pty_since",
@@ -559,6 +558,10 @@ test("the unified execute recovery surface preserves the PTY process lifecycle",
   ]) {
     assert.equal(recoveryTools.isExecuteRecoveryToolName(name, readOnlyTools, { contract }), true, name);
   }
+  assert.equal(
+    recoveryTools.isExecuteRecoveryToolName("send_pty_input", readOnlyTools, { contract }),
+    false,
+  );
   assert.equal(
     recoveryTools.isExecuteRecoveryToolName("execute_command", readOnlyTools, { contract }),
     false,

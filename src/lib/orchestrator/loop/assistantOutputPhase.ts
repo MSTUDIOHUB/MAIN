@@ -566,6 +566,7 @@ export function handleAssistantOutputPhase(input: {
 
   const toolProgressPresentation = resolveToolProgressPresentation({
     progressEligibleToolCallCount: progressEligibleToolCalls.length,
+    unsupportedToolCallCount: unsupportedToolCalls.length,
     finalReplyOptionCount: finalReplyOptions.length,
     hasSubstantivePlanAssistantText,
     workflowMode,

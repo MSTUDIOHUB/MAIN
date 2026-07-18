@@ -3669,11 +3669,13 @@ export default function ChatArea({
         if (idx === finalVisibleAgentIndex) return false;
         if (!block || block.type !== "agent" || block.hiddenProcess || block.streaming) return false;
         if (Array.isArray(block.options) && block.options.length > 0) return false;
-        // Only the reviewed Plan draft has an explicit semantic presentation
-        // identity here. Execute-stage model prose is process narration even
-        // when it says "root cause" or "confirmed"; runtime progress/checkpoint
-        // blocks, not wording heuristics, own visible stage summaries.
-        if (block.visibility !== "substantive_plan_text") return false;
+        // Reviewed Plan text and runtime-classified stage summaries have an
+        // explicit semantic identity. Ordinary execute prose remains process
+        // narration; wording alone cannot promote it into ChatArea.
+        if (
+          block.visibility !== "substantive_plan_text" &&
+          block.visibility !== "stage_summary"
+        ) return false;
         const text = getAgentVisibleMarkdownText(block);
         const content = String(text || "").trim();
         if (!content) return false;
