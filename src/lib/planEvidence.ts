@@ -1201,9 +1201,14 @@ function deriveInteractionMutationEvidence(input: {
     }
   }
 
+  const interactionBehaviorTargets = Array.from(targets).slice(0, 80);
   return {
-    interactionMutation,
-    interactionBehaviorTargets: Array.from(targets).slice(0, 80),
+    // Browser interaction evidence is actionable only when the source diff
+    // exposes a concrete DOM target. Custom window/Tauri events can contain
+    // addEventListener without any selector the browser DSL can operate; an
+    // empty target set would create an obligation that can never be closed.
+    interactionMutation: interactionMutation && interactionBehaviorTargets.length > 0,
+    interactionBehaviorTargets,
   };
 }
 
@@ -1260,7 +1265,7 @@ export function createPlanExecutionEvidenceEntry(input: {
       ...base,
       kind: "file",
       ...(changedIdentifiers.length > 0 ? { changedIdentifiers } : {}),
-      ...(interaction.interactionMutation ? { interactionMutation: true } : {}),
+      interactionMutation: interaction.interactionMutation,
       ...(interaction.interactionBehaviorTargets.length > 0
         ? { interactionBehaviorTargets: interaction.interactionBehaviorTargets }
         : {}),

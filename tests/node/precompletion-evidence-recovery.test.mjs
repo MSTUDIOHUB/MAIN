@@ -304,6 +304,49 @@ test("a changed referenced event-handler body creates an interaction obligation"
   assert.equal(audit.gap, "browser_validation_required");
 });
 
+test("a custom window event without a DOM target does not create an impossible browser obligation", () => {
+  const before = [
+    "document.addEventListener('DOMContentLoaded', () => {",
+    "  initializeApp();",
+    "});",
+  ].join("\n");
+  const after = [
+    "document.addEventListener('DOMContentLoaded', () => {",
+    "  function handleFileOpen(event) {",
+    "    openFiles(event.detail.paths);",
+    "  }",
+    "  window.addEventListener('file-open', handleFileOpen);",
+    "  initializeApp();",
+    "});",
+  ].join("\n");
+  const customEventMutation = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "apply_patch",
+    target: "src/main.js",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: before,
+      new: after,
+      path: "src/main.js",
+      fullFile: true,
+    },
+  });
+  const pageLoad = planEvidence.createPlanExecutionEvidenceEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    result: JSON.stringify({ ok: true, actions: [], assertions: [] }),
+  });
+  const audit = verification.buildExecuteEvidenceClosureAudit({
+    ledger: [customEventMutation, ...launchAndReady(), pageLoad],
+    validationExpected: true,
+  });
+
+  assert.equal(customEventMutation.interactionMutation, false);
+  assert.deepEqual(customEventMutation.interactionBehaviorTargets, undefined);
+  assert.equal(audit.validationObligations.length, 0);
+  assert.equal(audit.gap, "none");
+  assert.equal(audit.completionAllowed, true);
+});
+
 test("changing an interactive control id creates an action-bound browser obligation", () => {
   const toolbarMutation = planEvidence.createPlanExecutionEvidenceEntry({
     toolName: "apply_patch",

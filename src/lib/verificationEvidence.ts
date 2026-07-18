@@ -274,6 +274,9 @@ function deriveInteractionRequirement(entry: PlanExecutionEvidenceEntry): {
   behaviorTargets: string[];
   behaviorTargetGroups: string[][];
 } {
+  if (entry.interactionMutation === false) {
+    return { required: false, behaviorTargets: [], behaviorTargetGroups: [] };
+  }
   const structuralTargets = (entry.interactionBehaviorTargets || [])
     .map((target) => String(target || "").trim())
     .filter(Boolean);
