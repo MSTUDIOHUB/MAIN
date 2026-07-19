@@ -14,7 +14,6 @@ import {
   createAgentLoopMutableState,
   markChatFinalSynthesisPromptUsedMutableState,
   markExecuteOperationEvidenceMutableState,
-  resetAgentLoopMutableStateForApprovedPlanExecution,
 } from "./loopMutableState";
 import { createAgentLoopControlRuntime } from "./loopControlRuntime";
 import { prepareIterationStreamRequest } from "./iterationStreamPreparation";
@@ -224,24 +223,6 @@ export class AgentOrchestrator {
           });
         };
         publishExecuteRecoveryState();
-        const notifyApprovedPlanExecutionStarted = callbacks.onApprovedPlanExecutionStarted;
-        let approvedPlanExecutionPhaseStarted = false;
-        let approvedPlanExecutionResetPendingFold = false;
-        callbacks.onApprovedPlanExecutionStarted = () => {
-          if (!approvedPlanExecutionPhaseStarted) {
-            approvedPlanExecutionPhaseStarted = true;
-            approvedPlanExecutionResetPendingFold = true;
-            resetAgentLoopMutableStateForApprovedPlanExecution(loopState);
-            publishExecuteRecoveryState();
-          }
-          notifyApprovedPlanExecutionStarted?.();
-        };
-        const reapplyApprovedPlanExecutionResetAfterPhaseFold = () => {
-          if (!approvedPlanExecutionResetPendingFold) return;
-          approvedPlanExecutionResetPendingFold = false;
-          resetAgentLoopMutableStateForApprovedPlanExecution(loopState);
-          publishExecuteRecoveryState();
-        };
         const toolSurfaceRuntime = createAgentLoopToolSurfaceRuntime({
           callbacks,
           runtimeState,
@@ -844,7 +825,6 @@ export class AgentOrchestrator {
           getExecuteRecoveryState: () => loopState.executeRecoveryState,
         });
         applyAssistantIterationMutableState(loopState, assistantIterationPhase);
-        reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (assistantIterationPhase.status === "stopped") {
           if (
             effectiveSubagentPreference === "preferred" &&
@@ -945,7 +925,6 @@ export class AgentOrchestrator {
         });
         applyToolIterationMutableState(loopState, toolIterationPhase);
         publishExecuteRecoveryState();
-        reapplyApprovedPlanExecutionResetAfterPhaseFold();
         if (toolIterationPhase.status === "goal_completed") {
           turnEvents.stageTurnCompletion(emitTurnCompletedEvent);
           callbacks.onDebugEvent?.("goal_inner_loop_evidence_boundary", {

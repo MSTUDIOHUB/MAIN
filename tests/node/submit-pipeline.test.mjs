@@ -1123,23 +1123,24 @@ test("effective intent decision preserves explicit Unity setup-engine directive"
   assert.equal(decision.effectiveCommandDirective.requiresApproval, false);
 });
 
-test("approved-plan child run uses canonical execute intent and default execute workflow", () => {
+test("approved-plan child run cannot inherit generic consent before Harness admission", () => {
   const decision = resolveSubmitRuntimeDecision({
     effectiveRunIntent: "execute",
     currentMainModeKey: "main_mode",
-    isPlanApproved: true,
-    autoApproveTools: false,
+    isPlanApproved: false,
+    autoApproveTools: true,
     executionConsentGranted: true,
     shouldExecuteOnceFromReplyOption: false,
     preservePlanState: true,
     isLocalStudioCommand: false,
+    requiresPlanExecutionAdmission: true,
   });
 
   assert.equal(decision.effectiveWorkflowMode, "edit");
   assert.equal(decision.runtimeRunIntent, "execute");
   assert.equal(decision.effectiveDisplayIntent, "execute");
   assert.equal(decision.initialTurnStatus, "executing");
-  assert.equal(decision.shouldGrantExecutionConsentForTurn, true);
+  assert.equal(decision.shouldGrantExecutionConsentForTurn, false);
   assert.equal(decision.shouldResetPlanState, false);
 });
 
@@ -1207,6 +1208,18 @@ test("runtime decision cannot enter Goal without creation authority or an existi
     goalContinuationAuthorization: goalContinuationAuthorization(),
   });
   assert.equal(resumed.runtimeRunIntent, "goal");
+
+  const replayedWithoutDuplicateOverride = resolveSubmitRuntimeDecision({
+    effectiveRunIntent: "respond",
+    currentMainModeKey: "main_mode",
+    isPlanApproved: false,
+    autoApproveTools: false,
+    shouldExecuteOnceFromReplyOption: false,
+    preservePlanState: true,
+    isLocalStudioCommand: false,
+    goalContinuationAuthorization: goalContinuationAuthorization(),
+  });
+  assert.equal(replayedWithoutDuplicateOverride.runtimeRunIntent, "goal");
 });
 
 test("intent confirmation builder creates pre-submit plan confirmation choices", () => {
@@ -1837,7 +1850,7 @@ test("run state patch preserves hidden input and approved plan state when reques
   assert.equal(Object.hasOwn(patch, "currentTurnExecutionConsent"), false);
 });
 
-test("approved same-turn execution commit clears pending transition only when a run state is created", () => {
+test("reserved Plan attempt preserves its handoff until Harness admission", () => {
   const patch = buildSubmitRunStatePatch({
     turnId: "turn-plan",
     isHidden: true,
@@ -1856,12 +1869,13 @@ test("approved same-turn execution commit clears pending transition only when a 
     effectiveWorkflowMode: "plan",
     preservePlanState: true,
     shouldGrantExecutionConsentForTurn: true,
+    requiresPlanExecutionAdmission: true,
     currentConfig: { workflowMode: "plan", language: "en" },
   });
 
-  assert.equal(patch.pendingPlanApprovalHandoff, null);
-  assert.equal(patch.planApprovalExecutionStartedForTurnId, "turn-plan");
-  assert.deepEqual(patch.currentTurnExecutionConsent, { turnId: "turn-plan", granted: true });
+  assert.equal(Object.hasOwn(patch, "pendingPlanApprovalHandoff"), false);
+  assert.equal(Object.hasOwn(patch, "planApprovalExecutionStartedForTurnId"), false);
+  assert.equal(Object.hasOwn(patch, "currentTurnExecutionConsent"), false);
 });
 
 test("harness run marker draft initializes launch telemetry without store state", () => {

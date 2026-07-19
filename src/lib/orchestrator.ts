@@ -1551,7 +1551,6 @@ export interface OrchestratorCallbacks {
   onPlanApprovalInvalidated?: (reason: string) => void;
   onPlanTasksUpdated: (content: string) => void;
   onPlanExecutionProgress?: (progress: PlanExecutionProgressUpdate) => void;
-  onApprovedPlanExecutionStarted?: () => void;
   /** A fixed, user-safe plan drafting narration. Raw phases stay in the loop. */
   onPlanRuntimeNarration?: (narration: string | null) => void;
   onPlanMaxIterationsCheckpoint?: (

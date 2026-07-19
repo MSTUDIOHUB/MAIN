@@ -71,14 +71,24 @@ export interface ActiveGuidance {
 export interface PlanApprovalHandoff {
   planTurnId: string;
   requestedAt: number;
-  executionTurnId?: string;
+  /** Exact immutable approval capability that owns this handoff. */
+  approvalLeaseId: string;
+  /** One-shot execution attempt minted from the approval capability. */
+  executionLeaseId: string;
+  /** Session generation captured when the review decision was accepted. */
+  sessionEpoch: string;
+  /** Exact review request resolved by the user. */
+  reviewRequestId: string;
+  executionTurnId: string;
   /** Preallocated child owner so approval progress is never unowned. */
-  executionRunId?: string;
-  prompt?: string;
+  executionRunId: string;
+  executionAttempt: number;
+  executionInstructionHash: string;
+  prompt: string;
   /** Identity of the exact reviewable artifact revision the user approved. */
-  planRevision?: number;
-  artifactHash?: string;
-  artifactPaths?: string[];
+  planRevision: number;
+  artifactHash: string;
+  artifactPaths: string[];
   /** The planning run that produced the reviewed artifact. */
-  parentRunId?: string | null;
+  parentRunId: string | null;
 }

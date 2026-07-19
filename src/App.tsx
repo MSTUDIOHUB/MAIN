@@ -31,6 +31,12 @@ import {
   buildSessionRuntimeSnapshotFromStoreState,
   buildRestoredSessionRuntimePatch,
 } from "./store/useAppStore";
+import {
+  createPlanLifecycleSessionEpoch,
+  createPlanLifecycleState,
+  ensurePlanLifecycleOwner,
+  reducePlanLifecycle,
+} from "./lib/planLifecycle";
 import { getE2EQuickReplyHandler, initializeE2EScenarios } from "./lib/e2e";
 import {
   deleteChatSessionTempFiles,
@@ -425,11 +431,19 @@ function sortSessionsByRecent(sessions: any[]): any[] {
   return [...(sessions || [])].sort((a, b) => sessionSortTime(b) - sessionSortTime(a));
 }
 
+function resolveSessionPlanLifecycleEpoch(session: any): string | null {
+  const epoch = String(session?.planLifecycleEpoch || "").trim();
+  return epoch || null;
+}
+
 function mergeDiskSessionWithLocal(localSession: any, diskSession: any, selectedId: number | null) {
   const diskId = Number(diskSession?.id);
   const active = selectedId != null ? diskId === selectedId : diskSession.active === true;
   const localAffinity = resolveSessionModeAffinity(localSession as SessionModeAffinityLike, "main_mode");
   const diskAffinity = resolveSessionModeAffinity(diskSession as SessionModeAffinityLike, localAffinity);
+  const planLifecycleEpoch = resolveSessionPlanLifecycleEpoch(localSession) ||
+    resolveSessionPlanLifecycleEpoch(diskSession) ||
+    undefined;
   if (shouldDiscardMissingSession(diskSession) && localSession?.storageStatus !== "temporary") {
     return null;
   }
@@ -440,12 +454,14 @@ function mergeDiskSessionWithLocal(localSession: any, diskSession: any, selected
   ) {
     return {
       ...localSession,
+      planLifecycleEpoch,
       sessionModeAffinity: localAffinity,
       active: selectedId != null ? localSession.id === selectedId : localSession.active === true,
     };
   }
   return {
     ...diskSession,
+    planLifecycleEpoch,
     sessionModeAffinity: diskAffinity,
     runtimeSnapshot: diskSession?.runtimeSnapshot
       ? {
@@ -536,6 +552,10 @@ function stableRuntimeSignature(value: unknown): string {
     planTasks: compactJsonListSignature(snapshot.planTasks),
     planExecutionEvidenceLedger: compactJsonListSignature(snapshot.planExecutionEvidenceLedger),
     planExecutionEvidenceCount: snapshot.planExecutionEvidenceCount ?? 0,
+    planLifecycle: compactTextSignature(JSON.stringify(snapshot.planLifecycle || null)),
+    pendingPlanApprovalHandoff: compactTextSignature(JSON.stringify(snapshot.pendingPlanApprovalHandoff || null)),
+    planApprovalExecutionStartedForTurnId: snapshot.planApprovalExecutionStartedForTurnId ?? null,
+    planExecutionProgressSnapshot: compactTextSignature(JSON.stringify(snapshot.planExecutionProgressSnapshot || null)),
     planStage: snapshot.planStage ?? null,
     isPlanApproved: snapshot.isPlanApproved === true,
     planApprovalChoice: snapshot.planApprovalChoice ?? null,
@@ -690,10 +710,32 @@ function resolveGoalDeletionFenceOwnerSessionId(
 function applyGoalDeletionFencesToLoadedStore(workspace: string): void {
   useAppStore.setState((state: any) => {
     const currentScope = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const sessions = state.sessionsByWorkspace[workspace] || [];
+    const sessionEpochByKey = new Map<string, string>();
+    const sessionsWithOwner = sessions.map((session: any) => {
+      const sessionKey = resolveSessionRuntimeKey(workspace, session.id);
+      const planLifecycleEpoch = resolveSessionPlanLifecycleEpoch(session) ||
+        createPlanLifecycleSessionEpoch(Number(session.id) || Date.now());
+      if (sessionKey) sessionEpochByKey.set(sessionKey, planLifecycleEpoch);
+      return resolveSessionPlanLifecycleEpoch(session)
+        ? session
+        : { ...session, planLifecycleEpoch };
+    });
+    const activeSessionKey = currentScope === workspace
+      ? resolveSessionRuntimeKey(workspace, state.currentSessionId)
+      : null;
+    const activeSessionEpoch = activeSessionKey
+      ? sessionEpochByKey.get(activeSessionKey) || null
+      : null;
     const activeSnapshot = currentScope === workspace
       ? normalizeSessionRuntimeSnapshot(
           buildSessionRuntimeSnapshotFromStoreState(state),
-          { restoreInterruptedGoal: true, workspacePath: workspace },
+          {
+            restoreInterruptedGoal: true,
+            workspacePath: workspace,
+            expectedSessionKey: activeSessionKey,
+            expectedSessionEpoch: activeSessionEpoch,
+          },
         )
       : undefined;
     let runtimeChanged = false;
@@ -703,18 +745,53 @@ function applyGoalDeletionFencesToLoadedStore(workspace: string): void {
         const normalized = normalizeSessionRuntimeSnapshot(runtime as any, {
           restoreInterruptedGoal: true,
           workspacePath: workspace,
+          expectedSessionKey: sessionKey,
+          expectedSessionEpoch: sessionEpochByKey.get(sessionKey) || null,
         });
         if (!normalized) return [sessionKey, runtime];
         runtimeChanged = true;
-        return [sessionKey, { ...(runtime as any), ...normalized }];
+        const liveRuntime = runtime as any;
+        const goalOwnsHarness = liveRuntime.harnessRunMarker?.runtimeIntent === "goal";
+        // Goal deletion recovery is not a process-restart boundary. Preserve
+        // every live Plan capability and any non-Goal Harness owner while only
+        // applying the Goal fence projection.
+        return [sessionKey, {
+          ...liveRuntime,
+          ...normalized,
+          planArtifacts: liveRuntime.planArtifacts,
+          planTasks: liveRuntime.planTasks,
+          planExecutionEvidenceLedger: liveRuntime.planExecutionEvidenceLedger,
+          planExecutionEvidenceCount: liveRuntime.planExecutionEvidenceCount,
+          planAutoResumeCount: liveRuntime.planAutoResumeCount,
+          planExecutionProgressSnapshot: liveRuntime.planExecutionProgressSnapshot,
+          planLifecycle: liveRuntime.planLifecycle,
+          planStage: liveRuntime.planStage,
+          isPlanApproved: liveRuntime.isPlanApproved,
+          planApprovalChoice: liveRuntime.planApprovalChoice,
+          pendingPlanApprovalHandoff: liveRuntime.pendingPlanApprovalHandoff,
+          planApprovalExecutionStartedForTurnId: liveRuntime.planApprovalExecutionStartedForTurnId,
+          currentTurnExecutionConsent: liveRuntime.currentTurnExecutionConsent,
+          ...(goalOwnsHarness
+            ? {}
+            : {
+                harnessRunMarker: liveRuntime.harnessRunMarker,
+                activeActionRequest: liveRuntime.activeActionRequest,
+                taskFlow: liveRuntime.taskFlow,
+                conversationTurns: liveRuntime.conversationTurns,
+              }),
+        }];
       }),
     );
-    const sessions = state.sessionsByWorkspace[workspace] || [];
-    const nextSessions = sessions.map((session: any) => {
+    const nextSessions = sessionsWithOwner.map((session: any) => {
       if (!session.runtimeSnapshot) return session;
+      const sessionKey = resolveSessionRuntimeKey(workspace, session.id);
       const normalized = normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, {
         restoreInterruptedGoal: true,
         workspacePath: workspace,
+        expectedSessionKey: sessionKey,
+        expectedSessionEpoch: sessionKey
+          ? sessionEpochByKey.get(sessionKey) || null
+          : null,
       });
       if (!normalized) return session;
       return { ...session, messages: normalized.taskFlow || session.messages, runtimeSnapshot: normalized };
@@ -727,10 +804,14 @@ function applyGoalDeletionFencesToLoadedStore(workspace: string): void {
             goalStatus: activeSnapshot.goalStatus,
             goalRuntime: activeSnapshot.goalRuntime,
             queuedUserMessage: activeSnapshot.queuedUserMessage,
-            activeActionRequest: activeSnapshot.activeActionRequest,
-            harnessRunMarker: activeSnapshot.harnessRunMarker,
-            taskFlow: activeSnapshot.taskFlow,
-            conversationTurns: activeSnapshot.conversationTurns,
+            ...(state.harnessRunMarker?.runtimeIntent === "goal"
+              ? {
+                  activeActionRequest: activeSnapshot.activeActionRequest,
+                  harnessRunMarker: activeSnapshot.harnessRunMarker,
+                  taskFlow: activeSnapshot.taskFlow,
+                  conversationTurns: activeSnapshot.conversationTurns,
+                }
+              : {}),
           }
         : {}),
       ...(runtimeChanged ? { runtimeBySessionKey } : {}),
@@ -785,13 +866,23 @@ async function recoverGoalDeletionFences(
       } catch {
         // listProjectSessions may already contain the complete runtime snapshot.
       }
+      const ownerSessionKey = resolveSessionRuntimeKey(workspace, ownerSessionId);
+      const ownerSessionEpoch = resolveSessionPlanLifecycleEpoch(ownerSession) ||
+        resolveSessionPlanLifecycleEpoch(listedOwner) ||
+        createPlanLifecycleSessionEpoch(Number(ownerSessionId) || Date.now());
       const normalizedRuntime = normalizeSessionRuntimeSnapshot(
         ownerSession.runtimeSnapshot,
-        { restoreInterruptedGoal: true, workspacePath: workspace },
+        {
+          restoreInterruptedGoal: true,
+          workspacePath: workspace,
+          expectedSessionKey: ownerSessionKey,
+          expectedSessionEpoch: ownerSessionEpoch,
+        },
       );
       if (!normalizedRuntime) continue;
       const scrubbedSession = {
         ...ownerSession,
+        planLifecycleEpoch: ownerSessionEpoch,
         messages: normalizedRuntime.taskFlow || ownerSession.messages || [],
         runtimeSnapshot: normalizedRuntime,
       };
@@ -846,6 +937,7 @@ const SESSION_RECOVERY_SKIP_SAVE = "session_recovery_skip_save";
 type SessionTranscriptCacheEntry = {
   scopeKey: string;
   sessionId: number;
+  planLifecycleEpoch: string;
   taskFlow: TaskBlock[];
   conversationTurns: any[];
   runtimeSnapshot?: any;
@@ -883,6 +975,7 @@ function mergeSessionPage(
 
 function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackState: any) {
   const restoredTaskFlow = sanitizeTaskBlocksForPersist(entry.taskFlow || []);
+  const expectedSessionKey = resolveSessionRuntimeKey(entry.scopeKey, entry.sessionId);
   const restoredPatch = buildRestoredSessionRuntimePatch({
     snapshot: {
       ...(entry.runtimeSnapshot || {}),
@@ -891,6 +984,8 @@ function buildPagedRuntimePatch(entry: SessionTranscriptCacheEntry, fallbackStat
     },
     fallbackState,
     workspacePath: entry.scopeKey,
+    expectedSessionKey,
+    expectedSessionEpoch: entry.planLifecycleEpoch,
     taskFlow: restoredTaskFlow,
     conversationTurns: entry.conversationTurns || [],
     currentTurnId:
@@ -1251,13 +1346,23 @@ export default function App() {
     if (sessionKey && autosaveSuspendedForSessionRef.current === sessionKey) {
       return;
     }
+    const sessionRecord = (state.sessionsByWorkspace[scopeKey] || [])
+      .find((session: any) => session.id === state.currentSessionId);
+    const planLifecycleEpoch = resolveSessionPlanLifecycleEpoch(sessionRecord) ||
+      createPlanLifecycleSessionEpoch(Number(state.currentSessionId) || Date.now());
+    if (!resolveSessionPlanLifecycleEpoch(sessionRecord)) {
+      state.updateSession(scopeKey, state.currentSessionId, { planLifecycleEpoch });
+    }
     state.saveCurrentRuntimeToSession();
-    const snapshot = buildStoredSessionSnapshot(
+    const storedSnapshot = buildStoredSessionSnapshot(
       state,
       scopeKey,
       state.currentSessionId,
       sessionTranscriptCacheRef.current,
     );
+    const snapshot = storedSnapshot
+      ? { ...storedSnapshot, planLifecycleEpoch }
+      : null;
     if (!snapshot) return;
     const isPointerOnlyEmptySession =
       hasStoredSessionDetailPointer(snapshot) &&
@@ -1272,6 +1377,7 @@ export default function App() {
       cacheSessionTranscript(sessionKey, {
         scopeKey,
         sessionId: state.currentSessionId,
+        planLifecycleEpoch,
         taskFlow: taskFlowSnapshot,
         conversationTurns: normalizeInterruptedConversationTurnsForRestore(state.conversationTurns || [], taskFlowSnapshot),
         runtimeSnapshot: snapshot.runtimeSnapshot,
@@ -2052,9 +2158,28 @@ export default function App() {
     if (!sessionKey || !sessionId) return;
 
     const entry = getCachedSessionTranscript(sessionKey);
+    const sessionRecord = (state.sessionsByWorkspace[scopeKey] || [])
+      .find((session: any) => session.id === sessionId);
+    const expectedSessionEpoch = resolveSessionPlanLifecycleEpoch(sessionRecord);
+    if (!expectedSessionEpoch || entry?.planLifecycleEpoch !== expectedSessionEpoch) {
+      sessionTranscriptCacheRef.current.delete(sessionKey);
+      return;
+    }
     if (!entry?.hasMore || !entry.nextBeforeTurnIndex) return;
 
     const page = await loadProjectSessionPage(scopeKey, sessionId, entry.nextBeforeTurnIndex, SESSION_INITIAL_PAGE_TURNS);
+    const latestState = useAppStore.getState();
+    const latestSessionRecord = (latestState.sessionsByWorkspace[scopeKey] || [])
+      .find((session: any) => session.id === sessionId);
+    if (
+      resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(latestState.currentWorkspace),
+        latestState.currentSessionId,
+      ) !== sessionKey ||
+      resolveSessionPlanLifecycleEpoch(latestSessionRecord) !== expectedSessionEpoch
+    ) {
+      return;
+    }
     const merged = mergeSessionPage(entry, page);
     const nextEntry = {
       ...entry,
@@ -2075,8 +2200,28 @@ export default function App() {
   const restoreSessionState = async (target: any, id: number, scopeKey = activeSessionScope) => {
     const restoreToken = ++sessionRestoreTokenRef.current;
     const expectedSessionKey = resolveSessionRuntimeKey(scopeKey, id);
-    const liveRuntime = expectedSessionKey
-      ? useAppStore.getState().runtimeBySessionKey?.[expectedSessionKey]
+    const restoreStartState = useAppStore.getState();
+    const outerSession = (restoreStartState.sessionsByWorkspace[scopeKey] || [])
+      .find((session: any) => session.id === id);
+    const existingSessionEpoch = resolveSessionPlanLifecycleEpoch(outerSession) ||
+      resolveSessionPlanLifecycleEpoch(target);
+    const expectedSessionEpoch = existingSessionEpoch ||
+      createPlanLifecycleSessionEpoch(Number(id) || Date.now());
+    if (resolveSessionPlanLifecycleEpoch(outerSession) !== expectedSessionEpoch) {
+      restoreStartState.updateSession(scopeKey, id, {
+        planLifecycleEpoch: expectedSessionEpoch,
+      });
+    }
+    target = {
+      ...(target || { id }),
+      planLifecycleEpoch: expectedSessionEpoch,
+    };
+    const liveRuntimeCandidate = expectedSessionKey && existingSessionEpoch
+      ? restoreStartState.runtimeBySessionKey?.[expectedSessionKey]
+      : null;
+    const liveRuntime = liveRuntimeCandidate?.planLifecycle?.sessionKey === expectedSessionKey &&
+      liveRuntimeCandidate.planLifecycle.sessionEpoch === expectedSessionEpoch
+      ? liveRuntimeCandidate
       : null;
     useAppStore.setState({
       isGenerating: liveRuntime ? liveRuntime.isGenerating === true : false,
@@ -2088,10 +2233,13 @@ export default function App() {
     }
     const isCurrentRestore = () => {
       const state = useAppStore.getState();
+      const currentOuterSession = (state.sessionsByWorkspace[scopeKey] || [])
+        .find((session: any) => session.id === id);
       return (
         sessionRestoreTokenRef.current === restoreToken &&
         state.currentSessionId === id &&
-        resolveSessionWorkspaceKey(state.currentWorkspace) === scopeKey
+        resolveSessionWorkspaceKey(state.currentWorkspace) === scopeKey &&
+        resolveSessionPlanLifecycleEpoch(currentOuterSession) === expectedSessionEpoch
       );
     };
     const finishRestore = () => {
@@ -2144,7 +2292,18 @@ export default function App() {
       return;
     }
 
-    const cachedTranscript = getCachedSessionTranscript(liveSessionKey);
+    const cachedTranscriptCandidate = getCachedSessionTranscript(liveSessionKey);
+    const cachedTranscript = cachedTranscriptCandidate?.planLifecycleEpoch === expectedSessionEpoch
+      ? cachedTranscriptCandidate
+      : null;
+    if (cachedTranscriptCandidate && !cachedTranscript) {
+      if (liveSessionKey) sessionTranscriptCacheRef.current.delete(liveSessionKey);
+      appendDebugLog("warn", "session.restore", {
+        sessionId: id,
+        scopeKey,
+        mode: "stale_transcript_cache_discarded",
+      });
+    }
     if (cachedTranscript && (cachedTranscript.taskFlow.length > 0 || cachedTranscript.conversationTurns.length > 0 || !targetHasPersistedTranscript)) {
       const patch = buildPagedRuntimePatch(cachedTranscript, useAppStore.getState());
       syncTaskIdCounterFromBlocks(patch.taskFlow);
@@ -2176,10 +2335,12 @@ export default function App() {
           loadProjectSessionMeta(scopeKey, id),
           loadProjectSessionPage(scopeKey, id, null, SESSION_INITIAL_PAGE_TURNS),
         ]);
+        if (!isCurrentRestore()) return;
         const merged = mergeSessionPage(null, page);
         const cacheEntry = {
           scopeKey,
           sessionId: id,
+          planLifecycleEpoch: expectedSessionEpoch,
           taskFlow: merged.taskFlow,
           conversationTurns: merged.conversationTurns,
           runtimeSnapshot: meta.runtimeSnapshot,
@@ -2229,6 +2390,7 @@ export default function App() {
         hydratedTarget = shouldIgnoreMissingMetaForLocalTemporary
           ? {
               ...target,
+              planLifecycleEpoch: expectedSessionEpoch,
               messages: [],
               runtimeSnapshot: {
                 ...(target.runtimeSnapshot || {}),
@@ -2239,6 +2401,7 @@ export default function App() {
           : {
               ...target,
               ...meta,
+              planLifecycleEpoch: expectedSessionEpoch,
               messages: merged.taskFlow,
               runtimeSnapshot: {
                 ...(meta.runtimeSnapshot || {}),
@@ -2258,7 +2421,10 @@ export default function App() {
           error: error instanceof Error ? error.message : String(error),
         });
         try {
-          hydratedTarget = await loadProjectSession(scopeKey, id);
+          hydratedTarget = {
+            ...(await loadProjectSession(scopeKey, id)),
+            planLifecycleEpoch: expectedSessionEpoch,
+          };
           if (!isCurrentRestore()) return;
           updateSession(scopeKey, id, hydratedTarget);
         } catch (fallbackError) {
@@ -2298,7 +2464,10 @@ export default function App() {
       return;
     }
 
-    target = hydratedTarget;
+    target = {
+      ...(hydratedTarget || { id }),
+      planLifecycleEpoch: expectedSessionEpoch,
+    };
     if (target?.runtimeSnapshot && hasPersistableSessionTranscript(target)) {
       const snapshot = target.runtimeSnapshot;
       const snapshotTaskFlow = hasArrayItems(snapshot.taskFlow) ? snapshot.taskFlow : target.messages;
@@ -2316,6 +2485,8 @@ export default function App() {
         },
         fallbackState: useAppStore.getState(),
         workspacePath: scopeKey,
+        expectedSessionKey,
+        expectedSessionEpoch,
         taskFlow: restoredTaskFlow,
         conversationTurns: restoredConversationTurns,
         currentTurnId: snapshot.currentTurnId ?? null,
@@ -2541,45 +2712,98 @@ export default function App() {
 
   // ── Shared helper: reset chat runtime state to empty view ──────────────
   const resetToEmptyChatView = useCallback(() => {
-    useAppStore.setState({
-      taskFlow: [],
-      agentMessages: [],
-      contextMemoryState: null,
-      conversationTurns: [],
-      currentTurnId: null,
-      selectedDiffTaskId: null,
-      pendingSlashCommand: null,
-      planArtifacts: [],
-      planTasks: [],
-      planExecutionEvidenceLedger: [],
-      planExecutionEvidenceCount: 0,
-      planStage: "idle",
-      isPlanApproved: false,
-      planApprovalChoice: null,
-      agentStatus: "idle",
-      isGenerating: false,
-      abortController: null,
-      pendingReviewResolve: null,
-      pendingReviewTaskId: null,
-      pendingToolCall: null,
-      showPlanPanel: false,
-      showDiff: false,
-      showTerminal: false,
-      showFilePanel: false,
-      rightPanelTab: "plan",
+    useAppStore.setState((state) => {
+      const resetAt = Date.now();
+      const activeScopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+      const activeSession = (state.sessionsByWorkspace[activeScopeKey] || [])
+        .find((session: any) => session.id === state.currentSessionId);
+      const activeSessionKey = resolveSessionRuntimeKey(activeScopeKey, state.currentSessionId);
+      const existingOuterEpoch = resolveSessionPlanLifecycleEpoch(activeSession);
+      const activeSessionEpoch = activeSessionKey
+        ? existingOuterEpoch || (
+            state.planLifecycle.sessionKey === activeSessionKey
+              ? state.planLifecycle.sessionEpoch
+              : createPlanLifecycleSessionEpoch(resetAt)
+          )
+        : null;
+      const lifecycleOwner = activeSessionKey && activeSessionEpoch
+        ? ensurePlanLifecycleOwner({
+            lifecycle: state.planLifecycle,
+            sessionKey: activeSessionKey,
+            sessionEpoch: activeSessionEpoch,
+            at: resetAt,
+          })
+        : state.planLifecycle;
+      const lifecycleReset = reducePlanLifecycle(lifecycleOwner, {
+        type: "reset",
+        expectedVersion: lifecycleOwner.version,
+        at: resetAt,
+      });
+      return {
+        ...(activeSessionKey && activeSessionEpoch && !existingOuterEpoch
+          ? {
+              sessionsByWorkspace: {
+                ...state.sessionsByWorkspace,
+                [activeScopeKey]: (state.sessionsByWorkspace[activeScopeKey] || []).map((session: any) =>
+                  session.id === state.currentSessionId
+                    ? { ...session, planLifecycleEpoch: activeSessionEpoch }
+                    : session
+                ),
+              },
+            }
+          : {}),
+        taskFlow: [],
+        agentMessages: [],
+        contextMemoryState: null,
+        conversationTurns: [],
+        currentTurnId: null,
+        selectedDiffTaskId: null,
+        pendingSlashCommand: null,
+        planArtifacts: [],
+        planTasks: [],
+        planExecutionEvidenceLedger: [],
+        planExecutionEvidenceCount: 0,
+        planAutoResumeCount: 0,
+        planExecutionProgressSnapshot: null,
+        planLifecycle: lifecycleReset.disposition === "rejected"
+          ? lifecycleOwner
+          : lifecycleReset.state,
+        planStage: "idle",
+        isPlanApproved: false,
+        planApprovalChoice: null,
+        pendingPlanApprovalHandoff: null,
+        planApprovalExecutionStartedForTurnId: null,
+        currentTurnExecutionConsent: { turnId: null, granted: false },
+        agentStatus: "idle",
+        isGenerating: false,
+        abortController: null,
+        pendingReviewResolve: null,
+        pendingReviewTaskId: null,
+        pendingToolCall: null,
+        showPlanPanel: false,
+        showDiff: false,
+        showTerminal: false,
+        showFilePanel: false,
+        rightPanelTab: "plan",
+      };
     });
   }, []);
 
   const hydrateWorkspacePlanForEmptySession = useCallback((reason: string) => {
     const state = useAppStore.getState();
     if (!state.currentWorkspace.trim()) return;
+    const hydrationWorkspace = state.currentWorkspace;
+    const hydrationSessionKey = state.getCurrentSessionKey();
     void state.ensurePlanArtifactsHydratedForWorkspace({
       reason,
-      promoteTasksToExecuting: true,
     }).then((hydrated) => {
-      if (hydrated) {
-        useAppStore.getState().saveCurrentRuntimeToSession();
-      }
+      const latest = useAppStore.getState();
+      if (
+        !hydrated ||
+        latest.currentWorkspace !== hydrationWorkspace ||
+        latest.getCurrentSessionKey() !== hydrationSessionKey
+      ) return;
+      latest.saveCurrentRuntimeToSession();
     });
   }, []);
 
@@ -2646,6 +2870,8 @@ export default function App() {
     const isGlobalChat = scopeKey === GLOBAL_CHAT_KEY;
     const createdAt = Date.now();
     const createdAtIso = new Date(createdAt).toISOString();
+    const planLifecycleEpoch = createPlanLifecycleSessionEpoch(createdAt);
+    const newSessionKey = resolveSessionRuntimeKey(scopeKey, createdAt)!;
     const emptyRuntimeSnapshot = buildSessionRuntimeSnapshotFromStoreState({
       taskFlow: [],
       agentMessages: [],
@@ -2662,6 +2888,11 @@ export default function App() {
       planTasks: [],
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
+      planLifecycle: createPlanLifecycleState({
+        sessionKey: newSessionKey,
+        sessionEpoch: planLifecycleEpoch,
+        updatedAt: createdAt,
+      }),
       planStage: "idle",
       isPlanApproved: false,
       planApprovalChoice: null,
@@ -2674,6 +2905,7 @@ export default function App() {
     });
     const ns = {
       id: createdAt,
+      planLifecycleEpoch,
       title: isGlobalChat
         ? (config.language === "en" ? "New Chat" : "新聊天")
         : (config.language === "en" ? "New Conversation" : "新会话"),
@@ -2884,8 +3116,10 @@ export default function App() {
     if (!target) {
       const createdAt = Date.now();
       const createdAtIso = new Date(createdAt).toISOString();
+      const planLifecycleEpoch = createPlanLifecycleSessionEpoch(createdAt);
       target = {
         id: createdAt,
+        planLifecycleEpoch,
         title,
         date: createdAtIso,
         updatedAt: createdAtIso,
@@ -2894,6 +3128,62 @@ export default function App() {
         storageStatus: "temporary",
         recordingDisabled: !state.config.sessionRecordingEnabled,
         messages: [] as TaskBlock[],
+        runtimeSnapshot: buildSessionRuntimeSnapshotFromStoreState({
+          ...state,
+          runtimeEvents: [],
+          harnessRunMarker: null,
+          activeActionRequest: null,
+          taskFlow: [],
+          agentMessages: [],
+          contextMemoryState: null,
+          contextMemoryStateByRuntimeKey: {},
+          providerCompatibilityByRuntimeKey: {},
+          conversationTurns: [],
+          currentTurnId: null,
+          selectedMainModeKey: "main_mode",
+          selectedNexusModeKey: "nexus_general",
+          sessionModeAffinity: "main_mode",
+          imageStudio: undefined,
+          gameStudioInitialized: false,
+          pendingSlashCommand: null,
+          planArtifacts: [],
+          planTasks: [],
+          planExecutionEvidenceLedger: [],
+          planExecutionEvidenceCount: 0,
+          planAutoResumeCount: 0,
+          planExecutionProgressSnapshot: null,
+          planLifecycle: createPlanLifecycleState({
+            sessionKey: resolveSessionRuntimeKey(scopeKey, createdAt)!,
+            sessionEpoch: planLifecycleEpoch,
+            updatedAt: createdAt,
+          }),
+          planStage: "idle",
+          isPlanApproved: false,
+          planApprovalChoice: null,
+          pendingPlanApprovalHandoff: null,
+          planApprovalExecutionStartedForTurnId: null,
+          clearedPlanTurnId: null,
+          input: "",
+          contextMentions: [],
+          attachedFiles: [],
+          pendingRunDecision: null,
+          pendingRunDecisionResolver: null,
+          currentTurnExecutionConsent: { turnId: null, granted: false },
+          approvedLocalFileReadPaths: [],
+          approvedShellPermissionRules: [],
+          queuedUserMessage: null,
+          activeGuidance: null,
+          isGenerating: false,
+          agentStatus: "idle",
+          abortController: null,
+          pendingReviewResolve: null,
+          pendingReviewTaskId: null,
+          pendingToolCall: null,
+          activeGoal: null,
+          goalProgress: null,
+          goalStatus: "paused",
+          goalRuntime: null,
+        }),
       };
       state.addSession(scopeKey, target);
     } else {

@@ -52,12 +52,31 @@ function loadTranspiledModuleSync(sourcePath) {
 const { applySubmitPlanStateReset } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitPlanStateReset.ts"),
 );
+const { createPlanLifecycleState, reducePlanLifecycle } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planLifecycle.ts"),
+);
+
+function lifecycleWithDraft() {
+  const empty = createPlanLifecycleState({
+    sessionKey: "/repo:7",
+    sessionEpoch: "epoch-7",
+    updatedAt: 1,
+  });
+  return reducePlanLifecycle(empty, {
+    type: "start_drafting",
+    expectedVersion: empty.version,
+    at: 2,
+    planTurnId: "turn-plan",
+    artifactIdentity: null,
+  }).state;
+}
 
 test("submit plan state reset skips state writes when runtime decision preserves plan state", () => {
   const patches = [];
   const didReset = applySubmitPlanStateReset({
     shouldResetPlanState: false,
     defaultNormalizedStreamState: { status: "idle" },
+    planLifecycle: lifecycleWithDraft(),
     setState: (patch) => patches.push(patch),
   });
 
@@ -71,12 +90,20 @@ test("submit plan state reset clears approved plan runtime fields", () => {
   const didReset = applySubmitPlanStateReset({
     shouldResetPlanState: true,
     defaultNormalizedStreamState: streamState,
+    planLifecycle: lifecycleWithDraft(),
+    now: 3,
     setState: (patch) => patches.push(patch),
   });
 
   assert.equal(didReset, true);
   assert.equal(patches.length, 1);
   assert.equal(patches[0].isPlanApproved, false);
+  assert.equal(patches[0].planLifecycle.status, "empty");
+  assert.equal(patches[0].planLifecycle.sessionKey, "/repo:7");
+  assert.equal(patches[0].planLifecycle.sessionEpoch, "epoch-7");
+  assert.equal(patches[0].planLifecycle.planTurnId, null);
+  assert.equal(patches[0].planLifecycle.approvalLease, null);
+  assert.equal(patches[0].planLifecycle.executionLease, null);
   assert.equal(patches[0].planApprovalChoice, null);
   assert.deepEqual(patches[0].planExecutionEvidenceLedger, []);
   assert.equal(patches[0].planExecutionEvidenceCount, 0);

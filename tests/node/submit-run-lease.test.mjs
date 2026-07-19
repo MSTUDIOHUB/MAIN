@@ -56,10 +56,12 @@ const {
   path.join(workspaceRoot, "src/store/submitRunLease.ts"),
 );
 const {
+  HARNESS_RUN_MARKER_STORAGE_KEY,
   acquireHarnessRunMarker,
   closeHarnessRunMarker,
   closeHarnessRunMarkerForSessionDeletion,
   isHarnessRunMarkerOwnedByRun,
+  normalizeHarnessRunMarker,
   persistHarnessRunMarker,
   persistHarnessRunMarkerIfOwned,
   readHarnessRunMarker,
@@ -423,6 +425,107 @@ test("harness run ownership distinguishes sequential loops on the same conversat
   }), false);
 });
 
+test("Harness marker preserves an exact admitted Plan Run provenance", () => {
+  const provenance = {
+    schemaVersion: 1,
+    sessionKey: "workspace-a:7",
+    sessionEpoch: "session-epoch-plan",
+    planTurnId: "turn-plan-origin",
+    approvalLeaseId: "approval-lease-plan",
+    planRevision: 3,
+    artifactHash: "artifact-hash-plan",
+    executionLeaseId: "execution-lease-plan",
+    executionTurnId: "turn-plan",
+    executionRunId: "run-plan-child",
+    parentRunId: "run-plan-parent",
+    attempt: 2,
+    instructionHash: "instruction-hash-plan",
+  };
+  const marker = normalizeHarnessRunMarker({
+    schemaVersion: 1,
+    runId: "run-plan-outer",
+    activeRunId: provenance.executionRunId,
+    activeParentRunId: provenance.parentRunId,
+    activePlanExecutionProvenance: provenance,
+    instanceId: "instance-plan",
+    sessionKey: provenance.sessionKey,
+    turnId: provenance.executionTurnId,
+    status: "running",
+    startedAt: 100,
+    updatedAt: 110,
+  });
+
+  assert.ok(marker);
+  assert.deepEqual(marker.activePlanExecutionProvenance, provenance);
+  assert.equal(Object.isFrozen(marker.activePlanExecutionProvenance), true);
+});
+
+test("Harness marker rejects Plan provenance whose active owner, run, or parent differs", () => {
+  const provenance = {
+    schemaVersion: 1,
+    sessionKey: "workspace-a:7",
+    sessionEpoch: "session-epoch-plan",
+    planTurnId: "turn-plan-origin",
+    approvalLeaseId: "approval-lease-plan",
+    planRevision: 3,
+    artifactHash: "artifact-hash-plan",
+    executionLeaseId: "execution-lease-plan",
+    executionTurnId: "turn-plan",
+    executionRunId: "run-plan-child",
+    parentRunId: "run-plan-parent",
+    attempt: 2,
+    instructionHash: "instruction-hash-plan",
+  };
+  const marker = {
+    schemaVersion: 1,
+    runId: "run-plan-outer",
+    activeRunId: provenance.executionRunId,
+    activeParentRunId: provenance.parentRunId,
+    activePlanExecutionProvenance: provenance,
+    instanceId: "instance-plan",
+    sessionKey: provenance.sessionKey,
+    turnId: provenance.executionTurnId,
+    status: "running",
+    startedAt: 100,
+    updatedAt: 110,
+  };
+
+  const mismatches = [
+    { ...provenance, sessionKey: "workspace-foreign:8" },
+    { ...provenance, executionTurnId: "turn-foreign" },
+    { ...provenance, executionRunId: "run-plan-foreign" },
+    { ...provenance, parentRunId: "run-plan-foreign-parent" },
+  ];
+  for (const activePlanExecutionProvenance of mismatches) {
+    const normalized = normalizeHarnessRunMarker({
+      ...marker,
+      activePlanExecutionProvenance,
+    });
+    assert.ok(normalized);
+    assert.equal(normalized.activePlanExecutionProvenance, null);
+  }
+});
+
+test("Harness marker keeps legacy records compatible when Plan provenance is absent", () => {
+  const marker = normalizeHarnessRunMarker({
+    schemaVersion: 1,
+    runId: "run-legacy",
+    instanceId: "instance-legacy",
+    sessionKey: "workspace-legacy:1",
+    turnId: "turn-legacy",
+    status: "running",
+    startedAt: 100,
+    updatedAt: 110,
+  });
+
+  assert.ok(marker);
+  assert.equal(marker.activeRunId, "run-legacy");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(marker, "activePlanExecutionProvenance"),
+    false,
+  );
+});
+
 test("global harness persistence uses run ownership CAS across background sessions", () => {
   const previousWindow = globalThis.window;
   const values = new Map();
@@ -493,6 +596,170 @@ test("global harness persistence uses run ownership CAS across background sessio
     }, ownerB);
     assert.equal(closedB.runId, "run-b");
     assert.equal(readHarnessRunMarker().status, "completed");
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("owned Harness persistence fails closed when the storage write is swallowed", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  let rejectWrites = false;
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => {
+        if (rejectWrites) throw new Error("simulated localStorage denial");
+        values.set(key, String(value));
+      },
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const current = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-outer",
+      instanceId: "instance-a",
+      sessionKey: "workspace-a:7",
+      turnId: "turn-plan",
+      status: "running",
+      startedAt: 500,
+      updatedAt: 500,
+    });
+    const provenance = {
+      schemaVersion: 1,
+      sessionKey: current.sessionKey,
+      sessionEpoch: "session-epoch-a",
+      planTurnId: "turn-plan-origin",
+      approvalLeaseId: "approval-lease-a",
+      planRevision: 1,
+      artifactHash: "artifact-hash-a",
+      executionLeaseId: "execution-lease-a",
+      executionTurnId: current.turnId,
+      executionRunId: "run-plan-child",
+      parentRunId: "run-plan-parent",
+      attempt: 1,
+      instructionHash: "instruction-hash-a",
+    };
+    rejectWrites = true;
+    const candidate = {
+      ...current,
+      activeRunId: provenance.executionRunId,
+      activeParentRunId: provenance.parentRunId,
+      activePlanExecutionProvenance: provenance,
+    };
+
+    assert.equal(persistHarnessRunMarker(candidate), null);
+
+    const result = persistHarnessRunMarkerIfOwned(candidate, {
+      runId: current.runId,
+      sessionKey: current.sessionKey,
+      turnId: current.turnId,
+      instanceId: current.instanceId,
+      startedAt: current.startedAt,
+    });
+
+    assert.equal(result, null);
+    assert.equal(readHarnessRunMarker().activeRunId, current.runId);
+    assert.equal(readHarnessRunMarker().activePlanExecutionProvenance, undefined);
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("owned Harness persistence rejects every authority mismatch observed on read-back", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  let rewritePersistedMarker = null;
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => {
+        const parsed = JSON.parse(String(value));
+        const rewritten = rewritePersistedMarker
+          ? rewritePersistedMarker(parsed)
+          : parsed;
+        values.set(key, JSON.stringify(rewritten));
+      },
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const current = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-authority-outer",
+      instanceId: "instance-authority",
+      sessionKey: "workspace-authority:7",
+      turnId: "turn-authority",
+      status: "running",
+      startedAt: 600,
+      updatedAt: 600,
+    });
+    const provenance = {
+      schemaVersion: 1,
+      sessionKey: current.sessionKey,
+      sessionEpoch: "session-epoch-authority",
+      planTurnId: "turn-plan-origin",
+      approvalLeaseId: "approval-lease-authority",
+      planRevision: 4,
+      artifactHash: "artifact-hash-authority",
+      executionLeaseId: "execution-lease-authority",
+      executionTurnId: current.turnId,
+      executionRunId: "run-authority-child",
+      parentRunId: "run-authority-parent",
+      attempt: 3,
+      instructionHash: "instruction-hash-authority",
+    };
+    const candidate = {
+      ...current,
+      activeRunId: provenance.executionRunId,
+      activeParentRunId: provenance.parentRunId,
+      activePlanExecutionProvenance: provenance,
+    };
+    const owner = {
+      runId: current.runId,
+      sessionKey: current.sessionKey,
+      turnId: current.turnId,
+      instanceId: current.instanceId,
+      startedAt: current.startedAt,
+    };
+    const corruptions = [
+      (marker) => ({ ...marker, instanceId: "instance-raced" }),
+      (marker) => ({ ...marker, status: "paused" }),
+      (marker) => ({ ...marker, activeRunId: "run-raced-child" }),
+      (marker) => ({ ...marker, activeParentRunId: "run-raced-parent" }),
+      (marker) => ({
+        ...marker,
+        activePlanExecutionProvenance: {
+          ...marker.activePlanExecutionProvenance,
+          artifactHash: "artifact-hash-raced",
+        },
+      }),
+    ];
+
+    for (const corruption of corruptions) {
+      values.set(HARNESS_RUN_MARKER_STORAGE_KEY, JSON.stringify(current));
+      rewritePersistedMarker = corruption;
+      assert.equal(persistHarnessRunMarkerIfOwned(candidate, owner), null);
+    }
+
+    values.set(HARNESS_RUN_MARKER_STORAGE_KEY, JSON.stringify(current));
+    rewritePersistedMarker = null;
+    const accepted = persistHarnessRunMarkerIfOwned(candidate, owner);
+    assert.ok(accepted);
+    assert.equal(accepted.activeRunId, provenance.executionRunId);
+    assert.equal(accepted.activeParentRunId, provenance.parentRunId);
+    assert.deepEqual(accepted.activePlanExecutionProvenance, provenance);
   } finally {
     if (previousWindow === undefined) {
       delete globalThis.window;
@@ -622,6 +889,91 @@ test("Harness acquisition CAS cannot overwrite a newer Session owner", () => {
     const accepted = acquireHarnessRunMarker(staleCandidate, newer);
     assert.equal(accepted.runId, staleCandidate.runId);
     assert.equal(readHarnessRunMarker().runId, staleCandidate.runId);
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("Harness acquisition fails closed on write failure and read-back owner races", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  let writeMode = "normal";
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => {
+        if (writeMode === "throw") throw new Error("simulated acquisition write denial");
+        const parsed = JSON.parse(String(value));
+        const stored = writeMode === "race"
+          ? {
+              ...parsed,
+              runId: "run-competing-owner",
+              instanceId: "instance-competing-owner",
+              sessionKey: "workspace-competing:9",
+              turnId: "turn-competing-owner",
+              startedAt: 999,
+            }
+          : writeMode === "authority-race"
+            ? {
+                ...parsed,
+                activeRunId: "run-competing-child",
+              }
+          : parsed;
+        values.set(key, JSON.stringify(stored));
+      },
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const predecessor = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-acquire-predecessor",
+      instanceId: "instance-acquire-predecessor",
+      sessionKey: "workspace-acquire:1",
+      turnId: "turn-acquire-predecessor",
+      status: "running",
+      startedAt: 700,
+      updatedAt: 700,
+    });
+    const candidate = {
+      ...predecessor,
+      runId: "run-acquire-candidate",
+      activeRunId: "run-acquire-child",
+      activeParentRunId: "run-acquire-parent",
+      instanceId: "instance-acquire-candidate",
+      sessionKey: "workspace-acquire:2",
+      turnId: "turn-acquire-candidate",
+      startedAt: 800,
+      updatedAt: 800,
+    };
+
+    writeMode = "throw";
+    assert.equal(acquireHarnessRunMarker(candidate, predecessor), null);
+    assert.equal(readHarnessRunMarker().runId, predecessor.runId);
+
+    writeMode = "race";
+    assert.equal(acquireHarnessRunMarker(candidate, predecessor), null);
+    assert.equal(readHarnessRunMarker().runId, "run-competing-owner");
+
+    values.set(HARNESS_RUN_MARKER_STORAGE_KEY, JSON.stringify(predecessor));
+    writeMode = "authority-race";
+    assert.equal(acquireHarnessRunMarker(candidate, predecessor), null);
+    assert.equal(readHarnessRunMarker().runId, candidate.runId);
+    assert.equal(readHarnessRunMarker().activeRunId, "run-competing-child");
+
+    values.set(HARNESS_RUN_MARKER_STORAGE_KEY, JSON.stringify(predecessor));
+    writeMode = "normal";
+    const accepted = acquireHarnessRunMarker(candidate, predecessor);
+    assert.ok(accepted);
+    assert.equal(accepted.runId, candidate.runId);
+    assert.equal(accepted.instanceId, candidate.instanceId);
+    assert.equal(accepted.activeRunId, candidate.activeRunId);
+    assert.equal(accepted.activeParentRunId, candidate.activeParentRunId);
   } finally {
     if (previousWindow === undefined) {
       delete globalThis.window;

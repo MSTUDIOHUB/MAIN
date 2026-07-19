@@ -282,6 +282,23 @@ export function appendRuntimeEventWithResult(
       ),
     };
   }
+  if (event.type === "run.started") {
+    const existingStart = existing.find((candidate) =>
+      candidate.type === "run.started" &&
+      candidate.threadId === event.threadId &&
+      candidate.turnId === event.turnId &&
+      candidate.runId === event.runId
+    );
+    if (existingStart?.type === "run.started") {
+      return {
+        events: existing,
+        disposition: existingStart.parentRunId === event.parentRunId
+          ? "idempotent"
+          : "conflict",
+        existingEvent: existingStart,
+      };
+    }
+  }
   if (isRunTerminalEvent(event)) {
     const existingTerminal = existing.find((candidate) =>
       isRunTerminalEvent(candidate) &&

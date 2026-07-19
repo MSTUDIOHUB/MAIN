@@ -35,6 +35,7 @@ import {
 import {
   resolveSessionRuntimeKey,
   resolveSessionWorkspaceKey,
+  type PlanApprovalHandoff,
   type ProviderCompatibilityRuntimeLaneState,
 } from "../sessionTypes";
 import type { TaskBlock } from "../taskTypes";
@@ -106,17 +107,45 @@ import {
   waitForCoordinatedSubagents,
 } from "../subagents";
 import {
+  buildPendingPlanToolPermissionInvalidation,
   buildGoalConfirmationActionRequest,
   buildPlanReviewActionRequest,
   buildUserChoiceActionRequest,
+  isPlanExecutionAttemptIdentityCurrentForRun,
+  isToolPermissionPlanExecutionIdentityCurrent,
   isActionRequestOwnedByRun,
+  settlePendingPlanToolPermissionInvalidation,
   toUserChoiceResolutionIdentity,
   type ActionRequest,
+  type PendingPlanToolPermissionInvalidation,
   type UserChoiceActionRequest,
 } from "../actionRequest";
 import { buildToolPermissionActionRequest } from "../pendingToolReview";
 import { createAbortableReviewSettlement } from "../actionReviewSettlement";
-import { buildPlanApprovalIdentity } from "../planApprovalIdentity";
+import {
+  buildPlanApprovalIdentity,
+  buildPlanExecutionInstructionHash,
+} from "../planApprovalIdentity";
+import {
+  issuePlanAutoResumeAttempt,
+  issuePlanExplicitResumeAttempt,
+} from "../planExecutionContinuation";
+import {
+  capturePlanExecutionRunProvenance,
+  doesLifecycleRetainPlanExecutionProvenance,
+  type PlanExecutionRunProvenance,
+} from "../planExecutionProvenance";
+import {
+  applyPlanArtifactIdentity,
+  applyPlanReviewIdentity,
+  ensurePlanLifecycleOwner,
+  isPlanApprovalLeaseBoundToState,
+  isPlanLifecycleExecutionAuthorizedForRun,
+  reducePlanLifecycle,
+  type PlanArtifactIdentity,
+  type PlanLifecycleState,
+  type PlanReviewIdentity,
+} from "../planLifecycle";
 import { resolveRuntimeRunIdentity, type RuntimeRunIdentity } from "../runIdentity";
 import { buildDurableTurnContext, shouldCanonicalizeTerminalTurnContext } from "../durableTurnContext";
 import {
@@ -143,6 +172,48 @@ import {
 } from "../modelFeedbackDedupe";
 
 type WorkflowStoreState = any;
+
+function toWorkflowPlanArtifactIdentity(
+  identity: ReturnType<typeof buildPlanApprovalIdentity>,
+): PlanArtifactIdentity | null {
+  return identity
+    ? {
+        revision: identity.revision,
+        artifactHash: identity.artifactHash,
+        artifactPaths: identity.artifactPaths,
+      }
+    : null;
+}
+
+function alignWorkflowPlanReviewLifecycle(input: {
+  lifecycle: PlanLifecycleState | null | undefined;
+  request: Extract<ActionRequest, { kind: "plan_review" }>;
+  artifactIdentity: PlanArtifactIdentity;
+  at: number;
+}): PlanLifecycleState | null {
+  const owner = ensurePlanLifecycleOwner({
+    lifecycle: input.lifecycle,
+    sessionKey: input.request.sessionKey,
+    at: input.at,
+  });
+  const reviewIdentity: PlanReviewIdentity = {
+    sessionKey: input.request.sessionKey,
+    sessionEpoch: owner.sessionEpoch,
+    turnId: input.request.turnId,
+    runId: input.request.runId,
+    parentRunId: input.request.parentRunId || null,
+    requestId: input.request.requestId,
+    planRevision: input.request.planRevision,
+    artifactHash: input.request.artifactHash,
+    artifactPaths: input.request.artifactPaths,
+  };
+  return applyPlanReviewIdentity({
+    lifecycle: owner,
+    artifactIdentity: input.artifactIdentity,
+    reviewIdentity,
+    at: input.at,
+  });
+}
 
 export interface WorkflowEngineStoreHelpers {
   sanitizeTaskBlocksForPersist: (blocks: TaskBlock[]) => TaskBlock[];
@@ -174,16 +245,7 @@ export interface WorkflowEngineStoreHelpers {
     get: () => WorkflowStoreState;
     setActiveState: (patch: Record<string, unknown>) => void;
     planTurnId: string;
-    handoff: {
-      planTurnId: string;
-      requestedAt: number;
-      executionTurnId?: string;
-      prompt?: string;
-      planRevision?: number;
-      artifactHash?: string;
-      artifactPaths?: string[];
-      parentRunId?: string | null;
-    };
+    handoff: PlanApprovalHandoff;
     sessionKey: string;
     source: "workflow_fallback";
   }) => void;
@@ -213,6 +275,8 @@ export interface WorkflowContext {
   timerInterval: any;
   sendStartedAt: number;
   harnessRunId: string;
+  /** Immutable Plan attempt captured when this Harness Run crossed admission. */
+  planExecution: PlanExecutionRunProvenance | null;
   streamBuffer: any; // StreamingCadenceBuffer
   thinkingInterceptor: any; // StreamingThinkingInterceptor
   turnAgentMessagesStart: number;
@@ -329,6 +393,9 @@ export class WorkflowEngine {
       outerRunId: context.harnessRunId,
       source: "harness_marker",
     };
+    let activePlanExecutionIdentity: PlanExecutionRunProvenance | null =
+      context.planExecution ? Object.freeze({ ...context.planExecution }) : null;
+    let rejectedPlanActionContinuationIdentity: PlanExecutionRunProvenance | null = null;
     let lastNonActionableStopDiagnostic: {
       reason: string;
       recoveryReason: string | null;
@@ -532,28 +599,97 @@ export class WorkflowEngine {
       request: ActionRequest,
       input: { reason: string; target?: string; pauseMessage: string },
     ) => {
-      sessionSet((state: any) => reduceRunTransition(state, {
-        type: "action_required",
-        request,
-        events: [
-          withEventSchema({
-            type: "approval.requested",
-            threadId: runSessionKey,
+      const requestedAt = Date.now();
+      sessionSet((state: any) => {
+        const transitioned = reduceRunTransition(state, {
+          type: "action_required",
+          request,
+          events: [
+            withEventSchema({
+              type: "approval.requested",
+              threadId: runSessionKey,
+              turnId: request.turnId,
+              timestampMs: requestedAt,
+              requestId: request.requestId,
+              actionKind: request.kind,
+              title: request.title,
+              reason: input.reason,
+              ...(input.target ? { target: input.target } : {}),
+              runId: request.runId,
+              parentRunId: request.parentRunId || null,
+              ...(activeRuntimeRunIdentity.goalSliceId
+                ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
+                : {}),
+            }),
+          ],
+        });
+        if (request.kind === "tool_permission") {
+          const lifecycle = state.planLifecycle as PlanLifecycleState | undefined;
+          const executionLease = lifecycle?.executionLease;
+          const executionOwner = lifecycle?.execution;
+          const ownsPlanExecution = isToolPermissionPlanExecutionIdentityCurrent(
+            request,
+            lifecycle,
+          );
+          if (!ownsPlanExecution || !lifecycle || !executionLease || !executionOwner) {
+            return transitioned;
+          }
+          const paused = reducePlanLifecycle(lifecycle, {
+            type: "pause",
+            expectedVersion: lifecycle.version,
+            at: requestedAt,
+            expectedExecutionLeaseId: executionLease.executionLeaseId,
+            expectedExecution: executionOwner,
+            pause: {
+              reason: "tool_permission",
+              resultKind: "partial",
+              resumeCondition: "resolve_action_request",
+            },
+          });
+          if (paused.disposition === "rejected") {
+            logStoreEvent("plan_tool_permission_pause_rejected", {
+              requestId: request.requestId,
+              runId: request.runId,
+              reason: paused.reason || "unknown",
+            });
+            return transitioned;
+          }
+          return {
+            ...transitioned,
+            planLifecycle: paused.state,
+            isPlanApproved: false,
+            currentTurnExecutionConsent: { turnId: null, granted: false },
+            planApprovalExecutionStartedForTurnId: null,
+            planStage: "ready_to_execute",
+          };
+        }
+        if (request.kind !== "plan_review") return transitioned;
+        const artifactIdentity: PlanArtifactIdentity = {
+          revision: request.planRevision,
+          artifactHash: request.artifactHash,
+          artifactPaths: request.artifactPaths,
+        };
+        const planLifecycle = alignWorkflowPlanReviewLifecycle({
+          lifecycle: state.planLifecycle,
+          request,
+          artifactIdentity,
+          at: requestedAt,
+        });
+        if (!planLifecycle) {
+          logStoreEvent("plan_review_lifecycle_alignment_rejected", {
+            sessionKey: request.sessionKey,
             turnId: request.turnId,
-            timestampMs: Date.now(),
-            requestId: request.requestId,
-            actionKind: request.kind,
-            title: request.title,
-            reason: input.reason,
-            ...(input.target ? { target: input.target } : {}),
             runId: request.runId,
-            parentRunId: request.parentRunId || null,
-            ...(activeRuntimeRunIdentity.goalSliceId
-              ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
-              : {}),
-          }),
-        ],
-      }));
+            requestId: request.requestId,
+          });
+          return transitioned;
+        }
+        return {
+          ...transitioned,
+          planLifecycle,
+          isPlanApproved: false,
+        };
+      });
       logStoreEvent("action_request_created", {
         sessionKey: request.sessionKey,
         turnId: request.turnId,
@@ -568,9 +704,241 @@ export class WorkflowEngine {
       });
     };
 
-    const beginActionContinuationRun = (request: ActionRequest) => {
+    const beginActionContinuationRun = (request: ActionRequest): boolean => {
       const previous = activeRuntimeRunIdentity;
       const nextRunId = `run-action-${Date.now()}-${generateId()}`;
+      const requestPlanExecution = request.kind === "tool_permission"
+        ? request.planExecution || null
+        : null;
+      const isPlanScopedRequest = !!requestPlanExecution;
+      if (isPlanScopedRequest) {
+        let admitted = false;
+        let admittedPlanExecutionIdentity: PlanExecutionRunProvenance | null = null;
+        let rejectionReason = "plan_action_continuation_owner_mismatch";
+        const startedAt = Date.now();
+        sessionSet((state: any) => {
+          const lifecycle = state.planLifecycle as PlanLifecycleState | undefined;
+          const marker = state.harnessRunMarker as HarnessRunMarker | null;
+          const currentPlanIdentity = buildPlanApprovalIdentity(state.planArtifacts || []);
+          const planArtifactIdentityCurrent = request.kind === "tool_permission" &&
+            !!request.planExecution &&
+            !!currentPlanIdentity &&
+            currentPlanIdentity.revision === request.planExecution.planRevision &&
+            currentPlanIdentity.artifactHash === request.planExecution.artifactHash;
+          if (
+            request.kind !== "tool_permission" ||
+            !lifecycle ||
+            lifecycle.status !== "paused" ||
+            lifecycle.pause?.resumeCondition !== "resolve_action_request" ||
+            !isToolPermissionPlanExecutionIdentityCurrent(request, lifecycle) ||
+            !planArtifactIdentityCurrent ||
+            lifecycle.execution?.turnId !== request.turnId ||
+            lifecycle.execution.runId !== request.runId ||
+            !marker ||
+            !isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner)
+          ) {
+            if (!planArtifactIdentityCurrent) {
+              rejectionReason = "plan_artifact_identity_stale";
+            }
+            return {};
+          }
+          const instruction = JSON.stringify({
+            kind: "tool_permission_continuation",
+            requestId: request.requestId,
+            turnId: request.turnId,
+            runId: request.runId,
+            taskId: request.taskId,
+            toolName: request.toolName,
+            target: request.target,
+            risk: request.risk || "unknown",
+          });
+          const issued = issuePlanExplicitResumeAttempt({
+            lifecycle,
+            instruction,
+            executionRunId: nextRunId,
+            executionLeaseId: `plan-execution-action-${startedAt}-${generateId()}`,
+            authorization: {
+              kind: "action_decision",
+              turnId: request.turnId,
+              runId: request.runId,
+              requestId: request.requestId,
+            },
+            issuedAt: startedAt,
+          });
+          if (!issued.ok) {
+            rejectionReason = issued.reason;
+            return {};
+          }
+          const executionStarted = reducePlanLifecycle(issued.lifecycle, {
+            type: "execution_started",
+            expectedVersion: issued.lifecycle.version,
+            at: startedAt,
+            executionLeaseId: issued.handoff.executionLeaseId,
+            instructionHash: issued.handoff.executionInstructionHash,
+            execution: {
+              turnId: issued.handoff.executionTurnId,
+              runId: issued.handoff.executionRunId,
+              parentRunId: issued.handoff.parentRunId,
+              attempt: issued.handoff.executionAttempt,
+              startedAt,
+            },
+          });
+          if (executionStarted.disposition !== "applied") {
+            rejectionReason = executionStarted.reason || "execution_started_rejected";
+            return {};
+          }
+          admittedPlanExecutionIdentity = capturePlanExecutionRunProvenance(
+            executionStarted.state,
+          );
+          if (!admittedPlanExecutionIdentity) {
+            rejectionReason = "plan_execution_provenance_capture_failed";
+            return {};
+          }
+          const nextMarker = {
+            ...marker,
+            activeRunId: nextRunId,
+            activeParentRunId: request.runId,
+            activePlanExecutionProvenance: admittedPlanExecutionIdentity,
+            planStage: "executing",
+            isPlanApproved: true,
+            updatedAt: startedAt,
+          } as HarnessRunMarker;
+          const startedEvent = withEventSchema({
+            type: "run.started",
+            threadId: runSessionKey,
+            turnId: request.turnId,
+            timestampMs: startedAt,
+            runId: nextRunId,
+            parentRunId: request.runId,
+            ...(previous.goalSliceId ? { goalSliceId: previous.goalSliceId } : {}),
+          });
+          const eventAppend = appendRuntimeEventWithResult(
+            state.runtimeEvents,
+            startedEvent,
+          );
+          if (eventAppend.disposition === "conflict") {
+            rejectionReason = "run_started_conflict";
+            return {};
+          }
+          // The disk marker is the final admission CAS. All pure lifecycle and
+          // event checks run first so a rejected child cannot advance Harness.
+          const persistedMarker = persistHarnessRunMarkerIfOwned(nextMarker, harnessRunOwner);
+          if (!persistedMarker) {
+            rejectionReason = "harness_owner_mismatch";
+            return {};
+          }
+          admitted = true;
+          return {
+            runtimeEvents: eventAppend.events,
+            harnessRunMarker: persistedMarker,
+            planLifecycle: executionStarted.state,
+            isPlanApproved: true,
+            currentTurnExecutionConsent: {
+              turnId: issued.handoff.executionTurnId,
+              granted: true,
+            },
+            pendingPlanApprovalHandoff: null,
+            planApprovalExecutionStartedForTurnId: issued.handoff.executionTurnId,
+            planStage: "executing",
+          };
+        });
+        if (!admitted) {
+          let pauseReclassified = false;
+          sessionSet((state: any) => {
+            const lifecycle = state.planLifecycle as PlanLifecycleState | undefined;
+            const ownsRejectedExecution = !!requestPlanExecution &&
+              !!lifecycle &&
+              lifecycle.status === "paused" &&
+              lifecycle.pause?.resumeCondition === "resolve_action_request" &&
+              doesLifecycleRetainPlanExecutionProvenance(
+                lifecycle,
+                requestPlanExecution,
+              );
+            const pauseTransition = ownsRejectedExecution &&
+              lifecycle?.executionLease &&
+              lifecycle.execution
+              ? reducePlanLifecycle(lifecycle, {
+                  type: "pause",
+                  expectedVersion: lifecycle.version,
+                  at: Date.now(),
+                  expectedExecutionLeaseId: lifecycle.executionLease.executionLeaseId,
+                  expectedExecution: lifecycle.execution,
+                  pause: {
+                    reason: "plan_action_continuation_admission_rejected",
+                    resultKind: "error",
+                    resumeCondition: "explicit_resume",
+                  },
+                })
+              : null;
+            pauseReclassified = !!pauseTransition &&
+              pauseTransition.disposition !== "rejected";
+            return {
+              ...(pauseReclassified
+                ? {
+                    planLifecycle: pauseTransition!.state,
+                    pendingPlanApprovalHandoff: null,
+                    planApprovalExecutionStartedForTurnId: null,
+                    planStage: "ready_to_execute",
+                  }
+                : {}),
+              isPlanApproved: false,
+              currentTurnExecutionConsent: { turnId: null, granted: false },
+              taskFlow: state.taskFlow.map((block: any) =>
+                request.kind === "tool_permission" && block.id === request.taskId
+                  ? {
+                      ...block,
+                      status: "error",
+                      toolStatus: "failed",
+                      message: phaseLanguage === "zh"
+                        ? "工具批准已记录，但 Plan 子运行接纳失败；执行已安全暂停。"
+                        : "The tool decision was recorded, but the Plan child Run was not admitted; execution paused safely.",
+                    }
+                  : block
+              ),
+            };
+          });
+          if (pauseReclassified && requestPlanExecution) {
+            rejectedPlanActionContinuationIdentity = requestPlanExecution;
+          }
+          // The review settlement has already detached its abort listener
+          // before entering this continuation callback. Abort the obsolete
+          // parent Run explicitly so it cannot resume with revoked Plan
+          // consent after the child admission failed.
+          abortCtrl.abort();
+          logStoreEvent("plan_action_continuation_admission_rejected", {
+            requestId: request.requestId,
+            runId: request.runId,
+            nextRunId,
+            reason: rejectionReason,
+          });
+          return false;
+        }
+        activeRuntimeRunIdentity = {
+          runId: nextRunId,
+          parentRunId: request.runId,
+          outerRunId: previous.outerRunId,
+          ...(previous.goalSliceId ? { goalSliceId: previous.goalSliceId } : {}),
+          source: previous.source,
+        };
+        activePlanExecutionIdentity = admittedPlanExecutionIdentity;
+        logStoreEvent("plan_action_continuation_run_admitted", {
+          requestId: request.requestId,
+          actionKind: request.kind,
+          runId: nextRunId,
+          parentRunId: request.runId,
+          goalSliceId: previous.goalSliceId || null,
+        });
+        return true;
+      }
+      if (activePlanExecutionIdentity) {
+        logStoreEvent("plan_action_continuation_admission_rejected", {
+          requestId: request.requestId,
+          runId: request.runId,
+          nextRunId,
+          reason: "plan_request_missing_immutable_provenance",
+        });
+        return false;
+      }
       activeRuntimeRunIdentity = {
         runId: nextRunId,
         parentRunId: request.runId,
@@ -578,9 +946,11 @@ export class WorkflowEngine {
         ...(previous.goalSliceId ? { goalSliceId: previous.goalSliceId } : {}),
         source: previous.source,
       };
+      activePlanExecutionIdentity = null;
       updateHarnessRunMarker({
         activeRunId: nextRunId,
         activeParentRunId: request.runId,
+        activePlanExecutionProvenance: null,
       });
       appendWorkflowRuntimeEvent({
         type: "run.started",
@@ -600,6 +970,7 @@ export class WorkflowEngine {
         parentRunId: request.runId,
         goalSliceId: previous.goalSliceId || null,
       });
+      return true;
     };
 
     const beginTerminalConclusionRun = (parentRunId: string, reason: string): boolean => {
@@ -619,6 +990,7 @@ export class WorkflowEngine {
         ...marker,
         activeRunId: nextRunId,
         activeParentRunId: parentRunId,
+        activePlanExecutionProvenance: null,
       }, harnessRunOwner);
       if (!persistedMarker) {
         logStoreEvent("terminal_conclusion_run_skipped", {
@@ -636,6 +1008,7 @@ export class WorkflowEngine {
         ...(previous.goalSliceId ? { goalSliceId: previous.goalSliceId } : {}),
         source: previous.source,
       };
+      activePlanExecutionIdentity = null;
       sessionSet((state: any) =>
         isHarnessRunMarkerOwnedByRun(state.harnessRunMarker, harnessRunOwner)
           ? { harnessRunMarker: persistedMarker }
@@ -999,9 +1372,10 @@ export class WorkflowEngine {
             expected: harnessRunOwner,
             patchKeys: Object.keys(patch),
           });
+          return {};
         }
         return {
-          harnessRunMarker: nextMarker,
+          harnessRunMarker: persisted,
         };
       });
     };
@@ -1114,9 +1488,13 @@ export class WorkflowEngine {
       getPlanTasks: () => sessionGet().planTasks,
       getPlanExecutionEvidenceLedger: () => sessionGet().planExecutionEvidenceLedger,
       getPlanAutoResumeCount: () => sessionGet().planAutoResumeCount,
-      getIsApprovedPlanExecutionTransitionPending: () =>
-        sessionGet().pendingPlanApprovalHandoff?.planTurnId === turnId &&
-        sessionGet().planApprovalExecutionStartedForTurnId !== turnId,
+      getIsApprovedPlanExecutionTransitionPending: () => {
+        const latest = sessionGet();
+        const lifecycle = latest.planLifecycle as PlanLifecycleState | undefined;
+        return lifecycle?.status === "handoff_pending" &&
+          lifecycle.executionLease?.executionLeaseId === latest.pendingPlanApprovalHandoff?.executionLeaseId &&
+          latest.pendingPlanApprovalHandoff?.planTurnId === turnId;
+      },
       getStatus: () => sessionGet().agentStatus,
       consumeActiveGuidance: () => sessionGet().consumeActiveGuidance(turnId),
       onGuidanceInjected: (text: string) => {
@@ -1233,108 +1611,6 @@ export class WorkflowEngine {
           stopClass: outcome.stopClass || runtime.stopClass,
           lastError: outcome.status === "failed" ? outcome.reason : runtime.lastError,
           updatedAt: Date.now(),
-        });
-      },
-      onApprovedPlanExecutionStarted: () => {
-        const pendingHandoff = sessionGet().pendingPlanApprovalHandoff;
-        const startedForTurn = sessionGet().planApprovalExecutionStartedForTurnId;
-        if (startedForTurn === turnId) {
-          logStoreEvent("plan_approval_handoff_deduped", {
-            reason: "same_turn_execution_already_started",
-            planTurnId: turnId,
-            executionTurnId: turnId,
-            currentTurnStatus: sessionGet().conversationTurns.find((turn: any) => turn.id === turnId)?.status ?? null,
-            agentStatus: sessionGet().agentStatus,
-            isGenerating: sessionGet().isGenerating,
-            pendingPlanApprovalHandoff: pendingHandoff,
-            conversationTurns: sessionGet().conversationTurns.length,
-          });
-          return;
-        }
-        if (pendingHandoff && pendingHandoff.planTurnId !== turnId) {
-          logStoreEvent("plan_approval_handoff_ignored", {
-            reason: "different_pending_plan_turn",
-            planTurnId: turnId,
-            pendingPlanTurnId: pendingHandoff.planTurnId,
-            sessionKey: runSessionKey,
-            workspace: runWorkspace || null,
-          });
-          return;
-        }
-        const language = sessionGet().config.language === "en" ? "en" : "zh";
-        const previousSnapshot = sessionGet().planExecutionProgressSnapshot;
-        const progressSnapshot = normalizePlanExecutionProgressSnapshot({
-          turnId,
-          update: {
-            ...buildPlanExecutionProgressUpdate({
-              language,
-              phase: "starting",
-              iterationCount: 0,
-              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-              autoResumeCount: 0,
-              tasks: sessionGet().planTasks,
-              evidenceLedger: [],
-              recentToolActivity: [],
-              nextStep: language === "zh"
-                ? "在当前回合按已批准 plan.md 继续执行"
-                : "continue in the current turn and follow the approved plan.md",
-            }),
-            runId: activeRuntimeRunIdentity.runId,
-            parentRunId: activeRuntimeRunIdentity.parentRunId || null,
-          },
-          previous: previousSnapshot?.runId && previousSnapshot.runId !== activeRuntimeRunIdentity.runId
-            ? null
-            : previousSnapshot,
-          now: Date.now(),
-        });
-        sessionSet((s: any) => ({
-          currentTurnExecutionConsent: { turnId, granted: true },
-          pendingPlanApprovalHandoff: null,
-          planApprovalExecutionStartedForTurnId: turnId,
-          planExecutionProgressSnapshot: progressSnapshot,
-          currentTurnState: {
-            ...s.currentTurnState,
-            capsuleExplanation: null,
-          },
-          planStage: "executing",
-          agentStatus: "running",
-          isGenerating: true,
-          conversationTurns: s.conversationTurns.map((turn: any) =>
-            turn.id === turnId
-              ? {
-                  ...turn,
-                  status: "executing",
-                  summary: language === "zh"
-                    ? "计划已批准，正在当前回合继续执行。"
-                    : "Plan approved; execution is continuing in the current turn.",
-                }
-              : turn,
-          ),
-        }));
-        updateHarnessRunMarker({
-          turnId,
-          runtimeIntent: "execute",
-          planStage: "executing",
-          isPlanApproved: true,
-          status: "running",
-        });
-        emitProgressRuntimeEvent(
-          toPlanExecutionRuntimeProgressUpdate({
-            snapshot: progressSnapshot,
-            language,
-            dedupeKey: `plan-execution-progress:${activeRuntimeRunIdentity.runId}`,
-          }),
-        );
-        logStoreEvent("plan_approval_same_turn_execution_started", {
-          planTurnId: turnId,
-          executionTurnId: turnId,
-          currentTurnStatus: sessionGet().conversationTurns.find((turn: any) => turn.id === turnId)?.status ?? null,
-          agentStatus: sessionGet().agentStatus,
-          isGenerating: sessionGet().isGenerating,
-          pendingPlanApprovalHandoff: pendingHandoff,
-          conversationTurns: sessionGet().conversationTurns.length,
-          sessionKey: runSessionKey,
-          workspace: runWorkspace || null,
         });
       },
       getContextMemoryState: () => {
@@ -2828,6 +3104,64 @@ export class WorkflowEngine {
         const reviewTarget = deriveReviewToolTarget(toolCall);
         const reviewToolCallId = String(toolCall?.toolCallId || toolCall?.id || "").trim();
         const autoApproveToolScopes = sessionGet().autoApproveToolScopes || [];
+        const reviewRunOwner = {
+          sessionKey: runSessionKey,
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
+          parentRunId: activeRuntimeRunIdentity.parentRunId,
+        };
+        const reviewLifecycle = sessionGet().planLifecycle as PlanLifecycleState | undefined;
+        const reviewExecutionLease = reviewLifecycle?.executionLease;
+        const reviewExecutionOwner = reviewLifecycle?.execution;
+        const currentPlanIdentity = buildPlanApprovalIdentity(
+          sessionGet().planArtifacts || [],
+        );
+        const activePlanArtifactIdentityCurrent = !activePlanExecutionIdentity || (
+          !!currentPlanIdentity &&
+          currentPlanIdentity.revision === activePlanExecutionIdentity.planRevision &&
+          currentPlanIdentity.artifactHash === activePlanExecutionIdentity.artifactHash
+        );
+        const liveRunClaimsPlanExecution = !!reviewLifecycle &&
+          !!reviewExecutionLease &&
+          !!reviewExecutionOwner &&
+          isPlanLifecycleExecutionAuthorizedForRun(reviewLifecycle, {
+            executionLeaseId: reviewExecutionLease.executionLeaseId,
+            turnId: reviewRunOwner.turnId,
+            runId: reviewRunOwner.runId,
+            parentRunId: reviewRunOwner.parentRunId,
+            attempt: reviewExecutionOwner.attempt,
+          });
+        if (
+          (
+            activePlanExecutionIdentity &&
+            (
+              !isPlanExecutionAttemptIdentityCurrentForRun({
+                identity: activePlanExecutionIdentity,
+                owner: reviewRunOwner,
+                lifecycle: reviewLifecycle,
+              }) ||
+              !activePlanArtifactIdentityCurrent
+            )
+          ) ||
+          (!activePlanExecutionIdentity && liveRunClaimsPlanExecution)
+        ) {
+          logStoreEvent("plan_tool_permission_rejected_stale_run_provenance", {
+            turnId,
+            toolName,
+            target: reviewTarget,
+            toolCallId: reviewToolCallId || null,
+            executionLeaseId: activePlanExecutionIdentity?.executionLeaseId ||
+              reviewExecutionLease?.executionLeaseId || null,
+            executionAttempt: activePlanExecutionIdentity?.attempt ||
+              reviewExecutionOwner?.attempt || null,
+            reason: activePlanExecutionIdentity
+              ? activePlanArtifactIdentityCurrent
+                ? "plan_attempt_identity_stale"
+                : "plan_artifact_identity_stale"
+              : "plan_attempt_identity_missing_from_run",
+          });
+          return Promise.resolve({ action: "reject" });
+        }
         logStoreEvent("request_review_started", {
           turnId,
           toolName,
@@ -2931,6 +3265,9 @@ export class WorkflowEngine {
             title: resolveCurrentTurnTitle(),
             taskId,
             toolCall,
+            ...(activePlanExecutionIdentity
+              ? { planExecution: activePlanExecutionIdentity }
+              : {}),
           });
           const permissionPauseMessage = phaseLanguage === "zh"
             ? `等待批准：${permissionRequest.toolName} · ${permissionRequest.target}`
@@ -3234,167 +3571,116 @@ export class WorkflowEngine {
           return true;
         }
 
-        logStoreEvent("plan_max_iterations_auto_resume_pending", {
+        const issuedHandoffRef: { current: PlanApprovalHandoff | null } = { current: null };
+        let issueFailureReason = "plan_execution_not_authorized";
+        sessionSet((state: any) => {
+          const lifecycle = state.planLifecycle as PlanLifecycleState | undefined;
+          const executionLease = lifecycle?.executionLease;
+          const executionOwner = lifecycle?.execution;
+          if (
+            !lifecycle ||
+            !executionLease ||
+            !executionOwner ||
+            !isPlanLifecycleExecutionAuthorizedForRun(lifecycle, {
+              executionLeaseId: executionLease.executionLeaseId,
+              turnId,
+              runId: activeRuntimeRunIdentity.runId,
+              parentRunId: activeRuntimeRunIdentity.parentRunId,
+              attempt: executionOwner.attempt,
+            })
+          ) {
+            return {};
+          }
+          const instruction = buildPlanMaxIterationsResumePrompt({
+            language: phaseLanguage,
+            checkpoint: effectiveCheckpoint,
+            hasTasksArtifact:
+              state.planArtifacts.some((artifact: any) => artifact.kind === "tasks") ||
+              state.planTasks.length > 0,
+            tasks: state.planTasks,
+            artifacts: state.planArtifacts,
+            evidenceLedger: state.planExecutionEvidenceLedger,
+          });
+          const issuedAt = Date.now();
+          const checkpointHash = buildPlanExecutionInstructionHash(JSON.stringify({
+            iterationCount: effectiveCheckpoint.iterationCount,
+            maxIterations: effectiveCheckpoint.maxIterations,
+            autoResumeCount: effectiveCheckpoint.autoResumeCount,
+            strategyPivot: effectiveCheckpoint.strategyPivot,
+            attemptedStrategyPivots: effectiveCheckpoint.attemptedStrategyPivots,
+            priorExecutionLeaseId: executionLease.executionLeaseId,
+            priorRunId: executionOwner.runId,
+          }));
+          const issued = issuePlanAutoResumeAttempt({
+            lifecycle,
+            instruction,
+            checkpointHash,
+            executionRunId: `run-plan-auto-${issuedAt}-${generateId()}`,
+            executionLeaseId: `plan-execution-auto-${issuedAt}-${generateId()}`,
+            authorizationRequestId: `plan-auto-checkpoint-${issuedAt}-${generateId()}`,
+            issuedAt,
+            pause: {
+              reason: "max_iterations_auto_resume",
+              resultKind: "partial",
+              resumeCondition: "bounded_auto_resume_checkpoint",
+            },
+          });
+          if (!issued.ok) {
+            issueFailureReason = issued.reason;
+            return {};
+          }
+          issuedHandoffRef.current = issued.handoff;
+          return {
+            planLifecycle: issued.lifecycle,
+            pendingPlanApprovalHandoff: issued.handoff,
+            planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
+            isPlanApproved: false,
+            currentTurnExecutionConsent: { turnId: null, granted: false },
+            planApprovalExecutionStartedForTurnId: null,
+            planStage: "ready_to_execute",
+            conversationTurns: state.conversationTurns.map((candidate: any) =>
+              candidate.id === turnId || candidate.id === context.uiDisplayTurnId
+                ? { ...candidate, collapsed: false }
+                : candidate
+            ),
+          };
+        });
+        const issuedHandoff = issuedHandoffRef.current;
+        if (!issuedHandoff) {
+          const pauseNotice = buildPlanMaxIterationsPauseNotice({
+            ...effectiveCheckpoint,
+            autoResumeCount: currentCount,
+          }, phaseLanguage);
+          appendTurnBlock({
+            id: sessionGet()._nextTaskId(),
+            turnId: context.uiDisplayTurnId,
+            type: "system",
+            content: pauseNotice,
+            variant: "plan_execution_checkpoint",
+          });
+          sessionGet().setConversationTurnSummary(
+            context.uiDisplayTurnId,
+            phaseLanguage === "zh"
+              ? "计划自动续跑授权未能签发，已安全暂停；可使用 Resume Execution 重试。"
+              : "The Plan auto-resume lease could not be issued, so execution paused safely; use Resume Execution to retry.",
+          );
+          logStoreEvent("plan_max_iterations_auto_resume_lease_rejected", {
+            reason: issueFailureReason,
+            autoResumeCount: currentCount,
+            maxIterations: checkpoint.maxIterations,
+          });
+          return true;
+        }
+        logStoreEvent("plan_max_iterations_auto_resume_handoff_issued", {
           autoResumeCount: effectiveCheckpoint.autoResumeCount,
           maxIterations: checkpoint.maxIterations,
           strategyPivot: effectiveCheckpoint.strategyPivot,
           attemptedStrategyPivots: effectiveCheckpoint.attemptedStrategyPivots,
+          executionLeaseId: issuedHandoff.executionLeaseId,
+          executionRunId: issuedHandoff.executionRunId,
+          executionAttempt: issuedHandoff.executionAttempt,
+          parentRunId: issuedHandoff.parentRunId,
         });
-        const cancelAutoResume = (reason: string, options?: { visible?: boolean }) => {
-          const latest = sessionGet();
-          const latestSessionKey = resolveSessionRuntimeKey(
-            resolveSessionWorkspaceKey(latest.currentWorkspace),
-            latest.currentSessionId,
-          );
-          if (latestSessionKey !== runSessionKey) return;
-          const pauseCheckpoint = {
-            ...effectiveCheckpoint,
-            autoResumeCount: currentCount,
-          };
-          const pauseNotice = buildPlanMaxIterationsPauseNotice(
-            pauseCheckpoint,
-            phaseLanguage,
-          );
-          const cancellationNotice = options?.visible
-            ? pauseNotice
-            : phaseLanguage === "zh"
-              ? "自动续跑已取消：新的用户消息或运行时交接优先。"
-              : "Auto-resume was canceled because a newer user message or runtime handoff took priority.";
-          sessionSet((state: any) => ({
-            planAutoResumeCount: currentCount,
-            conversationTurns: state.conversationTurns.map((turn: any) =>
-              turn.id === turnId || turn.id === context.uiDisplayTurnId
-                ? { ...turn, collapsed: false }
-                : turn
-            ),
-            runtimeEvents: state.runtimeEvents.map((event: any) =>
-              event.type === "run.paused" &&
-              event.runId === activeRuntimeRunIdentity.runId &&
-              event.reason === "max_iterations_auto_resume"
-                ? {
-                    ...event,
-                    reason: "max_iterations_auto_resume_canceled",
-                    message: cancellationNotice,
-                  }
-                : event
-            ),
-          }));
-          logStoreEvent("plan_max_iterations_auto_resume_canceled", {
-            reason,
-            autoResumeCount: currentCount,
-            maxIterations: checkpoint.maxIterations,
-          });
-          emitLocalPlanExecutionProgress("paused", {
-            iteration: effectiveCheckpoint.iterationCount,
-            maxIterations: effectiveCheckpoint.maxIterations,
-            currentTask: effectiveCheckpoint.currentTask,
-            latestEvidence: effectiveCheckpoint.completedEvidence[0],
-            recoveryReason: reason,
-            nextStep: options?.visible
-              ? phaseLanguage === "zh"
-                ? "点击 Resume Execution 后从检查点继续"
-                : "click Resume Execution to continue from checkpoint"
-              : phaseLanguage === "zh"
-                ? "新的用户消息或运行时交接已优先接管"
-                : "a newer user message or runtime handoff took priority",
-          });
-          if (options?.visible) {
-            appendTurnBlock({
-              id: sessionGet()._nextTaskId(),
-              turnId: context.uiDisplayTurnId,
-              type: "system",
-              content: pauseNotice,
-              variant: "plan_execution_checkpoint",
-            });
-            sessionGet().setConversationTurnSummary(
-              context.uiDisplayTurnId,
-              phaseLanguage === "zh"
-                ? "计划自动续跑未能启动，已安全暂停；可使用 Resume Execution 重试。"
-                : "Plan auto-resume could not start and paused safely; use Resume Execution to retry.",
-            );
-          }
-        };
-        pendingMaxIterationsAutoResume = {
-          kind: "plan",
-          cancel: cancelAutoResume,
-          start: () => {
-            const latest = sessionGet();
-            const latestSessionKey = resolveSessionRuntimeKey(
-              resolveSessionWorkspaceKey(latest.currentWorkspace),
-              latest.currentSessionId,
-            );
-            if (latestSessionKey !== runSessionKey) return;
-            if (
-              latest.isGenerating ||
-              latest.agentStatus === "running" ||
-              latest.agentStatus === "pending_review"
-            ) {
-              logStoreEvent("plan_max_iterations_auto_resume_skipped", {
-                reason: "newer_run_active",
-                agentStatus: latest.agentStatus,
-                isGenerating: latest.isGenerating,
-              });
-              return;
-            }
-            if (!latest.isPlanApproved || latest.planStage !== "executing") {
-              cancelAutoResume("approved_plan_no_longer_executable", { visible: true });
-              return;
-            }
-
-            sessionSet((state: any) => ({
-              planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
-              conversationTurns: state.conversationTurns.map((turn: any) =>
-                turn.id === turnId || turn.id === context.uiDisplayTurnId
-                  ? { ...turn, status: "executing" }
-                  : turn
-              ),
-            }));
-            let started = false;
-            try {
-              started = latest.sendMessage(
-                buildPlanMaxIterationsResumePrompt({
-                  language: phaseLanguage,
-                  checkpoint: effectiveCheckpoint,
-                  hasTasksArtifact:
-                    latest.planArtifacts.some((artifact: any) => artifact.kind === "tasks") ||
-                    latest.planTasks.length > 0,
-                  tasks: latest.planTasks,
-                  artifacts: latest.planArtifacts,
-                  evidenceLedger: latest.planExecutionEvidenceLedger,
-                }),
-                undefined,
-                {
-                  hidden: true,
-                  reuseCurrentTurn: true,
-                  turnIdOverride: context.uiDisplayTurnId || turnId,
-                  preservePlanState: true,
-                  resolvedIntent: "execute",
-                  executionConsentGranted: true,
-                  parentRunIdOverride: activeRuntimeRunIdentity.runId,
-                  skipIntentResolution: true,
-                  turnTitle: phaseLanguage === "zh"
-                    ? "计划执行自动恢复"
-                    : "Plan Execution Auto-Resume",
-                  intentSummary: phaseLanguage === "zh"
-                    ? `计划执行达到安全轮次边界后切换策略：${effectiveCheckpoint.strategyPivot}。`
-                    : `Switch strategy after the plan execution safety boundary: ${effectiveCheckpoint.strategyPivot}.`,
-                },
-              ) === true;
-            } catch (error) {
-              logStoreEvent("plan_max_iterations_auto_resume_submission_failed", {
-                error: error instanceof Error ? error.message : String(error),
-              });
-            }
-            if (started) {
-              logStoreEvent("plan_max_iterations_auto_resume_dispatched", {
-                autoResumeCount: effectiveCheckpoint.autoResumeCount,
-                parentRunId: activeRuntimeRunIdentity.runId,
-              });
-            } else {
-              cancelAutoResume("resume_submission_rejected", { visible: true });
-            }
-          },
-        };
         return {
           status: "auto_resume_scheduled" as const,
           checkpoint: effectiveCheckpoint,
@@ -4063,11 +4349,21 @@ export class WorkflowEngine {
           liveBeforeRejection.activeActionRequest.artifactPaths.some(
             (artifactPath: string) => canonicalizePlanArtifactPath(artifactPath) === canonicalPath,
           );
+        const pendingPlanToolOwnsExecution =
+          liveBeforeRejection.activeActionRequest?.kind === "tool_permission" &&
+          !!liveBeforeRejection.activeActionRequest.planExecution;
         const invalidatesApprovedExecution =
-          liveBeforeRejection.isPlanApproved === true &&
+          (
+            liveBeforeRejection.isPlanApproved === true ||
+            !!liveBeforeRejection.planLifecycle?.approvalLease ||
+            pendingPlanToolOwnsExecution
+          ) &&
           (kind === "plan" || kind === "design" || kind === "bugfix") &&
           (!!rejectedApprovedArtifact || pendingApprovedReviewOwnsPath);
 
+        const invalidatedPlanToolReviewRef: {
+          current: PendingPlanToolPermissionInvalidation | null;
+        } = { current: null };
         sessionSet((state: any) => {
           const rejectedArtifact = state.planArtifacts.find(
             (artifact: any) => canonicalizePlanArtifactPath(artifact.path) === canonicalPath,
@@ -4105,6 +4401,23 @@ export class WorkflowEngine {
           const invalidatesApproval =
             state.isPlanApproved === true &&
             (kind === "plan" || kind === "design" || kind === "bugfix");
+          const nextPlanLifecycle = applyPlanArtifactIdentity({
+            lifecycle: state.planLifecycle,
+            sessionKey: runSessionKey,
+            artifactIdentity: toWorkflowPlanArtifactIdentity(
+              buildPlanApprovalIdentity(nextArtifacts),
+            ),
+            at: Date.now(),
+          });
+          const lifecycleApprovalInvalidated = Boolean(
+            state.planLifecycle?.approvalLease && !nextPlanLifecycle.approvalLease,
+          );
+          const shouldRevokeApproval = invalidatesApproval || lifecycleApprovalInvalidated;
+          const planToolInvalidation = buildPendingPlanToolPermissionInvalidation(
+            state,
+            shouldRevokeApproval,
+          );
+          invalidatedPlanToolReviewRef.current = planToolInvalidation;
           logStoreEvent("plan_artifact_rejection_invalidated_state", {
             path: canonicalPath,
             reportedPath: path,
@@ -4112,16 +4425,18 @@ export class WorkflowEngine {
             reason,
             removedExistingArtifact: !!rejectedArtifact,
             clearedPlanReviewRequest: pendingReviewOwnsPath,
-            invalidatedApproval: invalidatesApproval,
+            invalidatedApproval: shouldRevokeApproval,
             preservedApprovedTasksExecutionStage: preserveApprovedTasksExecutionStage,
             nextStage,
           });
           return {
+            planLifecycle: nextPlanLifecycle,
             planArtifacts: nextArtifacts,
             planStage: nextStage,
             showPlanPanel: nextArtifacts.length > 0 && state.showPlanPanel,
             ...(pendingReviewOwnsPath ? { activeActionRequest: null } : {}),
-            ...(invalidatesApproval
+            ...(planToolInvalidation?.patch || {}),
+            ...(shouldRevokeApproval
               ? {
                   isPlanApproved: false,
                   planApprovalChoice: null,
@@ -4135,6 +4450,19 @@ export class WorkflowEngine {
               : {}),
           };
         });
+        const invalidatedPlanToolReview = invalidatedPlanToolReviewRef.current;
+        if (invalidatedPlanToolReview) {
+          const settled = settlePendingPlanToolPermissionInvalidation(
+            invalidatedPlanToolReview,
+          );
+          logStoreEvent("plan_tool_permission_invalidated_by_artifact_rejection", {
+            requestId: invalidatedPlanToolReview.requestId,
+            taskId: invalidatedPlanToolReview.taskId,
+            sessionKey: runSessionKey,
+            path: canonicalPath,
+            settled,
+          });
+        }
 
         // A rejected rewrite of an already-approved artifact invalidates the
         // active execution lease. Reuse the central invalidation boundary so
@@ -4147,32 +4475,55 @@ export class WorkflowEngine {
       },
 
       onPlanStageChanged: (stage: "idle" | "plan" | "requirements" | "design" | "tasks" | "bugfix" | "ready_to_execute" | "executing" | "completed") => {
-        sessionSet({ planStage: stage });
+        if (stage !== "completed") {
+          sessionSet({ planStage: stage });
+          return;
+        }
+        logStoreEvent("plan_completion_declared", {
+          sessionKey: runSessionKey,
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
+          note: "canonical_projection_deferred_to_terminal_transaction",
+        });
       },
 
       onPlanApprovalInvalidated: (reason: string) => {
         const currentIdentity = buildPlanApprovalIdentity(sessionGet().planArtifacts);
-        sessionSet((state: any) => ({
-          isPlanApproved: false,
-          planApprovalChoice: null,
-          pendingPlanApprovalHandoff: null,
-          planApprovalExecutionStartedForTurnId: null,
-          activeActionRequest: null,
-          ...(currentIdentity
-            ? { agentStatus: "pending_review", isGenerating: false }
-            : {}),
-          conversationTurns: state.conversationTurns.map((candidate: any) =>
-            candidate.id === turnId
-              ? {
-                  ...candidate,
-                  ...(currentIdentity ? { status: "awaiting_approval" as const } : {}),
-                  summary: phaseLanguage === "zh"
-                    ? "计划内容在批准后发生变化，旧批准已失效。"
-                    : "The plan changed after review, so the previous approval is stale.",
-                }
-              : candidate
-          ),
-        }));
+        sessionSet((state: any) => {
+          const planLifecycle = applyPlanArtifactIdentity({
+            lifecycle: state.planLifecycle,
+            sessionKey: runSessionKey,
+            artifactIdentity: toWorkflowPlanArtifactIdentity(currentIdentity),
+            at: Date.now(),
+          });
+          return {
+            planLifecycle,
+            isPlanApproved: false,
+            planApprovalChoice: null,
+            pendingPlanApprovalHandoff: null,
+            planApprovalExecutionStartedForTurnId: null,
+            currentTurnExecutionConsent: { turnId: null, granted: false },
+            activeActionRequest: null,
+            planExecutionEvidenceLedger: [],
+            planExecutionEvidenceCount: 0,
+            planAutoResumeCount: 0,
+            planExecutionProgressSnapshot: null,
+            ...(currentIdentity
+              ? { agentStatus: "pending_review", isGenerating: false }
+              : {}),
+            conversationTurns: state.conversationTurns.map((candidate: any) =>
+              candidate.id === turnId
+                ? {
+                    ...candidate,
+                    ...(currentIdentity ? { status: "awaiting_approval" as const } : {}),
+                    summary: phaseLanguage === "zh"
+                      ? "计划内容在批准后发生变化，旧批准已失效。"
+                      : "The plan changed after review, so the previous approval is stale.",
+                  }
+                : candidate
+            ),
+          };
+        });
         if (currentIdentity) {
           const request = buildPlanReviewActionRequest({
             sessionKey: runSessionKey,
@@ -4860,6 +5211,7 @@ export class WorkflowEngine {
               }
             }
 
+            let planTerminalProjectionRejected = false;
             draft.set((state: any) => {
               let nextState = reduceRunTransition(state, {
                 type: "runtime_event",
@@ -4871,11 +5223,91 @@ export class WorkflowEngine {
                   event: turnTerminalEvent,
                 });
               }
+              const planLifecycle = state.planLifecycle as PlanLifecycleState | undefined;
+              const planExecutionLease = planLifecycle?.executionLease || null;
+              const planExecutionOwner = planLifecycle?.execution || null;
+              const exactPlanExecutionOwner = !!planLifecycle &&
+                !!planExecutionLease &&
+                !!planExecutionOwner &&
+                isPlanLifecycleExecutionAuthorizedForRun(planLifecycle, {
+                  executionLeaseId: planExecutionLease.executionLeaseId,
+                  turnId,
+                  runId: terminalRunIdentity.runId,
+                  parentRunId: terminalRunIdentity.parentRunId,
+                  attempt: planExecutionOwner.attempt,
+                });
+              let planLifecyclePatch: Record<string, unknown> = {};
+              if (exactPlanExecutionOwner && planLifecycle && planExecutionLease && planExecutionOwner) {
+                const terminalPlanProjection = collectPlanTaskTerminalProjection({
+                  tasks: state.planTasks || [],
+                  evidenceLedger: state.planExecutionEvidenceLedger || [],
+                  availableToolNames: terminalAvailableToolNames,
+                });
+                const canCompletePlan = outcome.status === "completed" &&
+                  outcome.resultKind === "success" &&
+                  terminalPlanProjection.blocking.length === 0;
+                const planTransition = canCompletePlan
+                  ? reducePlanLifecycle(planLifecycle, {
+                      type: "complete",
+                      expectedVersion: planLifecycle.version,
+                      at: timestampMs,
+                      expectedExecutionLeaseId: planExecutionLease.executionLeaseId,
+                      expectedExecution: planExecutionOwner,
+                    })
+                  : reducePlanLifecycle(planLifecycle, {
+                      type: "pause",
+                      expectedVersion: planLifecycle.version,
+                      at: timestampMs,
+                      expectedExecutionLeaseId: planExecutionLease.executionLeaseId,
+                      expectedExecution: planExecutionOwner,
+                      pause: {
+                        reason: outcome.reason || "plan_execution_stopped",
+                        resultKind: outcome.status === "completed" && outcome.resultKind !== "success"
+                          ? outcome.resultKind
+                          : (state.planExecutionEvidenceLedger || []).length > 0
+                          ? "partial"
+                          : "blocked",
+                        resumeCondition: outcome.status === "paused" && outcome.pauseKind === "action_required"
+                          ? "resolve_action_request"
+                          : "explicit_resume",
+                      },
+                    });
+                if (planTransition.disposition === "rejected") {
+                  planTerminalProjectionRejected = true;
+                  logStoreEvent("plan_terminal_projection_rejected", {
+                    sessionKey: runSessionKey,
+                    turnId,
+                    runId: terminalRunIdentity.runId,
+                    executionLeaseId: planExecutionLease.executionLeaseId,
+                    reason: planTransition.reason || "unknown",
+                  });
+                  return state;
+                }
+                planLifecyclePatch = {
+                  planLifecycle: planTransition.state,
+                  isPlanApproved: false,
+                  currentTurnExecutionConsent: { turnId: null, granted: false },
+                  pendingPlanApprovalHandoff: null,
+                  planApprovalExecutionStartedForTurnId: null,
+                  planStage: canCompletePlan ? "completed" : "ready_to_execute",
+                };
+              }
               return {
                 ...nextState,
+                ...planLifecyclePatch,
                 ...(attemptHarnessProjection === "absent"
                   ? {}
-                  : { harnessRunMarker: attemptHarnessProjection.terminal }),
+                  : {
+                      harnessRunMarker: {
+                        ...attemptHarnessProjection.terminal,
+                        ...(exactPlanExecutionOwner
+                          ? {
+                              isPlanApproved: false,
+                              planStage: planLifecyclePatch.planStage,
+                            }
+                          : {}),
+                      },
+                    }),
                 conversationTurns: nextState.conversationTurns.map((candidate: any) =>
                   terminalTurnIds.has(candidate.id)
                     ? {
@@ -4899,6 +5331,7 @@ export class WorkflowEngine {
                 ),
               };
             });
+            if (planTerminalProjectionRejected) return false;
 
             let durableState: any;
             try {
@@ -5148,6 +5581,7 @@ export class WorkflowEngine {
           planExecutionEvidenceCount: state.planExecutionEvidenceCount,
           planAutoResumeCount: state.planAutoResumeCount,
           planExecutionProgressSnapshot: state.planExecutionProgressSnapshot,
+          planLifecycle: state.planLifecycle,
           planStage: state.planStage,
           isPlanApproved: state.isPlanApproved,
           showPlanPanel: state.showPlanPanel,
@@ -5448,9 +5882,11 @@ export class WorkflowEngine {
               fallbackRunId: context.harnessRunId,
               goalSliceId: iterInput.goalSliceId,
             });
+            activePlanExecutionIdentity = null;
             updateHarnessRunMarker({
               activeRunId: activeRuntimeRunIdentity.runId,
               activeParentRunId: activeRuntimeRunIdentity.parentRunId,
+              activePlanExecutionProvenance: null,
             });
             const retainedContinuationMessages = restoreGoalContinuationMessages(iterInput.continuation);
             let iterationMessages: import("../orchestrator").AgentMessage[] = [
@@ -5947,14 +6383,43 @@ export class WorkflowEngine {
       clearInterval(timerInterval);
       let latestState = sessionGet();
       const queuedAfterRun = normalizeQueuedUserMessage(latestState.queuedUserMessage);
-      const pendingSameTurnExecution =
-        latestState.isPlanApproved === true &&
-        latestState.pendingPlanApprovalHandoff?.planTurnId === turnId &&
-        latestState.planApprovalExecutionStartedForTurnId !== turnId
-          ? latestState.pendingPlanApprovalHandoff
-          : null;
+      const pendingPlanHandoff = latestState.pendingPlanApprovalHandoff as PlanApprovalHandoff | null;
+      const pendingPlanLifecycle = latestState.planLifecycle as PlanLifecycleState | undefined;
+      const pendingExecutionLease = pendingPlanLifecycle?.executionLease || null;
+      const hasExactPendingPlanHandoff = !!pendingPlanHandoff &&
+        !!pendingPlanLifecycle &&
+        pendingPlanLifecycle.status === "handoff_pending" &&
+        isPlanApprovalLeaseBoundToState(pendingPlanLifecycle) &&
+        pendingPlanHandoff.planTurnId === turnId &&
+        pendingExecutionLease?.executionLeaseId === pendingPlanHandoff.executionLeaseId &&
+        pendingExecutionLease.executionRunId === pendingPlanHandoff.executionRunId &&
+        pendingExecutionLease.parentRunId === pendingPlanHandoff.parentRunId &&
+        pendingExecutionLease.attempt === pendingPlanHandoff.executionAttempt &&
+        pendingExecutionLease.instructionHash === pendingPlanHandoff.executionInstructionHash;
+      const pendingSameTurnExecution = hasExactPendingPlanHandoff ? pendingPlanHandoff : null;
       const ownedPendingAction = latestState.activeActionRequest as ActionRequest | null;
+      const hasExactRejectedPlanActionContinuation =
+        !!rejectedPlanActionContinuationIdentity &&
+        pendingPlanLifecycle?.status === "paused" &&
+        pendingPlanLifecycle.pause?.reason === "plan_action_continuation_admission_rejected" &&
+        pendingPlanLifecycle.pause.resumeCondition === "explicit_resume" &&
+        doesLifecycleRetainPlanExecutionProvenance(
+          pendingPlanLifecycle,
+          rejectedPlanActionContinuationIdentity,
+        );
+      if (hasExactRejectedPlanActionContinuation) {
+        // The permission wait already emitted this exact Run's durable pause.
+        // Preserve that non-terminal Turn boundary after child admission fails
+        // so an explicit resume can mint a fresh attempt instead of targeting a
+        // Turn that the finalizer has already completed.
+        loopOutcome = {
+          status: "paused",
+          reason: "tool_permission",
+          pauseKind: "recoverable",
+        };
+      }
       if (
+        !hasExactRejectedPlanActionContinuation &&
         loopOutcome.status === "aborted" &&
         ownedPendingAction?.status === "pending" &&
         isActionRequestOwnedByRun(ownedPendingAction, {
@@ -6049,13 +6514,19 @@ export class WorkflowEngine {
             resolveSessionWorkspaceKey(latest.currentWorkspace),
             latest.currentSessionId,
           );
+          const liveLifecycle = latest.planLifecycle as PlanLifecycleState | undefined;
+          const hasExactPlanApprovalHandoff = !!liveLifecycle &&
+            liveLifecycle.status === "handoff_pending" &&
+            isPlanApprovalLeaseBoundToState(liveLifecycle) &&
+            liveLifecycle.executionLease?.executionLeaseId === pendingSameTurnExecution.executionLeaseId &&
+            liveLifecycle.executionLease.executionRunId === pendingSameTurnExecution.executionRunId &&
+            liveLifecycle.executionLease.attempt === pendingSameTurnExecution.executionAttempt;
           const decision = resolveApprovedPlanSameTurnFallbackDecision({
             expectedSessionKey: runSessionKey,
             currentSessionKey: latestSessionKey,
             expectedHandoff: pendingSameTurnExecution,
             currentHandoff: latest.pendingPlanApprovalHandoff,
-            isPlanApproved: latest.isPlanApproved === true,
-            executionStartedForTurnId: latest.planApprovalExecutionStartedForTurnId,
+            hasExactPlanApprovalHandoff,
             isAgentBusy:
               latest.isGenerating ||
               latest.agentStatus === "running" ||
@@ -6227,6 +6698,67 @@ export class WorkflowEngine {
           error: errorMessage,
         });
         return false;
+      }
+      const catchLifecycle = sessionGet().planLifecycle as PlanLifecycleState | undefined;
+      const preservesRejectedPlanActionPause =
+        alreadyCommittedTerminal?.type === "run.paused" &&
+        !!rejectedPlanActionContinuationIdentity &&
+        catchLifecycle?.status === "paused" &&
+        catchLifecycle.pause?.reason === "plan_action_continuation_admission_rejected" &&
+        catchLifecycle.pause.resumeCondition === "explicit_resume" &&
+        doesLifecycleRetainPlanExecutionProvenance(
+          catchLifecycle,
+          rejectedPlanActionContinuationIdentity,
+        );
+      if (preservesRejectedPlanActionPause) {
+        const pauseOutcome: AgentLoopOutcome = {
+          status: "paused",
+          reason: "tool_permission",
+          pauseKind: "recoverable",
+        };
+        const pauseHarnessProjection = projectCurrentHarnessRunMarker(
+          "paused",
+          "tool_permission",
+        );
+        clearInterval(timerInterval);
+        if (pauseHarnessProjection === "ownership_lost") {
+          logStoreEvent("plan_action_continuation_pause_publication_skipped", {
+            reason: "harness_ownership_lost",
+            error: errorMessage,
+          });
+          return true;
+        }
+        const parentTurnId = context.uiDisplayTurnId || turnId;
+        const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
+          threadId: runSessionKey,
+          parentTurnId,
+        }).catch(() => null);
+        if (subagentFinalization) {
+          closeProjectedSubagentRuns({
+            ids: [
+              ...subagentFinalization.controllerMissingIds,
+              ...subagentFinalization.timedOutIds,
+            ],
+            error: "SUBAGENT_PARENT_PAUSED: the parent Plan Run paused after child admission was rejected.",
+            title: "Closed with paused Plan run",
+            reason: "canceled",
+          });
+        }
+        const pauseProjection = await commitTerminalProjectionBeforeStatusPublication(
+          pauseOutcome,
+          pauseHarnessProjection,
+        ).catch((pauseError) => {
+          logStoreEvent("plan_action_continuation_pause_publication_failed", {
+            error: pauseError instanceof Error ? pauseError.message : String(pauseError),
+            triggerError: errorMessage,
+          });
+          return { committed: false, finalText: null };
+        });
+        logStoreEvent("plan_action_continuation_exception_preserved_pause", {
+          triggerError: errorMessage,
+          committed: pauseProjection.committed,
+        });
+        return !pauseProjection.committed;
       }
       if (alreadyCommittedTerminal?.type === "run.paused") {
         beginTerminalConclusionRun(

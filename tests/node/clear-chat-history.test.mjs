@@ -91,6 +91,25 @@ async function waitFor(predicate, label, timeoutMs = 3000) {
   }
 }
 
+function installFakeLocalStorageWindow() {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => values.delete(key),
+    },
+  };
+  return () => {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  };
+}
+
 function readSource(relativePath) {
   return fsSync.readFileSync(path.join(process.cwd(), relativePath), "utf8");
 }
@@ -996,7 +1015,10 @@ test("failed deferred clear replays a fresh Turn only after exact workspace and 
   await new Promise((resolve) => setImmediate(resolve));
 });
 
-test("failed clear revalidates a broker-issued exact Goal continuation for the fresh Turn", async () => {
+test("failed clear revalidates a broker-issued exact Goal continuation for the fresh Turn", async (t) => {
+  // Harness ownership fails closed when durable WebView storage is unavailable.
+  // This integration test supplies the persistence surface present in desktop.
+  t.after(installFakeLocalStorageWindow());
   const { useAppStore } = loadTranspiledModuleSync(
     path.join(process.cwd(), "src/store/useAppStore.ts"),
   );
@@ -1078,6 +1100,7 @@ test("failed clear revalidates a broker-issued exact Goal continuation for the f
   assert.equal(continuedGoal.id, goalBeforeClear.id);
   assert.equal(continuedGoal.revision, goalBeforeClear.revision);
   assert.equal(continuedGoal.ownerTurnId, freshTurnId);
+  assert.equal(useAppStore.getState().harnessRunMarker?.runtimeIntent, "goal");
 
   useAppStore.setState({ sendMessage: realSendMessage });
   await useAppStore.getState().clearChatHistory();
@@ -1423,4 +1446,984 @@ test("failed clear terminalizes active and background owners before sequential r
   }), true);
   assert.equal(freshController.sessionGet().queuedUserMessage, null);
   assert.equal(activeController.hasSessionRuntimeOwnership(oldOwners[0].token), false);
+});
+
+function buildValidPlanArtifactText(label) {
+  return [
+    "# Plan authorization boundary",
+    "",
+    "## User goal",
+    `- ${label}: preserve exact Plan bytes and revoke stale execution authority.`,
+    "",
+    "## Key changes",
+    "- Bind approval to the materialized Plan revision and hash.",
+    "- Reject any tool continuation after the artifact changes.",
+    "",
+    "## Execution steps",
+    "1. Materialize the reviewed Plan artifact.",
+    "2. Admit an attempt-scoped execution lease.",
+    "3. Revoke the lease when a historical Diff is restored.",
+    "",
+    "## Validation",
+    "- Assert the resolver rejects once, the Run aborts once, and no old lease remains.",
+    "",
+  ].join("\n");
+}
+
+test("ordinary Execute Diff revert uses the Session generation without requiring a Plan owner", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-generic-diff-revert";
+  const sessionId = 810;
+  const turnId = "turn-generic-diff-revert";
+  const filePath = "src/generic.ts";
+  const oldText = "export const value = 1;\n";
+  const newText = "export const value = 2;\n";
+  seedWorkspaceSession(useAppStore, workspace, sessionId, turnId);
+  useAppStore.setState({
+    taskFlow: [{
+      id: 900,
+      turnId,
+      type: "tool",
+      toolName: "write_file",
+      target: filePath,
+      status: "success",
+      toolStatus: "executed",
+      diff: {
+        old: oldText,
+        new: newText,
+        path: filePath,
+        existed: true,
+        fullFile: true,
+      },
+    }],
+  });
+
+  const writes = [];
+  tauriInvoke = (command, payload) => {
+    if (command === "read_file") return Promise.resolve(newText);
+    if (command === "write_file") {
+      writes.push(payload);
+      return Promise.resolve();
+    }
+    return Promise.resolve("");
+  };
+  const result = await useAppStore.getState().revertDiffGroups([{
+    path: filePath,
+    taskIds: [900],
+    oldText,
+    newText,
+    existed: true,
+    fullFile: true,
+  }]);
+
+  assert.equal(result[0].ok, true);
+  assert.equal(writes.length, 1);
+  assert.equal(writes[0].content, oldText);
+  assert.ok(useAppStore.getState().sessionsByWorkspace[workspace][0].planLifecycleEpoch);
+  assert.equal(useAppStore.getState().taskFlow[0].revertStatus, "reverted");
+});
+
+function buildPlanDiffRevertFixture(input) {
+  const { buildPlanApprovalIdentity } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/lib/planApprovalIdentity.ts"),
+  );
+  const { buildToolPermissionActionRequest } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/lib/pendingToolReview.ts"),
+  );
+  const artifactPath = ".MAIN/plans/plan.md";
+  const artifact = {
+    kind: "plan",
+    path: artifactPath,
+    title: "Plan",
+    content: input.currentContent,
+    revision: 7,
+    updatedAt: 70,
+  };
+  const identity = buildPlanApprovalIdentity([artifact]);
+  assert.ok(identity);
+  const sessionEpoch = "epoch-plan-diff-revert";
+  const turnId = "turn-plan-diff-revert";
+  const reviewRunId = "run-plan-review";
+  const executionRunId = "run-plan-execution";
+  const requestId = "request-plan-review";
+  const approvalLeaseId = "approval-plan-diff";
+  const executionLeaseId = "execution-plan-diff";
+  const instructionHash = "plan-instruction-sha256-diff-revert";
+  const reviewIdentity = {
+    sessionKey: input.sessionKey,
+    sessionEpoch,
+    turnId,
+    runId: reviewRunId,
+    parentRunId: "run-plan-author",
+    requestId,
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    artifactPaths: identity.artifactPaths,
+  };
+  const approvalLease = {
+    schemaVersion: 2,
+    leaseId: approvalLeaseId,
+    sessionKey: input.sessionKey,
+    sessionEpoch,
+    planTurnId: turnId,
+    reviewRunId,
+    requestId,
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    artifactPaths: identity.artifactPaths,
+    approvedAt: 80,
+    approvalTurnId: turnId,
+    approvalRunId: reviewRunId,
+    approvalDecisionKind: "action_decision",
+  };
+  const executionLease = {
+    schemaVersion: 2,
+    executionLeaseId,
+    approvalLeaseId,
+    sessionKey: input.sessionKey,
+    sessionEpoch,
+    planTurnId: turnId,
+    executionTurnId: turnId,
+    executionRunId,
+    parentRunId: reviewRunId,
+    attempt: 1,
+    issuedAt: 81,
+    reason: "initial_approval",
+    instructionHash,
+    authorization: {
+      kind: "action_decision",
+      sessionKey: input.sessionKey,
+      sessionEpoch,
+      turnId,
+      runId: reviewRunId,
+      requestId,
+    },
+  };
+  const execution = {
+    turnId,
+    runId: executionRunId,
+    parentRunId: reviewRunId,
+    attempt: 1,
+    startedAt: 82,
+  };
+  const lifecycle = {
+    schemaVersion: 2,
+    version: 5,
+    status: input.pendingReview ? "paused" : "executing",
+    sessionKey: input.sessionKey,
+    sessionEpoch,
+    planTurnId: turnId,
+    artifactIdentity: {
+      revision: identity.revision,
+      artifactHash: identity.artifactHash,
+      artifactPaths: identity.artifactPaths,
+    },
+    reviewIdentity,
+    approvalLease,
+    executionLease,
+    lastIssuedAttempt: 1,
+    execution,
+    pause: input.pendingReview
+      ? {
+          reason: "tool_permission",
+          resultKind: "partial",
+          resumeCondition: "resolve_action_request",
+        }
+      : null,
+    updatedAt: 83,
+  };
+  const provenance = {
+    schemaVersion: 1,
+    sessionKey: input.sessionKey,
+    sessionEpoch,
+    planTurnId: turnId,
+    approvalLeaseId,
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    executionLeaseId,
+    executionTurnId: turnId,
+    executionRunId,
+    parentRunId: reviewRunId,
+    attempt: 1,
+    instructionHash,
+  };
+  const permissionRequest = input.pendingReview
+    ? buildToolPermissionActionRequest({
+        sessionKey: input.sessionKey,
+        turnId,
+        runId: executionRunId,
+        parentRunId: reviewRunId,
+        title: "Execute exact Plan",
+        taskId: 902,
+        toolCall: {
+          name: "apply_patch",
+          arguments: { patch: "*** Begin Patch\n*** End Patch" },
+        },
+        planExecution: provenance,
+        now: 84,
+      })
+    : null;
+  const harnessRunMarker = {
+    schemaVersion: 1,
+    runId: executionRunId,
+    parentRunId: reviewRunId,
+    activeRunId: executionRunId,
+    activeParentRunId: reviewRunId,
+    activePlanExecutionProvenance: provenance,
+    sessionKey: input.sessionKey,
+    sessionId: null,
+    workspace: input.sessionKey.slice(0, input.sessionKey.lastIndexOf(":")),
+    turnId,
+    instanceId: "instance-plan-diff-revert",
+    status: input.pendingReview ? "paused" : "running",
+    startedAt: 82,
+    updatedAt: 84,
+    closedAt: null,
+    closeReason: null,
+  };
+  return {
+    artifactPath,
+    artifact,
+    lifecycle,
+    permissionRequest,
+    provenance,
+    harnessRunMarker,
+    turnId,
+  };
+}
+
+for (const pendingReview of [false, true]) {
+  test(`Plan Diff revert revokes ${pendingReview ? "a paused tool review" : "an executing Run"} atomically`, async () => {
+    const { useAppStore } = loadTranspiledModuleSync(
+      path.join(process.cwd(), "src/store/useAppStore.ts"),
+    );
+    useAppStore.getState().resetAllSettings();
+    const workspace = `/workspace-plan-diff-revert-${pendingReview ? "review" : "running"}`;
+    const sessionId = pendingReview ? 812 : 811;
+    const sessionKey = `${workspace}:${sessionId}`;
+    const currentContent = buildValidPlanArtifactText("current content");
+    const restoredContent = buildValidPlanArtifactText("restored content");
+    const fixture = buildPlanDiffRevertFixture({
+      sessionKey,
+      currentContent,
+      pendingReview,
+    });
+    seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+    const decisions = [];
+    const abortController = new AbortController();
+    let aborts = 0;
+    abortController.signal.addEventListener("abort", () => { aborts += 1; });
+    useAppStore.setState({
+      planArtifacts: [fixture.artifact],
+      planTasks: [],
+      planLifecycle: fixture.lifecycle,
+      planStage: pendingReview ? "ready_to_execute" : "executing",
+      isPlanApproved: !pendingReview,
+      currentTurnExecutionConsent: { turnId: fixture.turnId, granted: true },
+      activeActionRequest: fixture.permissionRequest,
+      pendingReviewResolve: pendingReview
+        ? (decision) => decisions.push(decision)
+        : null,
+      pendingReviewTaskId: fixture.permissionRequest?.taskId ?? null,
+      pendingToolCall: fixture.permissionRequest
+        ? { name: fixture.permissionRequest.toolName, arguments: {} }
+        : null,
+      harnessRunMarker: fixture.harnessRunMarker,
+      abortController,
+      taskFlow: [{
+        id: 901,
+        turnId: fixture.turnId,
+        type: "tool",
+        toolName: "write_file",
+        target: fixture.artifactPath,
+        status: "success",
+        toolStatus: "executed",
+        diff: {
+          old: restoredContent,
+          new: currentContent,
+          path: fixture.artifactPath,
+          existed: true,
+          fullFile: true,
+        },
+      }],
+      agentStatus: pendingReview ? "pending_review" : "running",
+      isGenerating: true,
+    });
+
+    const writes = [];
+    tauriInvoke = (command, payload) => {
+      if (command === "read_file") return Promise.resolve(currentContent);
+      if (command === "write_file") {
+        writes.push(payload);
+        return Promise.resolve();
+      }
+      return Promise.resolve("");
+    };
+    const result = await useAppStore.getState().revertDiffGroups([{
+      path: fixture.artifactPath,
+      taskIds: [901],
+      oldText: restoredContent,
+      newText: currentContent,
+      existed: true,
+      fullFile: true,
+    }]);
+
+    assert.equal(result[0].ok, true);
+    assert.equal(writes.length, 1);
+    assert.equal(writes[0].content, restoredContent);
+    const state = useAppStore.getState();
+    assert.equal(state.planArtifacts[0].content, restoredContent.trim());
+    assert.equal(state.planArtifacts[0].revision, 8);
+    assert.equal(state.planLifecycle.status, "paused");
+    assert.equal(state.planLifecycle.pause.reason, "artifact_identity_changed");
+    assert.equal(state.planLifecycle.approvalLease, null);
+    assert.equal(state.planLifecycle.executionLease, null);
+    assert.equal(state.planLifecycle.execution, null);
+    assert.equal(state.isPlanApproved, false);
+    assert.deepEqual(state.currentTurnExecutionConsent, { turnId: null, granted: false });
+    assert.equal(state.activeActionRequest, null);
+    assert.equal(state.pendingReviewResolve, null);
+    assert.equal(state.pendingReviewTaskId, null);
+    assert.equal(state.pendingToolCall, null);
+    assert.deepEqual(decisions, pendingReview ? [{ action: "reject" }] : []);
+    assert.equal(aborts, 1);
+  });
+}
+
+test("explicit Plan resume revokes a resumable owner whose logical Turn is already terminal", () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-terminal-plan-resume";
+  const sessionId = 819;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const currentContent = buildValidPlanArtifactText("terminal Plan owner");
+  const fixture = buildPlanDiffRevertFixture({
+    sessionKey,
+    currentContent,
+    pendingReview: true,
+  });
+  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  useAppStore.setState({
+    planArtifacts: [fixture.artifact],
+    planTasks: [],
+    planLifecycle: fixture.lifecycle,
+    planStage: "ready_to_execute",
+    isPlanApproved: false,
+    pendingPlanApprovalHandoff: {
+      planTurnId: fixture.turnId,
+      requestedAt: 85,
+      approvalLeaseId: fixture.lifecycle.approvalLease.leaseId,
+      executionLeaseId: fixture.lifecycle.executionLease.executionLeaseId,
+      sessionEpoch: fixture.lifecycle.sessionEpoch,
+      reviewRequestId: fixture.lifecycle.approvalLease.requestId,
+      executionTurnId: fixture.lifecycle.execution.turnId,
+      executionRunId: fixture.lifecycle.execution.runId,
+      executionAttempt: fixture.lifecycle.execution.attempt,
+      executionInstructionHash: fixture.lifecycle.executionLease.instructionHash,
+      prompt: "continue terminal Plan",
+      planRevision: fixture.lifecycle.artifactIdentity.revision,
+      artifactHash: fixture.lifecycle.artifactIdentity.artifactHash,
+      artifactPaths: fixture.lifecycle.artifactIdentity.artifactPaths,
+      parentRunId: fixture.lifecycle.execution.parentRunId,
+    },
+    currentTurnExecutionConsent: { turnId: fixture.turnId, granted: true },
+    runtimeEvents: [{
+      schemaVersion: 2,
+      type: "turn.completed",
+      threadId: sessionKey,
+      turnId: fixture.turnId,
+      timestampMs: 90,
+      resultKind: "error",
+    }],
+    activeActionRequest: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+    harnessRunMarker: null,
+    abortController: null,
+    agentStatus: "idle",
+    isGenerating: false,
+  });
+
+  assert.equal(useAppStore.getState().resumePlanExecution("continue safely"), false);
+  const state = useAppStore.getState();
+  assert.equal(state.planLifecycle.status, "drafting");
+  assert.equal(state.planLifecycle.approvalLease, null);
+  assert.equal(state.planLifecycle.executionLease, null);
+  assert.equal(state.planLifecycle.execution, null);
+  assert.equal(state.pendingPlanApprovalHandoff, null);
+  assert.deepEqual(state.currentTurnExecutionConsent, { turnId: null, granted: false });
+  assert.equal(state.showPlanPanel, true);
+});
+
+test("an in-flight Plan Diff revert publishes only to its exact source Session after a Session switch", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  const { createPlanLifecycleState } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/lib/planLifecycle.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-plan-diff-source-fence";
+  const sourceSessionId = 814;
+  const targetSessionId = 815;
+  const sourceSessionKey = `${workspace}:${sourceSessionId}`;
+  const targetSessionKey = `${workspace}:${targetSessionId}`;
+  const currentContent = buildValidPlanArtifactText("source current content");
+  const restoredContent = buildValidPlanArtifactText("source restored content");
+  const fixture = buildPlanDiffRevertFixture({
+    sessionKey: sourceSessionKey,
+    currentContent,
+    pendingReview: false,
+  });
+  seedWorkspaceSession(useAppStore, workspace, sourceSessionId, fixture.turnId);
+  const sourceAbortController = new AbortController();
+  let sourceAborts = 0;
+  sourceAbortController.signal.addEventListener("abort", () => { sourceAborts += 1; });
+  useAppStore.setState({
+    planArtifacts: [fixture.artifact],
+    planTasks: [],
+    planLifecycle: fixture.lifecycle,
+    planStage: "executing",
+    isPlanApproved: true,
+    currentTurnExecutionConsent: { turnId: fixture.turnId, granted: true },
+    harnessRunMarker: fixture.harnessRunMarker,
+    abortController: sourceAbortController,
+    taskFlow: [{
+      id: 903,
+      turnId: fixture.turnId,
+      type: "tool",
+      toolName: "write_file",
+      target: fixture.artifactPath,
+      status: "success",
+      toolStatus: "executed",
+      diff: {
+        old: restoredContent,
+        new: currentContent,
+        path: fixture.artifactPath,
+        existed: true,
+        fullFile: true,
+      },
+    }],
+    agentStatus: "running",
+    isGenerating: true,
+  });
+
+  const readStarted = deferred();
+  const readGate = deferred();
+  const writes = [];
+  tauriInvoke = (command, payload) => {
+    if (command === "read_file") {
+      readStarted.resolve();
+      return readGate.promise;
+    }
+    if (command === "write_file") {
+      writes.push(payload);
+      return Promise.resolve();
+    }
+    return Promise.resolve("");
+  };
+  const revert = useAppStore.getState().revertDiffGroups([{
+    path: fixture.artifactPath,
+    taskIds: [903],
+    oldText: restoredContent,
+    newText: currentContent,
+    existed: true,
+    fullFile: true,
+  }]);
+  await readStarted.promise;
+  assert.ok(useAppStore.getState().runtimeBySessionKey[sourceSessionKey]);
+
+  const targetEpoch = "epoch-plan-diff-target";
+  const targetLifecycle = createPlanLifecycleState({
+    sessionKey: targetSessionKey,
+    sessionEpoch: targetEpoch,
+    updatedAt: 100,
+  });
+  const targetArtifact = {
+    kind: "plan",
+    path: ".MAIN/plans/target.md",
+    title: "Target Plan",
+    content: buildValidPlanArtifactText("target Session must remain visible"),
+    revision: 1,
+    updatedAt: 100,
+  };
+  const targetTaskFlow = [{
+    id: 990,
+    turnId: "turn-target-session",
+    type: "system",
+    content: "target-session-sentinel",
+  }];
+  const targetAbortController = new AbortController();
+  let targetAborts = 0;
+  targetAbortController.signal.addEventListener("abort", () => { targetAborts += 1; });
+  useAppStore.setState((state) => ({
+    sessionsByWorkspace: {
+      ...state.sessionsByWorkspace,
+      [workspace]: [
+        ...(state.sessionsByWorkspace[workspace] || []).map((session) => ({
+          ...session,
+          active: false,
+          planLifecycleEpoch: fixture.lifecycle.sessionEpoch,
+        })),
+        {
+          id: targetSessionId,
+          title: "Target Session",
+          date: "Today",
+          active: true,
+          messages: [],
+          planLifecycleEpoch: targetEpoch,
+        },
+      ],
+    },
+    currentSessionId: targetSessionId,
+    activeSessionByWorkspace: { ...state.activeSessionByWorkspace, [workspace]: targetSessionId },
+    planArtifacts: [targetArtifact],
+    planTasks: [],
+    planLifecycle: targetLifecycle,
+    planStage: "plan",
+    isPlanApproved: false,
+    currentTurnExecutionConsent: { turnId: null, granted: false },
+    harnessRunMarker: null,
+    abortController: targetAbortController,
+    taskFlow: targetTaskFlow,
+    conversationTurns: [executionTurn("turn-target-session")],
+    currentTurnId: "turn-target-session",
+    agentStatus: "running",
+    isGenerating: true,
+  }));
+  readGate.resolve(currentContent);
+
+  const result = await revert;
+  assert.equal(result[0].ok, true);
+  assert.equal(writes.length, 1);
+  assert.equal(sourceAborts, 1);
+  assert.equal(targetAborts, 0);
+  const state = useAppStore.getState();
+  assert.equal(state.currentSessionId, targetSessionId);
+  assert.equal(state.planLifecycle.sessionKey, targetSessionKey);
+  assert.equal(state.planLifecycle.sessionEpoch, targetEpoch);
+  assert.deepEqual(state.planArtifacts, [targetArtifact]);
+  assert.deepEqual(state.taskFlow, targetTaskFlow);
+  assert.equal(state.abortController, targetAbortController);
+  const sourceRuntime = state.runtimeBySessionKey[sourceSessionKey];
+  assert.ok(sourceRuntime);
+  assert.equal(sourceRuntime.planArtifacts[0].content, restoredContent.trim());
+  assert.equal(sourceRuntime.planLifecycle.status, "paused");
+  assert.equal(sourceRuntime.planLifecycle.approvalLease, null);
+  assert.equal(sourceRuntime.taskFlow[0].revertStatus, "reverted");
+});
+
+test("settings reset invalidates an in-flight Plan Diff revert without reinjecting its source runtime", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-plan-diff-reset-fence";
+  const sessionId = 816;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const currentContent = buildValidPlanArtifactText("reset current content");
+  const restoredContent = buildValidPlanArtifactText("reset restored content");
+  const fixture = buildPlanDiffRevertFixture({
+    sessionKey,
+    currentContent,
+    pendingReview: false,
+  });
+  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  useAppStore.setState({
+    planArtifacts: [fixture.artifact],
+    planTasks: [],
+    planLifecycle: fixture.lifecycle,
+    planStage: "executing",
+    isPlanApproved: true,
+    currentTurnExecutionConsent: { turnId: fixture.turnId, granted: true },
+    harnessRunMarker: fixture.harnessRunMarker,
+    abortController: new AbortController(),
+    taskFlow: [{
+      id: 904,
+      turnId: fixture.turnId,
+      type: "tool",
+      toolName: "write_file",
+      target: fixture.artifactPath,
+      status: "success",
+      toolStatus: "executed",
+      diff: {
+        old: restoredContent,
+        new: currentContent,
+        path: fixture.artifactPath,
+        existed: true,
+        fullFile: true,
+      },
+    }],
+    agentStatus: "running",
+    isGenerating: true,
+  });
+
+  const writeStarted = deferred();
+  const writeGate = deferred();
+  tauriInvoke = (command) => {
+    if (command === "read_file") return Promise.resolve(currentContent);
+    if (command === "write_file") {
+      writeStarted.resolve();
+      return writeGate.promise;
+    }
+    return Promise.resolve("");
+  };
+  const revert = useAppStore.getState().revertDiffGroups([{
+    path: fixture.artifactPath,
+    taskIds: [904],
+    oldText: restoredContent,
+    newText: currentContent,
+    existed: true,
+    fullFile: true,
+  }]);
+  await writeStarted.promise;
+  useAppStore.getState().resetAllSettings();
+  writeGate.resolve();
+
+  const result = await revert;
+  assert.equal(result[0].ok, false);
+  assert.match(result[0].message, /设置重置|Settings reset/);
+  const state = useAppStore.getState();
+  assert.deepEqual(state.runtimeBySessionKey, {});
+  assert.deepEqual(state.planArtifacts, []);
+  assert.deepEqual(state.taskFlow, []);
+  assert.equal(state.planLifecycle.status, "empty");
+  assert.equal(state.pendingPlanApprovalHandoff, null);
+  assert.equal(state.activeActionRequest, null);
+  assert.equal(state.abortController, null);
+});
+
+test("Plan Diff authority invalidation does not abort an unrelated generic Run", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-plan-diff-generic-run";
+  const sessionId = 817;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const currentContent = buildValidPlanArtifactText("generic current content");
+  const restoredContent = buildValidPlanArtifactText("generic restored content");
+  const fixture = buildPlanDiffRevertFixture({
+    sessionKey,
+    currentContent,
+    pendingReview: false,
+  });
+  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  const genericAbortController = new AbortController();
+  let genericAborts = 0;
+  genericAbortController.signal.addEventListener("abort", () => { genericAborts += 1; });
+  const genericMarker = {
+    ...fixture.harnessRunMarker,
+    runId: "run-generic-unrelated",
+    activeRunId: "run-generic-unrelated",
+    activeParentRunId: null,
+    parentRunId: null,
+    activePlanExecutionProvenance: null,
+  };
+  useAppStore.setState({
+    planArtifacts: [fixture.artifact],
+    planTasks: [],
+    planLifecycle: fixture.lifecycle,
+    planStage: "executing",
+    isPlanApproved: true,
+    harnessRunMarker: genericMarker,
+    abortController: genericAbortController,
+    taskFlow: [{
+      id: 905,
+      turnId: fixture.turnId,
+      type: "tool",
+      toolName: "write_file",
+      target: fixture.artifactPath,
+      status: "success",
+      toolStatus: "executed",
+      diff: {
+        old: restoredContent,
+        new: currentContent,
+        path: fixture.artifactPath,
+        existed: true,
+        fullFile: true,
+      },
+    }],
+  });
+  tauriInvoke = (command) => {
+    if (command === "read_file") return Promise.resolve(currentContent);
+    if (command === "write_file") return Promise.resolve();
+    return Promise.resolve("");
+  };
+
+  const result = await useAppStore.getState().revertDiffGroups([{
+    path: fixture.artifactPath,
+    taskIds: [905],
+    oldText: restoredContent,
+    newText: currentContent,
+    existed: true,
+    fullFile: true,
+  }]);
+
+  assert.equal(result[0].ok, true);
+  assert.equal(genericAborts, 0);
+  assert.equal(useAppStore.getState().harnessRunMarker.runId, "run-generic-unrelated");
+  assert.equal(useAppStore.getState().planLifecycle.approvalLease, null);
+});
+
+test("a throwing Plan abort observer cannot turn a committed Diff revert into failure", async () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-plan-diff-abort-throws";
+  const sessionId = 818;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const currentContent = buildValidPlanArtifactText("throwing abort current content");
+  const restoredContent = buildValidPlanArtifactText("throwing abort restored content");
+  const fixture = buildPlanDiffRevertFixture({
+    sessionKey,
+    currentContent,
+    pendingReview: false,
+  });
+  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  let abortCalls = 0;
+  useAppStore.setState({
+    planArtifacts: [fixture.artifact],
+    planTasks: [],
+    planLifecycle: fixture.lifecycle,
+    planStage: "executing",
+    isPlanApproved: true,
+    harnessRunMarker: fixture.harnessRunMarker,
+    abortController: {
+      signal: { aborted: false },
+      abort: () => {
+        abortCalls += 1;
+        throw new Error("observer abort failed");
+      },
+    },
+    taskFlow: [{
+      id: 906,
+      turnId: fixture.turnId,
+      type: "tool",
+      toolName: "write_file",
+      target: fixture.artifactPath,
+      status: "success",
+      toolStatus: "executed",
+      diff: {
+        old: restoredContent,
+        new: currentContent,
+        path: fixture.artifactPath,
+        existed: true,
+        fullFile: true,
+      },
+    }],
+  });
+  tauriInvoke = (command) => {
+    if (command === "read_file") return Promise.resolve(currentContent);
+    if (command === "write_file") return Promise.resolve();
+    return Promise.resolve("");
+  };
+
+  const result = await useAppStore.getState().revertDiffGroups([{
+    path: fixture.artifactPath,
+    taskIds: [906],
+    oldText: restoredContent,
+    newText: currentContent,
+    existed: true,
+    fullFile: true,
+  }]);
+
+  assert.equal(abortCalls, 1);
+  assert.equal(result[0].ok, true);
+  assert.equal(useAppStore.getState().taskFlow[0].revertStatus, "reverted");
+  assert.equal(useAppStore.getState().planArtifacts[0].content, restoredContent.trim());
+  assert.equal(useAppStore.getState().planLifecycle.approvalLease, null);
+});
+
+test("a stale Plan permission click rejects instead of approving artifact representation drift", () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-plan-permission-drift";
+  const sessionId = 813;
+  const sessionKey = `${workspace}:${sessionId}`;
+  const currentContent = buildValidPlanArtifactText("reviewed content");
+  const fixture = buildPlanDiffRevertFixture({
+    sessionKey,
+    currentContent,
+    pendingReview: true,
+  });
+  seedWorkspaceSession(useAppStore, workspace, sessionId, fixture.turnId);
+  const decisions = [];
+  const abortController = new AbortController();
+  let aborts = 0;
+  abortController.signal.addEventListener("abort", () => { aborts += 1; });
+  const request = fixture.permissionRequest;
+  assert.ok(request);
+  useAppStore.setState({
+    planArtifacts: [{
+      ...fixture.artifact,
+      content: buildValidPlanArtifactText("bytes changed outside lifecycle transition"),
+      revision: 8,
+      updatedAt: 90,
+    }],
+    planLifecycle: fixture.lifecycle,
+    planStage: "ready_to_execute",
+    isPlanApproved: false,
+    activeActionRequest: request,
+    pendingReviewResolve: (decision) => decisions.push(decision),
+    pendingReviewTaskId: request.taskId,
+    pendingToolCall: { name: request.toolName, arguments: {} },
+    harnessRunMarker: fixture.harnessRunMarker,
+    abortController,
+    agentStatus: "pending_review",
+    isGenerating: false,
+    taskFlow: [{
+      id: request.taskId,
+      turnId: request.turnId,
+      type: "tool",
+      toolName: request.toolName,
+      target: request.target,
+      status: "pending_review",
+      toolStatus: "pending",
+    }],
+  });
+
+  useAppStore.getState().allowToolAction(request.taskId, {
+    sessionKey: request.sessionKey,
+    turnId: request.turnId,
+    runId: request.runId,
+    requestId: request.requestId,
+    taskId: request.taskId,
+  });
+
+  const state = useAppStore.getState();
+  assert.deepEqual(decisions, [{ action: "reject" }]);
+  assert.equal(aborts, 1);
+  assert.equal(state.activeActionRequest, null);
+  assert.equal(state.pendingReviewResolve, null);
+  assert.equal(state.pendingReviewTaskId, null);
+  assert.equal(state.pendingToolCall, null);
+  assert.notEqual(state.taskFlow[0].toolStatus, "running");
+});
+
+test("settings reset revokes active and cached runtimes before clearing transient controls", () => {
+  const source = readSource("src/store/useAppStore.ts");
+  const start = source.indexOf("resetAllSettings: () => {");
+  const end = source.indexOf("\n\n  // ── Workflow Mode", start);
+  assert.notEqual(start, -1);
+  assert.notEqual(end, -1);
+  const body = source.slice(start, end);
+  const revertGenerationIndex = body.indexOf("planDiffRevertResetGeneration += 1");
+  const revokeIndex = body.indexOf("revokeAllSessionRuntimesBeforeSettingsReset({");
+  const clearIndex = body.indexOf("sessionsByWorkspace: {}");
+  assert.ok(revertGenerationIndex >= 0);
+  assert.ok(revertGenerationIndex < revokeIndex);
+  assert.ok(revokeIndex >= 0);
+  assert.ok(clearIndex > revokeIndex);
+  for (const field of [
+    "abortController: null",
+    "pendingRunDecisionResolver: null",
+    "pendingReviewResolve: null",
+    "activeActionRequest: null",
+    "pendingToolCall: null",
+    "pendingSlashCommand: null",
+    "harnessRunMarker: null",
+    'agentStatus: "idle"',
+    "isGenerating: false",
+  ]) {
+    assert.match(body, new RegExp(field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  }
+});
+
+test("real settings reset settles every live in-memory capability before state deletion", () => {
+  const { useAppStore } = loadTranspiledModuleSync(
+    path.join(process.cwd(), "src/store/useAppStore.ts"),
+  );
+  useAppStore.getState().resetAllSettings();
+  const workspace = "/workspace-settings-reset-runtime";
+  const activeSessionId = 821;
+  const activeSessionKey = `${workspace}:${activeSessionId}`;
+  const backgroundSessionKey = `${workspace}:822`;
+  seedWorkspaceSession(
+    useAppStore,
+    workspace,
+    activeSessionId,
+    "turn-settings-reset-active",
+  );
+  const calls = [];
+  useAppStore.setState({
+    runtimeBySessionKey: {
+      [backgroundSessionKey]: {
+        currentTurnId: "turn-settings-reset-background",
+        agentStatus: "running",
+        abortController: {
+          abort: () => calls.push("background:abort"),
+          signal: { aborted: false },
+        },
+      },
+    },
+  });
+  useAppStore.setState({
+    abortController: {
+      abort: () => calls.push("active:abort"),
+      signal: { aborted: false },
+    },
+    pendingRunDecisionResolver: (choice) => calls.push(`active:decision:${choice}`),
+    pendingReviewResolve: (decision) => calls.push(`active:review:${decision.action}`),
+    pendingReviewTaskId: 41,
+    activeActionRequest: {
+      schemaVersion: 1,
+      requestId: "request-settings-reset",
+      kind: "tool_permission",
+      sessionKey: activeSessionKey,
+      turnId: "turn-settings-reset-active",
+      runId: "run-settings-reset-active",
+      title: "Reset pending review",
+      status: "pending",
+      createdAt: 1,
+      taskId: 41,
+      toolName: "run_command",
+      target: "npm test",
+    },
+    pendingToolCall: { name: "run_command", arguments: { command: "npm test" } },
+    pendingSlashCommand: {
+      command: "/test",
+      raw: "/test",
+      source: "composer",
+    },
+  });
+  const beforeReset = useAppStore.getState();
+  assert.deepEqual(
+    Object.keys(beforeReset.runtimeBySessionKey).sort(),
+    [activeSessionKey, backgroundSessionKey].sort(),
+  );
+  assert.equal(
+    typeof beforeReset.runtimeBySessionKey[backgroundSessionKey].abortController.abort,
+    "function",
+  );
+
+  useAppStore.getState().resetAllSettings();
+
+  assert.deepEqual(calls, [
+    "active:abort",
+    "active:decision:cancel",
+    "active:review:reject",
+    "background:abort",
+  ]);
+  const state = useAppStore.getState();
+  assert.deepEqual(state.sessionsByWorkspace, {});
+  assert.deepEqual(state.runtimeBySessionKey, {});
+  assert.equal(state.abortController, null);
+  assert.equal(state.pendingRunDecisionResolver, null);
+  assert.equal(state.pendingReviewResolve, null);
+  assert.equal(state.activeActionRequest, null);
+  assert.equal(state.pendingToolCall, null);
+  assert.equal(state.pendingSlashCommand, null);
+  assert.equal(state.harnessRunMarker, null);
+  assert.equal(state.agentStatus, "idle");
+  assert.equal(state.isGenerating, false);
 });

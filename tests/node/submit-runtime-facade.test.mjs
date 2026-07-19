@@ -63,6 +63,11 @@ const {
   path.join(workspaceRoot, "src/store/submitSessionRuntimeController.ts"),
 );
 const {
+  buildPlanApprovalIdentity,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planApprovalIdentity.ts"),
+);
+const {
   persistHarnessRunMarker,
   readHarnessRunMarker,
   settleHarnessRunMarkerIfOwned,
@@ -181,6 +186,151 @@ function buildAcceptedControllerPlan(label) {
     "- Assert the revision, artifact hash, artifact paths, and request id all describe the latest write.",
     "",
   ].join("\n");
+}
+
+function buildPlanToolControllerFixture() {
+  const sessionKey = "/tmp/app:42";
+  const sessionEpoch = "session-epoch-plan-tool";
+  const artifactPath = ".MAIN/plans/plan.md";
+  const initialArtifact = {
+    kind: "plan",
+    path: artifactPath,
+    title: "Plan",
+    content: buildAcceptedControllerPlan("Approved revision"),
+    revision: 1,
+    updatedAt: 100,
+  };
+  const identity = buildPlanApprovalIdentity([initialArtifact]);
+  assert.ok(identity);
+  const planExecution = {
+    schemaVersion: 1,
+    sessionKey,
+    sessionEpoch,
+    planTurnId: "turn-1",
+    approvalLeaseId: "approval-lease-plan-tool",
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    executionLeaseId: "execution-lease-plan-tool",
+    executionTurnId: "turn-1",
+    executionRunId: "run-plan-tool",
+    parentRunId: "run-review-plan-tool",
+    attempt: 1,
+    instructionHash: "instruction-plan-tool",
+  };
+  const pendingRequest = {
+    schemaVersion: 1,
+    requestId: "action-tool-plan-tool",
+    kind: "tool_permission",
+    sessionKey,
+    turnId: planExecution.executionTurnId,
+    runId: planExecution.executionRunId,
+    parentRunId: planExecution.parentRunId,
+    title: "Execute approved Plan",
+    status: "pending",
+    createdAt: 120,
+    resolvedAt: null,
+    taskId: 77,
+    toolName: "apply_patch",
+    target: "src/main.ts",
+    risk: "write",
+    planExecution,
+  };
+  const reviewIdentity = {
+    sessionKey,
+    sessionEpoch,
+    turnId: "turn-1",
+    runId: "run-review-plan-tool",
+    parentRunId: null,
+    requestId: "review-plan-tool",
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    artifactPaths: identity.artifactPaths,
+  };
+  const approvalLease = {
+    schemaVersion: 2,
+    leaseId: planExecution.approvalLeaseId,
+    sessionKey,
+    sessionEpoch,
+    planTurnId: "turn-1",
+    reviewRunId: reviewIdentity.runId,
+    requestId: reviewIdentity.requestId,
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    artifactPaths: identity.artifactPaths,
+    approvedAt: 110,
+    approvalTurnId: "turn-1",
+    approvalRunId: reviewIdentity.runId,
+    approvalDecisionKind: "action_decision",
+  };
+  const executionLease = {
+    schemaVersion: 2,
+    executionLeaseId: planExecution.executionLeaseId,
+    approvalLeaseId: approvalLease.leaseId,
+    sessionKey,
+    sessionEpoch,
+    planTurnId: "turn-1",
+    executionTurnId: pendingRequest.turnId,
+    executionRunId: pendingRequest.runId,
+    parentRunId: pendingRequest.parentRunId,
+    attempt: 1,
+    issuedAt: 111,
+    reason: "initial_approval",
+    instructionHash: planExecution.instructionHash,
+    authorization: {
+      kind: "action_decision",
+      sessionKey,
+      sessionEpoch,
+      turnId: "turn-1",
+      runId: reviewIdentity.runId,
+      requestId: reviewIdentity.requestId,
+    },
+  };
+  const planLifecycle = {
+    schemaVersion: 2,
+    version: 5,
+    status: "paused",
+    sessionKey,
+    sessionEpoch,
+    planTurnId: "turn-1",
+    artifactIdentity: identity,
+    reviewIdentity,
+    approvalLease,
+    executionLease,
+    lastIssuedAttempt: 1,
+    execution: {
+      turnId: pendingRequest.turnId,
+      runId: pendingRequest.runId,
+      parentRunId: pendingRequest.parentRunId,
+      attempt: 1,
+      startedAt: 112,
+    },
+    pause: {
+      reason: "tool_permission",
+      resultKind: "partial",
+      resumeCondition: "resolve_action_request",
+    },
+    updatedAt: 120,
+  };
+  const exactHarnessRunMarker = {
+    schemaVersion: 1,
+    runId: "run-plan-outer",
+    activeRunId: pendingRequest.runId,
+    activeParentRunId: pendingRequest.parentRunId,
+    activePlanExecutionProvenance: planExecution,
+    instanceId: "instance-plan-tool",
+    sessionKey,
+    turnId: pendingRequest.turnId,
+    status: "paused",
+    startedAt: 109,
+    updatedAt: 120,
+  };
+  return {
+    sessionKey,
+    initialArtifact,
+    pendingRequest,
+    planLifecycle,
+    exactHarnessRunMarker,
+  };
 }
 
 function applySet(stateRef, patchOrUpdater) {
@@ -1146,6 +1296,153 @@ test("submit session runtime controller advances Plan revision and refreshes pen
     },
   );
   assert.equal(stateRef.current.isPlanApproved, false);
+});
+
+test("Plan artifact changes reject and clear the exact pending Plan tool permission", () => {
+  const {
+    sessionKey,
+    initialArtifact,
+    pendingRequest,
+    planLifecycle,
+    exactHarnessRunMarker,
+  } = buildPlanToolControllerFixture();
+  const decisions = [];
+  const events = [];
+  let aborts = 0;
+  const abortController = {
+    signal: { aborted: false },
+    abort() {
+      aborts += 1;
+      this.signal.aborted = true;
+    },
+  };
+  const stateRef = {
+    current: createControllerState({
+      planArtifacts: [initialArtifact],
+      planLifecycle,
+      harnessRunMarker: exactHarnessRunMarker,
+      activeActionRequest: pendingRequest,
+      pendingReviewResolve: (decision) => decisions.push(decision),
+      pendingReviewTaskId: pendingRequest.taskId,
+      pendingToolCall: { name: pendingRequest.toolName },
+      abortController,
+      planStage: "ready_to_execute",
+    }),
+  };
+
+  const controller = createSubmitSessionRuntimeController({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: sessionKey,
+    createRuntimeFromState: createControllerRuntimeFromState,
+    pickRuntimePatch: pickControllerRuntimePatch,
+    derivePlanStageFromArtifacts: () => "plan",
+    createDefaultCurrentTurnState: () => ({ interceptorHandled: false }),
+    logStoreEvent: (event, data) => events.push({ event, data }),
+    nowMs: () => 200,
+  });
+
+  controller.sessionGet().upsertPlanArtifact({
+    ...initialArtifact,
+    content: buildAcceptedControllerPlan("Changed after tool pause"),
+    updatedAt: 200,
+  });
+
+  assert.deepEqual(decisions, [{ action: "reject" }]);
+  assert.equal(aborts, 1);
+  assert.equal(stateRef.current.activeActionRequest, null);
+  assert.equal(stateRef.current.pendingReviewResolve, null);
+  assert.equal(stateRef.current.pendingReviewTaskId, null);
+  assert.equal(stateRef.current.pendingToolCall, null);
+  assert.equal(stateRef.current.planLifecycle.approvalLease, null);
+  assert.equal(stateRef.current.planLifecycle.executionLease, null);
+  assert.equal(stateRef.current.planLifecycle.execution, null);
+  assert.equal(stateRef.current.planLifecycle.pause.reason, "artifact_identity_changed");
+  assert.equal(stateRef.current.isPlanApproved, false);
+  assert.equal(
+    events.some((entry) => entry.event === "plan_tool_permission_invalidated_by_artifact_change"),
+    true,
+  );
+});
+
+test("Plan artifact invalidation rejects stale review state without aborting an unrelated active Run", () => {
+  const {
+    sessionKey,
+    initialArtifact,
+    pendingRequest,
+    planLifecycle,
+    exactHarnessRunMarker,
+  } = buildPlanToolControllerFixture();
+  const unrelatedHarnessRunMarker = {
+    ...exactHarnessRunMarker,
+    runId: "run-generic-outer",
+    activeRunId: "run-generic-active",
+    activeParentRunId: null,
+    activePlanExecutionProvenance: null,
+    turnId: "turn-generic-active",
+    status: "running",
+  };
+  const decisions = [];
+  const events = [];
+  let aborts = 0;
+  const abortController = {
+    signal: { aborted: false },
+    abort() {
+      aborts += 1;
+      this.signal.aborted = true;
+    },
+  };
+  const stateRef = {
+    current: createControllerState({
+      planArtifacts: [initialArtifact],
+      planLifecycle,
+      harnessRunMarker: unrelatedHarnessRunMarker,
+      activeActionRequest: pendingRequest,
+      pendingReviewResolve: (decision) => decisions.push(decision),
+      pendingReviewTaskId: pendingRequest.taskId,
+      pendingToolCall: { name: pendingRequest.toolName },
+      abortController,
+      agentStatus: "running",
+      planStage: "ready_to_execute",
+    }),
+  };
+  const controller = createSubmitSessionRuntimeController({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: sessionKey,
+    createRuntimeFromState: createControllerRuntimeFromState,
+    pickRuntimePatch: pickControllerRuntimePatch,
+    derivePlanStageFromArtifacts: () => "plan",
+    createDefaultCurrentTurnState: () => ({ interceptorHandled: false }),
+    logStoreEvent: (event, data) => events.push({ event, data }),
+    nowMs: () => 201,
+  });
+
+  controller.sessionGet().upsertPlanArtifact({
+    ...initialArtifact,
+    content: buildAcceptedControllerPlan("Changed while a generic Run owns the Session"),
+    updatedAt: 201,
+  });
+
+  assert.deepEqual(decisions, [{ action: "reject" }]);
+  assert.equal(aborts, 0);
+  assert.equal(abortController.signal.aborted, false);
+  assert.equal(stateRef.current.activeActionRequest, null);
+  assert.equal(stateRef.current.pendingReviewResolve, null);
+  assert.equal(stateRef.current.pendingReviewTaskId, null);
+  assert.equal(stateRef.current.pendingToolCall, null);
+  assert.equal(stateRef.current.harnessRunMarker, unrelatedHarnessRunMarker);
+  assert.equal(stateRef.current.planLifecycle.approvalLease, null);
+  assert.equal(stateRef.current.planLifecycle.executionLease, null);
+  assert.equal(stateRef.current.planLifecycle.execution, null);
+  assert.equal(
+    events.some((entry) => entry.event === "plan_tool_permission_invalidated_by_artifact_change"),
+    true,
+  );
+  assert.equal(
+    events.some((entry) => entry.event === "plan_execution_aborted_by_artifact_change"),
+    false,
+  );
 });
 
 test("submit elapsed timer updates active elapsed time and clears itself when run ends", () => {

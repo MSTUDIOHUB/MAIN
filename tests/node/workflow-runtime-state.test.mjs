@@ -141,6 +141,8 @@ test("pending review materializes a visible tool card for ExecutionCapsule", () 
   assert.match(reviewSource, /const reviewSettlement = createAbortableReviewSettlement\(\{/);
   assert.match(reviewSource, /pendingReviewResolve: reviewSettlement\.resolve/);
   assert.match(reviewSource, /reviewSettlement\.arm\(\)/);
+  assert.match(reviewSource, /const currentPlanIdentity = buildPlanApprovalIdentity/);
+  assert.match(reviewSource, /activePlanArtifactIdentityCurrent/);
   assert.ok(
     reviewSource.indexOf('type: "run.paused"') < reviewSource.indexOf("createAbortableReviewSettlement({"),
     "the permission owner must be paused before its settlement can create a continuation child",
@@ -149,6 +151,53 @@ test("pending review materializes a visible tool card for ExecutionCapsule", () 
   assert.match(settlementSource, /input\.signal\.addEventListener\("abort", handleAbort, \{ once: true \}\)/);
   assert.match(settlementSource, /settle\(input\.abortedDecision, false\)/);
   assert.match(settlementSource, /continueRun && !input\.signal\.aborted/);
+});
+
+test("Plan permission continuation fails closed across artifact drift and child admission rejection", () => {
+  const source = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const continuationStart = source.indexOf("const beginActionContinuationRun =");
+  const continuationEnd = source.indexOf("const beginTerminalConclusionRun =", continuationStart);
+  const continuation = source.slice(continuationStart, continuationEnd);
+
+  assert.notEqual(continuationStart, -1);
+  assert.ok(continuationEnd > continuationStart);
+  assert.match(continuation, /const currentPlanIdentity = buildPlanApprovalIdentity/);
+  assert.match(continuation, /planArtifactIdentityCurrent/);
+  const rejectionStart = continuation.indexOf("if (!admitted) {");
+  const rejectionEnd = continuation.indexOf("return false;", rejectionStart);
+  const rejection = continuation.slice(rejectionStart, rejectionEnd);
+  assert.notEqual(rejectionStart, -1);
+  assert.ok(rejectionEnd > rejectionStart);
+  assert.match(rejection, /doesLifecycleRetainPlanExecutionProvenance/);
+  assert.match(rejection, /reason:\s*"plan_action_continuation_admission_rejected"/);
+  assert.match(rejection, /resumeCondition:\s*"explicit_resume"/);
+  assert.match(rejection, /pendingPlanApprovalHandoff:\s*null/);
+  assert.match(rejection, /abortCtrl\.abort\(\)/);
+  assert.ok(
+    rejection.indexOf("abortCtrl.abort()") <
+      rejection.indexOf('logStoreEvent("plan_action_continuation_admission_rejected"'),
+    "the obsolete parent Run must be aborted before admission rejection is published",
+  );
+  const finalizerStart = source.indexOf(
+    "return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) =>",
+  );
+  const finalizerEnd = source.indexOf("const preTerminalRunId", finalizerStart);
+  const finalizer = source.slice(finalizerStart, finalizerEnd);
+  assert.match(finalizer, /hasExactRejectedPlanActionContinuation/);
+  assert.match(finalizer, /status:\s*"paused"/);
+  assert.match(finalizer, /reason:\s*"tool_permission"/);
+  assert.match(finalizer, /pauseKind:\s*"recoverable"/);
+  const catchStart = source.indexOf(".catch(async (err: any) =>", finalizerStart);
+  const catchSource = source.slice(catchStart);
+  assert.match(catchSource, /preservesRejectedPlanActionPause/);
+  assert.match(catchSource, /plan_action_continuation_exception_preserved_pause/);
+  assert.match(
+    catchSource,
+    /commitTerminalProjectionBeforeStatusPublication\(\s*pauseOutcome,\s*pauseHarnessProjection/,
+  );
 });
 
 test("a terminal conclusion child is created only after its owner was already paused", () => {
@@ -1342,23 +1391,31 @@ test("workflow engine owns finite differentiated auto-resumes between fresh evid
     assert.match(handler, /checkpoint\.strategyPivot !== null/);
     assert.match(handler, /planAutoResumeCount: effectiveCheckpoint\.autoResumeCount/);
     assert.match(handler, /turn\.id === turnId \|\| turn\.id === context\.uiDisplayTurnId/);
-    assert.match(handler, /pendingMaxIterationsAutoResume = \{/);
     assert.match(handler, /status: "auto_resume_scheduled" as const/);
-    assert.match(handler, /hidden: true/);
-    assert.match(handler, /reuseCurrentTurn: true/);
-    assert.match(handler, /turnIdOverride: context\.uiDisplayTurnId \|\| turnId/);
-    assert.match(handler, /parentRunIdOverride: activeRuntimeRunIdentity\.runId/);
-    assert.match(handler, /preservePlanState: true/);
-    assert.match(handler, /cancelAutoResume\("resume_submission_rejected", \{ visible: true \}\)/);
     assert.match(handler, /type: "system",\s*content: pauseNotice,/);
     assert.match(handler, /strategyPivot: effectiveCheckpoint\.strategyPivot/);
     assert.match(handler, /attemptedStrategyPivots: effectiveCheckpoint\.attemptedStrategyPivots/);
   }
   assert.match(planHandler, /buildPlanMaxIterationsResumePrompt/);
-  assert.match(planHandler, /resolvedIntent: "execute"/);
+  assert.match(planHandler, /issuePlanAutoResumeAttempt\(\{/);
+  assert.match(planHandler, /isPlanLifecycleExecutionAuthorizedForRun\(lifecycle/);
+  assert.match(planHandler, /checkpointHash = buildPlanExecutionInstructionHash/);
+  assert.match(planHandler, /pendingPlanApprovalHandoff: issued\.handoff/);
+  assert.match(planHandler, /isPlanApproved: false/);
+  assert.match(planHandler, /currentTurnExecutionConsent: \{ turnId: null, granted: false \}/);
+  assert.match(planHandler, /plan_max_iterations_auto_resume_handoff_issued/);
+  assert.doesNotMatch(planHandler, /pendingMaxIterationsAutoResume = \{/);
+  assert.doesNotMatch(planHandler, /latest\.sendMessage\(/);
+  assert.doesNotMatch(planHandler, /executionConsentGranted: true/);
   assert.doesNotMatch(planHandler, /runtimeIntentOverride/);
-  assert.match(planHandler, /executionConsentGranted: true/);
   assert.match(executeHandler, /buildExecuteMaxIterationsResumePrompt/);
+  assert.match(executeHandler, /pendingMaxIterationsAutoResume = \{/);
+  assert.match(executeHandler, /hidden: true/);
+  assert.match(executeHandler, /reuseCurrentTurn: true/);
+  assert.match(executeHandler, /turnIdOverride: context\.uiDisplayTurnId \|\| turnId/);
+  assert.match(executeHandler, /parentRunIdOverride: activeRuntimeRunIdentity\.runId/);
+  assert.match(executeHandler, /preservePlanState: true/);
+  assert.match(executeHandler, /cancelAutoResume\("resume_submission_rejected", \{ visible: true \}\)/);
   assert.doesNotMatch(executeHandler, /runtimeIntentOverride/);
   assert.match(executeHandler, /resolveExecuteMaxIterationsRecoveryDecision/);
   assert.match(
@@ -1470,13 +1527,17 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitPreflightExecutorSource, /applyPreRunSessionPatch\(\{ pendingRunDecision \}\)/);
   assert.match(submitPlanHydrationSource, /export async function runSubmitPlanHydrationEffect/);
   assert.match(submitPlanHydrationSource, /export function startSubmitPlanHydrationEffect/);
-  assert.match(submitPlanHydrationSource, /shouldPromoteHydratedPlanToExecuting/);
+  assert.match(submitPlanHydrationSource, /type: "hydrate_discovery"/);
+  assert.match(submitPlanHydrationSource, /sendOriginSessionEpoch/);
+  assert.match(submitPlanHydrationSource, /isSessionRuntimeOwnerActive\(/);
+  assert.doesNotMatch(submitPlanHydrationSource, /shouldPromoteHydratedPlanToExecuting/);
   assert.match(submitPlanHydrationSource, /send_async_resume_skipped_inactive_session/);
   assert.match(submitPlanExecutionResumeSource, /export async function runSubmitPlanExecutionResumeEffect/);
-  assert.match(submitPlanExecutionResumeSource, /export function buildTrustedPlanResumePrompt/);
-  assert.match(submitPlanExecutionResumeSource, /existing_plan_hydrated_for_execution/);
-  assert.match(submitPlanExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*!continuationTurnId/);
-  assert.match(submitPlanExecutionResumeSource, /reuseCurrentTurn:\s*!!continuationTurnId/);
+  assert.match(submitPlanExecutionResumeSource, /kind:\s*"discovery_only"/);
+  assert.match(submitPlanExecutionResumeSource, /existing_plan_discovered_for_review/);
+  assert.match(submitPlanExecutionResumeSource, /requiresTurnAdmission:\s*true/);
+  assert.doesNotMatch(submitPlanExecutionResumeSource, /executionConsentGranted:\s*true/);
+  assert.doesNotMatch(submitPlanExecutionResumeSource, /reuseCurrentTurn/);
   assert.match(submitPendingReviewTransitionSource, /export function applySubmitPendingReviewTransition/);
   assert.match(submitPendingReviewTransitionSource, /resolvePendingReviewSubmissionDecision/);
   assert.match(submitPendingReviewTransitionSource, /send_pending_review_abort_and_new_turn/);
@@ -1745,7 +1806,9 @@ test("global plan toolbar button is driven by live plan workspace, not historica
   assert.doesNotMatch(chatAreaSource, /const hasPlanPanelContent = useMemo/);
   assert.doesNotMatch(chatAreaSource, /groupedTurns\.some\(\(entry\)[\s\S]{0,220}hasGeneratedPlanContent\(entry\.blocks\)[\s\S]{0,220}\{hasPlanPanelContent && \(/);
 
-  assert.match(storeSource, /clearPlanArtifacts:\s*\(\) =>\s*set\(\(s\) =>/);
+  assert.match(storeSource, /clearPlanArtifacts:\s*\(\) =>\s*\{/);
+  assert.match(storeSource, /buildPendingPlanToolPermissionInvalidation\(s, true\)/);
+  assert.match(storeSource, /settlePendingPlanToolPermissionInvalidation\(invalidatedPlanToolReview\)/);
   assert.match(storeSource, /rightPanelTab:\s*nextRightPanelTab/);
   assert.match(storeSource, /s\.rightPanelTab === "plan" \? "terminal"/);
   assert.match(storeSource, /logStoreEvent\("planWorkspaceStateChanged"/);
@@ -1756,6 +1819,10 @@ test("approved plan execution stays in one logical turn and has one runtime owne
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const sessionTypesSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/sessionTypes.ts"), "utf8");
   const workflowEngineSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const submitAsyncWorkflowRunSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/store/submitAsyncWorkflowRun.ts"),
+    "utf8",
+  );
   const approvePlanMethod = storeSource.slice(
     storeSource.indexOf("approvePlan: (approvalChoice, expectedIdentity) =>"),
     storeSource.indexOf("rejectPlan: (expectedIdentity) =>", storeSource.indexOf("approvePlan: (approvalChoice, expectedIdentity) =>")),
@@ -1785,9 +1852,24 @@ test("approved plan execution stays in one logical turn and has one runtime owne
 
   assert.match(workflowEngineSource, /startApprovedPlanExecutionInCurrentTurn/);
   assert.match(workflowEngineSource, /source:\s*"workflow_fallback"/);
-  assert.match(workflowEngineSource, /onApprovedPlanExecutionStarted/);
-  assert.match(workflowEngineSource, /plan_approval_same_turn_execution_started/);
-  assert.match(workflowEngineSource, /plan_approval_handoff_deduped/);
+  assert.doesNotMatch(workflowEngineSource, /onApprovedPlanExecutionStarted/);
+  assert.match(submitAsyncWorkflowRunSource, /export function commitPlanExecutionRunAdmission/);
+  assert.match(storeSource, /const hasLivePlanApprovalCapability =/);
+  assert.match(storeSource, /const requiresPlanExecutionAdmission = Boolean\(/);
+  assert.match(submitAsyncWorkflowRunSource, /const runMatchesReservedPlanAttempt =/);
+  assert.match(submitAsyncWorkflowRunSource, /plan_execution_admission_fields_incomplete/);
+  assert.match(submitAsyncWorkflowRunSource, /type: "execution_started"/);
+  assert.match(submitAsyncWorkflowRunSource, /type: "run\.started"/);
+  assert.match(submitAsyncWorkflowRunSource, /currentTurnExecutionConsent: \{ turnId: input\.turnId, granted: true \}/);
+  assert.ok(
+    submitAsyncWorkflowRunSource.indexOf("commitPlanExecutionRunAdmission<TState>({") >
+      submitAsyncWorkflowRunSource.indexOf("startSubmitRunLease"),
+    "Plan execution authority must be consumed only after the Harness Run lease is acquired",
+  );
+  assert.match(storeSource, /plan_approval_handoff_deduped/);
+  assert.match(workflowEngineSource, /activePlanExecutionProvenance: admittedPlanExecutionIdentity/);
+  assert.match(workflowEngineSource, /plan_tool_permission_rejected_stale_run_provenance/);
+  assert.match(workflowEngineSource, /plan_tool_permission_invalidated_by_artifact_rejection/);
   assert.doesNotMatch(workflowEngineSource, /approvedPlanHandoff/);
   assert.match(workflowEngineSource, /getCurrentRunIntent:\s*\(\) => effectiveRunIntent/);
   assert.match(

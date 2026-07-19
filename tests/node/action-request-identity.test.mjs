@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import fsSync from "node:fs";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { createHash } from "node:crypto";
 import ts from "typescript";
 
 const moduleCache = new Map();
@@ -669,6 +670,317 @@ test("tool review builds a run-owned permission request with an auditable target
   }), true);
 });
 
+function planExecutionProvenance(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    sessionKey: "session-plan-1",
+    sessionEpoch: "epoch-plan-1",
+    planTurnId: "turn-plan-1",
+    approvalLeaseId: "approval-plan-1",
+    planRevision: 7,
+    artifactHash: "artifact-plan-7",
+    executionLeaseId: "execution-plan-1",
+    executionTurnId: "turn-plan-1",
+    executionRunId: "run-plan-2",
+    parentRunId: "run-plan-1",
+    attempt: 2,
+    instructionHash: "instruction-plan-2",
+    ...overrides,
+  };
+}
+
+function planExecutionLifecycle(planExecution, overrides = {}) {
+  const artifactPaths = [".MAIN/plans/plan.md"];
+  const reviewIdentity = {
+    sessionKey: planExecution.sessionKey,
+    sessionEpoch: planExecution.sessionEpoch,
+    turnId: planExecution.planTurnId,
+    runId: "run-plan-review-1",
+    parentRunId: "run-plan-author-1",
+    requestId: "request-plan-review-1",
+    planRevision: planExecution.planRevision,
+    artifactHash: planExecution.artifactHash,
+    artifactPaths,
+  };
+  return {
+    schemaVersion: 2,
+    version: 5,
+    status: "executing",
+    sessionKey: planExecution.sessionKey,
+    sessionEpoch: planExecution.sessionEpoch,
+    planTurnId: planExecution.planTurnId,
+    artifactIdentity: {
+      revision: planExecution.planRevision,
+      artifactHash: planExecution.artifactHash,
+      artifactPaths,
+    },
+    reviewIdentity,
+    approvalLease: {
+      schemaVersion: 2,
+      leaseId: planExecution.approvalLeaseId,
+      sessionKey: planExecution.sessionKey,
+      sessionEpoch: planExecution.sessionEpoch,
+      planTurnId: planExecution.planTurnId,
+      reviewRunId: reviewIdentity.runId,
+      requestId: reviewIdentity.requestId,
+      planRevision: planExecution.planRevision,
+      artifactHash: planExecution.artifactHash,
+      artifactPaths,
+      approvedAt: 40,
+      approvalTurnId: reviewIdentity.turnId,
+      approvalRunId: reviewIdentity.runId,
+      approvalDecisionKind: "action_decision",
+    },
+    executionLease: {
+      schemaVersion: 2,
+      executionLeaseId: planExecution.executionLeaseId,
+      approvalLeaseId: planExecution.approvalLeaseId,
+      sessionKey: planExecution.sessionKey,
+      sessionEpoch: planExecution.sessionEpoch,
+      planTurnId: planExecution.planTurnId,
+      executionTurnId: planExecution.executionTurnId,
+      executionRunId: planExecution.executionRunId,
+      parentRunId: planExecution.parentRunId,
+      attempt: planExecution.attempt,
+      issuedAt: 41,
+      reason: "initial_approval",
+      instructionHash: planExecution.instructionHash,
+      authorization: {
+        kind: "action_decision",
+        sessionKey: planExecution.sessionKey,
+        sessionEpoch: planExecution.sessionEpoch,
+        turnId: reviewIdentity.turnId,
+        runId: reviewIdentity.runId,
+        requestId: reviewIdentity.requestId,
+      },
+    },
+    lastIssuedAttempt: planExecution.attempt,
+    execution: {
+      turnId: planExecution.executionTurnId,
+      runId: planExecution.executionRunId,
+      parentRunId: planExecution.parentRunId,
+      attempt: planExecution.attempt,
+      startedAt: 42,
+    },
+    pause: null,
+    updatedAt: 42,
+    ...overrides,
+  };
+}
+
+function planExecutionHarnessMarker(planExecution, overrides = {}) {
+  return {
+    schemaVersion: 1,
+    runId: "run-plan-outer-1",
+    activeRunId: planExecution.executionRunId,
+    activeParentRunId: planExecution.parentRunId,
+    activePlanExecutionProvenance: planExecution,
+    instanceId: "instance-plan-1",
+    sessionKey: planExecution.sessionKey,
+    turnId: planExecution.executionTurnId,
+    status: "running",
+    startedAt: 42,
+    updatedAt: 45,
+    ...overrides,
+  };
+}
+
+function buildPlanToolPermissionRequest(planExecution = planExecutionProvenance()) {
+  return pendingToolReview.buildToolPermissionActionRequest({
+    sessionKey: planExecution.sessionKey,
+    turnId: planExecution.executionTurnId,
+    runId: planExecution.executionRunId,
+    parentRunId: planExecution.parentRunId,
+    title: "Apply reviewed Plan",
+    taskId: 11,
+    toolCall: {
+      name: "apply_patch",
+      arguments: { patch: "*** Begin Patch\n*** Update File: src/main.ts\n*** End Patch" },
+    },
+    planExecution,
+    now: 44,
+  });
+}
+
+test("Plan tool permission provenance never downgrades after its execution lease is revoked", () => {
+  const planExecution = planExecutionProvenance();
+  const request = buildPlanToolPermissionRequest(planExecution);
+  const lifecycle = planExecutionLifecycle(planExecution);
+
+  assert.deepEqual(request.planExecution, planExecution);
+  assert.equal(actionRequests.isToolPermissionPlanExecutionIdentityCurrent(request, lifecycle), true);
+  assert.equal(
+    actionRequests.isToolPermissionPlanExecutionIdentityCurrent(request, {
+      ...lifecycle,
+      approvalLease: null,
+      executionLease: null,
+    }),
+    false,
+  );
+  assert.equal(
+    actionRequests.isToolPermissionPlanExecutionIdentityCurrent(request, {
+      ...lifecycle,
+      artifactIdentity: { ...lifecycle.artifactIdentity, revision: 8 },
+    }),
+    false,
+  );
+  assert.equal(
+    actionRequests.isToolPermissionPlanExecutionIdentityCurrent(request, {
+      ...lifecycle,
+      executionLease: { ...lifecycle.executionLease, instructionHash: "stale-instruction" },
+    }),
+    false,
+  );
+  assert.equal(
+    actionRequests.isToolPermissionPlanExecutionIdentityCurrent(request, {
+      ...lifecycle,
+      executionLease: { ...lifecycle.executionLease, attempt: 3 },
+    }),
+    false,
+  );
+  assert.deepEqual(actionRequests.normalizeActionRequest(request)?.planExecution, planExecution);
+});
+
+test("normalization rejects the entire Plan tool request when provenance owner or capability fields are invalid", () => {
+  const planExecution = planExecutionProvenance();
+  const request = buildPlanToolPermissionRequest(planExecution);
+  for (const planExecutionOverride of [
+    { sessionKey: "other-session" },
+    { executionTurnId: "other-turn" },
+    { executionRunId: "other-run" },
+    { parentRunId: "other-parent" },
+  ]) {
+    assert.equal(actionRequests.normalizeActionRequest({
+      ...request,
+      planExecution: { ...planExecution, ...planExecutionOverride },
+    }), null);
+  }
+  for (const planExecutionOverride of [
+    { attempt: 0 },
+    { instructionHash: "  " },
+    { planRevision: 0 },
+    { artifactHash: "  " },
+  ]) {
+    assert.equal(actionRequests.normalizeActionRequest({
+      ...request,
+      planExecution: { ...planExecution, ...planExecutionOverride },
+    }), null);
+  }
+});
+
+test("Plan tool invalidation leaves generic permission alone", () => {
+  let genericSettlements = 0;
+  const genericRequest = pendingToolReview.buildToolPermissionActionRequest({
+    sessionKey: "session-generic",
+    turnId: "turn-generic",
+    runId: "run-generic",
+    title: "Generic tool",
+    taskId: 12,
+    toolCall: { name: "apply_patch", arguments: { patch: "*** Begin Patch\n*** End Patch" } },
+    now: 45,
+  });
+  assert.equal(actionRequests.buildPendingPlanToolPermissionInvalidation({
+    activeActionRequest: genericRequest,
+    pendingReviewResolve: () => { genericSettlements += 1; },
+    pendingReviewTaskId: genericRequest.taskId,
+  }, true), null);
+  assert.equal(genericSettlements, 0);
+});
+
+test("an exact Plan Harness owner rejects and aborts one cleared permission exactly once", () => {
+  const planExecution = planExecutionProvenance();
+  const planRequest = buildPlanToolPermissionRequest(planExecution);
+  const decisions = [];
+  let aborts = 0;
+  const abortController = {
+    signal: { aborted: false },
+    abort() {
+      aborts += 1;
+      this.signal.aborted = true;
+    },
+  };
+  const pendingState = {
+    activeActionRequest: planRequest,
+    pendingReviewResolve: (decision) => { decisions.push(decision); },
+    pendingReviewTaskId: planRequest.taskId,
+    pendingToolCall: { name: planRequest.toolName },
+    abortController,
+    planLifecycle: planExecutionLifecycle(planExecution),
+    harnessRunMarker: planExecutionHarnessMarker(planExecution),
+  };
+  const invalidation = actionRequests.buildPendingPlanToolPermissionInvalidation(pendingState, true);
+  assert.ok(invalidation);
+  assert.deepEqual(invalidation.patch, {
+    activeActionRequest: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
+  });
+  assert.equal(actionRequests.settlePendingPlanToolPermissionInvalidation(invalidation), true);
+  assert.deepEqual(decisions, [{ action: "reject" }]);
+  assert.equal(aborts, 1);
+  assert.equal(actionRequests.settlePendingPlanToolPermissionInvalidation(invalidation), false);
+  assert.deepEqual(decisions, [{ action: "reject" }]);
+  assert.equal(aborts, 1);
+
+  const clearedState = { ...pendingState, ...invalidation.patch };
+  const duplicate = actionRequests.buildPendingPlanToolPermissionInvalidation(clearedState, true);
+  assert.equal(duplicate, null);
+  assert.equal(actionRequests.settlePendingPlanToolPermissionInvalidation(duplicate), false);
+  assert.deepEqual(decisions, [{ action: "reject" }]);
+});
+
+test("generic or mismatched Harness owners still reject a Plan resolver once without aborting", () => {
+  const planExecution = planExecutionProvenance();
+  const planRequest = buildPlanToolPermissionRequest(planExecution);
+  const lifecycle = planExecutionLifecycle(planExecution);
+  const markers = [
+    {
+      ...planExecutionHarnessMarker(planExecution),
+      runId: "run-generic-outer",
+      activeRunId: "run-generic-child",
+      activeParentRunId: null,
+      activePlanExecutionProvenance: null,
+    },
+    planExecutionHarnessMarker(planExecution, {
+      activeRunId: "run-mismatched-plan-child",
+    }),
+  ];
+
+  for (const harnessRunMarker of markers) {
+    const decisions = [];
+    let aborts = 0;
+    const abortController = {
+      signal: { aborted: false },
+      abort() {
+        aborts += 1;
+        this.signal.aborted = true;
+      },
+    };
+    const invalidation = actionRequests.buildPendingPlanToolPermissionInvalidation({
+      activeActionRequest: planRequest,
+      pendingReviewResolve: (decision) => { decisions.push(decision); },
+      pendingReviewTaskId: planRequest.taskId,
+      pendingToolCall: { name: planRequest.toolName },
+      abortController,
+      planLifecycle: lifecycle,
+      harnessRunMarker,
+    }, true);
+
+    assert.ok(invalidation);
+    assert.deepEqual(invalidation.patch, {
+      activeActionRequest: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+    });
+    assert.equal(actionRequests.settlePendingPlanToolPermissionInvalidation(invalidation), true);
+    assert.equal(actionRequests.settlePendingPlanToolPermissionInvalidation(invalidation), false);
+    assert.deepEqual(decisions, [{ action: "reject" }]);
+    assert.equal(aborts, 0);
+  }
+});
+
 test("desktop review target discloses constrained actions without exposing filled text", () => {
   const request = pendingToolReview.buildToolPermissionActionRequest({
     sessionKey: "session-1",
@@ -766,6 +1078,16 @@ test("plan approval identity changes whenever a reviewable artifact changes", ()
   const same = planIdentity.buildPlanApprovalIdentity([{ ...artifact, updatedAt: 99 }]);
   const changed = planIdentity.buildPlanApprovalIdentity([{ ...artifact, content: "# Plan\n\n- Change B", revision: 2 }]);
   assert.deepEqual(first, same);
+  const canonical = [
+    artifact.kind,
+    artifact.path,
+    String(artifact.revision),
+    artifact.content,
+  ].join("\u001f");
+  assert.equal(
+    first.artifactHash,
+    `plan-sha256-${createHash("sha256").update(canonical).digest("hex")}`,
+  );
   assert.notEqual(first.artifactHash, changed.artifactHash);
   assert.equal(changed.revision, 2);
   assert.equal(planIdentity.isPlanApprovalIdentityCurrent({ artifacts: [artifact], revision: 1, artifactHash: first.artifactHash }), true);

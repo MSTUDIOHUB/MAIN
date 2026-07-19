@@ -2,6 +2,7 @@ import type { TaskBlock } from "./taskTypes";
 import {
   ACTION_REQUEST_SCHEMA_VERSION,
   createActionRequestId,
+  type ToolPermissionPlanExecutionIdentity,
   type ToolPermissionActionRequest,
 } from "./actionRequest";
 
@@ -96,6 +97,7 @@ export function buildToolPermissionActionRequest(input: {
   title: string;
   taskId: number;
   toolCall: NonNullable<PendingToolCallLike>;
+  planExecution?: ToolPermissionPlanExecutionIdentity;
   now?: number;
 }): ToolPermissionActionRequest {
   const now = input.now ?? Date.now();
@@ -119,6 +121,7 @@ export function buildToolPermissionActionRequest(input: {
     toolName,
     target: derivePendingReviewTarget(toolName, args, input.toolCall.localFileReadPath),
     risk,
+    ...(input.planExecution ? { planExecution: { ...input.planExecution } } : {}),
   };
 }
 

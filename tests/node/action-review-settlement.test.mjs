@@ -67,3 +67,26 @@ test("arming an already-aborted lease settles immediately", () => {
   settlement.arm();
   assert.deepEqual(events, ["abort_cleanup", "decision:reject"]);
 });
+
+test("a rejected continuation admission settles as a rejected decision", () => {
+  const controller = new AbortController();
+  const events = [];
+  const settlement = createAbortableReviewSettlement({
+    signal: controller.signal,
+    abortedDecision: { action: "reject" },
+    onContinue: () => {
+      events.push("continuation_rejected");
+      return false;
+    },
+    onAbort: () => events.push("abort_cleanup"),
+    onDecision: (decision) => events.push(`decision:${decision.action}`),
+  });
+  settlement.arm();
+
+  assert.equal(settlement.resolve({ action: "accept" }), true);
+  assert.deepEqual(events, [
+    "continuation_rejected",
+    "abort_cleanup",
+    "decision:reject",
+  ]);
+});

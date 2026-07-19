@@ -1,8 +1,9 @@
 import type { AttachedFile } from "../lib/attachments";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
-import type {
-  HarnessRunMarker,
-  HarnessRunOwner,
+import {
+  getHarnessActionRunId,
+  type HarnessRunMarker,
+  type HarnessRunOwner,
 } from "../lib/harnessCrashTelemetry";
 import type {
   PendingSlashCommand,
@@ -59,10 +60,27 @@ import {
 import type { GameStudioTurnRuntimeService } from "./gameStudioTurnPreparation";
 import {
   appendRuntimeEvent,
+  appendRuntimeEventWithResult,
   isRunTerminalEvent,
   isTerminalTurnEvent,
   withEventSchema,
 } from "../lib/turnEvents";
+import {
+  buildPlanApprovalIdentity,
+  buildPlanExecutionInstructionHash,
+} from "../lib/planApprovalIdentity";
+import {
+  isPlanApprovalLeaseBoundToState,
+  isPlanLifecycleExecutionAuthorizedForRun,
+  reducePlanLifecycle,
+  type PlanLifecycleState,
+} from "../lib/planLifecycle";
+import { releasePlanExecutionDispatch } from "../lib/planExecutionDispatchClaim";
+import type { PlanApprovalHandoff } from "../lib/sessionTypes";
+import {
+  capturePlanExecutionRunProvenance,
+  type PlanExecutionRunProvenance,
+} from "../lib/planExecutionProvenance";
 
 type SubmitAsyncWorkflowSet = (patchOrUpdater: any) => void;
 
@@ -72,6 +90,12 @@ export interface SubmitAsyncWorkflowRunState extends SubmitGameStudioPreparation
   isPlanApproved: boolean;
   planStage: PlanStage;
   planArtifacts: PlanArtifact[];
+  planLifecycle: PlanLifecycleState;
+  planApprovalChoice?: string | null;
+  showPlanPanel?: boolean;
+  pendingPlanApprovalHandoff?: PlanApprovalHandoff | null;
+  planApprovalExecutionStartedForTurnId?: string | null;
+  currentTurnExecutionConsent?: { turnId: string | null; granted: boolean };
   agentMessages: AgentMessage[];
   conversationTurns: ConversationTurn[];
   harnessRunMarker?: HarnessRunMarker | null;
@@ -154,6 +178,9 @@ export interface StartSubmitAsyncWorkflowRunInput<
   goalSourceContextSnapshot?: string;
   parentRunIdOverride?: string;
   runIdOverride?: string;
+  planExecutionLeaseId?: string;
+  planExecutionInstructionHash?: string;
+  requiresPlanExecutionAdmission?: boolean;
   turnInputContextSignals: TurnInputContextSignals;
   remoteFeishu: FeishuRemoteContext | undefined;
   options: unknown;
@@ -340,11 +367,55 @@ export function projectSubmitBootstrapErrorConclusion<
     resultKind: "error",
   }));
 
+  const planLifecycle = input.state.planLifecycle;
+  const planExecutionLease = planLifecycle?.executionLease || null;
+  const planExecutionOwner = planLifecycle?.execution || null;
+  const ownsExecutingPlan = !!planExecutionLease && !!planExecutionOwner &&
+    isPlanLifecycleExecutionAuthorizedForRun(planLifecycle, {
+      executionLeaseId: planExecutionLease.executionLeaseId,
+      turnId: input.turnId,
+      runId: input.submissionRunId,
+      parentRunId: input.parentRunId,
+      attempt: planExecutionOwner.attempt,
+    });
+  const ownsPendingPlanHandoff = planLifecycle?.status === "handoff_pending" &&
+    planExecutionLease?.executionTurnId === input.turnId &&
+    planExecutionLease.executionRunId === input.submissionRunId &&
+    planExecutionLease.parentRunId === input.parentRunId;
+  const planTransition = ownsExecutingPlan && planExecutionLease && planExecutionOwner
+    ? reducePlanLifecycle(planLifecycle, {
+        type: "pause",
+        expectedVersion: planLifecycle.version,
+        at: input.timestampMs,
+        expectedExecutionLeaseId: planExecutionLease.executionLeaseId,
+        expectedExecution: planExecutionOwner,
+        pause: {
+          reason: "submit_bootstrap_error",
+          resultKind: "error",
+          resumeCondition: "explicit_resume",
+        },
+      })
+    : ownsPendingPlanHandoff
+    ? reducePlanLifecycle(planLifecycle, {
+        type: "pause",
+        expectedVersion: planLifecycle.version,
+        at: input.timestampMs,
+        pause: {
+          reason: "plan_execution_admission_rejected",
+          resultKind: "error",
+          resumeCondition: "explicit_resume",
+        },
+      })
+    : null;
+  const hasPlanTerminalProjection = planTransition && planTransition.disposition !== "rejected";
   const marker = input.state.harnessRunMarker;
   const harnessRunMarker = input.ownsActiveMarker && marker
     ? {
         ...marker,
         status: "completed",
+        ...(hasPlanTerminalProjection
+          ? { isPlanApproved: false, planStage: "ready_to_execute" }
+          : {}),
         closeReason: "submit_bootstrap_error",
         closedAt: input.timestampMs,
         updatedAt: input.timestampMs,
@@ -356,6 +427,16 @@ export function projectSubmitBootstrapErrorConclusion<
     taskFlow,
     runtimeEvents,
     harnessRunMarker,
+    ...(hasPlanTerminalProjection
+      ? {
+          planLifecycle: planTransition.state,
+          isPlanApproved: false,
+          planStage: "ready_to_execute" as const,
+          pendingPlanApprovalHandoff: null,
+          planApprovalExecutionStartedForTurnId: null,
+          currentTurnExecutionConsent: { turnId: null, granted: false },
+        }
+      : {}),
     activeActionRequest: input.ownsActionRequest ? null : input.state.activeActionRequest,
     conversationTurns: input.state.conversationTurns.map((turn) =>
       ownerTurnIds.has(turn.id)
@@ -389,6 +470,130 @@ export function projectSubmitBootstrapErrorConclusion<
         }
       : {}),
   } as TState;
+}
+
+export type TerminalPlanHandoffRollbackDisposition =
+  | "rolled_back"
+  | "terminal_turn_missing"
+  | "not_handoff_pending"
+  | "owner_mismatch"
+  | "transition_rejected";
+
+/**
+ * A bootstrap that discovers an already-terminal logical Turn must never leave
+ * the exact child-attempt reservation in handoff_pending. Roll back only the
+ * immutable Session/lease/Run owner that this submission was going to admit;
+ * a newer or unrelated reservation remains untouched.
+ */
+export function projectTerminalPlanExecutionHandoffRollback<
+  TState extends SubmitAsyncWorkflowRunState,
+>(input: {
+  state: TState;
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  parentRunId?: string | null;
+  timestampMs: number;
+}): {
+  disposition: TerminalPlanHandoffRollbackDisposition;
+  patch: Partial<TState>;
+} {
+  const terminalTurn = (input.state.runtimeEvents || []).some((event) =>
+    isTerminalTurnEvent(event) &&
+    event.threadId === input.sessionKey &&
+    event.turnId === input.turnId
+  );
+  if (!terminalTurn) {
+    return { disposition: "terminal_turn_missing", patch: {} };
+  }
+
+  const lifecycle = input.state.planLifecycle;
+  if (lifecycle?.status !== "handoff_pending") {
+    return { disposition: "not_handoff_pending", patch: {} };
+  }
+  const lease = lifecycle.executionLease;
+  const handoff = input.state.pendingPlanApprovalHandoff || null;
+  const expectedParentRunId = input.parentRunId === undefined
+    ? lease?.parentRunId ?? null
+    : input.parentRunId;
+  const exactLifecycleOwner = !!lease &&
+    !!lifecycle.approvalLease &&
+    !!lifecycle.planTurnId &&
+    isPlanApprovalLeaseBoundToState(lifecycle) &&
+    lifecycle.sessionKey === input.sessionKey &&
+    lease.sessionKey === input.sessionKey &&
+    lease.sessionEpoch === lifecycle.sessionEpoch &&
+    lease.planTurnId === lifecycle.planTurnId &&
+    lease.executionTurnId === input.turnId &&
+    lease.executionRunId === input.runId &&
+    lease.parentRunId === expectedParentRunId;
+  const exactHandoffOwner = !handoff || (!!lease &&
+    handoff.planTurnId === lifecycle.planTurnId &&
+    handoff.approvalLeaseId === lease.approvalLeaseId &&
+    handoff.executionLeaseId === lease.executionLeaseId &&
+    handoff.sessionEpoch === lifecycle.sessionEpoch &&
+    handoff.executionTurnId === lease.executionTurnId &&
+    handoff.executionRunId === lease.executionRunId &&
+    handoff.executionAttempt === lease.attempt &&
+    handoff.executionInstructionHash === lease.instructionHash &&
+    handoff.parentRunId === lease.parentRunId &&
+    handoff.planRevision === lifecycle.artifactIdentity?.revision &&
+    handoff.artifactHash === lifecycle.artifactIdentity?.artifactHash);
+  if (!exactLifecycleOwner || !exactHandoffOwner) {
+    return { disposition: "owner_mismatch", patch: {} };
+  }
+
+  const reset = reducePlanLifecycle(lifecycle, {
+    type: "reset",
+    expectedVersion: lifecycle.version,
+    at: input.timestampMs,
+  });
+  if (reset.disposition === "rejected") {
+    return { disposition: "transition_rejected", patch: {} };
+  }
+  const currentArtifactIdentity = buildPlanApprovalIdentity(input.state.planArtifacts);
+  const discovery = currentArtifactIdentity
+    ? reducePlanLifecycle(reset.state, {
+        type: "hydrate_discovery",
+        expectedVersion: reset.state.version,
+        at: input.timestampMs,
+        planTurnId: input.turnId,
+        artifactIdentity: {
+          revision: currentArtifactIdentity.revision,
+          artifactHash: currentArtifactIdentity.artifactHash,
+          artifactPaths: currentArtifactIdentity.artifactPaths,
+        },
+      })
+    : null;
+  if (discovery?.disposition === "rejected") {
+    return { disposition: "transition_rejected", patch: {} };
+  }
+  const discoveredLifecycle = discovery?.state || reset.state;
+  const artifactKinds = new Set(input.state.planArtifacts.map((artifact) => artifact.kind));
+  const discoveryStage: PlanStage = artifactKinds.has("tasks")
+    ? "tasks"
+    : artifactKinds.has("bugfix")
+    ? "bugfix"
+    : artifactKinds.has("plan")
+    ? "plan"
+    : artifactKinds.has("design")
+    ? "design"
+    : artifactKinds.has("requirements")
+    ? "requirements"
+    : "idle";
+  return {
+    disposition: "rolled_back",
+    patch: {
+      planLifecycle: discoveredLifecycle,
+      isPlanApproved: false,
+      planApprovalChoice: null,
+      planStage: discoveryStage,
+      showPlanPanel: discoveryStage !== "idle",
+      pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: null,
+      currentTurnExecutionConsent: { turnId: null, granted: false },
+    } as Partial<TState>,
+  };
 }
 
 export function finalizeSubmitBootstrapFailure<
@@ -777,6 +982,189 @@ export function finalizeSubmitBootstrapFailure<
   return finalize();
 }
 
+export type PlanExecutionAdmissionResult =
+  | { ok: true; disposition: "not_applicable"; planExecution: null }
+  | {
+      ok: true;
+      disposition: "applied";
+      planExecution: PlanExecutionRunProvenance;
+    }
+  | { ok: false; reason: string };
+
+/** Consume a Plan execution attempt only after the Harness Run is admitted. */
+export function commitPlanExecutionRunAdmission<TState extends SubmitAsyncWorkflowRunState>(input: {
+  text: string;
+  sessionKey: string;
+  turnId: string;
+  runId: string;
+  parentRunId: string | null;
+  harnessRunMarker: HarnessRunMarker;
+  required?: boolean;
+  planExecutionLeaseId?: string;
+  planExecutionInstructionHash?: string;
+  at: number;
+  sessionSet: SubmitAsyncWorkflowSet;
+  persistHarnessRunMarkerIfOwned: (
+    marker: HarnessRunMarker,
+    owner: HarnessRunOwner,
+  ) => HarnessRunMarker | null;
+}): PlanExecutionAdmissionResult {
+  const executionLeaseId = String(input.planExecutionLeaseId || "").trim();
+  const suppliedInstructionHash = String(input.planExecutionInstructionHash || "").trim();
+  if (!executionLeaseId && !suppliedInstructionHash) {
+    return input.required === true
+      ? { ok: false, reason: "plan_execution_admission_fields_incomplete" }
+      : { ok: true, disposition: "not_applicable", planExecution: null };
+  }
+  if (!executionLeaseId || !suppliedInstructionHash) {
+    return { ok: false, reason: "plan_execution_admission_fields_incomplete" };
+  }
+  const computedInstructionHash = buildPlanExecutionInstructionHash(input.text);
+  if (computedInstructionHash !== suppliedInstructionHash) {
+    return { ok: false, reason: "plan_execution_instruction_hash_mismatch" };
+  }
+
+  let result: PlanExecutionAdmissionResult = {
+    ok: false,
+    reason: "plan_execution_admission_not_committed",
+  };
+  input.sessionSet((state: TState) => {
+    const marker = state.harnessRunMarker;
+    if (
+      !marker ||
+      marker.status !== "running" ||
+      marker.runId !== input.harnessRunMarker.runId ||
+      marker.instanceId !== input.harnessRunMarker.instanceId ||
+      marker.startedAt !== input.harnessRunMarker.startedAt ||
+      marker.sessionKey !== input.sessionKey ||
+      marker.turnId !== input.turnId ||
+      marker.runId !== input.runId ||
+      input.harnessRunMarker.runId !== input.runId ||
+      getHarnessActionRunId(marker) !== input.runId ||
+      getHarnessActionRunId(marker) !== getHarnessActionRunId(input.harnessRunMarker) ||
+      (marker.activeParentRunId || null) !==
+        (input.harnessRunMarker.activeParentRunId || null) ||
+      (marker.parentRunId || null) !== input.parentRunId ||
+      (input.harnessRunMarker.parentRunId || null) !== input.parentRunId
+    ) {
+      result = { ok: false, reason: "plan_execution_harness_owner_mismatch" };
+      return {};
+    }
+    if ((state.runtimeEvents || []).some((event) =>
+      (isTerminalTurnEvent(event) || isRunTerminalEvent(event)) &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId &&
+      (isTerminalTurnEvent(event) || event.runId === input.runId)
+    )) {
+      result = { ok: false, reason: "plan_execution_owner_already_terminal" };
+      return {};
+    }
+
+    const lifecycle = state.planLifecycle;
+    const lease = lifecycle?.executionLease;
+    const handoff = state.pendingPlanApprovalHandoff;
+    if (
+      lifecycle?.status !== "handoff_pending" ||
+      !lease ||
+      !isPlanApprovalLeaseBoundToState(lifecycle) ||
+      lease.executionLeaseId !== executionLeaseId ||
+      lease.instructionHash !== computedInstructionHash ||
+      lease.executionTurnId !== input.turnId ||
+      lease.executionRunId !== input.runId ||
+      lease.parentRunId !== input.parentRunId ||
+      !handoff ||
+      handoff.executionLeaseId !== executionLeaseId ||
+      handoff.executionAttempt !== lease.attempt ||
+      handoff.executionInstructionHash !== computedInstructionHash
+    ) {
+      result = { ok: false, reason: "plan_execution_lifecycle_owner_mismatch" };
+      return {};
+    }
+
+    const transition = reducePlanLifecycle(lifecycle, {
+      type: "execution_started",
+      expectedVersion: lifecycle.version,
+      at: input.at,
+      executionLeaseId,
+      instructionHash: computedInstructionHash,
+      execution: {
+        turnId: input.turnId,
+        runId: input.runId,
+        parentRunId: input.parentRunId,
+        attempt: lease.attempt,
+        startedAt: input.at,
+      },
+    });
+    if (transition.disposition !== "applied") {
+      result = {
+        ok: false,
+        reason: `plan_execution_lifecycle_${transition.reason || transition.disposition}`,
+      };
+      return {};
+    }
+
+    const planExecution = capturePlanExecutionRunProvenance(transition.state);
+    if (!planExecution) {
+      result = { ok: false, reason: "plan_execution_provenance_capture_failed" };
+      return {};
+    }
+    const runStarted = withEventSchema({
+      type: "run.started",
+      threadId: input.sessionKey,
+      turnId: input.turnId,
+      timestampMs: input.at,
+      runId: input.runId,
+      parentRunId: input.parentRunId,
+    });
+    const eventAppend = appendRuntimeEventWithResult(state.runtimeEvents, runStarted);
+    if (eventAppend.disposition === "conflict") {
+      result = { ok: false, reason: "plan_execution_run_started_conflict" };
+      return {};
+    }
+    const nextMarker: HarnessRunMarker = {
+      ...marker,
+      activeRunId: input.runId,
+      activeParentRunId: input.parentRunId,
+      activePlanExecutionProvenance: planExecution,
+      isPlanApproved: true,
+      planStage: "executing",
+      updatedAt: input.at,
+    };
+    const persistedMarker = input.persistHarnessRunMarkerIfOwned(nextMarker, {
+      runId: marker.runId,
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      instanceId: marker.instanceId,
+      startedAt: marker.startedAt,
+    });
+    if (!persistedMarker) {
+      result = { ok: false, reason: "plan_execution_harness_persist_cas_rejected" };
+      return {};
+    }
+    result = {
+      ok: true,
+      disposition: "applied",
+      planExecution,
+    };
+    return {
+      planLifecycle: transition.state,
+      isPlanApproved: true,
+      planStage: "executing" as const,
+      pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: input.turnId,
+      currentTurnExecutionConsent: { turnId: input.turnId, granted: true },
+      harnessRunMarker: persistedMarker,
+      runtimeEvents: eventAppend.events,
+      conversationTurns: state.conversationTurns.map((turn) =>
+        turn.id === input.turnId
+          ? { ...turn, status: "executing" as const, summary: "Executing the approved plan." }
+          : turn
+      ),
+    };
+  });
+  return result;
+}
+
 export async function runSubmitAsyncWorkflowRun<
   TState extends SubmitAsyncWorkflowRunState,
   TAbortController extends AbortController,
@@ -791,6 +1179,7 @@ export async function runSubmitAsyncWorkflowRun<
   const expectedHarnessRunMarker = input.readHarnessRunMarker();
   let submissionParentRunId = String(input.parentRunIdOverride || "").trim() || null;
   let acquiredRunOwner: SubmitBootstrapRunOwner | null = null;
+  let dispatchedPlanExecutionLeaseId = String(input.planExecutionLeaseId || "").trim();
   let userContent = input.text;
   const activeStudioAgentKey = input.sessionGet().activeStudioAgentKey;
   const gameStudioInitialized = input.sessionGet().gameStudioInitialized;
@@ -915,6 +1304,31 @@ export async function runSubmitAsyncWorkflowRun<
     event.turnId === input.turnId
   );
   if (terminalTurn) {
+    let handoffRollbackDisposition: TerminalPlanHandoffRollbackDisposition =
+      "not_handoff_pending";
+    let handoffRollbackRunId = submissionRunId;
+    input.sessionSet((state: TState) => {
+      const reservedLease = state.planLifecycle?.status === "handoff_pending" &&
+        state.planLifecycle.sessionKey === input.runSessionKey &&
+        state.planLifecycle.executionLease?.executionTurnId === input.turnId
+        ? state.planLifecycle.executionLease
+        : null;
+      handoffRollbackRunId = String(input.runIdOverride || "").trim() ||
+        reservedLease?.executionRunId ||
+        submissionRunId;
+      const rollback = projectTerminalPlanExecutionHandoffRollback({
+        state,
+        sessionKey: input.runSessionKey,
+        turnId: input.turnId,
+        runId: handoffRollbackRunId,
+        parentRunId: String(input.parentRunIdOverride || "").trim()
+          ? submissionParentRunId
+          : undefined,
+        timestampMs: input.nowMs(),
+      });
+      handoffRollbackDisposition = rollback.disposition;
+      return rollback.patch;
+    });
     input.elapsedTimer.dispose();
     input.logStoreEvent("submit_bootstrap_skipped_terminal_turn", {
       sessionKey: input.runSessionKey,
@@ -924,6 +1338,8 @@ export async function runSubmitAsyncWorkflowRun<
       terminalResultKind: terminalTurn.type === "turn.completed"
         ? terminalTurn.resultKind || "success"
         : "error",
+      planHandoffRollbackDisposition: handoffRollbackDisposition,
+      planHandoffRollbackRunId: handoffRollbackRunId,
     });
     return;
   }
@@ -975,6 +1391,57 @@ export async function runSubmitAsyncWorkflowRun<
     instanceId: runLease.harnessRunMarker.instanceId,
     startedAt: runLease.harnessRunMarker.startedAt,
   };
+  const hasPlanExecutionAdmissionFields = Boolean(
+    input.planExecutionLeaseId || input.planExecutionInstructionHash,
+  );
+  const livePlanLifecycle = input.sessionGet().planLifecycle;
+  const liveExecutionLease = livePlanLifecycle?.executionLease || null;
+  const runMatchesReservedPlanAttempt =
+    livePlanLifecycle?.status === "handoff_pending" &&
+    !!liveExecutionLease &&
+    liveExecutionLease.executionTurnId === input.turnId &&
+    liveExecutionLease.executionRunId === runLease.runId &&
+    liveExecutionLease.parentRunId === runLease.parentRunId;
+  const mustAdmitPlanExecution =
+    input.requiresPlanExecutionAdmission === true ||
+    hasPlanExecutionAdmissionFields ||
+    runMatchesReservedPlanAttempt;
+  // A live, exact lifecycle reservation is authoritative even if a caller
+  // omitted the duplicated transport fields. Conversely, a caller cannot
+  // downgrade a required Plan admission to a generic Run merely by omitting
+  // one or both fields.
+  const planExecutionLeaseId = String(
+    input.planExecutionLeaseId ||
+      (runMatchesReservedPlanAttempt ? liveExecutionLease?.executionLeaseId : "") ||
+      "",
+  ).trim();
+  const planExecutionInstructionHash = String(
+    input.planExecutionInstructionHash ||
+      (runMatchesReservedPlanAttempt ? liveExecutionLease?.instructionHash : "") ||
+      "",
+  ).trim();
+  dispatchedPlanExecutionLeaseId = planExecutionLeaseId || dispatchedPlanExecutionLeaseId;
+  const planExecutionAdmission = mustAdmitPlanExecution
+    ? !planExecutionLeaseId || !planExecutionInstructionHash
+      ? { ok: false, reason: "plan_execution_admission_fields_incomplete" } as const
+      : commitPlanExecutionRunAdmission<TState>({
+          text: input.text,
+          sessionKey: input.runSessionKey,
+          turnId: input.turnId,
+          runId: runLease.runId,
+          parentRunId: runLease.parentRunId,
+          harnessRunMarker: runLease.harnessRunMarker,
+          required: true,
+          planExecutionLeaseId,
+          planExecutionInstructionHash,
+          at: input.nowMs(),
+          sessionSet: input.sessionSet,
+          persistHarnessRunMarkerIfOwned: input.persistHarnessRunMarkerIfOwned,
+        })
+    : { ok: true, disposition: "not_applicable", planExecution: null } as const;
+  if (!planExecutionAdmission.ok) {
+    throw new Error(`PLAN_EXECUTION_ADMISSION_REJECTED: ${planExecutionAdmission.reason}`);
+  }
   if (input.goalContinuationAuthorization) {
     const activated = input.activateGoalContinuation({
       authorization: input.goalContinuationAuthorization,
@@ -1009,6 +1476,7 @@ export async function runSubmitAsyncWorkflowRun<
     timerInterval: input.elapsedTimer.timerInterval,
     sendStartedAt: input.sendStartedAt,
     harnessRunId: runLease.harnessRunMarker.runId,
+    planExecution: planExecutionAdmission.planExecution,
     turnAgentMessagesStart: runLease.turnAgentMessagesStart,
     getElapsedSeconds: input.elapsedTimer.getElapsedSeconds,
     PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: input.PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
@@ -1049,6 +1517,8 @@ export async function runSubmitAsyncWorkflowRun<
       parentRunId: acquiredRunOwner?.parentRunId ?? submissionParentRunId,
       acquired: acquiredRunOwner,
     });
+  } finally {
+    releasePlanExecutionDispatch(dispatchedPlanExecutionLeaseId);
   }
 }
 

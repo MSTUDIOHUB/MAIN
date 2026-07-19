@@ -1,8 +1,11 @@
 import type { HydratedPlanArtifacts } from "../lib/planArtifactHydration";
+import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import {
-  shouldPromoteHydratedPlanToExecuting,
-  type PlanStateHydrationReason,
-} from "../lib/planStateHydration";
+  createPlanLifecycleSessionEpoch,
+  createPlanLifecycleState,
+  reducePlanLifecycle,
+} from "../lib/planLifecycle";
+import type { PlanStateHydrationReason } from "../lib/planStateHydration";
 import { resolveSessionRuntimeKey, resolveSessionWorkspaceKey } from "../lib/sessionTypes";
 import { appendRuntimeEvent, withEventSchema } from "../lib/turnEvents";
 import type { PlanArtifact, PlanStage, PlanTask } from "../lib/workflowModels";
@@ -23,6 +26,7 @@ export interface RunSubmitPlanHydrationEffectInput {
   preferredLanguage: "zh" | "en";
   workspace: string;
   sendOriginSessionKey: string | null | undefined;
+  sendOriginSessionEpoch: string | null | undefined;
   getState: SubmitPlanHydrationGet;
   setState: SubmitPlanHydrationSet;
   hydrateExistingPlanArtifactsForWorkspace: (
@@ -35,7 +39,11 @@ export interface RunSubmitPlanHydrationEffectInput {
     isPlanApproved: boolean,
     currentStage: PlanStage,
   ) => PlanStage;
-  isSessionRuntimeActive: (state: any, sessionKey: string) => boolean;
+  isSessionRuntimeOwnerActive: (
+    state: any,
+    sessionKey: string,
+    sessionEpoch: string,
+  ) => boolean;
   resumeSubmission: (
     text: string,
     images: string[] | undefined,
@@ -66,7 +74,14 @@ export async function runSubmitPlanHydrationEffect(
   const stateAfterHydrationRead = input.getState();
   if (
     input.sendOriginSessionKey &&
-    !input.isSessionRuntimeActive(stateAfterHydrationRead, input.sendOriginSessionKey)
+    (
+      !input.sendOriginSessionEpoch ||
+      !input.isSessionRuntimeOwnerActive(
+        stateAfterHydrationRead,
+        input.sendOriginSessionKey,
+        input.sendOriginSessionEpoch,
+      )
+    )
   ) {
     input.logStoreEvent("send_async_resume_skipped_inactive_session", {
       phase: "auto_plan_hydration",
@@ -75,33 +90,48 @@ export async function runSubmitPlanHydrationEffect(
     return;
   }
 
-  const shouldPromoteToExecuting = shouldPromoteHydratedPlanToExecuting(input.reason);
   const hasHydratedData = !!hydrated && (hydrated.artifacts.length > 0 || hydrated.tasks.length > 0);
   if (hydrated && hasHydratedData) {
     input.setState((s: any) => {
       const alreadyHasPlanState =
         s.planArtifacts.length > 0 ||
         s.planTasks.length > 0 ||
-        s.planStage !== "idle";
+        s.planStage !== "idle" ||
+        (s.planLifecycle && s.planLifecycle.status !== "empty");
       if (alreadyHasPlanState) return {};
       const baseStage = input.derivePlanStageFromArtifacts(
         hydrated.artifacts,
         hydrated.tasks,
-        shouldPromoteToExecuting,
+        false,
         s.planStage,
       );
-      const nextStage =
-        shouldPromoteToExecuting && (baseStage === "idle" || baseStage === "ready_to_execute")
-          ? "executing"
-          : baseStage;
       const threadId =
         resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) ||
         "default";
+      const timestampMs = nowMs();
+      const exactOwnerEpoch = String(input.sendOriginSessionEpoch || "").trim();
+      const ownerLifecycle =
+        s.planLifecycle?.sessionKey === threadId &&
+        !!exactOwnerEpoch &&
+        s.planLifecycle.sessionEpoch === exactOwnerEpoch
+        ? s.planLifecycle
+        : createPlanLifecycleState({
+            sessionKey: threadId,
+            sessionEpoch: exactOwnerEpoch || createPlanLifecycleSessionEpoch(timestampMs),
+            updatedAt: timestampMs,
+          });
+      const lifecycleTransition = reducePlanLifecycle(ownerLifecycle, {
+        type: "hydrate_discovery",
+        expectedVersion: ownerLifecycle.version,
+        at: timestampMs,
+        planTurnId: s.currentTurnId || null,
+        artifactIdentity: buildPlanApprovalIdentity(hydrated.artifacts),
+      });
       const nextEvent = withEventSchema({
         type: "plan_state_hydrated",
         threadId,
         turnId: s.currentTurnId || undefined,
-        timestampMs: nowMs(),
+        timestampMs,
         reason: input.reason,
         taskCount: hydrated.tasks.length,
         artifactPaths: hydrated.artifacts.map((artifact) => artifact.path),
@@ -109,8 +139,11 @@ export async function runSubmitPlanHydrationEffect(
       return {
         planArtifacts: hydrated.artifacts,
         planTasks: hydrated.tasks,
-        planStage: nextStage,
-        isPlanApproved: shouldPromoteToExecuting || s.isPlanApproved,
+        planStage: baseStage,
+        isPlanApproved: false,
+        planLifecycle: lifecycleTransition.disposition === "rejected"
+          ? ownerLifecycle
+          : lifecycleTransition.state,
         showPlanPanel: true,
         rightPanelTab: "plan",
         showDiff: false,
@@ -129,12 +162,19 @@ export async function runSubmitPlanHydrationEffect(
     ...(input.options || {}),
     skipAutoPlanHydration: true,
     preservePlanState:
-      input.options?.preservePlanState === true || (hasHydratedData && shouldPromoteToExecuting),
+      input.options?.preservePlanState === true || hasHydratedData,
   };
   const latestState = input.getState();
   if (
     input.sendOriginSessionKey &&
-    !input.isSessionRuntimeActive(latestState, input.sendOriginSessionKey)
+    (
+      !input.sendOriginSessionEpoch ||
+      !input.isSessionRuntimeOwnerActive(
+        latestState,
+        input.sendOriginSessionKey,
+        input.sendOriginSessionEpoch,
+      )
+    )
   ) {
     input.logStoreEvent("send_async_resume_skipped_inactive_session", {
       phase: "auto_plan_hydration",

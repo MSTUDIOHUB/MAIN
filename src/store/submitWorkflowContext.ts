@@ -3,6 +3,7 @@ import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 import type { StudioConfig } from "../lib/gameStudio/catalog";
 import type { CommandDirective, ResolvedRunIntent } from "../lib/runIntent";
 import type { WorkflowContext } from "../lib/orchestrator/workflowEngine";
+import type { PlanExecutionRunProvenance } from "../lib/planExecutionProvenance";
 
 export interface CreateSubmitWorkflowContextInput {
   turnId: string;
@@ -25,6 +26,7 @@ export interface CreateSubmitWorkflowContextInput {
   timerInterval: unknown;
   sendStartedAt: number;
   harnessRunId: string;
+  planExecution: PlanExecutionRunProvenance | null;
   turnAgentMessagesStart: number;
   getElapsedSeconds: () => number;
   PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS: number;
@@ -56,6 +58,9 @@ export function createSubmitWorkflowContext(
     timerInterval: input.timerInterval,
     sendStartedAt: input.sendStartedAt,
     harnessRunId: input.harnessRunId,
+    planExecution: input.planExecution
+      ? Object.freeze({ ...input.planExecution })
+      : null,
     streamBuffer: null,
     thinkingInterceptor: null,
     turnAgentMessagesStart: input.turnAgentMessagesStart,

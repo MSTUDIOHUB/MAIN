@@ -371,14 +371,23 @@ test("approved plan same-turn fallback retries busy once only while the exact tr
     planTurnId: "turn-plan",
     executionTurnId: "turn-plan",
     requestedAt: 100,
+    approvalLeaseId: "lease-plan-1",
+    executionLeaseId: "execution-lease-1",
+    sessionEpoch: "epoch-1",
+    reviewRequestId: "request-plan-1",
+    executionRunId: "run-execution-1",
+    executionAttempt: 1,
+    executionInstructionHash: "instruction-hash-1",
+    parentRunId: "run-review-1",
+    planRevision: 1,
+    artifactHash: "plan-hash-1",
   };
   const base = {
     expectedSessionKey: "workspace:1",
     currentSessionKey: "workspace:1",
     expectedHandoff: handoff,
     currentHandoff: handoff,
-    isPlanApproved: true,
-    executionStartedForTurnId: null,
+    hasExactPlanApprovalHandoff: true,
     isAgentBusy: true,
   };
 
@@ -397,12 +406,12 @@ test("approved plan same-turn fallback retries busy once only while the exact tr
   }), "transition_stale");
   assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
     ...base,
-    executionStartedForTurnId: "turn-plan",
+    currentHandoff: { ...handoff, approvalLeaseId: "lease-plan-stale" },
     busyRetryAttempt: 0,
   }), "transition_stale");
   assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
     ...base,
-    isPlanApproved: false,
+    hasExactPlanApprovalHandoff: false,
     busyRetryAttempt: 0,
   }), "transition_stale");
   assert.equal(resolveApprovedPlanSameTurnFallbackDecision({
@@ -2554,6 +2563,7 @@ test("approved plan execution starts with the normal execute tool surface", () =
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
   const planReviewRuntimeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/planReviewRuntime.ts"), "utf8");
   const appStoreSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const asyncRunSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitAsyncWorkflowRun.ts"), "utf8");
   const loopMutableStateSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/loopMutableState.ts"), "utf8");
 
   assert.match(
@@ -2561,10 +2571,10 @@ test("approved plan execution starts with the normal execute tool surface", () =
     /executeRecoveryState:\s*createExecuteRecoveryRuntimeState\(\{/,
   );
   assert.match(planReviewRuntimeSource, /Approval belongs to a fresh child run/);
-  assert.match(
-    appStoreSource,
-    /planStage:\s*"executing"[\s\S]*plan_review_run_paused_for_child_execution/,
-  );
+  assert.match(appStoreSource, /plan_review_run_paused_for_child_execution/);
+  assert.match(appStoreSource, /planLifecycle:\s*approvedPlanLifecycle[\s\S]*isPlanApproved:\s*false/);
+  assert.match(asyncRunSource, /phaseRunners\.startRunLease \|\| startSubmitRunLease\)[\s\S]*commitPlanExecutionRunAdmission/);
+  assert.match(asyncRunSource, /type:\s*"execution_started"/);
   assert.match(appStoreSource, /startApprovedPlanExecutionInCurrentTurn/);
 });
 

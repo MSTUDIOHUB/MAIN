@@ -56,7 +56,7 @@ function loadTranspiledModuleSync(sourcePath) {
 const hydration = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planStateHydration.ts"));
 const catalog = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/gameStudio/catalog.ts"));
 
-const { resolvePlanStateHydrationReason, shouldPromoteHydratedPlanToExecuting } = hydration;
+const { resolvePlanStateHydrationReason } = hydration;
 const { parseGameStudioSlashCommand } = catalog;
 
 test("plan state hydration prefers explicit existing-plan execution semantics", () => {
@@ -67,7 +67,6 @@ test("plan state hydration prefers explicit existing-plan execution semantics", 
     slashCommand: null,
   });
   assert.equal(reason, "existing_plan_execution");
-  assert.equal(shouldPromoteHydratedPlanToExecuting(reason), true);
 });
 
 test("plan state hydration recognizes natural plan resume wording", () => {
@@ -78,7 +77,6 @@ test("plan state hydration recognizes natural plan resume wording", () => {
     slashCommand: null,
   });
   assert.equal(reason, "existing_plan_execution");
-  assert.equal(shouldPromoteHydratedPlanToExecuting(reason), true);
 });
 
 test("plan state hydration triggers for continuation state and execution studio commands", () => {
@@ -89,7 +87,6 @@ test("plan state hydration triggers for continuation state and execution studio 
     slashCommand: null,
   });
   assert.equal(continuation, "continuation_state");
-  assert.equal(shouldPromoteHydratedPlanToExecuting(continuation), true);
 
   const execCmd = resolvePlanStateHydrationReason({
     text: "/dev-story",
@@ -125,7 +122,8 @@ test("plan panel open path hydrates artifacts without auto-approving execution",
   assert.match(source, /openPlanWorkspacePanel:\s*async/);
   assert.match(source, /actualPathByCanonicalPath/);
   assert.match(source, /\.MAIN\/plans\/\$\{entry\.name\}/);
-  assert.match(source, /derivePlanStageFromArtifacts\(\s*hydratedPlan\.artifacts,\s*hydratedPlan\.tasks,\s*s\.isPlanApproved,\s*s\.planStage,\s*\)/);
+  assert.match(source, /derivePlanStageFromArtifacts\(\s*hydratedPlan\.artifacts,\s*hydratedPlan\.tasks,\s*false,\s*s\.planStage,\s*\)/);
+  assert.match(source, /plan_workspace_hydration_skipped_stale_owner/);
   assert.match(source, /setRightPanelTab:\s*\(tab\)\s*=>\s*\{\s*if \(tab === "plan"\)/);
 });
 
@@ -141,16 +139,59 @@ test("ChatArea omits the duplicated effective progress ledger", () => {
   assert.match(source, /archived-phase-analysis[\s\S]*archivedAfterChoice: false/);
 });
 
-test("plan panel keeps resume action available for paused approved execution", () => {
+test("plan panel gives a lease-bound paused execution priority over planning continuation", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/RightPanel.tsx"), "utf8");
+  const resumeGateStart = source.indexOf("const canResumeExecution =");
+  const resumeGateEnd = source.indexOf("const planPresentationRequest", resumeGateStart);
+  const resumeGate = source.slice(resumeGateStart, resumeGateEnd);
+  const resumeHandlerStart = source.indexOf("const handleResumeExecution = () => {");
+  const resumeHandlerEnd = source.indexOf("const handleSavePlanDocument", resumeHandlerStart);
+  const resumeHandler = source.slice(resumeHandlerStart, resumeHandlerEnd);
 
-  assert.match(source, /const canResumeExecution =[\s\S]*?isPlanApproved[\s\S]*?planStage === "executing"[\s\S]*?\(agentStatus === "idle" \|\| agentStatus === "error"\);/);
-  assert.doesNotMatch(source, /canResumeExecution[\s\S]*?allTrustedComplete/);
-  assert.match(source, /resolvedIntent:\s*"execute"/);
-  assert.doesNotMatch(source, /runtimeIntentOverride:\s*"execute"/);
-  assert.match(source, /executionConsentGranted:\s*true/);
-  assert.match(source, /createVisibleTurnForHiddenMessage:\s*!resumeTurnId/);
-  assert.match(source, /reuseCurrentTurn:\s*!!resumeTurnId/);
+  assert.notEqual(resumeGateStart, -1);
+  assert.notEqual(resumeGateEnd, -1);
+  assert.match(source, /planLifecycle:\s*useAppStore\(\(s\) => s\.planLifecycle\)/);
+  assert.match(resumeGate, /planLifecycle\.status === "paused"/);
+  assert.match(resumeGate, /isPlanApprovalLeaseBoundToState\(planLifecycle\)/);
+  assert.match(resumeGate, /!activeActionRequest/);
+  assert.match(resumeGate, /!isGenerating/);
+  assert.match(resumeGate, /!abortController/);
+  assert.match(resumeGate, /const canContinuePlanning = !canResumeExecution && canOfferPlanContinuation/);
+  assert.doesNotMatch(resumeGate, /isPlanApproved &&/);
+  assert.doesNotMatch(resumeGate, /planStage === "executing"/);
+  assert.doesNotMatch(resumeGate, /allTrustedComplete/);
+  assert.notEqual(resumeHandlerStart, -1);
+  assert.notEqual(resumeHandlerEnd, -1);
+  assert.match(source, /resumePlanExecution:\s*useAppStore\(\(s\) => s\.resumePlanExecution\)/);
+  assert.match(resumeHandler, /resumePlanExecution\(\s*buildTrustedResumePrompt\(\{/);
+  assert.doesNotMatch(resumeHandler, /sendMessage\s*\(/);
+  assert.doesNotMatch(resumeHandler, /executionConsentGranted:\s*true/);
+});
+
+test("store resume replaces a never-started Plan reservation instead of reusing its ghost Run", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const dispatchStart = source.indexOf("export function startApprovedPlanExecutionInCurrentTurn");
+  const dispatchEnd = source.indexOf("async function hydrateExistingPlanArtifactsForWorkspace", dispatchStart);
+  const dispatchSource = source.slice(dispatchStart, dispatchEnd);
+  const resumeStart = source.indexOf("resumePlanExecution: (instruction) => {");
+  const resumeEnd = source.indexOf("rejectPlan: (expectedIdentity)", resumeStart);
+  const resumeSource = source.slice(resumeStart, resumeEnd);
+
+  assert.notEqual(dispatchStart, -1);
+  assert.notEqual(dispatchEnd, -1);
+  assert.match(dispatchSource, /reason:\s*"plan_execution_dispatch_failed"/);
+  assert.match(dispatchSource, /pendingPlanApprovalHandoff:\s*reservedAttemptPaused \? null : input\.handoff/);
+  assert.match(dispatchSource, /planStage:\s*"ready_to_execute"/);
+  assert.notEqual(resumeStart, -1);
+  assert.notEqual(resumeEnd, -1);
+  assert.doesNotMatch(resumeSource, /!lifecycle\.execution\s*\|\|/);
+  assert.match(resumeSource, /lifecycle\.execution\?\.runId \|\| lifecycle\.approvalLease\.approvalRunId/);
+  assert.match(resumeSource, /executionLeaseId:\s*`plan-execution-resume-\$\{executionRunId\}`/);
+  assert.match(resumeSource, /const planTurnAlreadyTerminal =/);
+  assert.match(resumeSource, /plan_turn_terminal_owner_revoked_to_discovery/);
+  assert.match(resumeSource, /revokePlanLifecycleToDiscovery\(\{/);
+  assert.match(resumeSource, /pendingPlanApprovalHandoff:\s*null/);
+  assert.match(resumeSource, /currentTurnExecutionConsent:\s*\{ turnId: null, granted: false \}/);
 });
 
 test("plan UI distinguishes a candidate from an executable artifact without guessing failure", () => {
@@ -184,23 +225,28 @@ test("early Plan hydration busy gate retains validated Goal authority and refres
   );
 });
 
-test("new empty workspace sessions hydrate persisted plan tasks into resumable execution state", () => {
+test("new empty workspace sessions discover persisted plans without manufacturing approval", () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");
   const planExecutionResumeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"), "utf8");
   const appSource = fsSync.readFileSync(path.join(workspaceRoot, "src/App.tsx"), "utf8");
 
-  assert.match(storeSource, /promoteTasksToExecuting\?:\s*boolean/);
-  assert.match(storeSource, /options\.promoteTasksToExecuting === true[\s\S]*?hydratedPlan\.hasTasksArtifact[\s\S]*?hydratedPlan\.tasks\.length > 0/);
-  assert.match(storeSource, /isPlanApproved:\s*shouldPromoteHydratedTasksToExecuting \|\| s\.isPlanApproved/);
-  assert.match(storeSource, /planStage:\s*shouldPromoteHydratedTasksToExecuting \? "executing" : nextStage/);
+  assert.doesNotMatch(storeSource, /promoteTasksToExecuting/);
+  assert.match(storeSource, /isPlanApproved:\s*false,\s*planStage:\s*nextStage/);
   assert.match(submitIntentRoutingSource, /controlAction === "resume_plan_execution"[\s\S]*?startPlanExecutionResume\(\{/);
   assert.match(storeSource, /startPlanExecutionResume: \(resumeRequest\) =>[\s\S]*?runSubmitPlanExecutionResumeEffect\(\{/);
-  assert.match(planExecutionResumeSource, /createVisibleTurnForHiddenMessage:\s*!continuationTurnId/);
-  assert.match(planExecutionResumeSource, /reuseCurrentTurn:\s*!!continuationTurnId/);
-  assert.match(planExecutionResumeSource, /turnIdOverride:\s*continuationTurnId/);
-  assert.match(planExecutionResumeSource, /existing_plan_hydrated_for_execution/);
+  assert.match(planExecutionResumeSource, /kind:\s*"discovery_only"/);
+  assert.match(planExecutionResumeSource, /requiresTurnAdmission:\s*true/);
+  assert.match(planExecutionResumeSource, /requiresApproval:\s*true/);
+  assert.match(planExecutionResumeSource, /isPlanApproved:\s*false/);
+  assert.match(planExecutionResumeSource, /existing_plan_discovered_for_review/);
+  assert.doesNotMatch(planExecutionResumeSource, /resumeSubmission/);
+  assert.doesNotMatch(planExecutionResumeSource, /executionConsentGranted:\s*true/);
+  assert.doesNotMatch(planExecutionResumeSource, /reuseCurrentTurn/);
+  assert.doesNotMatch(planExecutionResumeSource, /turnIdOverride/);
+  assert.doesNotMatch(planExecutionResumeSource, /existing_plan_hydrated_for_execution/);
 
   assert.match(appSource, /hydrateWorkspacePlanForEmptySession\("new_session"\)/);
-  assert.match(appSource, /promoteTasksToExecuting:\s*true/);
+  assert.doesNotMatch(appSource, /promoteTasksToExecuting/);
+  assert.match(appSource, /hydrationWorkspace[\s\S]*hydrationSessionKey[\s\S]*saveCurrentRuntimeToSession/);
 });

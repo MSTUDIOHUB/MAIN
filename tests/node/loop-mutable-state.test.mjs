@@ -45,10 +45,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const {
-  createAgentLoopMutableState,
-  resetAgentLoopMutableStateForApprovedPlanExecution,
-} = loadTranspiledModuleSync(
+const { createAgentLoopMutableState } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/loopMutableState.ts"),
 );
 
@@ -77,41 +74,6 @@ test("loop mutable state owns common phase result folds", () => {
   assert.match(stateSource, /state\.unityMcpRuntimeState = result\.unityMcpRuntimeState/);
   assert.match(stateSource, /applyToolIterationMutableState/);
   assert.match(stateSource, /state\.loopGuardRuntimeState = result\.loopGuardRuntimeState/);
-});
-
-test("approved Plan phase reset removes planning counters while preserving the turn iteration and tool cache", () => {
-  const unityMcpRuntimeState = { firstPhaseActive: false };
-  const state = createAgentLoopMutableState({
-    callbacks: {
-      getIsPlanApproved: () => false,
-      getForcedExecuteRecoveryMode: () => null,
-      getSessionKey: () => "session-1",
-    },
-    workflowMode: "plan",
-    unityMcpRuntimeState,
-  });
-  const toolExecutionRuntimeState = state.toolExecutionRuntimeState;
-  state.iteration = 19;
-  state.recentPlanToolActivity.push({ name: "write_file", status: "succeeded", target: ".MAIN/plans/plan.md" });
-  state.recentToolActivity.push({ name: "read_file", status: "succeeded", target: "src/main.rs" });
-  state.attemptedPlanWriteTargets.push(".MAIN/plans/plan.md");
-  state.noToolRuntimeState.consecutiveNoToolCount = 4;
-  state.loopGuardRuntimeState.failedToolCallCounts.set("replace:src/main.rs", 2);
-  state.executeRecoveryState.mode = "mutation_first";
-
-  resetAgentLoopMutableStateForApprovedPlanExecution(state);
-
-  assert.equal(state.iteration, 19);
-  assert.equal(state.toolExecutionRuntimeState, toolExecutionRuntimeState);
-  assert.equal(state.unityMcpRuntimeState, unityMcpRuntimeState);
-  assert.equal(state.recentPlanToolActivity.length, 0);
-  assert.equal(state.recentToolActivity.length, 0);
-  assert.equal(state.attemptedPlanWriteTargets.length, 0);
-  assert.equal(state.noToolRuntimeState.consecutiveNoToolCount, 0);
-  assert.equal(state.loopGuardRuntimeState.failedToolCallCounts.size, 0);
-  assert.equal(state.executeRecoveryState.mode, "normal");
-  assert.equal(state.planRuntimeState.planRuntimePhase, "grounding");
-  assert.equal(state.evidenceRuntimeState.sawExecuteOperationEvidence, false);
 });
 
 test("loop mutable state migrates legacy post-mutation reads into validation", () => {
@@ -161,7 +123,8 @@ test("agent orchestrator delegates mutable runtime state creation and folds", ()
   assert.match(orchestratorSource, /applyToolIterationMutableState\(/);
   assert.match(orchestratorSource, /markExecuteOperationEvidenceMutableState\(loopState\)/);
   assert.match(orchestratorSource, /markChatFinalSynthesisPromptUsedMutableState\(loopState\)/);
-  assert.match(orchestratorSource, /resetAgentLoopMutableStateForApprovedPlanExecution\(loopState\)/);
+  assert.doesNotMatch(orchestratorSource, /resetAgentLoopMutableStateForApprovedPlanExecution/);
+  assert.doesNotMatch(orchestratorSource, /onApprovedPlanExecutionStarted/);
   assert.match(orchestratorSource, /publishExecuteRecoveryState/);
   assert.match(orchestratorSource, /onExecuteRecoveryStateChange/);
   assert.match(orchestratorSource, /phaseNoProgressCount: loopState\.executeRecoveryState\.phaseNoProgressCount/);

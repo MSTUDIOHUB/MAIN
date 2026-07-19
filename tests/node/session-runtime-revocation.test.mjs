@@ -13,6 +13,7 @@ const transpiled = ts.transpileModule(source, {
 const module = { exports: {} };
 new Function("exports", "module", "require", transpiled)(module.exports, module, () => ({}));
 const {
+  revokeAllSessionRuntimesBeforeSettingsReset,
   revokeSessionRuntimeBeforeDelete,
   revokeWorkspaceSessionRuntimesBeforeClear,
 } = module.exports;
@@ -195,4 +196,210 @@ test("workspace history clear revokes Execute, Goal, approval, and Harness owner
     reviewSettled: true,
     harnessClosed: false,
   });
+});
+
+test("settings reset revokes the active projection and every cached Session owner", () => {
+  const order = [];
+  const results = revokeAllSessionRuntimesBeforeSettingsReset({
+    activeSessionKey: "workspace-a:1",
+    activeRuntime: {
+      currentTurnId: "turn-active",
+      agentStatus: "running",
+      abortController: { abort: () => order.push("active:abort") },
+    },
+    runtimeBySessionKey: {
+      // The live projection must replace this stale snapshot for the same owner.
+      "workspace-a:1": {
+        abortController: { abort: () => order.push("stale-active:abort") },
+      },
+      "workspace-a:2": {
+        currentTurnId: "turn-review",
+        agentStatus: "pending_review",
+        pendingReviewResolve: (decision) => order.push(`review:${decision.action}`),
+      },
+      "workspace-b:3": {
+        currentTurnId: "turn-background",
+        agentStatus: "running",
+        abortController: { abort: () => order.push("background:abort") },
+      },
+      "workspace-b:empty": null,
+    },
+    closeHarness: () => {
+      order.push("unexpected:harness");
+      return true;
+    },
+  });
+
+  assert.deepEqual(order, ["active:abort", "review:reject", "background:abort"]);
+  assert.deepEqual(
+    results.map(({ identity }) => ({
+      ownerId: identity.ownerId,
+      source: identity.source,
+      sessionKey: identity.sessionKey,
+      turnId: identity.currentTurnId,
+    })),
+    [
+      {
+        ownerId: "active:workspace-a:1",
+        source: "active",
+        sessionKey: "workspace-a:1",
+        turnId: "turn-active",
+      },
+      {
+        ownerId: "cached:workspace-a:2",
+        source: "cached",
+        sessionKey: "workspace-a:2",
+        turnId: "turn-review",
+      },
+      {
+        ownerId: "cached:workspace-b:3",
+        source: "cached",
+        sessionKey: "workspace-b:3",
+        turnId: "turn-background",
+      },
+    ],
+  );
+  assert.deepEqual(results.map((result) => ({
+    aborted: result.aborted,
+    runDecisionSettled: result.runDecisionSettled,
+    reviewSettled: result.reviewSettled,
+    harnessClosed: result.harnessClosed,
+  })), [
+    { aborted: true, runDecisionSettled: false, reviewSettled: false, harnessClosed: false },
+    { aborted: false, runDecisionSettled: false, reviewSettled: true, harnessClosed: false },
+    { aborted: true, runDecisionSettled: false, reviewSettled: false, harnessClosed: false },
+  ]);
+});
+
+test("settings reset safely revokes an unbound active runtime and its exact Harness marker", () => {
+  const order = [];
+  const activeMarker = marker({
+    sessionKey: "workspace-a:9",
+    runId: "run-unbound",
+    turnId: "turn-unbound",
+    status: "paused",
+  });
+  const results = revokeAllSessionRuntimesBeforeSettingsReset({
+    activeSessionKey: null,
+    activeRuntime: {
+      currentTurnId: "turn-unbound",
+      agentStatus: "pending_review",
+      abortController: { abort: () => order.push("abort") },
+      pendingRunDecisionResolver: (choice) => order.push(`decision:${choice}`),
+      pendingReviewResolve: (decision) => order.push(`review:${decision.action}`),
+      harnessRunMarker: activeMarker,
+    },
+    runtimeBySessionKey: {},
+    closeHarness: (ownedMarker) => {
+      order.push(`harness:${ownedMarker.sessionKey}:${ownedMarker.runId}`);
+      return true;
+    },
+  });
+
+  assert.deepEqual(order, [
+    "abort",
+    "decision:cancel",
+    "review:reject",
+    "harness:workspace-a:9:run-unbound",
+  ]);
+  assert.deepEqual(results, [{
+    identity: {
+      ownerId: "active:unbound",
+      source: "active",
+      sessionKey: null,
+      currentTurnId: "turn-unbound",
+      agentStatus: "pending_review",
+      harnessRunId: "run-unbound",
+      harnessSessionKey: "workspace-a:9",
+      harnessTurnId: "turn-unbound",
+    },
+    aborted: true,
+    runDecisionSettled: true,
+    reviewSettled: true,
+    harnessClosed: true,
+  }]);
+});
+
+test("settings reset never settles aliased capability references twice", () => {
+  const calls = [];
+  const sharedAbortController = { abort: () => calls.push("abort") };
+  const sharedRunDecisionResolver = (choice) => calls.push(`decision:${choice}`);
+  const sharedReviewResolver = (decision) => calls.push(`review:${decision.action}`);
+  const aliasedRuntime = {
+    currentTurnId: "turn-shared",
+    agentStatus: "pending_review",
+    abortController: sharedAbortController,
+    pendingRunDecisionResolver: sharedRunDecisionResolver,
+    pendingReviewResolve: sharedReviewResolver,
+  };
+
+  const results = revokeAllSessionRuntimesBeforeSettingsReset({
+    activeSessionKey: "workspace-a:1",
+    activeRuntime: aliasedRuntime,
+    runtimeBySessionKey: {
+      // A different key can briefly alias the same live runtime during a switch.
+      "workspace-b:2": aliasedRuntime,
+    },
+    closeHarness: () => true,
+  });
+
+  assert.deepEqual(calls, ["abort", "decision:cancel", "review:reject"]);
+  assert.equal(results.length, 2);
+  assert.deepEqual(results[0], {
+    identity: {
+      ownerId: "active:workspace-a:1",
+      source: "active",
+      sessionKey: "workspace-a:1",
+      currentTurnId: "turn-shared",
+      agentStatus: "pending_review",
+      harnessRunId: null,
+      harnessSessionKey: null,
+      harnessTurnId: null,
+    },
+    aborted: true,
+    runDecisionSettled: true,
+    reviewSettled: true,
+    harnessClosed: false,
+  });
+  assert.deepEqual(results[1], {
+    identity: {
+      ownerId: "cached:workspace-b:2",
+      source: "cached",
+      sessionKey: "workspace-b:2",
+      currentTurnId: "turn-shared",
+      agentStatus: "pending_review",
+      harnessRunId: null,
+      harnessSessionKey: null,
+      harnessTurnId: null,
+    },
+    aborted: false,
+    runDecisionSettled: false,
+    reviewSettled: false,
+    harnessClosed: false,
+  });
+});
+
+test("settings reset reports the exact owner identity when one revocation phase throws", () => {
+  const errors = [];
+  const results = revokeAllSessionRuntimesBeforeSettingsReset({
+    activeRuntime: null,
+    runtimeBySessionKey: {
+      "workspace-a:7": {
+        currentTurnId: "turn-7",
+        agentStatus: "running",
+        abortController: { abort: () => { throw new Error("cannot abort"); } },
+      },
+    },
+    closeHarness: () => true,
+    onError: (identity, phase, error) => {
+      errors.push({ identity, phase, message: error.message });
+    },
+  });
+
+  assert.equal(results[0].aborted, false);
+  assert.deepEqual(errors, [{
+    identity: results[0].identity,
+    phase: "abort",
+    message: "cannot abort",
+  }]);
 });

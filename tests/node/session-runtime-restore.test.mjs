@@ -80,6 +80,125 @@ const {
   extractPlanTasks,
   validatePlanArtifactContent,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
+const {
+  PLAN_LIFECYCLE_SCHEMA_VERSION,
+  createPlanLifecycleState,
+  reducePlanLifecycle,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planLifecycle.ts"));
+const { buildPlanApprovalIdentity } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/planApprovalIdentity.ts"),
+);
+
+const exactPlanSessionKey = "plan-session";
+const exactPlanSessionEpoch = "plan-session-epoch-1";
+
+function applyPlanTransition(state, command) {
+  const result = reducePlanLifecycle(state, command);
+  assert.equal(result.disposition, "applied", result.reason);
+  return result.state;
+}
+
+function exactExecutingPlanLifecycle(artifacts) {
+  const identity = buildPlanApprovalIdentity(artifacts);
+  const review = {
+    sessionKey: exactPlanSessionKey,
+    sessionEpoch: exactPlanSessionEpoch,
+    turnId: "turn-plan",
+    runId: "run-outer",
+    parentRunId: null,
+    requestId: "request-plan-review",
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    artifactPaths: identity.artifactPaths,
+  };
+  let state = createPlanLifecycleState({
+    sessionKey: exactPlanSessionKey,
+    sessionEpoch: exactPlanSessionEpoch,
+    updatedAt: 1,
+  });
+  state = applyPlanTransition(state, {
+    type: "start_drafting",
+    expectedVersion: state.version,
+    at: 10,
+    planTurnId: "turn-plan",
+    artifactIdentity: identity,
+  });
+  state = applyPlanTransition(state, {
+    type: "request_review",
+    expectedVersion: state.version,
+    at: 20,
+    artifactIdentity: identity,
+    reviewIdentity: review,
+  });
+  const decision = {
+    sessionKey: exactPlanSessionKey,
+    sessionEpoch: exactPlanSessionEpoch,
+    turnId: "turn-plan",
+    runId: "run-outer",
+    requestId: "request-plan-review",
+    kind: "action_decision",
+  };
+  const approvalLease = {
+    schemaVersion: PLAN_LIFECYCLE_SCHEMA_VERSION,
+    leaseId: "approval-lease-1",
+    sessionKey: exactPlanSessionKey,
+    sessionEpoch: exactPlanSessionEpoch,
+    planTurnId: "turn-plan",
+    reviewRunId: "run-outer",
+    requestId: "request-plan-review",
+    planRevision: identity.revision,
+    artifactHash: identity.artifactHash,
+    artifactPaths: identity.artifactPaths,
+    approvedAt: 30,
+    approvalTurnId: "turn-plan",
+    approvalRunId: "run-outer",
+    approvalDecisionKind: "action_decision",
+  };
+  const executionLease = {
+    schemaVersion: PLAN_LIFECYCLE_SCHEMA_VERSION,
+    executionLeaseId: "execution-lease-1",
+    approvalLeaseId: approvalLease.leaseId,
+    sessionKey: exactPlanSessionKey,
+    sessionEpoch: exactPlanSessionEpoch,
+    planTurnId: "turn-plan",
+    executionTurnId: "turn-plan",
+    executionRunId: "run-child",
+    parentRunId: "run-outer",
+    attempt: 1,
+    issuedAt: 30,
+    reason: "initial_approval",
+    instructionHash: "instruction-hash-1",
+    authorization: decision,
+  };
+  state = applyPlanTransition(state, {
+    type: "approve",
+    expectedVersion: state.version,
+    at: 30,
+    expectedReviewIdentity: review,
+    decisionIdentity: decision,
+    lease: approvalLease,
+    executionLease,
+  });
+  return applyPlanTransition(state, {
+    type: "execution_started",
+    expectedVersion: state.version,
+    at: 31,
+    executionLeaseId: executionLease.executionLeaseId,
+    instructionHash: executionLease.instructionHash,
+    execution: {
+      turnId: "turn-plan",
+      runId: "run-child",
+      parentRunId: "run-outer",
+      attempt: 1,
+      startedAt: 31,
+    },
+  });
+}
+
+const exactPlanRestoreOptions = {
+  expectedSessionKey: exactPlanSessionKey,
+  expectedSessionEpoch: exactPlanSessionEpoch,
+};
 
 function buildApprovedPlanContent() {
   return [
@@ -356,12 +475,16 @@ test("restore preserves currentTaskId and migrates legacy task text only when th
       currentTaskId: planTasks[0].id,
       currentTask: "stale display text must not replace the stable id",
     },
+    planLifecycle: exactExecutingPlanLifecycle([plan, tasks]),
     isPlanApproved: true,
     planStage: "executing",
     planApprovalChoice: "approve",
-  });
-  assert.equal(migrated.isPlanApproved, true);
+  }, exactPlanRestoreOptions);
+  assert.equal(migrated.isPlanApproved, false);
+  assert.equal(migrated.planLifecycle.status, "paused");
+  assert.equal(migrated.planLifecycle.executionLease, null);
   assert.equal(migrated.planExecutionProgressSnapshot.currentTaskId, planTasks[0].id);
+  assert.equal(migrated.planExecutionProgressSnapshot.phase, "paused");
   assert.equal(migrated.planTasks.length, 3);
   assert.equal(migrated.planTasks[0].text, planTasks[0].text);
 
@@ -371,11 +494,12 @@ test("restore preserves currentTaskId and migrates legacy task text only when th
     planArtifacts: [plan, tasks],
     planTasks,
     planExecutionProgressSnapshot: progress,
+    planLifecycle: exactExecutingPlanLifecycle([plan, tasks]),
     isPlanApproved: true,
     planStage: "executing",
     planApprovalChoice: "approve",
-  });
-  assert.equal(legacy.isPlanApproved, true);
+  }, exactPlanRestoreOptions);
+  assert.equal(legacy.isPlanApproved, false);
   assert.equal(legacy.planExecutionProgressSnapshot.currentTaskId, planTasks[0].id);
 
   const ambiguous = normalizeSessionRuntimeSnapshot({
@@ -384,10 +508,11 @@ test("restore preserves currentTaskId and migrates legacy task text only when th
     planArtifacts: [plan, tasks],
     planTasks,
     planExecutionProgressSnapshot: { ...progress, currentTask: "读取 src/main.js" },
+    planLifecycle: exactExecutingPlanLifecycle([plan, tasks]),
     isPlanApproved: true,
     planStage: "executing",
     planApprovalChoice: "approve",
-  });
+  }, exactPlanRestoreOptions);
   assert.equal(ambiguous.isPlanApproved, false);
   assert.equal(ambiguous.planStage, "plan");
   assert.equal(ambiguous.planExecutionProgressSnapshot, null);
@@ -420,11 +545,14 @@ test("restore pauses and revokes approval when the Plan checkpoint turn or run o
     planTasks,
     planExecutionProgressSnapshot: baseProgress,
     harnessRunMarker: planHarnessMarker(),
+    planLifecycle: exactExecutingPlanLifecycle([plan, tasks]),
     isPlanApproved: true,
     planStage: "executing",
     planApprovalChoice: "approve",
-  });
-  assert.equal(valid.isPlanApproved, true);
+  }, exactPlanRestoreOptions);
+  assert.equal(valid.isPlanApproved, false);
+  assert.equal(valid.planLifecycle.status, "paused");
+  assert.equal(valid.planLifecycle.executionLease, null);
   assert.equal(valid.planExecutionProgressSnapshot.currentTaskId, planTasks[0].id);
   assert.equal(valid.harnessRunMarker.status, "paused");
   assert.equal(valid.runtimeEvents.at(-1).type, "run.paused");
@@ -440,10 +568,11 @@ test("restore pauses and revokes approval when the Plan checkpoint turn or run o
         ...(mismatch === "turn" ? { turnId: "turn-stale" } : { runId: "run-stale" }),
       },
       harnessRunMarker: planHarnessMarker(),
+      planLifecycle: exactExecutingPlanLifecycle([plan, tasks]),
       isPlanApproved: true,
       planStage: "executing",
       planApprovalChoice: "approve",
-    });
+    }, exactPlanRestoreOptions);
 
     assert.equal(restored.isPlanApproved, false, mismatch);
     assert.equal(restored.planStage, "plan", mismatch);
@@ -453,6 +582,77 @@ test("restore pauses and revokes approval when the Plan checkpoint turn or run o
     assert.equal(restored.conversationTurns[0].status, "paused", mismatch);
     assert.equal(restored.planArtifacts.some((artifact) => artifact.kind === "plan"), true, mismatch);
   }
+});
+
+test("restore retains checkpoint evidence only for the exact Session container epoch", () => {
+  const plan = planArtifact(buildApprovedPlanContent());
+  const tasks = approvedTaskArtifact();
+  const planTasks = extractPlanTasks(tasks.content);
+  const evidence = [{
+    id: "evidence-exact-owner",
+    turnId: "turn-plan",
+    runId: "run-child",
+    kind: "file",
+    target: "src/main.js",
+    value: "verified exact owner checkpoint",
+    createdAt: 90,
+  }];
+  const snapshot = {
+    currentTurnId: "turn-plan",
+    conversationTurns: [planConversationTurn()],
+    planArtifacts: [plan, tasks],
+    planTasks,
+    planExecutionEvidenceLedger: evidence,
+    planExecutionEvidenceCount: 1,
+    planExecutionProgressSnapshot: {
+      turnId: "turn-plan",
+      runId: "run-child",
+      parentRunId: "run-outer",
+      phase: "running",
+      currentTaskId: planTasks[0].id,
+      currentTask: planTasks[0].text,
+      latestEvidence: evidence[0].value,
+      iteration: 2,
+      maxIterations: 50,
+      autoResumeCount: 0,
+      updatedAt: 100,
+    },
+    harnessRunMarker: planHarnessMarker(),
+    planLifecycle: exactExecutingPlanLifecycle([plan, tasks]),
+    isPlanApproved: true,
+    planStage: "executing",
+    planApprovalChoice: "approve",
+  };
+
+  const exact = normalizeSessionRuntimeSnapshot(snapshot, exactPlanRestoreOptions);
+  assert.equal(exact.isPlanApproved, false);
+  assert.equal(exact.planLifecycle.status, "paused");
+  assert.equal(exact.planLifecycle.executionLease, null);
+  assert.deepEqual(exact.planExecutionEvidenceLedger, evidence);
+  assert.equal(exact.planExecutionEvidenceCount, 1);
+  assert.equal(exact.planExecutionProgressSnapshot.phase, "paused");
+
+  const crossEpoch = normalizeSessionRuntimeSnapshot(snapshot, {
+    expectedSessionKey: exactPlanSessionKey,
+    expectedSessionEpoch: "plan-session-epoch-recreated",
+  });
+  assert.equal(crossEpoch.isPlanApproved, false);
+  assert.equal(crossEpoch.planLifecycle.sessionKey, exactPlanSessionKey);
+  assert.equal(crossEpoch.planLifecycle.sessionEpoch, "plan-session-epoch-recreated");
+  assert.equal(crossEpoch.planLifecycle.approvalLease, null);
+  assert.equal(crossEpoch.planLifecycle.executionLease, null);
+  assert.deepEqual(crossEpoch.planExecutionEvidenceLedger, []);
+  assert.equal(crossEpoch.planExecutionEvidenceCount, 0);
+  assert.equal(crossEpoch.planExecutionProgressSnapshot, null);
+
+  const crossSession = normalizeSessionRuntimeSnapshot(snapshot, {
+    expectedSessionKey: "other-plan-session",
+    expectedSessionEpoch: "other-plan-epoch",
+  });
+  assert.equal(crossSession.planLifecycle.sessionKey, "other-plan-session");
+  assert.equal(crossSession.planLifecycle.sessionEpoch, "other-plan-epoch");
+  assert.equal(crossSession.planLifecycle.approvalLease, null);
+  assert.deepEqual(crossSession.planExecutionEvidenceLedger, []);
 });
 
 test("restore rewrites the exact owner pause boundary when an internal Plan choice request is cleared", () => {

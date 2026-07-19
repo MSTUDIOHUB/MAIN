@@ -111,7 +111,7 @@ function hydratedPlan() {
   };
 }
 
-test("submit plan hydration applies hydrated state and resumes with skip flag", async () => {
+test("submit plan hydration discovers artifacts without auto-approving execution", async () => {
   const state = createState();
   const harness = createHarness(state);
 
@@ -123,11 +123,13 @@ test("submit plan hydration applies hydrated state and resumes with skip flag", 
     preferredLanguage: "zh",
     workspace: "/repo",
     sendOriginSessionKey: "/repo:7",
+    sendOriginSessionEpoch: "epoch-7",
     getState: harness.getState,
     setState: harness.setState,
     hydrateExistingPlanArtifactsForWorkspace: async () => hydratedPlan(),
     derivePlanStageFromArtifacts: () => "ready_to_execute",
-    isSessionRuntimeActive: () => true,
+    isSessionRuntimeOwnerActive: (_state, key, epoch) =>
+      key === "/repo:7" && epoch === "epoch-7",
     resumeSubmission: harness.resumeSubmission.bind(harness),
     logStoreEvent: harness.logStoreEvent.bind(harness),
     nowMs: () => 1234,
@@ -135,13 +137,15 @@ test("submit plan hydration applies hydrated state and resumes with skip flag", 
 
   assert.equal(state.planArtifacts.length, 1);
   assert.equal(state.planTasks.length, 1);
-  assert.equal(state.planStage, "executing");
-  assert.equal(state.isPlanApproved, true);
+  assert.equal(state.planStage, "ready_to_execute");
+  assert.equal(state.isPlanApproved, false);
   assert.equal(state.showPlanPanel, true);
   assert.equal(state.rightPanelTab, "plan");
   assert.equal(state.showDiff, false);
   assert.equal(state.runtimeEvents[0].type, "plan_state_hydrated");
   assert.equal(state.runtimeEvents[0].timestampMs, 1234);
+  assert.equal(state.planLifecycle.sessionKey, "/repo:7");
+  assert.equal(state.planLifecycle.sessionEpoch, "epoch-7");
   assert.deepEqual(harness.logs, [
     {
       event: "plan_state_hydrated",
@@ -166,6 +170,53 @@ test("submit plan hydration applies hydrated state and resumes with skip flag", 
   ]);
 });
 
+test("submit plan hydration replaces a stale same-key lifecycle with the exact Session epoch", async () => {
+  const state = createState({
+    planLifecycle: {
+      schemaVersion: 2,
+      version: 8,
+      status: "empty",
+      sessionKey: "/repo:7",
+      sessionEpoch: "epoch-stale-container",
+      planTurnId: null,
+      artifactIdentity: null,
+      reviewIdentity: null,
+      approvalLease: null,
+      executionLease: null,
+      lastIssuedAttempt: 0,
+      execution: null,
+      pause: null,
+      updatedAt: 100,
+    },
+  });
+  const harness = createHarness(state);
+
+  await runSubmitPlanHydrationEffect({
+    reason: "existing_plan_execution",
+    text: "continue exact plan",
+    preferredLanguage: "en",
+    workspace: "/repo",
+    sendOriginSessionKey: "/repo:7",
+    sendOriginSessionEpoch: "epoch-7",
+    getState: harness.getState,
+    setState: harness.setState,
+    hydrateExistingPlanArtifactsForWorkspace: async () => hydratedPlan(),
+    derivePlanStageFromArtifacts: () => "ready_to_execute",
+    isSessionRuntimeOwnerActive: (_candidate, key, epoch) =>
+      key === "/repo:7" && epoch === "epoch-7",
+    resumeSubmission: harness.resumeSubmission.bind(harness),
+    logStoreEvent: harness.logStoreEvent.bind(harness),
+    nowMs: () => 1300,
+  });
+
+  assert.equal(state.planLifecycle.sessionKey, "/repo:7");
+  assert.equal(state.planLifecycle.sessionEpoch, "epoch-7");
+  assert.equal(state.planLifecycle.status, "drafting");
+  assert.equal(state.planLifecycle.approvalLease, null);
+  assert.equal(state.planLifecycle.executionLease, null);
+  assert.equal(harness.resumes.length, 1);
+});
+
 test("submit plan hydration skips async resume when origin session is inactive", async () => {
   const state = createState();
   const harness = createHarness(state);
@@ -178,11 +229,12 @@ test("submit plan hydration skips async resume when origin session is inactive",
     preferredLanguage: "en",
     workspace: "/repo",
     sendOriginSessionKey: "/repo:7",
+    sendOriginSessionEpoch: "epoch-7",
     getState: harness.getState,
     setState: harness.setState,
     hydrateExistingPlanArtifactsForWorkspace: async () => hydratedPlan(),
     derivePlanStageFromArtifacts: () => "idle",
-    isSessionRuntimeActive: () => false,
+    isSessionRuntimeOwnerActive: () => false,
     resumeSubmission: harness.resumeSubmission.bind(harness),
     logStoreEvent: harness.logStoreEvent.bind(harness),
   });
@@ -191,6 +243,60 @@ test("submit plan hydration skips async resume when origin session is inactive",
   assert.deepEqual(state.planArtifacts, []);
   assert.deepEqual(state.planTasks, []);
   assert.equal(state.planStage, "idle");
+  assert.deepEqual(harness.logs, [
+    {
+      event: "send_async_resume_skipped_inactive_session",
+      data: {
+        phase: "auto_plan_hydration",
+        sessionKey: "/repo:7",
+      },
+    },
+  ]);
+});
+
+test("submit plan hydration rejects a recreated Session with the same key but a new epoch", async () => {
+  const state = createState({
+    planLifecycle: {
+      sessionKey: "/repo:7",
+      sessionEpoch: "epoch-7",
+      status: "empty",
+    },
+  });
+  const harness = createHarness(state);
+  let finishHydration;
+  const hydrationPending = new Promise((resolve) => {
+    finishHydration = resolve;
+  });
+
+  const effect = runSubmitPlanHydrationEffect({
+    reason: "existing_plan_execution",
+    text: "continue exact plan",
+    preferredLanguage: "en",
+    workspace: "/repo",
+    sendOriginSessionKey: "/repo:7",
+    sendOriginSessionEpoch: "epoch-7",
+    getState: harness.getState,
+    setState: harness.setState,
+    hydrateExistingPlanArtifactsForWorkspace: async () => hydrationPending,
+    derivePlanStageFromArtifacts: () => "ready_to_execute",
+    isSessionRuntimeOwnerActive: (candidate, key, epoch) =>
+      candidate.planLifecycle?.sessionKey === key &&
+      candidate.planLifecycle?.sessionEpoch === epoch,
+    resumeSubmission: harness.resumeSubmission.bind(harness),
+    logStoreEvent: harness.logStoreEvent.bind(harness),
+  });
+
+  state.planLifecycle = {
+    ...state.planLifecycle,
+    sessionEpoch: "epoch-7-recreated",
+  };
+  finishHydration(hydratedPlan());
+  await effect;
+
+  assert.deepEqual(state.planArtifacts, []);
+  assert.deepEqual(state.planTasks, []);
+  assert.deepEqual(harness.resumes, []);
+  assert.equal(state.planLifecycle.sessionEpoch, "epoch-7-recreated");
   assert.deepEqual(harness.logs, [
     {
       event: "send_async_resume_skipped_inactive_session",

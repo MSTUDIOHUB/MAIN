@@ -1,3 +1,13 @@
+import {
+  doesLifecycleRetainPlanExecutionProvenance,
+  isPlanExecutionRunProvenanceForOwner,
+  normalizePlanExecutionRunProvenance,
+  type PlanExecutionRunProvenance,
+} from "./planExecutionProvenance";
+import type { HarnessRunMarker } from "./harnessCrashTelemetry";
+import { isHarnessMarkerOwnedByPlanExecution } from "./planExecutionOwnership";
+import type { PlanLifecycleState } from "./planLifecycle";
+
 export const ACTION_REQUEST_SCHEMA_VERSION = 1 as const;
 
 export type ActionRequestKind =
@@ -28,7 +38,27 @@ export interface ToolPermissionActionRequest extends ActionRequestBase {
   toolName: string;
   target: string;
   risk?: "local_file_read" | "browser_control" | "desktop_control" | "shell" | "write" | "external_write" | "unknown";
+  /** Immutable Plan-attempt provenance; once present this request may never downgrade to a generic continuation. */
+  readonly planExecution?: ToolPermissionPlanExecutionIdentity;
 }
+
+export type ToolPermissionPlanExecutionIdentity = PlanExecutionRunProvenance;
+
+export interface PendingPlanToolPermissionInvalidation {
+  readonly requestId: string;
+  readonly taskId: number;
+  readonly patch: Readonly<{
+    activeActionRequest: null;
+    pendingReviewResolve: null;
+    pendingReviewTaskId: null;
+    pendingToolCall: null;
+  }>;
+  readonly resolve: ((decision: { action: "reject" }) => unknown) | null;
+  /** Stops the stale Plan Run after the waiting review Promise is released. */
+  readonly abort: (() => void) | null;
+}
+
+const settledPlanToolPermissionInvalidations = new WeakSet<object>();
 
 export interface PlanReviewActionRequest extends ActionRequestBase {
   kind: "plan_review";
@@ -347,6 +377,105 @@ export function isExactToolPermissionResolutionIdentity(
     request.taskId === identity.taskId;
 }
 
+export function isToolPermissionPlanExecutionIdentityCurrent(
+  request: ToolPermissionActionRequest,
+  lifecycle: PlanLifecycleState | null | undefined,
+): boolean {
+  const identity = request.planExecution;
+  return !!identity && isPlanExecutionAttemptIdentityCurrentForRun({
+    identity,
+    owner: {
+      sessionKey: request.sessionKey,
+      turnId: request.turnId,
+      runId: request.runId,
+      parentRunId: request.parentRunId || null,
+    },
+    lifecycle,
+  });
+}
+
+export function isPlanExecutionAttemptIdentityCurrentForRun(input: {
+  identity: ToolPermissionPlanExecutionIdentity;
+  owner: {
+    sessionKey: string;
+    turnId: string;
+    runId: string;
+    parentRunId: string | null;
+  };
+  lifecycle: PlanLifecycleState | null | undefined;
+}): boolean {
+  const { identity, owner, lifecycle } = input;
+  return isPlanExecutionRunProvenanceForOwner(identity, owner) &&
+    doesLifecycleRetainPlanExecutionProvenance(lifecycle, identity);
+}
+
+/**
+ * Builds the single atomic invalidation patch for a pending Plan-owned tool
+ * review. Generic tool permissions deliberately return null and are not
+ * coupled to Plan artifact lifecycle changes.
+ */
+export function buildPendingPlanToolPermissionInvalidation(
+  state: {
+    activeActionRequest?: ActionRequest | null;
+    pendingReviewResolve?: ((decision: { action: "reject" }) => unknown) | null;
+    pendingReviewTaskId?: number | null;
+    abortController?: { abort: () => void; signal?: { aborted?: boolean } } | null;
+    planLifecycle?: PlanLifecycleState | null;
+    harnessRunMarker?: HarnessRunMarker | null;
+  },
+  shouldInvalidate: boolean,
+): PendingPlanToolPermissionInvalidation | null {
+  const request = state.activeActionRequest;
+  if (
+    !shouldInvalidate ||
+    request?.kind !== "tool_permission" ||
+    !request.planExecution
+  ) return null;
+  const resolve =
+    state.pendingReviewTaskId === request.taskId &&
+    typeof state.pendingReviewResolve === "function"
+      ? state.pendingReviewResolve
+      : null;
+  const ownsPlanExecution = isHarnessMarkerOwnedByPlanExecution({
+    lifecycle: state.planLifecycle,
+    marker: state.harnessRunMarker,
+  });
+  return {
+    requestId: request.requestId,
+    taskId: request.taskId,
+    patch: {
+      activeActionRequest: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+    },
+    resolve,
+    abort:
+      ownsPlanExecution &&
+      state.abortController &&
+      state.abortController.signal?.aborted !== true
+        ? () => state.abortController?.abort()
+        : null,
+  };
+}
+
+export function settlePendingPlanToolPermissionInvalidation(
+  invalidation: PendingPlanToolPermissionInvalidation | null | undefined,
+): boolean {
+  if (!invalidation || settledPlanToolPermissionInvalidations.has(invalidation)) return false;
+  settledPlanToolPermissionInvalidations.add(invalidation);
+  let settled = false;
+  try {
+    if (invalidation.resolve) {
+      const result = invalidation.resolve({ action: "reject" });
+      settled = result !== false;
+    }
+  } finally {
+    invalidation.abort?.();
+  }
+  return settled;
+}
+
 export function clearActionRequestOfKind(
   request: ActionRequest | null | undefined,
   kind: ActionRequestKind,
@@ -447,6 +576,16 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
     const taskId = Number(record.taskId);
     const toolName = normalizeNonEmptyString(record.toolName);
     if (!Number.isFinite(taskId) || !toolName) return null;
+    let planExecution: ToolPermissionPlanExecutionIdentity | undefined;
+    if (record.planExecution !== undefined) {
+      planExecution = normalizePlanExecutionRunProvenance(record.planExecution) || undefined;
+      if (!planExecution || !isPlanExecutionRunProvenanceForOwner(planExecution, {
+        sessionKey,
+        turnId,
+        runId,
+        parentRunId: base.parentRunId || null,
+      })) return null;
+    }
     return {
       ...base,
       kind,
@@ -454,6 +593,7 @@ export function normalizeActionRequest(value: unknown): ActionRequest | null {
       toolName,
       target: normalizeNonEmptyString(record.target) || toolName,
       ...(typeof record.risk === "string" ? { risk: record.risk as ToolPermissionActionRequest["risk"] } : {}),
+      ...(planExecution ? { planExecution } : {}),
     };
   }
   if (kind === "plan_review") {

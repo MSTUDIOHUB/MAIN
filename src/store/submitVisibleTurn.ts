@@ -45,6 +45,7 @@ export interface ApplySubmitVisibleTurnInput {
   preferredLanguage: "zh" | "en";
   preservePlanState: boolean;
   shouldGrantExecutionConsentForTurn: boolean;
+  requiresPlanExecutionAdmission?: boolean;
 }
 
 export interface ApplySubmitVisibleTurnResult {
@@ -145,6 +146,7 @@ export function applySubmitVisibleTurn(
       effectiveWorkflowMode: input.effectiveWorkflowMode,
       preservePlanState: input.preservePlanState,
       shouldGrantExecutionConsentForTurn: input.shouldGrantExecutionConsentForTurn,
+      requiresPlanExecutionAdmission: input.requiresPlanExecutionAdmission,
       currentConfig: s.config,
     }),
   );

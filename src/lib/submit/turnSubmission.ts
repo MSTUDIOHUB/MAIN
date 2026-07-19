@@ -1037,6 +1037,8 @@ export interface SubmitRunStatePatchInput<TConfig extends object> {
   effectiveWorkflowMode: LegacyWorkflowMode;
   preservePlanState: boolean;
   shouldGrantExecutionConsentForTurn: boolean;
+  /** Plan execution authority is consumed only after Harness admission. */
+  requiresPlanExecutionAdmission?: boolean;
   currentConfig: TConfig;
 }
 
@@ -1498,9 +1500,17 @@ export function resolveSubmitRuntimeDecision(params: {
   isLocalStudioCommand: boolean;
   goalCreationAuthorization?: GoalCreationAuthorization | null;
   goalContinuationAuthorization?: GoalContinuationAuthorization | null;
+  /** A reserved Plan attempt must not inherit generic auto-approval. */
+  requiresPlanExecutionAdmission?: boolean;
 }): SubmitRuntimeDecision {
+  // The exact, one-shot Goal continuation capability is itself runtime
+  // authority. Replays (for example after a failed history clear) must not
+  // silently fall back to a chat/respond runtime merely because the caller did
+  // not duplicate that authority as a runtimeIntentOverride.
   const requestedRuntimeRunIntent =
-    params.runtimeIntentOverride ||
+    isGoalContinuationAuthorization(params.goalContinuationAuthorization)
+      ? "goal"
+      : params.runtimeIntentOverride ||
     (params.shouldExecuteOnceFromReplyOption && params.effectiveRunIntent !== "plan"
       ? params.currentMainModeKey === "game_studio" ? "studio_workflow" : "execute"
       : params.effectiveRunIntent);
@@ -1519,9 +1529,11 @@ export function resolveSubmitRuntimeDecision(params: {
     runtimeRunIntent,
     effectiveDisplayIntent,
     shouldGrantExecutionConsentForTurn:
-      params.executionConsentGranted === true ||
-      params.shouldExecuteOnceFromReplyOption ||
-      params.autoApproveTools === true,
+      params.requiresPlanExecutionAdmission !== true && (
+        params.executionConsentGranted === true ||
+        params.shouldExecuteOnceFromReplyOption ||
+        params.autoApproveTools === true
+      ),
     initialTurnStatus:
       params.effectiveRunIntent === "plan" && !params.isPlanApproved
         ? "planning"
@@ -2591,6 +2603,9 @@ export function buildSubmitLocalStudioTurnPatch(
 export function buildSubmitRunStatePatch<TConfig extends object>(
   params: SubmitRunStatePatchInput<TConfig>,
 ): SubmitRunStatePatch<TConfig> {
+  const shouldGrantExecutionConsentForTurn =
+    params.shouldGrantExecutionConsentForTurn &&
+    params.requiresPlanExecutionAdmission !== true;
   return {
     currentTurnId: params.turnId,
     input: params.isHidden ? params.currentInput : "",
@@ -2625,10 +2640,10 @@ export function buildSubmitRunStatePatch<TConfig extends object>(
           planAutoResumeCount: 0,
           planExecutionProgressSnapshot: null,
         }),
-    ...(params.shouldGrantExecutionConsentForTurn
+    ...(shouldGrantExecutionConsentForTurn
       ? { currentTurnExecutionConsent: { turnId: params.turnId, granted: true } as const }
       : {}),
-    ...(params.preservePlanState && params.shouldGrantExecutionConsentForTurn
+    ...(params.preservePlanState && shouldGrantExecutionConsentForTurn
       ? {
           pendingPlanApprovalHandoff: null,
           planApprovalExecutionStartedForTurnId: params.turnId,

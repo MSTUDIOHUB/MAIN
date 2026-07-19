@@ -49,10 +49,7 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const {
-  buildTrustedPlanResumePrompt,
-  runSubmitPlanExecutionResumeEffect,
-} = loadTranspiledModuleSync(
+const { runSubmitPlanExecutionResumeEffect } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"),
 );
 
@@ -61,38 +58,7 @@ function planArtifact(overrides = {}) {
     kind: "plan",
     path: ".MAIN/plans/plan.md",
     title: "Plan",
-    content: [
-      "# Plan restore execution contract",
-      "",
-      "## User goal",
-      "- Resume an approved implementation without losing its task identity.",
-      "",
-      "## Summary",
-      "- Read `src/App.tsx` and confirmed it owns the restored view.",
-      "",
-      "## Read evidence",
-      "- `src/App.tsx`: the component renders the restored view.",
-      "",
-      "## Key changes",
-      "- Modify `src/App.tsx` so the restored view renders the approved state.",
-      "",
-      "## Public APIs / interfaces / types",
-      "- Keep the existing component props unchanged.",
-      "",
-      "## Execution steps",
-      "1. Update the restored rendering branch in `src/App.tsx`.",
-      "2. Run the focused verification command.",
-      "",
-      "## Validation criteria",
-      "- The restored view renders the approved state.",
-      "",
-      "## Test plan",
-      "- Run `npm test` and require a zero exit code.",
-      "",
-      "## Assumptions and defaults",
-      "- Preserve unrelated rendering behavior.",
-      "",
-    ].join("\n"),
+    content: "# Plan\n\n## Execution steps\n1. Update `src/App.tsx`.\n",
     updatedAt: 1,
     ...overrides,
   };
@@ -101,7 +67,7 @@ function planArtifact(overrides = {}) {
 function planTask(overrides = {}) {
   return {
     id: "task-1",
-    text: "Modify src/App.tsx so the restored view renders the approved state",
+    text: "Update src/App.tsx",
     status: "pending",
     executionKind: "mutation",
     evidenceStatus: "missing",
@@ -111,29 +77,17 @@ function planTask(overrides = {}) {
   };
 }
 
-function validationTask(overrides = {}) {
-  return {
-    id: "task-validate",
-    text: "Run verification command `npm test`",
-    status: "pending",
-    executionKind: "validation",
-    evidenceStatus: "missing",
-    source: "runtime",
-    commands: ["npm test"],
-    evidence: [{ kind: "cmd", value: "npm test" }],
-    ...overrides,
-  };
-}
-
 function progressSnapshot(overrides = {}) {
   return {
-    turnId: "turn-plan",
-    phase: "paused",
+    turnId: "turn-old",
+    runId: "run-old",
+    parentRunId: "run-parent-old",
+    phase: "executing",
     currentTaskId: "task-1",
-    currentTask: "Modify src/App.tsx so the restored view renders the approved state",
-    currentTool: "",
+    currentTask: "Update src/App.tsx",
+    currentTool: "write_file",
     latestEvidence: "",
-    nextStep: "Apply the approved mutation",
+    nextStep: "Continue old Run",
     iteration: 2,
     maxIterations: 50,
     autoResumeCount: 0,
@@ -145,14 +99,11 @@ function progressSnapshot(overrides = {}) {
 function createState(overrides = {}) {
   return {
     currentWorkspace: "/repo",
-    currentTurnId: "turn-plan",
     planArtifacts: [],
     planTasks: [],
     planStage: "idle",
-    planExecutionEvidenceLedger: [],
     planExecutionProgressSnapshot: null,
     isPlanApproved: false,
-    conversationTurns: [{ id: "turn-plan", userPrompt: "Continue the approved plan" }],
     ...overrides,
   };
 }
@@ -161,7 +112,8 @@ function createHarness(state) {
   return {
     preRunPatches: [],
     logs: [],
-    resumes: [],
+    blocked: [],
+    dispatches: [],
     setState(patch) {
       const next = typeof patch === "function" ? patch(state) : patch;
       if (next && typeof next === "object") Object.assign(state, next);
@@ -173,36 +125,43 @@ function createHarness(state) {
     logStoreEvent(event, data) {
       this.logs.push({ event, data });
     },
-    resumeSubmission(text, images, options) {
-      this.resumes.push({ text, images, options });
+    onResumeBlocked(message, detail) {
+      this.blocked.push({ message, detail });
+    },
+    resumeSubmission(...args) {
+      this.dispatches.push(args);
     },
   };
 }
 
-test("plan execution resume hydrates plan state and restarts the target logical turn", async () => {
-  const state = createState();
+test("disk hydration is discovery-only and cannot dispatch or inherit execution authority", async () => {
+  const state = createState({
+    isPlanApproved: true,
+    planStage: "executing",
+  });
   const harness = createHarness(state);
-  const hydratedTask = planTask();
-  const hydratedValidation = validationTask();
+  const task = planTask();
 
-  await runSubmitPlanExecutionResumeEffect({
+  const result = await runSubmitPlanExecutionResumeEffect({
     text: "继续执行计划",
-    images: ["ignored-image"],
+    images: ["must-not-be-forwarded"],
     preferredLanguage: "zh",
     shouldRouteContinuationToPlanResume: true,
-    uiParentTurnId: "turn-parent",
+    uiParentTurnId: "turn-old",
     commandDirective: { kind: "control", action: "resume_plan_execution" },
     getState: () => state,
     setState: harness.setState.bind(harness),
     applyPreRunSessionPatch: harness.applyPreRunSessionPatch.bind(harness),
     hydrateExistingPlanArtifactsForWorkspace: async () => ({
       artifacts: [planArtifact()],
-      tasks: [hydratedTask, hydratedValidation],
-      hasTasksArtifact: true,
+      tasks: [task],
+      hasTasksArtifact: false,
     }),
-    ensureApprovedPlanRuntimeTasksForState: () => [hydratedTask, hydratedValidation],
+    // Adversarial legacy callback: discovery must never invoke it even when a
+    // caller still carries the pre-refactor field at runtime.
     resumeSubmission: harness.resumeSubmission.bind(harness),
     logStoreEvent: harness.logStoreEvent.bind(harness),
+    onResumeBlocked: harness.onResumeBlocked.bind(harness),
   });
 
   assert.deepEqual(harness.preRunPatches, [
@@ -214,61 +173,44 @@ test("plan execution resume hydrates plan state and restarts the target logical 
       pendingRunDecision: null,
     },
   ]);
-  assert.equal(state.isPlanApproved, true);
-  assert.equal(state.planApprovalChoice, "继续执行计划");
-  assert.equal(state.planStage, "executing");
+  assert.equal(result.kind, "discovery_only");
+  assert.equal(result.reason, "plan_resume_requires_explicit_turn_approval");
+  assert.equal(result.requiresTurnAdmission, true);
+  assert.equal(result.requiresApproval, true);
+  assert.equal(result.artifactCount, 1);
+  assert.equal(result.taskCount, 1);
+  assert.equal(state.isPlanApproved, false);
+  assert.equal(state.planApprovalChoice, null);
+  assert.equal(state.planStage, "plan");
   assert.equal(state.showPlanPanel, true);
   assert.equal(state.rightPanelTab, "plan");
   assert.equal(state.showDiff, false);
-  assert.deepEqual(harness.logs, [
-    {
-      event: "existing_plan_hydrated_for_execution",
-      data: {
-        workspace: "/repo",
-        reusedExistingState: false,
-        artifacts: [".MAIN/plans/plan.md"],
-        taskCount: 2,
-      },
-    },
+  assert.equal(harness.dispatches.length, 0);
+  assert.equal(harness.blocked.length, 1);
+  assert.match(harness.blocked[0].message, /新的工作区回合/);
+  assert.deepEqual(harness.logs.map((entry) => entry.event), [
+    "existing_plan_discovered_for_review",
+    "existing_plan_resume_requires_explicit_turn_approval",
   ]);
-  assert.equal(harness.resumes.length, 1);
-  assert.match(harness.resumes[0].text, /请在新的恢复上下文中继续执行计划/);
-  assert.match(harness.resumes[0].text, /Modify src\/App\.tsx/);
-  assert.equal(harness.resumes[0].images, undefined);
-  assert.deepEqual(harness.resumes[0].options, {
-    hidden: true,
-    createVisibleTurnForHiddenMessage: false,
-    reuseCurrentTurn: true,
-    turnIdOverride: "turn-parent",
-    preservePlanState: true,
-    resolvedIntent: "execute",
-    commandDirective: { kind: "control", action: "resume_plan_execution" },
-    executionConsentGranted: true,
-    skipIntentResolution: true,
-    turnTitle: "计划执行恢复",
-    intentSummary: "从已批准计划的剩余任务继续执行。",
-  });
 });
 
-test("plan execution resume reuses existing plan state without rehydrating", async () => {
-  const existingTask = planTask({ id: "existing-task" });
+test("in-memory discovery never rehydrates or reuses a stale Turn/Run checkpoint", async () => {
+  const task = planTask();
   const state = createState({
     planArtifacts: [planArtifact()],
-    planTasks: [existingTask, validationTask()],
-    planStage: "ready_to_execute",
+    planTasks: [task],
+    planStage: "executing",
     isPlanApproved: true,
-    planExecutionProgressSnapshot: progressSnapshot({
-      currentTaskId: "existing-task",
-      currentTask: existingTask.text,
-    }),
+    planExecutionProgressSnapshot: progressSnapshot(),
   });
   const harness = createHarness(state);
   let hydrateCalls = 0;
 
-  await runSubmitPlanExecutionResumeEffect({
+  const result = await runSubmitPlanExecutionResumeEffect({
     text: "continue plan",
     preferredLanguage: "en",
     shouldRouteContinuationToPlanResume: true,
+    uiParentTurnId: "turn-old",
     commandDirective: null,
     getState: () => state,
     setState: harness.setState.bind(harness),
@@ -277,37 +219,28 @@ test("plan execution resume reuses existing plan state without rehydrating", asy
       hydrateCalls += 1;
       return { artifacts: [], tasks: [], hasTasksArtifact: false };
     },
-    ensureApprovedPlanRuntimeTasksForState: () => [],
     resumeSubmission: harness.resumeSubmission.bind(harness),
     logStoreEvent: harness.logStoreEvent.bind(harness),
+    onResumeBlocked: harness.onResumeBlocked.bind(harness),
   });
 
   assert.equal(hydrateCalls, 0);
-  assert.equal(state.planStage, "executing");
+  assert.equal(result.reason, "plan_resume_requires_explicit_turn_approval");
+  assert.equal(state.isPlanApproved, false);
+  assert.equal(state.planStage, "plan");
+  assert.equal(state.planExecutionProgressSnapshot.turnId, "turn-old");
+  assert.equal(state.planExecutionProgressSnapshot.runId, "run-old");
+  assert.equal(state.planExecutionProgressSnapshot.phase, "paused");
+  assert.match(state.planExecutionProgressSnapshot.nextStep, /new workspace Turn/);
   assert.equal(harness.logs[0].data.reusedExistingState, true);
-  assert.equal(harness.logs[0].data.taskCount, 2);
-  assert.equal(harness.resumes.length, 1);
-  assert.match(harness.resumes[0].text, /Continue plan execution in a fresh recovery context/);
-  assert.equal(harness.resumes[0].options.turnTitle, "Plan Execution Resume");
-  assert.equal(harness.resumes[0].options.reuseCurrentTurn, true);
-  assert.equal(harness.resumes[0].options.turnIdOverride, "turn-plan");
-  assert.equal(state.planExecutionProgressSnapshot.currentTaskId, "existing-task");
+  assert.equal(harness.dispatches.length, 0);
 });
 
-test("plan execution resume revokes an invalid old Plan while preserving its audit artifact", async () => {
-  const invalidPlan = planArtifact({
-    content: "# Plan\n\n## Key changes\n- Modify `src/App.tsx`.",
-  });
-  const state = createState({
-    planArtifacts: [invalidPlan],
-    planTasks: [planTask(), validationTask()],
-    planStage: "executing",
-    isPlanApproved: true,
-  });
+test("missing reviewable artifacts return a visible approval requirement with zero dispatch", async () => {
+  const state = createState();
   const harness = createHarness(state);
-  const blocked = [];
 
-  await runSubmitPlanExecutionResumeEffect({
+  const result = await runSubmitPlanExecutionResumeEffect({
     text: "continue plan",
     preferredLanguage: "en",
     shouldRouteContinuationToPlanResume: true,
@@ -315,100 +248,67 @@ test("plan execution resume revokes an invalid old Plan while preserving its aud
     getState: () => state,
     setState: harness.setState.bind(harness),
     applyPreRunSessionPatch: harness.applyPreRunSessionPatch.bind(harness),
-    hydrateExistingPlanArtifactsForWorkspace: async () => {
-      throw new Error("reviewable in-memory Plan must be audited before any disk fallback");
-    },
-    ensureApprovedPlanRuntimeTasksForState: () => [planTask(), validationTask()],
+    hydrateExistingPlanArtifactsForWorkspace: async () => ({
+      artifacts: [],
+      tasks: [],
+      hasTasksArtifact: false,
+    }),
     resumeSubmission: harness.resumeSubmission.bind(harness),
     logStoreEvent: harness.logStoreEvent.bind(harness),
-    onResumeBlocked: (message, detail) => blocked.push({ message, detail }),
+    onResumeBlocked: harness.onResumeBlocked.bind(harness),
   });
 
+  assert.equal(result.reason, "plan_resume_artifact_not_found");
+  assert.match(result.message, /No reviewable existing plan/);
   assert.equal(state.isPlanApproved, false);
   assert.equal(state.planStage, "plan");
-  assert.equal(state.planArtifacts.length, 1);
-  assert.equal(state.planArtifacts[0].content, invalidPlan.content);
-  assert.equal(state.planExecutionProgressSnapshot, null);
-  assert.equal(harness.resumes.length, 0);
-  assert.equal(blocked.length, 1);
-  assert.match(blocked[0].message, /kept it as an audit record/);
-  assert.equal(harness.logs.at(-1).event, "existing_plan_resume_revalidation_blocked");
+  assert.equal(harness.dispatches.length, 0);
+  assert.equal(harness.blocked.length, 1);
 });
 
-test("plan execution resume pauses when the checkpoint turn or run owner is stale", async () => {
-  for (const mismatch of ["turn", "run"]) {
-    const task = planTask();
-    const snapshot = progressSnapshot({
-      ...(mismatch === "turn" ? { turnId: "turn-stale" } : {}),
-      ...(mismatch === "run" ? { runId: "run-stale", parentRunId: "run-parent" } : {}),
-    });
-    const state = createState({
-      planArtifacts: [planArtifact()],
-      planTasks: [task, validationTask()],
-      planStage: "executing",
-      isPlanApproved: true,
-      planExecutionProgressSnapshot: snapshot,
-      harnessRunMarker: mismatch === "run"
-        ? {
-            runId: "outer-run",
-            activeRunId: "run-current",
-            activeParentRunId: "run-parent",
-            turnId: "turn-plan",
-          }
-        : null,
-    });
-    const harness = createHarness(state);
-    const blocked = [];
+test("hydration errors close as a visible discovery result instead of starting execution", async () => {
+  const state = createState();
+  const harness = createHarness(state);
 
-    await runSubmitPlanExecutionResumeEffect({
-      text: "continue plan",
-      preferredLanguage: "en",
-      shouldRouteContinuationToPlanResume: true,
-      commandDirective: null,
-      getState: () => state,
-      setState: harness.setState.bind(harness),
-      applyPreRunSessionPatch: harness.applyPreRunSessionPatch.bind(harness),
-      hydrateExistingPlanArtifactsForWorkspace: async () => {
-        throw new Error("valid in-memory Plan should not rehydrate");
-      },
-      ensureApprovedPlanRuntimeTasksForState: () => [task, validationTask()],
-      resumeSubmission: harness.resumeSubmission.bind(harness),
-      logStoreEvent: harness.logStoreEvent.bind(harness),
-      onResumeBlocked: (message, detail) => blocked.push({ message, detail }),
-    });
-
-    assert.equal(state.isPlanApproved, false, mismatch);
-    assert.equal(state.planStage, "plan", mismatch);
-    assert.equal(harness.resumes.length, 0, mismatch);
-    assert.equal(blocked.length, 1, mismatch);
-    assert.equal(
-      blocked[0].detail.reason,
-      mismatch === "turn"
-        ? "plan_resume_progress_owner_mismatch"
-        : "plan_resume_progress_run_owner_mismatch",
-      mismatch,
-    );
-  }
-});
-
-test("trusted plan resume prompt summarizes evidence and remaining tasks", () => {
-  const prompt = buildTrustedPlanResumePrompt({
-    language: "en",
-    hasTasksArtifact: false,
-    tasks: [planTask()],
-    artifacts: [planArtifact()],
-    evidenceLedger: [
-      {
-        kind: "cmd",
-        value: "npm test",
-        target: "npm test",
-        sourceTool: "run_command",
-      },
-    ],
+  const result = await runSubmitPlanExecutionResumeEffect({
+    text: "继续执行计划",
+    preferredLanguage: "zh",
+    shouldRouteContinuationToPlanResume: true,
+    commandDirective: null,
+    getState: () => state,
+    setState: harness.setState.bind(harness),
+    applyPreRunSessionPatch: harness.applyPreRunSessionPatch.bind(harness),
+    hydrateExistingPlanArtifactsForWorkspace: async () => {
+      throw new Error("disk unavailable");
+    },
+    resumeSubmission: harness.resumeSubmission.bind(harness),
+    logStoreEvent: harness.logStoreEvent.bind(harness),
+    onResumeBlocked: harness.onResumeBlocked.bind(harness),
   });
 
-  assert.match(prompt, /Plan artifact summary:/);
-  assert.match(prompt, /Recent trusted execution evidence:/);
-  assert.match(prompt, /cmd:npm test \(run_command\)/);
-  assert.match(prompt, /Priority recovery tasks:/);
+  assert.equal(result.reason, "plan_resume_discovery_unavailable");
+  assert.match(result.message, /执行保持暂停/);
+  assert.match(result.message, /disk unavailable/);
+  assert.equal(state.isPlanApproved, false);
+  assert.equal(state.planStage, "plan");
+  assert.equal(harness.dispatches.length, 0);
+  assert.deepEqual(harness.logs.map((entry) => entry.event), [
+    "existing_plan_discovery_unavailable",
+  ]);
+  assert.equal(harness.blocked.length, 1);
+});
+
+test("legacy resume source contains no execution grant or hidden dispatch path", () => {
+  const source = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/store/submitPlanExecutionResume.ts"),
+    "utf8",
+  );
+
+  assert.doesNotMatch(source, /resumeSubmission\s*\(/);
+  assert.doesNotMatch(source, /executionConsentGranted\s*:\s*true/);
+  assert.doesNotMatch(source, /isPlanApproved\s*:\s*true/);
+  assert.doesNotMatch(source, /reuseCurrentTurn/);
+  assert.doesNotMatch(source, /turnIdOverride/);
+  assert.match(source, /requiresTurnAdmission:\s*true/);
+  assert.match(source, /existing_plan_discovered_for_review/);
 });

@@ -514,9 +514,17 @@ export function isPlanReviewExecutionLeaseActive(input: {
 interface ApprovedPlanFallbackHandoffLike {
   planTurnId: string;
   requestedAt: number;
-  executionTurnId?: string;
-  planRevision?: number;
-  artifactHash?: string;
+  approvalLeaseId: string;
+  executionLeaseId: string;
+  sessionEpoch: string;
+  reviewRequestId: string;
+  executionTurnId: string;
+  executionRunId: string;
+  executionAttempt: number;
+  executionInstructionHash: string;
+  parentRunId: string | null;
+  planRevision: number;
+  artifactHash: string;
 }
 
 export function resolveApprovedPlanSameTurnFallbackDecision(input: {
@@ -524,16 +532,15 @@ export function resolveApprovedPlanSameTurnFallbackDecision(input: {
   currentSessionKey: string | null;
   expectedHandoff: ApprovedPlanFallbackHandoffLike;
   currentHandoff: ApprovedPlanFallbackHandoffLike | null | undefined;
-  isPlanApproved: boolean;
-  executionStartedForTurnId: string | null | undefined;
+  hasExactPlanApprovalHandoff: boolean;
   isAgentBusy: boolean;
   busyRetryAttempt: number;
   maxBusyRetries?: number;
 }): ApprovedPlanSameTurnFallbackDecision {
   if (input.currentSessionKey !== input.expectedSessionKey) return "session_changed";
 
-  const expectedExecutionTurnId = input.expectedHandoff.executionTurnId || input.expectedHandoff.planTurnId;
-  const currentExecutionTurnId = input.currentHandoff?.executionTurnId || input.currentHandoff?.planTurnId;
+  const expectedExecutionTurnId = input.expectedHandoff.executionTurnId;
+  const currentExecutionTurnId = input.currentHandoff?.executionTurnId;
   const exactArtifactIdentity =
     !input.expectedHandoff.artifactHash ||
     (
@@ -543,13 +550,29 @@ export function resolveApprovedPlanSameTurnFallbackDecision(input: {
         input.currentHandoff?.planRevision === input.expectedHandoff.planRevision
       )
     );
+  const exactApprovalLease =
+    !!input.expectedHandoff.approvalLeaseId &&
+    input.currentHandoff?.approvalLeaseId === input.expectedHandoff.approvalLeaseId &&
+    !!input.expectedHandoff.sessionEpoch &&
+    input.currentHandoff?.sessionEpoch === input.expectedHandoff.sessionEpoch &&
+    !!input.expectedHandoff.reviewRequestId &&
+    input.currentHandoff?.reviewRequestId === input.expectedHandoff.reviewRequestId;
+  const exactExecutionLease =
+    !!input.expectedHandoff.executionLeaseId &&
+    input.currentHandoff?.executionLeaseId === input.expectedHandoff.executionLeaseId &&
+    !!input.expectedHandoff.executionRunId &&
+    input.currentHandoff?.executionRunId === input.expectedHandoff.executionRunId &&
+    input.currentHandoff?.parentRunId === input.expectedHandoff.parentRunId &&
+    input.currentHandoff?.executionAttempt === input.expectedHandoff.executionAttempt &&
+    input.currentHandoff?.executionInstructionHash === input.expectedHandoff.executionInstructionHash;
   const isExactPendingTransition =
-    input.isPlanApproved &&
+    input.hasExactPlanApprovalHandoff &&
     input.currentHandoff?.planTurnId === input.expectedHandoff.planTurnId &&
     input.currentHandoff?.requestedAt === input.expectedHandoff.requestedAt &&
     currentExecutionTurnId === expectedExecutionTurnId &&
     exactArtifactIdentity &&
-    input.executionStartedForTurnId !== input.expectedHandoff.planTurnId;
+    exactApprovalLease &&
+    exactExecutionLease;
   if (!isExactPendingTransition) return "transition_stale";
 
   if (!input.isAgentBusy) return "start";

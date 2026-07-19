@@ -130,8 +130,27 @@ import {
 import { hasReviewablePlanArtifact, normalizePlanApprovalChoice } from "../lib/planControl";
 import {
   buildPlanApprovalIdentity,
+  buildPlanExecutionInstructionHash,
   isPlanApprovalIdentityCurrent,
 } from "../lib/planApprovalIdentity";
+import {
+  PLAN_LIFECYCLE_SCHEMA_VERSION,
+  applyPlanArtifactIdentity,
+  applyPlanLifecyclePause,
+  applyPlanReviewIdentity,
+  createPlanLifecycleState,
+  createPlanLifecycleSessionEpoch,
+  ensurePlanLifecycleOwner,
+  isPlanApprovalLeaseBoundToState,
+  isPlanLifecycleExecutionAuthorized,
+  migrateLegacyPlanLifecycle,
+  reducePlanLifecycle,
+  type PlanApprovalLease,
+  type PlanArtifactIdentity,
+  type PlanExecutionLease,
+  type PlanLifecycleState,
+  type PlanReviewIdentity,
+} from "../lib/planLifecycle";
 import {
   buildPlanExecutionProgressUpdate,
   isPlanReviewExecutionLeaseActive,
@@ -139,8 +158,11 @@ import {
   resolveRestoredPlanExecutionTaskIdentity,
   resolveApprovedPlanInitialExecutionRecovery,
   resolveApprovedPlanSameTurnFallbackDecision,
-  toPlanExecutionRuntimeProgressUpdate,
 } from "../lib/planExecutionRecovery";
+import {
+  claimPlanExecutionDispatch,
+  releasePlanExecutionDispatch,
+} from "../lib/planExecutionDispatchClaim";
 import {
   type AttachedFile,
   normalizeAttachedFile,
@@ -164,19 +186,25 @@ import {
 } from "../lib/goalResumeBoundary";
 import { resolveGoalEventOwnerIdentity } from "../lib/goalEventIdentity";
 import {
+  buildPendingPlanToolPermissionInvalidation,
   buildPlanReviewActionRequest,
   clearGoalConfirmationActionRequest,
   isCurrentGoalAdministrativeControl,
   isCurrentGoalControlResolution,
   isExactToolPermissionResolutionIdentity,
+  isToolPermissionPlanExecutionIdentityCurrent,
   isToolPermissionActionRequest,
   normalizeActionRequest,
+  settlePendingPlanToolPermissionInvalidation,
   type ActionRequest,
+  type PendingPlanToolPermissionInvalidation,
   type ToolPermissionResolutionIdentity,
   type UserChoiceResolutionIdentity,
   type PlanReviewResolutionIdentity,
   type GoalControlIdentity,
 } from "../lib/actionRequest";
+import { issuePlanExplicitResumeAttempt } from "../lib/planExecutionContinuation";
+import { isHarnessMarkerOwnedByPlanExecution } from "../lib/planExecutionOwnership";
 import {
   isInternalUnapprovedPlanChoiceRestore,
   restorePendingActionRequest,
@@ -332,6 +360,7 @@ import {
   type SessionCancellationSettlement,
 } from "./sessionCancellationBarrier";
 import {
+  revokeAllSessionRuntimesBeforeSettingsReset,
   revokeSessionRuntimeBeforeDelete,
   revokeWorkspaceSessionRuntimesBeforeClear,
 } from "./sessionRuntimeRevocation";
@@ -868,6 +897,27 @@ export type { MCPServer, MCPTool } from "../lib/mcpClient";
 
 export type WebSearchProvider = "duckduckgo" | "bing" | "baidu";
 
+const UNBOUND_PLAN_SESSION_KEY = "__MAIN_UNBOUND_PLAN_SESSION__";
+const UNBOUND_PLAN_SESSION_EPOCH = "__MAIN_UNBOUND_PLAN_EPOCH__";
+
+function createEmptyPlanLifecycleForSession(
+  sessionKey: string | null | undefined,
+  options?: { sessionEpoch?: string; now?: number },
+): PlanLifecycleState {
+  const normalizedSessionKey = String(sessionKey || "").trim() || UNBOUND_PLAN_SESSION_KEY;
+  const now = options?.now ?? Date.now();
+  const sessionEpoch = String(options?.sessionEpoch || "").trim() || (
+    normalizedSessionKey === UNBOUND_PLAN_SESSION_KEY
+      ? UNBOUND_PLAN_SESSION_EPOCH
+      : createPlanLifecycleSessionEpoch(now)
+  );
+  return createPlanLifecycleState({
+    sessionKey: normalizedSessionKey,
+    sessionEpoch,
+    updatedAt: now,
+  });
+}
+
 function normalizeWebSearchProvider(value: unknown): WebSearchProvider {
   return value === "bing" || value === "baidu" ? value : "duckduckgo";
 }
@@ -897,6 +947,7 @@ export interface SessionRuntimeSnapshot {
   planExecutionEvidenceCount: number;
   planAutoResumeCount?: number;
   planExecutionProgressSnapshot?: PlanExecutionProgressSnapshot | null;
+  planLifecycle?: PlanLifecycleState;
   planStage: PlanStage;
   isPlanApproved: boolean;
   planApprovalChoice?: string | null;
@@ -949,6 +1000,7 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
   readOnlyAutoApproveForSession: boolean;
   queuedUserMessage: QueuedUserMessage | null;
   activeGuidance: ActiveGuidance | null;
+  planLifecycle: PlanLifecycleState;
   planApprovalChoice: string | null;
   pendingPlanApprovalHandoff: PlanApprovalHandoff | null;
   planApprovalExecutionStartedForTurnId: string | null;
@@ -980,6 +1032,8 @@ export interface SessionRuntimeState extends SessionRuntimeSnapshot {
 
 export interface Session {
   id: number;
+  /** Container-owned Plan generation; runtime snapshots cannot self-assert it. */
+  planLifecycleEpoch?: string;
   title: string;
   date: string;
   active: boolean;
@@ -1103,7 +1157,7 @@ export interface AppState {
   stopSubagent: (subagentId: string) => boolean;
   stopAllSubagents: () => number;
   dismissEndedSubagents: () => number;
-  ensurePlanArtifactsHydratedForWorkspace: (options?: { openPanel?: boolean; reason?: string; promoteTasksToExecuting?: boolean }) => Promise<boolean>;
+  ensurePlanArtifactsHydratedForWorkspace: (options?: { openPanel?: boolean; reason?: string }) => Promise<boolean>;
   openPlanWorkspacePanel: () => Promise<boolean>;
   closeRightPanel: () => void;
   setRightPanelWidth: (w: number) => void;
@@ -1287,6 +1341,7 @@ export interface AppState {
   resetAllSettings: () => void;
 
   // Workflow mode
+  planLifecycle: PlanLifecycleState;
   isPlanApproved: boolean;
   planApprovalChoice: string | null;
   planArtifacts: PlanArtifact[];
@@ -1304,7 +1359,6 @@ export interface AppState {
   harnessRunMarker: HarnessRunMarker | null;
   activeActionRequest: ActionRequest | null;
   setWorkflowMode: (mode: "chat" | "edit" | "plan") => void;
-  setIsPlanApproved: (v: boolean) => void;
   setPlanStage: (stage: PlanStage) => void;
   upsertPlanArtifact: (artifact: PlanArtifact) => void;
   clearPlanArtifacts: () => void;
@@ -1313,6 +1367,7 @@ export interface AppState {
   setPlanTasks: (tasks: PlanTask[]) => void;
   setNormalizedStreamState: (state: NormalizedStreamState) => void;
   approvePlan: (approvalChoice?: string, expected?: PlanReviewResolutionIdentity) => void;
+  resumePlanExecution: (instruction: string) => boolean;
   rejectPlan: (expected?: PlanReviewResolutionIdentity) => boolean;
   rejectPlanAndDeleteFiles: (expected?: PlanReviewResolutionIdentity) => Promise<void>;
   showWorkflowMenu: boolean;
@@ -1458,6 +1513,9 @@ export interface AppState {
       goalContinuationGuidance?: string;
       /** Reserved child run identity for an approved Plan handoff. */
       runIdOverride?: string;
+      /** Exact one-shot Plan execution attempt consumed only after Run admission. */
+      planExecutionLeaseId?: string;
+      planExecutionInstructionHash?: string;
     },
   ) => boolean;
   // Resume loop after human review
@@ -1500,7 +1558,21 @@ function isPendingToolPermissionResolutionCurrent(
   const exactIdentity = !identity || isExactToolPermissionResolutionIdentity(request, identity);
   const activeSessionKey = state.getCurrentSessionKey();
   const ownsActiveSession = !!activeSessionKey && request?.sessionKey === activeSessionKey;
-  if (ownsPendingResolver && ownsPendingRequest && exactIdentity && ownsActiveSession) return true;
+  const planCapabilityCurrent = !isToolPermissionActionRequest(request) || !request.planExecution || (
+    isToolPermissionPlanExecutionIdentityCurrent(request, state.planLifecycle) &&
+    isPlanApprovalIdentityCurrent({
+      artifacts: state.planArtifacts,
+      revision: request.planExecution.planRevision,
+      artifactHash: request.planExecution.artifactHash,
+    })
+  );
+  if (
+    ownsPendingResolver &&
+    ownsPendingRequest &&
+    exactIdentity &&
+    ownsActiveSession &&
+    planCapabilityCurrent
+  ) return true;
 
   logStoreEvent("tool_permission_resolution_identity_mismatch", {
     action,
@@ -1519,8 +1591,58 @@ function isPendingToolPermissionResolutionCurrent(
     activeSessionKey,
     pendingReviewTaskId: state.pendingReviewTaskId,
     hasPendingResolver: !!state.pendingReviewResolve,
+    planCapabilityCurrent,
   });
   return false;
+}
+
+function buildStalePendingPlanToolPermissionInvalidation(
+  state: AppState,
+): PendingPlanToolPermissionInvalidation | null {
+  const request = state.activeActionRequest;
+  if (
+    !isToolPermissionActionRequest(request) ||
+    !request.planExecution ||
+    (
+      isToolPermissionPlanExecutionIdentityCurrent(request, state.planLifecycle) &&
+      isPlanApprovalIdentityCurrent({
+        artifacts: state.planArtifacts,
+        revision: request.planExecution.planRevision,
+        artifactHash: request.planExecution.artifactHash,
+      })
+    )
+  ) {
+    return null;
+  }
+  return buildPendingPlanToolPermissionInvalidation(state, true);
+}
+
+function invalidateStalePendingPlanToolPermission(input: {
+  state: AppState;
+  action: "approve_once" | "approve_session" | "reject";
+  applyPatch: (patch: Partial<AppState>) => void;
+}): boolean {
+  const invalidation = buildStalePendingPlanToolPermissionInvalidation(input.state);
+  if (!invalidation) return false;
+  input.applyPatch({ ...invalidation.patch });
+  let settled = false;
+  try {
+    settled = settlePendingPlanToolPermissionInvalidation(invalidation);
+  } catch (error) {
+    logStoreEvent("stale_plan_tool_permission_settlement_failed", {
+      action: input.action,
+      requestId: invalidation.requestId,
+      taskId: invalidation.taskId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+  }
+  logStoreEvent("stale_plan_tool_permission_invalidated", {
+    action: input.action,
+    requestId: invalidation.requestId,
+    taskId: invalidation.taskId,
+    settled,
+  });
+  return true;
 }
 
 // ── Mock Local Model Provider Map ─────────────────────────────────────
@@ -1858,7 +1980,12 @@ function isActionRequestOwnedByGoalForDeletion(input: {
 
 export function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
-  options?: { restoreInterruptedGoal?: boolean; workspacePath?: string | null },
+  options?: {
+    restoreInterruptedGoal?: boolean;
+    workspacePath?: string | null;
+    expectedSessionKey?: string | null;
+    expectedSessionEpoch?: string | null;
+  },
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
@@ -1918,6 +2045,39 @@ export function normalizeSessionRuntimeSnapshot(
   });
   const persistedPlanIdentity = buildPlanApprovalIdentity(snapshot.planArtifacts || []);
   const restoredPlanIdentity = buildPlanApprovalIdentity(restoredPlanArtifacts.artifacts);
+  const originalActionRequest = normalizeActionRequest(snapshot.activeActionRequest);
+  const rawPlanLifecycle = snapshot.planLifecycle;
+  const restoredLifecycleSessionKey = String(options?.expectedSessionKey || "").trim() ||
+    UNBOUND_PLAN_SESSION_KEY;
+  const suppliedLifecycleSessionEpoch = String(options?.expectedSessionEpoch || "").trim();
+  const restoredLifecycleSessionEpoch = suppliedLifecycleSessionEpoch || (
+    restoredLifecycleSessionKey === UNBOUND_PLAN_SESSION_KEY
+      ? UNBOUND_PLAN_SESSION_EPOCH
+      : createPlanLifecycleSessionEpoch(Date.now())
+  );
+  const rawPlanOwnerMatchesContainer = !!rawPlanLifecycle &&
+    !!suppliedLifecycleSessionEpoch &&
+    rawPlanLifecycle.sessionKey === restoredLifecycleSessionKey &&
+    rawPlanLifecycle.sessionEpoch === restoredLifecycleSessionEpoch;
+  const restoredReviewIdentity: PlanReviewIdentity | null = rawPlanOwnerMatchesContainer
+    ? rawPlanLifecycle.reviewIdentity || null
+    : null;
+  const candidateRestoredPlanLifecycle = migrateLegacyPlanLifecycle({
+    version: rawPlanLifecycle?.version,
+    status: rawPlanLifecycle?.status,
+    sessionKey: restoredLifecycleSessionKey,
+    sessionEpoch: restoredLifecycleSessionEpoch,
+    planTurnId: rawPlanLifecycle?.planTurnId || snapshot.currentTurnId || null,
+    artifactIdentity: restoredPlanIdentity,
+    reviewIdentity: restoredReviewIdentity,
+    approvalLease: rawPlanOwnerMatchesContainer ? rawPlanLifecycle?.approvalLease || null : null,
+    executionLease: rawPlanOwnerMatchesContainer ? rawPlanLifecycle?.executionLease || null : null,
+    lastIssuedAttempt: rawPlanOwnerMatchesContainer ? rawPlanLifecycle?.lastIssuedAttempt : 0,
+    execution: rawPlanOwnerMatchesContainer ? rawPlanLifecycle?.execution || null : null,
+    isPlanApproved: snapshot.planStage === "completed" ? false : snapshot.isPlanApproved === true,
+    planStage: snapshot.planStage,
+    updatedAt: rawPlanLifecycle?.updatedAt,
+  });
   const rejectedReviewablePlanArtifact = restoredPlanArtifacts.rejected.some((artifact) =>
     artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix"
   );
@@ -1968,8 +2128,9 @@ export function normalizeSessionRuntimeSnapshot(
     restoredActionParentRunId === (restoredProgress.parentRunId || null) &&
     normalizedHarnessRunMarker?.turnId === restoredProgress.turnId
   );
-  const restoredIsPlanApproved =
-    snapshot.isPlanApproved === true &&
+  const hasExactRestoredPlanApprovalCapability =
+    rawPlanOwnerMatchesContainer &&
+    isPlanApprovalLeaseBoundToState(candidateRestoredPlanLifecycle) &&
     !rejectedReviewablePlanArtifact &&
     restoredExecutionReadiness.ok &&
     !restoredTaskIdentity.ambiguous &&
@@ -1979,6 +2140,9 @@ export function normalizeSessionRuntimeSnapshot(
     !!restoredPlanIdentity &&
     persistedPlanIdentity.revision === restoredPlanIdentity.revision &&
     persistedPlanIdentity.artifactHash === restoredPlanIdentity.artifactHash;
+  // Restart restoration never grants active execution authority. An exact
+  // approval capability can be retained only for a new explicit-resume lease.
+  const restoredIsPlanApproved = false;
   const hasTasksArtifact = restoredPlanArtifacts.artifacts.some((artifact) =>
     artifact.kind === "tasks" || artifact.kind === "bugfix"
   );
@@ -1993,12 +2157,14 @@ export function normalizeSessionRuntimeSnapshot(
         };
       })
     : rederivedPlanTasks;
-  const restoredPlanTasks = restoredIsPlanApproved || hasTasksArtifact
-    ? restoredIsPlanApproved
+  const restoredPlanTasks = hasExactRestoredPlanApprovalCapability || hasTasksArtifact
+    ? hasExactRestoredPlanApprovalCapability
       ? restoredApprovedPlanTasks
       : restoredArtifactTaskSeed
     : [];
-  const restoredPlanStage = snapshot.isPlanApproved === true && !restoredIsPlanApproved
+  const restoredPlanStage = hasExactRestoredPlanApprovalCapability
+    ? "ready_to_execute" as const
+    : snapshot.isPlanApproved === true
     ? "plan" as const
     : derivePlanStageFromArtifacts(
         restoredPlanArtifacts.artifacts,
@@ -2029,14 +2195,13 @@ export function normalizeSessionRuntimeSnapshot(
         isPlanApproved: restoredIsPlanApproved,
       }
     : null;
-  const originalActionRequest = normalizeActionRequest(snapshot.activeActionRequest);
   const deletionOwnedActionRequest = goalDeletionFenced &&
     isActionRequestOwnedByGoalForDeletion({
       request: originalActionRequest,
       marker: interruptedHarnessRunMarker,
       goal: restoredGoalCandidate,
     });
-  const restoredActionRequest = restorePendingActionRequest({
+  const restoredActionRequestCandidate = restorePendingActionRequest({
         request: deletionOwnedActionRequest ? null : originalActionRequest,
         runOwner: restoredHarnessRunMarker,
         planIdentity: restoredPlanIdentity,
@@ -2044,6 +2209,26 @@ export function normalizeSessionRuntimeSnapshot(
         goalRuntime: normalizedGoalRuntime,
         unapprovedPlanTurnIds: restoredIsPlanApproved ? [] : unapprovedPlanTurnIds,
       });
+  const lifecycleReview = candidateRestoredPlanLifecycle.reviewIdentity;
+  const restoredActionRequest = restoredActionRequestCandidate?.kind === "plan_review"
+    ? candidateRestoredPlanLifecycle.status === "awaiting_approval" &&
+        !!lifecycleReview &&
+        lifecycleReview.sessionKey === restoredActionRequestCandidate.sessionKey &&
+        lifecycleReview.sessionEpoch === restoredLifecycleSessionEpoch &&
+        lifecycleReview.turnId === restoredActionRequestCandidate.turnId &&
+        lifecycleReview.runId === restoredActionRequestCandidate.runId &&
+        lifecycleReview.parentRunId === (restoredActionRequestCandidate.parentRunId || null) &&
+        lifecycleReview.requestId === restoredActionRequestCandidate.requestId &&
+        lifecycleReview.planRevision === restoredActionRequestCandidate.planRevision &&
+        lifecycleReview.artifactHash === restoredActionRequestCandidate.artifactHash &&
+        JSON.stringify([...lifecycleReview.artifactPaths].sort()) ===
+          JSON.stringify([...restoredActionRequestCandidate.artifactPaths].map(canonicalizePlanArtifactPath).sort()) &&
+        restoredHarnessRunMarker?.sessionKey === restoredActionRequestCandidate.sessionKey &&
+        restoredHarnessRunMarker.turnId === restoredActionRequestCandidate.turnId &&
+        getHarnessActionRunId(restoredHarnessRunMarker) === restoredActionRequestCandidate.runId
+      ? restoredActionRequestCandidate
+      : null
+    : restoredActionRequestCandidate;
   const rejectedProceduralChoice =
     isInternalUnapprovedPlanChoiceRestore({
       request: originalActionRequest,
@@ -2075,6 +2260,38 @@ export function normalizeSessionRuntimeSnapshot(
     : invalidatedActionRequest?.kind === "goal_confirmation"
     ? "stale_goal_confirmation_cleared"
     : "stale_user_choice_cleared";
+  let restoredPlanLifecycle = candidateRestoredPlanLifecycle;
+  if (!hasExactRestoredPlanApprovalCapability && restoredPlanLifecycle.approvalLease) {
+    restoredPlanLifecycle = migrateLegacyPlanLifecycle({
+      version: restoredPlanLifecycle.version,
+      status: "paused",
+      sessionKey: restoredPlanLifecycle.sessionKey,
+      sessionEpoch: restoredPlanLifecycle.sessionEpoch,
+      planTurnId: restoredPlanLifecycle.planTurnId,
+      artifactIdentity: restoredPlanLifecycle.artifactIdentity,
+      reviewIdentity: null,
+      approvalLease: null,
+      isPlanApproved: true,
+      planStage: restoredPlanStage,
+      updatedAt: restoredPlanLifecycle.updatedAt,
+    });
+  }
+  if (
+    restoredPlanLifecycle.status === "awaiting_approval" &&
+    restoredActionRequest?.kind !== "plan_review" &&
+    restoredPlanLifecycle.planTurnId
+  ) {
+    const downgraded = reducePlanLifecycle(restoredPlanLifecycle, {
+      type: "start_drafting",
+      expectedVersion: restoredPlanLifecycle.version,
+      at: restoredPlanLifecycle.updatedAt,
+      planTurnId: restoredPlanLifecycle.planTurnId,
+      artifactIdentity: restoredPlanLifecycle.artifactIdentity,
+    });
+    if (downgraded.disposition !== "rejected") {
+      restoredPlanLifecycle = downgraded.state;
+    }
+  }
   let invalidatedChoiceText = "";
   const taskFlow = rawTaskFlow.map((block) => {
     if (
@@ -2504,23 +2721,32 @@ export function normalizeSessionRuntimeSnapshot(
     pendingSlashCommand: normalizePendingSlashCommand(snapshot.pendingSlashCommand),
     planArtifacts: restoredPlanArtifacts.artifacts,
     planTasks: restoredPlanTasks,
-    planExecutionEvidenceLedger: restoredIsPlanApproved ? snapshot.planExecutionEvidenceLedger || [] : [],
-    planExecutionEvidenceCount: restoredIsPlanApproved ? snapshot.planExecutionEvidenceCount ?? 0 : 0,
-    planAutoResumeCount: restoredIsPlanApproved ? Math.max(0, Number(snapshot.planAutoResumeCount) || 0) : 0,
-    planExecutionProgressSnapshot: restoredIsPlanApproved
-      ? normalizeStoredPlanExecutionProgressSnapshot(
-          snapshot.planExecutionProgressSnapshot,
-          restoredTaskIdentity.currentTaskId,
-        )
+    planExecutionEvidenceLedger: hasExactRestoredPlanApprovalCapability
+      ? snapshot.planExecutionEvidenceLedger || []
+      : [],
+    planExecutionEvidenceCount: hasExactRestoredPlanApprovalCapability
+      ? snapshot.planExecutionEvidenceCount ?? 0
+      : 0,
+    planAutoResumeCount: hasExactRestoredPlanApprovalCapability
+      ? Math.max(0, Number(snapshot.planAutoResumeCount) || 0)
+      : 0,
+    planExecutionProgressSnapshot: hasExactRestoredPlanApprovalCapability
+      ? (() => {
+          const restored = normalizeStoredPlanExecutionProgressSnapshot(
+            snapshot.planExecutionProgressSnapshot,
+            restoredTaskIdentity.currentTaskId,
+          );
+          return restored ? { ...restored, phase: "paused" as const } : null;
+        })()
       : null,
+    planLifecycle: restoredPlanLifecycle,
     planStage: restoredPlanStage,
     isPlanApproved: restoredIsPlanApproved,
-    planApprovalChoice: restoredIsPlanApproved ? normalizePlanApprovalChoice(snapshot.planApprovalChoice) : "",
+    planApprovalChoice: hasExactRestoredPlanApprovalCapability
+      ? normalizePlanApprovalChoice(snapshot.planApprovalChoice)
+      : "",
     pendingPlanApprovalHandoff: null,
-    planApprovalExecutionStartedForTurnId:
-      restoredIsPlanApproved && typeof snapshot.planApprovalExecutionStartedForTurnId === "string"
-        ? snapshot.planApprovalExecutionStartedForTurnId
-        : null,
+    planApprovalExecutionStartedForTurnId: null,
     clearedPlanTurnId: typeof snapshot.clearedPlanTurnId === "string" ? snapshot.clearedPlanTurnId : null,
     showPlanPanel: restoredPlanArtifacts.artifacts.length > 0 && (snapshot.showPlanPanel ?? false),
     showDiff: snapshot.showDiff ?? false,
@@ -2553,6 +2779,39 @@ export function normalizeSessionRuntimeSnapshot(
       ?? DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
     goalRuntime: normalizedGoalRuntime,
   };
+}
+
+/**
+ * Serialization sanitizer for a live Session. Unlike restart restoration it
+ * must not retire a running Plan lease, close a Harness marker, or rewrite Turn
+ * status merely because a checkpoint is being persisted.
+ */
+export function sanitizeSessionRuntimeSnapshotForPersist(
+  snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
+): SessionRuntimeSnapshot | undefined {
+  if (!snapshot) return undefined;
+  const sanitizedPlanArtifacts = sanitizeRestoredPlanArtifacts({
+    artifacts: snapshot.planArtifacts || [],
+    isPlanApproved: snapshot.isPlanApproved === true,
+  }).artifacts;
+  const planLifecycle = snapshot.planLifecycle || createEmptyPlanLifecycleForSession(
+    snapshot.harnessRunMarker?.sessionKey || null,
+    { now: Date.now() },
+  );
+  return {
+    ...snapshot,
+    runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+    runtimeEvents: normalizeRuntimeEvents(snapshot.runtimeEvents),
+    harnessRunMarker: normalizeHarnessRunMarker(snapshot.harnessRunMarker),
+    activeActionRequest: normalizeActionRequest(snapshot.activeActionRequest),
+    taskFlow: sanitizeTaskBlocksForPersist(snapshot.taskFlow || []),
+    agentMessages: sanitizeAgentMessagesForPersist(snapshot.agentMessages || []),
+    planArtifacts: sanitizedPlanArtifacts,
+    planLifecycle,
+    isPlanApproved: snapshot.isPlanApproved === true &&
+      planLifecycle.status === "executing" &&
+      isPlanLifecycleExecutionAuthorized(planLifecycle),
+  } as SessionRuntimeSnapshot;
 }
 
 export function normalizeQueuedUserMessage(value: unknown): QueuedUserMessage | null {
@@ -2652,6 +2911,7 @@ const sessionRuntimeKeys = [
   "planExecutionEvidenceCount",
   "planAutoResumeCount",
   "planExecutionProgressSnapshot",
+  "planLifecycle",
   "planStage",
   "isPlanApproved",
   "planApprovalChoice",
@@ -2715,6 +2975,19 @@ function pickSessionRuntimePatch(source: Partial<SessionRuntimeState> | Record<s
 
 function isSessionRuntimeActive(state: Pick<AppState, "currentWorkspace" | "currentSessionId">, sessionKey: string | null) {
   return !!sessionKey && resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId) === sessionKey;
+}
+
+function resolveActiveSessionPlanLifecycleEpoch(
+  state: Pick<AppState, "currentWorkspace" | "currentSessionId" | "sessionsByWorkspace">,
+  sessionKey: string | null,
+): string | null {
+  if (!sessionKey || !isSessionRuntimeActive(state, sessionKey)) return null;
+  const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+  const session = (state.sessionsByWorkspace[scopeKey] || []).find(
+    (candidate) => candidate.id === state.currentSessionId,
+  );
+  const epoch = String(session?.planLifecycleEpoch || "").trim();
+  return epoch || null;
 }
 
 function buildQueuedGoalContinuationRemovalPatch(
@@ -2863,6 +3136,12 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
     planAutoResumeCount: Math.max(0, Number(state.planAutoResumeCount) || 0),
     planExecutionProgressSnapshot: normalizeStoredPlanExecutionProgressSnapshot(state.planExecutionProgressSnapshot),
+    planLifecycle: state.planLifecycle || createEmptyPlanLifecycleForSession(
+      resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(state.currentWorkspace),
+        state.currentSessionId,
+      ),
+    ),
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: normalizePlanApprovalChoice(state.planApprovalChoice),
@@ -3102,6 +3381,8 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
         {
           restoreInterruptedGoal: true,
           workspacePath: input.scopeKey,
+          expectedSessionKey: input.sessionKey,
+          expectedSessionEpoch: sessionRecord.planLifecycleEpoch || null,
         },
       );
       ownerRuntime = createSessionRuntimeFromState({
@@ -3214,6 +3495,27 @@ function buildHistoryClearRevokedRuntime(
   now = Date.now(),
   preserveQueuedUserMessage = false,
 ): SessionRuntimeState {
+  const resetLifecycle = reducePlanLifecycle(runtime.planLifecycle, {
+    type: "reset",
+    expectedVersion: runtime.planLifecycle.version,
+    at: now,
+  });
+  let revokedPlanLifecycle = resetLifecycle.disposition === "rejected"
+    ? runtime.planLifecycle
+    : resetLifecycle.state;
+  const retainedArtifactIdentity = toPlanLifecycleArtifactIdentity(
+    buildPlanApprovalIdentity(runtime.planArtifacts || []),
+  );
+  if (resetLifecycle.disposition !== "rejected" && retainedArtifactIdentity) {
+    const discovery = reducePlanLifecycle(revokedPlanLifecycle, {
+      type: "hydrate_discovery",
+      expectedVersion: revokedPlanLifecycle.version,
+      at: now,
+      planTurnId: runtime.currentTurnId || runtime.planLifecycle.planTurnId || null,
+      artifactIdentity: retainedArtifactIdentity,
+    });
+    if (discovery.disposition !== "rejected") revokedPlanLifecycle = discovery.state;
+  }
   const activeGoal = runtime.activeGoal
     ? { ...runtime.activeGoal, status: "paused" as const, updatedAt: now }
     : null;
@@ -3255,6 +3557,10 @@ function buildHistoryClearRevokedRuntime(
     pendingReviewTaskId: null,
     activeActionRequest: null,
     pendingToolCall: null,
+    planLifecycle: revokedPlanLifecycle,
+    isPlanApproved: false,
+    planApprovalChoice: null,
+    planStage: retainedArtifactIdentity ? "plan" : "idle",
     pendingPlanApprovalHandoff: null,
     planApprovalExecutionStartedForTurnId: null,
     queuedUserMessage: preserveQueuedUserMessage ? runtime.queuedUserMessage : null,
@@ -3343,6 +3649,8 @@ export function buildRestoredSessionRuntimePatch(input: {
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined;
   fallbackState: Partial<AppState>;
   workspacePath?: string | null;
+  expectedSessionKey?: string | null;
+  expectedSessionEpoch?: string | null;
   taskFlow?: TaskBlock[];
   conversationTurns?: ConversationTurn[];
   currentTurnId?: string | null;
@@ -3359,6 +3667,8 @@ export function buildRestoredSessionRuntimePatch(input: {
   const normalized = normalizeSessionRuntimeSnapshot(mergedSnapshot, {
     restoreInterruptedGoal: true,
     workspacePath: input.workspacePath ?? input.fallbackState.currentWorkspace,
+    expectedSessionKey: input.expectedSessionKey,
+    expectedSessionEpoch: input.expectedSessionEpoch,
   });
   if (!normalized) return {};
   const taskFlow = normalized.taskFlow || [];
@@ -3409,15 +3719,22 @@ function normalizeSessionsByWorkspace(
 
   Object.entries(sessionsByWorkspace).forEach(([workspace, sessions]) => {
     const scopeKey = resolveSessionWorkspaceKey(workspace);
-    const normalizedSessions = (sessions || []).map((session) => ({
-      ...session,
-      sessionModeAffinity: resolveSessionModeAffinity(session as SessionModeAffinityLike, "main_mode"),
-      messages: sanitizeTaskBlocksForPersist(session.messages || []),
-      runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, {
-        restoreInterruptedGoal: true,
-        workspacePath: scopeKey,
-      }),
-    }));
+    const normalizedSessions = (sessions || []).map((session) => {
+      const planLifecycleEpoch = String(session.planLifecycleEpoch || "").trim() ||
+        createPlanLifecycleSessionEpoch(Number(session.id) || Date.now());
+      return {
+        ...session,
+        planLifecycleEpoch,
+        sessionModeAffinity: resolveSessionModeAffinity(session as SessionModeAffinityLike, "main_mode"),
+        messages: sanitizeTaskBlocksForPersist(session.messages || []),
+        runtimeSnapshot: normalizeSessionRuntimeSnapshot(session.runtimeSnapshot, {
+          restoreInterruptedGoal: true,
+          workspacePath: scopeKey,
+          expectedSessionKey: resolveSessionRuntimeKey(scopeKey, session.id),
+          expectedSessionEpoch: planLifecycleEpoch,
+        }),
+      };
+    });
     const existing = normalizedEntries.get(scopeKey) || [];
     normalizedEntries.set(scopeKey, [...existing, ...normalizedSessions]);
   });
@@ -3450,6 +3767,8 @@ const workspaceClearSubmissionReplayReadySessionKeys = new Map<string, string | 
 const workspaceClearTransactions = new Map<string, Promise<void>>();
 const invalidatedWorkspaceClearTransactions = new WeakSet<Promise<void>>();
 const WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS = 3;
+let planDiffRevertResetGeneration = 0;
+let planDiffRevertOperationCounter = 0;
 
 function discardWorkspaceClearSubmissionReplayState(workspaceKeyInput: string): void {
   const workspaceKey = resolveSessionWorkspaceKey(workspaceKeyInput);
@@ -3961,10 +4280,16 @@ export function buildSessionRuntimeSnapshotFromStoreState(state: any): SessionRu
     planExecutionEvidenceCount: state.planExecutionEvidenceCount ?? 0,
     planAutoResumeCount: Math.max(0, Number(state.planAutoResumeCount) || 0),
     planExecutionProgressSnapshot: normalizeStoredPlanExecutionProgressSnapshot(state.planExecutionProgressSnapshot),
+    planLifecycle: state.planLifecycle || createEmptyPlanLifecycleForSession(
+      resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(state.currentWorkspace),
+        state.currentSessionId,
+      ),
+    ),
     planStage: state.planStage ?? "idle",
     isPlanApproved: state.isPlanApproved === true,
     planApprovalChoice: state.planApprovalChoice ?? null,
-    pendingPlanApprovalHandoff: null,
+    pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff || null,
     planApprovalExecutionStartedForTurnId:
       typeof state.planApprovalExecutionStartedForTurnId === "string"
         ? state.planApprovalExecutionStartedForTurnId
@@ -4002,7 +4327,11 @@ function resolveCurrentSessionModeAffinityFromState(state: any): SessionModeAffi
   return resolveSessionModeAffinity(activeSession || state, state.selectedMainModeKey || "main_mode");
 }
 
-function buildEmptySessionRuntimeSnapshot(state: any, affinity: SessionModeAffinity): SessionRuntimeSnapshot {
+function buildEmptySessionRuntimeSnapshot(
+  state: any,
+  affinity: SessionModeAffinity,
+  owner: { sessionKey: string; sessionEpoch: string },
+): SessionRuntimeSnapshot {
   const selectedMainModeKey = normalizeSessionModeAffinity(affinity, "main_mode");
   return {
     ...buildSessionRuntimeSnapshotFromStoreState({
@@ -4020,6 +4349,10 @@ function buildEmptySessionRuntimeSnapshot(state: any, affinity: SessionModeAffin
       planTasks: [],
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
+      planLifecycle: createEmptyPlanLifecycleForSession(
+        owner.sessionKey,
+        { sessionEpoch: owner.sessionEpoch },
+      ),
       planStage: "idle",
       isPlanApproved: false,
       planApprovalChoice: null,
@@ -4054,8 +4387,11 @@ function buildNewSessionRecord(params: {
 }): Session {
   const createdAt = Date.now();
   const createdAtIso = new Date(createdAt).toISOString();
+  const planLifecycleEpoch = createPlanLifecycleSessionEpoch(createdAt);
+  const sessionKey = resolveSessionRuntimeKey(params.scopeKey, createdAt)!;
   return {
     id: createdAt,
+    planLifecycleEpoch,
     title: params.title || (
       params.affinity === "image_studio"
         ? buildImageSessionDefaultTitle(params.language)
@@ -4070,7 +4406,10 @@ function buildNewSessionRecord(params: {
     storageStatus: "temporary",
     recordingDisabled: !params.state.config.sessionRecordingEnabled,
     messages: [],
-    runtimeSnapshot: buildEmptySessionRuntimeSnapshot(params.state, params.affinity),
+    runtimeSnapshot: buildEmptySessionRuntimeSnapshot(params.state, params.affinity, {
+      sessionKey,
+      sessionEpoch: planLifecycleEpoch,
+    }),
   };
 }
 
@@ -4163,6 +4502,135 @@ function derivePlanStageFromArtifacts(
   return "idle";
 }
 
+function toPlanLifecycleArtifactIdentity(
+  identity: ReturnType<typeof buildPlanApprovalIdentity>,
+): PlanArtifactIdentity | null {
+  if (!identity) return null;
+  return {
+    revision: identity.revision,
+    artifactHash: identity.artifactHash,
+    artifactPaths: identity.artifactPaths,
+  };
+}
+
+function createPlanApprovalLeaseId(now = Date.now()): string {
+  const nonce = globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2, 12);
+  return `plan-approval-${now}-${nonce}`;
+}
+
+function createPlanExecutionLeaseId(now = Date.now()): string {
+  const nonce = globalThis.crypto?.randomUUID?.() || Math.random().toString(36).slice(2, 12);
+  return `plan-execution-${now}-${nonce}`;
+}
+
+function ensurePlanLifecycleSessionOwner(
+  lifecycle: PlanLifecycleState | null | undefined,
+  sessionKey: string,
+  now = Date.now(),
+): PlanLifecycleState {
+  return ensurePlanLifecycleOwner({
+    lifecycle,
+    sessionKey,
+    at: now,
+  });
+}
+
+function toPlanLifecycleReviewIdentity(
+  request: Extract<ActionRequest, { kind: "plan_review" }>,
+  sessionEpoch: string,
+): PlanReviewIdentity {
+  return {
+    sessionKey: request.sessionKey,
+    sessionEpoch,
+    turnId: request.turnId,
+    runId: request.runId,
+    parentRunId: request.parentRunId || null,
+    requestId: request.requestId,
+    planRevision: request.planRevision,
+    artifactHash: request.artifactHash,
+    artifactPaths: request.artifactPaths,
+  };
+}
+
+function alignPlanLifecycleWithReview(input: {
+  lifecycle: PlanLifecycleState | null | undefined;
+  sessionKey: string;
+  request: Extract<ActionRequest, { kind: "plan_review" }>;
+  artifactIdentity: PlanArtifactIdentity;
+  now?: number;
+}): PlanLifecycleState | null {
+  const now = input.now ?? Date.now();
+  const owner = ensurePlanLifecycleSessionOwner(input.lifecycle, input.sessionKey, now);
+  return applyPlanReviewIdentity({
+    lifecycle: owner,
+    artifactIdentity: input.artifactIdentity,
+    reviewIdentity: toPlanLifecycleReviewIdentity(input.request, owner.sessionEpoch),
+    at: now,
+  });
+}
+
+function transitionPlanLifecycleArtifactIdentity(input: {
+  lifecycle: PlanLifecycleState | null | undefined;
+  sessionKey: string;
+  artifactIdentity: PlanArtifactIdentity | null;
+  now?: number;
+}): PlanLifecycleState {
+  const now = input.now ?? Date.now();
+  return applyPlanArtifactIdentity({
+    lifecycle: input.lifecycle,
+    sessionKey: input.sessionKey,
+    at: now,
+    artifactIdentity: input.artifactIdentity,
+  });
+}
+
+function pausePlanLifecycle(input: {
+  lifecycle: PlanLifecycleState;
+  reason: string;
+  resultKind: "partial" | "blocked" | "error";
+  resumeCondition: string;
+  now?: number;
+}): PlanLifecycleState {
+  return applyPlanLifecyclePause({
+    lifecycle: input.lifecycle,
+    at: input.now ?? Date.now(),
+    pause: {
+      reason: input.reason,
+      resultKind: input.resultKind,
+      resumeCondition: input.resumeCondition,
+    },
+  });
+}
+
+function revokePlanLifecycleToDiscovery(input: {
+  lifecycle: PlanLifecycleState;
+  sessionKey: string;
+  artifacts: PlanArtifact[];
+  planTurnId?: string | null;
+  now?: number;
+}): PlanLifecycleState {
+  const now = input.now ?? Date.now();
+  const owner = ensurePlanLifecycleSessionOwner(input.lifecycle, input.sessionKey, now);
+  const reset = reducePlanLifecycle(owner, {
+    type: "reset",
+    expectedVersion: owner.version,
+    at: now,
+  });
+  if (reset.disposition === "rejected") return owner;
+  const artifactIdentity = toPlanLifecycleArtifactIdentity(
+    buildPlanApprovalIdentity(input.artifacts),
+  );
+  if (!artifactIdentity) return reset.state;
+  const discovery = reducePlanLifecycle(reset.state, {
+    type: "hydrate_discovery",
+    expectedVersion: reset.state.version,
+    at: now,
+    planTurnId: input.planTurnId || null,
+    artifactIdentity,
+  });
+  return discovery.disposition === "rejected" ? reset.state : discovery.state;
+}
+
 function supportsFullFileDiffRevert(block: Extract<TaskBlock, { type: "tool" }>): boolean {
   if (!block.diff) return false;
   if (block.diff.fullFile === true) return true;
@@ -4170,29 +4638,60 @@ function supportsFullFileDiffRevert(block: Extract<TaskBlock, { type: "tool" }>)
   return block.toolName === "write_file";
 }
 
-function buildPlanArtifactRevertPatch(
+interface PlanArtifactRevertTransition {
+  patch: Partial<AppState>;
+  pendingPermissionInvalidation: PendingPlanToolPermissionInvalidation | null;
+  revokedExecutionAbort: (() => void) | null;
+  approvalInvalidated: boolean;
+}
+
+function buildPlanArtifactRevertTransition(
   state: AppState,
   path: string,
   oldText: string,
   existed: boolean,
-): Partial<AppState> {
-  const kind = detectPlanArtifactKind(path);
-  if (!kind || kind === "summary") return {};
+  now = Date.now(),
+): PlanArtifactRevertTransition {
+  const canonicalPath = canonicalizePlanArtifactPath(path);
+  const kind = detectPlanArtifactKind(canonicalPath);
+  const noPlanTransition: PlanArtifactRevertTransition = {
+    patch: {},
+    pendingPermissionInvalidation: null,
+    revokedExecutionAbort: null,
+    approvalInvalidated: false,
+  };
+  if (!canonicalPath || !kind || kind === "summary") return noPlanTransition;
 
   const sanitized = sanitizePlanArtifactContent(oldText);
   const shouldKeepArtifact = existed && sanitized.trim().length > 0;
-  const nextArtifacts = shouldKeepArtifact
-    ? [
-        ...state.planArtifacts.filter((artifact) => artifact.kind !== kind),
-        {
-          kind,
-          path,
-          title: getPlanArtifactTitle(kind, state.config.language === "en" ? "en" : "zh"),
-          content: sanitized,
-          updatedAt: Date.now(),
-        },
-      ]
-    : state.planArtifacts.filter((artifact) => artifact.kind !== kind);
+  const currentMaxPlanRevision = state.planArtifacts.reduce(
+    (max, artifact) => Math.max(max, Number(artifact.revision) || 0),
+    0,
+  );
+  const existingIndex = state.planArtifacts.findIndex(
+    (artifact) => canonicalizePlanArtifactPath(artifact.path) === canonicalPath,
+  );
+  const nextArtifacts = state.planArtifacts.slice();
+  if (shouldKeepArtifact) {
+    const existingArtifact = existingIndex >= 0 ? nextArtifacts[existingIndex] : null;
+    const contentChanged = !existingArtifact ||
+      existingArtifact.kind !== kind ||
+      existingArtifact.content !== sanitized;
+    const restoredArtifact: PlanArtifact = {
+      kind,
+      path: canonicalPath,
+      title: getPlanArtifactTitle(kind, state.config.language === "en" ? "en" : "zh"),
+      content: sanitized,
+      revision: contentChanged
+        ? Math.max(1, currentMaxPlanRevision + 1)
+        : Math.max(1, Number(existingArtifact?.revision) || 1),
+      updatedAt: contentChanged ? now : existingArtifact?.updatedAt || now,
+    };
+    if (existingIndex >= 0) nextArtifacts[existingIndex] = restoredArtifact;
+    else nextArtifacts.push(restoredArtifact);
+  } else if (existingIndex >= 0) {
+    nextArtifacts.splice(existingIndex, 1);
+  }
 
   let nextTasks = state.planTasks;
   if (kind === "tasks" || kind === "bugfix") {
@@ -4214,15 +4713,122 @@ function buildPlanArtifactRevertPatch(
     );
   }
 
+  const nextApprovalIdentity = buildPlanApprovalIdentity(nextArtifacts);
+  const lifecycleSessionKey = resolveSessionRuntimeKey(
+    resolveSessionWorkspaceKey(state.currentWorkspace),
+    state.currentSessionId,
+  ) || UNBOUND_PLAN_SESSION_KEY;
+  let nextPlanLifecycle = transitionPlanLifecycleArtifactIdentity({
+    lifecycle: state.planLifecycle,
+    sessionKey: lifecycleSessionKey,
+    artifactIdentity: toPlanLifecycleArtifactIdentity(nextApprovalIdentity),
+    now,
+  });
+  const heldPlanAuthority = state.isPlanApproved ||
+    !!state.planLifecycle.approvalLease ||
+    !!state.planLifecycle.executionLease;
+  const approvalInvalidated = heldPlanAuthority &&
+    !isPlanApprovalLeaseBoundToState(nextPlanLifecycle);
+  const pendingPermissionInvalidation = buildPendingPlanToolPermissionInvalidation(
+    state,
+    approvalInvalidated,
+  );
+  const revokedExecutionAbort = approvalInvalidated &&
+    !pendingPermissionInvalidation &&
+    isHarnessMarkerOwnedByPlanExecution({
+      lifecycle: state.planLifecycle,
+      marker: state.harnessRunMarker,
+    }) &&
+    state.abortController &&
+    !state.abortController.signal.aborted
+      ? () => state.abortController?.abort()
+      : null;
+  const effectivePlanApproved = state.isPlanApproved &&
+    isPlanApprovalLeaseBoundToState(nextPlanLifecycle);
+  const shouldRefreshPlanReviewRequest =
+    state.activeActionRequest?.kind === "plan_review" &&
+    !!nextApprovalIdentity &&
+    (
+      state.activeActionRequest.planRevision !== nextApprovalIdentity.revision ||
+      state.activeActionRequest.artifactHash !== nextApprovalIdentity.artifactHash
+    );
+  const clearsPlanReviewRequest =
+    state.activeActionRequest?.kind === "plan_review" && !nextApprovalIdentity;
+  const nextPlanReviewRequest = shouldRefreshPlanReviewRequest &&
+    state.activeActionRequest?.kind === "plan_review" &&
+    nextApprovalIdentity
+      ? buildPlanReviewActionRequest({
+          sessionKey: state.activeActionRequest.sessionKey,
+          turnId: state.activeActionRequest.turnId,
+          runId: state.activeActionRequest.runId,
+          parentRunId: state.activeActionRequest.parentRunId,
+          title: state.activeActionRequest.title,
+          planRevision: nextApprovalIdentity.revision,
+          artifactHash: nextApprovalIdentity.artifactHash,
+          artifactPaths: nextApprovalIdentity.artifactPaths,
+        })
+      : state.activeActionRequest;
+  if (
+    shouldRefreshPlanReviewRequest &&
+    nextPlanReviewRequest?.kind === "plan_review" &&
+    nextApprovalIdentity
+  ) {
+    const alignedLifecycle = alignPlanLifecycleWithReview({
+      lifecycle: nextPlanLifecycle,
+      sessionKey: lifecycleSessionKey,
+      request: nextPlanReviewRequest,
+      artifactIdentity: nextApprovalIdentity,
+      now,
+    });
+    if (alignedLifecycle) nextPlanLifecycle = alignedLifecycle;
+  }
+  const effectiveTasks = approvalInvalidated ? [] : nextTasks;
+  const nextStage = derivePlanStageFromArtifacts(
+    nextArtifacts,
+    effectiveTasks,
+    effectivePlanApproved,
+    state.planStage,
+  );
+  const shouldAutoOpenPlanPanel = !effectivePlanApproved && state.planStage !== "executing";
+
   return {
-    planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
-    planTasks: nextTasks,
-    planStage: derivePlanStageFromArtifacts(
-      nextArtifacts,
-      nextTasks,
-      state.isPlanApproved,
-      state.planStage,
-    ),
+    patch: {
+      planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
+      planTasks: effectiveTasks,
+      planLifecycle: nextPlanLifecycle,
+      planStage: nextStage,
+      isPlanApproved: effectivePlanApproved,
+      clearedPlanTurnId: null,
+      ...(shouldRefreshPlanReviewRequest
+        ? { activeActionRequest: nextPlanReviewRequest }
+        : clearsPlanReviewRequest
+          ? { activeActionRequest: null }
+          : {}),
+      ...(pendingPermissionInvalidation?.patch || {}),
+      ...(approvalInvalidated
+        ? {
+            planApprovalChoice: null,
+            pendingPlanApprovalHandoff: null,
+            planApprovalExecutionStartedForTurnId: null,
+            currentTurnExecutionConsent: { turnId: null, granted: false },
+            planExecutionEvidenceLedger: [],
+            planExecutionEvidenceCount: 0,
+            planAutoResumeCount: 0,
+            planExecutionProgressSnapshot: null,
+          }
+        : {}),
+      ...(shouldAutoOpenPlanPanel
+        ? {
+            showPlanPanel: true,
+            rightPanelTab: state.showDiff && state.rightPanelTab === "diff"
+              ? "diff" as const
+              : "plan" as const,
+          }
+        : {}),
+    },
+    pendingPermissionInvalidation,
+    revokedExecutionAbort,
+    approvalInvalidated,
   };
 }
 
@@ -4264,6 +4870,36 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
     }));
     return false;
   }
+  const lifecycle = latest.planLifecycle;
+  const approvalLease = lifecycle.approvalLease;
+  const executionLease = lifecycle.executionLease;
+  const expectedSessionKey = input.sessionKey || lifecycle.sessionKey;
+  const exactLifecycleHandoff =
+    lifecycle.status === "handoff_pending" &&
+    !!approvalLease &&
+    !!executionLease &&
+    isPlanApprovalLeaseBoundToState(lifecycle) &&
+    lifecycle.sessionKey === expectedSessionKey &&
+    approvalLease.planTurnId === input.planTurnId &&
+    executionLease.executionTurnId === (input.handoff.executionTurnId || input.planTurnId) &&
+    executionLease.executionRunId === input.handoff.executionRunId &&
+    executionLease.parentRunId === input.handoff.parentRunId &&
+    executionLease.attempt === input.handoff.executionAttempt &&
+    executionLease.instructionHash === input.handoff.executionInstructionHash &&
+    approvalLease.leaseId === input.handoff.approvalLeaseId &&
+    executionLease.executionLeaseId === input.handoff.executionLeaseId &&
+    approvalLease.sessionEpoch === input.handoff.sessionEpoch &&
+    approvalLease.requestId === input.handoff.reviewRequestId;
+  if (!exactLifecycleHandoff || !approvalLease || !executionLease) {
+    logStoreEvent("plan_approval_same_turn_execution_skipped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: "approval_lease_mismatch",
+      planTurnId: input.planTurnId,
+      executionTurnId: input.handoff.executionTurnId || input.planTurnId,
+      currentTurnStatus: currentTurn.status,
+    }));
+    return false;
+  }
   if (
     input.handoff.artifactHash &&
     !isPlanApprovalIdentityCurrent({
@@ -4273,7 +4909,15 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
     })
   ) {
     const language = latest.config.language === "en" ? "en" : "zh";
+    const currentArtifactIdentity = toPlanLifecycleArtifactIdentity(
+      buildPlanApprovalIdentity(latest.planArtifacts),
+    );
     const rollbackPatch = {
+      planLifecycle: transitionPlanLifecycleArtifactIdentity({
+        lifecycle,
+        sessionKey: expectedSessionKey,
+        artifactIdentity: currentArtifactIdentity,
+      }),
       isPlanApproved: false,
       planApprovalChoice: null,
       pendingPlanApprovalHandoff: null,
@@ -4307,23 +4951,12 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
     }));
     return false;
   }
-  if (latest.planApprovalExecutionStartedForTurnId === input.planTurnId) {
-    logStoreEvent("plan_approval_handoff_deduped", buildPlanApprovalHandoffDedupLogPayload({
-      state: latest,
-      reason: "same_turn_execution_already_started",
-      planTurnId: input.planTurnId,
-      executionTurnId: input.planTurnId,
-      currentTurnStatus: currentTurn?.status ?? null,
-    }));
-    return false;
-  }
   const exactPendingDecision = resolveApprovedPlanSameTurnFallbackDecision({
     expectedSessionKey: input.sessionKey || "__active_session__",
     currentSessionKey: input.sessionKey || "__active_session__",
     expectedHandoff: input.handoff,
     currentHandoff: latest.pendingPlanApprovalHandoff,
-    isPlanApproved: latest.isPlanApproved === true,
-    executionStartedForTurnId: latest.planApprovalExecutionStartedForTurnId,
+    hasExactPlanApprovalHandoff: exactLifecycleHandoff,
     isAgentBusy: false,
     busyRetryAttempt: 0,
     maxBusyRetries: 0,
@@ -4351,24 +4984,33 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
     }));
     return false;
   }
+  if (!claimPlanExecutionDispatch(executionLease.executionLeaseId)) {
+    logStoreEvent("plan_approval_handoff_deduped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: "execution_lease_dispatch_already_claimed",
+      planTurnId: input.planTurnId,
+      executionTurnId: executionLease.executionTurnId,
+      currentTurnStatus: currentTurn.status,
+    }));
+    return false;
+  }
 
   const language = latest.config.language === "en" ? "en" : "zh";
-  const prompt = input.handoff.prompt || buildApprovedPlanExecutionPrompt({
-    state: latest,
-    language,
-    executionPlanTasks: latest.planTasks,
-    normalizedApprovalChoice: latest.planApprovalChoice,
-  });
+  const prompt = input.handoff.prompt;
+  if (buildPlanExecutionInstructionHash(prompt) !== executionLease.instructionHash) {
+    releasePlanExecutionDispatch(executionLease.executionLeaseId);
+    logStoreEvent("plan_approval_same_turn_execution_skipped", buildPlanApprovalHandoffDedupLogPayload({
+      state: latest,
+      reason: "execution_instruction_hash_mismatch",
+      planTurnId: input.planTurnId,
+      executionTurnId: executionLease.executionTurnId,
+      currentTurnStatus: currentTurn.status,
+    }));
+    return false;
+  }
   const initialExecuteRecoveryState = resolveApprovedPlanInitialExecutionRecovery(
     latest.planTasks,
   );
-
-  latest.updateConversationTurn(input.planTurnId, {
-    status: "executing",
-    summary: language === "zh"
-      ? "计划已批准，正在当前回合继续执行。"
-      : "Plan approved; execution is continuing in the current turn.",
-  });
 
   const reviewRunMarker = latest.harnessRunMarker;
   const reviewedPlanContent = latest.planArtifacts
@@ -4400,20 +5042,12 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
       }) as AgentMessage[]
     : latest.agentMessages;
 
-  const runtimePatch = {
-    currentTurnId: input.planTurnId,
-    pendingPlanApprovalHandoff: null,
-    planApprovalExecutionStartedForTurnId: input.planTurnId,
-    currentTurnExecutionConsent: { turnId: input.planTurnId, granted: true },
-    ...(childAgentMessages !== latest.agentMessages
-      ? { agentMessages: childAgentMessages }
-      : {}),
-  };
-  if (input.sessionKey) {
-    latest.updateRuntimeForSession?.(input.sessionKey, runtimePatch);
-  }
-  if (!input.sessionKey || isSessionRuntimeActive(latest, input.sessionKey)) {
-    input.setActiveState(runtimePatch);
+  if (childAgentMessages !== latest.agentMessages) {
+    const contextPatch = { agentMessages: childAgentMessages };
+    if (input.sessionKey) latest.updateRuntimeForSession?.(input.sessionKey, contextPatch);
+    if (!input.sessionKey || isSessionRuntimeActive(latest, input.sessionKey)) {
+      input.setActiveState(contextPatch);
+    }
   }
   if (childAgentMessages !== latest.agentMessages) {
     logStoreEvent("plan_approval_child_context_compacted", {
@@ -4447,9 +5081,11 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
             forceExecuteRecoveryState: initialExecuteRecoveryState,
           }
         : {}),
-      executionConsentGranted: true,
+      executionConsentGranted: false,
       parentRunIdOverride: input.handoff.parentRunId || undefined,
       runIdOverride: input.handoff.executionRunId,
+      planExecutionLeaseId: executionLease.executionLeaseId,
+      planExecutionInstructionHash: executionLease.instructionHash,
       skipIntentResolution: true,
       intentSummary: language === "zh"
         ? "用户已批准计划，MAIN 将在当前回合中按 plan.md 落地。"
@@ -4459,15 +5095,47 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
     submissionError = error instanceof Error ? error.message : String(error);
   }
   if (!submissionStarted) {
+    releasePlanExecutionDispatch(executionLease.executionLeaseId);
+    const failedAt = Date.now();
+    const failedSnapshot = input.get();
+    const failedLifecycle = failedSnapshot.planLifecycle;
+    const ownsFailedReservation =
+      failedLifecycle.status === "handoff_pending" &&
+      failedLifecycle.executionLease?.executionLeaseId === executionLease.executionLeaseId &&
+      failedLifecycle.executionLease.executionRunId === input.handoff.executionRunId &&
+      failedLifecycle.executionLease.parentRunId === input.handoff.parentRunId &&
+      failedLifecycle.approvalLease?.leaseId === input.handoff.approvalLeaseId &&
+      isPlanApprovalLeaseBoundToState(failedLifecycle);
+    const failedDispatchTransition = ownsFailedReservation
+      ? reducePlanLifecycle(failedLifecycle, {
+          type: "pause",
+          expectedVersion: failedLifecycle.version,
+          at: failedAt,
+          pause: {
+            reason: "plan_execution_dispatch_failed",
+            resultKind: "error",
+            resumeCondition: "explicit_resume",
+          },
+        })
+      : null;
+    const reservedAttemptPaused = !!failedDispatchTransition &&
+      failedDispatchTransition.disposition !== "rejected" &&
+      failedDispatchTransition.state.status === "paused";
     const rollbackPatch = {
-      pendingPlanApprovalHandoff: input.handoff,
+      ...(reservedAttemptPaused
+        ? { planLifecycle: failedDispatchTransition.state }
+        : {}),
+      isPlanApproved: false,
+      currentTurnExecutionConsent: { turnId: null, granted: false },
+      pendingPlanApprovalHandoff: reservedAttemptPaused ? null : input.handoff,
       planApprovalExecutionStartedForTurnId: null,
+      planStage: "ready_to_execute" as const,
       agentStatus: "idle" as const,
       isGenerating: false,
       abortController: null,
     };
     if (input.sessionKey) {
-      latest.updateRuntimeForSession?.(input.sessionKey, rollbackPatch);
+      failedSnapshot.updateRuntimeForSession?.(input.sessionKey, rollbackPatch);
     }
     input.setActiveState(rollbackPatch);
     latest.updateConversationTurn(input.planTurnId, {
@@ -4481,7 +5149,8 @@ export function startApprovedPlanExecutionInCurrentTurn(input: {
       planTurnId: input.planTurnId,
       sessionKey: input.sessionKey,
       error: submissionError,
-      pendingPreserved: true,
+      pendingPreserved: !reservedAttemptPaused,
+      lifecyclePaused: reservedAttemptPaused,
       conversationTurns: input.get().conversationTurns.length,
     });
     return false;
@@ -4987,13 +5656,23 @@ export const useAppStore = create<AppState>()(
     });
   },
   clearGitDiffPreview: () => set({ gitDiffPreview: null }),
-  ensurePlanArtifactsHydratedForWorkspace: async (options: { openPanel?: boolean; reason?: string; promoteTasksToExecuting?: boolean } = {}) => {
+  ensurePlanArtifactsHydratedForWorkspace: async (options: { openPanel?: boolean; reason?: string } = {}) => {
     const state = get();
+    const hydrationWorkspace = state.currentWorkspace;
+    const hydrationSessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(hydrationWorkspace),
+      state.currentSessionId,
+    );
+    const hydrationSessionEpoch = resolveActiveSessionPlanLifecycleEpoch(
+      state,
+      hydrationSessionKey,
+    );
     const language = state.config.language === "en" ? "en" : "zh";
     const alreadyHasPlanState =
       state.planArtifacts.length > 0 ||
       state.planTasks.length > 0 ||
-      state.planStage !== "idle";
+      state.planStage !== "idle" ||
+      state.planLifecycle.status !== "empty";
 
     const openPanelPatch = options.openPanel
       ? {
@@ -5016,9 +5695,35 @@ export const useAppStore = create<AppState>()(
 
     let hydrated: Awaited<ReturnType<typeof hydrateExistingPlanArtifactsForWorkspace>> | null = null;
     try {
-      hydrated = await hydrateExistingPlanArtifactsForWorkspace(state.currentWorkspace, language);
+      hydrated = await hydrateExistingPlanArtifactsForWorkspace(hydrationWorkspace, language);
     } catch {
       hydrated = null;
+    }
+    const stateAfterHydrationRead = get();
+    const liveSessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(stateAfterHydrationRead.currentWorkspace),
+      stateAfterHydrationRead.currentSessionId,
+    );
+    const liveSessionEpoch = resolveActiveSessionPlanLifecycleEpoch(
+      stateAfterHydrationRead,
+      liveSessionKey,
+    );
+    if (
+      stateAfterHydrationRead.currentWorkspace !== hydrationWorkspace ||
+      liveSessionKey !== hydrationSessionKey ||
+      !hydrationSessionEpoch ||
+      liveSessionEpoch !== hydrationSessionEpoch
+    ) {
+      logStoreEvent("plan_workspace_hydration_skipped_stale_owner", {
+        workspace: hydrationWorkspace || null,
+        sessionKey: hydrationSessionKey,
+        liveWorkspace: stateAfterHydrationRead.currentWorkspace || null,
+        liveSessionKey,
+        hydrationSessionEpoch,
+        liveSessionEpoch,
+        reason: options.reason || "open_plan_panel",
+      });
+      return false;
     }
 
     const hasHydratedData = !!hydrated && (hydrated.artifacts.length > 0 || hydrated.tasks.length > 0);
@@ -5033,30 +5738,57 @@ export const useAppStore = create<AppState>()(
     const hydratedPlan = hydrated;
 
     set((s) => {
+      const scopedSessionKey = resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(s.currentWorkspace),
+        s.currentSessionId,
+      );
+      const scopedSessionEpoch = resolveActiveSessionPlanLifecycleEpoch(s, scopedSessionKey);
+      if (
+        s.currentWorkspace !== hydrationWorkspace ||
+        scopedSessionKey !== hydrationSessionKey ||
+        !hydrationSessionEpoch ||
+        scopedSessionEpoch !== hydrationSessionEpoch
+      ) {
+        return {};
+      }
       const liveAlreadyHasPlanState =
         s.planArtifacts.length > 0 ||
         s.planTasks.length > 0 ||
-        s.planStage !== "idle";
+        s.planStage !== "idle" ||
+        s.planLifecycle.status !== "empty";
       if (liveAlreadyHasPlanState) return openPanelPatch;
 
       const nextStage = derivePlanStageFromArtifacts(
         hydratedPlan.artifacts,
         hydratedPlan.tasks,
-        s.isPlanApproved,
+        false,
         s.planStage,
       );
-      const shouldPromoteHydratedTasksToExecuting =
-        options.promoteTasksToExecuting === true &&
-        hydratedPlan.hasTasksArtifact &&
-        hydratedPlan.tasks.length > 0;
       const threadId =
         resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId) ||
         "default";
+      const timestampMs = Date.now();
+      const ownerLifecycle =
+        s.planLifecycle.sessionKey === threadId &&
+        s.planLifecycle.sessionEpoch === hydrationSessionEpoch
+        ? s.planLifecycle
+        : createPlanLifecycleState({
+            sessionKey: threadId,
+            sessionEpoch: hydrationSessionEpoch,
+            updatedAt: timestampMs,
+          });
+      const lifecycleTransition = reducePlanLifecycle(ownerLifecycle, {
+        type: "hydrate_discovery",
+        expectedVersion: ownerLifecycle.version,
+        at: timestampMs,
+        planTurnId: s.currentTurnId || null,
+        artifactIdentity: buildPlanApprovalIdentity(hydratedPlan.artifacts),
+      });
       const nextEvent = withEventSchema({
         type: "plan_state_hydrated",
         threadId,
         turnId: s.currentTurnId || undefined,
-        timestampMs: Date.now(),
+        timestampMs,
         reason: options.reason || "open_plan_panel",
         taskCount: hydratedPlan.tasks.length,
         artifactPaths: hydratedPlan.artifacts.map((artifact) => artifact.path),
@@ -5065,8 +5797,11 @@ export const useAppStore = create<AppState>()(
       return {
         planArtifacts: hydratedPlan.artifacts,
         planTasks: hydratedPlan.tasks,
-        isPlanApproved: shouldPromoteHydratedTasksToExecuting || s.isPlanApproved,
-        planStage: shouldPromoteHydratedTasksToExecuting ? "executing" : nextStage,
+        isPlanApproved: false,
+        planStage: nextStage,
+        planLifecycle: lifecycleTransition.disposition === "rejected"
+          ? ownerLifecycle
+          : lifecycleTransition.state,
         ...openPanelPatch,
         runtimeEvents: appendRuntimeEvent(s.runtimeEvents, nextEvent),
       };
@@ -5076,7 +5811,7 @@ export const useAppStore = create<AppState>()(
       reason: options.reason || "open_plan_panel",
       artifacts: hydratedPlan.artifacts.map((artifact) => artifact.path),
       taskCount: hydratedPlan.tasks.length,
-      promotedToExecuting: options.promoteTasksToExecuting === true && hydratedPlan.hasTasksArtifact && hydratedPlan.tasks.length > 0,
+      promotedToExecuting: false,
     });
     return true;
   },
@@ -5888,7 +6623,7 @@ export const useAppStore = create<AppState>()(
         messages: sanitizeTaskBlocksForPersist(latest.taskFlow),
         storageStatus: latest.config.sessionRecordingEnabled ? "ok" : "temporary",
         recordingDisabled: !latest.config.sessionRecordingEnabled,
-        runtimeSnapshot: normalizeSessionRuntimeSnapshot(buildSessionRuntimeSnapshotFromStoreState(latest)),
+        runtimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist(buildSessionRuntimeSnapshotFromStoreState(latest)),
       });
     };
 
@@ -6665,15 +7400,10 @@ export const useAppStore = create<AppState>()(
     if (!sessionKey) return false;
     const state = get();
     const storedRuntime = state.runtimeBySessionKey[sessionKey];
-    const normalizedRuntime = storedRuntime
-      ? normalizeSessionRuntimeSnapshot(storedRuntime, {
-          restoreInterruptedGoal: true,
-          workspacePath: resolveSessionWorkspaceKey(state.currentWorkspace),
-        })
-      : undefined;
-    const runtime = storedRuntime && normalizedRuntime
-      ? { ...storedRuntime, ...normalizedRuntime }
-      : storedRuntime;
+    // runtimeBySessionKey is an in-process cache, not a restart boundary. Running
+    // Harness owners and Plan execution leases must survive an ordinary Session
+    // switch; restart normalization would incorrectly retire both here.
+    const runtime = storedRuntime;
     if (!runtime) return false;
     if (options.requireTranscript && !hasSessionRuntimeTranscript(runtime)) return false;
     set({
@@ -7008,7 +7738,29 @@ export const useAppStore = create<AppState>()(
     }
   },
   revertDiffGroups: async (groups) => {
-    const language = get().config.language === "en" ? "en" : "zh";
+    const sourceInitialState = get();
+    const sourceWorkspace = sourceInitialState.currentWorkspace.trim();
+    const sourceWorkspaceKey = resolveSessionWorkspaceKey(sourceWorkspace);
+    const sourceSessionId = sourceInitialState.currentSessionId;
+    const sourceSessionKey = resolveSessionRuntimeKey(sourceWorkspaceKey, sourceSessionId);
+    const sourceSessionRecord = sourceSessionId == null
+      ? null
+      : (sourceInitialState.sessionsByWorkspace[sourceWorkspaceKey] || []).find(
+          (session) => session.id === sourceSessionId,
+        ) || null;
+    const sourceRecordEpoch = String(sourceSessionRecord?.planLifecycleEpoch || "").trim();
+    const sourceLifecycleEpoch = sourceInitialState.planLifecycle?.sessionKey === sourceSessionKey
+      ? String(sourceInitialState.planLifecycle.sessionEpoch || "").trim()
+      : "";
+    const sourceSessionEpoch = sourceRecordEpoch || sourceLifecycleEpoch || (
+      sourceSessionRecord
+        ? createPlanLifecycleSessionEpoch(Number(sourceSessionRecord.id) || Date.now())
+        : ""
+    );
+    const resetGeneration = planDiffRevertResetGeneration;
+    planDiffRevertOperationCounter += 1;
+    const operationId = `plan-diff-revert-${planDiffRevertOperationCounter}`;
+    const language = sourceInitialState.config.language === "en" ? "en" : "zh";
     const copy = {
       noPath: language === "zh" ? "缺少文件路径，无法撤销。" : "Missing file path; cannot revert.",
       noExecuted: language === "zh" ? "没有已执行的修改可撤销。" : "No executed change is available to revert.",
@@ -7018,8 +7770,207 @@ export const useAppStore = create<AppState>()(
       rejected: language === "zh" ? "待审批修改已拒绝。" : "Pending change rejected.",
       restored: language === "zh" ? "已恢复到修改前内容。" : "Restored to the content before this change.",
       deleted: language === "zh" ? "已删除 AI 新建的文件。" : "Deleted the file created by the AI.",
+      sourceOwnerUnavailable: language === "zh"
+        ? "无法确认发起撤销的 Session 所有权，未执行文件修改。"
+        : "The source Session owner could not be verified; no file mutation was performed.",
+      settingsReset: (diskMayHaveChanged: boolean) => language === "zh"
+        ? diskMayHaveChanged
+          ? "设置重置已使本次撤销失效；文件操作可能已经完成，但旧 Session/Plan 状态不会重新注入。"
+          : "设置重置已使本次撤销失效；未继续执行文件修改，也不会重新注入旧 Session/Plan 状态。"
+        : diskMayHaveChanged
+        ? "Settings reset invalidated this revert. The file operation may have completed, but the retired Session/Plan state was not republished."
+        : "Settings reset invalidated this revert. No further file mutation was performed and the retired Session/Plan state was not republished.",
+      sourceOwnerChanged: (diskMayHaveChanged: boolean) => language === "zh"
+        ? diskMayHaveChanged
+          ? "源 Session 已被删除或更换所有者；文件操作可能已经完成，但结果未发布到任何其他 Session。"
+          : "源 Session 已被删除或更换所有者；未继续执行文件修改，也未污染当前 Session。"
+        : diskMayHaveChanged
+        ? "The source Session was removed or replaced. The file operation may have completed, but no state was published to another Session."
+        : "The source Session was removed or replaced. No further file mutation was performed and the current Session was not changed.",
+      invalidPlan: (reason: string) => language === "zh"
+        ? `撤销后的 Plan 文件未通过质量校验，未写入：${reason}`
+        : `The reverted Plan artifact failed validation and was not written: ${reason}`,
     };
     const results: DiffRevertResult[] = [];
+
+    type SourceFenceDisposition = "current" | "settings_reset" | "source_owner_lost";
+    type SourceRuntimeSnapshot = {
+      disposition: SourceFenceDisposition;
+      state: AppState | null;
+      active: boolean;
+      runtime: SessionRuntimeState | null;
+    };
+    type SourcePublication<T> = {
+      disposition: "published" | Exclude<SourceFenceDisposition, "current">;
+      value: T | null;
+    };
+
+    if (!sourceSessionKey || !sourceSessionRecord || !sourceSessionEpoch) {
+      return groups.map((group) => ({
+        path: String(group.path || "").trim(),
+        taskIds: group.taskIds.filter((id) => Number.isFinite(id)),
+        ok: false,
+        message: copy.sourceOwnerUnavailable,
+      }));
+    }
+    const exactSourceSessionKey = sourceSessionKey;
+
+    // Some temporary Sessions predate the persisted epoch field, and an
+    // ordinary Execute run need not bind the Plan lifecycle at all. Materialize
+    // the Session-owned generation before the first await so every later CAS
+    // can fence the exact container without rejecting non-Plan Diff cards.
+    let sourceEpochMaterialized = false;
+    set((latest) => {
+      if (
+        planDiffRevertResetGeneration !== resetGeneration ||
+        !isSessionRuntimeActive(latest, exactSourceSessionKey)
+      ) {
+        return {};
+      }
+      const sessions = latest.sessionsByWorkspace[sourceWorkspaceKey] || [];
+      const owner = sessions.find((session) => session.id === sourceSessionId);
+      const currentEpoch = String(owner?.planLifecycleEpoch || "").trim();
+      if (!owner || (currentEpoch && currentEpoch !== sourceSessionEpoch)) return {};
+      sourceEpochMaterialized = true;
+      if (currentEpoch === sourceSessionEpoch) return {};
+      return {
+        sessionsByWorkspace: {
+          ...latest.sessionsByWorkspace,
+          [sourceWorkspaceKey]: sessions.map((session) =>
+            session.id === sourceSessionId
+              ? { ...session, planLifecycleEpoch: sourceSessionEpoch }
+              : session
+          ),
+        },
+      };
+    });
+    if (!sourceEpochMaterialized) {
+      return groups.map((group) => ({
+        path: String(group.path || "").trim(),
+        taskIds: group.taskIds.filter((id) => Number.isFinite(id)),
+        ok: false,
+        message: copy.sourceOwnerUnavailable,
+      }));
+    }
+
+    const ownsExactSourceContainer = (candidate: AppState): boolean => {
+      const owner = (candidate.sessionsByWorkspace[sourceWorkspaceKey] || []).find(
+        (session) => session.id === sourceSessionId,
+      );
+      if (String(owner?.planLifecycleEpoch || "").trim() !== sourceSessionEpoch) return false;
+      const lifecycle = candidate.planLifecycle;
+      return lifecycle.sessionKey === UNBOUND_PLAN_SESSION_KEY
+        ? lifecycle.sessionEpoch === UNBOUND_PLAN_SESSION_EPOCH
+        : lifecycle.sessionKey === exactSourceSessionKey &&
+          lifecycle.sessionEpoch === sourceSessionEpoch;
+    };
+
+    const readSourceRuntime = (): SourceRuntimeSnapshot => {
+      if (planDiffRevertResetGeneration !== resetGeneration) {
+        return {
+          disposition: "settings_reset",
+          state: null,
+          active: false,
+          runtime: null,
+        };
+      }
+      const latest = get();
+      const active = isSessionRuntimeActive(latest, exactSourceSessionKey);
+      const runtime = active
+        ? createSessionRuntimeFromState(latest)
+        : latest.runtimeBySessionKey[exactSourceSessionKey] || null;
+      if (!runtime) {
+        return {
+          disposition: "source_owner_lost",
+          state: null,
+          active,
+          runtime: null,
+        };
+      }
+      const scopedState = (active
+        ? latest
+        : {
+            ...latest,
+            ...runtime,
+            currentWorkspace: sourceWorkspace,
+            currentSessionId: sourceSessionId,
+          }) as AppState;
+      if (!ownsExactSourceContainer(scopedState)) {
+        return {
+          disposition: "source_owner_lost",
+          state: null,
+          active,
+          runtime,
+        };
+      }
+      return { disposition: "current", state: scopedState, active, runtime };
+    };
+
+    const publishSourceRuntime = <T>(
+      build: (sourceState: AppState) => { patch: Partial<AppState>; value: T },
+    ): SourcePublication<T> => {
+      let publication: SourcePublication<T> = {
+        disposition: "source_owner_lost",
+        value: null,
+      };
+      set((latest) => {
+        if (planDiffRevertResetGeneration !== resetGeneration) {
+          publication = { disposition: "settings_reset", value: null };
+          return {};
+        }
+        const active = isSessionRuntimeActive(latest, exactSourceSessionKey);
+        const runtime = active
+          ? createSessionRuntimeFromState(latest)
+          : latest.runtimeBySessionKey[exactSourceSessionKey] || null;
+        if (!runtime) {
+          publication = { disposition: "source_owner_lost", value: null };
+          return {};
+        }
+        const scopedState = (active
+          ? latest
+          : {
+              ...latest,
+              ...runtime,
+              currentWorkspace: sourceWorkspace,
+              currentSessionId: sourceSessionId,
+            }) as AppState;
+        if (!ownsExactSourceContainer(scopedState)) {
+          publication = { disposition: "source_owner_lost", value: null };
+          return {};
+        }
+        const built = build(scopedState);
+        publication = { disposition: "published", value: built.value };
+        if (active) return built.patch;
+        const runtimePatch = pickSessionRuntimePatch(built.patch);
+        return {
+          runtimeBySessionKey: {
+            ...latest.runtimeBySessionKey,
+            [exactSourceSessionKey]: {
+              ...runtime,
+              ...runtimePatch,
+            },
+          },
+        };
+      });
+      return publication;
+    };
+
+    const fenceFailureMessage = (
+      disposition: SourceFenceDisposition,
+      diskMayHaveChanged: boolean,
+    ) => disposition === "settings_reset"
+      ? copy.settingsReset(diskMayHaveChanged)
+      : copy.sourceOwnerChanged(diskMayHaveChanged);
+    const publishWorkspaceMutationVersion = () => {
+      invalidateWorkspaceTreeCache();
+      const latest = get();
+      if (
+        planDiffRevertResetGeneration === resetGeneration &&
+        resolveSessionWorkspaceKey(latest.currentWorkspace) === sourceWorkspaceKey
+      ) {
+        latest.bumpWorkspaceContentVersion();
+      }
+    };
 
     for (const group of groups) {
       const path = String(group.path || "").trim();
@@ -7029,7 +7980,17 @@ export const useAppStore = create<AppState>()(
         continue;
       }
 
-      const state = get();
+      const sourceSnapshot = readSourceRuntime();
+      if (sourceSnapshot.disposition !== "current" || !sourceSnapshot.state) {
+        results.push({
+          path,
+          taskIds,
+          ok: false,
+          message: fenceFailureMessage(sourceSnapshot.disposition, false),
+        });
+        continue;
+      }
+      const state = sourceSnapshot.state;
       const taskIdSet = new Set(taskIds);
       const relatedBlocks = state.taskFlow.filter(
         (block): block is Extract<TaskBlock, { type: "tool" }> =>
@@ -7037,7 +7998,62 @@ export const useAppStore = create<AppState>()(
       );
       const pendingBlock = relatedBlocks.find((block) => block.toolStatus === "pending");
       if (pendingBlock) {
-        get().rejectDiff(pendingBlock.id);
+        const rejected = publishSourceRuntime((sourceState) => {
+          const request = sourceState.activeActionRequest;
+          const marker = sourceState.harnessRunMarker;
+          const ownsExactPendingReview =
+            request?.kind === "tool_permission" &&
+            request.status === "pending" &&
+            request.sessionKey === exactSourceSessionKey &&
+            request.turnId === pendingBlock.turnId &&
+            request.taskId === pendingBlock.id &&
+            sourceState.pendingReviewTaskId === pendingBlock.id &&
+            typeof sourceState.pendingReviewResolve === "function" &&
+            marker?.sessionKey === exactSourceSessionKey &&
+            (marker.status === "running" || marker.status === "paused") &&
+            marker.turnId === request.turnId &&
+            getHarnessActionRunId(marker) === request.runId &&
+            (marker.activeParentRunId || null) === (request.parentRunId || null);
+          const resolve = ownsExactPendingReview
+            ? sourceState.pendingReviewResolve
+            : null;
+          return {
+            patch: {
+              taskFlow: sourceState.taskFlow.map((block) =>
+                block.id === pendingBlock.id && block.type === "tool"
+                  ? {
+                      ...block,
+                      status: "error",
+                      toolStatus: "rejected",
+                      message: "Changes rejected by user.",
+                    }
+                  : block
+              ),
+              showDiff: false,
+              ...(resolve
+                ? {
+                    pendingReviewResolve: null,
+                    pendingReviewTaskId: null,
+                    activeActionRequest: null,
+                    pendingToolCall: null,
+                  }
+                : {}),
+            },
+            value: resolve,
+          };
+        });
+        if (rejected.disposition !== "published") {
+          results.push({
+            path,
+            taskIds,
+            ok: false,
+            message: fenceFailureMessage(rejected.disposition, false),
+          });
+          continue;
+        }
+        if (rejected.value) {
+          runAfterNextPaint(() => rejected.value?.({ action: "reject" }));
+        }
         results.push({ path, taskIds, ok: true, message: copy.rejected });
         continue;
       }
@@ -7051,39 +8067,89 @@ export const useAppStore = create<AppState>()(
       const canRevert = executedBlocks.every(supportsFullFileDiffRevert);
       if (!canRevert) {
         const message = copy.unsafeLegacy;
-        set((s) => ({
-          taskFlow: s.taskFlow.map((block) =>
-            block.type === "tool" && taskIdSet.has(block.id)
-              ? { ...block, revertStatus: "failed" as const, revertMessage: message }
-              : block
-          ),
+        const publication = publishSourceRuntime((sourceState) => ({
+          patch: {
+            taskFlow: sourceState.taskFlow.map((block) =>
+              block.type === "tool" && taskIdSet.has(block.id)
+                ? { ...block, revertStatus: "failed" as const, revertMessage: message }
+                : block
+            ),
+          },
+          value: true,
         }));
-        results.push({ path, taskIds, ok: false, message });
+        results.push({
+          path,
+          taskIds,
+          ok: false,
+          message: publication.disposition === "published"
+            ? message
+            : fenceFailureMessage(publication.disposition, false),
+        });
         continue;
       }
 
       const existed = group.existed ?? executedBlocks[0]?.diff?.existed ?? true;
-      const workspace = state.currentWorkspace.trim();
-      const sessionKey = !workspace ? resolveGlobalChatSessionKey(state.currentSessionId) : null;
-      const useChatTempStorage = !!sessionKey && !workspace;
+      const chatTempSessionKey = !sourceWorkspace
+        ? resolveGlobalChatSessionKey(sourceSessionId)
+        : null;
+      const useChatTempStorage = !!chatTempSessionKey && !sourceWorkspace;
 
-      set((s) => ({
-        taskFlow: s.taskFlow.map((block) =>
-          block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
-            ? { ...block, revertStatus: "reverting" as const, revertMessage: "" }
-            : block
-        ),
+      const reverting = publishSourceRuntime((sourceState) => ({
+        patch: {
+          taskFlow: sourceState.taskFlow.map((block) =>
+            block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
+              ? { ...block, revertStatus: "reverting" as const, revertMessage: "" }
+              : block
+          ),
+        },
+        value: true,
       }));
+      if (reverting.disposition !== "published") {
+        results.push({
+          path,
+          taskIds,
+          ok: false,
+          message: fenceFailureMessage(reverting.disposition, false),
+        });
+        continue;
+      }
 
+      let diskMutationStarted = false;
       try {
+        const canonicalPlanPath = canonicalizePlanArtifactPath(path);
+        const planArtifactKind = detectPlanArtifactKind(canonicalPlanPath);
+        const sanitizedOldText = sanitizePlanArtifactContent(group.oldText);
+        if (
+          existed &&
+          planArtifactKind &&
+          planArtifactKind !== "summary" &&
+          sanitizedOldText.trim().length > 0
+        ) {
+          const validation = validatePlanArtifactContent(sanitizedOldText, planArtifactKind);
+          if (!validation.ok) {
+            throw new Error(copy.invalidPlan(validation.reason || "invalid_plan_artifact"));
+          }
+        }
+
         let currentContent = "";
         let missingCurrentFile = false;
         try {
           currentContent = useChatTempStorage
-            ? await readChatTempFile(sessionKey!, path)
-            : await readFile(path, workspace || undefined);
+            ? await readChatTempFile(chatTempSessionKey!, path)
+            : await readFile(path, sourceWorkspace || undefined);
         } catch {
           missingCurrentFile = true;
+        }
+
+        const afterReadFence = readSourceRuntime();
+        if (afterReadFence.disposition !== "current") {
+          results.push({
+            path,
+            taskIds,
+            ok: false,
+            message: fenceFailureMessage(afterReadFence.disposition, false),
+          });
+          continue;
         }
 
         if (missingCurrentFile) {
@@ -7092,40 +8158,134 @@ export const useAppStore = create<AppState>()(
           throw new Error(copy.conflict);
         }
 
+        diskMutationStarted = true;
         if (!existed) {
           if (useChatTempStorage) {
-            await deleteChatTempPath(sessionKey!, path);
+            await deleteChatTempPath(chatTempSessionKey!, path);
           } else {
-            await deleteWorkspacePath(path, workspace || undefined);
+            await deleteWorkspacePath(path, sourceWorkspace || undefined);
           }
         } else if (useChatTempStorage) {
-          await writeChatTempFile(sessionKey!, path, group.oldText);
+          await writeChatTempFile(chatTempSessionKey!, path, group.oldText);
         } else {
-          await writeFile(path, group.oldText, workspace || undefined);
+          await writeFile(path, group.oldText, sourceWorkspace || undefined);
         }
 
         const message = existed ? copy.restored : copy.deleted;
-        set((s) => ({
-          taskFlow: s.taskFlow.map((block) =>
-            block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
-              ? { ...block, revertStatus: "reverted" as const, revertMessage: message }
-              : block
-          ),
-          ...buildPlanArtifactRevertPatch(s, path, group.oldText, existed),
-        }));
-        invalidateWorkspaceTreeCache();
-        get().bumpWorkspaceContentVersion();
+        const publication = publishSourceRuntime((sourceState) => {
+          const planTransition = buildPlanArtifactRevertTransition(
+            sourceState,
+            path,
+            group.oldText,
+            existed,
+          );
+          return {
+            patch: {
+              taskFlow: sourceState.taskFlow.map((block) =>
+                block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
+                  ? { ...block, revertStatus: "reverted" as const, revertMessage: message }
+                  : block
+              ),
+              ...planTransition.patch,
+            },
+            value: planTransition,
+          };
+        });
+        if (publication.disposition !== "published") {
+          publishWorkspaceMutationVersion();
+          results.push({
+            path,
+            taskIds,
+            ok: false,
+            message: fenceFailureMessage(publication.disposition, true),
+          });
+          continue;
+        }
+        const planTransition = publication.value;
+        const sideEffectFence = readSourceRuntime();
+        if (sideEffectFence.disposition !== "current") {
+          publishWorkspaceMutationVersion();
+          results.push({
+            path,
+            taskIds,
+            ok: false,
+            message: fenceFailureMessage(sideEffectFence.disposition, true),
+          });
+          continue;
+        }
+        const pendingPermissionInvalidation = planTransition?.pendingPermissionInvalidation;
+        if (pendingPermissionInvalidation) {
+          let settled = false;
+          try {
+            settled = settlePendingPlanToolPermissionInvalidation(pendingPermissionInvalidation);
+          } catch (settlementError) {
+            logStoreEvent("plan_tool_permission_revert_settlement_failed", {
+              requestId: pendingPermissionInvalidation.requestId,
+              taskId: pendingPermissionInvalidation.taskId,
+              error: settlementError instanceof Error
+                ? settlementError.message
+                : String(settlementError),
+            });
+          }
+          logStoreEvent("plan_tool_permission_invalidated_by_diff_revert", {
+            requestId: pendingPermissionInvalidation.requestId,
+            taskId: pendingPermissionInvalidation.taskId,
+            sessionKey: exactSourceSessionKey,
+            operationId,
+            settled,
+          });
+        } else if (planTransition?.revokedExecutionAbort) {
+          try {
+            planTransition.revokedExecutionAbort();
+            logStoreEvent("plan_execution_aborted_by_diff_revert", {
+              path: canonicalPlanPath,
+              sessionKey: exactSourceSessionKey,
+              operationId,
+            });
+          } catch (abortError) {
+            // The filesystem mutation and source-Session CAS are already
+            // committed. An observer/controller throwing during revocation
+            // must not rewrite that successful result as a failed revert.
+            logStoreEvent("plan_execution_diff_revert_abort_failed", {
+              path: canonicalPlanPath,
+              sessionKey: exactSourceSessionKey,
+              operationId,
+              error: abortError instanceof Error
+                ? abortError.message
+                : String(abortError),
+            });
+          }
+        }
+        if (planTransition?.approvalInvalidated) {
+          logStoreEvent("plan_authority_invalidated_by_diff_revert", {
+            path: canonicalPlanPath,
+            sessionKey: exactSourceSessionKey,
+            operationId,
+          });
+        }
+        publishWorkspaceMutationVersion();
         results.push({ path, taskIds, ok: true, message });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        set((s) => ({
-          taskFlow: s.taskFlow.map((block) =>
-            block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
-              ? { ...block, revertStatus: "failed" as const, revertMessage: message }
-              : block
-          ),
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        const publication = publishSourceRuntime((sourceState) => ({
+          patch: {
+            taskFlow: sourceState.taskFlow.map((block) =>
+              block.type === "tool" && taskIdSet.has(block.id) && block.toolStatus === "executed"
+                ? { ...block, revertStatus: "failed" as const, revertMessage: errorMessage }
+                : block
+            ),
+          },
+          value: true,
         }));
-        results.push({ path, taskIds, ok: false, message });
+        if (diskMutationStarted) publishWorkspaceMutationVersion();
+        results.push({
+          path,
+          taskIds,
+          ok: false,
+          message: publication.disposition === "published"
+            ? errorMessage
+            : fenceFailureMessage(publication.disposition, diskMutationStarted),
+        });
       }
     }
 
@@ -7473,6 +8633,7 @@ export const useAppStore = create<AppState>()(
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
         planExecutionProgressSnapshot: null,
+        planLifecycle: createEmptyPlanLifecycleForSession(null),
         planStage: "idle",
         isPlanApproved: false,
         planApprovalChoice: null,
@@ -7545,6 +8706,47 @@ export const useAppStore = create<AppState>()(
   },
 
   resetAllSettings: () => {
+    // Invalidate every async Diff revert before revocation or state clearing.
+    // A late filesystem promise may settle, but it can no longer republish a
+    // retired Plan or transient capability into the reset Store.
+    planDiffRevertResetGeneration += 1;
+    const current = get();
+    const activeSessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(current.currentWorkspace),
+      current.currentSessionId,
+    );
+    const hasActiveRuntimeCapability = current.currentSessionId != null ||
+      !!current.abortController ||
+      !!current.pendingRunDecisionResolver ||
+      !!current.pendingReviewResolve ||
+      !!current.harnessRunMarker;
+    const revocations = revokeAllSessionRuntimesBeforeSettingsReset({
+      activeSessionKey,
+      activeRuntime: hasActiveRuntimeCapability
+        ? createSessionRuntimeFromState(current)
+        : null,
+      runtimeBySessionKey: current.runtimeBySessionKey,
+      closeHarness: (marker) => !!closeHarnessRunMarkerForSessionDeletion({
+        runId: marker.runId,
+        sessionKey: marker.sessionKey,
+        turnId: marker.turnId!,
+        instanceId: marker.instanceId,
+        startedAt: marker.startedAt,
+      }),
+      onError: (identity, phase, error) => {
+        logStoreEvent("settings_reset_runtime_revocation_failed", {
+          ...identity,
+          phase,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      },
+    });
+    revocations.forEach(({ identity, ...result }) => {
+      logStoreEvent("settings_reset_runtime_revoked", {
+        ...identity,
+        ...result,
+      });
+    });
     for (const transaction of workspaceClearTransactions.values()) {
       invalidatedWorkspaceClearTransactions.add(transaction);
     }
@@ -7581,10 +8783,24 @@ export const useAppStore = create<AppState>()(
       feishuPairingRequests: [],
       pendingFeishuApprovals: [],
       selectedDiffTaskId: null,
+      input: "",
+      contextMentions: [],
+      attachedFiles: [],
+      lockedComposerIntent: null,
       conversationTurns: [],
       currentTurnId: null,
+      currentTurnState: createDefaultCurrentTurnState(),
       pendingRunDecision: null,
       pendingRunDecisionResolver: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      activeActionRequest: null,
+      pendingToolCall: null,
+      pendingSlashCommand: null,
+      abortController: null,
+      agentStatus: "idle",
+      isGenerating: false,
+      elapsedTime: 0,
       executionConsentPolicy: "ask_per_turn",
       currentTurnExecutionConsent: { turnId: null, granted: false },
       autoApproveTools: false,
@@ -7604,12 +8820,18 @@ export const useAppStore = create<AppState>()(
       instructionLastLoadedAt: null,
       hookLastLoadedAt: null,
       sessionHookCache: [],
+      activeGoal: null,
+      goalProgress: null,
+      goalStatus: "paused",
+      goalIterationBudget: DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
+      goalRuntime: null,
       planArtifacts: [],
       planTasks: [],
       planExecutionEvidenceLedger: [],
       planExecutionEvidenceCount: 0,
       planAutoResumeCount: 0,
       planExecutionProgressSnapshot: null,
+      planLifecycle: createEmptyPlanLifecycleForSession(null),
       planStage: "idle",
       isPlanApproved: false,
       planApprovalChoice: null,
@@ -7619,11 +8841,13 @@ export const useAppStore = create<AppState>()(
       showPlanPanel: false,
       normalizedStreamState: defaultNormalizedStreamState,
       harnessRunMarker: null,
+      ...getClosedSessionPanelPatch(),
     });
   },
 
   // ── Workflow Mode ──────────────────────────────────────────────────
 
+  planLifecycle: createEmptyPlanLifecycleForSession(null, { now: 0 }),
   isPlanApproved: false,
   planApprovalChoice: null,
   pendingPlanApprovalHandoff: null,
@@ -7643,9 +8867,12 @@ export const useAppStore = create<AppState>()(
     config: { ...s.config, workflowMode: mode },
     ...(mode === "chat" ? { showPlanPanel: false, showDiff: false } : {}),
   })),
-  setIsPlanApproved: (v) => set({ isPlanApproved: v, ...(v ? {} : { planApprovalChoice: null }) }),
   setPlanStage: (stage) => set({ planStage: stage }),
-  upsertPlanArtifact: (artifact) =>
+  upsertPlanArtifact: (artifact) => {
+    const invalidatedPlanToolReviewRef: {
+      current: PendingPlanToolPermissionInvalidation | null;
+    } = { current: null };
+    const revokedPlanExecutionAbortRef: { current: (() => void) | null } = { current: null };
     set((s) => {
       const canonicalPath = canonicalizePlanArtifactPath(artifact.path);
       const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
@@ -7723,13 +8950,41 @@ export const useAppStore = create<AppState>()(
             s.planExecutionEvidenceLedger,
             s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
           );
-      const nextStage = derivePlanStageFromArtifacts(
-        nextArtifacts,
-        normalizedTasks,
-        s.isPlanApproved,
-        s.planStage,
-      );
       const nextApprovalIdentity = buildPlanApprovalIdentity(nextArtifacts);
+      const lifecycleSessionKey = resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(s.currentWorkspace),
+        s.currentSessionId,
+      ) || UNBOUND_PLAN_SESSION_KEY;
+      const lifecycleNow = Date.now();
+      let nextPlanLifecycle = transitionPlanLifecycleArtifactIdentity({
+        lifecycle: s.planLifecycle,
+        sessionKey: lifecycleSessionKey,
+        artifactIdentity: toPlanLifecycleArtifactIdentity(nextApprovalIdentity),
+        now: lifecycleNow,
+      });
+      const approvalInvalidated = Boolean(
+        (s.isPlanApproved || s.planLifecycle.approvalLease) &&
+        !nextPlanLifecycle.approvalLease,
+      );
+      const planToolInvalidation = buildPendingPlanToolPermissionInvalidation(
+        s,
+        approvalInvalidated,
+      );
+      invalidatedPlanToolReviewRef.current = planToolInvalidation;
+      if (
+        approvalInvalidated &&
+        !planToolInvalidation &&
+        isHarnessMarkerOwnedByPlanExecution({
+          lifecycle: s.planLifecycle,
+          marker: s.harnessRunMarker,
+        }) &&
+        s.abortController &&
+        !s.abortController.signal.aborted
+      ) {
+        revokedPlanExecutionAbortRef.current = () => s.abortController?.abort();
+      }
+      const effectivePlanApproved = s.isPlanApproved &&
+        isPlanApprovalLeaseBoundToState(nextPlanLifecycle);
       const shouldRefreshPlanReviewRequest =
         s.activeActionRequest?.kind === "plan_review" &&
         !!nextApprovalIdentity &&
@@ -7751,6 +9006,26 @@ export const useAppStore = create<AppState>()(
             artifactPaths: nextApprovalIdentity.artifactPaths,
           })
         : s.activeActionRequest;
+      if (
+        shouldRefreshPlanReviewRequest &&
+        nextPlanReviewRequest?.kind === "plan_review" &&
+        nextApprovalIdentity
+      ) {
+        const alignedLifecycle = alignPlanLifecycleWithReview({
+          lifecycle: nextPlanLifecycle,
+          sessionKey: lifecycleSessionKey,
+          request: nextPlanReviewRequest,
+          artifactIdentity: nextApprovalIdentity,
+          now: lifecycleNow,
+        });
+        if (alignedLifecycle) nextPlanLifecycle = alignedLifecycle;
+      }
+      const nextStage = derivePlanStageFromArtifacts(
+        nextArtifacts,
+        approvalInvalidated ? [] : normalizedTasks,
+        effectivePlanApproved,
+        s.planStage,
+      );
       logStoreEvent("plan_artifact_stage_transition", {
         path: canonicalPath,
         kind: artifact.kind,
@@ -7758,17 +9033,35 @@ export const useAppStore = create<AppState>()(
         nextStage,
         artifacts: nextArtifacts.length,
         tasks: normalizedTasks.length,
-        approved: s.isPlanApproved,
+        approved: effectivePlanApproved,
+        approvalInvalidated,
+        lifecycleStatus: nextPlanLifecycle.status,
+        lifecycleVersion: nextPlanLifecycle.version,
       });
 
-      const shouldAutoOpenPlanPanel = !s.isPlanApproved && s.planStage !== "executing";
+      const shouldAutoOpenPlanPanel = !effectivePlanApproved && s.planStage !== "executing";
 
       return {
         planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
         planStage: nextStage,
-        planTasks: normalizedTasks,
+        planTasks: approvalInvalidated ? [] : normalizedTasks,
+        planLifecycle: nextPlanLifecycle,
         ...(shouldRefreshPlanReviewRequest ? { activeActionRequest: nextPlanReviewRequest } : {}),
+        ...(planToolInvalidation?.patch || {}),
         clearedPlanTurnId: null,
+        ...(approvalInvalidated
+          ? {
+              isPlanApproved: false,
+              planApprovalChoice: null,
+              pendingPlanApprovalHandoff: null,
+              planApprovalExecutionStartedForTurnId: null,
+              currentTurnExecutionConsent: { turnId: null, granted: false },
+              planExecutionEvidenceLedger: [],
+              planExecutionEvidenceCount: 0,
+              planAutoResumeCount: 0,
+              planExecutionProgressSnapshot: null,
+            }
+          : {}),
         ...(shouldAutoOpenPlanPanel
           ? {
               showPlanPanel: true,
@@ -7776,12 +9069,71 @@ export const useAppStore = create<AppState>()(
             }
           : {}),
       };
-    }),
-  clearPlanArtifacts: () =>
+    });
+    const invalidatedPlanToolReview = invalidatedPlanToolReviewRef.current;
+    if (invalidatedPlanToolReview) {
+      const settled = settlePendingPlanToolPermissionInvalidation(invalidatedPlanToolReview);
+      logStoreEvent("plan_tool_permission_invalidated_by_artifact_change", {
+        requestId: invalidatedPlanToolReview.requestId,
+        taskId: invalidatedPlanToolReview.taskId,
+        sessionKey: get().getCurrentSessionKey(),
+        settled,
+        source: "global_upsert",
+      });
+    }
+    if (revokedPlanExecutionAbortRef.current) {
+      try {
+        revokedPlanExecutionAbortRef.current();
+        logStoreEvent("plan_execution_aborted_by_artifact_change", {
+          sessionKey: get().getCurrentSessionKey(),
+          source: "global_upsert",
+        });
+      } catch (error) {
+        logStoreEvent("plan_execution_abort_failed_after_artifact_change", {
+          sessionKey: get().getCurrentSessionKey(),
+          source: "global_upsert",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  },
+  clearPlanArtifacts: () => {
+    const invalidatedPlanToolReviewRef: {
+      current: PendingPlanToolPermissionInvalidation | null;
+    } = { current: null };
+    const revokedPlanExecutionAbortRef: { current: (() => void) | null } = { current: null };
     set((s) => {
       const before = summarizePlanWorkspaceStateForLog(s);
       const nextRightPanelTab = s.rightPanelTab === "plan" ? "terminal" as const : s.rightPanelTab;
+      const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId);
+      const lifecycleOwner = ensurePlanLifecycleSessionOwner(
+        s.planLifecycle,
+        sessionKey || UNBOUND_PLAN_SESSION_KEY,
+      );
+      const lifecycleReset = reducePlanLifecycle(lifecycleOwner, {
+        type: "reset",
+        expectedVersion: lifecycleOwner.version,
+        at: Date.now(),
+      });
+      const planToolInvalidation = buildPendingPlanToolPermissionInvalidation(s, true);
+      invalidatedPlanToolReviewRef.current = planToolInvalidation;
+      if (
+        !planToolInvalidation &&
+        (s.planLifecycle.approvalLease || s.planLifecycle.executionLease) &&
+        isHarnessMarkerOwnedByPlanExecution({
+          lifecycle: s.planLifecycle,
+          marker: s.harnessRunMarker,
+        }) &&
+        s.abortController &&
+        !s.abortController.signal.aborted
+      ) {
+        revokedPlanExecutionAbortRef.current = () => s.abortController?.abort();
+      }
+      const clearsPlanReviewRequest = s.activeActionRequest?.kind === "plan_review";
       const patch = {
+        planLifecycle: lifecycleReset.disposition === "rejected"
+          ? lifecycleOwner
+          : lifecycleReset.state,
         planArtifacts: [],
         planStage: "idle" as const,
         planTasks: [],
@@ -7793,13 +9145,13 @@ export const useAppStore = create<AppState>()(
         planApprovalChoice: null,
         pendingPlanApprovalHandoff: null,
         planApprovalExecutionStartedForTurnId: null,
-        activeActionRequest: null,
+        ...(clearsPlanReviewRequest ? { activeActionRequest: null } : {}),
+        ...(planToolInvalidation?.patch || {}),
         clearedPlanTurnId: s.currentTurnId || s.conversationTurns.find((turn) => isPlanConversationTurn(turn) && turn.status !== "done" && turn.status !== "completed_with_changes")?.id || null,
         isPlanApproved: false,
         showPlanPanel: false,
         rightPanelTab: nextRightPanelTab,
       };
-      const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(s.currentWorkspace), s.currentSessionId);
       const runtimeBySessionKey = sessionKey
         ? {
             ...s.runtimeBySessionKey,
@@ -7819,7 +9171,34 @@ export const useAppStore = create<AppState>()(
         ...patch,
         runtimeBySessionKey,
       };
-    }),
+    });
+    const invalidatedPlanToolReview = invalidatedPlanToolReviewRef.current;
+    if (invalidatedPlanToolReview) {
+      const settled = settlePendingPlanToolPermissionInvalidation(invalidatedPlanToolReview);
+      logStoreEvent("plan_tool_permission_invalidated_by_artifact_change", {
+        requestId: invalidatedPlanToolReview.requestId,
+        taskId: invalidatedPlanToolReview.taskId,
+        sessionKey: get().getCurrentSessionKey(),
+        settled,
+        source: "global_clear",
+      });
+    }
+    if (revokedPlanExecutionAbortRef.current) {
+      try {
+        revokedPlanExecutionAbortRef.current();
+        logStoreEvent("plan_execution_aborted_by_artifact_change", {
+          sessionKey: get().getCurrentSessionKey(),
+          source: "global_clear",
+        });
+      } catch (error) {
+        logStoreEvent("plan_execution_abort_failed_after_artifact_change", {
+          sessionKey: get().getCurrentSessionKey(),
+          source: "global_clear",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  },
   deletePersistedPlanFiles: async () => {
     const state = get();
     const sessionKey = !state.currentWorkspace.trim()
@@ -7879,7 +9258,7 @@ export const useAppStore = create<AppState>()(
     (() => {
       const state = get();
       const approvedTurnId = state.currentTurnId;
-      if (state.isPlanApproved) {
+      if (state.isPlanApproved && isPlanApprovalLeaseBoundToState(state.planLifecycle)) {
         logStoreEvent("plan_approval_handoff_deduped", {
           reason: "already_approved",
           planTurnId: approvedTurnId,
@@ -7895,8 +9274,18 @@ export const useAppStore = create<AppState>()(
       const approvalIdentity = buildPlanApprovalIdentity(state.planArtifacts);
       if (!approvedTurnId || !hasReviewablePlanArtifact(state.planArtifacts) || !approvalIdentity) {
         const language = state.config.language === "en" ? "en" : "zh";
+        const approvalSessionKey = resolveSessionRuntimeKey(
+          resolveSessionWorkspaceKey(state.currentWorkspace),
+          state.currentSessionId,
+        ) || UNBOUND_PLAN_SESSION_KEY;
         state.abortController?.abort();
         set((s) => ({
+          planLifecycle: revokePlanLifecycleToDiscovery({
+            lifecycle: s.planLifecycle,
+            sessionKey: approvalSessionKey,
+            artifacts: s.planArtifacts,
+            planTurnId: approvedTurnId,
+          }),
           isPlanApproved: false,
           planApprovalChoice: null,
           pendingPlanApprovalHandoff: null,
@@ -7985,7 +9374,17 @@ export const useAppStore = create<AppState>()(
           artifactHash: approvalIdentity.artifactHash,
           artifactPaths: approvalIdentity.artifactPaths,
         });
-        set({ activeActionRequest: refreshedRequest });
+        const refreshedLifecycle = alignPlanLifecycleWithReview({
+          lifecycle: state.planLifecycle,
+          sessionKey: reviewSessionKey || UNBOUND_PLAN_SESSION_KEY,
+          request: refreshedRequest,
+          artifactIdentity: approvalIdentity,
+        });
+        set({
+          activeActionRequest: refreshedRequest,
+          ...(refreshedLifecycle ? { planLifecycle: refreshedLifecycle } : {}),
+          isPlanApproved: false,
+        });
         logStoreEvent("plan_approval_blocked_stale_review_request", {
           planTurnId: approvedTurnId,
           staleRequestId: reviewRequest.requestId,
@@ -8009,6 +9408,15 @@ export const useAppStore = create<AppState>()(
           : executionReadiness.reason || "unknown_plan_execution_readiness_failure";
         state.abortController?.abort();
         set((s) => ({
+          planLifecycle: pausePlanLifecycle({
+            lifecycle: ensurePlanLifecycleSessionOwner(
+              s.planLifecycle,
+              reviewSessionKey || UNBOUND_PLAN_SESSION_KEY,
+            ),
+            reason: "plan_execution_materialization_failed",
+            resultKind: "blocked",
+            resumeCondition: "revise_and_review_plan",
+          }),
           isPlanApproved: false,
           planApprovalChoice: null,
           pendingPlanApprovalHandoff: null,
@@ -8065,15 +9473,15 @@ export const useAppStore = create<AppState>()(
         : null;
       const hasPendingHandoffForTurn =
         !!approvedTurnId && state.pendingPlanApprovalHandoff?.planTurnId === approvedTurnId;
-      const hasStartedExecutionForTurn =
-        !!approvedTurnId && state.planApprovalExecutionStartedForTurnId === approvedTurnId;
-      const isAlreadyExecutingCurrentTurn =
-        !!approvedTurnId && state.planStage === "executing" && currentTurn?.status === "executing";
-      if (hasPendingHandoffForTurn || hasStartedExecutionForTurn || isAlreadyExecutingCurrentTurn) {
+      const isAlreadyExecutingCurrentAttempt =
+        !!approvedTurnId &&
+        state.planLifecycle.status === "executing" &&
+        state.planLifecycle.execution?.turnId === approvedTurnId;
+      if (hasPendingHandoffForTurn || isAlreadyExecutingCurrentAttempt) {
         logStoreEvent("plan_approval_handoff_deduped", {
           reason: hasPendingHandoffForTurn
             ? "pending_same_turn_execution_exists"
-            : "same_turn_execution_already_started",
+            : "execution_attempt_already_started",
           planTurnId: approvedTurnId,
           executionTurnId: approvedTurnId,
           currentTurnStatus: currentTurn?.status ?? null,
@@ -8096,99 +9504,139 @@ export const useAppStore = create<AppState>()(
       // Reserve the child owner before stopping the review run. This closes
       // the slow-first-token gap where an approved plan was executing but its
       // only visible checkpoint still belonged to no run at all.
-      const executionRunId = approvedTurnId
-        ? createSubmitHarnessRunId(Date.now())
-        : null;
-      const executionParentRunId = executionRunId
-        ? reviewRequest?.runId || getHarnessActionRunId(state.harnessRunMarker) || null
-        : null;
-      const pendingHandoffPatch = approvedTurnId
-        ? {
-            planTurnId: approvedTurnId,
-            requestedAt: Date.now(),
-            executionTurnId: approvedTurnId,
-            executionRunId: executionRunId || undefined,
-            prompt: executionPrompt,
-            planRevision: approvalIdentity.revision,
-            artifactHash: approvalIdentity.artifactHash,
-            artifactPaths: approvalIdentity.artifactPaths,
-            parentRunId: executionParentRunId,
-          }
-        : null;
-      const initialProgressSnapshot = approvedTurnId
-        ? normalizePlanExecutionProgressSnapshot({
-            turnId: approvedTurnId,
-            update: buildPlanExecutionProgressUpdate({
-              language,
-              phase: "starting",
-              iterationCount: 0,
-              maxIterations: PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-              autoResumeCount: 0,
-              tasks: executionPlanTasks,
-              evidenceLedger: [],
-              recentToolActivity: [],
-            }),
-            ...(executionRunId
-              ? {
-                  runId: executionRunId,
-                  parentRunId: executionParentRunId,
-                }
-              : {}),
-            now: Date.now(),
-          })
-        : state.planExecutionProgressSnapshot;
+      const approvalTimestamp = Date.now();
+      const executionRunId = createSubmitHarnessRunId(approvalTimestamp);
+      const executionParentRunId = reviewRequest.runId;
+      const executionInstructionHash = buildPlanExecutionInstructionHash(executionPrompt);
+      const reviewLifecycle = alignPlanLifecycleWithReview({
+        lifecycle: state.planLifecycle,
+        sessionKey: reviewSessionKey || UNBOUND_PLAN_SESSION_KEY,
+        request: reviewRequest,
+        artifactIdentity: approvalIdentity,
+        now: approvalTimestamp,
+      });
+      if (!reviewLifecycle) {
+        logStoreEvent("plan_approval_blocked_lifecycle_alignment", {
+          planTurnId: approvedTurnId,
+          sessionKey: reviewSessionKey,
+          requestId: reviewRequest.requestId,
+          planRevision: approvalIdentity.revision,
+        });
+        return;
+      }
+      const approvalLease: PlanApprovalLease = Object.freeze({
+        schemaVersion: PLAN_LIFECYCLE_SCHEMA_VERSION,
+        leaseId: createPlanApprovalLeaseId(approvalTimestamp),
+        sessionKey: reviewRequest.sessionKey,
+        sessionEpoch: reviewLifecycle.sessionEpoch,
+        planTurnId: approvedTurnId,
+        reviewRunId: reviewRequest.runId,
+        requestId: reviewRequest.requestId,
+        planRevision: approvalIdentity.revision,
+        artifactHash: approvalIdentity.artifactHash,
+        artifactPaths: Object.freeze([...approvalIdentity.artifactPaths]),
+        approvedAt: approvalTimestamp,
+        approvalTurnId: approvedTurnId,
+        approvalRunId: reviewRequest.runId,
+        approvalDecisionKind: "action_decision",
+      });
+      const approvalDecision = Object.freeze({
+        sessionKey: reviewRequest.sessionKey,
+        sessionEpoch: reviewLifecycle.sessionEpoch,
+        turnId: approvedTurnId,
+        runId: reviewRequest.runId,
+        requestId: reviewRequest.requestId,
+        kind: "action_decision" as const,
+      });
+      const executionLease: PlanExecutionLease = Object.freeze({
+        schemaVersion: PLAN_LIFECYCLE_SCHEMA_VERSION,
+        executionLeaseId: createPlanExecutionLeaseId(approvalTimestamp),
+        approvalLeaseId: approvalLease.leaseId,
+        sessionKey: approvalLease.sessionKey,
+        sessionEpoch: approvalLease.sessionEpoch,
+        planTurnId: approvedTurnId,
+        executionTurnId: approvedTurnId,
+        executionRunId,
+        parentRunId: executionParentRunId,
+        attempt: 1,
+        issuedAt: approvalTimestamp,
+        reason: "initial_approval",
+        instructionHash: executionInstructionHash,
+        authorization: approvalDecision,
+      });
+      const approvalTransition = reducePlanLifecycle(reviewLifecycle, {
+        type: "approve",
+        expectedVersion: reviewLifecycle.version,
+        at: approvalTimestamp,
+        expectedReviewIdentity: toPlanLifecycleReviewIdentity(
+          reviewRequest,
+          reviewLifecycle.sessionEpoch,
+        ),
+        decisionIdentity: approvalDecision,
+        lease: approvalLease,
+        executionLease,
+      });
+      if (approvalTransition.disposition === "rejected") {
+        logStoreEvent("plan_approval_blocked_lifecycle_transition", {
+          reason: approvalTransition.reason || "unknown",
+          planTurnId: approvedTurnId,
+          sessionKey: reviewSessionKey,
+          requestId: reviewRequest.requestId,
+          lifecycleVersion: reviewLifecycle.version,
+        });
+        return;
+      }
+      const approvedPlanLifecycle = approvalTransition.state;
+      const pendingHandoffPatch: PlanApprovalHandoff = {
+        planTurnId: approvedTurnId,
+        requestedAt: approvalTimestamp,
+        executionTurnId: approvedTurnId,
+        executionRunId,
+        executionAttempt: executionLease.attempt,
+        executionInstructionHash,
+        prompt: executionPrompt,
+        planRevision: approvalIdentity.revision,
+        artifactHash: approvalIdentity.artifactHash,
+        artifactPaths: approvalIdentity.artifactPaths,
+        parentRunId: executionParentRunId,
+        approvalLeaseId: approvalLease.leaseId,
+        executionLeaseId: executionLease.executionLeaseId,
+        sessionEpoch: approvalLease.sessionEpoch,
+        reviewRequestId: approvalLease.requestId,
+      };
       const activePlanLoop = !!approvedTurnId && isPlanReviewExecutionLeaseActive({
         agentStatus: state.agentStatus,
         isGenerating: state.isGenerating,
         hasAbortController: state.abortController !== null,
       });
       const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
-      const initialProgressEvent = approvedTurnId && executionRunId && initialProgressSnapshot
-        ? withEventSchema({
-            type: "progress.updated",
-            threadId: reviewSessionKey,
-            turnId: approvedTurnId,
-            timestampMs: initialProgressSnapshot.updatedAt,
-            runId: executionRunId,
-            parentRunId: executionParentRunId,
-            progress: toPlanExecutionRuntimeProgressUpdate({
-              snapshot: initialProgressSnapshot,
-              language,
-              dedupeKey: `plan-execution-progress:${executionRunId}`,
-            }),
-          })
-        : null;
 
       set((s) => ({
-        isPlanApproved: true,
+        planLifecycle: approvedPlanLifecycle,
+        isPlanApproved: false,
         ...approvalChoicePatch,
-        ...(approvedTurnId
-          ? { currentTurnExecutionConsent: { turnId: approvedTurnId, granted: true } }
-          : {}),
+        currentTurnExecutionConsent: { turnId: null, granted: false },
         pendingPlanApprovalHandoff: pendingHandoffPatch,
         planApprovalExecutionStartedForTurnId: null,
         activeActionRequest: null,
         planExecutionEvidenceLedger: [],
         planExecutionEvidenceCount: 0,
         planAutoResumeCount: 0,
-        planExecutionProgressSnapshot: initialProgressSnapshot,
-        ...(initialProgressEvent
-          ? { runtimeEvents: appendRuntimeEvent(s.runtimeEvents, initialProgressEvent) }
-          : {}),
+        planExecutionProgressSnapshot: null,
         ...(executionPlanTasks.length > 0 ? { planTasks: executionPlanTasks } : {}),
         agentStatus: activePlanLoop ? s.agentStatus : "idle",
         isGenerating: activePlanLoop ? s.isGenerating : false,
         abortController: activePlanLoop ? s.abortController : null,
-        planStage: "executing",
+        planStage: "ready_to_execute",
         conversationTurns: approvedTurnId
           ? s.conversationTurns.map((turn) =>
               turn.id === approvedTurnId
                 ? {
                     ...turn,
-                    status: "executing" as const,
+                    status: "paused" as const,
                     summary: language === "zh"
-                      ? "计划已批准，正在当前回合继续执行。"
-                      : "Plan approved; execution is continuing in the current turn.",
+                      ? "计划已批准，正在接纳新的执行 Run。"
+                      : "Plan approved; the new execution Run is being admitted.",
                   }
                 : turn,
             )
@@ -8226,6 +9674,235 @@ export const useAppStore = create<AppState>()(
         });
       }
     })(),
+  resumePlanExecution: (instruction) => {
+    const state = get();
+    const lifecycle = state.planLifecycle;
+    const prompt = String(instruction || "").trim();
+    const sessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(state.currentWorkspace),
+      state.currentSessionId,
+    );
+    const planTurnAlreadyTerminal = !!sessionKey &&
+      !!lifecycle.planTurnId &&
+      state.runtimeEvents.some((event) =>
+        isTerminalTurnEvent(event) &&
+        event.threadId === sessionKey &&
+        event.turnId === lifecycle.planTurnId
+      );
+    const buildTerminalPlanOwnerRevocationPatch = (latest: AppState): Partial<AppState> => ({
+      planLifecycle: revokePlanLifecycleToDiscovery({
+        lifecycle: latest.planLifecycle,
+        sessionKey: sessionKey || UNBOUND_PLAN_SESSION_KEY,
+        artifacts: latest.planArtifacts,
+        planTurnId: lifecycle.planTurnId,
+      }),
+      isPlanApproved: false,
+      planApprovalChoice: null,
+      pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: null,
+      currentTurnExecutionConsent: { turnId: null, granted: false },
+      planStage: derivePlanStageFromArtifacts(
+        latest.planArtifacts,
+        latest.planTasks,
+        false,
+        "idle",
+      ),
+      showPlanPanel: latest.planArtifacts.length > 0,
+    });
+    if (planTurnAlreadyTerminal) {
+      if (
+        lifecycle.status !== "paused" ||
+        !lifecycle.approvalLease ||
+        !isPlanApprovalLeaseBoundToState(lifecycle)
+      ) {
+        logStoreEvent("plan_explicit_resume_rejected", {
+          reason: "plan_turn_already_terminal_without_resumable_owner",
+          sessionKey,
+          planTurnId: lifecycle.planTurnId,
+          lifecycleStatus: lifecycle.status,
+        });
+        return false;
+      }
+      let revoked = false;
+      set((latest) => {
+        const owner = latest.planLifecycle;
+        const stillTerminal = latest.runtimeEvents.some((event) =>
+          isTerminalTurnEvent(event) &&
+          event.threadId === sessionKey &&
+          event.turnId === lifecycle.planTurnId
+        );
+        if (
+          !stillTerminal ||
+          owner.sessionKey !== lifecycle.sessionKey ||
+          owner.sessionEpoch !== lifecycle.sessionEpoch ||
+          owner.version !== lifecycle.version
+        ) return {};
+        revoked = true;
+        return buildTerminalPlanOwnerRevocationPatch(latest);
+      });
+      logStoreEvent("plan_explicit_resume_rejected", {
+        reason: revoked
+          ? "plan_turn_terminal_owner_revoked_to_discovery"
+          : "plan_turn_terminal_owner_compare_and_swap_conflict",
+        sessionKey,
+        planTurnId: lifecycle.planTurnId,
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+    const busy = !!state.abortController || state.isGenerating ||
+      state.agentStatus === "running" || state.agentStatus === "pending_review";
+    if (
+      !prompt ||
+      !sessionKey ||
+      lifecycle.sessionKey !== sessionKey ||
+      lifecycle.status !== "paused" ||
+      !lifecycle.planTurnId ||
+      !lifecycle.approvalLease ||
+      !isPlanApprovalLeaseBoundToState(lifecycle) ||
+      busy ||
+      !!state.activeActionRequest
+    ) {
+      logStoreEvent("plan_explicit_resume_rejected", {
+        reason: !prompt
+          ? "empty_instruction"
+          : !sessionKey || lifecycle.sessionKey !== sessionKey
+          ? "session_owner_mismatch"
+          : lifecycle.status !== "paused"
+          ? "plan_execution_not_paused"
+          : !lifecycle.approvalLease || !isPlanApprovalLeaseBoundToState(lifecycle)
+          ? "approval_lease_missing_or_stale"
+          : busy
+          ? "run_owner_still_active"
+          : state.activeActionRequest
+          ? "action_request_pending"
+          : "plan_turn_missing",
+        sessionKey,
+        planTurnId: lifecycle.planTurnId,
+        lifecycleStatus: lifecycle.status,
+      });
+      return false;
+    }
+
+    const issuedAt = Date.now();
+    const executionRunId = createSubmitHarnessRunId(issuedAt);
+    const requestId = `plan-resume-action-${executionRunId}`;
+    const resumeActionOwner = lifecycle.execution
+      ? {
+          turnId: lifecycle.execution.turnId,
+          runId: lifecycle.execution.runId,
+        }
+      : {
+          turnId: lifecycle.approvalLease.approvalTurnId,
+          runId: lifecycle.approvalLease.approvalRunId,
+        };
+    const issued = issuePlanExplicitResumeAttempt({
+      lifecycle,
+      instruction: prompt,
+      executionRunId,
+      executionLeaseId: `plan-execution-resume-${executionRunId}`,
+      authorization: {
+        kind: "action_decision",
+        turnId: resumeActionOwner.turnId,
+        runId: resumeActionOwner.runId,
+        requestId,
+      },
+      issuedAt,
+    });
+    if (!issued.ok) {
+      logStoreEvent("plan_explicit_resume_rejected", {
+        reason: issued.reason,
+        sessionKey,
+        planTurnId: lifecycle.planTurnId,
+        priorRunId: lifecycle.execution?.runId || lifecycle.approvalLease.approvalRunId,
+      });
+      return false;
+    }
+
+    let reserved = false;
+    let reservationRejectionReason = "lifecycle_compare_and_swap_conflict";
+    set((latest) => {
+      const owner = latest.planLifecycle;
+      const ownerTurnAlreadyTerminal = latest.runtimeEvents.some((event) =>
+        isTerminalTurnEvent(event) &&
+        event.threadId === sessionKey &&
+        event.turnId === lifecycle.planTurnId
+      );
+      if (
+        owner.sessionKey !== lifecycle.sessionKey ||
+        owner.sessionEpoch !== lifecycle.sessionEpoch ||
+        owner.version !== lifecycle.version ||
+        owner.status !== "paused" ||
+        latest.abortController ||
+        latest.isGenerating ||
+        latest.agentStatus === "running" ||
+        latest.agentStatus === "pending_review" ||
+        latest.activeActionRequest ||
+        ownerTurnAlreadyTerminal
+      ) {
+        if (ownerTurnAlreadyTerminal) {
+          reservationRejectionReason = "plan_turn_terminal_owner_revoked_to_discovery";
+          if (
+            owner.sessionKey === lifecycle.sessionKey &&
+            owner.sessionEpoch === lifecycle.sessionEpoch &&
+            owner.version === lifecycle.version
+          ) {
+            return buildTerminalPlanOwnerRevocationPatch(latest);
+          }
+        }
+        return {};
+      }
+      reserved = true;
+      return {
+        planLifecycle: issued.lifecycle,
+        isPlanApproved: false,
+        pendingPlanApprovalHandoff: issued.handoff,
+        planApprovalExecutionStartedForTurnId: null,
+        currentTurnExecutionConsent: { turnId: null, granted: false },
+        planStage: "ready_to_execute",
+        conversationTurns: latest.conversationTurns.map((turn) =>
+          turn.id === lifecycle.planTurnId
+            ? {
+                ...turn,
+                status: "paused" as const,
+                summary: latest.config.language === "en"
+                  ? "The explicit Plan resume was accepted and its child Run is being admitted."
+                  : "计划续跑操作已接受，正在接纳新的子 Run。",
+              }
+            : turn
+        ),
+      };
+    });
+    if (!reserved) {
+      logStoreEvent("plan_explicit_resume_rejected", {
+        reason: reservationRejectionReason,
+        sessionKey,
+        planTurnId: lifecycle.planTurnId,
+        expectedVersion: lifecycle.version,
+      });
+      return false;
+    }
+
+    logStoreEvent("plan_explicit_resume_reserved", {
+      sessionKey,
+      planTurnId: lifecycle.planTurnId,
+      requestId,
+      executionRunId,
+      executionLeaseId: issued.handoff.executionLeaseId,
+      executionAttempt: issued.handoff.executionAttempt,
+    });
+    runAfterNextPaint(() => {
+      startApprovedPlanExecutionInCurrentTurn({
+        get,
+        setActiveState: (patch) => set(patch),
+        planTurnId: lifecycle.planTurnId!,
+        handoff: issued.handoff,
+        sessionKey,
+        source: "store_fallback",
+      });
+    });
+    return true;
+  },
   rejectPlan: (expectedIdentity) => {
     const state = get();
     if (expectedIdentity) {
@@ -8262,7 +9939,17 @@ export const useAppStore = create<AppState>()(
           : "用户已拒绝计划，本回合已完成收口。",
       });
     }
-    set({
+    const rejectionSessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(state.currentWorkspace),
+      state.currentSessionId,
+    ) || UNBOUND_PLAN_SESSION_KEY;
+    set((latest) => ({
+      planLifecycle: revokePlanLifecycleToDiscovery({
+        lifecycle: latest.planLifecycle,
+        sessionKey: rejectionSessionKey,
+        artifacts: latest.planArtifacts,
+        planTurnId: canceledTurnId,
+      }),
       isPlanApproved: false,
       planApprovalChoice: null,
       pendingPlanApprovalHandoff: null,
@@ -8275,7 +9962,7 @@ export const useAppStore = create<AppState>()(
       ...(canceledTurnId
         ? {}
         : { agentStatus: "idle", isGenerating: false, abortController: null }),
-    });
+    }));
     return true;
   },
   rejectPlanAndDeleteFiles: async (expectedIdentity) => {
@@ -9552,10 +11239,13 @@ export const useAppStore = create<AppState>()(
   approvePendingReviewForSession: (identity) => {
     const state = get();
     const taskId = identity?.taskId ?? state.pendingReviewTaskId;
-    if (
-      taskId == null ||
-      !isPendingToolPermissionResolutionCurrent(state, taskId, identity, "approve_session")
-    ) {
+    if (taskId == null) return;
+    if (!isPendingToolPermissionResolutionCurrent(state, taskId, identity, "approve_session")) {
+      invalidateStalePendingPlanToolPermission({
+        state,
+        action: "approve_session",
+        applyPatch: (patch) => set(patch),
+      });
       return;
     }
     const pendingLocalFileReadPath = normalizeLocalFileReadPath(state.pendingToolCall?.localFileReadPath);
@@ -9588,7 +11278,14 @@ export const useAppStore = create<AppState>()(
    */
   allowToolAction: (taskId: number, identity) => {
     const state = get();
-    if (!isPendingToolPermissionResolutionCurrent(state, taskId, identity, "approve_once")) return;
+    if (!isPendingToolPermissionResolutionCurrent(state, taskId, identity, "approve_once")) {
+      invalidateStalePendingPlanToolPermission({
+        state,
+        action: "approve_once",
+        applyPatch: (patch) => set(patch),
+      });
+      return;
+    }
 
     const resolve = state.pendingReviewResolve;
     if (!resolve) return;
@@ -9643,7 +11340,14 @@ export const useAppStore = create<AppState>()(
    */
   rejectToolAction: (taskId: number, identity) => {
     const state = get();
-    if (!isPendingToolPermissionResolutionCurrent(state, taskId, identity, "reject")) return;
+    if (!isPendingToolPermissionResolutionCurrent(state, taskId, identity, "reject")) {
+      invalidateStalePendingPlanToolPermission({
+        state,
+        action: "reject",
+        applyPatch: (patch) => set(patch),
+      });
+      return;
+    }
 
     const resolve = state.pendingReviewResolve;
     if (!resolve) return;
@@ -9720,7 +11424,12 @@ export const useAppStore = create<AppState>()(
       planExecutionEvidenceCount: 0,
       planAutoResumeCount: 0,
       planExecutionProgressSnapshot: null,
+      planLifecycle: createEmptyPlanLifecycleForSession(null),
       planStage: "idle",
+      isPlanApproved: false,
+      planApprovalChoice: null,
+      pendingPlanApprovalHandoff: null,
+      planApprovalExecutionStartedForTurnId: null,
       normalizedStreamState: defaultNormalizedStreamState,
       resolvedInstructionSet: null,
       instructionSources: [],
@@ -9811,6 +11520,8 @@ export const useAppStore = create<AppState>()(
     replyOptionIsCustom?: boolean;
     parentRunIdOverride?: string;
     runIdOverride?: string;
+    planExecutionLeaseId?: string;
+    planExecutionInstructionHash?: string;
     continueExistingGoal?: boolean;
     goalContinuationGuidance?: string;
     visibleGoalSubmissionEnvelope?: VisibleGoalSubmissionEnvelope;
@@ -10426,12 +12137,24 @@ export const useAppStore = create<AppState>()(
         preferredLanguage: preferredLanguage === "en" ? "en" : "zh",
         workspace: state.currentWorkspace,
         sendOriginSessionKey: submissionOriginSessionKey,
+        sendOriginSessionEpoch: resolveActiveSessionPlanLifecycleEpoch(
+          state,
+          submissionOriginSessionKey,
+        ),
         getState: get,
         setState: set,
         hydrateExistingPlanArtifactsForWorkspace,
         derivePlanStageFromArtifacts,
-        isSessionRuntimeActive: (latestState, expectedSessionKey) =>
-          resolveVisibleGoalSubmissionSessionKey(latestState) === expectedSessionKey,
+        isSessionRuntimeOwnerActive: (
+          latestState,
+          expectedSessionKey,
+          expectedSessionEpoch,
+        ) =>
+          resolveVisibleGoalSubmissionSessionKey(latestState) === expectedSessionKey &&
+          resolveActiveSessionPlanLifecycleEpoch(
+            latestState,
+            expectedSessionKey,
+          ) === expectedSessionEpoch,
         resumeSubmission: (nextText, nextImages, nextOptions) => {
           const goalCreationAuthorization =
             submitPipelineDecision.shortcuts.goalCreationAuthorization;
@@ -10568,10 +12291,6 @@ export const useAppStore = create<AppState>()(
           setState: set,
           applyPreRunSessionPatch,
           hydrateExistingPlanArtifactsForWorkspace,
-          ensureApprovedPlanRuntimeTasksForState,
-          resumeSubmission: (nextText, nextImages, nextOptions) => {
-            get().sendMessage(nextText, nextImages, nextOptions);
-          },
           onResumeBlocked: (message) => {
             const ownerTurnId = resumeRequest.uiParentTurnId || get().currentTurnId;
             if (!ownerTurnId) return;
@@ -10661,6 +12380,21 @@ export const useAppStore = create<AppState>()(
       goalCreationAuthorization,
     } = intentRouting;
 
+    const hasLivePlanApprovalCapability =
+      !!state.planLifecycle.approvalLease &&
+      isPlanApprovalLeaseBoundToState(state.planLifecycle);
+    const requestsPlanExecution =
+      effectiveRunIntent === "execute" &&
+      (
+        hasLivePlanApprovalCapability ||
+        state.planLifecycle.status === "handoff_pending" ||
+        state.planLifecycle.status === "executing"
+      );
+    const requiresPlanExecutionAdmission = Boolean(
+      options?.planExecutionLeaseId ||
+      options?.planExecutionInstructionHash ||
+      requestsPlanExecution
+    );
     const runtimeDecision = resolveSubmitRuntimeDecision({
       effectiveRunIntent,
       runtimeIntentOverride: options?.runtimeIntentOverride,
@@ -10673,6 +12407,7 @@ export const useAppStore = create<AppState>()(
       isLocalStudioCommand,
       goalCreationAuthorization,
       goalContinuationAuthorization,
+      requiresPlanExecutionAdmission,
     });
     const effectiveWorkflowMode = runtimeDecision.effectiveWorkflowMode;
     const runtimeRunIntent = runtimeDecision.runtimeRunIntent;
@@ -10725,6 +12460,7 @@ export const useAppStore = create<AppState>()(
     applySubmitPlanStateReset({
       shouldResetPlanState: runtimeDecision.shouldResetPlanState,
       defaultNormalizedStreamState,
+      planLifecycle: state.planLifecycle,
       setState: set,
     });
 
@@ -10841,7 +12577,7 @@ export const useAppStore = create<AppState>()(
       sessionScopeKey,
       titleIntentSignature,
       sanitizeTaskBlocksForPersist,
-      normalizeSessionRuntimeSnapshot,
+      normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
     });
 
     const localSlashSubmission = startGameStudioLocalSlashSubmission({
@@ -10896,6 +12632,7 @@ export const useAppStore = create<AppState>()(
       preferredLanguage,
       preservePlanState,
       shouldGrantExecutionConsentForTurn,
+      requiresPlanExecutionAdmission,
     });
     const selectedChoiceText = visibleTurnSubmission.selectedChoiceText;
     const markUserContextItemFailed = visibleTurnSubmission.markUserContextItemFailed;
@@ -11055,6 +12792,9 @@ export const useAppStore = create<AppState>()(
       goalSourceContextSnapshot,
       parentRunIdOverride: options?.parentRunIdOverride,
       runIdOverride: options?.runIdOverride,
+      planExecutionLeaseId: options?.planExecutionLeaseId,
+      planExecutionInstructionHash: options?.planExecutionInstructionHash,
+      requiresPlanExecutionAdmission,
       turnInputContextSignals,
       remoteFeishu,
       options,
@@ -11100,7 +12840,7 @@ export const useAppStore = create<AppState>()(
       PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
       sanitizeTaskBlocksForPersist,
       sanitizeAgentMessagesForPersist,
-      normalizeSessionRuntimeSnapshot,
+      normalizeSessionRuntimeSnapshot: sanitizeSessionRuntimeSnapshotForPersist,
       normalizeProviderCompatibilityByRuntimeKey,
       compactCompletedTurnAgentMessages,
       normalizeQueuedUserMessage,
@@ -11287,7 +13027,15 @@ export const useAppStore = create<AppState>()(
             goalRuntime: hydratedCurrentSession?.runtimeSnapshot?.goalRuntime || persistedState.goalRuntime,
             activeGoal: hydratedCurrentSession?.runtimeSnapshot?.activeGoal || persistedState.activeGoal,
             goalProgress: hydratedCurrentSession?.runtimeSnapshot?.goalProgress || persistedState.goalProgress,
-          }, { restoreInterruptedGoal: true })
+          }, {
+            restoreInterruptedGoal: true,
+            workspacePath: hydratedCurrentScopeKey,
+            expectedSessionKey: resolveSessionRuntimeKey(
+              hydratedCurrentScopeKey,
+              hydratedCurrentSession?.id || null,
+            ),
+            expectedSessionEpoch: hydratedCurrentSession?.planLifecycleEpoch || null,
+          })
         : undefined;
       const hydratedGoalRuntime = normalizedHydratedRuntime?.goalRuntime || null;
       const selectedMainModeKey = mapLegacyNexusModeToMainMode(

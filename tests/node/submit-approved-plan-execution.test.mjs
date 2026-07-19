@@ -1230,15 +1230,38 @@ test("approvePlan applies readiness failure before queuing a same-turn child run
   assert.match(approvePlanMethod, /plan_approval_blocked_execution_materialization/);
 });
 
-test("approvePlan reserves a child run before publishing the initial execution progress", () => {
+test("approvePlan issues an immutable attempt lease and defers execution authority until Harness admission", () => {
   const storeSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
+  const asyncRunSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/store/submitAsyncWorkflowRun.ts"),
+    "utf8",
+  );
   const approveStart = storeSource.indexOf("approvePlan: (approvalChoice, expectedIdentity) =>");
   const approveEnd = storeSource.indexOf("rejectPlan: (expectedIdentity) =>", approveStart);
   const approvePlanMethod = storeSource.slice(approveStart, approveEnd);
+  const admissionStart = asyncRunSource.indexOf("export function commitPlanExecutionRunAdmission");
+  const admissionEnd = asyncRunSource.indexOf("export async function runSubmitAsyncWorkflowRun", admissionStart);
+  const admissionMethod = asyncRunSource.slice(admissionStart, admissionEnd);
 
-  assert.match(approvePlanMethod, /const executionRunId = approvedTurnId/);
-  assert.match(approvePlanMethod, /executionRunId: executionRunId \|\| undefined/);
-  assert.match(approvePlanMethod, /runId: executionRunId/);
-  assert.match(approvePlanMethod, /toPlanExecutionRuntimeProgressUpdate\(/);
-  assert.match(approvePlanMethod, /plan-execution-progress:\$\{executionRunId\}/);
+  assert.match(approvePlanMethod, /const executionRunId = createSubmitHarnessRunId\(approvalTimestamp\)/);
+  assert.match(approvePlanMethod, /const executionParentRunId = reviewRequest\.runId/);
+  assert.match(approvePlanMethod, /const approvalLease: PlanApprovalLease = Object\.freeze\(\{/);
+  assert.match(approvePlanMethod, /const executionLease: PlanExecutionLease = Object\.freeze\(\{/);
+  assert.match(approvePlanMethod, /reason: "initial_approval"/);
+  assert.match(approvePlanMethod, /authorization: approvalDecision/);
+  assert.match(approvePlanMethod, /type: "approve"[\s\S]*lease: approvalLease,[\s\S]*executionLease,/);
+  assert.match(approvePlanMethod, /pendingPlanApprovalHandoff: pendingHandoffPatch/);
+  assert.match(approvePlanMethod, /isPlanApproved: false/);
+  assert.match(approvePlanMethod, /currentTurnExecutionConsent: \{ turnId: null, granted: false \}/);
+  assert.doesNotMatch(approvePlanMethod, /toPlanExecutionRuntimeProgressUpdate\(/);
+
+  assert.match(admissionMethod, /marker\.status !== "running"/);
+  assert.match(admissionMethod, /lifecycle\?\.status !== "handoff_pending"/);
+  assert.match(admissionMethod, /lease\.executionLeaseId !== executionLeaseId/);
+  assert.match(admissionMethod, /lease\.instructionHash !== computedInstructionHash/);
+  assert.match(admissionMethod, /lease\.executionRunId !== input\.runId/);
+  assert.match(admissionMethod, /lease\.parentRunId !== input\.parentRunId/);
+  assert.match(admissionMethod, /type: "execution_started"/);
+  assert.match(admissionMethod, /isPlanApproved: true/);
+  assert.match(admissionMethod, /currentTurnExecutionConsent: \{ turnId: input\.turnId, granted: true \}/);
 });

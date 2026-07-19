@@ -60,12 +60,3 @@ export function resolvePlanStateHydrationReason(input: {
   if (isStudioExecutionHydrationCommand(input.slashCommand)) return "studio_execution_command";
   return null;
 }
-
-export function shouldPromoteHydratedPlanToExecuting(
-  reason: PlanStateHydrationReason,
-): boolean {
-  return reason === "existing_plan_execution" ||
-    reason === "resume_plan_semantic" ||
-    reason === "continuation_state" ||
-    reason === "studio_execution_command";
-}

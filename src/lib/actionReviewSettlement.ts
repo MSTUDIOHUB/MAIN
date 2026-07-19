@@ -12,7 +12,7 @@ export interface AbortableReviewSettlement<TDecision> {
 export function createAbortableReviewSettlement<TDecision>(input: {
   signal: AbortSignal;
   abortedDecision: TDecision;
-  onContinue: () => void;
+  onContinue: () => boolean | void;
   onAbort: () => void;
   onDecision: (decision: TDecision) => void;
 }): AbortableReviewSettlement<TDecision> {
@@ -23,8 +23,16 @@ export function createAbortableReviewSettlement<TDecision>(input: {
     if (settled) return false;
     settled = true;
     if (armed) input.signal.removeEventListener("abort", handleAbort);
-    if (continueRun && !input.signal.aborted) input.onContinue();
-    else input.onAbort();
+    if (continueRun && !input.signal.aborted) {
+      const continuationAccepted = input.onContinue();
+      if (continuationAccepted === false) {
+        input.onAbort();
+        input.onDecision(input.abortedDecision);
+        return true;
+      }
+    } else {
+      input.onAbort();
+    }
     input.onDecision(decision);
     return true;
   };

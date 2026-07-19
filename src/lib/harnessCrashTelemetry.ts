@@ -1,4 +1,9 @@
 import { appendDebugLog } from "./debugLog";
+import {
+  isPlanExecutionRunProvenanceForOwner,
+  normalizePlanExecutionRunProvenance,
+  type PlanExecutionRunProvenance,
+} from "./planExecutionProvenance";
 
 export const HARNESS_RUN_MARKER_STORAGE_KEY = "main.harnessRunMarker.v1";
 const HARNESS_INSTANCE_STORAGE_KEY = "main.harnessInstance.v1";
@@ -13,6 +18,8 @@ export interface HarnessRunMarker {
   /** Current child run that owns any actionable request shown in the UI. */
   activeRunId?: string | null;
   activeParentRunId?: string | null;
+  /** Historical classification of the active child Run; revocation never reclassifies it as generic. */
+  activePlanExecutionProvenance?: PlanExecutionRunProvenance | null;
   /** Previous execution run in the same logical turn. Absent on legacy markers. */
   parentRunId?: string | null;
   /** Earliest durable message index for this logical turn across resumed runs. */
@@ -118,12 +125,14 @@ function canUseLocalStorage() {
   return typeof window !== "undefined" && !!window.localStorage;
 }
 
-function writeJson(key: string, value: unknown) {
-  if (!canUseLocalStorage()) return;
+function writeJson(key: string, value: unknown): boolean {
+  if (!canUseLocalStorage()) return false;
   try {
     window.localStorage.setItem(key, JSON.stringify(value));
+    return true;
   } catch {
     // localStorage can be unavailable in restricted WebView states.
+    return false;
   }
 }
 
@@ -159,15 +168,36 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
   const runId = typeof record.runId === "string" && record.runId.trim()
     ? record.runId
     : `legacy-${sessionKey}-${turnId || "no-turn"}-${startedAt}`;
+  const activeRunId = typeof record.activeRunId === "string" && record.activeRunId.trim()
+    ? record.activeRunId.trim()
+    : runId;
+  const activeParentRunId = typeof record.activeParentRunId === "string" && record.activeParentRunId.trim()
+    ? record.activeParentRunId.trim()
+    : null;
+  const hasPlanExecutionProvenance = Object.prototype.hasOwnProperty.call(
+    record,
+    "activePlanExecutionProvenance",
+  );
+  const candidatePlanExecutionProvenance = normalizePlanExecutionRunProvenance(
+    record.activePlanExecutionProvenance,
+  );
+  const activePlanExecutionProvenance =
+    candidatePlanExecutionProvenance &&
+    turnId &&
+    isPlanExecutionRunProvenanceForOwner(candidatePlanExecutionProvenance, {
+      sessionKey,
+      turnId,
+      runId: activeRunId,
+      parentRunId: activeParentRunId,
+    })
+      ? candidatePlanExecutionProvenance
+      : null;
   return {
     schemaVersion: 1,
     runId,
-    activeRunId: typeof record.activeRunId === "string" && record.activeRunId.trim()
-      ? record.activeRunId.trim()
-      : runId,
-    activeParentRunId: typeof record.activeParentRunId === "string" && record.activeParentRunId.trim()
-      ? record.activeParentRunId.trim()
-      : null,
+    activeRunId,
+    activeParentRunId,
+    ...(hasPlanExecutionProvenance ? { activePlanExecutionProvenance } : {}),
     parentRunId: typeof record.parentRunId === "string" && record.parentRunId.trim()
       ? record.parentRunId.trim()
       : null,
@@ -219,14 +249,15 @@ export function getCurrentHarnessInstanceId(): string {
   return instance?.instanceId || "unknown";
 }
 
-export function persistHarnessRunMarker(marker: HarnessRunMarker): HarnessRunMarker {
+export function persistHarnessRunMarker(marker: HarnessRunMarker): HarnessRunMarker | null {
   const normalized = normalizeHarnessRunMarker({
     ...marker,
     updatedAt: Date.now(),
     status: marker.status || "running",
   }) || marker;
-  writeJson(HARNESS_RUN_MARKER_STORAGE_KEY, normalized);
-  return normalized;
+  return writeJson(HARNESS_RUN_MARKER_STORAGE_KEY, normalized)
+    ? normalized
+    : null;
 }
 
 function hasSameHarnessLeaseIdentity(
@@ -241,12 +272,54 @@ function hasSameHarnessLeaseIdentity(
     current.startedAt === expected.startedAt;
 }
 
+function hasSamePlanExecutionProvenance(
+  current: PlanExecutionRunProvenance | null | undefined,
+  expected: PlanExecutionRunProvenance | null | undefined,
+): boolean {
+  if (!current || !expected) return current == null && expected == null;
+  return current.schemaVersion === expected.schemaVersion &&
+    current.sessionKey === expected.sessionKey &&
+    current.sessionEpoch === expected.sessionEpoch &&
+    current.planTurnId === expected.planTurnId &&
+    current.approvalLeaseId === expected.approvalLeaseId &&
+    current.planRevision === expected.planRevision &&
+    current.artifactHash === expected.artifactHash &&
+    current.executionLeaseId === expected.executionLeaseId &&
+    current.executionTurnId === expected.executionTurnId &&
+    current.executionRunId === expected.executionRunId &&
+    current.parentRunId === expected.parentRunId &&
+    current.attempt === expected.attempt &&
+    current.instructionHash === expected.instructionHash;
+}
+
+/**
+ * Verify the authority-bearing fields that make a persisted Harness marker a
+ * valid admission fence. Mutable telemetry can advance independently, but a
+ * caller must never observe success for another outer generation, lifecycle
+ * status, actionable child Run, or Plan execution provenance.
+ */
+function hasSameHarnessPersistenceAuthority(
+  current: HarnessRunMarker | null,
+  expected: HarnessRunMarker,
+): current is HarnessRunMarker {
+  return !!current &&
+    hasSameHarnessLeaseIdentity(current, expected) &&
+    current.status === expected.status &&
+    current.activeRunId === expected.activeRunId &&
+    current.activeParentRunId === expected.activeParentRunId &&
+    hasSamePlanExecutionProvenance(
+      current.activePlanExecutionProvenance,
+      expected.activePlanExecutionProvenance,
+    );
+}
+
 /**
  * Acquire the global Harness slot only if its exact predecessor owner is still
- * current. localStorage reads and writes are synchronous in this renderer, so
- * the identity check and write form the acquisition CAS for competing async
- * bootstraps. Mutable progress fields intentionally do not invalidate the
- * predecessor; a different run/session/turn/process generation does.
+ * current, then verify the authority-bearing postcondition from storage.
+ * This fences competing async bootstraps observed by this renderer; localStorage
+ * does not provide a cross-renderer atomic compare-and-swap. Mutable progress
+ * fields intentionally do not invalidate the predecessor; a different
+ * run/session/turn/process generation does.
  */
 export function acquireHarnessRunMarker(
   marker: HarnessRunMarker,
@@ -254,7 +327,12 @@ export function acquireHarnessRunMarker(
 ): HarnessRunMarker | null {
   const current = readHarnessRunMarker();
   if (!hasSameHarnessLeaseIdentity(current, expectedCurrent)) return null;
-  return persistHarnessRunMarker(marker);
+  const persisted = persistHarnessRunMarker(marker);
+  if (!persisted) return null;
+  const verified = readHarnessRunMarker();
+  return hasSameHarnessPersistenceAuthority(verified, persisted)
+    ? verified
+    : null;
 }
 
 export function persistHarnessRunMarkerIfOwned(
@@ -272,7 +350,12 @@ export function persistHarnessRunMarkerIfOwned(
   ) {
     return null;
   }
-  return persistHarnessRunMarker(marker);
+  const persisted = persistHarnessRunMarker(marker);
+  if (!persisted) return null;
+  const verified = readHarnessRunMarker();
+  return hasSameHarnessPersistenceAuthority(verified, persisted)
+    ? verified
+    : null;
 }
 
 function isExactHarnessRunGeneration(
@@ -316,7 +399,8 @@ export function settleHarnessRunMarkerIfOwned(
   ) {
     return null;
   }
-  persistHarnessRunMarker(marker);
+  const persisted = persistHarnessRunMarker(marker);
+  if (!persisted) return null;
   const verified = readHarnessRunMarker();
   return isExactHarnessRunGeneration(verified, owner) &&
       verified.status === marker.status &&
@@ -338,6 +422,7 @@ export function closeHarnessRunMarker(
     closedAt: Date.now(),
     updatedAt: Date.now(),
   });
+  if (!next) return null;
   appendDebugLog("info", "app.instance.closed", {
     reason: next.closeReason,
     status: next.status,
@@ -374,6 +459,7 @@ export function closeHarnessRunMarkerForSessionDeletion(
     closedAt: Date.now(),
     updatedAt: Date.now(),
   });
+  if (!next) return null;
   appendDebugLog("info", "app.instance.closed", {
     reason: next.closeReason,
     status: next.status,
@@ -398,11 +484,12 @@ export function markHarnessInstanceStarted(): HarnessUncleanRestartDiagnostic | 
     closedAt: null,
     closeReason: null,
   };
-  writeJson(HARNESS_INSTANCE_STORAGE_KEY, instance);
-  appendDebugLog("info", "app.instance.started", {
+  const instancePersisted = writeJson(HARNESS_INSTANCE_STORAGE_KEY, instance);
+  appendDebugLog(instancePersisted ? "info" : "error", "app.instance.started", {
     instanceId: instance.instanceId,
     previousInstanceId: previousInstance?.instanceId || null,
     previousClosedAt: previousInstance?.closedAt || null,
+    persistenceSucceeded: instancePersisted,
   });
 
   if (previousRun?.status === "running") {
@@ -411,7 +498,7 @@ export function markHarnessInstanceStarted(): HarnessUncleanRestartDiagnostic | 
       previousInstanceId: previousInstance?.instanceId || previousRun.instanceId || null,
       marker: previousRun,
     };
-    writeJson(HARNESS_PENDING_UNCLEAN_RESTART_KEY, diagnostic);
+    const diagnosticPersisted = writeJson(HARNESS_PENDING_UNCLEAN_RESTART_KEY, diagnostic);
     appendDebugLog("error", "app.unclean_restart_detected", {
       previousInstanceId: diagnostic.previousInstanceId,
       sessionKey: previousRun.sessionKey,
@@ -433,14 +520,26 @@ export function markHarnessInstanceStarted(): HarnessUncleanRestartDiagnostic | 
       latestTool: previousRun.latestTool,
       latestToolTarget: previousRun.latestToolTarget,
       updatedAt: previousRun.updatedAt,
+      diagnosticPersisted,
     });
-    persistHarnessRunMarker({
+    const previousRunClosed = !!persistHarnessRunMarker({
       ...previousRun,
       status: "error",
       closedAt: now,
       closeReason: "unclean_restart_detected",
       updatedAt: now,
     });
+    if (!diagnosticPersisted || !previousRunClosed) {
+      appendDebugLog("error", "app.harness_persistence_degraded", {
+        phase: "unclean_restart_reconciliation",
+        instancePersisted,
+        diagnosticPersisted,
+        previousRunClosed,
+        previousRunId: previousRun.runId,
+        previousSessionKey: previousRun.sessionKey,
+        previousTurnId: previousRun.turnId,
+      });
+    }
     return diagnostic;
   }
 
@@ -456,15 +555,16 @@ export function markHarnessInstanceClosed(reason: string) {
     closedAt: Date.now(),
     closeReason: reason,
   };
-  writeJson(HARNESS_INSTANCE_STORAGE_KEY, next);
+  const instancePersisted = writeJson(HARNESS_INSTANCE_STORAGE_KEY, next);
   const currentRun = readHarnessRunMarker();
-  appendDebugLog("info", "app.instance.closed", {
+  appendDebugLog(instancePersisted ? "info" : "error", "app.instance.closed", {
     reason,
     instanceId: next.instanceId,
     activeRun: currentRun?.status === "running",
     activeTurnId: currentRun?.turnId || null,
     activeStreamId: currentRun?.activeStreamId || null,
     activeIteration: currentRun?.iteration || 0,
+    persistenceSucceeded: instancePersisted,
   });
 }
 

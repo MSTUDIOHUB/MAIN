@@ -32,6 +32,7 @@ import {
 } from "../lib/turnPresentation";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { isPlanCandidateBlock, isReviewablePlanBlock, selectLatestPlanCandidatePreview } from "../lib/chat/chatBlockVisibility";
+import { isPlanApprovalLeaseBoundToState } from "../lib/planLifecycle";
 
 const CODE_FONT_FAMILY = "'JetBrains Mono', 'Fira Code', Menlo, Monaco, 'Courier New', monospace";
 const TERMINAL_FONT_FAMILY = [
@@ -972,16 +973,20 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     planArtifacts,
     planTasks,
     planExecutionEvidenceLedger,
+    planLifecycle,
     planStage,
     conversationTurns,
     taskFlow,
     approvePlan,
+    resumePlanExecution,
     rejectPlan,
     rejectPlanAndDeleteFiles,
     sendMessage,
     deletePersistedPlanFiles,
     deleteBrowserValidationArtifacts,
     agentStatus,
+    isGenerating,
+    abortController,
     config,
     isPlanApproved,
     currentTurnId,
@@ -1006,16 +1011,20 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     planArtifacts: useAppStore((s) => s.planArtifacts),
     planTasks: useAppStore((s) => s.planTasks),
     planExecutionEvidenceLedger: useAppStore((s) => s.planExecutionEvidenceLedger),
+    planLifecycle: useAppStore((s) => s.planLifecycle),
     planStage: useAppStore((s) => s.planStage),
     conversationTurns: useAppStore((s) => s.conversationTurns),
     taskFlow: useAppStore((s) => s.taskFlow),
     approvePlan: useAppStore((s) => s.approvePlan),
+    resumePlanExecution: useAppStore((s) => s.resumePlanExecution),
     rejectPlan: useAppStore((s) => s.rejectPlan),
     rejectPlanAndDeleteFiles: useAppStore((s) => s.rejectPlanAndDeleteFiles),
     sendMessage: useAppStore((s) => s.sendMessage),
     deletePersistedPlanFiles: useAppStore((s) => s.deletePersistedPlanFiles),
     deleteBrowserValidationArtifacts: useAppStore((s) => s.deleteBrowserValidationArtifacts),
     agentStatus: useAppStore((s) => s.agentStatus),
+    isGenerating: useAppStore((s) => s.isGenerating),
+    abortController: useAppStore((s) => s.abortController),
     config: useAppStore((s) => s.config),
     isPlanApproved: useAppStore((s) => s.isPlanApproved),
     currentTurnId: useAppStore((s) => s.currentTurnId),
@@ -1120,10 +1129,21 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     hasActivePlanContext &&
     !isPlanApproved &&
     latestPlanTurn?.status === "awaiting_input";
+  const canResumeExecution =
+    hasActivePlanContext &&
+    !!activeSessionKey &&
+    planLifecycle.sessionKey === activeSessionKey &&
+    planLifecycle.status === "paused" &&
+    isPlanApprovalLeaseBoundToState(planLifecycle) &&
+    !activeActionRequest &&
+    !isGenerating &&
+    !abortController &&
+    (agentStatus === "idle" || agentStatus === "error");
   // A visible assistant draft is only a diagnostic preview until the runtime
   // has materialized and verified a plan artifact. Never offer formal-plan
   // continuation/rejection controls for a candidate that failed the gate.
-  const canContinuePlanning = canOfferPlanContinuation({
+  // A paused, lease-bound execution always wins over planning continuation.
+  const canContinuePlanning = !canResumeExecution && canOfferPlanContinuation({
     hasActivePlanContext,
     isPlanApproved,
     isAwaitingInput,
@@ -1131,11 +1151,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
     materializedArtifactCount: planArtifacts.length,
     agentStatus,
   });
-  const canResumeExecution =
-    hasActivePlanContext &&
-    isPlanApproved &&
-    planStage === "executing" &&
-    (agentStatus === "idle" || agentStatus === "error");
   const planPresentationRequest = hasMatchingPlanReviewRequest || hasMatchingPlanChoiceRequest
     ? activeActionRequest
     : null;
@@ -1220,8 +1235,7 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
       planArtifacts.some((artifact) => artifact.kind === "tasks") ||
       planTasks.length > 0;
 
-    const resumeTurnId = latestPlanTurn?.id || currentTurnId || undefined;
-    sendMessage(
+    resumePlanExecution(
       buildTrustedResumePrompt({
         language,
         hasTasksArtifact,
@@ -1229,21 +1243,6 @@ export default function RightPanel({ activeDiffTask, rightPanelWidth, startResiz
         artifacts: planArtifacts,
         evidenceLedger: planExecutionEvidenceLedger,
       }),
-      undefined,
-      {
-        hidden: true,
-        createVisibleTurnForHiddenMessage: !resumeTurnId,
-        reuseCurrentTurn: !!resumeTurnId,
-        turnIdOverride: resumeTurnId,
-        preservePlanState: true,
-        resolvedIntent: "execute",
-        executionConsentGranted: true,
-        skipIntentResolution: true,
-        turnTitle: language === "zh" ? "计划执行恢复" : "Plan Execution Resume",
-        intentSummary: language === "zh"
-          ? "从已批准计划的剩余任务继续执行。"
-          : "Resume execution from the remaining tasks in the approved plan.",
-      },
     );
   };
   const handleSavePlanDocument = async (document: { title: string; suggestedFileName: string; content: string; sourcePath?: string }) => {

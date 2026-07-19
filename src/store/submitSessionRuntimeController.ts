@@ -21,7 +21,23 @@ import {
 } from "../lib/runIntent";
 import { normalizeApprovedPlanTaskStatuses } from "./submitApprovedPlanExecution";
 import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
-import { buildPlanReviewActionRequest, type ActionRequest } from "../lib/actionRequest";
+import type { HarnessRunMarker } from "../lib/harnessCrashTelemetry";
+import { isHarnessMarkerOwnedByPlanExecution } from "../lib/planExecutionOwnership";
+import {
+  applyPlanArtifactIdentity,
+  applyPlanReviewIdentity,
+  ensurePlanLifecycleOwner,
+  isPlanApprovalLeaseBoundToState,
+  type PlanLifecycleState,
+  type PlanReviewIdentity,
+} from "../lib/planLifecycle";
+import {
+  buildPendingPlanToolPermissionInvalidation,
+  buildPlanReviewActionRequest,
+  settlePendingPlanToolPermissionInvalidation,
+  type ActionRequest,
+  type PendingPlanToolPermissionInvalidation,
+} from "../lib/actionRequest";
 import {
   createSubmitSessionRuntimeFacade,
   type SubmitOwnerScopedRuntimeProjectionInput,
@@ -40,9 +56,22 @@ export interface SubmitSessionRuntimeControllerState<TRuntime extends object>
   planArtifacts: PlanArtifact[];
   planTasks: PlanTask[];
   planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
+  planExecutionEvidenceCount: number;
+  planAutoResumeCount: number;
+  planExecutionProgressSnapshot?: unknown | null;
+  planLifecycle: PlanLifecycleState;
   planStage: PlanStage;
   isPlanApproved: boolean;
+  planApprovalChoice?: string | null;
+  pendingPlanApprovalHandoff?: unknown | null;
+  planApprovalExecutionStartedForTurnId?: string | null;
+  currentTurnExecutionConsent?: { turnId: string | null; granted: boolean };
   activeActionRequest?: ActionRequest | null;
+  pendingReviewResolve?: ((decision: { action: "reject" }) => void) | null;
+  pendingReviewTaskId?: number | null;
+  pendingToolCall?: unknown | null;
+  abortController?: { abort: () => void; signal?: { aborted?: boolean } } | null;
+  harnessRunMarker?: HarnessRunMarker | null;
   showPlanPanel: boolean;
   showDiff: boolean;
   showTerminal: boolean;
@@ -148,7 +177,11 @@ export function createSubmitSessionRuntimeController<
       ),
     } as Partial<TState>));
 
-  const sessionUpsertPlanArtifact = (artifact: PlanArtifact) =>
+  const sessionUpsertPlanArtifact = (artifact: PlanArtifact) => {
+    const invalidatedPlanToolReviewRef: {
+      current: PendingPlanToolPermissionInvalidation | null;
+    } = { current: null };
+    const revokedPlanExecutionAbortRef: { current: (() => void) | null } = { current: null };
     sessionSet((s) => {
       const canonicalPath = canonicalizePlanArtifactPath(artifact.path);
       const sanitizedContent = sanitizePlanArtifactContent(artifact.content);
@@ -217,6 +250,47 @@ export function createSubmitSessionRuntimeController<
             s.isPlanApproved && s.planExecutionEvidenceLedger.length > 0,
           );
       const nextApprovalIdentity = buildPlanApprovalIdentity(nextArtifacts);
+      const lifecycleAt = nowMs();
+      const lifecycleOwner = ensurePlanLifecycleOwner({
+        lifecycle: s.planLifecycle,
+        sessionKey: input.runSessionKey,
+        at: lifecycleAt,
+      });
+      let nextPlanLifecycle = applyPlanArtifactIdentity({
+        lifecycle: lifecycleOwner,
+        sessionKey: input.runSessionKey,
+        artifactIdentity: nextApprovalIdentity
+          ? {
+              revision: nextApprovalIdentity.revision,
+              artifactHash: nextApprovalIdentity.artifactHash,
+              artifactPaths: nextApprovalIdentity.artifactPaths,
+            }
+          : null,
+        at: lifecycleAt,
+      });
+      const approvalInvalidated = Boolean(
+        (s.isPlanApproved || s.planLifecycle?.approvalLease) &&
+        !nextPlanLifecycle.approvalLease,
+      );
+      const planToolInvalidation = buildPendingPlanToolPermissionInvalidation(
+        s,
+        approvalInvalidated,
+      );
+      invalidatedPlanToolReviewRef.current = planToolInvalidation;
+      if (
+        approvalInvalidated &&
+        !planToolInvalidation &&
+        isHarnessMarkerOwnedByPlanExecution({
+          lifecycle: s.planLifecycle,
+          marker: s.harnessRunMarker,
+        }) &&
+        s.abortController &&
+        s.abortController.signal?.aborted !== true
+      ) {
+        revokedPlanExecutionAbortRef.current = () => s.abortController?.abort();
+      }
+      const effectivePlanApproved = s.isPlanApproved &&
+        isPlanApprovalLeaseBoundToState(nextPlanLifecycle);
       const shouldRefreshPlanReviewRequest =
         s.activeActionRequest?.kind === "plan_review" &&
         !!nextApprovalIdentity &&
@@ -238,21 +312,90 @@ export function createSubmitSessionRuntimeController<
             artifactPaths: nextApprovalIdentity.artifactPaths,
           })
         : s.activeActionRequest;
+      if (
+        shouldRefreshPlanReviewRequest &&
+        nextPlanReviewRequest?.kind === "plan_review" &&
+        nextApprovalIdentity
+      ) {
+        const reviewIdentity: PlanReviewIdentity = {
+          sessionKey: nextPlanReviewRequest.sessionKey,
+          sessionEpoch: nextPlanLifecycle.sessionEpoch,
+          turnId: nextPlanReviewRequest.turnId,
+          runId: nextPlanReviewRequest.runId,
+          parentRunId: nextPlanReviewRequest.parentRunId || null,
+          requestId: nextPlanReviewRequest.requestId,
+          planRevision: nextPlanReviewRequest.planRevision,
+          artifactHash: nextPlanReviewRequest.artifactHash,
+          artifactPaths: nextPlanReviewRequest.artifactPaths,
+        };
+        const aligned = applyPlanReviewIdentity({
+          lifecycle: nextPlanLifecycle,
+          artifactIdentity: {
+            revision: nextApprovalIdentity.revision,
+            artifactHash: nextApprovalIdentity.artifactHash,
+            artifactPaths: nextApprovalIdentity.artifactPaths,
+          },
+          reviewIdentity,
+          at: lifecycleAt,
+        });
+        if (aligned) nextPlanLifecycle = aligned;
+      }
       return {
+        planLifecycle: nextPlanLifecycle,
         planArtifacts: nextArtifacts.sort((a, b) => a.updatedAt - b.updatedAt),
         planStage: input.derivePlanStageFromArtifacts(
           nextArtifacts,
-          normalizedTasks,
-          s.isPlanApproved,
+          approvalInvalidated ? [] : normalizedTasks,
+          effectivePlanApproved,
           s.planStage,
         ),
-        planTasks: normalizedTasks,
+        planTasks: approvalInvalidated ? [] : normalizedTasks,
         ...(shouldRefreshPlanReviewRequest ? { activeActionRequest: nextPlanReviewRequest } : {}),
+        ...(planToolInvalidation?.patch || {}),
         clearedPlanTurnId: null,
+        ...(approvalInvalidated
+          ? {
+              isPlanApproved: false,
+              planApprovalChoice: null,
+              pendingPlanApprovalHandoff: null,
+              planApprovalExecutionStartedForTurnId: null,
+              currentTurnExecutionConsent: { turnId: null, granted: false },
+              planExecutionEvidenceLedger: [],
+              planExecutionEvidenceCount: 0,
+              planAutoResumeCount: 0,
+              planExecutionProgressSnapshot: null,
+            }
+          : {}),
         showPlanPanel: true,
         rightPanelTab: s.showDiff && s.rightPanelTab === "diff" ? "diff" : "plan",
       } as unknown as Partial<TState>;
     });
+    const invalidatedPlanToolReview = invalidatedPlanToolReviewRef.current;
+    if (invalidatedPlanToolReview) {
+      const settled = settlePendingPlanToolPermissionInvalidation(invalidatedPlanToolReview);
+      input.logStoreEvent("plan_tool_permission_invalidated_by_artifact_change", {
+        requestId: invalidatedPlanToolReview.requestId,
+        taskId: invalidatedPlanToolReview.taskId,
+        sessionKey: input.runSessionKey,
+        settled,
+      });
+    }
+    if (revokedPlanExecutionAbortRef.current) {
+      try {
+        revokedPlanExecutionAbortRef.current();
+        input.logStoreEvent("plan_execution_aborted_by_artifact_change", {
+          sessionKey: input.runSessionKey,
+          source: "session_controller",
+        });
+      } catch (error) {
+        input.logStoreEvent("plan_execution_abort_failed_after_artifact_change", {
+          sessionKey: input.runSessionKey,
+          source: "session_controller",
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+  };
 
   const sessionOpenRightPanelTab = (tab: RightPanelTab) =>
     sessionSet({

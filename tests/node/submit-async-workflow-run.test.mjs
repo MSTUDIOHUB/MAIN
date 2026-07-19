@@ -50,12 +50,21 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  commitPlanExecutionRunAdmission,
   finalizeSubmitBootstrapFailure,
+  projectTerminalPlanExecutionHandoffRollback,
   runSubmitAsyncWorkflowRun,
   startSubmitAsyncWorkflowRun,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitAsyncWorkflowRun.ts"),
 );
+const {
+  createPlanLifecycleState,
+  reducePlanLifecycle,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planLifecycle.ts"));
+const {
+  buildPlanExecutionInstructionHash,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planApprovalIdentity.ts"));
 
 function executionTurn(overrides = {}) {
   return {
@@ -249,6 +258,293 @@ function createHarness(overrides = {}) {
     input: baseInput,
   };
 }
+
+function createPlanAdmissionFixture(overrides = {}) {
+  const text = overrides.text || "execute the approved plan";
+  const sessionKey = "workspace::plan-session";
+  const sessionEpoch = "plan-session-epoch";
+  const turnId = "turn-plan";
+  const reviewRunId = "run-review";
+  const runId = "run-execution";
+  const instructionHash = buildPlanExecutionInstructionHash(text);
+  const artifactIdentity = {
+    revision: 3,
+    artifactHash: "plan-artifact-hash-3",
+    artifactPaths: [".MAIN/plans/plan.md"],
+  };
+  const reviewIdentity = {
+    sessionKey,
+    sessionEpoch,
+    turnId,
+    runId: reviewRunId,
+    parentRunId: "run-author",
+    requestId: "request-review",
+    planRevision: artifactIdentity.revision,
+    artifactHash: artifactIdentity.artifactHash,
+    artifactPaths: artifactIdentity.artifactPaths,
+  };
+  const decisionIdentity = {
+    sessionKey,
+    sessionEpoch,
+    turnId,
+    runId: reviewRunId,
+    requestId: reviewIdentity.requestId,
+    kind: "action_decision",
+  };
+  const approvalLease = {
+    schemaVersion: 2,
+    leaseId: "approval-lease",
+    sessionKey,
+    sessionEpoch,
+    planTurnId: turnId,
+    reviewRunId,
+    requestId: reviewIdentity.requestId,
+    planRevision: artifactIdentity.revision,
+    artifactHash: artifactIdentity.artifactHash,
+    artifactPaths: artifactIdentity.artifactPaths,
+    approvedAt: 30,
+    approvalTurnId: turnId,
+    approvalRunId: reviewRunId,
+    approvalDecisionKind: "action_decision",
+  };
+  const executionLease = {
+    schemaVersion: 2,
+    executionLeaseId: "execution-lease",
+    approvalLeaseId: approvalLease.leaseId,
+    sessionKey,
+    sessionEpoch,
+    planTurnId: turnId,
+    executionTurnId: turnId,
+    executionRunId: runId,
+    parentRunId: reviewRunId,
+    attempt: 1,
+    issuedAt: 30,
+    reason: "initial_approval",
+    instructionHash,
+    authorization: decisionIdentity,
+  };
+  let lifecycle = createPlanLifecycleState({ sessionKey, sessionEpoch, updatedAt: 1 });
+  for (const command of [
+    {
+      type: "start_drafting", expectedVersion: lifecycle.version, at: 10,
+      planTurnId: turnId, artifactIdentity,
+    },
+  ]) {
+    const result = reducePlanLifecycle(lifecycle, command);
+    assert.equal(result.disposition, "applied", result.reason);
+    lifecycle = result.state;
+  }
+  let result = reducePlanLifecycle(lifecycle, {
+    type: "request_review", expectedVersion: lifecycle.version, at: 20,
+    artifactIdentity, reviewIdentity,
+  });
+  assert.equal(result.disposition, "applied", result.reason);
+  lifecycle = result.state;
+  result = reducePlanLifecycle(lifecycle, {
+    type: "approve", expectedVersion: lifecycle.version, at: 30,
+    expectedReviewIdentity: reviewIdentity,
+    decisionIdentity,
+    lease: approvalLease,
+    executionLease,
+  });
+  assert.equal(result.disposition, "applied", result.reason);
+  lifecycle = result.state;
+
+  const marker = {
+    schemaVersion: 1,
+    status: "running",
+    runId,
+    parentRunId: reviewRunId,
+    activeRunId: runId,
+    activeParentRunId: reviewRunId,
+    sessionKey,
+    turnId,
+    instanceId: "harness-instance",
+    startedAt: 40,
+    updatedAt: 40,
+  };
+  const state = {
+    harnessRunMarker: marker,
+    planLifecycle: lifecycle,
+    planArtifacts: [{
+      kind: "plan",
+      path: artifactIdentity.artifactPaths[0],
+      title: "Plan",
+      content: "# Plan\n\n1. Execute the change.",
+      revision: artifactIdentity.revision,
+      updatedAt: 30,
+    }],
+    pendingPlanApprovalHandoff: {
+      planTurnId: turnId,
+      requestedAt: 30,
+      approvalLeaseId: approvalLease.leaseId,
+      executionLeaseId: executionLease.executionLeaseId,
+      sessionEpoch,
+      reviewRequestId: reviewIdentity.requestId,
+      executionTurnId: turnId,
+      executionRunId: runId,
+      executionAttempt: executionLease.attempt,
+      executionInstructionHash: instructionHash,
+      prompt: text,
+      planRevision: artifactIdentity.revision,
+      artifactHash: artifactIdentity.artifactHash,
+      artifactPaths: artifactIdentity.artifactPaths,
+      parentRunId: reviewRunId,
+    },
+    runtimeEvents: [],
+    conversationTurns: [executionTurn({ id: turnId, status: "paused" })],
+    currentTurnExecutionConsent: { turnId: null, granted: false },
+    isPlanApproved: false,
+    planStage: "ready_to_execute",
+  };
+  const sessionSet = (patchOrUpdater) => {
+    const patch = typeof patchOrUpdater === "function"
+      ? patchOrUpdater(state)
+      : patchOrUpdater;
+    Object.assign(state, patch);
+  };
+  return {
+    text,
+    sessionKey,
+    turnId,
+    runId,
+    reviewRunId,
+    instructionHash,
+    executionLease,
+    marker,
+    state,
+    sessionSet,
+  };
+}
+
+test("Plan Run admission atomically persists immutable provenance before granting execution", () => {
+  const fixture = createPlanAdmissionFixture();
+  const persisted = [];
+  const result = commitPlanExecutionRunAdmission({
+    text: fixture.text,
+    sessionKey: fixture.sessionKey,
+    turnId: fixture.turnId,
+    runId: fixture.runId,
+    parentRunId: fixture.reviewRunId,
+    harnessRunMarker: fixture.marker,
+    required: true,
+    planExecutionLeaseId: fixture.executionLease.executionLeaseId,
+    planExecutionInstructionHash: fixture.instructionHash,
+    at: 50,
+    sessionSet: fixture.sessionSet,
+    persistHarnessRunMarkerIfOwned: (marker) => {
+      persisted.push(marker);
+      return marker;
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.disposition, "applied");
+  assert.equal(Object.isFrozen(result.planExecution), true);
+  assert.equal(fixture.state.planLifecycle.status, "executing");
+  assert.deepEqual(fixture.state.harnessRunMarker.activePlanExecutionProvenance, result.planExecution);
+  assert.deepEqual(persisted[0].activePlanExecutionProvenance, result.planExecution);
+  assert.deepEqual(fixture.state.currentTurnExecutionConsent, {
+    turnId: fixture.turnId,
+    granted: true,
+  });
+  assert.equal(fixture.state.runtimeEvents.filter((event) => event.type === "run.started").length, 1);
+});
+
+test("Plan Run admission keeps the lifecycle reserved when Harness persistence CAS loses", () => {
+  const fixture = createPlanAdmissionFixture();
+  const result = commitPlanExecutionRunAdmission({
+    text: fixture.text,
+    sessionKey: fixture.sessionKey,
+    turnId: fixture.turnId,
+    runId: fixture.runId,
+    parentRunId: fixture.reviewRunId,
+    harnessRunMarker: fixture.marker,
+    required: true,
+    planExecutionLeaseId: fixture.executionLease.executionLeaseId,
+    planExecutionInstructionHash: fixture.instructionHash,
+    at: 50,
+    sessionSet: fixture.sessionSet,
+    persistHarnessRunMarkerIfOwned: () => null,
+  });
+
+  assert.deepEqual(result, {
+    ok: false,
+    reason: "plan_execution_harness_persist_cas_rejected",
+  });
+  assert.equal(fixture.state.planLifecycle.status, "handoff_pending");
+  assert.deepEqual(fixture.state.currentTurnExecutionConsent, { turnId: null, granted: false });
+  assert.equal(fixture.state.runtimeEvents.length, 0);
+  assert.equal(fixture.state.harnessRunMarker.activePlanExecutionProvenance, undefined);
+});
+
+test("required Plan admission cannot downgrade to not-applicable when fields are omitted", () => {
+  const fixture = createPlanAdmissionFixture();
+  const result = commitPlanExecutionRunAdmission({
+    text: fixture.text,
+    sessionKey: fixture.sessionKey,
+    turnId: fixture.turnId,
+    runId: fixture.runId,
+    parentRunId: fixture.reviewRunId,
+    harnessRunMarker: fixture.marker,
+    required: true,
+    at: 50,
+    sessionSet: fixture.sessionSet,
+    persistHarnessRunMarkerIfOwned: () => {
+      throw new Error("persistence must not be reached");
+    },
+  });
+  assert.deepEqual(result, {
+    ok: false,
+    reason: "plan_execution_admission_fields_incomplete",
+  });
+  assert.equal(fixture.state.planLifecycle.status, "handoff_pending");
+});
+
+test("a terminal Plan Turn rolls back only its exact pending child handoff", () => {
+  const fixture = createPlanAdmissionFixture();
+  fixture.state.runtimeEvents.push({
+    schemaVersion: 2,
+    type: "turn.completed",
+    threadId: fixture.sessionKey,
+    turnId: fixture.turnId,
+    timestampMs: 45,
+    resultKind: "canceled",
+  });
+  const rollback = projectTerminalPlanExecutionHandoffRollback({
+    state: fixture.state,
+    sessionKey: fixture.sessionKey,
+    turnId: fixture.turnId,
+    runId: fixture.runId,
+    parentRunId: fixture.reviewRunId,
+    timestampMs: 50,
+  });
+  assert.equal(rollback.disposition, "rolled_back");
+  assert.equal(rollback.patch.planLifecycle.status, "drafting");
+  assert.equal(rollback.patch.planLifecycle.pause, null);
+  assert.equal(rollback.patch.planLifecycle.approvalLease, null);
+  assert.equal(rollback.patch.planLifecycle.executionLease, null);
+  assert.equal(rollback.patch.planLifecycle.execution, null);
+  assert.equal(rollback.patch.planStage, "plan");
+  assert.equal(rollback.patch.showPlanPanel, true);
+  assert.equal(rollback.patch.pendingPlanApprovalHandoff, null);
+  assert.deepEqual(rollback.patch.currentTurnExecutionConsent, {
+    turnId: null,
+    granted: false,
+  });
+
+  const foreign = projectTerminalPlanExecutionHandoffRollback({
+    state: fixture.state,
+    sessionKey: fixture.sessionKey,
+    turnId: fixture.turnId,
+    runId: "run-foreign",
+    parentRunId: fixture.reviewRunId,
+    timestampMs: 50,
+  });
+  assert.equal(foreign.disposition, "owner_mismatch");
+  assert.deepEqual(foreign.patch, {});
+  assert.equal(fixture.state.planLifecycle.status, "handoff_pending");
+});
 
 test("submit async workflow run keeps stage order from context build to engine launch", async () => {
   const harness = createHarness({
@@ -611,6 +907,74 @@ test("a Turn canceled during bootstrap cannot acquire a run lease or start tools
     entry[0] === "log" && entry[1] === "submit_bootstrap_skipped_terminal_turn"
   );
   assert.equal(skipLog?.[2]?.terminalResultKind, "canceled");
+});
+
+test("terminal bootstrap detection cannot strand the exact Plan child in handoff_pending", async () => {
+  const plan = createPlanAdmissionFixture();
+  plan.state.runtimeEvents.push({
+    schemaVersion: 2,
+    type: "turn.completed",
+    threadId: plan.sessionKey,
+    turnId: plan.turnId,
+    timestampMs: 45,
+    resultKind: "canceled",
+  });
+  const harness = createHarness({
+    state: {
+      ...plan.state,
+      conversationTurns: [executionTurn({
+        id: plan.turnId,
+        status: "done",
+      })],
+      agentStatus: "idle",
+      isGenerating: false,
+    },
+    input: {
+      text: plan.text,
+      turnId: plan.turnId,
+      uiDisplayTurnId: plan.turnId,
+      runSessionKey: plan.sessionKey,
+      parentRunIdOverride: plan.reviewRunId,
+      planExecutionLeaseId: plan.executionLease.executionLeaseId,
+      planExecutionInstructionHash: plan.instructionHash,
+      requiresPlanExecutionAdmission: true,
+      phaseRunners: {
+        buildAttachmentContext: async () => ({
+          userContent: plan.text,
+          attachmentRefs: [],
+          failedAttachmentCount: 0,
+        }),
+        buildPromptContext: () => ({ userContent: plan.text }),
+        runGameStudioPreparation: async () => ({
+          ok: true,
+          userContent: plan.text,
+          activeStudioAgentKey: "coder",
+          gameStudioInitialized: true,
+          gameStudioConfigForTurn: null,
+        }),
+        startRunLease: () => {
+          throw new Error("terminal Plan Turn must not acquire a Run lease");
+        },
+      },
+    },
+  });
+
+  await runSubmitAsyncWorkflowRun(harness.input);
+
+  assert.equal(harness.state.planLifecycle.status, "drafting");
+  assert.equal(harness.state.planLifecycle.approvalLease, null);
+  assert.equal(harness.state.planLifecycle.executionLease, null);
+  assert.equal(harness.state.pendingPlanApprovalHandoff, null);
+  assert.equal(harness.state.planApprovalExecutionStartedForTurnId, null);
+  assert.deepEqual(harness.state.currentTurnExecutionConsent, {
+    turnId: null,
+    granted: false,
+  });
+  const skipLog = harness.calls.find((entry) =>
+    entry[0] === "log" && entry[1] === "submit_bootstrap_skipped_terminal_turn"
+  );
+  assert.equal(skipLog?.[2]?.planHandoffRollbackDisposition, "rolled_back");
+  assert.equal(skipLog?.[2]?.planHandoffRollbackRunId, plan.runId);
 });
 
 test("bulk clear invalidates a deferred bootstrap before lease, marker, engine, or tools", async () => {
