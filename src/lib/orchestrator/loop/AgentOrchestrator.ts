@@ -89,11 +89,6 @@ export class AgentOrchestrator {
         return this.latestExecuteRecoveryState;
     }
 
-    failActiveRun(message: string): void {
-        this.discardPendingTurnCompletion();
-        this.activeTurnEvents?.emitTurnFailedEvent(message);
-    }
-
     async execute(callbacks: OrchestratorCallbacks, abortController: AbortController) {
         this.sawExecutionEvidence = false;
         this.latestTurnContract = null;
@@ -116,7 +111,6 @@ export class AgentOrchestrator {
           eventTurnId,
           emitTurnEvent,
           emitTurnCompletedEvent,
-          emitTurnFailedEvent,
           emitRunPausedEvent: emitPreparedRunPausedEvent,
         } = turnEvents;
         const emitRunPausedEvent: typeof emitPreparedRunPausedEvent = (reason, message, progress) => {
@@ -872,6 +866,11 @@ export class AgentOrchestrator {
           if (turnEvents.hasStagedTurnCompletion()) {
             return;
           }
+          const committedPauseReason = turnEvents.getRunPauseReason();
+          if (committedPauseReason) {
+            this.latestRunPauseReason = committedPauseReason;
+            return;
+          }
           const pauseReason = workflowMode === "plan" && !callbacks.getIsPlanApproved() && callbacks.getStatus() === "pending_review"
             ? "plan_review_required"
             : "assistant_stopped";
@@ -939,7 +938,6 @@ export class AgentOrchestrator {
           activateUnityMcpFallback,
           setPlanRuntimePhase,
           clearExecuteRecovery,
-          emitTurnFailedEvent,
           emitPlanExecutionProgress,
           activateExecuteRecovery,
           activateChatFinalSynthesis,

@@ -50,6 +50,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildOwnerScopedDurableSessionPatch,
   createSubmitPreRunSessionPatcher,
   createSubmitSessionRuntimeFacade,
   startSubmitElapsedTimer,
@@ -60,6 +61,13 @@ const {
   createSubmitSessionRuntimeController,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitSessionRuntimeController.ts"),
+);
+const {
+  persistHarnessRunMarker,
+  readHarnessRunMarker,
+  settleHarnessRunMarkerIfOwned,
+} = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/harnessCrashTelemetry.ts"),
 );
 
 const runtimeKeys = ["currentTurnId", "agentStatus", "elapsedTime", "taskFlow"];
@@ -180,6 +188,25 @@ function applySet(stateRef, patchOrUpdater) {
     ? patchOrUpdater(stateRef.current)
     : patchOrUpdater;
   stateRef.current = { ...stateRef.current, ...patch };
+}
+
+function installFakeLocalStorageWindow() {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => values.delete(key),
+    },
+  };
+  return () => {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  };
 }
 
 test("submit pre-run session patcher writes directly when origin session is active", () => {
@@ -357,6 +384,554 @@ test("submit session runtime facade writes background runs only to their runtime
   assert.equal(scoped.decorated, true);
 });
 
+test("owner-scoped publication preserves concurrent config and Session index updates", () => {
+  const stateRef = {
+    current: {
+      currentWorkspace: "/tmp/app",
+      currentSessionId: 42,
+      runtimeBySessionKey: {},
+      sessionsByWorkspace: {
+        "/tmp/app": [
+          { id: 42, title: "Original title", messages: [], storageStatus: "temporary" },
+          { id: 99, title: "Neighbor", messages: [] },
+        ],
+        "/tmp/other": [{ id: 1, title: "Other workspace" }],
+      },
+      currentTurnId: "turn-run",
+      agentStatus: "running",
+      elapsedTime: 2,
+      taskFlow: [{ id: 1, content: "working" }],
+      config: { theme: "old", sessionRecordingEnabled: true },
+    },
+  };
+  const facade = createSubmitSessionRuntimeFacade({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/app:42",
+    createRuntimeFromState,
+    pickRuntimePatch,
+  });
+  facade.seedSessionRuntime();
+  const revisionToken = facade.getSessionRevisionToken();
+  const projectedState = {
+    ...facade.sessionGet(),
+    agentStatus: "idle",
+    elapsedTime: 8,
+    taskFlow: [{ id: 2, content: "done" }],
+  };
+  const durableState = {
+    ...projectedState,
+    sessionsByWorkspace: {
+      ...projectedState.sessionsByWorkspace,
+      "/tmp/app": projectedState.sessionsByWorkspace["/tmp/app"].map((session) =>
+        session.id === 42
+          ? {
+              ...session,
+              title: "Original title",
+              messages: [{ id: 2, content: "done" }],
+              runtimeSnapshot: { terminal: true },
+              updatedAtMs: 500,
+              storageStatus: "ok",
+            }
+          : session
+      ),
+    },
+  };
+
+  stateRef.current = {
+    ...stateRef.current,
+    config: { theme: "latest", sessionRecordingEnabled: false },
+    sessionsByWorkspace: {
+      "/tmp/app": [
+        {
+          id: 42,
+          title: "Concurrent semantic title",
+          titleSource: "semantic",
+          messages: [],
+          storageStatus: "temporary",
+        },
+        { id: 99, title: "Neighbor updated concurrently", messages: [{ id: 99 }] },
+        { id: 100, title: "New concurrent Session" },
+      ],
+      "/tmp/other": [{ id: 1, title: "Other workspace updated" }],
+      "/tmp/new": [{ id: 5, title: "New workspace Session" }],
+    },
+  };
+
+  const publication = facade.publishOwnerScopedRuntimeProjection({
+    projectedState,
+    durableState,
+    scopeKey: "/tmp/app",
+    sessionId: 42,
+    expectedRevisionToken: revisionToken,
+  });
+
+  assert.deepEqual(publication, { published: true, disposition: "published" });
+  assert.deepEqual(stateRef.current.config, {
+    theme: "latest",
+    sessionRecordingEnabled: false,
+  });
+  assert.equal(stateRef.current.agentStatus, "idle");
+  assert.equal(stateRef.current.elapsedTime, 8);
+  assert.deepEqual(stateRef.current.taskFlow, [{ id: 2, content: "done" }]);
+  const targetSession = stateRef.current.sessionsByWorkspace["/tmp/app"][0];
+  assert.equal(targetSession.title, "Concurrent semantic title");
+  assert.equal(targetSession.titleSource, "semantic");
+  assert.deepEqual(targetSession.messages, [{ id: 2, content: "done" }]);
+  assert.deepEqual(targetSession.runtimeSnapshot, { terminal: true });
+  assert.equal(targetSession.updatedAtMs, 500);
+  assert.equal(targetSession.storageStatus, "ok");
+  assert.equal(
+    stateRef.current.sessionsByWorkspace["/tmp/app"][1].title,
+    "Neighbor updated concurrently",
+  );
+  assert.equal(stateRef.current.sessionsByWorkspace["/tmp/app"].length, 3);
+  assert.equal(stateRef.current.sessionsByWorkspace["/tmp/new"][0].id, 5);
+  assert.equal(stateRef.current.sessionsByWorkspace["/tmp/other"][0].title, "Other workspace updated");
+});
+
+test("owner-scoped terminal publication settles Harness only after revision CAS succeeds", () => {
+  const restoreWindow = installFakeLocalStorageWindow();
+  try {
+    const runningMarker = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-terminal",
+      instanceId: "instance-terminal",
+      sessionKey: "/tmp/app:42",
+      workspace: "/tmp/app",
+      sessionId: 42,
+      turnId: "turn-run",
+      status: "running",
+      startedAt: 100,
+      updatedAt: 100,
+    });
+    const exactOwner = {
+      runId: runningMarker.runId,
+      sessionKey: runningMarker.sessionKey,
+      turnId: runningMarker.turnId,
+      instanceId: runningMarker.instanceId,
+      startedAt: runningMarker.startedAt,
+    };
+    const terminalMarker = {
+      ...runningMarker,
+      status: "completed",
+      closeReason: "turn_completed",
+      closedAt: 500,
+      updatedAt: 500,
+    };
+    const stateRef = {
+      current: {
+        currentWorkspace: "/tmp/app",
+        currentSessionId: 42,
+        runtimeBySessionKey: {},
+        sessionsByWorkspace: {
+          "/tmp/app": [{ id: 42, title: "Terminal", messages: [] }],
+        },
+        currentTurnId: "turn-run",
+        agentStatus: "running",
+        elapsedTime: 1,
+        taskFlow: [{ id: 1, content: "working" }],
+      },
+    };
+    const facade = createSubmitSessionRuntimeFacade({
+      get: () => stateRef.current,
+      set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+      runSessionKey: "/tmp/app:42",
+      createRuntimeFromState,
+      pickRuntimePatch,
+    });
+    facade.seedSessionRuntime();
+
+    const buildTerminalProjection = () => {
+      const projectedState = {
+        ...facade.sessionGet(),
+        agentStatus: "idle",
+        elapsedTime: 9,
+        taskFlow: [{ id: 2, content: "done" }],
+      };
+      return {
+        projectedState,
+        durableState: {
+          ...projectedState,
+          sessionsByWorkspace: {
+            ...projectedState.sessionsByWorkspace,
+            "/tmp/app": [{
+              ...projectedState.sessionsByWorkspace["/tmp/app"][0],
+              messages: [{ id: 2, content: "done" }],
+            }],
+          },
+        },
+      };
+    };
+
+    const staleRevisionToken = facade.getSessionRevisionToken();
+    const staleProjection = buildTerminalProjection();
+    facade.sessionSet({ elapsedTime: 2 });
+    let settleCalls = 0;
+    const settleBeforePublish = () => {
+      settleCalls += 1;
+      assert.equal(stateRef.current.agentStatus, "running");
+      assert.deepEqual(stateRef.current.taskFlow, [{ id: 1, content: "working" }]);
+      assert.ok(settleHarnessRunMarkerIfOwned(terminalMarker, exactOwner));
+    };
+
+    const conflictedPublication = facade.publishOwnerScopedRuntimeProjection({
+      ...staleProjection,
+      scopeKey: "/tmp/app",
+      sessionId: 42,
+      expectedRevisionToken: staleRevisionToken,
+      beforePublish: settleBeforePublish,
+    });
+    assert.deepEqual(conflictedPublication, {
+      published: false,
+      disposition: "revision_conflict",
+    });
+    assert.equal(settleCalls, 0);
+    assert.equal(readHarnessRunMarker().status, "running");
+    assert.equal(stateRef.current.agentStatus, "running");
+
+    const retryRevisionToken = facade.getSessionRevisionToken();
+    const retryProjection = buildTerminalProjection();
+    const acceptedPublication = facade.publishOwnerScopedRuntimeProjection({
+      ...retryProjection,
+      scopeKey: "/tmp/app",
+      sessionId: 42,
+      expectedRevisionToken: retryRevisionToken,
+      beforePublish: settleBeforePublish,
+    });
+    assert.deepEqual(acceptedPublication, { published: true, disposition: "published" });
+    assert.equal(settleCalls, 1);
+    assert.equal(readHarnessRunMarker().status, "completed");
+    assert.equal(readHarnessRunMarker().closeReason, "turn_completed");
+    assert.equal(stateRef.current.agentStatus, "idle");
+    assert.deepEqual(stateRef.current.taskFlow, [{ id: 2, content: "done" }]);
+  } finally {
+    restoreWindow();
+  }
+});
+
+test("a foreign global Harness owner cannot prevent an old Session from publishing its conclusion", () => {
+  const restoreWindow = installFakeLocalStorageWindow();
+  try {
+    const foreignMarker = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-foreign",
+      instanceId: "instance-foreign",
+      sessionKey: "/tmp/foreign:7",
+      workspace: "/tmp/foreign",
+      sessionId: 7,
+      turnId: "turn-foreign",
+      status: "running",
+      startedAt: 700,
+      updatedAt: 700,
+    });
+    const oldMarker = {
+      ...foreignMarker,
+      runId: "run-old",
+      instanceId: "instance-old",
+      sessionKey: "/tmp/app:42",
+      workspace: "/tmp/app",
+      sessionId: 42,
+      turnId: "turn-old",
+      status: "completed",
+      closeReason: "old_turn_completed",
+      startedAt: 100,
+      closedAt: 800,
+      updatedAt: 800,
+    };
+    const stateRef = {
+      current: {
+        currentWorkspace: "/tmp/app",
+        currentSessionId: 42,
+        runtimeBySessionKey: {},
+        sessionsByWorkspace: {
+          "/tmp/app": [{ id: 42, title: "Old Session", messages: [] }],
+        },
+        currentTurnId: "turn-old",
+        agentStatus: "running",
+        elapsedTime: 3,
+        taskFlow: [{ id: 1, content: "working" }],
+      },
+    };
+    const facade = createSubmitSessionRuntimeFacade({
+      get: () => stateRef.current,
+      set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+      runSessionKey: "/tmp/app:42",
+      createRuntimeFromState,
+      pickRuntimePatch,
+    });
+    facade.seedSessionRuntime();
+    const revisionToken = facade.getSessionRevisionToken();
+    const projectedState = {
+      ...facade.sessionGet(),
+      agentStatus: "idle",
+      elapsedTime: 6,
+      taskFlow: [{ id: 2, content: "old turn done" }],
+    };
+    let ownerLost = false;
+
+    const publication = facade.publishOwnerScopedRuntimeProjection({
+      projectedState,
+      scopeKey: "/tmp/app",
+      sessionId: 42,
+      expectedRevisionToken: revisionToken,
+      beforePublish: () => {
+        assert.equal(stateRef.current.agentStatus, "running");
+        ownerLost = settleHarnessRunMarkerIfOwned(oldMarker, {
+          runId: oldMarker.runId,
+          sessionKey: oldMarker.sessionKey,
+          turnId: oldMarker.turnId,
+          instanceId: oldMarker.instanceId,
+          startedAt: oldMarker.startedAt,
+        }) === null;
+      },
+    });
+
+    assert.deepEqual(publication, { published: true, disposition: "published" });
+    assert.equal(ownerLost, true);
+    assert.equal(stateRef.current.agentStatus, "idle");
+    assert.deepEqual(stateRef.current.taskFlow, [{ id: 2, content: "old turn done" }]);
+    assert.equal(readHarnessRunMarker().runId, foreignMarker.runId);
+    assert.equal(readHarnessRunMarker().sessionKey, foreignMarker.sessionKey);
+    assert.equal(readHarnessRunMarker().status, "running");
+  } finally {
+    restoreWindow();
+  }
+});
+
+test("owner-scoped publication updates a background runtime without touching the visible Session", () => {
+  const runRuntime = {
+    currentTurnId: "turn-run",
+    agentStatus: "running",
+    elapsedTime: 3,
+    taskFlow: [{ id: 1 }],
+  };
+  const visibleRuntime = {
+    currentTurnId: "turn-visible",
+    agentStatus: "pending_review",
+    elapsedTime: 11,
+    taskFlow: [{ id: 50 }],
+  };
+  const stateRef = {
+    current: {
+      currentWorkspace: "/tmp/visible",
+      currentSessionId: 7,
+      runtimeBySessionKey: {
+        "/tmp/run:42": runRuntime,
+        "/tmp/visible:7": visibleRuntime,
+      },
+      sessionsByWorkspace: {
+        "/tmp/run": [{ id: 42, title: "Run", messages: [] }],
+        "/tmp/visible": [{ id: 7, title: "Visible", messages: [{ id: 50 }] }],
+      },
+      ...visibleRuntime,
+      config: { theme: "latest" },
+    },
+  };
+  const facade = createSubmitSessionRuntimeFacade({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/run:42",
+    createRuntimeFromState,
+    pickRuntimePatch,
+  });
+  const revisionToken = facade.getSessionRevisionToken();
+  const projectedState = {
+    ...facade.sessionGet(),
+    agentStatus: "idle",
+    elapsedTime: 9,
+    taskFlow: [{ id: 2 }],
+  };
+  const durableState = {
+    ...projectedState,
+    sessionsByWorkspace: {
+      ...projectedState.sessionsByWorkspace,
+      "/tmp/run": [{
+        ...projectedState.sessionsByWorkspace["/tmp/run"][0],
+        messages: [{ id: 2 }],
+        runtimeSnapshot: { terminal: true },
+        storageStatus: "ok",
+      }],
+    },
+  };
+
+  const publication = facade.publishOwnerScopedRuntimeProjection({
+    projectedState,
+    durableState,
+    scopeKey: "/tmp/run",
+    sessionId: 42,
+    expectedRevisionToken: revisionToken,
+  });
+
+  assert.equal(publication.published, true);
+  assert.equal(stateRef.current.currentTurnId, "turn-visible");
+  assert.equal(stateRef.current.agentStatus, "pending_review");
+  assert.equal(stateRef.current.elapsedTime, 11);
+  assert.deepEqual(stateRef.current.taskFlow, [{ id: 50 }]);
+  assert.equal(stateRef.current.runtimeBySessionKey["/tmp/run:42"].agentStatus, "idle");
+  assert.deepEqual(stateRef.current.runtimeBySessionKey["/tmp/run:42"].taskFlow, [{ id: 2 }]);
+  assert.deepEqual(stateRef.current.sessionsByWorkspace["/tmp/run"][0].messages, [{ id: 2 }]);
+  assert.deepEqual(
+    stateRef.current.sessionsByWorkspace["/tmp/visible"][0].messages,
+    [{ id: 50 }],
+  );
+  assert.equal(stateRef.current.config.theme, "latest");
+});
+
+test("a seeded facade treats a deleted runtime key as ownership lost", () => {
+  const stateRef = {
+    current: {
+      currentWorkspace: "/tmp/run",
+      currentSessionId: 42,
+      runtimeBySessionKey: {},
+      currentTurnId: "turn-owner",
+      agentStatus: "running",
+      elapsedTime: 4,
+      taskFlow: [{ id: 1 }],
+      config: { theme: "old" },
+    },
+  };
+  const facade = createSubmitSessionRuntimeFacade({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/run:42",
+    createRuntimeFromState,
+    pickRuntimePatch,
+  });
+  facade.seedSessionRuntime();
+  const projectedState = {
+    ...facade.sessionGet(),
+    agentStatus: "idle",
+    taskFlow: [{ id: 2 }],
+  };
+
+  stateRef.current = {
+    ...stateRef.current,
+    currentTurnId: "turn-reset-global",
+    agentStatus: "pending_review",
+    elapsedTime: 20,
+    taskFlow: [{ id: 70 }],
+    config: { theme: "latest" },
+    runtimeBySessionKey: {},
+  };
+  assert.equal(facade.sessionGet().currentTurnId, "turn-owner");
+
+  stateRef.current = {
+    ...stateRef.current,
+    currentWorkspace: "/tmp/visible",
+    currentSessionId: 7,
+    currentTurnId: "turn-visible",
+  };
+  const missingToken = facade.getSessionRevisionToken();
+  stateRef.current = { ...stateRef.current, config: { theme: "newer" } };
+  assert.equal(facade.getSessionRevisionToken(), missingToken);
+  assert.equal(facade.hasSessionRuntimeOwnership(), false);
+  assert.equal(facade.sessionGet().currentTurnId, "turn-owner");
+
+  facade.sessionSet({ agentStatus: "idle", elapsedTime: 99 });
+  assert.deepEqual(stateRef.current.runtimeBySessionKey, {});
+  assert.equal(stateRef.current.agentStatus, "pending_review");
+  assert.equal(stateRef.current.elapsedTime, 20);
+
+  const beforePublication = stateRef.current;
+  let beforePublishCalls = 0;
+  const publication = facade.publishOwnerScopedRuntimeProjection({
+    projectedState,
+    durableState: projectedState,
+    scopeKey: "/tmp/run",
+    sessionId: 42,
+    expectedRevisionToken: missingToken,
+    beforePublish: () => {
+      beforePublishCalls += 1;
+    },
+  });
+  assert.deepEqual(publication, { published: false, disposition: "ownership_lost" });
+  assert.equal(beforePublishCalls, 0);
+  assert.deepEqual(stateRef.current, beforePublication);
+  assert.deepEqual(stateRef.current.runtimeBySessionKey, {});
+});
+
+test("a recreated Session with the same runtime key cannot inherit an old facade generation", () => {
+  const stateRef = {
+    current: {
+      currentWorkspace: "/tmp/run",
+      currentSessionId: 42,
+      runtimeBySessionKey: {},
+      currentTurnId: "turn-old",
+      agentStatus: "running",
+      elapsedTime: 1,
+      taskFlow: [],
+      config: { theme: "old" },
+    },
+  };
+  const createFacade = () => createSubmitSessionRuntimeFacade({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/run:42",
+    createRuntimeFromState,
+    pickRuntimePatch,
+  });
+  const oldFacade = createFacade();
+  oldFacade.seedSessionRuntime();
+  const oldOwnerToken = oldFacade.getSessionRuntimeOwnerToken();
+  assert.equal(oldFacade.hasSessionRuntimeOwnership(oldOwnerToken), true);
+
+  delete stateRef.current.runtimeBySessionKey["/tmp/run:42"];
+  stateRef.current = {
+    ...stateRef.current,
+    currentTurnId: "turn-new",
+    agentStatus: "idle",
+  };
+  const newFacade = createFacade();
+  newFacade.seedSessionRuntime();
+
+  assert.equal(oldFacade.hasSessionRuntimeOwnership(oldOwnerToken), false);
+  assert.equal(newFacade.hasSessionRuntimeOwnership(newFacade.getSessionRuntimeOwnerToken()), true);
+  oldFacade.sessionSet({ agentStatus: "running", elapsedTime: 99 });
+  assert.equal(stateRef.current.agentStatus, "idle");
+  assert.equal(stateRef.current.elapsedTime, 1);
+  assert.equal(stateRef.current.runtimeBySessionKey["/tmp/run:42"].agentStatus, "idle");
+});
+
+test("durable Session patch excludes mutable metadata returned by a save adapter", () => {
+  const projectedState = {
+    sessionsByWorkspace: {
+      workspace: [{
+        id: 7,
+        title: "Old title",
+        modelConfig: { model: "old" },
+        messages: [],
+        storageStatus: "temporary",
+      }],
+    },
+  };
+  const durableState = {
+    sessionsByWorkspace: {
+      workspace: [{
+        id: 7,
+        title: "Adapter title must not publish",
+        modelConfig: { model: "adapter" },
+        messages: [{ id: 1 }],
+        runtimeSnapshot: { terminal: true },
+        storageStatus: "ok",
+        updatedAtMs: 10,
+      }],
+    },
+  };
+
+  assert.deepEqual(buildOwnerScopedDurableSessionPatch({
+    projectedState,
+    durableState,
+    scopeKey: "workspace",
+    sessionId: 7,
+  }), {
+    messages: [{ id: 1 }],
+    runtimeSnapshot: { terminal: true },
+    storageStatus: "ok",
+    updatedAtMs: 10,
+  });
+});
+
 test("submit session runtime controller decorates active scoped callbacks", async () => {
   const events = [];
   const stateRef = {
@@ -394,6 +969,36 @@ test("submit session runtime controller decorates active scoped callbacks", asyn
   assert.equal(await controller.sessionGet().openPlanWorkspacePanel(), false);
   assert.equal(stateRef.current.rightPanelTab, "plan");
   assert.deepEqual(events, []);
+});
+
+test("decorated session reads keep a stable raw revision token until the Store changes", () => {
+  const stateRef = {
+    current: createControllerState(),
+  };
+  const controller = createSubmitSessionRuntimeController({
+    get: () => stateRef.current,
+    set: (patchOrUpdater) => applySet(stateRef, patchOrUpdater),
+    runSessionKey: "/tmp/app:42",
+    createRuntimeFromState: createControllerRuntimeFromState,
+    pickRuntimePatch: pickControllerRuntimePatch,
+    derivePlanStageFromArtifacts: () => "planning",
+    createDefaultCurrentTurnState: () => ({ interceptorHandled: false }),
+    logStoreEvent: () => {},
+  });
+
+  const firstRead = controller.sessionGet();
+  const firstToken = controller.getSessionRevisionToken();
+  const secondRead = controller.sessionGet();
+  const secondToken = controller.getSessionRevisionToken();
+  assert.notEqual(firstRead, secondRead);
+  assert.equal(firstToken, secondToken);
+
+  stateRef.current = { ...stateRef.current, unrelatedGlobalUiValue: true };
+  assert.equal(controller.getSessionRevisionToken(), firstToken);
+
+  controller.sessionSet({ elapsedTime: 9 });
+  assert.notEqual(controller.getSessionRevisionToken(), firstToken);
+  assert.equal(controller.sessionGet().elapsedTime, 9);
 });
 
 test("submit session runtime controller writes decorated callbacks to background runtime", () => {

@@ -124,10 +124,80 @@ test("scoped read fan-out applies lifecycle hooks per target and exposes partial
 
 test("pending review materializes a visible tool card for ExecutionCapsule", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const settlementSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/actionReviewSettlement.ts"),
+    "utf8",
+  );
+  const reviewStart = source.indexOf("requestReview: (toolCall: any) =>");
+  const reviewEnd = source.indexOf("onPlanExecutionProgress:", reviewStart);
+  const reviewSource = source.slice(reviewStart, reviewEnd);
 
+  assert.notEqual(reviewStart, -1);
+  assert.ok(reviewEnd > reviewStart);
   assert.match(source, /status: "pending_review",\s*toolStatus: "pending"/);
   assert.match(source, /taskFlow: \[\.\.\.s\.taskFlow, pendingBlock\]/);
-  assert.match(source, /pendingReviewTaskId: taskId/);
+  assert.match(reviewSource, /pendingReviewTaskId: taskId/);
+  assert.match(reviewSource, /type: "run\.paused"[\s\S]*reason: "tool_permission"/);
+  assert.match(reviewSource, /const reviewSettlement = createAbortableReviewSettlement\(\{/);
+  assert.match(reviewSource, /pendingReviewResolve: reviewSettlement\.resolve/);
+  assert.match(reviewSource, /reviewSettlement\.arm\(\)/);
+  assert.ok(
+    reviewSource.indexOf('type: "run.paused"') < reviewSource.indexOf("createAbortableReviewSettlement({"),
+    "the permission owner must be paused before its settlement can create a continuation child",
+  );
+  assert.match(settlementSource, /if \(input\.signal\.aborted\)[\s\S]*handleAbort\(\)/);
+  assert.match(settlementSource, /input\.signal\.addEventListener\("abort", handleAbort, \{ once: true \}\)/);
+  assert.match(settlementSource, /settle\(input\.abortedDecision, false\)/);
+  assert.match(settlementSource, /continueRun && !input\.signal\.aborted/);
+});
+
+test("a terminal conclusion child is created only after its owner was already paused", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const helperStart = source.indexOf("const beginTerminalConclusionRun =");
+  const helperEnd = source.indexOf("const normalizeToolLifecycleMeta", helperStart);
+  const helperSource = source.slice(helperStart, helperEnd);
+  const terminalStart = source.indexOf("const preTerminalRunId = activeRuntimeRunIdentity.runId");
+  const terminalEnd = source.indexOf("const harnessProjection =", terminalStart);
+  const terminalSource = source.slice(terminalStart, terminalEnd);
+
+  assert.notEqual(helperStart, -1);
+  assert.ok(helperEnd > helperStart);
+  assert.notEqual(terminalStart, -1);
+  assert.ok(terminalEnd > terminalStart);
+  assert.match(helperSource, /isHarnessRunMarkerOwnedByRun\(marker, harnessRunOwner\)/);
+  assert.match(helperSource, /persistHarnessRunMarkerIfOwned\(/);
+  assert.match(helperSource, /parentRunId,[\s\S]*type: "run\.started"[\s\S]*parentRunId,/);
+  assert.ok(
+    helperSource.indexOf("persistHarnessRunMarkerIfOwned(") < helperSource.indexOf('type: "run.started"'),
+    "the conclusion child must acquire the harness owner before publishing run.started",
+  );
+  assert.match(
+    terminalSource,
+    /const preTerminalEvent = [\s\S]*isRunTerminalEvent\(event\)[\s\S]*event\.runId === preTerminalRunId/,
+  );
+  assert.match(
+    terminalSource,
+    /if \(loopOutcome\.status !== "paused" && preTerminalEvent\?\.type === "run\.paused"\) \{\s*if \(!beginTerminalConclusionRun\(preTerminalRunId, loopOutcome\.reason\)\) \{[\s\S]*return true;[\s\S]*\}\s*\}/,
+  );
+});
+
+test("queued guidance supersedes a permission wait through canonical cancellation", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/Composer.tsx"), "utf8");
+  const start = source.indexOf("const handleGuideQueuedMessage");
+  const end = source.indexOf("// ── Handle textarea change", start);
+  const handler = source.slice(start, end);
+
+  assert.notEqual(start, -1);
+  assert.ok(end > start);
+  assert.match(handler, /appState\.stopGeneration\(\)/);
+  assert.match(handler, /onSendMessage\(guidance, queuedUserMessage\.images \|\| \[\]/);
+  assert.doesNotMatch(handler, /appState\.abortController\?\.abort\(\)/);
+  assert.doesNotMatch(handler, /useAppStore\.setState\(/);
+  const pendingReviewBranch = handler.slice(
+    handler.indexOf('if (appState.agentStatus === "pending_review")'),
+    handler.indexOf("if (isStreaming)"),
+  );
+  assert.doesNotMatch(pendingReviewBranch, /clearQueuedUserMessage\(/);
 });
 
 test("desktop permission review is explicitly per-call in the ChatArea capsule", () => {
@@ -275,21 +345,29 @@ test("workflow engine projects then closes harness from structured agent loop ou
   assert.match(source, /const projectHarnessForAgentLoopOutcome = \(outcome: AgentLoopOutcome\)/);
   assert.match(source, /case "completed":[\s\S]*agent_loop_completed/);
   assert.match(source, /case "paused":[\s\S]*projectCurrentHarnessRunMarker\("paused"/);
-  assert.match(source, /case "stopped_no_action":[\s\S]*agent_loop_no_action/);
+  assert.match(source, /case "aborted":[\s\S]*projectCurrentHarnessRunMarker\("completed"/);
+  assert.match(source, /resultKind: outcome\.resultKind/);
   assert.match(source, /publishCurrentHarnessRunMarkerClose/);
   assert.match(source, /agent_loop_stop_summary/);
   assert.match(source, /streamElapsedMs:\s*source\.streamElapsedMs/);
   assert.match(source, /lastStreamError:\s*source\.lastStreamError/);
 });
 
-test("agent loop returns structured non-completed outcomes for stops and approved-plan guard", () => {
+test("agent loop closes non-actionable stops and completion-guard gaps as typed conclusions", () => {
   const runnerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentLoopRunner.ts"), "utf8");
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
+  const resolverStart = guardsSource.indexOf("export function resolveNonActionableStopOutcome(");
+  const resolverEnd = guardsSource.indexOf("export function resolveFinalTurnContractForCompletion", resolverStart);
+  const resolverSource = guardsSource.slice(resolverStart, resolverEnd);
 
   assert.match(runnerSource, /Promise<AgentLoopOutcome>/);
   assert.match(runnerSource, /onNonActionableStop: \(message, reason, progress\) =>/);
-  assert.match(runnerSource, /resolveNonActionableStopOutcome\(reason, progress\)/);
-  assert.match(guardsSource, /reason === "incomplete_plan" \? "paused"/);
+  assert.match(runnerSource, /resolveNonActionableStopOutcome\(reason, progress, \{[\s\S]*sawExecutionEvidence:/);
+  assert.match(runnerSource, /completedAgentLoopOutcome\("agent_loop_no_terminal_outcome", "error"\)/);
+  assert.match(resolverSource, /options\.sawExecutionEvidence[\s\S]*\? "partial" as const/);
+  assert.match(resolverSource, /reason === "no_output"[\s\S]*\? "error" as const[\s\S]*: "blocked" as const/);
+  assert.match(resolverSource, /return \{ status: "completed", resultKind, reason: recoveryReason \}/);
+  assert.doesNotMatch(resolverSource, /status: "paused"|pauseKind:/);
   assert.match(guardsSource, /approved_plan_completion_guard/);
   assert.match(guardsSource, /buildPlanTaskEvidenceAudit/);
 });
@@ -1109,6 +1187,11 @@ test("approved plan no-tool turns use evidence recovery, the active contract, th
   const executeNoToolRecoverySource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeNoToolRecovery.ts"), "utf8");
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
   const workflowEngine = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const approvedGuardStart = guardsSource.indexOf("export function runApprovedPlanCompletionGuard(");
+  const approvedGuardEnd = guardsSource.indexOf("export function runExecutionEvidenceCompletionGuard(", approvedGuardStart);
+  const approvedGuardSource = guardsSource.slice(approvedGuardStart, approvedGuardEnd);
+  const executionGuardEnd = guardsSource.indexOf("export function runAgentLoopCompletionGuards(", approvedGuardEnd);
+  const executionGuardSource = guardsSource.slice(approvedGuardEnd, executionGuardEnd);
 
   assert.match(assistantOutputPhaseSource, /resolveApprovedPlanNoToolRoute\(\{/);
   assert.match(source, /handleAssistantIterationPhase\(\{/);
@@ -1125,9 +1208,16 @@ test("approved plan no-tool turns use evidence recovery, the active contract, th
   assert.match(executeNoToolRecoverySource, /required_tool_call_protocol_violation/);
   assert.match(executeNoToolRecoverySource, /availableTools: Array\.from\(availableToolNames\)/);
   assert.match(guardsSource, /approved_plan_completion_guard_no_evidence/);
-  assert.match(guardsSource, /status: sawExecutionEvidence \? "paused" : "stopped_no_action"/);
   assert.match(guardsSource, /approved_plan_completion_guard_incomplete_after_change/);
-  assert.match(workflowEngine, /progress\?\.recoveryReason === "approved_plan_completion_guard_no_evidence"[\s\S]*?"stopped_no_action"/);
+  assert.match(
+    approvedGuardSource,
+    /return \{\s*status: "completed",\s*resultKind: sawExecutionEvidence \? "partial" : "blocked",\s*reason: "approved_plan_completion_guard"/,
+  );
+  assert.match(
+    executionGuardSource,
+    /return \{\s*status: "completed",\s*resultKind: sawExecutionEvidence \? "partial" : "blocked"/,
+  );
+  assert.doesNotMatch(workflowEngine, /const stoppedStatus =/);
   assert.match(workflowEngine, /const stopBlock = \{/);
   assert.match(workflowEngine, /type: "system"/);
   assert.match(workflowEngine, /content: message/);
@@ -1158,18 +1248,18 @@ test("explicit reply options mark assistant text as awaiting input even when too
   const workflowEngine = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
   const assistantOutputPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantOutputPhase.ts"), "utf8");
   const runnerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentLoopRunner.ts"), "utf8");
+  const agentOrchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8");
 
   assert.match(assistantOutputPhaseSource, /awaitingInput:\s*shouldPauseForUserChoice/);
   assert.match(runnerSource, /onAssistantFinalText: \(text, replyOptions = \[\], meta\) =>/);
-  assert.match(runnerSource, /status: "paused", reason: "awaiting_user_choice"/);
+  assert.match(runnerSource, /pausedAgentLoopOutcome\(USER_CHOICE_PAUSE_REASON, "action_required"\)/);
   assert.match(runnerSource, /agent_loop_awaiting_user_choice/);
+  assert.match(agentOrchestratorSource, /const committedPauseReason = turnEvents\.getRunPauseReason\(\)/);
+  assert.match(agentOrchestratorSource, /this\.latestRunPauseReason = committedPauseReason/);
   assert.match(workflowEngine, /const awaitingInput = meta\?\.awaitingInput === true && replyOptions\.length > 0/);
   assert.match(workflowEngine, /status:\s*"awaiting_input"/);
-  assert.match(
-    workflowEngine,
-    /isIntentionalActionPause[\s\S]*?await persistCurrentSessionRuntime\(sessionGet\(\)\)[\s\S]*?agentStatus:[\s\S]*?: "idle"[\s\S]*?isGenerating: false/,
-    "awaiting-input turns may publish idle only after their checkpoint is durable",
-  );
+  assert.match(workflowEngine, /persistTerminalProjection:[\s\S]*?isIntentionalActionPause/);
+  assert.match(workflowEngine, /publishTerminalStatus:[\s\S]*?isGenerating: false/);
 });
 
 test("agent loop blocks execute completion without execution evidence", () => {
@@ -1390,7 +1480,51 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitPendingReviewTransitionSource, /export function applySubmitPendingReviewTransition/);
   assert.match(submitPendingReviewTransitionSource, /resolvePendingReviewSubmissionDecision/);
   assert.match(submitPendingReviewTransitionSource, /send_pending_review_abort_and_new_turn/);
-  assert.match(submitPendingReviewTransitionSource, /stopped_no_action/);
+  assert.match(submitPendingReviewTransitionSource, /closeTurnAsCanceled/);
+  assert.match(submitPendingReviewTransitionSource, /superseded_by_new_user_turn/);
+  assert.doesNotMatch(submitPendingReviewTransitionSource, /stopped_no_action/);
+  const canceledCommitSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/store/commitCanceledTurn.ts"),
+    "utf8",
+  );
+  const closeCanceledTurnStart = storeSource.indexOf("closeTurnAsCanceled: (turnId, options) => {");
+  const closeCanceledTurnEnd = storeSource.indexOf("stopGeneration: () => {", closeCanceledTurnStart);
+  const closeCanceledTurnSource = storeSource.slice(closeCanceledTurnStart, closeCanceledTurnEnd);
+  const cancellationFenceIndex = closeCanceledTurnSource.indexOf(
+    "beginSessionCancellation(sessionKey, turnId, async () => {",
+  );
+  const controlPlaneRevocationIndex = closeCanceledTurnSource.indexOf(
+    "sessionSet((state) => {",
+    cancellationFenceIndex,
+  );
+  assert.ok(closeCanceledTurnStart >= 0 && closeCanceledTurnEnd > closeCanceledTurnStart);
+  assert.ok(cancellationFenceIndex >= 0);
+  assert.ok(
+    controlPlaneRevocationIndex > cancellationFenceIndex,
+    "the cancellation fence must be registered before transient controls are revoked",
+  );
+  const controlPlaneRevocationSource = closeCanceledTurnSource.slice(controlPlaneRevocationIndex);
+  assert.doesNotMatch(
+    controlPlaneRevocationSource,
+    /agentStatus:\s*"idle"|isGenerating:\s*false|abortController:\s*null/,
+    "closeTurnAsCanceled must leave visible lifecycle fields unchanged until terminal publication",
+  );
+  assert.match(storeSource, /const result = await commitCanceledTurn\(\{/);
+  assert.match(canceledCommitSource, /durableState = await input\.persistProjection\(projection\.state\)/);
+  assert.ok(
+    canceledCommitSource.indexOf("await input.persistProjection(projection.state)") <
+      canceledCommitSource.indexOf("input.publishProjection({"),
+    "cancellation must attempt persistence before terminal publication",
+  );
+  const goalClearStart = storeSource.indexOf("const buildClearedOwnerRuntime =");
+  const goalClearEnd = storeSource.indexOf("const clearedOwnerRuntime =", goalClearStart);
+  const goalClearSource = storeSource.slice(goalClearStart, goalClearEnd);
+  assert.ok(goalClearStart >= 0 && goalClearEnd > goalClearStart);
+  assert.match(goalClearSource, /const runtimeOwnedWaitingAction = runtimeOwnedActionRequest/);
+  assert.doesNotMatch(goalClearSource, /runtimeOwnedActionRequest\?\.kind === "user_choice"/);
+  assert.match(goalClearSource, /projectCanceledTurn\(\{/);
+  assert.match(goalClearSource, /reason: "goal_cleared"/);
+  assert.doesNotMatch(goalClearSource, /stopped_no_action/);
   assert.match(submitPlanStateResetSource, /export function applySubmitPlanStateReset/);
   assert.match(submitPlanStateResetSource, /planExecutionEvidenceLedger: \[\]/);
   assert.match(submitPlanStateResetSource, /currentTurnExecutionConsent: \{ turnId: null, granted: false \}/);
@@ -1408,7 +1542,7 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitAsyncWorkflowRunSource, /\(phaseRunners\.buildPromptContext \|\| buildSubmitPromptContext\)/);
   assert.match(submitAsyncWorkflowRunSource, /await \(phaseRunners\.runGameStudioPreparation \|\| runSubmitGameStudioPreparation\)/);
   assert.match(submitAsyncWorkflowRunSource, /\(phaseRunners\.startRunLease \|\| startSubmitRunLease\)/);
-  assert.match(submitAsyncWorkflowRunSource, /void \(phaseRunners\.runWorkflowEngine \|\| runSubmitWorkflowEngine\)/);
+  assert.match(submitAsyncWorkflowRunSource, /await \(phaseRunners\.runWorkflowEngine \|\| runSubmitWorkflowEngine\)/);
   assert.match(submitAttachmentContextSource, /export async function buildSubmitAttachmentContext/);
   assert.match(submitAttachmentContextSource, /export async function prepareAttachedFileForRead/);
   assert.match(submitAttachmentContextSource, /\[attached_tabular_file\]/);
@@ -1450,7 +1584,10 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(gameStudioTurnPreparationSource, /export async function prepareGameStudioTurn/);
   assert.match(submitGameStudioPreparationSource, /export async function runSubmitGameStudioPreparation/);
   assert.match(submitGameStudioPreparationSource, /export function applySubmitGameStudioPreparationResult/);
-  assert.match(submitGameStudioPreparationSource, /pendingSlashCommand: null/);
+  assert.match(submitGameStudioPreparationSource, /errorMessage: preparation\.errorMessage/);
+  assert.doesNotMatch(submitGameStudioPreparationSource, /status: "error"/);
+  assert.match(submitAsyncWorkflowRunSource, /throw new Error\(gameStudioPreparation\.errorMessage/);
+  assert.match(submitAsyncWorkflowRunSource, /pendingSlashCommand: null/);
   assert.match(submitGameStudioPreparationSource, /shouldInvalidateWorkspaceTree/);
   assert.match(gameStudioLocalSlashSubmissionSource, /export function startGameStudioLocalSlashSubmission/);
   assert.match(
@@ -1542,7 +1679,7 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   assert.match(submitAsyncWorkflowRunSource, /const runLease = \(phaseRunners\.startRunLease \|\| startSubmitRunLease\)/);
   assert.match(submitAsyncWorkflowRunSource, /const context = \(phaseRunners\.createWorkflowContext \|\| createSubmitWorkflowContext\)/);
   assert.match(submitAsyncWorkflowRunSource, /\(phaseRunners\.startStreamingUi \|\| startSubmitStreamingUi\)\(\{/);
-  assert.match(submitAsyncWorkflowRunSource, /void \(phaseRunners\.runWorkflowEngine \|\| runSubmitWorkflowEngine\)/);
+  assert.match(submitAsyncWorkflowRunSource, /await \(phaseRunners\.runWorkflowEngine \|\| runSubmitWorkflowEngine\)/);
   assert.doesNotMatch(storeSource, /new WorkflowEngine/);
   assert.match(storeSource, /createSubmitSessionRuntimeController<AppState, SessionRuntimeState>/);
   assert.doesNotMatch(storeSource, /const sessionSetConversationTurnStatus/);
@@ -1678,7 +1815,7 @@ test("tool-result recovery returns the activated execute-recovery state", () => 
   assert.match(actionsSource, /return nextState;/);
 });
 
-test("six no-progress recovery attempts pause before another model stream", () => {
+test("six no-progress recovery attempts stop before another model stream", () => {
   const preparationSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"),
     "utf8",
@@ -1693,27 +1830,32 @@ test("six no-progress recovery attempts pause before another model stream", () =
   assert.match(preparationSource, /recoveryPause:\s*\{/);
   assert.match(preparationSource, /execute_recovery_max_iterations_reached/);
   assert.match(orchestratorSource, /execute_recovery_no_progress_limit/);
-  assert.ok(pauseCheck >= 0 && streamCall > pauseCheck, "the terminal pause must be persisted before another LLM stream starts");
+  assert.ok(pauseCheck >= 0 && streamCall > pauseCheck, "the terminal checkpoint must be emitted before another LLM stream starts");
 });
 
-test("durable no-progress recovery is projected as paused with a visible assistant checkpoint", () => {
+test("durable no-progress recovery closes as a completed partial conclusion", () => {
   const workflowSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",
   );
-  const chatSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/components/ChatArea.tsx"),
+  const guardsSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"),
     "utf8",
   );
 
   assert.match(workflowSource, /scopeExecutionEvidenceLedger\([\s\S]*?turnId,[\s\S]*?entry\.kind === "file"/);
-  assert.match(workflowSource, /loopOutcome\.status === "stopped_no_action"[\s\S]*?execute_recovery_no_progress_limit[\s\S]*?status: "paused"/);
-  assert.match(workflowSource, /paused_turn_final_presentation_committed/);
+  assert.match(guardsSource, /options\.sawExecutionEvidence[\s\S]*?"partial" as const/);
+  assert.match(guardsSource, /return \{ status: "completed", resultKind, reason: recoveryReason \}/);
+  assert.match(
+    workflowSource,
+    /outcome\.status === "completed" &&[\s\S]*outcome\.resultKind === "success" \|\| outcome\.resultKind === "partial"\)[\s\S]*ensureCompletedTurnFinalPresentation\(outcome, draft\)/,
+  );
+  assert.match(workflowSource, /type: "run\.completed"[\s\S]*resultKind: outcome\.resultKind/);
+  assert.match(workflowSource, /type: "turn\.completed"[\s\S]*resultKind: turnResultKind/);
   assert.match(workflowSource, /visibility: "assistant_final" as const/);
-  assert.match(chatSource, /turn\.status === "paused" && explicitFinalAgentIndex >= 0/);
 });
 
-test("read-only batch-loop exhaustion atomically projects paused state and a ChatArea final", () => {
+test("read-only batch-loop exhaustion records a checkpoint and closes the Turn", () => {
   const workflowSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",
@@ -1725,15 +1867,12 @@ test("read-only batch-loop exhaustion atomically projects paused state and a Cha
   );
   assert.match(
     workflowSource,
-    /terminalRecoveryReason === "execute_no_progress_batch_loop"[\s\S]*status: "paused"/,
+    /const runTerminalEvent = outcome\.status === "completed"[\s\S]*type: "run\.completed"/,
   );
-  assert.match(
-    workflowSource,
-    /shouldCommitPausedTurnFinalPresentation\(\{[\s\S]*hasDurableMutationEvidence: durableRecoveryMutations\.length > 0[\s\S]*ensurePausedTurnFinalPresentation\(loopOutcome\)/,
-  );
+  assert.match(workflowSource, /const turnTerminalEvent = closesLogicalTurn[\s\S]*type: "turn\.completed"/);
 });
 
-test("terminal runs persist the turn projection before publishing idle", () => {
+test("terminal runs persist, accept the owner CAS, and settle Harness before publishing idle", () => {
   const workflowEngineSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",
@@ -1745,13 +1884,21 @@ test("terminal runs persist the turn projection before publishing idle", () => {
     "const harnessProjection = pendingSameTurnExecution",
   );
   const commitIndex = workflowEngineSource.indexOf(
-    "const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(",
+    "const terminalProjection = await commitTerminalProjectionBeforeStatusPublication(",
     markerProjectionIndex,
   );
   const gateCommitIndex = workflowEngineSource.indexOf("terminalStatusPublicationGate.commitTerminal({");
   const persistProjectionIndex = workflowEngineSource.indexOf("persistTerminalProjection:", gateCommitIndex);
-  const durablePersistIndex = workflowEngineSource.indexOf("await persistCurrentSessionRuntime(sessionGet())", persistProjectionIndex);
-  const closeIndex = workflowEngineSource.indexOf("publishCurrentHarnessRunMarkerClose(harnessProjection)", durablePersistIndex);
+  const durablePersistIndex = workflowEngineSource.indexOf("await persistCurrentSessionRuntime(draft.snapshot())", persistProjectionIndex);
+  const storePublishIndex = workflowEngineSource.indexOf(
+    "publishOwnerScopedRuntimeProjection({",
+    durablePersistIndex,
+  );
+  const beforePublishIndex = workflowEngineSource.indexOf("beforePublish: () => {", storePublishIndex);
+  const closeIndex = workflowEngineSource.indexOf(
+    "publishCurrentHarnessRunMarkerClose(attemptHarnessProjection)",
+    beforePublishIndex,
+  );
   const publishStatusIndex = workflowEngineSource.indexOf("publishTerminalStatus:", gateCommitIndex);
 
   assert.notEqual(commitIndex, -1);
@@ -1770,8 +1917,26 @@ test("terminal runs persist the turn projection before publishing idle", () => {
   assert.ok(gateCommitIndex >= 0 && persistProjectionIndex > gateCommitIndex);
   assert.ok(markerProjectionIndex >= 0 && markerProjectionIndex < commitIndex);
   assert.ok(durablePersistIndex > persistProjectionIndex);
-  assert.ok(closeIndex > durablePersistIndex);
+  assert.ok(storePublishIndex > durablePersistIndex);
+  assert.ok(beforePublishIndex > storePublishIndex);
+  assert.ok(closeIndex > beforePublishIndex);
   assert.ok(publishStatusIndex > closeIndex);
+  assert.doesNotMatch(
+    workflowEngineSource.slice(durablePersistIndex, storePublishIndex),
+    /publishCurrentHarnessRunMarkerClose/,
+    "a revision conflict must leave the global Harness marker untouched for retry",
+  );
+  assert.match(
+    workflowEngineSource,
+    /const harnessRunOwner: ExactHarnessRunOwner = \{[\s\S]*instanceId: initialHarnessMarker\?\.instanceId[\s\S]*startedAt: initialHarnessMarker\?\.startedAt/,
+  );
+  assert.match(workflowEngineSource, /harness_close_owner_lost_before_terminal_publish/);
+  assert.match(workflowEngineSource, /harness_close_persist_degraded/);
+  assert.doesNotMatch(
+    workflowEngineSource.slice(persistProjectionIndex, publishStatusIndex),
+    /sessionSet\(\(\) => durableState\)/,
+    "terminal publication must merge only the owner-scoped runtime and durable Session patch",
+  );
   assert.doesNotMatch(
     workflowEngineSource.slice(commitIndex, workflowEngineSource.indexOf("if (pendingSameTurnExecution)", commitIndex)),
     /persistCurrentSessionRuntime\(latestState\)/,
@@ -1780,11 +1945,11 @@ test("terminal runs persist the turn projection before publishing idle", () => {
   assert.match(workflowEngineSource, /terminal_idle_notification_deferred/);
   assert.match(
     workflowEngineSource,
-    /terminalTurnIds\.has\(candidate\.id\)[\s\S]*?status: terminalTurnStatus/,
+    /terminalTurnIds\.has\(candidate\.id\)[\s\S]*?status: isIntentionalActionPause \? candidate\.status : terminalTurnStatus/,
   );
   assert.match(workflowEngineSource, /terminal_run_projection_committed/);
   assert.match(workflowEngineSource, /harnessProjection === "ownership_lost"/);
-  assert.match(workflowEngineSource, /if \(!terminalProjectionCommitted\)/);
+  assert.match(workflowEngineSource, /if \(!terminalProjection\.committed\)/);
   assert.match(
     workflowEngineSource,
     /isIntentionalActionPause[\s\S]*?pendingAction\?\.status === "pending"/,
@@ -1811,21 +1976,45 @@ test("terminal runs persist the turn projection before publishing idle", () => {
     /recordingDisabled: sessionRecord\?\.recordingDisabled === true \|\| !state\.config\.sessionRecordingEnabled/,
   );
   const crashStart = workflowEngineSource.indexOf(".catch(async (err: any) =>");
-  const errorProjectionIndex = workflowEngineSource.indexOf(
-    "projectCurrentHarnessRunMarker(",
+  const errorOutcomeIndex = workflowEngineSource.indexOf(
+    'status: "completed",',
     crashStart,
   );
-  const errorPersistIndex = workflowEngineSource.indexOf(
-    "await persistCurrentSessionRuntime(terminalState)",
-    errorProjectionIndex,
+  const errorResultKindIndex = workflowEngineSource.indexOf(
+    'resultKind: "error",',
+    errorOutcomeIndex,
   );
-  const errorPublishIndex = workflowEngineSource.indexOf(
-    "publishCurrentHarnessRunMarkerClose(errorHarnessProjection)",
-    errorPersistIndex,
+  const sharedTerminalCommitIndex = workflowEngineSource.indexOf(
+    "await commitTerminalProjectionBeforeStatusPublication(",
+    errorResultKindIndex,
   );
-  assert.ok(crashStart >= 0 && errorProjectionIndex > crashStart);
-  assert.ok(errorPersistIndex > errorProjectionIndex);
-  assert.ok(errorPublishIndex > errorPersistIndex);
+  assert.ok(crashStart >= 0 && errorOutcomeIndex > crashStart);
+  assert.ok(errorResultKindIndex > errorOutcomeIndex);
+  assert.ok(sharedTerminalCommitIndex > errorResultKindIndex);
+  assert.match(
+    workflowEngineSource.slice(gateCommitIndex, publishStatusIndex),
+    /ensureClosedTurnConclusion\(outcome, draft\)/,
+  );
+  const emergencyStart = workflowEngineSource.indexOf(
+    "const publishEmergencyErrorConclusion = async",
+  );
+  const emergencyEnd = workflowEngineSource.indexOf(
+    "const executeLoopStrategy =",
+    emergencyStart,
+  );
+  const emergencySource = workflowEngineSource.slice(emergencyStart, emergencyEnd);
+  assert.ok(emergencyStart >= 0 && emergencyEnd > emergencyStart);
+  assert.match(emergencySource, /type: "run\.completed"/);
+  assert.match(emergencySource, /type: "turn\.completed"/);
+  assert.match(emergencySource, /resultKind: "error"/);
+  assert.match(emergencySource, /ensureClosedTurnConclusion\(outcome, draft\)/);
+  assert.match(emergencySource, /durability: "memory_only"/);
+  assert.match(emergencySource, /durability: "durable_after_memory_publication"/);
+  assert.doesNotMatch(
+    workflowEngineSource.slice(crashStart),
+    /type:\s*"(?:run|turn)\.failed"/,
+    "crashes are completed error conclusions and use the shared terminal transaction",
+  );
 });
 
 test("approved-plan same-turn handoff cannot publish a completed logical turn", () => {
@@ -1844,19 +2033,6 @@ test("approved-plan same-turn handoff cannot publish a completed logical turn", 
     "const harnessProjection = pendingSameTurnExecution",
     pendingHandoffIndex,
   );
-  const completionGateIndex = workflowEngineSource.indexOf(
-    "shouldCommitCompletedTurnFinalPresentation({",
-    markerProjectionIndex,
-  );
-  const terminalCommitIndex = workflowEngineSource.indexOf(
-    "const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(",
-    completionGateIndex,
-  );
-  const handoffAttemptIndex = workflowEngineSource.indexOf(
-    "if (pendingSameTurnExecution)",
-    terminalCommitIndex,
-  );
-  const continuationSource = workflowEngineSource.slice(terminalStart, handoffAttemptIndex);
   const terminalProjectionHelperStart = workflowEngineSource.indexOf(
     "const commitTerminalProjectionBeforeStatusPublication = async",
   );
@@ -1864,6 +2040,19 @@ test("approved-plan same-turn handoff cannot publish a completed logical turn", 
     "const commitTerminalTurnContext =",
     terminalProjectionHelperStart,
   );
+  const completionGateIndex = workflowEngineSource.indexOf(
+    "shouldCommitCompletedTurnFinalPresentation({",
+    terminalProjectionHelperStart,
+  );
+  const terminalCommitIndex = workflowEngineSource.indexOf(
+    "const terminalProjection = await commitTerminalProjectionBeforeStatusPublication(",
+    markerProjectionIndex,
+  );
+  const handoffAttemptIndex = workflowEngineSource.indexOf(
+    "if (pendingSameTurnExecution)",
+    terminalCommitIndex,
+  );
+  const continuationSource = workflowEngineSource.slice(terminalStart, handoffAttemptIndex);
   const terminalProjectionHelper = workflowEngineSource.slice(
     terminalProjectionHelperStart,
     terminalProjectionHelperEnd,
@@ -1872,16 +2061,17 @@ test("approved-plan same-turn handoff cannot publish a completed logical turn", 
   assert.ok(terminalStart >= 0);
   assert.ok(pendingHandoffIndex > terminalStart);
   assert.ok(markerProjectionIndex > pendingHandoffIndex);
-  assert.ok(completionGateIndex > markerProjectionIndex);
-  assert.ok(terminalCommitIndex > completionGateIndex);
+  assert.ok(completionGateIndex > terminalProjectionHelperStart);
+  assert.ok(completionGateIndex < terminalProjectionHelperEnd);
+  assert.ok(terminalCommitIndex > markerProjectionIndex);
   assert.ok(handoffAttemptIndex > terminalCommitIndex);
   assert.match(
     continuationSource,
     /pendingSameTurnExecution\s*\?\s*projectCurrentHarnessRunMarker\("paused", "plan_approval_handoff_pending"\)/,
   );
   assert.match(
-    continuationSource,
-    /hasPendingSameTurnExecution: !!pendingSameTurnExecution/,
+    terminalProjectionHelper,
+    /hasPendingSameTurnExecution: isSameTurnExecutionContinuation/,
   );
   assert.match(
     continuationSource,

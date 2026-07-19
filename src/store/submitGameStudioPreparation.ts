@@ -8,23 +8,12 @@ import {
 type SubmitGameStudioSet = (patchOrUpdater: any) => void;
 
 export interface SubmitGameStudioPreparationState {
-  taskFlow: any[];
-  conversationTurns: Array<{
-    id: string;
-    status?: string;
-    blockIds: number[];
-    elapsedTime?: number;
-  }>;
-  elapsedTime?: number;
   bumpWorkspaceContentVersion?: () => void;
-  agentStatus?: string;
-  isGenerating?: boolean;
-  abortController?: AbortController | null;
-  pendingSlashCommand?: unknown;
 }
 
 export interface SubmitGameStudioPreparationApplication {
   ok: boolean;
+  errorMessage?: string;
   userContent: string;
   activeStudioAgentKey: StudioAgentKey;
   gameStudioInitialized: boolean;
@@ -33,21 +22,15 @@ export interface SubmitGameStudioPreparationApplication {
 
 export interface ApplySubmitGameStudioPreparationInput<TState extends SubmitGameStudioPreparationState> {
   preparation: GameStudioTurnPreparationResult;
-  turnId: string;
-  nextTaskId: () => number;
   sessionGet: () => TState;
   sessionSet: SubmitGameStudioSet;
-  disposeElapsedTimer: () => void;
   invalidateWorkspaceTreeCache: () => void;
 }
 
 export interface RunSubmitGameStudioPreparationInput<TState extends SubmitGameStudioPreparationState>
   extends Omit<GameStudioTurnPreparationInput, "logWarning"> {
-  turnId: string;
-  nextTaskId: () => number;
   sessionGet: () => TState;
   sessionSet: SubmitGameStudioSet;
-  disposeElapsedTimer: () => void;
   invalidateWorkspaceTreeCache: () => void;
   logWarning: (event: string, data: Record<string, unknown>) => void;
 }
@@ -58,6 +41,7 @@ export function applySubmitGameStudioPreparationResult<TState extends SubmitGame
   const { preparation } = input;
   const application: SubmitGameStudioPreparationApplication = {
     ok: preparation.ok,
+    ...(preparation.ok ? {} : { errorMessage: preparation.errorMessage }),
     userContent: preparation.userContent,
     activeStudioAgentKey: preparation.activeStudioAgentKey,
     gameStudioInitialized: preparation.gameStudioInitialized,
@@ -65,37 +49,6 @@ export function applySubmitGameStudioPreparationResult<TState extends SubmitGame
   };
 
   if (!preparation.ok) {
-    input.disposeElapsedTimer();
-    const failureId = input.nextTaskId();
-    input.sessionSet((state: TState) => ({
-      taskFlow: [
-        ...state.taskFlow,
-        {
-          id: failureId,
-          turnId: input.turnId,
-          type: "system",
-          content: preparation.errorMessage,
-        },
-      ],
-      conversationTurns: state.conversationTurns.map((turn: TState["conversationTurns"][number]) =>
-        turn.id === input.turnId
-          ? {
-              ...turn,
-              status: "error",
-              blockIds: turn.blockIds.includes(failureId) ? turn.blockIds : [...turn.blockIds, failureId],
-              elapsedTime: Math.max(
-                0,
-                Number(turn.elapsedTime) || 0,
-                Number(state.elapsedTime) || 0,
-              ),
-            }
-          : turn,
-      ),
-      agentStatus: "error",
-      isGenerating: false,
-      abortController: null,
-      pendingSlashCommand: null,
-    } as Partial<TState>));
     return application;
   }
 
@@ -130,11 +83,8 @@ export async function runSubmitGameStudioPreparation<TState extends SubmitGameSt
   });
   return applySubmitGameStudioPreparationResult({
     preparation,
-    turnId: input.turnId,
-    nextTaskId: input.nextTaskId,
     sessionGet: input.sessionGet,
     sessionSet: input.sessionSet,
-    disposeElapsedTimer: input.disposeElapsedTimer,
     invalidateWorkspaceTreeCache: input.invalidateWorkspaceTreeCache,
   });
 }

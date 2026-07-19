@@ -1,5 +1,6 @@
 import type {
   ConversationTurn,
+  ConversationTurnRuntimeOutcome,
   ConversationTurnStatus,
   PlanExecutionProgressSnapshot,
   PlanTask,
@@ -12,7 +13,10 @@ export type TurnPresentationKind =
   | "goal"
   | "awaiting"
   | "paused"
+  | "partial"
   | "blocked"
+  | "error"
+  | "canceled"
   | "failed";
 
 export type TurnPresentationLifecycle =
@@ -20,6 +24,11 @@ export type TurnPresentationLifecycle =
   | "action_required"
   | "resumable"
   | "success"
+  | "partial"
+  | "blocked"
+  | "error"
+  | "canceled"
+  /** Legacy-only projections when runtimeOutcome is absent. */
   | "no_action"
   | "failed";
 
@@ -33,6 +42,7 @@ export type TurnPresentationSource = Pick<
   | "intent"
   | "displayIntent"
   | "status"
+  | "runtimeOutcome"
   | "processCollapsed"
   | "collapsed"
 >;
@@ -50,6 +60,8 @@ export interface TurnPresentationModel extends TurnPresentationIdentity {
   title: string;
   status: ConversationTurnStatus | string;
   statusLabel: string;
+  outcomeStatus?: ConversationTurnRuntimeOutcome["status"];
+  resultKind?: "success" | "partial" | "blocked" | "error" | "canceled";
   intent: string;
   isPlan: boolean;
   isGoal: boolean;
@@ -84,6 +96,9 @@ export type CapsuleStatusKind =
   | "awaiting_choice"
   | "paused"
   | "completed"
+  | "partial"
+  | "blocked"
+  | "canceled"
   | "error";
 
 export interface CapsuleStatusProjection {
@@ -113,7 +128,18 @@ const CAPSULE_STATUS_COPY: Record<CapsuleStatusKind, { zh: string; en: string }>
   awaiting_choice: { zh: "等待选择", en: "Awaiting choice" },
   paused: { zh: "已暂停", en: "Paused" },
   completed: { zh: "已完成", en: "Completed" },
+  partial: { zh: "部分完成", en: "Partially completed" },
+  blocked: { zh: "已受阻", en: "Blocked" },
+  canceled: { zh: "已取消", en: "Canceled" },
   error: { zh: "发生错误", en: "Error" },
+};
+
+const TURN_RESULT_STATUS_COPY: Record<string, { zh: string; en: string }> = {
+  success: { zh: "已完成", en: "Completed" },
+  partial: { zh: "部分完成", en: "Partially completed" },
+  blocked: { zh: "已受阻", en: "Blocked" },
+  error: { zh: "错误", en: "Error" },
+  canceled: { zh: "已取消", en: "Canceled" },
 };
 
 /**
@@ -134,9 +160,13 @@ export function buildCapsuleStatusProjection(
   const planStage = String(input.planStage || "").toLowerCase();
   const intent = String(presentation?.intent || "").toLowerCase();
   const agentStatus = String(input.agentStatus || "").toLowerCase();
-
   let kind: CapsuleStatusKind;
-  if (actionKind === "tool_permission") kind = "awaiting_permission";
+  if (lifecycle === "success") kind = "completed";
+  else if (lifecycle === "partial") kind = "partial";
+  else if (lifecycle === "blocked" || lifecycle === "no_action") kind = "blocked";
+  else if (lifecycle === "canceled") kind = "canceled";
+  else if (lifecycle === "error" || lifecycle === "failed") kind = "error";
+  else if (actionKind === "tool_permission") kind = "awaiting_permission";
   else if (actionKind === "user_choice") kind = "awaiting_choice";
   else if (actionKind === "plan_review") kind = "awaiting_approval";
   else if (status === "awaiting_input") kind = "awaiting_choice";
@@ -148,8 +178,7 @@ export function buildCapsuleStatusProjection(
   else if (input.currentTaskExecutionKind === "validation") kind = "validating";
   else if (phase === "tool_start" || phase === "tool_done" || phase === "running") kind = "executing";
   else if (lifecycle === "resumable") kind = "paused";
-  else if (lifecycle === "failed" || agentStatus === "error") kind = "error";
-  else if (lifecycle === "success") kind = "completed";
+  else if (agentStatus === "error") kind = "error";
   else if (status === "executing" || planStage === "executing") kind = "executing";
   else if (intent === "plan" || ["plan", "requirements", "design", "tasks", "ready_to_execute"].includes(planStage)) kind = "planning";
   else if (input.isRunActive || lifecycle === "active") kind = "analyzing";
@@ -161,9 +190,26 @@ export function buildCapsuleStatusProjection(
 export function resolveTurnPresentationLifecycle(
   statusValue: unknown,
   hasActionRequest = false,
+  runtimeOutcome?: ConversationTurnRuntimeOutcome | null,
 ): TurnPresentationLifecycle {
-  if (hasActionRequest) return "action_required";
   const status = String(statusValue || "").trim().toLowerCase();
+  if (runtimeOutcome?.status === "completed") {
+    if (runtimeOutcome.resultKind === "partial") return "partial";
+    if (runtimeOutcome.resultKind === "blocked") return "blocked";
+    if (runtimeOutcome.resultKind === "error") return "error";
+    if (runtimeOutcome.resultKind === "canceled") return "canceled";
+    return "success";
+  }
+  if (runtimeOutcome?.status === "aborted") return "canceled";
+  if (runtimeOutcome?.status === "paused") {
+    return hasActionRequest ||
+      runtimeOutcome.pauseKind === "action_required" ||
+      status === "awaiting_input" ||
+      status === "awaiting_approval"
+      ? "action_required"
+      : "resumable";
+  }
+  if (hasActionRequest) return "action_required";
   if (status === "awaiting_input" || status === "awaiting_approval") return "action_required";
   if (status === "paused" || status === "pausing" || status === "blocked" || status === "budget_exceeded") {
     return "resumable";
@@ -230,6 +276,12 @@ export function resolvePlanPresentationBehavior(input: {
       : actionKind === "user_choice"
       ? "choice"
       : "action_required"
+    : lifecycle === "partial"
+    ? "success"
+    : lifecycle === "blocked" || lifecycle === "canceled"
+    ? "no_action"
+    : lifecycle === "error"
+    ? "failed"
     : lifecycle;
 
   return {
@@ -260,9 +312,9 @@ export function resolveGoalPresentationBehavior(input: {
 }): GoalPresentationBehavior {
   const status = String(input.status || "").trim().toLowerCase();
   const primaryActionPending = status === "pausing";
-  const tone: GoalPresentationTone = input.lifecycle === "success"
+  const tone: GoalPresentationTone = input.lifecycle === "success" || input.lifecycle === "partial"
     ? "completed"
-    : input.lifecycle === "failed"
+    : input.lifecycle === "failed" || input.lifecycle === "error"
     ? "failed"
     : input.lifecycle === "active"
     ? "active"
@@ -597,9 +649,16 @@ function resolvePresentationIntent(turn?: TurnPresentationSource | null): string
 function resolvePresentationKind(input: {
   intent: string;
   status: string;
+  lifecycle: TurnPresentationLifecycle;
   kindOverride?: TurnPresentationKind;
 }): TurnPresentationKind {
+  if (input.lifecycle === "partial") return "partial";
+  if (input.lifecycle === "blocked") return "blocked";
+  if (input.lifecycle === "error") return "error";
+  if (input.lifecycle === "canceled") return "canceled";
   if (input.kindOverride) return input.kindOverride;
+  if (input.lifecycle === "action_required") return "awaiting";
+  if (input.lifecycle === "resumable") return "paused";
   if (input.status === "error") return "failed";
   if (input.status === "awaiting_input" || input.status === "awaiting_approval") return "awaiting";
   if (input.status === "paused") return "paused";
@@ -628,12 +687,21 @@ export function buildTurnPresentationModel(
   input: BuildTurnPresentationModelInput,
 ): TurnPresentationModel {
   const intent = resolvePresentationIntent(input.turn);
-  const status = String(input.statusOverride || input.turn?.status || "done");
-  const kind = resolvePresentationKind({ intent, status, kindOverride: input.kindOverride });
+  const fallbackStatus = String(input.statusOverride || input.turn?.status || "done");
+  const runtimeOutcome = input.turn?.runtimeOutcome;
+  const status = runtimeOutcome?.status === "completed"
+    ? runtimeOutcome.resultKind || fallbackStatus
+    : runtimeOutcome?.status === "aborted"
+    ? "canceled"
+    : runtimeOutcome?.status === "paused" && fallbackStatus !== "awaiting_input" && fallbackStatus !== "awaiting_approval"
+    ? "paused"
+    : fallbackStatus;
   const lifecycle = input.lifecycleOverride || resolveTurnPresentationLifecycle(
     status,
     input.hasActionRequest || !!input.actionKind,
+    runtimeOutcome,
   );
+  const kind = resolvePresentationKind({ intent, status, lifecycle, kindOverride: input.kindOverride });
   const isAwaiting = kind === "awaiting";
   const isPlan = intent === "plan";
   const isGoal = intent === "goal";
@@ -641,10 +709,22 @@ export function buildTurnPresentationModel(
   return {
     kind,
     lifecycle,
-    ...(input.actionKind ? { actionKind: input.actionKind } : {}),
+    ...(input.actionKind && lifecycle === "action_required" ? { actionKind: input.actionKind } : {}),
     title: resolvePresentationTitle(input),
     status,
-    statusLabel: compactTitle(input.statusLabel, 40) || status,
+    statusLabel: runtimeOutcome && TURN_RESULT_STATUS_COPY[status]
+      ? TURN_RESULT_STATUS_COPY[status][input.language === "en" ? "en" : "zh"]
+      : compactTitle(input.statusLabel, 40) || status,
+    ...(runtimeOutcome
+      ? {
+          outcomeStatus: runtimeOutcome.status,
+          ...(runtimeOutcome.status === "aborted"
+            ? { resultKind: "canceled" as const }
+            : runtimeOutcome.resultKind
+            ? { resultKind: runtimeOutcome.resultKind }
+            : {}),
+        }
+      : {}),
     intent,
     isPlan,
     isGoal,

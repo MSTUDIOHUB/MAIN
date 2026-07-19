@@ -66,6 +66,8 @@ const {
   MAIN_THREAD_EVENT_SCHEMA_VERSION,
   withEventSchema,
   appendRuntimeEvent,
+  appendRuntimeEventWithResult,
+  isRunTerminalEvent,
   isTerminalTurnEvent,
 } = turnEvents;
 const {
@@ -481,6 +483,75 @@ test("runtime event reducer keeps one terminal event per run and one terminal ev
   assert.deepEqual(events.map((event) => event.type), ["run.paused", "turn.completed"]);
 });
 
+test("runtime terminal appends distinguish commit, replay, and semantic conflict", () => {
+  const completedWithError = withEventSchema({
+    type: "run.completed",
+    threadId: "thread-terminal-contract",
+    turnId: "turn-terminal-contract",
+    runId: "run-terminal-contract",
+    parentRunId: null,
+    timestampMs: 1,
+    resultKind: "error",
+    summary: "The task concluded with an execution error.",
+  });
+  assert.equal(isRunTerminalEvent(completedWithError), true);
+
+  const committed = appendRuntimeEventWithResult([], completedWithError);
+  assert.equal(committed.disposition, "committed");
+  assert.deepEqual(committed.events, [completedWithError]);
+
+  const replay = appendRuntimeEventWithResult(committed.events, withEventSchema({
+    ...completedWithError,
+    timestampMs: 2,
+    summary: "Equivalent replay with different presentation text.",
+  }));
+  assert.equal(replay.disposition, "idempotent");
+  assert.equal(replay.events, committed.events);
+  assert.equal(replay.existingEvent, completedWithError);
+
+  const conflictingResult = appendRuntimeEventWithResult(committed.events, withEventSchema({
+    ...completedWithError,
+    timestampMs: 3,
+    resultKind: "success",
+  }));
+  assert.equal(conflictingResult.disposition, "conflict");
+  assert.equal(conflictingResult.events, committed.events);
+
+  const legacyFailed = withEventSchema({
+    type: "run.failed",
+    threadId: "thread-legacy",
+    turnId: "turn-legacy",
+    runId: "run-legacy",
+    parentRunId: null,
+    timestampMs: 4,
+    error: { message: "persisted legacy failure" },
+  });
+  assert.equal(isRunTerminalEvent(legacyFailed), true);
+
+  const aborted = withEventSchema({
+    type: "run.aborted",
+    threadId: "thread-aborted",
+    turnId: "turn-aborted",
+    runId: "run-aborted",
+    parentRunId: null,
+    timestampMs: 5,
+    reason: "user_cancelled",
+  });
+  assert.equal(isRunTerminalEvent(aborted), true);
+
+  for (const resultKind of ["success", "partial", "blocked", "error", "canceled"]) {
+    const turn = withEventSchema({
+      type: "turn.completed",
+      threadId: `thread-${resultKind}`,
+      turnId: `turn-${resultKind}`,
+      timestampMs: 6,
+      resultKind,
+    });
+    assert.equal(turn.resultKind, resultKind);
+    assert.equal(isTerminalTurnEvent(turn), true);
+  }
+});
+
 test("Goal slice completion terminates only the child run, not the long-lived turn", () => {
   const events = [];
   const emitter = turnPreparation.createTurnEventEmitter({
@@ -498,6 +569,72 @@ test("Goal slice completion terminates only the child run, not the long-lived tu
   emitter.emitTurnCompletedEvent();
   assert.deepEqual(events.map((event) => event.type), ["run.completed"]);
   assert.equal(events[0].goalSliceId, "goal-1:slice:1");
+});
+
+test("a parent pause does not suppress completion of a child run on the same logical turn", () => {
+  const events = [];
+  let currentRunIdentity = {
+    runId: "run-plan-review",
+    parentRunId: null,
+  };
+  const emitter = turnPreparation.createTurnEventEmitter({
+    getSessionKey: () => "session-plan-handoff",
+    getCurrentTurnId: () => "turn-plan-handoff",
+    getGoalTurnContract: () => null,
+    getCurrentRunIdentity: () => currentRunIdentity,
+    onTurnEvent: (event) => events.push(event),
+  });
+
+  assert.equal(emitter.emitRunPausedEvent(
+    "plan_review",
+    "The review run is paused before approved execution starts.",
+  ), true);
+  currentRunIdentity = {
+    runId: "run-plan-execution",
+    parentRunId: "run-plan-review",
+  };
+  emitter.emitTurnCompletedEvent();
+
+  assert.deepEqual(events.map((event) => event.type), [
+    "run.paused",
+    "run.completed",
+    "turn.completed",
+  ]);
+  assert.deepEqual(events.slice(0, 2).map((event) => ({
+    runId: event.runId,
+    parentRunId: event.parentRunId,
+  })), [
+    { runId: "run-plan-review", parentRunId: null },
+    { runId: "run-plan-execution", parentRunId: "run-plan-review" },
+  ]);
+  assert.equal(events[2].turnId, "turn-plan-handoff");
+});
+
+test("turn event emitter preserves the committed pause reason and rejects a duplicate terminal", () => {
+  const events = [];
+  const emitter = turnPreparation.createTurnEventEmitter({
+    getSessionKey: () => "session-choice",
+    getCurrentTurnId: () => "turn-choice",
+    getGoalTurnContract: () => null,
+    getCurrentRunIdentity: () => ({
+      runId: "run-choice",
+      parentRunId: null,
+    }),
+    onTurnEvent: (event) => events.push(event),
+  });
+
+  assert.equal(emitter.getRunPauseReason(), null);
+  assert.equal(emitter.emitRunPausedEvent(
+    "awaiting_user_choice",
+    "Waiting for a user choice.",
+  ), true);
+  assert.equal(emitter.getRunPauseReason(), "awaiting_user_choice");
+  assert.equal(emitter.emitRunPausedEvent(
+    "assistant_stopped",
+    "Duplicate fallback pause.",
+  ), false);
+  assert.equal(emitter.getRunPauseReason(), "awaiting_user_choice");
+  assert.equal(events.filter((event) => event.type === "run.paused").length, 1);
 });
 
 test("turn completion emitter stages exactly one terminal commit", () => {

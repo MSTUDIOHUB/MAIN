@@ -1077,16 +1077,20 @@ async function postJsonRequest(
 ): Promise<unknown> {
   if (signal?.aborted) throw createAbortError();
 
-    if (settings.useRustProxy) {
-      let result: string;
+  if (settings.useRustProxy) {
+    let result: string;
+    const requestId = `proxy-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
     const cancelProxyRequest = () => {
-      invoke("cancel_proxy_request").catch(() => {});
+      invoke("cancel_proxy_request", { requestId }).catch(() => {});
     };
+    signal?.addEventListener("abort", cancelProxyRequest, { once: true });
+    // Close the check/listener race: cancellation may occur after the initial
+    // preflight but before the listener is installed. Rust remembers this
+    // request-scoped early cancellation until the matching lease is acquired.
     if (signal?.aborted) {
-      cancelProxyRequest();
+      signal.removeEventListener("abort", cancelProxyRequest);
       throw createAbortError();
     }
-    signal?.addEventListener("abort", cancelProxyRequest, { once: true });
     try {
       result = await invoke<string>("proxy_request", {
         url,
@@ -1095,6 +1099,7 @@ async function postJsonRequest(
         body: JSON.stringify(body),
         authMode: settings.authMode,
         tokenRef: settings.tokenRef,
+        requestId,
       });
     } catch (err) {
       if (signal?.aborted) throw createAbortError();
@@ -1606,6 +1611,8 @@ async function streamViaRustProxy(
   let unlistenChunk: UnlistenFn | null = null;
   let unlistenDone: UnlistenFn | null = null;
   let noProgressInterval: ReturnType<typeof setInterval> | null = null;
+  let abortSignalHandler: (() => void) | null = null;
+  let startStreamInvoked = false;
   let resolved = false;
 
   // Buffer for partial SSE lines
@@ -1930,6 +1937,10 @@ async function streamViaRustProxy(
   const cleanup = () => {
     unlistenChunk?.();
     unlistenDone?.();
+    if (signal && abortSignalHandler) {
+      signal.removeEventListener("abort", abortSignalHandler);
+      abortSignalHandler = null;
+    }
     if (noProgressInterval !== null) {
       clearInterval(noProgressInterval);
       noProgressInterval = null;
@@ -2088,6 +2099,37 @@ async function streamViaRustProxy(
 
   unlistenChunk = chunkUnlisten;
   unlistenDone = doneUnlisten;
+
+  // Install cancellation before dispatching start_chat_stream. Tauri commands
+  // can be scheduled independently, so Rust also keeps an early-cancel
+  // tombstone for this exact streamId until the stream lease is registered.
+  if (signal) {
+    abortSignalHandler = () => {
+      if (resolved) return;
+      resolved = true;
+      if (startStreamInvoked) {
+        invoke("cancel_chat_stream", { streamId }).catch(() => {});
+      }
+      callbacks.onLifecycle?.({
+        phase: "stream_cancelled",
+        streamId,
+        elapsedMs: Date.now() - streamStartedAt,
+        chunkCount: rustProxyChunkCount,
+        byteCount: rustProxyByteCount,
+        status: "cancelled",
+      });
+      const error = createAbortError();
+      onError(error);
+      rejectResult?.(error);
+      cleanup();
+    };
+    signal.addEventListener("abort", abortSignalHandler, { once: true });
+    if (signal.aborted) {
+      abortSignalHandler();
+      return resultPromise;
+    }
+  }
+
   noProgressInterval = setInterval(() => {
     if (resolved) return;
     const now = Date.now();
@@ -2106,6 +2148,7 @@ async function streamViaRustProxy(
   (noProgressInterval as ReturnType<typeof setInterval> & { unref?: () => void }).unref?.();
 
   // Now safe to start the stream: listeners are fully registered before Rust emits chunks.
+  startStreamInvoked = true;
   invoke("start_chat_stream", {
     streamId,
     url: apiUrl,
@@ -2121,14 +2164,6 @@ async function streamViaRustProxy(
     rejectResult?.(error);
     cleanup();
   });
-
-  // Handle abort signal
-  if (signal) {
-    const onAbort = () => {
-      invoke("cancel_chat_stream", { streamId }).catch(() => {});
-    };
-    signal.addEventListener("abort", onAbort, { once: true });
-  }
 
   return resultPromise;
 }

@@ -91,6 +91,7 @@ import {
 } from "./lib/actionRequest";
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./lib/turnEvents";
 import { resolveVisibleGoalSubmissionSessionKey } from "./lib/submit/turnSubmission";
+import { deferSubmissionForWorkspaceClear } from "./store/workspaceClearSubmissionBarrier";
 import {
   buildFeishuMarkdownCard,
   createFeishuPairedUserFromMessage,
@@ -1932,12 +1933,19 @@ export default function App() {
                       ...turn.pendingOperationProposal,
                       approvalStatus: "cancelled",
                     },
-                    status: "done",
                   }
                 : turn,
             )
           : s.conversationTurns,
       }));
+      if (sourceTurnId) {
+        useAppStore.getState().closeTurnAsCanceled(sourceTurnId, {
+          reason: "operation_cancelled",
+          message: state.config.language === "en"
+            ? "The proposed operation was canceled; this turn is now closed."
+            : "用户已取消拟议操作，本回合已完成收口。",
+        });
+      }
       return;
     }
 
@@ -2091,6 +2099,9 @@ export default function App() {
         autosaveSuspendedForSessionRef.current = "";
       }
       lastSessionRuntimeSignatureRef.current = "";
+      if (isCurrentRestore()) {
+        useAppStore.getState().markWorkspaceClearSubmissionReplayReady(scopeKey, id);
+      }
     };
     const startedAt = performance.now();
     const liveSessionKey = resolveSessionRuntimeKey(scopeKey, id);
@@ -2511,6 +2522,7 @@ export default function App() {
           rightPanelTab: "plan",
         });
         hydrateWorkspacePlanForEmptySession("workspace_open_empty");
+        useAppStore.getState().markWorkspaceClearSubmissionReplayReady(stablePath, null);
       }
     } catch (error) {
       console.error("Failed to open workspace path:", error);
@@ -2582,6 +2594,7 @@ export default function App() {
       resetToEmptyChatView();
       setCurrentWorkspace("");
       setCurrentSessionId(null);
+      useAppStore.getState().markWorkspaceClearSubmissionReplayReady(GLOBAL_CHAT_KEY, null);
       return;
     }
 
@@ -2683,6 +2696,7 @@ export default function App() {
     lastSessionRuntimeSignatureRef.current = "";
     resetToEmptyChatView();
     if (!isGlobalChat) hydrateWorkspacePlanForEmptySession("new_session");
+    useAppStore.getState().markWorkspaceClearSubmissionReplayReady(scopeKey, ns.id);
   };
 
   const handleSelectSession = async (scopeKey: string, id: number) => {
@@ -2891,7 +2905,10 @@ export default function App() {
     return target.id;
   }, []);
 
-  const runFeishuRemoteMessage = useCallback((message: FeishuInboundMessage, fromQueue = false) => {
+  const runFeishuRemoteMessage = useCallback(function runFeishuRemoteMessage(
+    message: FeishuInboundMessage,
+    fromQueue = false,
+  ) {
     const state = useAppStore.getState();
     const feishuConfig = normalizeImAdaptersConfig(state.config.imAdapters).feishu;
     const pairedUser = findFeishuPairedUser(feishuConfig, message.userId);
@@ -2914,6 +2931,56 @@ export default function App() {
       return false;
     }
 
+    const workspaceKey = resolveSessionWorkspaceKey(state.currentWorkspace);
+    const linkedSessionId = state.feishuLinkedSessionId;
+    const workspaceSessions = state.sessionsByWorkspace[workspaceKey] || [];
+    const isLinkedSessionValid = !!linkedSessionId &&
+      workspaceSessions.some((session: any) => session.id === linkedSessionId);
+    const workspaceClearDeferral = deferSubmissionForWorkspaceClear({
+      currentWorkspaceKey: workspaceKey,
+      submissionOriginSessionKey: isLinkedSessionValid
+        ? resolveSessionRuntimeKey(workspaceKey, linkedSessionId)
+        : null,
+      submission: {
+        id: `workspace-clear-feishu-${message.messageId || Date.now()}`,
+        targetSessionKey: isLinkedSessionValid
+          ? resolveSessionRuntimeKey(workspaceKey, linkedSessionId)
+          : null,
+        createdAt: Date.now(),
+        replay: () => runFeishuRemoteMessage(message, true),
+        onDiscard: (reason) => {
+          appendDebugLog("warn", "feishu.workspace_clear_submission_discarded", {
+            workspaceKey,
+            messageId: message.messageId || null,
+            reason,
+          });
+          void sendFeishuText(
+            message,
+            state.config.language === "en"
+              ? `The retained remote task was not run (${reason}). Please send it again.`
+              : `保留的远程任务未执行（${reason}），请重新发送。`,
+          );
+        },
+      },
+    });
+    if (workspaceClearDeferral.deferred) {
+      appendDebugLog("info", "feishu.workspace_clear_submission_deferred", {
+        workspaceKey,
+        disposition: workspaceClearDeferral.disposition,
+        replacedSubmissionId: workspaceClearDeferral.replacedSubmissionId,
+        queuePolicy: "single_slot_latest_wins",
+      });
+      if (!fromQueue) {
+        void sendFeishuText(
+          message,
+          state.config.language === "en"
+            ? "Workspace history is being cleared. This latest remote task is retained and will run after clearing settles."
+            : "工作区历史正在清理；这条最新远程任务已保留，将在清理完成后执行。",
+        );
+      }
+      return true;
+    }
+
     const busy = state.isGenerating || state.agentStatus === "running" || state.agentStatus === "pending_review";
     if (busy) {
       if (!fromQueue) {
@@ -2928,10 +2995,8 @@ export default function App() {
       return false;
     }
 
-    const linkedSessionId = state.feishuLinkedSessionId;
-    const scopeKey = resolveSessionWorkspaceKey(state.currentWorkspace);
-    const sessions = state.sessionsByWorkspace[scopeKey] || [];
-    const isLinkedSessionValid = linkedSessionId && sessions.some((s: any) => s.id === linkedSessionId);
+    const scopeKey = workspaceKey;
+    const sessions = workspaceSessions;
 
     if (isLinkedSessionValid) {
       if (state.currentSessionId !== linkedSessionId) {

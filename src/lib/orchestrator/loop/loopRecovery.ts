@@ -964,7 +964,6 @@ export function handleStrictRepeatGuardRecovery(input: {
   availableToolNames: Set<string>;
   toolCapabilityRegistry: ToolCapabilityRegistry;
   toolPermissionPolicy: ToolPermissionPolicy;
-  emitTurnFailedEvent: (message: string) => void;
   executeRecoveryState?: ExecuteRecoveryRuntimeState;
   activateExecuteRecovery?: (
     mode: Exclude<ExecuteRecoveryMode, "normal">,

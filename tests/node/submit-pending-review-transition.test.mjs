@@ -52,6 +52,9 @@ function loadTranspiledModuleSync(sourcePath) {
 const { applySubmitPendingReviewTransition } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/store/submitPendingReviewTransition.ts"),
 );
+const { projectCanceledTurn } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/canceledTurnProjection.ts"),
+);
 
 function conversationTurn(overrides = {}) {
   return {
@@ -86,6 +89,23 @@ function createState(overrides = {}) {
       },
     ],
     pendingReviewTaskId: 99,
+    runtimeEvents: [],
+    activeActionRequest: {
+      schemaVersion: 1,
+      requestId: "request-review-1",
+      kind: "tool_permission",
+      sessionKey: "workspace::1",
+      turnId: "turn-1",
+      runId: "run-review-1",
+      parentRunId: null,
+      title: "Approve tool",
+      status: "pending",
+      createdAt: 1,
+      taskId: 1,
+      toolName: "shell",
+      target: "pwd",
+    },
+    harnessRunMarker: null,
     abortController: null,
     pendingReviewResolve: null,
     pendingToolCall: { id: "tool-1" },
@@ -95,17 +115,33 @@ function createState(overrides = {}) {
 }
 
 function createHarness(state) {
+  let nextTaskId = 1_000;
   return {
     logs: [],
     errors: [],
+    cancellations: [],
     setState(patch) {
       const next = typeof patch === "function" ? patch(state) : patch;
       if (next && typeof next === "object") Object.assign(state, next);
     },
-    setConversationTurnStatus(turnId, status) {
-      state.conversationTurns = state.conversationTurns.map((turn) =>
-        turn.id === turnId ? { ...turn, status } : turn
-      );
+    closeTurnAsCanceled(turnId, options) {
+      const projection = projectCanceledTurn({
+        state,
+        sessionKey: "workspace::1",
+        turnId,
+        reason: options.reason,
+        message: options.message,
+        nextTaskId: () => nextTaskId++,
+        nowMs: 100,
+      });
+      this.cancellations.push({
+        turnId,
+        options,
+        cancellationRunId: projection.cancellationRunId,
+      });
+      if (projection.state === state) return false;
+      Object.assign(state, projection.state);
+      return true;
     },
     logStoreEvent(event, data) {
       this.logs.push({ event, data });
@@ -116,7 +152,7 @@ function createHarness(state) {
   };
 }
 
-test("pending review transition aborts current review and marks source turn stopped_no_action", () => {
+test("pending review transition closes the superseded source turn as canceled", () => {
   let abortCount = 0;
   const rejected = [];
   const state = createState({
@@ -136,7 +172,7 @@ test("pending review transition aborts current review and marks source turn stop
     state,
     getState: () => state,
     setState: harness.setState.bind(harness),
-    setConversationTurnStatus: harness.setConversationTurnStatus.bind(harness),
+    closeTurnAsCanceled: harness.closeTurnAsCanceled.bind(harness),
     logStoreEvent: harness.logStoreEvent.bind(harness),
     logError: harness.logError.bind(harness),
   });
@@ -162,7 +198,44 @@ test("pending review transition aborts current review and marks source turn stop
   assert.equal(state.pendingReviewResolve, null);
   assert.equal(state.pendingReviewTaskId, null);
   assert.equal(state.pendingToolCall, null);
-  assert.equal(state.conversationTurns[0].status, "stopped_no_action");
+  assert.equal(state.activeActionRequest, null);
+  assert.equal(state.conversationTurns[0].status, "done");
+  assert.deepEqual(state.conversationTurns[0].runtimeOutcome, {
+    status: "aborted",
+    reason: "superseded_by_new_user_turn",
+    resultKind: "canceled",
+    runId: "run-review-1",
+    parentRunId: null,
+    updatedAt: 100,
+  });
+  assert.deepEqual(
+    state.runtimeEvents.map((event) => ({
+      type: event.type,
+      runId: event.runId,
+      resultKind: event.resultKind,
+      reason: event.reason,
+    })),
+    [
+      { type: "run.started", runId: "run-review-1", resultKind: undefined, reason: undefined },
+      {
+        type: "run.aborted",
+        runId: "run-review-1",
+        resultKind: undefined,
+        reason: "superseded_by_new_user_turn",
+      },
+      { type: "turn.completed", runId: undefined, resultKind: "canceled", reason: undefined },
+    ],
+  );
+  assert.equal(state.taskFlow.at(-1).visibility, "assistant_final");
+  assert.match(state.taskFlow.at(-1).content, /旧回合已取消并完成收口/);
+  assert.deepEqual(harness.cancellations, [{
+    turnId: "turn-1",
+    options: {
+      reason: "superseded_by_new_user_turn",
+      message: "新的用户指令已取代待审核操作；旧回合已取消并完成收口。",
+    },
+    cancellationRunId: "run-review-1",
+  }]);
 });
 
 test("pending review transition keeps approval reply options on the existing review path", () => {
@@ -181,7 +254,7 @@ test("pending review transition keeps approval reply options on the existing rev
     state,
     getState: () => state,
     setState: harness.setState.bind(harness),
-    setConversationTurnStatus: harness.setConversationTurnStatus.bind(harness),
+    closeTurnAsCanceled: harness.closeTurnAsCanceled.bind(harness),
     logStoreEvent: harness.logStoreEvent.bind(harness),
     logError: harness.logError.bind(harness),
   });

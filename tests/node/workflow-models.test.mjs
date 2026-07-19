@@ -631,6 +631,46 @@ test("deriveVisibleConversationTurnStatus shows paused when approved plan execut
   assert.equal(visibleStatus, "paused");
 });
 
+test("deriveVisibleConversationTurnStatus never lets Plan globals reopen a terminal runtime outcome", () => {
+  const base = {
+    baseStatus: "executing",
+    workflowMode: "plan",
+    isPinnedPlanTurnVisible: true,
+    isPlanApproved: true,
+    planStage: "executing",
+    agentStatus: "idle",
+    hasIncompletePlanTasks: true,
+    hasTasksArtifact: true,
+  };
+
+  for (const resultKind of ["success", "partial", "blocked", "error"]) {
+    const visibleStatus = deriveVisibleConversationTurnStatus({
+      ...base,
+      runtimeOutcome: {
+        status: "completed",
+        reason: `terminal_${resultKind}`,
+        resultKind,
+        runId: `run-${resultKind}`,
+        parentRunId: null,
+        updatedAt: 10,
+      },
+    });
+    assert.equal(visibleStatus, resultKind);
+  }
+
+  assert.equal(deriveVisibleConversationTurnStatus({
+    ...base,
+    runtimeOutcome: {
+      status: "aborted",
+      reason: "user_cancelled",
+      resultKind: "canceled",
+      runId: "run-canceled",
+      parentRunId: null,
+      updatedAt: 11,
+    },
+  }), "canceled");
+});
+
 test("deriveVisibleConversationTurnStatus keeps awaiting approval visible before plan execution starts", () => {
   const visibleStatus = deriveVisibleConversationTurnStatus({
     baseStatus: "planning",

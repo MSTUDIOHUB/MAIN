@@ -74,8 +74,8 @@ export interface TurnEventEmitter {
   eventContinuesTurn: boolean;
   emitTurnEvent: (event: MainThreadEventInput) => void;
   emitTurnCompletedEvent: () => void;
-  emitTurnFailedEvent: (message: string) => void;
   emitRunPausedEvent: (reason: string, message: string, progress?: MainThreadProgressUpdate) => boolean;
+  getRunPauseReason: (runId?: string) => string | null;
   stageTurnCompletion: (commit: () => void) => void;
   hasStagedTurnCompletion: () => boolean;
   commitStagedTurnCompletion: () => boolean;
@@ -677,15 +677,18 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     };
   };
   let turnEventTerminalEmitted = false;
-  let runTerminalEmitted = false;
+  const terminalRunIds = new Set<string>();
+  const runPauseReasons = new Map<string, string>();
   let stagedTurnCompletion: (() => void) | null = null;
   const emitTurnEvent = (event: MainThreadEventInput): void => {
     if (
       event.type === "run.paused" ||
       event.type === "run.completed" ||
+      event.type === "run.aborted" ||
       event.type === "run.failed"
     ) {
-      runTerminalEmitted = true;
+      terminalRunIds.add(event.runId);
+      if (event.type === "run.paused") runPauseReasons.set(event.runId, event.reason);
     }
     // Progress is a run-scoped observation, not merely turn-scoped history.
     // Stamp newly emitted progress with the active run identity while keeping
@@ -705,9 +708,8 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
   });
   const emitTurnCompletedEvent = () => {
     if (turnEventTerminalEmitted) return;
-    if (!runTerminalEmitted) {
-      const runEventIdentity = resolveRunEventIdentity();
-      runTerminalEmitted = true;
+    const runEventIdentity = resolveRunEventIdentity();
+    if (!terminalRunIds.has(runEventIdentity.runId)) {
       emitTurnEvent({
         type: "run.completed",
         threadId: eventThreadId,
@@ -730,7 +732,11 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     });
   };
   const stageTurnCompletion = (commit: () => void) => {
-    if (stagedTurnCompletion || turnEventTerminalEmitted || runTerminalEmitted) return;
+    if (
+      stagedTurnCompletion ||
+      turnEventTerminalEmitted ||
+      terminalRunIds.has(resolveRunEventIdentity().runId)
+    ) return;
     stagedTurnCompletion = commit;
   };
   Object.defineProperty(emitTurnCompletedEvent, "stageCompletion", {
@@ -751,41 +757,13 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     stagedTurnCompletion = null;
     return true;
   };
-  const emitTurnFailedEvent = (message: string) => {
-    if (turnEventTerminalEmitted) return;
-    if (!runTerminalEmitted) {
-      const runEventIdentity = resolveRunEventIdentity();
-      runTerminalEmitted = true;
-      emitTurnEvent({
-        type: "run.failed",
-        threadId: eventThreadId,
-        turnId: eventTurnId,
-        timestampMs: Date.now(),
-        error: { message },
-        ...runEventIdentity,
-      });
-    }
-    // Inner Goal failures can be recoverable and may advance to another slice.
-    // Preserve the run.failed evidence, but defer turn.failed to the outer
-    // Goal state machine.
-    if (resolveRunEventIdentity().goalSliceId) return;
-    turnEventTerminalEmitted = true;
-    emitTurnEvent({
-      type: "turn.failed",
-      threadId: eventThreadId,
-      turnId: eventTurnId,
-      timestampMs: Date.now(),
-      error: { message },
-    });
-  };
   const emitRunPausedEvent = (
     reason: string,
     message: string,
     progress?: MainThreadProgressUpdate,
   ) => {
-    if (runTerminalEmitted) return false;
     const runEventIdentity = resolveRunEventIdentity();
-    runTerminalEmitted = true;
+    if (terminalRunIds.has(runEventIdentity.runId)) return false;
     emitTurnEvent({
       type: "run.paused",
       threadId: eventThreadId,
@@ -821,8 +799,9 @@ export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEv
     eventContinuesTurn,
     emitTurnEvent,
     emitTurnCompletedEvent,
-    emitTurnFailedEvent,
     emitRunPausedEvent,
+    getRunPauseReason: (runId?: string) =>
+      runPauseReasons.get(runId || resolveRunEventIdentity().runId) || null,
     stageTurnCompletion,
     hasStagedTurnCompletion,
     commitStagedTurnCompletion,

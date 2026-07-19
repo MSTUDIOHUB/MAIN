@@ -44,7 +44,7 @@ import { buildCloudAuthFriendlyError } from "../lib/cloudAuthErrorHints";
 import { isRetryableCloudErrorMessage } from "../lib/cloudRetry";
 import { isProviderCompatibilityErrorMessage } from "../lib/providerCompatibility";
 import { clearDebugLog, copyDebugLogToClipboard, readDebugLogSnapshot } from "../lib/debugLog";
-import { clearProjectSessions, exportTextFile, spawnPty, writePty } from "../lib/ipc";
+import { exportTextFile, spawnPty, writePty } from "../lib/ipc";
 import { useAppStore } from "../store/useAppStore";
 import {
   createFeishuPairingCode,
@@ -148,6 +148,7 @@ const SETTINGS_COPY = {
     cancel: "取消",
     done: "完成",
     confirmClear: "确认清空",
+    clearHistoryFailed: "清空失败，历史记录仍保留。请重试。",
     confirmReset: "确认重置",
     tipLabel: "提示",
     refresh: "刷新",
@@ -364,6 +365,7 @@ const SETTINGS_COPY = {
     cancel: "Cancel",
     done: "Done",
     confirmClear: "Confirm Clear",
+    clearHistoryFailed: "Clear failed. History was preserved; please try again.",
     confirmReset: "Confirm Reset",
     tipLabel: "Tip",
     refresh: "Refresh",
@@ -938,6 +940,8 @@ function DataManagerPanel({ t, language }: { t: any; language: "zh" | "en" }) {
   const clearChatHistory = useAppStore((s) => s.clearChatHistory);
   const resetAllSettings = useAppStore((s) => s.resetAllSettings);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [clearingHistory, setClearingHistory] = useState(false);
+  const [clearHistoryError, setClearHistoryError] = useState("");
   const [confirmReset, setConfirmReset] = useState(false);
 
   return (
@@ -959,7 +963,10 @@ function DataManagerPanel({ t, language }: { t: any; language: "zh" | "en" }) {
         <p className="text-[11.5px] text-[#71717a] leading-relaxed">{t.clearHistoryDesc}</p>
         {!confirmClear ? (
           <button
-            onClick={() => setConfirmClear(true)}
+            onClick={() => {
+              setClearHistoryError("");
+              setConfirmClear(true);
+            }}
             className="px-4 py-2 text-[12px] font-bold bg-[#18181b] text-[#f59e0b] border border-[#292524] rounded-md hover:bg-[#2e1f0f] transition-colors"
           >
             {t.clearHistory}
@@ -969,22 +976,34 @@ function DataManagerPanel({ t, language }: { t: any; language: "zh" | "en" }) {
             <p className="text-[12px] text-[#f87171] font-bold">{t.clearHistoryConfirm}</p>
             <button
               onClick={async () => {
-                await clearProjectSessions(useAppStore.getState().currentWorkspace).catch(() => {});
-                clearChatHistory();
-                setConfirmClear(false);
+                setClearingHistory(true);
+                setClearHistoryError("");
+                try {
+                  await clearChatHistory();
+                  setConfirmClear(false);
+                } catch {
+                  setClearHistoryError(copy.clearHistoryFailed);
+                } finally {
+                  setClearingHistory(false);
+                }
               }}
+              disabled={clearingHistory}
               className="px-4 py-2 text-[12px] font-bold bg-[#7f1d1d] text-white border border-[#991b1b] rounded-md hover:bg-[#991b1b] transition-colors"
             >
-              {copy.confirmClear}
+              {clearingHistory ? `${copy.confirmClear}…` : copy.confirmClear}
             </button>
             <button
               onClick={() => setConfirmClear(false)}
+              disabled={clearingHistory}
               className="px-4 py-2 text-[12px] font-bold bg-[#18181b] text-[#a1a1aa] border border-[#27272a] rounded-md hover:text-white transition-colors"
             >
               {copy.cancel}
             </button>
           </div>
         )}
+        {clearHistoryError ? (
+          <p className="text-[11.5px] text-[#f87171] leading-relaxed">{clearHistoryError}</p>
+        ) : null}
       </div>
 
       {/* Reset All Settings */}

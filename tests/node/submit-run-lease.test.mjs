@@ -56,11 +56,14 @@ const {
   path.join(workspaceRoot, "src/store/submitRunLease.ts"),
 );
 const {
+  acquireHarnessRunMarker,
   closeHarnessRunMarker,
+  closeHarnessRunMarkerForSessionDeletion,
   isHarnessRunMarkerOwnedByRun,
   persistHarnessRunMarker,
   persistHarnessRunMarkerIfOwned,
   readHarnessRunMarker,
+  settleHarnessRunMarkerIfOwned,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/harnessCrashTelemetry.ts"),
 );
@@ -130,7 +133,8 @@ test("submit run lease appends agent message, opens abort lease, and persists ha
       goals.push({ objective, options });
     },
     getCurrentHarnessInstanceId: () => "instance-a",
-    persistHarnessRunMarker: (marker) => {
+    expectedHarnessRunMarker: null,
+    acquireHarnessRunMarker: (marker) => {
       persistedMarkers.push(marker);
       return { ...marker, persisted: true };
     },
@@ -186,12 +190,53 @@ test("submit run lease refuses inferred or internally resolved Goal creation wit
     setAbortController: () => {},
     startGoal: () => { startGoalCalls += 1; },
     getCurrentHarnessInstanceId: () => "instance-a",
-    persistHarnessRunMarker: (marker) => marker,
+    expectedHarnessRunMarker: null,
+    acquireHarnessRunMarker: (marker) => marker,
     setHarnessRunMarker: () => {},
     nowMs: () => 457,
   });
 
   assert.equal(startGoalCalls, 0);
+});
+
+test("submit run lease performs no local acquisition effects when Harness CAS loses", () => {
+  const agentMessages = [];
+  let abortControllerCreations = 0;
+  let goalStarts = 0;
+  let localMarkerWrites = 0;
+
+  assert.throws(() => startSubmitRunLease({
+    userContent: "stale bootstrap",
+    currentImages: [],
+    runSessionKey: "workspace-a:7",
+    runWorkspace: "/repo",
+    runSessionId: 7,
+    turnId: "turn-stale",
+    effectiveRunIntent: "execute",
+    runtimeRunIntent: "execute",
+    getRuntimeSnapshot: () => ({
+      agentMessagesLength: agentMessages.length,
+      planStage: "idle",
+      isPlanApproved: false,
+    }),
+    appendAgentMessage: (message) => agentMessages.push(message),
+    createAbortController: () => {
+      abortControllerCreations += 1;
+      return { signal: { aborted: false } };
+    },
+    setAbortController: () => assert.fail("lost CAS must not publish an AbortController"),
+    startGoal: () => { goalStarts += 1; },
+    getCurrentHarnessInstanceId: () => "instance-a",
+    expectedHarnessRunMarker: null,
+    acquireHarnessRunMarker: () => null,
+    setHarnessRunMarker: () => { localMarkerWrites += 1; },
+    nowMs: () => 458,
+  }), /HARNESS_RUN_LEASE_OWNER_LOST/);
+
+  assert.deepEqual(agentMessages, []);
+  assert.equal(abortControllerCreations, 0);
+  assert.equal(goalStarts, 0);
+  assert.equal(localMarkerWrites, 0);
 });
 
 test("submit run lease links only exact same-turn resumes", () => {
@@ -227,7 +272,8 @@ test("submit run lease links only exact same-turn resumes", () => {
     setAbortController: () => {},
     startGoal: () => assert.fail("goal must not start"),
     getCurrentHarnessInstanceId: () => "instance-a",
-    persistHarnessRunMarker: (marker) => (persisted = marker),
+    expectedHarnessRunMarker: null,
+    acquireHarnessRunMarker: (marker) => (persisted = marker),
     setHarnessRunMarker: () => {},
     nowMs: () => 789,
   });
@@ -267,7 +313,8 @@ test("action continuations preserve their exact paused parent run even when anot
     setAbortController: () => {},
     startGoal: () => assert.fail("goal must not start"),
     getCurrentHarnessInstanceId: () => "instance-a",
-    persistHarnessRunMarker: (marker) => (persisted = marker),
+    expectedHarnessRunMarker: null,
+    acquireHarnessRunMarker: (marker) => (persisted = marker),
     setHarnessRunMarker: () => {},
     nowMs: () => 790,
   });
@@ -308,7 +355,8 @@ test("approved handoffs preserve a preallocated child run id through the submiss
     setAbortController: () => {},
     startGoal: () => assert.fail("goal must not start"),
     getCurrentHarnessInstanceId: () => "instance-a",
-    persistHarnessRunMarker: (marker) => (persisted = marker),
+    expectedHarnessRunMarker: null,
+    acquireHarnessRunMarker: (marker) => (persisted = marker),
     setHarnessRunMarker: () => {},
     nowMs: () => 791,
   });
@@ -344,7 +392,8 @@ test("Goal choice continuations append guidance without creating a replacement G
     setAbortController: () => {},
     startGoal: () => assert.fail("a Goal continuation must retain the existing Goal"),
     getCurrentHarnessInstanceId: () => "instance-a",
-    persistHarnessRunMarker: (marker) => (persisted = marker),
+    expectedHarnessRunMarker: null,
+    acquireHarnessRunMarker: (marker) => (persisted = marker),
     setHarnessRunMarker: () => {},
     nowMs: () => 792,
   });
@@ -405,6 +454,8 @@ test("global harness persistence uses run ownership CAS across background sessio
       runId: "run-b",
       sessionKey: "workspace-b:2",
       turnId: "turn-b",
+      instanceId: "instance-a",
+      startedAt: 200,
     };
 
     assert.equal(persistHarnessRunMarkerIfOwned({
@@ -415,6 +466,21 @@ test("global harness persistence uses run ownership CAS across background sessio
       iteration: 3,
     }, ownerA), null);
     assert.equal(readHarnessRunMarker().runId, "run-b");
+    assert.equal(persistHarnessRunMarkerIfOwned({
+      ...markerB,
+      iteration: 4,
+    }, {
+      ...ownerB,
+      instanceId: "instance-stale",
+    }), null);
+    assert.equal(persistHarnessRunMarkerIfOwned({
+      ...markerB,
+      iteration: 5,
+    }, {
+      ...ownerB,
+      startedAt: 199,
+    }), null);
+    assert.equal(readHarnessRunMarker().iteration, markerB.iteration);
     assert.equal(closeHarnessRunMarker({
       status: "completed",
       closeReason: "old_session_finished",
@@ -426,6 +492,203 @@ test("global harness persistence uses run ownership CAS across background sessio
       closeReason: "owner_finished",
     }, ownerB);
     assert.equal(closedB.runId, "run-b");
+    assert.equal(readHarnessRunMarker().status, "completed");
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("Harness settlement cannot close a reused logical id from another generation", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const predecessor = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-reused",
+      instanceId: "instance-old",
+      sessionKey: "workspace-a:7",
+      turnId: "turn-reused",
+      status: "running",
+      startedAt: 100,
+      updatedAt: 100,
+    });
+    const successor = persistHarnessRunMarker({
+      ...predecessor,
+      instanceId: "instance-new",
+      status: "running",
+      startedAt: 200,
+      updatedAt: 200,
+    });
+    const staleTerminal = {
+      ...predecessor,
+      status: "completed",
+      closeReason: "stale_generation_finished",
+      closedAt: 300,
+      updatedAt: 300,
+    };
+
+    assert.equal(settleHarnessRunMarkerIfOwned(staleTerminal, {
+      runId: predecessor.runId,
+      sessionKey: predecessor.sessionKey,
+      turnId: predecessor.turnId,
+      instanceId: predecessor.instanceId,
+      startedAt: predecessor.startedAt,
+    }), null);
+    assert.equal(readHarnessRunMarker().instanceId, successor.instanceId);
+    assert.equal(readHarnessRunMarker().startedAt, successor.startedAt);
+    assert.equal(readHarnessRunMarker().status, "running");
+
+    const exactTerminal = {
+      ...successor,
+      status: "completed",
+      closeReason: "successor_finished",
+      closedAt: 400,
+      updatedAt: 400,
+    };
+    const exactOwner = {
+      runId: successor.runId,
+      sessionKey: successor.sessionKey,
+      turnId: successor.turnId,
+      instanceId: successor.instanceId,
+      startedAt: successor.startedAt,
+    };
+    const settled = settleHarnessRunMarkerIfOwned(exactTerminal, exactOwner);
+    assert.equal(settled.status, "completed");
+    assert.equal(settled.closeReason, "successor_finished");
+    assert.equal(settleHarnessRunMarkerIfOwned(exactTerminal, exactOwner).status, "completed");
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("Harness acquisition CAS cannot overwrite a newer Session owner", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const predecessor = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-predecessor",
+      instanceId: "instance-a",
+      sessionKey: "workspace-a:1",
+      turnId: "turn-a",
+      status: "running",
+      startedAt: 100,
+      updatedAt: 100,
+    });
+    const newer = persistHarnessRunMarker({
+      ...predecessor,
+      runId: "run-new-owner",
+      instanceId: "instance-b",
+      sessionKey: "workspace-b:2",
+      turnId: "turn-b",
+      startedAt: 200,
+      updatedAt: 200,
+    });
+    const staleCandidate = {
+      ...predecessor,
+      runId: "run-stale-candidate",
+      turnId: "turn-stale",
+      startedAt: 300,
+      updatedAt: 300,
+    };
+
+    assert.equal(acquireHarnessRunMarker(staleCandidate, predecessor), null);
+    assert.equal(readHarnessRunMarker().runId, newer.runId);
+
+    const accepted = acquireHarnessRunMarker(staleCandidate, newer);
+    assert.equal(accepted.runId, staleCandidate.runId);
+    assert.equal(readHarnessRunMarker().runId, staleCandidate.runId);
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("Session deletion closes an exact paused Harness owner without restoring its write lease", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, String(value)),
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const paused = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-paused",
+      instanceId: "instance-a",
+      sessionKey: "workspace-a:7",
+      turnId: "turn-paused",
+      status: "paused",
+      startedAt: 300,
+      updatedAt: 300,
+    });
+    const owner = {
+      runId: paused.runId,
+      sessionKey: paused.sessionKey,
+      turnId: paused.turnId,
+    };
+
+    assert.equal(isHarnessRunMarkerOwnedByRun(paused, owner), false);
+    assert.equal(persistHarnessRunMarkerIfOwned({
+      ...paused,
+      iteration: 9,
+    }, owner), null);
+    assert.equal(readHarnessRunMarker().iteration, paused.iteration);
+    assert.equal(closeHarnessRunMarkerForSessionDeletion({
+      ...owner,
+      runId: "foreign-run",
+    }), null);
+    assert.equal(closeHarnessRunMarkerForSessionDeletion({
+      ...owner,
+      instanceId: "stale-instance",
+      startedAt: paused.startedAt,
+    }), null);
+    assert.equal(closeHarnessRunMarkerForSessionDeletion({
+      ...owner,
+      instanceId: paused.instanceId,
+      startedAt: paused.startedAt + 1,
+    }), null);
+    assert.equal(readHarnessRunMarker().status, "paused");
+
+    const closed = closeHarnessRunMarkerForSessionDeletion({
+      ...owner,
+      instanceId: paused.instanceId,
+      startedAt: paused.startedAt,
+    });
+    assert.equal(closed.runId, paused.runId);
+    assert.equal(closed.status, "completed");
+    assert.equal(closed.closeReason, "session_deleted");
     assert.equal(readHarnessRunMarker().status, "completed");
   } finally {
     if (previousWindow === undefined) {

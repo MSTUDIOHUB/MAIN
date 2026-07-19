@@ -6,7 +6,6 @@ import {
   resolveSubmitSendGateDecision,
   type SubmitSendGateDecision,
 } from "../lib/submit/turnSubmission";
-import type { ConversationTurnStatus } from "../lib/workflowModels";
 import type { ResolvedRunIntent } from "../lib/runIntent";
 import type {
   GoalContinuationAuthorization,
@@ -61,10 +60,7 @@ export interface ApplySubmitSendGateEffectsInput<TState extends SubmitSendGateEf
   approvePendingReviewOnce: () => void;
   approvePlan: (approvalChoice?: string) => void;
   setState: (patch: any) => void;
-  setConversationTurnStatus: (
-    turnId: string,
-    status: ConversationTurnStatus,
-  ) => void;
+  closeTurnAsCanceled: (turnId: string, options: { reason: string; message: string }) => boolean;
   logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
 }
 
@@ -164,12 +160,16 @@ export function applySubmitSendGateEffects<TState extends SubmitSendGateEffectsS
     input.logStoreEvent("send_stuck_state_reset", {
       previousStatus: decision.action.previousStatus,
     });
-    input.setState({ agentStatus: "idle", isGenerating: false });
-    if (input.state.currentTurnId && decision.action.turnStatus) {
-      input.setConversationTurnStatus(
-        input.state.currentTurnId,
-        decision.action.turnStatus,
-      );
+    const closed = input.state.currentTurnId
+      ? input.closeTurnAsCanceled(input.state.currentTurnId, {
+          reason: "stale_runtime_superseded",
+          message: /[^\x00-\x7F]/.test(input.text)
+            ? "检测到旧回合的运行租约已经丢失；旧回合已取消并完成收口。"
+            : "The previous turn lost its run lease; it was canceled and closed.",
+        })
+      : false;
+    if (!closed) {
+      input.setState({ agentStatus: "idle", isGenerating: false });
     }
   }
 

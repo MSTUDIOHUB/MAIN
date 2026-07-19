@@ -39,9 +39,14 @@ const runIdentity = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/r
 const turnContext = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnContext.ts"));
 const durableTurnContext = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/durableTurnContext.ts"));
 
-test("successful and failed terminal runs both canonicalize persisted context", () => {
+test("closed canonical runs and legacy error snapshots canonicalize persisted context", () => {
   assert.equal(durableTurnContext.shouldCanonicalizeTerminalTurnContext("completed"), true);
-  assert.equal(durableTurnContext.shouldCanonicalizeTerminalTurnContext("error"), true);
+  assert.equal(durableTurnContext.shouldCanonicalizeTerminalTurnContext("aborted"), true);
+  assert.equal(
+    durableTurnContext.shouldCanonicalizeTerminalTurnContext("error"),
+    true,
+    "persisted pre-contract error snapshots remain readable",
+  );
   assert.equal(durableTurnContext.shouldCanonicalizeTerminalTurnContext("paused"), false);
   assert.equal(durableTurnContext.shouldCanonicalizeTerminalTurnContext("stopped_no_action"), false);
 });

@@ -1334,18 +1334,13 @@ export default function Composer({
 
     const appState = useAppStore.getState();
     if (appState.agentStatus === "pending_review") {
-      appState.abortController?.abort();
-      useAppStore.setState({
-        agentStatus: "idle",
-        isGenerating: false,
-        abortController: null,
-        isPlanApproved: false,
-        planApprovalChoice: null,
-        planExecutionEvidenceLedger: [],
-        planExecutionEvidenceCount: 0,
-        planAutoResumeCount: 0,
-        planExecutionProgressSnapshot: null,
+      appState.stopGeneration();
+      closeSlashMenu();
+      setStoreInput("");
+      onSendMessage(guidance, queuedUserMessage.images || [], {
+        queuedUserMessageId: queuedUserMessage.id,
       });
+      return;
     }
 
     if (isStreaming) {

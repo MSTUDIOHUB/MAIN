@@ -45,7 +45,12 @@ export interface StartSubmitRunLeaseInput<TAbortController> {
   setAbortController: (abortController: TAbortController) => void;
   startGoal: (objective: string, options: { sessionKey: string; sourceContext?: string; ownerTurnId: string; subagentPreference?: SubagentDelegationPreference }) => void;
   getCurrentHarnessInstanceId: () => string;
-  persistHarnessRunMarker: (marker: HarnessRunMarker) => HarnessRunMarker;
+  /** Exact global marker snapshot captured when bootstrap began. */
+  expectedHarnessRunMarker: HarnessRunMarker | null;
+  acquireHarnessRunMarker: (
+    marker: HarnessRunMarker,
+    expectedCurrent: HarnessRunMarker | null,
+  ) => HarnessRunMarker | null;
   setHarnessRunMarker: (marker: HarnessRunMarker) => void;
   nowMs?: () => number;
 }
@@ -93,14 +98,54 @@ export function startSubmitRunLease<TAbortController>(
     userContent: input.userContent,
     currentImages: input.currentImages,
   });
+  const hasExplicitGoalCreationAuthorization = isGoalCreationAuthorization(
+    input.goalCreationAuthorization,
+  );
+  const startedAtMs = (input.nowMs || Date.now)();
+  const runId = String(input.runIdOverride || "").trim() || createSubmitHarnessRunId(startedAtMs);
+  const lineage = resolveSubmitRunLineage({
+    previousMarker: runtimeBeforeMessage.harnessRunMarker,
+    sessionKey: input.runSessionKey,
+    turnId: input.turnId,
+    runId,
+    currentMessageStartIndex: turnAgentMessagesStart,
+  });
+  const parentRunId = String(input.parentRunIdOverride || "").trim() || lineage.parentRunId;
+  const harnessRunMarkerDraft = {
+    ...buildSubmitHarnessRunMarkerDraft({
+      runId: lineage.runId,
+      instanceId: input.getCurrentHarnessInstanceId(),
+      runSessionKey: input.runSessionKey,
+      runWorkspace: input.runWorkspace,
+      runSessionId: input.runSessionId,
+      turnId: input.turnId,
+      effectiveRunIntent: input.effectiveRunIntent,
+      runtimeRunIntent: input.runtimeRunIntent,
+      planStage: runtimeBeforeMessage.planStage,
+      isPlanApproved: runtimeBeforeMessage.isPlanApproved,
+      messagesLen: runtimeBeforeMessage.agentMessagesLength + 1,
+      startedAtMs,
+    }),
+    parentRunId,
+    turnStartMessageIndex: lineage.turnStartMessageIndex,
+    lastGoalSliceRunId: null,
+  };
+  const harnessRunMarker = input.acquireHarnessRunMarker(
+    harnessRunMarkerDraft,
+    input.expectedHarnessRunMarker,
+  );
+  if (!harnessRunMarker) {
+    throw new Error(
+      "HARNESS_RUN_LEASE_OWNER_LOST: a newer Harness owner acquired the global slot during bootstrap",
+    );
+  }
+  input.setHarnessRunMarker(harnessRunMarker);
+
   input.appendAgentMessage(agentUserMessage);
 
   const abortController = input.createAbortController();
   input.setAbortController(abortController);
 
-  const hasExplicitGoalCreationAuthorization = isGoalCreationAuthorization(
-    input.goalCreationAuthorization,
-  );
   if (
     input.effectiveRunIntent === "goal" &&
     input.runtimeRunIntent === "goal" &&
@@ -120,38 +165,6 @@ export function startSubmitRunLease<TAbortController>(
       },
     );
   }
-
-  const runtimeAfterMessage = input.getRuntimeSnapshot();
-  const startedAtMs = (input.nowMs || Date.now)();
-  const runId = String(input.runIdOverride || "").trim() || createSubmitHarnessRunId(startedAtMs);
-  const lineage = resolveSubmitRunLineage({
-    previousMarker: runtimeBeforeMessage.harnessRunMarker,
-    sessionKey: input.runSessionKey,
-    turnId: input.turnId,
-    runId,
-    currentMessageStartIndex: turnAgentMessagesStart,
-  });
-  const parentRunId = String(input.parentRunIdOverride || "").trim() || lineage.parentRunId;
-  const harnessRunMarker = input.persistHarnessRunMarker({
-    ...buildSubmitHarnessRunMarkerDraft({
-      runId: lineage.runId,
-      instanceId: input.getCurrentHarnessInstanceId(),
-      runSessionKey: input.runSessionKey,
-      runWorkspace: input.runWorkspace,
-      runSessionId: input.runSessionId,
-      turnId: input.turnId,
-      effectiveRunIntent: input.effectiveRunIntent,
-      runtimeRunIntent: input.runtimeRunIntent,
-      planStage: runtimeAfterMessage.planStage,
-      isPlanApproved: runtimeAfterMessage.isPlanApproved,
-      messagesLen: runtimeAfterMessage.agentMessagesLength,
-      startedAtMs,
-    }),
-    parentRunId,
-    turnStartMessageIndex: lineage.turnStartMessageIndex,
-    lastGoalSliceRunId: null,
-  });
-  input.setHarnessRunMarker(harnessRunMarker);
 
   return {
     turnAgentMessagesStart,

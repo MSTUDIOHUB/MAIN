@@ -9,6 +9,7 @@ type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K>
 
 export type EventStreamMode = "legacy" | "dual" | "events_only";
 export type ToolFeedbackFormat = "legacy" | "envelope_v1";
+export type TerminalResultKind = "success" | "partial" | "blocked" | "error" | "canceled";
 
 export interface MainThreadUsage {
   inputTokens: number;
@@ -138,7 +139,9 @@ export type MainThreadItemDetails =
 export type MainThreadEvent =
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "thread.started"; threadId: string; timestampMs: number }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "turn.started"; threadId: string; turnId: string; timestampMs: number }
-  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "turn.completed"; threadId: string; turnId: string; timestampMs: number; usage?: MainThreadUsage }
+  | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "turn.completed"; threadId: string; turnId: string; timestampMs: number; usage?: MainThreadUsage; resultKind?: TerminalResultKind }
+  // Read compatibility for persisted events; new application conclusions use
+  // turn.completed with resultKind="error".
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "turn.failed"; threadId: string; turnId: string; timestampMs: number; error: MainThreadError }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "slash.command.started"; threadId: string; turnId?: string; timestampMs: number; command: string; executionMode: "local_fast" | "model_workflow" }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "slash.command.completed"; threadId: string; turnId?: string; timestampMs: number; command: string; executionMode: "local_fast" | "model_workflow" }
@@ -175,7 +178,10 @@ export type MainThreadEvent =
     } & MainThreadRunIdentity)
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.started"; threadId: string; turnId: string; timestampMs: number } & MainThreadRunIdentity)
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.paused"; threadId: string; turnId: string; timestampMs: number; reason: string; message: string; progress?: MainThreadProgressUpdate } & MainThreadRunIdentity)
-  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string } & MainThreadRunIdentity)
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.completed"; threadId: string; turnId: string; timestampMs: number; summary?: string; resultKind?: TerminalResultKind } & MainThreadRunIdentity)
+  | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.aborted"; threadId: string; turnId: string; timestampMs: number; reason: string; message?: string } & MainThreadRunIdentity)
+  // Read compatibility for persisted events; new application conclusions use
+  // run.completed with resultKind="error".
   | ({ schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "run.failed"; threadId: string; turnId: string; timestampMs: number; error: MainThreadError } & MainThreadRunIdentity)
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.started"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
   | { schemaVersion: typeof MAIN_THREAD_EVENT_SCHEMA_VERSION; type: "item.updated"; threadId: string; turnId: string; timestampMs: number; item: MainThreadItem }
@@ -217,42 +223,113 @@ export function appendRuntimeEvent(
   event: MainThreadEvent,
   maxEvents = 800,
 ): MainThreadEvent[] {
+  return appendRuntimeEventWithResult(events, event, maxEvents).events;
+}
+
+export type AppendRuntimeEventDisposition = "committed" | "idempotent" | "conflict";
+
+export interface AppendRuntimeEventResult {
+  events: MainThreadEvent[];
+  disposition: AppendRuntimeEventDisposition;
+  existingEvent?: MainThreadEvent;
+}
+
+function completedResultKind(
+  event: Extract<MainThreadEvent, { type: "run.completed" | "turn.completed" }>,
+): TerminalResultKind {
+  return event.resultKind || "success";
+}
+
+function hasSameTerminalMeaning(existing: MainThreadEvent, incoming: MainThreadEvent): boolean {
+  if (existing.type !== incoming.type) return false;
+  if (existing.type === "run.completed" && incoming.type === "run.completed") {
+    return completedResultKind(existing) === completedResultKind(incoming);
+  }
+  if (existing.type === "turn.completed" && incoming.type === "turn.completed") {
+    return completedResultKind(existing) === completedResultKind(incoming);
+  }
+  if (existing.type === "run.paused" && incoming.type === "run.paused") {
+    return existing.reason === incoming.reason;
+  }
+  if (existing.type === "run.aborted" && incoming.type === "run.aborted") {
+    return existing.reason === incoming.reason;
+  }
+  // Legacy failed events have no stable reason code. Replays of the same
+  // terminal identity are idempotent even if wrapper text changed.
+  return existing.type === "run.failed" || existing.type === "turn.failed";
+}
+
+/**
+ * Append an event and expose whether a terminal transition was accepted,
+ * replayed, or rejected. Reducers must not apply side effects from a
+ * conflicting terminal candidate.
+ */
+export function appendRuntimeEventWithResult(
+  events: MainThreadEvent[] | null | undefined,
+  event: MainThreadEvent,
+  maxEvents = 800,
+): AppendRuntimeEventResult {
   const existing = events || [];
   if (
     event.type === "thread.started" &&
     existing.some((candidate) => candidate.type === "thread.started" && candidate.threadId === event.threadId)
   ) {
-    return existing;
+    return {
+      events: existing,
+      disposition: "idempotent",
+      existingEvent: existing.find((candidate) =>
+        candidate.type === "thread.started" && candidate.threadId === event.threadId
+      ),
+    };
   }
-  if (
-    (event.type === "run.paused" || event.type === "run.completed" || event.type === "run.failed") &&
-    existing.some((candidate) =>
-      (candidate.type === "run.paused" || candidate.type === "run.completed" || candidate.type === "run.failed") &&
+  if (isRunTerminalEvent(event)) {
+    const existingTerminal = existing.find((candidate) =>
+      isRunTerminalEvent(candidate) &&
       candidate.threadId === event.threadId &&
       candidate.turnId === event.turnId &&
       candidate.runId === event.runId
-    )
-  ) {
-    return existing;
+    );
+    if (existingTerminal) {
+      return {
+        events: existing,
+        disposition: hasSameTerminalMeaning(existingTerminal, event) ? "idempotent" : "conflict",
+        existingEvent: existingTerminal,
+      };
+    }
   }
-  if (
-    isTerminalTurnEvent(event) &&
-    existing.some((candidate) =>
+  if (isTerminalTurnEvent(event)) {
+    const existingTerminal = existing.find((candidate) =>
       isTerminalTurnEvent(candidate) &&
       candidate.threadId === event.threadId &&
       candidate.turnId === event.turnId
-    )
-  ) {
-    return existing;
+    );
+    if (existingTerminal) {
+      return {
+        events: existing,
+        disposition: hasSameTerminalMeaning(existingTerminal, event) ? "idempotent" : "conflict",
+        existingEvent: existingTerminal,
+      };
+    }
   }
   const next = [...existing, event];
-  if (next.length <= maxEvents) return next;
+  if (next.length <= maxEvents) return { events: next, disposition: "committed" };
   const firstThreadStarted = next.find((candidate) => candidate.type === "thread.started");
-  if (!firstThreadStarted || maxEvents <= 1) return next.slice(next.length - maxEvents);
+  if (!firstThreadStarted || maxEvents <= 1) {
+    return { events: next.slice(next.length - maxEvents), disposition: "committed" };
+  }
   const tail = next
     .filter((candidate) => candidate !== firstThreadStarted)
     .slice(-(maxEvents - 1));
-  return [firstThreadStarted, ...tail];
+  return { events: [firstThreadStarted, ...tail], disposition: "committed" };
+}
+
+export function isRunTerminalEvent(
+  event: MainThreadEvent,
+): event is Extract<MainThreadEvent, { type: "run.paused" | "run.completed" | "run.aborted" | "run.failed" }> {
+  return event.type === "run.paused" ||
+    event.type === "run.completed" ||
+    event.type === "run.aborted" ||
+    event.type === "run.failed";
 }
 
 export function isTerminalTurnEvent(

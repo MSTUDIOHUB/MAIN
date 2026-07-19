@@ -24,6 +24,8 @@ import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { buildPlanReviewActionRequest, type ActionRequest } from "../lib/actionRequest";
 import {
   createSubmitSessionRuntimeFacade,
+  type SubmitOwnerScopedRuntimeProjectionInput,
+  type SubmitOwnerScopedRuntimePublicationResult,
   type SubmitSessionPatch,
   type SubmitSessionPatchInput,
   type SubmitSessionRuntimeFacade,
@@ -80,6 +82,12 @@ export interface SubmitSessionRuntimeController<
   sessionRuntimeFacade: SubmitSessionRuntimeFacade<TState, TRuntime>;
   sessionSet: (patchOrUpdater: SubmitSessionPatchInput<TState>) => void;
   sessionGet: () => TState;
+  getSessionRuntimeOwnerToken: () => object;
+  hasSessionRuntimeOwnership: (expectedOwnerToken?: object) => boolean;
+  getSessionRevisionToken: () => unknown;
+  publishOwnerScopedRuntimeProjection: (
+    input: SubmitOwnerScopedRuntimeProjectionInput<TState>,
+  ) => SubmitOwnerScopedRuntimePublicationResult;
 }
 
 export function createSubmitSessionRuntimeController<
@@ -318,5 +326,10 @@ export function createSubmitSessionRuntimeController<
     sessionRuntimeFacade,
     sessionSet,
     sessionGet,
+    getSessionRuntimeOwnerToken: sessionRuntimeFacade.getSessionRuntimeOwnerToken,
+    hasSessionRuntimeOwnership: sessionRuntimeFacade.hasSessionRuntimeOwnership,
+    getSessionRevisionToken: sessionRuntimeFacade.getSessionRevisionToken,
+    publishOwnerScopedRuntimeProjection:
+      sessionRuntimeFacade.publishOwnerScopedRuntimeProjection,
   };
 }

@@ -63,6 +63,10 @@ const HTTP_CONNECT_TIMEOUT_SECS: u64 = 15;
 const HTTP_SHORT_TIMEOUT_SECS: u64 = 15;
 const MODEL_REQUEST_TIMEOUT_SECS: u64 = 30 * 60;
 const STREAM_READ_TIMEOUT_SECS: u64 = 15 * 60;
+const HTTP_ERROR_BODY_LIMIT_BYTES: usize = 64 * 1024;
+const CURL_FALLBACK_OUTPUT_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+const CURL_FALLBACK_STDERR_LIMIT_BYTES: usize = 64 * 1024;
+const CURL_FALLBACK_SUPERVISOR_GRACE_SECS: u64 = 5;
 const STREAM_FIRST_RESPONSE_TIMEOUT_SECS: u64 = 180;
 const STREAM_FIRST_CHUNK_TIMEOUT_SECS: u64 = 180;
 const STREAM_IDLE_CHUNK_TIMEOUT_SECS: u64 = 180;
@@ -1664,20 +1668,98 @@ fn should_try_curl_transport_fallback(url: &str, method: &str, error_message: &s
         || normalized.contains("certificate")
 }
 
-fn proxy_request_via_curl(
+struct BoundedProcessOutput {
+    status: ExitStatus,
+    stdout: CapturedPipe,
+    stderr: CapturedPipe,
+}
+
+fn run_cancellable_bounded_process(
+    mut command: ProcessCommand,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    timeout: Duration,
+    stdout_limit: usize,
+    stderr_limit: usize,
+) -> Result<BoundedProcessOutput, String> {
+    if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("Aborted".to_string());
+    }
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolate_process_group(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("无法启动受信任代理进程: {e}"))?;
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stdout| thread::spawn(move || read_limited_pipe(stdout, stdout_limit)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_limited_pipe(stderr, stderr_limit)));
+
+    let started_at = Instant::now();
+    let mut cancelled = false;
+    let mut timed_out = false;
+    let status_result = loop {
+        if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+            cancelled = true;
+            break terminate_timed_out_child(&mut child);
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if started_at.elapsed() >= timeout => {
+                timed_out = true;
+                break terminate_timed_out_child(&mut child);
+            }
+            Ok(None) => thread::sleep(Duration::from_millis(10)),
+            Err(error) => {
+                let _ = terminate_timed_out_child(&mut child);
+                break Err(format!("等待受信任代理进程结束失败: {error}"));
+            }
+        }
+    };
+
+    // Always drain and join the capture threads after the child has exited so
+    // cancellation cannot leave either a process or pipe reader behind.
+    let stdout = join_captured_pipe(stdout_handle, "curl stdout")?;
+    let stderr = join_captured_pipe(stderr_handle, "curl stderr")?;
+    let status = status_result?;
+    if cancelled {
+        return Err("Aborted".to_string());
+    }
+    if timed_out {
+        return Err(format!(
+            "curl 回退超过 {} 秒的受信任执行上限",
+            timeout.as_secs()
+        ));
+    }
+    if stdout.truncated {
+        return Err(format!("curl 回退响应超过 {} 字节上限", stdout_limit));
+    }
+
+    Ok(BoundedProcessOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn proxy_request_via_curl(
     url: &str,
     method: &str,
     headers: Option<&std::collections::HashMap<String, String>>,
     body: Option<&str>,
+    request_lease: &ProxyRequestLease,
 ) -> Result<String, String> {
-    let mut command = ProcessCommand::new("curl");
-    command.arg("-sS");
-    command.arg("-L");
-    command.arg("-X").arg(method);
-    command.arg(url);
-    command
-        .arg("--connect-timeout")
-        .arg(HTTP_CONNECT_TIMEOUT_SECS.to_string());
+    if request_lease.is_cancelled() {
+        return Err("Aborted".to_string());
+    }
+
     let max_time_secs = if method.eq_ignore_ascii_case("POST")
         && (url.contains("/v1/responses")
             || url.contains("/v1/chat/completions")
@@ -1689,45 +1771,78 @@ fn proxy_request_via_curl(
     } else {
         HTTP_SHORT_TIMEOUT_SECS
     };
-    command.arg("--max-time").arg(max_time_secs.to_string());
-    command.arg("-w").arg("\n__HTTP_STATUS__:%{http_code}");
 
-    let has_content_type = headers
-        .map(|hdrs| {
-            hdrs.keys()
-                .any(|key| key.eq_ignore_ascii_case("content-type"))
-        })
-        .unwrap_or(false);
-    if !has_content_type {
-        command.arg("-H").arg("Content-Type: application/json");
-    }
+    let owned_url = url.to_string();
+    let owned_method = method.to_string();
+    let owned_headers = headers.cloned();
+    let owned_body = body.map(str::to_string);
+    let cancel_flag = request_lease.cancel_flag.clone();
+    let supervisor_timeout =
+        Duration::from_secs(max_time_secs.saturating_add(CURL_FALLBACK_SUPERVISOR_GRACE_SECS));
+    let output = tauri::async_runtime::spawn_blocking(move || {
+        let mut command = ProcessCommand::new("curl");
+        command.arg("-sS");
+        command.arg("-L");
+        command.arg("-X").arg(&owned_method);
+        command.arg(&owned_url);
+        command
+            .arg("--connect-timeout")
+            .arg(HTTP_CONNECT_TIMEOUT_SECS.to_string());
+        command.arg("--max-time").arg(max_time_secs.to_string());
+        command.arg("-w").arg("\n__HTTP_STATUS__:%{http_code}");
 
-    let has_accept_encoding = headers
-        .map(|hdrs| {
-            hdrs.keys()
-                .any(|key| key.eq_ignore_ascii_case("accept-encoding"))
-        })
-        .unwrap_or(false);
-    if !has_accept_encoding {
-        command.arg("-H").arg("Accept-Encoding: identity");
-    }
-
-    if let Some(hdrs) = headers {
-        for (key, value) in hdrs {
-            command.arg("-H").arg(format!("{key}: {value}"));
+        let has_content_type = owned_headers
+            .as_ref()
+            .map(|hdrs| {
+                hdrs.keys()
+                    .any(|key| key.eq_ignore_ascii_case("content-type"))
+            })
+            .unwrap_or(false);
+        if !has_content_type {
+            command.arg("-H").arg("Content-Type: application/json");
         }
+
+        let has_accept_encoding = owned_headers
+            .as_ref()
+            .map(|hdrs| {
+                hdrs.keys()
+                    .any(|key| key.eq_ignore_ascii_case("accept-encoding"))
+            })
+            .unwrap_or(false);
+        if !has_accept_encoding {
+            command.arg("-H").arg("Accept-Encoding: identity");
+        }
+
+        if let Some(hdrs) = owned_headers.as_ref() {
+            for (key, value) in hdrs {
+                command.arg("-H").arg(format!("{key}: {value}"));
+            }
+        }
+
+        if let Some(body_str) = owned_body.as_ref() {
+            command.arg("--data-binary").arg(body_str);
+        }
+
+        run_cancellable_bounded_process(
+            command,
+            cancel_flag,
+            supervisor_timeout,
+            CURL_FALLBACK_OUTPUT_LIMIT_BYTES,
+            CURL_FALLBACK_STDERR_LIMIT_BYTES,
+        )
+    })
+    .await
+    .map_err(|error| format!("curl 回退监督任务失败: {error}"))??;
+
+    if request_lease.is_cancelled() {
+        return Err("Aborted".to_string());
     }
 
-    if let Some(body_str) = body {
-        command.arg("--data-binary").arg(body_str);
+    let stdout = output.stdout.text;
+    let mut stderr = output.stderr.text.trim().to_string();
+    if output.stderr.truncated {
+        stderr.push_str(" [stderr truncated]");
     }
-
-    let output = command
-        .output()
-        .map_err(|e| format!("curl 回退执行失败: {e}"))?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
     if !output.status.success() && stdout.trim().is_empty() {
         return Err(if stderr.is_empty() {
@@ -7147,15 +7262,303 @@ fn count_tokens(text: String) -> Result<usize, String> {
 }
 
 /// Proxy an HTTP request through the Rust backend (bypasses WebView CORS).
-/// Uses async reqwest with a timeout — prevents UI freeze during model discovery.
-static PROXY_REQUEST_CANCEL: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-static PROXY_REQUEST_ABORT: std::sync::Mutex<Option<futures_util::future::AbortHandle>> =
-    std::sync::Mutex::new(None);
+/// Each request owns an independent cancellation slot. A foreground Turn must
+/// never abort an unrelated request that belongs to another Session or Run.
+struct ProxyRequestContext {
+    generation: u64,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+    abort_handle: Option<futures_util::future::AbortHandle>,
+    settled: bool,
+}
 
-fn set_proxy_abort_handle(handle: Option<futures_util::future::AbortHandle>) {
-    if let Ok(mut slot) = PROXY_REQUEST_ABORT.lock() {
-        *slot = handle;
+const EARLY_CANCELLED_PROXY_REQUEST_LIMIT: usize = 1_024;
+
+#[derive(Default)]
+struct ProxyRequestRegistry {
+    active: HashMap<String, ProxyRequestContext>,
+    early_cancelled: std::collections::VecDeque<String>,
+    next_generation: u64,
+}
+
+impl ProxyRequestRegistry {
+    fn take_early_cancel(&mut self, request_id: &str) -> bool {
+        let Some(index) = self
+            .early_cancelled
+            .iter()
+            .position(|candidate| candidate == request_id)
+        else {
+            return false;
+        };
+        self.early_cancelled.remove(index);
+        true
+    }
+
+    fn remember_early_cancel(&mut self, request_id: String) {
+        if self
+            .early_cancelled
+            .iter()
+            .any(|candidate| candidate == &request_id)
+        {
+            return;
+        }
+        if self.early_cancelled.len() >= EARLY_CANCELLED_PROXY_REQUEST_LIMIT {
+            self.early_cancelled.pop_front();
+        }
+        self.early_cancelled.push_back(request_id);
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self.next_generation == 0 {
+            self.next_generation = 1;
+        }
+        self.next_generation
+    }
+}
+
+static PROXY_REQUEST_REGISTRY: OnceLock<Mutex<ProxyRequestRegistry>> = OnceLock::new();
+
+fn get_proxy_request_registry() -> &'static Mutex<ProxyRequestRegistry> {
+    PROXY_REQUEST_REGISTRY.get_or_init(|| Mutex::new(ProxyRequestRegistry::default()))
+}
+
+fn normalize_proxy_request_id(request_id: Option<String>) -> String {
+    request_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "proxy-legacy-{}-{}",
+                now_millis(),
+                rand::thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(8)
+                    .map(char::from)
+                    .collect::<String>()
+            )
+        })
+}
+
+struct ProxyRequestLease {
+    request_id: String,
+    generation: u64,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ProxyRequestLease {
+    fn acquire(request_id: String) -> Result<Self, String> {
+        let mut registry = get_proxy_request_registry()
+            .lock()
+            .map_err(|_| "代理请求注册表锁已损坏".to_string())?;
+        if registry.active.contains_key(&request_id) {
+            return Err(format!(
+                "DUPLICATE_PROXY_REQUEST_ID: request_id `{request_id}` 已在执行"
+            ));
+        }
+        let was_cancelled_early = registry.take_early_cancel(&request_id);
+        let generation = registry.allocate_generation();
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(was_cancelled_early));
+        registry.active.insert(
+            request_id.clone(),
+            ProxyRequestContext {
+                generation,
+                cancel_flag: cancel_flag.clone(),
+                abort_handle: None,
+                settled: false,
+            },
+        );
+        Ok(Self {
+            request_id,
+            generation,
+            cancel_flag,
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        get_proxy_request_registry()
+            .lock()
+            .ok()
+            .and_then(|registry| {
+                registry.active.get(&self.request_id).and_then(|context| {
+                    (context.generation == self.generation).then(|| {
+                        context
+                            .cancel_flag
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    })
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    fn set_abort_handle(&self, handle: Option<futures_util::future::AbortHandle>) {
+        let Ok(mut registry) = get_proxy_request_registry().lock() else {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            return;
+        };
+        let Some(context) = registry.active.get_mut(&self.request_id) else {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            return;
+        };
+        if context.generation != self.generation || context.settled {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            return;
+        }
+        if let Some(handle) = handle {
+            if context
+                .cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                handle.abort();
+            } else {
+                context.abort_handle = Some(handle);
+            }
+        } else {
+            context.abort_handle = None;
+        }
+    }
+
+    fn try_settle_success(&self) -> bool {
+        let Ok(mut registry) = get_proxy_request_registry().lock() else {
+            return false;
+        };
+        let Some(context) = registry.active.get_mut(&self.request_id) else {
+            return false;
+        };
+        if context.generation != self.generation
+            || context.settled
+            || context
+                .cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        context.settled = true;
+        context.abort_handle = None;
+        true
+    }
+}
+
+impl Drop for ProxyRequestLease {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = get_proxy_request_registry().lock() {
+            if registry
+                .active
+                .get(&self.request_id)
+                .map(|context| context.generation == self.generation)
+                .unwrap_or(false)
+            {
+                registry.active.remove(&self.request_id);
+            }
+        }
+    }
+}
+
+async fn read_http_response_body_limited(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<CapturedPipe, reqwest::Error> {
+    use futures_util::StreamExt;
+
+    let mut stream = response.bytes_stream();
+    let mut bytes = Vec::with_capacity(limit.min(8 * 1024));
+    let mut truncated = false;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        let remaining = limit.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            bytes.extend_from_slice(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() == limit {
+            // Read at most one more chunk to distinguish an exact-limit body
+            // from a larger one; the captured allocation never grows further.
+            if let Some(next_chunk) = stream.next().await {
+                let next_chunk = next_chunk?;
+                truncated = !next_chunk.is_empty();
+            }
+            break;
+        }
+    }
+
+    Ok(CapturedPipe {
+        text: String::from_utf8_lossy(&bytes).to_string(),
+        truncated,
+    })
+}
+
+fn render_limited_http_body(body: CapturedPipe) -> String {
+    if body.truncated {
+        format!("{} [body truncated]", body.text)
+    } else {
+        body.text
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ProxyPhaseError<E> {
+    Aborted,
+    TimedOut,
+    Inner(E),
+}
+
+async fn await_proxy_abortable_phase<F, T, E>(
+    request_lease: &ProxyRequestLease,
+    timeout: Duration,
+    future: F,
+) -> Result<T, ProxyPhaseError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    if request_lease.is_cancelled() {
+        return Err(ProxyPhaseError::Aborted);
+    }
+
+    let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
+    request_lease.set_abort_handle(Some(abort_handle));
+    let result = tokio::time::timeout(
+        timeout,
+        futures_util::future::Abortable::new(future, abort_registration),
+    )
+    .await;
+    request_lease.set_abort_handle(None);
+
+    if request_lease.is_cancelled() {
+        return Err(ProxyPhaseError::Aborted);
+    }
+    match result {
+        Err(_) => Err(ProxyPhaseError::TimedOut),
+        Ok(Err(_)) => Err(ProxyPhaseError::Aborted),
+        Ok(Ok(Err(error))) => Err(ProxyPhaseError::Inner(error)),
+        Ok(Ok(Ok(value))) => Ok(value),
+    }
+}
+
+async fn read_proxy_error_body(
+    response: reqwest::Response,
+    request_lease: &ProxyRequestLease,
+) -> Result<String, String> {
+    match await_proxy_abortable_phase(
+        request_lease,
+        Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS),
+        read_http_response_body_limited(response, HTTP_ERROR_BODY_LIMIT_BYTES),
+    )
+    .await
+    {
+        Err(ProxyPhaseError::Aborted) => Err("Aborted".to_string()),
+        Err(ProxyPhaseError::TimedOut) => Err(format!(
+            "HTTP_ERROR_BODY_TIMEOUT: 非成功响应体读取超过 {} 秒",
+            HTTP_SHORT_TIMEOUT_SECS
+        )),
+        Err(ProxyPhaseError::Inner(error)) => Err(format!("读取错误响应失败: {error}")),
+        Ok(body) => Ok(render_limited_http_body(body)),
     }
 }
 
@@ -7168,10 +7571,18 @@ async fn proxy_request(
     body: Option<String>,
     auth_mode: Option<String>,
     token_ref: Option<String>,
+    request_id: Option<String>,
 ) -> Result<String, String> {
+    let request_id = normalize_proxy_request_id(request_id);
+    let request_lease = ProxyRequestLease::acquire(request_id.clone())?;
+    if request_lease.is_cancelled() {
+        return Err("Aborted".to_string());
+    }
     let (url, headers, body_project_id) =
         prepare_cloud_auth_request(&app, url, headers, auth_mode, token_ref).await?;
-    PROXY_REQUEST_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    if request_lease.is_cancelled() {
+        return Err("Aborted".to_string());
+    }
     let meth = method.to_uppercase();
     let body = if let Some(project_id) = body_project_id {
         body.map(|body_str| inject_gemini_code_assist_project(&body_str, &project_id))
@@ -7304,23 +7715,23 @@ async fn proxy_request(
     };
 
     let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
-    set_proxy_abort_handle(Some(abort_handle));
+    request_lease.set_abort_handle(Some(abort_handle));
 
     let response = match futures_util::future::Abortable::new(req.send(), abort_registration).await
     {
         Err(_) => {
-            set_proxy_abort_handle(None);
+            request_lease.set_abort_handle(None);
             return Err("Aborted".to_string());
         }
         Ok(response) => response,
     };
-    set_proxy_abort_handle(None);
+    request_lease.set_abort_handle(None);
 
     let response = match response {
         Ok(response) => response,
         Err(e) => {
-            set_proxy_abort_handle(None);
-            if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+            request_lease.set_abort_handle(None);
+            if request_lease.is_cancelled() {
                 return Err("Aborted".to_string());
             }
             let msg = e.to_string();
@@ -7346,15 +7757,28 @@ async fn proxy_request(
             }
 
             if should_retry_transport {
+                if request_lease.is_cancelled() {
+                    return Err("Aborted".to_string());
+                }
                 record_debug_log(
                     &app,
                     "warn",
                     "proxy_request",
                     format!("primary failed, trying curl fallback: {}", url),
                 );
-                match proxy_request_via_curl(&url, &meth, Some(&headers), body_for_debug.as_deref())
+                match proxy_request_via_curl(
+                    &url,
+                    &meth,
+                    Some(&headers),
+                    body_for_debug.as_deref(),
+                    &request_lease,
+                )
+                .await
                 {
                     Ok(result) => {
+                        if !request_lease.try_settle_success() {
+                            return Err("Aborted".to_string());
+                        }
                         record_debug_log(
                             &app,
                             "info",
@@ -7368,6 +7792,9 @@ async fn proxy_request(
                         return Ok(result);
                     }
                     Err(curl_err) => {
+                        if request_lease.is_cancelled() || curl_err == "Aborted" {
+                            return Err("Aborted".to_string());
+                        }
                         record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed after transport error url={} primary_err={} curl_err={}", url, msg, curl_err));
                     }
                 }
@@ -7394,7 +7821,10 @@ async fn proxy_request(
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
     if !status.is_success() {
-        let error_body = response.text().await.unwrap_or_default();
+        let error_body = read_proxy_error_body(response, &request_lease).await?;
+        if request_lease.is_cancelled() {
+            return Err("Aborted".to_string());
+        }
         let error_message = if url.contains("/v1internal:generateContent") {
             classify_gemini_code_assist_error(status, &error_body)
         } else {
@@ -7439,14 +7869,28 @@ async fn proxy_request(
         }
 
         if should_retry_via_curl {
+            if request_lease.is_cancelled() {
+                return Err("Aborted".to_string());
+            }
             record_debug_log(
                 &app,
                 "warn",
                 "proxy_request",
                 format!("primary failed, trying curl fallback: {}", url),
             );
-            match proxy_request_via_curl(&url, &meth, Some(&headers), body_for_debug.as_deref()) {
+            match proxy_request_via_curl(
+                &url,
+                &meth,
+                Some(&headers),
+                body_for_debug.as_deref(),
+                &request_lease,
+            )
+            .await
+            {
                 Ok(result) => {
+                    if !request_lease.try_settle_success() {
+                        return Err("Aborted".to_string());
+                    }
                     record_debug_log(
                         &app,
                         "info",
@@ -7461,6 +7905,9 @@ async fn proxy_request(
                     return Ok(result);
                 }
                 Err(curl_err) => {
+                    if request_lease.is_cancelled() || curl_err == "Aborted" {
+                        return Err("Aborted".to_string());
+                    }
                     record_debug_log(
                         &app,
                         "error",
@@ -7480,12 +7927,12 @@ async fn proxy_request(
         return Err(error_message);
     }
 
-    if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+    if request_lease.is_cancelled() {
         return Err("Aborted".to_string());
     }
     let (text_abort_handle, text_abort_registration) =
         futures_util::future::AbortHandle::new_pair();
-    set_proxy_abort_handle(Some(text_abort_handle));
+    request_lease.set_abort_handle(Some(text_abort_handle));
     let text_result = match futures_util::future::Abortable::new(
         response.text(),
         text_abort_registration,
@@ -7493,17 +7940,17 @@ async fn proxy_request(
     .await
     {
         Err(_) => {
-            set_proxy_abort_handle(None);
+            request_lease.set_abort_handle(None);
             return Err("Aborted".to_string());
         }
         Ok(result) => result,
     };
-    set_proxy_abort_handle(None);
+    request_lease.set_abort_handle(None);
 
     let text = match text_result {
         Ok(text) => text,
         Err(e) => {
-            if PROXY_REQUEST_CANCEL.load(std::sync::atomic::Ordering::Relaxed) {
+            if request_lease.is_cancelled() {
                 return Err("Aborted".to_string());
             }
             let msg = e.to_string();
@@ -7524,15 +7971,28 @@ async fn proxy_request(
                 );
             }
             if should_retry_read {
+                if request_lease.is_cancelled() {
+                    return Err("Aborted".to_string());
+                }
                 record_debug_log(
                     &app,
                     "warn",
                     "proxy_request",
                     format!("primary failed, trying curl fallback: {}", url),
                 );
-                match proxy_request_via_curl(&url, &meth, Some(&headers), body_for_debug.as_deref())
+                match proxy_request_via_curl(
+                    &url,
+                    &meth,
+                    Some(&headers),
+                    body_for_debug.as_deref(),
+                    &request_lease,
+                )
+                .await
                 {
                     Ok(result) => {
+                        if !request_lease.try_settle_success() {
+                            return Err("Aborted".to_string());
+                        }
                         record_debug_log(
                             &app,
                             "info",
@@ -7546,6 +8006,9 @@ async fn proxy_request(
                         return Ok(result);
                     }
                     Err(curl_err) => {
+                        if request_lease.is_cancelled() || curl_err == "Aborted" {
+                            return Err("Aborted".to_string());
+                        }
                         record_debug_log(&app, "error", "proxy_request", format!("curl fallback failed after read error url={} primary_err={} curl_err={}", url, msg, curl_err));
                     }
                 }
@@ -7553,6 +8016,9 @@ async fn proxy_request(
             return Err(format!("读取响应失败: {msg}"));
         }
     };
+    if !request_lease.try_settle_success() {
+        return Err("Aborted".to_string());
+    }
     if is_model_request {
         record_debug_log(
             &app,
@@ -7637,11 +8103,38 @@ async fn proxy_request_detailed(
 }
 
 #[tauri::command]
-fn cancel_proxy_request() -> Result<(), String> {
-    PROXY_REQUEST_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
-    if let Ok(mut slot) = PROXY_REQUEST_ABORT.lock() {
-        if let Some(handle) = slot.take() {
-            handle.abort();
+fn cancel_proxy_request(request_id: Option<String>) -> Result<(), String> {
+    let request_id = request_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(request_id) = request_id {
+        if let Ok(mut registry) = get_proxy_request_registry().lock() {
+            if let Some(context) = registry.active.get_mut(&request_id) {
+                if !context.settled {
+                    context
+                        .cancel_flag
+                        .store(true, std::sync::atomic::Ordering::Release);
+                    if let Some(handle) = context.abort_handle.take() {
+                        handle.abort();
+                    }
+                }
+            } else {
+                registry.remember_early_cancel(request_id);
+            }
+        }
+    } else if let Ok(mut registry) = get_proxy_request_registry().lock() {
+        // Compatibility for legacy callers only. Turn-owned model requests
+        // always supply request_id and therefore cannot cross-cancel.
+        for context in registry.active.values_mut() {
+            if context.settled {
+                continue;
+            }
+            context
+                .cancel_flag
+                .store(true, std::sync::atomic::Ordering::Release);
+            if let Some(handle) = context.abort_handle.take() {
+                handle.abort();
+            }
         }
     }
     Ok(())
@@ -8244,42 +8737,232 @@ fn open_image_studio_output(
 
 // region: 流式聊天代理 (Cloud SSE Proxy)
 
-/// Global cancellation token for the active chat stream.
+/// Per-stream cancellation state. Registration, early-cancel consumption,
+/// handle installation, and cancellation share one lock so no stream can
+/// cross the boundary between those phases without observing its cancellation.
 struct StreamContext {
+    generation: u64,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
     abort_handle: Option<futures_util::future::AbortHandle>,
+    settled: bool,
 }
 
-static ACTIVE_STREAMS: OnceLock<Mutex<HashMap<String, StreamContext>>> = OnceLock::new();
+const EARLY_CANCELLED_STREAM_LIMIT: usize = 1_024;
 
-fn get_active_streams() -> &'static Mutex<HashMap<String, StreamContext>> {
-    ACTIVE_STREAMS.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Default)]
+struct StreamRegistry {
+    active: HashMap<String, StreamContext>,
+    early_cancelled: std::collections::VecDeque<String>,
+    next_generation: u64,
 }
 
-fn set_stream_abort_handle(stream_id: &str, handle: Option<futures_util::future::AbortHandle>) {
-    let mut streams = get_active_streams().lock().unwrap();
-    if let Some(ctx) = streams.get_mut(stream_id) {
-        ctx.abort_handle = handle;
+impl StreamRegistry {
+    fn take_early_cancel(&mut self, stream_id: &str) -> bool {
+        let Some(index) = self
+            .early_cancelled
+            .iter()
+            .position(|candidate| candidate == stream_id)
+        else {
+            return false;
+        };
+        self.early_cancelled.remove(index);
+        true
+    }
+
+    fn remember_early_cancel(&mut self, stream_id: String) {
+        if self
+            .early_cancelled
+            .iter()
+            .any(|candidate| candidate == &stream_id)
+        {
+            return;
+        }
+        if self.early_cancelled.len() >= EARLY_CANCELLED_STREAM_LIMIT {
+            self.early_cancelled.pop_front();
+        }
+        self.early_cancelled.push_back(stream_id);
+    }
+
+    fn allocate_generation(&mut self) -> u64 {
+        self.next_generation = self.next_generation.wrapping_add(1);
+        if self.next_generation == 0 {
+            self.next_generation = 1;
+        }
+        self.next_generation
     }
 }
 
-fn abort_active_stream_request(stream_id: &str) {
-    let mut streams = get_active_streams().lock().unwrap();
-    if let Some(ctx) = streams.get_mut(stream_id) {
-        if let Some(handle) = ctx.abort_handle.take() {
-            handle.abort();
+static STREAM_REGISTRY: OnceLock<Mutex<StreamRegistry>> = OnceLock::new();
+
+fn get_stream_registry() -> &'static Mutex<StreamRegistry> {
+    STREAM_REGISTRY.get_or_init(|| Mutex::new(StreamRegistry::default()))
+}
+
+struct ChatStreamLease {
+    stream_id: String,
+    generation: u64,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ChatStreamLease {
+    fn acquire(stream_id: String) -> Result<Self, String> {
+        let mut registry = get_stream_registry()
+            .lock()
+            .map_err(|_| "流注册表锁已损坏".to_string())?;
+        if registry.active.contains_key(&stream_id) {
+            return Err(format!(
+                "DUPLICATE_STREAM_ID: stream_id `{stream_id}` 已在执行"
+            ));
+        }
+        let was_cancelled_early = registry.take_early_cancel(&stream_id);
+        let generation = registry.allocate_generation();
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(was_cancelled_early));
+        registry.active.insert(
+            stream_id.clone(),
+            StreamContext {
+                generation,
+                cancel_flag: cancel_flag.clone(),
+                abort_handle: None,
+                settled: false,
+            },
+        );
+        Ok(Self {
+            stream_id,
+            generation,
+            cancel_flag,
+        })
+    }
+
+    fn is_cancelled(&self) -> bool {
+        get_stream_registry()
+            .lock()
+            .ok()
+            .and_then(|registry| {
+                registry.active.get(&self.stream_id).and_then(|context| {
+                    (context.generation == self.generation).then(|| {
+                        context
+                            .cancel_flag
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    })
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    fn set_abort_handle(&self, handle: Option<futures_util::future::AbortHandle>) {
+        let Ok(mut registry) = get_stream_registry().lock() else {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            return;
+        };
+        let Some(context) = registry.active.get_mut(&self.stream_id) else {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            return;
+        };
+        if context.generation != self.generation || context.settled {
+            if let Some(handle) = handle {
+                handle.abort();
+            }
+            return;
+        }
+        if let Some(handle) = handle {
+            if context
+                .cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                handle.abort();
+            } else {
+                context.abort_handle = Some(handle);
+            }
+        } else {
+            context.abort_handle = None;
+        }
+    }
+
+    fn abort_active_request(&self) {
+        let Ok(mut registry) = get_stream_registry().lock() else {
+            return;
+        };
+        let Some(context) = registry.active.get_mut(&self.stream_id) else {
+            return;
+        };
+        if context.generation == self.generation {
+            if let Some(handle) = context.abort_handle.take() {
+                handle.abort();
+            }
+        }
+    }
+
+    fn try_settle_success(&self) -> bool {
+        let Ok(mut registry) = get_stream_registry().lock() else {
+            return false;
+        };
+        let Some(context) = registry.active.get_mut(&self.stream_id) else {
+            return false;
+        };
+        if context.generation != self.generation
+            || context.settled
+            || context
+                .cancel_flag
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
+        }
+        context.settled = true;
+        context.abort_handle = None;
+        true
+    }
+}
+
+impl Drop for ChatStreamLease {
+    fn drop(&mut self) {
+        if let Ok(mut registry) = get_stream_registry().lock() {
+            if registry
+                .active
+                .get(&self.stream_id)
+                .map(|context| context.generation == self.generation)
+                .unwrap_or(false)
+            {
+                registry.active.remove(&self.stream_id);
+            }
         }
     }
 }
 
-struct StreamCleanupGuard {
-    stream_id: String,
-}
+async fn read_stream_error_body(
+    response: reqwest::Response,
+    stream_lease: &ChatStreamLease,
+) -> Result<String, String> {
+    if stream_lease.is_cancelled() {
+        return Err("Aborted".to_string());
+    }
 
-impl Drop for StreamCleanupGuard {
-    fn drop(&mut self) {
-        let mut streams = get_active_streams().lock().unwrap();
-        streams.remove(&self.stream_id);
+    let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
+    stream_lease.set_abort_handle(Some(abort_handle));
+    let read_result = tokio::time::timeout(
+        Duration::from_secs(HTTP_SHORT_TIMEOUT_SECS),
+        futures_util::future::Abortable::new(
+            read_http_response_body_limited(response, HTTP_ERROR_BODY_LIMIT_BYTES),
+            abort_registration,
+        ),
+    )
+    .await;
+    stream_lease.set_abort_handle(None);
+
+    if stream_lease.is_cancelled() {
+        return Err("Aborted".to_string());
+    }
+    match read_result {
+        Err(_) => Err(format!(
+            "HTTP_ERROR_BODY_TIMEOUT: 非成功流响应体读取超过 {} 秒",
+            HTTP_SHORT_TIMEOUT_SECS
+        )),
+        Ok(Err(_)) => Err("Aborted".to_string()),
+        Ok(Ok(Err(error))) => Err(format!("读取错误流响应失败: {error}")),
+        Ok(Ok(Ok(body))) => Ok(render_limited_http_body(body)),
     }
 }
 
@@ -8303,7 +8986,7 @@ struct StreamChunkPayload {
 #[derive(Clone, Serialize)]
 struct StreamDonePayload {
     stream_id: String,
-    status: String, // "ok" | "error"
+    status: String, // "ok" | "error" | "cancelled"
     error: Option<String>,
 }
 
@@ -8320,23 +9003,49 @@ async fn start_chat_stream(
     auth_mode: Option<String>,
     token_ref: Option<String>,
 ) -> Result<(), String> {
-    let (url, headers, body_project_id) =
-        prepare_cloud_auth_request(&app, url, Some(headers), auth_mode, token_ref).await?;
+    let stream_id = stream_id.trim().to_string();
+    if stream_id.is_empty() {
+        return Err("STREAM_ID_REQUIRED: stream_id 不能为空".to_string());
+    }
+    let stream_started_at = Instant::now();
+    let original_url = url.clone();
+    let stream_lease = ChatStreamLease::acquire(stream_id.clone())?;
+    let cancel_flag = stream_lease.cancel_flag.clone();
+    if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+        emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+        return Ok(());
+    }
+
+    let (auth_abort_handle, auth_abort_registration) =
+        futures_util::future::AbortHandle::new_pair();
+    stream_lease.set_abort_handle(Some(auth_abort_handle));
+    let auth_result = futures_util::future::Abortable::new(
+        prepare_cloud_auth_request(&app, url, Some(headers), auth_mode, token_ref),
+        auth_abort_registration,
+    )
+    .await;
+    stream_lease.set_abort_handle(None);
+    if auth_result.is_err() || cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
+        record_debug_log(
+            &app,
+            "info",
+            "stream_cancelled",
+            format!(
+                "cancelled_during_auth stream_id={} url={} elapsed_ms={}",
+                stream_id,
+                original_url,
+                stream_started_at.elapsed().as_millis(),
+            ),
+        );
+        emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+        return Ok(());
+    }
+    let (url, headers, body_project_id) = auth_result.expect("checked aborted auth result")?;
     let body = if let Some(project_id) = body_project_id {
         inject_gemini_code_assist_project(&body, &project_id)?
     } else {
         body
     };
-    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    {
-        let mut streams = get_active_streams().lock().unwrap();
-        streams.insert(stream_id.clone(), StreamContext {
-            cancel_flag: cancel_flag.clone(),
-            abort_handle: None,
-        });
-    }
-    let _cleanup_guard = StreamCleanupGuard { stream_id: stream_id.clone() };
-    let stream_started_at = Instant::now();
 
     let is_model_request = url.contains("/v1/chat/completions")
         || url.contains("/v1/responses")
@@ -8412,7 +9121,7 @@ async fn start_chat_stream(
 
     let (send_abort_handle, send_abort_registration) =
         futures_util::future::AbortHandle::new_pair();
-    set_stream_abort_handle(&stream_id, Some(send_abort_handle));
+    stream_lease.set_abort_handle(Some(send_abort_handle));
     let response_result = match tokio::time::timeout(
         Duration::from_secs(STREAM_FIRST_RESPONSE_TIMEOUT_SECS),
         futures_util::future::Abortable::new(req_builder.send(), send_abort_registration),
@@ -8420,8 +9129,8 @@ async fn start_chat_stream(
     .await
     {
         Err(_) => {
-            abort_active_stream_request(&stream_id);
-            cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            stream_lease.abort_active_request();
+            cancel_flag.store(true, std::sync::atomic::Ordering::Release);
             record_debug_log(
                 &app,
                 "warn",
@@ -8451,7 +9160,7 @@ async fn start_chat_stream(
             return Ok(());
         }
         Ok(Err(_)) => {
-            set_stream_abort_handle(&stream_id, None);
+            stream_lease.set_abort_handle(None);
             record_debug_log(
                 &app,
                 "info",
@@ -8467,7 +9176,7 @@ async fn start_chat_stream(
             return Ok(());
         }
         Ok(Ok(result)) => {
-            set_stream_abort_handle(&stream_id, None);
+            stream_lease.set_abort_handle(None);
             result
         }
     };
@@ -8484,7 +9193,18 @@ async fn start_chat_stream(
 
     if !response.status().is_success() {
         let status = response.status();
-        let error_body = response.text().await.unwrap_or_default();
+        let error_body = match read_stream_error_body(response, &stream_lease).await {
+            Ok(body) => body,
+            Err(error) if error == "Aborted" || stream_lease.is_cancelled() => {
+                emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        if stream_lease.is_cancelled() {
+            emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+            return Ok(());
+        }
         if is_model_request {
             record_debug_log(
                 &app,
@@ -8517,7 +9237,7 @@ async fn start_chat_stream(
     loop {
         let (chunk_abort_handle, chunk_abort_registration) =
             futures_util::future::AbortHandle::new_pair();
-        set_stream_abort_handle(&stream_id, Some(chunk_abort_handle));
+        stream_lease.set_abort_handle(Some(chunk_abort_handle));
         let next_chunk = if chunk_count == 0 {
             match tokio::time::timeout(
                 Duration::from_secs(STREAM_FIRST_CHUNK_TIMEOUT_SECS),
@@ -8526,9 +9246,9 @@ async fn start_chat_stream(
             .await
             {
                 Err(_) => {
-                    set_stream_abort_handle(&stream_id, None);
-                    abort_active_stream_request(&stream_id);
-                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    stream_lease.set_abort_handle(None);
+                    stream_lease.abort_active_request();
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Release);
                     record_debug_log(
                         &app,
                         "warn",
@@ -8558,7 +9278,7 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Err(_)) => {
-                    set_stream_abort_handle(&stream_id, None);
+                    stream_lease.set_abort_handle(None);
                     record_debug_log(
                         &app,
                         "info",
@@ -8574,7 +9294,7 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Ok(item)) => {
-                    set_stream_abort_handle(&stream_id, None);
+                    stream_lease.set_abort_handle(None);
                     item
                 }
             }
@@ -8586,8 +9306,8 @@ async fn start_chat_stream(
             .await
             {
                 Err(_) => {
-                    abort_active_stream_request(&stream_id);
-                    cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    stream_lease.abort_active_request();
+                    cancel_flag.store(true, std::sync::atomic::Ordering::Release);
                     record_debug_log(
                         &app,
                         "warn",
@@ -8623,7 +9343,7 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Err(_)) => {
-                    set_stream_abort_handle(&stream_id, None);
+                    stream_lease.set_abort_handle(None);
                     record_debug_log(
                         &app,
                         "info",
@@ -8641,17 +9361,13 @@ async fn start_chat_stream(
                     return Ok(());
                 }
                 Ok(Ok(item)) => {
-                    set_stream_abort_handle(&stream_id, None);
+                    stream_lease.set_abort_handle(None);
                     item
                 }
             }
         };
 
-        let Some(chunk_result) = next_chunk else {
-            break;
-        };
-
-        if cancel_flag.load(std::sync::atomic::Ordering::Relaxed) {
+        if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
             record_debug_log(
                 &app,
                 "info",
@@ -8668,6 +9384,10 @@ async fn start_chat_stream(
             emit_chat_stream_done(&app, &stream_id, "cancelled", None);
             return Ok(());
         }
+
+        let Some(chunk_result) = next_chunk else {
+            break;
+        };
 
         match chunk_result {
             Ok(bytes) => {
@@ -8729,7 +9449,12 @@ async fn start_chat_stream(
         }
     }
 
-    set_stream_abort_handle(&stream_id, None);
+    stream_lease.set_abort_handle(None);
+    if cancel_flag.load(std::sync::atomic::Ordering::Acquire) || !stream_lease.try_settle_success()
+    {
+        emit_chat_stream_done(&app, &stream_id, "cancelled", None);
+        return Ok(());
+    }
     emit_chat_stream_done(&app, &stream_id, "ok", None);
 
     if is_model_request {
@@ -8754,17 +9479,31 @@ async fn start_chat_stream(
 /// Cancel the active chat stream.
 #[tauri::command]
 fn cancel_chat_stream(stream_id: Option<String>) -> Result<(), String> {
-    let mut streams = get_active_streams().lock().unwrap();
-    if let Some(sid) = stream_id {
-        if let Some(ctx) = streams.get_mut(&sid) {
-            ctx.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
-            if let Some(handle) = ctx.abort_handle.take() {
-                handle.abort();
+    if let Some(raw_stream_id) = stream_id {
+        let stream_id = raw_stream_id.trim().to_string();
+        if stream_id.is_empty() {
+            return Ok(());
+        }
+        let mut registry = get_stream_registry().lock().unwrap();
+        if let Some(ctx) = registry.active.get_mut(&stream_id) {
+            if !ctx.settled {
+                ctx.cancel_flag
+                    .store(true, std::sync::atomic::Ordering::Release);
+                if let Some(handle) = ctx.abort_handle.take() {
+                    handle.abort();
+                }
             }
+        } else {
+            registry.remember_early_cancel(stream_id);
         }
     } else {
-        for ctx in streams.values_mut() {
-            ctx.cancel_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut registry = get_stream_registry().lock().unwrap();
+        for ctx in registry.active.values_mut() {
+            if ctx.settled {
+                continue;
+            }
+            ctx.cancel_flag
+                .store(true, std::sync::atomic::Ordering::Release);
             if let Some(handle) = ctx.abort_handle.take() {
                 handle.abort();
             }
@@ -11110,20 +11849,293 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        browser_evaluate_supervisor_timeout, compare_file_nodes, delete_path_within_workspace,
-        delete_plan_files_in_dir, is_supported_attachment_path, is_valid_git_branch_name,
-        looks_long_running_shell_command, merge_json_rows_by_id, parse_git_branch_line,
-        parse_git_numstat, parse_git_porcelain_entries, parse_git_porcelain_status,
-        pty_foreground_state, pty_shell_available, read_pty_current_generation_view,
-        read_pty_generation_since, read_pty_generation_tail, read_session_transcript_with_fallback,
-        resolve_existing_path, resolve_open_file_external_path,
-        resolve_session_transcript_to_write, resolve_write_path, should_hide_list_directory_entry,
+        await_proxy_abortable_phase, browser_evaluate_supervisor_timeout, cancel_chat_stream,
+        cancel_proxy_request, compare_file_nodes, delete_path_within_workspace,
+        delete_plan_files_in_dir, get_proxy_request_registry, get_stream_registry,
+        is_supported_attachment_path, is_valid_git_branch_name, looks_long_running_shell_command,
+        merge_json_rows_by_id, parse_git_branch_line, parse_git_numstat,
+        parse_git_porcelain_entries, parse_git_porcelain_status, pty_foreground_state,
+        pty_shell_available, read_pty_current_generation_view, read_pty_generation_since,
+        read_pty_generation_tail, read_session_transcript_with_fallback, resolve_existing_path,
+        resolve_open_file_external_path, resolve_session_transcript_to_write, resolve_write_path,
+        run_cancellable_bounded_process, should_hide_list_directory_entry,
         should_skip_recursive_search_dir, validate_pty_input, write_json_atomic,
-        write_jsonl_atomic, FileNode, SessionTranscript, PTY_TAIL_DEFAULT_CHARS,
+        write_jsonl_atomic, ChatStreamLease, FileNode, ProxyPhaseError, ProxyRequestLease,
+        SessionTranscript, EARLY_CANCELLED_PROXY_REQUEST_LIMIT, EARLY_CANCELLED_STREAM_LIMIT,
+        PTY_TAIL_DEFAULT_CHARS,
     };
     use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
+
+    static CANCELLATION_REGISTRY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn proxy_cancellation_is_scoped_by_request_id() {
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        {
+            let mut registry = get_proxy_request_registry().lock().unwrap();
+            registry.active.clear();
+            registry.early_cancelled.clear();
+        }
+
+        let request_a = ProxyRequestLease::acquire("proxy-test-a".to_string()).unwrap();
+        let request_b = ProxyRequestLease::acquire("proxy-test-b".to_string()).unwrap();
+        cancel_proxy_request(Some("proxy-test-a".to_string())).unwrap();
+
+        assert!(request_a.is_cancelled());
+        assert!(!request_b.is_cancelled());
+        drop(request_a);
+        drop(request_b);
+
+        cancel_proxy_request(Some("proxy-test-early".to_string())).unwrap();
+        let early = ProxyRequestLease::acquire("proxy-test-early".to_string()).unwrap();
+        assert!(early.is_cancelled());
+        drop(early);
+
+        let settled = ProxyRequestLease::acquire("proxy-test-settled".to_string()).unwrap();
+        assert!(settled.try_settle_success());
+        cancel_proxy_request(Some("proxy-test-settled".to_string())).unwrap();
+        assert!(!settled.is_cancelled());
+        drop(settled);
+
+        for index in 0..(EARLY_CANCELLED_PROXY_REQUEST_LIMIT + 17) {
+            cancel_proxy_request(Some(format!("proxy-test-bounded-{index}"))).unwrap();
+        }
+        let mut registry = get_proxy_request_registry().lock().unwrap();
+        assert_eq!(
+            registry.early_cancelled.len(),
+            EARLY_CANCELLED_PROXY_REQUEST_LIMIT
+        );
+        assert!(!registry
+            .early_cancelled
+            .iter()
+            .any(|request_id| request_id == "proxy-test-bounded-0"));
+        assert!(registry
+            .early_cancelled
+            .iter()
+            .any(|request_id| request_id == "proxy-test-bounded-1040"));
+        registry.early_cancelled.clear();
+    }
+
+    #[test]
+    fn proxy_duplicate_id_is_rejected_and_stale_drop_is_generation_scoped() {
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        let request_id = "proxy-test-duplicate".to_string();
+        let request = ProxyRequestLease::acquire(request_id.clone()).unwrap();
+        let duplicate_error = match ProxyRequestLease::acquire(request_id.clone()) {
+            Ok(_) => panic!("duplicate proxy request ID must be rejected"),
+            Err(error) => error,
+        };
+        assert!(duplicate_error.contains("DUPLICATE_PROXY_REQUEST_ID"));
+
+        let replacement_generation = {
+            let mut registry = get_proxy_request_registry().lock().unwrap();
+            let replacement_generation = registry.allocate_generation();
+            registry.active.get_mut(&request_id).unwrap().generation = replacement_generation;
+            replacement_generation
+        };
+        drop(request);
+
+        let mut registry = get_proxy_request_registry().lock().unwrap();
+        assert_eq!(
+            registry.active.get(&request_id).unwrap().generation,
+            replacement_generation
+        );
+        registry.active.remove(&request_id);
+    }
+
+    #[test]
+    fn proxy_abortable_phase_is_bounded_and_observes_exact_cancel() {
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let timeout_lease = ProxyRequestLease::acquire("proxy-test-timeout".to_string()).unwrap();
+        let timeout_result = runtime.block_on(await_proxy_abortable_phase(
+            &timeout_lease,
+            Duration::from_millis(20),
+            std::future::pending::<Result<(), ()>>(),
+        ));
+        assert_eq!(timeout_result, Err(ProxyPhaseError::TimedOut));
+        drop(timeout_lease);
+
+        let request_id = "proxy-test-phase-cancel".to_string();
+        let cancel_lease = ProxyRequestLease::acquire(request_id.clone()).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let cancel_thread = std::thread::spawn(move || {
+            ready_rx.recv().unwrap();
+            cancel_proxy_request(Some(request_id)).unwrap();
+        });
+        let cancel_result = runtime.block_on(await_proxy_abortable_phase(
+            &cancel_lease,
+            Duration::from_secs(1),
+            async move {
+                ready_tx.send(()).unwrap();
+                std::future::pending::<()>().await;
+                Ok::<(), ()>(())
+            },
+        ));
+        cancel_thread.join().unwrap();
+        assert_eq!(cancel_result, Err(ProxyPhaseError::Aborted));
+        drop(cancel_lease);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellable_bounded_process_reaps_on_cancel_and_caps_output() {
+        let workspace = make_temp_workspace("cancellable-process");
+        let ready_path = workspace.join("ready");
+        let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_flag = cancel_flag.clone();
+        let worker_ready_path = ready_path.clone();
+        let worker = std::thread::spawn(move || {
+            let mut command = std::process::Command::new("/bin/sh");
+            command
+                .arg("-c")
+                .arg("printf ready > \"$1\"; sleep 30")
+                .arg("main-curl-test")
+                .arg(worker_ready_path);
+            run_cancellable_bounded_process(
+                command,
+                worker_flag,
+                Duration::from_secs(30),
+                1024,
+                1024,
+            )
+        });
+
+        let started_at = std::time::Instant::now();
+        while !ready_path.exists() && started_at.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ready_path.exists(),
+            "child process did not reach ready state"
+        );
+        cancel_flag.store(true, std::sync::atomic::Ordering::Release);
+        let cancelled_error = match worker.join().unwrap() {
+            Ok(_) => panic!("cancelled child must not return successful output"),
+            Err(error) => error,
+        };
+        assert_eq!(cancelled_error, "Aborted");
+
+        let mut output_command = std::process::Command::new("/bin/sh");
+        output_command.arg("-c").arg("printf '%01024d' 0");
+        let output_error = match run_cancellable_bounded_process(
+            output_command,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Duration::from_secs(2),
+            32,
+            32,
+        ) {
+            Ok(_) => panic!("oversized child output must be rejected"),
+            Err(error) => error,
+        };
+        assert!(output_error.contains("超过 32 字节上限"));
+        fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn chat_stream_cancellation_is_scoped_and_remembers_early_cancel() {
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        {
+            let mut registry = get_stream_registry().lock().unwrap();
+            registry.active.clear();
+            registry.early_cancelled.clear();
+        }
+
+        let stream_a = ChatStreamLease::acquire("stream-test-a".to_string()).unwrap();
+        let stream_b = ChatStreamLease::acquire("stream-test-b".to_string()).unwrap();
+        cancel_chat_stream(Some("stream-test-a".to_string())).unwrap();
+
+        assert!(stream_a
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!stream_b
+            .cancel_flag
+            .load(std::sync::atomic::Ordering::Relaxed));
+        drop(stream_a);
+        drop(stream_b);
+
+        cancel_chat_stream(Some("stream-test-early".to_string())).unwrap();
+        assert!(get_stream_registry()
+            .lock()
+            .unwrap()
+            .early_cancelled
+            .iter()
+            .any(|stream_id| stream_id == "stream-test-early"));
+        let early = ChatStreamLease::acquire("stream-test-early".to_string()).unwrap();
+        assert!(early.cancel_flag.load(std::sync::atomic::Ordering::Relaxed));
+
+        let (abort_handle, abort_registration) = futures_util::future::AbortHandle::new_pair();
+        early.set_abort_handle(Some(abort_handle));
+        assert!(abort_registration.handle().is_aborted());
+        assert!(get_stream_registry()
+            .lock()
+            .unwrap()
+            .active
+            .get("stream-test-early")
+            .unwrap()
+            .abort_handle
+            .is_none());
+        drop(early);
+
+        let settled = ChatStreamLease::acquire("stream-test-settled".to_string()).unwrap();
+        assert!(settled.try_settle_success());
+        cancel_chat_stream(Some("stream-test-settled".to_string())).unwrap();
+        assert!(!settled.is_cancelled());
+        drop(settled);
+
+        {
+            let mut registry = get_stream_registry().lock().unwrap();
+            registry.early_cancelled.clear();
+        }
+        for index in 0..(EARLY_CANCELLED_STREAM_LIMIT + 17) {
+            cancel_chat_stream(Some(format!("stream-test-bounded-{index}"))).unwrap();
+        }
+        let mut registry = get_stream_registry().lock().unwrap();
+        assert_eq!(registry.early_cancelled.len(), EARLY_CANCELLED_STREAM_LIMIT);
+        assert!(!registry
+            .early_cancelled
+            .iter()
+            .any(|stream_id| stream_id == "stream-test-bounded-0"));
+        assert!(registry
+            .early_cancelled
+            .iter()
+            .any(|stream_id| stream_id == "stream-test-bounded-1040"));
+        registry.early_cancelled.clear();
+    }
+
+    #[test]
+    fn stream_duplicate_id_is_rejected_and_stale_drop_is_generation_scoped() {
+        let _test_guard = CANCELLATION_REGISTRY_TEST_LOCK.lock().unwrap();
+        let stream_id = "stream-test-duplicate".to_string();
+        let stream = ChatStreamLease::acquire(stream_id.clone()).unwrap();
+        let duplicate_error = match ChatStreamLease::acquire(stream_id.clone()) {
+            Ok(_) => panic!("duplicate stream ID must be rejected"),
+            Err(error) => error,
+        };
+        assert!(duplicate_error.contains("DUPLICATE_STREAM_ID"));
+
+        let replacement_generation = {
+            let mut registry = get_stream_registry().lock().unwrap();
+            let replacement_generation = registry.allocate_generation();
+            registry.active.get_mut(&stream_id).unwrap().generation = replacement_generation;
+            replacement_generation
+        };
+        drop(stream);
+
+        let mut registry = get_stream_registry().lock().unwrap();
+        assert_eq!(
+            registry.active.get(&stream_id).unwrap().generation,
+            replacement_generation
+        );
+        registry.active.remove(&stream_id);
+    }
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn make_temp_workspace(name: &str) -> PathBuf {

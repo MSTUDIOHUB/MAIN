@@ -138,3 +138,24 @@ test("submit turn draft reuses existing turn title and UI parent", () => {
   assert.equal(draft.existingTurn?.id, "turn-existing");
   assert.equal(draft.titleDecision.turnTitle, "Existing Camera Fix");
 });
+
+test("a rejected reuse override cannot create a duplicate logical Turn id", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    reuseCurrentTurn: false,
+    reusableTurnId: null,
+    turnIdOverride: "turn-existing",
+  }));
+
+  assert.equal(draft.turnId, "turn-created");
+  assert.equal(draft.existingTurn, null);
+});
+
+test("a preallocated fresh Turn id remains valid for a new continuation", () => {
+  const draft = prepareSubmitTurnDraft(baseInput({
+    reuseCurrentTurn: false,
+    reusableTurnId: null,
+    turnIdOverride: "turn-preallocated",
+  }));
+
+  assert.equal(draft.turnId, "turn-preallocated");
+});

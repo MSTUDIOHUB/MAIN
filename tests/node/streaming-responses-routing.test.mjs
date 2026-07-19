@@ -93,6 +93,158 @@ test("OpenAI Responses cloud requests use the non-streaming Rust proxy path", as
   assert.equal(requests[0].reasoning.effort, "xhigh");
 });
 
+test("aborting a non-streaming Rust proxy request cancels only its request id", async () => {
+  const calls = [];
+  let rejectProxy;
+  const { streamChatCompletion } = await loadStreamingModule((command, args) => {
+    calls.push({ command, args });
+    if (command === "proxy_request") {
+      return new Promise((_resolve, reject) => {
+        rejectProxy = reject;
+      });
+    }
+    if (command === "cancel_proxy_request") {
+      rejectProxy?.(new Error("Aborted"));
+      return Promise.resolve();
+    }
+    throw new Error(`Unexpected command: ${command}`);
+  });
+  const controller = new AbortController();
+  const pending = streamChatCompletion(
+    [{ role: "user", content: "cancel this request only" }],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+    },
+    { onToken: () => {}, onDone: () => {}, onError: () => {} },
+    controller.signal,
+  );
+  await Promise.resolve();
+  controller.abort();
+  await assert.rejects(pending, (error) => error?.name === "AbortError");
+
+  assert.deepEqual(calls.map((call) => call.command), [
+    "proxy_request",
+    "cancel_proxy_request",
+  ]);
+  assert.match(calls[0].args.requestId, /^proxy-/);
+  assert.equal(calls[1].args.requestId, calls[0].args.requestId);
+});
+
+test("a non-streaming Rust proxy cancellation during listener installation never starts the request", async () => {
+  const calls = [];
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const addEventListener = signal.addEventListener.bind(signal);
+  signal.addEventListener = (type, listener, options) => {
+    addEventListener(type, listener, options);
+    if (type === "abort") controller.abort();
+  };
+  const { streamChatCompletion } = await loadStreamingModule(async (command, args) => {
+    calls.push({ command, args });
+  });
+
+  await assert.rejects(
+    streamChatCompletion(
+      [{ role: "user", content: "cancel before proxy dispatch" }],
+      {
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "test-key",
+        model: "gpt-5.4",
+        apiProtocol: "openai",
+        apiFormat: "responses",
+        useRustProxy: true,
+      },
+      { onToken: () => {}, onDone: () => {}, onError: () => {} },
+      signal,
+    ),
+    (error) => error?.name === "AbortError",
+  );
+
+  assert.deepEqual(calls.map((call) => call.command), ["cancel_proxy_request"]);
+  assert.match(calls[0].args.requestId, /^proxy-/);
+});
+
+test("a pre-aborted Rust stream never dispatches a start request", async () => {
+  const calls = [];
+  const listeners = new Map();
+  const { streamChatCompletion } = await loadStreamingModule(
+    async (command, args) => {
+      calls.push({ command, args });
+    },
+    async (eventName, handler) => {
+      listeners.set(eventName, handler);
+      return () => listeners.delete(eventName);
+    },
+  );
+  const controller = new AbortController();
+  controller.abort();
+
+  await assert.rejects(
+    streamChatCompletion(
+      [{ role: "user", content: "do not start" }],
+      {
+        baseUrl: "http://127.0.0.1:1234/v1",
+        apiKey: "not-needed",
+        model: "local-model",
+        provider: "LM Studio",
+        useRustProxy: true,
+      },
+      { onToken: () => {}, onDone: () => {}, onError: () => {} },
+      controller.signal,
+    ),
+    (error) => error?.name === "AbortError",
+  );
+
+  assert.deepEqual(calls, []);
+  assert.equal(listeners.size, 0);
+});
+
+test("a Rust stream installs its abort listener before dispatching start", async () => {
+  const calls = [];
+  const listeners = new Map();
+  const controller = new AbortController();
+  const { streamChatCompletion } = await loadStreamingModule(
+    async (command, args) => {
+      calls.push({ command, args });
+      if (command === "start_chat_stream") {
+        controller.abort();
+      }
+    },
+    async (eventName, handler) => {
+      listeners.set(eventName, handler);
+      return () => listeners.delete(eventName);
+    },
+  );
+
+  await assert.rejects(
+    streamChatCompletion(
+      [{ role: "user", content: "cancel during dispatch" }],
+      {
+        baseUrl: "http://127.0.0.1:1234/v1",
+        apiKey: "not-needed",
+        model: "local-model",
+        provider: "LM Studio",
+        useRustProxy: true,
+      },
+      { onToken: () => {}, onDone: () => {}, onError: () => {} },
+      controller.signal,
+    ),
+    (error) => error?.name === "AbortError",
+  );
+
+  assert.deepEqual(calls.map((call) => call.command), [
+    "start_chat_stream",
+    "cancel_chat_stream",
+  ]);
+  assert.equal(calls[0].args.streamId, calls[1].args.streamId);
+  assert.equal(listeners.size, 0);
+});
+
 test("OpenAI Responses reports image delivery from the accepted serialized request", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {

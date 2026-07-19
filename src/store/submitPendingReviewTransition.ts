@@ -25,7 +25,7 @@ export interface ApplySubmitPendingReviewTransitionInput<TState extends SubmitPe
   state: TState;
   getState: () => TState;
   setState: (patch: any) => void;
-  setConversationTurnStatus: (turnId: string, status: "stopped_no_action") => void;
+  closeTurnAsCanceled: (turnId: string, options: { reason: string; message: string }) => boolean;
   logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
   logError?: (message: string, error: unknown) => void;
 }
@@ -85,18 +85,23 @@ export function applySubmitPendingReviewTransition<TState extends SubmitPendingR
     }
   }
 
-  input.setState({
-    agentStatus: "idle",
-    isGenerating: false,
-    abortController: null,
-    pendingReviewResolve: null,
-    pendingReviewTaskId: null,
-    activeActionRequest: null,
-    pendingToolCall: null,
-  });
-
   if (input.state.currentTurnId) {
-    input.setConversationTurnStatus(input.state.currentTurnId, "stopped_no_action");
+    input.closeTurnAsCanceled(input.state.currentTurnId, {
+      reason: "superseded_by_new_user_turn",
+      message: /[^\x00-\x7F]/.test(input.text)
+        ? "新的用户指令已取代待审核操作；旧回合已取消并完成收口。"
+        : "A new user instruction superseded the pending review; the previous turn was canceled and closed.",
+    });
+  } else {
+    input.setState({
+      agentStatus: "idle",
+      isGenerating: false,
+      abortController: null,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      activeActionRequest: null,
+      pendingToolCall: null,
+    });
   }
 
   return {

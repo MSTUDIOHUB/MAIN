@@ -1,6 +1,7 @@
 import { executeAgentLoop, getSessionTaskTargetingEvidence, isReviewablePlanStage, type AgentLoopOutcome, type OrchestratorCallbacks } from "../orchestrator";
 import { executeGoalLoop, type GoalEngineCallbacks } from "../goalEngine";
 import { isGoalRuntimeDeleted } from "../goalPersistence";
+import { isCurrentGoalWorkflowOwner } from "../goalRunOwnership";
 import {
   evaluateGoalEvidenceCheckpoint,
   goalRequiresMutation,
@@ -44,6 +45,9 @@ import { appendDebugLog } from "../debugLog";
 import {
   MAIN_THREAD_EVENT_SCHEMA_VERSION,
   appendRuntimeEvent,
+  appendRuntimeEventWithResult,
+  isRunTerminalEvent,
+  isTerminalTurnEvent,
   withEventSchema,
   type MainThreadProgressUpdate,
 } from "../turnEvents";
@@ -71,7 +75,15 @@ import {
   createPlanExecutionFailureEntry,
   shouldRecordPlanExecutionFailure,
 } from "../planEvidence";
-import { closeHarnessRunMarker, getHarnessActionRunId, isHarnessRunMarkerOwnedByRun, persistHarnessRunMarkerIfOwned, type HarnessRunMarker } from "../harnessCrashTelemetry";
+import {
+  getHarnessActionRunId,
+  isHarnessRunMarkerOwnedByRun,
+  persistHarnessRunMarkerIfOwned,
+  readHarnessRunMarker,
+  settleHarnessRunMarkerIfOwned,
+  type ExactHarnessRunOwner,
+  type HarnessRunMarker,
+} from "../harnessCrashTelemetry";
 import { generateId } from "../utils";
 import { runAfterNextPaint } from "../uiScheduling";
 import { supportsToolDiffPreview } from "../toolDiff";
@@ -103,6 +115,7 @@ import {
   type UserChoiceActionRequest,
 } from "../actionRequest";
 import { buildToolPermissionActionRequest } from "../pendingToolReview";
+import { createAbortableReviewSettlement } from "../actionReviewSettlement";
 import { buildPlanApprovalIdentity } from "../planApprovalIdentity";
 import { resolveRuntimeRunIdentity, type RuntimeRunIdentity } from "../runIdentity";
 import { buildDurableTurnContext, shouldCanonicalizeTerminalTurnContext } from "../durableTurnContext";
@@ -145,6 +158,18 @@ export interface WorkflowEngineStoreHelpers {
     language: "zh" | "en";
   }) => any[];
   normalizeQueuedUserMessage: (value: unknown) => any | null;
+  getSessionRevisionToken: () => unknown;
+  publishOwnerScopedRuntimeProjection: (input: {
+    projectedState: WorkflowStoreState;
+    durableState?: WorkflowStoreState;
+    scopeKey: string;
+    sessionId: number | string | null | undefined;
+    expectedRevisionToken: unknown;
+    beforePublish?: () => void;
+  }) => {
+    published: boolean;
+    disposition: "published" | "revision_conflict" | "ownership_lost" | "durable_session_missing";
+  };
   startApprovedPlanExecutionInCurrentTurn: (input: {
     get: () => WorkflowStoreState;
     setActiveState: (patch: Record<string, unknown>) => void;
@@ -235,6 +260,8 @@ export class WorkflowEngine {
       normalizeProviderCompatibilityByRuntimeKey,
       compactCompletedTurnAgentMessages,
       normalizeQueuedUserMessage,
+      getSessionRevisionToken,
+      publishOwnerScopedRuntimeProjection,
       startApprovedPlanExecutionInCurrentTurn,
       persistSessionRecord,
       logStoreEvent: writeStoreEvent,
@@ -285,12 +312,14 @@ export class WorkflowEngine {
     const abortCtrl = context.abortCtrl;
     const timerInterval = context.timerInterval;
     const sendStartedAt = context.sendStartedAt;
-    const harnessRunOwner = {
+    const initialHarnessMarker = sessionGet().harnessRunMarker as HarnessRunMarker | null;
+    const harnessRunOwner: ExactHarnessRunOwner = {
       runId: context.harnessRunId,
       sessionKey: runSessionKey,
       turnId,
+      instanceId: initialHarnessMarker?.instanceId || "",
+      startedAt: initialHarnessMarker?.startedAt ?? -1,
     };
-    const initialHarnessMarker = sessionGet().harnessRunMarker as HarnessRunMarker | null;
     let activeRuntimeRunIdentity: RuntimeRunIdentity = {
       runId: context.harnessRunId,
       parentRunId:
@@ -393,8 +422,10 @@ export class WorkflowEngine {
     };
 
     const appendWorkflowRuntimeEvent = (event: Parameters<typeof withEventSchema>[0]) => {
-      sessionSet((state: any) => ({
-        runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema(event as any)),
+      const normalizedEvent = withEventSchema(event as any);
+      sessionSet((state: any) => reduceRunTransition(state, {
+        type: "runtime_event",
+        event: normalizedEvent,
       }));
     };
 
@@ -521,19 +552,6 @@ export class WorkflowEngine {
               ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
               : {}),
           }),
-          withEventSchema({
-            type: "run.paused",
-            threadId: runSessionKey,
-            turnId: request.turnId,
-            timestampMs: Date.now(),
-            runId: request.runId,
-            parentRunId: request.parentRunId || null,
-            ...(activeRuntimeRunIdentity.goalSliceId
-              ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
-              : {}),
-            reason: input.reason,
-            message: input.pauseMessage,
-          }),
         ],
       }));
       logStoreEvent("action_request_created", {
@@ -545,6 +563,7 @@ export class WorkflowEngine {
         actionKind: request.kind,
         goalSliceId: activeRuntimeRunIdentity.goalSliceId || null,
         reason: input.reason,
+        pauseMessage: input.pauseMessage,
         target: input.target || null,
       });
     };
@@ -581,6 +600,64 @@ export class WorkflowEngine {
         parentRunId: request.runId,
         goalSliceId: previous.goalSliceId || null,
       });
+    };
+
+    const beginTerminalConclusionRun = (parentRunId: string, reason: string): boolean => {
+      const previous = activeRuntimeRunIdentity;
+      const nextRunId = `run-conclusion-${Date.now()}-${generateId()}`;
+      const marker = sessionGet().harnessRunMarker as HarnessRunMarker | null;
+      if (!marker || !isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner)) {
+        logStoreEvent("terminal_conclusion_run_skipped", {
+          sessionKey: runSessionKey,
+          turnId,
+          parentRunId,
+          reason: "harness_ownership_lost",
+        });
+        return false;
+      }
+      const persistedMarker = persistHarnessRunMarkerIfOwned({
+        ...marker,
+        activeRunId: nextRunId,
+        activeParentRunId: parentRunId,
+      }, harnessRunOwner);
+      if (!persistedMarker) {
+        logStoreEvent("terminal_conclusion_run_skipped", {
+          sessionKey: runSessionKey,
+          turnId,
+          parentRunId,
+          reason: "global_harness_ownership_lost",
+        });
+        return false;
+      }
+      activeRuntimeRunIdentity = {
+        runId: nextRunId,
+        parentRunId,
+        outerRunId: previous.outerRunId,
+        ...(previous.goalSliceId ? { goalSliceId: previous.goalSliceId } : {}),
+        source: previous.source,
+      };
+      sessionSet((state: any) =>
+        isHarnessRunMarkerOwnedByRun(state.harnessRunMarker, harnessRunOwner)
+          ? { harnessRunMarker: persistedMarker }
+          : {}
+      );
+      appendWorkflowRuntimeEvent({
+        type: "run.started",
+        threadId: runSessionKey,
+        turnId,
+        timestampMs: Date.now(),
+        runId: nextRunId,
+        parentRunId,
+        ...(previous.goalSliceId ? { goalSliceId: previous.goalSliceId } : {}),
+      });
+      logStoreEvent("terminal_conclusion_run_started", {
+        sessionKey: runSessionKey,
+        turnId,
+        runId: nextRunId,
+        parentRunId,
+        reason,
+      });
+      return true;
     };
 
     const normalizeToolLifecycleMeta = (meta?: { toolCallId?: string | null }): ToolLifecycleMeta => {
@@ -713,7 +790,9 @@ export class WorkflowEngine {
       const ownsIdentity =
         marker.runId === harnessRunOwner.runId &&
         marker.sessionKey === harnessRunOwner.sessionKey &&
-        marker.turnId === harnessRunOwner.turnId;
+        marker.turnId === harnessRunOwner.turnId &&
+        marker.instanceId === harnessRunOwner.instanceId &&
+        marker.startedAt === harnessRunOwner.startedAt;
       if (!isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner) && !(allowErrorOverride && ownsIdentity)) {
         if (marker?.status === "running") {
           logStoreEvent("harness_close_skipped_owner_mismatch", {
@@ -739,25 +818,62 @@ export class WorkflowEngine {
         closedAt,
         closeReason: reason,
       };
-      sessionSet({ harnessRunMarker: terminal });
       return { source: marker, terminal };
     };
 
-    const publishCurrentHarnessRunMarkerClose = (result: TerminalHarnessProjectionResult): boolean => {
-      if (result === "absent") return true;
-      if (result === "ownership_lost") return false;
+    const publishCurrentHarnessRunMarkerClose = (result: TerminalHarnessProjectionResult): void => {
+      if (result === "absent" || result === "ownership_lost") return;
       const { source, terminal } = result;
-      const closedMarker = closeHarnessRunMarker({
-        status: terminal.status,
-        closeReason: terminal.closeReason || "agent_loop_closed",
-      }, harnessRunOwner);
+      const currentGlobalMarker = readHarnessRunMarker();
+      const ownsExactGlobalGeneration = !!currentGlobalMarker &&
+        currentGlobalMarker.runId === harnessRunOwner.runId &&
+        currentGlobalMarker.sessionKey === harnessRunOwner.sessionKey &&
+        currentGlobalMarker.turnId === harnessRunOwner.turnId &&
+        currentGlobalMarker.instanceId === harnessRunOwner.instanceId &&
+        currentGlobalMarker.startedAt === harnessRunOwner.startedAt;
+      if (!ownsExactGlobalGeneration) {
+        logStoreEvent("harness_close_owner_lost_before_terminal_publish", {
+          expected: harnessRunOwner,
+          actual: currentGlobalMarker
+            ? {
+                runId: currentGlobalMarker.runId,
+                sessionKey: currentGlobalMarker.sessionKey,
+                turnId: currentGlobalMarker.turnId,
+                instanceId: currentGlobalMarker.instanceId,
+                startedAt: currentGlobalMarker.startedAt,
+                status: currentGlobalMarker.status,
+              }
+            : null,
+          requestedStatus: terminal.status,
+          reason: terminal.closeReason,
+        });
+        return;
+      }
+      if (
+        currentGlobalMarker.status !== "running" &&
+        currentGlobalMarker.status !== "paused" &&
+        (
+          currentGlobalMarker.status !== terminal.status ||
+          currentGlobalMarker.closeReason !== terminal.closeReason
+        )
+      ) {
+        logStoreEvent("harness_close_terminal_conflict", {
+          expected: harnessRunOwner,
+          existingStatus: currentGlobalMarker.status,
+          existingReason: currentGlobalMarker.closeReason,
+          requestedStatus: terminal.status,
+          requestedReason: terminal.closeReason,
+        });
+        return;
+      }
+      const closedMarker = settleHarnessRunMarkerIfOwned(terminal, harnessRunOwner);
       if (!closedMarker) {
-        logStoreEvent("harness_close_publish_skipped", {
+        logStoreEvent("harness_close_persist_degraded", {
           expected: harnessRunOwner,
           requestedStatus: terminal.status,
           reason: terminal.closeReason,
         });
-        return false;
+        return;
       }
       const latestRuntime = sessionGet();
       logStoreEvent("agent_loop_stop_summary", {
@@ -781,7 +897,6 @@ export class WorkflowEngine {
         lastStreamError: source.lastStreamError || null,
         stopDiagnostic: lastNonActionableStopDiagnostic,
       });
-      return true;
     };
 
     const emitProgressRuntimeEvent = (
@@ -937,6 +1052,18 @@ export class WorkflowEngine {
         ) {
           const committedText = String(event.item.details.text || "").trim();
           if (committedText) publishedCompletedAssistantFinalText = committedText;
+        }
+        if (isRunTerminalEvent(event) || isTerminalTurnEvent(event)) {
+          // The loop may discover a terminal candidate, but production
+          // publication belongs to the WorkflowEngine transaction after the
+          // final presentation and durable session projection are ready.
+          logStoreEvent("inner_terminal_candidate_deferred", {
+            eventType: event.type,
+            sessionKey: runSessionKey,
+            turnId,
+            runId: "runId" in event ? event.runId : activeRuntimeRunIdentity.runId,
+          });
+          return;
         }
         sessionSet((state: any) => reduceRunTransition(state, { type: "runtime_event", event }));
       },
@@ -2151,7 +2278,14 @@ export class WorkflowEngine {
                   }
                 : {
                     ...turn,
-                    status: turn.status === "awaiting_approval" || turn.status === "done" ? turn.status : "done",
+                    // A model final is only a terminal candidate. Completion
+                    // guards, durable persistence, and the harness lease must
+                    // all settle before the workflow owner closes the turn.
+                    status: turn.status === "awaiting_approval"
+                      ? turn.status
+                      : isUnapprovedPlanRuntime()
+                      ? "planning"
+                      : "executing",
                     summary: normalizedFinal,
                   }
               : turn
@@ -2798,19 +2932,50 @@ export class WorkflowEngine {
             taskId,
             toolCall,
           });
+          const permissionPauseMessage = phaseLanguage === "zh"
+            ? `等待批准：${permissionRequest.toolName} · ${permissionRequest.target}`
+            : `Awaiting approval: ${permissionRequest.toolName} · ${permissionRequest.target}`;
           publishActionRequest(permissionRequest, {
             reason: "tool_permission",
             target: permissionRequest.target,
-            pauseMessage: phaseLanguage === "zh"
-              ? `等待批准：${permissionRequest.toolName} · ${permissionRequest.target}`
-              : `Awaiting approval: ${permissionRequest.toolName} · ${permissionRequest.target}`,
+            pauseMessage: permissionPauseMessage,
+          });
+          appendWorkflowRuntimeEvent({
+            type: "run.paused",
+            threadId: runSessionKey,
+            turnId,
+            timestampMs: Date.now(),
+            runId: permissionRequest.runId,
+            parentRunId: permissionRequest.parentRunId || null,
+            ...(activeRuntimeRunIdentity.goalSliceId
+              ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId }
+              : {}),
+            reason: "tool_permission",
+            message: permissionPauseMessage,
+          });
+
+          const reviewSettlement = createAbortableReviewSettlement({
+            signal: abortCtrl.signal,
+            abortedDecision: { action: "reject" },
+            onContinue: () => beginActionContinuationRun(permissionRequest),
+            onAbort: () => {
+              sessionSet((state: any) =>
+                state.activeActionRequest?.requestId === permissionRequest.requestId
+                  ? {
+                      pendingReviewResolve: null,
+                      pendingReviewTaskId: null,
+                      pendingToolCall: null,
+                      activeActionRequest: null,
+                    }
+                  : {}
+              );
+            },
+            onDecision: resolve,
           });
           sessionSet({
-            pendingReviewResolve: (decision: any) => {
-              beginActionContinuationRun(permissionRequest);
-              resolve(decision);
-            },
+            pendingReviewResolve: reviewSettlement.resolve,
           });
+          reviewSettlement.arm();
         });
       },
 
@@ -2865,7 +3030,7 @@ export class WorkflowEngine {
           planAutoResumeCount: currentCount,
           conversationTurns: state.conversationTurns.map((turn: any) =>
             turn.id === turnId || turn.id === context.uiDisplayTurnId
-              ? { ...turn, status: "stopped_no_action", collapsed: false }
+              ? { ...turn, collapsed: false }
               : turn
           ),
         }));
@@ -2890,7 +3055,7 @@ export class WorkflowEngine {
             planAutoResumeCount: currentCount,
             conversationTurns: state.conversationTurns.map((turn: any) =>
               turn.id === turnId || turn.id === context.uiDisplayTurnId
-                ? { ...turn, status: "stopped_no_action", collapsed: false }
+                ? { ...turn, collapsed: false }
                 : turn
             ),
             runtimeEvents: state.runtimeEvents.map((event: any) =>
@@ -3030,11 +3195,7 @@ export class WorkflowEngine {
           planStage: state.planStage === "completed" ? "completed" : "executing",
           conversationTurns: state.conversationTurns.map((turn: any) =>
             turn.id === turnId || turn.id === context.uiDisplayTurnId
-              ? {
-                  ...turn,
-                  status: "stopped_no_action",
-                  collapsed: false,
-                }
+              ? { ...turn, collapsed: false }
               : turn
           ),
         }));
@@ -3103,7 +3264,7 @@ export class WorkflowEngine {
             planAutoResumeCount: currentCount,
             conversationTurns: state.conversationTurns.map((turn: any) =>
               turn.id === turnId || turn.id === context.uiDisplayTurnId
-                ? { ...turn, status: "stopped_no_action", collapsed: false }
+                ? { ...turn, collapsed: false }
                 : turn
             ),
             runtimeEvents: state.runtimeEvents.map((event: any) =>
@@ -3475,11 +3636,7 @@ export class WorkflowEngine {
           planAutoResumeCount: currentCount,
           conversationTurns: state.conversationTurns.map((turn: any) =>
             turn.id === turnId || turn.id === context.uiDisplayTurnId
-              ? {
-                  ...turn,
-                  status: "stopped_no_action",
-                  collapsed: false,
-                }
+              ? { ...turn, collapsed: false }
               : turn
           ),
         }));
@@ -3539,7 +3696,7 @@ export class WorkflowEngine {
             planAutoResumeCount: currentCount,
             conversationTurns: state.conversationTurns.map((turn: any) =>
               turn.id === turnId || turn.id === context.uiDisplayTurnId
-                ? { ...turn, status: "stopped_no_action", collapsed: false }
+                ? { ...turn, collapsed: false }
                 : turn
             ),
             runtimeEvents: state.runtimeEvents.map((event: any) =>
@@ -3655,13 +3812,30 @@ export class WorkflowEngine {
       },
 
       onStatusChange: (status: "idle" | "running" | "pending_review" | "error") => {
-        const publicationDecision = terminalStatusPublicationGate.requestStatus(status);
-        if (!publicationDecision.publishNow) {
+        if (status === "idle" || status === "error") {
+          const publicationDecision = terminalStatusPublicationGate.requestStatus(
+            "idle",
+            activeRuntimeRunIdentity.runId,
+          );
           logStoreEvent("terminal_idle_notification_deferred", {
             sessionKey: runSessionKey,
             turnId,
             runId: activeRuntimeRunIdentity.runId,
+            requestedStatus: status,
             deferredIdleCount: publicationDecision.deferredIdleCount,
+          });
+          return;
+        }
+        const publicationDecision = terminalStatusPublicationGate.requestStatus(
+          status,
+          activeRuntimeRunIdentity.runId,
+        );
+        if (!publicationDecision.publishNow) {
+          logStoreEvent("stale_runtime_status_publication_skipped", {
+            sessionKey: runSessionKey,
+            turnId,
+            runId: activeRuntimeRunIdentity.runId,
+            requestedStatus: status,
           });
           return;
         }
@@ -3710,7 +3884,6 @@ export class WorkflowEngine {
         sessionSet((s: any) => ({
           agentStatus: status,
           isGenerating: status === "running",
-          ...(status === "idle" || status === "error" ? { abortController: null } : {}),
           ...(status === "running" && isUnapprovedPlanRuntime()
             ? {
                 conversationTurns: s.conversationTurns.map((turn: any) =>
@@ -3733,7 +3906,6 @@ export class WorkflowEngine {
       },
 
       onError: (error: string) => {
-        sessionSet({ agentStatus: "error", isGenerating: false, abortController: null });
         appendTurnBlock({
           id: sessionGet()._nextTaskId(),
           turnId,
@@ -3787,20 +3959,6 @@ export class WorkflowEngine {
               progress?.repeatedTargets ?? previous?.repeatedTargets,
           });
         }
-        const stoppedStatus = reason === "no_output"
-          ? "stopped_no_output"
-          : isDurableRecoveryPause
-          ? "paused"
-          : progress?.recoveryReason === "approved_plan_completion_guard_no_evidence"
-          ? "stopped_no_action"
-          : progress?.recoveryReason === "required_tool_call_protocol_violation_after_change" ||
-            progress?.recoveryReason === "execute_no_action_after_change" ||
-            progress?.recoveryReason?.startsWith("desktop_control_") ||
-            progress?.recoveryReason?.startsWith("execution_evidence_gap:")
-          ? "paused"
-          : reason === "incomplete_plan"
-          ? "paused"
-          : "stopped_no_action";
         const isPlanGenerationFailure =
           reason === "incomplete_plan" && progress?.recoveryReason === "plan_generation_failed";
         sessionSet((s: any) => {
@@ -3855,7 +4013,6 @@ export class WorkflowEngine {
               turn.id === turnId && turn.status !== "awaiting_approval"
                 ? {
                     ...turn,
-                    status: stoppedStatus,
                     // A held model draft cannot own terminal presentation.
                     // Persist the runtime-owned evidence checkpoint so a
                     // paused turn remains understandable after reload.
@@ -4001,13 +4158,14 @@ export class WorkflowEngine {
           pendingPlanApprovalHandoff: null,
           planApprovalExecutionStartedForTurnId: null,
           activeActionRequest: null,
-          agentStatus: currentIdentity ? "pending_review" : "idle",
-          isGenerating: false,
+          ...(currentIdentity
+            ? { agentStatus: "pending_review", isGenerating: false }
+            : {}),
           conversationTurns: state.conversationTurns.map((candidate: any) =>
             candidate.id === turnId
               ? {
                   ...candidate,
-                  status: currentIdentity ? "awaiting_approval" : "paused",
+                  ...(currentIdentity ? { status: "awaiting_approval" as const } : {}),
                   summary: phaseLanguage === "zh"
                     ? "计划内容在批准后发生变化，旧批准已失效。"
                     : "The plan changed after review, so the previous approval is stale.",
@@ -4138,10 +4296,38 @@ export class WorkflowEngine {
       return result;
     };
 
+    type TerminalStateAccess = {
+      get: () => any;
+      set: (patchOrUpdater: any) => void;
+    };
+    const liveTerminalStateAccess: TerminalStateAccess = {
+      get: sessionGet,
+      set: sessionSet,
+    };
+    const createTerminalDraftAccess = (initialState: any) => {
+      let draftState = initialState;
+      const access: TerminalStateAccess & { snapshot: () => any } = {
+        get: () => draftState,
+        set: (patchOrUpdater: any) => {
+          const patch = typeof patchOrUpdater === "function"
+            ? patchOrUpdater(draftState)
+            : patchOrUpdater;
+          if (patch && typeof patch === "object") {
+            draftState = { ...draftState, ...patch };
+          }
+        },
+        snapshot: () => draftState,
+      };
+      return access;
+    };
+
     let completedTurnHasChanges = false;
-    const ensureCompletedTurnFinalPresentation = (outcome: AgentLoopOutcome): string | null => {
+    const ensureCompletedTurnFinalPresentation = (
+      outcome: AgentLoopOutcome,
+      access: TerminalStateAccess = liveTerminalStateAccess,
+    ): string | null => {
       if (outcome.status !== "completed") return null;
-      const current = sessionGet();
+      const current = access.get();
       const terminalOwnership = resolveTerminalTurnOwnership({
         turnId,
         uiDisplayTurnId: context.uiDisplayTurnId,
@@ -4190,7 +4376,7 @@ export class WorkflowEngine {
       );
       const reusableFinalBlock = matchingPublishedBlock || existingTerminalFinalBlock || null;
       const finalBlockId = reusableFinalBlock?.id ?? current._nextTaskId();
-      sessionSet((state: any) => {
+      access.set((state: any) => {
         let taskFlow = state.taskFlow.map((block: TaskBlock) => {
           if (
             block.type === "agent" &&
@@ -4236,7 +4422,7 @@ export class WorkflowEngine {
           ),
         };
       });
-      logStoreEvent("completed_turn_final_presentation_committed", {
+      logStoreEvent("completed_turn_final_presentation_staged", {
         source: finalPresentation.source,
         finalChars: finalPresentation.text.length,
         modifiedFiles: finalPresentation.execution.modifiedFiles,
@@ -4248,7 +4434,111 @@ export class WorkflowEngine {
       return finalPresentation.text;
     };
 
-    const ensurePausedTurnFinalPresentation = (outcome: AgentLoopOutcome): string | null => {
+    const ensureClosedTurnConclusion = (
+      outcome: AgentLoopOutcome,
+      access: TerminalStateAccess = liveTerminalStateAccess,
+    ): string | null => {
+      const resultKind = outcome.status === "aborted"
+        ? "canceled"
+        : outcome.status === "completed"
+        ? outcome.resultKind
+        : null;
+      if (resultKind !== "error" && resultKind !== "blocked" && resultKind !== "canceled") {
+        return null;
+      }
+      const current = access.get();
+      const terminalOwnership = resolveTerminalTurnOwnership({
+        turnId,
+        uiDisplayTurnId: context.uiDisplayTurnId,
+      });
+      const terminalTurnIds = new Set(terminalOwnership.evidenceTurnIds);
+      const presentationTurn = current.conversationTurns.find((candidate: any) =>
+        candidate.id === terminalOwnership.ownerTurnId
+      ) || current.conversationTurns.find((candidate: any) => candidate.id === turnId);
+      const presentationTurnId = presentationTurn?.id || terminalOwnership.ownerTurnId;
+      const language = (current.preferredResponseLanguage || current.config.language) === "en"
+        ? "en"
+        : "zh";
+      const reason = String(outcome.reason || "").trim() || (language === "en" ? "Unknown reason" : "未知原因");
+      const conclusion = language === "en"
+        ? resultKind === "canceled"
+          ? `This turn was canceled and is now closed. ${reason}`
+          : resultKind === "blocked"
+          ? `This turn is complete with a blocked result. ${reason}`
+          : `This turn is complete, but MAIN could not finish the requested work. ${reason}`
+        : resultKind === "canceled"
+        ? `本回合已取消并完成收口。${reason}`
+        : resultKind === "blocked"
+        ? `本回合已完成收口，但结果受到阻塞。原因：${reason}`
+        : `本回合已完成收口，但 MAIN 未能完成所请求的工作。原因：${reason}`;
+      const turnBlocks = current.taskFlow.filter((block: TaskBlock) =>
+        !!block.turnId && terminalTurnIds.has(block.turnId)
+      );
+      const existingTerminalFinalBlock = [...turnBlocks].reverse().find((block: TaskBlock) =>
+        block.type === "agent" && block.visibility === "assistant_final"
+      );
+      const finalBlockId = existingTerminalFinalBlock?.id ?? current._nextTaskId();
+      access.set((state: any) => {
+        let foundFinal = false;
+        let taskFlow = state.taskFlow.map((block: TaskBlock) => {
+          if (block.id === finalBlockId && block.type === "agent") {
+            foundFinal = true;
+            return {
+              ...block,
+              content: conclusion,
+              streaming: false,
+              hiddenProcess: false,
+              visibility: "assistant_final" as const,
+              turnPhase: withTurnRuntimePhaseStatus(block.turnPhase, "done", phaseLanguage),
+            };
+          }
+          if (
+            block.type === "agent" &&
+            terminalTurnIds.has(block.turnId || "") &&
+            block.visibility === "assistant_final"
+          ) {
+            return { ...block, visibility: "assistant_update" as const };
+          }
+          return block;
+        });
+        if (!foundFinal) {
+          taskFlow = [...taskFlow, {
+            id: finalBlockId,
+            turnId: presentationTurnId,
+            type: "agent" as const,
+            content: conclusion,
+            streaming: false,
+            visibility: "assistant_final" as const,
+          }];
+        }
+        return {
+          taskFlow,
+          conversationTurns: state.conversationTurns.map((candidate: any) =>
+            terminalTurnIds.has(candidate.id)
+              ? {
+                  ...candidate,
+                  summary: conclusion,
+                  blockIds: candidate.id === presentationTurnId && !candidate.blockIds.includes(finalBlockId)
+                    ? [...candidate.blockIds, finalBlockId]
+                    : candidate.blockIds,
+                }
+              : candidate
+          ),
+        };
+      });
+      completedTurnHasChanges = getScopedDurableMutationEvidence().length > 0;
+      logStoreEvent("closed_turn_conclusion_staged", {
+        outcomeStatus: outcome.status,
+        resultKind,
+        finalChars: conclusion.length,
+      });
+      return conclusion;
+    };
+
+    const ensurePausedTurnFinalPresentation = (
+      outcome: AgentLoopOutcome,
+      access: TerminalStateAccess = liveTerminalStateAccess,
+    ): string | null => {
       if (
         outcome.status !== "paused" ||
         (
@@ -4263,7 +4553,7 @@ export class WorkflowEngine {
         outcome.reason === "execute_recovery_no_progress_limit" &&
         durableMutationEvidence.length === 0
       ) return null;
-      const current = sessionGet();
+      const current = access.get();
       const terminalOwnership = resolveTerminalTurnOwnership({
         turnId,
         uiDisplayTurnId: context.uiDisplayTurnId,
@@ -4303,7 +4593,7 @@ export class WorkflowEngine {
         block.visibility === "assistant_final"
       );
       const finalBlockId = existingTerminalFinalBlock?.id ?? current._nextTaskId();
-      sessionSet((state: any) => {
+      access.set((state: any) => {
         let foundFinal = false;
         const taskFlow = state.taskFlow.map((block: TaskBlock) => {
           if (block.id === finalBlockId && block.type === "agent") {
@@ -4350,7 +4640,7 @@ export class WorkflowEngine {
           ),
         };
       });
-      logStoreEvent("paused_turn_final_presentation_committed", {
+      logStoreEvent("paused_turn_final_presentation_staged", {
         source: finalPresentation.source,
         recoveryReason: outcome.reason,
         finalChars: finalPresentation.text.length,
@@ -4370,14 +4660,11 @@ export class WorkflowEngine {
           return projectCurrentHarnessRunMarker("completed", outcome.reason || "agent_loop_completed");
         case "paused":
           return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_paused");
-        case "stopped_no_output":
-          return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_output");
-        case "stopped_no_action":
-          return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_no_action");
         case "aborted":
-          return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_aborted");
-        case "error":
-          return projectCurrentHarnessRunMarker("error", outcome.reason || "agent_loop_error");
+          // Aborted describes why the execution run stopped. The harness lease
+          // itself still closes cleanly after the cancellation conclusion is
+          // durably committed.
+          return projectCurrentHarnessRunMarker("completed", outcome.reason || "agent_loop_aborted");
       }
     };
 
@@ -4385,64 +4672,305 @@ export class WorkflowEngine {
       outcome: AgentLoopOutcome,
       harnessProjection: TerminalHarnessProjectionResult,
       options: { pendingSameTurnExecution?: boolean } = {},
-    ): Promise<boolean> => {
-      if (harnessProjection === "ownership_lost") return false;
-      const current = sessionGet();
-      const pendingAction = current.activeActionRequest as ActionRequest | null;
-      const isSameTurnExecutionContinuation = options.pendingSameTurnExecution === true;
-      const isIntentionalActionPause =
-        !isSameTurnExecutionContinuation &&
-        outcome.status === "paused" &&
-        pendingAction?.status === "pending";
-      if (isIntentionalActionPause) {
-        // The action-request reducer already projected awaiting_input or
-        // awaiting_approval. Persist it before outer cleanup can publish any
-        // different UI status.
-        await persistCurrentSessionRuntime(sessionGet());
-        if (!publishCurrentHarnessRunMarkerClose(harnessProjection)) {
-          return false;
-        }
-        terminalStatusPublicationGate.discardDeferredIdle();
-        sessionSet({
-          agentStatus: pendingAction?.kind === "plan_review" || pendingAction?.kind === "tool_permission"
-            ? "pending_review"
-            : "idle",
-          isGenerating: false,
-          abortController: null,
-        });
-        return true;
+    ): Promise<{ committed: boolean; finalText: string | null }> => {
+      if (harnessProjection === "ownership_lost") {
+        return { committed: false, finalText: null };
       }
-
-      // Plan approval closes only the review run lease. The logical turn stays
-      // executable until the child execution run acquires its own lease; it
-      // must never be persisted as done during this handoff window.
-      const terminalTurnStatus = isSameTurnExecutionContinuation
-        ? "executing"
-        : outcome.status === "completed"
-        ? completedTurnHasChanges ? "completed_with_changes" : "done"
-        : outcome.status === "error"
-        ? "error"
-        : outcome.status === "stopped_no_output"
-        ? "stopped_no_output"
-        : outcome.status === "stopped_no_action"
-        ? "stopped_no_action"
-        : "paused";
+      const requestedHarnessProjection: Exclude<TerminalHarnessProjectionResult, "ownership_lost"> =
+        harnessProjection;
+      const isSameTurnExecutionContinuation = options.pendingSameTurnExecution === true;
       const terminalTurnIds = new Set([turnId, context.uiDisplayTurnId].filter(Boolean));
+      const terminalRunIdentity = { ...activeRuntimeRunIdentity };
+      const closesLogicalTurn =
+        !isSameTurnExecutionContinuation && outcome.status !== "paused";
+      const turnResultKind = outcome.status === "completed"
+        ? outcome.resultKind
+        : "canceled" as const;
+      let committedFinalText: string | null = null;
+      let committedTurnStatus = "paused";
+      let committedIsIntentionalActionPause = false;
+      let committedPendingAction: ActionRequest | null = null;
       const terminalCommitted = await terminalStatusPublicationGate.commitTerminal({
+        runKey: terminalRunIdentity.runId,
         persistTerminalProjection: async () => {
-          sessionSet((state: any) => ({
-            conversationTurns: state.conversationTurns.map((candidate: any) =>
+          for (let attempt = 0; attempt < 3; attempt += 1) {
+            const baseRevisionToken = getSessionRevisionToken();
+            const baseState = sessionGet();
+            if (getSessionRevisionToken() !== baseRevisionToken) {
+              logStoreEvent("terminal_projection_retry_after_concurrent_update", {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+                attempt: attempt + 1,
+                phase: "snapshot",
+              });
+              continue;
+            }
+            let attemptHarnessProjection: TerminalHarnessProjectionResult = "absent";
+            if (requestedHarnessProjection !== "absent") {
+              const marker = baseState.harnessRunMarker as HarnessRunMarker | null;
+              if (!marker || !isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner)) {
+                logStoreEvent("terminal_projection_owner_changed", {
+                  sessionKey: runSessionKey,
+                  turnId,
+                  runId: terminalRunIdentity.runId,
+                  attempt,
+                });
+                return false;
+              }
+              const closedAt = Date.now();
+              attemptHarnessProjection = {
+                source: marker,
+                terminal: {
+                  ...marker,
+                  status: requestedHarnessProjection.terminal.status,
+                  planStage: baseState.planStage,
+                  isPlanApproved: baseState.isPlanApproved,
+                  updatedAt: closedAt,
+                  closedAt,
+                  closeReason: requestedHarnessProjection.terminal.closeReason,
+                },
+              };
+            }
+
+            completedTurnHasChanges = false;
+            const draft = createTerminalDraftAccess(baseState);
+            commitFinalElapsedTime(draft);
+            let finalText: string | null = null;
+            if (
+              outcome.status === "completed" &&
+              (outcome.resultKind === "success" || outcome.resultKind === "partial") &&
+              shouldCommitCompletedTurnFinalPresentation({
+                outcomeStatus: outcome.status,
+                hasPendingSameTurnExecution: isSameTurnExecutionContinuation,
+              })
+            ) {
+              finalText = ensureCompletedTurnFinalPresentation(outcome, draft);
+            } else if (!isSameTurnExecutionContinuation) {
+              finalText = ensureClosedTurnConclusion(outcome, draft);
+            }
+            if (shouldCommitPausedTurnFinalPresentation({
+              outcomeStatus: outcome.status,
+              recoveryReason: outcome.reason,
+              hasDurableMutationEvidence: getScopedDurableMutationEvidence().length > 0,
+              hasPendingSameTurnExecution: isSameTurnExecutionContinuation,
+            })) {
+              finalText = ensurePausedTurnFinalPresentation(outcome, draft) || finalText;
+            }
+            if (shouldCanonicalizeTerminalTurnContext(outcome.status) && !isSameTurnExecutionContinuation) {
+              commitTerminalTurnContext(outcome, draft);
+            }
+
+            const projectedState = draft.get();
+            const pendingAction = projectedState.activeActionRequest as ActionRequest | null;
+            const isIntentionalActionPause =
+              !isSameTurnExecutionContinuation &&
+              outcome.status === "paused" &&
+              pendingAction?.status === "pending" &&
+              isActionRequestOwnedByRun(pendingAction, {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+              });
+            const terminalTurnStatus = isSameTurnExecutionContinuation
+              ? "executing"
+              : outcome.status === "completed"
+              ? completedTurnHasChanges ? "completed_with_changes" : "done"
+              : outcome.status === "aborted"
+              ? "done"
+              : "paused";
+            const timestampMs = Date.now();
+            const summary = projectedState.conversationTurns.find((candidate: any) =>
               terminalTurnIds.has(candidate.id)
-                ? { ...candidate, status: terminalTurnStatus, collapsed: false }
-                : candidate
-            ),
-          }));
-          await persistCurrentSessionRuntime(sessionGet());
-          return publishCurrentHarnessRunMarkerClose(harnessProjection);
+            )?.summary || outcome.reason;
+            const runTerminalEvent = outcome.status === "completed"
+              ? withEventSchema({
+                  type: "run.completed",
+                  threadId: runSessionKey,
+                  turnId,
+                  timestampMs,
+                  runId: terminalRunIdentity.runId,
+                  parentRunId: terminalRunIdentity.parentRunId,
+                  ...(terminalRunIdentity.goalSliceId
+                    ? { goalSliceId: terminalRunIdentity.goalSliceId }
+                    : {}),
+                  resultKind: outcome.resultKind,
+                  summary,
+                })
+              : outcome.status === "aborted"
+              ? withEventSchema({
+                  type: "run.aborted",
+                  threadId: runSessionKey,
+                  turnId,
+                  timestampMs,
+                  runId: terminalRunIdentity.runId,
+                  parentRunId: terminalRunIdentity.parentRunId,
+                  ...(terminalRunIdentity.goalSliceId
+                    ? { goalSliceId: terminalRunIdentity.goalSliceId }
+                    : {}),
+                  reason: outcome.reason,
+                  message: summary,
+                })
+              : withEventSchema({
+                  type: "run.paused",
+                  threadId: runSessionKey,
+                  turnId,
+                  timestampMs,
+                  runId: terminalRunIdentity.runId,
+                  parentRunId: terminalRunIdentity.parentRunId,
+                  ...(terminalRunIdentity.goalSliceId
+                    ? { goalSliceId: terminalRunIdentity.goalSliceId }
+                    : {}),
+                  reason: outcome.reason,
+                  message: summary,
+                });
+            const runAppend = appendRuntimeEventWithResult(
+              projectedState.runtimeEvents,
+              runTerminalEvent,
+            );
+            if (runAppend.disposition === "conflict") {
+              logStoreEvent("terminal_run_projection_conflict", {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+                requestedType: runTerminalEvent.type,
+                existingType: runAppend.existingEvent?.type || null,
+              });
+              return false;
+            }
+            const turnTerminalEvent = closesLogicalTurn
+              ? withEventSchema({
+                  type: "turn.completed",
+                  threadId: runSessionKey,
+                  turnId,
+                  timestampMs,
+                  resultKind: turnResultKind,
+                })
+              : null;
+            if (turnTerminalEvent) {
+              const turnAppend = appendRuntimeEventWithResult(runAppend.events, turnTerminalEvent);
+              if (turnAppend.disposition === "conflict") {
+                logStoreEvent("terminal_turn_projection_conflict", {
+                  sessionKey: runSessionKey,
+                  turnId,
+                  runId: terminalRunIdentity.runId,
+                  existingType: turnAppend.existingEvent?.type || null,
+                });
+                return false;
+              }
+            }
+
+            draft.set((state: any) => {
+              let nextState = reduceRunTransition(state, {
+                type: "runtime_event",
+                event: runTerminalEvent,
+              });
+              if (turnTerminalEvent) {
+                nextState = reduceRunTransition(nextState, {
+                  type: "runtime_event",
+                  event: turnTerminalEvent,
+                });
+              }
+              return {
+                ...nextState,
+                ...(attemptHarnessProjection === "absent"
+                  ? {}
+                  : { harnessRunMarker: attemptHarnessProjection.terminal }),
+                conversationTurns: nextState.conversationTurns.map((candidate: any) =>
+                  terminalTurnIds.has(candidate.id)
+                    ? {
+                        ...candidate,
+                        status: isIntentionalActionPause ? candidate.status : terminalTurnStatus,
+                        collapsed: false,
+                        runtimeOutcome: {
+                          status: outcome.status,
+                          reason: outcome.reason,
+                          ...(outcome.status === "completed"
+                            ? { resultKind: outcome.resultKind }
+                            : outcome.status === "paused"
+                            ? { pauseKind: outcome.pauseKind }
+                            : { resultKind: "canceled" as const }),
+                          runId: terminalRunIdentity.runId,
+                          parentRunId: terminalRunIdentity.parentRunId,
+                          updatedAt: timestampMs,
+                        },
+                      }
+                    : candidate
+                ),
+              };
+            });
+
+            let durableState: any;
+            try {
+              durableState = await persistCurrentSessionRuntime(draft.snapshot());
+            } catch (error) {
+              if (outcome.status !== "completed" || outcome.resultKind !== "error") {
+                throw error;
+              }
+              if (getSessionRevisionToken() !== baseRevisionToken && attempt < 2) {
+                continue;
+              }
+              logStoreEvent("terminal_error_conclusion_persist_unavailable", {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              durableState = draft.snapshot();
+            }
+            if (getSessionRevisionToken() !== baseRevisionToken) {
+              logStoreEvent("terminal_projection_retry_after_concurrent_update", {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+                attempt: attempt + 1,
+              });
+              continue;
+            }
+            const publication = publishOwnerScopedRuntimeProjection({
+              projectedState: draft.snapshot(),
+              durableState,
+              scopeKey: runScopeKey,
+              sessionId: runSessionId,
+              expectedRevisionToken: baseRevisionToken,
+              beforePublish: () => {
+                publishCurrentHarnessRunMarkerClose(attemptHarnessProjection);
+              },
+            });
+            if (!publication.published) {
+              if (publication.disposition === "revision_conflict") {
+                logStoreEvent("terminal_projection_retry_after_concurrent_update", {
+                  sessionKey: runSessionKey,
+                  turnId,
+                  runId: terminalRunIdentity.runId,
+                  attempt: attempt + 1,
+                  phase: "owner_scoped_publish",
+                });
+                continue;
+              }
+              logStoreEvent("terminal_projection_owner_changed", {
+                sessionKey: runSessionKey,
+                turnId,
+                runId: terminalRunIdentity.runId,
+                attempt,
+                disposition: publication.disposition,
+              });
+              return false;
+            }
+            committedFinalText = finalText;
+            committedTurnStatus = terminalTurnStatus;
+            committedIsIntentionalActionPause = isIntentionalActionPause;
+            committedPendingAction = pendingAction;
+            return true;
+          }
+          throw new Error("TERMINAL_PROJECTION_CONCURRENT_UPDATE_LIMIT");
         },
         publishTerminalStatus: () => {
           sessionSet({
-            agentStatus: !isSameTurnExecutionContinuation && outcome.status === "error" ? "error" : "idle",
+            agentStatus: committedIsIntentionalActionPause &&
+              (committedPendingAction?.kind === "plan_review" || committedPendingAction?.kind === "tool_permission")
+              ? "pending_review"
+              : "idle",
             isGenerating: false,
             abortController: null,
           });
@@ -4452,18 +4980,26 @@ export class WorkflowEngine {
         const committed = sessionGet();
         logStoreEvent("terminal_run_projection_committed", {
           outcomeStatus: outcome.status,
-          turnStatus: terminalTurnStatus,
+          outcomeKind: outcome.status === "completed"
+            ? outcome.resultKind
+            : outcome.status === "paused"
+            ? outcome.pauseKind
+            : "canceled",
+          turnStatus: committedTurnStatus,
           pendingSameTurnExecution: isSameTurnExecutionContinuation,
           turnIds: Array.from(terminalTurnIds),
           planStage: committed.planStage,
           isPlanApproved: committed.isPlanApproved,
         });
       }
-      return terminalCommitted;
+      return { committed: terminalCommitted, finalText: committedFinalText };
     };
 
-    const commitTerminalTurnContext = (loopOutcome: AgentLoopOutcome) => {
-      let latestState = sessionGet();
+    const commitTerminalTurnContext = (
+      loopOutcome: AgentLoopOutcome,
+      access: TerminalStateAccess = liveTerminalStateAccess,
+    ) => {
+      let latestState = access.get();
       if (!shouldCanonicalizeTerminalTurnContext(loopOutcome.status)) return latestState;
       const terminalOwnership = resolveTerminalTurnOwnership({
         turnId,
@@ -4493,19 +5029,23 @@ export class WorkflowEngine {
           : [],
         unfinished: [
           ...planTerminalProjection.blocking,
-          ...(loopOutcome.status === "error" ? [loopOutcome.reason] : []),
+          ...(loopOutcome.status === "aborted" ||
+          (loopOutcome.status === "completed" &&
+            (loopOutcome.resultKind === "error" || loopOutcome.resultKind === "blocked"))
+            ? [loopOutcome.reason]
+            : []),
         ],
         advisories: planTerminalProjection.advisories,
       });
       if (durableContext) {
-        sessionSet((state: any) => ({
+        access.set((state: any) => ({
           conversationTurns: state.conversationTurns.map((candidate: any) =>
             candidate.id === terminalOwnership.ownerTurnId
               ? { ...candidate, durableContext }
               : candidate
           ),
         }));
-        logStoreEvent("durable_turn_context_committed", {
+        logStoreEvent("durable_turn_context_staged", {
           outcomeStatus: loopOutcome.status,
           visibleUserMessages: durableContext.visibleUserMessages.length,
           finalAnswerChars: durableContext.finalAssistantAnswer.length,
@@ -4517,7 +5057,7 @@ export class WorkflowEngine {
           advisories: durableContext.execution.advisories.length,
           artifacts: durableContext.execution.artifacts.length,
         });
-        latestState = sessionGet();
+        latestState = access.get();
       }
 
       const terminalTurn = latestState.conversationTurns.find((candidate: any) =>
@@ -4538,9 +5078,9 @@ export class WorkflowEngine {
       });
       if (compactedMessages !== latestState.agentMessages) {
         const beforeMessageCount = latestState.agentMessages.length;
-        sessionSet({ agentMessages: compactedMessages });
-        latestState = sessionGet();
-        logStoreEvent("terminal_turn_context_compacted", {
+        access.set({ agentMessages: compactedMessages });
+        latestState = access.get();
+        logStoreEvent("terminal_turn_context_compaction_staged", {
           outcomeStatus: loopOutcome.status,
           contextSource: "canonical_visible_messages_and_durable_summary",
           beforeMessageCount,
@@ -4551,10 +5091,10 @@ export class WorkflowEngine {
       return latestState;
     };
 
-    const commitFinalElapsedTime = () => {
+    const commitFinalElapsedTime = (access: TerminalStateAccess = liveTerminalStateAccess) => {
       const elapsedTime = Math.max(0, getElapsedSeconds());
       const elapsedTurnIds = new Set([turnId, context.uiDisplayTurnId].filter(Boolean));
-      sessionSet((state: any) => ({
+      access.set((state: any) => ({
         pendingSlashCommand: null,
         elapsedTime,
         conversationTurns: state.conversationTurns.map((candidate: any) =>
@@ -4569,8 +5109,8 @@ export class WorkflowEngine {
       return elapsedTime;
     };
 
-    const persistCurrentSessionRuntime = async (state = sessionGet()): Promise<void> => {
-      if (runSessionId == null) return;
+    const persistCurrentSessionRuntime = async (state: any): Promise<any> => {
+      if (runSessionId == null) return state;
       const messages = sanitizeTaskBlocksForPersist(state.taskFlow);
       const sessionRecord = (state.sessionsByWorkspace?.[runScopeKey] || []).find(
         (candidate: any) => candidate.id === runSessionId,
@@ -4627,8 +5167,21 @@ export class WorkflowEngine {
           goalRuntime: state.goalRuntime,
         }),
       };
-      state.updateSession(runScopeKey, runSessionId, sessionPatch);
-      if (!shouldPersist) return;
+      let committedSessionPatch: Record<string, unknown> = sessionPatch;
+      if (!shouldPersist) {
+        const sessions = state.sessionsByWorkspace?.[runScopeKey] || [];
+        return {
+          ...state,
+          sessionsByWorkspace: {
+            ...state.sessionsByWorkspace,
+            [runScopeKey]: sessions.map((candidate: any) =>
+              candidate.id === runSessionId
+                ? { ...candidate, ...committedSessionPatch }
+                : candidate
+            ),
+          },
+        };
+      }
 
       if (!sessionRecord) {
         throw new Error(`SESSION_RUNTIME_RECORD_MISSING: ${runScopeKey}:${runSessionId}`);
@@ -4639,11 +5192,12 @@ export class WorkflowEngine {
           ...sessionRecord,
           ...sessionPatch,
         });
-        sessionGet().updateSession(runScopeKey, runSessionId, {
+        committedSessionPatch = {
+          ...sessionPatch,
           ...(saved && typeof saved === "object" ? saved : {}),
           storageStatus: "ok",
           recordingDisabled: false,
-        });
+        };
       } catch (error) {
         logStoreEvent("session_runtime_persist_failed", {
           scopeKey: runScopeKey,
@@ -4652,25 +5206,211 @@ export class WorkflowEngine {
         });
         throw error;
       }
+      const sessions = state.sessionsByWorkspace?.[runScopeKey] || [];
+      return {
+        ...state,
+        sessionsByWorkspace: {
+          ...state.sessionsByWorkspace,
+          [runScopeKey]: sessions.map((candidate: any) =>
+            candidate.id === runSessionId
+              ? { ...candidate, ...committedSessionPatch }
+              : candidate
+          ),
+        },
+      };
+    };
+
+    const publishEmergencyErrorConclusion = async (input: {
+      reason: string;
+      triggerError: string;
+    }): Promise<{ committed: boolean; finalText: string | null }> => {
+      const outcome: AgentLoopOutcome = {
+        status: "completed",
+        reason: input.reason,
+        resultKind: "error",
+      };
+      const terminalRunIdentity = { ...activeRuntimeRunIdentity };
+      const terminalTurnIds = new Set([turnId, context.uiDisplayTurnId].filter(Boolean));
+      const baseRevisionToken = getSessionRevisionToken();
+      const current = sessionGet();
+      if (current.runtimeEvents.some((event: any) =>
+        isTerminalTurnEvent(event) &&
+        event.threadId === runSessionKey &&
+        terminalTurnIds.has(event.turnId)
+      )) {
+        return { committed: true, finalText: null };
+      }
+      const harnessProjection = projectCurrentHarnessRunMarker(
+        "completed",
+        "terminal_error_memory_fallback",
+        true,
+      );
+      if (harnessProjection === "ownership_lost") {
+        return { committed: false, finalText: null };
+      }
+
+      const draft = createTerminalDraftAccess(current);
+      commitFinalElapsedTime(draft);
+      const finalText = ensureClosedTurnConclusion(outcome, draft);
+      commitTerminalTurnContext(outcome, draft);
+      const timestampMs = Date.now();
+      const runTerminalEvent = withEventSchema({
+        type: "run.completed",
+        threadId: runSessionKey,
+        turnId,
+        timestampMs,
+        runId: terminalRunIdentity.runId,
+        parentRunId: terminalRunIdentity.parentRunId,
+        ...(terminalRunIdentity.goalSliceId
+          ? { goalSliceId: terminalRunIdentity.goalSliceId }
+          : {}),
+        resultKind: "error",
+        summary: finalText || input.reason,
+      });
+      const runAppend = appendRuntimeEventWithResult(
+        draft.get().runtimeEvents,
+        runTerminalEvent,
+      );
+      if (runAppend.disposition === "conflict") {
+        logStoreEvent("terminal_error_memory_fallback_conflict", {
+          runId: terminalRunIdentity.runId,
+          existingType: runAppend.existingEvent?.type || null,
+          triggerError: input.triggerError,
+        });
+        return { committed: false, finalText: null };
+      }
+      const turnTerminalEvent = withEventSchema({
+        type: "turn.completed",
+        threadId: runSessionKey,
+        turnId,
+        timestampMs,
+        resultKind: "error",
+      });
+      const turnAppend = appendRuntimeEventWithResult(runAppend.events, turnTerminalEvent);
+      if (turnAppend.disposition === "conflict") {
+        return { committed: false, finalText: null };
+      }
+
+      draft.set((state: any) => {
+        let nextState = reduceRunTransition(state, {
+          type: "runtime_event",
+          event: runTerminalEvent,
+        });
+        nextState = reduceRunTransition(nextState, {
+          type: "runtime_event",
+          event: turnTerminalEvent,
+        });
+        return {
+          ...nextState,
+          ...(harnessProjection === "absent"
+            ? {}
+            : { harnessRunMarker: harnessProjection.terminal }),
+          agentStatus: "idle",
+          isGenerating: false,
+          abortController: null,
+          conversationTurns: nextState.conversationTurns.map((candidate: any) =>
+            terminalTurnIds.has(candidate.id)
+              ? {
+                  ...candidate,
+                  status: "done",
+                  collapsed: false,
+                  runtimeOutcome: {
+                    status: "completed",
+                    reason: input.reason,
+                    resultKind: "error",
+                    runId: terminalRunIdentity.runId,
+                    parentRunId: terminalRunIdentity.parentRunId,
+                    updatedAt: timestampMs,
+                  },
+                }
+              : candidate
+          ),
+        };
+      });
+      const projectedState = draft.snapshot();
+      const memoryPublication = publishOwnerScopedRuntimeProjection({
+        projectedState,
+        durableState: projectedState,
+        scopeKey: runScopeKey,
+        sessionId: runSessionId,
+        expectedRevisionToken: baseRevisionToken,
+        beforePublish: () => {
+          publishCurrentHarnessRunMarkerClose(harnessProjection);
+        },
+      });
+      if (!memoryPublication.published) {
+        logStoreEvent("terminal_error_memory_fallback_owner_changed", {
+          runId: terminalRunIdentity.runId,
+          disposition: memoryPublication.disposition,
+          triggerError: input.triggerError,
+        });
+        return { committed: false, finalText: null };
+      }
+      const publishedRevisionToken = getSessionRevisionToken();
+      try {
+        const durableState = await persistCurrentSessionRuntime(projectedState);
+        const durablePublication = publishOwnerScopedRuntimeProjection({
+          projectedState,
+          durableState,
+          scopeKey: runScopeKey,
+          sessionId: runSessionId,
+          expectedRevisionToken: publishedRevisionToken,
+        });
+        if (durablePublication.published) {
+          logStoreEvent("terminal_error_memory_fallback_reconciled", {
+            runId: terminalRunIdentity.runId,
+            durability: "durable_after_memory_publication",
+            disposition: durablePublication.disposition,
+            triggerError: input.triggerError,
+          });
+        } else {
+          logStoreEvent("terminal_error_memory_fallback_reconcile_skipped", {
+            runId: terminalRunIdentity.runId,
+            durability: "durable_not_published_after_concurrent_update",
+            disposition: durablePublication.disposition,
+            triggerError: input.triggerError,
+          });
+        }
+      } catch (persistError) {
+        logStoreEvent("terminal_error_memory_fallback_committed", {
+          runId: terminalRunIdentity.runId,
+          durability: "memory_only",
+          triggerError: input.triggerError,
+          persistError: persistError instanceof Error
+            ? persistError.message
+            : String(persistError),
+        });
+      }
+      return { committed: true, finalText };
     };
 
     const executeLoopStrategy = (): Promise<AgentLoopOutcome> => {
       if (context.runtimeRunIntent === "goal") {
         const activeGoal = sessionGet().goalRuntime?.goal || sessionGet().activeGoal;
         if (!activeGoal) {
-          return Promise.resolve({ status: "error", reason: "no_active_goal" });
+          return Promise.resolve({
+            status: "completed",
+            reason: "no_active_goal",
+            resultKind: "error",
+          });
         }
 
         const goalOwnerId = activeGoal.id;
         const goalOwnerRevision = activeGoal.revision || 1;
+        const goalOwnerTurnId = String(activeGoal.ownerTurnId || turnId).trim();
         const goalOwnerWorkspace = String(sessionGet().currentWorkspace || "").trim();
         let staleGoalCallbackLogged = false;
         const isCurrentGoalOwner = () => {
           const state = sessionGet();
           const currentGoal = state.goalRuntime?.goal || state.activeGoal;
           return String(state.currentWorkspace || "").trim() === goalOwnerWorkspace &&
-            currentGoal?.id === goalOwnerId &&
-            (currentGoal.revision || 1) === goalOwnerRevision &&
+            isCurrentGoalWorkflowOwner({
+              goalId: goalOwnerId,
+              goalRevision: goalOwnerRevision,
+              ownerTurnId: goalOwnerTurnId,
+              currentGoal,
+              fallbackOwnerTurnId: turnId,
+            }) &&
             !isGoalRuntimeDeleted(goalOwnerWorkspace, goalOwnerId);
         };
         const acceptGoalCallback = (callback: string) => {
@@ -4681,6 +5421,10 @@ export class WorkflowEngine {
               callback,
               goalId: goalOwnerId,
               goalRevision: goalOwnerRevision,
+              ownerTurnId: goalOwnerTurnId,
+              currentOwnerTurnId: String(
+                (sessionGet().goalRuntime?.goal || sessionGet().activeGoal)?.ownerTurnId || "",
+              ).trim() || null,
               workspace: goalOwnerWorkspace || null,
             });
           }
@@ -4962,7 +5706,8 @@ export class WorkflowEngine {
             const exactMaxIterationBoundary =
               deferredRecoveryReason === "max_iterations_boundary" ||
               outcome.reason === "max_iterations_boundary";
-            const sliceBoundaryReached = outcome.status === "stopped_no_action"
+            const sliceBoundaryReached = outcome.status === "completed"
+              && outcome.resultKind !== "success"
               && modelIterationsUsed >= goalInnerIterationLimit
               && exactMaxIterationBoundary;
             if (deferredNonActionableStop && !sliceBoundaryReached) {
@@ -5062,12 +5807,20 @@ export class WorkflowEngine {
             });
 
             return {
-              assistantText: assistantText.trim() || (outcome.status === "error" ? outcome.reason : "Iteration completed without textual response"),
+              assistantText: assistantText.trim() || (
+                outcome.status === "completed" && outcome.resultKind === "error"
+                  ? outcome.reason
+                  : "Iteration completed without textual response"
+              ),
               toolCalls,
               tokensUsed,
-              completed: outcome.status === "completed",
+              completed: outcome.status === "completed" && outcome.resultKind !== "error" && outcome.resultKind !== "blocked",
               outcomeStatus: outcome.status,
-              error: outcome.status === "error" ? outcome.reason : undefined,
+              outcomeResultKind: outcome.status === "completed" ? outcome.resultKind : undefined,
+              outcomePauseKind: outcome.status === "paused" ? outcome.pauseKind : undefined,
+              error: outcome.status === "completed" && outcome.resultKind === "error"
+                ? outcome.reason
+                : undefined,
               stopReason,
               sliceBoundaryReached,
               usage: {
@@ -5131,29 +5884,36 @@ export class WorkflowEngine {
               ?.goalContinuationGuidance || "",
           ).trim() || undefined,
         }).then((goalOutcome) => {
-          if (isCurrentGoalOwner() && goalOutcome.status === "completed") {
-            appendWorkflowRuntimeEvent({
-              type: "turn.completed",
-              threadId: runSessionKey,
-              turnId,
-              timestampMs: Date.now(),
-            });
-          } else if (isCurrentGoalOwner() && goalOutcome.status === "failed") {
-            appendWorkflowRuntimeEvent({
-              type: "turn.failed",
-              threadId: runSessionKey,
-              turnId,
-              timestampMs: Date.now(),
-              error: { message: goalOutcome.reason },
-            });
+          if (goalOutcome.status === "completed") {
+            return {
+              status: "completed" as const,
+              reason: goalOutcome.reason,
+              resultKind: "success" as const,
+            };
+          }
+          if (goalOutcome.status === "failed") {
+            return {
+              status: "completed" as const,
+              reason: goalOutcome.reason,
+              resultKind: "error" as const,
+            };
+          }
+          if (goalOutcome.status === "blocked" || goalOutcome.status === "budget_exceeded") {
+            return {
+              status: "completed" as const,
+              reason: goalOutcome.reason,
+              resultKind: "blocked" as const,
+            };
+          }
+          if (goalOutcome.status === "cancelled") {
+            return { status: "aborted" as const, reason: goalOutcome.reason };
           }
           return {
-            status: goalOutcome.status === "completed"
-              ? "completed"
-              : goalOutcome.status === "failed"
-                ? "error"
-                : "paused",
+            status: "paused" as const,
             reason: goalOutcome.reason,
+            pauseKind: goalOutcome.status === "awaiting_input"
+              ? "action_required" as const
+              : "recoverable" as const,
           };
         });
       }
@@ -5162,28 +5922,6 @@ export class WorkflowEngine {
     };
 
     return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) => {
-      const terminalRecoveryReason = lastNonActionableStopDiagnostic?.recoveryReason || loopOutcome.reason;
-      const durableRecoveryMutations = getScopedDurableMutationEvidence();
-      if (
-        loopOutcome.status === "stopped_no_action" &&
-        (
-          (
-            terminalRecoveryReason === "execute_recovery_no_progress_limit" &&
-            durableRecoveryMutations.length > 0
-          ) || terminalRecoveryReason === "execute_no_progress_batch_loop"
-        )
-      ) {
-        loopOutcome = {
-          status: "paused",
-          reason: terminalRecoveryReason,
-        };
-        logStoreEvent("durable_recovery_stop_normalized", {
-          fromStatus: "stopped_no_action",
-          toStatus: "paused",
-          recoveryReason: terminalRecoveryReason,
-          mutationTargets: durableRecoveryMutations.map((entry) => entry.target || entry.value),
-        });
-      }
       const parentTurnId = context.uiDisplayTurnId || turnId;
       const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
         threadId: runSessionKey,
@@ -5215,6 +5953,43 @@ export class WorkflowEngine {
         latestState.planApprovalExecutionStartedForTurnId !== turnId
           ? latestState.pendingPlanApprovalHandoff
           : null;
+      const ownedPendingAction = latestState.activeActionRequest as ActionRequest | null;
+      if (
+        loopOutcome.status === "aborted" &&
+        ownedPendingAction?.status === "pending" &&
+        isActionRequestOwnedByRun(ownedPendingAction, {
+          sessionKey: runSessionKey,
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
+        })
+      ) {
+        loopOutcome = {
+          status: "paused",
+          reason: loopOutcome.reason || "action_required",
+          pauseKind: "action_required",
+        };
+      }
+      if (pendingSameTurnExecution) {
+        loopOutcome = {
+          status: "paused",
+          reason: "plan_approval_handoff_pending",
+          pauseKind: "recoverable",
+        };
+      }
+      const preTerminalRunId = activeRuntimeRunIdentity.runId;
+      const preTerminalEvent = [...sessionGet().runtimeEvents].reverse().find((event: any) =>
+        isRunTerminalEvent(event) &&
+        event.threadId === runSessionKey &&
+        event.turnId === turnId &&
+        event.runId === preTerminalRunId
+      );
+      if (loopOutcome.status !== "paused" && preTerminalEvent?.type === "run.paused") {
+        if (!beginTerminalConclusionRun(preTerminalRunId, loopOutcome.reason)) {
+          // A canonical cancellation or a newer run already owns closure. A
+          // stale workflow must not append an unowned child run.
+          return true;
+        }
+      }
       // Approval is a lease boundary, not completion of the logical turn. Close
       // the review run as paused while the durable turn remains executing.
       const harnessProjection = pendingSameTurnExecution
@@ -5229,34 +6004,6 @@ export class WorkflowEngine {
         });
         return true;
       }
-      commitFinalElapsedTime();
-
-      if (loopOutcome.status === "completed" || loopOutcome.status === "error") {
-        const request = sessionGet().activeActionRequest as ActionRequest | null;
-        if (request && isActionRequestOwnedByRun(request, {
-          sessionKey: runSessionKey,
-          turnId,
-          runId: activeRuntimeRunIdentity.runId,
-        })) {
-          sessionSet((state: any) => reduceRunTransition(state, {
-            type: "terminal_cleanup",
-            owner: {
-              sessionKey: runSessionKey,
-              turnId,
-              runId: activeRuntimeRunIdentity.runId,
-            },
-          }));
-          logStoreEvent("terminal_run_action_request_cleared", {
-            sessionKey: runSessionKey,
-            turnId,
-            runId: activeRuntimeRunIdentity.runId,
-            requestId: request.requestId,
-            actionKind: request.kind,
-            outcomeStatus: loopOutcome.status,
-          });
-        }
-      }
-
       if (pendingMaxIterationsAutoResume && (pendingSameTurnExecution || queuedAfterRun)) {
         pendingMaxIterationsAutoResume.cancel(
           pendingSameTurnExecution ? "plan_approval_handoff" : "queued_user_message",
@@ -5264,38 +6011,14 @@ export class WorkflowEngine {
         pendingMaxIterationsAutoResume = null;
         latestState = sessionGet();
       }
-      // A completed run is not publishable until ChatArea owns one explicit,
-      // durable assistant final. This runs after the completion guards and
-      // before context compaction/persistence, so paused/error outcomes can
-      // never receive a synthetic success conclusion.
-      let completedFinalTextForRemote: string | null = null;
-      if (shouldCommitCompletedTurnFinalPresentation({
-        outcomeStatus: loopOutcome.status,
-        hasPendingSameTurnExecution: !!pendingSameTurnExecution,
-      })) {
-        completedFinalTextForRemote = ensureCompletedTurnFinalPresentation(loopOutcome);
-      }
-      if (shouldCommitPausedTurnFinalPresentation({
-        outcomeStatus: loopOutcome.status,
-        recoveryReason: loopOutcome.reason,
-        hasDurableMutationEvidence: durableRecoveryMutations.length > 0,
-        hasPendingSameTurnExecution: !!pendingSameTurnExecution,
-      })) {
-        ensurePausedTurnFinalPresentation(loopOutcome);
-      }
-      if (shouldCanonicalizeTerminalTurnContext(loopOutcome.status) && !pendingSameTurnExecution) {
-        latestState = commitTerminalTurnContext(loopOutcome);
-      }
-
       // The closed run marker, elapsed time, durable turn context, and terminal
-      // turn status form one persistence boundary. Publish idle only after the
-      // durable session write completes.
-      const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(
+      // turn status are staged off-store, persisted, then published together.
+      const terminalProjection = await commitTerminalProjectionBeforeStatusPublication(
         loopOutcome,
         harnessProjection,
         { pendingSameTurnExecution: !!pendingSameTurnExecution },
       );
-      if (!terminalProjectionCommitted) {
+      if (!terminalProjection.committed) {
         logStoreEvent("terminal_run_publication_skipped", {
           reason: "harness_ownership_changed_before_publish",
           sessionKey: runSessionKey,
@@ -5304,6 +6027,7 @@ export class WorkflowEngine {
         });
         return true;
       }
+      const completedFinalTextForRemote = terminalProjection.finalText;
       if (remoteFeishu && completedFinalTextForRemote) {
         const language = sessionGet().config.language === "en" ? "en" : "zh";
         void invoke("send_feishu_message", {
@@ -5479,9 +6203,45 @@ export class WorkflowEngine {
       return true;
     }).catch(async (err: any) => {
       const errorMessage = err instanceof Error ? err.message : String(err);
+      const alreadyCommittedTerminal = sessionGet().runtimeEvents.find((event: any) =>
+        isRunTerminalEvent(event) &&
+        event.threadId === runSessionKey &&
+        event.turnId === turnId &&
+        event.runId === activeRuntimeRunIdentity.runId
+      );
+      const alreadyCommittedTurn = sessionGet().runtimeEvents.some((event: any) =>
+        isTerminalTurnEvent(event) &&
+        event.threadId === runSessionKey &&
+        event.turnId === turnId
+      );
+      if (
+        alreadyCommittedTerminal &&
+        alreadyCommittedTurn &&
+        sessionGet().harnessRunMarker?.status !== "running"
+      ) {
+        logStoreEvent("post_terminal_exception_recorded", {
+          sessionKey: runSessionKey,
+          turnId,
+          runId: activeRuntimeRunIdentity.runId,
+          terminalType: alreadyCommittedTerminal.type,
+          error: errorMessage,
+        });
+        return false;
+      }
+      if (alreadyCommittedTerminal?.type === "run.paused") {
+        beginTerminalConclusionRun(
+          activeRuntimeRunIdentity.runId,
+          "terminal_error_after_paused_run",
+        );
+      }
+      const errorOutcome: AgentLoopOutcome = {
+        status: "completed",
+        reason: errorMessage,
+        resultKind: "error",
+      };
       const errorHarnessProjection = projectCurrentHarnessRunMarker(
-        "error",
-        "agent_loop_crashed",
+        "completed",
+        "agent_loop_error_conclusion",
         true,
       );
       if (errorHarnessProjection === "ownership_lost") {
@@ -5502,7 +6262,8 @@ export class WorkflowEngine {
       if (subagentFinalization) {
         callbacks.onDebugEvent?.("parent_subagents_finalized", {
           parentTurnId,
-          outcomeStatus: "error",
+          outcomeStatus: "completed",
+          outcomeKind: "error",
           ...subagentFinalization,
         });
         closeProjectedSubagentRuns({
@@ -5516,51 +6277,14 @@ export class WorkflowEngine {
         });
       }
       clearInterval(timerInterval);
-      commitFinalElapsedTime();
-      appendWorkflowRuntimeEvent({
-        type: "run.failed",
-        threadId: runSessionKey,
-        turnId,
-        timestampMs: Date.now(),
-        runId: activeRuntimeRunIdentity.runId,
-        parentRunId: activeRuntimeRunIdentity.parentRunId,
-        ...(activeRuntimeRunIdentity.goalSliceId ? { goalSliceId: activeRuntimeRunIdentity.goalSliceId } : {}),
-        error: { message: errorMessage },
-      });
-      appendWorkflowRuntimeEvent({
-        type: "turn.failed",
-        threadId: runSessionKey,
-        turnId,
-        timestampMs: Date.now(),
-        error: { message: errorMessage },
-      });
-      sessionSet((state: any) => reduceRunTransition(state, {
-        type: "terminal_cleanup",
-        owner: {
-          sessionKey: runSessionKey,
-          turnId,
-          runId: activeRuntimeRunIdentity.runId,
-        },
-      }));
       logStoreEvent("agent_loop_crashed", {
         turnId,
         error: errorMessage,
         stack: err instanceof Error ? err.stack?.slice(0, 1200) : null,
         stopClass: "unrecoverable_error",
       });
-      if (remoteFeishu) {
-        const language = sessionGet().config.language === "en" ? "en" : "zh";
-        void invoke("send_feishu_message", {
-          chatId: remoteFeishu.chatId,
-          userId: remoteFeishu.userId,
-          openId: remoteFeishu.userId,
-          messageId: remoteFeishu.messageId,
-          text: language === "en"
-            ? `MAIN crashed while handling the remote task: ${errorMessage}`
-            : `MAIN 处理远程任务时崩溃：${errorMessage}`,
-        }).catch(() => {});
-      }
-      // Show crash as visible system block
+      // Preserve the technical incident as evidence; the assistant final below
+      // owns the user-facing conclusion.
       const crashId = sessionGet()._nextTaskId();
       sessionSet((s: any) => ({
         taskFlow: [...s.taskFlow, {
@@ -5573,27 +6297,43 @@ export class WorkflowEngine {
           turn.id === turnId
             ? {
                 ...turn,
-                status: "error",
                 summary: errorMessage,
-                blockIds: [...turn.blockIds, crashId],
+                blockIds: turn.blockIds.includes(crashId)
+                  ? turn.blockIds
+                  : [...turn.blockIds, crashId],
               }
             : turn
         ),
-        agentStatus: "error",
-        isGenerating: false,
-        abortController: null,
       }));
 
-      const terminalState = commitTerminalTurnContext({
-        status: "error",
-        reason: errorMessage,
-      });
+      let terminalProjection: { committed: boolean; finalText: string | null };
       try {
-        await persistCurrentSessionRuntime(terminalState);
-      } catch {
-        // persistCurrentSessionRuntime already records the durable-write error.
-      } finally {
-        publishCurrentHarnessRunMarkerClose(errorHarnessProjection);
+        terminalProjection = await commitTerminalProjectionBeforeStatusPublication(
+          errorOutcome,
+          errorHarnessProjection,
+        );
+      } catch (terminalError) {
+        const terminalErrorMessage = terminalError instanceof Error
+          ? terminalError.message
+          : String(terminalError);
+        terminalProjection = await publishEmergencyErrorConclusion({
+          reason: `${errorMessage}; terminal publication recovery: ${terminalErrorMessage}`,
+          triggerError: terminalErrorMessage,
+        });
+      }
+      const finalText = terminalProjection.finalText;
+      if (remoteFeishu && finalText && terminalProjection.committed) {
+        const language = sessionGet().config.language === "en" ? "en" : "zh";
+        void invoke("send_feishu_message", {
+          chatId: remoteFeishu.chatId,
+          userId: remoteFeishu.userId,
+          openId: remoteFeishu.userId,
+          messageId: remoteFeishu.messageId,
+          text: finalText,
+          feishuCardTitle: language === "en" ? "Task Conclusion" : "任务结论",
+          feishuCardMarkdown: finalText,
+          isFeishuReplyCard: true,
+        }).catch(() => {});
       }
 
       return false;

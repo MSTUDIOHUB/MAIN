@@ -2,6 +2,9 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { createProjectSessionMutationCoordinator } from "./projectSessionMutationCoordinator";
+
+const projectSessionMutations = createProjectSessionMutationCoordinator();
 
 export interface PtyDataPayload {
   sessionKey?: string;
@@ -925,7 +928,11 @@ export function rebuildProjectSessionsIndex(workspace: string): Promise<any[]> {
 }
 
 export function saveProjectSession(workspace: string, session: any): Promise<any> {
-  return invoke<any>("save_project_session", { workspace, session });
+  const sessionId = String(session?.id ?? "unknown");
+  const ownerKey = `${workspace}\u0000${sessionId}`;
+  return projectSessionMutations.save(ownerKey, () =>
+    invoke<any>("save_project_session", { workspace, session })
+  );
 }
 
 export function loadProjectSession(workspace: string, sessionId: number | string): Promise<any> {
@@ -962,11 +969,20 @@ export function loadProjectSessionPage(
 }
 
 export function deleteProjectSession(workspace: string, sessionId: number | string): Promise<any[]> {
-  return invoke<any[]>("delete_project_session", { workspace, sessionId });
+  const ownerKey = `${workspace}\u0000${String(sessionId)}`;
+  return projectSessionMutations.delete(ownerKey, () =>
+    invoke<any[]>("delete_project_session", { workspace, sessionId })
+  );
 }
 
-export function clearProjectSessions(workspace: string): Promise<void> {
-  return invoke<void>("clear_project_sessions", { workspace });
+export function clearProjectSessions(
+  workspace: string,
+  sessionIds: readonly (number | string)[] = [],
+): Promise<void> {
+  const ownerKeys = sessionIds.map((sessionId) => `${workspace}\u0000${String(sessionId)}`);
+  return projectSessionMutations.clear(workspace, ownerKeys, () =>
+    invoke<void>("clear_project_sessions", { workspace })
+  );
 }
 
 export function exportTextFile(path: string, content: string): Promise<void> {

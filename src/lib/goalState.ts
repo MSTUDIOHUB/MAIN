@@ -14,6 +14,11 @@ import {
   resolveEffectiveSubagentDelegationPreference,
   type SubagentDelegationPreference,
 } from "./turnIntake";
+import type {
+  AgentLoopPauseKind,
+  AgentLoopResultKind,
+  LegacyAgentLoopOutcomeStatus,
+} from "./runOutcome";
 
 export type GoalStatus =
   | "active"           // Currently executing
@@ -262,7 +267,9 @@ export interface GoalIteration {
   /** Unresolved blockers encountered */
   unresolvedBlockers: string[];
   /** Exact inner-loop outcome and stop reason for this internal continuation. */
-  innerOutcomeStatus?: "completed" | "paused" | "stopped_no_action" | "stopped_no_output" | "aborted" | "error";
+  innerOutcomeStatus?: LegacyAgentLoopOutcomeStatus;
+  innerOutcomeResultKind?: AgentLoopResultKind;
+  innerOutcomePauseKind?: AgentLoopPauseKind;
   stopReason?: string;
   stopClass?: GoalStopClass;
   usage?: GoalIterationUsage;

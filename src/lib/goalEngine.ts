@@ -87,6 +87,11 @@ import {
   extractGoalAssistantSummary,
 } from "./goalContinuity";
 import { resolveEffectiveSubagentDelegationPreference } from "./turnIntake";
+import type {
+  AgentLoopPauseKind,
+  AgentLoopResultKind,
+  LegacyAgentLoopOutcomeStatus,
+} from "./runOutcome";
 
 // ── Goal Engine callbacks ────────────────────────────────────────
 
@@ -141,7 +146,11 @@ export interface GoalAgentIterationResult {
   /** Whether the iteration completed normally */
   completed: boolean;
   /** Exact inner-loop outcome; non-completed outcomes must not be auto-restarted. */
-  outcomeStatus?: "completed" | "paused" | "stopped_no_action" | "stopped_no_output" | "aborted" | "error";
+  outcomeStatus?: LegacyAgentLoopOutcomeStatus;
+  /** Quality of a canonical completed outcome; errors must not be treated as success. */
+  outcomeResultKind?: AgentLoopResultKind;
+  /** Structured reason for a canonical pause, preserved across Goal slices. */
+  outcomePauseKind?: AgentLoopPauseKind;
   /** Error message if iteration failed */
   error?: string;
   /** Exact stop reason returned by the inner agent loop. */
@@ -444,7 +453,8 @@ export async function executeGoalLoop(input: {
       iteration.phase = "execute";
       iteration.endedAt = Date.now();
       iteration.summary = `Error: ${errorMsg.slice(0, 200)}`;
-      iteration.innerOutcomeStatus = "error";
+      iteration.innerOutcomeStatus = "completed";
+      iteration.innerOutcomeResultKind = "error";
       iteration.stopReason = errorMsg;
       iteration.stopClass = "recoverable_error";
       iteration.usage = failureUsage;
@@ -467,7 +477,8 @@ export async function executeGoalLoop(input: {
       };
 
       const decision = resolveGoalInnerOutcomeDecision({
-        status: "error",
+        status: "completed",
+        resultKind: "error",
         stopReason: errorMsg,
         isAborted: callbacks.isAborted(),
       });
@@ -569,9 +580,15 @@ export async function executeGoalLoop(input: {
     };
     iteration.usage = normalizedUsage;
     iteration.innerOutcomeStatus = agentResult.outcomeStatus;
+    iteration.innerOutcomeResultKind = agentResult.outcomeResultKind;
+    iteration.innerOutcomePauseKind = agentResult.outcomePauseKind;
     iteration.stopReason = agentResult.stopReason
       || agentResult.error
-      || (agentResult.outcomeStatus === "completed" ? "agent_loop_completed" : agentResult.outcomeStatus);
+      || (agentResult.outcomeStatus === "completed"
+        ? agentResult.outcomeResultKind === "error"
+          ? "agent_loop_error"
+          : "agent_loop_completed"
+        : agentResult.outcomeStatus);
     progress.lastStopReason = iteration.stopReason;
     const tokensUsed = normalizedUsage.tokensUsed;
     progress.totalTokensUsed += tokensUsed;
@@ -598,6 +615,8 @@ export async function executeGoalLoop(input: {
       continuationId: goalTurnContract.goalSliceId,
       continuation: iteration.index,
       outcomeStatus: agentResult.outcomeStatus || (agentResult.completed ? "completed" : "unknown"),
+      outcomeResultKind: agentResult.outcomeResultKind || null,
+      outcomePauseKind: agentResult.outcomePauseKind || null,
       stopReason: iteration.stopReason || null,
       sliceBoundaryReached: agentResult.sliceBoundaryReached === true,
       usage: normalizedUsage,
@@ -614,7 +633,9 @@ export async function executeGoalLoop(input: {
       ? completionSignal.blockerReason || "goal_blocked_without_reason"
       : iteration.stopReason || agentResult.error || agentResult.outcomeStatus || "agent_loop_completed";
     const innerDecision = resolveGoalInnerOutcomeDecision({
-      status: completionSignal.blocked ? "stopped_no_action" : agentResult.outcomeStatus,
+      status: agentResult.outcomeStatus,
+      resultKind: completionSignal.blocked ? "blocked" : agentResult.outcomeResultKind,
+      pauseKind: agentResult.outcomePauseKind,
       stopReason: effectiveStopReason,
       sliceBoundaryReached: autoContinue,
       isAborted: callbacks.isAborted(),
@@ -626,7 +647,9 @@ export async function executeGoalLoop(input: {
       progress.lastStopReason = effectiveStopReason;
       progress.stopClass = immediateStopStatus === "failed"
         ? "unrecoverable_error"
-        : immediateStopStatus === "awaiting_input"
+        : immediateStopStatus === "blocked"
+          ? "blocked"
+          : immediateStopStatus === "awaiting_input"
           ? "awaiting_input"
           : "user_paused";
       iteration.stopClass = progress.stopClass;
@@ -954,19 +977,24 @@ function resolveGoalCompletionCandidate(input: {
     return { accepted: true, source: "model_marker" };
   }
 
-  // A normal inner completion and the expected continuation boundary are
-  // clean terminal points. A stopped_no_action result can also be a normal
-  // provider-side handoff after real tool work (especially with local models
-  // that omit the final marker); let the evidence gate decide that narrow
-  // case. Pauses, input requests, stream failures, blocked states, and other
-  // recovery errors keep their explicit paths above.
-  const reachedCleanBoundary = input.innerDecision.action === "continue" && (
-    input.agentResult.completed === true
-    || input.agentResult.outcomeStatus === "completed"
-    || input.agentResult.sliceBoundaryReached === true
-  );
-  const toolBackedNoAction = input.agentResult.outcomeStatus === "stopped_no_action"
-    && input.agentResult.toolCalls.length > 0;
+  // A success/partial inner completion and the expected continuation boundary
+  // are clean points for the evidence gate. Error/blocked conclusions are
+  // completed application turns too, but they are never completion evidence.
+  const completionCanAdvance = input.agentResult.outcomeResultKind !== "error"
+    && input.agentResult.outcomeResultKind !== "blocked";
+  const reachedCleanBoundary = completionCanAdvance
+    && input.innerDecision.action === "continue" && (
+      input.agentResult.completed === true
+      || input.agentResult.outcomeStatus === "completed"
+      || input.agentResult.sliceBoundaryReached === true
+    );
+  const toolBackedNoAction = (
+    input.agentResult.outcomeStatus === "stopped_no_action"
+    || (
+      input.agentResult.outcomeStatus === "paused"
+      && input.agentResult.outcomePauseKind === "no_action"
+    )
+  ) && input.agentResult.toolCalls.length > 0;
   return reachedCleanBoundary || toolBackedNoAction
     ? { accepted: true, source: "runtime_evidence" }
     : { accepted: false, source: "none" };
@@ -977,13 +1005,19 @@ function canSettleGoalFromRuntimeEvidence(input: {
   agentResult: GoalAgentIterationResult;
 }): boolean {
   if (input.completionSignal.blocked) return false;
-  // Explicit user-control and provider-error outcomes have already been
-  // handled above or need their own recovery path. A stopped_no_action or
-  // stopped_no_output result is allowed here only when the evidence gate can
-  // independently prove every required criterion.
-  return input.agentResult.outcomeStatus !== "paused"
-    && input.agentResult.outcomeStatus !== "aborted"
-    && input.agentResult.outcomeStatus !== "error";
+  if (input.agentResult.outcomeStatus === "aborted") return false;
+  if (
+    input.agentResult.outcomeStatus === "error"
+    || input.agentResult.outcomeResultKind === "error"
+    || input.agentResult.outcomeResultKind === "blocked"
+  ) return false;
+  // Historical stopped_no_* and their canonical typed pauses may settle only
+  // when trusted evidence independently proves every Goal criterion.
+  if (input.agentResult.outcomeStatus === "paused") {
+    return input.agentResult.outcomePauseKind === "no_action"
+      || input.agentResult.outcomePauseKind === "no_output";
+  }
+  return true;
 }
 
 function goalStopClassForBudgetReason(

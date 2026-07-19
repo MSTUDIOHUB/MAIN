@@ -1,4 +1,11 @@
 import { logAgentEvent } from "../../orchestrator";
+import {
+  USER_CHOICE_PAUSE_REASON,
+  abortedAgentLoopOutcome,
+  completedAgentLoopOutcome,
+  isErrorAgentLoopOutcome,
+  pausedAgentLoopOutcome,
+} from "../../runOutcome";
 import type { AgentLoopOutcome, OrchestratorCallbacks } from "../types";
 import { AgentOrchestrator } from "./AgentOrchestrator";
 import { resolveNonActionableStopOutcome, runAgentLoopCompletionGuards } from "./completionGuards";
@@ -16,16 +23,20 @@ export async function executeAgentLoop(
   const orchestrator = new AgentOrchestrator();
   let outcome: AgentLoopOutcome | null = null;
   const setOutcome = (next: AgentLoopOutcome) => {
-    if (outcome?.status === "error") return;
-    if (outcome?.status === "aborted" && next.status !== "error") return;
-    outcome = next;
+    if (outcome?.status === "aborted") return;
+    if (next.status === "aborted") {
+      outcome = next;
+      return;
+    }
+    if (outcome && isErrorAgentLoopOutcome(outcome)) return;
+    if (isErrorAgentLoopOutcome(next) || outcome === null) outcome = next;
   };
   const wrappedCallbacks: OrchestratorCallbacks = {
     ...callbacks,
     onAssistantFinalText: (text, replyOptions = [], meta) => {
       const isSubagent = (callbacks.getSubagentDepth?.() ?? 0) > 0;
       if (!isSubagent && meta?.awaitingInput === true && replyOptions.length > 0) {
-        setOutcome({ status: "paused", reason: "awaiting_user_choice" });
+        setOutcome(pausedAgentLoopOutcome(USER_CHOICE_PAUSE_REASON, "action_required"));
         logAgentEvent("agent_loop_awaiting_user_choice", {
           replyOptions: replyOptions.length,
         });
@@ -37,11 +48,13 @@ export async function executeAgentLoop(
       );
     },
     onNonActionableStop: (message, reason, progress) => {
-      setOutcome(resolveNonActionableStopOutcome(reason, progress));
+      setOutcome(resolveNonActionableStopOutcome(reason, progress, {
+        sawExecutionEvidence: orchestrator.hasExecuteOperationEvidence(),
+      }));
       callbacks.onNonActionableStop(message, reason, progress);
     },
     onError: (error) => {
-      setOutcome({ status: "error", reason: buildAgentLoopErrorReason(error) });
+      setOutcome(completedAgentLoopOutcome(buildAgentLoopErrorReason(error), "error"));
       callbacks.onError(error);
     },
   };
@@ -50,46 +63,56 @@ export async function executeAgentLoop(
     await orchestrator.execute(wrappedCallbacks, abortController);
   } catch (error) {
     const errorReason = buildAgentLoopErrorReason(error);
-    orchestrator.failActiveRun(errorReason);
-    setOutcome({ status: "error", reason: errorReason });
-    throw error;
+    if (!(outcome && isErrorAgentLoopOutcome(outcome))) {
+      const visibleError = error instanceof Error
+        ? error.message
+        : String(error || errorReason);
+      wrappedCallbacks.onError(visibleError || errorReason);
+    }
+    setOutcome(completedAgentLoopOutcome(errorReason, "error"));
   }
 
   const runPauseReason = orchestrator.getLatestRunPauseReason?.();
   if (runPauseReason && outcome === null) {
-    setOutcome({ status: "paused", reason: runPauseReason });
+    if (runPauseReason === "max_iterations_auto_resume") {
+      setOutcome(pausedAgentLoopOutcome(runPauseReason, "recoverable"));
+    } else if (
+      runPauseReason === "plan_review_required" ||
+      runPauseReason === USER_CHOICE_PAUSE_REASON
+    ) {
+      setOutcome(pausedAgentLoopOutcome(runPauseReason, "action_required"));
+    } else {
+      setOutcome(completedAgentLoopOutcome(runPauseReason, "blocked"));
+    }
   }
 
   if (abortController.signal.aborted) {
     orchestrator.discardPendingTurnCompletion?.();
-    return { status: "aborted", reason: "agent_loop_aborted" };
+    return abortedAgentLoopOutcome();
   }
 
   if (outcome === null && orchestrator.hasPendingTurnCompletion?.() === true) {
-    setOutcome({ status: "completed", reason: "agent_loop_completed" });
+    setOutcome(completedAgentLoopOutcome("agent_loop_completed", "success"));
   }
 
   if (outcome === null) {
     const language = callbacks.getPreferredLanguage?.() === "zh" ? "zh" : "en";
     const message = language === "zh"
-      ? "本轮执行已停止，但运行时没有提交完成、暂停、失败或取消终态。任务保持未完成，请检查阻断原因后恢复。"
-      : "The run stopped without committing a completed, paused, failed, or aborted terminal state. The task remains incomplete; inspect the blocker and resume.";
+      ? "本轮执行已停止，但运行时没有提交完成、暂停或取消终态。任务保持未完成，请检查阻断原因后恢复。"
+      : "The run stopped without committing a completed, paused, or aborted terminal state. The task remains incomplete; inspect the blocker and resume.";
     logAgentEvent("agent_loop_missing_terminal_outcome", {
       pendingTurnCompletion: orchestrator.hasPendingTurnCompletion?.() === true,
     });
-    orchestrator.pauseActiveRun?.("agent_loop_no_terminal_outcome", message);
     callbacks.onNonActionableStop?.(message, "no_action", {
       phase: "paused",
       recoveryReason: "agent_loop_no_terminal_outcome",
       nextStep: message,
     });
     callbacks.onStatusChange?.("idle");
-    setOutcome({
-      status: "stopped_no_action",
-      reason: "agent_loop_no_terminal_outcome",
-    });
+    setOutcome(completedAgentLoopOutcome("agent_loop_no_terminal_outcome", "error"));
   }
-  if (outcome === null) {
+  const resolvedOutcome = outcome as AgentLoopOutcome | null;
+  if (resolvedOutcome === null) {
     throw new Error("Agent loop terminal outcome resolution failed");
   }
 
@@ -104,15 +127,21 @@ export async function executeAgentLoop(
       callbacks.onStatusChange(status);
     },
   };
-  const guardedOutcome = runAgentLoopCompletionGuards({
-    outcome,
-    callbacks: completionGuardCallbacks,
-    latestTurnContract: orchestrator.getLatestTurnContract(),
-    sawExecutionEvidence: orchestrator.hasExecuteOperationEvidence(),
-    executeRecoveryState: orchestrator.getLatestExecuteRecoveryState?.() ?? null,
-  });
+  const guardedOutcome = resolvedOutcome.status === "completed" && resolvedOutcome.resultKind === "success"
+    ? runAgentLoopCompletionGuards({
+        outcome: resolvedOutcome,
+        callbacks: completionGuardCallbacks,
+        latestTurnContract: orchestrator.getLatestTurnContract(),
+        sawExecutionEvidence: orchestrator.hasExecuteOperationEvidence(),
+        executeRecoveryState: orchestrator.getLatestExecuteRecoveryState?.() ?? null,
+      })
+    : resolvedOutcome;
   if (guardedOutcome.status === "completed") {
-    orchestrator.commitPendingTurnCompletion?.();
+    if (guardedOutcome.resultKind !== "success") {
+      orchestrator.discardPendingTurnCompletion?.();
+    } else {
+      orchestrator.commitPendingTurnCompletion?.();
+    }
   } else {
     orchestrator.discardPendingTurnCompletion?.();
     const language = callbacks.getPreferredLanguage?.() === "zh" ? "zh" : "en";

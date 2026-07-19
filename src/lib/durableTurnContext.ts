@@ -12,11 +12,12 @@ import { isNoOpToolFeedback } from "./toolFeedbackEnvelope";
 const VALIDATION_TARGET_RE = /(?:\btest\b|pytest|vitest|jest|playwright|\bbuild\b|\blint\b|typecheck|\btsc\b|cargo\s+check|go\s+test)/i;
 
 /**
- * Both successful and failed terminal runs must shed transient recovery/control
- * messages before the next logical turn is assembled.
+ * Every closed logical turn sheds transient recovery/control messages before
+ * the next turn is assembled. Error is retained only for persisted legacy
+ * sessions; new runtime errors close as completed with resultKind=error.
  */
 export function shouldCanonicalizeTerminalTurnContext(status: string): boolean {
-  return status === "completed" || status === "error";
+  return status === "completed" || status === "aborted" || status === "error";
 }
 
 function compact(value: unknown, maxChars = 260): string {

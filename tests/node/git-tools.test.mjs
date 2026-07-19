@@ -31,6 +31,12 @@ const invokeState = {
   calls: [],
 };
 
+const keyedAsyncQueue = await loadCommonJs("src/lib/keyedAsyncQueue.ts");
+const projectSessionMutationCoordinator = await loadCommonJs(
+  "src/lib/projectSessionMutationCoordinator.ts",
+  { "./keyedAsyncQueue": keyedAsyncQueue },
+);
+
 const ipc = await loadCommonJs("src/lib/ipc.ts", {
   "@tauri-apps/api/core": {
     invoke: async (command, args) => {
@@ -41,6 +47,7 @@ const ipc = await loadCommonJs("src/lib/ipc.ts", {
   "@tauri-apps/api/event": {
     listen: async () => () => {},
   },
+  "./projectSessionMutationCoordinator": projectSessionMutationCoordinator,
 });
 const diff = await loadCommonJs("src/lib/diff.ts");
 const gitTools = await loadCommonJs("src/lib/gitTools.ts", {

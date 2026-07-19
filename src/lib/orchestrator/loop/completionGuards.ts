@@ -245,19 +245,15 @@ function describeEvidenceClosureGap(
 export function resolveNonActionableStopOutcome(
   reason: NonActionableStopReason,
   progress?: NonActionableStopProgress,
+  options: { sawExecutionEvidence?: boolean } = {},
 ): AgentLoopOutcome {
-  const status: AgentLoopOutcome["status"] =
-    reason === "no_output" ? "stopped_no_output" :
-    progress?.recoveryReason === "approved_plan_completion_guard_no_evidence" ? "stopped_no_action" :
-    progress?.recoveryReason === "execute_recovery_no_progress_limit" ? "paused" :
-    progress?.recoveryReason === "execute_no_progress_batch_loop" ? "paused" :
-    progress?.recoveryReason === "required_tool_call_protocol_violation_after_change" ? "paused" :
-    progress?.recoveryReason === "execute_no_action_after_change" ? "paused" :
-    progress?.recoveryReason?.startsWith("desktop_control_") ? "paused" :
-    progress?.recoveryReason?.startsWith("execution_evidence_gap:") ? "paused" :
-    reason === "incomplete_plan" ? "paused" :
-    "stopped_no_action";
-  return { status, reason: progress?.recoveryReason || reason };
+  const recoveryReason = progress?.recoveryReason || reason;
+  const resultKind = reason === "no_output"
+    ? "error" as const
+    : options.sawExecutionEvidence
+    ? "partial" as const
+    : "blocked" as const;
+  return { status: "completed", resultKind, reason: recoveryReason };
 }
 
 export function resolveFinalTurnContractForCompletion(input: {
@@ -292,7 +288,10 @@ export function runApprovedPlanCompletionGuard(input: {
   executeRecoveryState?: ExecuteRecoveryRuntimeState | null;
 }): AgentLoopOutcome | null {
   const { outcome, callbacks, sawExecutionEvidence } = input;
-  if (outcome.status !== "completed") return null;
+  if (
+    outcome.status !== "completed" ||
+    (outcome.resultKind !== undefined && outcome.resultKind !== "success")
+  ) return null;
   if (!callbacks.getIsPlanApproved()) return null;
   if (callbacks.getIsApprovedPlanExecutionTransitionPending?.() === true) {
     logAgentEvent("plan_completion_guard_deferred_pending_same_turn_execution", {
@@ -301,6 +300,7 @@ export function runApprovedPlanCompletionGuard(input: {
     });
     return {
       status: "paused",
+      pauseKind: "recoverable",
       reason: "approved_plan_same_turn_execution_pending",
     };
   }
@@ -387,7 +387,8 @@ export function runApprovedPlanCompletionGuard(input: {
   );
   callbacks.onStatusChange("idle");
   return {
-    status: sawExecutionEvidence ? "paused" : "stopped_no_action",
+    status: "completed",
+    resultKind: sawExecutionEvidence ? "partial" : "blocked",
     reason: "approved_plan_completion_guard",
   };
 }
@@ -410,6 +411,7 @@ export function runExecutionEvidenceCompletionGuard(input: {
   } = input;
   if (
     outcome.status !== "completed" ||
+    (outcome.resultKind !== undefined && outcome.resultKind !== "success") ||
     finalTurnContract.completionEvidenceRequired !== "execution_evidence" ||
     approvedPlanAlreadyAudited
   ) {
@@ -490,7 +492,8 @@ export function runExecutionEvidenceCompletionGuard(input: {
   );
   callbacks.onStatusChange("idle");
   return {
-    status: missingAnyExecutionEvidence ? "stopped_no_action" : "paused",
+    status: "completed",
+    resultKind: sawExecutionEvidence ? "partial" : "blocked",
     reason: activeRecoveryPending
       ? "execution_evidence_gap:recovery_phase_pending"
       : missingAnyExecutionEvidence
@@ -508,6 +511,10 @@ export function runAgentLoopCompletionGuards(input: {
   sawExecutionEvidence: boolean;
   executeRecoveryState?: ExecuteRecoveryRuntimeState | null;
 }): AgentLoopOutcome {
+  if (
+    input.outcome.status !== "completed" ||
+    (input.outcome.resultKind !== undefined && input.outcome.resultKind !== "success")
+  ) return input.outcome;
   const approvedPlanGuardOutcome = runApprovedPlanCompletionGuard(input);
   if (approvedPlanGuardOutcome) return approvedPlanGuardOutcome;
 

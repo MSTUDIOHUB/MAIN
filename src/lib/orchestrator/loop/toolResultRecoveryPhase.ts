@@ -873,7 +873,6 @@ export async function handleToolResultRecoveryPhase(input: {
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
   iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId" | "turnContext">;
   emitTurnEvent: (event: MainThreadEventInput) => void;
-  emitTurnFailedEvent: (message: string) => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
   activateExecuteRecovery: ActivateExecuteRecovery;
@@ -2175,7 +2174,6 @@ export async function handleToolResultRecoveryPhase(input: {
     availableToolNames: input.availableToolNames,
     toolCapabilityRegistry: input.toolCapabilityRegistry,
     toolPermissionPolicy: input.toolPermissionPolicy,
-    emitTurnFailedEvent: input.emitTurnFailedEvent,
     executeRecoveryState,
     activateExecuteRecovery: activateExecuteRecoveryAndSync,
   });

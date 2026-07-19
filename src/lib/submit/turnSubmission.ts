@@ -8,6 +8,10 @@ import {
 } from "../sessionTypes";
 import type { HarnessRunMarker } from "../harnessCrashTelemetry";
 import {
+  isTerminalTurnEvent,
+  type MainThreadEvent,
+} from "../turnEvents";
+import {
   isExactUserChoiceResolutionIdentity,
   isMatchingUserChoiceResolution,
   type ActionRequest,
@@ -292,6 +296,7 @@ export interface SubmitPipelineSnapshot {
   agentStatus: string;
   currentTurnId: string | null;
   currentSessionKey?: string | null;
+  runtimeEvents?: MainThreadEvent[];
   conversationTurns: ConversationTurn[];
   taskFlow: TaskBlock[];
   selectedMainModeKey: MainModeKey;
@@ -511,7 +516,7 @@ export function isGoalContinuationAuthorization(
     Number.isFinite(Number(candidate.goalRevision)) &&
     Number(candidate.goalRevision) >= 1 &&
     !!String(candidate.ownerTurnId || "").trim() &&
-    (candidate.source === "goal_user_choice" ? !!requestId : !requestId);
+    (candidate.source === "goal_user_choice" ? !!requestId : true);
 }
 
 export function validateGoalContinuationAuthorization(input: {
@@ -537,7 +542,10 @@ export function validateGoalContinuationAuthorization(input: {
   const goalSessionKey = String(goal.sessionKey || "").trim();
   const continuationStatusMatches = authorization.source === "goal_user_choice"
     ? goal.status === "awaiting_input" || goal.status === "paused"
-    : goal.status === "active";
+    : goal.status === "active" ||
+      goal.status === "paused" ||
+      goal.status === "awaiting_input" ||
+      goal.status === "blocked";
   if (
     !continuationStatusMatches ||
     authorization.workspaceKey !== workspaceKey ||
@@ -554,15 +562,37 @@ export function validateGoalContinuationAuthorization(input: {
     return null;
   }
 
-  if (authorization.source !== "goal_user_choice") return authorization;
   const request = input.activeActionRequest;
-  return request?.kind === "user_choice" &&
-    request.status === "pending" &&
-    request.requestId === authorization.requestId &&
-    request.sessionKey === authorization.sessionKey &&
-    request.turnId === authorization.ownerTurnId
-      ? authorization
-      : null;
+  if (authorization.source === "goal_user_choice") {
+    return request?.kind === "user_choice" &&
+      request.status === "pending" &&
+      request.requestId === authorization.requestId &&
+      request.sessionKey === authorization.sessionKey &&
+      request.turnId === authorization.ownerTurnId
+        ? authorization
+        : null;
+  }
+  if (authorization.source === "goal_manual_resume" && authorization.requestId) {
+    return request?.kind === "goal_confirmation" &&
+      request.status === "pending" &&
+      request.requestId === authorization.requestId &&
+      request.sessionKey === authorization.sessionKey &&
+      request.turnId === authorization.ownerTurnId &&
+      request.goalId === authorization.goalId &&
+      request.goalRevision === authorization.goalRevision
+        ? authorization
+        : null;
+  }
+  // A manual resume without a request identity cannot bypass a newer Goal
+  // confirmation that appeared after the envelope was captured.
+  if (
+    authorization.source === "goal_manual_resume" &&
+    request?.kind === "goal_confirmation" &&
+    request.status === "pending"
+  ) {
+    return null;
+  }
+  return authorization;
 }
 
 /**
@@ -1063,7 +1093,6 @@ export type SubmitSendGateAction =
   | {
       kind: "reset_stuck_state";
       previousStatus: string;
-      turnStatus?: ConversationTurnStatus;
     };
 
 export interface SubmitSendGateDecision {
@@ -1797,11 +1826,6 @@ export function resolveSubmitSendGateDecision(params: {
         action: {
           kind: "reset_stuck_state",
           previousStatus: params.agentStatus,
-          turnStatus: params.hasCurrentTurn
-            ? params.agentStatus === "pending_review"
-              ? "awaiting_approval"
-              : "stopped_no_action"
-            : undefined,
         },
       };
     }
@@ -2827,6 +2851,7 @@ export function resolveSubmitTurnReuseDecision(input: {
   options?: SubmitPipelineOptions;
   currentTurnId: string | null;
   currentSessionKey?: string | null;
+  runtimeEvents?: MainThreadEvent[];
   currentTurn: ConversationTurn | null;
   conversationTurns: ConversationTurn[];
   taskFlow: TaskBlock[];
@@ -2925,11 +2950,22 @@ export function resolveSubmitTurnReuseDecision(input: {
   const shouldExplicitlyReuseCurrentTurn = input.options?.reuseCurrentTurn === true &&
     (!isExplicitChoiceSubmission || choiceIdentityMatches);
   const requestedReuseTurnId = String(input.options?.turnIdOverride || "").trim();
-  const reusableTurnId = requestedReuseTurnId
-    ? input.conversationTurns.some((turn) => turn.id === requestedReuseTurnId)
-      ? requestedReuseTurnId
-      : null
-    : input.currentTurnId;
+  const requestedReuseTurn = requestedReuseTurnId
+    ? input.conversationTurns.find((turn) => turn.id === requestedReuseTurnId) || null
+    : input.currentTurn;
+  const currentSessionKey = String(input.currentSessionKey || "").trim();
+  const requestedTurnHasTerminalEvent = !!requestedReuseTurn && !!currentSessionKey &&
+    (input.runtimeEvents || []).some((event) =>
+      isTerminalTurnEvent(event) &&
+      event.threadId === currentSessionKey &&
+      event.turnId === requestedReuseTurn.id
+    );
+  const requestedTurnIsClosed = requestedTurnHasTerminalEvent ||
+    requestedReuseTurn?.runtimeOutcome?.status === "completed" ||
+    requestedReuseTurn?.runtimeOutcome?.status === "aborted";
+  const reusableTurnId = requestedReuseTurn && !requestedTurnIsClosed
+    ? requestedReuseTurn.id
+    : null;
   const reuseCurrentTurn = shouldReuseLogicalTurnForSubmission({
     explicitReuse: shouldExplicitlyReuseCurrentTurn,
     exactChoiceMatch: shouldAutoResumeChoiceTurn,
@@ -3178,6 +3214,7 @@ export function buildSubmitPipelineDecision(input: SubmitPipelineInput): SubmitP
     options,
     currentTurnId: snapshot.currentTurnId,
     currentSessionKey: snapshot.currentSessionKey,
+    runtimeEvents: snapshot.runtimeEvents || [],
     currentTurn,
     conversationTurns: snapshot.conversationTurns,
     taskFlow: snapshot.taskFlow,

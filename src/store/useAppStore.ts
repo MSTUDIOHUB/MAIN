@@ -12,6 +12,7 @@ import type { SessionAutoApproveScope } from "../lib/runtimeTools";
 import {
   analyzeTabularDocument,
   cancelImageStudioJob,
+  clearProjectSessions,
   deleteChatTempPath,
   deletePlanFiles,
   deleteWorkspacePath,
@@ -35,11 +36,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { setWorkspaceRoot as setWorkspaceRootIpc } from "../lib/ipc";
 import { appendDebugLog } from "../lib/debugLog";
 import {
+  acquireHarnessRunMarker,
   consumePendingUncleanRestartDiagnostic,
+  closeHarnessRunMarkerForSessionDeletion,
   getHarnessActionRunId,
   getCurrentHarnessInstanceId,
   normalizeHarnessRunMarker,
-  persistHarnessRunMarker,
+  persistHarnessRunMarkerIfOwned,
+  readHarnessRunMarker,
+  settleHarnessRunMarkerIfOwned,
   type HarnessRunMarker,
 } from "../lib/harnessCrashTelemetry";
 import { normalizeContextMemoryState, type ContextMemoryState } from "../lib/contextMemory";
@@ -73,6 +78,7 @@ import {
   findDroppedPlanTasks,
   getPlanArtifactTitle,
   isGenericConversationTitle,
+  isConversationTurnRuntimeClosed,
   isPlanConversationTurn,
   looksLikeReasoningLeakTitle,
   normalizeResponseLanguagePolicy,
@@ -86,6 +92,7 @@ import { sanitizeRestoredPlanArtifacts } from "../lib/planArtifactRestore";
 import {
   MAIN_THREAD_EVENT_SCHEMA_VERSION,
   appendRuntimeEvent,
+  isTerminalTurnEvent,
   normalizeEventStreamMode,
   normalizeToolFeedbackFormat,
   withEventSchema,
@@ -151,6 +158,10 @@ import {
 } from "../lib/turnContext";
 import { serializeDurableTurnContextForModel } from "../lib/durableTurnContext";
 import { buildGoalSourceContextSnapshot } from "../lib/goalSourceContext";
+import {
+  buildAcceptedGoalContinuationState,
+  resolveGoalResumeTurnBoundary,
+} from "../lib/goalResumeBoundary";
 import { resolveGoalEventOwnerIdentity } from "../lib/goalEventIdentity";
 import {
   buildPlanReviewActionRequest,
@@ -253,6 +264,7 @@ import type { GoalBudget } from "../lib/goalBudget";
 import { buildGoalRuntimeSnapshot, normalizeGoalRuntimeSnapshot, restoreGoalRuntimeSnapshot } from "../lib/goalRuntime";
 import {
   isQueuedGoalContinuationOwnedByGoal,
+  resolveGoalPauseTransition,
   resolveQueuedGoalContinuationRemoval,
   resolveGoalActionRequestOwnership,
   resolveGoalPendingReviewOwnership,
@@ -309,6 +321,32 @@ import { applySubmitPlanStateReset } from "./submitPlanStateReset";
 import { applySubmitSendGateEffects } from "./submitSendGateEffects";
 import { resolveAndApplySubmitIntentRouting } from "./submitIntentRouting";
 import { startSubmitAsyncWorkflowRun } from "./submitAsyncWorkflowRun";
+import { persistSubmitRuntimeProjection } from "./persistSubmitRuntimeProjection";
+import { commitCanceledTurn } from "./commitCanceledTurn";
+import {
+  beginSessionCancellation,
+  deferUntilSessionCancellationSettled,
+  getPendingSessionCancellation,
+  hasCanceledTurnTerminalProjection,
+  resolveDeferredSessionSubmissionDecision,
+  type SessionCancellationSettlement,
+} from "./sessionCancellationBarrier";
+import {
+  revokeSessionRuntimeBeforeDelete,
+  revokeWorkspaceSessionRuntimesBeforeClear,
+} from "./sessionRuntimeRevocation";
+import {
+  beginWorkspaceClearSubmissionBarrier,
+  discardAllWorkspaceClearSubmissionStateForSettingsReset,
+  discardWorkspaceClearSubmissionState,
+  deferSubmissionForWorkspaceClear,
+  peekSettledWorkspaceClearSubmission,
+  resolveWorkspaceClearBarrierForSubmission,
+  restoreSettledWorkspaceClearSubmission,
+  settleWorkspaceClearSubmissionBarrier,
+  takeSettledWorkspaceClearSubmission,
+} from "./workspaceClearSubmissionBarrier";
+import { projectCanceledTurn } from "../lib/canceledTurnProjection";
 import { createSubmitHarnessRunId } from "./submitRunLease";
 import {
   buildApprovedPlanExecutionPrompt,
@@ -1024,6 +1062,7 @@ export interface AppState {
   updateMessage: (id: string, patch: Partial<Message>) => void;
   clearMessages: () => void;
   setGenerating: (value: boolean, ctrl?: AbortController | null) => void;
+  closeTurnAsCanceled: (turnId: string, options?: { reason?: string; message?: string }) => boolean;
   stopGeneration: () => void;
 
   // Layout panels
@@ -1215,6 +1254,10 @@ export interface AppState {
   getCurrentSessionKey: () => string | null;
   saveCurrentRuntimeToSession: () => void;
   restoreRuntimeForSession: (sessionKey: string | null, options?: { resetPanels?: boolean; requireTranscript?: boolean }) => boolean;
+  markWorkspaceClearSubmissionReplayReady: (
+    workspacePath: string,
+    sessionId: number | null,
+  ) => boolean;
   updateRuntimeForSession: (
     sessionKey: string,
     patch:
@@ -1240,7 +1283,7 @@ export interface AppState {
   revertDiffGroups: (groups: DiffRevertRequest[]) => Promise<DiffRevertResult[]>;
 
   // Data management
-  clearChatHistory: () => void;
+  clearChatHistory: () => Promise<void>;
   resetAllSettings: () => void;
 
   // Workflow mode
@@ -1355,7 +1398,7 @@ export interface AppState {
       replyOptionIsCustom?: boolean;
       parentRunIdOverride?: string;
     },
-  ) => void;
+  ) => QueuedUserMessage | null;
   clearQueuedUserMessage: (options?: {
     expectedId?: string;
     disposition?: Exclude<QueuedGoalContinuationRemovalMode, "replaced">;
@@ -1759,6 +1802,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "run.started",
     "run.paused",
     "run.completed",
+    "run.aborted",
     "run.failed",
     "item.started",
     "item.updated",
@@ -1766,7 +1810,7 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
     "error",
   ]);
 
-  const normalized: MainThreadEvent[] = [];
+  let normalized: MainThreadEvent[] = [];
   for (const raw of value) {
     if (!raw || typeof raw !== "object") continue;
     const record = raw as Record<string, unknown>;
@@ -1784,7 +1828,10 @@ function normalizeRuntimeEvents(value: unknown): MainThreadEvent[] {
               : null,
           }
         : record;
-      normalized.push(withEventSchema(eventRecord as MainThreadEventInput));
+      normalized = appendRuntimeEvent(
+        normalized,
+        withEventSchema(eventRecord as MainThreadEventInput),
+      );
     } catch {
       // ignore malformed runtime events
     }
@@ -2101,6 +2148,20 @@ export function normalizeSessionRuntimeSnapshot(
     : invalidatedActionUsesChinese
     ? "待选择项与当前运行身份不一致；已移除失效按钮并保留上下文。"
     : "The pending choice no longer matches the active run; stale controls were removed and context was preserved.";
+  const restoredRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents);
+  const restoredMarkerRunId = getHarnessActionRunId(restoredHarnessRunMarker);
+  const restoredMarkerRunTerminal = restoredMarkerRunId
+    ? [...restoredRuntimeEvents].reverse().find((event) =>
+        (
+          event.type === "run.completed" ||
+          event.type === "run.aborted" ||
+          event.type === "run.failed"
+        ) &&
+        event.threadId === restoredHarnessRunMarker?.sessionKey &&
+        event.turnId === restoredHarnessRunMarker?.turnId &&
+        event.runId === restoredMarkerRunId
+      )
+    : undefined;
   const restoredMarkerTerminalStatus = restoredHarnessRunMarker?.status === "completed" || restoredHarnessRunMarker?.status === "error"
     ? restoredHarnessRunMarker.status
     : null;
@@ -2113,20 +2174,47 @@ export function normalizeSessionRuntimeSnapshot(
     const ownsInvalidatedRequest = invalidatedActionRequest?.turnId === turn.id;
     const useChinese = /[^\x00-\x7F]/.test(String(turn.userPrompt || ""));
     const ownsTerminalMarker = restoredMarkerTerminalStatus && restoredHarnessRunMarker?.turnId === turn.id;
+    const terminalWasAborted = restoredMarkerRunTerminal?.type === "run.aborted";
+    const terminalResultKind = terminalWasAborted
+      ? "canceled" as const
+      : restoredMarkerRunTerminal?.type === "run.completed" && restoredMarkerRunTerminal.resultKind
+      ? restoredMarkerRunTerminal.resultKind
+      : restoredMarkerRunTerminal?.type === "run.failed" || restoredMarkerTerminalStatus === "error"
+      ? "error" as const
+      : "success" as const;
+    const terminalReason = restoredMarkerRunTerminal?.type === "run.aborted"
+      ? restoredMarkerRunTerminal.reason
+      : restoredMarkerRunTerminal?.type === "run.failed"
+      ? restoredMarkerRunTerminal.error.message
+      : restoredMarkerRunTerminal?.type === "run.completed"
+      ? restoredMarkerRunTerminal.summary || restoredHarnessRunMarker?.closeReason
+      : restoredHarnessRunMarker?.closeReason;
     return {
       ...turn,
       status: ownsTerminalMarker
-        ? restoredMarkerTerminalStatus === "completed" ? "done" as const : "error" as const
+        ? "done" as const
         : "paused" as const,
       summary: ownsTerminalMarker
         ? restoredMarkerTerminalStatus === "completed"
           ? useChinese ? "运行已完成；恢复时清理了不一致的待处理控件。" : "The run completed; inconsistent pending controls were cleared during restore."
-          : useChinese ? "运行已失败；恢复时清理了不一致的待处理控件。" : "The run failed; inconsistent pending controls were cleared during restore."
+          : useChinese ? "运行已得出错误结论；恢复时清理了不一致的待处理控件。" : "The run concluded with an error; inconsistent pending controls were cleared during restore."
         : ownsInvalidatedRequest
         ? summarizeAssistantText(invalidatedChoiceText) || invalidatedActionMessage
         : useChinese
         ? "恢复时未找到可解析的操作请求；已移除失效控件并保留上下文。"
         : "No resolvable action request was found during restore; stale controls were removed and context was preserved.",
+      ...(ownsTerminalMarker
+        ? {
+            runtimeOutcome: {
+              status: terminalWasAborted ? "aborted" as const : "completed" as const,
+              reason: terminalReason || "restored_terminal_checkpoint",
+              resultKind: terminalResultKind,
+              runId: restoredHarnessRunMarker?.activeRunId || restoredHarnessRunMarker?.runId || "restored-run",
+              parentRunId: restoredHarnessRunMarker?.activeParentRunId || restoredHarnessRunMarker?.parentRunId || null,
+              updatedAt: restoredHarnessRunMarker?.closedAt || restoredHarnessRunMarker?.updatedAt || Date.now(),
+            },
+          }
+        : {}),
     };
   });
   const sanitizedHarnessRunMarker = invalidatedRequestOwnsProjectedMarkerRun && restoredHarnessRunMarker?.status === "paused"
@@ -2139,7 +2227,7 @@ export function normalizeSessionRuntimeSnapshot(
   const replacementPauseReason = invalidatedActionReason;
   const replacementPauseMessage = invalidatedActionMessage;
   let replacedOwnerPause = false;
-  let runtimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents)
+  let runtimeEvents = restoredRuntimeEvents
     .filter((event) =>
       !invalidatedOwnerRequest || (
         !(event.type === "approval.requested" && event.requestId === invalidatedOwnerRequest.requestId) &&
@@ -2177,7 +2265,7 @@ export function normalizeSessionRuntimeSnapshot(
       });
     });
   const ownerHasHardTerminal = !!invalidatedOwnerRequest && runtimeEvents.some((event) =>
-    (event.type === "run.completed" || event.type === "run.failed") &&
+    (event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed") &&
     event.threadId === invalidatedOwnerRequest.sessionKey &&
     event.turnId === invalidatedOwnerRequest.turnId &&
     event.runId === invalidatedOwnerRequest.runId
@@ -2194,16 +2282,18 @@ export function normalizeSessionRuntimeSnapshot(
               timestampMs,
               runId: invalidatedOwnerRequest.runId,
               parentRunId: invalidatedOwnerRequest.parentRunId || null,
+              resultKind: "success",
               summary: "Restored completed run; stale pending action controls were removed.",
             }
           : {
-              type: "run.failed",
+              type: "run.completed",
               threadId: invalidatedOwnerRequest.sessionKey,
               turnId: invalidatedOwnerRequest.turnId,
               timestampMs,
               runId: invalidatedOwnerRequest.runId,
               parentRunId: invalidatedOwnerRequest.parentRunId || null,
-              error: { message: sanitizedHarnessRunMarker?.lastStreamError || sanitizedHarnessRunMarker?.closeReason || "Restored failed run." },
+              resultKind: "error",
+              summary: sanitizedHarnessRunMarker?.lastStreamError || sanitizedHarnessRunMarker?.closeReason || "Restored error conclusion.",
             }
         : {
             type: "run.paused",
@@ -2220,7 +2310,7 @@ export function normalizeSessionRuntimeSnapshot(
   const interruptedActionRunId = getHarnessActionRunId(sanitizedHarnessRunMarker);
   const interruptedTurnId = sanitizedHarnessRunMarker?.turnId || null;
   const interruptedRunHasTerminal = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
-    (event.type === "run.paused" || event.type === "run.completed" || event.type === "run.failed") &&
+    (event.type === "run.paused" || event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed") &&
     event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
     event.turnId === interruptedTurnId &&
     event.runId === interruptedActionRunId
@@ -2265,7 +2355,7 @@ export function normalizeSessionRuntimeSnapshot(
     }));
   }
   const projectedRunHasHardTerminal = !!interruptedActionRunId && !!interruptedTurnId && runtimeEvents.some((event) =>
-    (event.type === "run.completed" || event.type === "run.failed") &&
+    (event.type === "run.completed" || event.type === "run.aborted" || event.type === "run.failed") &&
     event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
     event.turnId === interruptedTurnId &&
     event.runId === interruptedActionRunId
@@ -2286,18 +2376,57 @@ export function normalizeSessionRuntimeSnapshot(
             timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
             runId: interruptedActionRunId,
             parentRunId: sanitizedHarnessRunMarker.activeParentRunId || sanitizedHarnessRunMarker.parentRunId || null,
+            resultKind: "success",
             summary: "Restored completed run checkpoint.",
           }
         : {
-            type: "run.failed",
+            type: "run.completed",
             threadId: sanitizedHarnessRunMarker.sessionKey,
             turnId: interruptedTurnId,
             timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
             runId: interruptedActionRunId,
             parentRunId: sanitizedHarnessRunMarker.activeParentRunId || sanitizedHarnessRunMarker.parentRunId || null,
-            error: { message: sanitizedHarnessRunMarker.lastStreamError || sanitizedHarnessRunMarker.closeReason || "Restored failed run." },
+            resultKind: "error",
+            summary: sanitizedHarnessRunMarker.lastStreamError || sanitizedHarnessRunMarker.closeReason || "Restored error conclusion.",
           }
     ));
+  }
+  const restoredProjectedRunTerminal = interruptedActionRunId && interruptedTurnId
+    ? [...runtimeEvents].reverse().find((event) =>
+        (
+          event.type === "run.completed" ||
+          event.type === "run.aborted" ||
+          event.type === "run.failed"
+        ) &&
+        event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
+        event.turnId === interruptedTurnId &&
+        event.runId === interruptedActionRunId
+      )
+    : undefined;
+  const restoredTurnHasTerminal = !!interruptedTurnId && runtimeEvents.some((event) =>
+    (event.type === "turn.completed" || event.type === "turn.failed") &&
+    event.threadId === sanitizedHarnessRunMarker?.sessionKey &&
+    event.turnId === interruptedTurnId
+  );
+  if (
+    sanitizedHarnessRunMarker &&
+    interruptedTurnId &&
+    !restoredTurnHasTerminal &&
+    (sanitizedHarnessRunMarker.status === "completed" || sanitizedHarnessRunMarker.status === "error")
+  ) {
+    runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+      type: "turn.completed",
+      threadId: sanitizedHarnessRunMarker.sessionKey,
+      turnId: interruptedTurnId,
+      timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
+      resultKind: restoredProjectedRunTerminal?.type === "run.aborted"
+        ? "canceled"
+        : restoredProjectedRunTerminal?.type === "run.failed" || sanitizedHarnessRunMarker.status === "error"
+        ? "error"
+        : restoredProjectedRunTerminal?.type === "run.completed" && restoredProjectedRunTerminal.resultKind
+        ? restoredProjectedRunTerminal.resultKind
+        : "success",
+    }));
   }
   if (options?.restoreInterruptedGoal) {
     const beforeReconcileCount = runtimeEvents.length;
@@ -2795,6 +2924,392 @@ function createSessionRuntimeFromState(state: Partial<AppState>): SessionRuntime
   };
 }
 
+function settleCanceledTurnHarnessProjection(
+  projectedMarker: HarnessRunMarker,
+  sourceMarker: HarnessRunMarker | null,
+): HarnessRunMarker | null {
+  if (!sourceMarker) return projectedMarker;
+  const exactOwner = {
+    runId: sourceMarker.runId,
+    sessionKey: sourceMarker.sessionKey,
+    turnId: sourceMarker.turnId || "",
+    instanceId: sourceMarker.instanceId,
+    startedAt: sourceMarker.startedAt,
+  };
+  const latestMarker = readHarnessRunMarker();
+  const ownsExactGlobalGeneration = !!latestMarker &&
+    latestMarker.runId === exactOwner.runId &&
+    latestMarker.sessionKey === exactOwner.sessionKey &&
+    latestMarker.turnId === exactOwner.turnId &&
+    latestMarker.instanceId === exactOwner.instanceId &&
+    latestMarker.startedAt === exactOwner.startedAt;
+  if (!ownsExactGlobalGeneration) {
+    logStoreEvent("canceled_turn_harness_owner_lost_before_terminal_publish", {
+      expected: exactOwner,
+      actual: latestMarker
+        ? {
+            runId: latestMarker.runId,
+            sessionKey: latestMarker.sessionKey,
+            turnId: latestMarker.turnId,
+            instanceId: latestMarker.instanceId,
+            startedAt: latestMarker.startedAt,
+            status: latestMarker.status,
+          }
+        : null,
+    });
+    return null;
+  }
+  if (
+    latestMarker.status !== "running" &&
+    latestMarker.status !== "paused" &&
+    (
+      latestMarker.status !== projectedMarker.status ||
+      latestMarker.closeReason !== projectedMarker.closeReason
+    )
+  ) {
+    logStoreEvent("canceled_turn_harness_terminal_conflict", {
+      expected: exactOwner,
+      existingStatus: latestMarker.status,
+      existingReason: latestMarker.closeReason,
+      requestedStatus: projectedMarker.status,
+      requestedReason: projectedMarker.closeReason,
+    });
+    return null;
+  }
+  const settledMarker = settleHarnessRunMarkerIfOwned(projectedMarker, exactOwner);
+  if (!settledMarker) {
+    logStoreEvent("canceled_turn_harness_persist_degraded", {
+      expected: exactOwner,
+      requestedStatus: projectedMarker.status,
+      requestedReason: projectedMarker.closeReason,
+    });
+  }
+  return settledMarker;
+}
+
+function hasTurnTerminalConclusion(
+  state: Pick<AppState, "runtimeEvents" | "taskFlow">,
+  sessionKey: string,
+  turnId: string,
+): boolean {
+  const hasTerminal = state.runtimeEvents.some((event) =>
+    isTerminalTurnEvent(event) &&
+    event.threadId === sessionKey &&
+    event.turnId === turnId
+  );
+  const hasVisibleFinal = state.taskFlow.some((block) =>
+    block.type === "agent" &&
+    block.turnId === turnId &&
+    block.visibility === "assistant_final"
+  );
+  return hasTerminal && hasVisibleFinal;
+}
+
+function ensureCanceledTurnVisibleConclusion(input: {
+  state: AppState;
+  turnId: string;
+  message: string;
+  nextTaskId: () => number;
+}): AppState {
+  const existingFinal = input.state.taskFlow.find((block) =>
+    block.type === "agent" &&
+    block.turnId === input.turnId &&
+    block.visibility === "assistant_final"
+  );
+  if (existingFinal) return input.state;
+  const finalBlockId = input.nextTaskId();
+  return {
+    ...input.state,
+    taskFlow: [...input.state.taskFlow, {
+      id: finalBlockId,
+      turnId: input.turnId,
+      type: "agent",
+      content: input.message,
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    conversationTurns: input.state.conversationTurns.map((turn) =>
+      turn.id === input.turnId
+        ? {
+            ...turn,
+            status: "done" as const,
+            summary: turn.summary || input.message,
+            collapsed: false,
+            blockIds: turn.blockIds.includes(finalBlockId)
+              ? turn.blockIds
+              : [...turn.blockIds, finalBlockId],
+          }
+        : turn
+    ),
+  };
+}
+
+async function reconcileCanceledTurnWithLatestRuntime(input: {
+  getState: () => AppState;
+  setState: (
+    patchOrUpdater: Partial<AppState> | ((state: AppState) => Partial<AppState>),
+  ) => void;
+  sessionKey: string;
+  scopeKey: string;
+  sessionId: number | null;
+  turnId: string;
+  reason: string;
+  message: string;
+  nextTaskId: () => number;
+}): Promise<SessionCancellationSettlement> {
+  let sessionDeleted = false;
+  let targetWasActive = false;
+  let projectedRuntime: SessionRuntimeState | null = null;
+  let discardedQueueId: string | null = null;
+
+  input.setState((latest) => {
+    const sessionRecord = input.sessionId == null
+      ? null
+      : (latest.sessionsByWorkspace[input.scopeKey] || []).find(
+          (candidate) => candidate.id === input.sessionId,
+        ) || null;
+    targetWasActive = isSessionRuntimeActive(latest, input.sessionKey);
+    if (!sessionRecord) {
+      sessionDeleted = true;
+      const existingRuntime = latest.runtimeBySessionKey[input.sessionKey];
+      discardedQueueId = (
+        targetWasActive
+          ? latest.queuedUserMessage
+          : existingRuntime?.queuedUserMessage
+      )?.id || null;
+      const runtimeBySessionKey = { ...latest.runtimeBySessionKey };
+      delete runtimeBySessionKey[input.sessionKey];
+      return {
+        runtimeBySessionKey,
+        ...(targetWasActive
+          ? {
+              currentSessionId: null,
+              queuedUserMessage: null,
+              input: "",
+              contextMentions: [],
+              attachedFiles: [],
+            }
+          : {}),
+      };
+    }
+
+    let ownerRuntime = targetWasActive
+      ? createSessionRuntimeFromState(latest)
+      : latest.runtimeBySessionKey[input.sessionKey];
+    if (!ownerRuntime && sessionRecord.runtimeSnapshot) {
+      const restoredSnapshot = normalizeSessionRuntimeSnapshot(
+        sessionRecord.runtimeSnapshot,
+        {
+          restoreInterruptedGoal: true,
+          workspacePath: input.scopeKey,
+        },
+      );
+      ownerRuntime = createSessionRuntimeFromState({
+        ...latest,
+        ...restoredSnapshot,
+      });
+    }
+    if (!ownerRuntime) return {};
+
+    const scopedState = (targetWasActive
+      ? latest
+      : {
+          ...latest,
+          ...ownerRuntime,
+          runtimeEvents: ownerRuntime.runtimeEvents || [],
+        }) as AppState;
+    const projection = projectCanceledTurn({
+      state: scopedState,
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      reason: input.reason,
+      message: input.message,
+      nextTaskId: input.nextTaskId,
+    });
+    let projectedState = projection.state;
+    if (
+      projection.disposition === "already_closed" &&
+      !hasTurnTerminalConclusion(projectedState, input.sessionKey, input.turnId)
+    ) {
+      projectedState = ensureCanceledTurnVisibleConclusion({
+        state: projectedState,
+        turnId: input.turnId,
+        message: input.message,
+        nextTaskId: input.nextTaskId,
+      });
+    }
+    if (
+      projection.harnessRunMarker &&
+      projection.harnessRunMarker !== scopedState.harnessRunMarker
+    ) {
+      settleCanceledTurnHarnessProjection(
+        projection.harnessRunMarker,
+        scopedState.harnessRunMarker || null,
+      );
+    }
+    projectedRuntime = createSessionRuntimeFromState(projectedState);
+    return {
+      runtimeBySessionKey: {
+        ...latest.runtimeBySessionKey,
+        [input.sessionKey]: projectedRuntime,
+      },
+    };
+  });
+
+  if (sessionDeleted) {
+    logStoreEvent("canceled_turn_reconciliation_session_deleted", {
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      discardedQueueId,
+    });
+    return {
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      terminalSettled: false,
+      disposition: "session_deleted",
+      queueDisposition: "discard",
+    };
+  }
+  if (!projectedRuntime) {
+    return {
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      terminalSettled: false,
+      disposition: "latest_runtime_missing",
+    };
+  }
+  if (targetWasActive) {
+    input.setState(pickSessionRuntimePatch(projectedRuntime));
+  }
+  const latest = input.getState();
+  const latestRuntime = isSessionRuntimeActive(latest, input.sessionKey)
+    ? createSessionRuntimeFromState(latest)
+    : latest.runtimeBySessionKey[input.sessionKey];
+  const terminalSettled = !!latestRuntime && hasTurnTerminalConclusion(
+    {
+      runtimeEvents: latestRuntime.runtimeEvents || [],
+      taskFlow: latestRuntime.taskFlow,
+    },
+    input.sessionKey,
+    input.turnId,
+  );
+  logStoreEvent("canceled_turn_reconciled_memory_terminal", {
+    sessionKey: input.sessionKey,
+    turnId: input.turnId,
+    terminalSettled,
+  });
+  return {
+    sessionKey: input.sessionKey,
+    turnId: input.turnId,
+    terminalSettled,
+    disposition: terminalSettled
+      ? "reconciled_memory_terminal"
+      : "memory_terminal_verification_failed",
+  };
+}
+
+function buildHistoryClearRevokedRuntime(
+  runtime: SessionRuntimeState,
+  pauseReason: string,
+  now = Date.now(),
+  preserveQueuedUserMessage = false,
+): SessionRuntimeState {
+  const activeGoal = runtime.activeGoal
+    ? { ...runtime.activeGoal, status: "paused" as const, updatedAt: now }
+    : null;
+  const goalProgress = runtime.goalProgress
+    ? {
+        ...runtime.goalProgress,
+        pauseReason,
+        lastUpdatedAt: now,
+        ...(runtime.goalProgress.usage
+          ? { usage: { ...runtime.goalProgress.usage, activeStartedAt: null } }
+          : {}),
+      }
+    : null;
+  const goalRuntime = runtime.goalRuntime
+    ? {
+        ...runtime.goalRuntime,
+        goal: activeGoal || {
+          ...runtime.goalRuntime.goal,
+          status: "paused" as const,
+          updatedAt: now,
+        },
+        progress: goalProgress || runtime.goalRuntime.progress,
+        status: "paused" as const,
+        phase: "re_plan" as const,
+        pauseReason,
+        updatedAt: now,
+      }
+    : null;
+  return {
+    ...runtime,
+    currentTurnState: createDefaultCurrentTurnState(),
+    isGenerating: false,
+    agentStatus: "idle",
+    abortController: null,
+    harnessRunMarker: null,
+    pendingRunDecision: null,
+    pendingRunDecisionResolver: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    activeActionRequest: null,
+    pendingToolCall: null,
+    pendingPlanApprovalHandoff: null,
+    planApprovalExecutionStartedForTurnId: null,
+    queuedUserMessage: preserveQueuedUserMessage ? runtime.queuedUserMessage : null,
+    activeGuidance: null,
+    currentTurnExecutionConsent: { turnId: null, granted: false },
+    normalizedStreamState: defaultNormalizedStreamState,
+    activeGoal,
+    goalProgress,
+    goalStatus: "paused",
+    goalRuntime,
+  };
+}
+
+function buildHistoryClearFailedTerminalRuntime(input: {
+  runtime: SessionRuntimeState;
+  sessionKey: string;
+  message: string;
+  nextTaskId: () => number;
+  now: number;
+}): SessionRuntimeState {
+  const currentTurnId = input.runtime.currentTurnId;
+  const currentTurn = currentTurnId
+    ? input.runtime.conversationTurns.find((turn) => turn.id === currentTurnId) || null
+    : null;
+  const legacyTerminal = !!currentTurn && (
+    currentTurn.status === "done" ||
+    currentTurn.status === "completed_with_changes" ||
+    currentTurn.status === "stopped_no_action" ||
+    currentTurn.status === "stopped_no_output" ||
+    currentTurn.status === "error"
+  );
+  if (!currentTurnId || !currentTurn || legacyTerminal || isConversationTurnRuntimeClosed(currentTurn.runtimeOutcome)) {
+    return buildHistoryClearRevokedRuntime(input.runtime, input.message, input.now, true);
+  }
+  const cancelableRuntime: SessionRuntimeState & { runtimeEvents: MainThreadEvent[] } = {
+    ...input.runtime,
+    runtimeEvents: input.runtime.runtimeEvents || [],
+  };
+  const projection = projectCanceledTurn<SessionRuntimeState & { runtimeEvents: MainThreadEvent[] }>({
+    state: cancelableRuntime,
+    sessionKey: input.sessionKey,
+    turnId: currentTurnId,
+    reason: "workspace_history_clear_failed_runtime_revoked",
+    message: input.message,
+    nextTaskId: input.nextTaskId,
+    nowMs: input.now,
+  });
+  return buildHistoryClearRevokedRuntime(
+    createSessionRuntimeFromState(projection.state),
+    input.message,
+    input.now,
+    true,
+  );
+}
+
 function getClosedSessionPanelPatch(): Partial<AppState> {
   return {
     showPlanPanel: false,
@@ -2925,6 +3440,117 @@ export function syncTaskIdCounterFromBlocks(blocks: TaskBlock[]): void {
 let workspaceTreeCache: string = "";
 let workspaceTreeCacheKey: string = "";
 let workspaceTreeCacheVersion = -1;
+const scheduledWorkspaceClearSubmissionReplays = new Set<string>();
+const workspaceClearSubmissionReplayAttempts = new Map<string, {
+  workspaceKey: string;
+  attempt: number;
+}>();
+const workspaceClearSubmissionReplayNotReady = new Set<string>();
+const workspaceClearSubmissionReplayReadySessionKeys = new Map<string, string | null>();
+const workspaceClearTransactions = new Map<string, Promise<void>>();
+const invalidatedWorkspaceClearTransactions = new WeakSet<Promise<void>>();
+const WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS = 3;
+
+function discardWorkspaceClearSubmissionReplayState(workspaceKeyInput: string): void {
+  const workspaceKey = resolveSessionWorkspaceKey(workspaceKeyInput);
+  scheduledWorkspaceClearSubmissionReplays.delete(workspaceKey);
+  workspaceClearSubmissionReplayNotReady.delete(workspaceKey);
+  workspaceClearSubmissionReplayReadySessionKeys.delete(workspaceKey);
+  for (const [submissionId, entry] of workspaceClearSubmissionReplayAttempts) {
+    if (entry.workspaceKey === workspaceKey) {
+      workspaceClearSubmissionReplayAttempts.delete(submissionId);
+    }
+  }
+}
+
+function invalidateWorkspaceClearTransaction(workspaceKeyInput: string): void {
+  const workspaceKey = resolveSessionWorkspaceKey(workspaceKeyInput);
+  const transaction = workspaceClearTransactions.get(workspaceKey);
+  if (!transaction) return;
+  invalidatedWorkspaceClearTransactions.add(transaction);
+  if (workspaceClearTransactions.get(workspaceKey) === transaction) {
+    workspaceClearTransactions.delete(workspaceKey);
+  }
+}
+
+function scheduleWorkspaceClearSubmissionReplay(workspaceKeyInput: string): void {
+  const workspaceKey = resolveSessionWorkspaceKey(workspaceKeyInput);
+  if (scheduledWorkspaceClearSubmissionReplays.has(workspaceKey)) return;
+  scheduledWorkspaceClearSubmissionReplays.add(workspaceKey);
+  setTimeout(() => {
+    scheduledWorkspaceClearSubmissionReplays.delete(workspaceKey);
+    if (workspaceClearSubmissionReplayNotReady.has(workspaceKey)) return;
+    const latest = useAppStore.getState();
+    if (resolveSessionWorkspaceKey(latest.currentWorkspace) !== workspaceKey) return;
+    const activeSessionKey = resolveSessionRuntimeKey(workspaceKey, latest.currentSessionId);
+    if (
+      !workspaceClearSubmissionReplayReadySessionKeys.has(workspaceKey) ||
+      workspaceClearSubmissionReplayReadySessionKeys.get(workspaceKey) !== activeSessionKey
+    ) {
+      return;
+    }
+    const queued = peekSettledWorkspaceClearSubmission(workspaceKey);
+    if (
+      queued?.outcome === "preserved" &&
+      queued.targetSessionKey &&
+      queued.targetSessionKey === activeSessionKey &&
+      latest.runtimeBySessionKey[queued.targetSessionKey]
+    ) {
+      // A Session activation may begin an async disk restore in App.tsx. The
+      // clear failure path already owns a complete terminal in-memory runtime;
+      // publish that exact snapshot before replay instead of racing disk I/O.
+      latest.restoreRuntimeForSession(queued.targetSessionKey, {
+        resetPanels: true,
+      });
+    }
+    const pending = takeSettledWorkspaceClearSubmission({
+      workspaceKey,
+      activeSessionKey,
+    });
+    if (!pending) return;
+    let started = false;
+    try {
+      started = pending.replay(pending.outcome) === true;
+    } catch (error) {
+      logStoreEvent("workspace_clear_submission_replay_failed", {
+        workspaceKey,
+        submissionId: pending.id,
+        outcome: pending.outcome,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (!started) {
+      const retained = restoreSettledWorkspaceClearSubmission(pending);
+      const attempt = (workspaceClearSubmissionReplayAttempts.get(pending.id)?.attempt || 0) + 1;
+      if (retained) {
+        workspaceClearSubmissionReplayAttempts.set(pending.id, { workspaceKey, attempt });
+      }
+      else workspaceClearSubmissionReplayAttempts.delete(pending.id);
+      logStoreEvent("workspace_clear_submission_replay_retained", {
+        workspaceKey,
+        submissionId: pending.id,
+        outcome: pending.outcome,
+        retained,
+        attempt,
+        maxAutoReplays: WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS,
+      });
+      if (retained && attempt < WORKSPACE_CLEAR_SUBMISSION_MAX_AUTO_REPLAYS) {
+        setTimeout(
+          () => scheduleWorkspaceClearSubmissionReplay(workspaceKey),
+          attempt * 75,
+        );
+      }
+      return;
+    }
+    workspaceClearSubmissionReplayAttempts.delete(pending.id);
+    logStoreEvent("workspace_clear_submission_replayed", {
+      workspaceKey,
+      submissionId: pending.id,
+      outcome: pending.outcome,
+      targetSessionKey: pending.targetSessionKey,
+    });
+  }, 0);
+}
 
 function invalidateWorkspaceTreeCache(): void {
   workspaceTreeCache = "";
@@ -3988,6 +4614,171 @@ export const useAppStore = create<AppState>()(
     set((s) => ({ messages: s.messages.map((m) => (m.id === id ? { ...m, ...patch } : m)) })),
   clearMessages: () => set({ messages: [] }),
   setGenerating: (value, ctrl = null) => set({ isGenerating: value, abortController: ctrl }),
+  closeTurnAsCanceled: (turnId, options) => {
+    const current = get();
+    const turn = current.conversationTurns.find((candidate) => candidate.id === turnId);
+    if (!turn) return false;
+    const language = current.config.language === "en" ? "en" : "zh";
+    const reason = String(options?.reason || "user_cancelled").trim() || "user_cancelled";
+    const message = String(options?.message || "").trim() || (
+      language === "en"
+        ? "This turn was canceled by the user and is now closed."
+        : "用户已取消，本回合已完成收口。"
+    );
+    const scopeKey = resolveSessionWorkspaceKey(current.currentWorkspace);
+    const sessionKey = resolveSessionRuntimeKey(scopeKey, current.currentSessionId);
+    if (!sessionKey) return false;
+    const pendingCancellation = getPendingSessionCancellation(sessionKey);
+    if (pendingCancellation) {
+      logStoreEvent("canceled_turn_transaction_already_pending", {
+        sessionKey,
+        requestedTurnId: turnId,
+        pendingTurnId: pendingCancellation.turnId,
+      });
+      return true;
+    }
+    const ownedActionRequest = current.activeActionRequest?.sessionKey === sessionKey &&
+      current.activeActionRequest.turnId === turnId
+        ? current.activeActionRequest
+        : null;
+    const ownedMarker = current.harnessRunMarker?.sessionKey === sessionKey &&
+      current.harnessRunMarker.turnId === turnId
+        ? current.harnessRunMarker
+        : null;
+    const ownerRunId = ownedActionRequest?.runId || getHarnessActionRunId(ownedMarker);
+    const ownerParentRunId = ownedActionRequest?.parentRunId || ownedMarker?.parentRunId || null;
+    const {
+      sessionGet,
+      sessionSet,
+      getSessionRevisionToken,
+      publishOwnerScopedRuntimeProjection,
+    } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
+      get,
+      set,
+      runSessionKey: sessionKey,
+      createRuntimeFromState: createSessionRuntimeFromState,
+      pickRuntimePatch: pickSessionRuntimePatch,
+      normalizePatch: (patch) =>
+        normalizeTaskFlowPatchForConsumedReplyOptions(patch as Record<string, unknown>),
+      derivePlanStageFromArtifacts,
+      createDefaultCurrentTurnState,
+      logStoreEvent,
+    });
+
+    const cancellationStart = beginSessionCancellation(sessionKey, turnId, async () => {
+      const result = await commitCanceledTurn({
+        sessionKey,
+        scopeKey,
+        sessionId: current.currentSessionId,
+        turnId,
+        runId: ownerRunId,
+        parentRunId: ownerParentRunId,
+        reason,
+        message,
+        nextTaskId: () => get()._nextTaskId(),
+        sessionGet,
+        getSessionRevisionToken,
+        persistProjection: (projectedState) => persistSubmitRuntimeProjection({
+          state: projectedState,
+          scopeKey,
+          sessionId: current.currentSessionId,
+          sanitizeTaskBlocksForPersist,
+          buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
+          persistSessionRecord: saveProjectSession,
+          nowMs,
+        }),
+        publishProjection: publishOwnerScopedRuntimeProjection,
+        persistHarnessMarker: settleCanceledTurnHarnessProjection,
+        log: logStoreEvent,
+        nowMs,
+      });
+      const settledState = sessionGet();
+      const hasExistingTerminal = settledState.runtimeEvents.some((event) =>
+        isTerminalTurnEvent(event) &&
+        event.threadId === sessionKey &&
+        event.turnId === turnId
+      );
+      const hasVisibleFinal = settledState.taskFlow.some((block) =>
+        block.type === "agent" &&
+        block.turnId === turnId &&
+        block.visibility === "assistant_final"
+      );
+      const terminalSettled = result.disposition === "already_closed"
+        ? hasExistingTerminal && hasVisibleFinal
+        : hasCanceledTurnTerminalProjection({
+            sessionKey,
+            turnId,
+            runtimeEvents: settledState.runtimeEvents,
+            taskFlow: settledState.taskFlow,
+          });
+      logStoreEvent("canceled_turn_transaction_settled", {
+        sessionKey,
+        turnId,
+        runId: result.cancellationRunId,
+        committed: result.committed,
+        disposition: result.disposition,
+        attempts: result.attempts,
+        terminalSettled,
+      });
+      return {
+        sessionKey,
+        turnId,
+        terminalSettled,
+        disposition: result.disposition,
+      };
+    }, {
+      maxReconciliationAttempts: 2,
+      reconcile: async ({ attempt, previousSettlement, error }) => {
+        logStoreEvent("canceled_turn_reconciliation_started", {
+          sessionKey,
+          turnId,
+          attempt,
+          previousDisposition: previousSettlement?.disposition || null,
+          error: error instanceof Error ? error.message : error ? String(error) : null,
+        });
+        return reconcileCanceledTurnWithLatestRuntime({
+          getState: get,
+          setState: set,
+          sessionKey,
+          scopeKey,
+          sessionId: current.currentSessionId,
+          turnId,
+          reason,
+          message,
+          nextTaskId: () => get()._nextTaskId(),
+        });
+      },
+    });
+    if (!cancellationStart.started) return true;
+
+    // The fence above must exist before revoking any transient control-plane
+    // capability. Keep the Turn visibly running/paused until commitCanceledTurn
+    // has durably persisted (or explicitly selected memory fallback) and the
+    // owner-scoped terminal projection publishes idle with the conclusion.
+    sessionSet((state) => {
+      const action = state.activeActionRequest;
+      const ownsAction = !!action &&
+        action.sessionKey === sessionKey &&
+        action.turnId === turnId &&
+        (!ownerRunId || action.runId === ownerRunId);
+      const ownsCurrentExecution = state.currentTurnId === turnId && (
+        !ownerRunId ||
+        getHarnessActionRunId(state.harnessRunMarker) === ownerRunId ||
+        ownsAction
+      );
+      return {
+        ...(ownsAction ? { activeActionRequest: null } : {}),
+        ...(ownsAction || ownsCurrentExecution
+          ? {
+              pendingReviewResolve: null,
+              pendingReviewTaskId: null,
+              pendingToolCall: null,
+            }
+          : {}),
+      };
+    });
+    return true;
+  },
   stopGeneration: () => {
     const currentTurnId = get().currentTurnId;
     if (get().selectedMainModeKey === "image_studio" || get().imageStudio.activeStreamId) {
@@ -3995,9 +4786,6 @@ export const useAppStore = create<AppState>()(
       activeImageStudioStreamCleanup = null;
       void cancelImageStudioJob().catch(() => {});
       set((s) => ({
-        isGenerating: false,
-        abortController: null,
-        agentStatus: "idle",
         imageStudio: {
           ...s.imageStudio,
           activeJobId: null,
@@ -4016,27 +4804,15 @@ export const useAppStore = create<AppState>()(
               }
             : block,
         ),
-        conversationTurns: currentTurnId
-          ? s.conversationTurns.map((turn) =>
-              turn.id === currentTurnId
-                ? {
-                    ...turn,
-                    status: "stopped_no_action" as const,
-                    elapsedTime: Math.max(
-                      0,
-                      Number(turn.elapsedTime) || 0,
-                      Number(s.elapsedTime) || 0,
-                    ),
-                  }
-                : turn
-            )
-          : s.conversationTurns,
       }));
+      if (currentTurnId) {
+        get().closeTurnAsCanceled(currentTurnId, { reason: "image_generation_cancelled" });
+      } else {
+        set({ isGenerating: false, abortController: null, agentStatus: "idle" });
+      }
       return;
     }
     get().abortController?.abort();
-    invoke("cancel_proxy_request").catch(() => {});
-    invoke("cancel_chat_stream").catch(() => {});
     const currentStatus = get().agentStatus;
     const clearCurrentTurnOptions = () => {
       if (!currentTurnId) return;
@@ -4048,14 +4824,12 @@ export const useAppStore = create<AppState>()(
         ),
       }));
     };
-    // Preserve pending_review so the plan panel stays visible
-    if (currentStatus === "pending_review") {
-      set({ isGenerating: false, abortController: null });
-      if (currentTurnId) {
-        get().setConversationTurnStatus(currentTurnId, "awaiting_approval");
-      }
+    clearCurrentTurnOptions();
+    if (currentTurnId) {
+      get().closeTurnAsCanceled(currentTurnId, {
+        reason: currentStatus === "pending_review" ? "review_cancelled" : "user_cancelled",
+      });
     } else {
-      clearCurrentTurnOptions();
       set({
         isGenerating: false,
         abortController: null,
@@ -4063,9 +4837,6 @@ export const useAppStore = create<AppState>()(
         pendingRunDecision: null,
         pendingRunDecisionResolver: null,
       });
-      if (currentTurnId) {
-        get().setConversationTurnStatus(currentTurnId, "stopped_no_action");
-      }
     }
   },
 
@@ -5185,9 +5956,71 @@ export const useAppStore = create<AppState>()(
         ),
       }));
     };
-    const finishTurn = (status: ConversationTurnStatus, summary: string) => {
+    const finishTurn = (resultKind: "success" | "error", summary: string) => {
       const isWebFallback = !isLocalImageStudioProvider(get().imageStudio.config);
-      set((s) => ({
+      const timestampMs = Date.now();
+      const runId = `run-image-${turnId}`;
+      set((s) => {
+        if (s.runtimeEvents.some((event) =>
+          isTerminalTurnEvent(event) && event.threadId === runSessionKey && event.turnId === turnId
+        )) return {};
+        const existingFinal = [...s.taskFlow].reverse().find((block) =>
+          block.turnId === turnId && block.type === "agent" && block.visibility === "assistant_final"
+        );
+        const finalBlockId = existingFinal?.id ?? s._nextTaskId();
+        let foundFinal = false;
+        let taskFlow = s.taskFlow.map((block) => {
+          if (block.id !== finalBlockId || block.type !== "agent") return block;
+          foundFinal = true;
+          return {
+            ...block,
+            content: summary,
+            streaming: false,
+            hiddenProcess: false,
+            visibility: "assistant_final" as const,
+          };
+        });
+        if (!foundFinal) {
+          taskFlow = [...taskFlow, {
+            id: finalBlockId,
+            turnId,
+            type: "agent" as const,
+            content: summary,
+            streaming: false,
+            visibility: "assistant_final" as const,
+          }];
+        }
+        let runtimeEvents = s.runtimeEvents;
+        if (!runtimeEvents.some((event) =>
+          event.type === "run.started" && event.threadId === runSessionKey && event.turnId === turnId && event.runId === runId
+        )) {
+          runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+            type: "run.started",
+            threadId: runSessionKey,
+            turnId,
+            timestampMs,
+            runId,
+            parentRunId: null,
+          }));
+        }
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "run.completed",
+          threadId: runSessionKey,
+          turnId,
+          timestampMs,
+          runId,
+          parentRunId: null,
+          resultKind,
+          summary,
+        }));
+        runtimeEvents = appendRuntimeEvent(runtimeEvents, withEventSchema({
+          type: "turn.completed",
+          threadId: runSessionKey,
+          turnId,
+          timestampMs,
+          resultKind,
+        }));
+        return {
         isGenerating: false,
         abortController: null,
         agentStatus: "idle",
@@ -5197,12 +6030,26 @@ export const useAppStore = create<AppState>()(
           activeStreamId: null,
           ...(isWebFallback ? { cooldownUntil: Date.now() + 15000 } : {}),
         },
+        taskFlow,
+        runtimeEvents,
         conversationTurns: s.conversationTurns.map((turn) =>
           turn.id === turnId
             ? {
                 ...turn,
-                status,
+                status: "done" as const,
                 summary,
+                collapsed: false,
+                blockIds: turn.blockIds.includes(finalBlockId)
+                  ? turn.blockIds
+                  : [...turn.blockIds, finalBlockId],
+                runtimeOutcome: {
+                  status: "completed" as const,
+                  reason: resultKind === "error" ? summary : "image_generation_completed",
+                  resultKind,
+                  runId,
+                  parentRunId: null,
+                  updatedAt: timestampMs,
+                },
                 elapsedTime: Math.max(
                   0,
                   Number(turn.elapsedTime) || 0,
@@ -5211,7 +6058,8 @@ export const useAppStore = create<AppState>()(
               }
             : turn
         ),
-      }));
+        };
+      });
       persistSession();
     };
 
@@ -5234,7 +6082,11 @@ export const useAppStore = create<AppState>()(
               message: language === "en" ? "Canceled" : "已取消",
             },
           });
-          finishTurn("stopped_no_action", language === "en" ? "Image generation canceled." : "图片生成已取消。");
+          get().closeTurnAsCanceled(turnId, {
+            reason: "image_generation_cancelled",
+            message: language === "en" ? "Image generation was canceled; this turn is now closed." : "图片生成已取消，本回合已完成收口。",
+          });
+          persistSession();
           return;
         }
 
@@ -5292,7 +6144,7 @@ export const useAppStore = create<AppState>()(
             message: language === "en" ? "Done" : "已完成",
           },
         });
-        finishTurn("done", language === "en" ? "Image generated." : "图片已生成。");
+        finishTurn("success", language === "en" ? "Image generated." : "图片已生成。");
       };
 
       try {
@@ -5784,6 +6636,9 @@ export const useAppStore = create<AppState>()(
   removeWorkspaceEntry: (path: string) => {
     const normalizedPath = path.trim();
     if (!normalizedPath) return;
+    invalidateWorkspaceClearTransaction(normalizedPath);
+    discardWorkspaceClearSubmissionState(normalizedPath, "workspace_removed");
+    discardWorkspaceClearSubmissionReplayState(normalizedPath);
     set((s) => ({
       workspaces: s.workspaces.filter((entry) => entry.path !== normalizedPath),
       activeSessionByWorkspace: Object.fromEntries(
@@ -5827,6 +6682,22 @@ export const useAppStore = create<AppState>()(
     });
     return true;
   },
+  markWorkspaceClearSubmissionReplayReady: (workspacePath, sessionId) => {
+    const workspaceKey = resolveSessionWorkspaceKey(workspacePath);
+    const state = get();
+    if (
+      resolveSessionWorkspaceKey(state.currentWorkspace) !== workspaceKey ||
+      state.currentSessionId !== sessionId
+    ) {
+      return false;
+    }
+    workspaceClearSubmissionReplayReadySessionKeys.set(
+      workspaceKey,
+      resolveSessionRuntimeKey(workspaceKey, sessionId),
+    );
+    scheduleWorkspaceClearSubmissionReplay(workspaceKey);
+    return true;
+  },
   updateRuntimeForSession: (sessionKey, patchOrUpdater) => {
     if (!sessionKey) return;
     set((s) => {
@@ -5850,6 +6721,8 @@ export const useAppStore = create<AppState>()(
     invalidateWorkspaceTreeCache();
     const normalizedPath = path.trim();
     if (!normalizedPath) {
+      workspaceClearSubmissionReplayNotReady.add(GLOBAL_CHAT_KEY);
+      workspaceClearSubmissionReplayReadySessionKeys.delete(GLOBAL_CHAT_KEY);
       set((s) => ({
         activeSessionByWorkspace: {
           ...s.activeSessionByWorkspace,
@@ -5870,9 +6743,15 @@ export const useAppStore = create<AppState>()(
         activeGuidance: null,
         showWorkspaceTreePanel: false,
       }));
-      void get().refreshInstructionAndHookState();
+      void get().refreshInstructionAndHookState()
+        .finally(() => {
+          workspaceClearSubmissionReplayNotReady.delete(GLOBAL_CHAT_KEY);
+          scheduleWorkspaceClearSubmissionReplay(GLOBAL_CHAT_KEY);
+        });
       return;
     }
+    workspaceClearSubmissionReplayNotReady.add(resolveSessionWorkspaceKey(normalizedPath));
+    workspaceClearSubmissionReplayReadySessionKeys.delete(resolveSessionWorkspaceKey(normalizedPath));
     set((s) => {
       const updated = { ...s.sessionsByWorkspace };
       if (!updated[normalizedPath]) {
@@ -5940,7 +6819,12 @@ export const useAppStore = create<AppState>()(
           config: { ...s.config, workspace: stablePath },
         }));
         invalidateWorkspaceTreeCache();
-        return get().refreshInstructionAndHookState();
+        return get().refreshInstructionAndHookState()
+          .finally(() => {
+            workspaceClearSubmissionReplayNotReady.delete(resolveSessionWorkspaceKey(normalizedPath));
+            workspaceClearSubmissionReplayNotReady.delete(resolveSessionWorkspaceKey(stablePath));
+            scheduleWorkspaceClearSubmissionReplay(stablePath);
+          });
       })
       .catch(() => {});
   },
@@ -5963,6 +6847,43 @@ export const useAppStore = create<AppState>()(
   },
 
   removeSession: (workspacePath: string, sessionId: number, options: { nextSessionId?: number | null } = {}) => {
+    const sessionKey = resolveSessionRuntimeKey(workspacePath, sessionId);
+    const current = get();
+    const activeSessionKey = resolveSessionRuntimeKey(
+      resolveSessionWorkspaceKey(current.currentWorkspace),
+      current.currentSessionId,
+    );
+    const ownedRuntime = sessionKey
+      ? activeSessionKey === sessionKey
+        ? createSessionRuntimeFromState(current)
+        : current.runtimeBySessionKey[sessionKey] || null
+      : null;
+    if (ownedRuntime && sessionKey) {
+      const revocation = revokeSessionRuntimeBeforeDelete({
+        runtime: ownedRuntime,
+        sessionKey,
+        closeHarness: (marker) => !!closeHarnessRunMarkerForSessionDeletion({
+          runId: marker.runId,
+          sessionKey: marker.sessionKey,
+          turnId: marker.turnId!,
+          instanceId: marker.instanceId,
+          startedAt: marker.startedAt,
+        }),
+        onError: (phase, error) => {
+          logStoreEvent("session_delete_runtime_revocation_failed", {
+            sessionKey,
+            phase,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      });
+      logStoreEvent("session_runtime_revoked_before_delete", {
+        sessionKey,
+        turnId: ownedRuntime.currentTurnId,
+        agentStatus: ownedRuntime.agentStatus,
+        ...revocation,
+      });
+    }
     set((s) => {
       const wsSessions = s.sessionsByWorkspace[workspacePath];
       if (!wsSessions) return s;
@@ -5971,7 +6892,6 @@ export const useAppStore = create<AppState>()(
       const nextSessionId = isCurrentSession
         ? options.nextSessionId ?? filtered[0]?.id ?? null
         : s.currentSessionId;
-      const sessionKey = resolveSessionRuntimeKey(workspacePath, sessionId);
       const runtimeBySessionKey = { ...s.runtimeBySessionKey };
       if (sessionKey) delete runtimeBySessionKey[sessionKey];
       return {
@@ -6037,7 +6957,11 @@ export const useAppStore = create<AppState>()(
     });
   },
 
-  setCurrentSessionId: (id: number | null) =>
+  setCurrentSessionId: (id: number | null) => {
+    const workspaceKey = resolveSessionWorkspaceKey(get().currentWorkspace);
+    if (get().currentSessionId !== id) {
+      workspaceClearSubmissionReplayReadySessionKeys.delete(workspaceKey);
+    }
     set((s) => ({
       currentSessionId: id,
       activeSessionByWorkspace: {
@@ -6051,7 +6975,9 @@ export const useAppStore = create<AppState>()(
       ...(s.currentSessionId !== id ? { approvedLocalFileReadPaths: [] } : {}),
       ...(s.currentSessionId !== id ? { approvedShellPermissionRules: [] } : {}),
       ...(s.currentSessionId !== id ? { queuedUserMessage: null, activeGuidance: null } : {}),
-    })),
+    }));
+    scheduleWorkspaceClearSubmissionReplay(workspaceKey);
+  },
 
   // Task Flow — now starts empty (no more mock data)
   taskFlow: [],
@@ -6209,15 +7135,300 @@ export const useAppStore = create<AppState>()(
   // ── Data Management ──────────────────────────────────────────────────
 
   clearChatHistory: () => {
-    set((s) => {
-      const ws = resolveSessionWorkspaceKey(s.currentWorkspace);
-      const sessionsByWorkspace = { ...s.sessionsByWorkspace };
-      const runtimeBySessionKey = { ...s.runtimeBySessionKey };
-      if (ws) {
-        delete sessionsByWorkspace[ws];
-        Object.keys(runtimeBySessionKey).forEach((key) => {
-          if (key.startsWith(`${ws}:`)) delete runtimeBySessionKey[key];
+    const current = get();
+    const workspaceKey = resolveSessionWorkspaceKey(current.currentWorkspace);
+    const existingTransaction = workspaceClearTransactions.get(workspaceKey);
+    if (existingTransaction) return existingTransaction;
+    let resolveTransaction!: () => void;
+    let rejectTransaction!: (error: unknown) => void;
+    const transaction = new Promise<void>((resolve, reject) => {
+      resolveTransaction = resolve;
+      rejectTransaction = reject;
+    });
+    workspaceClearTransactions.set(workspaceKey, transaction);
+    void (async () => {
+    const workspaceClearBarrierToken = beginWorkspaceClearSubmissionBarrier(workspaceKey);
+    workspaceClearSubmissionReplayReadySessionKeys.delete(workspaceKey);
+    let workspaceClearBarrierOutcome: "cleared" | "preserved" = "preserved";
+    let workspaceClearReplayPublicationReady = false;
+    let workspaceClearBarrierSettled = false;
+    try {
+    const activeSessionKey = resolveSessionRuntimeKey(workspaceKey, current.currentSessionId);
+    const activeRuntime = activeSessionKey ? createSessionRuntimeFromState(current) : null;
+    const ownedRuntimesForRecovery = new Map<string, SessionRuntimeState>();
+    const runtimeSessionPrefix = `${workspaceKey}:`;
+    Object.entries(current.runtimeBySessionKey).forEach(([sessionKey, runtime]) => {
+      if (sessionKey.startsWith(runtimeSessionPrefix)) {
+        ownedRuntimesForRecovery.set(sessionKey, runtime);
+      }
+    });
+    if (activeSessionKey && activeRuntime) {
+      ownedRuntimesForRecovery.set(activeSessionKey, activeRuntime);
+    }
+    const sessionIds = new Set<string>(
+      (current.sessionsByWorkspace[workspaceKey] || []).map((session) => String(session.id)),
+    );
+    if (current.currentSessionId != null) sessionIds.add(String(current.currentSessionId));
+    Object.keys(current.runtimeBySessionKey).forEach((sessionKey) => {
+      if (sessionKey.startsWith(runtimeSessionPrefix)) {
+        const sessionId = sessionKey.slice(runtimeSessionPrefix.length);
+        if (sessionId) sessionIds.add(sessionId);
+      }
+    });
+
+    const revocations = revokeWorkspaceSessionRuntimesBeforeClear({
+      workspaceKey,
+      activeSessionKey,
+      activeRuntime,
+      runtimeBySessionKey: current.runtimeBySessionKey,
+      closeHarness: (marker) => !!closeHarnessRunMarkerForSessionDeletion({
+        runId: marker.runId,
+        sessionKey: marker.sessionKey,
+        turnId: marker.turnId!,
+        instanceId: marker.instanceId,
+        startedAt: marker.startedAt,
+      }),
+      onError: (sessionKey, phase, error) => {
+        logStoreEvent("workspace_history_runtime_revocation_failed", {
+          workspaceKey,
+          sessionKey,
+          phase,
+          error: error instanceof Error ? error.message : String(error),
         });
+      },
+    });
+    revocations.forEach((revocation) => {
+      logStoreEvent("workspace_history_runtime_revoked", {
+        workspaceKey,
+        ...revocation,
+      });
+    });
+
+    const pendingSummary = current.config.language === "en"
+      ? "History clearing was requested. The previous runtime was revoked before storage mutation."
+      : "已请求清空历史；旧运行已在存储变更前撤销。";
+    set((state) => {
+      const runtimeBySessionKey = { ...state.runtimeBySessionKey };
+      Object.keys(runtimeBySessionKey).forEach((sessionKey) => {
+        if (sessionKey.startsWith(runtimeSessionPrefix)) delete runtimeBySessionKey[sessionKey];
+      });
+      const ownsVisibleSession = resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(state.currentWorkspace),
+        state.currentSessionId,
+      ) === activeSessionKey;
+      if (!ownsVisibleSession) return { runtimeBySessionKey };
+      return {
+        ...buildHistoryClearRevokedRuntime(
+          createSessionRuntimeFromState(state),
+          pendingSummary,
+        ),
+        currentSessionId: null,
+        activeSessionByWorkspace: {
+          ...state.activeSessionByWorkspace,
+          [workspaceKey]: null,
+        },
+        runtimeBySessionKey,
+      };
+    });
+    logStoreEvent("workspace_history_runtime_generation_revoked", {
+      workspaceKey,
+      activeSessionKey,
+      runtimeOwnerCount: ownedRuntimesForRecovery.size,
+    });
+
+    try {
+      await clearProjectSessions(workspaceKey, Array.from(sessionIds));
+    } catch (error) {
+      if (invalidatedWorkspaceClearTransactions.has(transaction)) {
+        logStoreEvent("workspace_history_clear_recovery_skipped_invalidated", {
+          workspaceKey,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+      const failureSummary = current.config.language === "en"
+        ? "History clearing could not be persisted. The Session was preserved, and its revoked turn was canceled and closed. Send a new instruction to continue."
+        : "历史清理未能持久化。Session 已保留，已撤销的回合已取消并收口；可发送新指令继续。";
+      const terminalizedAt = Date.now();
+      const recoveryState = get();
+      const recoverySessions = recoveryState.sessionsByWorkspace[workspaceKey] || [];
+      const terminalRuntimes = new Map<string, SessionRuntimeState>();
+      const terminalSessionRecords = new Map<string, Session>();
+      let memoryFallbackCount = 0;
+
+      ownedRuntimesForRecovery.forEach((runtime, sessionKey) => {
+        const terminalRuntime = createSessionRuntimeFromState(
+          buildHistoryClearFailedTerminalRuntime({
+            runtime: createSessionRuntimeFromState(runtime),
+            sessionKey,
+            message: failureSummary,
+            nextTaskId: get()._nextTaskId,
+            now: terminalizedAt,
+          }),
+        );
+        terminalRuntimes.set(sessionKey, terminalRuntime);
+        const ownerSessionId = sessionKey.startsWith(runtimeSessionPrefix)
+          ? sessionKey.slice(runtimeSessionPrefix.length)
+          : "";
+        const ownerSession = recoverySessions.find(
+          (session) => String(session.id) === ownerSessionId,
+        );
+        if (!ownerSession) {
+          memoryFallbackCount += 1;
+          logStoreEvent("workspace_history_terminal_snapshot_memory_fallback", {
+            workspaceKey,
+            sessionKey,
+            sessionId: ownerSessionId || null,
+            reason: "session_record_missing",
+          });
+          return;
+        }
+        const updatedAt = new Date(terminalizedAt).toISOString();
+        terminalSessionRecords.set(sessionKey, {
+          ...ownerSession,
+          messages: sanitizeTaskBlocksForPersist(terminalRuntime.taskFlow || []),
+          runtimeSnapshot: buildSessionRuntimeSnapshotFromStoreState({
+            ...recoveryState,
+            ...terminalRuntime,
+            currentWorkspace: workspaceKey,
+            currentSessionId: ownerSession.id,
+          }),
+          updatedAt,
+          updatedAtMs: terminalizedAt,
+        });
+      });
+
+      // Keep the Session invisible until every affected owner has had a chance
+      // to durably record its terminal Turn projection. A failed owner save is
+      // an explicit memory fallback, never a reason to republish an open Turn.
+      for (const [sessionKey, terminalSession] of terminalSessionRecords) {
+        if (invalidatedWorkspaceClearTransactions.has(transaction)) break;
+        try {
+          const saved = await saveProjectSession(workspaceKey, terminalSession);
+          if (saved && typeof saved === "object") {
+            terminalSessionRecords.set(sessionKey, {
+              ...terminalSession,
+              ...(saved as Partial<Session>),
+              id: terminalSession.id,
+              messages: terminalSession.messages,
+              runtimeSnapshot: terminalSession.runtimeSnapshot,
+            });
+          }
+          logStoreEvent("workspace_history_terminal_snapshot_persisted", {
+            workspaceKey,
+            sessionKey,
+            sessionId: terminalSession.id,
+          });
+        } catch (saveError) {
+          memoryFallbackCount += 1;
+          logStoreEvent("workspace_history_terminal_snapshot_memory_fallback", {
+            workspaceKey,
+            sessionKey,
+            sessionId: terminalSession.id,
+            reason: "session_save_failed",
+            error: saveError instanceof Error ? saveError.message : String(saveError),
+          });
+        }
+      }
+
+      if (invalidatedWorkspaceClearTransactions.has(transaction)) {
+        logStoreEvent("workspace_history_clear_recovery_skipped_invalidated", {
+          workspaceKey,
+          phase: "after_terminal_persistence",
+          error: error instanceof Error ? error.message : String(error),
+        });
+        throw error;
+      }
+
+      set((state) => {
+        const workspaceSessions = state.sessionsByWorkspace[workspaceKey] || [];
+        const survivingSessionIds = new Set(workspaceSessions.map((session) => String(session.id)));
+        const runtimeBySessionKey = { ...state.runtimeBySessionKey };
+        terminalRuntimes.forEach((runtime, sessionKey) => {
+          const ownerSessionId = sessionKey.startsWith(runtimeSessionPrefix)
+            ? sessionKey.slice(runtimeSessionPrefix.length)
+            : "";
+          if (!survivingSessionIds.has(ownerSessionId)) return;
+          runtimeBySessionKey[sessionKey] = createSessionRuntimeFromState(runtime);
+        });
+        const sessionsByWorkspace = {
+          ...state.sessionsByWorkspace,
+          [workspaceKey]: workspaceSessions.map((session) => {
+            const sessionKey = `${workspaceKey}:${session.id}`;
+            const terminalSession = terminalSessionRecords.get(sessionKey);
+            return terminalSession
+              ? { ...session, ...terminalSession, id: session.id, active: session.active }
+              : session;
+          }),
+        };
+        const visibleRuntime = activeSessionKey && survivingSessionIds.has(String(current.currentSessionId))
+          ? terminalRuntimes.get(activeSessionKey) || null
+          : null;
+        const shouldPublishVisibleRuntime = !!visibleRuntime &&
+          resolveSessionWorkspaceKey(state.currentWorkspace) === workspaceKey &&
+          state.currentSessionId == null;
+        return shouldPublishVisibleRuntime
+          ? { ...visibleRuntime, sessionsByWorkspace, runtimeBySessionKey }
+          : { sessionsByWorkspace, runtimeBySessionKey };
+      });
+      if (activeSessionKey && current.currentSessionId != null) {
+        set((state) => {
+          const sessionStillExists = (state.sessionsByWorkspace[workspaceKey] || []).some(
+            (session) => String(session.id) === String(current.currentSessionId),
+          );
+          if (!sessionStillExists) return {};
+          const shouldRestoreVisibleSession =
+            resolveSessionWorkspaceKey(state.currentWorkspace) === workspaceKey &&
+            state.currentSessionId == null;
+          const shouldRestoreWorkspacePointer = state.activeSessionByWorkspace[workspaceKey] == null;
+          if (!shouldRestoreVisibleSession && !shouldRestoreWorkspacePointer) return {};
+          return {
+            ...(shouldRestoreVisibleSession ? { currentSessionId: current.currentSessionId } : {}),
+            ...(shouldRestoreWorkspacePointer
+              ? {
+                  activeSessionByWorkspace: {
+                    ...state.activeSessionByWorkspace,
+                    [workspaceKey]: current.currentSessionId,
+                  },
+                }
+              : {}),
+          };
+        });
+      }
+      workspaceClearReplayPublicationReady = true;
+      logStoreEvent("workspace_history_clear_failed", {
+        workspaceKey,
+        ownerCount: sessionIds.size,
+        terminalOwnerCount: terminalRuntimes.size,
+        memoryFallbackCount,
+        recovery: "session_preserved_turns_canceled",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      throw error;
+    }
+    if (invalidatedWorkspaceClearTransactions.has(transaction)) {
+      logStoreEvent("workspace_history_clear_publication_skipped_invalidated", {
+        workspaceKey,
+        outcome: "cleared",
+      });
+      return;
+    }
+    // Durable deletion is the monotonic capability boundary. Even if a later
+    // local publication hook throws, no replay may reuse the deleted Session.
+    workspaceClearBarrierOutcome = "cleared";
+
+    set((s) => {
+      const sessionsByWorkspace = { ...s.sessionsByWorkspace };
+      const activeSessionByWorkspace = { ...s.activeSessionByWorkspace };
+      const runtimeBySessionKey = { ...s.runtimeBySessionKey };
+      delete sessionsByWorkspace[workspaceKey];
+      delete activeSessionByWorkspace[workspaceKey];
+      Object.keys(runtimeBySessionKey).forEach((key) => {
+        if (key.startsWith(runtimeSessionPrefix)) delete runtimeBySessionKey[key];
+      });
+      const workspaceStillVisible = resolveSessionWorkspaceKey(s.currentWorkspace) === workspaceKey;
+      if (!workspaceStillVisible) {
+        return { sessionsByWorkspace, activeSessionByWorkspace, runtimeBySessionKey };
       }
       return {
         taskFlow: [],
@@ -6233,8 +7444,17 @@ export const useAppStore = create<AppState>()(
         selectedNexusModeKey: "nexus_general",
         conversationTurns: [],
         currentTurnId: null,
+        currentTurnState: createDefaultCurrentTurnState(),
         pendingRunDecision: null,
         pendingRunDecisionResolver: null,
+        isGenerating: false,
+        agentStatus: "idle",
+        abortController: null,
+        elapsedTime: 0,
+        pendingReviewResolve: null,
+        pendingReviewTaskId: null,
+        activeActionRequest: null,
+        pendingToolCall: null,
         executionConsentPolicy: "ask_per_turn",
         currentTurnExecutionConsent: { turnId: null, granted: false },
         autoApproveTools: false,
@@ -6268,14 +7488,72 @@ export const useAppStore = create<AppState>()(
         instructionLastLoadedAt: null,
         hookLastLoadedAt: null,
         sessionHookCache: [],
+        activeGoal: null,
+        goalProgress: null,
+        goalStatus: "paused",
+        goalIterationBudget: DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
+        goalRuntime: null,
         currentSessionId: null,
         sessionsByWorkspace,
+        activeSessionByWorkspace,
         runtimeBySessionKey,
       };
     });
+    workspaceClearReplayPublicationReady = true;
+    logStoreEvent("workspace_history_cleared", {
+      workspaceKey,
+      ownerCount: sessionIds.size,
+      runtimeOwnerCount: revocations.length,
+    });
+    } finally {
+      if (!workspaceClearBarrierSettled) {
+        workspaceClearBarrierSettled = true;
+        const barrierSettlement = settleWorkspaceClearSubmissionBarrier({
+          token: workspaceClearBarrierToken,
+          outcome: workspaceClearBarrierOutcome,
+        });
+        if (barrierSettlement.settled) {
+          const latest = get();
+          if (
+            workspaceClearReplayPublicationReady &&
+            resolveSessionWorkspaceKey(latest.currentWorkspace) === workspaceKey
+          ) {
+            get().markWorkspaceClearSubmissionReplayReady(
+              workspaceKey,
+              latest.currentSessionId,
+            );
+          }
+          scheduleWorkspaceClearSubmissionReplay(workspaceKey);
+        }
+      }
+    }
+    })().then(
+      () => {
+        if (workspaceClearTransactions.get(workspaceKey) === transaction) {
+          workspaceClearTransactions.delete(workspaceKey);
+        }
+        resolveTransaction();
+      },
+      (error) => {
+        if (workspaceClearTransactions.get(workspaceKey) === transaction) {
+          workspaceClearTransactions.delete(workspaceKey);
+        }
+        rejectTransaction(error);
+      },
+    );
+    return transaction;
   },
 
   resetAllSettings: () => {
+    for (const transaction of workspaceClearTransactions.values()) {
+      invalidatedWorkspaceClearTransactions.add(transaction);
+    }
+    workspaceClearTransactions.clear();
+    discardAllWorkspaceClearSubmissionStateForSettingsReset();
+    scheduledWorkspaceClearSubmissionReplays.clear();
+    workspaceClearSubmissionReplayAttempts.clear();
+    workspaceClearSubmissionReplayNotReady.clear();
+    workspaceClearSubmissionReplayReadySessionKeys.clear();
     set({
       config: defaultConfig,
       skills: defaultSkills,
@@ -6973,6 +8251,17 @@ export const useAppStore = create<AppState>()(
       }
     }
     state.abortController?.abort();
+    const canceledTurnId = state.activeActionRequest?.kind === "plan_review"
+      ? state.activeActionRequest.turnId
+      : state.currentTurnId;
+    if (canceledTurnId) {
+      get().closeTurnAsCanceled(canceledTurnId, {
+        reason: "plan_rejected",
+        message: state.config.language === "en"
+          ? "The plan was rejected by the user; this turn is now closed."
+          : "用户已拒绝计划，本回合已完成收口。",
+      });
+    }
     set({
       isPlanApproved: false,
       planApprovalChoice: null,
@@ -6983,13 +8272,10 @@ export const useAppStore = create<AppState>()(
       planExecutionEvidenceCount: 0,
       planAutoResumeCount: 0,
       planExecutionProgressSnapshot: null,
-      agentStatus: "idle",
-      isGenerating: false,
-      abortController: null,
+      ...(canceledTurnId
+        ? {}
+        : { agentStatus: "idle", isGenerating: false, abortController: null }),
     });
-    if (state.currentTurnId) {
-      get().setConversationTurnStatus(state.currentTurnId, "stopped_no_action");
-    }
     return true;
   },
   rejectPlanAndDeleteFiles: async (expectedIdentity) => {
@@ -7051,7 +8337,15 @@ export const useAppStore = create<AppState>()(
     }));
   },
   pauseGoal: (expectedIdentity) => {
-    const { activeGoal, goalProgress, goalRuntime, isGenerating, abortController, activeActionRequest } = get();
+    const current = get();
+    const {
+      activeGoal,
+      goalProgress,
+      goalRuntime,
+      isGenerating,
+      abortController,
+      activeActionRequest,
+    } = current;
     if (!activeGoal) return;
     const expectedRevision = activeGoal.revision || 1;
     if (expectedIdentity && !isCurrentGoalAdministrativeControl({
@@ -7071,7 +8365,28 @@ export const useAppStore = create<AppState>()(
       return;
     }
     if (activeGoal.status !== "active" && activeGoal.status !== "awaiting_input") return;
-    const nextStatus: GoalStatus = isGenerating ? "pausing" : "paused";
+    const sessionKey = resolveVisibleGoalSubmissionSessionKey(current);
+    const pendingReviewOwnership = resolveGoalPendingReviewOwnership({
+      goal: activeGoal,
+      marker: current.harnessRunMarker,
+      currentWorkspace: resolveSessionWorkspaceKey(current.currentWorkspace),
+      currentSessionKey: sessionKey,
+      agentStatus: current.agentStatus,
+      actionRequest: activeActionRequest,
+      pendingReviewTaskId: current.pendingReviewTaskId,
+      hasPendingReviewResolver: !!current.pendingReviewResolve,
+    });
+    const pauseTransition = resolveGoalPauseTransition({
+      goal: activeGoal,
+      queuedMessage: current.queuedUserMessage,
+      marker: current.harnessRunMarker,
+      currentWorkspace: resolveSessionWorkspaceKey(current.currentWorkspace),
+      currentSessionKey: sessionKey,
+      isGenerating,
+      hasAbortController: !!abortController,
+      hasOwnedPendingReview: pendingReviewOwnership.owned,
+    });
+    const nextStatus: GoalStatus = pauseTransition.nextStatus;
     const nextGoal = { ...activeGoal, status: nextStatus, updatedAt: Date.now() };
     const nextProgress = goalProgress || createGoalProgress(activeGoal.id, "");
     const nextRuntime = {
@@ -7084,20 +8399,12 @@ export const useAppStore = create<AppState>()(
       updatedAt: Date.now(),
     };
     set((state) => {
-      const workspaceKey = resolveSessionWorkspaceKey(state.currentWorkspace);
-      const sessionKey = resolveVisibleGoalSubmissionSessionKey(state);
-      const clearQueuedContinuation = isQueuedGoalContinuationOwnedByGoal({
-        queuedMessage: state.queuedUserMessage,
-        goal: activeGoal,
-        workspaceKey,
-        sessionKey,
-      });
       return {
         activeGoal: nextGoal,
         goalProgress: nextRuntime.progress,
         goalStatus: nextStatus,
         goalRuntime: nextRuntime,
-        ...(clearQueuedContinuation ? { queuedUserMessage: null } : {}),
+        ...(pauseTransition.shouldClearQueuedContinuation ? { queuedUserMessage: null } : {}),
         activeActionRequest: clearGoalConfirmationActionRequest(
           state.activeActionRequest,
           activeGoal.id,
@@ -7120,17 +8427,26 @@ export const useAppStore = create<AppState>()(
         })),
       };
     });
-    abortController?.abort();
+    if (!pauseTransition.shouldAbortRun && isGenerating && abortController) {
+      logStoreEvent("goal_pause_foreign_run_preserved", {
+        goalId: activeGoal.id,
+        goalRevision: expectedRevision,
+        reason: pauseTransition.abortReason,
+        markerRuntimeIntent: current.harnessRunMarker?.runtimeIntent || null,
+        markerSessionKey: current.harnessRunMarker?.sessionKey || null,
+        markerTurnId: current.harnessRunMarker?.turnId || null,
+      });
+    }
+    if (pauseTransition.shouldAbortRun) abortController?.abort();
   },
   resumeGoal: (expectedIdentity) => {
     const {
       activeGoal,
-      goalProgress,
-      goalRuntime,
       goalStatus,
       isGenerating,
       config,
       runtimeEvents,
+      conversationTurns,
       currentTurnId,
       activeActionRequest,
       harnessRunMarker,
@@ -7148,7 +8464,7 @@ export const useAppStore = create<AppState>()(
     }) : false;
     const hasPendingActionRequest = activeActionRequest?.status === "pending";
     if ((expectedIdentity && !exactControlResolution) ||
-      (goalStatus === "awaiting_input" && hasPendingActionRequest && !exactControlResolution)) {
+      (hasPendingActionRequest && !exactControlResolution)) {
       logStoreEvent("goal_resume_identity_mismatch", {
         expectedGoalId: expectedIdentity?.goalId || null,
         activeGoalId: activeGoal.id,
@@ -7164,92 +8480,46 @@ export const useAppStore = create<AppState>()(
       event.type === "goal.started" && event.goalId === activeGoal.id && typeof event.turnId === "string"
     ) as Extract<MainThreadEvent, { type: "goal.started" }> | undefined;
     const eventOwnerTurnId = goalStartedEvent?.turnId;
-    const ownerTurnId = activeGoal.ownerTurnId || eventOwnerTurnId || currentTurnId || null;
-    if (!ownerTurnId) return;
+    const previousOwnerTurnId = activeGoal.ownerTurnId || eventOwnerTurnId || currentTurnId || null;
+    if (!previousOwnerTurnId) return;
     const ownerWorkspaceKey = resolveSessionWorkspaceKey(currentWorkspace);
     const ownerSessionKey = resolveVisibleGoalSubmissionSessionKey({
       currentWorkspace,
       currentSessionId,
     });
-    const resumedGoal = {
-      ...activeGoal,
-      ownerTurnId,
-      status: "active" as const,
-      updatedAt: Date.now(),
-    };
-    const resumedProgress = {
-      ...(goalProgress || createGoalProgress(activeGoal.id, "")),
-      pauseReason: undefined,
-      lastUserConfirmedIteration: goalProgress?.totalIterationsUsed || 0,
-      ...(goalStatus === "blocked"
-        ? {
-            recoveryState: undefined,
-            recoveryAuditStartIteration: goalProgress?.totalIterationsUsed || 0,
-            lastStopReason: undefined,
-            stopClass: undefined,
-          }
-        : {}),
-      usage: {
-        ...(goalProgress?.usage || {
-          modelIterations: 0,
-          toolCalls: 0,
-          totalTokensUsed: goalProgress?.totalTokensUsed || 0,
-          activeDurationMs: 0,
-          activeStartedAt: null,
-          estimatedTokens: true,
-        }),
-        activeStartedAt: Date.now(),
-      },
-    };
-    const resumedRuntime = {
-      ...(goalRuntime || buildGoalRuntimeSnapshot({ goal: resumedGoal, progress: resumedProgress, phase: "re_plan" })),
-      goal: resumedGoal,
-      progress: resumedProgress,
-      status: "active" as const,
-      phase: "re_plan" as const,
-      pauseReason: undefined,
-      updatedAt: Date.now(),
-    };
-    set((state) => ({
-      activeGoal: resumedGoal,
-      goalProgress: resumedProgress,
-      goalStatus: "active",
-      goalRuntime: resumedRuntime,
-      activeActionRequest: clearGoalConfirmationActionRequest(
-        state.activeActionRequest,
-        activeGoal.id,
-        expectedRevision,
-      ),
-      runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
-        type: "goal.state_changed",
-        ...resolveGoalEventOwnerIdentity({
-          goal: resumedGoal,
-          currentWorkspace: state.currentWorkspace,
-          currentSessionId: state.currentSessionId,
-          currentTurnId: ownerTurnId,
-        }),
-        timestampMs: Date.now(),
-        goalId: resumedGoal.id,
-        from: goalStatus,
-        to: "active",
-        phase: "re_plan",
-        reason: "user_resume",
-      })),
-    }));
+    const resumeBoundary = resolveGoalResumeTurnBoundary({
+      ownerTurnId: previousOwnerTurnId,
+      sessionKey: ownerSessionKey,
+      conversationTurns,
+      runtimeEvents,
+    });
+    const resumeTurnId = resumeBoundary.turnId;
+    logStoreEvent("goal_resume_turn_boundary_resolved", {
+      goalId: activeGoal.id,
+      goalRevision: activeGoal.revision || 1,
+      previousOwnerTurnId,
+      resumeTurnId,
+      reuseCurrentTurn: resumeBoundary.reuseCurrentTurn,
+      reason: resumeBoundary.reason,
+    });
     const language = config.language === "en" ? "en" : "zh";
     const resumeText = language === "en"
-      ? `Resume the active goal ${resumedGoal.id} from its latest checkpoint.`
-      : `从最近检查点继续执行当前目标 ${resumedGoal.id}。`;
+      ? `Resume the active goal ${activeGoal.id} from its latest checkpoint.`
+      : `从最近检查点继续执行当前目标 ${activeGoal.id}。`;
     const goalContinuationEnvelope = get().captureGoalContinuationEnvelope(
       resumeText,
-      { source: "goal_manual_resume" },
+      {
+        source: "goal_manual_resume",
+        ...(exactControlResolution && activeActionRequest?.kind === "goal_confirmation"
+          ? { requestId: activeActionRequest.requestId }
+          : {}),
+      },
     );
     if (!goalContinuationEnvelope) {
-      const pausedGoal = { ...resumedGoal, status: "paused" as const };
-      set({
-        activeGoal: pausedGoal,
-        goalStatus: "paused",
-        goalRuntime: { ...resumedRuntime, goal: pausedGoal, status: "paused" },
+      logStoreEvent("goal_resume_authorization_capture_failed", {
+        goalId: activeGoal.id,
+        goalRevision: expectedRevision,
+        ownerSessionKey,
       });
       return;
     }
@@ -7264,10 +8534,11 @@ export const useAppStore = create<AppState>()(
           goalContinuationEnvelope,
           goalContinuationGuidance: resumeText,
           skipIntentResolution: true,
-          reuseCurrentTurn: true,
-          turnIdOverride: ownerTurnId,
+          reuseCurrentTurn: resumeBoundary.reuseCurrentTurn,
+          turnIdOverride: resumeTurnId,
+          parentRunIdOverride: resumeBoundary.parentRunId || undefined,
           preservePlanState: false,
-          createVisibleTurnForHiddenMessage: false,
+          createVisibleTurnForHiddenMessage: resumeBoundary.createVisibleTurnForHiddenMessage,
           submissionOriginSessionKey: ownerSessionKey,
         },
       );
@@ -7280,63 +8551,22 @@ export const useAppStore = create<AppState>()(
         if (!ownerRuntime) return;
         if (isQueuedGoalContinuationOwnedByGoal({
           queuedMessage: ownerRuntime.queuedUserMessage,
-          goal: resumedGoal,
+          goal: activeGoal,
           workspaceKey: ownerWorkspaceKey,
           sessionKey: ownerSessionKey,
           expectedText: resumeText,
           expectedSource: "goal_manual_resume",
         })) {
           logStoreEvent("goal_resume_waiting_in_exact_queue", {
-            goalId: resumedGoal.id,
-            goalRevision: resumedGoal.revision || 1,
+            goalId: activeGoal.id,
+            goalRevision: activeGoal.revision || 1,
             ownerSessionKey,
           });
           return;
         }
-
-        const buildResumeRejectedPatch = (
-          runtime: SessionRuntimeState,
-        ): Partial<SessionRuntimeState> => {
-          const runtimeGoal = runtime.activeGoal;
-          if (
-            runtimeGoal?.id !== resumedGoal.id ||
-            (runtimeGoal.revision || 1) !== (resumedGoal.revision || 1) ||
-            String(runtimeGoal.sessionKey || "").trim() !==
-              String(resumedGoal.sessionKey || "").trim() ||
-            String(runtimeGoal.ownerTurnId || "").trim() !==
-              String(resumedGoal.ownerTurnId || "").trim() ||
-            runtimeGoal.status !== "active"
-          ) {
-            return {};
-          }
-          const pausedGoal = { ...runtimeGoal, status: "paused" as const };
-          const runtimeSnapshot = runtime.goalRuntime;
-          return {
-            activeGoal: pausedGoal,
-            goalStatus: "paused",
-            goalRuntime: runtimeSnapshot &&
-              runtimeSnapshot.goal.id === resumedGoal.id &&
-              (runtimeSnapshot.goal.revision || 1) === (resumedGoal.revision || 1)
-              ? {
-                  ...runtimeSnapshot,
-                  goal: pausedGoal,
-                  status: "paused",
-                  pauseReason: "Unable to acquire a resume run lease",
-                  updatedAt: Date.now(),
-                }
-              : runtimeSnapshot,
-          };
-        };
-        if (activeSessionKey === ownerSessionKey) {
-          set((state) => pickSessionRuntimePatch(
-            buildResumeRejectedPatch(createSessionRuntimeFromState(state)),
-          ));
-        } else {
-          get().updateRuntimeForSession(ownerSessionKey, buildResumeRejectedPatch);
-        }
         logStoreEvent("goal_resume_submission_rejected", {
-          goalId: resumedGoal.id,
-          goalRevision: resumedGoal.revision || 1,
+          goalId: activeGoal.id,
+          goalRevision: activeGoal.revision || 1,
           ownerSessionKey,
           activeSessionKey,
         });
@@ -7713,21 +8943,41 @@ export const useAppStore = create<AppState>()(
     });
     const buildClearedOwnerRuntime = (runtime: SessionRuntimeState): SessionRuntimeState => {
       const runtimeOwnedActionRequest = resolveOwnedGoalActionRequest(runtime);
-      const runtimeOwnedGoalUserChoice = runtimeOwnedActionRequest?.kind === "user_choice"
-        ? runtimeOwnedActionRequest
-        : ownedGoalUserChoice &&
-          runtime.activeActionRequest?.requestId === ownedGoalUserChoice.requestId
+      const runtimeOwnedWaitingAction = runtimeOwnedActionRequest || (
+        ownedGoalUserChoice &&
+        runtime.activeActionRequest?.requestId === ownedGoalUserChoice.requestId
           ? ownedGoalUserChoice
-          : null;
-      const activeGoalMatches = hasDeletedGoalIdentity(runtime.activeGoal);
-      const runtimeGoalMatches = hasDeletedGoalIdentity(runtime.goalRuntime?.goal);
-      const progressMatches = runtime.goalProgress?.goalId === goal.id;
-      const nextActiveGoal = activeGoalMatches ? null : runtime.activeGoal;
-      const nextGoalRuntime = runtimeGoalMatches ? null : runtime.goalRuntime;
+          : null
+      );
+      const cancelableRuntime = {
+        ...runtime,
+        runtimeEvents: runtime.runtimeEvents || [],
+        taskFlow: runtime.taskFlow || [],
+        conversationTurns: runtime.conversationTurns || [],
+      };
+      const closedWaitingRuntime: SessionRuntimeState = runtimeOwnedWaitingAction
+        ? projectCanceledTurn({
+            state: cancelableRuntime,
+            sessionKey: ownerSessionKey,
+            turnId: runtimeOwnedWaitingAction.turnId,
+            runId: runtimeOwnedWaitingAction.runId,
+            parentRunId: runtimeOwnedWaitingAction.parentRunId || null,
+            reason: "goal_cleared",
+            message: current.config.language === "en"
+              ? "The Goal was cleared; its waiting turn was canceled and closed."
+              : "Goal 已清除；等待中的回合已取消并收口。",
+            nextTaskId: get()._nextTaskId,
+          }).state
+        : runtime;
+      const activeGoalMatches = hasDeletedGoalIdentity(closedWaitingRuntime.activeGoal);
+      const runtimeGoalMatches = hasDeletedGoalIdentity(closedWaitingRuntime.goalRuntime?.goal);
+      const progressMatches = closedWaitingRuntime.goalProgress?.goalId === goal.id;
+      const nextActiveGoal = activeGoalMatches ? null : closedWaitingRuntime.activeGoal;
+      const nextGoalRuntime = runtimeGoalMatches ? null : closedWaitingRuntime.goalRuntime;
       // An action request is global session runtime state. Clear it only when
       // strict Goal marker ownership was proven; a stale Goal must not consume
       // a request owned by a newer Execute run on the same logical turn.
-      let nextActionRequest = runtime.activeActionRequest;
+      let nextActionRequest = closedWaitingRuntime.activeActionRequest;
       if (
         ownedPendingReviewRequestId &&
         nextActionRequest?.requestId === ownedPendingReviewRequestId
@@ -7747,43 +8997,20 @@ export const useAppStore = create<AppState>()(
         nextActionRequest = null;
       }
       const pendingResolverMatches = !!ownedPendingReviewResolve &&
-        runtime.pendingReviewResolve === ownedPendingReviewResolve &&
-        runtime.pendingReviewTaskId === ownedPendingReviewTaskId;
+        closedWaitingRuntime.pendingReviewResolve === ownedPendingReviewResolve &&
+        closedWaitingRuntime.pendingReviewTaskId === ownedPendingReviewTaskId;
       const runtimePendingResolverMatches =
         runtimeOwnedActionRequest?.kind === "tool_permission" &&
-        runtime.pendingReviewTaskId === runtimeOwnedActionRequest.taskId;
-      const runtimeEvents = runtime.runtimeEvents || [];
+        closedWaitingRuntime.pendingReviewTaskId === runtimeOwnedActionRequest.taskId;
+      const runtimeEvents = closedWaitingRuntime.runtimeEvents || [];
       const alreadyRecorded = runtimeEvents.some((event) =>
         event.type === "goal.cleared" && event.goalId === goal.id
       );
-      const taskFlow = runtimeOwnedGoalUserChoice
-        ? (runtime.taskFlow || []).map((block) =>
-            block.type === "agent" &&
-            block.turnId === runtimeOwnedGoalUserChoice.turnId &&
-            block.choiceRequest?.requestId === runtimeOwnedGoalUserChoice.requestId
-              ? {
-                  ...block,
-                  options: undefined,
-                  choiceRequest: undefined,
-                  archivedAfterChoice: true,
-                }
-              : block
-          )
-        : runtime.taskFlow;
-      const conversationTurns = runtimeOwnedGoalUserChoice
-        ? (runtime.conversationTurns || []).map((turn) =>
-            turn.id === runtimeOwnedGoalUserChoice.turnId && turn.status === "awaiting_input"
-              ? { ...turn, status: "stopped_no_action" as const }
-              : turn
-            )
-        : runtime.conversationTurns;
       return {
-        ...runtime,
-        taskFlow,
-        conversationTurns,
+        ...closedWaitingRuntime,
         activeGoal: nextActiveGoal,
-        goalProgress: progressMatches ? null : runtime.goalProgress,
-        goalStatus: !nextActiveGoal && !nextGoalRuntime ? "paused" : runtime.goalStatus,
+        goalProgress: progressMatches ? null : closedWaitingRuntime.goalProgress,
+        goalStatus: !nextActiveGoal && !nextGoalRuntime ? "paused" : closedWaitingRuntime.goalStatus,
         goalRuntime: nextGoalRuntime,
         activeActionRequest: nextActionRequest,
         ...(pendingResolverMatches || runtimePendingResolverMatches
@@ -7793,7 +9020,7 @@ export const useAppStore = create<AppState>()(
               pendingToolCall: null,
             }
           : {}),
-        ...(runAbortController && runtime.abortController === runAbortController
+        ...(runAbortController && closedWaitingRuntime.abortController === runAbortController
           ? { abortController: null }
           : {}),
         runtimeEvents: alreadyRecorded
@@ -8194,7 +9421,8 @@ export const useAppStore = create<AppState>()(
       createdAt: Date.now(),
       status: "queued",
     });
-    if (!queued) return;
+    if (!queued) return null;
+    const replacedQueueId = state.queuedUserMessage?.id || null;
     const removal = buildQueuedGoalContinuationRemovalPatch(
       state,
       state.queuedUserMessage,
@@ -8214,6 +9442,9 @@ export const useAppStore = create<AppState>()(
       });
     }
     logStoreEvent("queued_user_message_set", {
+      queueId: queued.id,
+      queuePolicy: "single_slot_latest_wins",
+      replacedQueueId,
       chars: queued.text.length,
       images: queued.images?.length || 0,
       contextMentions: queued.contextMentions?.length || 0,
@@ -8226,6 +9457,7 @@ export const useAppStore = create<AppState>()(
       goalContinuationGuidanceChars: queued.goalContinuationGuidance?.length || 0,
       visibleGoalSubmissionEnvelopeConsumed: !!visibleGoalCreationAuthorization,
     });
+    return queued;
   },
   clearQueuedUserMessage: (options) => {
     const state = get();
@@ -8587,11 +9819,107 @@ export const useAppStore = create<AppState>()(
     submissionOriginSessionKey?: string;
   }) => {
     let state = get();
-    const visibleSubmissionSessionKey =
-      resolveVisibleGoalSubmissionSessionKey(state);
     const suppliedSubmissionOriginSessionKey = String(
       options?.submissionOriginSessionKey || "",
     ).trim();
+    const capturedImages = images ? [...images] : undefined;
+    const capturedUserContext = {
+      contextMentionsSnapshot: [
+        ...(options?.contextMentionsSnapshot || state.contextMentions),
+      ],
+      attachedFilesSnapshot: (
+        options?.attachedFilesSnapshot || state.attachedFiles
+      ).map((file) => normalizeAttachedFile(file)),
+    };
+    const workspaceClearBarrierWorkspace = resolveWorkspaceClearBarrierForSubmission({
+      currentWorkspaceKey: resolveSessionWorkspaceKey(state.currentWorkspace),
+      submissionOriginSessionKey: suppliedSubmissionOriginSessionKey,
+    });
+    const staleContinuationDuringClear = !!workspaceClearBarrierWorkspace && (
+      options?.hidden === true ||
+      !!options?.queuedUserMessageId ||
+      options?.reuseCurrentTurn === true ||
+      !!options?.turnIdOverride ||
+      !!options?.runIdOverride ||
+      !!options?.parentRunIdOverride ||
+      !!options?.uiParentTurnId ||
+      !!options?.parentPlanTurnId ||
+      !!options?.replyOptionSourceTurnId ||
+      !!options?.replyOptionRequestIdentity ||
+      !!options?.forceExecuteRecoveryMode ||
+      !!options?.forceExecuteRecoveryState ||
+      (options?.continueExistingGoal === true && !options.goalContinuationEnvelope)
+    );
+    if (staleContinuationDuringClear) {
+      logStoreEvent("workspace_clear_stale_continuation_discarded", {
+        workspaceKey: workspaceClearBarrierWorkspace,
+        submissionOriginSessionKey: suppliedSubmissionOriginSessionKey || null,
+        hidden: options?.hidden === true,
+        queuedReplay: !!options?.queuedUserMessageId,
+        turnBound: !!options?.turnIdOverride || options?.reuseCurrentTurn === true,
+        runBound: !!options?.runIdOverride || !!options?.parentRunIdOverride,
+        approvalBound: !!options?.replyOptionRequestIdentity,
+        textChars: text.length,
+        disposition: "discarded_stale_continuation",
+      });
+      return true;
+    }
+    const workspaceClearDeferral = deferSubmissionForWorkspaceClear({
+      currentWorkspaceKey: resolveSessionWorkspaceKey(state.currentWorkspace),
+      submissionOriginSessionKey: suppliedSubmissionOriginSessionKey,
+      submission: {
+        id: `workspace-clear-submission-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        targetSessionKey:
+          suppliedSubmissionOriginSessionKey &&
+          !suppliedSubmissionOriginSessionKey.startsWith("workspace-only:")
+            ? suppliedSubmissionOriginSessionKey
+            : null,
+        createdAt: Date.now(),
+        replay: (outcome) => {
+          // Rebuild a fresh visible submission from user-owned input only.
+          // A successful clear invalidates every old Session capability. A
+          // preserved clear may carry only the exact Goal continuation envelope
+          // so normal validation can accept or reject it for the fresh Turn.
+          const replayOptions = {
+            ...capturedUserContext,
+            ...(options?.remoteFeishu ? { remoteFeishu: options.remoteFeishu } : {}),
+            ...(outcome === "preserved" && suppliedSubmissionOriginSessionKey
+              ? { submissionOriginSessionKey: suppliedSubmissionOriginSessionKey }
+              : {}),
+            ...(outcome === "preserved" && options?.goalContinuationEnvelope
+              ? {
+                  goalContinuationEnvelope: options.goalContinuationEnvelope,
+                  ...(options.goalContinuationGuidance?.trim()
+                    ? { goalContinuationGuidance: options.goalContinuationGuidance.trim() }
+                    : {}),
+                }
+              : {}),
+          };
+          return get().sendMessage(text, capturedImages, replayOptions);
+        },
+        onDiscard: (reason) => {
+          logStoreEvent("workspace_clear_submission_discarded", {
+            workspaceKey: workspaceClearBarrierWorkspace,
+            reason,
+            textChars: text.length,
+          });
+        },
+      },
+    });
+    if (workspaceClearDeferral.deferred) {
+      logStoreEvent("workspace_clear_submission_deferred", {
+        workspaceKey: workspaceClearDeferral.workspaceKey,
+        disposition: workspaceClearDeferral.disposition,
+        submissionOriginSessionKey: suppliedSubmissionOriginSessionKey || null,
+        replacedSubmissionId: workspaceClearDeferral.replacedSubmissionId,
+        textChars: text.length,
+        images: capturedImages?.length || 0,
+        queuePolicy: "single_slot_latest_wins",
+      });
+      return true;
+    }
+    const visibleSubmissionSessionKey =
+      resolveVisibleGoalSubmissionSessionKey(state);
     if (
       suppliedSubmissionOriginSessionKey &&
       suppliedSubmissionOriginSessionKey !== visibleSubmissionSessionKey
@@ -8605,6 +9933,186 @@ export const useAppStore = create<AppState>()(
     }
     const submissionOriginSessionKey = suppliedSubmissionOriginSessionKey ||
       visibleSubmissionSessionKey;
+    type CancellationQueueContext = {
+      runtimeIntentOverride?: ResolvedRunIntent;
+      goalSourceContextSnapshot?: string;
+      goalCreationAuthorization?: GoalCreationAuthorization;
+      goalContinuationAuthorization?: GoalContinuationAuthorization;
+      goalContinuationGuidance?: string;
+    };
+    const readCancellationQueuedMessage = (
+      candidate: AppState,
+    ): QueuedUserMessage | null => normalizeQueuedUserMessage(
+      isSessionRuntimeActive(candidate, submissionOriginSessionKey)
+        ? candidate.queuedUserMessage
+        : candidate.runtimeBySessionKey[submissionOriginSessionKey]?.queuedUserMessage,
+    );
+    const deferCurrentSubmissionForCancellation = (
+      replayOptions: typeof options = options,
+      queuedWorkflowContext: CancellationQueueContext = {},
+    ): boolean => {
+      if (!getPendingSessionCancellation(submissionOriginSessionKey)) return false;
+      const replayOptionsWithoutSessionOrigin = replayOptions
+        ? { ...replayOptions }
+        : undefined;
+      if (replayOptionsWithoutSessionOrigin) {
+        delete replayOptionsWithoutSessionOrigin.submissionOriginSessionKey;
+      }
+
+      let queued = readCancellationQueuedMessage(get());
+      const reusesExactQueuedMessage = !!replayOptions?.queuedUserMessageId &&
+        !!queued &&
+        isExactQueuedMessageReplay({
+          queuedMessageId: queued.id,
+          replayMessageId: replayOptions.queuedUserMessageId,
+          queuedText: queued.text,
+          replayText: text,
+          queuedSessionKey: queued.sessionKey,
+          replaySessionKey: submissionOriginSessionKey,
+        });
+      if (!reusesExactQueuedMessage) {
+        const goalContinuationAuthorization =
+          queuedWorkflowContext.goalContinuationAuthorization ||
+          goalContinuationAuthorizationBroker.consume({
+            envelope: replayOptions?.goalContinuationEnvelope,
+            text,
+          });
+        queued = get().queueUserMessage(text, images, {
+          contextMentions: replayOptions?.contextMentionsSnapshot || state.contextMentions,
+          attachedFiles: (replayOptions?.attachedFilesSnapshot || state.attachedFiles)
+            .map((file) => normalizeAttachedFile(file)),
+          runtimeIntentOverride:
+            queuedWorkflowContext.runtimeIntentOverride ||
+            replayOptions?.runtimeIntentOverride,
+          goalSourceContextSnapshot:
+            queuedWorkflowContext.goalSourceContextSnapshot ||
+            replayOptions?.goalSourceContextSnapshot,
+          goalCreationAuthorization: queuedWorkflowContext.goalCreationAuthorization,
+          goalContinuationAuthorization: goalContinuationAuthorization || undefined,
+          goalContinuationGuidance:
+            queuedWorkflowContext.goalContinuationGuidance ||
+            replayOptions?.goalContinuationGuidance,
+          visibleGoalSubmissionEnvelope: replayOptions?.visibleGoalSubmissionEnvelope,
+          replyOptionRequestIdentity: replayOptions?.replyOptionRequestIdentity,
+          replyOptionIsCustom: replayOptions?.replyOptionIsCustom,
+          parentRunIdOverride: replayOptions?.parentRunIdOverride,
+        });
+      }
+      if (!queued) {
+        logStoreEvent("send_cancellation_barrier_queue_rejected", {
+          sessionKey: submissionOriginSessionKey,
+          textChars: text.length,
+          images: images?.length || 0,
+        });
+        return true;
+      }
+
+      const queuedMessageId = queued.id;
+      const deferred = deferUntilSessionCancellationSettled({
+        sessionKey: submissionOriginSessionKey,
+        onSettled: (settlement) => {
+          const latest = get();
+          const latestQueued = readCancellationQueuedMessage(latest);
+          const activeSessionKey = resolveVisibleGoalSubmissionSessionKey(latest);
+          const decision = resolveDeferredSessionSubmissionDecision({
+            expectedQueueId: queuedMessageId,
+            currentQueueId: latestQueued?.id,
+            targetSessionKey: submissionOriginSessionKey,
+            activeSessionKey,
+            terminalSettled: settlement.terminalSettled,
+            queueDisposition: settlement.queueDisposition,
+          });
+          if (decision !== "replay") {
+            logStoreEvent(
+              decision === "discard_session_deleted"
+                ? "send_cancellation_barrier_queue_discarded"
+                : "send_cancellation_barrier_queue_retained",
+              {
+                sessionKey: submissionOriginSessionKey,
+                activeSessionKey,
+                turnId: settlement.turnId,
+                queueId: queuedMessageId,
+                activeQueueId: latestQueued?.id || null,
+                disposition: settlement.disposition,
+                decision,
+              },
+            );
+            return;
+          }
+          const started = latest.sendMessage(latestQueued!.text, latestQueued!.images, {
+            ...replayOptionsWithoutSessionOrigin,
+            contextMentionsSnapshot: latestQueued!.contextMentions || [],
+            attachedFilesSnapshot: latestQueued!.attachedFiles || [],
+            runtimeIntentOverride: latestQueued!.runtimeIntentOverride,
+            goalSourceContextSnapshot: latestQueued!.goalSourceContextSnapshot,
+            goalContinuationGuidance: latestQueued!.goalContinuationGuidance,
+            visibleGoalSubmissionEnvelope: undefined,
+            goalContinuationEnvelope: undefined,
+            queuedUserMessageId: latestQueued!.id,
+            submissionOriginSessionKey,
+          });
+          if (started) {
+            get().clearQueuedUserMessage({
+              expectedId: latestQueued!.id,
+              disposition: "consumed",
+              reason: "cancellation_barrier_run_lease_acquired",
+            });
+          }
+          logStoreEvent("send_cancellation_barrier_replayed", {
+            sessionKey: submissionOriginSessionKey,
+            turnId: settlement.turnId,
+            queueId: latestQueued!.id,
+            started,
+          });
+        },
+        onError: (error) => {
+          const latestQueued = readCancellationQueuedMessage(get());
+          logStoreEvent("send_cancellation_barrier_queue_retained", {
+            sessionKey: submissionOriginSessionKey,
+            queueId: queuedMessageId,
+            activeQueueId: latestQueued?.id || null,
+            decision: "retain_for_reconciliation",
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      });
+      if (!deferred) {
+        logStoreEvent("send_cancellation_barrier_queue_retained", {
+          sessionKey: submissionOriginSessionKey,
+          queueId: queuedMessageId,
+          decision: "barrier_changed_before_registration",
+        });
+      }
+      return true;
+    };
+    if (deferCurrentSubmissionForCancellation()) {
+      logStoreEvent("send_deferred_for_cancellation_barrier", {
+        sessionKey: submissionOriginSessionKey,
+        phase: "entry",
+      });
+      return true;
+    }
+    const pendingReviewTransition = applySubmitPendingReviewTransition({
+      text,
+      executionConsentGranted: options?.executionConsentGranted,
+      state,
+      getState: get,
+      setState: set,
+      closeTurnAsCanceled: (turnId, cancellationOptions) => {
+        return get().closeTurnAsCanceled(turnId, cancellationOptions);
+      },
+      logStoreEvent,
+    });
+    if (pendingReviewTransition.aborted) {
+      state = pendingReviewTransition.state;
+      if (deferCurrentSubmissionForCancellation()) {
+        logStoreEvent("send_deferred_for_cancellation_barrier", {
+          sessionKey: submissionOriginSessionKey,
+          phase: "pending_review_superseded",
+        });
+        return true;
+      }
+    }
     const validatedVisibleGoalCreationAuthorization =
       visibleGoalSubmissionAuthorizationBroker.consume({
         envelope: options?.visibleGoalSubmissionEnvelope,
@@ -8617,20 +10125,6 @@ export const useAppStore = create<AppState>()(
         envelope: options?.goalContinuationEnvelope,
         text,
       });
-    const pendingReviewTransition = applySubmitPendingReviewTransition({
-      text,
-      executionConsentGranted: options?.executionConsentGranted,
-      state,
-      getState: get,
-      setState: set,
-      setConversationTurnStatus: (turnId, status) => {
-        get().setConversationTurnStatus(turnId, status);
-      },
-      logStoreEvent,
-    });
-    if (pendingReviewTransition.aborted) {
-      state = pendingReviewTransition.state;
-    }
     const sendOriginSessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
     const applyPreRunSessionPatch = createSubmitPreRunSessionPatcher<AppState, SessionRuntimeState>({
       originSessionKey: sendOriginSessionKey,
@@ -8762,6 +10256,7 @@ export const useAppStore = create<AppState>()(
         agentStatus: state.agentStatus,
         currentTurnId: state.currentTurnId,
         currentSessionKey: sendOriginSessionKey,
+        runtimeEvents: state.runtimeEvents,
         conversationTurns: state.conversationTurns,
         taskFlow: state.taskFlow,
         selectedMainModeKey: currentMainModeKey,
@@ -8848,11 +10343,27 @@ export const useAppStore = create<AppState>()(
         get().approvePlan(approvalChoice);
       },
       setState: set,
-      setConversationTurnStatus: (turnId, status) => {
-        get().setConversationTurnStatus(turnId, status);
+      closeTurnAsCanceled: (turnId, cancellationOptions) => {
+        return get().closeTurnAsCanceled(turnId, cancellationOptions);
       },
       logStoreEvent,
     });
+    const deferResetSubmissionForCancellation = (
+      queuedWorkflowContext?: CancellationQueueContext,
+    ): boolean => {
+      if (!getPendingSessionCancellation(submissionOriginSessionKey)) return false;
+      return deferCurrentSubmissionForCancellation(options, {
+        ...queuedWorkflowContext,
+        goalCreationAuthorization:
+          queuedWorkflowContext?.goalCreationAuthorization ||
+          validatedVisibleGoalCreationAuthorization ||
+          undefined,
+        goalContinuationAuthorization:
+          queuedWorkflowContext?.goalContinuationAuthorization ||
+          goalContinuationAuthorization ||
+          undefined,
+      });
+    };
 
     const earlyGoalCreationAuthorization =
       submitPipelineDecision.shortcuts.goalCreationAuthorization;
@@ -8891,6 +10402,16 @@ export const useAppStore = create<AppState>()(
         state,
         earlyGoalQueuedWorkflowContext,
       );
+      if (
+        planResumeSendGateEffect.decision.action.kind === "reset_stuck_state" &&
+        deferResetSubmissionForCancellation(earlyGoalQueuedWorkflowContext)
+      ) {
+        logStoreEvent("send_deferred_for_cancellation_barrier", {
+          sessionKey: submissionOriginSessionKey,
+          phase: "early_stuck_state_reset",
+        });
+        return true;
+      }
       if (!planResumeSendGateEffect.shouldContinue) {
         return planResumeSendGateEffect.returnValue ?? false;
       }
@@ -9167,7 +10688,8 @@ export const useAppStore = create<AppState>()(
         })
       : undefined;
 
-    const sendGateEffect = applyCurrentSendGate(state, runtimeRunIntent === "goal"
+    const sendGateQueuedWorkflowContext: CancellationQueueContext | undefined =
+      runtimeRunIntent === "goal"
       ? {
           runtimeIntentOverride: "goal",
           goalSourceContextSnapshot,
@@ -9177,7 +10699,21 @@ export const useAppStore = create<AppState>()(
             ? { goalContinuationGuidance: options.goalContinuationGuidance.trim() }
             : {}),
         }
-      : undefined);
+      : undefined;
+    const sendGateEffect = applyCurrentSendGate(
+      state,
+      sendGateQueuedWorkflowContext,
+    );
+    if (
+      sendGateEffect.decision.action.kind === "reset_stuck_state" &&
+      deferResetSubmissionForCancellation(sendGateQueuedWorkflowContext)
+    ) {
+      logStoreEvent("send_deferred_for_cancellation_barrier", {
+        sessionKey: submissionOriginSessionKey,
+        phase: "stuck_state_reset",
+      });
+      return true;
+    }
     if (!sendGateEffect.shouldContinue) {
       return sendGateEffect.returnValue ?? false;
     }
@@ -9229,7 +10765,14 @@ export const useAppStore = create<AppState>()(
       backgroundRunningCount: backgroundRunningSessions.length,
       backgroundRunningSessions: backgroundRunningSessions.slice(0, 8),
     });
-    const { sessionGet, sessionSet } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
+    const {
+      sessionGet,
+      sessionSet,
+      getSessionRuntimeOwnerToken,
+      hasSessionRuntimeOwnership,
+      getSessionRevisionToken,
+      publishOwnerScopedRuntimeProjection,
+    } = createSubmitSessionRuntimeController<AppState, SessionRuntimeState>({
       get,
       set,
       runSessionKey,
@@ -9445,6 +10988,59 @@ export const useAppStore = create<AppState>()(
       runtimeRunIntent,
       goalCreationAuthorization,
       goalContinuationAuthorization,
+      activateGoalContinuation: ({ authorization, ownerTurnId, timestampMs }) => {
+        let accepted = false;
+        sessionSet((state: AppState) => {
+          const progress = state.goalProgress || state.goalRuntime?.progress || (
+            state.activeGoal
+              ? createGoalProgress(state.activeGoal.id, "")
+              : null
+          );
+          const transition = buildAcceptedGoalContinuationState({
+            goal: state.activeGoal,
+            progress,
+            runtime: state.goalRuntime,
+            authorization,
+            ownerTurnId,
+            nowMs: timestampMs,
+          });
+          if (!transition) return {};
+          accepted = true;
+          if (!transition.transitioned) return {};
+          return {
+            activeGoal: transition.goal,
+            goalProgress: transition.progress,
+            goalStatus: "active" as const,
+            goalRuntime: transition.runtime,
+            activeActionRequest: clearGoalConfirmationActionRequest(
+              state.activeActionRequest,
+              transition.goal.id,
+              transition.goal.revision || 1,
+            ),
+            runtimeEvents: appendRuntimeEvent(state.runtimeEvents, withEventSchema({
+              type: "goal.state_changed",
+              threadId: runSessionKey,
+              turnId: ownerTurnId,
+              timestampMs,
+              goalId: transition.goal.id,
+              from: transition.previousStatus,
+              to: "active",
+              phase: "re_plan",
+              reason: "resume_run_lease_acquired",
+            })),
+          };
+        });
+        if (accepted) {
+          logStoreEvent("goal_resume_run_lease_accepted", {
+            goalId: authorization.goalId,
+            goalRevision: authorization.goalRevision,
+            previousOwnerTurnId: authorization.ownerTurnId,
+            ownerTurnId,
+            sessionKey: runSessionKey,
+          });
+        }
+        return accepted;
+      },
       effectiveWorkflowMode,
       effectiveCommandDirective,
       effectiveIntentSummary,
@@ -9467,6 +11063,10 @@ export const useAppStore = create<AppState>()(
       nextTaskId: nextId,
       sessionGet,
       sessionSet,
+      getSessionRuntimeOwnerToken,
+      hasSessionRuntimeOwnership,
+      getSessionRevisionToken,
+      publishOwnerScopedRuntimeProjection,
       elapsedTimer,
       markUserContextItemFailed,
       ingestAttachmentFile,
@@ -9478,12 +11078,23 @@ export const useAppStore = create<AppState>()(
       invalidateWorkspaceTreeCache,
       createAbortController: () => new AbortController(),
       getCurrentHarnessInstanceId,
-      persistHarnessRunMarker,
+      readHarnessRunMarker,
+      acquireHarnessRunMarker,
+      persistHarnessRunMarkerIfOwned,
       getWorkspaceTree,
       nowMs,
       sendStartedAt,
       getLastTurnToolSummary,
       getLastVisibleTurnAgentSummary,
+      persistBootstrapProjection: (projectedState) => persistSubmitRuntimeProjection({
+        state: projectedState,
+        scopeKey: runScopeKey,
+        sessionId: runSessionId,
+        sanitizeTaskBlocksForPersist,
+        buildRuntimeSnapshot: buildSessionRuntimeSnapshotFromStoreState,
+        persistSessionRecord: saveProjectSession,
+        nowMs,
+      }),
       PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
       PROVIDER_COMPATIBILITY_FORCE_XML_TTL_MS,
       PROVIDER_COMPATIBILITY_NATIVE_RECOVERY_SUCCESS_STREAK,
@@ -10057,7 +11668,3 @@ export type { ResolvedRunIntent };
 export type { TurnRuntimePhase };
 export type { ExecuteRecoveryMode };
 export type { AttachedFile };
-
-// Test compatibility assertions for run-intent.test.mjs source search
-// const statusOverride = status === "idle" && abortCtrl.signal.aborted ? "stopped_no_action"
-// override: statusOverride

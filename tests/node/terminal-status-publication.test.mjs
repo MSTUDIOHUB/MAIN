@@ -46,18 +46,58 @@ test("terminal status gate awaits the terminal projection before publishing idle
   assert.equal(gate.requestStatus("idle").publishNow, true);
 });
 
-test("a resumed running phase starts a fresh idle publication transaction", async () => {
+test("a new run key starts a fresh idle publication transaction", async () => {
   const gate = createTerminalStatusPublicationGate();
   await gate.commitTerminal({
+    runKey: "run-old",
     persistTerminalProjection: () => {},
     publishTerminalStatus: () => {},
   });
-  assert.equal(gate.requestStatus("idle").publishNow, true);
-  assert.equal(gate.requestStatus("running").publishNow, true);
-  assert.deepEqual(gate.requestStatus("idle"), {
+  assert.equal(gate.requestStatus("idle", "run-old").publishNow, true);
+  assert.equal(gate.requestStatus("running", "run-new").publishNow, true);
+  assert.deepEqual(gate.requestStatus("idle", "run-new"), {
     publishNow: false,
     deferredIdleCount: 1,
   });
+});
+
+test("late running callbacks cannot reopen a committed run key", async () => {
+  const gate = createTerminalStatusPublicationGate();
+  await gate.commitTerminal({
+    runKey: "run-closed",
+    persistTerminalProjection: () => true,
+    publishTerminalStatus: () => {},
+  });
+
+  assert.deepEqual(gate.requestStatus("running", "run-closed"), {
+    publishNow: false,
+    deferredIdleCount: 0,
+  });
+  assert.equal(gate.requestStatus("idle", "run-closed").publishNow, true);
+});
+
+test("running callbacks cannot replace an in-flight terminal transaction", async () => {
+  const gate = createTerminalStatusPublicationGate();
+  let releasePersistence;
+  const barrier = new Promise((resolve) => {
+    releasePersistence = resolve;
+  });
+  let publishes = 0;
+  const terminal = gate.commitTerminal({
+    runKey: "run-in-flight",
+    persistTerminalProjection: async () => {
+      await barrier;
+      return true;
+    },
+    publishTerminalStatus: () => {
+      publishes += 1;
+    },
+  });
+
+  assert.equal(gate.requestStatus("running", "run-in-flight").publishNow, false);
+  releasePersistence();
+  assert.equal(await terminal, true);
+  assert.equal(publishes, 1);
 });
 
 test("a failed durable write never publishes idle", async () => {
@@ -78,6 +118,16 @@ test("a failed durable write never publishes idle", async () => {
 
   assert.equal(published, false);
   assert.equal(gate.requestStatus("idle").publishNow, false);
+
+  const retried = await gate.commitTerminal({
+    persistTerminalProjection: () => true,
+    publishTerminalStatus: () => {
+      published = true;
+    },
+  });
+  assert.equal(retried, true);
+  assert.equal(published, true);
+  assert.equal(gate.requestStatus("idle").publishNow, true);
 });
 
 test("lost run ownership cancels terminal publication without publishing idle", async () => {
@@ -94,4 +144,83 @@ test("lost run ownership cancels terminal publication without publishing idle", 
   assert.equal(committed, false);
   assert.equal(published, false);
   assert.equal(gate.requestStatus("idle").publishNow, false);
+
+  assert.equal(await gate.commitTerminal({
+    persistTerminalProjection: () => true,
+    publishTerminalStatus: () => {
+      published = true;
+    },
+  }), true);
+  assert.equal(published, true);
+});
+
+test("terminal publication is isolated and idempotent by run key", async () => {
+  const gate = createTerminalStatusPublicationGate();
+  const calls = [];
+
+  gate.requestStatus("running", "run-a");
+  assert.equal(gate.requestStatus("idle", "run-a").publishNow, false);
+  gate.requestStatus("running", "run-b");
+  assert.equal(gate.requestStatus("idle", "run-b").publishNow, false);
+
+  assert.equal(await gate.commitTerminal({
+    runKey: "run-a",
+    persistTerminalProjection: () => {
+      calls.push("persist-a");
+      return true;
+    },
+    publishTerminalStatus: () => calls.push("publish-a"),
+  }), true);
+  assert.equal(gate.requestStatus("idle", "run-a").publishNow, true);
+  assert.equal(gate.requestStatus("idle", "run-b").publishNow, false);
+
+  assert.equal(await gate.commitTerminal({
+    runKey: "run-a",
+    persistTerminalProjection: () => {
+      calls.push("unexpected-persist-a-replay");
+      return true;
+    },
+    publishTerminalStatus: () => calls.push("unexpected-publish-a-replay"),
+  }), true);
+  assert.deepEqual(calls, ["persist-a", "publish-a"]);
+});
+
+test("concurrent terminal commits for one run share one durable transaction", async () => {
+  const gate = createTerminalStatusPublicationGate();
+  let releasePersistence;
+  const persistenceBarrier = new Promise((resolve) => {
+    releasePersistence = resolve;
+  });
+  let persistCount = 0;
+  let publishCount = 0;
+
+  const first = gate.commitTerminal({
+    runKey: "run-concurrent",
+    persistTerminalProjection: async () => {
+      persistCount += 1;
+      await persistenceBarrier;
+      return true;
+    },
+    publishTerminalStatus: () => {
+      publishCount += 1;
+    },
+  });
+  const second = gate.commitTerminal({
+    runKey: "run-concurrent",
+    persistTerminalProjection: () => {
+      persistCount += 100;
+      return true;
+    },
+    publishTerminalStatus: () => {
+      publishCount += 100;
+    },
+  });
+
+  assert.equal(first, second);
+  await Promise.resolve();
+  assert.equal(persistCount, 1);
+  releasePersistence();
+  assert.deepEqual(await Promise.all([first, second]), [true, true]);
+  assert.equal(persistCount, 1);
+  assert.equal(publishCount, 1);
 });

@@ -31,6 +31,12 @@ import type {
   WaitSubagentsRequest,
   WaitSubagentsResult,
 } from "../subagents";
+export type {
+  AgentLoopOutcome,
+  AgentLoopOutcomeStatus,
+  AgentLoopPauseKind,
+  AgentLoopResultKind,
+} from "../runOutcome";
 
 export interface ToolCallInMessage {
   id: string;
@@ -58,19 +64,6 @@ export interface AgentMessage {
   tool_call_id?: string;
   reasoning_content?: string;
   reasoning?: string;
-}
-
-export type AgentLoopOutcomeStatus =
-  | "completed"
-  | "paused"
-  | "stopped_no_action"
-  | "stopped_no_output"
-  | "aborted"
-  | "error";
-
-export interface AgentLoopOutcome {
-  status: AgentLoopOutcomeStatus;
-  reason: string;
 }
 
 export type MaxIterationsCheckpointHandling =

@@ -25,6 +25,7 @@ import {
   buildPlanTaskEvidenceAudit,
   deriveVisibleConversationTurnStatus,
   hasLivePlanWorkspace,
+  isConversationTurnRuntimeClosed,
   isGenericConversationTitle,
   isEphemeralPlanArtifactPath,
   normalizeConversationDisplayTitle,
@@ -102,6 +103,7 @@ import {
 import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
+import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -112,6 +114,10 @@ const TURN_STATUS_LABELS: Record<string, string> = {
   stopped_no_action: "Stopped",
   stopped_no_output: "No visible reply",
   paused: "Paused",
+  success: "Completed",
+  partial: "Partially completed",
+  blocked: "Blocked",
+  canceled: "Canceled",
   done: "Done",
   error: "Error",
 };
@@ -359,14 +365,19 @@ function getTurnStatusTone(status: string): string {
     case "executing":
       return "border-[rgba(96,165,250,0.25)] bg-[rgba(96,165,250,0.12)] text-[#60a5fa]";
     case "completed_with_changes":
+    case "success":
       return "border-[rgba(52,211,153,0.25)] bg-[rgba(52,211,153,0.12)] text-[#34d399]";
     case "stopped_no_action":
     case "stopped_no_output":
+    case "partial":
+    case "blocked":
       return "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]";
     case "paused":
       return "border-[rgba(251,191,36,0.25)] bg-[rgba(251,191,36,0.12)] text-[#fbbf24]";
     case "done":
       return "border-[rgba(52,211,153,0.25)] bg-[rgba(52,211,153,0.12)] text-[#34d399]";
+    case "canceled":
+      return "border-[rgba(161,161,170,0.28)] bg-[rgba(161,161,170,0.1)] text-[#a1a1aa]";
     case "error":
       return "border-[rgba(251,113,133,0.25)] bg-[rgba(251,113,133,0.12)] text-[#fb7185]";
     default:
@@ -866,7 +877,14 @@ function PlanShortcutCard({
 }
 
 function isFinishedTurnStatus(status: string) {
-  return status === "done" || status === "completed" || status === "completed_with_changes";
+  return status === "done" ||
+    status === "completed" ||
+    status === "completed_with_changes" ||
+    status === "success" ||
+    status === "partial" ||
+    status === "blocked" ||
+    status === "error" ||
+    status === "canceled";
 }
 
 function getLatestThoughtBlock(blocks: any[]) {
@@ -2461,7 +2479,7 @@ export default function ChatArea({
     collapsedSummary: language === "zh" ? "本轮过程已折叠，结论会优先保留在这里。" : "This turn is collapsed. The conclusion is kept here first.",
     expandHistory: (count: number) => language === "zh" ? `展开 ${count} 条过程记录` : `Expand ${count} process item(s)`,
     turnStatusLabels: language === "zh"
-      ? { planning: "规划中", awaiting_approval: "待批准", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已完成并写入", stopped_no_action: "已停止，未执行", stopped_no_output: "未生成可见回复", paused: "已暂停", done: "完成", error: "错误" }
+      ? { planning: "规划中", awaiting_approval: "待批准", awaiting_input: "待选择", executing: "执行中", completed_with_changes: "已完成并写入", stopped_no_action: "已停止，未执行", stopped_no_output: "未生成可见回复", paused: "已暂停", success: "已完成", partial: "部分完成", blocked: "已受阻", canceled: "已取消", done: "完成", error: "错误" }
       : TURN_STATUS_LABELS,
     describePlan: (prompt: string, maxLength = 40) =>
       summarizePlanIntent(prompt, maxLength, language),
@@ -2589,6 +2607,7 @@ export default function ChatArea({
         event?.type === "turn.completed" ||
         event?.type === "turn.failed" ||
         event?.type === "run.completed" ||
+        event?.type === "run.aborted" ||
         event?.type === "run.failed" ||
         event?.type === "run.paused"
       ) {
@@ -2805,6 +2824,7 @@ export default function ChatArea({
   }, [visibleConversationTurns, currentTurnId]);
   const shouldKeepExecutionCapsuleResident =
     !!pinnedTurn &&
+    !isConversationTurnRuntimeClosed(pinnedTurn.runtimeOutcome) &&
     (
       pinnedTurn.status === "executing" ||
       pinnedTurn.status === "awaiting_input" ||
@@ -2924,6 +2944,7 @@ export default function ChatArea({
 
     return deriveVisibleConversationTurnStatus({
       baseStatus: capsuleControlTurn.status,
+      runtimeOutcome: capsuleControlTurn.runtimeOutcome,
       turnIntent: resolveConversationTurnIntent(capsuleControlTurn),
       isPinnedPlanTurnVisible: !!pinnedPlanTurn && capsuleControlTurn.id === pinnedPlanTurn.id,
       isPlanApproved,
@@ -2974,6 +2995,7 @@ export default function ChatArea({
 
   const capsulePlanExecutionSnapshot =
     pinnedPlanTurn &&
+    !isConversationTurnRuntimeClosed(pinnedPlanTurn.runtimeOutcome) &&
     planExecutionProgressSnapshot?.turnId === pinnedPlanTurn.id &&
     isPlanApproved &&
     planStage !== "completed"
@@ -3507,8 +3529,8 @@ export default function ChatArea({
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     // A runtime-owned assistant_final makes a recovery pause terminal for
     // presentation purposes without claiming successful completion.
-    const isPausedWithFinalConclusion = turn.status === "paused" && explicitFinalAgentIndex >= 0;
-    const isFinishedTurn = isFinishedTurnStatus(turn.status) || isPausedWithFinalConclusion;
+    const isPausedWithFinalConclusion = turnPresentation.lifecycle === "resumable" && explicitFinalAgentIndex >= 0;
+    const isFinishedTurn = isFinishedTurnStatus(turnPresentation.status) || isPausedWithFinalConclusion;
     const showReasoningDebug = config.reasoningDisplay !== "hidden";
     const substantiveIntermediateAgentBlockIds = new Set(blocks
       .map((block, idx) => ({ block, idx }))
@@ -3596,9 +3618,12 @@ export default function ChatArea({
     // while it's still being generated. The card replaces all detailed blocks,
     // so it must only appear once the model has finished working on this turn.
     const planTurnFinished =
-      turn.status === "done" ||
-      turn.status === "completed_with_changes" ||
-      turn.status === "awaiting_approval" ||
+      turnPresentation.lifecycle === "success" ||
+      turnPresentation.lifecycle === "partial" ||
+      turnPresentation.lifecycle === "blocked" ||
+      turnPresentation.lifecycle === "error" ||
+      turnPresentation.lifecycle === "canceled" ||
+      turnPresentation.lifecycle === "action_required" ||
       isPlanApproved;
     const hasCompletePlan = hasPlanContent && planTurnFinished;
     const finalAgentSummaryText = getLastAgentSummaryText(blocks);
@@ -3653,7 +3678,7 @@ export default function ChatArea({
     };
     const latestThoughtBlock = getLatestThoughtBlock(blocks);
     const bottomThoughtSummary =
-      showReasoningDebug && turn.status !== "error" && latestThoughtBlock
+      showReasoningDebug && turnPresentation.lifecycle !== "error" && turnPresentation.lifecycle !== "failed" && latestThoughtBlock
         ? (() => {
             const summary = getThoughtSummaryText(latestThoughtBlock);
             const shouldKeepSummary = latestThoughtBlock.isStreaming || shouldRetainStageSummary(summary);
@@ -3670,18 +3695,13 @@ export default function ChatArea({
     // assistant-update channel and the high-level Capsule status line.
     const shouldSuppressActiveRuntimeNotice = isActiveRunningTurn;
     const shouldShowTurnActivityNotice =
-      turn.status !== "error" &&
+      turnPresentation.lifecycle !== "error" &&
+      turnPresentation.lifecycle !== "failed" &&
       !shouldSuppressActiveRuntimeNotice &&
       Boolean(bottomThoughtSummary);
     const isTurnCompletedOrStopped =
-      turn.status === "done" ||
-      turn.status === "completed_with_changes" ||
-      isPausedWithFinalConclusion ||
-      turn.status === "stopped_no_action" ||
-      turn.status === "stopped_no_output" ||
-      turn.status === "error" ||
-      turn.status === "awaiting_approval" ||
-      turn.status === "awaiting_input";
+      turnPresentation.lifecycle !== "active" ||
+      isPausedWithFinalConclusion;
 
 
     const renderTurnBlockItem = (item) => {
@@ -3868,7 +3888,8 @@ export default function ChatArea({
       ? candidateChoiceRequest
       : null;
     const showInlineChoiceCheckpoint =
-      (turn.status === "awaiting_input" || (turn.status === "awaiting_approval" && turnIntent !== "plan")) &&
+      turnPresentation.lifecycle === "action_required" &&
+      (turnPresentation.status === "awaiting_input" || (turnPresentation.status === "awaiting_approval" && turnIntent !== "plan")) &&
       turnReplyOptions.length > 0 &&
       !!inlineChoiceRequest &&
       inlineChoiceRequest.requestId !== userChoiceActionRequest?.requestId;
@@ -3908,12 +3929,12 @@ export default function ChatArea({
                   {turnIntentLabel}
                 </span>
               )}
-              <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turn.status)}`}>
-                {copy.turnStatusLabels[turn.status] || turn.status}
+              <span className={`rounded-full border px-2 py-0.5 text-[10px] ${getTurnStatusTone(turnPresentation.status)}`}>
+                {turnPresentation.statusLabel}
               </span>
               <TurnTimer
                 turnId={turn.id}
-                status={turn.status}
+                status={turnPresentation.status}
                 isStreaming={isStreaming}
                 currentTurnId={currentTurnId}
                 savedElapsedTime={turn.elapsedTime}
@@ -4079,8 +4100,8 @@ export default function ChatArea({
                 turnId={turn.id}
                 runId={inlineChoiceRequest?.runId}
                 requestId={inlineChoiceRequest?.requestId}
-                status={copy.turnStatusLabels[turn.status] || turn.status}
-                statusToneClass={getTurnStatusTone(turn.status)}
+                status={turnPresentation.statusLabel}
+                statusToneClass={getTurnStatusTone(turnPresentation.status)}
                 language={language}
                 themeMode={config.themeMode}
                 chatFontSize={resolvedChatFontSize}
@@ -4174,9 +4195,18 @@ export default function ChatArea({
         ...(goalActionRequest ? { requestId: goalActionRequest.requestId } : {}),
       }
     : null;
+  const goalPresentationOwnerTurn = activeGoal && shouldDetachGoalPresentationFromOwnerTurn({
+    goalStatus,
+    ownerTurn: goalOwnerTurn,
+    ownerTurnId: activeGoal.ownerTurnId,
+    sessionKey: activeSessionKey || "",
+    runtimeEvents,
+  })
+    ? null
+    : goalOwnerTurn;
   const goalPresentation = activeGoal
     ? buildTurnPresentationModel({
-        turn: goalOwnerTurn,
+        turn: goalPresentationOwnerTurn,
         language,
         fallbackTitle: activeGoal.objective,
         statusOverride: goalStatus,

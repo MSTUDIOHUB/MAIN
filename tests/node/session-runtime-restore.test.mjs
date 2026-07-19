@@ -72,6 +72,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/store/useAppStore.ts"));
 const actionRequests = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/actionRequest.ts"));
 const pendingToolReview = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/pendingToolReview.ts"));
+const turnEvents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 const goalState = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalState.ts"));
 const goalRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalRuntime.ts"));
 const goalPersistence = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalPersistence.ts"));
@@ -718,14 +719,113 @@ test("restore projects terminal markers instead of inventing a resumable pause",
     });
 
     assert.equal(restored.activeActionRequest, null);
-    assert.equal(restored.conversationTurns[0].status, status === "completed" ? "done" : "error");
-    const runEvents = restored.runtimeEvents.filter((event) => event.runId === runId);
-    assert.deepEqual(
-      runEvents.map((event) => event.type),
-      [status === "completed" ? "run.completed" : "run.failed"],
+    assert.equal(restored.conversationTurns[0].status, "done");
+    assert.equal(restored.conversationTurns[0].runtimeOutcome?.status, "completed");
+    assert.equal(
+      restored.conversationTurns[0].runtimeOutcome?.resultKind,
+      status === "completed" ? "success" : "error",
     );
+    const runEvents = restored.runtimeEvents.filter((event) => event.runId === runId);
+    assert.deepEqual(runEvents.map((event) => event.type), ["run.completed"]);
+    assert.equal(runEvents[0]?.resultKind, status === "completed" ? "success" : "error");
     assert.equal(runEvents.some((event) => event.type === "run.paused"), false);
+    const turnTerminal = restored.runtimeEvents.find((event) =>
+      event.type === "turn.completed" && event.turnId === turnId
+    );
+    assert.equal(turnTerminal?.resultKind, status === "completed" ? "success" : "error");
   }
+});
+
+test("restore preserves an aborted run over its cleanly completed harness lease", () => {
+  const sessionKey = "terminal-aborted-session";
+  const turnId = "turn-aborted";
+  const runId = "run-aborted";
+  const request = actionRequests.buildUserChoiceActionRequest({
+    sessionKey,
+    turnId,
+    runId,
+    title: "Stale choice after cancellation",
+    optionValues: ["Continue", "Stop"],
+    allowCustomReply: false,
+    now: 500,
+  });
+  const restored = normalizeSessionRuntimeSnapshot({
+    activeActionRequest: request,
+    harnessRunMarker: {
+      schemaVersion: 1,
+      instanceId: "test-instance",
+      sessionKey,
+      turnId,
+      runId,
+      activeRunId: runId,
+      status: "completed",
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      startedAt: 100,
+      updatedAt: 500,
+      closedAt: 500,
+      closeReason: "user_cancelled",
+      lastStreamError: null,
+    },
+    taskFlow: [{
+      id: 601,
+      type: "agent",
+      turnId,
+      content: "Continue or stop?",
+      options: ["Continue", "Stop"].map((value) => ({ label: value, value })),
+      choiceRequest: actionRequests.toUserChoiceResolutionIdentity(request),
+    }],
+    conversationTurns: [{
+      id: turnId,
+      userPrompt: "Cancel this work",
+      title: "Canceled turn",
+      mode: "edit",
+      intent: "execute",
+      displayIntent: "execute",
+      status: "awaiting_input",
+      summary: "Waiting",
+      blockIds: [601],
+      collapsed: false,
+      createdAt: 100,
+    }],
+    runtimeEvents: [
+      turnEvents.withEventSchema({
+        type: "run.aborted",
+        threadId: sessionKey,
+        turnId,
+        runId,
+        parentRunId: null,
+        timestampMs: 500,
+        reason: "user_cancelled",
+        message: "The user canceled this run.",
+      }),
+      turnEvents.withEventSchema({
+        type: "turn.completed",
+        threadId: sessionKey,
+        turnId,
+        timestampMs: 500,
+        resultKind: "canceled",
+      }),
+    ],
+  });
+
+  assert.equal(restored.activeActionRequest, null);
+  assert.equal(restored.conversationTurns[0].status, "done");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.status, "aborted");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.resultKind, "canceled");
+  assert.equal(restored.conversationTurns[0].runtimeOutcome?.reason, "user_cancelled");
+  const runEvents = restored.runtimeEvents.filter((event) => event.runId === runId);
+  assert.deepEqual(runEvents.map((event) => event.type), ["run.aborted"]);
+  const turnTerminals = restored.runtimeEvents.filter((event) =>
+    event.turnId === turnId && (event.type === "turn.completed" || event.type === "turn.failed")
+  );
+  assert.deepEqual(turnTerminals.map((event) => [event.type, event.resultKind]), [
+    ["turn.completed", "canceled"],
+  ]);
+  assert.equal(restored.runtimeEvents.some((event) => event.type === "run.paused"), false);
+  assert.equal(restored.runtimeEvents.some((event) => event.type === "run.failed"), false);
 });
 
 test("restore clears non-resumable tool permission state and preserves a paused event", () => {

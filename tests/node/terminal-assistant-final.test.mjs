@@ -420,7 +420,7 @@ test("assistant_final visibility survives a persisted JSON reload", () => {
   assert.equal(messages.at(-1).content, "持久最终结论");
 });
 
-test("paused, error, stopped, and pending continuation outcomes never synthesize a success final", () => {
+test("non-completed and legacy outcome labels never synthesize a success final", () => {
   for (const outcomeStatus of ["paused", "error", "stopped_no_output", "stopped_no_action", "aborted"]) {
     assert.equal(shouldCommitCompletedTurnFinalPresentation({ outcomeStatus }), false, outcomeStatus);
   }
@@ -429,6 +429,41 @@ test("paused, error, stopped, and pending continuation outcomes never synthesize
     hasPendingSameTurnExecution: true,
   }), false);
   assert.equal(shouldCommitCompletedTurnFinalPresentation({ outcomeStatus: "completed" }), true);
+});
+
+test("canonical result kinds route success finals separately from blocked error and canceled conclusions", () => {
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const terminalStart = workflowSource.indexOf("const commitTerminalProjectionBeforeStatusPublication = async");
+  const terminalCommit = workflowSource.indexOf(
+    "durableState = await persistCurrentSessionRuntime(draft.snapshot())",
+    terminalStart,
+  );
+  const terminalRouting = workflowSource.slice(terminalStart, terminalCommit);
+  const closedConclusionStart = workflowSource.indexOf("const ensureClosedTurnConclusion");
+  const pausedConclusionStart = workflowSource.indexOf(
+    "const ensurePausedTurnFinalPresentation",
+    closedConclusionStart,
+  );
+  const closedConclusion = workflowSource.slice(closedConclusionStart, pausedConclusionStart);
+
+  assert.ok(terminalStart >= 0 && terminalCommit > terminalStart);
+  assert.match(
+    terminalRouting,
+    /outcome\.status === "completed" &&\s*\(outcome\.resultKind === "success" \|\| outcome\.resultKind === "partial"\)/,
+  );
+  assert.match(
+    terminalRouting,
+    /else if \(!isSameTurnExecutionContinuation\) \{\s*finalText = ensureClosedTurnConclusion\(outcome, draft\);/,
+  );
+  assert.match(
+    closedConclusion,
+    /resultKind !== "error" && resultKind !== "blocked" && resultKind !== "canceled"/,
+  );
+  assert.match(closedConclusion, /resultKind === "canceled"/);
+  assert.match(closedConclusion, /resultKind === "blocked"/);
 });
 
 test("recoverable no-progress pauses commit a partial assistant final", () => {
@@ -496,7 +531,7 @@ test("pause then completion reuses one assistant_final for the same logical turn
   );
 });
 
-test("workflow terminal contract persists only completed finals and uses supported ChatArea statuses", () => {
+test("workflow terminal contract routes canonical conclusions through supported ChatArea statuses", () => {
   const workflowSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",
@@ -507,9 +542,9 @@ test("workflow terminal contract persists only completed finals and uses support
   assert.match(workflowSource, /if \(outcome\.status !== "completed"\) return null;/);
   assert.match(workflowSource, /shouldCommitCompletedTurnFinalPresentation\(\{/);
   assert.match(workflowSource, /shouldCommitPausedTurnFinalPresentation\(\{/);
-  assert.match(workflowSource, /ensurePausedTurnFinalPresentation\(loopOutcome\)/);
+  assert.match(workflowSource, /ensurePausedTurnFinalPresentation\(outcome, draft\)/);
   assert.match(workflowSource, /emitLocalPlanExecutionProgress\("paused",\s*\{/);
-  assert.match(workflowSource, /paused_turn_final_presentation_committed/);
+  assert.match(workflowSource, /paused_turn_final_presentation_staged/);
   assert.match(workflowSource, /!context\.executionEvidenceDraftHeld/);
   assert.match(workflowSource, /visibility: "assistant_final" as const/);
   assert.match(workflowSource, /completedTurnHasChanges \? "completed_with_changes" : "done"/);
@@ -536,17 +571,17 @@ test("Feishu completion cards are emitted only after completed terminal commitme
   const callbackEnd = workflowSource.indexOf("onToolExecuting:", callbackStart);
   const callbackSource = workflowSource.slice(callbackStart, callbackEnd);
   const terminalStart = workflowSource.indexOf("return prepareSubagentsForNewTurn().then(executeLoopStrategy)");
-  const completionGate = workflowSource.indexOf("shouldCommitCompletedTurnFinalPresentation({", terminalStart);
-  const terminalCommit = workflowSource.indexOf("commitTerminalProjectionBeforeStatusPublication(", completionGate);
-  const terminalCommitGuard = workflowSource.indexOf("if (!terminalProjectionCommitted)", terminalCommit);
-  const completionCard = workflowSource.indexOf('feishuCardTitle: language === "en" ? "Task Complete" : "任务处理完成"', terminalCommitGuard);
+  const terminalCommit = workflowSource.indexOf("const terminalProjection = await commitTerminalProjectionBeforeStatusPublication(", terminalStart);
+  const terminalCommitGuard = workflowSource.indexOf("if (!terminalProjection.committed)", terminalCommit);
+  const committedFinal = workflowSource.indexOf("const completedFinalTextForRemote = terminalProjection.finalText", terminalCommitGuard);
+  const completionCard = workflowSource.indexOf('feishuCardTitle: language === "en" ? "Task Complete" : "任务处理完成"', committedFinal);
 
   assert.notEqual(callbackStart, -1);
   assert.ok(callbackEnd > callbackStart);
   assert.doesNotMatch(callbackSource, /Task Complete|任务处理完成/);
   assert.match(callbackSource, /remoteFeishu && awaitingInput[\s\S]*?"Input Required"[\s\S]*?"需要用户选择"/);
-  assert.ok(completionGate >= terminalStart);
-  assert.ok(terminalCommit > completionGate);
+  assert.ok(terminalCommit > terminalStart);
   assert.ok(terminalCommitGuard > terminalCommit);
-  assert.ok(completionCard > terminalCommitGuard);
+  assert.ok(committedFinal > terminalCommitGuard);
+  assert.ok(completionCard > committedFinal);
 });

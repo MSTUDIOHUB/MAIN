@@ -5,6 +5,7 @@ import type {
   OrchestratorCallbacks,
   ToolExecutionResult,
 } from "./orchestrator/types";
+import { normalizeAgentLoopOutcome } from "./runOutcome";
 import {
   activateSubagentScopeLease,
   buildSubagentPolicyDeferral,
@@ -595,9 +596,14 @@ function resolveChildConfig(config: AppConfig, maxIterations: number): AppConfig
 
 function resolveOutcomeStatus(outcome: AgentLoopOutcome, aborted: boolean): SubagentStatus {
   if (aborted || outcome.status === "aborted") return "canceled";
-  if (outcome.status === "completed") return "completed";
+  if (outcome.status === "completed") {
+    if (outcome.resultKind === "success") return "completed";
+    if (outcome.resultKind === "partial") return "degraded";
+    if (outcome.resultKind === "blocked") return "blocked";
+    return "failed";
+  }
   if (outcome.status === "paused") return "blocked";
-  return "failed";
+  return "blocked";
 }
 
 interface PreparedSubagentRun {
@@ -1329,8 +1335,10 @@ export async function executeControlledSubagent(input: {
           lastError = "SUBAGENT_WALL_CLOCK_TIMEOUT: execution exceeded 240 seconds.";
           childAbortController.abort();
         }, 240_000);
-        const outcome = await input.executeAgentLoop(childCallbacks, childAbortController)
-          .finally(() => clearTimeout(wallClockTimer));
+        const outcome = normalizeAgentLoopOutcome(
+          await input.executeAgentLoop(childCallbacks, childAbortController)
+            .finally(() => clearTimeout(wallClockTimer)),
+        );
         finalStatus = resolveOutcomeStatus(outcome, childAbortController.signal.aborted);
         if (wallClockTimedOut) finalStatus = "blocked";
         const candidateSummary = compactText(
@@ -1384,13 +1392,24 @@ export async function executeControlledSubagent(input: {
           });
         }
         if (
-          finalStatus === "failed" &&
-          (outcome.status === "stopped_no_action" || outcome.status === "stopped_no_output") &&
+          finalStatus === "blocked" &&
+          (
+            (
+              outcome.status === "completed" &&
+              (outcome.resultKind === "partial" || outcome.resultKind === "blocked")
+            ) ||
+            (
+              outcome.status === "paused" &&
+              (outcome.pauseKind === "no_action" || outcome.pauseKind === "no_output")
+            )
+          ) &&
           (candidateSummary.length > 0 || evidence.length > 0)
         ) {
           finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
           emitChildDebug("subagent_partial_result_preserved", {
             outcomeStatus: outcome.status,
+            outcomePauseKind: outcome.status === "paused" ? outcome.pauseKind : null,
+            outcomeResultKind: outcome.status === "completed" ? outcome.resultKind : null,
             outcomeReason: outcome.reason,
             summaryChars: candidateSummary.length,
             observationCount: compactedEvidence.length,

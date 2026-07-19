@@ -465,6 +465,7 @@ export function buildRuntimeProgressLedger(input: {
     const isRunOwnedEvent = event.type === "progress.updated" ||
       event.type === "run.paused" ||
       event.type === "run.completed" ||
+      event.type === "run.aborted" ||
       event.type === "run.failed" ||
       event.type === "harness.telemetry";
     if (activeRunId && isRunOwnedEvent && eventRunId !== activeRunId) continue;
@@ -493,13 +494,33 @@ export function buildRuntimeProgressLedger(input: {
         });
       }
     } else if (event.type === "run.completed") {
+      const resultTitle = event.resultKind === "error"
+        ? language === "zh" ? "运行已结束（错误结论）" : "Run concluded with an error"
+        : event.resultKind === "blocked"
+        ? language === "zh" ? "运行已结束（受阻结论）" : "Run concluded blocked"
+        : event.resultKind === "partial"
+        ? language === "zh" ? "运行已部分完成" : "Run partially completed"
+        : language === "zh" ? "运行已完成" : "Run completed";
       addItem(byKey, {
         key: `run-completed:${eventRunId || event.turnId}`,
         runId: eventRunId,
         phase: "completed",
-        title: language === "zh" ? "运行已完成" : "Run completed",
+        title: resultTitle,
         status: "completed",
         summary: compactLine(event.summary || "", 260),
+        target: "",
+        tool: "",
+        firstSeenAt: event.timestampMs,
+        lastSeenAt: event.timestampMs,
+      });
+    } else if (event.type === "run.aborted") {
+      addItem(byKey, {
+        key: `run-aborted:${eventRunId || event.turnId}`,
+        runId: eventRunId,
+        phase: "completed",
+        title: language === "zh" ? "运行已取消" : "Run canceled",
+        status: "completed",
+        summary: compactLine(event.message || event.reason, 260),
         target: "",
         tool: "",
         firstSeenAt: event.timestampMs,

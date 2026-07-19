@@ -1630,6 +1630,38 @@ test("iteration boundary with substantive evidence is a degraded partial result,
   assert.ok(traceEvents.some((entry) => entry.event === "subagent_partial_result_preserved"));
 });
 
+test("a completed error conclusion never projects as subagent success", async () => {
+  subagents.resetSubagentRuntimeForTests();
+  const result = await subagentRuntime.executeControlledSubagent({
+    request: {
+      objective: "Inspect a bounded file",
+      scopeKey: "error-conclusion",
+      allowedPaths: "src/lib/subagents.ts",
+    },
+    parentCallbacks: {
+      getConfig: () => makeConfig("local"),
+      getPreferredLanguage: () => "en",
+      getSessionKey: () => "thread-error-conclusion",
+      getMessages: () => [],
+    },
+    parentTurnId: "turn-error-conclusion",
+    existingRunCount: 0,
+    emitEvent: () => {},
+    executeAgentLoop: async (childCallbacks) => {
+      childCallbacks.onAssistantFinalText("The provider request failed before inspection.");
+      return {
+        status: "completed",
+        resultKind: "error",
+        reason: "provider_connection_reset",
+      };
+    },
+  });
+
+  assert.equal(result.status, "failed");
+  assert.notEqual(result.closureAudit?.state, "satisfied");
+  assert.match(result.summary, /provider request failed/i);
+});
+
 test("overlapping child scope is a policy deferral rather than a failed spawn", () => {
   subagents.resetSubagentRuntimeForTests();
   subagents.acquireSubagentScopeLease({

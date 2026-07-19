@@ -52,6 +52,15 @@ export interface HarnessRunOwner {
   runId: string;
   sessionKey: string;
   turnId: string;
+  /** Optional exact-process fence for async close paths. */
+  instanceId?: string;
+  /** Optional lease-generation fence for a reused logical identity. */
+  startedAt?: number;
+}
+
+export interface ExactHarnessRunOwner extends HarnessRunOwner {
+  instanceId: string;
+  startedAt: number;
 }
 
 export function isHarnessRunMarkerOwnedByRun(
@@ -62,7 +71,9 @@ export function isHarnessRunMarkerOwnedByRun(
     marker.status === "running" &&
     marker.runId === owner.runId &&
     marker.sessionKey === owner.sessionKey &&
-    marker.turnId === owner.turnId;
+    marker.turnId === owner.turnId &&
+    (owner.instanceId == null || marker.instanceId === owner.instanceId) &&
+    (owner.startedAt == null || marker.startedAt === owner.startedAt);
 }
 
 /** The outer harness lease and the currently actionable child run are
@@ -218,6 +229,34 @@ export function persistHarnessRunMarker(marker: HarnessRunMarker): HarnessRunMar
   return normalized;
 }
 
+function hasSameHarnessLeaseIdentity(
+  current: HarnessRunMarker | null,
+  expected: HarnessRunMarker | null,
+): boolean {
+  if (!current || !expected) return current === expected;
+  return current.runId === expected.runId &&
+    current.sessionKey === expected.sessionKey &&
+    current.turnId === expected.turnId &&
+    current.instanceId === expected.instanceId &&
+    current.startedAt === expected.startedAt;
+}
+
+/**
+ * Acquire the global Harness slot only if its exact predecessor owner is still
+ * current. localStorage reads and writes are synchronous in this renderer, so
+ * the identity check and write form the acquisition CAS for competing async
+ * bootstraps. Mutable progress fields intentionally do not invalidate the
+ * predecessor; a different run/session/turn/process generation does.
+ */
+export function acquireHarnessRunMarker(
+  marker: HarnessRunMarker,
+  expectedCurrent: HarnessRunMarker | null,
+): HarnessRunMarker | null {
+  const current = readHarnessRunMarker();
+  if (!hasSameHarnessLeaseIdentity(current, expectedCurrent)) return null;
+  return persistHarnessRunMarker(marker);
+}
+
 export function persistHarnessRunMarkerIfOwned(
   marker: HarnessRunMarker,
   owner: HarnessRunOwner,
@@ -227,11 +266,63 @@ export function persistHarnessRunMarkerIfOwned(
   if (
     marker.runId !== owner.runId ||
     marker.sessionKey !== owner.sessionKey ||
-    marker.turnId !== owner.turnId
+    marker.turnId !== owner.turnId ||
+    (owner.instanceId != null && marker.instanceId !== owner.instanceId) ||
+    (owner.startedAt != null && marker.startedAt !== owner.startedAt)
   ) {
     return null;
   }
   return persistHarnessRunMarker(marker);
+}
+
+function isExactHarnessRunGeneration(
+  marker: HarnessRunMarker | null | undefined,
+  owner: ExactHarnessRunOwner,
+): marker is HarnessRunMarker {
+  return !!marker &&
+    marker.runId === owner.runId &&
+    marker.sessionKey === owner.sessionKey &&
+    marker.turnId === owner.turnId &&
+    marker.instanceId === owner.instanceId &&
+    marker.startedAt === owner.startedAt;
+}
+
+/**
+ * Settle one exact Harness generation. A retry of the same terminal meaning is
+ * idempotent, while a marker from another process generation is never touched
+ * even when its logical run/session/turn ids were reused.
+ */
+export function settleHarnessRunMarkerIfOwned(
+  marker: HarnessRunMarker,
+  owner: ExactHarnessRunOwner,
+): HarnessRunMarker | null {
+  const current = readHarnessRunMarker();
+  if (
+    marker.status === "running" ||
+    !isExactHarnessRunGeneration(current, owner) ||
+    !isExactHarnessRunGeneration(marker, owner)
+  ) {
+    return null;
+  }
+  if (
+    current.status === marker.status &&
+    current.closeReason === marker.closeReason
+  ) {
+    return current;
+  }
+  if (
+    current.status !== "running" &&
+    !(current.status === "paused" && marker.status !== "paused")
+  ) {
+    return null;
+  }
+  persistHarnessRunMarker(marker);
+  const verified = readHarnessRunMarker();
+  return isExactHarnessRunGeneration(verified, owner) &&
+      verified.status === marker.status &&
+      verified.closeReason === marker.closeReason
+    ? verified
+    : null;
 }
 
 export function closeHarnessRunMarker(
@@ -244,6 +335,42 @@ export function closeHarnessRunMarker(
     ...current,
     ...patch,
     status: patch.status || "closed",
+    closedAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  appendDebugLog("info", "app.instance.closed", {
+    reason: next.closeReason,
+    status: next.status,
+    turnId: next.turnId,
+    iteration: next.iteration,
+    streamStatus: next.streamStatus,
+    streamElapsedMs: next.streamElapsedMs,
+    streamLifecycleStatus: next.streamLifecycleStatus,
+  });
+  return next;
+}
+
+/**
+ * Revoke the exact Harness owner when its Session is deleted. A paused marker
+ * no longer owns the ordinary persistence write lease, but it still needs this
+ * deletion-only CAS so it cannot remain as an orphaned global marker.
+ */
+export function closeHarnessRunMarkerForSessionDeletion(
+  owner: HarnessRunOwner,
+): HarnessRunMarker | null {
+  const current = readHarnessRunMarker();
+  const ownsDeletableMarker = !!current &&
+    (current.status === "running" || current.status === "paused") &&
+    current.runId === owner.runId &&
+    current.sessionKey === owner.sessionKey &&
+    current.turnId === owner.turnId &&
+    (owner.instanceId == null || current.instanceId === owner.instanceId) &&
+    (owner.startedAt == null || current.startedAt === owner.startedAt);
+  if (!current || !ownsDeletableMarker) return null;
+  const next = persistHarnessRunMarker({
+    ...current,
+    status: "completed",
+    closeReason: "session_deleted",
     closedAt: Date.now(),
     updatedAt: Date.now(),
   });

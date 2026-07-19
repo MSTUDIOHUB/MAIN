@@ -21,6 +21,13 @@ export interface GoalRunAbortOwnershipDecision {
   reason: GoalRunAbortOwnershipReason;
 }
 
+export interface GoalPauseTransitionDecision {
+  nextStatus: "pausing" | "paused";
+  shouldAbortRun: boolean;
+  shouldClearQueuedContinuation: boolean;
+  abortReason: GoalRunAbortOwnershipReason;
+}
+
 interface GoalOwnedActionRequest {
   kind?: string | null;
   status?: string | null;
@@ -266,6 +273,66 @@ export function resolveGoalRunAbortOwnership(input: {
     return { owned: false, reason: "no_active_run_lease" };
   }
   return resolveGoalHarnessOwnership(input);
+}
+
+/**
+ * Pause is a Goal-owner operation, while `isGenerating` and `abortController`
+ * are session-global projections. Resolve both the queue cleanup and abort
+ * decision from exact Goal ownership so a Goal waiting behind another run
+ * cannot stop that foreign run or remain stuck in `pausing`.
+ */
+export function resolveGoalPauseTransition(input: {
+  goal: Pick<GoalDefinition, "id" | "revision" | "status" | "sessionKey" | "ownerTurnId">;
+  queuedMessage: QueuedGoalContinuation | null | undefined;
+  marker: HarnessRunMarker | null | undefined;
+  currentWorkspace: string | null | undefined;
+  currentSessionKey: string | null | undefined;
+  isGenerating: boolean;
+  hasAbortController: boolean;
+  hasOwnedPendingReview?: boolean;
+}): GoalPauseTransitionDecision {
+  const abortOwnership = resolveGoalRunAbortOwnership({
+    goal: input.goal,
+    marker: input.marker,
+    currentWorkspace: input.currentWorkspace,
+    currentSessionKey: input.currentSessionKey,
+    isGenerating: input.isGenerating,
+    hasAbortController: input.hasAbortController,
+    hasOwnedPendingReview: input.hasOwnedPendingReview,
+  });
+  return {
+    nextStatus: abortOwnership.owned ? "pausing" : "paused",
+    shouldAbortRun: abortOwnership.owned,
+    shouldClearQueuedContinuation: isQueuedGoalContinuationOwnedByGoal({
+      queuedMessage: input.queuedMessage,
+      goal: input.goal,
+      workspaceKey: input.currentWorkspace,
+      sessionKey: input.currentSessionKey,
+    }),
+    abortReason: abortOwnership.reason,
+  };
+}
+
+/**
+ * Goal id/revision survive a manual resume, so they cannot by themselves fence
+ * callbacks from the old workflow. The captured owner Turn is the continuation
+ * generation boundary and must still match before any Goal callback publishes.
+ */
+export function isCurrentGoalWorkflowOwner(input: {
+  goalId: string;
+  goalRevision: number;
+  ownerTurnId: string;
+  currentGoal: Pick<GoalDefinition, "id" | "revision" | "ownerTurnId"> | null | undefined;
+  fallbackOwnerTurnId?: string | null;
+}): boolean {
+  const expectedOwnerTurnId = String(input.ownerTurnId || "").trim();
+  const currentOwnerTurnId = String(
+    input.currentGoal?.ownerTurnId || input.fallbackOwnerTurnId || "",
+  ).trim();
+  return !!expectedOwnerTurnId &&
+    input.currentGoal?.id === input.goalId &&
+    (input.currentGoal.revision || 1) === Math.max(1, Number(input.goalRevision) || 1) &&
+    currentOwnerTurnId === expectedOwnerTurnId;
 }
 
 /** A pending permission is part of the Goal lease even though the UI marks

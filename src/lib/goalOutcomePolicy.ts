@@ -1,18 +1,18 @@
 import type { GoalRecoveryState, GoalStatus } from "./goalState";
+import type {
+  AgentLoopPauseKind,
+  AgentLoopResultKind,
+  LegacyAgentLoopOutcomeStatus,
+} from "./runOutcome";
 
-export type GoalInnerOutcomeStatus =
-  | "completed"
-  | "paused"
-  | "stopped_no_action"
-  | "stopped_no_output"
-  | "aborted"
-  | "error";
+export type GoalInnerOutcomeStatus = LegacyAgentLoopOutcomeStatus;
 
 export type GoalInnerOutcomeAction =
   | "continue"
   | "recover"
   | "awaiting_input"
   | "paused"
+  | "blocked"
   | "failed";
 
 export interface GoalInnerOutcomeDecision {
@@ -52,6 +52,8 @@ export function normalizeGoalRecoveryCause(
 
 export function resolveGoalInnerOutcomeDecision(input: {
   status?: GoalInnerOutcomeStatus;
+  resultKind?: AgentLoopResultKind;
+  pauseKind?: AgentLoopPauseKind;
   stopReason?: string;
   sliceBoundaryReached?: boolean;
   isAborted?: boolean;
@@ -61,11 +63,28 @@ export function resolveGoalInnerOutcomeDecision(input: {
   if (status === "aborted" || input.isAborted || USER_PAUSE_RE.test(reason)) {
     return { action: "paused", reason };
   }
-  if (USER_INPUT_RE.test(reason)) {
+  if (input.pauseKind === "action_required" || USER_INPUT_RE.test(reason)) {
     return { action: "awaiting_input", reason };
   }
   if (UNRECOVERABLE_RE.test(reason)) {
     return { action: "failed", reason };
+  }
+  if (input.resultKind === "error") {
+    return {
+      action: "recover",
+      reason,
+      normalizedCause: normalizeGoalRecoveryCause("error", reason),
+    };
+  }
+  if (input.resultKind === "blocked") {
+    return { action: "blocked", reason };
+  }
+  if (input.pauseKind === "no_action" || input.pauseKind === "no_output") {
+    return {
+      action: "recover",
+      reason,
+      normalizedCause: input.pauseKind,
+    };
   }
   if (status === "paused" || RUNTIME_PAUSE_BOUNDARY_RE.test(reason)) {
     return { action: "paused", reason };
@@ -98,6 +117,7 @@ export function advanceGoalRecoveryState(input: {
 export function goalStatusForOutcomeAction(action: GoalInnerOutcomeAction): GoalStatus | null {
   if (action === "awaiting_input") return "awaiting_input";
   if (action === "paused") return "paused";
+  if (action === "blocked") return "blocked";
   if (action === "failed") return "failed";
   return null;
 }

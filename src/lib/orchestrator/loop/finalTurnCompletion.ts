@@ -9,6 +9,7 @@ import type { MainThreadEventInput, MainThreadItem } from "../../turnEvents";
 import type { ReplyOption } from "../../workflowModels";
 import type { OrchestratorCallbacks } from "../types";
 import type { TurnIterationContext } from "./turnIterationContext";
+import { USER_CHOICE_PAUSE_REASON } from "../../runOutcome";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 type CompletionStatus = "none" | "stopped";
@@ -172,7 +173,7 @@ export function handleReplyOptionsPause(input: {
     callbacks,
     ...completion,
     completionMode: "paused",
-    pauseReason: "awaiting_input",
+    pauseReason: USER_CHOICE_PAUSE_REASON,
     pauseMessage: callbacks.getPreferredLanguage() === "zh"
       ? "正在等待用户在当前回合中选择或补充信息。"
       : "Waiting for the user to choose or clarify within the current turn.",

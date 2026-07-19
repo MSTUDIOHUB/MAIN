@@ -1,21 +1,10 @@
 // src/lib/orchestrator/state/TurnContext.ts
-// TurnContext holds mutable turn state, the ephemeral item registry,
-// and provides the lifecycle methods for starting/ending a turn.
+// TurnContext holds mutable turn state and the ephemeral item registry.
 // Supports both legacy (ExecutionTurn-based) and new (sessionId-based) APIs.
 // ────────────────────────────────────────────────────────────────────
 
 import { generateId } from "../../utils";
 import type { TurnItem, ToolExecutionRecord, ExecutionTurn } from "./Thread";
-
-export type TurnPhase =
-  | "init"
-  | "building_prompt"
-  | "streaming"
-  | "evaluating"
-  | "executing_tools"
-  | "pruning"
-  | "completed"
-  | "failed";
 
 export interface BurnedReplacement {
   replacementText: string;
@@ -25,7 +14,6 @@ export interface BurnedReplacement {
 export class TurnContext {
   readonly turnId: string;
   readonly sessionId: string;
-  private _phase: TurnPhase = "init";
   private ephemeralItems: Map<string, TurnItem> = new Map();
   private persistentItems: Map<string, TurnItem> = new Map();
   private burnedReplacements: BurnedReplacement[] = [];
@@ -61,10 +49,6 @@ export class TurnContext {
     }
   }
 
-  get phase(): TurnPhase { return this._phase; }
-  get isTerminal(): boolean { return this._phase === "completed" || this._phase === "failed"; }
-
-  setPhase(phase: TurnPhase): void { this._phase = phase; }
   setSummary(s: string): void { this.summary = s; }
   getSummary(): string { return this.summary; }
 
@@ -72,13 +56,6 @@ export class TurnContext {
 
   startTurn(): void {
     if (this.legacyTurn) this.legacyTurn.startTime = Date.now();
-  }
-
-  endTurn(): void {
-    if (this.legacyTurn) {
-      this.legacyTurn.endTime = Date.now();
-    }
-    this._phase = "completed";
   }
 
   addItem(item: Omit<TurnItem, "id" | "createdAt">): TurnItem {
@@ -179,18 +156,6 @@ export class TurnContext {
 
   recordBurnedReplacement(replacement: BurnedReplacement): void { this.burnedReplacements.push(replacement); }
   getBurnedReplacements(): BurnedReplacement[] { return this.burnedReplacements; }
-
-  // ── Lifecycle ──────────────────────────────────────────────────────
-
-  complete(): void {
-    this._phase = "completed";
-    this.endTurn();
-  }
-
-  fail(reason: string): void {
-    this._phase = "failed";
-    this.summary = reason;
-  }
 
   toTurnSummary(): string {
     const parts: string[] = [];

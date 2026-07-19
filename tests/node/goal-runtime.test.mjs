@@ -311,6 +311,90 @@ test("a stale active Goal cannot abort the current non-Goal run", () => {
   assert.deepEqual(decision, { owned: false, reason: "runtime_intent_mismatch" });
 });
 
+test("pausing a queued Goal preserves the foreign run and settles the Goal as paused", () => {
+  const goal = {
+    id: "goal-queued",
+    revision: 3,
+    status: "active",
+    sessionKey: "/workspace:42",
+    ownerTurnId: "turn-goal-resume",
+  };
+  const decision = goalRunOwnership.resolveGoalPauseTransition({
+    goal,
+    queuedMessage: {
+      id: "queued-goal-resume",
+      status: "queued",
+      sessionKey: "/workspace:42",
+      goalContinuationAuthorization: {
+        kind: "goal_continuation_authorization",
+        source: "goal_manual_resume",
+        workspaceKey: "/workspace",
+        sessionKey: "/workspace:42",
+        goalId: goal.id,
+        goalRevision: goal.revision,
+        ownerTurnId: goal.ownerTurnId,
+      },
+    },
+    marker: {
+      status: "running",
+      runtimeIntent: "execute",
+      sessionKey: "/workspace:42",
+      turnId: "turn-foreign-execute",
+      workspace: "/workspace",
+    },
+    currentWorkspace: "/workspace",
+    currentSessionKey: "/workspace:42",
+    isGenerating: true,
+    hasAbortController: true,
+  });
+
+  assert.deepEqual(decision, {
+    nextStatus: "paused",
+    shouldAbortRun: false,
+    shouldClearQueuedContinuation: true,
+    abortReason: "runtime_intent_mismatch",
+  });
+});
+
+test("Goal workflow callbacks are fenced by the captured owner Turn", () => {
+  const captured = {
+    goalId: "goal-1",
+    goalRevision: 4,
+    ownerTurnId: "turn-old",
+  };
+  assert.equal(goalRunOwnership.isCurrentGoalWorkflowOwner({
+    ...captured,
+    currentGoal: { id: "goal-1", revision: 4, ownerTurnId: "turn-old" },
+  }), true);
+  assert.equal(goalRunOwnership.isCurrentGoalWorkflowOwner({
+    ...captured,
+    currentGoal: { id: "goal-1", revision: 4, ownerTurnId: "turn-resumed" },
+  }), false);
+
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const goalLoopStart = workflowSource.indexOf("const executeLoopStrategy =");
+  const goalLoopEnd = workflowSource.indexOf("return executeAgentLoop(callbacks, abortCtrl);", goalLoopStart);
+  const goalLoopSource = workflowSource.slice(goalLoopStart, goalLoopEnd);
+  assert.match(goalLoopSource, /const goalOwnerTurnId = String\(activeGoal\.ownerTurnId \|\| turnId\)\.trim\(\)/);
+  assert.match(goalLoopSource, /isCurrentGoalWorkflowOwner\(\{[\s\S]*?ownerTurnId: goalOwnerTurnId/);
+});
+
+test("Goal pause binds the global AbortController to the owner-scoped decision", () => {
+  const storeSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/store/useAppStore.ts"),
+    "utf8",
+  );
+  const pauseStart = storeSource.indexOf("pauseGoal: (expectedIdentity) => {");
+  const pauseEnd = storeSource.indexOf("resumeGoal: (expectedIdentity) => {", pauseStart);
+  const pauseSource = storeSource.slice(pauseStart, pauseEnd);
+  assert.match(pauseSource, /const pauseTransition = resolveGoalPauseTransition\(\{/);
+  assert.match(pauseSource, /if \(pauseTransition\.shouldAbortRun\) abortController\?\.abort\(\)/);
+  assert.equal((pauseSource.match(/abortController\?\.abort\(\)/g) || []).length, 1);
+});
+
 test("Goal deletion claims an action request only through the exact Goal marker", () => {
   const goal = {
     sessionKey: "/workspace:42",
@@ -636,6 +720,25 @@ test("Goal outcome policy preserves explicit pause boundaries before slice auto-
   });
   assert.equal(protocol.action, "recover");
   assert.equal(protocol.normalizedCause, "protocol_no_progress");
+
+  const canonicalNoAction = goalOutcomePolicy.resolveGoalInnerOutcomeDecision({
+    status: "paused",
+    pauseKind: "no_action",
+    stopReason: "execution_evidence_required",
+  });
+  assert.deepEqual(canonicalNoAction, {
+    action: "recover",
+    reason: "execution_evidence_required",
+    normalizedCause: "no_action",
+  });
+
+  const canonicalError = goalOutcomePolicy.resolveGoalInnerOutcomeDecision({
+    status: "completed",
+    resultKind: "error",
+    stopReason: "provider stream failed",
+  });
+  assert.equal(canonicalError.action, "recover");
+  assert.equal(canonicalError.normalizedCause, "transient_provider_failure");
 
   const workflowSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
@@ -2419,7 +2522,7 @@ test("read-only 8/8 slice preserves slice_budget_exhausted while recovery tracks
   assert.equal(firstSlice.stopClass, "slice_budget_exhausted");
 });
 
-test("permission and unrecoverable inner outcomes map to awaiting_input and failed", async () => {
+test("canonical action-required and error conclusions map to awaiting_input and failed", async () => {
   const permissionGoal = goalState.createGoalDefinition({ objective: "Fix runtime", iterationBudget: 10 });
   const permissionHarness = createEngineCallbacks(async () => ({
     assistantText: "Approval required",
@@ -2427,6 +2530,7 @@ test("permission and unrecoverable inner outcomes map to awaiting_input and fail
     tokensUsed: 10,
     completed: false,
     outcomeStatus: "paused",
+    outcomePauseKind: "action_required",
     stopReason: "permission_approval_required",
   }));
   const permissionOutcome = await goalEngine.executeGoalLoop({ goal: permissionGoal, callbacks: permissionHarness.callbacks });
@@ -2438,8 +2542,9 @@ test("permission and unrecoverable inner outcomes map to awaiting_input and fail
     assistantText: "Model unavailable",
     toolCalls: [],
     tokensUsed: 10,
-    completed: false,
-    outcomeStatus: "error",
+    completed: true,
+    outcomeStatus: "completed",
+    outcomeResultKind: "error",
     stopReason: "model_not_found",
   }));
   const fatalOutcome = await goalEngine.executeGoalLoop({ goal: fatalGoal, callbacks: fatalHarness.callbacks });

@@ -59,7 +59,7 @@ function createHarness(stateOverrides = {}) {
     approvedPendingReview: 0,
     approvedPlans: [],
     patches: [],
-    statuses: [],
+    cancellations: [],
     logs: [],
   };
   const state = {
@@ -98,8 +98,9 @@ function createHarness(stateOverrides = {}) {
         setState: (patch) => {
           calls.patches.push(patch);
         },
-        setConversationTurnStatus: (turnId, status) => {
-          calls.statuses.push({ turnId, status });
+        closeTurnAsCanceled: (turnId, options) => {
+          calls.cancellations.push({ turnId, options });
+          return true;
         },
         logStoreEvent: (event, data) => {
           calls.logs.push({ event, data });
@@ -274,12 +275,28 @@ test("send gate effects reset stuck running state and continue submission", () =
   assert.equal(result.shouldContinue, true);
   assert.equal(result.returnValue, undefined);
   assert.equal(result.decision.action.kind, "reset_stuck_state");
-  assert.deepEqual(harness.calls.patches, [
-    { agentStatus: "idle", isGenerating: false },
-  ]);
-  assert.deepEqual(harness.calls.statuses, [
-    { turnId: "turn-stuck", status: "stopped_no_action" },
-  ]);
+  assert.deepEqual(harness.calls.patches, []);
+  assert.deepEqual(harness.calls.cancellations, [{
+    turnId: "turn-stuck",
+    options: {
+      reason: "stale_runtime_superseded",
+      message: "检测到旧回合的运行租约已经丢失；旧回合已取消并完成收口。",
+    },
+  }]);
   assert.equal(harness.calls.logs[0].event, "send_stuck_state_reset");
   assert.equal(harness.calls.logs[0].data.previousStatus, "running");
+});
+
+test("send gate effects still releases a stuck status when no logical turn can be closed", () => {
+  const harness = createHarness({
+    agentStatus: "running",
+    abortController: null,
+    currentTurnId: null,
+  });
+  const result = harness.apply({ text: "continue" });
+
+  assert.equal(result.shouldContinue, true);
+  assert.equal(result.decision.action.kind, "reset_stuck_state");
+  assert.deepEqual(harness.calls.cancellations, []);
+  assert.deepEqual(harness.calls.patches, [{ agentStatus: "idle", isGenerating: false }]);
 });

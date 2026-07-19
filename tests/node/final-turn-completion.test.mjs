@@ -126,7 +126,7 @@ test("reply option pause completes the assistant item but keeps the logical turn
   assert.equal(harness.events[0].turnId, "turn_1");
   assert.equal(harness.events[0].item.details.text, "Assistant answer");
   assert.equal(harness.events[1].type, "run.paused");
-  assert.equal(harness.events[1].reason, "awaiting_input");
+  assert.equal(harness.events[1].reason, "awaiting_user_choice");
   assert.equal(harness.events[1].runId, "run_1");
   assert.equal(harness.events[1].parentRunId, "run_parent");
 });

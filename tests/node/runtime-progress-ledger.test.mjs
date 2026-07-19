@@ -669,8 +669,16 @@ test("run status projection keeps cache-only stubs out of current activity and m
   assert.equal(projection.healthSignals[0].kind, "repetition");
 });
 
-test("newer completed paused and failed terminal states override older running activity", () => {
-  for (const terminal of ["completed", "paused", "failed"]) {
+test("newer canonical and legacy terminal states override older running activity", () => {
+  for (const terminal of [
+    "completed",
+    "partial_conclusion",
+    "blocked_conclusion",
+    "error_conclusion",
+    "paused",
+    "aborted",
+    "legacy_failed",
+  ]) {
     const running = withEventSchema({
       type: "progress.updated",
       threadId: "thread-terminal",
@@ -687,7 +695,12 @@ test("newer completed paused and failed terminal states override older running a
         sourceToolCallIds: [`read-${terminal}`],
       },
     });
-    const terminalEvent = terminal === "completed"
+    const terminalEvent = [
+      "completed",
+      "partial_conclusion",
+      "blocked_conclusion",
+      "error_conclusion",
+    ].includes(terminal)
       ? withEventSchema({
           type: "run.completed",
           threadId: "thread-terminal",
@@ -695,6 +708,13 @@ test("newer completed paused and failed terminal states override older running a
           runId: `run-${terminal}`,
           parentRunId: null,
           timestampMs: 20,
+          resultKind: terminal === "partial_conclusion"
+            ? "partial"
+            : terminal === "blocked_conclusion"
+            ? "blocked"
+            : terminal === "error_conclusion"
+            ? "error"
+            : "success",
           summary: "All runtime evidence is complete.",
         })
       : terminal === "paused"
@@ -707,6 +727,17 @@ test("newer completed paused and failed terminal states override older running a
           timestampMs: 20,
           reason: "bounded_recovery",
           message: "Recovery paused after the bounded retry limit.",
+        })
+      : terminal === "aborted"
+      ? withEventSchema({
+          type: "run.aborted",
+          threadId: "thread-terminal",
+          turnId: `turn-${terminal}`,
+          runId: `run-${terminal}`,
+          parentRunId: null,
+          timestampMs: 20,
+          reason: "user_cancelled",
+          message: "The user canceled this run.",
         })
       : withEventSchema({
           type: "run.failed",
@@ -726,9 +757,31 @@ test("newer completed paused and failed terminal states override older running a
     const projection = buildRunStatusProjection(items, "zh");
 
     assert.equal(projection.currentActivity, null, `${terminal} must clear stale running activity`);
-    if (terminal === "completed") {
+    if (
+      terminal === "completed" ||
+      terminal === "partial_conclusion" ||
+      terminal === "blocked_conclusion" ||
+      terminal === "error_conclusion" ||
+      terminal === "aborted"
+    ) {
       assert.ok(projection.milestones.some((item) => item.status === "completed"));
-      assert.match(projection.activityText, /运行已完成/);
+      assert.match(
+        projection.activityText,
+        terminal === "partial_conclusion"
+          ? /部分完成/
+          : terminal === "blocked_conclusion"
+          ? /受阻结论/
+          : terminal === "error_conclusion"
+          ? /错误结论/
+          : terminal === "aborted"
+          ? /运行已取消/
+          : /运行已完成/,
+      );
+      assert.equal(
+        projection.healthSignals.some((signal) => signal.kind === "failure" || signal.kind === "pause"),
+        false,
+        `${terminal} is a closed conclusion, not an app-level failed or paused state`,
+      );
     } else {
       assert.ok(projection.healthSignals.some((signal) => signal.kind === (terminal === "paused" ? "pause" : "failure")));
     }

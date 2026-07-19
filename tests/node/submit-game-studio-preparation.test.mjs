@@ -148,7 +148,7 @@ test("submit game studio preparation applies success runtime patch and cache eff
   assert.equal(harness.disposed, false);
 });
 
-test("submit game studio preparation records failure and stops the run", () => {
+test("submit game studio preparation returns failure for the shared bootstrap conclusion owner", () => {
   const state = createState();
   const harness = createHarness(state);
 
@@ -170,15 +170,13 @@ test("submit game studio preparation records failure and stops the run", () => {
   });
 
   assert.equal(result.ok, false);
-  assert.equal(harness.disposed, true);
-  assert.equal(state.taskFlow.length, 1);
-  assert.equal(state.taskFlow[0].content, "Game Studio 初始化失败：offline");
-  assert.equal(state.conversationTurns[0].status, "error");
-  assert.deepEqual(state.conversationTurns[0].blockIds, [10]);
-  assert.equal(state.agentStatus, "error");
-  assert.equal(state.isGenerating, false);
-  assert.equal(state.abortController, null);
-  assert.equal(state.pendingSlashCommand, null);
+  assert.equal(result.errorMessage, "Game Studio 初始化失败：offline");
+  assert.equal(harness.disposed, false);
+  assert.equal(state.taskFlow.length, 0);
+  assert.equal(state.conversationTurns[0].status, "executing");
+  assert.deepEqual(state.conversationTurns[0].blockIds, []);
+  assert.equal(state.agentStatus, "running");
+  assert.equal(state.isGenerating, true);
 });
 
 test("submit game studio preparation runs preparation and applies envelope result", async () => {

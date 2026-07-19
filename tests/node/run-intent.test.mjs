@@ -897,20 +897,6 @@ test("continuation resumes an unfinished execute turn", () => {
   );
 });
 
-test("store marks aborted idle turns as resumable before deriving completed_with_changes", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
-
-  assert.match(source, /const statusOverride =\s*status === "idle" && abortCtrl\.signal\.aborted\s*\?\s*"stopped_no_action"/);
-  assert.match(source, /override: statusOverride/);
-});
-
-test("workflow engine marks non-actionable stops as resumable turn status", () => {
-  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
-
-  assert.match(source, /const stoppedStatus = reason === "no_output"[\s\S]*\? "stopped_no_output"[\s\S]*: reason === "incomplete_plan"[\s\S]*\? "paused"[\s\S]*: "stopped_no_action"/);
-  assert.match(source, /turn\.id === turnId && turn\.status !== "awaiting_approval"[\s\S]*status: stoppedStatus/);
-});
-
 test("store asks before executing when preflight upgrades natural chat to operations", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/store/useAppStore.ts"), "utf8");
   const submitIntentRoutingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/store/submitIntentRouting.ts"), "utf8");

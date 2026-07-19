@@ -57,9 +57,14 @@ export interface SubmitTurnDraft {
 export function prepareSubmitTurnDraft(input: PrepareSubmitTurnDraftInput): SubmitTurnDraft {
   const sessionState = input.sessionGet();
   const nextTaskId = sessionState._nextTaskId;
+  const requestedTurnId = String(input.turnIdOverride || "").trim();
+  const availableNewTurnId = requestedTurnId &&
+    !input.conversationTurns.some((turn) => turn.id === requestedTurnId)
+    ? requestedTurnId
+    : null;
   const turnId = input.reuseCurrentTurn
     ? input.reusableTurnId!
-    : input.turnIdOverride || input.createTurnId?.() || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    : availableNewTurnId || input.createTurnId?.() || `turn-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const uiDisplayTurnId = input.uiParentTurnId || turnId;
   const currentImages = input.images || [];
   const turnInputContextSignals = normalizeTurnInputContextSignals({

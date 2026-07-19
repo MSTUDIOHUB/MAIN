@@ -65,6 +65,13 @@ const {
   runApprovedPlanCompletionGuard,
   runExecutionEvidenceCompletionGuard,
 } = completionGuardsModule;
+const { handleReplyOptionsPause } = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/orchestrator/loop/finalTurnCompletion.ts"),
+);
+const {
+  appendRuntimeEventWithResult,
+  withEventSchema,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/turnEvents.ts"));
 
 test("terminal execution checkpoint preserves mutations, readiness, and the concrete browser blocker", () => {
   const ledger = [
@@ -170,6 +177,9 @@ function loadAgentLoopRunnerWithFake(FakeAgentOrchestrator, logEvents) {
     if (specifier === "./completionGuards") {
       return completionGuardsModule;
     }
+    if (specifier === "../../runOutcome") {
+      return loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/runOutcome.ts"));
+    }
     return localRequire(specifier);
   };
   const factory = new Function("exports", "module", "require", transpiled);
@@ -199,63 +209,74 @@ function createCallbacks(overrides = {}) {
   return { callbacks, events };
 }
 
-test("completion guard maps non-actionable stops to structured loop outcomes", () => {
-  assert.deepEqual(resolveNonActionableStopOutcome("no_output"), {
-    status: "stopped_no_output",
-    reason: "no_output",
+function assertCompletedOutcome(actual, resultKind, reason) {
+  assert.deepEqual(actual, {
+    status: "completed",
+    resultKind,
+    reason,
   });
-  assert.deepEqual(resolveNonActionableStopOutcome("incomplete_plan"), {
-    status: "paused",
-    reason: "incomplete_plan",
-  });
-  assert.deepEqual(
+}
+
+test("non-actionable stops always close with an explicit result quality", () => {
+  assertCompletedOutcome(
+    resolveNonActionableStopOutcome("no_output"),
+    "error",
+    "no_output",
+  );
+  assertCompletedOutcome(
+    resolveNonActionableStopOutcome("no_output", undefined, {
+      sawExecutionEvidence: true,
+    }),
+    "error",
+    "no_output",
+  );
+  assertCompletedOutcome(
+    resolveNonActionableStopOutcome("incomplete_plan"),
+    "blocked",
+    "incomplete_plan",
+  );
+  assertCompletedOutcome(
     resolveNonActionableStopOutcome("incomplete_plan", {
       recoveryReason: "approved_plan_completion_guard_no_evidence",
     }),
-    {
-      status: "stopped_no_action",
-      reason: "approved_plan_completion_guard_no_evidence",
-    },
+    "blocked",
+    "approved_plan_completion_guard_no_evidence",
   );
-  assert.deepEqual(
+  assertCompletedOutcome(
     resolveNonActionableStopOutcome("incomplete_plan", {
       recoveryReason: "preapproval_plan_quality_recovery_stream_timeout",
     }),
-    {
-      status: "paused",
-      reason: "preapproval_plan_quality_recovery_stream_timeout",
-    },
+    "blocked",
+    "preapproval_plan_quality_recovery_stream_timeout",
   );
-  assert.deepEqual(
+  assertCompletedOutcome(
     resolveNonActionableStopOutcome("missing_tool_loop", {
       recoveryReason: "required_tool_call_protocol_violation_after_change",
+    }, {
+      sawExecutionEvidence: true,
     }),
-    {
-      status: "paused",
-      reason: "required_tool_call_protocol_violation_after_change",
-    },
+    "partial",
+    "required_tool_call_protocol_violation_after_change",
   );
-  assert.deepEqual(
+  assertCompletedOutcome(
     resolveNonActionableStopOutcome("no_action", {
       recoveryReason: "execute_recovery_no_progress_limit",
     }),
-    {
-      status: "paused",
-      reason: "execute_recovery_no_progress_limit",
-    },
+    "blocked",
+    "execute_recovery_no_progress_limit",
   );
-  assert.deepEqual(
+  assertCompletedOutcome(
     resolveNonActionableStopOutcome("no_action", {
       recoveryReason: "execute_no_progress_batch_loop",
+    }, {
+      sawExecutionEvidence: true,
     }),
-    {
-      status: "paused",
-      reason: "execute_no_progress_batch_loop",
-    },
+    "partial",
+    "execute_no_progress_batch_loop",
   );
 });
 
-test("execution evidence completion guard pauses completed execute turns without evidence", () => {
+test("execution evidence completion guard closes execute turns without evidence as blocked", () => {
   const { callbacks, events } = createCallbacks();
   const result = runExecutionEvidenceCompletionGuard({
     outcome: { status: "completed", reason: "agent_loop_completed" },
@@ -271,10 +292,7 @@ test("execution evidence completion guard pauses completed execute turns without
     sawExecutionEvidence: false,
   });
 
-  assert.deepEqual(result, {
-    status: "stopped_no_action",
-    reason: "execution_evidence_required",
-  });
+  assertCompletedOutcome(result, "blocked", "execution_evidence_required");
   assert.equal(events.stops.length, 1);
   assert.equal(events.stops[0].reason, "no_action");
   assert.equal(events.statuses.at(-1), "idle");
@@ -365,7 +383,11 @@ test("an active recovery phase blocks final completion even when prior evidence 
       decisionCheckpoint: null,
     },
   });
-  assert.equal(result.reason, "execution_evidence_gap:recovery_phase_pending");
+  assertCompletedOutcome(
+    result,
+    "partial",
+    "execution_evidence_gap:recovery_phase_pending",
+  );
   assert.match(events.stops[0].message, /恢复事务仍处于 validation 阶段/);
 });
 
@@ -395,10 +417,11 @@ test("execution evidence completion guard rejects mutation without later validat
     sawExecutionEvidence: true,
   });
 
-  assert.deepEqual(result, {
-    status: "paused",
-    reason: "execution_evidence_gap:validation_after_mutation_required",
-  });
+  assertCompletedOutcome(
+    result,
+    "partial",
+    "execution_evidence_gap:validation_after_mutation_required",
+  );
   assert.match(events.stops[0].message, /最新修改之后没有可信/);
   assert.equal(events.stops[0].progress.recoveryReason, "execution_evidence_gap:validation_after_mutation_required");
 });
@@ -436,7 +459,11 @@ test("validation before a newer mutation cannot close the execution evidence gat
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assert.equal(result.reason, "execution_evidence_gap:validation_after_mutation_required");
+  assertCompletedOutcome(
+    result,
+    "partial",
+    "execution_evidence_gap:validation_after_mutation_required",
+  );
 });
 
 test("a later actual browser failure remains unresolved until the same browser target succeeds", () => {
@@ -483,7 +510,11 @@ test("a later actual browser failure remains unresolved until the same browser t
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assert.equal(blocked.reason, "execution_evidence_gap:unreconciled_failure");
+  assertCompletedOutcome(
+    blocked,
+    "partial",
+    "execution_evidence_gap:unreconciled_failure",
+  );
 
   const recoveredHarness = createCallbacks({
     getPlanExecutionEvidenceLedger: () => [...failedLedger, {
@@ -539,7 +570,11 @@ test("ledger append order, not equal millisecond timestamps, determines post-mut
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assert.equal(blocked.reason, "execution_evidence_gap:validation_after_mutation_required");
+  assertCompletedOutcome(
+    blocked,
+    "partial",
+    "execution_evidence_gap:validation_after_mutation_required",
+  );
 
   const closedHarness = createCallbacks({
     getPlanExecutionEvidenceLedger: () => [
@@ -607,7 +642,11 @@ test("long-running execution requires PTY readiness and only interaction work re
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assert.equal(pending.reason, "execution_evidence_gap:pty_observation_required");
+  assertCompletedOutcome(
+    pending,
+    "partial",
+    "execution_evidence_gap:pty_observation_required",
+  );
 
   const readyLedger = [...baseLedger, {
     id: "ready",
@@ -647,7 +686,11 @@ test("long-running execution requires PTY readiness and only interaction work re
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assert.equal(interactionReady.reason, "execution_evidence_gap:browser_validation_required");
+  assertCompletedOutcome(
+    interactionReady,
+    "partial",
+    "execution_evidence_gap:browser_validation_required",
+  );
 
   const browserHarness = createCallbacks({
     getPlanExecutionEvidenceLedger: () => [...interactionReadyLedger, {
@@ -720,8 +763,9 @@ test("validation-only long-running execution completes after current PTY readine
     sawExecutionEvidence: true,
   });
 
-  assert.equal(
-    guard([launch])?.reason,
+  assertCompletedOutcome(
+    guard([launch]),
+    "partial",
     "execution_evidence_gap:pty_observation_required",
   );
   const ready = {
@@ -787,7 +831,11 @@ test("a healthy existing server reconciles a port conflict but still requires br
     approvedPlanAlreadyAudited: false,
     sawExecutionEvidence: true,
   });
-  assert.equal(reconciled.reason, "execution_evidence_gap:browser_validation_required");
+  assertCompletedOutcome(
+    reconciled,
+    "partial",
+    "execution_evidence_gap:browser_validation_required",
+  );
 
   const browserHarness = createCallbacks({
     getPlanExecutionEvidenceLedger: () => [...reconciledLedger, {
@@ -832,7 +880,7 @@ test("a healthy existing server reconciles a port conflict but still requires br
   assert.equal(closed, null);
 });
 
-test("approved plan provenance keeps its completion guard in default execute workflow", () => {
+test("approved plan provenance closes without evidence as blocked", () => {
   const { callbacks, events } = createCallbacks({
     getWorkflowMode: () => "edit",
     getIsPlanApproved: () => true,
@@ -843,10 +891,7 @@ test("approved plan provenance keeps its completion guard in default execute wor
     sawExecutionEvidence: false,
   });
 
-  assert.deepEqual(result, {
-    status: "stopped_no_action",
-    reason: "approved_plan_completion_guard",
-  });
+  assertCompletedOutcome(result, "blocked", "approved_plan_completion_guard");
   assert.equal(events.stops.length, 1);
   assert.equal(events.stops[0].reason, "incomplete_plan");
   assert.equal(events.stops[0].progress.recoveryReason, "approved_plan_completion_guard_no_evidence");
@@ -884,10 +929,7 @@ test("approved plan completion keeps user review advisory without disabling auto
     sawExecutionEvidence: true,
   });
 
-  assert.deepEqual(result, {
-    status: "paused",
-    reason: "approved_plan_completion_guard",
-  });
+  assertCompletedOutcome(result, "partial", "approved_plan_completion_guard");
   assert.equal(events.stops.length, 1);
   assert.equal(
     events.stops[0].progress.recoveryReason,
@@ -933,13 +975,14 @@ test("approved plan completion is deferred until the current loop consumes the e
 
   assert.deepEqual(result, {
     status: "paused",
+    pauseKind: "recoverable",
     reason: "approved_plan_same_turn_execution_pending",
   });
   assert.equal(events.stops.length, 0);
   assert.equal(events.statuses.length, 0);
 });
 
-test("approved plan recovery without a pending approval transition still runs the evidence guard", () => {
+test("approved plan recovery without an internal continuation lease closes as blocked", () => {
   const { callbacks, events } = createCallbacks({
     getWorkflowMode: () => "plan",
     getIsPlanApproved: () => true,
@@ -951,10 +994,7 @@ test("approved plan recovery without a pending approval transition still runs th
     sawExecutionEvidence: false,
   });
 
-  assert.deepEqual(result, {
-    status: "stopped_no_action",
-    reason: "approved_plan_completion_guard",
-  });
+  assertCompletedOutcome(result, "blocked", "approved_plan_completion_guard");
   assert.equal(events.stops.length, 1);
 });
 
@@ -998,6 +1038,7 @@ test("agent loop runner preserves awaiting-choice pauses as a structured outcome
 
   assert.deepEqual(outcome, {
     status: "paused",
+    pauseKind: "action_required",
     reason: "awaiting_user_choice",
   });
   assert.equal(finals.length, 1);
@@ -1005,6 +1046,118 @@ test("agent loop runner preserves awaiting-choice pauses as a structured outcome
     event: "agent_loop_awaiting_user_choice",
     data: { replyOptions: 1 },
   }]);
+});
+
+test("user-choice pause stays idempotent from assistant completion through workflow terminal projection", async () => {
+  const emittedEvents = [];
+  const runIdentity = { runId: "run-choice", parentRunId: "run-parent" };
+
+  class AwaitingChoiceCompletionOrchestrator {
+    async execute(callbacks) {
+      callbacks.onAssistantFinalText(
+        "Choose a path",
+        [{ id: "continue", label: "Continue", value: "continue" }],
+        { awaitingInput: true },
+      );
+      const emitTurnEvent = (event) => emittedEvents.push(withEventSchema(event));
+      emitTurnEvent.runIdentity = runIdentity;
+      const completion = handleReplyOptionsPause({
+        callbacks,
+        iteration: 1,
+        shouldPauseForUserChoice: true,
+        shouldSuppressApprovedPlanNoToolText: false,
+        replyOptions: [{ id: "continue", label: "Continue", value: "continue" }],
+        effectiveToolCallCount: 0,
+        workflowMode: "chat",
+        turnIntent: "respond",
+        hasStructuredProposal: false,
+        planStage: "idle",
+        isPlanApproved: false,
+        completion: {
+          assistantHistoryText: "Choose a path",
+          providerReasoningForHistory: null,
+          assistantMsgId: "assistant-choice",
+          iterationContext: {
+            eventThreadId: "session-choice",
+            eventTurnId: "turn-choice",
+          },
+          emitTurnEvent,
+          emitTurnCompletedEvent: () => {
+            throw new Error("a user-choice pause must not complete the logical Turn");
+          },
+        },
+      });
+      assert.equal(completion.status, "stopped");
+    }
+
+    getLatestRunPauseReason() {
+      return emittedEvents.find((event) => event.type === "run.paused")?.reason || null;
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+
+    discardPendingTurnCompletion() {
+      return false;
+    }
+
+    pauseActiveRun(reason, message) {
+      if (emittedEvents.some((event) =>
+        event.type === "run.paused" && event.runId === runIdentity.runId
+      )) return false;
+      emittedEvents.push(withEventSchema({
+        type: "run.paused",
+        threadId: "session-choice",
+        turnId: "turn-choice",
+        timestampMs: 2,
+        ...runIdentity,
+        reason,
+        message,
+      }));
+      return true;
+    }
+  }
+
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(
+    AwaitingChoiceCompletionOrchestrator,
+    [],
+  );
+  const outcome = await executeAgentLoop({
+    getPreferredLanguage: () => "en",
+    getIsPlanApproved: () => false,
+    getPlanStage: () => "idle",
+    appendMessage: () => {},
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {},
+    onStatusChange: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "paused",
+    pauseKind: "action_required",
+    reason: "awaiting_user_choice",
+  });
+  const pauses = emittedEvents.filter((event) => event.type === "run.paused");
+  assert.equal(pauses.length, 1);
+  assert.equal(pauses[0].reason, outcome.reason);
+
+  const workflowTerminalCandidate = withEventSchema({
+    type: "run.paused",
+    threadId: "session-choice",
+    turnId: "turn-choice",
+    timestampMs: 3,
+    ...runIdentity,
+    reason: outcome.reason,
+    message: "Waiting for a user choice.",
+  });
+  const terminalAppend = appendRuntimeEventWithResult(
+    emittedEvents,
+    workflowTerminalCandidate,
+  );
+  assert.equal(terminalAppend.disposition, "idempotent");
+  assert.equal(terminalAppend.events.length, emittedEvents.length);
 });
 
 test("subagent runner strips reply options and preserves the evidence summary", async () => {
@@ -1058,14 +1211,18 @@ test("subagent runner strips reply options and preserves the evidence summary", 
     onError: () => {},
   }, new AbortController());
 
-  assert.deepEqual(outcome, { status: "completed", reason: "agent_loop_completed" });
+  assert.deepEqual(outcome, {
+    status: "completed",
+    reason: "agent_loop_completed",
+    resultKind: "success",
+  });
   assert.equal(finals[0][0], "Useful evidence summary");
   assert.deepEqual(finals[0][1], []);
   assert.equal(finals[0][2].awaitingInput, false);
   assert.deepEqual(terminalCommits, ["commit"]);
 });
 
-test("agent loop runner never defaults an uncommitted return to completed", async () => {
+test("agent loop runner closes a missing terminal invariant as an error conclusion", async () => {
   class MissingTerminalOrchestrator {
     async execute() {}
 
@@ -1097,10 +1254,7 @@ test("agent loop runner never defaults an uncommitted return to completed", asyn
     onError: () => {},
   }, new AbortController());
 
-  assert.deepEqual(outcome, {
-    status: "stopped_no_action",
-    reason: "agent_loop_no_terminal_outcome",
-  });
+  assertCompletedOutcome(outcome, "error", "agent_loop_no_terminal_outcome");
   assert.equal(stops[0].progress.recoveryReason, "agent_loop_no_terminal_outcome");
   assert.deepEqual(statuses, ["idle"]);
   assert.equal(logs.some((entry) => entry.event === "agent_loop_missing_terminal_outcome"), true);
@@ -1154,11 +1308,12 @@ test("completion guards discard staged completion instead of publishing a false 
     onError: () => {},
   }, new AbortController());
 
-  assert.equal(outcome.status, "stopped_no_action");
-  assert.deepEqual(terminalCommits, [
-    "discard",
-    "pause:execution_evidence_required",
-  ]);
+  assert.deepEqual(outcome, {
+    status: "completed",
+    resultKind: "blocked",
+    reason: "execution_evidence_required",
+  });
+  assert.deepEqual(terminalCommits, ["discard"]);
 });
 
 test("agent loop runner preserves a bounded error reason for Goal Runtime diagnostics", async () => {
@@ -1192,10 +1347,44 @@ test("agent loop runner preserves a bounded error reason for Goal Runtime diagno
   }, new AbortController());
 
   assert.deepEqual(outcome, {
-    status: "error",
+    status: "completed",
+    resultKind: "error",
     reason: "agent_loop_error: STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream stalled",
   });
   assert.deepEqual(errors, ["STREAM_NO_VISIBLE_PROGRESS_TIMEOUT: model stream stalled"]);
+});
+
+test("a thrown loop exception becomes a visible completed error conclusion", async () => {
+  const terminalActions = [];
+  class ThrowingOrchestrator {
+    async execute() {
+      throw new Error("provider connection reset");
+    }
+
+    discardPendingTurnCompletion() {
+      terminalActions.push("discard");
+      return true;
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+  }
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(ThrowingOrchestrator, []);
+  const errors = [];
+  const outcome = await executeAgentLoop({
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {},
+    onError: (error) => errors.push(error),
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "completed",
+    resultKind: "error",
+    reason: "agent_loop_error: provider connection reset",
+  });
+  assert.deepEqual(errors, ["provider connection reset"]);
+  assert.deepEqual(terminalActions, ["discard"]);
 });
 
 test("a run.paused boundary cannot fall through as agent_loop_completed", async () => {
@@ -1231,11 +1420,50 @@ test("a run.paused boundary cannot fall through as agent_loop_completed", async 
 
   assert.deepEqual(outcome, {
     status: "paused",
+    pauseKind: "action_required",
     reason: "plan_review_required",
   });
 });
 
-test("a start-hook block is a resumable pause, never an implicit completion", async () => {
+test("a committed user-choice pause remains action-required when no callback outcome was captured", async () => {
+  class CommittedChoicePauseOrchestrator {
+    async execute() {}
+
+    getLatestRunPauseReason() {
+      return "awaiting_user_choice";
+    }
+
+    hasExecuteOperationEvidence() {
+      return false;
+    }
+
+    discardPendingTurnCompletion() {
+      return false;
+    }
+
+    pauseActiveRun() {
+      return false;
+    }
+  }
+  const { executeAgentLoop } = loadAgentLoopRunnerWithFake(
+    CommittedChoicePauseOrchestrator,
+    [],
+  );
+  const outcome = await executeAgentLoop({
+    getPreferredLanguage: () => "en",
+    onAssistantFinalText: () => {},
+    onNonActionableStop: () => {},
+    onError: () => {},
+  }, new AbortController());
+
+  assert.deepEqual(outcome, {
+    status: "paused",
+    pauseKind: "action_required",
+    reason: "awaiting_user_choice",
+  });
+});
+
+test("a start-hook block without an action request closes as blocked", async () => {
   class StartHookBlockedOrchestrator {
     async execute() {}
 
@@ -1266,10 +1494,7 @@ test("a start-hook block is a resumable pause, never an implicit completion", as
     onError: () => {},
   }, new AbortController());
 
-  assert.deepEqual(outcome, {
-    status: "paused",
-    reason: "start_hook_blocked",
-  });
+  assertCompletedOutcome(outcome, "blocked", "start_hook_blocked");
 });
 
 test("agent loop runner returns aborted before completion guards read final state", async () => {

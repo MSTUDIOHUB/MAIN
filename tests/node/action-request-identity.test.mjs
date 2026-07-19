@@ -458,7 +458,19 @@ test("run transition reducer atomically enforces action-request lifecycle invari
     now: 1,
   });
   const requested = runTransitions.reduceRunTransition(
-    { activeActionRequest: null, runtimeEvents: [] },
+    {
+      activeActionRequest: null,
+      runtimeEvents: [],
+      conversationTurns: [{
+        id: "turn-1",
+        status: "awaiting_approval",
+        runtimeOutcome: {
+          status: "paused",
+          runId: "run-review",
+          reason: "plan_review",
+        },
+      }],
+    },
     {
       type: "action_required",
       request,
@@ -488,23 +500,147 @@ test("run transition reducer atomically enforces action-request lifecycle invari
     }),
   });
   assert.equal(childStarted.activeActionRequest, null);
+  assert.equal(childStarted.conversationTurns[0].status, "executing");
+  assert.equal(childStarted.conversationTurns[0].runtimeOutcome, undefined);
 
   const terminal = runTransitions.reduceRunTransition(
     { activeActionRequest: request, runtimeEvents: [] },
     {
       type: "runtime_event",
       event: turnEvents.withEventSchema({
-        type: "run.failed",
+        type: "run.completed",
         threadId: "session-1",
         turnId: "turn-1",
         runId: "run-review",
         parentRunId: null,
         timestampMs: 4,
-        error: { message: "failed" },
+        resultKind: "error",
+        summary: "The run concluded with an error result.",
       }),
     },
   );
   assert.equal(terminal.activeActionRequest, null);
+});
+
+test("run transition reducer preserves requests on terminal conflicts and clears only accepted exact terminals", () => {
+  const request = actionRequests.buildPlanReviewActionRequest({
+    sessionKey: "session-conflict",
+    turnId: "turn-conflict",
+    runId: "run-review",
+    title: "Review",
+    planRevision: 1,
+    artifactHash: "hash-conflict",
+    artifactPaths: [".MAIN/plans/plan.md"],
+    now: 10,
+  });
+  const paused = turnEvents.withEventSchema({
+    type: "run.paused",
+    threadId: "session-conflict",
+    turnId: "turn-conflict",
+    runId: "run-review",
+    parentRunId: null,
+    timestampMs: 11,
+    reason: "plan_review",
+    message: "Review the plan.",
+  });
+  const pending = runTransitions.reduceRunTransition(
+    { activeActionRequest: null, runtimeEvents: [] },
+    { type: "action_required", request, events: [paused] },
+  );
+
+  const lateConflictingTerminal = runTransitions.reduceRunTransition(pending, {
+    type: "runtime_event",
+    event: turnEvents.withEventSchema({
+      type: "run.completed",
+      threadId: "session-conflict",
+      turnId: "turn-conflict",
+      runId: "run-review",
+      parentRunId: null,
+      timestampMs: 12,
+      resultKind: "error",
+    }),
+  });
+  assert.equal(lateConflictingTerminal.activeActionRequest, request);
+  assert.deepEqual(lateConflictingTerminal.runtimeEvents.map((event) => event.type), ["run.paused"]);
+
+  const lateLegacyFailure = runTransitions.reduceRunTransition(pending, {
+    type: "runtime_event",
+    event: turnEvents.withEventSchema({
+      type: "run.failed",
+      threadId: "session-conflict",
+      turnId: "turn-conflict",
+      runId: "run-review",
+      parentRunId: null,
+      timestampMs: 12,
+      error: { message: "persisted legacy terminal arrived late" },
+    }),
+  });
+  assert.equal(lateLegacyFailure.activeActionRequest, request);
+  assert.deepEqual(lateLegacyFailure.runtimeEvents.map((event) => event.type), ["run.paused"]);
+
+  const otherRunAborted = runTransitions.reduceRunTransition(
+    { activeActionRequest: request, runtimeEvents: [] },
+    {
+      type: "runtime_event",
+      event: turnEvents.withEventSchema({
+        type: "run.aborted",
+        threadId: "session-conflict",
+        turnId: "turn-conflict",
+        runId: "run-other",
+        parentRunId: null,
+        timestampMs: 13,
+        reason: "user_cancelled",
+      }),
+    },
+  );
+  assert.equal(otherRunAborted.activeActionRequest, request);
+
+  const exactRunAborted = runTransitions.reduceRunTransition(
+    { activeActionRequest: request, runtimeEvents: [] },
+    {
+      type: "runtime_event",
+      event: turnEvents.withEventSchema({
+        type: "run.aborted",
+        threadId: "session-conflict",
+        turnId: "turn-conflict",
+        runId: "run-review",
+        parentRunId: null,
+        timestampMs: 14,
+        reason: "user_cancelled",
+      }),
+    },
+  );
+  assert.equal(exactRunAborted.activeActionRequest, null);
+});
+
+test("action-required transition cannot mount a request beside an accepted terminal", () => {
+  const request = actionRequests.buildUserChoiceActionRequest({
+    sessionKey: "session-terminal-batch",
+    turnId: "turn-terminal-batch",
+    runId: "run-terminal-batch",
+    title: "Choose",
+    optionValues: ["Continue", "Stop"],
+    allowCustomReply: false,
+    now: 20,
+  });
+  const state = runTransitions.reduceRunTransition(
+    { activeActionRequest: null, runtimeEvents: [] },
+    {
+      type: "action_required",
+      request,
+      events: [turnEvents.withEventSchema({
+        type: "run.completed",
+        threadId: "session-terminal-batch",
+        turnId: "turn-terminal-batch",
+        runId: "run-terminal-batch",
+        parentRunId: null,
+        timestampMs: 21,
+        resultKind: "blocked",
+      })],
+    },
+  );
+  assert.equal(state.activeActionRequest, null);
+  assert.deepEqual(state.runtimeEvents.map((event) => event.type), ["run.completed"]);
 });
 
 test("tool review builds a run-owned permission request with an auditable target", () => {

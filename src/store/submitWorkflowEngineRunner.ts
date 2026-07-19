@@ -26,6 +26,8 @@ export function createSubmitWorkflowEngineHelpers(
     normalizeProviderCompatibilityByRuntimeKey: input.normalizeProviderCompatibilityByRuntimeKey,
     compactCompletedTurnAgentMessages: input.compactCompletedTurnAgentMessages,
     normalizeQueuedUserMessage: input.normalizeQueuedUserMessage,
+    getSessionRevisionToken: input.getSessionRevisionToken,
+    publishOwnerScopedRuntimeProjection: input.publishOwnerScopedRuntimeProjection,
     startApprovedPlanExecutionInCurrentTurn: input.startApprovedPlanExecutionInCurrentTurn,
     persistSessionRecord: saveProjectSession,
     logStoreEvent: input.logStoreEvent,

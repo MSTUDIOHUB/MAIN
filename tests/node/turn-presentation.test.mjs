@@ -44,6 +44,9 @@ test("Capsule status projection exposes only structured high-level lifecycle cop
     [{ presentation: { intent: "execute", lifecycle: "action_required", status: "awaiting_input" }, actionKind: "user_choice" }, "awaiting_choice", "等待选择"],
     [{ presentation: { intent: "execute", lifecycle: "resumable", status: "paused" } }, "paused", "已暂停"],
     [{ presentation: { intent: "execute", lifecycle: "success", status: "done" } }, "completed", "已完成"],
+    [{ presentation: { intent: "execute", lifecycle: "partial", status: "partial" } }, "partial", "部分完成"],
+    [{ presentation: { intent: "execute", lifecycle: "blocked", status: "blocked" } }, "blocked", "已受阻"],
+    [{ presentation: { intent: "execute", lifecycle: "canceled", status: "canceled" } }, "canceled", "已取消"],
     [{ presentation: { intent: "execute", lifecycle: "failed", status: "error" } }, "error", "发生错误"],
   ];
 
@@ -56,6 +59,14 @@ test("Capsule status projection exposes only structured high-level lifecycle cop
     presentation: { intent: "execute", lifecycle: "active", status: "executing" },
     planExecutionPhase: "context_compression",
   }), { kind: "recovering", label: "Recovering" });
+
+  assert.deepEqual(buildCapsuleStatusProjection({
+    language: "en",
+    presentation: { intent: "plan", lifecycle: "success", status: "success" },
+    planStage: "executing",
+    planExecutionPhase: "paused",
+    agentStatus: "error",
+  }), { kind: "completed", label: "Completed" });
 
   const chatAreaSource = fs.readFileSync(
     path.join(workspaceRoot, "src/components/ChatArea.tsx"),
@@ -126,6 +137,63 @@ test("Plan Goal and exceptional states retain a presentation anchor", () => {
   assert.ok([plan, goal, paused, blocked, failed].every((model) => model.showStateAnchor));
 });
 
+test("canonical runtime outcomes own terminal presentation semantics", () => {
+  const terminalCases = [
+    ["success", "success", "ordinary", "Completed"],
+    ["partial", "partial", "partial", "Partially completed"],
+    ["blocked", "blocked", "blocked", "Blocked"],
+    ["error", "error", "error", "Error"],
+  ];
+
+  for (const [resultKind, lifecycle, kind, statusLabel] of terminalCases) {
+    const model = buildTurnPresentationModel({
+      language: "en",
+      turn: turn({
+        intent: "respond",
+        status: "executing",
+        runtimeOutcome: {
+          status: "completed",
+          reason: `terminal_${resultKind}`,
+          resultKind,
+          runId: `run-${resultKind}`,
+          parentRunId: null,
+          updatedAt: 10,
+        },
+      }),
+      statusOverride: "paused",
+      hasActionRequest: true,
+      actionKind: "user_choice",
+    });
+    assert.equal(model.status, resultKind);
+    assert.equal(model.lifecycle, lifecycle);
+    assert.equal(model.kind, kind);
+    assert.equal(model.statusLabel, statusLabel);
+    assert.equal(model.outcomeStatus, "completed");
+    assert.equal(model.resultKind, resultKind);
+    assert.equal(model.actionKind, undefined);
+  }
+
+  const canceled = buildTurnPresentationModel({
+    language: "en",
+    turn: turn({
+      status: "executing",
+      runtimeOutcome: {
+        status: "aborted",
+        reason: "user_cancelled",
+        resultKind: "canceled",
+        runId: "run-canceled",
+        parentRunId: null,
+        updatedAt: 11,
+      },
+    }),
+    statusOverride: "paused",
+  });
+  assert.deepEqual(
+    [canceled.status, canceled.lifecycle, canceled.kind, canceled.statusLabel, canceled.resultKind],
+    ["canceled", "canceled", "canceled", "Canceled", "canceled"],
+  );
+});
+
 test("awaiting state stays process-expanded and carries optional runtime identity", () => {
   const model = buildTurnPresentationModel({
     turn: turn({ status: "awaiting_input", collapsed: true }),
@@ -145,7 +213,7 @@ test("awaiting state stays process-expanded and carries optional runtime identit
   assert.equal(model.statusLabel, "Waiting for choice");
 });
 
-test("all workflow surfaces share the same six-state lifecycle projection", () => {
+test("legacy statuses retain the six-state compatibility lifecycle projection", () => {
   assert.deepEqual(
     [
       resolveTurnPresentationLifecycle("executing"),

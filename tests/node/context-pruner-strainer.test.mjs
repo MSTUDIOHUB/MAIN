@@ -409,24 +409,50 @@ test("StreamingThoughtSummarizer exports are functional", async () => {
   }
 });
 
-test("Thread state machine exports are functional", async () => {
-  try {
-    const mod = await import("../../src/lib/orchestrator/state/Thread.ts");
-    assert.ok(typeof mod.ConversationThread === "function", "ConversationThread should be exported");
-    assert.ok(typeof mod.createThread === "function", "createThread should be exported");
-    assert.ok(typeof mod.createTurn === "function", "createTurn should be exported");
-  } catch {
-    // Module may not resolve via ESM
-  }
+test("functional Thread helpers create production iteration state", () => {
+  const threadState = loadTranspiledModuleSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/state/Thread.ts"),
+  );
+  const messages = [{ role: "user", content: "inspect the workspace" }];
+  const thread = threadState.createThread("thread-1");
+  const turn = threadState.createTurn("turn-1", messages);
+  thread.turns.push(turn);
+
+  assert.equal(thread.threadId, "thread-1");
+  assert.equal(thread.turns.length, 1);
+  assert.equal(turn.turnId, "turn-1");
+  assert.equal(turn.promptMessages, messages);
+  assert.equal(threadState.ConversationThread, undefined);
 });
 
-test("TurnContext exports are functional", async () => {
-  try {
-    const mod = await import("../../src/lib/orchestrator/state/TurnContext.ts");
-    assert.ok(typeof mod.TurnContext === "function", "TurnContext should be exported");
-  } catch {
-    // Module may not resolve via ESM
-  }
+test("TurnContext keeps live iteration bookkeeping functional", () => {
+  const threadState = loadTranspiledModuleSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/state/Thread.ts"),
+  );
+  const { TurnContext } = loadTranspiledModuleSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/state/TurnContext.ts"),
+  );
+  const turn = threadState.createTurn("turn-context-1", []);
+  const context = new TurnContext(turn);
+
+  context.startTurn();
+  const item = context.addItem({
+    category: "tool",
+    scope: "ephemeral",
+    purpose: "read result",
+    burned: false,
+  });
+  context.registerToolExecution({
+    toolCallId: "tool-1",
+    toolName: "read_file",
+    argumentsHash: "hash",
+    resultLength: 12,
+    resultTruncated: false,
+  });
+
+  assert.equal(context.turnId, "turn-context-1");
+  assert.equal(turn.items[0], item);
+  assert.equal(context.getTotalToolCount(), 1);
 });
 
 test("ReasoningStrainer class backward compat exists", async () => {

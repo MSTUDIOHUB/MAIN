@@ -89,6 +89,7 @@ function baseSnapshot(overrides = {}) {
     agentStatus: "idle",
     currentTurnId: null,
     currentSessionKey: "session-1",
+    runtimeEvents: [],
     conversationTurns: [],
     taskFlow: [],
     selectedMainModeKey: "main_mode",
@@ -361,7 +362,20 @@ test("submit pipeline reuses awaiting-choice turns only with exact request ident
 });
 
 test("hidden approved-plan execution can reuse its logical turn with execute intent", () => {
-  const planTurn = turn({ id: "turn-plan", mode: "plan", intent: "plan", status: "paused" });
+  const planTurn = turn({
+    id: "turn-plan",
+    mode: "plan",
+    intent: "plan",
+    status: "paused",
+    runtimeOutcome: {
+      status: "paused",
+      reason: "plan_review",
+      pauseKind: "action_required",
+      runId: "run-plan-review",
+      parentRunId: null,
+      updatedAt: 2,
+    },
+  });
   const newerTurn = turn({ id: "turn-newer", status: "done" });
   const decision = buildSubmitPipelineDecision({
     text: "Continue approved plan execution",
@@ -385,6 +399,122 @@ test("hidden approved-plan execution can reuse its logical turn with execute int
   assert.equal(decision.turnReuse.reuseCurrentTurn, true);
   assert.equal(decision.turnReuse.reusableTurnId, "turn-plan");
   assert.equal(decision.turnReuse.isInternalTurn, false);
+});
+
+test("completed and aborted turns are immutable even under explicit reuse", () => {
+  for (const status of ["completed", "aborted"]) {
+    const closedTurn = turn({
+      id: `turn-${status}`,
+      status: "done",
+      runtimeOutcome: {
+        status,
+        reason: `turn_${status}`,
+        resultKind: status === "aborted" ? "canceled" : "success",
+        runId: `run-${status}`,
+        parentRunId: null,
+        updatedAt: 2,
+      },
+    });
+    const decision = buildSubmitPipelineDecision({
+      text: "Continue execution",
+      options: {
+        hidden: true,
+        reuseCurrentTurn: true,
+        turnIdOverride: closedTurn.id,
+        resolvedIntent: "execute",
+        executionConsentGranted: true,
+      },
+      snapshot: baseSnapshot({
+        currentTurnId: closedTurn.id,
+        conversationTurns: [closedTurn],
+      }),
+    });
+
+    assert.equal(decision.turnReuse.shouldExplicitlyReuseCurrentTurn, true);
+    assert.equal(decision.turnReuse.reusableTurnId, null);
+    assert.equal(decision.turnReuse.reuseCurrentTurn, false);
+    assert.equal(decision.turnReuse.isInternalTurn, true);
+  }
+});
+
+test("durable terminal turn events prevent reuse when the turn projection is stale", () => {
+  for (const type of ["turn.completed", "turn.failed"]) {
+    const staleTurn = turn({
+      id: `turn-stale-${type}`,
+      status: "awaiting_input",
+      runtimeOutcome: undefined,
+    });
+    const terminalEvent = type === "turn.completed"
+      ? {
+          schemaVersion: 2,
+          type,
+          threadId: "session-1",
+          turnId: staleTurn.id,
+          timestampMs: 2,
+          resultKind: "error",
+        }
+      : {
+          schemaVersion: 2,
+          type,
+          threadId: "session-1",
+          turnId: staleTurn.id,
+          timestampMs: 2,
+          error: { message: "legacy persisted terminal" },
+        };
+    const decision = buildSubmitPipelineDecision({
+      text: "Continue execution",
+      options: {
+        hidden: true,
+        reuseCurrentTurn: true,
+        turnIdOverride: staleTurn.id,
+        resolvedIntent: "execute",
+        executionConsentGranted: true,
+      },
+      snapshot: baseSnapshot({
+        currentTurnId: staleTurn.id,
+        conversationTurns: [staleTurn],
+        runtimeEvents: [terminalEvent],
+      }),
+    });
+
+    assert.equal(decision.turnReuse.shouldExplicitlyReuseCurrentTurn, true);
+    assert.equal(decision.turnReuse.reusableTurnId, null);
+    assert.equal(decision.turnReuse.reuseCurrentTurn, false);
+    assert.equal(decision.turnReuse.isInternalTurn, true);
+  }
+});
+
+test("terminal events from another session or turn do not block exact turn reuse", () => {
+  const openTurn = turn({ id: "turn-open", status: "paused", runtimeOutcome: undefined });
+  for (const terminalIdentity of [
+    { threadId: "session-other", turnId: openTurn.id },
+    { threadId: "session-1", turnId: "turn-other" },
+  ]) {
+    const decision = buildSubmitPipelineDecision({
+      text: "Continue execution",
+      options: {
+        hidden: true,
+        reuseCurrentTurn: true,
+        turnIdOverride: openTurn.id,
+        resolvedIntent: "execute",
+        executionConsentGranted: true,
+      },
+      snapshot: baseSnapshot({
+        currentTurnId: openTurn.id,
+        conversationTurns: [openTurn],
+        runtimeEvents: [{
+          schemaVersion: 2,
+          type: "turn.completed",
+          ...terminalIdentity,
+          timestampMs: 2,
+          resultKind: "success",
+        }],
+      }),
+    });
+
+    assert.equal(decision.turnReuse.reusableTurnId, openTurn.id);
+    assert.equal(decision.turnReuse.reuseCurrentTurn, true);
+  }
 });
 
 test("pending review abort is skipped for execution approval reply options", () => {
@@ -661,12 +791,18 @@ test("Goal continuation authorization rejects Goal replacement deletion and sess
     currentSessionId: 7,
     activeGoal,
   }), authorization);
-  assert.equal(validateGoalContinuationAuthorization({
+  assert.deepEqual(validateGoalContinuationAuthorization({
     authorization,
     currentWorkspace: "/repo",
     currentSessionId: 7,
     activeGoal: { ...activeGoal, status: "paused" },
-  }), null);
+  }), authorization);
+  assert.deepEqual(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal: { ...activeGoal, status: "blocked" },
+  }), authorization);
   assert.equal(validateGoalContinuationAuthorization({
     authorization,
     currentWorkspace: "/repo",
@@ -751,6 +887,53 @@ test("Goal choice continuation additionally requires the exact pending request",
     currentSessionId: 7,
     activeGoal,
     activeActionRequest: { ...request, requestId: "request-new" },
+  }), null);
+});
+
+test("manual Goal resume carries an exact confirmation identity across queue delay", () => {
+  const authorization = goalContinuationAuthorization({ requestId: "confirm-1" });
+  const activeGoal = {
+    id: "goal-1",
+    revision: 2,
+    sessionKey: "/repo:7",
+    ownerTurnId: "turn-goal",
+    status: "awaiting_input",
+  };
+  const request = {
+    schemaVersion: 1,
+    requestId: "confirm-1",
+    kind: "goal_confirmation",
+    sessionKey: "/repo:7",
+    turnId: "turn-goal",
+    runId: "run-goal",
+    title: "Continue Goal",
+    status: "pending",
+    createdAt: 1,
+    goalId: "goal-1",
+    goalRevision: 2,
+    reason: "continue?",
+  };
+
+  assert.deepEqual(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal,
+    activeActionRequest: request,
+  }), authorization);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization,
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal,
+    activeActionRequest: { ...request, requestId: "confirm-new" },
+  }), null);
+  assert.equal(validateGoalContinuationAuthorization({
+    authorization: goalContinuationAuthorization(),
+    currentWorkspace: "/repo",
+    currentSessionId: 7,
+    activeGoal,
+    activeActionRequest: request,
   }), null);
 });
 
@@ -1162,7 +1345,7 @@ test("send gate resets stuck running and pending-review states without an abort 
   });
   assert.equal(running.action.kind, "reset_stuck_state");
   assert.equal(running.action.previousStatus, "running");
-  assert.equal(running.action.turnStatus, "stopped_no_action");
+  assert.equal("turnStatus" in running.action, false);
 
   const pendingReview = resolveSubmitSendGateDecision({
     text: "继续",
@@ -1178,7 +1361,7 @@ test("send gate resets stuck running and pending-review states without an abort 
   });
   assert.equal(pendingReview.action.kind, "reset_stuck_state");
   assert.equal(pendingReview.action.previousStatus, "pending_review");
-  assert.equal(pendingReview.action.turnStatus, "awaiting_approval");
+  assert.equal("turnStatus" in pendingReview.action, false);
 });
 
 test("send gate queues ordinary input while an agent run is active", () => {

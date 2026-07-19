@@ -5,6 +5,7 @@ import {
 } from "./runIntent";
 import { workspacePathsReferToSameFile } from "./workspacePaths";
 import { looksLongRunningShellCommand } from "./toolExecutionContract";
+import type { AgentLoopPauseKind, AgentLoopResultKind } from "./runOutcome";
 
 // lib/workflowModels.ts
 // 计划面板、回合视图、流式归一化共享模型。
@@ -548,7 +549,51 @@ export type ConversationTurnStatus =
   | "done"
   | "error";
 
-export type VisibleConversationTurnStatus = ConversationTurnStatus;
+/**
+ * Presentation status for a logical Turn. New terminal Turns project their
+ * structured runtime result directly; legacy persisted Turns keep using the
+ * old ConversationTurnStatus values below as a compatibility fallback.
+ */
+export type VisibleConversationTurnStatus =
+  | ConversationTurnStatus
+  | AgentLoopResultKind
+  | "canceled";
+
+export interface ConversationTurnRuntimeOutcome {
+  status: "completed" | "paused" | "aborted";
+  reason: string;
+  resultKind?: AgentLoopResultKind | "canceled";
+  pauseKind?: AgentLoopPauseKind;
+  runId: string;
+  parentRunId: string | null;
+  updatedAt: number;
+}
+
+export function deriveRuntimeOutcomeVisibleStatus(
+  runtimeOutcome: ConversationTurnRuntimeOutcome | null | undefined,
+  fallbackStatus: ConversationTurnStatus,
+): VisibleConversationTurnStatus {
+  if (!runtimeOutcome) return fallbackStatus;
+  if (runtimeOutcome.status === "aborted") return "canceled";
+  if (runtimeOutcome.status === "paused") return "paused";
+  if (
+    runtimeOutcome.resultKind === "success" ||
+    runtimeOutcome.resultKind === "partial" ||
+    runtimeOutcome.resultKind === "blocked" ||
+    runtimeOutcome.resultKind === "error"
+  ) {
+    return runtimeOutcome.resultKind;
+  }
+  // normalizeAgentLoopOutcome treats an early-contract completed event without
+  // a resultKind as success, so presentation keeps the same compatibility rule.
+  return "success";
+}
+
+export function isConversationTurnRuntimeClosed(
+  runtimeOutcome: ConversationTurnRuntimeOutcome | null | undefined,
+): boolean {
+  return runtimeOutcome?.status === "completed" || runtimeOutcome?.status === "aborted";
+}
 
 export interface DurableTurnExecutionSummary {
   decisions: string[];
@@ -587,6 +632,8 @@ export interface ConversationTurn {
   intent?: ResolvedRunIntent;
   displayIntent?: ResolvedRunIntent;
   status: ConversationTurnStatus;
+  /** Canonical lifecycle/result projection; `status` remains a UI compatibility field. */
+  runtimeOutcome?: ConversationTurnRuntimeOutcome;
   summary: string;
   durableContext?: DurableTurnContext;
   blockIds: number[];
@@ -770,6 +817,7 @@ export function resolvePinnedConversationTurn(
 
 export function deriveVisibleConversationTurnStatus(params: {
   baseStatus: ConversationTurnStatus;
+  runtimeOutcome?: ConversationTurnRuntimeOutcome | null;
   workflowMode?: LegacyWorkflowMode;
   turnIntent?: ResolvedRunIntent;
   isPinnedPlanTurnVisible: boolean;
@@ -781,6 +829,7 @@ export function deriveVisibleConversationTurnStatus(params: {
 }): VisibleConversationTurnStatus {
   const {
     baseStatus,
+    runtimeOutcome,
     workflowMode,
     turnIntent,
     isPinnedPlanTurnVisible,
@@ -790,6 +839,9 @@ export function deriveVisibleConversationTurnStatus(params: {
     hasIncompletePlanTasks,
     hasTasksArtifact,
   } = params;
+  if (runtimeOutcome) {
+    return deriveRuntimeOutcomeVisibleStatus(runtimeOutcome, baseStatus);
+  }
   const effectiveIntent = turnIntent ?? resolveRunIntentFromLegacyWorkflowMode(workflowMode ?? "chat");
 
   if (effectiveIntent !== "plan" || !isPinnedPlanTurnVisible) {
