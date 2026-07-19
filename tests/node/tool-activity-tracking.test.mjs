@@ -72,6 +72,7 @@ const {
   buildBrowserValidationFailureContent,
   isBrowserValidationResultCacheable,
   parseBrowserValidationOutcome,
+  resolvePersistentBrowserFailureCallSignature,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/browserValidation.ts"));
 
 function result(overrides) {
@@ -309,6 +310,46 @@ test("browser validation cache ignores timeout-only retries while preserving mea
   assert.notEqual(first, differentCheck);
 });
 
+test("only deterministic browser failures produce a persistent exact-call signature", () => {
+  const args = {
+    url: "http://localhost:1420/",
+    actions: [{ kind: "click", selector: "#open" }],
+    checks: [{ kind: "text", value: "Opened" }],
+  };
+  const deterministicFailure = JSON.stringify({
+    ok: false,
+    failureReasons: ["validation_spec_error"],
+    failureSummary: "selector #open was not found",
+    validationSpecError: {
+      code: "selector_not_found",
+      message: "selector #open was not found",
+      fingerprint: "selector-open",
+    },
+  });
+  const transientFailure = JSON.stringify({
+    ok: false,
+    failureReasons: ["runtime_error"],
+    failureSummary: "net::ERR_CONNECTION_REFUSED",
+    error: "page.goto: net::ERR_CONNECTION_REFUSED",
+  });
+
+  assert.equal(
+    resolvePersistentBrowserFailureCallSignature(args, deterministicFailure),
+    buildBrowserValidationCacheSignature(args),
+  );
+  assert.equal(
+    resolvePersistentBrowserFailureCallSignature(args, transientFailure),
+    null,
+  );
+  assert.notEqual(
+    buildBrowserValidationCacheSignature({
+      ...args,
+      actions: [{ kind: "click", selector: "#open-document" }],
+    }),
+    buildBrowserValidationCacheSignature(args),
+  );
+});
+
 test("browser validation outcome keeps concise diagnostics for failed tool feedback", () => {
   const raw = JSON.stringify({
     ok: false,
@@ -332,9 +373,78 @@ test("browser validation outcome keeps concise diagnostics for failed tool feedb
   assert.equal(isBrowserValidationResultCacheable(buildBrowserValidationFailureContent(raw)), true);
   assert.equal(isBrowserValidationResultCacheable(JSON.stringify({
     ok: false,
-    failureReasons: ["runtime_error"],
+    failureReasons: ["runtime_error", "blank_page"],
+    blankPage: true,
     failureSummary: "runtime_error: net::ERR_CONNECTION_REFUSED",
+    error: "page.goto: net::ERR_CONNECTION_REFUSED at http://127.0.0.1:1420/",
   })), false);
+});
+
+test("browser validation outcome parses and caches deterministic specification failures", () => {
+  const raw = JSON.stringify({
+    ok: false,
+    failureReasons: ["validation_spec_error", "action_failed"],
+    failureSummary: "validation_spec_error: selector_not_found",
+    failureFingerprint: "validation-spec-stable",
+    validationSpecError: {
+      code: "selector_not_found",
+      message: "Selector #missing matched no elements.",
+      phase: "action",
+      actionId: "action-1",
+      actionIndex: 1,
+      actionKind: "click",
+      selector: "#missing",
+      expectedText: null,
+      actionFingerprint: "action-stable",
+      selectorFingerprint: "selector-stable",
+      fingerprint: "validation-spec-stable",
+    },
+    failedAction: {
+      id: "action-1",
+      index: 1,
+      kind: "click",
+      value: "#missing",
+      selector: "#missing",
+      error: "Selector #missing matched no elements.",
+      actionFingerprint: "action-stable",
+      selectorFingerprint: "selector-stable",
+    },
+    interactiveElements: [{
+      tag: "button",
+      type: "button",
+      role: "",
+      id: "new-btn",
+      name: "",
+      text: "New",
+      ariaLabel: "New document",
+      placeholder: "",
+      testId: "",
+      selectorCandidates: ["#new-btn", "button[aria-label=\"New document\"]"],
+      fingerprint: "interactive-stable",
+    }],
+  });
+  const outcome = parseBrowserValidationOutcome(raw);
+
+  assert.equal(outcome.failureFingerprint, "validation-spec-stable");
+  assert.equal(outcome.validationSpecError.code, "selector_not_found");
+  assert.equal(outcome.validationSpecError.selector, "#missing");
+  assert.equal(outcome.failedAction.actionFingerprint, "action-stable");
+  assert.deepEqual(outcome.interactiveElements[0].selectorCandidates, [
+    "#new-btn",
+    "button[aria-label=\"New document\"]",
+  ]);
+  assert.equal(isBrowserValidationResultCacheable(raw), true);
+
+  const reused = [
+    "REUSED_BROWSER_VALIDATION: identical browser_evaluate already ran.",
+    "Use the captured diagnostic instead of retrying unchanged.",
+    "",
+    `BROWSER_VALIDATION_FAILED: selector missing\n${raw}`,
+  ].join("\n");
+  const reusedOutcome = parseBrowserValidationOutcome(reused);
+  assert.equal(reusedOutcome.validationSpecError.code, "selector_not_found");
+  assert.equal(reusedOutcome.failedAction.selector, "#missing");
+  assert.equal(isBrowserValidationResultCacheable(reused), true);
 });
 
 test("tool activity tracking records bounded recent activity and helper classifications", () => {

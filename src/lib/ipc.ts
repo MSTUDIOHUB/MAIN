@@ -70,8 +70,12 @@ export interface BrowserEvaluateInput {
 
 export interface BrowserEvaluateResult {
   ok: boolean;
+  failureType?: string | null;
   failureSummary?: string;
   failureReasons?: string[];
+  failureFingerprint?: string | null;
+  validationSpecError?: Record<string, unknown> | null;
+  failedAction?: Record<string, unknown> | null;
   blankPage?: boolean;
   url?: string;
   finalUrl?: string;
@@ -86,7 +90,37 @@ export interface BrowserEvaluateResult {
   screenshotPath?: string | null;
   screenshotError?: string | null;
   renderDiagnostics?: Record<string, unknown> | null;
+  interactiveElements?: Array<Record<string, unknown>>;
+  navigationCompleted?: boolean;
   textPreview?: string;
+  durationMs?: number;
+  error?: string | null;
+}
+
+export interface ComputerUseInput {
+  appName: string;
+  appPath?: string;
+  launch?: boolean;
+  activate?: boolean;
+  actions?: string;
+  checks?: string;
+  screenshot?: boolean;
+  timeoutMs?: number;
+}
+
+export interface ComputerUseResult {
+  ok: boolean;
+  failureType?: string | null;
+  failureSummary?: string | null;
+  failureReasons?: string[];
+  appName?: string | null;
+  launched?: boolean;
+  actions?: Array<Record<string, unknown>>;
+  assertions?: Array<Record<string, unknown>>;
+  causalAssertionSatisfied?: boolean;
+  accessibility?: Record<string, unknown> | null;
+  screenshotPath?: string | null;
+  screenshotError?: string | null;
   durationMs?: number;
   error?: string | null;
 }
@@ -1152,6 +1186,23 @@ export function browserEvaluate(
     waitForSelector: input.waitForSelector,
     screenshot: input.screenshot,
     failOnConsoleError: input.failOnConsoleError,
+    timeoutMs: input.timeoutMs,
+    workspace,
+  });
+}
+
+export function computerUse(
+  input: ComputerUseInput,
+  workspace?: string,
+): Promise<ComputerUseResult> {
+  return invoke<ComputerUseResult>("computer_use", {
+    appName: input.appName,
+    appPath: input.appPath,
+    launch: input.launch,
+    activate: input.activate,
+    actions: input.actions,
+    checks: input.checks,
+    screenshot: input.screenshot,
     timeoutMs: input.timeoutMs,
     workspace,
   });

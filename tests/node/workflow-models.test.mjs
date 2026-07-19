@@ -2122,6 +2122,128 @@ test("runtime prose projection keeps distinct same-file mutation obligations", (
   assert.equal(reconciled.filter((task) => task.status !== "completed").length, 1);
 });
 
+test("MD Viewer change blocks derive three mutations without promoting rationale or an empty container", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# 修复计划：打开文件功能 + 初始标签页",
+      "",
+      "## 关键实现改动",
+      "",
+      "### 改动1：修复 `handleOpenFile()` — `src/main.js`（第232-252行）",
+      "**根因**：当前实现混用了后端命令与前端 dialog 插件。",
+      "**修改为**：使用已导入的 `openDialog`，并沿用已有文件加载入口。",
+      "",
+      "### 改动2：修复初始标签页 — `src/main.js`（第126-131行）",
+      "**根因**：初始化时创建 `title: '新文档'` 的标签页，编辑后会附加脏标记。",
+      "**修改为**：",
+      "",
+      "### 改动3：清理 Rust 后端冗余代码 — `src-tauri/src/main.rs`",
+      "- 移除不再使用的文件对话框命令注册。",
+      "- 保留文件读取与保存命令。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm run tauri dev` 并验证桌面窗口启动成功。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutations = tasks.filter((task) => task.executionKind === "mutation");
+  const mutationPaths = mutations.map((task) =>
+    task.evidence?.find((item) => item.kind === "file")?.value
+  );
+  assert.deepEqual(mutationPaths, [
+    "src/main.js",
+    "src/main.js",
+    "src-tauri/src/main.rs",
+  ], JSON.stringify(tasks, null, 2));
+  assert.equal(new Set(mutations.map((task) => task.id)).size, 3);
+  assert.equal(mutations.filter((task) => /handleOpenFile/.test(task.text)).length, 1);
+  assert.equal(mutations.filter((task) => /初始标签页/.test(task.text)).length, 1);
+  assert.match(
+    mutations.find((task) => task.evidence?.some((item) =>
+      item.kind === "file" && item.value === "src-tauri/src/main.rs"
+    ))?.text || "",
+    /移除不再使用的文件对话框命令注册/,
+  );
+  assert.equal(mutations.some((task) => /修改为\s*[:：]\s*$/.test(task.text)), false);
+});
+
+test("plan quality rejects an implementation label that owns no concrete body", () => {
+  const result = validateActionablePlanArtifact([
+    "# 修复启动状态",
+    "## 摘要",
+    "- 目标：修复 `src/main.ts` 的初始标题。",
+    "## 已确认证据",
+    "- `src/main.ts` 当前创建了错误的初始状态。",
+    "## 关键改动",
+    "### 改动1：修复初始状态 — `src/main.ts`",
+    "**根因**：初始化分支使用了错误的默认值。",
+    "**修改为**：",
+    "## 测试方案",
+    "- 运行 `npm test` 并检查退出码。",
+    "## 验收标准",
+    "- 启动后标题为“欢迎”。",
+  ].join("\n"));
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "empty_plan_implementation_detail");
+});
+
+test("plan quality rejects only explicit conflicting values for the same acceptance subject", () => {
+  const fixtures = [[
+    "# 修复启动状态",
+    "## 摘要",
+    "- 目标：修复 `src/main.ts` 的初始标题。",
+    "## 已确认证据",
+    "- `src/main.ts` 当前创建了错误的初始状态。",
+    "## 关键改动",
+    "- 修改 `src/main.ts`，统一初始化标题。",
+    "## 测试方案",
+    "- 运行 `npm test` 并检查退出码。",
+    "## 验收标准",
+    "- 启动后标签页标题为“欢迎”。",
+    "- 启动后标签页标题为“未命名文档”。",
+  ], [
+    "# Repair startup state",
+    "## Summary",
+    "- Goal: repair the initial title in `src/main.ts`.",
+    "## Confirmed Evidence",
+    "- `src/main.ts` currently creates the wrong initial state.",
+    "## Key Changes",
+    "- Modify `src/main.ts` to use one startup title.",
+    "## Test Plan",
+    "- Run `npm test` and check the exit status.",
+    "## Acceptance Criteria",
+    "- On startup, the tab title is \"Welcome\".",
+    "- On startup, the tab title is \"Untitled\".",
+  ]];
+
+  for (const lines of fixtures) {
+    const result = validateActionablePlanArtifact(lines.join("\n"));
+    assert.equal(result.ok, false);
+    assert.equal(result.reason, "conflicting_plan_acceptance_assertions");
+  }
+
+  const distinctScenarios = validateActionablePlanArtifact([
+    "# 修复标签页状态",
+    "## 摘要",
+    "- 目标：修复 `src/main.ts` 的标签页标题。",
+    "## 已确认证据",
+    "- `src/main.ts` 同时管理启动页和新建页。",
+    "## 关键改动",
+    "- 修改 `src/main.ts`，分别设置两个场景的标题。",
+    "## 测试方案",
+    "- 运行 `npm test` 并检查退出码。",
+    "## 验收标准",
+    "- 启动后的标签页标题为“欢迎”。",
+    "- 点击新建后的标签页标题为“未命名文档”。",
+  ].join("\n"));
+  assert.notEqual(distinctScenarios.reason, "conflicting_plan_acceptance_assertions");
+});
+
 test("only explicit build commands become command evidence", () => {
   const explicit = inferPlanTaskEvidence(
     "运行 `npm run build` 并检查退出码与输出。",
@@ -3289,6 +3411,35 @@ test("unstructured desktop output cannot satisfy tauri automation evidence", () 
   assert.equal(unverifiedAudit.pendingUserValidationTasks.length, 1);
   assert.equal(structuredDesktop?.automaticValidation, true);
   assert.equal(isPlanTaskTrustedComplete(verified[0]), true);
+});
+
+test("computer_use requires a real interaction and causal post-state before satisfying desktop evidence", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 在实际 Tauri 桌面窗口中验证打开文件行为。 （证据：tauri_required:desktop runtime interaction）",
+  );
+  const preExistingAssertion = createPlanExecutionEvidenceEntry({
+    toolName: "computer_use",
+    target: "MAIN",
+    result: JSON.stringify({
+      ok: true,
+      actions: [{ kind: "click", target: "Open", ok: true, interaction: true }],
+      assertions: [{ kind: "text", target: "Open", passed: true, beforePassed: true, causallyLinked: false }],
+    }),
+  });
+  const causalInteraction = createPlanExecutionEvidenceEntry({
+    toolName: "computer_use",
+    target: "MAIN",
+    result: JSON.stringify({
+      ok: true,
+      actions: [{ kind: "click", target: "Open", ok: true, interaction: true }],
+      assertions: [{ kind: "dialog", target: "visible", passed: true, beforePassed: false, causallyLinked: true }],
+    }),
+  });
+
+  assert.equal(preExistingAssertion?.automaticValidation, undefined);
+  assert.equal(causalInteraction?.automaticValidation, true);
+  assert.equal(isPlanTaskTrustedComplete(reconcilePlanTaskCompletion([], parsed, [preExistingAssertion])[0]), false);
+  assert.equal(isPlanTaskTrustedComplete(reconcilePlanTaskCompletion([], parsed, [causalInteraction])[0]), true);
 });
 
 test("long-running desktop startup requires execute_command plus a later PTY observation before completion", () => {

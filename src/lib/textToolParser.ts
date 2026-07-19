@@ -42,6 +42,7 @@ const TOOL_BODY_ARG_NAMES: Partial<Record<string, string>> = {
   send_pty_input: "input",
   run_command: "command",
   browser_evaluate: "url",
+  computer_use: "app_name",
   write_file: "content",
   apply_patch: "patch",
   web_search: "query",
@@ -68,6 +69,7 @@ const TOOL_POSITIONAL_ARG_NAMES: Partial<Record<string, string>> = {
   repo_map_files: "filter",
   repo_map_impact: "target",
   browser_evaluate: "url",
+  computer_use: "app_name",
   web_search: "query",
   web_fetch: "url",
 };

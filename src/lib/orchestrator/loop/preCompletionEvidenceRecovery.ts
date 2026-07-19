@@ -27,6 +27,15 @@ function reconcileWithActiveRecovery(
   // Older callers/snapshots do not carry the active capability. Preserve the
   // existing transaction rather than guessing and resetting its progress.
   if (!input.currentRequiredCapability) return null;
+  if (
+    input.currentRequiredCapability === "browser_diagnostic" &&
+    decision.gap === "unreconciled_failure"
+  ) {
+    // The browser failure has already moved from validation into diagnosis.
+    // A generic closure audit must not collapse that state back to the same
+    // browser-only retry before locator/source attribution changes.
+    return null;
+  }
   // Re-activating the same capability on every no-tool turn would reset the
   // phase budget. Only a changed ledger gap may replace an active contract.
   return input.currentRequiredCapability === decision.nextRequiredCapability
@@ -75,6 +84,9 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
   if (audit.completionAllowed || audit.gap === "none") return null;
   const scopedLedger = scopeExecutionEvidenceLedger(input.ledger, input.transactionId);
   const expectedTarget = latestMutationTarget(scopedLedger);
+  const desktopValidationExpected = scopedLedger.some((entry) =>
+    entry.kind === "tauri_required"
+  );
 
   if (
     audit.gap === "mutation_required" &&
@@ -89,6 +101,19 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
     }, input);
   }
 
+  if (
+    (audit.gap === "validation_required" || audit.gap === "validation_after_mutation_required") &&
+    desktopValidationExpected &&
+    input.availableToolNames.has("computer_use")
+  ) {
+    return reconcileWithActiveRecovery({
+      gap: audit.gap,
+      mode: "validation_only",
+      reason: `precompletion_evidence_gap:${audit.gap}:desktop`,
+      expectedTarget,
+      nextRequiredCapability: "desktop_validation",
+    }, input);
+  }
   if (
     (audit.gap === "validation_required" || audit.gap === "validation_after_mutation_required") &&
     input.availableToolNames.has("run_command")
@@ -157,7 +182,12 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
     const failure = resolveLatestUnreconciledFailureSignal({
       ledger: scopedLedger,
     });
-    const repairTarget = failure?.sourceTarget || expectedTarget;
+    // A browser locator/assertion failure without a stack/source reference is
+    // a validation-spec diagnosis, not permission to mutate whichever file
+    // happened to be read or changed most recently.
+    const repairTarget = failure?.domain === "browser"
+      ? failure.sourceTarget
+      : failure?.sourceTarget || expectedTarget;
 
     if (
       failure?.domain !== "process" &&
@@ -183,6 +213,20 @@ export function resolvePreCompletionEvidenceRecoveryDecision(input: {
           audit.longRunningStatus === "failed" || audit.longRunningStatus === "stopped"
             ? "recover_process"
             : "reconcile_server",
+      }, input);
+    }
+
+    if (
+      failure?.domain === "browser" &&
+      !repairTarget &&
+      hasAnyTool(input.availableToolNames, ["browser_evaluate", "grep_search", "read_file"])
+    ) {
+      return reconcileWithActiveRecovery({
+        gap: audit.gap,
+        mode: "action_plus_targeting",
+        reason: `precompletion_evidence_gap:${audit.gap}:browser_diagnostic`,
+        expectedTarget: null,
+        nextRequiredCapability: "browser_diagnostic",
       }, input);
     }
 

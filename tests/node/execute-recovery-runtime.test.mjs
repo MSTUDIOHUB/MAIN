@@ -61,14 +61,19 @@ const {
   clearExecuteRecoveryRuntimeState,
   createExecuteRecoveryRuntimeState,
   refundExecuteRecoveryRuntimeIteration,
+  isExecuteRecoveryPolicyDeferralFingerprint,
   registerExecuteRecoveryProtocolNoProgress,
   resolvePtyObservationPolicyDeferral,
+  shouldReleaseExecuteRecoveryPolicyBoundary,
   transitionExecuteRecoveryRuntimeState,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"),
 );
 const { buildApprovedPlanScopeConflictFingerprint } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/approvedPlanExecutionScope.ts"),
+);
+const executeRecoveryTools = loadTranspiledModuleSync(
+  path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"),
 );
 const { resolveDirectMutationPreflightRecovery } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/mutationFailureRecovery.ts"),
@@ -96,6 +101,138 @@ test("PTY observation policy deferral is recognized only from structured browser
     internalFeedback: true,
     qualityGateReason: "browser_preflight_deferred",
   }]), null, "other browser preflight outcomes keep their own recovery policy");
+});
+
+test("only a policy-owned protocol boundary with durable evidence releases recovery", () => {
+  const policyState = createExecuteRecoveryRuntimeState({
+    workflowMode: "edit",
+    forcedState: {
+      mode: "mutation_first",
+      reason: "approved_plan_execution_handoff",
+      expectedTarget: "src/main.js",
+      phaseNoProgressCount: 0,
+      protocolNoProgressCount: MAX_EXECUTE_RECOVERY_ITERATIONS,
+      protocolNoProgressFingerprint:
+        "mutation_first::src/main.js::read_file:package.json:policy:execute_recovery_read_scope_deferred",
+      decisionCheckpoint: {
+        expectedTarget: "src/main.js",
+        sourceObservationKey: null,
+        nextRequiredCapability: "mutation",
+      },
+    },
+  });
+  assert.equal(
+    isExecuteRecoveryPolicyDeferralFingerprint(
+      policyState.protocolNoProgressFingerprint,
+    ),
+    true,
+  );
+  assert.equal(shouldReleaseExecuteRecoveryPolicyBoundary({
+    state: policyState,
+    hasDurableEvidence: true,
+  }), true);
+  assert.equal(shouldReleaseExecuteRecoveryPolicyBoundary({
+    state: policyState,
+    hasDurableEvidence: false,
+  }), false);
+
+  const realNoProgress = {
+    ...policyState,
+    phaseNoProgressCount: MAX_EXECUTE_RECOVERY_ITERATIONS,
+    protocolNoProgressFingerprint:
+      "mutation_first::src/main.js::read_file:src/main.js:read_unchanged",
+  };
+  assert.equal(isExecuteRecoveryPolicyDeferralFingerprint(
+    realNoProgress.protocolNoProgressFingerprint,
+  ), false);
+  assert.equal(shouldReleaseExecuteRecoveryPolicyBoundary({
+    state: realNoProgress,
+    hasDurableEvidence: true,
+  }), false);
+
+  const approvedScopeConflict = {
+    ...policyState,
+    protocolNoProgressFingerprint: buildApprovedPlanScopeConflictFingerprint({
+      planRevision: 1,
+      unexpectedTargets: ["src/unreviewed.js"],
+      plannedTargets: ["src/main.js"],
+    }),
+  };
+  assert.equal(isExecuteRecoveryPolicyDeferralFingerprint(
+    approvedScopeConflict.protocolNoProgressFingerprint,
+  ), true);
+});
+
+test("browser diagnostic reads cannot select a source target and a corrected browser check closes recovery", () => {
+  const diagnostic = createExecuteRecoveryRuntimeState({
+    workflowMode: "edit",
+    forcedState: {
+      mode: "action_plus_targeting",
+      reason: "browser_validation_requires_diagnostic",
+      expectedTarget: null,
+      protocolNoProgressCount: 2,
+      protocolNoProgressFingerprint: "browser-failure",
+      decisionCheckpoint: {
+        expectedTarget: null,
+        sourceObservationKey: null,
+        nextRequiredCapability: "browser_diagnostic",
+        browserFailureFingerprint: "browser-failure",
+        browserFailureDetail: "locator #new-file-btn was not found",
+        browserFailedLocator: "#new-file-btn",
+        browserLocatorCandidates: ["#new-btn", "Open"],
+        browserRequestedUrl: "http://localhost:1420/",
+      },
+    },
+  });
+
+  assert.equal(diagnostic.decisionCheckpoint.nextRequiredCapability, "browser_diagnostic");
+  assert.deepEqual(diagnostic.decisionCheckpoint.browserLocatorCandidates, ["#new-btn", "Open"]);
+
+  const unrelatedRead = transitionExecuteRecoveryRuntimeState(diagnostic, {
+    freshReadTarget: "index.html",
+    sourceObservationKey: "index.html::version=1",
+    sourceObservedVersion: "1",
+  });
+  assert.equal(unrelatedRead.transition, "none");
+  assert.equal(unrelatedRead.state.expectedTarget, null);
+  assert.equal(unrelatedRead.state.decisionCheckpoint.nextRequiredCapability, "browser_diagnostic");
+
+  const corrected = transitionExecuteRecoveryRuntimeState(diagnostic, {
+    validationTarget: "http://localhost:1420/",
+    validationToolName: "browser_evaluate",
+  });
+  assert.equal(corrected.transition, "validation_to_normal");
+  assert.equal(corrected.state.mode, "normal");
+});
+
+test("browser and desktop recovery expose distinct bounded validation surfaces", () => {
+  const browser = executeRecoveryTools.resolveExecuteRecoveryActionContract(
+    "action_plus_targeting",
+    {
+      decisionCheckpoint: {
+        expectedTarget: null,
+        sourceObservationKey: null,
+        nextRequiredCapability: "browser_diagnostic",
+      },
+    },
+  );
+  assert.equal(browser.nextRequiredCapability, "browser_diagnostic");
+  assert.deepEqual([...browser.allowedToolNames].sort(), ["browser_evaluate", "grep_search", "read_file"]);
+  assert.equal(browser.allowedToolNames.has("apply_patch"), false);
+
+  const desktop = executeRecoveryTools.resolveExecuteRecoveryActionContract(
+    "validation_only",
+    {
+      decisionCheckpoint: {
+        expectedTarget: null,
+        sourceObservationKey: null,
+        nextRequiredCapability: "desktop_validation",
+      },
+    },
+  );
+  assert.equal(desktop.nextRequiredCapability, "desktop_validation");
+  assert.deepEqual([...desktop.allowedToolNames], ["computer_use"]);
+  assert.deepEqual(desktop.toolCallRequirement, { kind: "required_named", toolName: "computer_use" });
 });
 
 test("execute recovery state restores forced edit and approved-Plan continuation transactions", () => {

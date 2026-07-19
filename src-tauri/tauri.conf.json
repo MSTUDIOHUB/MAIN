@@ -29,6 +29,10 @@
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
+    "resources": {
+      "../scripts/browser_evaluate.mjs": "scripts/browser_evaluate.mjs",
+      "../scripts/computer_use.mjs": "scripts/computer_use.mjs"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

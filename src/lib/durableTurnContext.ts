@@ -140,6 +140,7 @@ export function collectDurableTurnExecutionSummary(input: {
       block.toolStatus === "executed" &&
       (
         risk === "browser_control" ||
+        risk === "desktop_control" ||
         (risk === "shell" && commandOutcome === "succeeded" && VALIDATION_TARGET_RE.test(block.target || ""))
       )
     ) {

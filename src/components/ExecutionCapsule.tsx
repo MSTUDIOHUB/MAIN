@@ -9,7 +9,7 @@ import {
   simplifyOperationProposalReplyOptions,
 } from "../lib/replyOptions";
 import type { TurnPresentationModel } from "../lib/turnPresentation";
-import type { ToolPermissionResolutionIdentity } from "../lib/actionRequest";
+import type { ToolPermissionActionRequest, ToolPermissionResolutionIdentity } from "../lib/actionRequest";
 
 // region: ExecutionCapsule 属性定义
 interface ExecutionCapsuleProps {
@@ -19,6 +19,7 @@ interface ExecutionCapsuleProps {
   runId?: string;
   requestId?: string;
   permissionIdentity?: ToolPermissionResolutionIdentity;
+  permissionRisk?: ToolPermissionActionRequest["risk"];
   status: string;
   statusToneClass: string;
   language: "zh" | "en";
@@ -113,6 +114,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
   runId,
   requestId,
   permissionIdentity,
+  permissionRisk,
   status,
   statusToneClass,
   language,
@@ -294,6 +296,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     ? reviewTaskCandidate
     : null;
   const hasPendingToolReview = !!activeReviewTask;
+  const desktopControlRequiresPerCallApproval = permissionRisk === "desktop_control";
   const hasActiveDiffPreview = !!activeReviewTask?.diff;
   const hasChoicePromptContent = hasReplyOptions || isAwaitingChoice || hasPendingRunDecision;
   const hasExpandableContent =
@@ -360,7 +363,11 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     showOptions: language === "zh" ? "展开选项" : "Show Options",
     collapseOptions: language === "zh" ? "收起选项" : "Collapse Options",
     diffRequest: language === "zh" ? "待确认变更" : "Pending Change",
-    chooseApproval: language === "zh" ? "请选择审批方式" : "Choose an approval option",
+    chooseApproval: desktopControlRequiresPerCallApproval
+      ? language === "zh"
+        ? "真实桌面控制每次只能单独审批"
+        : "Real desktop control requires approval for every call"
+      : language === "zh" ? "请选择审批方式" : "Choose an approval option",
     choiceHint: language === "zh"
       ? "模型已经识别出关键分叉并暂停。请先在聊天区点击一个选项，再继续当前回合。"
       : "The model found a real branch point and paused. Pick an option in chat before this turn continues.",
@@ -427,7 +434,7 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
       ? `共 ${progressItems.length} 个任务，已完成 ${completedCount} 个`
       : `${completedCount}/${progressItems.length} tasks completed`,
     executionStage: language === "zh" ? "执行步骤" : "Execution",
-  }), [activeProgressMode, completedCount, hasOperationProposalApproval, language, progressItems.length]);
+  }), [activeProgressMode, completedCount, desktopControlRequiresPerCallApproval, hasOperationProposalApproval, language, progressItems.length]);
 
   const isBlackTheme = themeMode === "black";
   const activeRunOutline = isRunActive
@@ -973,21 +980,23 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       >
                         {copy.reject}
                       </button>
-                      <button
-                        data-testid="execution-capsule-tool-approve-session"
-                        onClick={() => permissionIdentity && onApproveDiffSession?.(permissionIdentity)}
-                        className={`rounded-lg border px-4 py-2 text-[12px] font-medium transition-colors ${
-                          autoApproveTools
-                            ? "theme-plan-button"
-                            : "border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
-                        }`}
-                        title={copy.autoReviewInfo}
-                      >
-                        <span className="inline-flex items-center gap-1.5">
-                          {copy.approveDiffSession}
-                          <IconInfo className="h-3.5 w-3.5 opacity-75" />
-                        </span>
-                      </button>
+                      {!desktopControlRequiresPerCallApproval && (
+                        <button
+                          data-testid="execution-capsule-tool-approve-session"
+                          onClick={() => permissionIdentity && onApproveDiffSession?.(permissionIdentity)}
+                          className={`rounded-lg border px-4 py-2 text-[12px] font-medium transition-colors ${
+                            autoApproveTools
+                              ? "theme-plan-button"
+                              : "border-[#3f3f46] bg-[#09090b] text-[#a1a1aa] hover:bg-[#18181b] hover:text-[#f5f5f5]"
+                          }`}
+                          title={copy.autoReviewInfo}
+                        >
+                          <span className="inline-flex items-center gap-1.5">
+                            {copy.approveDiffSession}
+                            <IconInfo className="h-3.5 w-3.5 opacity-75" />
+                          </span>
+                        </button>
+                      )}
                       <button
                         data-testid="execution-capsule-tool-approve-once"
                         onClick={() => permissionIdentity && onApproveDiffOnce?.(permissionIdentity)}

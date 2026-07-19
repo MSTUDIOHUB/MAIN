@@ -58,6 +58,9 @@ export function classifyGoalToolCapability(input: GoalToolCapabilityInput): Goal
   if (risk === "browser_control") {
     return capability("browser", { meaningfulProgress: true });
   }
+  if (risk === "desktop_control") {
+    return capability("desktop", { meaningfulProgress: true });
+  }
   if (name.startsWith("mcp_") || name.includes("__")) {
     if (!MCP_READ_INTENT_RE.test(name) && !MCP_WRITE_INTENT_RE.test(name)) {
       return capability("unknown", { known: false, completionEligible: false, meaningfulProgress: false });
@@ -65,6 +68,7 @@ export function classifyGoalToolCapability(input: GoalToolCapabilityInput): Goal
     const mcpRisk = classifyMcpToolName(name);
     if (mcpRisk === "external_read") return capability("read", { meaningfulProgress: false });
     if (mcpRisk === "browser_control") return capability("browser", { meaningfulProgress: true });
+    if (mcpRisk === "desktop_control") return capability("desktop", { meaningfulProgress: true });
     if (
       (mcpRisk === "external_write" || mcpRisk === "destructive") &&
       (MCP_WORKSPACE_MUTATION_RE.test(name) || FILE_TARGET_RE.test(target))

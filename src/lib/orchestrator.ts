@@ -230,6 +230,7 @@ import {
   buildPlanEvidenceBundle,
   commandResultLooksSuccessful,
   isPlanEvidenceBundleReady,
+  resolveStructuredDesktopAutomationOutcome,
   type PlanEvidenceBundle,
 } from "./planEvidence";
 import { compactStructuredCommandResult } from "./commandValidationOutcome";
@@ -1631,7 +1632,7 @@ export interface OrchestratorCallbacks {
     toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
-    risk?: "local_file_read" | "browser_control";
+    risk?: "local_file_read" | "browser_control" | "desktop_control";
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   }) => Promise<ReviewDecision>;
@@ -1793,6 +1794,7 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     );
     case "run_command":     return (args.command as string) || "";
     case "browser_evaluate": return (args.url as string) || "";
+    case "computer_use": return (args.app_name as string) || (args.appName as string) || (args.app as string) || "desktop app";
     case "read_pty_buffer": return "terminal";
     case "read_pty_tail":   return "terminal tail";
     case "read_pty_since":  return `terminal @ ${args.offset ?? 0}`;
@@ -1839,6 +1841,7 @@ const NO_PROGRESS_EXCLUDED_TOOLS = new Set([
   "execute_command",
   "send_pty_input",
   "browser_evaluate",
+  "computer_use",
   "read_pty_buffer",
   "read_pty_tail",
   "read_pty_since",
@@ -3378,7 +3381,7 @@ function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars
     if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
       return { modelChars: 7000, displayChars: 8000 };
     }
-    if (name === "run_command" || name === "execute_command" || name === "browser_evaluate") return { modelChars: 6000, displayChars: 8000 };
+    if (name === "run_command" || name === "execute_command" || name === "browser_evaluate" || name === "computer_use") return { modelChars: 6000, displayChars: 8000 };
     return { modelChars: 6000, displayChars: 8000 };
   }
 
@@ -3386,7 +3389,7 @@ function getToolResultBudgets(name: string, cloudProfile: boolean): { modelChars
   if (name === "read_document" || name === "analyze_tabular_document" || name === "query_tabular_document") {
     return { modelChars: 16000, displayChars: 10000 };
   }
-  if (name === "run_command" || name === "execute_command" || name === "browser_evaluate") return { modelChars: 12000, displayChars: 10000 };
+  if (name === "run_command" || name === "execute_command" || name === "browser_evaluate" || name === "computer_use") return { modelChars: 12000, displayChars: 10000 };
   return { modelChars: 12000, displayChars: 10000 };
 }
 
@@ -4043,10 +4046,20 @@ async function executeToolCallWithLifecycle(
       logAgentEvent("browser_validation_result", {
         target,
         ok: browserOutcome?.ok ?? browserSucceeded,
+        failureType: browserOutcome?.failureType ?? null,
+        failureFingerprint: browserOutcome?.failureFingerprint ?? null,
         blankPage: browserOutcome?.blankPage ?? false,
         screenshotPath: browserOutcome?.screenshotPath ?? null,
         failureReasons: browserOutcome?.failureReasons.slice(0, 8) ?? [],
         failureSummary: browserOutcome?.failureSummary.slice(0, 600) ?? "",
+        validationSpecErrorCode: browserOutcome?.validationSpecError?.code ?? null,
+        failedSelector:
+          browserOutcome?.validationSpecError?.selector ||
+          browserOutcome?.failedAction?.selector ||
+          null,
+        locatorCandidates: browserOutcome?.interactiveElements
+          .flatMap((element) => element.selectorCandidates)
+          .slice(0, 16) ?? [],
         pageErrorCount: browserOutcome?.pageErrors.length ?? 0,
         consoleErrorCount: browserOutcome?.consoleErrors.length ?? 0,
         failedAssertionCount: browserOutcome?.failedAssertionCount ?? 0,
@@ -4056,6 +4069,67 @@ async function executeToolCallWithLifecycle(
         const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
         const budgets = getToolResultBudgets(tc.name, cloudProfile);
         const failureContent = buildBrowserValidationFailureContent(resultStr);
+        const modelFailureContent = truncateToolContent(failureContent, budgets.modelChars);
+        const displayFailureContent = truncateToolContent(failureContent, budgets.displayChars);
+        callbacks.onToolError(tc.name, target, displayFailureContent, {
+          toolCallId: tc.id,
+          failureKind: "actual",
+        });
+        const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
+          toolName: tc.name,
+          toolArgs: resolvedArgs,
+          toolResult: resultStr,
+          isError: true,
+          workspace,
+          workflowMode: callbacks.getWorkflowMode(),
+          language: callbacks.getPreferredLanguage(),
+          associatedPaths: callbacks.getAssociatedPaths(),
+        });
+        return {
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: modelFailureContent,
+          displayContent: displayFailureContent,
+          isError: true,
+          lifecycleState: "failed",
+          additionalContexts: [
+            ...preHookResult.additionalContexts,
+            ...postHookResult.additionalContexts,
+          ],
+        };
+      }
+    }
+
+    if (tc.name === "computer_use") {
+      const desktopOutcome = resolveStructuredDesktopAutomationOutcome(resultStr, {
+        requireCausalInteraction: true,
+      });
+      let parsedDesktop: Record<string, unknown> | null = null;
+      try {
+        const parsed = JSON.parse(resultStr);
+        parsedDesktop = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed as Record<string, unknown>
+          : null;
+      } catch {
+        parsedDesktop = null;
+      }
+      const adapterReportedSuccess = parsedDesktop?.ok === true || parsedDesktop?.success === true;
+      logAgentEvent("desktop_control_result", {
+        target,
+        ok: adapterReportedSuccess,
+        verified: desktopOutcome === "verified",
+        failureType: String(parsedDesktop?.failureType || "") || null,
+        failureSummary: String(parsedDesktop?.failureSummary || parsedDesktop?.error || "").slice(0, 600),
+        screenshotPath: String(parsedDesktop?.screenshotPath || "") || null,
+        actionCount: Array.isArray(parsedDesktop?.actions) ? parsedDesktop.actions.length : 0,
+        assertionCount: Array.isArray(parsedDesktop?.assertions) ? parsedDesktop.assertions.length : 0,
+        durationMs: typeof parsedDesktop?.durationMs === "number" ? parsedDesktop.durationMs : null,
+      });
+      if (!adapterReportedSuccess) {
+        const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
+        const budgets = getToolResultBudgets(tc.name, cloudProfile);
+        const failureContent = `DESKTOP_CONTROL_FAILED:\n${resultStr}`;
         const modelFailureContent = truncateToolContent(failureContent, budgets.modelChars);
         const displayFailureContent = truncateToolContent(failureContent, budgets.displayChars);
         callbacks.onToolError(tc.name, target, displayFailureContent, {
@@ -4383,7 +4457,7 @@ async function executeToolCallWithLifecycle(
       ...(isInternalFeedback ? { internalFeedback: true } : {}),
       ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
       ...(
-        tc.name === "browser_evaluate" || tc.name === "apply_patch"
+        tc.name === "browser_evaluate" || tc.name === "computer_use" || tc.name === "apply_patch"
           ? { evidenceResult: resultStr }
           : {}
       ),
@@ -5301,12 +5375,16 @@ export async function executeWriteToolWithReview(
 
   let decision: ReviewDecision;
   try {
-    const browserRisk = tc.name === "browser_evaluate" ? "browser_control" : undefined;
+    const controlRisk = tc.name === "browser_evaluate"
+      ? "browser_control"
+      : tc.name === "computer_use"
+      ? "desktop_control"
+      : undefined;
     decision = await callbacks.requestReview({
       toolCallId: tc.id,
       name: tc.name,
       arguments: toolArgs,
-      ...(browserRisk ? { risk: browserRisk } : {}),
+      ...(controlRisk ? { risk: controlRisk } : {}),
       ...(shellApprovalResolution.decision ? { shellPermissionDecision: shellApprovalResolution.decision } : {}),
     });
   } catch {

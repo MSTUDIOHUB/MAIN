@@ -38,6 +38,7 @@ export function formatApprovedPlanNoToolAvailableTools(
     "run_command",
     "execute_command",
     "browser_evaluate",
+    "computer_use",
   ].filter((name) => available.has(name));
   if (preferred.length === 0) return "";
   return language === "zh"

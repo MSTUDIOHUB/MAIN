@@ -5,6 +5,10 @@ import { getDiffStats } from "../lib/diff";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "../lib/toolPresentation";
 import { buildToolResultPresentation } from "../lib/toolResultPresentation";
 import {
+  getRepeatedBrowserFailureCallsForUi,
+  summarizeBrowserFailureForUi,
+} from "../lib/toolUiGrouping";
+import {
   classifyChatError,
   getChatFeedbackStatusCopy,
   normalizeChatFeedbackStatus,
@@ -37,6 +41,7 @@ const TOOL_LABELS: Record<string, { verb: { zh: string; en: string }; icon: Reac
   send_pty_input:   { verb: { zh: "发送终端输入", en: "send terminal input" }, icon: IconTerminal },
   run_command:      { verb: { zh: "运行命令并等待", en: "run command and wait" }, icon: IconTerminal },
   browser_evaluate: { verb: { zh: "浏览器验证", en: "validate in browser" }, icon: IconTerminal },
+  computer_use:     { verb: { zh: "桌面控制", en: "control desktop app" }, icon: IconTool },
   read_pty_buffer:  { verb: { zh: "读取终端", en: "read terminal" }, icon: IconTerminal },
   read_pty_tail:    { verb: { zh: "读取终端尾部", en: "read terminal tail" }, icon: IconTerminal },
   read_pty_since:   { verb: { zh: "读取新增终端输出", en: "read new terminal output" }, icon: IconTerminal },
@@ -191,6 +196,23 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
   );
   const purposeText = compactExplanation(why || intentSummary);
   const evidenceText = compactExplanation(isDone ? observationSummary || evidence : evidence, 220);
+  const browserFailureSummary = useMemo(
+    () => toolName === "browser_evaluate" && isFailed
+      ? summarizeBrowserFailureForUi({
+          message,
+          observationSummary,
+          evidence,
+          language: uiLanguage,
+        })
+      : null,
+    [evidence, isFailed, message, observationSummary, toolName, uiLanguage],
+  );
+  const repeatedBrowserFailureCalls = useMemo(
+    () => browserFailureSummary?.repeatCount > 1
+      ? getRepeatedBrowserFailureCallsForUi(message)
+      : [],
+    [browserFailureSummary?.repeatCount, message],
+  );
 
   // ── Collapsed summary row ──
   if (!expanded && isDone) {
@@ -237,6 +259,60 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
               </span>
             </span>
             <IconChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#71717a]" />
+          </button>
+        </div>
+      );
+    }
+
+    if (browserFailureSummary) {
+      const actionDetail = [browserFailureSummary.action, browserFailureSummary.selector]
+        .filter(Boolean)
+        .join(" · ");
+      return (
+        <div className="w-full ml-9 mt-1 mb-2">
+          <button
+            type="button"
+            onClick={() => setExpanded(true)}
+            data-testid="browser-validation-failure-summary"
+            className="flex w-full min-w-0 items-start gap-2 rounded-md border border-[rgba(251,146,60,0.24)] bg-[color-mix(in_srgb,var(--surface-bg)_94%,#f97316_6%)] px-2.5 py-2 text-left shadow-sm transition-colors hover:border-[rgba(251,146,60,0.42)]"
+          >
+            <IconChevronRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[var(--surface-text-muted)]" />
+            <IconComponent className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#fb923c]" />
+            <span className="min-w-0 flex-1">
+              <span className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-0.5 text-[11px]">
+                <span className="shrink-0 font-semibold text-[var(--surface-text)]">{localizedVerb}</span>
+                {actionDetail && (
+                  <span
+                    data-testid="browser-validation-failed-action"
+                    className="min-w-0 truncate font-mono text-[#fdba74]"
+                    title={actionDetail}
+                  >
+                    {actionDetail}
+                  </span>
+                )}
+                {browserFailureSummary.repeatCount > 1 && (
+                  <span
+                    data-testid="browser-validation-repeat-count"
+                    className="shrink-0 rounded-full border border-[rgba(251,146,60,0.3)] bg-[rgba(251,146,60,0.1)] px-1.5 py-0.5 text-[9px] font-semibold text-[#fdba74]"
+                  >
+                    ×{browserFailureSummary.repeatCount}
+                  </span>
+                )}
+              </span>
+              <span
+                data-testid="browser-validation-failure-reason"
+                className="mt-0.5 block truncate text-[10.5px] text-[var(--surface-text-subtle)]"
+                title={browserFailureSummary.reason}
+              >
+                {browserFailureSummary.reason}
+              </span>
+              <span className="mt-0.5 block truncate font-mono text-[9.5px] text-[var(--surface-text-muted)]" title={displayTarget}>
+                {displayTarget}
+              </span>
+            </span>
+            <span className="shrink-0 rounded-full border border-[rgba(251,146,60,0.22)] bg-[rgba(251,146,60,0.08)] px-1.5 py-0.5 text-[9px] text-[#fb923c]">
+              {feedbackCopy.shortLabel}
+            </span>
           </button>
         </div>
       );
@@ -388,6 +464,69 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
           </div>
         )}
 
+        {browserFailureSummary && (
+          <div
+            data-testid="browser-validation-failure-details"
+            className="mt-3 rounded-lg border border-[rgba(251,146,60,0.22)] bg-[rgba(251,146,60,0.06)] px-3 py-2"
+          >
+            <div className="flex min-w-0 flex-wrap items-center gap-2 text-[11px]">
+              <span className="font-semibold text-[#fdba74]">
+                {language === "zh" ? "失败动作" : "Failed action"}
+              </span>
+              {(browserFailureSummary.action || browserFailureSummary.selector) && (
+                <span className="min-w-0 break-all font-mono text-[var(--surface-text)]">
+                  {[browserFailureSummary.action, browserFailureSummary.selector].filter(Boolean).join(" · ")}
+                </span>
+              )}
+              {browserFailureSummary.repeatCount > 1 && (
+                <span className="shrink-0 rounded-full border border-[rgba(251,146,60,0.3)] px-1.5 py-0.5 text-[9px] text-[#fdba74]">
+                  ×{browserFailureSummary.repeatCount}
+                </span>
+              )}
+            </div>
+            <div className="mt-1 text-[11px] leading-5 text-[var(--surface-text-subtle)]">
+              <span className="font-medium text-[#fb923c]">{language === "zh" ? "原因：" : "Reason: "}</span>
+              {browserFailureSummary.reason}
+            </div>
+            {browserFailureSummary.repeatCount > 1 && (
+              <div className="mt-1 text-[10px] text-[var(--surface-text-muted)]">
+                {language === "zh"
+                  ? "下方按调用保留了每次验证的完整证据。"
+                  : "Each validation call and its complete evidence are retained below."}
+              </div>
+            )}
+          </div>
+        )}
+
+        {repeatedBrowserFailureCalls.length > 0 && (
+          <div data-testid="browser-validation-repeated-call-details" className="mt-3 space-y-1.5">
+            {repeatedBrowserFailureCalls.map((call, callIndex) => {
+              const callText = [
+                call.message,
+                call.evidence ? `${language === "zh" ? "证据" : "Evidence"}: ${call.evidence}` : "",
+                call.observationSummary
+                  ? `${language === "zh" ? "观察" : "Observation"}: ${call.observationSummary}`
+                  : "",
+              ].filter(Boolean).join("\n\n");
+              return (
+                <details
+                  key={`${String(call.id ?? callIndex)}-${callIndex}`}
+                  data-testid="browser-validation-repeated-call"
+                  className="rounded-md border border-[var(--surface-border-soft)] bg-[color-mix(in_srgb,var(--surface-bg)_96%,transparent)] px-2.5 py-1.5"
+                >
+                  <summary className="cursor-pointer select-none text-[10.5px] text-[var(--surface-text-subtle)]">
+                    {language === "zh" ? `第 ${callIndex + 1} 次调用` : `Call ${callIndex + 1}`}
+                    {call.id != null ? ` · ${String(call.id)}` : ""}
+                  </summary>
+                  <pre className="mt-2 max-h-[220px] overflow-y-auto whitespace-pre-wrap break-words border-t border-[var(--surface-border-soft)] pt-2 font-mono text-[10px] leading-5 text-[var(--surface-text-muted)]">
+                    {callText || (language === "zh" ? "无可用详情" : "No details available")}
+                  </pre>
+                </details>
+              );
+            })}
+          </div>
+        )}
+
         {isSystemErrorCard && errorInfo && (
           <div className="mt-3 rounded-lg border border-[rgba(251,113,133,0.22)] bg-[rgba(251,113,133,0.06)] px-3 py-2">
             <div className="flex flex-wrap items-center justify-between gap-2">
@@ -431,7 +570,7 @@ export default function ActionCard({ blockId, toolName, target, toolStatus, mess
           )}
 
         {/* Expandable message area — pending cards may include permission preflight details. */}
-        {message && (() => {
+        {message && repeatedBrowserFailureCalls.length === 0 && (() => {
           const presentation = buildToolResultPresentation({
             toolName: isSystemErrorCard ? "Error" : toolName,
             message,

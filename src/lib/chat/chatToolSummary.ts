@@ -6,7 +6,7 @@ export const TOOL_SUMMARY_GROUPS = {
   read: new Set(["get_project_skeleton", "get_file_outline", "code_ast_query", "find_symbol_references", "git_status", "git_diff", "read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "knowledge_search", "knowledge_get_excerpt"]),
   table: new Set(["analyze_tabular_document", "query_tabular_document"]),
   edit: new Set(["replace_in_file", "write_file", "apply_patch"]),
-  command: new Set(["execute_command", "send_pty_input", "run_command", "browser_evaluate", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
+  command: new Set(["execute_command", "send_pty_input", "run_command", "browser_evaluate", "computer_use", "read_pty_buffer", "read_pty_tail", "read_pty_since", "get_pty_status", "clear_pty_buffer"]),
 };
 
 export const READ_CONTEXT_TOOL_NAMES = new Set([

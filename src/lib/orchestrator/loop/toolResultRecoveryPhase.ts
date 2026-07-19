@@ -9,7 +9,12 @@ import {
   shouldEnterFailedFiniteValidationRecovery,
 } from "../../executeRecoveryTools";
 import { buildApprovedPlanScopeConflictFingerprint } from "../../approvedPlanExecutionScope";
-import { parseBrowserValidationOutcome } from "../../browserValidation";
+import {
+  buildBrowserValidationCacheSignature,
+  resolvePersistentBrowserFailureCallSignature,
+  parseBrowserValidationRecord,
+  parseBrowserValidationOutcome,
+} from "../../browserValidation";
 import { resolveDevServerRuntimeState } from "../../devServerRuntime";
 import {
   isReviewablePlanStage,
@@ -121,6 +126,158 @@ type EmitPlanExecutionProgress = (
   phase: PlanExecutionProgressPhase,
   overrides?: Partial<PlanExecutionProgressUpdate>,
 ) => void;
+
+function normalizeBrowserDiagnosticToken(value: unknown): string {
+  return String(value || "")
+    .replace(/\s+/g, " ")
+    .replace(/^[`'\"]+|[`'\"]+$/g, "")
+    .trim()
+    .slice(0, 240);
+}
+
+function parseDesktopControlRecord(value: string): Record<string, unknown> | null {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const candidates = [raw];
+  const markerMatches = [...raw.matchAll(/DESKTOP_(?:VALIDATION|CONTROL)_FAILED:/gi)];
+  const markerMatch = markerMatches[markerMatches.length - 1];
+  if (markerMatch?.index !== undefined) {
+    const payloadStart = raw.indexOf("\n", markerMatch.index + markerMatch[0].length);
+    if (payloadStart >= 0) candidates.unshift(raw.slice(payloadStart + 1).trim());
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // A failed tool result can include a user-facing prefix before the exact
+      // adapter JSON. Only the structured payload is authoritative here.
+    }
+  }
+  return null;
+}
+
+function extractFailedBrowserLocator(
+  args: Record<string, unknown>,
+  detail: string,
+): string | null {
+  const actions = Array.isArray(args.actions)
+    ? args.actions
+    : typeof args.actions === "string"
+    ? args.actions.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+    : [];
+  for (const action of actions) {
+    const actionText = typeof action === "string"
+      ? action
+      : action && typeof action === "object"
+        ? JSON.stringify(action)
+        : "";
+    const match = actionText.match(/(?:click|fill|press|select_file|wait_for_selector)\s*[:=]\s*([^\n,;}]+)/i) ||
+      actionText.match(/"(?:selector|locator|target)"\s*:\s*"([^"]+)"/i);
+    const locator = normalizeBrowserDiagnosticToken(match?.[1]);
+    if (locator) return locator;
+  }
+  const detailMatch = detail.match(/(?:locator|selector)\s*(?:not found|missing|failed|timed out)?\s*[:=]?\s*[`'\"]([^`'\"]+)[`'\"]/i) ||
+    detail.match(/(?:click|fill|wait_for_selector)\s*[:=]\s*([^\s,;}]+)/i);
+  return normalizeBrowserDiagnosticToken(detailMatch?.[1]) || null;
+}
+
+function collectBrowserLocatorCandidates(record: Record<string, unknown> | null): string[] {
+  if (!record) return [];
+  const candidates = new Set<string>();
+  const visit = (value: unknown, key = "", depth = 0) => {
+    if (depth > 5 || candidates.size >= 24 || value == null) return;
+    if (Array.isArray(value)) {
+      value.slice(0, 80).forEach((item) => visit(item, key, depth + 1));
+      return;
+    }
+    if (typeof value !== "object") {
+      const text = normalizeBrowserDiagnosticToken(value);
+      if (!text || text.length < 2 || text.length > 120) return;
+      if (/^(?:selector|locator|css)$/i.test(key)) candidates.add(text);
+      else if (/^id$/i.test(key)) candidates.add(text.startsWith("#") ? text : `#${text}`);
+      else if (/^(?:text|label|name|ariaLabel|visibleText)$/i.test(key)) candidates.add(text);
+      return;
+    }
+    for (const [childKey, childValue] of Object.entries(value as Record<string, unknown>)) {
+      if (
+        depth === 0 &&
+        !/(?:interactive|locator|element|control|candidate|dom|inventory)/i.test(childKey)
+      ) continue;
+      visit(childValue, childKey, depth + 1);
+    }
+  };
+  visit(record);
+  return [...candidates];
+}
+
+function buildStableBrowserFailureFingerprint(input: {
+  args: Record<string, unknown>;
+  failureType: string;
+  failureReasons: string[];
+  failureDetail: string;
+}): string {
+  const failureClass = [
+    input.failureType,
+    ...input.failureReasons,
+    input.failureDetail
+      .toLowerCase()
+      .replace(/\b\d+(?:\.\d+)?\s*(?:ms|s|seconds?)\b/g, "<time>")
+      .replace(/\b\d+\b/g, "#")
+      .replace(/\s+/g, " ")
+      .slice(0, 320),
+  ].filter(Boolean).join(":");
+  return `${buildBrowserValidationCacheSignature(input.args)}::${failureClass}`;
+}
+
+function browserDiagnosticTerms(checkpoint: ExecuteRecoveryRuntimeState["decisionCheckpoint"]): string[] {
+  return [
+    checkpoint?.browserFailedLocator || "",
+    ...(checkpoint?.browserLocatorCandidates || []),
+  ]
+    .map((value) => normalizeBrowserDiagnosticToken(value).toLowerCase())
+    .flatMap((value) => value ? [value, value.replace(/^[#.]/, "")] : [])
+    .filter((value, index, values) => value.length >= 2 && values.indexOf(value) === index);
+}
+
+function browserDiagnosticAttributionTerms(
+  checkpoint: ExecuteRecoveryRuntimeState["decisionCheckpoint"],
+): string[] {
+  const terms = browserDiagnosticTerms(checkpoint);
+  const structural = terms.filter((term) =>
+    /^(?:#|\.|\[)/.test(term) || /(?:data-|aria-|[_-])/.test(term)
+  );
+  // Visible text can exist in an initial document/title and is not causal proof
+  // of the failed control when the DOM inventory already supplied a structural
+  // selector. Use labels only as a bounded fallback when no selector exists.
+  return structural.length > 0 ? structural : terms;
+}
+
+function queryMatchesBrowserDiagnostic(
+  query: string,
+  checkpoint: ExecuteRecoveryRuntimeState["decisionCheckpoint"],
+): boolean {
+  const normalized = normalizeBrowserDiagnosticToken(query).toLowerCase();
+  const plain = normalized.replace(/^[#.]/, "");
+  if (!normalized || plain.length < 2) return false;
+  return browserDiagnosticAttributionTerms(checkpoint).some((term) =>
+    term === normalized || term === plain || term.replace(/^[#.]/, "") === plain
+  );
+}
+
+function sourcePathsFromGrepResult(content: string, workspace: string): string[] {
+  const paths = String(content || "").split(/\r?\n/).flatMap((line) => {
+    const match = line.match(/^(.+?):\d+:/);
+    if (!match) return [];
+    const path = relativizeToWorkspacePath(match[1].trim(), workspace)
+      .replace(/^\.\//, "")
+      .trim();
+    return path && path !== "." ? [path] : [];
+  });
+  return [...new Set(paths)];
+}
 
 type ActivateExecuteRecovery = (
   mode: Exclude<ExecuteRecoveryRuntimeState["mode"], "normal">,
@@ -1376,31 +1533,209 @@ export async function handleToolResultRecoveryPhase(input: {
     emitTurnEvent: input.emitTurnEvent,
   });
 
+  const failedDesktopControl = input.results.find((result) =>
+    result.name === "computer_use" && !result.internalFeedback && result.isError
+  );
+  if (failedDesktopControl) {
+    const desktopRecord = parseDesktopControlRecord(
+      failedDesktopControl.content || failedDesktopControl.displayContent || "",
+    );
+    const failureType = normalizeBrowserDiagnosticToken(
+      desktopRecord?.failureType || desktopRecord?.failure_type,
+    ).toLowerCase();
+    if (["permission_required", "unsupported_platform", "automation_unavailable"].includes(failureType)) {
+      const language = input.callbacks.getPreferredLanguage();
+      const detail = normalizeBrowserDiagnosticToken(
+        desktopRecord?.failureSummary || desktopRecord?.failure_summary || desktopRecord?.error,
+      ) || (language === "zh" ? "桌面自动化环境当前不可用。" : "Desktop automation is currently unavailable.");
+      const permissionRequired = failureType === "permission_required";
+      const nextStep = permissionRequired
+        ? language === "zh"
+          ? "在 macOS“系统设置 → 隐私与安全性 → 辅助功能”和“自动化”中允许 MAIN，然后从当前检查点恢复；MAIN 不会在权限未变化时自动重试。"
+          : "Allow MAIN under macOS System Settings > Privacy & Security > Accessibility and Automation, then resume this checkpoint; MAIN will not retry while permission is unchanged."
+        : language === "zh"
+          ? "保留现有源码与命令证据；在支持 macOS Accessibility 的 MAIN 桌面运行环境中恢复，或把这项真实桌面验收作为明确的人工检查。"
+          : "Keep the existing source and command evidence; resume in a MAIN desktop runtime with macOS Accessibility support, or treat this as an explicit manual desktop check.";
+      const notice = language === "zh"
+        ? [
+            "桌面控制已暂停，本次调用不会自动重试。",
+            `- 应用：${failedDesktopControl.target || "未识别"}`,
+            `- 原因：${detail}`,
+            `- 下一步：${nextStep}`,
+          ].join("\n")
+        : [
+            "Desktop control paused and this call will not be retried automatically.",
+            `- App: ${failedDesktopControl.target || "unknown"}`,
+            `- Reason: ${detail}`,
+            `- Next: ${nextStep}`,
+          ].join("\n");
+      const recoveryReason = `desktop_control_${failureType}`;
+      logAgentEvent("desktop_control_environment_blocked", {
+        iteration: input.iteration,
+        target: failedDesktopControl.target,
+        failureType,
+        detail: detail.slice(0, 600),
+        recoveryReason,
+      });
+      input.emitPlanExecutionProgress("paused", {
+        currentTask: language === "zh" ? "等待桌面控制环境可用" : "waiting for desktop control availability",
+        currentTool: "computer_use",
+        latestEvidence: detail,
+        recoveryReason,
+        nextStep,
+      });
+      input.callbacks.onNonActionableStop(notice, "no_action", {
+        phase: "paused",
+        currentTask: language === "zh" ? "桌面控制环境阻塞" : "desktop control environment blocked",
+        currentTool: "computer_use",
+        latestEvidence: detail,
+        recoveryReason,
+        nextStep,
+        repeatedTargets: failedDesktopControl.target ? [failedDesktopControl.target] : [],
+      });
+      input.callbacks.onStatusChange("idle");
+      return finish("stopped");
+    }
+  }
+
+  const browserDiagnosticCheckpoint =
+    executeRecoveryState.decisionCheckpoint?.nextRequiredCapability === "browser_diagnostic"
+      ? executeRecoveryState.decisionCheckpoint
+      : null;
+  if (browserDiagnosticCheckpoint) {
+    const attributedRead = input.results.find((result) => {
+      if (
+        result.name !== "read_file" ||
+        result.isError ||
+        result.internalFeedback ||
+        !result.readFileObservation ||
+        result.readFileObservation.source === "stub"
+      ) return false;
+      const content = String(result.content || result.displayContent || "").toLowerCase();
+      return browserDiagnosticAttributionTerms(browserDiagnosticCheckpoint).some((term) =>
+        content.includes(term.replace(/^[#.]/, ""))
+      );
+    });
+    const attributedGrep = input.results.find((result) => {
+      if (result.name !== "grep_search" || result.isError || result.internalFeedback) return false;
+      const args = input.toolArgsByCallId.get(result.toolCallId) || {};
+      const query = String(args.query || args.pattern || "").trim();
+      return queryMatchesBrowserDiagnostic(query, browserDiagnosticCheckpoint) &&
+        sourcePathsFromGrepResult(result.content || result.displayContent || "", input.workspace).length === 1;
+    });
+    const attributedTarget = attributedRead?.target || (
+      attributedGrep
+        ? sourcePathsFromGrepResult(
+            attributedGrep.content || attributedGrep.displayContent || "",
+            input.workspace,
+          )[0]
+        : ""
+    );
+    if (attributedTarget) {
+      const sourceObservationKey = attributedRead?.readFileObservation?.key || null;
+      const needsRead = !sourceObservationKey;
+      const readLease = needsRead
+        ? buildFailedValidationRepairReadLease({ target: attributedTarget })
+        : null;
+      executeRecoveryState = activateExecuteRecoveryAndSync(
+        needsRead ? "patch_recovery_read" : "mutation_first",
+        "browser_diagnostic_source_attributed",
+        {
+          expectedTarget: attributedTarget,
+          readLease,
+          sourceObservationKey,
+          decisionCheckpoint: {
+            ...browserDiagnosticCheckpoint,
+            expectedTarget: attributedTarget,
+            sourceObservationKey,
+            nextRequiredCapability: needsRead ? "targeted_read" : "mutation",
+          },
+          requestedUrl: browserDiagnosticCheckpoint.browserRequestedUrl,
+        },
+      );
+      logAgentEvent("browser_diagnostic_source_attributed", {
+        iteration: input.iteration,
+        target: attributedTarget,
+        evidenceTool: attributedRead?.name || attributedGrep?.name,
+        needsRead,
+        browserFailureFingerprint: browserDiagnosticCheckpoint.browserFailureFingerprint || null,
+      });
+      input.emitPlanExecutionProgress("running", {
+        currentTask: input.callbacks.getPreferredLanguage() === "zh"
+          ? "按浏览器诊断定位源码"
+          : "attributing browser diagnostics to source",
+        currentTool: needsRead ? "read_file" : "apply_patch",
+        latestEvidence: browserDiagnosticCheckpoint.browserFailureDetail || "",
+        recoveryReason: "browser_diagnostic_source_attributed",
+        nextStep: input.callbacks.getPreferredLanguage() === "zh"
+          ? needsRead
+            ? `读取搜索证据唯一指向的 ${attributedTarget}，确认当前版本后再决定是否修改`
+            : `诊断词已在 ${attributedTarget} 的当前源码中确认；仅修复该因果问题并重新执行原浏览器验收`
+          : needsRead
+            ? `read ${attributedTarget}, the unique source named by diagnostic search evidence, before deciding whether to mutate`
+            : `the diagnostic term is confirmed in current ${attributedTarget}; repair only that causal issue and rerun the original browser validation`,
+      });
+      input.callbacks.onStatusChange("running");
+      input.callbacks.appendMessage({
+        role: "user",
+        content: [
+          "BROWSER_DIAGNOSTIC_SOURCE_ATTRIBUTED: A locator/label returned by the browser diagnostic is now tied to exactly one source file.",
+          `Attributed source: ${attributedTarget}`,
+          needsRead
+            ? `Read the current ${attributedTarget} under the granted lease before deciding whether source repair is actually needed.`
+            : `The current source observation is bound. Repair only the browser-observed causal mismatch if needed.`,
+          `Then rerun the original browser interaction at ${browserDiagnosticCheckpoint.browserRequestedUrl || "the retained browser URL"}; do not substitute a non-causal pre-existing text assertion.`,
+        ].join("\n"),
+      });
+      return finish("continue");
+    }
+  }
+
   const failedBrowserValidation = input.results.find((result) => {
     if (result.name !== "browser_evaluate" || result.internalFeedback) return false;
     const outcome = parseBrowserValidationOutcome(result.content || "");
     return result.isError || outcome?.ok === false;
   });
   if (failedBrowserValidation) {
+    const outcome = parseBrowserValidationOutcome(failedBrowserValidation.content || "");
+    const rawRecord = parseBrowserValidationRecord(failedBrowserValidation.content || "");
+    const failureType = normalizeBrowserDiagnosticToken(
+      rawRecord?.failureType || rawRecord?.failure_type ||
+      (outcome as unknown as { failureType?: unknown } | null)?.failureType,
+    ).toLowerCase();
+    const failureDetail = outcome?.failureSummary ||
+      outcome?.pageErrors[0] ||
+      outcome?.consoleErrors[0] ||
+      outcome?.error ||
+      "browser validation failed";
+    const failedArgs = input.toolArgsByCallId.get(failedBrowserValidation.toolCallId) || {};
+    const browserFailureCallSignature = resolvePersistentBrowserFailureCallSignature(
+      failedArgs,
+      failedBrowserValidation.content || "",
+    );
+    const browserFailureFingerprint = buildStableBrowserFailureFingerprint({
+      args: failedArgs,
+      failureType,
+      failureReasons: outcome?.failureReasons || [],
+      failureDetail,
+    });
+    const browserFailedLocator = extractFailedBrowserLocator(failedArgs, failureDetail);
+    const browserLocatorCandidates = collectBrowserLocatorCandidates(rawRecord)
+      .filter((candidate) => candidate !== browserFailedLocator)
+      .slice(0, 24);
     const scopedLedger = scopeExecutionEvidenceLedger(
       input.callbacks.getPlanExecutionEvidenceLedger(),
       input.iterationContext.eventTurnId,
     );
     const failure = resolveLatestUnreconciledFailureSignal({ ledger: scopedLedger });
     const repairTarget = failure?.domain === "browser"
-      ? failure.sourceTarget || executeRecoveryState.expectedTarget
+      ? failure.sourceTarget
       : null;
     if (repairTarget) {
       const repairReadLease = buildFailedValidationRepairReadLease({
         target: repairTarget,
         sourceObservationKey: executeRecoveryState.sourceObservationKey,
       });
-      const outcome = parseBrowserValidationOutcome(failedBrowserValidation.content || "");
-      const failureDetail = outcome?.failureSummary ||
-        outcome?.pageErrors[0] ||
-        outcome?.consoleErrors[0] ||
-        failure?.detail ||
-        "browser validation failed";
       executeRecoveryState = activateExecuteRecoveryAndSync(
         "mutation_first",
         "browser_validation_requires_source_repair",
@@ -1412,6 +1747,12 @@ export async function handleToolResultRecoveryPhase(input: {
             expectedTarget: repairTarget,
             sourceObservationKey: null,
             nextRequiredCapability: "targeted_read",
+            browserFailureFingerprint,
+            browserFailureCallSignature,
+            browserFailureDetail: String(failureDetail).slice(0, 1_200),
+            browserFailedLocator,
+            browserLocatorCandidates,
+            browserRequestedUrl: failedBrowserValidation.target,
           },
           requestedUrl: failedBrowserValidation.target,
         },
@@ -1448,6 +1789,67 @@ export async function handleToolResultRecoveryPhase(input: {
       });
       return finish("continue");
     }
+
+    executeRecoveryState = activateExecuteRecoveryAndSync(
+      "action_plus_targeting",
+      "browser_validation_requires_diagnostic",
+      {
+        expectedTarget: null,
+        resetExpectedTarget: true,
+        sourceObservationKey: null,
+        decisionCheckpoint: {
+          expectedTarget: null,
+          sourceObservationKey: null,
+          nextRequiredCapability: "browser_diagnostic",
+          browserFailureFingerprint,
+          browserFailureCallSignature,
+          browserFailureDetail: String(failureDetail).slice(0, 1_200),
+          browserFailedLocator,
+          browserLocatorCandidates,
+          browserRequestedUrl: failedBrowserValidation.target,
+        },
+        protocolNoProgressFingerprint: browserFailureFingerprint,
+        requestedUrl: failedBrowserValidation.target,
+      },
+    );
+    logAgentEvent("browser_validation_requires_diagnostic", {
+      iteration: input.iteration,
+      browserTarget: failedBrowserValidation.target,
+      failureType: failureType || null,
+      failureReasons: outcome?.failureReasons || [],
+      failureDetail: String(failureDetail).slice(0, 600),
+      failedLocator: browserFailedLocator,
+      locatorCandidates: browserLocatorCandidates,
+      browserFailureFingerprint: browserFailureFingerprint.slice(0, 600),
+      browserFailureCallSignature: browserFailureCallSignature
+        ? browserFailureCallSignature.slice(0, 600)
+        : null,
+      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+    });
+    input.emitPlanExecutionProgress("running", {
+      currentTask: input.callbacks.getPreferredLanguage() === "zh"
+        ? "诊断浏览器验收参数与真实 DOM"
+        : "diagnosing browser validation against the real DOM",
+      currentTool: "browser_evaluate",
+      latestEvidence: String(failureDetail).slice(0, 600),
+      recoveryReason: "browser_validation_requires_diagnostic",
+      nextStep: input.callbacks.getPreferredLanguage() === "zh"
+        ? "根据返回的交互元素清单修正 locator/因果断言；若需源码定位，只搜索失败或候选 locator 并读取唯一命中文件"
+        : "correct the locator/causal assertion from the returned interactive inventory; if source lookup is needed, search only the failed/candidate locator and read a uniquely matched file",
+    });
+    input.callbacks.onStatusChange("running");
+    input.callbacks.appendMessage({
+      role: "user",
+      content: [
+        "BROWSER_VALIDATION_DIAGNOSTIC_REQUIRED: Browser validation ran, but no browser error stack identifies broken source.",
+        `Observed failure: ${String(failureDetail).slice(0, 1_200)}`,
+        `Failed locator: ${browserFailedLocator || "(not structured)"}`,
+        `DOM-derived candidates: ${browserLocatorCandidates.join(", ") || "(inspect the returned interactive-element inventory)"}`,
+        "Treat this as a validation-spec/DOM diagnosis first. Correct the locator or post-action causal assertion and rerun browser_evaluate, or grep only one of the listed locator/label terms and read only a uniquely matched source file.",
+        "Do not mutate an arbitrary recently read file, and do not repeat the identical failed action/check while its arguments and page state are unchanged.",
+      ].join("\n"),
+    });
+    return finish("continue");
   }
 
   const failedFiniteValidation = input.results.find((result) => {

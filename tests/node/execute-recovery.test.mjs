@@ -144,6 +144,9 @@ const {
   buildRepeatLoopArgsKey,
   buildRepeatLoopSignature,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/repetitionGuard.ts"));
+const {
+  buildBrowserValidationCacheSignature,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/browserValidation.ts"));
 
 const {
   findDelegatedObservationRequiringParentReread,
@@ -2323,6 +2326,109 @@ test("same-batch reads suppress only the exact duplicate signature", async () =>
   assert.deepEqual(result.readOnlyCalls.map((call) => call.id), ["same-1", "next"]);
   assert.equal(result.preExecutionResults.length, 1);
   assert.match(result.preExecutionResults[0].content, /^FILE_UNCHANGED_STUB/);
+});
+
+test("a persisted deterministic browser failure blocks only the exact cross-slice invocation", async () => {
+  const originalArgs = {
+    url: "https://example.com/",
+    actions: [{ kind: "click", selector: "#open" }],
+    checks: [{ kind: "text", value: "Opened" }],
+  };
+  const browserFailureCallSignature = buildBrowserValidationCacheSignature(originalArgs);
+  const browserRegistry = {
+    tools: {
+      browser_evaluate: {
+        key: "browser_evaluate",
+        name: "browser_evaluate",
+        source: "built_in",
+        category: "browser",
+        risk: "browser_control",
+        enabled: true,
+        autoExecutable: false,
+      },
+    },
+    policy: partitionPermissionPolicy,
+  };
+  const executeRecoveryState = {
+    mode: "action_plus_targeting",
+    reason: "browser_validation_requires_diagnostic",
+    expectedTarget: null,
+    attempts: 1,
+    iterationCount: 1,
+    phaseNoProgressCount: 1,
+    protocolNoProgressCount: 1,
+    protocolNoProgressFingerprint: "browser-failure",
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: {
+      expectedTarget: null,
+      sourceObservationKey: null,
+      nextRequiredCapability: "browser_diagnostic",
+      browserFailureFingerprint: "browser-failure",
+      browserFailureCallSignature,
+      browserFailureDetail: "selector #open was not found",
+      browserLocatorCandidates: ["#open-document"],
+      browserRequestedUrl: originalArgs.url,
+    },
+  };
+  const buildInput = (args) => createReadFilePartitionInput({
+    toolCalls: [{
+      id: `browser-${args.actions[0].selector}-${args.checks[0].value}`,
+      name: "browser_evaluate",
+      arguments: JSON.stringify(args),
+    }],
+    availableToolNames: new Set(["browser_evaluate"]),
+    toolCapabilityRegistry: browserRegistry,
+    toolPermissionPolicy: browserRegistry.policy,
+    executeRecoveryState,
+  });
+
+  const exact = await partitionToolCallsForExecution(buildInput(originalArgs));
+  assert.equal(exact.writeCalls.length, 0);
+  assert.equal(exact.preExecutionResults.length, 1);
+  assert.equal(exact.preExecutionResults[0].internalFeedback, true);
+  assert.equal(
+    exact.preExecutionResults[0].qualityGateReason,
+    "browser_validation_persisted_failure_reused",
+  );
+
+  for (const nextRequiredCapability of ["targeted_read", "targeting", "mutation"]) {
+    const stillUnchanged = await partitionToolCallsForExecution(createReadFilePartitionInput({
+      ...buildInput(originalArgs),
+      executeRecoveryState: {
+        ...executeRecoveryState,
+        decisionCheckpoint: {
+          ...executeRecoveryState.decisionCheckpoint,
+          nextRequiredCapability,
+        },
+      },
+    }));
+    assert.equal(stillUnchanged.writeCalls.length, 0, nextRequiredCapability);
+    assert.equal(
+      stillUnchanged.preExecutionResults[0]?.qualityGateReason,
+      "browser_validation_persisted_failure_reused",
+      `${nextRequiredCapability} alone must not release the unchanged browser invocation`,
+    );
+  }
+
+  for (const correctedArgs of [
+    {
+      ...originalArgs,
+      actions: [{ kind: "click", selector: "#open-document" }],
+    },
+    {
+      ...originalArgs,
+      actions: [{ kind: "fill", selector: "#open", value: "document.md" }],
+    },
+    {
+      ...originalArgs,
+      checks: [{ kind: "text", value: "Document opened" }],
+    },
+  ]) {
+    const corrected = await partitionToolCallsForExecution(buildInput(correctedArgs));
+    assert.equal(corrected.preExecutionResults.length, 0);
+    assert.equal(corrected.writeCalls.length, 1);
+  }
 });
 
 test("a read after a same-batch mutation is deferred instead of executing against old source", async () => {

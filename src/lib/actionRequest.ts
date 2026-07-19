@@ -27,7 +27,7 @@ export interface ToolPermissionActionRequest extends ActionRequestBase {
   taskId: number;
   toolName: string;
   target: string;
-  risk?: "local_file_read" | "browser_control" | "shell" | "write" | "external_write" | "unknown";
+  risk?: "local_file_read" | "browser_control" | "desktop_control" | "shell" | "write" | "external_write" | "unknown";
 }
 
 export interface PlanReviewActionRequest extends ActionRequestBase {

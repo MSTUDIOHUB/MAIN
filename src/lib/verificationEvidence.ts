@@ -7,6 +7,7 @@ import {
 import {
   browserResultLooksSuccessful,
   commandResultLooksSuccessful,
+  resolveStructuredDesktopAutomationOutcome,
 } from "./planEvidence";
 import {
   parseToolFeedbackEnvelope,
@@ -31,6 +32,7 @@ import { isWorkspaceMutationToolName } from "./workspaceMutationTools";
 export const VERIFICATION_TOOL_NAMES = new Set([
   "run_command",
   "browser_evaluate",
+  "computer_use",
   "execute_command",
   "read_pty_buffer",
   "read_pty_tail",
@@ -838,6 +840,11 @@ export function isSuccessfulVerificationToolObservation(
 
   if (observation.name === "browser_evaluate") {
     return browserResultLooksSuccessful(content);
+  }
+  if (observation.name === "computer_use") {
+    return resolveStructuredDesktopAutomationOutcome(content, {
+      requireCausalInteraction: true,
+    }) === "verified";
   }
   if (observation.name === "execute_command") {
     return false;

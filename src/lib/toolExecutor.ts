@@ -23,6 +23,7 @@ import {
   readPtyTail,
   readPtySince,
   browserEvaluate,
+  computerUse,
   codeAstQuery,
   getPtyStatus,
   findSymbolReferences,
@@ -143,6 +144,7 @@ const WORKSPACE_REQUIRED_TOOL_NAMES = new Set([
   "delete_workspace_path",
   "run_command",
   "browser_evaluate",
+  "computer_use",
   "execute_command",
   "send_pty_input",
   "read_pty_buffer",
@@ -757,6 +759,24 @@ export async function executeTool(
           args.failOnConsoleError === false || args.failOnConsoleError === "false"
             ? false
             : undefined,
+        timeoutMs: parseOptionalNumber(args.timeout_ms) ?? parseOptionalNumber(args.timeoutMs),
+      }, workspace);
+    }
+
+    case "computer_use": {
+      const appName = parseOptionalString(args.app_name) ?? parseOptionalString(args.appName) ?? parseOptionalString(args.app);
+      if (!appName) throw new Error("Missing required parameter 'app_name'.");
+      return await computerUse({
+        appName,
+        appPath: parseOptionalString(args.app_path) ?? parseOptionalString(args.appPath),
+        launch: args.launch === true || args.launch === "true" ? true : undefined,
+        activate:
+          args.activate === false || args.activate === "false"
+            ? false
+            : undefined,
+        actions: parseOptionalString(args.actions),
+        checks: parseOptionalString(args.checks),
+        screenshot: args.screenshot === true || args.screenshot === "true" ? true : undefined,
         timeoutMs: parseOptionalNumber(args.timeout_ms) ?? parseOptionalNumber(args.timeoutMs),
       }, workspace);
     }

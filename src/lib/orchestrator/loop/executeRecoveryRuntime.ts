@@ -243,6 +243,12 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
   const objectiveKind = input.previous?.objectiveKind;
   const objectiveExpectedTargets = input.previous?.objectiveExpectedTargets || [];
   const objectiveValidationEvidence = input.previous?.objectiveValidationEvidence || null;
+  const browserFailureFingerprint = input.previous?.browserFailureFingerprint || null;
+  const browserFailureCallSignature = input.previous?.browserFailureCallSignature || null;
+  const browserFailureDetail = input.previous?.browserFailureDetail || null;
+  const browserFailedLocator = input.previous?.browserFailedLocator || null;
+  const browserLocatorCandidates = input.previous?.browserLocatorCandidates || [];
+  const browserRequestedUrl = input.previous?.browserRequestedUrl || null;
   return {
     expectedTarget: input.expectedTarget,
     sourceObservationKey: input.sourceObservationKey,
@@ -270,6 +276,12 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
       ? { objectiveValidationEvidence }
       : {}),
     ...(objectiveClosurePending ? { objectiveClosurePending: true } : {}),
+    ...(browserFailureFingerprint ? { browserFailureFingerprint } : {}),
+    ...(browserFailureCallSignature ? { browserFailureCallSignature } : {}),
+    ...(browserFailureDetail ? { browserFailureDetail } : {}),
+    ...(browserFailedLocator ? { browserFailedLocator } : {}),
+    ...(browserLocatorCandidates.length > 0 ? { browserLocatorCandidates } : {}),
+    ...(browserRequestedUrl ? { browserRequestedUrl } : {}),
   };
 }
 
@@ -310,6 +322,19 @@ function inheritExecuteRecoveryCheckpointIdentity(
     previous?.objectiveExpectedTargets ?? [];
   const objectiveValidationEvidence = checkpoint.objectiveValidationEvidence ??
     previous?.objectiveValidationEvidence ?? null;
+  const browserFailureFingerprint = checkpoint.browserFailureFingerprint ||
+    previous?.browserFailureFingerprint || null;
+  const browserFailureCallSignature = checkpoint.browserFailureCallSignature === undefined
+    ? previous?.browserFailureCallSignature || null
+    : checkpoint.browserFailureCallSignature?.trim() || null;
+  const browserFailureDetail = checkpoint.browserFailureDetail ||
+    previous?.browserFailureDetail || null;
+  const browserFailedLocator = checkpoint.browserFailedLocator ||
+    previous?.browserFailedLocator || null;
+  const browserLocatorCandidates = checkpoint.browserLocatorCandidates ??
+    previous?.browserLocatorCandidates ?? [];
+  const browserRequestedUrl = checkpoint.browserRequestedUrl ||
+    previous?.browserRequestedUrl || null;
   return {
     ...checkpoint,
     ...(planTaskId ? { planTaskId } : {}),
@@ -335,6 +360,15 @@ function inheritExecuteRecoveryCheckpointIdentity(
       ? { objectiveValidationEvidence }
       : {}),
     ...(objectiveClosurePending ? { objectiveClosurePending: true } : {}),
+    ...(browserFailureFingerprint ? { browserFailureFingerprint } : {}),
+    ...(checkpoint.browserFailureCallSignature !== undefined ||
+      previous?.browserFailureCallSignature !== undefined
+      ? { browserFailureCallSignature }
+      : {}),
+    ...(browserFailureDetail ? { browserFailureDetail } : {}),
+    ...(browserFailedLocator ? { browserFailedLocator } : {}),
+    ...(browserLocatorCandidates.length > 0 ? { browserLocatorCandidates } : {}),
+    ...(browserRequestedUrl ? { browserRequestedUrl } : {}),
   };
 }
 
@@ -666,6 +700,20 @@ export function transitionExecuteRecoveryRuntimeState(
     protocolNoProgressCount: state.protocolNoProgressCount,
     protocolNoProgressFingerprint: state.protocolNoProgressFingerprint,
   });
+
+  if (
+    contract.nextRequiredCapability === "browser_diagnostic" &&
+    observation.validationTarget &&
+    observation.validationToolName === "browser_evaluate"
+  ) {
+    // A corrected interaction closes a spec-diagnostic transaction directly.
+    // Diagnostic reads remain non-causal and cannot select a mutation target.
+    return transitionValidatedObjective(
+      transactionState,
+      observation.validationTarget,
+      observation.validationToolName,
+    );
+  }
 
   if (contract.phase === "context" && observation.freshReadTarget) {
     const contextTarget = expectedTarget || observation.freshReadTarget;
@@ -1150,12 +1198,14 @@ export function transitionExecuteRecoveryRuntimeState(
       );
     }
     const browserValidation = validationToolName === "browser_evaluate";
+    const desktopValidation = validationToolName === "computer_use";
     if (
       nextCapability === "launch_long_process" ||
       nextCapability === "recover_process" ||
       nextCapability === "reconcile_server" ||
       nextCapability === "observe_pty" ||
-      (nextCapability === "browser_validation" && !browserValidation)
+      (nextCapability === "browser_validation" && !browserValidation) ||
+      (nextCapability === "desktop_validation" && !desktopValidation)
     ) {
       return {
         state: transactionState,
@@ -1239,6 +1289,44 @@ export function registerExecuteRecoveryProtocolNoProgress(
     protocolNoProgressFingerprint: normalized,
     protocolNoProgressCount: repeated ? state.protocolNoProgressCount + 1 : 1,
   };
+}
+
+export function isExecuteRecoveryPolicyDeferralFingerprint(
+  fingerprint: string | null | undefined,
+): boolean {
+  const normalized = String(fingerprint || "").trim();
+  if (!normalized) return false;
+  if (normalized.includes(":policy:")) return true;
+  try {
+    const parsed = JSON.parse(normalized) as { kind?: unknown };
+    return parsed?.kind === "approved_plan_scope_conflict";
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * A policy-owned deferral may exhaust the semantic protocol counter without
+ * consuming a real diagnostic attempt. Once this turn already has durable
+ * evidence, release the narrow transaction for one normal iteration; approved
+ * Plan scope and ordinary completion guards still constrain every real call.
+ */
+export function shouldReleaseExecuteRecoveryPolicyBoundary(input: {
+  state: ExecuteRecoveryRuntimeState;
+  hasDurableEvidence: boolean;
+  maxIterations?: number;
+}): boolean {
+  const maxIterations = Math.max(
+    1,
+    Math.floor(Number(input.maxIterations) || MAX_EXECUTE_RECOVERY_ITERATIONS),
+  );
+  return input.state.mode !== "normal" &&
+    input.hasDurableEvidence &&
+    input.state.protocolNoProgressCount >= maxIterations &&
+    input.state.phaseNoProgressCount < maxIterations &&
+    isExecuteRecoveryPolicyDeferralFingerprint(
+      input.state.protocolNoProgressFingerprint,
+    );
 }
 
 /**

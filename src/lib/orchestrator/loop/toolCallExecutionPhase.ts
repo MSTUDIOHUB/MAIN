@@ -18,7 +18,7 @@ import {
   logAgentEvent,
 } from "../../orchestrator";
 import {
-  resolveApprovedPlanInitialExecutionRecovery,
+  resolveApprovedPlanRecoveryReconciliation,
   type PlanToolActivitySummary,
 } from "../../planExecutionRecovery";
 import { extractReadFileWindowMetadata } from "../../readFileWindow";
@@ -29,7 +29,6 @@ import type { ToolDefinition } from "../../toolSchemas";
 import type { MainThreadEventInput, ToolFeedbackFormat } from "../../turnEvents";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanRuntimePhase } from "../../workflowModels";
-import { workspacePathsReferToSameFile } from "../../workspacePaths";
 import type {
   AgentMessage,
   OrchestratorCallbacks,
@@ -64,7 +63,10 @@ import type { AgentLoopRecoveryPromptRuntimeState } from "./recoveryPromptRuntim
 import { resetTransientRecoveryPromptRuntimeState } from "./recoveryPromptRuntimeState";
 import type { AgentLoopToolExecutionRuntimeState } from "./toolExecutionRuntimeState";
 import { partitionToolCallsForExecution } from "./toolCallPartitioning";
-import { executeToolExecutionRound } from "./toolExecutionRound";
+import {
+  executeToolExecutionRound,
+  shouldAdvanceWorkspaceObservationEpoch,
+} from "./toolExecutionRound";
 import { isVerificationEvidenceResult } from "./toolActivityTracking";
 import { handleToolResultPostProcessing } from "./toolResultPostProcessing";
 import { appendToolResultsToHistory } from "./toolResultHistory";
@@ -365,22 +367,6 @@ export async function executeToolCallPhase(input: {
   let evidenceRuntimeState = input.evidenceRuntimeState;
   let executeRecoveryState = input.executeRecoveryState;
   let loopGuardRuntimeState = input.loopGuardRuntimeState;
-  const effectiveToolCalls = normalizeLeaseBackedReadToolCalls(
-    input.effectiveToolCalls,
-    executeRecoveryState,
-    input.recoveryActionContract,
-  );
-  if (effectiveToolCalls.some((call, index) =>
-    call.arguments !== input.effectiveToolCalls[index]?.arguments
-  )) {
-    logAgentEvent("execute_recovery_read_args_normalized", {
-      iteration: input.iteration,
-      target: executeRecoveryState.readLease?.target || executeRecoveryState.expectedTarget,
-      purpose: executeRecoveryState.readLease?.purpose || null,
-      requestedRange: executeRecoveryState.readLease?.requestedRange || null,
-      coverageMode: executeRecoveryState.readLease?.coverageMode || "exact",
-    });
-  }
   const markExecuteOperationEvidenceAndSync = () => {
     input.markExecuteOperationEvidence();
     evidenceRuntimeState = markExecuteOperationEvidenceRuntimeState(
@@ -398,6 +384,83 @@ export async function executeToolCallPhase(input: {
     );
     return executeRecoveryState;
   };
+  const rebaseApprovedPlanRecovery = (event: string): boolean => {
+    if (!input.callbacks.getIsPlanApproved()) return false;
+    const reconciliation = resolveApprovedPlanRecoveryReconciliation({
+      tasks: input.callbacks.getPlanTasks(),
+      evidenceLedger: input.callbacks.getPlanExecutionEvidenceLedger(),
+      current: executeRecoveryState,
+      options: {
+        availableToolNames: input.iterationAllTools.map(
+          (tool) => tool.function.name,
+        ),
+      },
+    });
+    if (reconciliation.action === "unchanged") return false;
+    const previousTaskId =
+      executeRecoveryState.decisionCheckpoint?.planTaskId || null;
+    if (reconciliation.action === "complete") {
+      clearExecuteRecoveryAndSync(
+        "approved_plan_automation_obligations_satisfied",
+      );
+      logAgentEvent(event, {
+        iteration: input.iteration,
+        previousTaskId,
+        nextTaskId: null,
+        nextRequiredCapability: null,
+        expectedTarget: null,
+        action: "complete",
+      });
+      return true;
+    }
+    executeRecoveryState = createExecuteRecoveryRuntimeState({
+      workflowMode: input.workflowMode,
+      forcedState: reconciliation.next,
+    });
+    logAgentEvent(event, {
+      iteration: input.iteration,
+      previousTaskId,
+      nextTaskId:
+        reconciliation.next.decisionCheckpoint?.planTaskId || null,
+      nextRequiredCapability:
+        reconciliation.next.decisionCheckpoint?.nextRequiredCapability || null,
+      expectedTarget: reconciliation.next.expectedTarget,
+      action: "advance",
+    });
+    return true;
+  };
+  rebaseApprovedPlanRecovery(
+    "approved_plan_recovery_rebased_before_partition",
+  );
+  let recoveryActionContract = resolveExecuteRecoveryActionContract(
+    executeRecoveryState.mode,
+    {
+      expectedTarget: executeRecoveryState.expectedTarget,
+      readLease: executeRecoveryState.readLease,
+      sourceObservationKey: executeRecoveryState.sourceObservationKey,
+      decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
+      phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+      protocolNoProgressFingerprint:
+        executeRecoveryState.protocolNoProgressFingerprint,
+    },
+  );
+  const effectiveToolCalls = normalizeLeaseBackedReadToolCalls(
+    input.effectiveToolCalls,
+    executeRecoveryState,
+    recoveryActionContract,
+  );
+  if (effectiveToolCalls.some((call, index) =>
+    call.arguments !== input.effectiveToolCalls[index]?.arguments
+  )) {
+    logAgentEvent("execute_recovery_read_args_normalized", {
+      iteration: input.iteration,
+      target: executeRecoveryState.readLease?.target || executeRecoveryState.expectedTarget,
+      purpose: executeRecoveryState.readLease?.purpose || null,
+      requestedRange: executeRecoveryState.readLease?.requestedRange || null,
+      coverageMode: executeRecoveryState.readLease?.coverageMode || "exact",
+    });
+  }
 
   logAgentEvent("tool_calls_detected", {
     iteration: input.iteration,
@@ -444,7 +507,7 @@ export async function executeToolCallPhase(input: {
     failedToolCallCounts: input.failedToolCallCounts,
     buildCurrentTaskTargetingProfile: input.buildCurrentTaskTargetingProfile,
     executeRecoveryState,
-    recoveryActionContract: input.recoveryActionContract,
+    recoveryActionContract,
     ...input.toolExecutionRuntimeState,
     iterationContext: input.iterationContext,
     emitTurnEvent: input.emitTurnEvent,
@@ -483,6 +546,34 @@ export async function executeToolCallPhase(input: {
   });
   allResults.push(...toolExecutionRound.results);
   const wasAborted = toolExecutionRound.status === "aborted";
+
+  const browserFailureStateInvalidator = allResults.find((result) =>
+    result.name !== "browser_evaluate" &&
+    result.internalFeedback !== true &&
+    shouldAdvanceWorkspaceObservationEpoch(
+      result.name,
+      result,
+      toolArgsByCallId.get(result.toolCallId) || {},
+    )
+  );
+  if (
+    browserFailureStateInvalidator &&
+    executeRecoveryState.decisionCheckpoint?.browserFailureCallSignature
+  ) {
+    executeRecoveryState = {
+      ...executeRecoveryState,
+      decisionCheckpoint: {
+        ...executeRecoveryState.decisionCheckpoint,
+        browserFailureCallSignature: null,
+      },
+    };
+    logAgentEvent("browser_validation_persisted_failure_invalidated", {
+      iteration: input.iteration,
+      tool: browserFailureStateInvalidator.name,
+      target: browserFailureStateInvalidator.target,
+      reason: "workspace_or_page_state_change_evidence",
+    });
+  }
 
   const recoveryStateAtBatchStart = executeRecoveryState;
   const activeRecoveryReadLease =
@@ -639,39 +730,6 @@ export async function executeToolCallPhase(input: {
     executeRecoveryState = recoveryTransition.state;
   }
 
-  if (input.callbacks.getIsPlanApproved()) {
-    const nextPlanObligation = resolveApprovedPlanInitialExecutionRecovery(
-      input.callbacks.getPlanTasks(),
-      input.callbacks.getPlanExecutionEvidenceLedger(),
-    );
-    const currentTaskId = executeRecoveryState.decisionCheckpoint?.planTaskId?.trim() || "";
-    const nextTaskId = nextPlanObligation?.decisionCheckpoint?.planTaskId?.trim() || "";
-    const nextTarget = nextPlanObligation?.expectedTarget?.trim() || "";
-    const targetAdvanced = Boolean(
-      nextTarget &&
-      (!executeRecoveryState.expectedTarget ||
-        !workspacePathsReferToSameFile(nextTarget, executeRecoveryState.expectedTarget))
-    );
-    if (
-      nextPlanObligation &&
-      (!currentTaskId || currentTaskId !== nextTaskId || targetAdvanced)
-    ) {
-      const previousTaskId = currentTaskId || null;
-      executeRecoveryState = createExecuteRecoveryRuntimeState({
-        workflowMode: input.workflowMode,
-        forcedState: nextPlanObligation,
-      });
-      logAgentEvent("approved_plan_recovery_obligation_advanced", {
-        iteration: input.iteration,
-        previousTaskId,
-        nextTaskId: nextTaskId || null,
-        nextRequiredCapability:
-          nextPlanObligation.decisionCheckpoint?.nextRequiredCapability || null,
-        expectedTarget: nextPlanObligation.expectedTarget,
-      });
-    }
-  }
-
   const hasPlanDecisionOutput =
     input.hasStructuredProposal ||
     input.finalReplyOptionCount > 0 ||
@@ -725,6 +783,23 @@ export async function executeToolCallPhase(input: {
     planRuntimeState,
     toolResultPostProcessing,
   );
+  if (rebaseApprovedPlanRecovery(
+    "approved_plan_recovery_obligation_advanced",
+  )) {
+    recoveryActionContract = resolveExecuteRecoveryActionContract(
+      executeRecoveryState.mode,
+      {
+        expectedTarget: executeRecoveryState.expectedTarget,
+        readLease: executeRecoveryState.readLease,
+        sourceObservationKey: executeRecoveryState.sourceObservationKey,
+        decisionCheckpoint: executeRecoveryState.decisionCheckpoint,
+        phaseNoProgressCount: executeRecoveryState.phaseNoProgressCount,
+        protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
+        protocolNoProgressFingerprint:
+          executeRecoveryState.protocolNoProgressFingerprint,
+      },
+    );
+  }
 
   if (wasAborted) {
     // The assistant tool_calls message is already in history. Close every call

@@ -76,25 +76,38 @@ export function resolveRecoveryToolChoice(input: {
     resolveExecuteRecoveryActionContract(input.executeRecoveryMode);
   const executeRecoveryRequiresAction =
     input.isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
-  const requiresTool = executeRecoveryRequiresAction ||
+  const preapprovalRequiresTool =
     input.preapprovalPlanQualityRecoveryToolChoice === "required";
-  if (!requiresTool) return undefined;
-
-  if (input.preferExplicitFunction) {
-    // Joining a running child releases a scope lease and must remain eligible
-    // ahead of any new parent action. A named function choice would wrongly
-    // quarantine this contract-owned coordination call.
-    if (availableToolNames.has("wait_subagents")) return "required";
-    const requirement = recoveryActionContract.toolCallRequirement;
-    if (
-      input.isExecuteRecoveryEligible &&
-      requirement.kind === "required_named" &&
-      availableToolNames.has(requirement.toolName)
-    ) {
-      return { type: "function", function: { name: requirement.toolName } };
-    }
+  if (!executeRecoveryRequiresAction) {
+    return preapprovalRequiresTool ? "required" : undefined;
   }
 
+  const requirement = recoveryActionContract.toolCallRequirement;
+  if (requirement.kind === "optional") {
+    return preapprovalRequiresTool ? "required" : undefined;
+  }
+  if (requirement.kind === "required_named") {
+    // Never translate a missing exact capability into required-any. That would
+    // force the model to call an unrelated visible tool and manufacture a
+    // protocol loop. XML remains prompt-driven and returned above.
+    if (!availableToolNames.has(requirement.toolName)) return undefined;
+    // Joining a running child releases a scope lease and must remain eligible
+    // ahead of any new parent action. Once the exact phase capability is also
+    // executable, required-any keeps this coordination call available without
+    // turning a missing capability into a forced unrelated call.
+    if (availableToolNames.has("wait_subagents")) return "required";
+    if (input.preferExplicitFunction) {
+      return { type: "function", function: { name: requirement.toolName } };
+    }
+    return "required";
+  }
+
+  const hasExecutableRecoveryTool = recoveryActionContract.allowsAllTools
+    ? availableToolNames.size > 0
+    : [...availableToolNames].some((name) =>
+        recoveryActionContract.allowedToolNames.has(name)
+      );
+  if (!hasExecutableRecoveryTool) return undefined;
   return "required";
 }
 

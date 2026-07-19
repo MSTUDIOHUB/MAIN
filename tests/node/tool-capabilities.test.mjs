@@ -99,10 +99,15 @@ test("built-in tool risks separate read, write, shell, and destructive operation
   assert.equal(classifyBuiltInTool("web_fetch"), "external_read");
   assert.equal(classifyBuiltInTool("run_command"), "shell");
   assert.equal(classifyBuiltInTool("browser_evaluate"), "browser_control");
+  assert.equal(classifyBuiltInTool("computer_use"), "desktop_control");
   assert.equal(classifyBuiltInTool("delete_workspace_path"), "destructive");
 });
 
 test("MCP classification recognizes browser, search, GitHub write, and database tools", () => {
+  assert.equal(
+    classifyMcpTool({ name: "computer_use", description: "Desktop automation through an accessibility API", inputSchema: {} }),
+    "desktop_control",
+  );
   assert.equal(
     classifyMcpTool({ name: "browser_screenshot", description: "Take a page screenshot", inputSchema: {} }),
     "browser_control",
@@ -132,6 +137,30 @@ test("MCP classification recognizes browser, search, GitHub write, and database 
       { name: "Unity", type: "http", url: "http://127.0.0.1:8080/mcp" },
     ),
     "external_read",
+  );
+});
+
+test("desktop control is exposed for execution but remains separately approval gated", () => {
+  const tools = [
+    tool("read_file", "Read a file"),
+    tool("computer_use", "Desktop automation through an Accessibility API"),
+  ];
+  const registry = buildToolCapabilityRegistry({
+    toolDefinitions: tools,
+    policy: createDefaultToolPermissionPolicy(),
+  });
+
+  assert.equal(registry.tools.computer_use.risk, "desktop_control");
+  assert.equal(registry.tools.computer_use.category, "desktop");
+  assert.equal(isToolAutoExecutableForCall("computer_use", { app_name: "MAIN" }, registry), false);
+  assert.ok(createDefaultToolPermissionPolicy().approvalRequiredRiskLevels.includes("desktop_control"));
+  assert.deepEqual(
+    filterToolDefinitionsForIntent(tools, "plan", registry).map((item) => item.function.name),
+    ["read_file"],
+  );
+  assert.deepEqual(
+    filterToolDefinitionsForIntent(tools, "execute", registry).map((item) => item.function.name),
+    ["read_file", "computer_use"],
   );
 });
 

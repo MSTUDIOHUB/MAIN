@@ -1017,7 +1017,10 @@ export function parseBrowserInteractionEvidence(result: string): BrowserInteract
 
 type StructuredAutomationOutcome = "verified" | "failed" | "unverified";
 
-function resolveStructuredDesktopAutomationOutcome(result: string): StructuredAutomationOutcome {
+export function resolveStructuredDesktopAutomationOutcome(
+  result: string,
+  options: { requireCausalInteraction?: boolean } = {},
+): StructuredAutomationOutcome {
   try {
     const parsed = JSON.parse(result);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return "unverified";
@@ -1041,8 +1044,15 @@ function resolveStructuredDesktopAutomationOutcome(result: string): StructuredAu
       structuredStringList(record.pageErrors).length > 0 ||
       structuredStringList(record.consoleErrors).length > 0;
     if (hasExplicitFailure) return "failed";
+    const hasRealInteraction = actions.some((action) => action.interaction === true);
+    const hasCausalAssertion = assertions.some((assertion) =>
+      assertion.passed === true && assertion.causallyLinked === true
+    );
+    const causalContractSatisfied = options.requireCausalInteraction !== true ||
+      (hasRealInteraction && hasCausalAssertion);
     const hasVerifiedEnvelope =
       (record.ok === true || record.success === true) &&
+      causalContractSatisfied &&
       actions.length > 0 &&
       actions.every((action) => action.ok === true || action.success === true) &&
       assertions.length > 0 &&
@@ -1444,7 +1454,9 @@ export function createPlanExecutionEvidenceEntry(input: {
     };
   }
   if (sourceToolLooksLikeTauriAutomation(input.toolName)) {
-    const outcome = resolveStructuredDesktopAutomationOutcome(input.result);
+    const outcome = resolveStructuredDesktopAutomationOutcome(input.result, {
+      requireCausalInteraction: input.toolName === "computer_use",
+    });
     return {
       ...base,
       kind: "tool",

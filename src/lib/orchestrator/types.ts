@@ -337,7 +337,7 @@ export interface OrchestratorCallbacks {
     toolCallId?: string;
     name: string;
     arguments: Record<string, unknown>;
-    risk?: "local_file_read" | "browser_control";
+    risk?: "local_file_read" | "browser_control" | "desktop_control";
     localFileReadPath?: string;
     shellPermissionDecision?: ShellPermissionDecision;
   }) => Promise<ReviewDecision>;

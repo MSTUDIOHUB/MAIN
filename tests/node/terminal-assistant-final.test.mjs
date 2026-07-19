@@ -38,8 +38,10 @@ const {
   collectBlockingPlanTaskTextsForTerminalSummary,
   collectPlanTaskTerminalProjection,
   resolveCompletedTurnFinalPresentation,
+  resolvePausedTurnFinalPresentation,
   resolveTerminalTurnOwnership,
   shouldCommitCompletedTurnFinalPresentation,
+  shouldCommitPausedTurnFinalPresentation,
 } = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/terminalAssistantFinal.ts"),
 );
@@ -175,6 +177,32 @@ test("held draft cannot masquerade as final when completion falls back to durabl
   assert.doesNotMatch(result.text, /继续修改另一个文件/);
   assert.match(result.text, /`src\/main\.ts`/);
   assert.match(result.text, /未记录独立的自动验证结果/);
+});
+
+test("durable recovery pause gets a self-contained non-success assistant conclusion", () => {
+  const heldDraft = {
+    id: 11,
+    turnId: "turn-1",
+    type: "agent",
+    content: "我已经全部完成，现在准备收尾。",
+    visibility: "assistant_update",
+  };
+  const result = resolvePausedTurnFinalPresentation({
+    turnBlocks: [userBlock, heldDraft, writeBlock],
+    durableMutationPaths: ["src/main.ts"],
+    unfinished: ["修复文件打开后的预览同步", "运行浏览器交互验收"],
+    nextStep: "从保留的文件版本继续精确修改并重新验证。",
+    language: "zh",
+  });
+
+  assert.equal(result.source, "durable_progress_checkpoint");
+  assert.equal(result.hasChanges, true);
+  assert.match(result.text, /^本轮执行已暂停，已完成的修改与持久证据均已保留。/);
+  assert.match(result.text, /已做\n- 已修改 `src\/main\.ts`/);
+  assert.match(result.text, /未做\n- 修复文件打开后的预览同步\n- 运行浏览器交互验收/);
+  assert.match(result.text, /验证\n- 未记录独立的自动验证结果。/);
+  assert.match(result.text, /下一步\n- 从保留的文件版本继续精确修改并重新验证。/);
+  assert.doesNotMatch(result.text, /我已经全部完成|已完成本轮工作/);
 });
 
 test("unfinished evidence produces a non-success terminal report", () => {
@@ -403,6 +431,22 @@ test("paused, error, stopped, and pending continuation outcomes never synthesize
   assert.equal(shouldCommitCompletedTurnFinalPresentation({ outcomeStatus: "completed" }), true);
 });
 
+test("only a durable no-progress recovery pause commits the partial assistant final", () => {
+  assert.equal(shouldCommitPausedTurnFinalPresentation({
+    outcomeStatus: "paused",
+    recoveryReason: "execute_recovery_no_progress_limit",
+    hasDurableMutationEvidence: true,
+  }), true);
+  for (const input of [
+    { outcomeStatus: "stopped_no_action", recoveryReason: "execute_recovery_no_progress_limit", hasDurableMutationEvidence: true },
+    { outcomeStatus: "paused", recoveryReason: "awaiting_user_choice", hasDurableMutationEvidence: true },
+    { outcomeStatus: "paused", recoveryReason: "execute_recovery_no_progress_limit", hasDurableMutationEvidence: false },
+    { outcomeStatus: "paused", recoveryReason: "execute_recovery_no_progress_limit", hasDurableMutationEvidence: true, hasPendingSameTurnExecution: true },
+  ]) {
+    assert.equal(shouldCommitPausedTurnFinalPresentation(input), false, JSON.stringify(input));
+  }
+});
+
 test("workflow terminal contract persists only completed finals and uses supported ChatArea statuses", () => {
   const workflowSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
@@ -413,6 +457,9 @@ test("workflow terminal contract persists only completed finals and uses support
 
   assert.match(workflowSource, /if \(outcome\.status !== "completed"\) return null;/);
   assert.match(workflowSource, /shouldCommitCompletedTurnFinalPresentation\(\{/);
+  assert.match(workflowSource, /shouldCommitPausedTurnFinalPresentation\(\{/);
+  assert.match(workflowSource, /ensurePausedTurnFinalPresentation\(loopOutcome\)/);
+  assert.match(workflowSource, /paused_turn_final_presentation_committed/);
   assert.match(workflowSource, /!context\.executionEvidenceDraftHeld/);
   assert.match(workflowSource, /visibility: "assistant_final" as const/);
   assert.match(workflowSource, /completedTurnHasChanges \? "completed_with_changes" : "done"/);
@@ -426,6 +473,7 @@ test("workflow terminal contract persists only completed finals and uses support
   assert.match(storeSource, /\.\.\.\(b\.visibility \? \{ visibility: b\.visibility \} : \{\}\)/);
   assert.match(storeSource, /block\.visibility !== "assistant_final"/);
   assert.match(chatSource, /block\.visibility === "assistant_final"/);
+  assert.match(chatSource, /isPausedWithFinalConclusion/);
   assert.match(chatSource, /data-testid=\{block\.visibility === "assistant_final" \? "assistant-final" : undefined\}/);
 });
 

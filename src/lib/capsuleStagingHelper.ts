@@ -112,7 +112,7 @@ export function deriveDynamicFirstPersonText(
     const toolName = String(runningTool.toolName || "");
     const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "get_project_skeleton"]);
     const modifyTools = new Set(["write_file", "replace_in_file", "apply_text_edits", "delete_file"]);
-    const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "send_pty_input"]);
+  const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "computer_use", "send_pty_input"]);
 
     if (isZh) {
       if (readTools.has(toolName)) {

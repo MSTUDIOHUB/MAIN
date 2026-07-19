@@ -3607,7 +3607,7 @@ export function materializePlanArtifactFromVisibleText(input: {
   // Final validation: if still not ok and canonicalization can help, try it
   if (
     !validation.ok &&
-    !/insufficient_grounded_evidence|generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|placeholder_validation_plan|non_executable_test_plan|excessive_plan_code_dump/i.test(validation.reason || "")
+    !/insufficient_grounded_evidence|generic_fallback_plan|unsupported_debug_log_advice|weak_path_echo_evidence|import_only_evidence|placeholder_validation_plan|non_executable_test_plan|excessive_plan_code_dump|empty_plan_implementation_detail|conflicting_plan_acceptance_assertions/i.test(validation.reason || "")
   ) {
     const canonical = canonicalizePlanArtifactContent({
       content,

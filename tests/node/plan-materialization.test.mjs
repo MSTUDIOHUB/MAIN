@@ -2018,6 +2018,49 @@ test("rejects low quality visible text instead of materializing a plan", () => {
   assert.match(result.reason || "", /too_short|not_structured|quality_gate/);
 });
 
+test("materialization preserves the quality rejection for an empty change body", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# Repair startup state",
+      "",
+      "## Summary",
+      "- Repair the incorrect startup title in `src/main.ts`.",
+      "",
+      "## Confirmed Evidence",
+      "- `src/main.ts` currently initializes the wrong title.",
+      "",
+      "## Key Changes",
+      "### Change 1: repair startup state — `src/main.ts`",
+      "**Root cause**: the initialization branch uses the wrong default.",
+      "**Change to**:",
+      "",
+      "## Public APIs / Interfaces / Types",
+      "- No public API, interface, or type changes.",
+      "",
+      "## Test Plan",
+      "- Run `npm test` and check the exit status.",
+      "",
+      "## Acceptance Criteria",
+      "- On startup, the tab title is \"Welcome\".",
+      "",
+      "## Assumptions",
+      "- Preserve all unrelated startup behavior.",
+    ].join("\n"),
+    userGoal: "Repair the incorrect startup title in src/main.ts.",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.ts",
+      status: "succeeded",
+      summary: "the initialization branch uses the wrong default title",
+    }],
+    language: "en",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "empty_plan_implementation_detail");
+  assert.equal(result.quality?.canAutoRepair, false);
+});
+
 test("materializes MVP defaults without requiring open questions", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [

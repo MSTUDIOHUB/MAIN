@@ -102,16 +102,15 @@ export function createAgentLoopRuntimeActions(input: {
     reason,
     context = {},
   ) => {
-    const repeatedTargets = Array.isArray(context.repeatedTargets)
-      ? context.repeatedTargets.filter((target): target is string => typeof target === "string" && !!target.trim())
-      : [];
     const expectedTarget = typeof context.expectedTarget === "string"
       ? context.expectedTarget
       : typeof context.target === "string"
         ? context.target
-        : repeatedTargets.length === 1
-          ? repeatedTargets[0]
-          : null;
+        : null;
+    // Repetition is a loop symptom, not causal source attribution. Promoting a
+    // lone recently-read path here made unrelated files become mutation
+    // targets after browser/spec failures. Callers that have real stack,
+    // plan-task, grep-hit, or mutation evidence must pass target explicitly.
     const currentRecoveryState = getExecuteRecoveryState();
     const explicitObservation = context.readFileObservation && typeof context.readFileObservation === "object"
       ? context.readFileObservation as PlanToolActivitySummary["readFileObservation"]

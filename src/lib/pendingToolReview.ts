@@ -9,7 +9,7 @@ type PendingToolCallLike = {
   toolCallId?: string;
   name?: string;
   arguments?: unknown;
-  risk?: "local_file_read" | "browser_control";
+  risk?: "local_file_read" | "browser_control" | "desktop_control";
   localFileReadPath?: string;
   shellPermissionDecision?: unknown;
 } | null | undefined;
@@ -55,12 +55,33 @@ export function summarizePendingPatchTarget(patch: string): string {
   return `${targets[0]}${targets.length > 1 ? ` +${targets.length - 1}` : ""}`;
 }
 
+export function summarizeDesktopControlTarget(args: Record<string, unknown>): string {
+  const appName = String(args.app_name || args.appName || args.app || "desktop app").trim() || "desktop app";
+  const actionLines = String(args.actions || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith("#"))
+    .slice(0, 3)
+    .map((line) => line.replace(/^(fill\s*:[^=]{0,240})=>[\s\S]*$/i, "$1=> [text]"));
+  const launchOnly = args.launch === true || args.launch === "true";
+  const actionSummary = actionLines.length > 0
+    ? actionLines.join("; ")
+    : launchOnly
+      ? "launch"
+      : "inspect";
+  const screenshot = args.screenshot === true || args.screenshot === "true"
+    ? " · screenshot"
+    : "";
+  return `${appName} · ${actionSummary}${screenshot}`;
+}
+
 export function derivePendingReviewTarget(toolName: string, args: Record<string, unknown>, localFileReadPath?: string): string {
   if (localFileReadPath && localFileReadPath.trim()) return localFileReadPath.trim();
   if (toolName === "apply_patch") {
     return summarizePendingPatchTarget(String(args.patch || "")) || "workspace patch";
   }
-  for (const key of ["path", "command", "url", "query", "pattern", "target", "file", "cwd", "input"]) {
+  if (toolName === "computer_use") return summarizeDesktopControlTarget(args);
+  for (const key of ["path", "command", "url", "app_name", "appName", "query", "pattern", "target", "file", "cwd", "input"]) {
     const value = args[key];
     if (typeof value === "string" && value.trim()) return value.trim();
   }

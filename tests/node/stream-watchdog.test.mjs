@@ -396,7 +396,15 @@ test("local recovery binds only genuinely single-capability phases", () => {
     forceXmlTools: false,
     preferExplicitFunction: true,
     recoveryActionContract: targetedReadContract,
-  }), "required", "a named requirement falls back to required-any when the tool is unavailable");
+  }), undefined, "a missing named capability must not force an unrelated tool call");
+  assert.equal(resolveRecoveryToolChoice({
+    isExecuteRecoveryEligible: true,
+    executeRecoveryMode: "patch_recovery_read",
+    llmToolNames: ["run_command", "wait_subagents"],
+    forceXmlTools: false,
+    preferExplicitFunction: true,
+    recoveryActionContract: targetedReadContract,
+  }), undefined, "a child join does not turn a missing exact capability into required-any");
 
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
@@ -450,6 +458,11 @@ test("local recovery tool choice follows the contract next capability, not the l
     recoveryActionContract: targeting,
     llmToolNames: ["code_ast_query", "find_symbol_references", "get_file_outline"],
   }), "required", "structural targeting is a capability surface, not one hard-coded parser call");
+  assert.equal(resolveRecoveryToolChoice({
+    ...common,
+    recoveryActionContract: targeting,
+    llmToolNames: ["run_command"],
+  }), undefined, "required-any applies only when an allowed capability tool is truly present");
 
   const observePty = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     devServerStatus: "running",
@@ -501,7 +514,7 @@ test("local recovery tool choice follows the contract next capability, not the l
     executeRecoveryMode: "validation_only",
     recoveryActionContract: migratedPostMutation,
     llmToolNames: ["read_file"],
-  }), "required", "legacy state must not force a redundant post-mutation reread");
+  }), undefined, "validation recovery stays optional when run_command is absent");
 });
 
 test("validation recovery binds the command capability selected by the action contract", () => {

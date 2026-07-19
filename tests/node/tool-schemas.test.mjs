@@ -104,6 +104,24 @@ test("browser validation schema exposes local Playwright checks", () => {
   assert.match(browserEvaluate.function.parameters.properties.timeout_ms.description, /默认 15000/);
 });
 
+test("desktop control schema exposes only constrained accessibility actions", () => {
+  const tools = buildToolDefinitions([]);
+  const computerUse = tools.find((tool) => tool.function.name === "computer_use");
+
+  assert.ok(computerUse);
+  assert.match(computerUse.function.description, /Accessibility API/);
+  assert.match(computerUse.function.description, /每次需要桌面控制审批/);
+  assert.deepEqual(computerUse.function.parameters.required, ["app_name"]);
+  assert.ok(computerUse.function.parameters.properties.actions);
+  assert.ok(computerUse.function.parameters.properties.checks);
+  assert.ok(computerUse.function.parameters.properties.app_path);
+  assert.match(computerUse.function.parameters.properties.actions.description, /Accessibility 标签而非坐标/);
+  assert.match(computerUse.function.parameters.properties.checks.description, /动作前为假、动作后为真/);
+  assert.match(computerUse.function.parameters.properties.screenshot.description, /默认 false/);
+  assert.equal(computerUse.function.parameters.properties.script, undefined);
+  assert.equal(computerUse.function.parameters.properties.command, undefined);
+});
+
 test("repo_map and apply_patch schemas are exposed for built-in code intelligence and edits", () => {
   const tools = buildToolDefinitions([]);
   const names = new Set(tools.map((tool) => tool.function.name));

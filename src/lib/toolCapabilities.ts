@@ -13,6 +13,7 @@ export type ToolRiskLevel =
   | "external_read"
   | "external_write"
   | "browser_control"
+  | "desktop_control"
   | "destructive";
 
 export interface ToolPermissionPolicy {
@@ -157,6 +158,7 @@ const READ_ONLY_BUILT_INS = new Set([
 const WORKSPACE_WRITE_BUILT_INS = new Set(["replace_in_file", "write_file", "apply_patch"]);
 const SHELL_BUILT_INS = new Set(["run_command", "execute_command", "send_pty_input"]);
 const BROWSER_CONTROL_BUILT_INS = new Set(["browser_evaluate"]);
+const DESKTOP_CONTROL_BUILT_INS = new Set(["computer_use"]);
 const DESTRUCTIVE_BUILT_INS = new Set(["delete_workspace_path"]);
 const EXTERNAL_READ_BUILT_INS = new Set(["web_search", "web_fetch"]);
 
@@ -251,6 +253,22 @@ const BROWSER_TERMS = [
   "hover",
   "viewport",
   "localhost",
+];
+
+const DESKTOP_CONTROL_TERMS = [
+  "computer use",
+  "computer_use",
+  "desktop control",
+  "desktop automation",
+  "accessibility api",
+  "applescript",
+  "osascript",
+  "system events",
+  "tauri driver",
+  "webdriver",
+  "桌面控制",
+  "桌面自动化",
+  "无障碍 api",
 ];
 
 const WEB_RESEARCH_TERMS = [
@@ -352,6 +370,7 @@ export function createDefaultToolPermissionPolicy(): ToolPermissionPolicy {
       "shell",
       "external_write",
       "browser_control",
+      "desktop_control",
       "destructive",
     ],
     disabledRiskLevels: [],
@@ -368,6 +387,7 @@ export function normalizeToolPermissionPolicy(policy?: Partial<ToolPermissionPol
     "external_read",
     "external_write",
     "browser_control",
+    "desktop_control",
     "destructive",
   ]);
   const normalizeRiskList = (value: unknown, fallback: ToolRiskLevel[]) =>
@@ -511,6 +531,7 @@ export function classifyBuiltInTool(name: string): ToolRiskLevel {
   if (WORKSPACE_WRITE_BUILT_INS.has(name)) return "workspace_write";
   if (SHELL_BUILT_INS.has(name)) return "shell";
   if (BROWSER_CONTROL_BUILT_INS.has(name)) return "browser_control";
+  if (DESKTOP_CONTROL_BUILT_INS.has(name)) return "desktop_control";
   if (DESTRUCTIVE_BUILT_INS.has(name)) return "destructive";
   return "external_write";
 }
@@ -526,6 +547,7 @@ export function classifyKnownBuiltInTool(name: string): ToolRiskLevel | null {
   if (WORKSPACE_WRITE_BUILT_INS.has(name)) return "workspace_write";
   if (SHELL_BUILT_INS.has(name)) return "shell";
   if (BROWSER_CONTROL_BUILT_INS.has(name)) return "browser_control";
+  if (DESKTOP_CONTROL_BUILT_INS.has(name)) return "desktop_control";
   if (DESTRUCTIVE_BUILT_INS.has(name)) return "destructive";
   return null;
 }
@@ -536,6 +558,7 @@ export function classifySkillTool(skillOrTool: SkillLike | ToolDefinition): Tool
   const text = normalizeText(`${name} ${description || ""}`);
 
   if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
+  if (containsAny(text, DESKTOP_CONTROL_TERMS)) return "desktop_control";
   if (containsAny(text, BROWSER_TERMS)) return "browser_control";
   if (containsWriteIntent(text)) return "external_write";
   if (containsReadIntent(text)) return "external_read";
@@ -547,6 +570,7 @@ export function classifyMcpTool(tool: MCPTool, server?: MCPServer): ToolRiskLeve
   if (EXTERNAL_READ_MCP_TOOL_NAMES.has(tool.name)) return "external_read";
 
   if (containsAny(text, DESTRUCTIVE_TERMS)) return "destructive";
+  if (containsAny(text, DESKTOP_CONTROL_TERMS)) return "desktop_control";
 
   if (containsAny(text, DATABASE_TERMS)) {
     if (containsAny(text, ["drop", "truncate", "delete", "alter"])) return "destructive";
@@ -655,6 +679,7 @@ function deriveToolCategory(
   source: ToolSourceKind,
 ): string {
   const text = normalizeText(`${name} ${description || ""}`);
+  if (risk === "desktop_control" || DESKTOP_CONTROL_BUILT_INS.has(name)) return "desktop";
   if (source === "built_in" && containsAny(text, BROWSER_TERMS)) return "browser";
   if (source === "built_in" && EXTERNAL_READ_BUILT_INS.has(name)) return "research";
   if (source === "mcp" && containsAny(text, BROWSER_TERMS)) return "browser";

@@ -515,6 +515,7 @@ export async function partitionToolCallsForExecution(input: {
   const readFileWindowNarrowedNotes = new Map<string, string>();
   const queuedReadOnlySignatures = new Set<string>();
   const queuedFileReadSignatures = new Set<string>();
+  const queuedBrowserValidationSignatures = new Set<string>();
   const toolFailureSignatures = new Map<string, string>();
   const preExecutionResults: ToolExecutionResult[] = [];
   let sawOrderSensitiveWorkspaceAction = false;
@@ -618,6 +619,67 @@ export async function partitionToolCallsForExecution(input: {
       ? `${baseFailureSignature}::recovery=${recoveryFailureScope}`
       : baseFailureSignature;
     toolFailureSignatures.set(tc.id, failureSignature);
+
+    const browserCallSignature = tc.name === "browser_evaluate"
+      ? buildBrowserValidationCacheSignature(toolArgs)
+      : null;
+    const persistedBrowserFailureSignature =
+      executeRecoveryState.decisionCheckpoint?.browserFailureCallSignature?.trim() || null;
+    if (
+      browserCallSignature &&
+      persistedBrowserFailureSignature === browserCallSignature &&
+      !browserValidationCache.has(browserCallSignature)
+    ) {
+      const previousDetail = String(
+        executeRecoveryState.decisionCheckpoint?.browserFailureDetail ||
+        "the same deterministic browser validation already failed",
+      ).replace(/\s+/g, " ").trim().slice(0, 600);
+      const locatorCandidates = (
+        executeRecoveryState.decisionCheckpoint?.browserLocatorCandidates || []
+      ).slice(0, 8);
+      const message = callbacks.getPreferredLanguage() === "zh"
+        ? [
+            "BROWSER_VALIDATION_PERSISTED_FAILURE_REUSED: 完全相同的 browser_evaluate 已稳定失败，且此后没有页面或参数状态变化证据，本次未重新启动浏览器。",
+            `既有失败：${previousDetail}`,
+            locatorCandidates.length > 0
+              ? `可用候选：${locatorCandidates.join(", ")}`
+              : "请先修改 selector、actions、checks，或修复页面源码后再重新验证。",
+          ].join("\n")
+        : [
+            "BROWSER_VALIDATION_PERSISTED_FAILURE_REUSED: this exact browser_evaluate already failed deterministically and no page or argument state change has been observed since, so the browser was not relaunched.",
+            `Previous failure: ${previousDetail}`,
+            locatorCandidates.length > 0
+              ? `Available candidates: ${locatorCandidates.join(", ")}`
+              : "Change the selector, actions, or checks, or repair the page source before validating again.",
+          ].join("\n");
+      callbacks.onToolDone(tc.name, target, message, {
+        toolCallId: tc.id,
+        internalFeedback: true,
+        qualityGateReason: "browser_validation_persisted_failure_reused",
+      });
+      toolFailureSignatures.delete(tc.id);
+      logAgentEvent("browser_validation_persisted_failure_reused", {
+        iteration,
+        target,
+        signature: truncateForLog(browserCallSignature, 180),
+        recoveryPhase: executeRecoveryContract.phase,
+        nextRequiredCapability: executeRecoveryContract.nextRequiredCapability,
+        browserFailureFingerprint:
+          executeRecoveryState.decisionCheckpoint?.browserFailureFingerprint || null,
+      });
+      preExecutionResults.push({
+        toolCallId: tc.id,
+        name: tc.name,
+        target,
+        content: message,
+        displayContent: `BROWSER_VALIDATION_PERSISTED_FAILURE_REUSED: ${target || "browser_evaluate"}`,
+        isError: false,
+        lifecycleState: "completed",
+        internalFeedback: true,
+        qualityGateReason: "browser_validation_persisted_failure_reused",
+      });
+      continue;
+    }
 
     const finiteCommandRequestedThroughPty =
       tc.name === "execute_command" &&
@@ -2164,6 +2226,37 @@ export async function partitionToolCallsForExecution(input: {
       const reviewSignature = tc.name === "browser_evaluate"
         ? buildBrowserValidationCacheSignature(toolArgs)
         : buildRepeatLoopSignature(tc.name, buildRepeatLoopArgsKey(toolArgs));
+      if (
+        tc.name === "browser_evaluate" &&
+        queuedBrowserValidationSignatures.has(reviewSignature)
+      ) {
+        const message = callbacks.getPreferredLanguage() === "zh"
+          ? "BROWSER_VALIDATION_BATCH_DUPLICATE_DEFERRED: 同一批次已经安排了参数完全相同的 browser_evaluate。本次重复调用未执行；请先使用首次调用返回的 DOM、locator、断言与错误证据。"
+          : "BROWSER_VALIDATION_BATCH_DUPLICATE_DEFERRED: an identical browser_evaluate is already scheduled in this batch. This duplicate did not run; consume the first call's DOM, locator, assertion, and error evidence.";
+        callbacks.onToolDone(tc.name, target, message, {
+          toolCallId: tc.id,
+          internalFeedback: true,
+          qualityGateReason: "browser_validation_batch_duplicate",
+        });
+        toolFailureSignatures.delete(tc.id);
+        logAgentEvent("browser_validation_batch_duplicate_deferred", {
+          iteration,
+          target,
+          signature: truncateForLog(reviewSignature, 180),
+        });
+        preExecutionResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: message,
+          displayContent: "",
+          isError: false,
+          lifecycleState: "completed",
+          internalFeedback: true,
+          qualityGateReason: "browser_validation_batch_duplicate",
+        });
+        continue;
+      }
       const cachedBrowserValidation = tc.name === "browser_evaluate"
         ? browserValidationCache.get(reviewSignature)
         : undefined;
@@ -2193,6 +2286,9 @@ export async function partitionToolCallsForExecution(input: {
           lifecycleState: cachedBrowserFailed ? "failed" : "completed",
         });
         continue;
+      }
+      if (tc.name === "browser_evaluate") {
+        queuedBrowserValidationSignatures.add(reviewSignature);
       }
       writeCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments });
       if (isOrderSensitiveWorkspaceAction) sawOrderSensitiveWorkspaceAction = true;

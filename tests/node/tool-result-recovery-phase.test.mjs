@@ -40,6 +40,16 @@ test("tool result recovery phase owns post-tool recovery ordering", () => {
   assert.match(phaseSource, /handleExecuteConvergencePrompt\(\{[\s\S]*?logAgentEvent\("post_tool_result_continuation"/);
 });
 
+test("desktop environment failures pause once instead of entering a retry loop", () => {
+  assert.match(phaseSource, /desktop_control_environment_blocked/);
+  assert.match(
+    phaseSource,
+    /\["permission_required", "unsupported_platform", "automation_unavailable"\]\.includes\(failureType\)/,
+  );
+  assert.match(phaseSource, /recoveryReason = `desktop_control_\$\{failureType\}`/);
+  assert.match(phaseSource, /return finish\("stopped"\)/);
+});
+
 test("parent overlap with an active child joins before generic no-progress accounting", () => {
   const deferralIndex = phaseSource.indexOf(
     "shouldJoinPendingSubagentsAfterScopeDeferral(input.results)",
@@ -296,6 +306,16 @@ test("browser runtime failures atomically leave browser-only validation for sour
   assert.match(branch, /buildFailedValidationRepairReadLease/);
   assert.match(branch, /"browser_validation_requires_source_repair"/);
   assert.match(branch, /nextRequiredCapability: "targeted_read"/);
+  assert.match(branch, /"browser_validation_requires_diagnostic"/);
+  assert.match(branch, /nextRequiredCapability: "browser_diagnostic"/);
+  assert.match(branch, /resolvePersistentBrowserFailureCallSignature/);
+  assert.match(branch, /browserFailureCallSignature,/);
+  assert.match(branch, /protocolNoProgressFingerprint: browserFailureFingerprint/);
+  assert.doesNotMatch(
+    branch,
+    /failure\.sourceTarget \|\| executeRecoveryState\.expectedTarget/,
+    "a browser locator failure cannot inherit an unrelated last mutation/read target",
+  );
   assert.match(branch, /return finish\("continue"\)/);
   assert.doesNotMatch(branch, /reconcile_server/);
 });

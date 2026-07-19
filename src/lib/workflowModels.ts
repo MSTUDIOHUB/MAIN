@@ -2964,7 +2964,11 @@ const RUNTIME_TASK_OPTIONAL_RE =
 const RUNTIME_TASK_CHANGE_HEADING_RE =
   /^(?:改动|变更|changes?)\s*\d*\s*[：:]\s*(.+)$/i;
 const RUNTIME_TASK_CHANGE_DETAIL_RE =
-  /^(?:改动(?:内容)?|变更(?:内容)?|changes?|implementation(?: details)?)\s*[：:]\s*(.+)$/i;
+  /^(?:改动(?:内容)?|变更(?:内容)?|修改为|改为|变更为|调整为|根因|原因|changes?|change to|replace with|root cause|reason|implementation(?: details)?)\s*[：:]\s*(.+)$/i;
+const RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE =
+  /^(?:改动(?:内容)?|变更(?:内容)?|实现细节|修改说明|修改为|改为|变更为|调整为|changes?|change to|replace with|implementation(?: details)?)\s*[:：]?\s*$/i;
+const RUNTIME_TASK_CHANGE_CHILD_REMOVAL_RE =
+  /^(?:(?:移除|删去|注销|取消注册)|(?:remove|drop|unregister)\b)/i;
 const RUNTIME_TASK_FILE_TABLE_SECTION_RE =
   /(?:关键(?:实现)?改动|实现改动|改动\s*\d+|影响文件|涉及文件|文件变更|变更文件|key changes?|implementation changes?|affected files?|files? to change|file changes?|^files?$)/i;
 const RUNTIME_TASK_DIAGNOSIS_ACTION_PREFIX = String.raw`(?:(?:(?:问题诊断|故障诊断|诊断|根因分析)\s*(?:与|及|/)\s*)|(?:(?:Problem\s+Diagnosis|Diagnosis|Diagnostic\s+(?:Findings|Analysis)|Root\s+Cause(?:\s+Analysis)?)\s+(?:and|&|/)\s+))?`;
@@ -3544,8 +3548,11 @@ function collectRuntimeTaskChangeHeadingTasks(
       if (!change) continue;
 
       const headingBody = change[1] || "";
-      const headingTarget = headingBody.split(/\s+(?:—|–|-)\s+/u, 1)[0] || headingBody;
-      const referencedFiles = extractWorkspaceFileReferencesFromText(headingTarget);
+      // Change headings commonly put the owned path after a dash, for example
+      // "Change 2: repair initial state — src/main.js". Restricting path
+      // discovery to the prefix before that dash discarded the explicit owner
+      // and let descendant rationale leak out as standalone mutations.
+      const referencedFiles = extractWorkspaceFileReferencesFromText(headingBody);
       const selectedOwnerFiles = selectMutationOwnerFileReferences(headingBody, referencedFiles);
       const files = selectedOwnerFiles.length > 0 ? selectedOwnerFiles : referencedFiles;
       if (files.length === 0) continue;
@@ -3569,7 +3576,27 @@ function collectRuntimeTaskChangeHeadingTasks(
       .replace(/\*\*/g, "")
       .trim();
     const detail = normalized.match(RUNTIME_TASK_CHANGE_DETAIL_RE)?.[1]?.trim();
-    if (detail) pendingChange.details.push(detail);
+    if (detail) {
+      pendingChange.details.push(detail);
+      continue;
+    }
+
+    const isChildListItem = /^\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/.test(line);
+    const isExplicitChildMutation =
+      RUNTIME_TASK_STANDALONE_ACTION_RE.test(normalized) ||
+      RUNTIME_TASK_CHANGE_CHILD_REMOVAL_RE.test(normalized);
+    if (
+      isChildListItem &&
+      isExplicitChildMutation &&
+      !PRIMARY_VALIDATION_TASK_RE.test(normalized) &&
+      extractShellCommandsFromText(normalized).length === 0 &&
+      !pendingChange.details.includes(normalized)
+    ) {
+      // Change N owns explicit implementation bullets even when the model did
+      // not prefix them with "Change to". Ordinary rationale, preservation
+      // notes, and validation commands remain outside the mutation contract.
+      pendingChange.details.push(normalized);
+    }
   }
   flushPendingChange();
   return tasks;
@@ -3591,7 +3618,8 @@ function collectRuntimeTaskProseSectionTasks(
   let pendingHeadingSummary: {
     files: string[];
     text: string;
-    usedByDetail: boolean;
+    details: string[];
+    mergeDetails: boolean;
   } | null = null;
 
   const ensureMutationFiles = (files: string[]) => {
@@ -3628,16 +3656,30 @@ function collectRuntimeTaskProseSectionTasks(
       remember(files, description);
       return;
     }
-    pendingHeadingSummary.usedByDetail = true;
-    remember(
-      files,
-      `${pendingHeadingSummary.text}${language === "en" ? "; " : "；"}${description}`,
-    );
+    const clean = stripMarkdownTaskLine(description).replace(/^[\s:：—–-]+/, "").trim();
+    if (clean && !pendingHeadingSummary.details.includes(clean)) {
+      pendingHeadingSummary.details.push(clean);
+    }
   };
 
   const flushPendingHeadingSummary = () => {
-    if (pendingHeadingSummary && !pendingHeadingSummary.usedByDetail) {
-      remember(pendingHeadingSummary.files, pendingHeadingSummary.text);
+    if (pendingHeadingSummary) {
+      if (pendingHeadingSummary.mergeDetails) {
+        const description = [
+          pendingHeadingSummary.text,
+          ...pendingHeadingSummary.details,
+        ].filter(Boolean).join(language === "en" ? "; " : "；");
+        remember(pendingHeadingSummary.files, description);
+      } else if (pendingHeadingSummary.details.length > 0) {
+        // A generic mutation heading owns its child bullets but does not make
+        // them one obligation. Only an explicit Change N block merges
+        // rationale/implementation metadata into one reviewed change.
+        for (const detail of pendingHeadingSummary.details) {
+          remember(pendingHeadingSummary.files, detail);
+        }
+      } else {
+        remember(pendingHeadingSummary.files, pendingHeadingSummary.text);
+      }
     }
     pendingHeadingSummary = null;
   };
@@ -3707,23 +3749,34 @@ function collectRuntimeTaskProseSectionTasks(
         const isFileOnlyHeading =
           nestedHeadingFiles.length === 1 &&
           normalizedFileOnlyHeading === nestedHeadingFiles[0];
+        let fileHeadingRemainder = normalizedFileOnlyHeading;
+        for (const filePath of nestedHeadingFiles) {
+          fileHeadingRemainder = fileHeadingRemainder
+            .split(filePath).join("")
+            .replace(/^[\s:：—–,，.。-]+|[\s:：—–,，.。-]+$/g, "")
+            .trim();
+        }
+        const isGenericFileOwnerHeading =
+          nestedHeadingFiles.length === 1 &&
+          /^(?:(?:核心|主要|具体|目标|source|core|main|target)\s*)?(?:修改|改动|变更|changes?|modifications?)$/i.test(fileHeadingRemainder);
         if (
           !inValidationSection &&
           nestedHeadingFiles.length > 0 &&
-          (isExplicitFileHeading || isFileOnlyHeading || isLikelySourceMutationTask(headingText))
+          (isExplicitFileHeading || isFileOnlyHeading || isGenericFileOwnerHeading || isLikelySourceMutationTask(headingText))
         ) {
-          const mutationOwnerFiles = isExplicitFileHeading || isFileOnlyHeading
+          const mutationOwnerFiles = isExplicitFileHeading || isFileOnlyHeading || isGenericFileOwnerHeading
             ? nestedHeadingFiles
             : selectMutationOwnerFileReferences(headingText, nestedHeadingFiles);
           const effectiveOwnerFiles = mutationOwnerFiles.length > 0
             ? mutationOwnerFiles
             : nestedHeadingFiles;
           ensureMutationFiles(effectiveOwnerFiles);
-          if (!isExplicitFileHeading && !isFileOnlyHeading) {
+          if (!isExplicitFileHeading && !isFileOnlyHeading && !isGenericFileOwnerHeading) {
             pendingHeadingSummary = {
               files: effectiveOwnerFiles,
               text: headingText,
-              usedByDetail: false,
+              details: [],
+              mergeDetails: RUNTIME_TASK_CHANGE_HEADING_RE.test(headingText),
             };
           }
           pendingFiles = effectiveOwnerFiles;
@@ -3747,7 +3800,7 @@ function collectRuntimeTaskProseSectionTasks(
 
     const normalized = stripMarkdownTaskLine(rawLine.replace(/\*\*/g, "")).trim();
     if (!normalized) continue;
-    if (/^(?:改动内容|变更内容|实现细节|修改说明|Changes?|Implementation Details?)\s*[:：]?$/i.test(normalized)) {
+    if (RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE.test(normalized)) {
       // A container label keeps the current file owner but is not itself an
       // executable mutation.
       continue;
@@ -4858,6 +4911,116 @@ function hasConcreteStepExpectationScenario(testPlanBody: string): boolean {
   return collectConcreteStepExpectationScenarios(testPlanBody).length > 0;
 }
 
+function stripPlanQualityLine(line: string): string {
+  return String(line || "")
+    .replace(/^\s*(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/, "")
+    .replace(/\*\*|__/g, "")
+    .trim();
+}
+
+/**
+ * A label such as "Change to:" is valid only when it owns a following body.
+ * Treating the empty label itself as a mutation creates an obligation that no
+ * write can ever satisfy. Nested list content and ordinary following prose are
+ * accepted; a sibling item, the next heading, or end-of-document is empty.
+ */
+function hasEmptyPlanImplementationDetail(content: string): boolean {
+  const lines = String(content || "").split(/\r?\n/);
+  for (let index = 0; index < lines.length; index += 1) {
+    const rawLine = lines[index] || "";
+    if (!RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE.test(stripPlanQualityLine(rawLine))) continue;
+
+    const listItem = rawLine.match(/^(\s*)(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/);
+    const ownerIndent = String(listItem?.[1] || "").length;
+    let hasOwnedBody = false;
+    for (let cursor = index + 1; cursor < lines.length; cursor += 1) {
+      const nextLine = lines[cursor] || "";
+      if (!nextLine.trim()) continue;
+      if (/^\s*#{1,6}\s+/.test(nextLine)) break;
+
+      const nextListItem = nextLine.match(/^(\s*)(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/);
+      if (listItem && nextListItem && String(nextListItem[1] || "").length <= ownerIndent) break;
+      if (RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE.test(stripPlanQualityLine(nextLine))) break;
+      hasOwnedBody = true;
+      break;
+    }
+    if (!hasOwnedBody) return true;
+  }
+  return false;
+}
+
+interface ExplicitPlanAcceptanceAssertion {
+  subject: string;
+  value: string;
+}
+
+function parseExplicitPlanAcceptanceAssertion(
+  line: string,
+): ExplicitPlanAcceptanceAssertion | null {
+  const clean = stripPlanQualityLine(line);
+  if (!clean || isMarkdownTableSyntaxLine(clean)) return null;
+  const match = clean.match(
+    /^(.{2,180}?)\s*(?:(?:应当|应该|必须|预期)\s*)?(?:显示为|设为|设置为|等于|为|是|=|should\s+(?:be|equal|show|display)|must\s+(?:be|equal|show|display)|is|equals?|shows?|displays?)\s*(?:`([^`\r\n]{1,120})`|"([^"\r\n]{1,120})"|'([^'\r\n]{1,120})'|“([^”\r\n]{1,120})”|‘([^’\r\n]{1,120})’)\s*(?:[。.!]|[（(][^（）()\r\n]{0,120}[）)])*\s*$/i,
+  );
+  if (!match) return null;
+  const subject = String(match[1] || "")
+    .replace(/^(?:验证|确认|检查|断言|预期|verify|confirm|check|assert|expect(?:ed)?)\s*[:：]?\s*/i, "")
+    .replace(/[`*_~\s:：,，.。;；()（）'"“”‘’\-–—]/g, "")
+    .toLowerCase();
+  const value = String(match.slice(2).find(Boolean) || "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+  return subject.length >= 2 && value
+    ? { subject, value }
+    : null;
+}
+
+/**
+ * Reject only explicit, syntactically assigned acceptance values for the same
+ * normalized subject. Scenario prose with different subjects remains valid,
+ * and no product-specific expected string is hard-coded here.
+ */
+function hasConflictingPlanAcceptanceAssertions(content: string): boolean {
+  const valuesBySubject = new Map<string, Set<string>>();
+  let validationSectionLevel = 0;
+  let inCodeFence = false;
+
+  for (const rawLine of normalizeRuntimePlanSectionHeadings(content).split(/\r?\n/)) {
+    if (/^\s*```/.test(rawLine)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) continue;
+
+    const heading = rawLine.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const level = String(heading[1] || "").length;
+      if (validationSectionLevel > 0 && level <= validationSectionLevel) {
+        validationSectionLevel = 0;
+      }
+      if (
+        level > 1 &&
+        RUNTIME_TASK_VALIDATION_SECTION_RE.test(
+          String(heading[2] || "").replace(/\*\*/g, "").trim(),
+        )
+      ) {
+        validationSectionLevel = level;
+      }
+      continue;
+    }
+    if (validationSectionLevel === 0) continue;
+
+    const assertion = parseExplicitPlanAcceptanceAssertion(rawLine);
+    if (!assertion) continue;
+    const values = valuesBySubject.get(assertion.subject) || new Set<string>();
+    values.add(assertion.value);
+    if (values.size > 1) return true;
+    valuesBySubject.set(assertion.subject, values);
+  }
+  return false;
+}
+
 export function validateActionablePlanArtifact(
   content: string,
 ): PlanArtifactQualityResult {
@@ -4934,6 +5097,12 @@ export function validateActionablePlanArtifact(
   }
   if (/(?:以落实已批准目标|落实已批准方案中涉及|Apply the approved plan change|for the approved goal)/i.test(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "generic_approved_goal_plan" });
+  }
+  if (hasEmptyPlanImplementationDetail(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "empty_plan_implementation_detail" });
+  }
+  if (hasConflictingPlanAcceptanceAssertions(raw)) {
+    return classifyPlanArtifactQualityResult({ ok: false, reason: "conflicting_plan_acceptance_assertions" });
   }
   if (planEvidenceSectionsContainInternalPlanArtifacts(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "internal_plan_artifact_evidence" });

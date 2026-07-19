@@ -401,6 +401,7 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
     if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return `edited ${rawTarget}`;
     if (toolName === "run_command" || toolName === "execute_command") return `ran ${rawTarget}`;
     if (toolName === "browser_evaluate") return `validated ${rawTarget}`;
+    if (toolName === "computer_use") return `controlled ${rawTarget}`;
     return toolName ? `${toolName} ${rawTarget}` : "";
   }
   if (toolName === "grep_search" || toolName === "glob_search" || toolName === "knowledge_search" || toolName.startsWith("repo_map_")) return `搜索 ${rawTarget}`;
@@ -412,6 +413,7 @@ function toolActionForActivityTitle(block: any, language: ToolPresentationLangua
   if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return `编辑 ${rawTarget}`;
   if (toolName === "run_command" || toolName === "execute_command") return `运行 ${rawTarget}`;
   if (toolName === "browser_evaluate") return `验证 ${rawTarget}`;
+  if (toolName === "computer_use") return `控制 ${rawTarget}`;
   return toolName ? `${toolName} ${rawTarget}` : "";
 }
 
@@ -537,6 +539,7 @@ function classifyToolActivityKind(toolName: string, status: TurnArchiveStepStatu
   }
   if (isExploringToolName(toolName)) return "exploring";
   if (toolName === "browser_evaluate") return "browser";
+  if (toolName === "computer_use") return "command";
   if (EDIT_ACTIVITY_TOOL_NAMES.has(toolName)) return "edit";
   if (toolName === "execute_command" || toolName === "run_command" || toolName === "send_pty_input" || TERMINAL_READ_TOOL_NAMES.has(toolName)) {
     return "command";

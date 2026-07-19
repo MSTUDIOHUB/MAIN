@@ -18,11 +18,15 @@ import {
   formatPlanEvidenceBundleForModel,
   isPlanEvidenceBundleReady,
 } from "../../planEvidence";
-import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
+import {
+  resolveApprovedPlanRecoveryReconciliation,
+  type PlanToolActivitySummary,
+} from "../../planExecutionRecovery";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import type { ToolDefinition } from "../../toolSchemas";
 import type { TurnInputContextSignals } from "../../turnIntake";
 import type { PlanExecutionProgressPhase } from "../../workflowModels";
+import { hasDurableExecutionProgress } from "../../verificationEvidence";
 import { generateId } from "../../utils";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import {
@@ -33,6 +37,8 @@ import {
   activateExecuteRecoveryRuntimeState,
   advanceExecuteRecoveryRuntimeIteration,
   buildExecuteRecoveryMaxIterationsPrompt,
+  createExecuteRecoveryRuntimeState,
+  shouldReleaseExecuteRecoveryPolicyBoundary,
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
 import type { AgentLoopRuntimeState } from "./turnPreparation";
@@ -203,23 +209,64 @@ export async function prepareIterationStreamRequest(input: {
   const rawIterationAllTools = finalTextOnlyStep || streamRuntimeState.chatFinalSynthesisActive
     ? []
     : resolveAllToolsForRuntime(runtimeIntent);
+  const rawIterationToolNames = new Set(
+    rawIterationAllTools.map((tool) => tool.function.name),
+  );
+  let recoveryStateBeforeBoundary = input.executeRecoveryState;
+  if (callbacks.getIsPlanApproved()) {
+    const reconciliation = resolveApprovedPlanRecoveryReconciliation({
+      tasks: callbacks.getPlanTasks(),
+      evidenceLedger: callbacks.getPlanExecutionEvidenceLedger(),
+      current: recoveryStateBeforeBoundary,
+      options: { availableToolNames: rawIterationToolNames },
+    });
+    if (reconciliation.action === "advance") {
+      const previousTaskId =
+        recoveryStateBeforeBoundary.decisionCheckpoint?.planTaskId || null;
+      recoveryStateBeforeBoundary = createExecuteRecoveryRuntimeState({
+        workflowMode,
+        forcedState: reconciliation.next,
+      });
+      logAgentEvent("approved_plan_recovery_rebased_before_surface", {
+        iteration,
+        previousTaskId,
+        nextTaskId:
+          reconciliation.next.decisionCheckpoint?.planTaskId || null,
+        nextRequiredCapability:
+          reconciliation.next.decisionCheckpoint?.nextRequiredCapability || null,
+        expectedTarget: reconciliation.next.expectedTarget,
+      });
+    } else if (reconciliation.action === "complete") {
+      recoveryStateBeforeBoundary = clearExecuteRecovery(
+        "approved_plan_automation_obligations_satisfied",
+        undefined,
+        recoveryStateBeforeBoundary,
+      );
+      logAgentEvent("approved_plan_recovery_released_after_evidence", {
+        iteration,
+        reason: "no_remaining_automatable_obligation",
+      });
+    }
+  }
   const structuredWorkspaceMutationObserved = hasStructuredWorkspaceMutationEvidence({
     callbacks,
     recentToolActivity,
   });
   const recoveryCheckpointCapability =
-    input.executeRecoveryState.decisionCheckpoint?.nextRequiredCapability || null;
+    recoveryStateBeforeBoundary.decisionCheckpoint?.nextRequiredCapability || null;
   const prematureFileModifyLifecycleRecovery =
     callbacks.getCommandDirective?.()?.kind === "file_modify" &&
     workflowMode === "edit" &&
     isMutationRuntimeIntent(runtimeIntent) &&
     !callbacks.getIsPlanApproved() &&
     !structuredWorkspaceMutationObserved &&
-    input.executeRecoveryState.mode !== "normal" &&
+    recoveryStateBeforeBoundary.mode !== "normal" &&
     new Set([
       "launch_long_process",
       "observe_pty",
       "browser_validation",
+      "browser_diagnostic",
+      "desktop_validation",
       "recover_process",
       "reconcile_server",
     ]).has(String(recoveryCheckpointCapability || ""));
@@ -227,13 +274,13 @@ export async function prepareIterationStreamRequest(input: {
     ? clearExecuteRecovery(
         "file_modify_requires_structured_mutation_before_process_validation",
         undefined,
-        input.executeRecoveryState,
+        recoveryStateBeforeBoundary,
       )
-    : input.executeRecoveryState;
+    : recoveryStateBeforeBoundary;
   if (prematureFileModifyLifecycleRecovery) {
     logAgentEvent("premature_file_modify_lifecycle_recovery_cleared", {
       iteration,
-      previousMode: input.executeRecoveryState.mode,
+      previousMode: recoveryStateBeforeBoundary.mode,
       previousCapability: recoveryCheckpointCapability,
       expectedTarget: input.executeRecoveryState.expectedTarget,
       structuredMutationObserved: false,
@@ -244,10 +291,29 @@ export async function prepareIterationStreamRequest(input: {
     advanceExecuteRecoveryRuntimeIteration(recoveryStateForIteration);
   let executeRecoveryState = executeRecoveryIterationAdvance.state;
   let recoveryPause: IterationStreamPreparationResult["recoveryPause"] = null;
+  let recoveryBoundaryReleaseNotice = "";
   if (executeRecoveryIterationAdvance.reachedMaxIterations) {
     const exhaustedState = executeRecoveryState;
-    const pauseMessage = buildExecuteRecoveryMaxIterationsPrompt({
-      language: callbacks.getPreferredLanguage(),
+    const exhaustedContract = resolveExecuteRecoveryActionContract(
+      exhaustedState.mode,
+      {
+        expectedTarget: exhaustedState.expectedTarget,
+        readLease: exhaustedState.readLease,
+        sourceObservationKey: exhaustedState.sourceObservationKey,
+        decisionCheckpoint: exhaustedState.decisionCheckpoint,
+        phaseNoProgressCount: exhaustedState.phaseNoProgressCount,
+        protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
+        protocolNoProgressFingerprint:
+          exhaustedState.protocolNoProgressFingerprint,
+      },
+    );
+    const releasePolicyBoundary = shouldReleaseExecuteRecoveryPolicyBoundary({
+      state: exhaustedState,
+      hasDurableEvidence: hasDurableExecutionProgress({
+        ledger: callbacks.getPlanExecutionEvidenceLedger(),
+        transactionId: iterationContext.eventTurnId,
+        recoveryActionContract: exhaustedContract,
+      }),
       maxIterations: executeRecoveryIterationAdvance.maxIterations,
     });
     logAgentEvent("execute_recovery_max_iterations_reached", {
@@ -258,19 +324,43 @@ export async function prepareIterationStreamRequest(input: {
       protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
       protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
       maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
+      disposition: releasePolicyBoundary
+        ? "normal_surface_continuation"
+        : "pause",
     });
-    recoveryPause = {
-      message: pauseMessage,
-      previousMode: exhaustedState.mode,
-      expectedTarget: exhaustedState.expectedTarget,
-      phaseNoProgressCount: exhaustedState.phaseNoProgressCount,
-      protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
-    };
-    executeRecoveryState = clearExecuteRecovery(
-      "max_recovery_iterations_reached",
-      undefined,
-      executeRecoveryState,
-    );
+    if (releasePolicyBoundary) {
+      executeRecoveryState = clearExecuteRecovery(
+        "policy_no_progress_boundary_released",
+        undefined,
+        executeRecoveryState,
+      );
+      recoveryBoundaryReleaseNotice = callbacks.getPreferredLanguage() === "zh"
+        ? "RECOVERY_POLICY_BOUNDARY_RELEASED: 已保留本轮真实执行证据，并释放了过期的窄事务目标。请使用当前完整但仍受批准范围约束的工具面继续下一项未完成工作或验证；不要重复刚才被策略推迟的同一调用。"
+        : "RECOVERY_POLICY_BOUNDARY_RELEASED: durable evidence from this turn was retained and the stale narrow transaction target was released. Continue the next unfinished approved action or validation with the current full, still scope-constrained tool surface; do not repeat the same policy-deferred call.";
+      logAgentEvent("execute_recovery_policy_boundary_released", {
+        iteration,
+        previousMode: exhaustedState.mode,
+        previousTarget: exhaustedState.expectedTarget,
+        protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
+      });
+    } else {
+      const pauseMessage = buildExecuteRecoveryMaxIterationsPrompt({
+        language: callbacks.getPreferredLanguage(),
+        maxIterations: executeRecoveryIterationAdvance.maxIterations,
+      });
+      recoveryPause = {
+        message: pauseMessage,
+        previousMode: exhaustedState.mode,
+        expectedTarget: exhaustedState.expectedTarget,
+        phaseNoProgressCount: exhaustedState.phaseNoProgressCount,
+        protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
+      };
+      executeRecoveryState = clearExecuteRecovery(
+        "max_recovery_iterations_reached",
+        undefined,
+        executeRecoveryState,
+      );
+    }
     executeRecoveryIterationAdvance = {
       ...executeRecoveryIterationAdvance,
       state: executeRecoveryState,
@@ -422,6 +512,12 @@ export async function prepareIterationStreamRequest(input: {
     managedAgentMessages: contextManagementResult.managedAgentMessages,
     iteration,
   });
+  if (recoveryBoundaryReleaseNotice) {
+    managedAgentMessages = [
+      ...managedAgentMessages,
+      { role: "system", content: recoveryBoundaryReleaseNotice },
+    ];
+  }
   if (
     toolSurfaceDecision.recoveryActionContract.phase !== "normal" ||
     toolSurfaceDecision.recoveryActionContract.modeLabel === "objective_audit"

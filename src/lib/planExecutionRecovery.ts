@@ -24,6 +24,7 @@ import {
   type ForcedExecuteRecoveryRuntimeState,
 } from "./executeRecoveryTools";
 import { isPlanReadOnlyToolName } from "./planReadOnlyConvergence";
+import { workspacePathsReferToSameFile } from "./workspacePaths";
 import {
   buildExecuteEvidenceClosureAudit,
   resolveLatestUnreconciledFailureSignal,
@@ -32,6 +33,11 @@ import {
 } from "./verificationEvidence";
 
 export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
+
+export interface ApprovedPlanRecoveryResolutionOptions {
+  /** Runtime tools actually available for this iteration, before recovery filtering. */
+  availableToolNames?: Iterable<string>;
+}
 
 export function hasPendingApprovedPlanSourceMutation(
   tasks: PlanTask[],
@@ -57,7 +63,9 @@ export function hasPendingApprovedPlanSourceMutation(
 export function resolveApprovedPlanInitialExecutionRecovery(
   tasks: PlanTask[],
   evidenceLedger: PlanExecutionEvidenceEntry[] = [],
+  options: ApprovedPlanRecoveryResolutionOptions = {},
 ): ForcedExecuteRecoveryRuntimeState | null {
+  const availableToolNames = new Set(options.availableToolNames || []);
   const pending = (Array.isArray(tasks) ? tasks : []).filter((task) =>
     task.status !== "completed" && task.evidenceStatus !== "satisfied"
   );
@@ -178,8 +186,112 @@ export function resolveApprovedPlanInitialExecutionRecovery(
         },
       };
     }
+
+    if (
+      unsatisfiedEvidence.some((item) => item.kind === "tauri_required") &&
+      availableToolNames.has("computer_use")
+    ) {
+      return {
+        mode: "validation_only",
+        reason: "approved_plan_desktop_handoff",
+        expectedTarget: null,
+        attempts: 0,
+        phaseNoProgressCount: 0,
+        protocolNoProgressCount: 0,
+        protocolNoProgressFingerprint: null,
+        readLease: null,
+        sourceObservationKey: null,
+        decisionCheckpoint: {
+          expectedTarget: null,
+          sourceObservationKey: null,
+          nextRequiredCapability: "desktop_validation",
+          ...taskCheckpointIdentity,
+        },
+      };
+    }
   }
   return null;
+}
+
+export interface ApprovedPlanRecoveryStateLike {
+  mode: ExecuteRecoveryMode;
+  reason?: string | null;
+  expectedTarget?: string | null;
+  decisionCheckpoint?: {
+    planTaskId?: string | null;
+    requirementRef?: string | null;
+    nextRequiredCapability?: string | null;
+  } | null;
+}
+
+export type ApprovedPlanRecoveryReconciliation =
+  | { action: "unchanged"; next: ForcedExecuteRecoveryRuntimeState | null }
+  | { action: "advance"; next: ForcedExecuteRecoveryRuntimeState }
+  | { action: "complete"; next: null };
+
+/**
+ * Rebase an approved-Plan recovery transaction onto the first obligation that
+ * is still unsatisfied by durable evidence. Task identity and target identity
+ * are deliberately compared separately: two reviewed changes may touch the
+ * same file, while read/patch/PTY subphases of one obligation must retain their
+ * exact lease and progress counters.
+ */
+export function resolveApprovedPlanRecoveryReconciliation(input: {
+  tasks: PlanTask[];
+  evidenceLedger?: PlanExecutionEvidenceEntry[];
+  current: ApprovedPlanRecoveryStateLike;
+  options?: ApprovedPlanRecoveryResolutionOptions;
+}): ApprovedPlanRecoveryReconciliation {
+  const next = resolveApprovedPlanInitialExecutionRecovery(
+    input.tasks,
+    input.evidenceLedger || [],
+    input.options,
+  );
+  const currentTaskId = String(
+    input.current.decisionCheckpoint?.planTaskId || "",
+  ).trim();
+  const currentRequirementRef = String(
+    input.current.decisionCheckpoint?.requirementRef || "",
+  ).trim();
+  const currentIsPlanOwned = Boolean(currentTaskId || currentRequirementRef) ||
+    String(input.current.reason || "").startsWith("approved_plan_");
+
+  if (!next) {
+    return currentIsPlanOwned
+      ? { action: "complete", next: null }
+      : { action: "unchanged", next: null };
+  }
+  if (input.current.mode === "normal") {
+    return { action: "advance", next };
+  }
+
+  const nextTaskId = String(next.decisionCheckpoint?.planTaskId || "").trim();
+  const nextRequirementRef = String(
+    next.decisionCheckpoint?.requirementRef || "",
+  ).trim();
+  const taskChanged = currentTaskId && nextTaskId
+    ? currentTaskId !== nextTaskId
+    : currentRequirementRef && nextRequirementRef
+      ? currentRequirementRef !== nextRequirementRef
+      : !currentTaskId && !currentRequirementRef;
+  if (taskChanged) return { action: "advance", next };
+
+  const currentTarget = String(input.current.expectedTarget || "").trim();
+  const nextTarget = String(next.expectedTarget || "").trim();
+  const targetChanged = Boolean(currentTarget) !== Boolean(nextTarget) ||
+    Boolean(
+      currentTarget && nextTarget &&
+      !workspacePathsReferToSameFile(currentTarget, nextTarget)
+    );
+  // Within one task, a source-attributed command/browser failure may
+  // intentionally reopen mutation on a different target. Only the canonical
+  // successful-mutation transition is allowed to hand the same task from its
+  // file obligation to its command/browser/desktop validation obligation.
+  const mutationEvidenceJustCommitted =
+    input.current.reason === "recovery_mutation_observed";
+  return targetChanged && mutationEvidenceJustCommitted
+    ? { action: "advance", next }
+    : { action: "unchanged", next };
 }
 
 export interface ExecuteMaxIterationsRecoveryDecision {

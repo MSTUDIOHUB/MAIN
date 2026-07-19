@@ -682,6 +682,38 @@ test("a browser screenshot receipt is never promoted to a source repair target",
   const failure = verification.resolveLatestUnreconciledFailureSignal({ ledger: [failed] });
   assert.equal(failure.domain, "browser");
   assert.equal(failure.sourceTarget, null);
+
+  const recovery = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: [failed],
+    validationExpected: true,
+    currentRecoveryMode: "normal",
+    availableToolNames: new Set(["browser_evaluate", "grep_search", "read_file", "apply_patch"]),
+  });
+  assert.equal(recovery.mode, "action_plus_targeting");
+  assert.equal(recovery.nextRequiredCapability, "browser_diagnostic");
+  assert.equal(recovery.expectedTarget, null);
+});
+
+test("an active browser diagnostic is not collapsed back into the identical browser-only retry", () => {
+  const failed = planEvidence.createPlanExecutionFailureEntry({
+    toolName: "browser_evaluate",
+    target: "http://localhost:1420/",
+    error: `BROWSER_VALIDATION_FAILED: locator missing\n${JSON.stringify({
+      ok: false,
+      failureType: "validation_spec_error",
+      failureReasons: ["missing_locator"],
+      actions: [{ kind: "click", target: "#missing", ok: false }],
+      assertions: [],
+    })}`,
+  });
+  const recovery = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: [failed],
+    validationExpected: true,
+    currentRecoveryMode: "action_plus_targeting",
+    currentRequiredCapability: "browser_diagnostic",
+    availableToolNames: new Set(["browser_evaluate", "grep_search", "read_file"]),
+  });
+  assert.equal(recovery, null);
 });
 
 test("external review markers are advisory while actual automation is explicit evidence", () => {
@@ -737,6 +769,21 @@ test("pre-completion audit selects the exact next capability", () => {
   });
   assert.equal(finite.mode, "finite_validation_only");
   assert.equal(finite.nextRequiredCapability, "validation");
+
+  const desktop = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
+    ledger: [nonInteractionMutation(), {
+      id: "tauri-review",
+      kind: "tauri_required",
+      value: "Open file dialog",
+      sourceTool: "runtime_marker",
+      createdAt: 2,
+    }],
+    validationExpected: true,
+    currentRecoveryMode: "normal",
+    availableToolNames: new Set(["computer_use", "run_command"]),
+  });
+  assert.equal(desktop.mode, "validation_only");
+  assert.equal(desktop.nextRequiredCapability, "desktop_validation");
 
   const launch = precompletion.resolvePreCompletionEvidenceRecoveryDecision({
     ledger: [mutation()],

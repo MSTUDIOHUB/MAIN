@@ -64,6 +64,73 @@ test("browser evaluator keeps page diagnostics when a body-text wait times out o
   assert.equal(result.finalUrl, server.url);
   assert.match(result.error, /wait_for_text only searches document\.body text/);
   assert.match(result.error, /title check/);
+  assert.ok(result.failureReasons.includes("validation_spec_error"));
+  assert.equal(result.failureType, "validation_spec_error");
+  assert.equal(result.validationSpecError.code, "body_text_matches_title_only");
+  assert.equal(result.validationSpecError.phase, "wait_for_text");
+  assert.equal(result.validationSpecError.expectedText, "MD Viewer");
+  assert.match(result.failureFingerprint, /^browser-failure-/);
+  assert.match(result.validationSpecError.fingerprint, /^validation-spec-/);
+});
+
+test("browser evaluator reports a stable missing-selector specification error with locator inventory", async (t) => {
+  const buttons = Array.from({ length: 40 }, (_, index) =>
+    `<button id="button-${index}" aria-label="Action ${index}">Action ${index}</button>`
+  ).join("");
+  const server = await startServer(`<!doctype html><title>Controls</title><main>${buttons}</main>`);
+  t.after(server.close);
+
+  const input = {
+    url: server.url,
+    actions: "click: #new-file-btn",
+    timeoutMs: 1000,
+    screenshot: false,
+  };
+  const first = await runBrowserEvaluate(input);
+  const second = await runBrowserEvaluate(input);
+
+  for (const result of [first, second]) {
+    assert.equal(result.ok, false);
+    assert.ok(result.failureReasons.includes("validation_spec_error"));
+    assert.equal(result.failureType, "validation_spec_error");
+    assert.ok(result.failureReasons.includes("action_failed"));
+    assert.equal(result.validationSpecError.code, "selector_not_found");
+    assert.equal(result.validationSpecError.selector, "#new-file-btn");
+    assert.equal(result.failedAction.kind, "click");
+    assert.equal(result.failedAction.selector, "#new-file-btn");
+    assert.equal(result.failedAction.actionFingerprint, result.validationSpecError.actionFingerprint);
+    assert.equal(result.failedAction.selectorFingerprint, result.validationSpecError.selectorFingerprint);
+    assert.ok(result.interactiveElements.length > 0);
+    assert.ok(result.interactiveElements.length <= 32);
+    assert.ok(result.interactiveElements.some((element) =>
+      element.selectorCandidates.includes("#button-0")
+    ));
+    assert.equal(result.renderDiagnostics.interactiveElementInventoryTruncated, true);
+    assert.match(result.failureSummary, /Inspect interactiveElements/);
+  }
+
+  assert.equal(first.failureFingerprint, second.failureFingerprint);
+  assert.equal(first.failedAction.actionFingerprint, second.failedAction.actionFingerprint);
+  assert.equal(first.failedAction.selectorFingerprint, second.failedAction.selectorFingerprint);
+});
+
+test("browser evaluator keeps a navigation failure transient instead of labeling it as a deterministic blank page", async () => {
+  const server = await startServer("<!doctype html><main>temporary</main>");
+  const unavailableUrl = server.url;
+  await server.close();
+
+  const result = await runBrowserEvaluate({
+    url: unavailableUrl,
+    timeoutMs: 1000,
+    screenshot: false,
+  });
+
+  assert.equal(result.ok, false);
+  assert.ok(result.failureReasons.includes("runtime_error"));
+  assert.equal(result.failureReasons.includes("blank_page"), false);
+  assert.equal(result.navigationCompleted, false);
+  assert.equal(result.validationSpecError, null);
+  assert.match(result.error, /ERR_CONNECTION_REFUSED|ECONNREFUSED/);
 });
 
 test("browser evaluator completes a DOM validation without a title/body mismatch", async (t) => {

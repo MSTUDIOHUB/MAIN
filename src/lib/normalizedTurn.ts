@@ -385,6 +385,7 @@ const REVIEW_GATED_TEXT_TOOL_NAMES = new Set([
   "execute_command",
   "send_pty_input",
   "browser_evaluate",
+  "computer_use",
 ]);
 
 function looksLikeClarifyingOrPermissionQuestion(text: string): boolean {

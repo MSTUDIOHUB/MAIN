@@ -79,15 +79,15 @@ test("approved Plan scope recovery keeps one semantic fingerprint across policy-
 test("approved Plan recovery advances the runtime contract after task evidence closes", () => {
   assert.match(
     phaseSource,
-    /resolveApprovedPlanInitialExecutionRecovery\(\s*input\.callbacks\.getPlanTasks\(\),\s*input\.callbacks\.getPlanExecutionEvidenceLedger\(\)/,
+    /resolveApprovedPlanRecoveryReconciliation\(\{[\s\S]*?tasks:\s*input\.callbacks\.getPlanTasks\(\),[\s\S]*?evidenceLedger:\s*input\.callbacks\.getPlanExecutionEvidenceLedger\(\)/,
   );
   assert.match(
     phaseSource,
-    /currentTaskId !== nextTaskId \|\| targetAdvanced/,
+    /approved_plan_recovery_rebased_before_partition/,
   );
   assert.match(
     phaseSource,
-    /createExecuteRecoveryRuntimeState\(\{[\s\S]*?forcedState: nextPlanObligation/,
+    /createExecuteRecoveryRuntimeState\(\{[\s\S]*?forcedState:\s*reconciliation\.next/,
   );
   assert.match(phaseSource, /approved_plan_recovery_obligation_advanced/);
 });

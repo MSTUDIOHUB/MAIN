@@ -108,8 +108,10 @@ import { buildDurableTurnContext, shouldCanonicalizeTerminalTurnContext } from "
 import {
   collectPlanTaskTerminalProjection,
   resolveCompletedTurnFinalPresentation,
+  resolvePausedTurnFinalPresentation,
   resolveTerminalTurnOwnership,
   shouldCommitCompletedTurnFinalPresentation,
+  shouldCommitPausedTurnFinalPresentation,
 } from "../terminalAssistantFinal";
 import { reduceRunTransition } from "../runTransitionReducer";
 import { createTerminalStatusPublicationGate } from "../terminalStatusPublication";
@@ -120,6 +122,7 @@ import {
 } from "../executeRecoveryTools";
 import { scopeExecutionEvidenceLedger } from "../verificationEvidence";
 import { isNoOpToolFeedback } from "../toolFeedbackEnvelope";
+import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
 
 type WorkflowStoreState = any;
 
@@ -299,6 +302,16 @@ export class WorkflowEngine {
       nextStep: string | null;
       repeatedTargets: string[];
     } | null = null;
+    const getScopedDurableMutationEvidence = () => scopeExecutionEvidenceLedger(
+      sessionGet().planExecutionEvidenceLedger || [],
+      turnId,
+    ).filter((entry) =>
+      entry.kind === "file" &&
+      isWorkspaceMutationToolName(entry.sourceTool) &&
+      !["failed", "pending", "unknown", "running", "stopped"].includes(
+        String(entry.observationStatus || ""),
+      )
+    );
     let pendingMaxIterationsAutoResume: {
       kind: "plan" | "execute";
       start: () => void;
@@ -3185,6 +3198,43 @@ export class WorkflowEngine {
                           : null,
                     }
                   : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailureFingerprint
+                  ? {
+                      browserFailureFingerprint:
+                        latestExecuteRecoveryState.decisionCheckpoint.browserFailureFingerprint,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailureCallSignature
+                  ? {
+                      browserFailureCallSignature:
+                        latestExecuteRecoveryState.decisionCheckpoint.browserFailureCallSignature,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailureDetail
+                  ? {
+                      browserFailureDetail:
+                        latestExecuteRecoveryState.decisionCheckpoint.browserFailureDetail,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserFailedLocator
+                  ? {
+                      browserFailedLocator:
+                        latestExecuteRecoveryState.decisionCheckpoint.browserFailedLocator,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserLocatorCandidates?.length
+                  ? {
+                      browserLocatorCandidates: [
+                        ...latestExecuteRecoveryState.decisionCheckpoint.browserLocatorCandidates,
+                      ],
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.browserRequestedUrl
+                  ? {
+                      browserRequestedUrl:
+                        latestExecuteRecoveryState.decisionCheckpoint.browserRequestedUrl,
+                    }
+                  : {}),
               },
         };
         const notice = shouldAutoResume
@@ -3491,12 +3541,18 @@ export class WorkflowEngine {
           messageChars: message.length,
           messagePreview: message.replace(/\s+/g, " ").slice(0, 260),
         });
+        const isDurableRecoveryPause =
+          progress?.recoveryReason === "execute_recovery_no_progress_limit" &&
+          getScopedDurableMutationEvidence().length > 0;
         const stoppedStatus = reason === "no_output"
           ? "stopped_no_output"
+          : isDurableRecoveryPause
+          ? "paused"
           : progress?.recoveryReason === "approved_plan_completion_guard_no_evidence"
           ? "stopped_no_action"
           : progress?.recoveryReason === "required_tool_call_protocol_violation_after_change" ||
             progress?.recoveryReason === "execute_no_action_after_change" ||
+            progress?.recoveryReason?.startsWith("desktop_control_") ||
             progress?.recoveryReason?.startsWith("execution_evidence_gap:")
           ? "paused"
           : reason === "incomplete_plan"
@@ -3931,6 +3987,85 @@ export class WorkflowEngine {
         failures: finalPresentation.execution.failures,
         unfinished: finalPresentation.execution.unfinished,
         advisories: finalPresentation.execution.advisories,
+      });
+      return finalPresentation.text;
+    };
+
+    const ensurePausedTurnFinalPresentation = (outcome: AgentLoopOutcome): string | null => {
+      if (outcome.status !== "paused" || outcome.reason !== "execute_recovery_no_progress_limit") {
+        return null;
+      }
+      const durableMutationEvidence = getScopedDurableMutationEvidence();
+      if (durableMutationEvidence.length === 0) return null;
+      const current = sessionGet();
+      const terminalOwnership = resolveTerminalTurnOwnership({
+        turnId,
+        uiDisplayTurnId: context.uiDisplayTurnId,
+      });
+      const terminalTurnIds = new Set(terminalOwnership.evidenceTurnIds);
+      const presentationTurn = current.conversationTurns.find((candidate: any) =>
+        candidate.id === terminalOwnership.ownerTurnId
+      ) || current.conversationTurns.find((candidate: any) => candidate.id === turnId);
+      const presentationTurnId = presentationTurn?.id || terminalOwnership.ownerTurnId;
+      const turnBlocks = current.taskFlow.filter((block: TaskBlock) =>
+        !!block.turnId && terminalTurnIds.has(block.turnId)
+      );
+      const isPlanTurn = presentationTurn?.mode === "plan" || presentationTurn?.intent === "plan";
+      const planTerminalProjection = isPlanTurn
+        ? collectPlanTaskTerminalProjection({
+            tasks: current.planTasks || [],
+            evidenceLedger: current.planExecutionEvidenceLedger || [],
+            availableToolNames: terminalAvailableToolNames,
+          })
+        : { blocking: [], advisories: [] };
+      const finalPresentation = resolvePausedTurnFinalPresentation({
+        turnBlocks,
+        artifactPaths: isPlanTurn
+          ? (current.planArtifacts || []).map((artifact: any) => artifact.path)
+          : [],
+        unfinished: planTerminalProjection.blocking,
+        advisories: planTerminalProjection.advisories,
+        durableMutationPaths: durableMutationEvidence
+          .map((entry) => String(entry.target || entry.value || "").trim())
+          .filter(Boolean),
+        nextStep: lastNonActionableStopDiagnostic?.nextStep,
+        language: (current.preferredResponseLanguage || current.config.language) === "en" ? "en" : "zh",
+      });
+      const finalBlockId = current._nextTaskId();
+      sessionSet((state: any) => {
+        const taskFlow = [...state.taskFlow, {
+          id: finalBlockId,
+          turnId: presentationTurnId,
+          type: "agent" as const,
+          content: finalPresentation.text,
+          streaming: false,
+          visibility: "assistant_final" as const,
+        }];
+        return {
+          taskFlow,
+          conversationTurns: state.conversationTurns.map((candidate: any) =>
+            terminalTurnIds.has(candidate.id)
+              ? {
+                  ...candidate,
+                  summary: finalPresentation.text,
+                  blockIds: candidate.id === presentationTurnId && !candidate.blockIds.includes(finalBlockId)
+                    ? [...candidate.blockIds, finalBlockId]
+                    : candidate.blockIds,
+                }
+              : candidate
+          ),
+        };
+      });
+      logStoreEvent("paused_turn_final_presentation_committed", {
+        source: finalPresentation.source,
+        recoveryReason: outcome.reason,
+        finalChars: finalPresentation.text.length,
+        modifiedFiles: finalPresentation.execution.modifiedFiles,
+        validations: finalPresentation.execution.validations,
+        failures: finalPresentation.execution.failures,
+        unfinished: finalPresentation.execution.unfinished,
+        advisories: finalPresentation.execution.advisories,
+        nextStep: lastNonActionableStopDiagnostic?.nextStep || null,
       });
       return finalPresentation.text;
     };
@@ -4530,12 +4665,12 @@ export class WorkflowEngine {
             const modelIterationsUsed = Math.max(maxObservedModelIteration, assistantResponseCount);
             const deferredNonActionableStop = deferredNonActionableStops[0];
             const deferredRecoveryReason = deferredNonActionableStop?.[2]?.recoveryReason;
+            const exactMaxIterationBoundary =
+              deferredRecoveryReason === "max_iterations_boundary" ||
+              outcome.reason === "max_iterations_boundary";
             const sliceBoundaryReached = outcome.status === "stopped_no_action"
               && modelIterationsUsed >= goalInnerIterationLimit
-              && (
-                deferredNonActionableStop?.[1] === "no_action"
-                || deferredRecoveryReason === "max_iterations_boundary"
-              );
+              && exactMaxIterationBoundary;
             if (deferredNonActionableStop && !sliceBoundaryReached) {
               callbacks.onNonActionableStop(...deferredNonActionableStop);
             }
@@ -4733,6 +4868,24 @@ export class WorkflowEngine {
     };
 
     return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) => {
+      const terminalRecoveryReason = lastNonActionableStopDiagnostic?.recoveryReason || loopOutcome.reason;
+      const durableRecoveryMutations = getScopedDurableMutationEvidence();
+      if (
+        loopOutcome.status === "stopped_no_action" &&
+        terminalRecoveryReason === "execute_recovery_no_progress_limit" &&
+        durableRecoveryMutations.length > 0
+      ) {
+        loopOutcome = {
+          status: "paused",
+          reason: "execute_recovery_no_progress_limit",
+        };
+        logStoreEvent("durable_recovery_stop_normalized", {
+          fromStatus: "stopped_no_action",
+          toStatus: "paused",
+          recoveryReason: terminalRecoveryReason,
+          mutationTargets: durableRecoveryMutations.map((entry) => entry.target || entry.value),
+        });
+      }
       const parentTurnId = context.uiDisplayTurnId || turnId;
       const subagentFinalization = await finalizeCoordinatedSubagentsForParent({
         threadId: runSessionKey,
@@ -4823,6 +4976,14 @@ export class WorkflowEngine {
         hasPendingSameTurnExecution: !!pendingSameTurnExecution,
       })) {
         completedFinalTextForRemote = ensureCompletedTurnFinalPresentation(loopOutcome);
+      }
+      if (shouldCommitPausedTurnFinalPresentation({
+        outcomeStatus: loopOutcome.status,
+        recoveryReason: loopOutcome.reason,
+        hasDurableMutationEvidence: durableRecoveryMutations.length > 0,
+        hasPendingSameTurnExecution: !!pendingSameTurnExecution,
+      })) {
+        ensurePausedTurnFinalPresentation(loopOutcome);
       }
       if (shouldCanonicalizeTerminalTurnContext(loopOutcome.status) && !pendingSameTurnExecution) {
         latestState = commitTerminalTurnContext(loopOutcome);

@@ -52,7 +52,7 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
         : "",
       input.missingTasksArtifact
         ? "任务清单应保持 8-20 个以内，每项一句话，并带轻量 evidence 标签，例如 `— 证据: file:src/App.tsx`、`— 证据: cmd:npm test` 或 `— 证据: deliverable:REPORT.md`。"
-        : "允许的下一步只有：`read_file` 一次性读取缺失的精确源码窗口、`apply_patch`/`replace_in_file`/`write_file` 写入源码、`run_command`/`execute_command` 做真实命令验证、或 `browser_evaluate` 做 UI/DOM/截图验证。不要再读取 `.MAIN/plans/plan.md`，不要用 `cat`/`head`/`grep`/`rg` 通过 shell 翻源码。若读取了源码，下一轮必须写入或验证；完成任务前必须先产生真实工具证据。",
+        : "允许的下一步只有：`read_file` 一次性读取缺失的精确源码窗口、`apply_patch`/`replace_in_file`/`write_file` 写入源码、`run_command`/`execute_command` 做真实命令验证、`browser_evaluate` 做网页 UI/DOM/截图验证，或在桌面验收项且工具已开放时使用 `computer_use`。不要再读取 `.MAIN/plans/plan.md`，不要用 `cat`/`head`/`grep`/`rg` 通过 shell 翻源码。若读取了源码，下一轮必须写入或验证；完成任务前必须先产生真实工具证据。",
       "当前缺失证据：",
       remainingText,
       recentActivitySummary ? `最近工具结果：${recentActivitySummary}` : "",
@@ -72,7 +72,7 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
       : "",
     input.missingTasksArtifact
       ? "The task list should stay within 8-20 concise items and include lightweight evidence labels such as `- evidence: file:src/App.tsx`, `- evidence: cmd:npm test`, or `- evidence: deliverable:REPORT.md`."
-      : "The only allowed next steps are: one targeted `read_file` for the exact missing source window, `apply_patch`/`replace_in_file`/`write_file` for source edits, `run_command`/`execute_command` for real command validation, or `browser_evaluate` for UI/DOM/screenshot validation. Do not reread `.MAIN/plans/plan.md`, and do not use shell `cat`/`head`/`grep`/`rg` to page source. If you read source, the following turn must write or validate; completion requires real tool evidence.",
+      : "The only allowed next steps are: one targeted `read_file` for the exact missing source window, `apply_patch`/`replace_in_file`/`write_file` for source edits, `run_command`/`execute_command` for real command validation, `browser_evaluate` for web UI/DOM/screenshot validation, or `computer_use` for an exposed desktop acceptance item. Do not reread `.MAIN/plans/plan.md`, and do not use shell `cat`/`head`/`grep`/`rg` to page source. If you read source, the following turn must write or validate; completion requires real tool evidence.",
     "Missing evidence:",
     remainingText,
     recentActivitySummary ? `Recent tool result: ${recentActivitySummary}` : "",

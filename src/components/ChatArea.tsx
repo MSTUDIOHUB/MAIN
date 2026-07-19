@@ -882,7 +882,7 @@ function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh"
     const target = String(runningTool.target || runningTool.toolName || "").split("/").pop() || runningTool.toolName;
     const tableTools = new Set(["analyze_tabular_document", "query_tabular_document"]);
     const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "knowledge_search", "knowledge_get_excerpt", "get_project_skeleton"]);
-    const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "send_pty_input"]);
+    const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "computer_use", "send_pty_input"]);
     const toolName = String(runningTool.toolName || "");
     const prefix = language === "zh"
       ? completedToolCallCount > 0 ? `已完成 ${completedToolCallCount} 次，` : ""
@@ -3679,7 +3679,10 @@ export default function ChatArea({
       ? explicitFinalAgentIndex
       : legacyFinalVisibleAgentIndex;
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
-    const isFinishedTurn = isFinishedTurnStatus(turn.status);
+    // A runtime-owned assistant_final makes a recovery pause terminal for
+    // presentation purposes without claiming successful completion.
+    const isPausedWithFinalConclusion = turn.status === "paused" && explicitFinalAgentIndex >= 0;
+    const isFinishedTurn = isFinishedTurnStatus(turn.status) || isPausedWithFinalConclusion;
     const showReasoningDebug = config.reasoningDisplay !== "hidden";
     const substantiveIntermediateAgentBlockIds = new Set(blocks
       .map((block, idx) => ({ block, idx }))
@@ -3838,6 +3841,7 @@ export default function ChatArea({
     const isTurnCompletedOrStopped =
       turn.status === "done" ||
       turn.status === "completed_with_changes" ||
+      isPausedWithFinalConclusion ||
       turn.status === "stopped_no_action" ||
       turn.status === "stopped_no_output" ||
       turn.status === "error" ||
@@ -4421,6 +4425,7 @@ export default function ChatArea({
       runId={permissionActionRequest?.runId || capsuleHarnessIdentity?.runId || undefined}
       requestId={permissionActionRequest?.requestId || undefined}
       permissionIdentity={permissionResolutionIdentity || undefined}
+      permissionRisk={permissionActionRequest?.risk}
       status={capsuleStatusLabel}
       statusToneClass={getTurnStatusTone(capsuleControlTurnStatusKey || "awaiting_input")}
       language={language}

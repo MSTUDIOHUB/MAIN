@@ -533,6 +533,29 @@ test("tool review builds a run-owned permission request with an auditable target
   }), true);
 });
 
+test("desktop review target discloses constrained actions without exposing filled text", () => {
+  const request = pendingToolReview.buildToolPermissionActionRequest({
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    title: "Validate MAIN",
+    taskId: 10,
+    toolCall: {
+      name: "computer_use",
+      risk: "desktop_control",
+      arguments: {
+        app_name: "MAIN",
+        actions: "click: Open\nfill: File name => private-value\npress: Enter",
+        screenshot: true,
+      },
+    },
+    now: 43,
+  });
+  assert.equal(request.risk, "desktop_control");
+  assert.match(request.target, /^MAIN · click: Open; fill: File name => \[text\]; press: Enter · screenshot$/);
+  assert.doesNotMatch(request.target, /private-value/);
+});
+
 test("visible pending tool review resolves only the request exact task and turn", () => {
   const request = pendingToolReview.buildToolPermissionActionRequest({
     sessionKey: "session-1",

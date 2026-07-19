@@ -19,6 +19,13 @@ export interface CompletedTurnFinalPresentation {
   hasChanges: boolean;
 }
 
+export interface PausedTurnFinalPresentation {
+  text: string;
+  source: "durable_progress_checkpoint";
+  execution: DurableTurnExecutionSummary;
+  hasChanges: boolean;
+}
+
 export interface TerminalTurnOwnership {
   ownerTurnId: string;
   evidenceTurnIds: string[];
@@ -42,6 +49,23 @@ export function shouldCommitCompletedTurnFinalPresentation(input: {
   hasPendingSameTurnExecution?: boolean;
 }): boolean {
   return input.outcomeStatus === "completed" && input.hasPendingSameTurnExecution !== true;
+}
+
+/**
+ * A recovery budget boundary is a truthful terminal pause, not a no-action
+ * outcome, when this transaction already owns a durable workspace mutation.
+ * Other pauses (approval, user input, process control) keep their existing UI.
+ */
+export function shouldCommitPausedTurnFinalPresentation(input: {
+  outcomeStatus: string;
+  recoveryReason?: string | null;
+  hasDurableMutationEvidence: boolean;
+  hasPendingSameTurnExecution?: boolean;
+}): boolean {
+  return input.outcomeStatus === "paused" &&
+    input.recoveryReason === "execute_recovery_no_progress_limit" &&
+    input.hasDurableMutationEvidence &&
+    input.hasPendingSameTurnExecution !== true;
 }
 
 /**
@@ -183,6 +207,99 @@ function formatEvidenceFallback(
   }
 
   return sections.join("\n\n");
+}
+
+function mergeDurableMutationPaths(
+  execution: DurableTurnExecutionSummary,
+  paths: string[] | undefined,
+): DurableTurnExecutionSummary {
+  const durablePaths = (paths || [])
+    .map((path) => String(path || "").trim())
+    .filter(Boolean);
+  if (durablePaths.length === 0) return execution;
+  return {
+    ...execution,
+    modifiedFiles: [...new Set([...execution.modifiedFiles, ...durablePaths])],
+  };
+}
+
+function formatPausedEvidenceCheckpoint(input: {
+  execution: DurableTurnExecutionSummary;
+  nextStep?: string | null;
+  language: "zh" | "en";
+}): string {
+  const { execution, language } = input;
+  const done: string[] = [
+    ...execution.modifiedFiles.map((path) =>
+      language === "zh" ? `已修改 \`${path}\`` : `Modified \`${path}\``
+    ),
+    ...execution.artifacts.map((path) =>
+      language === "zh" ? `已生成产物 \`${path}\`` : `Created artifact \`${path}\``
+    ),
+  ];
+  if (done.length === 0) {
+    done.push(language === "zh" ? "已保留本轮持久执行证据。" : "Preserved this run's durable execution evidence.");
+  }
+  const unfinished = execution.unfinished.length > 0
+    ? execution.unfinished
+    : [language === "zh" ? "剩余修改或验证尚未完成。" : "Remaining changes or validation are not complete."];
+  const validations = execution.validations.length > 0
+    ? bulletList(execution.validations)
+    : [language === "zh" ? "- 未记录独立的自动验证结果。" : "- No separate automated validation was recorded."];
+  const nextStep = String(input.nextStep || "").trim() || (language === "zh"
+    ? "从保留的证据检查点恢复尚未完成的精确修改或验证。"
+    : "Resume the exact unfinished mutation or validation from the preserved evidence checkpoint.");
+  const sections = [
+    language === "zh"
+      ? "本轮执行已暂停，已完成的修改与持久证据均已保留。"
+      : "This run is paused. Completed changes and durable evidence have been preserved.",
+    [language === "zh" ? "已做" : "Done", ...bulletList(done)].join("\n"),
+    [language === "zh" ? "未做" : "Not done", ...bulletList(unfinished)].join("\n"),
+    [language === "zh" ? "验证" : "Validation", ...validations].join("\n"),
+  ];
+  if (execution.failures.length > 0) {
+    sections.push([
+      language === "zh" ? "执行中发现的问题" : "Problems found during execution",
+      ...bulletList(execution.failures),
+    ].join("\n"));
+  }
+  if (execution.advisories.length > 0) {
+    sections.push(formatAdvisorySection(execution.advisories, language));
+  }
+  sections.push([language === "zh" ? "下一步" : "Next step", `- ${nextStep}`].join("\n"));
+  return sections.join("\n\n");
+}
+
+/**
+ * Build a runtime-owned, non-success conclusion for a paused execution. Model
+ * progress prose is intentionally ignored; only durable blocks, Plan state,
+ * and the trusted recovery checkpoint participate in this presentation.
+ */
+export function resolvePausedTurnFinalPresentation(input: {
+  turnBlocks: TaskBlock[];
+  artifactPaths?: string[];
+  unfinished?: string[];
+  advisories?: string[];
+  durableMutationPaths?: string[];
+  nextStep?: string | null;
+  language: "zh" | "en";
+}): PausedTurnFinalPresentation {
+  const execution = mergeDurableMutationPaths(collectDurableTurnExecutionSummary({
+    turnBlocks: input.turnBlocks,
+    artifactPaths: input.artifactPaths,
+    unfinished: input.unfinished,
+    advisories: input.advisories,
+  }), input.durableMutationPaths);
+  return {
+    text: formatPausedEvidenceCheckpoint({
+      execution,
+      nextStep: input.nextStep,
+      language: input.language,
+    }),
+    source: "durable_progress_checkpoint",
+    execution,
+    hasChanges: execution.modifiedFiles.length > 0,
+  };
 }
 
 /**

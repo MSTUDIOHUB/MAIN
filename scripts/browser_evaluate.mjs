@@ -10,6 +10,66 @@ const MAX_FAILED_REQUESTS = 40;
 const MAX_SAVED_SCREENSHOTS = 20;
 const DEFAULT_TIMEOUT_MS = 15_000;
 const MAX_FAILURE_SUMMARY_CHARS = 1200;
+const MAX_INTERACTIVE_ELEMENT_INVENTORY = 32;
+const MAX_INVENTORY_TEXT_CHARS = 120;
+
+function stableHash(value) {
+  let hash = 2166136261;
+  const text = String(value || "");
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function normalizeFingerprintPart(value) {
+  return String(value ?? "").replace(/\s+/g, " ").trim();
+}
+
+function buildStableFingerprint(kind, ...parts) {
+  const canonical = [kind, ...parts].map(normalizeFingerprintPart).join("\u001f");
+  return `${kind}-${stableHash(canonical)}`;
+}
+
+function createValidationSpecError(details) {
+  const code = normalizeFingerprintPart(details.code || "invalid_validation_spec");
+  const message = normalizeFingerprintPart(details.message || "The browser validation specification is invalid.");
+  const phase = normalizeFingerprintPart(details.phase || "validation");
+  const actionKind = normalizeFingerprintPart(details.actionKind);
+  const selector = normalizeFingerprintPart(details.selector);
+  const expectedText = normalizeFingerprintPart(details.expectedText);
+  const actionFingerprint = details.actionFingerprint || (actionKind
+    ? buildStableFingerprint("action", actionKind, selector || details.actionValue)
+    : null);
+  const selectorFingerprint = details.selectorFingerprint || (selector
+    ? buildStableFingerprint("selector", selector)
+    : null);
+  const validationSpecError = {
+    code,
+    message,
+    phase,
+    actionId: details.actionId || null,
+    actionIndex: Number.isInteger(details.actionIndex) ? details.actionIndex : null,
+    actionKind: actionKind || null,
+    selector: selector || null,
+    expectedText: expectedText || null,
+    actionFingerprint,
+    selectorFingerprint,
+    fingerprint: buildStableFingerprint(
+      "validation-spec",
+      code,
+      phase,
+      actionKind,
+      selector,
+      expectedText,
+    ),
+  };
+  const error = new Error(message);
+  error.name = "ValidationSpecError";
+  error.validationSpecError = validationSpecError;
+  return error;
+}
 
 function clampNumber(value, fallback, min, max) {
   const parsed = Number(value);
@@ -116,7 +176,7 @@ async function bodyText(page) {
 }
 
 async function inspectRenderedPage(page) {
-  return await page.evaluate(() => {
+  return await page.evaluate(({ maxItems, maxTextChars }) => {
     const body = document.body;
     if (!body) {
       return {
@@ -127,9 +187,27 @@ async function inspectRenderedPage(page) {
         visibleMediaElementCount: 0,
         visibleBackgroundImageCount: 0,
         visiblePseudoContentCount: 0,
+        interactiveElements: [],
+        interactiveElementInventoryTruncated: false,
         blankPage: true,
       };
     }
+
+    const stableHash = (value) => {
+      let hash = 2166136261;
+      const text = String(value || "");
+      for (let index = 0; index < text.length; index += 1) {
+        hash ^= text.charCodeAt(index);
+        hash = Math.imul(hash, 16777619);
+      }
+      return (hash >>> 0).toString(36);
+    };
+    const trimText = (value) => String(value || "").replace(/\s+/g, " ").trim().slice(0, maxTextChars);
+    const escapeAttribute = (value) => String(value || "").replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    const escapeCssIdentifier = (value) => {
+      if (globalThis.CSS?.escape) return globalThis.CSS.escape(String(value || ""));
+      return String(value || "").replace(/([^a-zA-Z0-9_-])/g, "\\$1");
+    };
 
     const isVisible = (element) => {
       const style = window.getComputedStyle(element);
@@ -187,6 +265,38 @@ async function inspectRenderedPage(page) {
     }).length;
     const visibleText = typeof body.innerText === "string" ? body.innerText : body.textContent || "";
     const normalizedText = String(visibleText).replace(/\s+/g, "").trim();
+    const visibleInteractiveElements = visibleElements.filter((element) => element.matches(interactiveSelector));
+    const interactiveElements = visibleInteractiveElements.slice(0, maxItems).map((element) => {
+      const tag = element.tagName.toLowerCase();
+      const type = "type" in element ? trimText(element.type) : "";
+      const role = trimText(element.getAttribute("role"));
+      const id = trimText(element.id);
+      const name = trimText(element.getAttribute("name"));
+      const ariaLabel = trimText(element.getAttribute("aria-label"));
+      const placeholder = trimText(element.getAttribute("placeholder"));
+      const testId = trimText(element.getAttribute("data-testid"));
+      const text = trimText(element.textContent);
+      const selectorCandidates = [];
+      if (id) selectorCandidates.push(`#${escapeCssIdentifier(id)}`);
+      if (testId) selectorCandidates.push(`[data-testid="${escapeAttribute(testId)}"]`);
+      if (ariaLabel) selectorCandidates.push(`${tag}[aria-label="${escapeAttribute(ariaLabel)}"]`);
+      if (name) selectorCandidates.push(`${tag}[name="${escapeAttribute(name)}"]`);
+      if (selectorCandidates.length === 0 && type) selectorCandidates.push(`${tag}[type="${escapeAttribute(type)}"]`);
+      if (selectorCandidates.length === 0) selectorCandidates.push(tag);
+      return {
+        tag,
+        type,
+        role,
+        id,
+        name,
+        text,
+        ariaLabel,
+        placeholder,
+        testId,
+        selectorCandidates: selectorCandidates.slice(0, 4),
+        fingerprint: `interactive-${stableHash([tag, type, role, id, name, ariaLabel, placeholder, testId, text].join("\u001f"))}`,
+      };
+    });
     const blankPage = normalizedText.length === 0 &&
       visibleMeaningfulElementCount === 0 &&
       visibleBackgroundImageCount === 0 &&
@@ -200,8 +310,13 @@ async function inspectRenderedPage(page) {
       visibleMediaElementCount,
       visibleBackgroundImageCount,
       visiblePseudoContentCount,
+      interactiveElements,
+      interactiveElementInventoryTruncated: visibleInteractiveElements.length > interactiveElements.length,
       blankPage,
     };
+  }, {
+    maxItems: MAX_INTERACTIVE_ELEMENT_INVENTORY,
+    maxTextChars: MAX_INVENTORY_TEXT_CHARS,
   });
 }
 
@@ -218,7 +333,10 @@ async function capturePageDiagnostics(page, result) {
     // Keep the navigation result even when body extraction itself fails.
   }
   try {
-    result.renderDiagnostics = await inspectRenderedPage(page);
+    const inspection = await inspectRenderedPage(page);
+    const { interactiveElements, ...renderDiagnostics } = inspection;
+    result.renderDiagnostics = renderDiagnostics;
+    result.interactiveElements = interactiveElements;
     result.blankPage = result.renderDiagnostics.blankPage === true;
   } catch {
     // A page can disappear during failed navigation; retain the other diagnostics.
@@ -254,7 +372,14 @@ function finalizeValidationOutcome(result, failOnConsoleError) {
     if (normalized) summaries.push(`${reason}: ${normalized}`);
   };
 
-  if (result.error) addFailure("runtime_error", result.error);
+  if (result.validationSpecError) {
+    addFailure(
+      "validation_spec_error",
+      `${result.validationSpecError.code}: ${result.validationSpecError.message}`,
+    );
+  } else if (result.error) {
+    addFailure("runtime_error", result.error);
+  }
   if (typeof result.status === "number" && (result.status < 200 || result.status >= 400)) {
     addFailure("http_status", `navigation returned HTTP ${result.status}`);
   }
@@ -270,7 +395,7 @@ function finalizeValidationOutcome(result, failOnConsoleError) {
   }
   const failedAction = result.actions.find((item) => item.ok === false);
   if (failedAction) addFailure("action_failed", `${failedAction.kind}: ${failedAction.value}`);
-  const pageWasReached = typeof result.status === "number" || (result.finalUrl && result.finalUrl !== "about:blank");
+  const pageWasReached = result.navigationCompleted === true;
   if (result.blankPage && pageWasReached) {
     const diagnostics = result.renderDiagnostics || {};
     addFailure(
@@ -281,8 +406,35 @@ function finalizeValidationOutcome(result, failOnConsoleError) {
   if (result.screenshotError) addFailure("screenshot_failed", result.screenshotError);
 
   result.failureReasons = reasons;
+  result.failureType = result.validationSpecError ? "validation_spec_error" : reasons[0] || null;
   result.failureSummary = summaries.join(" | ").slice(0, MAX_FAILURE_SUMMARY_CHARS);
   result.ok = reasons.length === 0;
+  result.failedAction = failedAction
+    ? {
+        id: failedAction.id,
+        index: failedAction.index,
+        kind: failedAction.kind,
+        value: failedAction.value,
+        selector: failedAction.selector || null,
+        error: failedAction.error || null,
+        actionFingerprint: failedAction.actionFingerprint || null,
+        selectorFingerprint: failedAction.selectorFingerprint || null,
+      }
+    : null;
+  result.failureFingerprint = reasons.length === 0
+    ? null
+    : buildStableFingerprint(
+        "browser-failure",
+        result.url || result.finalUrl,
+        result.validationSpecError?.fingerprint,
+        reasons.join(","),
+        failedAction?.actionFingerprint,
+        failedAssertion ? `${failedAssertion.kind}:${failedAssertion.value}` : "",
+        result.status,
+        result.blankPage,
+        result.pageErrors[0],
+        result.consoleErrors[0],
+      );
 }
 
 function describeWaitForTextFailure(error, expectedText, title) {
@@ -300,6 +452,50 @@ function describeWaitForTextFailure(error, expectedText, title) {
     ].join("\n");
   }
   return message;
+}
+
+function waitForTextSpecError(error, expectedText, title, details = {}) {
+  const message = error?.message || String(error);
+  const expected = String(expectedText || "").trim();
+  const pageTitle = String(title || "").trim();
+  if (!expected || !pageTitle.includes(expected) || !/timeout/i.test(message)) return null;
+  return createValidationSpecError({
+    code: "body_text_matches_title_only",
+    message: describeWaitForTextFailure(error, expected, pageTitle),
+    phase: details.phase || "wait_for_text",
+    actionId: details.actionId,
+    actionIndex: details.actionIndex,
+    actionKind: details.actionKind || "wait_for_text",
+    actionValue: expected,
+    expectedText: expected,
+    actionFingerprint: details.actionFingerprint,
+  });
+}
+
+function pageReachedSuccessfully(result) {
+  if (result.navigationCompleted !== true) return false;
+  if (typeof result.status === "number") return result.status >= 200 && result.status < 400;
+  return Boolean(result.finalUrl && result.finalUrl !== "about:blank");
+}
+
+async function selectorSpecError(page, result, error, details) {
+  if (!details.selector || !pageReachedSuccessfully(result)) return null;
+  let count;
+  try {
+    count = await page.locator(details.selector).count();
+  } catch (selectorError) {
+    return createValidationSpecError({
+      ...details,
+      code: "invalid_selector",
+      message: `Invalid selector "${details.selector}": ${selectorError?.message || String(selectorError)}`,
+    });
+  }
+  if (count !== 0) return null;
+  return createValidationSpecError({
+    ...details,
+    code: "selector_not_found",
+    message: `Selector "${details.selector}" matched no elements on the successfully loaded page. Inspect interactiveElements for available locator candidates. Original error: ${error?.message || String(error)}`,
+  });
 }
 
 function pushBounded(list, item, max) {
@@ -522,11 +718,18 @@ async function runActions(page, input, result, timeoutMs, workspace, assertionTr
     const line = actionLines[index];
     const { kind, value } = parseDirective(line, "click");
     const selector = selectorForAction(kind, value);
+    const actionFingerprint = buildStableFingerprint("action", kind, value);
+    const selectorFingerprint = selector ? buildStableFingerprint("selector", selector) : null;
     const action = {
       id: `action-${index + 1}`,
+      index: index + 1,
       kind,
       value,
+      selector: selector || null,
+      actionFingerprint,
+      selectorFingerprint,
       ok: false,
+      error: null,
       beforeState: STATEFUL_ACTION_KINDS.has(kind)
         ? await captureInteractionState(page, selector)
         : null,
@@ -538,38 +741,83 @@ async function runActions(page, input, result, timeoutMs, workspace, assertionTr
       effectStateChanged: false,
     };
     result.actions.push(action);
-    if (!value && kind !== "no_console_errors") throw new Error(`Action ${kind} requires a value.`);
-
-    if (kind === "click") {
-      await page.locator(value).first().click({ timeout: timeoutMs });
-    } else if (kind === "fill") {
-      const [selector, text] = splitSelectorValue(value);
-      if (!selector) throw new Error("fill requires selector => text.");
-      await page.locator(selector).first().fill(text, { timeout: timeoutMs });
-    } else if (kind === "press") {
-      const [selector, key] = splitSelectorValue(value);
-      if (!selector || !key) throw new Error("press requires selector => key.");
-      await page.locator(selector).first().press(key, { timeout: timeoutMs });
-    } else if (kind === "select_file" || kind === "set_input_files" || kind === "upload") {
-      const [selector, filePath] = splitSelectorValue(value);
-      if (!selector || !filePath) throw new Error("select_file requires selector => relative/path.");
-      await page.locator(selector).first().setInputFiles(resolveWorkspaceFile(filePath, workspace), { timeout: timeoutMs });
-    } else if (kind === "wait_for_selector" || kind === "wait_selector") {
-      await page.locator(value).first().waitFor({ state: "visible", timeout: timeoutMs });
-    } else if (kind === "wait_for_text" || kind === "wait_text") {
-      try {
-        await page.waitForFunction(
-          (needle) => document.body?.innerText?.includes(needle),
-          value,
-          { timeout: timeoutMs },
-        );
-      } catch (error) {
-        throw new Error(describeWaitForTextFailure(error, value, result.title));
+    try {
+      if (!value && kind !== "no_console_errors") {
+        throw createValidationSpecError({
+          code: "missing_action_value",
+          message: `Action ${kind} requires a value.`,
+          phase: "action",
+          actionId: action.id,
+          actionIndex: action.index,
+          actionKind: kind,
+          actionValue: value,
+          actionFingerprint,
+          selector,
+          selectorFingerprint,
+        });
       }
-    } else if (kind === "wait") {
-      await page.waitForTimeout(clampNumber(value, 500, 0, Math.min(timeoutMs, 10_000)));
-    } else {
-      throw new Error(`Unsupported browser action: ${kind}`);
+
+      if (kind === "click") {
+        await page.locator(value).first().click({ timeout: timeoutMs });
+      } else if (kind === "fill") {
+        const [selector, text] = splitSelectorValue(value);
+        if (!selector) throw new Error("fill requires selector => text.");
+        await page.locator(selector).first().fill(text, { timeout: timeoutMs });
+      } else if (kind === "press") {
+        const [selector, key] = splitSelectorValue(value);
+        if (!selector || !key) throw new Error("press requires selector => key.");
+        await page.locator(selector).first().press(key, { timeout: timeoutMs });
+      } else if (kind === "select_file" || kind === "set_input_files" || kind === "upload") {
+        const [selector, filePath] = splitSelectorValue(value);
+        if (!selector || !filePath) throw new Error("select_file requires selector => relative/path.");
+        await page.locator(selector).first().setInputFiles(resolveWorkspaceFile(filePath, workspace), { timeout: timeoutMs });
+      } else if (kind === "wait_for_selector" || kind === "wait_selector") {
+        await page.locator(value).first().waitFor({ state: "visible", timeout: timeoutMs });
+      } else if (kind === "wait_for_text" || kind === "wait_text") {
+        try {
+          await page.waitForFunction(
+            (needle) => document.body?.innerText?.includes(needle),
+            value,
+            { timeout: timeoutMs },
+          );
+        } catch (error) {
+          throw waitForTextSpecError(error, value, result.title, {
+            phase: "action",
+            actionId: action.id,
+            actionIndex: action.index,
+            actionKind: kind,
+            actionFingerprint,
+          }) || error;
+        }
+      } else if (kind === "wait") {
+        await page.waitForTimeout(clampNumber(value, 500, 0, Math.min(timeoutMs, 10_000)));
+      } else {
+        throw createValidationSpecError({
+          code: "unsupported_action",
+          message: `Unsupported browser action: ${kind}`,
+          phase: "action",
+          actionId: action.id,
+          actionIndex: action.index,
+          actionKind: kind,
+          actionValue: value,
+          actionFingerprint,
+          selector,
+          selectorFingerprint,
+        });
+      }
+    } catch (error) {
+      const validationSpecError = error?.validationSpecError || await selectorSpecError(page, result, error, {
+        phase: "action",
+        actionId: action.id,
+        actionIndex: action.index,
+        actionKind: kind,
+        actionValue: value,
+        actionFingerprint,
+        selector,
+        selectorFingerprint,
+      });
+      action.error = validationSpecError?.message || error?.message || String(error);
+      throw validationSpecError || error;
     }
     action.ok = true;
     if (STATEFUL_ACTION_KINDS.has(kind)) {
@@ -636,6 +884,10 @@ async function main() {
     ok: false,
     failureSummary: "",
     failureReasons: [],
+    failureFingerprint: null,
+    failureType: null,
+    validationSpecError: null,
+    failedAction: null,
     blankPage: false,
     url: normalizedUrl,
     finalUrl: "",
@@ -650,9 +902,11 @@ async function main() {
     screenshotPath: null,
     screenshotError: null,
     renderDiagnostics: null,
+    interactiveElements: [],
     textPreview: "",
     durationMs: 0,
     error: null,
+    navigationCompleted: false,
   };
 
   let browser;
@@ -687,6 +941,7 @@ async function main() {
 
     const response = await page.goto(normalizedUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
     result.status = response?.status() ?? null;
+    result.navigationCompleted = true;
     await capturePageDiagnostics(page, result);
 
     try {
@@ -700,10 +955,20 @@ async function main() {
     }
 
     if (input.waitForSelector || input.wait_for_selector) {
-      await page.locator(String(input.waitForSelector || input.wait_for_selector)).first().waitFor({
-        state: "visible",
-        timeout: timeoutMs,
-      });
+      const selector = String(input.waitForSelector || input.wait_for_selector);
+      try {
+        await page.locator(selector).first().waitFor({
+          state: "visible",
+          timeout: timeoutMs,
+        });
+      } catch (error) {
+        throw await selectorSpecError(page, result, error, {
+          phase: "wait_for_selector",
+          actionKind: "wait_for_selector",
+          actionValue: selector,
+          selector,
+        }) || error;
+      }
     }
     if (input.waitForText || input.wait_for_text) {
       const expectedText = String(input.waitForText || input.wait_for_text);
@@ -714,7 +979,10 @@ async function main() {
           { timeout: timeoutMs },
         );
       } catch (error) {
-        throw new Error(describeWaitForTextFailure(error, expectedText, result.title));
+        throw waitForTextSpecError(error, expectedText, result.title, {
+          phase: "wait_for_text",
+          actionKind: "wait_for_text",
+        }) || error;
       }
     }
 
@@ -725,6 +993,7 @@ async function main() {
     await capturePageDiagnostics(page, result);
   } catch (error) {
     result.error = error?.message || String(error);
+    result.validationSpecError = error?.validationSpecError || null;
   } finally {
     if (page) {
       try {

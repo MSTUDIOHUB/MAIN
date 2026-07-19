@@ -69,6 +69,7 @@ const {
   isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
   resolveApprovedPlanInitialExecutionRecovery,
+  resolveApprovedPlanRecoveryReconciliation,
   resolveApprovedPlanSameTurnFallbackDecision,
   resolveExecuteMaxIterationsRecoveryDecision,
   summarizeRepeatedPlanTargetsFromToolActivity,
@@ -192,6 +193,140 @@ test("approved Plan recovery advances to the next unsatisfied task identity", ()
   });
   assert.equal(batch.selectedCallId, "launch-dev");
   assert.deepEqual(batch.deferredCallIds, []);
+});
+
+test("approved Plan recovery rebases same-file tasks by durable task identity", () => {
+  const tasks = [
+    {
+      id: "main-open",
+      requirementRef: "REQ-OPEN",
+      text: "Fix open handling",
+      status: "in_progress",
+      evidenceStatus: "partial",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    },
+    {
+      id: "main-tab",
+      requirementRef: "REQ-TAB",
+      text: "Fix initial tab",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    },
+  ];
+  const evidenceLedger = [{
+    id: "open-mutation",
+    planTaskId: "main-open",
+    requirementRef: "REQ-OPEN",
+    kind: "file",
+    value: "src/main.js",
+    target: "src/main.js",
+    sourceTool: "replace_in_file",
+    createdAt: 1,
+  }];
+  const decision = resolveApprovedPlanRecoveryReconciliation({
+    tasks,
+    evidenceLedger,
+    current: {
+      mode: "validation_only",
+      reason: "recovery_mutation_observed",
+      expectedTarget: "src/main.js",
+      decisionCheckpoint: {
+        planTaskId: "main-open",
+        requirementRef: "REQ-OPEN",
+        nextRequiredCapability: "validation",
+      },
+    },
+  });
+
+  assert.equal(decision.action, "advance");
+  assert.equal(decision.next?.decisionCheckpoint?.planTaskId, "main-tab");
+  assert.equal(decision.next?.expectedTarget, "src/main.js");
+});
+
+test("approved Plan durable rebase runs before the iteration tool surface is selected", () => {
+  const source = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/iterationStreamPreparation.ts"),
+    "utf8",
+  );
+  const rebaseIndex = source.indexOf("resolveApprovedPlanRecoveryReconciliation({");
+  const surfaceIndex = source.indexOf("resolveIterationToolSurface({");
+  const boundaryIndex = source.indexOf("shouldReleaseExecuteRecoveryPolicyBoundary({");
+
+  assert.ok(rebaseIndex >= 0 && rebaseIndex < surfaceIndex);
+  assert.ok(boundaryIndex > rebaseIndex && boundaryIndex < surfaceIndex);
+  assert.match(source, /policy_no_progress_boundary_released/);
+  assert.match(source, /normal_surface_continuation/);
+});
+
+test("approved Plan recovery preserves an in-flight subphase of the same obligation", () => {
+  const task = {
+    id: "edit-main",
+    requirementRef: "REQ-MAIN",
+    text: "Modify main",
+    status: "pending",
+    evidenceStatus: "missing",
+    evidence: [{ kind: "file", value: "src/main.js" }],
+  };
+  const decision = resolveApprovedPlanRecoveryReconciliation({
+    tasks: [task],
+    current: {
+      mode: "patch_recovery_read",
+      reason: "recovery_context_required",
+      expectedTarget: "src/main.js",
+      decisionCheckpoint: {
+        planTaskId: "edit-main",
+        requirementRef: "REQ-MAIN",
+        nextRequiredCapability: "targeted_read",
+      },
+    },
+  });
+
+  assert.equal(decision.action, "unchanged");
+});
+
+test("approved Plan reconciliation does not undo a source-attributed validation repair", () => {
+  const task = {
+    id: "browser-check",
+    requirementRef: "REQ-BROWSER",
+    text: "Verify the Open interaction",
+    status: "in_progress",
+    evidenceStatus: "requires_browser_validation",
+    evidence: [{ kind: "browser_dom", value: "browser interaction: Open" }],
+  };
+  const decision = resolveApprovedPlanRecoveryReconciliation({
+    tasks: [task],
+    current: {
+      mode: "mutation_first",
+      reason: "browser_validation_source_attributed",
+      expectedTarget: "src/components/toolbar.js",
+      decisionCheckpoint: {
+        planTaskId: "browser-check",
+        requirementRef: "REQ-BROWSER",
+        nextRequiredCapability: "mutation",
+      },
+    },
+  });
+
+  assert.equal(decision.action, "unchanged");
+});
+
+test("approved Plan exposes desktop validation only when computer control is actually available", () => {
+  const task = {
+    id: "desktop-check",
+    text: "Validate the Tauri window",
+    status: "in_progress",
+    evidenceStatus: "requires_tauri_validation",
+    evidence: [{ kind: "tauri_required", value: "tauri runtime validation" }],
+  };
+  assert.equal(resolveApprovedPlanInitialExecutionRecovery([task]), null);
+
+  const recovery = resolveApprovedPlanInitialExecutionRecovery([task], [], {
+    availableToolNames: new Set(["computer_use", "run_command"]),
+  });
+  assert.equal(recovery?.mode, "validation_only");
+  assert.equal(recovery?.decisionCheckpoint?.nextRequiredCapability, "desktop_validation");
+  assert.equal(recovery?.decisionCheckpoint?.planTaskId, "desktop-check");
 });
 
 test("approved Plan store handoff forwards the derived recovery state", () => {

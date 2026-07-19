@@ -52,7 +52,12 @@ function loadTranspiledModuleSync(sourcePath) {
   return module.exports;
 }
 
-const { buildChatRenderSegments } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolUiGrouping.ts"));
+const {
+  buildChatRenderSegments,
+  buildRepeatedBrowserFailureSignature,
+  getRepeatedBrowserFailureCallsForUi,
+  summarizeBrowserFailureForUi,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/toolUiGrouping.ts"));
 const { dedupeModelFeedbackText, createModelFeedbackDedupeState } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/modelFeedbackDedupe.ts"));
 
 test("model feedback plus three reads renders as one collapsed operation cluster", () => {
@@ -149,4 +154,105 @@ test("dedupe keeps substantive repeated-looking findings but suppresses thin dup
   assert.equal(second.shouldSuppress, true);
   assert.equal(second.reason, "thin_duplicate");
   assert.equal(finding.shouldSuppress, false);
+});
+
+function failedBrowserBlock({
+  id,
+  selector = "#new-file-btn",
+  reason = `runtime_error: locator.click: Timeout 15000ms exceeded. Call log: - waiting for locator('${selector}').first() | action_failed: click: ${selector}`,
+  screenshot = `.MAIN/browser-validation/browser-${id}.png`,
+  requestedChecks,
+}) {
+  const result = {
+    ok: false,
+    failureSummary: reason,
+    failureReasons: ["runtime_error", "action_failed"],
+    actions: [{ id: "action-1", kind: "click", value: selector, ok: false }],
+    screenshotPath: screenshot,
+    ...(requestedChecks ? { requestedChecks } : {}),
+  };
+  return {
+    id,
+    type: "tool",
+    toolName: "browser_evaluate",
+    toolStatus: "failed",
+    target: "http://localhost:1420/",
+    message: `BROWSER_VALIDATION_FAILED: ${reason}\n${JSON.stringify(result)}`,
+    evidence: `evidence-${id}`,
+  };
+}
+
+test("identical consecutive browser failures collapse into one card with every raw call retained", () => {
+  const blocks = [
+    failedBrowserBlock({ id: 11 }),
+    failedBrowserBlock({ id: 12 }),
+    failedBrowserBlock({ id: 13 }),
+  ];
+  const segments = buildChatRenderSegments({ blocks, language: "zh" });
+
+  assert.equal(segments.length, 1);
+  assert.equal(segments[0].kind, "block");
+  assert.equal(segments[0].index, 0);
+  const grouped = JSON.parse(segments[0].block.message);
+  assert.equal(grouped.type, "MAIN_REPEATED_BROWSER_FAILURE");
+  assert.equal(grouped.repeatCount, 3);
+  assert.deepEqual(grouped.calls.map((call) => call.id), [11, 12, 13]);
+  assert.deepEqual(grouped.calls.map((call) => call.evidence), ["evidence-11", "evidence-12", "evidence-13"]);
+  assert.match(grouped.calls[2].message, /browser-13\.png/);
+
+  const summary = summarizeBrowserFailureForUi({
+    message: segments[0].block.message,
+    language: "zh",
+  });
+  assert.equal(summary.action, "click");
+  assert.equal(summary.selector, "#new-file-btn");
+  assert.equal(summary.repeatCount, 3);
+  assert.match(summary.reason, /选择器超时/);
+  const retainedCalls = getRepeatedBrowserFailureCallsForUi(segments[0].block.message);
+  assert.equal(retainedCalls.length, 3);
+  assert.match(retainedCalls[0].message, /BROWSER_VALIDATION_FAILED/);
+});
+
+test("browser failure grouping keeps distinct selectors, errors, specs, and interrupted calls separate", () => {
+  const selectorA = failedBrowserBlock({ id: 21, selector: "#new-file-btn" });
+  const selectorB = failedBrowserBlock({ id: 22, selector: "#new-btn" });
+  assert.notEqual(buildRepeatedBrowserFailureSignature(selectorA), buildRepeatedBrowserFailureSignature(selectorB));
+
+  const reasonA = failedBrowserBlock({ id: 23, reason: "assertion_failed: expected text A" });
+  const reasonB = failedBrowserBlock({ id: 24, reason: "assertion_failed: expected text B" });
+  assert.notEqual(buildRepeatedBrowserFailureSignature(reasonA), buildRepeatedBrowserFailureSignature(reasonB));
+
+  const specA = failedBrowserBlock({ id: 25, requestedChecks: ["text: created"] });
+  const specB = failedBrowserBlock({ id: 26, requestedChecks: ["selector: #editor"] });
+  assert.notEqual(buildRepeatedBrowserFailureSignature(specA), buildRepeatedBrowserFailureSignature(specB));
+
+  const interrupted = buildChatRenderSegments({
+    language: "zh",
+    blocks: [
+      failedBrowserBlock({ id: 31 }),
+      { id: 32, type: "agent", content: "检查源码后再重试。", streaming: false },
+      failedBrowserBlock({ id: 33 }),
+    ],
+  });
+  assert.equal(interrupted.length, 3);
+  assert.ok(interrupted.every((segment) => segment.kind === "block"));
+});
+
+test("browser failure summary explains the page-title versus body-text mismatch", () => {
+  const reason = 'runtime_error: page.waitForFunction: Timeout 15000ms exceeded. wait_for_text only searches document.body text; "MD Viewer" matches the current page title "MD Viewer" instead.';
+  const result = {
+    ok: false,
+    failureSummary: reason,
+    failureReasons: ["runtime_error", "action_failed"],
+    actions: [{ kind: "wait_for_text", value: "MD Viewer", ok: false }],
+  };
+  const summary = summarizeBrowserFailureForUi({
+    message: `BROWSER_VALIDATION_FAILED: ${reason}\n${JSON.stringify(result)}`,
+    language: "zh",
+  });
+
+  assert.equal(summary.action, "wait_for_text");
+  assert.equal(summary.selector, "MD Viewer");
+  assert.match(summary.reason, /正文未出现目标文本/);
+  assert.match(summary.reason, /页面标题/);
 });

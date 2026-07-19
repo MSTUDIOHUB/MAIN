@@ -1,4 +1,5 @@
 import { createModelFeedbackDedupeState, dedupeModelFeedbackText, isThinModelToolNarration } from "./modelFeedbackDedupe";
+import { parseBrowserValidationRecord } from "./browserValidation";
 import { compactToolPresentationTarget, getToolPresentationLabel } from "./toolPresentation";
 
 export interface ToolUiGroupBlock {
@@ -15,6 +16,264 @@ export interface ToolUiGroupBlock {
   content?: string;
   streaming?: boolean;
   hiddenProcess?: boolean;
+  evidence?: string;
+}
+
+const REPEATED_BROWSER_FAILURE_GROUP_TYPE = "MAIN_REPEATED_BROWSER_FAILURE";
+
+export interface RepeatedBrowserFailureCall {
+  id?: string | number;
+  target?: string;
+  message?: string;
+  evidence?: string;
+  observationSummary?: string;
+  intentSummary?: string;
+  why?: string;
+}
+
+interface RepeatedBrowserFailurePayload {
+  type: typeof REPEATED_BROWSER_FAILURE_GROUP_TYPE;
+  repeatCount: number;
+  calls: RepeatedBrowserFailureCall[];
+}
+
+export interface BrowserFailureUiSummary {
+  action: string;
+  selector: string;
+  reason: string;
+  repeatCount: number;
+  failureCodes: string[];
+}
+
+function normalizeUiText(value: unknown): string {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function parseJsonRecord(value: unknown): Record<string, unknown> | null {
+  const raw = String(value || "").trim();
+  if (!raw) return null;
+  const candidates = [raw];
+  if (raw.startsWith("BROWSER_VALIDATION_FAILED:") && raw.includes("\n")) {
+    candidates.unshift(raw.slice(raw.indexOf("\n") + 1).trim());
+  }
+  for (const candidate of candidates) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
+    } catch {
+      // Browser errors may carry a human-readable prefix before the JSON payload.
+    }
+  }
+  return null;
+}
+
+function parseRepeatedBrowserFailurePayload(value: unknown): RepeatedBrowserFailurePayload | null {
+  const parsed = parseJsonRecord(value);
+  if (
+    parsed?.type !== REPEATED_BROWSER_FAILURE_GROUP_TYPE ||
+    !Array.isArray(parsed.calls)
+  ) {
+    return null;
+  }
+  const calls = parsed.calls.filter((call) => call && typeof call === "object") as RepeatedBrowserFailureCall[];
+  if (calls.length === 0) return null;
+  return {
+    type: REPEATED_BROWSER_FAILURE_GROUP_TYPE,
+    repeatCount: Math.max(calls.length, Number(parsed.repeatCount) || 0),
+    calls,
+  };
+}
+
+export function getRepeatedBrowserFailureCallsForUi(value: unknown): RepeatedBrowserFailureCall[] {
+  return parseRepeatedBrowserFailurePayload(value)?.calls || [];
+}
+
+function unwrapBrowserFailureMessage(value: unknown): {
+  message: string;
+  repeatCount: number;
+} {
+  const grouped = parseRepeatedBrowserFailurePayload(value);
+  if (!grouped) {
+    return { message: String(value || ""), repeatCount: 1 };
+  }
+  return {
+    message: String(grouped.calls[0]?.message || ""),
+    repeatCount: grouped.repeatCount,
+  };
+}
+
+function getBrowserFailureRecord(message: string): Record<string, unknown> | null {
+  return parseBrowserValidationRecord(message) || parseJsonRecord(message);
+}
+
+function getFailedBrowserAction(record: Record<string, unknown> | null): {
+  kind: string;
+  value: string;
+} | null {
+  if (!record || !Array.isArray(record.actions)) return null;
+  const actions = record.actions.filter((item) => item && typeof item === "object") as Array<Record<string, unknown>>;
+  const selected = actions.find((item) => item.ok === false) || actions[actions.length - 1];
+  if (!selected) return null;
+  const kind = normalizeUiText(selected.kind);
+  const value = normalizeUiText(selected.value);
+  return kind || value ? { kind, value } : null;
+}
+
+function getActionSelector(kind: string, value: string): string {
+  if (!value) return "";
+  if (["fill", "press", "select_file", "set_input_files", "upload"].includes(kind)) {
+    return normalizeUiText(value.split(/\s*=>\s*/, 1)[0]);
+  }
+  if (["click", "wait_for_selector", "wait_selector", "wait_for_text", "wait_text"].includes(kind)) return value;
+  return "";
+}
+
+function getFailureCodes(record: Record<string, unknown> | null): string[] {
+  if (!record) return [];
+  const value = record.failureReasons ?? record.failure_reasons;
+  if (!Array.isArray(value)) return [];
+  return value.map(normalizeUiText).filter(Boolean);
+}
+
+function extractRawBrowserFailureReason(
+  message: string,
+  record: Record<string, unknown> | null,
+  fallback: unknown,
+): string {
+  const structured = normalizeUiText(
+    record?.failureSummary || record?.failure_summary || record?.error,
+  );
+  if (structured) return structured;
+  const prefixMatch = message.match(/BROWSER_VALIDATION_FAILED:\s*([^\n]+)/i);
+  return normalizeUiText(prefixMatch?.[1] || fallback);
+}
+
+function compactBrowserFailureReason(rawReason: string, language: "zh" | "en"): string {
+  const raw = normalizeUiText(rawReason);
+  if (!raw) return language === "zh" ? "浏览器验证未通过" : "Browser validation did not pass";
+  if (/wait_for_text only searches document\.body text/i.test(raw)) {
+    return language === "zh"
+      ? "正文未出现目标文本；该文本仅匹配页面标题"
+      : "Target text was absent from the page body and only matched the page title";
+  }
+  if (/waiting for locator\(['\"]?([^)'\"]+)/i.test(raw) && /Timeout/i.test(raw)) {
+    return language === "zh"
+      ? "目标元素不存在或不可交互，等待选择器超时"
+      : "The target element was missing or not interactive before the selector timed out";
+  }
+  if (/validation_spec_error/i.test(raw)) {
+    return language === "zh" ? "浏览器验证参数无效" : "The browser validation specification is invalid";
+  }
+  if (/assertion_failed/i.test(raw)) {
+    return language === "zh" ? "页面断言未通过" : "A page assertion failed";
+  }
+  if (/blank_page/i.test(raw)) {
+    return language === "zh" ? "页面没有可识别的渲染内容" : "The page had no meaningful rendered content";
+  }
+  const withoutPlaywrightLog = raw
+    .replace(/\s*\|\s*action_failed:[\s\S]*$/i, "")
+    .replace(/\s*Call log:[\s\S]*$/i, "")
+    .replace(/^runtime_error:\s*/i, "");
+  const maxChars = 150;
+  return withoutPlaywrightLog.length <= maxChars
+    ? withoutPlaywrightLog
+    : `${withoutPlaywrightLog.slice(0, maxChars - 3).trim()}...`;
+}
+
+/**
+ * Derive a concise browser failure label from the structured validator result.
+ * The complete raw result remains available in the expanded ActionCard.
+ */
+export function summarizeBrowserFailureForUi(input: {
+  message?: string;
+  observationSummary?: string;
+  evidence?: string;
+  language?: "zh" | "en";
+}): BrowserFailureUiSummary {
+  const language = input.language === "en" ? "en" : "zh";
+  const unwrapped = unwrapBrowserFailureMessage(input.message);
+  const record = getBrowserFailureRecord(unwrapped.message);
+  const failedAction = getFailedBrowserAction(record);
+  const rawReason = extractRawBrowserFailureReason(
+    unwrapped.message,
+    record,
+    input.observationSummary || input.evidence,
+  );
+  return {
+    action: failedAction?.kind || "",
+    selector: failedAction ? getActionSelector(failedAction.kind, failedAction.value) : "",
+    reason: compactBrowserFailureReason(rawReason, language),
+    repeatCount: unwrapped.repeatCount,
+    failureCodes: getFailureCodes(record),
+  };
+}
+
+function normalizeBrowserFailureFingerprintText(value: unknown): string {
+  return normalizeUiText(value)
+    .replace(/browser-\d+-\d+\.png/gi, "browser-<screenshot>.png")
+    .replace(/\b\d{4,}ms\b/gi, "<duration>")
+    .toLowerCase();
+}
+
+/** Returns null when the block lacks enough structured evidence to group safely. */
+export function buildRepeatedBrowserFailureSignature(block: ToolUiGroupBlock): string | null {
+  if (
+    block.type !== "tool" ||
+    block.toolName !== "browser_evaluate" ||
+    String(block.toolStatus || "") !== "failed"
+  ) {
+    return null;
+  }
+  const unwrapped = unwrapBrowserFailureMessage(block.message);
+  const record = getBrowserFailureRecord(unwrapped.message);
+  const failedAction = getFailedBrowserAction(record);
+  const failureCodes = getFailureCodes(record);
+  const reason = extractRawBrowserFailureReason(
+    unwrapped.message,
+    record,
+    block.observationSummary || block.evidence,
+  );
+  if ((!failedAction?.kind && !failedAction?.value) || (!reason && failureCodes.length === 0)) return null;
+
+  const requestedSpec = record
+    ? record.validationSpec || record.validation_spec || record.request || record.spec || {
+        requestedActions: record.requestedActions || record.requested_actions,
+        requestedChecks: record.requestedChecks || record.requested_checks || record.checks,
+      }
+    : null;
+  return JSON.stringify({
+    tool: "browser_evaluate",
+    target: normalizeBrowserFailureFingerprintText(block.target),
+    action: normalizeBrowserFailureFingerprintText(failedAction?.kind),
+    value: normalizeBrowserFailureFingerprintText(failedAction?.value),
+    failureCodes: [...failureCodes].sort(),
+    reason: normalizeBrowserFailureFingerprintText(reason),
+    requestedSpec,
+    intent: normalizeBrowserFailureFingerprintText(block.intentSummary || block.why),
+  });
+}
+
+function buildRepeatedBrowserFailureBlock(blocks: ToolUiGroupBlock[]): ToolUiGroupBlock {
+  const first = blocks[0];
+  const payload: RepeatedBrowserFailurePayload = {
+    type: REPEATED_BROWSER_FAILURE_GROUP_TYPE,
+    repeatCount: blocks.length,
+    calls: blocks.map((block) => ({
+      id: block.id,
+      target: block.target,
+      message: block.message,
+      evidence: block.evidence,
+      observationSummary: block.observationSummary,
+      intentSummary: block.intentSummary,
+      why: block.why,
+    })),
+  };
+  return {
+    ...first,
+    message: JSON.stringify(payload, null, 2),
+  };
 }
 
 export interface CompletedToolGroupRange {
@@ -191,6 +450,7 @@ const COMMAND_OPERATION_TOOL_NAMES = new Set([
   "get_pty_status",
   "clear_pty_buffer",
   "browser_evaluate",
+  "computer_use",
 ]);
 
 function classifyOperationTool(toolName: string): ChatOperationKind {
@@ -199,7 +459,9 @@ function classifyOperationTool(toolName: string): ChatOperationKind {
   if (READ_OPERATION_TOOL_NAMES.has(toolName)) return "read";
   if (TABLE_OPERATION_TOOL_NAMES.has(toolName)) return "table";
   if (EDIT_OPERATION_TOOL_NAMES.has(toolName)) return "edit";
-  if (COMMAND_OPERATION_TOOL_NAMES.has(toolName)) return toolName === "browser_evaluate" ? "verify" : "command";
+  if (COMMAND_OPERATION_TOOL_NAMES.has(toolName)) {
+    return toolName === "browser_evaluate" || toolName === "computer_use" ? "verify" : "command";
+  }
   return "other";
 }
 
@@ -461,6 +723,29 @@ export function buildChatRenderSegments(input: BuildChatRenderSegmentsInput): Ch
     if (!includeUser && block?.type === "user") {
       index += 1;
       continue;
+    }
+
+    const repeatedBrowserFailureSignature = buildRepeatedBrowserFailureSignature(block);
+    if (repeatedBrowserFailureSignature) {
+      const startIndex = index;
+      const repeatedBlocks = [block];
+      let nextIndex = index + 1;
+      while (
+        nextIndex < blocks.length &&
+        buildRepeatedBrowserFailureSignature(blocks[nextIndex]) === repeatedBrowserFailureSignature
+      ) {
+        repeatedBlocks.push(blocks[nextIndex]);
+        nextIndex += 1;
+      }
+      if (repeatedBlocks.length > 1) {
+        items.push({
+          kind: "block",
+          block: buildRepeatedBrowserFailureBlock(repeatedBlocks),
+          index: startIndex,
+        });
+        index = nextIndex;
+        continue;
+      }
     }
 
     if (block?.type === "agent" && !block.streaming && !block.hiddenProcess) {

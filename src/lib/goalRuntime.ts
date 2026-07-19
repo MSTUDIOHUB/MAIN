@@ -18,6 +18,7 @@ import {
   createGoalContinuationState,
   sanitizeGoalContinuationMemoryPacket,
 } from "./goalContinuity";
+import { parseBrowserValidationOutcome } from "./browserValidation";
 
 export interface GoalToolObservation {
   id?: string;
@@ -131,17 +132,87 @@ export function isGoalToolResultSuccessful(result: string | undefined, explicit?
     // Tool adapters may return plain text. Clear failure markers remain authoritative.
   }
   return !(
-    /exit\s*code\s*[:=]\s*[1-9]\d*/i.test(text)
+    /^\s*BROWSER_VALIDATION_FAILED:/i.test(text)
+    || /^\s*(?:VALIDATION_SPEC_ERROR|DESKTOP_(?:VALIDATION|CONTROL)_FAILED):/i.test(text)
+    || /exit\s*code\s*[:=]\s*[1-9]\d*/i.test(text)
     || /\b[1-9]\d*\s+(?:errors?|failed|failures?)\b/i.test(text)
     || /(?:^|\n)\s*(?:error|failed|failure|panic|exception)\s*[:：]/i.test(text)
     || /\b(?:command|test|tests|build|lint|typecheck)\s+(?:has\s+)?failed\b/i.test(text)
   );
 }
 
-function compactEvidenceSummary(result: string | undefined, fallback: string): string {
+function compactEvidenceSummary(
+  result: string | undefined,
+  fallback: string,
+  maxChars = 240,
+): string {
   const text = String(result || "").replace(/\s+/g, " ").trim();
   if (!text) return fallback;
-  return text.length > 240 ? `${text.slice(0, 237)}...` : text;
+  return text.length > maxChars ? `${text.slice(0, Math.max(0, maxChars - 3))}...` : text;
+}
+
+function browserGoalEvidenceDetails(result: string | undefined): {
+  summary: string | null;
+  references: string[];
+} {
+  const outcome = parseBrowserValidationOutcome(String(result || ""));
+  if (!outcome) return { summary: null, references: [] };
+  const failureType = String(outcome.failureType || "").trim();
+  const summary = [
+    outcome.ok === true ? "browser_ok" : outcome.ok === false ? "browser_failed" : "browser_unknown",
+    failureType ? `failureType=${failureType}` : "",
+    outcome.failureReasons.length > 0 ? `reasons=${outcome.failureReasons.join(",")}` : "",
+    outcome.failureSummary ? `detail=${outcome.failureSummary}` : "",
+    outcome.pageErrors.length > 0 ? `pageErrors=${outcome.pageErrors.slice(0, 3).join(" | ")}` : "",
+    outcome.consoleErrors.length > 0 ? `consoleErrors=${outcome.consoleErrors.slice(0, 3).join(" | ")}` : "",
+    outcome.screenshotPath ? `screenshot=${outcome.screenshotPath}` : "",
+  ].filter(Boolean).join("; ");
+  return {
+    summary: compactEvidenceSummary(summary, "browser_evaluate", 1_200),
+    references: outcome.screenshotPath ? [outcome.screenshotPath] : [],
+  };
+}
+
+function desktopGoalEvidenceDetails(result: string | undefined): {
+  summary: string | null;
+  references: string[];
+} {
+  const raw = String(result || "").trim();
+  const jsonText = /^DESKTOP_(?:VALIDATION|CONTROL)_FAILED:/i.test(raw) && raw.includes("\n")
+    ? raw.slice(raw.indexOf("\n") + 1).trim()
+    : raw;
+  try {
+    const parsed = JSON.parse(jsonText);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { summary: null, references: [] };
+    }
+    const record = parsed as Record<string, unknown>;
+    const screenshotPath = String(record.screenshotPath || record.screenshot_path || "").trim();
+    const rawFailureReasons = record.failureReasons ?? record.failure_reasons;
+    const failureReasons = Array.isArray(rawFailureReasons)
+      ? rawFailureReasons
+          .map((item: unknown) => String(item || "").replace(/\s+/g, " ").trim())
+          .filter(Boolean)
+          .slice(0, 8)
+      : [];
+    const actions = Array.isArray(record.actions) ? record.actions.length : 0;
+    const assertions = Array.isArray(record.assertions) ? record.assertions.length : 0;
+    const summary = [
+      record.ok === true ? "desktop_ok" : record.ok === false ? "desktop_failed" : "desktop_unknown",
+      record.failureType ? `failureType=${String(record.failureType)}` : "",
+      failureReasons.length > 0 ? `reasons=${failureReasons.join(",")}` : "",
+      record.failureSummary || record.error ? `detail=${String(record.failureSummary || record.error)}` : "",
+      `actions=${actions}`,
+      `assertions=${assertions}`,
+      screenshotPath ? `screenshot=${screenshotPath}` : "",
+    ].filter(Boolean).join("; ");
+    return {
+      summary: compactEvidenceSummary(summary, "computer_use", 1_200),
+      references: screenshotPath ? [screenshotPath] : [],
+    };
+  } catch {
+    return { summary: null, references: [] };
+  }
 }
 
 export function createGoalEvidenceEntries(input: {
@@ -161,6 +232,12 @@ export function createGoalEvidenceEntries(input: {
       arguments: observation.arguments,
     });
     const kind = capability.kind;
+    const browserDetails = observation.name === "browser_evaluate"
+      ? browserGoalEvidenceDetails(observation.result)
+      : { summary: null, references: [] as string[] };
+    const desktopDetails = observation.name === "computer_use"
+      ? desktopGoalEvidenceDetails(observation.result)
+      : { summary: null, references: [] as string[] };
     return {
       id: `goal_evidence_${input.iteration}_${createdAt}_${index + 1}`,
       goalId: goal.id,
@@ -174,8 +251,15 @@ export function createGoalEvidenceEntries(input: {
           : "passed" as const,
       sourceTool: observation.name,
       target,
-      summary: compactEvidenceSummary(observation.result, `${observation.name}${target ? `: ${target}` : ""}`),
-      references: kind === "file_change" && target ? [target] : [],
+      summary: browserDetails.summary || desktopDetails.summary || compactEvidenceSummary(
+        observation.result,
+        `${observation.name}${target ? `: ${target}` : ""}`,
+      ),
+      references: [
+        ...(kind === "file_change" && target ? [target] : []),
+        ...browserDetails.references,
+        ...desktopDetails.references,
+      ],
       criterionIds: [],
       createdAt: createdAt + index,
     };

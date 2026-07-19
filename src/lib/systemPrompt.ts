@@ -489,7 +489,7 @@ export function buildSystemPrompt(
   }));
 
   sections.push(makeSection("AUTONOMY AND SAFETY", [
-    "Use exposed read-only tools without step-by-step consent. The runtime enforces intent-scoped tool exposure and approvals for mutations, commands, browser control, external writes, and destructive operations.",
+    "Use exposed read-only tools without step-by-step consent. The runtime enforces intent-scoped tool exposure and approvals for mutations, commands, browser control, desktop control, external writes, and destructive operations.",
     "Never bypass a missing file tool with shell paging or shell-based source writes. Use the structured file tools when exposed.",
     "Treat existing workspace changes as user-owned. Scope edits to the request and do not revert unrelated work.",
     "Do not create `.MAIN/steering` or steering documents unless the user explicitly requests them. Already injected workspace instructions are authoritative; do not rescan for them.",

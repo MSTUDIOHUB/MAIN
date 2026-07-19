@@ -571,13 +571,13 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
     type: "function",
     function: {
       name: "browser_evaluate",
-      description: "使用 Playwright 打开本地页面进行浏览器级验证，返回 DOM、console、网络失败、空白页诊断、断言和截图证据。默认自动截图并将页面运行时异常或空白渲染标记为失败。仅允许 localhost/127.0.0.1/[::1]/file://工作区内页面；不能用 curl/grep/cat 替代。",
+      description: "使用 Playwright 打开本地页面进行浏览器级验证，返回 DOM、console、网络失败、空白页诊断、断言、交互元素候选定位器和截图证据。确定性的 selector/验证规格错误会明确返回 validationSpecError；仅允许 localhost/127.0.0.1/[::1]/file://工作区内页面。",
       parameters: {
         type: "object",
         properties: {
           url: { type: "string", description: "要打开的本地 URL，例如 http://localhost:5173 或工作区内 file:// 页面" },
-          actions: { type: "string", description: "可选，逐行 Playwright 动作 DSL：click: selector；fill: selector => text；press: selector => Enter；select_file: selector => relative/file.csv；wait_for_selector: selector；wait_for_text: text（只检查 document.body 正文，不检查页面 title）" },
-          checks: { type: "string", description: "可选，逐行断言 DSL：text: 文本；not_text: 文本；selector: CSS；not_selector: CSS；title: 文本；console: 文本；not_console: 文本；no_console_errors" },
+          actions: { type: "string", description: "可选，逐行 Playwright 动作 DSL：click: selector；fill: selector => text；press: selector => Enter；select_file: selector => relative/file.csv；wait_for_selector: selector；wait_for_text: text（只检查 document.body 正文，不检查页面 title）。优先使用工具返回的 DOM/locator 事实，不要猜 selector。" },
+          checks: { type: "string", description: "可选，逐行断言 DSL：text: 文本；not_text: 文本；selector: CSS；not_selector: CSS；title: 文本；console: 文本；not_console: 文本；no_console_errors。验证交互效果时至少提供一个动作前为假、动作后为真的可观察断言；页面初始就成立的断言不能证明点击/输入生效。" },
           wait_for_text: { type: "string", description: "可选，打开页面后等待 document.body 正文中出现的文本；不能用页面标题，标题请使用 checks: title: 文本" },
           wait_for_selector: { type: "string", description: "可选，打开页面后等待出现的 CSS selector" },
           screenshot: { type: "boolean", description: "可选，是否保存全页截图到 .MAIN/browser-validation/ 作为验证证据，默认 true；仅在明确不需要视觉证据时设为 false" },
@@ -585,6 +585,27 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
           timeout_ms: { type: "number", description: "可选，单次浏览器验证超时时间，默认 15000，最大 180000" },
         },
         required: ["url"],
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "computer_use",
+      description: "在 macOS 上通过系统 Accessibility API 对真实桌面应用执行受限自动化，并返回结构化动作、断言、窗口/控件清单和可选窗口截图。该工具与浏览器验证分离且每次需要桌面控制审批；只接受固定动作 DSL，不执行模型提供的 AppleScript、shell 或任意坐标脚本。",
+      parameters: {
+        type: "object",
+        properties: {
+          app_name: { type: "string", description: "系统进程/应用显示名称，例如 MAIN 或 TextEdit。必须精确对应正在运行或要启动的应用。" },
+          app_path: { type: "string", description: "可选，仅当 launch=true 时使用；必须是工作区内现有 .app 的相对路径。已安装应用按 app_name 启动时省略。" },
+          launch: { type: "boolean", description: "可选，是否先启动应用，默认 false。开发态 Tauri 通常先用 execute_command 启动，再用本工具控制。" },
+          activate: { type: "boolean", description: "可选，执行前是否将目标应用置于前台，默认 true。" },
+          actions: { type: "string", description: "可选，逐行受限桌面动作 DSL：activate；inspect；click: 无障碍名称；fill: 无障碍名称 => 文本；press: Enter|Tab|Escape|Space|ArrowLeft|ArrowRight|ArrowUp|ArrowDown|Delete；wait_for: 可访问文本；wait: 毫秒；choose_file: 工作区相对文件。click/fill 使用 Accessibility 标签而非坐标。" },
+          checks: { type: "string", description: "可选，逐行断言 DSL：text: 文本；not_text: 文本；window: 标题；not_window: 标题；role: AXRole；not_role: AXRole；dialog: visible|hidden。交互验收应使用动作前为假、动作后为真的断言（例如 dialog: visible），避免用初始已存在的文本充当因果证据。" },
+          screenshot: { type: "boolean", description: "可选，是否截取目标应用首个窗口到 .MAIN/desktop-validation/，默认 false。截图会捕获真实桌面内容，应仅在验收确有需要时开启。" },
+          timeout_ms: { type: "number", description: "可选，整次桌面控制调用的总时间预算，默认 15000，最大 120000；预算耗尽会返回结构化 timeout，不会由宿主强杀后丢失诊断。" },
+        },
+        required: ["app_name"],
       },
     },
   },

@@ -130,6 +130,16 @@ test("pending review materializes a visible tool card for ExecutionCapsule", () 
   assert.match(source, /pendingReviewTaskId: taskId/);
 });
 
+test("desktop permission review is explicitly per-call in the ChatArea capsule", () => {
+  const chatSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
+  const capsuleSource = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ExecutionCapsule.tsx"), "utf8");
+
+  assert.match(chatSource, /permissionRisk=\{permissionActionRequest\?\.risk\}/);
+  assert.match(capsuleSource, /permissionRisk === "desktop_control"/);
+  assert.match(capsuleSource, /!desktopControlRequiresPerCallApproval && \(/);
+  assert.match(capsuleSource, /真实桌面控制每次只能单独审批/);
+});
+
 test("chat rendering keeps substantive intermediate conclusions out of process archive", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
 
@@ -686,6 +696,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolCallPartitioningSource, /buildReadOnlyCacheSignature/);
   assert.match(toolCallPartitioningSource, /logAgentEvent\("file_read_cache_hit"/);
   assert.match(toolCallPartitioningSource, /logAgentEvent\("browser_validation_reused_without_state_change"/);
+  assert.match(toolCallPartitioningSource, /queuedBrowserValidationSignatures/);
+  assert.match(toolCallPartitioningSource, /browser_validation_batch_duplicate_deferred/);
   assert.match(toolCallPartitioningSource, /emitToolPreflightBlocked/);
   assert.match(toolExecutionRoundSource, /export async function executeToolExecutionRound/);
   assert.match(toolExecutionRoundSource, /executeReadOnlyToolsConcurrently/);
@@ -1174,6 +1186,10 @@ test("workflow engine owns one hidden auto-resume between fresh evidence checkpo
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",
   );
+  const toolCallExecutionPhaseSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"),
+    "utf8",
+  );
   const planStart = source.indexOf("onPlanMaxIterationsCheckpoint:");
   const executeStart = source.indexOf("onExecuteMaxIterationsCheckpoint:", planStart);
   const handlersEnd = source.indexOf("onStatusChange:", executeStart);
@@ -1219,6 +1235,21 @@ test("workflow engine owns one hidden auto-resume between fresh evidence checkpo
   assert.match(executeHandler, /readLease: latestExecuteRecoveryState\?\.readLease \|\| null/);
   assert.match(executeHandler, /sourceObservationKey: latestExecuteRecoveryState\?\.sourceObservationKey \|\| null/);
   assert.match(executeHandler, /phaseNoProgressCount: recoveryPhaseChanged/);
+  assert.match(
+    executeHandler,
+    /browserFailureCallSignature:\s*latestExecuteRecoveryState\.decisionCheckpoint\.browserFailureCallSignature/,
+    "same-turn workflow resume must retain the exact deterministic browser failure signature",
+  );
+  assert.match(
+    executeHandler,
+    /browserLocatorCandidates:\s*\[\s*\.\.\.latestExecuteRecoveryState\.decisionCheckpoint\.browserLocatorCandidates/,
+    "same-turn workflow resume must retain the browser diagnostic evidence paired with the signature",
+  );
+  assert.match(
+    toolCallExecutionPhaseSource,
+    /shouldAdvanceWorkspaceObservationEpoch\([\s\S]*?browserFailureCallSignature: null/,
+    "only real workspace or page-state-changing execution evidence may release an unchanged browser retry",
+  );
   assert.doesNotMatch(executeHandler, /forceExecuteRecoveryMode: "action_plus_targeting"/);
   assert.match(executeHandler, /executionConsentGranted: true/);
   assert.notEqual(terminalStart, -1);
@@ -1615,6 +1646,23 @@ test("six no-progress recovery attempts pause before another model stream", () =
   assert.match(preparationSource, /execute_recovery_max_iterations_reached/);
   assert.match(orchestratorSource, /execute_recovery_no_progress_limit/);
   assert.ok(pauseCheck >= 0 && streamCall > pauseCheck, "the terminal pause must be persisted before another LLM stream starts");
+});
+
+test("durable no-progress recovery is projected as paused with a visible assistant checkpoint", () => {
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const chatSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/components/ChatArea.tsx"),
+    "utf8",
+  );
+
+  assert.match(workflowSource, /scopeExecutionEvidenceLedger\([\s\S]*?turnId,[\s\S]*?entry\.kind === "file"/);
+  assert.match(workflowSource, /loopOutcome\.status === "stopped_no_action"[\s\S]*?execute_recovery_no_progress_limit[\s\S]*?status: "paused"/);
+  assert.match(workflowSource, /paused_turn_final_presentation_committed/);
+  assert.match(workflowSource, /visibility: "assistant_final" as const/);
+  assert.match(chatSource, /turn\.status === "paused" && explicitFinalAgentIndex >= 0/);
 });
 
 test("terminal runs persist the turn projection before publishing idle", () => {

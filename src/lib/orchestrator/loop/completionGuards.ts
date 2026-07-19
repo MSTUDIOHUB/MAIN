@@ -249,8 +249,10 @@ export function resolveNonActionableStopOutcome(
   const status: AgentLoopOutcome["status"] =
     reason === "no_output" ? "stopped_no_output" :
     progress?.recoveryReason === "approved_plan_completion_guard_no_evidence" ? "stopped_no_action" :
+    progress?.recoveryReason === "execute_recovery_no_progress_limit" ? "paused" :
     progress?.recoveryReason === "required_tool_call_protocol_violation_after_change" ? "paused" :
     progress?.recoveryReason === "execute_no_action_after_change" ? "paused" :
+    progress?.recoveryReason?.startsWith("desktop_control_") ? "paused" :
     progress?.recoveryReason?.startsWith("execution_evidence_gap:") ? "paused" :
     reason === "incomplete_plan" ? "paused" :
     "stopped_no_action";

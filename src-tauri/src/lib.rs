@@ -5421,6 +5421,156 @@ async fn browser_evaluate(
     .map_err(|error| format!("BROWSER_EVALUATE_TASK_FAILED: {error}"))?
 }
 
+#[tauri::command]
+async fn computer_use(
+    state: State<'_, WorkspaceState>,
+    app_name: String,
+    app_path: Option<String>,
+    launch: Option<bool>,
+    activate: Option<bool>,
+    actions: Option<String>,
+    checks: Option<String>,
+    screenshot: Option<bool>,
+    timeout_ms: Option<u64>,
+    workspace: Option<String>,
+) -> Result<Value, String> {
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        run_computer_use_process(
+            workspace, app_name, app_path, launch, activate, actions, checks, screenshot,
+            timeout_ms,
+        )
+    })
+    .await
+    .map_err(|error| format!("COMPUTER_USE_TASK_FAILED: {error}"))?
+}
+
+fn run_computer_use_process(
+    workspace: PathBuf,
+    app_name: String,
+    app_path: Option<String>,
+    launch: Option<bool>,
+    activate: Option<bool>,
+    actions: Option<String>,
+    checks: Option<String>,
+    screenshot: Option<bool>,
+    timeout_ms: Option<u64>,
+) -> Result<Value, String> {
+    let script_path = computer_use_script_path();
+    if !script_path.exists() {
+        return Err(format!(
+            "computer_use script not found: {}",
+            script_path.display()
+        ));
+    }
+    let node_path = resolve_node_executable().ok_or_else(|| {
+        "computer_use requires Node.js so it can run the constrained desktop automation adapter."
+            .to_string()
+    })?;
+
+    let action_timeout = Duration::from_millis(timeout_ms.unwrap_or(15_000).clamp(1_000, 120_000));
+    let supervisor_timeout =
+        action_timeout.saturating_add(Duration::from_millis(BROWSER_EVALUATE_CLEANUP_GRACE_MS));
+    let payload = json!({
+        "appName": app_name,
+        "appPath": app_path,
+        "launch": launch.unwrap_or(false),
+        "activate": activate.unwrap_or(true),
+        "actions": actions.unwrap_or_default(),
+        "checks": checks.unwrap_or_default(),
+        "screenshot": screenshot.unwrap_or(false),
+        "timeoutMs": action_timeout.as_millis() as u64,
+        "workspace": workspace.to_string_lossy(),
+    });
+
+    let mut command = ProcessCommand::new(&node_path);
+    command
+        .arg(script_path)
+        .current_dir(&workspace)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    isolate_process_group(&mut command);
+
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("启动 computer_use 失败: {error}"))?;
+    let stdout_handle = child
+        .stdout
+        .take()
+        .map(|stdout| thread::spawn(move || read_limited_pipe(stdout, COMMAND_OUTPUT_LIMIT_BYTES)));
+    let stderr_handle = child
+        .stderr
+        .take()
+        .map(|stderr| thread::spawn(move || read_limited_pipe(stderr, COMMAND_OUTPUT_LIMIT_BYTES)));
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        let input = serde_json::to_string(&payload)
+            .map_err(|error| format!("序列化 computer_use 输入失败: {error}"))?;
+        stdin
+            .write_all(input.as_bytes())
+            .map_err(|error| format!("写入 computer_use 输入失败: {error}"))?;
+    }
+    let _ = child.stdin.take();
+
+    let started_at = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started_at.elapsed() >= supervisor_timeout {
+                    timed_out = true;
+                    break terminate_timed_out_child(&mut child)?;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("等待 computer_use 结束失败: {error}")),
+        }
+    };
+
+    let stdout = join_captured_pipe(stdout_handle, "computer_use stdout")?;
+    let stderr = join_captured_pipe(stderr_handle, "computer_use stderr")?;
+    let stdout_text = stdout.text.trim();
+    let stderr_text = stderr.text.trim();
+
+    if timed_out {
+        return Err(format!(
+            "computer_use timed out after {}ms (action budget {}ms + cleanup grace {}ms){}",
+            supervisor_timeout.as_millis(),
+            action_timeout.as_millis(),
+            BROWSER_EVALUATE_CLEANUP_GRACE_MS,
+            if stderr_text.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr_text}")
+            }
+        ));
+    }
+    if !status.success() {
+        return Err(format!(
+            "computer_use exited with code {:?}. stdout: {} stderr: {}",
+            status.code(),
+            stdout_text,
+            stderr_text
+        ));
+    }
+    if stdout_text.is_empty() {
+        return Err(format!(
+            "computer_use produced no JSON result{}",
+            if stderr_text.is_empty() {
+                String::new()
+            } else {
+                format!("; stderr: {stderr_text}")
+            }
+        ));
+    }
+
+    serde_json::from_str::<Value>(stdout_text).map_err(|error| {
+        format!("computer_use returned invalid JSON: {error}; stdout: {stdout_text}")
+    })
+}
+
 fn run_browser_evaluate_process(
     workspace: PathBuf,
     url: String,
@@ -10137,10 +10287,31 @@ fn feishu_project_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn runtime_script_path(file_name: &str) -> PathBuf {
+    let source_path = feishu_project_root().join("scripts").join(file_name);
+    let mut candidates = Vec::new();
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(binary_dir) = executable.parent() {
+            candidates.push(binary_dir.join("scripts").join(file_name));
+            candidates.push(binary_dir.join("resources").join("scripts").join(file_name));
+            if let Some(contents_dir) = binary_dir.parent() {
+                candidates.push(contents_dir.join("Resources").join("scripts").join(file_name));
+            }
+        }
+    }
+    candidates.push(source_path.clone());
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.exists())
+        .unwrap_or(source_path)
+}
+
 fn browser_validation_script_path() -> PathBuf {
-    feishu_project_root()
-        .join("scripts")
-        .join("browser_evaluate.mjs")
+    runtime_script_path("browser_evaluate.mjs")
+}
+
+fn computer_use_script_path() -> PathBuf {
+    runtime_script_path("computer_use.mjs")
 }
 
 fn feishu_sidecar_script_path() -> PathBuf {
@@ -10844,6 +11015,7 @@ pub fn run() {
             get_pty_status,
             run_command,
             browser_evaluate,
+            computer_use,
             shell_permission_preflight,
             build_repository_index,
             code_ast_query,

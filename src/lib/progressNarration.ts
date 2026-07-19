@@ -145,6 +145,9 @@ export function deriveToolTargetRole(input: {
   if (toolName === "browser_evaluate") {
     return language === "zh" ? `浏览器页面 \`${compactLine(target, 72)}\`` : `browser page \`${compactLine(target, 72)}\``;
   }
+  if (toolName === "computer_use") {
+    return language === "zh" ? `桌面应用 \`${compactLine(target, 72)}\`` : `desktop app \`${compactLine(target, 72)}\``;
+  }
 
   if (toolName === "run_command" || toolName === "execute_command") {
     if (VERIFY_COMMAND_RE.test(target)) {
@@ -671,6 +674,11 @@ export function summarizeToolObservation(input: {
       if (failed || /"ok"\s*:\s*false/i.test(result)) return `Browser validation for ${role} reported a failure that needs follow-up.`;
       return `Browser validation output for ${role} was captured for the next decision.`;
     }
+    if (input.toolName === "computer_use") {
+      if (/"ok"\s*:\s*true/i.test(result) && !failed) return `Desktop interaction for ${role} completed with structured evidence.`;
+      if (failed || /"ok"\s*:\s*false/i.test(result)) return `Desktop control for ${role} reported a failure that needs follow-up.`;
+      return `Desktop control output for ${role} was captured for the next decision.`;
+    }
     if (input.toolName === "grep_search" || input.toolName === "glob_search" || input.toolName.startsWith("repo_map_")) return `Search results narrowed the relevant evidence around ${role}.`;
     return `Read ${role} and captured the relevant context.`;
   }
@@ -687,6 +695,11 @@ export function summarizeToolObservation(input: {
     if (/"ok"\s*:\s*true/i.test(result) && !failed) return `${role}的浏览器验证已通过。`;
     if (failed || /"ok"\s*:\s*false/i.test(result)) return `${role}的浏览器验证返回失败信号，需要继续处理。`;
     return `已记录${role}的浏览器验证结果，用于判断下一步。`;
+  }
+  if (input.toolName === "computer_use") {
+    if (/"ok"\s*:\s*true/i.test(result) && !failed) return `${role}的桌面交互已完成并记录结构化证据。`;
+    if (failed || /"ok"\s*:\s*false/i.test(result)) return `${role}的桌面控制返回失败信号，需要继续处理。`;
+    return `已记录${role}的桌面控制结果，用于判断下一步。`;
   }
   if (input.toolName === "grep_search" || input.toolName === "glob_search" || input.toolName.startsWith("repo_map_")) return `搜索结果已收窄 ${role} 的相关证据。`;
   return `已读取 ${role}，捕获了后续判断所需上下文。`;

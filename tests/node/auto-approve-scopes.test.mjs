@@ -104,6 +104,8 @@ test("built-in tools use risk-based scope matching (not mcp_action)", () => {
   assert.equal(isAllowedBySessionAutoApprove("external_write", "built_in", scopes, DEFAULT_POLICY), true);
   // Built-in tool with shell risk should match shell scope
   assert.equal(isAllowedBySessionAutoApprove("shell", "built_in", scopes, DEFAULT_POLICY), true);
+  // Real desktop control intentionally has no session-wide auto-approval scope.
+  assert.equal(isAllowedBySessionAutoApprove("desktop_control", "built_in", scopes, DEFAULT_POLICY), false);
 });
 
 test("policy disabled risk levels override all scopes", () => {

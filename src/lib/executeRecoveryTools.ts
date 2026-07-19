@@ -63,6 +63,8 @@ export type ExecuteRecoveryNextCapability =
   | "targeted_read"
   | "mutation"
   | "validation"
+  | "browser_diagnostic"
+  | "desktop_validation"
   | "launch_long_process"
   | "recover_process"
   | "reconcile_server"
@@ -152,6 +154,18 @@ export interface ExecutionDecisionCheckpoint {
   } | null;
   /** A write has evidence, but objective closure still awaits validation/audit. */
   objectiveClosurePending?: boolean;
+  /** Stable identity of a browser validation spec/runtime failure under diagnosis. */
+  browserFailureFingerprint?: string | null;
+  /** Exact cache-contract signature of a deterministic failed browser invocation. */
+  browserFailureCallSignature?: string | null;
+  /** Bounded structured diagnostic retained across Goal continuation slices. */
+  browserFailureDetail?: string | null;
+  /** Locator that failed in the attempted browser action, if one was explicit. */
+  browserFailedLocator?: string | null;
+  /** DOM-derived locator/text candidates returned by the validator. */
+  browserLocatorCandidates?: string[];
+  /** Exact browser target whose validation remains open. */
+  browserRequestedUrl?: string | null;
 }
 
 export interface ReadProgressFingerprint {
@@ -243,6 +257,7 @@ export const EXECUTE_RECOVERY_VALIDATION_TOOLS = new Set([
   "run_command",
   "execute_command",
   "browser_evaluate",
+  "computer_use",
   "git_status",
   "git_diff",
   "send_pty_input",
@@ -272,6 +287,16 @@ const EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS = new Set([
 
 const EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS = new Set([
   "browser_evaluate",
+]);
+
+const EXECUTE_RECOVERY_BROWSER_DIAGNOSTIC_CONTRACT_TOOLS = new Set([
+  "browser_evaluate",
+  "grep_search",
+  "read_file",
+]);
+
+const EXECUTE_RECOVERY_DESKTOP_VALIDATION_CONTRACT_TOOLS = new Set([
+  "computer_use",
 ]);
 
 const EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS = new Set([
@@ -312,6 +337,10 @@ function resolveRecoveryAllowedToolNames(
       return EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS;
     case "validation":
       return EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS;
+    case "browser_diagnostic":
+      return EXECUTE_RECOVERY_BROWSER_DIAGNOSTIC_CONTRACT_TOOLS;
+    case "desktop_validation":
+      return EXECUTE_RECOVERY_DESKTOP_VALIDATION_CONTRACT_TOOLS;
     case "launch_long_process":
       return EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS;
     case "observe_pty":
@@ -334,6 +363,8 @@ function resolveRecoveryToolCallRequirement(
     ? "read_file"
     : nextCapability === "browser_validation"
     ? "browser_evaluate"
+    : nextCapability === "desktop_validation"
+    ? "computer_use"
     : nextCapability === "launch_long_process"
     ? "execute_command"
     : nextCapability === "validation"
@@ -544,6 +575,15 @@ export function resolveExecuteRecoveryActionContract(
   ) {
     phase = "context";
     nextRequiredCapability = "targeting";
+  } else if (checkpointCapability === "browser_diagnostic") {
+    // A malformed locator/assertion is not evidence that application source is
+    // broken. Keep a narrow inspection surface until DOM/search evidence
+    // attributes a concrete source target or a corrected browser check passes.
+    phase = "context";
+    nextRequiredCapability = "browser_diagnostic";
+  } else if (checkpointCapability === "desktop_validation") {
+    phase = "validation";
+    nextRequiredCapability = "desktop_validation";
   } else if (devServerLifecycleStep) {
     phase = devServerLifecycleStep.phase;
     nextRequiredCapability = devServerLifecycleStep.nextRequiredCapability;
@@ -673,6 +713,8 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
     "targeted_read",
     "mutation",
     "validation",
+    "browser_diagnostic",
+    "desktop_validation",
     "launch_long_process",
     "recover_process",
     "reconcile_server",
@@ -746,6 +788,12 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
         return tool && target ? { tool, target, revision } : null;
       })()
     : null;
+  const browserLocatorCandidates = Array.isArray(candidate.browserLocatorCandidates)
+    ? [...new Set(candidate.browserLocatorCandidates
+        .map((entry) => String(entry || "").replace(/\s+/g, " ").trim())
+        .filter(Boolean))]
+        .slice(0, 24)
+    : [];
   return {
     expectedTarget: String(candidate.expectedTarget || "").trim() || null,
     sourceObservationKey: String(candidate.sourceObservationKey || "").trim() || null,
@@ -802,6 +850,39 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
     ...(candidate.objectiveClosurePending === undefined
       ? {}
       : { objectiveClosurePending: candidate.objectiveClosurePending === true }),
+    ...(candidate.browserFailureFingerprint === undefined
+      ? {}
+      : {
+          browserFailureFingerprint:
+            String(candidate.browserFailureFingerprint || "").trim() || null,
+        }),
+    ...(candidate.browserFailureCallSignature === undefined
+      ? {}
+      : {
+          browserFailureCallSignature:
+            String(candidate.browserFailureCallSignature || "").trim() || null,
+        }),
+    ...(candidate.browserFailureDetail === undefined
+      ? {}
+      : {
+          browserFailureDetail:
+            String(candidate.browserFailureDetail || "").replace(/\s+/g, " ").trim().slice(0, 1_200) || null,
+        }),
+    ...(candidate.browserFailedLocator === undefined
+      ? {}
+      : {
+          browserFailedLocator:
+            String(candidate.browserFailedLocator || "").replace(/\s+/g, " ").trim().slice(0, 240) || null,
+        }),
+    ...(candidate.browserLocatorCandidates === undefined
+      ? {}
+      : { browserLocatorCandidates }),
+    ...(candidate.browserRequestedUrl === undefined
+      ? {}
+      : {
+          browserRequestedUrl:
+            String(candidate.browserRequestedUrl || "").trim().slice(0, 2_000) || null,
+        }),
   };
 }
 
@@ -1089,6 +1170,10 @@ export function resolveExecuteRecoveryBatchDecision(input: {
         return scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_OBSERVATION_CONTRACT_TOOLS.has(call.name));
       case "browser_validation":
         return scopedEligible.find((call) => EXECUTE_RECOVERY_BROWSER_VALIDATION_CONTRACT_TOOLS.has(call.name));
+      case "browser_diagnostic":
+        return scopedEligible.find((call) => EXECUTE_RECOVERY_BROWSER_DIAGNOSTIC_CONTRACT_TOOLS.has(call.name));
+      case "desktop_validation":
+        return scopedEligible.find((call) => EXECUTE_RECOVERY_DESKTOP_VALIDATION_CONTRACT_TOOLS.has(call.name));
       case "recover_process":
         return scopedEligible.find((call) => EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS.has(call.name)) ||
           scopedEligible.find((call) => call.name === "execute_command");
@@ -1213,6 +1298,7 @@ export function buildExecutionActionContractCard(input: {
         ].join("\n");
   }
   const sourcePhase = contract.phase === "context" || contract.phase === "mutation";
+  const browserDiagnostic = contract.nextRequiredCapability === "browser_diagnostic";
   if (input.language === "zh") {
     return [
       "[EXECUTION_ACTION_CONTRACT]",
@@ -1228,7 +1314,15 @@ export function buildExecutionActionContractCard(input: {
         : []),
       `availableTools=${tools}`,
       ...(sourcePhase
-        ? [
+        ? browserDiagnostic
+          ? [
+              `browserFailure=${contract.decisionCheckpoint?.browserFailureDetail || "browser validation failed without a source stack"}`,
+              `failedLocator=${contract.decisionCheckpoint?.browserFailedLocator || "(none)"}`,
+              `locatorCandidates=${(contract.decisionCheckpoint?.browserLocatorCandidates || []).join(", ") || "(none)"}`,
+              "先利用浏览器返回的 DOM/交互元素清单修正 locator 或因果断言；需要源码定位时，只搜索失败 locator、候选 locator 或可见标签，并且只读取搜索结果明确指向的文件。",
+              "这个阶段不授权源码修改，也不能把最后读取的任意文件当作故障源。不要在参数和页面状态未变化时重复同一个失败验证。",
+            ]
+          : [
             `sourceObservation=${observation}; readLeaseRange=${range}`,
             hasSourceObservation
               ? "复用已绑定的源码 observation；不要为满足规则而复读未变化的相同窗口。"
@@ -1256,8 +1350,16 @@ export function buildExecutionActionContractCard(input: {
         ]
       : []),
     `availableTools=${tools}`,
-    ...(sourcePhase
-      ? [
+      ...(sourcePhase
+      ? browserDiagnostic
+        ? [
+            `browserFailure=${contract.decisionCheckpoint?.browserFailureDetail || "browser validation failed without a source stack"}`,
+            `failedLocator=${contract.decisionCheckpoint?.browserFailedLocator || "(none)"}`,
+            `locatorCandidates=${(contract.decisionCheckpoint?.browserLocatorCandidates || []).join(", ") || "(none)"}`,
+            "First correct the locator or causal assertion from the returned DOM/interactive-element inventory. If source lookup is needed, search only the failed locator, a returned locator candidate, or its visible label, and read only a file named by that search.",
+            "This phase does not authorize source mutation and must not promote an arbitrary last-read file into a failure target. Do not repeat an identical failed validation while its arguments and page state are unchanged.",
+          ]
+        : [
           `sourceObservation=${observation}; readLeaseRange=${range}`,
           hasSourceObservation
             ? "Reuse the bound source observation; do not reread an unchanged covered window merely to satisfy a rule."

@@ -44,6 +44,7 @@ const goalSourceContext = loadTranspiledModuleSync(path.join(workspaceRoot, "src
 const goalEventIdentity = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalEventIdentity.ts"));
 const goalPersistence = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalPersistence.ts"));
 const goalRunOwnership = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalRunOwnership.ts"));
+const goalOutcomePolicy = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalOutcomePolicy.ts"));
 
 function createIteration(index) {
   return {
@@ -559,6 +560,93 @@ test("tool result parsing accepts zero failures and rejects explicit failures", 
   assert.equal(goalRuntime.isGoalToolResultSuccessful("0 errors"), true);
   assert.equal(goalRuntime.isGoalToolResultSuccessful("Tests failed: assertion mismatch"), false);
   assert.equal(goalRuntime.isGoalToolResultSuccessful('{"exitCode":1}'), false);
+  assert.equal(goalRuntime.isGoalToolResultSuccessful("BROWSER_VALIDATION_FAILED: locator missing"), false);
+});
+
+test("Goal browser failures retain structured diagnostics and screenshot references", () => {
+  const goal = goalState.createGoalDefinition({ objective: "Fix the editor and verify it in the browser" });
+  const evidence = goalRuntime.createGoalEvidenceEntries({
+    goal,
+    iteration: 2,
+    now: 20,
+    observations: [{
+      name: "browser_evaluate",
+      target: "http://localhost:1420/",
+      success: false,
+      result: `BROWSER_VALIDATION_FAILED: locator missing\n${JSON.stringify({
+        ok: false,
+        failureType: "validation_spec_error",
+        failureReasons: ["missing_locator"],
+        failureSummary: "click selector #new-file-btn was not found",
+        screenshotPath: ".MAIN/browser-validation/failure.png",
+        pageErrors: [],
+        consoleErrors: [],
+        assertions: [],
+      })}`,
+    }],
+  });
+
+  assert.equal(evidence[0].status, "failed");
+  assert.match(evidence[0].summary, /validation_spec_error|missing_locator/);
+  assert.match(evidence[0].summary, /#new-file-btn/);
+  assert.deepEqual(evidence[0].references, [".MAIN/browser-validation/failure.png"]);
+});
+
+test("Goal desktop failures retain their structured blocker and screenshot reference", () => {
+  const goal = goalState.createGoalDefinition({ objective: "Control MAIN and verify the native window" });
+  const evidence = goalRuntime.createGoalEvidenceEntries({
+    goal,
+    iteration: 3,
+    now: 30,
+    observations: [{
+      name: "computer_use",
+      target: "MAIN",
+      success: false,
+      result: `DESKTOP_CONTROL_FAILED:\n${JSON.stringify({
+        ok: false,
+        failureType: "permission_required",
+        failureReasons: ["Accessibility permission is required"],
+        failureSummary: "Enable MAIN in macOS Accessibility settings",
+        actions: [],
+        assertions: [],
+        screenshotPath: ".MAIN/desktop-validation/failure.png",
+      })}`,
+    }],
+  });
+
+  assert.equal(evidence[0].kind, "desktop");
+  assert.equal(evidence[0].status, "failed");
+  assert.match(evidence[0].summary, /permission_required/);
+  assert.match(evidence[0].summary, /Accessibility/);
+  assert.deepEqual(evidence[0].references, [".MAIN/desktop-validation/failure.png"]);
+});
+
+test("Goal outcome policy preserves explicit pause boundaries before slice auto-continuation", () => {
+  assert.deepEqual(goalOutcomePolicy.resolveGoalInnerOutcomeDecision({
+    status: "paused",
+    stopReason: "execute_recovery_no_progress_limit",
+    sliceBoundaryReached: true,
+  }), {
+    action: "paused",
+    reason: "execute_recovery_no_progress_limit",
+  });
+  const protocol = goalOutcomePolicy.resolveGoalInnerOutcomeDecision({
+    status: "stopped_no_action",
+    stopReason: "required_tool_call_protocol_violation_after_change",
+  });
+  assert.equal(protocol.action, "recover");
+  assert.equal(protocol.normalizedCause, "protocol_no_progress");
+
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  assert.match(workflowSource, /exactMaxIterationBoundary/);
+  assert.doesNotMatch(
+    workflowSource,
+    /sliceBoundaryReached[\s\S]{0,260}deferredNonActionableStop\?\.\[1\]\s*===\s*"no_action"/,
+    "a generic no-action/protocol pause must not be rewritten as an automatic Goal slice boundary",
+  );
 });
 
 test("a completion marker without fresh execution evidence is only a candidate", () => {
@@ -1236,6 +1324,11 @@ test("Goal continuation drops expired recovery tool errors without losing real t
             type: "function",
             function: { name: "apply_patch", arguments: '{"patch":"*** Begin Patch"}' },
           },
+          {
+            id: "persisted-browser-retry",
+            type: "function",
+            function: { name: "browser_evaluate", arguments: '{"url":"http://localhost:1420/"}' },
+          },
         ],
       },
       { role: "tool", tool_call_id: "read-source", content: "const app = document.querySelector('#app');" },
@@ -1251,6 +1344,11 @@ test("Goal continuation drops expired recovery tool errors without losing real t
         role: "tool",
         tool_call_id: "deferred-edit",
         content: "EXECUTE_RECOVERY_BATCH_DEFERRED: consume the selected read before editing.",
+      },
+      {
+        role: "tool",
+        tool_call_id: "persisted-browser-retry",
+        content: "BROWSER_VALIDATION_PERSISTED_FAILURE_REUSED: unchanged stable failure was not executed.",
       },
       {
         role: "assistant",
@@ -1273,6 +1371,7 @@ test("Goal continuation drops expired recovery tool errors without losing real t
   assert.deepEqual(resultIds.sort(), ["read-missing", "read-source"]);
   assert.equal(restored.some((message) => message.content.includes("READ_FILE_NOT_AVAILABLE_IN_RECOVERY")), false);
   assert.equal(restored.some((message) => message.content.includes("EXECUTE_RECOVERY_BATCH_DEFERRED")), false);
+  assert.equal(restored.some((message) => message.content.includes("BROWSER_VALIDATION_PERSISTED_FAILURE_REUSED")), false);
   assert.equal(restored.some((message) => message.content.includes("querySelector")), true);
   assert.equal(restored.some((message) => message.content.includes("ENOENT")), true);
   assert.doesNotMatch(state.memoryPacket || "", /READ_FILE_NOT_AVAILABLE_IN_RECOVERY/);
@@ -1454,6 +1553,12 @@ test("Goal continuation preserves the exact recovery contract snapshot across sl
         requirementRef: "REQ-TOOLBAR",
       }],
       objectiveClosurePending: true,
+      browserFailureFingerprint: "browser-failure-v1",
+      browserFailureCallSignature: "browser_evaluate::exact-v1",
+      browserFailureDetail: "selector #open was not found",
+      browserFailedLocator: "#open",
+      browserLocatorCandidates: ["#open-document"],
+      browserRequestedUrl: "http://localhost:1420/",
     },
   };
   const first = goalContinuity.createGoalContinuationState({

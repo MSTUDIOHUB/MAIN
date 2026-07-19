@@ -75,6 +75,7 @@ export type GoalEvidenceKind =
   | "test"
   | "build"
   | "browser"
+  | "desktop"
   | "mcp"
   | "user_validation"
   | "blocker"
