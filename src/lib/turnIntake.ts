@@ -19,14 +19,24 @@ export interface TurnInputContextLike {
 }
 
 const SUBAGENT_REFERENCE_RE = /(?:sub[\s_-]?agents?|子智能体|子代理|多智能体|multi[\s_-]?agents?|multiple\s+agents?)/i;
-const SUBAGENT_FORBIDDEN_RE = /(?:(?:不要|禁止|无需|不需要|别|不可|不能).{0,24}(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:sub[\s_-]?agents?|子智能体|子代理|多智能体).{0,24}(?:不要|禁止|无需|不需要|不可|不能)|(?:do\s+not|don't|without|no)\s+(?:use\s+)?(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?))/i;
+// A negative instruction about what a child may read or mutate is not a ban
+// on delegation. Keep this predicate syntactically tied to enabling/using the
+// child itself instead of treating arbitrary nearby negation as "forbidden".
+const SUBAGENT_FORBIDDEN_RE = /(?:(?:不要|禁止|无需|不需要|别|不可|不能)\s*(?:再\s*)?(?:使用|启用|开启|调用|创建|启动|派遣|委派)\s*(?:任何\s*|一个\s*|多个\s*)?(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:不要|禁止|无需|不需要|别|不可|不能)\s*(?:任何\s*|一个\s*|多个\s*)?(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)\s*(?:参与|介入|协作|工作)?(?=$|[，,。.!！？?；;])|(?:do\s+not|don't)\s+(?:use\s+|spawn\s+|create\s+|enable\s+)(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)|without\s+(?:using\s+)?(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)|(?:^|[.!?;]\s*)no\s+(?:sub[\s_-]?agents?|multi[\s_-]?agents?|multiple\s+agents?)(?:\s+(?:for|in|on)\s+(?:this\s+)?(?:turn|task|request))?(?=$|[.!?;]))/i;
+const SUBAGENT_REQUIRED_RE = /(?:(?:必须|务必|需要|请)\s*(?:(?:先|连续|立即|优先)\s*)*(?:调用|使用|启动|创建|派遣|委派)\s*(?:一个|多个|\d+\s*个|[一二三四五六七八九十]+\s*个)?\s*(?:spawn[\s_-]?sub[\s_-]?agent|sub[\s_-]?agents?|子智能体|子代理)|(?:must|required\s+to|need\s+to|please)\s+(?:first\s+)?(?:use|spawn|create|start|call)\s+(?:one|two|three|several|multiple|\d+)?\s*(?:spawn[\s_-]?sub[\s_-]?agent|sub[\s_-]?agents?|agents?))/i;
 const SUBAGENT_PARALLEL_RE = /(?:(?:多个|两个|多开|并行|协同|分工).{0,32}(?:sub[\s_-]?agents?|子智能体|子代理|智能体)|(?:sub[\s_-]?agents?|子智能体|子代理|智能体).{0,32}(?:多个|两个|多开|并行|协同|分工)|(?:parallel|multiple|two|several|collaborat(?:e|ion)|divide\s+the\s+work).{0,32}(?:sub[\s_-]?agents?|agents?))/i;
 const SUBAGENT_ALLOWED_RE = /(?:(?:可以|可用|允许|同意|可开启|可使用).{0,28}(?:sub[\s_-]?agents?|子智能体|子代理|多智能体)|(?:may|can|allowed\s+to|feel\s+free\s+to).{0,28}(?:use\s+|spawn\s+)?(?:sub[\s_-]?agents?|agents?))/i;
 
 export function resolveSubagentDelegationPreference(input: string): SubagentDelegationPreference {
   const text = String(input || "").replace(/\s+/g, " ").trim();
   if (!text || !SUBAGENT_REFERENCE_RE.test(text)) return "unspecified";
-  if (SUBAGENT_FORBIDDEN_RE.test(text)) return "forbidden";
+  const requiredDirective = SUBAGENT_REQUIRED_RE.exec(text);
+  const forbiddenDirective = SUBAGENT_FORBIDDEN_RE.exec(text);
+  if (requiredDirective && forbiddenDirective) {
+    return requiredDirective.index > forbiddenDirective.index ? "preferred" : "forbidden";
+  }
+  if (requiredDirective) return "preferred";
+  if (forbiddenDirective) return "forbidden";
   if (SUBAGENT_PARALLEL_RE.test(text)) return "preferred";
   if (SUBAGENT_ALLOWED_RE.test(text)) return "allowed";
   return "allowed";

@@ -2891,6 +2891,17 @@ function getLastTurnToolSummary(turnId: string, taskFlow: TaskBlock[]): string {
 function getLastVisibleTurnAgentSummary(turnId: string, taskFlow: TaskBlock[]): string {
   for (let index = taskFlow.length - 1; index >= 0; index--) {
     const block = taskFlow[index];
+    if (
+      block.turnId !== turnId ||
+      block.type !== "agent" ||
+      block.hiddenProcess ||
+      block.visibility !== "assistant_final"
+    ) continue;
+    const summary = summarizeAssistantText(block.content || "");
+    if (summary) return summary;
+  }
+  for (let index = taskFlow.length - 1; index >= 0; index--) {
+    const block = taskFlow[index];
     if (block.turnId !== turnId || block.type !== "agent" || block.hiddenProcess) continue;
     const summary = summarizeAssistantText(block.content || "");
     if (summary) return summary;

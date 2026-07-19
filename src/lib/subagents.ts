@@ -66,6 +66,12 @@ export interface SubagentRunSnapshot {
   closedAt?: number;
   summary?: string;
   error?: string;
+  /** Provenance-backed tool observations returned by the child runtime. */
+  evidenceCount?: number;
+  observationCount?: number;
+  substantiveEvidenceCount?: number;
+  closureState?: "satisfied" | "partial" | "blocked";
+  remainingWork?: string;
   progress?: SubagentProgress;
 }
 
@@ -78,6 +84,11 @@ export type SubagentRunPatch = Partial<Pick<
   | "closedAt"
   | "summary"
   | "error"
+  | "evidenceCount"
+  | "observationCount"
+  | "substantiveEvidenceCount"
+  | "closureState"
+  | "remainingWork"
   | "progress"
 >>;
 
@@ -187,6 +198,8 @@ export interface SubagentEvidenceProvenance {
   sourceToolCallId?: string;
   sourceObservation?: FileReadObservationIdentity;
   sourceVersion?: string;
+  sourceContentHash?: string;
+  sourceContentChars?: number;
   sourceRange?: FileReadWindowIdentity;
   factReferences?: SubagentEvidenceFactReference[];
 }
@@ -196,7 +209,65 @@ export interface SubagentEvidenceItem {
   target: string;
   detail: string;
   facts?: string[];
+  observation?: {
+    kind: "source" | "structure" | "search" | "diff";
+    sourcePath: string;
+    contentChars: number;
+    negative: boolean;
+    substantive: boolean;
+  };
   provenance: SubagentEvidenceProvenance;
+}
+
+export interface SubagentPathCoverageAudit {
+  requiredPaths: string[];
+  coveredPaths: string[];
+  /** Required paths whose latest runtime state is still failed. */
+  failedPaths: string[];
+  /** Required paths without a successful observation, including failed paths. */
+  uncoveredPaths: string[];
+}
+
+/**
+ * Reconcile required child-scope roots with runtime-owned observations. A
+ * later successful observation resolves an earlier failure for the same path;
+ * activity on a descendant does not claim that an entire directory root was
+ * covered.
+ */
+export function resolveSubagentPathCoverage(input: {
+  requiredPaths: string[];
+  observedPaths: Iterable<string>;
+  failedPaths: Iterable<string>;
+}): SubagentPathCoverageAudit {
+  const requiredByIdentity = new Map<string, string>();
+  for (const path of input.requiredPaths) {
+    const identity = normalizeSubagentScopePathIdentity(String(path || ""));
+    if (identity && !requiredByIdentity.has(identity)) {
+      requiredByIdentity.set(identity, String(path || "").trim().replace(/\\/g, "/"));
+    }
+  }
+  const observedIdentities = new Set([...input.observedPaths]
+    .map((path) => normalizeSubagentScopePathIdentity(String(path || "")))
+    .filter(Boolean));
+  const failedIdentities = new Set([...input.failedPaths]
+    .map((path) => normalizeSubagentScopePathIdentity(String(path || "")))
+    .filter(Boolean));
+  const requiredEntries = [...requiredByIdentity.entries()];
+  const coveredPaths = requiredEntries
+    .filter(([identity]) => observedIdentities.has(identity))
+    .map(([, path]) => path);
+  const failedPaths = requiredEntries
+    .filter(([identity]) => !observedIdentities.has(identity) && failedIdentities.has(identity))
+    .map(([, path]) => path);
+  const uncoveredPaths = requiredEntries
+    .filter(([identity]) => !observedIdentities.has(identity))
+    .map(([, path]) => path);
+  return {
+    requiredPaths: requiredEntries.map(([, path]) => path),
+    coveredPaths,
+    failedPaths,
+    uncoveredPaths,
+  };
 }
 
 export interface SubagentResultEnvelope {
@@ -208,6 +279,17 @@ export interface SubagentResultEnvelope {
   /** Child-authored synthesis is a hypothesis; only provenance-backed evidence is trusted. */
   summaryTrust: "unverified_hypothesis";
   evidence: SubagentEvidenceItem[];
+  closureAudit?: {
+    state: "satisfied" | "partial" | "blocked";
+    observationCount: number;
+    substantiveEvidenceCount: number;
+    acceptedEvidenceToolCallIds: string[];
+    requiredPaths: string[];
+    coveredPaths: string[];
+    failedPaths: string[];
+    uncoveredPaths: string[];
+    reason: string;
+  };
   blocker?: string;
   remainingWork?: string;
   error?: string;
@@ -228,6 +310,13 @@ export interface SubagentExecutionScope {
   scopeKey: string;
   workspace: string;
   allowedPaths: string[];
+  /** Paths confirmed as files before the child model receives its first tool surface. */
+  allowedFilePaths: string[];
+  /** Remaining exact paths; directory tools may target only these entries. */
+  allowedDirectoryPaths: string[];
+  scopeKind: "exact_files" | "directory_or_mixed";
+  /** A scope-invalid tool is removed after its first blocked call in this child run. */
+  blockedToolNames: string[];
 }
 
 export interface RuntimeTraceContext {
@@ -255,13 +344,41 @@ function boundedCount(value: unknown): number {
 }
 
 /**
+ * Resolve dot segments before a path participates in a child-scope decision.
+ * A raw prefix check is not a security boundary: `src/../package.json` is not
+ * inside `src`, while `other/../src/main.ts` does overlap a `src` lease.
+ * Traversal above the supplied workspace-relative root is rejected.
+ */
+function normalizeSubagentScopePathIdentity(value: string): string {
+  const normalized = normalizeWorkspacePathIdentity(value);
+  if (!normalized) return "";
+  const drive = normalized.match(/^([a-z]:)\/(.*)$/i);
+  const absolute = normalized.startsWith("/");
+  const source = drive ? drive[2] : absolute ? normalized.slice(1) : normalized;
+  const segments: string[] = [];
+  for (const segment of source.split("/")) {
+    if (!segment || segment === ".") continue;
+    if (segment === "..") {
+      if (segments.length === 0) return "";
+      segments.pop();
+      continue;
+    }
+    segments.push(segment);
+  }
+  const joined = segments.join("/");
+  if (drive) return joined ? `${drive[1]}/${joined}` : `${drive[1]}/`;
+  if (absolute) return joined ? `/${joined}` : "/";
+  return joined || ".";
+}
+
+/**
  * Reduce path-like delegation hints to non-overlapping, canonical scopes.
  * Task count is deliberately excluded: several checklist items can still own
  * the same file and therefore do not prove that parallel work is independent.
  */
 export function normalizeIndependentDelegationScopeKeys(values: unknown[]): string[] {
   const normalized = [...new Set(values
-    .map((value) => normalizeWorkspacePathIdentity(String(value || "")))
+    .map((value) => normalizeSubagentScopePathIdentity(String(value || "")))
     .filter((value) => value && value !== "."))]
     .sort((left, right) => left.length - right.length || left.localeCompare(right));
   const independent: string[] = [];
@@ -326,8 +443,25 @@ export function resolveDelegationDecision(input: {
   if (pendingSubagentCount > 0) {
     return decision("defer", "pending_subagents_require_join");
   }
-  if (preference === "preferred") return decision("admit", "explicit_preference");
-  if (preference === "allowed") return decision("admit", "explicit_permission");
+  if (preference === "preferred" || preference === "allowed") {
+    // Preference changes priority, never the existence of useful work. The
+    // parent must identify at least one concrete path scope before spawning;
+    // runtime health remains an admission boundary just as it is for adaptive
+    // fan-out.
+    if (independentScopeCount === 0) {
+      return decision("defer", "insufficient_independent_scope");
+    }
+    if (input.runtimeHealth?.state === "degraded") {
+      return decision("defer", "runtime_capacity_degraded");
+    }
+    if (input.runtimeHealth?.state === "busy") {
+      return decision("defer", "runtime_capacity_busy");
+    }
+    return decision(
+      "admit",
+      preference === "preferred" ? "explicit_preference" : "explicit_permission",
+    );
+  }
   // Auto delegation is an initial-context optimization only. Files already
   // read by the parent and checklist length are evidence/telemetry, not a
   // reason to reopen fan-out during diagnosis.
@@ -583,7 +717,7 @@ export function parseSubagentAllowedPaths(value: unknown, workspace = ""): strin
     .filter(Boolean);
   const seen = new Set<string>();
   return paths.filter((path) => {
-    const identity = normalizeWorkspacePathIdentity(path);
+    const identity = normalizeSubagentScopePathIdentity(path);
     if (!identity || seen.has(identity)) return false;
     seen.add(identity);
     return true;
@@ -605,10 +739,10 @@ export function countParentObservedDelegationPaths(input: {
       if (entry.startsWith("file:")) return entry.slice("file:".length);
       return "";
     })
-    .map(normalizeWorkspacePathIdentity)
+    .map(normalizeSubagentScopePathIdentity)
     .filter(Boolean);
   return input.allowedPaths
-    .map(normalizeWorkspacePathIdentity)
+    .map(normalizeSubagentScopePathIdentity)
     .filter(Boolean)
     .filter((allowed) => observedPaths.some((observed) =>
       pathContains(allowed, observed) || pathContains(observed, allowed)
@@ -616,8 +750,8 @@ export function countParentObservedDelegationPaths(input: {
 }
 
 function pathContains(scopePath: string, targetPath: string): boolean {
-  const scope = normalizeWorkspacePathIdentity(scopePath);
-  const target = normalizeWorkspacePathIdentity(targetPath);
+  const scope = normalizeSubagentScopePathIdentity(scopePath);
+  const target = normalizeSubagentScopePathIdentity(targetPath);
   if (!scope || !target) return false;
   if (scope === ".") return true;
   return target === scope || target.startsWith(`${scope}/`);
@@ -626,14 +760,14 @@ function pathContains(scopePath: string, targetPath: string): boolean {
 export function acquireSubagentScopeLease(input: SubagentScopeLease): void {
   scopeLeases.set(input.subagentId, {
     ...input,
-    allowedPaths: input.allowedPaths.map(normalizeWorkspacePathIdentity).filter(Boolean),
+    allowedPaths: input.allowedPaths.map(normalizeSubagentScopePathIdentity).filter(Boolean),
   });
 }
 
 export function reserveSubagentScope(input: SubagentScopeLease): void {
   scopeReservations.set(input.subagentId, {
     ...input,
-    allowedPaths: input.allowedPaths.map(normalizeWorkspacePathIdentity).filter(Boolean),
+    allowedPaths: input.allowedPaths.map(normalizeSubagentScopePathIdentity).filter(Boolean),
   });
 }
 
@@ -655,10 +789,17 @@ export function findSubagentScopeConflict(input: {
   targetPath: string;
   currentSubagentId?: string | null;
 }): SubagentScopeLease | null {
-  for (const lease of scopeLeases.values()) {
+  // A reservation is ownership from the moment spawn is admitted. Waiting for
+  // the child to make its first tool call allowed the parent to duplicate the
+  // same reads during model startup.
+  const childOwnership = new Map<string, SubagentScopeLease>([
+    ...scopeReservations.entries(),
+    ...scopeLeases.entries(),
+  ]);
+  for (const lease of childOwnership.values()) {
     if (lease.threadId !== input.threadId) continue;
     if (lease.subagentId === input.currentSubagentId) continue;
-    const target = normalizeWorkspacePathIdentity(
+    const target = normalizeSubagentScopePathIdentity(
       relativizeToWorkspacePath(input.targetPath, lease.workspace),
     );
     if (!target) continue;
@@ -675,7 +816,7 @@ export function findSubagentLeaseOverlap(input: {
   allowedPaths: string[];
 }): SubagentScopeLease | null {
   const candidates = input.allowedPaths
-    .map((path) => normalizeWorkspacePathIdentity(relativizeToWorkspacePath(path, input.workspace)))
+    .map((path) => normalizeSubagentScopePathIdentity(relativizeToWorkspacePath(path, input.workspace)))
     .filter(Boolean);
   const childOwnership = new Map<string, SubagentScopeLease>([
     ...scopeReservations.entries(),
@@ -694,10 +835,70 @@ export function validateSubagentScopeTarget(
   scope: SubagentExecutionScope,
   targetPath: string,
 ): boolean {
-  const target = normalizeWorkspacePathIdentity(
+  const target = normalizeSubagentScopePathIdentity(
     relativizeToWorkspacePath(targetPath, scope.workspace),
   );
   return !!target && scope.allowedPaths.some((allowed) => pathContains(allowed, target));
+}
+
+export function resolveSubagentScopedReadTargets(input: {
+  scope: SubagentExecutionScope;
+  requestedPath: string;
+}):
+  | { action: "allow"; requestedPath: string; targets: string[] }
+  | { action: "narrow"; requestedPath: string; targets: string[]; reason: "root_default" | "ancestor_narrowed" }
+  | { action: "block"; requestedPath: string; targets: [] } {
+  const rawRequestedPath = String(input.requestedPath || "").trim().replace(/\\/g, "/");
+  if (rawRequestedPath && validateSubagentScopeTarget(input.scope, rawRequestedPath)) {
+    return { action: "allow", requestedPath: rawRequestedPath, targets: [rawRequestedPath] };
+  }
+
+  const isRootDefault = !rawRequestedPath || rawRequestedPath === "." || rawRequestedPath === "./";
+  const normalizedRequested = isRootDefault
+    ? "."
+    : normalizeSubagentScopePathIdentity(
+        relativizeToWorkspacePath(rawRequestedPath, input.scope.workspace),
+      );
+  // Invalid traversal and unrelated paths remain hard failures. Only a root
+  // default or a genuine ancestor of an owned path can be safely narrowed.
+  if (!isRootDefault && !normalizedRequested) {
+    return { action: "block", requestedPath: rawRequestedPath || ".", targets: [] };
+  }
+  const candidates = input.scope.allowedPaths.filter((allowed) =>
+    isRootDefault || pathContains(normalizedRequested, allowed)
+  );
+  if (candidates.length === 0) {
+    return { action: "block", requestedPath: rawRequestedPath || ".", targets: [] };
+  }
+  const candidateIdentities = new Set(candidates.map(normalizeSubagentScopePathIdentity));
+  const ownedDirectories = input.scope.allowedDirectoryPaths
+    .filter((path) => candidateIdentities.has(normalizeSubagentScopePathIdentity(path)));
+  const targets = candidates.filter((candidate, index) => {
+    const identity = normalizeSubagentScopePathIdentity(candidate);
+    if (!identity || candidates.findIndex((item) =>
+      normalizeSubagentScopePathIdentity(item) === identity
+    ) !== index) return false;
+    return !ownedDirectories.some((directory) => {
+      const directoryIdentity = normalizeSubagentScopePathIdentity(directory);
+      return directoryIdentity !== identity && pathContains(directoryIdentity, identity);
+    });
+  });
+  return {
+    action: "narrow",
+    requestedPath: rawRequestedPath || ".",
+    targets,
+    reason: isRootDefault ? "root_default" : "ancestor_narrowed",
+  };
+}
+
+export function recordSubagentScopeBlockedTool(
+  scope: SubagentExecutionScope,
+  toolName: string,
+): boolean {
+  const normalized = String(toolName || "").trim();
+  if (!normalized || scope.blockedToolNames.includes(normalized)) return false;
+  scope.blockedToolNames.push(normalized);
+  return true;
 }
 
 export function registerCoordinatedSubagentRun(input: CoordinatedSubagentRun): void {

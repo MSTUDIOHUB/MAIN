@@ -60,12 +60,42 @@ const {
   buildProviderCompatibilitySystemMessage,
   buildCompatibilityRetryMessages,
   buildTranscriptCompatibilityRetryMessages,
+  ensureProviderCompatibilityMode,
   isProviderCompatibilityErrorMessage,
   isProviderImageContentCompatibilityErrorMessage,
   isNativeToolCompatibilityErrorMessage,
 } = providerCompatibility;
 
 const { TOOL_FEEDBACK_ENVELOPE_PREFIX, formatToolFeedbackEnvelope } = toolFeedbackEnvelope;
+
+const readFileTool = {
+  type: "function",
+  function: {
+    name: "read_file",
+    description: "Read one workspace file.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string", description: "Workspace-relative path." } },
+      required: ["path"],
+    },
+  },
+};
+
+const writeFileTool = {
+  type: "function",
+  function: {
+    name: "write_file",
+    description: "Write one workspace file.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Workspace-relative path." },
+        content: { type: "string", description: "Full file content." },
+      },
+      required: ["path", "content"],
+    },
+  },
+};
 
 test("provider compatibility error helper matches weak OpenAI-compatible gateways", () => {
   assert.equal(
@@ -110,16 +140,37 @@ test("provider compatibility error helper matches weak OpenAI-compatible gateway
   );
 });
 
-test("provider compatibility prompt exposes XML write tools for implementation mode", () => {
-  const message = buildProviderCompatibilitySystemMessage("edit");
+test("provider compatibility prompt derives its XML catalog from the active edit schemas", () => {
+  const message = buildProviderCompatibilitySystemMessage("edit", [writeFileTool]);
 
   assert.equal(message.role, "system");
-  assert.match(message.content, /Tool access is available through XML tool calls/);
-  assert.match(message.content, /write_file: create or overwrite a workspace file/);
-  assert.match(message.content, /replace_in_file: edit an existing workspace file/);
-  assert.match(message.content, /run_command: run workspace commands/);
-  assert.match(message.content, /Never claim that write tools or folder access are unavailable/);
+  assert.match(message.content, /protocol=xml-text/);
+  assert.match(message.content, /write_file\(path: string, content: string\)/);
   assert.match(message.content, /<tool>write_file<\/tool>/);
+  assert.doesNotMatch(message.content, /replace_in_file|run_command|browser_evaluate|read_file/);
+});
+
+test("provider compatibility replaces a native tool card instead of appending a conflicting catalog", () => {
+  const messages = ensureProviderCompatibilityMode([{
+    role: "system",
+    content: [
+      "[ROLE]",
+      "Work on the request.",
+      "",
+      "[TOOLS]",
+      "profile=cloud/openai; protocol=native; available=write_file, run_command.",
+      "Call native tools directly and do not emit XML.",
+      "",
+      "[COMPLETION]",
+      "Use real evidence.",
+    ].join("\n"),
+  }], "edit", [writeFileTool]);
+
+  const text = messages.map((message) => String(message.content || "")).join("\n");
+  assert.equal((text.match(/\[TOOLS\]/g) || []).length, 1);
+  assert.match(text, /protocol=xml-text/);
+  assert.doesNotMatch(text, /protocol=native|run_command|do not emit XML/i);
+  assert.match(text, /\[ROLE\][\s\S]*\[COMPLETION\]/);
 });
 
 test("XML tool compatibility preserves multimodal user content while flattening tool history", () => {
@@ -188,7 +239,7 @@ test("transcript compatibility retry collapses history into one plain-text user 
     ] },
     { role: "assistant", content: "我先检查。" },
     { role: "tool", content: "{\"ok\":true}" },
-  ], "edit");
+  ], "edit", [readFileTool]);
 
   assert.equal(messages.length, 1);
   assert.equal(messages[0].role, "user");
@@ -198,7 +249,9 @@ test("transcript compatibility retry collapses history into one plain-text user 
   assert.match(messages[0].content, /\[User 2\]/);
   assert.match(messages[0].content, /\[Assistant 3\]/);
   assert.match(messages[0].content, /\[User 4\]/);
-  assert.match(messages[0].content, /emit XML <tool_use> blocks only/);
+  assert.match(messages[0].content, /read_file\(path: string\)/);
+  assert.match(messages[0].content, /emit only one XML call from the active catalog/);
+  assert.doesNotMatch(messages[0].content, /write_file|replace_in_file|run_command/);
   assert.match(messages[0].content, /status: provider_unsupported/);
   assert.match(messages[0].content, /imageCount: 1/);
 });

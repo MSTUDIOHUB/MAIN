@@ -209,6 +209,20 @@ export function resolveExecuteMaxIterationsRecoveryDecision(input: {
   });
 
   if (
+    input.recoveryState?.mode === "objective_audit" &&
+    input.recoveryState.decisionCheckpoint?.objectiveClosurePending === true
+  ) {
+    // A complete evidence ledger is necessary but not sufficient for an
+    // unstructured Direct Edit root. Preserve the explicit audit transaction
+    // until assistantCompletion records the no-tool closure handshake.
+    return {
+      mode: "objective_audit",
+      gap: closure.gap,
+      reason: "max_iterations_objective_audit_pending",
+    };
+  }
+
+  if (
     closure.gap === "validation_required" ||
     closure.gap === "validation_after_mutation_required"
   ) {
@@ -389,11 +403,7 @@ export interface PlanToolActivitySummary {
   readFileObservation?: FileReadObservationIdentity;
   /** Parser-backed declaration ranges retained without source prose. */
   astObservation?: PlanAstObservation;
-  /**
-   * Provenance for a child-owned observation. Joined summaries only inject a
-   * compact reference, never the complete source window, so the parent must
-   * perform its own targeted read before using it as mutation context.
-   */
+  /** Provenance for a child-owned observation and its exact source epoch. */
   delegatedObservation?: {
     owner: {
       agentKind: "subagent";
@@ -404,9 +414,11 @@ export interface PlanToolActivitySummary {
     sourceToolCallId?: string;
     sourceObservationKey?: string;
     sourceVersion?: string;
+    sourceContentHash?: string;
+    sourceContentChars?: number;
     sourceRange?: FileReadWindowIdentity;
-    parentContextState: "reference_only";
-    requiresParentReread: true;
+    parentContextState: "reference_only" | "version_verified";
+    requiresParentReread: boolean;
   };
 }
 

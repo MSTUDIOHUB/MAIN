@@ -31,6 +31,7 @@ export function annotateRequiredToolCallProtocolResult(
       protocolViolation: "required_tool_call_not_available",
       protocolAllowedTools: allowed ? [...allowed] : [],
       protocolActualTools: calls.map((call) => call.name),
+      protocolActualToolCalls: calls.map((call) => ({ ...call })),
     };
   }
   if (typeof toolChoice !== "object" || toolChoice.type !== "function") {
@@ -55,5 +56,6 @@ export function annotateRequiredToolCallProtocolResult(
     protocolViolation: "required_function_call_mismatch",
     protocolExpectedTool: expectedTool,
     protocolActualTools: calls.map((call) => call.name),
+    protocolActualToolCalls: calls.map((call) => ({ ...call })),
   };
 }

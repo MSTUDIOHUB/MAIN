@@ -3,6 +3,7 @@ import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
 import {
   analyzePlanDecisionFork,
   classifyPlanArtifactQualityResult,
+  isRuntimeTaskMutationSectionHeading,
   repairActionablePlanArtifactContent,
   validateActionablePlanArtifact,
   validatePlanArtifactContent,
@@ -292,6 +293,14 @@ function normalizePlanContent(rawText: string): string {
   const sanitized = sanitizePlanArtifactContent(strippedPlanJson);
   if (/^#\s+/m.test(sanitized)) return sanitized;
   return `# Plan\n\n${sanitized}`;
+}
+
+function hasSummaryRoleDocumentTitle(content: string): boolean {
+  const firstDocumentHeading = String(content || "")
+    .split(/\r?\n/)
+    .map((line) => line.trim().match(/^#\s+(.+?)\s*$/)?.[1] || "")
+    .find(Boolean) || "";
+  return /^(?:摘要|Summary)$/i.test(normalizePlanSectionRoleTitle(firstDocumentHeading));
 }
 
 function compactPlanLine(value: unknown, maxChars = 180, preserveFormatting = false): string {
@@ -1548,10 +1557,17 @@ const PLAN_GROUNDING_READ_TOOLS = new Set([
   "get_file_outline",
 ]);
 const PLAN_CHANGE_TARGET_FILE_RE = /(?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_@.-]+\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html|md)\b/gi;
-const PLAN_EXPLICIT_MUTATION_RE = /(?:修改|更新|改动|改为|新增|添加|实现|生成|创建|删除|重构|修复|替换|移除|接入|迁移|写入|持久化|归一化|统一|配置|扩展|支持|引入|拆分|合并|modify|update|change|add|implement|generate|create|delete|refactor|fix|replace|remove|wire|migrate|write|persist|normalize|configure|extend|support|introduce|split|merge)/i;
+const PLAN_DIAGNOSTIC_CLAIM_TARGET_FILE_RE = /(?:[A-Za-z0-9_@.-]+\/)*[A-Za-z0-9_@.-]+\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html|md|csv|tsv|xls|xlsx)\b/gi;
+const PLAN_EXPLICIT_MUTATION_RE = /(?:修改|更新|改动|改为|新增|添加|增加|实现|生成|创建|删除|重构|修复|替换|移除|接入|迁移|写入|持久化|归一化|统一|配置|扩展|支持|引入|拆分|合并|modify|update|change|add|implement|generate|create|delete|refactor|fix|replace|remove|wire|migrate|write|persist|normalize|configure|extend|support|introduce|split|merge)/i;
 const PLAN_NEW_FILE_LINE_RE = /(?:新增文件|新建文件|创建新文件|add\s+(?:a\s+)?new\s+file|create\s+(?:a\s+)?new\s+file)/i;
-const PLAN_CONFIRMED_EVIDENCE_HEADING_RE = /(?:^|\n)\s*#{1,6}\s*(?:已确认(?:事实|发现|证据)|已读证据|证据依据|当前状态|当前实现|现有架构|项目背景|实现约束|Confirmed (?:Facts|Findings|Evidence)|Read Evidence|Evidence|Current State|Current Implementation|Existing Architecture|Project Context|Implementation Constraints)\s*$/im;
+const PLAN_CONFIRMED_EVIDENCE_HEADING_RE = /(?:^|\n)\s*#{1,6}\s*(?:\d+\s*[.)、:：-]?\s*)?(?:已确认(?:事实|发现|证据)|已读证据|证据依据|证据归因|当前状态|当前实现|现有架构|项目背景|实现约束|Confirmed (?:Facts|Findings|Evidence)|Read Evidence|Evidence(?: Mapping)?|Current State|Current Implementation|Existing Architecture|Project Context|Implementation Constraints)(?:\s*(?:[（(][^()（）\r\n]{1,60}[）)]|[:：—-]\s*[^#\r\n]{1,60}))?\s*$/im;
 const PLAN_KEY_CHANGES_HEADING_RE = /^(?:关键改动|关键实现改动|实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|落地方案|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Plan of Work)$/i;
+
+function isPlanGroundingMutationSectionHeading(heading: string): boolean {
+  const normalized = normalizePlanSectionRoleTitle(heading);
+  return PLAN_KEY_CHANGES_HEADING_RE.test(normalized) ||
+    isRuntimeTaskMutationSectionHeading(normalized);
+}
 
 function normalizePlanGroundingPath(value: string): string {
   return String(value || "")
@@ -1623,7 +1639,7 @@ function collectPlanChangeTargets(content: string): string[] {
   const targets: string[] = [];
   const keyChangesBody = extractPlanGroundingSectionBody(
     content,
-    PLAN_KEY_CHANGES_HEADING_RE,
+    isPlanGroundingMutationSectionHeading,
   );
   for (const rawLine of keyChangesBody.split(/\r?\n/)) {
     const line = rawLine.trim();
@@ -1723,23 +1739,39 @@ export function validateExplicitPlanCodeChangeGrounding(input: {
   return classifyPlanArtifactQualityResult({ ok: true });
 }
 
-function extractPlanGroundingSectionBody(content: string, headingPattern: RegExp): string {
+function extractPlanGroundingSectionBody(
+  content: string,
+  headingMatcher: RegExp | ((heading: string) => boolean),
+): string {
   const body: string[] = [];
-  let inSection = false;
+  let sectionLevel = 0;
+  const matchesHeading = (heading: string): boolean => {
+    if (typeof headingMatcher === "function") return headingMatcher(heading);
+    headingMatcher.lastIndex = 0;
+    return headingMatcher.test(heading);
+  };
   for (const line of String(content || "").split(/\r?\n/)) {
-    const heading = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    const heading = line.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
     if (heading) {
-      if (inSection) break;
-      inSection = headingPattern.test(heading[1] || "");
+      const level = heading[1]?.length || 0;
+      const title = heading[2] || "";
+      if (sectionLevel > 0 && level > sectionLevel) {
+        // Descendant headings are part of the owning mutation section. Keep
+        // their text so a file-bearing child heading is audited as a change.
+        body.push(title);
+        continue;
+      }
+      if (sectionLevel > 0 && level <= sectionLevel) sectionLevel = 0;
+      if (matchesHeading(title)) sectionLevel = level;
       continue;
     }
-    if (inSection) body.push(line);
+    if (sectionLevel > 0) body.push(line);
   }
   return body.join("\n").trim();
 }
 
 const PLAN_VALIDATION_TARGET_HEADING_RE =
-  /^(?:验证(?:方式|标准|方案|步骤)?|测试(?:方案|计划|场景|步骤)?|验收(?:标准|方案|步骤)?|Validation(?:\s+(?:Plan|Steps|Standards?|Strategy))?|Verification(?:\s+(?:Plan|Steps|Standards?|Strategy))?|Testing|Tests?|Test Plan|Acceptance(?:\s+(?:Criteria|Plan|Steps))?)$/i;
+  /^(?:\d+\s*[.)、:：-]?\s*)?(?:验证(?:方式|标准|方案|步骤)?|测试(?:方案|计划|场景|步骤)?|构建(?:检查)?|验收(?:标准|方案|步骤)?|Validation(?:\s+(?:Plan|Steps|Standards?|Strategy))?|Verification(?:\s+(?:Plan|Steps|Standards?|Strategy))?|Testing|Tests?|Test Plan|Acceptance(?:\s+(?:Criteria|Plan|Steps))?|Build(?: Checks?)?|Checks?)(?:\s*(?:[（(][^()（）\r\n]{1,60}[）)]|[:：—-]\s*[^#\r\n]{1,60}))?$/i;
 const LOCALHOST_WITH_PORT_RE = /(https?:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):)(\d{1,5})/gi;
 const DEV_SERVER_CONFIG_TARGET_RE =
   /(?:^|\/)(?:package\.json|angular\.json|tauri\.conf\.json|(?:electron\.)?vite\.config\.[cm]?[jt]s|webpack\.config\.[cm]?[jt]s|rspack\.config\.[cm]?[jt]s|rsbuild\.config\.[cm]?[jt]s|next\.config\.[cm]?[jt]s|nuxt\.config\.[cm]?[jt]s|astro\.config\.[cm]?[jt]s|svelte\.config\.[cm]?[jt]s|wxt\.config\.[cm]?[jt]s)$/i;
@@ -1827,7 +1859,10 @@ export function repairPlanValidationTargetFromEvidence(input: {
   const observedPorts = observed.ports;
   if (observedPorts.length !== 1) return { content: input.content, repaired: false };
 
-  const keyChanges = extractPlanGroundingSectionBody(input.content, PLAN_KEY_CHANGES_HEADING_RE);
+  const keyChanges = extractPlanGroundingSectionBody(
+    input.content,
+    isPlanGroundingMutationSectionHeading,
+  );
   const normalizedKeyChanges = normalizePlanGroundingPath(keyChanges);
   const explicitlyProposedPorts = extractDevServerPortsFromConfigEvidence(keyChanges);
   const mentionsObservedConfig = observed.targets.some((target) => {
@@ -1869,6 +1904,9 @@ export function repairPlanValidationTargetFromEvidence(input: {
 
 const PLAN_ABSENCE_CLAIM_RE =
   /(?:缺少|不存在|没有|未(?:注册|添加|实现|调用|使用|定义|监听)|\bmissing\b|\babsent\b|\bwithout\b|\bnot\s+(?:present|registered|implemented|called|used|defined)\b)/i;
+const PLAN_TABULAR_CLAIM_RE =
+  /(?:\b(?:csv|tsv|xls|xlsx|spreadsheet)\b|表格|数据源|物理层)/i;
+const PLAN_TABULAR_EVIDENCE_TARGET_RE = /\.(?:csv|tsv|xls|xlsx)$/i;
 
 function collectReadEvidenceForClaimGrounding(input: {
   evidenceRecords?: PlanEvidenceRecord[];
@@ -2033,11 +2071,24 @@ export function findContradictedPlanDiagnosticClaim(input: {
     if (!claim) continue;
     const identifiers = collectDirectAbsenceClaimIdentifiers(line);
     if (identifiers.length === 0) continue;
-    const lineTargets = [...line.matchAll(PLAN_CHANGE_TARGET_FILE_RE)]
+    const lineTargets = [...line.matchAll(PLAN_DIAGNOSTIC_CLAIM_TARGET_FILE_RE)]
       .map((match) => normalizePlanGroundingPath(match[0] || ""));
-    const relevantEvidence = lineTargets.length > 0
+    const targetMatchedEvidence = lineTargets.length > 0
       ? evidence.filter((item) => lineTargets.some((target) => planGroundingPathsMatch(target, item.target)))
-      : evidence;
+      : [];
+    const tabularEvidence = PLAN_TABULAR_CLAIM_RE.test(line)
+      ? evidence.filter((item) => PLAN_TABULAR_EVIDENCE_TARGET_RE.test(item.target))
+      : [];
+    // Absence is always relative to a source. A statement such as "the CSV
+    // has no creatorName column" is not contradicted by a TypeScript interface
+    // that defines creatorName. Prefer an exact line target, then a clearly
+    // named source family, and only fall back to all evidence when the claim
+    // itself has no usable scope.
+    const relevantEvidence = lineTargets.length > 0
+      ? targetMatchedEvidence
+      : tabularEvidence.length > 0
+        ? tabularEvidence
+        : evidence;
     for (const identifier of identifiers) {
       const hasPositiveObservation = relevantEvidence.some((item) => {
         return evidenceContainsPositiveIdentifierObservation(item.detail, identifier, line);
@@ -2075,7 +2126,7 @@ export function validatePlanEvidenceGrounding(input: {
 
   const keyChangesBody = extractPlanGroundingSectionBody(
     input.content,
-    PLAN_KEY_CHANGES_HEADING_RE,
+    isPlanGroundingMutationSectionHeading,
   );
   const hasSourceBackedMutationPlan =
     readTargets.some((target) => /\.(?:tsx?|jsx?|mjs|cjs|swift|py|rs|go|json|toml|ya?ml|css|scss|html)$/i.test(target)) &&
@@ -3147,7 +3198,9 @@ export function canonicalizePlanArtifactContent(input: {
   const validationLines = collectLinesFromSections(sections, [
     // Match the validation role instead of loose substrings such as
     // unverified assumptions. Descendants of a validation heading are kept.
-    /^(?:验证(?:方式|标准|方案|步骤)?|测试(?:方案|计划|场景|步骤)?|构建(?:检查)?|验收(?:标准|方案)?|Validation(?: Plan| Steps| Standards?)?|Testing|Test Plan|Acceptance(?: Criteria| Plan)?|Build(?: Checks?)?|Checks?)$/i,
+    // Numbered bilingual headings such as `3. 测试方案 (Validation)` are one
+    // semantic role, not a different plan dialect.
+    PLAN_VALIDATION_TARGET_HEADING_RE,
   ], 8, 4000, true, true, true);
 
   const hasRequiredSignals = [
@@ -3504,6 +3557,36 @@ export function materializePlanArtifactFromVisibleText(input: {
       content = compacted;
       validation = compactedValidation;
       source = "deterministically_compacted_visible_plan";
+    }
+  }
+  if (
+    !validation.ok &&
+    hasSummaryRoleDocumentTitle(content) &&
+    /^(?:raw_evidence_in_plan_summary|missing_plan_required_sections:)/i.test(validation.reason || "")
+  ) {
+    // `# 摘要` followed by numbered H2/H3 evidence/change/test sections is a
+    // recoverable hierarchy error. Canonicalize the already-visible facts and
+    // roles before inserting isolated scaffold sections, so the review artifact
+    // gets a document title and sibling sections without dropping evidence.
+    const canonical = canonicalizePlanArtifactContent({
+      content,
+      userGoal: input.userGoal,
+      evidence: input.evidence,
+      evidenceRecords: input.evidenceRecords,
+      files: input.files,
+      recentToolActivity: input.recentToolActivity,
+      turnContext: input.turnContext,
+      language: input.language,
+    });
+    if (canonical) {
+      const canonicalValidation = validateActionablePlanArtifact(canonical);
+      if (canonicalValidation.ok) {
+        content = canonical;
+        validation = canonicalValidation;
+        source = input.sourceHint === "deterministic_evidence"
+          ? "deterministic_evidence"
+          : "canonicalized_visible_plan";
+      }
     }
   }
   if (!validation.ok && validation.canAutoRepair) {

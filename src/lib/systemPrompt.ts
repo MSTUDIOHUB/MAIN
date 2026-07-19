@@ -6,7 +6,6 @@ import type { Lang, Skill } from "./appTypes";
 import type { ResolvedInstructionSet } from "./instructions";
 import type { PendingSlashCommand, StudioAgentKey, StudioConfig } from "./gameStudio/catalog";
 import { mapLegacyNexusModeToMainMode, type MainModeKey } from "./mainModes";
-import { getCachedCapabilities, heuristicDetectCapabilities } from "./modelProbe";
 import {
   getApplicableProtocolPackagesForWorkspace,
   getProtocolPackageEntryPath,
@@ -60,11 +59,12 @@ export type ToolProtocolCardProfile = {
   model?: string | null;
   toolProtocol?: string | null;
   nativeToolsEnabled?: boolean;
-  modelProtocolNotes?: string[];
   workflowMode?: "chat" | "edit" | "plan";
   availableToolNames?: string[];
   /** Exact active definitions. Native and XML paths must derive from these schemas. */
   toolDefinitions?: ToolDefinition[];
+  /** Runtime compaction may omit prose descriptions while retaining exact signatures. */
+  descriptionMaxChars?: number;
   language?: Lang;
 };
 
@@ -75,34 +75,17 @@ function languageName(language: Lang | undefined, fallback: Lang = "zh"): string
 }
 
 export function detectInstructionLanguage(
-  model: string | null | undefined,
+  _model: string | null | undefined,
   preferredResponseLanguage: Lang,
   strategy: PromptLanguageStrategy,
-  provider?: string,
+  _provider?: string,
 ): "en" | "zh" {
   if (strategy === "pure_user_language") return preferredResponseLanguage === "en" ? "en" : "zh";
   if (strategy === "pure_english" || strategy === "english_core_localized_output") return "en";
-  if (!model) return preferredResponseLanguage === "en" ? "en" : "zh";
-
-  if (provider) {
-    const cacheKey = `probe:${provider.toLowerCase()}:${model.toLowerCase()}`;
-    const cached = getCachedCapabilities(cacheKey);
-    if (cached) return cached.instructionLanguage;
-  }
-  return heuristicDetectCapabilities(model, preferredResponseLanguage).instructionLanguage;
-}
-
-function resolveCapabilityLevel(
-  model: string | undefined,
-  provider: string | undefined,
-  preferredResponseLanguage: Lang,
-): number {
-  if (!model) return 2;
-  if (provider) {
-    const cached = getCachedCapabilities(`probe:${provider.toLowerCase()}:${model.toLowerCase()}`);
-    if (cached) return cached.capabilityLevel;
-  }
-  return heuristicDetectCapabilities(model, preferredResponseLanguage).capabilityLevel;
+  // `model_aware` is retained as a persisted setting name, but instruction
+  // language is deliberately model-neutral. Switching local models must not
+  // silently change the guidance contract.
+  return preferredResponseLanguage === "en" ? "en" : "zh";
 }
 
 export function buildLanguageContract(input: {
@@ -143,10 +126,12 @@ function compactSchemaSignature(tool: ToolDefinition): string {
   return `${tool.function.name}(${args})`;
 }
 
-function compactSchemaDescription(description: string): string {
+function compactSchemaDescription(description: string, maxChars = 180): string {
   const normalized = String(description || "").replace(/\s+/g, " ").trim();
-  if (normalized.length <= 180) return normalized;
-  return `${normalized.slice(0, 177)}...`;
+  if (maxChars <= 0) return "";
+  if (normalized.length <= maxChars) return normalized;
+  if (maxChars <= 3) return normalized.slice(0, maxChars);
+  return `${normalized.slice(0, maxChars - 3)}...`;
 }
 
 function schemaExampleValue(name: string, schema: { type?: string; enum?: string[] }): string {
@@ -198,10 +183,6 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     (rawProtocol === "auto" || rawProtocol === "")
   );
   const provider = `${profile.activeProfile || "unknown"}/${profile.provider || "unknown"}`;
-  const modelNotes = (profile.modelProtocolNotes || [])
-    .map((note) => String(note || "").trim())
-    .filter(Boolean)
-    .slice(0, 2);
 
   if (!usesXml && profile.nativeToolsEnabled) {
     return [
@@ -210,7 +191,6 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
       language === "zh"
         ? "工具 schema 是名称、参数和描述的唯一事实来源。需要工具时直接发起 native tool call；不要在正文复制工具目录、伪造 JSON/XML 或输出 `[Tool call: ...]`。"
         : "The native schemas are the sole source of truth for tool names, arguments, and descriptions. Call tools directly; do not copy a tool catalog into prose or emit pseudo JSON/XML or `[Tool call: ...]`.",
-      ...modelNotes.map((note) => `Provider normalization: ${note}`),
     ].join("\n");
   }
 
@@ -226,7 +206,10 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
 
   const catalog = definitions.length > 0
     ? definitions.map((tool) => {
-        const description = compactSchemaDescription(tool.function.description);
+        const description = compactSchemaDescription(
+          tool.function.description,
+          profile.descriptionMaxChars,
+        );
         return `- ${compactSchemaSignature(tool)}${description ? ` — ${description}` : ""}`;
       })
     : availableNames.map((name) => `- ${name}()`);
@@ -243,7 +226,6 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
     language === "zh"
       ? "禁止输出 `[Tool call: ...]`、`<tool_code>` 或自然语言工具占位符。"
       : "Never emit `[Tool call: ...]`, `<tool_code>`, or a prose placeholder for a tool call.",
-    ...modelNotes.map((note) => `Provider normalization: ${note}`),
   ].join("\n");
 }
 
@@ -321,12 +303,8 @@ function joinWithinPromptBudget(sections: string[]): string {
 function buildIntentModule(input: {
   intent: ResolvedUserIntent;
   contract: EffectiveTurnContract;
-  availableTools: string[];
 }): string {
-  const { intent, contract, availableTools } = input;
-  const available = new Set(availableTools);
-  const writeTools = ["apply_patch", "replace_in_file", "write_file"].filter((name) => available.has(name));
-  const validationTools = ["run_command", "execute_command", "browser_evaluate", "git_diff"].filter((name) => available.has(name));
+  const { intent, contract } = input;
 
   if (intent === "plan") {
     return makeSection("PLAN", [
@@ -340,8 +318,7 @@ function buildIntentModule(input: {
 
   if (intent === "execute") {
     return makeSection("EXECUTE", [
-      `Available mutation tools: ${writeTools.join(", ") || "none"}.`,
-      `Available validation tools: ${validationTools.join(", ") || "none"}.`,
+      "Treat the active tool schemas above as the sole capability surface; built-in, MCP, engine, and browser tools may all provide valid task-specific actions.",
       "Act on the user request with the smallest relevant context reads and targeted edits. Do not stop after narrating intended steps when an exposed tool can perform the next safe action.",
       "Prefer a delta edit over rewriting a large existing file. After editing, inspect the actual diff when available and run the most relevant exposed validation.",
       "A successful write proves only that exact mutation. It does not prove that the user's other requested outcomes are complete.",
@@ -525,12 +502,12 @@ export function buildSystemPrompt(
     language: instructionLanguage,
   }));
 
-  sections.push(buildIntentModule({ intent, contract, availableTools: tools }));
+  sections.push(buildIntentModule({ intent, contract }));
 
   sections.push(makeSection("COMPLETION", [
     "Track every requested outcome, not merely whether any tool succeeded. A mutation, command, or read is evidence for only the outcome it actually addresses.",
     "Before reporting completion, confirm that each requested outcome has corresponding artifact/diff evidence and that required validation ran successfully.",
-    "If the model discovers that another safe edit is still needed during validation, request that edit tool; the runtime may reopen mutation once while retaining the pending validation checkpoint.",
+    "If another safe edit is still needed during validation, request that edit tool; the runtime may reopen the mutation phase for distinct remaining outcomes within a finite runtime limit while retaining the pending validation checkpoint.",
     "If work cannot continue, state the exact unresolved outcome, attempted evidence, and blocker. Keep completed, paused, failed, aborted, and no-action outcomes distinct.",
   ]));
 
@@ -556,18 +533,6 @@ export function buildSystemPrompt(
 
   if (intent === "goal" && goalTurnContract?.context) {
     sections.push(makeSection("GOAL RUNTIME CONTRACT", [compactExternalContent(goalTurnContract.context, 5_000)]));
-  }
-
-  // Keep provider adaptation structural and bounded; stronger models do not need extra ceremony.
-  const capabilityLevel = resolveCapabilityLevel(
-    toolProtocolProfile?.model || undefined,
-    toolProtocolProfile?.provider || toolProtocolProfile?.activeProfile,
-    responseLanguage,
-  );
-  if (capabilityLevel <= 1) {
-    sections.push(makeSection("LOCAL MODEL FOCUS", [
-      "Choose one concrete next action at a time. Use exact schema argument names and inspect the latest tool result before selecting the next action.",
-    ]));
   }
 
   sections.push(...buildInstructionSections(skills, workspace, resolvedInstructions));

@@ -25,6 +25,7 @@ import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
 import type { PlanEvidenceRecoveryObjective } from "./planRuntimeState";
 import {
   extractDelegatedSubagentActivities,
+  extractSubagentParentRereadObligations,
   isVerificationEvidenceResult,
   rememberDelegatedSubagentActivities,
   rememberToolActivity,
@@ -84,6 +85,7 @@ export function handleToolResultPostProcessing(input: {
   unityConsoleRefreshObservedAfterWrite: boolean;
   unityMcpForceConsoleFirstPending: boolean;
   unityConsoleMissingFirstToolRepromptIssued: boolean;
+  forceXmlTools: boolean;
   recentSuccessfulProjectWrite: RecentSuccessfulProjectWrite;
   recoveringFromEmptyAssistantReplyAfterWrite: boolean;
   markExecuteOperationEvidence: () => void;
@@ -127,7 +129,9 @@ export function handleToolResultPostProcessing(input: {
   // become user progress, execution evidence, task targeting or success usage.
   const externalResults = results.filter((result) => !result.internalFeedback);
   externalResults.forEach((result) => callbacks.onToolResultObserved?.(result));
-  const delegatedActivities = externalResults.flatMap(extractDelegatedSubagentActivities);
+  const delegatedEvidenceActivities = externalResults.flatMap(extractDelegatedSubagentActivities);
+  const parentRereadObligations = externalResults.flatMap(extractSubagentParentRereadObligations);
+  const delegatedActivities = [...delegatedEvidenceActivities, ...parentRereadObligations];
   const directlyTrackedResults = externalResults.filter((result) =>
     result.name !== "spawn_subagent" && result.name !== "wait_subagents"
   );
@@ -183,20 +187,18 @@ export function handleToolResultPostProcessing(input: {
     );
     if (targetingEvidenceKey) taskTargetingEvidence.add(targetingEvidenceKey);
   }
-  if (delegatedActivities.length > 0) {
+  if (delegatedEvidenceActivities.length > 0) {
     callbacks.onDebugEvent?.("subagent_evidence_promoted", {
       iteration,
-      evidenceCount: delegatedActivities.length,
+      evidenceCount: delegatedEvidenceActivities.length,
       provenanceSource: "tool_observation",
       summaryProseTrusted: false,
-      childOwnedObservationCount: delegatedActivities.filter((activity) =>
+      childOwnedObservationCount: delegatedEvidenceActivities.filter((activity) =>
         activity.delegatedObservation?.owner.agentKind === "subagent"
       ).length,
       parentConsumedObservationCount: 0,
-      requiresParentRereadCount: delegatedActivities.filter((activity) =>
-        activity.delegatedObservation?.requiresParentReread === true
-      ).length,
-      targets: delegatedActivities.map((activity) => activity.target).slice(0, 12),
+      requiresParentRereadCount: parentRereadObligations.length,
+      targets: delegatedEvidenceActivities.map((activity) => activity.target).slice(0, 12),
     });
   }
 
@@ -204,6 +206,7 @@ export function handleToolResultPostProcessing(input: {
     results: externalResults,
     unityMcpForceConsoleFirstPending,
     unityConsoleMissingFirstToolRepromptIssued,
+    forceXmlTools: input.forceXmlTools,
     language: MODEL_CONTROL_LANGUAGE,
   });
   if (unityConsoleResult.fallbackReason) {

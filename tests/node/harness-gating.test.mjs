@@ -195,10 +195,15 @@ test("isShellFileReadCommand detects read commands after directory changes", () 
 });
 
 test("orchestrator reports shell-read misuse before shell metadata errors", () => {
-  const source = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
-  const shellReadIndex = source.indexOf("const shellReadValidationErrorBeforeContract = buildShellReadValidationError");
-  const contractIndex = source.indexOf("const validationError = validateToolExecutionContract");
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const lifecycleStart = source.indexOf("async function executeToolCallWithLifecycle");
+  const lifecycleEnd = source.indexOf("export async function autoMaterializePlanArtifactFromVisibleText", lifecycleStart);
+  const lifecycleSource = source.slice(lifecycleStart, lifecycleEnd);
+  const shellReadIndex = lifecycleSource.indexOf("const shellReadValidationErrorBeforeContract = buildShellReadValidationError");
+  const contractIndex = lifecycleSource.indexOf("const validationError = validateToolExecutionContract");
 
+  assert.ok(lifecycleStart > 0);
+  assert.ok(lifecycleEnd > lifecycleStart);
   assert.ok(shellReadIndex > 0);
   assert.ok(contractIndex > 0);
   assert.ok(shellReadIndex < contractIndex);
@@ -704,6 +709,42 @@ test("buildReadBeforeModifyValidationError blocks write_file when file exists an
 
   assert.ok(okSmall);
   assert.match(okSmall.content, /READ_BEFORE_MODIFY_BLOCKED/);
+});
+
+test("buildReadBeforeModifyValidationError distinguishes confirmed absence from metadata failure", async () => {
+  const tc = { id: "call_write_metadata_probe", name: "write_file" };
+  const callbacks = createMockCallbacks({
+    getSessionKey: () => "mock-session-metadata-probe",
+  });
+
+  globalThis.mockIpcInvoke = async (cmd) => {
+    if (cmd === "get_file_metadata") {
+      throw new Error("FILE_METADATA_NOT_FOUND: No such file or directory");
+    }
+    return {};
+  };
+  const confirmedNew = await buildReadBeforeModifyValidationError(
+    tc,
+    { path: "src/NewPanel.tsx" },
+    ".",
+    callbacks,
+  );
+  assert.equal(confirmedNew, null, "workspace structure is sufficient for a confirmed new file");
+
+  globalThis.mockIpcInvoke = async (cmd) => {
+    if (cmd === "get_file_metadata") {
+      throw new Error("FILE_METADATA_UNAVAILABLE: Permission denied");
+    }
+    return {};
+  };
+  const unknown = await buildReadBeforeModifyValidationError(
+    tc,
+    { path: "src/PrivatePanel.tsx" },
+    ".",
+    callbacks,
+  );
+  assert.ok(unknown);
+  assert.match(unknown.content, /WRITE_FILE_METADATA_UNAVAILABLE/);
 });
 
 test("buildReadBeforeModifyValidationError recovers read evidence from message history", async () => {

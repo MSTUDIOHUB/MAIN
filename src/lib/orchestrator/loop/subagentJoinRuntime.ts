@@ -2,6 +2,7 @@ import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { OrchestratorCallbacks, ToolExecutionResult } from "../types";
 import {
   extractDelegatedSubagentActivities,
+  extractSubagentParentRereadObligations,
   rememberDelegatedSubagentActivities,
 } from "./toolActivityTracking";
 
@@ -39,8 +40,8 @@ export async function joinPendingSubagentsForParent(input: {
   input.callbacks.appendMessage({
     role: "user",
     content: input.callbacks.getPreferredLanguage() === "zh"
-      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。summary 是子模型生成的未验证假设，不能单独作为事实；只有 provenance.source=tool_observation、带 owner 且带工具调用或源码观察身份的 evidence 才是可信线索。join 仅注入紧凑引用，不会把 child 的源码窗口变成 parent 已消费上下文；在据此修改文件前，必须在租约释放后对相同目标做一次定向 read_file。\n${content}`
-      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. Each summary is an unverified child hypothesis and is not evidence by itself; only evidence with provenance.source=tool_observation, an owner, and a tool-call or source-observation identity is a trusted lead. Join injects only a compact reference and never turns a child's source window into parent-consumed context; before mutating from it, perform a targeted read_file for the same target after the lease is released.\n${content}`,
+      ? `SUBAGENT_JOIN_RESULT：运行时已汇合子智能体。summary 是子模型生成的未验证假设，不能单独作为事实；只有 provenance.source=tool_observation、带 owner、工具调用身份、版本和内容哈希的 evidence 才可复用。缺少完整版本身份或不具备自校验能力的修改，只能在租约释放后把对应路径作为定向 parent read_file 候选。degraded/blocked 子任务不会提升为完成证据；其 failed/uncovered 精确路径也仅作为父任务补读候选。若用户禁止主线程重读，则必须保留为未解决阻塞，不能把补读或 partial output 宣称为完成。\n${content}`
+      : `SUBAGENT_JOIN_RESULT: The runtime joined the subagents. Each summary is an unverified child hypothesis and is not evidence by itself. Evidence is reusable only with tool_observation provenance, owner, tool-call identity, version, and content hash. Evidence without complete version identity, or a mutation that cannot self-verify its source context, remains only a targeted parent read_file candidate after the lease is released. A degraded/blocked child is never promoted as completion evidence; exact failed/uncovered paths are also only parent-reread candidates. If the user forbids parent rereads, keep them as unresolved blockers and do not claim the reread or partial output as completion.\n${content}`,
   });
   const syntheticResult: ToolExecutionResult = {
     toolCallId: `runtime-wait-subagents-${Date.now()}`,
@@ -50,7 +51,9 @@ export async function joinPendingSubagentsForParent(input: {
     isError: false,
     lifecycleState: "completed",
   };
-  const delegatedActivities = extractDelegatedSubagentActivities(syntheticResult);
+  const delegatedEvidenceActivities = extractDelegatedSubagentActivities(syntheticResult);
+  const parentRereadObligations = extractSubagentParentRereadObligations(syntheticResult);
+  const delegatedActivities = [...delegatedEvidenceActivities, ...parentRereadObligations];
   const sourceEvidenceCount = joined.results.reduce(
     (count, entry) => count + entry.evidence.length,
     0,
@@ -65,20 +68,28 @@ export async function joinPendingSubagentsForParent(input: {
     requestedIds: pendingIds,
     resultIds: joined.results.map((entry) => entry.subagentId),
     statuses: joined.results.map((entry) => entry.status),
-    evidenceCount: delegatedActivities.length,
+    evidenceCount: delegatedEvidenceActivities.length,
     sourceEvidenceCount,
     evidenceAdoptionRate: sourceEvidenceCount > 0
-      ? delegatedActivities.length / sourceEvidenceCount
+      ? delegatedEvidenceActivities.length / sourceEvidenceCount
       : 0,
     distinctEvidenceTargets,
     requiredParentRereads: delegatedActivities.filter((activity) =>
       activity.delegatedObservation?.requiresParentReread === true
     ).length,
+    versionedReuseCandidates: delegatedActivities.filter((activity) =>
+      activity.name === "read_file" &&
+      !!activity.delegatedObservation?.sourceToolCallId &&
+      !!activity.delegatedObservation?.sourceObservationKey &&
+      !!activity.delegatedObservation?.sourceVersion &&
+      !!activity.delegatedObservation?.sourceContentHash &&
+      Number.isFinite(activity.delegatedObservation?.sourceContentChars)
+    ).length,
     potentialParentDiscoveryReadsAvoided: distinctEvidenceTargets,
     baselineComparison: "not_available",
     summaryProseTrusted: false,
-    provenanceBackedEvidenceCount: delegatedActivities.length,
-    delegatedObservationReuse: "reference_only_requires_parent_reread",
+    provenanceBackedEvidenceCount: delegatedEvidenceActivities.length,
+    delegatedObservationReuse: "version_checked_self_verifying_mutations_only",
     pendingIds: joined.pendingIds,
   });
   return true;

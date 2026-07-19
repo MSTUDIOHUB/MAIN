@@ -422,7 +422,10 @@ export async function prepareIterationStreamRequest(input: {
     managedAgentMessages: contextManagementResult.managedAgentMessages,
     iteration,
   });
-  if (toolSurfaceDecision.recoveryActionContract.phase !== "normal") {
+  if (
+    toolSurfaceDecision.recoveryActionContract.phase !== "normal" ||
+    toolSurfaceDecision.recoveryActionContract.modeLabel === "objective_audit"
+  ) {
     const contractCard = buildExecutionActionContractCard({
       contract: toolSurfaceDecision.recoveryActionContract,
       language: MODEL_CONTROL_LANGUAGE,
@@ -523,6 +526,10 @@ export async function prepareIterationStreamRequest(input: {
       ),
       forceXmlTools: contextManagementResult.forceXmlTools,
     });
+
+  callbacks.onToolSurfaceResolved?.(
+    toolSurfaceDecision.iterationAllTools.map((tool) => tool.function.name),
+  );
 
   callbacks.onDebugEvent?.("agent.iteration_start", {
     iteration,

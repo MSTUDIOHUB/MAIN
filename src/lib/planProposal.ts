@@ -152,10 +152,11 @@ export function hasPlanDraftPreview(text: string): boolean {
 }
 
 // ── Tiered Plan Output Support ──────────────────────────────────────
-// Allows models of varying capability to produce usable plan output.
-// Tier 1 = full structured format (strong models)
-// Tier 2 = <proposed_plan> wrapped markdown (medium models)
-// Tier 3 = plain structured markdown (weak/quantized models)
+// Accept the supported document/protocol shapes without inferring anything
+// about the model that produced them.
+// Tier 1 = full structured protocol.
+// Tier 2 = <proposed_plan> wrapped Markdown.
+// Tier 3 = plain structured Markdown compatibility output.
 
 export interface TextPlanProposal {
   kind: "tier2_proposed_plan" | "tier3_plaintext";

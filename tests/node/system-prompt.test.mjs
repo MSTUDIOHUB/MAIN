@@ -104,6 +104,7 @@ function buildPrompt({
   gameStudio,
   priority,
   goal,
+  model = "qwen3.6",
 } = {}) {
   return buildSystemPrompt(
     [],
@@ -125,7 +126,7 @@ function buildPrompt({
     {
       activeProfile: "local",
       provider: "OMLX",
-      model: "qwen3.6",
+      model,
       toolProtocol: native ? "native" : "xml",
       nativeToolsEnabled: native,
       toolDefinitions,
@@ -145,6 +146,9 @@ test("generated core prompt is compact and states the actual completion contract
   assert.match(prompt, /\[COMPLETION\]/);
   assert.match(prompt, /A successful write proves only that exact mutation/);
   assert.match(prompt, /each requested outcome has corresponding artifact\/diff evidence/);
+  assert.match(prompt, /reopen the mutation phase for distinct remaining outcomes within a finite runtime limit/);
+  assert.doesNotMatch(prompt, /reopen mutation once/);
+  assert.doesNotMatch(prompt, /Available (?:mutation|validation) tools:/);
 });
 
 test("native mode treats provider schemas as the sole tool truth and does not duplicate descriptions", () => {
@@ -198,6 +202,7 @@ test("XML fallback uses only the filtered active definitions", () => {
 test("no-tool turns contain no executable XML example or fake capability", () => {
   const prompt = buildPrompt({ intent: "plan", available: [], native: false, toolDefinitions: [] });
   assert.match(prompt, /available=none/);
+  assert.equal(prompt.match(/available=none/g)?.length, 1);
   assert.doesNotMatch(prompt, /<tool_use>/);
   assert.match(prompt, /Do not edit source files or write plan artifacts before approval/);
 });
@@ -276,8 +281,27 @@ test("response language is independent from English control instructions", () =>
   assert.match(prompt, /Write all user-visible prose.*简体中文/);
 });
 
+test("local model identity does not alter the guidance contract", () => {
+  assert.equal(detectInstructionLanguage("qwen3.6", "en", "model_aware", "OMLX"), "en");
+  assert.equal(detectInstructionLanguage("gemma-4", "en", "model_aware", "OMLX"), "en");
+  assert.equal(detectInstructionLanguage("qwen3.6", "zh", "model_aware", "OMLX"), "zh");
+  assert.equal(detectInstructionLanguage("gemma-4", "zh", "model_aware", "OMLX"), "zh");
+  assert.equal(buildPrompt({ model: "qwen3.6" }), buildPrompt({ model: "gemma-4" }));
+});
+
 test("systemPrompt no longer contains a second hardcoded tool-description catalog", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/systemPrompt.ts"), "utf8");
   assert.doesNotMatch(source, /addToolDescription|TOOL_REQUIRED_ARGUMENTS/);
   assert.doesNotMatch(source, /replace_in_file:.*search, replace/);
+});
+
+test("Chinese approved-plan continuation remains tool-protocol neutral", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const start = source.indexOf("export function buildApprovedPlanContinuationPrompt");
+  const end = source.indexOf("export function shouldTreatCloudGatewayErrorAsCompatibility", start);
+  const promptBuilder = source.slice(start, end);
+
+  assert.ok(start >= 0 && end > start);
+  assert.match(promptBuilder, /当前暴露的正式工具调用/);
+  assert.doesNotMatch(promptBuilder, /使用\s*<tool_use>\s*格式/);
 });

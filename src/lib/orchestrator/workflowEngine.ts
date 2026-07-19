@@ -105,6 +105,12 @@ import { buildToolPermissionActionRequest } from "../pendingToolReview";
 import { buildPlanApprovalIdentity } from "../planApprovalIdentity";
 import { resolveRuntimeRunIdentity, type RuntimeRunIdentity } from "../runIdentity";
 import { buildDurableTurnContext, shouldCanonicalizeTerminalTurnContext } from "../durableTurnContext";
+import {
+  collectPlanTaskTerminalProjection,
+  resolveCompletedTurnFinalPresentation,
+  resolveTerminalTurnOwnership,
+  shouldCommitCompletedTurnFinalPresentation,
+} from "../terminalAssistantFinal";
 import { reduceRunTransition } from "../runTransitionReducer";
 import { createTerminalStatusPublicationGate } from "../terminalStatusPublication";
 import { findLatestRunOwnedAgentBlock } from "./runOwnedAgentBlocks";
@@ -113,6 +119,7 @@ import {
   type ForcedExecuteRecoveryRuntimeState,
 } from "../executeRecoveryTools";
 import { scopeExecutionEvidenceLedger } from "../verificationEvidence";
+import { isNoOpToolFeedback } from "../toolFeedbackEnvelope";
 
 type WorkflowStoreState = any;
 
@@ -302,6 +309,12 @@ export class WorkflowEngine {
       replyOptions: any[];
       meta: any;
     } | null = null;
+    // Set only from a committed assistant item event. Streamed progress,
+    // provisional plan text, and evidence-held drafts never enter this slot.
+    let publishedCompletedAssistantFinalText: string | null = null;
+    // The terminal Plan summary must use the same final iteration tool surface
+    // as approved-Plan finalization when classifying browser validation.
+    let terminalAvailableToolNames: Set<string> | null = null;
     const logStoreEvent = (event: string, data: Record<string, unknown> = {}) => {
       const state = sessionGet();
       const goal = state.goalRuntime?.goal || state.activeGoal || null;
@@ -593,9 +606,6 @@ export class WorkflowEngine {
       const diffPath = String(diffPreview.path || target || "").trim();
       return !isEphemeralPlanArtifactPath(diffPath);
     };
-
-    const isNoOpToolResult = (text: string) =>
-      /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|no changes|no-op|nothing to (?:change|patch|write)|"noOp"\s*:\s*true/i.test(text);
 
     const summarizeReviewPatchTarget = (patch: string): string => {
       const text = String(patch || "");
@@ -934,6 +944,14 @@ export class WorkflowEngine {
         event.type === "thread.started" && event.threadId === threadId
       ),
       onTurnEvent: (event) => {
+        if (
+          event.type === "item.completed" &&
+          event.item?.details?.type === "agent_message" &&
+          !context.executionEvidenceDraftHeld
+        ) {
+          const committedText = String(event.item.details.text || "").trim();
+          if (committedText) publishedCompletedAssistantFinalText = committedText;
+        }
         sessionSet((state: any) => reduceRunTransition(state, { type: "runtime_event", event }));
       },
       hasSessionHookInitialized: (key: string) => sessionGet().hasSessionHookInitialized(key),
@@ -1287,6 +1305,9 @@ export class WorkflowEngine {
           };
           return { providerCompatibilityByRuntimeKey: nextMap };
         });
+      },
+      onToolSurfaceResolved: (availableToolNames) => {
+        terminalAvailableToolNames = new Set(availableToolNames);
       },
       onHarnessRunUpdate: (patch: any) => {
         const markerPatch = patch as Partial<HarnessRunMarker> & Record<string, unknown>;
@@ -1880,10 +1901,11 @@ export class WorkflowEngine {
           ? toUserChoiceResolutionIdentity(choiceActionRequest)
           : undefined;
 
-        // Resolve Feishu adaptive card sending. Text emitted before a tool call is
-        // progress, not completion, so remote replies wait for the final answer.
-        if (remoteFeishu && !hasToolCalls && !provisionalPlanCandidate) {
-          const cardTitle = sessionGet().config.language === "en" ? "Task Complete" : "任务处理完成";
+        // A user-choice pause may be surfaced remotely, but it is not a
+        // successful terminal answer. The completion card is deferred until
+        // the outer loop commits a completed outcome below.
+        if (remoteFeishu && awaitingInput && !hasToolCalls && !provisionalPlanCandidate) {
+          const cardTitle = sessionGet().config.language === "en" ? "Input Required" : "需要用户选择";
           const displaySummary = pickProcessAssistantText(
             text,
             sessionGet().normalizedStreamState.hiddenThought,
@@ -2288,7 +2310,7 @@ export class WorkflowEngine {
         // the tool card running would make later lifecycle matching ambiguous.
         const operationStatus = operationFailed ? "failed" : "done";
         const operationToolStatus = operationFailed ? "failed" : "executed";
-        const noOp = isNoOpToolResult(evidenceResultText);
+        const noOp = isNoOpToolFeedback(evidenceResultText);
         const unownedEntry = createPlanExecutionEvidenceEntry({
           toolName,
           target,
@@ -2391,7 +2413,10 @@ export class WorkflowEngine {
                 ...block,
                 status: operationStatus,
                 toolStatus: operationToolStatus,
-                output: resultText,
+                // Preserve the exact structured apply_patch evidence (not its
+                // UI-truncated display) so terminal summaries retain every
+                // changed source/destination path.
+                output: toolName === "apply_patch" ? evidenceResultText : resultText,
                 message: resultText,
                 ...(completedDiff ? { diff: completedDiff } : block.diff ? { diff: block.diff } : {}),
                 intentSummary: block.intentSummary || deriveToolIntentSummary({
@@ -3095,6 +3120,71 @@ export class WorkflowEngine {
                         latestExecuteRecoveryState.decisionCheckpoint.requirementRef,
                     }
                   : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.pendingFiniteValidation
+                  ? {
+                      pendingFiniteValidation:
+                        latestExecuteRecoveryState.decisionCheckpoint.pendingFiniteValidation,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.validationMutationReopenCount
+                  ? {
+                      validationMutationReopenCount:
+                        latestExecuteRecoveryState.decisionCheckpoint.validationMutationReopenCount,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.validationMutationReopenFingerprints
+                  ? {
+                      validationMutationReopenFingerprints: [
+                        ...latestExecuteRecoveryState.decisionCheckpoint
+                          .validationMutationReopenFingerprints,
+                      ],
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveMutationEvidence
+                  ? {
+                      objectiveMutationEvidence:
+                        latestExecuteRecoveryState.decisionCheckpoint.objectiveMutationEvidence
+                          .map((entry) => ({ ...entry })),
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveClosurePending
+                  ? { objectiveClosurePending: true }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveObligationId
+                  ? {
+                      objectiveObligationId:
+                        latestExecuteRecoveryState.decisionCheckpoint.objectiveObligationId,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveRevision
+                  ? {
+                      objectiveRevision:
+                        latestExecuteRecoveryState.decisionCheckpoint.objectiveRevision,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveKind
+                  ? {
+                      objectiveKind:
+                        latestExecuteRecoveryState.decisionCheckpoint.objectiveKind,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveExpectedTargets
+                  ? {
+                      objectiveExpectedTargets: [
+                        ...latestExecuteRecoveryState.decisionCheckpoint.objectiveExpectedTargets,
+                      ],
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.objectiveValidationEvidence !== undefined
+                  ? {
+                      objectiveValidationEvidence:
+                        latestExecuteRecoveryState.decisionCheckpoint.objectiveValidationEvidence
+                          ? {
+                              ...latestExecuteRecoveryState.decisionCheckpoint.objectiveValidationEvidence,
+                            }
+                          : null,
+                    }
+                  : {}),
               },
         };
         const notice = shouldAutoResume
@@ -3749,6 +3839,102 @@ export class WorkflowEngine {
       return result;
     };
 
+    let completedTurnHasChanges = false;
+    const ensureCompletedTurnFinalPresentation = (outcome: AgentLoopOutcome): string | null => {
+      if (outcome.status !== "completed") return null;
+      const current = sessionGet();
+      const terminalOwnership = resolveTerminalTurnOwnership({
+        turnId,
+        uiDisplayTurnId: context.uiDisplayTurnId,
+      });
+      const terminalTurnIds = new Set(terminalOwnership.evidenceTurnIds);
+      const presentationTurn = current.conversationTurns.find((candidate: any) =>
+        candidate.id === terminalOwnership.ownerTurnId
+      ) || current.conversationTurns.find((candidate: any) => candidate.id === turnId);
+      const presentationTurnId = presentationTurn?.id || terminalOwnership.ownerTurnId;
+      const turnBlocks = current.taskFlow.filter((block: TaskBlock) =>
+        !!block.turnId && terminalTurnIds.has(block.turnId)
+      );
+      const isPlanTurn = presentationTurn?.mode === "plan" || presentationTurn?.intent === "plan";
+      const planTerminalProjection = isPlanTurn
+        ? collectPlanTaskTerminalProjection({
+            tasks: current.planTasks || [],
+            evidenceLedger: current.planExecutionEvidenceLedger || [],
+            availableToolNames: terminalAvailableToolNames,
+          })
+        : { blocking: [], advisories: [] };
+      const finalPresentation = resolveCompletedTurnFinalPresentation({
+        turnBlocks,
+        publishedModelFinalText: publishedCompletedAssistantFinalText,
+        artifactPaths: isPlanTurn
+          ? (current.planArtifacts || []).map((artifact: any) => artifact.path)
+          : [],
+        unfinished: planTerminalProjection.blocking,
+        advisories: planTerminalProjection.advisories,
+        language: (current.preferredResponseLanguage || current.config.language) === "en" ? "en" : "zh",
+      });
+      completedTurnHasChanges = finalPresentation.hasChanges;
+
+      const matchingPublishedBlock = publishedCompletedAssistantFinalText
+        ? [...turnBlocks].reverse().find((block: TaskBlock) =>
+            block.turnId === presentationTurnId &&
+            block.type === "agent" &&
+            block.hiddenProcess !== true &&
+            block.streaming !== true &&
+            String(block.content || "").trim() === publishedCompletedAssistantFinalText
+          )
+        : null;
+      const finalBlockId = matchingPublishedBlock?.id ?? current._nextTaskId();
+      sessionSet((state: any) => {
+        let taskFlow = state.taskFlow.map((block: TaskBlock) =>
+          block.id === finalBlockId && block.type === "agent"
+            ? {
+                ...block,
+                content: finalPresentation.text,
+                streaming: false,
+                hiddenProcess: false,
+                visibility: "assistant_final" as const,
+                turnPhase: withTurnRuntimePhaseStatus(block.turnPhase, "done", phaseLanguage),
+              }
+            : block
+        );
+        if (!matchingPublishedBlock) {
+          taskFlow = [...taskFlow, {
+            id: finalBlockId,
+            turnId: presentationTurnId,
+            type: "agent" as const,
+            content: finalPresentation.text,
+            streaming: false,
+            visibility: "assistant_final" as const,
+          }];
+        }
+        return {
+          taskFlow,
+          conversationTurns: state.conversationTurns.map((candidate: any) =>
+            terminalTurnIds.has(candidate.id)
+              ? {
+                  ...candidate,
+                  summary: finalPresentation.text,
+                  blockIds: candidate.id === presentationTurnId && !candidate.blockIds.includes(finalBlockId)
+                    ? [...candidate.blockIds, finalBlockId]
+                    : candidate.blockIds,
+                }
+              : candidate
+          ),
+        };
+      });
+      logStoreEvent("completed_turn_final_presentation_committed", {
+        source: finalPresentation.source,
+        finalChars: finalPresentation.text.length,
+        modifiedFiles: finalPresentation.execution.modifiedFiles,
+        validations: finalPresentation.execution.validations,
+        failures: finalPresentation.execution.failures,
+        unfinished: finalPresentation.execution.unfinished,
+        advisories: finalPresentation.execution.advisories,
+      });
+      return finalPresentation.text;
+    };
+
     const projectHarnessForAgentLoopOutcome = (outcome: AgentLoopOutcome): TerminalHarnessProjectionResult => {
       switch (outcome.status) {
         case "completed":
@@ -3769,11 +3955,14 @@ export class WorkflowEngine {
     const commitTerminalProjectionBeforeStatusPublication = async (
       outcome: AgentLoopOutcome,
       harnessProjection: TerminalHarnessProjectionResult,
+      options: { pendingSameTurnExecution?: boolean } = {},
     ): Promise<boolean> => {
       if (harnessProjection === "ownership_lost") return false;
       const current = sessionGet();
       const pendingAction = current.activeActionRequest as ActionRequest | null;
+      const isSameTurnExecutionContinuation = options.pendingSameTurnExecution === true;
       const isIntentionalActionPause =
+        !isSameTurnExecutionContinuation &&
         outcome.status === "paused" &&
         pendingAction?.status === "pending";
       if (isIntentionalActionPause) {
@@ -3795,8 +3984,13 @@ export class WorkflowEngine {
         return true;
       }
 
-      const terminalTurnStatus = outcome.status === "completed"
-        ? "completed"
+      // Plan approval closes only the review run lease. The logical turn stays
+      // executable until the child execution run acquires its own lease; it
+      // must never be persisted as done during this handoff window.
+      const terminalTurnStatus = isSameTurnExecutionContinuation
+        ? "executing"
+        : outcome.status === "completed"
+        ? completedTurnHasChanges ? "completed_with_changes" : "done"
         : outcome.status === "error"
         ? "error"
         : outcome.status === "stopped_no_output"
@@ -3819,7 +4013,7 @@ export class WorkflowEngine {
         },
         publishTerminalStatus: () => {
           sessionSet({
-            agentStatus: outcome.status === "error" ? "error" : "idle",
+            agentStatus: !isSameTurnExecutionContinuation && outcome.status === "error" ? "error" : "idle",
             isGenerating: false,
             abortController: null,
           });
@@ -3830,6 +4024,7 @@ export class WorkflowEngine {
         logStoreEvent("terminal_run_projection_committed", {
           outcomeStatus: outcome.status,
           turnStatus: terminalTurnStatus,
+          pendingSameTurnExecution: isSameTurnExecutionContinuation,
           turnIds: Array.from(terminalTurnIds),
           planStage: committed.planStage,
           isPlanApproved: committed.isPlanApproved,
@@ -3841,29 +4036,44 @@ export class WorkflowEngine {
     const commitTerminalTurnContext = (loopOutcome: AgentLoopOutcome) => {
       let latestState = sessionGet();
       if (!shouldCanonicalizeTerminalTurnContext(loopOutcome.status)) return latestState;
-      const completedTurn = latestState.conversationTurns.find((candidate: any) => candidate.id === turnId);
-      const turnBlocks = latestState.taskFlow.filter((block: any) => block.turnId === turnId);
-      const isPlanTurn = completedTurn?.mode === "plan" || completedTurn?.intent === "plan";
-      const durableContext = buildDurableTurnContext({
+      const terminalOwnership = resolveTerminalTurnOwnership({
         turnId,
+        uiDisplayTurnId: context.uiDisplayTurnId,
+      });
+      const terminalTurnIds = new Set(terminalOwnership.evidenceTurnIds);
+      const completedTurn = latestState.conversationTurns.find((candidate: any) =>
+        candidate.id === terminalOwnership.ownerTurnId
+      ) || latestState.conversationTurns.find((candidate: any) => candidate.id === turnId);
+      const turnBlocks = latestState.taskFlow.filter((block: any) =>
+        !!block.turnId && terminalTurnIds.has(block.turnId)
+      );
+      const isPlanTurn = completedTurn?.mode === "plan" || completedTurn?.intent === "plan";
+      const planTerminalProjection = isPlanTurn
+        ? collectPlanTaskTerminalProjection({
+            tasks: latestState.planTasks || [],
+            evidenceLedger: latestState.planExecutionEvidenceLedger || [],
+            availableToolNames: terminalAvailableToolNames,
+          })
+        : { blocking: [], advisories: [] };
+      const durableContext = buildDurableTurnContext({
+        turnId: terminalOwnership.ownerTurnId,
         turnBlocks,
         fallbackAssistantText: completedTurn?.summary || loopOutcome.reason,
         artifactPaths: isPlanTurn
           ? (latestState.planArtifacts || []).map((artifact: any) => artifact.path)
           : [],
-        unfinished: isPlanTurn
-          ? [
-              ...(latestState.planTasks || [])
-                .filter((task: any) => task.evidenceStatus !== "satisfied")
-                .map((task: any) => task.text),
-              ...(loopOutcome.status === "error" ? [loopOutcome.reason] : []),
-            ]
-          : loopOutcome.status === "error" ? [loopOutcome.reason] : [],
+        unfinished: [
+          ...planTerminalProjection.blocking,
+          ...(loopOutcome.status === "error" ? [loopOutcome.reason] : []),
+        ],
+        advisories: planTerminalProjection.advisories,
       });
       if (durableContext) {
         sessionSet((state: any) => ({
           conversationTurns: state.conversationTurns.map((candidate: any) =>
-            candidate.id === turnId ? { ...candidate, durableContext } : candidate
+            candidate.id === terminalOwnership.ownerTurnId
+              ? { ...candidate, durableContext }
+              : candidate
           ),
         }));
         logStoreEvent("durable_turn_context_committed", {
@@ -3875,19 +4085,25 @@ export class WorkflowEngine {
           validations: durableContext.execution.validations.length,
           failures: durableContext.execution.failures.length,
           unfinished: durableContext.execution.unfinished.length,
+          advisories: durableContext.execution.advisories.length,
           artifacts: durableContext.execution.artifacts.length,
         });
         latestState = sessionGet();
       }
 
-      const terminalTurn = latestState.conversationTurns.find((candidate: any) => candidate.id === turnId);
+      const terminalTurn = latestState.conversationTurns.find((candidate: any) =>
+        candidate.id === terminalOwnership.ownerTurnId
+      ) || completedTurn;
       const terminalSummary = String(terminalTurn?.summary || loopOutcome.reason || "").trim();
       if (!terminalSummary) return latestState;
+      const terminalBlocks = latestState.taskFlow.filter((block: any) =>
+        !!block.turnId && terminalTurnIds.has(block.turnId)
+      );
       const compactedMessages = compactCompletedTurnAgentMessages({
         agentMessages: latestState.agentMessages,
         turnStartIndex: turnAgentMessagesStart,
         turnSummary: terminalSummary,
-        turnBlocks: latestState.taskFlow.filter((block: any) => block.turnId === turnId),
+        turnBlocks: terminalBlocks,
         durableContext: terminalTurn?.durableContext,
         language: (latestState.preferredResponseLanguage || latestState.config.language) === "en" ? "en" : "zh",
       });
@@ -4540,7 +4756,19 @@ export class WorkflowEngine {
         reason: "canceled",
       });
       clearInterval(timerInterval);
-      const harnessProjection = projectHarnessForAgentLoopOutcome(loopOutcome);
+      let latestState = sessionGet();
+      const queuedAfterRun = normalizeQueuedUserMessage(latestState.queuedUserMessage);
+      const pendingSameTurnExecution =
+        latestState.isPlanApproved === true &&
+        latestState.pendingPlanApprovalHandoff?.planTurnId === turnId &&
+        latestState.planApprovalExecutionStartedForTurnId !== turnId
+          ? latestState.pendingPlanApprovalHandoff
+          : null;
+      // Approval is a lease boundary, not completion of the logical turn. Close
+      // the review run as paused while the durable turn remains executing.
+      const harnessProjection = pendingSameTurnExecution
+        ? projectCurrentHarnessRunMarker("paused", "plan_approval_handoff_pending")
+        : projectHarnessForAgentLoopOutcome(loopOutcome);
       if (harnessProjection === "ownership_lost") {
         logStoreEvent("terminal_run_publication_skipped", {
           reason: "harness_ownership_lost",
@@ -4578,20 +4806,23 @@ export class WorkflowEngine {
         }
       }
 
-      let latestState = sessionGet();
-      const queuedAfterRun = normalizeQueuedUserMessage(latestState.queuedUserMessage);
-      const pendingSameTurnExecution =
-        latestState.isPlanApproved === true &&
-        latestState.pendingPlanApprovalHandoff?.planTurnId === turnId &&
-        latestState.planApprovalExecutionStartedForTurnId !== turnId
-          ? latestState.pendingPlanApprovalHandoff
-          : null;
       if (pendingMaxIterationsAutoResume && (pendingSameTurnExecution || queuedAfterRun)) {
         pendingMaxIterationsAutoResume.cancel(
           pendingSameTurnExecution ? "plan_approval_handoff" : "queued_user_message",
         );
         pendingMaxIterationsAutoResume = null;
         latestState = sessionGet();
+      }
+      // A completed run is not publishable until ChatArea owns one explicit,
+      // durable assistant final. This runs after the completion guards and
+      // before context compaction/persistence, so paused/error outcomes can
+      // never receive a synthetic success conclusion.
+      let completedFinalTextForRemote: string | null = null;
+      if (shouldCommitCompletedTurnFinalPresentation({
+        outcomeStatus: loopOutcome.status,
+        hasPendingSameTurnExecution: !!pendingSameTurnExecution,
+      })) {
+        completedFinalTextForRemote = ensureCompletedTurnFinalPresentation(loopOutcome);
       }
       if (shouldCanonicalizeTerminalTurnContext(loopOutcome.status) && !pendingSameTurnExecution) {
         latestState = commitTerminalTurnContext(loopOutcome);
@@ -4603,6 +4834,7 @@ export class WorkflowEngine {
       const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(
         loopOutcome,
         harnessProjection,
+        { pendingSameTurnExecution: !!pendingSameTurnExecution },
       );
       if (!terminalProjectionCommitted) {
         logStoreEvent("terminal_run_publication_skipped", {
@@ -4612,6 +4844,19 @@ export class WorkflowEngine {
           runId: activeRuntimeRunIdentity.runId,
         });
         return true;
+      }
+      if (remoteFeishu && completedFinalTextForRemote) {
+        const language = sessionGet().config.language === "en" ? "en" : "zh";
+        void invoke("send_feishu_message", {
+          chatId: remoteFeishu.chatId,
+          userId: remoteFeishu.userId,
+          openId: remoteFeishu.userId,
+          messageId: remoteFeishu.messageId,
+          text: completedFinalTextForRemote,
+          feishuCardTitle: language === "en" ? "Task Complete" : "任务处理完成",
+          feishuCardMarkdown: completedFinalTextForRemote,
+          isFeishuReplyCard: true,
+        }).catch(() => {});
       }
       latestState = sessionGet();
       if (pendingSameTurnExecution) {

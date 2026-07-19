@@ -868,7 +868,7 @@ function PlanShortcutCard({
 }
 
 function isFinishedTurnStatus(status: string) {
-  return status === "done" || status === "completed_with_changes";
+  return status === "done" || status === "completed" || status === "completed_with_changes";
 }
 
 function getLatestThoughtBlock(blocks: any[]) {
@@ -2205,7 +2205,11 @@ function AgentContentBlock({
   }
 
   return (
-    <div className="mt-4 flex w-full min-w-0 items-start justify-start gap-3">
+    <div
+      data-testid={block.visibility === "assistant_final" ? "assistant-final" : undefined}
+      data-turn-id={block.turnId || undefined}
+      className="mt-4 flex w-full min-w-0 items-start justify-start gap-3"
+    >
       <div className="mt-1 flex-shrink-0">
         <IconLogoM className="theme-text h-6 w-6 drop-shadow-[0_0_8px_var(--accent-subtle)]" />
       </div>
@@ -3652,7 +3656,16 @@ export default function ChatArea({
     const hiddenCount = blocks.filter((block) => block.type !== "user").length;
     const { entries: turnChangeEntries, totalExecutedEdits } = collectTurnChangeEntries(blocks);
     const shouldShowTurnChanges = turnChangeEntries.length > 0 || totalExecutedEdits > 0;
-    const finalVisibleAgentIndex = [...blocks]
+    const explicitFinalAgentIndex = [...blocks]
+      .map((block, idx) => ({ block, idx }))
+      .reverse()
+      .find(({ block }) =>
+        block.type === "agent" &&
+        block.visibility === "assistant_final" &&
+        !block.hiddenProcess &&
+        hasRenderableAgentBlock(block)
+      )?.idx ?? -1;
+    const legacyFinalVisibleAgentIndex = [...blocks]
       .map((block, idx) => ({ block, idx }))
       .reverse()
       .find(({ block }) =>
@@ -3660,6 +3673,11 @@ export default function ChatArea({
         block.visibility !== "user_progress" &&
         hasRenderableAgentBlock(block)
       )?.idx ?? -1;
+    // New completed turns carry an explicit semantic final. The legacy
+    // fallback is retained only for sessions persisted before that contract.
+    const finalVisibleAgentIndex = explicitFinalAgentIndex >= 0
+      ? explicitFinalAgentIndex
+      : legacyFinalVisibleAgentIndex;
     const finalVisibleAgentBlock = finalVisibleAgentIndex >= 0 ? blocks[finalVisibleAgentIndex] : null;
     const isFinishedTurn = isFinishedTurnStatus(turn.status);
     const showReasoningDebug = config.reasoningDisplay !== "hidden";

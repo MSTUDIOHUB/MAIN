@@ -128,6 +128,32 @@ test("assistant turn display auto-continues read-only permission options when al
   assert.equal(decision.finalReplyOptions.length, 0);
 });
 
+test("subagent substantive stop report completes instead of auto-continuing a read-only option", () => {
+  const report = "Conclusion: open-file wiring is correct; initial tab state remains broken.";
+  const decision = resolveDecision({
+    workflowMode: "chat",
+    turnIntent: "analyze",
+    runtimeIntent: "analyze",
+    normalizedVisibleText: report,
+    normalizedBaseVisibleText: report,
+    normalizedFinishReason: "stop",
+    normalizedReplyOptions: [{
+      label: "Continue reading",
+      value: "continue",
+      action: "allow_readonly_session",
+      source: "readonly_permission",
+    }],
+    readOnlyAutoApproveForSession: true,
+    isSubagentTurn: true,
+  });
+
+  assert.equal(decision.subagentSubstantiveFinalReport, true);
+  assert.equal(decision.autoContinueReadOnlyPermission, false);
+  assert.equal(decision.suppressReadOnlyPermissionOptions, true);
+  assert.equal(decision.finalReplyOptions.length, 0);
+  assert.match(decision.finalVisibleText, /Conclusion: open-file wiring/);
+});
+
 test("assistant turn display suppresses executable options during approved plan execution", () => {
   const decision = resolveDecision({
     workflowMode: "plan",

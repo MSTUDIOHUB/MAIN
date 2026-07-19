@@ -364,6 +364,7 @@ test("unity forced console result resolves soft reprompt and fallback prompts", 
     results: [{ name: "set_active_instance", isError: false, content: "", target: "", toolCallId: "call_1" }],
     unityMcpForceConsoleFirstPending: true,
     unityConsoleMissingFirstToolRepromptIssued: false,
+    forceXmlTools: true,
     language: "en",
   });
 
@@ -371,11 +372,25 @@ test("unity forced console result resolves soft reprompt and fallback prompts", 
   assert.equal(reprompt.unityConsoleMissingFirstToolRepromptIssued, true);
   assert.equal(reprompt.fallbackReason, null);
   assert.match(reprompt.prompt, /requires `read_console`/);
+  assert.match(reprompt.prompt, /XML `<tool_use>`/);
+
+  const nativeReprompt = resolveUnityMcpForcedConsoleResult({
+    results: [{ name: "set_active_instance", isError: false, content: "", target: "", toolCallId: "call_native" }],
+    unityMcpForceConsoleFirstPending: true,
+    unityConsoleMissingFirstToolRepromptIssued: false,
+    forceXmlTools: false,
+    language: "en",
+  });
+
+  assert.match(nativeReprompt.prompt, /active native schemas/);
+  assert.match(nativeReprompt.prompt, /`read_console`/);
+  assert.doesNotMatch(nativeReprompt.prompt, /XML|<tool_use>|<tool>|<parameter/i);
 
   const fallback = resolveUnityMcpForcedConsoleResult({
     results: [{ name: "read_console", isError: true, content: "MCP_CALL_FAILURE[unreachable]", target: "", toolCallId: "call_2" }],
     unityMcpForceConsoleFirstPending: true,
     unityConsoleMissingFirstToolRepromptIssued: true,
+    forceXmlTools: false,
     language: "zh",
   });
 

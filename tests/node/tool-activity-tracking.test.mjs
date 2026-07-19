@@ -136,6 +136,7 @@ function createPostProcessingInput(overrides = {}) {
     unityConsoleRefreshObservedAfterWrite: false,
     unityMcpForceConsoleFirstPending: false,
     unityConsoleMissingFirstToolRepromptIssued: false,
+    forceXmlTools: false,
     recentSuccessfulProjectWrite: null,
     recoveringFromEmptyAssistantReplyAfterWrite: true,
     markExecuteOperationEvidence: () => executeEvidenceMarks.push(true),
@@ -169,6 +170,14 @@ test("tool activity tracking excludes no-op cached and plan-artifact writes from
       content: "already matched requested content",
     }),
   }), {}), false);
+
+  assert.equal(toolResultCountsAsExecutionEvidence(result({
+    content: JSON.stringify({
+      success: true,
+      noOp: true,
+      message: "File already matched requested content.",
+    }),
+  }), { path: "src/App.tsx" }), false, "raw no-op writes reuse the canonical classifier");
 
   assert.equal(toolResultCountsAsExecutionEvidence(result({
     name: "read_file",
@@ -365,6 +374,10 @@ test("tool activity tracking records bounded recent activity and helper classifi
   });
   assert.match(activity[1].detail, /Applied patch/);
   assert.equal(isEditProgressResult(result({ name: "apply_patch" })), true);
+  assert.equal(isEditProgressResult(result({
+    name: "apply_patch",
+    content: JSON.stringify({ success: true, noOp: true }),
+  })), false, "a no-op edit is not mutation progress");
   assert.equal(isEditProgressResult(result({ name: "run_command", target: "shell-write:npm test" })), true);
   assert.equal(isVerificationEvidenceResult(result({ name: "run_command", isError: false })), true);
   assert.equal(isVerificationEvidenceResult(result({
@@ -641,6 +654,219 @@ test("delegated evidence owner must match the enclosing child result", () => {
               subagentId: "subagent-b",
             },
           }),
+        }],
+      }],
+      pendingIds: [],
+    }),
+  });
+
+  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+});
+
+test("structured non-substantive child observations stay out of the parent evidence ledger", () => {
+  const waitResult = result({
+    toolCallId: "wait_empty_outline",
+    name: "wait_subagents",
+    target: "subagent-a",
+    content: JSON.stringify({
+      results: [{
+        subagentId: "subagent-a",
+        status: "blocked",
+        evidence: [{
+          tool: "get_file_outline",
+          target: "src/main.js",
+          detail: "No symbols found.",
+          observation: {
+            kind: "structure",
+            sourcePath: "src/main.js",
+            contentChars: 17,
+            negative: true,
+            substantive: false,
+          },
+          provenance: toolObservationProvenance("child-outline-empty"),
+        }],
+      }],
+      pendingIds: [],
+    }),
+  });
+
+  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+});
+
+test("a completed child with a non-satisfied closure audit cannot promote evidence", () => {
+  const waitResult = result({
+    toolCallId: "wait_partial_closure",
+    name: "wait_subagents",
+    target: "subagent-a",
+    content: JSON.stringify({
+      results: [{
+        subagentId: "subagent-a",
+        status: "completed",
+        closureAudit: {
+          state: "partial",
+          observationCount: 1,
+          substantiveEvidenceCount: 1,
+          acceptedEvidenceToolCallIds: ["child-read-partial"],
+          reason: "More requested work remains.",
+        },
+        evidence: [{
+          tool: "read_file",
+          target: "src/main.js",
+          detail: "Observed implementation context.",
+          observation: {
+            kind: "source",
+            sourcePath: "src/main.js",
+            contentChars: 32,
+            negative: false,
+            substantive: true,
+          },
+          provenance: toolObservationProvenance("child-read-partial"),
+        }],
+      }],
+      pendingIds: [],
+    }),
+  });
+
+  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+});
+
+test("a satisfied structured closure promotes only substantive observations", () => {
+  const waitResult = result({
+    toolCallId: "wait_satisfied_closure",
+    name: "wait_subagents",
+    target: "subagent-a",
+    content: JSON.stringify({
+      results: [{
+        subagentId: "subagent-a",
+        status: "completed",
+        closureAudit: {
+          state: "satisfied",
+          observationCount: 2,
+          substantiveEvidenceCount: 1,
+          acceptedEvidenceToolCallIds: ["child-read-source"],
+          reason: "Requested source evidence was collected.",
+        },
+        evidence: [{
+          tool: "get_file_outline",
+          target: "src/main.js",
+          detail: "No symbols found.",
+          observation: {
+            kind: "structure",
+            sourcePath: "src/main.js",
+            contentChars: 17,
+            negative: true,
+            substantive: false,
+          },
+          provenance: toolObservationProvenance("child-outline-empty"),
+        }, {
+          tool: "read_file",
+          target: "src/main.js",
+          detail: "Observed implementation context.",
+          observation: {
+            kind: "source",
+            sourcePath: "src/main.js",
+            contentChars: 32,
+            negative: false,
+            substantive: true,
+          },
+          provenance: toolObservationProvenance("child-read-source"),
+        }],
+      }],
+      pendingIds: [],
+    }),
+  });
+
+  const promoted = extractDelegatedSubagentActivities(waitResult);
+  assert.equal(promoted.length, 1);
+  assert.equal(promoted[0].name, "read_file");
+  assert.equal(promoted[0].delegatedObservation.sourceToolCallId, "child-read-source");
+});
+
+test("a nominally satisfied closure with partial path coverage is not promoted", () => {
+  const waitResult = result({
+    toolCallId: "wait_incomplete_coverage",
+    name: "wait_subagents",
+    target: "subagent-a",
+    content: JSON.stringify({
+      results: [{
+        subagentId: "subagent-a",
+        status: "completed",
+        closureAudit: {
+          state: "satisfied",
+          observationCount: 1,
+          substantiveEvidenceCount: 1,
+          acceptedEvidenceToolCallIds: ["child-read-main"],
+          requiredPaths: ["src/main.js", "src/components/editor.js"],
+          coveredPaths: ["src/main.js"],
+          failedPaths: ["src/components/editor.js"],
+          uncoveredPaths: ["src/components/editor.js"],
+          reason: "Inconsistent fixture that must be rejected defensively.",
+        },
+        evidence: [{
+          tool: "read_file",
+          target: "src/main.js",
+          detail: "Observed implementation context.",
+          observation: {
+            kind: "source",
+            sourcePath: "src/main.js",
+            contentChars: 32,
+            negative: false,
+            substantive: true,
+          },
+          provenance: toolObservationProvenance("child-read-main"),
+        }],
+      }],
+      pendingIds: [],
+    }),
+  });
+
+  assert.deepEqual(extractDelegatedSubagentActivities(waitResult), []);
+});
+
+test("a nominally covered path still requires substantive evidence before parent promotion", () => {
+  const waitResult = result({
+    toolCallId: "wait_non_substantive_coverage",
+    name: "wait_subagents",
+    target: "subagent-a",
+    content: JSON.stringify({
+      results: [{
+        subagentId: "subagent-a",
+        status: "completed",
+        closureAudit: {
+          state: "satisfied",
+          observationCount: 2,
+          substantiveEvidenceCount: 1,
+          acceptedEvidenceToolCallIds: ["child-read-main"],
+          requiredPaths: ["src/main.js", "src/components/editor.js"],
+          coveredPaths: ["src/main.js", "src/components/editor.js"],
+          failedPaths: [],
+          uncoveredPaths: [],
+          reason: "Inconsistent fixture that must be rejected defensively.",
+        },
+        evidence: [{
+          tool: "read_file",
+          target: "src/main.js",
+          detail: "Observed implementation context.",
+          observation: {
+            kind: "source",
+            sourcePath: "src/main.js",
+            contentChars: 32,
+            negative: false,
+            substantive: true,
+          },
+          provenance: toolObservationProvenance("child-read-main"),
+        }, {
+          tool: "get_file_outline",
+          target: "src/components/editor.js",
+          detail: "(No recognizable symbols found)",
+          observation: {
+            kind: "structure",
+            sourcePath: "src/components/editor.js",
+            contentChars: 31,
+            negative: true,
+            substantive: false,
+          },
+          provenance: toolObservationProvenance("child-empty-outline"),
         }],
       }],
       pendingIds: [],

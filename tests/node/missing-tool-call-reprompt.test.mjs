@@ -95,6 +95,7 @@ function createMissingToolNoToolInput(harness, overrides = {}) {
     workflowMode: "edit",
     turnIntent: "execute",
     runtimeIntent: "execute",
+    forceXmlTools: true,
     mainModeKey: "main_mode",
     hasMeaningfulVisibleText: true,
     compactedProseCodeDump: false,
@@ -204,12 +205,21 @@ test("read-only continuation prompt tells the model to start tools immediately",
   assert.match(prompt, /不要再输出“请稍候”/);
 });
 
-test("second missing-tool retry uses strict single-tool-call wording", () => {
-  const prompt = buildMissingToolCallContinuationPrompt("generic", "zh", 2);
+test("second XML missing-tool retry uses strict single-tool-call wording", () => {
+  const prompt = buildMissingToolCallContinuationPrompt("generic", "zh", 2, true);
 
   assert.match(prompt, /只输出一个 `<tool_use>` 工具调用块/);
   assert.match(prompt, /不要输出任何普通正文/);
   assert.match(prompt, /write_file/);
+});
+
+test("native missing-tool retries use active schemas without XML text", () => {
+  const first = buildMissingToolCallContinuationPrompt("generic", "en", 1, false);
+  const second = buildMissingToolCallContinuationPrompt("generic", "zh", 2, false);
+
+  assert.match(first, /native tool call/i);
+  assert.match(second, /native tool call/i);
+  assert.doesNotMatch(`${first}\n${second}`, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("truncated plan recovery asks for concise evidence-grounded closure without another approval", () => {
@@ -263,12 +273,20 @@ test("post-write verification prompt prefers immediate run_command validation", 
   assert.match(prompt, /不要再输出“我将运行\/测试\/验证”/);
 });
 
-test("second post-write verification retry requires a single tool call with no prose", () => {
-  const prompt = buildMissingToolCallContinuationPrompt("post_write_verify", "zh", 2);
+test("second XML post-write verification retry requires a single tool call with no prose", () => {
+  const prompt = buildMissingToolCallContinuationPrompt("post_write_verify", "zh", 2, true);
 
   assert.match(prompt, /只输出一个 `<tool_use>` 工具调用块/);
   assert.match(prompt, /不要输出任何普通正文/);
   assert.match(prompt, /run_command/);
+});
+
+test("native post-write verification retry requests one native call without XML", () => {
+  const prompt = buildMissingToolCallContinuationPrompt("post_write_verify", "en", 2, false);
+
+  assert.match(prompt, /exactly one formal native tool call/i);
+  assert.match(prompt, /run_command/);
+  assert.doesNotMatch(prompt, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("missing-tool no-tool recovery reprompts generic execute prose", () => {
@@ -284,6 +302,17 @@ test("missing-tool no-tool recovery reprompts generic execute prose", () => {
   assert.match(harness.appended[0].content, /immediately continue using tools/i);
   assert.match(harness.appended[0].content, /<tool_use>/);
   assert.equal(harness.stops.length, 0);
+});
+
+test("missing-tool no-tool recovery preserves native protocol", () => {
+  const harness = createMissingToolNoToolHarness("en");
+  const result = handleMissingToolNoToolRecovery(createMissingToolNoToolInput(harness, {
+    forceXmlTools: false,
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.match(harness.appended[0].content, /native tool call/i);
+  assert.doesNotMatch(harness.appended[0].content, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("missing-tool no-tool recovery uses plan closure prompt after truncation", () => {

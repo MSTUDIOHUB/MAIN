@@ -58,28 +58,19 @@ export function buildExecuteNoActionPauseMessage(input: {
   ].filter(Boolean).join("\n");
 }
 
-export function isReasoningModelName(modelName: string | null | undefined): boolean {
-  if (!modelName) return false;
-  const lower = modelName.toLowerCase();
-  return /deepseek-r1|qwq|reasoning|thinking|o1|o3/i.test(lower);
-}
-
 export function isReasoningDominatedLengthResult(
   result: Pick<StreamResult, "content" | "actionableContent" | "semanticContent" | "finishReason" | "reasoningContent" | "toolCalls">,
   isLocal?: boolean,
-  isReasoningModel?: boolean,
 ): boolean {
   if (result.finishReason !== "length") return false;
-  return isReasoningDominatedNoActionResult(result, isLocal, isReasoningModel);
+  return isReasoningDominatedNoActionResult(result, isLocal);
 }
 
 export function isReasoningDominatedNoActionResult(
   result: Pick<StreamResult, "content" | "actionableContent" | "semanticContent" | "reasoningContent" | "toolCalls">,
   isLocal?: boolean,
-  isReasoningModel?: boolean,
 ): boolean {
   if (Array.isArray(result.toolCalls) && result.toolCalls.length > 0) return false;
-  if (isReasoningModel) return false;
 
   const reasoningChars = String(result.reasoningContent || "").trim().length;
   const semanticContent = typeof result.actionableContent === "string"
@@ -229,8 +220,25 @@ export function looksLikeNonStandardToolCallFormat(text: string): boolean {
   return NON_STANDARD_TOOL_WRAPPER_RE.test(content);
 }
 
-export function buildPseudoToolCallRecoveryPrompt(language: "zh" | "en", workflowMode: WorkflowMode): string {
+export function buildPseudoToolCallRecoveryPrompt(
+  language: "zh" | "en",
+  workflowMode: WorkflowMode,
+  forceXmlTools = true,
+): string {
   const modeText = workflowMode === "chat" ? "read-only/discussion" : workflowMode === "plan" ? "plan" : "execute";
+  if (!forceXmlTools) {
+    return language === "zh"
+      ? [
+          "你刚才输出了非标准工具格式（如 `[Tool call: ...]` 或文本包装器），它不是可执行工具调用，MAIN 不能据此执行工具。",
+          "如果需要工具，请立即从当前暴露的 native schemas 中发起一个正式工具调用，并补齐所有必填参数。",
+          `当前运行阶段：${modeText}。不要再输出 \`[Tool call: ...]\`、文本包装器或自然语言工具占位符。工具名和参数名必须与当前 schema 完全一致；如果缺少路径或参数，请先用已暴露的只读工具获取上下文，或用可见正文说明缺口。`,
+        ].join("\n")
+      : [
+          "You just emitted a non-standard tool format (for example a `[Tool call: ...]` placeholder or a text wrapper). That is not an executable tool call, so MAIN cannot run a tool from it.",
+          "If a tool is needed, immediately make one formal native tool call from the currently exposed schemas and provide every required argument.",
+          `Current workflow mode: ${modeText}. Do not output \`[Tool call: ...]\`, a text wrapper, or a prose tool placeholder again. Match the active schema tool and argument names exactly; if a path or argument is missing, use an exposed read-only tool to gather context or explain the gap in visible text.`,
+        ].join("\n");
+  }
   return language === "zh"
     ? [
         "你刚才输出了非标准工具格式（如 `[Tool call: ...]` 或 `<tool_code>...</tool_code>`），它不是可执行工具调用，MAIN 不能据此执行工具。",
@@ -318,8 +326,17 @@ export function buildExecuteXmlTextActionRecoveryPrompt(input: {
   ].filter(Boolean).join("\n");
 }
 
-export function buildToolProtocolDoomLoopStopMessage(language: "zh" | "en", toolName?: string | null): string {
+export function buildToolProtocolDoomLoopStopMessage(
+  language: "zh" | "en",
+  toolName?: string | null,
+  forceXmlTools = true,
+): string {
   const tool = toolName ? ` ${toolName}` : "";
+  if (!forceXmlTools) {
+    return language === "zh"
+      ? `模型连续输出不可执行的伪工具调用${tool}，没有通过当前 native schema 发起正式调用。MAIN 已停止本轮以避免继续堆叠恢复提示。你可以继续当前任务，MAIN 会保留已读取的上下文；建议下一条明确指定文件路径或让 MAIN 先读取 @ 文件。`
+      : `The model repeatedly emitted a non-executable pseudo tool call${tool} instead of a formal call from the active native schemas. MAIN stopped this turn to avoid piling on more recovery prompts. You can continue the task; MAIN kept the context already read. For the next message, specify the file path or ask MAIN to read the @ file first.`;
+  }
   return language === "zh"
     ? `模型连续输出不可执行的伪工具调用${tool}，没有补齐正式 XML 参数。MAIN 已停止本轮以避免继续堆叠恢复提示。你可以继续当前任务，MAIN 会保留已读取的上下文；建议下一条明确指定文件路径或让 MAIN 先读取 @ 文件。`
     : `The model repeatedly emitted a non-executable pseudo tool call${tool} without valid XML parameters. MAIN stopped this turn to avoid piling on more recovery prompts. You can continue the task; MAIN kept the context already read. For the next message, specify the file path or ask MAIN to read the @ file first.`;
@@ -528,7 +545,11 @@ export function looksLikeToolUnavailableClaim(text: string): boolean {
   return toolClaim;
 }
 
-export function buildToolUnavailableRecoveryPrompt(language: "zh" | "en", workflowMode: WorkflowMode): string {
+export function buildToolUnavailableRecoveryPrompt(
+  language: "zh" | "en",
+  workflowMode: WorkflowMode,
+  forceXmlTools = true,
+): string {
   const writeAllowed = workflowMode === "chat"
     ? language === "zh"
       ? "当前是聊天回合，除非用户明确要求实现或修改，先只使用只读工具。"
@@ -536,6 +557,22 @@ export function buildToolUnavailableRecoveryPrompt(language: "zh" | "en", workfl
     : language === "zh"
     ? "如果用户要求实现、修复或计划落盘，可以使用写入/执行工具。"
     : "If the user asked for implementation, fixes, or plan artifacts, write/execute tools are available.";
+
+  if (!forceXmlTools) {
+    return language === "zh"
+      ? [
+          "上一条回复错误地声称 MAIN 没有工具或无法访问工作区。请纠正：当前请求中暴露的 native tool schemas 就是真实可用的能力。",
+          "不要再声称无法访问工作区、文件或工具；如果需要上下文，请立即从当前 schema 中发起一个正式工具调用。",
+          writeAllowed,
+          "只调用当前暴露的工具，并严格使用 schema 中的参数名；不要在正文中伪造工具载荷。",
+        ].join("\n")
+      : [
+          "The previous reply incorrectly claimed that MAIN has no tools or cannot access the workspace. Correct this: the native tool schemas exposed in the current request are the real available capabilities.",
+          "Do not claim that workspace files or tools are unavailable. If context is needed, immediately make one formal tool call from the active schemas.",
+          writeAllowed,
+          "Call only a currently exposed tool and match its schema argument names exactly; do not serialize or imitate a tool payload in prose.",
+        ].join("\n");
+  }
 
   return language === "zh"
     ? [

@@ -40,12 +40,15 @@ export type ExecuteRecoveryPhaseTransition =
   | "validation_progress"
   | "context_to_mutation"
   | "mutation_to_validation"
+  | "validation_to_objective_audit"
   | "validation_to_normal";
 
 export interface ExecuteRecoveryObservation {
   expectedTarget?: string | null;
   freshReadTarget?: string | null;
   mutationTarget?: string | null;
+  /** Exact structured changed paths when one mutation updates multiple files. */
+  mutationTargets?: string[];
   validationTarget?: string | null;
   validationToolName?: string | null;
   /** Present only for a fresh/replayed source observation, never a cache stub. */
@@ -94,6 +97,122 @@ function resetExecuteRecoveryPhaseProgress<T extends ExecuteRecoveryRuntimeState
   };
 }
 
+function appendObjectiveMutationEvidence(
+  checkpoint: ExecutionDecisionCheckpoint | null,
+  targets: string[],
+): NonNullable<ExecutionDecisionCheckpoint["objectiveMutationEvidence"]> {
+  const requirementRef = checkpoint?.requirementRef?.trim() || null;
+  return targets.reduce<NonNullable<ExecutionDecisionCheckpoint["objectiveMutationEvidence"]>>(
+    (evidence, target) => {
+      const alreadyRecorded = evidence.some((entry) =>
+        workspacePathsReferToSameFile(entry.target, target) &&
+        String(entry.requirementRef || "").toLowerCase() ===
+          String(requirementRef || "").toLowerCase()
+      );
+      return alreadyRecorded
+        ? evidence
+        : [
+            ...evidence,
+            { target, ...(requirementRef ? { requirementRef } : {}) },
+          ].slice(-32);
+    },
+    checkpoint?.objectiveMutationEvidence || [],
+  );
+}
+
+function appendObjectiveExpectedTargets(
+  checkpoint: ExecutionDecisionCheckpoint | null,
+  targets: string[],
+): string[] {
+  return targets.reduce<string[]>((expectedTargets, target) => {
+    if (expectedTargets.some((entry) => workspacePathsReferToSameFile(entry, target))) {
+      return expectedTargets;
+    }
+    return [...expectedTargets, target].slice(-32);
+  }, checkpoint?.objectiveExpectedTargets || []);
+}
+
+function buildObjectiveMutationCheckpoint(input: {
+  checkpoint: ExecutionDecisionCheckpoint | null;
+  expectedTarget: string | null;
+  evidenceTargets: string[];
+}): ExecutionDecisionCheckpoint {
+  const checkpoint = input.checkpoint;
+  const requirementRef = checkpoint?.requirementRef?.trim() || null;
+  const planTaskId = checkpoint?.planTaskId?.trim() || null;
+  const objectiveKind: NonNullable<ExecutionDecisionCheckpoint["objectiveKind"]> =
+    requirementRef || planTaskId ? "requirement" : "root";
+  const previousRevision = Math.max(
+    1,
+    Math.floor(Number(checkpoint?.objectiveRevision) || 1),
+  );
+  // A mutation requested after a successful validation opens a genuinely new
+  // objective revision. Validation-stage follow-up edits before any successful
+  // validation stay in the same revision and retain the finite checkpoint.
+  const objectiveRevision = checkpoint?.objectiveValidationEvidence
+    ? previousRevision + 1
+    : previousRevision;
+  const identity = requirementRef
+    ? `requirement:${requirementRef.toLowerCase()}`
+    : planTaskId
+      ? `task:${planTaskId.toLowerCase()}`
+      : checkpoint?.objectiveObligationId?.trim() || "root:direct-edit";
+  const expectedTargets = appendObjectiveExpectedTargets(
+    checkpoint,
+    [
+      ...(input.expectedTarget ? [input.expectedTarget] : []),
+      ...input.evidenceTargets,
+    ],
+  );
+  return {
+    ...(checkpoint || {
+      expectedTarget: input.expectedTarget,
+      sourceObservationKey: null,
+      nextRequiredCapability: "validation" as const,
+    }),
+    objectiveObligationId: identity,
+    objectiveRevision,
+    objectiveKind,
+    objectiveExpectedTargets: expectedTargets,
+    objectiveMutationEvidence: appendObjectiveMutationEvidence(
+      checkpoint,
+      input.evidenceTargets,
+    ),
+    objectiveValidationEvidence: null,
+    objectiveClosurePending: true,
+  };
+}
+
+function resolveObjectiveMutationCoverage(input: {
+  checkpoint: ExecutionDecisionCheckpoint | null;
+  expectedTarget: string | null;
+}): { covered: boolean; missingTargets: string[]; kind: "root" | "requirement" } {
+  const checkpoint = input.checkpoint;
+  const kind = checkpoint?.objectiveKind || (
+    checkpoint?.requirementRef || checkpoint?.planTaskId ? "requirement" : "root"
+  );
+  const expectedTargets = checkpoint?.objectiveExpectedTargets?.length
+    ? checkpoint.objectiveExpectedTargets
+    : input.expectedTarget
+      ? [input.expectedTarget]
+      : [];
+  const requirementRef = checkpoint?.requirementRef?.trim().toLowerCase() || "";
+  const evidence = checkpoint?.objectiveMutationEvidence || [];
+  const missingTargets = expectedTargets.filter((target) => !evidence.some((entry) =>
+    workspacePathsReferToSameFile(entry.target, target) &&
+    (
+      kind === "root" ||
+      !requirementRef ||
+      String(entry.requirementRef || "").trim().toLowerCase() === requirementRef
+    )
+  ));
+  return {
+    covered: expectedTargets.length > 0 && missingTargets.length === 0,
+    missingTargets,
+    kind,
+  };
+}
+
 function buildExecuteRecoveryDecisionCheckpoint(input: {
   expectedTarget: string | null;
   sourceObservationKey: string | null;
@@ -108,6 +227,22 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
   const planTaskId = input.previous?.planTaskId?.trim() || null;
   const requirementRef = input.previous?.requirementRef?.trim() || null;
   const pendingFiniteValidation = input.previous?.pendingFiniteValidation || null;
+  const validationMutationReopenCount = Math.max(
+    0,
+    Math.floor(Number(input.previous?.validationMutationReopenCount) || 0),
+  );
+  const validationMutationReopenFingerprints =
+    input.previous?.validationMutationReopenFingerprints || [];
+  const objectiveMutationEvidence = input.previous?.objectiveMutationEvidence || [];
+  const objectiveClosurePending = input.previous?.objectiveClosurePending === true;
+  const objectiveObligationId = input.previous?.objectiveObligationId?.trim() || null;
+  const objectiveRevision = Math.max(
+    1,
+    Math.floor(Number(input.previous?.objectiveRevision) || 1),
+  );
+  const objectiveKind = input.previous?.objectiveKind;
+  const objectiveExpectedTargets = input.previous?.objectiveExpectedTargets || [];
+  const objectiveValidationEvidence = input.previous?.objectiveValidationEvidence || null;
   return {
     expectedTarget: input.expectedTarget,
     sourceObservationKey: input.sourceObservationKey,
@@ -118,6 +253,23 @@ function buildExecuteRecoveryDecisionCheckpoint(input: {
     ...(planTaskId ? { planTaskId } : {}),
     ...(requirementRef ? { requirementRef } : {}),
     ...(pendingFiniteValidation ? { pendingFiniteValidation } : {}),
+    ...(validationMutationReopenCount > 0
+      ? { validationMutationReopenCount }
+      : {}),
+    ...(validationMutationReopenFingerprints.length > 0
+      ? { validationMutationReopenFingerprints }
+      : {}),
+    ...(objectiveMutationEvidence.length > 0
+      ? { objectiveMutationEvidence }
+      : {}),
+    ...(objectiveObligationId ? { objectiveObligationId } : {}),
+    ...(input.previous?.objectiveRevision !== undefined ? { objectiveRevision } : {}),
+    ...(objectiveKind ? { objectiveKind } : {}),
+    ...(objectiveExpectedTargets.length > 0 ? { objectiveExpectedTargets } : {}),
+    ...(input.previous?.objectiveValidationEvidence !== undefined
+      ? { objectiveValidationEvidence }
+      : {}),
+    ...(objectiveClosurePending ? { objectiveClosurePending: true } : {}),
   };
 }
 
@@ -130,11 +282,59 @@ function inheritExecuteRecoveryCheckpointIdentity(
   const requirementRef = checkpoint.requirementRef?.trim() || previous?.requirementRef?.trim() || null;
   const pendingFiniteValidation = checkpoint.pendingFiniteValidation ||
     previous?.pendingFiniteValidation || null;
+  const validationMutationReopenCount = Math.max(
+    0,
+    Math.floor(Number(
+      checkpoint.validationMutationReopenCount ??
+      previous?.validationMutationReopenCount,
+    ) || 0),
+  );
+  const validationMutationReopenFingerprints =
+    checkpoint.validationMutationReopenFingerprints ??
+    previous?.validationMutationReopenFingerprints ??
+    [];
+  const objectiveMutationEvidence = checkpoint.objectiveMutationEvidence ??
+    previous?.objectiveMutationEvidence ??
+    [];
+  const objectiveClosurePending = checkpoint.objectiveClosurePending ??
+    previous?.objectiveClosurePending ??
+    false;
+  const objectiveObligationId = checkpoint.objectiveObligationId?.trim() ||
+    previous?.objectiveObligationId?.trim() || null;
+  const objectiveRevision = Math.max(
+    1,
+    Math.floor(Number(checkpoint.objectiveRevision ?? previous?.objectiveRevision) || 1),
+  );
+  const objectiveKind = checkpoint.objectiveKind || previous?.objectiveKind;
+  const objectiveExpectedTargets = checkpoint.objectiveExpectedTargets ??
+    previous?.objectiveExpectedTargets ?? [];
+  const objectiveValidationEvidence = checkpoint.objectiveValidationEvidence ??
+    previous?.objectiveValidationEvidence ?? null;
   return {
     ...checkpoint,
     ...(planTaskId ? { planTaskId } : {}),
     ...(requirementRef ? { requirementRef } : {}),
     ...(pendingFiniteValidation ? { pendingFiniteValidation } : {}),
+    ...(validationMutationReopenCount > 0
+      ? { validationMutationReopenCount }
+      : {}),
+    ...(validationMutationReopenFingerprints.length > 0
+      ? { validationMutationReopenFingerprints }
+      : {}),
+    ...(objectiveMutationEvidence.length > 0
+      ? { objectiveMutationEvidence }
+      : {}),
+    ...(objectiveObligationId ? { objectiveObligationId } : {}),
+    ...(checkpoint.objectiveRevision !== undefined || previous?.objectiveRevision !== undefined
+      ? { objectiveRevision }
+      : {}),
+    ...(objectiveKind ? { objectiveKind } : {}),
+    ...(objectiveExpectedTargets.length > 0 ? { objectiveExpectedTargets } : {}),
+    ...(checkpoint.objectiveValidationEvidence !== undefined ||
+      previous?.objectiveValidationEvidence !== undefined
+      ? { objectiveValidationEvidence }
+      : {}),
+    ...(objectiveClosurePending ? { objectiveClosurePending: true } : {}),
   };
 }
 
@@ -225,13 +425,18 @@ export function activateExecuteRecoveryRuntimeState(
     mode: Exclude<ExecuteRecoveryMode, "normal">;
     reason: string;
     expectedTarget?: string | null;
+    /** Explicitly release a prior single-target lock for an objective follow-up. */
+    resetExpectedTarget?: boolean;
     readLease?: RecoveryReadLease | null;
     sourceObservationKey?: string | null;
     decisionCheckpoint?: ExecutionDecisionCheckpoint | null;
   },
 ): ExecuteRecoveryRuntimeState {
   const requestedMode = normalizeExecuteRecoveryMode(input.mode) as Exclude<ExecuteRecoveryMode, "normal">;
-  const expectedTarget = input.expectedTarget?.trim() || state.expectedTarget;
+  const requestedExpectedTarget = input.expectedTarget?.trim() || null;
+  const expectedTarget = input.resetExpectedTarget
+    ? requestedExpectedTarget
+    : requestedExpectedTarget || state.expectedTarget;
   const readLease = migrateRecoveryReadLease(
     input.readLease === undefined ? state.readLease : input.readLease,
   );
@@ -326,6 +531,105 @@ export function clearExecuteRecoveryRuntimeState(
     readLease: null,
     sourceObservationKey: null,
     decisionCheckpoint: null,
+  };
+}
+
+function transitionValidatedObjective(
+  state: ExecuteRecoveryRuntimeState,
+  validationTarget: string,
+  validationToolName: string,
+): {
+  state: ExecuteRecoveryRuntimeState;
+  transition: ExecuteRecoveryPhaseTransition;
+  target: string | null;
+  consumedExpectedRead: false;
+} {
+  const checkpoint = state.decisionCheckpoint;
+  const target = state.expectedTarget || validationTarget;
+  if (checkpoint?.objectiveClosurePending !== true) {
+    return {
+      state: clearExecuteRecoveryRuntimeState(state),
+      transition: "validation_to_normal",
+      target,
+      consumedExpectedRead: false,
+    };
+  }
+
+  const coverage = resolveObjectiveMutationCoverage({
+    checkpoint,
+    expectedTarget: state.expectedTarget,
+  });
+  const objectiveRevision = Math.max(
+    1,
+    Math.floor(Number(checkpoint.objectiveRevision) || 1),
+  );
+  const verifiedCheckpoint: ExecutionDecisionCheckpoint = {
+    ...checkpoint,
+    objectiveRevision,
+    objectiveKind: coverage.kind,
+    objectiveValidationEvidence: {
+      tool: validationToolName || "validation",
+      target: validationTarget,
+      revision: objectiveRevision,
+    },
+    objectiveClosurePending: true,
+  };
+
+  if (!coverage.covered) {
+    const missingTarget = coverage.missingTargets[0] || state.expectedTarget;
+    const readLease: RecoveryReadLease | null = missingTarget
+      ? {
+          purpose: "missing_window",
+          target: missingTarget,
+          state: "available",
+        }
+      : null;
+    return {
+      state: resetExecuteRecoveryPhaseProgress({
+        ...state,
+        mode: readLease ? "patch_recovery_read" : "mutation_first",
+        reason: "objective_obligation_mutation_evidence_missing",
+        expectedTarget: missingTarget || null,
+        readLease,
+        sourceObservationKey: null,
+        decisionCheckpoint: {
+          ...verifiedCheckpoint,
+          expectedTarget: missingTarget || null,
+          sourceObservationKey: null,
+          nextRequiredCapability: readLease ? "targeted_read" : "mutation",
+        },
+      }),
+      transition: "validation_progress",
+      target: missingTarget || target,
+      consumedExpectedRead: false,
+    };
+  }
+
+  if (coverage.kind === "root") {
+    return {
+      state: resetExecuteRecoveryPhaseProgress({
+        ...state,
+        mode: "objective_audit",
+        reason: "objective_closure_audit_required",
+        readLease: null,
+        decisionCheckpoint: {
+          ...verifiedCheckpoint,
+          expectedTarget: state.expectedTarget,
+          sourceObservationKey: state.sourceObservationKey,
+          nextRequiredCapability: "any",
+        },
+      }),
+      transition: "validation_to_objective_audit",
+      target,
+      consumedExpectedRead: false,
+    };
+  }
+
+  return {
+    state: clearExecuteRecoveryRuntimeState(state),
+    transition: "validation_to_normal",
+    target,
+    consumedExpectedRead: false,
   };
 }
 
@@ -626,8 +930,17 @@ export function transitionExecuteRecoveryRuntimeState(
   }
 
   if (contract.phase !== "context" && observation.freshReadTarget) {
-    const contextTarget = expectedTarget || observation.freshReadTarget;
-    if (!workspacePathsReferToSameFile(observation.freshReadTarget, contextTarget)) {
+    const objectiveAuditTargetSwitch = state.mode === "objective_audit" && Boolean(
+      expectedTarget &&
+      !workspacePathsReferToSameFile(observation.freshReadTarget, expectedTarget),
+    );
+    const contextTarget = objectiveAuditTargetSwitch
+      ? observation.freshReadTarget
+      : expectedTarget || observation.freshReadTarget;
+    if (
+      state.mode !== "objective_audit" &&
+      !workspacePathsReferToSameFile(observation.freshReadTarget, contextTarget)
+    ) {
       return {
         state: transactionState,
         transition: "none",
@@ -705,10 +1018,35 @@ export function transitionExecuteRecoveryRuntimeState(
 
   if (
     contract.phase !== "context" &&
-    observation.mutationTarget
+    (observation.mutationTarget || observation.mutationTargets?.length)
   ) {
-    const mutationTarget = expectedTarget || observation.mutationTarget;
-    if (!workspacePathsReferToSameFile(observation.mutationTarget, mutationTarget)) {
+    const structuredMutationTargets = (observation.mutationTargets || [])
+      .map((target) => target.trim())
+      .filter(Boolean);
+    const observedMutationTargets = [...new Set(
+      structuredMutationTargets.length > 0
+        ? structuredMutationTargets
+        : observation.mutationTarget
+          ? [observation.mutationTarget.trim()].filter(Boolean)
+          : [],
+    )];
+    const auditTargetSwitch = state.mode === "objective_audit" &&
+      observedMutationTargets.length > 0 &&
+      Boolean(
+        expectedTarget &&
+        !observedMutationTargets.some((target) =>
+          workspacePathsReferToSameFile(target, expectedTarget)
+        ),
+      );
+    const mutationTarget = auditTargetSwitch
+      ? observedMutationTargets[0] || null
+      : expectedTarget || observedMutationTargets[0] || null;
+    if (
+      !mutationTarget ||
+      (state.mode !== "objective_audit" && expectedTarget && !observedMutationTargets.some((target) =>
+        workspacePathsReferToSameFile(target, expectedTarget)
+      ))
+    ) {
       return {
         state: transactionState,
         transition: "none",
@@ -716,22 +1054,39 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
+    const evidenceTargets = observedMutationTargets.map((target) =>
+      !auditTargetSwitch && expectedTarget && workspacePathsReferToSameFile(target, expectedTarget)
+        ? expectedTarget
+        : target
+    );
+    const nextExpectedTarget = auditTargetSwitch
+      ? observedMutationTargets.length === 1
+        ? observedMutationTargets[0]
+        : null
+      : expectedTarget || (
+          observedMutationTargets.length === 1 ? mutationTarget : null
+        );
+    const objectiveCheckpoint = buildObjectiveMutationCheckpoint({
+      checkpoint: state.decisionCheckpoint,
+      expectedTarget: nextExpectedTarget,
+      evidenceTargets,
+    });
     return {
       state: resetExecuteRecoveryPhaseProgress({
         ...transactionState,
         mode: "validation_only",
         reason: "recovery_mutation_observed",
-        expectedTarget: mutationTarget,
+        expectedTarget: nextExpectedTarget,
         // A successful mutation carries structured changed-path/diff evidence,
         // but it does not prove the whole user objective is implemented. Move
         // provisionally to validation; assistantCompletionPhase may reopen the
-        // mutation surface once when the model explicitly requests more edits.
+        // mutation surface for a distinct structured objective/target request.
         readLease: null,
         decisionCheckpoint: buildExecuteRecoveryDecisionCheckpoint({
-          expectedTarget: mutationTarget,
+          expectedTarget: nextExpectedTarget,
           sourceObservationKey: state.sourceObservationKey,
           nextRequiredCapability: "validation",
-          previous: state.decisionCheckpoint,
+          previous: objectiveCheckpoint,
         }),
       }),
       transition: "mutation_to_validation",
@@ -785,15 +1140,14 @@ export function transitionExecuteRecoveryRuntimeState(
         (nextCapability === "recover_process" || nextCapability === "reconcile_server")
       );
     if (processReady) {
-      return {
-        state: clearExecuteRecoveryRuntimeState(transactionState),
-        transition: "validation_to_normal",
-        // PTY readiness closes only the process-start obligation. If the Plan
-        // also carries browser evidence, the task audit reactivates that
-        // independent obligation after this transaction is cleared.
-        target: expectedTarget || observation.validationTarget,
-        consumedExpectedRead: false,
-      };
+      // PTY readiness closes only the process-start obligation. If the Plan
+      // also carries browser evidence, the task audit reactivates that
+      // independent obligation after this transaction is cleared.
+      return transitionValidatedObjective(
+        transactionState,
+        observation.validationTarget,
+        validationToolName,
+      );
     }
     const browserValidation = validationToolName === "browser_evaluate";
     if (
@@ -810,14 +1164,13 @@ export function transitionExecuteRecoveryRuntimeState(
         consumedExpectedRead: false,
       };
     }
-    return {
-      state: clearExecuteRecoveryRuntimeState(transactionState),
-      transition: "validation_to_normal",
-      // Validation is often a workspace command rather than a file-targeted
-      // operation. Clear bookkeeping against the transaction file identity.
-      target: expectedTarget || observation.validationTarget,
-      consumedExpectedRead: false,
-    };
+    // Validation is often a workspace command rather than a file-targeted
+    // operation. Closure remains bound to the transaction file identity.
+    return transitionValidatedObjective(
+      transactionState,
+      observation.validationTarget,
+      validationToolName,
+    );
   }
 
   return {

@@ -612,7 +612,7 @@ test("approval readiness accepts a semantically valid mutation plan with concret
   assert.ok(readiness.executableValidationTaskCount >= 1);
 });
 
-test("approval readiness does not materialize semantic prose as a shell command", () => {
+test("approval readiness projects a concrete upload assertion as browser evidence, never a shell command", () => {
   const artifact = reviewablePlanArtifact([
     "# 修复 CSV 字段映射",
     "",
@@ -635,12 +635,15 @@ test("approval readiness does not materialize semantic prose as a shell command"
     executionPlanTasks,
   });
 
-  assert.equal(readiness.ok, false, JSON.stringify({ readiness, executionPlanTasks }));
-  assert.equal(readiness.reason, "executable_validation_task_missing");
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.reason, null);
   assert.equal(executionPlanTasks.some((entry) =>
     entry.evidence?.some((evidence) => evidence.kind === "cmd")
   ), false);
-  assert.equal(readiness.executableValidationTaskCount, 0);
+  assert.equal(executionPlanTasks.some((entry) =>
+    entry.evidence?.some((evidence) => evidence.kind === "browser_dom")
+  ), true, JSON.stringify(executionPlanTasks));
+  assert.equal(readiness.executableValidationTaskCount, 1);
 });
 
 test("approval readiness rejects flattened validation prose without a concrete command", () => {

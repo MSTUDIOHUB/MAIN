@@ -29,12 +29,118 @@ import { applyPlanNoToolRuntimeState, applyPlanRuntimePhase } from "./planRuntim
 import type { TurnIterationContext } from "./turnIterationContext";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
-import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
+import type { ExecuteRecoveryMode, RecoveryReadLease } from "../../executeRecoveryTools";
 import { resolvePreCompletionEvidenceRecoveryDecision } from "./preCompletionEvidenceRecovery";
 import { resolveCommandEvidenceRequirements } from "../../verificationEvidence";
-import { isWorkspaceMutationToolName } from "../../workspaceMutationTools";
+import {
+  isWorkspaceMutationToolName,
+  resolveWorkspaceMutationTargets,
+} from "../../workspaceMutationTools";
+import { workspacePathsReferToSameFile } from "../../workspacePaths";
 
 type WorkflowMode = "chat" | "edit" | "plan";
+
+// Semantic fingerprints reject an identical validation-to-mutation retry.
+// This higher independent-action ceiling is only a final safety fuse for
+// objectives that legitimately require several distinct edits.
+export const MAX_VALIDATION_MUTATION_REOPENS = 8;
+
+export interface RecoveryReadObservationResolution {
+  key: string;
+  path: string;
+  requestSignature: string;
+  versionToken: string;
+  requestedRange?: { startLine?: number; endLine?: number; maxLines?: number } | null;
+}
+
+export function objectiveAuditHasCurrentClosureEvidence(
+  recoveryState: ExecuteRecoveryRuntimeState,
+): boolean {
+  const checkpoint = recoveryState.decisionCheckpoint;
+  if (
+    checkpoint?.objectiveClosurePending !== true ||
+    checkpoint.objectiveKind !== "root"
+  ) {
+    return false;
+  }
+  const revision = Math.max(
+    1,
+    Math.floor(Number(checkpoint.objectiveRevision) || 1),
+  );
+  if (checkpoint.objectiveValidationEvidence?.revision !== revision) return false;
+  const mutationEvidence = checkpoint.objectiveMutationEvidence || [];
+  if (mutationEvidence.length === 0) return false;
+  const expectedTargets = checkpoint.objectiveExpectedTargets?.length
+    ? checkpoint.objectiveExpectedTargets
+    : recoveryState.expectedTarget
+      ? [recoveryState.expectedTarget]
+      : [];
+  return expectedTargets.length > 0 && expectedTargets.every((target) =>
+    mutationEvidence.some((entry) =>
+      workspacePathsReferToSameFile(entry.target, target)
+    )
+  );
+}
+
+export function resolveValidationMutationReopenTargetBinding(input: {
+  recoveryState: ExecuteRecoveryRuntimeState;
+  requestedTarget: string | null;
+  reusableObservation: RecoveryReadObservationResolution | null;
+}): {
+  mode: "mutation_first" | "patch_recovery_read";
+  targetChanged: boolean;
+  expectedTarget: string | null;
+  sourceObservationKey: string | null;
+  readLease: RecoveryReadLease | null;
+} {
+  const expectedTarget = input.requestedTarget || input.recoveryState.expectedTarget;
+  const targetChanged = Boolean(
+    input.requestedTarget &&
+    (
+      !input.recoveryState.expectedTarget ||
+      !workspacePathsReferToSameFile(
+        input.requestedTarget,
+        input.recoveryState.expectedTarget,
+      )
+    ),
+  );
+  if (!targetChanged || !expectedTarget) {
+    return {
+      mode: "mutation_first",
+      targetChanged,
+      expectedTarget,
+      sourceObservationKey: input.recoveryState.sourceObservationKey,
+      readLease: input.recoveryState.readLease,
+    };
+  }
+  if (input.reusableObservation) {
+    return {
+      mode: "mutation_first",
+      targetChanged: true,
+      expectedTarget,
+      sourceObservationKey: input.reusableObservation.key,
+      readLease: {
+        purpose: "context_restore",
+        target: expectedTarget,
+        requestedRange: input.reusableObservation.requestedRange,
+        observationKey: input.reusableObservation.key,
+        observedVersion: input.reusableObservation.versionToken,
+        state: "consumed",
+      },
+    };
+  }
+  return {
+    mode: "patch_recovery_read",
+    targetChanged: true,
+    expectedTarget,
+    sourceObservationKey: null,
+    readLease: {
+      purpose: "missing_window",
+      target: expectedTarget,
+      state: "available",
+    },
+  };
+}
 
 type EmitTaskOrchestratorPhase = (
   phase: TaskOrchestratorPhase,
@@ -52,11 +158,57 @@ export type AssistantCompletionPhaseResult = {
   planRuntimeState: PlanLoopRuntimeState;
 };
 
+function stableEditFingerprintHash(value: string): string {
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+function stableSerializeEditArgs(value: unknown): string {
+  if (value === null || value === undefined) return "null";
+  if (typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map(stableSerializeEditArgs).join(",")}]`;
+  }
+  return `{${Object.entries(value as Record<string, unknown>)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, entry]) => `${JSON.stringify(key)}:${stableSerializeEditArgs(entry)}`)
+    .join(",")}}`;
+}
+
+function resolveEditLocusSeed(
+  toolName: string,
+  args: Record<string, unknown>,
+): string {
+  if (toolName === "replace_in_file") {
+    const searchText = String(
+      args.search_text ?? args.old_text ?? args.oldString ?? args.search ??
+      "",
+    );
+    const replaceText = String(
+      args.replace_text ?? args.new_text ?? args.newString ?? args.replace ?? "",
+    );
+    return `${searchText}\u0000${replaceText}`;
+  }
+  if (toolName === "apply_patch") return String(args.patch || "");
+  if (toolName === "write_file") return String(args.content || "");
+  return stableSerializeEditArgs(args);
+}
+
 export function resolveValidationMutationReopen(input: {
   recoveryState: ExecuteRecoveryRuntimeState;
   protocolViolation?: NormalizedStreamState["protocolViolation"];
   protocolActualTools?: string[];
-}): { requestedTools: string[] } | null {
+  protocolActualToolCalls?: NormalizedStreamState["protocolActualToolCalls"];
+}): {
+  requestedTools: string[];
+  requestedTargets: string[];
+  semanticFingerprints: string[];
+  budgetExhausted: boolean;
+} | null {
   const validationActive =
     input.recoveryState.mode === "validation_only" ||
     input.recoveryState.mode === "finite_validation_only" ||
@@ -71,12 +223,74 @@ export function resolveValidationMutationReopen(input: {
     .filter((name) => isWorkspaceMutationToolName(name)))];
   if (requestedTools.length === 0) return null;
 
-  // One recovery activation establishes mutation -> validation. A single
-  // reopen is allowed when the model explicitly reports that more mutation is
-  // needed. A second reopen would indicate semantic no-progress and must be
-  // handled by the bounded checkpoint instead of oscillating forever.
-  if (input.recoveryState.attempts > 1) return null;
-  return { requestedTools };
+  const requestedMutationIntents = (input.protocolActualToolCalls || [])
+    .filter((call) => isWorkspaceMutationToolName(call.name))
+    .flatMap((call) => {
+      try {
+        const parsed = JSON.parse(call.arguments || "{}");
+        const args = parsed && typeof parsed === "object" && !Array.isArray(parsed)
+          ? parsed as Record<string, unknown>
+          : {};
+        const locusHash = stableEditFingerprintHash(resolveEditLocusSeed(call.name, args));
+        const targets = resolveWorkspaceMutationTargets(call.name, args);
+        return (targets.length > 0 ? targets : [""]).map((target) => ({
+          toolName: call.name,
+          target: target.replace(/\\/g, "/").trim(),
+          locusHash,
+        }));
+      } catch {
+        return [];
+      }
+    });
+  const canonicalMutationIntents = requestedMutationIntents.map((intent) => ({
+    ...intent,
+    target:
+      intent.target &&
+      input.recoveryState.expectedTarget &&
+      workspacePathsReferToSameFile(intent.target, input.recoveryState.expectedTarget)
+        ? input.recoveryState.expectedTarget
+        : intent.target,
+  }));
+  const requestedTargets = [...new Set(canonicalMutationIntents
+    .map((intent) => intent.target)
+    .filter(Boolean))];
+  const checkpoint = input.recoveryState.decisionCheckpoint;
+  const requirementRef = checkpoint?.requirementRef?.trim().toLowerCase() || "";
+  const semanticFingerprints = canonicalMutationIntents.length > 0
+    ? canonicalMutationIntents.map((intent) => [
+        `tool:${intent.toolName.toLowerCase()}`,
+        intent.target ? `target:${intent.target.toLowerCase()}` : "target:(unknown)",
+        `locus:${intent.locusHash}`,
+        requirementRef ? `requirement:${requirementRef}` : "",
+      ].filter(Boolean).join("|"))
+    : input.recoveryState.expectedTarget
+      ? [[
+          `target:${input.recoveryState.expectedTarget.replace(/\\/g, "/").toLowerCase()}`,
+          requirementRef ? `requirement:${requirementRef}` : "",
+          `tools:${requestedTools.slice().sort().join(",")}`,
+        ].filter(Boolean).join("|")]
+    : requirementRef
+      ? [`requirement:${requirementRef}`]
+      : [`objective-tools:${requestedTools.slice().sort().join(",")}`];
+  const spentFingerprints = new Set(
+    (checkpoint?.validationMutationReopenFingerprints || [])
+      .map((fingerprint) => fingerprint.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  const newSemanticFingerprints = [...new Set(semanticFingerprints.filter((fingerprint) =>
+    !spentFingerprints.has(fingerprint.toLowerCase())
+  ))];
+  if (newSemanticFingerprints.length === 0) return null;
+  const reopenCount = Math.max(
+    0,
+    Math.floor(Number(checkpoint?.validationMutationReopenCount) || 0),
+  );
+  return {
+    requestedTools,
+    requestedTargets,
+    semanticFingerprints: newSemanticFingerprints,
+    budgetExhausted: reopenCount >= MAX_VALIDATION_MUTATION_REOPENS,
+  };
 }
 
 export async function handleAssistantCompletionPhase(input: {
@@ -139,6 +353,14 @@ export async function handleAssistantCompletionPhase(input: {
   waitForPlanApprovalIfNeeded: Parameters<typeof handlePlanNoToolRecovery>[0]["waitForPlanApprovalIfNeeded"];
   tryClosePlanWithEvidence: Parameters<typeof handlePlanNoToolRecovery>[0]["tryClosePlanWithEvidence"];
   getExecuteRecoveryState: () => ExecuteRecoveryRuntimeState;
+  clearExecuteRecovery: (
+    reason: string,
+    resetTarget?: string,
+    stateOverride?: ExecuteRecoveryRuntimeState,
+  ) => ExecuteRecoveryRuntimeState;
+  resolveRecoveryReadObservation?: (
+    target: string,
+  ) => Promise<RecoveryReadObservationResolution | null>;
   activateExecuteRecovery: (
     mode: Exclude<ExecuteRecoveryMode, "normal">,
     reason: string,
@@ -200,7 +422,7 @@ export async function handleAssistantCompletionPhase(input: {
     input.approvedPlanAuditForNoTool?.acceptedCompletion &&
     input.approvedPlanAuditForNoTool.pendingExternalValidation
   );
-  const currentExecuteRecoveryState = input.getExecuteRecoveryState();
+  let currentExecuteRecoveryState = input.getExecuteRecoveryState();
   const preCompletionRecovery = resolvePreCompletionEvidenceRecoveryDecision({
     ledger: input.callbacks.getPlanExecutionEvidenceLedger(),
     // Manual/user review remains an advisory conclusion. It never turns off
@@ -259,36 +481,137 @@ export async function handleAssistantCompletionPhase(input: {
     return finish("continue");
   }
 
+  if (currentExecuteRecoveryState.mode === "objective_audit") {
+    const checkpoint = currentExecuteRecoveryState.decisionCheckpoint;
+    const revision = Math.max(1, Math.floor(Number(checkpoint?.objectiveRevision) || 1));
+    if (objectiveAuditHasCurrentClosureEvidence(currentExecuteRecoveryState)) {
+      currentExecuteRecoveryState = input.clearExecuteRecovery(
+        "objective_audit_model_stop",
+        currentExecuteRecoveryState.expectedTarget || undefined,
+        currentExecuteRecoveryState,
+      );
+      logAgentEvent("objective_closure_audit_completed", {
+        iteration: input.iteration,
+        objectiveObligationId: checkpoint?.objectiveObligationId || null,
+        objectiveRevision: revision,
+        mutationTargets: (checkpoint?.objectiveMutationEvidence || []).map((entry) => entry.target),
+        validationTool: checkpoint?.objectiveValidationEvidence?.tool || null,
+        completionSignal: "assistant_stop_without_tool_call",
+      });
+    } else {
+      const language = input.callbacks.getPreferredLanguage();
+      input.callbacks.onNonActionableStop(
+        language === "zh"
+          ? "执行已暂停：objective closure audit 缺少同一 revision 的结构化 mutation/validation 证据，不能把零工具响应当作完成。"
+          : "Execution paused: the objective closure audit lacks structured mutation/validation evidence for the same revision, so a no-tool response cannot be accepted as completion.",
+        "no_action",
+        {
+          phase: "paused",
+          recoveryReason: "objective_closure_audit_evidence_missing",
+          nextStep: language === "zh"
+            ? "从保留的 objective checkpoint 恢复并补齐缺失证据。"
+            : "Resume from the retained objective checkpoint and collect the missing evidence.",
+        },
+      );
+      input.callbacks.onStatusChange("idle");
+      return finish("stopped");
+    }
+  }
+
   const validationMutationReopen = resolveValidationMutationReopen({
     recoveryState: currentExecuteRecoveryState,
     protocolViolation: input.normalized.protocolViolation,
     protocolActualTools: input.normalized.protocolActualTools,
+    protocolActualToolCalls: input.normalized.protocolActualToolCalls,
   });
   if (validationMutationReopen) {
     const currentCheckpoint = currentExecuteRecoveryState.decisionCheckpoint;
+    if (validationMutationReopen.budgetExhausted) {
+      const language = input.callbacks.getPreferredLanguage();
+      const message = language === "zh"
+        ? `执行已暂停：同一目标在校验阶段已用尽 ${MAX_VALIDATION_MUTATION_REOPENS} 次独立修改重开预算，仍有结构化编辑请求未完成。现有变更、目标证据和校验检查点均已保留。`
+        : `Execution paused: this objective exhausted its ${MAX_VALIDATION_MUTATION_REOPENS} distinct validation-to-mutation reopens while another structured edit was still requested. Existing changes, target evidence, and the validation checkpoint were preserved.`;
+      input.callbacks.onNonActionableStop(message, "missing_tool_loop", {
+        phase: "paused",
+        recoveryReason: "validation_mutation_reopen_budget_exhausted",
+        nextStep: language === "zh"
+          ? "从保留的 objective checkpoint 恢复，重新核对剩余目标或由用户调整范围；不要继续尝试新的编辑位置。"
+          : "Resume from the retained objective checkpoint to re-audit the remaining target or let the user revise scope; do not keep trying new edit loci.",
+      });
+      input.callbacks.onStatusChange("idle");
+      logAgentEvent("validation_mutation_reopen_budget_exhausted", {
+        iteration: input.iteration,
+        requestedTools: validationMutationReopen.requestedTools,
+        requestedTargets: validationMutationReopen.requestedTargets,
+        validationMutationReopenCount:
+          currentCheckpoint?.validationMutationReopenCount || 0,
+        maxValidationMutationReopens: MAX_VALIDATION_MUTATION_REOPENS,
+      });
+      return finish("stopped");
+    }
+    const validationMutationReopenCount = Math.max(
+      0,
+      Math.floor(Number(currentCheckpoint?.validationMutationReopenCount) || 0),
+    ) + 1;
+    // Recovery is a serial transaction. A multi-target patch reopens against
+    // its first target; the remaining targets stay in objectiveExpectedTargets
+    // and are handled by subsequent read -> mutation steps.
+    const requestedTarget = validationMutationReopen.requestedTargets[0] || null;
+    const targetChanged = Boolean(
+      requestedTarget &&
+      (
+        !currentExecuteRecoveryState.expectedTarget ||
+        !workspacePathsReferToSameFile(
+          requestedTarget,
+          currentExecuteRecoveryState.expectedTarget,
+        )
+      ),
+    );
+    const nextExpectedTarget = requestedTarget || currentExecuteRecoveryState.expectedTarget;
+    const reusableObservation = targetChanged && requestedTarget
+      ? await input.resolveRecoveryReadObservation?.(requestedTarget) || null
+      : null;
+    const targetBinding = resolveValidationMutationReopenTargetBinding({
+      recoveryState: currentExecuteRecoveryState,
+      requestedTarget,
+      reusableObservation,
+    });
+    const targetReadRequired = targetBinding.mode === "patch_recovery_read";
+    const nextSourceObservationKey = targetBinding.sourceObservationKey;
+    const priorObjectiveTargets = currentCheckpoint?.objectiveExpectedTargets || [];
+    const objectiveExpectedTargets = [
+      ...priorObjectiveTargets,
+      ...validationMutationReopen.requestedTargets,
+    ].reduce<string[]>((targets, target) =>
+      targets.some((entry) => workspacePathsReferToSameFile(entry, target))
+        ? targets
+        : [...targets, target], []);
+    const validationMutationReopenFingerprints = [...new Set([
+      ...(currentCheckpoint?.validationMutationReopenFingerprints || []),
+      ...validationMutationReopen.semanticFingerprints,
+    ])].slice(-32);
     input.callbacks.onStreamToken("__ESCALATION_RESET__:validation_mutation_reopen", input.assistantMsgId);
     input.activateExecuteRecovery(
-      "mutation_first",
+      targetBinding.mode,
       "validation_followup_mutation_requested",
       {
-        expectedTarget: currentExecuteRecoveryState.expectedTarget,
-        sourceObservationKey: currentExecuteRecoveryState.sourceObservationKey,
+        expectedTarget: nextExpectedTarget,
+        resetExpectedTarget: targetChanged,
+        sourceObservationKey: nextSourceObservationKey,
+        ...(targetBinding.readLease ? { readLease: targetBinding.readLease } : {}),
+        ...(reusableObservation ? { readFileObservation: reusableObservation } : {}),
         decisionCheckpoint: {
-          expectedTarget: currentExecuteRecoveryState.expectedTarget,
-          sourceObservationKey: currentExecuteRecoveryState.sourceObservationKey,
-          nextRequiredCapability: "mutation",
-          ...(currentCheckpoint?.evidenceVersion
+          ...(currentCheckpoint || {}),
+          expectedTarget: nextExpectedTarget,
+          sourceObservationKey: nextSourceObservationKey,
+          nextRequiredCapability: targetReadRequired ? "targeted_read" : "mutation",
+          ...(!targetChanged && currentCheckpoint?.evidenceVersion
             ? { evidenceVersion: currentCheckpoint.evidenceVersion }
             : {}),
-          ...(currentCheckpoint?.planTaskId
-            ? { planTaskId: currentCheckpoint.planTaskId }
-            : {}),
-          ...(currentCheckpoint?.requirementRef
-            ? { requirementRef: currentCheckpoint.requirementRef }
-            : {}),
-          ...(currentCheckpoint?.pendingFiniteValidation
-            ? { pendingFiniteValidation: currentCheckpoint.pendingFiniteValidation }
-            : {}),
+          validationMutationReopenCount,
+          validationMutationReopenFingerprints,
+          ...(objectiveExpectedTargets.length > 0 ? { objectiveExpectedTargets } : {}),
+          objectiveClosurePending: true,
         },
         source: "validation_requested_followup_mutation",
       },
@@ -298,8 +621,11 @@ export async function handleAssistantCompletionPhase(input: {
     input.callbacks.appendMessage({
       role: "system",
       content: [
-        "VALIDATION_MUTATION_REOPEN: The validation checkpoint is retained, but the mutation surface has been reopened once because the previous response explicitly requested a workspace edit tool.",
+        "VALIDATION_MUTATION_REOPEN: The validation checkpoint is retained, but the mutation surface has been reopened for a distinct structured objective/target because the previous response explicitly requested a workspace edit tool.",
         `Requested edit tools: ${validationMutationReopen.requestedTools.join(", ")}.`,
+        validationMutationReopen.requestedTargets.length > 0
+          ? `Requested edit targets: ${validationMutationReopen.requestedTargets.join(", ")}.`
+          : "",
         requestExcerpt ? `Original turn objective: ${requestExcerpt}` : "",
         "Make only the remaining task-relevant edit. Do not substitute a cosmetic or nearby change for an unresolved requested outcome. The retained finite validation will run after the mutation.",
       ].filter(Boolean).join("\n"),
@@ -307,8 +633,13 @@ export async function handleAssistantCompletionPhase(input: {
     logAgentEvent("validation_mutation_surface_reopened", {
       iteration: input.iteration,
       requestedTools: validationMutationReopen.requestedTools,
-      expectedTarget: currentExecuteRecoveryState.expectedTarget,
+      requestedTargets: validationMutationReopen.requestedTargets,
+      semanticFingerprints: validationMutationReopen.semanticFingerprints,
+      expectedTarget: nextExpectedTarget,
+      targetReadRequired,
+      reusedObservationKey: reusableObservation?.key || null,
       recoveryAttempts: currentExecuteRecoveryState.attempts,
+      validationMutationReopenCount,
       pendingFiniteValidation: currentCheckpoint?.pendingFiniteValidation || null,
     });
     return finish("continue");
@@ -434,6 +765,7 @@ export async function handleAssistantCompletionPhase(input: {
     workflowMode: input.workflowMode,
     turnIntent: input.turnIntent,
     runtimeIntent: input.runtimeIntent,
+    forceXmlTools: input.forceXmlTools,
     mainModeKey: input.mainModeKey,
     hasMeaningfulVisibleText: input.hasMeaningfulVisibleText,
     compactedProseCodeDump: input.compactedProseCodeDump,

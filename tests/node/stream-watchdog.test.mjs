@@ -64,6 +64,7 @@ const {
   isReasoningDominatedLengthResult,
   isReasoningDominatedNoActionResult,
   isStreamWatchdogTimeoutMessage,
+  permitsConfiguredMaxOutputEscalation,
   shouldAttemptPlanClosureGuard,
   shouldDeferNoProgressStopToPlanReadOnlyConvergence,
   shouldUsePlanNoVisibleTokenWatchdog,
@@ -75,7 +76,13 @@ const streamInvocationSource = fsSync.readFileSync(
 const {
   shouldSuppressPlanTruncationWarning,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
-const { resolveRecoveryToolChoice } = loadTranspiledModuleSync(
+const {
+  SUBAGENT_FINAL_STREAM_MAX_OUTPUT_TOKENS,
+  SUBAGENT_TOOL_STREAM_MAX_OUTPUT_TOKENS,
+  capSubagentStreamMaxEscalations,
+  capSubagentStreamMaxTokens,
+  resolveRecoveryToolChoice,
+} = loadTranspiledModuleSync(
   path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
 );
 const {
@@ -96,6 +103,26 @@ const {
   shouldAttemptApprovedPlanStreamWatchdogRecovery,
   shouldAttemptPreapprovalPlanStreamWatchdogRecovery,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/streamRecovery.ts"));
+
+test("subagent tool and final streams use separate bounded output budgets", () => {
+  assert.equal(SUBAGENT_TOOL_STREAM_MAX_OUTPUT_TOKENS, 4_096);
+  assert.equal(SUBAGENT_FINAL_STREAM_MAX_OUTPUT_TOKENS, 2_048);
+  assert.equal(capSubagentStreamMaxTokens(1, undefined), 4_096);
+  assert.equal(capSubagentStreamMaxTokens(1, 8_192), 4_096);
+  assert.equal(capSubagentStreamMaxTokens(2, 1_024), 1_024);
+  assert.equal(capSubagentStreamMaxEscalations(1, 2), 1);
+  assert.equal(capSubagentStreamMaxTokens(1, 8_192, true), 2_048);
+  assert.equal(capSubagentStreamMaxEscalations(1, 2, true), 0);
+
+  assert.equal(capSubagentStreamMaxTokens(0, undefined), undefined);
+  assert.equal(capSubagentStreamMaxTokens(0, 8_192), 8_192);
+  assert.equal(capSubagentStreamMaxEscalations(0, 2), 2);
+
+  assert.equal(permitsConfiguredMaxOutputEscalation(undefined, undefined), true);
+  assert.equal(permitsConfiguredMaxOutputEscalation(4_096, undefined), false);
+  assert.equal(permitsConfiguredMaxOutputEscalation(4_096, 0), false);
+  assert.equal(permitsConfiguredMaxOutputEscalation(4_096, 1), true);
+});
 
 test("exact messages sent to the model advance file-read eviction independently of token reduction", () => {
   const exactRead = `READ_FILE_RESULT\n${"x".repeat(1_200)}\nTAIL_MARKER`;

@@ -3537,11 +3537,30 @@ fn get_file_metadata(
     workspace: Option<String>,
 ) -> Result<FileMetadata, String> {
     let workspace = resolve_workspace_root(&state, workspace)?;
-    let real_path = resolve_existing_path(&path, &workspace)?;
+    let raw_path = if Path::new(&path).is_absolute() {
+        PathBuf::from(&path)
+    } else {
+        workspace.join(&path)
+    };
+    let real_path = match raw_path.canonicalize() {
+        Ok(real_path) => real_path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(format!("FILE_METADATA_NOT_FOUND: {error}"));
+        }
+        Err(error) => return Err(format!("FILE_METADATA_UNAVAILABLE: {error}")),
+    };
+    ensure_in_workspace(&real_path, &workspace)
+        .map_err(|error| format!("FILE_METADATA_UNAVAILABLE: {error}"))?;
     if !real_path.is_file() {
-        return Err("get_file_metadata 目标不是文件".to_string());
+        return Err("FILE_METADATA_UNAVAILABLE: get_file_metadata 目标不是文件".to_string());
     }
-    let metadata = fs::metadata(&real_path).map_err(|e| e.to_string())?;
+    let metadata = fs::metadata(&real_path).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            format!("FILE_METADATA_NOT_FOUND: {error}")
+        } else {
+            format!("FILE_METADATA_UNAVAILABLE: {error}")
+        }
+    })?;
     let modified_ms = metadata
         .modified()
         .map_err(|e| format!("读取文件修改时间失败: {e}"))?
@@ -3716,6 +3735,41 @@ fn write_file(
 }
 
 #[tauri::command]
+fn write_file_create_new(
+    state: State<WorkspaceState>,
+    path: String,
+    content: String,
+    workspace: Option<String>,
+) -> Result<(), String> {
+    let _lock = get_workspace_write_lock().lock().unwrap();
+    let workspace = resolve_workspace_root(&state, workspace)?;
+    let real_path = resolve_write_path(&path, &workspace)?;
+    if let Some(parent) = real_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建父目录失败: {e}"))?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&real_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("CREATE_NEW_TARGET_EXISTS: {}", real_path.display())
+            } else {
+                format!("创建新文件失败: {error}")
+            }
+        })?;
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        drop(file);
+        let cleanup = fs::remove_file(&real_path)
+            .err()
+            .map(|cleanup_error| format!("；清理未完成文件失败: {cleanup_error}"))
+            .unwrap_or_default();
+        return Err(format!("写入新文件失败: {error}{cleanup}"));
+    }
+    Ok(())
+}
+
+#[tauri::command]
 fn write_file_atomic(
     state: State<WorkspaceState>,
     path: String,
@@ -3770,6 +3824,39 @@ fn write_chat_temp_file(
         fs::create_dir_all(parent).map_err(|e| format!("创建聊天临时父目录失败: {e}"))?;
     }
     fs::write(&real_path, content).map_err(|e| format!("写入聊天临时文件失败: {e}"))?;
+    Ok(real_path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn write_chat_temp_file_create_new(
+    session_key: String,
+    path: String,
+    content: String,
+) -> Result<String, String> {
+    let workspace = ensure_chat_temp_root(&session_key)?;
+    let real_path = resolve_write_path(&path, &workspace)?;
+    if let Some(parent) = real_path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建聊天临时父目录失败: {e}"))?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&real_path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("CREATE_NEW_TARGET_EXISTS: {}", real_path.display())
+            } else {
+                format!("创建聊天临时新文件失败: {error}")
+            }
+        })?;
+    if let Err(error) = file.write_all(content.as_bytes()) {
+        drop(file);
+        let cleanup = fs::remove_file(&real_path)
+            .err()
+            .map(|cleanup_error| format!("；清理未完成文件失败: {cleanup_error}"))
+            .unwrap_or_default();
+        return Err(format!("写入聊天临时新文件失败: {error}{cleanup}"));
+    }
     Ok(real_path.to_string_lossy().to_string())
 }
 
@@ -10740,6 +10827,7 @@ pub fn run() {
             get_file_metadata,
             open_file_external,
             write_file,
+            write_file_create_new,
             write_file_atomic,
             export_text_file,
             glob_search,
@@ -10813,6 +10901,7 @@ pub fn run() {
             extract_protocol_package,
             delete_protocol_package,
             write_chat_temp_file,
+            write_chat_temp_file_create_new,
             read_chat_temp_file,
             get_chat_temp_root,
             ingest_attachment_file,

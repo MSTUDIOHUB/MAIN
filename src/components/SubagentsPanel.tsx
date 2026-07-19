@@ -225,6 +225,13 @@ export default function SubagentsPanel({
               <div className={`mt-1 text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#71717a]"}`}>
                 {selected.role} · {formatTime(selected.startedAt || selected.createdAt, language)} · {formatDuration(selected, language)}
               </div>
+              {(selected.observationCount !== undefined || selected.evidenceCount !== undefined) && (
+                <div className={`mt-1 text-[10px] ${isLight ? "text-[#5f6368]" : "text-[#71717a]"}`}>
+                  {language === "zh"
+                    ? `可信证据 ${selected.evidenceCount || 0} · 观察结果 ${selected.observationCount || 0} · 执行记录 ${selected.activities.length}`
+                    : `Trusted evidence ${selected.evidenceCount || 0} · Observations ${selected.observationCount || 0} · Activity ${selected.activities.length}`}
+                </div>
+              )}
             </div>
             {isSubagentActiveStatus(selected.status) && (
               <button

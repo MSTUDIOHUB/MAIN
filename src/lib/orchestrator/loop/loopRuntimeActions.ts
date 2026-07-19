@@ -256,6 +256,7 @@ export function createAgentLoopRuntimeActions(input: {
           expectedTarget,
           readLease,
           decisionCheckpoint: explicitDecisionCheckpoint,
+          resetExpectedTarget: context.resetExpectedTarget === true,
           sourceObservationKey: mode === "patch_recovery_read"
             ? explicitObservation?.key || null
             : sourceObservationKey,

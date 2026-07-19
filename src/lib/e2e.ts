@@ -1,4 +1,9 @@
-import { GLOBAL_CHAT_KEY, finalizeStreamingTaskBlocks, useAppStore } from "../store/useAppStore";
+import {
+  GLOBAL_CHAT_KEY,
+  finalizeStreamingTaskBlocks,
+  sanitizeTaskBlocksForPersist,
+  useAppStore,
+} from "../store/useAppStore";
 import {
   ensureApprovedPlanRuntimeTasksForState,
   evaluateApprovedPlanExecutionReadiness,
@@ -26,6 +31,7 @@ const PLAN_QUICK_REPLY_MATERIALIZE_GEMMA_SCENARIO = "plan-quick-reply-materializ
 const PLAN_QUICK_REPLY_MATERIALIZE_QWEN_SCENARIO = "plan-quick-reply-materialize-qwen";
 const PLAN_RELOAD_RESUME_SCENARIO = "plan-reload-resume";
 const DIFF_RELOAD_SUMMARY_SCENARIO = "diff-reload-summary";
+const ASSISTANT_FINAL_PERSISTENCE_SCENARIO = "assistant-final-persistence";
 const LIVE_EDIT_DIFF_STEPS_SCENARIO = "live-edit-diff-steps";
 const STAGE_CONCLUSION_PRESERVED_SCENARIO = "stage-conclusion-preserved";
 const PLAN_REPLACE_REFRESH_SCENARIO = "plan-replace-refresh";
@@ -2861,6 +2867,159 @@ function seedDiffReloadSummaryScenario() {
     bridge.initialized = false;
   };
 
+  bridge.cleanup = cleanup;
+  return cleanup;
+}
+
+function seedAssistantFinalPersistenceScenario() {
+  const bridge = getBridge();
+  if (!bridge) return undefined;
+
+  const workspace = "/tmp/e2e-assistant-final-persistence";
+  const sessionId = 999013;
+  const storageKey = "__MAIN_E2E_ASSISTANT_FINAL_SNAPSHOT__";
+  const now = Date.now();
+  const restoredRaw = window.sessionStorage.getItem(storageKey);
+  let restored: { taskFlow: any[]; conversationTurns: any[] } | null = null;
+  if (restoredRaw) {
+    try {
+      restored = JSON.parse(restoredRaw);
+    } catch {
+      restored = null;
+    }
+  }
+
+  if (!restored) {
+    const taskFlow = sanitizeTaskBlocksForPersist([
+      { id: 9101, turnId: "assistant-final-completed", type: "user", content: "完成并总结修改" },
+      {
+        id: 9102,
+        turnId: "assistant-final-completed",
+        type: "agent",
+        content: "持久化后的最终结论仍然可见。",
+        visibility: "assistant_final",
+        streaming: false,
+      },
+      { id: 9201, turnId: "assistant-final-paused", type: "user", content: "暂停的任务" },
+      {
+        id: 9202,
+        turnId: "assistant-final-paused",
+        type: "agent",
+        content: "暂停回合只显示检查点，不显示成功 final。",
+        visibility: "assistant_update",
+        streaming: false,
+      },
+      { id: 9301, turnId: "assistant-final-error", type: "user", content: "失败的任务" },
+      {
+        id: 9302,
+        turnId: "assistant-final-error",
+        type: "agent",
+        content: "失败回合不会获得成功 final。",
+        visibility: "assistant_update",
+        streaming: false,
+      },
+      { id: 9401, turnId: "assistant-final-pending", type: "user", content: "等待批准的任务" },
+      {
+        id: 9402,
+        turnId: "assistant-final-pending",
+        type: "agent",
+        content: "等待 handoff 的回合不会提前显示成功 final。",
+        visibility: "assistant_update",
+        streaming: false,
+      },
+    ] as any);
+    const conversationTurns = [
+      {
+        id: "assistant-final-completed",
+        userPrompt: "完成并总结修改",
+        title: "完成态 final",
+        mode: "edit",
+        intent: "execute",
+        status: "completed_with_changes",
+        summary: "持久化后的最终结论仍然可见。",
+        blockIds: [9101, 9102],
+        processCollapsed: false,
+        collapsed: false,
+        createdAt: now,
+      },
+      {
+        id: "assistant-final-paused",
+        userPrompt: "暂停的任务",
+        title: "暂停态",
+        mode: "edit",
+        intent: "execute",
+        status: "paused",
+        summary: "任务已暂停。",
+        blockIds: [9201, 9202],
+        processCollapsed: false,
+        collapsed: false,
+        createdAt: now + 1,
+      },
+      {
+        id: "assistant-final-error",
+        userPrompt: "失败的任务",
+        title: "错误态",
+        mode: "edit",
+        intent: "execute",
+        status: "error",
+        summary: "任务失败。",
+        blockIds: [9301, 9302],
+        processCollapsed: false,
+        collapsed: false,
+        createdAt: now + 2,
+      },
+      {
+        id: "assistant-final-pending",
+        userPrompt: "等待批准的任务",
+        title: "待 handoff",
+        mode: "plan",
+        intent: "plan",
+        status: "awaiting_approval",
+        summary: "等待批准。",
+        blockIds: [9401, 9402],
+        processCollapsed: false,
+        collapsed: false,
+        createdAt: now + 3,
+      },
+    ];
+    restored = { taskFlow, conversationTurns };
+    window.sessionStorage.setItem(storageKey, JSON.stringify(restored));
+  }
+
+  useAppStore.setState((state) => ({
+    ...state,
+    config: { ...state.config, language: "zh", workflowMode: "edit" },
+    currentWorkspace: workspace,
+    sessionsByWorkspace: {
+      [workspace]: [{
+        id: sessionId,
+        title: "E2E Assistant Final Persistence",
+        date: new Date(now).toISOString(),
+        active: true,
+        messages: [],
+      }],
+    },
+    currentSessionId: sessionId,
+    taskFlow: restored.taskFlow,
+    conversationTurns: restored.conversationTurns,
+    currentTurnId: "assistant-final-pending",
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planStage: "idle",
+    isPlanApproved: false,
+    activeActionRequest: null,
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+  }));
+
+  bindBridgeSnapshot(ASSISTANT_FINAL_PERSISTENCE_SCENARIO);
+  bridge.events = [{ type: restoredRaw ? "restored" : "seeded" }];
+  const cleanup = () => {
+    bridge.initialized = false;
+  };
   bridge.cleanup = cleanup;
   return cleanup;
 }
@@ -6749,7 +6908,19 @@ function seedRealOmlxPlanFlowScenario() {
       closedAt: run.closedAt || null,
       summary: run.summary || "",
       error: run.error || "",
-      evidenceCount: run.activities.filter((activity) => activity.status === "completed").length,
+      evidenceCount: run.evidenceCount || 0,
+      observationCount: run.observationCount || 0,
+      substantiveEvidenceCount: run.substantiveEvidenceCount || 0,
+      closureState: run.closureState || "",
+      remainingWork: run.remainingWork || "",
+      activityCount: run.activities.length,
+      activities: run.activities.map((activity) => ({
+        status: activity.status,
+        title: activity.title,
+        tool: activity.tool || "",
+        target: activity.target || "",
+        detail: String(activity.detail || "").slice(0, 1_200),
+      })),
     }));
     return {
       model,
@@ -6784,6 +6955,7 @@ function seedRealOmlxPlanFlowScenario() {
         sourceTool: entry.sourceTool,
         target: entry.target,
       })),
+      currentTurnId: currentTurn?.id ?? null,
       currentTurnStatus: currentTurn?.status ?? null,
       currentRunId: state.harnessRunMarker?.runId || null,
       parentRunId: state.harnessRunMarker?.parentRunId || null,
@@ -6807,7 +6979,9 @@ function seedRealOmlxPlanFlowScenario() {
       subagentRuns,
       taskFlowTypes: state.taskFlow.map((block) => block.type),
       taskFlowPreview: state.taskFlow.map((block: any) => ({
+        turnId: block.turnId || "",
         type: block.type,
+        visibility: block.visibility || "",
         title: block.title || "",
         content: String(block.content || block.error || "").slice(0, 800),
         toolName: block.toolName || "",
@@ -8589,6 +8763,10 @@ export function initializeE2EScenarios(): (() => void) | undefined {
 
   if (scenario === DIFF_RELOAD_SUMMARY_SCENARIO) {
     return seedDiffReloadSummaryScenario();
+  }
+
+  if (scenario === ASSISTANT_FINAL_PERSISTENCE_SCENARIO) {
+    return seedAssistantFinalPersistenceScenario();
   }
 
   if (scenario === LIVE_EDIT_DIFF_STEPS_SCENARIO) {

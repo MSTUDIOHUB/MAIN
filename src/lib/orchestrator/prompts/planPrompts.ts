@@ -1,6 +1,7 @@
 
 import {
   type PlanTaskEvidenceAudit,
+  canDowngradeUnavailableBrowserValidationToAdvisory,
   describePlanValidationDecision,
   isPlanTaskAwaitingBrowserValidation,
   isPlanTaskAwaitingExternalValidation,
@@ -198,7 +199,11 @@ export function resolveApprovedPlanValidationBoundary(input: {
   const allBrowser = remaining.every(isPlanTaskAwaitingBrowserValidation);
   const allExternal = remaining.every(isPlanTaskAwaitingExternalValidation);
   if (allBrowser && browserAvailable) return "browser_prompt";
-  if (allBrowser) return "pause_browser_unavailable";
+  if (allBrowser) {
+    return canDowngradeUnavailableBrowserValidationToAdvisory(audit)
+      ? "pause_external_validation"
+      : "pause_browser_unavailable";
+  }
   if (allExternal) return "pause_external_validation";
   return "none";
 }

@@ -36,6 +36,8 @@ import type {
 
 export type ReadOnlyToolCallForRound = ToolCallToExecute & {
   allowExternalLocalRead?: boolean;
+  /** Runtime-only lease roots; never accepted from model-authored arguments. */
+  scopedReadPaths?: string[];
 };
 
 export type LocalFileReadToolCallForRound = ToolCallToExecute & {

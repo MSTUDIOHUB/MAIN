@@ -99,6 +99,7 @@ function baseInput(overrides = {}) {
     workflowMode: "chat",
     turnIntent: "respond",
     runtimeIntent: "respond",
+    forceXmlTools: false,
     streamText: "",
     normalized: emptyNormalized(),
     normalizedBaseToolCallCount: 0,
@@ -208,6 +209,24 @@ test("empty edit response after project write asks for post-write verification",
   assert.equal(result.recoveringFromEmptyAssistantReplyAfterWrite, true);
   const userPrompt = events.find((event) => event.type === "append" && event.message.role === "user")?.message.content || "";
   assert.match(userPrompt, /verify|validation|inspect/i);
+});
+
+test("second native empty response after a write keeps verification on native tools", async () => {
+  const { callbacks, events } = makeCallbacks({ language: "en" });
+  const result = await handleEmptyResponseRecovery(baseInput({
+    callbacks,
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    forceXmlTools: false,
+    consecutiveEmptyResponseCount: 1,
+    recentSuccessfulProjectWrite: { name: "replace_in_file", target: "src/app.ts" },
+  }));
+
+  assert.equal(result.status, "continue");
+  const userPrompt = events.find((event) => event.type === "append" && event.message.role === "user")?.message.content || "";
+  assert.match(userPrompt, /native tool call/i);
+  assert.doesNotMatch(userPrompt, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("malformed plan tool-use block recovers before empty counters increment", async () => {

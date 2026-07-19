@@ -93,7 +93,9 @@ export interface TaskTargetingToolGateResult {
 }
 
 const PATH_REF_RE =
-  /(?:^|[\s`"'(（])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?=$|[\s`"',，。；;:)）])/g;
+  /(?:^|[\s`"'(（,，])((?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12})(?=$|[\s`"',，。；;:)）])/g;
+const ASSIGNED_PATH_LIST_RE = /(?:^|[\s,，;；])allowed[_\s-]?paths?\s*[:=]\s*([^\n;；]+)/gi;
+const EXACT_PATH_REF_RE = /^(?:\.{1,2}\/|[A-Za-z0-9_.-]+\/)*[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}$/;
 const SYMBOL_RE = /\b[A-Za-z_$][A-Za-z0-9_$]*(?:[A-Z][A-Za-z0-9_$]*|Data|Store|View|Panel|Island|Chart|Table|Route|Hook)\b/g;
 const TABULAR_EXT_RE = /\.(?:csv|tsv|xlsx|xls|xlsm)$/i;
 const UI_SOURCE_RE = /\.(?:tsx|jsx|css|scss|sass|less)$/i;
@@ -131,6 +133,12 @@ export function isUiSourcePath(path: string): boolean {
 
 function extractExplicitPaths(text: string): string[] {
   const paths: string[] = [];
+  for (const assigned of String(text || "").matchAll(ASSIGNED_PATH_LIST_RE)) {
+    for (const candidate of String(assigned[1] || "").split(/[,，]/)) {
+      const value = candidate.trim().replace(/^[`"']|[`"']$/g, "");
+      if (EXACT_PATH_REF_RE.test(value)) pushUnique(paths, value);
+    }
+  }
   for (const matched of String(text || "").matchAll(PATH_REF_RE)) {
     pushUnique(paths, matched[1] || "");
   }

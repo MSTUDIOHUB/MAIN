@@ -13,6 +13,7 @@ export {
 
 export type ExecuteRecoveryMode =
   | "normal"
+  | "objective_audit"
   | "mutation_first"
   | "action_plus_targeting"
   | "patch_recovery_read"
@@ -122,6 +123,35 @@ export interface ExecutionDecisionCheckpoint {
   requirementRef?: string | null;
   /** Exact finite validation that must succeed after the current repair. */
   pendingFiniteValidation?: PendingFiniteValidationCheckpoint | null;
+  /**
+   * Validation-to-mutation transitions already spent for this unfinished
+   * objective. This is deliberately independent from generic recovery
+   * activations so patch/read retries cannot consume the bounded reopen.
+   */
+  validationMutationReopenCount?: number;
+  /** Semantic obligations already granted a validation -> mutation reopen. */
+  validationMutationReopenFingerprints?: string[];
+  /** Exact mutations observed while the original turn objective is still open. */
+  objectiveMutationEvidence?: Array<{
+    target: string;
+    requirementRef?: string | null;
+  }>;
+  /** Stable structured identity for the unfinished objective transaction. */
+  objectiveObligationId?: string | null;
+  /** Monotonic objective revision retained across recovery/Goal continuations. */
+  objectiveRevision?: number;
+  /** Root Direct Edit objectives use an explicit audit; Plan/Goal use task evidence. */
+  objectiveKind?: "root" | "requirement";
+  /** Every exact workspace target that must have durable mutation evidence. */
+  objectiveExpectedTargets?: string[];
+  /** Exact successful validation associated with the current objective revision. */
+  objectiveValidationEvidence?: {
+    tool: string;
+    target: string;
+    revision: number;
+  } | null;
+  /** A write has evidence, but objective closure still awaits validation/audit. */
+  objectiveClosurePending?: boolean;
 }
 
 export interface ReadProgressFingerprint {
@@ -324,6 +354,7 @@ export function normalizeExecuteRecoveryMode(value: unknown): ExecuteRecoveryMod
   // was separated from the execute transaction.
   if (value === "action_only") return "mutation_first";
   return value === "mutation_first" ||
+    value === "objective_audit" ||
     value === "action_plus_targeting" ||
     value === "patch_recovery_read" ||
     value === "validation_only" ||
@@ -476,6 +507,19 @@ export function resolveExecuteRecoveryActionContract(
       allowedToolNames: new Set<string>(),
       surfaceDescription: "normal",
       toolCallRequirement: resolveRecoveryToolCallRequirement("any"),
+    };
+  }
+  if (mode === "objective_audit") {
+    return {
+      ...shared,
+      modeLabel: mode,
+      phase: "normal",
+      nextRequiredCapability: "any",
+      allowTargetedFileRead: true,
+      allowsAllTools: true,
+      allowedToolNames: new Set<string>(),
+      surfaceDescription: "objective-audit:full-surface",
+      toolCallRequirement: { kind: "optional" },
     };
   }
   let phase: ExecuteRecoveryContractPhase = "mutation";
@@ -658,6 +702,50 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
         };
       })()
     : null;
+  const validationMutationReopenFingerprints = Array.isArray(
+    candidate.validationMutationReopenFingerprints,
+  )
+    ? [...new Set(candidate.validationMutationReopenFingerprints
+        .map((entry) => String(entry || "").trim().toLowerCase())
+        .filter(Boolean))]
+        .slice(-32)
+    : [];
+  const objectiveMutationEvidence = Array.isArray(candidate.objectiveMutationEvidence)
+    ? candidate.objectiveMutationEvidence
+        .flatMap((entry) => {
+          if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+          const target = String(entry.target || "").trim();
+          if (!target) return [];
+          const requirementRef = String(entry.requirementRef || "").trim() || null;
+          return [{ target, ...(requirementRef ? { requirementRef } : {}) }];
+        })
+        .filter((entry, index, entries) => entries.findIndex((candidateEntry) =>
+          candidateEntry.target.toLowerCase() === entry.target.toLowerCase() &&
+          String(candidateEntry.requirementRef || "").toLowerCase() ===
+            String(entry.requirementRef || "").toLowerCase()
+        ) === index)
+        .slice(-32)
+    : [];
+  const objectiveExpectedTargets = Array.isArray(candidate.objectiveExpectedTargets)
+    ? [...new Set(candidate.objectiveExpectedTargets
+        .map((entry) => String(entry || "").trim().replace(/\\/g, "/"))
+        .filter(Boolean))]
+        .slice(-32)
+    : [];
+  const objectiveValidationEvidenceCandidate = candidate.objectiveValidationEvidence;
+  const objectiveValidationEvidence = objectiveValidationEvidenceCandidate &&
+    typeof objectiveValidationEvidenceCandidate === "object" &&
+    !Array.isArray(objectiveValidationEvidenceCandidate)
+    ? (() => {
+        const tool = String(objectiveValidationEvidenceCandidate.tool || "").trim();
+        const target = String(objectiveValidationEvidenceCandidate.target || "").trim();
+        const revision = Math.max(
+          1,
+          Math.floor(Number(objectiveValidationEvidenceCandidate.revision) || 1),
+        );
+        return tool && target ? { tool, target, revision } : null;
+      })()
+    : null;
   return {
     expectedTarget: String(candidate.expectedTarget || "").trim() || null,
     sourceObservationKey: String(candidate.sourceObservationKey || "").trim() || null,
@@ -674,6 +762,46 @@ export function normalizeExecutionDecisionCheckpointSnapshot(
     ...(candidate.pendingFiniteValidation === undefined
       ? {}
       : { pendingFiniteValidation }),
+    ...(candidate.validationMutationReopenCount === undefined
+      ? {}
+      : {
+          validationMutationReopenCount: Math.max(
+            0,
+            Math.floor(Number(candidate.validationMutationReopenCount) || 0),
+          ),
+        }),
+    ...(candidate.validationMutationReopenFingerprints === undefined
+      ? {}
+      : { validationMutationReopenFingerprints }),
+    ...(candidate.objectiveMutationEvidence === undefined
+      ? {}
+      : { objectiveMutationEvidence }),
+    ...(candidate.objectiveObligationId === undefined
+      ? {}
+      : {
+          objectiveObligationId:
+            String(candidate.objectiveObligationId || "").trim() || null,
+        }),
+    ...(candidate.objectiveRevision === undefined
+      ? {}
+      : {
+          objectiveRevision: Math.max(
+            1,
+            Math.floor(Number(candidate.objectiveRevision) || 1),
+          ),
+        }),
+    ...(candidate.objectiveKind === "root" || candidate.objectiveKind === "requirement"
+      ? { objectiveKind: candidate.objectiveKind }
+      : {}),
+    ...(candidate.objectiveExpectedTargets === undefined
+      ? {}
+      : { objectiveExpectedTargets }),
+    ...(candidate.objectiveValidationEvidence === undefined
+      ? {}
+      : { objectiveValidationEvidence }),
+    ...(candidate.objectiveClosurePending === undefined
+      ? {}
+      : { objectiveClosurePending: candidate.objectiveClosurePending === true }),
   };
 }
 
@@ -1044,12 +1172,53 @@ export function buildExecutionActionContractCard(input: {
     .trim()
     .slice(0, 900);
   const pendingFiniteValidation = contract.decisionCheckpoint?.pendingFiniteValidation || null;
+  const objectiveClosure = contract.decisionCheckpoint?.objectiveClosurePending === true
+    ? "pending"
+    : "not-tracked";
+  const mutationEvidence = (contract.decisionCheckpoint?.objectiveMutationEvidence || [])
+    .slice(-8)
+    .map((entry) => `${entry.target}${entry.requirementRef ? `@${entry.requirementRef}` : ""}`)
+    .join(", ") || "(none)";
+  if (contract.modeLabel === "objective_audit") {
+    const revision = Math.max(
+      1,
+      Math.floor(Number(contract.decisionCheckpoint?.objectiveRevision) || 1),
+    );
+    const validationEvidence = contract.decisionCheckpoint?.objectiveValidationEvidence;
+    const evidenceLine = validationEvidence
+      ? `${validationEvidence.tool}:${validationEvidence.target}@revision-${validationEvidence.revision}`
+      : "(none)";
+    return input.language === "zh"
+      ? [
+          "[EXECUTION_ACTION_CONTRACT]",
+          `phase=objective_audit; next=close_or_continue; target=${target}`,
+          `objectiveRevision=${revision}; mutationEvidence=${mutationEvidence}`,
+          `validationEvidence=${evidenceLine}`,
+          ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
+          `availableTools=${tools}`,
+          "这是动态 objective closure audit，完整工具面已恢复。逐项核对用户要求与当前 revision 的真实 mutation + validation 证据。",
+          "若仍有未完成工作，立即调用对应的具体工具；切换到新文件目标时先 read_file，再修改并重新验证。",
+          "只有全部 objective outcome 均已覆盖时才不调用工具，并直接输出面向用户的最终结论总结。不要为了结束审查而虚构工具调用。",
+        ].join("\n")
+      : [
+          "[EXECUTION_ACTION_CONTRACT]",
+          `phase=objective_audit; next=close_or_continue; target=${target}`,
+          `objectiveRevision=${revision}; mutationEvidence=${mutationEvidence}`,
+          `validationEvidence=${evidenceLine}`,
+          ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
+          `availableTools=${tools}`,
+          "This is a dynamic objective-closure audit with the full tool surface restored. Check every requested outcome against real mutation and validation evidence from the current revision.",
+          "If work remains, call the concrete tool now; when switching to a new file target, read_file first, then mutate and validate again.",
+          "Only when every objective outcome is covered, make no tool call and output the final user-facing conclusion summary. Do not invent a tool call merely to end the audit.",
+        ].join("\n");
+  }
   const sourcePhase = contract.phase === "context" || contract.phase === "mutation";
   if (input.language === "zh") {
     return [
       "[EXECUTION_ACTION_CONTRACT]",
       `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
       `planTask=${planTaskId}; requirement=${requirementRef}`,
+      `objectiveClosure=${objectiveClosure}; mutationEvidence=${mutationEvidence}`,
       ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
       ...(pendingFiniteValidation
         ? [
@@ -1078,6 +1247,7 @@ export function buildExecutionActionContractCard(input: {
     "[EXECUTION_ACTION_CONTRACT]",
     `phase=${contract.phase}; next=${contract.nextRequiredCapability}; target=${target}`,
     `planTask=${planTaskId}; requirement=${requirementRef}`,
+    `objectiveClosure=${objectiveClosure}; mutationEvidence=${mutationEvidence}`,
     ...(turnObjective ? [`turnObjective=${turnObjective}`] : []),
     ...(pendingFiniteValidation
       ? [

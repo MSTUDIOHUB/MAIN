@@ -57,6 +57,7 @@ export async function handleEmptyResponseRecovery(input: {
   workflowMode: WorkflowMode;
   turnIntent: ResolvedUserIntent;
   runtimeIntent: ResolvedUserIntent;
+  forceXmlTools: boolean;
   streamText: string;
   normalized: NormalizedStreamState;
   normalizedBaseToolCallCount: number;
@@ -296,6 +297,7 @@ export async function handleEmptyResponseRecovery(input: {
             "post_write_verify",
             MODEL_CONTROL_LANGUAGE,
             consecutiveEmptyResponseCount,
+            input.forceXmlTools,
           )
         : workflowMode === "chat"
         ? "The previous reply was empty. Answer the user with visible Markdown, or use a formal tool call when a tool is genuinely needed. Do not return another empty message or hidden reasoning only. Continue now and keep the final user-visible response in MAIN's configured response language."

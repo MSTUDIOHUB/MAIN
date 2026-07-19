@@ -90,3 +90,18 @@ export function parseToolFeedbackEnvelope(text: string): { envelope: ToolFeedbac
     return null;
   }
 }
+
+/** Canonical classifier for tool observations that produced no durable effect. */
+export function isNoOpToolFeedback(text: string): boolean {
+  const source = String(text || "");
+  const parsed = parseToolFeedbackEnvelope(source);
+  if (
+    parsed &&
+    (parsed.envelope.status === "no_op" ||
+      parsed.envelope.status === "no_effect_mutation" ||
+      parsed.envelope.status === "cached")
+  ) {
+    return true;
+  }
+  return /FILE_UNCHANGED_STUB|READ_FILE_REPEAT_LIMIT|READ_ONLY_REPEAT_LIMIT|empty_change|invalid_patch|identical_content|NO_EFFECT_MUTATION|no changes|no-op|nothing to (?:change|patch|write)|already matched requested content|"status"\s*:\s*"(?:no_op|no_effect_mutation|cached)"|"noOp"\s*:\s*true/i.test(source);
+}

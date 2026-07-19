@@ -941,6 +941,33 @@ test("runtime plan task derivation binds prose change sections with a labeled fi
   assert.match(sourceTask.text, /修改.*useCsvParser\.ts.*normalizeCsvOrder/);
 });
 
+test("a bulleted target-file owner binds nested mutation details", () => {
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    updatedAt: 1,
+    content: [
+      "# creatorName 修复计划",
+      "",
+      "## 关键实现改动",
+      "### 1. 修复 CSV 归一化逻辑",
+      "- **目标文件**：`src/hooks/useCsvParser.ts`",
+      "- **改动内容**：",
+      "  - 在 `normalizeCsvOrder` 中增加 `creatorName` 映射。",
+      "",
+      "## 验证方案",
+      "- 运行 `npm test`。",
+    ].join("\n"),
+  }], { language: "zh" });
+
+  const mutation = tasks.find((task) => task.executionKind === "mutation");
+  assert.ok(mutation, JSON.stringify(tasks, null, 2));
+  assert.equal(mutation.evidence?.[0]?.kind, "file");
+  assert.equal(mutation.evidence?.[0]?.value, "src/hooks/useCsvParser.ts");
+  assert.match(mutation.text, /normalizeCsvOrder.*creatorName/);
+});
+
 test("file heading owns mutation prose while referenced contract files remain evidence only", () => {
   const tasks = deriveRuntimePlanTasksFromArtifacts([{
     kind: "plan",
@@ -2649,6 +2676,28 @@ test("approved Plan blocks workspace mutations outside the reviewed task targets
   assert.equal(allowed.allowed, true);
   assert.equal(blocked.allowed, false);
   assert.deepEqual(blocked.unexpectedTargets, ["src/app.tsx"]);
+
+  const moveOutsideScope = resolveApprovedPlanMutationScope({
+    workflowMode: "edit",
+    isPlanApproved: true,
+    toolName: "apply_patch",
+    args: {
+      patch: [
+        "*** Begin Patch",
+        "*** Update File: src/hooks/useCsvParser.ts",
+        "*** Move to: src/unreviewed/useCsvParser.ts",
+        "*** End Patch",
+      ].join("\n"),
+    },
+    target: "src/hooks/useCsvParser.ts",
+    tasks,
+  });
+  assert.equal(moveOutsideScope.allowed, false);
+  assert.deepEqual(moveOutsideScope.requestedTargets, [
+    "src/hooks/usecsvparser.ts",
+    "src/unreviewed/usecsvparser.ts",
+  ]);
+  assert.deepEqual(moveOutsideScope.unexpectedTargets, ["src/unreviewed/usecsvparser.ts"]);
 });
 
 test("approved Plan executes only exactly reviewed shell commands", () => {
@@ -4166,6 +4215,7 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
 
   const prompt = buildPlanExecutionNoToolRecoveryPrompt({
     language: "zh",
+    forceXmlTools: true,
     missingTasksArtifact: false,
     remainingText: audit.blockedReasons.join("\n"),
     commandHint: "命令提示",
@@ -4179,6 +4229,14 @@ test("approved plan execution no-tool recovery bypasses generic missing-tool sto
   assert.match(prompt, /完成任务前必须先产生真实工具证据/);
   assert.match(prompt, /src\/store\/useAppStore\.ts/);
   assert.doesNotMatch(prompt, /missing_tool_reprompt_limit|聊天失败/);
+
+  const nativePrompt = buildPlanExecutionNoToolRecoveryPrompt({
+    language: "en",
+    missingTasksArtifact: false,
+    remainingText: "file evidence for src/store/useAppStore.ts",
+  });
+  assert.match(nativePrompt, /formal tool call from the active schemas/);
+  assert.doesNotMatch(nativePrompt, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("collectChangeEntries ignores ephemeral plan files but keeps source and bugfix diffs", () => {

@@ -24,6 +24,8 @@ import {
 } from "./unityMcpRuntime";
 
 type SetPlanRuntimePhase = Parameters<typeof handleAssistantCompletionPhase>[0]["setPlanRuntimePhase"];
+type ClearExecuteRecovery = Parameters<typeof handleAssistantCompletionPhase>[0]["clearExecuteRecovery"];
+type ResolveRecoveryReadObservation = Parameters<typeof handleAssistantCompletionPhase>[0]["resolveRecoveryReadObservation"];
 type ActivateExecuteRecovery = Parameters<typeof handleAssistantStreamPostProcessingPhase>[0]["activateExecuteRecovery"];
 type ActivateChatFinalSynthesis = Parameters<typeof handleAssistantDisplayActionPhase>[0]["activateChatFinalSynthesis"];
 type PauseForReviewablePlanArtifact = Parameters<typeof handleAssistantStreamPostProcessingPhase>[0]["pauseForReviewablePlanArtifact"];
@@ -92,6 +94,8 @@ export async function handleAssistantIterationPhase(input: {
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
   setPlanRuntimePhase: SetPlanRuntimePhase;
   activateExecuteRecovery: ActivateExecuteRecovery;
+  clearExecuteRecovery: ClearExecuteRecovery;
+  resolveRecoveryReadObservation?: ResolveRecoveryReadObservation;
   activateChatFinalSynthesis: ActivateChatFinalSynthesis;
   activateUnityMcpFallback: (reason: string) => void;
   pauseForReviewablePlanArtifact: PauseForReviewablePlanArtifact;
@@ -207,6 +211,7 @@ export async function handleAssistantIterationPhase(input: {
     isCloudProfile,
     iterationToolCount: input.iterationAllTools.length,
     llmToolCount: input.llmTools.length,
+    forceXmlTools: input.forceXmlTools,
     messages: callbacks.getMessages(),
     activateChatFinalSynthesis: input.activateChatFinalSynthesis,
   });
@@ -369,6 +374,8 @@ export async function handleAssistantIterationPhase(input: {
     waitForPlanApprovalIfNeeded: input.waitForPlanApprovalIfNeeded,
     tryClosePlanWithEvidence: input.tryClosePlanWithEvidence,
     getExecuteRecoveryState: input.getExecuteRecoveryState,
+    clearExecuteRecovery: input.clearExecuteRecovery,
+    resolveRecoveryReadObservation: input.resolveRecoveryReadObservation,
     activateExecuteRecovery: input.activateExecuteRecovery,
   });
   noToolRuntimeState = assistantCompletionPhase.noToolRuntimeState;

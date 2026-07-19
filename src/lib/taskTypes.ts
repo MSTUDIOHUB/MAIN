@@ -53,6 +53,7 @@ export interface DiffRevertResult {
 }
 
 export type AssistantTextVisibility =
+  | "assistant_final"
   | "user_progress"
   | "hidden_process"
   | "assistant_update"

@@ -17,21 +17,28 @@ import {
   parseSubagentAllowedPaths,
   releaseSubagentScopeLease,
   reserveSubagentScope,
+  resolveSubagentPathCoverage,
   resolveSubagentCapacityPolicy,
   unregisterSubagentAbortController,
   withSubagentCapacity,
   type SpawnSubagentRequest,
   type SpawnSubagentResult,
   type SubagentActivity,
+  type SubagentPathCoverageAudit,
   type SubagentProgress,
   type SubagentRunPatch,
+  type SubagentExecutionScope,
   type SubagentResultEnvelope,
   type SubagentRunSnapshot,
   type SubagentStatus,
 } from "./subagents";
 import { withEventSchema, type MainThreadEvent } from "./turnEvents";
 import { generateId } from "./utils";
-import { buildFileReadWindowIdentity } from "./orchestrator/fileReadCache";
+import { getFileMetadata } from "./ipc";
+import {
+  buildFileReadWindowIdentity,
+  hashString,
+} from "./orchestrator/fileReadCache";
 import {
   extractPlanEvidenceFacts,
   mergePlanEvidenceFacts,
@@ -69,6 +76,329 @@ function compactText(value: unknown, maxChars: number): string {
   return text.length > maxChars ? `${text.slice(0, maxChars).trimEnd()}...` : text;
 }
 
+function normalizeDeclaredRemainingWorkValue(value: unknown): string {
+  const normalized = String(value ?? "")
+    .replace(/^[ \t]*(?:[-*]|\d+[.)、])?[ \t]*/gm, "")
+    .replace(/[`~]/g, "")
+    .replace(/\*\*|__/g, "")
+    .trim();
+  const contradictsNegation = /(?:但|不过|然而|可是|but|however|except).{0,80}(?:仍?需|需要|尚需|待处理|未完成|need|required|remain|pending|left)/i.test(normalized);
+  const chineseNoRemainingStatement = /^(?:(?:无|没有|暂无)(?:任何)?(?:(?:剩余|后续|待办)(?:工作|任务|事项))?(?:[。.！!\s]*(?:[（(]\s*已(?:完成|检查|核实|覆盖)[^）)]*[）)]|已(?:完成|检查|核实|覆盖)[\s\S]*))?[。.！!\s]*|已(?:完成|检查|核实|覆盖)[^,，;；。\n]{0,80}[,，;；。\s]+(?:无|没有)(?:任何)?(?:剩余|后续|待办)(?:工作|任务|事项)[。.！!\s]*)$/i.test(normalized);
+  const englishNoRemainingStatement = /^(?:no\s+(?:remaining|further|additional)\s+(?:work|tasks?|actions?|steps?)(?:\s+(?:is|are))?(?:\s+(?:required|needed|pending))?(?:\s+(?:within|in)\b[^.!]*)?|nothing\s+remains(?:\s+to\s+be\s+done)?)[.!\s]*$/i.test(normalized);
+  const noRemainingCompletionStatement =
+    chineseNoRemainingStatement ||
+    englishNoRemainingStatement ||
+    /^(?:none|nothing|n\/?a|not applicable)(?:(?:[.!;\s]+|\s*[—–-]\s*)(?:the\s+|all\s+)?(?:(?:requested|assigned|scoped)\s+)?(?:work|scope)?\s*(?:is\s+)?(?:complete(?:d)?|done)[\s\S]*)?[.!\s]*$/i.test(normalized);
+  const explicitlyNegated = (
+    /^(?:无需|不需要|no further\b|not required\b|nothing (?:else|further)\b)/i.test(normalized) ||
+    noRemainingCompletionStatement
+  ) && !contradictsNegation;
+  if (
+    !normalized ||
+    explicitlyNegated ||
+    /^(?:无|没有|暂无|none|nothing|n\/?a|not applicable)[。.!\s]*$/i.test(normalized)
+  ) {
+    return "";
+  }
+  return compactText(normalized, 1_000);
+}
+
+function collectRemainingWorkLeafValues(
+  value: unknown,
+  output: string[],
+  depth: number,
+): void {
+  if (depth > 12 || output.length >= 32 || value === null || value === undefined) return;
+  if (typeof value === "string") {
+    const normalized = normalizeDeclaredRemainingWorkValue(value);
+    if (normalized) output.push(normalized);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) collectRemainingWorkLeafValues(item, output, depth + 1);
+    return;
+  }
+  if (typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const completionStatus = Object.entries(record).find(([key]) => (
+      ["completionstatus", "state", "status"].includes(key.toLowerCase().replace(/[\s_-]+/g, ""))
+    ))?.[1];
+    if (/^(?:complete(?:d)?|done|finished|resolved|satisfied|closed|已完成|完成|已结束|已解决)$/i.test(
+      String(completionStatus ?? "").trim(),
+    )) {
+      return;
+    }
+    const contentKeys = new Set([
+      "action",
+      "description",
+      "item",
+      "task",
+      "text",
+      "title",
+      "work",
+      "remainingwork",
+      "remainingtasks",
+      "剩余工作",
+    ]);
+    for (const [key, item] of Object.entries(record)) {
+      const normalizedKey = key.toLowerCase().replace(/[\s_-]+/g, "");
+      if (contentKeys.has(normalizedKey)) {
+        collectRemainingWorkLeafValues(item, output, depth + 1);
+      }
+    }
+  }
+}
+
+function collectStructuredRemainingWorkValues(
+  value: unknown,
+  output: string[],
+  depth = 0,
+  withinReport = false,
+): void {
+  if (depth > 12 || output.length >= 32 || value === null || value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      collectStructuredRemainingWorkValues(item, output, depth + 1, withinReport || depth === 0);
+    }
+    return;
+  }
+  if (typeof value !== "object") return;
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    const normalizedKey = key.toLowerCase().replace(/[\s_-]+/g, "");
+    if (["remainingwork", "remainingtasks", "剩余工作"].includes(normalizedKey)) {
+      collectRemainingWorkLeafValues(item, output, depth + 1);
+      continue;
+    }
+    if ([
+      "data",
+      "evidence",
+      "evidences",
+      "example",
+      "examples",
+      "input",
+      "inputs",
+      "properties",
+      "property",
+      "raw",
+      "rawdata",
+      "schema",
+      "schemas",
+      "source",
+      "sources",
+      "toolresult",
+      "toolresults",
+    ].includes(normalizedKey)) {
+      continue;
+    }
+    const isReportContainer = [
+      "analysis",
+      "conclusion",
+      "conclusions",
+      "finding",
+      "findings",
+      "output",
+      "outputs",
+      "report",
+      "reports",
+      "response",
+      "result",
+      "results",
+      "section",
+      "sections",
+      "summaries",
+      "summary",
+      "tasks",
+      "work",
+    ].includes(normalizedKey);
+    if (withinReport || isReportContainer) {
+      collectStructuredRemainingWorkValues(item, output, depth + 1, true);
+    }
+  }
+}
+
+function parseStructuredSubagentSummary(summary: string): unknown {
+  let candidate = String(summary || "").trim();
+  const fenced = candidate.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
+  if (fenced) {
+    candidate = fenced[1].trim();
+  } else if (!candidate.startsWith("{") && !candidate.startsWith("[")) {
+    const jsonFences = [...candidate.matchAll(/```json\s*\n?([\s\S]*?)\n?```/gi)];
+    if (jsonFences.length === 0) return null;
+    candidate = jsonFences[jsonFences.length - 1][1].trim();
+  }
+  if (!candidate.startsWith("{") && !candidate.startsWith("[")) return null;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+}
+
+export function extractDeclaredSubagentRemainingWork(summary: string): string {
+  const text = String(summary || "");
+  const structured = parseStructuredSubagentSummary(text);
+  if (structured !== null) {
+    const values: string[] = [];
+    collectStructuredRemainingWorkValues(structured, values);
+    const uniqueValues = [...new Set(values)];
+    if (uniqueValues.length > 0) return compactText(uniqueValues.join("\n"), 1_000);
+  }
+
+  const marker = /(?:^|\n)\s*(?:#{1,6}\s*)?(?:\*\*|__)?(?:剩余工作|Remaining Work)(?:\*\*|__)?\s*[:：]?[ \t]*/i.exec(text);
+  if (!marker || marker.index === undefined) return "";
+  const tail = text.slice(marker.index + marker[0].length);
+  const section = tail.split(/\n\s*(?:#{1,6}\s+|(?:\*\*|__)[^*\n]{1,48}(?:\*\*|__)\s*[:：])/)[0] || "";
+  return normalizeDeclaredRemainingWorkValue(section);
+}
+
+const EMPTY_STRUCTURE_MESSAGE = /^\(?\s*no (?:symbols?|class|struct|type|func|function|interface|recognizable|public\/protected)[^\n]*(?:found)?\s*\)?[.!]?$/i;
+const STRUCTURE_CONTAINER_KEYS = new Set([
+  "children",
+  "declarations",
+  "items",
+  "members",
+  "nodes",
+  "outline",
+  "results",
+  "symbols",
+]);
+const STRUCTURE_METADATA_KEYS = new Set([
+  "count",
+  "extension",
+  "file",
+  "filename",
+  "language",
+  "meta",
+  "metadata",
+  "path",
+  "status",
+  "success",
+  "total",
+]);
+const STRUCTURE_DESCRIPTOR_KEYS = new Set([
+  "declaration",
+  "description",
+  "kind",
+  "label",
+  "name",
+  "signature",
+  "text",
+  "type",
+]);
+
+function isEmptyParsedStructureValue(value: unknown, nestedRecord = false): boolean {
+  if (value === null || value === undefined || typeof value === "boolean" || typeof value === "number") {
+    return true;
+  }
+  if (typeof value === "string") {
+    const text = value.trim();
+    return !text || /^(?:null|undefined|none|n\/?a)$/i.test(text) || EMPTY_STRUCTURE_MESSAGE.test(text);
+  }
+  if (Array.isArray(value)) {
+    return value.length === 0 || value.every((item) => isEmptyParsedStructureValue(item, true));
+  }
+
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return true;
+  const normalizedEntries = entries.map(([key, item]) => [
+    key.toLowerCase().replace(/[\s_-]+/g, ""),
+    item,
+  ] as const);
+  const structuralValues = normalizedEntries
+    .filter(([key]) => STRUCTURE_CONTAINER_KEYS.has(key))
+    .map(([, item]) => item);
+  if (structuralValues.length > 0) {
+    return structuralValues.every((item) => isEmptyParsedStructureValue(item, true));
+  }
+  if (nestedRecord && normalizedEntries.some(([key, item]) => (
+    STRUCTURE_DESCRIPTOR_KEYS.has(key) && !isEmptyParsedStructureValue(item, true)
+  ))) {
+    return false;
+  }
+  const contentValues = normalizedEntries
+    .filter(([key]) => !STRUCTURE_METADATA_KEYS.has(key))
+    .map(([, item]) => item);
+  return contentValues.length === 0 || contentValues.every((item) => (
+    isEmptyParsedStructureValue(item, true)
+  ));
+}
+
+export function isEmptySubagentStructureObservation(value: unknown): boolean {
+  const text = String(value ?? "").trim();
+  if (!text || /^(?:null|undefined|none|n\/?a|\[\]|\{\})$/i.test(text)) return true;
+  if (EMPTY_STRUCTURE_MESSAGE.test(text)) return true;
+  if (!text.startsWith("{") && !text.startsWith("[")) return false;
+  try {
+    return isEmptyParsedStructureValue(JSON.parse(text));
+  } catch {
+    return false;
+  }
+}
+
+export function isSubagentEvidenceSubstantive(
+  item: SubagentResultEnvelope["evidence"][number],
+): boolean {
+  if (item.provenance.source !== "tool_observation" || !String(item.target || "").trim()) return false;
+  if (item.observation) return item.observation.substantive === true;
+  const detail = String(item.detail || "").trim();
+  if (item.tool === "get_file_outline") {
+    return !isEmptySubagentStructureObservation(detail);
+  }
+  if ((item.provenance.sourceContentChars || 0) > 0 || (item.facts?.length || 0) > 0) return true;
+  // A successful targeted search/diff with zero hits is still a meaningful
+  // negative observation. It differs from an empty outline that reveals no
+  // source content for the assigned investigation.
+  if (["grep_search", "code_ast_query", "find_symbol_references", "git_diff"].includes(item.tool)) {
+    return true;
+  }
+  return detail.length > 0;
+}
+
+const EXTENSIONLESS_FILE_NAMES = new Set([
+  "dockerfile",
+  "gemfile",
+  "license",
+  "makefile",
+  "procfile",
+  "readme",
+]);
+
+function looksLikeExactFilePath(path: string): boolean {
+  const baseName = String(path || "").replace(/\\/g, "/").split("/").pop()?.toLowerCase() || "";
+  return baseName.includes(".") || EXTENSIONLESS_FILE_NAMES.has(baseName);
+}
+
+export async function resolveSubagentExecutionScopePaths(input: {
+  allowedPaths: string[];
+  workspace: string;
+}): Promise<Pick<SubagentExecutionScope,
+  "allowedFilePaths" | "allowedDirectoryPaths" | "scopeKind"
+>> {
+  const fileChecks = await Promise.all(input.allowedPaths.map(async (path) => {
+    try {
+      await getFileMetadata(path, input.workspace);
+      return true;
+    } catch (error) {
+      if (/(?:目标不是文件|not\s+(?:a\s+)?file)/iu.test(String(error || ""))) {
+        return false;
+      }
+      // The desktop IPC distinguishes files from directories. Unit tests and
+      // non-Tauri harnesses may not have that IPC, so retain a conservative
+      // filename fallback without ever broadening an allowed path.
+      return looksLikeExactFilePath(path);
+    }
+  }));
+  const allowedFilePaths = input.allowedPaths.filter((_path, index) => fileChecks[index]);
+  const allowedDirectoryPaths = input.allowedPaths.filter((_path, index) => !fileChecks[index]);
+  return {
+    allowedFilePaths,
+    allowedDirectoryPaths,
+    scopeKind: allowedFilePaths.length === input.allowedPaths.length
+      ? "exact_files"
+      : "directory_or_mixed",
+  };
+}
+
 export function resolveReadOnlySubagentRole(_requestedRole: unknown): string {
   // Every child runtime is intentionally read/search-only. Keep the persisted
   // role aligned with its actual capability instead of displaying model-authored
@@ -83,6 +413,42 @@ function compactEvidenceFragment(value: unknown, maxChars: number): string {
   const headBudget = Math.max(0, Math.ceil((maxChars - separator.length) * 0.55));
   const tailBudget = Math.max(0, maxChars - separator.length - headBudget);
   return `${text.slice(0, headBudget).trimEnd()}${separator}${text.slice(-tailBudget).trimStart()}`;
+}
+
+function recordFailedScopedPathsFromContent(
+  content: unknown,
+  requiredPaths: string[],
+  failedPaths: Set<string>,
+): void {
+  const text = String(content || "");
+  if (!text) return;
+  for (const requiredPath of requiredPaths) {
+    const escapedPath = requiredPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const sectionFailure = new RegExp(`^===\\s*${escapedPath}\\s*===\\s*\\nError:`, "mi").test(text);
+    const aggregateFailure = new RegExp(`^${escapedPath}\\s*:\\s*[^\\n]+`, "mi").test(text);
+    if (sectionFailure || aggregateFailure) failedPaths.add(requiredPath);
+  }
+}
+
+function buildCoverageRemainingWork(
+  coverage: SubagentPathCoverageAudit,
+): string {
+  if (coverage.uncoveredPaths.length === 0) return "";
+  const failed = coverage.failedPaths.length > 0
+    ? ` Failed paths: ${coverage.failedPaths.join(", ")}.`
+    : "";
+  return `Collect successful observations for uncovered required paths: ${coverage.uncoveredPaths.join(", ")}.${failed}`;
+}
+
+function extractObservedReadFileWindowContent(modelContent: string): string | null {
+  const startMarker = "---CONTENT START---\n";
+  const endMarker = "\n---CONTENT END---";
+  const start = modelContent.indexOf(startMarker);
+  if (start < 0) return null;
+  const contentStart = start + startMarker.length;
+  const end = modelContent.lastIndexOf(endMarker);
+  if (end < contentStart) return null;
+  return modelContent.slice(contentStart, end);
 }
 
 function compactEvidence(
@@ -116,6 +482,17 @@ function compactEvidence(
     if (existingIndex !== undefined) {
       const existing = compacted[existingIndex];
       existing.facts = mergePlanEvidenceFacts(existing.facts, facts);
+      if (item.observation) {
+        const previousObservation = existing.observation;
+        existing.observation = previousObservation
+          ? {
+              ...item.observation,
+              contentChars: Math.max(previousObservation.contentChars, item.observation.contentChars),
+              negative: previousObservation.negative && item.observation.negative,
+              substantive: previousObservation.substantive || item.observation.substantive,
+            }
+          : { ...item.observation };
+      }
       const existingReferences = existing.provenance.factReferences || [];
       const referenceKeys = new Set(existingReferences.map((reference) => [
         reference.fact,
@@ -152,6 +529,7 @@ function compactEvidence(
       target,
       detail,
       ...(facts.length > 0 ? { facts } : {}),
+      ...(item.observation ? { observation: { ...item.observation } } : {}),
       provenance: {
         ...item.provenance,
         ...(factReferences.length > 0 ? { factReferences } : {}),
@@ -177,6 +555,7 @@ function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"):
       allowedPaths ? `Allowed paths: ${allowedPaths}` : "",
       expectedOutput ? `Expected output: ${expectedOutput}` : "",
       "Use only the read/search tools exposed to you. Do not modify files, run shell commands, request approval, or spawn another agent.",
+      "Do not finish by proposing a tool call that is still available to you. A complete report needs at least one source-backed observation; if an outline or search is empty, read an exact allowed file before summarizing.",
       "Stay inside the allowed paths. Return a concise evidence summary with file paths, findings, uncertainty, and remaining work. Never offer approval choices or address the end user directly.",
     ].filter(Boolean).join("\n\n");
   }
@@ -189,6 +568,7 @@ function buildChildPrompt(request: SpawnSubagentRequest, language: "zh" | "en"):
     allowedPaths ? `允许路径：${allowedPaths}` : "",
     expectedOutput ? `预期产出：${expectedOutput}` : "",
     "只使用当前暴露的读取与搜索工具。不得修改文件、运行 Shell 命令、请求用户批准或继续创建子智能体。",
+    "不要以“稍后再调用当前可用工具”结束任务。完整报告至少需要一条源码支撑的观察；若 outline 或搜索为空，应先读取一个允许的精确文件再总结。",
     "严格限制在允许路径内。返回简洁的证据摘要，包含文件路径、结论、不确定项与剩余工作；不要提供批准选项，也不要直接面向最终用户说话。",
   ].filter(Boolean).join("\n\n");
 }
@@ -419,7 +799,7 @@ export async function executeControlledSubagent(input: {
   emitChildDebug("subagent_scope_reserved", {
     scopeKey,
     allowedPathCount: allowedPaths.length,
-    parentBlocking: false,
+    parentBlocking: true,
   });
 
   const childAbortController = new AbortController();
@@ -442,10 +822,36 @@ export async function executeControlledSubagent(input: {
   let lastError = "";
   let completedToolCalls = 0;
   const evidence: SubagentResultEnvelope["evidence"] = [];
+  // allowedPaths is an authorization ceiling, not an obligation to inspect
+  // every permitted root. Required coverage is introduced only by a concrete
+  // runtime fan-out (or a future explicit completion contract).
+  const requiredObservationPaths = new Set<string>();
+  const coveredObservationPaths = new Set<string>();
+  const failedObservationPaths = new Set<string>();
   let activitySequence = 0;
   let lastProgressEmitAt = 0;
   let childForceXmlTools = false;
   let scopeLeaseActivated = false;
+  const initializedHookSessions = new Set<string>();
+  const initiallyFileLikePaths = allowedPaths.filter(looksLikeExactFilePath);
+  const subagentExecutionScope: SubagentExecutionScope = {
+    subagentId,
+    parentSessionKey: snapshot.threadId,
+    scopeKey,
+    workspace: parentConfig.workspace,
+    allowedPaths,
+    allowedFilePaths: initiallyFileLikePaths,
+    allowedDirectoryPaths: allowedPaths.filter((path) => !initiallyFileLikePaths.includes(path)),
+    scopeKind: initiallyFileLikePaths.length === allowedPaths.length
+      ? "exact_files"
+      : "directory_or_mixed",
+    blockedToolNames: [],
+  };
+  const resolvePathCoverage = (): SubagentPathCoverageAudit => resolveSubagentPathCoverage({
+    requiredPaths: [...requiredObservationPaths],
+    observedPaths: coveredObservationPaths,
+    failedPaths: failedObservationPaths,
+  });
 
   const emitUpdate = (patch: SubagentRunPatch, activity?: SubagentActivity) => {
     input.emitEvent(withEventSchema({
@@ -481,10 +887,25 @@ export async function executeControlledSubagent(input: {
   });
 
   const childCallbacks: OrchestratorCallbacks = {
-    ...input.parentCallbacks,
+    // Keep child callbacks as an explicit allowlist. Spreading the parent
+    // object makes every future parent state callback an accidental cross-run
+    // write channel (for example recovery checkpoints or terminal tool state).
     getMessages: () => childMessages,
     getConfig: () => resolveChildConfig(parentConfig, policy.childMaxIterations),
+    getPreferredLanguage: () => language,
+    getSkills: () => input.parentCallbacks.getSkills(),
+    getMainModeKey: () => input.parentCallbacks.getMainModeKey(),
+    getActiveStudioAgentKey: () => input.parentCallbacks.getActiveStudioAgentKey(),
+    getGameStudioInitialized: () => input.parentCallbacks.getGameStudioInitialized(),
     getPendingSlashCommand: () => null,
+    getGameStudioConfig: () => input.parentCallbacks.getGameStudioConfig?.() || null,
+    getWorkspaceTree: () => input.parentCallbacks.getWorkspaceTree(),
+    getMcpServers: () => input.parentCallbacks.getMcpServers(),
+    getMcpDiscoveredTools: () => input.parentCallbacks.getMcpDiscoveredTools(),
+    getWebSearchEnabled: () => input.parentCallbacks.getWebSearchEnabled?.() === true,
+    getWebSearchProvider: () => input.parentCallbacks.getWebSearchProvider?.() || "duckduckgo",
+    getEnabledKnowledgeBaseIds: () => input.parentCallbacks.getEnabledKnowledgeBaseIds?.() || [],
+    getAssociatedPaths: () => input.parentCallbacks.getAssociatedPaths(),
     getSessionKey: () => `${snapshot.threadId}:${subagentId}`,
     getCurrentTurnId: () => subagentId,
     getCurrentRunIntent: () => "analyze",
@@ -492,15 +913,20 @@ export async function executeControlledSubagent(input: {
     getGoalTurnContract: () => null,
     getExecutionConsentGranted: () => false,
     getForcedExecuteRecoveryMode: () => null,
+    getForcedExecuteRecoveryState: () => null,
     getCommandDirective: () => null,
     getWorkflowMode: () => "chat",
     getIsPlanApproved: () => false,
     getPlanApprovalChoice: () => null,
     getReadOnlyAutoApproveForSession: () => true,
+    getApprovedLocalFileReadPaths: () => input.parentCallbacks.getApprovedLocalFileReadPaths(),
+    getAutoApproveToolScopes: () => [],
     getPlanStage: () => "idle",
+    getPlanArtifacts: () => [],
     getPlanTasks: () => [],
     getPlanExecutionEvidenceLedger: () => [],
     getPlanAutoResumeCount: () => 0,
+    getIsApprovedPlanExecutionTransitionPending: () => false,
     getStatus: () => childStatus,
     consumeActiveGuidance: () => null,
     startNewTurn: () => {},
@@ -510,13 +936,7 @@ export async function executeControlledSubagent(input: {
       runId: childRunId,
       parentRunId,
     }),
-    getSubagentScope: () => ({
-      subagentId,
-      parentSessionKey: snapshot.threadId,
-      scopeKey,
-      workspace: parentConfig.workspace,
-      allowedPaths,
-    }),
+    getSubagentScope: () => subagentExecutionScope,
     getRuntimeTraceContext: () => ({
       threadId: `${snapshot.threadId}:${subagentId}`,
       turnId: subagentId,
@@ -525,6 +945,10 @@ export async function executeControlledSubagent(input: {
       agentKind: "subagent",
       subagentId,
     }),
+    hasSessionHookInitialized: (sessionKey) => initializedHookSessions.has(sessionKey),
+    markSessionHookInitialized: (sessionKey) => {
+      initializedHookSessions.add(sessionKey);
+    },
     shouldForceXmlForProviderCompatibility: () => childForceXmlTools,
     onProviderCompatibilityFallback: (reason) => {
       childForceXmlTools = true;
@@ -535,6 +959,13 @@ export async function executeControlledSubagent(input: {
       });
     },
     onProviderNativeToolSuccess: () => {},
+    // Child iterations resolve a deliberately narrower read-only surface.
+    // Never project that surface into the parent's terminal capability audit.
+    onToolSurfaceResolved: undefined,
+    onModelUsage: (usage) => input.parentCallbacks.onModelUsage?.(usage),
+    onExecuteRecoveryStateChange: undefined,
+    evaluateGoalToolResultCheckpoint: undefined,
+    getPendingSubagentIds: () => [],
     onDebugEvent: (event, data = {}) => {
       if (event === "memory_pressure_sample" && data.action === "hold") {
         emitProgress({
@@ -653,69 +1084,146 @@ export async function executeControlledSubagent(input: {
           target,
           completedToolCalls,
         },
-      }, makeActivity("completed", language === "zh" ? "工具调用完成" : "Tool call completed", tool, target, result));
+    }, makeActivity("completed", language === "zh" ? "工具调用完成" : "Tool call completed", tool, target, result));
     },
     onToolResultObserved: (result: ToolExecutionResult) => {
+      const scopedReadCoverage = result.scopedReadCoverage;
+      for (const path of scopedReadCoverage?.requiredPaths || []) requiredObservationPaths.add(path);
+      for (const path of scopedReadCoverage?.failedPaths || []) failedObservationPaths.add(path);
+      recordFailedScopedPathsFromContent(
+        result.displayContent || result.content,
+        [...requiredObservationPaths],
+        failedObservationPaths,
+      );
       if (
-        result.isError ||
         result.internalFeedback ||
         !SUBAGENT_EVIDENCE_TOOL_NAMES.has(result.name) ||
-        !String(result.target || "").trim()
+        !String(result.target || "").trim() ||
+        (result.isError && !result.scopedReadObservations?.length)
       ) return;
-      // Evidence must come from the model-facing structured tool payload. The
-      // display payload may be a shortened UI status (for example a cache
-      // badge) and must not replace the source observation used for facts.
-      const rawObservation = result.content || result.displayContent || "";
-      const detail = summarizePlanEvidenceDetail({
-        tool: result.name,
-        target: result.target,
-        content: rawObservation,
-        maxChars: 400,
-      }) || compactText(rawObservation, 1_000);
-      const facts = extractPlanEvidenceFacts(detail);
-      const sourceObservation = result.readFileObservation
-        ? { ...result.readFileObservation }
-        : undefined;
-      const sourceRange = result.name === "read_file"
-        ? buildFileReadWindowIdentity(rawObservation)
-        : undefined;
-      const factReferences = facts.map((fact) => ({
-        fact,
-        sourceToolCallId: result.toolCallId,
-        ...(sourceObservation?.key
-          ? { sourceObservationKey: sourceObservation.key }
-          : {}),
-        ...(sourceObservation?.versionToken
-          ? { sourceVersion: sourceObservation.versionToken }
-          : {}),
-        ...(sourceRange ? { sourceRange: { ...sourceRange } } : {}),
-      }));
-      evidence.push({
-        tool: result.name,
-        target: result.target,
-        // This detail is derived exclusively from a completed tool result. The
-        // child-authored final summary is deliberately kept outside evidence.
-        detail,
-        ...(facts.length > 0 ? { facts } : {}),
-        provenance: {
-          source: "tool_observation",
-          owner: {
-            agentKind: "subagent",
-            subagentId,
-            parentTurnId: input.parentTurnId,
-            runId: childRunId,
-          },
+      // Evidence must come from model-facing tool payloads. A safely fanned-out
+      // scoped search contributes one observation per runtime-owned source path
+      // while retaining the original tool-call identity.
+      const defaultContent = result.content || result.displayContent || "";
+      const sourceObservations = result.scopedReadObservations?.length
+        ? result.scopedReadObservations
+        : [{
+            sourcePath: result.target,
+            content: defaultContent,
+            negative: !defaultContent.trim() ||
+              /(?:no matches?|0 matches?|not found|no references? found)/i.test(defaultContent),
+          }];
+      for (const scopedObservation of sourceObservations) {
+        const sourcePath = String(scopedObservation.sourcePath || "").trim();
+        if (!sourcePath) continue;
+        const rawObservation = String(scopedObservation.content || "");
+        const detail = summarizePlanEvidenceDetail({
+          tool: result.name,
+          target: sourcePath,
+          content: rawObservation,
+          maxChars: 400,
+        }) || compactText(rawObservation, 1_000);
+        const facts = extractPlanEvidenceFacts(detail);
+        const isSourceRead = ["read_file", "read_file_window", "read_document"].includes(result.name);
+        const isStructureRead = result.name === "get_file_outline";
+        const isDiffRead = result.name === "git_diff";
+        const observationKind = isSourceRead
+          ? "source"
+          : isStructureRead
+          ? "structure"
+          : isDiffRead
+          ? "diff"
+          : "search";
+        const envelopedSourceContent = isSourceRead
+          ? extractObservedReadFileWindowContent(rawObservation)
+          : null;
+        const isCachedSourceStub = isSourceRead &&
+          /FILE_UNCHANGED_STUB|CACHED_FILE_REPLAY|READ_FILE_REPEAT_LIMIT/i.test(rawObservation);
+        const effectiveSourceContent = isSourceRead
+          ? envelopedSourceContent !== null
+            ? envelopedSourceContent
+            : isCachedSourceStub ? null : rawObservation
+          : null;
+        const negative = scopedObservation.negative || (
+          isStructureRead && (
+            isEmptySubagentStructureObservation(rawObservation) ||
+            isEmptySubagentStructureObservation(detail)
+          )
+        ) || (isSourceRead && effectiveSourceContent !== null && effectiveSourceContent.trim() === "");
+        const sourceContentChars = effectiveSourceContent === null
+          ? 0
+          : [...effectiveSourceContent].length;
+        const substantive = isSourceRead
+          ? effectiveSourceContent !== null
+          : isStructureRead
+          ? !negative && detail.trim().length > 0
+          // A successful targeted search or diff with zero hits is meaningful
+          // negative evidence; it is not equivalent to an empty outline.
+          : true;
+        if (substantive) coveredObservationPaths.add(sourcePath);
+        const sourceObservation = !result.scopedReadObservations?.length && result.readFileObservation
+          ? { ...result.readFileObservation }
+          : undefined;
+        const sourceRange = isSourceRead && envelopedSourceContent !== null
+          ? buildFileReadWindowIdentity(rawObservation)
+          : undefined;
+        const sourceContentHash = effectiveSourceContent !== null
+          ? hashString(effectiveSourceContent)
+          : "";
+        const factReferences = facts.map((fact) => ({
+          fact,
           sourceToolCallId: result.toolCallId,
-          ...(sourceObservation ? { sourceObservation } : {}),
+          ...(sourceObservation?.key
+            ? { sourceObservationKey: sourceObservation.key }
+            : {}),
           ...(sourceObservation?.versionToken
             ? { sourceVersion: sourceObservation.versionToken }
             : {}),
           ...(sourceRange ? { sourceRange: { ...sourceRange } } : {}),
-          ...(factReferences.length > 0 ? { factReferences } : {}),
-        },
-      });
+        }));
+        evidence.push({
+          tool: result.name,
+          target: sourcePath,
+          // The child-authored summary is deliberately kept outside evidence.
+          detail,
+          ...(facts.length > 0 ? { facts } : {}),
+          observation: {
+            kind: observationKind,
+            sourcePath,
+            contentChars: isSourceRead ? sourceContentChars : [...rawObservation].length,
+            negative,
+            substantive,
+          },
+          provenance: {
+            source: "tool_observation",
+            owner: {
+              agentKind: "subagent",
+              subagentId,
+              parentTurnId: input.parentTurnId,
+              runId: childRunId,
+            },
+            sourceToolCallId: result.toolCallId,
+            ...(sourceObservation ? { sourceObservation } : {}),
+            ...(sourceObservation?.versionToken
+              ? { sourceVersion: sourceObservation.versionToken }
+              : {}),
+            ...(sourceContentHash ? { sourceContentHash } : {}),
+            ...(isSourceRead ? { sourceContentChars } : {}),
+            ...(sourceRange ? { sourceRange: { ...sourceRange } } : {}),
+            ...(factReferences.length > 0 ? { factReferences } : {}),
+          },
+        });
+      }
     },
     onToolError: (tool, target, error) => {
+      if (SUBAGENT_EVIDENCE_TOOL_NAMES.has(tool)) {
+        if (String(target || "").trim()) failedObservationPaths.add(target);
+        recordFailedScopedPathsFromContent(
+          error,
+          [...requiredObservationPaths],
+          failedObservationPaths,
+        );
+      }
       emitUpdate({
         status: "running",
         progress: {
@@ -802,6 +1310,20 @@ export async function executeControlledSubagent(input: {
           },
         }, makeActivity("running", language === "zh" ? "开始执行" : "Execution started"));
 
+        const resolvedScopePaths = await resolveSubagentExecutionScopePaths({
+          allowedPaths,
+          workspace: parentConfig.workspace,
+        });
+        subagentExecutionScope.allowedFilePaths = resolvedScopePaths.allowedFilePaths;
+        subagentExecutionScope.allowedDirectoryPaths = resolvedScopePaths.allowedDirectoryPaths;
+        subagentExecutionScope.scopeKind = resolvedScopePaths.scopeKind;
+        emitChildDebug("subagent_scope_paths_resolved", {
+          scopeKey,
+          scopeKind: resolvedScopePaths.scopeKind,
+          allowedFilePaths: resolvedScopePaths.allowedFilePaths,
+          allowedDirectoryPaths: resolvedScopePaths.allowedDirectoryPaths,
+        });
+
         const wallClockTimer = setTimeout(() => {
           wallClockTimedOut = true;
           lastError = "SUBAGENT_WALL_CLOCK_TIMEOUT: execution exceeded 240 seconds.";
@@ -811,7 +1333,6 @@ export async function executeControlledSubagent(input: {
           .finally(() => clearTimeout(wallClockTimer));
         finalStatus = resolveOutcomeStatus(outcome, childAbortController.signal.aborted);
         if (wallClockTimedOut) finalStatus = "blocked";
-        runtimeCompletedSuccessfully = finalStatus === "completed";
         const candidateSummary = compactText(
           finalText || turnSummary || streamText || childMessages
             .filter((message) => message.role === "assistant" && typeof message.content === "string")
@@ -821,18 +1342,63 @@ export async function executeControlledSubagent(input: {
           16_000,
         );
         finalSummary = candidateSummary;
+        const compactedEvidence = compactEvidence(evidence);
+        const declaredRemainingWork = extractDeclaredSubagentRemainingWork(candidateSummary);
+        const requiresEvidence = String(input.request.expectedOutput || "").trim().length > 0;
+        const substantiveEvidence = compactedEvidence.filter(isSubagentEvidenceSubstantive);
+        const hasSubstantiveEvidence = substantiveEvidence.length > 0;
+        const pathCoverage = resolvePathCoverage();
+        if (finalStatus === "completed" && declaredRemainingWork) {
+          finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
+          lastError = "SUBAGENT_REMAINING_WORK_DECLARED: the child report explicitly identifies unfinished in-scope work.";
+          emitChildDebug("subagent_completion_downgraded", {
+            reason: "declared_remaining_work",
+            observationCount: compactedEvidence.length,
+            substantiveEvidenceCount: substantiveEvidence.length,
+            remainingWork: declaredRemainingWork,
+          });
+        } else if (finalStatus === "completed" && requiresEvidence && !hasSubstantiveEvidence) {
+          finalStatus = "blocked";
+          lastError = "SUBAGENT_EVIDENCE_REQUIRED: the expected output requires source evidence, but no substantive tool observation was returned.";
+          emitChildDebug("subagent_completion_downgraded", {
+            reason: "missing_substantive_evidence",
+            observationCount: compactedEvidence.length,
+            substantiveEvidenceCount: 0,
+          });
+        }
+        if (finalStatus === "completed" && pathCoverage.uncoveredPaths.length > 0) {
+          finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
+          lastError = [
+            "SUBAGENT_SCOPE_COVERAGE_INCOMPLETE: required path observations are incomplete.",
+            `uncovered=[${pathCoverage.uncoveredPaths.join(", ")}]`,
+            `failed=[${pathCoverage.failedPaths.join(", ")}]`,
+          ].join(" ");
+          emitChildDebug("subagent_completion_downgraded", {
+            reason: "incomplete_required_path_coverage",
+            requiredPaths: pathCoverage.requiredPaths,
+            coveredPaths: pathCoverage.coveredPaths,
+            failedPaths: pathCoverage.failedPaths,
+            uncoveredPaths: pathCoverage.uncoveredPaths,
+            observationCount: compactedEvidence.length,
+            substantiveEvidenceCount: substantiveEvidence.length,
+          });
+        }
         if (
           finalStatus === "failed" &&
           (outcome.status === "stopped_no_action" || outcome.status === "stopped_no_output") &&
           (candidateSummary.length > 0 || evidence.length > 0)
         ) {
-          finalStatus = "blocked";
+          finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
           emitChildDebug("subagent_partial_result_preserved", {
             outcomeStatus: outcome.status,
             outcomeReason: outcome.reason,
             summaryChars: candidateSummary.length,
-            evidenceCount: evidence.length,
+            observationCount: compactedEvidence.length,
+            substantiveEvidenceCount: substantiveEvidence.length,
           });
+        }
+        if (finalStatus === "failed" && reportSubagentCapacityFailure(policy, lastError || outcome.reason)) {
+          finalStatus = hasSubstantiveEvidence ? "degraded" : "blocked";
         }
         if (!finalSummary) {
           finalSummary = finalStatus === "completed"
@@ -840,14 +1406,47 @@ export async function executeControlledSubagent(input: {
             : lastError || outcome.reason;
         }
         const completedAt = Date.now();
-        if (finalStatus === "failed") {
-          const degraded = reportSubagentCapacityFailure(policy, lastError || outcome.reason);
-          if (degraded) finalStatus = "degraded";
-        }
+        const coverageRemainingWork = buildCoverageRemainingWork(pathCoverage);
+        const remainingWork = finalStatus === "completed"
+          ? ""
+          : declaredRemainingWork || coverageRemainingWork || objective;
+        const closureState: NonNullable<SubagentResultEnvelope["closureAudit"]>["state"] =
+          finalStatus === "completed"
+            ? "satisfied"
+            : finalStatus === "degraded" && hasSubstantiveEvidence
+            ? "partial"
+            : "blocked";
+        const closureReason = closureState === "satisfied"
+          ? requiresEvidence
+            ? "The expected output is backed by substantive tool observations and no remaining work was declared."
+            : "The child runtime completed and declared no remaining work."
+          : closureState === "partial"
+          ? lastError || outcome.reason || "Substantive evidence was returned, but in-scope work remains."
+          : lastError || outcome.reason || "The child did not produce sufficient evidence to close the objective.";
+        const acceptedEvidenceToolCallIds = [...new Set(substantiveEvidence
+          .map((item) => String(item.provenance.sourceToolCallId || "").trim())
+          .filter(Boolean))];
+        const closureAudit: NonNullable<SubagentResultEnvelope["closureAudit"]> = {
+          state: closureState,
+          observationCount: compactedEvidence.length,
+          substantiveEvidenceCount: substantiveEvidence.length,
+          acceptedEvidenceToolCallIds,
+          requiredPaths: pathCoverage.requiredPaths,
+          coveredPaths: pathCoverage.coveredPaths,
+          failedPaths: pathCoverage.failedPaths,
+          uncoveredPaths: pathCoverage.uncoveredPaths,
+          reason: closureReason,
+        };
+        runtimeCompletedSuccessfully = finalStatus === "completed";
         emitUpdate({
           status: finalStatus,
           completedAt,
           summary: finalSummary,
+          evidenceCount: substantiveEvidence.length,
+          observationCount: compactedEvidence.length,
+          substantiveEvidenceCount: substantiveEvidence.length,
+          closureState,
+          ...(remainingWork ? { remainingWork } : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
           progress: {
             phase: "done",
@@ -878,15 +1477,16 @@ export async function executeControlledSubagent(input: {
             timestampMs: completedAt,
             subagentId,
             reason: lastError || outcome.reason,
-            evidenceCount: evidence.length,
-            remainingWork: objective,
+            evidenceCount: substantiveEvidence.length,
+            remainingWork,
           }));
           emitChildDebug("subagent_handed_back", {
             subagentId,
             scopeKey,
             reason: lastError || outcome.reason,
-            evidenceCount: evidence.length,
-            remainingWork: objective,
+            observationCount: compactedEvidence.length,
+            substantiveEvidenceCount: substantiveEvidence.length,
+            remainingWork,
           });
         }
         return {
@@ -896,9 +1496,12 @@ export async function executeControlledSubagent(input: {
           status: finalStatus,
           summary: finalSummary,
           summaryTrust: "unverified_hypothesis",
-          evidence: compactEvidence(evidence),
+          evidence: compactedEvidence,
+          closureAudit,
           ...(finalStatus === "completed" ? {} : { blocker: lastError || outcome.reason }),
-          ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
+          ...(finalStatus === "blocked" || finalStatus === "degraded"
+            ? { remainingWork }
+            : {}),
           ...(finalStatus === "completed" ? {} : { error: lastError || outcome.reason }),
         };
       },
@@ -913,14 +1516,40 @@ export async function executeControlledSubagent(input: {
         ? "SUBAGENT_CANCELED_BY_USER：子智能体已停止；除非用户明确要求，否则不要重新创建相同任务。"
         : "SUBAGENT_CANCELED_BY_USER: the subagent was stopped; do not respawn the same task unless the user explicitly asks."
       : error instanceof Error ? error.message : String(error || "");
+    const compactedEvidence = compactEvidence(evidence);
+    const substantiveEvidence = compactedEvidence.filter(isSubagentEvidenceSubstantive);
+    const pathCoverage = resolvePathCoverage();
     if (finalStatus === "failed" && reportSubagentCapacityFailure(policy, error)) {
-      finalStatus = "degraded";
+      finalStatus = substantiveEvidence.length > 0 ? "degraded" : "blocked";
     }
+    const remainingWork = extractDeclaredSubagentRemainingWork(finalSummary) ||
+      buildCoverageRemainingWork(pathCoverage) ||
+      objective;
+    const closureState: NonNullable<SubagentResultEnvelope["closureAudit"]>["state"] =
+      finalStatus === "degraded" && substantiveEvidence.length > 0 ? "partial" : "blocked";
+    const closureAudit: NonNullable<SubagentResultEnvelope["closureAudit"]> = {
+      state: closureState,
+      observationCount: compactedEvidence.length,
+      substantiveEvidenceCount: substantiveEvidence.length,
+      acceptedEvidenceToolCallIds: [...new Set(substantiveEvidence
+        .map((item) => String(item.provenance.sourceToolCallId || "").trim())
+        .filter(Boolean))],
+      requiredPaths: pathCoverage.requiredPaths,
+      coveredPaths: pathCoverage.coveredPaths,
+      failedPaths: pathCoverage.failedPaths,
+      uncoveredPaths: pathCoverage.uncoveredPaths,
+      reason: lastError || "The child runtime failed before the objective could be closed.",
+    };
     emitUpdate({
       status: finalStatus,
       completedAt: Date.now(),
       summary: finalSummary,
       error: lastError,
+      evidenceCount: substantiveEvidence.length,
+      observationCount: compactedEvidence.length,
+      substantiveEvidenceCount: substantiveEvidence.length,
+      closureState,
+      remainingWork,
       progress: {
         phase: "done",
         title: finalStatus === "canceled"
@@ -944,13 +1573,17 @@ export async function executeControlledSubagent(input: {
       status: finalStatus,
       summary: finalSummary,
       summaryTrust: "unverified_hypothesis",
-      evidence: compactEvidence(evidence),
+      evidence: compactedEvidence,
+      closureAudit,
       blocker: lastError,
-      ...(finalStatus === "degraded" ? { remainingWork: objective } : {}),
+      ...(finalStatus === "blocked" || finalStatus === "degraded" ? { remainingWork } : {}),
       error: lastError,
     };
   } finally {
     const closedAt = Date.now();
+    const finalEvidence = compactEvidence(evidence);
+    const finalSubstantiveEvidence = finalEvidence.filter(isSubagentEvidenceSubstantive);
+    const finalPathCoverage = resolvePathCoverage();
     if (runtimeStartedAt !== null) {
       recordSubagentRuntimeSample({
         laneKey: policy.laneKey,
@@ -964,10 +1597,16 @@ export async function executeControlledSubagent(input: {
       status: finalStatus,
       durationMs: closedAt - lifecycleStartedAt,
       completedToolCalls,
-      evidenceCount: compactEvidence(evidence).length,
-      trustedEvidenceCount: compactEvidence(evidence).filter((item) =>
+      observationCount: finalEvidence.length,
+      evidenceCount: finalSubstantiveEvidence.length,
+      substantiveEvidenceCount: finalSubstantiveEvidence.length,
+      trustedEvidenceCount: finalSubstantiveEvidence.filter((item) =>
         item.provenance.source === "tool_observation"
       ).length,
+      requiredPaths: finalPathCoverage.requiredPaths,
+      coveredPaths: finalPathCoverage.coveredPaths,
+      failedPaths: finalPathCoverage.failedPaths,
+      uncoveredPaths: finalPathCoverage.uncoveredPaths,
       summaryTrust: "unverified_hypothesis",
       blocker: compactText(lastError, 300) || null,
       scopeLeaseActivated,

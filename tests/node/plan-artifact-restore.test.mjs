@@ -169,6 +169,20 @@ test("restore rejects an unapproved Plan built on an unsupported hypothesis", ()
   }]);
 });
 
+test("current-state evidence may describe a possible risk without becoming a speculative change", () => {
+  const content = buildActionablePlan().replace(
+    "## 关键改动",
+    [
+      "## 现状分析 (Evidence Bundle)",
+      "- `src/lib/planArtifactRestore.ts` 的旧恢复路径可能导致未经校验的草稿进入候选区；此项是风险描述，不是未经证实的实现承诺。",
+      "",
+      "## 关键改动",
+    ].join("\n"),
+  );
+  const quality = validateActionablePlanArtifact(content);
+  assert.equal(quality.ok, true, quality.reason || "evidence risk should remain reviewable");
+});
+
 test("restore retains an already-approved structurally valid legacy Plan", () => {
   const content = buildUnsupportedHypothesisPlan();
   assert.equal(validatePlanArtifactContent(content, "plan").ok, true);

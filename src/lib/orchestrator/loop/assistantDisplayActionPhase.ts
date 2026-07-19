@@ -70,6 +70,7 @@ export function handleAssistantDisplayActionPhase(input: {
   isCloudProfile: boolean;
   iterationToolCount: number;
   llmToolCount: number;
+  forceXmlTools: boolean;
   messages: AgentMessage[];
   activateChatFinalSynthesis: (
     reason: string,
@@ -104,6 +105,10 @@ export function handleAssistantDisplayActionPhase(input: {
     sawExecuteOperationEvidence: input.sawExecuteOperationEvidence,
     readOnlyAutoApproveForSession:
       workflowMode === "edit" || callbacks.getReadOnlyAutoApproveForSession(),
+    isSubagentTurn: (callbacks.getSubagentDepth?.() || 0) > 0,
+    hasPriorToolEvidence: input.recentToolActivity.some((activity) =>
+      activity.status === "succeeded"
+    ),
     language: callbacks.getPreferredLanguage(),
   });
   const {
@@ -373,6 +378,7 @@ export function handleAssistantDisplayActionPhase(input: {
     isCloudProfile: input.isCloudProfile,
     iterationToolCount: input.iterationToolCount,
     llmToolCount: input.llmToolCount,
+    forceXmlTools: input.forceXmlTools,
     pseudoToolCallPlaceholder,
     pseudoToolNameCandidate,
     recoveryPromptState,

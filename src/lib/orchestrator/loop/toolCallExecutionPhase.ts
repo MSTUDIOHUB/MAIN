@@ -1,4 +1,5 @@
 import type { HooksConfig } from "../../hooks";
+import { extractStructuredChangedPaths } from "../fileReadCache";
 import { analyzePtyObservationResult } from "../../devServerRuntime";
 import {
   buildPatchRecoveryReadNoProgressFingerprint,
@@ -325,6 +326,7 @@ export async function executeToolCallPhase(input: {
   turnInputContextSignals: TurnInputContextSignals;
   taskTargetingEvidence: Set<string>;
   unityConsoleDiagnosticsRequested: boolean;
+  forceXmlTools: boolean;
   noToolRuntimeState: AgentLoopNoToolRuntimeState;
   planRuntimeState: PlanLoopRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
@@ -522,6 +524,9 @@ export async function executeToolCallPhase(input: {
   const mutationResult = allResults.find((result) =>
     !result.internalFeedback && isProjectSourceWriteResult(result)
   );
+  const mutationTargets = mutationResult
+    ? extractStructuredChangedPaths(mutationResult.content, mutationResult.displayContent)
+    : [];
   const validationResult = allResults.find(isVerificationEvidenceResult);
   const recoveryIterationBudgetNeutral =
     executeRecoveryState.mode !== "normal" &&
@@ -573,6 +578,7 @@ export async function executeToolCallPhase(input: {
           ))
         : false,
       mutationTarget: mutationResult?.target,
+      mutationTargets,
       validationTarget: validationResult?.target || validationResult?.name,
       validationToolName: validationResult?.name,
     },
@@ -693,6 +699,7 @@ export async function executeToolCallPhase(input: {
       unityMcpRuntimeState.forceConsoleFirstPending,
     unityConsoleMissingFirstToolRepromptIssued:
       unityMcpRuntimeState.consoleMissingFirstToolRepromptIssued,
+    forceXmlTools: input.forceXmlTools,
     recentSuccessfulProjectWrite:
       evidenceRuntimeState.recentSuccessfulProjectWrite,
     recoveringFromEmptyAssistantReplyAfterWrite:

@@ -140,8 +140,49 @@ test("turn intake distinguishes preferred, allowed, and forbidden subagent deleg
     "forbidden",
   );
   assert.equal(
+    resolveSubagentDelegationPreference(
+      "必须先连续调用 spawn_subagent 三次；主体不要重读子智能体租约路径。",
+    ),
+    "preferred",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference(
+      "可以开启多个子智能体并行分析，但子智能体不要修改文件。",
+    ),
+    "preferred",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference(
+      "Use several subagents, but no subagents may modify files.",
+    ),
+    "preferred",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference(
+      "Please spawn three subagents, but do not reread subagent leased paths.",
+    ),
+    "preferred",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference(
+      "必须先使用三个子智能体分析；但本轮不要使用子智能体。",
+    ),
+    "forbidden",
+  );
+  assert.equal(
     resolveSubagentDelegationPreference("修复启动白屏"),
     "unspecified",
+  );
+});
+
+test("child mutation restrictions do not disable delegation", () => {
+  assert.equal(
+    resolveSubagentDelegationPreference("可以开启多个子智能体，但禁止子智能体修改文件。"),
+    "preferred",
+  );
+  assert.equal(
+    resolveSubagentDelegationPreference("本轮禁止子智能体参与。"),
+    "forbidden",
   );
 });
 

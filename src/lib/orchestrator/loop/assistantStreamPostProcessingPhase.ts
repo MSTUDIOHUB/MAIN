@@ -116,6 +116,7 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     runtimeState,
     iteration,
     runtimeIntent,
+    forceXmlTools,
     streamResult,
   } = input;
   const {
@@ -197,6 +198,7 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     workflowMode,
     turnIntent,
     runtimeIntent,
+    forceXmlTools,
     streamText,
     normalized,
     normalizedBaseToolCallCount: normalizedBase.toolCalls.length,

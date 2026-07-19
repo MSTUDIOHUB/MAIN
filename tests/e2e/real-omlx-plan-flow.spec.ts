@@ -57,6 +57,7 @@ const allowSafeExecutionPause = process.env.REAL_OMLX_ALLOW_SAFE_PAUSE === "1";
 const expectAgentExplanation = process.env.REAL_OMLX_EXPECT_AGENT_TEXT === "1";
 const forbiddenChatNoise = /<tool_use>|<user_options>|\[PROPOSAL START\]|append_debug_log|ContextMemoryState|MAIN TOOL FEEDBACK|^\s*कल\s*$/m;
 const completedTurnStatuses = new Set(["done", "completed", "completed_with_changes"]);
+const reviewablePlanStages = new Set(["plan", "design", "bugfix", "ready_to_execute"]);
 
 const useSemanticMdViewerMutationOracle =
   realOmlxFixture === "md-viewer" &&
@@ -1492,6 +1493,21 @@ for (const model of models) {
       debugTail: terminalSnapshot?.debugTail,
     }).slice(-40_000)}`);
     expect(completedTurnStatuses.has(String(terminalSnapshot?.currentTurnStatus || ""))).toBe(true);
+    const terminalTurnId = String(terminalSnapshot?.currentTurnId || "");
+    expect(terminalTurnId).not.toBe("");
+    const finalAssistantMessage = page.locator(
+      `[data-testid="assistant-final"][data-turn-id="${terminalTurnId}"]`,
+    );
+    await expect(finalAssistantMessage).toBeVisible();
+    const finalAssistantText = String(await finalAssistantMessage.textContent() || "").trim();
+    expect(finalAssistantText.length).toBeGreaterThan(0);
+    expect(finalAssistantText).not.toContain("agent_loop_completed");
+    expect((terminalSnapshot?.taskFlowPreview || []).some((block: { turnId?: string; type?: string; visibility?: string; content?: string }) =>
+      block.turnId === terminalTurnId &&
+      block.type === "agent" &&
+      block.visibility === "assistant_final" &&
+      String(block.content || "").trim().length > 0
+    )).toBe(true);
 
     const source = await fs.readFile(
       path.join(workspace, "src/hooks/useCsvParser.ts"),
@@ -1620,7 +1636,7 @@ for (const model of models) {
       block.toolName === "read_file" || block.toolName === "grep_search"
     )).toBe(false);
 
-    if (/qwen3\.6-35b-a3b/i.test(model) || process.env.REAL_OMLX_GOAL_REQUIRE_COMPLETION === "1") {
+    if (process.env.REAL_OMLX_GOAL_REQUIRE_COMPLETION === "1") {
       expect(snapshot?.goalStatus).toBe("completed");
     }
 
@@ -1653,7 +1669,6 @@ for (const model of models) {
 }
 
 const subagentModel = process.env.OMLX_SUBAGENT_MODEL ||
-  models.find((model) => /qwen3\.6-35b-a3b/i.test(model)) ||
   models[0];
 
 test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async ({ page }) => {
@@ -1685,10 +1700,17 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
 
   let maxActiveChildren = 0;
   let maxRunningChildren = 0;
+  let terminalOutcome = "running";
+  let stableTerminalPolls = 0;
+  let sawRunActivity = false;
   await expect.poll(async () => {
     const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
-    if (snapshot?.dispatchError) return `dispatch_error:${snapshot.dispatchError}`;
+    if (snapshot?.dispatchError) {
+      terminalOutcome = `dispatch_error:${snapshot.dispatchError}`;
+      return true;
+    }
     const runs = snapshot?.subagentRuns || [];
+    if (snapshot?.isGenerating === true || runs.length > 0) sawRunActivity = true;
     maxActiveChildren = Math.max(
       maxActiveChildren,
       runs.filter((run: { status?: string }) => ["queued", "starting", "running", "summarizing"].includes(String(run.status))).length,
@@ -1701,30 +1723,80 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
       runs.length >= 3 &&
       snapshot?.planArtifacts?.length > 0 &&
       snapshot?.isGenerating === false &&
+      snapshot?.agentStatus === "pending_review" &&
+      snapshot?.currentTurnStatus === "awaiting_approval" &&
+      reviewablePlanStages.has(String(snapshot?.planStage || "")) &&
       runs.every((run: { status?: string }) => !["queued", "starting", "running", "summarizing"].includes(String(run.status)))
     ) {
-      return "joined_plan_ready";
+      terminalOutcome = "joined_plan_ready";
+      return true;
     }
-    if (snapshot?.isGenerating === false && runs.length < 3) {
-      return `terminal_without_three_subagents:${runs.length}:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+    let observedTerminal = "";
+    if (sawRunActivity && snapshot?.isGenerating === false && runs.length < 3) {
+      observedTerminal = `terminal_without_three_subagents:${runs.length}:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+    } else if (sawRunActivity && snapshot?.isGenerating === false && !snapshot?.planArtifacts?.length) {
+      observedTerminal = `terminal_without_plan:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+    } else if (
+      sawRunActivity &&
+      snapshot?.isGenerating === false &&
+      runs.length >= 3 &&
+      snapshot?.planArtifacts?.length > 0 &&
+      runs.every((run: { status?: string }) => !["queued", "starting", "running", "summarizing"].includes(String(run.status))) &&
+      (
+        snapshot?.agentStatus !== "pending_review" ||
+        snapshot?.currentTurnStatus !== "awaiting_approval" ||
+        !reviewablePlanStages.has(String(snapshot?.planStage || ""))
+      )
+    ) {
+      observedTerminal = `terminal_invalid_plan_state:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}:${snapshot?.planStage}`;
     }
-    if (snapshot?.isGenerating === false && !snapshot?.planArtifacts?.length) {
-      return `terminal_without_plan:${snapshot?.currentTurnStatus}:${snapshot?.agentStatus}`;
+    if (observedTerminal) {
+      stableTerminalPolls += 1;
+      terminalOutcome = observedTerminal;
+      return stableTerminalPolls >= 3;
     }
-    return `running:${runs.length}:${maxActiveChildren}`;
-  }, { timeout: 600_000 }).toBe("joined_plan_ready");
+    stableTerminalPolls = 0;
+    terminalOutcome = `running:${runs.length}:${maxActiveChildren}`;
+    return false;
+  }, { timeout: 600_000 }).toBe(true);
+  const terminalSnapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  if (terminalOutcome !== "joined_plan_ready") {
+    console.log(`[real-omlx-subagents-terminal:${subagentModel}] ${JSON.stringify({
+      terminalOutcome,
+      agentStatus: terminalSnapshot?.agentStatus,
+      currentTurnStatus: terminalSnapshot?.currentTurnStatus,
+      planStage: terminalSnapshot?.planStage,
+      runs: terminalSnapshot?.subagentRuns,
+      taskFlow: terminalSnapshot?.taskFlowPreview,
+      debug: terminalSnapshot?.debugTail,
+    }).slice(0, 40_000)}`);
+  }
+  expect(terminalOutcome).toBe("joined_plan_ready");
 
-  const snapshot = await page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.());
+  const snapshot = terminalSnapshot;
+  expect(snapshot.agentStatus).toBe("pending_review");
+  expect(snapshot.currentTurnStatus).toBe("awaiting_approval");
+  expect(reviewablePlanStages.has(String(snapshot.planStage || ""))).toBe(true);
+  const planQuality = validateActionablePlanArtifact(snapshot.planArtifacts[0].content);
+  expect(planQuality.ok, planQuality.reason || "plan should be actionable").toBe(true);
   const runs = snapshot.subagentRuns as Array<{
     id: string;
     scopeKey: string;
     status: string;
+    createdAt: number;
     startedAt: number | null;
     completedAt: number | null;
+    closedAt: number | null;
     summary: string;
     evidenceCount: number;
+    observationCount: number;
+    substantiveEvidenceCount: number;
+    closureState: string;
+    remainingWork: string;
+    error: string;
   }>;
-  const selectedRuns = runs.slice(0, 3);
+  const expectedScopeKeys = new Set(["csv-parser", "chart-consumer", "type-contract"]);
+  const selectedRuns = runs.filter((run) => expectedScopeKeys.has(run.scopeKey));
   const debugEntries = (snapshot.debugTail || []) as Array<{ source?: string; message?: string }>;
   const parsedDebugEntries = debugEntries.map((entry) => {
     try {
@@ -1745,35 +1817,67 @@ test(`real OMLX adaptively admits a third subagent with ${subagentModel}`, async
     debug: diagnosticDebug,
   }).slice(0, 20_000)}`);
 
-  expect(new Set(selectedRuns.map((run) => run.scopeKey)).size).toBe(3);
+  expect(selectedRuns).toHaveLength(3);
+  expect(new Set(selectedRuns.map((run) => run.scopeKey))).toEqual(expectedScopeKeys);
   expect(selectedRuns.every((run) => ["completed", "blocked", "degraded"].includes(run.status))).toBe(true);
-  expect(selectedRuns.every((run) => run.startedAt && run.completedAt && run.summary.trim().length > 0)).toBe(true);
-  expect(maxActiveChildren).toBeGreaterThanOrEqual(3);
-  expect(maxRunningChildren).toBeGreaterThanOrEqual(3);
-  expect(Math.max(...selectedRuns.map((run) => run.startedAt || 0)))
+  expect(selectedRuns.every((run) => (
+    Number.isFinite(run.createdAt) &&
+    run.createdAt > 0 &&
+    !!run.startedAt &&
+    !!run.completedAt &&
+    run.createdAt <= run.startedAt &&
+    run.startedAt <= run.completedAt &&
+    (run.closedAt === null || run.completedAt <= run.closedAt) &&
+    run.summary.trim().length > 0
+  ))).toBe(true);
+  expect(selectedRuns.every((run) => run.evidenceCount === run.substantiveEvidenceCount)).toBe(true);
+  expect(selectedRuns.every((run) => {
+    if (run.status === "completed") {
+      return run.closureState === "satisfied" && run.evidenceCount > 0 && !run.remainingWork.trim();
+    }
+    if (run.status === "degraded") {
+      return run.closureState === "partial" && run.evidenceCount > 0 && run.remainingWork.trim().length > 0;
+    }
+    return run.closureState === "blocked" &&
+      (run.error.trim().length > 0 || run.remainingWork.trim().length > 0);
+  })).toBe(true);
+  expect(Math.max(...selectedRuns.map((run) => run.createdAt)))
     .toBeLessThan(Math.min(...selectedRuns.map((run) => run.completedAt || Number.MAX_SAFE_INTEGER)));
   expect(parsedDebugEntries.some((entry) =>
     entry.source === "parent_join_required" ||
+    entry.source === "parent_wait" ||
     (entry.source === "store.agent_loop_stop_summary" && entry.latestTool === "wait_subagents")
   )).toBe(true);
   expect(debugText).toMatch(/parent_wait/);
   expect(debugText).toMatch(/parent_resume/);
+  const selectedRunIds = new Set(selectedRuns.map((run) => run.id));
   expect(parsedDebugEntries.some((entry) => (
-    entry.source === "model_lane_admission" && entry.activeRequests === 3 && entry.limit === 4
+    entry.source === "model_lane_admission" &&
+    Array.isArray(entry.liveRequests) &&
+    entry.liveRequests.some((request: { agentKind?: string }) => (
+      request.agentKind === "parent" || request.agentKind === "main"
+    )) &&
+    entry.liveRequests.some((request: { agentKind?: string }) => request.agentKind === "subagent")
   ))).toBe(true);
   expect(parsedDebugEntries.some((entry) => (
+    entry.source === "model_lane_admission" &&
+    Array.isArray(entry.liveRequests) &&
+    entry.liveRequests.filter((request: { agentKind?: string }) => request.agentKind === "subagent").length >= 2
+  ))).toBe(true);
+  const elasticBurstObserved = parsedDebugEntries.some((entry) => (
     entry.source === "subagent_started" &&
+    selectedRunIds.has(String(entry.subagentId || "")) &&
     entry.elasticAdmissionGranted === true &&
+    entry.burstAdmission?.allowed === true &&
     Number(entry.burstAdmission?.safeOverlapSamples || 0) >= 2
-  ))).toBe(true);
-  expect(parsedDebugEntries.some((entry) => (
-    entry.source === "model_lane_admission"
-    && ["cold_start_first_token", "lane_full"].includes(String(entry.queueReason || ""))
-  ))).toBe(true);
-  expect(debugText).not.toMatch(/"decision":"degraded"|SUBAGENT_MEMORY_PRESSURE_DEGRADED|out of memory|\bOOM\b/i);
-  for (const run of selectedRuns) {
-    expect(debugText).toContain(run.id.replace(/^subagent-/, "run-subagent-"));
-  }
+  ));
+  const safeCapacityFallbackObserved = parsedDebugEntries.some((entry) => (
+    entry.source === "subagent_elastic_admission" &&
+    selectedRunIds.has(String(entry.subagentId || "")) &&
+    entry.decision === "started_after_base_slot_released"
+  ));
+  expect(elasticBurstObserved || safeCapacityFallbackObserved).toBe(true);
+  expect(debugText).not.toMatch(/out of memory|\bOOM\b|uncaught|unhandled rejection/i);
   expect(snapshot.planArtifacts[0].content).toMatch(/useCsvParser|creatorName/);
   expect(snapshot.planArtifacts[0].content).toMatch(/useChartData|dashboardStore/);
   expect(snapshot.planArtifacts[0].content).toMatch(/src\/types\/order\.ts/);

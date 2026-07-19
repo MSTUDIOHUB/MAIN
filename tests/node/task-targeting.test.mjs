@@ -83,6 +83,30 @@ const designSkill = {
   entryPoint: "design-md/DESIGN.md",
 };
 
+test("task targeting extracts assignment and comma-delimited path scopes", () => {
+  const profile = buildTaskTargetingProfile({
+    userPrompt: "allowed_paths=src/a.ts,src/b.ts，src/c.ts",
+  });
+
+  assert.deepEqual(profile.explicitPaths, ["src/a.ts", "src/b.ts", "src/c.ts"]);
+});
+
+test("task targeting extracts allowed_paths after Chinese sentence punctuation", () => {
+  const profile = buildTaskTargetingProfile({
+    userPrompt: "Euler：scope=只分析字段归一化，allowed_paths=src/hooks/useCsvParser.ts，expected_output=给出证据。",
+  });
+
+  assert.deepEqual(profile.explicitPaths, ["src/hooks/useCsvParser.ts"]);
+});
+
+test("task targeting does not promote numeric model settings to file scopes", () => {
+  const profile = buildTaskTargetingProfile({
+    userPrompt: "model=qwen3.6 version=1.2.3 temperature=0.7",
+  });
+
+  assert.deepEqual(profile.explicitPaths, []);
+});
+
 test("task targeting blocks UI source writes until DESIGN protocol is read or style is confirmed", () => {
   const profile = buildTaskTargetingProfile({
     userPrompt: "请按照当前 Skill 修改 ExecutionCapsule 的 UI 样式。",

@@ -554,6 +554,8 @@ export interface DurableTurnExecutionSummary {
   validations: string[];
   failures: string[];
   unfinished: string[];
+  /** Non-blocking checks that still need a user or unavailable runtime. */
+  advisories: string[];
   artifacts: string[];
 }
 
@@ -622,6 +624,12 @@ export interface NormalizedStreamState {
     | "required_tool_call_not_available";
   protocolExpectedTool?: string;
   protocolActualTools?: string[];
+  protocolActualToolCalls?: Array<{
+    index: number;
+    id: string;
+    name: string;
+    arguments: string;
+  }>;
   protocolAllowedTools?: string[];
 }
 
@@ -1270,7 +1278,7 @@ const BROWSER_INTERACTION_VALIDATION_RE =
 // two clauses structural prevents a lone verb such as "click" or a passive
 // page-load check from becoming interaction evidence.
 const DIRECT_UI_INTERACTION_ACTION_RE =
-  /(?:实际\s*)?(?:点击|双击|填写|选择|切换|拖拽|拖放|提交)|\b(?:actually\s+)?(?:click|double[- ]?click|fill|select|toggle|drag|drop|submit)\b/i;
+  /(?:实际\s*)?(?:点击|双击|填写|选择|切换|拖拽|拖放|提交|上传|导入)|\b(?:actually\s+)?(?:click|double[- ]?click|fill|select|toggle|drag|drop|submit|upload|import)\b/i;
 const POST_INTERACTION_ASSERTION_CUE_RE =
   /(?:→|->|=>|(?:操作|动作|点击|选择|切换|提交)?(?:完成)?后|然后|随后|接着|并(?:检查|验证|确认|断言|观察)|(?:验证|检查|确认|断言|观察)|\b(?:then|after(?:wards)?|and\s+(?:verify|check|confirm|assert|observe)|(?:verify|check|confirm|assert|observe))\b)/i;
 const OBSERVABLE_UI_POST_STATE_RE =
@@ -1282,7 +1290,7 @@ const TAURI_VALIDATION_RE =
 const MANUAL_VALIDATION_RE =
   /(?:人工|用户(?:自己)?|你自己|自行|肉眼|手动(?:验证|确认|检查|验收)|需(?:要)?\s*手动(?:验证|确认|检查|验收)|由用户手动|human|user confirmation|user validation|manual(?:ly)? validation|manually confirmed by (?:the )?user|visually inspect)/i;
 const SOURCE_MUTATION_TASK_RE =
-  /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|防御性编程)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
+  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|防御性编程)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
 const PRIMARY_VALIDATION_TASK_RE =
   /(?:^\s*(?:(?:静态|逻辑|行为|功能|单元|集成|端到端|回归|构建|类型|编译|运行时|自动化)?(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图))(?:\s|[（(]|[:：]|$)|^\s*(?:运行|执行)\s+(?:(?:npm|pnpm|yarn|bun|npx|node|cargo|pytest|python|go|swift|dotnet|mvn|gradle)\b|[^\r\n]{0,100}(?:测试|验证|检查|验收|构建|编译|lint|类型检查))|^\s*(?:(?:static|logical?|behavioral|functional|unit|integration|end-to-end|e2e|regression|build|type|compile|runtime|automated)\s+)?(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
 const NEGATED_SOURCE_MUTATION_SPAN_RE =
@@ -2540,13 +2548,58 @@ export function isPlanTaskAwaitingBrowserValidation(task: Pick<PlanTask, "eviden
   return task.evidenceStatus === "requires_browser_validation";
 }
 
+/**
+ * Browser review is a hard acceptance gate when it originated from an
+ * explicit user criterion, describes a concrete interaction/assertion, or
+ * requires a screenshot. A generic passive browser check added by a Plan may
+ * be reported as advisory only when other trusted/core evidence already
+ * exists and the current runtime has no browser tool.
+ */
+export function isPlanTaskBrowserValidationRequiredForCompletion(task: PlanTask): boolean {
+  if (!isPlanTaskAwaitingBrowserValidation(task)) return false;
+  if (isUserRequestValidationTask(task)) return true;
+  return (task.evidence || []).some((item) =>
+    item.kind === "browser_screenshot" ||
+    item.requiresInteraction === true ||
+    /^(?:DOM assertion|browser interaction):/i.test(String(item.value || ""))
+  );
+}
+
+export function canDowngradeUnavailableBrowserValidationToAdvisory(
+  audit: Pick<PlanTaskEvidenceAudit, "tasks" | "remainingTasks">,
+): boolean {
+  const remaining = audit.remainingTasks;
+  if (
+    remaining.length === 0 ||
+    !remaining.every(isPlanTaskAwaitingBrowserValidation) ||
+    remaining.some(isPlanTaskBrowserValidationRequiredForCompletion)
+  ) return false;
+  const hasTrustedCoreTask = audit.tasks.some(isPlanTaskTrustedComplete);
+  const hasSatisfiedCoreEvidenceInsideBrowserTask = remaining.some((task) =>
+    (task.evidence || []).some((item) =>
+      item.kind !== "browser_dom" &&
+      item.kind !== "browser_screenshot" &&
+      item.kind !== "manual_user_validation" &&
+      item.kind !== "tauri_required"
+    )
+  );
+  return hasTrustedCoreTask || hasSatisfiedCoreEvidenceInsideBrowserTask;
+}
+
 export function isPlanTaskBlockingAutomation(
   task: PlanTask,
-  options: { browserValidationAvailable?: boolean } = {},
+  options: {
+    browserValidationAvailable?: boolean;
+    unavailableBrowserIsAdvisory?: boolean;
+  } = {},
 ): boolean {
   if (isPlanTaskTrustedComplete(task)) return false;
   if (isPlanTaskAwaitingExternalValidation(task)) return false;
-  if (isPlanTaskAwaitingBrowserValidation(task) && !options.browserValidationAvailable) return false;
+  if (
+    isPlanTaskAwaitingBrowserValidation(task) &&
+    !options.browserValidationAvailable &&
+    options.unavailableBrowserIsAdvisory === true
+  ) return false;
   return true;
 }
 
@@ -2879,11 +2932,11 @@ export function extractPlanTasks(markdown: string): PlanTask[] {
 }
 
 const RUNTIME_TASK_ACTION_RE =
-  /(?:实现|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地)|\b(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate)\b/i;
+  /(?:实现|修改|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地)|\b(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate)\b/i;
 const RUNTIME_TASK_STANDALONE_ACTION_RE =
   /^(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|replace|refactor|save)\b)|^(?:`?[^`\s]+\.[A-Za-z0-9]{1,10}`?)\s*[:：—-]\s*(?:(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|执行|运行|验证|测试|检查|落地|创建|删除|替换|重构|保存)(?:\s|`|[（(:：])|(?:implement|update|modify|fix|add|wire|integrate|generate|write|run|verify|test|check|validate|create|delete|replace|refactor|save)\b)/i;
 const RUNTIME_TASK_MUTATION_RE =
-  /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
+  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
 const RUNTIME_TASK_VERIFICATION_RE =
   /(?:执行|运行|验证|测试|验收)|\b(?:run|verify|test|validate|acceptance)\b/i;
 const RUNTIME_TASK_READ_ONLY_RE =
@@ -2892,8 +2945,12 @@ const RUNTIME_TASK_FILE_ROLE_RE =
   /(?:负责|用于|包含|当前|现有|可能|根因|原因|问题|错误|不匹配|responsible|handles|contains|current|existing|possible|root cause|finding|issue|mismatch)/i;
 const RUNTIME_TASK_SECTION_RE =
   /(?:关键改动|实现改动|实现方案|实施方案|改动|修复|执行|实施|任务|步骤|顺序|验证|测试|验收|Key Changes|Implementation Changes|Implementation Plan|Proposed Changes|Changes|Fix(?:es)?|Repair|Execution|Implementation|Approach|Tasks|Steps|Order|Validation|Testing|Tests?|Acceptance)/i;
-const RUNTIME_TASK_VALIDATION_SECTION_RE =
-  /^(?:\d+\s*[.)、:：-]?\s*)?(?:(?:目标\s*与\s*)?(?:关键\s*)?(?:验证(?:方式|方案|标准|步骤|结果)?|测试(?:方式|方案|标准|步骤|结果)?|验收(?:方式|方案|标准|步骤|结果)?)|(?:Goals?\s+and\s+)?(?:Key\s+)?(?:Validation(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Verification(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Testing(?:\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Acceptance(?:\s+(?:Criteria|Tests?|Steps|Results))?))\s*$/i;
+const RUNTIME_TASK_HEADING_PREFIX = String.raw`(?:\d+\s*[.)、:：-]?\s*)?`;
+const RUNTIME_TASK_HEADING_SUFFIX = String.raw`(?:\s*(?:[（(][^()（）\r\n]{1,60}[）)]|[:：—-]\s*[^#\r\n]{1,60}))?`;
+const RUNTIME_TASK_VALIDATION_SECTION_RE = new RegExp(
+  `^${RUNTIME_TASK_HEADING_PREFIX}(?:(?:目标\\s*与\\s*)?(?:关键\\s*)?(?:验证(?:方式|方案|标准|步骤|结果)?|测试(?:方式|方案|标准|步骤|结果)?|验收(?:方式|方案|标准|步骤|结果)?)|(?:Goals?\\s+and\\s+)?(?:Key\\s+)?(?:Validation(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Verification(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Testing(?:\\s+(?:Plan|Strategy|Criteria|Steps|Results))?|Acceptance(?:\\s+(?:Criteria|Tests?|Steps|Results))?))${RUNTIME_TASK_HEADING_SUFFIX}\\s*$`,
+  "i",
+);
 const RUNTIME_TASK_EXCLUDED_SECTION_RE =
   /(?:用户目标|目标|摘要|概要|当前状态|状态发现|已确认发现|已确认事实|现状|背景|问题分析|根因|技术栈|整体结构|影响文件|涉及文件|证据|已读证据|最相关证据|假设|默认值|公共\s*API|接口|类型|数据流|控制流|设计思路|总体思路|User Goals?|Goals?|Summary|Overview|Current State|Confirmed Findings|Findings|Background|Root Cause|Tech Stack|Architecture|Evidence|Read Evidence|Most Relevant Evidence|Assumptions|Defaults|Public APIs|Interfaces|Types|Files|Data Flow|Control Flow|Design Notes)/i;
 const RUNTIME_TASK_DIAGNOSTIC_SECTION_RE =
@@ -2910,9 +2967,7 @@ const RUNTIME_TASK_CHANGE_DETAIL_RE =
   /^(?:改动(?:内容)?|变更(?:内容)?|changes?|implementation(?: details)?)\s*[：:]\s*(.+)$/i;
 const RUNTIME_TASK_FILE_TABLE_SECTION_RE =
   /(?:关键(?:实现)?改动|实现改动|改动\s*\d+|影响文件|涉及文件|文件变更|变更文件|key changes?|implementation changes?|affected files?|files? to change|file changes?|^files?$)/i;
-const RUNTIME_TASK_HEADING_PREFIX = String.raw`(?:\d+\s*[.)、:：-]?\s*)?`;
 const RUNTIME_TASK_DIAGNOSIS_ACTION_PREFIX = String.raw`(?:(?:(?:问题诊断|故障诊断|诊断|根因分析)\s*(?:与|及|/)\s*)|(?:(?:Problem\s+Diagnosis|Diagnosis|Diagnostic\s+(?:Findings|Analysis)|Root\s+Cause(?:\s+Analysis)?)\s+(?:and|&|/)\s+))?`;
-const RUNTIME_TASK_HEADING_SUFFIX = String.raw`(?:\s*(?:[（(][^()（）\r\n]{1,60}[）)]|[:：—-]\s*[^#\r\n]{1,60}))?`;
 const RUNTIME_TASK_MUTATION_SECTION_RE = new RegExp(
   `^${RUNTIME_TASK_HEADING_PREFIX}${RUNTIME_TASK_DIAGNOSIS_ACTION_PREFIX}(?:关键(?:实现)?改动|实现(?:改动|方案|计划|步骤)|实施(?:步骤|方案|计划)|架构改动|设计方案|改动(?:方案|计划|步骤)?|变更(?:方案|计划|步骤)?|修复(?:步骤|方案|计划)|执行(?:步骤|方案|计划|顺序)|落地(?:步骤|方案|计划)|任务|步骤|顺序|Key Changes|Implementation(?: Changes| Plan| Steps| Tasks| Order)?|Architecture Changes|Design Changes|Proposed Changes|Changes?|Execution(?: Steps| Plan| Order)|Plan of Work|Tasks?|Steps?|Approach|Fix(?:es)?(?: Plan| Steps)?|Repair(?: Plan| Steps)?)${RUNTIME_TASK_HEADING_SUFFIX}\s*$`,
   "i",
@@ -3690,8 +3745,13 @@ function collectRuntimeTaskProseSectionTasks(
     }
     if (!inActionableSection || isMarkdownTableSyntaxLine(rawLine)) continue;
 
-    const normalized = rawLine.replace(/\*\*/g, "").trim();
+    const normalized = stripMarkdownTaskLine(rawLine.replace(/\*\*/g, "")).trim();
     if (!normalized) continue;
+    if (/^(?:改动内容|变更内容|实现细节|修改说明|Changes?|Implementation Details?)\s*[:：]?$/i.test(normalized)) {
+      // A container label keeps the current file owner but is not itself an
+      // executable mutation.
+      continue;
+    }
     const directFiles = extractWorkspaceFileReferencesFromText(normalized);
     const isFileLabel = /^(?:文件|目标文件|(?:唯一)?修改文件|file|target file|(?:only|sole) file to change)\s*[:：]/i.test(normalized);
     const normalizedFileOnlyLine = stripMarkdownTaskLine(normalized)
@@ -4025,6 +4085,13 @@ export function deriveRuntimePlanTasksFromArtifacts(
     candidateLineMutationFiles.forEach((value) => structuredMutationFiles.add(value));
   }
 
+  for (const scenario of collectConcreteStepExpectationScenarios(
+    extractPlanTestSectionBody(normalizedRuntimeContent),
+  )) {
+    if (tasks.length >= maxTasks) break;
+    pushTask(makeRuntimeTask(scenario, language));
+  }
+
   const existingCommandEvidence = new Set(
     tasks
       .flatMap((task) => task.evidence || [])
@@ -4126,9 +4193,9 @@ function hasMeaningfulPlanSections(content: string, _kind: PlanArtifactKind): bo
     if (!trimmed || /^#{1,6}\s+/.test(trimmed)) return false;
     return !/^(?:TBD|TODO|To be determined|待定|待补充|稍后补充)[。.!！]?$/i.test(trimmed);
   });
-  // Artifact validity is semantic, not proportional to output length. Compact
-  // models may express a complete plan in a few lines; the plan-specific gate
-  // below still checks goal, work path, validation, grounding, and noise.
+  // Artifact validity is semantic, not proportional to output length. A short
+  // plan can still be complete; the plan-specific gate below checks goal, work
+  // path, validation, grounding, and noise.
   return hasHeading && hasBody;
 }
 
@@ -4597,19 +4664,198 @@ export function hasAnyContentUnderSection(text: string, sectionRegex: RegExp): b
   return inSection && contentChars > 5;
 }
 
-function extractPlanSectionBody(text: string, sectionRegex: RegExp): string {
+function extractPlanSectionBody(
+  text: string,
+  sectionRegex: RegExp,
+  includeDescendantSections = true,
+): string {
   const body: string[] = [];
   let inSection = false;
+  let sectionLevel = 0;
   for (const line of String(text || "").split(/\r?\n/)) {
     const heading = line.trim().match(/^#{1,6}\s+(.+?)\s*$/);
     if (heading) {
-      if (inSection) break;
+      const level = (heading[0].match(/^#+/)?.[0] || "").length;
+      if (inSection) {
+        if (level <= sectionLevel || !includeDescendantSections) break;
+        body.push(line);
+        continue;
+      }
       inSection = sectionRegex.test(heading[1] || "");
+      if (inSection) sectionLevel = level;
       continue;
     }
     if (inSection) body.push(line);
   }
   return body.join("\n").trim();
+}
+
+type StructuredTestLabel = "input" | "expected" | "assertion";
+
+function parseStructuredTestRow(line: string): {
+  label: StructuredTestLabel;
+  value: string;
+} | null {
+  const match = String(line || "").match(
+    /^\s*(?:[-*]\s*)?(?:\*{1,2}|_{1,2})?(输入|Input|预期(?:输出|结果)?|Expected(?: output| result)?|验证方法|断言|Assertion|Verify)(?:\*{1,2}|_{1,2})?\s*[:：][ \t]*(.*?)\s*$/i,
+  );
+  if (!match) return null;
+  const rawLabel = String(match[1] || "").toLowerCase();
+  const label: StructuredTestLabel = /^(?:输入|input)$/i.test(rawLabel)
+    ? "input"
+    : /^(?:预期|expected)/i.test(rawLabel)
+      ? "expected"
+      : "assertion";
+  return { label, value: String(match[2] || "").trim() };
+}
+
+function isConcreteStructuredTestValue(value: string): boolean {
+  const normalized = String(value || "")
+    .replace(/[`*_~]/g, "")
+    .trim();
+  if (!normalized || /^[\s.,:;!?，。；：！？…·\-–—]+$/u.test(normalized)) return false;
+  return !/^(?:tbd|todo|to\s+do|n\/?a|none|null|待补充|待填写|待定|待确认|稍后补充|暂无|占位|略)$/i.test(normalized);
+}
+
+function hasConcreteStructuredTestScenario(testPlanBody: string): boolean {
+  const lines = String(testPlanBody || "").split(/\r?\n/);
+  for (let index = 0; index < lines.length; index++) {
+    const input = parseStructuredTestRow(lines[index] || "");
+    if (input?.label !== "input" || !isConcreteStructuredTestValue(input.value)) continue;
+
+    let hasExpected = false;
+    for (let cursor = index + 1; cursor < lines.length; cursor++) {
+      const line = lines[cursor] || "";
+      if (!line.trim() || /^\s*#{1,6}\s+/.test(line)) break;
+      const row = parseStructuredTestRow(line);
+      if (!row || row.label === "input") break;
+      if (!isConcreteStructuredTestValue(row.value)) continue;
+      if (row.label === "expected") hasExpected = true;
+    }
+    // A concrete input paired with a concrete expected result already defines
+    // an executable assertion. Requiring a second, redundant "assertion" row
+    // rejects otherwise reviewable plans without adding runtime certainty.
+    if (hasExpected) return true;
+  }
+  return false;
+}
+
+function hasConcreteNarrativeTestScenario(testPlanBody: string): boolean {
+  const lines = String(testPlanBody || "")
+    .split(/\r?\n/)
+    .map((line) => line
+      .replace(/^\s*[-*+]\s+/, "")
+      .replace(/[`*_~]/g, "")
+      .trim())
+    .filter(Boolean);
+
+  return lines.some((line) => {
+    const hasScenarioCue = /(?:测试用例|测试场景|场景\s*[A-Za-z0-9一二三四五六七八九十]+|test\s*case|test\s*scenario|scenario\s*[A-Za-z0-9]+)/i.test(line);
+    if (!hasScenarioCue) return false;
+
+    const inputMatch = /(?:输入|给定|当|使用|\binput\b|\bgiven\b|\bwhen\b|\bwith\b)/i.exec(line);
+    const expectationMatch = /(?:断言|预期|应当|应该|返回|输出|显示|保持|\bassert(?:ion)?\b|\bexpect(?:ed)?\b|\bshould\b|\breturns?\b|\boutputs?\b|\brenders?\b|\bdisplays?\b|\bpreserves?\b)/i.exec(line);
+    if (
+      !inputMatch ||
+      !expectationMatch ||
+      inputMatch.index >= expectationMatch.index
+    ) return false;
+
+    const inputValue = line.slice(
+      inputMatch.index + inputMatch[0].length,
+      expectationMatch.index,
+    );
+    const expectedValue = line.slice(
+      expectationMatch.index + expectationMatch[0].length,
+    );
+    return isConcreteStructuredTestValue(inputValue) &&
+      isConcreteStructuredTestValue(expectedValue) &&
+      inputValue.replace(/[\s:：,，.。;；()（）'"-]/g, "").length >= 4 &&
+      expectedValue.replace(/[\s:：,，.。;；()（）'"-]/g, "").length >= 6;
+  });
+}
+
+function extractPlanTestSectionBody(text: string): string {
+  const body: string[] = [];
+  let inSection = false;
+  let sectionLevel = 0;
+  const testSection = new RegExp(
+    `^${RUNTIME_TASK_HEADING_PREFIX}(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)${RUNTIME_TASK_HEADING_SUFFIX}\\s*$`,
+    "i",
+  );
+  const testSubsection = new RegExp(
+    `^${RUNTIME_TASK_HEADING_PREFIX}(?:单元测试|集成测试|端到端测试|功能测试|回归测试|手动验证|测试用例|测试场景|Unit Tests?|Integration Tests?|End-to-End Tests?|E2E Tests?|Functional Tests?|Regression Tests?|Manual Verification|Test Cases?|Test Scenarios?)${RUNTIME_TASK_HEADING_SUFFIX}\\s*$`,
+    "i",
+  );
+  for (const line of String(text || "").split(/\r?\n/)) {
+    const heading = line.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const level = (heading[1] || "").length;
+      const title = heading[2] || "";
+      if (inSection) {
+        if (level > sectionLevel || testSubsection.test(title)) {
+          body.push(line);
+          continue;
+        }
+        break;
+      }
+      inSection = testSection.test(title);
+      if (inSection) sectionLevel = level;
+      continue;
+    }
+    if (inSection) body.push(line);
+  }
+  return body.join("\n").trim();
+}
+
+function collectConcreteStepExpectationScenarios(testPlanBody: string): string[] {
+  const blocks: string[][] = [];
+  let current: string[] = [];
+  const flush = () => {
+    if (current.some((line) => line.trim())) blocks.push(current);
+    current = [];
+  };
+  for (const line of String(testPlanBody || "").split(/\r?\n/)) {
+    const normalized = line
+      .replace(/^\s*[-*+]\s+/, "")
+      .replace(/[`*_~]/g, "")
+      .trim();
+    const startsScenario = /^#{1,6}\s+/.test(line.trim()) ||
+      /^(?:测试用例|测试场景|场景\s*[A-Za-z0-9一二三四五六七八九十]+|test\s*case|test\s*scenario|scenario\s*[A-Za-z0-9]+)/i.test(normalized);
+    if (startsScenario && current.length > 0) flush();
+    current.push(line);
+  }
+  flush();
+
+  const scenarios: string[] = [];
+  for (const block of blocks) {
+    const lines = block.map((line) => line
+      .replace(/^\s*[-*+]\s+/, "")
+      .replace(/[`*_~]/g, "")
+      .trim());
+    const stepIndex = lines.findIndex((line) =>
+      /^(?:测试步骤|操作步骤|执行步骤|Test Steps?|Steps?|Procedure)\s*[:：]?/i.test(line)
+    );
+    if (stepIndex < 0) continue;
+    const expectedIndex = lines.findIndex((line, index) =>
+      index > stepIndex && parseStructuredTestRow(line)?.label === "expected"
+    );
+    if (expectedIndex <= stepIndex + 1) continue;
+
+    const expected = parseStructuredTestRow(lines[expectedIndex] || "");
+    if (!expected || !isConcreteStructuredTestValue(expected.value)) continue;
+    const actionText = lines.slice(stepIndex + 1, expectedIndex).join(" ");
+    const hasAction = /(?:上传|导入|打开|点击|双击|拖放|保存|刷新|输入|选择|提交|启动|运行|执行|调用|观察|比较|upload|import|open|click|double[- ]click|drag|drop|save|reload|refresh|enter|select|submit|start|run|execute|invoke|observe|compare)/i.test(actionText);
+    const concrete = hasAction &&
+      isConcreteStructuredTestValue(actionText) &&
+      actionText.replace(/[\s:：,，.。;；()（）'"-]/g, "").length >= 8;
+    if (concrete) scenarios.push(`${actionText} → ${expected.value}`);
+  }
+  return scenarios;
+}
+
+function hasConcreteStepExpectationScenario(testPlanBody: string): boolean {
+  return collectConcreteStepExpectationScenarios(testPlanBody).length > 0;
 }
 
 export function validateActionablePlanArtifact(
@@ -4619,7 +4865,11 @@ export function validateActionablePlanArtifact(
   if (!base.ok) return classifyPlanArtifactQualityResult(base);
 
   const raw = String(content || "").trim();
-  const summaryBody = extractPlanSectionBody(raw, /^(?:摘要|Summary)$/i);
+  // A section-role label is sometimes emitted as the document H1 while the
+  // actual evidence, changes, and tests are H2/H3 siblings below it. Summary
+  // hygiene applies only to the summary's direct prose; descendant role
+  // sections must retain their own evidence semantics.
+  const summaryBody = extractPlanSectionBody(raw, /^(?:摘要|Summary)$/i, false);
   const repeatedGoalLabels = (
     summaryBody.match(/^\s*[-*]\s*(?:用户目标|User goal)\s*[:：]/gim) || []
   ).length;
@@ -4748,12 +4998,13 @@ export function validateActionablePlanArtifact(
     /(?:公共\s*API|接口|类型|Public APIs?|Interfaces?|Types?).{0,120}(?:新增|修改|变化|保持|不变|added|modified|changed|unchanged|preserved)/i.test(raw) ||
     hasAnyContentUnderSection(raw, /(?:公共\s*API\s*\/\s*接口\s*\/\s*类型|公共\s*API|接口|类型|Public APIs?\s*\/\s*Interfaces?\s*\/\s*Types?|Public APIs?|Interfaces?|Types?)/i);
   const hasTestPlan = /(?:^|\n)\s*#{1,6}\s*(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)/i.test(raw);
-  const testPlanBody = extractPlanSectionBody(
-    raw,
-    /^(?:测试方案|测试计划|测试场景|验证方案|Test Plan|Testing|Tests?)$/i,
-  );
+  const testPlanBody = extractPlanTestSectionBody(raw);
   const hasConcreteTestCommand = /`\s*(?:(?:npm|pnpm|yarn|bun)\s+(?:run\s+)?[\w:-]+|npx\s+\S+|node\s+--test\b|cargo\s+(?:test|check|build|clippy)\b|pytest\b|python\d*\s+-m\s+\S+|go\s+test\b|swift\s+test\b|dotnet\s+test\b|mvn\s+test\b|gradle\w*\s+\S+)/i.test(testPlanBody);
+  const hasStructuredInputExpectationScenario = hasConcreteStructuredTestScenario(testPlanBody);
   const hasConcreteManualOrToolScenario =
+    hasStructuredInputExpectationScenario ||
+    hasConcreteNarrativeTestScenario(testPlanBody) ||
+    hasConcreteStepExpectationScenario(testPlanBody) ||
     /(?:运行|执行).{0,100}(?:单元测试|集成测试|端到端测试|E2E|Playwright|测试套件|测试|构建|编译|lint|类型检查)/i.test(testPlanBody) ||
     /(?:运行|执行|启动|构建|编译|手动|浏览器|桌面|Playwright|E2E|双击|拖放|打开|点击|导入|保存|刷新).{0,140}(?:验证|确认|检查|断言|比较|预期|应当|成功|失败|通过|结果)/i.test(testPlanBody) ||
     /(?:验证|确认|检查|断言|比较).{0,140}(?:打开|点击|双击|拖放|导入|保存|渲染|事件|窗口|状态|输出|结果|错误|回退|流程|链路)/i.test(testPlanBody) ||
@@ -4825,12 +5076,21 @@ export function validateActionablePlanArtifact(
     }
     const isSpeculationAllowedSection = /(?:未验证假设|待验证假设|假设与默认值|默认假设|假设|默认值|Unverified|Hypotheses|Assumptions|Defaults|摘要|Summary|用户目标|User Goal|现象|Symptom|根因|Root Cause|背景|Background)/i
       .test(currentPlanQualityHeading);
+    const isImplementationCommitmentSection = /(?:关键(?:实现)?改动|实现(?:方案|步骤)?|实施(?:方案|步骤)?|执行步骤|改动内容|公共\s*API|接口|类型|Key Changes?|Implementation|Execution Steps?|Changes?|Public APIs?|Interfaces?|Types?)/i
+      .test(currentPlanQualityHeading);
+    const isInputCoverageRequirement =
+      /(?:兼容|支持|处理|覆盖|接受|验证|测试).{0,32}(?:可能(?:出现)?的?|潜在的?).{0,32}(?:输入|字段|列名|值|格式|情况|分支|变体|错误|CSV|TSV|XLSX)/i.test(line) ||
+      /(?:support|handle|cover|accept|validate|test).{0,32}(?:possible|potential|optional).{0,32}(?:input|field|column|value|format|case|branch|variant|error|CSV|TSV|XLSX)/i.test(line);
     if (
+      isImplementationCommitmentSection &&
       !isSpeculationAllowedSection &&
       /(?:假设|可能|高概率|中概率|低概率|probably|possibly|hypothesis|likely)/i.test(line) &&
+      !isInputCoverageRequirement &&
       !/(?:默认假设|未验证|待验证|需验证|证据|依据|观察|已读|default assumption|unverified|needs validation|evidence|observed)/i.test(line)
     ) {
-      // Only classify as a speculative code change if it mentions code targets (files, paths, or code keywords)
+      // Only implementation commitments can become unsupported speculative
+      // changes. Evidence/current-state sections may accurately describe a
+      // possible risk without committing that hypothesis as an edit.
       const mentionsCodeTargets = /(?:\.[a-z0-9]+|\b(?:function|class|interface|type|const|let|var|import|export|useEffect|useState)\b|\/|\\)/i.test(line);
       if (mentionsCodeTargets) {
         unsupportedHypothesisLines.push(line);

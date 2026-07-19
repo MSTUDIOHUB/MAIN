@@ -248,3 +248,97 @@ test("applyWorkspacePatch writes path= header changes to the canonical workspace
   assert.equal(files.get("src/main.js"), "const title = \"new\";\n");
   assert.equal(files.has("path=src/main.js"), false);
 });
+
+test("applyWorkspacePatch performs a real move and reports both destination and source", async () => {
+  const files = new Map([["src/old.ts", "export const value = 'old';\n"]]);
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/old.ts",
+    "*** Move to: src/moved.ts",
+    "@@",
+    "-export const value = 'old';",
+    "+export const value = 'new';",
+    "*** End Patch",
+  ].join("\n");
+  const result = await applyWorkspacePatch(patch, {
+    readFile: async (file) => {
+      if (!files.has(file)) throw new Error("missing");
+      return files.get(file);
+    },
+    probePath: async (file) => files.has(file) ? "exists" : "absent",
+    writeFile: async (file, content) => {
+      files.set(file, content);
+    },
+    writeNewFile: async (file, content) => {
+      if (files.has(file)) throw new Error("CREATE_NEW_TARGET_EXISTS");
+      files.set(file, content);
+    },
+    deletePath: async (file) => {
+      files.delete(file);
+    },
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(files.has("src/old.ts"), false);
+  assert.equal(files.get("src/moved.ts"), "export const value = 'new';\n");
+  assert.deepEqual(
+    result.changes.map((change) => [change.kind, change.path]),
+    [["add", "src/moved.ts"], ["delete", "src/old.ts"]],
+  );
+});
+
+test("applyWorkspacePatch rejects an existing or unverified move destination before any write", async () => {
+  const patch = [
+    "*** Begin Patch",
+    "*** Update File: src/old.ts",
+    "*** Move to: src/existing.ts",
+    "*** End Patch",
+  ].join("\n");
+  for (const destinationStatus of ["exists", "unknown"]) {
+    const writes = [];
+    const deletes = [];
+    const result = await applyWorkspacePatch(patch, {
+      readFile: async (file) => file === "src/old.ts" ? "old\n" : "occupied\n",
+      probePath: async () => destinationStatus,
+      writeFile: async (file) => { writes.push(file); },
+      deletePath: async (file) => { deletes.push(file); },
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error || "", /Move destination/);
+    assert.deepEqual(writes, []);
+    assert.deepEqual(deletes, []);
+  }
+});
+
+test("applyWorkspacePatch rejects an unverified Add File target before any write", async () => {
+  const writes = [];
+  const result = await applyWorkspacePatch(
+    "*** Begin Patch\n*** Add File: src/new.ts\n+export const value = true;\n*** End Patch",
+    {
+      readFile: async () => { throw new Error("permission denied"); },
+      probePath: async () => "unknown",
+      writeFile: async (file) => { writes.push(file); },
+      writeNewFile: async (file) => { writes.push(file); },
+    },
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error || "", /Add File target availability could not be verified/);
+  assert.deepEqual(writes, []);
+});
+
+test("applyWorkspacePatch requires atomic create-new support for Add File", async () => {
+  const writes = [];
+  const result = await applyWorkspacePatch(
+    "*** Begin Patch\n*** Add File: src/new.ts\n+export const value = true;\n*** End Patch",
+    {
+      readFile: async () => { throw new Error("missing"); },
+      probePath: async () => "absent",
+      writeFile: async (file) => { writes.push(file); },
+    },
+  );
+
+  assert.equal(result.ok, false);
+  assert.match(result.error || "", /Atomic Add File is not supported/);
+  assert.deepEqual(writes, []);
+});

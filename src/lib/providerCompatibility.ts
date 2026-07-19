@@ -2,6 +2,8 @@ import {
   TOOL_FEEDBACK_ENVELOPE_PREFIX,
   parseToolFeedbackEnvelope,
 } from "./toolFeedbackEnvelope";
+import { buildToolProtocolCard } from "./systemPrompt";
+import type { ToolDefinition } from "./toolSchemas";
 import { buildProviderUnsupportedVisualContextNotice } from "./visualContext";
 
 export interface CompatibilityToolCall {
@@ -121,49 +123,25 @@ export function isProviderImageContentCompatibilityErrorMessage(message: string)
 
 function buildProviderCompatibilityInstructionText(
   workflowMode: "chat" | "edit" | "plan",
+  toolDefinitions: ToolDefinition[] = [],
 ): string {
-  const sharedToolAccess = [
-    "Tool access is available through XML tool calls.",
-    "MAIN tools are still available through XML tool calls even when this cloud endpoint does not support native function/tools payloads.",
-    "Use XML tools for workspace access; do not say tools, files, or folder access are unavailable.",
-    "Available XML tools include:",
-    "- repo_map_search, repo_map_context: use MAIN's built-in local repo map to locate symbols/files before reading source.",
-    "- read_file: read a file under the workspace.",
-    "- list_directory, glob_search, grep_search: inspect folders and search files under the workspace.",
-    "- apply_patch: modify workspace files with a Codex-style patch or common ---/+++ unified diff. Prefer this for precise code edits.",
-    "- write_file: create or overwrite a workspace file. This is allowed when the user asks for implementation or file changes.",
-    "- replace_in_file: edit an existing workspace file by exact text replacement. This is allowed when the user asks for implementation or file changes.",
-    "- run_command: run workspace commands when needed for implementation or verification.",
-    "- browser_evaluate: validate local pages with Playwright DOM/console assertions when browser rendering evidence is required.",
-    "Never claim that write tools or folder access are unavailable. If you need to modify files, emit XML tool calls instead of describing an imaginary patch.",
-  ];
-
-  if (workflowMode === "chat") {
-    return [
-      PROVIDER_COMPATIBILITY_TAG,
-      "native_tools_disabled=true",
-      "Native function/tools payloads are disabled for this endpoint; XML <tool_use> is enabled.",
-      ...sharedToolAccess,
-      "When tool use is necessary, you MUST emit XML tool calls in this exact format:",
-      "<tool_use>",
-      "<tool>read_file</tool>",
-      "<parameter name=\"path\">src/foo.ts</parameter>",
-      "</tool_use>",
-      "Because this runtime is read-oriented, keep tools read-only unless the user clearly asks for implementation, file changes, or command execution.",
-    ].join("\n");
-  }
-
+  const toolNames = toolDefinitions.map((tool) => tool.function.name);
+  const protocolCard = buildToolProtocolCard({
+    activeProfile: "cloud",
+    provider: "compatibility-fallback",
+    toolProtocol: "xml",
+    nativeToolsEnabled: false,
+    availableToolNames: toolNames,
+    toolDefinitions,
+    descriptionMaxChars: 120,
+    language: "en",
+  });
   return [
     PROVIDER_COMPATIBILITY_TAG,
     "native_tools_disabled=true",
-    "Native function/tools payloads are disabled for this endpoint; XML <tool_use> is enabled.",
-    ...sharedToolAccess,
-    "When tool use is necessary, you MUST emit XML tool calls in this exact format:",
-    "<tool_use>",
-    "<tool>write_file</tool>",
-    "<parameter name=\"path\">Assets/Readme.md</parameter>",
-    "<parameter name=\"content\">完整文件内容</parameter>",
-    "</tool_use>",
+    protocolCard,
+    `workflowMode=${workflowMode}. The catalog above is the complete intent-scoped tool surface for this retry.`,
+    "Do not reuse a tool name from earlier history unless it is present in this catalog.",
   ].join("\n");
 }
 
@@ -178,19 +156,35 @@ export function hasProviderNativeToolsDisabled(messages: CompatibilityMessage[])
 
 export function buildProviderCompatibilitySystemMessage(
   workflowMode: "chat" | "edit" | "plan",
+  toolDefinitions: ToolDefinition[] = [],
 ): CompatibilityMessage {
   return {
     role: "system",
-    content: buildProviderCompatibilityInstructionText(workflowMode),
+    content: buildProviderCompatibilityInstructionText(workflowMode, toolDefinitions),
   };
+}
+
+const TOOL_PROTOCOL_SECTION_PATTERN = /(?:^|\n)\[TOOLS\]\n[\s\S]*?(?=\n\n\[[A-Z0-9 _():/.-]+\]\n|$)/g;
+
+function stripToolProtocolSection(content: string): string {
+  return content.replace(TOOL_PROTOCOL_SECTION_PATTERN, "\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 export function ensureProviderCompatibilityMode(
   messages: CompatibilityMessage[],
   workflowMode: "chat" | "edit" | "plan",
+  toolDefinitions: ToolDefinition[] = [],
 ): CompatibilityMessage[] {
-  if (hasProviderNativeToolsDisabled(messages)) return messages;
-  return [...messages, buildProviderCompatibilitySystemMessage(workflowMode)];
+  const sanitized = messages.flatMap((message): CompatibilityMessage[] => {
+    if (message.role !== "system" || typeof message.content !== "string") return [message];
+    if (
+      message.content.includes(PROVIDER_COMPATIBILITY_TAG) &&
+      message.content.includes("native_tools_disabled=true")
+    ) return [];
+    const content = stripToolProtocolSection(message.content);
+    return content ? [{ ...message, content }] : [];
+  });
+  return [...sanitized, buildProviderCompatibilitySystemMessage(workflowMode, toolDefinitions)];
 }
 
 export function buildCompatibilityRetryMessages(
@@ -304,11 +298,17 @@ function labelForRole(role: CompatibilityMessage["role"]): string {
 export function buildTranscriptCompatibilityRetryMessages(
   messages: CompatibilityMessage[],
   workflowMode: "chat" | "edit" | "plan",
+  toolDefinitions: ToolDefinition[] = [],
 ): CompatibilityMessage[] {
   // A transcript retry is intentionally plain text. Record the visual loss as
   // structured unsupported context so the model cannot pretend it saw images.
   const flattened = buildCompatibilityRetryMessages(messages, {
     imageHandling: "omit_unsupported",
+  }).flatMap((message): CompatibilityMessage[] => {
+    if (message.role !== "system" || typeof message.content !== "string") return [message];
+    if (message.content.includes(PROVIDER_COMPATIBILITY_TAG)) return [];
+    const content = stripToolProtocolSection(message.content);
+    return content ? [{ ...message, content }] : [];
   });
   const transcript = flattened
     .map((message, index) => {
@@ -319,7 +319,7 @@ export function buildTranscriptCompatibilityRetryMessages(
     .filter(Boolean)
     .join("\n\n");
 
-  const instructionText = buildProviderCompatibilityInstructionText(workflowMode)
+  const instructionText = buildProviderCompatibilityInstructionText(workflowMode, toolDefinitions)
     .split("\n")
     .filter(stripCompatibilityMeta)
     .join("\n")
@@ -340,7 +340,9 @@ export function buildTranscriptCompatibilityRetryMessages(
       transcript || "[No prior transcript available.]",
       "",
       "[Reply Rule]",
-      "Reply normally. If tool use is necessary, emit XML <tool_use> blocks only.",
+      toolDefinitions.length > 0
+        ? "Reply normally. If tool use is necessary, emit only one XML call from the active catalog."
+        : "Reply normally. No tool is available in this transcript fallback.",
     ].join("\n").trim(),
   }];
 }

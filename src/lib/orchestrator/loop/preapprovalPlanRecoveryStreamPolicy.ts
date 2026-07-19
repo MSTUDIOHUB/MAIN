@@ -1,4 +1,3 @@
-import { isPlanDraftWriteToolName } from "../../planRuntime";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { FetchLLMStreamOptions } from "../types";
 
@@ -49,17 +48,16 @@ export function resolvePreapprovalPlanQualityRecoveryStreamPolicy(input: {
   const stage: PreapprovalPlanQualityRecoveryStage = input.planAutoScaffoldPromptIssued
     ? "auto_scaffold"
     : "rewrite";
-  const canRequireNativePlanWrite =
-    !input.forceXmlTools &&
-    input.llmToolNames.some(isPlanDraftWriteToolName);
-
   return {
     active: true,
     stage,
     maxOutputTokens: PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_OUTPUT_TOKENS,
     maxStreamElapsedMs: PREAPPROVAL_PLAN_QUALITY_RECOVERY_MAX_ELAPSED_MS,
     maxStreamElapsedLabel: `preapproval_plan_quality_recovery_${stage}`,
-    toolChoice: canRequireNativePlanWrite ? "required" : undefined,
+    // Plan finalization is a visible-text turn. MAIN owns artifact
+    // materialization, so this policy must never manufacture a write-tool
+    // requirement from a stale or synthetic tool list.
+    toolChoice: undefined,
     stopClass: PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS,
   };
 }

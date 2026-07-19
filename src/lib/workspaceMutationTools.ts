@@ -62,6 +62,25 @@ function extractApplyPatchTargets(patch: string): string[] {
   for (const match of String(patch || "").matchAll(/^\+\+\+\s+(?:b\/)?([^\s]+)$/gmi)) {
     if (match[1] && match[1] !== "/dev/null") targets.push(normalizeApplyPatchHeaderPath(match[1]));
   }
+  for (const match of String(patch || "").matchAll(/^\*\*\*\s+Move\s+to:\s*(.+)$/gmi)) {
+    if (match[1]) targets.push(normalizeApplyPatchHeaderPath(match[1]));
+  }
+  return [...new Set(targets.filter(Boolean))];
+}
+
+function extractApplyPatchCreationTargets(patch: string): string[] {
+  const targets: string[] = [];
+  for (const match of String(patch || "").matchAll(/^\*\*\*\s+Add\s+File:\s*(.+)$/gmi)) {
+    if (match[1]) targets.push(normalizeApplyPatchHeaderPath(match[1]));
+  }
+  return [...new Set(targets.filter(Boolean))];
+}
+
+function extractApplyPatchMoveTargets(patch: string): string[] {
+  const targets: string[] = [];
+  for (const match of String(patch || "").matchAll(/^\*\*\*\s+Move\s+to:\s*(.+)$/gmi)) {
+    if (match[1]) targets.push(normalizeApplyPatchHeaderPath(match[1]));
+  }
   return [...new Set(targets.filter(Boolean))];
 }
 
@@ -90,6 +109,38 @@ export function resolveWorkspaceMutationTargets(
   }
 
   return [normalizeMutationPath(args.path || fallbackTarget)].filter(Boolean);
+}
+
+/**
+ * Targets whose mutation request explicitly permits creating a file that does
+ * not exist yet. Callers must still verify non-existence before treating these
+ * as creations; `write_file` can also overwrite an existing file.
+ */
+export function resolveWorkspaceMutationCreationTargets(
+  name: string,
+  args: Record<string, unknown> = {},
+  fallbackTarget = "",
+): string[] {
+  if (name === "apply_patch") {
+    // A Move destination is creation-capable but not unconditionally
+    // create-only: callers must prove it absent, and the executor rechecks it.
+    return extractApplyPatchMoveTargets(String(args.patch || ""));
+  }
+  if (name === "write_file") {
+    return resolveWorkspaceMutationTargets(name, args, fallbackTarget);
+  }
+  return [];
+}
+
+/** Create-only mutations fail instead of overwriting when the target exists. */
+export function resolveWorkspaceMutationCreateOnlyTargets(
+  name: string,
+  args: Record<string, unknown> = {},
+): string[] {
+  if (name === "apply_patch") {
+    return extractApplyPatchCreationTargets(String(args.patch || ""));
+  }
+  return [];
 }
 
 export function hasResolvedWorkspaceMutationTarget(name: string, target: string): boolean {

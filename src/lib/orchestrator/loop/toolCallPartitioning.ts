@@ -16,10 +16,12 @@ import {
   formatReadFileWindowCoverageStub,
   formatReadFileWindowNarrowedNote,
   getReadFileCoverageForPath,
+  hashString,
   invalidateStaleFileReadStatesForPath,
   resolveReadFileEligibilityDecision,
   type FileReadState,
 } from "../../orchestrator/fileReadCache";
+import { readFileWindow } from "../../ipc";
 import {
   countSuccessfulPlanReadEvidence,
   hasSuccessfulTabularActivity,
@@ -46,6 +48,7 @@ import {
   parseToolCallArguments,
   planUnsupportedToolFeedbackMessage,
   PLAN_REPEAT_READ_LIMIT,
+  probeFileMetadataAvailability,
   readFileMetadataIfAvailable,
   truncateForLog,
   truncateToolContent,
@@ -72,13 +75,20 @@ import {
   type PlanRuntimePhase,
 } from "../../workflowModels";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
-import { findSubagentScopeConflict, validateSubagentScopeTarget } from "../../subagents";
+import {
+  findSubagentScopeConflict,
+  recordSubagentScopeBlockedTool,
+  resolveSubagentScopedReadTargets,
+  validateSubagentScopeTarget,
+} from "../../subagents";
 import {
   isAbsoluteWorkspacePath,
   workspacePathsReferToSameFile,
 } from "../../workspacePaths";
 import {
   isWorkspaceMutationToolCall,
+  resolveWorkspaceMutationCreateOnlyTargets,
+  resolveWorkspaceMutationCreationTargets,
   resolveWorkspaceMutationTargets,
 } from "../../workspaceMutationTools";
 import { shouldCacheReadOnlyToolResult } from "../../readOnlyToolCachePolicy";
@@ -115,6 +125,12 @@ export interface ToolCallPartitioningResult {
   preExecutionResults: ToolExecutionResult[];
 }
 
+const SUBAGENT_SCOPE_NARROWABLE_READ_TOOLS = new Set([
+  "grep_search",
+  "find_symbol_references",
+  "git_diff",
+]);
+
 function finiteValidationCheckpointMatchesArgs(input: {
   checkpoint: NonNullable<RecoveryActionContract["decisionCheckpoint"]>["pendingFiniteValidation"];
   args: Record<string, unknown>;
@@ -138,6 +154,68 @@ function grepSearchPathLeavesWorkspace(args: Record<string, unknown>): boolean {
   if (!path || path === "." || path === "./") return false;
   if (isAbsoluteWorkspacePath(path)) return true;
   return path.split("/").some((part) => part === "..");
+}
+
+export async function objectiveAuditTargetsMissingReadObservation(input: {
+  mutationTargets: string[];
+  knownTargets: string[];
+  creationTargets?: string[];
+  createOnlyTargets?: string[];
+  fileReadStates: Map<string, FileReadState>;
+  managedAgentMessages: AgentMessage[];
+  workspace: string;
+  readMetadata?: typeof readFileMetadataIfAvailable;
+  probeMetadata?: typeof probeFileMetadataAvailability;
+}): Promise<string[]> {
+  const switchedTargets = input.mutationTargets.filter((target) =>
+    !input.knownTargets.some((knownTarget) =>
+      workspacePathsReferToSameFile(knownTarget, target)
+    )
+  );
+  const missingTargets: string[] = [];
+  for (const target of switchedTargets) {
+    const isCreateOnlyTarget = (input.createOnlyTargets || []).some((creationTarget) =>
+      workspacePathsReferToSameFile(creationTarget, target)
+    );
+    // apply_patch Add File is create-only: the patch executor rejects an
+    // existing target atomically, so no nullable metadata inference is needed.
+    if (isCreateOnlyTarget) continue;
+    const isExplicitCreationCandidate = (input.creationTargets || []).some((creationTarget) =>
+      workspacePathsReferToSameFile(creationTarget, target)
+    );
+    let verifiedTargetMetadata: Awaited<ReturnType<typeof readFileMetadataIfAvailable>> | undefined;
+    if (isExplicitCreationCandidate) {
+      const probe = await (input.probeMetadata || probeFileMetadataAvailability)(
+        target,
+        input.workspace,
+      );
+      // Only a confirmed ENOENT permits creation. Unknown IPC, permission, or
+      // path-resolution failures stay blocked instead of being mistaken for
+      // proof that write_file cannot overwrite anything.
+      if (probe.status === "absent") continue;
+      if (probe.status === "exists") verifiedTargetMetadata = probe.metadata;
+    }
+    const candidates = [...input.fileReadStates.values()]
+      .filter((state) => workspacePathsReferToSameFile(state.path, target))
+      .sort((left, right) => right.updatedAt - left.updatedAt);
+    let reusable = false;
+    for (const state of candidates) {
+      if (!isContentInActiveMessages(state.modelContent, input.managedAgentMessages)) continue;
+      const metadata = verifiedTargetMetadata || await (
+        input.readMetadata || readFileMetadataIfAvailable
+      )(state.path, input.workspace);
+      if (
+        metadata &&
+        metadata.sizeBytes === state.sizeBytes &&
+        metadata.modifiedMs === state.modifiedMs
+      ) {
+        reusable = true;
+        break;
+      }
+    }
+    if (!reusable) missingTargets.push(target);
+  }
+  return missingTargets;
 }
 
 function parentHasReusableDelegatedSourceWindow(input: {
@@ -225,6 +303,149 @@ export function findDelegatedObservationRequiringParentReread(input: {
   return null;
 }
 
+export type DelegatedObservationReuseDecision = {
+  reusable: boolean;
+  reason:
+    | "versioned_exact_mutation"
+    | "parent_context_available"
+    | "mutation_not_self_verifying"
+    | "missing_source_identity"
+    | "missing_content_hash"
+    | "missing_content_length"
+    | "missing_source_range"
+    | "insufficient_source_coverage"
+    | "current_version_unavailable"
+    | "source_version_changed"
+    | "current_content_hash_unavailable"
+    | "source_content_changed"
+    | "mutation_context_outside_observed_source";
+};
+
+export async function readCurrentDelegatedSourceContent(input: {
+  activity: PlanToolActivitySummary;
+  target: string;
+  workspace: string;
+  readWindow?: typeof readFileWindow;
+}): Promise<{ content: string; contentHash: string } | null> {
+  const delegated = input.activity.delegatedObservation;
+  const sourceRange = delegated?.sourceRange;
+  const sourceContentChars = delegated?.sourceContentChars;
+  if (
+    !sourceRange ||
+    !Number.isFinite(sourceContentChars) ||
+    Number(sourceContentChars) < 0
+  ) return null;
+  try {
+    const payload = await (input.readWindow || readFileWindow)(
+      input.target,
+      input.workspace,
+      sourceRange.startLine,
+      sourceRange.endLine,
+      Math.max(1, sourceRange.endLine - sourceRange.startLine + 1),
+      Math.max(1, Math.floor(Number(sourceContentChars))),
+    );
+    if (
+      payload.startLine !== sourceRange.startLine ||
+      payload.endLine !== sourceRange.endLine ||
+      payload.totalLines !== sourceRange.totalLines
+    ) return null;
+    const content = String(payload.content || "");
+    return { content, contentHash: hashString(content) };
+  } catch {
+    return null;
+  }
+}
+
+function isSingleTargetDelegatedUpdatePatch(
+  patch: string,
+  delegatedTarget: string,
+): boolean {
+  const operationLines = patch
+    .split(/\r?\n/u)
+    .map((line) => line.trim())
+    .filter((line) => /^\*\*\* (?:Update|Add|Delete) File:|^\*\*\* Move to:/u.test(line));
+  if (operationLines.some((line) =>
+    /^\*\*\* (?:Add|Delete) File:|^\*\*\* Move to:/u.test(line)
+  )) return false;
+  const updateTargets = operationLines.flatMap((line) => {
+    const match = line.match(/^\*\*\* Update File:\s*(.+)$/u);
+    return match?.[1]?.trim() ? [match[1].trim()] : [];
+  });
+  return updateTargets.length === 1 &&
+    workspacePathsReferToSameFile(updateTargets[0], delegatedTarget);
+}
+
+/**
+ * Reuse a child read only for mutations whose own application contract checks
+ * exact source context. Full-file writes and deletes still require a parent
+ * read. Metadata is checked again for every attempted mutation, so a prior
+ * successful write cannot reuse a stale child epoch.
+ */
+export function resolveVersionedDelegatedObservationReuse(input: {
+  activity: PlanToolActivitySummary;
+  mutationToolName: string;
+  mutationArgs: Record<string, unknown>;
+  currentVersion: string | null;
+  currentContentHash: string | null;
+  currentSourceContent: string | null;
+}): DelegatedObservationReuseDecision {
+  const delegated = input.activity.delegatedObservation;
+  if (!delegated?.requiresParentReread) {
+    return { reusable: true, reason: "parent_context_available" };
+  }
+  const selfVerifyingMutation = input.mutationToolName === "replace_in_file"
+    ? String(input.mutationArgs.search_text || "").trim().length > 0
+    : input.mutationToolName === "apply_patch" &&
+      isSingleTargetDelegatedUpdatePatch(
+        String(input.mutationArgs.patch || ""),
+        input.activity.target,
+      );
+  if (!selfVerifyingMutation) {
+    return { reusable: false, reason: "mutation_not_self_verifying" };
+  }
+  if (!delegated.sourceToolCallId || !delegated.sourceObservationKey || !delegated.sourceVersion) {
+    return { reusable: false, reason: "missing_source_identity" };
+  }
+  if (!delegated.sourceContentHash) {
+    return { reusable: false, reason: "missing_content_hash" };
+  }
+  if (!Number.isFinite(delegated.sourceContentChars)) {
+    return { reusable: false, reason: "missing_content_length" };
+  }
+  if (!input.currentVersion) {
+    return { reusable: false, reason: "current_version_unavailable" };
+  }
+  if (input.currentVersion !== delegated.sourceVersion) {
+    return { reusable: false, reason: "source_version_changed" };
+  }
+  if (!input.currentContentHash || input.currentSourceContent === null) {
+    return { reusable: false, reason: "current_content_hash_unavailable" };
+  }
+  if (input.currentContentHash !== delegated.sourceContentHash) {
+    return { reusable: false, reason: "source_content_changed" };
+  }
+  if (!delegated.sourceRange) {
+    return { reusable: false, reason: "missing_source_range" };
+  }
+  if (
+    input.mutationToolName === "apply_patch" &&
+    (
+      delegated.sourceRange.truncated ||
+      delegated.sourceRange.startLine !== 1 ||
+      delegated.sourceRange.endLine < delegated.sourceRange.totalLines
+    )
+  ) {
+    return { reusable: false, reason: "insufficient_source_coverage" };
+  }
+  if (
+    input.mutationToolName === "replace_in_file" &&
+    !input.currentSourceContent.includes(String(input.mutationArgs.search_text || ""))
+  ) {
+    return { reusable: false, reason: "mutation_context_outside_observed_source" };
+  }
+  return { reusable: true, reason: "versioned_exact_mutation" };
+}
+
 export async function partitionToolCallsForExecution(input: {
   toolCalls: ToolCallToExecute[];
   workspace: string;
@@ -287,6 +508,9 @@ export async function partitionToolCallsForExecution(input: {
   const specFileCalls: ToolCallToExecute[] = [];
   const writeCalls: WriteToolCallForRound[] = [];
   const toolArgsByCallId = new Map<string, Record<string, unknown>>();
+  // Runtime-owned fan-out targets for broad child reads. This sidecar never
+  // enters model-authored JSON, so it cannot be forged by a child response.
+  const scopedReadPathsByCallId = new Map<string, string[]>();
   const readOnlyCallSignatures = new Map<string, string>();
   const readFileWindowNarrowedNotes = new Map<string, string>();
   const queuedReadOnlySignatures = new Set<string>();
@@ -317,6 +541,29 @@ export async function partitionToolCallsForExecution(input: {
 
   for (const tc of toolCalls) {
     let toolArgs = parseToolCallArguments(tc, workspace);
+    const subagentScope = callbacks.getSubagentScope?.() ?? null;
+    if (subagentScope && SUBAGENT_SCOPE_NARROWABLE_READ_TOOLS.has(tc.name)) {
+      const requestedPath = typeof toolArgs.path === "string" ? toolArgs.path : "";
+      const scopeResolution = resolveSubagentScopedReadTargets({
+        scope: subagentScope,
+        requestedPath,
+      });
+      if (scopeResolution.action === "narrow" && scopeResolution.targets.length > 0) {
+        toolArgs = { ...toolArgs, path: scopeResolution.targets[0] };
+        tc.arguments = JSON.stringify(toolArgs);
+        scopedReadPathsByCallId.set(tc.id, scopeResolution.targets);
+        callbacks.onDebugEvent?.("subagent_scope_tool_args_narrowed", {
+          iteration,
+          tool: tc.name,
+          scopeKey: subagentScope.scopeKey,
+          requestedPath: scopeResolution.requestedPath,
+          resolvedPath: scopeResolution.targets[0],
+          resolvedPaths: scopeResolution.targets,
+          reason: scopeResolution.reason,
+          allowedPaths: subagentScope.allowedPaths,
+        });
+      }
+    }
     const targetingProfile = buildCurrentTaskTargetingProfile();
     const isPlanStructureExploreTool =
       workflowMode === "plan" &&
@@ -657,6 +904,67 @@ export async function partitionToolCallsForExecution(input: {
       continue;
     }
 
+    if (
+      executeRecoveryMode === "objective_audit" &&
+      isWorkspaceMutationToolCall(tc.name, toolArgs)
+    ) {
+      const mutationTargets = resolveWorkspaceMutationTargets(tc.name, toolArgs, target);
+      const creationTargets = resolveWorkspaceMutationCreationTargets(
+        tc.name,
+        toolArgs,
+        target,
+      );
+      const createOnlyTargets = resolveWorkspaceMutationCreateOnlyTargets(
+        tc.name,
+        toolArgs,
+      );
+      const knownTargets = [
+        ...(executeRecoveryState.decisionCheckpoint?.objectiveExpectedTargets || []),
+        ...(executeRecoveryState.expectedTarget ? [executeRecoveryState.expectedTarget] : []),
+      ];
+      const missingReadTargets = await objectiveAuditTargetsMissingReadObservation({
+        mutationTargets,
+        knownTargets,
+        creationTargets,
+        createOnlyTargets,
+        fileReadStates,
+        managedAgentMessages,
+        workspace,
+      });
+      if (missingReadTargets.length > 0) {
+        const language = callbacks.getPreferredLanguage();
+        const message = language === "zh"
+          ? `OBJECTIVE_AUDIT_TARGET_READ_REQUIRED: closure audit 请求修改新目标 ${missingReadTargets.join(", ")}，但当前上下文没有这些文件仍有效的源码 observation。本次写入未执行；请先对新目标调用 read_file，再根据读取结果修改。`
+          : `OBJECTIVE_AUDIT_TARGET_READ_REQUIRED: the closure audit requested a mutation to new target(s) ${missingReadTargets.join(", ")}, but the current context has no still-valid source observation for them. The write did not execute; call read_file for each new target before mutating it.`;
+        toolFailureSignatures.delete(tc.id);
+        callbacks.onToolDone(tc.name, target, message, {
+          toolCallId: tc.id,
+          internalFeedback: true,
+          qualityGateReason: "objective_audit_target_read_required",
+        });
+        logAgentEvent("objective_audit_target_mutation_deferred", {
+          iteration,
+          tool: tc.name,
+          mutationTargets,
+          missingReadTargets,
+          knownTargets,
+          diskWritten: false,
+        });
+        preExecutionResults.push({
+          toolCallId: tc.id,
+          name: tc.name,
+          target,
+          content: message,
+          displayContent: "",
+          isError: false,
+          lifecycleState: "completed",
+          internalFeedback: true,
+          qualityGateReason: "objective_audit_target_read_required",
+        });
+        continue;
+      }
+    }
+
     const isOrderSensitiveWorkspaceAction =
       isWorkspaceMutationToolCall(tc.name, toolArgs) ||
       tc.name === "run_command" ||
@@ -787,23 +1095,30 @@ export async function partitionToolCallsForExecution(input: {
       ? mutationScopeTargets
       : tc.name === "grep_search" || tc.name === "find_symbol_references" || tc.name === "git_diff"
         ? [directScopeTarget || "."]
-        : new Set(["read_file", "get_file_outline", "code_ast_query"] as string[]).has(tc.name)
+        : new Set([
+            "read_file",
+            "read_file_window",
+            "read_document",
+            "get_file_outline",
+            "code_ast_query",
+            "list_directory",
+          ] as string[]).has(tc.name)
           ? [directScopeTarget]
           : [];
     if (scopeTargets.length > 0) {
-      const subagentScope = callbacks.getSubagentScope?.() ?? null;
-      const scopeConflict = subagentScope ? null : scopeTargets
+      const activeSubagentScope = callbacks.getSubagentScope?.() ?? null;
+      const scopeConflict = activeSubagentScope ? null : scopeTargets
         .map((scopeTarget) => findSubagentScopeConflict({
           threadId: callbacks.getSessionKey(),
           targetPath: scopeTarget,
         }))
         .find(Boolean) || null;
-      const scopeBlocked = subagentScope
+      const scopeBlocked = activeSubagentScope
         ? scopeTargets.some((scopeTarget) =>
-            !scopeTarget || !validateSubagentScopeTarget(subagentScope, scopeTarget)
+            !scopeTarget || !validateSubagentScopeTarget(activeSubagentScope, scopeTarget)
           )
         : !!scopeConflict;
-      const parentScopeDeferred = !subagentScope && !!scopeConflict;
+      const parentScopeDeferred = !activeSubagentScope && !!scopeConflict;
       callbacks.onDebugEvent?.("delegation_scope_decision", {
         tool: tc.name,
         targets: scopeTargets,
@@ -811,13 +1126,13 @@ export async function partitionToolCallsForExecution(input: {
         reason: parentScopeDeferred
           ? "overlapping_active_scope"
           : scopeBlocked ? "subagent_scope_escape" : "no_scope_conflict",
-        agentKind: subagentScope ? "subagent" : "parent",
-        subagentId: subagentScope?.subagentId || scopeConflict?.subagentId || null,
-        scopeKey: subagentScope?.scopeKey || scopeConflict?.scopeKey || null,
+        agentKind: activeSubagentScope ? "subagent" : "parent",
+        subagentId: activeSubagentScope?.subagentId || scopeConflict?.subagentId || null,
+        scopeKey: activeSubagentScope?.scopeKey || scopeConflict?.scopeKey || null,
       });
       if (scopeBlocked) {
-        const message = subagentScope
-          ? `SUBAGENT_SCOPE_BLOCKED: ${tc.name} targets '${scopeTargets.join(", ") || "<missing path>"}' are outside allowed_paths for scope '${subagentScope.scopeKey}'.`
+        const message = activeSubagentScope
+          ? `SUBAGENT_SCOPE_BLOCKED: ${tc.name} targets '${scopeTargets.join(", ") || "<missing path>"}' are outside allowed_paths for scope '${activeSubagentScope.scopeKey}'.`
           : `PARENT_SCOPE_DEFERRED_TO_SUBAGENT: '${scopeTargets.join(", ")}' overlaps the active lease held by ${scopeConflict?.subagentId} (${scopeConflict?.scopeKey}). This is a policy deferral, not a tool failure; continue non-overlapping work and call wait_subagents before accessing it.`;
         if (parentScopeDeferred) {
           toolFailureSignatures.delete(tc.id);
@@ -835,7 +1150,17 @@ export async function partitionToolCallsForExecution(input: {
             failureKind: "policy",
           });
         } else {
+          const childScope = activeSubagentScope!;
+          const firstBlockedCallForTool = recordSubagentScopeBlockedTool(childScope, tc.name);
           callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+          callbacks.onDebugEvent?.("subagent_scope_tool_quarantined", {
+            iteration,
+            tool: tc.name,
+            scopeKey: childScope.scopeKey,
+            targets: scopeTargets,
+            firstBlockedCallForTool,
+            nextSurfaceAction: "remove_tool",
+          });
         }
         preExecutionResults.push({
           toolCallId: tc.id,
@@ -1216,40 +1541,79 @@ export async function partitionToolCallsForExecution(input: {
         const rereadTarget = mutationTargets.find((candidate) =>
           workspacePathsReferToSameFile(candidate, delegatedSource.target)
         ) || delegatedSource.target;
-        const readToolAvailable = availableToolNames.has("read_file");
-        const message = callbacks.getPreferredLanguage() === "zh"
-          ? `PARENT_SOURCE_REREAD_REQUIRED: ${delegatedSource.target} 的证据由子智能体 ${delegatedSource.delegatedObservation?.owner.subagentId} 观察，join 只注入了紧凑引用，不能作为父任务已消费的源码窗口。${readToolAvailable ? `请先对 ${rereadTarget} 调用一次定向 read_file，再根据父任务实际看到的版本修改。` : `当前工具面缺少 read_file；请保持修改暂停，直到恢复契约重新开放该定向读取能力。`}`
-          : `PARENT_SOURCE_REREAD_REQUIRED: evidence for ${delegatedSource.target} was observed by child ${delegatedSource.delegatedObservation?.owner.subagentId}; join injected only a compact reference, not parent-consumed source. ${readToolAvailable ? `Call one targeted read_file for ${rereadTarget}, then mutate from the version actually seen by the parent.` : "read_file is absent from the current tool surface; keep the mutation paused until the recovery contract exposes that targeted read."}`;
-        toolFailureSignatures.delete(tc.id);
-        callbacks.onToolDone(tc.name, target, message, {
-          toolCallId: tc.id,
-          internalFeedback: true,
-          qualityGateReason: "subagent_parent_reread_required",
+        const delegatedMetadata = await readFileMetadataIfAvailable(rereadTarget, workspace);
+        const currentVersion = delegatedMetadata
+          ? `${delegatedMetadata.sizeBytes}:${delegatedMetadata.modifiedMs}`
+          : null;
+        const currentSource = await readCurrentDelegatedSourceContent({
+          activity: delegatedSource,
+          target: rereadTarget,
+          workspace,
         });
-        logAgentEvent("subagent_parent_reread_required", {
-          iteration,
-          tool: tc.name,
-          target,
-          rereadTarget,
-          ownerSubagentId: delegatedSource.delegatedObservation?.owner.subagentId || null,
-          sourceObservationKey: delegatedSource.delegatedObservation?.sourceObservationKey || null,
-          sourceVersion: delegatedSource.delegatedObservation?.sourceVersion || null,
-          sourceRange: delegatedSource.delegatedObservation?.sourceRange || null,
-          readToolAvailable,
-          failureKind: "policy",
+        const reuseDecision = resolveVersionedDelegatedObservationReuse({
+          activity: delegatedSource,
+          mutationToolName: tc.name,
+          mutationArgs: toolArgs,
+          currentVersion,
+          currentContentHash: currentSource?.contentHash || null,
+          currentSourceContent: currentSource?.content ?? null,
         });
-        preExecutionResults.push({
-          toolCallId: tc.id,
-          name: tc.name,
-          target,
-          content: message,
-          displayContent: "",
-          isError: false,
-          lifecycleState: "completed",
-          internalFeedback: true,
-          qualityGateReason: "subagent_parent_reread_required",
-        });
-        continue;
+        if (reuseDecision.reusable) {
+          logAgentEvent("subagent_versioned_evidence_reused", {
+            iteration,
+            tool: tc.name,
+            target,
+            sourceTarget: delegatedSource.target,
+            ownerSubagentId: delegatedSource.delegatedObservation?.owner.subagentId || null,
+            sourceToolCallId: delegatedSource.delegatedObservation?.sourceToolCallId || null,
+            sourceObservationKey: delegatedSource.delegatedObservation?.sourceObservationKey || null,
+            sourceVersion: delegatedSource.delegatedObservation?.sourceVersion || null,
+            sourceContentHash: delegatedSource.delegatedObservation?.sourceContentHash || null,
+            currentContentHash: currentSource?.contentHash || null,
+            currentVersion,
+            reason: reuseDecision.reason,
+            safetyContract: "self_verifying_mutation",
+          });
+        } else {
+          const readToolAvailable = availableToolNames.has("read_file");
+          const message = callbacks.getPreferredLanguage() === "zh"
+            ? `PARENT_SOURCE_REREAD_REQUIRED: ${delegatedSource.target} 的子智能体证据不能安全复用（${reuseDecision.reason}）。${readToolAvailable ? `请先对 ${rereadTarget} 调用一次定向 read_file，再根据父任务实际看到的版本修改。` : `当前工具面缺少 read_file；请保持修改暂停，直到恢复契约重新开放该定向读取能力。`}`
+            : `PARENT_SOURCE_REREAD_REQUIRED: child evidence for ${delegatedSource.target} cannot be reused safely (${reuseDecision.reason}). ${readToolAvailable ? `Call one targeted read_file for ${rereadTarget}, then mutate from the version actually seen by the parent.` : "read_file is absent from the current tool surface; keep the mutation paused until the recovery contract exposes that targeted read."}`;
+          toolFailureSignatures.delete(tc.id);
+          callbacks.onToolDone(tc.name, target, message, {
+            toolCallId: tc.id,
+            internalFeedback: true,
+            qualityGateReason: "subagent_parent_reread_required",
+          });
+          logAgentEvent("subagent_parent_reread_required", {
+            iteration,
+            tool: tc.name,
+            target,
+            rereadTarget,
+            ownerSubagentId: delegatedSource.delegatedObservation?.owner.subagentId || null,
+            sourceObservationKey: delegatedSource.delegatedObservation?.sourceObservationKey || null,
+            sourceVersion: delegatedSource.delegatedObservation?.sourceVersion || null,
+            sourceContentHash: delegatedSource.delegatedObservation?.sourceContentHash || null,
+            currentContentHash: currentSource?.contentHash || null,
+            sourceRange: delegatedSource.delegatedObservation?.sourceRange || null,
+            currentVersion,
+            reuseReason: reuseDecision.reason,
+            readToolAvailable,
+            failureKind: "policy",
+          });
+          preExecutionResults.push({
+            toolCallId: tc.id,
+            name: tc.name,
+            target,
+            content: message,
+            displayContent: "",
+            isError: false,
+            lifecycleState: "completed",
+            internalFeedback: true,
+            qualityGateReason: "subagent_parent_reread_required",
+          });
+          continue;
+        }
       }
     }
 
@@ -1320,7 +1684,18 @@ export async function partitionToolCallsForExecution(input: {
       // pre-mutation result, so it must never own persistent file reads.
       const cacheableReadOnlyTool =
         tc.name !== "read_file" && shouldCacheReadOnlyToolResult(tc.name);
-      let signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
+      const scopedReadPaths = scopedReadPathsByCallId.get(tc.id) || [];
+      const buildEffectiveReadSignature = (args: Record<string, unknown>) =>
+        buildReadOnlyCacheSignature(
+          tc.name,
+          scopedReadPaths.length > 1
+            ? {
+                ...args,
+                __runtime_scoped_read_paths: [...scopedReadPaths].sort(),
+              }
+            : args,
+        );
+      let signature = buildEffectiveReadSignature(effectiveToolArgs);
       let cached = cacheableReadOnlyTool ? readOnlyResultCache.get(signature) : undefined;
       const fileReadMetadata =
         tc.name === "read_file" && typeof toolArgs.path === "string"
@@ -1635,7 +2010,7 @@ export async function partitionToolCallsForExecution(input: {
           }
           if (resolvedCoveragePlan.overlapped && resolvedCoveragePlan.suggestedArgs) {
             effectiveToolArgs = resolvedCoveragePlan.suggestedArgs;
-            signature = buildReadOnlyCacheSignature(tc.name, effectiveToolArgs);
+            signature = buildEffectiveReadSignature(effectiveToolArgs);
             cached = readOnlyResultCache.get(signature);
             fileReadSignature = buildFileReadSignature(fileReadMetadata.path, effectiveToolArgs);
             fileReadState = fileReadStates.get(fileReadSignature);
@@ -1760,6 +2135,7 @@ export async function partitionToolCallsForExecution(input: {
         id: tc.id,
         name: tc.name,
         arguments: JSON.stringify(effectiveToolArgs),
+        ...(scopedReadPaths.length > 0 ? { scopedReadPaths } : {}),
         allowExternalLocalRead:
           !!planned.localFileReadPath &&
           (planned.risk === "local_file_read" ||

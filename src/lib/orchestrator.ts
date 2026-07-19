@@ -41,7 +41,11 @@ import { preflightWorkspaceMutation } from "./workspaceMutationPreflight";
 import {
   isReadOnlyNoProgressDetail,
 } from "./executeRecoveryTools";
-import { workspacePathsReferToSameFile } from "./workspacePaths";
+import {
+  normalizeWorkspacePathIdentity,
+  workspacePathsReferToSameFile,
+} from "./workspacePaths";
+import { recordSubagentScopeBlockedTool } from "./subagents";
 import {
   WORKSPACE_MUTATION_TOOL_NAMES,
   resolveWorkspaceMutationTargets,
@@ -179,7 +183,7 @@ import {
   latestVisualContextIsModelVisible,
 } from "./visualContext";
 import {
-  getModelInstructionProfile,
+  getProtocolInstructionProfile,
   normalizeCloudToolProtocol,
   normalizeLocalToolProtocol,
   resolveEffectiveCloudApiFormat,
@@ -824,7 +828,13 @@ export async function buildReadBeforeModifyValidationError(
 
   let existingFile = tc.name === "replace_in_file";
   let metadata: { path: string; sizeBytes: number; modifiedMs: number } | null = null;
-  if (tc.name === "write_file" || tc.name === "read_file") {
+  let writeMetadataStatus: FileMetadataAvailabilityProbe["status"] | null = null;
+  if (tc.name === "write_file") {
+    const probe = await probeFileMetadataAvailability(path, workspace);
+    writeMetadataStatus = probe.status;
+    metadata = probe.status === "exists" ? probe.metadata : null;
+    existingFile = probe.status === "exists";
+  } else if (tc.name === "read_file") {
     metadata = await readFileMetadataIfAvailable(path, workspace);
     existingFile = !!metadata;
   }
@@ -861,6 +871,31 @@ export async function buildReadBeforeModifyValidationError(
 
   if (tc.name === "read_file") return null;
 
+  if (tc.name === "write_file" && writeMetadataStatus === "unknown") {
+    const language = callbacks.getPreferredLanguage();
+    const message = language === "zh"
+      ? `WRITE_FILE_METADATA_UNAVAILABLE: 无法确认 ${path} 是否已存在（可能是 IPC、权限或路径解析错误）。为避免把未知状态误当成新文件并覆盖内容，本次写入已阻止；请先读取目标或修复文件访问问题。`
+      : `WRITE_FILE_METADATA_UNAVAILABLE: could not determine whether ${path} already exists (for example due to IPC, permission, or path-resolution failure). The write was blocked so an unknown state cannot be mistaken for a new file; read the target or resolve file access first.`;
+    callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+    emitToolPreflightBlocked(callbacks, {
+      reason: "write_file_metadata_unavailable",
+      tool: tc.name,
+      target,
+      message,
+      toolCallId: tc.id,
+      lifecycleState: "blocked",
+    });
+    callbacks.onToolError(tc.name, target, message, { toolCallId: tc.id });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: `Error: ${message}`,
+      isError: true,
+      lifecycleState: "blocked",
+    };
+  }
+
   // 2. Write File Size-Gate Check (Dynamic threshold scaling with context limit, min 48KB)
   if (tc.name === "write_file" && metadata && metadata.sizeBytes > dynamicMaxWriteSizeBytes) {
     const language = callbacks.getPreferredLanguage();
@@ -887,7 +922,8 @@ export async function buildReadBeforeModifyValidationError(
     };
   }
 
-  if (!existingFile && hasParentRead) return null;
+  if (writeMetadataStatus === "absent" && hasParentRead) return null;
+  if (!existingFile && tc.name !== "write_file" && hasParentRead) return null;
   if (hasExactRead) return null;
 
   const language = callbacks.getPreferredLanguage();
@@ -1418,6 +1454,7 @@ export interface OrchestratorCallbacks {
   shouldForceXmlForProviderCompatibility?: () => boolean;
   onProviderCompatibilityFallback?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
+  onToolSurfaceResolved?: (availableToolNames: string[]) => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
   onModelUsage?: (usage: NonNullable<StreamResult["usage"]>) => void;
   onExecuteRecoveryStateChange?: (state: {
@@ -1651,9 +1688,10 @@ export function resolveEffectiveToolProtocol(config: AppConfig, settings: Stream
     : normalizeCloudToolProtocol(settings.toolProtocol);
 }
 
-export function resolveModelProtocolProfile(input: {
+export function resolveRuntimeProtocolProfile(input: {
   activeProfile?: "local" | "cloud";
   provider?: string | null;
+  /** Accepted for caller compatibility; model identity never changes runtime guidance. */
   model?: string | null;
   protocol?: string | null;
   configuredToolProtocol?: CloudToolProtocol | null;
@@ -1667,38 +1705,25 @@ export function resolveModelProtocolProfile(input: {
   const activeProfile = input.activeProfile === "cloud" ? "cloud" : "local";
   const configured = input.configuredToolProtocol || "auto";
   const provider = String(input.provider || "").trim();
-  const providerLower = provider.toLowerCase();
-  const model = String(input.model || "").trim();
-  const cloudProfile = getModelInstructionProfile({
+  const protocolProfile = getProtocolInstructionProfile({
     protocol: input.protocol || "openai",
-    provider,
-    model,
   });
 
   let toolProtocol: CloudToolProtocol = configured;
   if (activeProfile === "local") {
     toolProtocol = normalizeLocalToolProtocol(configured === "auto" ? undefined : configured, provider);
-    if (toolProtocol === "auto" && /gemma/.test(model.toLowerCase())) {
-      toolProtocol = "xml";
-    }
     if (input.compatibilityOverride === true) toolProtocol = "xml";
-    if (input.compatibilityOverride === false && toolProtocol === "xml" && providerLower.includes("omlx") && configured !== "xml" && !/gemma/.test(model.toLowerCase())) {
-      toolProtocol = "auto";
-    }
   } else {
     toolProtocol = normalizeCloudToolProtocol(configured);
-    if (toolProtocol === "auto") toolProtocol = cloudProfile.toolProtocolPreference;
+    if (toolProtocol === "auto") toolProtocol = protocolProfile.toolProtocolPreference;
     if (input.compatibilityOverride === true) toolProtocol = "xml";
-    if (input.compatibilityOverride === false && toolProtocol === "xml" && cloudProfile.toolProtocolPreference !== "xml") {
-      toolProtocol = "native";
-    }
   }
 
   return {
-    providerFamily: activeProfile === "local" ? provider || "local" : cloudProfile.provider,
+    providerFamily: activeProfile === "local" ? provider || "local" : protocolProfile.provider,
     toolProtocol,
-    reasoning: cloudProfile.reasoning,
-    notes: cloudProfile.noiseRules,
+    reasoning: protocolProfile.reasoning,
+    notes: protocolProfile.noiseRules,
   };
 }
 
@@ -1708,7 +1733,7 @@ export function shouldUseXmlToolProtocol(
   messages: AgentMessage[],
   compatibilityOverride?: boolean,
 ): boolean {
-  const profile = resolveModelProtocolProfile({
+  const profile = resolveRuntimeProtocolProfile({
     activeProfile: config.activeProfile,
     provider: settings.provider,
     model: settings.model,
@@ -1718,7 +1743,6 @@ export function shouldUseXmlToolProtocol(
   });
   if (profile.toolProtocol === "xml") return true;
   if (compatibilityOverride === true) return true;
-  if (compatibilityOverride === false) return false;
   return hasProviderNativeToolsDisabled(messages);
 }
 
@@ -1749,7 +1773,7 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     case "knowledge_search": return (args.query as string) || "knowledge";
     case "knowledge_get_excerpt": return (args.chunk_id as string) || (args.chunkId as string) || "knowledge excerpt";
     case "glob_search":     return (args.pattern as string) || "";
-    case "grep_search":     return (args.query as string) || "";
+    case "grep_search":     return (args.path as string) || (args.query as string) || "";
     case "web_search":      return (args.query as string) || "web search";
     case "web_fetch":       return (args.url as string) || "";
     case "repo_map_search": return (args.query as string) || "";
@@ -1757,8 +1781,9 @@ export function getToolTarget(name: string, args: Record<string, unknown>): stri
     case "repo_map_files": return (args.filter as string) || "repo map files";
     case "repo_map_impact": return (args.target as string) || "";
     case "repo_map_status": return "repo map";
+    case "get_file_outline": return (args.path as string) || "";
     case "code_ast_query": return (args.path as string) || "";
-    case "find_symbol_references": return (args.symbol as string) || "";
+    case "find_symbol_references": return (args.path as string) || (args.symbol as string) || "";
     case "git_status": return "git status";
     case "git_diff": return (args.path as string) || (args.filter as string) || "workspace diff";
     case "execute_command": return (args.command as string) || "";
@@ -2244,10 +2269,10 @@ export function buildApprovedPlanContinuationPrompt(callbacks: OrchestratorCallb
     approvalChoiceHint +
     (callbacks.getPlanTasks().length > 0
       ? language === "zh"
-        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，ExecutionCapsule 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，使用 <tool_use> 格式调用工具；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。只有同一文件版本、同一读取范围仍在当前上下文且再次读取只返回 `FILE_UNCHANGED_STUB` 时，才应停止该无进展重复；文件修改后、结果已淘汰或需要不同范围时可以重新读取。否则转向 `apply_patch`/`replace_in_file`/`write_file`、验证、其他必要范围或精确阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；不可自动执行的 Tauri/人工复核只记录为最终结论中的建议项，不能关闭任何自动验证缺口，也不能仅因此暂停。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部可自动执行的任务都有真实文件/命令/交付物/浏览器证据满足后才能结束执行；剩余 Tauri/人工复核必须明确列在结论中。如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
+        ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。MAIN 已有 runtime 任务清单，ExecutionCapsule 会直接显示任务进度；不需要为了第一次源码写入强制创建或读取 `.MAIN/plans/tasks.md`。请按当前任务清单逐项执行，通过当前暴露的正式工具调用推进；只有任务较长、需要跨会话审计或用户明确要求留档时，才先把清单持久化到 tasks.md。不要为了确认 tasks.md 是否存在而读取它；只有它已知存在或你正在同步已有审计文件时，才读取/更新。任何需要 shell 的任务都必须在当前任务清单中保留精确命令并用反引号包裹。只有同一文件版本、同一读取范围仍在当前上下文且再次读取只返回 `FILE_UNCHANGED_STUB` 时，才应停止该无进展重复；文件修改后、结果已淘汰或需要不同范围时可以重新读取。否则转向 `apply_patch`/`replace_in_file`/`write_file`、验证、其他必要范围或精确阻塞。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据，不能用 curl/grep/cat 代替；不可自动执行的 Tauri/人工复核只记录为最终结论中的建议项，不能关闭任何自动验证缺口，也不能仅因此暂停。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部可自动执行的任务都有真实文件/命令/交付物/浏览器证据满足后才能结束执行；剩余 Tauri/人工复核必须明确列在结论中。如果 tasks.md 已存在，完成任务后再同步更新对应 checkbox。\n"
         : "The plan is approved. You are now in EXECUTION MODE. MAIN already has a runtime task list, so ExecutionCapsule can show task progress without forcing creation or reads of `.MAIN/plans/tasks.md` before the first source write. Execute the current task list with tool calls; persist the list to tasks.md only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists; only read/update it when it is already known to exist or you are syncing an existing audit file. Any task that needs shell work must keep the exact command in the current task list using backticks. Stop rereading only when the same range of the same unchanged file version is still active and another read returns `FILE_UNCHANGED_STUB`; reread after mutation, eviction, or for a different required range. Otherwise patch/write, validate, inspect another needed range, or pause with the exact blocker. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence; do not substitute curl/grep/cat. Tauri or manual review that cannot be automated is only an advisory in the final conclusion: it cannot close any automatic validation gap and must not by itself pause the run. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Stop only after every automatable task has real file/command/deliverable/browser evidence, and list any remaining Tauri/manual review explicitly in the conclusion; if tasks.md exists, update the matching checkbox after evidence exists.\n"
       : language === "zh"
-      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，使用 <tool_use> 格式调用工具。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；不可自动执行的 Tauri/人工复核只记录在最终结论中，不能关闭自动验证缺口，也不能仅因此暂停。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部可自动执行任务都有真实文件/命令/交付物/浏览器证据满足后才能结束，并在结论中列出剩余用户复核建议。\n"
+      ? "计划已批准，现在进入执行阶段（EXECUTION MODE）。请先基于已批准的 plan.md 派生精简 runtime 任务清单；只有任务较长、需要跨会话审计或用户明确要求留档时，才生成 `.MAIN/plans/tasks.md`。不要为了确认 tasks.md 是否存在而读取它。随后按任务逐项执行，通过当前暴露的正式工具调用推进。页面渲染验证必须使用 Browser/Playwright DOM 或截图证据；不可自动执行的 Tauri/人工复核只记录在最终结论中，不能关闭自动验证缺口，也不能仅因此暂停。你可以正常修改项目源码文件，写入路径必须是项目中的正确位置，绝对不要将源码写入 `.MAIN/plans/` 或任何隐藏目录。只有全部可自动执行任务都有真实文件/命令/交付物/浏览器证据满足后才能结束，并在结论中列出剩余用户复核建议。\n"
       : "The plan is approved. You are now in EXECUTION MODE. First derive a concise runtime task list from the approved plan.md; generate `.MAIN/plans/tasks.md` only when the work is long, cross-session, or explicitly needs an audit file. Do not read tasks.md just to check whether it exists. Then execute the tasks one by one using tool calls. Rendered-page validation requires Browser/Playwright DOM or screenshot evidence. Tauri or manual review that cannot be automated belongs only in the final conclusion: it cannot close an automatic validation gap and must not by itself pause the run. You may now edit project source files, but write them to the proper project paths and never into `.MAIN/plans/` or hidden folders. Stop only after every automatable task has real file/command/deliverable/browser evidence, and list any remaining user review suggestions in the conclusion.\n") +
     deliverableHint +
     (runtimeTaskList ? "\n" + runtimeTaskList + "\n" : "") +
@@ -2277,6 +2302,17 @@ interface FetchLLMStreamOptions {
   responseFormat?: Record<string, unknown>;
   workflowMode?: string;
   runtimeIntent?: string;
+}
+
+export function permitsConfiguredMaxOutputEscalation(
+  maxTokensOverride: number | undefined,
+  maxEscalationsOverride: number | undefined,
+): boolean {
+  // An explicit max-token value is the fixed ceiling unless the caller also
+  // supplies an explicit, positive retry budget. This lets bounded phases use
+  // the override as their starting point without silently enabling the
+  // default three retries.
+  return maxTokensOverride === undefined || (maxEscalationsOverride ?? 0) > 0;
 }
 
 export function isStreamWatchdogTimeoutMessage(message: string): boolean {
@@ -2443,7 +2479,7 @@ export async function fetchLLMStream(
   options: FetchLLMStreamOptions = {},
 ): Promise<StreamResult> {
   let fullText = "";
-  // P1: Constrain local model output length while allowing reasoning models adequate room
+  // P1: Constrain local output length while retaining room for provider-reported hidden reasoning.
   const isLocal = isLocalProfile(settings);
   let currentMaxTokens: number;
   if (maxTokensOverride !== undefined) {
@@ -2727,13 +2763,14 @@ export async function fetchLLMStream(
     const contextPressure = tokenBreakdown.total > 0 ? tokenBreakdown.system / tokenBreakdown.total : 0;
     // Escalation rules: only skip, never auto-degrade
     // - If context pressure > 0.85, skip escalation (keep current maxTokens)
-    // - Skip entirely when maxTokensOverride is set (already precisely configured)
+    // - An explicit maxTokensOverride stays fixed unless the caller also
+    //   supplied a positive, bounded escalation budget.
     const shouldEscalate =
       result.finishReason === "length" &&
       escalationCount < MAX_ESCALATIONS &&
       currentMaxTokens < effectiveCap &&
       contextPressure <= 0.85 &&
-      maxTokensOverride === undefined;
+      permitsConfiguredMaxOutputEscalation(maxTokensOverride, maxEscalationsOverride);
 
     if (shouldEscalate) {
       const nextMaxTokens = escalateMaxTokens(currentMaxTokens, settings.contextLimit);
@@ -3189,6 +3226,42 @@ export async function readFileMetadataIfAvailable(path: string, workspace?: stri
   }
 }
 
+export type FileMetadataAvailabilityProbe =
+  | {
+      status: "exists";
+      metadata: { path: string; sizeBytes: number; modifiedMs: number };
+    }
+  | { status: "absent"; metadata: null }
+  | { status: "unknown"; metadata: null };
+
+/**
+ * Unlike `readFileMetadataIfAvailable`, this preserves the distinction between
+ * a confirmed ENOENT and an IPC/permission/path-resolution failure. Callers may
+ * authorize creation only for the former.
+ */
+export async function probeFileMetadataAvailability(
+  path: string,
+  workspace?: string,
+): Promise<FileMetadataAvailabilityProbe> {
+  try {
+    const metadata = await getFileMetadata(path, workspace);
+    return {
+      status: "exists",
+      metadata: {
+        path: String(metadata.path || path),
+        sizeBytes: Number(metadata.sizeBytes) || 0,
+        modifiedMs: Number(metadata.modifiedMs) || 0,
+      },
+    };
+  } catch (error) {
+    const message = getErrorMessage(error, "FILE_METADATA_UNAVAILABLE");
+    if (message.startsWith("FILE_METADATA_NOT_FOUND:")) {
+      return { status: "absent", metadata: null };
+    }
+    return { status: "unknown", metadata: null };
+  }
+}
+
 function normalizePathLike(value: string): string {
   return String(value || "").trim().replace(/\\/g, "/").replace(/\/+/g, "/");
 }
@@ -3386,11 +3459,324 @@ export function buildToolResultHistoryContentByFormat(
 
 interface ExecuteToolLifecycleOptions {
   allowExternalLocalRead?: boolean;
+  /** Runtime-owned lease roots for one safely fanned-out child read. */
+  scopedReadPaths?: string[];
   shellPermissionApproval?: ShellPermissionApproval;
   abortSignal?: AbortSignal;
   turnContext?: TurnInputContextSignals;
   recentPlanToolActivity?: PlanToolActivitySummary[];
   attemptedPlanWriteTargets?: string[];
+}
+
+const SCOPED_READ_FAN_OUT_TOOLS = new Set([
+  "grep_search",
+  "find_symbol_references",
+  "git_diff",
+]);
+
+interface ScopedReadFanOutEntry {
+  sourcePath: string;
+  content: string;
+  negative: boolean;
+  error: string;
+  blocked: boolean;
+  additionalContexts: string[];
+}
+
+/**
+ * Execute each runtime-owned scoped-read target through its own validation and
+ * Pre/PostToolUse lifecycle. The model-visible JSON still represents one tool
+ * call, while the immutable sidecar paths remain the sole execution scope.
+ */
+async function executeScopedReadFanOutWithLifecycle(input: {
+  tc: ToolCallToExecute;
+  baseToolArgs: Record<string, unknown>;
+  scopedReadPaths: string[];
+  workspace: string;
+  callbacks: OrchestratorCallbacks;
+  allTools: ToolDefinition[];
+  hooksConfig: Awaited<ReturnType<typeof loadHooksConfig>>;
+  options: ExecuteToolLifecycleOptions;
+}): Promise<ToolExecutionResult> {
+  const {
+    tc,
+    baseToolArgs,
+    scopedReadPaths,
+    workspace,
+    callbacks,
+    allTools,
+    hooksConfig,
+    options,
+  } = input;
+  const sessionKey = callbacks.getSessionKey();
+  const target = scopedReadPaths.join(", ");
+  callbacks.onToolExecuting(tc.name, target, undefined, { toolCallId: tc.id });
+
+  // Validate the shared selector/query once before it is projected across
+  // runtime-owned paths. Otherwise one malformed model call is misreported as
+  // N independent file failures and creates bogus path-coverage debt.
+  const baseValidationError = validateToolExecutionContract(tc.name, baseToolArgs, allTools);
+  if (baseValidationError) {
+    const scope = callbacks.getSubagentScope?.() ?? null;
+    const quarantined = scope
+      ? recordSubagentScopeBlockedTool(scope, tc.name)
+      : false;
+    const message = [
+      `SUBAGENT_SCOPED_READ_CALL_INVALID: ${baseValidationError}`,
+      quarantined
+        ? `The broad tool '${tc.name}' is removed for the next child iteration. Use an exact allowed read_file/read_document/get_file_outline call instead.`
+        : "Correct the shared arguments before retrying this scoped read.",
+    ].join(" ");
+    callbacks.onToolDone(tc.name, target, message, {
+      toolCallId: tc.id,
+      internalFeedback: true,
+      qualityGateReason: "subagent_scoped_read_invalid_arguments",
+    });
+    callbacks.onDebugEvent?.("subagent_scoped_read_fallback", {
+      tool: tc.name,
+      scopeKey: scope?.scopeKey || null,
+      reason: "invalid_shared_arguments",
+      quarantined,
+      scopedReadPaths,
+    });
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: message,
+      displayContent: "",
+      isError: false,
+      lifecycleState: "blocked",
+      internalFeedback: true,
+      qualityGateReason: "subagent_scoped_read_invalid_arguments",
+    };
+  }
+
+  const entries = await Promise.all(scopedReadPaths.map(async (sourcePath): Promise<ScopedReadFanOutEntry> => {
+    const initialArgs = normalizeToolCallForExecution(
+      tc.name,
+      { ...baseToolArgs, path: sourcePath },
+      workspace,
+    );
+    const validationError = validateToolExecutionContract(tc.name, initialArgs, allTools);
+    if (validationError) {
+      return {
+        sourcePath,
+        content: "",
+        negative: false,
+        error: validationError,
+        blocked: true,
+        additionalContexts: [],
+      };
+    }
+
+    const hookPayload = {
+      toolName: tc.name,
+      toolArgs: initialArgs,
+      workspace,
+      workflowMode: callbacks.getWorkflowMode(),
+      language: callbacks.getPreferredLanguage(),
+      associatedPaths: callbacks.getAssociatedPaths(),
+      scopedReadFanOut: true,
+      scopedReadTarget: sourcePath,
+      scopedReadTargets: [...scopedReadPaths],
+    };
+    const preHookResult = await runLifecycleHooks(
+      callbacks,
+      hooksConfig,
+      "PreToolUse",
+      hookPayload,
+    );
+    if (preHookResult.blocked) {
+      return {
+        sourcePath,
+        content: "",
+        negative: false,
+        error: preHookResult.blockedReason ?? `${tc.name} was blocked by a PreToolUse hook.`,
+        blocked: true,
+        additionalContexts: [...preHookResult.additionalContexts],
+      };
+    }
+
+    const hookArgs = normalizeToolCallForExecution(
+      tc.name,
+      preHookResult.updatedToolArgs ?? initialArgs,
+      workspace,
+    );
+    const hookPath = typeof hookArgs.path === "string" ? hookArgs.path.trim() : "";
+    if (
+      !hookPath ||
+      normalizeWorkspacePathIdentity(hookPath) !== normalizeWorkspacePathIdentity(sourcePath)
+    ) {
+      return {
+        sourcePath,
+        content: "",
+        negative: false,
+        error: `SCOPED_READ_HOOK_PATH_BLOCKED: PreToolUse cannot rewrite runtime-owned target ${sourcePath} to ${hookPath || "(missing)"}.`,
+        blocked: true,
+        additionalContexts: [...preHookResult.additionalContexts],
+      };
+    }
+
+    // Keep path immutable after hooks while honoring safe edits to query,
+    // symbol, filter and result-budget arguments.
+    const effectiveArgs = { ...hookArgs, path: sourcePath };
+    const postHookValidationError = validateToolExecutionContract(tc.name, effectiveArgs, allTools);
+    if (postHookValidationError) {
+      return {
+        sourcePath,
+        content: "",
+        negative: false,
+        error: postHookValidationError,
+        blocked: true,
+        additionalContexts: [...preHookResult.additionalContexts],
+      };
+    }
+
+    try {
+      const value = await executeTool(
+        tc.name,
+        effectiveArgs,
+        workspace,
+        sessionKey,
+        {
+          allowExternalLocalRead: options.allowExternalLocalRead === true,
+          shellPermissionApproval: options.shellPermissionApproval,
+        },
+      );
+      const content = typeof value === "string" ? value : JSON.stringify(value);
+      const negative = !content.trim() ||
+        /(?:no matches?|0 matches?|not found|no references? found)/i.test(content);
+      const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
+        ...hookPayload,
+        toolArgs: effectiveArgs,
+        toolResult: content,
+        isError: false,
+      });
+      return {
+        sourcePath,
+        content,
+        negative,
+        error: "",
+        blocked: false,
+        additionalContexts: [
+          ...preHookResult.additionalContexts,
+          ...postHookResult.additionalContexts,
+        ],
+      };
+    } catch (error) {
+      const errorMessage = error instanceof Error
+        ? error.message
+        : String(error || "Unknown scoped read error");
+      const postHookResult = await runLifecycleHooks(callbacks, hooksConfig, "PostToolUse", {
+        ...hookPayload,
+        toolArgs: effectiveArgs,
+        toolResult: errorMessage,
+        isError: true,
+      });
+      return {
+        sourcePath,
+        content: "",
+        negative: false,
+        error: errorMessage,
+        blocked: false,
+        additionalContexts: [
+          ...preHookResult.additionalContexts,
+          ...postHookResult.additionalContexts,
+        ],
+      };
+    }
+  }));
+
+  const successful = entries.filter((entry) => !entry.error);
+  const failed = entries.filter((entry) => Boolean(entry.error));
+  const allTargetsFailed = failed.length === entries.length;
+  const sharedFailure = allTargetsFailed && new Set(
+    failed.map((entry) => entry.error.trim()),
+  ).size === 1;
+  const coverage = {
+    requiredPaths: [...scopedReadPaths],
+    coveredPaths: successful.map((entry) => entry.sourcePath),
+    // An identical all-target error is call/global failure evidence, not proof
+    // that every underlying file is unreadable. Keep the targets uncovered so
+    // exact reads can recover them, without falsely labelling each path failed.
+    failedPaths: sharedFailure ? [] : failed.map((entry) => entry.sourcePath),
+  };
+  const cloudProfile = callbacks.getConfig().activeProfile === "cloud";
+  const budgets = getToolResultBudgets(tc.name, cloudProfile);
+  const perTargetBudget = Math.max(
+    1_000,
+    Math.floor(budgets.modelChars / scopedReadPaths.length) - 96,
+  );
+  const coverageLine = `SCOPED_READ_COVERAGE: ${JSON.stringify(coverage)}`;
+  const resultSections = entries.map((entry) => {
+    const body = entry.error
+      ? `Error: ${entry.error}`
+      : truncateToolContent(entry.content || "(no matches)", perTargetBudget);
+    return `=== ${entry.sourcePath} ===\n${body}`;
+  }).join("\n\n");
+  const rawContent = `${coverageLine}\n\n${resultSections}`;
+  const modelContent = truncateToolContent(rawContent, budgets.modelChars);
+  const displayContent = truncateToolContent(rawContent, budgets.displayChars);
+  const additionalContexts = [...new Set(entries.flatMap((entry) => entry.additionalContexts))];
+  const scopedReadObservations = successful.map(({ sourcePath, content, negative }) => ({
+    sourcePath,
+    content,
+    negative,
+  }));
+
+  if (failed.length > 0) {
+    const scope = callbacks.getSubagentScope?.() ?? null;
+    const quarantined = allTargetsFailed && scope
+      ? recordSubagentScopeBlockedTool(scope, tc.name)
+      : false;
+    const recoveryGuidance = quarantined
+      ? `\n\nSCOPED_READ_EXACT_FALLBACK: all fan-out targets failed for '${tc.name}'. This broad tool is removed for the next child iteration; inspect each still-uncovered allowed file with an exact read_file/read_document/get_file_outline call.`
+      : "";
+    const failureContent = `${modelContent}${recoveryGuidance}`;
+    const failureDisplayContent = `${displayContent}${recoveryGuidance}`;
+    callbacks.onToolError(tc.name, target, displayContent, {
+      toolCallId: tc.id,
+      failureKind: "actual",
+    });
+    if (quarantined) {
+      callbacks.onDebugEvent?.("subagent_scoped_read_fallback", {
+        tool: tc.name,
+        scopeKey: scope?.scopeKey || null,
+        reason: sharedFailure ? "shared_all_target_failure" : "all_target_failure",
+        quarantined,
+        scopedReadPaths,
+      });
+    }
+    return {
+      toolCallId: tc.id,
+      name: tc.name,
+      target,
+      content: failureContent,
+      displayContent: failureDisplayContent,
+      isError: true,
+      lifecycleState: successful.length === 0 && failed.every((entry) => entry.blocked)
+        ? "blocked"
+        : "failed",
+      scopedReadCoverage: coverage,
+      ...(scopedReadObservations.length > 0 ? { scopedReadObservations } : {}),
+      additionalContexts,
+    };
+  }
+
+  callbacks.onToolDone(tc.name, target, displayContent, { toolCallId: tc.id });
+  return {
+    toolCallId: tc.id,
+    name: tc.name,
+    target,
+    content: modelContent,
+    displayContent,
+    isError: false,
+    lifecycleState: "completed",
+    scopedReadCoverage: coverage,
+    scopedReadObservations,
+    additionalContexts,
+  };
 }
 
 async function executeToolCallWithLifecycle(
@@ -3427,6 +3813,27 @@ async function executeToolCallWithLifecycle(
   );
   if (shellReadValidationErrorBeforeContract) {
     return shellReadValidationErrorBeforeContract;
+  }
+
+  const scopedReadPaths = [...new Set(
+    (options.scopedReadPaths || [])
+      .map((path) => String(path || "").trim())
+      .filter(Boolean),
+  )];
+  if (
+    scopedReadPaths.length > 1 &&
+    SCOPED_READ_FAN_OUT_TOOLS.has(tc.name)
+  ) {
+    return executeScopedReadFanOutWithLifecycle({
+      tc,
+      baseToolArgs: toolArgs,
+      scopedReadPaths,
+      workspace,
+      callbacks,
+      allTools,
+      hooksConfig,
+      options,
+    });
   }
 
   // Validate required parameters before execution
@@ -3486,7 +3893,9 @@ async function executeToolCallWithLifecycle(
           provider: callbacks.getWebSearchProvider?.() || "duckduckgo",
         }
       : baseResolvedArgs;
-  const target = getToolTarget(tc.name, resolvedArgs);
+  const target = scopedReadPaths.length > 1
+    ? scopedReadPaths.join(", ")
+    : getToolTarget(tc.name, resolvedArgs);
 
   if (preHookResult.blocked) {
     const reason = preHookResult.blockedReason ?? `${tc.name} was blocked by a PreToolUse hook.`;
@@ -3623,9 +4032,9 @@ async function executeToolCallWithLifecycle(
             return JSON.stringify(joined);
           })()
       : await executeTool(tc.name, resolvedArgs, workspace, sessionKey, {
-          allowExternalLocalRead: options.allowExternalLocalRead === true,
-          shellPermissionApproval: options.shellPermissionApproval,
-        });
+            allowExternalLocalRead: options.allowExternalLocalRead === true,
+            shellPermissionApproval: options.shellPermissionApproval,
+          });
     let resultStr = typeof rawResult === "string" ? rawResult : JSON.stringify(rawResult);
 
     if (tc.name === "browser_evaluate") {
@@ -3973,7 +4382,11 @@ async function executeToolCallWithLifecycle(
       diff: completedDiffPreview,
       ...(isInternalFeedback ? { internalFeedback: true } : {}),
       ...(finalQualityGateReason ? { qualityGateReason: finalQualityGateReason } : {}),
-      ...(tc.name === "browser_evaluate" ? { evidenceResult: resultStr } : {}),
+      ...(
+        tc.name === "browser_evaluate" || tc.name === "apply_patch"
+          ? { evidenceResult: resultStr }
+          : {}
+      ),
     });
     return {
       toolCallId: tc.id,
@@ -4254,7 +4667,10 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
  * From claude-code-haha's toolOrchestration.ts: safe tools can run in parallel.
  */
 export async function executeReadOnlyToolsConcurrently(
-  toolCalls: Array<ToolCallToExecute & { allowExternalLocalRead?: boolean }>,
+  toolCalls: Array<ToolCallToExecute & {
+    allowExternalLocalRead?: boolean;
+    scopedReadPaths?: string[];
+  }>,
   workspace: string,
   callbacks: OrchestratorCallbacks,
   allTools: ToolDefinition[],
@@ -4264,6 +4680,7 @@ export async function executeReadOnlyToolsConcurrently(
   const promises = toolCalls.map(tc =>
     executeToolCallWithLifecycle(tc, workspace, callbacks, allTools, hooksConfig, {
       allowExternalLocalRead: tc.allowExternalLocalRead === true,
+      scopedReadPaths: tc.scopedReadPaths,
       abortSignal: options.abortSignal,
       turnContext: options.turnContext,
       recentPlanToolActivity: options.recentPlanToolActivity,
@@ -4767,6 +5184,9 @@ export async function executeWriteToolWithReview(
     args: toolArgs,
     language: callbacks.getPreferredLanguage(),
     readFile: async (path) => String(await executeTool("read_file", { path, __raw: true }, workspace, callbacks.getSessionKey()) ?? ""),
+    probeFileAvailability: async (path) => (
+      await probeFileMetadataAvailability(path, workspace)
+    ).status,
     readFileMetadata: async (path) => {
       try {
         const metadata = await getFileMetadata(path, workspace);
@@ -5062,5 +5482,3 @@ export function summarizeToolsForDiagnostics(tools: ToolDefinition[]): Record<st
 export * from "./orchestrator/types";
 export { AgentOrchestrator } from "./orchestrator/loop/AgentOrchestrator";
 export { executeAgentLoop } from "./orchestrator/loop/AgentLoopRunner";
-
-export { isReasoningModelName } from "./orchestrator/agentRecovery";

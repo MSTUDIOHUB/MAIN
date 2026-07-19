@@ -93,7 +93,7 @@ test("preapproval plan rewrite gets one provider-neutral bounded stream lease", 
   );
   assert.equal(policy.maxStreamElapsedMs, 120_000);
   assert.equal(policy.maxOutputTokens, 2_048);
-  assert.equal(policy.toolChoice, "required");
+  assert.equal(policy.toolChoice, undefined);
   assert.equal(
     policy.stopClass,
     PREAPPROVAL_PLAN_QUALITY_RECOVERY_TIMEOUT_STOP_CLASS,
@@ -124,6 +124,21 @@ test("XML fallback remains bounded without requesting unavailable native tools",
   assert.equal(policy.toolChoice, undefined);
   assert.equal(options.toolChoice, undefined);
   assert.equal(options.maxStreamElapsedMs, 120_000);
+});
+
+test("rewrite finalization never manufactures a native write-tool requirement", () => {
+  const policy = resolvePolicy({
+    llmToolNames: ["write_file", "replace_in_file"],
+    forceXmlTools: false,
+  });
+  const options = applyPreapprovalPlanQualityRecoveryStreamOptions(
+    policy,
+    { workflowMode: "plan", runtimeIntent: "plan" },
+    2,
+  );
+
+  assert.equal(policy.toolChoice, undefined);
+  assert.equal(options.toolChoice, undefined);
 });
 
 test("non-rewrite plan phases and approved execution are not capped", () => {

@@ -160,6 +160,7 @@ export interface OrchestratorCallbacks {
   shouldForceXmlForProviderCompatibility?: () => boolean;
   onProviderCompatibilityFallback?: (reason: string) => void;
   onProviderNativeToolSuccess?: () => void;
+  onToolSurfaceResolved?: (availableToolNames: string[]) => void;
   onDebugEvent?: (event: string, data?: Record<string, unknown>) => void;
   onModelUsage?: (usage: NonNullable<import("../streaming").StreamResult["usage"]>) => void;
   onExecuteRecoveryStateChange?: (state: {
@@ -374,6 +375,18 @@ export interface ToolExecutionResult {
   missingPlanSections?: string[];
   /** Internal identity for one versioned read_file request window. */
   readFileObservation?: import("./fileReadCache").FileReadObservationIdentity;
+  /** Runtime-owned observations for one safely fanned-out scoped read call. */
+  scopedReadObservations?: Array<{
+    sourcePath: string;
+    content: string;
+    negative: boolean;
+  }>;
+  /** Runtime-owned coverage truth for a safely fanned-out scoped read. */
+  scopedReadCoverage?: {
+    requiredPaths: string[];
+    coveredPaths: string[];
+    failedPaths: string[];
+  };
   patchRecoveryMismatch?: PatchRecoveryMismatchEvidence;
   /** Structured workspace mutation preflight outcome; never inferred from localized text. */
   mutationPreflightReason?: import("../workspaceMutationPreflight").WorkspaceMutationPreflightReason;

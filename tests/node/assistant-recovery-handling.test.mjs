@@ -106,6 +106,7 @@ function noToolInput(overrides = {}) {
     isCloudProfile: true,
     iterationToolCount: 3,
     llmToolCount: 3,
+    forceXmlTools: false,
     pseudoToolCallPlaceholder: false,
     pseudoToolNameCandidate: null,
     recoveryPromptState: createAgentLoopRecoveryPromptRuntimeState(),
@@ -133,6 +134,26 @@ test("assistant no-tool recovery handler reprompts tool-unavailable claims and r
   );
   assert.equal(context.events[0].status, "running");
   assert.match(context.events[1].message.content, /tools/i);
+  assert.match(context.events[1].message.content, /native tool schemas/i);
+  assert.doesNotMatch(context.events[1].message.content, /XML|<tool_use>|<tool>|<parameter/i);
+});
+
+test("assistant pseudo-tool recovery preserves native protocol", () => {
+  const context = createCallbacks();
+  const result = handleAssistantNoToolRecovery(noToolInput({
+    callbacks: context.callbacks,
+    isCloudProfile: false,
+    userVisibleText: "[Tool call: read_file]",
+    normalizedVisibleText: "[Tool call: read_file]",
+    pseudoToolCallPlaceholder: true,
+    pseudoToolNameCandidate: "read_file",
+    forceXmlTools: false,
+  }));
+
+  assert.equal(result.status, "continue");
+  const prompt = context.events.find((event) => event.type === "appendMessage")?.message.content || "";
+  assert.match(prompt, /native tool call/i);
+  assert.doesNotMatch(prompt, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("assistant no-tool recovery handler stops repeated pseudo-tool repair loops", () => {
@@ -158,6 +179,7 @@ test("assistant no-tool recovery handler stops repeated pseudo-tool repair loops
     ["streamToken", "nonActionableStop", "status"],
   );
   assert.equal(context.events[1].reason, "missing_tool_loop");
+  assert.doesNotMatch(context.events[1].message, /XML|<tool_use>|<tool>|<parameter/i);
   assert.equal(context.events[2].status, "idle");
 });
 

@@ -58,7 +58,7 @@ const { buildMissingToolCallContinuationPrompt } = loadTranspiledModuleSync(
 );
 
 test("generic reprompt no longer hard-forces 'do not ask user' behavior", () => {
-  const zh = buildMissingToolCallContinuationPrompt("generic", "zh", 1);
+  const zh = buildMissingToolCallContinuationPrompt("generic", "zh", 1, true);
   assert.equal(zh.includes("不要询问用户指示"), false);
   assert.equal(zh.includes("不要等待确认"), false);
   assert.ok(zh.includes("关键参数缺失"));
@@ -66,9 +66,16 @@ test("generic reprompt no longer hard-forces 'do not ask user' behavior", () => 
 });
 
 test("generic reprompt keeps one-question clarification escape hatch", () => {
-  const en = buildMissingToolCallContinuationPrompt("generic", "en", 1);
+  const en = buildMissingToolCallContinuationPrompt("generic", "en", 1, true);
   assert.equal(en.includes("Do not ask the user what to do next"), false);
   assert.equal(en.includes("instead of waiting for confirmation"), false);
   assert.ok(en.includes("ask one short clarifying question"));
   assert.ok(en.includes("<tool_use>"));
+});
+
+test("generic native reprompt never emits the XML fallback protocol", () => {
+  const prompt = buildMissingToolCallContinuationPrompt("generic", "en", 1, false);
+
+  assert.match(prompt, /native tool call/i);
+  assert.doesNotMatch(prompt, /XML|<tool_use>|<tool>|<parameter/i);
 });

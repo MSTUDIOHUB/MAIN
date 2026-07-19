@@ -1,6 +1,6 @@
 import type { LegacyConversationThread } from "../state/Thread";
 import { type EffectiveTurnContract } from "../../runIntent";
-import { createSystemPromptApplier, createTaskTargetingRuntime, createTurnEventEmitter, emitInitialTurnPreparationEvents, loadAgentLoopHooksConfig, loadAgentLoopResolvedInstructions, prepareAgentLoopRuntimeState, resolveAgentLoopTurnInputContext, runAgentLoopStartHooks, startModelProbeForTurn, type TurnEventEmitter } from "./turnPreparation";
+import { createSystemPromptApplier, createTaskTargetingRuntime, createTurnEventEmitter, emitInitialTurnPreparationEvents, loadAgentLoopHooksConfig, loadAgentLoopResolvedInstructions, prepareAgentLoopRuntimeState, resolveAgentLoopTurnInputContext, runAgentLoopStartHooks, type TurnEventEmitter } from "./turnPreparation";
 import { invokeStreamWithRecoveryForIteration } from "./streamRecovery";
 import { prepareAgentLoopToolRegistry } from "./toolRegistrySetup";
 import { handleMaxIterationBoundary } from "./maxIterationBoundary";
@@ -38,6 +38,12 @@ import {
   type VisualContextDeliveryStatus,
 } from "../../visualContext";
 import { resolveEffectiveSubagentDelegationPreference } from "../../turnIntake";
+import {
+  getFileReadObservationForState,
+  selectFileReadStateForRecoveryContext,
+} from "../fileReadCache";
+import { readFileMetadataIfAvailable } from "../../orchestrator";
+import { resolveRecoverySourceContextFreshness } from "./contextManagement";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -99,7 +105,6 @@ export class AgentOrchestrator {
           config,
           isCloudProfile,
           skills,
-          settings,
           workspace,
           turnIntent,
           workflowMode,
@@ -302,7 +307,6 @@ export class AgentOrchestrator {
             : null,
         });
         const initialRuntimeIntent = resolveRuntimeIntent();
-        startModelProbeForTurn(settings);
         applySystemPromptForRuntime(initialRuntimeIntent, resolveAllToolsForRuntime(initialRuntimeIntent));
         const startHooksResult = await runAgentLoopStartHooks({
           callbacks,
@@ -804,6 +808,40 @@ export class AgentOrchestrator {
           emitPlanExecutionProgress,
           setPlanRuntimePhase,
           activateExecuteRecovery,
+          clearExecuteRecovery,
+          resolveRecoveryReadObservation: async (target) => {
+            const sourceState = selectFileReadStateForRecoveryContext({
+              states: loopState.toolExecutionRuntimeState.fileReadStates,
+              targetPath: target,
+            });
+            if (!sourceState) return null;
+            const currentMetadata = await readFileMetadataIfAvailable(
+              sourceState.path,
+              workspace,
+            );
+            const freshness = resolveRecoverySourceContextFreshness({
+              state: sourceState,
+              currentMetadata,
+            });
+            if (!freshness.current) return null;
+            const observation = getFileReadObservationForState(sourceState, "replay");
+            return {
+              key: observation.key,
+              path: observation.path,
+              requestSignature: observation.requestSignature,
+              versionToken: observation.versionToken,
+              ...(sourceState.window
+                ? {
+                    requestedRange: {
+                      startLine: sourceState.window.startLine,
+                      endLine: sourceState.window.endLine,
+                      maxLines:
+                        sourceState.window.endLine - sourceState.window.startLine + 1,
+                    },
+                  }
+                : {}),
+            };
+          },
           activateChatFinalSynthesis,
           activateUnityMcpFallback,
           pauseForReviewablePlanArtifact,
@@ -883,6 +921,7 @@ export class AgentOrchestrator {
           turnInputContextSignals,
           taskTargetingEvidence,
           unityConsoleDiagnosticsRequested,
+          forceXmlTools,
           noToolRuntimeState: loopState.noToolRuntimeState,
           planRuntimeState: loopState.planRuntimeState,
           loopGuardRuntimeState: loopState.loopGuardRuntimeState,

@@ -119,6 +119,9 @@ const {
   resolveExecuteNoToolCheckpointLimit,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeNoToolRecovery.ts"));
 const {
+  MAX_VALIDATION_MUTATION_REOPENS,
+  objectiveAuditHasCurrentClosureEvidence,
+  resolveValidationMutationReopenTargetBinding,
   resolveValidationMutationReopen,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/assistantCompletionPhase.ts"));
 
@@ -144,6 +147,7 @@ const {
 
 const {
   findDelegatedObservationRequiringParentReread,
+  objectiveAuditTargetsMissingReadObservation,
   partitionToolCallsForExecution,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"));
 const {
@@ -159,6 +163,12 @@ const {
   resolveReadFileEligibilityDecision,
   selectFileReadStateForRecoveryContext,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/fileReadCache.ts"));
+
+const {
+  resolveWorkspaceMutationCreateOnlyTargets,
+  resolveWorkspaceMutationCreationTargets,
+  resolveWorkspaceMutationTargets,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workspaceMutationTools.ts"));
 
 const {
   buildExecuteRecoverySourceContextMessage,
@@ -181,6 +191,7 @@ const subagents = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/sub
 const {
   buildReadOnlyCacheSignature,
   getToolTarget,
+  probeFileMetadataAvailability,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 
 const readOnlyTools = new Set([
@@ -2793,15 +2804,28 @@ test("adaptive delegation exposes spawn only during useful context or diagnosis 
   });
 
   const context = resolveIterationToolSurface(makeInput());
-  assert.equal(context.delegationDecision.action, "admit");
+  assert.equal(context.delegationDecision.action, "defer");
+  assert.equal(context.delegationDecision.reason, "insufficient_independent_scope");
   assert.equal(context.delegationDecision.phase, "context");
-  assert.equal(context.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
+  assert.equal(context.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), false);
+
+  const explicitlyScopedPrompt = resolveIterationToolSurface(makeInput({
+    latestUserPromptText: [
+      "必须先连续调用 spawn_subagent 三次并行分析。",
+      "allowed_paths=src/hooks/useCsvParser.ts,src/hooks/useChartData.ts,src/types/order.ts。",
+      "主体不要重读子智能体租约路径。",
+    ].join("\n"),
+  }));
+  assert.equal(explicitlyScopedPrompt.delegationDecision.preference, "preferred");
+  assert.equal(explicitlyScopedPrompt.delegationDecision.action, "admit");
+  assert.equal(explicitlyScopedPrompt.delegationDecision.independentScopeCount, 3);
+  assert.equal(explicitlyScopedPrompt.iterationAllTools.some((tool) => tool.function.name === "spawn_subagent"), true);
 
   const sessionPreferred = resolveIterationToolSurface(makeInput({
     latestUserPromptText: "检查启动和菜单模块",
     turnInputContextSignals: {
       imageParts: 0,
-      mentionedFilePaths: [],
+      mentionedFilePaths: ["src/main.js"],
       attachedFilePaths: [],
       subagentPreference: "preferred",
     },
@@ -3065,6 +3089,61 @@ test("parent access to an active child lease is deferred without incrementing fa
   assert.equal(done.length, 1);
   assert.equal(partitioned.toolFailureSignatures?.size || 0, 0);
   subagents.resetSubagentRuntimeForTests();
+});
+
+test("child broad grep target is safely narrowed before scope validation", async () => {
+  const debugEvents = [];
+  const scope = {
+    subagentId: "subagent-chart",
+    parentSessionKey: "thread",
+    scopeKey: "chart-consumer",
+    workspace: workspaceRoot,
+    allowedPaths: ["src/App.tsx", "src/main.tsx"],
+    allowedFilePaths: ["src/App.tsx", "src/main.tsx"],
+    allowedDirectoryPaths: [],
+    scopeKind: "exact_files",
+    blockedToolNames: [],
+  };
+  const input = createReadFilePartitionInput({
+    toolCalls: [{
+      id: "child-broad-grep",
+      name: "grep_search",
+      arguments: JSON.stringify({ query: "creatorName", path: "." }),
+    }],
+    availableToolNames: new Set(["grep_search"]),
+    toolCapabilityRegistry: {
+      ...partitionToolCapabilityRegistry,
+      tools: {
+        ...partitionToolCapabilityRegistry.tools,
+        grep_search: {
+          key: "grep_search",
+          name: "grep_search",
+          source: "built_in",
+          category: "file",
+          risk: "read_only",
+          enabled: true,
+          autoExecutable: true,
+        },
+      },
+    },
+  });
+  input.callbacks = {
+    ...input.callbacks,
+    getSubagentScope: () => scope,
+    onDebugEvent: (event, data) => debugEvents.push({ event, data }),
+  };
+
+  const partitioned = await partitionToolCallsForExecution(input);
+  assert.equal(partitioned.preExecutionResults.length, 0);
+  assert.equal(partitioned.readOnlyCalls.length, 1);
+  assert.equal(partitioned.toolArgsByCallId.get("child-broad-grep").path, "src/App.tsx");
+  assert.deepEqual(partitioned.readOnlyCalls[0].scopedReadPaths, ["src/App.tsx", "src/main.tsx"]);
+  assert.ok(debugEvents.some((entry) =>
+    entry.event === "subagent_scope_tool_args_narrowed" &&
+    entry.data.requestedPath === "." &&
+    entry.data.resolvedPath === "src/App.tsx" &&
+    JSON.stringify(entry.data.resolvedPaths) === JSON.stringify(["src/App.tsx", "src/main.tsx"])
+  ));
 });
 
 test("child-owned source references require a parent-visible targeted read before mutation", async () => {
@@ -3490,12 +3569,45 @@ test("finite validation checkpoints persist command, cwd, and timeout in the act
       cwd: "src-tauri/",
       timeoutMs: 120000,
     },
+    validationMutationReopenCount: 2.9,
+    validationMutationReopenFingerprints: [" Edit:A ", "edit:a", "EDIT:B"],
+    objectiveMutationEvidence: [
+      { target: "src-tauri/src/main.rs", requirementRef: "REQ-RUST" },
+      { target: "src-tauri/src/main.rs", requirementRef: "REQ-RUST" },
+      { target: "" },
+    ],
+    objectiveObligationId: " requirement:REQ-RUST ",
+    objectiveRevision: 3.8,
+    objectiveKind: "requirement",
+    objectiveExpectedTargets: ["src-tauri/src/main.rs", "src-tauri/src/main.rs", ""],
+    objectiveValidationEvidence: {
+      tool: "run_command",
+      target: "cargo check",
+      revision: 3.9,
+    },
+    objectiveClosurePending: true,
   });
   assert.deepEqual(checkpoint?.pendingFiniteValidation, {
     command: "cargo check",
     cwd: "src-tauri",
     timeoutMs: 120000,
   });
+  assert.equal(checkpoint?.validationMutationReopenCount, 2);
+  assert.deepEqual(checkpoint?.validationMutationReopenFingerprints, ["edit:a", "edit:b"]);
+  assert.deepEqual(checkpoint?.objectiveMutationEvidence, [{
+    target: "src-tauri/src/main.rs",
+    requirementRef: "REQ-RUST",
+  }]);
+  assert.equal(checkpoint?.objectiveObligationId, "requirement:REQ-RUST");
+  assert.equal(checkpoint?.objectiveRevision, 3);
+  assert.equal(checkpoint?.objectiveKind, "requirement");
+  assert.deepEqual(checkpoint?.objectiveExpectedTargets, ["src-tauri/src/main.rs"]);
+  assert.deepEqual(checkpoint?.objectiveValidationEvidence, {
+    tool: "run_command",
+    target: "cargo check",
+    revision: 3,
+  });
+  assert.equal(checkpoint?.objectiveClosurePending, true);
   const contract = resolveExecuteRecoveryActionContract("validation_only", {
     expectedTarget: checkpoint?.expectedTarget,
     decisionCheckpoint: checkpoint,
@@ -4923,12 +5035,12 @@ test("segmented recovery reads use ordinary versioned cache eligibility without 
   );
 });
 
-test("validation reopens mutation once when the provider requested an edit tool", () => {
+test("validation reopens distinct edit obligations independently from generic recovery attempts", () => {
   const recoveryState = {
     mode: "validation_only",
     reason: "recovery_mutation_observed",
     expectedTarget: "src/main.js",
-    attempts: 1,
+    attempts: 2,
     phaseNoProgressCount: 0,
     protocolNoProgressCount: 0,
     protocolNoProgressFingerprint: null,
@@ -4940,18 +5052,130 @@ test("validation reopens mutation once when the provider requested an edit tool"
       sourceObservationKey: "src-main-v1",
       nextRequiredCapability: "validation",
       pendingFiniteValidation: { command: "npm test", cwd: "." },
+      objectiveMutationEvidence: [{ target: "src/main.js", requirementRef: "REQ-OPEN" }],
+      objectiveClosurePending: true,
     },
   };
-  assert.deepEqual(resolveValidationMutationReopen({
+  const first = resolveValidationMutationReopen({
     recoveryState,
     protocolViolation: "required_tool_call_not_available",
     protocolActualTools: ["replace_in_file"],
-  }), { requestedTools: ["replace_in_file"] });
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "replace-preview",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/main.js",
+        search_text: "renderEditor(oldValue)",
+        replace_text: "renderEditor(newValue)",
+      }),
+    }],
+  });
+  assert.deepEqual(first?.requestedTools, ["replace_in_file"]);
+  assert.deepEqual(first?.requestedTargets, ["src/main.js"]);
+  assert.match(first?.semanticFingerprints[0] || "", /tool:replace_in_file\|target:src\/main\.js\|locus:[0-9a-f]{8}/);
+
+  const spentState = {
+    ...recoveryState,
+    decisionCheckpoint: {
+      ...recoveryState.decisionCheckpoint,
+      validationMutationReopenCount: 1,
+      validationMutationReopenFingerprints: first.semanticFingerprints,
+    },
+  };
   assert.equal(resolveValidationMutationReopen({
-    recoveryState: { ...recoveryState, attempts: 2 },
+    recoveryState: spentState,
     protocolViolation: "required_tool_call_not_available",
     protocolActualTools: ["replace_in_file"],
-  }), null, "a second mutation/validation oscillation stays bounded");
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "replace-preview-again",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/main.js",
+        search_text: "renderEditor(oldValue)",
+        replace_text: "renderEditor(newValue)",
+      }),
+    }],
+  }), null, "the same target and edit locus is a bounded semantic retry");
+
+  const sameFileDifferentLocus = resolveValidationMutationReopen({
+    recoveryState: spentState,
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "replace-label",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/main.js",
+        search_text: "createInitialDocument()",
+        replace_text: "restoreInitialDocumentIfNeeded()",
+      }),
+    }],
+  });
+  assert.deepEqual(sameFileDifferentLocus?.requestedTargets, ["src/main.js"]);
+  assert.notEqual(
+    sameFileDifferentLocus?.semanticFingerprints[0],
+    first.semanticFingerprints[0],
+    "a distinct locus in the same file remains executable",
+  );
+
+  const distinctTarget = resolveValidationMutationReopen({
+    recoveryState: {
+      ...spentState,
+      decisionCheckpoint: {
+        ...spentState.decisionCheckpoint,
+        validationMutationReopenCount: 2,
+        validationMutationReopenFingerprints: [
+          ...first.semanticFingerprints,
+          ...sameFileDifferentLocus.semanticFingerprints,
+        ],
+      },
+    },
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "replace-toolbar",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/components/toolbar.js",
+        search_text: "openDialog()",
+        replace_text: "openMarkdownDialog()",
+      }),
+    }],
+  });
+  assert.deepEqual(distinctTarget?.requestedTargets, ["src/components/toolbar.js"]);
+  assert.equal(distinctTarget?.budgetExhausted, false, "a third distinct edit remains executable");
+  assert.equal(MAX_VALIDATION_MUTATION_REOPENS, 8, "the hard safety fuse permits multi-part objectives");
+  const exhausted = resolveValidationMutationReopen({
+    recoveryState: {
+      ...spentState,
+      decisionCheckpoint: {
+        ...spentState.decisionCheckpoint,
+        validationMutationReopenCount: MAX_VALIDATION_MUTATION_REOPENS,
+        validationMutationReopenFingerprints: [
+          ...first.semanticFingerprints,
+          ...sameFileDifferentLocus.semanticFingerprints,
+          ...distinctTarget.semanticFingerprints,
+        ],
+      },
+    },
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "third-distinct-reopen",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/components/toolbar.js",
+        search_text: "openAnotherDialog()",
+        replace_text: "openFinalDialog()",
+      }),
+    }],
+  });
+  assert.equal(exhausted?.budgetExhausted, true, "the ninth distinct reopen is stopped by the hard safety fuse");
   assert.equal(resolveValidationMutationReopen({
     recoveryState,
     protocolViolation: "required_tool_call_missing",
@@ -4962,6 +5186,212 @@ test("validation reopens mutation once when the provider requested an edit tool"
     protocolViolation: "required_tool_call_not_available",
     protocolActualTools: ["read_file"],
   }), null);
+});
+
+test("validation target switches bind a fresh observation or require a missing-window read", () => {
+  const recoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src/main.js",
+    attempts: 2,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: "main-v1",
+    decisionCheckpoint: null,
+  };
+  const missing = resolveValidationMutationReopenTargetBinding({
+    recoveryState,
+    requestedTarget: "src/components/toolbar.js",
+    reusableObservation: null,
+  });
+  assert.equal(missing.mode, "patch_recovery_read");
+  assert.equal(missing.sourceObservationKey, null);
+  assert.deepEqual(missing.readLease, {
+    purpose: "missing_window",
+    target: "src/components/toolbar.js",
+    state: "available",
+  });
+
+  const observed = resolveValidationMutationReopenTargetBinding({
+    recoveryState,
+    requestedTarget: "src/components/toolbar.js",
+    reusableObservation: {
+      key: "toolbar-v2:1-80",
+      path: "src/components/toolbar.js",
+      requestSignature: "toolbar:1-80",
+      versionToken: "200:4",
+      requestedRange: { startLine: 1, endLine: 80, maxLines: 80 },
+    },
+  });
+  assert.equal(observed.mode, "mutation_first");
+  assert.equal(observed.sourceObservationKey, "toolbar-v2:1-80");
+  assert.equal(observed.readLease.state, "consumed");
+  assert.equal(observed.readLease.purpose, "context_restore");
+});
+
+test("objective audit defers a new-target mutation until a current source observation is active", async () => {
+  const missing = await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: ["src/components/toolbar.js"],
+    knownTargets: ["src/main.js"],
+    fileReadStates: new Map(),
+    managedAgentMessages: [],
+    workspace: "/workspace",
+    readMetadata: async () => null,
+  });
+  assert.deepEqual(missing, ["src/components/toolbar.js"]);
+
+  const newFileCreation = await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: ["src/components/new-panel.js"],
+    knownTargets: ["src/main.js"],
+    creationTargets: ["src/components/new-panel.js"],
+    fileReadStates: new Map(),
+    managedAgentMessages: [],
+    workspace: "/workspace",
+    probeMetadata: async () => ({ status: "absent", metadata: null }),
+  });
+  assert.deepEqual(
+    newFileCreation,
+    [],
+    "an explicitly requested, verified-absent file cannot require an impossible source read",
+  );
+
+  const existingWriteTarget = await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: ["src/components/new-panel.js"],
+    knownTargets: ["src/main.js"],
+    creationTargets: ["src/components/new-panel.js"],
+    fileReadStates: new Map(),
+    managedAgentMessages: [],
+    workspace: "/workspace",
+    probeMetadata: async (target) => ({
+      status: "exists",
+      metadata: { path: target, sizeBytes: 40, modifiedMs: 3 },
+    }),
+  });
+  assert.deepEqual(
+    existingWriteTarget,
+    ["src/components/new-panel.js"],
+    "write_file still requires a current source observation when its target already exists",
+  );
+
+  const unknownWriteTarget = await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: ["src/components/new-panel.js"],
+    knownTargets: ["src/main.js"],
+    creationTargets: ["src/components/new-panel.js"],
+    fileReadStates: new Map(),
+    managedAgentMessages: [],
+    workspace: "/workspace",
+    probeMetadata: async () => ({ status: "unknown", metadata: null }),
+  });
+  assert.deepEqual(
+    unknownWriteTarget,
+    ["src/components/new-panel.js"],
+    "an IPC or permission error is not proof that write_file has a new target",
+  );
+
+  const createOnlyPatchTarget = await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: ["src/components/new-panel.js"],
+    knownTargets: ["src/main.js"],
+    createOnlyTargets: ["src/components/new-panel.js"],
+    fileReadStates: new Map(),
+    managedAgentMessages: [],
+    workspace: "/workspace",
+    probeMetadata: async () => {
+      throw new Error("create-only targets do not use overwrite-capable metadata inference");
+    },
+  });
+  assert.deepEqual(createOnlyPatchTarget, []);
+
+  const movePatch = [
+    "*** Begin Patch",
+    "*** Update File: src/main.js",
+    "*** Move to: src/moved-main.js",
+    "*** End Patch",
+  ].join("\n");
+  const moveTargets = resolveWorkspaceMutationTargets("apply_patch", { patch: movePatch });
+  const moveCreationTargets = resolveWorkspaceMutationCreationTargets(
+    "apply_patch",
+    { patch: movePatch },
+  );
+  assert.deepEqual(moveTargets, ["src/main.js", "src/moved-main.js"]);
+  assert.deepEqual(moveCreationTargets, ["src/moved-main.js"]);
+  assert.deepEqual(
+    resolveWorkspaceMutationCreateOnlyTargets("apply_patch", { patch: movePatch }),
+    [],
+    "Move destinations require explicit absence proof and are not Add File create-only targets",
+  );
+  assert.deepEqual(await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: moveTargets,
+    knownTargets: ["src/main.js"],
+    creationTargets: moveCreationTargets,
+    fileReadStates: new Map(),
+    managedAgentMessages: [],
+    workspace: "/workspace",
+    probeMetadata: async () => ({ status: "absent", metadata: null }),
+  }), []);
+  assert.deepEqual(await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: moveTargets,
+    knownTargets: ["src/main.js"],
+    creationTargets: moveCreationTargets,
+    fileReadStates: new Map(),
+    managedAgentMessages: [],
+    workspace: "/workspace",
+    probeMetadata: async (target) => ({
+      status: "exists",
+      metadata: { path: target, sizeBytes: 20, modifiedMs: 1 },
+    }),
+  }), ["src/moved-main.js"]);
+
+  const source = "function openMarkdownDialog() {}";
+  const fileReadStates = new Map([["toolbar-window", {
+    signature: "toolbar-window",
+    path: "src/components/toolbar.js",
+    argsKey: "{}",
+    contentHash: "toolbar-hash",
+    contentLength: source.length,
+    sizeBytes: 120,
+    modifiedMs: 7,
+    modelContent: source,
+    updatedAt: 10,
+  }]]);
+  const reusable = await objectiveAuditTargetsMissingReadObservation({
+    mutationTargets: ["src/components/toolbar.js"],
+    knownTargets: ["src/main.js"],
+    fileReadStates,
+    managedAgentMessages: [{ role: "tool", content: source }],
+    workspace: "/workspace",
+    readMetadata: async (target) => ({
+      path: target,
+      sizeBytes: 120,
+      modifiedMs: 7,
+    }),
+  });
+  assert.deepEqual(reusable, []);
+});
+
+test("file metadata availability treats only an explicit not-found code as absence", async () => {
+  const previousInvoke = globalThis.mockIpcInvoke;
+  try {
+    globalThis.mockIpcInvoke = async () => {
+      throw new Error("FILE_METADATA_NOT_FOUND: No such file or directory");
+    };
+    assert.deepEqual(
+      await probeFileMetadataAvailability("src/new-file.ts", "/workspace"),
+      { status: "absent", metadata: null },
+    );
+
+    globalThis.mockIpcInvoke = async () => {
+      throw new Error("FILE_METADATA_UNAVAILABLE: Permission denied");
+    };
+    assert.deepEqual(
+      await probeFileMetadataAvailability("src/private.ts", "/workspace"),
+      { status: "unknown", metadata: null },
+    );
+  } finally {
+    globalThis.mockIpcInvoke = previousInvoke;
+  }
 });
 
 test("local stream invocation uses required-any instead of named function choice", () => {
@@ -4981,6 +5411,8 @@ test("recovery action cards retain the original turn objective and finite valida
       sourceObservationKey: "source-v1",
       nextRequiredCapability: "validation",
       pendingFiniteValidation: { command: "npm test", cwd: "." },
+      objectiveMutationEvidence: [{ target: "src/main.js", requirementRef: "REQ-OPEN" }],
+      objectiveClosurePending: true,
     },
   });
   const card = buildExecutionActionContractCard({
@@ -4992,4 +5424,79 @@ test("recovery action cards retain the original turn objective and finite valida
   assert.match(card, /turnObjective=Open the selected Markdown file/);
   assert.match(card, /validationCommand=npm test/);
   assert.match(card, /validationCwd=\./);
+  assert.match(card, /objectiveClosure=pending/);
+  assert.match(card, /mutationEvidence=src\/main\.js@REQ-OPEN/);
+});
+
+test("objective audit action cards restore the full surface and allow no-tool closure", () => {
+  const contract = resolveExecuteRecoveryActionContract("objective_audit", {
+    expectedTarget: "src/main.js",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "main-v2",
+      nextRequiredCapability: "any",
+      objectiveObligationId: "root:direct-edit",
+      objectiveRevision: 2,
+      objectiveKind: "root",
+      objectiveExpectedTargets: ["src/main.js"],
+      objectiveMutationEvidence: [{ target: "src/main.js" }],
+      objectiveValidationEvidence: {
+        tool: "run_command",
+        target: "npm test",
+        revision: 2,
+      },
+      objectiveClosurePending: true,
+    },
+  });
+  assert.equal(contract.allowsAllTools, true);
+  assert.deepEqual(contract.toolCallRequirement, { kind: "optional" });
+  const card = buildExecutionActionContractCard({
+    contract,
+    language: "en",
+    availableToolNames: ["read_file", "replace_in_file", "run_command"],
+    turnObjective: "Finish every requested Open File behavior.",
+  });
+  assert.match(card, /phase=objective_audit/);
+  assert.match(card, /full tool surface restored/i);
+  assert.match(card, /make no tool call and output the final user-facing conclusion summary/i);
+  assert.doesNotMatch(card, /Call one tool from availableTools/);
+
+  const validAuditState = {
+    mode: "objective_audit",
+    reason: "objective_closure_audit_required",
+    expectedTarget: "src/main.js",
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: null,
+    decisionCheckpoint: contract.decisionCheckpoint,
+  };
+  assert.equal(objectiveAuditHasCurrentClosureEvidence(validAuditState), true);
+  assert.equal(objectiveAuditHasCurrentClosureEvidence({
+    ...validAuditState,
+    decisionCheckpoint: {
+      ...validAuditState.decisionCheckpoint,
+      objectiveMutationEvidence: [],
+    },
+  }), false, "closurePending alone cannot synthesize missing mutation evidence");
+  assert.equal(objectiveAuditHasCurrentClosureEvidence({
+    ...validAuditState,
+    decisionCheckpoint: {
+      ...validAuditState.decisionCheckpoint,
+      objectiveExpectedTargets: ["src/main.js", "src/components/toolbar.js"],
+    },
+  }), false, "every expected target must have durable mutation evidence");
+  assert.equal(objectiveAuditHasCurrentClosureEvidence({
+    ...validAuditState,
+    decisionCheckpoint: {
+      ...validAuditState.decisionCheckpoint,
+      objectiveValidationEvidence: {
+        ...validAuditState.decisionCheckpoint.objectiveValidationEvidence,
+        revision: 1,
+      },
+    },
+  }), false, "validation from an older objective revision cannot close the audit");
 });

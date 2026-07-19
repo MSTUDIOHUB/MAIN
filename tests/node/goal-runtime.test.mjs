@@ -1443,6 +1443,17 @@ test("Goal continuation preserves the exact recovery contract snapshot across sl
       evidenceVersion: "v7",
       planTaskId: "task-toolbar",
       requirementRef: "REQ-TOOLBAR",
+      pendingFiniteValidation: { command: "npm test", cwd: "." },
+      validationMutationReopenCount: 2,
+      validationMutationReopenFingerprints: [
+        "tool:replace_in_file|target:src/toolbar.ts|locus:11111111|requirement:req-toolbar",
+        "tool:replace_in_file|target:src/toolbar.ts|locus:22222222|requirement:req-toolbar",
+      ],
+      objectiveMutationEvidence: [{
+        target: "src/toolbar.ts",
+        requirementRef: "REQ-TOOLBAR",
+      }],
+      objectiveClosurePending: true,
     },
   };
   const first = goalContinuity.createGoalContinuationState({

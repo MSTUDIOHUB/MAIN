@@ -36,8 +36,13 @@ export interface ApplyPatchPreview {
 export interface ApplyPatchIo {
   readFile: (path: string) => Promise<string>;
   writeFile: (path: string, content: string) => Promise<void>;
+  /** Atomically create a destination and fail if it already exists. */
+  writeNewFile?: (path: string, content: string) => Promise<void>;
   deletePath?: (path: string) => Promise<void>;
+  probePath?: (path: string) => Promise<ApplyPatchPathAvailability>;
 }
+
+export type ApplyPatchPathAvailability = "exists" | "absent" | "unknown";
 
 function normalizePatchPath(path: string): string {
   return String(path || "").replace(/\\/g, "/").replace(/^\.\//, "").trim();
@@ -284,6 +289,7 @@ function replaceFirstExact(content: string, oldText: string, newText: string): s
 export async function previewApplyPatch(
   patch: string,
   readFile: (path: string) => Promise<string>,
+  probePath?: (path: string) => Promise<ApplyPatchPathAvailability>,
 ): Promise<ApplyPatchPreview> {
   const parsed = parseApplyPatch(patch);
   if (!parsed.ok) return { ok: false, changes: [], error: parsed.error };
@@ -304,11 +310,41 @@ export async function previewApplyPatch(
     }
   };
 
+  const resolvePathAvailability = async (path: string): Promise<ApplyPatchPathAvailability> => {
+    if (probePath) {
+      try {
+        return await probePath(path);
+      } catch {
+        return "unknown";
+      }
+    }
+    try {
+      await readFile(path);
+      return "exists";
+    } catch {
+      return "absent";
+    }
+  };
+
   for (const operation of parsed.operations) {
     if (operation.kind === "add") {
-      const current = await readCurrent(operation.path);
-      if (current.existed) {
+      if (staged.has(operation.path)) {
+        return {
+          ok: false,
+          changes: [],
+          error: `Add File target is already used by this patch: ${operation.path}`,
+        };
+      }
+      const targetAvailability = await resolvePathAvailability(operation.path);
+      if (targetAvailability === "exists") {
         return { ok: false, changes: [], error: `Add File target already exists: ${operation.path}` };
+      }
+      if (targetAvailability === "unknown") {
+        return {
+          ok: false,
+          changes: [],
+          error: `Add File target availability could not be verified: ${operation.path}`,
+        };
       }
       const next = operation.content || "";
       if (!next) return { ok: false, changes: [], error: `Add File content is empty: ${operation.path}` };
@@ -342,15 +378,58 @@ export async function previewApplyPatch(
     if (next === current.content && !operation.newPath) {
       return { ok: false, changes: [], error: `Patch would not change ${operation.path}.` };
     }
-    staged.set(operation.path, operation.newPath ? null : next);
-    if (operation.newPath) staged.set(operation.newPath, next);
-    changes.push({
-      path: operation.newPath || operation.path,
-      kind: "update",
-      oldContent: current.content,
-      newContent: next,
-      existed: true,
-    });
+    if (operation.newPath) {
+      if (staged.has(operation.newPath)) {
+        return {
+          ok: false,
+          changes: [],
+          error: `Move destination is already used by this patch: ${operation.newPath}`,
+        };
+      }
+      const destinationAvailability = await resolvePathAvailability(operation.newPath);
+      if (destinationAvailability === "exists") {
+        return {
+          ok: false,
+          changes: [],
+          error: `Move destination already exists: ${operation.newPath}`,
+        };
+      }
+      if (destinationAvailability === "unknown") {
+        return {
+          ok: false,
+          changes: [],
+          error: `Move destination availability could not be verified: ${operation.newPath}`,
+        };
+      }
+      staged.set(operation.path, null);
+      staged.set(operation.newPath, next);
+      // Write the verified-new destination before deleting the source. The
+      // executor preflights every change first, so an existing destination
+      // rejects the whole patch without any partial mutation.
+      changes.push({
+        path: operation.newPath,
+        kind: "add",
+        oldContent: "",
+        newContent: next,
+        existed: false,
+      });
+      changes.push({
+        path: operation.path,
+        kind: "delete",
+        oldContent: current.content,
+        newContent: "",
+        existed: true,
+      });
+    } else {
+      staged.set(operation.path, next);
+      changes.push({
+        path: operation.path,
+        kind: "update",
+        oldContent: current.content,
+        newContent: next,
+        existed: true,
+      });
+    }
   }
 
   if (changes.length === 0 || changes.every((change) => change.oldContent === change.newContent)) {
@@ -364,12 +443,29 @@ export async function applyWorkspacePatch(
   patch: string,
   io: ApplyPatchIo,
 ): Promise<ApplyPatchPreview> {
-  const preview = await previewApplyPatch(patch, io.readFile);
+  const preview = await previewApplyPatch(patch, io.readFile, io.probePath);
   if (!preview.ok) return preview;
+  if (preview.changes.some((change) => change.kind === "delete") && !io.deletePath) {
+    const firstDelete = preview.changes.find((change) => change.kind === "delete");
+    return {
+      ok: false,
+      changes: [],
+      error: `Delete File is not supported for ${firstDelete?.path || "this patch"}.`,
+    };
+  }
+  if (preview.changes.some((change) => change.kind === "add") && !io.writeNewFile) {
+    const firstAdd = preview.changes.find((change) => change.kind === "add");
+    return {
+      ok: false,
+      changes: [],
+      error: `Atomic Add File is not supported for ${firstAdd?.path || "this patch"}.`,
+    };
+  }
   for (const change of preview.changes) {
     if (change.kind === "delete") {
-      if (!io.deletePath) return { ok: false, changes: [], error: `Delete File is not supported for ${change.path}.` };
-      await io.deletePath(change.path);
+      await io.deletePath!(change.path);
+    } else if (change.kind === "add") {
+      await io.writeNewFile!(change.path, change.newContent);
     } else {
       await io.writeFile(change.path, change.newContent);
     }

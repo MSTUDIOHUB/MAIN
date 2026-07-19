@@ -12,7 +12,7 @@ import {
   logAgentEvent,
   looksLikeRepairExecutionRequest,
   resolveEffectiveToolProtocol,
-  resolveModelProtocolProfile,
+  resolveRuntimeProtocolProfile,
   runLifecycleHooks,
   shouldUseXmlToolProtocol,
 } from "../../orchestrator";
@@ -40,7 +40,6 @@ import {
 import { generateId } from "../../utils";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import { formatWebResearchLocalDate } from "../../webResearchGuard";
-import { createProbeRunner, runModelProbe } from "../../modelProbe";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
   appendVisualObservationProtocol,
@@ -57,7 +56,7 @@ export interface AgentLoopRuntimeState {
   effectiveToolProtocol: ReturnType<typeof resolveEffectiveToolProtocol>;
   compatibilityForcedAtStart: boolean | undefined;
   nativeToolsEnabled: boolean;
-  modelProtocolProfile: ReturnType<typeof resolveModelProtocolProfile>;
+  runtimeProtocolProfile: ReturnType<typeof resolveRuntimeProtocolProfile>;
   reasoningPolicy: ReturnType<typeof resolveReasoningPolicy>;
   workspace: string;
   mainModeKey: MainModeKey;
@@ -144,7 +143,7 @@ export async function prepareAgentLoopRuntimeState(
     initialMessages,
     compatibilityForcedAtStart,
   );
-  const modelProtocolProfile = resolveModelProtocolProfile({
+  const runtimeProtocolProfile = resolveRuntimeProtocolProfile({
     activeProfile: config.activeProfile,
     provider: settings.provider,
     model: settings.model,
@@ -154,7 +153,7 @@ export async function prepareAgentLoopRuntimeState(
   });
   const reasoningPolicy = resolveReasoningPolicy({
     activeProfile: config.activeProfile,
-    requestedMode: modelProtocolProfile.reasoning,
+    requestedMode: runtimeProtocolProfile.reasoning,
     reasoningRequest: config.activeProfile === "cloud" ? "auto" : "off",
     reasoningDisplay: config.reasoningDisplay,
     reasoningEffort: settings.reasoningEffort,
@@ -170,7 +169,7 @@ export async function prepareAgentLoopRuntimeState(
     effectiveToolProtocol,
     compatibilityForcedAtStart,
     nativeToolsEnabled,
-    modelProtocolProfile,
+    runtimeProtocolProfile,
     reasoningPolicy,
     workspace: config.workspace,
     mainModeKey: callbacks.getMainModeKey(),
@@ -290,7 +289,7 @@ export function createSystemPromptApplier(input: {
     settings,
     effectiveToolProtocol,
     compatibilityForcedAtStart,
-    modelProtocolProfile,
+    runtimeProtocolProfile,
     workspace,
     mainModeKey,
     workspaceTree,
@@ -359,9 +358,9 @@ export function createSystemPromptApplier(input: {
       config.activeProfile,
       settings.provider || "",
       settings.model || "",
-      modelProtocolProfile.providerFamily,
-      modelProtocolProfile.reasoning,
-      modelProtocolProfile.notes.join(","),
+      runtimeProtocolProfile.providerFamily,
+      runtimeProtocolProfile.reasoning,
+      runtimeProtocolProfile.notes.join(","),
       toolSchemaFingerprint,
       visualObservationRequest?.turnId || "no-visual-turn",
       visualObservationRequest?.imageCount || 0,
@@ -425,7 +424,6 @@ export function createSystemPromptApplier(input: {
           callbacks.getMessages(),
           compatibilityForcedAtStart,
         ),
-        modelProtocolNotes: modelProtocolProfile.notes,
         toolDefinitions: tools,
       },
       effectiveTurnContract,
@@ -644,25 +642,6 @@ export function createTaskTargetingRuntime(input: {
   };
 }
 
-export function startModelProbeForTurn(settings: StreamSettings): void {
-  if (!settings.model || !settings.provider || !settings.baseUrl) return;
-  const probeRunner = createProbeRunner(
-    settings.provider,
-    settings.model,
-    settings.baseUrl,
-    settings.apiKey ?? "",
-  );
-  setTimeout(() => {
-    runModelProbe(probeRunner, settings.model!, settings.provider!)
-      .then(() => {
-        // Results are already cached inside runModelProbe.
-      })
-      .catch(() => {
-        // Probe failed; heuristic fallback will be used.
-      });
-  }, 0);
-}
-
 export function createTurnEventEmitter(callbacks: OrchestratorCallbacks): TurnEventEmitter {
   const eventThreadId = callbacks.getSessionKey() || "default";
   const eventTurnId = callbacks.getCurrentTurnId?.() || generateId();
@@ -858,7 +837,7 @@ export function emitInitialTurnPreparationEvents(input: {
   const {
     config,
     effectiveToolProtocol,
-    modelProtocolProfile,
+    runtimeProtocolProfile,
     nativeToolsEnabled,
     reasoningPolicy,
     settings,
@@ -970,12 +949,12 @@ export function emitInitialTurnPreparationEvents(input: {
     provider: settings.provider,
     nativeToolsEnabled,
     toolProtocol: effectiveToolProtocol,
-    modelProtocolToolProtocol: modelProtocolProfile.toolProtocol,
-    modelProtocolReasoning: modelProtocolProfile.reasoning,
+    runtimeProtocolToolProtocol: runtimeProtocolProfile.toolProtocol,
+    runtimeProtocolReasoning: runtimeProtocolProfile.reasoning,
     reasoningPolicyMode: reasoningPolicy.mode,
     reasoningDisplay: reasoningPolicy.display,
     reasoningReplayInContext: reasoningPolicy.replayInContext,
-    providerFamily: modelProtocolProfile.providerFamily,
+    providerFamily: runtimeProtocolProfile.providerFamily,
     xmlToolsEnabled: true,
   });
   logAgentEvent("reasoning_policy_applied", {
@@ -984,7 +963,7 @@ export function emitInitialTurnPreparationEvents(input: {
     display: reasoningPolicy.display,
     replayInContext: reasoningPolicy.replayInContext,
     maxHiddenChars: reasoningPolicy.maxHiddenChars,
-    providerFamily: modelProtocolProfile.providerFamily,
+    providerFamily: runtimeProtocolProfile.providerFamily,
     activeProfile: config.activeProfile,
   });
 }

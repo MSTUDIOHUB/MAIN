@@ -57,6 +57,7 @@ export function handleAssistantNoToolRecovery(input: {
   isCloudProfile: boolean;
   iterationToolCount: number;
   llmToolCount: number;
+  forceXmlTools: boolean;
   pseudoToolCallPlaceholder: boolean;
   pseudoToolNameCandidate: string | null;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
@@ -114,7 +115,7 @@ export function handleAssistantNoToolRecovery(input: {
       iteration: input.iteration,
       allTools: input.iterationToolCount,
       llmTools: input.llmToolCount,
-      xmlToolsEnabled: true,
+      xmlToolsEnabled: input.forceXmlTools,
       visibleChars: input.userVisibleText.length,
     });
     input.callbacks.onStatusChange("running");
@@ -123,6 +124,7 @@ export function handleAssistantNoToolRecovery(input: {
       content: buildToolUnavailableRecoveryPrompt(
         MODEL_CONTROL_LANGUAGE,
         input.workflowMode,
+        input.forceXmlTools,
       ),
     });
     return {
@@ -150,6 +152,7 @@ export function handleAssistantNoToolRecovery(input: {
       content: buildPseudoToolCallRecoveryPrompt(
         MODEL_CONTROL_LANGUAGE,
         input.workflowMode,
+        input.forceXmlTools,
       ),
     });
     return {
@@ -173,6 +176,7 @@ export function handleAssistantNoToolRecovery(input: {
       buildToolProtocolDoomLoopStopMessage(
         input.callbacks.getPreferredLanguage(),
         route.messageToolName,
+        input.forceXmlTools,
       ),
       "missing_tool_loop",
     );

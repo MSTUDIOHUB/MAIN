@@ -38,7 +38,7 @@
 1294:function summarizeReplyOptionsForLog(replyOptions: ReplyOption[], limit = 4) {
 1470:function deriveStreamSettings(config: AppConfig): StreamSettings {
 1512:function resolveEffectiveToolProtocol(config: AppConfig, settings: StreamSettings) {
-1518:export function resolveModelProtocolProfile(input: {
+1518:export function resolveRuntimeProtocolProfile(input: {
 1569:function shouldUseXmlToolProtocol(
 1589:function prepareMessagesForToolProtocol(
 1601:function getToolTarget(name: string, args: Record<string, unknown>): string {

@@ -18,11 +18,16 @@ import {
   shouldCompactProseCodeDump,
 } from "../../orchestrator";
 import { buildPlanFallbackNotice } from "../../orchestrator/planOrchestration";
+import {
+  isSubstantiveModelFeedback,
+  shouldRetainStageSummary,
+} from "../../modelFeedbackDedupe";
 import type { PlanStage, ReplyOption } from "../../workflowModels";
 
 export interface AssistantTurnDisplayDecision {
   compactedProseCodeDump: boolean;
   compactedIncompletePlanText: boolean;
+  subagentSubstantiveFinalReport: boolean;
   autoContinueReadOnlyPermission: boolean;
   suppressReadOnlyPermissionOptionsForToolCalls: boolean;
   suppressTruncatedReadOnlyPermissionOptions: boolean;
@@ -62,6 +67,8 @@ export function resolveAssistantTurnDisplayDecision(input: {
   sawPlanModeToolActivity: boolean;
   sawExecuteOperationEvidence: boolean;
   readOnlyAutoApproveForSession: boolean;
+  isSubagentTurn?: boolean;
+  hasPriorToolEvidence?: boolean;
   language: "zh" | "en";
 }): AssistantTurnDisplayDecision {
   const isExecutionRuntime =
@@ -110,9 +117,24 @@ export function resolveAssistantTurnDisplayDecision(input: {
     input.effectiveToolCallCount === 0 &&
     input.normalizedFinishReason === "length" &&
     sourceVisibleText.trim().length > 1200;
+  const subagentReportWithoutPermissionPrompt = input.isSubagentTurn
+    ? stripReadOnlyPermissionPrompt(sourceVisibleText).trim()
+    : "";
+  const subagentSubstantiveFinalReport =
+    input.isSubagentTurn === true &&
+    input.effectiveToolCallCount === 0 &&
+    input.normalizedFinishReason === "stop" &&
+    (
+      shouldRetainStageSummary(subagentReportWithoutPermissionPrompt) ||
+      (
+        input.hasPriorToolEvidence === true &&
+        isSubstantiveModelFeedback(subagentReportWithoutPermissionPrompt)
+      )
+    );
   const autoContinueReadOnlyPermission =
     input.effectiveToolCallCount === 0 &&
     !compactedProseCodeDump &&
+    !subagentSubstantiveFinalReport &&
     shouldAutoContinueReadOnlyPermission({
       replyOptions: normalizedReplyOptions,
       readOnlyAutoApproveForSession: input.readOnlyAutoApproveForSession,
@@ -127,6 +149,7 @@ export function resolveAssistantTurnDisplayDecision(input: {
     input.normalizedFinishReason === "length" &&
     hasOnlyReadOnlyPermissionReplyOptions(normalizedReplyOptions);
   const suppressReadOnlyPermissionOptions =
+    subagentSubstantiveFinalReport ||
     autoContinueReadOnlyPermission ||
     suppressReadOnlyPermissionOptionsForToolCalls ||
     suppressTruncatedReadOnlyPermissionOptions;
@@ -201,6 +224,7 @@ export function resolveAssistantTurnDisplayDecision(input: {
   return {
     compactedProseCodeDump,
     compactedIncompletePlanText,
+    subagentSubstantiveFinalReport,
     autoContinueReadOnlyPermission,
     suppressReadOnlyPermissionOptionsForToolCalls,
     suppressTruncatedReadOnlyPermissionOptions,

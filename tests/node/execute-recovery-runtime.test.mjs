@@ -129,6 +129,16 @@ test("execute recovery state restores forced edit and approved-Plan continuation
         sourceObservationKey: "src/App.tsx@version-2:20-40",
         nextRequiredCapability: "targeted_read",
         evidenceVersion: "ledger-7",
+        validationMutationReopenCount: 2,
+        validationMutationReopenFingerprints: [
+          "tool:replace_in_file|target:src/app.tsx|locus:11111111",
+          "tool:replace_in_file|target:src/app.tsx|locus:22222222",
+        ],
+        objectiveMutationEvidence: [{
+          target: "src/App.tsx",
+          requirementRef: "REQ-APP",
+        }],
+        objectiveClosurePending: true,
       },
     },
   });
@@ -143,6 +153,13 @@ test("execute recovery state restores forced edit and approved-Plan continuation
   assert.equal(restoredTransaction.sourceObservationKey, "src/App.tsx@version-2:20-40");
   assert.equal(restoredTransaction.decisionCheckpoint?.evidenceVersion, "ledger-7");
   assert.equal(restoredTransaction.decisionCheckpoint?.nextRequiredCapability, "validation");
+  assert.equal(restoredTransaction.decisionCheckpoint?.validationMutationReopenCount, 2);
+  assert.equal(restoredTransaction.decisionCheckpoint?.validationMutationReopenFingerprints?.length, 2);
+  assert.deepEqual(restoredTransaction.decisionCheckpoint?.objectiveMutationEvidence, [{
+    target: "src/App.tsx",
+    requirementRef: "REQ-APP",
+  }]);
+  assert.equal(restoredTransaction.decisionCheckpoint?.objectiveClosurePending, true);
 
   const restoredApprovedPlanTransaction = createExecuteRecoveryRuntimeState({
     workflowMode: "plan",
@@ -331,17 +348,153 @@ test("execute recovery transaction advances a missing-window read to mutation an
   assert.equal(mutation.state.attempts, attempts);
   assert.equal(mutation.state.readLease, null);
   assert.equal(mutation.state.decisionCheckpoint?.nextRequiredCapability, "validation");
+  assert.equal(mutation.state.decisionCheckpoint?.objectiveClosurePending, true);
+  assert.deepEqual(mutation.state.decisionCheckpoint?.objectiveMutationEvidence, [{
+    target: "src/App.tsx",
+  }]);
   state = mutation.state;
 
   const verified = transitionExecuteRecoveryRuntimeState(state, {
     validationTarget: "npm test",
     validationToolName: "run_command",
   });
-  assert.equal(verified.transition, "validation_to_normal");
+  assert.equal(verified.transition, "validation_to_objective_audit");
   assert.equal(verified.target, "src/App.tsx", "validation keeps the transaction target instead of its command label");
-  assert.equal(verified.state.mode, "normal");
-  assert.equal(verified.state.expectedTarget, null);
-  assert.equal(verified.state.attempts, 0);
+  assert.equal(verified.state.mode, "objective_audit");
+  assert.equal(verified.state.expectedTarget, "src/App.tsx");
+  assert.equal(verified.state.decisionCheckpoint?.objectiveKind, "root");
+  assert.equal(verified.state.decisionCheckpoint?.objectiveRevision, 1);
+  assert.deepEqual(verified.state.decisionCheckpoint?.objectiveValidationEvidence, {
+    tool: "run_command",
+    target: "npm test",
+    revision: 1,
+  });
+
+  const furtherMutation = transitionExecuteRecoveryRuntimeState(verified.state, {
+    mutationTarget: "src/App.tsx",
+  });
+  assert.equal(furtherMutation.transition, "mutation_to_validation");
+  assert.equal(furtherMutation.state.mode, "validation_only");
+  assert.equal(furtherMutation.state.decisionCheckpoint?.objectiveRevision, 2);
+  assert.equal(furtherMutation.state.decisionCheckpoint?.objectiveValidationEvidence, null);
+});
+
+test("Direct Edit preserves exact mutation evidence while reopening a distinct target", () => {
+  let state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "mutation_first",
+      reason: "direct_edit_recovery",
+      expectedTarget: "src/main.js",
+      decisionCheckpoint: {
+        expectedTarget: "src/main.js",
+        sourceObservationKey: "main-v1",
+        nextRequiredCapability: "mutation",
+        requirementRef: "REQ-OPEN-FILE",
+        pendingFiniteValidation: { command: "npm test", cwd: "." },
+      },
+    },
+  );
+  state = transitionExecuteRecoveryRuntimeState(state, {
+    mutationTarget: "src/main.js",
+  }).state;
+  assert.equal(state.mode, "validation_only");
+  assert.deepEqual(state.decisionCheckpoint?.objectiveMutationEvidence, [{
+    target: "src/main.js",
+    requirementRef: "REQ-OPEN-FILE",
+  }]);
+
+  state = activateExecuteRecoveryRuntimeState(state, {
+    mode: "patch_recovery_read",
+    reason: "validation_followup_mutation_requested",
+    expectedTarget: "src/components/toolbar.js",
+    sourceObservationKey: null,
+    readLease: {
+      purpose: "missing_window",
+      target: "src/components/toolbar.js",
+      state: "available",
+    },
+    decisionCheckpoint: {
+      expectedTarget: "src/components/toolbar.js",
+      sourceObservationKey: null,
+      nextRequiredCapability: "targeted_read",
+      requirementRef: "REQ-OPEN-FILE",
+      pendingFiniteValidation: { command: "npm test", cwd: "." },
+      validationMutationReopenCount: 1,
+      validationMutationReopenFingerprints: [
+        "tool:replace_in_file|target:src/components/toolbar.js|locus:12345678",
+      ],
+      objectiveMutationEvidence: state.decisionCheckpoint?.objectiveMutationEvidence,
+      objectiveClosurePending: true,
+    },
+  });
+  assert.equal(state.mode, "patch_recovery_read");
+  assert.equal(state.expectedTarget, "src/components/toolbar.js");
+  assert.deepEqual(state.decisionCheckpoint?.pendingFiniteValidation, {
+    command: "npm test",
+    cwd: ".",
+  });
+
+  state = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/components/toolbar.js",
+    sourceObservationKey: "toolbar-v1",
+    sourceObservedVersion: "100:2",
+  }).state;
+  assert.equal(state.mode, "mutation_first");
+  assert.equal(state.readLease?.state, "consumed");
+
+  state = transitionExecuteRecoveryRuntimeState(state, {
+    mutationTarget: "Workspace patch",
+    mutationTargets: [
+      "src/components/toolbar.js",
+      "src/components/preview.js",
+    ],
+  }).state;
+  assert.equal(state.mode, "validation_only");
+  assert.deepEqual(state.decisionCheckpoint?.objectiveMutationEvidence, [{
+    target: "src/main.js",
+    requirementRef: "REQ-OPEN-FILE",
+  }, {
+    target: "src/components/toolbar.js",
+    requirementRef: "REQ-OPEN-FILE",
+  }, {
+    target: "src/components/preview.js",
+    requirementRef: "REQ-OPEN-FILE",
+  }]);
+  assert.equal(state.decisionCheckpoint?.validationMutationReopenCount, 1);
+  assert.equal(state.decisionCheckpoint?.objectiveClosurePending, true);
+
+  const verified = transitionExecuteRecoveryRuntimeState(state, {
+    validationTarget: "npm test",
+    validationToolName: "run_command",
+  });
+  assert.equal(verified.transition, "validation_to_normal");
+  assert.equal(verified.state.mode, "normal", "structured requirement target coverage closes after validation");
+});
+
+test("an unrelated title mutation plus successful validation cannot close a Direct Edit root objective", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "mutation_first",
+      reason: "direct_edit_recovery",
+      expectedTarget: "src/main.js",
+    },
+  );
+  const titleOnlyMutation = transitionExecuteRecoveryRuntimeState(state, {
+    mutationTarget: "src/main.js",
+    mutationTargets: ["src/main.js"],
+  });
+  assert.equal(titleOnlyMutation.state.decisionCheckpoint?.objectiveKind, "root");
+  assert.equal(titleOnlyMutation.state.decisionCheckpoint?.objectiveClosurePending, true);
+
+  const validation = transitionExecuteRecoveryRuntimeState(titleOnlyMutation.state, {
+    validationTarget: "npm test",
+    validationToolName: "run_command",
+  });
+  assert.equal(validation.transition, "validation_to_objective_audit");
+  assert.equal(validation.state.mode, "objective_audit");
+  assert.equal(validation.state.decisionCheckpoint?.objectiveClosurePending, true);
 });
 
 test("failed-process recovery accepts a bounded target repair before returning to validation", () => {
@@ -506,8 +659,8 @@ test("recovery no-progress budget resets only for fresh phase evidence", () => {
     validationTarget: "npm test",
     validationToolName: "run_command",
   });
-  assert.equal(validation.transition, "validation_to_normal");
-  assert.equal(validation.state.mode, "normal");
+  assert.equal(validation.transition, "validation_to_objective_audit");
+  assert.equal(validation.state.mode, "objective_audit");
   assert.equal(validation.state.phaseNoProgressCount, 0);
 });
 

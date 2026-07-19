@@ -3,6 +3,7 @@ import {
   normalizeToolParametersSchema,
   type ToolDefinition,
 } from "./toolSchemas";
+import { buildToolProtocolCard } from "./systemPrompt";
 import {
   buildContextMemoryState,
   contextMemoryContentToText,
@@ -150,9 +151,22 @@ export interface OpenAiResponsesProbeRequestCandidate {
   body: Record<string, unknown>;
 }
 
-export interface ModelInstructionProfile {
-  provider: "openai" | "anthropic" | "qwen" | "deepseek" | "kimi" | "gemma" | "generic";
-  visibleLanguage: "follow_user" | "localized";
+export type OpenAiResponsesTerminalStatus =
+  | "completed"
+  | "failed"
+  | "incomplete"
+  | "in_progress"
+  | "unknown";
+
+export interface OpenAiResponsesTerminalState {
+  status: OpenAiResponsesTerminalStatus;
+  error: string | null;
+  incompleteReason: string | null;
+}
+
+export interface ProtocolInstructionProfile {
+  provider: "openai" | "anthropic" | "gemini" | "generic";
+  visibleLanguage: "follow_user";
   reasoning: ModelReasoningMode;
   toolProtocolPreference: CloudToolProtocol;
   noiseRules: string[];
@@ -420,17 +434,12 @@ export function resolveEffectiveCloudApiFormat(options: {
   return normalizeCloudApiFormat(options.apiFormat);
 }
 
-export function getModelInstructionProfile(input: {
+export function getProtocolInstructionProfile(input: {
   protocol?: unknown;
-  provider?: unknown;
-  model?: unknown;
-}): ModelInstructionProfile {
+}): ProtocolInstructionProfile {
   const protocol = normalizeCloudProtocol(input.protocol);
-  const providerText = String(input.provider || "").toLowerCase();
-  const modelText = String(input.model || "").toLowerCase();
-  const haystack = `${providerText} ${modelText}`;
 
-  if (protocol === "anthropic" || /claude|anthropic/.test(haystack)) {
+  if (protocol === "anthropic") {
     return {
       provider: "anthropic",
       visibleLanguage: "follow_user",
@@ -443,62 +452,9 @@ export function getModelInstructionProfile(input: {
     };
   }
 
-  if (/qwen|qwq/.test(haystack)) {
+  if (protocol === "gemini") {
     return {
-      provider: "qwen",
-      visibleLanguage: "localized",
-      reasoning: "passive_hidden",
-      toolProtocolPreference: "auto",
-      noiseRules: [
-        "Fold reasoning_content into hidden metadata; do not ask the model to output thinking tags.",
-        "Suppress repeated XML tool tags from visible text.",
-      ],
-    };
-  }
-
-  if (/gemma/.test(haystack)) {
-    return {
-      provider: "gemma",
-      visibleLanguage: "localized",
-      reasoning: "passive_hidden",
-      toolProtocolPreference: "auto",
-      noiseRules: [
-        "Fold `thought`, `thinking`, `reasoning`, and `reasoning_content` fields or labels into hidden metadata.",
-        "Do not expose bare `thought:` prefixes in the assistant body or use hidden tags as an action channel.",
-        "If a tool is needed, emit the actual tool call instead of prose saying `I will use read_file`.",
-      ],
-    };
-  }
-
-  if (/deepseek/.test(haystack)) {
-    return {
-      provider: "deepseek",
-      visibleLanguage: "localized",
-      reasoning: "passive_hidden",
-      toolProtocolPreference: "auto",
-      noiseRules: [
-        "Treat reasoning deltas as hidden metadata and do not replay them as context.",
-        "Collapse duplicate assistant prefixes.",
-      ],
-    };
-  }
-
-  if (/kimi|moonshot/.test(haystack)) {
-    return {
-      provider: "kimi",
-      visibleLanguage: "localized",
-      reasoning: "disabled",
-      toolProtocolPreference: "xml",
-      noiseRules: [
-        "Prefer XML tools on gateways with weak function-calling compatibility.",
-        "Remove duplicated tool prose from visible answers.",
-      ],
-    };
-  }
-
-  if (protocol === "gemini" || /gemini|google/.test(haystack)) {
-    return {
-      provider: "generic",
+      provider: "gemini",
       visibleLanguage: "follow_user",
       reasoning: "disabled",
       toolProtocolPreference: "xml",
@@ -510,9 +466,9 @@ export function getModelInstructionProfile(input: {
   }
 
   return {
-    provider: protocol === "openai" ? "openai" : "generic",
+    provider: "openai",
     visibleLanguage: "follow_user",
-    reasoning: protocol === "openai" ? "passive_hidden" : "disabled",
+    reasoning: "passive_hidden",
     toolProtocolPreference: "auto",
     noiseRules: [
       "Separate visible text, hidden reasoning metadata, and tool calls before rendering.",
@@ -1001,13 +957,18 @@ export function compactCloudResponsesMessages(
   ];
 }
 
+export type CompactResponsesToolProtocol = "native" | "xml" | "none";
+
 export function compactCloudResponsesInstructions(
   instructions: string | undefined,
-  options: Pick<CloudResponsesMessageCompactionOptions, "aggressive"> = {},
+  options: Pick<CloudResponsesMessageCompactionOptions, "aggressive"> & {
+    toolProtocol?: CompactResponsesToolProtocol;
+    toolDefinitions?: ToolDefinition[];
+  } = {},
 ): string | undefined {
   if (!instructions) return undefined;
   const maxChars = options.aggressive ? 3000 : CLOUD_RESPONSES_INSTRUCTION_MAX_CHARS;
-  if (!options.aggressive && instructions.length <= maxChars) return instructions;
+  if (!options.aggressive && instructions.length <= maxChars && !options.toolProtocol) return instructions;
 
   // Visual observations are an execution contract, not ordinary prompt
   // prose. If compaction keeps the image but drops this block, transport can
@@ -1019,31 +980,63 @@ export function compactCloudResponsesInstructions(
     .map((match) => String(match[0] || "").trim())
     .filter(Boolean);
   const protectedVisualProtocol = visualProtocolBlocks[visualProtocolBlocks.length - 1] || "";
-  const compactableInstructions = instructions.replace(visualProtocolPattern, "");
+  const toolProtocolPattern = /(?:^|\n)\[TOOLS\]\n[\s\S]*?(?=\n\n\[[A-Z0-9 _():/.-]+\]\n|$)/g;
+  const existingToolProtocolBlocks = [...instructions.matchAll(toolProtocolPattern)]
+    .map((match) => String(match[0] || "").trim())
+    .filter(Boolean);
+  const existingToolProtocol = existingToolProtocolBlocks[existingToolProtocolBlocks.length - 1] || "";
+  const compactableInstructions = instructions
+    .replace(visualProtocolPattern, "")
+    .replace(toolProtocolPattern, "");
   const lines = compactableInstructions.split(/\r?\n/);
   const keepPatterns = [
     /当前工作区|相对路径|workspace|工作区/i,
     /M Studio|Unity|游戏开发|教程|中文|Region|注释/i,
-    /工具调用格式|tool_use|<tool>|parameter|XML/i,
-    /write_file|replace_in_file|apply_patch|run_command|browser_evaluate|read_file|list_directory|get_project_skeleton|glob_search|grep_search|repo_map_search|repo_map_context/i,
-    /不要声称.*没有写入|写入工具可用|文件访问|工作区权限/i,
     /TURN INTENT|USER INTENT|执行|修复|实现|计划|报告/i,
     /AGENTS|WORKSPACE INSTRUCTIONS|rules|instructions/i,
   ];
-  const requiredToolReminder = options.aggressive
+  const compactReminder = options.aggressive
     ? [
         "[Cloud Gateway Compact Instructions]",
         "Answer using the compact transcript and ContextState only; keep output short to avoid gateway timeouts.",
-        "Tool access is available through XML <tool_use> calls. Use XML tools instead of saying files or write access are unavailable.",
-        "Key XML tools: read_file, grep_search, glob_search, write_file, replace_in_file, run_command.",
+        "Follow the retained [TOOLS] contract exactly. It is the sole source of truth for this request's protocol, names, and arguments.",
       ]
     : [
         "[Cloud Compact Instructions]",
         "Use concise responses and prefer small tool-driven steps to avoid cloud gateway timeouts.",
-        "Tool access is available through XML <tool_use> calls. Workspace read/write tools are available when the user asks for implementation.",
-        "Available key tools: repo_map_search, repo_map_context, get_project_skeleton, list_directory, read_file, glob_search, grep_search, apply_patch, write_file, replace_in_file, run_command, browser_evaluate.",
-        "Never claim write tools or folder access are unavailable; emit XML tool calls instead.",
+        "Follow the retained [TOOLS] contract exactly. Do not invent a protocol or capability that is absent from the current request.",
       ];
+  const activeToolDefinitions = options.toolDefinitions || [];
+  const activeToolNames = activeToolDefinitions.map((tool) => tool.function.name);
+  const generatedToolProtocol = options.toolProtocol === "xml" && activeToolDefinitions.length === 0 && existingToolProtocol
+    ? existingToolProtocol
+    : options.toolProtocol === "none"
+    ? [
+        "[TOOLS]",
+        "profile=cloud/openai-responses; protocol=none; available=none.",
+        "No tools are attached to this compact fallback. Do not emit pseudo calls or claim that a tool ran.",
+      ].join("\n")
+    : options.toolProtocol
+    ? buildToolProtocolCard({
+        activeProfile: "cloud",
+        provider: "openai-responses",
+        toolProtocol: options.toolProtocol,
+        nativeToolsEnabled: options.toolProtocol === "native",
+        availableToolNames: activeToolNames,
+        toolDefinitions: activeToolDefinitions,
+        descriptionMaxChars: options.aggressive ? 0 : 120,
+        language: "en",
+      })
+    : existingToolProtocol;
+
+  if (!options.aggressive && instructions.length <= maxChars && options.toolProtocol) {
+    const reconciled = existingToolProtocol
+      ? instructions.replace(toolProtocolPattern, (match) => (
+          match.startsWith("\n") ? `\n${generatedToolProtocol}` : generatedToolProtocol
+        ))
+      : `${instructions.trim()}\n\n${generatedToolProtocol}`;
+    return reconciled.trim();
+  }
 
   const keptLines: string[] = [];
   const seen = new Set<string>();
@@ -1057,16 +1050,18 @@ export function compactCloudResponsesInstructions(
     keptLines.push(trimmed);
   }
 
-  const compact = [
-    ...requiredToolReminder,
+  const protectedPrefix = [
+    ...compactReminder,
+    ...(generatedToolProtocol ? ["", generatedToolProtocol] : []),
     ...(protectedVisualProtocol ? ["", protectedVisualProtocol] : []),
-    "",
+  ].join("\n");
+  const compactSuffix = [
     ...keptLines,
-    "",
     `[Cloud compacted ${instructions.length} chars of system instructions to reduce 524 timeout risk.]`,
   ].join("\n");
-
-  return truncateTextForCloud(compact, maxChars);
+  const suffixBudget = Math.max(0, maxChars - protectedPrefix.length - 2);
+  if (suffixBudget === 0) return protectedPrefix;
+  return `${protectedPrefix}\n\n${truncateTextForCloud(compactSuffix, suffixBudget)}`.trim();
 }
 
 export function buildOpenAiResponsesInputCandidates(
@@ -1137,6 +1132,7 @@ export function buildOpenAiResponsesRequestCandidates(options: {
   compact?: boolean;
   compactionMode?: "standard" | "aggressive";
   includeTools?: boolean;
+  toolProtocol?: CompactResponsesToolProtocol;
   contextMemoryState?: ContextMemoryState | null;
   targetInputTokens?: number;
 }): OpenAiResponsesProbeRequestCandidate[] {
@@ -1149,13 +1145,22 @@ export function buildOpenAiResponsesRequestCandidates(options: {
       })
     : options.messages;
   const rawInstructions = extractOpenAiResponsesInstructions(protocolMessages);
-  const instructions = options.compact
-    ? compactCloudResponsesInstructions(rawInstructions, { aggressive })
-    : rawInstructions;
   const tools = options.includeTools === false ? [] : convertOpenAiToolsToResponses(options.tools);
 
   return buildOpenAiResponsesInputCandidates(protocolMessages).map((candidate) => {
     const candidateTools = candidate.mode !== "transcript_text" ? tools : [];
+    const candidateToolProtocol: CompactResponsesToolProtocol = options.toolProtocol === "xml"
+      ? "xml"
+      : candidateTools.length > 0 && options.toolProtocol !== "none"
+      ? "native"
+      : "none";
+    const instructions = options.compact
+      ? compactCloudResponsesInstructions(rawInstructions, {
+          aggressive,
+          toolProtocol: candidateToolProtocol,
+          toolDefinitions: options.tools,
+        })
+      : rawInstructions;
     return {
       mode: candidate.mode,
       body: {
@@ -1236,27 +1241,111 @@ export function ensureOpenAiChatGptCodexRequestBody(
   };
 }
 
-export function parseOpenAiResponsesSseText(streamText: string): string {
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function extractResponseErrorMessage(value: unknown): string | null {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const record = asRecord(value);
+  if (!record) return null;
+  for (const key of ["message", "detail", "code"] as const) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
+  }
+  return null;
+}
+
+/**
+ * Resolve the terminal state carried by an OpenAI Responses JSON object or an
+ * SSE terminal-event envelope. A missing status is intentionally `unknown` so
+ * older OpenAI-compatible JSON gateways remain usable; an explicit failure or
+ * incomplete response is never normalized to successful completion.
+ */
+export function resolveOpenAiResponsesTerminalState(payload: unknown): OpenAiResponsesTerminalState {
+  const envelope = asRecord(payload);
+  const nestedResponse = asRecord(envelope?.response);
+  const response = nestedResponse || envelope;
+  const rawStatus = String(response?.status ?? envelope?.status ?? "").trim().toLowerCase();
+  const status: OpenAiResponsesTerminalStatus = rawStatus === "completed"
+    ? "completed"
+    : rawStatus === "failed" || rawStatus === "cancelled" || rawStatus === "canceled"
+    ? "failed"
+    : rawStatus === "incomplete"
+    ? "incomplete"
+    : rawStatus === "in_progress" || rawStatus === "queued"
+    ? "in_progress"
+    : "unknown";
+  const incompleteDetails = asRecord(response?.incomplete_details ?? envelope?.incomplete_details);
+  const rawIncompleteReason = incompleteDetails?.reason;
+  const incompleteReason = typeof rawIncompleteReason === "string" && rawIncompleteReason.trim()
+    ? rawIncompleteReason.trim()
+    : null;
+  const error = extractResponseErrorMessage(response?.error)
+    || extractResponseErrorMessage(envelope?.error);
+  return { status, error, incompleteReason };
+}
+
+function mergeOpenAiResponsesStreamText(deltaText: string, snapshotText: string): string {
+  if (!deltaText) return snapshotText;
+  if (!snapshotText) return deltaText;
+  if (snapshotText === deltaText || snapshotText.startsWith(deltaText)) return snapshotText;
+  if (deltaText.startsWith(snapshotText) || deltaText.endsWith(snapshotText)) return deltaText;
+  return `${deltaText}${snapshotText}`;
+}
+
+/** Parse a complete Responses SSE body without discarding its terminal state. */
+export function parseOpenAiResponsesSsePayload(streamText: string): Record<string, unknown> {
   const lines = String(streamText || "").split(/\r?\n/);
   let eventName = "";
-  let text = "";
+  let deltaText = "";
+  let snapshotText = "";
+  let latestResponse: Record<string, unknown> | null = null;
+  let terminalEnvelope: Record<string, unknown> | null = null;
+  let terminalStatus: "completed" | "failed" | "incomplete" | null = null;
+
   const flushData = (rawData: string) => {
     const data = rawData.trim();
     if (!data || data === "[DONE]") return;
     try {
-      const payload = JSON.parse(data);
-      const delta = (payload as { delta?: unknown }).delta;
-      if (typeof delta === "string" && (eventName === "response.output_text.delta" || !eventName)) {
-        text += delta;
-        return;
+      const payload = asRecord(JSON.parse(data));
+      if (!payload) return;
+      const payloadType = typeof payload.type === "string" ? payload.type.trim() : "";
+      const effectiveEvent = eventName || payloadType;
+      const nestedResponse = asRecord(payload.response);
+      if (nestedResponse) latestResponse = nestedResponse;
+
+      const delta = payload.delta;
+      if (typeof delta === "string" && effectiveEvent === "response.output_text.delta") {
+        deltaText += delta;
       }
-      const outputText = (payload as { output_text?: unknown }).output_text;
-      if (typeof outputText === "string") {
-        text += outputText;
-        return;
+
+      if (effectiveEvent === "response.completed") terminalStatus = "completed";
+      if (effectiveEvent === "response.failed" || effectiveEvent === "response.cancelled") terminalStatus = "failed";
+      if (effectiveEvent === "response.incomplete") terminalStatus = "incomplete";
+      if (terminalStatus && (
+        effectiveEvent === "response.completed" ||
+        effectiveEvent === "response.failed" ||
+        effectiveEvent === "response.cancelled" ||
+        effectiveEvent === "response.incomplete"
+      )) {
+        terminalEnvelope = payload;
+        latestResponse = nestedResponse || payload;
       }
-      const responseText = extractOpenAiResponseText(payload, "responses");
-      if (responseText) text += responseText;
+
+      const candidatePayload = nestedResponse || payload;
+      const responseText = extractOpenAiResponseText(candidatePayload, "responses");
+      const directText = typeof payload.text === "string"
+        ? payload.text
+        : typeof payload.output_text === "string"
+        ? payload.output_text
+        : "";
+      const candidateSnapshot = responseText || directText;
+      if (candidateSnapshot && effectiveEvent !== "response.output_text.delta") {
+        snapshotText = candidateSnapshot;
+      }
     } catch {
       // Ignore malformed SSE data lines.
     }
@@ -1279,7 +1368,51 @@ export function parseOpenAiResponsesSseText(streamText: string): string {
     }
   }
   flushData(dataLines.join("\n"));
-  return text;
+
+  const resolvedLatestState = resolveOpenAiResponsesTerminalState(latestResponse);
+  if (!terminalStatus) {
+    if (resolvedLatestState.status === "completed") terminalStatus = "completed";
+    if (resolvedLatestState.status === "failed") terminalStatus = "failed";
+    if (resolvedLatestState.status === "incomplete") terminalStatus = "incomplete";
+  }
+
+  const outputText = mergeOpenAiResponsesStreamText(deltaText, snapshotText);
+  // Assignments made while flushing event blocks are opaque to TypeScript's
+  // outer control-flow analysis, so capture their runtime types explicitly.
+  const capturedResponse = latestResponse as Record<string, unknown> | null;
+  const capturedTerminalEnvelope = terminalEnvelope as Record<string, unknown> | null;
+  const result: Record<string, unknown> = capturedResponse ? { ...capturedResponse } : {};
+  if (capturedTerminalEnvelope && result.error == null && capturedTerminalEnvelope.error != null) {
+    result.error = capturedTerminalEnvelope.error;
+  }
+  if (capturedTerminalEnvelope && result.incomplete_details == null && capturedTerminalEnvelope.incomplete_details != null) {
+    result.incomplete_details = capturedTerminalEnvelope.incomplete_details;
+  }
+  if (terminalStatus) {
+    result.status = terminalStatus;
+  } else {
+    // Receiving EOF/[DONE] without a Responses terminal event is a transport
+    // truncation, not successful completion. Preserve any partial text while
+    // making the non-terminal state explicit to downstream orchestration.
+    result.status = "incomplete";
+    result.incomplete_details = { reason: "missing_terminal_event" };
+  }
+  if (outputText) result.output_text = outputText;
+  return result;
+}
+
+export function parseOpenAiResponsesSseText(streamText: string): string {
+  const payload = parseOpenAiResponsesSsePayload(streamText);
+  const terminal = resolveOpenAiResponsesTerminalState(payload);
+  if (terminal.status === "failed") {
+    throw new Error(`OPENAI_RESPONSES_FAILED: ${terminal.error || "The response failed before completion."}`);
+  }
+  if (terminal.status === "incomplete" || terminal.status === "in_progress") {
+    throw new Error(
+      `OPENAI_RESPONSES_INCOMPLETE: ${terminal.incompleteReason || "The response ended without a completed terminal event."}`,
+    );
+  }
+  return extractOpenAiResponseText(payload, "responses");
 }
 
 function mapGeminiRole(role: ProtocolChatMessage["role"]): "user" | "model" {

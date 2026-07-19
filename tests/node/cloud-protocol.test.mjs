@@ -64,7 +64,9 @@ const {
   buildOpenAiResponsesRequestCandidates,
   buildOpenAiResponsesProbeRequestCandidates,
   ensureOpenAiChatGptCodexRequestBody,
+  parseOpenAiResponsesSsePayload,
   parseOpenAiResponsesSseText,
+  resolveOpenAiResponsesTerminalState,
   buildOpenAiResponsesRequestExtras,
   buildOpenAiResponsesTranscript,
   buildGeminiGenerateContentUrl,
@@ -82,7 +84,7 @@ const {
   extractAnthropicResponseText,
   extractOpenAiResponseText,
   mapMessagesForAnthropic,
-  getModelInstructionProfile,
+  getProtocolInstructionProfile,
   resolveReasoningPolicy,
   getDefaultLocalProviderEndpoint,
   getDefaultLocalToolProtocol,
@@ -92,6 +94,48 @@ const {
   normalizeLocalToolProtocol,
   parseCloudCustomHeaders,
 } = await loadCloudProtocolModule();
+
+const compactReadTool = {
+  type: "function",
+  function: {
+    name: "read_file",
+    description: "Read one workspace file.",
+    parameters: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+    },
+  },
+};
+
+const compactWriteTool = {
+  type: "function",
+  function: {
+    name: "write_file",
+    description: "Write one workspace file.",
+    parameters: {
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        content: { type: "string" },
+      },
+      required: ["path", "content"],
+    },
+  },
+};
+
+const compactRunTool = {
+  type: "function",
+  function: {
+    name: "run_command",
+    description: "Run one finite workspace command.",
+    parameters: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+    },
+  },
+};
 
 const orchestratorModuleCache = new Map();
 
@@ -136,7 +180,10 @@ function loadOrchestratorModule() {
   return loadOrchestratorTsModule(path.join(workspaceRoot, "src/lib/orchestrator.ts"));
 }
 
-const { resolveModelProtocolProfile } = loadOrchestratorModule();
+const {
+  resolveRuntimeProtocolProfile,
+  shouldUseXmlToolProtocol,
+} = loadOrchestratorModule();
 
 test("anthropic request body lifts system prompts and converts native tools/tool results", () => {
   const body = buildAnthropicRequestBody({
@@ -491,7 +538,29 @@ test("responses request builder emits deterministic store false, instructions, a
   assert.equal(candidates[2].body.tools, undefined);
 });
 
-test("cloud tool protocol and model profile helpers normalize provider behavior", () => {
+test("short compact Responses candidates reconcile their tool contract with the attached payload", () => {
+  const candidates = buildOpenAiResponsesRequestCandidates({
+    messages: [
+      { role: "system", content: "[ROLE]\nKeep this role.\n\n[TOOLS]\nprotocol=native; available=stale_tool.\n\n[COMPLETION]\nUse evidence." },
+      { role: "user", content: "Read file" },
+    ],
+    model: "gpt-5.4",
+    compact: true,
+    toolProtocol: "native",
+    tools: [compactReadTool],
+  });
+  const structuredInstructions = String(candidates[0].body.instructions || "");
+  const transcriptInstructions = String(candidates[2].body.instructions || "");
+
+  assert.match(structuredInstructions, /\[ROLE\][\s\S]*Keep this role/);
+  assert.match(structuredInstructions, /protocol=native/);
+  assert.match(structuredInstructions, /available=read_file/);
+  assert.doesNotMatch(structuredInstructions, /stale_tool|<tool_use>/);
+  assert.match(transcriptInstructions, /protocol=none; available=none/);
+  assert.doesNotMatch(transcriptInstructions, /stale_tool|protocol=native|<tool_use>/);
+});
+
+test("cloud tool and explicit API protocol helpers normalize configured behavior", () => {
   assert.equal(normalizeCloudAuthMode("openai_chatgpt_oauth"), "openai_chatgpt_oauth");
   assert.equal(normalizeCloudAuthMode("gemini_google_oauth"), "gemini_google_oauth");
   assert.equal(normalizeCloudAuthMode("bad"), "api_key");
@@ -526,50 +595,60 @@ test("cloud tool protocol and model profile helpers normalize provider behavior"
   assert.equal(normalizeLocalToolProtocol("native", "LM Studio"), "native");
   assert.equal(normalizeLocalToolProtocol("xml", "OMLX"), "xml");
 
-  assert.equal(getModelInstructionProfile({ protocol: "anthropic", model: "claude-sonnet-4-5" }).provider, "anthropic");
-  assert.equal(getModelInstructionProfile({ protocol: "openai", model: "qwen3-coder" }).reasoning, "passive_hidden");
-  assert.equal(getModelInstructionProfile({ protocol: "openai", provider: "OMLX", model: "gemma-4-26b-a4b-it-8bit" }).provider, "gemma");
-  assert.equal(getModelInstructionProfile({ protocol: "openai", provider: "OMLX", model: "gemma-4-26b-a4b-it-8bit" }).reasoning, "passive_hidden");
-  assert.equal(getModelInstructionProfile({ protocol: "openai", model: "kimi-k2" }).toolProtocolPreference, "xml");
-  assert.equal(getModelInstructionProfile({ protocol: "gemini", model: "gemini-2.5-pro" }).toolProtocolPreference, "xml");
+  assert.equal(getProtocolInstructionProfile({ protocol: "anthropic" }).provider, "anthropic");
+  assert.equal(getProtocolInstructionProfile({ protocol: "openai" }).reasoning, "passive_hidden");
+  assert.equal(getProtocolInstructionProfile({ protocol: "openai" }).toolProtocolPreference, "auto");
+  assert.equal(getProtocolInstructionProfile({ protocol: "gemini" }).toolProtocolPreference, "xml");
   assert.equal(resolveReasoningPolicy({ activeProfile: "local", requestedMode: "passive_hidden" }).mode, "passive_hidden");
   assert.equal(resolveReasoningPolicy({ activeProfile: "cloud", reasoningRequest: "auto", reasoningEffort: "high" }).mode, "native_enabled");
   assert.equal(resolveReasoningPolicy({ activeProfile: "local", requestedMode: "passive_hidden" }).replayInContext, false);
 });
 
-test("model protocol profile covers local and cloud providers", () => {
-  assert.equal(resolveModelProtocolProfile({
+test("runtime protocol profile uses explicit protocol and config without model-name inference", () => {
+  assert.equal(resolveRuntimeProtocolProfile({
     activeProfile: "local",
     provider: "Ollama",
     model: "qwen3",
     configuredToolProtocol: "auto",
   }).toolProtocol, "xml");
 
-  assert.equal(resolveModelProtocolProfile({
+  assert.equal(resolveRuntimeProtocolProfile({
     activeProfile: "local",
     provider: "OMLX",
     model: "mlx-qwen",
     configuredToolProtocol: "auto",
   }).toolProtocol, "auto");
 
-  const localGemmaProfile = resolveModelProtocolProfile({
+  const localGemmaProfile = resolveRuntimeProtocolProfile({
     activeProfile: "local",
     provider: "OMLX",
     model: "gemma-4-26b-a4b-it-8bit",
     configuredToolProtocol: "auto",
   });
-  assert.equal(localGemmaProfile.toolProtocol, "xml");
+  assert.equal(localGemmaProfile.toolProtocol, "auto");
   assert.equal(localGemmaProfile.reasoning, "passive_hidden");
-  assert.equal(localGemmaProfile.notes.some((note) => /hidden metadata/.test(note)), true);
+  assert.equal(localGemmaProfile.notes.some((note) => /hidden reasoning/.test(note)), true);
+  assert.deepEqual(localGemmaProfile, resolveRuntimeProtocolProfile({
+    activeProfile: "local",
+    provider: "OMLX",
+    model: "qwen3.6-35b-a3b",
+    configuredToolProtocol: "auto",
+  }));
+  assert.deepEqual(localGemmaProfile, resolveRuntimeProtocolProfile({
+    activeProfile: "local",
+    provider: "OMLX",
+    model: "arbitrary-local-model",
+    configuredToolProtocol: "auto",
+  }));
 
-  assert.equal(resolveModelProtocolProfile({
+  assert.equal(resolveRuntimeProtocolProfile({
     activeProfile: "local",
     provider: "OMLX",
     model: "mlx-qwen",
     configuredToolProtocol: "xml",
   }).toolProtocol, "xml");
 
-  assert.equal(resolveModelProtocolProfile({
+  assert.equal(resolveRuntimeProtocolProfile({
     activeProfile: "cloud",
     provider: "OpenAI",
     model: "gpt-5.4",
@@ -577,13 +656,33 @@ test("model protocol profile covers local and cloud providers", () => {
     configuredToolProtocol: "auto",
   }).toolProtocol, "auto");
 
-  assert.equal(resolveModelProtocolProfile({
+  assert.equal(resolveRuntimeProtocolProfile({
     activeProfile: "cloud",
     provider: "Gemini",
     model: "gemini-2.5-pro",
     protocol: "gemini",
     configuredToolProtocol: "auto",
   }).toolProtocol, "xml");
+
+  assert.equal(resolveRuntimeProtocolProfile({
+    activeProfile: "cloud",
+    provider: "OpenAI-compatible",
+    model: "any-model",
+    protocol: "openai",
+    configuredToolProtocol: "xml",
+    compatibilityOverride: false,
+  }).toolProtocol, "xml");
+  assert.equal(shouldUseXmlToolProtocol(
+    { activeProfile: "cloud" },
+    {
+      provider: "OpenAI-compatible",
+      model: "any-model",
+      apiProtocol: "openai",
+      toolProtocol: "xml",
+    },
+    [],
+    false,
+  ), true);
 });
 
 test("gemini helpers build native generateContent requests and extract text", () => {
@@ -785,7 +884,52 @@ test("Responses SSE parser aggregates output text deltas", () => {
   assert.equal(text, "ok!");
 });
 
-test("cloud responses compact instructions preserve workspace write tools", () => {
+test("Responses SSE parser preserves failed terminal state and rejects partial text-only reads", () => {
+  const streamText = [
+    "event: response.output_text.delta",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}",
+    "",
+    "event: response.failed",
+    "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"upstream generation failed\"}}}",
+    "",
+  ].join("\n");
+
+  const payload = parseOpenAiResponsesSsePayload(streamText);
+  assert.equal(payload.output_text, "partial");
+  assert.deepEqual(resolveOpenAiResponsesTerminalState(payload), {
+    status: "failed",
+    error: "upstream generation failed",
+    incompleteReason: null,
+  });
+  assert.throws(
+    () => parseOpenAiResponsesSseText(streamText),
+    /OPENAI_RESPONSES_FAILED: upstream generation failed/,
+  );
+});
+
+test("Responses SSE parser marks a partial body without a terminal event incomplete", () => {
+  const streamText = [
+    "event: response.output_text.delta",
+    "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}",
+    "",
+    "data: [DONE]",
+    "",
+  ].join("\n");
+
+  const payload = parseOpenAiResponsesSsePayload(streamText);
+  assert.equal(payload.output_text, "partial");
+  assert.deepEqual(resolveOpenAiResponsesTerminalState(payload), {
+    status: "incomplete",
+    error: null,
+    incompleteReason: "missing_terminal_event",
+  });
+  assert.throws(
+    () => parseOpenAiResponsesSseText(streamText),
+    /OPENAI_RESPONSES_INCOMPLETE: missing_terminal_event/,
+  );
+});
+
+test("cloud responses compact instructions derive native tool truth from active schemas", () => {
   const longInstructions = [
     "当前工作区绝对路径为：/tmp/workspace",
     "可用的工具：read_file, write_file, replace_in_file, run_command",
@@ -794,14 +938,66 @@ test("cloud responses compact instructions preserve workspace write tools", () =
     "low priority filler ".repeat(1200),
   ].join("\n");
 
-  const compacted = compactCloudResponsesInstructions(longInstructions);
+  const compacted = compactCloudResponsesInstructions(longInstructions, {
+    toolProtocol: "native",
+    toolDefinitions: [compactReadTool, compactWriteTool, compactRunTool],
+  });
 
   assert.ok(compacted.length <= 8000);
   assert.match(compacted, /write_file/);
-  assert.match(compacted, /replace_in_file/);
   assert.match(compacted, /run_command/);
   assert.match(compacted, /M Studio Unity/);
-  assert.match(compacted, /Never claim write tools or folder access are unavailable/);
+  assert.match(compacted, /protocol=native/);
+  assert.doesNotMatch(compacted, /replace_in_file|<tool_use>|protocol=xml-text/);
+});
+
+test("cloud responses XML compaction advertises only the current schema surface", () => {
+  const candidates = buildOpenAiResponsesRequestCandidates({
+    messages: [{
+      role: "system",
+      content: `[TOOLS]\nlegacy native catalog\n\n[COMPLETION]\nUse real evidence.\n${"filler ".repeat(1800)}`,
+    }, { role: "user", content: "Read the requested file." }],
+    model: "gateway-model",
+    tools: [compactReadTool],
+    compact: true,
+    includeTools: false,
+    toolProtocol: "xml",
+  });
+  const structured = candidates.find((candidate) => candidate.mode === "message_text");
+  const instructions = String(structured?.body.instructions || "");
+
+  assert.equal(structured?.body.tools, undefined);
+  assert.equal((instructions.match(/^\[TOOLS\]$/gm) || []).length, 1);
+  assert.match(instructions, /protocol=xml-text/);
+  assert.match(instructions, /read_file\(path: string\)/);
+  assert.match(instructions, /<tool>read_file<\/tool>/);
+  assert.doesNotMatch(instructions, /write_file|replace_in_file|run_command|protocol=native/);
+});
+
+test("Responses XML compaction preserves the prompt's active catalog when native payload tools are empty", () => {
+  const activeXmlCard = [
+    "[TOOLS]",
+    "profile=local/omlx; protocol=xml-text.",
+    "- read_file(path: string) — Read one workspace file.",
+    "Example:",
+    "<tool_use>",
+    "<tool>read_file</tool>",
+    "<parameter name=\"path\">src/example.ts</parameter>",
+    "</tool_use>",
+  ].join("\n");
+  const candidates = buildOpenAiResponsesRequestCandidates({
+    messages: [{ role: "system", content: `${activeXmlCard}\n\n[COMPLETION]\nUse evidence.` }, { role: "user", content: "Read it" }],
+    model: "xml-gateway-model",
+    compact: true,
+    includeTools: false,
+    toolProtocol: "xml",
+  });
+  const instructions = String(candidates[0].body.instructions || "");
+
+  assert.match(instructions, /protocol=xml-text/);
+  assert.match(instructions, /read_file\(path: string\)/);
+  assert.match(instructions, /<tool>read_file<\/tool>/);
+  assert.doesNotMatch(instructions, /available=none|protocol=none/);
 });
 
 test("cloud responses compact instructions preserve the current visual observation contract", () => {
@@ -956,6 +1152,8 @@ test("responses aggressive compact mode builds a small no-tool gateway fallback"
   assert.equal(transcript?.body.reasoning, undefined);
   assert.equal(transcript?.body.store, false);
   assert.match(String(transcript?.body.instructions || ""), /Cloud Gateway Compact Instructions/);
+  assert.match(String(transcript?.body.instructions || ""), /protocol=none; available=none/);
+  assert.doesNotMatch(String(transcript?.body.instructions || ""), /<tool_use>|write_file|replace_in_file|run_command/);
   assert.ok(String(transcript?.body.instructions || "").length <= 3100);
   assert.ok(String(transcript?.body.input || "").length < 12000);
 });

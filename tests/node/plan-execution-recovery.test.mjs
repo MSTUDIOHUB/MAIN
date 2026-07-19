@@ -1761,6 +1761,53 @@ test("execute max-iteration recovery permits final synthesis when evidence is al
   });
 });
 
+test("execute max-iteration recovery preserves a pending root objective audit", () => {
+  const decision = resolveExecuteMaxIterationsRecoveryDecision({
+    evidenceLedger: [{
+      id: "mutation-before-audit",
+      kind: "file",
+      value: "src/App.tsx",
+      target: "src/App.tsx",
+      sourceTool: "apply_patch",
+      createdAt: 1,
+    }, {
+      id: "validation-before-audit",
+      kind: "cmd",
+      value: "npm test",
+      target: "npm test",
+      sourceTool: "run_command",
+      createdAt: 2,
+    }],
+    recoveryState: {
+      mode: "objective_audit",
+      reason: "objective_closure_audit_required",
+      expectedTarget: "src/App.tsx",
+      decisionCheckpoint: {
+        expectedTarget: "src/App.tsx",
+        sourceObservationKey: "app-v2",
+        nextRequiredCapability: "any",
+        objectiveObligationId: "root:direct-edit",
+        objectiveRevision: 2,
+        objectiveKind: "root",
+        objectiveExpectedTargets: ["src/App.tsx"],
+        objectiveMutationEvidence: [{ target: "src/App.tsx" }],
+        objectiveValidationEvidence: {
+          tool: "run_command",
+          target: "npm test",
+          revision: 2,
+        },
+        objectiveClosurePending: true,
+      },
+    },
+  });
+
+  assert.deepEqual(decision, {
+    mode: "objective_audit",
+    gap: "none",
+    reason: "max_iterations_objective_audit_pending",
+  });
+});
+
 test("execute max-iteration recovery observes every long process but requests browser only for interaction obligations", () => {
   const mutation = {
     id: "mutation-before-server",

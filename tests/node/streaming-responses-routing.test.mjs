@@ -197,6 +197,8 @@ test("OpenAI Responses gateway timeouts preserve the current image in aggressive
   assert.equal(Array.isArray(requests[0].input), true);
   assert.equal(requests[0].tools[0].name, "write_file");
   assert.deepEqual(requests[0].reasoning, { effort: "xhigh" });
+  assert.match(requests[0].instructions, /protocol=native/);
+  assert.doesNotMatch(requests[0].instructions, /<tool_use>|protocol=xml-text/);
 
   assert.equal(Array.isArray(requests[1].input), true);
   assert.match(JSON.stringify(requests[1].input), /input_image/);
@@ -206,6 +208,8 @@ test("OpenAI Responses gateway timeouts preserve the current image in aggressive
   assert.equal(requests[1].user_prompt_id, undefined);
   assert.equal(requests[1].store, false);
   assert.match(requests[1].instructions, /Cloud Gateway Compact Instructions/);
+  assert.match(requests[1].instructions, /protocol=none; available=none/);
+  assert.doesNotMatch(requests[1].instructions, /<tool_use>|write_file|replace_in_file|run_command/);
   assert.ok(requests[1].instructions.length <= 3100);
   assert.ok(JSON.stringify(requests[1].input).length < 12000);
   assert.deepEqual(result.visualTransportReceipt, {
@@ -236,7 +240,9 @@ test("OpenAI ChatGPT OAuth cloud requests pass token references to the Rust prox
     assert.equal(body.top_p, undefined);
     return "__CONTENT_TYPE__:text/event-stream\n"
       + "event: response.output_text.delta\n"
-      + "data: {\"delta\":\"ok\"}\n\n";
+      + "data: {\"delta\":\"ok\"}\n\n"
+      + "event: response.completed\n"
+      + "data: {\"response\":{\"status\":\"completed\",\"output_text\":\"ok\"}}\n\n";
   });
 
   await streamChatCompletion(
@@ -274,7 +280,9 @@ test("OpenAI ChatGPT OAuth forces responses endpoint even when apiFormat is chat
     assert.equal(typeof body.instructions, "string");
     return "__CONTENT_TYPE__:text/event-stream\n"
       + "event: response.output_text.delta\n"
-      + "data: {\"delta\":\"ok\"}\n\n";
+      + "data: {\"delta\":\"ok\"}\n\n"
+      + "event: response.completed\n"
+      + "data: {\"response\":{\"status\":\"completed\",\"output_text\":\"ok\"}}\n\n";
   });
 
   await streamChatCompletion(
@@ -297,6 +305,87 @@ test("OpenAI ChatGPT OAuth forces responses endpoint even when apiFormat is chat
   );
 
   assert.equal(invokeArgs[0].url, "https://api.openai.com/v1/responses");
+});
+
+test("OpenAI Responses propagates incomplete JSON as length and suppresses partial tool calls", async () => {
+  const tokens = [];
+  let doneCount = 0;
+  let errorCount = 0;
+  const { streamChatCompletion } = await loadStreamingModule(async () => JSON.stringify({
+    status: "incomplete",
+    incomplete_details: { reason: "max_output_tokens" },
+    output_text: "partial answer",
+    output: [{
+      type: "function_call",
+      call_id: "partial-call",
+      name: "write_file",
+      arguments: "{\"path\":\"src/a.ts\"",
+    }],
+  }));
+
+  const result = await streamChatCompletion(
+    [{ role: "user", content: "finish the task" }],
+    {
+      baseUrl: "https://api.openai.com/v1",
+      apiKey: "test-key",
+      model: "gpt-5.4",
+      apiProtocol: "openai",
+      apiFormat: "responses",
+      useRustProxy: true,
+    },
+    {
+      onToken: (token) => tokens.push(token),
+      onDone: () => { doneCount += 1; },
+      onError: () => { errorCount += 1; },
+    },
+  );
+
+  assert.equal(result.content, "partial answer");
+  assert.equal(result.finishReason, "length");
+  assert.equal(result.responseStatus, "incomplete");
+  assert.equal(result.responseIncompleteReason, "max_output_tokens");
+  assert.deepEqual(result.toolCalls, []);
+  assert.deepEqual(tokens, ["partial answer"]);
+  assert.equal(doneCount, 1);
+  assert.equal(errorCount, 0);
+});
+
+test("OpenAI Responses rejects failed SSE without publishing partial output as done", async () => {
+  const tokens = [];
+  let doneCount = 0;
+  const errors = [];
+  const { streamChatCompletion } = await loadStreamingModule(async () => (
+    "__CONTENT_TYPE__:text/event-stream\n"
+    + "event: response.output_text.delta\n"
+    + "data: {\"delta\":\"partial\"}\n\n"
+    + "event: response.failed\n"
+    + "data: {\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"generation crashed\"}}}\n\n"
+  ));
+
+  await assert.rejects(
+    () => streamChatCompletion(
+      [{ role: "user", content: "finish the task" }],
+      {
+        baseUrl: "https://api.openai.com/v1",
+        apiKey: "test-key",
+        model: "gpt-5.4",
+        apiProtocol: "openai",
+        apiFormat: "responses",
+        useRustProxy: true,
+      },
+      {
+        onToken: (token) => tokens.push(token),
+        onDone: () => { doneCount += 1; },
+        onError: (error) => { errors.push(error); },
+      },
+    ),
+    /OPENAI_RESPONSES_FAILED: generation crashed/,
+  );
+
+  assert.deepEqual(tokens, []);
+  assert.equal(doneCount, 0);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0].message, /OPENAI_RESPONSES_FAILED/);
 });
 
 test("Gemini OAuth cloud requests use native generateContent endpoint and token refs", async () => {
@@ -1395,7 +1484,7 @@ test("OpenAI Responses throws a tagged compatibility error when every candidate 
   assert.equal(requests.length >= 2, true);
 });
 
-test("OpenAI Responses sends compacted system instructions for cloud requests", async () => {
+test("OpenAI Responses without attached tools compacts to an explicit no-tool contract", async () => {
   const requests = [];
   const { streamChatCompletion } = await loadStreamingModule(async (_command, args) => {
     const body = JSON.parse(args.body);
@@ -1430,8 +1519,9 @@ test("OpenAI Responses sends compacted system instructions for cloud requests", 
   );
 
   assert.ok(requests[0].instructions.length <= 8000);
-  assert.match(requests[0].instructions, /write_file/);
-  assert.match(requests[0].instructions, /replace_in_file/);
+  assert.equal(requests[0].tools, undefined);
+  assert.match(requests[0].instructions, /protocol=none; available=none/);
+  assert.doesNotMatch(requests[0].instructions, /<tool_use>|write_file|replace_in_file|run_command/);
   assert.equal(requests[0].reasoning.effort, "xhigh");
 });
 

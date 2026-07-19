@@ -216,21 +216,36 @@ export function buildPlanPostConvergenceToolRedirectPrompt(input: {
   const reason = input.qualityGateReason || (missing ? `missing:${missing}` : "");
   const phase = input.phase || "drafting";
   if (phase === "needs_rewrite") {
+    const needsExecutableTestContract = /(?:^|:)non_executable_test_plan(?:$|:)/i.test(reason);
     if (input.language === "en") {
       return [
-        "PLAN_NEEDS_REWRITE: The last visible plan draft was structurally incomplete, but this is not a reason to read more files.",
+        needsExecutableTestContract
+          ? "PLAN_NEEDS_REWRITE: The Test Plan exists, but its execution contract is not concrete enough. This is not a reason to read more files."
+          : "PLAN_NEEDS_REWRITE: The last visible plan draft was structurally incomplete, but this is not a reason to read more files.",
         toolList ? `The attempted read-only tool call(s) were suppressed before execution: ${toolList}.` : "",
         reason ? `Quality gate reason: ${reason}.` : "",
-        "Rewrite the visible `<proposed_plan>` now. Add the missing user goal/sections from the canonical request and the frozen evidence bundle; MAIN runtime owns the file write.",
+        needsExecutableTestContract
+          ? "Rewrite only the Test Plan contract while preserving the objective, evidence, implementation scope, and target files. For each required check, provide either an exact runnable command, or one self-contained scenario with concrete input/setup or action plus a concrete observable expected result/assertion. Do not split the action and expectation across unrelated scenarios."
+          : "Rewrite the visible `<proposed_plan>` now. Add the missing user goal/sections from the canonical request and the frozen evidence bundle; MAIN runtime owns the file write.",
+        needsExecutableTestContract
+          ? "Output the complete revised `<proposed_plan>` so MAIN can materialize it; do not claim that a check has already passed."
+          : "",
         "Do not call read-only tools in the next response unless MAIN explicitly reopens evidence recovery.",
         "Do not edit source files or `tasks.md` before approval.",
       ].filter(Boolean).join("\n");
     }
     return [
-      "PLAN_NEEDS_REWRITE: 上一个可见计划草稿只是结构不完整，这不是继续读文件的理由。",
+      needsExecutableTestContract
+        ? "PLAN_NEEDS_REWRITE: 测试方案已经存在，但其中的执行契约还不够具体；这不是继续读文件的理由。"
+        : "PLAN_NEEDS_REWRITE: 上一个可见计划草稿只是结构不完整，这不是继续读文件的理由。",
       toolList ? `刚才的只读工具已在执行前静默拦截：${toolList}。` : "",
       reason ? `质量门禁原因：${reason}。` : "",
-      "现在直接重写可见 `<proposed_plan>`：把用户目标和缺失章节补齐，证据只使用当前冻结的证据包；计划文件由 MAIN runtime 写入。",
+      needsExecutableTestContract
+        ? "只修正测试方案的执行契约，并保持用户目标、已有证据、实现范围和目标文件不变。每项必要验证必须提供：精确可运行命令；或者同一场景内的具体输入/准备或操作，以及可观察的具体预期结果/断言。不同场景之间不能借用操作和预期。"
+        : "现在直接重写可见 `<proposed_plan>`：把用户目标和缺失章节补齐，证据只使用当前冻结的证据包；计划文件由 MAIN runtime 写入。",
+      needsExecutableTestContract
+        ? "输出完整修订后的 `<proposed_plan>` 供 MAIN 物化；不要声称验证已经通过。"
+        : "",
       "下一条不要再调用只读工具；除非 MAIN 明确进入补证据阶段。",
       "批准前不要修改源码或生成 `tasks.md`。",
     ].filter(Boolean).join("\n");

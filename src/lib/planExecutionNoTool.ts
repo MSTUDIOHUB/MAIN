@@ -24,6 +24,8 @@ export function shouldHandleApprovedPlanExecutionNoTool(input: {
 
 export function buildPlanExecutionNoToolRecoveryPrompt(input: {
   language: "zh" | "en";
+  /** XML is opt-in; omitted/false keeps the recovery protocol-neutral for native schemas. */
+  forceXmlTools?: boolean;
   missingTasksArtifact: boolean;
   remainingText: string;
   commandHint?: string;
@@ -33,11 +35,18 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
   const remainingText = String(input.remainingText || "").trim();
   const commandHint = String(input.commandHint || "").trim();
   const recentActivitySummary = String(input.recentActivitySummary || "").trim();
+  const toolCallRequirement = input.forceXmlTools
+    ? input.language === "zh"
+      ? "下一条回复必须只包含一个真实 `<tool_use>`"
+      : "The next reply must contain exactly one real `<tool_use>`"
+    : input.language === "zh"
+      ? "下一条回复必须只发起一个当前 schema 中的正式工具调用"
+      : "The next reply must make exactly one formal tool call from the active schemas";
   if (input.language === "zh") {
     return [
       input.missingTasksArtifact
-        ? "TOOL_ONLY_RECOVERY: 已批准计划正在执行，但当前缺少可审计的任务清单。下一条回复必须只包含一个真实 `<tool_use>`；先从 plan.md 派生 runtime 任务清单，只有长任务、跨会话恢复或需要审计留档时才用 `write_file` 创建 `.MAIN/plans/tasks.md`。"
-        : "TOOL_ONLY_RECOVERY: 已批准计划正在执行，但上一轮没有工具调用。下一条回复必须只包含一个真实 `<tool_use>`，不要输出进度说明、计划、伪代码或完成总结。",
+        ? `TOOL_ONLY_RECOVERY: 已批准计划正在执行，但当前缺少可审计的任务清单。${toolCallRequirement}；先从 plan.md 派生 runtime 任务清单，只有长任务、跨会话恢复或需要审计留档时才用 \`write_file\` 创建 \`.MAIN/plans/tasks.md\`。`
+        : `TOOL_ONLY_RECOVERY: 已批准计划正在执行，但上一轮没有工具调用。${toolCallRequirement}，不要输出进度说明、计划、伪代码或完成总结。`,
       input.rejectedCompletionClaim
         ? "你刚才的完成声明没有通过可信证据审计；正文不会被当作完成证据。"
         : "",
@@ -56,8 +65,8 @@ export function buildPlanExecutionNoToolRecoveryPrompt(input: {
 
   return [
     input.missingTasksArtifact
-      ? "TOOL_ONLY_RECOVERY: An approved plan is executing, but no auditable task list exists. The next reply must contain exactly one real `<tool_use>`; derive runtime tasks from plan.md, and call `write_file` for `.MAIN/plans/tasks.md` only for long work, cross-session recovery, or explicit audit-file needs."
-      : "TOOL_ONLY_RECOVERY: An approved plan is executing, but the previous step did not call a tool. The next reply must contain exactly one real `<tool_use>`; do not output a progress note, plan, pseudocode, or final summary.",
+      ? `TOOL_ONLY_RECOVERY: An approved plan is executing, but no auditable task list exists. ${toolCallRequirement}; derive runtime tasks from plan.md, and call \`write_file\` for \`.MAIN/plans/tasks.md\` only for long work, cross-session recovery, or explicit audit-file needs.`
+      : `TOOL_ONLY_RECOVERY: An approved plan is executing, but the previous step did not call a tool. ${toolCallRequirement}; do not output a progress note, plan, pseudocode, or final summary.`,
     input.rejectedCompletionClaim
       ? "Your completion claim did not pass the trusted evidence audit; prose is not completion evidence."
       : "",

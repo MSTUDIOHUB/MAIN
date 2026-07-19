@@ -19,6 +19,7 @@ import { summarizeRepeatedPlanTargetsFromToolActivity, type PlanToolActivitySumm
 import { assessPlanEvidenceReadiness } from "../../planReadOnlyConvergence";
 import { shouldClosePlanToolSurfaceAfterReadOnlyConvergence } from "../../planRuntime";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
+import { buildTaskTargetingProfile } from "../../taskTargeting";
 import {
   getSubagentAdmissionHealth,
   normalizeIndependentDelegationScopeKeys,
@@ -26,6 +27,7 @@ import {
   resolveSubagentCapacityPolicy,
   type DelegationDecision,
   type DelegationRuntimePhase,
+  type SubagentExecutionScope,
 } from "../../subagents";
 import type { ToolDefinition } from "../../toolSchemas";
 import {
@@ -76,6 +78,97 @@ const DIRECT_FILE_MODIFY_SOURCE_TOOLS = new Set([
 const DIRECT_FILE_MODIFY_VALIDATION_TOOLS = new Set([
   "run_command",
 ]);
+
+const SUBAGENT_UNSCOPED_WORKSPACE_TOOLS = new Set([
+  "glob_search",
+  "get_project_skeleton",
+  "repo_map_status",
+  "repo_map_search",
+  "repo_map_context",
+  "repo_map_files",
+  "repo_map_impact",
+]);
+
+const SUBAGENT_EXACT_PATH_TOOLS = new Set([
+  "read_file",
+  "read_document",
+  "get_file_outline",
+  "code_ast_query",
+]);
+
+const SUBAGENT_REQUIRED_SCOPED_PATH_TOOLS = new Set([
+  "grep_search",
+  "find_symbol_references",
+  "git_diff",
+]);
+
+function withSubagentPathContract(
+  tool: ToolDefinition,
+  paths: string[],
+  description: string,
+): ToolDefinition {
+  const pathProperty = tool.function.parameters.properties.path;
+  if (!pathProperty || paths.length === 0) return tool;
+  return {
+    ...tool,
+    function: {
+      ...tool.function,
+      parameters: {
+        ...tool.function.parameters,
+        properties: {
+          ...tool.function.parameters.properties,
+          path: {
+            ...pathProperty,
+            description,
+            enum: [...paths],
+          },
+        },
+        required: [...new Set([...(tool.function.parameters.required || []), "path"])],
+      },
+    },
+  };
+}
+
+export function scopeSubagentToolDefinitions(input: {
+  tools: ToolDefinition[];
+  scope: SubagentExecutionScope | null;
+}): ToolDefinition[] {
+  if (!input.scope) return input.tools;
+  const scope = input.scope;
+  const blocked = new Set(scope.blockedToolNames);
+  const ownsWorkspaceRoot = scope.allowedPaths.some((path) => path === ".");
+  return input.tools.flatMap((tool) => {
+    const name = tool.function.name;
+    if (blocked.has(name)) return [];
+    if (!ownsWorkspaceRoot && SUBAGENT_UNSCOPED_WORKSPACE_TOOLS.has(name)) return [];
+    if (name === "list_directory") {
+      if (scope.allowedDirectoryPaths.length === 0) return [];
+      return [withSubagentPathContract(
+        tool,
+        scope.allowedDirectoryPaths,
+        `Exact directory owned by this subagent: ${scope.allowedDirectoryPaths.join(", ")}`,
+      )];
+    }
+    if (SUBAGENT_REQUIRED_SCOPED_PATH_TOOLS.has(name)) {
+      return [withSubagentPathContract(
+        tool,
+        scope.allowedPaths,
+        `Required exact scope target. Choose one of: ${scope.allowedPaths.join(", ")}`,
+      )];
+    }
+    if (
+      scope.scopeKind === "exact_files" &&
+      SUBAGENT_EXACT_PATH_TOOLS.has(name)
+    ) {
+      return [withSubagentPathContract(
+        tool,
+        scope.allowedFilePaths,
+        `Required exact file owned by this subagent. Choose one of: ${scope.allowedFilePaths.join(", ")}`,
+      )];
+    }
+    return [tool];
+  });
+}
 
 export function hasStructuredWorkspaceMutationEvidence(input: {
   callbacks: OrchestratorCallbacks;
@@ -396,7 +489,13 @@ export function resolveIterationToolSurface(input: {
   } else {
     delegationPhase = "context";
   }
+  const declaredTargetProfile = buildTaskTargetingProfile({
+    userPrompt: latestUserPromptText,
+    planTaskTexts: callbacks.getPlanTasks().map((task) => task.text),
+    userContext: turnInputContextSignals,
+  });
   const explicitScopeKeys = [
+    ...declaredTargetProfile.explicitPaths,
     ...(turnInputContextSignals.mentionedFilePaths || []),
     ...(turnInputContextSignals.attachedFilePaths || []),
   ];
@@ -489,9 +588,27 @@ export function resolveIterationToolSurface(input: {
       ),
     }).status,
   });
+  const subagentScope = callbacks.getSubagentScope?.() ?? null;
+  const subagentScopedIterationAllTools = scopeSubagentToolDefinitions({
+    tools: delegationScopedIterationAllTools,
+    scope: subagentScope,
+  });
+  if (subagentScope) {
+    const beforeNames = delegationScopedIterationAllTools.map((tool) => tool.function.name);
+    const afterNames = subagentScopedIterationAllTools.map((tool) => tool.function.name);
+    callbacks.onDebugEvent?.("subagent_tool_surface_scoped", {
+      iteration,
+      scopeKey: subagentScope.scopeKey,
+      scopeKind: subagentScope.scopeKind,
+      allowedPaths: subagentScope.allowedPaths,
+      blockedToolNames: subagentScope.blockedToolNames,
+      removedTools: beforeNames.filter((name) => !afterNames.includes(name)),
+      scopedTools: afterNames,
+    });
+  }
   const iterationAllTools = shouldClosePlanToolSurface
     ? []
-    : delegationScopedIterationAllTools;
+    : subagentScopedIterationAllTools;
 
   const shouldLogToolSurfaceDecision =
     rawIterationAllTools.length !== iterationAllTools.length ||

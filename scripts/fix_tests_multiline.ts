@@ -29,12 +29,4 @@ for (const file of testFiles) {
   fs.writeFileSync(file, content);
 }
 
-// Restore isReasoningModelName export
-const orchFile = "src/lib/orchestrator.ts";
-let orchContent = fs.readFileSync(orchFile, "utf8");
-if (!orchContent.includes("isReasoningModelName")) {
-  orchContent += '\nexport { isReasoningModelName } from "./orchestrator/agentRecovery";\n';
-  fs.writeFileSync(orchFile, orchContent);
-}
-
-console.log("Fixed multiline readFileSync and isReasoningModelName");
+console.log("Fixed multiline readFileSync references");

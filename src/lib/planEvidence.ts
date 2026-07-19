@@ -91,6 +91,7 @@ const LOW_SIGNAL_TARGET_RE = /(?:^|[\\/])(?:package-lock\.json|pnpm-lock\.yaml|y
 const PATH_LIKE_RE = /(?:^|[\s`'"(])([A-Za-z0-9_.@-]+(?:\/[A-Za-z0-9_.@-]+)+\.[A-Za-z0-9]+)(?=$|[\s`'"),:;])/g;
 const OBJECTIVE_SOURCE_REFERENCE_RE = /(?:\.{1,2}\/|[A-Za-z0-9_.@-]+\/)*[A-Za-z0-9_.-]+\.(?:tsx?|jsx?|mjs|cjs|rs|py|go|swift|java|kt|cs|cpp|c|h|hpp|vue|svelte|css|scss|html|json|toml|ya?ml)/gi;
 const OBJECTIVE_MUTATION_VERB_RE = /(?:实现|修改|改动|变更|更新|新增|添加|修复|补齐|调整|替换|重构|删除|创建|implement|change|update|modify|fix|add|replace|refactor|delete|create)/gi;
+const PLAN_CANDIDATE_MUTATION_RE = /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|补全|完善|调整|替换|重构|删除|创建|统一|对齐|implement|change|update|modify|fix|add|replace|refactor|delete|create|complete|align)/i;
 const MAX_PLAN_EVIDENCE_FACTS = 24;
 
 function stableHash(value: string): string {
@@ -673,27 +674,64 @@ export function formatPlanEvidenceBundleForModel(
   ].join("\n");
 }
 
-function sectionLines(content: string, heading: RegExp): string[] {
-  let active = false;
-  const lines: string[] = [];
+interface PlanSectionEntry {
+  kind: "heading" | "body";
+  text: string;
+  level: number;
+}
+
+function sectionEntries(content: string, heading: RegExp): PlanSectionEntry[] {
+  let sectionLevel = 0;
+  const entries: PlanSectionEntry[] = [];
   for (const rawLine of content.split(/\r?\n/)) {
-    const match = rawLine.trim().match(/^#{1,6}\s+(.+?)\s*$/);
+    const match = rawLine.trim().match(/^(#{1,6})\s+(.+?)\s*$/);
     if (match) {
-      if (active) break;
-      active = heading.test(match[1] || "");
+      const level = match[1]?.length || 0;
+      const title = String(match[2] || "").trim();
+      if (sectionLevel > 0 && level > sectionLevel) {
+        entries.push({ kind: "heading", text: compact(title, 500), level });
+        continue;
+      }
+      if (sectionLevel > 0 && level <= sectionLevel) sectionLevel = 0;
+      heading.lastIndex = 0;
+      if (heading.test(title)) sectionLevel = level;
       continue;
     }
-    if (!active) continue;
+    if (sectionLevel === 0) continue;
     const line = rawLine.trim().replace(/^[-*]\s+/, "").replace(/^\d+[.)]\s+/, "").trim();
-    if (line) lines.push(compact(line, 500));
+    if (line) entries.push({ kind: "body", text: compact(line, 500), level: sectionLevel });
   }
-  return lines;
+  return entries;
+}
+
+function sectionLines(content: string, heading: RegExp): string[] {
+  return sectionEntries(content, heading)
+    .filter((entry) => entry.kind === "body")
+    .map((entry) => entry.text);
+}
+
+function findExplicitPlanPaths(text: string): string[] {
+  return [...text.matchAll(new RegExp(PATH_LIKE_RE.source, "g"))]
+    .map((match) => match[1] || "")
+    .filter(Boolean);
+}
+
+function isPlanCandidateMutationLine(text: string): boolean {
+  const normalized = String(text || "").trim();
+  if (!normalized) return false;
+  if (/[:：]\s*$/.test(normalized) && findExplicitPlanPaths(normalized).length === 0) return false;
+  const validationFirst = /^(?:确保|验证|测试|检查|确认|核实|观察|评估|保持)/.test(normalized) ||
+    /^(?:verify|test|check|confirm|ensure|validate|observe|assess|keep)\b/i.test(normalized);
+  const pivotsToMutation = /(?:然后|随后|之后|再|并(?:且)?).{0,120}(?:修改|更新|改为|重构|修复|替换|移除|接入|迁移)|(?:then|after(?:wards)?|and then).{0,120}(?:modify|update|change|refactor|fix|replace|remove|wire|migrate)/i.test(normalized);
+  if (validationFirst && !pivotsToMutation) return false;
+  if (/^(?:不(?:会|需|需要|计划)?修改|无需修改|不改变|保持.+不变|no\s+(?:source\s+)?changes?|do\s+not\s+modify|keep.+unchanged)/i.test(normalized)) {
+    return false;
+  }
+  return PLAN_CANDIDATE_MUTATION_RE.test(normalized);
 }
 
 function findTargetRef(text: string, bundle: PlanEvidenceBundle): string {
-  const explicitPaths = [...text.matchAll(PATH_LIKE_RE)]
-    .map((match) => match[1] || "")
-    .filter(Boolean);
+  const explicitPaths = findExplicitPlanPaths(text);
   for (const path of explicitPaths) {
     const exact = bundle.changeTargets.find((target) =>
       workspacePathsReferToSameFile(target, path)
@@ -721,14 +759,47 @@ export function buildPlanCandidate(input: {
 }): PlanCandidate {
   const summary = sectionLines(input.content, /^(?:摘要|目标|用户目标|概述|背景|Summary|Goal|User Goal|Overview|Objective|Background)$/i);
   const findings = sectionLines(input.content, /^(?:已确认证据|已读证据|证据引用|已确认事实|真实发现|发现|当前状态|当前实现|现有架构|项目背景|实现约束|Confirmed Evidence|Read Evidence|Evidence References?|Confirmed Facts|Findings|Current State|Current Implementation|Existing Architecture|Project Context|Implementation Constraints)$/i);
-  const changeLines = sectionLines(input.content, /^(?:关键改动|关键实现改动|实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|落地方案|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Plan of Work)$/i);
-  const changes = changeLines.map((text) => {
-    const targetRef = findTargetRef(text, input.bundle);
+  const changeEntries = sectionEntries(input.content, /^(?:关键改动|关键实现改动|实现改动|实现方案|实施方案|执行方案|架构改动|设计方案|落地方案|Key Changes|Implementation Changes|Implementation Plan|Implementation|Approach|Architecture Changes|Design Changes|Plan of Work)$/i);
+  const changes: PlanCandidateChange[] = [];
+  let activeTargetRef = "";
+  for (const entry of changeEntries) {
+    const text = entry.text;
+    if (entry.kind === "heading") activeTargetRef = "";
+
+    const explicitPaths = findExplicitPlanPaths(text);
+    const ownerLabel = text
+      .replace(/[`*_~]/g, "")
+      .trim();
+    if (
+      explicitPaths.length > 0 &&
+      /^(?:目标文件|修改文件|变更文件|文件|target\s+file|file(?:\s+to\s+change)?)\s*[:：]/i.test(ownerLabel)
+    ) {
+      activeTargetRef = findTargetRef(text, input.bundle);
+      continue;
+    }
+    // Container labels such as "改动内容:" do not end the target ownership
+    // established immediately above them.
+    if (/[:：]\s*$/.test(text) && explicitPaths.length === 0) continue;
+    if (!isPlanCandidateMutationLine(text)) continue;
+    const resolvedTargetRef = findTargetRef(text, input.bundle);
+    const targetRef = explicitPaths.length > 0
+      ? resolvedTargetRef
+      : activeTargetRef || resolvedTargetRef;
+    // The artifact quality gate has already required a concrete implementation
+    // path. Candidate binding is an additional evidence audit: skip a vague
+    // nested sentence when it cannot be bound, but preserve any explicit wrong
+    // path so validation still rejects fabricated or truncated targets.
+    if (!targetRef && explicitPaths.length === 0) continue;
     const evidenceRefs = input.bundle.facts
       .filter((fact) => !targetRef || workspacePathsReferToSameFile(fact.target, targetRef))
       .map((fact) => fact.id);
-    return { text, targetRef, evidenceRefs };
-  });
+    changes.push({ text, targetRef, evidenceRefs });
+    if (targetRef && input.bundle.changeTargets.some((target) => (
+      workspacePathsReferToSameFile(target, targetRef)
+    ))) {
+      activeTargetRef = targetRef;
+    }
+  }
   return {
     bundleHash: input.bundle.hash,
     summary,

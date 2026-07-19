@@ -26,12 +26,14 @@ import {
   normalizeCloudProtocol,
   normalizeCloudToolProtocol,
   resolveEffectiveCloudApiFormat,
-  parseOpenAiResponsesSseText,
+  parseOpenAiResponsesSsePayload,
+  resolveOpenAiResponsesTerminalState,
   type CloudApiProtocol,
   type CloudAuthMode,
   type CloudToolProtocol,
   type OpenAiApiFormat,
   type OpenAiReasoningEffort,
+  type OpenAiResponsesTerminalStatus,
   type ProtocolChatMessage,
   type ReasoningRequestMode,
 } from "./cloudProtocol";
@@ -157,6 +159,8 @@ export interface StreamResult {
   protocolExpectedTool?: string;
   /** Tool names returned by the provider before the mismatched calls were quarantined. */
   protocolActualTools?: string[];
+  /** Structured calls retained only for recovery targeting after quarantine. */
+  protocolActualToolCalls?: StreamedToolCall[];
   /** Tools exposed by the active capability contract when returned calls were outside it. */
   protocolAllowedTools?: string[];
   usage?: {
@@ -167,6 +171,10 @@ export interface StreamResult {
   streamDiagnostics?: StreamSemanticDiagnostics;
   /** Receipt for the exact accepted request that produced this response. */
   visualTransportReceipt?: VisualTransportReceipt;
+  /** Explicit terminal state reported by the OpenAI Responses API. */
+  responseStatus?: OpenAiResponsesTerminalStatus;
+  /** Provider reason when a Responses result ended before completion. */
+  responseIncompleteReason?: string;
 }
 
 export type StreamMirrorKind =
@@ -884,6 +892,14 @@ function isTranscriptCompatibilityRequest(messages: ChatMessage[]): boolean {
   );
 }
 
+function isXmlProviderCompatibilityRequest(messages: ChatMessage[]): boolean {
+  return messages.some((message) =>
+    typeof message.content === "string"
+    && message.content.includes(PROVIDER_COMPATIBILITY_TAG)
+    && message.content.includes("native_tools_disabled=true"),
+  );
+}
+
 function createAbortError(): Error {
   const error = new Error("Aborted");
   error.name = "AbortError";
@@ -893,6 +909,15 @@ function createAbortError(): Error {
 function buildHttpErrorMessage(status: number, statusText: string, errorBody: string): string {
   const detail = String(errorBody || statusText || "").trim().slice(0, 500);
   return detail ? `HTTP ${status}: ${detail}` : `HTTP ${status}: Request failed`;
+}
+
+function createOpenAiResponsesFailureError(payload: unknown): Error {
+  const terminal = resolveOpenAiResponsesTerminalState(payload);
+  const error = new Error(
+    `OPENAI_RESPONSES_FAILED: ${terminal.error || "The provider returned a failed Responses result."}`,
+  );
+  (error as Error & { code?: string }).code = "OPENAI_RESPONSES_FAILED";
+  return error;
 }
 
 function isRecoverableRustStreamReadError(message: string): boolean {
@@ -1080,7 +1105,7 @@ async function postJsonRequest(
     if (signal?.aborted) throw createAbortError();
     const contentType = (result.match(/^__CONTENT_TYPE__:(.*)\n/) || [])[1]?.trim() || "";
     if (contentType.includes("text/event-stream")) {
-      return { output_text: parseOpenAiResponsesSseText(result.replace(/^__CONTENT_TYPE__:.*\n/, "")) };
+      return parseOpenAiResponsesSsePayload(result.replace(/^__CONTENT_TYPE__:.*\n/, ""));
     }
     return JSON.parse(result);
   }
@@ -1102,6 +1127,10 @@ async function postJsonRequest(
     throw new Error(buildHttpErrorMessage(response.status, response.statusText, errorBody));
   }
 
+  const responseContentType = response.headers.get("content-type") || "";
+  if (responseContentType.includes("text/event-stream")) {
+    return parseOpenAiResponsesSsePayload(await response.text());
+  }
   return response.json();
 }
 
@@ -1149,6 +1178,9 @@ async function requestOpenAiNonStreaming(
       acceptedRequestBody = requestBody;
     } else if (apiFormat === "responses") {
       const shouldIncludeTools = !minimalCompatibilityMode && shouldSendNativeTools(settings);
+      const usesXmlToolProtocol =
+        normalizeCloudToolProtocol(settings.toolProtocol) === "xml" ||
+        isXmlProviderCompatibilityRequest(messages);
       const requestCandidates = buildOpenAiResponsesRequestCandidates({
         messages: messages as ProtocolChatMessage[],
         model: settings.model,
@@ -1157,6 +1189,11 @@ async function requestOpenAiNonStreaming(
         reasoningEffort: settings.reasoningEffort,
         compact: true,
         includeTools: shouldIncludeTools,
+        toolProtocol: usesXmlToolProtocol
+          ? "xml"
+          : shouldIncludeTools && (tools?.length || 0) > 0
+          ? "native"
+          : "none",
         targetInputTokens: settings.contextLimit
           ? computeContextBudgets(settings.contextLimit, maxTokens).inputBudget
           : undefined,
@@ -1202,6 +1239,21 @@ async function requestOpenAiNonStreaming(
             settings,
             signal,
           );
+          const candidateTerminal = resolveOpenAiResponsesTerminalState(candidatePayload);
+          if (candidateTerminal.status === "failed") {
+            throw createOpenAiResponsesFailureError(candidatePayload);
+          }
+          if (candidateTerminal.status === "incomplete" || candidateTerminal.status === "in_progress") {
+            payload = candidatePayload;
+            acceptedRequestBody = candidateBody;
+            emitStreamingConsole(
+              "streaming",
+              "warn",
+              `OpenAI responses ended ${candidateTerminal.status}; preserving partial output as truncated`,
+              candidateTerminal.incompleteReason || undefined,
+            );
+            break;
+          }
           const candidateContent = extractOpenAiResponseText(candidatePayload, "responses");
           const candidateToolCalls = extractOpenAiResponsesToolCalls(candidatePayload);
           if (!candidateContent && candidateToolCalls.length === 0) {
@@ -1233,11 +1285,13 @@ async function requestOpenAiNonStreaming(
               gatewayCompactCandidates = buildOpenAiResponsesRequestCandidates({
                 messages: messages as ProtocolChatMessage[],
                 model: settings.model,
+                tools,
                 disableResponseStorage: settings.disableResponseStorage,
                 reasoningEffort: "none",
                 compact: true,
                 compactionMode: "aggressive",
                 includeTools: false,
+                toolProtocol: usesXmlToolProtocol ? "xml" : "none",
                 targetInputTokens: settings.contextLimit
                   ? Math.min(6000, computeContextBudgets(settings.contextLimit, maxTokens).inputBudget)
                   : 6000,
@@ -1305,12 +1359,23 @@ async function requestOpenAiNonStreaming(
       acceptedRequestBody = chatBody;
     }
 
+    const responsesTerminal = !isGemini && apiFormat === "responses"
+      ? resolveOpenAiResponsesTerminalState(payload)
+      : null;
+    if (responsesTerminal?.status === "failed") {
+      throw createOpenAiResponsesFailureError(payload);
+    }
+    const responsesIncomplete = responsesTerminal?.status === "incomplete" || responsesTerminal?.status === "in_progress";
     const content = isGemini ? extractGeminiResponseText(payload) : extractOpenAiResponseText(payload, apiFormat);
-    const toolCalls = isGemini
+    const parsedToolCalls = isGemini
       ? []
       : apiFormat === "chat_completions"
       ? extractOpenAiChatCompletionToolCalls(payload)
       : extractOpenAiResponsesToolCalls(payload);
+    // A function call inside an incomplete response may have truncated JSON
+    // arguments. Keep it out of the executable tool channel until a completed
+    // retry produces a terminal response.
+    const toolCalls = responsesIncomplete ? [] : parsedToolCalls;
     const reasoning = !isGemini && apiFormat === "chat_completions"
       ? extractOpenAiChatCompletionReasoning(payload)
       : {};
@@ -1324,12 +1389,22 @@ async function requestOpenAiNonStreaming(
       actionableContent: semanticProgress.actionableContent,
       semanticContent: semanticProgress.semanticContent,
       toolCalls,
-      finishReason: toolCalls.length > 0
+      finishReason: responsesIncomplete
+        ? "length"
+        : toolCalls.length > 0
         ? "tool_calls"
         : apiFormat === "chat_completions"
           ? extractOpenAiChatCompletionFinishReason(payload)
           : "stop",
       ...reasoning,
+      ...(responsesTerminal && responsesTerminal.status !== "unknown"
+        ? {
+            responseStatus: responsesTerminal.status,
+            ...(responsesTerminal.incompleteReason
+              ? { responseIncompleteReason: responsesTerminal.incompleteReason }
+              : {}),
+          }
+        : {}),
       streamDiagnostics: {
         rawContentChars: semanticProgress.rawContentChars,
         reasoningChars: semanticProgress.reasoningChars,

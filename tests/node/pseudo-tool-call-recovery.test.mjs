@@ -91,14 +91,22 @@ test("detects non-standard tool_code wrapper as protocol mismatch", () => {
   );
 });
 
-test("pseudo tool recovery prompt requires XML tool_use with parameters", () => {
-  const prompt = buildPseudoToolCallRecoveryPrompt("zh", "chat");
+test("XML pseudo tool recovery prompt requires tool_use with parameters", () => {
+  const prompt = buildPseudoToolCallRecoveryPrompt("zh", "chat", true);
 
   assert.match(prompt, /不是可执行工具调用/);
   assert.match(prompt, /<tool_code>/);
   assert.match(prompt, /<tool_use>/);
   assert.match(prompt, /<parameter name="path">/);
   assert.match(prompt, /不要再输出 `\[Tool call: \.\.\.\]`、`<tool_code>/);
+});
+
+test("native pseudo tool recovery prompt uses schemas without XML", () => {
+  const prompt = buildPseudoToolCallRecoveryPrompt("en", "chat", false);
+
+  assert.match(prompt, /formal native tool call/i);
+  assert.match(prompt, /active schema/i);
+  assert.doesNotMatch(prompt, /XML|<tool_use>|<tool>|<parameter/i);
 });
 
 test("XML execute text recovery catches no-evidence plain text stops", () => {

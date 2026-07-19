@@ -34,6 +34,32 @@ export type PlanStreamWatchdogOptionsResolver = (
 // Shared timeout policy for the bounded approved-Plan watchdog retry. It no
 // longer activates or narrows an action-only tool surface.
 export const APPROVED_PLAN_ACTION_REQUIRED_STREAM_MAX_ELAPSED_MS = 45_000;
+export const SUBAGENT_TOOL_STREAM_MAX_OUTPUT_TOKENS = 4_096;
+export const SUBAGENT_FINAL_STREAM_MAX_OUTPUT_TOKENS = 2_048;
+
+export function capSubagentStreamMaxTokens(
+  subagentDepth: number,
+  currentMaxTokens: number | undefined,
+  finalTextOnlyStep = false,
+): number | undefined {
+  if (subagentDepth <= 0) return currentMaxTokens;
+  const budget = finalTextOnlyStep
+    ? SUBAGENT_FINAL_STREAM_MAX_OUTPUT_TOKENS
+    : SUBAGENT_TOOL_STREAM_MAX_OUTPUT_TOKENS;
+  return Math.min(
+    currentMaxTokens || budget,
+    budget,
+  );
+}
+
+export function capSubagentStreamMaxEscalations(
+  subagentDepth: number,
+  maxOutputEscalations: number,
+  finalTextOnlyStep = false,
+): number {
+  if (subagentDepth <= 0) return maxOutputEscalations;
+  return finalTextOnlyStep ? 0 : Math.min(maxOutputEscalations, 1);
+}
 
 export function resolveRecoveryToolChoice(input: {
   isExecuteRecoveryEligible: boolean;
@@ -146,7 +172,7 @@ export async function invokeInitialStreamForIteration(input: {
     config,
     settings,
     effectiveToolProtocol,
-    modelProtocolProfile,
+    runtimeProtocolProfile,
     turnIntent,
     workflowMode,
   } = runtimeState;
@@ -189,7 +215,8 @@ export async function invokeInitialStreamForIteration(input: {
     runtimeIntent === "execute" &&
     isExecuteRecoveryEligible && recoveryActionContract.phase !== "normal";
   const recoveryStreamMaxElapsedMs = approvedPlanRecoveryStreamMaxElapsedMs;
-  const childStreamBounded = (callbacks.getSubagentDepth?.() ?? 0) > 0;
+  const subagentDepth = callbacks.getSubagentDepth?.() ?? 0;
+  const childStreamBounded = subagentDepth > 0;
   const normalApprovedLocalExecutionBounded =
     config.activeProfile === "local" &&
     callbacks.getIsPlanApproved() &&
@@ -256,14 +283,25 @@ export async function invokeInitialStreamForIteration(input: {
       preapprovalPlanQualityRecoveryStreamPolicy,
       currentMaxTokens,
     );
-  const effectiveCurrentMaxTokens = childStreamBounded && finalTextOnlyStep
-    ? Math.min(policyCurrentMaxTokens || 2_048, 2_048)
-    : policyCurrentMaxTokens;
-  const effectiveMaxOutputEscalations =
+  // Child work is deliberately narrow, but the tool phase still needs room for
+  // models that reason before emitting a call. Keep that phase bounded with
+  // one finite escalation; make the forced final-prose phase smaller and
+  // non-escalating so report synthesis cannot become a second parent run.
+  const effectiveCurrentMaxTokens = capSubagentStreamMaxTokens(
+    subagentDepth,
+    policyCurrentMaxTokens,
+    finalTextOnlyStep,
+  );
+  const policyMaxOutputEscalations =
     capPreapprovalPlanQualityRecoveryMaxEscalations(
       preapprovalPlanQualityRecoveryStreamPolicy,
       maxOutputEscalations,
     );
+  const effectiveMaxOutputEscalations = capSubagentStreamMaxEscalations(
+    subagentDepth,
+    policyMaxOutputEscalations,
+    finalTextOnlyStep,
+  );
 
   callbacks.onDebugEvent?.("agent.llm_request_shape", {
     iteration,
@@ -272,7 +310,7 @@ export async function invokeInitialStreamForIteration(input: {
     runtimeIntent,
     activeProfile: config.activeProfile,
     provider: settings.provider || "unknown",
-    providerFamily: modelProtocolProfile.providerFamily,
+    providerFamily: runtimeProtocolProfile.providerFamily,
     model: settings.model,
     apiProtocol: settings.apiProtocol,
     useRustProxy: settings.useRustProxy,

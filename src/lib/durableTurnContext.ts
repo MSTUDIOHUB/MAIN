@@ -1,8 +1,13 @@
 import type { TaskBlock } from "./taskTypes";
 import { classifyKnownBuiltInTool } from "./toolCapabilities";
 import { buildCanonicalCompletedTurnMessages } from "./turnContext";
-import { isEphemeralPlanArtifactPath, type DurableTurnContext } from "./workflowModels";
+import {
+  isEphemeralPlanArtifactPath,
+  type DurableTurnContext,
+  type DurableTurnExecutionSummary,
+} from "./workflowModels";
 import { classifyCommandResultOutcome } from "./planEvidence";
+import { isNoOpToolFeedback } from "./toolFeedbackEnvelope";
 
 const VALIDATION_TARGET_RE = /(?:\btest\b|pytest|vitest|jest|playwright|\bbuild\b|\blint\b|typecheck|\btsc\b|cargo\s+check|go\s+test)/i;
 
@@ -23,12 +28,31 @@ function unique(values: string[], maxItems = 24): string[] {
   return [...new Set(values.map((value) => compact(value)).filter(Boolean))].slice(0, maxItems);
 }
 
+function extractReportedChangedPaths(resultText: string): string[] {
+  const source = String(resultText || "").trim();
+  if (!source.startsWith("{")) return [];
+  try {
+    const payload = JSON.parse(source) as Record<string, unknown>;
+    const values = Array.isArray(payload.changedFiles)
+      ? payload.changedFiles
+      : Array.isArray(payload.changedPaths)
+        ? payload.changedPaths
+        : [];
+    return values
+      .map((value) => compact(value))
+      .filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 export function buildDurableTurnContext(input: {
   turnId: string;
   turnBlocks: TaskBlock[];
   fallbackAssistantText?: string;
   artifactPaths?: string[];
   unfinished?: string[];
+  advisories?: string[];
   now?: number;
 }): DurableTurnContext | null {
   const canonicalMessages = buildCanonicalCompletedTurnMessages({
@@ -43,6 +67,34 @@ export function buildDurableTurnContext(input: {
     .find((message) => message.role === "assistant")?.content || "";
   if (visibleUserMessages.length === 0 || !finalAssistantAnswer) return null;
 
+  const execution = collectDurableTurnExecutionSummary({
+    turnBlocks: input.turnBlocks,
+    artifactPaths: input.artifactPaths,
+    unfinished: input.unfinished,
+    advisories: input.advisories,
+  });
+
+  return {
+    schemaVersion: 1,
+    turnId: input.turnId,
+    visibleUserMessages,
+    finalAssistantAnswer,
+    execution,
+    committedAt: input.now ?? Date.now(),
+  };
+}
+
+/**
+ * Derive user-safe execution evidence without requiring a model-authored final
+ * answer. The terminal presentation layer uses this when a completed run ends
+ * on a tool-only or blank model turn.
+ */
+export function collectDurableTurnExecutionSummary(input: {
+  turnBlocks: TaskBlock[];
+  artifactPaths?: string[];
+  unfinished?: string[];
+  advisories?: string[];
+}): DurableTurnExecutionSummary {
   const decisions: string[] = [];
   const modifiedFiles: string[] = [];
   const validations: string[] = [];
@@ -70,12 +122,19 @@ export function buildDurableTurnContext(input: {
       ? classifyCommandResultOutcome(block.toolName, resultText)
       : null;
     const commandFailed = commandOutcome === "failed";
+    const noOp = isNoOpToolFeedback(resultText);
     if (
       block.toolStatus === "executed" &&
-      (risk === "workspace_write" || risk === "destructive") &&
-      !isEphemeralPlanArtifactPath(target)
+      !noOp &&
+      (risk === "workspace_write" || risk === "destructive")
     ) {
-      modifiedFiles.push(target);
+      const reportedChangedPaths = extractReportedChangedPaths(resultText);
+      const mutationTargets = reportedChangedPaths.length > 0
+        ? reportedChangedPaths
+        : [target];
+      modifiedFiles.push(...mutationTargets.filter((path) =>
+        !isEphemeralPlanArtifactPath(path)
+      ));
     }
     if (
       block.toolStatus === "executed" &&
@@ -92,19 +151,13 @@ export function buildDurableTurnContext(input: {
   }
 
   return {
-    schemaVersion: 1,
-    turnId: input.turnId,
-    visibleUserMessages,
-    finalAssistantAnswer,
-    execution: {
-      decisions: unique(decisions),
-      modifiedFiles: unique(modifiedFiles),
-      validations: unique(validations),
-      failures: unique(failures),
-      unfinished: unique(input.unfinished || []),
-      artifacts: unique(input.artifactPaths || []),
-    },
-    committedAt: input.now ?? Date.now(),
+    decisions: unique(decisions),
+    modifiedFiles: unique(modifiedFiles),
+    validations: unique(validations),
+    failures: unique(failures),
+    unfinished: unique(input.unfinished || []),
+    advisories: unique(input.advisories || []),
+    artifacts: unique(input.artifactPaths || []),
   };
 }
 
@@ -123,6 +176,7 @@ export function serializeDurableTurnContextForModel(
     `validations: ${JSON.stringify(execution.validations)}`,
     `failures: ${JSON.stringify(execution.failures)}`,
     `unfinished: ${JSON.stringify(execution.unfinished)}`,
+    `advisories: ${JSON.stringify(execution.advisories || [])}`,
     `artifacts: ${JSON.stringify(execution.artifacts)}`,
     "[/durable_turn_context]",
   ].join("\n");

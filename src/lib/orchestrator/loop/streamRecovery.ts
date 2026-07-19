@@ -1150,6 +1150,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           imageHandling: compatibilityImageHandling,
         }),
         workflowMode,
+        iterationAllTools,
       );
       replaceMessagesForRetry({
         callbacks,
@@ -1230,6 +1231,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
             imageHandling: providerCompatibilityImageHandling,
           }),
           workflowMode,
+          iterationAllTools,
         );
         logAgentEvent("provider_compatibility_retry_visual_context", {
           iteration,
@@ -1288,6 +1290,7 @@ export async function invokeStreamWithRecoveryForIteration(input: {
           const transcriptMessages = buildTranscriptCompatibilityRetryMessages(
             managedAgentMessages,
             workflowMode,
+            iterationAllTools,
           );
           replaceMessagesForRetry({
             callbacks,

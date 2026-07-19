@@ -132,6 +132,7 @@ export function resolveUnityMcpForcedConsoleResult(input: {
   results: ToolExecutionResult[];
   unityMcpForceConsoleFirstPending: boolean;
   unityConsoleMissingFirstToolRepromptIssued: boolean;
+  forceXmlTools: boolean;
   language: "zh" | "en";
 }): {
   unityMcpForceConsoleFirstPending: boolean;
@@ -143,6 +144,7 @@ export function resolveUnityMcpForcedConsoleResult(input: {
     results,
     unityMcpForceConsoleFirstPending,
     unityConsoleMissingFirstToolRepromptIssued,
+    forceXmlTools,
     language,
   } = input;
 
@@ -174,9 +176,13 @@ export function resolveUnityMcpForcedConsoleResult(input: {
         unityMcpForceConsoleFirstPending: true,
         unityConsoleMissingFirstToolRepromptIssued: true,
         fallbackReason: null,
-        prompt: language === "zh"
-          ? "你已经调用了可用工具，但这轮是 Unity console 诊断路径，仍缺少必需的 `read_console`。下一条请只输出一个标准 XML `<tool_use>` 调用 `read_console`（必要时先 `set_active_instance`），不要输出 `<tool_code>` 或过程说明。"
-          : "You already called an available tool, but this Unity console diagnostics path still requires `read_console`. In the next reply, output exactly one standard XML `<tool_use>` call for `read_console` (use `set_active_instance` first only if required), with no `<tool_code>` wrapper and no process narration.",
+        prompt: forceXmlTools
+          ? language === "zh"
+            ? "你已经调用了可用工具，但这轮是 Unity console 诊断路径，仍缺少必需的 `read_console`。下一条请只输出一个标准 XML `<tool_use>` 调用 `read_console`（必要时先 `set_active_instance`），不要输出 `<tool_code>` 或过程说明。"
+            : "You already called an available tool, but this Unity console diagnostics path still requires `read_console`. In the next reply, output exactly one standard XML `<tool_use>` call for `read_console` (use `set_active_instance` first only if required), with no `<tool_code>` wrapper and no process narration."
+          : language === "zh"
+            ? "你已经调用了可用工具，但这轮是 Unity console 诊断路径，仍缺少必需的 `read_console`。下一条请从当前 native schema 发起一个正式工具调用：必要时先调用 `set_active_instance`，否则直接调用 `read_console`。不要输出文本工具占位符或过程说明。"
+            : "You already called an available tool, but this Unity console diagnostics path still requires `read_console`. Make one formal tool call from the active native schemas next: use `set_active_instance` only if required; otherwise call `read_console` directly. Do not emit a text tool placeholder or process narration.",
       };
     }
     return {

@@ -73,6 +73,12 @@ test("named function choice quarantines a different provider tool call", () => {
   assert.equal(mismatched.protocolViolation, "required_function_call_mismatch");
   assert.equal(mismatched.protocolExpectedTool, "apply_patch");
   assert.deepEqual(mismatched.protocolActualTools, ["read_file"]);
+  assert.deepEqual(mismatched.protocolActualToolCalls, [{
+    index: 0,
+    id: "call-read",
+    name: "read_file",
+    arguments: "{}",
+  }]);
   assert.deepEqual(mismatched.toolCalls, [], "the mismatched read must never reach IPC execution");
 });
 
@@ -110,6 +116,12 @@ test("required capability quarantines calls outside the exposed tool surface", (
     "wait_subagents",
   ]);
   assert.deepEqual(unavailable.protocolActualTools, ["read_file"]);
+  assert.deepEqual(unavailable.protocolActualToolCalls, [{
+    index: 0,
+    id: "call-read",
+    name: "read_file",
+    arguments: "{}",
+  }]);
   assert.deepEqual(unavailable.toolCalls, []);
 
   const legalAlternative = protocol.annotateRequiredToolCallProtocolResult(

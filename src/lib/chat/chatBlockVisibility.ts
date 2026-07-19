@@ -26,7 +26,15 @@ export function hasRenderableAgentBlock(block: any) {
 }
 
 export function getLastAgentSummaryText(blocks: any[]) {
-  const agentBlock = [...blocks]
+  const explicitFinal = [...blocks]
+    .reverse()
+    .find((block) =>
+      block.type === "agent" &&
+      block.visibility === "assistant_final" &&
+      !block.hiddenProcess &&
+      hasRenderableAgentBlock(block)
+    );
+  const agentBlock = explicitFinal || [...blocks]
     .reverse()
     .find((block) => block.type === "agent" && !block.hiddenProcess && hasRenderableAgentBlock(block));
   if (!agentBlock) return "";

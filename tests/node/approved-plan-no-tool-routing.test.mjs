@@ -177,7 +177,7 @@ test("browser review remains an automatic evidence blocker when browser automati
   assert.equal(available.shouldHandleApprovedPlanNoTool, true);
 });
 
-test("an unavailable browser cannot hide a missing mutation in the same task", () => {
+test("an unavailable optional browser check becomes advisory only after the mutation is proven", () => {
   const planTasks = [{
     id: "task-mutation-and-browser",
     text: "Update the page, then verify the rendered result",
@@ -208,7 +208,30 @@ test("an unavailable browser cannot hide a missing mutation in the same task", (
   assert.equal(beforeMutation.audit.acceptedCompletion, false);
   assert.equal(beforeMutation.shouldHandleApprovedPlanNoTool, true);
   assert.equal(afterMutation.audit.tasks[0].evidenceStatus, "requires_browser_validation");
-  assert.equal(afterMutation.audit.acceptedCompletion, false);
-  assert.equal(afterMutation.hasRemainingApprovedPlanTasks, true);
-  assert.equal(afterMutation.shouldHandleApprovedPlanNoTool, true);
+  assert.equal(afterMutation.audit.acceptedCompletion, true);
+  assert.equal(afterMutation.hasRemainingApprovedPlanTasks, false);
+  assert.equal(afterMutation.shouldHandleApprovedPlanNoTool, false);
+});
+
+test("an explicit browser interaction remains blocking when browser automation is unavailable", () => {
+  const decision = route({
+    planTasks: [{
+      id: "task-required-browser",
+      requirementRef: "USER-VALIDATION-required-browser",
+      text: "Click Open and confirm the preview updates",
+      status: "pending",
+      executionKind: "validation",
+      evidence: [{
+        kind: "browser_dom",
+        value: "browser interaction: click Open",
+        requiresInteraction: true,
+      }],
+    }],
+    availableToolNames: new Set(["read_file", "run_command"]),
+  });
+
+  assert.equal(decision.audit.tasks[0].evidenceStatus, "requires_browser_validation");
+  assert.equal(decision.audit.acceptedCompletion, false);
+  assert.equal(decision.hasRemainingApprovedPlanTasks, true);
+  assert.equal(decision.shouldHandleApprovedPlanNoTool, true);
 });

@@ -1,4 +1,8 @@
-import { previewApplyPatch, summarizeApplyPatchTarget } from "./applyPatchTool";
+import {
+  previewApplyPatch,
+  summarizeApplyPatchTarget,
+  type ApplyPatchPathAvailability,
+} from "./applyPatchTool";
 import {
   buildExecutePatchMismatchFingerprint,
   normalizeRecoveryReadRange,
@@ -32,6 +36,7 @@ export interface WorkspaceMutationPreflightInput {
   readFileMetadata?: (
     path: string,
   ) => Promise<{ sizeBytes: number; modifiedMs: number } | null>;
+  probeFileAvailability?: (path: string) => Promise<ApplyPatchPathAvailability>;
 }
 
 function asText(value: unknown): string {
@@ -211,7 +216,11 @@ export async function preflightWorkspaceMutation(
     const patchTarget = summarizeApplyPatchTarget(patch) ||
       patch.match(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/m)?.[1]?.trim() ||
       "patch";
-    const preview = await previewApplyPatch(patch, input.readFile);
+    const preview = await previewApplyPatch(
+      patch,
+      input.readFile,
+      input.probeFileAvailability,
+    );
     if (!preview.ok) {
       const recoveryTarget = preview.changes[0]?.path || patchTarget;
       const patchRecoveryMismatch = await buildPatchRecoveryMismatchEvidence({

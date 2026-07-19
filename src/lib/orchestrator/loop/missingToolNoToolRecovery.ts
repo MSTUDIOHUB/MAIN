@@ -82,6 +82,7 @@ export function handleMissingToolNoToolRecovery(input: {
   workflowMode: "chat" | "edit" | "plan";
   turnIntent: ResolvedUserIntent;
   runtimeIntent: ResolvedUserIntent;
+  forceXmlTools: boolean;
   mainModeKey?: MainModeKey;
   hasMeaningfulVisibleText: boolean;
   compactedProseCodeDump: boolean;
@@ -108,6 +109,7 @@ export function handleMissingToolNoToolRecovery(input: {
     workflowMode,
     turnIntent,
     runtimeIntent,
+    forceXmlTools,
     mainModeKey,
     hasMeaningfulVisibleText,
     compactedProseCodeDump,
@@ -229,6 +231,7 @@ export function handleMissingToolNoToolRecovery(input: {
           effectiveMissingToolKind === "none" ? "generic" : effectiveMissingToolKind,
           MODEL_CONTROL_LANGUAGE,
           consecutiveNoToolCount,
+          forceXmlTools,
         ),
   });
   if (missingToolCallRepromptKind === "post_write_verify") {

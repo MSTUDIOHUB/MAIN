@@ -64,6 +64,7 @@ const {
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planRuntime.ts"));
 
 const {
+  buildPlanPostConvergenceToolRedirectPrompt,
   buildPlanRuntimeCapsuleNarration,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/planOrchestration.ts"));
 
@@ -82,6 +83,23 @@ test("plan runtime capsule narration exposes only fixed user-safe drafting state
   );
   assert.equal(buildPlanRuntimeCapsuleNarration("review_ready", "zh"), "");
   assert.equal(buildPlanRuntimeCapsuleNarration("blocked", "en"), "");
+});
+
+test("non-executable test plans get a reason-specific rewrite contract", () => {
+  const prompt = buildPlanPostConvergenceToolRedirectPrompt({
+    language: "zh",
+    toolNames: [],
+    phase: "needs_rewrite",
+    qualityGateReason: "non_executable_test_plan",
+    missingSections: [],
+  });
+
+  assert.match(prompt, /测试方案已经存在/);
+  assert.match(prompt, /精确可运行命令/);
+  assert.match(prompt, /具体输入\/准备或操作/);
+  assert.match(prompt, /可观察的具体预期结果\/断言/);
+  assert.match(prompt, /保持用户目标、已有证据、实现范围和目标文件不变/);
+  assert.doesNotMatch(prompt, /补齐.*缺失章节/);
 });
 
 const allPlanTools = [

@@ -95,6 +95,33 @@ test("tool lifecycle keeps edit diff previews through completion", () => {
   assert.match(source, /withTurnRuntimePhaseStatus/);
 });
 
+test("scoped read fan-out applies lifecycle hooks per target and exposes partial coverage", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
+  const start = source.indexOf("async function executeScopedReadFanOutWithLifecycle");
+  const end = source.indexOf("async function executeToolCallWithLifecycle", start);
+  const fanOutSource = source.slice(start, end);
+
+  assert.notEqual(start, -1);
+  assert.ok(end > start);
+  assert.match(fanOutSource, /Promise\.all\(scopedReadPaths\.map\(async \(sourcePath\)/);
+  assert.ok(
+    fanOutSource.indexOf("const baseValidationError") <
+      fanOutSource.indexOf("Promise.all(scopedReadPaths.map"),
+    "shared arguments must be validated before per-path fan-out",
+  );
+  assert.match(fanOutSource, /subagent_scoped_read_invalid_arguments/);
+  assert.match(fanOutSource, /recordSubagentScopeBlockedTool/);
+  assert.match(fanOutSource, /sharedFailure \? \[\] : failed\.map/);
+  assert.match(fanOutSource, /SCOPED_READ_EXACT_FALLBACK/);
+  assert.match(fanOutSource, /scopedReadTarget: sourcePath[\s\S]*"PreToolUse"/);
+  assert.match(fanOutSource, /"PostToolUse"[\s\S]*toolArgs: effectiveArgs/);
+  assert.match(fanOutSource, /SCOPED_READ_HOOK_PATH_BLOCKED/);
+  assert.match(fanOutSource, /requiredPaths: \[\.\.\.scopedReadPaths\]/);
+  assert.match(fanOutSource, /coveredPaths: successful\.map/);
+  assert.match(fanOutSource, /failedPaths: sharedFailure \? \[\] : failed\.map/);
+  assert.match(fanOutSource, /if \(failed\.length > 0\)[\s\S]*isError: true[\s\S]*scopedReadCoverage: coverage/);
+});
+
 test("pending review materializes a visible tool card for ExecutionCapsule", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
 
@@ -596,7 +623,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(turnPreparationSource, /export async function loadAgentLoopHooksConfig/);
   assert.match(turnPreparationSource, /export async function runAgentLoopStartHooks/);
   assert.match(turnPreparationSource, /export function createTaskTargetingRuntime/);
-  assert.match(turnPreparationSource, /export function startModelProbeForTurn/);
+  assert.doesNotMatch(turnPreparationSource, /startModelProbeForTurn/);
   assert.match(turnPreparationSource, /export function createTurnEventEmitter/);
   assert.match(turnPreparationSource, /export function emitInitialTurnPreparationEvents/);
   assert.match(turnPreparationSource, /computeDynamicLocalContextLimit/);
@@ -605,7 +632,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(turnPreparationSource, /buildSystemPrompt/);
   assert.match(turnPreparationSource, /tool_protocol_card_applied/);
   assert.match(turnPreparationSource, /task_orchestrator_phase/);
-  assert.match(turnPreparationSource, /runModelProbe/);
+  assert.doesNotMatch(turnPreparationSource, /runModelProbe|createProbeRunner/);
   assert.match(turnPreparationSource, /runLifecycleHooks/);
   assert.match(streamInvocationSource, /export async function invokeInitialStreamForIteration/);
   assert.match(streamInvocationSource, /llm_request_shape/);
@@ -1103,6 +1130,7 @@ test("agent loop blocks execute completion without execution evidence", () => {
   const runnerSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentLoopRunner.ts"), "utf8");
   const guardsSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/completionGuards.ts"), "utf8");
   const toolActivityTrackingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolActivityTracking.ts"), "utf8");
+  const toolFeedbackSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/toolFeedbackEnvelope.ts"), "utf8");
   const toolIterationPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolIterationPhase.ts"), "utf8");
   const toolCallExecutionPhaseSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"), "utf8");
   const toolResultPostProcessingSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/toolResultPostProcessing.ts"), "utf8");
@@ -1128,7 +1156,8 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(toolActivityTrackingSource, /parseToolFeedbackEnvelope/);
   assert.match(toolActivityTrackingSource, /feedbackStatus === "no_op"/);
   assert.match(toolActivityTrackingSource, /feedbackStatus === "no_effect_mutation"/);
-  assert.match(toolActivityTrackingSource, /already matched requested content/);
+  assert.match(toolActivityTrackingSource, /isNoOpToolFeedback/);
+  assert.match(toolFeedbackSource, /already matched requested content/);
   assert.match(toolActivityTrackingSource, /classifyCommandResultOutcome/);
   assert.match(toolActivityTrackingSource, /browserResultLooksSuccessful/);
   assert.match(toolActivityTrackingSource, /export function rememberToolActivity/);
@@ -1597,7 +1626,7 @@ test("terminal runs persist the turn projection before publishing idle", () => {
   const toolExecutingStart = workflowEngineSource.indexOf("onToolExecuting:", finalTextStart);
   const finalTextCallback = workflowEngineSource.slice(finalTextStart, toolExecutingStart);
   const markerProjectionIndex = workflowEngineSource.indexOf(
-    "const harnessProjection = projectHarnessForAgentLoopOutcome(loopOutcome)",
+    "const harnessProjection = pendingSameTurnExecution",
   );
   const commitIndex = workflowEngineSource.indexOf(
     "const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(",
@@ -1681,4 +1710,73 @@ test("terminal runs persist the turn projection before publishing idle", () => {
   assert.ok(crashStart >= 0 && errorProjectionIndex > crashStart);
   assert.ok(errorPersistIndex > errorProjectionIndex);
   assert.ok(errorPublishIndex > errorPersistIndex);
+});
+
+test("approved-plan same-turn handoff cannot publish a completed logical turn", () => {
+  const workflowEngineSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const terminalStart = workflowEngineSource.indexOf(
+    "return prepareSubagentsForNewTurn().then(executeLoopStrategy).then(async (loopOutcome) =>",
+  );
+  const pendingHandoffIndex = workflowEngineSource.indexOf(
+    "const pendingSameTurnExecution =",
+    terminalStart,
+  );
+  const markerProjectionIndex = workflowEngineSource.indexOf(
+    "const harnessProjection = pendingSameTurnExecution",
+    pendingHandoffIndex,
+  );
+  const completionGateIndex = workflowEngineSource.indexOf(
+    "shouldCommitCompletedTurnFinalPresentation({",
+    markerProjectionIndex,
+  );
+  const terminalCommitIndex = workflowEngineSource.indexOf(
+    "const terminalProjectionCommitted = await commitTerminalProjectionBeforeStatusPublication(",
+    completionGateIndex,
+  );
+  const handoffAttemptIndex = workflowEngineSource.indexOf(
+    "if (pendingSameTurnExecution)",
+    terminalCommitIndex,
+  );
+  const continuationSource = workflowEngineSource.slice(terminalStart, handoffAttemptIndex);
+  const terminalProjectionHelperStart = workflowEngineSource.indexOf(
+    "const commitTerminalProjectionBeforeStatusPublication = async",
+  );
+  const terminalProjectionHelperEnd = workflowEngineSource.indexOf(
+    "const commitTerminalTurnContext =",
+    terminalProjectionHelperStart,
+  );
+  const terminalProjectionHelper = workflowEngineSource.slice(
+    terminalProjectionHelperStart,
+    terminalProjectionHelperEnd,
+  );
+
+  assert.ok(terminalStart >= 0);
+  assert.ok(pendingHandoffIndex > terminalStart);
+  assert.ok(markerProjectionIndex > pendingHandoffIndex);
+  assert.ok(completionGateIndex > markerProjectionIndex);
+  assert.ok(terminalCommitIndex > completionGateIndex);
+  assert.ok(handoffAttemptIndex > terminalCommitIndex);
+  assert.match(
+    continuationSource,
+    /pendingSameTurnExecution\s*\?\s*projectCurrentHarnessRunMarker\("paused", "plan_approval_handoff_pending"\)/,
+  );
+  assert.match(
+    continuationSource,
+    /hasPendingSameTurnExecution: !!pendingSameTurnExecution/,
+  );
+  assert.match(
+    continuationSource,
+    /\{ pendingSameTurnExecution: !!pendingSameTurnExecution \}/,
+  );
+  assert.match(
+    terminalProjectionHelper,
+    /isSameTurnExecutionContinuation[\s\S]*?\? "executing"[\s\S]*?: outcome\.status === "completed"/,
+  );
+  assert.doesNotMatch(
+    continuationSource.slice(pendingHandoffIndex, handoffAttemptIndex),
+    /status:\s*completedTurnHasChanges \? "completed_with_changes" : "done"/,
+  );
 });

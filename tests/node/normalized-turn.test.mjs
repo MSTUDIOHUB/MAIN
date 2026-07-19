@@ -504,10 +504,22 @@ test("normalization preserves quarantined protocol tool metadata for semantic re
     protocolViolation: "required_tool_call_not_available",
     protocolExpectedTool: "run_command",
     protocolActualTools: ["replace_in_file"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "replace-main",
+      name: "replace_in_file",
+      arguments: JSON.stringify({ path: "src/main.js", search_text: "old", replace_text: "new" }),
+    }],
     protocolAllowedTools: ["run_command"],
   });
   assert.equal(normalized.protocolViolation, "required_tool_call_not_available");
   assert.equal(normalized.protocolExpectedTool, "run_command");
   assert.deepEqual(normalized.protocolActualTools, ["replace_in_file"]);
+  assert.deepEqual(normalized.protocolActualToolCalls, [{
+    index: 0,
+    id: "replace-main",
+    name: "replace_in_file",
+    arguments: JSON.stringify({ path: "src/main.js", search_text: "old", replace_text: "new" }),
+  }]);
   assert.deepEqual(normalized.protocolAllowedTools, ["run_command"]);
 });

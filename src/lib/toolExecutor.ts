@@ -28,6 +28,7 @@ import {
   findSymbolReferences,
   runCommand,
   getFileOutline,
+  getFileMetadata,
   ingestAttachmentFile,
   readFile,
   readFileWindow,
@@ -35,7 +36,9 @@ import {
   webFetch,
   webSearch,
   writeChatTempFile,
+  writeChatTempFileCreateNew,
   writeFile,
+  writeFileCreateNew,
   type ShellPermissionApproval,
 } from "./ipc";
 import { isChatAttachmentPath } from "./attachments";
@@ -867,6 +870,13 @@ export async function executeTool(
           await writeFile(path, content, workspace);
         }
       };
+      const writeNewPatchFile = async (path: string, content: string) => {
+        if (shouldUseChatTempStorage(workspace, sessionKey)) {
+          await writeChatTempFileCreateNew(sessionKey!, path, content);
+        } else {
+          await writeFileCreateNew(path, content, workspace);
+        }
+      };
       const deletePatchPath = async (path: string) => {
         if (shouldUseChatTempStorage(workspace, sessionKey)) {
           await deleteChatTempPath(sessionKey!, path);
@@ -874,10 +884,34 @@ export async function executeTool(
           await deleteWorkspacePath(path, workspace);
         }
       };
+      const probePatchPath = async (path: string) => {
+        if (shouldUseChatTempStorage(workspace, sessionKey)) {
+          try {
+            await readChatTempFile(sessionKey!, path);
+            return "exists" as const;
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error || "");
+            return /(?:FILE_METADATA_NOT_FOUND:|No such file or directory|os error 2)/i.test(message)
+              ? "absent" as const
+              : "unknown" as const;
+          }
+        }
+        try {
+          await getFileMetadata(path, workspace);
+          return "exists" as const;
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error || "");
+          return message.startsWith("FILE_METADATA_NOT_FOUND:")
+            ? "absent" as const
+            : "unknown" as const;
+        }
+      };
       const result = await applyWorkspacePatch(patch, {
         readFile: readPatchFile,
         writeFile: writePatchFile,
+        writeNewFile: writeNewPatchFile,
         deletePath: deletePatchPath,
+        probePath: probePatchPath,
       });
       if (!result.ok) {
         throw new Error(result.error || "apply_patch failed.");

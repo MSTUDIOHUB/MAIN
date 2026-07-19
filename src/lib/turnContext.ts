@@ -10,6 +10,7 @@ export interface TurnContextMessageLike {
 export interface TurnContextBlockLike {
   type?: string;
   content?: string;
+  visibility?: string;
   hiddenProcess?: boolean;
   streaming?: boolean;
 }
@@ -137,7 +138,16 @@ export function buildCanonicalCompletedTurnMessages(input: {
     .filter(Boolean)
     .map((content) => ({ role: "user" as const, content }));
 
-  const finalAssistantBlock = [...blocks]
+  const explicitFinalAssistantBlock = [...blocks]
+    .reverse()
+    .find((block) =>
+      block?.type === "agent" &&
+      block.visibility === "assistant_final" &&
+      block.hiddenProcess !== true &&
+      block.streaming !== true &&
+      String(block.content || "").trim().length > 0
+    );
+  const finalAssistantBlock = explicitFinalAssistantBlock || [...blocks]
     .reverse()
     .find((block) =>
       block?.type === "agent" &&

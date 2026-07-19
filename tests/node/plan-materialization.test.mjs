@@ -57,6 +57,7 @@ const {
   canonicalizePlanArtifactContent,
   composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
+  extractNumberedUserGoalFacets,
   extractPlanEvidenceFacts,
   findContradictedPlanDiagnosticClaim,
   isMaterializablePlanLikeText,
@@ -149,6 +150,28 @@ test("numbered user-goal facets require change or decision plus validation cover
     ].join("\n"),
   });
   assert.equal(complete.ok, true, complete.reason);
+});
+
+test("numbered subagent assignment descriptors are collaboration metadata, not acceptance facets", () => {
+  const userGoal = [
+    "请为 creatorName 数据链路生成整改计划。",
+    "1. Euler：scope_key=csv-parser，scope=分析 CSV 字段归一化，allowed_paths=src/hooks/useCsvParser.ts，expected_output=给出文件证据。",
+    "2. Mendel：scope_key=chart-consumer，scope=分析图表消费逻辑，allowed_paths=src/hooks/useChartData.ts，expected_output=说明消费端契约。",
+  ].join("\n");
+
+  assert.deepEqual(extractNumberedUserGoalFacets(userGoal), []);
+  const coverage = validateNumberedUserGoalFacetCoverage({
+    userGoal,
+    content: [
+      "# creatorName 整改计划",
+      "## 关键改动",
+      "- 修改 `src/hooks/useCsvParser.ts` 补齐 creatorName 归一化。",
+      "- 保持 `src/hooks/useChartData.ts` 的消费契约。",
+      "## 测试方案",
+      "- 上传 CSV 并验证 Dashboard 正确显示 creatorName。",
+    ].join("\n"),
+  });
+  assert.equal(coverage.ok, true, coverage.reason || "");
 });
 
 test("numbered facets can use a C/V traceability ledger without duplicating evidence", () => {
@@ -1054,6 +1077,101 @@ test("Plan diagnostic absence claims are rejected when read evidence contains th
   assert.match(materialized.reason || "", /plan_diagnostic_claim_contradicted:DOMContentLoaded/);
 });
 
+test("Plan diagnostic absence claims stay scoped to the named tabular source", () => {
+  const content = [
+    "# CSV creatorName 整改计划",
+    "## 已确认事实",
+    "- `cn_tutorial_orders_by_creator_20260512.csv` 包含 creator 与 amount 列。",
+    "## 根因",
+    "- CSV 物理层不存在 creatorName 列，需要由解析器从 creator 映射。",
+    "## 关键改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，为 creatorName 增加归一化映射。",
+    "## 测试方案",
+    "- 输入仅含 creator 的行；预期输出 creatorName 与 creator 相同；断言两者非空且一致。",
+    "## 风险",
+    "- 保持 creator 兼容字段。",
+  ].join("\n");
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "cn_tutorial_orders_by_creator_20260512.csv",
+    status: "succeeded",
+    summary: "creator,amount\\nalice,12",
+  }, {
+    tool: "read_file",
+    target: "src/hooks/useCsvParser.ts",
+    status: "succeeded",
+    summary: "interface CsvOrder { creator?: string; creatorName?: string }",
+  }, {
+    tool: "read_file",
+    target: "src/types/order.ts",
+    status: "succeeded",
+    summary: "interface Order { creatorName: string; amount: number }",
+  }];
+
+  assert.equal(findContradictedPlanDiagnosticClaim({ content, evidenceRecords }), null);
+});
+
+test("Plan diagnostic tabular absence claims still reject a present CSV column", () => {
+  const content = [
+    "# CSV creatorName 整改计划",
+    "## 根因",
+    "- CSV 数据源不存在 creatorName 列。",
+    "## 关键改动",
+    "- 修改 `src/hooks/useCsvParser.ts` 的字段映射。",
+    "## 验证标准",
+    "- 解析 fixture 并断言输出。",
+    "## 风险",
+    "- 保持兼容。",
+  ].join("\n");
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "orders.csv",
+    status: "succeeded",
+    summary: "creatorName,amount\\nalice,12",
+  }, {
+    tool: "read_file",
+    target: "src/hooks/useCsvParser.ts",
+    status: "succeeded",
+    summary: "interface CsvOrder { creatorName?: string }",
+  }];
+
+  assert.equal(
+    findContradictedPlanDiagnosticClaim({ content, evidenceRecords }),
+    "creatorName",
+  );
+});
+
+test("Plan diagnostic claims do not borrow a column from a different CSV", () => {
+  const content = [
+    "# CSV 整改计划",
+    "## 根因",
+    "- `a.csv` 不存在 creatorName 列，需要从 creator 归一化。",
+    "## 关键改动",
+    "- 修改 `src/hooks/useCsvParser.ts` 的字段映射。",
+    "## 验证标准",
+    "- 解析 a.csv 并断言输出。",
+    "## 风险",
+    "- 保持兼容。",
+  ].join("\n");
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "a.csv",
+    status: "succeeded",
+    summary: "creator,amount\\nalice,12",
+  }, {
+    tool: "read_file",
+    target: "b.csv",
+    status: "succeeded",
+    summary: "creatorName,amount\\nbob,18",
+  }];
+
+  assert.equal(findContradictedPlanDiagnosticClaim({ content, evidenceRecords }), null);
+  assert.equal(findContradictedPlanDiagnosticClaim({
+    content,
+    evidenceRecords: [{ ...evidenceRecords[0], summary: "creatorName,amount\\nalice,12" }],
+  }), "creatorName");
+});
+
 test("Plan diagnostic relation claims do not treat contextual function names as absent", () => {
   const content = [
     "# 修复计划",
@@ -1597,6 +1715,93 @@ test("materializes Gemma4 proposal plan with tables without leaking protocol mar
   assert.match(result.content || "", /\| 文件 \| 改动 \|/);
   assert.match(result.content || "", /\| src\/App\.tsx \| 增加数据映射并接入上传流程 \|/);
   assert.doesNotMatch(result.content || "", /PROPOSAL|user_options|<option|approve_operation_once/i);
+});
+
+test("canonicalizes an H1 summary with numbered bilingual evidence, changes, and validation", () => {
+  const objective = "为 CSV creatorName 数据链路生成一个可审批的整改计划。";
+  const records = [
+    {
+      tool: "read_file",
+      target: "src/hooks/useCsvParser.ts",
+      status: "succeeded",
+      summary: "normalizeCsvOrder maps creator; the returned object is missing creatorName required by downstream consumers",
+    },
+    {
+      tool: "read_file",
+      target: "src/hooks/useChartData.ts",
+      status: "succeeded",
+      summary: "buildCourseRanking reads order.creatorName and only then falls back to order.creator",
+    },
+    {
+      tool: "read_file",
+      target: "src/types/order.ts",
+      status: "succeeded",
+      summary: "Order requires creatorName while CsvOrder currently declares creatorName as optional",
+    },
+    {
+      tool: "read_file",
+      target: "src/store/dashboardStore.ts",
+      status: "succeeded",
+      summary: "dashboard aggregation configures creatorField as creatorName",
+    },
+  ];
+  const bundle = buildPlanEvidenceBundle({ objective, evidenceRecords: records });
+  const visibleText = [
+    "# 摘要",
+    "针对 `creatorName` 数据链路在 CSV 解析、类型定义与图表消费之间的不一致性，制定整改计划以确保数据流完整。",
+    "",
+    "### 1. 证据归因 (Evidence Mapping)",
+    "- **CSV 解析端**：`src/hooks/useCsvParser.ts` 的 `normalizeCsvOrder` 仅映射 `creator`，缺少 `creatorName` 赋值。",
+    "  - *证据*：返回对象只包含 `creator` 键。",
+    "- **消费端契约**：`src/hooks/useChartData.ts` 的 `buildCourseRanking` 访问 `order.creatorName`。",
+    "- **类型契约**：`src/types/order.ts` 的 `Order.creatorName` 必填，而 `CsvOrder.creatorName` 可选。",
+    "- **Store 配置**：`src/store/dashboardStore.ts` 指定 `creatorField = 'creatorName'`。",
+    "",
+    "### 2. 关键实现改动 (Implementation Path)",
+    "- **修复解析逻辑**：修改 `src/hooks/useCsvParser.ts`，在 `normalizeCsvOrder` 中把已解析的 `creator` 同步赋给 `creatorName`。",
+    "- **对齐类型定义**：保持 `Order.creatorName` 的消费契约，并确保 CSV 转换结果始终填充该字段。",
+    "",
+    "### 3. 测试方案 (Validation)",
+    "- **单元测试**：验证 `normalizeCsvOrder`。",
+    "  - *输入*：`{ \"creator\": \"alice\" }`",
+    "  - *预期输出*：`{ \"creator\": \"alice\", \"creatorName\": \"alice\" }`",
+    "- **集成验证**：导入同一 CSV 后检查 Dashboard 使用 `creatorName` 渲染 alice，且不触发 `order.creator` 回退。",
+    "",
+    "### 4. 假设与默认值",
+    "- 假设原始 CSV 的 `creator` 与业务 `creatorName` 语义一致。",
+  ].join("\n");
+
+  // The evidence subsection is not summary pollution merely because the model
+  // used a section-role label as H1.
+  const rawQuality = validateActionablePlanArtifact(visibleText);
+  assert.notEqual(rawQuality.reason, "raw_evidence_in_plan_summary");
+  assert.notEqual(rawQuality.reason, "non_executable_test_plan");
+
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText,
+    userGoal: objective,
+    evidenceRecords: records,
+    files: records.map((record) => record.target),
+    language: "zh",
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.source, "canonicalized_visible_plan");
+  assert.match(result.content || "", /^# 计划$/m);
+  assert.match(result.content || "", /^## 已确认证据$/m);
+  assert.match(result.content || "", /^## 关键改动$/m);
+  assert.match(result.content || "", /^## 测试方案$/m);
+  assert.match(result.content || "", /src\/hooks\/useCsvParser\.ts/);
+  assert.match(result.content || "", /creatorName/);
+  assert.doesNotMatch(result.content || "", /^# 摘要$/m);
+  assert.equal(validateActionablePlanArtifact(result.content || "").ok, true);
+  assert.equal(validatePlanEvidenceGrounding({
+    content: result.content || "",
+    evidenceRecords: records,
+    evidenceBundle: bundle,
+  }).ok, true);
 });
 
 test("repairs visible plan text that has evidence but no explicit user goal section", () => {
@@ -2782,6 +2987,165 @@ test("plan evidence sanitizer retains src-tauri paths without inventing their in
   assert.deepEqual(validatePlanCandidate(candidate, bundle.hash), ["ungrounded_changes"]);
 });
 
+test("candidate evidence binding does not misclassify validation references as source changes", () => {
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-candidate-validation-reference",
+    objective: "修改 src/hooks/useCsvParser.ts，补全 creatorName 映射；其余文件只作契约证据。",
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/hooks/useCsvParser.ts",
+      status: "succeeded",
+      summary: "normalizeCsvOrder maps creator but does not assign creatorName",
+    }, {
+      tool: "read_file",
+      target: "src/hooks/useChartData.ts",
+      status: "succeeded",
+      summary: "buildCourseRanking consumes creatorName and falls back to creator",
+    }, {
+      tool: "read_file",
+      target: "src/store/dashboardStore.ts",
+      status: "succeeded",
+      summary: "creatorField is the creatorName contract key",
+    }, {
+      tool: "read_file",
+      target: "src/types/order.ts",
+      status: "succeeded",
+      summary: "Order requires creatorName as a string",
+    }],
+  });
+  assert.deepEqual(bundle.changeTargets, ["src/hooks/useCsvParser.ts"]);
+
+  const candidate = buildPlanCandidate({
+    content: [
+      "# 计划：creatorName 数据链路整改",
+      "",
+      "## 摘要",
+      "- 补全 creatorName 映射并保持消费契约。",
+      "",
+      "## 已确认证据",
+      "- src/hooks/useCsvParser.ts 当前缺少 creatorName 映射。",
+      "",
+      "## 关键实现改动",
+      "1. 完善解析逻辑：",
+      "- 修改 src/hooks/useCsvParser.ts 中的 normalizeCsvOrder。",
+      "- 增加 creator 到 creatorName 的确定性映射。",
+      "2. 统一类型契约：",
+      "- 对齐 CsvOrder 与 Order 的 creatorName 约束。",
+      "3. 验证 Store 驱动：",
+      "- 确保 src/store/dashboardStore.ts 的 creatorField 能正确驱动更新后的数据流。",
+      "",
+      "## 测试方案",
+      "- 输入 creator=alice，预期 creatorName=alice。",
+    ].join("\n"),
+    bundle,
+  });
+
+  assert.equal(candidate.changes.length > 0, true);
+  assert.equal(candidate.changes.every((change) => change.targetRef === "src/hooks/useCsvParser.ts"), true);
+  assert.deepEqual(validatePlanCandidate(candidate, bundle.hash), []);
+});
+
+test("nested canonical change sections bind descendant mutations to their target-file owner", () => {
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "src/parser.ts",
+    status: "succeeded",
+    summary: "normalizeRow does not assign creatorName from creator",
+  }, {
+    tool: "read_file",
+    target: "src/consumer.ts",
+    status: "succeeded",
+    summary: "buildLabel does not preserve the creator fallback contract",
+  }];
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-nested-target-owner",
+    objective: "修改 src/parser.ts 和 src/consumer.ts，补齐 creatorName 映射并保持消费回退。",
+    evidenceRecords,
+  });
+  assert.deepEqual(new Set(bundle.changeTargets), new Set(["src/parser.ts", "src/consumer.ts"]));
+
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# creatorName 双目标修复计划",
+      "",
+      "## 摘要",
+      "- 补齐解析层 creatorName 映射，并保持消费端回退契约。",
+      "",
+      "## 已确认事实",
+      "- `src/parser.ts` 未填充 creatorName。",
+      "- `src/consumer.ts` 未保持 creator 回退。",
+      "",
+      "## 关键实现改动",
+      "### 1. 解析器改动",
+      "- **目标文件**：`src/parser.ts`",
+      "- **改动内容**：",
+      "  - 补齐 creator 到 creatorName 的确定性映射。",
+      "### 2. 消费端改动",
+      "- **目标文件**：`src/consumer.ts`",
+      "- **改动内容**：",
+      "  - 修复 creatorName 缺失时的 creator 回退。",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 保持现有字段类型，不新增公共 API。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm test` 验证映射和回退场景。",
+      "",
+      "## 假设与默认值",
+      "- 保持其它字段归一化行为不变。",
+    ].join("\n"),
+    userGoal: bundle.objective,
+    evidenceRecords,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true, result.reason);
+  assert.equal(result.candidate?.changes.length, 2, JSON.stringify(result.candidate, null, 2));
+  assert.deepEqual(
+    new Set(result.candidate?.changes.map((change) => change.targetRef)),
+    new Set(["src/parser.ts", "src/consumer.ts"]),
+  );
+  assert.ok(result.candidate?.changes.every((change) => change.evidenceRefs.length > 0));
+  assert.deepEqual(validatePlanCandidate(result.candidate, bundle.hash), []);
+});
+
+test("semantic non-canonical mutation sections reject wrong or unread paths", () => {
+  const cases = [{
+    heading: "修复步骤",
+    plannedTarget: "src/unread.ts",
+    readTarget: "src/read.ts",
+  }, {
+    heading: "Repair Steps",
+    plannedTarget: "src/main.rs",
+    readTarget: "src-tauri/src/main.rs",
+  }];
+
+  for (const fixture of cases) {
+    const validation = validatePlanEvidenceGrounding({
+      content: [
+        "# Repair plan",
+        "",
+        `## ${fixture.heading}`,
+        `- Modify \`${fixture.plannedTarget}\` to repair the confirmed contract gap.`,
+      ].join("\n"),
+      evidenceRecords: [{
+        tool: "read_file",
+        target: fixture.readTarget,
+        status: "succeeded",
+        summary: "The inspected source exposes a concrete contract gap.",
+      }],
+    });
+
+    assert.equal(validation.ok, false, JSON.stringify({ fixture, validation }));
+    assert.match(
+      validation.reason || "",
+      new RegExp(`ungrounded_plan_change_targets:${fixture.plannedTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}`),
+    );
+  }
+});
+
 test("candidate projection does not impose canonical headings after semantic plan validation", () => {
   const bundle = buildPlanEvidenceBundle({
     turnId: "turn-flexible-plan-headings",
@@ -3196,6 +3560,344 @@ test("rejects a structurally complete MD Viewer plan whose test plan is only dia
   });
   assert.equal(materialized.ok, false);
   assert.equal(materialized.reason, "non_executable_test_plan");
+});
+
+test("structured input, expected output, and assertion rows form an executable test plan", () => {
+  const content = [
+    "# CSV creatorName 数据链路修复计划",
+    "",
+    "## 摘要",
+    "- 修复 CSV creator 字段未映射到 creatorName，导致 Dashboard 排名回退的问题。",
+    "",
+    "## 已确认发现",
+    "- `src/hooks/useCsvParser.ts` 当前只返回 `creator`。",
+    "- `src/hooks/useChartData.ts` 读取 `creatorName`。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，让 `normalizeCsvOrder` 同源填充 `creator` 与 `creatorName`。",
+    "- 更新 `src/hooks/useChartData.ts`，保留 `creator` 回退兼容。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- `CsvOrder.creatorName` 保持可选，不新增公共 API。",
+    "",
+    "## 测试方案",
+    "### normalizeCsvOrder 单元场景",
+    "- 输入：`{ creator: 'alice' }`",
+    "- 预期输出：`{ creator: 'alice', creatorName: 'alice' }`",
+    "- 验证方法：断言 `result.creatorName === 'alice'`。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 creator 回退行为不变。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+});
+
+test("concrete input and expected output form an executable scenario without a redundant assertion row", () => {
+  const content = [
+    "# CSV creatorName 数据链路修复计划",
+    "",
+    "## 摘要",
+    "- 修复 CSV creator 字段未映射到 creatorName 的数据链路缺口。",
+    "",
+    "## 已确认发现",
+    "- `src/hooks/useCsvParser.ts` 当前只返回 `creator`。",
+    "- `src/hooks/useChartData.ts` 消费 `creatorName`。",
+    "",
+    "## 关键改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，让 `normalizeCsvOrder` 同源填充 `creator` 与 `creatorName`。",
+    "- 更新 `src/hooks/useChartData.ts`，在解析层修复后移除冗余回退。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 保持 `Order.creatorName: string` 契约，不新增公共 API。",
+    "",
+    "## 测试方案",
+    "### normalizeCsvOrder 单元场景",
+    "- 输入：`{ creator: 'alice', amount: '12' }`",
+    "- 预期输出：`{ creator: 'alice', creatorName: 'alice' }`",
+    "",
+    "## 假设与默认值",
+    "- 当前 CSV 的 creator 与 creatorName 具有相同业务语义。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+});
+
+test("a concrete narrative test case with input and assertion is executable", () => {
+  const content = [
+    "# CSV creatorName 数据链路修复计划",
+    "",
+    "## 摘要",
+    "- 修复 CSV 解析层遗漏 creatorName、导致 Dashboard 回退显示的问题。",
+    "",
+    "## 已确认发现",
+    "- `src/hooks/useCsvParser.ts` 当前未映射 `creatorName`。",
+    "- `src/hooks/useChartData.ts` 优先消费 `creatorName`。",
+    "",
+    "## 关键实现改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，在 `normalizeCsvOrder` 中补齐 `creatorName` 映射。",
+    "- 保持 `src/hooks/useChartData.ts` 的兼容回退行为。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 保持 `Order.creatorName: string` 契约，不新增公共 API。",
+    "",
+    "## 测试方案",
+    "## 1. 单元测试",
+    "- **测试用例 A**：输入包含 `creatorName` 字段的模拟 Row，断言 `normalizeCsvOrder` 返回的对象包含正确姓名。",
+    "- **测试用例 B**：输入不含姓名列的 Row，断言 `creatorName` 返回默认值而非 `undefined`。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 `creator` 回退语义不变。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+});
+
+test("a multi-line action and expected result stay inside one executable test scenario", () => {
+  const content = [
+    "# CSV creatorName 数据链路修复计划",
+    "",
+    "## 摘要",
+    "- 修复 CSV 解析层遗漏 creatorName、导致 Dashboard 回退显示的问题。",
+    "",
+    "## 已确认发现",
+    "- `src/hooks/useCsvParser.ts` 当前未映射 `creatorName`。",
+    "",
+    "## 关键实现改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，在 `normalizeCsvOrder` 中补齐 `creatorName` 映射。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 保持 `Order.creatorName: string` 契约，不新增公共 API。",
+    "",
+    "## 测试方案",
+    "## 1. 集成测试",
+    "- **测试步骤**：",
+    "  - 上传包含姓名列的 CSV。",
+    "  - 观察 Dashboard 的课程排名标签。",
+    "- **预期结果**：标签显示 CSV 中的真实姓名，而不是 creator ID 或 unknown。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 creator 回退语义不变。",
+  ].join("\n");
+
+  const validation = validateActionablePlanArtifact(content);
+  assert.equal(validation.ok, true, validation.reason || "");
+});
+
+test("the real creatorName candidate materializes with frozen evidence and executable tasks", () => {
+  const evidenceRecords = [{
+    tool: "read_file",
+    target: "src/hooks/useCsvParser.ts",
+    status: "succeeded",
+    summary: "normalizeCsvOrder maps creator but does not assign creatorName",
+  }, {
+    tool: "read_file",
+    target: "src/hooks/useChartData.ts",
+    status: "succeeded",
+    summary: "buildCourseRanking consumes creatorName and falls back to creator",
+  }, {
+    tool: "read_file",
+    target: "src/store/dashboardStore.ts",
+    status: "succeeded",
+    summary: "creatorField selects creatorName",
+  }, {
+    tool: "read_file",
+    target: "src/types/order.ts",
+    status: "succeeded",
+    summary: "Order requires creatorName as a string",
+  }];
+  const bundle = buildPlanEvidenceBundle({
+    turnId: "turn-real-creator-name-candidate",
+    objective: "修改 src/hooks/useCsvParser.ts，补齐 creatorName 映射；src/hooks/useChartData.ts、src/store/dashboardStore.ts、src/types/order.ts 只作为消费和类型契约证据。",
+    evidenceRecords,
+  });
+  assert.deepEqual(bundle.changeTargets, ["src/hooks/useCsvParser.ts"]);
+
+  const visibleText = [
+    "# CSV creatorName 数据链路整改计划",
+    "",
+    "## 摘要",
+    "- 修复 CSV 解析层遗漏 creatorName、导致图表消费端只能回退的问题。",
+    "",
+    "## 已确认发现",
+    "- `src/hooks/useCsvParser.ts` 的 `normalizeCsvOrder` 未映射 `creatorName`。",
+    "- `src/hooks/useChartData.ts` 优先消费 `creatorName`，`src/store/dashboardStore.ts` 将其声明为契约字段。",
+    "- `src/types/order.ts` 要求 `Order.creatorName` 为必填字符串。",
+    "",
+    "## 关键实现改动",
+    "### 1. 修复 CSV 归一化逻辑",
+    "- **目标文件**：`src/hooks/useCsvParser.ts`",
+    "- **改动内容**：",
+    "  - 在 `normalizeCsvOrder` 中增加 `creatorName` 映射，并兼容现有 creator 列。",
+    "### 2. 保持类型契约",
+    "- **目标文件**：`src/hooks/useCsvParser.ts`",
+    "- **改动内容**：",
+    "  - 保证解析结果为 `creatorName` 提供字符串值，不改变消费端文件。",
+    "",
+    "## 公共 API / 接口 / 类型",
+    "- 保持 `Order.creatorName: string`，不新增公共 API。",
+    "",
+    "## 测试方案",
+    "### 1. 单元测试",
+    "- **测试用例 A**：输入包含 creatorName 字段的模拟 Row，断言 `normalizeCsvOrder` 返回正确姓名。",
+    "- **测试用例 B**：输入不含姓名列的 Row，断言 `creatorName` 返回默认字符串而非 undefined。",
+    "### 2. 集成测试",
+    "- **测试步骤**：",
+    "  - 上传包含姓名列的 CSV。",
+    "  - 观察 Dashboard 的课程排名标签。",
+    "- **预期结果**：标签显示 CSV 中的真实姓名，而不是 creator ID 或 unknown。",
+    "",
+    "## 假设与默认值",
+    "- 保持现有 creator 回退语义不变。",
+  ].join("\n");
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText,
+    userGoal: bundle.objective,
+    evidenceRecords,
+    evidenceBundle: bundle,
+    expectedEvidenceBundleHash: bundle.hash,
+    language: "zh",
+  });
+
+  assert.equal(result.ok, true, result.reason || "");
+  assert.equal(result.evidenceBundleHash, bundle.hash);
+  assert.ok(result.candidate?.changes.length > 0, JSON.stringify(result.candidate, null, 2));
+  assert.ok(result.candidate?.changes.every((change) => (
+    change.targetRef === "src/hooks/useCsvParser.ts" && change.evidenceRefs.length > 0
+  )));
+  assert.deepEqual(validatePlanCandidate(result.candidate, bundle.hash), []);
+
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: result.path,
+    title: "creatorName 数据链路整改",
+    content: result.content,
+    updatedAt: Date.now(),
+  }]);
+  assert.ok(tasks.some((task) => task.executionKind === "mutation"), JSON.stringify(tasks, null, 2));
+  assert.ok(tasks.some((task) => task.executionKind === "validation"), JSON.stringify(tasks, null, 2));
+});
+
+test("empty structured test labels remain non-executable placeholders", () => {
+  const content = [
+    "# 字段修复计划",
+    "## 用户目标",
+    "- 修复 `src/parser.ts` 的字段映射。",
+    "## 已确认事实",
+    "- 已读源码确认映射缺失。",
+    "## 关键改动",
+    "- 修改 `src/parser.ts`，补齐 creatorName。",
+    "## 执行步骤",
+    "1. 修改解析器。",
+    "2. 验证结果。",
+    "## 验证标准",
+    "- creatorName 与输入一致。",
+    "## 测试方案",
+    "- 输入：",
+    "- 预期输出：",
+    "- 断言：",
+    "## 风险",
+    "- 保持兼容。",
+  ].join("\n");
+
+  const quality = validateActionablePlanArtifact(content);
+  assert.equal(quality.ok, false);
+  assert.equal(quality.reason, "non_executable_test_plan");
+});
+
+test("structured test labels cannot borrow content from the following line", () => {
+  const content = [
+    "# 字段修复计划",
+    "## 用户目标",
+    "- 修复 `src/parser.ts` 的字段映射。",
+    "## 已确认事实",
+    "- 已读源码确认映射缺失。",
+    "## 关键改动",
+    "- 修改 `src/parser.ts`，补齐 creatorName。",
+    "## 执行步骤",
+    "1. 修改解析器。",
+    "2. 验证结果。",
+    "## 验证标准",
+    "- creatorName 与输入一致。",
+    "## 测试方案",
+    "- 输入：",
+    "- 预期输出：",
+    "- 断言：creatorName 与 creator 相等。",
+    "## 风险",
+    "- 保持兼容。",
+  ].join("\n");
+
+  const quality = validateActionablePlanArtifact(content);
+  assert.equal(quality.ok, false);
+  assert.equal(quality.reason, "non_executable_test_plan");
+});
+
+test("structured test rows reject placeholders and cannot span scenario blocks", () => {
+  const buildPlan = (rows) => [
+    "# 字段修复计划",
+    "## 用户目标",
+    "- 修复 `src/parser.ts` 的字段映射。",
+    "## 已确认事实",
+    "- 已读源码确认映射缺失。",
+    "## 关键改动",
+    "- 修改 `src/parser.ts`，补齐 creatorName。",
+    "## 执行步骤",
+    "1. 修改解析器。",
+    "2. 验证结果。",
+    "## 验证标准",
+    "- creatorName 与输入一致。",
+    "## 测试方案",
+    ...rows,
+    "## 风险",
+    "- 保持兼容。",
+  ].join("\n");
+
+  const placeholders = validateActionablePlanArtifact(buildPlan([
+    "- 输入：TBD",
+    "- 预期输出：-",
+    "- 断言：值相等。",
+  ]));
+  assert.equal(placeholders.ok, false);
+  assert.equal(placeholders.reason, "non_executable_test_plan");
+
+  const splitScenarios = validateActionablePlanArtifact(buildPlan([
+    "### 场景一",
+    "- 输入：有效订单。",
+    "### 场景二",
+    "- 预期输出：归一化订单。",
+    "- 断言：值相等。",
+  ]));
+  assert.equal(splitScenarios.ok, false);
+  assert.equal(splitScenarios.reason, "non_executable_test_plan");
+});
+
+test("input coverage requirements are not treated as unsupported source hypotheses", () => {
+  const content = [
+    "# CSV creatorName 整改计划",
+    "## 用户目标",
+    "- 修复 CSV creatorName 数据链路。",
+    "## 已确认事实",
+    "- `orders.csv` 当前包含 creator 与 amount 列。",
+    "## 关键改动",
+    "- 修改 `src/hooks/useCsvParser.ts`，从 creator 归一化 creatorName。",
+    "- 兼容多种可能的 CSV 列名，例如 `row.creatorName` 或中文列名。",
+    "## 执行步骤",
+    "1. 实现字段归一化。",
+    "2. 运行解析测试。",
+    "## 验证标准",
+    "- creator 输入产生非空 creatorName。",
+    "## 测试方案",
+    "- 输入：仅含 creator 的行。",
+    "- 预期输出：creatorName 与 creator 一致。",
+    "- 断言：两者非空且相等。",
+    "## 风险",
+    "- 保留 creator 兼容字段。",
+  ].join("\n");
+
+  assert.equal(validateActionablePlanArtifact(content).ok, true);
 });
 
 test("structural Plan repair preserves the canonical goal and executable MD Viewer test scenarios", () => {
