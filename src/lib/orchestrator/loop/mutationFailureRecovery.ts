@@ -26,18 +26,23 @@ interface MutationFailureResultLike {
 }
 
 /**
- * Complete recovery action for one mutation preflight mismatch. A failed
- * patch stays in the same execution transaction and reuses the versioned
- * source observation already in context. read_file remains available through
- * the stable execution surface; its cache decides whether a later request is
- * a changed/missing window or an unchanged stub. No forced cache bypass is
- * created here.
+ * Complete recovery action for one mutation preflight mismatch. Exact
+ * structured mismatch evidence grants one target/range read lease. Without an
+ * exact range the transaction stays mutation-only and must correct the call
+ * from its retained observation instead of reopening broad diagnosis.
  */
 export interface DirectMutationPreflightRecoveryDecision {
-  mode: "mutation_first";
+  mode: "mutation_first" | "patch_recovery_read";
   reason: MutationPreflightRecoveryReason;
   target: string;
-  readLease: null;
+  readLease: {
+    purpose: "patch_recovery";
+    target: string;
+    requestedRange: NonNullable<PatchRecoveryMismatchEvidence["requestedRange"]>;
+    observedVersion: string | null;
+    mismatchFingerprint: string;
+    state: "available";
+  } | null;
   sourceObservationKey: string | null;
   decisionCheckpoint: ExecutionDecisionCheckpoint;
 }
@@ -122,16 +127,27 @@ export function resolveDirectMutationPreflightRecovery(input: {
       retainedObservation?.versionToken ||
       null;
     const sourceObservationKey = retainedObservation?.key || null;
+    const requestedRange = mismatchEvidence?.requestedRange || null;
+    const readLease = requestedRange && mismatchEvidence?.mismatchFingerprint
+      ? {
+          purpose: "patch_recovery" as const,
+          target,
+          requestedRange,
+          observedVersion,
+          mismatchFingerprint: mismatchEvidence.mismatchFingerprint,
+          state: "available" as const,
+        }
+      : null;
     return {
-      mode: "mutation_first",
+      mode: readLease ? "patch_recovery_read" : "mutation_first",
       reason,
       target,
-      readLease: null,
+      readLease,
       sourceObservationKey,
       decisionCheckpoint: {
         expectedTarget: target,
         sourceObservationKey,
-        nextRequiredCapability: "mutation",
+        nextRequiredCapability: readLease ? "targeted_read" : "mutation",
         evidenceVersion: observedVersion,
       },
     };

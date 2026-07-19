@@ -1,4 +1,5 @@
 import { classifyCommandResultOutcome } from "../../planEvidence";
+import type { ExecuteNoProgressStrategyPivot } from "../../executeRecoveryTools";
 
 export type RecentLoopGuardToolCall = {
   name: string;
@@ -16,6 +17,7 @@ export interface AgentLoopGuardRuntimeState {
   noProgressBatchRepeatCount: number;
   consecutiveReadFileOnlyCacheHits: number;
   lastReadFileOnlyObservationSignature: string;
+  noProgressStrategyPivots: ExecuteNoProgressStrategyPivot[];
   recentToolCalls: RecentLoopGuardToolCall[];
   recentTargetToolCalls: RecentTargetProgressToolCall[];
   repeatGuardRecoveredSignatures: Set<string>;
@@ -29,6 +31,7 @@ export type NoProgressLoopTrackingState = Pick<
   | "noProgressBatchRepeatCount"
   | "consecutiveReadFileOnlyCacheHits"
   | "lastReadFileOnlyObservationSignature"
+  | "noProgressStrategyPivots"
 >;
 
 export type ToolFailureSignatureResult = {
@@ -45,6 +48,7 @@ export function createAgentLoopGuardRuntimeState(): AgentLoopGuardRuntimeState {
     noProgressBatchRepeatCount: 0,
     consecutiveReadFileOnlyCacheHits: 0,
     lastReadFileOnlyObservationSignature: "",
+    noProgressStrategyPivots: [],
     recentToolCalls: [],
     recentTargetToolCalls: [],
     repeatGuardRecoveredSignatures: new Set(),
@@ -61,6 +65,7 @@ export function getNoProgressTrackingRuntimeState(
     noProgressBatchRepeatCount: state.noProgressBatchRepeatCount,
     consecutiveReadFileOnlyCacheHits: state.consecutiveReadFileOnlyCacheHits,
     lastReadFileOnlyObservationSignature: state.lastReadFileOnlyObservationSignature,
+    noProgressStrategyPivots: [...state.noProgressStrategyPivots],
   };
 }
 
@@ -74,6 +79,7 @@ export function applyNoProgressTrackingRuntimeState(
     noProgressBatchRepeatCount: input.noProgressBatchRepeatCount,
     consecutiveReadFileOnlyCacheHits: input.consecutiveReadFileOnlyCacheHits,
     lastReadFileOnlyObservationSignature: input.lastReadFileOnlyObservationSignature,
+    noProgressStrategyPivots: [...(input.noProgressStrategyPivots || [])],
   };
 }
 
@@ -111,6 +117,7 @@ export function resetLoopGuardRuntimeStateAfterMutation(
   state.noProgressBatchRepeatCount = 0;
   state.consecutiveReadFileOnlyCacheHits = 0;
   state.lastReadFileOnlyObservationSignature = "";
+  state.noProgressStrategyPivots.length = 0;
   state.recentToolCalls.length = 0;
   state.recentTargetToolCalls.length = 0;
   state.repeatGuardRecoveredSignatures.clear();

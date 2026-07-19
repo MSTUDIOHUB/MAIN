@@ -16,7 +16,7 @@ import {
   runLifecycleHooks,
   shouldUseXmlToolProtocol,
 } from "../../orchestrator";
-import { buildEffectiveTurnContract, hasExplicitUnityConsoleDiagnosticCue, type CommandDirective, type EffectiveTurnContract, type ResolvedUserIntent } from "../../runIntent";
+import { buildEffectiveTurnContract, hasExplicitUnityConsoleDiagnosticCue, isMutationRuntimeIntent, type CommandDirective, type EffectiveTurnContract, type ResolvedUserIntent } from "../../runIntent";
 import type { StreamSettings } from "../../streaming";
 import { extractCompatibilityTextContent } from "../../providerCompatibility";
 import { buildSubagentSystemPrompt, buildSystemPrompt } from "../../systemPrompt";
@@ -222,7 +222,9 @@ export function resolveAgentLoopTurnInputContext(
     durableContextPreserved: true,
   });
   const repairExecutionRequestInChat =
-    runtimeState.workflowMode === "chat" && looksLikeRepairExecutionRequest(latestUserPromptText);
+    runtimeState.workflowMode === "chat" &&
+    isMutationRuntimeIntent(runtimeState.turnIntent) &&
+    looksLikeRepairExecutionRequest(latestUserPromptText);
   const turnInputContextSignals = extractTurnInputContextSignalsFromMessages(runtimeState.initialMessages);
   const commandDirective = callbacks.getCommandDirective?.() ?? null;
   const gameStudioConfig = callbacks.getGameStudioConfig?.() ?? null;

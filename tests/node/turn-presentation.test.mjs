@@ -20,6 +20,7 @@ new Function("exports", "module", "require", transpiled)(
 );
 
 const {
+  buildCapsuleStatusProjection,
   buildPlanExecutionCapsuleProjection,
   buildTurnPresentationModel,
   canOfferPlanContinuation,
@@ -30,6 +31,48 @@ const {
   resolveTurnPresentationLifecycle,
   shouldRenderTurnBoundary,
 } = module.exports;
+
+test("Capsule status projection exposes only structured high-level lifecycle copy", () => {
+  const cases = [
+    [{ presentation: { intent: "respond", lifecycle: "active", status: "planning" }, isRunActive: true }, "analyzing", "正在分析"],
+    [{ presentation: { intent: "plan", lifecycle: "active", status: "planning" }, planStage: "design" }, "planning", "正在制定计划"],
+    [{ presentation: { intent: "plan", lifecycle: "active", status: "executing" }, planStage: "executing", planExecutionPhase: "tool_start" }, "executing", "正在执行"],
+    [{ presentation: { intent: "plan", lifecycle: "active", status: "executing" }, planStage: "executing", currentTaskExecutionKind: "validation" }, "validating", "正在验证"],
+    [{ presentation: { intent: "plan", lifecycle: "active", status: "executing" }, planExecutionPhase: "auto_resume" }, "recovering", "正在恢复"],
+    [{ presentation: { intent: "plan", lifecycle: "action_required", status: "awaiting_approval" }, actionKind: "plan_review" }, "awaiting_approval", "等待批准"],
+    [{ presentation: { intent: "execute", lifecycle: "action_required", status: "awaiting_input" }, actionKind: "tool_permission" }, "awaiting_permission", "等待权限"],
+    [{ presentation: { intent: "execute", lifecycle: "action_required", status: "awaiting_input" }, actionKind: "user_choice" }, "awaiting_choice", "等待选择"],
+    [{ presentation: { intent: "execute", lifecycle: "resumable", status: "paused" } }, "paused", "已暂停"],
+    [{ presentation: { intent: "execute", lifecycle: "success", status: "done" } }, "completed", "已完成"],
+    [{ presentation: { intent: "execute", lifecycle: "failed", status: "error" } }, "error", "发生错误"],
+  ];
+
+  for (const [input, kind, label] of cases) {
+    assert.deepEqual(buildCapsuleStatusProjection({ ...input, language: "zh" }), { kind, label });
+  }
+
+  assert.deepEqual(buildCapsuleStatusProjection({
+    language: "en",
+    presentation: { intent: "execute", lifecycle: "active", status: "executing" },
+    planExecutionPhase: "context_compression",
+  }), { kind: "recovering", label: "Recovering" });
+
+  const chatAreaSource = fs.readFileSync(
+    path.join(workspaceRoot, "src/components/ChatArea.tsx"),
+    "utf8",
+  );
+  const executionCapsuleSource = fs.readFileSync(
+    path.join(workspaceRoot, "src/components/ExecutionCapsule.tsx"),
+    "utf8",
+  );
+  assert.match(chatAreaSource, /data-testid="capsule-status-label"/);
+  assert.match(chatAreaSource, /className=\{`min-w-0 block flex-1 truncate whitespace-nowrap/);
+  assert.doesNotMatch(chatAreaSource, /currentTurnState\.capsuleExplanation/);
+  assert.doesNotMatch(chatAreaSource, /deriveDynamicFirstPersonText/);
+  assert.doesNotMatch(chatAreaSource, /planExecutionCapsuleProjection\?\.headline/);
+  assert.doesNotMatch(chatAreaSource, /capsuleRunStatus\.activityText/);
+  assert.doesNotMatch(executionCapsuleSource, /\{activeReviewTask\.target\}/);
+});
 
 function turn(overrides = {}) {
   return {

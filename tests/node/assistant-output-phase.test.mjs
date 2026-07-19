@@ -25,6 +25,7 @@ test("assistant output phase owns recovery progress and presentation ordering", 
   const toolProgress = indexOfRequired(phaseSource, /resolveToolProgressRouting\(\{/);
   const protocolClear = indexOfRequired(phaseSource, /resolveToolProtocolStreamClearDecision\(\{/);
   const replyOptions = indexOfRequired(phaseSource, /resolveAssistantReplyOptionRouting\(\{/);
+  const commentary = indexOfRequired(phaseSource, /onAssistantCommentary\(visibleAssistantText/);
   const finalText = indexOfRequired(phaseSource, /onAssistantFinalText\(visibleAssistantText/);
   const postConvergence = indexOfRequired(phaseSource, /handlePlanPostConvergenceToolRedirect\(\{/);
 
@@ -32,8 +33,21 @@ test("assistant output phase owns recovery progress and presentation ordering", 
   assert.ok(languageRecovery < toolProgress);
   assert.ok(toolProgress < protocolClear);
   assert.ok(protocolClear < replyOptions);
-  assert.ok(replyOptions < finalText);
+  assert.ok(replyOptions < commentary);
+  assert.ok(commentary < finalText);
   assert.ok(finalText < postConvergence);
+});
+
+test("assistant output routes substantive tool-call prose through commentary without making it terminal", () => {
+  const phaseSource = sourceFor("src/lib/orchestrator/loop/assistantOutputPhase.ts");
+
+  assert.match(
+    phaseSource,
+    /visibility === "assistant_update"[\s\S]*callbacks\.onAssistantCommentary[\s\S]*callbacks\.onAssistantFinalText/,
+  );
+  assert.match(phaseSource, /callbacks\.onAssistantCommentary\(visibleAssistantText/);
+  assert.match(phaseSource, /finalReplyOptions\.length === 0/);
+  assert.match(phaseSource, /!shouldPauseForUserChoice/);
 });
 
 test("assistant output phase owns progress and no-tool presentation telemetry", () => {

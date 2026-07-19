@@ -244,6 +244,15 @@ test("completion guard maps non-actionable stops to structured loop outcomes", (
       reason: "execute_recovery_no_progress_limit",
     },
   );
+  assert.deepEqual(
+    resolveNonActionableStopOutcome("no_action", {
+      recoveryReason: "execute_no_progress_batch_loop",
+    }),
+    {
+      status: "paused",
+      reason: "execute_no_progress_batch_loop",
+    },
+  );
 });
 
 test("execution evidence completion guard pauses completed execute turns without evidence", () => {

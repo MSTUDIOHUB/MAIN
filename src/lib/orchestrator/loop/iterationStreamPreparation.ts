@@ -38,6 +38,7 @@ import {
   advanceExecuteRecoveryRuntimeIteration,
   buildExecuteRecoveryMaxIterationsPrompt,
   createExecuteRecoveryRuntimeState,
+  resolveExecuteRecoveryNoProgressBoundary,
   shouldReleaseExecuteRecoveryPolicyBoundary,
   type ExecuteRecoveryRuntimeState,
 } from "./executeRecoveryRuntime";
@@ -206,9 +207,15 @@ export async function prepareIterationStreamRequest(input: {
     });
   }
 
+  const capabilityRuntimeIntent: ResolvedUserIntent =
+    workflowMode === "chat" &&
+    isMutationRuntimeIntent(turnIntent) &&
+    input.executeRecoveryState.reason.startsWith("chat_repair_strategy_pivot:")
+      ? "execute"
+      : runtimeIntent;
   const rawIterationAllTools = finalTextOnlyStep || streamRuntimeState.chatFinalSynthesisActive
     ? []
-    : resolveAllToolsForRuntime(runtimeIntent);
+    : resolveAllToolsForRuntime(capabilityRuntimeIntent);
   const rawIterationToolNames = new Set(
     rawIterationAllTools.map((tool) => tool.function.name),
   );
@@ -316,18 +323,7 @@ export async function prepareIterationStreamRequest(input: {
       }),
       maxIterations: executeRecoveryIterationAdvance.maxIterations,
     });
-    logAgentEvent("execute_recovery_max_iterations_reached", {
-      iteration,
-      executeRecoveryMode: executeRecoveryState.mode,
-      executeRecoveryAttempts: executeRecoveryState.attempts,
-      recoveryIterationCount: executeRecoveryState.iterationCount,
-      protocolNoProgressCount: executeRecoveryState.protocolNoProgressCount,
-      protocolNoProgressFingerprint: executeRecoveryState.protocolNoProgressFingerprint,
-      maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
-      disposition: releasePolicyBoundary
-        ? "normal_surface_continuation"
-        : "pause",
-    });
+    let boundaryDisposition = "pause";
     if (releasePolicyBoundary) {
       executeRecoveryState = clearExecuteRecovery(
         "policy_no_progress_boundary_released",
@@ -337,6 +333,7 @@ export async function prepareIterationStreamRequest(input: {
       recoveryBoundaryReleaseNotice = callbacks.getPreferredLanguage() === "zh"
         ? "RECOVERY_POLICY_BOUNDARY_RELEASED: 已保留本轮真实执行证据，并释放了过期的窄事务目标。请使用当前完整但仍受批准范围约束的工具面继续下一项未完成工作或验证；不要重复刚才被策略推迟的同一调用。"
         : "RECOVERY_POLICY_BOUNDARY_RELEASED: durable evidence from this turn was retained and the stale narrow transaction target was released. Continue the next unfinished approved action or validation with the current full, still scope-constrained tool surface; do not repeat the same policy-deferred call.";
+      boundaryDisposition = "normal_surface_continuation";
       logAgentEvent("execute_recovery_policy_boundary_released", {
         iteration,
         previousMode: exhaustedState.mode,
@@ -344,26 +341,63 @@ export async function prepareIterationStreamRequest(input: {
         protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
       });
     } else {
-      const pauseMessage = buildExecuteRecoveryMaxIterationsPrompt({
-        language: callbacks.getPreferredLanguage(),
-        maxIterations: executeRecoveryIterationAdvance.maxIterations,
-      });
-      recoveryPause = {
-        message: pauseMessage,
-        previousMode: exhaustedState.mode,
-        expectedTarget: exhaustedState.expectedTarget,
-        phaseNoProgressCount: exhaustedState.phaseNoProgressCount,
-        protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
-      };
-      executeRecoveryState = clearExecuteRecovery(
-        "max_recovery_iterations_reached",
-        undefined,
-        executeRecoveryState,
+      const currentTaskId = exhaustedState.decisionCheckpoint?.planTaskId || "";
+      const currentTask = callbacks.getPlanTasks().find((task) =>
+        currentTaskId && String(task.id || "") === currentTaskId
       );
+      const strategyBoundary = resolveExecuteRecoveryNoProgressBoundary({
+        state: exhaustedState,
+        cause: "execute_recovery_phase_budget",
+        language: callbacks.getPreferredLanguage(),
+        availableToolNames: rawIterationToolNames,
+        unfinishedObjective: currentTask?.text || latestUserPromptText,
+      });
+      if (strategyBoundary.decision.action === "continue_with_pivot") {
+        executeRecoveryState = strategyBoundary.state;
+        recoveryBoundaryReleaseNotice = strategyBoundary.decision.prompt;
+        boundaryDisposition = `strategy_pivot:${strategyBoundary.decision.strategy}`;
+        logAgentEvent("execute_recovery_strategy_pivot", {
+          iteration,
+          strategy: strategyBoundary.decision.strategy,
+          attemptedStrategies: strategyBoundary.decision.attemptedStrategies,
+          currentTaskId: executeRecoveryState.decisionCheckpoint?.planTaskId || null,
+          expectedTarget: executeRecoveryState.expectedTarget,
+        });
+      } else {
+        const pauseMessage = buildExecuteRecoveryMaxIterationsPrompt({
+          language: callbacks.getPreferredLanguage(),
+          maxIterations: executeRecoveryIterationAdvance.maxIterations,
+        });
+        recoveryPause = {
+          message: pauseMessage,
+          previousMode: exhaustedState.mode,
+          expectedTarget: exhaustedState.expectedTarget,
+          phaseNoProgressCount: exhaustedState.phaseNoProgressCount,
+          protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
+        };
+        executeRecoveryState = clearExecuteRecovery(
+          "max_recovery_iterations_reached",
+          undefined,
+          executeRecoveryState,
+        );
+      }
     }
+    logAgentEvent("execute_recovery_max_iterations_reached", {
+      iteration,
+      executeRecoveryMode: exhaustedState.mode,
+      executeRecoveryAttempts: exhaustedState.attempts,
+      recoveryIterationCount: exhaustedState.iterationCount,
+      protocolNoProgressCount: exhaustedState.protocolNoProgressCount,
+      protocolNoProgressFingerprint: exhaustedState.protocolNoProgressFingerprint,
+      maxRecoveryIterations: executeRecoveryIterationAdvance.maxIterations,
+      attemptedStrategies:
+        exhaustedState.decisionCheckpoint?.noProgressStrategyPivots || [],
+      disposition: boundaryDisposition,
+    });
     executeRecoveryIterationAdvance = {
       ...executeRecoveryIterationAdvance,
       state: executeRecoveryState,
+      reachedMaxIterations: recoveryPause !== null,
     };
   }
 
@@ -465,6 +499,7 @@ export async function prepareIterationStreamRequest(input: {
     iteration,
     workflowMode,
     runtimeIntent,
+    turnIntent,
     rawIterationAllTools,
     executeRecoveryMode: executeRecoveryState.mode,
     executeRecoveryReason: executeRecoveryState.reason,
@@ -484,7 +519,7 @@ export async function prepareIterationStreamRequest(input: {
     latestUserPromptText,
     lastAssistantTextForCheckpoint,
   });
-  applySystemPromptForRuntime(runtimeIntent, toolSurfaceDecision.iterationAllTools);
+  applySystemPromptForRuntime(capabilityRuntimeIntent, toolSurfaceDecision.iterationAllTools);
 
   const contextManagementResult = prepareManagedMessagesForIteration({
     callbacks,

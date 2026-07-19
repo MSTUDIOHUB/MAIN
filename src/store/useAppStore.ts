@@ -129,6 +129,7 @@ import {
   buildPlanExecutionProgressUpdate,
   isPlanReviewExecutionLeaseActive,
   normalizePlanExecutionProgressSnapshot,
+  resolveRestoredPlanExecutionTaskIdentity,
   resolveApprovedPlanInitialExecutionRecovery,
   resolveApprovedPlanSameTurnFallbackDecision,
   toPlanExecutionRuntimeProgressUpdate,
@@ -1688,7 +1689,10 @@ export function normalizeInterruptedConversationTurnsForRestore(
 
 
 
-function normalizeStoredPlanExecutionProgressSnapshot(value: unknown): PlanExecutionProgressSnapshot | null {
+function normalizeStoredPlanExecutionProgressSnapshot(
+  value: unknown,
+  migratedCurrentTaskId?: string,
+): PlanExecutionProgressSnapshot | null {
   const snapshot = value as Partial<PlanExecutionProgressSnapshot> | null | undefined;
   if (!snapshot || typeof snapshot !== "object") return null;
   const turnId = typeof snapshot.turnId === "string" ? snapshot.turnId : "";
@@ -1703,6 +1707,9 @@ function normalizeStoredPlanExecutionProgressSnapshot(value: unknown): PlanExecu
         ? null
         : undefined,
       phase: snapshot.phase || "running",
+      currentTaskId: typeof snapshot.currentTaskId === "string"
+        ? snapshot.currentTaskId
+        : migratedCurrentTaskId,
       currentTask: String(snapshot.currentTask || ""),
       currentTool: String(snapshot.currentTool || ""),
       latestEvidence: String(snapshot.latestEvidence || ""),
@@ -1867,9 +1874,60 @@ export function normalizeSessionRuntimeSnapshot(
   const rejectedReviewablePlanArtifact = restoredPlanArtifacts.rejected.some((artifact) =>
     artifact.kind === "plan" || artifact.kind === "design" || artifact.kind === "bugfix"
   );
+  const restoredArtifactTaskSeed = restoredPlanArtifacts.artifacts
+    .filter((artifact) => artifact.kind === "tasks")
+    .flatMap((artifact) => extractPlanTasks(artifact.content));
+  const rederivedPlanTasks = ensureApprovedPlanRuntimeTasksForState({
+    planArtifacts: restoredPlanArtifacts.artifacts,
+    planTasks: restoredArtifactTaskSeed,
+    planExecutionEvidenceLedger: snapshot.planExecutionEvidenceLedger || [],
+    // Identity migration must inspect the neutral reviewed graph. Marking an
+    // arbitrary first task in_progress before the legacy checkpoint is
+    // resolved would turn an ambiguous same-file graph into a false match.
+    isPlanApproved: false,
+    currentTurnId: snapshot.currentTurnId ?? null,
+    conversationTurns: (snapshot.conversationTurns || []).map((turn) => ({
+      id: turn.id,
+      userPrompt: turn.userPrompt || "",
+    })),
+  }, "zh");
+  const restoredExecutionReadiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: restoredPlanArtifacts.artifacts,
+    executionPlanTasks: rederivedPlanTasks,
+  });
+  const restoredTaskIdentity = resolveRestoredPlanExecutionTaskIdentity({
+    snapshot: snapshot.planExecutionProgressSnapshot,
+    tasks: rederivedPlanTasks,
+  });
+  const normalizedHarnessRunMarker = normalizeHarnessRunMarker(snapshot.harnessRunMarker);
+  const restoredProgress = snapshot.planExecutionProgressSnapshot;
+  const expectedProgressTurnId = snapshot.currentTurnId ||
+    snapshot.planApprovalExecutionStartedForTurnId ||
+    null;
+  const progressTurnOwnerValid = !restoredProgress || (
+    typeof restoredProgress.turnId === "string" &&
+    restoredProgress.turnId.length > 0 &&
+    (!expectedProgressTurnId || restoredProgress.turnId === expectedProgressTurnId) &&
+    (snapshot.conversationTurns || []).some((turn) =>
+      turn.id === restoredProgress.turnId && isPlanConversationTurn(turn)
+    )
+  );
+  const restoredActionRunId = getHarnessActionRunId(normalizedHarnessRunMarker);
+  const restoredActionParentRunId = normalizedHarnessRunMarker?.activeParentRunId ||
+    normalizedHarnessRunMarker?.parentRunId ||
+    null;
+  const progressRunOwnerValid = !restoredProgress?.runId || Boolean(
+    restoredActionRunId === restoredProgress.runId &&
+    restoredActionParentRunId === (restoredProgress.parentRunId || null) &&
+    normalizedHarnessRunMarker?.turnId === restoredProgress.turnId
+  );
   const restoredIsPlanApproved =
     snapshot.isPlanApproved === true &&
     !rejectedReviewablePlanArtifact &&
+    restoredExecutionReadiness.ok &&
+    !restoredTaskIdentity.ambiguous &&
+    progressTurnOwnerValid &&
+    progressRunOwnerValid &&
     !!persistedPlanIdentity &&
     !!restoredPlanIdentity &&
     persistedPlanIdentity.revision === restoredPlanIdentity.revision &&
@@ -1877,16 +1935,30 @@ export function normalizeSessionRuntimeSnapshot(
   const hasTasksArtifact = restoredPlanArtifacts.artifacts.some((artifact) =>
     artifact.kind === "tasks" || artifact.kind === "bugfix"
   );
+  const restoredApprovedPlanTasks = restoredTaskIdentity.currentTaskId
+    ? rederivedPlanTasks.map((task) => {
+        if (task.status === "completed" || task.evidenceStatus === "satisfied") return task;
+        return {
+          ...task,
+          status: task.id === restoredTaskIdentity.currentTaskId
+            ? "in_progress" as const
+            : "pending" as const,
+        };
+      })
+    : rederivedPlanTasks;
   const restoredPlanTasks = restoredIsPlanApproved || hasTasksArtifact
-    ? snapshot.planTasks || []
+    ? restoredIsPlanApproved
+      ? restoredApprovedPlanTasks
+      : restoredArtifactTaskSeed
     : [];
-  const restoredPlanStage = derivePlanStageFromArtifacts(
-    restoredPlanArtifacts.artifacts,
-    restoredPlanTasks,
-    restoredIsPlanApproved,
-    snapshot.planStage ?? "idle",
-  );
-  const normalizedHarnessRunMarker = normalizeHarnessRunMarker(snapshot.harnessRunMarker);
+  const restoredPlanStage = snapshot.isPlanApproved === true && !restoredIsPlanApproved
+    ? "plan" as const
+    : derivePlanStageFromArtifacts(
+        restoredPlanArtifacts.artifacts,
+        restoredPlanTasks,
+        restoredIsPlanApproved,
+        snapshot.planStage ?? "idle",
+      );
   const interruptedHarnessRunMarker = normalizedHarnessRunMarker?.status === "running"
     ? {
         ...normalizedHarnessRunMarker,
@@ -2307,7 +2379,10 @@ export function normalizeSessionRuntimeSnapshot(
     planExecutionEvidenceCount: restoredIsPlanApproved ? snapshot.planExecutionEvidenceCount ?? 0 : 0,
     planAutoResumeCount: restoredIsPlanApproved ? Math.max(0, Number(snapshot.planAutoResumeCount) || 0) : 0,
     planExecutionProgressSnapshot: restoredIsPlanApproved
-      ? normalizeStoredPlanExecutionProgressSnapshot(snapshot.planExecutionProgressSnapshot)
+      ? normalizeStoredPlanExecutionProgressSnapshot(
+          snapshot.planExecutionProgressSnapshot,
+          restoredTaskIdentity.currentTaskId,
+        )
       : null,
     planStage: restoredPlanStage,
     isPlanApproved: restoredIsPlanApproved,
@@ -8975,6 +9050,67 @@ export const useAppStore = create<AppState>()(
           resumeSubmission: (nextText, nextImages, nextOptions) => {
             get().sendMessage(nextText, nextImages, nextOptions);
           },
+          onResumeBlocked: (message) => {
+            const ownerTurnId = resumeRequest.uiParentTurnId || get().currentTurnId;
+            if (!ownerTurnId) return;
+            set((s) => {
+              const existingFinal = [...s.taskFlow].reverse().find((block) =>
+                block.turnId === ownerTurnId &&
+                block.type === "agent" &&
+                block.visibility === "assistant_final"
+              );
+              const finalBlockId = existingFinal?.id ?? s._nextTaskId();
+              let foundFinal = false;
+              const taskFlow = s.taskFlow.map((block) => {
+                if (block.id === finalBlockId && block.type === "agent") {
+                  foundFinal = true;
+                  return {
+                    ...block,
+                    content: message,
+                    streaming: false,
+                    hiddenProcess: false,
+                    visibility: "assistant_final" as const,
+                  };
+                }
+                if (
+                  block.turnId === ownerTurnId &&
+                  block.type === "agent" &&
+                  block.visibility === "assistant_final"
+                ) {
+                  return { ...block, visibility: "assistant_update" as const };
+                }
+                return block;
+              });
+              if (!foundFinal) {
+                taskFlow.push({
+                  id: finalBlockId,
+                  turnId: ownerTurnId,
+                  type: "agent",
+                  content: message,
+                  streaming: false,
+                  visibility: "assistant_final",
+                });
+              }
+              return {
+                taskFlow,
+                conversationTurns: s.conversationTurns.map((turn) =>
+                  turn.id === ownerTurnId
+                    ? {
+                        ...turn,
+                        status: "paused" as const,
+                        summary: message,
+                        blockIds: turn.blockIds.includes(finalBlockId)
+                          ? turn.blockIds
+                          : [...turn.blockIds, finalBlockId],
+                      }
+                    : turn
+                ),
+                agentStatus: "idle",
+                isGenerating: false,
+                abortController: null,
+              };
+            });
+          },
           logStoreEvent,
         });
       },
@@ -9924,11 +10060,3 @@ export type { AttachedFile };
 // Test compatibility assertions for run-intent.test.mjs source search
 // const statusOverride = status === "idle" && abortCtrl.signal.aborted ? "stopped_no_action"
 // override: statusOverride
-
-// Test compatibility assertions for plan-execution-recovery.test.mjs source search
-// const emitPlanStreamHeartbeat =
-// streamStatus !== "chunk_progress"
-// streamStatus !== "no_chunk_progress_warning"
-// emitLocalPlanExecutionProgress("running"
-// ChatArea 会持续显示流式进度
-// emitPlanStreamHeartbeat(markerPatch)

@@ -250,6 +250,7 @@ export function resolveNonActionableStopOutcome(
     reason === "no_output" ? "stopped_no_output" :
     progress?.recoveryReason === "approved_plan_completion_guard_no_evidence" ? "stopped_no_action" :
     progress?.recoveryReason === "execute_recovery_no_progress_limit" ? "paused" :
+    progress?.recoveryReason === "execute_no_progress_batch_loop" ? "paused" :
     progress?.recoveryReason === "required_tool_call_protocol_violation_after_change" ? "paused" :
     progress?.recoveryReason === "execute_no_action_after_change" ? "paused" :
     progress?.recoveryReason?.startsWith("desktop_control_") ? "paused" :

@@ -62,10 +62,15 @@ export function shouldCommitPausedTurnFinalPresentation(input: {
   hasDurableMutationEvidence: boolean;
   hasPendingSameTurnExecution?: boolean;
 }): boolean {
-  return input.outcomeStatus === "paused" &&
-    input.recoveryReason === "execute_recovery_no_progress_limit" &&
-    input.hasDurableMutationEvidence &&
-    input.hasPendingSameTurnExecution !== true;
+  if (
+    input.outcomeStatus !== "paused" ||
+    input.hasPendingSameTurnExecution === true
+  ) {
+    return false;
+  }
+  if (input.recoveryReason === "execute_no_progress_batch_loop") return true;
+  return input.recoveryReason === "execute_recovery_no_progress_limit" &&
+    input.hasDurableMutationEvidence;
 }
 
 /**

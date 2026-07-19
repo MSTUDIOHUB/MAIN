@@ -5,10 +5,12 @@ import {
   normalizeExecuteRecoveryMode,
   readEvidenceSatisfiesRecoveryLease,
   resolveExecuteRecoveryActionContract,
+  resolveExecuteNoProgressStrategyDecision,
   type ExecutionDecisionCheckpoint,
   type ExecuteRecoveryMode,
   type ForcedExecuteRecoveryRuntimeState,
   type RecoveryReadLease,
+  type ExecuteNoProgressStrategyDecision,
 } from "../../executeRecoveryTools";
 import { isLocalDevServerHealthProbeCommand } from "../../devServerRuntime";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
@@ -51,11 +53,13 @@ export interface ExecuteRecoveryObservation {
   mutationTargets?: string[];
   validationTarget?: string | null;
   validationToolName?: string | null;
-  /** Present only for a fresh/replayed source observation, never a cache stub. */
+  /** Stable observation identity; an unchanged cache stub may replay it. */
   sourceObservationKey?: string | null;
   sourceRequestedRange?: RecoveryReadLease["requestedRange"];
   sourceObservedVersion?: string | null;
   sourceRangeWasRuntimeNarrowed?: boolean;
+  /** Cache stubs may consume a one-shot lease, but never refresh recovery budgets. */
+  sourceObservationWasCacheStub?: boolean;
 }
 
 export interface PtyObservationPolicyDeferral {
@@ -335,6 +339,8 @@ function inheritExecuteRecoveryCheckpointIdentity(
     previous?.browserLocatorCandidates ?? [];
   const browserRequestedUrl = checkpoint.browserRequestedUrl ||
     previous?.browserRequestedUrl || null;
+  const noProgressStrategyPivots = checkpoint.noProgressStrategyPivots ??
+    previous?.noProgressStrategyPivots ?? [];
   return {
     ...checkpoint,
     ...(planTaskId ? { planTaskId } : {}),
@@ -369,6 +375,9 @@ function inheritExecuteRecoveryCheckpointIdentity(
     ...(browserFailedLocator ? { browserFailedLocator } : {}),
     ...(browserLocatorCandidates.length > 0 ? { browserLocatorCandidates } : {}),
     ...(browserRequestedUrl ? { browserRequestedUrl } : {}),
+    ...(noProgressStrategyPivots.length > 0
+      ? { noProgressStrategyPivots: [...noProgressStrategyPivots] }
+      : {}),
   };
 }
 
@@ -729,6 +738,10 @@ export function transitionExecuteRecoveryRuntimeState(
       (contract.readLease.state === "available" || contract.readLease.state === "active")
         ? contract.readLease
         : null;
+    const commitContextProgress = (next: ExecuteRecoveryRuntimeState) =>
+      observation.sourceObservationWasCacheStub === true
+        ? next
+        : resetExecuteRecoveryPhaseProgress(next);
     if (activeReadLease?.coverageMode === "segmented_exact") {
       const requiredRange = normalizeRecoveryReadRange(
         activeReadLease.requiredRange || activeReadLease.requestedRange,
@@ -761,7 +774,7 @@ export function transitionExecuteRecoveryRuntimeState(
       if (expectedVersion && observedVersion && expectedVersion !== observedVersion) {
         const sourceObservationKey = observation.sourceObservationKey?.trim() || null;
         return {
-          state: resetExecuteRecoveryPhaseProgress({
+          state: commitContextProgress({
             ...transactionState,
             reason: "recovery_plan_line_version_changed",
             sourceObservationKey,
@@ -816,7 +829,7 @@ export function transitionExecuteRecoveryRuntimeState(
       if (observedEnd < requiredEnd) {
         const nextStartLine = observedEnd + 1;
         return {
-          state: resetExecuteRecoveryPhaseProgress({
+          state: commitContextProgress({
             ...transactionState,
             reason: "recovery_plan_line_segment_observed",
             sourceObservationKey,
@@ -848,7 +861,7 @@ export function transitionExecuteRecoveryRuntimeState(
         };
       }
       return {
-        state: resetExecuteRecoveryPhaseProgress({
+        state: commitContextProgress({
           ...transactionState,
           mode: "mutation_first",
           reason: "recovery_context_observed",
@@ -884,7 +897,7 @@ export function transitionExecuteRecoveryRuntimeState(
     if (sourceVersionChanged && activeReadLease?.purpose === "initial_targeting") {
       const sourceObservationKey = observation.sourceObservationKey?.trim() || null;
       return {
-        state: resetExecuteRecoveryPhaseProgress({
+        state: commitContextProgress({
           ...transactionState,
           mode: "action_plus_targeting",
           reason: "recovery_source_version_changed",
@@ -917,7 +930,7 @@ export function transitionExecuteRecoveryRuntimeState(
       if (sourceVersionChanged && currentVersionLease) {
         const sourceObservationKey = observation.sourceObservationKey?.trim() || null;
         return {
-          state: resetExecuteRecoveryPhaseProgress({
+          state: commitContextProgress({
             ...transactionState,
             reason: "recovery_source_version_refreshed",
             sourceObservationKey,
@@ -943,7 +956,7 @@ export function transitionExecuteRecoveryRuntimeState(
       };
     }
     const sourceObservationKey = observation.sourceObservationKey?.trim() || state.sourceObservationKey;
-    const nextState = resetExecuteRecoveryPhaseProgress({
+    const nextState = commitContextProgress({
         ...transactionState,
         mode: "mutation_first",
         reason: "recovery_context_observed",
@@ -1231,6 +1244,66 @@ export function transitionExecuteRecoveryRuntimeState(
   };
 }
 
+export function resolveExecuteRecoveryNoProgressBoundary(input: {
+  state: ExecuteRecoveryRuntimeState;
+  cause: string;
+  language: "zh" | "en";
+  availableToolNames?: Iterable<string> | null;
+  unfinishedObjective?: string | null;
+}): {
+  state: ExecuteRecoveryRuntimeState;
+  decision: ExecuteNoProgressStrategyDecision;
+} {
+  const decision = resolveExecuteNoProgressStrategyDecision({
+    attemptedStrategies: input.state.decisionCheckpoint?.noProgressStrategyPivots,
+    currentTaskId: input.state.decisionCheckpoint?.planTaskId,
+    expectedTarget: input.state.expectedTarget,
+    unfinishedObjective:
+      input.unfinishedObjective || input.state.decisionCheckpoint?.requirementRef,
+    availableToolNames: input.availableToolNames,
+    cause: input.cause,
+    language: input.language,
+  });
+  if (decision.action === "pause") {
+    return { state: input.state, decision };
+  }
+
+  const previousCheckpoint = input.state.decisionCheckpoint;
+  const closeRepeatedRead = Boolean(
+    input.state.readLease &&
+    (input.state.readLease.state === "available" || input.state.readLease.state === "active")
+  );
+  const nextCapability = closeRepeatedRead
+    ? "mutation" as const
+    : previousCheckpoint?.nextRequiredCapability || "mutation";
+  const checkpoint: ExecutionDecisionCheckpoint = {
+    ...(previousCheckpoint || {
+      expectedTarget: input.state.expectedTarget,
+      sourceObservationKey: input.state.sourceObservationKey,
+      nextRequiredCapability: nextCapability,
+    }),
+    expectedTarget: input.state.expectedTarget,
+    sourceObservationKey: input.state.sourceObservationKey,
+    nextRequiredCapability: nextCapability,
+    noProgressStrategyPivots: decision.attemptedStrategies,
+  };
+  return {
+    decision,
+    state: {
+      ...input.state,
+      mode: closeRepeatedRead ? "mutation_first" : input.state.mode,
+      reason: `no_progress_strategy_pivot:${decision.strategy}`,
+      attempts: input.state.attempts + 1,
+      phaseNoProgressCount: 0,
+      iterationCount: 0,
+      protocolNoProgressCount: 0,
+      protocolNoProgressFingerprint: null,
+      readLease: closeRepeatedRead ? null : input.state.readLease,
+      decisionCheckpoint: checkpoint,
+    },
+  };
+}
+
 export function advanceExecuteRecoveryRuntimeIteration(
   state: ExecuteRecoveryRuntimeState,
 ): {
@@ -1327,29 +1400,6 @@ export function shouldReleaseExecuteRecoveryPolicyBoundary(input: {
     isExecuteRecoveryPolicyDeferralFingerprint(
       input.state.protocolNoProgressFingerprint,
     );
-}
-
-/**
- * Undo the iteration-start debit when the runtime itself deferred a call,
- * returned an unchanged cache stub, or only observed a still-running PTY.
- * These outcomes add no diagnostic failure and must not exhaust the six-step
- * no-progress budget merely because the model followed the requested gate.
- */
-export function refundExecuteRecoveryRuntimeIteration(
-  state: ExecuteRecoveryRuntimeState,
-): ExecuteRecoveryRuntimeState {
-  if (state.mode === "normal") return state;
-  const phaseNoProgressCount = Math.max(
-    0,
-    (Number.isFinite(state.phaseNoProgressCount)
-      ? state.phaseNoProgressCount
-      : state.iterationCount || 0) - 1,
-  );
-  return {
-    ...state,
-    phaseNoProgressCount,
-    iterationCount: phaseNoProgressCount,
-  };
 }
 
 export function buildExecuteRecoveryMaxIterationsPrompt(input: {

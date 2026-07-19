@@ -503,8 +503,8 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
     >
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div className="min-w-0 flex flex-wrap items-center gap-2">
-            <span data-testid="execution-capsule-title" className="min-w-0 max-w-full truncate text-[12px] font-semibold text-[var(--surface-text-strong)]" title={resolvedTitle}>
-              {resolvedTitle}
+            <span data-testid="execution-capsule-title" className="min-w-0 max-w-full truncate text-[12px] font-semibold text-[var(--surface-text-strong)]" title={hasPendingToolReview ? copy.pendingReview : resolvedTitle}>
+              {hasPendingToolReview ? copy.pendingReview : resolvedTitle}
             </span>
             <span className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] ${statusToneClass}`}>{resolvedStatus}</span>
             {hasTasks && (
@@ -1005,17 +1005,6 @@ const ExecutionCapsule = memo(function ExecutionCapsule({
                       >
                         {copy.approveDiffOnce}
                       </button>
-                    </div>
-                    <div
-                      className={`mt-3 max-h-[4.8rem] overflow-hidden rounded-xl border border-[rgba(255,255,255,0.06)] bg-[rgba(0,0,0,0.22)] px-3 py-2 font-mono text-[11px] leading-6 ${secondaryText}`}
-                      style={{
-                        overflowWrap: "anywhere",
-                        display: "-webkit-box",
-                        WebkitLineClamp: 3,
-                        WebkitBoxOrient: "vertical",
-                      }}
-                    >
-                      {activeReviewTask.target}
                     </div>
                   </div>
                 )}

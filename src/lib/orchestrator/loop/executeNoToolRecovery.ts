@@ -5,6 +5,11 @@ import {
 import type { ResolvedUserIntent } from "../../runIntent";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import {
+  EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS,
+  resolveExecuteNoProgressStrategyDecision,
+  type ExecuteNoProgressStrategyDecision,
+} from "../../executeRecoveryTools";
+import {
   buildNonActionableStopMessage,
   logAgentEvent,
   MAX_NO_ACTION_RETRIES,
@@ -16,8 +21,77 @@ export type ExecuteNoToolRecoveryResult = {
   consecutiveNoToolCount: number;
 };
 
-export function resolveExecuteNoToolCheckpointLimit(activeProfile: string): number {
-  return activeProfile === "local" ? 5 : MAX_NO_ACTION_RETRIES;
+export function resolveExecuteNoToolCheckpointLimit(_activeProfile: string): number {
+  return MAX_NO_ACTION_RETRIES;
+}
+
+/** Execution recovery budgets are capability-driven, never provider/profile-driven. */
+export function resolveProviderNeutralExecuteNoToolCheckpointLimit(): number {
+  return resolveExecuteNoToolCheckpointLimit("");
+}
+
+export function resolveExecuteNoToolStrategyAtBoundary(input: {
+  callbacks: OrchestratorCallbacks;
+  consecutiveNoToolCount: number;
+  checkpointLimit: number;
+  availableToolNames?: Iterable<string> | null;
+  cause: string;
+}): ExecuteNoProgressStrategyDecision {
+  const recoveryState = input.callbacks.getForcedExecuteRecoveryState?.() || null;
+  const planTaskId = recoveryState?.decisionCheckpoint?.planTaskId || null;
+  const planTasks = input.callbacks.getPlanTasks?.() || [];
+  const checkpointTask = planTaskId
+    ? planTasks.find((task) => String(task.id || "") === planTaskId) || null
+    : null;
+  const inProgressTasks = planTasks.filter((task) => task.status === "in_progress");
+  const currentTask = checkpointTask || (inProgressTasks.length === 1 ? inProgressTasks[0] : null);
+  const attemptedCount = Math.max(
+    0,
+    input.consecutiveNoToolCount - input.checkpointLimit,
+  );
+  const countedAttempts = EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS.slice(0, attemptedCount);
+  const checkpointAttempts = recoveryState?.decisionCheckpoint?.noProgressStrategyPivots || [];
+  return resolveExecuteNoProgressStrategyDecision({
+    attemptedStrategies: [...checkpointAttempts, ...countedAttempts],
+    currentTaskId: planTaskId || currentTask?.id || null,
+    expectedTarget: recoveryState?.expectedTarget || null,
+    unfinishedObjective: currentTask?.text || null,
+    availableToolNames: input.availableToolNames,
+    cause: input.cause,
+    language: input.callbacks.getPreferredLanguage(),
+  });
+}
+
+export function applyExecuteNoToolStrategyPivot(input: {
+  callbacks: OrchestratorCallbacks;
+  decision: Extract<ExecuteNoProgressStrategyDecision, { action: "continue_with_pivot" }>;
+  forceXmlTools: boolean;
+  assistantMsgId?: string;
+  iteration: number;
+  cause: string;
+  runtimeAlreadyPrepared?: boolean;
+}): void {
+  if (!input.runtimeAlreadyPrepared) {
+    if (input.assistantMsgId) {
+      input.callbacks.onStreamToken("__ESCALATION_RESET__:", input.assistantMsgId);
+    }
+    input.callbacks.onStatusChange("running");
+  }
+  if (
+    input.decision.strategy === "alternate_capability_reframe" &&
+    !input.forceXmlTools
+  ) {
+    input.callbacks.onProviderCompatibilityFallback?.(
+      "execute_no_progress_alternate_protocol",
+    );
+  }
+  input.callbacks.appendMessage({ role: "user", content: input.decision.prompt });
+  logAgentEvent("execute_no_progress_strategy_pivot", {
+    iteration: input.iteration,
+    cause: input.cause,
+    strategy: input.decision.strategy,
+    attemptedStrategies: input.decision.attemptedStrategies,
+  });
 }
 
 export function isExecuteRuntimeRequiringEvidence(input: {
@@ -58,7 +132,6 @@ export function handleExecuteNoToolRecovery(input: {
 }): ExecuteNoToolRecoveryResult {
   const {
     callbacks,
-    activeProfile,
     iteration,
     workflowMode,
     turnIntent,
@@ -111,10 +184,27 @@ export function handleExecuteNoToolRecovery(input: {
         protocolViolation: input.protocolViolation,
       },
     );
-    const protocolCheckpointLimit = input.protocolViolationOnly
-      ? Math.min(2, resolveExecuteNoToolCheckpointLimit(activeProfile))
-      : resolveExecuteNoToolCheckpointLimit(activeProfile);
+    const protocolCheckpointLimit = resolveProviderNeutralExecuteNoToolCheckpointLimit();
     if (consecutiveNoToolCount >= protocolCheckpointLimit) {
+      const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
+        callbacks,
+        consecutiveNoToolCount,
+        checkpointLimit: protocolCheckpointLimit,
+        availableToolNames,
+        cause: input.protocolViolation,
+      });
+      if (strategyDecision.action === "continue_with_pivot") {
+        applyExecuteNoToolStrategyPivot({
+          callbacks,
+          decision: strategyDecision,
+          forceXmlTools,
+          assistantMsgId,
+          iteration,
+          cause: input.protocolViolation,
+          runtimeAlreadyPrepared: true,
+        });
+        return finish("continue");
+      }
       const stoppedAfterDurableChange = sawExecuteOperationEvidence;
       const stopMessage = stoppedAfterDurableChange
         ? callbacks.getPreferredLanguage() === "zh"
@@ -183,7 +273,27 @@ export function handleExecuteNoToolRecovery(input: {
       availableToolCount: availableToolNames.size,
     });
 
-    if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
+    const executeCheckpointLimit = resolveProviderNeutralExecuteNoToolCheckpointLimit();
+    if (consecutiveNoToolCount >= executeCheckpointLimit) {
+      const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
+        callbacks,
+        consecutiveNoToolCount,
+        checkpointLimit: executeCheckpointLimit,
+        availableToolNames,
+        cause: "execute_xml_text_without_action",
+      });
+      if (strategyDecision.action === "continue_with_pivot") {
+        applyExecuteNoToolStrategyPivot({
+          callbacks,
+          decision: strategyDecision,
+          forceXmlTools,
+          assistantMsgId,
+          iteration,
+          cause: "execute_xml_text_without_action",
+          runtimeAlreadyPrepared: true,
+        });
+        return finish("continue");
+      }
       logAgentEvent("loop_stop", {
         reason: "execute_xml_text_without_action",
         iteration,

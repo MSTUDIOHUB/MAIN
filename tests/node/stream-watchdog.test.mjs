@@ -346,7 +346,7 @@ test("preapproval plan quality recovery requires a native plan artifact call", (
   }), undefined);
 });
 
-test("local recovery binds only genuinely single-capability phases", () => {
+test("recovery uses a narrow capability surface with provider-neutral required-any", () => {
   const streamInvocationSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
     "utf8",
@@ -365,7 +365,6 @@ test("local recovery binds only genuinely single-capability phases", () => {
     executeRecoveryMode: "mutation_first",
     llmToolNames: ["apply_patch", "replace_in_file", "write_file"],
     forceXmlTools: false,
-    preferExplicitFunction: true,
   }), "required");
 
   const targetedReadContract = resolveExecuteRecoveryActionContract("patch_recovery_read", {
@@ -385,16 +384,14 @@ test("local recovery binds only genuinely single-capability phases", () => {
     executeRecoveryMode: "patch_recovery_read",
     llmToolNames: ["read_file"],
     forceXmlTools: false,
-    preferExplicitFunction: true,
     recoveryActionContract: targetedReadContract,
-  }), { type: "function", function: { name: "read_file" } });
+  }), "required");
 
   assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "patch_recovery_read",
     llmToolNames: ["run_command"],
     forceXmlTools: false,
-    preferExplicitFunction: true,
     recoveryActionContract: targetedReadContract,
   }), undefined, "a missing named capability must not force an unrelated tool call");
   assert.equal(resolveRecoveryToolChoice({
@@ -402,7 +399,6 @@ test("local recovery binds only genuinely single-capability phases", () => {
     executeRecoveryMode: "patch_recovery_read",
     llmToolNames: ["run_command", "wait_subagents"],
     forceXmlTools: false,
-    preferExplicitFunction: true,
     recoveryActionContract: targetedReadContract,
   }), undefined, "a child join does not turn a missing exact capability into required-any");
 
@@ -411,11 +407,10 @@ test("local recovery binds only genuinely single-capability phases", () => {
     executeRecoveryMode: "patch_recovery_read",
     llmToolNames: ["read_file", "wait_subagents"],
     forceXmlTools: false,
-    preferExplicitFunction: true,
   }), "required", "a pending child join must not be quarantined by named read_file choice");
 });
 
-test("local max-iteration continuation binds the first post-mutation action to run_command", () => {
+test("max-iteration continuation exposes command validation with required-any", () => {
   const decision = resolveExecuteMaxIterationsRecoveryDecision({
     evidenceLedger: [{
       id: "mutation-before-boundary",
@@ -433,16 +428,14 @@ test("local max-iteration continuation binds the first post-mutation action to r
     executeRecoveryMode: decision.mode,
     llmToolNames: ["read_file", "run_command"],
     forceXmlTools: false,
-    preferExplicitFunction: true,
-  }), { type: "function", function: { name: "run_command" } });
+  }), "required");
 });
 
-test("local recovery tool choice follows the contract next capability, not the legacy mode label", () => {
+test("recovery required-any follows the contract capability surface, not the legacy mode label", () => {
   const common = {
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "action_plus_targeting",
     forceXmlTools: false,
-    preferExplicitFunction: true,
   };
   const targeting = resolveExecuteRecoveryActionContract("action_plus_targeting", {
     expectedTarget: "src/main.js",
@@ -488,16 +481,16 @@ test("local recovery tool choice follows the contract next capability, not the l
     devServerStatus: "ready",
     devServerNextCapability: "browser",
   });
-  assert.deepEqual(resolveRecoveryToolChoice({
+  assert.equal(resolveRecoveryToolChoice({
     ...common,
     recoveryActionContract: browser,
     llmToolNames: ["browser_evaluate"],
-  }), { type: "function", function: { name: "browser_evaluate" } });
-  assert.deepEqual(resolveRecoveryToolChoice({
+  }), "required");
+  assert.equal(resolveRecoveryToolChoice({
     ...common,
     recoveryActionContract: browser,
     llmToolNames: ["browser_evaluate", "git_status", "read_file"],
-  }), { type: "function", function: { name: "browser_evaluate" } },
+  }), "required",
   "an exact browser checkpoint must bind the browser even when the stable execution surface has other tools");
 
   const migratedPostMutation = resolveExecuteRecoveryActionContract("validation_only", {
@@ -517,14 +510,13 @@ test("local recovery tool choice follows the contract next capability, not the l
   }), undefined, "validation recovery stays optional when run_command is absent");
 });
 
-test("validation recovery binds the command capability selected by the action contract", () => {
-  assert.deepEqual(resolveRecoveryToolChoice({
+test("validation recovery requires one call from the command capability surface", () => {
+  assert.equal(resolveRecoveryToolChoice({
     isExecuteRecoveryEligible: true,
     executeRecoveryMode: "validation_only",
     llmToolNames: ["run_command", "execute_command", "browser_evaluate"],
     forceXmlTools: false,
-    preferExplicitFunction: true,
-  }), { type: "function", function: { name: "run_command" } });
+  }), "required");
 });
 
 test("approved plan watchdog timeout gets exactly one bounded native-tool recovery opportunity", () => {

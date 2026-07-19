@@ -177,17 +177,18 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
   const definitions = (profile.toolDefinitions || [])
     .filter((tool) => availableSet.has(tool.function.name));
   const rawProtocol = String(profile.toolProtocol || "auto").toLowerCase();
+  // Protocol selection follows the capability surface, not model/provider
+  // identity. The same active tools therefore produce the same contract for
+  // every model.
   const usesXml = rawProtocol === "xml" || (
-    profile.activeProfile === "local" &&
     profile.nativeToolsEnabled !== true &&
     (rawProtocol === "auto" || rawProtocol === "")
   );
-  const provider = `${profile.activeProfile || "unknown"}/${profile.provider || "unknown"}`;
 
   if (!usesXml && profile.nativeToolsEnabled) {
     return [
       "[TOOLS]",
-      `profile=${provider}; protocol=native; available=${availableNames.join(", ") || "none"}.`,
+      `protocol=native; available=${availableNames.join(", ") || "none"}.`,
       language === "zh"
         ? "工具 schema 是名称、参数和描述的唯一事实来源。需要工具时直接发起 native tool call；不要在正文复制工具目录、伪造 JSON/XML 或输出 `[Tool call: ...]`。"
         : "The native schemas are the sole source of truth for tool names, arguments, and descriptions. Call tools directly; do not copy a tool catalog into prose or emit pseudo JSON/XML or `[Tool call: ...]`.",
@@ -197,7 +198,7 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
   if (availableNames.length === 0) {
     return [
       "[TOOLS]",
-      `profile=${provider}; protocol=xml-text; available=none.`,
+      "protocol=xml-text; available=none.",
       language === "zh"
         ? "本轮没有工具。不要输出 XML、伪工具调用或假装已经读取、修改、运行或验证。"
         : "No tools are available this turn. Do not emit XML, pseudo calls, or pretend to have read, changed, run, or validated anything.",
@@ -216,7 +217,7 @@ export function buildToolProtocolCard(profile: ToolProtocolCardProfile): string 
   const example = buildXmlExample(selectExampleDefinition(definitions), availableNames[0] || "");
   return [
     "[TOOLS]",
-    `profile=${provider}; protocol=xml-text.`,
+    "protocol=xml-text.",
     language === "zh"
       ? "以下目录由本轮真实 schema 动态生成。需要工具时只输出一个完整 XML 工具块，不要混排正文；参数名必须与目录完全一致。"
       : "This catalog is generated from the active schemas. When a tool is needed, output exactly one complete XML block with no surrounding prose; argument names must match the catalog exactly.",
@@ -312,6 +313,7 @@ function buildIntentModule(input: {
       "Describe the desired result, grounded current state, affected boundary, implementation path, and executable validation.",
       "Do not turn your own read/check/fix ordering into user choices. Ask only when a user-owned product, scope, technology, or priority decision blocks the plan.",
       "When ready, output one visible `<proposed_plan>` Markdown block and stop. MAIN runtime, not the model, validates and materializes `.MAIN/plans/plan.md`.",
+      "For a multi-step turn, optionally give a brief user-facing update only when a material finding changes the plan. Do not narrate file reads, searches, or tool names.",
       "Do not edit source files or write plan artifacts before approval.",
     ]);
   }
@@ -322,6 +324,7 @@ function buildIntentModule(input: {
       "Act on the user request with the smallest relevant context reads and targeted edits. Do not stop after narrating intended steps when an exposed tool can perform the next safe action.",
       "Prefer a delta edit over rewriting a large existing file. After editing, inspect the actual diff when available and run the most relevant exposed validation.",
       "A successful write proves only that exact mutation. It does not prove that the user's other requested outcomes are complete.",
+      "For a multi-step turn, optionally give a brief user-facing update when a material finding changes the approach, implementation begins, validation begins, or a real blocker appears. Do not narrate file reads, searches, commands, or tool names; missing commentary never blocks execution.",
     ]);
   }
 

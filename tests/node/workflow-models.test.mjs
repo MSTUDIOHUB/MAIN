@@ -2749,6 +2749,44 @@ test("approved mutation task requires the planned identifier in the fresh diff",
   assert.equal(plannedWrite?.changedIdentifiers?.includes("creatorName"), true);
 });
 
+test("same-path mutation does not complete when a declared call target is absent from the fresh diff", () => {
+  const parsed = extractPlanTasks(
+    "- [ ] 修改 `src/main.js` 中的 `handleOpenFile`，确保调用 `renderMarkdown` 更新编辑区。",
+  );
+  assert.equal(parsed.length, 1);
+  assert.deepEqual(parsed[0].evidence?.[0]?.requiredTerms, ["renderMarkdown"]);
+
+  const unrelatedWrite = createPlanExecutionEvidenceEntry({
+    toolName: "replace_in_file",
+    target: "src/main.js",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: "document.title = 'Old';",
+      new: "document.title = 'New';",
+      path: "src/main.js",
+    },
+  });
+  const expectedWrite = createPlanExecutionEvidenceEntry({
+    toolName: "replace_in_file",
+    target: "src/main.js",
+    result: JSON.stringify({ success: true }),
+    diff: {
+      old: "editor.value = content;",
+      new: "editor.value = content;\nrenderMarkdown(content);",
+      path: "src/main.js",
+    },
+  });
+
+  assert.equal(buildPlanTaskEvidenceAudit({
+    tasks: parsed,
+    evidenceLedger: unrelatedWrite ? [unrelatedWrite] : [],
+  }).allTrustedComplete, false);
+  assert.equal(buildPlanTaskEvidenceAudit({
+    tasks: parsed,
+    evidenceLedger: expectedWrite ? [expectedWrite] : [],
+  }).allTrustedComplete, true);
+});
+
 test("mutation location identifiers are not required in fresh changed lines", () => {
   const parsed = extractPlanTasks(
     "- [ ] 仅修改 `src/hooks/useCsvParser.ts` 中的 `normalizeCsvOrder` 函数。",

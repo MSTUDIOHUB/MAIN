@@ -1,4 +1,7 @@
-import { buildEmptyModelResponsePauseNotice } from "../../agentLoopSafety";
+import {
+  buildChatFinalSynthesisPrompt,
+  buildEmptyModelResponsePauseNotice,
+} from "../../agentLoopSafety";
 import { summarizeRepeatedExecuteTargets } from "../../executeRecoveryTools";
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { buildMissingToolCallContinuationPrompt } from "../../missingToolCallReprompt";
@@ -17,6 +20,12 @@ import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
 import type { ResolvedUserIntent } from "../../runIntent";
 import type { NormalizedStreamState } from "../../workflowModels";
 import type { OrchestratorCallbacks } from "../types";
+import {
+  applyExecuteNoToolStrategyPivot,
+  isExecuteRuntimeRequiringEvidence,
+  resolveExecuteNoToolStrategyAtBoundary,
+  resolveProviderNeutralExecuteNoToolCheckpointLimit,
+} from "./executeNoToolRecovery";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -62,6 +71,7 @@ export async function handleEmptyResponseRecovery(input: {
   normalized: NormalizedStreamState;
   normalizedBaseToolCallCount: number;
   recentToolActivity: PlanToolActivitySummary[];
+  availableToolNames?: Set<string>;
   recentSuccessfulProjectWrite: RecentSuccessfulProjectWrite;
   consecutiveEmptyResponseCount: number;
   emptyResponseCountThisTurn: number;
@@ -72,7 +82,6 @@ export async function handleEmptyResponseRecovery(input: {
 }): Promise<EmptyResponseRecoveryResult> {
   const {
     callbacks,
-    activeProfile,
     iteration,
     workflowMode,
     turnIntent,
@@ -147,10 +156,15 @@ export async function handleEmptyResponseRecovery(input: {
 
   consecutiveEmptyResponseCount += 1;
   emptyResponseCountThisTurn += 1;
+  const isSubagent = (callbacks.getSubagentDepth?.() || 0) > 0;
+  const isExecuteRuntime = isExecuteRuntimeRequiringEvidence({
+    workflowMode,
+    turnIntent,
+    runtimeIntent,
+  });
 
   if (
-    (callbacks.getSubagentDepth?.() || 0) > 0 &&
-    activeProfile === "local" &&
+    isSubagent &&
     consecutiveEmptyResponseCount === 1 &&
     !input.normalized.toolCalls.length &&
     !callbacks.shouldForceXmlForProviderCompatibility?.()
@@ -176,9 +190,33 @@ export async function handleEmptyResponseRecovery(input: {
   if (
     workflowMode === "chat" &&
     runtimeIntent === "respond" &&
+    !isExecuteRuntime &&
     emptyResponseCountThisTurn >= 2
   ) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
+    if (emptyResponseCountThisTurn === 2 && !isSubagent) {
+      callbacks.appendMessage({
+        role: "assistant",
+        content: buildEmptyAssistantPlaceholder(normalized.hiddenThought),
+      });
+      callbacks.onStatusChange("running");
+      callbacks.appendMessage({
+        role: "user",
+        content: buildChatFinalSynthesisPrompt({
+          language: callbacks.getPreferredLanguage(),
+          reason: "second_empty_response_text_only_synthesis",
+          iteration,
+          repeatedTargets,
+          recentActivity: recentToolActivity,
+        }),
+      });
+      emitDebug("empty_response_text_only_synthesis", {
+        iteration,
+        emptyResponseCountThisTurn,
+        repeatedTargets,
+      });
+      return finish("continue");
+    }
     emitDebug("loop_stop", {
       reason: "empty_model_response",
       iteration,
@@ -191,7 +229,6 @@ export async function handleEmptyResponseRecovery(input: {
         language: callbacks.getPreferredLanguage(),
         emptyResponses: emptyResponseCountThisTurn,
         repeatedTargets,
-        localProfile: activeProfile === "local",
       }),
       "no_output",
       {
@@ -251,7 +288,37 @@ export async function handleEmptyResponseRecovery(input: {
     return finish("continue");
   }
 
-  if (consecutiveEmptyResponseCount >= 3) {
+  let executeStrategiesExhausted = false;
+  if (
+    isExecuteRuntime &&
+    consecutiveEmptyResponseCount >= resolveProviderNeutralExecuteNoToolCheckpointLimit()
+  ) {
+    const checkpointLimit = resolveProviderNeutralExecuteNoToolCheckpointLimit();
+    const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
+      callbacks,
+      consecutiveNoToolCount: consecutiveEmptyResponseCount,
+      checkpointLimit,
+      availableToolNames: input.availableToolNames,
+      cause: "empty_execute_response",
+    });
+    if (strategyDecision.action === "continue_with_pivot") {
+      callbacks.appendMessage({
+        role: "assistant",
+        content: buildEmptyAssistantPlaceholder(normalized.hiddenThought),
+      });
+      applyExecuteNoToolStrategyPivot({
+        callbacks,
+        decision: strategyDecision,
+        forceXmlTools: input.forceXmlTools,
+        iteration,
+        cause: "empty_execute_response",
+      });
+      return finish("continue");
+    }
+    executeStrategiesExhausted = true;
+  }
+
+  if (executeStrategiesExhausted || (!isExecuteRuntime && consecutiveEmptyResponseCount >= 3)) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
     emitDebug("loop_stop", {
       reason: "empty_model_response",
@@ -265,7 +332,6 @@ export async function handleEmptyResponseRecovery(input: {
         language: callbacks.getPreferredLanguage(),
         emptyResponses: consecutiveEmptyResponseCount,
         repeatedTargets,
-        localProfile: activeProfile === "local",
       }),
       "no_output",
       {

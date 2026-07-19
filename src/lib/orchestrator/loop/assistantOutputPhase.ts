@@ -583,7 +583,7 @@ export function handleAssistantOutputPhase(input: {
     !shouldHideApprovedPlanNoToolText &&
     (visibleAssistantText || finalReplyOptions.length > 0)
   ) {
-    callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, {
+    const presentationMeta = {
       hasToolCalls: effectiveToolCalls.length > 0,
       visibility: toolProgressPresentation.visibility,
       preserveAssistantText: shouldPreserveApprovedExecutionText,
@@ -600,7 +600,23 @@ export function handleAssistantOutputPhase(input: {
           target: getToolTarget(call.name, args),
         };
       }),
-    });
+    };
+    if (
+      toolProgressPresentation.visibility === "assistant_update" &&
+      visibleAssistantText.trim() &&
+      finalReplyOptions.length === 0 &&
+      !shouldPauseForUserChoice &&
+      callbacks.onAssistantCommentary
+    ) {
+      callbacks.onAssistantCommentary(visibleAssistantText, {
+        visibility: "assistant_update",
+        modelAuthored: presentationMeta.modelAuthored,
+        progress: presentationMeta.progress,
+        toolCalls: presentationMeta.toolCalls,
+      });
+    } else {
+      callbacks.onAssistantFinalText(visibleAssistantText, finalReplyOptions, presentationMeta);
+    }
   }
 
   if (input.autoContinueReadOnlyPermission) {
@@ -614,7 +630,7 @@ export function handleAssistantOutputPhase(input: {
     });
     if (
       noToolRuntimeState.consecutiveNoToolCount >=
-      (input.activeProfile === "local" ? 5 : MAX_NO_ACTION_RETRIES)
+      MAX_NO_ACTION_RETRIES
     ) {
       logAgentEvent("readonly_permission_auto_continue_limit", {
         iteration,

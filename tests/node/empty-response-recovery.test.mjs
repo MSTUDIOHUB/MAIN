@@ -116,7 +116,7 @@ function baseInput(overrides = {}) {
   };
 }
 
-test("empty chat response stops after the per-turn retry budget", async () => {
+test("second empty chat response enters text-only synthesis before the third pauses", async () => {
   const { callbacks, events } = makeCallbacks({ language: "zh" });
   const result = await handleEmptyResponseRecovery(baseInput({
     callbacks,
@@ -124,11 +124,59 @@ test("empty chat response stops after the per-turn retry budget", async () => {
     consecutiveEmptyResponseCount: 1,
   }));
 
-  assert.equal(result.status, "stopped");
+  assert.equal(result.status, "continue");
   assert.equal(result.emptyResponseCountThisTurn, 2);
   assert.equal(result.consecutiveEmptyResponseCount, 2);
-  assert.equal(events.some((event) => event.type === "stop" && event.reason === "no_output"), true);
-  assert.equal(events.some((event) => event.type === "status" && event.status === "idle"), true);
+  assert.equal(events.some((event) => event.type === "stop"), false);
+  assert.equal(events.some((event) =>
+    event.type === "append" && /CHAT_FINAL_SYNTHESIS/.test(event.message.content)
+  ), true);
+
+  const paused = makeCallbacks({ language: "zh" });
+  const third = await handleEmptyResponseRecovery(baseInput({
+    callbacks: paused.callbacks,
+    emptyResponseCountThisTurn: 2,
+    consecutiveEmptyResponseCount: 2,
+  }));
+  assert.equal(third.status, "stopped");
+  assert.equal(paused.events.some((event) => event.type === "stop" && event.reason === "no_output"), true);
+});
+
+test("first subagent empty response uses capability fallback independent of profile", async () => {
+  const generated = makeCallbacks({ language: "en" });
+  const fallbacks = [];
+  const callbacks = {
+    ...generated.callbacks,
+    getSubagentDepth: () => 1,
+    shouldForceXmlForProviderCompatibility: () => false,
+    onProviderCompatibilityFallback: (reason) => fallbacks.push(reason),
+  };
+  const result = await handleEmptyResponseRecovery(baseInput({
+    callbacks,
+    activeProfile: "cloud",
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.deepEqual(fallbacks, ["subagent_empty_native_completion"]);
+  assert.equal(generated.events.some((event) =>
+    event.type === "append" && /switched to the XML tool protocol/.test(event.message.content)
+  ), true);
+});
+
+test("subagent pauses when XML fallback also returns empty", async () => {
+  const generated = makeCallbacks({ language: "en" });
+  const callbacks = {
+    ...generated.callbacks,
+    getSubagentDepth: () => 1,
+    shouldForceXmlForProviderCompatibility: () => true,
+  };
+  const result = await handleEmptyResponseRecovery(baseInput({
+    callbacks,
+    consecutiveEmptyResponseCount: 1,
+    emptyResponseCountThisTurn: 1,
+  }));
+  assert.equal(result.status, "stopped");
+  assert.equal(generated.events.some((event) => event.type === "stop"), true);
 });
 
 test("first unapproved plan empty response appends placeholder and plan continuation prompt", async () => {
@@ -211,9 +259,9 @@ test("empty edit response after project write asks for post-write verification",
   assert.match(userPrompt, /verify|validation|inspect/i);
 });
 
-test("second native empty response after a write keeps verification on native tools", async () => {
+test("execute empty responses use both no-action pivots before pausing", async () => {
   const { callbacks, events } = makeCallbacks({ language: "en" });
-  const result = await handleEmptyResponseRecovery(baseInput({
+  const firstPivot = await handleEmptyResponseRecovery(baseInput({
     callbacks,
     workflowMode: "edit",
     turnIntent: "execute",
@@ -223,10 +271,47 @@ test("second native empty response after a write keeps verification on native to
     recentSuccessfulProjectWrite: { name: "replace_in_file", target: "src/app.ts" },
   }));
 
+  assert.equal(firstPivot.status, "continue");
+  assert.match(events.at(-1)?.message.content || "", /current_task_action_lock/);
+
+  const second = makeCallbacks({ language: "en" });
+  const secondPivot = await handleEmptyResponseRecovery(baseInput({
+    callbacks: second.callbacks,
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    consecutiveEmptyResponseCount: 2,
+  }));
+  assert.equal(secondPivot.status, "continue");
+  assert.match(second.events.at(-1)?.message.content || "", /alternate_capability_reframe/);
+
+  const exhausted = makeCallbacks({ language: "en" });
+  const stopped = await handleEmptyResponseRecovery(baseInput({
+    callbacks: exhausted.callbacks,
+    workflowMode: "edit",
+    turnIntent: "execute",
+    runtimeIntent: "execute",
+    consecutiveEmptyResponseCount: 3,
+  }));
+  assert.equal(stopped.status, "stopped");
+  assert.equal(exhausted.events.some((event) => event.type === "stop"), true);
+});
+
+test("repair-in-chat execute intent uses execution pivots instead of text synthesis", async () => {
+  const { callbacks, events } = makeCallbacks({ language: "en" });
+  const result = await handleEmptyResponseRecovery(baseInput({
+    callbacks,
+    workflowMode: "chat",
+    turnIntent: "execute",
+    runtimeIntent: "respond",
+    consecutiveEmptyResponseCount: 1,
+    emptyResponseCountThisTurn: 1,
+  }));
   assert.equal(result.status, "continue");
-  const userPrompt = events.find((event) => event.type === "append" && event.message.role === "user")?.message.content || "";
-  assert.match(userPrompt, /native tool call/i);
-  assert.doesNotMatch(userPrompt, /XML|<tool_use>|<tool>|<parameter/i);
+  assert.match(events.at(-1)?.message.content || "", /current_task_action_lock/);
+  assert.equal(events.some((event) =>
+    event.type === "append" && /CHAT_FINAL_SYNTHESIS/.test(event.message.content)
+  ), false);
 });
 
 test("malformed plan tool-use block recovers before empty counters increment", async () => {

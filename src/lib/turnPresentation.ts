@@ -73,6 +73,91 @@ export interface BuildTurnPresentationModelInput extends TurnPresentationIdentit
   forceProcessExpanded?: boolean;
 }
 
+export type CapsuleStatusKind =
+  | "analyzing"
+  | "planning"
+  | "executing"
+  | "validating"
+  | "recovering"
+  | "awaiting_approval"
+  | "awaiting_permission"
+  | "awaiting_choice"
+  | "paused"
+  | "completed"
+  | "error";
+
+export interface CapsuleStatusProjection {
+  kind: CapsuleStatusKind;
+  label: string;
+}
+
+export interface BuildCapsuleStatusProjectionInput {
+  language?: "zh" | "en";
+  presentation?: Pick<TurnPresentationModel, "intent" | "lifecycle" | "status" | "actionKind"> | null;
+  actionKind?: ActionRequestKind | null;
+  planStage?: string | null;
+  planExecutionPhase?: string | null;
+  currentTaskExecutionKind?: "mutation" | "validation" | "deliverable" | "observation" | null;
+  agentStatus?: string | null;
+  isRunActive?: boolean;
+}
+
+const CAPSULE_STATUS_COPY: Record<CapsuleStatusKind, { zh: string; en: string }> = {
+  analyzing: { zh: "正在分析", en: "Analyzing" },
+  planning: { zh: "正在制定计划", en: "Planning" },
+  executing: { zh: "正在执行", en: "Executing" },
+  validating: { zh: "正在验证", en: "Validating" },
+  recovering: { zh: "正在恢复", en: "Recovering" },
+  awaiting_approval: { zh: "等待批准", en: "Awaiting approval" },
+  awaiting_permission: { zh: "等待权限", en: "Awaiting permission" },
+  awaiting_choice: { zh: "等待选择", en: "Awaiting choice" },
+  paused: { zh: "已暂停", en: "Paused" },
+  completed: { zh: "已完成", en: "Completed" },
+  error: { zh: "发生错误", en: "Error" },
+};
+
+/**
+ * Projects runtime state into the only prose allowed in the global Capsule.
+ * The projection deliberately accepts lifecycle/phase enums only: model text,
+ * tool names, paths, evidence and heartbeat copy belong to ChatArea or the
+ * detailed Run Status surfaces and cannot enter this boundary.
+ */
+export function buildCapsuleStatusProjection(
+  input: BuildCapsuleStatusProjectionInput,
+): CapsuleStatusProjection {
+  const language = input.language === "en" ? "en" : "zh";
+  const presentation = input.presentation;
+  const actionKind = input.actionKind || presentation?.actionKind || null;
+  const lifecycle = String(presentation?.lifecycle || "").toLowerCase();
+  const status = String(presentation?.status || "").toLowerCase();
+  const phase = String(input.planExecutionPhase || "").toLowerCase();
+  const planStage = String(input.planStage || "").toLowerCase();
+  const intent = String(presentation?.intent || "").toLowerCase();
+  const agentStatus = String(input.agentStatus || "").toLowerCase();
+
+  let kind: CapsuleStatusKind;
+  if (actionKind === "tool_permission") kind = "awaiting_permission";
+  else if (actionKind === "user_choice") kind = "awaiting_choice";
+  else if (actionKind === "plan_review") kind = "awaiting_approval";
+  else if (status === "awaiting_input") kind = "awaiting_choice";
+  else if (status === "awaiting_approval") kind = "awaiting_approval";
+  else if (phase === "paused") kind = "paused";
+  else if (phase === "tool_error") kind = "error";
+  else if (phase === "completed") kind = "completed";
+  else if (["auto_resume", "checkpoint", "context_compression"].includes(phase)) kind = "recovering";
+  else if (input.currentTaskExecutionKind === "validation") kind = "validating";
+  else if (phase === "tool_start" || phase === "tool_done" || phase === "running") kind = "executing";
+  else if (lifecycle === "resumable") kind = "paused";
+  else if (lifecycle === "failed" || agentStatus === "error") kind = "error";
+  else if (lifecycle === "success") kind = "completed";
+  else if (status === "executing" || planStage === "executing") kind = "executing";
+  else if (intent === "plan" || ["plan", "requirements", "design", "tasks", "ready_to_execute"].includes(planStage)) kind = "planning";
+  else if (input.isRunActive || lifecycle === "active") kind = "analyzing";
+  else kind = "analyzing";
+
+  return { kind, label: CAPSULE_STATUS_COPY[kind][language] };
+}
+
 export function resolveTurnPresentationLifecycle(
   statusValue: unknown,
   hasActionRequest = false,

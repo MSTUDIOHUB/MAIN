@@ -147,18 +147,29 @@ test("reasoning dominated execute turn activates mutation-first recovery", () =>
   assert.equal(events.some((event) => event.type === "append" && /one concrete action/.test(event.message.content)), true);
 });
 
-test("second reasoning dominated turn pauses without another recovery prompt", () => {
+test("reasoning dominated execution pivots strategies before the hard pause", () => {
   const { callbacks, events } = makeCallbacks();
   const result = handleReasoningDominatedNoToolRecovery(baseInput({
     callbacks,
     consecutiveReasoningDominatedCount: 1,
   }));
 
-  assert.equal(result.status, "stopped");
+  assert.equal(result.status, "continue");
   assert.equal(result.consecutiveReasoningDominatedCount, 2);
-  assert.equal(events.some((event) => event.type === "stop" && event.reason === "no_output"), true);
-  assert.equal(events.some((event) => event.type === "status" && event.status === "idle"), true);
-  assert.equal(events.some((event) => event.type === "append"), false);
+  assert.equal(events.some((event) => event.type === "stop"), false);
+  assert.equal(events.some((event) =>
+    event.type === "append" && /current_task_action_lock/.test(event.message.content)
+  ), true);
+
+  const exhausted = makeCallbacks();
+  const stopped = handleReasoningDominatedNoToolRecovery(baseInput({
+    callbacks: exhausted.callbacks,
+    consecutiveReasoningDominatedCount: 3,
+  }));
+  assert.equal(stopped.status, "stopped");
+  assert.equal(stopped.consecutiveReasoningDominatedCount, 4);
+  assert.equal(exhausted.events.some((event) => event.type === "stop"), true);
+  assert.equal(exhausted.events.some((event) => event.type === "status" && event.status === "idle"), true);
 });
 
 test("approved execute reasoning recovery follows Plan evidence provenance", () => {
@@ -203,7 +214,7 @@ test("approved execute reasoning recovery follows Plan evidence provenance", () 
 
   handleReasoningDominatedNoToolRecovery(baseInput({
     callbacks: sourceSatisfied.callbacks,
-    consecutiveReasoningDominatedCount: 1,
+    consecutiveReasoningDominatedCount: 3,
   }));
   assert.equal(
     sourceSatisfied.events.some((event) =>

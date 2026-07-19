@@ -44,7 +44,6 @@ import {
   countCompletedToolCalls,
   type ChatOperationCluster,
 } from "../lib/toolUiGrouping";
-import { deriveDynamicFirstPersonText } from "../lib/capsuleStagingHelper";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
   buildRuntimeProgressLedger,
@@ -58,8 +57,6 @@ import {
   STREAMING_AGENT_CONTENT_PREVIEW_CHARS,
   formatTokenCount,
   getDisplayAgentContent,
-  normalizeCapsuleExplanationText,
-  normalizeCapsuleProgressText,
   normalizeTranscriptDedupeText,
 } from "../lib/chat/chatContentPreview";
 import { shouldRetainStageSummary } from "../lib/modelFeedbackDedupe";
@@ -96,6 +93,7 @@ import {
   shouldRenderPermissionCapsule,
 } from "../lib/actionRequest";
 import {
+  buildCapsuleStatusProjection,
   buildPlanExecutionCapsuleProjection,
   buildTurnPresentationModel,
   isPlanReviewCapsulePresentationEligible,
@@ -875,64 +873,12 @@ function getLatestThoughtBlock(blocks: any[]) {
   return [...blocks].reverse().find((block) => block?.type === "thought" && String(block.content || "").trim());
 }
 
-function getActiveTurnActivity(blocks: any[], turnStatus: string, language: "zh" | "en") {
-  const completedToolCallCount = countCompletedToolCalls(blocks);
-  const runningTool = [...blocks].reverse().find((block) => block.type === "tool" && block.toolStatus === "running");
-  if (runningTool) {
-    const target = String(runningTool.target || runningTool.toolName || "").split("/").pop() || runningTool.toolName;
-    const tableTools = new Set(["analyze_tabular_document", "query_tabular_document"]);
-    const readTools = new Set(["read_file", "read_document", "list_directory", "glob_search", "grep_search", "repo_map_status", "repo_map_search", "repo_map_context", "repo_map_files", "repo_map_impact", "index_workspace_documents", "knowledge_search", "knowledge_get_excerpt", "get_project_skeleton"]);
-    const commandTools = new Set(["execute_command", "run_command", "browser_evaluate", "computer_use", "send_pty_input"]);
-    const toolName = String(runningTool.toolName || "");
-    const prefix = language === "zh"
-      ? completedToolCallCount > 0 ? `已完成 ${completedToolCallCount} 次，` : ""
-      : completedToolCallCount > 0 ? `${completedToolCallCount} completed, ` : "";
-    if (language === "zh") {
-      if (tableTools.has(toolName)) return `${prefix}当前分析表格：${target}`;
-      if (readTools.has(toolName)) return `${prefix}当前读取资料：${target}`;
-      if (commandTools.has(toolName)) return `${prefix}当前执行命令：${target}`;
-      return `${prefix}当前调用工具：${target}`;
-    }
-    if (tableTools.has(toolName)) return `${prefix}analyzing table: ${target}`;
-    if (readTools.has(toolName)) return `${prefix}reading context: ${target}`;
-    if (commandTools.has(toolName)) return `${prefix}running command: ${target}`;
-    return `${prefix}using tool: ${target}`;
-  }
-
-  const streamingThought = [...blocks].reverse().find((block) => block.type === "thought" && block.isStreaming);
-  if (streamingThought) {
-    const thoughtChars = String(streamingThought.content || "").length;
-    if (thoughtChars > 4_000) {
-      return language === "zh"
-        ? "正在整理较长上下文，等待可见回复或下一步动作..."
-        : "Working through a longer context while waiting for the visible reply or next action...";
-    }
-    return language === "zh" ? "正在整理下一步..." : "Thinking through the next step...";
-  }
-
-  const hasStreamingAgent = blocks.some((block) => block.type === "agent" && block.streaming);
-  if (hasStreamingAgent) return language === "zh" ? "正在生成回复..." : "Writing the response...";
-
-  if (turnStatus === "planning") return language === "zh" ? "正在整理计划..." : "Building the plan...";
-  if (turnStatus === "executing") {
-    if (completedToolCallCount > 0) {
-      return language === "zh"
-        ? `已完成 ${completedToolCallCount} 次，正在等待模型规划下一步...`
-        : `${completedToolCallCount} completed, waiting for the model to plan the next step...`;
-    }
-    return language === "zh" ? "正在等待模型规划下一步..." : "Waiting for the model to plan the next step...";
-  }
-  return "";
-}
-
 function TurnActivityNotice({
-  activityText,
   thoughtSummaryText,
   isThinking,
   language,
   chatFontSize,
 }: {
-  activityText?: string;
   thoughtSummaryText?: string;
   isThinking?: boolean;
   language: "zh" | "en";
@@ -940,8 +886,7 @@ function TurnActivityNotice({
   text?: string;
 }) {
   const resolvedThoughtSummaryText = String(thoughtSummaryText || "").trim();
-  const resolvedActivityText = String(activityText || "").trim();
-  if (!resolvedThoughtSummaryText && !resolvedActivityText) return null;
+  if (!resolvedThoughtSummaryText) return null;
   const thoughtTitle = language === "zh"
     ? isThinking ? "正在整理思路" : "思考摘要"
     : isThinking ? "Thinking" : "Thinking summary";
@@ -950,11 +895,6 @@ function TurnActivityNotice({
       data-testid="turn-activity-notice"
       className="ml-9 rounded-2xl border border-[rgba(96,165,250,0.2)] bg-[rgba(37,99,235,0.08)] px-4 py-3 text-[12px] text-[#bfdbfe]"
     >
-      {resolvedActivityText && (
-        <div data-testid="turn-activity-text" className="mb-2 font-mono text-[11px] text-[#93c5fd]">
-          {resolvedActivityText}
-        </div>
-      )}
       {resolvedThoughtSummaryText && (
         <div data-testid="turn-activity-thought-summary" className="max-h-[42vh] overflow-y-auto pr-1" style={{ fontSize: `${chatFontSize}px` }}>
           <div className="mb-1.5 flex items-center gap-2 font-mono text-[10.5px] text-[#93c5fd]">
@@ -2580,10 +2520,8 @@ export default function ChatArea({
     approvePendingReviewForSession,
     rejectPlan,
     agentStatus,
-    normalizedStreamState,
     pendingReviewTaskId,
     pendingToolCall,
-    capsuleExplanationState,
     pendingRunDecision,
     resolvePendingRunDecision,
     dismissPendingRunDecision,
@@ -2626,10 +2564,8 @@ export default function ChatArea({
     approvePendingReviewForSession: useAppStore((s) => s.approvePendingReviewForSession),
     rejectPlan: useAppStore((s) => s.rejectPlan),
     agentStatus: useAppStore((s) => s.agentStatus),
-    normalizedStreamState: useAppStore((s) => s.normalizedStreamState),
     pendingReviewTaskId: useAppStore((s) => s.pendingReviewTaskId),
     pendingToolCall: useAppStore((s) => s.pendingToolCall),
-    capsuleExplanationState: useAppStore((s) => s.currentTurnState.capsuleExplanation),
     pendingRunDecision: useAppStore((s) => s.pendingRunDecision),
     resolvePendingRunDecision: useAppStore((s) => s.resolvePendingRunDecision),
     dismissPendingRunDecision: useAppStore((s) => s.dismissPendingRunDecision),
@@ -2715,7 +2651,6 @@ export default function ChatArea({
   // region: 输入区上方执行胶囊状态
   const [composerHeight, setComposerHeight] = useState(220);
   const [previewImageItem, setPreviewImageItem] = useState<UserContextItem | null>(null);
-  const [persistedExplanation, setPersistedExplanation] = useState("");
   const [chatAreaHeight, setChatAreaHeight] = useState(0);
   const [isCapsuleCollapsed, setIsCapsuleCollapsed] = useState(false);
   const [capsulePopover, setCapsulePopover] = useState<"progress" | "tasks" | "goal" | null>(null);
@@ -2783,7 +2718,6 @@ export default function ChatArea({
     setCapsulePopover(null);
   }, [isCapsuleCollapsed, activeSessionKey]);
 
-  const lastTurnIdRef = useRef<string | undefined>(undefined);
   // endregion
 
   useEffect(() => {
@@ -3107,114 +3041,6 @@ export default function ChatArea({
     () => buildRunStatusProjection(capsuleProgressLedger, language, 3),
     [capsuleProgressLedger, language],
   );
-  // 缓存并锁死当前轮次下模型输出的最新的非空第一人称说明，防止被工具调用瞬间冲刷掉
-  const [activeTurnExplanation, setActiveTurnExplanation] = useState<{ text: string; blockId: string | null }>({ text: "", blockId: null });
-  const activeTurnExplanationRef = useRef<string | null>(null);
-
-  const explanationInfo = useMemo(() => {
-    if (!capsuleIsRunActive || !capsuleTurn) return { text: "", blockId: null };
-
-    const activeTurnBlocks = capsuleTurnBlocks;
-    
-    for (let i = activeTurnBlocks.length - 1; i >= 0; i--) {
-      const block = activeTurnBlocks[i];
-      if (block.type === "agent") {
-        const text = getAgentVisibleMarkdownText(block);
-        const content = String(text || "").trim();
-        if (!content) continue;
-        
-        // Route rich conversational first-person staging explanations into the capsule.
-        const capsuleText = normalizeCapsuleExplanationText(content);
-        return {
-          text: capsuleText || "",
-          blockId: block.id || null
-        };
-      }
-    }
-    return { text: "", blockId: null };
-  }, [capsuleIsRunActive, capsuleTurnBlocks]);
-
-  const capsuleExplanationBySource = useMemo(() => {
-    if (!capsuleIsRunActive || !capsuleTurn) return { runtime: "", model: "" };
-    if (capsuleExplanationState?.turnId !== capsuleTurn.id) return { runtime: "", model: "" };
-    const text = normalizeCapsuleExplanationText(capsuleExplanationState.text);
-    if (!text) return { runtime: "", model: "" };
-    return capsuleExplanationState.source === "runtime"
-      ? { runtime: text, model: "" }
-      : { runtime: "", model: text };
-  }, [capsuleExplanationState, capsuleIsRunActive, capsuleTurn]);
-
-  useEffect(() => {
-    if (!capsuleTurn) {
-      activeTurnExplanationRef.current = null;
-      setActiveTurnExplanation((current) => (
-        current.text || current.blockId !== null
-          ? { text: "", blockId: null }
-          : current
-      ));
-      return;
-    }
-    const turnChanged = capsuleTurn.id !== activeTurnExplanationRef.current;
-    if (turnChanged) {
-      activeTurnExplanationRef.current = capsuleTurn.id;
-      setActiveTurnExplanation((current) => (
-        current.text || current.blockId !== null
-          ? { text: "", blockId: null }
-          : current
-      )); // 轮次变更时彻底重置
-    }
-    if (explanationInfo.text) {
-      setActiveTurnExplanation((current) => (
-        current.text !== explanationInfo.text || current.blockId !== explanationInfo.blockId
-          ? { text: explanationInfo.text, blockId: explanationInfo.blockId }
-          : current
-      )); // 仅在有新的非空模型说明时更新
-    } else if (explanationInfo.blockId && activeTurnExplanation.blockId === explanationInfo.blockId) {
-      // 如果当前最新 agent 块的 ID 与缓存的块 ID 相同，但其 text 为空（即它不再通过 first-person 校验，例如长回答、列表、代码块等），
-      // 则清除缓存，防止显示已截断或不合规的中间内容，并让 capsule 优雅回退到动态工具/心流状态。
-      setActiveTurnExplanation((current) => (
-        current.text || current.blockId !== explanationInfo.blockId
-          ? { text: "", blockId: explanationInfo.blockId }
-          : current
-      ));
-    }
-  }, [explanationInfo, capsuleTurn, activeTurnExplanation.blockId]);
-
-  const capsuleActivityText = useMemo(() => {
-    if (planExecutionCapsuleProjection?.headline) {
-      return normalizeCapsuleProgressText(planExecutionCapsuleProjection.headline);
-    }
-    if (!capsuleIsRunActive || !capsuleTurn) return "";
-    // A plan-runtime narration is authoritative during drafting. A compliant
-    // model explanation may still be shown, but cannot replace runtime state.
-    if (capsuleExplanationBySource.runtime) return capsuleExplanationBySource.runtime;
-    if (capsuleExplanationBySource.model) return capsuleExplanationBySource.model;
-    if (activeTurnExplanation.text) return activeTurnExplanation.text;
-    if (explanationInfo.text) return explanationInfo.text;
-    const progressText = normalizeCapsuleProgressText(capsuleRunStatus.activityText);
-    if (progressText) return progressText;
-    return normalizeCapsuleProgressText(deriveDynamicFirstPersonText(capsuleTurn, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought));
-  }, [planExecutionCapsuleProjection?.headline, capsuleIsRunActive, capsuleTurn, capsuleExplanationBySource, activeTurnExplanation.text, explanationInfo.text, capsuleRunStatus.activityText, capsuleTurnBlocks, agentStatus, language, normalizedStreamState?.hiddenThought]);
-
-  useEffect(() => {
-    const turnChanged = capsuleTurn?.id !== lastTurnIdRef.current;
-    if (turnChanged) {
-      lastTurnIdRef.current = capsuleTurn?.id;
-    }
-
-    if (!capsuleIsRunActive) {
-      setPersistedExplanation("");
-      setIsCapsuleCollapsed(false);
-    } else if (capsuleActivityText) {
-      setPersistedExplanation(capsuleActivityText);
-      if (turnChanged) {
-        setIsCapsuleCollapsed(false);
-      }
-    } else if (turnChanged) {
-      setPersistedExplanation("");
-      setIsCapsuleCollapsed(false);
-    }
-  }, [capsuleActivityText, capsuleIsRunActive, capsuleTurn]);
 
   const hasLivePlanWorkspaceContent = useMemo(() => hasLivePlanWorkspace({
     planArtifacts,
@@ -3712,6 +3538,13 @@ export default function ChatArea({
       })
       .map(({ block }) => block.id));
     const hasSubstantiveIntermediateAgentText = substantiveIntermediateAgentBlockIds.size > 0;
+    const publicAssistantUpdates = blocks
+      .map((block, blockIndex) => ({ block, blockIndex }))
+      .filter(({ block }) =>
+        block?.type === "agent" &&
+        block.visibility === "assistant_update" &&
+        substantiveIntermediateAgentBlockIds.has(block.id)
+      );
     const hasFoldableProcessBlocks = blocks.some((block) => {
       if (!block || block.type === "user" || block.type === "thought") return false;
       if (block.type === "agent") return block.hiddenProcess === true;
@@ -3792,7 +3625,6 @@ export default function ChatArea({
     const turnToolCount = blocks.filter((block) =>
       block.type === "tool" && ["executed", "running", "failed"].includes(String(block.toolStatus || ""))
     ).length;
-    const activeTurnActivity = getActiveTurnActivity(blocks, turn.status, language);
     const turnSubagentRuns = subagentRuns.filter((run) => run.parentTurnId === turn.id);
     const liveProcessTimeline = !shouldArchiveCompletedProcess && shouldRenderLiveProcessTimeline
       ? buildLiveTurnProcessTimelineModel({ blocks, language, includeThoughts: showReasoningDebug })
@@ -3833,11 +3665,14 @@ export default function ChatArea({
         : "";
     const isBottomThoughtStreaming = !!latestThoughtBlock?.isStreaming;
     const isActiveRunningTurn = capsuleTurn?.id === turn.id && capsuleIsRunActive;
-    const shouldRouteActivityNoticeToCapsule = isActiveRunningTurn && !!capsuleActivityText;
+    // Active runtime metadata already has durable homes in the process
+    // timeline and Run Status popover. Keep it out of both the public
+    // assistant-update channel and the high-level Capsule status line.
+    const shouldSuppressActiveRuntimeNotice = isActiveRunningTurn;
     const shouldShowTurnActivityNotice =
       turn.status !== "error" &&
-      !shouldRouteActivityNoticeToCapsule &&
-      ((isChatIntent ? false : !!activeTurnActivity) || bottomThoughtSummary);
+      !shouldSuppressActiveRuntimeNotice &&
+      Boolean(bottomThoughtSummary);
     const isTurnCompletedOrStopped =
       turn.status === "done" ||
       turn.status === "completed_with_changes" ||
@@ -4151,6 +3986,7 @@ export default function ChatArea({
           {!isTurnExpanded ? (
             <React.Fragment key="collapsed-process-visible-messages">
               {additionalVisibleUserBlocks.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
+              {publicAssistantUpdates.map(({ block, blockIndex }) => renderBlock(block, blockIndex))}
               {finalVisibleAgentBlock
                 ? renderBlock(finalVisibleAgentBlock, finalVisibleAgentIndex)
                 : null}
@@ -4221,7 +4057,6 @@ export default function ChatArea({
           {isTurnExpanded && shouldShowTurnActivityNotice && (
             <TurnActivityNotice
               key="turn-activity-notice"
-              activityText={isChatIntent ? undefined : (shouldRouteActivityNoticeToCapsule ? undefined : activeTurnActivity)}
               thoughtSummaryText={bottomThoughtSummary}
               isThinking={isBottomThoughtStreaming}
               language={language}
@@ -4358,6 +4193,27 @@ export default function ChatArea({
         requestId: goalBlockingActionRequest?.requestId,
       })
     : null;
+  const capsuleActionKind = planReviewActionRequest?.kind ||
+    userChoiceActionRequest?.kind ||
+    (shouldShowExecutionCapsule ? permissionActionRequest?.kind : undefined) ||
+    (pendingRunDecision ? "user_choice" : undefined);
+  const currentPlanTaskExecutionKind = currentPlanTaskId
+    ? auditedPlanTasks.find((task) => task.id === currentPlanTaskId)?.executionKind || null
+    : null;
+  const capsuleStatusProjection = buildCapsuleStatusProjection({
+    language,
+    presentation: activeGoal ? goalPresentation : capsulePresentation,
+    actionKind: capsuleActionKind,
+    planStage,
+    planExecutionPhase: capsulePlanExecutionSnapshot?.phase,
+    currentTaskExecutionKind: currentPlanTaskExecutionKind,
+    agentStatus,
+    isRunActive: capsuleIsRunActive,
+  });
+
+  useEffect(() => {
+    setIsCapsuleCollapsed(false);
+  }, [capsuleTurn?.id]);
 
   const planReviewCapsuleControls = planReviewActionRequest ? (
     <PlanReviewCapsule
@@ -4486,9 +4342,8 @@ export default function ChatArea({
     </div>
   ) : null;
   const hasExecutionCapsuleControls = !!executionCapsuleControls;
-  const hasCapsuleFlow = !!persistedExplanation;
   const shouldShowMainCapsule =
-    hasCapsuleFlow ||
+    capsuleIsRunActive ||
     hasExecutionCapsuleControls ||
     !!planReviewCapsuleControls ||
     !!userChoiceCapsuleControls ||
@@ -5152,22 +5007,12 @@ export default function ChatArea({
             </div>
           )}
           {(() => {
-            const isRich = hasCapsuleFlow && (persistedExplanation.includes("#") || persistedExplanation.includes("\n"));
-            const headerLabel = planReviewActionRequest
-              ? planReviewActionRequest.title
-              : userChoiceActionRequest
-              ? userChoiceActionRequest.title
-              : planExecutionCapsuleProjection?.headline
-              ? planExecutionCapsuleProjection.headline
-              : hasCapsuleFlow
-              ? isRich
-                ? (language === "zh" ? "MAIN 的实时心流" : "MAIN's Flow")
-                : renderCompactMarkdownText(persistedExplanation)
-              : "MAIN";
+            const headerLabel = capsuleStatusProjection.label;
             const hasTypedCapsuleControls = hasExecutionCapsuleControls || !!planReviewCapsuleControls || !!userChoiceCapsuleControls;
             return (
               <div
                 data-testid="agent-explanation-capsule"
+                data-capsule-status={capsuleStatusProjection.kind}
                 data-action-kind={planReviewActionRequest?.kind || userChoiceActionRequest?.kind || permissionActionRequest?.kind || undefined}
                 data-session-key={planReviewActionRequest?.sessionKey || userChoiceActionRequest?.sessionKey || permissionActionRequest?.sessionKey || undefined}
                 data-turn-id={planReviewActionRequest?.turnId || userChoiceActionRequest?.turnId || permissionActionRequest?.turnId || undefined}
@@ -5215,11 +5060,12 @@ export default function ChatArea({
                           >
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
                           </button>
-                          <span className={`whitespace-pre-wrap break-words min-w-0 block flex-1 text-left ${
-                            isRich
-                              ? "font-semibold text-[var(--accent-light)]"
-                              : isLightThemeMode ? "text-[#18181b]" : "text-white"
-                          }`}>
+                          <span
+                            data-testid="capsule-status-label"
+                            className={`min-w-0 block flex-1 truncate whitespace-nowrap text-left font-semibold ${
+                              isLightThemeMode ? "text-[#18181b]" : "text-white"
+                            }`}
+                          >
                             {headerLabel}
                           </span>
                         </div>
@@ -5300,13 +5146,6 @@ export default function ChatArea({
                         </div>
                       )}
 
-                      {hasCapsuleFlow && isRich && (
-                        <div className={`w-full border-t pt-3 text-left pr-1 ${
-                          isLightThemeMode ? "border-[#e4e4e7]" : "border-[#27272a]/60"
-                        }`}>
-                          {renderCompactMarkdownText(persistedExplanation)}
-                        </div>
-                      )}
                     </div>
                   </div>
                 )}

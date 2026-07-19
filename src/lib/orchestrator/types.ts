@@ -214,6 +214,16 @@ export interface OrchestratorCallbacks {
     },
   ) => void;
   onThought: (thought: string) => void;
+  /** Durable, user-visible progress commentary. This is not a terminal answer. */
+  onAssistantCommentary?: (
+    text: string,
+    meta?: {
+      visibility: "assistant_update";
+      modelAuthored?: boolean;
+      progress?: ProgressNarration;
+      toolCalls?: Array<{ id?: string; name: string; target: string }>;
+    },
+  ) => void;
   onAssistantFinalText: (
     text: string,
     replyOptions?: ReplyOption[],
@@ -253,6 +263,9 @@ export interface OrchestratorCallbacks {
     checkpoint: PlanMaxIterationsCheckpoint,
   ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
   onExecuteMaxIterationsCheckpoint?: (
+    checkpoint: PlanMaxIterationsCheckpoint,
+  ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
+  onChatMaxIterationsCheckpoint?: (
     checkpoint: PlanMaxIterationsCheckpoint,
   ) => MaxIterationsCheckpointHandling | Promise<MaxIterationsCheckpointHandling>;
   onTurnSummaryReady: (summary: string) => void;

@@ -179,7 +179,7 @@ test("tool progress presentation gives model-authored reporting an assistant upd
   assert.equal(decision.modelAuthored, true);
 });
 
-test("assistant update identity does not depend on finding or next-step keywords", () => {
+test("assistant update identity preserves a substantive finding plus next step", () => {
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 1,
     unsupportedToolCallCount: 0,
@@ -194,6 +194,43 @@ test("assistant update identity does not depend on finding or next-step keywords
 
   assert.equal(decision.visibility, "assistant_update");
   assert.equal(decision.shouldPreserveApprovedExecutionText, true);
+});
+
+test("mixed tool narration keeps the substantive stage finding as an assistant update", () => {
+  const decision = resolveToolProgressPresentation({
+    progressEligibleToolCallCount: 1,
+    unsupportedToolCallCount: 0,
+    finalReplyOptionCount: 0,
+    hasSubstantivePlanAssistantText: false,
+    workflowMode: "plan",
+    isPlanApproved: true,
+    runtimeNarrationInjected: false,
+    visibleAssistantText: "让我继续读取相关实现；已确认根因是暂停状态没有统一投影，下一步会收敛终态写入。",
+    shouldSuppressApprovedPlanNoToolText: false,
+  });
+
+  assert.equal(decision.visibility, "assistant_update");
+  assert.equal(decision.shouldPreserveApprovedExecutionText, true);
+  assert.equal(decision.modelAuthored, true);
+  assert.equal(decision.capsuleCandidate, false);
+});
+
+test("thin tool preambles stay internal instead of becoming assistant updates", () => {
+  const decision = resolveToolProgressPresentation({
+    progressEligibleToolCallCount: 1,
+    unsupportedToolCallCount: 0,
+    finalReplyOptionCount: 0,
+    hasSubstantivePlanAssistantText: false,
+    workflowMode: "edit",
+    isPlanApproved: true,
+    runtimeNarrationInjected: false,
+    visibleAssistantText: "让我继续读取关键文件来确认问题根因。",
+    shouldSuppressApprovedPlanNoToolText: false,
+  });
+
+  assert.equal(decision.visibility, "user_progress");
+  assert.equal(decision.shouldPreserveApprovedExecutionText, false);
+  assert.equal(decision.capsuleCandidate, false);
 });
 
 test("unsupported-tool narration remains hidden even when it describes a next attempt", () => {

@@ -169,6 +169,39 @@ test("onAssistantFinalText leaves terminal status and abort cleanup to the publi
   assert.doesNotMatch(finalTextCallback, /agentStatus:\s*"idle"/);
 });
 
+test("assistant commentary is durable, deduped, and independent from final evidence publication", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const commentaryStart = source.indexOf("onAssistantCommentary:");
+  const finalTextStart = source.indexOf("onAssistantFinalText:", commentaryStart);
+  const callbackSource = source.slice(commentaryStart, finalTextStart);
+
+  assert.notEqual(commentaryStart, -1);
+  assert.ok(finalTextStart > commentaryStart);
+  assert.match(callbackSource, /isThinModelToolNarration/);
+  assert.match(callbackSource, /normalizeModelFeedbackForDedupe/);
+  assert.match(callbackSource, /visibility:\s*"assistant_update"/);
+  assert.match(callbackSource, /block\.visibility !== "assistant_final"/);
+  assert.match(callbackSource, /context\.agentBlockIdsCreatedThisRun\.has\(block\.id\)/);
+  assert.match(callbackSource, /blockIds:[\s\S]*blockId/);
+  assert.doesNotMatch(callbackSource, /executionEvidenceDraftHeld/);
+  assert.doesNotMatch(callbackSource, /summary:\s*visibleText/);
+});
+
+test("held final publication never overwrites a durable assistant update", () => {
+  const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
+  const finalTextStart = source.indexOf("onAssistantFinalText:");
+  const toolExecutingStart = source.indexOf("onToolExecuting:", finalTextStart);
+  const finalTextCallback = source.slice(finalTextStart, toolExecutingStart);
+
+  assert.match(finalTextCallback, /block\.visibility !== "assistant_update"/);
+  assert.match(finalTextCallback, /block\.visibility !== "assistant_final"/);
+  assert.match(finalTextCallback, /context\.agentBlockIdsCreatedThisRun\.has\(block\.id\)/);
+  assert.match(
+    finalTextCallback,
+    /normalizeModelFeedbackForDedupe\(String\(block\.content \|\| ""\)\) ===\s*normalizedVisibleCandidate/,
+  );
+});
+
 test("onToolDone populates planExecutionEvidenceLedger and reconciles planTasks", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"), "utf8");
   const orchestratorSource = fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8");
@@ -756,7 +789,9 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.doesNotMatch(loopRecoverySource, /export function handleRepeatedEditValidationRecovery/);
   assert.match(loopRecoverySource, /export function handleStrictRepeatGuardRecovery/);
   assert.match(loopRecoverySource, /registerToolCallForRepeatGuard/);
-  assert.match(loopRecoverySource, /formatRepeatLoopRecoveryMessage/);
+  assert.match(loopRecoverySource, /resolveExecuteNoProgressStrategyDecision/);
+  assert.match(loopRecoverySource, /EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS\.filter/);
+  assert.match(loopRecoverySource, /strict_repeat_strategy_exhausted/);
   assert.match(loopRecoverySource, /formatRepeatLoopFatalMessage/);
   assert.match(loopRecoverySource, /approved_plan_repeated_browser_validation/);
   assert.doesNotMatch(loopRecoverySource, /approved_plan_read_file_repeat_limit/);
@@ -770,7 +805,7 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(maxIterationBoundarySource, /buildPlanMaxIterationsPauseNotice/);
   assert.match(maxIterationBoundarySource, /buildExecuteMaxIterationsPauseNotice/);
   assert.match(maxIterationBoundarySource, /logAgentEvent\(isPlanBoundary[\s\S]*?"max_iterations_checkpoint"[\s\S]*?"execute_max_iterations_checkpoint"/);
-  assert.match(maxIterationBoundarySource, /reason: "max_iterations_boundary"/);
+  assert.match(maxIterationBoundarySource, /handling\.autoResumeScheduled \? "max_iterations_auto_resume" : "max_iterations_boundary"/);
   assert.match(approvedPlanRecoveryActionsSource, /export function pauseApprovedPlanStreamWatchdog/);
   assert.match(approvedPlanRecoveryActionsSource, /approved_plan_stream_watchdog_paused/);
   assert.match(preCompletionEvidenceRecoverySource, /export function resolvePreCompletionEvidenceRecoveryDecision/);
@@ -1181,7 +1216,7 @@ test("agent loop blocks execute completion without execution evidence", () => {
   assert.match(workflowEngine, /currentTurnExecutionConsent/);
 });
 
-test("workflow engine owns one hidden auto-resume between fresh evidence checkpoints", () => {
+test("workflow engine owns finite differentiated auto-resumes between fresh evidence checkpoints", () => {
   const source = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",
@@ -1190,7 +1225,8 @@ test("workflow engine owns one hidden auto-resume between fresh evidence checkpo
     path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"),
     "utf8",
   );
-  const planStart = source.indexOf("onPlanMaxIterationsCheckpoint:");
+  const chatStart = source.indexOf("onChatMaxIterationsCheckpoint:");
+  const planStart = source.indexOf("onPlanMaxIterationsCheckpoint:", chatStart);
   const executeStart = source.indexOf("onExecuteMaxIterationsCheckpoint:", planStart);
   const handlersEnd = source.indexOf("onStatusChange:", executeStart);
   const planHandler = source.slice(planStart, executeStart);
@@ -1199,11 +1235,21 @@ test("workflow engine owns one hidden auto-resume between fresh evidence checkpo
   const terminalEnd = source.indexOf("}).catch(async", terminalStart);
   const terminalContinuation = source.slice(terminalStart, terminalEnd);
 
+  assert.notEqual(chatStart, -1);
   assert.notEqual(planStart, -1);
   assert.notEqual(executeStart, -1);
   assert.notEqual(handlersEnd, -1);
+  const chatHandler = source.slice(chatStart, planStart);
+  assert.match(chatHandler, /currentCount < checkpoint\.strategyPivotBudget/);
+  assert.match(chatHandler, /buildChatMaxIterationsResumePrompt/);
+  assert.match(chatHandler, /resolvedIntent: effectiveRunIntent/);
+  assert.match(chatHandler, /runtimeIntentOverride: effectiveRunIntent/);
+  assert.doesNotMatch(chatHandler, /executionConsentGranted: true/);
+  assert.doesNotMatch(chatHandler, /forceExecuteRecoveryMode/);
+  assert.match(chatHandler, /kind: "chat"/);
   for (const handler of [planHandler, executeHandler]) {
     assert.match(handler, /currentCount < PLAN_MAX_AUTO_RESUME_LIMIT/);
+    assert.match(handler, /checkpoint\.strategyPivot !== null/);
     assert.match(handler, /planAutoResumeCount: effectiveCheckpoint\.autoResumeCount/);
     assert.match(handler, /turn\.id === turnId \|\| turn\.id === context\.uiDisplayTurnId/);
     assert.match(handler, /pendingMaxIterationsAutoResume = \{/);
@@ -1215,6 +1261,8 @@ test("workflow engine owns one hidden auto-resume between fresh evidence checkpo
     assert.match(handler, /preservePlanState: true/);
     assert.match(handler, /cancelAutoResume\("resume_submission_rejected", \{ visible: true \}\)/);
     assert.match(handler, /type: "system",\s*content: pauseNotice,/);
+    assert.match(handler, /strategyPivot: effectiveCheckpoint\.strategyPivot/);
+    assert.match(handler, /attemptedStrategyPivots: effectiveCheckpoint\.attemptedStrategyPivots/);
   }
   assert.match(planHandler, /buildPlanMaxIterationsResumePrompt/);
   assert.match(planHandler, /resolvedIntent: "execute"/);
@@ -1663,6 +1711,26 @@ test("durable no-progress recovery is projected as paused with a visible assista
   assert.match(workflowSource, /paused_turn_final_presentation_committed/);
   assert.match(workflowSource, /visibility: "assistant_final" as const/);
   assert.match(chatSource, /turn\.status === "paused" && explicitFinalAgentIndex >= 0/);
+});
+
+test("read-only batch-loop exhaustion atomically projects paused state and a ChatArea final", () => {
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+
+  assert.match(
+    workflowSource,
+    /progress\?\.recoveryReason === "execute_no_progress_batch_loop"[\s\S]*emitLocalPlanExecutionProgress\("paused",\s*\{/,
+  );
+  assert.match(
+    workflowSource,
+    /terminalRecoveryReason === "execute_no_progress_batch_loop"[\s\S]*status: "paused"/,
+  );
+  assert.match(
+    workflowSource,
+    /shouldCommitPausedTurnFinalPresentation\(\{[\s\S]*hasDurableMutationEvidence: durableRecoveryMutations\.length > 0[\s\S]*ensurePausedTurnFinalPresentation\(loopOutcome\)/,
+  );
 });
 
 test("terminal runs persist the turn projection before publishing idle", () => {

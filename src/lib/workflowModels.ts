@@ -418,6 +418,8 @@ export interface PlanExecutionProgressSnapshot {
   runId?: string;
   parentRunId?: string | null;
   phase: PlanExecutionProgressPhase;
+  /** Stable approved-Plan task identity; display text is never an identity source. */
+  currentTaskId?: string;
   currentTask: string;
   currentTool: string;
   latestEvidence: string;
@@ -1290,7 +1292,7 @@ const TAURI_VALIDATION_RE =
 const MANUAL_VALIDATION_RE =
   /(?:人工|用户(?:自己)?|你自己|自行|肉眼|手动(?:验证|确认|检查|验收)|需(?:要)?\s*手动(?:验证|确认|检查|验收)|由用户手动|human|user confirmation|user validation|manual(?:ly)? validation|manually confirmed by (?:the )?user|visually inspect)/i;
 const SOURCE_MUTATION_TASK_RE =
-  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|防御性编程)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)\b/i;
+  /(?:实现|修改|改动|变更|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|映射(?:为|成|到)|赋值|设置|写入|填充|防御性编程)|\b(?:implement|change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export|map|assign|set|populate)\b/i;
 const PRIMARY_VALIDATION_TASK_RE =
   /(?:^\s*(?:(?:静态|逻辑|行为|功能|单元|集成|端到端|回归|构建|类型|编译|运行时|自动化)?(?:手动测试|自动测试|视觉回归|回归测试|测试|验证|验收|检查|打开|预览|截图))(?:\s|[（(]|[:：]|$)|^\s*(?:运行|执行)\s+(?:(?:npm|pnpm|yarn|bun|npx|node|cargo|pytest|python|go|swift|dotnet|mvn|gradle)\b|[^\r\n]{0,100}(?:测试|验证|检查|验收|构建|编译|lint|类型检查))|^\s*(?:(?:static|logical?|behavioral|functional|unit|integration|end-to-end|e2e|regression|build|type|compile|runtime|automated)\s+)?(?:run|verify|test|validate|check|visual regression|screenshot)\b|[:：]\s*(?:验证|测试|检查|验收|确认)|[:：]\s*(?:verify|test|validate|check)\b)/i;
 const NEGATED_SOURCE_MUTATION_SPAN_RE =
@@ -1603,6 +1605,8 @@ function inferMutationRequiredTerms(text: string): string[] {
     /(?:增加|新增|添加|补齐|写入|设置|赋值给)\s*(?:字段|属性)?\s*`([A-Za-z_$][\w$-]*)`/i,
     /`([A-Za-z_$][\w$-]*)`\s*(?:字段|属性)\s*(?:增加|新增|添加|补齐|写入|设置|赋值)/i,
     /(?:add|introduce|write|set|assign|populate)\s+(?:the\s+)?`([A-Za-z_$][\w$-]*)`/i,
+    /(?:改为|调整为|确保|并)?\s*(?:调用|委托给|转发给)\s*`([A-Za-z_$][\w$-]*)`/i,
+    /(?:call|invoke|delegate\s+to|forward\s+to)\s+`([A-Za-z_$][\w$-]*)`/i,
   ];
   for (const pattern of explicitTargetPatterns) {
     const match = normalized.match(pattern);
@@ -3083,7 +3087,7 @@ export function isRuntimeTaskActionableText(text: string): boolean {
   // implementation”. Treat the leading intent as authoritative unless the
   // same sentence explicitly pivots from inspection to a write action or
   // defines a concrete validation outcome that the runtime can prove.
-  const hasLeadingReadOnlyIntent = /^(?:(?:需要|需|先|请|继续|首先|下一步)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解)|^(?:(?:need(?:s)?\s+to|first|please|next)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand)\b/i.test(normalized.trim());
+  const hasLeadingReadOnlyIntent = /^(?:(?:需要|需|先|请|继续|首先|下一步)\s*)?(?:(?:深度|深入|进一步|详细|全面)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解)|^(?:(?:need(?:s)?\s+to|first|please|next)\s+)?(?:(?:deeply|further|thoroughly|carefully)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand)\b/i.test(normalized.trim());
   const hasMutationAfterRead = /(?:然后|随后|之后|再|并(?:且)?).{0,100}(?:修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出)|(?:then|after(?:wards)?|and then).{0,100}(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i.test(normalized);
   const hasConcreteValidationOutcome =
     PRIMARY_VALIDATION_TASK_RE.test(normalized) &&
@@ -4171,6 +4175,75 @@ export function deriveRuntimePlanTasksFromArtifacts(
   return tasks;
 }
 
+function normalizeMutationOutcomeForApproval(task: PlanTask): string {
+  let outcome = stripMarkdownTaskLine(task.text)
+    .replace(PLAN_TASK_EVIDENCE_LABEL_RE, "")
+    .trim();
+  for (const evidence of task.evidence || []) {
+    if (evidence.kind !== "file" && evidence.kind !== "deliverable") continue;
+    const value = String(evidence.value || "").trim();
+    if (!value) continue;
+    outcome = outcome
+      .split(`\`${value}\``).join(" ")
+      .split(value).join(" ");
+  }
+  return outcome
+    .replace(/^(?:(?:修改|更新|新增|添加|增加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现)|(?:change|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export|implement)\b)\s*(?:文件|file)?\s*/i, "")
+    .replace(/^[\s的中内里:：—–,，.。;；()（）'"`-]+|[\s:：—–,，.。;；'"`-]+$/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function normalizeMutationOutcomeIdentity(value: string): string {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/(?:修改|更新|变更|改动|调整|修复|实现|change|update|modify|fix|adjust|implement)/gi, "")
+    .replace(/[\s:：—–,，.。;；()（）'"`_-]+/g, "");
+}
+
+/**
+ * Audit the executable graph produced from a review artifact. A mutation is
+ * approvable only when it retains a concrete owner, a described post-change
+ * state, and trusted runtime-verifiable mutation evidence. This deliberately
+ * runs after presentation repairs so adding an Evidence heading cannot turn
+ * an empty implementation label into an executable obligation.
+ */
+export function validateDerivedPlanTasksForApproval(
+  tasks: PlanTask[],
+): PlanArtifactValidationResult {
+  const mutationIdentities = new Set<string>();
+  for (const task of Array.isArray(tasks) ? tasks : []) {
+    if (task.executionKind !== "mutation") continue;
+    const mutationEvidence = (task.evidence || []).filter((item) =>
+      (item.kind === "file" || item.kind === "deliverable") &&
+      Boolean(String(item.value || "").trim()) &&
+      !isInternalPlanEvidenceValue(item.value)
+    );
+    if (mutationEvidence.length === 0) {
+      return { ok: false, reason: "missing_plan_mutation_target" };
+    }
+    const outcome = normalizeMutationOutcomeForApproval(task);
+    const normalizedOutcome = normalizeMutationOutcomeIdentity(outcome);
+    const identifierOnly = /^(?:[A-Za-z_$][\w$]*(?:\(\))?|[\w.-]+\.[A-Za-z0-9]{1,10})$/u.test(outcome);
+    if (!normalizedOutcome || identifierOnly) {
+      return { ok: false, reason: "empty_plan_implementation_detail" };
+    }
+    // `file`/`deliverable` is the runtime-owned acceptance obligation for a
+    // mutation: it can be satisfied only by a fresh trusted change to that
+    // exact target. The global actionable Plan gate separately requires an
+    // executable validation/acceptance section; do not manufacture a second,
+    // tautological evidence class here.
+    for (const evidence of mutationEvidence) {
+      const identity = `${normalizePlanEvidenceValue(evidence.value)}:${normalizedOutcome}`;
+      if (mutationIdentities.has(identity)) {
+        return { ok: false, reason: "duplicated_plan_mutation_task" };
+      }
+      mutationIdentities.add(identity);
+    }
+  }
+  return { ok: true };
+}
+
 function mergePlanTaskStatus(previous: PlanTask | undefined, next: PlanTask): PlanTaskStatus {
   if (!previous) return next.status;
   if (isPlanTaskTrustedComplete(previous)) return "completed";
@@ -4928,7 +5001,15 @@ function hasEmptyPlanImplementationDetail(content: string): boolean {
   const lines = String(content || "").split(/\r?\n/);
   for (let index = 0; index < lines.length; index += 1) {
     const rawLine = lines[index] || "";
-    if (!RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE.test(stripPlanQualityLine(rawLine))) continue;
+    const cleanLine = stripPlanQualityLine(rawLine);
+    const isEmptyImplementationOwner =
+      RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE.test(cleanLine) ||
+      (
+        RUNTIME_TASK_MUTATION_RE.test(cleanLine) &&
+        /[:：]\s*$/.test(cleanLine) &&
+        /^(?:(?:修改|更新|变更|改动|调整|修复|实现|替换|重构)|(?:modify|update|change|adjust|fix|implement|replace|refactor)\b)/i.test(cleanLine)
+      );
+    if (!isEmptyImplementationOwner) continue;
 
     const listItem = rawLine.match(/^(\s*)(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/);
     const ownerIndent = String(listItem?.[1] || "").length;
@@ -4940,7 +5021,15 @@ function hasEmptyPlanImplementationDetail(content: string): boolean {
 
       const nextListItem = nextLine.match(/^(\s*)(?:[-*+]\s+(?:\[[ xX]\]\s+)?|\d+[.)、:：-]\s+)/);
       if (listItem && nextListItem && String(nextListItem[1] || "").length <= ownerIndent) break;
-      if (RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE.test(stripPlanQualityLine(nextLine))) break;
+      const nextCleanLine = stripPlanQualityLine(nextLine);
+      if (
+        RUNTIME_TASK_IMPLEMENTATION_CONTAINER_RE.test(nextCleanLine) ||
+        (
+          RUNTIME_TASK_MUTATION_RE.test(nextCleanLine) &&
+          /[:：]\s*$/.test(nextCleanLine) &&
+          /^(?:(?:修改|更新|变更|改动|调整|修复|实现|替换|重构)|(?:modify|update|change|adjust|fix|implement|replace|refactor)\b)/i.test(nextCleanLine)
+        )
+      ) break;
       hasOwnedBody = true;
       break;
     }
@@ -5017,6 +5106,49 @@ function hasConflictingPlanAcceptanceAssertions(content: string): boolean {
     values.add(assertion.value);
     if (values.size > 1) return true;
     valuesBySubject.set(assertion.subject, values);
+  }
+  return false;
+}
+
+/**
+ * Lexical fallback at the Plan text boundary for an explicitly unresolved
+ * core interface commitment. Structured evidence-bundle contract closure is
+ * preferred when available, but a draft must never promise an API/plugin/SDK
+ * implementation while its own implementation or interface section says the
+ * contract still needs confirmation.
+ */
+function hasUnresolvedCoreInterfaceContract(content: string): boolean {
+  let actionableContractSectionLevel = 0;
+  let inCodeFence = false;
+  for (const rawLine of normalizeRuntimePlanSectionHeadings(content).split(/\r?\n/)) {
+    if (/^\s*```/.test(rawLine)) {
+      inCodeFence = !inCodeFence;
+      continue;
+    }
+    if (inCodeFence) continue;
+    const heading = rawLine.match(/^\s*(#{1,6})\s+(.+?)\s*$/);
+    if (heading) {
+      const level = String(heading[1] || "").length;
+      if (actionableContractSectionLevel > 0 && level <= actionableContractSectionLevel) {
+        actionableContractSectionLevel = 0;
+      }
+      const headingText = String(heading[2] || "").replace(/\*\*/g, "").trim();
+      if (
+        level > 1 &&
+        (
+          isRuntimeTaskMutationSectionHeading(headingText) ||
+          /^(?:公共\s*API(?:\s*\/\s*接口\s*\/\s*类型)?|接口|类型|Public APIs?(?:\s*\/\s*Interfaces?\s*\/\s*Types?)?|Interfaces?|Types?)$/i.test(headingText)
+        )
+      ) {
+        actionableContractSectionLevel = level;
+      }
+      continue;
+    }
+    if (actionableContractSectionLevel === 0) continue;
+    const line = stripPlanQualityLine(rawLine);
+    const unresolved = /(?:仍需确认|尚需确认|有待确认|待确认|待验证|未验证|待查明|\bTBD\b|\bTODO\b|needs?\s+(?:to\s+be\s+)?(?:confirmed|verified)|requires?\s+(?:confirmation|verification)|unconfirmed|unverified)/i.test(line);
+    const coreContract = /(?:第三方|外部|公共\s*API|接口|契约|类型定义|事件|载荷|命令|插件|方法|函数|\bAPI\b|\bSDK\b|\bplugin\b|\bmanifest\b|type definitions?|interfaces?|contracts?|events?|payloads?|schemas?|methods?|functions?|commands?|invoke|listen|@[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)/i.test(line);
+    if (unresolved && coreContract) return true;
   }
   return false;
 }
@@ -5106,6 +5238,12 @@ export function validateActionablePlanArtifact(
   }
   if (planEvidenceSectionsContainInternalPlanArtifacts(raw)) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "internal_plan_artifact_evidence" });
+  }
+  if (hasUnresolvedCoreInterfaceContract(raw)) {
+    return classifyPlanArtifactQualityResult({
+      ok: false,
+      reason: "unverified_plan_contract_counterpart:declared_core_interface",
+    });
   }
   const decisionFork = analyzePlanDecisionFork(raw);
   if (decisionFork.requiresUserOptions) {
@@ -5280,6 +5418,19 @@ export function validateActionablePlanArtifact(
     );
   if (unsupportedDebugAdviceLines.length > 0) {
     return classifyPlanArtifactQualityResult({ ok: false, reason: "unsupported_debug_log_advice" });
+  }
+
+  const derivedTaskValidation = validateDerivedPlanTasksForApproval(
+    deriveRuntimePlanTasksFromArtifacts([{
+      kind: "plan",
+      path: ".MAIN/plans/plan.md",
+      title: documentTitle || "Plan",
+      content: raw,
+      updatedAt: 0,
+    }]),
+  );
+  if (!derivedTaskValidation.ok) {
+    return classifyPlanArtifactQualityResult(derivedTaskValidation);
   }
 
   return classifyPlanArtifactQualityResult({ ok: true });

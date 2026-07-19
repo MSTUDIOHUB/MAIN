@@ -1,4 +1,5 @@
 import { isPreApprovalPlanDraftWrite, parseToolCallArguments } from "../../orchestrator";
+import { isThinModelToolNarration } from "../../modelFeedbackDedupe";
 import type { LegacyWorkflowMode } from "../../runIntent";
 import { looksLikeSubstantivePlanAssistantText } from "../../workflowModels";
 import type { ToolCallToExecute } from "../types";
@@ -104,11 +105,15 @@ export function resolveToolProgressPresentation(input: {
   const unsupportedOnlyToolNarration =
     input.unsupportedToolCallCount > 0 &&
     input.progressEligibleToolCallCount === 0;
+  const thinToolNarration = isThinModelToolNarration(input.visibleAssistantText);
   // Model-authored prose emitted with a real tool call is the assistant's
   // public update channel. Runtime-injected tool narration and unsupported-tool
   // corrections remain process-only; the UI must not infer this identity from
   // words such as "confirmed" or "next".
-  const assistantUpdate = modelAuthoredToolNarration && !unsupportedOnlyToolNarration;
+  const assistantUpdate =
+    modelAuthoredToolNarration &&
+    !unsupportedOnlyToolNarration &&
+    !thinToolNarration;
   const shouldPreserveApprovedExecutionText = assistantUpdate;
 
   return {
@@ -120,6 +125,8 @@ export function resolveToolProgressPresentation(input: {
       ? "assistant_update"
       : unsupportedOnlyToolNarration
       ? "hidden_process"
+      : thinToolNarration
+      ? "user_progress"
       : modelAuthoredToolNarration
       ? "hidden_process"
       : shouldRenderToolProgress || input.shouldSuppressApprovedPlanNoToolText

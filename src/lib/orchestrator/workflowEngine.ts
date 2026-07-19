@@ -50,6 +50,7 @@ import {
 import { type DurableTurnContext, type PlanExecutionEvidenceEntry, type PlanExecutionProgressPhase, type PlanExecutionProgressUpdate, getPlanArtifactTitle, extractPlanTasks, isEphemeralPlanArtifactPath, reconcilePlanTaskCompletion, resolvePlanExecutionEvidenceIdentity, canonicalizePlanArtifactPath, detectPlanArtifactKind } from "../workflowModels";
 import {
   PLAN_MAX_AUTO_RESUME_LIMIT,
+  buildChatMaxIterationsResumePrompt,
   buildExecuteMaxIterationsAutoResumeNotice,
   buildExecuteMaxIterationsPauseNotice,
   buildExecuteMaxIterationsResumePrompt,
@@ -123,6 +124,10 @@ import {
 import { scopeExecutionEvidenceLedger } from "../verificationEvidence";
 import { isNoOpToolFeedback } from "../toolFeedbackEnvelope";
 import { isWorkspaceMutationToolName } from "../workspaceMutationTools";
+import {
+  isThinModelToolNarration,
+  normalizeModelFeedbackForDedupe,
+} from "../modelFeedbackDedupe";
 
 type WorkflowStoreState = any;
 
@@ -313,7 +318,7 @@ export class WorkflowEngine {
       )
     );
     let pendingMaxIterationsAutoResume: {
-      kind: "plan" | "execute";
+      kind: "chat" | "plan" | "execute";
       start: () => void;
       cancel: (reason: string, options?: { visible?: boolean }) => void;
     } | null = null;
@@ -838,6 +843,7 @@ export class WorkflowEngine {
             tasks: sessionGet().planTasks,
             evidenceLedger: sessionGet().planExecutionEvidenceLedger,
             recentToolActivity: [],
+            currentTaskId: update.currentTaskId,
             currentTask: update.currentTask,
             currentTool: update.currentTool,
             latestEvidence: update.latestEvidence,
@@ -863,39 +869,6 @@ export class WorkflowEngine {
           dedupeKey: `plan-execution-progress:${activeRuntimeRunIdentity.runId}`,
         }),
       );
-    };
-
-    const emitPlanStreamHeartbeat = (marker: any) => {
-      const previous = sessionGet().planExecutionProgressSnapshot;
-      if (!previous || previous.turnId !== turnId) return;
-      const currentTool = marker.currentToolName
-        ? [
-            marker.currentToolName,
-            marker.currentToolInputKey,
-            marker.currentToolInputTarget,
-          ].filter(Boolean).join(" · ")
-        : "";
-      const zh = phaseLanguage === "zh";
-      const streamStatus = marker.streamStatus;
-      emitLocalPlanExecutionProgress("running", {
-        iteration: marker.iteration || previous.iteration || 0,
-        maxIterations: marker.maxIterations || previous.maxIterations || PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
-        currentTask: previous.currentTask,
-        currentTool,
-        latestEvidence: previous.latestEvidence,
-        nextStep: streamStatus === "no_chunk_progress_warning"
-          ? zh
-            ? "模型仍在流式生成但间隔偏长；可继续等待，或停止后查看日志与恢复点"
-            : "model is still streaming with a long gap; keep waiting or stop and inspect logs/recovery details"
-          : zh
-          ? "模型仍在生成；ChatArea 会持续显示流式进度"
-          : "model is still generating; ChatArea will keep showing stream progress",
-        progressSignature: previous.progressSignature,
-        repeatedTargets: previous.repeatedTargets,
-        recoveryReason: streamStatus === "no_chunk_progress_warning"
-          ? "stream_no_chunk_progress"
-          : previous.recoveryReason,
-      });
     };
 
     const updateHarnessRunMarker = (patch: Partial<HarnessRunMarker>) => {
@@ -1325,7 +1298,6 @@ export class WorkflowEngine {
       onHarnessRunUpdate: (patch: any) => {
         const markerPatch = patch as Partial<HarnessRunMarker> & Record<string, unknown>;
         updateHarnessRunMarker(markerPatch);
-        emitPlanStreamHeartbeat(markerPatch);
       },
       onDebugEvent: (event: any, data: any = {}) => {
         try {
@@ -1827,6 +1799,81 @@ export class WorkflowEngine {
         }
       },
 
+      onAssistantCommentary: (text, meta) => {
+        const visibleText = String(text || "").trim();
+        if (!visibleText || isThinModelToolNarration(visibleText)) {
+          logStoreEvent("assistant_commentary_suppressed", {
+            turnId,
+            reason: visibleText ? "thin_tool_narration" : "empty",
+          });
+          return;
+        }
+
+        const normalized = normalizeModelFeedbackForDedupe(visibleText);
+        if (!normalized) return;
+
+        sessionSet((state: any) => {
+          const ownedTurnIds = new Set([turnId, toolDisplayTurnId].filter(Boolean));
+          const matchingBlocks = state.taskFlow.filter((block: any) =>
+            block.type === "agent" &&
+            ownedTurnIds.has(block.turnId) &&
+            block.visibility !== "assistant_final" &&
+            (
+              block.visibility === "assistant_update" ||
+              context.agentBlockIdsCreatedThisRun.has(block.id)
+            ) &&
+            normalizeModelFeedbackForDedupe(String(block.content || "")) === normalized
+          );
+          const existing = matchingBlocks[matchingBlocks.length - 1];
+          if (existing?.visibility === "assistant_update") {
+            logStoreEvent("assistant_commentary_deduped", {
+              turnId,
+              blockId: existing.id,
+            });
+            return {};
+          }
+
+          const blockId = existing?.id ?? state._nextTaskId();
+          if (!existing) context.agentBlockIdsCreatedThisRun.add(blockId);
+          const commentaryBlock = attachRuntimePhase({
+            ...(existing || {}),
+            id: blockId,
+            turnId: toolDisplayTurnId,
+            type: "agent",
+            content: visibleText,
+            streaming: false,
+            hiddenProcess: false,
+            visibility: "assistant_update",
+          } as TaskBlock);
+          const taskFlow = existing
+            ? state.taskFlow.map((block: any) => block.id === blockId ? commentaryBlock : block)
+            : [...state.taskFlow, commentaryBlock];
+          const conversationTurns = state.conversationTurns.map((turn: any) =>
+            turn.id === turnId
+              ? {
+                  ...turn,
+                  status: turn.status === "awaiting_approval"
+                    ? turn.status
+                    : isUnapprovedPlanRuntime()
+                    ? "planning"
+                    : "executing",
+                  blockIds: turn.blockIds.includes(blockId)
+                    ? turn.blockIds
+                    : [...turn.blockIds, blockId],
+                }
+              : turn
+          );
+          return { taskFlow, conversationTurns };
+        });
+
+        logStoreEvent("assistant_commentary_published", {
+          turnId,
+          visibleChars: visibleText.length,
+          modelAuthored: meta?.modelAuthored !== false,
+          toolCalls: meta?.toolCalls?.length || 0,
+        });
+      },
+
       onAssistantFinalText: (text: any, replyOptions: any[] = [], meta: any) => {
         const hasToolCalls = meta?.hasToolCalls === true;
         const awaitingInput = meta?.awaitingInput === true && replyOptions.length > 0;
@@ -2022,12 +2069,18 @@ export class WorkflowEngine {
               nextStreamingBlockId = null;
             }
           } else {
+            const normalizedVisibleCandidate = normalizeModelFeedbackForDedupe(visibleText);
             const existingAgentBlock = [...taskFlow]
               .reverse()
               .find((block) =>
                 block.turnId === turnId &&
                 block.type === "agent" &&
-                !block.archivedAfterChoice
+                !block.archivedAfterChoice &&
+                block.visibility !== "assistant_update" &&
+                block.visibility !== "assistant_final" &&
+                context.agentBlockIdsCreatedThisRun.has(block.id) &&
+                normalizeModelFeedbackForDedupe(String(block.content || "")) ===
+                  normalizedVisibleCandidate
               );
 
             if (existingAgentBlock) {
@@ -2401,9 +2454,9 @@ export class WorkflowEngine {
             planExecutionEvidenceLedger: nextLedger,
             planExecutionEvidenceCount: nextLedger.length,
             planTasks: nextTasks,
-            // This is a consecutive no-progress checkpoint budget, not a
-            // lifetime task limit. Fresh durable evidence earns another
-            // context rotation when unfinished work remains.
+            // This is a consecutive no-progress strategy budget, not a
+            // lifetime task limit. Fresh durable evidence starts a new finite
+            // pivot epoch when unfinished work remains.
             ...(gainedDurableExecutionEvidence ? { planAutoResumeCount: 0 } : {}),
           };
           if (existingIndex < 0) return evidencePatch;
@@ -2769,6 +2822,7 @@ export class WorkflowEngine {
           phase: progress.phase,
           iteration: progress.iteration,
           autoResume: progress.autoResumeCount,
+          currentTaskId: progress.currentTaskId || null,
           currentTask: progress.currentTask,
           currentTool: progress.currentTool,
           latestEvidence: progress.latestEvidence,
@@ -2780,6 +2834,7 @@ export class WorkflowEngine {
         emitLocalPlanExecutionProgress(progress.phase, {
           iteration: progress.iteration,
           maxIterations: progress.maxIterations,
+          currentTaskId: progress.currentTaskId,
           currentTask: progress.currentTask,
           currentTool: progress.currentTool,
           latestEvidence: progress.latestEvidence,
@@ -2791,6 +2846,156 @@ export class WorkflowEngine {
         });
       },
 
+      onChatMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
+        const currentCount = Math.max(
+          0,
+          Number(sessionGet().planAutoResumeCount) || 0,
+        );
+        const shouldAutoResume =
+          checkpoint.autoResumeEligible &&
+          checkpoint.strategyPivot !== null &&
+          currentCount < checkpoint.strategyPivotBudget;
+        if (!shouldAutoResume) return false;
+
+        const effectiveCheckpoint = {
+          ...checkpoint,
+          autoResumeCount: currentCount + 1,
+        };
+        sessionSet((state: any) => ({
+          planAutoResumeCount: currentCount,
+          conversationTurns: state.conversationTurns.map((turn: any) =>
+            turn.id === turnId || turn.id === context.uiDisplayTurnId
+              ? { ...turn, status: "stopped_no_action", collapsed: false }
+              : turn
+          ),
+        }));
+        logStoreEvent("chat_max_iterations_auto_resume_pending", {
+          autoResumeCount: effectiveCheckpoint.autoResumeCount,
+          maxIterations: checkpoint.maxIterations,
+          runtimeIntent: effectiveRunIntent,
+          strategyPivot: effectiveCheckpoint.strategyPivot,
+        });
+
+        const cancelAutoResume = (reason: string, options?: { visible?: boolean }) => {
+          const latest = sessionGet();
+          const latestSessionKey = resolveSessionRuntimeKey(
+            resolveSessionWorkspaceKey(latest.currentWorkspace),
+            latest.currentSessionId,
+          );
+          if (latestSessionKey !== runSessionKey) return;
+          const cancellationNotice = phaseLanguage === "zh"
+            ? "对话策略续跑已取消：新的用户消息或运行时交接优先。已有上下文仍会保留。"
+            : "Conversation strategy continuation was canceled because a newer user message or runtime handoff took priority. Retained context remains available.";
+          sessionSet((state: any) => ({
+            planAutoResumeCount: currentCount,
+            conversationTurns: state.conversationTurns.map((turn: any) =>
+              turn.id === turnId || turn.id === context.uiDisplayTurnId
+                ? { ...turn, status: "stopped_no_action", collapsed: false }
+                : turn
+            ),
+            runtimeEvents: state.runtimeEvents.map((event: any) =>
+              event.type === "run.paused" &&
+              event.runId === activeRuntimeRunIdentity.runId &&
+              event.reason === "max_iterations_auto_resume"
+                ? {
+                    ...event,
+                    reason: "max_iterations_auto_resume_canceled",
+                    message: cancellationNotice,
+                  }
+                : event
+            ),
+          }));
+          if (options?.visible) {
+            sessionGet().setConversationTurnSummary(
+              context.uiDisplayTurnId,
+              cancellationNotice,
+            );
+          }
+          logStoreEvent("chat_max_iterations_auto_resume_canceled", {
+            reason,
+            autoResumeCount: currentCount,
+          });
+        };
+
+        pendingMaxIterationsAutoResume = {
+          kind: "chat",
+          cancel: cancelAutoResume,
+          start: () => {
+            const latest = sessionGet();
+            const latestSessionKey = resolveSessionRuntimeKey(
+              resolveSessionWorkspaceKey(latest.currentWorkspace),
+              latest.currentSessionId,
+            );
+            if (latestSessionKey !== runSessionKey) return;
+            if (
+              latest.isGenerating ||
+              latest.agentStatus === "running" ||
+              latest.agentStatus === "pending_review"
+            ) {
+              logStoreEvent("chat_max_iterations_auto_resume_skipped", {
+                reason: "newer_run_active",
+                agentStatus: latest.agentStatus,
+                isGenerating: latest.isGenerating,
+              });
+              return;
+            }
+
+            sessionSet((state: any) => ({
+              planAutoResumeCount: effectiveCheckpoint.autoResumeCount,
+              conversationTurns: state.conversationTurns.map((turn: any) =>
+                turn.id === turnId || turn.id === context.uiDisplayTurnId
+                  ? { ...turn, status: "executing" }
+                  : turn
+              ),
+            }));
+            let started = false;
+            try {
+              started = latest.sendMessage(
+                buildChatMaxIterationsResumePrompt({
+                  language: phaseLanguage,
+                  runtimeIntent: effectiveRunIntent,
+                  checkpoint: effectiveCheckpoint,
+                }),
+                undefined,
+                {
+                  hidden: true,
+                  reuseCurrentTurn: true,
+                  turnIdOverride: context.uiDisplayTurnId || turnId,
+                  preservePlanState: true,
+                  resolvedIntent: effectiveRunIntent,
+                  runtimeIntentOverride: effectiveRunIntent,
+                  parentRunIdOverride: activeRuntimeRunIdentity.runId,
+                  skipIntentResolution: true,
+                  turnTitle: phaseLanguage === "zh"
+                    ? "对话策略续跑"
+                    : "Conversation Strategy Continuation",
+                  intentSummary: phaseLanguage === "zh"
+                    ? `达到安全轮次边界后切换策略：${effectiveCheckpoint.strategyPivot}。`
+                    : `Switch bounded strategy after the conversation safety boundary: ${effectiveCheckpoint.strategyPivot}.`,
+                },
+              ) === true;
+            } catch (error) {
+              logStoreEvent("chat_max_iterations_auto_resume_submission_failed", {
+                error: error instanceof Error ? error.message : String(error),
+              });
+            }
+            if (started) {
+              logStoreEvent("chat_max_iterations_auto_resume_dispatched", {
+                autoResumeCount: effectiveCheckpoint.autoResumeCount,
+                runtimeIntent: effectiveRunIntent,
+                parentRunId: activeRuntimeRunIdentity.runId,
+              });
+            } else {
+              cancelAutoResume("resume_submission_rejected", { visible: true });
+            }
+          },
+        };
+        return {
+          status: "auto_resume_scheduled" as const,
+          checkpoint: effectiveCheckpoint,
+        };
+      },
+
       onPlanMaxIterationsCheckpoint: (checkpoint: PlanMaxIterationsCheckpoint) => {
         const currentCount = Math.max(
           0,
@@ -2798,6 +3003,7 @@ export class WorkflowEngine {
         );
         const shouldAutoResume =
           checkpoint.autoResumeEligible &&
+          checkpoint.strategyPivot !== null &&
           currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
         const effectiveCheckpoint = {
           ...checkpoint,
@@ -2862,7 +3068,7 @@ export class WorkflowEngine {
             maxIterations: checkpoint.maxIterations,
             reason: checkpoint.autoResumeEligible
               ? "auto_resume_limit_reached"
-              : "no_durable_execution_progress",
+              : "strategy_pivots_exhausted_or_blocked",
           });
           return true;
         }
@@ -2870,6 +3076,8 @@ export class WorkflowEngine {
         logStoreEvent("plan_max_iterations_auto_resume_pending", {
           autoResumeCount: effectiveCheckpoint.autoResumeCount,
           maxIterations: checkpoint.maxIterations,
+          strategyPivot: effectiveCheckpoint.strategyPivot,
+          attemptedStrategyPivots: effectiveCheckpoint.attemptedStrategyPivots,
         });
         const cancelAutoResume = (reason: string, options?: { visible?: boolean }) => {
           const latest = sessionGet();
@@ -3007,8 +3215,8 @@ export class WorkflowEngine {
                     ? "计划执行自动恢复"
                     : "Plan Execution Auto-Resume",
                   intentSummary: phaseLanguage === "zh"
-                    ? "计划执行达到安全轮次边界后自动恢复一次。"
-                    : "Auto-resume once after the plan execution safety boundary.",
+                    ? `计划执行达到安全轮次边界后切换策略：${effectiveCheckpoint.strategyPivot}。`
+                    : `Switch strategy after the plan execution safety boundary: ${effectiveCheckpoint.strategyPivot}.`,
                 },
               ) === true;
             } catch (error) {
@@ -3039,6 +3247,7 @@ export class WorkflowEngine {
         );
         const shouldAutoResume =
           checkpoint.autoResumeEligible &&
+          checkpoint.strategyPivot !== null &&
           currentCount < PLAN_MAX_AUTO_RESUME_LIMIT;
         const effectiveCheckpoint = {
           ...checkpoint,
@@ -3131,6 +3340,13 @@ export class WorkflowEngine {
                   ? {
                       requirementRef:
                         latestExecuteRecoveryState.decisionCheckpoint.requirementRef,
+                    }
+                  : {}),
+                ...(latestExecuteRecoveryState?.decisionCheckpoint?.noProgressStrategyPivots?.length
+                  ? {
+                      noProgressStrategyPivots: [
+                        ...latestExecuteRecoveryState.decisionCheckpoint.noProgressStrategyPivots,
+                      ],
                     }
                   : {}),
                 ...(latestExecuteRecoveryState?.decisionCheckpoint?.pendingFiniteValidation
@@ -3288,7 +3504,7 @@ export class WorkflowEngine {
             maxIterations: checkpoint.maxIterations,
             reason: checkpoint.autoResumeEligible
               ? "auto_resume_limit_reached"
-              : "no_durable_execution_progress",
+              : "strategy_pivots_exhausted_or_blocked",
           });
           return true;
         }
@@ -3296,6 +3512,8 @@ export class WorkflowEngine {
         logStoreEvent("execute_max_iterations_auto_resume_pending", {
           autoResumeCount: effectiveCheckpoint.autoResumeCount,
           maxIterations: checkpoint.maxIterations,
+          strategyPivot: effectiveCheckpoint.strategyPivot,
+          attemptedStrategyPivots: effectiveCheckpoint.attemptedStrategyPivots,
         });
         const cancelAutoResume = (reason: string, options?: { visible?: boolean }) => {
           const latest = sessionGet();
@@ -3411,8 +3629,8 @@ export class WorkflowEngine {
                     ? "执行自动恢复"
                     : "Execution Auto-Resume",
                   intentSummary: phaseLanguage === "zh"
-                    ? "执行达到安全轮次边界后自动恢复一次。"
-                    : "Auto-resume once after the execution safety boundary.",
+                    ? `执行达到安全轮次边界后切换策略：${effectiveCheckpoint.strategyPivot}。`
+                    : `Switch strategy after the execution safety boundary: ${effectiveCheckpoint.strategyPivot}.`,
                 },
               ) === true;
             } catch (error) {
@@ -3542,8 +3760,33 @@ export class WorkflowEngine {
           messagePreview: message.replace(/\s+/g, " ").slice(0, 260),
         });
         const isDurableRecoveryPause =
-          progress?.recoveryReason === "execute_recovery_no_progress_limit" &&
-          getScopedDurableMutationEvidence().length > 0;
+          (
+            progress?.recoveryReason === "execute_recovery_no_progress_limit" &&
+            getScopedDurableMutationEvidence().length > 0
+          ) || progress?.recoveryReason === "execute_no_progress_batch_loop";
+        if (isDurableRecoveryPause) {
+          const previous = sessionGet().planExecutionProgressSnapshot;
+          emitLocalPlanExecutionProgress("paused", {
+            iteration: progress?.iteration ?? previous?.iteration ?? 0,
+            maxIterations:
+              progress?.maxIterations ??
+              previous?.maxIterations ??
+              PLAN_EXECUTION_PROGRESS_DEFAULT_MAX_ITERATIONS,
+            currentTaskId: progress?.currentTaskId ?? previous?.currentTaskId,
+            currentTask: progress?.currentTask ?? previous?.currentTask,
+            currentTool: progress?.currentTool ?? previous?.currentTool,
+            latestEvidence: progress?.latestEvidence ?? previous?.latestEvidence,
+            nextStep: progress?.nextStep ?? previous?.nextStep ?? message,
+            progressSignature:
+              progress?.progressSignature ?? previous?.progressSignature,
+            lastEffectiveEvidenceAt:
+              progress?.lastEffectiveEvidenceAt ?? previous?.lastEffectiveEvidenceAt,
+            recoveryReason:
+              progress?.recoveryReason ?? previous?.recoveryReason,
+            repeatedTargets:
+              progress?.repeatedTargets ?? previous?.repeatedTargets,
+          });
+        }
         const stoppedStatus = reason === "no_output"
           ? "stopped_no_output"
           : isDurableRecoveryPause
@@ -3940,10 +4183,24 @@ export class WorkflowEngine {
             String(block.content || "").trim() === publishedCompletedAssistantFinalText
           )
         : null;
-      const finalBlockId = matchingPublishedBlock?.id ?? current._nextTaskId();
+      const existingTerminalFinalBlock = [...turnBlocks].reverse().find((block: TaskBlock) =>
+        block.turnId === presentationTurnId &&
+        block.type === "agent" &&
+        block.visibility === "assistant_final"
+      );
+      const reusableFinalBlock = matchingPublishedBlock || existingTerminalFinalBlock || null;
+      const finalBlockId = reusableFinalBlock?.id ?? current._nextTaskId();
       sessionSet((state: any) => {
-        let taskFlow = state.taskFlow.map((block: TaskBlock) =>
-          block.id === finalBlockId && block.type === "agent"
+        let taskFlow = state.taskFlow.map((block: TaskBlock) => {
+          if (
+            block.type === "agent" &&
+            terminalTurnIds.has(block.turnId || "") &&
+            block.visibility === "assistant_final" &&
+            block.id !== finalBlockId
+          ) {
+            return { ...block, visibility: "assistant_update" as const };
+          }
+          return block.id === finalBlockId && block.type === "agent"
             ? {
                 ...block,
                 content: finalPresentation.text,
@@ -3952,9 +4209,9 @@ export class WorkflowEngine {
                 visibility: "assistant_final" as const,
                 turnPhase: withTurnRuntimePhaseStatus(block.turnPhase, "done", phaseLanguage),
               }
-            : block
-        );
-        if (!matchingPublishedBlock) {
+            : block;
+        });
+        if (!reusableFinalBlock) {
           taskFlow = [...taskFlow, {
             id: finalBlockId,
             turnId: presentationTurnId,
@@ -3992,11 +4249,20 @@ export class WorkflowEngine {
     };
 
     const ensurePausedTurnFinalPresentation = (outcome: AgentLoopOutcome): string | null => {
-      if (outcome.status !== "paused" || outcome.reason !== "execute_recovery_no_progress_limit") {
+      if (
+        outcome.status !== "paused" ||
+        (
+          outcome.reason !== "execute_recovery_no_progress_limit" &&
+          outcome.reason !== "execute_no_progress_batch_loop"
+        )
+      ) {
         return null;
       }
       const durableMutationEvidence = getScopedDurableMutationEvidence();
-      if (durableMutationEvidence.length === 0) return null;
+      if (
+        outcome.reason === "execute_recovery_no_progress_limit" &&
+        durableMutationEvidence.length === 0
+      ) return null;
       const current = sessionGet();
       const terminalOwnership = resolveTerminalTurnOwnership({
         turnId,
@@ -4031,16 +4297,44 @@ export class WorkflowEngine {
         nextStep: lastNonActionableStopDiagnostic?.nextStep,
         language: (current.preferredResponseLanguage || current.config.language) === "en" ? "en" : "zh",
       });
-      const finalBlockId = current._nextTaskId();
+      const existingTerminalFinalBlock = [...turnBlocks].reverse().find((block: TaskBlock) =>
+        block.turnId === presentationTurnId &&
+        block.type === "agent" &&
+        block.visibility === "assistant_final"
+      );
+      const finalBlockId = existingTerminalFinalBlock?.id ?? current._nextTaskId();
       sessionSet((state: any) => {
-        const taskFlow = [...state.taskFlow, {
-          id: finalBlockId,
-          turnId: presentationTurnId,
-          type: "agent" as const,
-          content: finalPresentation.text,
-          streaming: false,
-          visibility: "assistant_final" as const,
-        }];
+        let foundFinal = false;
+        const taskFlow = state.taskFlow.map((block: TaskBlock) => {
+          if (block.id === finalBlockId && block.type === "agent") {
+            foundFinal = true;
+            return {
+              ...block,
+              content: finalPresentation.text,
+              streaming: false,
+              hiddenProcess: false,
+              visibility: "assistant_final" as const,
+            };
+          }
+          if (
+            block.type === "agent" &&
+            terminalTurnIds.has(block.turnId || "") &&
+            block.visibility === "assistant_final"
+          ) {
+            return { ...block, visibility: "assistant_update" as const };
+          }
+          return block;
+        });
+        if (!foundFinal) {
+          taskFlow.push({
+            id: finalBlockId,
+            turnId: presentationTurnId,
+            type: "agent" as const,
+            content: finalPresentation.text,
+            streaming: false,
+            visibility: "assistant_final" as const,
+          });
+        }
         return {
           taskFlow,
           conversationTurns: state.conversationTurns.map((candidate: any) =>
@@ -4872,12 +5166,16 @@ export class WorkflowEngine {
       const durableRecoveryMutations = getScopedDurableMutationEvidence();
       if (
         loopOutcome.status === "stopped_no_action" &&
-        terminalRecoveryReason === "execute_recovery_no_progress_limit" &&
-        durableRecoveryMutations.length > 0
+        (
+          (
+            terminalRecoveryReason === "execute_recovery_no_progress_limit" &&
+            durableRecoveryMutations.length > 0
+          ) || terminalRecoveryReason === "execute_no_progress_batch_loop"
+        )
       ) {
         loopOutcome = {
           status: "paused",
-          reason: "execute_recovery_no_progress_limit",
+          reason: terminalRecoveryReason,
         };
         logStoreEvent("durable_recovery_stop_normalized", {
           fromStatus: "stopped_no_action",

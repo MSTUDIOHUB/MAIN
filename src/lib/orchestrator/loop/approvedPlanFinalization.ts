@@ -16,7 +16,11 @@ import {
   resolveApprovedPlanValidationBoundary,
 } from "../../orchestrator";
 import type { OrchestratorCallbacks } from "../types";
-import { resolveExecuteNoToolCheckpointLimit } from "./executeNoToolRecovery";
+import {
+  applyExecuteNoToolStrategyPivot,
+  resolveExecuteNoToolStrategyAtBoundary,
+  resolveProviderNeutralExecuteNoToolCheckpointLimit,
+} from "./executeNoToolRecovery";
 import {
   buildExecuteEvidenceClosureAudit,
   resolveCommandEvidenceRequirements,
@@ -150,7 +154,6 @@ export function handleApprovedPlanFinalization(input: {
 }): ApprovedPlanFinalizationResult {
   const {
     callbacks,
-    activeProfile,
     iteration,
     approvedPlanAuditForNoTool,
     rejectedCompletionClaim,
@@ -198,7 +201,26 @@ export function handleApprovedPlanFinalization(input: {
         ? "- 先派生 runtime 任务清单；只有长任务或需要审计留档时才生成 `.MAIN/plans/tasks.md`，再执行源码或交付物写入。"
         : "- First derive a runtime task list; generate `.MAIN/plans/tasks.md` only for long work or audit-file needs, then execute source or deliverable writes.",
     );
-    if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
+    const checkpointLimit = resolveProviderNeutralExecuteNoToolCheckpointLimit();
+    if (consecutiveNoToolCount >= checkpointLimit) {
+      const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
+        callbacks,
+        consecutiveNoToolCount,
+        checkpointLimit,
+        availableToolNames,
+        cause: "remaining_plan_tasks",
+      });
+      if (strategyDecision.action === "continue_with_pivot") {
+        applyExecuteNoToolStrategyPivot({
+          callbacks,
+          decision: strategyDecision,
+          forceXmlTools: Boolean(callbacks.shouldForceXmlForProviderCompatibility?.()),
+          iteration,
+          cause: "remaining_plan_tasks",
+          runtimeAlreadyPrepared: true,
+        });
+        return finish("continue");
+      }
       logAgentEvent("loop_stop", {
         reason: "remaining_plan_tasks_limit",
         iteration,

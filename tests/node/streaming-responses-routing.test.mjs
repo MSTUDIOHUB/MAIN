@@ -540,9 +540,12 @@ test("OpenAI Responses respects XML tool protocol by omitting native tools", asy
         parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
       },
     }],
+    undefined,
+    { toolChoice: "required" },
   );
 
   assert.equal(requests[0].tools, undefined);
+  assert.equal(requests[0].tool_choice, undefined);
 });
 
 test("OpenAI-compatible history keeps tool call arguments as JSON strings", async () => {
@@ -626,7 +629,7 @@ test("OpenAI-compatible history keeps tool call arguments as JSON strings", asyn
   assert.equal(bodies[0].messages[2].tool_calls[0].function.arguments, "{\"path\":\".\"}");
 });
 
-test("OpenAI-compatible Rust proxy attaches required tool_choice when requested", async () => {
+test("OpenAI-compatible native request sends one narrow schema with required-any", async () => {
   const listeners = new Map();
   const bodies = [];
   const listenMock = async (eventName, handler) => {
@@ -689,7 +692,10 @@ test("OpenAI-compatible Rust proxy attaches required tool_choice when requested"
 
   assert.equal(result.content, "ok");
   assert.equal(bodies[0].tool_choice, "required");
+  assert.equal(typeof bodies[0].tool_choice, "string");
+  assert.equal(bodies[0].tools.length, 1);
   assert.equal(bodies[0].tools[0].function.name, "apply_patch");
+  assert.deepEqual(bodies[0].tools[0].function.parameters.required, ["patch"]);
 });
 
 test("local Rust stream read errors fall back to a non-streaming request", async () => {

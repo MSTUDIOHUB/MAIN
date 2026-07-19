@@ -66,7 +66,6 @@ export function resolveRecoveryToolChoice(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   llmToolNames: string[];
   forceXmlTools: boolean;
-  preferExplicitFunction?: boolean;
   preapprovalPlanQualityRecoveryToolChoice?: "required";
   recoveryActionContract?: RecoveryActionContract;
 }): OpenAiToolChoice | undefined {
@@ -91,21 +90,18 @@ export function resolveRecoveryToolChoice(input: {
     // force the model to call an unrelated visible tool and manufacture a
     // protocol loop. XML remains prompt-driven and returned above.
     if (!availableToolNames.has(requirement.toolName)) return undefined;
-    // Joining a running child releases a scope lease and must remain eligible
-    // ahead of any new parent action. Once the exact phase capability is also
-    // executable, required-any keeps this coordination call available without
-    // turning a missing capability into a forced unrelated call.
-    if (availableToolNames.has("wait_subagents")) return "required";
-    if (input.preferExplicitFunction) {
-      return { type: "function", function: { name: requirement.toolName } };
-    }
+    // The schema surface is already narrowed to the exact capability. Use
+    // portable required-any for every provider; named function choice is not
+    // part of MAIN's execution semantics and is inconsistently implemented by
+    // OpenAI-compatible local servers.
     return "required";
   }
 
   const hasExecutableRecoveryTool = recoveryActionContract.allowsAllTools
     ? availableToolNames.size > 0
     : [...availableToolNames].some((name) =>
-        recoveryActionContract.allowedToolNames.has(name)
+        recoveryActionContract.allowedToolNames.has(name) ||
+        name === "wait_subagents"
       );
   if (!hasExecutableRecoveryTool) return undefined;
   return "required";
@@ -282,11 +278,6 @@ export async function invokeInitialStreamForIteration(input: {
     executeRecoveryMode,
     llmToolNames: llmTools.map((tool) => tool.function.name),
     forceXmlTools,
-    // Local OpenAI-compatible servers often accept tool_choice="required"
-    // but ignore or mishandle the named-function object. Recovery already
-    // narrows the schema surface, so required-any is both sufficient and more
-    // portable locally. Keep explicit named choice for compatible cloud paths.
-    preferExplicitFunction: config.activeProfile === "cloud",
     preapprovalPlanQualityRecoveryToolChoice:
       preapprovalPlanQualityRecoveryStreamPolicy.toolChoice,
     recoveryActionContract,

@@ -76,6 +76,7 @@ const goalState = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goa
 const goalRuntime = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalRuntime.ts"));
 const goalPersistence = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/goalPersistence.ts"));
 const {
+  extractPlanTasks,
   validatePlanArtifactContent,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
 
@@ -174,6 +175,83 @@ function planArtifact(content, overrides = {}) {
   };
 }
 
+function tasksArtifact(content, overrides = {}) {
+  return {
+    kind: "tasks",
+    path: ".MAIN/plans/tasks.md",
+    title: "Tasks",
+    content,
+    revision: 4,
+    updatedAt: 101,
+    ...overrides,
+  };
+}
+
+function approvedTaskArtifact() {
+  return tasksArtifact([
+    "# Tasks",
+    "",
+    "- [ ] 修改 src/main.js 中的 handleOpenFile()，统一文件打开入口 — 证据: file:src/main.js",
+    "- [ ] 修改 src/main.js 中的 closeTab()，保留正确的活动标签 — 证据: file:src/main.js",
+    "- [ ] 运行恢复链路测试 — 证据: cmd:node --test tests/node/session-runtime-restore.test.mjs",
+    "",
+  ].join("\n"));
+}
+
+function planConversationTurn(overrides = {}) {
+  return {
+    id: "turn-plan",
+    userPrompt: "执行已批准的恢复计划",
+    title: "恢复计划",
+    mode: "plan",
+    intent: "plan",
+    displayIntent: "execute",
+    status: "executing",
+    summary: "",
+    blockIds: [],
+    collapsed: false,
+    createdAt: 100,
+    ...overrides,
+  };
+}
+
+function planHarnessMarker(overrides = {}) {
+  return {
+    schemaVersion: 1,
+    instanceId: "test-instance",
+    sessionKey: "plan-session",
+    workspace: "/repo",
+    sessionId: 1,
+    turnId: "turn-plan",
+    runId: "run-outer",
+    activeRunId: "run-child",
+    activeParentRunId: "run-outer",
+    status: "running",
+    workflowMode: "plan",
+    runtimeIntent: "execute",
+    planStage: "executing",
+    isPlanApproved: true,
+    iteration: 2,
+    maxIterations: 50,
+    messagesLen: 2,
+    toolCount: 1,
+    latestTool: "read_file",
+    latestToolTarget: "src/main.js",
+    activeStreamId: null,
+    streamStatus: null,
+    streamChunkCount: 0,
+    streamByteCount: 0,
+    streamElapsedMs: null,
+    streamLifecycleStatus: null,
+    lastStreamError: null,
+    startedAt: 100,
+    updatedAt: 200,
+    closedAt: null,
+    closeReason: null,
+    ...overrides,
+  };
+}
+
 function buildUnsupportedPlanContent() {
   return [
     "# MD Viewer 文件打开修复计划",
@@ -232,6 +310,148 @@ test("restore invalidates approval when sanitization removes one reviewable arti
   assert.equal(restored.planApprovalChoice, "");
   assert.deepEqual(restored.planExecutionEvidenceLedger, []);
   assert.equal(restored.planExecutionEvidenceCount, 0);
+});
+
+test("restore keeps an invalid approved Plan as audit history while revoking execution", () => {
+  const invalidPlan = planArtifact(buildUnsupportedPlanContent(), { revision: 2 });
+  const restored = normalizeSessionRuntimeSnapshot({
+    planArtifacts: [invalidPlan],
+    isPlanApproved: true,
+    planStage: "executing",
+    planApprovalChoice: "approve",
+  });
+
+  assert.equal(restored.isPlanApproved, false);
+  assert.equal(restored.planStage, "plan");
+  assert.equal(restored.planArtifacts.length, 1);
+  assert.equal(restored.planArtifacts[0].content, invalidPlan.content.trim());
+  assert.equal(restored.planApprovalChoice, "");
+});
+
+test("restore preserves currentTaskId and migrates legacy task text only when the approved graph is unique", () => {
+  const plan = planArtifact(buildApprovedPlanContent());
+  const tasks = approvedTaskArtifact();
+  assert.equal(validatePlanArtifactContent(tasks.content, "tasks").ok, true);
+  const planTasks = extractPlanTasks(tasks.content);
+  const progress = {
+    turnId: "turn-plan",
+    phase: "running",
+    currentTask: planTasks[0].text,
+    currentTool: "read_file · src/main.js",
+    latestEvidence: "read src/main.js",
+    nextStep: "apply the reviewed mutation",
+    iteration: 2,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    updatedAt: 100,
+  };
+  const migrated = normalizeSessionRuntimeSnapshot({
+    currentTurnId: "turn-plan",
+    conversationTurns: [planConversationTurn()],
+    planArtifacts: [plan, tasks],
+    planTasks,
+    planExecutionProgressSnapshot: {
+      ...progress,
+      currentTaskId: planTasks[0].id,
+      currentTask: "stale display text must not replace the stable id",
+    },
+    isPlanApproved: true,
+    planStage: "executing",
+    planApprovalChoice: "approve",
+  });
+  assert.equal(migrated.isPlanApproved, true);
+  assert.equal(migrated.planExecutionProgressSnapshot.currentTaskId, planTasks[0].id);
+  assert.equal(migrated.planTasks.length, 3);
+  assert.equal(migrated.planTasks[0].text, planTasks[0].text);
+
+  const legacy = normalizeSessionRuntimeSnapshot({
+    currentTurnId: "turn-plan",
+    conversationTurns: [planConversationTurn()],
+    planArtifacts: [plan, tasks],
+    planTasks,
+    planExecutionProgressSnapshot: progress,
+    isPlanApproved: true,
+    planStage: "executing",
+    planApprovalChoice: "approve",
+  });
+  assert.equal(legacy.isPlanApproved, true);
+  assert.equal(legacy.planExecutionProgressSnapshot.currentTaskId, planTasks[0].id);
+
+  const ambiguous = normalizeSessionRuntimeSnapshot({
+    currentTurnId: "turn-plan",
+    conversationTurns: [planConversationTurn()],
+    planArtifacts: [plan, tasks],
+    planTasks,
+    planExecutionProgressSnapshot: { ...progress, currentTask: "读取 src/main.js" },
+    isPlanApproved: true,
+    planStage: "executing",
+    planApprovalChoice: "approve",
+  });
+  assert.equal(ambiguous.isPlanApproved, false);
+  assert.equal(ambiguous.planStage, "plan");
+  assert.equal(ambiguous.planExecutionProgressSnapshot, null);
+});
+
+test("restore pauses and revokes approval when the Plan checkpoint turn or run owner is stale", () => {
+  const plan = planArtifact(buildApprovedPlanContent());
+  const tasks = approvedTaskArtifact();
+  const planTasks = extractPlanTasks(tasks.content);
+  const baseProgress = {
+    turnId: "turn-plan",
+    runId: "run-child",
+    parentRunId: "run-outer",
+    phase: "running",
+    currentTaskId: planTasks[0].id,
+    currentTask: planTasks[0].text,
+    currentTool: "read_file · src/main.js",
+    latestEvidence: "read src/main.js",
+    nextStep: "apply the reviewed mutation",
+    iteration: 2,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    updatedAt: 100,
+  };
+
+  const valid = normalizeSessionRuntimeSnapshot({
+    currentTurnId: "turn-plan",
+    conversationTurns: [planConversationTurn()],
+    planArtifacts: [plan, tasks],
+    planTasks,
+    planExecutionProgressSnapshot: baseProgress,
+    harnessRunMarker: planHarnessMarker(),
+    isPlanApproved: true,
+    planStage: "executing",
+    planApprovalChoice: "approve",
+  });
+  assert.equal(valid.isPlanApproved, true);
+  assert.equal(valid.planExecutionProgressSnapshot.currentTaskId, planTasks[0].id);
+  assert.equal(valid.harnessRunMarker.status, "paused");
+  assert.equal(valid.runtimeEvents.at(-1).type, "run.paused");
+
+  for (const mismatch of ["turn", "run"]) {
+    const restored = normalizeSessionRuntimeSnapshot({
+      currentTurnId: "turn-plan",
+      conversationTurns: [planConversationTurn()],
+      planArtifacts: [plan, tasks],
+      planTasks,
+      planExecutionProgressSnapshot: {
+        ...baseProgress,
+        ...(mismatch === "turn" ? { turnId: "turn-stale" } : { runId: "run-stale" }),
+      },
+      harnessRunMarker: planHarnessMarker(),
+      isPlanApproved: true,
+      planStage: "executing",
+      planApprovalChoice: "approve",
+    });
+
+    assert.equal(restored.isPlanApproved, false, mismatch);
+    assert.equal(restored.planStage, "plan", mismatch);
+    assert.equal(restored.planExecutionProgressSnapshot, null, mismatch);
+    assert.equal(restored.harnessRunMarker.status, "paused", mismatch);
+    assert.equal(restored.runtimeEvents.at(-1).type, "run.paused", mismatch);
+    assert.equal(restored.conversationTurns[0].status, "paused", mismatch);
+    assert.equal(restored.planArtifacts.some((artifact) => artifact.kind === "plan"), true, mismatch);
+  }
 });
 
 test("restore rewrites the exact owner pause boundary when an internal Plan choice request is cleared", () => {

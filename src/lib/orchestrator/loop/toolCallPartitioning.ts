@@ -797,7 +797,23 @@ export async function partitionToolCallsForExecution(input: {
       workflowMode === "plan" &&
       !callbacks.getIsPlanApproved() &&
       isPreApprovalPlanDraftWrite(tc.name, toolArgs);
-    if (!availableToolNames.has(tc.name) && !isAllowedPlanDraftMutation) {
+    const isSelectedCurrentRecoveryMutation =
+      executeRecoveryBatchDecision.selectedCallId === tc.id &&
+      isWorkspaceMutationToolCall(tc.name, toolArgs) &&
+      (
+        !executeRecoveryState.expectedTarget ||
+        resolveWorkspaceMutationTargets(tc.name, toolArgs, target).some((mutationTarget) =>
+          workspacePathsReferToSameFile(
+            mutationTarget,
+            executeRecoveryState.expectedTarget || "",
+          )
+        )
+      );
+    if (
+      !availableToolNames.has(tc.name) &&
+      !isAllowedPlanDraftMutation &&
+      !isSelectedCurrentRecoveryMutation
+    ) {
       const unsupportedMessage = planUnsupportedToolFeedbackMessage({
         language: callbacks.getPreferredLanguage(),
         toolName: tc.name,

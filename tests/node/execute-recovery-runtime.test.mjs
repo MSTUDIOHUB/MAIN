@@ -60,7 +60,6 @@ const {
   buildExecuteRecoveryMaxIterationsPrompt,
   clearExecuteRecoveryRuntimeState,
   createExecuteRecoveryRuntimeState,
-  refundExecuteRecoveryRuntimeIteration,
   isExecuteRecoveryPolicyDeferralFingerprint,
   registerExecuteRecoveryProtocolNoProgress,
   resolvePtyObservationPolicyDeferral,
@@ -801,6 +800,48 @@ test("recovery no-progress budget resets only for fresh phase evidence", () => {
   assert.equal(validation.state.phaseNoProgressCount, 0);
 });
 
+test("an unchanged cache stub does not refund or refresh the recovery budget", () => {
+  let state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "patch_mismatch",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "patch_recovery",
+        target: "src/main.js",
+        requestedRange: { startLine: 205, endLine: 256 },
+        state: "active",
+      },
+    },
+  );
+
+  state = advanceExecuteRecoveryRuntimeIteration(state).state;
+  assert.equal(state.phaseNoProgressCount, 1);
+
+  const cacheStub = transitionExecuteRecoveryRuntimeState(state, {});
+  assert.equal(cacheStub.transition, "none");
+  assert.equal(cacheStub.state.phaseNoProgressCount, 1);
+
+  const repeated = registerExecuteRecoveryProtocolNoProgress(
+    cacheStub.state,
+    "patch_recovery_read::src/main.js::unchanged_cache_stub",
+  );
+  assert.equal(repeated.phaseNoProgressCount, 1);
+  assert.equal(repeated.protocolNoProgressCount, 1);
+
+  const executionPhaseSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallExecutionPhase.ts"),
+    "utf8",
+  );
+  const recoveryRuntimeSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(executionPhaseSource, /refundExecuteRecoveryRuntimeIteration/);
+  assert.doesNotMatch(recoveryRuntimeSource, /refundExecuteRecoveryRuntimeIteration/);
+});
+
 test("patch recovery consumes only the leased target, source range, and version", () => {
   const lease = {
     purpose: "patch_recovery",
@@ -851,6 +892,39 @@ test("patch recovery consumes only the leased target, source range, and version"
   assert.equal(exact.state.readLease.observationKey, "main:205-256:v1");
   assert.deepEqual(exact.state.readLease.requestedRange, lease.requestedRange);
   assert.equal(exact.state.readLease.observedVersion, lease.observedVersion);
+});
+
+test("the first unchanged cache observation closes the one-shot read lease", () => {
+  const state = activateExecuteRecoveryRuntimeState(
+    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
+    {
+      mode: "patch_recovery_read",
+      reason: "patch_mismatch",
+      expectedTarget: "src/main.js",
+      readLease: {
+        purpose: "patch_recovery",
+        target: "src/main.js",
+        requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+        observedVersion: "8192:1700000000000",
+        mismatchFingerprint: "patch_mismatch::src/main.js::invalid_patch",
+        state: "active",
+      },
+    },
+  );
+  const cached = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.js",
+    sourceObservationKey: "main:205-256:v1:stub",
+    sourceRequestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    sourceObservedVersion: "8192:1700000000000",
+  });
+  assert.equal(cached.transition, "context_to_mutation");
+  assert.equal(cached.state.mode, "mutation_first");
+  assert.equal(cached.state.readLease.state, "consumed");
+  assert.equal(
+    executeRecoveryTools.resolveExecuteRecoveryActionContract(cached.state.mode, cached.state)
+      .allowedToolNames.has("read_file"),
+    false,
+  );
 });
 
 test("parser declaration leases accept one bounded source prefix", () => {
@@ -988,19 +1062,6 @@ test("reviewed Plan line ranges accumulate versioned read segments before mutati
   ]);
 });
 
-test("policy deferrals, cache stubs, and PTY waits can refund the current phase debit", () => {
-  let state = activateExecuteRecoveryRuntimeState(
-    createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
-    { mode: "validation_only", reason: "awaiting_runtime_evidence" },
-  );
-  state = advanceExecuteRecoveryRuntimeIteration(state).state;
-  assert.equal(state.phaseNoProgressCount, 1);
-  state = refundExecuteRecoveryRuntimeIteration(state);
-  assert.equal(state.phaseNoProgressCount, 0);
-  assert.equal(state.iterationCount, 0);
-  assert.equal(refundExecuteRecoveryRuntimeIteration(state).phaseNoProgressCount, 0);
-});
-
 test("six identical unchanged-read stubs stop through the unified protocol budget", () => {
   let state = activateExecuteRecoveryRuntimeState(
     createExecuteRecoveryRuntimeState({ workflowMode: "edit" }),
@@ -1019,9 +1080,8 @@ test("six identical unchanged-read stubs stop through the unified protocol budge
   const fingerprint = "patch_recovery_read::src/main.js::unchanged_stub";
   for (let index = 1; index <= MAX_EXECUTE_RECOVERY_ITERATIONS; index += 1) {
     state = advanceExecuteRecoveryRuntimeIteration(state).state;
-    state = refundExecuteRecoveryRuntimeIteration(state);
     state = registerExecuteRecoveryProtocolNoProgress(state, fingerprint);
-    assert.equal(state.phaseNoProgressCount, 0);
+    assert.equal(state.phaseNoProgressCount, index);
     assert.equal(state.protocolNoProgressCount, index);
   }
   const boundary = advanceExecuteRecoveryRuntimeIteration(state);

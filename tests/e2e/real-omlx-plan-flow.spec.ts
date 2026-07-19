@@ -1459,6 +1459,23 @@ for (const model of models) {
       reason: "agent_loop_completed",
       planStage: "completed",
     });
+    const terminalTurnId = String(executionSnapshot?.currentTurnId || "");
+    expect(terminalTurnId).not.toBe("");
+    const finalAssistantBlocks = (executionSnapshot?.taskFlowPreview || []).filter(
+      (block: { turnId?: string; type?: string; visibility?: string; content?: string }) =>
+        block.turnId === terminalTurnId &&
+        block.type === "agent" &&
+        block.visibility === "assistant_final" &&
+        String(block.content || "").trim().length > 0,
+    );
+    expect(finalAssistantBlocks).toHaveLength(1);
+    expect(String(finalAssistantBlocks[0]?.content || "")).toMatch(
+      /完成|修改|修复|验证|passed|updated|fixed|implemented|validated/i,
+    );
+    expect(String(finalAssistantBlocks[0]?.content || "")).not.toContain("agent_loop_completed");
+    await expect(page.locator(
+      `[data-testid="assistant-final"][data-turn-id="${terminalTurnId}"]`,
+    )).toBeVisible();
     expect(bodyText).not.toMatch(forbiddenChatNoise);
   });
 

@@ -14,6 +14,7 @@ import {
   reconcilePlanTaskCompletion,
   requiresPtyObservationForPlanCommand,
   validateActionablePlanArtifact,
+  validateDerivedPlanTasksForApproval,
   validatePlanArtifactContent,
   type ConversationTurn,
   type PlanArtifact,
@@ -202,6 +203,21 @@ export function evaluateApprovedPlanExecutionReadiness(input: {
         taskCount,
       });
     }
+  }
+
+  const derivedTaskQuality = validateDerivedPlanTasksForApproval(
+    input.executionPlanTasks,
+  );
+  if (!derivedTaskQuality.ok) {
+    return failedPlanExecutionReadiness({
+      reason: "plan_artifact_quality_rejected",
+      qualityReason: derivedTaskQuality.reason || "invalid_runtime_plan_task_graph",
+      mutationOriented: false,
+      requiresExecutableValidation: false,
+      concreteMutationTaskCount: 0,
+      executableValidationTaskCount: 0,
+      taskCount,
+    });
   }
 
   const mutationOriented = reviewableArtifacts.some((artifact) =>

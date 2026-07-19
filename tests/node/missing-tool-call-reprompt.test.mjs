@@ -391,3 +391,19 @@ test("missing-tool no-tool recovery stops execute read-only no-action loops at c
   assert.equal(harness.stops[0].progress.recoveryReason, "execute_read_only_no_action_checkpoint");
   assert.deepEqual(harness.stops[0].progress.repeatedTargets, ["src/app.tsx"]);
 });
+
+test("missing-tool execution uses a structured strategy pivot before the pause boundary", () => {
+  const harness = createMissingToolNoToolHarness("en");
+  const result = handleMissingToolNoToolRecovery(createMissingToolNoToolInput(harness, {
+    activeProfile: "local",
+    consecutiveNoToolCount: 1,
+    hasMeaningfulVisibleText: false,
+    visibleText: "",
+  }));
+
+  assert.equal(result.status, "continue");
+  assert.equal(result.consecutiveNoToolCount, 2);
+  assert.match(harness.appended.at(-1)?.content || "", /EXECUTE_NO_PROGRESS_STRATEGY_PIVOT/);
+  assert.match(harness.appended.at(-1)?.content || "", /current_task_action_lock/);
+  assert.equal(harness.stops.length, 0);
+});

@@ -71,7 +71,9 @@ const {
   resolveApprovedPlanInitialExecutionRecovery,
   resolveApprovedPlanRecoveryReconciliation,
   resolveApprovedPlanSameTurnFallbackDecision,
+  resolveRestoredPlanExecutionTaskIdentity,
   resolveExecuteMaxIterationsRecoveryDecision,
+  resolveMaxIterationStrategyPivot,
   summarizeRepeatedPlanTargetsFromToolActivity,
   toPlanExecutionRuntimeProgressUpdate,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
@@ -85,9 +87,14 @@ test("approved Plan handoff derives the first executable recovery contract", () 
     evidenceStatus: "missing",
     evidence: [{ kind: "file", value: "src/main.rs" }],
   }]);
-  assert.equal(sourceMutation?.mode, "mutation_first");
+  assert.equal(sourceMutation?.mode, "patch_recovery_read");
   assert.equal(sourceMutation?.expectedTarget, "src/main.rs");
-  assert.equal(sourceMutation?.decisionCheckpoint?.nextRequiredCapability, "mutation");
+  assert.deepEqual(sourceMutation?.readLease, {
+    purpose: "plan_line_context",
+    target: "src/main.rs",
+    state: "available",
+  });
+  assert.equal(sourceMutation?.decisionCheckpoint?.nextRequiredCapability, "targeted_read");
   assert.equal(sourceMutation?.decisionCheckpoint?.planTaskId, "edit-main");
   assert.equal(sourceMutation?.decisionCheckpoint?.requirementRef, "REQ-BACKEND");
 
@@ -432,6 +439,14 @@ const {
   resolveExecuteRecoveryActionContract,
   resolveExecuteRecoveryBatchDecision,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/executeRecoveryTools.ts"));
+
+const {
+  createExecuteRecoveryRuntimeState,
+  transitionExecuteRecoveryRuntimeState,
+} = loadTranspiledModuleSync(path.join(
+  workspaceRoot,
+  "src/lib/orchestrator/loop/executeRecoveryRuntime.ts",
+));
 
 const {
   appendApprovedPlanUserValidationConclusion,
@@ -1340,6 +1355,40 @@ test("approved plan finalization continues from provenance in execute workflow",
   assert.match(harness.appended[0].content, /Next priority tasks/i);
 });
 
+test("approved Plan no-tool execution exhausts strategy pivots before pausing", () => {
+  const pivotHarness = createApprovedPlanNoToolHarness("en");
+  const pivot = handleApprovedPlanFinalization({
+    callbacks: pivotHarness.callbacks,
+    activeProfile: "local",
+    iteration: 8,
+    approvedPlanAuditForNoTool: createApprovedPlanNoToolAudit(),
+    rejectedCompletionClaim: false,
+    availableToolNames: new Set(["replace_in_file", "run_command"]),
+    consecutiveNoToolCount: 1,
+    emitTaskOrchestratorPhase: (phase, extra) => pivotHarness.taskPhases.push({ phase, extra }),
+    emitPlanExecutionProgress: (phase, overrides) => pivotHarness.progress.push({ phase, overrides }),
+  });
+  assert.equal(pivot.status, "continue");
+  assert.match(pivotHarness.appended.at(-1)?.content || "", /current_task_action_lock/);
+  assert.equal(pivotHarness.stops.length, 0);
+
+  const exhaustedHarness = createApprovedPlanNoToolHarness("en");
+  const exhausted = handleApprovedPlanFinalization({
+    callbacks: exhaustedHarness.callbacks,
+    activeProfile: "cloud",
+    iteration: 10,
+    approvedPlanAuditForNoTool: createApprovedPlanNoToolAudit(),
+    rejectedCompletionClaim: false,
+    availableToolNames: new Set(["replace_in_file", "run_command"]),
+    consecutiveNoToolCount: 3,
+    emitTaskOrchestratorPhase: (phase, extra) => exhaustedHarness.taskPhases.push({ phase, extra }),
+    emitPlanExecutionProgress: (phase, overrides) => exhaustedHarness.progress.push({ phase, overrides }),
+  });
+  assert.equal(exhausted.status, "stopped");
+  assert.equal(exhaustedHarness.stops.length, 1);
+  assert.equal(exhaustedHarness.progress.at(-1)?.phase, "paused");
+});
+
 test("approved plan finalization completes automated work and leaves user validation in the conclusion", () => {
   const harness = createApprovedPlanNoToolHarness("zh");
   const pendingValidationTask = {
@@ -1558,7 +1607,7 @@ test("strict repeat guard redirects repeated successful shell inspection without
   assert.deepEqual([...failedToolCallCounts.values()], []);
 });
 
-test("strict repeat guard pauses repeated approved-plan browser validation after one recovery", () => {
+test("strict repeat guard uses two pivots before pausing repeated approved-plan browser validation", () => {
   const harness = createStrictRepeatGuardHarness("zh");
   const recentToolCalls = [];
   const repeatGuardRecoveredSignatures = new Set();
@@ -1578,6 +1627,23 @@ test("strict repeat guard pauses repeated approved-plan browser validation after
 
   assert.equal(result.status, "continue");
   assert.equal(harness.toolErrors.length, 0);
+  assert.match(harness.appended.at(-1)?.content || "", /current_task_action_lock/);
+
+  for (let i = 0; i < 3; i += 1) {
+    result = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+      effectiveToolCalls: [{
+        id: `call_browser_pause_${i}`,
+        name: "browser_evaluate",
+        arguments: JSON.stringify({ url: "http://localhost:5173", script: "document.body.innerText" }),
+      }],
+      recentToolCalls,
+      repeatGuardRecoveredSignatures,
+    }));
+  }
+
+  assert.equal(result.status, "continue");
+  assert.match(harness.appended.at(-1)?.content || "", /alternate_capability_reframe/);
+  assert.equal(harness.stops.length, 0);
 
   for (let i = 0; i < 3; i += 1) {
     result = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
@@ -1627,6 +1693,7 @@ test("strict repeat guard redirects repeated PTY controls to observation without
 test("strict repeat guard leaves policy deferrals to protocol no-progress while retaining real command protection", () => {
   const harness = createStrictRepeatGuardHarness("en");
   const recentToolCalls = [];
+  const repeatGuardRecoveredSignatures = new Set();
   let result = null;
 
   for (let i = 0; i < 3; i += 1) {
@@ -1674,16 +1741,50 @@ test("strict repeat guard leaves policy deferrals to protocol no-progress while 
         lifecycleState: "completed",
       }],
       recentToolCalls,
+      repeatGuardRecoveredSignatures,
       availableToolNames: new Set(["execute_command"]),
     }));
   }
 
+  assert.equal(result.status, "continue");
+  assert.match(harness.appended.at(-1)?.content || "", /current_task_action_lock/);
+
+  for (let cycle = 0; cycle < 2; cycle += 1) {
+    for (let i = 0; i < 3; i += 1) {
+      const call = {
+        id: `call_executed_dev_${cycle}_${i}`,
+        name: "execute_command",
+        arguments: JSON.stringify({ command: "npm run dev" }),
+      };
+      result = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+        effectiveToolCalls: [call],
+        results: [{
+          toolCallId: call.id,
+          name: call.name,
+          target: "npm run dev",
+          content: "command completed",
+          isError: false,
+          lifecycleState: "completed",
+        }],
+        recentToolCalls,
+        repeatGuardRecoveredSignatures,
+        availableToolNames: new Set(["execute_command"]),
+      }));
+    }
+    if (cycle === 0) {
+      assert.equal(result.status, "continue");
+      assert.match(harness.appended.at(-1)?.content || "", /alternate_capability_reframe/);
+    }
+  }
+
   assert.equal(result.status, "stopped");
-  assert.equal(harness.errors.length > 0, true);
-  assert.match(harness.errors[0], /repetition loop/i);
+  assert.equal(harness.errors.length, 0);
+  assert.equal(harness.stops.length, 1);
+  assert.equal(harness.stops[0].metadata.recoveryReason, "strict_repeat_strategy_exhausted");
+  assert.deepEqual(harness.statuses.slice(-1), ["idle"]);
 });
 
-test("repeated-failure policy feedback redirects once and then pauses without a fatal error", () => {
+test("repeated-failure policy feedback uses two pivots before a recoverable pause", () => {
   const harness = createStrictRepeatGuardHarness("en");
   harness.callbacks.getIsPlanApproved = () => false;
   const repeatGuardRecoveredSignatures = new Set();
@@ -1720,7 +1821,17 @@ test("repeated-failure policy feedback redirects once and then pauses without a 
     results: [createPolicyResult(secondCall, "repeated_failure_exhausted")],
     repeatGuardRecoveredSignatures,
   }));
-  assert.equal(second.status, "stopped");
+  assert.equal(second.status, "continue");
+  assert.match(harness.appended.at(-1)?.content || "", /alternate_capability_reframe/);
+  assert.equal(harness.stops.length, 0);
+
+  const thirdCall = createCall("policy-3");
+  const third = handleStrictRepeatGuardRecovery(createRepeatGuardInput(harness, {
+    effectiveToolCalls: [thirdCall],
+    results: [createPolicyResult(thirdCall, "repeated_failure_exhausted")],
+    repeatGuardRecoveredSignatures,
+  }));
+  assert.equal(third.status, "stopped");
   assert.equal(harness.stops.length, 1);
   assert.equal(harness.stops[0].reason, "no_action");
   assert.equal(harness.stops[0].metadata.recoveryReason, "repeated_failure_policy_no_progress");
@@ -1754,12 +1865,22 @@ test("max-iteration checkpoint keeps internal plan files out of project-source e
   assert.equal(checkpoint.completedEvidence.some((line) => line.includes("runtime-notes")), false);
 });
 
-test("pause notice is structured and points to manual resume after one auto-resume", () => {
+test("pause notice is structured after the differentiated strategy fuse is exhausted", () => {
+  const exhausted = resolveMaxIterationStrategyPivot({
+    autoResumeCount: PLAN_MAX_AUTO_RESUME_LIMIT,
+    objectiveComplete: false,
+    nextRequiredCapability: "mutation",
+  });
   const checkpoint = buildPlanMaxIterationsCheckpoint({
     iterationCount: 50,
     maxIterations: 50,
     autoResumeCount: PLAN_MAX_AUTO_RESUME_LIMIT,
     autoResumeEligible: false,
+    strategyPivot: exhausted.selected,
+    attemptedStrategyPivots: exhausted.attempted,
+    remainingStrategyPivots: exhausted.remaining,
+    strategyPivotBudget: exhausted.hardLimit,
+    strategyCapability: "mutation",
     tasks,
     evidenceLedger,
     recentToolActivity: [{ name: "run_command", target: "npm test", status: "failed", detail: "exitCode 1" }],
@@ -1768,9 +1889,55 @@ test("pause notice is structured and points to manual resume after one auto-resu
   const notice = buildPlanMaxIterationsPauseNotice(checkpoint, "en");
 
   assert.match(notice, /RecoveryDetails:/);
-  assert.match(notice, /autoResumeCount: 1\/1/);
+  assert.match(notice, /autoResumeCount: 3\/3/);
+  assert.match(notice, /continue_contract, reconcile_evidence, bounded_alternative/);
   assert.match(notice, /Resume Execution/);
   assert.match(notice, /Add resume guard tests/);
+});
+
+test("max-iteration strategy pivots are provider-neutral, differentiated, and finite", () => {
+  const first = resolveMaxIterationStrategyPivot({
+    autoResumeCount: 0,
+    objectiveComplete: false,
+    nextRequiredCapability: "mutation",
+  });
+  const second = resolveMaxIterationStrategyPivot({
+    autoResumeCount: 1,
+    objectiveComplete: false,
+    nextRequiredCapability: "mutation",
+  });
+  const third = resolveMaxIterationStrategyPivot({
+    autoResumeCount: 2,
+    objectiveComplete: false,
+    nextRequiredCapability: "validation",
+  });
+  const exhausted = resolveMaxIterationStrategyPivot({
+    autoResumeCount: 3,
+    objectiveComplete: false,
+    nextRequiredCapability: "validation",
+  });
+  const blocked = resolveMaxIterationStrategyPivot({
+    autoResumeCount: 0,
+    objectiveComplete: false,
+    nextRequiredCapability: "mutation",
+    hardBlocked: true,
+  });
+  const completed = resolveMaxIterationStrategyPivot({
+    autoResumeCount: 0,
+    objectiveComplete: true,
+    nextRequiredCapability: "any",
+  });
+
+  assert.deepEqual(
+    [first.selected, second.selected, third.selected, exhausted.selected],
+    ["continue_contract", "reconcile_evidence", "bounded_alternative", null],
+  );
+  assert.equal(first.hardLimit, PLAN_MAX_AUTO_RESUME_LIMIT);
+  assert.deepEqual(third.attempted, ["continue_contract", "reconcile_evidence"]);
+  assert.equal(blocked.selected, null);
+  assert.deepEqual(blocked.remaining, []);
+  assert.equal(completed.selected, "synthesize_completion");
+  assert.equal(completed.hardLimit, 1);
 });
 
 test("execute max-iteration notices describe a recoverable boundary instead of failure", () => {
@@ -1786,17 +1953,26 @@ test("execute max-iteration notices describe a recoverable boundary instead of f
     unresolvedBlockers: ["Agent loop reached maximum iterations (50)."],
   });
 
-  const autoNotice = buildExecuteMaxIterationsAutoResumeNotice({ ...checkpoint, autoResumeCount: 1 }, "zh");
+  const autoNotice = buildExecuteMaxIterationsAutoResumeNotice({
+    ...checkpoint,
+    autoResumeCount: 1,
+    strategyPivot: "continue_contract",
+    strategyCapability: "validation",
+    strategyPivotBudget: PLAN_MAX_AUTO_RESUME_LIMIT,
+  }, "zh");
   const pauseNotice = buildExecuteMaxIterationsPauseNotice(checkpoint, "zh");
   const prompt = buildExecuteMaxIterationsResumePrompt({ language: "zh", checkpoint });
 
   assert.match(autoNotice, /恢复点/);
+  assert.match(autoNotice, /差异化策略 1\/3/);
+  assert.match(autoNotice, /validation/);
   assert.match(pauseNotice, /不是工具权限或模式切换失败/);
   assert.match(pauseNotice, /Resume Execution/);
   assert.match(pauseNotice, /复用已读上下文/);
   assert.match(pauseNotice, /重复只读/);
   assert.match(prompt, /如果任务已经完成，直接输出最终总结/);
   assert.match(prompt, /普通 Execute 50 轮安全边界/);
+  assert.match(prompt, /selectedStrategyPivot/);
 });
 
 test("execute max-iteration recovery resumes validation after a completed mutation", () => {
@@ -2400,14 +2576,15 @@ test("approved plan no-progress recovery uses the unified execution contract", (
 
   assert.equal(mutationContract.phase, "mutation");
   assert.equal(mutationContract.surfaceDescription, "capability:mutation");
-  assert.equal(mutationContract.allowTargetedFileRead, true);
-  for (const toolName of ["read_file", "apply_patch"]) {
-    assert.equal(
-      isExecuteRecoveryToolName(toolName, readOnlyTools, { contract: mutationContract }),
-      true,
-      toolName,
-    );
-  }
+  assert.equal(mutationContract.allowTargetedFileRead, false);
+  assert.equal(
+    isExecuteRecoveryToolName("read_file", readOnlyTools, { contract: mutationContract }),
+    false,
+  );
+  assert.equal(
+    isExecuteRecoveryToolName("apply_patch", readOnlyTools, { contract: mutationContract }),
+    true,
+  );
   assert.equal(
     isExecuteRecoveryToolName("run_command", readOnlyTools, { contract: mutationContract }),
     false,
@@ -2439,6 +2616,38 @@ test("approved plan no-progress recovery uses the unified execution contract", (
   assert.match(toolCallPlanningSource, /const initialBaseIterationAllTools = recoveryIterationAllTools/);
   assert.match(toolCallPlanningSource, /recoveryToolSurface: recoveryActionContract\.surfaceDescription/);
   assert.doesNotMatch(toolCallPartitioningSource, /patch_recovery_read_cache_bypass/);
+});
+
+test("approved source task consumes one initial read lease then becomes mutation-only", () => {
+  const initial = resolveApprovedPlanInitialExecutionRecovery([{
+    id: "edit-main",
+    text: "Modify the backend",
+    status: "in_progress",
+    evidenceStatus: "missing",
+    evidence: [{ kind: "file", value: "src/main.rs" }],
+  }]);
+  assert.ok(initial);
+  const state = createExecuteRecoveryRuntimeState({
+    workflowMode: "edit",
+    forcedState: initial,
+  });
+  const initialContract = resolveExecuteRecoveryActionContract(state.mode, state);
+  assert.deepEqual([...initialContract.allowedToolNames], ["read_file"]);
+
+  const observed = transitionExecuteRecoveryRuntimeState(state, {
+    freshReadTarget: "src/main.rs",
+    sourceObservationKey: "src/main.rs::v1::1-200",
+    sourceObservedVersion: "4096:1",
+  });
+  assert.equal(observed.transition, "context_to_mutation");
+  assert.equal(observed.state.readLease?.state, "consumed");
+  const mutationContract = resolveExecuteRecoveryActionContract(
+    observed.state.mode,
+    observed.state,
+  );
+  assert.equal(mutationContract.allowTargetedFileRead, false);
+  assert.equal(mutationContract.allowedToolNames.has("read_file"), false);
+  assert.equal(mutationContract.allowedToolNames.has("apply_patch"), true);
 });
 test("approved plan execution has no source-edit-first tool surface or shell veto", () => {
   const orchestratorSource = (fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator.ts"), "utf8") + "\n" + fsSync.readFileSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/AgentOrchestrator.ts"), "utf8"));
@@ -2616,6 +2825,101 @@ test("plan execution progress prefers active tool-matched task over broad first 
   assert.doesNotMatch(update.currentTask, /^目标：/);
 });
 
+test("plan execution progress keeps explicit task identity when two tasks own the same file", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "tool_start",
+    iterationCount: 2,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    currentTaskId: "open-file",
+    tasks: [
+      {
+        id: "open-file",
+        text: "修改 src/main.js 的 handleOpenFile()，统一文件打开入口",
+        status: "in_progress",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "file", value: "src/main.js" }],
+      },
+      {
+        id: "close-tab",
+        text: "修改 src/main.js 的 closeTab()，修复关闭状态",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "file", value: "src/main.js" }],
+      },
+    ],
+    evidenceLedger: [],
+    recentToolActivity: [{ name: "read_file", target: "src/main.js", status: "succeeded" }],
+  });
+
+  assert.equal(update.currentTaskId, "open-file");
+  assert.match(update.currentTask, /handleOpenFile/);
+  assert.doesNotMatch(update.currentTask, /closeTab/);
+});
+
+test("same-file fallback prefers the unique in-progress task and never the last index", () => {
+  const update = buildPlanExecutionProgressUpdate({
+    language: "zh",
+    phase: "tool_start",
+    iterationCount: 2,
+    maxIterations: 50,
+    autoResumeCount: 0,
+    tasks: [
+      {
+        id: "open-file",
+        text: "修改 src/main.js 的 handleOpenFile()，统一文件打开入口",
+        status: "in_progress",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "file", value: "src/main.js" }],
+      },
+      {
+        id: "close-tab",
+        text: "修改 src/main.js 的 closeTab()，修复关闭状态",
+        status: "pending",
+        evidenceStatus: "missing",
+        evidence: [{ kind: "file", value: "src/main.js" }],
+      },
+    ],
+    evidenceLedger: [],
+    recentToolActivity: [{ name: "read_file", target: "src/main.js", status: "succeeded" }],
+  });
+
+  assert.equal(update.currentTaskId, "open-file");
+  assert.match(update.currentTask, /handleOpenFile/);
+});
+
+test("legacy progress identity migrates only from a unique task graph", () => {
+  const tasks = [
+    {
+      id: "open-file",
+      text: "修改 src/main.js 的 handleOpenFile()，统一文件打开入口",
+      status: "in_progress",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    },
+    {
+      id: "close-tab",
+      text: "修改 src/main.js 的 closeTab()，修复关闭状态",
+      status: "pending",
+      evidenceStatus: "missing",
+      evidence: [{ kind: "file", value: "src/main.js" }],
+    },
+  ];
+  assert.deepEqual(resolveRestoredPlanExecutionTaskIdentity({
+    snapshot: { currentTask: "修改 src/main.js 的 handleOpenFile()，统一文件打开入口" },
+    tasks,
+  }), { currentTaskId: "open-file", ambiguous: false });
+  assert.deepEqual(resolveRestoredPlanExecutionTaskIdentity({
+    snapshot: { currentTask: "读取 src/main.js" },
+    tasks: tasks.map((task) => ({ ...task, status: "pending" })),
+  }), { ambiguous: true });
+  assert.deepEqual(resolveRestoredPlanExecutionTaskIdentity({
+    snapshot: { currentTaskId: "missing", currentTask: tasks[0].text },
+    tasks,
+  }), { ambiguous: true });
+});
+
 test("plan execution progress does not keep a completed command as the current task", () => {
   const update = buildPlanExecutionProgressUpdate({
     language: "zh",
@@ -2704,18 +3008,16 @@ test("ChatArea renders live approved-plan progress snapshots in expanded turns",
   assert.match(chatAreaSource, /data-testid=\{block\.variant\}/);
 });
 
-test("approved-plan stream heartbeats update visible plan progress", () => {
-  const storeSource = fsSync.readFileSync(
-    path.join(workspaceRoot, "src/store/useAppStore.ts"),
+test("approved-plan stream heartbeats remain harness telemetry", () => {
+  const workflowEngineSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
     "utf8",
   );
 
-  assert.match(storeSource, /const\s+emitPlanStreamHeartbeat\s*=/);
-  assert.match(storeSource, /streamStatus\s*!==\s*"chunk_progress"/);
-  assert.match(storeSource, /streamStatus\s*!==\s*"no_chunk_progress_warning"/);
-  assert.match(storeSource, /emitLocalPlanExecutionProgress\("running"/);
-  assert.match(storeSource, /ChatArea 会持续显示流式进度/);
-  assert.match(storeSource, /emitPlanStreamHeartbeat\(markerPatch\)/);
+  assert.doesNotMatch(workflowEngineSource, /const\s+emitPlanStreamHeartbeat\s*=/);
+  assert.doesNotMatch(workflowEngineSource, /emitPlanStreamHeartbeat\(markerPatch\)/);
+  assert.match(workflowEngineSource, /onHarnessRunUpdate:[\s\S]*updateHarnessRunMarker\(markerPatch\)/);
+  assert.doesNotMatch(workflowEngineSource, /ChatArea will keep showing stream progress|ChatArea 会持续显示流式进度/);
 });
 
 test("workflow engine forwards the complete approved-plan progress snapshot", () => {

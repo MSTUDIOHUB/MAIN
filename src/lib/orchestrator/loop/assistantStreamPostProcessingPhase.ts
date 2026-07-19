@@ -80,6 +80,7 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
   iterationRequestStartedAt: number;
   runtimeIntent: ResolvedUserIntent;
   forceXmlTools: boolean;
+  availableToolNames: Set<string>;
   llmToolCount: number;
   managedMessageCount: number;
   currentMaxTokens: number | undefined;
@@ -173,6 +174,8 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     ...planRuntimeState,
     consecutiveReasoningDominatedCount:
       noToolRuntimeState.consecutiveReasoningDominatedCount,
+    forceXmlTools,
+    availableToolNames: input.availableToolNames,
     setPlanRuntimePhase: input.setPlanRuntimePhase,
     activateExecuteRecovery: input.activateExecuteRecovery,
   });
@@ -203,6 +206,7 @@ export async function handleAssistantStreamPostProcessingPhase(input: {
     normalized,
     normalizedBaseToolCallCount: normalizedBase.toolCalls.length,
     recentToolActivity: input.recentToolActivity,
+    availableToolNames: input.availableToolNames,
     recentSuccessfulProjectWrite: input.recentSuccessfulProjectWrite,
     consecutiveEmptyResponseCount:
       noToolRuntimeState.consecutiveEmptyResponseCount,

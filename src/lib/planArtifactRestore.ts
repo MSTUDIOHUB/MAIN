@@ -17,11 +17,11 @@ export interface RestoredPlanArtifactSanitization {
 }
 
 /**
- * Persisted unapproved artifacts are candidates, not proof that a review
- * boundary was reached. Re-apply the actionable Plan gate on restore so an
- * older runtime cannot revive a draft that the current runtime would reject.
- * Already-approved work keeps the narrower structural gate to preserve a
- * resumable execution lease across validator upgrades.
+ * Persisted artifacts are candidates, not proof that a review boundary was
+ * reached. Re-apply the current actionable Plan gate even to an artifact that
+ * an older runtime marked approved. An invalid formerly-approved Plan remains
+ * in the artifact list as an audit record, while `rejected` invalidates its
+ * execution lease and returns the owning store to an unapproved Plan stage.
  */
 export function sanitizeRestoredPlanArtifacts(input: {
   artifacts: PlanArtifact[] | null | undefined;
@@ -50,7 +50,7 @@ export function sanitizeRestoredPlanArtifacts(input: {
       continue;
     }
 
-    const validation = kind === "plan" && !input.isPlanApproved
+    const validation = kind === "plan"
       ? validateActionablePlanArtifact(content)
       : validatePlanArtifactContent(content, kind);
     if (!validation.ok) {
@@ -59,6 +59,15 @@ export function sanitizeRestoredPlanArtifacts(input: {
         kind,
         reason: validation.reason || "quality_gate",
       });
+      if (kind === "plan" && input.isPlanApproved) {
+        artifacts.push({
+          ...candidate,
+          path,
+          content,
+          revision: Math.max(1, Number(candidate.revision) || 1),
+          updatedAt: Math.max(0, Number(candidate.updatedAt) || 0),
+        });
+      }
       continue;
     }
 

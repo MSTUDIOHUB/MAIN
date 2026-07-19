@@ -129,6 +129,12 @@ const {
   handleMaxIterationBoundary,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/maxIterationBoundary.ts"));
 const {
+  CHAT_MAX_AUTO_RESUME_LIMIT,
+  PLAN_MAX_AUTO_RESUME_LIMIT,
+  buildChatMaxIterationsResumePrompt,
+  resolveChatMaxIterationStrategyPivot,
+} = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/planExecutionRecovery.ts"));
+const {
   hasDurableExecutionProgress,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/verificationEvidence.ts"));
 
@@ -324,17 +330,20 @@ function createExecuteNoToolHarness(language = "en") {
   const statuses = [];
   const streamTokens = [];
   const stops = [];
+  const protocolFallbacks = [];
   return {
     appended,
     statuses,
     streamTokens,
     stops,
+    protocolFallbacks,
     callbacks: {
       getPreferredLanguage: () => language,
       appendMessage: (message) => appended.push(message),
       onStatusChange: (status) => statuses.push(status),
       onStreamToken: (token, id) => streamTokens.push({ token, id }),
       onNonActionableStop: (message, reason, progress) => stops.push({ message, reason, progress }),
+      onProviderCompatibilityFallback: (reason) => protocolFallbacks.push(reason),
     },
   };
 }
@@ -384,12 +393,24 @@ test("execute no-tool recovery does not classify assistant prose or synthesize a
   }
 });
 
-test("generic max-iteration boundary emits stop, idle, and a resumable run pause in order", async () => {
+test("ordinary chat max-iteration boundary synthesizes, then uses one bounded alternative", async () => {
   const order = [];
-  await handleMaxIterationBoundary({
+  const checkpoints = [];
+  let autoResumeCount = 0;
+  const runBoundary = async () => handleMaxIterationBoundary({
     callbacks: {
       getPreferredLanguage: () => "en",
       getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => autoResumeCount,
+      onChatMaxIterationsCheckpoint: (checkpoint) => {
+        checkpoints.push(checkpoint);
+        if (!checkpoint.autoResumeEligible) return false;
+        autoResumeCount += 1;
+        return {
+          status: "auto_resume_scheduled",
+          checkpoint: { ...checkpoint, autoResumeCount },
+        };
+      },
       onNonActionableStop: (_message, reason, progress) => {
         order.push(`stop:${reason}:${progress?.recoveryReason}`);
       },
@@ -400,18 +421,82 @@ test("generic max-iteration boundary emits stop, idle, and a resumable run pause
     effectiveMaxIterations: 8,
     recentPlanToolActivity: [],
     recentToolActivity: [],
-    lastAssistantTextForCheckpoint: "",
+    lastAssistantTextForCheckpoint: "retained partial answer",
     sawExecuteOperationEvidence: false,
     executeRecoveryMode: "off",
     emitPlanExecutionProgress: () => {},
     emitRunPausedEvent: (reason) => order.push(`run:paused:${reason}`),
   });
 
+  await runBoundary();
+  await runBoundary();
+  await runBoundary();
+
+  assert.equal(CHAT_MAX_AUTO_RESUME_LIMIT, 2);
+  assert.deepEqual(checkpoints.map((checkpoint) => checkpoint.strategyPivot), [
+    "synthesize_completion",
+    "bounded_alternative",
+    null,
+  ]);
   assert.deepEqual(order, [
-    "stop:no_action:max_iterations_boundary",
+    "run:paused:max_iterations_auto_resume",
+    "status:idle",
+    "run:paused:max_iterations_auto_resume",
     "status:idle",
     "run:paused:max_iterations_boundary",
+    "stop:no_action:chat_max_iterations_strategy_exhausted",
+    "status:idle",
   ]);
+
+  const synthesisPrompt = buildChatMaxIterationsResumePrompt({
+    language: "en",
+    runtimeIntent: "respond",
+    checkpoint: { ...checkpoints[0], autoResumeCount: 1 },
+  });
+  assert.match(synthesisPrompt, /Make no tool calls/);
+  assert.match(synthesisPrompt, /originalRuntimeIntent: respond/);
+  assert.doesNotMatch(synthesisPrompt, /produces mutation or validation evidence/i);
+  const alternative = resolveChatMaxIterationStrategyPivot({ autoResumeCount: 1 });
+  assert.equal(alternative.selected, "bounded_alternative");
+});
+
+test("subagent max-iteration boundary returns a partial handoff instead of scheduling continuation", async () => {
+  const summaries = [];
+  const finals = [];
+  const stops = [];
+  const paused = [];
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getSubagentDepth: () => 1,
+      onTurnSummaryReady: (summary) => summaries.push(summary),
+      onAssistantFinalText: (text) => finals.push(text),
+      onNonActionableStop: (_message, _reason, progress) => stops.push(progress),
+      onStatusChange: () => {},
+    },
+    workflowMode: "chat",
+    runtimeIntent: "analyze",
+    effectiveMaxIterations: 6,
+    recentPlanToolActivity: [],
+    recentToolActivity: [{
+      name: "read_file",
+      target: "src/App.tsx",
+      status: "succeeded",
+    }],
+    lastAssistantTextForCheckpoint: "The handler delegates to the editor store.",
+    sawExecuteOperationEvidence: false,
+    executeRecoveryMode: "off",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: (reason) => paused.push(reason),
+  });
+
+  assert.equal(summaries.length, 1);
+  assert.equal(finals.length, 1);
+  assert.match(summaries[0], /partial handoff/i);
+  assert.match(summaries[0], /src\/App\.tsx/);
+  assert.equal(stops[0]?.recoveryReason, "subagent_max_iterations_partial_handoff");
+  assert.deepEqual(paused, ["subagent_max_iterations_partial_handoff"]);
 });
 
 test("execute max-iteration callback can schedule auto-resume without consuming the counter", async () => {
@@ -463,7 +548,8 @@ test("execute max-iteration callback can schedule auto-resume without consuming 
   assert.deepEqual(stops, []);
   assert.deepEqual(statuses, ["idle"]);
   assert.equal(pausedRuns[0].reason, "max_iterations_auto_resume");
-  assert.match(pausedRuns[0].message, /auto-resume once in a fresh context/);
+  assert.match(pausedRuns[0].message, /switched to differentiated strategy 1\/3/);
+  assert.match(pausedRuns[0].message, /validation capability/);
 });
 
 test("successful MCP source edits count as durable max-iteration progress", async () => {
@@ -515,7 +601,7 @@ test("successful MCP source edits count as durable max-iteration progress", asyn
   assert.equal(stops.length, 0);
 });
 
-test("max-iteration auto-resume ignores raw success and non-durable transaction evidence", async () => {
+test("max-iteration boundary offers a structured pivot despite non-durable observations", async () => {
   let checkpoint;
   await handleMaxIterationBoundary({
     callbacks: {
@@ -547,7 +633,8 @@ test("max-iteration auto-resume ignores raw success and non-durable transaction 
     emitRunPausedEvent: () => {},
   });
 
-  assert.equal(checkpoint?.autoResumeEligible, false);
+  assert.equal(checkpoint?.autoResumeEligible, true);
+  assert.equal(checkpoint?.strategyPivot, "continue_contract");
 });
 
 test("durable progress accepts structured finite-command and browser evidence", () => {
@@ -564,7 +651,7 @@ test("durable progress accepts structured finite-command and browser evidence", 
   }
 });
 
-test("an unrelated successful shell inspection is not durable max-iteration progress", async () => {
+test("an unrelated shell inspection cannot block the first differentiated pivot", async () => {
   let checkpoint;
   const stops = [];
   await handleMaxIterationBoundary({
@@ -600,11 +687,12 @@ test("an unrelated successful shell inspection is not durable max-iteration prog
     emitRunPausedEvent: () => {},
   });
 
-  assert.equal(checkpoint?.autoResumeEligible, false);
-  assert.equal(stops.length, 1);
+  assert.equal(checkpoint?.autoResumeEligible, true);
+  assert.equal(checkpoint?.strategyPivot, "continue_contract");
+  assert.equal(stops.length, 0);
 });
 
-test("a content-level browser readiness failure is not durable max-iteration progress", async () => {
+test("a browser readiness failure pivots to the structured contract before pausing", async () => {
   let checkpoint;
   const stops = [];
   await handleMaxIterationBoundary({
@@ -640,8 +728,9 @@ test("a content-level browser readiness failure is not durable max-iteration pro
     emitRunPausedEvent: () => {},
   });
 
-  assert.equal(checkpoint?.autoResumeEligible, false);
-  assert.equal(stops.length, 1);
+  assert.equal(checkpoint?.autoResumeEligible, true);
+  assert.equal(checkpoint?.strategyPivot, "continue_contract");
+  assert.equal(stops.length, 0);
 });
 
 test("approved Plan provenance selects its checkpoint in the canonical execute workflow", async () => {
@@ -688,13 +777,14 @@ test("approved Plan provenance selects its checkpoint in the canonical execute w
     emitRunPausedEvent: (reason, message) => pausedRuns.push({ reason, message }),
   });
 
-  assert.equal(observedCheckpoint?.autoResumeEligible, false);
-  assert.equal(pausedRuns[0]?.reason, "max_iterations_boundary");
-  assert.equal(stops.length, 1);
-  assert.match(pausedRuns[0]?.message || "", /no trusted write, command, or validation progress/i);
+  assert.equal(observedCheckpoint?.autoResumeEligible, true);
+  assert.equal(observedCheckpoint?.strategyPivot, "continue_contract");
+  assert.equal(pausedRuns[0]?.reason, "max_iterations_auto_resume");
+  assert.equal(stops.length, 0);
+  assert.match(pausedRuns[0]?.message || "", /differentiated strategy/i);
 });
 
-test("pending PTY polling cannot make a max-iteration checkpoint auto-resumable", async () => {
+test("pending PTY polling pivots once instead of forcing an arbitrary pause", async () => {
   const stops = [];
   let checkpoint;
   await handleMaxIterationBoundary({
@@ -729,7 +819,49 @@ test("pending PTY polling cannot make a max-iteration checkpoint auto-resumable"
     emitRunPausedEvent: () => {},
   });
 
+  assert.equal(checkpoint?.autoResumeEligible, true);
+  assert.equal(checkpoint?.strategyPivot, "continue_contract");
+  assert.equal(stops.length, 0);
+});
+
+test("max-iteration differentiated pivots retain a hard no-progress fuse", async () => {
+  let checkpoint;
+  const stops = [];
+  let callbackCalls = 0;
+  await handleMaxIterationBoundary({
+    callbacks: {
+      getPreferredLanguage: () => "en",
+      getIsPlanApproved: () => false,
+      getPlanAutoResumeCount: () => PLAN_MAX_AUTO_RESUME_LIMIT,
+      getPlanExecutionEvidenceLedger: () => [],
+      onExecuteMaxIterationsCheckpoint: (value) => {
+        callbackCalls += 1;
+        checkpoint = value;
+        return false;
+      },
+      onNonActionableStop: (...args) => stops.push(args),
+      onStatusChange: () => {},
+    },
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    effectiveMaxIterations: 50,
+    recentPlanToolActivity: [],
+    recentToolActivity: [],
+    lastAssistantTextForCheckpoint: "still unfinished",
+    sawExecuteOperationEvidence: false,
+    executeRecoveryMode: "normal",
+    emitPlanExecutionProgress: () => {},
+    emitRunPausedEvent: () => {},
+  });
+
+  assert.equal(callbackCalls, 1);
   assert.equal(checkpoint?.autoResumeEligible, false);
+  assert.equal(checkpoint?.strategyPivot, null);
+  assert.deepEqual(checkpoint?.attemptedStrategyPivots, [
+    "continue_contract",
+    "reconcile_evidence",
+    "bounded_alternative",
+  ]);
   assert.equal(stops.length, 1);
 });
 
@@ -805,8 +937,8 @@ test("assistant wording cannot consume the required-tool protocol retry budget",
     visibleText: "已经修复完成并验证通过。",
   }));
 
-  assert.equal(resolveExecuteNoToolCheckpointLimit("local"), 5);
-  assert.equal(resolveExecuteNoToolCheckpointLimit("cloud") < resolveExecuteNoToolCheckpointLimit("local"), true);
+  assert.equal(resolveExecuteNoToolCheckpointLimit("local"), 2);
+  assert.equal(resolveExecuteNoToolCheckpointLimit("cloud"), 2);
   assert.equal(result.status, "none");
   assert.equal(result.consecutiveNoToolCount, 4);
   assert.deepEqual(harness.statuses, []);
@@ -851,6 +983,37 @@ test("named-tool mismatches are quarantined and reprompt the exact runtime contr
   assert.match(harness.appended[0].content, /specific function/);
   assert.match(harness.appended[0].content, /mismatched call was not executed/);
   assert.match(harness.appended[0].content, /exactly the named tool/);
+});
+
+test("execute protocol no-action exhausts provider-neutral strategy pivots before pausing", () => {
+  const firstHarness = createExecuteNoToolHarness("en");
+  const first = handleExecuteNoToolRecovery(createExecuteNoToolInput(firstHarness, {
+    activeProfile: "local",
+    consecutiveNoToolCount: 1,
+    protocolViolation: "required_tool_call_missing",
+  }));
+  assert.equal(first.status, "continue");
+  assert.equal(first.consecutiveNoToolCount, 2);
+  assert.match(firstHarness.appended.at(-1)?.content || "", /current_task_action_lock/);
+  assert.equal(firstHarness.stops.length, 0);
+
+  const secondHarness = createExecuteNoToolHarness("en");
+  const second = handleExecuteNoToolRecovery(createExecuteNoToolInput(secondHarness, {
+    activeProfile: "cloud",
+    consecutiveNoToolCount: 2,
+    protocolViolation: "required_tool_call_missing",
+  }));
+  assert.equal(second.status, "continue");
+  assert.match(secondHarness.appended.at(-1)?.content || "", /alternate_capability_reframe/);
+  assert.deepEqual(secondHarness.protocolFallbacks, ["execute_no_progress_alternate_protocol"]);
+
+  const exhaustedHarness = createExecuteNoToolHarness("en");
+  const exhausted = handleExecuteNoToolRecovery(createExecuteNoToolInput(exhaustedHarness, {
+    consecutiveNoToolCount: 3,
+    protocolViolation: "required_tool_call_missing",
+  }));
+  assert.equal(exhausted.status, "stopped");
+  assert.equal(exhaustedHarness.stops.length, 1);
 });
 
 test("out-of-surface tool calls are quarantined as protocol recovery", () => {
@@ -917,7 +1080,6 @@ test("execute recovery exposes only the current capability surface", () => {
   }));
 
   assert.deepEqual(scoped, [
-    "read_file",
     "apply_patch",
     "replace_in_file",
     "write_file",
@@ -942,7 +1104,7 @@ test("execute recovery exposes only the current capability surface", () => {
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
-  }), true);
+  }), false);
   assert.equal(isExecuteRecoveryToolName("grep_search", readOnlyTools, {
     mode: "mutation_first",
     allowFileRead: true,
@@ -2628,7 +2790,52 @@ test("patch recovery without an active read lease returns to the mutation surfac
 
   assert.equal(decision.isExecuteRecoveryEligible, true);
   assert.deepEqual(decision.iterationAllTools.map((tool) => tool.function.name), [
+    "apply_patch",
+  ]);
+});
+
+test("chat recovery cannot expand a respond turn into a mutation surface", () => {
+  const tools = ["read_file", "apply_patch"].map((name) => ({
+    type: "function",
+    function: { name, description: name, parameters: { type: "object", properties: {} } },
+  }));
+  const makeInput = (turnIntent) => ({
+    callbacks: {
+      getConfig: () => createLocalRuntimeConfig(),
+      getIsPlanApproved: () => false,
+      getPlanTasks: () => [],
+      getPlanExecutionEvidenceLedger: () => [],
+      getMessages: () => [],
+      getPlanStage: () => "idle",
+    },
+    iteration: 4,
+    workflowMode: "chat",
+    runtimeIntent: "respond",
+    turnIntent,
+    rawIterationAllTools: tools,
+    executeRecoveryMode: "mutation_first",
+    executeRecoveryReason: "chat_repair_strategy_pivot:current_task_action_lock",
+    executeRecoveryAttempts: 1,
+    recoveryIterationCount: 1,
+    maxRecoveryIterations: 6,
+    recentToolActivity: [],
+    recentPlanToolActivity: [],
+    planRuntimePhase: "idle",
+    usedPlanReadOnlyConvergencePrompt: false,
+    turnInputContextSignals: {},
+    lastAssistantTextForCheckpoint: "",
+  });
+
+  const denied = resolveIterationToolSurface(makeInput("respond"));
+  const authorized = resolveIterationToolSurface(makeInput("execute"));
+
+  assert.equal(denied.isExecuteRecoveryEligible, false);
+  assert.deepEqual(denied.iterationAllTools.map((tool) => tool.function.name), [
     "read_file",
+    "apply_patch",
+  ]);
+  assert.equal(authorized.isExecuteRecoveryEligible, true);
+  assert.deepEqual(authorized.iterationAllTools.map((tool) => tool.function.name), [
     "apply_patch",
   ]);
 });
@@ -3087,7 +3294,7 @@ test("plan checklist length is telemetry, not an independent-scope admission sig
   assert.equal(decision.availableToolNames.has("spawn_subagent"), false);
 });
 
-test("recovery hides new child creation but keeps join available and selects it before phase work", () => {
+test("recovery hides new child creation and current phase work wins before join", () => {
   const tools = ["read_file", "spawn_subagent", "wait_subagents", "apply_patch"].map((name) => ({
     type: "function",
     function: { name, description: name, parameters: { type: "object", properties: {} } },
@@ -3131,8 +3338,8 @@ test("recovery hides new child creation but keeps join available and selects it 
       { id: "edit", name: "apply_patch", target: "src/App.tsx" },
     ],
   });
-  assert.equal(batch.selectedToolName, "wait_subagents");
-  assert.deepEqual(batch.deferredCallIds, ["edit"]);
+  assert.equal(batch.selectedToolName, "apply_patch");
+  assert.deepEqual(batch.deferredCallIds, ["join"]);
 });
 
 test("a spawn omitted by adaptive admission is a policy deferral, not a tool failure", async () => {
@@ -3607,8 +3814,8 @@ test("normal approved Plan execute workflow is not narrowed by tool history alon
     recoveryIterationCount: 1,
   }));
   assert.equal(recovery.isExecuteRecoveryEligible, true);
-  assert.equal(recovery.availableToolNames.has("read_file"), true);
-  assert.equal(recovery.recoveryActionContract.allowTargetedFileRead, true);
+  assert.equal(recovery.availableToolNames.has("read_file"), false);
+  assert.equal(recovery.recoveryActionContract.allowTargetedFileRead, false);
 });
 
 test("repeat-edit validation recovery exposes only finite command validation", () => {
@@ -3877,9 +4084,18 @@ test("patch mismatch recovery reuses versioned observations without cache bypass
     false,
     "localized executor prose must not drive recovery state",
   );
+  const exactReadContract = resolveExecuteRecoveryActionContract("patch_recovery_read", {
+    expectedTarget: "src/App.tsx",
+    readLease: {
+      purpose: "patch_recovery",
+      target: "src/App.tsx",
+      requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+      state: "available",
+    },
+  });
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "patch_recovery_read",
-    allowFileRead: true,
+    contract: exactReadContract,
   }), true);
   assert.equal(isExecuteRecoveryToolName("list_directory", readOnlyTools, {
     mode: "patch_recovery_read",
@@ -3949,7 +4165,7 @@ test("patch mismatch recovery reuses versioned observations without cache bypass
   assert.match(prompt, /不能默认再读一次文件/);
 });
 
-test("mutation mismatch stays in one transaction and reuses retained source identity", () => {
+test("mutation mismatch grants only a precise one-shot read and otherwise reuses retained source", () => {
   const replaceDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
     runtimeIntent: "execute",
@@ -4021,7 +4237,7 @@ test("mutation mismatch stays in one transaction and reuses retained source iden
   const activatedContract = resolveExecuteRecoveryActionContract(activated.mode, activated);
   assert.equal(activated.mode, "mutation_first");
   assert.equal(activatedContract.nextRequiredCapability, "mutation");
-  assert.equal(activatedContract.allowedToolNames.has("read_file"), true);
+  assert.equal(activatedContract.allowedToolNames.has("read_file"), false);
 
   const versionedDecision = resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
@@ -4041,12 +4257,23 @@ test("mutation mismatch stays in one transaction and reuses retained source iden
       },
     }],
   });
-  assert.equal(versionedDecision?.mode, "mutation_first");
+  assert.equal(versionedDecision?.mode, "patch_recovery_read");
   assert.equal(
     versionedDecision?.decisionCheckpoint.evidenceVersion,
     "8192:1700000000000",
   );
-  assert.equal(versionedDecision?.readLease, null);
+  assert.deepEqual(versionedDecision?.readLease, {
+    purpose: "patch_recovery",
+    target: "src/main.js",
+    requestedRange: { startLine: 205, endLine: 256, maxLines: 52 },
+    observedVersion: "8192:1700000000000",
+    mismatchFingerprint: "patch_mismatch::src/main.js::invalid_patch::mutation-a1",
+    state: "available",
+  });
+  assert.equal(
+    versionedDecision?.decisionCheckpoint.nextRequiredCapability,
+    "targeted_read",
+  );
 
   assert.equal(resolveDirectMutationPreflightRecovery({
     workflowMode: "edit",
@@ -4087,8 +4314,29 @@ test("recovery batch selection serializes different model call shapes by phase",
     }),
   });
   assert.equal(context.phase, "need_context");
-  assert.equal(context.selectedCallId, "target-read", "path aliases must select the actual mismatch target");
-  assert.deepEqual(context.deferredCallIds.sort(), ["edit", "validate-first", "wrong-read"]);
+  assert.equal(context.selectedCallId, "edit", "a current-target mutation must win over the read lease");
+  assert.deepEqual(context.deferredCallIds.sort(), ["target-read", "validate-first", "wrong-read"]);
+
+  const mutationBeatsLease = resolveExecuteRecoveryBatchDecision({
+    mode: "patch_recovery_read",
+    calls: [
+      { id: "cached-read", name: "read_file", target: "src/App.tsx" },
+      { id: "current-edit", name: "apply_patch", target: "src/App.tsx" },
+      { id: "new-window", name: "read_file", target: "src/App.tsx" },
+    ],
+    expectedTarget: "src/App.tsx",
+    contract: resolveExecuteRecoveryActionContract("patch_recovery_read", {
+      expectedTarget: "src/App.tsx",
+      readLease: {
+        purpose: "patch_recovery",
+        target: "src/App.tsx",
+        requestedRange: { startLine: 100, endLine: 150 },
+        state: "available",
+      },
+    }),
+  });
+  assert.equal(mutationBeatsLease.selectedCallId, "current-edit");
+  assert.deepEqual(mutationBeatsLease.deferredCallIds, ["cached-read", "new-window"]);
 
   const wrongTargetOnly = resolveExecuteRecoveryBatchDecision({
     mode: "patch_recovery_read",
@@ -4121,14 +4369,14 @@ test("recovery batch selection serializes different model call shapes by phase",
     expectedTarget: "src/App.tsx",
   });
   assert.equal(mutationReadOnly.phase, "need_mutation");
-  assert.equal(mutationReadOnly.selectedCallId, "read-again");
-  assert.deepEqual(mutationReadOnly.deferredCallIds, []);
+  assert.equal(mutationReadOnly.selectedCallId, null);
+  assert.deepEqual(mutationReadOnly.deferredCallIds, ["read-again"]);
   const mutationContract = resolveExecuteRecoveryActionContract("mutation_first", {
     expectedTarget: "src/App.tsx",
     sourceObservationKey: "src/App.tsx::v1::1-100",
   });
-  assert.equal(mutationContract.allowTargetedFileRead, true);
-  assert.equal(mutationContract.allowedToolNames.has("read_file"), true);
+  assert.equal(mutationContract.allowTargetedFileRead, false);
+  assert.equal(mutationContract.allowedToolNames.has("read_file"), false);
   assert.equal(mutationContract.surfaceDescription, "capability:mutation");
 
   const mutationValidationOnly = resolveExecuteRecoveryBatchDecision({
@@ -4271,6 +4519,11 @@ test("recovery batch selection serializes different model call shapes by phase",
     "utf8",
   );
   assert.match(toolCallExecutionPhaseSource, /partitionToolCallsForExecution\(\{[\s\S]*?executeRecoveryState,/);
+  assert.doesNotMatch(
+    toolCallExecutionPhaseSource,
+    /refundExecuteRecoveryRuntimeIteration/,
+    "policy deferrals and cache stubs must not refresh the recovery budget",
+  );
 });
 
 test("a fresh unleased target window refreshes observation but keeps the mutation checkpoint", () => {
@@ -4865,7 +5118,7 @@ test("max-steps final text prompt disables tools for chat final boundary", () =>
   assert.match(prompt, /what remains unfinished/);
 });
 
-test("empty model response pause explains local-model empty completion instead of waiting for max iterations", () => {
+test("empty model response pause is provider-neutral and preserves recovery context", () => {
   const notice = buildEmptyModelResponsePauseNotice({
     language: "zh",
     emptyResponses: 2,
@@ -4873,7 +5126,8 @@ test("empty model response pause explains local-model empty completion instead o
     localProfile: true,
   });
   assert.match(notice, /2 次空响应/);
-  assert.match(notice, /本地模型/);
+  assert.match(notice, /已有上下文和工具协议/);
+  assert.doesNotMatch(notice, /本地模型|网关|上游模型/);
   assert.match(notice, /src\/App\.tsx/);
 });
 
@@ -4984,7 +5238,8 @@ test("orchestrator wires execute convergence and max-iteration recovery before i
   assert.doesNotMatch(source, /executeRecoveryReason !== reason/);
   assert.match(loopControlRuntimeSource, /resolveAgentLoopIterationBudget/);
   assert.match(streamInvocationSource, /buildMaxStepsFinalTextPrompt/);
-  assert.match(source, /recoveryReason: "max_iterations_boundary"/);
+  assert.match(source, /recoveryReason: handling\.checkpoint\.autoResumeEligible/);
+  assert.match(source, /"chat_max_iterations_strategy_exhausted"/);
   assert.match(source, /normalizeNoProgressResultContent/);
   assert.match(source, /resolveReadOnlyNoProgressTrigger/);
   assert.match(streamInvocationSource, /buildChatFinalSynthesisPrompt/);
@@ -5505,8 +5760,9 @@ test("local stream invocation uses required-any instead of named function choice
     path.join(workspaceRoot, "src/lib/orchestrator/loop/streamInvocation.ts"),
     "utf8",
   );
-  assert.match(source, /preferExplicitFunction:\s*config\.activeProfile === "cloud"/);
-  assert.doesNotMatch(source, /preferExplicitFunction:\s*config\.activeProfile === "local"/);
+  assert.doesNotMatch(source, /preferExplicitFunction/);
+  assert.doesNotMatch(source, /\{\s*type:\s*["']function["']\s*,\s*function:\s*\{\s*name:/);
+  assert.match(source, /return "required";/);
 });
 
 test("recovery action cards retain the original turn objective and finite validation", () => {

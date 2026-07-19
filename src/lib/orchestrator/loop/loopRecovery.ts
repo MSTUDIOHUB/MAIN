@@ -17,14 +17,17 @@ import { isApprovedPlanCachedReadOnlyNoProgressBatch } from "../../approvedPlanR
 import { MODEL_CONTROL_LANGUAGE } from "../../modelControlLanguage";
 import { isPtyControlInput } from "../../ptyCommandRuntime";
 import {
+  EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS,
   buildExecuteNoProgressLoopPauseNotice,
   buildExecuteRecoveryPrompt,
   isReadOnlyNoProgressDetail,
   resolveExecuteRecoveryActionContract,
+  resolveExecuteNoProgressStrategyDecision,
   resolveExecuteReadOnlyRecoveryTrigger,
   resolveReadOnlyNoProgressTrigger,
   summarizeRepeatedExecuteTargets,
   type ExecuteRecoveryMode,
+  type ExecuteNoProgressStrategyPivot,
 } from "../../executeRecoveryTools";
 import {
   buildPlanNoProgressLoopPauseNotice,
@@ -35,8 +38,9 @@ import {
 } from "../../planExecutionRecovery";
 import { isMutationRuntimeIntent, type ResolvedUserIntent } from "../../runIntent";
 import {
+  buildRepeatLoopArgsKey,
+  buildRepeatLoopSignature,
   formatRepeatLoopFatalMessage,
-  formatRepeatLoopRecoveryMessage,
   formatTargetProgressLoopRecoveryMessage,
   getShellMutationTargetForLoopGuard,
   isReadOnlyShellInspectionToolCall,
@@ -89,6 +93,7 @@ export interface NoProgressTrackingState {
   noProgressBatchRepeatCount: number;
   consecutiveReadFileOnlyCacheHits: number;
   lastReadFileOnlyObservationSignature: string;
+  noProgressStrategyPivots: ExecuteNoProgressStrategyPivot[];
 }
 
 function buildReadFileOnlyObservationBatchSignature(results: ToolExecutionResult[]): string {
@@ -143,7 +148,6 @@ export type NoProgressRecoveryResult =
 
 export function handleNoProgressRecovery(input: {
   callbacks: OrchestratorCallbacks;
-  activeProfile: string;
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
   iteration: number;
@@ -154,6 +158,7 @@ export function handleNoProgressRecovery(input: {
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
   executeRecoveryAttempts: number;
+  executeRecoveryState: ExecuteRecoveryRuntimeState;
   executeRecoverySourceObservationKey?: string | null;
   repairExecutionRequestInChat: boolean;
   latestUserPromptText: string;
@@ -161,6 +166,7 @@ export function handleNoProgressRecovery(input: {
   planReadOnlyConvergenceBatches: number;
   planReadOnlyConvergenceTools: number;
   remainingTaskText?: string | null;
+  availableToolNames: Set<string>;
   tracking: NoProgressTrackingState;
   activateExecuteRecovery: (
     mode: Exclude<ExecuteRecoveryMode, "normal">,
@@ -172,7 +178,6 @@ export function handleNoProgressRecovery(input: {
 }): NoProgressRecoveryResult {
   const {
     callbacks,
-    activeProfile,
     workflowMode,
     runtimeIntent,
     iteration,
@@ -183,12 +188,14 @@ export function handleNoProgressRecovery(input: {
     executeRecoveryMode,
     executeRecoveryReason,
     executeRecoveryAttempts,
+    executeRecoveryState,
     repairExecutionRequestInChat,
     latestUserPromptText,
     isUnapprovedPlanReadOnlyBatch,
     planReadOnlyConvergenceBatches,
     planReadOnlyConvergenceTools,
     remainingTaskText,
+    availableToolNames,
     activateExecuteRecovery,
     activateChatFinalSynthesis,
     emitTaskOrchestratorPhase,
@@ -201,6 +208,9 @@ export function handleNoProgressRecovery(input: {
     consecutiveReadFileOnlyCacheHits,
     lastReadFileOnlyObservationSignature,
   } = input.tracking;
+  const noProgressStrategyPivots = [
+    ...(input.tracking.noProgressStrategyPivots || []),
+  ];
   if (noProgressBatchSignature) {
     if (noProgressBatchSignature === lastNoProgressBatchSignature) {
       noProgressBatchRepeatCount += 1;
@@ -235,6 +245,7 @@ export function handleNoProgressRecovery(input: {
     noProgressBatchRepeatCount,
     consecutiveReadFileOnlyCacheHits,
     lastReadFileOnlyObservationSignature,
+    noProgressStrategyPivots,
   };
 
   let pendingExecuteRecoveryPrompt: string | null = null;
@@ -242,6 +253,7 @@ export function handleNoProgressRecovery(input: {
   let currentExecuteRecoveryMode = executeRecoveryMode;
   let currentExecuteRecoveryReason = executeRecoveryReason;
   let currentExecuteRecoveryAttempts = executeRecoveryAttempts;
+  let currentExecuteRecoveryState = executeRecoveryState;
   const executeMutationRecoveryEligible = isExecuteMutationRecoveryEligible({
     callbacks,
     workflowMode,
@@ -255,7 +267,9 @@ export function handleNoProgressRecovery(input: {
     currentExecuteRecoveryMode = mode;
     currentExecuteRecoveryReason = reason;
     currentExecuteRecoveryAttempts += 1;
-    return activateExecuteRecovery(mode, reason, context);
+    const activatedState = activateExecuteRecovery(mode, reason, context);
+    if (activatedState) currentExecuteRecoveryState = activatedState;
+    return currentExecuteRecoveryState;
   };
 
   const mutationFailureTargets = results
@@ -313,14 +327,10 @@ export function handleNoProgressRecovery(input: {
           readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
           sawExecuteOperationEvidence,
           noProgressBatchRepeatCount,
-          minReadOnlyActivities: currentExecuteRecoveryMode === "normal"
-            ? (activeProfile === "local" ? 10 : 8)
-            : Infinity,
-          minCachedReadOnlyActivities: currentExecuteRecoveryMode === "normal"
-            ? (activeProfile === "local" ? 4 : 3)
-            : Infinity,
-          maxNoProgressReadOnlyRepeats: activeProfile === "local" ? 3 : 2,
-          maxReadOnlyToolChars: activeProfile === "local" ? 100000 : 30000,
+          minReadOnlyActivities: currentExecuteRecoveryMode === "normal" ? 8 : Infinity,
+          minCachedReadOnlyActivities: currentExecuteRecoveryMode === "normal" ? 3 : Infinity,
+          maxNoProgressReadOnlyRepeats: 2,
+          maxReadOnlyToolChars: 48000,
         })
       : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
   if (executeReadOnlyRecovery.shouldRecover) {
@@ -369,16 +379,72 @@ export function handleNoProgressRecovery(input: {
           readOnlyTools: PLAN_EXPLORATION_READ_ONLY_TOOLS,
           sawExecuteOperationEvidence,
           noProgressBatchRepeatCount,
-          minReadOnlyActivities: activeProfile === "local" ? 24 : 16,
-          minCachedReadOnlyActivities: activeProfile === "local" ? 10 : 6,
-          maxNoProgressReadOnlyRepeats: activeProfile === "local" ? 5 : 3,
-          maxReadOnlyToolChars: activeProfile === "local" ? 80000 : 48000,
+          minReadOnlyActivities: 16,
+          minCachedReadOnlyActivities: 6,
+          maxNoProgressReadOnlyRepeats: 3,
+          maxReadOnlyToolChars: 48000,
         })
       : { shouldRecover: false, reason: "", readOnlyActivityCount: 0, batchToolChars: 0 };
   if (chatReadOnlyNoProgress.shouldRecover) {
     const repeatedTargets = summarizeRepeatedExecuteTargets(recentToolActivity.slice(-12));
     const progressSignature = buildPlanProgressSignatureFromToolActivity(recentToolActivity) || noProgressBatchSignature;
     if (repairExecutionRequestInChat) {
+      const strategyDecision = resolveExecuteNoProgressStrategyDecision({
+        attemptedStrategies: noProgressStrategyPivots,
+        unfinishedObjective: latestUserPromptText,
+        availableToolNames,
+        cause: chatReadOnlyNoProgress.reason,
+        language: callbacks.getPreferredLanguage(),
+      });
+      if (strategyDecision.action === "continue_with_pivot") {
+        noProgressStrategyPivots.splice(
+          0,
+          noProgressStrategyPivots.length,
+          ...strategyDecision.attemptedStrategies,
+        );
+        const activatedRecovery = activateTrackedExecuteRecovery(
+          "mutation_first",
+          `chat_repair_strategy_pivot:${strategyDecision.strategy}`,
+          {
+            resetExpectedTarget: true,
+            readLease: null,
+            decisionCheckpoint: {
+              expectedTarget: null,
+              sourceObservationKey: null,
+              nextRequiredCapability: "mutation",
+              noProgressStrategyPivots: strategyDecision.attemptedStrategies,
+            },
+          },
+        );
+        callbacks.appendMessage({
+          role: "user",
+          content: [
+            strategyDecision.prompt,
+            buildExecuteRecoveryPrompt({
+              language: MODEL_CONTROL_LANGUAGE,
+              reason: `chat_repair_strategy_pivot:${strategyDecision.strategy}`,
+              contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
+              repeatedTargets,
+              recentActivity: recentToolActivity,
+            }),
+          ].join("\n\n"),
+        });
+        callbacks.onStatusChange("running");
+        logAgentEvent("chat_repair_no_progress_strategy_pivot", {
+          iteration,
+          strategy: strategyDecision.strategy,
+          attemptedStrategies: strategyDecision.attemptedStrategies,
+          repeatedTargets,
+          progressSignature: truncateForLog(progressSignature, 220),
+        });
+        return {
+          status: "continue",
+          tracking,
+          noProgressBatchSignature,
+          pendingExecuteRecoveryPrompt,
+          pendingExecuteNoProgressPause,
+        };
+      }
       logAgentEvent("chat_repair_readonly_no_progress_paused", {
         reason: chatReadOnlyNoProgress.reason,
         iteration,
@@ -509,6 +575,66 @@ export function handleNoProgressRecovery(input: {
         pendingExecuteNoProgressPause?.progressSignature ||
         buildPlanProgressSignatureFromToolActivity(recentToolActivity) ||
         noProgressBatchSignature;
+      const currentTaskId = currentExecuteRecoveryState.decisionCheckpoint?.planTaskId || "";
+      const currentTask = callbacks.getPlanTasks().find((task) =>
+        currentTaskId && String(task.id || "") === currentTaskId
+      );
+      const strategyDecision = resolveExecuteNoProgressStrategyDecision({
+        attemptedStrategies:
+          currentExecuteRecoveryState.decisionCheckpoint?.noProgressStrategyPivots,
+        currentTaskId,
+        expectedTarget: currentExecuteRecoveryState.expectedTarget,
+        unfinishedObjective: currentTask?.text || remainingTaskText,
+        availableToolNames,
+        cause: pendingExecuteNoProgressPause?.reason || "execute_no_progress_batch_loop",
+        language,
+      });
+      if (strategyDecision.action === "continue_with_pivot") {
+        const priorCheckpoint = currentExecuteRecoveryState.decisionCheckpoint;
+        const activatedRecovery = activateTrackedExecuteRecovery(
+          "mutation_first",
+          `no_progress_strategy_pivot:${strategyDecision.strategy}`,
+          {
+            expectedTarget: currentExecuteRecoveryState.expectedTarget,
+            readLease: null,
+            sourceObservationKey: currentExecuteRecoveryState.sourceObservationKey,
+            decisionCheckpoint: {
+              ...(priorCheckpoint || {
+                expectedTarget: currentExecuteRecoveryState.expectedTarget,
+                sourceObservationKey: currentExecuteRecoveryState.sourceObservationKey,
+              }),
+              nextRequiredCapability: "mutation",
+              noProgressStrategyPivots: strategyDecision.attemptedStrategies,
+            },
+          },
+        );
+        pendingExecuteRecoveryPrompt = [
+          strategyDecision.prompt,
+          buildExecuteRecoveryPrompt({
+            language: MODEL_CONTROL_LANGUAGE,
+            reason: `no_progress_strategy_pivot:${strategyDecision.strategy}`,
+            contract: resolveRuntimeRecoveryActionContract(activatedRecovery),
+            repeatedTargets,
+            recentActivity: recentToolActivity,
+          }),
+        ].join("\n\n");
+        logAgentEvent("execute_no_progress_strategy_pivot", {
+          iteration,
+          strategy: strategyDecision.strategy,
+          attemptedStrategies: strategyDecision.attemptedStrategies,
+          currentTaskId: activatedRecovery.decisionCheckpoint?.planTaskId || null,
+          expectedTarget: activatedRecovery.expectedTarget,
+          repeatedTargets,
+        });
+        callbacks.onStatusChange("running");
+        return {
+          status: "continue",
+          tracking,
+          noProgressBatchSignature,
+          pendingExecuteRecoveryPrompt,
+          pendingExecuteNoProgressPause: null,
+        };
+      }
       const pauseNotice = pendingExecuteNoProgressPause?.notice || buildExecuteNoProgressLoopPauseNotice({
         language,
         repeats: noProgressBatchRepeatCount,
@@ -839,6 +965,12 @@ export function handleStrictRepeatGuardRecovery(input: {
   toolCapabilityRegistry: ToolCapabilityRegistry;
   toolPermissionPolicy: ToolPermissionPolicy;
   emitTurnFailedEvent: (message: string) => void;
+  executeRecoveryState?: ExecuteRecoveryRuntimeState;
+  activateExecuteRecovery?: (
+    mode: Exclude<ExecuteRecoveryMode, "normal">,
+    reason: string,
+    context?: Record<string, unknown>,
+  ) => ExecuteRecoveryRuntimeState;
 }): StrictRepeatGuardRecoveryResult {
   const {
     callbacks,
@@ -853,8 +985,87 @@ export function handleStrictRepeatGuardRecovery(input: {
     availableToolNames,
     toolCapabilityRegistry,
     toolPermissionPolicy,
-    emitTurnFailedEvent,
+    executeRecoveryState,
+    activateExecuteRecovery,
   } = input;
+
+  let currentExecuteRecoveryState = executeRecoveryState;
+  const appendStructuredRepeatPivot = (pivotInput: {
+    signature: string;
+    toolName: string;
+    target: string;
+    cause: string;
+    closeReadSurface: boolean;
+    policyFeedback?: string;
+  }): boolean => {
+    const attemptedStrategies = EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS.filter((strategy) =>
+      repeatGuardRecoveredSignatures.has(
+        `${pivotInput.signature}:strategy:${strategy}`,
+      )
+    );
+    const currentTaskId = currentExecuteRecoveryState?.decisionCheckpoint?.planTaskId || "";
+    const currentTask = callbacks.getPlanTasks().find((task) =>
+      currentTaskId && String(task.id || "") === currentTaskId
+    );
+    const decision = resolveExecuteNoProgressStrategyDecision({
+      attemptedStrategies,
+      currentTaskId,
+      expectedTarget: currentExecuteRecoveryState?.expectedTarget || pivotInput.target,
+      unfinishedObjective: currentTask?.text,
+      availableToolNames,
+      cause: pivotInput.cause,
+      language: callbacks.getPreferredLanguage(),
+      requireExecutionEvidence:
+        callbacks.getIsPlanApproved() || isMutationRuntimeIntent(runtimeIntent),
+    });
+    if (decision.action !== "continue_with_pivot") return false;
+
+    repeatGuardRecoveredSignatures.add(pivotInput.signature);
+    repeatGuardRecoveredSignatures.add(
+      `${pivotInput.signature}:strategy:${decision.strategy}`,
+    );
+    recentToolCalls.length = 0;
+    if (
+      pivotInput.closeReadSurface &&
+      activateExecuteRecovery &&
+      (callbacks.getIsPlanApproved() || isMutationRuntimeIntent(runtimeIntent))
+    ) {
+      const priorCheckpoint = currentExecuteRecoveryState?.decisionCheckpoint;
+      currentExecuteRecoveryState = activateExecuteRecovery(
+        "mutation_first",
+        `repeat_guard_strategy_pivot:${decision.strategy}`,
+        {
+          expectedTarget: currentExecuteRecoveryState?.expectedTarget || pivotInput.target,
+          readLease: null,
+          sourceObservationKey: currentExecuteRecoveryState?.sourceObservationKey || null,
+          decisionCheckpoint: {
+            ...(priorCheckpoint || {
+              expectedTarget: currentExecuteRecoveryState?.expectedTarget || pivotInput.target,
+              sourceObservationKey: currentExecuteRecoveryState?.sourceObservationKey || null,
+            }),
+            nextRequiredCapability: "mutation",
+            noProgressStrategyPivots: decision.attemptedStrategies,
+          },
+        },
+      );
+    }
+    callbacks.appendMessage({
+      role: "system",
+      content: `[System: ${[
+        pivotInput.policyFeedback,
+        decision.prompt,
+      ].filter(Boolean).join("\n\n")}]`,
+    });
+    logAgentEvent("strict_repeat_strategy_pivot", {
+      iteration,
+      tool: pivotInput.toolName,
+      target: pivotInput.target,
+      strategy: decision.strategy,
+      attemptedStrategies: decision.attemptedStrategies,
+      runtimeIntent,
+    });
+    return true;
+  };
 
   const resultByToolCallId = new Map(
     results.map((result) => [result.toolCallId, result]),
@@ -862,17 +1073,30 @@ export function handleStrictRepeatGuardRecovery(input: {
 
   for (const toolCall of effectiveToolCalls) {
     const executionResult = resultByToolCallId.get(toolCall.id);
-    if (executionResult?.internalFeedback === true &&
-      executionResult.qualityGateReason === "repeated_failure_blocked") {
-      callbacks.appendMessage({ role: "system", content: `[System: ${executionResult.content}]` });
-      return { status: "continue" };
-    }
-    if (executionResult?.internalFeedback === true &&
-      executionResult.qualityGateReason === "repeated_failure_exhausted") {
-      const target = executionResult.target || "";
+    const toolArgs = parseToolCallArguments(toolCall, workspace);
+    const target = executionResult?.target || getToolTarget(toolCall.name, toolArgs);
+    const policySignature = buildRepeatLoopSignature(
+      toolCall.name,
+      buildRepeatLoopArgsKey(toolArgs),
+    );
+    if (
+      executionResult?.internalFeedback === true &&
+      (executionResult.qualityGateReason === "repeated_failure_blocked" ||
+        executionResult.qualityGateReason === "repeated_failure_exhausted")
+    ) {
+      if (appendStructuredRepeatPivot({
+        signature: policySignature,
+        toolName: toolCall.name,
+        target,
+        cause: executionResult.qualityGateReason,
+        closeReadSurface: toolCall.name === "read_file",
+        policyFeedback: executionResult.content,
+      })) {
+        return { status: "continue" };
+      }
       const notice = callbacks.getPreferredLanguage() === "zh"
-        ? `执行已暂停：${toolCall.name}${target ? ` (${target})` : ""} 在策略纠正后仍被原样请求。`
-        : `Execution paused: ${toolCall.name}${target ? ` (${target})` : ""} was requested unchanged after policy correction.`;
+        ? `执行已暂停：${toolCall.name}${target ? ` (${target})` : ""} 在两次差异化策略纠正后仍被原样请求。`
+        : `Execution paused: ${toolCall.name}${target ? ` (${target})` : ""} was requested unchanged after both differentiated strategy pivots.`;
       callbacks.onNonActionableStop(notice, "no_action", {
         recoveryReason: "repeated_failure_policy_no_progress",
         repeatedTargets: target ? [target] : [],
@@ -881,7 +1105,12 @@ export function handleStrictRepeatGuardRecovery(input: {
           : "change arguments, target, or tool, or state the real blocker",
       });
       callbacks.onStatusChange("idle");
-      logAgentEvent("repeated_failure_policy_exhausted", { iteration, tool: toolCall.name, target });
+      logAgentEvent("repeated_failure_policy_exhausted", {
+        iteration,
+        tool: toolCall.name,
+        target,
+        attemptedStrategies: [...EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS],
+      });
       return { status: "stopped" };
     }
     // The strict guard protects real repeated executions. Calls converted by
@@ -889,7 +1118,6 @@ export function handleStrictRepeatGuardRecovery(input: {
     // so their bounded convergence belongs to RecoveryActionContract's
     // protocol-no-progress counter instead of this global fatal guard.
     if (!executionResult || executionResult.internalFeedback) continue;
-    const toolArgs = parseToolCallArguments(toolCall, workspace);
     const autoExecutable = isToolAutoExecutableForCall(
       toolCall.name,
       toolArgs,
@@ -910,7 +1138,6 @@ export function handleStrictRepeatGuardRecovery(input: {
     );
     if (!repeatCheck.repeated) continue;
 
-    const target = getToolTarget(toolCall.name, toolArgs);
     const repeatedPtyControl = toolCall.name === "send_pty_input" && isPtyControlInput(
       typeof toolArgs.input === "string" ? toolArgs.input : "",
       typeof toolArgs.control === "string" ? toolArgs.control : undefined,
@@ -935,39 +1162,22 @@ export function handleStrictRepeatGuardRecovery(input: {
       });
       return { status: "continue" };
     }
-    if (repeatGuardReadOnly && (readOnlyShellInspection || !repeatGuardRecoveredSignatures.has(repeatCheck.signature))) {
-      const recoveryMessage = formatRepeatLoopRecoveryMessage(
-        toolCall.name,
-        target,
-        repeatCheck.threshold,
-        availableToolNames,
-      );
-      repeatGuardRecoveredSignatures.add(repeatCheck.signature);
-      recentToolCalls.length = 0;
-      callbacks.appendMessage({
-        role: "system",
-        content: `[System: ${recoveryMessage}]`,
-      });
+    const repeatCause = callbacks.getIsPlanApproved() && toolCall.name === "browser_evaluate"
+      ? "approved_plan_repeated_browser_validation"
+      : callbacks.getIsPlanApproved() && runtimeIntent === "execute" && toolCall.name === "read_file"
+      ? "approved_plan_repeated_read_file"
+      : `strict_repeat_${toolCall.name}`;
+    if (appendStructuredRepeatPivot({
+      signature: repeatCheck.signature,
+      toolName: toolCall.name,
+      target,
+      cause: repeatCause,
+      closeReadSurface: toolCall.name === "read_file",
+    })) {
       return { status: "continue" };
     }
 
     if (callbacks.getIsPlanApproved() && toolCall.name === "browser_evaluate") {
-      const recoveryMessage = formatRepeatLoopRecoveryMessage(
-        toolCall.name,
-        target,
-        repeatCheck.threshold,
-        availableToolNames,
-      );
-      if (!repeatGuardRecoveredSignatures.has(repeatCheck.signature)) {
-        repeatGuardRecoveredSignatures.add(repeatCheck.signature);
-        recentToolCalls.length = 0;
-        callbacks.appendMessage({
-          role: "system",
-          content: `[System: ${recoveryMessage}]`,
-        });
-        return { status: "continue" };
-      }
-
       const language = callbacks.getPreferredLanguage();
       const repeatedTargets = target ? [target] : summarizeRepeatedPlanTargetsFromToolActivity(recentPlanToolActivity);
       const progressSignature = buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity);
@@ -1081,9 +1291,21 @@ export function handleStrictRepeatGuardRecovery(input: {
       : callbacks.getPreferredLanguage() === "zh"
       ? "\nRecovery: 请开启新的恢复上下文，先复用已成功结果，再继续下一个文件或不同目标。"
       : "\nRecovery: start a fresh recovery context, reuse successful results, then continue with the next file or a different target.";
-    callbacks.onError(`${fatalMessage}\n${structuredRecovery}${recoveryHint}`);
-    callbacks.onStatusChange("error");
-    emitTurnFailedEvent(fatalMessage);
+    const pauseNotice = `${fatalMessage}\n${structuredRecovery}${recoveryHint}`;
+    callbacks.onNonActionableStop(pauseNotice, "no_action", {
+      progressSignature: buildPlanProgressSignatureFromToolActivity(recentPlanToolActivity),
+      repeatedTargets: target ? [target] : [],
+      recoveryReason: "strict_repeat_strategy_exhausted",
+      nextStep: remainingTask?.text || defaultSuggestedNextTask,
+    });
+    callbacks.onStatusChange("idle");
+    logAgentEvent("loop_stop", {
+      reason: "strict_repeat_strategy_exhausted",
+      iteration,
+      tool: toolCall.name,
+      target,
+      attemptedStrategies: [...EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS],
+    });
     return { status: "stopped" };
   }
 

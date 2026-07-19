@@ -133,6 +133,7 @@ export async function handleAssistantIterationPhase(input: {
       iterationRequestStartedAt: input.iterationRequestStartedAt,
       runtimeIntent,
       forceXmlTools: input.forceXmlTools,
+      availableToolNames: input.availableToolNames,
       llmToolCount: input.llmTools.length,
       managedMessageCount: input.managedMessageCount,
       currentMaxTokens: input.streamRuntimeState.currentMaxTokens,

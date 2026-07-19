@@ -84,6 +84,7 @@ test("no-progress tracking snapshot and reducer preserve unrelated guard collect
     noProgressBatchRepeatCount: 0,
     consecutiveReadFileOnlyCacheHits: 0,
     lastReadFileOnlyObservationSignature: "",
+    noProgressStrategyPivots: [],
   });
 
   const next = applyNoProgressTrackingRuntimeState(state, {
@@ -99,6 +100,7 @@ test("no-progress tracking snapshot and reducer preserve unrelated guard collect
     noProgressBatchRepeatCount: 3,
     consecutiveReadFileOnlyCacheHits: 2,
     lastReadFileOnlyObservationSignature: "window-app",
+    noProgressStrategyPivots: [],
   });
 });
 
@@ -194,6 +196,7 @@ test("a durable mutation starts a fresh loop-guard progress epoch", () => {
     noProgressBatchRepeatCount: 0,
     consecutiveReadFileOnlyCacheHits: 0,
     lastReadFileOnlyObservationSignature: "",
+    noProgressStrategyPivots: [],
   });
   assert.equal(next.recentToolCalls.length, 0);
   assert.equal(next.recentTargetToolCalls.length, 0);

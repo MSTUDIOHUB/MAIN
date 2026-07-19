@@ -26,6 +26,11 @@ import type { ExecuteRecoveryMode } from "../../executeRecoveryTools";
 import type { PlanRuntimePhase } from "../../workflowModels";
 import type { AgentMessage, OrchestratorCallbacks } from "../types";
 import type { PlanEvidenceRecoveryObjective } from "./planRuntimeState";
+import {
+  applyExecuteNoToolStrategyPivot,
+  isExecuteRuntimeRequiringEvidence,
+  resolveExecuteNoToolStrategyAtBoundary,
+} from "./executeNoToolRecovery";
 
 type WorkflowMode = "chat" | "edit" | "plan";
 
@@ -65,6 +70,8 @@ export function handleReasoningDominatedNoToolRecovery(input: {
   planReasoningOnlyRecoveryPasses: number;
   planEvidenceRecoveryObjective: PlanEvidenceRecoveryObjective;
   consecutiveReasoningDominatedCount: number;
+  forceXmlTools?: boolean;
+  availableToolNames?: Set<string>;
   setPlanRuntimePhase: SetPlanRuntimePhase;
   activateExecuteRecovery: ActivateExecuteRecovery;
 }): ReasoningDominatedNoToolRecoveryResult {
@@ -196,7 +203,36 @@ export function handleReasoningDominatedNoToolRecovery(input: {
       isPlanApproved: callbacks.getIsPlanApproved(),
     },
   );
-  if (consecutiveReasoningDominatedCount >= 2) {
+  const reasoningCheckpointLimit = 2;
+  const isExecuteRuntime = isExecuteRuntimeRequiringEvidence({
+    workflowMode,
+    turnIntent,
+    runtimeIntent,
+  });
+  if (consecutiveReasoningDominatedCount >= reasoningCheckpointLimit) {
+    if (isExecuteRuntime) {
+      const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
+        callbacks,
+        consecutiveNoToolCount: consecutiveReasoningDominatedCount,
+        checkpointLimit: reasoningCheckpointLimit,
+        availableToolNames: input.availableToolNames,
+        cause: "reasoning_dominated_no_action",
+      });
+      if (strategyDecision.action === "continue_with_pivot") {
+        applyExecuteNoToolStrategyPivot({
+          callbacks,
+          decision: strategyDecision,
+          forceXmlTools: input.forceXmlTools ?? Boolean(
+            callbacks.shouldForceXmlForProviderCompatibility?.(),
+          ),
+          assistantMsgId,
+          iteration,
+          cause: "reasoning_dominated_no_action",
+          runtimeAlreadyPrepared: true,
+        });
+        return finish("continue");
+      }
+    }
     callbacks.onNonActionableStop(
       buildReasoningDominatedPauseMessage(callbacks.getPreferredLanguage(), workflowMode),
       callbacks.getIsPlanApproved() || workflowMode === "plan"

@@ -431,11 +431,16 @@ test("paused, error, stopped, and pending continuation outcomes never synthesize
   assert.equal(shouldCommitCompletedTurnFinalPresentation({ outcomeStatus: "completed" }), true);
 });
 
-test("only a durable no-progress recovery pause commits the partial assistant final", () => {
+test("recoverable no-progress pauses commit a partial assistant final", () => {
   assert.equal(shouldCommitPausedTurnFinalPresentation({
     outcomeStatus: "paused",
     recoveryReason: "execute_recovery_no_progress_limit",
     hasDurableMutationEvidence: true,
+  }), true);
+  assert.equal(shouldCommitPausedTurnFinalPresentation({
+    outcomeStatus: "paused",
+    recoveryReason: "execute_no_progress_batch_loop",
+    hasDurableMutationEvidence: false,
   }), true);
   for (const input of [
     { outcomeStatus: "stopped_no_action", recoveryReason: "execute_recovery_no_progress_limit", hasDurableMutationEvidence: true },
@@ -445,6 +450,50 @@ test("only a durable no-progress recovery pause commits the partial assistant fi
   ]) {
     assert.equal(shouldCommitPausedTurnFinalPresentation(input), false, JSON.stringify(input));
   }
+});
+
+test("execute batch-loop exhaustion commits a paused final without mutation evidence", () => {
+  assert.equal(shouldCommitPausedTurnFinalPresentation({
+    outcomeStatus: "paused",
+    recoveryReason: "execute_no_progress_batch_loop",
+    hasDurableMutationEvidence: false,
+  }), true);
+
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const pausedFinalStart = workflowSource.indexOf("const ensurePausedTurnFinalPresentation");
+  const pausedFinalEnd = workflowSource.indexOf("const projectHarnessForAgentLoopOutcome", pausedFinalStart);
+  const pausedFinalSource = workflowSource.slice(pausedFinalStart, pausedFinalEnd);
+  assert.match(pausedFinalSource, /outcome\.reason !== "execute_no_progress_batch_loop"/);
+  assert.match(
+    pausedFinalSource,
+    /outcome\.reason === "execute_recovery_no_progress_limit"[\s\S]*durableMutationEvidence\.length === 0/,
+  );
+  assert.match(pausedFinalSource, /visibility: "assistant_final" as const/);
+});
+
+test("pause then completion reuses one assistant_final for the same logical turn", () => {
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const completedStart = workflowSource.indexOf("const ensureCompletedTurnFinalPresentation");
+  const completedEnd = workflowSource.indexOf("const ensurePausedTurnFinalPresentation", completedStart);
+  const completedSource = workflowSource.slice(completedStart, completedEnd);
+  const pausedStart = completedEnd;
+  const pausedEnd = workflowSource.indexOf("const projectHarnessForAgentLoopOutcome", pausedStart);
+  const pausedSource = workflowSource.slice(pausedStart, pausedEnd);
+
+  assert.match(pausedSource, /const existingTerminalFinalBlock = \[\.\.\.turnBlocks\]\.reverse\(\)\.find/);
+  assert.match(pausedSource, /const finalBlockId = existingTerminalFinalBlock\?\.id \?\? current\._nextTaskId\(\)/);
+  assert.match(completedSource, /const reusableFinalBlock = matchingPublishedBlock \|\| existingTerminalFinalBlock \|\| null/);
+  assert.match(completedSource, /const finalBlockId = reusableFinalBlock\?\.id \?\? current\._nextTaskId\(\)/);
+  assert.match(
+    completedSource,
+    /block\.visibility === "assistant_final"[\s\S]*block\.id !== finalBlockId[\s\S]*visibility: "assistant_update"/,
+  );
 });
 
 test("workflow terminal contract persists only completed finals and uses supported ChatArea statuses", () => {
@@ -459,6 +508,7 @@ test("workflow terminal contract persists only completed finals and uses support
   assert.match(workflowSource, /shouldCommitCompletedTurnFinalPresentation\(\{/);
   assert.match(workflowSource, /shouldCommitPausedTurnFinalPresentation\(\{/);
   assert.match(workflowSource, /ensurePausedTurnFinalPresentation\(loopOutcome\)/);
+  assert.match(workflowSource, /emitLocalPlanExecutionProgress\("paused",\s*\{/);
   assert.match(workflowSource, /paused_turn_final_presentation_committed/);
   assert.match(workflowSource, /!context\.executionEvidenceDraftHeld/);
   assert.match(workflowSource, /visibility: "assistant_final" as const/);

@@ -2061,6 +2061,137 @@ test("materialization preserves the quality rejection for an empty change body",
   assert.equal(result.quality?.canAutoRepair, false);
 });
 
+test("materialization rejects an empty named action heading before evidence repair", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# 修复文件打开入口",
+      "",
+      "## 摘要",
+      "- 用户目标：修复 `src/main.js` 的文件打开入口。",
+      "",
+      "## 关键改动",
+      "- 修改 handleOpenFile()：",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 不修改公共接口。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm test` 并检查退出码。",
+      "",
+      "## 验收标准",
+      "- 打开文件后正文应正确显示。",
+    ].join("\n"),
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "handleOpenFile owns the file-open flow",
+    }],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "empty_plan_implementation_detail");
+  assert.equal(result.quality?.canAutoRepair, false);
+});
+
+test("evidence-section auto repair cannot approve a path-only mutation task", () => {
+  const result = materializePlanArtifactFromVisibleText({
+    visibleText: [
+      "# 修复文件打开入口",
+      "",
+      "## 摘要",
+      "- 用户目标：修复 `src/main.js` 的文件打开入口。",
+      "",
+      "## 关键改动",
+      "- 修改 `src/main.js`",
+      "",
+      "## 公共 API / 接口 / 类型",
+      "- 不修改公共接口。",
+      "",
+      "## 测试方案",
+      "- 运行 `npm test` 并检查退出码。",
+      "",
+      "## 验收标准",
+      "- 打开文件后正文应正确显示。",
+    ].join("\n"),
+    evidenceRecords: [{
+      tool: "read_file",
+      target: "src/main.js",
+      status: "succeeded",
+      summary: "handleOpenFile owns the file-open flow",
+    }],
+    language: "zh",
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.reason, "empty_plan_implementation_detail");
+  assert.equal(result.quality?.canAutoRepair, false);
+});
+
+test("actionable Plan gate rejects unresolved core API contracts in Chinese and English", () => {
+  const buildPlan = (interfaceLine) => [
+    "# Repair integration contract",
+    "",
+    "## User Goal",
+    "- Repair the integration in `src/main.ts`.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.ts` owns the existing integration call.",
+    "",
+    "## Key Changes",
+    "- Modify `src/main.ts` so the integration uses the confirmed request contract and preserves existing fallback behavior.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    `- ${interfaceLine}`,
+    "",
+    "## Test Plan",
+    "- Run `npm test` and check the exit status.",
+    "",
+    "## Acceptance Criteria",
+    "- The integration request succeeds and the existing fallback remains available.",
+  ].join("\n");
+
+  for (const line of [
+    "第三方 SDK 的 payload 类型仍需确认后再实现。",
+    "The plugin API payload contract still needs to be verified before implementation.",
+  ]) {
+    const quality = validateActionablePlanArtifact(buildPlan(line));
+    assert.equal(quality.ok, false);
+    assert.equal(quality.reason, "unverified_plan_contract_counterpart:declared_core_interface");
+    assert.equal(quality.recoveryAction, "targeted_evidence");
+  }
+});
+
+test("actionable Plan gate rejects synonymous duplicate mutations for one target", () => {
+  const quality = validateActionablePlanArtifact([
+    "# Repair startup title",
+    "",
+    "## User Goal",
+    "- Repair the startup title in `src/main.ts`.",
+    "",
+    "## Confirmed Evidence",
+    "- `src/main.ts` initializes the current startup title.",
+    "",
+    "## Key Changes",
+    "- Update `src/main.ts`: set the startup title to Welcome.",
+    "- Modify `src/main.ts`: set the startup title to Welcome.",
+    "",
+    "## Public APIs / Interfaces / Types",
+    "- No public API, interface, or type changes.",
+    "",
+    "## Test Plan",
+    "- Run `npm test` and check the exit status.",
+    "",
+    "## Acceptance Criteria",
+    "- On startup, the title is Welcome.",
+  ].join("\n"));
+
+  assert.equal(quality.ok, false);
+  assert.equal(quality.reason, "duplicated_plan_mutation_task");
+  assert.equal(quality.canAutoRepair, false);
+});
+
 test("materializes MVP defaults without requiring open questions", () => {
   const result = materializePlanArtifactFromVisibleText({
     visibleText: [

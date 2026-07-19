@@ -199,6 +199,24 @@ test("XML fallback uses only the filtered active definitions", () => {
   assert.doesNotMatch(card, /read_file\(|replace_in_file\(/);
 });
 
+test("auto protocol selection depends on the active capability surface, not provider profile", () => {
+  const base = {
+    provider: "provider-is-metadata-only",
+    toolProtocol: "auto",
+    nativeToolsEnabled: false,
+    availableToolNames: ["read_file"],
+    toolDefinitions: [tools[0]],
+    language: "en",
+  };
+  const local = buildToolProtocolCard({ ...base, activeProfile: "local" });
+  const cloud = buildToolProtocolCard({ ...base, activeProfile: "cloud" });
+
+  assert.equal(local, cloud);
+  assert.match(local, /protocol=xml-text/);
+  assert.match(local, /read_file\(path: string, start_line\?: number\)/);
+  assert.doesNotMatch(local, /provider-is-metadata-only|profile=/);
+});
+
 test("no-tool turns contain no executable XML example or fake capability", () => {
   const prompt = buildPrompt({ intent: "plan", available: [], native: false, toolDefinitions: [] });
   assert.match(prompt, /available=none/);

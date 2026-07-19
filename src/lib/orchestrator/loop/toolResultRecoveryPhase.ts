@@ -1465,7 +1465,6 @@ export async function handleToolResultRecoveryPhase(input: {
 
   const noProgressRecovery = handleNoProgressRecovery({
     callbacks: input.callbacks,
-    activeProfile: input.activeProfile,
     workflowMode: input.workflowMode,
     runtimeIntent: input.runtimeIntent,
     iteration: input.iteration,
@@ -1477,6 +1476,7 @@ export async function handleToolResultRecoveryPhase(input: {
     executeRecoveryMode: executeRecoveryState.mode,
     executeRecoveryReason: executeRecoveryState.reason,
     executeRecoveryAttempts: executeRecoveryState.attempts,
+    executeRecoveryState,
     executeRecoverySourceObservationKey: executeRecoveryState.sourceObservationKey,
     repairExecutionRequestInChat: input.repairExecutionRequestInChat,
     latestUserPromptText: input.latestUserPromptText,
@@ -1484,6 +1484,7 @@ export async function handleToolResultRecoveryPhase(input: {
     planReadOnlyConvergenceBatches: planRuntimeState.planReadOnlyConvergenceBatches,
     planReadOnlyConvergenceTools: planRuntimeState.planReadOnlyConvergenceTools,
     remainingTaskText: input.remainingTaskText,
+    availableToolNames: input.availableToolNames,
     tracking: getNoProgressTrackingRuntimeState(loopGuardRuntimeState),
     activateExecuteRecovery: activateExecuteRecoveryAndSync,
     activateChatFinalSynthesis: input.activateChatFinalSynthesis,
@@ -2175,6 +2176,8 @@ export async function handleToolResultRecoveryPhase(input: {
     toolCapabilityRegistry: input.toolCapabilityRegistry,
     toolPermissionPolicy: input.toolPermissionPolicy,
     emitTurnFailedEvent: input.emitTurnFailedEvent,
+    executeRecoveryState,
+    activateExecuteRecovery: activateExecuteRecoveryAndSync,
   });
   if (strictRepeatGuardRecovery.status === "stopped") {
     return finish("stopped");

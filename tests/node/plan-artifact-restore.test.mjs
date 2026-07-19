@@ -183,7 +183,7 @@ test("current-state evidence may describe a possible risk without becoming a spe
   assert.equal(quality.ok, true, quality.reason || "evidence risk should remain reviewable");
 });
 
-test("restore retains an already-approved structurally valid legacy Plan", () => {
+test("restore retains an invalid approved Plan only as an audit record and revokes approval", () => {
   const content = buildUnsupportedHypothesisPlan();
   assert.equal(validatePlanArtifactContent(content, "plan").ok, true);
   assert.equal(validateActionablePlanArtifact(content).ok, false);
@@ -196,7 +196,11 @@ test("restore retains an already-approved structurally valid legacy Plan", () =>
   assert.equal(restored.artifacts.length, 1);
   assert.equal(restored.artifacts[0].content, content.trim());
   assert.equal(restored.artifacts[0].revision, 2);
-  assert.deepEqual(restored.rejected, []);
+  assert.deepEqual(restored.rejected, [{
+    path: ".MAIN/plans/plan.md",
+    kind: "plan",
+    reason: "unsupported_hypothesis_as_plan",
+  }]);
 });
 
 test("restore rejects a Plan artifact outside the canonical .MAIN/plans paths", () => {

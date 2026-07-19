@@ -24,7 +24,9 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   await expect(page.getByTestId("execution-capsule-plan-badge")).toHaveCount(0);
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  await expect(capsule).toContainText("正在执行：apply_patch · src/task-9.ts");
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
+  await expect(capsule).not.toContainText("apply_patch");
+  await expect(capsule).not.toContainText("src/task-9.ts");
   await expect(capsule).not.toContainText("阶段：tool_start");
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
   await expect(page.getByTestId("plan-task-progress")).toContainText("8/9");
@@ -52,7 +54,8 @@ test("preapproval Plan recovery keeps internal phases and heartbeats out of user
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  await expect(capsule).toContainText("正在整理已确认信息，生成可审批计划");
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在制定计划");
+  await expect(capsule).not.toContainText("正在整理已确认信息，生成可审批计划");
   await expect(capsule).not.toContainText("我已读取 tauri.conf.json");
   await expect(capsule).not.toHaveAttribute("data-plan-runtime-phase", /.+/);
   await expect(page.getByTestId("plan-draft-runtime-progress")).toHaveCount(0);
@@ -98,7 +101,7 @@ test("ExecutionCapsule keeps approval buttons visible for a long command with pl
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("拒绝");
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("开启自动审查并批准");
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("批准此工具请求");
-  await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("printf");
+  await expect(page.getByTestId("execution-capsule-tool-review")).not.toContainText("printf");
   await expect(page.getByTestId("execution-capsule-plan-badge")).toContainText("任务 8/12");
   await expect(page.getByTestId("execution-capsule-plan-progress")).toHaveCount(0);
   await expect(page.getByTestId("execution-capsule-current-plan-task")).toHaveCount(0);
@@ -200,7 +203,8 @@ test("task tracking popover preserves authored checklist order with runtime-only
   expect(styles.className).not.toContain("shadow-[inset_3px_0_0");
   expect(styles.borderLeftColor).not.toBe("rgb(5, 150, 105)");
 
-  await expect(page.getByTestId("agent-explanation-capsule")).toContainText("等待工具批准：run_command");
+  await expect(page.getByTestId("capsule-status-label")).toHaveText("等待权限");
+  await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("run_command");
   await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("阶段：waiting_review");
   await expect(page.getByTestId("plan-execution-runtime-progress")).toHaveCount(0);
 });
@@ -214,7 +218,7 @@ test("ExecutionCapsule renders approval controls from pendingToolCall when the p
   await page.evaluate(() => (window as any).__CODELY_E2E__?.showOrphanPendingReviewPrompt?.());
   await expect(page.getByTestId("execution-capsule-tool-review")).toBeVisible();
   await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("批准此工具请求");
-  await expect(page.getByTestId("execution-capsule-tool-review")).toContainText("SnakeController.cs");
+  await expect(page.getByTestId("execution-capsule-tool-review")).not.toContainText("SnakeController.cs");
 
   await page.getByTestId("execution-capsule-tool-approve-once").click();
   await expect

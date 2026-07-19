@@ -21,6 +21,7 @@ import type { MainThreadProgressUpdate } from "./turnEvents";
 import {
   isReadOnlyNoProgressDetail,
   type ExecuteRecoveryMode,
+  type ExecuteRecoveryNextCapability,
   type ForcedExecuteRecoveryRuntimeState,
 } from "./executeRecoveryTools";
 import { isPlanReadOnlyToolName } from "./planReadOnlyConvergence";
@@ -32,7 +33,76 @@ import {
   type ExecuteEvidenceGap,
 } from "./verificationEvidence";
 
-export const PLAN_MAX_AUTO_RESUME_LIMIT = 1;
+export const PLAN_MAX_AUTO_RESUME_LIMIT = 3;
+export const CHAT_MAX_AUTO_RESUME_LIMIT = 2;
+
+export type MaxIterationStrategyPivot =
+  | "continue_contract"
+  | "reconcile_evidence"
+  | "bounded_alternative"
+  | "synthesize_completion";
+
+export interface MaxIterationStrategyPivotDecision {
+  selected: MaxIterationStrategyPivot | null;
+  attempted: MaxIterationStrategyPivot[];
+  remaining: MaxIterationStrategyPivot[];
+  hardLimit: number;
+}
+
+/**
+ * Select a genuinely different continuation at an iteration boundary. The
+ * queue is based only on structured objective/contract state. Provider and
+ * model identity never participate, and the finite queue is the hard fuse for
+ * a no-progress evidence epoch.
+ */
+export function resolveMaxIterationStrategyPivot(input: {
+  autoResumeCount: number;
+  objectiveComplete: boolean;
+  nextRequiredCapability?: ExecuteRecoveryNextCapability | null;
+  hardBlocked?: boolean;
+}): MaxIterationStrategyPivotDecision {
+  const queue: MaxIterationStrategyPivot[] = input.objectiveComplete
+    ? ["synthesize_completion"]
+    : [
+        "continue_contract",
+        "reconcile_evidence",
+        "bounded_alternative",
+      ];
+  const spent = Math.max(0, Math.floor(Number(input.autoResumeCount) || 0));
+  const attempted = queue.slice(0, spent);
+  const remaining = input.hardBlocked ? [] : queue.slice(spent);
+  return {
+    selected: remaining[0] || null,
+    attempted,
+    remaining,
+    hardLimit: queue.length,
+  };
+}
+
+/**
+ * Ordinary conversation has a smaller, non-execution recovery queue. It must
+ * never inherit mutation or validation obligations merely because the model
+ * used many turns: first answer from retained context, then allow one
+ * materially different bounded observation before the hard fuse applies.
+ */
+export function resolveChatMaxIterationStrategyPivot(input: {
+  autoResumeCount: number;
+  hardBlocked?: boolean;
+}): MaxIterationStrategyPivotDecision {
+  const queue: MaxIterationStrategyPivot[] = [
+    "synthesize_completion",
+    "bounded_alternative",
+  ];
+  const spent = Math.max(0, Math.floor(Number(input.autoResumeCount) || 0));
+  const attempted = queue.slice(0, spent);
+  const remaining = input.hardBlocked ? [] : queue.slice(spent);
+  return {
+    selected: remaining[0] || null,
+    attempted,
+    remaining,
+    hardLimit: queue.length,
+  };
+}
 
 export interface ApprovedPlanRecoveryResolutionOptions {
   /** Runtime tools actually available for this iteration, before recovery filtering. */
@@ -56,9 +126,9 @@ export function hasPendingApprovedPlanSourceMutation(
 
 /**
  * Start approved execution from the first reviewed obligation instead of
- * reopening an unconstrained diagnostic turn. The stable recovery surface
- * still exposes a targeted read when exact source text is genuinely missing;
- * this checkpoint only fixes the task, target, and next capability.
+ * reopening an unconstrained diagnostic turn. A source mutation begins with
+ * one target-scoped read lease; the first fresh observation or unchanged
+ * cache stub consumes it and switches the transaction to mutation-only.
  */
 export function resolveApprovedPlanInitialExecutionRecovery(
   tasks: PlanTask[],
@@ -85,19 +155,23 @@ export function resolveApprovedPlanInitialExecutionRecovery(
         ?.value?.trim();
       if (target) {
         return {
-          mode: "mutation_first",
+          mode: "patch_recovery_read",
           reason: "approved_plan_execution_handoff",
           expectedTarget: target,
           attempts: 0,
           phaseNoProgressCount: 0,
           protocolNoProgressCount: 0,
           protocolNoProgressFingerprint: null,
-          readLease: null,
+          readLease: {
+            purpose: "plan_line_context",
+            target,
+            state: "available",
+          },
           sourceObservationKey: null,
           decisionCheckpoint: {
             expectedTarget: target,
             sourceObservationKey: null,
-            nextRequiredCapability: "mutation",
+            nextRequiredCapability: "targeted_read",
             ...taskCheckpointIdentity,
           },
         };
@@ -539,8 +613,13 @@ export interface PlanMaxIterationsCheckpoint {
   iterationCount: number;
   maxIterations: number;
   autoResumeCount: number;
-  /** Auto-resume is safe only when this run produced durable execution delta. */
+  /** Auto-resume is safe while an untried structured pivot remains. */
   autoResumeEligible: boolean;
+  strategyPivot: MaxIterationStrategyPivot | null;
+  attemptedStrategyPivots: MaxIterationStrategyPivot[];
+  remainingStrategyPivots: MaxIterationStrategyPivot[];
+  strategyPivotBudget: number;
+  strategyCapability: ExecuteRecoveryNextCapability | null;
   currentTask: string;
   remainingTasks: string[];
   completedEvidence: string[];
@@ -747,28 +826,36 @@ function scoreTaskForActivity(task: PlanTask, targets: string[]): number {
 function resolveActivePlanTask(input: {
   tasks: PlanTask[];
   recentToolActivity: PlanToolActivitySummary[];
+  currentTaskId?: string;
   currentTool?: string;
   latestEvidence?: string;
   includeCompleted?: boolean;
 }): PlanTask | undefined {
+  const eligibleTasks = input.tasks.filter((task) =>
+    input.includeCompleted ||
+    (task.status !== "completed" && task.evidenceStatus !== "satisfied")
+  );
+  const currentTaskId = String(input.currentTaskId || "").trim();
+  if (currentTaskId) {
+    return eligibleTasks.find((task) => task.id === currentTaskId);
+  }
   const targets = collectActivityTargets(input);
-  let bestTask: PlanTask | undefined;
   let bestScore = 0;
-  let bestIndex = -1;
-  input.tasks.forEach((task, index) => {
-    if (
-      !input.includeCompleted &&
-      (task.status === "completed" || task.evidenceStatus === "satisfied")
-    ) return;
+  const bestTasks: PlanTask[] = [];
+  eligibleTasks.forEach((task) => {
     const score = scoreTaskForActivity(task, targets);
     if (score < 3) return;
-    if (!bestTask || score > bestScore || (score === bestScore && index > bestIndex)) {
-      bestTask = task;
+    if (score > bestScore) {
+      bestTasks.length = 0;
+      bestTasks.push(task);
       bestScore = score;
-      bestIndex = index;
+    } else if (score === bestScore) {
+      bestTasks.push(task);
     }
   });
-  return bestTask;
+  if (bestTasks.length === 1) return bestTasks[0];
+  const uniqueInProgressMatch = bestTasks.filter((task) => task.status === "in_progress");
+  return uniqueInProgressMatch.length === 1 ? uniqueInProgressMatch[0] : undefined;
 }
 
 function isBroadPlanTask(task: PlanTask | undefined): boolean {
@@ -914,6 +1001,7 @@ export function buildPlanExecutionProgressUpdate(input: {
   tasks: PlanTask[];
   evidenceLedger: PlanExecutionEvidenceEntry[];
   recentToolActivity: PlanToolActivitySummary[];
+  currentTaskId?: string;
   currentTask?: string;
   currentTool?: string;
   latestEvidence?: string;
@@ -937,6 +1025,7 @@ export function buildPlanExecutionProgressUpdate(input: {
   const activeTask = resolveActivePlanTask({
     tasks: audit.tasks,
     recentToolActivity: input.recentToolActivity,
+    currentTaskId: input.currentTaskId,
     currentTool: input.currentTool,
     latestEvidence: input.latestEvidence || recentEvidence,
     includeCompleted: input.phase === "tool_done",
@@ -952,6 +1041,9 @@ export function buildPlanExecutionProgressUpdate(input: {
 
   return {
     phase: input.phase,
+    ...((activeTask?.id || remainingTask?.id)
+      ? { currentTaskId: activeTask?.id || remainingTask?.id }
+      : {}),
     currentTask,
     currentTool: compactLine(input.currentTool || recentTool || (input.language === "zh" ? "暂无工具调用" : "no tool call yet")),
     latestEvidence: compactLine(input.latestEvidence || recentEvidence || (input.language === "zh" ? "暂无项目源码证据" : "no project-source evidence yet")),
@@ -982,6 +1074,7 @@ export function normalizePlanExecutionProgressSnapshot(input: {
       ? input.update.parentRunId
       : previous?.parentRunId,
     phase: input.update.phase || previous?.phase || "running",
+    currentTaskId: compactLine(input.update.currentTaskId || previous?.currentTaskId || "", 160) || undefined,
     currentTask: compactLine(input.update.currentTask || previous?.currentTask || ""),
     currentTool: compactLine(input.update.currentTool || previous?.currentTool || ""),
     latestEvidence: compactLine(input.update.latestEvidence || previous?.latestEvidence || ""),
@@ -998,6 +1091,52 @@ export function normalizePlanExecutionProgressSnapshot(input: {
     autoResumeCount: Math.max(0, Number(input.update.autoResumeCount ?? previous?.autoResumeCount) || 0),
     updatedAt: Math.max(0, Number(input.update.updatedAt) || Number(input.now) || Date.now()),
   };
+}
+
+export interface RestoredPlanExecutionTaskIdentityResolution {
+  currentTaskId?: string;
+  ambiguous: boolean;
+}
+
+/**
+ * Migrate legacy checkpoints that predate `currentTaskId`. Text and status are
+ * accepted only when they identify exactly one live task. Ambiguous same-file
+ * task graphs must be paused for revision instead of guessing from path order.
+ */
+export function resolveRestoredPlanExecutionTaskIdentity(input: {
+  snapshot?: Partial<PlanExecutionProgressSnapshot> | null;
+  tasks: PlanTask[];
+}): RestoredPlanExecutionTaskIdentityResolution {
+  const snapshot = input.snapshot;
+  if (!snapshot) return { ambiguous: false };
+  const tasks = Array.isArray(input.tasks) ? input.tasks : [];
+  const persistedId = String(snapshot.currentTaskId || "").trim();
+  if (persistedId) {
+    return tasks.some((task) => task.id === persistedId)
+      ? { currentTaskId: persistedId, ambiguous: false }
+      : { ambiguous: true };
+  }
+
+  const eligible = tasks.filter((task) =>
+    task.status !== "completed" && task.evidenceStatus !== "satisfied"
+  );
+  if (eligible.length === 0) return { ambiguous: false };
+  const checkpointText = compactLine(snapshot.currentTask || "");
+  if (checkpointText) {
+    const textMatches = eligible.filter((task) => compactLine(task.text) === checkpointText);
+    if (textMatches.length === 1) {
+      return { currentTaskId: textMatches[0].id, ambiguous: false };
+    }
+    if (textMatches.length > 1) return { ambiguous: true };
+  }
+  const inProgress = eligible.filter((task) => task.status === "in_progress");
+  if (inProgress.length === 1) {
+    return { currentTaskId: inProgress[0].id, ambiguous: false };
+  }
+  if (inProgress.length > 1) return { ambiguous: true };
+  return eligible.length === 1
+    ? { currentTaskId: eligible[0].id, ambiguous: false }
+    : { ambiguous: true };
 }
 
 /**
@@ -1091,6 +1230,11 @@ export function buildPlanMaxIterationsCheckpoint(input: {
   maxIterations: number;
   autoResumeCount: number;
   autoResumeEligible: boolean;
+  strategyPivot?: MaxIterationStrategyPivot | null;
+  attemptedStrategyPivots?: MaxIterationStrategyPivot[];
+  remainingStrategyPivots?: MaxIterationStrategyPivot[];
+  strategyPivotBudget?: number;
+  strategyCapability?: ExecuteRecoveryNextCapability | null;
   tasks: PlanTask[];
   evidenceLedger: PlanExecutionEvidenceEntry[];
   recentToolActivity: PlanToolActivitySummary[];
@@ -1115,6 +1259,14 @@ export function buildPlanMaxIterationsCheckpoint(input: {
     maxIterations: input.maxIterations,
     autoResumeCount: Math.max(0, input.autoResumeCount),
     autoResumeEligible: input.autoResumeEligible,
+    strategyPivot: input.strategyPivot || null,
+    attemptedStrategyPivots: [...(input.attemptedStrategyPivots || [])],
+    remainingStrategyPivots: [...(input.remainingStrategyPivots || [])],
+    strategyPivotBudget: Math.max(
+      0,
+      Math.floor(Number(input.strategyPivotBudget) || PLAN_MAX_AUTO_RESUME_LIMIT),
+    ),
+    strategyCapability: input.strategyCapability || null,
     currentTask,
     remainingTasks: topLines(
       remaining.map(summarizeTask),
@@ -1157,18 +1309,45 @@ export function buildPlanExecutionProgressNotice(input: {
   return summarizePlanExecutionProgressSnapshot(snapshot, input.language);
 }
 
+function describeMaxIterationStrategyPivot(
+  checkpoint: PlanMaxIterationsCheckpoint,
+  language: "zh" | "en",
+): string {
+  const capability = checkpoint.strategyCapability || "any";
+  switch (checkpoint.strategyPivot) {
+    case "continue_contract":
+      return language === "zh"
+        ? `直接推进检查点要求的 ${capability} 能力，只执行一个最小必要动作`
+        : `advance the checkpoint's ${capability} capability with one smallest necessary action`;
+    case "reconcile_evidence":
+      return language === "zh"
+        ? "根据持久证据重新核对未完成目标，再选择尚未满足的最小动作"
+        : "reconcile durable evidence against the unfinished objective, then select its smallest unmet action";
+    case "bounded_alternative":
+      return language === "zh"
+        ? "改用尚未尝试的有限替代能力；若不可行则报告结构化阻塞"
+        : "use one untried bounded alternative capability, or report the structured blocker";
+    case "synthesize_completion":
+      return language === "zh"
+        ? "不再调用工具，根据完整证据生成最终结论"
+        : "make no more tool calls and synthesize the final answer from complete evidence";
+    default:
+      return language === "zh" ? "没有剩余策略" : "no strategy remains";
+  }
+}
+
 export function buildPlanMaxIterationsAutoResumeNotice(
   checkpoint: PlanMaxIterationsCheckpoint,
   language: "zh" | "en",
 ): string {
   return language === "zh"
     ? [
-        `计划执行达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保存检查点并自动开启 1 次恢复上下文。`,
-        "计划将继续执行；恢复上下文会重新读取当前 workspace 状态。",
+        `计划执行达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保存检查点并切换到差异化策略 ${checkpoint.autoResumeCount}/${checkpoint.strategyPivotBudget}。`,
+        `下一策略：${describeMaxIterationStrategyPivot(checkpoint, language)}。`,
       ].join("\n")
     : [
-        `Plan execution reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN saved a checkpoint and will auto-resume once in a fresh context.`,
-        "Plan execution will continue; the recovery context will reread the current workspace state.",
+        `Plan execution reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN saved a checkpoint and switched to differentiated strategy ${checkpoint.autoResumeCount}/${checkpoint.strategyPivotBudget}.`,
+        `Next strategy: ${describeMaxIterationStrategyPivot(checkpoint, language)}.`,
       ].join("\n");
 }
 
@@ -1189,13 +1368,15 @@ export function buildPlanMaxIterationsPauseNotice(
     return [
       `计划执行已暂停：连续第 ${checkpoint.iterationCount}/${checkpoint.maxIterations} 轮后仍未闭环。`,
       checkpoint.autoResumeEligible
-        ? "自上次获得新执行证据后，MAIN 已经自动恢复过一次；为避免无进展循环，这次停在可恢复状态。"
-        : "本轮没有检测到可信写入、命令或验收进展，MAIN 不会自动开启另一个循环。",
+        ? "仍存在未尝试的差异化策略，但恢复调度未能启动；当前停在可恢复状态。"
+        : "本证据 epoch 的差异化策略已经耗尽，MAIN 不会开启无界循环。",
       "",
       "RecoveryDetails:",
       `- reason: ${checkpoint.reason}`,
       `- autoResumeCount: ${checkpoint.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
       `- autoResumeEligible: ${checkpoint.autoResumeEligible}`,
+      `- strategyPivot: ${checkpoint.strategyPivot || "none"}`,
+      `- attemptedStrategyPivots: ${checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
       `- currentTask: ${checkpoint.currentTask}`,
       "- recentToolActivity:",
       ...(toolLines.length ? toolLines : ["- 无"]),
@@ -1213,13 +1394,15 @@ export function buildPlanMaxIterationsPauseNotice(
   return [
     `Plan execution paused after ${checkpoint.iterationCount}/${checkpoint.maxIterations} iterations without closure.`,
     checkpoint.autoResumeEligible
-      ? "MAIN has already auto-resumed once since the last fresh execution evidence, so it is stopping here to avoid a no-progress loop."
-      : "This run produced no trusted write, command, or validation progress, so MAIN will not start another automatic loop.",
+      ? "An untried differentiated strategy remains, but recovery dispatch could not start; the run is paused at its checkpoint."
+      : "The differentiated strategies for this evidence epoch are exhausted, so MAIN will not open an unbounded loop.",
     "",
     "RecoveryDetails:",
     `- reason: ${checkpoint.reason}`,
     `- autoResumeCount: ${checkpoint.autoResumeCount}/${PLAN_MAX_AUTO_RESUME_LIMIT}`,
     `- autoResumeEligible: ${checkpoint.autoResumeEligible}`,
+    `- strategyPivot: ${checkpoint.strategyPivot || "none"}`,
+    `- attemptedStrategyPivots: ${checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
     `- currentTask: ${checkpoint.currentTask}`,
     "- recentToolActivity:",
     ...(toolLines.length ? toolLines : ["- none"]),
@@ -1240,12 +1423,12 @@ export function buildExecuteMaxIterationsAutoResumeNotice(
 ): string {
   return language === "zh"
     ? [
-        `执行达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保存恢复点并自动开启 1 次恢复上下文。`,
-        "接下来会复用检查点与压缩记忆，并临时收窄工具面，避免重复同一批读取操作。",
+        `执行达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保存恢复点并切换到差异化策略 ${checkpoint.autoResumeCount}/${checkpoint.strategyPivotBudget}。`,
+        `下一策略：${describeMaxIterationStrategyPivot(checkpoint, language)}。`,
       ].join("\n")
     : [
-        `Execution reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN saved a recovery checkpoint and will auto-resume once in a fresh context.`,
-        "The recovery context will reuse the checkpoint plus compact memory and temporarily narrow tools to avoid repeating the same reads.",
+        `Execution reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN saved a recovery checkpoint and switched to differentiated strategy ${checkpoint.autoResumeCount}/${checkpoint.strategyPivotBudget}.`,
+        `Next strategy: ${describeMaxIterationStrategyPivot(checkpoint, language)}.`,
       ].join("\n");
 }
 
@@ -1291,6 +1474,86 @@ export function buildExecuteMaxIterationsPauseNotice(
   ].filter(Boolean).join("\n");
 }
 
+export function buildChatMaxIterationsAutoResumeNotice(
+  checkpoint: PlanMaxIterationsCheckpoint,
+  language: "zh" | "en",
+): string {
+  return language === "zh"
+    ? [
+        `对话达到 ${checkpoint.maxIterations} 轮安全边界，MAIN 已保留上下文并切换到有界策略 ${checkpoint.autoResumeCount}/${checkpoint.strategyPivotBudget}。`,
+        `下一策略：${describeMaxIterationStrategyPivot(checkpoint, language)}。`,
+      ].join("\n")
+    : [
+        `Conversation reached the ${checkpoint.maxIterations}-iteration safety boundary. MAIN retained the context and switched to bounded strategy ${checkpoint.autoResumeCount}/${checkpoint.strategyPivotBudget}.`,
+        `Next strategy: ${describeMaxIterationStrategyPivot(checkpoint, language)}.`,
+      ].join("\n");
+}
+
+export function buildChatMaxIterationsPauseNotice(
+  checkpoint: PlanMaxIterationsCheckpoint,
+  language: "zh" | "en",
+): string {
+  const repeatedTargets = summarizeRepeatedPlanTargetsFromToolActivity(
+    checkpoint.recentToolActivity,
+  );
+  if (language === "zh") {
+    return [
+      `对话已暂停：达到 ${checkpoint.iterationCount}/${checkpoint.maxIterations} 轮安全边界后，两种有界策略均未形成可交付答案。`,
+      "MAIN 已保留对话上下文和已有观察；这不是写入、验证或工具权限要求。",
+      "",
+      "RecoveryDetails:",
+      `- attemptedStrategyPivots: ${checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+      `- repeatedTargets: ${repeatedTargets.join(", ") || "none"}`,
+      checkpoint.lastAssistantText
+        ? `- partialAssistantText: ${checkpoint.lastAssistantText}`
+        : "- partialAssistantText: none",
+      "- nextStep: 继续时复用现有上下文，回答尚未闭环的问题；只有确有信息缺口时才做一次不同的有界观察。",
+    ].join("\n");
+  }
+  return [
+    `Conversation paused after ${checkpoint.iterationCount}/${checkpoint.maxIterations} iterations because both bounded strategies failed to produce a deliverable answer.`,
+    "MAIN retained the conversation context and observations; this does not impose mutation, validation, or tool-evidence requirements.",
+    "",
+    "RecoveryDetails:",
+    `- attemptedStrategyPivots: ${checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+    `- repeatedTargets: ${repeatedTargets.join(", ") || "none"}`,
+    checkpoint.lastAssistantText
+      ? `- partialAssistantText: ${checkpoint.lastAssistantText}`
+      : "- partialAssistantText: none",
+    "- nextStep: On continuation, reuse retained context and answer the unresolved question; make one different bounded observation only if information is genuinely missing.",
+  ].join("\n");
+}
+
+export function buildChatMaxIterationsResumePrompt(input: {
+  language: "zh" | "en";
+  runtimeIntent: string;
+  checkpoint: PlanMaxIterationsCheckpoint;
+}): string {
+  const synthesizeOnly = input.checkpoint.strategyPivot === "synthesize_completion";
+  if (input.language === "zh") {
+    return [
+      "继续同一用户问题，并保持原来的对话意图；达到轮次边界不会把回答任务转换成执行任务。",
+      `- originalRuntimeIntent: ${input.runtimeIntent}`,
+      `- selectedStrategyPivot: ${input.checkpoint.strategyPivot || "none"}`,
+      `- attemptedStrategyPivots: ${input.checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+      synthesizeOnly
+        ? "- strategy: 不调用工具。只使用已保留的对话和观察，直接给出自洽的最终回答；明确说明仍未知的部分，不得编造。"
+        : "- strategy: 仅在确有信息缺口时使用一次尚未尝试、且与重复路径实质不同的有界观察，然后立即回答用户；不得重复同一工具、目标和参数。",
+      "- completion: 输出面向用户的答案或具体外部/权限/上下文阻塞，不要求写入、mutation 或 validation 证据。",
+    ].join("\n");
+  }
+  return [
+    "Continue the same user question with its original conversational intent; reaching an iteration boundary must not convert an answer task into an execution task.",
+    `- originalRuntimeIntent: ${input.runtimeIntent}`,
+    `- selectedStrategyPivot: ${input.checkpoint.strategyPivot || "none"}`,
+    `- attemptedStrategyPivots: ${input.checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+    synthesizeOnly
+      ? "- strategy: Make no tool calls. Use only retained conversation and observations to deliver a coherent final answer; state what remains unknown without inventing facts."
+      : "- strategy: Only if information is genuinely missing, make one bounded observation using an untried capability materially different from the repeated path, then answer immediately; do not repeat the same tool, target, and arguments.",
+    "- completion: Return a user-facing answer or a concrete external, permission, or context blocker. Mutation and validation evidence are not required.",
+  ].join("\n");
+}
+
 export function buildExecuteMaxIterationsResumePrompt(input: {
   language: "zh" | "en";
   checkpoint: PlanMaxIterationsCheckpoint;
@@ -1308,6 +1571,9 @@ export function buildExecuteMaxIterationsResumePrompt(input: {
       "",
       "Checkpoint:",
       `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
+      `- selectedStrategyPivot: ${input.checkpoint.strategyPivot || "none"}`,
+      `- attemptedStrategyPivots: ${input.checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+      `- strategyInstruction: ${describeMaxIterationStrategyPivot(input.checkpoint, input.language)}`,
       input.checkpoint.lastAssistantText ? `- lastAssistantText: ${input.checkpoint.lastAssistantText}` : "",
       "",
       "最近工具活动：",
@@ -1323,6 +1589,9 @@ export function buildExecuteMaxIterationsResumePrompt(input: {
     "",
     "Checkpoint:",
     `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
+    `- selectedStrategyPivot: ${input.checkpoint.strategyPivot || "none"}`,
+    `- attemptedStrategyPivots: ${input.checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+    `- strategyInstruction: ${describeMaxIterationStrategyPivot(input.checkpoint, input.language)}`,
     input.checkpoint.lastAssistantText ? `- lastAssistantText: ${input.checkpoint.lastAssistantText}` : "",
     "",
     "Recent tool activity:",
@@ -1372,6 +1641,9 @@ export function buildPlanMaxIterationsResumePrompt(input: {
       "Checkpoint:",
       `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
       `- currentTask: ${input.checkpoint.currentTask}`,
+      `- selectedStrategyPivot: ${input.checkpoint.strategyPivot || "none"}`,
+      `- attemptedStrategyPivots: ${input.checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+      `- strategyInstruction: ${describeMaxIterationStrategyPivot(input.checkpoint, input.language)}`,
       input.checkpoint.lastAssistantText ? `- lastAssistantText: ${input.checkpoint.lastAssistantText}` : "",
       "",
       "计划文件摘要（仅内部计划状态）：",
@@ -1400,6 +1672,9 @@ export function buildPlanMaxIterationsResumePrompt(input: {
     "Checkpoint:",
     `- iterationBoundary: ${input.checkpoint.iterationCount}/${input.checkpoint.maxIterations}`,
     `- currentTask: ${input.checkpoint.currentTask}`,
+    `- selectedStrategyPivot: ${input.checkpoint.strategyPivot || "none"}`,
+    `- attemptedStrategyPivots: ${input.checkpoint.attemptedStrategyPivots.join(", ") || "none"}`,
+    `- strategyInstruction: ${describeMaxIterationStrategyPivot(input.checkpoint, input.language)}`,
     input.checkpoint.lastAssistantText ? `- lastAssistantText: ${input.checkpoint.lastAssistantText}` : "",
     "",
     "Plan artifact summary (internal plan state only):",

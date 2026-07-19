@@ -133,6 +133,8 @@ test("ChatArea omits the duplicated effective progress ledger", () => {
   const source = fsSync.readFileSync(path.join(workspaceRoot, "src/components/ChatArea.tsx"), "utf8");
 
   assert.match(source, /\{isTurnExpanded && shouldShowTurnActivityNotice && \(/);
+  assert.doesNotMatch(source, /getActiveTurnActivity|turn-activity-text|activityText=\{/);
+  assert.match(source, /shouldShowTurnActivityNotice =[\s\S]*Boolean\(bottomThoughtSummary\)/);
   assert.doesNotMatch(source, /data-testid="effective-progress-ledger"/);
   assert.doesNotMatch(source, /progressItems=\{effectiveProgressLedger\}/);
   assert.match(source, /data-testid="effective-progress-popover"/);

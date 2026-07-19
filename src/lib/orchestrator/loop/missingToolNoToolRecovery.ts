@@ -19,7 +19,13 @@ import {
   logAgentEvent,
 } from "../../orchestrator";
 import type { OrchestratorCallbacks } from "../types";
-import { isExecuteRuntimeRequiringEvidence, resolveExecuteNoToolCheckpointLimit } from "./executeNoToolRecovery";
+import {
+  applyExecuteNoToolStrategyPivot,
+  isExecuteRuntimeRequiringEvidence,
+  resolveExecuteNoToolCheckpointLimit,
+  resolveExecuteNoToolStrategyAtBoundary,
+  resolveProviderNeutralExecuteNoToolCheckpointLimit,
+} from "./executeNoToolRecovery";
 
 export type MissingToolNoToolRecoveryResult = {
   status: "none" | "continue" | "stopped";
@@ -168,9 +174,41 @@ export function handleMissingToolNoToolRecovery(input: {
     preservedVisibleText: hasMeaningfulVisibleText,
   });
 
-  if (consecutiveNoToolCount >= resolveExecuteNoToolCheckpointLimit(activeProfile)) {
+  const isExecuteRuntime = isExecuteRuntimeRequiringEvidence({
+    workflowMode,
+    turnIntent,
+    runtimeIntent,
+  });
+  const checkpointLimit = isExecuteRuntime
+    ? resolveProviderNeutralExecuteNoToolCheckpointLimit()
+    : resolveExecuteNoToolCheckpointLimit(activeProfile);
+  if (consecutiveNoToolCount >= checkpointLimit) {
+    if (isExecuteRuntime) {
+      const strategyDecision = resolveExecuteNoToolStrategyAtBoundary({
+        callbacks,
+        consecutiveNoToolCount,
+        checkpointLimit,
+        cause: hiddenThoughtOnlyNoToolStop
+          ? "hidden_thought_only"
+          : effectiveMissingToolKind,
+      });
+      if (strategyDecision.action === "continue_with_pivot") {
+        applyExecuteNoToolStrategyPivot({
+          callbacks,
+          decision: strategyDecision,
+          forceXmlTools,
+          assistantMsgId,
+          iteration,
+          cause: hiddenThoughtOnlyNoToolStop
+            ? "hidden_thought_only"
+            : effectiveMissingToolKind,
+          runtimeAlreadyPrepared: true,
+        });
+        return finish("continue");
+      }
+    }
     if (
-      isExecuteRuntimeRequiringEvidence({ workflowMode, turnIntent, runtimeIntent }) &&
+      isExecuteRuntime &&
       recentToolActivity.length >= 3 &&
       !sawExecuteOperationEvidence
     ) {

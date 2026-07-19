@@ -9,12 +9,25 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("capsule preserves model explanation while tools are folded", async ({ page }) => {
+test("assistant updates stay ordered in ChatArea while Capsule exposes only a high-level status", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-model-explanation");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
-  await expect(capsule).toContainText("保留这条模型说明");
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
+  await expect(capsule).not.toContainText("保留这条模型说明");
+  await expect(capsule).not.toContainText("ChatArea.tsx");
+  await expect(capsule).not.toContainText("read_file");
+  await expect(capsule).not.toContainText("暂无工具调用");
+  await expect(capsule).not.toContainText("tool:");
   await expect(capsule).not.toContainText("等待您的下一步指令");
+  const firstUpdate = page.getByText("已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。");
+  const secondUpdate = page.getByText("展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。");
+  await expect(firstUpdate).toHaveCount(1);
+  await expect(secondUpdate).toHaveCount(1);
+  await expect.poll(async () => firstUpdate.evaluate((first, secondText) => {
+    const second = Array.from(document.querySelectorAll("*")).find((node) => node.textContent === secondText);
+    return second ? Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) : false;
+  }, "展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。")).toBe(true);
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
 
@@ -62,7 +75,9 @@ test("capsule preserves model explanation while tools are folded", async ({ page
   await processDisclosure.click();
   await expect(processDisclosure).toHaveAttribute("aria-expanded", "false");
   await expect(timeline).toHaveCount(0);
-  await expect(capsule).toContainText("保留这条模型说明");
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
+  await expect(firstUpdate).toHaveCount(1);
+  await expect(secondUpdate).toHaveCount(1);
 
   await processDisclosure.click();
   await expect(timeline).toBeVisible();
@@ -74,6 +89,11 @@ test("capsule preserves model explanation while tools are folded", async ({ page
 
   await expect(page.getByTestId("live-turn-step")).toHaveCount(3);
   await expect(page.getByTestId("live-turn-process-details")).toContainText("运行回归测试确认折叠状态");
+
+  await page.reload();
+  await expect(page.getByText("已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。")).toHaveCount(1);
+  await expect(page.getByText("展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。")).toHaveCount(1);
+  await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("保留这条模型说明");
 });
 
 test("capsule progress fallback never shows idle waiting copy", async ({ page }) => {
@@ -81,17 +101,29 @@ test("capsule progress fallback never shows idle waiting copy", async ({ page })
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
-  const capsuleText = (await capsule.textContent()) || "";
-  expect(capsuleText).not.toContain("等待您的下一步指令");
-  expect(capsuleText).not.toContain("随时准备开始新的探索或修改");
-  expect(capsuleText.trim().length).toBeGreaterThan(0);
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
+  await expect(capsule).not.toContainText("ChatArea.tsx");
+  await expect(capsule).not.toContainText("grep_search");
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
 });
 
 test("turn process timeline stays inside its frame in a narrow viewport", async ({ page }) => {
-  await page.setViewportSize({ width: 760, height: 720 });
+  await page.setViewportSize({ width: 420, height: 720 });
   await page.goto("/?e2eScenario=capsule-model-explanation");
+
+  const statusLabel = page.getByTestId("capsule-status-label");
+  await expect(statusLabel).toHaveText("正在执行");
+  const statusMetrics = await statusLabel.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      whiteSpace: style.whiteSpace,
+      height: element.getBoundingClientRect().height,
+      lineHeight: Number.parseFloat(style.lineHeight),
+    };
+  });
+  expect(statusMetrics.whiteSpace).toBe("nowrap");
+  expect(statusMetrics.height).toBeLessThanOrEqual(statusMetrics.lineHeight + 1);
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();

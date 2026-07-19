@@ -43,7 +43,6 @@ import {
 } from "./evidenceRuntimeState";
 import {
   createExecuteRecoveryRuntimeState,
-  refundExecuteRecoveryRuntimeIteration,
   registerExecuteRecoveryProtocolNoProgress,
   transitionExecuteRecoveryRuntimeState,
   type ExecuteRecoveryRuntimeState,
@@ -663,6 +662,8 @@ export async function executeToolCallPhase(input: {
         ? observedReadResultRange(freshReadResult)
         : null,
       sourceObservedVersion: freshReadResult?.readFileObservation?.versionToken || null,
+      sourceObservationWasCacheStub:
+        freshReadResult?.readFileObservation?.source === "stub",
       sourceRangeWasRuntimeNarrowed: freshReadResult
         ? /^\s*READ_FILE_WINDOW_NARROWED\b/i.test(String(
             freshReadResult.displayContent || freshReadResult.content || "",
@@ -691,7 +692,10 @@ export async function executeToolCallPhase(input: {
       executeRecoveryAttempts: executeRecoveryState.attempts,
     });
   } else if (recoveryIterationBudgetNeutral) {
-    executeRecoveryState = refundExecuteRecoveryRuntimeIteration(recoveryTransition.state);
+    // Policy deferrals, internal feedback, unchanged cache stubs, and passive
+    // PTY observations are not execution progress. Keep the iteration debit so
+    // they cannot refresh the recovery budget indefinitely.
+    executeRecoveryState = recoveryTransition.state;
     const protocolFingerprint = buildRecoveryProtocolNoProgressFingerprint(
       executeRecoveryState,
       allResults,
@@ -709,7 +713,7 @@ export async function executeToolCallPhase(input: {
       iteration: input.iteration,
       fingerprints: protocolFingerprint.readProgress,
     });
-    logAgentEvent("execute_recovery_phase_budget_preserved", {
+    logAgentEvent("execute_recovery_no_progress_recorded", {
       iteration: input.iteration,
       mode: executeRecoveryState.mode,
       reason: "policy_deferral_cache_stub_or_pty_observation",

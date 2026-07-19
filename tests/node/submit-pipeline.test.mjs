@@ -1849,6 +1849,47 @@ test("visible turn patch appends user blocks to reused turns without duplicating
   assert.deepEqual(patch.conversationTurns[0].blockIds, [1, 2]);
 });
 
+test("approved Plan execution keeps the reused turn's logical Plan identity", () => {
+  const existingTurn = turn({
+    id: "turn-plan",
+    blockIds: [1],
+    status: "awaiting_approval",
+    intent: "plan",
+    displayIntent: "plan",
+    mode: "plan",
+  });
+  const patch = buildSubmitVisibleTurnPatch({
+    taskFlow: [
+      { id: 1, turnId: "turn-plan", type: "user", content: "先制定计划" },
+    ],
+    conversationTurns: [existingTurn],
+    text: "执行计划",
+    turnId: "turn-plan",
+    userBlockId: 2,
+    isHidden: false,
+    reuseCurrentTurn: true,
+    parentPlanTurnDoneSummary: "done",
+    isInternalTurn: false,
+    shouldExplicitlyReuseCurrentTurn: true,
+    shouldAutoResumeChoiceTurn: false,
+    currentTurnHasReplyOptions: false,
+    effectiveRunIntent: "execute",
+    effectiveDisplayIntent: "execute",
+    effectiveIntentSummary: "执行已批准计划",
+    effectiveCommandDirective: null,
+    effectiveWorkflowMode: "edit",
+    initialTurnStatus: "executing",
+    turnTitle: "执行计划",
+    createdAtMs: 457,
+  });
+
+  assert.equal(patch.conversationTurns.length, 1);
+  assert.equal(patch.conversationTurns[0].intent, "plan");
+  assert.equal(patch.conversationTurns[0].displayIntent, "execute");
+  assert.equal(patch.conversationTurns[0].mode, "plan");
+  assert.equal(patch.conversationTurns[0].status, "executing");
+});
+
 test("visible turn patch creates hidden internal turns without user blocks", () => {
   const parentTurn = turn({
     id: "parent",

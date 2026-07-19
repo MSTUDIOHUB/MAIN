@@ -234,6 +234,8 @@ export function resolveIterationToolSurface(input: {
   iteration: number;
   workflowMode: "chat" | "edit" | "plan";
   runtimeIntent: ResolvedUserIntent;
+  /** Formal turn authorization; recovery must not infer mutation authority from prose. */
+  turnIntent?: ResolvedUserIntent;
   rawIterationAllTools: ToolDefinition[];
   executeRecoveryMode: ExecuteRecoveryMode;
   executeRecoveryReason: string;
@@ -259,6 +261,7 @@ export function resolveIterationToolSurface(input: {
     iteration,
     workflowMode,
     runtimeIntent,
+    turnIntent = runtimeIntent,
     rawIterationAllTools,
     executeRecoveryMode,
     executeRecoveryReason,
@@ -286,8 +289,14 @@ export function resolveIterationToolSurface(input: {
     ),
   );
   const isExecuteRecoveryEligible =
-    workflowMode === "edit" &&
-    isMutationRuntimeIntent(runtimeIntent) &&
+    (
+      (workflowMode === "edit" && isMutationRuntimeIntent(runtimeIntent)) ||
+      (
+        workflowMode === "chat" &&
+        isMutationRuntimeIntent(turnIntent) &&
+        executeRecoveryReason.startsWith("chat_repair_strategy_pivot:")
+      )
+    ) &&
     executeRecoveryMode !== "normal";
   const pendingSubagentCount = callbacks.getPendingSubagentIds?.().length || 0;
   const recoveryActionContract = resolveExecuteRecoveryActionContract(executeRecoveryMode, {

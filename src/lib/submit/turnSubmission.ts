@@ -2337,10 +2337,14 @@ export function buildSubmitVisibleTurnPatch(
 
   const updateExistingTurn = (turn: ConversationTurn): ConversationTurn =>
     turn.id === params.turnId
-      ? {
+      ? (() => {
+          const preservePlanIdentity =
+            turn.intent === "plan" &&
+            params.effectiveRunIntent === "execute";
+          return {
           ...turn,
           status: params.initialTurnStatus,
-          intent: params.effectiveRunIntent,
+          intent: preservePlanIdentity ? "plan" : params.effectiveRunIntent,
           displayIntent: params.effectiveDisplayIntent,
           intentSummary: turn.intentSummary || params.effectiveIntentSummary,
           commandDirective: turn.commandDirective || params.effectiveCommandDirective || undefined,
@@ -2348,11 +2352,12 @@ export function buildSubmitVisibleTurnPatch(
             turn.pendingOperationProposal,
             params.operationProposalChoiceAction,
           ),
-          mode: params.effectiveWorkflowMode,
+          mode: preservePlanIdentity ? "plan" : params.effectiveWorkflowMode,
           ...(userBlock && !turn.blockIds.includes(userBlock.id)
             ? { blockIds: [...turn.blockIds, userBlock.id] }
             : {}),
-        }
+          };
+        })()
       : turn;
 
   if (params.reuseCurrentTurn) {

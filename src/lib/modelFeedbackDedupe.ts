@@ -62,6 +62,10 @@ export function isThinModelToolNarration(text: string): boolean {
   const raw = String(text || "").trim();
   const normalized = raw.replace(/\s+/g, "");
   if (!normalized || normalized.length > 280) return false;
+  const hasMaterialFindingOrDecision =
+    /(?:(?:已经|已)(?:确认|发现|定位|验证|证明|排除).{0,48}(?:根因|原因|问题|行为|边界|状态|结果|约束|方案|取舍|决策)|(?:根因|原因|结论|结果|决策|取舍|约束)(?:是|为|在于|来自|显示|表明|：|:))/.test(normalized) ||
+    /\b(?:(?:confirmed|found|located|verified|proved|ruled out).{0,80}(?:root cause|cause|issue|behavior|boundary|state|result|constraint|approach|decision)|(?:root cause|conclusion|result|decision|trade-?off|constraint)\s*(?:is|was|:|shows?|indicates?))\b/i.test(raw);
+  if (hasMaterialFindingOrDecision) return false;
   const futureToolNarration =
     /(?:^|[。,，；;！!？?：:])(?:我(?:会|將|将|先|现在|正在|继续)|让我|接下来|现在|继续|正在).{0,56}(?:读取|查看|检查|搜索|调查|执行|运行|调用|写入|修改|验证|整理|完成)/.test(normalized) ||
     /(?:continuingto|i(?:'|’)llread|iwillread|iread|readcomplete|searchcomplete|runningcommand)/i.test(normalized);

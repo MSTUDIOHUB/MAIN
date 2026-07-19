@@ -5239,12 +5239,22 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
     ? "e2e-capsule-model-explanation-turn"
     : "e2e-capsule-progress-only-turn";
   const userBlockId = useAppStore.getState()._nextTaskId();
+  const firstUpdateId = useAppStore.getState()._nextTaskId();
   const readToolId = useAppStore.getState()._nextTaskId();
   const commandToolId = useAppStore.getState()._nextTaskId();
+  const secondUpdateId = useAppStore.getState()._nextTaskId();
   const runningToolId = useAppStore.getState()._nextTaskId();
   const capsuleText = "我会保留这条模型说明，并在工具执行时继续围绕 capsule 链路排查。";
   const taskFlow: any[] = [
     { id: userBlockId, turnId, type: "user" as const, content: "继续排查 capsule 和工具折叠。" },
+    ...(kind === "model" ? [{
+      id: firstUpdateId,
+      turnId,
+      type: "agent" as const,
+      content: "已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。",
+      visibility: "assistant_update" as const,
+      streaming: false,
+    }] : []),
     {
       id: readToolId,
       turnId,
@@ -5269,6 +5279,14 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       intentSummary: "运行回归测试确认折叠状态",
       observationSummary: "验证命令已完成。",
     },
+    ...(kind === "model" ? [{
+      id: secondUpdateId,
+      turnId,
+      type: "agent" as const,
+      content: "展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。",
+      visibility: "assistant_update" as const,
+      streaming: false,
+    }] : []),
     {
       id: runningToolId,
       turnId,

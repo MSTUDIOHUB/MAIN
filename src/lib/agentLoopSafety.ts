@@ -249,15 +249,14 @@ export function buildEmptyModelResponsePauseNotice(input: {
   language: "zh" | "en";
   emptyResponses: number;
   repeatedTargets?: string[];
+  /** @deprecated Empty-output diagnosis is capability-based, not profile-based. */
   localProfile?: boolean;
 }): string {
   const targets = input.repeatedTargets?.filter(Boolean) || [];
   if (input.language === "zh") {
     return [
       `模型本轮已返回 ${input.emptyResponses} 次空响应，没有产生可见正文或工具调用。`,
-      input.localProfile
-        ? "这通常是本地模型在长上下文或 XML 工具协议下的空补全/预填充兼容问题。"
-        : "这通常是网关或上游模型返回空补全。MAIN 已保留当前上下文。",
+      "当前请求在已有上下文和工具协议下没有产生可用输出。MAIN 已保留当前上下文。",
       targets.length ? `最近重复目标：${targets.join("、")}` : "最近重复目标：未定位到单一目标",
       "下一步：继续时请先复用已读上下文，要求模型直接总结、换一个明确目标，或说明具体阻塞。",
     ].join("\n");
@@ -265,9 +264,7 @@ export function buildEmptyModelResponsePauseNotice(input: {
 
   return [
     `The model returned ${input.emptyResponses} empty responses in this turn without visible text or tool calls.`,
-    input.localProfile
-      ? "This usually indicates a local-model empty-completion/prefill compatibility issue under long context or XML tools."
-      : "This usually indicates an empty completion from the gateway or upstream model. MAIN preserved the current context.",
+    "The current request produced no usable output under the retained context and tool contract. MAIN preserved the current context.",
     targets.length ? `Recent repeated targets: ${targets.join(", ")}` : "Recent repeated targets: none isolated",
     "Next: resume by reusing cached context and asking for a direct summary, a different concrete target, or the exact blocker.",
   ].join("\n");

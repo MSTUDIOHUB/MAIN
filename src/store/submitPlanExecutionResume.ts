@@ -1,6 +1,10 @@
 import { looksLikeExistingPlanExecutionRequest, type CommandDirective } from "../lib/runIntent";
-import type { PlanArtifact, PlanExecutionEvidenceEntry, PlanStage, PlanTask } from "../lib/workflowModels";
+import { getHarnessActionRunId, type HarnessRunMarker } from "../lib/harnessCrashTelemetry";
+import { getReviewablePlanArtifacts } from "../lib/planApprovalIdentity";
+import { resolveRestoredPlanExecutionTaskIdentity } from "../lib/planExecutionRecovery";
+import type { PlanArtifact, PlanExecutionEvidenceEntry, PlanExecutionProgressSnapshot, PlanStage, PlanTask } from "../lib/workflowModels";
 import { buildPlanTaskEvidenceAudit } from "../lib/workflowModels";
+import { evaluateApprovedPlanExecutionReadiness } from "./submitApprovedPlanExecution";
 
 type SubmitPlanExecutionResumeSet = (patchOrUpdater: any) => void;
 
@@ -11,6 +15,10 @@ export interface SubmitPlanExecutionResumeState {
   planTasks: PlanTask[];
   planStage: PlanStage;
   planExecutionEvidenceLedger: PlanExecutionEvidenceEntry[];
+  planExecutionProgressSnapshot?: PlanExecutionProgressSnapshot | null;
+  harnessRunMarker?: HarnessRunMarker | null;
+  isPlanApproved: boolean;
+  conversationTurns: Array<{ id: string; userPrompt?: string }>;
 }
 
 export interface SubmitPlanExecutionResumeOptions {
@@ -52,6 +60,10 @@ export interface RunSubmitPlanExecutionResumeEffectInput<TState extends SubmitPl
     options: SubmitPlanExecutionResumeOptions,
   ) => void;
   logStoreEvent: (event: string, data?: Record<string, unknown>) => void;
+  onResumeBlocked?: (message: string, detail: {
+    reason: string;
+    qualityReason?: string | null;
+  }) => void;
 }
 
 export function buildTrustedPlanResumePrompt(input: {
@@ -148,10 +160,7 @@ export async function runSubmitPlanExecutionResumeEffect<TState extends SubmitPl
     | null = null;
 
   if (shouldHydrateExistingPlan) {
-    const alreadyHydrated =
-      latest.planArtifacts.length > 0 ||
-      latest.planTasks.length > 0 ||
-      latest.planStage !== "idle";
+    const alreadyHydrated = getReviewablePlanArtifacts(latest.planArtifacts).length > 0;
     const hydrated = alreadyHydrated
       ? {
           artifacts: latest.planArtifacts,
@@ -169,11 +178,6 @@ export async function runSubmitPlanExecutionResumeEffect<TState extends SubmitPl
     input.setState({
       planArtifacts: hydrated.artifacts,
       planTasks: hydrated.tasks,
-      isPlanApproved: true,
-      planApprovalChoice: input.text.trim() || null,
-      planStage: "executing",
-      planAutoResumeCount: 0,
-      planExecutionProgressSnapshot: null,
       showPlanPanel: true,
       rightPanelTab: "plan",
       showDiff: false,
@@ -195,12 +199,98 @@ export async function runSubmitPlanExecutionResumeEffect<TState extends SubmitPl
     input.setState({ planTasks: resumePlanTasks });
     latest = input.getState();
   }
+  const executionReadiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: latest.planArtifacts,
+    executionPlanTasks: resumePlanTasks.length > 0 ? resumePlanTasks : latest.planTasks,
+  });
+  const continuationTurnId = input.uiParentTurnId || latest.currentTurnId || undefined;
+  const restoredTaskIdentity = resolveRestoredPlanExecutionTaskIdentity({
+    snapshot: latest.planExecutionProgressSnapshot,
+    tasks: resumePlanTasks.length > 0 ? resumePlanTasks : latest.planTasks,
+  });
+  const progressOwnerMismatch = Boolean(
+    latest.planExecutionProgressSnapshot &&
+    continuationTurnId &&
+    latest.planExecutionProgressSnapshot.turnId !== continuationTurnId
+  );
+  const progressRunId = String(latest.planExecutionProgressSnapshot?.runId || "").trim();
+  const markerRunId = getHarnessActionRunId(latest.harnessRunMarker);
+  const progressParentRunId = latest.planExecutionProgressSnapshot?.parentRunId || null;
+  const markerParentRunId = latest.harnessRunMarker?.activeParentRunId ||
+    latest.harnessRunMarker?.parentRunId ||
+    null;
+  const progressRunOwnerMismatch = Boolean(
+    progressRunId &&
+    (
+      !markerRunId ||
+      markerRunId !== progressRunId ||
+      markerParentRunId !== progressParentRunId ||
+      latest.harnessRunMarker?.turnId !== latest.planExecutionProgressSnapshot?.turnId
+    )
+  );
+  if (
+    !executionReadiness.ok ||
+    restoredTaskIdentity.ambiguous ||
+    progressOwnerMismatch ||
+    progressRunOwnerMismatch
+  ) {
+    const reason = !executionReadiness.ok
+      ? executionReadiness.reason || "plan_execution_materialization_failed"
+      : progressOwnerMismatch
+      ? "plan_resume_progress_owner_mismatch"
+      : progressRunOwnerMismatch
+      ? "plan_resume_progress_run_owner_mismatch"
+      : "ambiguous_plan_resume_task_identity";
+    const qualityReason = executionReadiness.qualityReason || null;
+    const message = input.preferredLanguage === "zh"
+      ? `现有计划未通过重新校验，已保留为审计记录并撤销执行批准（${qualityReason || reason}）。请修订或重新生成计划后再执行。`
+      : `The existing plan failed revalidation, so MAIN kept it as an audit record and revoked execution approval (${qualityReason || reason}). Revise or regenerate the plan before executing it.`;
+    input.setState({
+      isPlanApproved: false,
+      planApprovalChoice: null,
+      planStage: "plan",
+      planTasks: [],
+      planExecutionEvidenceLedger: [],
+      planExecutionEvidenceCount: 0,
+      planAutoResumeCount: 0,
+      planExecutionProgressSnapshot: null,
+      showPlanPanel: true,
+      rightPanelTab: "plan",
+      showDiff: false,
+    });
+    input.logStoreEvent("existing_plan_resume_revalidation_blocked", {
+      workspace: latest.currentWorkspace || null,
+      reason,
+      qualityReason,
+      ambiguousTaskIdentity: restoredTaskIdentity.ambiguous,
+      progressOwnerMismatch,
+      progressRunOwnerMismatch,
+    });
+    input.onResumeBlocked?.(message, { reason, qualityReason });
+    return;
+  }
+
+  input.setState({
+    isPlanApproved: true,
+    planApprovalChoice: input.text.trim() || null,
+    planStage: "executing",
+    planTasks: resumePlanTasks.length > 0 ? resumePlanTasks : latest.planTasks,
+    planAutoResumeCount: 0,
+    planExecutionProgressSnapshot: latest.planExecutionProgressSnapshot
+      ? {
+          ...latest.planExecutionProgressSnapshot,
+          ...(restoredTaskIdentity.currentTaskId
+            ? { currentTaskId: restoredTaskIdentity.currentTaskId }
+            : {}),
+        }
+      : null,
+  });
+  latest = input.getState();
   const hasTasksArtifact =
     (hydratedForExecution?.artifacts || latest.planArtifacts).some((artifact) => artifact.kind === "tasks") ||
     resumePlanTasks.length > 0 ||
     (hydratedForExecution?.tasks || latest.planTasks).length > 0;
 
-  const continuationTurnId = input.uiParentTurnId || latest.currentTurnId || undefined;
   input.resumeSubmission(
     buildTrustedPlanResumePrompt({
       language: input.preferredLanguage,

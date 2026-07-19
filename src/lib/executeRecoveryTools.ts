@@ -98,6 +98,11 @@ export interface RecoveryReadLease {
   observedVersion?: string | null;
   /** Stable identity of the patch failure that granted this one-shot read. */
   mismatchFingerprint?: string | null;
+  /**
+   * available: granted; active: the exact read is in flight; consumed: the
+   * one-shot lease is closed by a fresh observation or unchanged cache stub.
+   * Only a new mismatch or source-version epoch may grant another lease.
+   */
   state: "available" | "active" | "consumed";
 }
 
@@ -121,6 +126,12 @@ export interface ExecutionDecisionCheckpoint {
   evidenceVersion?: string | null;
   /** Approved Plan task that owns the current recovery transaction. */
   planTaskId?: string | null;
+  /**
+   * Provider-neutral no-progress strategies already attempted for this exact
+   * unfinished objective. A terminal pause is only valid after the bounded
+   * strategy set has been exhausted.
+   */
+  noProgressStrategyPivots?: ExecuteNoProgressStrategyPivot[];
   /** Stable requirement reference used for diagnostics and legacy task remapping. */
   requirementRef?: string | null;
   /** Exact finite validation that must succeed after the current repair. */
@@ -166,6 +177,108 @@ export interface ExecutionDecisionCheckpoint {
   browserLocatorCandidates?: string[];
   /** Exact browser target whose validation remains open. */
   browserRequestedUrl?: string | null;
+}
+
+export type ExecuteNoProgressStrategyPivot =
+  | "current_task_action_lock"
+  | "alternate_capability_reframe";
+
+export const EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS: readonly ExecuteNoProgressStrategyPivot[] = [
+  "current_task_action_lock",
+  "alternate_capability_reframe",
+];
+
+export type ExecuteNoProgressStrategyDecision =
+  | {
+      action: "continue_with_pivot";
+      strategy: ExecuteNoProgressStrategyPivot;
+      attemptedStrategies: ExecuteNoProgressStrategyPivot[];
+      prompt: string;
+    }
+  | {
+      action: "pause";
+      attemptedStrategies: ExecuteNoProgressStrategyPivot[];
+    };
+
+/**
+ * Choose the next bounded recovery strategy without consulting model or
+ * provider identity. The prompt carries only execution facts: the unfinished
+ * task, its locked target, the available capability surface, and the call
+ * pattern that must not be repeated.
+ */
+export function resolveExecuteNoProgressStrategyDecision(input: {
+  attemptedStrategies?: readonly ExecuteNoProgressStrategyPivot[] | null;
+  currentTaskId?: string | null;
+  expectedTarget?: string | null;
+  unfinishedObjective?: string | null;
+  availableToolNames?: Iterable<string> | null;
+  cause: string;
+  language: "zh" | "en";
+  /** False for read-only conversational work that must not inherit execution evidence requirements. */
+  requireExecutionEvidence?: boolean;
+}): ExecuteNoProgressStrategyDecision {
+  const attemptedStrategies = EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS.filter((strategy) =>
+    input.attemptedStrategies?.includes(strategy)
+  );
+  const strategy = EXECUTE_NO_PROGRESS_STRATEGY_PIVOTS.find((candidate) =>
+    !attemptedStrategies.includes(candidate)
+  );
+  if (!strategy) {
+    return { action: "pause", attemptedStrategies };
+  }
+
+  const nextAttempted = [...attemptedStrategies, strategy];
+  const task = input.currentTaskId?.trim() || "unidentified-current-task";
+  const target = input.expectedTarget?.trim() || "current-task-target";
+  const objective = input.unfinishedObjective?.trim() || "complete the current unfinished objective";
+  const capabilities = [...new Set(
+    [...(input.availableToolNames || [])]
+      .map((name) => String(name || "").trim())
+      .filter(Boolean),
+  )].sort();
+  const capabilityText = capabilities.join(", ") || "current recovery contract tools";
+  const requireExecutionEvidence = input.requireExecutionEvidence !== false;
+  const prompt = input.language === "zh"
+    ? [
+        "EXECUTE_NO_PROGRESS_STRATEGY_PIVOT:",
+        `- strategy: ${strategy}`,
+        `- cause: ${input.cause}`,
+        `- currentTaskId: ${task}`,
+        `- lockedTarget: ${target}`,
+        `- unfinishedObjective: ${objective}`,
+        `- availableCapabilities: ${capabilityText}`,
+        "- constraint: 复用已有观察；关闭重复读取，不得原样重放相同工具、目标和参数。",
+        strategy === "current_task_action_lock"
+          ? requireExecutionEvidence
+            ? "- nextAction: 聚焦当前任务，立即选择一个能产生写入或验证证据的动作。"
+            : "- nextAction: 聚焦当前问题，复用已有观察直接形成答案；确有信息缺口时只做一个新的有界观察。"
+          : requireExecutionEvidence
+          ? "- nextAction: 改用尚未尝试的能力或实质不同的参数/目标继续；若存在真实权限、外部或安全阻塞，结构化说明该阻塞。"
+          : "- nextAction: 改用尚未尝试的有界观察或实质不同的参数/目标，然后立即回答；若存在真实外部、权限或上下文阻塞，结构化说明该阻塞。",
+      ].join("\n")
+    : [
+        "EXECUTE_NO_PROGRESS_STRATEGY_PIVOT:",
+        `- strategy: ${strategy}`,
+        `- cause: ${input.cause}`,
+        `- currentTaskId: ${task}`,
+        `- lockedTarget: ${target}`,
+        `- unfinishedObjective: ${objective}`,
+        `- availableCapabilities: ${capabilityText}`,
+        "- constraint: Reuse retained observations; repeated reads are closed, and the same tool/target/arguments must not be replayed unchanged.",
+        strategy === "current_task_action_lock"
+          ? requireExecutionEvidence
+            ? "- nextAction: Stay on the current task and take an action that produces mutation or validation evidence now."
+            : "- nextAction: Stay on the current question and use retained observations to answer directly; make only one new bounded observation if information is genuinely missing."
+          : requireExecutionEvidence
+          ? "- nextAction: Continue with an untried capability or materially different arguments/target; if a real permission, external, or safety blocker exists, report it structurally."
+          : "- nextAction: Use one untried bounded observation or materially different arguments/target, then answer immediately; if a real external, permission, or context blocker exists, report it structurally.",
+      ].join("\n");
+  return {
+    action: "continue_with_pivot",
+    strategy,
+    attemptedStrategies: nextAttempted,
+    prompt,
+  };
 }
 
 export interface ReadProgressFingerprint {
@@ -303,10 +416,9 @@ const EXECUTE_RECOVERY_LONG_PROCESS_LAUNCH_CONTRACT_TOOLS = new Set([
   "execute_command",
 ]);
 
-const EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS = new Set([
-  ...EXECUTE_RECOVERY_MUTATION_TOOLS,
-  ...EXECUTE_RECOVERY_PATCH_READ_TOOLS,
-]);
+const EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS = new Set(
+  EXECUTE_RECOVERY_MUTATION_TOOLS,
+);
 
 const EXECUTE_RECOVERY_RECONCILE_SERVER_CONTRACT_TOOLS = new Set([
   ...EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS,
@@ -322,8 +434,8 @@ export const EXECUTE_RECOVERY_CORE_TOOLS = new Set([
 /**
  * One capability owns both the next action and its real schema surface. This
  * prevents a model from selecting a visible-but-guaranteed-to-be-deferred
- * tool for six rounds. Mutation deliberately retains read_file: version,
- * range, and context eligibility still decide whether that reread is useful.
+ * tool for six rounds. A consumed read lease closes read_file immediately;
+ * mutation never carries an ambient reread capability.
  */
 function resolveRecoveryAllowedToolNames(
   nextCapability: ExecuteRecoveryNextCapability,
@@ -1127,23 +1239,31 @@ export function resolveExecuteRecoveryBatchDecision(input: {
     call.name === "code_ast_query" ||
     call.name === "get_file_outline" ||
     EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name);
-  const scopedEligible = transactionTarget
-    ? eligible.filter((call) =>
+  const scopedCalls = transactionTarget
+    ? calls.filter((call) =>
         !isTargetScopedCall(call) ||
         workspacePathsReferToSameFile(call.target || "", transactionTarget)
       )
-    : eligible;
+    : calls;
+  const scopedEligible = eligible.filter((call) => scopedCalls.includes(call));
   // A malformed or partially streamed apply_patch may not expose a target yet.
   // If it is the only eligible mutation, let normal patch parsing and mutation
   // preflight return the precise error instead of silently deferring the call.
   const soleUnresolvedPatch =
     Boolean(transactionTarget) &&
-    eligible.length === 1 &&
-    eligible[0]?.name === "apply_patch" &&
-    /^(?:workspace patch)?$/i.test(String(eligible[0]?.target || "").trim());
-  const matchingMutation = scopedEligible.find((call) =>
-    EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)
-  ) || (soleUnresolvedPatch ? eligible[0] : undefined);
+    calls.length === 1 &&
+    calls[0]?.name === "apply_patch" &&
+    /^(?:workspace patch)?$/i.test(String(calls[0]?.target || "").trim());
+  // A concrete current-target mutation is already actionable and always wins
+  // over a read lease emitted in the same model batch. Normal permission and
+  // mutation-preflight checks still run after this serialization decision.
+  const mutationMayPreempt =
+    contract.nextRequiredCapability === "mutation" ||
+    contract.nextRequiredCapability === "targeted_read";
+  const matchingMutation = mutationMayPreempt
+    ? scopedCalls.find((call) => EXECUTE_RECOVERY_MUTATION_TOOLS.has(call.name)) ||
+      (soleUnresolvedPatch ? calls[0] : undefined)
+    : undefined;
   const matchingRead = scopedEligible.find((call) => call.name === "read_file");
   const matchingTargeting = scopedEligible.find((call) =>
     EXECUTE_RECOVERY_TARGETING_TOOLS.has(call.name)
@@ -1160,8 +1280,7 @@ export function resolveExecuteRecoveryBatchDecision(input: {
       case "targeting":
         return matchingTargeting;
       case "mutation":
-        // A targeted reread may refresh the exact observation before mutation.
-        return matchingMutation || matchingRead;
+        return matchingMutation;
       case "validation":
         return matchingValidation;
       case "launch_long_process":
@@ -1189,9 +1308,10 @@ export function resolveExecuteRecoveryBatchDecision(input: {
         return undefined;
     }
   })();
-  // Joining an already-running child releases its scope lease; it is the one
-  // housekeeping exception to the action capability selected by the contract.
-  const selected = matchingJoin || matchingNextCapability;
+  // The current transaction action always wins. Coordination is a fallback
+  // only when the phase capability is absent; it must not starve a mutation or
+  // the one precise leased read emitted in the same model batch.
+  const selected = matchingMutation || matchingNextCapability || matchingJoin;
   return {
     active: true,
     phase,

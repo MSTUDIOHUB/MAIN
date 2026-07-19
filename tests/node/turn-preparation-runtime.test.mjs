@@ -124,6 +124,32 @@ test("Goal turn intake uses the canonical objective instead of an internal conti
   assert.equal(debugEvents[0].payload.goalObjectiveChars, objective.length);
 });
 
+test("chat repair recovery requires formal mutation intent instead of lexical repair wording", () => {
+  const baseCallbacks = {
+    getSessionKey: () => "chat-repair-authorization",
+    getMainModeKey: () => "agent",
+  };
+  const denied = resolveAgentLoopTurnInputContext(baseRuntimeState({
+    turnIntent: "respond",
+    workflowMode: "chat",
+    initialMessages: [{
+      role: "user",
+      content: "请分析这个问题，但不要修改或修复任何文件。",
+    }],
+  }), baseCallbacks);
+  const authorized = resolveAgentLoopTurnInputContext(baseRuntimeState({
+    turnIntent: "execute",
+    workflowMode: "chat",
+    initialMessages: [{
+      role: "user",
+      content: "请找到这个问题并修复相关文件。",
+    }],
+  }), baseCallbacks);
+
+  assert.equal(denied.repairExecutionRequestInChat, false);
+  assert.equal(authorized.repairExecutionRequestInChat, true);
+});
+
 test("turn preparation start hooks are a no-op when hooks are disabled", async () => {
   const events = [];
   const callbacks = {
