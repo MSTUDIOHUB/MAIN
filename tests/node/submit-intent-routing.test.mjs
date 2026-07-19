@@ -68,6 +68,7 @@ function createHarness(overrides = {}) {
     preferredLanguage: "zh",
     options: {},
     currentMainModeKey: "main_mode",
+    hasWorkspace: false,
     parsedStudioCommand: null,
     isHidden: false,
     autoApproveTools: false,
@@ -199,6 +200,34 @@ test("submit intent routing starts blocking preflight for ambiguous chat executi
   assert.equal(harness.calls.preflights[0].request.mainModeKey, "main_mode");
   assert.equal(harness.calls.preflights[0].sendOriginSessionKey, "workspace::7");
   assert.deepEqual(harness.calls.preRunPatches, []);
+});
+
+test("workspace submissions continue into Turn creation without pre-turn intent gates", () => {
+  const harness = createHarness({
+    text: "我希望加一个设置按钮",
+    hasWorkspace: true,
+  });
+  const result = harness.resolve();
+
+  assert.equal(result.handled, false);
+  assert.equal(result.effectiveRunIntent, "execute");
+  assert.equal(result.effectiveCommandDirective.kind, "file_modify");
+  assert.deepEqual(harness.calls.preRunPatches, []);
+  assert.deepEqual(harness.calls.preflights, []);
+  assert.equal(harness.calls.logs[0].event, "workspace_turn_intent_resolved");
+});
+
+test("complex workspace submissions enter Plan without a pre-turn decision", () => {
+  const harness = createHarness({
+    text: "生成一套游戏框架代码包括文件夹，实现完整的回合制战斗系统。",
+    hasWorkspace: true,
+  });
+  const result = harness.resolve();
+
+  assert.equal(result.handled, false);
+  assert.equal(result.effectiveRunIntent, "plan");
+  assert.deepEqual(harness.calls.preRunPatches, []);
+  assert.deepEqual(harness.calls.preflights, []);
 });
 
 test("hidden skip-intent control prompts do not infer shell directives from embedded commands", () => {

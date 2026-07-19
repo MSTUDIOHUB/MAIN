@@ -39,6 +39,7 @@ export interface SubmitIntentRoutingInput<
   preferredLanguage: "zh" | "en";
   options?: TOptions;
   currentMainModeKey: MainModeKey;
+  hasWorkspace: boolean;
   parsedStudioCommand: PendingSlashCommand | null;
   isHidden: boolean;
   autoApproveTools: boolean;
@@ -217,6 +218,7 @@ export function resolveAndApplySubmitIntentRouting<
     const reuseResolution = resolveTurnRunIntent(input.text, {
       language: input.preferredLanguage,
       mainModeKey: input.currentMainModeKey,
+      hasWorkspace: input.hasWorkspace,
       parsedStudioCommand: input.parsedStudioCommand,
       hasPlanArtifacts: input.hasPlanArtifacts,
       planStage: input.planStage,
@@ -232,7 +234,7 @@ export function resolveAndApplySubmitIntentRouting<
       (reuseLooksLikeExecutionIntent &&
         (reuseResolution.riskLevel === "high" || reuseResolution.intent === "plan"));
 
-    if (shouldRequestPlanDecision) {
+    if (shouldRequestPlanDecision && !input.hasWorkspace) {
       if (consumeDecisionSuppression()) {
         applyDecisionSuppressedFallback(
           "reuse_resolution",
@@ -297,6 +299,7 @@ export function resolveAndApplySubmitIntentRouting<
       : resolveTurnRunIntent(input.text, {
           language: input.preferredLanguage,
           mainModeKey: input.currentMainModeKey,
+          hasWorkspace: input.hasWorkspace,
           parsedStudioCommand: input.parsedStudioCommand,
           hasPlanArtifacts: input.hasPlanArtifacts,
           planStage: input.planStage,
@@ -311,6 +314,16 @@ export function resolveAndApplySubmitIntentRouting<
     });
     effectiveCommandDirective =
       resolution.commandDirective || inferCommandDirective(input.text, resolution.intent);
+
+    if (input.hasWorkspace) {
+      input.logStoreEvent("workspace_turn_intent_resolved", {
+        intent: resolution.intent,
+        riskLevel: resolution.riskLevel,
+        confidence: resolution.confidence,
+        controlAction: resolution.controlAction ?? null,
+        inputChars: input.text.trim().length,
+      });
+    }
 
     if (resolution.controlAction === "approve_plan") {
       input.applyPreRunSessionPatch({
@@ -344,7 +357,7 @@ export function resolveAndApplySubmitIntentRouting<
       return { handled: true, returnValue: true };
     }
 
-    if (resolution.needsDecision) {
+    if (resolution.needsDecision && !input.hasWorkspace) {
       if (consumeDecisionSuppression()) {
         applyDecisionSuppressedFallback(
           "resolution",
@@ -366,34 +379,38 @@ export function resolveAndApplySubmitIntentRouting<
       }
     }
 
-    const executionApprovalDecision = resolveSubmitExecutionApprovalDecision({
-      text: input.text,
-      images: input.images,
-      preferredLanguage: input.preferredLanguage,
-      resolution,
-      effectiveCommandDirective,
-      isLocalFastStudioCommand: input.isLocalFastStudioCommand,
-    });
-    if (executionApprovalDecision.pendingRunDecision) {
-      input.applyPreRunSessionPatch({
-        pendingRunDecision: executionApprovalDecision.pendingRunDecision,
+    if (!input.hasWorkspace) {
+      const executionApprovalDecision = resolveSubmitExecutionApprovalDecision({
+        text: input.text,
+        images: input.images,
+        preferredLanguage: input.preferredLanguage,
+        resolution,
+        effectiveCommandDirective,
+        isLocalFastStudioCommand: input.isLocalFastStudioCommand,
       });
-      return { handled: true, returnValue: true };
+      if (executionApprovalDecision.pendingRunDecision) {
+        input.applyPreRunSessionPatch({
+          pendingRunDecision: executionApprovalDecision.pendingRunDecision,
+        });
+        return { handled: true, returnValue: true };
+      }
     }
 
-    const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
-      resolution,
-      currentMainModeKey: input.currentMainModeKey,
-      text: input.text,
-      images: input.images,
-      options: input.options,
-      preferredLanguage: input.preferredLanguage,
-      currentConfig: input.currentConfig,
-      sendOriginSessionKey: input.sendOriginSessionKey,
-    });
-    if (blockingPreflightEffect) {
-      input.startBlockingPreflight(blockingPreflightEffect);
-      return { handled: true, returnValue: true };
+    if (!input.hasWorkspace) {
+      const blockingPreflightEffect = buildSubmitBlockingPreflightEffect({
+        resolution,
+        currentMainModeKey: input.currentMainModeKey,
+        text: input.text,
+        images: input.images,
+        options: input.options,
+        preferredLanguage: input.preferredLanguage,
+        currentConfig: input.currentConfig,
+        sendOriginSessionKey: input.sendOriginSessionKey,
+      });
+      if (blockingPreflightEffect) {
+        input.startBlockingPreflight(blockingPreflightEffect);
+        return { handled: true, returnValue: true };
+      }
     }
 
     effectiveRunIntent = resolution.intent;

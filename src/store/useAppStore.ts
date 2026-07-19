@@ -9003,6 +9003,7 @@ export const useAppStore = create<AppState>()(
       images,
       options,
       currentMainModeKey,
+      hasWorkspace: !!state.currentWorkspace?.trim(),
       parsedStudioCommand,
       isHidden,
       autoApproveTools: state.autoApproveTools,

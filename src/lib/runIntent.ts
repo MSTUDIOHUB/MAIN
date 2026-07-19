@@ -131,6 +131,12 @@ export type ExecutionConsentPolicy = "ask_per_turn" | "auto_thread";
 export interface ResolveTurnRunIntentContext {
   language?: "zh" | "en";
   mainModeKey: MainModeKey;
+  /**
+   * A visible message submitted while a workspace is attached is always a
+   * workflow Turn. Semantic intent still controls the capability surface; it
+   * must not be used as a pre-Turn chat/task gate.
+   */
+  hasWorkspace?: boolean;
   parsedStudioCommand?: PendingSlashCommand | null;
   hasPlanArtifacts: boolean;
   planStage:
@@ -1487,6 +1493,7 @@ export function resolveTurnRunIntent(
   context: ResolveTurnRunIntentContext,
 ): RunIntentResolution {
   const language = context.language === "en" ? "en" : "zh";
+  const isWorkspaceTurn = context.hasWorkspace === true;
   const normalizedInput = normalizeInput(input);
   const finalize = (resolution: Parameters<typeof finalizeRunIntentResolution>[2]) =>
     finalizeRunIntentResolution(input, context, resolution);
@@ -1566,11 +1573,15 @@ export function resolveTurnRunIntent(
 
   if (matchesAny(normalizedInput, STRONG_REPORT_PATTERNS)) {
     return finalize({
-      intent: "respond",
+      intent: isWorkspaceTurn ? "report" : "respond",
       reason: localizeReason(
         language,
-        "检测到报告输出语义，但未使用 /报告；本轮保持自然回复并让模型按请求组织内容。",
-        "Detected report wording without /report; this turn stays in natural response while following the requested format.",
+        isWorkspaceTurn
+          ? "检测到工作区报告请求；本轮进入只读报告流程。"
+          : "检测到报告输出语义，但未使用 /报告；本轮保持自然回复并让模型按请求组织内容。",
+        isWorkspaceTurn
+          ? "Detected a workspace report request, so this turn enters the read-only report workflow."
+          : "Detected report wording without /report; this turn stays in natural response while following the requested format.",
       ),
       confidence: 0.86,
       bypassMainRouter: false,
@@ -1584,28 +1595,40 @@ export function resolveTurnRunIntent(
 
   if (context.mainModeKey === "main_mode" && hasStrongSummarizeSignal && hasStrongExecuteSignal) {
     return finalize({
-      intent: "respond",
+      intent: isWorkspaceTurn ? "execute" : "respond",
       reason: localizeReason(
         language,
-        "同时检测到总结与真实操作信号；真实操作需要先得到用户批准。",
-        "Detected both summary and real-operation signals; real operations require user approval first.",
+        isWorkspaceTurn
+          ? "同时检测到总结与真实操作信号；工作区回合进入执行流程，具体高风险工具仍按调用审批。"
+          : "同时检测到总结与真实操作信号；真实操作需要先得到用户批准。",
+        isWorkspaceTurn
+          ? "Detected both summary and real-operation signals. The workspace turn enters execution while risky tools remain approval-gated at call time."
+          : "Detected both summary and real-operation signals; real operations require user approval first.",
       ),
       confidence: 0.9,
       bypassMainRouter: false,
       riskLevel: "medium",
-      needsDecision: true,
-      suggestedIntent: "execute",
-      decisionOptions: ["execute", "respond", "summarize"],
+      ...(isWorkspaceTurn
+        ? {}
+        : {
+            needsDecision: true,
+            suggestedIntent: "execute" as const,
+            decisionOptions: ["execute", "respond", "summarize"] as ResolvedUserIntent[],
+          }),
     });
   }
 
   if (hasStrongSummarizeSignal) {
     return finalize({
-      intent: "respond",
+      intent: isWorkspaceTurn ? "summarize" : "respond",
       reason: localizeReason(
         language,
-        "检测到总结语义，但未使用 /总结；本轮保持自然回复并按请求提炼内容。",
-        "Detected summary wording without /summarize; this turn stays in natural response while summarizing as requested.",
+        isWorkspaceTurn
+          ? "检测到工作区总结请求；本轮进入只读总结流程。"
+          : "检测到总结语义，但未使用 /总结；本轮保持自然回复并按请求提炼内容。",
+        isWorkspaceTurn
+          ? "Detected a workspace summary request, so this turn enters the read-only summary workflow."
+          : "Detected summary wording without /summarize; this turn stays in natural response while summarizing as requested.",
       ),
       confidence: 0.86,
       bypassMainRouter: false,
@@ -1629,11 +1652,15 @@ export function resolveTurnRunIntent(
 
   if (hasStrongAnalyzeSignal) {
     return finalize({
-      intent: "respond",
+      intent: isWorkspaceTurn ? "analyze" : "respond",
       reason: localizeReason(
         language,
-        "检测到分析/检查语义，但未使用 /分析；本轮保持自然回复并可进行必要的只读检查。",
-        "Detected analysis wording without /analyze; this turn stays in natural response and may use read-only inspection.",
+        isWorkspaceTurn
+          ? "检测到工作区分析/检查请求；本轮进入只读分析流程。"
+          : "检测到分析/检查语义，但未使用 /分析；本轮保持自然回复并可进行必要的只读检查。",
+        isWorkspaceTurn
+          ? "Detected a workspace analysis or inspection request, so this turn enters the read-only analysis workflow."
+          : "Detected analysis wording without /analyze; this turn stays in natural response and may use read-only inspection.",
       ),
       confidence: 0.86,
       bypassMainRouter: false,
@@ -1643,11 +1670,15 @@ export function resolveTurnRunIntent(
 
   if (matchesAny(normalizedInput, STRONG_PLAN_PATTERNS)) {
     return finalize({
-      intent: "respond",
+      intent: isWorkspaceTurn ? "plan" : "respond",
       reason: localizeReason(
         language,
-        "检测到方案/规划语义，但未使用 /计划；本轮保持自然回复并在形成方案后跟踪是否执行。",
-        "Detected planning wording without /plan; this turn stays in natural response and will track execution follow-up if a proposal is produced.",
+        isWorkspaceTurn
+          ? "检测到工作区方案/规划请求；本轮进入正式计划流程。"
+          : "检测到方案/规划语义，但未使用 /计划；本轮保持自然回复并在形成方案后跟踪是否执行。",
+        isWorkspaceTurn
+          ? "Detected a workspace planning request, so this turn enters the formal planning workflow."
+          : "Detected planning wording without /plan; this turn stays in natural response and will track execution follow-up if a proposal is produced.",
       ),
       confidence: 0.86,
       bypassMainRouter: false,
@@ -1658,18 +1689,26 @@ export function resolveTurnRunIntent(
   const complexImplementationMatches = countPatternMatches(normalizedInput, COMPLEX_IMPLEMENTATION_PATTERNS);
   if (complexImplementationMatches >= 2) {
     return finalize({
-      intent: "respond",
+      intent: isWorkspaceTurn ? "plan" : "respond",
       reason: localizeReason(
         language,
-        "检测到多文件/架构级实现请求；真实操作或正式计划都需要用户选择后继续。",
-        "Detected a multi-file or architecture-level implementation request; real operations or formal planning require the user to choose first.",
+        isWorkspaceTurn
+          ? "检测到多文件/架构级工作区任务；本轮先进入正式计划流程，源码写入仍需计划批准。"
+          : "检测到多文件/架构级实现请求；真实操作或正式计划都需要用户选择后继续。",
+        isWorkspaceTurn
+          ? "Detected a multi-file or architecture-level workspace task. This turn enters formal planning first, and source writes still require plan approval."
+          : "Detected a multi-file or architecture-level implementation request; real operations or formal planning require the user to choose first.",
       ),
       confidence: 0.93,
       bypassMainRouter: false,
       riskLevel: "high",
-      needsDecision: true,
-      suggestedIntent: "plan",
-      decisionOptions: ["plan", "respond", "execute"],
+      ...(isWorkspaceTurn
+        ? {}
+        : {
+            needsDecision: true,
+            suggestedIntent: "plan" as const,
+            decisionOptions: ["plan", "respond", "execute"] as ResolvedUserIntent[],
+          }),
     });
   }
 
@@ -1701,6 +1740,28 @@ export function resolveTurnRunIntent(
     });
   }
 
+  if (isWorkspaceTurn && looksLikeAmbiguousChatExecutionInput(normalizedInput)) {
+    return finalize({
+      intent: "execute",
+      reason: localizeReason(
+        language,
+        "检测到工作区中的功能新增或修改请求；本轮进入执行流程，实际变更仍由工具调用审批约束。",
+        "Detected a feature addition or modification request in the workspace. This turn enters execution while actual changes remain tool-approval gated.",
+      ),
+      confidence: 0.9,
+      bypassMainRouter: false,
+      riskLevel: "medium",
+      commandDirective: createCommandDirective("file_modify", {
+        source: "natural_language",
+        action: "workspace_file_change",
+        requiresWorkspace: true,
+        requiresApproval: true,
+        confidence: 0.9,
+        reason: "Workspace feature modification intent detected.",
+      }),
+    });
+  }
+
   if (matchesAny(normalizedInput, WEAK_PLAN_PATTERNS)) {
     return finalize({
       intent: "respond",
@@ -1723,18 +1784,26 @@ export function resolveTurnRunIntent(
   }
   if (riskMatches >= 2) {
     return finalize({
-      intent: "respond",
+      intent: isWorkspaceTurn ? "plan" : "respond",
       reason: localizeReason(
         language,
-        "这条请求涉及较多阶段或系统，MAIN 建议先确认是否进入计划阶段，再决定是否直接实施。",
-        "This request spans multiple phases or systems. MAIN should confirm whether to plan first before implementing.",
+        isWorkspaceTurn
+          ? "这条工作区请求涉及多个阶段或系统；本轮先进入正式计划流程。"
+          : "这条请求涉及较多阶段或系统，MAIN 建议先确认是否进入计划阶段，再决定是否直接实施。",
+        isWorkspaceTurn
+          ? "This workspace request spans multiple phases or systems, so the turn enters formal planning first."
+          : "This request spans multiple phases or systems. MAIN should confirm whether to plan first before implementing.",
       ),
       confidence: 0.82,
       bypassMainRouter: false,
       riskLevel: "high",
-      needsDecision: true,
-      suggestedIntent: "plan",
-      decisionOptions: ["plan", "respond", "execute"],
+      ...(isWorkspaceTurn
+        ? {}
+        : {
+            needsDecision: true,
+            suggestedIntent: "plan" as const,
+            decisionOptions: ["plan", "respond", "execute"] as ResolvedUserIntent[],
+          }),
     });
   }
 

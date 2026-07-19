@@ -89,6 +89,7 @@ function createContext(overrides = {}) {
   return {
     language: "zh",
     mainModeKey: "main_mode",
+    hasWorkspace: false,
     parsedStudioCommand: null,
     hasPlanArtifacts: false,
     planStage: "idle",
@@ -107,6 +108,44 @@ test("plain Chinese planning wording stays natural without slash lock", () => {
   const result = resolveTurnRunIntent("先给我一个方案再实现", createContext());
   assert.equal(result.intent, "respond");
   assert.equal(result.needsDecision, undefined);
+});
+
+test("workspace planning wording enters a formal Plan turn without a slash command", () => {
+  const result = resolveTurnRunIntent(
+    "先给我一个方案再实现",
+    createContext({ hasWorkspace: true }),
+  );
+  assert.equal(result.intent, "plan");
+  assert.equal(result.needsDecision, undefined);
+});
+
+test("workspace output-style requests retain explicit read-only intent", () => {
+  const cases = [
+    ["请仔细检查验证这段指令通信链路", "analyze"],
+    ["请总结一下这次排查结论", "summarize"],
+    ["请整理成分析报告", "report"],
+  ];
+  for (const [input, expectedIntent] of cases) {
+    const result = resolveTurnRunIntent(input, createContext({ hasWorkspace: true }));
+    assert.equal(result.intent, expectedIntent, input);
+    assert.equal(result.needsDecision, undefined, input);
+  }
+});
+
+test("workspace implementation requests enter Turn semantics without a pre-turn choice", () => {
+  const complex = resolveTurnRunIntent(
+    "生成一套游戏框架代码包括文件夹，实现《歧路旅人》CTB回合制战斗逻辑。",
+    createContext({ hasWorkspace: true }),
+  );
+  assert.equal(complex.intent, "plan");
+  assert.equal(complex.needsDecision, undefined);
+
+  const feature = resolveTurnRunIntent(
+    "我希望加一个设置按钮",
+    createContext({ hasWorkspace: true }),
+  );
+  assert.equal(feature.intent, "execute");
+  assert.equal(feature.needsDecision, undefined);
 });
 
 test("plain English implementation request enters execute workflow", () => {

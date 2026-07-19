@@ -52,6 +52,13 @@ export interface ToolIntentFilterOptions {
 }
 
 const PLAN_DRAFT_WRITE_TOOL_NAMES = new Set(["write_file", "replace_in_file"]);
+const READ_ONLY_RUNTIME_INTENTS = new Set<ResolvedUserIntent>([
+  "respond",
+  "discuss",
+  "analyze",
+  "summarize",
+  "report",
+]);
 
 export interface McpRoutingConfig {
   enabled: boolean;
@@ -746,13 +753,18 @@ export function filterToolDefinitionsForIntent(
     const capability = registry.tools[name];
     if (capability && !capability.enabled) return false;
     const risk = capability?.risk ?? classifyBuiltInTool(name);
+    if (registry.policy.disabledRiskLevels.includes(risk)) return false;
 
     if (effectiveIntent === "plan") {
       if (PLAN_DRAFT_WRITE_TOOL_NAMES.has(name)) return true;
       return risk === "read_only" || risk === "external_read";
     }
 
-    return !registry.policy.disabledRiskLevels.includes(risk);
+    if (READ_ONLY_RUNTIME_INTENTS.has(effectiveIntent)) {
+      return risk === "read_only" || risk === "external_read";
+    }
+
+    return true;
   });
 }
 
