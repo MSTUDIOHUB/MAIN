@@ -12,8 +12,6 @@ sourceFeature: "公开 Releases、应用内检查更新、About 设置页"
 
 MAIN 的公开安装包通过 GitHub Releases 分发，应用内也提供手动检查更新入口。
 
-<!-- screenshot: docs/main-manual/assets/install-update-about.png -->
-
 ## 适用场景
 
 - 第一次在 macOS 或 Windows 上安装 MAIN。
@@ -28,7 +26,7 @@ MAIN 的公开安装包通过 GitHub Releases 分发，应用内也提供手动�
 
 ## 步骤
 
-1. 打开 MAIN 官网或公开 GitHub Releases 页面。
+1. 打开 MAIN 官网或 [公开 GitHub Releases 页面](https://github.com/MSTUDIOHUB/MAIN-Releases/releases/latest)。
 2. 下载与你系统匹配的安装包。
 3. macOS 用户将应用拖入 Applications，首次打开时根据系统提示确认。
 4. Windows 用户运行安装包，或解压便携包后启动 MAIN。

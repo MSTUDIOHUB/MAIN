@@ -10,7 +10,7 @@ sourceFeature: "runMode、composer toolbar、Plan mode"
 
 # Chat / Plan / Fast
 
-工作方式决定 MAIN 的执行节奏：直接聊、先计划，或快速处理小任务。
+工作方式决定 MAIN 的执行策略：直接分析、先计划，或快速处理小任务。它不改变提交身份；在工作区会话中，Chat、Plan 和 Fast 的每次用户发送都先成为一个 Turn。
 
 ![输入框下方的工具栏用于选择场景、引用文件、添加附件、启用联网和自动审查。](assets/screenshots/composer-tools-row.png)
 
@@ -38,6 +38,7 @@ sourceFeature: "runMode、composer toolbar、Plan mode"
 - Chat 更偏讨论和分析。
 - Plan 会先给出可审阅计划。
 - Fast 会减少往返，适合小改动。
+- 三种工作方式都保存 Turn、工具证据和最终结论；Chat 不会绕过回合。
 
 ## 常见问题
 
@@ -49,6 +50,9 @@ Fast 仍受审批保护，但不适合模糊或高风险任务。
 
 **可以中途切换吗？**  
 可以。任务变复杂时，直接要求 MAIN 先整理计划。
+
+**Chat 不调用工具时还算一次运行吗？**
+算。它仍是一个 Turn，只是模型可能不需要本机工具；结束时仍会保存唯一结论。
 
 ## 下一步
 

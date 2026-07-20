@@ -153,8 +153,8 @@ Studio 包不会在用户只是“切换到模式”时就污染工作区。
 
 MAIN v1 没有依赖缺失的 `execute_skill` 后端能力，而是采用了下面这条链路：
 
-1. 输入 slash 命令
-2. 前端先做确定性解析
+1. 输入并发送 slash 命令；工作区会话先把它接纳为一个 Turn
+2. 前端做确定性解析
 3. 标准化为 canonical command
 4. 写入 `pendingSlashCommand`
 5. 生成隐式 command envelope
@@ -165,6 +165,8 @@ MAIN v1 没有依赖缺失的 `execute_skill` 后端能力，而是采用了下�
    - `.MAIN/rules` / `.MAIN/templates` / `.MAIN/hooks.json`
 
 所以，Game Studio 的执行入口仍然是 MAIN 自己的主 Agent 与编排器，只是被 Studio 协议包增强了。
+
+本地快速命令也必须生成可见结论；成功、错误和取消均写入唯一 `assistant_final`，局部 slash command 失败不会产生应用级 failed 终态。bridge 只在开始时捕获的 Turn、receipt 和 user-block 身份仍精确匹配时原位修复；若异步执行期间 adoption 已漂移，它保留原 Turn 并新建隔离的 presentation-recovery Turn/Run 展示结论，不会重跑命令。final、runtime outcome、`run.completed` 与 `turn.completed` 作为同一投影进入有界持久化屏障；保存不可用时明确降级为 temporary 内存结论。冷恢复不会自动重放 unresolved local-fast，而会形成可见隔离结论，用户可用新 Turn 重试。完整状态语义见 [运行时生命周期](RUNTIME_LIFECYCLE.md)。
 
 ## `/agent` 的粘性逻辑
 

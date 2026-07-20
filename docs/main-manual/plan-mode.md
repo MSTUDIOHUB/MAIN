@@ -12,8 +12,6 @@ sourceFeature: "PlanReviewBlock、PlanPanel、planLifecycle、.MAIN/plans"
 
 计划模式适合高影响任务：MAIN 先探索和写计划，你确认后再执行文件修改和验证。
 
-<!-- screenshot: docs/main-manual/assets/plan-mode-panel.png -->
-
 ## 适用场景
 
 - 多文件修改。

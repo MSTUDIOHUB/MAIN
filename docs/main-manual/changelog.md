@@ -12,7 +12,7 @@ sourceFeature: "docs/releases、公开 Release Notes、About update"
 
 MAIN 的公开版本说明保存在 `docs/releases/`，网站手册可以把这里作为更新日志索引页。
 
-<!-- screenshot: docs/main-manual/assets/changelog-release-notes.png -->
+版本说明记录发布当时的行为，不会随之后的重构回写。它们不能替代当前架构或运行时契约；相关边界请先阅读 [Release Notes Archive 说明](../releases/README.md)。
 
 ## 适用场景
 
@@ -29,27 +29,34 @@ MAIN 的公开版本说明保存在 `docs/releases/`，网站手册可以把这�
 
 当前仓库已有这些公开版本说明：
 
-- `docs/releases/Release_Notes_2.2.4_ZH.md`
-- `docs/releases/Release_Notes_2.2.3_ZH.md`
-- `docs/releases/Release_Notes_2.2.2_ZH.md`
-- `docs/releases/Release_Notes_2.2.1_ZH.md`
-- `docs/releases/Release_Notes_2.2.0_ZH.md`
-- `docs/releases/Release_Notes_2.1.9_ZH.md`
-- `docs/releases/Release_Notes_2.0.8_ZH.md`
-- `docs/releases/Release_Notes_2.0.6_ZH.md`
-- `docs/releases/Release_Notes_2.0.3_ZH.md`
-- `docs/releases/Release_Notes_1.6.7_ZH.md`
-- `docs/releases/Release_Notes_1.6.6_ZH.md`
-- `docs/releases/Release_Notes_1.6.5_ZH.md`
-- `docs/releases/Release_Notes_1.6.3_ZH.md`
-- `docs/releases/Release_Notes_1.6.2_ZH.md`
-- `docs/releases/Release_Notes_1.6.1_ZH.md`
-- `docs/releases/Release_Notes_1.6.0_ZH.md`
-- `docs/releases/Release_Notes_1.5.9_ZH.md`
-- `docs/releases/Release_Notes_1.5.8_ZH.md`
-- `docs/releases/Release_Notes_1.5.7_ZH.md`
-- `docs/releases/Release_Notes_1.5.5_ZH.md`
-- `docs/releases/Release_Notes_1.5.0_ZH.md`
+- [2.3.2](../releases/Release_Notes_2.3.2_ZH.md)
+- [2.3.1](../releases/Release_Notes_2.3.1_ZH.md)
+- [2.3.0](../releases/Release_Notes_2.3.0_ZH.md)
+- [2.2.9](../releases/Release_Notes_2.2.9_ZH.md)
+- [2.2.8](../releases/Release_Notes_2.2.8_ZH.md)
+- [2.2.6](../releases/Release_Notes_2.2.6_ZH.md)
+- [2.2.5](../releases/Release_Notes_2.2.5_ZH.md)
+- [2.2.4](../releases/Release_Notes_2.2.4_ZH.md)
+- [2.2.3](../releases/Release_Notes_2.2.3_ZH.md)
+- [2.2.2](../releases/Release_Notes_2.2.2_ZH.md)
+- [2.2.1](../releases/Release_Notes_2.2.1_ZH.md)
+- [2.2.0](../releases/Release_Notes_2.2.0_ZH.md)
+- [2.1.9](../releases/Release_Notes_2.1.9_ZH.md)
+- [2.0.8](../releases/Release_Notes_2.0.8_ZH.md)
+- [2.0.6](../releases/Release_Notes_2.0.6_ZH.md)
+- [2.0.3](../releases/Release_Notes_2.0.3_ZH.md)
+- [1.6.7](../releases/Release_Notes_1.6.7_ZH.md)
+- [1.6.6](../releases/Release_Notes_1.6.6_ZH.md)
+- [1.6.5](../releases/Release_Notes_1.6.5_ZH.md)
+- [1.6.3](../releases/Release_Notes_1.6.3_ZH.md)
+- [1.6.2](../releases/Release_Notes_1.6.2_ZH.md)
+- [1.6.1](../releases/Release_Notes_1.6.1_ZH.md)
+- [1.6.0](../releases/Release_Notes_1.6.0_ZH.md)
+- [1.5.9](../releases/Release_Notes_1.5.9_ZH.md)
+- [1.5.8](../releases/Release_Notes_1.5.8_ZH.md)
+- [1.5.7](../releases/Release_Notes_1.5.7_ZH.md)
+- [1.5.5](../releases/Release_Notes_1.5.5_ZH.md)
+- [1.5.0](../releases/Release_Notes_1.5.0_ZH.md)
 
 ## 步骤
 

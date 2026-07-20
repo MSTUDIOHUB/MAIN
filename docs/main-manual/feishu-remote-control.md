@@ -12,8 +12,6 @@ sourceFeature: "IM Adapters、FeishuAdapterPanel、persistent approval"
 
 飞书远程控制允许你通过飞书机器人向 MAIN 发送任务，并在移动端或飞书会话中审批敏感操作。
 
-<!-- screenshot: docs/main-manual/assets/feishu-remote-control.png -->
-
 ## 适用场景
 
 - 离开电脑后继续给本地 MAIN 派发任务。

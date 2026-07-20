@@ -12,8 +12,6 @@ sourceFeature: "imageStudio、ImageGenerationCard、本地图片服务、HiDream
 
 图像工作室是 MAIN 的独立图片生成工作区，支持本地图片服务优先，也可使用 HiDream Web fallback。
 
-<!-- screenshot: docs/main-manual/assets/image-studio-empty-state.png -->
-
 ## 适用场景
 
 - 生成产品图、概念图、界面灵感图或视觉草稿。

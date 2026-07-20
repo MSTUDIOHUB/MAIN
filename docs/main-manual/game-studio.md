@@ -12,8 +12,6 @@ sourceFeature: "Game Studio、slash commands、49 agents、protocol package"
 
 Game Studio 是 MAIN 面向游戏开发的工作中枢，整合 slash 工作流、专业 Agent、模板、规则和引擎相关协议。
 
-<!-- screenshot: docs/main-manual/assets/game-studio-onboarding.png -->
-
 ## 适用场景
 
 - 启动一个新游戏概念。
@@ -74,6 +72,7 @@ Game Studio 是 MAIN 面向游戏开发的工作中枢，整合 slash 工作流�
 - 输入框支持 Studio slash 命令搜索。
 - 当前专家会以 chip 显示在输入区。
 - 初始化后，工作区出现 Studio 协议、模板和规则资产。
+- 本地快速 slash 的成功、错误或取消都会显示一条最终结论。如果执行期间原 Turn 身份已改变，MAIN 会用隔离的恢复 Turn 显示该结论，不会改写原 Turn 或重跑命令。若应用在结论落盘前中断，冷恢复会按 at-most-once 原则显示隔离错误，而不会自动重复可能已经发生的本地副作用；请用一条新指令明确重试。
 
 ## 常见问题
 

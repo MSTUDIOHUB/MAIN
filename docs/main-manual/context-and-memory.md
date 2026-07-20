@@ -12,8 +12,6 @@ sourceFeature: "contextWindow、contextTrim、sessionRecording、KnowledgeModal"
 
 MAIN 会在模型上下文有限的前提下管理会话历史、项目资料、工具结果和知识库检索，让长任务尽量保持连续。
 
-<!-- screenshot: docs/main-manual/assets/context-settings.png -->
-
 ## 适用场景
 
 - 长对话后模型开始忘记前文。

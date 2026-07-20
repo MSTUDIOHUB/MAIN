@@ -12,8 +12,6 @@ sourceFeature: "Sidebar Git menu、getGitStatus、getGitDiff、gitCommitAll、gi
 
 MAIN 可以在侧边栏显示工作区 Git 状态，并提供 Diff 预览、提交信息生成、commit、push 和创建分支入口。
 
-<!-- screenshot: docs/main-manual/assets/git-workflows-menu.png -->
-
 ## 适用场景
 
 - 审查 MAIN 刚刚产生的改动。

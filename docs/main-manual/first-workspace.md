@@ -1,11 +1,11 @@
 ---
 title: "第一个工作区"
 sidebarTitle: "第一个工作区"
-description: "打开项目文件夹，理解工作区、全局聊天和会话的关系。"
+description: "打开项目文件夹，理解工作区权限、会话和 Turn 的关系。"
 category: "getting-started"
 order: 40
 status: "draft"
-sourceFeature: "Workspace sidebar、global chat、session list"
+sourceFeature: "Workspace sidebar、session list、Workspace Turn admission"
 ---
 
 # 第一个工作区
@@ -33,6 +33,8 @@ sourceFeature: "Workspace sidebar、global chat、session list"
 3. 新建或选择聊天会话。
 4. 先发送只读任务，例如“阅读项目结构，不要修改文件”。
 5. 切换项目时，回到左侧工作区区域。
+
+发送后，这条消息会先成为当前工作区会话中的一个 Turn，再进入 Chat、Plan 或 Fast 策略。即使只是提问，也会保存一个可恢复且最终有结论的回合。
 
 ## 结果确认
 

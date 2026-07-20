@@ -1,7 +1,7 @@
 ---
 title: "故障排查"
 sidebarTitle: "故障排查"
-description: "排查模型、MCP、知识库、更新和命令执行问题。"
+description: "从 Turn 结论、工具证据和 Debug Log 排查任务问题。"
 category: "reference"
 order: 30
 status: "draft"
@@ -10,9 +10,7 @@ sourceFeature: "cloudAuthErrorHints、mcp diagnostics、debugLog、tool feedback
 
 # 故障排查
 
-遇到连接失败、工具失败或任务卡住时，先确认当前工作区、模型状态、审批状态和调试日志。
-
-<!-- screenshot: docs/main-manual/assets/troubleshooting-debug-log.png -->
+遇到连接失败、工具失败或任务卡住时，先确认当前工作区、Turn 结论、审批状态、模型状态和调试日志。工具失败不等于应用级失败；先找到第一条真正偏离预期的事件。
 
 ## 适用场景
 
@@ -30,12 +28,13 @@ sourceFeature: "cloudAuthErrorHints、mcp diagnostics、debugLog、tool feedback
 
 ## 步骤
 
-1. 先确认问题发生在哪一类能力：模型、工具、MCP、知识库、更新或命令。
-2. 打开对应设置页，检查当前状态。
-3. 使用测试连接、扫描工具或测试检索等内置检查入口。
-4. 查看对话区工具块和右侧终端输出。
-5. 打开 Debug Log，复制或导出最近错误。
-6. 调整配置后，用只读任务重新验证。
+1. 确认用户消息是否已经成为一个 Turn；工作区中的普通 Chat 也应有 Turn 身份和最终结论。
+2. 区分当前状态：暂停表示可续跑；受阻、错误、部分完成、取消或成功表示 Turn 已形成结论。
+3. 确认问题发生在哪一类能力：模型、工具、审批、持久化、MCP、网络、知识库、更新或命令。
+4. 查看对话区工具块和右侧终端，记录第一条非预期 tool result、exit code 或 timeout。
+5. 打开对应设置页，使用测试连接、扫描工具或测试检索等检查入口。
+6. 打开 Debug Log，按 session / turn / run / iteration 顺序导出相关片段。
+7. 调整配置后，用一个新的低风险 Turn 重新验证；不要仅凭最后一条包装错误判断根因。
 
 ## 常见问题处理
 
@@ -78,6 +77,18 @@ sourceFeature: "cloudAuthErrorHints、mcp diagnostics、debugLog、tool feedback
 3. 如果是 dev server 等长驻命令，确认它是否已经正常启动。
 4. 如果是测试或构建卡住，停止任务后让 MAIN 读取日志尾部并总结阻塞点。
 
+### Turn 长期显示执行中
+
+1. 查看是否存在等待中的审批卡片；有审批时应显示暂停或待处理状态。
+2. 检查最近 Run 是否只有取消诊断而缺少“已取消”结论；正常取消最终会显示一条 canceled 结论。
+3. 刷新或重启后确认同一用户消息没有重复生成 Turn 或最终答复。
+4. 导出 Debug Log，保留 `sessionKey`、`turnId`、`runId`、首次异常工具结果和最后事件。
+5. 不要通过手工删除项目文件修复生命周期问题。
+
+### 工具失败但 Turn 显示已结束
+
+这是合法状态。“已结束”只表示生命周期收口；请查看最终结论属于错误、受阻还是部分完成，并对照具体工具的 exit code、stderr、permission 或 network guard 证据。
+
 ### 更新失败
 
 1. 打开 `Settings > About`。
@@ -88,6 +99,7 @@ sourceFeature: "cloudAuthErrorHints、mcp diagnostics、debugLog、tool feedback
 ## 结果确认
 
 - 每个问题都应能定位到配置、网络、权限、工具协议或外部服务状态。
+- 每个工作区 Turn 最终应只有一个可读结论；暂停时应保留明确恢复条件。
 - 调整后用低风险任务验证。
 - 无法解决时，导出 Debug Log，并保留当前模型、Endpoint 类型和出错步骤。
 
@@ -107,3 +119,4 @@ sourceFeature: "cloudAuthErrorHints、mcp diagnostics、debugLog、tool feedback
 - 阅读 [设置参考](settings-reference.md)，找到对应设置项。
 - 阅读 [工具参考](tools-reference.md)，理解工具失败类型。
 - 阅读 [本地模型](local-models.md)、[云端模型](cloud-models.md) 或 [MCP 服务器](mcp.md)，回到具体配置页。
+- 深入排障可查看 [运行时生命周期](../RUNTIME_LIFECYCLE.md)、[Session 持久化](../SESSION_PERSISTENCE.md) 和 [测试、Trace 与 Replay](../TESTING_AND_REPLAY.md)。

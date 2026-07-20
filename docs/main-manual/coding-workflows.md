@@ -12,8 +12,6 @@ sourceFeature: "工程实现场景、文件工具、终端工具、Diff 审查"
 
 MAIN 可以在你的项目中阅读代码、定位问题、提出方案、修改文件并运行验证命令。
 
-<!-- screenshot: docs/main-manual/assets/coding-workflow-diff.png -->
-
 ## 适用场景
 
 - 修复报错或测试失败。

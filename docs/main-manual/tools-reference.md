@@ -12,8 +12,6 @@ sourceFeature: "toolSchemas、toolExecutor、runtimeTools、MCP tools、knowledg
 
 MAIN 的工具让 Agent 能够观察项目、修改文件、执行命令、检索资料、验证页面并调用外部服务。
 
-<!-- screenshot: docs/main-manual/assets/tools-reference-blocks.png -->
-
 ## 适用场景
 
 - 想知道 MAIN 能自动做什么。

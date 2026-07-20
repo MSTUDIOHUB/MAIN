@@ -9,6 +9,16 @@ npm install
 npm run tauri dev
 ```
 
+## 现行运行时契约
+
+- [架构与唯一所有权](docs/ARCHITECTURE.md)
+- [Run / Turn 生命周期](docs/RUNTIME_LIFECYCLE.md)
+- [Session 持久化与 Workspace Turn 接纳](docs/SESSION_PERSISTENCE.md)
+- [Rust 受信任执行边界](docs/TRUSTED_EXECUTION.md)
+- [测试、Trace 与 Replay](docs/TESTING_AND_REPLAY.md)
+
+历史 Release Notes 只记录当时版本，不能覆盖上述现行契约。
+
 ## 打包
 
 ```bash
@@ -20,16 +30,14 @@ npm run build:windows
 
 - `npm run icon:app` 会使用 `public/LogoM.png` 重新生成应用图标。
 - `npm run build:mac:unsigned` 用于本地验证未签名的 macOS 包。
-- `npm run build:mac` 用于正式签名的 macOS 包。
+- `npm run build:mac` 使用当前 Tauri / Apple signing 配置生成 app 与 dmg；只有证书、公证配置和验收都通过后才能视为正式分发包。
 - `npm run build:windows` 需要在 Windows 机器或 Windows CI 上执行，并显式生成 Windows 11 x64 产物。
 
-默认产物位于 `src-tauri/target/release/bundle/`。
+产物目录取决于目标平台与 target；以构建命令输出和发布脚本校验结果为准。
 
 ## 发布说明
 
-详细的 macOS 签名、公证和 Windows 打包说明见 `docs/Release_Guide_ZH.md`。
-
-闭源主仓库构建、公开 Releases 仓库只发布 `.zip` 的 GitHub Actions 流程见 `docs/Public_Releases_Distribution_Guide_ZH.md`。
+闭源主仓库、双公开仓库、签名、GitHub Actions 与本地发布的现行流程见 [桌面打包与公开发布指南](docs/Release_Guide_ZH.md)。
 
 Actions 额度用完时可以改走本地发布：
 

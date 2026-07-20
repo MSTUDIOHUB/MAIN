@@ -35,7 +35,7 @@
           "path": "first-workspace.md",
           "title": "第一个工作区",
           "sidebarTitle": "第一个工作区",
-          "description": "打开项目文件夹，理解工作区、全局聊天和会话的关系。"
+          "description": "打开项目文件夹，理解工作区权限、会话和 Turn 的关系。"
         }
       ]
     },
@@ -57,21 +57,21 @@
           "path": "run-modes.md",
           "title": "Chat / Plan / Fast",
           "sidebarTitle": "工作方式",
-          "description": "选择合适的执行节奏，让 MAIN 用正确的方式处理任务。"
+          "description": "选择执行策略；工作区中的 Chat、Plan 和 Fast 都以 Turn 运行。"
         },
         {
           "slug": "agent-loop",
           "path": "agent-loop.md",
           "title": "Agent 如何工作",
           "sidebarTitle": "Agent 循环",
-          "description": "了解 MAIN 如何读取上下文、调用工具、执行命令并整理结果。"
+          "description": "了解一次 Turn 如何读取上下文、调用工具、暂停续跑并形成结论。"
         },
         {
           "slug": "permissions-and-approval",
           "path": "permissions-and-approval.md",
           "title": "权限与审批",
           "sidebarTitle": "权限与审批",
-          "description": "理解 ActionCard、Diff 审查、命令审批和自动批准。"
+          "description": "理解用户审批与 Rust 最终安全校验的双重边界。"
         },
         {
           "slug": "context-and-memory",
@@ -93,7 +93,7 @@
           "path": "workspaces-and-sessions.md",
           "title": "工作区与会话",
           "sidebarTitle": "工作区与会话",
-          "description": "管理多个项目、全局聊天和历史会话。"
+          "description": "管理工作区、历史会话和可恢复的任务回合。"
         },
         {
           "slug": "coding-workflows",
@@ -114,7 +114,7 @@
           "path": "terminal-and-tools.md",
           "title": "终端与工具",
           "sidebarTitle": "终端与工具",
-          "description": "使用集成终端、文件工具、文档表格分析和浏览器验证。"
+          "description": "使用经过工作区、命令与进程回收校验的终端和工具。"
         },
         {
           "slug": "git-workflows",
@@ -214,7 +214,7 @@
           "path": "troubleshooting.md",
           "title": "故障排查",
           "sidebarTitle": "故障排查",
-          "description": "排查模型、MCP、知识库、更新和命令执行问题。"
+          "description": "从 Turn 结论、工具证据和 Debug Log 排查任务问题。"
         },
         {
           "slug": "changelog",

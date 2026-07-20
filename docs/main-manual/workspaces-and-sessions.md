@@ -1,24 +1,28 @@
 ---
 title: "工作区与会话"
 sidebarTitle: "工作区与会话"
-description: "管理多个项目、全局聊天和历史会话。"
+description: "管理工作区、历史会话和可恢复的任务回合。"
 category: "use-main"
 order: 10
 status: "draft"
-sourceFeature: "Sidebar、sessionsByWorkspace、GLOBAL_CHAT_KEY、FilePanel"
+sourceFeature: "Sidebar、sessionsByWorkspace、Workspace Turn admission、FilePanel"
 ---
 
 # 工作区与会话
 
-工作区决定 MAIN 可以访问哪个项目；会话决定同一个工作区内的上下文和任务历史。
-
-<!-- screenshot: docs/main-manual/assets/workspaces-sessions.png -->
+工作区决定 MAIN 可以访问哪个项目；会话保存同一个工作区内的上下文、任务回合和恢复状态。
 
 ## 适用场景
 
 - 同时处理多个项目。
 - 为不同任务保留不同对话历史。
 - 在不需要项目文件时使用全局聊天。
+
+## 工作区中的每次发送
+
+在工作区会话里，每次点击发送都会先被接纳为一个 Turn，然后才判断采用 Chat、Plan、Fast、工具或本地命令。普通问答也不会绕过 Turn。
+
+Turn 会保存用户消息、执行证据和最终结论。重复提交同一个客户端请求不会创建两个 Turn；连续发送的不同请求则按会话顺序处理。应用重启或切换会话后，已持久化但尚未执行完的请求可以从原身份恢复。
 
 ## 前置条件
 
@@ -31,14 +35,16 @@ sourceFeature: "Sidebar、sessionsByWorkspace、GLOBAL_CHAT_KEY、FilePanel"
 2. 选择项目文件夹。
 3. 在工作区下创建新会话。
 4. 给每个任务使用独立会话，例如“修复登录 bug”和“整理发布说明”分开。
-5. 需要临时问答时进入全局聊天。
-6. 不再需要的会话可以从侧边栏删除。
-7. 如果工作区列表太长，可以折叠不常用项目。
+5. 在同一会话连续发送时，观察上一 Turn 是已结束、等待审批还是已暂停；后续提交不会越过仍被占用的队头。
+6. 不需要项目上下文的临时问答可以进入全局聊天。全局聊天不是工作区 Turn 接纳的例外，而是没有工作区文件权限的另一种会话范围。
+7. 不再需要的会话可以从侧边栏删除。
+8. 如果工作区列表太长，可以折叠不常用项目。
 
 ## 结果确认
 
 - 每个工作区有独立会话列表。
 - 切换会话后，中间对话区恢复对应上下文。
+- 工作区中的每条用户消息都归属于一个可追踪 Turn，并最终显示成功、部分完成、受阻、错误或取消结论。
 - 当前工作区会影响文件面板、终端命令和 Git 状态。
 - 全局聊天不会默认读取某个项目文件夹。
 
@@ -53,8 +59,15 @@ sourceFeature: "Sidebar、sessionsByWorkspace、GLOBAL_CHAT_KEY、FilePanel"
 **为什么有些旧会话标题看起来被自动生成？**  
 MAIN 会根据任务内容生成标题，方便在侧边栏快速识别。
 
+**停止生成后为什么仍显示一条结论？**
+取消不是丢弃回合。MAIN 会停止当前运行并把 Turn 收口为“已取消”，避免历史记录长期停在执行中。
+
+**“运行已暂停”是不是失败？**
+不是。暂停表示正在等待审批、外部条件或明确续跑；它会保留目标和进度。真正结束时会显示该 Turn 的最终结论。
+
 ## 下一步
 
 - 阅读 [第一个工作区](first-workspace.md)，完成首次添加。
 - 阅读 [代码工作流](coding-workflows.md)，让 MAIN 在工作区内执行任务。
 - 阅读 [Git 工作流](git-workflows.md)，查看工作区改动。
+- 开发与排障人员可查看 [运行时生命周期](../RUNTIME_LIFECYCLE.md) 和 [Session 持久化](../SESSION_PERSISTENCE.md)。
