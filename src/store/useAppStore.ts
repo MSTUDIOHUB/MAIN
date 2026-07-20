@@ -6962,7 +6962,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         // Remove streaming flag (transient UI state) — keep content (string)
         const publicProgress = b.publicProgress &&
           b.publicProgress.schemaVersion === 1 &&
-          b.publicProgress.kind === "assistant_commentary" &&
+          (b.publicProgress.kind === "assistant_commentary" || b.publicProgress.kind === "capsule_activity") &&
           b.publicProgress.source === "model_visible_content" &&
           String(b.publicProgress.sessionKey || "").trim() &&
           String(b.publicProgress.turnId || "").trim() &&
@@ -6970,7 +6970,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           String(b.publicProgress.runId || "").trim()
             ? {
                 schemaVersion: 1 as const,
-                kind: "assistant_commentary" as const,
+                kind: b.publicProgress.kind,
                 source: "model_visible_content" as const,
                 sessionKey: String(b.publicProgress.sessionKey).trim(),
                 turnId: String(b.publicProgress.turnId).trim(),

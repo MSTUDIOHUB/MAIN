@@ -21,7 +21,10 @@ import {
   compactThoughtContentForPersist,
   pickProcessAssistantText,
 } from "../thoughtCompaction";
-import { resolveStreamingAssistantDisplay } from "../streamDisplayPolicy";
+import {
+  resolveStreamingAssistantDisplay,
+  shouldProjectStreamingAssistantToCapsule,
+} from "../streamDisplayPolicy";
 import {
   makeTurnRuntimePhase,
   normalizeTurnRuntimePhase,
@@ -39,7 +42,10 @@ import {
   type ProviderCompatibilityRuntimeLaneState,
 } from "../sessionTypes";
 import type { TaskBlock } from "../taskTypes";
-import { stripAssistantPublicProgress } from "../assistantPublicProgress";
+import {
+  buildPublicAssistantProgressIdentity,
+  stripAssistantPublicProgress,
+} from "../assistantPublicProgress";
 import type { AttachedFile } from "../attachments";
 import type { FeishuRemoteContext } from "../remoteContextTypes";
 import type { StudioConfig as GameStudioConfig } from "../gameStudio/catalog";
@@ -2001,7 +2007,33 @@ export class WorkflowEngine {
             } else {
               const blockId = sessionGet()._nextTaskId();
               context.currentStreamingBlockId = blockId;
-              appendTurnBlock({ id: blockId, turnId, type: "agent", content: remainingAgent, streaming: true });
+              const capsuleActivityIdentity = shouldProjectStreamingAssistantToCapsule({
+                workflowMode: sessionGet().config.workflowMode,
+                runIntent: effectiveRunIntent,
+              })
+                ? buildPublicAssistantProgressIdentity({
+                    kind: "capsule_activity",
+                    sessionKey: runSessionKey,
+                    turnId,
+                    displayTurnId: toolDisplayTurnId,
+                    runId: activeRuntimeRunIdentity.runId,
+                    parentRunId: activeRuntimeRunIdentity.parentRunId,
+                  })
+                : undefined;
+              appendTurnBlock({
+                id: blockId,
+                turnId: toolDisplayTurnId,
+                type: "agent",
+                content: remainingAgent,
+                streaming: true,
+                ...(capsuleActivityIdentity
+                  ? {
+                      hiddenProcess: false,
+                      visibility: "user_progress" as const,
+                      publicProgress: capsuleActivityIdentity,
+                    }
+                  : {}),
+              });
             }
           } else {
             const blockId = context.currentStreamingBlockId;
@@ -2477,6 +2509,15 @@ export class WorkflowEngine {
                 visibility: meta.visibility,
               }
             : {};
+          const settleAssistantPresentation = (block: TaskBlock): TaskBlock => {
+            if (block.type !== "agent") return block;
+            const keepsLiveCapsuleActivity =
+              block.visibility === "user_progress" &&
+              block.publicProgress?.kind === "capsule_activity";
+            return keepsLiveCapsuleActivity
+              ? block
+              : stripAssistantPublicProgress(block);
+          };
 
           // Merge answer/progress block. When this text precedes tool calls, close
           // the visible block but keep the overall run active for tool execution
@@ -2505,7 +2546,14 @@ export class WorkflowEngine {
             } else {
               taskFlow = taskFlow.map((t: any) =>
                 t.id === blockId && t.type === "agent"
-                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity, ...assistantPresentationPatch }
+                  ? settleAssistantPresentation({
+                      ...t,
+                      content: visibleText,
+                      streaming: false,
+                      options: replyOptions,
+                      choiceRequest: choiceRequestIdentity,
+                      ...assistantPresentationPatch,
+                    } as TaskBlock)
                   : t
               );
             }
@@ -2531,7 +2579,14 @@ export class WorkflowEngine {
               const blockId = existingAgentBlock.id;
               taskFlow = taskFlow.map((t: any) =>
                 t.id === blockId && t.type === "agent"
-                  ? { ...t, content: visibleText, streaming: false, options: replyOptions, choiceRequest: choiceRequestIdentity, ...assistantPresentationPatch }
+                  ? settleAssistantPresentation({
+                      ...t,
+                      content: visibleText,
+                      streaming: false,
+                      options: replyOptions,
+                      choiceRequest: choiceRequestIdentity,
+                      ...assistantPresentationPatch,
+                    } as TaskBlock)
                   : t
               );
             } else {

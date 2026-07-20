@@ -1,6 +1,10 @@
 import { StreamingThinkingInterceptor } from "../lib/chat/StreamingThinkingInterceptor";
 import { StreamingCadenceBuffer } from "../lib/chat/streamBuffer";
-import { resolveStreamingAssistantDisplay } from "../lib/streamDisplayPolicy";
+import { buildPublicAssistantProgressIdentity } from "../lib/assistantPublicProgress";
+import {
+  resolveStreamingAssistantDisplay,
+  shouldProjectStreamingAssistantToCapsule,
+} from "../lib/streamDisplayPolicy";
 import type { TaskBlock } from "../lib/taskTypes";
 import {
   makeTurnRuntimePhase,
@@ -39,6 +43,29 @@ export interface SubmitStreamingUiLease {
   streamBuffer: StreamingCadenceBuffer;
 }
 
+function buildStreamingCapsuleActivityIdentity(
+  context: WorkflowContext,
+  state: any,
+) {
+  const marker = state?.harnessRunMarker;
+  const markerOwnsContext =
+    marker?.sessionKey === context.runSessionKey &&
+    marker?.turnId === context.turnId &&
+    marker?.runId === context.harnessRunId;
+  return buildPublicAssistantProgressIdentity({
+    kind: "capsule_activity",
+    sessionKey: context.runSessionKey,
+    turnId: context.turnId,
+    displayTurnId: context.uiDisplayTurnId || context.turnId,
+    runId: markerOwnsContext
+      ? String(marker.activeRunId || marker.runId || "")
+      : context.harnessRunId,
+    parentRunId: markerOwnsContext
+      ? marker.activeParentRunId || marker.parentRunId || null
+      : null,
+  });
+}
+
 export function startSubmitStreamingUi(
   input: StartSubmitStreamingUiInput,
 ): SubmitStreamingUiLease {
@@ -49,6 +76,7 @@ export function startSubmitStreamingUi(
     nextTaskId,
   } = input;
   const turnId = context.turnId;
+  const displayTurnId = context.uiDisplayTurnId || turnId;
   const phaseLanguage = context.phaseLanguage;
   const effectiveRunIntent = context.effectiveRunIntent;
   const thinkingInterceptor = new StreamingThinkingInterceptor();
@@ -64,6 +92,13 @@ export function startSubmitStreamingUi(
     flushIntervalMs: 90,
     onFlush: ({ agentDelta, thinkingDelta, thoughtStarted, thoughtEnded }) => {
       const latestStateForDedupe = sessionGet();
+      const projectAgentStreamToCapsule = shouldProjectStreamingAssistantToCapsule({
+        workflowMode: latestStateForDedupe.config.workflowMode,
+        runIntent: effectiveRunIntent,
+      });
+      const capsuleActivityIdentity = projectAgentStreamToCapsule
+        ? buildStreamingCapsuleActivityIdentity(context, latestStateForDedupe)
+        : undefined;
       const shouldDisplayReasoningBlocks = latestStateForDedupe.config.reasoningDisplay !== "hidden";
       const nextInterceptorThought = thinkingDelta
         ? appendThoughtDelta(latestStateForDedupe.currentTurnState.interceptorThought, thinkingDelta)
@@ -163,10 +198,10 @@ export function startSubmitStreamingUi(
         let conversationTurns = s.conversationTurns;
 
         const appendBlock = (block: TaskBlock) => {
-          const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: block.turnId ?? turnId } as TaskBlock);
+          const blockWithTurn: TaskBlock = attachRuntimePhase({ ...block, turnId: displayTurnId } as TaskBlock);
           taskFlow = [...taskFlow, blockWithTurn];
           conversationTurns = conversationTurns.map((turn: any) =>
-            turn.id === turnId && !turn.blockIds.includes(blockWithTurn.id)
+            turn.id === displayTurnId && !turn.blockIds.includes(blockWithTurn.id)
               ? { ...turn, blockIds: [...turn.blockIds, blockWithTurn.id] }
               : turn
           );
@@ -175,7 +210,7 @@ export function startSubmitStreamingUi(
         if (shouldDisplayReasoningBlocks && thoughtIdToCreate !== null) {
           appendBlock({
             id: thoughtIdToCreate,
-            turnId,
+            turnId: displayTurnId,
             type: "thought",
             content: compactThoughtContent(currentInterceptorThoughtContent),
             isStreaming: true,
@@ -199,7 +234,20 @@ export function startSubmitStreamingUi(
         }
 
         if (agentBlockIdToCreate !== null && agentContent) {
-          appendBlock({ id: agentBlockIdToCreate, turnId, type: "agent", content: agentContent, streaming: true });
+          appendBlock({
+            id: agentBlockIdToCreate,
+            turnId,
+            type: "agent",
+            content: agentContent,
+            streaming: true,
+            ...(capsuleActivityIdentity
+              ? {
+                  hiddenProcess: false,
+                  visibility: "user_progress" as const,
+                  publicProgress: capsuleActivityIdentity,
+                }
+              : {}),
+          });
         }
 
         if (agentBlockIdToAppend !== null && agentContent) {

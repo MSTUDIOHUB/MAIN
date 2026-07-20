@@ -63,7 +63,12 @@ export type AssistantTextVisibility =
 
 export interface PublicAssistantProgressIdentity {
   schemaVersion: 1;
-  kind: "assistant_commentary";
+  /**
+   * `capsule_activity` is provisional live model prose owned by one exact Run.
+   * It may be promoted to durable `assistant_commentary` only after the
+   * runtime has classified it as a real stage update.
+   */
+  kind: "assistant_commentary" | "capsule_activity";
   source: "model_visible_content";
   sessionKey: string;
   /** Logical Turn owner used by the runtime event ledger. */

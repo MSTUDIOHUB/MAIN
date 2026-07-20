@@ -24,7 +24,8 @@ function compactPublicCommentary(value: unknown): string {
 
 /**
  * Select the latest explicit provider-visible commentary for one exact live
- * owner. Hidden thought, demoted finals, legacy assistant_update blocks, and
+ * owner. Settled stage summaries and provisional Capsule activity use
+ * different typed channels; hidden thought, finals, legacy blocks, and
  * cross-Run content all fail closed.
  */
 export function selectCapsulePublicCommentary(input: {
@@ -44,12 +45,20 @@ export function selectCapsulePublicCommentary(input: {
     .filter((block): block is Extract<TaskBlock, { type: "agent" }> =>
       block.type === "agent" &&
       block.turnId === displayTurnId &&
-      block.visibility === "assistant_update" &&
       block.hiddenProcess !== true &&
-      block.streaming !== true &&
       (!Array.isArray(block.options) || block.options.length === 0) &&
       block.publicProgress?.schemaVersion === 1 &&
-      block.publicProgress.kind === "assistant_commentary" &&
+      (
+        (
+          block.publicProgress.kind === "assistant_commentary" &&
+          block.visibility === "assistant_update" &&
+          block.streaming !== true
+        ) ||
+        (
+          block.publicProgress.kind === "capsule_activity" &&
+          block.visibility === "user_progress"
+        )
+      ) &&
       block.publicProgress.source === "model_visible_content" &&
       block.publicProgress.sessionKey === sessionKey &&
       block.publicProgress.turnId === logicalTurnId &&

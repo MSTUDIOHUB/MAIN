@@ -71,6 +71,7 @@ import {
   isTransparentToolNarrationBlock,
   resolvePlanArtifactOwnerTurnId,
   selectLatestPlanCandidatePreview,
+  shouldSuppressSupersededPlanCandidate,
   shouldSuppressAgentAsExplanation,
   shouldSuppressAgentToolEcho,
 } from "../lib/chat/chatBlockVisibility";
@@ -3712,6 +3713,11 @@ export default function ChatArea({
     const renderTurnBlockItem = (item) => {
       if (item.kind !== "readContextGroup" && item.kind !== "operationCluster" && item.block?.type === "thought") return null;
       if (item.kind === "block") {
+        if (shouldSuppressSupersededPlanCandidate({
+          block: item.block,
+          hasReviewableArtifact: hasReviewablePlanArtifact,
+          ownsReviewableArtifact: turn.id === planArtifactOwnerTurnId,
+        })) return null;
         // `user_progress` is runtime/process narration, including legacy
         // persisted model prose that used to be promoted from tool-call text.
         // Its structured tool evidence is rendered by the process timeline and

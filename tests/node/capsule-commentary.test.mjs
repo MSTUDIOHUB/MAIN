@@ -67,6 +67,23 @@ function commentaryBlock(overrides = {}) {
   };
 }
 
+function capsuleActivityBlock(overrides = {}) {
+  const block = commentaryBlock({
+    content: "让我先查看 src/main.js，确认文件打开事件入口。",
+    streaming: true,
+    visibility: "user_progress",
+    ...overrides,
+  });
+  return {
+    ...block,
+    publicProgress: {
+      ...block.publicProgress,
+      kind: "capsule_activity",
+      ...(overrides.publicProgress || {}),
+    },
+  };
+}
+
 const exactOwner = {
   sessionKey: "session-a",
   logicalTurnId: "turn-a",
@@ -86,6 +103,15 @@ test("Capsule selects only the latest exact-owner provider-visible commentary", 
   assert.equal(selected, "当前判断：打开路径还要处理空白标签页。");
 });
 
+test("Capsule exposes exact-owner provisional activity while the model stream is live", () => {
+  const selected = selectCapsulePublicCommentary({
+    blocks: [capsuleActivityBlock()],
+    ...exactOwner,
+  });
+
+  assert.equal(selected, "让我先查看 src/main.js，确认文件打开事件入口。");
+});
+
 test("Capsule rejects legacy, cross-owner, final, streaming, and hidden blocks", () => {
   const rejected = [
     { ...commentaryBlock(), publicProgress: undefined },
@@ -96,6 +122,8 @@ test("Capsule rejects legacy, cross-owner, final, streaming, and hidden blocks",
     commentaryBlock({ publicProgress: { ...commentaryBlock().publicProgress, runId: "run-old" } }),
     commentaryBlock({ visibility: "assistant_final" }),
     commentaryBlock({ streaming: true }),
+    capsuleActivityBlock({ visibility: "assistant_update" }),
+    capsuleActivityBlock({ publicProgress: { ...capsuleActivityBlock().publicProgress, runId: "run-old" } }),
     commentaryBlock({ hiddenProcess: true }),
     commentaryBlock({ options: [{ label: "继续", value: "continue" }] }),
   ];

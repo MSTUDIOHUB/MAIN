@@ -5527,8 +5527,10 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
   const turnId = kind === "model"
     ? "e2e-capsule-model-explanation-turn"
     : "e2e-capsule-progress-only-turn";
+  const runId = `run-${turnId}`;
   const userBlockId = useAppStore.getState()._nextTaskId();
   const firstUpdateId = useAppStore.getState()._nextTaskId();
+  const liveActivityId = useAppStore.getState()._nextTaskId();
   const readToolId = useAppStore.getState()._nextTaskId();
   const commandToolId = useAppStore.getState()._nextTaskId();
   const secondUpdateId = useAppStore.getState()._nextTaskId();
@@ -5540,14 +5542,34 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: firstUpdateId,
       turnId,
       type: "agent" as const,
-      content: "已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。",
+      content: "已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。",
       visibility: "assistant_update" as const,
       streaming: false,
+    }, {
+      id: liveActivityId,
+      turnId,
+      type: "agent" as const,
+      content: "让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。",
+      visibility: "user_progress" as const,
+      streaming: true,
+      hiddenProcess: false,
+      publicProgress: {
+        schemaVersion: 1 as const,
+        kind: "capsule_activity" as const,
+        source: "model_visible_content" as const,
+        sessionKey: `${workspace}:${sessionId}`,
+        turnId,
+        displayTurnId: turnId,
+        runId,
+        parentRunId: null,
+        createdAt: now,
+      },
     }] : []),
     {
       id: readToolId,
       turnId,
       type: "tool" as const,
+      runId,
       toolName: "read_file",
       target: "src/components/ChatArea.tsx",
       status: "done",
@@ -5560,6 +5582,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: commandToolId,
       turnId,
       type: "tool" as const,
+      runId,
       toolName: "run_command",
       target: "npm run test:workflow-assets",
       status: "done",
@@ -5580,6 +5603,7 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       id: runningToolId,
       turnId,
       type: "tool" as const,
+      runId,
       toolName: "grep_search",
       target: "src/components/ChatArea.tsx",
       status: "running",
@@ -5611,6 +5635,39 @@ function seedCapsuleProcessScenario(kind: "model" | "progress") {
       ],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: {
+      schemaVersion: 1,
+      runId,
+      activeRunId: runId,
+      parentRunId: null,
+      instanceId: `instance-${turnId}`,
+      sessionKey: `${workspace}:${sessionId}`,
+      workspace,
+      sessionId,
+      turnId,
+      status: "running",
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      iteration: 2,
+      maxIterations: 25,
+      messagesLen: 4,
+      toolCount: 3,
+      latestTool: "grep_search",
+      latestToolTarget: "src/components/ChatArea.tsx",
+      activeStreamId: `stream-${turnId}`,
+      streamStatus: "chunk_progress",
+      streamChunkCount: 2,
+      streamByteCount: 128,
+      streamElapsedMs: 1_200,
+      streamLifecycleStatus: "streaming",
+      lastStreamError: null,
+      startedAt: now - 2_000,
+      updatedAt: now,
+      closedAt: null,
+      closeReason: null,
+    },
     taskFlow,
     conversationTurns: [
       {

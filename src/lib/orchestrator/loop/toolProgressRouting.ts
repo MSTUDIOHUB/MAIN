@@ -93,6 +93,8 @@ export function resolveToolProgressPresentation(input: {
   runtimeNarrationInjected: boolean;
   visibleAssistantText: string;
   shouldSuppressApprovedPlanNoToolText: boolean;
+  /** False only before this Run has any completed tool observation. */
+  hasPriorToolEvidence?: boolean;
 }): ToolProgressPresentationDecision {
   const shouldRenderToolProgress =
     input.progressEligibleToolCallCount > 0 &&
@@ -113,6 +115,7 @@ export function resolveToolProgressPresentation(input: {
   const assistantUpdate =
     modelAuthoredToolNarration &&
     !unsupportedOnlyToolNarration &&
+    input.hasPriorToolEvidence !== false &&
     !thinToolNarration;
   const shouldPreserveApprovedExecutionText = assistantUpdate;
 

@@ -1,4 +1,31 @@
-import type { TaskBlock } from "./taskTypes";
+import type { PublicAssistantProgressIdentity, TaskBlock } from "./taskTypes";
+
+export function buildPublicAssistantProgressIdentity(input: {
+  kind: PublicAssistantProgressIdentity["kind"];
+  sessionKey: string;
+  turnId: string;
+  displayTurnId: string;
+  runId: string;
+  parentRunId?: string | null;
+  createdAt?: number;
+}): PublicAssistantProgressIdentity | undefined {
+  const sessionKey = String(input.sessionKey || "").trim();
+  const turnId = String(input.turnId || "").trim();
+  const displayTurnId = String(input.displayTurnId || "").trim();
+  const runId = String(input.runId || "").trim();
+  if (!sessionKey || !turnId || !displayTurnId || !runId) return undefined;
+  return {
+    schemaVersion: 1,
+    kind: input.kind,
+    source: "model_visible_content",
+    sessionKey,
+    turnId,
+    displayTurnId,
+    runId,
+    parentRunId: String(input.parentRunId || "").trim() || null,
+    createdAt: Math.max(0, Number(input.createdAt) || Date.now()),
+  };
+}
 
 /**
  * Public Capsule commentary is a live-run capability, not durable final-text

@@ -196,6 +196,25 @@ test("assistant update identity preserves a substantive finding plus next step",
   assert.equal(decision.shouldPreserveApprovedExecutionText, true);
 });
 
+test("first tool-call preamble stays process-only until the Run has tool evidence", () => {
+  const decision = resolveToolProgressPresentation({
+    progressEligibleToolCallCount: 3,
+    unsupportedToolCallCount: 0,
+    finalReplyOptionCount: 0,
+    hasSubstantivePlanAssistantText: false,
+    workflowMode: "plan",
+    isPlanApproved: false,
+    runtimeNarrationInjected: false,
+    visibleAssistantText: "我需要先理解文件打开和新建文档的问题。让我先查看相关代码，了解真实实现。",
+    shouldSuppressApprovedPlanNoToolText: false,
+    hasPriorToolEvidence: false,
+  });
+
+  assert.equal(decision.visibility, "user_progress");
+  assert.equal(decision.shouldPreserveApprovedExecutionText, false);
+  assert.equal(decision.modelAuthored, true);
+});
+
 test("mixed tool narration keeps the substantive stage finding as an assistant update", () => {
   const decision = resolveToolProgressPresentation({
     progressEligibleToolCallCount: 1,

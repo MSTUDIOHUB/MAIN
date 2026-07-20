@@ -91,8 +91,41 @@ const {
   isPlanGenerationFailureBlock,
   resolvePlanArtifactOwnerTurnId,
   selectLatestPlanCandidatePreview,
+  shouldSuppressSupersededPlanCandidate,
   shouldSuppressAgentToolEcho,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/chat/chatBlockVisibility.ts"));
+
+test("canonical plan artifact suppresses the superseded raw proposal in ChatArea", () => {
+  const candidate = {
+    id: 7,
+    type: "agent",
+    content: [
+      "<proposed_plan>",
+      "# 完整修复计划",
+      "## Change",
+      "- 修改 src/main.js 的文件打开事件，并修复新建文档标题状态。",
+      "## Verification",
+      "- 运行构建与文件打开回归测试。",
+      "</proposed_plan>",
+    ].join("\n"),
+    turnPhase: { id: "scope" },
+  };
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: candidate,
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), true);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: candidate,
+    hasReviewableArtifact: false,
+    ownsReviewableArtifact: true,
+  }), false);
+  assert.equal(shouldSuppressSupersededPlanCandidate({
+    block: { ...candidate, turnPhase: { id: "review_ready" } },
+    hasReviewableArtifact: true,
+    ownsReviewableArtifact: true,
+  }), false);
+});
 
 const {
   buildReadContextEntries,

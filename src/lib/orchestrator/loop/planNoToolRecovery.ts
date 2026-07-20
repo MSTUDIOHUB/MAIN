@@ -47,6 +47,23 @@ export type PlanNoToolRecoveryResult = {
 
 export { buildPlanClosureEvidenceRecoveryPrompt } from "../planOrchestration";
 
+/**
+ * Structured proposal detection runs against the raw provider stream. When it
+ * succeeds, materialization must use that same source; the user-visible text
+ * may already have had the proposal protocol removed for display.
+ */
+export function selectPlanMaterializationSourceText(input: {
+  hasStructuredProposal: boolean;
+  streamText: string;
+  sourceVisibleText: string;
+}): string {
+  const streamText = String(input.streamText || "").trim();
+  const sourceVisibleText = String(input.sourceVisibleText || "").trim();
+  return input.hasStructuredProposal && streamText
+    ? streamText
+    : sourceVisibleText || streamText;
+}
+
 function buildPlanGenerationFailedMessage(language: "zh" | "en", reason: string): string {
   return language === "zh"
     ? `计划生成失败：经过有界的计划物化恢复后，仍未得到通过校验的计划产物（${reason}）。请补充约束或重试计划生成。`
@@ -661,7 +678,11 @@ export async function handlePlanNoToolRecovery(input: {
   }
 
   if (decision.shouldMaterializeStructuredProposal) {
-    const visibleText = sourceVisibleText || streamText;
+    const visibleText = selectPlanMaterializationSourceText({
+      hasStructuredProposal,
+      streamText,
+      sourceVisibleText,
+    });
     const materializedProposal = await autoMaterializePlanArtifactFromVisibleText({
       visibleText,
       workspace,

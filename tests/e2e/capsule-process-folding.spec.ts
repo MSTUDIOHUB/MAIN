@@ -9,22 +9,28 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("assistant updates stay ordered in ChatArea while Capsule exposes structured live activity", async ({ page }) => {
+test("settled updates stay ordered in ChatArea while live model activity stays in Capsule", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-model-explanation");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
   await expect(capsule.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
+  await expect(capsule.getByTestId("capsule-commentary-label")).toContainText(
+    "让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。",
+  );
   await expect(capsule).not.toContainText("保留这条模型说明");
   await expect(capsule).not.toContainText("read_file");
   await expect(capsule).not.toContainText("grep_search");
   await expect(capsule).not.toContainText("暂无工具调用");
   await expect(capsule).not.toContainText("tool:");
   await expect(capsule).not.toContainText("等待您的下一步指令");
-  const firstUpdate = page.getByText("已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。");
+  const firstUpdate = page.getByText("已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。");
   const secondUpdate = page.getByText("展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。");
   await expect(firstUpdate).toHaveCount(1);
   await expect(secondUpdate).toHaveCount(1);
+  await expect(page.locator('[data-testid="chat-scroll-container"]')).not.toContainText(
+    "让我继续查看 ChatArea.tsx，确认 Capsule 的实时投影入口。",
+  );
   await expect.poll(async () => firstUpdate.evaluate((first, secondText) => {
     const second = Array.from(document.querySelectorAll("*")).find((node) => node.textContent === secondText);
     return second ? Boolean(first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING) : false;
@@ -52,6 +58,7 @@ test("assistant updates stay ordered in ChatArea while Capsule exposes structure
     )).toBe(mode);
     await expect(progressPopover).toBeVisible();
     await expect(capsule.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
+    await expect(capsule.getByTestId("capsule-commentary-label")).toContainText("让我继续查看 ChatArea.tsx");
     const capsuleSurface = await capsule.evaluate((element) => {
       const capsuleStyle = getComputedStyle(element);
       const activity = element.querySelector<HTMLElement>('[data-testid="capsule-activity-label"]');
@@ -106,9 +113,10 @@ test("assistant updates stay ordered in ChatArea while Capsule exposes structure
   await expect(page.getByTestId("live-turn-process-details")).toContainText("运行回归测试确认折叠状态");
 
   await page.reload();
-  await expect(page.getByText("已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。")).toHaveCount(1);
+  await expect(page.getByText("已确认阶段性结论应留在 ChatArea，实时动作应进入 Capsule。")).toHaveCount(1);
   await expect(page.getByText("展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。")).toHaveCount(1);
   await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("保留这条模型说明");
+  await expect(page.getByTestId("capsule-commentary-label")).toContainText("让我继续查看 ChatArea.tsx");
   await expect(page.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
 });
 
