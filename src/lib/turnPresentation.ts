@@ -143,10 +143,9 @@ const TURN_RESULT_STATUS_COPY: Record<string, { zh: string; en: string }> = {
 };
 
 /**
- * Projects runtime state into the only prose allowed in the global Capsule.
- * The projection deliberately accepts lifecycle/phase enums only: model text,
- * tool names, paths, evidence and heartbeat copy belong to ChatArea or the
- * detailed Run Status surfaces and cannot enter this boundary.
+ * Projects runtime state into Capsule's stable lifecycle heading. Live tool
+ * activity is projected separately from structured runtime data; model text,
+ * evidence and heartbeat prose remain outside this boundary.
  */
 export function buildCapsuleStatusProjection(
   input: BuildCapsuleStatusProjectionInput,

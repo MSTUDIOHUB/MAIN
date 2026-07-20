@@ -78,9 +78,30 @@ type RuntimeWithSubmitOwner = {
   [SUBMIT_SESSION_RUNTIME_OWNER]?: object;
 };
 
+/**
+ * Carry the opaque submit owner across an ordinary snapshot refresh of the
+ * same Session container. Replacement, deletion, restore, and Session
+ * recreation paths must not call this helper: those operations intentionally
+ * revoke the previous generation.
+ */
+export function preserveSubmitSessionRuntimeOwnership<TRuntime extends object>(
+  previous: TRuntime | null | undefined,
+  replacement: TRuntime,
+): TRuntime {
+  const ownerToken = (previous as RuntimeWithSubmitOwner | null | undefined)?.[
+    SUBMIT_SESSION_RUNTIME_OWNER
+  ];
+  if (!ownerToken) return replacement;
+  return {
+    ...replacement,
+    [SUBMIT_SESSION_RUNTIME_OWNER]: ownerToken,
+  };
+}
+
 const DURABLE_SESSION_PUBLICATION_KEYS = [
   "messages",
   "runtimeSnapshot",
+  "storageRevision",
   "storageStatus",
   "recordingDisabled",
   "updatedAt",

@@ -17,6 +17,19 @@ test("ExecutionCapsule does not invent execution step progress from plain tool a
   await expect(page.getByTestId("execution-capsule-execution-progress")).toHaveCount(0);
 });
 
+test("active Capsule shows exact-run public model commentary alongside structured activity", async ({ page }) => {
+  await page.goto("/?e2eScenario=execution-capsule-execution-progress");
+
+  const capsule = page.getByTestId("agent-explanation-capsule");
+  await expect(capsule).toBeVisible();
+  await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
+  await expect(capsule.getByTestId("capsule-commentary-label")).toHaveText(
+    "模型进展：当前判断：已确认展示层入口，正在核对活动状态与运行身份。",
+  );
+  await expect(capsule.getByTestId("capsule-activity-label")).toBeVisible();
+  await expect(capsule).not.toContainText("**");
+});
+
 test("pure plan execution keeps the runtime checkpoint in the main Capsule without duplicating its task tracker", async ({ page }) => {
   await page.goto("/?e2eScenario=execution-capsule-plan-task-progress");
 
@@ -25,6 +38,7 @@ test("pure plan execution keeps the runtime checkpoint in the main Capsule witho
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
+  await expect(capsule.getByTestId("capsule-activity-label")).toHaveText("正在执行已批准计划");
   await expect(capsule).not.toContainText("apply_patch");
   await expect(capsule).not.toContainText("src/task-9.ts");
   await expect(capsule).not.toContainText("阶段：tool_start");

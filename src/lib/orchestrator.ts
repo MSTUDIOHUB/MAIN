@@ -134,6 +134,7 @@ import type { AppConfig, Skill } from "./appTypes";
 import {
   canonicalizePlanArtifactPath,
   classifyPlanArtifactQualityResult,
+  deriveRuntimePlanTasksFromArtifacts,
   detectPlanArtifactKind,
   extractPlanTasks,
   findDroppedPlanTasks,
@@ -142,6 +143,8 @@ import {
   isPlanTaskTrustedComplete,
   analyzePlanDecisionFork,
   repairActionablePlanArtifactContent,
+  validateActionablePlanArtifact,
+  validateDerivedPlanTasksForApproval,
   validatePlanArtifactContent,
   type PlanArtifact,
   type PlanArtifactQualityResult,
@@ -217,14 +220,21 @@ import {
 } from "./turnEvents";
 import { normalizeToolCallForExecution } from "./toolCallNormalization";
 import {
+  appendTrustedValidationCommandsToPlan,
   composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
   materializePlanArtifactFromVisibleText,
   sanitizePlanEvidenceInput,
   validateGroundedActionablePlanArtifact,
   type PlanEvidenceRecord,
+  type PlanMaterializationResult,
   type PlanMaterializationSource,
 } from "./planMaterialization";
+import {
+  assessPlanExecutableValidation,
+  planArtifactRequiresExecutableValidation,
+} from "./planExecutableValidation";
+import { resolveTrustedProjectValidationCommands } from "./projectValidationCommands";
 import {
   assessPlanClosureEvidence,
   browserResultLooksSuccessful,
@@ -2920,6 +2930,153 @@ interface PlanMaterializationResultForLoop {
   replyOptions?: string[];
 }
 
+export interface ReviewablePlanPreparationResult {
+  ok: boolean;
+  repaired: boolean;
+  reason?: string;
+}
+
+type ExecutablePlanCandidatePreparation = PlanMaterializationResult & {
+  repaired?: boolean;
+};
+
+function buildTransientPlanArtifact(input: {
+  path: string;
+  content: string;
+}): PlanArtifact {
+  return {
+    kind: "plan",
+    path: input.path,
+    title: "Plan",
+    content: input.content,
+    revision: 1,
+    updatedAt: 0,
+  };
+}
+
+function rejectExecutablePlanCandidate(
+  reason: string,
+): ExecutablePlanCandidatePreparation {
+  return {
+    ok: false,
+    repaired: false,
+    reason,
+    quality: classifyPlanArtifactQualityResult({ ok: false, reason }),
+  };
+}
+
+async function prepareExecutablePlanCandidate(input: {
+  materialized: PlanMaterializationResult;
+  workspace: string;
+  callbacks: OrchestratorCallbacks;
+}): Promise<ExecutablePlanCandidatePreparation> {
+  const materialized = input.materialized;
+  if (
+    !materialized.ok ||
+    materialized.kind !== "plan" ||
+    !materialized.path ||
+    !materialized.content
+  ) {
+    return materialized;
+  }
+
+  const artifact = buildTransientPlanArtifact({
+    path: materialized.path,
+    content: materialized.content,
+  });
+  const tasks = deriveRuntimePlanTasksFromArtifacts([artifact], {
+    language: input.callbacks.getPreferredLanguage(),
+  });
+  const assessment = assessPlanExecutableValidation({
+    planArtifacts: [artifact],
+    executionPlanTasks: tasks,
+  });
+  if (!assessment.missing) return { ...materialized, repaired: false };
+
+  let packageManifest: string;
+  try {
+    packageManifest = String(await executeTool(
+      "read_file",
+      { path: "package.json", __raw: true },
+      input.workspace,
+      input.callbacks.getSessionKey(),
+    ) ?? "");
+  } catch (error) {
+    logAgentEvent("plan_manifest_validation_unproven", {
+      reason: "package_manifest_unavailable",
+      path: materialized.path,
+      error: getErrorMessage(error, "package.json unavailable"),
+    });
+    return rejectExecutablePlanCandidate(
+      "executable_validation_manifest_unproven:package_manifest_unavailable",
+    );
+  }
+
+  const commandResolution = resolveTrustedProjectValidationCommands(packageManifest, {
+    maxCommands: 1,
+  });
+  if (!commandResolution.ok) {
+    logAgentEvent("plan_manifest_validation_unproven", {
+      reason: commandResolution.reason,
+      path: materialized.path,
+    });
+    return rejectExecutablePlanCandidate(
+      `executable_validation_manifest_unproven:${commandResolution.reason}`,
+    );
+  }
+
+  const repair = appendTrustedValidationCommandsToPlan({
+    content: materialized.content,
+    commands: commandResolution.commands.map((entry) => entry.command),
+    language: input.callbacks.getPreferredLanguage(),
+  });
+  if (!repair.ok) {
+    return rejectExecutablePlanCandidate(
+      `executable_validation_manifest_unproven:${repair.reason}`,
+    );
+  }
+
+  const repairedArtifact = buildTransientPlanArtifact({
+    path: materialized.path,
+    content: repair.content,
+  });
+  const quality = validateActionablePlanArtifact(repair.content);
+  if (!quality.ok) {
+    return rejectExecutablePlanCandidate(
+      `manifest_validation_repair_rejected:${quality.reason || "quality_gate"}`,
+    );
+  }
+  const repairedTasks = deriveRuntimePlanTasksFromArtifacts([repairedArtifact], {
+    language: input.callbacks.getPreferredLanguage(),
+  });
+  const taskQuality = validateDerivedPlanTasksForApproval(repairedTasks);
+  if (!taskQuality.ok) {
+    return rejectExecutablePlanCandidate(
+      `manifest_validation_repair_rejected:${taskQuality.reason || "invalid_runtime_plan_task_graph"}`,
+    );
+  }
+  const repairedAssessment = assessPlanExecutableValidation({
+    planArtifacts: [repairedArtifact],
+    executionPlanTasks: repairedTasks,
+  });
+  if (repairedAssessment.missing) {
+    return rejectExecutablePlanCandidate("executable_validation_task_missing");
+  }
+
+  logAgentEvent("plan_manifest_validation_repaired", {
+    path: materialized.path,
+    command: commandResolution.commands[0]?.command || "",
+    scriptName: commandResolution.commands[0]?.scriptName || "",
+    manifestPath: commandResolution.commands[0]?.manifestPath || "package.json",
+  });
+  return {
+    ...materialized,
+    content: repair.content,
+    source: "manifest_validation_repaired_plan",
+    repaired: true,
+  };
+}
+
 async function writeMaterializedPlanArtifact(input: {
   materialized: {
     ok: boolean;
@@ -3039,6 +3196,77 @@ async function writeMaterializedPlanArtifact(input: {
       },
     };
   }
+}
+
+/**
+ * Last pre-review repair for persisted/restored plans. The artifact is updated
+ * atomically before its approval identity is calculated; if a trusted command
+ * cannot be proven, the caller must keep the run out of pending_review.
+ */
+export async function prepareReviewablePlanArtifactForReview(input: {
+  workspace: string;
+  callbacks: OrchestratorCallbacks;
+}): Promise<ReviewablePlanPreparationResult> {
+  const artifacts = input.callbacks.getPlanArtifacts?.() || [];
+  if (artifacts.length === 0) return { ok: true, repaired: false };
+  const tasks = deriveRuntimePlanTasksFromArtifacts(artifacts, {
+    language: input.callbacks.getPreferredLanguage(),
+  });
+  const assessment = assessPlanExecutableValidation({
+    planArtifacts: artifacts,
+    executionPlanTasks: tasks,
+  });
+  if (!assessment.missing) return { ok: true, repaired: false };
+
+  const artifact = artifacts.find((candidate) =>
+    candidate.kind === "plan" && planArtifactRequiresExecutableValidation(candidate)
+  );
+  if (!artifact) {
+    return {
+      ok: false,
+      repaired: false,
+      reason: "executable_validation_repair_target_missing",
+    };
+  }
+  const prepared = await prepareExecutablePlanCandidate({
+    materialized: {
+      ok: true,
+      kind: "plan",
+      path: artifact.path,
+      content: artifact.content,
+      source: "visible_plan",
+    },
+    workspace: input.workspace,
+    callbacks: input.callbacks,
+  });
+  if (!prepared.ok || !prepared.content || !prepared.path || !prepared.kind) {
+    return {
+      ok: false,
+      repaired: false,
+      reason: prepared.reason || "executable_validation_task_missing",
+    };
+  }
+  if (!prepared.repaired) {
+    return {
+      ok: false,
+      repaired: false,
+      reason: "executable_validation_task_missing",
+    };
+  }
+
+  const written = await writeMaterializedPlanArtifact({
+    materialized: prepared,
+    workspace: input.workspace,
+    callbacks: input.callbacks,
+    toolCallPrefix: "plan_manifest_validation_repair",
+  });
+  return written.ok
+    ? { ok: true, repaired: true }
+    : {
+        ok: false,
+        repaired: false,
+        reason: written.reason || "manifest_validation_repair_write_failed",
+      };
 }
 
 interface CachedReadOnlyToolResult {
@@ -4615,8 +4843,27 @@ export async function autoMaterializePlanArtifactFromVisibleText(input: {
     };
   }
 
-  return writeMaterializedPlanArtifact({
+  const prepared = await prepareExecutablePlanCandidate({
     materialized,
+    workspace: input.workspace,
+    callbacks: input.callbacks,
+  });
+  if (!prepared.ok || !prepared.path || !prepared.content || !prepared.kind) {
+    logAgentEvent("plan_visible_materialization_rejected", {
+      reason: prepared.reason || "executable_validation_task_missing",
+      evidenceBundleId: closureInput.evidenceBundle.bundleId,
+      evidenceBundleHash: closureInput.evidenceBundle.hash,
+    });
+    return {
+      ok: false,
+      reason: prepared.reason || "executable_validation_task_missing",
+      quality: prepared.quality,
+      replyOptions: materialized.replyOptions,
+    };
+  }
+
+  return writeMaterializedPlanArtifact({
+    materialized: prepared,
     workspace: input.workspace,
     callbacks: input.callbacks,
     toolCallPrefix: "plan_materialize",
@@ -4734,10 +4981,28 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     };
   }
 
+  const prepared = await prepareExecutablePlanCandidate({
+    materialized,
+    workspace: input.workspace,
+    callbacks: input.callbacks,
+  });
+  if (!prepared.ok || !prepared.path || !prepared.content || !prepared.kind) {
+    logAgentEvent("plan_evidence_materialization_rejected", {
+      reason: prepared.reason || "executable_validation_task_missing",
+      evidenceBundleId: closureInput.evidenceBundle.bundleId,
+      evidenceBundleHash: closureInput.evidenceBundle.hash,
+    });
+    return {
+      ok: false,
+      reason: prepared.reason || "executable_validation_task_missing",
+      quality: prepared.quality,
+    };
+  }
+
   logAgentEvent("plan_evidence_materialization_ready", {
-    path: materialized.path,
-    kind: materialized.kind,
-    source: materialized.source || "deterministic_evidence",
+    path: prepared.path,
+    kind: prepared.kind,
+    source: prepared.source || "deterministic_evidence",
     evidenceCount: closureInput.evidence.length,
     structuredEvidenceCount: closureInput.evidenceRecords.length,
     fileCount: closureInput.files.length,
@@ -4745,7 +5010,7 @@ export async function autoMaterializePlanArtifactFromEvidence(input: {
     evidenceBundleHash: closureInput.evidenceBundle.hash,
   });
   return writeMaterializedPlanArtifact({
-    materialized,
+    materialized: prepared,
     workspace: input.workspace,
     callbacks: input.callbacks,
     toolCallPrefix: "plan_evidence_materialize",
@@ -5156,6 +5421,44 @@ export async function buildPlanArtifactMutationValidationError(
       callbacks,
       validation,
     });
+  }
+
+  if (kind === "plan") {
+    const prepared = await prepareExecutablePlanCandidate({
+      materialized: {
+        ok: true,
+        kind: "plan",
+        path,
+        content: nextContent,
+        source: "visible_plan",
+      },
+      workspace,
+      callbacks,
+    });
+    if (!prepared.ok || !prepared.content) {
+      return buildPlanArtifactQualityPreflightRejection({
+        tc,
+        target,
+        path,
+        kind,
+        callbacks,
+        validation: {
+          ok: false,
+          reason: prepared.reason || "executable_validation_task_missing",
+          recoveryAction: "rewrite",
+        },
+      });
+    }
+    if (prepared.repaired) {
+      nextContent = prepared.content;
+      if (tc.name === "write_file") {
+        args.content = prepared.content;
+        tc.arguments = JSON.stringify({ ...args, content: prepared.content });
+      }
+      // replace_in_file is promoted below to one validated full-content
+      // write. Do not mix a synthetic `content` field into its original
+      // search/replace contract before that atomic promotion.
+    }
   }
 
   if (kind === "tasks") {

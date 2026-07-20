@@ -49,6 +49,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  buildCapsuleActivityText,
   buildRuntimeProgressLedger,
   buildRuntimeProgressProjection,
   buildRunStatusProjection,
@@ -190,6 +191,71 @@ test("runtime progress ledger dedupes repeated read blocks and exposes cache reu
   assert.equal(dashboardItem.cacheHits, 1);
   assert.match(summarizeRuntimeProgressLedger(items, "zh"), /dashboardStore\.ts ×2/);
   assert.match(summarizeRuntimeProgressLedger(items, "zh"), /缓存复用/);
+});
+
+test("Capsule activity is regenerated from structured tool fields without model prose or raw tool names", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:1:search",
+    runId: "run-1",
+    phase: "tool_start",
+    title: "模型声称正在做一些不应进入 Capsule 的事情",
+    status: "running",
+    summary: "grep_search · src/components/ChatArea.tsx · secret reasoning",
+    target: "src/components/ChatArea.tsx",
+    tool: "grep_search",
+    sourceToolCallIds: ["call-1", "call-2"],
+    repeatCount: 2,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 2,
+  }], "zh");
+
+  const activityText = buildCapsuleActivityText(projection, "zh");
+  assert.equal(activityText, "正在搜索 ChatArea.tsx · 2 次");
+  assert.doesNotMatch(activityText, /grep_search|secret reasoning|模型声称/);
+  assert.equal(buildCapsuleActivityText({ ...projection, currentActivity: null }, "zh"), "");
+});
+
+test("Capsule activity never falls back to an unproven progress title", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:unknown",
+    runId: "run-unknown",
+    phase: "investigating",
+    title: "raw model prose must stay private",
+    status: "running",
+    summary: "also private",
+    target: "",
+    tool: "custom_unknown_tool",
+    sourceToolCallIds: [],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 1,
+  }], "zh");
+
+  assert.equal(buildCapsuleActivityText(projection, "zh"), "正在分析");
+  assert.doesNotMatch(buildCapsuleActivityText(projection, "zh"), /raw model prose|private/);
+});
+
+test("Capsule maps approved Plan execution to a fixed public phase label", () => {
+  const projection = buildRunStatusProjection([{
+    key: "run:approved-plan",
+    runId: "run-approved-plan",
+    phase: "plan_execution:tool_start",
+    title: "raw runtime title",
+    status: "running",
+    summary: "internal plan detail",
+    target: "",
+    tool: "",
+    sourceToolCallIds: [],
+    repeatCount: 1,
+    cacheHits: 0,
+    firstSeenAt: 1,
+    lastSeenAt: 1,
+  }], "zh");
+
+  assert.equal(buildCapsuleActivityText(projection, "zh"), "正在执行已批准计划");
+  assert.equal(buildCapsuleActivityText(projection, "en"), "Executing approved plan");
 });
 
 test("runtime progress ledger merges a progress snapshot with a tool occurrence without double-counting", () => {

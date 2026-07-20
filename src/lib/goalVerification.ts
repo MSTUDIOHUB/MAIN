@@ -5,6 +5,7 @@
 // ────────────────────────────────────────────────────────────────────
 
 import type { GoalDefinition } from "./goalState";
+import { resolveTrustedProjectValidationCommands } from "./projectValidationCommands";
 
 export type VerificationStrategyKind =
   | "test_command"    // npm test, cargo test, pytest, etc.
@@ -77,11 +78,16 @@ export function inferVerificationStrategies(input: {
 
   // ── Node.js / JavaScript / TypeScript ──
   if (project.packageJson) {
-    const scripts = (project.packageJson.scripts ?? {}) as Record<string, string>;
+    const resolved = resolveTrustedProjectValidationCommands(project.packageJson, {
+      maxCommands: 10,
+    });
+    const commands = resolved.ok ? resolved.commands : [];
 
     // Type check
-    if (scripts.lint || scripts.typecheck) {
-      const cmd = scripts.typecheck ? "npm run typecheck" : "npm run lint";
+    const typeCheck = commands.find((entry) => entry.scriptName === "typecheck") ||
+      commands.find((entry) => entry.scriptName === "lint");
+    if (typeCheck) {
+      const cmd = typeCheck.command;
       strategies.push({
         kind: "type_check",
         command: cmd,
@@ -92,8 +98,9 @@ export function inferVerificationStrategies(input: {
     }
 
     // Test
-    if (scripts.test || scripts["test:unit"] || scripts["test:e2e"]) {
-      const cmd = scripts.test ? "npm test" : scripts["test:unit"] ? "npm run test:unit" : "npm run test:e2e";
+    const testCommand = commands.find((entry) => entry.scriptName.startsWith("test"));
+    if (testCommand) {
+      const cmd = testCommand.command;
       strategies.push({
         kind: "test_command",
         command: cmd,
@@ -105,11 +112,12 @@ export function inferVerificationStrategies(input: {
     }
 
     // Build
-    if (scripts.build) {
+    const build = commands.find((entry) => entry.scriptName === "build");
+    if (build) {
       strategies.push({
         kind: "build_check",
-        command: "npm run build",
-        label: "Build check (npm run build)",
+        command: build.command,
+        label: `Build check (${build.command})`,
         failurePattern: "error|Error|FAIL|BUILD FAILED",
         timeoutMs: DEFAULT_VERIFICATION_TIMEOUT_MS * 2,
       });

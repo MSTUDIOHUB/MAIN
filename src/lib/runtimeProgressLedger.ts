@@ -48,6 +48,8 @@ export interface RunStatusProjection {
   activityText: string;
 }
 
+const LIVE_CAPSULE_ACTIVITY_STATUSES = new Set<RuntimeProgressStatus>(["running", "done"]);
+
 type RuntimeProgressAggregation = "snapshot" | "occurrence";
 
 type RuntimeProgressLedgerCandidate = Omit<
@@ -737,4 +739,63 @@ export function buildRunStatusProjection(
     healthSignals,
     activityText,
   };
+}
+
+/**
+ * Build the compact live line shown directly in Capsule. Tool-backed entries
+ * are regenerated from structured tool/target/status fields so model-authored
+ * prose, evidence summaries, and raw tool protocol never leak into the global
+ * execution surface.
+ */
+export function buildCapsuleActivityText(
+  projection: RunStatusProjection,
+  language: RuntimeProgressLanguage = "zh",
+): string {
+  const activity = projection.currentActivity;
+  if (!activity || !LIVE_CAPSULE_ACTIVITY_STATUSES.has(activity.status)) return "";
+
+  const normalizedLanguage = normalizeLanguage(language);
+  const family = toolFamily(activity.tool);
+  const isKnownToolFamily = ["read", "search", "edit", "command", "browser"].includes(family);
+  const structuredTitle = isKnownToolFamily
+    ? titleForTool(activity.tool, activity.target, activity.status, normalizedLanguage)
+    : activity.target
+      ? normalizedLanguage === "zh"
+        ? `${activity.status === "done" ? "已处理" : "正在处理"} ${compactTarget(activity.target)}`
+        : `${activity.status === "done" ? "Processed" : "Processing"} ${compactTarget(activity.target)}`
+      : (() => {
+          const phase = String(activity.phase || "").toLowerCase();
+          if (/understand|investigat|analy/.test(phase)) {
+            return normalizedLanguage === "zh" ? "正在分析" : "Analyzing";
+          }
+          if (/plan[_:\-]?execution|approved[_:\-]?plan/.test(phase)) {
+            return normalizedLanguage === "zh"
+              ? "正在执行已批准计划"
+              : "Executing approved plan";
+          }
+          if (/plan/.test(phase)) {
+            return normalizedLanguage === "zh" ? "正在规划" : "Planning";
+          }
+          if (/edit|mutat|implement/.test(phase)) {
+            return normalizedLanguage === "zh" ? "正在修改" : "Editing";
+          }
+          if (/valid|verif|test/.test(phase)) {
+            return normalizedLanguage === "zh" ? "正在验证" : "Validating";
+          }
+          if (/recover|reconcil/.test(phase)) {
+            return normalizedLanguage === "zh" ? "正在恢复" : "Recovering";
+          }
+          if (/summar|conclu/.test(phase)) {
+            return normalizedLanguage === "zh" ? "正在整理结论" : "Preparing conclusion";
+          }
+          return "";
+        })();
+  if (!structuredTitle) return "";
+
+  const repeatText = activity.repeatCount > 1
+    ? normalizedLanguage === "zh"
+      ? ` · ${activity.repeatCount} 次`
+      : ` · ${activity.repeatCount}x`
+    : "";
+  return `${structuredTitle}${repeatText}`;
 }

@@ -3,7 +3,6 @@ import { getReviewablePlanArtifacts } from "../lib/planApprovalIdentity";
 import {
   deriveRuntimePlanTasksFromArtifacts,
   getPendingPlanTaskCommandFocus,
-  isFinitePlanValidationCommand,
   isLikelySourceMutationTask,
   isRuntimeTaskMutationSectionHeading,
   isPlanTaskSourceMutationObligation,
@@ -12,7 +11,6 @@ import {
   mergeUserRequestValidationIntoRuntimeTasks,
   normalizeRuntimePlanSectionHeadings,
   reconcilePlanTaskCompletion,
-  requiresPtyObservationForPlanCommand,
   validateActionablePlanArtifact,
   validateDerivedPlanTasksForApproval,
   validatePlanArtifactContent,
@@ -21,6 +19,7 @@ import {
   type PlanExecutionEvidenceEntry,
   type PlanTask,
 } from "../lib/workflowModels";
+import { assessPlanExecutableValidation } from "../lib/planExecutableValidation";
 
 export type ApprovedPlanExecutionReadinessReason =
   | "missing_reviewable_plan_artifact"
@@ -42,8 +41,6 @@ export interface ApprovedPlanExecutionReadiness {
   taskCount: number;
 }
 
-const PLAN_VALIDATION_SECTION_RE =
-  /^(?:(?:目标\s*与\s*)?(?:测试方案|测试计划|测试场景|验证方案|验证标准|验证方式|验收标准|验收)|(?:Goals?\s+and\s+)?(?:Test Plan|Testing|Tests?|Validation|Acceptance(?: Criteria)?))(?:\s*(?:[（(].*[）)]|[:：—-]|与).*)?$/i;
 const LEADING_READ_OR_VALIDATION_INTENT_RE =
   /^(?:(?:需要|需|先|请|继续|首先|下一步|再)\s*)?(?:读取|查看|检查|确认|定位|分析|排查|梳理|调研|审查|理解|验证|测试|验收|运行测试|执行测试)|^(?:(?:need(?:s)?\s+to|first|please|next|then)\s+)?(?:read|inspect|review|analy[sz]e|identify|investigate|check|confirm|understand|verify|validate|test)\b/i;
 const EXPLICIT_MUTATION_ACTION_RE =
@@ -52,10 +49,6 @@ const MUTATION_AFTER_READ_RE =
   /(?:然后|随后|之后|再|并(?:且)?).{0,120}(?:将.{1,80}(?:改为|替换为)|修改|更新|新增|添加|修复|补齐|调整|接入|集成|生成|输出|落地|创建|删除|替换|重构|保存|导出|实现)|(?:then|after(?:wards)?|and then).{0,120}(?:implement|update|modify|fix|add|wire|integrate|generate|write|create|delete|replace|refactor|save|export)/i;
 const EXPLICIT_NO_MUTATION_RE =
   /^(?:不(?:修改|改动|新增|改变|写入)|无需(?:修改|改动|新增|改变|写入)|保持.{0,80}不变|do not (?:modify|change|write)\b|no (?:source |code )?changes?\b|keep.{0,80}unchanged\b)/i;
-const VALIDATION_TASK_TEXT_RE =
-  /(?:验证|测试|验收|检查|确认|构建|编译|lint|类型检查|回归|verify|validate|test|acceptance|check|build|compile|typecheck|type-check|regression)/i;
-const VALIDATION_COMMAND_RE =
-  /(?:\b(?:test|tests|testing|lint|typecheck|type-check|check|build|compile|clippy|pytest|vitest|jest|playwright|cypress)\b|tsc(?:\s|$)|cargo\s+(?:test|check|build|clippy)\b|go\s+test\b|swift\s+test\b|dotnet\s+test\b|mvn\s+test\b|gradle\w*\s+\S+)/i;
 
 function stripPlanListSyntax(line: string): string {
   return String(line || "")
@@ -125,31 +118,6 @@ function isConcreteMutationOrDeliverableTask(task: PlanTask): boolean {
     return true;
   }
   return isPlanTaskSourceMutationObligation(task) && hasExplicitMutationIntent(task.text);
-}
-
-function isExecutableValidationTask(task: PlanTask): boolean {
-  const evidence = task.evidence || [];
-  if (evidence.some((item) =>
-    item.kind === "browser_dom" ||
-    item.kind === "browser_screenshot" ||
-    item.kind === "dev_server_url"
-  )) {
-    return true;
-  }
-  const commands = [
-    ...(task.commands || []),
-    ...evidence.filter((item) => item.kind === "cmd").map((item) => item.value),
-  ].filter((value) => {
-    const command = String(value || "").trim();
-    return command && (
-      isFinitePlanValidationCommand(command) ||
-      requiresPtyObservationForPlanCommand(command)
-    );
-  });
-  return commands.length > 0 && (
-    VALIDATION_TASK_TEXT_RE.test(task.text) ||
-    commands.some((command) => VALIDATION_COMMAND_RE.test(command))
-  );
 }
 
 function failedPlanExecutionReadiness(input: Omit<ApprovedPlanExecutionReadiness, "ok" | "stopClass">): ApprovedPlanExecutionReadiness {
@@ -223,11 +191,13 @@ export function evaluateApprovedPlanExecutionReadiness(input: {
   const mutationOriented = reviewableArtifacts.some((artifact) =>
     collectSectionLines(artifact.content, isRuntimeTaskMutationSectionHeading).some(hasExplicitMutationIntent)
   );
-  const requiresExecutableValidation = reviewableArtifacts.some((artifact) =>
-    collectSectionLines(artifact.content, PLAN_VALIDATION_SECTION_RE).length > 0
-  );
+  const executableValidation = assessPlanExecutableValidation({
+    planArtifacts: reviewableArtifacts,
+    executionPlanTasks: input.executionPlanTasks,
+  });
+  const requiresExecutableValidation = executableValidation.requiresExecutableValidation;
   const concreteMutationTaskCount = input.executionPlanTasks.filter(isConcreteMutationOrDeliverableTask).length;
-  const executableValidationTaskCount = input.executionPlanTasks.filter(isExecutableValidationTask).length;
+  const executableValidationTaskCount = executableValidation.executableValidationTaskCount;
   const counts = {
     mutationOriented,
     requiresExecutableValidation,

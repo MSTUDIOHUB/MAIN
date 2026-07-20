@@ -188,6 +188,7 @@ const {
   activateExecuteRecoveryRuntimeState,
   advanceExecuteRecoveryRuntimeIteration,
   createExecuteRecoveryRuntimeState,
+  pinExecuteRecoveryFiniteValidationCheckpoint,
   transitionExecuteRecoveryRuntimeState,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/orchestrator/loop/executeRecoveryRuntime.ts"));
 
@@ -3818,7 +3819,7 @@ test("normal approved Plan execute workflow is not narrowed by tool history alon
   assert.equal(recovery.recoveryActionContract.allowTargetedFileRead, false);
 });
 
-test("repeat-edit validation recovery exposes only finite command validation", () => {
+test("unpinned validation recovery exposes only manifest discovery and finite command execution", () => {
   assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
     mode: "validation_only",
   }), true);
@@ -3830,7 +3831,7 @@ test("repeat-edit validation recovery exposes only finite command validation", (
   }), false);
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
     mode: "validation_only",
-  }), false);
+  }), true);
 
   const prompt = buildExecuteValidationRecoveryPrompt({
     language: "zh",
@@ -3846,8 +3847,19 @@ test("repeat-edit validation recovery exposes only finite command validation", (
 });
 
 test("failed finite validation recovery keeps an exact run_command checkpoint", () => {
+  const contract = resolveExecuteRecoveryActionContract("finite_validation_only", {
+    decisionCheckpoint: {
+      expectedTarget: "src/example.js",
+      sourceObservationKey: "src/example.js::v1",
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: {
+        command: "node -e require('./src/example.js')",
+        cwd: ".",
+      },
+    },
+  });
   assert.equal(isExecuteRecoveryToolName("run_command", readOnlyTools, {
-    mode: "finite_validation_only",
+    contract,
   }), true);
   for (const available of [
     "execute_command",
@@ -3856,11 +3868,11 @@ test("failed finite validation recovery keeps an exact run_command checkpoint", 
     "browser_evaluate",
   ]) {
     assert.equal(isExecuteRecoveryToolName(available, readOnlyTools, {
-      mode: "finite_validation_only",
+      contract,
     }), false, available);
   }
   assert.equal(isExecuteRecoveryToolName("read_file", readOnlyTools, {
-    mode: "finite_validation_only",
+    contract,
   }), false);
   const prompt = buildFailedFiniteValidationRecoveryPrompt({
     command: "node -e require('./src/example.js')",
@@ -4489,6 +4501,7 @@ test("recovery batch selection serializes different model call shapes by phase",
       expectedTarget: null,
       sourceObservationKey: null,
       nextRequiredCapability: "validation",
+      pendingFiniteValidation: { command: "npm test", cwd: "." },
     },
   });
   assert.deepEqual(commandValidationContract.toolCallRequirement, {
@@ -4506,6 +4519,20 @@ test("recovery batch selection serializes different model call shapes by phase",
   });
   assert.equal(commandValidation.selectedCallId, "focused-command");
   assert.deepEqual(commandValidation.deferredCallIds, ["browser-too-soon", "probe-first"]);
+
+  const unpinnedValidationContract = resolveExecuteRecoveryActionContract("validation_only", {
+    expectedTarget: "src/main.js",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src-main-v1",
+      nextRequiredCapability: "validation",
+      objectiveClosurePending: true,
+    },
+  });
+  assert.equal(unpinnedValidationContract.surfaceDescription, "capability:validation-discovery");
+  assert.deepEqual(unpinnedValidationContract.toolCallRequirement, { kind: "required_any" });
+  assert.equal(unpinnedValidationContract.allowedToolNames.has("run_command"), true);
+  assert.equal(unpinnedValidationContract.allowedToolNames.has("read_file"), true);
 
   const toolCallPartitioningSource = fsSync.readFileSync(
     path.join(workspaceRoot, "src/lib/orchestrator/loop/toolCallPartitioning.ts"),
@@ -5547,6 +5574,148 @@ test("validation reopens distinct edit obligations independently from generic re
     protocolViolation: "required_tool_call_not_available",
     protocolActualTools: ["read_file"],
   }), null);
+});
+
+test("direct-edit validation reopens only after a finite command is pinned", () => {
+  const recoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src/main.js",
+    attempts: 1,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: "src-main-v1",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src-main-v1",
+      nextRequiredCapability: "validation",
+      objectiveMutationEvidence: [{ target: "src/main.js" }],
+      objectiveClosurePending: true,
+    },
+  };
+  assert.equal(resolveValidationMutationReopen({
+    recoveryState,
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "second-edit",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/main.js",
+        search_text: "old open handler",
+        replace_text: "new open handler",
+      }),
+    }],
+  }), null);
+  const reopen = resolveValidationMutationReopen({
+    recoveryState: {
+      ...recoveryState,
+      decisionCheckpoint: {
+        ...recoveryState.decisionCheckpoint,
+        pendingFiniteValidation: { command: "npm run build", cwd: "." },
+      },
+    },
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "second-edit-after-pin",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/main.js",
+        search_text: "old open handler",
+        replace_text: "new open handler",
+      }),
+    }],
+  });
+  assert.deepEqual(reopen?.requestedTools, ["replace_in_file"]);
+  assert.equal(reopen?.budgetExhausted, false);
+
+});
+
+test("pinning a trusted validation command is attempt-neutral and closes the generic surface", () => {
+  const mutationTransition = transitionExecuteRecoveryRuntimeState(
+    {
+      mode: "mutation_first",
+      reason: "read_only_evidence_budget",
+      expectedTarget: "src/main.js",
+      attempts: 2,
+      phaseNoProgressCount: 1,
+      protocolNoProgressCount: 1,
+      protocolNoProgressFingerprint: "same-edit",
+      iterationCount: 1,
+      readLease: null,
+      sourceObservationKey: "src-main-v1",
+      decisionCheckpoint: {
+        expectedTarget: "src/main.js",
+        sourceObservationKey: "src-main-v1",
+        nextRequiredCapability: "mutation",
+      },
+    },
+    { mutationTarget: "src/main.js", mutationTargets: ["src/main.js"] },
+  );
+  assert.equal(mutationTransition.state.mode, "validation_only");
+  assert.equal(mutationTransition.state.decisionCheckpoint?.pendingFiniteValidation, undefined);
+
+  const pinned = pinExecuteRecoveryFiniteValidationCheckpoint(
+    mutationTransition.state,
+    { command: "npm run build", cwd: "." },
+  );
+  assert.equal(pinned.attempts, mutationTransition.state.attempts);
+  assert.equal(pinned.phaseNoProgressCount, mutationTransition.state.phaseNoProgressCount);
+  assert.deepEqual(pinned.decisionCheckpoint?.pendingFiniteValidation, {
+    command: "npm run build",
+    cwd: ".",
+  });
+  const contract = resolveExecuteRecoveryActionContract(pinned.mode, pinned);
+  assert.deepEqual([...contract.allowedToolNames], ["run_command"]);
+  assert.deepEqual(contract.toolCallRequirement, {
+    kind: "required_named",
+    toolName: "run_command",
+  });
+});
+
+test("validation cannot escape into mutation without a retained finite validation", () => {
+  const recoveryState = {
+    mode: "validation_only",
+    reason: "recovery_mutation_observed",
+    expectedTarget: "src/main.js",
+    attempts: 0,
+    phaseNoProgressCount: 0,
+    protocolNoProgressCount: 0,
+    protocolNoProgressFingerprint: null,
+    iterationCount: 0,
+    readLease: null,
+    sourceObservationKey: "src-main-v1",
+    decisionCheckpoint: {
+      expectedTarget: "src/main.js",
+      sourceObservationKey: "src-main-v1",
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: null,
+      objectiveMutationEvidence: [{ target: "src/main.js", requirementRef: "REQ-OPEN" }],
+      objectiveClosurePending: true,
+    },
+  };
+
+  assert.equal(resolveValidationMutationReopen({
+    recoveryState,
+    protocolViolation: "required_tool_call_not_available",
+    protocolActualTools: ["replace_in_file"],
+    protocolActualToolCalls: [{
+      index: 0,
+      id: "replace-instead-of-validating",
+      name: "replace_in_file",
+      arguments: JSON.stringify({
+        path: "src/main.js",
+        search_text: "oldValue",
+        replace_text: "newValue",
+      }),
+    }],
+  }), null, "an off-surface edit must be rejected until an exact failed validation is retained");
 });
 
 test("validation target switches bind a fresh observation or require a missing-window read", () => {

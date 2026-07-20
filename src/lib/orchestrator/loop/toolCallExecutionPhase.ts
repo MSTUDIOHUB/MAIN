@@ -341,7 +341,14 @@ export async function executeToolCallPhase(input: {
   toolFeedbackFormat: ToolFeedbackFormat;
   failedToolCallCounts: Map<string, number>;
   buildCurrentTaskTargetingProfile: () => TaskTargetingProfile;
-  iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId" | "turnContext">;
+  iterationContext: Pick<
+    TurnIterationContext,
+    | "eventThreadId"
+    | "eventTurnId"
+    | "turnContext"
+    | "startedToolCallIds"
+    | "completedToolCallIds"
+  >;
   emitTurnEvent: (event: MainThreadEventInput) => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   markExecuteOperationEvidence: () => void;

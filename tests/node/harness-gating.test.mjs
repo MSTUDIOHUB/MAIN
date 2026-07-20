@@ -389,6 +389,77 @@ test("validated Plan replace is promoted to one exact full-content write", async
   });
 });
 
+test("validation repair on replace_in_file is promoted to the repaired full-content write", async () => {
+  const original = [
+    "# Proposed Plan",
+    "",
+    "## 1. 目标与验收标准",
+    "- 修复 creator 映射，同时保留现有 creator 字段。",
+    "",
+    "## 2. 已确认证据",
+    "- `src/main.ts` 当前返回 creator，但消费方读取 creatorName。",
+    "",
+    "## 3. 实施步骤",
+    "- 修改 `src/main.ts`，在返回记录中添加 creatorName，并保留 creator 兼容字段。",
+    "",
+    "## 4. 影响范围",
+    "- 公共 API 和现有 creator 字段保持不变。",
+    "",
+    "## 5. 风险与回滚",
+    "- 若验证失败，恢复原有字段映射。",
+    "",
+    "## 6. 测试方案",
+    "- 手动验证：",
+    "  - 使用 `creator-orders.csv` 导入 creator 数据。",
+    "  - 观察 Dashboard 是否正确显示 creatorName。",
+    "- 代码审查：确认返回值与消费方字段契约兼容。",
+    "",
+    "## 7. 假设与默认值",
+    "- 保持无关解析行为不变。",
+  ].join("\n");
+  globalThis.mockIpcInvoke = async (cmd, invokeArgs) => {
+    if (cmd !== "read_file") return {};
+    return JSON.stringify(invokeArgs || {}).includes("package.json")
+      ? JSON.stringify({ scripts: { test: "tsc --noEmit" } })
+      : original;
+  };
+  const args = {
+    path: ".MAIN/plans/plan.md",
+    search_text: "修复 creator 映射",
+    replace_text: "修复 creatorName 映射",
+  };
+  const tc = {
+    id: "call-plan-validation-repair-replace",
+    name: "replace_in_file",
+    arguments: JSON.stringify(args),
+  };
+  const result = await buildPlanArtifactMutationValidationError(
+    tc,
+    args,
+    "/tmp/workspace",
+    createMockCallbacks({ getIsPlanApproved: () => false }),
+    {
+      recentToolActivity: [{
+        name: "read_file",
+        target: "src/main.ts",
+        status: "succeeded",
+        detail: "returns creator; consumer reads creatorName",
+      }],
+    },
+  );
+
+  assert.equal(result, null, result?.content);
+  assert.equal(tc.name, "write_file");
+  assert.equal(args.search_text, undefined);
+  assert.equal(args.replace_text, undefined);
+  assert.match(String(args.content || ""), /修复 creatorName 映射/);
+  assert.match(String(args.content || ""), /运行 `npm test` 并检查退出码与输出/);
+  assert.deepEqual(JSON.parse(tc.arguments), {
+    path: ".MAIN/plans/plan.md",
+    content: args.content,
+  });
+});
+
 test("buildLoopDetectionValidationError blocks repeated failed mutations on the same file path", () => {
   const messages = Array.from({ length: 5 }, (_value, index) => {
     const id = `call_write_${index + 1}`;

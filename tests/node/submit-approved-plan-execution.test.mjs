@@ -449,6 +449,27 @@ test("approval readiness rejects a recovered Plan whose validation prose has no 
   ), false, JSON.stringify(executionPlanTasks));
 });
 
+test("approval readiness accepts the recovered Plan after trusted manifest validation repair", () => {
+  const repairedContent = realQwenCsvRecoveryPlan().replace(
+    "## 6. 测试方案",
+    "## 6. 测试方案\n- 运行 `npm test` 并检查退出码与输出。",
+  );
+  const artifact = reviewablePlanArtifact(repairedContent);
+  const executionPlanTasks = ensureApprovedPlanRuntimeTasksForState(baseState({
+    planArtifacts: [artifact],
+    planTasks: [],
+    isPlanApproved: false,
+  }), "zh");
+  const readiness = evaluateApprovedPlanExecutionReadiness({
+    planArtifacts: [artifact],
+    executionPlanTasks,
+  });
+
+  assert.equal(readiness.ok, true, JSON.stringify({ readiness, executionPlanTasks }));
+  assert.equal(readiness.concreteMutationTaskCount, 1);
+  assert.equal(readiness.executableValidationTaskCount, 1);
+});
+
 test("approval readiness keeps mutation intent from a combined diagnosis and fix heading", () => {
   const artifact = reviewablePlanArtifact([
     "# 白屏修复计划",

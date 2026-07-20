@@ -31,6 +31,39 @@ test("ordinary running turn stays in the continuous flow while streaming", async
   await expect(page.getByTestId("composer-stop-button")).toBeVisible();
 });
 
+test("stopping a running Turn atomically projects one canceled conclusion and restores the send control", async ({ page }) => {
+  await page.goto("/?e2eScenario=streaming-timer");
+
+  await expect(page.getByTestId("composer-stop-button")).toBeVisible();
+  await page.getByTestId("composer-stop-button").click();
+
+  await expect(page.getByTestId("composer-stop-button")).toHaveCount(0);
+  await expect(page.getByTestId("composer-send-button")).toBeVisible();
+  await expect(
+    page.getByTestId("turn-state-anchor").getByText("已取消", { exact: true }),
+  ).toBeVisible();
+  await expect.poll(async () => page.evaluate(() => {
+    const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+    return {
+      isGenerating: snapshot?.isGenerating,
+      agentStatus: snapshot?.agentStatus,
+      turnStatus: snapshot?.turnStatus,
+      turnResultKind: snapshot?.turnResultKind,
+      canceledRunConclusions: snapshot?.canceledRunConclusions,
+      turnConclusions: snapshot?.turnConclusions,
+      visibleFinals: snapshot?.visibleFinals,
+    };
+  })).toEqual({
+    isGenerating: false,
+    agentStatus: "idle",
+    turnStatus: "done",
+    turnResultKind: "canceled",
+    canceledRunConclusions: 1,
+    turnConclusions: 1,
+    visibleFinals: 1,
+  });
+});
+
 test("composer durably admits additional workspace Turns in FIFO order while a run is active", async ({ page }) => {
   await page.goto("/?e2eScenario=composer-running-guidance");
 

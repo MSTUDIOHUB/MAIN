@@ -19,6 +19,7 @@ import type {
 import type { AgentMessage } from "../lib/orchestrator";
 import type { WorkflowEngineStoreHelpers } from "../lib/orchestrator/workflowEngine";
 import type { TaskBlock } from "../lib/taskTypes";
+import { stripAssistantPublicProgress } from "../lib/assistantPublicProgress";
 import type {
   ConversationTurn,
   PendingOperationProposal,
@@ -296,7 +297,7 @@ export function projectSubmitBootstrapErrorConclusion<
     if (block.id === finalBlockId && block.type === "agent") {
       foundFinal = true;
       return {
-        ...block,
+        ...stripAssistantPublicProgress(block),
         content: input.message,
         streaming: false,
         hiddenProcess: false,
@@ -309,7 +310,10 @@ export function projectSubmitBootstrapErrorConclusion<
       block.type === "agent" &&
       block.visibility === "assistant_final"
     ) {
-      return { ...block, visibility: "assistant_update" as const };
+      return {
+        ...stripAssistantPublicProgress(block),
+        visibility: "assistant_update" as const,
+      };
     }
     return block;
   });
@@ -412,6 +416,7 @@ export function projectSubmitBootstrapErrorConclusion<
     ? {
         ...marker,
         status: "completed",
+        terminalResultKind: "error",
         ...(hasPlanTerminalProjection
           ? { isPlanApproved: false, planStage: "ready_to_execute" }
           : {}),

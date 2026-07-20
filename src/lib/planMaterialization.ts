@@ -3,6 +3,7 @@ import { parseToolFeedbackEnvelope } from "./toolFeedbackEnvelope";
 import {
   analyzePlanDecisionFork,
   classifyPlanArtifactQualityResult,
+  isFinitePlanValidationCommand,
   isRuntimeTaskMutationSectionHeading,
   repairActionablePlanArtifactContent,
   validateActionablePlanArtifact,
@@ -11,6 +12,7 @@ import {
   type PlanArtifactQualityResult,
   type PlanStage,
 } from "./workflowModels";
+import { findPlanValidationSectionHeadingLineIndex } from "./planExecutableValidation";
 import { extractPrimaryUserRequestText, normalizeTurnInputContextSignals, type TurnInputContextLike } from "./turnIntake";
 import {
   assessPlanConfigurationContracts,
@@ -37,6 +39,7 @@ export type PlanMaterializationSource =
   | "canonicalized_visible_plan"
   | "grounding_repaired_visible_plan"
   | "evidence_section_repaired_visible_plan"
+  | "manifest_validation_repaired_plan"
   | "deterministic_evidence";
 
 export interface PlanMaterializationResult {
@@ -2507,6 +2510,64 @@ function buildDeterministicValidationPlanLines(input: {
   return lines;
 }
 
+export type TrustedValidationPlanRepairReason =
+  | "missing_trusted_validation_command"
+  | "missing_plan_validation_section";
+
+export type TrustedValidationPlanRepairResult =
+  | { ok: true; repaired: boolean; content: string; commands: string[]; reason: null }
+  | { ok: false; repaired: false; content: string; commands: []; reason: TrustedValidationPlanRepairReason };
+
+/**
+ * Add only runtime-supplied, finite commands to the existing validation
+ * section. Command discovery belongs to the trusted workspace-manifest layer;
+ * this pure representation repair never infers a command from file names.
+ */
+export function appendTrustedValidationCommandsToPlan(input: {
+  content: string;
+  commands: string[];
+  language?: "zh" | "en";
+}): TrustedValidationPlanRepairResult {
+  const content = String(input.content || "");
+  const commands = uniqueValidationCommands(input.commands)
+    .filter(isFinitePlanValidationCommand)
+    .filter((command) => !content.includes(`\`${command}\``));
+  if (commands.length === 0) {
+    return {
+      ok: false,
+      repaired: false,
+      content,
+      commands: [],
+      reason: "missing_trusted_validation_command",
+    };
+  }
+  const headingIndex = findPlanValidationSectionHeadingLineIndex(content);
+  if (headingIndex < 0) {
+    return {
+      ok: false,
+      repaired: false,
+      content,
+      commands: [],
+      reason: "missing_plan_validation_section",
+    };
+  }
+
+  const language = input.language === "en" ? "en" : "zh";
+  const lines = content.split(/\r?\n/);
+  let insertIndex = headingIndex + 1;
+  while (insertIndex < lines.length && !lines[insertIndex]?.trim()) insertIndex += 1;
+  const validationLines = buildDeterministicValidationPlanLines({ commands, language })
+    .map((line) => `- ${line}`);
+  lines.splice(insertIndex, 0, ...validationLines, "");
+  return {
+    ok: true,
+    repaired: true,
+    content: lines.join("\n").replace(/\n{3,}/g, "\n\n").trim(),
+    commands,
+    reason: null,
+  };
+}
+
 function labelPlanReferenceLines(
   lines: string[],
   prefix: PlanFacetReferencePrefix,
@@ -2926,16 +2987,10 @@ function buildCodexStylePlanArtifact(input: {
     ...extractExplicitInteractiveStartupCommands(goal),
     ...extractInlineCommands([...evidence, ...constraints]),
   ]);
-  const inferredCommands = [
-    files.some((file) => /^src-tauri\/.*\.rs$/i.test(file))
-      ? "cargo check --manifest-path src-tauri/Cargo.toml"
-      : files.some((file) => /\.rs$/i.test(file)) ? "cargo check" : "",
-    files.some((file) => /\.(?:ts|tsx|js|jsx|mjs|cjs)$/i.test(file)) ? "npm run build" : "",
-    files.some((file) => /\.py$/i.test(file)) ? "python -m pytest" : "",
-    files.some((file) => /\.go$/i.test(file)) ? "go test ./..." : "",
-    files.some((file) => /\.cs$/i.test(file)) ? "dotnet test" : "",
-  ].filter(Boolean);
-  const commands = uniqueValidationCommands([...explicitCommands, ...inferredCommands]);
+  // A source extension proves neither that a toolchain is installed nor that
+  // the corresponding project command exists. Keep explicit user/evidence
+  // commands here; workspace-manifest command discovery runs before review.
+  const commands = explicitCommands;
   const desktopRuntimeRequired =
     /(?:mac(?:os)?|windows|linux|desktop|桌面|窗口|原生|native|dialog|button|click|select|drag|drop|keyboard|shortcut|鼠标|按钮|操作|交互|行为|功能|显示|无反应|失效|无法|启动|点击|选择|拖拽|键盘|快捷键)/i.test(goal) &&
     /(?:tauri|src-tauri|electron|wails|desktop)/i.test(evidence.join("\n"));
@@ -2976,7 +3031,7 @@ function buildCodexStylePlanArtifact(input: {
       : [`Implement the confirmed data/reporting change for ${goalSummary} using the inspected evidence: ${evidence[0]}.`];
     const validation = [
       ...buildFacetValidationPlanLines({ facets, language: "en" }),
-      ...(commands.length > 0
+      ...(commands.length > 0 || desktopRuntimeRequired
         ? buildDeterministicValidationPlanLines({ commands, language: "en", desktopRuntimeRequired })
         : ["Run the focused test, build, or browser/desktop validation for the touched subsystem and record the result."]),
     ];
@@ -3031,7 +3086,7 @@ function buildCodexStylePlanArtifact(input: {
     : [`基于已确认的证据实施与“${goalSummary}”相关的数据/报表改动：${evidence[0]}。`];
   const validation = [
     ...buildFacetValidationPlanLines({ facets, language: "zh" }),
-    ...(commands.length > 0
+    ...(commands.length > 0 || desktopRuntimeRequired
       ? buildDeterministicValidationPlanLines({ commands, language: "zh", desktopRuntimeRequired })
       : ["运行受影响子系统的聚焦测试、构建检查或浏览器/桌面验证，并记录结果。"]),
   ];

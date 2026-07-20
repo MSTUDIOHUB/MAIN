@@ -91,6 +91,15 @@ test("phase threshold pivots twice before the bounded recovery fuse pauses", () 
     "current_task_action_lock",
     "alternate_capability_reframe",
   ]);
+  assert.equal(
+    second.state.phaseNoProgressCount,
+    runtime.MAX_EXECUTE_RECOVERY_ITERATIONS + 1,
+    "a wording-only pivot cannot refund the unchanged mutation surface",
+  );
+  assert.equal(
+    second.state.protocolNoProgressCount,
+    runtime.MAX_EXECUTE_RECOVERY_ITERATIONS,
+  );
 
   const finalBoundary = runtime.resolveExecuteRecoveryNoProgressBoundary({
     state: exhaustedState(second.state.decisionCheckpoint.noProgressStrategyPivots),
@@ -108,6 +117,31 @@ test("phase threshold pivots twice before the bounded recovery fuse pauses", () 
     runtime.MAX_EXECUTE_RECOVERY_ITERATIONS + 1,
     "strategy exhaustion does not silently expand or refund the hard budget",
   );
+});
+
+test("pinned validation pivots cannot multiply the same run_command-only budget", () => {
+  const state = {
+    ...exhaustedState(),
+    mode: "validation_only",
+    decisionCheckpoint: {
+      ...exhaustedState().decisionCheckpoint,
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: { command: "npm test", cwd: "." },
+    },
+  };
+  const pivot = runtime.resolveExecuteRecoveryNoProgressBoundary({
+    state,
+    cause: "execute_recovery_phase_budget",
+    language: "en",
+    availableToolNames: ["run_command"],
+  });
+
+  assert.equal(pivot.decision.action, "continue_with_pivot");
+  assert.equal(pivot.state.mode, "validation_only");
+  assert.equal(pivot.state.phaseNoProgressCount, state.phaseNoProgressCount);
+  assert.equal(pivot.state.iterationCount, state.iterationCount);
+  assert.equal(pivot.state.protocolNoProgressCount, state.protocolNoProgressCount);
+  assert.equal(pivot.state.protocolNoProgressFingerprint, state.protocolNoProgressFingerprint);
 });
 
 test("strategy selection is capability-based and contains no provider or model branch", () => {

@@ -53,6 +53,7 @@ const {
 
 function createState(overrides = {}) {
   return {
+    currentTurnId: "turn-1",
     taskFlow: [{ id: 1, turnId: "turn-1", type: "user", content: "stop" }],
     conversationTurns: [{
       id: "turn-1",
@@ -96,6 +97,7 @@ function createState(overrides = {}) {
 
 function createHarness(overrides = {}) {
   let state = createState(overrides.state);
+  const expectedAbortController = state.abortController ?? null;
   let revisionToken = {};
   let nextTaskId = 2;
   const order = [];
@@ -116,6 +118,7 @@ function createHarness(overrides = {}) {
       runId: "run-1",
       reason: "user_cancelled",
       message: "Canceled and closed.",
+      expectedAbortController,
       nextTaskId: () => nextTaskId++,
       sessionGet: () => state,
       getSessionRevisionToken: () => revisionToken,
@@ -166,6 +169,180 @@ test("persistence failure is an explicit memory fallback, not a missing conclusi
   assert.deepEqual(harness.order, ["persist", "publish"]);
   assert.equal(harness.published[0].durableState, undefined);
   assert.equal(harness.state.runtimeEvents.at(-1).type, "turn.completed");
+});
+
+test("an already closed current Turn repairs stale busy controls without duplicating its conclusion", async () => {
+  const initial = createState({
+    conversationTurns: [{
+      ...createState().conversationTurns[0],
+      status: "done",
+    }],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Canceled and closed.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      createState().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "canceled",
+        summary: "Canceled and closed.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "canceled",
+      },
+    ],
+  });
+  const harness = createHarness({ state: initial });
+  harness.input.persistHarnessMarker = (projectedMarker) => {
+    harness.order.push("settle_harness");
+    return projectedMarker;
+  };
+  const result = await commitCanceledTurn(harness.input);
+
+  assert.equal(result.committed, true);
+  assert.equal(result.disposition, "already_closed_durable");
+  assert.deepEqual(harness.order, ["persist", "publish", "settle_harness"]);
+  assert.deepEqual(harness.state.runtimeEvents, initial.runtimeEvents);
+  assert.deepEqual(harness.state.taskFlow, initial.taskFlow);
+  assert.equal(harness.state.isGenerating, false);
+  assert.equal(harness.state.agentStatus, "idle");
+  assert.equal(harness.state.abortController, null);
+  assert.equal(harness.state.harnessRunMarker.status, "completed");
+});
+
+test("an already-closed cleanup reports an explicit memory fallback when durability is unavailable", async () => {
+  const initial = createState({
+    conversationTurns: [{ ...createState().conversationTurns[0], status: "done" }],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Canceled and closed.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      createState().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "canceled",
+        summary: "Canceled and closed.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "canceled",
+      },
+    ],
+  });
+  const harness = createHarness({ state: initial });
+  harness.input.persistProjection = async () => {
+    harness.order.push("persist");
+    throw new Error("disk unavailable");
+  };
+
+  const result = await commitCanceledTurn(harness.input);
+
+  assert.equal(result.committed, true);
+  assert.equal(result.disposition, "already_closed_memory_fallback");
+  assert.deepEqual(harness.order, ["persist", "publish"]);
+  assert.equal(harness.published[0].durableState, undefined);
+  assert.equal(harness.state.isGenerating, false);
+  assert.equal(harness.state.agentStatus, "idle");
+});
+
+test("an already-closed cleanup retries fail closed after a successor controller wins the CAS", async () => {
+  const oldController = { abort() {} };
+  const successorController = { abort() {} };
+  const terminalState = createState({
+    abortController: oldController,
+    conversationTurns: [{
+      ...createState().conversationTurns[0],
+      status: "done",
+    }],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Already complete.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      createState().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "success",
+        summary: "Already complete.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "success",
+      },
+    ],
+  });
+  const harness = createHarness({ state: terminalState });
+  let publishAttempts = 0;
+  harness.input.publishProjection = () => {
+    publishAttempts += 1;
+    harness.order.push("publish");
+    harness.setState({
+      ...harness.state,
+      harnessRunMarker: null,
+      activeActionRequest: null,
+      abortController: successorController,
+      isGenerating: true,
+      agentStatus: "running",
+    });
+    harness.replaceRevision();
+    return { published: false, disposition: "revision_conflict" };
+  };
+
+  const result = await commitCanceledTurn(harness.input);
+
+  assert.equal(result.committed, true);
+  assert.equal(result.disposition, "already_closed_durable");
+  assert.equal(result.attempts, 2);
+  assert.equal(publishAttempts, 1);
+  assert.deepEqual(harness.order, ["persist", "publish", "persist"]);
+  assert.equal(harness.state.abortController, successorController);
+  assert.equal(harness.state.isGenerating, true);
+  assert.equal(harness.state.agentStatus, "running");
 });
 
 test("a concurrent owner update retries and reuses the exact paused run id", async () => {
@@ -483,6 +660,7 @@ test("deferred cancellation publishes the old terminal before a same-key control
       runId: "run-1",
       reason: "superseded_by_new_user_turn",
       message: "The old Turn was canceled and closed.",
+      expectedAbortController: cancellationController.sessionGet().abortController ?? null,
       nextTaskId: () => 2,
       sessionGet: cancellationController.sessionGet,
       getSessionRevisionToken: cancellationController.getSessionRevisionToken,

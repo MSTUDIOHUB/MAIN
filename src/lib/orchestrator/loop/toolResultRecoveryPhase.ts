@@ -871,7 +871,14 @@ export async function handleToolResultRecoveryPhase(input: {
   executeRecoveryState: ExecuteRecoveryRuntimeState;
   recoveryPromptState: AgentLoopRecoveryPromptRuntimeState;
   evidenceRuntimeState: AgentLoopEvidenceRuntimeState;
-  iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId" | "turnContext">;
+  iterationContext: Pick<
+    TurnIterationContext,
+    | "eventThreadId"
+    | "eventTurnId"
+    | "turnContext"
+    | "startedToolCallIds"
+    | "completedToolCallIds"
+  >;
   emitTurnEvent: (event: MainThreadEventInput) => void;
   emitTaskOrchestratorPhase: EmitTaskOrchestratorPhase;
   emitPlanExecutionProgress: EmitPlanExecutionProgress;
@@ -1493,6 +1500,17 @@ export async function handleToolResultRecoveryPhase(input: {
     loopGuardRuntimeState,
     noProgressRecovery.tracking,
   );
+  // A no-progress decision is still downstream of real tool execution. Close
+  // every started item and satisfy native provider tool-call history before a
+  // continue/pause branch can leave this phase.
+  appendToolResultsToHistory({
+    callbacks: input.callbacks,
+    toolFeedbackFormat: input.toolFeedbackFormat,
+    results: input.results,
+    toolArgsByCallId: input.toolArgsByCallId,
+    iterationContext: input.iterationContext,
+    emitTurnEvent: input.emitTurnEvent,
+  });
   if (noProgressRecovery.status === "stopped") {
     return finish("stopped");
   }
@@ -1523,15 +1541,6 @@ export async function handleToolResultRecoveryPhase(input: {
       reason: "durable_structured_mutation",
     });
   }
-
-  appendToolResultsToHistory({
-    callbacks: input.callbacks,
-    toolFeedbackFormat: input.toolFeedbackFormat,
-    results: input.results,
-    toolArgsByCallId: input.toolArgsByCallId,
-    iterationContext: input.iterationContext,
-    emitTurnEvent: input.emitTurnEvent,
-  });
 
   const failedDesktopControl = input.results.find((result) =>
     result.name === "computer_use" && !result.internalFeedback && result.isError

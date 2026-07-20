@@ -40,6 +40,30 @@ test("tool result recovery phase owns post-tool recovery ordering", () => {
   assert.match(phaseSource, /handleExecuteConvergencePrompt\(\{[\s\S]*?logAgentEvent\("post_tool_result_continuation"/);
 });
 
+test("no-progress exits close tool lifecycle and provider history first", () => {
+  const noProgressIndex = phaseSource.indexOf(
+    "const noProgressRecovery = handleNoProgressRecovery({",
+  );
+  const appendIndex = phaseSource.indexOf(
+    "appendToolResultsToHistory({",
+    noProgressIndex,
+  );
+  const stoppedIndex = phaseSource.indexOf(
+    'if (noProgressRecovery.status === "stopped")',
+    noProgressIndex,
+  );
+  const continueIndex = phaseSource.indexOf(
+    'if (noProgressRecovery.status === "continue")',
+    noProgressIndex,
+  );
+
+  assert.notEqual(appendIndex, -1);
+  assert.notEqual(stoppedIndex, -1);
+  assert.notEqual(continueIndex, -1);
+  assert.ok(appendIndex < stoppedIndex);
+  assert.ok(appendIndex < continueIndex);
+});
+
 test("desktop environment failures pause once instead of entering a retry loop", () => {
   assert.match(phaseSource, /desktop_control_environment_blocked/);
   assert.match(

@@ -47,6 +47,7 @@ import {
 } from "../lib/toolUiGrouping";
 import { buildLiveTurnProcessTimelineModel, buildTurnProcessArchiveModel, type TurnArchiveStep } from "../lib/turnProcessArchive";
 import {
+  buildCapsuleActivityText,
   buildRuntimeProgressLedger,
   buildRunStatusProjection,
 } from "../lib/runtimeProgressLedger";
@@ -104,6 +105,7 @@ import { buildPlanApprovalIdentity } from "../lib/planApprovalIdentity";
 import { isSubagentActiveStatus, projectSubagentRuns } from "../lib/subagents";
 import { getHarnessActionRunId } from "../lib/harnessCrashTelemetry";
 import { shouldDetachGoalPresentationFromOwnerTurn } from "../lib/goalResumeBoundary";
+import { selectCapsulePublicCommentary } from "../lib/capsuleCommentary";
 
 const TURN_STATUS_LABELS: Record<string, string> = {
   planning: "Planning",
@@ -4236,6 +4238,30 @@ export default function ChatArea({
     agentStatus,
     isRunActive: capsuleIsRunActive,
   });
+  const capsuleActivityText = capsuleIsRunActive && [
+    "analyzing",
+    "planning",
+    "executing",
+    "validating",
+    "recovering",
+  ].includes(capsuleStatusProjection.kind)
+    ? buildCapsuleActivityText(capsuleRunStatus, language)
+    : "";
+  const capsuleCommentaryText = capsuleIsRunActive &&
+    !capsuleActionKind &&
+    activeSessionKey &&
+    capsuleTurn?.id &&
+    capsuleActiveRunId &&
+    ["analyzing", "planning", "executing", "validating", "recovering"].includes(
+      capsuleStatusProjection.kind,
+    )
+      ? selectCapsulePublicCommentary({
+          blocks: capsuleTurnBlocks,
+          sessionKey: activeSessionKey,
+          displayTurnId: capsuleTurn.id,
+          runId: capsuleActiveRunId,
+        })
+      : "";
 
   useEffect(() => {
     setIsCapsuleCollapsed(false);
@@ -5070,8 +5096,8 @@ export default function ChatArea({
                 ) : (
                   <div className="agent-explanation-scroll-container">
                     <div className="relative z-10 flex w-full flex-col items-start gap-3">
-                      <div className="flex items-center w-full justify-between">
-                        <div className="flex items-center min-w-0 flex-1">
+                      <div className="flex items-start w-full justify-between">
+                        <div className="flex items-start min-w-0 flex-1">
                           <button
                             ref={mButtonRef}
                             type="button"
@@ -5081,18 +5107,47 @@ export default function ChatArea({
                             }}
                             aria-expanded={showProgressPopover}
                             aria-controls="run-status-popover"
-                            className="shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:scale-105 active:scale-95 transition-all cursor-pointer"
+                            className="mt-0.5 shrink-0 mr-2.5 flex items-center justify-center h-6 w-6 rounded-full border border-[var(--accent-subtle-border)] bg-[var(--accent-subtle)] group hover:bg-[var(--accent)] hover:border-transparent hover:scale-105 active:scale-95 transition-all cursor-pointer"
                             title={language === "zh" ? "查看运行状态" : "View Run Status"}
                           >
                             <IconLogoM className="h-3.5 w-3.5 text-[var(--accent-light)] group-hover:text-[var(--accent-contrast)] pointer-events-none transition-colors" />
                           </button>
-                          <span
-                            data-testid="capsule-status-label"
-                            className={`min-w-0 block flex-1 truncate whitespace-nowrap text-left font-semibold ${
-                              isLightThemeMode ? "text-[#18181b]" : "text-white"
-                            }`}
-                          >
-                            {headerLabel}
+                          <span className="min-w-0 block flex-1 text-left">
+                            <span
+                              data-testid="capsule-status-label"
+                              className={`block truncate whitespace-nowrap font-semibold ${
+                                isLightThemeMode ? "text-[#18181b]" : "text-white"
+                              }`}
+                            >
+                              {headerLabel}
+                            </span>
+                            {capsuleCommentaryText && (
+                              <span
+                                data-testid="capsule-commentary-label"
+                                aria-live="polite"
+                                aria-atomic="true"
+                                title={capsuleCommentaryText}
+                                className={`mt-0.5 block truncate whitespace-nowrap text-[11px] font-medium ${
+                                  isLightThemeMode ? "text-[#3f3f46]" : "text-[#d4d4d8]"
+                                }`}
+                              >
+                                {language === "zh" ? "模型进展：" : "Model update: "}
+                                {capsuleCommentaryText}
+                              </span>
+                            )}
+                            {capsuleActivityText && (
+                              <span
+                                data-testid="capsule-activity-label"
+                                aria-live="polite"
+                                aria-atomic="true"
+                                title={capsuleActivityText}
+                                className={`mt-0.5 block truncate whitespace-nowrap text-[11px] font-normal ${
+                                  isLightThemeMode ? "text-[#52525b]" : "text-[#a1a1aa]"
+                                }`}
+                              >
+                                {capsuleActivityText}
+                              </span>
+                            )}
                           </span>
                         </div>
 

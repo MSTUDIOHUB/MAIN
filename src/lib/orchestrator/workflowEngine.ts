@@ -39,6 +39,7 @@ import {
   type ProviderCompatibilityRuntimeLaneState,
 } from "../sessionTypes";
 import type { TaskBlock } from "../taskTypes";
+import { stripAssistantPublicProgress } from "../assistantPublicProgress";
 import type { AttachedFile } from "../attachments";
 import type { FeishuRemoteContext } from "../remoteContextTypes";
 import type { StudioConfig as GameStudioConfig } from "../gameStudio/catalog";
@@ -79,6 +80,7 @@ import {
 } from "../planEvidence";
 import {
   getHarnessActionRunId,
+  isExactHarnessRunGeneration,
   isHarnessRunMarkerOwnedByRun,
   persistHarnessRunMarkerIfOwned,
   readHarnessRunMarker,
@@ -399,6 +401,7 @@ export class WorkflowEngine {
     let rejectedPlanActionContinuationIdentity: PlanExecutionRunProvenance | null = null;
     let lastNonActionableStopDiagnostic: {
       reason: string;
+      message: string;
       recoveryReason: string | null;
       phase: string | null;
       nextStep: string | null;
@@ -1156,18 +1159,16 @@ export class WorkflowEngine {
     const projectCurrentHarnessRunMarker = (
       status: "completed" | "paused" | "error",
       reason: string,
-      allowErrorOverride = false,
+      options: {
+        terminalResultKind?: "success" | "partial" | "blocked" | "error" | "canceled";
+        allowErrorOverride?: boolean;
+      } = {},
     ): TerminalHarnessProjectionResult => {
       const runtime = sessionGet();
       const marker = runtime.harnessRunMarker as HarnessRunMarker | null;
       if (!marker) return "absent";
-      const ownsIdentity =
-        marker.runId === harnessRunOwner.runId &&
-        marker.sessionKey === harnessRunOwner.sessionKey &&
-        marker.turnId === harnessRunOwner.turnId &&
-        marker.instanceId === harnessRunOwner.instanceId &&
-        marker.startedAt === harnessRunOwner.startedAt;
-      if (!isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner) && !(allowErrorOverride && ownsIdentity)) {
+      const ownsIdentity = isExactHarnessRunGeneration(marker, harnessRunOwner);
+      if (!isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner) && !(options.allowErrorOverride && ownsIdentity)) {
         if (marker?.status === "running") {
           logStoreEvent("harness_close_skipped_owner_mismatch", {
             expected: harnessRunOwner,
@@ -1186,6 +1187,12 @@ export class WorkflowEngine {
       const terminal: HarnessRunMarker = {
         ...marker,
         status,
+        ...(status === "completed" || status === "error"
+          ? {
+              terminalResultKind: options.terminalResultKind ||
+                (status === "error" ? "error" : "blocked"),
+            }
+          : { terminalResultKind: null }),
         planStage: runtime.planStage,
         isPlanApproved: runtime.isPlanApproved,
         updatedAt: closedAt,
@@ -1199,13 +1206,10 @@ export class WorkflowEngine {
       if (result === "absent" || result === "ownership_lost") return;
       const { source, terminal } = result;
       const currentGlobalMarker = readHarnessRunMarker();
-      const ownsExactGlobalGeneration = !!currentGlobalMarker &&
-        currentGlobalMarker.runId === harnessRunOwner.runId &&
-        currentGlobalMarker.sessionKey === harnessRunOwner.sessionKey &&
-        currentGlobalMarker.turnId === harnessRunOwner.turnId &&
-        currentGlobalMarker.instanceId === harnessRunOwner.instanceId &&
-        currentGlobalMarker.startedAt === harnessRunOwner.startedAt;
-      if (!ownsExactGlobalGeneration) {
+      if (
+        !currentGlobalMarker ||
+        !isExactHarnessRunGeneration(currentGlobalMarker, harnessRunOwner)
+      ) {
         logStoreEvent("harness_close_owner_lost_before_terminal_publish", {
           expected: harnessRunOwner,
           actual: currentGlobalMarker
@@ -1249,7 +1253,6 @@ export class WorkflowEngine {
         });
         return;
       }
-      const latestRuntime = sessionGet();
       logStoreEvent("agent_loop_stop_summary", {
         turnId,
         sessionKey: runSessionKey,
@@ -1258,8 +1261,12 @@ export class WorkflowEngine {
         reason: terminal.closeReason,
         workflowMode: source.workflowMode,
         runtimeIntent: source.runtimeIntent,
-        planStage: latestRuntime.planStage,
-        isPlanApproved: latestRuntime.isPlanApproved,
+        // beforePublish runs only after the owner/revision CAS succeeds, but
+        // immediately before the Store patch is installed. Read terminal
+        // lifecycle fields from that accepted projection, not the still-live
+        // pre-publication Store snapshot.
+        planStage: terminal.planStage,
+        isPlanApproved: terminal.isPlanApproved,
         iteration: source.iteration,
         maxIterations: source.maxIterations,
         latestTool: source.latestTool || null,
@@ -2205,10 +2212,18 @@ export class WorkflowEngine {
 
       onAssistantCommentary: (text, meta) => {
         const visibleText = String(text || "").trim();
-        if (!visibleText || isThinModelToolNarration(visibleText)) {
+        if (
+          meta?.modelAuthored !== true ||
+          !visibleText ||
+          isThinModelToolNarration(visibleText)
+        ) {
           logStoreEvent("assistant_commentary_suppressed", {
             turnId,
-            reason: visibleText ? "thin_tool_narration" : "empty",
+            reason: meta?.modelAuthored !== true
+              ? "not_model_visible_content"
+              : visibleText
+              ? "thin_tool_narration"
+              : "empty",
           });
           return;
         }
@@ -2218,18 +2233,39 @@ export class WorkflowEngine {
 
         sessionSet((state: any) => {
           const ownedTurnIds = new Set([turnId, toolDisplayTurnId].filter(Boolean));
+          const publicProgress = {
+            schemaVersion: 1 as const,
+            kind: "assistant_commentary" as const,
+            source: "model_visible_content" as const,
+            sessionKey: runSessionKey,
+            turnId,
+            displayTurnId: toolDisplayTurnId,
+            runId: activeRuntimeRunIdentity.runId,
+            parentRunId: activeRuntimeRunIdentity.parentRunId || null,
+            createdAt: Date.now(),
+          };
           const matchingBlocks = state.taskFlow.filter((block: any) =>
             block.type === "agent" &&
             ownedTurnIds.has(block.turnId) &&
             block.visibility !== "assistant_final" &&
             (
-              block.visibility === "assistant_update" ||
-              context.agentBlockIdsCreatedThisRun.has(block.id)
+              context.agentBlockIdsCreatedThisRun.has(block.id) ||
+              (
+                block.visibility === "assistant_update" &&
+                block.publicProgress?.source === "model_visible_content" &&
+                block.publicProgress?.sessionKey === runSessionKey &&
+                block.publicProgress?.runId === activeRuntimeRunIdentity.runId
+              )
             ) &&
             normalizeModelFeedbackForDedupe(String(block.content || "")) === normalized
           );
           const existing = matchingBlocks[matchingBlocks.length - 1];
-          if (existing?.visibility === "assistant_update") {
+          if (
+            existing?.visibility === "assistant_update" &&
+            existing.publicProgress?.source === "model_visible_content" &&
+            existing.publicProgress?.sessionKey === runSessionKey &&
+            existing.publicProgress?.runId === activeRuntimeRunIdentity.runId
+          ) {
             logStoreEvent("assistant_commentary_deduped", {
               turnId,
               blockId: existing.id,
@@ -2248,6 +2284,10 @@ export class WorkflowEngine {
             streaming: false,
             hiddenProcess: false,
             visibility: "assistant_update",
+            publicProgress: {
+              ...publicProgress,
+              createdAt: existing?.publicProgress?.createdAt || publicProgress.createdAt,
+            },
           } as TaskBlock);
           const taskFlow = existing
             ? state.taskFlow.map((block: any) => block.id === blockId ? commentaryBlock : block)
@@ -2273,7 +2313,7 @@ export class WorkflowEngine {
         logStoreEvent("assistant_commentary_published", {
           turnId,
           visibleChars: visibleText.length,
-          modelAuthored: meta?.modelAuthored !== false,
+          modelAuthored: true,
           toolCalls: meta?.toolCalls?.length || 0,
         });
       },
@@ -4204,6 +4244,7 @@ export class WorkflowEngine {
       onNonActionableStop: (message: string, reason: "no_output" | "no_action" | "missing_tool_loop" | "incomplete_plan", progress?: Partial<PlanExecutionProgressUpdate>) => {
         lastNonActionableStopDiagnostic = {
           reason,
+          message: String(message || "").trim(),
           recoveryReason: progress?.recoveryReason || null,
           phase: progress?.phase || null,
           nextStep: progress?.nextStep || null,
@@ -4700,14 +4741,29 @@ export class WorkflowEngine {
             availableToolNames: terminalAvailableToolNames,
           })
         : { blocking: [], advisories: [] };
+      const partialDiagnosticUnfinished = outcome.resultKind === "partial" &&
+        lastNonActionableStopDiagnostic
+        ? [
+            lastNonActionableStopDiagnostic.message,
+            lastNonActionableStopDiagnostic.nextStep
+              ? ((current.preferredResponseLanguage || current.config.language) === "en"
+                  ? `Next step: ${lastNonActionableStopDiagnostic.nextStep}`
+                  : `下一步：${lastNonActionableStopDiagnostic.nextStep}`)
+              : "",
+          ].map((value) => String(value || "").trim()).filter(Boolean)
+        : [];
       const finalPresentation = resolveCompletedTurnFinalPresentation({
         turnBlocks,
         publishedModelFinalText: publishedCompletedAssistantFinalText,
         artifactPaths: isPlanTurn
           ? (current.planArtifacts || []).map((artifact: any) => artifact.path)
           : [],
-        unfinished: planTerminalProjection.blocking,
+        unfinished: [
+          ...planTerminalProjection.blocking,
+          ...partialDiagnosticUnfinished,
+        ],
         advisories: planTerminalProjection.advisories,
+        resultKind: outcome.resultKind,
         language: (current.preferredResponseLanguage || current.config.language) === "en" ? "en" : "zh",
       });
       completedTurnHasChanges = finalPresentation.hasChanges;
@@ -4736,11 +4792,14 @@ export class WorkflowEngine {
             block.visibility === "assistant_final" &&
             block.id !== finalBlockId
           ) {
-            return { ...block, visibility: "assistant_update" as const };
+            return {
+              ...stripAssistantPublicProgress(block),
+              visibility: "assistant_update" as const,
+            };
           }
           return block.id === finalBlockId && block.type === "agent"
             ? {
-                ...block,
+                ...stripAssistantPublicProgress(block),
                 content: finalPresentation.text,
                 streaming: false,
                 hiddenProcess: false,
@@ -4836,7 +4895,7 @@ export class WorkflowEngine {
           if (block.id === finalBlockId && block.type === "agent") {
             foundFinal = true;
             return {
-              ...block,
+              ...stripAssistantPublicProgress(block),
               content: conclusion,
               streaming: false,
               hiddenProcess: false,
@@ -4849,7 +4908,10 @@ export class WorkflowEngine {
             terminalTurnIds.has(block.turnId || "") &&
             block.visibility === "assistant_final"
           ) {
-            return { ...block, visibility: "assistant_update" as const };
+            return {
+              ...stripAssistantPublicProgress(block),
+              visibility: "assistant_update" as const,
+            };
           }
           return block;
         });
@@ -4951,7 +5013,7 @@ export class WorkflowEngine {
           if (block.id === finalBlockId && block.type === "agent") {
             foundFinal = true;
             return {
-              ...block,
+              ...stripAssistantPublicProgress(block),
               content: finalPresentation.text,
               streaming: false,
               hiddenProcess: false,
@@ -4963,7 +5025,10 @@ export class WorkflowEngine {
             terminalTurnIds.has(block.turnId || "") &&
             block.visibility === "assistant_final"
           ) {
-            return { ...block, visibility: "assistant_update" as const };
+            return {
+              ...stripAssistantPublicProgress(block),
+              visibility: "assistant_update" as const,
+            };
           }
           return block;
         });
@@ -5009,14 +5074,22 @@ export class WorkflowEngine {
     const projectHarnessForAgentLoopOutcome = (outcome: AgentLoopOutcome): TerminalHarnessProjectionResult => {
       switch (outcome.status) {
         case "completed":
-          return projectCurrentHarnessRunMarker("completed", outcome.reason || "agent_loop_completed");
+          return projectCurrentHarnessRunMarker(
+            "completed",
+            outcome.reason || "agent_loop_completed",
+            { terminalResultKind: outcome.resultKind },
+          );
         case "paused":
           return projectCurrentHarnessRunMarker("paused", outcome.reason || "agent_loop_paused");
         case "aborted":
           // Aborted describes why the execution run stopped. The harness lease
           // itself still closes cleanly after the cancellation conclusion is
           // durably committed.
-          return projectCurrentHarnessRunMarker("completed", outcome.reason || "agent_loop_aborted");
+          return projectCurrentHarnessRunMarker(
+            "completed",
+            outcome.reason || "agent_loop_aborted",
+            { terminalResultKind: "canceled" },
+          );
       }
     };
 
@@ -5058,7 +5131,7 @@ export class WorkflowEngine {
               });
               continue;
             }
-            let attemptHarnessProjection: TerminalHarnessProjectionResult = "absent";
+            let attemptHarnessProjection: Exclude<TerminalHarnessProjectionResult, "ownership_lost"> = "absent";
             if (requestedHarnessProjection !== "absent") {
               const marker = baseState.harnessRunMarker as HarnessRunMarker | null;
               if (!marker || !isHarnessRunMarkerOwnedByRun(marker, harnessRunOwner)) {
@@ -5081,6 +5154,8 @@ export class WorkflowEngine {
                   updatedAt: closedAt,
                   closedAt,
                   closeReason: requestedHarnessProjection.terminal.closeReason,
+                  terminalResultKind:
+                    requestedHarnessProjection.terminal.terminalResultKind || null,
                 },
               };
             }
@@ -5357,9 +5432,38 @@ export class WorkflowEngine {
             });
             if (planTerminalProjectionRejected) return false;
 
+            const terminalDraftState = draft.snapshot();
+            if (attemptHarnessProjection !== "absent") {
+              const terminalHarnessMarker = terminalDraftState.harnessRunMarker as HarnessRunMarker | null;
+              const expectedTerminalResultKind = outcome.status === "completed"
+                ? outcome.resultKind
+                : outcome.status === "aborted"
+                ? "canceled"
+                : null;
+              if (
+                !terminalHarnessMarker ||
+                !isExactHarnessRunGeneration(terminalHarnessMarker, harnessRunOwner) ||
+                (terminalHarnessMarker.terminalResultKind || null) !== expectedTerminalResultKind
+              ) {
+                logStoreEvent("terminal_projection_harness_snapshot_invalid", {
+                  sessionKey: runSessionKey,
+                  turnId,
+                  runId: terminalRunIdentity.runId,
+                  attempt,
+                  expectedTerminalResultKind,
+                  actualTerminalResultKind: terminalHarnessMarker?.terminalResultKind || null,
+                });
+                return false;
+              }
+              attemptHarnessProjection = {
+                source: attemptHarnessProjection.source,
+                terminal: terminalHarnessMarker,
+              };
+            }
+
             let durableState: any;
             try {
-              durableState = await persistCurrentSessionRuntime(draft.snapshot());
+              durableState = await persistCurrentSessionRuntime(terminalDraftState);
             } catch (error) {
               if (outcome.status !== "completed" || outcome.resultKind !== "error") {
                 throw error;
@@ -5373,7 +5477,7 @@ export class WorkflowEngine {
                 runId: terminalRunIdentity.runId,
                 error: error instanceof Error ? error.message : String(error),
               });
-              durableState = draft.snapshot();
+              durableState = terminalDraftState;
             }
             if (getSessionRevisionToken() !== baseRevisionToken) {
               logStoreEvent("terminal_projection_retry_after_concurrent_update", {
@@ -5385,7 +5489,7 @@ export class WorkflowEngine {
               continue;
             }
             const publication = publishOwnerScopedRuntimeProjection({
-              projectedState: draft.snapshot(),
+              projectedState: terminalDraftState,
               durableState,
               scopeKey: runScopeKey,
               sessionId: runSessionId,
@@ -5488,8 +5592,12 @@ export class WorkflowEngine {
           ...planTerminalProjection.blocking,
           ...(loopOutcome.status === "aborted" ||
           (loopOutcome.status === "completed" &&
-            (loopOutcome.resultKind === "error" || loopOutcome.resultKind === "blocked"))
-            ? [loopOutcome.reason]
+            (
+              loopOutcome.resultKind === "error" ||
+              loopOutcome.resultKind === "blocked" ||
+              loopOutcome.resultKind === "partial"
+            ))
+            ? [lastNonActionableStopDiagnostic?.nextStep || loopOutcome.reason]
             : []),
         ],
         advisories: planTerminalProjection.advisories,
@@ -5701,7 +5809,7 @@ export class WorkflowEngine {
       const harnessProjection = projectCurrentHarnessRunMarker(
         "completed",
         "terminal_error_memory_fallback",
-        true,
+        { terminalResultKind: "error", allowErrorOverride: true },
       );
       if (harnessProjection === "ownership_lost") {
         return { committed: false, finalText: null };
@@ -5994,6 +6102,13 @@ export class WorkflowEngine {
               },
               onThought: (...args: Parameters<OrchestratorCallbacks["onThought"]>) => {
                 if (acceptGoalCallback("onThought")) callbacks.onThought(...args);
+              },
+              onAssistantCommentary: (
+                ...args: Parameters<NonNullable<OrchestratorCallbacks["onAssistantCommentary"]>>
+              ) => {
+                if (acceptGoalCallback("onAssistantCommentary")) {
+                  callbacks.onAssistantCommentary?.(...args);
+                }
               },
               onAssistantFinalText: (
                 ...args: Parameters<OrchestratorCallbacks["onAssistantFinalText"]>
@@ -6798,7 +6913,7 @@ export class WorkflowEngine {
       const errorHarnessProjection = projectCurrentHarnessRunMarker(
         "completed",
         "agent_loop_error_conclusion",
-        true,
+        { terminalResultKind: "error", allowErrorOverride: true },
       );
       if (errorHarnessProjection === "ownership_lost") {
         clearInterval(timerInterval);

@@ -54,6 +54,7 @@ function loadTranspiledModuleSync(sourcePath) {
 }
 
 const {
+  appendTrustedValidationCommandsToPlan,
   canonicalizePlanArtifactContent,
   composePlanArtifactFromEvidence,
   composeReviewablePlanFromEvidence,
@@ -376,6 +377,41 @@ const {
   deriveRuntimePlanTasksFromArtifacts,
   validateActionablePlanArtifact,
 } = loadTranspiledModuleSync(path.join(workspaceRoot, "src/lib/workflowModels.ts"));
+
+test("trusted manifest validation repair adds an exact executable task without guessing a build command", () => {
+  const content = [
+    "# Proposed Plan",
+    "",
+    "## 已确认证据",
+    "- `src/hooks/useCsvParser.ts` 的字段映射与下游类型不一致。",
+    "",
+    "## 实施步骤",
+    "- 修改 `src/hooks/useCsvParser.ts`，补齐 creatorName 映射并保留 creator 兼容字段。",
+    "",
+    "## 测试方案",
+    "- 上传现有 CSV 并人工确认 Dashboard 的 creator 显示。",
+  ].join("\n");
+  const repaired = appendTrustedValidationCommandsToPlan({
+    content,
+    commands: ["npm test"],
+    language: "zh",
+  });
+
+  assert.equal(repaired.ok, true);
+  assert.match(repaired.content, /运行 `npm test` 并检查退出码与输出/);
+  assert.doesNotMatch(repaired.content, /npm run build/);
+  const tasks = deriveRuntimePlanTasksFromArtifacts([{
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: repaired.content,
+    revision: 1,
+    updatedAt: 1,
+  }], { language: "zh" });
+  assert.equal(tasks.some((task) =>
+    task.executionKind === "validation" && task.commands?.includes("npm test")
+  ), true, JSON.stringify(tasks));
+});
 
 test("materializes valid visible plan text into plan.md artifact", () => {
   const result = materializePlanArtifactFromVisibleText({
@@ -772,8 +808,8 @@ test("source evidence preserves interface contracts and detects cross-file misma
   assert.match(plan, /generate_handler!/);
   assert.match(plan, /Tauri event API/);
   assert.match(plan, /`dialog:default`/);
-  assert.match(plan, /cargo check --manifest-path src-tauri\/Cargo\.toml/);
-  assert.match(plan, /npm run build/);
+  assert.doesNotMatch(plan, /cargo check --manifest-path src-tauri\/Cargo\.toml/);
+  assert.doesNotMatch(plan, /npm run build/);
   assert.match(plan, /实际启动的桌面窗口/);
   assert.doesNotMatch(plan, /read file content/);
   const generatedTechnicalSections = plan.match(/## 已确认证据[\s\S]*?(?=\n## 公共 API)/)?.[0] || "";
@@ -2467,7 +2503,8 @@ test("deterministic plan preserves the exact creator to creatorName repair contr
   assert.match(content, /保持 creator 向后兼容/);
   assert.match(content, /`src\/hooks\/useCsvParser\.ts`/);
   assert.match(content, /normalizeCsvOrder 目前只返回 creator/);
-  assert.match(content, /运行 `npm run build`/);
+  assert.doesNotMatch(content, /npm run build/);
+  assert.match(content, /聚焦测试、构建检查或浏览器\/桌面验证/);
   assert.doesNotMatch(content, /course、date、status、amount/);
 });
 

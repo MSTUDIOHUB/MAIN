@@ -4,6 +4,7 @@ import {
   type SubmitExistingTurnAdoptionDecision,
 } from "../lib/submit/turnSubmission";
 import type { TaskBlock } from "../lib/taskTypes";
+import { stripAssistantPublicProgress } from "../lib/assistantPublicProgress";
 import {
   isConversationTurnRuntimeClosed,
   type ConversationTurn,
@@ -522,7 +523,10 @@ export function createGameStudioLocalSlashBridge(
               block.turnId === input.turnId &&
               block.type === "agent" &&
               block.visibility === "assistant_final"
-                ? { ...block, visibility: "assistant_update" as const }
+                ? {
+                    ...stripAssistantPublicProgress(block),
+                    visibility: "assistant_update" as const,
+                  }
                 : block
             )
           : s.taskFlow;
@@ -622,7 +626,10 @@ export function createGameStudioLocalSlashBridge(
               : block.turnId === input.turnId &&
                 block.type === "agent" &&
                 block.visibility === "assistant_final"
-                ? { ...block, visibility: "assistant_update" as const }
+                ? {
+                    ...stripAssistantPublicProgress(block),
+                    visibility: "assistant_update" as const,
+                  }
               : block
           )
         : localStudioTurnPatch.taskFlow;
@@ -899,10 +906,13 @@ export function createGameStudioLocalSlashBridge(
           block.visibility !== "assistant_final"
         ) return block;
         if (index !== canonicalFinalIndex) {
-          return { ...block, visibility: "assistant_update" as const };
+          return {
+            ...stripAssistantPublicProgress(block),
+            visibility: "assistant_update" as const,
+          };
         }
         return {
-          ...block,
+          ...stripAssistantPublicProgress(block),
           content,
           streaming: false,
           hiddenProcess: false,

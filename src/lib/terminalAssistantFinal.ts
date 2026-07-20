@@ -1,4 +1,5 @@
 import type { TaskBlock } from "./taskTypes";
+import type { TerminalResultKind } from "./turnEvents";
 import { collectDurableTurnExecutionSummary } from "./durableTurnContext";
 import {
   buildPlanTaskEvidenceAudit,
@@ -319,19 +320,34 @@ export function resolveCompletedTurnFinalPresentation(input: {
   artifactPaths?: string[];
   unfinished?: string[];
   advisories?: string[];
+  resultKind?: TerminalResultKind;
   language: "zh" | "en";
 }): CompletedTurnFinalPresentation {
-  const execution = collectDurableTurnExecutionSummary({
+  const resultKind = input.resultKind || "success";
+  let execution = collectDurableTurnExecutionSummary({
     turnBlocks: input.turnBlocks,
     artifactPaths: input.artifactPaths,
     unfinished: input.unfinished,
     advisories: input.advisories,
   });
+  // A completed(partial) Run closes the Turn, but it is never a success
+  // presentation. Persisted compatibility paths can reach this resolver
+  // without a detailed checkpoint, so add a conservative unfinished item
+  // rather than allowing the fallback to say "completed".
+  if (resultKind === "partial" && execution.unfinished.length === 0) {
+    execution = {
+      ...execution,
+      unfinished: [input.language === "zh"
+        ? "本轮只完成了部分工作；剩余修改或验证没有形成可恢复的详细记录。"
+        : "Only part of the requested work completed; no detailed recoverable record exists for the remaining change or validation."],
+    };
+  }
   const publishedModelFinalText = String(input.publishedModelFinalText || "").trim();
   // Runtime-owned blocking evidence outranks model-authored success prose. A
   // completed projection should be rare in this state, but persisted or
   // compatibility runs must still leave a truthful, recoverable conclusion.
-  const canUsePublishedModelFinal = Boolean(publishedModelFinalText) &&
+  const canUsePublishedModelFinal = resultKind === "success" &&
+    Boolean(publishedModelFinalText) &&
     execution.unfinished.length === 0;
   const publishedTextWithAdvisories = canUsePublishedModelFinal && execution.advisories.length > 0
     ? `${publishedModelFinalText}\n\n${formatAdvisorySection(execution.advisories, input.language)}`

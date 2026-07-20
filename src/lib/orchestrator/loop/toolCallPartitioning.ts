@@ -470,7 +470,10 @@ export async function partitionToolCallsForExecution(input: {
   readOnlyDuplicateSkipCounts: Map<string, number>;
   fileReadStates: Map<string, FileReadState>;
   browserValidationCache: Map<string, ToolExecutionResult>;
-  iterationContext: Pick<TurnIterationContext, "eventThreadId" | "eventTurnId">;
+  iterationContext: Pick<
+    TurnIterationContext,
+    "eventThreadId" | "eventTurnId" | "startedToolCallIds"
+  >;
   emitTurnEvent: (event: MainThreadEventInput) => void;
 }): Promise<ToolCallPartitioningResult> {
   const {
@@ -1741,6 +1744,7 @@ export async function partitionToolCallsForExecution(input: {
         },
       } as MainThreadItem,
     });
+    iterationContext.startedToolCallIds?.add(tc.id);
 
     if (planned.action === "local_file_read_review" && planned.localFileReadPath) {
       localFileReadCalls.push({ id: tc.id, name: tc.name, arguments: tc.arguments, localFileReadPath: planned.localFileReadPath });

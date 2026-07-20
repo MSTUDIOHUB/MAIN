@@ -93,6 +93,7 @@ import { sanitizeRestoredPlanArtifacts } from "../lib/planArtifactRestore";
 import {
   MAIN_THREAD_EVENT_SCHEMA_VERSION,
   appendRuntimeEvent,
+  isRunTerminalEvent,
   isTerminalTurnEvent,
   normalizeEventStreamMode,
   normalizePersistedMainThreadEvent,
@@ -335,6 +336,7 @@ import {
 } from "./slices/workspaceSlice";
 import {
   createSubmitPreRunSessionPatcher,
+  preserveSubmitSessionRuntimeOwnership,
   startSubmitElapsedTimer,
 } from "./submitRuntimeFacade";
 import { createSubmitSessionRuntimeController } from "./submitSessionRuntimeController";
@@ -490,6 +492,7 @@ import type {
   JobItem,
   TaskBlock,
 } from "../lib/taskTypes";
+import { stripAssistantPublicProgress } from "../lib/assistantPublicProgress";
 import type { FeishuRemoteContext } from "../lib/remoteContextTypes";
 import { compactThoughtContent } from "../lib/thoughtCompaction";
 import {
@@ -2092,7 +2095,7 @@ function canonicalizeRestoredTerminalTurnFinal(input: {
       block.visibility === "assistant_final"
     ) {
       return {
-        ...block,
+        ...stripAssistantPublicProgress(block),
         content: input.forceFinalText || !String(block.content || "").trim()
           ? restoredFinalText
           : block.content,
@@ -2107,7 +2110,10 @@ function canonicalizeRestoredTerminalTurnFinal(input: {
       block.turnId === input.turnId &&
       block.visibility === "assistant_final"
     ) {
-      return { ...block, visibility: "assistant_update" as const };
+      return {
+        ...stripAssistantPublicProgress(block),
+        visibility: "assistant_update" as const,
+      };
     }
     return block;
   });
@@ -4150,6 +4156,34 @@ function isActionRequestOwnedByGoalForDeletion(input: {
   }).owned;
 }
 
+function summarizeRestoredTerminalResult(
+  resultKind: "success" | "partial" | "blocked" | "error" | "canceled",
+  useChinese: boolean,
+): string {
+  switch (resultKind) {
+    case "success":
+      return useChinese
+        ? "运行已成功完成；恢复时清理了不一致的待处理控件。"
+        : "The run completed successfully; inconsistent pending controls were cleared during restore.";
+    case "partial":
+      return useChinese
+        ? "运行已得出部分完成结论；未完成信息已保留，恢复时清理了不一致的待处理控件。"
+        : "The run concluded partially; unfinished details were retained and inconsistent pending controls were cleared during restore.";
+    case "blocked":
+      return useChinese
+        ? "运行已收口但无法证明全部完成；阻塞信息已保留，恢复时清理了不一致的待处理控件。"
+        : "The run concluded without proof of full completion; blocker details were retained and inconsistent pending controls were cleared during restore.";
+    case "canceled":
+      return useChinese
+        ? "运行已取消；恢复时清理了不一致的待处理控件。"
+        : "The run was canceled; inconsistent pending controls were cleared during restore.";
+    case "error":
+      return useChinese
+        ? "运行已得出错误结论；恢复时清理了不一致的待处理控件。"
+        : "The run concluded with an error; inconsistent pending controls were cleared during restore.";
+  }
+}
+
 export function normalizeSessionRuntimeSnapshot(
   snapshot: Partial<SessionRuntimeSnapshot> | null | undefined,
   options?: {
@@ -4162,6 +4196,7 @@ export function normalizeSessionRuntimeSnapshot(
   },
 ): SessionRuntimeSnapshot | undefined {
   if (!snapshot) return undefined;
+  const expectedContainerSessionKey = String(options?.expectedSessionKey || "").trim();
   const selectedMainModeKey = mapLegacyNexusModeToMainMode(
     (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedMainModeKey ||
       (snapshot as Partial<SessionRuntimeSnapshot> & { selectedAgentKey?: string }).selectedNexusModeKey ||
@@ -4182,21 +4217,85 @@ export function normalizeSessionRuntimeSnapshot(
     return Number.isSafeInteger(blockId) && blockId > 0 ? [blockId] : [];
   });
   const normalizedContextMemoryState = normalizeContextMemoryState(snapshot.contextMemoryState);
-  const queuedUserMessage = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
+  const queuedUserMessageCandidate = normalizeQueuedUserMessage(snapshot.queuedUserMessage);
+  const queuedUserMessageOwnerKeys = queuedUserMessageCandidate
+    ? [
+        queuedUserMessageCandidate.sessionKey,
+        queuedUserMessageCandidate.goalContinuationAuthorization?.sessionKey,
+      ].filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    : [];
+  const queuedUserMessage = queuedUserMessageCandidate && (
+    !expectedContainerSessionKey ||
+    (
+      queuedUserMessageOwnerKeys.length > 0 &&
+      queuedUserMessageOwnerKeys.every((sessionKey) => sessionKey === expectedContainerSessionKey)
+    )
+  )
+    ? queuedUserMessageCandidate
+    : null;
   const activeGuidance = normalizeActiveGuidance(snapshot.activeGuidance);
-  const migratedLegacyGoal = snapshot.activeGoal
+  const migratedLegacyGoalCandidate = snapshot.activeGoal
     ? migrateGoalDefinition(snapshot.activeGoal)
     : null;
-  const restoredRuntime = snapshot.goalRuntime && [2, 3].includes(Number(snapshot.goalRuntime.schemaVersion))
+  const migratedRuntimeGoalCandidate = snapshot.goalRuntime?.goal
+    ? migrateGoalDefinition(snapshot.goalRuntime.goal)
+    : null;
+  const progressForAcceptedGoal = (
+    goal: GoalDefinition,
+    progress: GoalProgress | null | undefined,
+  ): GoalProgress => progress?.goalId === goal.id
+    ? { ...progress }
+    : createGoalProgress(goal.id, "");
+  const legacyWorkspaceGoalSessionKey = String(options?.workspacePath || "").trim();
+  const snapshotConversationTurnIds = new Set(
+    (snapshot.conversationTurns || [])
+      .map((turn) => String(turn?.id || "").trim())
+      .filter(Boolean),
+  );
+  const snapshotRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents);
+  const hasLegacyGoalOwnerEvidence = (goal: GoalDefinition): boolean => {
+    const ownerTurnId = String(goal.ownerTurnId || "").trim();
+    if (!ownerTurnId) return false;
+    if (snapshotConversationTurnIds.has(ownerTurnId)) return true;
+    return snapshotRuntimeEvents.some((event) =>
+      event.threadId === expectedContainerSessionKey &&
+      "turnId" in event &&
+      event.turnId === ownerTurnId
+    );
+  };
+  const goalMatchesExpectedContainer = (goal: GoalDefinition | null): boolean =>
+    !goal ||
+    !expectedContainerSessionKey ||
+    goal.sessionKey === expectedContainerSessionKey ||
+    (
+      (
+        !String(goal.sessionKey || "").trim() ||
+        (!!legacyWorkspaceGoalSessionKey && goal.sessionKey === legacyWorkspaceGoalSessionKey)
+      ) &&
+      hasLegacyGoalOwnerEvidence(goal)
+    );
+  const migratedLegacyGoal = goalMatchesExpectedContainer(migratedLegacyGoalCandidate)
+    ? migratedLegacyGoalCandidate
+    : null;
+  const migratedLegacyGoalProgress = migratedLegacyGoal
+    ? progressForAcceptedGoal(migratedLegacyGoal, snapshot.goalProgress)
+    : null;
+  const restoredRuntime = snapshot.goalRuntime &&
+    migratedRuntimeGoalCandidate &&
+    [2, 3].includes(Number(snapshot.goalRuntime.schemaVersion)) &&
+    goalMatchesExpectedContainer(migratedRuntimeGoalCandidate)
     ? {
         ...snapshot.goalRuntime,
-        goal: migrateGoalDefinition(snapshot.goalRuntime.goal),
-        progress: { ...snapshot.goalRuntime.progress },
+        goal: migratedRuntimeGoalCandidate,
+        progress: progressForAcceptedGoal(
+          migratedRuntimeGoalCandidate,
+          snapshot.goalRuntime.progress,
+        ),
       }
     : migratedLegacyGoal
       ? buildGoalRuntimeSnapshot({
           goal: migratedLegacyGoal,
-          progress: snapshot.goalProgress || createGoalProgress(migratedLegacyGoal.id, ""),
+          progress: migratedLegacyGoalProgress || createGoalProgress(migratedLegacyGoal.id, ""),
           phase: null,
         })
       : null;
@@ -4228,7 +4327,13 @@ export function normalizeSessionRuntimeSnapshot(
   });
   const persistedPlanIdentity = buildPlanApprovalIdentity(snapshot.planArtifacts || []);
   const restoredPlanIdentity = buildPlanApprovalIdentity(restoredPlanArtifacts.artifacts);
-  const originalActionRequest = normalizeActionRequest(snapshot.activeActionRequest);
+  const actionRequestCandidate = normalizeActionRequest(snapshot.activeActionRequest);
+  const originalActionRequest = actionRequestCandidate && (
+    !expectedContainerSessionKey ||
+    actionRequestCandidate.sessionKey === expectedContainerSessionKey
+  )
+    ? actionRequestCandidate
+    : null;
   const rawPlanLifecycle = snapshot.planLifecycle;
   const restoredLifecycleSessionKey = String(options?.expectedSessionKey || "").trim() ||
     UNBOUND_PLAN_SESSION_KEY;
@@ -4289,7 +4394,13 @@ export function normalizeSessionRuntimeSnapshot(
     snapshot: snapshot.planExecutionProgressSnapshot,
     tasks: rederivedPlanTasks,
   });
-  const normalizedHarnessRunMarker = normalizeHarnessRunMarker(snapshot.harnessRunMarker);
+  const harnessRunMarkerCandidate = normalizeHarnessRunMarker(snapshot.harnessRunMarker);
+  const normalizedHarnessRunMarker = harnessRunMarkerCandidate && (
+    !expectedContainerSessionKey ||
+    harnessRunMarkerCandidate.sessionKey === expectedContainerSessionKey
+  )
+    ? harnessRunMarkerCandidate
+    : null;
   const restoredProgress = snapshot.planExecutionProgressSnapshot;
   const expectedProgressTurnId = snapshot.currentTurnId ||
     snapshot.planApprovalExecutionStartedForTurnId ||
@@ -4548,7 +4659,9 @@ export function normalizeSessionRuntimeSnapshot(
     : invalidatedActionUsesChinese
     ? "待选择项与当前运行身份不一致；已移除失效按钮并保留上下文。"
     : "The pending choice no longer matches the active run; stale controls were removed and context was preserved.";
-  const restoredRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents);
+  const restoredRuntimeEvents = normalizeRuntimeEvents(snapshot.runtimeEvents).filter(
+    (event) => !expectedContainerSessionKey || event.threadId === expectedContainerSessionKey,
+  );
   const restoredMarkerRunId = getHarnessActionRunId(restoredHarnessRunMarker);
   const restoredMarkerRunConclusion = restoredMarkerRunId
     ? [...restoredRuntimeEvents].reverse().find((event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
@@ -4581,9 +4694,11 @@ export function normalizeSessionRuntimeSnapshot(
     const useChinese = /[^\x00-\x7F]/.test(String(turn.userPrompt || ""));
     const terminalResultKind = restoredMarkerRunConclusion?.type === "run.completed" && restoredMarkerRunConclusion.resultKind
       ? restoredMarkerRunConclusion.resultKind
+      : restoredHarnessRunMarker?.terminalResultKind
+      ? restoredHarnessRunMarker.terminalResultKind
       : restoredMarkerTerminalStatus === "error"
       ? "error" as const
-      : "success" as const;
+      : "blocked" as const;
     const terminalWasAborted = terminalResultKind === "canceled" && !!restoredMarkerRunAbort;
     const terminalReason = terminalWasAborted
       ? restoredMarkerRunAbort?.reason
@@ -4594,9 +4709,7 @@ export function normalizeSessionRuntimeSnapshot(
         ? "done" as const
         : "paused" as const,
       summary: ownsTerminalMarker
-        ? restoredMarkerTerminalStatus === "completed"
-          ? useChinese ? "运行已完成；恢复时清理了不一致的待处理控件。" : "The run completed; inconsistent pending controls were cleared during restore."
-          : useChinese ? "运行已得出错误结论；恢复时清理了不一致的待处理控件。" : "The run concluded with an error; inconsistent pending controls were cleared during restore."
+        ? summarizeRestoredTerminalResult(terminalResultKind, useChinese)
         : ownsInvalidatedRequest
         ? summarizeAssistantText(invalidatedChoiceText) || invalidatedActionMessage
         : useChinese
@@ -4682,7 +4795,7 @@ export function normalizeSessionRuntimeSnapshot(
               timestampMs,
               runId: invalidatedOwnerRequest.runId,
               parentRunId: invalidatedOwnerRequest.parentRunId || null,
-              resultKind: "success",
+              resultKind: sanitizedHarnessRunMarker?.terminalResultKind || "blocked",
               summary: "Restored completed run; stale pending action controls were removed.",
             }
           : {
@@ -4776,7 +4889,7 @@ export function normalizeSessionRuntimeSnapshot(
             timestampMs: sanitizedHarnessRunMarker.closedAt || Date.now(),
             runId: interruptedActionRunId,
             parentRunId: sanitizedHarnessRunMarker.activeParentRunId || sanitizedHarnessRunMarker.parentRunId || null,
-            resultKind: "success",
+            resultKind: sanitizedHarnessRunMarker.terminalResultKind || "blocked",
             summary: "Restored completed run checkpoint.",
           }
         : {
@@ -4819,7 +4932,7 @@ export function normalizeSessionRuntimeSnapshot(
         ? "error"
         : restoredProjectedRunConclusion?.type === "run.completed" && restoredProjectedRunConclusion.resultKind
         ? restoredProjectedRunConclusion.resultKind
-        : "success",
+        : sanitizedHarnessRunMarker.terminalResultKind || "blocked",
     }));
   }
   // A durable Turn conclusion is authoritative even when its Harness marker
@@ -5409,12 +5522,12 @@ export function normalizeSessionRuntimeSnapshot(
     activeGoal: normalizedGoalRuntime?.goal ?? legacyGoal,
     goalProgress: goalDeletionFenced
       ? null
-      : normalizedGoalRuntime?.progress ?? snapshot.goalProgress ?? null,
+      : normalizedGoalRuntime?.progress ?? (legacyGoal ? migratedLegacyGoalProgress : null),
     goalStatus: goalDeletionFenced
       ? "paused"
-      : normalizedGoalRuntime?.status ?? snapshot.goalStatus ?? "paused",
+      : normalizedGoalRuntime?.status ?? (legacyGoal ? snapshot.goalStatus ?? "paused" : "paused"),
     goalIterationBudget: normalizedGoalRuntime?.goal.iterationBudget
-      ?? snapshot.goalIterationBudget
+      ?? (legacyGoal ? snapshot.goalIterationBudget : undefined)
       ?? DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
     goalRuntime: normalizedGoalRuntime,
   };
@@ -5935,8 +6048,21 @@ function hasTurnTerminalConclusion(
   return hasTerminal && hasVisibleFinal;
 }
 
+function hasTurnTerminalEvent(
+  state: Pick<AppState, "runtimeEvents">,
+  sessionKey: string,
+  turnId: string,
+): boolean {
+  return state.runtimeEvents.some((event) =>
+    isTerminalTurnEvent(event) &&
+    event.threadId === sessionKey &&
+    event.turnId === turnId
+  );
+}
+
 function ensureCanceledTurnVisibleConclusion(input: {
   state: AppState;
+  sessionKey: string;
   turnId: string;
   message: string;
   nextTaskId: () => number;
@@ -5947,6 +6073,31 @@ function ensureCanceledTurnVisibleConclusion(input: {
     block.visibility === "assistant_final"
   );
   if (existingFinal) return input.state;
+  const turn = input.state.conversationTurns.find((candidate) => candidate.id === input.turnId);
+  const turnConclusion = [...input.state.runtimeEvents].reverse().find(
+    (event): event is Extract<MainThreadEvent, { type: "turn.completed" }> =>
+      isTerminalTurnEvent(event) &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId,
+  );
+  const runConclusion = [...input.state.runtimeEvents].reverse().find(
+    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+      isRunTerminalEvent(event) &&
+      event.threadId === input.sessionKey &&
+      event.turnId === input.turnId,
+  );
+  const resultKind = turn?.runtimeOutcome?.resultKind ||
+    turnConclusion?.resultKind ||
+    runConclusion?.resultKind ||
+    "canceled";
+  const usesChinese = /[^\x00-\x7F]/.test(String(turn?.userPrompt || input.message));
+  const canonicalMessage = String(turn?.summary || runConclusion?.summary || "").trim() || (
+    resultKind === "success"
+      ? usesChinese ? "本回合已完成。" : "This turn completed."
+      : resultKind === "error"
+        ? usesChinese ? "本回合已得出错误结论。" : "This turn concluded with an error."
+        : input.message
+  );
   const finalBlockId = input.nextTaskId();
   return {
     ...input.state,
@@ -5954,7 +6105,7 @@ function ensureCanceledTurnVisibleConclusion(input: {
       id: finalBlockId,
       turnId: input.turnId,
       type: "agent",
-      content: input.message,
+      content: canonicalMessage,
       streaming: false,
       visibility: "assistant_final",
     }],
@@ -5963,7 +6114,7 @@ function ensureCanceledTurnVisibleConclusion(input: {
         ? {
             ...turn,
             status: "done" as const,
-            summary: turn.summary || input.message,
+            summary: canonicalMessage,
             collapsed: false,
             blockIds: turn.blockIds.includes(finalBlockId)
               ? turn.blockIds
@@ -5983,14 +6134,18 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
   scopeKey: string;
   sessionId: number | null;
   turnId: string;
+  runId: string | null;
+  parentRunId: string | null;
   reason: string;
   message: string;
+  expectedAbortController: AbortController | null;
   nextTaskId: () => number;
 }): Promise<SessionCancellationSettlement> {
   let sessionDeleted = false;
   let targetWasActive = false;
   let projectedRuntime: SessionRuntimeState | null = null;
   let discardedQueueId: string | null = null;
+  let ownerTransferred = false;
 
   input.setState((latest) => {
     const sessionRecord = input.sessionId == null
@@ -6055,14 +6210,35 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
           ...ownerRuntime,
           runtimeEvents: ownerRuntime.runtimeEvents || [],
         }) as AppState;
+    const targetAlreadyTerminal = hasTurnTerminalEvent(
+      scopedState,
+      input.sessionKey,
+      input.turnId,
+    );
+    if (
+      !targetAlreadyTerminal &&
+      (scopedState.abortController ?? null) !== input.expectedAbortController
+    ) {
+      ownerTransferred = true;
+      return {};
+    }
     const projection = projectCanceledTurn({
       state: scopedState,
       sessionKey: input.sessionKey,
       turnId: input.turnId,
+      runId: input.runId,
+      parentRunId: input.parentRunId,
       reason: input.reason,
       message: input.message,
       nextTaskId: input.nextTaskId,
+      controlPlaneFence: {
+        abortController: input.expectedAbortController,
+      },
     });
+    if (projection.disposition === "ownership_lost") {
+      ownerTransferred = true;
+      return {};
+    }
     let projectedState = projection.state;
     if (
       projection.disposition === "already_closed" &&
@@ -6070,6 +6246,7 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
     ) {
       projectedState = ensureCanceledTurnVisibleConclusion({
         state: projectedState,
+        sessionKey: input.sessionKey,
         turnId: input.turnId,
         message: input.message,
         nextTaskId: input.nextTaskId,
@@ -6105,6 +6282,19 @@ async function reconcileCanceledTurnWithLatestRuntime(input: {
       terminalSettled: false,
       disposition: "session_deleted",
       queueDisposition: "discard",
+    };
+  }
+  if (ownerTransferred) {
+    logStoreEvent("canceled_turn_reconciliation_owner_transferred", {
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      runId: input.runId,
+    });
+    return {
+      sessionKey: input.sessionKey,
+      turnId: input.turnId,
+      terminalSettled: false,
+      disposition: "owner_transferred",
     };
   }
   if (!projectedRuntime) {
@@ -6770,6 +6960,26 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
         };
       case "agent":
         // Remove streaming flag (transient UI state) — keep content (string)
+        const publicProgress = b.publicProgress &&
+          b.publicProgress.schemaVersion === 1 &&
+          b.publicProgress.kind === "assistant_commentary" &&
+          b.publicProgress.source === "model_visible_content" &&
+          String(b.publicProgress.sessionKey || "").trim() &&
+          String(b.publicProgress.turnId || "").trim() &&
+          String(b.publicProgress.displayTurnId || "").trim() &&
+          String(b.publicProgress.runId || "").trim()
+            ? {
+                schemaVersion: 1 as const,
+                kind: "assistant_commentary" as const,
+                source: "model_visible_content" as const,
+                sessionKey: String(b.publicProgress.sessionKey).trim(),
+                turnId: String(b.publicProgress.turnId).trim(),
+                displayTurnId: String(b.publicProgress.displayTurnId).trim(),
+                runId: String(b.publicProgress.runId).trim(),
+                parentRunId: String(b.publicProgress.parentRunId || "").trim() || null,
+                createdAt: Math.max(0, Number(b.publicProgress.createdAt) || 0),
+              }
+            : null;
         return {
           id: b.id,
           turnId: b.turnId,
@@ -6778,6 +6988,7 @@ export function sanitizeTaskBlocksForPersist(blocks: TaskBlock[]): TaskBlock[] {
           content: stripVisualObservationProtocolComments(String(b.content)),
           ...(b.hiddenProcess ? { hiddenProcess: true } : {}),
           ...(b.visibility ? { visibility: b.visibility } : {}),
+          ...(publicProgress ? { publicProgress } : {}),
           ...(b.archivedAfterChoice ? { archivedAfterChoice: true } : {}),
           ...(b.archivedProposal ? { archivedProposal: true } : {}),
           ...(b.selectedOption ? { selectedOption: String(b.selectedOption) } : {}),
@@ -7037,66 +7248,86 @@ function resolveCurrentSessionModeAffinityFromState(state: any): SessionModeAffi
   return resolveSessionModeAffinity(activeSession || state, state.selectedMainModeKey || "main_mode");
 }
 
-function buildEmptySessionRuntimeSnapshot(
+export function buildEmptySessionRuntimeSnapshot(
   state: any,
   affinity: SessionModeAffinity,
-  owner: { sessionKey: string; sessionEpoch: string },
+  owner: { sessionKey: string; sessionEpoch: string; createdAt: number },
 ): SessionRuntimeSnapshot {
   const selectedMainModeKey = normalizeSessionModeAffinity(affinity, "main_mode");
-  return {
-    ...buildSessionRuntimeSnapshotFromStoreState({
-      ...state,
-      taskFlow: [],
-      agentMessages: [],
-      contextMemoryState: null,
-      conversationTurns: [],
-      currentTurnId: null,
-      selectedMainModeKey,
-      selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
-      imageStudio: state.imageStudio || createDefaultImageStudioRuntime(),
-      pendingSlashCommand: null,
-      planArtifacts: [],
-      planTasks: [],
-      planExecutionEvidenceLedger: [],
-      planExecutionEvidenceCount: 0,
-      planLifecycle: createEmptyPlanLifecycleForSession(
-        owner.sessionKey,
-        { sessionEpoch: owner.sessionEpoch },
-      ),
-      planStage: "idle",
-      isPlanApproved: false,
-      planApprovalChoice: null,
-      pendingPlanApprovalHandoff: null,
-      planApprovalExecutionStartedForTurnId: null,
-      clearedPlanTurnId: null,
-      showPlanPanel: false,
-      showDiff: false,
-      showTerminal: false,
-      showFilePanel: false,
-      rightPanelTab: "plan",
-      selectedDiffTaskId: null,
-      transcriptPartial: false,
-      transcriptLoadedTurns: 0,
-      transcriptTotalTurns: 0,
-      autoApproveTools: false,
-      autoApproveToolScopes: [],
-      preferSubagents: false,
-      webSearchEnabled: false,
-      webSearchProvider: "duckduckgo",
-      approvedShellPermissionRules: [],
-      queuedUserMessage: null,
-      activeGuidance: null,
-      workspaceTurnQueue: owner.sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
-        ? null
-        : createWorkspaceTurnQueueState({
-            sessionKey: owner.sessionKey,
-            sessionEpoch: owner.sessionEpoch,
-            updatedAt: Number(state?.currentSessionId) || Date.now(),
-          }),
-      workspaceInstructionLedger: [],
-    }),
+  const previousImageStudio = normalizeImageStudioRuntime(
+    state.imageStudio || createDefaultImageStudioRuntime(),
+  );
+  const snapshot = {
+    runtimeEventSchemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+    runtimeEvents: [],
+    harnessRunMarker: null,
+    activeActionRequest: null,
+    taskFlow: [],
+    agentMessages: [],
+    contextMemoryState: null,
+    contextMemoryStateByRuntimeKey: {},
+    providerCompatibilityByRuntimeKey: {},
+    conversationTurns: [],
+    currentTurnId: null,
+    selectedMainModeKey,
+    selectedNexusModeKey: mapMainModeToLegacyNexusMode(selectedMainModeKey),
     sessionModeAffinity: selectedMainModeKey,
-  };
+    imageStudio: {
+      ...previousImageStudio,
+      activeJobId: null,
+      activeStreamId: null,
+    },
+    activeStudioAgentKey: "studio_auto",
+    gameStudioInitialized: false,
+    pendingSlashCommand: null,
+    planArtifacts: [],
+    planTasks: [],
+    planExecutionEvidenceLedger: [],
+    planExecutionEvidenceCount: 0,
+    planAutoResumeCount: 0,
+    planExecutionProgressSnapshot: null,
+    planLifecycle: createEmptyPlanLifecycleForSession(owner.sessionKey, {
+      sessionEpoch: owner.sessionEpoch,
+      now: owner.createdAt,
+    }),
+    planStage: "idle",
+    isPlanApproved: false,
+    planApprovalChoice: null,
+    pendingPlanApprovalHandoff: null,
+    planApprovalExecutionStartedForTurnId: null,
+    clearedPlanTurnId: null,
+    showPlanPanel: false,
+    showDiff: false,
+    showTerminal: false,
+    showFilePanel: false,
+    rightPanelTab: "plan",
+    selectedDiffTaskId: null,
+    transcriptPartial: false,
+    transcriptLoadedTurns: 0,
+    transcriptTotalTurns: 0,
+    autoApproveTools: false,
+    autoApproveToolScopes: [],
+    preferSubagents: false,
+    webSearchEnabled: false,
+    webSearchProvider: "duckduckgo",
+    approvedShellPermissionRules: [],
+    queuedUserMessage: null,
+    activeGuidance: null,
+    workspaceTurnQueue: owner.sessionKey.startsWith(`${GLOBAL_CHAT_KEY}:`)
+      ? null
+      : createWorkspaceTurnQueueState({
+          sessionKey: owner.sessionKey,
+          sessionEpoch: owner.sessionEpoch,
+          updatedAt: owner.createdAt,
+        }),
+    workspaceInstructionLedger: [],
+    activeGoal: null,
+    goalProgress: null,
+    goalStatus: "paused",
+    goalIterationBudget: DEFAULT_GOAL_EMERGENCY_CONTINUATION_LIMIT,
+    goalRuntime: null,
+  } satisfies Required<SessionRuntimeSnapshot>;
+  return snapshot;
 }
 
 function buildNewSessionRecord(params: {
@@ -7130,6 +7361,7 @@ function buildNewSessionRecord(params: {
     runtimeSnapshot: buildEmptySessionRuntimeSnapshot(params.state, params.affinity, {
       sessionKey,
       sessionEpoch: planLifecycleEpoch,
+      createdAt,
     }),
   };
 }
@@ -8242,6 +8474,7 @@ export const useAppStore = create<AppState>()(
         : null;
     const ownerRunId = ownedActionRequest?.runId || getHarnessActionRunId(ownedMarker);
     const ownerParentRunId = ownedActionRequest?.parentRunId || ownedMarker?.parentRunId || null;
+    const expectedAbortController = current.abortController;
     const {
       sessionGet,
       sessionSet,
@@ -8270,6 +8503,7 @@ export const useAppStore = create<AppState>()(
         parentRunId: ownerParentRunId,
         reason,
         message,
+        expectedAbortController,
         nextTaskId: () => get()._nextTaskId(),
         sessionGet,
         getSessionRevisionToken,
@@ -8298,7 +8532,7 @@ export const useAppStore = create<AppState>()(
         block.turnId === turnId &&
         block.visibility === "assistant_final"
       );
-      const terminalSettled = result.disposition === "already_closed"
+      const terminalSettled = result.disposition.startsWith("already_closed")
         ? hasExistingTerminal && hasVisibleFinal
         : hasCanceledTurnTerminalProjection({
             sessionKey,
@@ -8338,8 +8572,11 @@ export const useAppStore = create<AppState>()(
           scopeKey,
           sessionId: current.currentSessionId,
           turnId,
+          runId: ownerRunId,
+          parentRunId: ownerParentRunId,
           reason,
           message,
+          expectedAbortController,
           nextTaskId: () => get()._nextTaskId(),
         });
       },
@@ -10367,15 +10604,23 @@ export const useAppStore = create<AppState>()(
     return resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
   },
   saveCurrentRuntimeToSession: () => {
-    const state = get();
-    const sessionKey = resolveSessionRuntimeKey(resolveSessionWorkspaceKey(state.currentWorkspace), state.currentSessionId);
-    if (!sessionKey) return;
-    set((s) => ({
-      runtimeBySessionKey: {
-        ...s.runtimeBySessionKey,
-        [sessionKey]: createSessionRuntimeFromState(s),
-      },
-    }));
+    set((s) => {
+      const sessionKey = resolveSessionRuntimeKey(
+        resolveSessionWorkspaceKey(s.currentWorkspace),
+        s.currentSessionId,
+      );
+      if (!sessionKey) return {};
+      const replacement = createSessionRuntimeFromState(s);
+      return {
+        runtimeBySessionKey: {
+          ...s.runtimeBySessionKey,
+          [sessionKey]: preserveSubmitSessionRuntimeOwnership(
+            s.runtimeBySessionKey[sessionKey],
+            replacement,
+          ),
+        },
+      };
+    });
   },
   restoreRuntimeForSession: (sessionKey: string | null, options: { requireTranscript?: boolean; resetPanels?: boolean } = {}) => {
     if (!sessionKey) return false;
@@ -17563,7 +17808,7 @@ export const useAppStore = create<AppState>()(
                 if (block.id === finalBlockId && block.type === "agent") {
                   foundFinal = true;
                   return {
-                    ...block,
+                    ...stripAssistantPublicProgress(block),
                     content: message,
                     streaming: false,
                     hiddenProcess: false,
@@ -17575,7 +17820,10 @@ export const useAppStore = create<AppState>()(
                   block.type === "agent" &&
                   block.visibility === "assistant_final"
                 ) {
-                  return { ...block, visibility: "assistant_update" as const };
+                  return {
+                    ...stripAssistantPublicProgress(block),
+                    visibility: "assistant_update" as const,
+                  };
                 }
                 return block;
               });

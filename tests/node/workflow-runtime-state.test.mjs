@@ -424,10 +424,39 @@ test("workflow engine projects then closes harness from structured agent loop ou
   assert.match(source, /const projectHarnessForAgentLoopOutcome = \(outcome: AgentLoopOutcome\)/);
   assert.match(source, /case "completed":[\s\S]*agent_loop_completed/);
   assert.match(source, /case "paused":[\s\S]*projectCurrentHarnessRunMarker\("paused"/);
-  assert.match(source, /case "aborted":[\s\S]*projectCurrentHarnessRunMarker\("completed"/);
+  assert.match(source, /case "aborted":[\s\S]*projectCurrentHarnessRunMarker\(\s*"completed"[\s\S]*terminalResultKind: "canceled"/);
   assert.match(source, /resultKind: outcome\.resultKind/);
   assert.match(source, /publishCurrentHarnessRunMarkerClose/);
   assert.match(source, /agent_loop_stop_summary/);
+  const harnessPublishStart = source.indexOf("const publishCurrentHarnessRunMarkerClose =");
+  const harnessPublishEnd = source.indexOf("const emitProgressRuntimeEvent =", harnessPublishStart);
+  const harnessPublishSource = source.slice(harnessPublishStart, harnessPublishEnd);
+  assert.match(harnessPublishSource, /planStage:\s*terminal\.planStage/);
+  assert.match(harnessPublishSource, /isPlanApproved:\s*terminal\.isPlanApproved/);
+  assert.doesNotMatch(harnessPublishSource, /latestRuntime\s*=\s*sessionGet\(\)/);
+  const terminalProjectionStart = source.indexOf(
+    "const commitTerminalProjectionBeforeStatusPublication = async",
+  );
+  const terminalProjectionEnd = source.indexOf(
+    "const commitTerminalTurnContext =",
+    terminalProjectionStart,
+  );
+  const terminalProjectionSource = source.slice(terminalProjectionStart, terminalProjectionEnd);
+  assert.ok(terminalProjectionStart >= 0 && terminalProjectionEnd > terminalProjectionStart);
+  assert.match(terminalProjectionSource, /const terminalDraftState = draft\.snapshot\(\)/);
+  assert.match(
+    terminalProjectionSource,
+    /const terminalHarnessMarker = terminalDraftState\.harnessRunMarker[\s\S]*terminal: terminalHarnessMarker/,
+  );
+  assert.match(
+    terminalProjectionSource,
+    /isExactHarnessRunGeneration\(terminalHarnessMarker, harnessRunOwner\)/,
+  );
+  assert.match(
+    terminalProjectionSource,
+    /persistCurrentSessionRuntime\(terminalDraftState\)/,
+  );
+  assert.match(terminalProjectionSource, /projectedState: terminalDraftState/);
   assert.match(source, /streamElapsedMs:\s*source\.streamElapsedMs/);
   assert.match(source, /lastStreamError:\s*source\.lastStreamError/);
 });
@@ -879,7 +908,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolRegistrySetupSource, /WEB_RESEARCH_TOOL_NAMES/);
   assert.match(toolRegistrySetupSource, /KNOWLEDGE_TOOL_NAMES/);
   assert.match(toolCallPartitioningSource, /export async function partitionToolCallsForExecution/);
-  assert.match(toolCallPartitioningSource, /iterationContext: Pick<TurnIterationContext, "eventThreadId" \| "eventTurnId">;/);
+  assert.match(toolCallPartitioningSource, /iterationContext: Pick</);
+  assert.match(toolCallPartitioningSource, /"eventThreadId" \| "eventTurnId" \| "startedToolCallIds"/);
   assert.match(toolCallPartitioningSource, /const \{ eventThreadId, eventTurnId \} = iterationContext;/);
   assert.match(toolCallPartitioningSource, /planRuntimeToolCall/);
   assert.match(toolCallPartitioningSource, /shouldBlockToolCallForTargeting/);
@@ -896,7 +926,8 @@ test("agent loop runtime state preparation is separated from the main execute lo
   assert.match(toolExecutionRoundSource, /logAgentEvent\("file_read_cache_stored"/);
   assert.match(toolExecutionRoundSource, /browserValidationCache\.set/);
   assert.match(toolResultHistorySource, /export function appendToolResultsToHistory/);
-  assert.match(toolResultHistorySource, /iterationContext: Pick<TurnIterationContext, "eventThreadId" \| "eventTurnId" \| "turnContext">;/);
+  assert.match(toolResultHistorySource, /iterationContext: Pick</);
+  assert.match(toolResultHistorySource, /\| "turnContext"[\s\S]*\| "startedToolCallIds"[\s\S]*\| "completedToolCallIds"/);
   assert.match(toolResultHistorySource, /const \{ eventThreadId, eventTurnId, turnContext \} = iterationContext;/);
   assert.match(toolResultHistorySource, /buildToolResultHistoryContentByFormat/);
   assert.match(toolResultHistorySource, /turnContext\.registerToolExecution/);
@@ -1602,10 +1633,16 @@ test("ordinary composer sends only reuse awaiting-choice turns on exact option m
   );
   assert.match(storeSource, /const result = await commitCanceledTurn\(\{/);
   assert.match(canceledCommitSource, /durableState = await input\.persistProjection\(projection\.state\)/);
+  const durableCancelPersistIndex = canceledCommitSource.indexOf(
+    "await input.persistProjection(projection.state)",
+  );
+  const durableCancelPublishIndex = canceledCommitSource.indexOf(
+    "const publication = input.publishProjection({",
+    durableCancelPersistIndex,
+  );
   assert.ok(
-    canceledCommitSource.indexOf("await input.persistProjection(projection.state)") <
-      canceledCommitSource.indexOf("input.publishProjection({"),
-    "cancellation must attempt persistence before terminal publication",
+    durableCancelPersistIndex >= 0 && durableCancelPublishIndex > durableCancelPersistIndex,
+    "a new cancellation conclusion must attempt persistence before terminal publication",
   );
   const goalClearStart = storeSource.indexOf("const buildClearedOwnerRuntime =");
   const goalClearEnd = storeSource.indexOf("const clearedOwnerRuntime =", goalClearStart);
@@ -2001,7 +2038,10 @@ test("terminal runs persist, accept the owner CAS, and settle Harness before pub
   );
   const gateCommitIndex = workflowEngineSource.indexOf("terminalStatusPublicationGate.commitTerminal({");
   const persistProjectionIndex = workflowEngineSource.indexOf("persistTerminalProjection:", gateCommitIndex);
-  const durablePersistIndex = workflowEngineSource.indexOf("await persistCurrentSessionRuntime(draft.snapshot())", persistProjectionIndex);
+  const durablePersistIndex = workflowEngineSource.indexOf(
+    "await persistCurrentSessionRuntime(terminalDraftState)",
+    persistProjectionIndex,
+  );
   const storePublishIndex = workflowEngineSource.indexOf(
     "publishOwnerScopedRuntimeProjection({",
     durablePersistIndex,

@@ -103,6 +103,39 @@ test("tool-only completion gets a deterministic Codex-style final from durable e
   assert.doesNotMatch(result.text, /agent_loop_completed/);
 });
 
+test("completed partial never renders a success claim and preserves the recovery checkpoint", () => {
+  const result = resolveCompletedTurnFinalPresentation({
+    turnBlocks: [userBlock, writeBlock],
+    publishedModelFinalText: "已完成本轮工作。",
+    unfinished: [
+      "打开文件流程仍未完成。",
+      "下一步：恢复目标检查点并完成剩余修改后运行 npm run build。",
+    ],
+    resultKind: "partial",
+    language: "zh",
+  });
+
+  assert.equal(result.source, "durable_evidence_fallback");
+  assert.match(result.text, /^本轮执行已结束，但仍有未完成项。/);
+  assert.match(result.text, /打开文件流程仍未完成/);
+  assert.match(result.text, /下一步：恢复目标检查点/);
+  assert.doesNotMatch(result.text, /已完成本轮工作/);
+});
+
+test("legacy partial without a diagnostic still fails closed to an incomplete summary", () => {
+  const result = resolveCompletedTurnFinalPresentation({
+    turnBlocks: [userBlock, writeBlock],
+    publishedModelFinalText: "Completed this task.",
+    resultKind: "partial",
+    language: "en",
+  });
+
+  assert.equal(result.source, "durable_evidence_fallback");
+  assert.match(result.text, /^This run has ended, but some work remains incomplete\./);
+  assert.match(result.text, /Only part of the requested work completed/);
+  assert.doesNotMatch(result.text, /Completed this task\./);
+});
+
 test("no-op workspace mutations do not claim file changes or completed_with_changes", () => {
   const noOpWrite = {
     ...writeBlock,
@@ -438,7 +471,7 @@ test("canonical result kinds route success finals separately from blocked error 
   );
   const terminalStart = workflowSource.indexOf("const commitTerminalProjectionBeforeStatusPublication = async");
   const terminalCommit = workflowSource.indexOf(
-    "durableState = await persistCurrentSessionRuntime(draft.snapshot())",
+    "durableState = await persistCurrentSessionRuntime(terminalDraftState)",
     terminalStart,
   );
   const terminalRouting = workflowSource.slice(terminalStart, terminalCommit);
@@ -464,6 +497,26 @@ test("canonical result kinds route success finals separately from blocked error 
   );
   assert.match(closedConclusion, /resultKind === "canceled"/);
   assert.match(closedConclusion, /resultKind === "blocked"/);
+});
+
+test("partial terminal outcomes retain a truthful unfinished explanation", () => {
+  const workflowSource = fsSync.readFileSync(
+    path.join(workspaceRoot, "src/lib/orchestrator/workflowEngine.ts"),
+    "utf8",
+  );
+  const durableContextStart = workflowSource.indexOf("const commitTerminalTurnContext =");
+  const durableContextEnd = workflowSource.indexOf(
+    "const terminalTurn = latestState.conversationTurns.find",
+    durableContextStart,
+  );
+  const durableContextSource = workflowSource.slice(durableContextStart, durableContextEnd);
+
+  assert.ok(durableContextStart >= 0 && durableContextEnd > durableContextStart);
+  assert.match(durableContextSource, /loopOutcome\.resultKind === "partial"/);
+  assert.match(
+    durableContextSource,
+    /lastNonActionableStopDiagnostic\?\.nextStep \|\| loopOutcome\.reason/,
+  );
 });
 
 test("recoverable no-progress pauses commit a partial assistant final", () => {

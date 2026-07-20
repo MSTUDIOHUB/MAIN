@@ -77,7 +77,9 @@ test("Capsule status projection exposes only structured high-level lifecycle cop
     "utf8",
   );
   assert.match(chatAreaSource, /data-testid="capsule-status-label"/);
-  assert.match(chatAreaSource, /className=\{`min-w-0 block flex-1 truncate whitespace-nowrap/);
+  assert.match(chatAreaSource, /data-testid="capsule-activity-label"/);
+  assert.match(chatAreaSource, /buildCapsuleActivityText\(capsuleRunStatus, language\)/);
+  assert.match(chatAreaSource, /aria-live="polite"/);
   assert.doesNotMatch(chatAreaSource, /currentTurnState\.capsuleExplanation/);
   assert.doesNotMatch(chatAreaSource, /deriveDynamicFirstPersonText/);
   assert.doesNotMatch(chatAreaSource, /planExecutionCapsuleProjection\?\.headline/);

@@ -61,6 +61,20 @@ export type AssistantTextVisibility =
   | "stage_summary"
   | "substantive_plan_text";
 
+export interface PublicAssistantProgressIdentity {
+  schemaVersion: 1;
+  kind: "assistant_commentary";
+  source: "model_visible_content";
+  sessionKey: string;
+  /** Logical Turn owner used by the runtime event ledger. */
+  turnId: string;
+  /** UI Turn that owns the rendered block (may equal turnId). */
+  displayTurnId: string;
+  runId: string;
+  parentRunId: string | null;
+  createdAt: number;
+}
+
 export type ProgressTaskBlock = TaskBlockBase & ProgressNarration & {
   type: "progress";
   toolCallId?: string;
@@ -108,6 +122,8 @@ export type TaskBlock =
       streaming?: boolean;
       hiddenProcess?: boolean;
       visibility?: AssistantTextVisibility;
+      /** Explicit provenance for safe Capsule public-progress projection. */
+      publicProgress?: PublicAssistantProgressIdentity;
       archivedAfterChoice?: boolean;
       archivedProposal?: boolean;
       selectedOption?: string;

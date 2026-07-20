@@ -11,6 +11,7 @@ import {
   type ForcedExecuteRecoveryRuntimeState,
   type RecoveryReadLease,
   type ExecuteNoProgressStrategyDecision,
+  type PendingFiniteValidationCheckpoint,
 } from "../../executeRecoveryTools";
 import { isLocalDevServerHealthProbeCommand } from "../../devServerRuntime";
 import { workspacePathsReferToSameFile } from "../../workspacePaths";
@@ -574,6 +575,45 @@ export function clearExecuteRecoveryRuntimeState(
     readLease: null,
     sourceObservationKey: null,
     decisionCheckpoint: null,
+  };
+}
+
+/**
+ * Attach the runtime-selected finite acceptance boundary without spending a
+ * recovery attempt or resetting no-progress accounting. Discovery is an
+ * internal policy step; only executing the command is model-visible progress.
+ */
+export function pinExecuteRecoveryFiniteValidationCheckpoint(
+  state: ExecuteRecoveryRuntimeState,
+  checkpoint: PendingFiniteValidationCheckpoint,
+): ExecuteRecoveryRuntimeState {
+  if (
+    state.mode !== "validation_only" &&
+    state.mode !== "finite_validation_only"
+  ) return state;
+  if (state.decisionCheckpoint?.pendingFiniteValidation) return state;
+  const command = checkpoint.command.trim();
+  const cwd = checkpoint.cwd.trim() || ".";
+  if (!command) return state;
+  return {
+    ...state,
+    decisionCheckpoint: {
+      ...(state.decisionCheckpoint || {
+        expectedTarget: state.expectedTarget,
+        sourceObservationKey: state.sourceObservationKey,
+        nextRequiredCapability: "validation" as const,
+      }),
+      expectedTarget: state.expectedTarget,
+      sourceObservationKey: state.sourceObservationKey,
+      nextRequiredCapability: "validation",
+      pendingFiniteValidation: {
+        command,
+        cwd,
+        ...(Number.isFinite(checkpoint.timeoutMs) && Number(checkpoint.timeoutMs) > 0
+          ? { timeoutMs: Math.floor(Number(checkpoint.timeoutMs)) }
+          : {}),
+      },
+    },
   };
 }
 
@@ -1276,6 +1316,10 @@ export function resolveExecuteRecoveryNoProgressBoundary(input: {
   const nextCapability = closeRepeatedRead
     ? "mutation" as const
     : previousCheckpoint?.nextRequiredCapability || "mutation";
+  const nextMode = closeRepeatedRead ? "mutation_first" as const : input.state.mode;
+  const contractBoundaryChanged = closeRepeatedRead ||
+    nextMode !== input.state.mode ||
+    nextCapability !== previousCheckpoint?.nextRequiredCapability;
   const checkpoint: ExecutionDecisionCheckpoint = {
     ...(previousCheckpoint || {
       expectedTarget: input.state.expectedTarget,
@@ -1291,13 +1335,23 @@ export function resolveExecuteRecoveryNoProgressBoundary(input: {
     decision,
     state: {
       ...input.state,
-      mode: closeRepeatedRead ? "mutation_first" : input.state.mode,
+      mode: nextMode,
       reason: `no_progress_strategy_pivot:${decision.strategy}`,
       attempts: input.state.attempts + 1,
-      phaseNoProgressCount: 0,
-      iterationCount: 0,
-      protocolNoProgressCount: 0,
-      protocolNoProgressFingerprint: null,
+      // A wording-only pivot does not buy another recovery window. Reset the
+      // hard budget only when the executable contract actually changes.
+      phaseNoProgressCount: contractBoundaryChanged
+        ? 0
+        : input.state.phaseNoProgressCount,
+      iterationCount: contractBoundaryChanged
+        ? 0
+        : input.state.iterationCount,
+      protocolNoProgressCount: contractBoundaryChanged
+        ? 0
+        : input.state.protocolNoProgressCount,
+      protocolNoProgressFingerprint: contractBoundaryChanged
+        ? null
+        : input.state.protocolNoProgressFingerprint,
       readLease: closeRepeatedRead ? null : input.state.readLease,
       decisionCheckpoint: checkpoint,
     },

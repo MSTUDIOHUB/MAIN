@@ -9,14 +9,15 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
-test("assistant updates stay ordered in ChatArea while Capsule exposes only a high-level status", async ({ page }) => {
+test("assistant updates stay ordered in ChatArea while Capsule exposes structured live activity", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-model-explanation");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
+  await expect(capsule.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
   await expect(capsule).not.toContainText("保留这条模型说明");
-  await expect(capsule).not.toContainText("ChatArea.tsx");
   await expect(capsule).not.toContainText("read_file");
+  await expect(capsule).not.toContainText("grep_search");
   await expect(capsule).not.toContainText("暂无工具调用");
   await expect(capsule).not.toContainText("tool:");
   await expect(capsule).not.toContainText("等待您的下一步指令");
@@ -50,6 +51,20 @@ test("assistant updates stay ordered in ChatArea while Capsule exposes only a hi
       page.evaluate(() => (window as any).__CODELY_E2E__?.getSnapshot?.().themeMode ?? null)
     )).toBe(mode);
     await expect(progressPopover).toBeVisible();
+    await expect(capsule.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
+    const capsuleSurface = await capsule.evaluate((element) => {
+      const capsuleStyle = getComputedStyle(element);
+      const activity = element.querySelector<HTMLElement>('[data-testid="capsule-activity-label"]');
+      const activityStyle = activity ? getComputedStyle(activity) : null;
+      return {
+        backgroundColor: capsuleStyle.backgroundColor,
+        activityColor: activityStyle?.color || "",
+        activityOverflow: activityStyle?.overflow || "",
+      };
+    });
+    expect(capsuleSurface.backgroundColor).not.toBe("rgba(0, 0, 0, 0)");
+    expect(capsuleSurface.activityColor).not.toBe("");
+    expect(capsuleSurface.activityOverflow).toBe("hidden");
     const surface = await progressPopover.evaluate((element) => {
       const style = getComputedStyle(element);
       return {
@@ -94,15 +109,16 @@ test("assistant updates stay ordered in ChatArea while Capsule exposes only a hi
   await expect(page.getByText("已确认公开阶段说明应留在 ChatArea，Capsule 只保留高层状态。")).toHaveCount(1);
   await expect(page.getByText("展示边界已经明确；下一步只需验证运行详情仍可从 M 弹层查看。")).toHaveCount(1);
   await expect(page.getByTestId("agent-explanation-capsule")).not.toContainText("保留这条模型说明");
+  await expect(page.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
 });
 
-test("capsule progress fallback never shows idle waiting copy", async ({ page }) => {
+test("capsule progress fallback shows concrete structured activity without idle waiting copy", async ({ page }) => {
   await page.goto("/?e2eScenario=capsule-progress-only");
 
   const capsule = page.getByTestId("agent-explanation-capsule");
   await expect(capsule).toBeVisible();
   await expect(capsule.getByTestId("capsule-status-label")).toHaveText("正在执行");
-  await expect(capsule).not.toContainText("ChatArea.tsx");
+  await expect(capsule.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
   await expect(capsule).not.toContainText("grep_search");
   await expect(page.getByTestId("turn-activity-notice")).toHaveCount(0);
   await expect(page.getByTestId("effective-progress-ledger")).toHaveCount(0);
@@ -114,6 +130,7 @@ test("turn process timeline stays inside its frame in a narrow viewport", async 
 
   const statusLabel = page.getByTestId("capsule-status-label");
   await expect(statusLabel).toHaveText("正在执行");
+  await expect(page.getByTestId("capsule-activity-label")).toHaveText("正在搜索 ChatArea.tsx");
   const statusMetrics = await statusLabel.evaluate((element) => {
     const style = getComputedStyle(element);
     return {
@@ -124,6 +141,13 @@ test("turn process timeline stays inside its frame in a narrow viewport", async 
   });
   expect(statusMetrics.whiteSpace).toBe("nowrap");
   expect(statusMetrics.height).toBeLessThanOrEqual(statusMetrics.lineHeight + 1);
+
+  const activityMetrics = await page.getByTestId("capsule-activity-label").evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+    capsuleWidth: element.closest('[data-testid="agent-explanation-capsule"]')?.getBoundingClientRect().width || 0,
+  }));
+  expect(activityMetrics.clientWidth).toBeLessThanOrEqual(activityMetrics.capsuleWidth);
 
   const timeline = page.getByTestId("live-turn-process-timeline");
   await expect(timeline).toBeVisible();

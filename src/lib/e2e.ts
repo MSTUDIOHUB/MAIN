@@ -26,7 +26,7 @@ import {
   reducePlanLifecycle,
 } from "./planLifecycle";
 import { issuePlanExplicitResumeAttempt } from "./planExecutionContinuation";
-import type { HarnessRunMarker } from "./harnessCrashTelemetry";
+import { readHarnessRunMarker, type HarnessRunMarker } from "./harnessCrashTelemetry";
 import { createGoalContinuationAuthorization } from "./submit/turnSubmission";
 import { MAIN_THREAD_EVENT_SCHEMA_VERSION } from "./turnEvents";
 import { projectSubagentRuns } from "./subagents";
@@ -324,6 +324,7 @@ function bindBridgeSnapshot(scenario: string) {
     const currentTurn = state.currentTurnId
       ? state.conversationTurns.find((turn) => turn.id === state.currentTurnId) || null
       : null;
+    const persistedHarnessRunMarker = readHarnessRunMarker();
     const visibleConversationTurns = state.conversationTurns
       .filter((turn) => turn.uiVisibility !== "internal")
       .map((turn) => ({
@@ -376,6 +377,42 @@ function bindBridgeSnapshot(scenario: string) {
       pendingPlanApprovalHandoff: state.pendingPlanApprovalHandoff,
       planApprovalExecutionStartedForTurnId: state.planApprovalExecutionStartedForTurnId,
       planLifecycleStatus: state.planLifecycle.status,
+      harnessRunMarker: state.harnessRunMarker
+        ? {
+            runId: state.harnessRunMarker.runId,
+            sessionKey: state.harnessRunMarker.sessionKey,
+            turnId: state.harnessRunMarker.turnId,
+            status: state.harnessRunMarker.status,
+            planStage: state.harnessRunMarker.planStage,
+            isPlanApproved: state.harnessRunMarker.isPlanApproved,
+          }
+        : null,
+      persistedHarnessRunMarker: persistedHarnessRunMarker
+        ? {
+            runId: persistedHarnessRunMarker.runId,
+            sessionKey: persistedHarnessRunMarker.sessionKey,
+            turnId: persistedHarnessRunMarker.turnId,
+            status: persistedHarnessRunMarker.status,
+            terminalResultKind: persistedHarnessRunMarker.terminalResultKind || null,
+            planStage: persistedHarnessRunMarker.planStage,
+            isPlanApproved: persistedHarnessRunMarker.isPlanApproved,
+          }
+        : null,
+      runCompletedEvents: state.runtimeEvents.flatMap((event) =>
+        event.type === "run.completed" && event.turnId === currentTurn?.id
+          ? [{ runId: event.runId, resultKind: event.resultKind }]
+          : []
+      ),
+      turnCompletedEvents: state.runtimeEvents.flatMap((event) =>
+        event.type === "turn.completed" && event.turnId === currentTurn?.id
+          ? [{ turnId: event.turnId, resultKind: event.resultKind }]
+          : []
+      ),
+      visibleFinalCount: agentBlocks.filter((block) =>
+        block.turnId === currentTurn?.id &&
+        block.visibility === "assistant_final" &&
+        block.streaming !== true
+      ).length,
       visibleConversationTurns,
       taskFlowUserCount: state.taskFlow.filter((block) => block.type === "user").length,
       agentTexts: agentBlocks.map((block) => block.content),
@@ -3693,7 +3730,9 @@ function seedExecutionCapsuleExecutionProgressScenario() {
   const sessionId = 999601;
   const now = Date.now();
   const turnId = "e2e-execution-capsule-execution-progress-turn";
+  const runId = "run-e2e-execution-capsule-execution-progress";
   const userBlockId = useAppStore.getState()._nextTaskId();
+  const commentaryBlockId = useAppStore.getState()._nextTaskId();
   const readBlockId = useAppStore.getState()._nextTaskId();
   const editBlockId = useAppStore.getState()._nextTaskId();
   const commandBlockId = useAppStore.getState()._nextTaskId();
@@ -3720,8 +3759,61 @@ function seedExecutionCapsuleExecutionProgressScenario() {
       ],
     },
     currentSessionId: sessionId,
+    harnessRunMarker: {
+      schemaVersion: 1,
+      runId,
+      activeRunId: runId,
+      parentRunId: null,
+      instanceId: "e2e-execution-capsule-execution-progress-instance",
+      sessionKey: `${workspace}:${sessionId}`,
+      workspace,
+      sessionId,
+      turnId,
+      status: "running",
+      workflowMode: "edit",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      iteration: 3,
+      maxIterations: 25,
+      messagesLen: 5,
+      toolCount: 2,
+      latestTool: "replace_in_file",
+      latestToolTarget: "src/components/ExecutionCapsule.tsx",
+      activeStreamId: "stream-e2e-execution-capsule-execution-progress",
+      streamStatus: "chunk_progress",
+      streamChunkCount: 3,
+      streamByteCount: 180,
+      streamElapsedMs: 1_200,
+      streamLifecycleStatus: "streaming",
+      lastStreamError: null,
+      startedAt: now - 2_000,
+      updatedAt: now,
+      closedAt: null,
+      closeReason: null,
+    },
     taskFlow: [
       { id: userBlockId, turnId, type: "user", content: "/执行 修改 ExecutionCapsule 执行步骤进度。" },
+      {
+        id: commentaryBlockId,
+        turnId,
+        type: "agent",
+        content: "**当前判断**：已确认展示层入口，正在核对活动状态与运行身份。",
+        streaming: false,
+        hiddenProcess: false,
+        visibility: "assistant_update",
+        publicProgress: {
+          schemaVersion: 1,
+          kind: "assistant_commentary",
+          source: "model_visible_content",
+          sessionKey: `${workspace}:${sessionId}`,
+          turnId,
+          displayTurnId: turnId,
+          runId,
+          parentRunId: null,
+          createdAt: now,
+        },
+      },
       {
         id: readBlockId,
         turnId,
@@ -3762,12 +3854,42 @@ function seedExecutionCapsuleExecutionProgressScenario() {
         intent: "execute",
         status: "executing",
         summary: "执行模式下 ExecutionCapsule 应展示工具步骤进度。",
-        blockIds: [userBlockId, readBlockId, editBlockId, commandBlockId],
+        blockIds: [userBlockId, commentaryBlockId, readBlockId, editBlockId, commandBlockId],
         collapsed: false,
         createdAt: now,
       },
     ],
     currentTurnId: turnId,
+    runtimeEvents: [
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "run.started" as const,
+        threadId: `${workspace}:${sessionId}`,
+        turnId,
+        timestampMs: now - 2_000,
+        runId,
+        parentRunId: null,
+      },
+      {
+        schemaVersion: MAIN_THREAD_EVENT_SCHEMA_VERSION,
+        type: "progress.updated" as const,
+        threadId: `${workspace}:${sessionId}`,
+        turnId,
+        timestampMs: now,
+        runId,
+        parentRunId: null,
+        progress: {
+          phase: "editing",
+          title: "正在修改 ExecutionCapsule",
+          status: "running",
+          summary: "正在更新当前运行的展示状态。",
+          tool: "replace_in_file",
+          canonicalTarget: "src/components/ExecutionCapsule.tsx",
+          sourceToolCallIds: ["e2e-execution-capsule-edit"],
+          dedupeKey: `execution-capsule-edit:${runId}`,
+        },
+      },
+    ],
     planArtifacts: [],
     planTasks: [],
     planExecutionEvidenceLedger: [],
@@ -6431,12 +6553,27 @@ function seedStreamingTimerScenario() {
       },
     ],
     currentTurnId: turnId,
+    runtimeEvents: [],
+    harnessRunMarker: buildE2EPausedActionOwner({
+      workspace: "/tmp/e2e-streaming-timer",
+      sessionId: 999005,
+      turnId: "e2e-previous-session-turn",
+      runId: "e2e-previous-session-run",
+      workflowMode: "chat",
+      runtimeIntent: "execute",
+      planStage: "idle",
+      isPlanApproved: false,
+      closeReason: "previous_session_paused",
+      now,
+    }),
+    activeActionRequest: null,
     input: "",
     attachedFiles: [],
     contextMentions: [],
     elapsedTime: 0,
     isGenerating: true,
     agentStatus: "running",
+    abortController: new AbortController(),
     showDiff: false,
     showPlanPanel: false,
     showTerminal: false,
@@ -6446,9 +6583,32 @@ function seedStreamingTimerScenario() {
 
   bridge.getSnapshot = () => {
     const state = useAppStore.getState();
+    const turn = state.conversationTurns.find((candidate) => candidate.id === turnId) || null;
     return {
       isGenerating: state.isGenerating,
+      agentStatus: state.agentStatus,
       elapsedTime: state.elapsedTime,
+      turnStatus: turn?.status || null,
+      turnResultKind: turn?.runtimeOutcome?.status === "completed"
+        ? turn.runtimeOutcome.resultKind
+        : null,
+      canceledRunConclusions: state.runtimeEvents.filter((event) =>
+        event.type === "run.completed" &&
+        event.threadId === "/tmp/e2e-streaming-timer:999006" &&
+        event.turnId === turnId &&
+        event.resultKind === "canceled"
+      ).length,
+      turnConclusions: state.runtimeEvents.filter((event) =>
+        event.type === "turn.completed" &&
+        event.threadId === "/tmp/e2e-streaming-timer:999006" &&
+        event.turnId === turnId
+      ).length,
+      visibleFinals: state.taskFlow.filter((block) =>
+        block.type === "agent" &&
+        block.turnId === turnId &&
+        block.visibility === "assistant_final" &&
+        block.streaming !== true
+      ).length,
       seedCount: readSeedCount(STREAMING_TIMER_SCENARIO),
     };
   };
@@ -8055,6 +8215,7 @@ function seedPlanApprovalExecuteToolsScenario() {
     ],
     planExecutionEvidenceLedger: [],
     planExecutionEvidenceCount: 0,
+    runtimeEvents: [],
     planStage: "ready_to_execute",
     isPlanApproved: false,
     planApprovalChoice: null,

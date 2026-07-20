@@ -4,6 +4,7 @@ import {
   normalizePlanExecutionRunProvenance,
   type PlanExecutionRunProvenance,
 } from "./planExecutionProvenance";
+import type { TerminalResultKind } from "./turnEvents";
 
 export const HARNESS_RUN_MARKER_STORAGE_KEY = "main.harnessRunMarker.v1";
 const HARNESS_INSTANCE_STORAGE_KEY = "main.harnessInstance.v1";
@@ -32,6 +33,8 @@ export interface HarnessRunMarker {
   sessionId: number | null;
   turnId: string | null;
   status: HarnessRunStatus;
+  /** Exact completed result for crash restore; Harness status alone is lossy. */
+  terminalResultKind?: TerminalResultKind | null;
   workflowMode: string;
   runtimeIntent: string;
   planStage: string;
@@ -174,6 +177,19 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
   const activeParentRunId = typeof record.activeParentRunId === "string" && record.activeParentRunId.trim()
     ? record.activeParentRunId.trim()
     : null;
+  const status: HarnessRunStatus = record.status || "running";
+  const explicitTerminalResultKind = record.terminalResultKind === "success" ||
+    record.terminalResultKind === "partial" ||
+    record.terminalResultKind === "blocked" ||
+    record.terminalResultKind === "error" ||
+    record.terminalResultKind === "canceled"
+      ? record.terminalResultKind
+      : null;
+  const terminalResultKind = status === "error"
+    ? explicitTerminalResultKind || "error"
+    : status === "completed" || status === "closed"
+    ? explicitTerminalResultKind
+    : null;
   const hasPlanExecutionProvenance = Object.prototype.hasOwnProperty.call(
     record,
     "activePlanExecutionProvenance",
@@ -215,7 +231,8 @@ export function normalizeHarnessRunMarker(value: unknown): HarnessRunMarker | nu
     workspace: typeof record.workspace === "string" ? record.workspace : null,
     sessionId: typeof record.sessionId === "number" ? record.sessionId : null,
     turnId,
-    status: record.status || "running",
+    status,
+    ...(terminalResultKind ? { terminalResultKind } : {}),
     workflowMode: typeof record.workflowMode === "string" ? record.workflowMode : "unknown",
     runtimeIntent: typeof record.runtimeIntent === "string" ? record.runtimeIntent : "unknown",
     planStage: typeof record.planStage === "string" ? record.planStage : "idle",
@@ -307,6 +324,7 @@ function hasSameHarnessPersistenceAuthority(
     current.status === expected.status &&
     current.activeRunId === expected.activeRunId &&
     current.activeParentRunId === expected.activeParentRunId &&
+    (current.terminalResultKind || null) === (expected.terminalResultKind || null) &&
     hasSamePlanExecutionProvenance(
       current.activePlanExecutionProvenance,
       expected.activePlanExecutionProvenance,
@@ -358,10 +376,10 @@ export function persistHarnessRunMarkerIfOwned(
     : null;
 }
 
-function isExactHarnessRunGeneration(
+export function isExactHarnessRunGeneration(
   marker: HarnessRunMarker | null | undefined,
   owner: ExactHarnessRunOwner,
-): marker is HarnessRunMarker {
+): boolean {
   return !!marker &&
     marker.runId === owner.runId &&
     marker.sessionKey === owner.sessionKey &&
@@ -381,17 +399,59 @@ export function settleHarnessRunMarkerIfOwned(
 ): HarnessRunMarker | null {
   const current = readHarnessRunMarker();
   if (
+    !current ||
     marker.status === "running" ||
     !isExactHarnessRunGeneration(current, owner) ||
     !isExactHarnessRunGeneration(marker, owner)
   ) {
     return null;
   }
-  if (
-    current.status === marker.status &&
-    current.closeReason === marker.closeReason
-  ) {
-    return current;
+  const hasSameTerminalMeaning = current.status === marker.status &&
+    current.closeReason === marker.closeReason;
+  if (hasSameTerminalMeaning) {
+    const currentResultKind = current.terminalResultKind || null;
+    const requestedResultKind = marker.terminalResultKind || null;
+    if (
+      currentResultKind &&
+      requestedResultKind &&
+      currentResultKind !== requestedResultKind
+    ) return null;
+    const effectiveResultKind = requestedResultKind || currentResultKind;
+    const resultKindNeedsRepair = !currentResultKind && !!requestedResultKind;
+    const sameAuthorityWithoutRepairableResult = hasSameHarnessLeaseIdentity(current, marker) &&
+      current.status === marker.status &&
+      current.activeRunId === marker.activeRunId &&
+      current.activeParentRunId === marker.activeParentRunId &&
+      hasSamePlanExecutionProvenance(
+        current.activePlanExecutionProvenance,
+        marker.activePlanExecutionProvenance,
+      );
+    if (!sameAuthorityWithoutRepairableResult) return null;
+    if (
+      !resultKindNeedsRepair &&
+      current.planStage === marker.planStage &&
+      current.isPlanApproved === marker.isPlanApproved
+    ) {
+      return current;
+    }
+    const repairMarker = {
+      ...current,
+      ...(effectiveResultKind ? { terminalResultKind: effectiveResultKind } : {}),
+      planStage: marker.planStage,
+      isPlanApproved: marker.isPlanApproved,
+      updatedAt: Math.max(current.updatedAt, marker.updatedAt),
+    };
+    const repaired = persistHarnessRunMarker(repairMarker);
+    if (!repaired) return null;
+    const verifiedRepair = readHarnessRunMarker();
+    return verifiedRepair &&
+        hasSameHarnessPersistenceAuthority(verifiedRepair, repairMarker) &&
+        verifiedRepair.closeReason === marker.closeReason &&
+        (verifiedRepair.terminalResultKind || null) === effectiveResultKind &&
+        verifiedRepair.planStage === marker.planStage &&
+        verifiedRepair.isPlanApproved === marker.isPlanApproved
+      ? verifiedRepair
+      : null;
   }
   if (
     current.status !== "running" &&
@@ -402,9 +462,11 @@ export function settleHarnessRunMarkerIfOwned(
   const persisted = persistHarnessRunMarker(marker);
   if (!persisted) return null;
   const verified = readHarnessRunMarker();
-  return isExactHarnessRunGeneration(verified, owner) &&
-      verified.status === marker.status &&
-      verified.closeReason === marker.closeReason
+  return verified &&
+      hasSameHarnessPersistenceAuthority(verified, marker) &&
+      verified.closeReason === marker.closeReason &&
+      verified.planStage === marker.planStage &&
+      verified.isPlanApproved === marker.isPlanApproved
     ? verified
     : null;
 }
@@ -455,6 +517,7 @@ export function closeHarnessRunMarkerForSessionDeletion(
   const next = persistHarnessRunMarker({
     ...current,
     status: "completed",
+    terminalResultKind: "canceled",
     closeReason: "session_deleted",
     closedAt: Date.now(),
     updatedAt: Date.now(),

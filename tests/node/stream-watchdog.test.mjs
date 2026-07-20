@@ -507,7 +507,7 @@ test("recovery required-any follows the contract capability surface, not the leg
     executeRecoveryMode: "validation_only",
     recoveryActionContract: migratedPostMutation,
     llmToolNames: ["read_file"],
-  }), undefined, "validation recovery stays optional when run_command is absent");
+  }), "required", "an unpinned validation checkpoint requires its remaining manifest-discovery action");
 });
 
 test("validation recovery requires one call from the command capability surface", () => {

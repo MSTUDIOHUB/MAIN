@@ -8,9 +8,13 @@ import {
 } from "../../orchestrator";
 import { resolvePlanClosureArtifactKind } from "../../orchestrator/planOrchestration";
 import { composeReviewablePlanFromEvidence } from "../../planMaterialization";
+import { assessPlanExecutableValidation } from "../../planExecutableValidation";
 import { buildPlanApprovalIdentity } from "../../planApprovalIdentity";
 import type { PlanToolActivitySummary } from "../../planExecutionRecovery";
-import type { PlanRuntimePhase } from "../../workflowModels";
+import {
+  deriveRuntimePlanTasksFromArtifacts,
+  type PlanRuntimePhase,
+} from "../../workflowModels";
 import type { OrchestratorCallbacks } from "../types";
 import {
   markPlanClosurePromptIssued,
@@ -62,6 +66,11 @@ export function createPlanReviewRuntimeHandlers(input: {
   getPlanRuntimeState: () => PlanLoopRuntimeState;
   setPlanRuntimeState: (state: PlanLoopRuntimeState) => void;
   setPlanRuntimePhase: SetPlanRuntimePhase;
+  prepareReviewablePlanArtifact?: () => Promise<{
+    ok: boolean;
+    repaired: boolean;
+    reason?: string;
+  }>;
 }): PlanReviewRuntimeHandlers {
   const {
     callbacks,
@@ -74,6 +83,7 @@ export function createPlanReviewRuntimeHandlers(input: {
     getPlanRuntimeState,
     setPlanRuntimeState,
     setPlanRuntimePhase,
+    prepareReviewablePlanArtifact,
   } = input;
 
   const waitForPlanApprovalIfNeeded = async (): Promise<boolean> => {
@@ -113,6 +123,67 @@ export function createPlanReviewRuntimeHandlers(input: {
         planStage: stage,
       });
       return "not_reviewable";
+    }
+    if (callbacks.getPlanArtifacts && !buildPlanApprovalIdentity(callbacks.getPlanArtifacts())) {
+      logAgentEvent("plan_review_blocked_missing_artifact", {
+        trigger,
+        iteration: getIteration(),
+        planStage: stage,
+      });
+      return "not_reviewable";
+    }
+    if (callbacks.getPlanArtifacts && prepareReviewablePlanArtifact) {
+      const preparation = await prepareReviewablePlanArtifact();
+      if (!preparation.ok) {
+        const reason = preparation.reason || "executable_validation_task_missing";
+        const state = getPlanRuntimeState();
+        setPlanRuntimeState({
+          ...state,
+          planRuntimePhase: "needs_rewrite",
+          planQualityRejectCount: state.planQualityRejectCount + 1,
+          planLastQualityGateReason: reason,
+          planArtifactQualityRejected: true,
+        });
+        setPlanRuntimePhase("needs_rewrite", reason, "failed");
+        logAgentEvent("plan_review_blocked_execution_materialization", {
+          trigger,
+          iteration: getIteration(),
+          planStage: stage,
+          reason,
+        });
+        return "not_reviewable";
+      }
+    }
+    if (callbacks.getPlanArtifacts) {
+      const artifacts = callbacks.getPlanArtifacts();
+      const tasks = deriveRuntimePlanTasksFromArtifacts(artifacts, {
+        language: callbacks.getPreferredLanguage(),
+      });
+      const executableValidation = assessPlanExecutableValidation({
+        planArtifacts: artifacts,
+        executionPlanTasks: tasks,
+      });
+      if (executableValidation.missing) {
+        const reason = executableValidation.reason || "executable_validation_task_missing";
+        const state = getPlanRuntimeState();
+        setPlanRuntimeState({
+          ...state,
+          planRuntimePhase: "needs_rewrite",
+          planQualityRejectCount: state.planQualityRejectCount + 1,
+          planLastQualityGateReason: reason,
+          planArtifactQualityRejected: true,
+        });
+        setPlanRuntimePhase("needs_rewrite", reason, "failed");
+        logAgentEvent("plan_review_blocked_execution_materialization", {
+          trigger,
+          iteration: getIteration(),
+          planStage: stage,
+          reason,
+          requiresExecutableValidation: executableValidation.requiresExecutableValidation,
+          executableValidationTaskCount: executableValidation.executableValidationTaskCount,
+        });
+        return "not_reviewable";
+      }
     }
     const reviewIdentity = callbacks.getPlanArtifacts
       ? buildPlanApprovalIdentity(callbacks.getPlanArtifacts())

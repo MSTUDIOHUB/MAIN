@@ -75,6 +75,7 @@ function pendingRequest(overrides = {}) {
 
 function state(overrides = {}) {
   return {
+    currentTurnId: "turn-1",
     taskFlow: [{
       id: 1,
       turnId: "turn-1",
@@ -116,6 +117,52 @@ function state(overrides = {}) {
     ...overrides,
   };
 }
+
+test("cross-Session control residue cannot keep the canceled Session busy", () => {
+  const foreignMarker = {
+    ...state().harnessRunMarker,
+    sessionKey: "session-old",
+    turnId: "turn-old",
+    status: "paused",
+  };
+  const foreignAction = pendingRequest({
+    requestId: "request-old",
+    sessionKey: "session-old",
+    turnId: "turn-old",
+    runId: "run-old",
+  });
+  const initial = state({
+    harnessRunMarker: foreignMarker,
+    activeActionRequest: foreignAction,
+  });
+
+  const result = projectCanceledTurn({
+    state: initial,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    reason: "user_cancelled",
+    message: "Canceled and closed.",
+    nextTaskId: () => 2,
+    nowMs: 10,
+  });
+
+  assert.equal(result.disposition, "committed");
+  assert.equal(result.state.conversationTurns[0].status, "done");
+  assert.equal(result.state.agentStatus, "idle");
+  assert.equal(result.state.isGenerating, false);
+  assert.equal(result.state.abortController, null);
+  assert.equal(result.state.harnessRunMarker, null);
+  assert.equal(result.state.activeActionRequest, null);
+  assert.equal(result.state.pendingReviewResolve, null);
+  assert.equal(result.state.pendingReviewTaskId, null);
+  assert.equal(result.state.pendingToolCall, null);
+  assert.equal(
+    result.state.runtimeEvents.filter((event) =>
+      event.type === "turn.completed" && event.threadId === "session-1"
+    ).length,
+    1,
+  );
+});
 
 test("canceling a running run closes the same run and publishes one visible conclusion", () => {
   const initial = state();
@@ -300,6 +347,14 @@ test("canceling a paused run concludes that same run through the canonical cance
 test("an already completed logical turn is immutable under a late cancel", () => {
   const initial = state({
     conversationTurns: [turn({ status: "done" })],
+    harnessRunMarker: null,
+    activeActionRequest: null,
+    agentStatus: "idle",
+    isGenerating: false,
+    abortController: null,
+    pendingReviewResolve: null,
+    pendingReviewTaskId: null,
+    pendingToolCall: null,
     runtimeEvents: [{
       schemaVersion: 2,
       type: "turn.completed",
@@ -325,6 +380,238 @@ test("an already completed logical turn is immutable under a late cancel", () =>
   assert.deepEqual(result.state.runtimeEvents, initial.runtimeEvents);
   assert.equal(result.state.conversationTurns[0].status, "done");
 });
+
+test("an already closed current Turn repairs only stale transient controls", () => {
+  const initial = state({
+    conversationTurns: [turn({ status: "done" })],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Canceled and closed.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      state().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 8,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "canceled",
+        summary: "Canceled and closed.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "canceled",
+      },
+    ],
+  });
+  const result = projectCanceledTurn({
+    state: initial,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    reason: "user_cancelled",
+    message: "Canceled and closed.",
+    nextTaskId: () => 2,
+    nowMs: 10,
+    controlPlaneFence: { abortController: initial.abortController ?? null },
+  });
+
+  assert.equal(result.disposition, "already_closed");
+  assert.notEqual(result.state, initial);
+  assert.deepEqual(result.state.runtimeEvents, initial.runtimeEvents);
+  assert.deepEqual(result.state.taskFlow, initial.taskFlow);
+  assert.equal(result.state.agentStatus, "idle");
+  assert.equal(result.state.isGenerating, false);
+  assert.equal(result.state.abortController, null);
+});
+
+test("an already closed Turn cannot clear a successor controller before its marker is visible", () => {
+  const capturedController = { abort() {} };
+  const successorController = { abort() {} };
+  const initial = state({
+    conversationTurns: [turn({ status: "done" })],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Already complete.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      state().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 8,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "success",
+        summary: "Already complete.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "success",
+      },
+    ],
+    harnessRunMarker: null,
+    activeActionRequest: null,
+    abortController: successorController,
+  });
+  const result = projectCanceledTurn({
+    state: initial,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    reason: "late_cancel",
+    message: "Must not clear successor.",
+    nextTaskId: () => 2,
+    nowMs: 10,
+    controlPlaneFence: { abortController: capturedController },
+  });
+
+  assert.equal(result.disposition, "already_closed");
+  assert.equal(result.state, initial);
+  assert.equal(result.state.abortController, successorController);
+  assert.equal(result.state.isGenerating, true);
+  assert.equal(result.state.agentStatus, "running");
+});
+
+test("a late Stop cannot rewrite a successful Turn's Harness meaning as cancellation", () => {
+  const initial = state({
+    conversationTurns: [turn({
+      status: "done",
+      summary: "Work completed successfully.",
+      runtimeOutcome: {
+        status: "completed",
+        resultKind: "success",
+        reason: "agent_loop_completed",
+        runId: "run-1",
+        parentRunId: null,
+        updatedAt: 9,
+      },
+    })],
+    taskFlow: [{
+      id: 1,
+      turnId: "turn-1",
+      type: "agent",
+      content: "Work completed successfully.",
+      streaming: false,
+      visibility: "assistant_final",
+    }],
+    runtimeEvents: [
+      state().runtimeEvents[0],
+      {
+        schemaVersion: 2,
+        type: "run.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        runId: "run-1",
+        parentRunId: null,
+        resultKind: "success",
+        summary: "Work completed successfully.",
+      },
+      {
+        schemaVersion: 2,
+        type: "turn.completed",
+        threadId: "session-1",
+        turnId: "turn-1",
+        timestampMs: 9,
+        resultKind: "success",
+      },
+    ],
+  });
+  const result = projectCanceledTurn({
+    state: initial,
+    sessionKey: "session-1",
+    turnId: "turn-1",
+    runId: "run-1",
+    reason: "late_user_cancelled",
+    message: "Must not become canceled.",
+    nextTaskId: () => 2,
+    nowMs: 10,
+    controlPlaneFence: { abortController: initial.abortController ?? null },
+  });
+
+  assert.equal(result.disposition, "already_closed");
+  assert.deepEqual(result.state.runtimeEvents, initial.runtimeEvents);
+  assert.deepEqual(result.state.taskFlow, initial.taskFlow);
+  assert.equal(result.state.harnessRunMarker?.status, "completed");
+  assert.equal(result.state.harnessRunMarker?.closeReason, "agent_loop_completed");
+  assert.equal(result.state.isGenerating, false);
+});
+
+for (const [resultKind, expectedCloseReason] of [
+  ["partial", "agent_loop_partial"],
+  ["blocked", "agent_loop_blocked"],
+]) {
+  test(`a late Stop preserves an event-owned ${resultKind} terminal meaning`, () => {
+    const initial = state({
+      conversationTurns: [turn({
+        status: "done",
+        summary: `Turn ended as ${resultKind}.`,
+      })],
+      runtimeEvents: [
+        state().runtimeEvents[0],
+        {
+          schemaVersion: 2,
+          type: "run.completed",
+          threadId: "session-1",
+          turnId: "turn-1",
+          timestampMs: 9,
+          runId: "run-1",
+          parentRunId: null,
+          resultKind,
+          summary: `Turn ended as ${resultKind}.`,
+        },
+        {
+          schemaVersion: 2,
+          type: "turn.completed",
+          threadId: "session-1",
+          turnId: "turn-1",
+          timestampMs: 9,
+          resultKind,
+        },
+      ],
+    });
+    const result = projectCanceledTurn({
+      state: initial,
+      sessionKey: "session-1",
+      turnId: "turn-1",
+      runId: "run-1",
+      reason: "late_user_cancelled",
+      message: "Must not rewrite the terminal meaning.",
+      nextTaskId: () => 2,
+      nowMs: 10,
+      controlPlaneFence: { abortController: initial.abortController ?? null },
+    });
+
+    assert.equal(result.disposition, "already_closed");
+    assert.deepEqual(result.state.runtimeEvents, initial.runtimeEvents);
+    assert.equal(result.state.harnessRunMarker?.status, "completed");
+    assert.equal(result.state.harnessRunMarker?.terminalResultKind, resultKind);
+    assert.equal(result.state.harnessRunMarker?.closeReason, expectedCloseReason);
+    assert.equal(result.state.isGenerating, false);
+  });
+}
 
 test("closing an old turn preserves the control plane owned by a newer turn", () => {
   const newerAbortController = { abort() {} };

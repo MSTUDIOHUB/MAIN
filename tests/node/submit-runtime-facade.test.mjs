@@ -542,7 +542,13 @@ test("owner-scoped publication preserves concurrent config and Session index upd
       runtimeBySessionKey: {},
       sessionsByWorkspace: {
         "/tmp/app": [
-          { id: 42, title: "Original title", messages: [], storageStatus: "temporary" },
+          {
+            id: 42,
+            title: "Original title",
+            messages: [],
+            storageRevision: 8,
+            storageStatus: "temporary",
+          },
           { id: 99, title: "Neighbor", messages: [] },
         ],
         "/tmp/other": [{ id: 1, title: "Other workspace" }],
@@ -580,6 +586,7 @@ test("owner-scoped publication preserves concurrent config and Session index upd
               title: "Original title",
               messages: [{ id: 2, content: "done" }],
               runtimeSnapshot: { terminal: true },
+              storageRevision: 9,
               updatedAtMs: 500,
               storageStatus: "ok",
             }
@@ -598,6 +605,7 @@ test("owner-scoped publication preserves concurrent config and Session index upd
           title: "Concurrent semantic title",
           titleSource: "semantic",
           messages: [],
+          storageRevision: 8,
           storageStatus: "temporary",
         },
         { id: 99, title: "Neighbor updated concurrently", messages: [{ id: 99 }] },
@@ -629,6 +637,7 @@ test("owner-scoped publication preserves concurrent config and Session index upd
   assert.equal(targetSession.titleSource, "semantic");
   assert.deepEqual(targetSession.messages, [{ id: 2, content: "done" }]);
   assert.deepEqual(targetSession.runtimeSnapshot, { terminal: true });
+  assert.equal(targetSession.storageRevision, 9);
   assert.equal(targetSession.updatedAtMs, 500);
   assert.equal(targetSession.storageStatus, "ok");
   assert.equal(
@@ -1063,6 +1072,7 @@ test("durable Session patch excludes mutable metadata returned by a save adapter
         modelConfig: { model: "adapter" },
         messages: [{ id: 1 }],
         runtimeSnapshot: { terminal: true },
+        storageRevision: 9,
         storageStatus: "ok",
         updatedAtMs: 10,
       }],
@@ -1077,6 +1087,7 @@ test("durable Session patch excludes mutable metadata returned by a save adapter
   }), {
     messages: [{ id: 1 }],
     runtimeSnapshot: { terminal: true },
+    storageRevision: 9,
     storageStatus: "ok",
     updatedAtMs: 10,
   });

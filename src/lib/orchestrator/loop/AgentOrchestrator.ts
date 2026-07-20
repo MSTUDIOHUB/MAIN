@@ -28,6 +28,7 @@ import { isPlanRuntimeFinalizationPhase } from "../../planRuntime";
 import { joinPendingSubagentsForParent } from "./subagentJoinRuntime";
 import { resolveExecuteRecoveryActionContract } from "../../executeRecoveryTools";
 import type { ExecuteRecoveryRuntimeState } from "./executeRecoveryRuntime";
+import { pinExecuteRecoveryFiniteValidationCheckpoint } from "./executeRecoveryRuntime";
 import { buildExecutionCheckpointPresentation } from "./completionGuards";
 import {
   parseVisualContextRecognition,
@@ -41,8 +42,14 @@ import {
   getFileReadObservationForState,
   selectFileReadStateForRecoveryContext,
 } from "../fileReadCache";
-import { readFileMetadataIfAvailable } from "../../orchestrator";
+import {
+  prepareReviewablePlanArtifactForReview,
+  readFileMetadataIfAvailable,
+} from "../../orchestrator";
 import { resolveRecoverySourceContextFreshness } from "./contextManagement";
+import { executeTool } from "../../toolExecutor";
+import { resolveTrustedProjectValidationCommands } from "../../projectValidationCommands";
+import type { PendingFiniteValidationCheckpoint } from "../../executeRecoveryTools";
 
 const APPROVED_PLAN_RECOVERY_STREAM_MAX_ELAPSED_MS = 90_000;
 
@@ -224,6 +231,47 @@ export class AgentOrchestrator {
           });
         };
         publishExecuteRecoveryState();
+        let trustedValidationCheckpointPromise:
+          Promise<PendingFiniteValidationCheckpoint | null> | null = null;
+        const resolveTrustedValidationCheckpoint = () => {
+          if (trustedValidationCheckpointPromise) return trustedValidationCheckpointPromise;
+          trustedValidationCheckpointPromise = (async () => {
+            try {
+              const packageManifest = String(await executeTool(
+                "read_file",
+                { path: "package.json", __raw: true },
+                workspace,
+                callbacks.getSessionKey(),
+              ) ?? "");
+              const resolution = resolveTrustedProjectValidationCommands(packageManifest, {
+                maxCommands: 1,
+              });
+              if (!resolution.ok) {
+                callbacks.onDebugEvent?.("agent.execute_recovery_validation_unpinned", {
+                  reason: resolution.reason,
+                  manifestPath: "package.json",
+                });
+                return null;
+              }
+              const selected = resolution.commands[0];
+              if (!selected) return null;
+              callbacks.onDebugEvent?.("agent.execute_recovery_validation_pinned", {
+                command: selected.command,
+                scriptName: selected.scriptName,
+                manifestPath: selected.manifestPath,
+              });
+              return { command: selected.command, cwd: "." };
+            } catch (error) {
+              callbacks.onDebugEvent?.("agent.execute_recovery_validation_unpinned", {
+                reason: "package_manifest_unavailable",
+                manifestPath: "package.json",
+                error: error instanceof Error ? error.message : String(error),
+              });
+              return null;
+            }
+          })();
+          return trustedValidationCheckpointPromise;
+        };
         const toolSurfaceRuntime = createAgentLoopToolSurfaceRuntime({
           callbacks,
           runtimeState,
@@ -348,6 +396,10 @@ export class AgentOrchestrator {
             loopState.planRuntimeState = state;
           },
           setPlanRuntimePhase,
+          prepareReviewablePlanArtifact: () => prepareReviewablePlanArtifactForReview({
+            workspace,
+            callbacks,
+          }),
         });
 
         const loopControl = createAgentLoopControlRuntime({
@@ -394,6 +446,26 @@ export class AgentOrchestrator {
           callbacks.onStatusChange("idle");
           emitRunPausedEvent("aborted", "The run was aborted and can be resumed in the same turn.");
           return;
+        }
+
+        if (
+          (loopState.executeRecoveryState.mode === "validation_only" ||
+            loopState.executeRecoveryState.mode === "finite_validation_only") &&
+          !loopState.executeRecoveryState.decisionCheckpoint?.pendingFiniteValidation
+        ) {
+          const checkpoint = await resolveTrustedValidationCheckpoint();
+          if (abortController.signal.aborted) {
+            callbacks.onStatusChange("idle");
+            emitRunPausedEvent("aborted", "The run was aborted and can be resumed in the same turn.");
+            return;
+          }
+          if (checkpoint) {
+            loopState.executeRecoveryState = pinExecuteRecoveryFiniteValidationCheckpoint(
+              loopState.executeRecoveryState,
+              checkpoint,
+            );
+            publishExecuteRecoveryState();
+          }
         }
 
         if (

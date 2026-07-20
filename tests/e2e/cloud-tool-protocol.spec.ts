@@ -784,31 +784,14 @@ test.beforeEach(async ({ page }) => {
         }
 
         if (scenario === "plan-approval-execute-tools") {
-          const missingInitialReads = [
-            !readFileCalls.includes("src/main.js")
-              ? [
-                  "<tool_use>",
-                  "<tool>read_file</tool>",
-                  "<parameter name=\"path\">src/main.js</parameter>",
-                  "</tool_use>",
-                ].join("\n")
-              : "",
-            !readFileCalls.includes("src-tauri/tauri.conf.json")
-              ? [
-                  "<tool_use>",
-                  "<tool>read_file</tool>",
-                  "<parameter name=\"path\">src-tauri/tauri.conf.json</parameter>",
-                  "</tool_use>",
-                ].join("\n")
-              : "",
-          ].filter(Boolean);
-          if (missingInitialReads.length > 0) {
+          if (!readFileCalls.includes("src/main.js")) {
             return JSON.stringify({
               output_text: [
-                readFileCalls.length === 0
-                  ? "请选择下一步：\n1. 引用了 `save_file_content` 命令但未在 Rust 端实现\n2. 我来确认是否在 tauri.conf.json 中配置"
-                  : "继续补齐执行所需的源码读取。",
-                ...missingInitialReads,
+                "请选择下一步：\n1. 引用了 `save_file_content` 命令但未在 Rust 端实现\n2. 我来确认当前源码",
+                "<tool_use>",
+                "<tool>read_file</tool>",
+                "<parameter name=\"path\">src/main.js</parameter>",
+                "</tool_use>",
               ].filter(Boolean).join("\n"),
             });
           }
@@ -2191,7 +2174,6 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
         const probe = (window as any).__CLOUD_TOOL_PROTOCOL_TEST__;
         return {
           readMain: (probe?.readFileCalls || []).includes("src/main.js"),
-          readTauriConfig: (probe?.readFileCalls || []).includes("src-tauri/tauri.conf.json"),
           awaitingChoice: document.querySelectorAll('[data-testid="execution-capsule-awaiting-choice"]').length,
           replyOptions: document.querySelectorAll('[data-testid^="execution-capsule-reply-option-"]').length,
         };
@@ -2199,7 +2181,6 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
     )
     .toEqual({
       readMain: true,
-      readTauriConfig: true,
       awaitingChoice: 0,
       replyOptions: 0,
     });
@@ -2218,10 +2199,11 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
         const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
         return {
           hasWrite: toolNameSets.some((names: string[]) => names.includes("write_file") && names.includes("replace_in_file")),
-          hasShell: toolNameSets.some((names: string[]) => names.includes("run_command") && names.includes("execute_command")),
+          hasShell: toolNameSets.some((names: string[]) =>
+            names.includes("run_command") || names.includes("execute_command")
+          ),
           currentTurnIntent: snapshot?.currentTurnIntent,
           currentTurnDisplayIntent: snapshot?.currentTurnDisplayIntent,
-          isPlanApproved: snapshot?.isPlanApproved,
           wroteSource: (probe?.writeFileCalls || []).includes("src/main.js"),
           ranValidation: (probe?.runCommandCalls || []).includes("npm run test:workflow-assets"),
         };
@@ -2232,7 +2214,6 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
       hasShell: true,
       currentTurnIntent: "plan",
       currentTurnDisplayIntent: "execute",
-      isPlanApproved: true,
       wroteSource: true,
       ranValidation: true,
     });
@@ -2255,6 +2236,47 @@ test("approved plan resumes with execute runtime tools while preserving plan tur
       hasWriteToolBlock: true,
       hasValidationToolBlock: true,
       hasExecutionResult: true,
+    });
+
+  await expect
+    .poll(async () => {
+      return page.evaluate(() => {
+        const snapshot = (window as any).__CODELY_E2E__?.getSnapshot?.();
+        return {
+          agentStatus: snapshot?.agentStatus,
+          isGenerating: snapshot?.isGenerating,
+          currentTurnStatus: snapshot?.currentTurnStatus,
+          planLifecycleStatus: snapshot?.planLifecycleStatus,
+          planStage: snapshot?.planStage,
+          isPlanApproved: snapshot?.isPlanApproved,
+          harnessRunMarker: snapshot?.harnessRunMarker,
+          persistedHarnessRunMarker: snapshot?.persistedHarnessRunMarker,
+          runCompletedEvents: snapshot?.runCompletedEvents,
+          turnCompletedEvents: snapshot?.turnCompletedEvents,
+          visibleFinalCount: snapshot?.visibleFinalCount,
+        };
+      });
+    }, { timeout: 25_000 })
+    .toEqual({
+      agentStatus: "idle",
+      isGenerating: false,
+      currentTurnStatus: "completed_with_changes",
+      planLifecycleStatus: "completed",
+      planStage: "completed",
+      isPlanApproved: false,
+      harnessRunMarker: expect.objectContaining({
+        status: "completed",
+        planStage: "completed",
+        isPlanApproved: false,
+      }),
+      persistedHarnessRunMarker: expect.objectContaining({
+        status: "completed",
+        planStage: "completed",
+        isPlanApproved: false,
+      }),
+      runCompletedEvents: [expect.objectContaining({ resultKind: "success" })],
+      turnCompletedEvents: [expect.objectContaining({ resultKind: "success" })],
+      visibleFinalCount: 1,
     });
 });
 

@@ -214,6 +214,10 @@ export function resolveValidationMutationReopen(input: {
     input.recoveryState.mode === "finite_validation_only" ||
     input.recoveryState.decisionCheckpoint?.nextRequiredCapability === "validation";
   if (!validationActive) return null;
+  // Mutation may reopen only from an exact retained validation command. This
+  // keeps the recovery transaction auditable and prevents an unpinned
+  // validation phase from becoming an ambient edit escape.
+  if (!input.recoveryState.decisionCheckpoint?.pendingFiniteValidation) return null;
   if (
     input.protocolViolation !== "required_tool_call_not_available" &&
     input.protocolViolation !== "required_function_call_mismatch"

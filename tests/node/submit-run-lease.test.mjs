@@ -820,6 +820,9 @@ test("Harness settlement cannot close a reused logical id from another generatio
     const exactTerminal = {
       ...successor,
       status: "completed",
+      terminalResultKind: "partial",
+      planStage: "completed",
+      isPlanApproved: false,
       closeReason: "successor_finished",
       closedAt: 400,
       updatedAt: 400,
@@ -833,8 +836,204 @@ test("Harness settlement cannot close a reused logical id from another generatio
     };
     const settled = settleHarnessRunMarkerIfOwned(exactTerminal, exactOwner);
     assert.equal(settled.status, "completed");
+    assert.equal(settled.terminalResultKind, "partial");
     assert.equal(settled.closeReason, "successor_finished");
+    persistHarnessRunMarker({
+      ...settled,
+      terminalResultKind: undefined,
+      planStage: "executing",
+      isPlanApproved: true,
+    });
+    const repaired = settleHarnessRunMarkerIfOwned(exactTerminal, exactOwner);
+    assert.equal(repaired.status, "completed");
+    assert.equal(repaired.terminalResultKind, "partial");
+    assert.equal(repaired.planStage, "completed");
+    assert.equal(repaired.isPlanApproved, false);
+    assert.equal(readHarnessRunMarker().planStage, "completed");
+    assert.equal(readHarnessRunMarker().isPlanApproved, false);
     assert.equal(settleHarnessRunMarkerIfOwned(exactTerminal, exactOwner).status, "completed");
+    assert.equal(settleHarnessRunMarkerIfOwned({
+      ...exactTerminal,
+      terminalResultKind: "success",
+    }, exactOwner), null, "a retry cannot rewrite one terminal result into another");
+    assert.equal(readHarnessRunMarker().terminalResultKind, "partial");
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("Harness marker normalization preserves exact terminal kinds and never infers success", () => {
+  const base = {
+    schemaVersion: 1,
+    runId: "run-terminal-kind",
+    instanceId: "instance-terminal-kind",
+    sessionKey: "workspace-a:terminal-kind",
+    turnId: "turn-terminal-kind",
+    workflowMode: "edit",
+    runtimeIntent: "execute",
+    planStage: "idle",
+    isPlanApproved: false,
+    startedAt: 100,
+    updatedAt: 200,
+  };
+  for (const terminalResultKind of ["success", "partial", "blocked", "error", "canceled"]) {
+    assert.equal(normalizeHarnessRunMarker({
+      ...base,
+      status: "completed",
+      terminalResultKind,
+    })?.terminalResultKind, terminalResultKind);
+  }
+  assert.equal(normalizeHarnessRunMarker({
+    ...base,
+    status: "completed",
+  })?.terminalResultKind, undefined, "legacy completed markers remain unknown");
+  assert.equal(normalizeHarnessRunMarker({
+    ...base,
+    status: "running",
+    terminalResultKind: "success",
+  })?.terminalResultKind, undefined, "a live marker cannot retain stale terminal truth");
+  assert.equal(normalizeHarnessRunMarker({
+    ...base,
+    status: "error",
+  })?.terminalResultKind, "error");
+});
+
+test("Harness settlement rejects a terminal write whose Plan metadata is torn before verification", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  let tamperNextTerminalWrite = false;
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => {
+        const serialized = String(value);
+        if (key === HARNESS_RUN_MARKER_STORAGE_KEY && tamperNextTerminalWrite) {
+          tamperNextTerminalWrite = false;
+          const parsed = JSON.parse(serialized);
+          values.set(key, JSON.stringify({
+            ...parsed,
+            planStage: "executing",
+            isPlanApproved: true,
+          }));
+          return;
+        }
+        values.set(key, serialized);
+      },
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const running = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-torn-terminal",
+      instanceId: "instance-torn-terminal",
+      sessionKey: "workspace-a:8",
+      turnId: "turn-torn-terminal",
+      status: "running",
+      planStage: "executing",
+      isPlanApproved: true,
+      startedAt: 500,
+      updatedAt: 500,
+    });
+    const terminal = {
+      ...running,
+      status: "completed",
+      planStage: "completed",
+      isPlanApproved: false,
+      closeReason: "agent_loop_completed",
+      closedAt: 600,
+      updatedAt: 600,
+    };
+    tamperNextTerminalWrite = true;
+    const settled = settleHarnessRunMarkerIfOwned(terminal, {
+      runId: running.runId,
+      sessionKey: running.sessionKey,
+      turnId: running.turnId,
+      instanceId: running.instanceId,
+      startedAt: running.startedAt,
+    });
+
+    assert.equal(settled, null);
+    assert.equal(readHarnessRunMarker().status, "completed");
+    assert.equal(readHarnessRunMarker().planStage, "executing");
+    assert.equal(readHarnessRunMarker().isPlanApproved, true);
+  } finally {
+    if (previousWindow === undefined) {
+      delete globalThis.window;
+    } else {
+      globalThis.window = previousWindow;
+    }
+  }
+});
+
+test("Harness settlement rejects a terminal write whose active child owner is torn before verification", () => {
+  const previousWindow = globalThis.window;
+  const values = new Map();
+  let tamperNextTerminalWrite = false;
+  globalThis.window = {
+    localStorage: {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => {
+        const serialized = String(value);
+        if (key === HARNESS_RUN_MARKER_STORAGE_KEY && tamperNextTerminalWrite) {
+          tamperNextTerminalWrite = false;
+          const parsed = JSON.parse(serialized);
+          values.set(key, JSON.stringify({
+            ...parsed,
+            activeRunId: "run-torn-successor-child",
+            activeParentRunId: "run-torn-successor-parent",
+          }));
+          return;
+        }
+        values.set(key, serialized);
+      },
+      removeItem: (key) => values.delete(key),
+    },
+  };
+
+  try {
+    const running = persistHarnessRunMarker({
+      schemaVersion: 1,
+      runId: "run-torn-child-owner",
+      instanceId: "instance-torn-child-owner",
+      sessionKey: "workspace-a:9",
+      turnId: "turn-torn-child-owner",
+      status: "running",
+      activeRunId: "run-child-original",
+      activeParentRunId: "run-parent-original",
+      planStage: "executing",
+      isPlanApproved: true,
+      startedAt: 700,
+      updatedAt: 700,
+    });
+    const terminal = {
+      ...running,
+      status: "completed",
+      planStage: "completed",
+      isPlanApproved: false,
+      closeReason: "agent_loop_completed",
+      closedAt: 800,
+      updatedAt: 800,
+    };
+    tamperNextTerminalWrite = true;
+    const settled = settleHarnessRunMarkerIfOwned(terminal, {
+      runId: running.runId,
+      sessionKey: running.sessionKey,
+      turnId: running.turnId,
+      instanceId: running.instanceId,
+      startedAt: running.startedAt,
+    });
+
+    assert.equal(settled, null);
+    assert.equal(readHarnessRunMarker().status, "completed");
+    assert.equal(readHarnessRunMarker().planStage, "completed");
+    assert.equal(readHarnessRunMarker().isPlanApproved, false);
+    assert.equal(readHarnessRunMarker().activeRunId, "run-torn-successor-child");
   } finally {
     if (previousWindow === undefined) {
       delete globalThis.window;

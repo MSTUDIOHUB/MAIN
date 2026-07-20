@@ -227,6 +227,71 @@ test("an accepted rewrite can enter review with the current tool-phase quality s
   assert.equal(events.some((event) => event.type === "phase" && event.phase === "review_ready"), true);
 });
 
+test("plan review fails closed when a validation section has no executable task", async () => {
+  const artifact = {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: [
+      "# Proposed Plan",
+      "",
+      "## Implementation",
+      "- Modify `src/main.ts` to preserve the parsed creator name in the returned object.",
+      "",
+      "## Test Plan",
+      "- Upload a CSV and manually inspect the creator shown on the dashboard.",
+    ].join("\n"),
+    revision: 1,
+    updatedAt: 1,
+  };
+  const { events, handlers, getPlanRuntimeState } = createHandlers({
+    callbacks: {
+      getPlanStage: () => "plan",
+      getPlanArtifacts: () => [artifact],
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+    },
+  });
+
+  assert.equal(await handlers.pauseForReviewablePlanArtifact("missing_validation_command"), "not_reviewable");
+  assert.equal(events.some((event) => event.type === "status" && event.status === "pending_review"), false);
+  assert.equal(getPlanRuntimeState().planArtifactQualityRejected, true);
+  assert.equal(
+    getPlanRuntimeState().planLastQualityGateReason,
+    "executable_validation_task_missing",
+  );
+});
+
+test("plan review accepts an explicit finite non-Node validation command without manifest repair", async () => {
+  const artifact = {
+    kind: "plan",
+    path: ".MAIN/plans/plan.md",
+    title: "Plan",
+    content: [
+      "# Proposed Plan",
+      "",
+      "## Implementation",
+      "- Modify `src/main.rs` to preserve the parsed creator name.",
+      "",
+      "## Test Plan",
+      "- Run `cargo test` and inspect the exit status and output.",
+    ].join("\n"),
+    revision: 1,
+    updatedAt: 1,
+  };
+  const { events, handlers } = createHandlers({
+    callbacks: {
+      getPlanStage: () => "plan",
+      getPlanArtifacts: () => [artifact],
+      getPreferredLanguage: () => "en",
+      onAssistantFinalText: () => {},
+    },
+  });
+
+  assert.equal(await handlers.pauseForReviewablePlanArtifact("explicit_cargo_test"), "stopped");
+  assert.equal(events.some((event) => event.type === "status" && event.status === "pending_review"), true);
+});
+
 test("plan review pauses the current run and approved execution keeps the normal tool surface", async () => {
   const trace = [];
   const lifecycle = [];

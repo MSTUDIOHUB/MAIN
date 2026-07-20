@@ -1,5 +1,6 @@
 import {
   projectCanceledTurn,
+  type CanceledTurnControlPlaneFence,
   type CanceledTurnProjectionState,
 } from "../lib/canceledTurnProjection";
 import type { HarnessRunMarker } from "../lib/harnessCrashTelemetry";
@@ -20,6 +21,7 @@ export interface CommitCanceledTurnInput<
   parentRunId?: string | null;
   reason: string;
   message: string;
+  expectedAbortController: AbortController | null;
   nextTaskId: () => number;
   sessionGet: () => TState;
   getSessionRevisionToken: () => unknown;
@@ -42,6 +44,8 @@ export interface CommitCanceledTurnResult {
     | "committed_durable"
     | "committed_memory_fallback"
     | "already_closed"
+    | "already_closed_durable"
+    | "already_closed_memory_fallback"
     | "ownership_lost"
     | "durable_session_missing"
     | "concurrent_update_limit";
@@ -60,6 +64,9 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
 ): Promise<CommitCanceledTurnResult> {
   const maxAttempts = Math.max(1, Math.min(5, input.maxAttempts ?? 3));
   let stableCancellationRunId = "";
+  const controlPlaneFence: CanceledTurnControlPlaneFence = {
+    abortController: input.expectedAbortController,
+  };
 
   const createHarnessSettlement = (
     projectedMarker: HarnessRunMarker | null | undefined,
@@ -101,13 +108,62 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
       message: input.message,
       nextTaskId: input.nextTaskId,
       nowMs: (input.nowMs || Date.now)(),
+      controlPlaneFence,
     });
     stableCancellationRunId = projection.cancellationRunId || stableCancellationRunId;
 
     if (projection.disposition === "already_closed") {
+      let durableState: TState | undefined;
+      let persistError: unknown = null;
+      try {
+        durableState = await input.persistProjection(projection.state);
+      } catch (error) {
+        persistError = error;
+        input.log?.("canceled_turn_closed_projection_persist_unavailable", {
+          sessionKey: input.sessionKey,
+          turnId: input.turnId,
+          runId: stableCancellationRunId,
+          attempt,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+      if (input.getSessionRevisionToken() !== revisionToken) {
+        input.log?.("canceled_turn_closed_projection_retry", {
+          sessionKey: input.sessionKey,
+          turnId: input.turnId,
+          runId: stableCancellationRunId,
+          attempt,
+        });
+        continue;
+      }
+      if (projection.state !== baseState) {
+        const beforePublish = createHarnessSettlement(
+          projection.harnessRunMarker,
+          baseState.harnessRunMarker,
+        );
+        const publication = input.publishProjection({
+          projectedState: projection.state,
+          ...(durableState ? { durableState } : {}),
+          scopeKey: input.scopeKey,
+          sessionId: input.sessionId,
+          expectedRevisionToken: revisionToken,
+          ...(beforePublish ? { beforePublish } : {}),
+        });
+        if (!publication.published) {
+          if (publication.disposition === "revision_conflict") continue;
+          return {
+            committed: false,
+            disposition: publication.disposition,
+            cancellationRunId: stableCancellationRunId,
+            attempts: attempt,
+          };
+        }
+      }
       return {
         committed: true,
-        disposition: "already_closed",
+        disposition: persistError
+          ? "already_closed_memory_fallback"
+          : "already_closed_durable",
         cancellationRunId: stableCancellationRunId,
         attempts: attempt,
       };
@@ -196,11 +252,35 @@ export async function commitCanceledTurn<TState extends CanceledTurnProjectionSt
     message: input.message,
     nextTaskId: input.nextTaskId,
     nowMs: (input.nowMs || Date.now)(),
+    controlPlaneFence,
   });
   if (finalProjection.disposition === "already_closed") {
+    if (finalProjection.state !== finalBaseState) {
+      const finalBeforePublish = createHarnessSettlement(
+        finalProjection.harnessRunMarker,
+        finalBaseState.harnessRunMarker,
+      );
+      const publication = input.publishProjection({
+        projectedState: finalProjection.state,
+        scopeKey: input.scopeKey,
+        sessionId: input.sessionId,
+        expectedRevisionToken: finalRevisionToken,
+        ...(finalBeforePublish ? { beforePublish: finalBeforePublish } : {}),
+      });
+      if (!publication.published) {
+        return {
+          committed: false,
+          disposition: publication.disposition === "revision_conflict"
+            ? "concurrent_update_limit"
+            : publication.disposition,
+          cancellationRunId: finalProjection.cancellationRunId || stableCancellationRunId,
+          attempts: maxAttempts,
+        };
+      }
+    }
     return {
       committed: true,
-      disposition: "already_closed",
+      disposition: "already_closed_memory_fallback",
       cancellationRunId: finalProjection.cancellationRunId || stableCancellationRunId,
       attempts: maxAttempts,
     };

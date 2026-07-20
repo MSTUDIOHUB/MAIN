@@ -10,13 +10,16 @@ import {
   isTerminalTurnEvent,
   withEventSchema,
   type MainThreadEvent,
+  type TerminalResultKind,
 } from "./turnEvents";
 import type { ConversationTurn } from "./workflowModels";
+import { stripAssistantPublicProgress } from "./assistantPublicProgress";
 
 export interface CanceledTurnProjectionState {
   taskFlow: TaskBlock[];
   conversationTurns: ConversationTurn[];
   runtimeEvents: MainThreadEvent[];
+  currentTurnId?: string | null;
   activeActionRequest?: ActionRequest | null;
   harnessRunMarker?: HarnessRunMarker | null;
   agentStatus?: string;
@@ -35,11 +38,165 @@ export interface CanceledTurnProjectionResult<TState> {
   disposition: "committed" | "already_closed" | "ownership_lost";
 }
 
+export interface CanceledTurnControlPlaneFence {
+  /** Exact controller observed when the user requested Stop. */
+  abortController: AbortController | null;
+}
+
 function createCancellationRunId(nowMs: number): string {
   const uuid = globalThis.crypto?.randomUUID?.();
   return uuid
     ? `run-cancel-${uuid}`
     : `run-cancel-${nowMs}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function canonicalTerminalCloseReason(
+  resultKind: TerminalResultKind,
+  cancellationReason: string,
+): string {
+  switch (resultKind) {
+    case "success":
+      return "agent_loop_completed";
+    case "partial":
+      return "agent_loop_partial";
+    case "blocked":
+      return "agent_loop_blocked";
+    case "error":
+      return "agent_loop_error";
+    case "canceled":
+      return cancellationReason;
+  }
+}
+
+function reconcileAlreadyClosedControlPlane<
+  TState extends CanceledTurnProjectionState,
+>(input: {
+  state: TState;
+  sessionKey: string;
+  turnIds: ReadonlySet<string>;
+  requestedRunId: string;
+  reason: string;
+  timestampMs: number;
+  controlPlaneFence?: CanceledTurnControlPlaneFence;
+}): { state: TState; harnessRunMarker: HarnessRunMarker | null } {
+  const currentTurnId = String(input.state.currentTurnId || "").trim();
+  if (!currentTurnId || !input.turnIds.has(currentTurnId)) {
+    return {
+      state: input.state,
+      harnessRunMarker: input.state.harnessRunMarker || null,
+    };
+  }
+
+  const marker = input.state.harnessRunMarker || null;
+  const actionRequest = input.state.activeActionRequest || null;
+  if (
+    !input.controlPlaneFence ||
+    (input.state.abortController ?? null) !== input.controlPlaneFence.abortController
+  ) {
+    return { state: input.state, harnessRunMarker: marker };
+  }
+  const markerBelongsToSession = !!marker && marker.sessionKey === input.sessionKey;
+  const actionBelongsToSession = !!actionRequest && actionRequest.sessionKey === input.sessionKey;
+  const markerOwnsTarget = markerBelongsToSession &&
+    !!marker.turnId &&
+    input.turnIds.has(marker.turnId) &&
+    (marker.status === "running" || marker.status === "paused") &&
+    (!input.requestedRunId || getHarnessActionRunId(marker) === input.requestedRunId);
+  const actionOwnsTarget = actionBelongsToSession &&
+    actionRequest.status === "pending" &&
+    input.turnIds.has(actionRequest.turnId) &&
+    (!input.requestedRunId || actionRequest.runId === input.requestedRunId);
+  const hasSameSessionSuccessorControl = (
+    markerBelongsToSession &&
+    (marker.status === "running" || marker.status === "paused") &&
+    !markerOwnsTarget
+  ) || (
+    actionBelongsToSession &&
+    actionRequest.status === "pending" &&
+    !actionOwnsTarget
+  );
+  const terminalRunIds = new Set(input.state.runtimeEvents
+    .filter((event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+      isRunTerminalEvent(event) &&
+      event.threadId === input.sessionKey &&
+      input.turnIds.has(event.turnId)
+    )
+    .map((event) => event.runId));
+  const canonicalTurn = input.state.conversationTurns.find((turn) =>
+    input.turnIds.has(turn.id)
+  );
+  const canonicalTurnConclusion = [...input.state.runtimeEvents].reverse().find(
+    (event): event is Extract<MainThreadEvent, { type: "turn.completed" }> =>
+      isTerminalTurnEvent(event) &&
+      event.threadId === input.sessionKey &&
+      input.turnIds.has(event.turnId),
+  );
+  const canonicalRunConclusion = [...input.state.runtimeEvents].reverse().find(
+    (event): event is Extract<MainThreadEvent, { type: "run.completed" }> =>
+      isRunTerminalEvent(event) &&
+      event.threadId === input.sessionKey &&
+      input.turnIds.has(event.turnId) &&
+      (!input.requestedRunId || event.runId === input.requestedRunId),
+  );
+  const canonicalResultKind = canonicalTurn?.runtimeOutcome?.resultKind ||
+    canonicalTurnConclusion?.resultKind ||
+    canonicalRunConclusion?.resultKind ||
+    "canceled";
+  const canonicalCloseReason = canonicalTurn?.runtimeOutcome?.reason ||
+    canonicalTerminalCloseReason(canonicalResultKind, input.reason);
+  const hasOpenSuccessorRun = input.state.runtimeEvents.some((event) =>
+    event.type === "run.started" &&
+    event.threadId === input.sessionKey &&
+    input.turnIds.has(event.turnId) &&
+    !terminalRunIds.has(event.runId) &&
+    (!input.requestedRunId || event.runId !== input.requestedRunId)
+  );
+  if (hasSameSessionSuccessorControl || hasOpenSuccessorRun) {
+    return { state: input.state, harnessRunMarker: marker };
+  }
+
+  const quarantinesCrossSessionMarker = !!marker && !markerBelongsToSession;
+  const quarantinesCrossSessionAction = !!actionRequest && !actionBelongsToSession;
+  const needsCleanup = input.state.isGenerating === true ||
+    (typeof input.state.agentStatus === "string" && input.state.agentStatus !== "idle") ||
+    !!input.state.abortController ||
+    markerOwnsTarget ||
+    actionOwnsTarget ||
+    quarantinesCrossSessionMarker ||
+    quarantinesCrossSessionAction ||
+    !!input.state.pendingReviewResolve ||
+    input.state.pendingReviewTaskId != null ||
+    input.state.pendingToolCall != null;
+  if (!needsCleanup) return { state: input.state, harnessRunMarker: marker };
+
+  const harnessRunMarker = quarantinesCrossSessionMarker
+    ? null
+    : markerOwnsTarget && marker
+      ? {
+          ...marker,
+          status: canonicalResultKind === "error" ? "error" as const : "completed" as const,
+          terminalResultKind: canonicalResultKind,
+          updatedAt: input.timestampMs,
+          closedAt: input.timestampMs,
+          closeReason: canonicalCloseReason,
+        }
+      : marker;
+  return {
+    state: {
+      ...input.state,
+      agentStatus: "idle",
+      isGenerating: false,
+      abortController: null,
+      harnessRunMarker,
+      activeActionRequest: actionOwnsTarget || quarantinesCrossSessionAction
+        ? null
+        : actionRequest,
+      pendingReviewResolve: null,
+      pendingReviewTaskId: null,
+      pendingToolCall: null,
+    },
+    harnessRunMarker,
+  };
 }
 
 /** Close a logical Turn after an explicit user cancellation. */
@@ -55,6 +212,7 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
   runId?: string | null;
   parentRunId?: string | null;
   cancellationRunId?: string | null;
+  controlPlaneFence?: CanceledTurnControlPlaneFence;
 }): CanceledTurnProjectionResult<TState> {
   const timestampMs = input.nowMs ?? Date.now();
   const turnIds = new Set([input.turnId, input.uiDisplayTurnId].filter(Boolean) as string[]);
@@ -64,10 +222,20 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     turnIds.has(event.turnId)
   );
   if (alreadyClosed) {
-    return {
+    const requestedRunId = String(input.runId || "").trim();
+    const reconciled = reconcileAlreadyClosedControlPlane({
       state: input.state,
-      cancellationRunId: String(input.runId || ""),
-      harnessRunMarker: input.state.harnessRunMarker || null,
+      sessionKey: input.sessionKey,
+      turnIds,
+      requestedRunId,
+      reason: input.reason,
+      timestampMs,
+      controlPlaneFence: input.controlPlaneFence,
+    });
+    return {
+      state: reconciled.state,
+      cancellationRunId: requestedRunId,
+      harnessRunMarker: reconciled.harnessRunMarker,
       disposition: "already_closed",
     };
   }
@@ -249,7 +417,7 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     if (block.id === finalBlockId && block.type === "agent") {
       foundFinal = true;
       return {
-        ...block,
+        ...stripAssistantPublicProgress(block),
         content: cancellationMessage,
         streaming: false,
         hiddenProcess: false,
@@ -262,7 +430,10 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
       !!block.turnId &&
       turnIds.has(block.turnId)
     ) {
-      return { ...block, visibility: "assistant_update" as const };
+      return {
+        ...stripAssistantPublicProgress(block),
+        visibility: "assistant_update" as const,
+      };
     }
     return block;
   });
@@ -283,10 +454,12 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     turnIds.has(marker.turnId) &&
     (marker.status === "running" || marker.status === "paused") &&
     (!ownerRunId || getHarnessActionRunId(marker) === ownerRunId);
-  const hasForeignMarkerOwner = !!marker &&
+  const markerBelongsToSession = !!marker && marker.sessionKey === input.sessionKey;
+  const actionBelongsToSession = !!actionRequest && actionRequest.sessionKey === input.sessionKey;
+  const hasForeignMarkerOwner = markerBelongsToSession &&
     (marker.status === "running" || marker.status === "paused") &&
     !ownsMarkerTurn;
-  const hasForeignActionOwner = !!actionRequest &&
+  const hasForeignActionOwner = actionBelongsToSession &&
     actionRequest.status === "pending" &&
     !ownsActionRequest;
   const hasForeignControlOwner = hasForeignMarkerOwner || hasForeignActionOwner;
@@ -294,10 +467,13 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     actionRequest.kind === "tool_permission" &&
     input.state.pendingReviewTaskId === actionRequest.taskId;
   const shouldClearPendingReview = !hasForeignControlOwner || ownsPendingReview;
-  const harnessRunMarker = ownsMarkerTurn && marker
+  const harnessRunMarker = marker && !markerBelongsToSession
+    ? null
+    : ownsMarkerTurn && marker
     ? {
         ...marker,
         status: "completed" as const,
+        terminalResultKind: "canceled" as const,
         activeRunId: cancellationRunId,
         activeParentRunId: cancellationParentRunId,
         updatedAt: timestampMs,
@@ -310,7 +486,9 @@ export function projectCanceledTurn<TState extends CanceledTurnProjectionState>(
     taskFlow,
     runtimeEvents,
     harnessRunMarker,
-    activeActionRequest: ownsActionRequest ? null : actionRequest,
+    activeActionRequest: ownsActionRequest || (actionRequest && !actionBelongsToSession)
+      ? null
+      : actionRequest,
     conversationTurns: input.state.conversationTurns.map((turn) =>
       turnIds.has(turn.id)
         ? {

@@ -385,6 +385,19 @@ export const EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS = new Set([
   "run_command",
 ]);
 
+/**
+ * A validation transaction without a pinned finite command must retain a
+ * truthful discovery surface. In particular, `run_command` cannot be the only
+ * advertised action while the runtime has supplied no admissible command.
+ * Manifest/source reads may discover a real finite command, but mutation stays
+ * unavailable until that exact retained validation fails. The bounded
+ * validation-to-mutation reopen owns only that evidence-backed transition.
+ */
+export const EXECUTE_RECOVERY_UNPINNED_VALIDATION_TOOLS = new Set([
+  "run_command",
+  "read_file",
+]);
+
 export const EXECUTE_RECOVERY_MUTATION_TOOLS = new Set(WORKSPACE_MUTATION_TOOL_NAMES);
 
 const EXECUTE_RECOVERY_PTY_DIAGNOSTIC_CONTRACT_TOOLS = new Set([
@@ -439,6 +452,7 @@ export const EXECUTE_RECOVERY_CORE_TOOLS = new Set([
  */
 function resolveRecoveryAllowedToolNames(
   nextCapability: ExecuteRecoveryNextCapability,
+  options: { hasPinnedFiniteValidation?: boolean } = {},
 ): ReadonlySet<string> {
   switch (nextCapability) {
     case "targeted_read":
@@ -448,7 +462,9 @@ function resolveRecoveryAllowedToolNames(
     case "mutation":
       return EXECUTE_RECOVERY_MUTATION_CONTRACT_TOOLS;
     case "validation":
-      return EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS;
+      return options.hasPinnedFiniteValidation
+        ? EXECUTE_RECOVERY_FINITE_VALIDATION_TOOLS
+        : EXECUTE_RECOVERY_UNPINNED_VALIDATION_TOOLS;
     case "browser_diagnostic":
       return EXECUTE_RECOVERY_BROWSER_DIAGNOSTIC_CONTRACT_TOOLS;
     case "desktop_validation":
@@ -470,6 +486,7 @@ function resolveRecoveryAllowedToolNames(
 
 function resolveRecoveryToolCallRequirement(
   nextCapability: ExecuteRecoveryNextCapability,
+  options: { hasPinnedFiniteValidation?: boolean } = {},
 ): RecoveryToolCallRequirement {
   const toolName = nextCapability === "targeted_read"
     ? "read_file"
@@ -479,7 +496,7 @@ function resolveRecoveryToolCallRequirement(
     ? "computer_use"
     : nextCapability === "launch_long_process"
     ? "execute_command"
-    : nextCapability === "validation"
+    : nextCapability === "validation" && options.hasPinnedFiniteValidation
     ? "run_command"
     : null;
   return toolName
@@ -704,7 +721,12 @@ export function resolveExecuteRecoveryActionContract(
     nextRequiredCapability = "validation";
   }
 
-  const allowedToolNames = resolveRecoveryAllowedToolNames(nextRequiredCapability);
+  const hasPinnedFiniteValidation = Boolean(
+    context.decisionCheckpoint?.pendingFiniteValidation?.command?.trim(),
+  );
+  const allowedToolNames = resolveRecoveryAllowedToolNames(nextRequiredCapability, {
+    hasPinnedFiniteValidation,
+  });
   return {
     ...shared,
     modeLabel: mode,
@@ -715,8 +737,13 @@ export function resolveExecuteRecoveryActionContract(
     allowTargetedFileRead: allowedToolNames.has("read_file"),
     allowsAllTools: false,
     allowedToolNames,
-    surfaceDescription: `capability:${nextRequiredCapability}`,
-    toolCallRequirement: resolveRecoveryToolCallRequirement(nextRequiredCapability),
+    surfaceDescription:
+      nextRequiredCapability === "validation" && !hasPinnedFiniteValidation
+        ? "capability:validation-discovery"
+        : `capability:${nextRequiredCapability}`,
+    toolCallRequirement: resolveRecoveryToolCallRequirement(nextRequiredCapability, {
+      hasPinnedFiniteValidation,
+    }),
   };
 }
 
@@ -1454,6 +1481,8 @@ export function buildExecutionActionContractCard(input: {
         : []),
       pendingFiniteValidation && contract.nextRequiredCapability === "validation"
         ? "只用 run_command 在 validationCwd 重新运行 validationCommand；不要替换验收边界。"
+        : contract.nextRequiredCapability === "validation"
+        ? "当前没有可冒充为验收边界的固定命令。优先用 read_file 检查 package.json、Cargo.toml 等可信清单，或从已有上下文选择一条真实、有限的 run_command；在精确校验失败并保留检查点之前不要请求修改工具。不要用 Shell 文件读取替代 read_file。"
         : "只调用 availableTools 中能够完成 next 的一个工具；不要重启诊断或请求当前工具面之外的能力。",
     ].join("\n");
   }
@@ -1491,6 +1520,8 @@ export function buildExecutionActionContractCard(input: {
       : []),
     pendingFiniteValidation && contract.nextRequiredCapability === "validation"
       ? "Use run_command in validationCwd to rerun validationCommand; do not substitute a different acceptance boundary."
+      : contract.nextRequiredCapability === "validation"
+      ? "No command is pinned, so do not invent an acceptance boundary. First use read_file to inspect a trusted manifest such as package.json or Cargo.toml, or choose one real finite run_command from retained context. Do not request a mutation tool until that exact validation fails and its checkpoint is retained. Never substitute a shell file read for read_file."
       : "Call one tool from availableTools that satisfies next; do not restart diagnosis or request a capability outside the current surface.",
   ].join("\n");
 }

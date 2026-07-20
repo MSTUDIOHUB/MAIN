@@ -10,6 +10,10 @@ export interface TurnIterationContext {
   thread: LegacyConversationThread;
   turn: ExecutionTurn;
   turnContext: TurnContext;
+  /** Exact lifecycle ids emitted as item.started during this iteration. */
+  startedToolCallIds: Set<string>;
+  /** Prevent duplicate history folds from emitting a second terminal item. */
+  completedToolCallIds: Set<string>;
 }
 
 export function startTurnIteration(input: {
@@ -38,5 +42,7 @@ export function startTurnIteration(input: {
     thread,
     turn,
     turnContext,
+    startedToolCallIds: new Set<string>(),
+    completedToolCallIds: new Set<string>(),
   };
 }
